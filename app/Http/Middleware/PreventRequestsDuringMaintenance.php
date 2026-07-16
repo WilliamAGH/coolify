@@ -12,6 +12,14 @@ class PreventRequestsDuringMaintenance extends Middleware
     {
         return parent::inExceptArray($request)
             || ($request instanceof Request
-                && ControlPlaneReadOnlyRoutePolicy::allowsPassiveRequest($request));
+                && (ControlPlaneReadOnlyRoutePolicy::allowsPassiveRequest($request)
+                    || $this->isRouteHealthRequest($request)));
+    }
+
+    private function isRouteHealthRequest(Request $request): bool
+    {
+        return $request->getRealMethod() === 'GET'
+            && $request->getPathInfo() === '/api/control-plane/route-health'
+            && ! ControlPlaneReadOnlyRoutePolicy::hasQueryString($request);
     }
 }

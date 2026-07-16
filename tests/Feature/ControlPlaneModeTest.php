@@ -593,6 +593,18 @@ it('shares the exact read-only policy across passive, API, and maintenance bound
                 Request::create($path.'?probe=1', 'GET'),
             ))->toBeFalse();
     }
+
+    expect($maintenanceBoundary->invoke(
+        $maintenanceMiddleware,
+        Request::create('/api/control-plane/route-health', 'GET'),
+    ))->toBeTrue()
+        ->and($maintenanceBoundary->invoke(
+            $maintenanceMiddleware,
+            Request::create('/api/control-plane/route-health?probe=1', 'GET'),
+        ))->toBeFalse()
+        ->and(ControlPlaneReadOnlyRoutePolicy::allowsPassiveRequest(
+            Request::create('/api/control-plane/route-health', 'GET'),
+        ))->toBeFalse();
 });
 
 it('acknowledges only the exact active web-only direct-origin probe secret', function () {
