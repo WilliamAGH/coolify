@@ -33,19 +33,19 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           persist-credentials: false
 
       - name: Login to ${{ env.GITHUB_REGISTRY }}
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.GITHUB_REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN  }}
 
       - name: Login to ${{ env.DOCKER_REGISTRY }}
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.DOCKER_REGISTRY }}
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -54,10 +54,11 @@ jobs:
       - name: Get Version
         id: version
         run: |
-          echo "VERSION=$(docker run --rm -v "$(pwd):/app" -w /app php:8.2-alpine3.16 php bootstrap/getRealtimeVersion.php)"|xargs >> $GITHUB_OUTPUT
+          version="$(docker run --rm --volume "${PWD}:/app" --workdir /app php:8.2-alpine3.16 php bootstrap/getRealtimeVersion.php)"
+          printf 'VERSION=%s\n' "${version}" >> "${GITHUB_OUTPUT}"
 
       - name: Build and Push Image (${{ matrix.arch }})
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: docker/coolify-realtime/Dockerfile
@@ -73,21 +74,21 @@ jobs:
     runs-on: ubuntu-24.04
     needs: build-push
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           persist-credentials: false
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
 
       - name: Login to ${{ env.GITHUB_REGISTRY }}
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.GITHUB_REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN  }}
 
       - name: Login to ${{ env.DOCKER_REGISTRY }}
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.DOCKER_REGISTRY }}
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -96,7 +97,8 @@ jobs:
       - name: Get Version
         id: version
         run: |
-          echo "VERSION=$(docker run --rm -v "$(pwd):/app" -w /app php:8.2-alpine3.16 php bootstrap/getRealtimeVersion.php)"|xargs >> $GITHUB_OUTPUT
+          version="$(docker run --rm --volume "${PWD}:/app" --workdir /app php:8.2-alpine3.16 php bootstrap/getRealtimeVersion.php)"
+          printf 'VERSION=%s\n' "${version}" >> "${GITHUB_OUTPUT}"
 
       - name: Create & publish manifest on ${{ env.GITHUB_REGISTRY }}
         run: |
@@ -114,7 +116,7 @@ jobs:
           --tag ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-next \
           --tag ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:next
 
-      - uses: sarisia/actions-status-discord@v1
+      - uses: sarisia/actions-status-discord@eb045afee445dc055c18d3d90bd0f244fd062708 # v1.16.0
         if: always()
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK_DEV_RELEASE_CHANNEL  }}

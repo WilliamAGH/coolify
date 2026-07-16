@@ -1,0 +1,517 @@
+name: Application validation
+
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: application-validation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  php:
+    name: PHP 8.5 application
+    runs-on: ubuntu-24.04
+    env:
+      APP_ENV: testing
+      CACHE_STORE: array
+      DB_CONNECTION: testing
+      QUEUE_CONNECTION: sync
+      SESSION_DRIVER: array
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Set up PHP
+        uses: shivammathur/setup-php@44454db4f0199b8b9685a5d763dc37cbf79108e1 # 2.36.0
+        with:
+          php-version: '8.5'
+          coverage: none
+          extensions: mbstring, pdo_sqlite, redis
+      - name: Install Composer dependencies
+        run: composer install --no-interaction --prefer-dist --optimize-autoloader
+      - name: Validate Composer metadata
+        run: composer validate --strict
+      - name: Audit Composer dependencies
+        run: composer audit --locked --no-interaction
+      - name: Discover packages and boot the application
+        run: |
+          php artisan package:discover --ansi
+          php artisan about --only=environment
+      - name: Run application tests
+        run: |
+          set -Eeuo pipefail
+          php artisan test --compact --testsuite=Unit
+          php artisan test --compact --testsuite=Feature
+          php artisan test --compact tests/v4/Feature
+
+  browser:
+    name: Pest browser tests
+    runs-on: ubuntu-24.04
+    env:
+      APP_ENV: testing
+      CACHE_STORE: array
+      DB_CONNECTION: testing
+      QUEUE_CONNECTION: sync
+      SESSION_DRIVER: array
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Set up PHP
+        uses: shivammathur/setup-php@44454db4f0199b8b9685a5d763dc37cbf79108e1 # 2.36.0
+        with:
+          php-version: '8.5'
+          coverage: none
+          extensions: mbstring, pdo_sqlite
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: composer install --no-interaction --prefer-dist --optimize-autoloader
+      - run: npm ci
+      - name: Install Chromium and system dependencies
+        run: npx playwright install --with-deps chromium
+      - name: Build browser assets
+        run: npm run build
+      - name: Run Pest browser tests
+        run: php artisan test --compact tests/v4/Browser
+
+  formatting:
+    name: PHP formatting
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Set up PHP
+        uses: shivammathur/setup-php@44454db4f0199b8b9685a5d763dc37cbf79108e1 # 2.36.0
+        with:
+          php-version: '8.5'
+          coverage: none
+      - run: composer install --no-interaction --prefer-dist --optimize-autoloader
+      - name: Format and require a clean tree
+        run: |
+          vendor/bin/pint --format agent
+          git diff --exit-code
+
+  node:
+    name: Node 22 application
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm audit --audit-level=high
+      - run: npm test
+      - run: npm run build
+
+  workflow-and-shell:
+    name: Workflow and shell contracts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+      - name: Validate workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: Require immutable external action references
+        shell: bash
+        run: |
+          if grep -RInP 'uses:\s+(?!\./)[^@\s]+@(?![0-9a-f]{40}(?:\s|$))' .github/workflows; then
+            echo 'External GitHub Actions must be pinned to a full commit SHA.' >&2
+            exit 1
+          fi
+      - name: ShellCheck changed shell scripts
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -Eeuo pipefail
+          base_sha="${BASE_SHA:-}"
+          if ! git cat-file -e "${base_sha}^{commit}" 2>/dev/null; then
+            base_sha="$(git rev-parse "${GITHUB_SHA}^" 2>/dev/null || printf '%s' 4b825dc642cb6eb9a060e54bf8d69288fbee4904)"
+          fi
+          mapfile -d '' changed_paths < <(git diff --name-only -z --diff-filter=ACMR "$base_sha" "$GITHUB_SHA")
+          scripts=()
+          for path in "${changed_paths[@]}"; do
+            [[ -f "$path" ]] || continue
+
+            if [[ "$path" == *.sh ]]; then
+              scripts+=("$path")
+              continue
+            fi
+
+            first_line=''
+            IFS= read -r first_line < "$path" || :
+            if [[ -x "$path" && "$first_line" =~ ^\#!.*(ba|da|k)?sh([[:space:]]|$) ]]; then
+              scripts+=("$path")
+            fi
+          done
+          if (( ${#scripts[@]} > 0 )); then
+            shellcheck -- "${scripts[@]}"
+          fi
+      - name: Render Linux Compose contracts
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -eu
+          base_sha="${BASE_SHA:-}"
+          if ! git cat-file -e "${base_sha}^{commit}" 2>/dev/null; then
+            base_sha="$(git rev-parse "${GITHUB_SHA}^" 2>/dev/null || printf '%s' 4b825dc642cb6eb9a060e54bf8d69288fbee4904)"
+          fi
+          mapfile -d '' compose_files < <(
+            git diff --name-only -z --diff-filter=ACMR "$base_sha" "$GITHUB_SHA" -- \
+              'docker-compose.yml' 'docker-compose.dev.yml' 'docker-compose-maxio.dev.yml' \
+              'docker-compose.preflight.yml' 'docker-compose.prod.yml' \
+              'docker/**/compose.yaml' 'tests/Integration/**/compose.yaml'
+          )
+          for compose_file in "${compose_files[@]}"; do
+            docker compose -f "$compose_file" config --quiet
+          done
+      - name: Verify pinned source provenance
+        run: |
+          docker/verify-source-provenance.sh docker/production/Dockerfile
+          docker/verify-source-provenance.sh docker/testing-host/Dockerfile
+
+  postgres-redis:
+    name: PostgreSQL 15 and Redis 7
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: coolify_testing
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d coolify_testing"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DB_CONNECTION: pgsql
+      DB_HOST: 127.0.0.1
+      DB_PORT: 5432
+      DB_DATABASE: coolify_testing
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+      CACHE_STORE: redis
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: 6379
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Set up PHP
+        uses: shivammathur/setup-php@44454db4f0199b8b9685a5d763dc37cbf79108e1 # 2.36.0
+        with:
+          php-version: '8.5'
+          coverage: none
+          extensions: mbstring, pdo_pgsql, redis
+      - run: composer install --no-interaction --prefer-dist --optimize-autoloader
+      - run: php artisan migrate:fresh --force
+      - name: Run concurrency, migration, lock, and queue tests
+        run: |
+          set -Eeuo pipefail
+          tests=(
+            tests/Feature/QueueApplicationDeploymentCommitTest.php
+            tests/Feature/PostgresDeploymentClaimConcurrencyTest.php
+            tests/Feature/BlueGreenDeploymentStateMachineTest.php
+            tests/Feature/BlueGreenOperationFencingTest.php
+            tests/Feature/ProductionSeederTest.php
+            tests/Unit/Actions/Application/BlueGreen/BlueGreenDeploymentLockTest.php
+            tests/Feature/BlueGreenMigrationReplayTest.php
+          )
+          for test_file in "${tests[@]}"; do
+            php artisan test --compact "$test_file"
+          done
+
+  integration-changes:
+    name: Select integration gates
+    runs-on: ubuntu-24.04
+    outputs:
+      migration: ${{ steps.paths.outputs.migration }}
+      runtime-fence: ${{ steps.paths.outputs.runtime-fence }}
+      backup-restore: ${{ steps.paths.outputs.backup-restore }}
+      blue-green-simulation: ${{ steps.paths.outputs.blue-green-simulation }}
+      application-deployment-blue-green: ${{ steps.paths.outputs.application-deployment-blue-green }}
+      production-application-blue-green: ${{ steps.paths.outputs.production-application-blue-green }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+      - name: Select integration gates from changed paths
+        id: paths
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -Eeuo pipefail
+
+          migration=false
+          runtime_fence=false
+          backup_restore=false
+          blue_green_simulation=false
+          application_deployment_blue_green=false
+          production_application_blue_green=false
+          base_sha="${BASE_SHA:-}"
+
+          if [[ -z "$base_sha" || "$base_sha" =~ ^0+$ ]] || ! git cat-file -e "${base_sha}^{commit}" 2>/dev/null; then
+            migration=true
+            runtime_fence=true
+            backup_restore=true
+            blue_green_simulation=true
+            application_deployment_blue_green=true
+            production_application_blue_green=true
+          else
+            while IFS= read -r path; do
+              case "$path" in
+                .github/workflows/application-validation.yml)
+                  migration=true
+                  runtime_fence=true
+                  backup_restore=true
+                  blue_green_simulation=true
+                  application_deployment_blue_green=true
+                  production_application_blue_green=true
+                  ;;
+                app/Console/Commands/Migration.php|database/migrations/2026_07_12_*|database/migrations/control-plane-*)
+                  migration=true
+                  blue_green_simulation=true
+                  application_deployment_blue_green=true
+                  ;;
+                tests/Integration/ControlPlaneMigration/*)
+                  migration=true
+                  ;;
+                docker/control-plane-blue-green/controllers/*|tests/Integration/ControlPlaneRuntimeFence/*)
+                  runtime_fence=true
+                  blue_green_simulation=true
+                  ;;
+                app/Contracts/ProxyMutation.php|app/Jobs/ProxyMutationTask.php|app/Providers/AppServiceProvider.php|app/Support/ControlPlaneMode.php|app/Support/ProxyMutation*|app/Support/UsesProxyMutationQueue.php|config/control-plane.php|config/horizon.php)
+                  runtime_fence=true
+                  blue_green_simulation=true
+                  application_deployment_blue_green=true
+                  production_application_blue_green=true
+                  ;;
+                docker/control-plane-blue-green/backup/*|docker/control-plane-blue-green/backup-quiesce/*|tests/Integration/ControlPlaneBackupRestore/*|tests/Integration/ControlPlaneBackupQuiesce/*)
+                  backup_restore=true
+                  blue_green_simulation=true
+                  ;;
+                app/Actions/Application/BlueGreen/*|app/Actions/Proxy/BlueGreen*|app/Jobs/ApplicationDeploymentJob.php|app/Models/ApplicationBlueGreen*|app/Models/ApplicationDeploymentQueue.php|app/Models/ApplicationSetting.php|app/Services/BlueGreenDeploymentLifecycle.php|app/Support/BlueGreen*)
+                  blue_green_simulation=true
+                  application_deployment_blue_green=true
+                  production_application_blue_green=true
+                  ;;
+                docker/control-plane-blue-green/*|tests/Integration/ControlPlaneBlueGreen/*)
+                  blue_green_simulation=true
+                  ;;
+                docker/production/*|tests/Integration/ProductionApplicationBlueGreen/*)
+                  production_application_blue_green=true
+                  application_deployment_blue_green=true
+                  ;;
+                docker/testing-host/*|tests/Integration/ApplicationDeploymentJobBlueGreen/*)
+                  application_deployment_blue_green=true
+                  ;;
+              esac
+            done < <(git diff --name-only --diff-filter=ACMR "$base_sha" "$GITHUB_SHA")
+          fi
+
+          {
+            echo "migration=$migration"
+            echo "runtime-fence=$runtime_fence"
+            echo "backup-restore=$backup_restore"
+            echo "blue-green-simulation=$blue_green_simulation"
+            echo "application-deployment-blue-green=$application_deployment_blue_green"
+            echo "production-application-blue-green=$production_application_blue_green"
+          } >> "$GITHUB_OUTPUT"
+
+  control-plane-migration:
+    name: Control-plane migration replay
+    if: needs.integration-changes.outputs.migration == 'true'
+    needs: integration-changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+      - name: Set up PHP
+        uses: shivammathur/setup-php@44454db4f0199b8b9685a5d763dc37cbf79108e1 # 2.36.0
+        with:
+          php-version: '8.5'
+          coverage: none
+          extensions: mbstring, pdo_pgsql, redis
+      - run: composer install --no-interaction --prefer-dist --optimize-autoloader
+      - name: Run clean-install, upgrade, replay, and foreign-schema gates
+        run: tests/Integration/ControlPlaneMigration/run.sh
+
+  control-plane-runtime-fence:
+    name: Control-plane runtime fence
+    if: needs.integration-changes.outputs.runtime-fence == 'true'
+    needs: integration-changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Run runtime fencing and terminal-state gates
+        run: tests/Integration/ControlPlaneRuntimeFence/run.sh
+
+  control-plane-backup-restore:
+    name: Control-plane backup and restore
+    if: needs.integration-changes.outputs.backup-restore == 'true'
+    needs: integration-changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Run backup, restore, and quiescence gates
+        run: tests/Integration/ControlPlaneBackupRestore/run.sh
+
+  control-plane-blue-green-simulation:
+    name: Control-plane blue/green simulation (${{ matrix.scenario }})
+    if: needs.integration-changes.outputs.blue-green-simulation == 'true'
+    needs: integration-changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - queue-gate
+          - router-reload-failure
+          - continuous-availability
+          - routed-candidate-restart
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Set up PHP
+        uses: shivammathur/setup-php@44454db4f0199b8b9685a5d763dc37cbf79108e1 # 2.36.0
+        with:
+          php-version: '8.5'
+          coverage: none
+      - run: composer install --no-interaction --prefer-dist --optimize-autoloader
+      - name: Run selected promotion, rollback, and availability scenario
+        run: tests/Integration/ControlPlaneBlueGreen/run.sh "${{ matrix.scenario }}"
+
+  application-deployment-blue-green:
+    name: Application deployment job blue/green acceptance
+    if: needs.integration-changes.outputs.application-deployment-blue-green == 'true'
+    needs: integration-changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      - name: Build the production control-plane image
+        run: |
+          docker buildx build --load \
+            --file docker/production/Dockerfile \
+            --tag coolify:application-deployment-job-blue-green-current \
+            .
+      - name: Build the testing-host image
+        run: |
+          docker buildx build --load \
+            --file docker/testing-host/Dockerfile \
+            --tag coolify-testing-host-supply-chain:local \
+            .
+      - name: Run the real deployment job acceptance gate
+        run: tests/Integration/ApplicationDeploymentJobBlueGreen/run.sh
+
+  production-application-blue-green:
+    name: Production application blue/green acceptance
+    if: needs.integration-changes.outputs.production-application-blue-green == 'true'
+    needs: integration-changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      - name: Run the production-image acceptance gate
+        run: tests/Integration/ProductionApplicationBlueGreen/run.sh
+
+  required:
+    name: Application validation required
+    if: always()
+    needs:
+      - php
+      - browser
+      - formatting
+      - node
+      - workflow-and-shell
+      - postgres-redis
+      - integration-changes
+      - control-plane-migration
+      - control-plane-runtime-fence
+      - control-plane-backup-restore
+      - control-plane-blue-green-simulation
+      - application-deployment-blue-green
+      - production-application-blue-green
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every validation job
+        env:
+          PHP_RESULT: ${{ needs.php.result }}
+          BROWSER_RESULT: ${{ needs.browser.result }}
+          FORMATTING_RESULT: ${{ needs.formatting.result }}
+          NODE_RESULT: ${{ needs.node.result }}
+          WORKFLOW_RESULT: ${{ needs.workflow-and-shell.result }}
+          POSTGRES_REDIS_RESULT: ${{ needs.postgres-redis.result }}
+          SELECTION_RESULT: ${{ needs.integration-changes.result }}
+          MIGRATION_SELECTED: ${{ needs.integration-changes.outputs.migration }}
+          MIGRATION_RESULT: ${{ needs.control-plane-migration.result }}
+          RUNTIME_FENCE_SELECTED: ${{ needs.integration-changes.outputs.runtime-fence }}
+          RUNTIME_FENCE_RESULT: ${{ needs.control-plane-runtime-fence.result }}
+          BACKUP_RESTORE_SELECTED: ${{ needs.integration-changes.outputs.backup-restore }}
+          BACKUP_RESTORE_RESULT: ${{ needs.control-plane-backup-restore.result }}
+          BLUE_GREEN_SIMULATION_SELECTED: ${{ needs.integration-changes.outputs.blue-green-simulation }}
+          BLUE_GREEN_SIMULATION_RESULT: ${{ needs.control-plane-blue-green-simulation.result }}
+          APPLICATION_DEPLOYMENT_BLUE_GREEN_SELECTED: ${{ needs.integration-changes.outputs.application-deployment-blue-green }}
+          APPLICATION_DEPLOYMENT_BLUE_GREEN_RESULT: ${{ needs.application-deployment-blue-green.result }}
+          PRODUCTION_APPLICATION_BLUE_GREEN_SELECTED: ${{ needs.integration-changes.outputs.production-application-blue-green }}
+          PRODUCTION_APPLICATION_BLUE_GREEN_RESULT: ${{ needs.production-application-blue-green.result }}
+        run: |
+          set -Eeuo pipefail
+
+          require_success() {
+            local name=$1 result=$2
+            if [[ "$result" != success ]]; then
+              echo "Required validation job did not succeed: $name=$result" >&2
+              exit 1
+            fi
+          }
+
+          require_selected() {
+            local name=$1 selected=$2 result=$3
+            if [[ "$selected" == true ]]; then
+              require_success "$name" "$result"
+            elif [[ "$selected" != false || "$result" != skipped ]]; then
+              echo "Integration selection/result mismatch: $name selected=$selected result=$result" >&2
+              exit 1
+            fi
+          }
+
+          require_success php "$PHP_RESULT"
+          require_success browser "$BROWSER_RESULT"
+          require_success formatting "$FORMATTING_RESULT"
+          require_success node "$NODE_RESULT"
+          require_success workflow-and-shell "$WORKFLOW_RESULT"
+          require_success postgres-redis "$POSTGRES_REDIS_RESULT"
+          require_success integration-changes "$SELECTION_RESULT"
+          require_selected control-plane-migration "$MIGRATION_SELECTED" "$MIGRATION_RESULT"
+          require_selected control-plane-runtime-fence "$RUNTIME_FENCE_SELECTED" "$RUNTIME_FENCE_RESULT"
+          require_selected control-plane-backup-restore "$BACKUP_RESTORE_SELECTED" "$BACKUP_RESTORE_RESULT"
+          require_selected control-plane-blue-green-simulation "$BLUE_GREEN_SIMULATION_SELECTED" "$BLUE_GREEN_SIMULATION_RESULT"
+          require_selected application-deployment-blue-green "$APPLICATION_DEPLOYMENT_BLUE_GREEN_SELECTED" "$APPLICATION_DEPLOYMENT_BLUE_GREEN_RESULT"
+          require_selected production-application-blue-green "$PRODUCTION_APPLICATION_BLUE_GREEN_SELECTED" "$PRODUCTION_APPLICATION_BLUE_GREEN_RESULT"

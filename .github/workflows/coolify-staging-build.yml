@@ -7,128 +7,56 @@ on:
       - v3.x
       - '**v5.x**'
     paths-ignore:
-        - .github/workflows/coolify-helper.yml
-        - .github/workflows/coolify-helper-next.yml
-        - .github/workflows/coolify-realtime.yml
-        - .github/workflows/coolify-realtime-next.yml
-        - .github/workflows/pr-quality.yaml
-        - docker/coolify-helper/Dockerfile
-        - docker/coolify-realtime/Dockerfile
-        - docker/testing-host/Dockerfile
-        - templates/**
-        - CHANGELOG.md
+      - .github/workflows/coolify-helper.yml
+      - .github/workflows/coolify-helper-next.yml
+      - .github/workflows/coolify-realtime.yml
+      - .github/workflows/coolify-realtime-next.yml
+      - .github/workflows/pr-quality.yaml
+      - docker/coolify-helper/**
+      - docker/coolify-realtime/**
+      - docker/testing-host/**
+      - CHANGELOG.md
 
-permissions:
-  contents: read
-  packages: write
-
-env:
-  GITHUB_REGISTRY: ghcr.io
-  DOCKER_REGISTRY: docker.io
-  IMAGE_NAME: "coollabsio/coolify"
+permissions: {}
 
 jobs:
-  build-push:
-    strategy:
-      matrix:
-        include:
-          - arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-24.04
-          - arch: aarch64
-            platform: linux/aarch64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          persist-credentials: false
-
-      - name: Sanitize branch name for Docker tag
-        id: sanitize
-        run: |
-          # Replace slashes and other invalid characters with dashes
-          SANITIZED_NAME=$(echo "${{ github.ref_name }}" | sed 's/[\/]/-/g')
-          echo "tag=${SANITIZED_NAME}" >> $GITHUB_OUTPUT
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to ${{ env.GITHUB_REGISTRY }}
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.GITHUB_REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN  }}
-
-      - name: Login to ${{ env.DOCKER_REGISTRY }}
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.DOCKER_REGISTRY }}
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Build and Push Image (${{ matrix.arch }})
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/production/Dockerfile
-          platforms: ${{ matrix.platform }}
-          push: true
-          tags: |
-            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.sanitize.outputs.tag }}-${{ matrix.arch }}
-            ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.sanitize.outputs.tag }}-${{ matrix.arch }}
-          cache-from: |
-            type=gha,scope=build-${{ matrix.arch }}
-            type=registry,ref=${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}
-
-  merge-manifest:
+  authorize:
+    name: Authorize canonical release source
+    permissions: {}
     runs-on: ubuntu-24.04
-    needs: build-push
     steps:
-      - uses: actions/checkout@v5
-        with:
-          persist-credentials: false
-
-      - name: Sanitize branch name for Docker tag
-        id: sanitize
+      - name: Require the canonical repository
+        env:
+          REPOSITORY: ${{ github.repository }}
         run: |
-          # Replace slashes and other invalid characters with dashes
-          SANITIZED_NAME=$(echo "${{ github.ref_name }}" | sed 's/[\/]/-/g')
-          echo "tag=${SANITIZED_NAME}" >> $GITHUB_OUTPUT
+          set -eu
+          [ "$REPOSITORY" = 'coollabsio/coolify' ]
 
-      - uses: docker/setup-buildx-action@v3
+  application-validation:
+    name: Validate application before image publication
+    needs: authorize
+    uses: ./.github/workflows/application-validation.yml
+    permissions:
+      contents: read
 
-      - name: Login to ${{ env.GITHUB_REGISTRY }}
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.GITHUB_REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN  }}
-
-      - name: Login to ${{ env.DOCKER_REGISTRY }}
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.DOCKER_REGISTRY }}
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Create & publish manifest on ${{ env.GITHUB_REGISTRY }}
-        run: |
-         docker buildx imagetools create \
-         ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.sanitize.outputs.tag }}-amd64 \
-         ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.sanitize.outputs.tag }}-aarch64 \
-         --tag ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.sanitize.outputs.tag }}
-
-      - name: Create & publish manifest on ${{ env.DOCKER_REGISTRY }}
-        run: |
-          docker buildx imagetools create \
-          ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.sanitize.outputs.tag }}-amd64 \
-          ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.sanitize.outputs.tag }}-aarch64 \
-          --tag ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.sanitize.outputs.tag }}
-
-      - uses: sarisia/actions-status-discord@v1
-        if: always()
-        with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK_DEV_RELEASE_CHANNEL  }}
+  publish:
+    name: Build and publish staging Linux image
+    needs: application-validation
+    uses: ./.github/workflows/publish-linux-image.yml
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    with:
+      artifact_name: coolify-staging
+      candidate_repository: coollabsio/coolify-staging-candidates
+      dockerfile: docker/production/Dockerfile
+      publish_latest: false
+      release_kind: staging
+      semantic_version: ''
+      target_repository: coollabsio/coolify-staging
+    secrets:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}

@@ -1,0 +1,11 @@
+#!/bin/sh
+
+set -eu
+
+if [ "${1:-}" = version ]; then
+    printf '%s\n' "${PRODUCTION_IMAGE_SUPPLY_CHAIN_SIMULATED_DOCKER_VERSION:?}"
+
+    exit 0
+fi
+
+exit 64

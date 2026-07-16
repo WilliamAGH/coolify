@@ -1,0 +1,1099 @@
+name: Publish Linux image
+
+on:
+  workflow_call:
+    inputs:
+      release_kind:
+        required: true
+        type: string
+      dockerfile:
+        required: true
+        type: string
+      artifact_name:
+        required: true
+        type: string
+      candidate_repository:
+        required: true
+        type: string
+      target_repository:
+        required: true
+        type: string
+      semantic_version:
+        default: ''
+        required: false
+        type: string
+      publish_latest:
+        default: false
+        required: false
+        type: boolean
+      validate_only:
+        default: false
+        required: false
+        type: boolean
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: true
+      DOCKERHUB_TOKEN:
+        required: true
+    outputs:
+      digest:
+        description: Published multi-platform index digest.
+        value: ${{ jobs.release.outputs.index_digest }}
+      ghcr_image:
+        description: Immutable GHCR image reference.
+        value: ${{ jobs.release.outputs.ghcr_image }}
+      docker_image:
+        description: Immutable Docker Hub image reference.
+        value: ${{ jobs.release.outputs.docker_image }}
+
+permissions: {}
+
+concurrency:
+  group: linux-image-${{ inputs.target_repository }}
+  cancel-in-progress: false
+
+jobs:
+  validate-inputs:
+    name: Validate release target
+    permissions: {}
+    runs-on: ubuntu-24.04
+    outputs:
+      run_tag: ${{ steps.target.outputs.run_tag }}
+    steps:
+      - id: target
+        env:
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+          CANDIDATE_REPOSITORY: ${{ inputs.candidate_repository }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          PUBLISH_LATEST: ${{ inputs.publish_latest }}
+          RELEASE_KIND: ${{ inputs.release_kind }}
+          REPOSITORY: ${{ github.repository }}
+          SEMANTIC_VERSION: ${{ inputs.semantic_version }}
+          SEMANTIC_VERSION_PATTERN: '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*))(\.((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?$'
+          TARGET_REPOSITORY: ${{ inputs.target_repository }}
+          VALIDATE_ONLY: ${{ inputs.validate_only }}
+        run: |
+          set -eu
+          case "$RELEASE_KIND" in
+            production)
+              [ "$ARTIFACT_NAME" = 'coolify' ]
+              [ "$DOCKERFILE" = 'docker/production/Dockerfile' ]
+              [ "$TARGET_REPOSITORY" = 'coollabsio/coolify' ]
+              [ "$CANDIDATE_REPOSITORY" = 'coollabsio/coolify-production-staging' ]
+              printf '%s' "$SEMANTIC_VERSION" | grep -Eq "$SEMANTIC_VERSION_PATTERN"
+              [ "$PUBLISH_LATEST" = true ]
+              if [ "$REPOSITORY" = 'coollabsio/coolify' ]; then
+                [ "$VALIDATE_ONLY" = false ]
+              else
+                [ "$VALIDATE_ONLY" = true ]
+              fi
+              ;;
+            testing-host)
+              [ "$ARTIFACT_NAME" = 'coolify-testing-host' ]
+              [ "$DOCKERFILE" = 'docker/testing-host/Dockerfile' ]
+              [ "$TARGET_REPOSITORY" = 'coollabsio/coolify-testing-host' ]
+              [ "$CANDIDATE_REPOSITORY" = 'coollabsio/coolify-testing-host-staging' ]
+              [ -z "$SEMANTIC_VERSION" ]
+              [ "$PUBLISH_LATEST" = true ]
+              ;;
+            staging)
+              [ "$ARTIFACT_NAME" = 'coolify-staging' ]
+              [ "$DOCKERFILE" = 'docker/production/Dockerfile' ]
+              [ "$TARGET_REPOSITORY" = 'coollabsio/coolify-staging' ]
+              [ "$CANDIDATE_REPOSITORY" = 'coollabsio/coolify-staging-candidates' ]
+              [ -z "$SEMANTIC_VERSION" ]
+              [ "$PUBLISH_LATEST" = false ]
+              ;;
+            *)
+              echo "Unknown release kind: $RELEASE_KIND" >&2
+              exit 1
+              ;;
+          esac
+
+          [ "$CANDIDATE_REPOSITORY" != "$TARGET_REPOSITORY" ]
+          run_tag="sha-$GITHUB_SHA-run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          printf '%s' "$run_tag" | grep -Eq '^sha-[0-9a-f]{40}-run-[1-9][0-9]*-[1-9][0-9]*$'
+
+          validate_tag_length() {
+            tag="$1"
+            [ "${#tag}" -le 128 ] || {
+              printf 'OCI tag exceeds the 128-character limit: %s\n' "$tag" >&2
+              exit 1
+            }
+          }
+
+          for tag in "$run_tag" "${run_tag}-amd64" "${run_tag}-arm64" "quarantine-${run_tag}"; do
+            validate_tag_length "$tag"
+          done
+          if [ -n "$SEMANTIC_VERSION" ]; then
+            validate_tag_length "$SEMANTIC_VERSION"
+          fi
+
+          printf 'run_tag=%s\n' "$run_tag" >> "$GITHUB_OUTPUT"
+
+  build-and-scan:
+    name: Build and scan Linux OCI (${{ matrix.arch }})
+    needs: validate-inputs
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            oci_arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            oci_arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: Preflight native Docker host and record runner evidence
+        env:
+          ARCH: ${{ matrix.arch }}
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+
+          [[ -z ${DOCKER_HOST:-} && -z ${DOCKER_CONTEXT:-} ]] \
+            || { echo 'Ambient Docker endpoint overrides are forbidden.' >&2; exit 1; }
+          [[ $(docker context show) == default ]] \
+            || { echo 'The release build must use Docker default context.' >&2; exit 1; }
+          [[ $(docker context inspect default --format '{{.Endpoints.docker.Host}}') == unix:///var/run/docker.sock ]] \
+            || { echo 'The release build must use the local Unix Docker socket.' >&2; exit 1; }
+          [[ -S /var/run/docker.sock ]] \
+            || { echo 'The local Unix Docker socket is absent.' >&2; exit 1; }
+          [[ $(docker version --format '{{.Server.Os}}/{{.Server.Arch}}') == "$PLATFORM" ]] \
+            || { echo "Docker daemon platform does not match $PLATFORM." >&2; exit 1; }
+
+          install -d -m 0700 linux-image
+          runner_evidence="linux-image/${ARTIFACT_NAME}-${ARCH}.runner-environment.txt"
+          {
+            printf 'ImageOS=%s\n' "${ImageOS:-}"
+            printf 'ImageVersion=%s\n' "${ImageVersion:-}"
+            printf 'uname:\n'
+            uname -a
+            printf 'docker-client:\n'
+            docker version --format '{{.Client.Os}}/{{.Client.Arch}} {{.Client.Version}}'
+            printf 'docker-server:\n'
+            docker version --format '{{.Server.Os}}/{{.Server.Arch}} {{.Server.Version}}'
+            printf 'buildx:\n'
+            docker buildx version
+            printf 'cgroup:\n'
+            cat /proc/1/cgroup
+          } > "$runner_evidence"
+          chmod 0600 "$runner_evidence"
+          [[ -f $runner_evidence && ! -L $runner_evidence ]] \
+            || { echo 'Runner evidence is not a regular file.' >&2; exit 1; }
+
+      - name: Test host-gate evidence packager
+        run: sudo "$GITHUB_WORKSPACE/tests/Integration/ControlPlaneRuntimeFence/package-host-gate-evidence-test.sh"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Verify source provenance
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: docker/verify-source-provenance.sh "$DOCKERFILE"
+
+      - name: Prepare OCI evidence directory
+        run: mkdir -p linux-image
+
+      - name: Build local OCI archive
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: ${{ inputs.dockerfile }}
+          labels: |
+            io.coolify.release-run-attempt=${{ github.run_attempt }}
+            io.coolify.release-run-id=${{ github.run_id }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ inputs.semantic_version || github.sha }}
+          outputs: type=oci,dest=linux-image/${{ inputs.artifact_name }}-${{ matrix.arch }}.oci.tar,name=local/${{ inputs.artifact_name }}:${{ github.sha }}-${{ matrix.arch }},oci-mediatypes=true
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          push: false
+          sbom: false
+
+      - name: Resolve native child digest
+        env:
+          ARCH: ${{ matrix.arch }}
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+          OCI_ARCH: ${{ matrix.oci_arch }}
+        run: |
+          set -eu
+          archive="linux-image/${ARTIFACT_NAME}-${ARCH}.oci.tar"
+          layout="linux-image/layout-${ARCH}"
+          mkdir -p "$layout"
+          tar -xf "$archive" -C "$layout"
+          child_digest="$(jq -er --arg arch "$OCI_ARCH" '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch)] | if length == 1 then .[0].digest else error("expected one native manifest") end' "$layout/index.json")"
+          printf '%s' "$child_digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          child_blob="$layout/blobs/sha256/${child_digest#sha256:}"
+          test -f "$child_blob"
+          printf '%s  %s\n' "${child_digest#sha256:}" "$child_blob" | sha256sum --check --strict -
+          {
+            printf 'CHILD_DIGEST=%s\n' "$child_digest"
+            printf 'ARCHIVE_SHA256=%s\n' "$(sha256sum "$archive" | awk '{print $1}')"
+          } > "linux-image/${ARTIFACT_NAME}-${ARCH}.candidate.env"
+
+      - name: Generate SPDX SBOM from the local OCI archive
+        id: sbom
+        continue-on-error: true
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          artifact-name: ${{ inputs.artifact_name }}-${{ matrix.arch }}-${{ github.sha }}.spdx.json
+          format: spdx-json
+          image: oci-archive:linux-image/${{ inputs.artifact_name }}-${{ matrix.arch }}.oci.tar
+          output-file: linux-image/${{ inputs.artifact_name }}-${{ matrix.arch }}.sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Scan local OCI for high and critical vulnerabilities
+        id: vulnerability
+        if: always()
+        continue-on-error: true
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          fail-build: true
+          image: oci-archive:linux-image/${{ inputs.artifact_name }}-${{ matrix.arch }}.oci.tar
+          only-fixed: false
+          output-file: linux-image/${{ inputs.artifact_name }}-${{ matrix.arch }}.vulnerabilities.json
+          output-format: json
+          severity-cutoff: high
+
+      - name: Scan local OCI for secrets
+        id: secret
+        if: always()
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          exit-code: '1'
+          format: json
+          input: linux-image/${{ inputs.artifact_name }}-${{ matrix.arch }}.oci.tar
+          output: linux-image/${{ inputs.artifact_name }}-${{ matrix.arch }}.secrets.json
+          scan-type: image
+          scanners: secret
+
+      - name: Enforce local supply-chain gates
+        if: always()
+        env:
+          SBOM_OUTCOME: ${{ steps.sbom.outcome }}
+          SECRET_OUTCOME: ${{ steps.secret.outcome }}
+          VULNERABILITY_OUTCOME: ${{ steps.vulnerability.outcome }}
+        run: |
+          set -eu
+          [ "$SBOM_OUTCOME" = success ]
+          [ "$VULNERABILITY_OUTCOME" = success ]
+          [ "$SECRET_OUTCOME" = success ]
+
+      - name: Verify the exact testing-host OCI archive and runtime
+        if: ${{ inputs.release_kind == 'testing-host' }}
+        env:
+          ARCH: ${{ matrix.arch }}
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -eu
+          archive="linux-image/${ARTIFACT_NAME}-${ARCH}.oci.tar"
+          candidate="linux-image/${ARTIFACT_NAME}-${ARCH}.candidate.env"
+          image="local/${ARTIFACT_NAME}:${GITHUB_SHA}-${ARCH}-runtime"
+          archive_sha256="$(sed -n 's/^ARCHIVE_SHA256=//p' "$candidate")"
+          child_digest="$(sed -n 's/^CHILD_DIGEST=//p' "$candidate")"
+          printf '%s' "$archive_sha256" | grep -Eq '^[0-9a-f]{64}$'
+          printf '%s' "$child_digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          OCI_ARCHIVE="$archive" \
+            OCI_ARCHIVE_SHA256="$archive_sha256" \
+            OCI_CHILD_DIGEST="$child_digest" \
+            OCI_IMAGE="$image" \
+            OCI_PLATFORM="$PLATFORM" \
+            tests/Integration/VerifyOciArchiveImage.sh
+          TESTING_HOST_IMAGE="$image" tests/Integration/TestingHostImageTest.sh
+
+      - name: Run passive control-plane runtime gate
+        if: inputs.release_kind == 'production' && matrix.arch == 'amd64'
+        env:
+          ARCH: ${{ matrix.arch }}
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -eu
+          archive="linux-image/${ARTIFACT_NAME}-${ARCH}.oci.tar"
+          candidate="linux-image/${ARTIFACT_NAME}-${ARCH}.candidate.env"
+          image="local/${ARTIFACT_NAME}:${GITHUB_SHA}-${ARCH}-runtime"
+          archive_sha256="$(sed -n 's/^ARCHIVE_SHA256=//p' "$candidate")"
+          child_digest="$(sed -n 's/^CHILD_DIGEST=//p' "$candidate")"
+          printf '%s' "$archive_sha256" | grep -Eq '^[0-9a-f]{64}$'
+          printf '%s' "$child_digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          OCI_ARCHIVE="$archive" \
+            OCI_ARCHIVE_SHA256="$archive_sha256" \
+            OCI_CHILD_DIGEST="$child_digest" \
+            OCI_IMAGE="$image" \
+            OCI_PLATFORM="$PLATFORM" \
+            tests/Integration/VerifyOciArchiveImage.sh
+          PREFLIGHT_IMAGE="$image" tests/Integration/PassiveControlPlaneImageTest.sh
+
+      - name: Install registry client for exact production host gate
+        if: inputs.release_kind == 'production' && matrix.arch == 'amd64'
+        uses: regclient/actions/regctl-installer@1b705e32d40851370799ea5814e83d0a5f6a70dc # v0.1.0
+        with:
+          release: v0.11.5
+
+      - name: Verify registry client bytes for exact production host gate
+        if: inputs.release_kind == 'production' && matrix.arch == 'amd64'
+        run: |
+          set -eu
+          printf '%s  %s\n' c93aa7638749f5aaac1a8e01787321889c78f0101809bb2880343478d0ba0467 "$(command -v regctl)" | sha256sum --check --strict -
+
+      - name: Run native systemd host gate against exact OCI child
+        id: production-host-gate
+        if: inputs.release_kind == 'production' && matrix.arch == 'amd64'
+        continue-on-error: true
+        env:
+          ARCH: ${{ matrix.arch }}
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+
+          readonly evidence_directory="$RUNNER_TEMP/control-plane-runtime-fence-native-amd64-evidence"
+          readonly exited_operation="runtime-fence-host-exited-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          readonly full_operation="runtime-fence-host-github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          readonly host_build_script=tests/Integration/ControlPlaneRuntimeFence/build-systemd-ubuntu24-image.sh
+          readonly host_acceptance_script=tests/Integration/ControlPlaneRuntimeFence/linux-host-acceptance.sh
+          readonly local_registry_image='docker.io/library/registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373'
+          # Docker records the official-image RepoDigest as "traefik@…", not
+          # "docker.io/library/traefik@…". Keep this literal aligned with the
+          # value attested below and pass the same immutable reference onward.
+          readonly traefik_source='traefik@sha256:34d5089d0b414945342848518b383f11f5b3a645504ed87b77ffeb9d683d0e48'
+          readonly registry_container="coolify-runtime-fence-exact-oci-registry-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          fail() {
+            printf 'CONTROL_PLANE_RUNTIME_FENCE_CI_FAILURE %s\n' "$1" >&2
+            exit 1
+          }
+
+          candidate_value() {
+            local key=$1 count value
+
+            count="$(grep -E -c "^${key}=" "$candidate" || true)"
+            [[ $count == 1 ]] || fail "candidate metadata does not contain exactly one $key"
+            value="$(sed -n "s/^${key}=//p" "$candidate")"
+            [[ -n $value && $value != *$'\r'* && $value != *$'\n'* ]] \
+              || fail "candidate metadata has an unsafe $key"
+            printf '%s' "$value"
+          }
+
+          local_repo_digest() {
+            local reference=$1 candidate_reference
+
+            docker pull --platform linux/amd64 "$reference" >/dev/null
+            while IFS= read -r candidate_reference; do
+              [[ $candidate_reference == "$reference" ]] && break
+            done < <(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$reference")
+            [[ ${candidate_reference:-} == "$reference" ]] \
+              || fail "local registry did not retain the exact immutable RepoDigest: $reference"
+            docker image inspect "$reference" >/dev/null
+            printf '%s' "$reference"
+          }
+
+          cleanup() {
+            local status=$?
+
+            docker rm -f "$registry_container" >/dev/null 2>&1 || true
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          [[ $GITHUB_EVENT_NAME == push && $GITHUB_REF == refs/heads/v4.x ]] \
+            || fail 'the privileged production host gate requires a push to refs/heads/v4.x'
+          [[ $PLATFORM == linux/amd64 ]] || fail 'the production host gate requires linux/amd64'
+
+          archive="linux-image/${ARTIFACT_NAME}-${ARCH}.oci.tar"
+          candidate="linux-image/${ARTIFACT_NAME}-${ARCH}.candidate.env"
+          image="local/${ARTIFACT_NAME}:${GITHUB_SHA}-${ARCH}-runtime"
+          [[ -f $archive && ! -L $archive && -f $candidate && ! -L $candidate ]] \
+            || fail 'the verified production OCI archive or candidate metadata is unsafe'
+          archive_sha256="$(candidate_value ARCHIVE_SHA256)"
+          child_digest="$(candidate_value CHILD_DIGEST)"
+          [[ $archive_sha256 =~ ^[a-f0-9]{64}$ && $child_digest =~ ^sha256:[a-f0-9]{64}$ ]] \
+            || fail 'the verified production OCI metadata is malformed'
+          [[ $(sha256sum "$archive" | awk '{print $1}') == "$archive_sha256" ]] \
+            || fail 'the production OCI archive changed after exact runtime verification'
+          [[ $(docker image inspect --format '{{.Id}}' "$image") =~ ^sha256:[a-f0-9]{64}$ ]] \
+            || fail 'VerifyOciArchiveImage did not retain the exact loaded release image'
+
+          install -d -m 0700 "$evidence_directory"
+          host_output="$(mktemp)"
+          CONTROL_PLANE_RUNTIME_HOST_IMAGE_BUILD_MODE=loopback-registry \
+          CONTROL_PLANE_RUNTIME_BUILD_CA_FILE=/etc/ssl/certs/ca-certificates.crt \
+            "$host_build_script" "coolify-runtime-fence/systemd-host:${GITHUB_SHA}" | tee "$host_output"
+          mapfile -t host_references < <(sed -n 's/^CONTROL_PLANE_RUNTIME_HOST_IMAGE=//p' "$host_output")
+          rm -f -- "$host_output"
+          [[ ${#host_references[@]} == 1 \
+            && ${host_references[0]} =~ ^127\.0\.0\.1:[1-9][0-9]{0,4}/[A-Za-z0-9._/-]+@sha256:[a-f0-9]{64}$ ]] \
+            || fail 'the systemd host image build did not return exactly one local immutable RepoDigest'
+          readonly host_image=${host_references[0]}
+
+          CONTROL_PLANE_RUNTIME_HOST_GATE_EXECUTE=1 \
+          CONTROL_PLANE_RUNTIME_HOST_GATE_EVIDENCE_DIRECTORY="$evidence_directory" \
+          CONTROL_PLANE_RUNTIME_HOST_GATE_OPERATION="$exited_operation" \
+          CONTROL_PLANE_RUNTIME_HOST_IMAGE="$host_image" \
+            "$host_acceptance_script" --test-exited-container-evidence
+
+          docker pull "$local_registry_image" >/dev/null
+          docker run --detach --pull never --name "$registry_container" \
+            --tmpfs /var/lib/registry:rw,mode=0700 \
+            --publish 127.0.0.1::5000 "$local_registry_image" >/dev/null
+          registry_binding="$(docker port "$registry_container" 5000/tcp)"
+          [[ $registry_binding =~ ^127\.0\.0\.1:([1-9][0-9]{0,4})$ ]] \
+            || fail 'the exact-OCI local registry is not bound only to loopback'
+          local_registry="127.0.0.1:${BASH_REMATCH[1]}"
+          for _ in {1..30}; do
+            curl --fail --silent --show-error --max-time 2 "http://${local_registry}/v2/" >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl --fail --silent --show-error --max-time 2 "http://${local_registry}/v2/" >/dev/null \
+            || fail 'the exact-OCI local registry did not become ready'
+          regctl registry set "$local_registry" --tls disabled
+
+          web_tag="${local_registry}/coolify-control-plane-web:${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          regctl image import "$web_tag" "$archive"
+          [[ $(regctl image digest "$web_tag") == "$child_digest" ]] \
+            || fail 'loopback registry rewrote or did not retain the verified OCI child digest'
+          web_image="$(local_repo_digest "${web_tag%:*}@${child_digest}")"
+          [[ $(docker image inspect --format '{{.Id}}' "$web_image") == "$(docker image inspect --format '{{.Id}}' "$image")" \
+            && $(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$web_image") == linux/amd64 ]] \
+            || fail 'the loopback RepoDigest is not the exact loaded production OCI image'
+
+          docker pull --platform linux/amd64 "$traefik_source" >/dev/null
+          docker image inspect "$traefik_source" >/dev/null
+          docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$traefik_source" \
+            | grep -F -x "$traefik_source" >/dev/null
+          [[ $(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$traefik_source") == linux/amd64 ]] \
+            || fail 'the pinned Traefik v3.6.13 platform digest is not linux/amd64'
+          docker run --rm --pull never --platform linux/amd64 --entrypoint traefik "$traefik_source" version \
+            | grep -F -x 'Version: 3.6.13' >/dev/null
+
+          CONTROL_PLANE_RUNTIME_HOST_GATE_EXECUTE=1 \
+          CONTROL_PLANE_RUNTIME_HOST_GATE_EVIDENCE_DIRECTORY="$evidence_directory" \
+          CONTROL_PLANE_RUNTIME_HOST_GATE_OPERATION="$full_operation" \
+          CONTROL_PLANE_RUNTIME_HOST_IMAGE="$host_image" \
+          CONTROL_PLANE_RUNTIME_PROXY_IMAGE="$traefik_source" \
+          CONTROL_PLANE_RUNTIME_WEB_A_IMAGE="$web_image" \
+          CONTROL_PLANE_RUNTIME_WEB_B_IMAGE="$web_image" \
+            "$host_acceptance_script"
+
+      - name: Package sanitized production host-gate evidence
+        id: package-production-host-gate-evidence
+        if: always() && inputs.release_kind == 'production' && matrix.arch == 'amd64'
+        continue-on-error: true
+        env:
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+
+          readonly evidence_directory="$RUNNER_TEMP/control-plane-runtime-fence-native-amd64-evidence"
+          readonly exited_operation="runtime-fence-host-exited-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          readonly full_operation="runtime-fence-host-github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          readonly package_directory="$GITHUB_WORKSPACE/linux-image/host-gate-evidence"
+          package_count=0
+          package_failure_count=0
+          install -d -m 0700 "$package_directory"
+          for mode_and_operation in "exited:$exited_operation" "full:$full_operation"; do
+            mode=${mode_and_operation%%:*}
+            operation=${mode_and_operation#*:}
+            operation_directory="$evidence_directory/$operation"
+            output="$package_directory/${ARTIFACT_NAME}-${operation}.tar"
+            if [[ ! -d $operation_directory || -L $operation_directory ]]; then
+              echo "Host-gate evidence operation is absent or unsafe: $operation_directory" >&2
+              package_failure_count=$((package_failure_count + 1))
+              continue
+            fi
+            if ! sudo "$GITHUB_WORKSPACE/tests/Integration/ControlPlaneRuntimeFence/package-host-gate-evidence.sh" \
+              --mode "$mode" "$operation_directory" "$operation" "$output"; then
+              package_failure_count=$((package_failure_count + 1))
+              continue
+            fi
+            if ! sudo chown --no-dereference "$(id -u):$(id -g)" "$output" \
+              || [[ ! -f $output || -L $output ]]; then
+              echo "Sanitized host evidence is unsafe: $output" >&2
+              package_failure_count=$((package_failure_count + 1))
+              continue
+            fi
+            package_count=$((package_count + 1))
+          done
+          printf 'package_count=%s\n' "$package_count" >> "$GITHUB_OUTPUT"
+          printf 'package_failure_count=%s\n' "$package_failure_count" >> "$GITHUB_OUTPUT"
+          [[ $package_failure_count -eq 0 ]] \
+            || { echo "Host-gate evidence packaging failed independently for $package_failure_count operation(s)." >&2; exit 1; }
+
+      - name: Upload sanitized production host-gate evidence
+        id: upload-production-host-gate-evidence
+        if: always() && inputs.release_kind == 'production' && matrix.arch == 'amd64'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: control-plane-runtime-fence-native-amd64-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            linux-image/host-gate-evidence/${{ inputs.artifact_name }}-runtime-fence-host-exited-${{ github.run_id }}-${{ github.run_attempt }}.tar
+            linux-image/host-gate-evidence/${{ inputs.artifact_name }}-runtime-fence-host-github-${{ github.run_id }}-${{ github.run_attempt }}.tar
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Require native production host-gate success
+        if: always() && inputs.release_kind == 'production' && matrix.arch == 'amd64'
+        env:
+          EVIDENCE_ARTIFACT_ID: ${{ steps.upload-production-host-gate-evidence.outputs.artifact-id }}
+          HOST_GATE_OUTCOME: ${{ steps.production-host-gate.outcome }}
+          PACKAGE_COUNT: ${{ steps.package-production-host-gate-evidence.outputs.package_count }}
+          PACKAGE_FAILURE_COUNT: ${{ steps.package-production-host-gate-evidence.outputs.package_failure_count }}
+          PACKAGE_OUTCOME: ${{ steps.package-production-host-gate-evidence.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.upload-production-host-gate-evidence.outcome }}
+        run: |
+          set -Eeuo pipefail
+          [[ $HOST_GATE_OUTCOME == success ]] \
+            || { echo "Native production host gate did not succeed: $HOST_GATE_OUTCOME" >&2; exit 1; }
+          [[ $PACKAGE_OUTCOME == success && $PACKAGE_COUNT == 2 && $PACKAGE_FAILURE_COUNT == 0 ]] \
+            || { echo "Host-gate evidence packages are incomplete: outcome=$PACKAGE_OUTCOME count=$PACKAGE_COUNT failures=$PACKAGE_FAILURE_COUNT" >&2; exit 1; }
+          [[ $UPLOAD_OUTCOME == success && -n $EVIDENCE_ARTIFACT_ID ]] \
+            || { echo "Host-gate evidence artifact was not durably uploaded: outcome=$UPLOAD_OUTCOME artifact_id=$EVIDENCE_ARTIFACT_ID" >&2; exit 1; }
+
+      - name: Verify retained OCI evidence files
+        if: success()
+        env:
+          ARCH: ${{ matrix.arch }}
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+        run: |
+          set -eu
+          runner_evidence="linux-image/${ARTIFACT_NAME}-${ARCH}.runner-environment.txt"
+          [[ -f $runner_evidence && ! -L $runner_evidence ]] \
+            || { echo 'Runner evidence is not a regular file.' >&2; exit 1; }
+
+      - name: Retain gated OCI evidence
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          compression-level: 0
+          if-no-files-found: error
+          name: linux-image-${{ inputs.artifact_name }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.arch }}
+          path: |
+            linux-image/${{ inputs.artifact_name }}-${{ matrix.arch }}.oci.tar
+            linux-image/${{ inputs.artifact_name }}-${{ matrix.arch }}.candidate.env
+            linux-image/${{ inputs.artifact_name }}-${{ matrix.arch }}.sbom.spdx.json
+            linux-image/${{ inputs.artifact_name }}-${{ matrix.arch }}.vulnerabilities.json
+            linux-image/${{ inputs.artifact_name }}-${{ matrix.arch }}.secrets.json
+            linux-image/${{ inputs.artifact_name }}-${{ matrix.arch }}.runner-environment.txt
+          retention-days: 7
+
+  stage-candidates:
+    name: Stage verified Linux candidates
+    needs: [validate-inputs, build-and-scan]
+    if: ${{ ! inputs.validate_only }}
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-24.04
+    outputs:
+      amd64_digest: ${{ steps.stage.outputs.amd64_digest }}
+      arm64_digest: ${{ steps.stage.outputs.arm64_digest }}
+      index_digest: ${{ steps.stage.outputs.index_digest }}
+      run_tag: ${{ needs.validate-inputs.outputs.run_tag }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download gated OCI evidence
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          merge-multiple: true
+          path: candidate-input
+          pattern: linux-image-${{ inputs.artifact_name }}-${{ github.run_id }}-${{ github.run_attempt }}-*
+
+      - name: Install registry client
+        uses: regclient/actions/regctl-installer@1b705e32d40851370799ea5814e83d0a5f6a70dc # v0.1.0
+        with:
+          release: v0.11.5
+
+      - name: Verify registry client bytes
+        run: |
+          set -eu
+          printf '%s  %s\n' c93aa7638749f5aaac1a8e01787321889c78f0101809bb2880343478d0ba0467 "$(command -v regctl)" | sha256sum --check --strict -
+
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          password: ${{ github.token }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+
+      - name: Stage candidates by verified digest
+        id: stage
+        env:
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+          CANDIDATE_REPOSITORY: ghcr.io/${{ inputs.candidate_repository }}
+          DOCKER_TARGET: docker.io/${{ inputs.target_repository }}
+          GHCR_TARGET: ghcr.io/${{ inputs.target_repository }}
+          RELEASE_KIND: ${{ inputs.release_kind }}
+          RUN_TAG: ${{ needs.validate-inputs.outputs.run_tag }}
+        run: |
+          set -eu
+          amd64_digest="$(sed -n 's/^CHILD_DIGEST=//p' "candidate-input/${ARTIFACT_NAME}-amd64.candidate.env")"
+          arm64_digest="$(sed -n 's/^CHILD_DIGEST=//p' "candidate-input/${ARTIFACT_NAME}-arm64.candidate.env")"
+          for digest in "$amd64_digest" "$arm64_digest"; do
+            printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          done
+
+          ensure_child() {
+            tag="$1"
+            archive="$2"
+            expected="$3"
+            existing="$(regctl image digest "$tag" 2>/dev/null || true)"
+            if [ -n "$existing" ]; then
+              [ "$existing" = "$expected" ]
+            else
+              regctl image import "$tag" "$archive"
+            fi
+            [ "$(regctl image digest "$tag")" = "$expected" ]
+          }
+
+          ensure_child "$CANDIDATE_REPOSITORY:${RUN_TAG}-amd64" "candidate-input/${ARTIFACT_NAME}-amd64.oci.tar" "$amd64_digest"
+          ensure_child "$CANDIDATE_REPOSITORY:${RUN_TAG}-arm64" "candidate-input/${ARTIFACT_NAME}-arm64.oci.tar" "$arm64_digest"
+
+          index_digest="$(regctl image digest "$CANDIDATE_REPOSITORY:$RUN_TAG" 2>/dev/null || true)"
+          if [ -n "$index_digest" ]; then
+            scripts/publish-linux-image.sh verify-index "$CANDIDATE_REPOSITORY" "$index_digest" "$amd64_digest" "$arm64_digest"
+          else
+            regctl index create "$CANDIDATE_REPOSITORY:$RUN_TAG" --ref "$CANDIDATE_REPOSITORY@$amd64_digest" --ref "$CANDIDATE_REPOSITORY@$arm64_digest"
+            index_digest="$(regctl image digest "$CANDIDATE_REPOSITORY:$RUN_TAG")"
+            scripts/publish-linux-image.sh verify-index "$CANDIDATE_REPOSITORY" "$index_digest" "$amd64_digest" "$arm64_digest"
+          fi
+
+          scripts/publish-linux-image.sh ensure-tag "$CANDIDATE_REPOSITORY" "$GHCR_TARGET" "quarantine-$RUN_TAG" "$index_digest" "$amd64_digest" "$arm64_digest"
+          scripts/publish-linux-image.sh ensure-tag "$CANDIDATE_REPOSITORY" "$DOCKER_TARGET" "quarantine-$RUN_TAG" "$index_digest" "$amd64_digest" "$arm64_digest"
+
+          mkdir -p candidate-binding
+          jq -n \
+            --arg amd64 "$amd64_digest" \
+            --arg arm64 "$arm64_digest" \
+            --arg index "$index_digest" \
+            --arg kind "$RELEASE_KIND" \
+            --arg runTag "$RUN_TAG" \
+            --arg source "$GITHUB_SHA" \
+            '{childDigest: {amd64: $amd64, arm64: $arm64}, indexDigest: $index, releaseKind: $kind, runTag: $runTag, sourceDigest: $source}' \
+            > candidate-binding/supply-chain.json
+          {
+            printf 'amd64_digest=%s\n' "$amd64_digest"
+            printf 'arm64_digest=%s\n' "$arm64_digest"
+            printf 'index_digest=%s\n' "$index_digest"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Retain candidate digest binding
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          if-no-files-found: error
+          name: linux-image-binding-${{ inputs.artifact_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: candidate-binding/
+          retention-days: 90
+
+  attest-and-verify:
+    name: Attest and verify candidate digests
+    needs: stage-candidates
+    if: ${{ ! inputs.validate_only }}
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    runs-on: ubuntu-24.04
+    env:
+      DOCKER_TARGET: docker.io/${{ inputs.target_repository }}
+      GHCR_TARGET: ghcr.io/${{ inputs.target_repository }}
+    steps:
+      - name: Download child SBOMs
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          merge-multiple: true
+          path: attestation-input
+          pattern: linux-image-${{ inputs.artifact_name }}-${{ github.run_id }}-${{ github.run_attempt }}-*
+
+      - name: Download index digest binding
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: linux-image-binding-${{ inputs.artifact_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: attestation-input
+
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          password: ${{ github.token }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+
+      - name: Attest GHCR amd64 child SBOM
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          push-to-registry: true
+          sbom-path: attestation-input/${{ inputs.artifact_name }}-amd64.sbom.spdx.json
+          subject-digest: ${{ needs.stage-candidates.outputs.amd64_digest }}
+          subject-name: ${{ env.GHCR_TARGET }}
+
+      - name: Attest GHCR arm64 child SBOM
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          push-to-registry: true
+          sbom-path: attestation-input/${{ inputs.artifact_name }}-arm64.sbom.spdx.json
+          subject-digest: ${{ needs.stage-candidates.outputs.arm64_digest }}
+          subject-name: ${{ env.GHCR_TARGET }}
+
+      - name: Attest GHCR index binding
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          predicate-path: attestation-input/supply-chain.json
+          predicate-type: https://coolify.io/attestations/image-supply-chain/v1
+          push-to-registry: true
+          subject-digest: ${{ needs.stage-candidates.outputs.index_digest }}
+          subject-name: ${{ env.GHCR_TARGET }}
+
+      - name: Attest Docker Hub amd64 child SBOM
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          push-to-registry: true
+          sbom-path: attestation-input/${{ inputs.artifact_name }}-amd64.sbom.spdx.json
+          subject-digest: ${{ needs.stage-candidates.outputs.amd64_digest }}
+          subject-name: ${{ env.DOCKER_TARGET }}
+
+      - name: Attest Docker Hub arm64 child SBOM
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          push-to-registry: true
+          sbom-path: attestation-input/${{ inputs.artifact_name }}-arm64.sbom.spdx.json
+          subject-digest: ${{ needs.stage-candidates.outputs.arm64_digest }}
+          subject-name: ${{ env.DOCKER_TARGET }}
+
+      - name: Attest Docker Hub index binding
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          predicate-path: attestation-input/supply-chain.json
+          predicate-type: https://coolify.io/attestations/image-supply-chain/v1
+          push-to-registry: true
+          subject-digest: ${{ needs.stage-candidates.outputs.index_digest }}
+          subject-name: ${{ env.DOCKER_TARGET }}
+
+      - name: Install pinned GitHub CLI verifier
+        id: gh_cli
+        run: |
+          set -eu
+          archive="$RUNNER_TEMP/gh_2.96.0_linux_amd64.tar.gz"
+          curl -fsSLo "$archive" https://github.com/cli/cli/releases/download/v2.96.0/gh_2.96.0_linux_amd64.tar.gz
+          printf '%s  %s\n' 83d5c2ccad5498f58bf6368acb1ab32588cf43ab3a4b1c301bf36328b1c8bd60 "$archive" | sha256sum --check --strict -
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          install -Dm0755 "$RUNNER_TEMP/gh_2.96.0_linux_amd64/bin/gh" "$RUNNER_TEMP/pinned-gh/bin/gh"
+          printf 'path=%s\n' "$RUNNER_TEMP/pinned-gh/bin/gh" >> "$GITHUB_OUTPUT"
+
+      - name: Verify both registry attestations
+        env:
+          AMD64_DIGEST: ${{ needs.stage-candidates.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ needs.stage-candidates.outputs.arm64_digest }}
+          GH_CLI: ${{ steps.gh_cli.outputs.path }}
+          GH_TOKEN: ${{ github.token }}
+          INDEX_DIGEST: ${{ needs.stage-candidates.outputs.index_digest }}
+        run: |
+          set -eu
+          for repository in "$GHCR_TARGET" "$DOCKER_TARGET"; do
+            for child_digest in "$AMD64_DIGEST" "$ARM64_DIGEST"; do
+              "$GH_CLI" attestation verify "oci://${repository}@${child_digest}" \
+                --bundle-from-oci \
+                --predicate-type https://spdx.dev/Document/v2.3 \
+                --repo "$GITHUB_REPOSITORY" \
+                --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/publish-linux-image.yml" \
+                --source-digest "$GITHUB_SHA" \
+                --source-ref "$GITHUB_REF"
+            done
+            "$GH_CLI" attestation verify "oci://${repository}@${INDEX_DIGEST}" \
+              --bundle-from-oci \
+              --predicate-type https://coolify.io/attestations/image-supply-chain/v1 \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/publish-linux-image.yml" \
+              --source-digest "$GITHUB_SHA" \
+              --source-ref "$GITHUB_REF"
+          done
+
+  release:
+    name: Publish immutable tags and aliases
+    needs: [stage-candidates, attest-and-verify]
+    if: ${{ ! inputs.validate_only }}
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-24.04
+    outputs:
+      docker_image: ${{ steps.references.outputs.docker_image }}
+      ghcr_image: ${{ steps.references.outputs.ghcr_image }}
+      index_digest: ${{ needs.stage-candidates.outputs.index_digest }}
+    env:
+      AMD64_DIGEST: ${{ needs.stage-candidates.outputs.amd64_digest }}
+      ARM64_DIGEST: ${{ needs.stage-candidates.outputs.arm64_digest }}
+      DOCKER_TARGET: docker.io/${{ inputs.target_repository }}
+      GHCR_TARGET: ghcr.io/${{ inputs.target_repository }}
+      INDEX_DIGEST: ${{ needs.stage-candidates.outputs.index_digest }}
+      RUN_TAG: ${{ needs.stage-candidates.outputs.run_tag }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install registry client
+        uses: regclient/actions/regctl-installer@1b705e32d40851370799ea5814e83d0a5f6a70dc # v0.1.0
+        with:
+          release: v0.11.5
+
+      - name: Verify registry client bytes
+        run: |
+          set -eu
+          printf '%s  %s\n' c93aa7638749f5aaac1a8e01787321889c78f0101809bb2880343478d0ba0467 "$(command -v regctl)" | sha256sum --check --strict -
+
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          password: ${{ github.token }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+
+      - name: Create or verify immutable run tags
+        run: |
+          set -eu
+          scripts/publish-linux-image.sh ensure-pair "$GHCR_TARGET" "$GHCR_TARGET" "$DOCKER_TARGET" "$RUN_TAG" "$INDEX_DIGEST" "$AMD64_DIGEST" "$ARM64_DIGEST"
+
+      - name: Publish semantic and latest aliases atomically
+        if: ${{ inputs.semantic_version != '' || inputs.publish_latest }}
+        env:
+          PUBLISH_LATEST: ${{ inputs.publish_latest }}
+          SEMANTIC_VERSION: ${{ inputs.semantic_version }}
+        run: |
+          set -Eeuo pipefail
+
+          alias_digest() {
+            local repository="$1"
+            local tag="$2"
+
+            regctl image digest "${repository}:${tag}" 2>/dev/null || true
+          }
+
+          require_digest_or_empty() {
+            local digest="$1"
+            local alias_name="$2"
+
+            if [[ -n "$digest" && ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              printf 'Invalid prior digest for %s: %s\n' "$alias_name" "$digest" >&2
+              return 1
+            fi
+          }
+
+          verify_prior_alias() {
+            local repository="$1"
+            local tag="$2"
+            local digest="$3"
+
+            require_digest_or_empty "$digest" "${repository}:${tag}"
+            if [[ -n "$digest" ]]; then
+              [[ "$(regctl image digest "${repository}@${digest}")" == "$digest" ]]
+            fi
+          }
+
+          restore_alias_if_owned() {
+            local repository="$1"
+            local tag="$2"
+            local previous_digest="$3"
+            shift 3
+            local current_digest
+            local expected_digest
+            local owned_mutation=false
+
+            current_digest="$(alias_digest "$repository" "$tag")"
+            if [[ "$current_digest" == "$previous_digest" ]]; then
+              return 0
+            fi
+
+            for expected_digest in "$@"; do
+              if [[ -n "$expected_digest" && "$current_digest" == "$expected_digest" ]]; then
+                owned_mutation=true
+                break
+              fi
+            done
+
+            if [[ "$owned_mutation" != true ]]; then
+              printf 'Refusing to overwrite alias changed outside this release: %s:%s\n' "$repository" "$tag" >&2
+              return 1
+            fi
+
+            if [[ -n "$previous_digest" ]]; then
+              regctl image copy "${repository}@${previous_digest}" "${repository}:${tag}"
+            else
+              regctl tag delete --ignore-missing "${repository}:${tag}"
+            fi
+
+            [[ "$(alias_digest "$repository" "$tag")" == "$previous_digest" ]]
+          }
+
+          ghcr_semantic_before=''
+          docker_semantic_before=''
+          ghcr_latest_before=''
+          docker_latest_before=''
+          mutation_started=false
+          committed=false
+
+          compensate_aliases() {
+            local status=$?
+            local compensation_failed=false
+
+            trap - EXIT
+            if [[ "$committed" == true || "$mutation_started" != true || "$status" -eq 0 ]]; then
+              return "$status"
+            fi
+
+            if [[ "$PUBLISH_LATEST" == true ]]; then
+              restore_alias_if_owned "$DOCKER_TARGET" latest "$docker_latest_before" \
+                "$INDEX_DIGEST" "$ghcr_latest_before" "$docker_latest_before" \
+                || compensation_failed=true
+              restore_alias_if_owned "$GHCR_TARGET" latest "$ghcr_latest_before" \
+                "$INDEX_DIGEST" "$ghcr_latest_before" "$docker_latest_before" \
+                || compensation_failed=true
+            fi
+
+            if [[ -n "$SEMANTIC_VERSION" ]]; then
+              restore_alias_if_owned "$DOCKER_TARGET" "$SEMANTIC_VERSION" "$docker_semantic_before" \
+                "$INDEX_DIGEST" || compensation_failed=true
+              restore_alias_if_owned "$GHCR_TARGET" "$SEMANTIC_VERSION" "$ghcr_semantic_before" \
+                "$INDEX_DIGEST" || compensation_failed=true
+            fi
+
+            if [[ "$compensation_failed" == true ]]; then
+              printf 'Alias publication failed and compensation was incomplete.\n' >&2
+            fi
+
+            return "$status"
+          }
+          trap compensate_aliases EXIT
+
+          scripts/publish-linux-image.sh verify-index "$GHCR_TARGET" "$INDEX_DIGEST" "$AMD64_DIGEST" "$ARM64_DIGEST"
+          scripts/publish-linux-image.sh verify-index "$DOCKER_TARGET" "$INDEX_DIGEST" "$AMD64_DIGEST" "$ARM64_DIGEST"
+
+          if [[ -n "$SEMANTIC_VERSION" ]]; then
+            ghcr_semantic_before="$(alias_digest "$GHCR_TARGET" "$SEMANTIC_VERSION")"
+            docker_semantic_before="$(alias_digest "$DOCKER_TARGET" "$SEMANTIC_VERSION")"
+            verify_prior_alias "$GHCR_TARGET" "$SEMANTIC_VERSION" "$ghcr_semantic_before"
+            verify_prior_alias "$DOCKER_TARGET" "$SEMANTIC_VERSION" "$docker_semantic_before"
+            [[ -z "$ghcr_semantic_before" || "$ghcr_semantic_before" == "$INDEX_DIGEST" ]]
+            [[ -z "$docker_semantic_before" || "$docker_semantic_before" == "$INDEX_DIGEST" ]]
+          fi
+
+          if [[ "$PUBLISH_LATEST" == true ]]; then
+            ghcr_latest_before="$(alias_digest "$GHCR_TARGET" latest)"
+            docker_latest_before="$(alias_digest "$DOCKER_TARGET" latest)"
+            verify_prior_alias "$GHCR_TARGET" latest "$ghcr_latest_before"
+            verify_prior_alias "$DOCKER_TARGET" latest "$docker_latest_before"
+          fi
+
+          mutation_started=true
+          if [[ -n "$SEMANTIC_VERSION" ]]; then
+            scripts/publish-linux-image.sh ensure-pair "$GHCR_TARGET" "$GHCR_TARGET" "$DOCKER_TARGET" "$SEMANTIC_VERSION" "$INDEX_DIGEST" "$AMD64_DIGEST" "$ARM64_DIGEST"
+          fi
+
+          if [[ "$PUBLISH_LATEST" == true ]]; then
+            scripts/publish-linux-image.sh promote-latest "$GHCR_TARGET" "$DOCKER_TARGET" "$INDEX_DIGEST" "$AMD64_DIGEST" "$ARM64_DIGEST" "$GITHUB_RUN_ID"
+          fi
+
+          committed=true
+          trap - EXIT
+
+      - id: references
+        name: Record immutable image references
+        run: |
+          set -eu
+          {
+            printf 'ghcr_image=%s@%s\n' "$GHCR_TARGET" "$INDEX_DIGEST"
+            printf 'docker_image=%s@%s\n' "$DOCKER_TARGET" "$INDEX_DIGEST"
+          } >> "$GITHUB_OUTPUT"
+
+  cleanup:
+    name: Remove disposable candidate tags
+    needs: [validate-inputs, stage-candidates, attest-and-verify, release]
+    if: ${{ always() && ! inputs.validate_only }}
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-24.04
+    env:
+      CANDIDATE_REPOSITORY: ghcr.io/${{ inputs.candidate_repository }}
+      DOCKER_TARGET: docker.io/${{ inputs.target_repository }}
+      GHCR_TARGET: ghcr.io/${{ inputs.target_repository }}
+      RUN_TAG: ${{ needs.validate-inputs.outputs.run_tag }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install registry client
+        uses: regclient/actions/regctl-installer@1b705e32d40851370799ea5814e83d0a5f6a70dc # v0.1.0
+        with:
+          release: v0.11.5
+
+      - name: Verify registry client bytes
+        run: |
+          set -eu
+          printf '%s  %s\n' c93aa7638749f5aaac1a8e01787321889c78f0101809bb2880343478d0ba0467 "$(command -v regctl)" | sha256sum --check --strict -
+
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          password: ${{ github.token }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+
+      - name: Delete candidate and quarantine tags only
+        run: |
+          set -eu
+          printf '%s' "$RUN_TAG" | grep -Eq '^sha-[0-9a-f]{40}-run-[1-9][0-9]*-[1-9][0-9]*$'
+          scripts/publish-linux-image.sh cleanup-candidates "$CANDIDATE_REPOSITORY" "$GHCR_TARGET" "$RUN_TAG"
+          regctl tag delete --ignore-missing "$GHCR_TARGET:quarantine-$RUN_TAG"
+          regctl tag delete --ignore-missing "$DOCKER_TARGET:quarantine-$RUN_TAG"
