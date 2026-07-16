@@ -1,7 +1,11 @@
 <?php
 
+use App\Models\SharedEnvironmentVariable;
 use App\Models\User;
 use App\Policies\SharedEnvironmentVariablePolicy;
+use Tests\TestCase;
+
+uses(TestCase::class);
 
 it('allows any user to view any shared environment variables', function () {
     $user = Mockery::mock(User::class)->makePartial();
@@ -17,14 +21,10 @@ it('allows team member to view their team shared environment variable', function
 
     $user = Mockery::mock(User::class)->makePartial();
     $user->shouldReceive('getAttribute')->with('teams')->andReturn($teams);
-
-    $model = new class
-    {
-        public $team_id = 1;
-    };
+    $sharedEnvironmentVariable = new SharedEnvironmentVariable(['team_id' => 1]);
 
     $policy = new SharedEnvironmentVariablePolicy;
-    expect($policy->view($user, $model))->toBeTrue();
+    expect($policy->view($user, $sharedEnvironmentVariable))->toBeTrue();
 });
 
 it('denies non-team member to view shared environment variable', function () {
@@ -34,14 +34,10 @@ it('denies non-team member to view shared environment variable', function () {
 
     $user = Mockery::mock(User::class)->makePartial();
     $user->shouldReceive('getAttribute')->with('teams')->andReturn($teams);
-
-    $model = new class
-    {
-        public $team_id = 2;
-    };
+    $sharedEnvironmentVariable = new SharedEnvironmentVariable(['team_id' => 2]);
 
     $policy = new SharedEnvironmentVariablePolicy;
-    expect($policy->view($user, $model))->toBeFalse();
+    expect($policy->view($user, $sharedEnvironmentVariable))->toBeFalse();
 });
 
 it('allows admin to create shared environment variable', function () {
@@ -63,101 +59,69 @@ it('denies non-admin to create shared environment variable', function () {
 it('allows team admin to update shared environment variable', function () {
     $user = Mockery::mock(User::class)->makePartial();
     $user->shouldReceive('isAdminOfTeam')->with(1)->andReturn(true);
-
-    $model = new class
-    {
-        public $team_id = 1;
-    };
+    $sharedEnvironmentVariable = new SharedEnvironmentVariable(['team_id' => 1]);
 
     $policy = new SharedEnvironmentVariablePolicy;
-    expect($policy->update($user, $model))->toBeTrue();
+    expect($policy->update($user, $sharedEnvironmentVariable))->toBeTrue();
 });
 
 it('denies team member to update shared environment variable', function () {
     $user = Mockery::mock(User::class)->makePartial();
     $user->shouldReceive('isAdminOfTeam')->with(1)->andReturn(false);
-
-    $model = new class
-    {
-        public $team_id = 1;
-    };
+    $sharedEnvironmentVariable = new SharedEnvironmentVariable(['team_id' => 1]);
 
     $policy = new SharedEnvironmentVariablePolicy;
-    expect($policy->update($user, $model))->toBeFalse();
+    expect($policy->update($user, $sharedEnvironmentVariable))->toBeFalse();
 });
 
 it('allows team admin to delete shared environment variable', function () {
     $user = Mockery::mock(User::class)->makePartial();
     $user->shouldReceive('isAdminOfTeam')->with(1)->andReturn(true);
-
-    $model = new class
-    {
-        public $team_id = 1;
-    };
+    $sharedEnvironmentVariable = new SharedEnvironmentVariable(['team_id' => 1]);
 
     $policy = new SharedEnvironmentVariablePolicy;
-    expect($policy->delete($user, $model))->toBeTrue();
+    expect($policy->delete($user, $sharedEnvironmentVariable))->toBeTrue();
 });
 
 it('denies team member to delete shared environment variable', function () {
     $user = Mockery::mock(User::class)->makePartial();
     $user->shouldReceive('isAdminOfTeam')->with(1)->andReturn(false);
-
-    $model = new class
-    {
-        public $team_id = 1;
-    };
+    $sharedEnvironmentVariable = new SharedEnvironmentVariable(['team_id' => 1]);
 
     $policy = new SharedEnvironmentVariablePolicy;
-    expect($policy->delete($user, $model))->toBeFalse();
+    expect($policy->delete($user, $sharedEnvironmentVariable))->toBeFalse();
 });
 
 it('denies restore of shared environment variable', function () {
     $user = Mockery::mock(User::class)->makePartial();
-
-    $model = new class
-    {
-        public $team_id = 1;
-    };
+    $sharedEnvironmentVariable = new SharedEnvironmentVariable(['team_id' => 1]);
 
     $policy = new SharedEnvironmentVariablePolicy;
-    expect($policy->restore($user, $model))->toBeFalse();
+    expect($policy->restore($user, $sharedEnvironmentVariable))->toBeFalse();
 });
 
 it('denies force delete of shared environment variable', function () {
     $user = Mockery::mock(User::class)->makePartial();
-
-    $model = new class
-    {
-        public $team_id = 1;
-    };
+    $sharedEnvironmentVariable = new SharedEnvironmentVariable(['team_id' => 1]);
 
     $policy = new SharedEnvironmentVariablePolicy;
-    expect($policy->forceDelete($user, $model))->toBeFalse();
+    expect($policy->forceDelete($user, $sharedEnvironmentVariable))->toBeFalse();
 });
 
 it('allows team admin to manage environment', function () {
     $user = Mockery::mock(User::class)->makePartial();
     $user->shouldReceive('isAdminOfTeam')->with(1)->andReturn(true);
-
-    $model = new class
-    {
-        public $team_id = 1;
-    };
+    $sharedEnvironmentVariable = new SharedEnvironmentVariable(['team_id' => 1]);
 
     $policy = new SharedEnvironmentVariablePolicy;
-    expect($policy->manageEnvironment($user, $model))->toBeTrue();
+    expect($policy->manageEnvironment($user, $sharedEnvironmentVariable))->toBeTrue();
 });
 
 it('denies team member to manage environment', function () {
     $user = Mockery::mock(User::class)->makePartial();
     $user->shouldReceive('isAdminOfTeam')->with(1)->andReturn(false);
-
-    $model = new class
-    {
-        public $team_id = 1;
-    };
+    $sharedEnvironmentVariable = new SharedEnvironmentVariable(['team_id' => 1]);
 
     $policy = new SharedEnvironmentVariablePolicy;
-    expect($policy->manageEnvironment($user, $model))->toBeFalse();
+    expect($policy->manageEnvironment($user, $sharedEnvironmentVariable))->toBeFalse();
 });
