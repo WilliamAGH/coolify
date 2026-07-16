@@ -1,6 +1,5 @@
 <?php
 
-use App\Livewire\Project\Database\Import as DatabaseImport;
 use App\Livewire\Project\Service\Heading;
 use App\Models\Environment;
 use App\Models\InstanceSettings;
@@ -113,16 +112,15 @@ test('does not open service database backups route from another team', function 
 })->throws(NotFoundHttpException::class);
 
 test('does not resolve service database import component from another team', function () {
-    $component = app(DatabaseImport::class);
-    $component->parameters = [
+    $this->withoutExceptionHandling();
+
+    $this->get(route('project.service.database.import', [
         'project_uuid' => $this->projectA->uuid,
         'environment_uuid' => $this->environmentA->uuid,
         'service_uuid' => $this->otherService->uuid,
         'stack_service_uuid' => $this->otherServiceDatabase->uuid,
-    ];
-
-    $component->getContainers();
-})->throws(ModelNotFoundException::class);
+    ]));
+})->throws(NotFoundHttpException::class);
 
 test('service heading does not hydrate with another team service', function () {
     Livewire::test(Heading::class, ['service' => $this->otherService]);

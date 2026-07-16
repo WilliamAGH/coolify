@@ -1,10 +1,13 @@
 <?php
 
+use App\Actions\Proxy\CheckProxy;
+use App\Events\ServerValidated;
 use App\Livewire\Server\ValidateAndInstall;
 use App\Models\Server;
 use App\Models\Team;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Event;
 use Livewire\Livewire;
 
 uses(RefreshDatabase::class);
@@ -19,6 +22,10 @@ beforeEach(function () {
     $this->server = Server::factory()->create([
         'team_id' => $this->team->id,
     ]);
+});
+
+afterEach(function () {
+    CheckProxy::clearFake();
 });
 
 it('casts server_metadata as array', function () {
@@ -98,22 +105,32 @@ it('can overwrite server_metadata with new values', function () {
 });
 
 it('calls gatherServerMetadata during ValidateAndInstall when docker version is valid', function () {
-    $serverMock = Mockery::mock($this->server)->makePartial();
-    $serverMock->shouldReceive('isSwarm')->andReturn(false);
-    $serverMock->shouldReceive('validateDockerEngineVersion')->once()->andReturn('24.0.0');
-    $serverMock->shouldReceive('gatherServerMetadata')->once();
-    $serverMock->shouldReceive('isBuildServer')->andReturn(false);
+    Event::fake([ServerValidated::class]);
 
-    Livewire::test(ValidateAndInstall::class, ['server' => $serverMock])
-        ->call('validateDockerVersion');
+    $serverMock = Mockery::mock($this->server)->makePartial();
+    $serverMock->shouldReceive('isSwarm')->once()->andReturn(false);
+    $serverMock->shouldReceive('validateDockerEngineVersion')->once()->andReturn('24.0.0');
+    $serverMock->shouldReceive('update')->once()->with(['is_validating' => false])->andReturnTrue();
+    $serverMock->shouldReceive('gatherServerMetadata')->once();
+    CheckProxy::shouldRun()->once()->with($serverMock, true)->andReturnFalse();
+
+    $component = Livewire::test(ValidateAndInstall::class, ['server' => $this->server])->instance();
+    $component->server = $serverMock;
+    $component->validateDockerVersion();
+
+    Event::assertDispatched(ServerValidated::class, fn (ServerValidated $event) => $event->teamId === $this->team->id && $event->serverUuid === $this->server->uuid);
 });
 
 it('does not call gatherServerMetadata when docker version validation fails', function () {
     $serverMock = Mockery::mock($this->server)->makePartial();
-    $serverMock->shouldReceive('isSwarm')->andReturn(false);
+    $serverMock->shouldReceive('isSwarm')->once()->andReturn(false);
     $serverMock->shouldReceive('validateDockerEngineVersion')->once()->andReturn(false);
+    $serverMock->shouldReceive('update')->once()->andReturnTrue();
     $serverMock->shouldNotReceive('gatherServerMetadata');
 
-    Livewire::test(ValidateAndInstall::class, ['server' => $serverMock])
-        ->call('validateDockerVersion');
+    $component = Livewire::test(ValidateAndInstall::class, ['server' => $this->server])->instance();
+    $component->server = $serverMock;
+    $component->validateDockerVersion();
+
+    expect($component->error)->toContain('Minimum Docker Engine version');
 });

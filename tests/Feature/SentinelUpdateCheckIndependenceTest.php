@@ -13,6 +13,12 @@ uses(RefreshDatabase::class);
 
 beforeEach(function () {
     Queue::fake();
+    InstanceSettings::forceCreate([
+        'id' => 0,
+        'fqdn' => 'https://coolify.test',
+        'instance_timezone' => 'UTC',
+        'update_check_frequency' => '0 * * * *',
+    ]);
 
     // Create user (which automatically creates a team)
     $user = User::factory()->create();
@@ -36,7 +42,7 @@ afterEach(function () {
     Carbon::setTestNow(); // Reset frozen time
 });
 
-it('dispatches sentinel check hourly regardless of instance update_check_frequency setting', function () {
+it('dispatches a daily sentinel restart regardless of instance update_check_frequency setting', function () {
     // Set instance update_check_frequency to yearly (most infrequent option)
     $instanceSettings = InstanceSettings::first();
     $instanceSettings->update([
@@ -44,8 +50,8 @@ it('dispatches sentinel check hourly regardless of instance update_check_frequen
         'instance_timezone' => 'UTC',
     ]);
 
-    // Set time to top of any hour (sentinel should check every hour)
-    Carbon::setTestNow('2025-06-15 14:00:00'); // Random hour, not January 1st
+    // Sentinel restarts run daily at midnight, independently of update checks.
+    Carbon::setTestNow('2025-06-15 00:00:00'); // Not January 1st
 
     // Run ServerManagerJob
     $job = new ServerManagerJob;
@@ -57,7 +63,7 @@ it('dispatches sentinel check hourly regardless of instance update_check_frequen
     });
 });
 
-it('does not dispatch sentinel check when not at top of hour', function () {
+it('does not dispatch a sentinel restart outside the daily schedule', function () {
     // Set instance update_check_frequency to hourly (most frequent)
     $instanceSettings = InstanceSettings::first();
     $instanceSettings->update([
@@ -65,7 +71,7 @@ it('does not dispatch sentinel check when not at top of hour', function () {
         'instance_timezone' => 'UTC',
     ]);
 
-    // Set time to middle of the hour (sentinel check cron won't match)
+    // Set time to middle of the day (daily sentinel restart cron won't match)
     Carbon::setTestNow('2025-06-15 14:30:00'); // 30 minutes past the hour
 
     // Run ServerManagerJob
@@ -76,27 +82,27 @@ it('does not dispatch sentinel check when not at top of hour', function () {
     Queue::assertNotPushed(CheckAndStartSentinelJob::class);
 });
 
-it('dispatches sentinel check at every hour mark throughout the day', function () {
+it('dispatches a sentinel restart at every daily midnight', function () {
     $instanceSettings = InstanceSettings::first();
     $instanceSettings->update([
         'update_check_frequency' => '0 0 1 1 *', // Yearly
         'instance_timezone' => 'UTC',
     ]);
 
-    // Test multiple hours throughout a day
-    $hoursToTest = [0, 6, 12, 18, 23]; // Various hours of the day
+    // Test multiple daily boundaries.
+    $daysToTest = [15, 16, 17, 18, 19];
 
-    foreach ($hoursToTest as $hour) {
+    foreach ($daysToTest as $day) {
         Queue::fake(); // Reset queue for each test
 
-        Carbon::setTestNow("2025-06-15 {$hour}:00:00");
+        Carbon::setTestNow("2025-06-{$day} 00:00:00");
 
         $job = new ServerManagerJob;
         $job->handle();
 
         Queue::assertPushed(CheckAndStartSentinelJob::class, function ($job) {
             return $job->server->id === $this->server->id;
-        }, "Failed to dispatch sentinel check at hour {$hour}");
+        }, "Failed to dispatch sentinel restart on day {$day}");
     }
 });
 
@@ -111,13 +117,13 @@ it('respects server timezone when checking sentinel updates', function () {
         'instance_timezone' => 'UTC',
     ]);
 
-    // Set time to 17:00 UTC which is 12:00 PM EST (top of hour in server's timezone)
-    Carbon::setTestNow('2025-01-15 17:00:00');
+    // Set time to 05:00 UTC, which is midnight EST in the server's timezone.
+    Carbon::setTestNow('2025-01-15 05:00:00');
 
     $job = new ServerManagerJob;
     $job->handle();
 
-    // Should dispatch because it's top of hour in server's timezone (America/New_York)
+    // Should dispatch because it is midnight in the server's timezone (America/New_York).
     Queue::assertPushed(CheckAndStartSentinelJob::class, function ($job) {
         return $job->server->id === $this->server->id;
     });
@@ -135,7 +141,7 @@ it('does not dispatch sentinel check for servers without sentinel enabled', func
         'instance_timezone' => 'UTC',
     ]);
 
-    Carbon::setTestNow('2025-06-15 14:00:00');
+    Carbon::setTestNow('2025-06-15 00:00:00');
 
     $job = new ServerManagerJob;
     $job->handle();
@@ -168,7 +174,7 @@ it('handles multiple servers with different sentinel configurations', function (
         'instance_timezone' => 'UTC',
     ]);
 
-    Carbon::setTestNow('2025-06-15 14:00:00');
+    Carbon::setTestNow('2025-06-15 00:00:00');
 
     $job = new ServerManagerJob;
     $job->handle();

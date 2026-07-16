@@ -1,29 +1,53 @@
 <?php
 
-use App\Models\ScheduledDatabaseBackup;
+use App\Models\Environment;
+use App\Models\InstanceSettings;
+use App\Models\Project;
 use App\Models\ScheduledDatabaseBackupExecution;
 use App\Models\ScheduledTask;
 use App\Models\ScheduledTaskExecution;
+use App\Models\Server;
+use App\Models\StandaloneDocker;
 use App\Models\StandalonePostgresql;
 use App\Models\Team;
 use Carbon\Carbon;
+use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Notification;
+use Illuminate\Support\Facades\Queue;
 
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
-    // Freeze time for consistent testing
     Carbon::setTestNow('2025-01-15 12:00:00');
-
-    // Fake notifications to ensure none are sent
     Notification::fake();
+    Queue::fake();
+    Http::fake(['*' => Http::response([], 500)]);
+
+    $settings = InstanceSettings::query()->find(0) ?? new InstanceSettings;
+    $settings->forceFill([
+        'id' => 0,
+        'do_not_track' => true,
+    ]);
+    $settings->save();
 });
 
 afterEach(function () {
     Carbon::setTestNow();
+    Artisan::clearResolvedInstance('artisan');
 });
+
+function runStartupExecutionCleanup(): void
+{
+    $kernel = app(Kernel::class);
+
+    Artisan::shouldReceive('call')->once()->with('optimize:clear')->andReturn(0);
+    Artisan::shouldReceive('call')->once()->with('optimize')->andReturn(0);
+
+    expect($kernel->call('app:init'))->toBe(0);
+}
 
 test('app:init marks stuck scheduled task executions as failed', function () {
     // Create a team for the scheduled task
@@ -56,7 +80,7 @@ test('app:init marks stuck scheduled task executions as failed', function () {
     ]);
 
     // Run the app:init command
-    Artisan::call('app:init');
+    runStartupExecutionCleanup();
 
     // Refresh models from database
     $runningExecution1->refresh();
@@ -85,17 +109,27 @@ test('app:init marks stuck database backup executions as failed', function () {
     // Create a team for the scheduled backup
     $team = Team::factory()->create();
 
-    // Create a database
-    $database = StandalonePostgresql::factory()->create([
-        'team_id' => $team->id,
+    $server = Server::factory()->create(['team_id' => $team->id]);
+    $destination = StandaloneDocker::where('server_id', $server->id)->firstOrFail();
+    $project = Project::factory()->create(['team_id' => $team->id]);
+    $environment = Environment::factory()->create(['project_id' => $project->id]);
+    $database = StandalonePostgresql::create([
+        'name' => 'startup-cleanup-postgres',
+        'image' => 'postgres:15-alpine',
+        'postgres_user' => 'postgres',
+        'postgres_password' => 'password',
+        'postgres_db' => 'testdb',
+        'environment_id' => $environment->id,
+        'destination_id' => $destination->id,
+        'destination_type' => $destination->getMorphClass(),
     ]);
 
-    // Create a scheduled backup
-    $scheduledBackup = ScheduledDatabaseBackup::factory()->create([
+    $scheduledBackup = $database->scheduledBackups()->create([
         'team_id' => $team->id,
-        'database_id' => $database->id,
-        'database_type' => StandalonePostgresql::class,
+        'frequency' => '* * * * *',
     ]);
+
+    expect($scheduledBackup->database->is($database))->toBeTrue();
 
     // Create multiple backup executions with 'running' status
     $runningBackup1 = ScheduledDatabaseBackupExecution::create([
@@ -119,7 +153,7 @@ test('app:init marks stuck database backup executions as failed', function () {
     ]);
 
     // Run the app:init command
-    Artisan::call('app:init');
+    runStartupExecutionCleanup();
 
     // Refresh models from database
     $runningBackup1->refresh();
@@ -168,11 +202,7 @@ test('app:init handles cleanup when no stuck executions exist', function () {
         'finished_at' => Carbon::now()->subMinutes(19),
     ]);
 
-    // Run the app:init command (should not fail)
-    $exitCode = Artisan::call('app:init');
-
-    // Assert command succeeded
-    expect($exitCode)->toBe(0);
+    runStartupExecutionCleanup();
 
     // Assert all executions remain unchanged
     expect(ScheduledTaskExecution::where('status', 'running')->count())->toBe(0)
@@ -184,11 +214,14 @@ test('app:init handles cleanup when no stuck executions exist', function () {
 });
 
 test('cleanup does not send notifications even when team has notification settings', function () {
-    // Create a team with notification settings enabled
-    $team = Team::factory()->create([
+    $team = Team::factory()->create();
+    $team->emailNotificationSettings->update([
         'smtp_enabled' => true,
         'smtp_from_address' => 'test@example.com',
+        'scheduled_task_failure_email_notifications' => true,
     ]);
+
+    expect($team->isNotificationTypeEnabled('email', 'scheduled_task_failure'))->toBeTrue();
 
     // Create a scheduled task
     $scheduledTask = ScheduledTask::factory()->create([
@@ -203,7 +236,7 @@ test('cleanup does not send notifications even when team has notification settin
     ]);
 
     // Run the app:init command
-    Artisan::call('app:init');
+    runStartupExecutionCleanup();
 
     // Refresh model
     $runningExecution->refresh();

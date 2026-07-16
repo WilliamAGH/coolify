@@ -2,6 +2,7 @@
 
 use App\Models\Application;
 use App\Models\Environment;
+use App\Models\InstanceSettings;
 use App\Models\Project;
 use App\Models\Server;
 use App\Models\Team;
@@ -12,13 +13,19 @@ use Illuminate\Support\Facades\Log;
 
 uses(RefreshDatabase::class);
 
+beforeEach(function () {
+    InstanceSettings::forceCreate([
+        'id' => 0,
+        'is_api_enabled' => true,
+    ]);
+});
+
 function makeAuditTeamUser(): array
 {
     $team = Team::factory()->create();
     $user = User::factory()->create();
     $team->members()->attach($user->id, ['role' => 'owner']);
     session(['currentTeam' => $team]);
-    test()->actingAs($user);
 
     return [$team, $user];
 }
@@ -262,10 +269,13 @@ describe('API mutation audit logging', function () {
         Log::shouldReceive('info')->andReturnNull();
         Log::shouldReceive('error')->andReturnNull();
 
-        // Generate a valid OpenSSH-format private key for the test.
-        $opensshKey = "-----BEGIN OPENSSH PRIVATE KEY-----\n".
-            base64_encode(str_repeat('a', 256)).
-            "\n-----END OPENSSH PRIVATE KEY-----";
+        $opensshKey = '-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACBbhpqHhqv6aI67Mj9abM3DVbmcfYhZAhC7ca4d9UCevAAAAJi/QySHv0Mk
+hwAAAAtzc2gtZWQyNTUxOQAAACBbhpqHhqv6aI67Mj9abM3DVbmcfYhZAhC7ca4d9UCevA
+AAAECBQw4jg1WRT2IGHMncCiZhURCts2s24HoDS0thHnnRKVuGmoeGq/pojrsyP1pszcNV
+uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
+-----END OPENSSH PRIVATE KEY-----';
 
         $response = $this->withHeaders([
             'Authorization' => 'Bearer '.$token,
@@ -276,8 +286,7 @@ describe('API mutation audit logging', function () {
             'private_key' => $opensshKey,
         ]);
 
-        // Either 201 or 422 acceptable depending on validation; the assertion above verifies log if 201.
-        expect($response->status())->toBeIn([201, 422]);
+        $response->assertCreated();
     });
 
     test('enable_api denial for non-root team emits warning audit event', function () {

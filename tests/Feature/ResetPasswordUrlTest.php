@@ -22,10 +22,11 @@ function callResetUrl(ResetPassword $notification, $notifiable): string
 }
 
 it('generates reset URL using configured FQDN, not request host', function () {
-    InstanceSettings::updateOrCreate(
-        ['id' => 0],
-        ['fqdn' => 'https://coolify.example.com', 'public_ipv4' => '65.21.3.91']
-    );
+    InstanceSettings::forceCreate([
+        'id' => 0,
+        'fqdn' => 'https://coolify.example.com',
+        'public_ipv4' => '65.21.3.91',
+    ]);
     Once::flush();
 
     $user = User::factory()->create();
@@ -41,10 +42,11 @@ it('generates reset URL using configured FQDN, not request host', function () {
 });
 
 it('generates reset URL using public IP when no FQDN is configured', function () {
-    InstanceSettings::updateOrCreate(
-        ['id' => 0],
-        ['fqdn' => null, 'public_ipv4' => '65.21.3.91']
-    );
+    InstanceSettings::forceCreate([
+        'id' => 0,
+        'fqdn' => null,
+        'public_ipv4' => '65.21.3.91',
+    ]);
     Once::flush();
 
     $user = User::factory()->create();
@@ -59,10 +61,11 @@ it('generates reset URL using public IP when no FQDN is configured', function ()
 });
 
 it('is immune to X-Forwarded-Host header poisoning when FQDN is set', function () {
-    InstanceSettings::updateOrCreate(
-        ['id' => 0],
-        ['fqdn' => 'https://coolify.example.com', 'public_ipv4' => '65.21.3.91']
-    );
+    InstanceSettings::forceCreate([
+        'id' => 0,
+        'fqdn' => 'https://coolify.example.com',
+        'public_ipv4' => '65.21.3.91',
+    ]);
     Once::flush();
 
     // Simulate a request with a spoofed X-Forwarded-Host header
@@ -82,10 +85,11 @@ it('is immune to X-Forwarded-Host header poisoning when FQDN is set', function (
 });
 
 it('is immune to X-Forwarded-Host header poisoning when using IP only', function () {
-    InstanceSettings::updateOrCreate(
-        ['id' => 0],
-        ['fqdn' => null, 'public_ipv4' => '65.21.3.91']
-    );
+    InstanceSettings::forceCreate([
+        'id' => 0,
+        'fqdn' => null,
+        'public_ipv4' => '65.21.3.91',
+    ]);
     Once::flush();
 
     $user = User::factory()->create();
@@ -104,10 +108,12 @@ it('is immune to X-Forwarded-Host header poisoning when using IP only', function
 });
 
 it('generates reset URL with bracketed IPv6 when no FQDN is configured', function () {
-    InstanceSettings::updateOrCreate(
-        ['id' => 0],
-        ['fqdn' => null, 'public_ipv4' => null, 'public_ipv6' => '2001:db8::1']
-    );
+    InstanceSettings::forceCreate([
+        'id' => 0,
+        'fqdn' => null,
+        'public_ipv4' => null,
+        'public_ipv6' => '2001:db8::1',
+    ]);
     Once::flush();
 
     $user = User::factory()->create();
@@ -122,10 +128,12 @@ it('generates reset URL with bracketed IPv6 when no FQDN is configured', functio
 });
 
 it('is immune to X-Forwarded-Host header poisoning when using IPv6 only', function () {
-    InstanceSettings::updateOrCreate(
-        ['id' => 0],
-        ['fqdn' => null, 'public_ipv4' => null, 'public_ipv6' => '2001:db8::1']
-    );
+    InstanceSettings::forceCreate([
+        'id' => 0,
+        'fqdn' => null,
+        'public_ipv4' => null,
+        'public_ipv6' => '2001:db8::1',
+    ]);
     Once::flush();
 
     $user = User::factory()->create();
@@ -144,10 +152,12 @@ it('is immune to X-Forwarded-Host header poisoning when using IPv6 only', functi
 });
 
 it('uses APP_URL fallback when no FQDN or public IPs are configured', function () {
-    InstanceSettings::updateOrCreate(
-        ['id' => 0],
-        ['fqdn' => null, 'public_ipv4' => null, 'public_ipv6' => null]
-    );
+    InstanceSettings::forceCreate([
+        'id' => 0,
+        'fqdn' => null,
+        'public_ipv4' => null,
+        'public_ipv6' => null,
+    ]);
     Once::flush();
 
     config(['app.url' => 'http://my-coolify.local']);
@@ -168,10 +178,10 @@ it('uses APP_URL fallback when no FQDN or public IPs are configured', function (
 });
 
 it('generates a valid route path in the reset URL', function () {
-    InstanceSettings::updateOrCreate(
-        ['id' => 0],
-        ['fqdn' => 'https://coolify.example.com']
-    );
+    InstanceSettings::forceCreate([
+        'id' => 0,
+        'fqdn' => 'https://coolify.example.com',
+    ]);
     Once::flush();
 
     $user = User::factory()->create();

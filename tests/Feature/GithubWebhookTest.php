@@ -1,5 +1,14 @@
 <?php
 
+use App\Models\InstanceSettings;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+
+uses(RefreshDatabase::class);
+
+beforeEach(function () {
+    InstanceSettings::forceCreate(['id' => 0]);
+});
+
 describe('GitHub Manual Webhook', function () {
     test('ping event returns pong', function () {
         $response = $this->postJson('/webhooks/source/github/events/manual', [], [

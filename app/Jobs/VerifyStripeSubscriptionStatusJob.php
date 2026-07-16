@@ -9,6 +9,7 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use Stripe\StripeClient;
 
 class VerifyStripeSubscriptionStatusJob implements ShouldBeEncrypted, ShouldQueue
 {
@@ -29,7 +30,7 @@ class VerifyStripeSubscriptionStatusJob implements ShouldBeEncrypted, ShouldQueu
         if (! $this->subscription->stripe_subscription_id &&
             $this->subscription->stripe_customer_id) {
             try {
-                $stripe = new \Stripe\StripeClient(config('subscription.stripe_api_key'));
+                $stripe = $this->stripeClient();
                 $subscriptions = $stripe->subscriptions->all([
                     'customer' => $this->subscription->stripe_customer_id,
                     'limit' => 1,
@@ -50,7 +51,7 @@ class VerifyStripeSubscriptionStatusJob implements ShouldBeEncrypted, ShouldQueu
         }
 
         try {
-            $stripe = new \Stripe\StripeClient(config('subscription.stripe_api_key'));
+            $stripe = $this->stripeClient();
             $stripeSubscription = $stripe->subscriptions->retrieve(
                 $this->subscription->stripe_subscription_id
             );
@@ -100,5 +101,14 @@ class VerifyStripeSubscriptionStatusJob implements ShouldBeEncrypted, ShouldQueu
                 'VerifyStripeSubscriptionStatusJob failed for subscription ID '.$this->subscription->id.': '.$e->getMessage()
             );
         }
+    }
+
+    private function stripeClient(): StripeClient
+    {
+        if (app()->bound(StripeClient::class)) {
+            return app(StripeClient::class);
+        }
+
+        return new StripeClient(config('subscription.stripe_api_key'));
     }
 }

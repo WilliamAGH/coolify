@@ -5,6 +5,7 @@ namespace App\Livewire\Source\Github;
 use App\Models\GithubApp;
 use App\Rules\SafeExternalUrl;
 use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
+use Illuminate\Validation\ValidationException;
 use Livewire\Component;
 
 class Create extends Component
@@ -60,6 +61,8 @@ class Create extends Component
             }
 
             return redirectRoute($this, 'source.github.show', ['github_app_uuid' => $github_app->uuid]);
+        } catch (ValidationException $exception) {
+            throw $exception;
         } catch (\Throwable $e) {
             return handleError($e, $this);
         }

@@ -638,7 +638,7 @@
                         </p>
                     </x-slot:explanation>
                 </x-boarding-step>
-            @elseif ($currentState === 'create-resource')
+            @elseif ($currentState === 'create-resource' && $createdServer && $createdProject)
                 <x-boarding-progress :currentStep="3" />
                 <div class="w-full max-w-2xl text-center space-y-8">
                     <div class="space-y-4">

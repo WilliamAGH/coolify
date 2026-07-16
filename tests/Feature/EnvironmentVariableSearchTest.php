@@ -155,10 +155,14 @@ services:
 YAML,
     ]);
 
-    Livewire::test(All::class, ['resource' => $service])
-        ->set('search', 'api')
+    $component = Livewire::test(All::class, ['resource' => $service])
+        ->set('search', 'api');
+
+    expect($component->instance()->hardcodedEnvironmentVariables->pluck('key')->all())
+        ->toBe(['API_TOKEN']);
+
+    $component
         ->assertSee('Production Environment Variables')
-        ->assertSee('API_TOKEN')
         ->assertDontSee('No environment variables found.');
 });
 
@@ -242,10 +246,15 @@ it('hides the preview section when search filters out all preview variables', fu
         'resourceable_id' => $application->id,
     ]);
 
-    Livewire::test(All::class, ['resource' => $application])
-        ->set('search', 'api')
+    $component = Livewire::test(All::class, ['resource' => $application])
+        ->set('search', 'api');
+
+    expect($component->instance()->environmentVariables->pluck('key')->all())
+        ->toBe(['API_KEY']);
+    expect($component->instance()->environmentVariablesPreview)->toBeEmpty();
+
+    $component
         ->assertSee('Production Environment Variables')
-        ->assertSee('API_KEY')
         ->assertDontSee('Preview Deployments Environment Variables')
         ->assertDontSee('PREVIEW_TOKEN');
 });

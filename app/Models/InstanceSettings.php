@@ -64,6 +64,7 @@ class InstanceSettings extends Model
 
         'allowed_ip_ranges' => 'array',
         'is_auto_update_enabled' => 'boolean',
+        'new_version_available' => 'boolean',
         'auto_update_frequency' => 'string',
         'update_check_frequency' => 'string',
         'sentinel_token' => 'encrypted',

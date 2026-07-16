@@ -7,17 +7,23 @@ use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Livewire\Livewire;
 
-uses(RefreshDatabase::class);
+trait InteractsWithGithubSourceCreation
+{
+    public Team $team;
 
-beforeEach(function () {
-    // Create a team with owner
+    public User $user;
+}
+
+uses(RefreshDatabase::class, InteractsWithGithubSourceCreation::class);
+
+beforeEach(function (): void {
     $this->team = Team::factory()->create();
     $this->user = User::factory()->create();
     $this->team->members()->attach($this->user->id, ['role' => 'owner']);
+    $this->user->load('teams');
 
-    // Set current team
     $this->actingAs($this->user);
-    session(['currentTeam' => $this->team]);
+    refreshSession($this->team);
 });
 
 describe('GitHub Source Create Component', function () {
@@ -28,9 +34,8 @@ describe('GitHub Source Create Component', function () {
             ->call('createGitHubApp')
             ->assertRedirect();
 
-        $githubApp = GithubApp::where('name', 'my-test-app')->first();
+        $githubApp = GithubApp::query()->where('name', 'my-test-app')->sole();
 
-        expect($githubApp)->not->toBeNull();
         expect($githubApp->name)->toBe('my-test-app');
         expect($githubApp->api_url)->toBe('https://api.github.com');
         expect($githubApp->html_url)->toBe('https://github.com');
@@ -48,9 +53,8 @@ describe('GitHub Source Create Component', function () {
             ->call('createGitHubApp')
             ->assertRedirect();
 
-        $githubApp = GithubApp::where('name', 'system-wide-app')->first();
+        $githubApp = GithubApp::query()->where('name', 'system-wide-app')->sole();
 
-        expect($githubApp)->not->toBeNull();
         expect($githubApp->is_system_wide)->toBeTrue();
     });
 
@@ -62,28 +66,26 @@ describe('GitHub Source Create Component', function () {
             ->call('createGitHubApp')
             ->assertRedirect();
 
-        $githubApp = GithubApp::where('name', 'org-app')->first();
+        $githubApp = GithubApp::query()->where('name', 'org-app')->sole();
 
-        expect($githubApp)->not->toBeNull();
         expect($githubApp->organization)->toBe('my-org');
     });
 
-    test('creates github app with custom git settings', function () {
+    test('creates GitHub Enterprise source with custom git settings', function () {
         Livewire::test(Create::class)
             ->assertSuccessful()
             ->set('name', 'enterprise-app')
-            ->set('api_url', 'https://github.enterprise.com/api/v3')
-            ->set('html_url', 'https://github.enterprise.com')
+            ->set('api_url', 'https://enterprise.github.com/api/v3')
+            ->set('html_url', 'https://enterprise.github.com')
             ->set('custom_user', 'git-custom')
             ->set('custom_port', 2222)
             ->call('createGitHubApp')
             ->assertRedirect();
 
-        $githubApp = GithubApp::where('name', 'enterprise-app')->first();
+        $githubApp = GithubApp::query()->where('name', 'enterprise-app')->sole();
 
-        expect($githubApp)->not->toBeNull();
-        expect($githubApp->api_url)->toBe('https://github.enterprise.com/api/v3');
-        expect($githubApp->html_url)->toBe('https://github.enterprise.com');
+        expect($githubApp->api_url)->toBe('https://enterprise.github.com/api/v3');
+        expect($githubApp->html_url)->toBe('https://enterprise.github.com');
         expect($githubApp->custom_user)->toBe('git-custom');
         expect($githubApp->custom_port)->toBe(2222);
     });
@@ -101,7 +103,7 @@ describe('GitHub Source Create Component', function () {
             ->set('name', 'redirect-test')
             ->call('createGitHubApp');
 
-        $githubApp = GithubApp::where('name', 'redirect-test')->first();
+        $githubApp = GithubApp::query()->where('name', 'redirect-test')->sole();
 
         $component->assertRedirect(route('source.github.show', ['github_app_uuid' => $githubApp->uuid]));
     });

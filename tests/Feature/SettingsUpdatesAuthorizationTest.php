@@ -5,6 +5,7 @@ use App\Models\InstanceSettings;
 use App\Models\Server;
 use App\Models\Team;
 use App\Models\User;
+use App\Policies\ServerPolicy;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Once;
 use Livewire\Livewire;
@@ -24,9 +25,22 @@ test('non-admin user is redirected from settings updates page', function () {
 });
 
 test('instance admin can access settings updates page', function () {
-    $rootTeam = Team::find(0) ?? Team::factory()->create(['id' => 0]);
-    Server::factory()->create(['id' => 0, 'team_id' => $rootTeam->id]);
-    InstanceSettings::create(['id' => 0]);
+    $rootTeam = Team::find(0);
+    if (! $rootTeam) {
+        $rootTeam = Team::factory()->make();
+        $rootTeam->id = 0;
+        $rootTeam->save();
+    }
+
+    if (! Server::find(0)) {
+        $server = Server::factory()->make(['team_id' => $rootTeam->id]);
+        $server->id = 0;
+        $server->save();
+    }
+
+    $settings = new InstanceSettings;
+    $settings->id = 0;
+    $settings->save();
     Once::flush();
 
     $user = User::factory()->create();
@@ -38,4 +52,20 @@ test('instance admin can access settings updates page', function () {
     Livewire::test(Updates::class)
         ->assertOk()
         ->assertNoRedirect();
+});
+
+test('only team administrators can manage a server proxy', function () {
+    $team = Team::factory()->create();
+    $server = Server::factory()->create(['team_id' => $team->id]);
+    $member = User::factory()->create();
+    $administrator = User::factory()->create();
+    $team->members()->attach($member->id, ['role' => 'member']);
+    $team->members()->attach($administrator->id, ['role' => 'admin']);
+    $member->load('teams');
+    $administrator->load('teams');
+
+    $policy = new ServerPolicy;
+
+    expect($policy->manageProxy($member, $server))->toBeFalse()
+        ->and($policy->manageProxy($administrator, $server))->toBeTrue();
 });

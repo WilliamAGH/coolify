@@ -1,6 +1,7 @@
 <?php
 
 use App\Livewire\Team\InviteLink;
+use App\Models\InstanceSettings;
 use App\Models\Team;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -9,6 +10,8 @@ use Livewire\Livewire;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
+    InstanceSettings::forceCreate(['id' => 0]);
+
     // Create a team with owner, admin, and member
     $this->team = Team::factory()->create();
 

@@ -5,6 +5,7 @@ use App\Jobs\PushServerUpdateJob;
 use App\Jobs\ServerStorageCheckJob;
 use App\Models\Server;
 use App\Models\Team;
+use App\Support\ProxyMutationQueue;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Queue;
@@ -220,11 +221,11 @@ it('respects the configured proxy connect interval', function () {
     Queue::assertPushed(ConnectProxyToNetworksJob::class, 1);
 });
 
-it('uses default queue for PushServerUpdateJob', function () {
+it('routes PushServerUpdateJob through the proxy mutation queue', function () {
     $team = Team::factory()->create();
     $server = Server::factory()->create(['team_id' => $team->id]);
 
     $job = new PushServerUpdateJob($server, ['containers' => []]);
 
-    expect($job->queue)->toBeNull();
+    expect($job->queue)->toBe(ProxyMutationQueue::NAME);
 });

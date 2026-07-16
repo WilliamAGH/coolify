@@ -1,5 +1,6 @@
 <?php
 
+use App\Models\InstanceSettings;
 use App\Models\Team;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -7,6 +8,8 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
+    InstanceSettings::forceCreate(['id' => 0]);
+
     $this->user = User::factory()->create();
     $this->team = Team::factory()->personal()->create();
     $this->team->members()->attach($this->user->id, ['role' => 'owner']);
@@ -51,11 +54,7 @@ it('does not redirect authenticated user with force_password_reset from two-fact
 });
 
 it('renders 419 error page with login link instead of previous url', function () {
-    $response = $this->get('/two-factor-challenge', [
-        'X-CSRF-TOKEN' => 'invalid-token',
-    ]);
-
-    // The 419 page should exist and contain a link to /login
+    // The 419 page should exist and contain a link to /login.
     $view = view('errors.419')->render();
 
     expect($view)->toContain('/login');

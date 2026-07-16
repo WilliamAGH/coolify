@@ -1,6 +1,7 @@
 <?php
 
 use App\Models\CloudProviderToken;
+use App\Models\InstanceSettings;
 use App\Models\Team;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -9,6 +10,11 @@ use Illuminate\Support\Facades\Http;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
+    InstanceSettings::forceCreate([
+        'id' => 0,
+        'is_api_enabled' => true,
+    ]);
+
     // Create a team with owner
     $this->team = Team::factory()->create();
     $this->user = User::factory()->create();
@@ -283,7 +289,9 @@ describe('PATCH /api/v1/cloud-tokens/{uuid}', function () {
         $response = $this->withHeaders([
             'Authorization' => 'Bearer '.$this->bearerToken,
             'Content-Type' => 'application/json',
-        ])->patchJson("/api/v1/cloud-tokens/{$token->uuid}", []);
+        ])->patchJson("/api/v1/cloud-tokens/{$token->uuid}", [
+            'name' => null,
+        ]);
 
         $response->assertStatus(422);
         $response->assertJsonValidationErrors(['name']);

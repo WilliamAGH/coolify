@@ -19,7 +19,10 @@ uses(RefreshDatabase::class);
 
 beforeEach(function () {
     Bus::fake();
-    InstanceSettings::updateOrCreate(['id' => 0]);
+    InstanceSettings::forceCreate([
+        'id' => 0,
+        'is_api_enabled' => true,
+    ]);
 
     $this->team = Team::factory()->create();
     $this->user = User::factory()->create();

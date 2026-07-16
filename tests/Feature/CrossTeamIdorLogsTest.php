@@ -2,28 +2,34 @@
 
 use App\Models\Application;
 use App\Models\Environment;
+use App\Models\InstanceSettings;
 use App\Models\Project;
 use App\Models\Server;
 use App\Models\Service;
 use App\Models\StandaloneDocker;
 use App\Models\Team;
 use App\Models\User;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+
+uses(RefreshDatabase::class);
 
 beforeEach(function () {
+    InstanceSettings::forceCreate(['id' => 0]);
+
     // Attacker: Team A
     $this->userA = User::factory()->create();
     $this->teamA = Team::factory()->create();
     $this->userA->teams()->attach($this->teamA, ['role' => 'owner']);
 
     $this->serverA = Server::factory()->create(['team_id' => $this->teamA->id]);
-    $this->destinationA = StandaloneDocker::factory()->create(['server_id' => $this->serverA->id]);
+    $this->destinationA = $this->serverA->standaloneDockers()->firstOrFail();
     $this->projectA = Project::factory()->create(['team_id' => $this->teamA->id]);
     $this->environmentA = Environment::factory()->create(['project_id' => $this->projectA->id]);
 
     // Victim: Team B
     $this->teamB = Team::factory()->create();
     $this->serverB = Server::factory()->create(['team_id' => $this->teamB->id]);
-    $this->destinationB = StandaloneDocker::factory()->create(['server_id' => $this->serverB->id]);
+    $this->destinationB = $this->serverB->standaloneDockers()->firstOrFail();
     $this->projectB = Project::factory()->create(['team_id' => $this->teamB->id]);
     $this->environmentB = Environment::factory()->create(['project_id' => $this->projectB->id]);
 
@@ -34,6 +40,7 @@ beforeEach(function () {
     ]);
 
     $this->victimService = Service::factory()->create([
+        'server_id' => $this->serverB->id,
         'environment_id' => $this->environmentB->id,
         'destination_id' => $this->destinationB->id,
         'destination_type' => StandaloneDocker::class,
@@ -82,6 +89,7 @@ test('can access logs of own application', function () {
 
 test('can access logs of own service', function () {
     $ownService = Service::factory()->create([
+        'server_id' => $this->serverA->id,
         'environment_id' => $this->environmentA->id,
         'destination_id' => $this->destinationA->id,
         'destination_type' => StandaloneDocker::class,

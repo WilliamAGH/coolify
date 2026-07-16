@@ -135,7 +135,7 @@ class ValidationPatterns
      */
     public static function normalizeEnvironmentVariableKey(string $value): string
     {
-        return str($value)->trim()->value;
+        return str($value)->trim()->replaceMatches('/\s+/u', '_')->value;
     }
 
     /**

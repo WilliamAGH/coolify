@@ -163,13 +163,13 @@ it('generates environment variable key rules with correct defaults', function ()
         ->toContain('regex:'.ValidationPatterns::ENVIRONMENT_VARIABLE_KEY_PATTERN);
 });
 
-it('normalizes environment variable keys by trimming surrounding whitespace', function () {
-    expect(ValidationPatterns::normalizeEnvironmentVariableKey(' node.name '))->toBe('node.name');
+it('normalizes whitespace in environment variable keys', function () {
+    expect(ValidationPatterns::normalizeEnvironmentVariableKey(" \tAPP ENV\nKEY \r"))->toBe('APP_ENV_KEY');
 });
 
 it('normalizes environment variable keys before model validation', function () {
     $environmentVariable = new EnvironmentVariable;
-    $environmentVariable->key = ' APP_ENV ';
+    $environmentVariable->key = ' APP ENV ';
 
     expect($environmentVariable->key)->toBe('APP_ENV');
 });

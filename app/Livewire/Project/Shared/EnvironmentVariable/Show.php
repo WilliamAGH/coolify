@@ -14,6 +14,7 @@ use App\Traits\EnvironmentVariableAnalyzer;
 use App\Traits\EnvironmentVariableProtection;
 use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
+use Illuminate\Validation\ValidationException;
 use Livewire\Attributes\Computed;
 use Livewire\Component;
 
@@ -221,8 +222,10 @@ class Show extends Component
             $this->dispatch('success', 'Environment variable updated.');
             $this->dispatch('envsUpdated');
             $this->dispatch('configurationChanged');
-        } catch (\Exception $e) {
-            return handleError($e);
+        } catch (ValidationException $e) {
+            throw $e;
+        } catch (\Throwable $e) {
+            return handleError($e, $this);
         }
     }
 

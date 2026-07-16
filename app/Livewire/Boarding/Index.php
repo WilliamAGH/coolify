@@ -125,7 +125,7 @@ class Index extends Component
             if ($this->selectedExistingServer) {
                 $this->createdServer = Server::ownedByCurrentTeam()->find($this->selectedExistingServer);
                 if ($this->createdServer) {
-                    $this->serverPublicKey = $this->createdServer->privateKey->getPublicKey();
+                    $this->serverPublicKey = $this->createdServer->privateKey?->getPublicKey() ?? '';
                     $this->updateServerDetails();
                 }
             }

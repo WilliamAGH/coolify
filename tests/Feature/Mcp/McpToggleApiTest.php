@@ -4,7 +4,6 @@ use App\Models\InstanceSettings;
 use App\Models\Team;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
-use Illuminate\Support\Facades\DB;
 
 uses(RefreshDatabase::class);
 
@@ -17,34 +16,32 @@ beforeEach(function () {
     $settings->id = 0;
     $settings->save();
 
+    $this->rootTeam = Team::factory()->create(['id' => 0]);
     $this->team = Team::factory()->create();
     $this->user = User::factory()->create();
+    $this->rootTeam->members()->attach($this->user->id, ['role' => 'owner']);
     $this->team->members()->attach($this->user->id, ['role' => 'owner']);
     session(['currentTeam' => $this->team]);
 });
 
-function makeRootMcpToken(User $user): string
+function makeRootMcpToken(User $user, Team $rootTeam): string
 {
+    session(['currentTeam' => $rootTeam]);
     $token = $user->createToken('mcp-root', ['root']);
-    DB::table('personal_access_tokens')
-        ->where('id', $token->accessToken->id)
-        ->update(['team_id' => '0']);
 
     return $token->plainTextToken;
 }
 
 function makeNonRootMcpToken(User $user, Team $team, array $abilities = ['write']): string
 {
+    session(['currentTeam' => $team]);
     $token = $user->createToken('mcp-write', $abilities);
-    DB::table('personal_access_tokens')
-        ->where('id', $token->accessToken->id)
-        ->update(['team_id' => (string) $team->id]);
 
     return $token->plainTextToken;
 }
 
 test('POST /api/v1/mcp/enable enables MCP server with root token', function () {
-    $token = makeRootMcpToken($this->user);
+    $token = makeRootMcpToken($this->user, $this->rootTeam);
 
     $response = test()->withHeaders([
         'Authorization' => 'Bearer '.$token,
@@ -57,7 +54,7 @@ test('POST /api/v1/mcp/enable enables MCP server with root token', function () {
 
 test('POST /api/v1/mcp/disable disables MCP server with root token', function () {
     InstanceSettings::query()->where('id', 0)->update(['is_mcp_server_enabled' => true]);
-    $token = makeRootMcpToken($this->user);
+    $token = makeRootMcpToken($this->user, $this->rootTeam);
 
     $response = test()->withHeaders([
         'Authorization' => 'Bearer '.$token,

@@ -67,6 +67,14 @@ class Service extends BaseModel
 
     protected $appends = ['server_status', 'status'];
 
+    protected function casts(): array
+    {
+        return [
+            'connect_to_docker_network' => 'boolean',
+            'is_container_label_escape_enabled' => 'boolean',
+        ];
+    }
+
     protected static function booted()
     {
         static::creating(function ($service) {

@@ -71,8 +71,7 @@ class ServerPolicy
      */
     public function manageProxy(User $user, Server $server): bool
     {
-        // return $user->isAdmin() && $user->teams->contains('id', $server->team_id);
-        return true;
+        return $user->isAdminOfTeam($server->team_id);
     }
 
     /**

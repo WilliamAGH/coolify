@@ -1,6 +1,7 @@
 <?php
 
 use App\Models\GithubApp;
+use App\Models\InstanceSettings;
 use App\Models\PrivateKey;
 use App\Models\Team;
 use App\Models\User;
@@ -9,19 +10,26 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
+    InstanceSettings::forceCreate([
+        'id' => 0,
+        'is_api_enabled' => true,
+    ]);
+
     // Create a team with owner
     $this->team = Team::factory()->create();
     $this->user = User::factory()->create();
     $this->team->members()->attach($this->user->id, ['role' => 'owner']);
 
-    // Create an API token for the user
-    $this->token = $this->user->createToken('test-token', ['*'], $this->team->id);
+    session(['currentTeam' => $this->team]);
+
+    // Create an API token for the user's current team.
+    $this->token = $this->user->createToken('test-token', ['*']);
     $this->bearerToken = $this->token->plainTextToken;
 
     // Create a private key for the team
     $this->privateKey = PrivateKey::create([
         'name' => 'Test Key',
-        'private_key' => 'test-private-key-content',
+        'private_key' => generateSSHKey('ed25519')['private'],
         'team_id' => $this->team->id,
     ]);
 });
@@ -118,7 +126,8 @@ describe('GET /api/v1/github-apps', function () {
         $otherTeam = Team::factory()->create();
         $otherUser = User::factory()->create();
         $otherTeam->members()->attach($otherUser->id, ['role' => 'owner']);
-        $otherToken = $otherUser->createToken('other-token', ['*'], $otherTeam->id);
+        session(['currentTeam' => $otherTeam]);
+        $otherToken = $otherUser->createToken('other-token', ['*']);
 
         // System-wide apps should be visible to other teams
         $response = $this->withHeaders([
@@ -152,7 +161,7 @@ describe('GET /api/v1/github-apps', function () {
         $otherTeam = Team::factory()->create();
         $otherPrivateKey = PrivateKey::create([
             'name' => 'Other Key',
-            'private_key' => 'other-key',
+            'private_key' => generateSSHKey('ed25519')['private'],
             'team_id' => $otherTeam->id,
         ]);
         GithubApp::create([

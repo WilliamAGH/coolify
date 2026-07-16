@@ -14,7 +14,10 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
-    InstanceSettings::updateOrCreate(['id' => 0]);
+    InstanceSettings::forceCreate([
+        'id' => 0,
+        'is_api_enabled' => true,
+    ]);
 
     $this->team = Team::factory()->create();
     $this->user = User::factory()->create();
@@ -51,7 +54,7 @@ describe('PATCH /api/v1/databases', function () {
             'public_port_timeout' => 7200,
         ]);
 
-        $response->assertStatus(200);
+        $response->assertOk();
         $database->refresh();
         expect($database->public_port_timeout)->toBe(7200);
     });
@@ -138,7 +141,7 @@ describe('POST /api/v1/databases/postgresql', function () {
             'instant_deploy' => false,
         ]);
 
-        $response->assertStatus(200);
+        $response->assertCreated();
         $uuid = $response->json('uuid');
         $database = StandalonePostgresql::whereUuid($uuid)->first();
         expect($database)->not->toBeNull();

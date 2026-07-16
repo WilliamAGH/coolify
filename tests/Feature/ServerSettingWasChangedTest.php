@@ -1,11 +1,21 @@
 <?php
 
+use App\Models\InstanceSettings;
 use App\Models\Server;
 use App\Models\ServerSetting;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Queue;
 
 uses(RefreshDatabase::class);
+
+beforeEach(function () {
+    Queue::fake();
+    InstanceSettings::forceCreate([
+        'id' => 0,
+        'fqdn' => 'https://coolify.test',
+    ]);
+});
 
 it('wasChanged returns true after saving a changed field', function () {
     // Create user and server

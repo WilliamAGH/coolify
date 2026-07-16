@@ -27,13 +27,13 @@ it('allows Docker-compatible environment variable keys in the add form', functio
     'uppercase dots' => 'XPACK.SECURITY.ENABLED',
 ]);
 
-it('trims surrounding whitespace in environment variable keys in the add form', function () {
+it('normalizes whitespace in environment variable keys in the add form', function () {
     Livewire::test(Add::class)
-        ->set('key', ' node.name ')
+        ->set('key', " node\tname ")
         ->set('value', 'value')
         ->call('submit')
         ->assertHasNoErrors()
         ->assertDispatched('saveKey', function ($event, array $data) {
-            return data_get($data, 'key') === 'node.name' || data_get($data, '0.key') === 'node.name';
+            return data_get($data, 'key') === 'node_name' || data_get($data, '0.key') === 'node_name';
         });
 });

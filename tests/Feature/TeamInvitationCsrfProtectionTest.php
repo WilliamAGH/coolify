@@ -1,16 +1,20 @@
 <?php
 
+use App\Http\Middleware\VerifyCsrfToken;
+use App\Models\InstanceSettings;
 use App\Models\Team;
 use App\Models\TeamInvitation;
 use App\Models\User;
-use Illuminate\Cookie\Middleware\EncryptCookies;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
+    InstanceSettings::forceCreate(['id' => 0]);
+
     $this->team = Team::factory()->create();
     $this->user = User::factory()->create(['email' => 'invited@example.com']);
+    $this->user->teams()->first()->update(['show_boarding' => false]);
 
     $this->invitation = TeamInvitation::create([
         'team_id' => $this->team->id,
@@ -77,11 +81,18 @@ test('POST invitation accepts and adds user to team', function () {
 
 test('POST invitation without CSRF token is rejected', function () {
     $this->actingAs($this->user);
+    $this->app->bind(VerifyCsrfToken::class, function ($app) {
+        return new class($app, $app->make('encrypter')) extends VerifyCsrfToken
+        {
+            protected function runningUnitTests()
+            {
+                return false;
+            }
+        };
+    });
 
-    $response = $this->withoutMiddleware(EncryptCookies::class)
-        ->post('/invitations/test-invitation-uuid', [], [
-            'X-CSRF-TOKEN' => 'invalid-token',
-        ]);
+    $response = $this->withMiddleware()
+        ->post('/invitations/test-invitation-uuid');
 
     // Should be rejected with 419 (CSRF token mismatch)
     $response->assertStatus(419);
@@ -100,6 +111,7 @@ test('unauthenticated user cannot view invitation', function () {
 
 test('wrong user cannot view invitation', function () {
     $otherUser = User::factory()->create(['email' => 'other@example.com']);
+    $otherUser->teams()->first()->update(['show_boarding' => false]);
     $this->actingAs($otherUser);
 
     $response = $this->get('/invitations/test-invitation-uuid');
@@ -109,6 +121,7 @@ test('wrong user cannot view invitation', function () {
 
 test('wrong user cannot accept invitation via POST', function () {
     $otherUser = User::factory()->create(['email' => 'other@example.com']);
+    $otherUser->teams()->first()->update(['show_boarding' => false]);
     $this->actingAs($otherUser);
 
     $response = $this->post('/invitations/test-invitation-uuid');
@@ -121,12 +134,15 @@ test('wrong user cannot accept invitation via POST', function () {
     ]);
 });
 
-test('GET revoke route no longer exists', function () {
+test('GET revoke route does not modify the invitation', function () {
     $this->actingAs($this->user);
 
     $response = $this->get('/invitations/test-invitation-uuid/revoke');
 
-    $response->assertStatus(404);
+    $response->assertRedirect(route('dashboard'));
+    $this->assertDatabaseHas('team_invitations', [
+        'uuid' => 'test-invitation-uuid',
+    ]);
 });
 
 test('POST invitation for already-member user deletes invitation without duplicating', function () {

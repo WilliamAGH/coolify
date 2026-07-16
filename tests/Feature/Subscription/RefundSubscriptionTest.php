@@ -5,6 +5,7 @@ use App\Models\Subscription;
 use App\Models\Team;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Stripe\Exception\InvalidRequestException;
 use Stripe\Service\InvoiceService;
 use Stripe\Service\RefundService;
 use Stripe\Service\SubscriptionService;
@@ -141,7 +142,7 @@ describe('checkEligibility', function () {
         $this->mockSubscriptions
             ->shouldReceive('retrieve')
             ->with('sub_test_123')
-            ->andThrow(new \Stripe\Exception\InvalidRequestException('No such subscription'));
+            ->andThrow(new InvalidRequestException('No such subscription'));
 
         $action = new RefundSubscription($this->mockStripe);
         $result = $action->checkEligibility($this->team);
@@ -269,6 +270,7 @@ describe('execute', function () {
         $stripeSubscription = (object) [
             'status' => 'active',
             'start_date' => now()->subDays(10)->timestamp,
+            'current_period_end' => now()->addDays(20)->timestamp,
         ];
 
         $this->mockSubscriptions
@@ -298,7 +300,7 @@ describe('execute', function () {
         $this->mockSubscriptions
             ->shouldReceive('cancel')
             ->with('sub_test_123')
-            ->andThrow(new \Exception('Stripe cancel API error'));
+            ->andThrow(new Exception('Stripe cancel API error'));
 
         $action = new RefundSubscription($this->mockStripe);
         $result = $action->execute($this->team);

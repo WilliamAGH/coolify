@@ -22,9 +22,7 @@ beforeEach(function () {
 
     $this->actingAs($this->user);
     session(['currentTeam' => $this->team]);
-    InstanceSettings::unguarded(function () {
-        InstanceSettings::updateOrCreate(['id' => 0], []);
-    });
+    InstanceSettings::forceCreate(['id' => 0]);
 
     $this->project = Project::factory()->create(['team_id' => $this->team->id]);
     $this->environment = Environment::factory()->create(['project_id' => $this->project->id]);

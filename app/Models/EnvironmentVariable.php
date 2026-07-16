@@ -37,8 +37,13 @@ class EnvironmentVariable extends BaseModel
     public const BUILDPACK_CONTROL_VARIABLE_PREFIXES = ['NIXPACKS_', 'RAILPACK_'];
 
     protected $attributes = [
+        'is_literal' => false,
+        'is_multiline' => false,
+        'is_preview' => false,
         'is_runtime' => true,
         'is_buildtime' => true,
+        'is_shown_once' => false,
+        'is_required' => false,
     ];
 
     protected $fillable = [
@@ -69,10 +74,13 @@ class EnvironmentVariable extends BaseModel
     protected $casts = [
         'key' => 'string',
         'value' => 'encrypted',
+        'is_literal' => 'boolean',
         'is_multiline' => 'boolean',
         'is_preview' => 'boolean',
         'is_runtime' => 'boolean',
         'is_buildtime' => 'boolean',
+        'is_shown_once' => 'boolean',
+        'is_required' => 'boolean',
         'version' => 'string',
         'resourceable_type' => 'string',
         'resourceable_id' => 'integer',
@@ -371,9 +379,7 @@ class EnvironmentVariable extends BaseModel
     protected function key(): Attribute
     {
         return Attribute::make(
-            set: fn (string $value) => ValidationPatterns::validatedEnvironmentVariableKey(
-                ValidationPatterns::normalizeEnvironmentVariableKey($value)
-            ),
+            set: fn (string $value) => ValidationPatterns::validatedEnvironmentVariableKey($value),
         );
     }
 

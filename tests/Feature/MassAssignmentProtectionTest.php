@@ -1,9 +1,12 @@
 <?php
 
 use App\Models\Application;
+use App\Models\InstanceSettings;
+use App\Models\Project;
 use App\Models\Server;
 use App\Models\Service;
 use App\Models\StandaloneClickhouse;
+use App\Models\StandaloneDocker;
 use App\Models\StandaloneDragonfly;
 use App\Models\StandaloneKeydb;
 use App\Models\StandaloneMariadb;
@@ -13,6 +16,18 @@ use App\Models\StandalonePostgresql;
 use App\Models\StandaloneRedis;
 use App\Models\Team;
 use App\Models\User;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+
+uses(RefreshDatabase::class);
+
+beforeEach(function () {
+    Model::reguard();
+});
+
+afterEach(function () {
+    Model::reguard();
+});
 
 describe('mass assignment protection', function () {
 
@@ -48,16 +63,6 @@ describe('mass assignment protection', function () {
         }
     });
 
-    test('Application model blocks mass assignment of relationship IDs', function () {
-        $application = new Application;
-        $dangerousFields = ['id', 'uuid', 'environment_id', 'destination_id', 'destination_type', 'source_id', 'source_type', 'private_key_id', 'repository_project_id'];
-
-        foreach ($dangerousFields as $field) {
-            expect($application->isFillable($field))
-                ->toBeFalse("Application model should not allow mass assignment of '{$field}'");
-        }
-    });
-
     test('Application model allows mass assignment of user-facing fields', function () {
         $application = new Application;
         $userFields = ['name', 'description', 'git_repository', 'git_branch', 'build_pack', 'install_command', 'build_command', 'start_command', 'ports_exposes', 'health_check_path', 'limits_memory', 'status'];
@@ -88,19 +93,6 @@ describe('mass assignment protection', function () {
         expect($server->isFillable('created_at'))->toBeFalse();
     });
 
-    test('User model blocks mass assignment of auth-sensitive fields', function () {
-        $user = new User;
-
-        expect($user->isFillable('id'))->toBeFalse('User id should not be fillable');
-        expect($user->isFillable('email_verified_at'))->toBeFalse('email_verified_at should not be fillable');
-        expect($user->isFillable('remember_token'))->toBeFalse('remember_token should not be fillable');
-        expect($user->isFillable('two_factor_secret'))->toBeFalse('two_factor_secret should not be fillable');
-        expect($user->isFillable('two_factor_recovery_codes'))->toBeFalse('two_factor_recovery_codes should not be fillable');
-        expect($user->isFillable('pending_email'))->toBeFalse('pending_email should not be fillable');
-        expect($user->isFillable('email_change_code'))->toBeFalse('email_change_code should not be fillable');
-        expect($user->isFillable('email_change_code_expires_at'))->toBeFalse('email_change_code_expires_at should not be fillable');
-    });
-
     test('User model allows mass assignment of profile fields', function () {
         $user = new User;
 
@@ -125,29 +117,6 @@ describe('mass assignment protection', function () {
         expect($team->isFillable('personal_team'))->toBeTrue();
         expect($team->isFillable('show_boarding'))->toBeTrue();
         expect($team->isFillable('custom_server_limit'))->toBeTrue();
-    });
-
-    test('standalone database models block mass assignment of relationship IDs', function () {
-        $models = [
-            StandalonePostgresql::class,
-            StandaloneRedis::class,
-            StandaloneMysql::class,
-            StandaloneMariadb::class,
-            StandaloneMongodb::class,
-            StandaloneKeydb::class,
-            StandaloneDragonfly::class,
-            StandaloneClickhouse::class,
-        ];
-
-        foreach ($models as $modelClass) {
-            $model = new $modelClass;
-            $dangerousFields = ['id', 'uuid', 'environment_id', 'destination_id', 'destination_type'];
-
-            foreach ($dangerousFields as $field) {
-                expect($model->isFillable($field))
-                    ->toBeFalse("Model {$modelClass} should not allow mass assignment of '{$field}'");
-            }
-        }
     });
 
     test('standalone database models allow mass assignment of config fields', function () {
@@ -220,29 +189,165 @@ describe('mass assignment protection', function () {
         }
     });
 
-    test('Application fill ignores non-fillable fields', function () {
-        $application = new Application;
-        $application->fill([
-            'name' => 'test-app',
-            'environment_id' => 999,
-            'destination_id' => 999,
-            'team_id' => 999,
-            'private_key_id' => 999,
-        ]);
+    describe('untrusted request boundaries', function () {
+        beforeEach(function () {
+            InstanceSettings::forceCreate([
+                'id' => 0,
+                'is_api_enabled' => true,
+                'is_registration_enabled' => true,
+            ]);
 
-        expect($application->name)->toBe('test-app');
-        expect($application->environment_id)->toBeNull();
-        expect($application->destination_id)->toBeNull();
-        expect($application->private_key_id)->toBeNull();
-    });
+            $this->team = Team::factory()->create();
+            $this->user = User::factory()->create();
+            $this->team->members()->attach($this->user->id, ['role' => 'owner']);
+            session(['currentTeam' => $this->team]);
 
-    test('Service model blocks mass assignment of relationship IDs', function () {
-        $service = new Service;
+            $this->bearerToken = $this->user->createToken('mass-assignment-boundary', ['*'])->plainTextToken;
+            $this->apiHeaders = [
+                'Authorization' => 'Bearer '.$this->bearerToken,
+                'Content-Type' => 'application/json',
+            ];
 
-        expect($service->isFillable('id'))->toBeFalse();
-        expect($service->isFillable('uuid'))->toBeFalse();
-        expect($service->isFillable('environment_id'))->toBeFalse();
-        expect($service->isFillable('destination_id'))->toBeFalse();
-        expect($service->isFillable('server_id'))->toBeFalse();
+            $this->server = Server::factory()->create(['team_id' => $this->team->id]);
+            $this->destination = StandaloneDocker::query()
+                ->where('server_id', $this->server->id)
+                ->firstOrFail();
+            $this->project = Project::factory()->create(['team_id' => $this->team->id]);
+            $this->environment = $this->project->environments()->firstOrFail();
+
+            $this->application = Application::factory()->create([
+                'environment_id' => $this->environment->id,
+                'destination_id' => $this->destination->id,
+                'destination_type' => $this->destination->getMorphClass(),
+            ]);
+            $this->service = Service::factory()->create([
+                'environment_id' => $this->environment->id,
+                'server_id' => $this->server->id,
+                'destination_id' => $this->destination->id,
+                'destination_type' => $this->destination->getMorphClass(),
+            ]);
+            $this->database = StandalonePostgresql::create([
+                'name' => 'boundary-test-postgres',
+                'image' => 'postgres:16-alpine',
+                'postgres_user' => 'postgres',
+                'postgres_password' => 'password',
+                'postgres_db' => 'postgres',
+                'environment_id' => $this->environment->id,
+                'destination_id' => $this->destination->id,
+                'destination_type' => $this->destination->getMorphClass(),
+            ]);
+        });
+
+        test('application API rejects identity and relationship rebinding fields', function () {
+            $originalRelationships = $this->application->only([
+                'uuid',
+                'environment_id',
+                'destination_id',
+                'destination_type',
+                'source_id',
+                'source_type',
+                'private_key_id',
+                'repository_project_id',
+            ]);
+            $payload = [
+                'id' => 999999,
+                'uuid' => $this->application->uuid,
+                'environment_id' => 999999,
+                'destination_id' => 999999,
+                'destination_type' => StandaloneDocker::class,
+                'source_id' => 999999,
+                'source_type' => User::class,
+                'private_key_id' => 999999,
+                'repository_project_id' => 999999,
+            ];
+
+            $this->withHeaders($this->apiHeaders)
+                ->patchJson("/api/v1/applications/{$this->application->uuid}", $payload)
+                ->assertUnprocessable()
+                ->assertInvalid(array_keys($payload));
+
+            expect($this->application->refresh()->only(array_keys($originalRelationships)))
+                ->toBe($originalRelationships);
+        });
+
+        test('service API rejects identity and relationship rebinding fields', function () {
+            $originalRelationships = $this->service->only([
+                'uuid',
+                'environment_id',
+                'server_id',
+                'destination_id',
+                'destination_type',
+            ]);
+            $payload = [
+                'id' => 999999,
+                'uuid' => $this->service->uuid,
+                'environment_id' => 999999,
+                'server_id' => 999999,
+                'destination_id' => 999999,
+                'destination_type' => StandaloneDocker::class,
+            ];
+
+            $this->withHeaders($this->apiHeaders)
+                ->patchJson("/api/v1/services/{$this->service->uuid}", $payload)
+                ->assertUnprocessable()
+                ->assertInvalid(array_keys($payload));
+
+            expect($this->service->refresh()->only(array_keys($originalRelationships)))
+                ->toBe($originalRelationships);
+        });
+
+        test('database API rejects identity and relationship rebinding fields', function () {
+            $originalRelationships = $this->database->only([
+                'uuid',
+                'environment_id',
+                'destination_id',
+                'destination_type',
+            ]);
+            $payload = [
+                'id' => 999999,
+                'uuid' => $this->database->uuid,
+                'environment_id' => 999999,
+                'destination_id' => 999999,
+                'destination_type' => StandaloneDocker::class,
+            ];
+
+            $this->withHeaders($this->apiHeaders)
+                ->patchJson("/api/v1/databases/{$this->database->uuid}", $payload)
+                ->assertUnprocessable()
+                ->assertInvalid(array_keys($payload));
+
+            expect($this->database->refresh()->only(array_keys($originalRelationships)))
+                ->toBe($originalRelationships);
+        });
+
+        test('registration ignores injected authentication and email-change state', function () {
+            $email = 'boundary-registration@example.com';
+
+            $this->post('/register', [
+                'name' => 'Boundary Registration',
+                'email' => $email,
+                'password' => 'SecurePassword123!',
+                'password_confirmation' => 'SecurePassword123!',
+                'id' => 999999,
+                'force_password_reset' => true,
+                'remember_token' => 'attacker-controlled-token',
+                'two_factor_secret' => 'attacker-controlled-secret',
+                'two_factor_recovery_codes' => '["attacker-controlled-code"]',
+                'pending_email' => 'attacker-pending@example.com',
+                'email_change_code' => '000000',
+                'email_change_code_expires_at' => '2999-01-01 00:00:00',
+            ])->assertRedirect();
+
+            $registeredUser = User::query()->where('email', $email)->firstOrFail();
+
+            expect($registeredUser->id)->not->toBe(999999)
+                ->and($registeredUser->force_password_reset)->toBeFalse()
+                ->and($registeredUser->remember_token)->toBeNull()
+                ->and($registeredUser->two_factor_secret)->toBeNull()
+                ->and($registeredUser->two_factor_recovery_codes)->toBeNull()
+                ->and($registeredUser->pending_email)->toBeNull()
+                ->and($registeredUser->email_change_code)->toBeNull()
+                ->and($registeredUser->email_change_code_expires_at)->toBeNull();
+        });
     });
 });

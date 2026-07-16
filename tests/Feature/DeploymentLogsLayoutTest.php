@@ -69,7 +69,7 @@ it('renders deployment logs in a full-height layout', function () {
 
     $response->assertSuccessful();
     $response->assertSee('rolling update started');
-    $response->assertSee('flex h-[calc(100vh-10rem)] min-h-40 flex-col overflow-hidden', false);
+    $response->assertSee('flex h-[calc(100vh-10rem)] min-h-[50rem] flex-col overflow-hidden', false);
     $response->assertSee('flex flex-1 min-h-0 flex-col overflow-hidden', false);
     $response->assertSee('mt-4 flex flex-1 min-h-0 flex-col overflow-hidden', false);
     $response->assertSee('flex min-h-0 flex-col w-full overflow-hidden bg-white', false);

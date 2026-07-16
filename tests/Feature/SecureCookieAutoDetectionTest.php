@@ -1,13 +1,15 @@
 <?php
 
 use App\Models\InstanceSettings;
+use App\Models\User;
+use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Cache;
 
-uses(\Illuminate\Foundation\Testing\RefreshDatabase::class);
+uses(RefreshDatabase::class);
 
 beforeEach(function () {
     Cache::forget('instance_settings_fqdn_host');
-    InstanceSettings::updateOrCreate(['id' => 0], ['fqdn' => null]);
+    InstanceSettings::forceCreate(['id' => 0, 'fqdn' => null]);
     // Ensure session.secure starts unconfigured for each test
     config(['session.secure' => null]);
 });
@@ -48,6 +50,8 @@ it('does not override explicit SESSION_SECURE_COOKIE=true', function () {
 });
 
 it('marks session cookie with Secure flag when accessed over HTTPS proxy', function () {
+    User::factory()->create();
+
     $response = $this->get('/login', [
         'X-Forwarded-Proto' => 'https',
         'X-Forwarded-For' => '1.2.3.4',

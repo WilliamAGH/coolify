@@ -12,7 +12,7 @@ class EnsureTokenBelongsToCurrentTeamMember
     {
         $user = $request->user();
         $token = $user?->currentAccessToken();
-        $teamId = $token?->team_id;
+        $teamId = data_get($token, 'team_id');
 
         if (! $user || ! $token || is_null($teamId)) {
             return response()->json(['message' => 'Invalid token.'], 401);

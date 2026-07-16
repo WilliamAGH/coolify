@@ -4,6 +4,7 @@ use App\Models\InstanceSettings;
 use App\Models\Server;
 use App\Notifications\Server\ServerPatchCheck;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Once;
 
 uses(RefreshDatabase::class);
 
@@ -11,8 +12,9 @@ beforeEach(function () {
     // Create a real InstanceSettings record in the test database
     // This avoids Mockery alias/overload issues that pollute global state
     $this->setInstanceSettings = function ($fqdn = null, $publicIpv4 = null, $publicIpv6 = null) {
+        Once::flush();
         InstanceSettings::query()->delete();
-        InstanceSettings::create([
+        InstanceSettings::forceCreate([
             'id' => 0,
             'fqdn' => $fqdn,
             'public_ipv4' => $publicIpv4,

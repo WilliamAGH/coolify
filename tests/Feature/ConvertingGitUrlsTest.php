@@ -3,7 +3,11 @@
 use App\Models\GithubApp;
 
 test('convertGitUrlsForDeployKeyAndGithubAppAndHttpUrl', function () {
-    $githubApp = GithubApp::find(0);
+    $githubApp = new GithubApp([
+        'html_url' => 'https://github.com',
+        'custom_user' => 'git',
+        'custom_port' => 22,
+    ]);
     $result = convertGitUrl('andrasbacsai/coolify-examples.git', 'deploy_key', $githubApp);
     expect($result)->toBe([
         'repository' => 'git@github.com:andrasbacsai/coolify-examples.git',
@@ -13,7 +17,11 @@ test('convertGitUrlsForDeployKeyAndGithubAppAndHttpUrl', function () {
 });
 
 test('convertGitUrlsForDeployKeyAndGithubAppAndSshUrl', function () {
-    $githubApp = GithubApp::find(0);
+    $githubApp = new GithubApp([
+        'html_url' => 'https://github.com',
+        'custom_user' => 'git',
+        'custom_port' => 22,
+    ]);
     $result = convertGitUrl('git@github.com:andrasbacsai/coolify-examples.git', 'deploy_key', $githubApp);
     expect($result)->toBe([
         'repository' => 'git@github.com:andrasbacsai/coolify-examples.git',

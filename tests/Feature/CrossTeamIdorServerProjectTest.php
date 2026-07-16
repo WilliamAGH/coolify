@@ -8,6 +8,7 @@ use App\Livewire\Project\DeleteProject;
 use App\Models\Application;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\Environment;
+use App\Models\InstanceSettings;
 use App\Models\Project;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
@@ -20,6 +21,11 @@ use Livewire\Livewire;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
+    InstanceSettings::forceCreate([
+        'id' => 0,
+        'is_api_enabled' => true,
+    ]);
+
     // Attacker: Team A
     $this->userA = User::factory()->create();
     $this->teamA = Team::factory()->create();
@@ -154,7 +160,7 @@ describe('DeployController API Server IDOR', function () {
         // Create a deployment queue entry that references Team B's server as build_server
         $application = Application::factory()->create([
             'environment_id' => $this->environmentA->id,
-            'destination_id' => StandaloneDocker::factory()->create(['server_id' => $this->serverA->id])->id,
+            'destination_id' => $this->serverA->standaloneDockers()->firstOrFail()->id,
             'destination_type' => StandaloneDocker::class,
         ]);
 
@@ -167,10 +173,11 @@ describe('DeployController API Server IDOR', function () {
         ]);
 
         $token = $this->userA->createToken('test-token', ['*']);
+        auth()->logout();
 
         $response = $this->withHeaders([
             'Authorization' => 'Bearer '.$token->plainTextToken,
-        ])->deleteJson("/api/v1/deployments/{$deployment->deployment_uuid}");
+        ])->postJson("/api/v1/deployments/{$deployment->deployment_uuid}/cancel");
 
         // The cancellation should proceed but the build_server should NOT be found
         // (team-scoped query returns null for Team B's server)

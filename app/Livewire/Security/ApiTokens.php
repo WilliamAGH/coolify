@@ -4,6 +4,7 @@ namespace App\Livewire\Security;
 
 use App\Models\InstanceSettings;
 use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
+use Illuminate\Validation\ValidationException;
 use Laravel\Sanctum\PersonalAccessToken;
 use Livewire\Attributes\Locked;
 use Livewire\Component;
@@ -14,7 +15,7 @@ class ApiTokens extends Component
 
     public ?string $description = null;
 
-    public ?int $expiresInDays = 30;
+    public ?int $expiresInDays = null;
 
     public $tokens = [];
 
@@ -43,6 +44,7 @@ class ApiTokens extends Component
 
     public function mount()
     {
+        $this->expiresInDays = 30;
         $this->isApiEnabled = InstanceSettings::get()->is_api_enabled;
         $this->canUseRootPermissions = auth()->user()->can('useRootPermissions', PersonalAccessToken::class);
         $this->canUseWritePermissions = auth()->user()->can('useWritePermissions', PersonalAccessToken::class);
@@ -109,6 +111,8 @@ class ApiTokens extends Component
             $token = auth()->user()->createToken($this->description, array_values($this->permissions), $expiresAt);
             $this->getTokens();
             session()->flash('token', $token->plainTextToken);
+        } catch (ValidationException $exception) {
+            throw $exception;
         } catch (\Exception $e) {
             return handleError($e, $this);
         }

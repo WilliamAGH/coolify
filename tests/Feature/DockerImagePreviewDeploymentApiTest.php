@@ -3,6 +3,7 @@
 use App\Models\Application;
 use App\Models\ApplicationPreview;
 use App\Models\Environment;
+use App\Models\InstanceSettings;
 use App\Models\Project;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
@@ -16,6 +17,10 @@ uses(RefreshDatabase::class);
 
 beforeEach(function () {
     Queue::fake();
+    InstanceSettings::forceCreate([
+        'id' => 0,
+        'is_api_enabled' => true,
+    ]);
 
     $this->team = Team::factory()->create();
     $this->user = User::factory()->create();
@@ -108,6 +113,27 @@ test('it updates an existing docker image preview tag when redeploying through t
         ->first();
 
     expect($preview->docker_registry_image_tag)->toBe('pr_99_new');
+});
+
+test('it rejects an invalid docker tag without creating preview or deployment state', function () {
+    $application = createDockerImageApplication($this->environment, $this->destination);
+
+    $response = $this->withHeaders([
+        'Authorization' => 'Bearer '.$this->bearerToken,
+    ])->postJson('/api/v1/deploy', [
+        'uuid' => $application->uuid,
+        'pull_request_id' => 1234,
+        'docker_tag' => 'pr_1234$(touch /tmp/pwned)',
+    ]);
+
+    $response->assertUnprocessable()
+        ->assertInvalid(['docker_tag']);
+
+    expect(ApplicationPreview::query()
+        ->where('application_id', $application->id)
+        ->where('pull_request_id', 1234)
+        ->doesntExist())->toBeTrue()
+        ->and($application->deployment_queue()->doesntExist())->toBeTrue();
 });
 
 test('it rejects docker_tag without pull_request_id', function () {

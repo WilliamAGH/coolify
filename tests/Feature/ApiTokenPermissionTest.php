@@ -1,12 +1,19 @@
 <?php
 
+use App\Models\InstanceSettings;
 use App\Models\Team;
 use App\Models\User;
+use App\Policies\ApiTokenPolicy;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->create([
+        'id' => 0,
+        'is_api_enabled' => true,
+    ]));
+
     $this->team = Team::factory()->create();
     $this->user = User::factory()->create();
     $this->team->members()->attach($this->user->id, ['role' => 'owner']);
@@ -25,7 +32,7 @@ describe('POST /api/v1/projects', function () {
             'name' => 'Test Project',
         ]);
 
-        $response->assertStatus(403);
+        $response->assertForbidden();
     });
 
     test('write token can create a project', function () {
@@ -38,7 +45,7 @@ describe('POST /api/v1/projects', function () {
             'name' => 'Test Project',
         ]);
 
-        $response->assertStatus(201);
+        $response->assertCreated();
         $response->assertJsonStructure(['uuid']);
     });
 
@@ -52,7 +59,7 @@ describe('POST /api/v1/projects', function () {
             'name' => 'Test Project',
         ]);
 
-        $response->assertStatus(201);
+        $response->assertCreated();
         $response->assertJsonStructure(['uuid']);
     });
 });
@@ -70,7 +77,7 @@ describe('POST /api/v1/servers', function () {
             'private_key_uuid' => 'fake-uuid',
         ]);
 
-        $response->assertStatus(403);
+        $response->assertForbidden();
     });
 });
 
@@ -82,7 +89,7 @@ describe('GET /api/v1/servers/{uuid}/validate', function () {
             'Authorization' => 'Bearer '.$token->plainTextToken,
         ])->getJson('/api/v1/servers/fake-uuid/validate');
 
-        $response->assertStatus(403);
+        $response->assertForbidden();
     });
 });
 
@@ -95,6 +102,20 @@ describe('POST /api/v1/cloud-tokens/{uuid}/validate', function () {
             'Content-Type' => 'application/json',
         ])->postJson('/api/v1/cloud-tokens/fake-uuid/validate');
 
-        $response->assertStatus(403);
+        $response->assertForbidden();
     });
+});
+
+test('team members cannot grant write or root token permissions', function () {
+    $member = User::factory()->create();
+    $this->team->members()->attach($member->id, ['role' => 'member']);
+    $member->load('teams');
+
+    $this->actingAs($member);
+    refreshSession($this->team);
+
+    $policy = new ApiTokenPolicy;
+
+    expect($policy->useWritePermissions($member))->toBeFalse()
+        ->and($policy->useRootPermissions($member))->toBeFalse();
 });

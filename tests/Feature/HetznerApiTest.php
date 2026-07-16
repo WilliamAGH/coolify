@@ -1,6 +1,7 @@
 <?php
 
 use App\Models\CloudProviderToken;
+use App\Models\InstanceSettings;
 use App\Models\PrivateKey;
 use App\Models\Team;
 use App\Models\User;
@@ -10,6 +11,10 @@ use Illuminate\Support\Facades\Http;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
+    config()->set('app.maintenance.driver', 'file');
+    config()->set('cache.default', 'array');
+    InstanceSettings::forceCreate(['id' => 0, 'is_api_enabled' => true]);
+
     // Create a team with owner
     $this->team = Team::factory()->create();
     $this->user = User::factory()->create();
@@ -190,7 +195,7 @@ describe('GET /api/v1/hetzner/images', function () {
 describe('GET /api/v1/hetzner/ssh-keys', function () {
     test('gets Hetzner SSH keys', function () {
         Http::fake([
-            'https://api.hetzner.cloud/v1/ssh_keys*' => Http::response([
+            'https://api.hetzner.cloud/v1/ssh_keys?*' => Http::response([
                 'ssh_keys' => [
                     ['id' => 1, 'name' => 'my-key', 'fingerprint' => 'aa:bb:cc:dd'],
                     ['id' => 2, 'name' => 'another-key', 'fingerprint' => 'ee:ff:11:22'],
@@ -214,7 +219,7 @@ describe('POST /api/v1/servers/hetzner', function () {
     test('creates a Hetzner server', function () {
         // Mock Hetzner API calls
         Http::fake([
-            'https://api.hetzner.cloud/v1/ssh_keys*' => Http::response([
+            'https://api.hetzner.cloud/v1/ssh_keys?*' => Http::response([
                 'ssh_keys' => [],
                 'meta' => ['pagination' => ['next_page' => null]],
             ], 200),
@@ -262,7 +267,7 @@ describe('POST /api/v1/servers/hetzner', function () {
 
     test('generates server name if not provided', function () {
         Http::fake([
-            'https://api.hetzner.cloud/v1/ssh_keys*' => Http::response([
+            'https://api.hetzner.cloud/v1/ssh_keys?*' => Http::response([
                 'ssh_keys' => [],
                 'meta' => ['pagination' => ['next_page' => null]],
             ], 200),
@@ -300,16 +305,18 @@ describe('POST /api/v1/servers/hetzner', function () {
         $response = $this->withHeaders([
             'Authorization' => 'Bearer '.$this->bearerToken,
             'Content-Type' => 'application/json',
-        ])->postJson('/api/v1/servers/hetzner', []);
-
-        $response->assertStatus(422);
-        $response->assertJsonValidationErrors([
-            'cloud_provider_token_id',
-            'location',
-            'server_type',
-            'image',
-            'private_key_uuid',
+        ])->postJson('/api/v1/servers/hetzner', [
+            'name' => 'test-server',
         ]);
+
+        $response->assertUnprocessable()
+            ->assertJsonValidationErrors([
+                'cloud_provider_token_id',
+                'location',
+                'server_type',
+                'image',
+                'private_key_uuid',
+            ]);
     });
 
     test('validates cloud_provider_token_id exists', function () {
@@ -346,7 +353,7 @@ describe('POST /api/v1/servers/hetzner', function () {
 
     test('prefers IPv4 when both IPv4 and IPv6 are enabled', function () {
         Http::fake([
-            'https://api.hetzner.cloud/v1/ssh_keys*' => Http::response([
+            'https://api.hetzner.cloud/v1/ssh_keys?*' => Http::response([
                 'ssh_keys' => [],
                 'meta' => ['pagination' => ['next_page' => null]],
             ], 200),
@@ -383,7 +390,7 @@ describe('POST /api/v1/servers/hetzner', function () {
 
     test('uses IPv6 when only IPv6 is enabled', function () {
         Http::fake([
-            'https://api.hetzner.cloud/v1/ssh_keys*' => Http::response([
+            'https://api.hetzner.cloud/v1/ssh_keys?*' => Http::response([
                 'ssh_keys' => [],
                 'meta' => ['pagination' => ['next_page' => null]],
             ], 200),

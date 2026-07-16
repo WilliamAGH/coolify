@@ -4,6 +4,9 @@ use App\Models\Application;
 use App\Models\EnvironmentVariable;
 use App\Models\Team;
 use App\Models\User;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+
+uses(RefreshDatabase::class);
 
 beforeEach(function () {
     $this->user = User::factory()->create();
@@ -83,7 +86,7 @@ test('comment field can be mass assigned with long text', function () {
     expect(strlen($env->comment))->toBe(strlen($comment));
 });
 
-test('all boolean fields default correctly when not provided', function () {
+test('all boolean fields use their model defaults when not provided', function () {
     $env = EnvironmentVariable::create([
         'key' => 'TEST_VAR',
         'value' => 'test_value',
@@ -91,12 +94,13 @@ test('all boolean fields default correctly when not provided', function () {
         'resourceable_id' => $this->application->id,
     ]);
 
-    // Boolean fields can be null or false depending on database defaults
-    expect($env->is_multiline)->toBeIn([false, null]);
-    expect($env->is_preview)->toBeIn([false, null]);
-    expect($env->is_runtime)->toBeIn([false, null]);
-    expect($env->is_buildtime)->toBeIn([false, null]);
-    expect($env->is_shown_once)->toBeIn([false, null]);
+    expect($env->is_literal)->toBeFalse();
+    expect($env->is_multiline)->toBeFalse();
+    expect($env->is_preview)->toBeFalse();
+    expect($env->is_runtime)->toBeTrue();
+    expect($env->is_buildtime)->toBeTrue();
+    expect($env->is_shown_once)->toBeFalse();
+    expect($env->is_required)->toBeFalse();
 });
 
 test('value field is properly encrypted when mass assigned', function () {
@@ -113,7 +117,7 @@ test('value field is properly encrypted when mass assigned', function () {
     expect($env->value)->toBe($plainValue);
 
     // Verify it's actually encrypted in the database
-    $rawValue = \DB::table('environment_variables')
+    $rawValue = DB::table('environment_variables')
         ->where('id', $env->id)
         ->value('value');
 
@@ -121,7 +125,7 @@ test('value field is properly encrypted when mass assigned', function () {
     expect($rawValue)->not->toBeNull();
 });
 
-test('key field is trimmed and spaces replaced with underscores', function () {
+test('key field is trimmed and spaces are replaced with underscores', function () {
     $env = EnvironmentVariable::create([
         'key' => '  TEST KEY WITH SPACES  ',
         'value' => 'test_value',

@@ -3,7 +3,10 @@
 use App\Livewire\Project\Application\General;
 use App\Models\Application;
 use App\Models\Environment;
+use App\Models\InstanceSettings;
 use App\Models\Project;
+use App\Models\Server;
+use App\Models\StandaloneDocker;
 use App\Models\Team;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -12,6 +15,8 @@ use Livewire\Livewire;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
+    InstanceSettings::forceCreate(['id' => 0]);
+
     $this->team = Team::factory()->create();
     $this->user = User::factory()->create();
     $this->team->members()->attach($this->user->id, ['role' => 'owner']);
@@ -21,13 +26,20 @@ beforeEach(function () {
 
     $this->project = Project::factory()->create(['team_id' => $this->team->id]);
     $this->environment = Environment::factory()->create(['project_id' => $this->project->id]);
+    $this->server = Server::factory()->create(['team_id' => $this->team->id]);
+    $this->destination = $this->server->standaloneDockers()->firstOrFail();
 });
 
 describe('Application Redirect', function () {
     test('setRedirect persists the redirect value to the database', function () {
         $application = Application::factory()->create([
             'environment_id' => $this->environment->id,
+            'destination_id' => $this->destination->id,
+            'destination_type' => StandaloneDocker::class,
             'fqdn' => 'https://example.com,https://www.example.com',
+            'is_http_basic_auth_enabled' => false,
+            'static_image' => 'nginx:alpine',
+            'base_directory' => '/',
             'redirect' => 'both',
         ]);
 
@@ -44,7 +56,12 @@ describe('Application Redirect', function () {
     test('setRedirect rejects www redirect when no www domain exists', function () {
         $application = Application::factory()->create([
             'environment_id' => $this->environment->id,
+            'destination_id' => $this->destination->id,
+            'destination_type' => StandaloneDocker::class,
             'fqdn' => 'https://example.com',
+            'is_http_basic_auth_enabled' => false,
+            'static_image' => 'nginx:alpine',
+            'base_directory' => '/',
             'redirect' => 'both',
         ]);
 
