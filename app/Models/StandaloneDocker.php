@@ -2,11 +2,14 @@
 
 namespace App\Models;
 
+use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
 use App\Jobs\ConnectProxyToNetworksJob;
 use App\Support\ValidationPatterns;
 use App\Traits\HasSafeStringAttribute;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Support\Facades\DB;
 
 class StandaloneDocker extends BaseModel
 {
@@ -22,7 +25,7 @@ class StandaloneDocker extends BaseModel
     protected static function boot()
     {
         parent::boot();
-        static::saving(function (StandaloneDocker $standaloneDocker): void {
+        static::updating(function (StandaloneDocker $standaloneDocker): void {
             if ($standaloneDocker->isDirty(['server_id', 'network'])) {
                 $standaloneDocker->assertBlueGreenTopologyCanChange();
             }
@@ -36,8 +39,30 @@ class StandaloneDocker extends BaseModel
             instant_remote_process([
                 "docker network inspect {$safeNetwork} >/dev/null 2>&1 || docker network create --driver overlay --attachable {$safeNetwork} >/dev/null",
             ], $server, false);
-            ConnectProxyToNetworksJob::dispatchSync($server);
+            ConnectProxyToNetworksJob::dispatch($server)->afterCommit();
         });
+    }
+
+    protected function performUpdate(Builder $query)
+    {
+        if (! $this->isDirty(['server_id', 'network'])) {
+            return parent::performUpdate($query);
+        }
+
+        return DB::transaction(function () use ($query): bool {
+            BlueGreenTopologyLock::acquire();
+
+            return parent::performUpdate($query);
+        }, attempts: 5);
+    }
+
+    public function delete()
+    {
+        return DB::transaction(function (): ?bool {
+            BlueGreenTopologyLock::acquire();
+
+            return parent::delete();
+        }, attempts: 5);
     }
 
     public function setNetworkAttribute(string $value): void

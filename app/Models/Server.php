@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
 use App\Actions\Proxy\StartProxy;
 use App\Actions\Server\InstallDocker;
 use App\Actions\Server\InstallPrerequisites;
@@ -138,6 +139,8 @@ class Server extends BaseModel
             }
             $server->fill($payload);
 
+        });
+        static::updating(function ($server) {
             if ($server->isDirty('proxy')) {
                 $server->assertBlueGreenTopologyCanChange(
                     willBeSwarm: $server->isSwarm(),
@@ -223,6 +226,19 @@ class Server extends BaseModel
         });
     }
 
+    protected function performUpdate(Builder $query)
+    {
+        if (! $this->isDirty('proxy')) {
+            return parent::performUpdate($query);
+        }
+
+        return DB::transaction(function () use ($query): bool {
+            BlueGreenTopologyLock::acquire();
+
+            return parent::performUpdate($query);
+        }, attempts: 5);
+    }
+
     /**
      * Find a Server by ID using the identity map cache.
      * This prevents N+1 queries when the same Server is accessed multiple times.
@@ -282,6 +298,7 @@ class Server extends BaseModel
         'hetzner_server_id',
         'hetzner_server_status',
         'is_validating',
+        'validation_logs',
         'detected_traefik_version',
         'traefik_outdated_info',
         'server_metadata',

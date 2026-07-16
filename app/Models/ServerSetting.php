@@ -2,9 +2,12 @@
 
 namespace App\Models;
 
+use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
 use Illuminate\Contracts\Encryption\DecryptException;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use OpenApi\Attributes as OA;
 
@@ -107,6 +110,7 @@ class ServerSetting extends Model
         'force_docker_cleanup' => 'boolean',
         'docker_cleanup_threshold' => 'integer',
         'sentinel_token' => 'encrypted',
+        'is_build_server' => 'boolean',
         'is_reachable' => 'boolean',
         'is_swarm_manager' => 'boolean',
         'is_swarm_worker' => 'boolean',
@@ -118,7 +122,7 @@ class ServerSetting extends Model
 
     protected static function booted()
     {
-        static::saving(function (ServerSetting $setting): void {
+        static::updating(function (ServerSetting $setting): void {
             if (! $setting->isDirty(['is_swarm_manager', 'is_swarm_worker'])) {
                 return;
             }
@@ -156,6 +160,19 @@ class ServerSetting extends Model
                 $settings->server->restartSentinel();
             }
         });
+    }
+
+    protected function performUpdate(Builder $query)
+    {
+        if (! $this->isDirty(['is_swarm_manager', 'is_swarm_worker'])) {
+            return parent::performUpdate($query);
+        }
+
+        return DB::transaction(function () use ($query): bool {
+            BlueGreenTopologyLock::acquire();
+
+            return parent::performUpdate($query);
+        }, attempts: 5);
     }
 
     /**

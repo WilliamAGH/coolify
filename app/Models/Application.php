@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentPhase;
@@ -332,6 +333,8 @@ class Application extends BaseModel
                     $application->custom_healthcheck_found = false;
                 }
             }
+        });
+        static::updating(function ($application) {
             if ($application->hasBlueGreenEligibilityAffectingChanges()) {
                 $application->prepareBlueGreenConfigurationMutation();
             }
@@ -383,6 +386,7 @@ class Application extends BaseModel
         }
 
         return DB::transaction(function () use ($query): bool {
+            BlueGreenTopologyLock::acquire();
             $application = self::withTrashed()
                 ->whereKey($this->getKey())
                 ->lockForUpdate()
