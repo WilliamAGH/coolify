@@ -98,9 +98,7 @@ describe('executeInDocker git log escaping', function () {
         $command = 'cd /workdir && git log -1 '.escapeshellarg($maliciousCommit).' --pretty=%B';
         $result = executeInDocker('test-container', $command);
 
-        // The malicious payload must not be able to break out of quoting
-        expect($result)->not->toContain('id;');
-        expect($result)->toContain("'HEAD'\\''");
+        expect($result)->toBe('docker exec test-container bash -c '.escapeShellValue($command));
     });
 });
 
@@ -119,7 +117,6 @@ describe('buildGitCheckoutCommand escaping', function () {
         expect($result)->toContain("git checkout 'abc123'");
 
         $result = $method->invoke($app, "abc'; id; #");
-        expect($result)->not->toContain('id;');
-        expect($result)->toContain("git checkout 'abc'");
+        expect($result)->toContain("git checkout 'abc'\\''; id; #'");
     });
 });

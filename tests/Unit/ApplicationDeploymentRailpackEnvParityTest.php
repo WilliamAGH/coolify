@@ -57,23 +57,18 @@ it('generates escaped railpack env args from resolved values and includes instal
 
     $reflection = new ReflectionClass(ApplicationDeploymentJob::class);
     $applicationProperty = $reflection->getProperty('application');
-    $applicationProperty->setAccessible(true);
     $applicationProperty->setValue($job, $application);
 
     $pullRequestProperty = $reflection->getProperty('pull_request_id');
-    $pullRequestProperty->setAccessible(true);
     $pullRequestProperty->setValue($job, 0);
 
     $mainServerProperty = $reflection->getProperty('mainServer');
-    $mainServerProperty->setAccessible(true);
     $mainServerProperty->setValue($job, Mockery::mock(Server::class));
 
     $method = $reflection->getMethod('generate_railpack_env_variables');
-    $method->setAccessible(true);
     $variables = $method->invoke($job);
 
     $envArgsProperty = $reflection->getProperty('env_railpack_args');
-    $envArgsProperty->setAccessible(true);
     $envArgs = $envArgsProperty->getValue($job);
 
     expect($variables->all())->toBe([
@@ -119,19 +114,15 @@ it('uses preview railpack environment variables for preview deployments', functi
 
     $reflection = new ReflectionClass(ApplicationDeploymentJob::class);
     $applicationProperty = $reflection->getProperty('application');
-    $applicationProperty->setAccessible(true);
     $applicationProperty->setValue($job, $application);
 
     $pullRequestProperty = $reflection->getProperty('pull_request_id');
-    $pullRequestProperty->setAccessible(true);
     $pullRequestProperty->setValue($job, 42);
 
     $mainServerProperty = $reflection->getProperty('mainServer');
-    $mainServerProperty->setAccessible(true);
     $mainServerProperty->setValue($job, Mockery::mock(Server::class));
 
     $method = $reflection->getMethod('generate_railpack_env_variables');
-    $method->setAccessible(true);
     $variables = $method->invoke($job);
 
     expect($variables->all())->toBe([
@@ -178,19 +169,15 @@ it('merges coolify env variables into railpack build variables', function () {
 
     $reflection = new ReflectionClass(ApplicationDeploymentJob::class);
     $applicationProperty = $reflection->getProperty('application');
-    $applicationProperty->setAccessible(true);
     $applicationProperty->setValue($job, $application);
 
     $pullRequestProperty = $reflection->getProperty('pull_request_id');
-    $pullRequestProperty->setAccessible(true);
     $pullRequestProperty->setValue($job, 0);
 
     $mainServerProperty = $reflection->getProperty('mainServer');
-    $mainServerProperty->setAccessible(true);
     $mainServerProperty->setValue($job, Mockery::mock(Server::class));
 
     $method = $reflection->getMethod('generate_railpack_env_variables');
-    $method->setAccessible(true);
     $variables = $method->invoke($job);
 
     expect($variables->all())->toBe([
@@ -204,7 +191,6 @@ it('merges coolify env variables into railpack build variables', function () {
     ]);
 
     $envArgsProperty = $reflection->getProperty('env_railpack_args');
-    $envArgsProperty->setAccessible(true);
     $envArgs = $envArgsProperty->getValue($job);
 
     expect($envArgs)->toContain("--env 'COOLIFY_URL=https://app.example.com'");
@@ -242,25 +228,20 @@ it('preserves user railpack deploy apt packages while adding healthcheck tools o
 
     $reflection = new ReflectionClass(ApplicationDeploymentJob::class);
     $applicationProperty = $reflection->getProperty('application');
-    $applicationProperty->setAccessible(true);
     $applicationProperty->setValue($job, $application);
 
     $pullRequestProperty = $reflection->getProperty('pull_request_id');
-    $pullRequestProperty->setAccessible(true);
     $pullRequestProperty->setValue($job, 0);
 
     $mainServerProperty = $reflection->getProperty('mainServer');
-    $mainServerProperty->setAccessible(true);
     $mainServerProperty->setValue($job, Mockery::mock(Server::class));
 
     $method = $reflection->getMethod('generate_railpack_env_variables');
-    $method->setAccessible(true);
     $variables = $method->invoke($job);
 
     expect($variables->get('RAILPACK_DEPLOY_APT_PACKAGES'))->toBe('ffmpeg curl wget');
 
     $envArgsProperty = $reflection->getProperty('env_railpack_args');
-    $envArgsProperty->setAccessible(true);
     $envArgs = $envArgsProperty->getValue($job);
 
     expect($envArgs)->toContain("--env 'RAILPACK_DEPLOY_APT_PACKAGES=ffmpeg curl wget'");

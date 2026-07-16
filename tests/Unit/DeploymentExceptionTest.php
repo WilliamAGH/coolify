@@ -9,7 +9,6 @@ test('DeploymentException is in the dontReport array', function () {
     // Use reflection to access the protected $dontReport property
     $reflection = new ReflectionClass($handler);
     $property = $reflection->getProperty('dontReport');
-    $property->setAccessible(true);
     $dontReport = $property->getValue($handler);
 
     expect($dontReport)->toContain(DeploymentException::class);
@@ -47,8 +46,6 @@ test('DeploymentException is not reported when thrown', function () {
     // Check that the exception should not be reported
     $reflection = new ReflectionClass($handler);
     $method = $reflection->getMethod('shouldReport');
-    $method->setAccessible(true);
-
     $shouldReport = $method->invoke($handler, $exception);
 
     expect($shouldReport)->toBeFalse();
@@ -63,8 +60,6 @@ test('RuntimeException is still reported when thrown', function () {
     // Check that the exception should be reported
     $reflection = new ReflectionClass($handler);
     $method = $reflection->getMethod('shouldReport');
-    $method->setAccessible(true);
-
     $shouldReport = $method->invoke($handler, $exception);
 
     expect($shouldReport)->toBeTrue();

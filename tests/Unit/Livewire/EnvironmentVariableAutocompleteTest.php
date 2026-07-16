@@ -1,6 +1,7 @@
 <?php
 
 use App\Livewire\Project\Shared\EnvironmentVariable\Add;
+use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Support\Facades\Auth;
 
 it('has availableSharedVariables computed property', function () {
@@ -36,18 +37,37 @@ it('returns empty arrays when currentTeam returns null', function () {
         'team' => [],
         'project' => [],
         'environment' => [],
+        'server' => [],
     ]);
 });
 
-it('availableSharedVariables method wraps authorization checks in try-catch blocks', function () {
-    // Read the source code to verify the authorization pattern
-    $reflectionMethod = new ReflectionMethod(Add::class, 'availableSharedVariables');
-    $source = file_get_contents($reflectionMethod->getFileName());
+it('does not expose shared variables when authorization is denied', function () {
+    $team = new stdClass;
+    $user = new class($team)
+    {
+        public function __construct(private object $team) {}
 
-    // Verify that the method contains authorization checks
-    expect($source)->toContain('$this->authorize(\'view\', $team)')
-        ->and($source)->toContain('$this->authorize(\'view\', $project)')
-        ->and($source)->toContain('$this->authorize(\'view\', $environment)')
-        // Verify authorization checks are wrapped in try-catch blocks
-        ->and($source)->toContain('} catch (\Illuminate\Auth\Access\AuthorizationException $e) {');
+        public function currentTeam(): object
+        {
+            return $this->team;
+        }
+    };
+
+    Auth::shouldReceive('user')->andReturn($user);
+
+    $component = new class extends Add
+    {
+        public function authorize($ability, $arguments = [])
+        {
+            throw new AuthorizationException;
+        }
+    };
+    $component->parameters = [];
+
+    expect($component->availableSharedVariables())->toBe([
+        'team' => [],
+        'project' => [],
+        'environment' => [],
+        'server' => [],
+    ]);
 });

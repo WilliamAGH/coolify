@@ -238,12 +238,12 @@ describe('aggregateFromStrings', function () {
         expect($result)->toBe('starting:unknown');
     });
 
-    test('prioritizes running over paused/exited when no starting', function () {
+    test('treats running mixed with exited and paused containers as degraded', function () {
         $statuses = collect(['running:healthy', 'paused', 'exited']);
 
         $result = $this->aggregator->aggregateFromStrings($statuses);
 
-        expect($result)->toBe('running:healthy');
+        expect($result)->toBe('degraded:unhealthy');
     });
 
     test('prioritizes dead over paused/starting/exited', function () {

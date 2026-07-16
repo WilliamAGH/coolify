@@ -358,6 +358,38 @@ function parseDockerVolumeString(string $volumeString): array
     ];
 }
 
+/**
+ * Remove one-time volume materialization fields while preserving the user's raw Compose definition.
+ */
+function sanitizeDockerComposeRaw(string $originalCompose): string
+{
+    $originalYaml = Yaml::parse($originalCompose);
+
+    if (isset($originalYaml['services'])) {
+        foreach ($originalYaml['services'] as &$service) {
+            if (! isset($service['volumes'])) {
+                continue;
+            }
+
+            foreach ($service['volumes'] as &$volume) {
+                if (! is_array($volume)) {
+                    continue;
+                }
+
+                unset($volume['content']);
+                unset($volume['isDirectory']);
+                unset($volume['is_directory']);
+            }
+
+            unset($volume);
+        }
+
+        unset($service);
+    }
+
+    return Yaml::dump($originalYaml, 10, 2);
+}
+
 function applicationParser(Application $resource, int $pull_request_id = 0, ?int $preview_id = null, ?string $commit = null): Collection
 {
     $uuid = data_get($resource, 'uuid');
@@ -1471,24 +1503,8 @@ function applicationParser(Application $resource, int $pull_request_id = 0, ?int
 
     // Update docker_compose_raw to remove content: from volumes only
     // This keeps the original user input clean while preventing content reapplication
-    // Parse the original compose again to create a clean version without Coolify additions
     try {
-        $originalYaml = Yaml::parse($originalCompose);
-        // Remove content, isDirectory, and is_directory from all volume definitions
-        if (isset($originalYaml['services'])) {
-            foreach ($originalYaml['services'] as $serviceName => &$service) {
-                if (isset($service['volumes'])) {
-                    foreach ($service['volumes'] as $key => &$volume) {
-                        if (is_array($volume)) {
-                            unset($volume['content']);
-                            unset($volume['isDirectory']);
-                            unset($volume['is_directory']);
-                        }
-                    }
-                }
-            }
-        }
-        $resource->docker_compose_raw = Yaml::dump($originalYaml, 10, 2);
+        $resource->docker_compose_raw = sanitizeDockerComposeRaw($originalCompose);
     } catch (Exception $e) {
         // If parsing fails, keep the original docker_compose_raw unchanged
         ray('Failed to update docker_compose_raw in applicationParser: '.$e->getMessage());
@@ -2728,24 +2744,8 @@ function serviceParser(Service $resource): Collection
 
     // Update docker_compose_raw to remove content: from volumes only
     // This keeps the original user input clean while preventing content reapplication
-    // Parse the original compose again to create a clean version without Coolify additions
     try {
-        $originalYaml = Yaml::parse($originalCompose);
-        // Remove content, isDirectory, and is_directory from all volume definitions
-        if (isset($originalYaml['services'])) {
-            foreach ($originalYaml['services'] as $serviceName => &$service) {
-                if (isset($service['volumes'])) {
-                    foreach ($service['volumes'] as $key => &$volume) {
-                        if (is_array($volume)) {
-                            unset($volume['content']);
-                            unset($volume['isDirectory']);
-                            unset($volume['is_directory']);
-                        }
-                    }
-                }
-            }
-        }
-        $resource->docker_compose_raw = Yaml::dump($originalYaml, 10, 2);
+        $resource->docker_compose_raw = sanitizeDockerComposeRaw($originalCompose);
     } catch (Exception $e) {
         // If parsing fails, keep the original docker_compose_raw unchanged
         ray('Failed to update docker_compose_raw in serviceParser: '.$e->getMessage());

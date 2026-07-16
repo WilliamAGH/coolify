@@ -1,6 +1,7 @@
 <?php
 
 use App\Models\Application;
+use App\Models\Service;
 
 /**
  * Unit tests to verify that containers without health checks are not
@@ -176,17 +177,15 @@ it('preserves unknown health state in ContainerStatusAggregator aggregated statu
 });
 
 it('preserves unknown health state in Service model aggregation', function () {
-    $serviceFile = file_get_contents(__DIR__.'/../../app/Models/Service.php');
+    $service = Mockery::mock(Service::class)->makePartial();
+    $service->shouldReceive('isStarting')->andReturn(false);
+    $service->shouldReceive('getAttribute')->with('applications')->andReturn(collect([
+        (object) ['status' => 'running:healthy', 'exclude_from_status' => false],
+        (object) ['status' => 'running:unknown', 'exclude_from_status' => false],
+    ]));
+    $service->shouldReceive('getAttribute')->with('databases')->andReturn(collect());
 
-    // Verify unknown is handled correctly
-    expect($serviceFile)
-        ->toContain("} elseif (\$health->value() === 'unknown') {")
-        ->toContain("if (\$aggregateHealth !== 'unhealthy') {")
-        ->toContain("\$aggregateHealth = 'unknown';");
-
-    // The pattern should appear at least once (Service model has different aggregation logic than ContainerStatusAggregator)
-    $unknownCount = substr_count($serviceFile, "} elseif (\$health->value() === 'unknown') {");
-    expect($unknownCount)->toBeGreaterThan(0);
+    expect($service->status)->toBe('running:unknown');
 });
 
 it('handles starting state (created/starting) in GetContainersStatus', function () {
@@ -285,19 +284,24 @@ it('handles edge case states in ContainerStatusAggregator aggregation', function
 });
 
 it('handles edge case states in Service model', function () {
-    $serviceFile = file_get_contents(__DIR__.'/../../app/Models/Service.php');
+    $expectedStatuses = [
+        'created:unknown' => 'starting:unknown',
+        'starting:unknown' => 'starting:unknown',
+        'paused:unknown' => 'paused:unknown',
+        'dead:unhealthy' => 'degraded:unhealthy',
+        'removing:unhealthy' => 'degraded:unhealthy',
+    ];
 
-    // Check for created/starting handling pattern
-    $createdStartingCount = substr_count($serviceFile, "\$status->startsWith('created') || \$status->startsWith('starting')");
-    expect($createdStartingCount)->toBeGreaterThan(0, 'created/starting handling should exist');
+    foreach ($expectedStatuses as $resourceStatus => $expectedStatus) {
+        $service = Mockery::mock(Service::class)->makePartial();
+        $service->shouldReceive('isStarting')->andReturn(false);
+        $service->shouldReceive('getAttribute')->with('applications')->andReturn(collect([
+            (object) ['status' => $resourceStatus, 'exclude_from_status' => false],
+        ]));
+        $service->shouldReceive('getAttribute')->with('databases')->andReturn(collect());
 
-    // Check for paused handling pattern
-    $pausedCount = substr_count($serviceFile, "\$status->startsWith('paused')");
-    expect($pausedCount)->toBeGreaterThan(0, 'paused handling should exist');
-
-    // Check for dead/removing handling pattern
-    $deadRemovingCount = substr_count($serviceFile, "\$status->startsWith('dead') || \$status->startsWith('removing')");
-    expect($deadRemovingCount)->toBeGreaterThan(0, 'dead/removing handling should exist');
+        expect($service->status)->toBe($expectedStatus);
+    }
 });
 
 it('appends :excluded suffix to excluded container statuses in GetContainersStatus', function () {

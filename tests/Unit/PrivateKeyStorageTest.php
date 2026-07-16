@@ -1,20 +1,29 @@
 <?php
 
 use App\Models\PrivateKey;
+use App\Models\Team;
+use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Storage;
+use PHPUnit\Framework\Attributes\Test;
 use Tests\TestCase;
 
 class PrivateKeyStorageTest extends TestCase
 {
     use RefreshDatabase;
 
+    protected Team $team;
+
     protected function setUp(): void
     {
         parent::setUp();
 
-        // Set up a test team for the tests
-        $this->actingAs(\App\Models\User::factory()->create());
+        $this->team = Team::factory()->create();
+        $user = User::factory()->create();
+        $this->team->members()->attach($user->id, ['role' => 'owner']);
+
+        $this->actingAs($user);
+        session(['currentTeam' => $this->team]);
     }
 
     protected function getValidPrivateKey(): string
@@ -28,8 +37,8 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
 -----END OPENSSH PRIVATE KEY-----';
     }
 
-    /** @test */
-    public function it_successfully_stores_private_key_in_filesystem()
+    #[Test]
+    public function it_successfully_stores_private_key_in_filesystem(): void
     {
         Storage::fake('ssh-keys');
 
@@ -52,8 +61,8 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
         $this->assertEquals($privateKey->private_key, $storedContent);
     }
 
-    /** @test */
-    public function it_throws_exception_when_storage_fails()
+    #[Test]
+    public function it_throws_exception_when_storage_fails(): void
     {
         Storage::fake('ssh-keys');
 
@@ -61,22 +70,22 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
         Storage::shouldReceive('disk')
             ->with('ssh-keys')
             ->andReturn(
-                \Mockery::mock()
+                Mockery::mock()
                     ->shouldReceive('exists')
                     ->andReturn(true)
                     ->shouldReceive('put')
-                    ->with(\Mockery::any(), 'test')
+                    ->with(Mockery::any(), 'test')
                     ->andReturn(true)
                     ->shouldReceive('delete')
-                    ->with(\Mockery::any())
+                    ->with(Mockery::any())
                     ->andReturn(true)
                     ->shouldReceive('put')
-                    ->with(\Mockery::pattern('/ssh_key@/'), \Mockery::any())
+                    ->with(Mockery::pattern('/ssh_key@/'), Mockery::any())
                     ->andReturn(false) // Simulate storage failure
                     ->getMock()
             );
 
-        $this->expectException(\Exception::class);
+        $this->expectException(Exception::class);
         $this->expectExceptionMessage('Failed to write SSH key to filesystem');
 
         PrivateKey::createAndStore([
@@ -92,8 +101,8 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
         ]);
     }
 
-    /** @test */
-    public function it_throws_exception_when_storage_directory_is_not_writable()
+    #[Test]
+    public function it_throws_exception_when_storage_directory_is_not_writable(): void
     {
         Storage::fake('ssh-keys');
 
@@ -101,17 +110,17 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
         Storage::shouldReceive('disk')
             ->with('ssh-keys')
             ->andReturn(
-                \Mockery::mock()
+                Mockery::mock()
                     ->shouldReceive('exists')
                     ->with('')
                     ->andReturn(true)
                     ->shouldReceive('put')
-                    ->with(\Mockery::pattern('/\.test_write_/'), 'test')
+                    ->with(Mockery::pattern('/\.test_write_/'), 'test')
                     ->andReturn(false) // Simulate directory not writable
                     ->getMock()
             );
 
-        $this->expectException(\Exception::class);
+        $this->expectException(Exception::class);
         $this->expectExceptionMessage('SSH keys storage directory is not writable. Run on the host: sudo chown -R 9999 /data/coolify/ssh && sudo chmod -R 700 /data/coolify/ssh && docker restart coolify');
 
         PrivateKey::createAndStore([
@@ -122,8 +131,8 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
         ]);
     }
 
-    /** @test */
-    public function it_creates_storage_directory_if_not_exists()
+    #[Test]
+    public function it_creates_storage_directory_if_not_exists(): void
     {
         Storage::fake('ssh-keys');
 
@@ -131,7 +140,7 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
         Storage::shouldReceive('disk')
             ->with('ssh-keys')
             ->andReturn(
-                \Mockery::mock()
+                Mockery::mock()
                     ->shouldReceive('exists')
                     ->with('')
                     ->andReturn(false) // Directory doesn't exist
@@ -139,20 +148,20 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
                     ->with('')
                     ->andReturn(true) // Successfully create directory
                     ->shouldReceive('put')
-                    ->with(\Mockery::pattern('/\.test_write_/'), 'test')
+                    ->with(Mockery::pattern('/\.test_write_/'), 'test')
                     ->andReturn(true) // Directory is writable after creation
                     ->shouldReceive('delete')
-                    ->with(\Mockery::pattern('/\.test_write_/'))
+                    ->with(Mockery::pattern('/\.test_write_/'))
                     ->andReturn(true)
                     ->shouldReceive('put')
-                    ->with(\Mockery::pattern('/ssh_key@/'), \Mockery::any())
+                    ->with(Mockery::pattern('/ssh_key@/'), Mockery::any())
                     ->andReturn(true)
                     ->shouldReceive('exists')
-                    ->with(\Mockery::pattern('/ssh_key@/'))
+                    ->with(Mockery::pattern('/ssh_key@/'))
                     ->andReturn(true)
                     ->shouldReceive('get')
-                    ->with(\Mockery::pattern('/ssh_key@/'))
-                    ->andReturn($this->getValidPrivateKey())
+                    ->with(Mockery::pattern('/ssh_key@/'))
+                    ->andReturn(formatPrivateKey($this->getValidPrivateKey()))
                     ->getMock()
             );
 
@@ -169,8 +178,8 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
         ]);
     }
 
-    /** @test */
-    public function it_throws_exception_when_file_content_verification_fails()
+    #[Test]
+    public function it_throws_exception_when_file_content_verification_fails(): void
     {
         Storage::fake('ssh-keys');
 
@@ -178,32 +187,32 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
         Storage::shouldReceive('disk')
             ->with('ssh-keys')
             ->andReturn(
-                \Mockery::mock()
+                Mockery::mock()
                     ->shouldReceive('exists')
                     ->with('')
                     ->andReturn(true)
                     ->shouldReceive('put')
-                    ->with(\Mockery::pattern('/\.test_write_/'), 'test')
+                    ->with(Mockery::pattern('/\.test_write_/'), 'test')
                     ->andReturn(true)
                     ->shouldReceive('delete')
-                    ->with(\Mockery::pattern('/\.test_write_/'))
+                    ->with(Mockery::pattern('/\.test_write_/'))
                     ->andReturn(true)
                     ->shouldReceive('put')
-                    ->with(\Mockery::pattern('/ssh_key@/'), \Mockery::any())
+                    ->with(Mockery::pattern('/ssh_key@/'), Mockery::any())
                     ->andReturn(true) // File created successfully
                     ->shouldReceive('exists')
-                    ->with(\Mockery::pattern('/ssh_key@/'))
+                    ->with(Mockery::pattern('/ssh_key@/'))
                     ->andReturn(true) // File exists
                     ->shouldReceive('get')
-                    ->with(\Mockery::pattern('/ssh_key@/'))
+                    ->with(Mockery::pattern('/ssh_key@/'))
                     ->andReturn('corrupted content') // But content is wrong
                     ->shouldReceive('delete')
-                    ->with(\Mockery::pattern('/ssh_key@/'))
+                    ->with(Mockery::pattern('/ssh_key@/'))
                     ->andReturn(true) // Clean up bad file
                     ->getMock()
             );
 
-        $this->expectException(\Exception::class);
+        $this->expectException(Exception::class);
         $this->expectExceptionMessage('SSH key file content verification failed');
 
         PrivateKey::createAndStore([
@@ -219,8 +228,8 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
         ]);
     }
 
-    /** @test */
-    public function it_successfully_deletes_private_key_from_filesystem()
+    #[Test]
+    public function it_successfully_deletes_private_key_from_filesystem(): void
     {
         Storage::fake('ssh-keys');
 
@@ -239,8 +248,8 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
         Storage::disk('ssh-keys')->assertMissing($filename);
     }
 
-    /** @test */
-    public function it_handles_database_transaction_rollback_on_storage_failure()
+    #[Test]
+    public function it_handles_database_transaction_rollback_on_storage_failure(): void
     {
         Storage::fake('ssh-keys');
 
@@ -251,18 +260,18 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
         Storage::shouldReceive('disk')
             ->with('ssh-keys')
             ->andReturn(
-                \Mockery::mock()
+                Mockery::mock()
                     ->shouldReceive('exists')
                     ->with('')
                     ->andReturn(true)
                     ->shouldReceive('put')
-                    ->with(\Mockery::pattern('/\.test_write_/'), 'test')
+                    ->with(Mockery::pattern('/\.test_write_/'), 'test')
                     ->andReturn(true)
                     ->shouldReceive('delete')
-                    ->with(\Mockery::pattern('/\.test_write_/'))
+                    ->with(Mockery::pattern('/\.test_write_/'))
                     ->andReturn(true)
                     ->shouldReceive('put')
-                    ->with(\Mockery::pattern('/ssh_key@/'), \Mockery::any())
+                    ->with(Mockery::pattern('/ssh_key@/'), Mockery::any())
                     ->andReturn(false) // Storage fails
                     ->getMock()
             );
@@ -274,7 +283,7 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
                 'private_key' => $this->getValidPrivateKey(),
                 'team_id' => currentTeam()->id,
             ]);
-        } catch (\Exception $e) {
+        } catch (Exception $e) {
             // Expected exception
         }
 
@@ -285,8 +294,8 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
         ]);
     }
 
-    /** @test */
-    public function it_successfully_updates_private_key_with_transaction()
+    #[Test]
+    public function it_successfully_updates_private_key_with_transaction(): void
     {
         Storage::fake('ssh-keys');
 
@@ -311,6 +320,6 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
 
         $filename = "ssh_key@{$privateKey->uuid}";
         $storedContent = Storage::disk('ssh-keys')->get($filename);
-        $this->assertEquals($newPrivateKey, $storedContent);
+        $this->assertEquals($privateKey->private_key, $storedContent);
     }
 }

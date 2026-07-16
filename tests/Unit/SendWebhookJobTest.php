@@ -25,9 +25,12 @@ it('sends webhook to valid URLs', function () {
 it('blocks webhook to loopback address', function () {
     Http::fake();
     Log::shouldReceive('warning')
-        ->once()
+        ->twice()
         ->withArgs(function ($message) {
-            return str_contains($message, 'blocked unsafe webhook URL');
+            return in_array($message, [
+                'Webhook URL points to blocked IP range',
+                'SendWebhookJob: blocked unsafe webhook URL',
+            ], true);
         });
 
     $job = new SendWebhookJob(
@@ -43,9 +46,12 @@ it('blocks webhook to loopback address', function () {
 it('blocks webhook to cloud metadata endpoint', function () {
     Http::fake();
     Log::shouldReceive('warning')
-        ->once()
+        ->twice()
         ->withArgs(function ($message) {
-            return str_contains($message, 'blocked unsafe webhook URL');
+            return in_array($message, [
+                'Webhook URL points to blocked IP range',
+                'SendWebhookJob: blocked unsafe webhook URL',
+            ], true);
         });
 
     $job = new SendWebhookJob(
@@ -61,9 +67,12 @@ it('blocks webhook to cloud metadata endpoint', function () {
 it('blocks webhook to localhost', function () {
     Http::fake();
     Log::shouldReceive('warning')
-        ->once()
+        ->twice()
         ->withArgs(function ($message) {
-            return str_contains($message, 'blocked unsafe webhook URL');
+            return in_array($message, [
+                'Webhook URL points to blocked host',
+                'SendWebhookJob: blocked unsafe webhook URL',
+            ], true);
         });
 
     $job = new SendWebhookJob(

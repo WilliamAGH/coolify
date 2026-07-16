@@ -4,6 +4,7 @@ namespace Tests\Unit;
 
 use App\Helpers\SshMultiplexingHelper;
 use App\Models\PrivateKey;
+use App\Models\Server;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
@@ -49,7 +50,7 @@ class SshKeyValidationTest extends TestCase
                 return $this;
             }
 
-            public function getKeyLocation()
+            public function getKeyLocation(): string
             {
                 return Storage::disk('ssh-keys')->path("ssh_key@{$this->uuid}");
             }
@@ -171,7 +172,7 @@ class SshKeyValidationTest extends TestCase
                 return $this;
             }
 
-            public function getKeyLocation()
+            public function getKeyLocation(): string
             {
                 return Storage::disk('ssh-keys')->path("ssh_key@{$this->uuid}");
             }
@@ -193,7 +194,7 @@ class SshKeyValidationTest extends TestCase
 
     public function test_server_model_detects_private_key_id_changes()
     {
-        $reflection = new \ReflectionMethod(\App\Models\Server::class, 'booted');
+        $reflection = new \ReflectionMethod(Server::class, 'booted');
         $filename = $reflection->getFileName();
         $startLine = $reflection->getStartLine();
         $endLine = $reflection->getEndLine();

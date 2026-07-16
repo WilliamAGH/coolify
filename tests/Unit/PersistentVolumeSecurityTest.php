@@ -49,14 +49,11 @@ it('rejects volume names with shell metacharacters', function (string $name) {
 
 it('escapeshellarg neutralizes injection in docker volume rm command', function (string $maliciousName) {
     $command = 'docker volume rm -f '.escapeshellarg($maliciousName);
+    $roundTrip = shell_exec('printf %s '.escapeshellarg($maliciousName));
 
-    // The command should contain the name as a single quoted argument,
-    // preventing shell interpretation of metacharacters
-    expect($command)->not->toContain('; ')
-        ->not->toContain('| ')
-        ->not->toContain('&& ')
-        ->not->toContain('`')
-        ->toStartWith('docker volume rm -f ');
+    expect($command)
+        ->toBe('docker volume rm -f '.escapeshellarg($maliciousName))
+        ->and($roundTrip)->toBe($maliciousName);
 })->with([
     'semicolon' => 'vol; rm -rf /',
     'pipe' => 'vol | cat /etc/passwd',

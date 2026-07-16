@@ -1,44 +1,102 @@
 <?php
 
-/**
- * Unit tests to verify that the "new image" quick action properly matches
- * the docker-image type using the quickcommand field.
- *
- * This test verifies the fix for the issue where typing "new image" would
- * not match because the frontend was only checking name and type fields,
- * not the quickcommand field.
- */
-it('ensures GlobalSearch blade template checks quickcommand field in matching logic', function () {
-    $bladeFile = file_get_contents(__DIR__.'/../../resources/views/livewire/global-search.blade.php');
+use App\Livewire\GlobalSearch;
+use Illuminate\Support\Facades\Auth;
+use Tests\TestCase;
 
-    // Check that the matching logic includes quickcommand check
-    expect($bladeFile)
-        ->toContain('item.quickcommand')
-        ->toContain('quickcommand.toLowerCase().includes(trimmed)');
+uses(TestCase::class);
+
+beforeEach(function () {
+    $user = Mockery::mock();
+    $user->shouldReceive('can')->with('createAnyResource')->andReturnTrue();
+    $user->shouldReceive('isAdmin')->andReturnFalse();
+    $user->shouldReceive('isOwner')->andReturnFalse();
+
+    Auth::shouldReceive('user')->andReturn($user);
 });
 
-it('ensures GlobalSearch clears search query when starting resource creation', function () {
-    $globalSearchFile = file_get_contents(__DIR__.'/../../app/Livewire/GlobalSearch.php');
+it('matches exact quick actions against the quickcommand metadata', function () {
+    $blade = file_get_contents(resource_path('views/livewire/global-search.blade.php'));
 
-    // Check that navigateToResourceCreation clears the search query
-    expect($globalSearchFile)
-        ->toContain('$this->searchQuery = \'\'');
+    expect($blade)->toContain('item.quickcommand && item.quickcommand.toLowerCase().includes(trimmed)');
 });
 
-it('ensures GlobalSearch uses Livewire redirect method', function () {
-    $globalSearchFile = file_get_contents(__DIR__.'/../../app/Livewire/GlobalSearch.php');
+it('starts Docker image resource selection and clears the search query', function () {
+    $component = new class extends GlobalSearch
+    {
+        public bool $serversLoaded = false;
 
-    // Check that completeResourceCreation uses $this->redirect()
-    expect($globalSearchFile)
-        ->toContain('$this->redirect(route(\'project.resource.create\'');
+        public function loadServers()
+        {
+            $this->serversLoaded = true;
+        }
+    };
+    $component->searchQuery = 'new image';
+    $component->creatableItems = [[
+        'name' => 'Docker Image',
+        'type' => 'docker-image',
+        'resourceType' => 'application',
+    ]];
+
+    $component->navigateToResource('docker-image');
+
+    expect($component->selectedResourceType)->toBe('docker-image')
+        ->and($component->isSelectingResource)->toBeTrue()
+        ->and($component->searchQuery)->toBe('')
+        ->and($component->serversLoaded)->toBeTrue();
 });
 
-it('ensures docker-image item has quickcommand with new image', function () {
-    $globalSearchFile = file_get_contents(__DIR__.'/../../app/Livewire/GlobalSearch.php');
+it('redirects a completed Docker image selection to resource creation', function () {
+    $component = new class extends GlobalSearch
+    {
+        public ?array $recordedRedirect = null;
 
-    // Check that Docker Image has the correct quickcommand
-    expect($globalSearchFile)
-        ->toContain("'name' => 'Docker Image'")
-        ->toContain("'quickcommand' => '(type: new image)'")
-        ->toContain("'type' => 'docker-image'");
+        public function redirectRoute($name, $parameters = [], $absolute = true, $navigate = false)
+        {
+            $this->recordedRedirect = [
+                'name' => $name,
+                'parameters' => $parameters,
+            ];
+
+            return null;
+        }
+    };
+    $component->selectedResourceType = 'docker-image';
+    $component->selectedServerId = 7;
+    $component->selectedDestinationUuid = 'destination-uuid';
+    $component->selectedProjectUuid = 'project-uuid';
+
+    $component->selectEnvironment('environment-uuid');
+
+    expect($component->recordedRedirect)->toBe([
+        'name' => 'project.resource.create',
+        'parameters' => [
+            'project_uuid' => 'project-uuid',
+            'environment_uuid' => 'environment-uuid',
+            'type' => 'docker-image',
+            'destination' => 'destination-uuid',
+            'server_id' => 7,
+        ],
+    ]);
+});
+
+it('publishes Docker Image with the new image quickcommand', function () {
+    $component = new class extends GlobalSearch
+    {
+        public function getServicesProperty()
+        {
+            return [];
+        }
+    };
+
+    (new ReflectionMethod(GlobalSearch::class, 'loadCreatableItems'))->invoke($component);
+
+    $dockerImage = collect($component->creatableItems)->firstWhere('type', 'docker-image');
+
+    expect($dockerImage)->toMatchArray([
+        'name' => 'Docker Image',
+        'quickcommand' => '(type: new image)',
+        'type' => 'docker-image',
+        'resourceType' => 'application',
+    ]);
 });

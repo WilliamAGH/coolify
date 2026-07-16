@@ -3,22 +3,40 @@
 use App\Actions\Server\UpdateCoolify;
 use App\Models\InstanceSettings;
 use App\Models\Server;
+use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Tests\TestCase;
+
+uses(TestCase::class, RefreshDatabase::class);
 
 beforeEach(function () {
-    // Mock Server
-    $this->mockServer = Mockery::mock(Server::class)->makePartial();
-    $this->mockServer->id = 0;
+    config([
+        'constants.coolify.version' => '4.1.2',
+        'constants.coolify.versions_url' => 'https://cdn.coollabs.io/coolify/versions.json',
+        'constants.coolify.upgrade_script_url' => 'https://cdn.coollabs.io/coolify/upgrade.sh',
+    ]);
 
-    // Mock InstanceSettings
-    $this->settings = Mockery::mock(InstanceSettings::class);
-    $this->settings->is_auto_update_enabled = true;
-    $this->settings->shouldReceive('save')->andReturn(true);
-});
+    $this->settings = (new InstanceSettings)->forceFill([
+        'id' => 0,
+        'instance_timezone' => 'UTC',
+        'is_auto_update_enabled' => true,
+    ]);
+    $this->settings->saveQuietly();
 
-afterEach(function () {
-    Mockery::close();
+    $this->server = (new Server)->forceFill([
+        'id' => 0,
+        'uuid' => 'coolify-server',
+        'name' => 'Coolify',
+        'ip' => '127.0.0.1',
+        'team_id' => 0,
+        'private_key_id' => 0,
+        'proxy' => ['type' => 'NONE'],
+    ]);
+    $this->server->saveQuietly();
+
+    Cache::flush();
 });
 
 it('has UpdateCoolify action class', function () {
@@ -26,107 +44,129 @@ it('has UpdateCoolify action class', function () {
 });
 
 it('validates cache against running version before fallback', function () {
-    // Mock Server::find to return our mock server
-    Server::shouldReceive('find')
-        ->with(0)
-        ->andReturn($this->mockServer);
-
-    // Mock instanceSettings
-    $this->app->instance('App\Models\InstanceSettings', function () {
-        return $this->settings;
-    });
-
-    // CDN fails
     Http::fake(['*' => Http::response(null, 500)]);
-
-    // Mock cache returning older version
-    Cache::shouldReceive('remember')
-        ->andReturn(['coolify' => ['v4' => ['version' => '4.0.5']]]);
-
+    Cache::put('coolify:versions:all', ['coolify' => [
+        'v4' => ['version' => '4.0.5'],
+        'helper' => ['version' => '1.0.14'],
+    ]]);
     config(['constants.coolify.version' => '4.0.10']);
 
     $action = new UpdateCoolify;
 
-    // Should throw exception - cache is older than running
-    try {
-        $action->handle(manual_update: false);
-        expect(false)->toBeTrue('Expected exception was not thrown');
-    } catch (\Exception $e) {
-        expect($e->getMessage())->toContain('cache version');
-        expect($e->getMessage())->toContain('4.0.5');
-        expect($e->getMessage())->toContain('4.0.10');
-    }
+    expect(fn () => $action->handle(manual_update: false))->toThrow(
+        Exception::class,
+        'Cannot determine latest version: CDN unavailable and cache version (4.0.5) is older than running version (4.0.10)',
+    );
 });
 
-it('uses validated cache when CDN fails and cache is newer', function () {
-    // Mock Server::find
-    Server::shouldReceive('find')
-        ->with(0)
-        ->andReturn($this->mockServer);
+it('uses validated cache when CDN fails and automatic updates are disabled', function () {
+    $this->settings->is_auto_update_enabled = false;
+    $this->settings->saveQuietly();
 
-    // Mock instanceSettings
-    $this->app->instance('App\Models\InstanceSettings', function () {
-        return $this->settings;
-    });
-
-    // CDN fails
     Http::fake(['*' => Http::response(null, 500)]);
-
-    // Cache has newer version than current
-    Cache::shouldReceive('remember')
-        ->andReturn(['coolify' => ['v4' => ['version' => '4.0.10']]]);
-
+    Cache::put('coolify:versions:all', ['coolify' => [
+        'v4' => ['version' => '4.0.10'],
+        'helper' => ['version' => '1.0.14'],
+    ]]);
     config(['constants.coolify.version' => '4.0.5']);
+    Log::spy();
 
-    // Mock the update method to prevent actual update
-    $action = Mockery::mock(UpdateCoolify::class)->makePartial();
-    $action->shouldReceive('update')->once();
-    $action->server = $this->mockServer;
-
-    \Illuminate\Support\Facades\Log::shouldReceive('warning')
-        ->once()
-        ->with('Failed to fetch fresh version from CDN, using validated cache', Mockery::type('array'));
-
-    // Should not throw - cache (4.0.10) > running (4.0.5)
+    $action = new UpdateCoolify;
     $action->handle(manual_update: false);
 
     expect($action->latestVersion)->toBe('4.0.10');
+    Log::shouldHaveReceived('warning')
+        ->withArgs(fn (string $message): bool => str_contains($message, 'using validated cache'))
+        ->once();
 });
 
 it('prevents downgrade even with manual update', function () {
-    // Mock Server::find
-    Server::shouldReceive('find')
-        ->with(0)
-        ->andReturn($this->mockServer);
-
-    // Mock instanceSettings
-    $this->app->instance('App\Models\InstanceSettings', function () {
-        return $this->settings;
-    });
-
-    // CDN returns older version
     Http::fake([
         '*' => Http::response([
-            'coolify' => ['v4' => ['version' => '4.0.0']],
-        ], 200),
+            'coolify' => [
+                'v4' => ['version' => '4.0.0'],
+                'helper' => ['version' => '1.0.14'],
+            ],
+        ]),
     ]);
-
-    // Current version is newer
     config(['constants.coolify.version' => '4.0.10']);
+    Log::spy();
 
     $action = new UpdateCoolify;
 
-    \Illuminate\Support\Facades\Log::shouldReceive('error')
-        ->once()
-        ->with('Downgrade prevented', Mockery::type('array'));
+    expect(fn () => $action->handle(manual_update: true))->toThrow(
+        Exception::class,
+        'Cannot downgrade from 4.0.10 to 4.0.0. If you need to downgrade, please do so manually via Docker commands.',
+    );
+    Log::shouldHaveReceived('error')
+        ->with('Downgrade prevented', Mockery::type('array'))
+        ->once();
+});
 
-    // Should throw exception even for manual updates
-    try {
-        $action->handle(manual_update: true);
-        expect(false)->toBeTrue('Expected exception was not thrown');
-    } catch (\Exception $e) {
-        expect($e->getMessage())->toContain('Cannot downgrade');
-        expect($e->getMessage())->toContain('4.0.10');
-        expect($e->getMessage())->toContain('4.0.0');
-    }
+it('rejects malformed remote semantic versions before an update can run', function () {
+    Http::fake([
+        '*' => Http::response([
+            'coolify' => [
+                'v4' => ['version' => '4.2.0; touch /tmp/pwned'],
+                'helper' => ['version' => '1.0.15'],
+            ],
+        ]),
+    ]);
+
+    expect(fn () => (new UpdateCoolify)->handle())
+        ->toThrow(UnexpectedValueException::class, 'CDN response Coolify version must be a semantic version.');
+});
+
+it('rejects malformed remote helper versions before an update can run', function () {
+    Http::fake([
+        '*' => Http::response([
+            'coolify' => [
+                'v4' => ['version' => '4.2.0'],
+                'helper' => ['version' => '1.0.15; touch /tmp/pwned'],
+            ],
+        ]),
+    ]);
+
+    expect(fn () => (new UpdateCoolify)->handle())
+        ->toThrow(UnexpectedValueException::class, 'CDN response helper version must be a semantic version.');
+});
+
+it('rejects unsafe configured update URLs before making a remote request', function () {
+    config([
+        'constants.coolify.versions_url' => 'https://cdn.coollabs.io/coolify/versions.json; touch /tmp/pwned',
+    ]);
+
+    expect(fn () => (new UpdateCoolify)->handle())
+        ->toThrow(UnexpectedValueException::class, 'Coolify versions URL must be a valid HTTPS URL.');
+});
+
+it('rejects unsafe configured upgrade script URLs before remote processing', function () {
+    Http::fake([
+        '*' => Http::response([
+            'coolify' => [
+                'v4' => ['version' => '4.2.0'],
+                'helper' => ['version' => '1.0.15'],
+            ],
+        ]),
+    ]);
+    config([
+        'constants.coolify.upgrade_script_url' => 'https://cdn.coollabs.io/coolify/upgrade.sh; touch /tmp/pwned',
+    ]);
+
+    expect(fn () => (new UpdateCoolify)->handle(manual_update: true))
+        ->toThrow(UnexpectedValueException::class, 'Coolify upgrade script URL must be a valid HTTPS URL.');
+});
+
+it('quotes all dynamic upgrade command arguments', function () {
+    $upgradeCommands = (new ReflectionMethod(UpdateCoolify::class, 'upgradeCommands'))->invoke(
+        new UpdateCoolify,
+        'https://cdn.coollabs.io/coolify/upgrade.sh?channel=v4&safe=1',
+        '4.2.0',
+        '1.0.15',
+    );
+
+    expect($upgradeCommands)->toBe([
+        "curl -fsSL -- 'https://cdn.coollabs.io/coolify/upgrade.sh?channel=v4&safe=1' -o '/data/coolify/source/upgrade.sh'",
+        "bash '/data/coolify/source/upgrade.sh' '4.2.0' '1.0.15'",
+    ]);
 });

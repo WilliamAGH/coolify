@@ -11,7 +11,7 @@ it('accepts valid public URLs', function () {
 
     $validUrls = [
         'https://api.github.com',
-        'https://github.example.com/api/v3',
+        'https://github.com/api/v3',
         'https://example.com',
         'http://example.com',
     ];

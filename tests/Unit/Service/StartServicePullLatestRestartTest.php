@@ -4,6 +4,9 @@ use App\Actions\Service\RestartService;
 use App\Actions\Service\StartService;
 use App\Actions\Service\StopService;
 use App\Models\Service;
+use Tests\TestCase;
+
+uses(TestCase::class);
 
 it('does not stop a service before pulling latest images', function () {
     $method = new ReflectionMethod(StartService::class, 'shouldStopBeforeStarting');

@@ -1,90 +1,106 @@
 <?php
 
-/**
- * Unit tests for GetContainersStatus service aggregation logic (SSH path).
- *
- * These tests verify that the SSH-based status updates (GetContainersStatus)
- * correctly aggregates container statuses for services with multiple containers,
- * using the same logic as PushServerUpdateJob (Sentinel path).
- *
- * This ensures consistency across both status update paths and prevents
- * race conditions where the last container processed wins.
- */
-it('implements service multi-container aggregation in SSH path', function () {
-    $actionFile = file_get_contents(__DIR__.'/../../app/Actions/Docker/GetContainersStatus.php');
+use App\Actions\Docker\GetContainersStatus;
+use App\Jobs\PushServerUpdateJob;
+use App\Models\Service;
+use App\Models\ServiceApplication;
 
-    // Verify service container collection property exists
-    expect($actionFile)
-        ->toContain('protected ?Collection $serviceContainerStatuses;');
+it('aggregates all SSH-observed containers before updating a service application', function () {
+    $subResource = Mockery::mock(ServiceApplication::class)->makePartial();
+    $subResource->forceFill(['status' => 'exited']);
+    $subResource->shouldReceive('update')
+        ->once()
+        ->with(['status' => 'running:unknown'])
+        ->andReturnTrue();
 
-    // Verify aggregateServiceContainerStatuses method exists
-    expect($actionFile)
-        ->toContain('private function aggregateServiceContainerStatuses($services)')
-        ->toContain('$this->aggregateServiceContainerStatuses($services);');
+    $applications = Mockery::mock();
+    $applications->shouldReceive('where')->once()->with('id', '23')->andReturnSelf();
+    $applications->shouldReceive('first')->once()->andReturn($subResource);
 
-    // Verify service aggregation uses same logic as applications
-    expect($actionFile)
-        ->toContain('$hasUnknown = false;');
+    $service = Mockery::mock(Service::class)->makePartial();
+    $service->forceFill([
+        'id' => 17,
+        'docker_compose_raw' => null,
+    ]);
+    $service->shouldReceive('applications')->once()->andReturn($applications);
+
+    $action = new GetContainersStatus;
+    $statuses = collect([
+        '17:application:23' => collect([
+            'web' => 'running:healthy',
+            'worker' => 'running:unknown',
+        ]),
+    ]);
+    (new ReflectionProperty(GetContainersStatus::class, 'serviceContainerStatuses'))
+        ->setValue($action, $statuses);
+
+    (new ReflectionMethod(GetContainersStatus::class, 'aggregateServiceContainerStatuses'))
+        ->invoke($action, collect([$service]));
 });
 
-it('services use same priority as applications in SSH path', function () {
-    $actionFile = file_get_contents(__DIR__.'/../../app/Actions/Docker/GetContainersStatus.php');
+it('excludes opted-out containers from SSH service aggregation', function () {
+    $subResource = Mockery::mock(ServiceApplication::class)->makePartial();
+    $subResource->forceFill(['status' => 'exited']);
+    $subResource->shouldReceive('update')
+        ->once()
+        ->with(['status' => 'running:healthy'])
+        ->andReturnTrue();
 
-    // Both aggregation methods should use the same priority logic
-    $priorityLogic = <<<'PHP'
-                if ($hasUnhealthy) {
-                    $aggregatedStatus = 'running (unhealthy)';
-                } elseif ($hasUnknown) {
-                    $aggregatedStatus = 'running (unknown)';
-                } else {
-                    $aggregatedStatus = 'running (healthy)';
-                }
-PHP;
+    $applications = Mockery::mock();
+    $applications->shouldReceive('where')->once()->with('id', '23')->andReturnSelf();
+    $applications->shouldReceive('first')->once()->andReturn($subResource);
 
-    // Should appear in service aggregation
-    expect($actionFile)->toContain($priorityLogic);
+    $service = Mockery::mock(Service::class)->makePartial();
+    $service->forceFill([
+        'id' => 17,
+        'docker_compose_raw' => <<<'YAML'
+services:
+  web:
+    image: nginx:latest
+  worker:
+    image: busybox:latest
+    exclude_from_hc: true
+YAML,
+    ]);
+    $service->shouldReceive('applications')->once()->andReturn($applications);
+
+    $action = new GetContainersStatus;
+    (new ReflectionProperty(GetContainersStatus::class, 'serviceContainerStatuses'))
+        ->setValue($action, collect([
+            '17:application:23' => collect([
+                'web' => 'running:healthy',
+                'worker' => 'exited',
+            ]),
+        ]));
+
+    (new ReflectionMethod(GetContainersStatus::class, 'aggregateServiceContainerStatuses'))
+        ->invoke($action, collect([$service]));
 });
 
-it('collects service containers before aggregating in SSH path', function () {
-    $actionFile = file_get_contents(__DIR__.'/../../app/Actions/Docker/GetContainersStatus.php');
+it('applies the same aggregation contract to Sentinel service updates', function () {
+    $subResource = Mockery::mock(ServiceApplication::class)->makePartial();
+    $subResource->forceFill(['status' => 'exited']);
+    $subResource->shouldReceive('save')->once()->andReturnTrue();
 
-    // Verify service containers are collected, not immediately updated
-    expect($actionFile)
-        ->toContain('$key = $serviceLabelId.\':\'.$subType.\':\'.$subId;')
-        ->toContain('$this->serviceContainerStatuses->get($key)->put($containerName, $containerStatus);');
+    $service = new Service;
+    $service->forceFill([
+        'id' => 17,
+        'docker_compose_raw' => null,
+    ]);
 
-    // Verify aggregation happens before ServiceChecked dispatch
-    expect($actionFile)
-        ->toContain('$this->aggregateServiceContainerStatuses($services);')
-        ->toContain('ServiceChecked::dispatch($this->server->team->id);');
-});
+    $job = (new ReflectionClass(PushServerUpdateJob::class))->newInstanceWithoutConstructor();
+    $job->serviceContainerStatuses = collect([
+        '17:application:23' => collect([
+            'web' => 'running:healthy',
+            'worker' => 'running:unknown',
+        ]),
+    ]);
+    $job->servicesById = collect(['17' => $service]);
+    $job->serviceApplicationsById = collect(['23' => $subResource]);
+    $job->serviceDatabasesById = collect();
 
-it('SSH and Sentinel paths use identical service aggregation logic', function () {
-    $jobFile = file_get_contents(__DIR__.'/../../app/Jobs/PushServerUpdateJob.php');
-    $actionFile = file_get_contents(__DIR__.'/../../app/Actions/Docker/GetContainersStatus.php');
+    (new ReflectionMethod(PushServerUpdateJob::class, 'aggregateServiceContainerStatuses'))
+        ->invoke($job);
 
-    // Both should track the same status flags
-    expect($jobFile)->toContain('$hasUnknown = false;');
-    expect($actionFile)->toContain('$hasUnknown = false;');
-
-    // Both should check for unknown status
-    expect($jobFile)->toContain('if (str($status)->contains(\'unknown\')) {');
-    expect($actionFile)->toContain('if (str($status)->contains(\'unknown\')) {');
-
-    // Both should have elseif for unknown priority
-    expect($jobFile)->toContain('} elseif ($hasUnknown) {');
-    expect($actionFile)->toContain('} elseif ($hasUnknown) {');
-});
-
-it('handles service status updates consistently', function () {
-    $jobFile = file_get_contents(__DIR__.'/../../app/Jobs/PushServerUpdateJob.php');
-    $actionFile = file_get_contents(__DIR__.'/../../app/Actions/Docker/GetContainersStatus.php');
-
-    // Both should parse service key with same format
-    expect($jobFile)->toContain('[$serviceId, $subType, $subId] = explode(\':\', $key);');
-    expect($actionFile)->toContain('[$serviceId, $subType, $subId] = explode(\':\', $key);');
-
-    // Both should handle excluded containers
-    expect($jobFile)->toContain('$excludedContainers = collect();');
-    expect($actionFile)->toContain('$excludedContainers = collect();');
+    expect($subResource->status)->toBe('running:unknown');
 });

@@ -1,6 +1,10 @@
 <?php
 
+use App\Models\Application;
 use App\Models\EnvironmentVariable;
+use Tests\TestCase;
+
+uses(TestCase::class);
 
 /**
  * Tests for GitHub Issue #6160: COMPOSER_AUTH environment variable escaping.
@@ -12,16 +16,28 @@ use App\Models\EnvironmentVariable;
  */
 const COMPOSER_AUTH_JSON = '{"http-basic":{"backpackforlaravel.com":{"username":"ourusername","password":"ourpassword"}}}';
 
+function composerAuthEnvironmentVariable(string $value, bool $isLiteral = false): EnvironmentVariable
+{
+    $application = new Application;
+    $application->setRelation('environment', null);
+    $application->setRelation('destination', null);
+
+    $environmentVariable = new EnvironmentVariable([
+        'key' => 'COMPOSER_AUTH',
+        'value' => $value,
+        'is_literal' => $isLiteral,
+        'is_multiline' => false,
+    ]);
+    $environmentVariable->setRelation('resourceable', $application);
+
+    return $environmentVariable;
+}
+
 // ---------------------------------------------------------------------------
 // Test 1: realValue accessor returns raw JSON for non-literal env vars
 // ---------------------------------------------------------------------------
 it('realValue accessor returns raw JSON without escaping quotes', function () {
-    $env = Mockery::mock(EnvironmentVariable::class)->makePartial();
-    $env->shouldReceive('relationLoaded')->with('resourceable')->andReturn(true);
-    $env->shouldReceive('getAttribute')->with('resourceable')->andReturn(new stdClass);
-    $env->shouldReceive('getAttribute')->with('value')->andReturn(COMPOSER_AUTH_JSON);
-    $env->shouldReceive('getAttribute')->with('is_literal')->andReturn(false);
-    $env->shouldReceive('getAttribute')->with('is_multiline')->andReturn(false);
+    $env = composerAuthEnvironmentVariable(COMPOSER_AUTH_JSON);
 
     $realValue = $env->real_value;
 
@@ -35,12 +51,7 @@ it('realValue accessor returns raw JSON without escaping quotes', function () {
 // (JSON check fires before the literal single-quote wrapping)
 // ---------------------------------------------------------------------------
 it('realValue accessor for literal JSON env returns raw value without wrapping', function () {
-    $env = Mockery::mock(EnvironmentVariable::class)->makePartial();
-    $env->shouldReceive('relationLoaded')->with('resourceable')->andReturn(true);
-    $env->shouldReceive('getAttribute')->with('resourceable')->andReturn(new stdClass);
-    $env->shouldReceive('getAttribute')->with('value')->andReturn(COMPOSER_AUTH_JSON);
-    $env->shouldReceive('getAttribute')->with('is_literal')->andReturn(true);
-    $env->shouldReceive('getAttribute')->with('is_multiline')->andReturn(false);
+    $env = composerAuthEnvironmentVariable(COMPOSER_AUTH_JSON, isLiteral: true);
 
     $realValue = $env->real_value;
 
@@ -54,12 +65,7 @@ it('realValue accessor for literal JSON env returns raw value without wrapping',
 // Test 3: Non-JSON values still get normal escaping (regression check)
 // ---------------------------------------------------------------------------
 it('realValue accessor still escapes non-JSON values with quotes', function () {
-    $env = Mockery::mock(EnvironmentVariable::class)->makePartial();
-    $env->shouldReceive('relationLoaded')->with('resourceable')->andReturn(true);
-    $env->shouldReceive('getAttribute')->with('resourceable')->andReturn(new stdClass);
-    $env->shouldReceive('getAttribute')->with('value')->andReturn('hello "world"');
-    $env->shouldReceive('getAttribute')->with('is_literal')->andReturn(false);
-    $env->shouldReceive('getAttribute')->with('is_multiline')->andReturn(false);
+    $env = composerAuthEnvironmentVariable('hello "world"');
 
     $realValue = $env->real_value;
 
@@ -74,12 +80,7 @@ it('realValue accessor still escapes non-JSON values with quotes', function () {
 it('realValue accessor returns raw JSON array without escaping', function () {
     $jsonArray = '[{"host":"example.com","token":"abc123"}]';
 
-    $env = Mockery::mock(EnvironmentVariable::class)->makePartial();
-    $env->shouldReceive('relationLoaded')->with('resourceable')->andReturn(true);
-    $env->shouldReceive('getAttribute')->with('resourceable')->andReturn(new stdClass);
-    $env->shouldReceive('getAttribute')->with('value')->andReturn($jsonArray);
-    $env->shouldReceive('getAttribute')->with('is_literal')->andReturn(false);
-    $env->shouldReceive('getAttribute')->with('is_multiline')->andReturn(false);
+    $env = composerAuthEnvironmentVariable($jsonArray);
 
     $realValue = $env->real_value;
 
