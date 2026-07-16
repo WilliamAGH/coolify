@@ -7,17 +7,28 @@ use App\Actions\Fortify\ResetUserPassword;
 use App\Actions\Fortify\UpdateUserPassword;
 use App\Actions\Fortify\UpdateUserProfileInformation;
 use App\Models\OauthSetting;
+use App\Models\TeamInvitation;
 use App\Models\User;
+use App\Support\ControlPlaneMode;
 use Illuminate\Cache\RateLimiting\Limit;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\ServiceProvider;
+use Illuminate\Support\Str;
 use Laravel\Fortify\Contracts\RegisterResponse;
 use Laravel\Fortify\Fortify;
+use LogicException;
 
 class FortifyServiceProvider extends ServiceProvider
 {
+    private const array LOOPBACK_PROXY_ADDRESSES = [
+        '127.0.0.1',
+        '::1',
+    ];
+
+    private const int MAX_CONTROL_PLANE_PROXY_ADDRESSES = 16;
+
     /**
      * Register any application services.
      */
@@ -82,7 +93,7 @@ class FortifyServiceProvider extends ServiceProvider
                 $user->save();
 
                 // Check if user has a pending invitation they haven't accepted yet
-                $invitation = \App\Models\TeamInvitation::whereEmail($email)->first();
+                $invitation = TeamInvitation::whereEmail($email)->first();
                 if ($invitation && $invitation->isValid()) {
                     // User is logging in for the first time after being invited
                     // Attach them to the invited team if not already attached
@@ -127,23 +138,97 @@ class FortifyServiceProvider extends ServiceProvider
         });
 
         RateLimiter::for('forgot-password', function (Request $request) {
-            // Use real client IP (not spoofable forwarded headers)
-            $realIp = $request->server('REMOTE_ADDR') ?? $request->ip();
-
-            return Limit::perMinute(5)->by($realIp);
+            return Limit::perMinute(5)->by(self::rateLimitClientAddress($request));
         });
 
         RateLimiter::for('login', function (Request $request) {
-            $email = (string) $request->email;
-            // Use email + real client IP (not spoofable forwarded headers)
-            // server('REMOTE_ADDR') gives the actual connecting IP before proxy headers
-            $realIp = $request->server('REMOTE_ADDR') ?? $request->ip();
+            $email = Str::transliterate(Str::lower((string) $request->input(Fortify::username())));
 
-            return Limit::perMinute(5)->by($email.'|'.$realIp);
+            return Limit::perMinute(5)->by($email.'|'.self::rateLimitClientAddress($request));
         });
 
         RateLimiter::for('two-factor', function (Request $request) {
             return Limit::perMinute(5)->by($request->session()->get('login.id'));
         });
+    }
+
+    private static function rateLimitClientAddress(Request $request): string
+    {
+        $remoteAddress = $request->server('REMOTE_ADDR');
+        if (! is_string($remoteAddress) || trim($remoteAddress) === '') {
+            throw new LogicException('Authentication rate limits require a server-supplied REMOTE_ADDR.');
+        }
+
+        if (self::isTrustedAuthenticationProxy($remoteAddress)) {
+            $forwardedClientAddress = self::normalizeIpAddress((string) $request->ip());
+
+            if ($forwardedClientAddress !== null) {
+                return $forwardedClientAddress;
+            }
+        }
+
+        return $remoteAddress;
+    }
+
+    private static function isTrustedAuthenticationProxy(string $remoteAddress): bool
+    {
+        if (in_array($remoteAddress, self::LOOPBACK_PROXY_ADDRESSES, true)) {
+            return true;
+        }
+
+        if (! ControlPlaneMode::isActiveWebOnly()) {
+            return false;
+        }
+
+        $normalizedRemoteAddress = self::normalizeIpAddress($remoteAddress);
+
+        return $normalizedRemoteAddress !== null
+            && in_array($normalizedRemoteAddress, self::trustedControlPlaneProxyAddresses(), true);
+    }
+
+    /**
+     * @return list<string>
+     */
+    private static function trustedControlPlaneProxyAddresses(): array
+    {
+        $configuredAddresses = config('control-plane.trusted_proxy_addresses');
+
+        if (! is_string($configuredAddresses) || $configuredAddresses === '') {
+            return [];
+        }
+
+        $addresses = explode(',', $configuredAddresses);
+        if (count($addresses) > self::MAX_CONTROL_PLANE_PROXY_ADDRESSES) {
+            return [];
+        }
+
+        $normalizedAddresses = [];
+        foreach ($addresses as $address) {
+            $normalizedAddress = self::normalizeIpAddress($address);
+
+            if ($address === ''
+                || trim($address) !== $address
+                || $normalizedAddress === null
+                || $normalizedAddress !== $address
+                || in_array($normalizedAddress, $normalizedAddresses, true)) {
+                return [];
+            }
+
+            $normalizedAddresses[] = $normalizedAddress;
+        }
+
+        return $normalizedAddresses;
+    }
+
+    private static function normalizeIpAddress(string $address): ?string
+    {
+        $packedAddress = @inet_pton($address);
+        if ($packedAddress === false) {
+            return null;
+        }
+
+        $normalizedAddress = inet_ntop($packedAddress);
+
+        return $normalizedAddress === false ? null : $normalizedAddress;
     }
 }
