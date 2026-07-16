@@ -28,10 +28,13 @@ printf '%s\n' '{' \
     '  "registry-mirrors": ["https://registry.example.test"],' \
     '  "insecure-registries": ["registry.lan:5000"],' \
     '  "features": {"containerd-snapshotter": true}' \
-    '}' > "$daemon_path"
+'}' > "$daemon_path"
+chmod 0600 "$daemon_path"
 
 update_docker_daemon_configuration "$daemon_path" 10.0.0.0/8 24 false \
     || fail 'existing address-pool merge failed'
+[ "$(stat -c '%a' "$daemon_path" 2>/dev/null || stat -f '%Lp' "$daemon_path")" = 600 ] \
+    || fail 'existing daemon configuration mode was not preserved'
 jq -e '
     .["default-address-pools"] == [{"base":"172.31.0.0/16","size":24}]
     and .["registry-mirrors"] == ["https://registry.example.test"]
@@ -73,5 +76,11 @@ update_docker_daemon_configuration "$daemon_path" 10.0.0.0/8 24 false || malform
     || fail 'malformed daemon configuration did not fail closed'
 [ "$(sha256sum "$daemon_path" | awk '{print $1}')" = "$malformed_before" ] \
     || fail 'malformed daemon configuration was overwritten'
+
+new_daemon_path=$TEMPORARY_DIRECTORY/new-daemon.json
+update_docker_daemon_configuration "$new_daemon_path" 10.0.0.0/8 24 true \
+    || fail 'new daemon configuration creation failed'
+[ "$(stat -c '%a' "$new_daemon_path" 2>/dev/null || stat -f '%Lp' "$new_daemon_path")" = 600 ] \
+    || fail 'new daemon configuration was not private'
 
 printf '%s\n' 'install-docker-daemon-configuration: passed'

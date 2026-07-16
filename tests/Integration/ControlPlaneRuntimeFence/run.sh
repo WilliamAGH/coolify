@@ -131,7 +131,7 @@ export CONTROL_PLANE_RUNTIME_TEST_SYSTEMD_DIRECTORY=$fixture/systemd
 export CONTROL_PLANE_RUNTIME_OPERATION_ID=runtime-fence-test
 export CONTROL_PLANE_RUNTIME_STATE_DIR=$fixture/state
 export CONTROL_PLANE_RUNTIME_PROXY_CONTAINER=proxy
-# shellcheck source=tests/Integration/ControlPlaneRuntimeFence/pool-manifest-fixture.bash
+# shellcheck disable=SC1090 # The runtime fixture path is resolved beside this runner.
 source "$POOL_FIXTURE"
 prepare_control_plane_pool_plan_fixture \
     "$fixture" runtime-fence-test "$FIXTURE_STAT_UID" "$FIXTURE_STAT_GID"

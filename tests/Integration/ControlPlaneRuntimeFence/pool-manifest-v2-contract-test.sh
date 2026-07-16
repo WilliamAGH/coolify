@@ -30,7 +30,7 @@ printf '%s' candidate-b-direct-placeholder > "$fixture/candidate-b-direct-token"
 printf '%s' candidate-applied-placeholder > "$fixture/candidate-applied-ack"
 printf '%s' candidate-b-applied-placeholder > "$fixture/candidate-b-applied-ack"
 
-# shellcheck source=tests/Integration/ControlPlaneRuntimeFence/pool-manifest-fixture.bash
+# shellcheck disable=SC1090 # The runtime fixture path is resolved beside this test.
 source "$POOL_FIXTURE"
 prepare_control_plane_pool_plan_fixture "$fixture" pool-manifest-contract "$fixture_uid" "$fixture_gid"
 

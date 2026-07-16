@@ -7151,13 +7151,14 @@ assert_pooled_ingress_capabilities()
     assert_release_asset_identity https-controller
     assert_release_asset_identity port8000-controller
     for capability_controller in "$https_controller" "$port8000_controller"; do
-        grep -Fq 'CONTROL_PLANE_INGRESS_POOL_MANIFEST' "$capability_controller" \
-            && grep -Fq 'CONTROL_PLANE_INGRESS_POOL_PLAN_MANIFEST' "$capability_controller" \
-            && grep -Fq 'CONTROL_PLANE_INGRESS_DRAIN_MEMBER' "$capability_controller" \
-            && grep -Fq 'verify-drained' "$capability_controller" \
-            && grep -Fq 'managed routing requires ingress-pool.manifest v2' \
-                "$capability_controller" \
-            || fail "pinned ingress controller lacks exact pooled-v2 capability: $capability_controller"
+        if ! grep -Fq 'CONTROL_PLANE_INGRESS_POOL_MANIFEST' "$capability_controller" \
+            || ! grep -Fq 'CONTROL_PLANE_INGRESS_POOL_PLAN_MANIFEST' "$capability_controller" \
+            || ! grep -Fq 'CONTROL_PLANE_INGRESS_DRAIN_MEMBER' "$capability_controller" \
+            || ! grep -Fq 'verify-drained' "$capability_controller" \
+            || ! grep -Fq 'managed routing requires ingress-pool.manifest v2' \
+                "$capability_controller"; then
+            fail "pinned ingress controller lacks exact pooled-v2 capability: $capability_controller"
+        fi
     done
 }
 
@@ -9458,6 +9459,7 @@ write_live_expand_migration_attempt_log()
         printf 'operator_postgres_backend_count=%s\n' "$migration_backend_count"
         printf 'operator_postgres_advisory_lock_count=%s\n' "$migration_advisory_lock_count"
         printf 'operator_postgres_backend_lock_count=%s\n' "$migration_backend_lock_count"
+        printf 'operator_postgres_backend_global_lock_count=%s\n' "$migration_backend_global_lock_count"
         printf 'operator_ledger_sha256=%s\n' "$migration_classification_ledger_sha256"
         printf 'operator_database_outcome=%s\n' "$attempt_database_outcome"
         printf 'operator_verification_sha256=%s\n' "$attempt_verification_sha256"
@@ -9730,7 +9732,7 @@ reconcile_live_expand_migration_runner()
                         ;;
                     exited)
                         record_live_expand_migration_runner_started
-                        reconciliation_mode=wait
+                        reconciliation_mode='wait'
                         ;;
                     *) fail 'durable migration runner has an unsafe lifecycle state' ;;
                 esac
@@ -9746,7 +9748,7 @@ reconcile_live_expand_migration_runner()
                         ;;
                     *) fail 'durable migration runner has an unsafe lifecycle state' ;;
                 esac
-                reconciliation_mode=wait
+                reconciliation_mode='wait'
             fi
             ;;
         launched:present|active:present)
@@ -9755,11 +9757,11 @@ reconcile_live_expand_migration_runner()
                     [ "$reconciliation_mode" != abort ] \
                         || fail 'recovery-abort is forbidden while a durable migration runner is active'
                     record_live_expand_migration_runner_started
-                    reconciliation_mode=wait
+                    reconciliation_mode='wait'
                     ;;
                 exited)
                     record_live_expand_migration_runner_started
-                    reconciliation_mode=wait
+                    reconciliation_mode='wait'
                     ;;
                 created)
                     fail 'durable live migration runner lifecycle regressed before terminal evidence'
@@ -12743,7 +12745,9 @@ reserved_work_count()
             $redis = app("redis")->connection($connectionName);
             $total = 0;
             foreach (array_filter(explode(",", getenv("CONTROL_PLANE_QUEUE_FILE_CONTENTS") ?: "")) as $queue) {
+                $total += (int) $redis->llen("queues:{$queue}");
                 $total += (int) $redis->zcard("queues:{$queue}:reserved");
+                $total += (int) $redis->zcard("queues:{$queue}:delayed");
             }
             echo $total, PHP_EOL;
         '
@@ -12765,7 +12769,7 @@ assert_no_active_old_work()
     reserved_count=$(reserved_work_count "$drain_container" | tr -d '[:space:]')
     active_count=$(active_deployment_worker_count)
     printf '%s' "$reserved_count" | grep -Eq '^[0-9]+$' \
-        || fail 'Redis reserved-work probe did not return a count'
+        || fail 'Redis queued-work probe did not return a count'
     printf '%s' "$active_count" | grep -Eq '^[0-9]+$' \
         || fail 'active deployment-worker probe did not return a count'
     [ "$reserved_count" = 0 ] && [ "$active_count" = 0 ]
@@ -12841,8 +12845,9 @@ assert_pool_http_drained()
         sleep 1
     done
     sleep "$drain_stable_seconds"
-    assert_http_drain_pass "$drained_a" && assert_http_drain_pass "$drained_b" \
-        || fail "$drained_color pool HTTP/TCP connections were not stably zero"
+    if ! assert_http_drain_pass "$drained_a" || ! assert_http_drain_pass "$drained_b"; then
+        fail "$drained_color pool HTTP/TCP connections were not stably zero"
+    fi
 }
 
 drain_color()
@@ -12911,7 +12916,7 @@ drain_color()
             until assert_no_active_old_work "$drain_container"; do
                 attempt=$((attempt + 1))
                 [ "$attempt" -lt "$drain_attempts" ] \
-                    || fail 'old reserved/active work did not quiesce within the drain bound'
+                    || fail 'old queued/active work did not quiesce within the drain bound'
                 sleep 1
             done
             state_phase=$background_zero_first
@@ -12923,7 +12928,7 @@ drain_color()
     if [ "$state_phase" = "$background_zero_first" ]; then
         sleep "$drain_stable_seconds"
         assert_no_active_old_work "$drain_container" \
-            || fail 'old reserved/active work was not zero on the second stable proof'
+            || fail 'old queued/active work was not zero on the second stable proof'
         state_phase=$background_zero_proven
         write_state "$state_phase"
         test_crash "after-${phase_prefix}-background-zero-proven"
@@ -12935,10 +12940,10 @@ drain_color()
             write_state "$state_phase"
             terminate_horizon "$drain_container"
             assert_no_active_old_work "$drain_container" \
-                || fail 'old reserved/active work reappeared after Horizon termination'
+                || fail 'old queued/active work reappeared after Horizon termination'
             sleep "$drain_stable_seconds"
             assert_no_active_old_work "$drain_container" \
-                || fail 'old reserved/active work was not zero on the post-termination stable proof'
+                || fail 'old queued/active work was not zero on the post-termination stable proof'
             state_phase=$horizon_stopped
             write_state "$state_phase"
             test_crash "after-${phase_prefix}-horizon-stopped"

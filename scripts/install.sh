@@ -75,8 +75,7 @@ fi
 restart_docker_service() {
     # Check if systemctl is available
     if command -v systemctl >/dev/null 2>&1; then
-        systemctl restart docker
-        if [ $? -eq 0 ]; then
+        if systemctl restart docker; then
             echo " - Docker daemon restarted successfully"
         else
             echo " - Failed to restart Docker daemon"
@@ -84,8 +83,7 @@ restart_docker_service() {
         fi
     # Check if service command is available
     elif command -v service >/dev/null 2>&1; then
-        service docker restart
-        if [ $? -eq 0 ]; then
+        if service docker restart; then
             echo " - Docker daemon restarted successfully"
         else
             echo " - Failed to restart Docker daemon"
@@ -106,6 +104,7 @@ update_docker_daemon_configuration() {
     local daemon_directory
     local daemon_candidate
     local daemon_filter
+    local daemon_mode
 
     daemon_directory=$(dirname "$daemon_path")
     mkdir -p "$daemon_directory"
@@ -153,7 +152,12 @@ update_docker_daemon_configuration() {
         return 10
     fi
 
-    chmod 0644 "$daemon_candidate"
+    if [ -e "$daemon_path" ]; then
+        daemon_mode=$(stat -c '%a' "$daemon_path" 2>/dev/null || stat -f '%Lp' "$daemon_path")
+        chmod "$daemon_mode" "$daemon_candidate"
+    else
+        chmod 0600 "$daemon_candidate"
+    fi
     mv -f "$daemon_candidate" "$daemon_path"
 
     return 0
@@ -179,10 +183,14 @@ compare_address_pools() {
     local size2="$4"
 
     # Normalize CIDR notation for comparison
-    local ip1=$(echo "$base1" | cut -d'/' -f1)
-    local prefix1=$(echo "$base1" | cut -d'/' -f2)
-    local ip2=$(echo "$base2" | cut -d'/' -f1)
-    local prefix2=$(echo "$base2" | cut -d'/' -f2)
+    local ip1
+    local prefix1
+    local ip2
+    local prefix2
+    ip1=$(echo "$base1" | cut -d'/' -f1)
+    prefix1=$(echo "$base1" | cut -d'/' -f2)
+    ip2=$(echo "$base2" | cut -d'/' -f1)
+    prefix2=$(echo "$base2" | cut -d'/' -f2)
 
     # Compare IPs and prefixes
     if [ "$ip1" = "$ip2" ] && [ "$prefix1" = "$prefix2" ] && [ "$size1" = "$size2" ]; then
@@ -309,7 +317,7 @@ set_coolify_data_permissions
 
 INSTALLATION_LOG_WITH_DATE="/data/coolify/source/installation-${DATE}.log"
 
-exec > >(tee -a $INSTALLATION_LOG_WITH_DATE) 2>&1
+exec > >(tee -a "$INSTALLATION_LOG_WITH_DATE") 2>&1
 
 getAJoke() {
     JOKES=$(curl -s --max-time 2 "https://v2.jokeapi.dev/joke/Programming?blacklistFlags=nsfw,religious,political,racist,sexist,explicit&format=txt&type=single" || true)
@@ -588,13 +596,15 @@ install_docker_manually() {
         fi
         apt-get install -y ca-certificates curl
         install -m 0755 -d /etc/apt/keyrings
-        curl -fsSL https://download.docker.com/linux/$OS_TYPE/gpg -o /etc/apt/keyrings/docker.asc
+        curl -fsSL "https://download.docker.com/linux/$OS_TYPE/gpg" -o /etc/apt/keyrings/docker.asc
         chmod a+r /etc/apt/keyrings/docker.asc
 
         # Add the repository to Apt sources
+        # shellcheck disable=SC1091 # Runtime distribution metadata has a fixed host path.
+        . /etc/os-release
         echo \
             "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$OS_TYPE \
-                  $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" |
+                  ${UBUNTU_CODENAME:-$VERSION_CODENAME} stable" |
             tee /etc/apt/sources.list.d/docker.list
         apt-get update
         apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
@@ -649,9 +659,9 @@ if ! [ -x "$(command -v docker)" ]; then
     "amzn")
         dnf install docker -y >/dev/null 2>&1
         DOCKER_CONFIG=${DOCKER_CONFIG:-/usr/local/lib/docker}
-        mkdir -p $DOCKER_CONFIG/cli-plugins >/dev/null 2>&1
-        curl -fsSL "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o $DOCKER_CONFIG/cli-plugins/docker-compose >/dev/null 2>&1
-        chmod +x $DOCKER_CONFIG/cli-plugins/docker-compose >/dev/null 2>&1
+        mkdir -p "$DOCKER_CONFIG/cli-plugins" >/dev/null 2>&1
+        curl -fsSL "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o "$DOCKER_CONFIG/cli-plugins/docker-compose" >/dev/null 2>&1
+        chmod +x "$DOCKER_CONFIG/cli-plugins/docker-compose" >/dev/null 2>&1
         systemctl start docker >/dev/null 2>&1
         systemctl enable docker >/dev/null 2>&1
         if ! [ -x "$(command -v docker)" ]; then
@@ -761,7 +771,7 @@ PID5=$!
 # Wait for all downloads to complete and check for errors
 DOWNLOAD_FAILED=false
 for PID in $PID1 $PID2 $PID3 $PID4 $PID5; do
-    if ! wait $PID; then
+    if ! wait "$PID"; then
         DOWNLOAD_FAILED=true
     fi
 done
@@ -868,18 +878,20 @@ if [ ! -f ~/.ssh/authorized_keys ]; then
 fi
 
 set +e
-IS_COOLIFY_VOLUME_EXISTS=$(docker volume ls | grep coolify-db | wc -l)
+IS_COOLIFY_VOLUME_EXISTS=$(docker volume ls | grep -c coolify-db)
 set -e
 
 if [ "$IS_COOLIFY_VOLUME_EXISTS" -eq 0 ]; then
     echo " - Generating SSH key."
-    test -f /data/coolify/ssh/keys/id.$CURRENT_USER@host.docker.internal && rm -f /data/coolify/ssh/keys/id.$CURRENT_USER@host.docker.internal
-    test -f /data/coolify/ssh/keys/id.$CURRENT_USER@host.docker.internal.pub && rm -f /data/coolify/ssh/keys/id.$CURRENT_USER@host.docker.internal.pub
-    ssh-keygen -t ed25519 -a 100 -f /data/coolify/ssh/keys/id.$CURRENT_USER@host.docker.internal -q -N "" -C coolify
-    chown 9999 /data/coolify/ssh/keys/id.$CURRENT_USER@host.docker.internal
+    SSH_PRIVATE_KEY_PATH="/data/coolify/ssh/keys/id.$CURRENT_USER@host.docker.internal"
+    SSH_PUBLIC_KEY_PATH="$SSH_PRIVATE_KEY_PATH.pub"
+    test -f "$SSH_PRIVATE_KEY_PATH" && rm -f "$SSH_PRIVATE_KEY_PATH"
+    test -f "$SSH_PUBLIC_KEY_PATH" && rm -f "$SSH_PUBLIC_KEY_PATH"
+    ssh-keygen -t ed25519 -a 100 -f "$SSH_PRIVATE_KEY_PATH" -q -N "" -C coolify
+    chown 9999 "$SSH_PRIVATE_KEY_PATH"
     sed -i "/coolify/d" ~/.ssh/authorized_keys
-    cat /data/coolify/ssh/keys/id.$CURRENT_USER@host.docker.internal.pub >>~/.ssh/authorized_keys
-    rm -f /data/coolify/ssh/keys/id.$CURRENT_USER@host.docker.internal.pub
+    cat "$SSH_PUBLIC_KEY_PATH" >>~/.ssh/authorized_keys
+    rm -f "$SSH_PUBLIC_KEY_PATH"
 fi
 
 set_coolify_data_permissions

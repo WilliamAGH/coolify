@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016 # This harness intentionally writes literal child-shell fixtures.
 
 set -Eeuo pipefail
 umask 077

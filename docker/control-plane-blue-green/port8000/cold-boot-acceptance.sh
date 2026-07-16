@@ -59,7 +59,9 @@ assert_exact_host_prerequisites()
         || fail 'CONTROL_PLANE_PORT8000_EXPECTED_DOCKER_VERSION is required and must be an exact safe version'
     [[ $expected_kernel_release =~ ^[A-Za-z0-9._+-]+$ ]] \
         || fail 'CONTROL_PLANE_PORT8000_EXPECTED_KERNEL_RELEASE is required and must be an exact safe release value'
-    [[ $(. /etc/os-release; printf '%s:%s' "$ID" "$VERSION_ID") == ubuntu:24.04 ]] \
+    # shellcheck disable=SC1091 # Runtime distribution metadata has a fixed host path.
+    . /etc/os-release
+    [[ $(printf '%s:%s' "$ID" "$VERSION_ID") == ubuntu:24.04 ]] \
         || fail 'cold-boot acceptance is pinned to Ubuntu 24.04'
     [[ $(uname -r) == "$expected_kernel_release" ]] \
         || fail 'kernel release differs from the explicit cold-boot target'
@@ -79,18 +81,18 @@ assert_exact_host_prerequisites()
     [[ -f $HAPROXY_BUILD_ATTESTATION && ! -L $HAPROXY_BUILD_ATTESTATION \
         && $(stat -c '%a:%u:%g' "$HAPROXY_BUILD_ATTESTATION") == 600:0:0 ]] \
         || fail 'HAProxy source-build attestation identity is unsafe'
-    grep -F -x -q "haproxy_version=$HAPROXY_VERSION" "$HAPROXY_BUILD_ATTESTATION" \
-        && grep -F -x -q "haproxy_source_sha256=$HAPROXY_SOURCE_SHA256" \
+    if ! grep -F -x -q "haproxy_version=$HAPROXY_VERSION" "$HAPROXY_BUILD_ATTESTATION" \
+        || ! grep -F -x -q "haproxy_source_sha256=$HAPROXY_SOURCE_SHA256" \
             "$HAPROXY_BUILD_ATTESTATION" \
-        && grep -F -x -q 'haproxy_build_options=TARGET=linux-glibc USE_SYSTEMD=1' \
+        || ! grep -F -x -q 'haproxy_build_options=TARGET=linux-glibc USE_SYSTEMD=1' \
             "$HAPROXY_BUILD_ATTESTATION" \
-        && grep -F -x -q \
-            "haproxy_binary=$HAPROXY_RUNTIME_BINARY" \
+        || ! grep -F -x -q "haproxy_binary=$HAPROXY_RUNTIME_BINARY" \
             "$HAPROXY_BUILD_ATTESTATION" \
-        && grep -F -x -q \
+        || ! grep -F -x -q \
             "haproxy_binary_sha256=$(checksum "$HAPROXY_RUNTIME_BINARY")" \
-            "$HAPROXY_BUILD_ATTESTATION" \
-        || fail 'HAProxy source-build attestation differs from the exact runtime'
+            "$HAPROXY_BUILD_ATTESTATION"; then
+        fail 'HAProxy source-build attestation differs from the exact runtime'
+    fi
     [[ $(dpkg-query -W -f='${Version}' nftables 2>/dev/null || true) == 1.0.9-1ubuntu0.1 ]] \
         || fail 'exact nftables 1.0.9-1ubuntu0.1 is required'
     [[ $(dpkg-query -W -f='${Version}' conntrack 2>/dev/null || true) == 1:1.4.8-1ubuntu1 ]] \

@@ -20,7 +20,9 @@ fail()
 }
 
 [[ $(id -u) -eq 0 ]] || fail 'host prerequisite installation requires root'
-[[ $(. /etc/os-release; printf '%s:%s' "$ID" "$VERSION_ID") == ubuntu:24.04 ]] \
+# shellcheck disable=SC1091 # Runtime distribution metadata has a fixed host path.
+. /etc/os-release
+[[ $(printf '%s:%s' "$ID" "$VERSION_ID") == ubuntu:24.04 ]] \
     || fail 'installer is pinned to Ubuntu 24.04'
 [[ $(dpkg-query -W -f='${Version}' nftables 2>/dev/null || true) == 1.0.9-1ubuntu0.1 ]] \
     || fail 'exact nftables 1.0.9-1ubuntu0.1 must already be installed'

@@ -61,7 +61,7 @@ for _ in {1..20}; do
 done
 [[ -S $socket ]] || fail 'fixture Docker socket did not start'
 
-# shellcheck source=tests/Integration/ControlPlaneRuntimeFence/pool-manifest-fixture.bash
+# shellcheck disable=SC1090 # The runtime fixture path is resolved beside this test.
 source "$POOL_FIXTURE"
 prepare_control_plane_pool_plan_fixture "$fixture" terminal-probe-test "$fixture_uid" "$fixture_gid"
 chgrp -R "$fixture_gid" "$fixture"

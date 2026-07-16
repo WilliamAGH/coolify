@@ -918,7 +918,7 @@ provider_freshness_sha256()
         retired_member_count retired_a_name retired_a_id retired_b_name retired_b_id \
         retired_a_backend_url retired_b_backend_url member_set_sha256 \
         backend_set_sha256 snapshot_sha256)
-    [[ $(sed 's/=.*//' <<< "$output") == "$expected_keys" ]] \
+    [[ $(cut -d= -f1 <<< "$output") == "$expected_keys" ]] \
         || fail 'terminal provider evidence contains reordered, duplicated, absent, or unknown records'
     [[ $(wc -l <<< "$output") -eq 17 \
         && $(grep -F -x -c version=2 <<< "$output") -eq 1 \

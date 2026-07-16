@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016 # Single-quoted programs are intentionally evaluated by isolated child shells.
 
 set -Eeuo pipefail
 umask 077
@@ -1005,9 +1006,10 @@ assert_ipv6_inventory()
         done | grep -F -x -v none | LC_ALL=C sort -u
     )
     for address in "${inventory_address[@]}"; do
-        [[ $address == *:* && $address == "${address,,}" ]] \
-            && ipcalc -c "$address" >/dev/null 2>&1 \
-            || fail 'IPv6 inventory contains a non-canonical address'
+        if [[ $address != *:* || $address != "${address,,}" ]] \
+            || ! ipcalc -c "$address" >/dev/null 2>&1; then
+            fail 'IPv6 inventory contains a non-canonical address'
+        fi
     done
     mapfile -t denial_endpoint < <(inventory_values external_denial)
     if ((${#inventory_address[@]} == 0)); then
@@ -4746,7 +4748,9 @@ assert_production_prerequisites()
     [[ -n $expected_docker_version ]] || fail 'production requires exact CONTROL_PLANE_PORT8000_EXPECTED_DOCKER_VERSION'
     [[ $(docker version --format '{{.Server.Version}}') == "$expected_docker_version" ]] \
         || fail 'Docker Engine does not match the explicitly attested production version'
-    [[ $(. /etc/os-release; printf '%s:%s' "$ID" "$VERSION_ID") == ubuntu:24.04 ]] \
+    # shellcheck disable=SC1091 # Runtime distribution metadata has a fixed host path.
+    . /etc/os-release
+    [[ $(printf '%s:%s' "$ID" "$VERSION_ID") == ubuntu:24.04 ]] \
         || fail 'production host is not the attested Ubuntu 24.04 baseline'
     [[ -n $expected_kernel_release ]] \
         || fail 'production requires exact CONTROL_PLANE_PORT8000_EXPECTED_KERNEL_RELEASE'
