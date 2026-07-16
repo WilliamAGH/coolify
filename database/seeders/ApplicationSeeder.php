@@ -15,6 +15,8 @@ class ApplicationSeeder extends Seeder
      */
     public function run(): void
     {
+        $testingHostKey = PrivateKeySeeder::testingHostKey();
+
         Application::create([
             'uuid' => 'docker-compose',
             'name' => 'Docker Compose Example',
@@ -112,7 +114,7 @@ CMD ["sh", "-c", "echo Crashing in 5 seconds... && sleep 5 && exit 1"]
             'destination_type' => StandaloneDocker::class,
             'source_id' => 0,
             'source_type' => GithubApp::class,
-            'private_key_id' => 1,
+            'private_key_id' => $testingHostKey->getKey(),
         ]);
         Application::create([
             'uuid' => 'gitlab-deploy-key',
@@ -127,7 +129,7 @@ CMD ["sh", "-c", "echo Crashing in 5 seconds... && sleep 5 && exit 1"]
             'destination_type' => StandaloneDocker::class,
             'source_id' => 1,
             'source_type' => GitlabApp::class,
-            'private_key_id' => 1,
+            'private_key_id' => $testingHostKey->getKey(),
         ]);
         Application::create([
             'uuid' => 'gitlab-public-example',

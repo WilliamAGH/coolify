@@ -55,6 +55,12 @@ return [
             'visibility' => 'private',
             'throw' => false,
         ],
+        'testing-host-key' => [
+            'driver' => 'local',
+            'root' => storage_path('app/ssh/testing-host'),
+            'visibility' => 'private',
+            'throw' => false,
+        ],
 
         'deployments' => [
             'driver' => 'local',

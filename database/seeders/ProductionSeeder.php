@@ -16,6 +16,7 @@ use App\Models\Server;
 use App\Models\StandaloneDocker;
 use App\Models\Team;
 use App\Models\User;
+use App\Support\ControlPlaneMode;
 use Illuminate\Database\Seeder;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
@@ -23,6 +24,13 @@ use Illuminate\Support\Facades\Storage;
 class ProductionSeeder extends Seeder
 {
     public function run(): void
+    {
+        ControlPlaneMode::withMutationLease(function (): void {
+            $this->seedControlPlane();
+        });
+    }
+
+    private function seedControlPlane(): void
     {
         $user = 'root';
 
@@ -63,6 +71,7 @@ class ProductionSeeder extends Seeder
         if (GithubApp::find(0) == null) {
             GithubApp::create([
                 'id' => 0,
+                'uuid' => 'github-public',
                 'name' => 'Public GitHub',
                 'api_url' => 'https://api.github.com',
                 'html_url' => 'https://github.com',
@@ -127,16 +136,12 @@ class ProductionSeeder extends Seeder
                     'last_applied_settings' => null,
                 ]);
                 $server = Server::create($server_details);
-                $server->settings->is_reachable = true;
-                $server->settings->is_usable = true;
-                $server->settings->save();
+                $this->markServerUsable($server);
                 StartProxy::dispatch($server);
                 CheckAndStartSentinelJob::dispatch($server);
             } else {
                 $server = Server::find(0);
-                $server->settings->is_reachable = true;
-                $server->settings->is_usable = true;
-                $server->settings->save();
+                $this->markServerUsable($server);
                 $shouldStart = CheckProxy::run($server);
                 if ($shouldStart) {
                     StartProxy::dispatch($server);
@@ -220,5 +225,13 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
         $this->call(SentinelSeeder::class);
         $this->call(RootUserSeeder::class);
         $this->call(CaSslCertSeeder::class);
+    }
+
+    private function markServerUsable(Server $server): void
+    {
+        $server->settings()->updateOrCreate([], [
+            'is_reachable' => true,
+            'is_usable' => true,
+        ]);
     }
 }

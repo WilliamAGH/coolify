@@ -16,8 +16,14 @@ use Database\Seeders\StandaloneDockerSeeder;
 use Database\Seeders\TeamSeeder;
 use Database\Seeders\UserSeeder;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Storage;
 
 uses(RefreshDatabase::class);
+
+beforeEach(function () {
+    Storage::fake('ssh-keys');
+    Storage::fake('testing-host-key');
+});
 
 function seedRailpackExamplePrerequisites(): void
 {
@@ -38,8 +44,13 @@ it('can seed the railpack examples directly on a clean development database', fu
     $this->seed(DevelopmentRailpackExamplesSeeder::class);
 
     expect(Team::query()->find(0))->not->toBeNull();
-    expect(PrivateKey::query()->find(1))->not->toBeNull();
-    expect(Server::query()->find(0))->not->toBeNull();
+    $testingHostKey = PrivateKey::query()->where('uuid', 'ssh')->sole();
+    $testingHostServer = Server::query()->find(0);
+
+    expect($testingHostKey)->not->toBeNull();
+    expect($testingHostServer)
+        ->not->toBeNull()
+        ->and($testingHostServer->private_key_id)->toBe($testingHostKey->getKey());
     expect(StandaloneDocker::query()->find(0))->not->toBeNull();
     expect(GithubApp::query()->find(0))->not->toBeNull();
     expect(Project::query()->where('uuid', DevelopmentRailpackExamplesSeeder::PROJECT_UUID)->exists())->toBeTrue();
@@ -138,4 +149,35 @@ it('is idempotent when run multiple times', function () {
 
     expect($project)->not->toBeNull();
     expect($project->applications()->count())->toBe(count(DevelopmentRailpackExamplesSeeder::examples()));
+});
+
+it('uses the canonical testing-host key ID when seeding railpack examples directly', function () {
+    config()->set('app.env', 'local');
+
+    (new Team)->forceFill([
+        'id' => 0,
+        'name' => 'Root Team',
+        'description' => 'The root team',
+        'personal_team' => true,
+    ])->save();
+
+    $previousPrivateKey = PrivateKey::generateNewKeyPair('ed25519')['private_key'];
+    $runtimePrivateKey = PrivateKey::generateNewKeyPair('ed25519')['private_key'];
+    Storage::disk('testing-host-key')->put('testing-host', $runtimePrivateKey);
+
+    PrivateKey::forceCreate([
+        'id' => 73,
+        'uuid' => 'ssh',
+        'team_id' => 0,
+        'name' => 'Testing Host Key',
+        'description' => 'This is a test docker container',
+        'private_key' => $previousPrivateKey,
+    ]);
+
+    $this->seed(DevelopmentRailpackExamplesSeeder::class);
+
+    $testingHostKey = PrivateKey::query()->where('uuid', 'ssh')->sole();
+
+    expect($testingHostKey->private_key)->toBe($runtimePrivateKey)
+        ->and(Server::query()->find(0)?->private_key_id)->toBe($testingHostKey->getKey());
 });

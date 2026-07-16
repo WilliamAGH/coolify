@@ -7,7 +7,6 @@ use App\Enums\ProxyTypes;
 use App\Models\Application;
 use App\Models\Environment;
 use App\Models\GithubApp;
-use App\Models\PrivateKey;
 use App\Models\Project;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
@@ -374,24 +373,8 @@ class DevelopmentRailpackExamplesSeeder extends Seeder
             ],
         );
 
-        PrivateKey::query()->firstOrCreate(
-            ['id' => 1],
-            [
-                'uuid' => 'ssh',
-                'team_id' => 0,
-                'name' => 'Testing Host Key',
-                'description' => 'This is a test docker container',
-                'private_key' => <<<'KEY'
------BEGIN OPENSSH PRIVATE KEY-----
-b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
-QyNTUxOQAAACBbhpqHhqv6aI67Mj9abM3DVbmcfYhZAhC7ca4d9UCevAAAAJi/QySHv0Mk
-hwAAAAtzc2gtZWQyNTUxOQAAACBbhpqHhqv6aI67Mj9abM3DVbmcfYhZAhC7ca4d9UCevA
-AAAECBQw4jg1WRT2IGHMncCiZhURCts2s24HoDS0thHnnRKVuGmoeGq/pojrsyP1pszcNV
-uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
------END OPENSSH PRIVATE KEY-----
-KEY,
-            ],
-        );
+        $testingHostKey = PrivateKeySeeder::testingHostKey();
+        $this->call(GithubAppSeeder::class);
 
         Server::query()->firstOrCreate(
             ['id' => 0],
@@ -401,7 +384,7 @@ KEY,
                 'description' => 'This is a test docker container in development mode',
                 'ip' => 'coolify-testing-host',
                 'team_id' => 0,
-                'private_key_id' => 1,
+                'private_key_id' => $testingHostKey->getKey(),
                 'proxy' => [
                     'type' => ProxyTypes::TRAEFIK->value,
                     'status' => ProxyStatus::EXITED->value,
@@ -416,23 +399,6 @@ KEY,
                 'name' => 'Standalone Docker 1',
                 'network' => 'coolify',
                 'server_id' => 0,
-            ],
-        );
-
-        $this->ensurePublicGithubSourceExists();
-    }
-
-    private function ensurePublicGithubSourceExists(): void
-    {
-        GithubApp::query()->firstOrCreate(
-            ['id' => 0],
-            [
-                'uuid' => 'github-public',
-                'name' => 'Public GitHub',
-                'api_url' => 'https://api.github.com',
-                'html_url' => 'https://github.com',
-                'is_public' => true,
-                'team_id' => 0,
             ],
         );
     }

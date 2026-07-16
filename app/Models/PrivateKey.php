@@ -4,6 +4,7 @@ namespace App\Models;
 
 use App\Traits\HasSafeStringAttribute;
 use DanHarrin\LivewireRateLimiting\WithRateLimiting;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
@@ -30,7 +31,7 @@ use phpseclib3\Crypt\PublicKeyLoader;
 )]
 class PrivateKey extends BaseModel
 {
-    use HasSafeStringAttribute, WithRateLimiting;
+    use HasFactory, HasSafeStringAttribute, WithRateLimiting;
 
     protected $fillable = [
         'name',
@@ -42,6 +43,7 @@ class PrivateKey extends BaseModel
     ];
 
     protected $casts = [
+        'is_git_related' => 'boolean',
         'private_key' => 'encrypted',
     ];
 
@@ -284,9 +286,9 @@ class PrivateKey extends BaseModel
         $disk->delete($testFilename);
     }
 
-    public function getKeyLocation()
+    public function getKeyLocation(): string
     {
-        return "/var/www/html/storage/app/ssh/keys/ssh_key@{$this->uuid}";
+        return config('filesystems.disks.ssh-keys.root')."/ssh_key@{$this->uuid}";
     }
 
     public function updatePrivateKey(array $data)

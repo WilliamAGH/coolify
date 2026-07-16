@@ -23,9 +23,13 @@ services:
       interval: 5s
       retries: 10
       timeout: 2s
+    depends_on:
+      testing-host-keygen:
+        condition: service_completed_successfully
     volumes:
       - .:/var/www/html/:cached
       - dev_backups_data:/var/www/html/storage/app/backups
+      - testing_host_private_key:/var/www/html/storage/app/ssh/testing-host
     networks:
       - coolify
   postgres:
@@ -101,6 +105,23 @@ services:
     command: sh -c "npm install && npm run dev"
     networks:
       - coolify
+  testing-host-keygen:
+    image: coolify-testing-host:dev
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: ./docker/testing-host/Dockerfile
+    user: root
+    restart: "no"
+    entrypoint: ["/bin/sh", "/usr/local/bin/coolify-testing-host-keygen"]
+    environment:
+      COOLIFY_TESTING_KEY_UID: "${USERID:-1000}"
+      COOLIFY_TESTING_KEY_GID: "${GROUPID:-1000}"
+    volumes:
+      - testing_host_private_key:/run/coolify-testing-host/private
+      - testing_host_public_key:/run/coolify-testing-host/public
+    networks:
+      - coolify
   testing-host:
     image: coolify-testing-host:dev
     pull_policy: never
@@ -109,6 +130,9 @@ services:
       dockerfile: ./docker/testing-host/Dockerfile
     init: true
     container_name: coolify-testing-host
+    depends_on:
+      testing-host-keygen:
+        condition: service_completed_successfully
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - dev_coolify_data:/data/coolify
@@ -116,6 +140,7 @@ services:
       - dev_postgres_data:/data/coolify/_volumes/database
       - dev_redis_data:/data/coolify/_volumes/redis
       - dev_minio_data:/data/coolify/_volumes/minio
+      - testing_host_public_key:/run/coolify-testing-host/public:ro
     networks:
       - coolify
   mailpit:
@@ -204,6 +229,8 @@ volumes:
   dev_coolify_data:
   dev_minio_data:
   dev_maxio_data:
+  testing_host_private_key:
+  testing_host_public_key:
 
 networks:
   coolify:
