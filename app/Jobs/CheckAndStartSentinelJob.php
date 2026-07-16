@@ -3,7 +3,10 @@
 namespace App\Jobs;
 
 use App\Actions\Server\StartSentinel;
+use App\Contracts\ProxyMutation;
 use App\Models\Server;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeEncrypted;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -11,16 +14,22 @@ use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 
-class CheckAndStartSentinelJob implements ShouldBeEncrypted, ShouldQueue
+class CheckAndStartSentinelJob implements ProxyMutation, ShouldBeEncrypted, ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    use UsesProxyMutationQueue;
 
     public $timeout = 120;
 
-    public function __construct(public Server $server) {}
+    public function __construct(public Server $server)
+    {
+        ProxyMutationQueue::assign($this);
+    }
 
     public function handle(): void
     {
+        ProxyMutationQueue::ensureExecutionAllowed();
+
         $latestVersion = get_latest_sentinel_version();
 
         // Check if sentinel is running

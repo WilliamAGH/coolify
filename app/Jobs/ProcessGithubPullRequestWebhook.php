@@ -3,11 +3,14 @@
 namespace App\Jobs;
 
 use App\Actions\Application\CleanupPreviewDeployment;
+use App\Contracts\ProxyMutation;
 use App\Enums\ProcessStatus;
 use App\Http\Controllers\Webhook\Concerns\DetectsSkipDeployCommits;
 use App\Models\Application;
 use App\Models\ApplicationPreview;
 use App\Models\GithubApp;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeEncrypted;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -16,10 +19,11 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Visus\Cuid2\Cuid2;
 
-class ProcessGithubPullRequestWebhook implements ShouldBeEncrypted, ShouldQueue
+class ProcessGithubPullRequestWebhook implements ProxyMutation, ShouldBeEncrypted, ShouldQueue
 {
     use DetectsSkipDeployCommits;
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    use UsesProxyMutationQueue;
 
     public int $tries = 3;
 
@@ -41,11 +45,13 @@ class ProcessGithubPullRequestWebhook implements ShouldBeEncrypted, ShouldQueue
         public string $fullName,
         public bool $isForkPullRequest = false,
     ) {
-        $this->onQueue('high');
+        ProxyMutationQueue::assign($this);
     }
 
     public function handle(): void
     {
+        ProxyMutationQueue::ensureExecutionAllowed();
+
         $application = Application::find($this->applicationId);
         if (! $application) {
             return;

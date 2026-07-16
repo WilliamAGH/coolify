@@ -2,9 +2,12 @@
 
 namespace App\Jobs;
 
+use App\Contracts\ProxyMutation;
 use App\Models\InstanceSettings;
 use App\Models\Server;
 use App\Models\Team;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeEncrypted;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -15,9 +18,10 @@ use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
 
-class ServerManagerJob implements ShouldBeEncrypted, ShouldQueue
+class ServerManagerJob implements ProxyMutation, ShouldBeEncrypted, ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    use UsesProxyMutationQueue;
 
     /**
      * The time when this job execution started.
@@ -35,11 +39,13 @@ class ServerManagerJob implements ShouldBeEncrypted, ShouldQueue
      */
     public function __construct()
     {
-        $this->onQueue('high');
+        ProxyMutationQueue::assign($this);
     }
 
     public function handle(): void
     {
+        ProxyMutationQueue::ensureExecutionAllowed();
+
         // Freeze the execution time at the start of the job
         $this->executionTime = Carbon::now();
         if (isCloud()) {

@@ -2,22 +2,28 @@
 
 namespace App\Actions\Service;
 
+use App\Contracts\ProxyMutation;
 use App\Models\Service;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Lorisleiva\Actions\Concerns\AsAction;
 use Lorisleiva\Actions\Decorators\JobDecorator;
 use Symfony\Component\Yaml\Yaml;
 
-class StartService
+class StartService implements ProxyMutation
 {
     use AsAction;
+    use UsesProxyMutationQueue;
 
     public function configureJob(JobDecorator $job): void
     {
-        $job->onQueue(deployment_queue());
+        ProxyMutationQueue::assign($job);
     }
 
     public function handle(Service $service, bool $pullLatestImages = false, bool $stopBeforeStart = false)
     {
+        ProxyMutationQueue::ensureExecutionAllowed();
+
         $service->parse();
         if ($this->shouldStopBeforeStarting($pullLatestImages, $stopBeforeStart)) {
             StopService::run(service: $service, dockerCleanup: false);
@@ -52,7 +58,7 @@ class StartService
         }
         $commands = array_merge($commands, $this->logDrainNetworkConnectCommands($service));
 
-        return remote_process($commands, $service->server, type_uuid: $service->uuid, callEventOnFinish: 'ServiceStatusChanged');
+        return proxy_mutation_remote_process($commands, $service->server, type_uuid: $service->uuid, callEventOnFinish: 'ServiceStatusChanged');
     }
 
     private function logDrainNetworkConnectCommands(Service $service): array

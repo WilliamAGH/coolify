@@ -61,7 +61,7 @@ class ScheduledTasksController extends Controller
             'command' => 'required|string',
             'frequency' => 'required|string',
             'container' => 'string|nullable',
-            'timeout' => 'integer|min:1',
+            'timeout' => 'integer|min:60|max:36000',
             'enabled' => 'boolean',
         ]);
 
@@ -137,7 +137,7 @@ class ScheduledTasksController extends Controller
             'command' => 'string',
             'frequency' => 'string',
             'container' => 'string|nullable',
-            'timeout' => 'integer|min:1',
+            'timeout' => 'integer|min:60|max:36000',
             'enabled' => 'boolean',
         ]);
 

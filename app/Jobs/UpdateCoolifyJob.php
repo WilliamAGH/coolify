@@ -3,7 +3,10 @@
 namespace App\Jobs;
 
 use App\Actions\Server\UpdateCoolify;
+use App\Contracts\ProxyMutation;
 use App\Models\Server;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeEncrypted;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -12,19 +15,22 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
 
-class UpdateCoolifyJob implements ShouldBeEncrypted, ShouldQueue
+class UpdateCoolifyJob implements ProxyMutation, ShouldBeEncrypted, ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    use UsesProxyMutationQueue;
 
     public $timeout = 600;
 
     public function __construct()
     {
-        $this->onQueue('high');
+        ProxyMutationQueue::assign($this);
     }
 
     public function handle(): void
     {
+        ProxyMutationQueue::ensureExecutionAllowed();
+
         try {
             CheckForUpdatesJob::dispatchSync();
             $settings = instanceSettings();

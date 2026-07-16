@@ -2,9 +2,12 @@
 
 namespace App\Jobs;
 
+use App\Contracts\ProxyMutation;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\Server;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeEncrypted;
 use Illuminate\Contracts\Queue\ShouldBeUnique;
@@ -13,14 +16,20 @@ use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 
-class CleanupHelperContainersJob implements ShouldBeEncrypted, ShouldBeUnique, ShouldQueue
+class CleanupHelperContainersJob implements ProxyMutation, ShouldBeEncrypted, ShouldBeUnique, ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    use UsesProxyMutationQueue;
 
-    public function __construct(public Server $server) {}
+    public function __construct(public Server $server)
+    {
+        ProxyMutationQueue::assign($this);
+    }
 
     public function handle(): void
     {
+        ProxyMutationQueue::ensureExecutionAllowed();
+
         try {
             // Get all active deployments on this server
             $activeDeployments = ApplicationDeploymentQueue::where('server_id', $this->server->id)

@@ -2,8 +2,11 @@
 
 namespace App\Jobs;
 
+use App\Contracts\ProxyMutation;
 use App\Models\LocalPersistentVolume;
 use App\Models\Server;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeEncrypted;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -11,9 +14,10 @@ use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 
-class VolumeCloneJob implements ShouldBeEncrypted, ShouldQueue
+class VolumeCloneJob implements ProxyMutation, ShouldBeEncrypted, ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    use UsesProxyMutationQueue;
 
     protected string $cloneDir = '/data/coolify/clone';
 
@@ -24,11 +28,13 @@ class VolumeCloneJob implements ShouldBeEncrypted, ShouldQueue
         protected ?Server $targetServer,
         protected LocalPersistentVolume $persistentVolume
     ) {
-        $this->onQueue('high');
+        ProxyMutationQueue::assign($this);
     }
 
     public function handle()
     {
+        ProxyMutationQueue::ensureExecutionAllowed();
+
         try {
             if (! $this->targetServer || $this->targetServer->id === $this->sourceServer->id) {
                 $this->cloneLocalVolume();

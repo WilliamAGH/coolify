@@ -2,18 +2,26 @@
 
 namespace App\Actions\Application;
 
+use App\Contracts\ProxyMutation;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Jobs\DeleteResourceJob;
 use App\Models\Application;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\ApplicationPreview;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Lorisleiva\Actions\Concerns\AsAction;
+use Lorisleiva\Actions\Decorators\JobDecorator;
 
-class CleanupPreviewDeployment
+class CleanupPreviewDeployment implements ProxyMutation
 {
     use AsAction;
+    use UsesProxyMutationQueue;
 
-    public string $jobQueue = 'high';
+    public function configureJob(JobDecorator $job): void
+    {
+        ProxyMutationQueue::assign($job);
+    }
 
     /**
      * Clean up a PR preview deployment completely.
@@ -31,6 +39,8 @@ class CleanupPreviewDeployment
         int $pull_request_id,
         ?ApplicationPreview $preview = null
     ): array {
+        ProxyMutationQueue::ensureExecutionAllowed();
+
         $result = [
             'cancelled_deployments' => 0,
             'killed_containers' => 0,

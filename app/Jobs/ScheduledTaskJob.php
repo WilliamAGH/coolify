@@ -2,6 +2,7 @@
 
 namespace App\Jobs;
 
+use App\Actions\Application\ResolveActiveApplicationContainer;
 use App\Events\ScheduledTaskDone;
 use App\Exceptions\NonReportableException;
 use App\Models\Application;
@@ -119,7 +120,25 @@ class ScheduledTaskJob implements ShouldBeEncrypted, ShouldQueue
             $this->executionId = $this->task_log->id;
 
             if ($this->resource->type() === 'application') {
+                $resolution = ResolveActiveApplicationContainer::run($this->resource, $this->server);
+                if ($resolution->failsClosed()) {
+                    throw new NonReportableException(
+                        'ScheduledTaskJob failed: Blue-green active container resolution failed: '.$resolution->failureReason(),
+                    );
+                }
+                if ($resolution->hasNoPublicContainer()) {
+                    throw new NonReportableException('ScheduledTaskJob failed: No active blue-green container is available.');
+                }
+
                 $containers = getCurrentApplicationContainerStatus($this->server, $this->resource->id, 0);
+                $containers = $containers->filter(
+                    fn (array $container) => $resolution->accepts(data_get($container, 'Names')),
+                );
+                if ($resolution->requiresExpectedContainer() && $containers->isEmpty()) {
+                    throw new NonReportableException(
+                        'ScheduledTaskJob failed: Active blue-green container '.$resolution->expectedContainerName().' was not found.',
+                    );
+                }
                 if ($containers->count() > 0) {
                     $containers->each(function ($container) {
                         $this->containers[] = str_replace('/', '', $container['Names']);

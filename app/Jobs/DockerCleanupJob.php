@@ -3,11 +3,14 @@
 namespace App\Jobs;
 
 use App\Actions\Server\CleanupDocker;
+use App\Contracts\ProxyMutation;
 use App\Events\DockerCleanupDone;
 use App\Models\DockerCleanupExecution;
 use App\Models\Server;
 use App\Notifications\Server\DockerCleanupFailed;
 use App\Notifications\Server\DockerCleanupSuccess;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Carbon\Carbon;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeEncrypted;
@@ -17,9 +20,10 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\Middleware\WithoutOverlapping;
 use Illuminate\Queue\SerializesModels;
 
-class DockerCleanupJob implements ShouldBeEncrypted, ShouldQueue
+class DockerCleanupJob implements ProxyMutation, ShouldBeEncrypted, ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    use UsesProxyMutationQueue;
 
     public $timeout = 600;
 
@@ -40,11 +44,13 @@ class DockerCleanupJob implements ShouldBeEncrypted, ShouldQueue
         public bool $deleteUnusedVolumes = false,
         public bool $deleteUnusedNetworks = false
     ) {
-        $this->onQueue('high');
+        ProxyMutationQueue::assign($this);
     }
 
     public function handle(): void
     {
+        ProxyMutationQueue::ensureExecutionAllowed();
+
         try {
             $this->execution_log = DockerCleanupExecution::create([
                 'server_id' => $this->server->id,

@@ -3,10 +3,12 @@
 namespace Tests\Feature\Proxy;
 
 use App\Jobs\RestartProxyJob;
+use App\Models\InstanceSettings;
 use App\Models\Server;
 use App\Models\Team;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Queue\Middleware\WithoutOverlapping;
 use Illuminate\Support\Facades\Queue;
 use Livewire\Livewire;
 use Tests\TestCase;
@@ -25,10 +27,14 @@ class RestartProxyTest extends TestCase
     {
         parent::setUp();
 
+        $settings = new InstanceSettings;
+        $settings->id = 0;
+        $settings->save();
+
         // Create test user and team
         $this->user = User::factory()->create();
         $this->team = Team::factory()->create(['name' => 'Test Team']);
-        $this->user->teams()->attach($this->team);
+        $this->user->teams()->attach($this->team, ['role' => 'owner']);
 
         // Create test server
         $this->server = Server::factory()->create([
@@ -39,6 +45,7 @@ class RestartProxyTest extends TestCase
 
         // Authenticate user
         $this->actingAs($this->user);
+        session(['currentTeam' => $this->team]);
     }
 
     public function test_restart_dispatches_job_for_all_servers()
@@ -90,11 +97,14 @@ class RestartProxyTest extends TestCase
 
         // Create another user without access
         $unauthorizedUser = User::factory()->create();
+        $unauthorizedTeam = Team::factory()->create();
+        $unauthorizedUser->teams()->attach($unauthorizedTeam, ['role' => 'owner']);
         $this->actingAs($unauthorizedUser);
+        session(['currentTeam' => $unauthorizedTeam]);
 
         Livewire::test('server.navbar', ['server' => $this->server])
             ->call('restart')
-            ->assertForbidden();
+            ->assertDispatched('error');
 
         // Assert job was NOT dispatched
         Queue::assertNotPushed(RestartProxyJob::class);
@@ -119,9 +129,9 @@ class RestartProxyTest extends TestCase
 
         // Verify both jobs have WithoutOverlapping middleware
         foreach ($jobs as $job) {
-            $middleware = $job['job']->middleware();
+            $middleware = $job->middleware();
             $this->assertCount(1, $middleware);
-            $this->assertInstanceOf(\Illuminate\Queue\Middleware\WithoutOverlapping::class, $middleware[0]);
+            $this->assertInstanceOf(WithoutOverlapping::class, $middleware[0]);
         }
     }
 

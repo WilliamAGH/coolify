@@ -4,15 +4,16 @@ namespace App\Providers;
 
 use App\Contracts\CustomJobRepositoryInterface;
 use App\Exceptions\DeploymentException;
-use App\Models\ApplicationDeploymentQueue;
+use App\Jobs\ApplicationDeploymentJob;
 use App\Models\User;
 use App\Repositories\CustomJobRepository;
 use Illuminate\Queue\Events\JobFailed;
+use Illuminate\Queue\Queue;
 use Illuminate\Queue\TimeoutExceededException;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Gate;
+use Illuminate\Support\Str;
 use Laravel\Horizon\Contracts\JobRepository;
-use Laravel\Horizon\Events\JobReserved;
 use Laravel\Horizon\HorizonApplicationServiceProvider;
 
 class HorizonServiceProvider extends HorizonApplicationServiceProvider
@@ -32,24 +33,16 @@ class HorizonServiceProvider extends HorizonApplicationServiceProvider
     public function boot(): void
     {
         parent::boot();
-        Event::listen(function (JobReserved $event) {
-            $payload = $event->payload->decoded;
-            $jobName = $payload['displayName'];
-            if ($jobName === 'App\Jobs\ApplicationDeploymentJob') {
-                $tags = $payload['tags'];
-                $id = $payload['id'];
-                $deploymentQueueId = collect($tags)->first(function ($tag) {
-                    return str_contains($tag, 'App\Models\ApplicationDeploymentQueue');
-                });
-                if (blank($deploymentQueueId)) {
-                    return;
-                }
-                $deploymentQueueId = explode(':', $deploymentQueueId)[1];
-                $deploymentQueue = ApplicationDeploymentQueue::find($deploymentQueueId);
-                $deploymentQueue->update([
-                    'horizon_job_id' => $id,
-                ]);
+        Queue::createPayloadUsing(function (string $connection, ?string $queue, array $payload): array {
+            $job = data_get($payload, 'data.command');
+            if (! $job instanceof ApplicationDeploymentJob) {
+                return [];
             }
+            if (! is_string($job->dispatch_attempt_uuid) || ! Str::isUuid($job->dispatch_attempt_uuid)) {
+                throw new DeploymentException('Application deployment jobs require a durable dispatch attempt identity.');
+            }
+
+            return ['uuid' => $job->dispatch_attempt_uuid];
         });
 
         Event::listen(function (JobFailed $event) {

@@ -1,31 +1,9 @@
 <?php
 
 use App\Actions\Database\StartDatabaseProxy;
-use App\Models\StandalonePostgresql;
-use App\Models\Team;
-use Illuminate\Foundation\Testing\RefreshDatabase;
-use Illuminate\Support\Facades\Notification;
 
-uses(RefreshDatabase::class);
-
-beforeEach(function () {
-    Notification::fake();
-});
-
-test('database proxy is disabled on port already allocated error', function () {
-    $team = Team::factory()->create();
-
-    $database = StandalonePostgresql::factory()->create([
-        'team_id' => $team->id,
-        'is_public' => true,
-        'public_port' => 5432,
-    ]);
-
-    expect($database->is_public)->toBeTrue();
-
+test('database proxy recognizes an allocated port error', function () {
     $action = new StartDatabaseProxy;
-
-    // Use reflection to test the private method directly
     $method = new ReflectionMethod($action, 'isNonTransientError');
 
     expect($method->invoke($action, 'Bind for 0.0.0.0:5432 failed: port is already allocated'))->toBeTrue();

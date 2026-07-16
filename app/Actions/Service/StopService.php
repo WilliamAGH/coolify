@@ -3,21 +3,31 @@
 namespace App\Actions\Service;
 
 use App\Actions\Server\CleanupDocker;
+use App\Contracts\ProxyMutation;
 use App\Enums\ProcessStatus;
 use App\Events\ServiceStatusChanged;
 use App\Models\Server;
 use App\Models\Service;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Lorisleiva\Actions\Concerns\AsAction;
+use Lorisleiva\Actions\Decorators\JobDecorator;
 use Spatie\Activitylog\Models\Activity;
 
-class StopService
+class StopService implements ProxyMutation
 {
     use AsAction;
+    use UsesProxyMutationQueue;
 
-    public string $jobQueue = 'high';
+    public function configureJob(JobDecorator $job): void
+    {
+        ProxyMutationQueue::assign($job);
+    }
 
     public function handle(Service $service, bool $deleteConnectedNetworks = false, bool $dockerCleanup = true)
     {
+        ProxyMutationQueue::ensureExecutionAllowed();
+
         try {
             // Cancel any in-progress deployment activities so status doesn't stay stuck at "starting"
             Activity::where('properties->type_uuid', $service->uuid)

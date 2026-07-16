@@ -3,16 +3,28 @@
 namespace App\Actions\Service;
 
 use App\Actions\Server\CleanupDocker;
+use App\Contracts\ProxyMutation;
 use App\Models\Service;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Illuminate\Support\Facades\Log;
 use Lorisleiva\Actions\Concerns\AsAction;
+use Lorisleiva\Actions\Decorators\JobDecorator;
 
-class DeleteService
+class DeleteService implements ProxyMutation
 {
     use AsAction;
+    use UsesProxyMutationQueue;
+
+    public function configureJob(JobDecorator $job): void
+    {
+        ProxyMutationQueue::assign($job);
+    }
 
     public function handle(Service $service, bool $deleteVolumes, bool $deleteConnectedNetworks, bool $deleteConfigurations, bool $dockerCleanup)
     {
+        ProxyMutationQueue::ensureExecutionAllowed();
+
         try {
             $server = data_get($service, 'server');
             if ($deleteVolumes && $server->isFunctional()) {

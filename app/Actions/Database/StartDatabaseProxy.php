@@ -2,6 +2,7 @@
 
 namespace App\Actions\Database;
 
+use App\Contracts\ProxyMutation;
 use App\Models\ServiceDatabase;
 use App\Models\StandaloneClickhouse;
 use App\Models\StandaloneDragonfly;
@@ -12,21 +13,26 @@ use App\Models\StandaloneMysql;
 use App\Models\StandalonePostgresql;
 use App\Models\StandaloneRedis;
 use App\Notifications\Container\ContainerRestarted;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Lorisleiva\Actions\Concerns\AsAction;
 use Lorisleiva\Actions\Decorators\JobDecorator;
 use Symfony\Component\Yaml\Yaml;
 
-class StartDatabaseProxy
+class StartDatabaseProxy implements ProxyMutation
 {
     use AsAction;
+    use UsesProxyMutationQueue;
 
     public function configureJob(JobDecorator $job): void
     {
-        $job->onQueue(deployment_queue());
+        ProxyMutationQueue::assign($job);
     }
 
     public function handle(StandaloneRedis|StandalonePostgresql|StandaloneMongodb|StandaloneMysql|StandaloneMariadb|StandaloneKeydb|StandaloneDragonfly|StandaloneClickhouse|ServiceDatabase $database)
     {
+        ProxyMutationQueue::ensureExecutionAllowed();
+
         $databaseType = $database->database_type;
         $network = data_get($database, 'destination.network');
         $server = data_get($database, 'destination.server');

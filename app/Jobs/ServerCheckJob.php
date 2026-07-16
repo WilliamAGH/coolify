@@ -6,8 +6,11 @@ use App\Actions\Docker\GetContainersStatus;
 use App\Actions\Proxy\CheckProxy;
 use App\Actions\Proxy\StartProxy;
 use App\Actions\Server\StartLogDrain;
+use App\Contracts\ProxyMutation;
 use App\Models\Server;
 use App\Notifications\Container\ContainerRestarted;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeEncrypted;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -18,9 +21,10 @@ use Illuminate\Queue\SerializesModels;
 use Illuminate\Queue\TimeoutExceededException;
 use Illuminate\Support\Facades\Log;
 
-class ServerCheckJob implements ShouldBeEncrypted, ShouldQueue
+class ServerCheckJob implements ProxyMutation, ShouldBeEncrypted, ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    use UsesProxyMutationQueue;
 
     public $tries = 1;
 
@@ -33,7 +37,10 @@ class ServerCheckJob implements ShouldBeEncrypted, ShouldQueue
         return [(new WithoutOverlapping('server-check-'.$this->server->uuid))->expireAfter(60)->dontRelease()];
     }
 
-    public function __construct(public Server $server) {}
+    public function __construct(public Server $server)
+    {
+        ProxyMutationQueue::assign($this);
+    }
 
     public function failed(?\Throwable $exception): void
     {
@@ -51,6 +58,8 @@ class ServerCheckJob implements ShouldBeEncrypted, ShouldQueue
 
     public function handle()
     {
+        ProxyMutationQueue::ensureExecutionAllowed();
+
         try {
             if ($this->server->serverStatus() === false) {
                 return 'Server is not reachable or not ready.';

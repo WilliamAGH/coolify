@@ -2,16 +2,28 @@
 
 namespace App\Actions\Server;
 
+use App\Contracts\ProxyMutation;
 use App\Events\SentinelRestarted;
 use App\Models\Server;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Lorisleiva\Actions\Concerns\AsAction;
+use Lorisleiva\Actions\Decorators\JobDecorator;
 
-class StartSentinel
+class StartSentinel implements ProxyMutation
 {
     use AsAction;
+    use UsesProxyMutationQueue;
+
+    public function configureJob(JobDecorator $job): void
+    {
+        ProxyMutationQueue::assign($job);
+    }
 
     public function handle(Server $server, bool $restart = false, ?string $latestVersion = null, ?string $customImage = null)
     {
+        ProxyMutationQueue::ensureExecutionAllowed();
+
         if ($server->isSwarm() || $server->isBuildServer()) {
             return;
         }

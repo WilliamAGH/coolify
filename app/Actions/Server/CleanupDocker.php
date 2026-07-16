@@ -2,17 +2,27 @@
 
 namespace App\Actions\Server;
 
+use App\Contracts\ProxyMutation;
 use App\Models\Server;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Lorisleiva\Actions\Concerns\AsAction;
+use Lorisleiva\Actions\Decorators\JobDecorator;
 
-class CleanupDocker
+class CleanupDocker implements ProxyMutation
 {
     use AsAction;
+    use UsesProxyMutationQueue;
 
-    public string $jobQueue = 'high';
+    public function configureJob(JobDecorator $job): void
+    {
+        ProxyMutationQueue::assign($job);
+    }
 
     public function handle(Server $server, bool $deleteUnusedVolumes = false, bool $deleteUnusedNetworks = false)
     {
+        ProxyMutationQueue::ensureExecutionAllowed();
+
         $realtimeImage = config('constants.coolify.realtime_image');
         $realtimeImageVersion = config('constants.coolify.realtime_version');
         $realtimeImageWithVersion = "$realtimeImage:$realtimeImageVersion";

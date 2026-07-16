@@ -2,12 +2,15 @@
 
 namespace App\Jobs;
 
+use App\Actions\Application\ActiveApplicationContainerResolution;
+use App\Actions\Application\ResolveActiveApplicationContainer;
 use App\Actions\Database\StartDatabaseProxy;
 use App\Actions\Database\StopDatabaseProxy;
 use App\Actions\Proxy\CheckProxy;
 use App\Actions\Proxy\StartProxy;
 use App\Actions\Server\StartLogDrain;
 use App\Actions\Shared\ComplexStatusCheck;
+use App\Contracts\ProxyMutation;
 use App\Models\Application;
 use App\Models\ApplicationPreview;
 use App\Models\Server;
@@ -25,6 +28,8 @@ use App\Models\StandaloneRedis;
 use App\Models\SwarmDocker;
 use App\Notifications\Container\ContainerRestarted;
 use App\Services\ContainerStatusAggregator;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use App\Traits\CalculatesExcludedStatus;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeEncrypted;
@@ -38,10 +43,11 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Laravel\Horizon\Contracts\Silenced;
 
-class PushServerUpdateJob implements ShouldBeEncrypted, ShouldQueue, Silenced
+class PushServerUpdateJob implements ProxyMutation, ShouldBeEncrypted, ShouldQueue, Silenced
 {
     use CalculatesExcludedStatus;
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    use UsesProxyMutationQueue;
 
     public $tries = 1;
 
@@ -95,6 +101,8 @@ class PushServerUpdateJob implements ShouldBeEncrypted, ShouldQueue, Silenced
 
     public Collection $applicationContainerStatuses;
 
+    public Collection $activeApplicationContainerResolutions;
+
     public Collection $serviceContainerStatuses;
 
     public bool $foundProxy = false;
@@ -115,6 +123,7 @@ class PushServerUpdateJob implements ShouldBeEncrypted, ShouldQueue, Silenced
 
     public function __construct(public Server $server, public $data)
     {
+        ProxyMutationQueue::assign($this);
         $this->containers = collect();
         $this->foundApplicationIds = collect();
         $this->foundDatabaseUuids = collect();
@@ -122,6 +131,7 @@ class PushServerUpdateJob implements ShouldBeEncrypted, ShouldQueue, Silenced
         $this->foundApplicationPreviewsIds = collect();
         $this->foundServiceDatabaseIds = collect();
         $this->applicationContainerStatuses = collect();
+        $this->activeApplicationContainerResolutions = collect();
         $this->serviceContainerStatuses = collect();
         $this->allApplicationIds = collect();
         $this->allDatabaseUuids = collect();
@@ -138,9 +148,12 @@ class PushServerUpdateJob implements ShouldBeEncrypted, ShouldQueue, Silenced
 
     public function handle()
     {
+        ProxyMutationQueue::ensureExecutionAllowed();
+
         // Defensive initialization for Collection properties to handle queue deserialization edge cases
         $this->serviceContainerStatuses ??= collect();
         $this->applicationContainerStatuses ??= collect();
+        $this->activeApplicationContainerResolutions ??= collect();
         $this->foundApplicationIds ??= collect();
         $this->foundDatabaseUuids ??= collect();
         $this->foundServiceApplicationIds ??= collect();
@@ -193,6 +206,8 @@ class PushServerUpdateJob implements ShouldBeEncrypted, ShouldQueue, Silenced
         }
 
         $this->applications = $this->loadApplications();
+        $this->activeApplicationContainerResolutions = (new ResolveActiveApplicationContainer)
+            ->resolveMany($this->applications, $this->server);
         $this->databases = $this->loadDatabases();
         $this->previews = $this->loadPreviews();
         $this->services = $this->loadServices();
@@ -241,6 +256,14 @@ class PushServerUpdateJob implements ShouldBeEncrypted, ShouldQueue, Silenced
                 $pullRequestId = $labels->get('coolify.pullRequestId', '0');
                 try {
                     if ($pullRequestId === '0') {
+                        $resolution = $this->activeApplicationContainerResolutions->get(
+                            (int) $applicationId,
+                            ActiveApplicationContainerResolution::standard(),
+                        );
+                        if (! $resolution->accepts(data_get($container, 'name'))) {
+                            continue;
+                        }
+
                         if ($this->allApplicationIds->contains($applicationId)) {
                             $this->foundApplicationIds->push($applicationId);
                         }
@@ -622,8 +645,47 @@ class PushServerUpdateJob implements ShouldBeEncrypted, ShouldQueue, Silenced
             return;
         }
 
-        // Batch update: mark all not-found applications as exited (excluding already exited ones)
-        Application::whereIn('id', $notFoundApplicationIds)
+        $normalApplicationIds = $notFoundApplicationIds->filter(function (int|string $applicationId): bool {
+            $application = $this->applicationsById->get((string) $applicationId);
+            if (! $application) {
+                return false;
+            }
+
+            $resolution = $this->activeApplicationContainerResolutions->get(
+                $application->id,
+                ActiveApplicationContainerResolution::standard(),
+            );
+            if ($resolution->failsClosed()) {
+                \Log::error('Blue-green application status resolution failed closed.', [
+                    'application_id' => $application->id,
+                    'server_id' => $this->server->id,
+                    'reason' => $resolution->failureReason(),
+                ]);
+                $application->update(['status' => 'degraded:unhealthy']);
+
+                return false;
+            }
+            if ($resolution->requiresExpectedContainer()) {
+                \Log::warning('Blue-green active application container was not observed.', [
+                    'application_id' => $application->id,
+                    'server_id' => $this->server->id,
+                    'expected_container' => $resolution->expectedContainerName(),
+                ]);
+                $application->update(['status' => 'degraded:unhealthy']);
+
+                return false;
+            }
+            if ($resolution->hasNoPublicContainer()) {
+                $application->update(['status' => 'exited']);
+
+                return false;
+            }
+
+            return true;
+        });
+
+        // Batch update: mark ordinary not-found applications as exited (excluding already exited ones)
+        Application::whereIn('id', $normalApplicationIds)
             ->where('status', 'not like', 'exited%')
             ->update(['status' => 'exited']);
     }
@@ -773,7 +835,7 @@ class PushServerUpdateJob implements ShouldBeEncrypted, ShouldQueue, Silenced
     private function updateAdditionalServersStatus()
     {
         $this->allApplicationsWithAdditionalServers->each(function ($application) {
-            ComplexStatusCheck::run($application);
+            ComplexStatusCheck::run($application, $this->activeApplicationContainerResolutions);
         });
     }
 

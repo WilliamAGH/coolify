@@ -3,6 +3,7 @@
 namespace App\Jobs;
 
 use App\Events\ServerReachabilityChanged;
+use App\Exceptions\ControlPlaneMutationLockedException;
 use App\Helpers\SshMultiplexingHelper;
 use App\Models\Server;
 use App\Services\ConfigurationRepository;
@@ -107,6 +108,13 @@ class ServerConnectionCheckJob implements ShouldBeEncrypted, ShouldQueue
 
             $this->dispatchReachabilityChangedIfNeeded($wasReachable, $wasNotified, true);
 
+        } catch (ControlPlaneMutationLockedException) {
+            Log::info('ServerConnectionCheckJob deferred while control-plane mutations are locked', [
+                'server_id' => $this->server->id,
+            ]);
+            $this->release($this->timeout);
+
+            return;
         } catch (\Throwable $e) {
 
             Log::error('ServerConnectionCheckJob failed', [
@@ -235,6 +243,8 @@ class ServerConnectionCheckJob implements ShouldBeEncrypted, ShouldQueue
             }
 
             return false;
+        } catch (ControlPlaneMutationLockedException $exception) {
+            throw $exception;
         } catch (\Throwable $e) {
             Log::debug('ServerConnectionCheck: Docker check failed', [
                 'server_id' => $this->server->id,

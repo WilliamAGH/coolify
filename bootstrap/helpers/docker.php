@@ -1,5 +1,6 @@
 <?php
 
+use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\ProxyTypes;
 use App\Models\Application;
 use App\Models\ApplicationPreview;
@@ -790,6 +791,20 @@ function generateLabelsApplication(Application $application, ?ApplicationPreview
     }
 
     return $labels->all();
+}
+
+function generateBlueGreenApplicationContainerLabels(BlueGreenDeploymentColor $color, int $routingRevision): array
+{
+    if ($routingRevision < 0) {
+        throw new InvalidArgumentException('The routing revision must be a nonnegative integer.');
+    }
+
+    return [
+        'traefik.enable=false',
+        'coolify.blueGreen.managed=true',
+        "coolify.blueGreen.color={$color->value}",
+        "coolify.blueGreen.routingRevision={$routingRevision}",
+    ];
 }
 
 function isDatabaseImage(?string $image = null, ?array $serviceConfig = null)

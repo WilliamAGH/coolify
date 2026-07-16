@@ -2,19 +2,31 @@
 
 namespace App\Actions\Proxy;
 
+use App\Contracts\ProxyMutation;
 use App\Enums\ProxyTypes;
 use App\Events\ProxyStatusChanged;
 use App\Events\ProxyStatusChangedUI;
 use App\Models\Server;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Lorisleiva\Actions\Concerns\AsAction;
+use Lorisleiva\Actions\Decorators\JobDecorator;
 use Spatie\Activitylog\Models\Activity;
 
-class StartProxy
+class StartProxy implements ProxyMutation
 {
     use AsAction;
+    use UsesProxyMutationQueue;
+
+    public function configureJob(JobDecorator $job): void
+    {
+        ProxyMutationQueue::assign($job);
+    }
 
     public function handle(Server $server, bool $async = true, bool $force = false, bool $restarting = false): string|Activity
     {
+        ProxyMutationQueue::ensureExecutionAllowed();
+
         $proxyType = $server->proxyType();
         if ((is_null($proxyType) || $proxyType === 'NONE' || $server->proxy->force_stop || $server->isBuildServer()) && $force === false) {
             return 'OK';
@@ -87,7 +99,7 @@ class StartProxy
         }
 
         if ($async) {
-            return remote_process($commands, $server, callEventOnFinish: 'ProxyStatusChanged', callEventData: $server->id);
+            return proxy_mutation_remote_process($commands, $server, callEventOnFinish: 'ProxyStatusChanged', callEventData: $server->id);
         } else {
             instant_remote_process($commands, $server);
 

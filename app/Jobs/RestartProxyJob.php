@@ -4,10 +4,13 @@ namespace App\Jobs;
 
 use App\Actions\Proxy\GetProxyConfiguration;
 use App\Actions\Proxy\SaveProxyConfiguration;
+use App\Contracts\ProxyMutation;
 use App\Enums\ProxyTypes;
 use App\Events\ProxyStatusChangedUI;
 use App\Models\Server;
 use App\Services\ProxyDashboardCacheService;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeEncrypted;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -16,9 +19,10 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\Middleware\WithoutOverlapping;
 use Illuminate\Queue\SerializesModels;
 
-class RestartProxyJob implements ShouldBeEncrypted, ShouldQueue
+class RestartProxyJob implements ProxyMutation, ShouldBeEncrypted, ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    use UsesProxyMutationQueue;
 
     public $tries = 1;
 
@@ -31,10 +35,15 @@ class RestartProxyJob implements ShouldBeEncrypted, ShouldQueue
         return [(new WithoutOverlapping('restart-proxy-'.$this->server->uuid))->expireAfter(120)->dontRelease()];
     }
 
-    public function __construct(public Server $server) {}
+    public function __construct(public Server $server)
+    {
+        ProxyMutationQueue::assign($this);
+    }
 
     public function handle()
     {
+        ProxyMutationQueue::ensureExecutionAllowed();
+
         try {
             // Set status to restarting
             $this->server->proxy->status = 'restarting';
@@ -46,7 +55,7 @@ class RestartProxyJob implements ShouldBeEncrypted, ShouldQueue
 
             // Create activity and dispatch immediately - returns Activity right away
             // The remote_process runs asynchronously, so UI gets activity ID instantly
-            $activity = remote_process(
+            $activity = proxy_mutation_remote_process(
                 $commands,
                 $this->server,
                 callEventOnFinish: 'ProxyStatusChanged',

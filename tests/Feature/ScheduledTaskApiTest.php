@@ -17,7 +17,7 @@ uses(RefreshDatabase::class);
 
 beforeEach(function () {
     // ApiAllowed middleware requires InstanceSettings with id=0
-    InstanceSettings::create(['id' => 0, 'is_api_enabled' => true]);
+    InstanceSettings::forceCreate(['id' => 0, 'is_api_enabled' => true]);
 
     $this->team = Team::factory()->create();
     $this->user = User::factory()->create();
@@ -189,6 +189,24 @@ describe('POST /api/v1/applications/{uuid}/scheduled-tasks', function () {
             'enabled' => true,
         ]);
     });
+
+    test('rejects a timeout outside the worker and Redis retry envelope', function (int $timeout) {
+        $application = Application::factory()->create([
+            'environment_id' => $this->environment->id,
+            'destination_id' => $this->destination->id,
+            'destination_type' => $this->destination->getMorphClass(),
+        ]);
+
+        $this->withHeaders(scheduledTaskAuthHeaders($this->bearerToken))
+            ->postJson("/api/v1/applications/{$application->uuid}/scheduled-tasks", [
+                'name' => 'Unsafe timeout',
+                'command' => 'echo test',
+                'frequency' => '* * * * *',
+                'timeout' => $timeout,
+            ])
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors('timeout');
+    })->with([59, 36001, 86101]);
 });
 
 describe('PATCH /api/v1/applications/{uuid}/scheduled-tasks/{task_uuid}', function () {
@@ -227,6 +245,25 @@ describe('PATCH /api/v1/applications/{uuid}/scheduled-tasks/{task_uuid}', functi
             ]);
 
         $response->assertStatus(404);
+    });
+
+    test('rejects an update timeout outside the worker and Redis retry envelope', function () {
+        $application = Application::factory()->create([
+            'environment_id' => $this->environment->id,
+            'destination_id' => $this->destination->id,
+            'destination_type' => $this->destination->getMorphClass(),
+        ]);
+        $task = ScheduledTask::factory()->create([
+            'application_id' => $application->id,
+            'team_id' => $this->team->id,
+        ]);
+
+        $this->withHeaders(scheduledTaskAuthHeaders($this->bearerToken))
+            ->patchJson("/api/v1/applications/{$application->uuid}/scheduled-tasks/{$task->uuid}", [
+                'timeout' => 36001,
+            ])
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors('timeout');
     });
 });
 

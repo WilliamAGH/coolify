@@ -4,9 +4,12 @@ namespace App\Jobs;
 
 use App\Actions\Proxy\CheckProxy;
 use App\Actions\Proxy\StartProxy;
+use App\Contracts\ProxyMutation;
 use App\Events\ServerReachabilityChanged;
 use App\Events\ServerValidated;
 use App\Models\Server;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeEncrypted;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -15,9 +18,10 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
 
-class ValidateAndInstallServerJob implements ShouldBeEncrypted, ShouldQueue
+class ValidateAndInstallServerJob implements ProxyMutation, ShouldBeEncrypted, ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    use UsesProxyMutationQueue;
 
     public $timeout = 600; // 10 minutes
 
@@ -27,11 +31,13 @@ class ValidateAndInstallServerJob implements ShouldBeEncrypted, ShouldQueue
         public Server $server,
         public int $numberOfTries = 0
     ) {
-        $this->onQueue('high');
+        ProxyMutationQueue::assign($this);
     }
 
     public function handle(): void
     {
+        ProxyMutationQueue::ensureExecutionAllowed();
+
         try {
             // Mark validation as in progress
             $this->server->update(['is_validating' => true]);
