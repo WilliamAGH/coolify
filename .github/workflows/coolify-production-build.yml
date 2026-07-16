@@ -49,7 +49,7 @@ jobs:
           printf '%s' "$version" | grep -Eq "$SEMANTIC_VERSION_PATTERN"
           [ "$(jq -er '.coolify.v4.version' versions.json)" = "$version" ]
 
-          should_publish=true
+          should_publish=false
           if printf '%s' "$BEFORE_SHA" | grep -Eq '^[0-9a-f]{40}$' &&
             [ "$BEFORE_SHA" != '0000000000000000000000000000000000000000' ]; then
             git cat-file -e "${BEFORE_SHA}^{commit}"
@@ -69,6 +69,7 @@ jobs:
                 printf 'Production version must increase: %s -> %s\n' "$previous_version" "$version" >&2
                 exit 1
               }
+              should_publish=true
             fi
           fi
 

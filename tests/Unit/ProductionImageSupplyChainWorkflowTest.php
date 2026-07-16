@@ -184,6 +184,11 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
         $violations[] = 'application validation must use read-only repository permissions';
     }
 
+    if (($applicationValidationWorkflow['concurrency']['group'] ?? null) !== 'application-validation-${{ github.event.pull_request.number || github.ref }}' ||
+        ($applicationValidationWorkflow['concurrency']['cancel-in-progress'] ?? null) !== "\${{ github.event_name == 'pull_request' }}") {
+        $violations[] = 'application validation must serialize pushes without cancellation while superseding stale pull requests';
+    }
+
     $requiredApplicationValidationJobs = [
         'php',
         'browser',

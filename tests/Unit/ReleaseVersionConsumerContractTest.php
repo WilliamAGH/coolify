@@ -1,6 +1,7 @@
 <?php
 
 use App\Actions\Server\UpdateCoolify;
+use Symfony\Component\Filesystem\Filesystem;
 use Symfony\Component\Process\Process;
 use Symfony\Component\Yaml\Yaml;
 
@@ -92,15 +93,87 @@ it('serves the workflow-published semantic tag to consumers through versions.jso
 
 it('publishes production only for an explicit increasing canonical version bump', function () {
     $workflow = Yaml::parseFile(releaseContractRepositoryRoot().'/.github/workflows/coolify-production-build.yml');
+    $applicationValidation = Yaml::parseFile(releaseContractRepositoryRoot().'/.github/workflows/application-validation.yml');
     $resolveVersion = $workflow['jobs']['resolve-version'];
     $versionStep = collect($resolveVersion['steps'])->firstWhere('id', 'version');
 
     expect($resolveVersion['outputs']['should_publish'] ?? null)->toBe('${{ steps.version.outputs.should_publish }}')
         ->and($workflow['jobs']['publish']['if'] ?? null)->toBe("\${{ needs.resolve-version.outputs.should_publish == 'true' }}")
+        ->and($applicationValidation['concurrency']['cancel-in-progress'] ?? null)->toBe("\${{ github.event_name == 'pull_request' }}")
         ->and($versionStep['env']['BEFORE_SHA'] ?? null)->toBe('${{ github.event.before }}')
         ->and($versionStep['run'] ?? '')->toContain('version_compare')
         ->toContain('should_publish=false')
         ->toContain("jq -er '.coolify.v4.version' versions.json");
+});
+
+it('keeps a bump push publishable when it is followed by an unchanged push', function () {
+    $root = releaseContractRepositoryRoot();
+    $workflow = Yaml::parseFile($root.'/.github/workflows/coolify-production-build.yml');
+    $versionStep = collect($workflow['jobs']['resolve-version']['steps'])->firstWhere('id', 'version');
+    $script = (string) ($versionStep['run'] ?? '');
+    $semanticVersionPattern = (string) ($versionStep['env']['SEMANTIC_VERSION_PATTERN'] ?? '');
+    $filesystem = new Filesystem;
+    $repository = sys_get_temp_dir().'/coolify-release-sequence-'.bin2hex(random_bytes(8));
+    $runnerTemp = $repository.'/runner';
+
+    $filesystem->mkdir([$repository.'/bootstrap', $repository.'/config', $runnerTemp]);
+    $filesystem->copy($root.'/bootstrap/getVersion.php', $repository.'/bootstrap/getVersion.php');
+    $filesystem->copy($root.'/config/constants.php', $repository.'/config/constants.php');
+    $filesystem->copy($root.'/versions.json', $repository.'/versions.json');
+
+    try {
+        (new Process(['git', 'init'], $repository))->mustRun();
+        (new Process(['git', 'config', 'user.email', 'release-contract@coolify.invalid'], $repository))->mustRun();
+        (new Process(['git', 'config', 'user.name', 'Release Contract'], $repository))->mustRun();
+
+        foreach (['config/constants.php', 'versions.json'] as $path) {
+            $contents = (string) file_get_contents($repository.'/'.$path);
+            file_put_contents($repository.'/'.$path, str_replace('4.1.3', '4.1.2', $contents));
+        }
+        (new Process(['git', 'add', '.'], $repository))->mustRun();
+        (new Process(['git', 'commit', '-m', 'baseline'], $repository))->mustRun();
+        $baseline = trim((new Process(['git', 'rev-parse', 'HEAD'], $repository))->mustRun()->getOutput());
+
+        $filesystem->copy($root.'/config/constants.php', $repository.'/config/constants.php', true);
+        $filesystem->copy($root.'/versions.json', $repository.'/versions.json', true);
+        (new Process(['git', 'add', '.'], $repository))->mustRun();
+        (new Process(['git', 'commit', '-m', 'bump'], $repository))->mustRun();
+        $bump = trim((new Process(['git', 'rev-parse', 'HEAD'], $repository))->mustRun()->getOutput());
+
+        file_put_contents($repository.'/unchanged', "follow-up\n");
+        (new Process(['git', 'add', '.'], $repository))->mustRun();
+        (new Process(['git', 'commit', '-m', 'unchanged'], $repository))->mustRun();
+        $unchanged = trim((new Process(['git', 'rev-parse', 'HEAD'], $repository))->mustRun()->getOutput());
+
+        $decisions = [];
+        foreach ([
+            [$bump, $baseline],
+            [$unchanged, $bump],
+            [$unchanged, str_repeat('0', 40)],
+        ] as [$revision, $before]) {
+            (new Process(['git', 'checkout', '--detach', $revision], $repository))->mustRun();
+            $output = tempnam($runnerTemp, 'output-');
+            expect($output)->not->toBeFalse();
+
+            $process = new Process(['bash', '-c', $script], $repository, [
+                'BEFORE_SHA' => $before,
+                'GITHUB_OUTPUT' => $output,
+                'RUNNER_TEMP' => $runnerTemp,
+                'SEMANTIC_VERSION_PATTERN' => $semanticVersionPattern,
+            ]);
+            $process->mustRun();
+            parse_str(str_replace("\n", '&', trim((string) file_get_contents($output))), $decision);
+            $decisions[] = $decision;
+        }
+
+        expect($decisions)->toBe([
+            ['should_publish' => 'true', 'version' => '4.1.3'],
+            ['should_publish' => 'false', 'version' => '4.1.3'],
+            ['should_publish' => 'false', 'version' => '4.1.3'],
+        ]);
+    } finally {
+        $filesystem->remove($repository);
+    }
 });
 
 it('resolves the published tag through the install script versions.json parse pipeline', function () {
