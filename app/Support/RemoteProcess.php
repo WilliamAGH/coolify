@@ -5,13 +5,15 @@ namespace App\Support;
 use App\Enums\ActivityTypes;
 use App\Enums\ProcessStatus;
 use App\Helpers\SshMultiplexingHelper;
-use App\Jobs\CoolifyTask;
 use App\Jobs\ProxyMutationTask;
 use App\Models\Server;
+use Closure;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Auth;
+use LogicException;
 use Spatie\Activitylog\Contracts\Activity;
+use Throwable;
 
 final class RemoteProcess
 {
@@ -26,6 +28,26 @@ final class RemoteProcess
         mixed $callEventData = null,
     ): Activity {
         ControlPlaneMode::ensureActive('Remote execution');
+        $executeInline = ControlPlaneMode::acceptedMutationExecutionActive();
+        if ($executeInline) {
+            $commandTimeout = self::acceptedDrainCommandTimeout();
+
+            return self::withAcceptedDrainRemoteConfiguration(
+                $commandTimeout,
+                fn (): Activity => self::dispatch(
+                    command: $command,
+                    server: $server,
+                    type: $type,
+                    type_uuid: $type_uuid,
+                    model: $model,
+                    ignore_errors: $ignore_errors,
+                    callEventOnFinish: $callEventOnFinish,
+                    callEventData: $callEventData,
+                    executeInline: true,
+                ),
+            );
+        }
+
         ProxyMutationQueue::ensureDispatchAllowed();
 
         return self::dispatch(
@@ -37,11 +59,10 @@ final class RemoteProcess
             ignore_errors: $ignore_errors,
             callEventOnFinish: $callEventOnFinish,
             callEventData: $callEventData,
-            taskClass: ProxyMutationTask::class,
+            executeInline: $executeInline,
         );
     }
 
-    /** @param class-string<CoolifyTask> $taskClass */
     private static function dispatch(
         Collection|array $command,
         Server $server,
@@ -51,7 +72,7 @@ final class RemoteProcess
         bool $ignore_errors,
         mixed $callEventOnFinish,
         mixed $callEventData,
-        string $taskClass,
+        bool $executeInline,
     ): Activity {
         ControlPlaneMode::ensureActive('Remote execution');
 
@@ -64,7 +85,7 @@ final class RemoteProcess
             $ignore_errors,
             $callEventOnFinish,
             $callEventData,
-            $taskClass,
+            $executeInline,
         ): Activity {
             $type = $type ?? ActivityTypes::INLINE->value;
             $command = $command instanceof Collection ? $command->toArray() : $command;
@@ -103,16 +124,92 @@ final class RemoteProcess
 
             $activity = $activityLog->log('[]');
 
-            dispatch(new $taskClass(
+            $task = new ProxyMutationTask(
                 activity: $activity,
                 ignore_errors: $ignore_errors,
                 call_event_on_finish: $callEventOnFinish,
                 call_event_data: $callEventData,
-            ));
+                executeInline: $executeInline,
+            );
+            if ($executeInline) {
+                self::executeInline($task);
+            } else {
+                dispatch($task);
+            }
 
             $activity->refresh();
 
             return $activity;
         });
+    }
+
+    private static function acceptedDrainCommandTimeout(): int
+    {
+        $commandTimeout = self::positiveTimeout('constants.ssh.accepted_drain_command_timeout');
+        $finalizationMargin = self::positiveTimeout('constants.ssh.accepted_drain_finalization_margin');
+        $minimumOuterTimeout = self::positiveTimeout('constants.ssh.accepted_drain_minimum_outer_timeout');
+        $implicitQueueTimeout = self::positiveTimeout('horizon.defaults.proxy-mutations.timeout');
+        $provenOuterTimeout = min($minimumOuterTimeout, $implicitQueueTimeout);
+
+        if ($commandTimeout + $finalizationMargin >= $provenOuterTimeout) {
+            throw new LogicException(
+                'Accepted proxy-mutation drain cannot prove a safe remote timeout envelope.'
+            );
+        }
+
+        return $commandTimeout;
+    }
+
+    private static function positiveTimeout(string $configurationKey): int
+    {
+        $configuredTimeout = config($configurationKey);
+        if (is_string($configuredTimeout) && ctype_digit($configuredTimeout)) {
+            $configuredTimeout = (int) $configuredTimeout;
+        }
+
+        if (! is_int($configuredTimeout) || $configuredTimeout < 1) {
+            throw new LogicException(
+                "Accepted proxy-mutation drain requires a positive integer {$configurationKey}."
+            );
+        }
+
+        return $configuredTimeout;
+    }
+
+    /** @param Closure(): Activity $operation */
+    private static function withAcceptedDrainRemoteConfiguration(int $commandTimeout, Closure $operation): Activity
+    {
+        $originalCommandTimeout = config('constants.ssh.command_timeout');
+        $originalMultiplexingEnabled = config('constants.ssh.mux_enabled');
+        config()->set('constants.ssh.command_timeout', $commandTimeout);
+        config()->set('constants.ssh.mux_enabled', false);
+
+        try {
+            return $operation();
+        } finally {
+            config()->set('constants.ssh.command_timeout', $originalCommandTimeout);
+            config()->set('constants.ssh.mux_enabled', $originalMultiplexingEnabled);
+        }
+    }
+
+    private static function executeInline(ProxyMutationTask $task): void
+    {
+        try {
+            $task->handle();
+            $task->activity->refresh();
+
+            if (! in_array($task->activity->getExtraProperty('status'), [
+                ProcessStatus::FINISHED->value,
+                ProcessStatus::ERROR->value,
+            ], true)) {
+                throw new LogicException(
+                    'Accepted proxy-mutation drain remote activity did not reach a terminal status.'
+                );
+            }
+        } catch (Throwable $exception) {
+            $task->failed($exception);
+
+            throw $exception;
+        }
     }
 }

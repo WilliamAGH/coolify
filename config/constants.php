@@ -78,6 +78,9 @@ return [
         'connection_timeout' => 10,
         'server_interval' => 20,
         'command_timeout' => 3600,
+        'accepted_drain_command_timeout' => 15,
+        'accepted_drain_finalization_margin' => 10,
+        'accepted_drain_minimum_outer_timeout' => 30,
         'max_retries' => env('SSH_MAX_RETRIES', 3),
         'retry_base_delay' => env('SSH_RETRY_BASE_DELAY', 2), // seconds
         'retry_max_delay' => env('SSH_RETRY_MAX_DELAY', 30), // seconds

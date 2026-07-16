@@ -7,7 +7,7 @@ use App\Enums\ProcessStatus;
 use App\Helpers\SshMultiplexingHelper;
 use App\Jobs\ApplicationDeploymentJob;
 use App\Models\Server;
-use Illuminate\Process\ProcessResult;
+use Illuminate\Contracts\Process\ProcessResult;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Process;
