@@ -2,7 +2,10 @@
 
 namespace App\Models;
 
+use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Casts\Attribute;
+use Illuminate\Support\Facades\DB;
 use Symfony\Component\Yaml\Yaml;
 
 class LocalPersistentVolume extends BaseModel
@@ -29,6 +32,15 @@ class LocalPersistentVolume extends BaseModel
                 $volume->resource_id,
             )?->prepareBlueGreenStorageAddition();
         });
+    }
+
+    protected function performInsert(Builder $query)
+    {
+        return DB::transaction(function () use ($query): bool {
+            BlueGreenTopologyLock::acquire();
+
+            return parent::performInsert($query);
+        }, attempts: 5);
     }
 
     public function resource()

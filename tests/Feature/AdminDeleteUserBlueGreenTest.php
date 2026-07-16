@@ -1,5 +1,6 @@
 <?php
 
+use App\Actions\Application\BlueGreen\BlueGreenDeactivationException;
 use App\Actions\User\DeleteUserServers;
 use App\Actions\User\DeleteUserTeams;
 use App\Console\Commands\AdminDeleteUser;
@@ -60,6 +61,36 @@ it('commits the deletion tombstone before administrative remote cleanup and fail
         ->and($tombstonedApplication->trashed())->toBeTrue()
         ->and(ApplicationBlueGreenDeactivation::query()->sole()->phase)
         ->toBe(BlueGreenDeactivationPhase::DEACTIVATING)
+        ->and(User::query()->whereKey($user->id)->exists())->toBeTrue()
+        ->and(DB::transactionLevel())->toBe(0);
+});
+
+it('finishes the root membership preflight transaction before direct application deactivation', function () {
+    ['application' => $application, 'destination' => $destination, 'team' => $team] = BlueGreenDeactivationScenario::context();
+    $user = User::factory()->create();
+    $team->members()->attach($user->id, ['role' => 'owner']);
+
+    $rootTeam = Team::factory()->create(['id' => 0, 'name' => 'Root Team']);
+    $otherRootMember = User::factory()->create();
+    $rootTeam->members()->attach($user->id, ['role' => 'owner']);
+    $rootTeam->members()->attach($otherRootMember->id, ['role' => 'owner']);
+
+    BlueGreenDeactivationScenario::enableBlueGreen($application);
+    BlueGreenDeactivationScenario::idleState($application, $destination);
+    config()->set('constants.ssh.mux_enabled', false);
+
+    $remoteTransactionLevels = [];
+    Process::fake(function (PendingProcess $process) use (&$remoteTransactionLevels) {
+        $remoteTransactionLevels[] = DB::transactionLevel();
+
+        return Process::result(exitCode: 255, errorOutput: 'ssh transport disconnected');
+    });
+
+    expect(fn () => $user->delete())
+        ->toThrow(BlueGreenDeactivationException::class, 'transport did not prove completion');
+
+    expect($remoteTransactionLevels)->not->toBeEmpty()
+        ->each->toBe(0)
         ->and(User::query()->whereKey($user->id)->exists())->toBeTrue()
         ->and(DB::transactionLevel())->toBe(0);
 });

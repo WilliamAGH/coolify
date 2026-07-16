@@ -12,6 +12,7 @@ use App\Services\ChangelogService;
 use App\Traits\DeletesUserSessions;
 use DateTimeInterface;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Messages\MailMessage;
@@ -123,12 +124,13 @@ class User extends Authenticatable implements SendsEmail
         });
 
         static::deleting(function (User $user) {
+            static::assertUserIsNotSoleRootTeamMember($user);
             static::deleteApplicationsForDeletedTeams($user);
 
             \DB::transaction(function () use ($user) {
                 RevokeUserTeamTokens::forUser($user);
 
-                $teams = $user->teams;
+                $teams = static::loadLockedTeamsForDeletion($user);
                 foreach ($teams as $team) {
                     $user_alone_in_team = $team->members->count() === 1;
 
@@ -181,15 +183,74 @@ class User extends Authenticatable implements SendsEmail
         });
     }
 
+    private static function assertUserIsNotSoleRootTeamMember(User $user): void
+    {
+        $user->getConnection()->transaction(function () use ($user): void {
+            $rootTeam = $user->teams()
+                ->getRelated()
+                ->newQuery()
+                ->whereKey(0)
+                ->lockForUpdate()
+                ->first();
+            if ($rootTeam === null) {
+                return;
+            }
+
+            $membersRelation = $rootTeam->members();
+            $pivotMemberKey = $membersRelation->getRelatedPivotKeyName();
+            $membersRelation->newPivotQuery()
+                ->orderBy($pivotMemberKey)
+                ->lockForUpdate()
+                ->get();
+
+            $memberModel = $membersRelation->getRelated();
+            $memberKey = $memberModel->qualifyColumn($memberModel->getKeyName());
+            $memberIds = $membersRelation
+                ->orderBy($memberKey)
+                ->lockForUpdate()
+                ->pluck($memberKey);
+
+            if ($memberIds->count() === 1 && (int) $memberIds->first() === $user->id) {
+                throw new \Exception('User is alone in the root team, cannot delete');
+            }
+        }, attempts: 5);
+    }
+
+    /** @return Collection<int, Team> */
+    private static function loadLockedTeamsForDeletion(User $user): Collection
+    {
+        $teamsRelation = $user->teams();
+        $teamModel = $teamsRelation->getRelated();
+        $teams = $teamsRelation
+            ->orderBy($teamModel->qualifyColumn($teamModel->getKeyName()))
+            ->lockForUpdate()
+            ->get();
+
+        foreach ($teams as $team) {
+            $membersRelation = $team->members();
+            $memberModel = $membersRelation->getRelated();
+            $team->setRelation(
+                'members',
+                $membersRelation
+                    ->orderBy($memberModel->qualifyColumn($memberModel->getKeyName()))
+                    ->lockForUpdate()
+                    ->get(),
+            );
+        }
+
+        return $teams;
+    }
+
     private static function deleteApplicationsForDeletedTeams(User $user): void
     {
-        foreach ($user->teams as $team) {
-            if ($team->id === 0 || $team->members->count() !== 1) {
+        foreach ($user->teams()->withCount('members')->useWritePdo()->get() as $team) {
+            if ($team->id === 0 || $team->members_count !== 1) {
                 continue;
             }
 
             $applications = Application::withTrashed()
                 ->whereHas('environment.project', fn (Builder $query): Builder => $query->where('team_id', $team->id))
+                ->useWritePdo()
                 ->get();
             foreach ($applications as $application) {
                 (new DeactivateBlueGreenApplication)->deletePermanently($application);
@@ -198,7 +259,7 @@ class User extends Authenticatable implements SendsEmail
     }
 
     /**
-     * Finalize team deletion by cleaning up all associated resources
+     * Finalize team deletion by cleaning up all associated resources.
      */
     private static function finalizeTeamDeletion(User $user, Team $team)
     {
