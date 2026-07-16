@@ -506,6 +506,16 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
 
     $runTagStep = releaseWorkflowStepById($jobs['validate-inputs'] ?? [], 'target');
     $runTagScript = (string) ($runTagStep['run'] ?? '');
+    $publicationStateStep = releaseWorkflowStepById($jobs['validate-inputs'] ?? [], 'publication');
+    $publicationStateScript = (string) ($publicationStateStep['run'] ?? '');
+    if (($jobs['validate-inputs']['outputs']['publish_required'] ?? null) !== '${{ steps.publication.outputs.publish_required }}' ||
+        ! str_contains($publicationStateScript, 'ghcr_status=') ||
+        ! str_contains($publicationStateScript, 'docker_status=') ||
+        ! str_contains($publicationStateScript, '[Dd]ocker-[Cc]ontent-[Dd]igest') ||
+        ! str_contains($publicationStateScript, '^200 sha256:') ||
+        ! str_contains($publicationStateScript, 'Semantic tag presence differs across registries')) {
+        $violations[] = 'serialized production publication must use matching authoritative registry tag state';
+    }
     if (! str_contains($runTagScript, 'run_tag="sha-$GITHUB_SHA-run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"') ||
         ! str_contains($runTagScript, "'^sha-[0-9a-f]{40}-run-[1-9][0-9]*-[1-9][0-9]*$'")) {
         $violations[] = 'immutable run tags must begin with the source commit and include the run provenance';
@@ -539,6 +549,7 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
 
     $requiredGraph = [
         'validate-inputs' => [],
+        'repair-latest' => ['validate-inputs'],
         'build-and-scan' => ['validate-inputs'],
         'stage-candidates' => ['validate-inputs', 'build-and-scan'],
         'attest-and-verify' => ['stage-candidates'],
@@ -562,6 +573,7 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
 
     foreach ([
         'validate-inputs' => [],
+        'repair-latest' => ['contents' => 'read', 'packages' => 'write'],
         'build-and-scan' => ['contents' => 'read'],
         'stage-candidates' => ['contents' => 'read', 'packages' => 'write'],
         'attest-and-verify' => [
@@ -586,17 +598,18 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
     }
 
     $validateOnlyConditions = [
-        'stage-candidates' => '${{ ! inputs.validate_only }}',
-        'attest-and-verify' => '${{ ! inputs.validate_only }}',
-        'release' => '${{ ! inputs.validate_only }}',
-        'cleanup' => '${{ always() && ! inputs.validate_only }}',
+        'repair-latest' => "\${{ ! inputs.validate_only && needs.validate-inputs.outputs.repair_required == 'true' }}",
+        'stage-candidates' => "\${{ ! inputs.validate_only && needs.validate-inputs.outputs.publish_required == 'true' }}",
+        'attest-and-verify' => "\${{ ! inputs.validate_only && needs.stage-candidates.result == 'success' }}",
+        'release' => "\${{ ! inputs.validate_only && needs.stage-candidates.result == 'success' }}",
+        'cleanup' => "\${{ always() && ! inputs.validate_only && needs.validate-inputs.outputs.publish_required == 'true' }}",
     ];
     foreach ($validateOnlyConditions as $jobName => $expectedCondition) {
         if (($jobs[$jobName]['if'] ?? null) !== $expectedCondition) {
             $violations[] = "validate-only may reach external publication job: {$jobName}";
         }
     }
-    if (array_key_exists('if', $jobs['build-and-scan'] ?? [])) {
+    if (($jobs['build-and-scan']['if'] ?? null) !== "\${{ inputs.validate_only || needs.validate-inputs.outputs.publish_required == 'true' }}") {
         $violations[] = 'validate-only must retain the complete build-and-scan job';
     }
     $requiredValidateOnlyProductionSteps = [
@@ -1136,6 +1149,108 @@ it('fails closed across canonical publication and fork validation modes', functi
         } finally {
             unlink($githubOutput);
         }
+    }
+});
+
+it('distinguishes absent semantic tags from registry disagreement and transport failures', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $sharedWorkflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $publicationStep = releaseWorkflowStepById($sharedWorkflow['jobs']['validate-inputs'] ?? [], 'publication');
+    $script = (string) ($publicationStep['run'] ?? '');
+    $filesystem = new Filesystem;
+    $fixture = sys_get_temp_dir().'/coolify-registry-state-'.bin2hex(random_bytes(8));
+    $mockBin = $fixture.'/bin';
+    $filesystem->mkdir([$mockBin, $fixture.'/runner']);
+    $curl = <<<'SH'
+#!/bin/sh
+set -eu
+output=
+headers=
+url=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output) output=$2; shift 2 ;;
+        --dump-header) headers=$2; shift 2 ;;
+        http*) url=$1; shift ;;
+        *) shift ;;
+    esac
+done
+case "$url" in
+    *'/token?'*) printf '{"token":"fixture-token"}\n' ;;
+    *ghcr.io/v2/*/manifests/latest)
+        [ "${GHCR_LATEST_STATUS:?}" != network ] || exit 7
+        : > "${output:?}"
+        printf 'Docker-Content-Digest: %s\r\n' "${GHCR_LATEST_DIGEST:-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" > "${headers:?}"
+        printf '%s' "$GHCR_LATEST_STATUS"
+        ;;
+    *registry-1.docker.io/v2/*/manifests/latest)
+        [ "${DOCKER_LATEST_STATUS:?}" != network ] || exit 7
+        : > "${output:?}"
+        printf 'Docker-Content-Digest: %s\r\n' "${DOCKER_LATEST_DIGEST:-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" > "${headers:?}"
+        printf '%s' "$DOCKER_LATEST_STATUS"
+        ;;
+    *ghcr.io/v2/*)
+        [ "${GHCR_STATUS:?}" != network ] || exit 7
+        : > "${output:?}"
+        printf 'Docker-Content-Digest: %s\r\n' "${GHCR_DIGEST:-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" > "${headers:?}"
+        printf '%s' "$GHCR_STATUS"
+        ;;
+    *registry-1.docker.io/v2/*)
+        [ "${DOCKER_STATUS:?}" != network ] || exit 7
+        : > "${output:?}"
+        printf 'Docker-Content-Digest: %s\r\n' "${DOCKER_DIGEST:-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" > "${headers:?}"
+        printf '%s' "$DOCKER_STATUS"
+        ;;
+    *) exit 64 ;;
+esac
+SH;
+    file_put_contents($mockBin.'/curl', $curl);
+    chmod($mockBin.'/curl', 0755);
+
+    try {
+        foreach ([
+            'both semantic tags absent require publication' => ['404', '404', 'a', 'a', '404', '404', 'a', 'a', true, 'true', 'false'],
+            'semantic and latest all match skip publication' => ['200', '200', 'a', 'a', '200', '200', 'a', 'a', true, 'false', 'false'],
+            'missing latest alias requires repair' => ['200', '200', 'a', 'a', '404', '200', 'a', 'a', true, 'false', 'true'],
+            'stale latest aliases require repair' => ['200', '200', 'a', 'a', '200', '200', 'b', 'b', true, 'false', 'true'],
+            'cross-registry semantic presence disagreement fails' => ['200', '404', 'a', 'a', '200', '200', 'a', 'a', false, null, null],
+            'cross-registry semantic digest disagreement fails' => ['200', '200', 'a', 'b', '200', '200', 'a', 'a', false, null, null],
+            'registry server failure fails' => ['500', '500', 'a', 'a', '200', '200', 'a', 'a', false, null, null],
+            'registry transport failure fails' => ['network', '404', 'a', 'a', '200', '200', 'a', 'a', false, null, null],
+        ] as $description => [$ghcrStatus, $dockerStatus, $ghcrDigest, $dockerDigest, $ghcrLatestStatus, $dockerLatestStatus, $ghcrLatestDigest, $dockerLatestDigest, $successful, $publishRequired, $repairRequired]) {
+            $output = tempnam($fixture.'/runner', 'output-');
+            expect($output)->not->toBeFalse();
+            $process = new Process(['bash', '-c', $script], $root, [
+                'DOCKER_STATUS' => $dockerStatus,
+                'DOCKER_DIGEST' => 'sha256:'.str_repeat($dockerDigest, 64),
+                'DOCKER_LATEST_DIGEST' => 'sha256:'.str_repeat($dockerLatestDigest, 64),
+                'DOCKER_LATEST_STATUS' => $dockerLatestStatus,
+                'GITHUB_OUTPUT' => $output,
+                'GHCR_STATUS' => $ghcrStatus,
+                'GHCR_DIGEST' => 'sha256:'.str_repeat($ghcrDigest, 64),
+                'GHCR_LATEST_DIGEST' => 'sha256:'.str_repeat($ghcrLatestDigest, 64),
+                'GHCR_LATEST_STATUS' => $ghcrLatestStatus,
+                'PATH' => $mockBin.':'.getenv('PATH'),
+                'RELEASE_KIND' => 'production',
+                'RUNNER_TEMP' => $fixture.'/runner',
+                'SEMANTIC_VERSION' => '4.1.4',
+                'VALIDATE_ONLY' => 'false',
+            ]);
+            $process->run();
+
+            expect($process->isSuccessful())->toBe($successful, $description);
+            if ($publishRequired !== null) {
+                $values = [];
+                foreach (file($output, FILE_IGNORE_NEW_LINES) ?: [] as $line) {
+                    [$key, $value] = array_pad(explode('=', $line, 2), 2, '');
+                    $values[$key] = $value;
+                }
+                expect($values['publish_required'] ?? null)->toBe($publishRequired)
+                    ->and($values['repair_required'] ?? null)->toBe($repairRequired);
+            }
+        }
+    } finally {
+        $filesystem->remove($fixture);
     }
 });
 

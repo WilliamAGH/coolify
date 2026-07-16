@@ -106,7 +106,7 @@ it('publishes production only for an explicit increasing canonical version bump'
         ->toContain("jq -er '.coolify.v4.version' versions.json");
 });
 
-it('keeps a bump push publishable when it is followed by an unchanged push', function () {
+it('keeps the newest version publishable after an intermediate pending bump is evicted', function () {
     $root = releaseContractRepositoryRoot();
     $workflow = Yaml::parseFile($root.'/.github/workflows/coolify-production-build.yml');
     $versionStep = collect($workflow['jobs']['resolve-version']['steps'])->firstWhere('id', 'version');
@@ -138,7 +138,15 @@ it('keeps a bump push publishable when it is followed by an unchanged push', fun
         $filesystem->copy($root.'/versions.json', $repository.'/versions.json', true);
         (new Process(['git', 'add', '.'], $repository))->mustRun();
         (new Process(['git', 'commit', '-m', 'bump'], $repository))->mustRun();
-        $bump = trim((new Process(['git', 'rev-parse', 'HEAD'], $repository))->mustRun()->getOutput());
+        $firstBump = trim((new Process(['git', 'rev-parse', 'HEAD'], $repository))->mustRun()->getOutput());
+
+        foreach (['config/constants.php', 'versions.json'] as $path) {
+            $contents = (string) file_get_contents($repository.'/'.$path);
+            file_put_contents($repository.'/'.$path, str_replace('4.1.3', '4.1.4', $contents));
+        }
+        (new Process(['git', 'add', '.'], $repository))->mustRun();
+        (new Process(['git', 'commit', '-m', 'pending bump'], $repository))->mustRun();
+        $evictedBump = trim((new Process(['git', 'rev-parse', 'HEAD'], $repository))->mustRun()->getOutput());
 
         file_put_contents($repository.'/unchanged', "follow-up\n");
         (new Process(['git', 'add', '.'], $repository))->mustRun();
@@ -147,8 +155,8 @@ it('keeps a bump push publishable when it is followed by an unchanged push', fun
 
         $decisions = [];
         foreach ([
-            [$bump, $baseline],
-            [$unchanged, $bump],
+            [$firstBump, $baseline],
+            [$unchanged, $evictedBump],
             [$unchanged, str_repeat('0', 40)],
         ] as [$revision, $before]) {
             (new Process(['git', 'checkout', '--detach', $revision], $repository))->mustRun();
@@ -168,8 +176,8 @@ it('keeps a bump push publishable when it is followed by an unchanged push', fun
 
         expect($decisions)->toBe([
             ['should_publish' => 'true', 'version' => '4.1.3'],
-            ['should_publish' => 'false', 'version' => '4.1.3'],
-            ['should_publish' => 'false', 'version' => '4.1.3'],
+            ['should_publish' => 'true', 'version' => '4.1.4'],
+            ['should_publish' => 'false', 'version' => '4.1.4'],
         ]);
     } finally {
         $filesystem->remove($repository);

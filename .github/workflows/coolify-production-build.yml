@@ -60,17 +60,15 @@ jobs:
             previous_version="$(php -r 'function env() { return null; } $constants = include $argv[1]; echo $constants["coolify"]["version"] ?? "";' "$previous_constants")"
             printf '%s' "$previous_version" | grep -Eq "$SEMANTIC_VERSION_PATTERN"
 
-            if [ "$version" = "$previous_version" ]; then
-              should_publish=false
-            else
-              # PHP receives its own positional arguments.
-              # shellcheck disable=SC2016
-              php -r 'exit(version_compare($argv[1], $argv[2], ">") ? 0 : 1);' "$version" "$previous_version" || {
-                printf 'Production version must increase: %s -> %s\n' "$previous_version" "$version" >&2
-                exit 1
-              }
-              should_publish=true
-            fi
+            # The serialized publisher decides whether this version is already
+            # present. Equal versions must reach it because GitHub may replace
+            # an intermediate pending bump run with a later unchanged push.
+            # shellcheck disable=SC2016
+            php -r 'exit(version_compare($argv[1], $argv[2], ">=") ? 0 : 1);' "$version" "$previous_version" || {
+              printf 'Production version must not decrease: %s -> %s\n' "$previous_version" "$version" >&2
+              exit 1
+            }
+            should_publish=true
           fi
 
           printf 'should_publish=%s\n' "$should_publish" >> "$GITHUB_OUTPUT"

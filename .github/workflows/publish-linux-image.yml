@@ -38,13 +38,13 @@ on:
     outputs:
       digest:
         description: Published multi-platform index digest.
-        value: ${{ jobs.release.outputs.index_digest }}
+        value: ${{ jobs.release.outputs.index_digest || jobs.repair-latest.outputs.index_digest }}
       ghcr_image:
         description: Immutable GHCR image reference.
-        value: ${{ jobs.release.outputs.ghcr_image }}
+        value: ${{ jobs.release.outputs.ghcr_image || jobs.repair-latest.outputs.ghcr_image }}
       docker_image:
         description: Immutable Docker Hub image reference.
-        value: ${{ jobs.release.outputs.docker_image }}
+        value: ${{ jobs.release.outputs.docker_image || jobs.repair-latest.outputs.docker_image }}
 
 permissions: {}
 
@@ -58,6 +58,9 @@ jobs:
     permissions: {}
     runs-on: ubuntu-24.04
     outputs:
+      index_digest: ${{ steps.publication.outputs.index_digest }}
+      publish_required: ${{ steps.publication.outputs.publish_required }}
+      repair_required: ${{ steps.publication.outputs.repair_required }}
       run_tag: ${{ steps.target.outputs.run_tag }}
     steps:
       - id: target
@@ -131,9 +134,170 @@ jobs:
 
           printf 'run_tag=%s\n' "$run_tag" >> "$GITHUB_OUTPUT"
 
+      - id: publication
+        name: Check authoritative semantic tag state
+        env:
+          RELEASE_KIND: ${{ inputs.release_kind }}
+          SEMANTIC_VERSION: ${{ inputs.semantic_version }}
+          VALIDATE_ONLY: ${{ inputs.validate_only }}
+        run: |
+          set -eu
+
+          if [ "$RELEASE_KIND" != production ] || [ "$VALIDATE_ONLY" = true ]; then
+            {
+              printf 'index_digest=\n'
+              printf 'publish_required=true\n'
+              printf 'repair_required=false\n'
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          manifest_status() {
+            token_url="$1"
+            manifest_url="$2"
+            response_file="$RUNNER_TEMP/registry-response-$$"
+            headers_file="$RUNNER_TEMP/registry-headers-$$"
+            token="$(curl --fail --silent --show-error --location "$token_url" | jq -er '.token')"
+            status="$(curl --silent --show-error --location \
+              --dump-header "$headers_file" --output "$response_file" --write-out '%{http_code}' \
+              --header "Authorization: Bearer $token" \
+              --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+              "$manifest_url")" || {
+                rm -f "$response_file" "$headers_file"
+                printf 'Registry request failed for %s\n' "$manifest_url" >&2
+                return 1
+              }
+
+            case "$status" in
+              200)
+                digest="$(sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest:[[:space:]]*\(sha256:[0-9a-f]\{64\}\)[[:space:]]*$/\1/p' "$headers_file" | tail -n 1)"
+                rm -f "$response_file" "$headers_file"
+                [ -n "$digest" ] || {
+                  printf 'Registry omitted a valid manifest digest for %s\n' "$manifest_url" >&2
+                  return 1
+                }
+                printf '200 %s\n' "$digest"
+                ;;
+              404)
+                rm -f "$response_file" "$headers_file"
+                printf '404\n'
+                ;;
+              *)
+                rm -f "$response_file" "$headers_file"
+                printf 'Registry returned HTTP %s for %s\n' "$status" "$manifest_url" >&2
+                return 1
+                ;;
+            esac
+          }
+
+          ghcr_status="$(manifest_status \
+            "https://ghcr.io/token?scope=repository:coollabsio/coolify:pull" \
+            "https://ghcr.io/v2/coollabsio/coolify/manifests/$SEMANTIC_VERSION")"
+          docker_status="$(manifest_status \
+            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:coollabsio/coolify:pull" \
+            "https://registry-1.docker.io/v2/coollabsio/coolify/manifests/$SEMANTIC_VERSION")"
+
+          if [ "$ghcr_status" = 404 ] && [ "$docker_status" = 404 ]; then
+            index_digest=''
+            publish_required=true
+            repair_required=false
+          elif [ "$ghcr_status" = "$docker_status" ] && printf '%s' "$ghcr_status" | grep -Eq '^200 sha256:[0-9a-f]{64}$'; then
+            index_digest="${ghcr_status#200 }"
+            ghcr_latest_status="$(manifest_status \
+              "https://ghcr.io/token?scope=repository:coollabsio/coolify:pull" \
+              "https://ghcr.io/v2/coollabsio/coolify/manifests/latest")"
+            docker_latest_status="$(manifest_status \
+              "https://auth.docker.io/token?service=registry.docker.io&scope=repository:coollabsio/coolify:pull" \
+              "https://registry-1.docker.io/v2/coollabsio/coolify/manifests/latest")"
+
+            publish_required=false
+            if [ "$ghcr_latest_status" = "200 $index_digest" ] &&
+              [ "$docker_latest_status" = "200 $index_digest" ]; then
+              repair_required=false
+            else
+              repair_required=true
+            fi
+          else
+            printf 'Semantic tag presence differs across registries: ghcr=%s docker=%s\n' \
+              "$ghcr_status" "$docker_status" >&2
+            exit 1
+          fi
+
+          {
+            printf 'index_digest=%s\n' "$index_digest"
+            printf 'publish_required=%s\n' "$publish_required"
+            printf 'repair_required=%s\n' "$repair_required"
+          } >> "$GITHUB_OUTPUT"
+
+  repair-latest:
+    name: Repair latest from immutable semantic digest
+    needs: validate-inputs
+    if: ${{ ! inputs.validate_only && needs.validate-inputs.outputs.repair_required == 'true' }}
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-24.04
+    outputs:
+      docker_image: ${{ steps.references.outputs.docker_image }}
+      ghcr_image: ${{ steps.references.outputs.ghcr_image }}
+      index_digest: ${{ needs.validate-inputs.outputs.index_digest }}
+    env:
+      DOCKER_TARGET: docker.io/${{ inputs.target_repository }}
+      GHCR_TARGET: ghcr.io/${{ inputs.target_repository }}
+      INDEX_DIGEST: ${{ needs.validate-inputs.outputs.index_digest }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install registry client
+        uses: regclient/actions/regctl-installer@1b705e32d40851370799ea5814e83d0a5f6a70dc # v0.1.0
+        with:
+          release: v0.11.5
+
+      - name: Verify registry client bytes
+        run: |
+          set -eu
+          printf '%s  %s\n' c93aa7638749f5aaac1a8e01787321889c78f0101809bb2880343478d0ba0467 "$(command -v regctl)" | sha256sum --check --strict -
+
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          password: ${{ github.token }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+
+      - name: Repair latest aliases atomically
+        run: |
+          set -eu
+          amd64_digest="$(regctl image digest "$GHCR_TARGET@$INDEX_DIGEST" --platform linux/amd64)"
+          arm64_digest="$(regctl image digest "$GHCR_TARGET@$INDEX_DIGEST" --platform linux/arm64)"
+          release_run_id="$(regctl image config "$GHCR_TARGET@$INDEX_DIGEST" --platform linux/amd64 | jq -er '.config.Labels["io.coolify.release-run-id"]')"
+          printf '%s' "$release_run_id" | grep -Eq '^[1-9][0-9]*$'
+          scripts/publish-linux-image.sh verify-index "$GHCR_TARGET" "$INDEX_DIGEST" "$amd64_digest" "$arm64_digest"
+          scripts/publish-linux-image.sh verify-index "$DOCKER_TARGET" "$INDEX_DIGEST" "$amd64_digest" "$arm64_digest"
+          scripts/publish-linux-image.sh promote-latest "$GHCR_TARGET" "$DOCKER_TARGET" "$INDEX_DIGEST" "$amd64_digest" "$arm64_digest" "$release_run_id"
+
+      - id: references
+        name: Record repaired immutable image references
+        run: |
+          set -eu
+          {
+            printf 'ghcr_image=%s@%s\n' "$GHCR_TARGET" "$INDEX_DIGEST"
+            printf 'docker_image=%s@%s\n' "$DOCKER_TARGET" "$INDEX_DIGEST"
+          } >> "$GITHUB_OUTPUT"
+
   build-and-scan:
     name: Build and scan Linux OCI (${{ matrix.arch }})
     needs: validate-inputs
+    if: ${{ inputs.validate_only || needs.validate-inputs.outputs.publish_required == 'true' }}
     permissions:
       contents: read
     strategy:
@@ -598,7 +762,7 @@ jobs:
   stage-candidates:
     name: Stage verified Linux candidates
     needs: [validate-inputs, build-and-scan]
-    if: ${{ ! inputs.validate_only }}
+    if: ${{ ! inputs.validate_only && needs.validate-inputs.outputs.publish_required == 'true' }}
     permissions:
       contents: read
       packages: write
@@ -716,7 +880,7 @@ jobs:
   attest-and-verify:
     name: Attest and verify candidate digests
     needs: stage-candidates
-    if: ${{ ! inputs.validate_only }}
+    if: ${{ ! inputs.validate_only && needs.stage-candidates.result == 'success' }}
     permissions:
       artifact-metadata: write
       attestations: write
@@ -847,7 +1011,7 @@ jobs:
   release:
     name: Publish immutable tags and aliases
     needs: [stage-candidates, attest-and-verify]
-    if: ${{ ! inputs.validate_only }}
+    if: ${{ ! inputs.validate_only && needs.stage-candidates.result == 'success' }}
     permissions:
       contents: read
       packages: write
@@ -1052,7 +1216,7 @@ jobs:
   cleanup:
     name: Remove disposable candidate tags
     needs: [validate-inputs, stage-candidates, attest-and-verify, release]
-    if: ${{ always() && ! inputs.validate_only }}
+    if: ${{ always() && ! inputs.validate_only && needs.validate-inputs.outputs.publish_required == 'true' }}
     permissions:
       contents: read
       packages: write
