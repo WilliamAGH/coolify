@@ -11,7 +11,7 @@
         "server"
     ],
     "require": {
-        "php": "^8.4",
+        "php": "^8.5",
         "danharrin/livewire-rate-limiting": "^2.1.0",
         "doctrine/dbal": "^4.4.1",
         "guzzlehttp/guzzle": "^7.10.0",
@@ -38,7 +38,7 @@
         "poliander/cron": "^3.3.0",
         "purplepixie/phpdns": "^2.3.6",
         "pusher/pusher-php-server": "^7.2.7",
-        "resend/resend-laravel": "^0.20.0",
+        "resend/resend-laravel": "^1.4.0",
         "sentry/sentry-laravel": "^4.20.1",
         "socialiteproviders/authentik": "^5.2",
         "socialiteproviders/clerk": "^5.1",
