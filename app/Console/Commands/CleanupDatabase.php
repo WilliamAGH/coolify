@@ -5,6 +5,8 @@ namespace App\Console\Commands;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
 use Illuminate\Console\Command;
+use Illuminate\Database\Query\Builder;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 
 class CleanupDatabase extends Command
@@ -13,7 +15,7 @@ class CleanupDatabase extends Command
 
     protected $description = 'Cleanup database';
 
-    public function handle()
+    public function handle(): int
     {
         if ($this->option('yes')) {
             echo "Running database cleanup...\n";
@@ -44,16 +46,18 @@ class CleanupDatabase extends Command
         }
 
         // Cleanup activity_log table
-        $activityLogIds = DB::table('activity_log')
-            ->where('created_at', '<', now()->subDays($keep_days))
+        $activityLogs = DB::table('activity_log')
+            ->where('created_at', '<', now()->subDays($keep_days));
+        $preservedActivityLogIds = (clone $activityLogs)
             ->orderBy('created_at', 'desc')
-            ->pluck('id')
-            ->slice(10)
-            ->values();
-        $count = $activityLogIds->count();
+            ->orderBy('id', 'desc')
+            ->limit(10)
+            ->pluck('id');
+        $activityLogs->whereNotIn('id', $preservedActivityLogIds);
+        $count = (clone $activityLogs)->count();
         echo "Delete $count entries from activity_log.\n";
         if ($this->option('yes')) {
-            DB::table('activity_log')->whereIn('id', $activityLogIds)->delete();
+            $this->deleteInBatches($activityLogs);
         }
 
         // Cleanup application_deployment_queues table
@@ -80,18 +84,17 @@ class CleanupDatabase extends Command
                             );
                         }
                     });
-            })
-            ->orderBy('created_at', 'desc');
-        $applicationDeploymentQueueIds = (clone $applicationDeploymentQueues)
-            ->pluck('id')
-            ->slice(10)
-            ->values();
-        $count = $applicationDeploymentQueueIds->count();
+            });
+        $preservedApplicationDeploymentQueueIds = (clone $applicationDeploymentQueues)
+            ->orderBy('created_at', 'desc')
+            ->orderBy('id', 'desc')
+            ->limit(10)
+            ->pluck('id');
+        $applicationDeploymentQueues->whereNotIn('id', $preservedApplicationDeploymentQueueIds);
+        $count = (clone $applicationDeploymentQueues)->count();
         echo "Delete $count entries from application_deployment_queues.\n";
         if ($this->option('yes')) {
-            DB::table($applicationDeploymentQueuesTable)
-                ->whereIn('id', $applicationDeploymentQueueIds)
-                ->delete();
+            $this->deleteInBatches($applicationDeploymentQueues);
         }
 
         // Cleanup scheduled_task_executions table
@@ -101,5 +104,18 @@ class CleanupDatabase extends Command
         if ($this->option('yes')) {
             $scheduled_task_executions->delete();
         }
+
+        return self::SUCCESS;
+    }
+
+    private function deleteInBatches(Builder $query): void
+    {
+        $deleteQuery = clone $query;
+
+        $query->select('id')->chunkById(1000, static function (Collection $rows) use ($deleteQuery): void {
+            (clone $deleteQuery)
+                ->whereIn('id', $rows->pluck('id'))
+                ->delete();
+        });
     }
 }
