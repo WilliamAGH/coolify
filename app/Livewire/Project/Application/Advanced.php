@@ -87,6 +87,9 @@ class Advanced extends Component
     #[Validate(['boolean'])]
     public bool $isConnectToDockerNetworkEnabled = false;
 
+    #[Validate(['boolean'])]
+    public bool $isBlueGreenDeploymentEnabled = false;
+
     #[Validate(['integer', 'min:0'])]
     public int $maxRestartCount = 10;
 
@@ -149,6 +152,7 @@ class Advanced extends Component
             $this->customInternalName = $this->application->settings->custom_internal_name;
             $this->isRawComposeDeploymentEnabled = $this->application->settings->is_raw_compose_deployment_enabled;
             $this->isConnectToDockerNetworkEnabled = $this->application->settings->connect_to_docker_network;
+            $this->isBlueGreenDeploymentEnabled = $this->application->isBlueGreenDeploymentOptedIn();
             $this->disableBuildCache = $this->application->settings->disable_build_cache;
             $this->injectBuildArgsToDockerfile = $this->application->settings->inject_build_args_to_dockerfile ?? true;
             $this->includeSourceCommitInBuild = $this->application->settings->include_source_commit_in_build ?? false;
@@ -203,6 +207,40 @@ class Advanced extends Component
             }
 
             $this->dispatch('success', 'Settings saved.');
+            $this->dispatch('configurationChanged');
+        } catch (\Throwable $e) {
+            return handleError($e, $this);
+        }
+    }
+
+    public function saveBlueGreenDeployment()
+    {
+        try {
+            $this->authorize('update', $this->application);
+            $this->validateOnly('isBlueGreenDeploymentEnabled');
+            $isCurrentlyOptedIn = $this->application->isBlueGreenDeploymentOptedIn();
+
+            if ($this->isBlueGreenDeploymentEnabled && ! $this->application->isBlueGreenDeploymentEligible()) {
+                $this->isBlueGreenDeploymentEnabled = $isCurrentlyOptedIn;
+                $this->dispatch('error', $this->application->blueGreenDeploymentIneligibilityReason());
+
+                return;
+            }
+
+            if (! $this->isBlueGreenDeploymentEnabled && $isCurrentlyOptedIn) {
+                $blockedReason = $this->application->blueGreenDeploymentOptOutBlockedReason();
+                if ($blockedReason !== null) {
+                    $this->isBlueGreenDeploymentEnabled = true;
+                    $this->dispatch('error', $blockedReason);
+
+                    return;
+                }
+            }
+
+            $this->application->settings->update([
+                'is_blue_green_deployment_enabled' => $this->isBlueGreenDeploymentEnabled,
+            ]);
+            $this->dispatch('success', 'Blue-green deployment setting saved.');
             $this->dispatch('configurationChanged');
         } catch (\Throwable $e) {
             return handleError($e, $this);

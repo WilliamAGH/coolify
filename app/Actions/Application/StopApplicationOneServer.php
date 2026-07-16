@@ -2,8 +2,12 @@
 
 namespace App\Actions\Application;
 
+use App\Actions\Application\BlueGreen\DeactivateBlueGreenApplicationDestination;
+use App\Actions\Application\BlueGreen\ResolveBlueGreenApplicationDestinationIds;
 use App\Models\Application;
+use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\Server;
+use App\Models\StandaloneDocker;
 use Lorisleiva\Actions\Concerns\AsAction;
 
 class StopApplicationOneServer
@@ -12,7 +16,21 @@ class StopApplicationOneServer
 
     public function handle(Application $application, Server $server)
     {
-        if ($application->destination->server->isSwarm()) {
+        $blueGreenStates = ApplicationBlueGreenDeployment::query()
+            ->where('application_id', $application->id)
+            ->whereHas('standaloneDocker', fn ($query) => $query->where('server_id', $server->id))
+            ->orderBy('standalone_docker_id')
+            ->get();
+        $blueGreenDestinationIds = StandaloneDocker::query()
+            ->whereIn('id', ResolveBlueGreenApplicationDestinationIds::run($application))
+            ->where('server_id', $server->id)
+            ->orderBy('id')
+            ->pluck('id');
+        foreach ($blueGreenDestinationIds as $standaloneDockerId) {
+            DeactivateBlueGreenApplicationDestination::run($application, $standaloneDockerId);
+        }
+
+        if ($server->isSwarm()) {
             return;
         }
         if (! $server->isFunctional()) {
@@ -20,10 +38,18 @@ class StopApplicationOneServer
         }
         try {
             $containers = getCurrentApplicationContainerStatus($server, $application->id, 0);
+            $blueGreenContainerNames = collect([
+                $application->uuid.'-blue',
+                $application->uuid.'-green',
+            ])->merge(
+                $blueGreenStates->pluck('legacy_container_name')->filter(),
+            );
             $timeout = $application->settings->stopGracePeriodSeconds();
 
-            if ($containers->count() > 0) {
-                foreach ($containers as $container) {
+            if ($containers->isNotEmpty()) {
+                foreach ($containers->reject(fn ($container): bool => $blueGreenContainerNames->contains(
+                    ltrim((string) data_get($container, 'Names'), '/'),
+                )) as $container) {
                     $containerName = data_get($container, 'Names');
                     if ($containerName) {
                         instant_remote_process(

@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Actions\Application\BlueGreen\DeactivateBlueGreenApplication;
 use App\Actions\User\RevokeUserTeamTokens;
 use App\Jobs\UpdateStripeCustomerEmailJob;
 use App\Notifications\Channels\SendsEmail;
@@ -10,6 +11,7 @@ use App\Notifications\TransactionalEmails\ResetPassword as TransactionalEmailsRe
 use App\Services\ChangelogService;
 use App\Traits\DeletesUserSessions;
 use DateTimeInterface;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Messages\MailMessage;
@@ -121,6 +123,8 @@ class User extends Authenticatable implements SendsEmail
         });
 
         static::deleting(function (User $user) {
+            static::deleteApplicationsForDeletedTeams($user);
+
             \DB::transaction(function () use ($user) {
                 RevokeUserTeamTokens::forUser($user);
 
@@ -175,6 +179,22 @@ class User extends Authenticatable implements SendsEmail
                 }
             });
         });
+    }
+
+    private static function deleteApplicationsForDeletedTeams(User $user): void
+    {
+        foreach ($user->teams as $team) {
+            if ($team->id === 0 || $team->members->count() !== 1) {
+                continue;
+            }
+
+            $applications = Application::withTrashed()
+                ->whereHas('environment.project', fn (Builder $query): Builder => $query->where('team_id', $team->id))
+                ->get();
+            foreach ($applications as $application) {
+                (new DeactivateBlueGreenApplication)->deletePermanently($application);
+            }
+        }
     }
 
     /**

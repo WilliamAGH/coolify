@@ -1,0 +1,35 @@
+entryPoints:
+  web:
+    address: ":80"
+  traefik:
+    address: ":8080"
+  metrics:
+    address: ":8082"
+
+api:
+  dashboard: true
+  insecure: true
+
+accessLog:
+  bufferingSize: 0
+  format: json
+
+log:
+  format: json
+
+metrics:
+  prometheus:
+    addRoutersLabels: true
+    addServicesLabels: true
+    entryPoint: metrics
+
+providers:
+  providersThrottleDuration: 12s
+  docker:
+    constraints: "Label(`coolify.bluegreen-provider-lab`,`true`)"
+    endpoint: unix:///var/run/docker.sock
+    exposedByDefault: false
+    watch: true
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true

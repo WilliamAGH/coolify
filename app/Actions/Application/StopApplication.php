@@ -2,19 +2,37 @@
 
 namespace App\Actions\Application;
 
+use App\Actions\Application\BlueGreen\DeactivateBlueGreenApplication;
 use App\Actions\Server\CleanupDocker;
+use App\Contracts\ProxyMutation;
 use App\Events\ServiceStatusChanged;
 use App\Models\Application;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Lorisleiva\Actions\Concerns\AsAction;
+use Lorisleiva\Actions\Decorators\JobDecorator;
 
-class StopApplication
+class StopApplication implements ProxyMutation
 {
     use AsAction;
+    use UsesProxyMutationQueue;
 
-    public string $jobQueue = 'high';
+    public function configureJob(JobDecorator $job): void
+    {
+        ProxyMutationQueue::assign($job);
+    }
 
     public function handle(Application $application, bool $previewDeployments = false, bool $dockerCleanup = true, bool $resetRestartCount = true)
     {
+        ProxyMutationQueue::ensureExecutionAllowed();
+
+        $blueGreenStates = DeactivateBlueGreenApplication::run($application);
+        $blueGreenContainerNames = collect([
+            $application->uuid.'-blue',
+            $application->uuid.'-green',
+        ])->merge(
+            $blueGreenStates->pluck('legacy_container_name')->filter(),
+        );
         $servers = collect([$application->destination->server]);
         if ($application?->additional_servers?->count() > 0) {
             $servers = $servers->merge($application->additional_servers);
@@ -35,7 +53,12 @@ class StopApplication
                     ? getCurrentApplicationContainerStatus($server, $application->id, includePullrequests: true)
                     : getCurrentApplicationContainerStatus($server, $application->id, 0);
 
-                $containersToStop = $containers->pluck('Names')->toArray();
+                $containersToStop = $containers
+                    ->reject(fn ($container): bool => $blueGreenContainerNames->contains(
+                        ltrim((string) data_get($container, 'Names'), '/'),
+                    ))
+                    ->pluck('Names')
+                    ->toArray();
                 $timeout = $application->settings->stopGracePeriodSeconds();
 
                 foreach ($containersToStop as $containerName) {

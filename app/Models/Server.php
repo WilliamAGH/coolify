@@ -137,6 +137,13 @@ class Server extends BaseModel
                 }
             }
             $server->fill($payload);
+
+            if ($server->isDirty('proxy')) {
+                $server->assertBlueGreenTopologyCanChange(
+                    willBeSwarm: $server->isSwarm(),
+                    proxyType: $server->proxyType(),
+                );
+            }
         });
         static::saved(function ($server) {
             if ($server->wasChanged('private_key_id') || $server->privateKey?->isDirty()) {
@@ -197,6 +204,10 @@ class Server extends BaseModel
             if (! isset($server->proxy->redirect_enabled)) {
                 $server->proxy->redirect_enabled = true;
             }
+        });
+
+        static::deleting(function (Server $server): void {
+            $server->assertBlueGreenTopologyCanBeRemoved();
         });
 
         static::forceDeleting(function ($server) {
@@ -1508,6 +1519,31 @@ $schema://$host {
         }
     }
 
+    public function assertBlueGreenTopologyCanChange(bool $willBeSwarm, ?string $proxyType): void
+    {
+        if (! $willBeSwarm && $proxyType === ProxyTypes::TRAEFIK->value) {
+            return;
+        }
+        if (! $this->hasBlueGreenTopologyProtection()) {
+            return;
+        }
+
+        if ($willBeSwarm) {
+            throw new \RuntimeException('Blue-green deployment destinations cannot be converted to Docker Swarm while an application is opted in or durable blue-green state exists. Disable blue-green deployment and complete its cleanup lifecycle first.');
+        }
+
+        throw new \RuntimeException('Blue-green deployment destinations require Traefik while an application is opted in or durable blue-green state exists. Disable blue-green deployment and complete its cleanup lifecycle first.');
+    }
+
+    public function assertBlueGreenTopologyCanBeRemoved(): void
+    {
+        if (! $this->hasBlueGreenTopologyProtection()) {
+            return;
+        }
+
+        throw new \RuntimeException('A server with an opted-in or durable blue-green application cannot be removed. Disable blue-green deployment and complete its cleanup lifecycle first.');
+    }
+
     public function isEmpty()
     {
         return $this->applications()->count() == 0 &&
@@ -1519,6 +1555,13 @@ $schema://$host {
     {
         $configRepository = app(ConfigurationRepository::class);
         $configRepository->disableSshMux();
+    }
+
+    private function hasBlueGreenTopologyProtection(): bool
+    {
+        return Application::hasBlueGreenTopologyProtectionForStandaloneDockerIds(
+            $this->standaloneDockers()->pluck('id')->all(),
+        );
     }
 
     public function generateCaCertificate()

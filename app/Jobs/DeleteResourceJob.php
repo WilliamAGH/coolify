@@ -2,12 +2,17 @@
 
 namespace App\Jobs;
 
+use App\Actions\Application\BlueGreen\BlueGreenDeactivationException;
+use App\Actions\Application\BlueGreen\DeactivateBlueGreenApplication;
 use App\Actions\Application\StopApplication;
 use App\Actions\Database\StopDatabase;
 use App\Actions\Server\CleanupDocker;
 use App\Actions\Service\DeleteService;
 use App\Actions\Service\StopService;
+use App\Contracts\ProxyMutation;
+use App\Enums\ApplicationDeploymentStatus;
 use App\Models\Application;
+use App\Models\ApplicationDeploymentQueue;
 use App\Models\ApplicationPreview;
 use App\Models\Service;
 use App\Models\StandaloneClickhouse;
@@ -18,17 +23,19 @@ use App\Models\StandaloneMongodb;
 use App\Models\StandaloneMysql;
 use App\Models\StandalonePostgresql;
 use App\Models\StandaloneRedis;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeEncrypted;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
-use Illuminate\Support\Facades\Artisan;
 
-class DeleteResourceJob implements ShouldBeEncrypted, ShouldQueue
+class DeleteResourceJob implements ProxyMutation, ShouldBeEncrypted, ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    use UsesProxyMutationQueue;
 
     public function __construct(
         public Application|ApplicationPreview|Service|StandalonePostgresql|StandaloneRedis|StandaloneMongodb|StandaloneMysql|StandaloneMariadb|StandaloneKeydb|StandaloneDragonfly|StandaloneClickhouse $resource,
@@ -37,17 +44,25 @@ class DeleteResourceJob implements ShouldBeEncrypted, ShouldQueue
         public bool $deleteConfigurations = true,
         public bool $dockerCleanup = true
     ) {
-        $this->onQueue('high');
+        ProxyMutationQueue::assign($this);
     }
 
     public function handle()
     {
+        ProxyMutationQueue::ensureExecutionAllowed();
+
+        $shouldForceDeleteResource = ! ($this->resource instanceof Application);
         try {
             // Handle ApplicationPreview instances separately
             if ($this->resource instanceof ApplicationPreview) {
                 $this->deleteApplicationPreview();
 
                 return;
+            }
+
+            if ($this->resource instanceof Application) {
+                (new DeactivateBlueGreenApplication)->beginDeletion($this->resource);
+                $shouldForceDeleteResource = true;
             }
 
             switch ($this->resource->type()) {
@@ -99,17 +114,23 @@ class DeleteResourceJob implements ShouldBeEncrypted, ShouldQueue
             if ($this->deleteConnectedNetworks && $this->resource->type() === 'application') {
                 $this->resource->deleteConnectedNetworks();
             }
+        } catch (BlueGreenDeactivationException $e) {
+            $shouldForceDeleteResource = false;
+
+            throw $e;
         } catch (\Throwable $e) {
             throw $e;
         } finally {
-            $this->resource->forceDelete();
-            if ($this->dockerCleanup) {
-                $server = data_get($this->resource, 'server') ?? data_get($this->resource, 'destination.server');
-                if ($server) {
-                    CleanupDocker::dispatch($server, false, false);
+            if ($shouldForceDeleteResource) {
+                $this->resource->forceDelete();
+                if ($this->dockerCleanup) {
+                    $server = data_get($this->resource, 'server') ?? data_get($this->resource, 'destination.server');
+                    if ($server) {
+                        CleanupDocker::dispatch($server, false, false);
+                    }
                 }
+                CleanupStuckedResourcesJob::dispatch();
             }
-            Artisan::queue('cleanup:stucked-resources');
         }
     }
 
@@ -125,11 +146,11 @@ class DeleteResourceJob implements ShouldBeEncrypted, ShouldQueue
         }
 
         // Cancel any active deployments for this PR (same logic as API cancel_deployment)
-        $activeDeployments = \App\Models\ApplicationDeploymentQueue::where('application_id', $application->id)
+        $activeDeployments = ApplicationDeploymentQueue::where('application_id', $application->id)
             ->where('pull_request_id', $pull_request_id)
             ->whereIn('status', [
-                \App\Enums\ApplicationDeploymentStatus::QUEUED->value,
-                \App\Enums\ApplicationDeploymentStatus::IN_PROGRESS->value,
+                ApplicationDeploymentStatus::QUEUED->value,
+                ApplicationDeploymentStatus::IN_PROGRESS->value,
             ])
             ->get();
 
@@ -137,7 +158,7 @@ class DeleteResourceJob implements ShouldBeEncrypted, ShouldQueue
             try {
                 // Mark deployment as cancelled
                 $activeDeployment->update([
-                    'status' => \App\Enums\ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+                    'status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
                 ]);
 
                 // Add cancellation log entry

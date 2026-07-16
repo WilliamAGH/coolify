@@ -1,0 +1,150 @@
+services:
+  volume-init:
+    image: "${PRODUCTION_APPLICATION_BLUE_GREEN_IMAGE:?Set PRODUCTION_APPLICATION_BLUE_GREEN_IMAGE}"
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["chmod 0777 /dynamic /saga /state"]
+    restart: "no"
+    volumes:
+      - dynamic:/dynamic
+      - saga:/saga
+      - state:/state
+    networks: [production-saga]
+
+  redis:
+    image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    networks: [production-saga]
+
+  production-blue:
+    image: "${PRODUCTION_APPLICATION_BLUE_GREEN_IMAGE:?Set PRODUCTION_APPLICATION_BLUE_GREEN_IMAGE}"
+    entrypoint: ["/bin/sh", "/lab/backend-entrypoint.sh"]
+    command: ["/init"]
+    restart: "no"
+    environment: &backend-environment
+      APP_DEBUG: "false"
+      APP_ENV: production
+      APP_KEY: "base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+      APP_URL: "http://traefik"
+      AUTORUN_ENABLED: "false"
+      BROADCAST_DRIVER: "null"
+      CACHE_DRIVER: array
+      CONTROL_PLANE_MODE: active
+      HORIZON_ENABLED: "false"
+      INIT_ENABLED: "false"
+      LOG_CHANNEL: stderr
+      MAIL_MAILER: array
+      MIGRATION_ENABLED: "false"
+      NIGHTWATCH_ENABLED: "false"
+      QUEUE_CONNECTION: "null"
+      REDIS_HOST: redis
+      REVISION: blue
+      SCHEDULER_ENABLED: "false"
+      SEEDER_ENABLED: "false"
+      SESSION_DRIVER: array
+    volumes: &backend-volumes
+      - ./backend-entrypoint.sh:/lab/backend-entrypoint.sh:ro
+      - ../../../docker/production/etc/nginx/site-opts.d/http.conf:/etc/nginx/site-opts.d/production-http.conf:ro
+      - ./nginx-websocket.conf:/etc/nginx/site-opts.d/http.conf:ro
+      - ./routes.php:/var/www/html/routes/api.php:ro
+      - ./websocket.php:/lab/websocket.php:ro
+      - state:/state
+    depends_on:
+      redis:
+        condition: service_healthy
+      volume-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/api/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    networks: [production-saga]
+
+  production-green:
+    image: "${PRODUCTION_APPLICATION_BLUE_GREEN_IMAGE:?Set PRODUCTION_APPLICATION_BLUE_GREEN_IMAGE}"
+    entrypoint: ["/bin/sh", "/lab/backend-entrypoint.sh"]
+    command: ["/init"]
+    restart: "no"
+    environment:
+      <<: *backend-environment
+      REVISION: green
+    volumes: *backend-volumes
+    depends_on:
+      redis:
+        condition: service_healthy
+      volume-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/api/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    networks: [production-saga]
+
+  traefik:
+    image: traefik:v3.6.17@sha256:802adc80a7bb20a6766c9385c2ad547f0de98564cd20d31d0b6d8f726f906f66
+    command: ["--configFile=/etc/traefik/traefik.yml"]
+    restart: "no"
+    volumes:
+      - dynamic:/dynamic:ro
+      - ./traefik.yml:/etc/traefik/traefik.yml:ro
+    depends_on:
+      production-blue:
+        condition: service_healthy
+      production-green:
+        condition: service_healthy
+    networks: [production-saga]
+
+  compiler:
+    image: "${PRODUCTION_APPLICATION_BLUE_GREEN_IMAGE:?Set PRODUCTION_APPLICATION_BLUE_GREEN_IMAGE}"
+    command: ["php", "/lab/compiler.php"]
+    restart: "no"
+    environment:
+      APP_DEBUG: "false"
+      APP_ENV: production
+      APP_KEY: "base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+      CONTROL_PLANE_MODE: passive
+      LOG_CHANNEL: stderr
+    volumes:
+      - ./compiler.php:/lab/compiler.php:ro
+      - dynamic:/proxy/dynamic
+    depends_on:
+      volume-init:
+        condition: service_completed_successfully
+    networks: [production-saga]
+
+  traffic:
+    image: "${PRODUCTION_APPLICATION_BLUE_GREEN_IMAGE:?Set PRODUCTION_APPLICATION_BLUE_GREEN_IMAGE}"
+    command: ["php", "/lab/traffic.php"]
+    restart: "no"
+    environment:
+      APP_DEBUG: "false"
+      APP_ENV: production
+      APP_KEY: "base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+      CONTROL_PLANE_MODE: passive
+      LOG_CHANNEL: stderr
+      TRAFFIC_DEADLINE_SECONDS: "180"
+    volumes:
+      - ./traffic.php:/lab/traffic.php:ro
+      - saga:/saga
+      - state:/state:ro
+    depends_on:
+      traefik:
+        condition: service_started
+    networks: [production-saga]
+
+networks:
+  production-saga:
+    driver: bridge
+
+volumes:
+  dynamic:
+  saga:
+  state:

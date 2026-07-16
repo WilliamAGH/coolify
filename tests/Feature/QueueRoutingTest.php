@@ -6,6 +6,7 @@ use App\Actions\Service\StartService;
 use App\Jobs\DatabaseBackupJob;
 use App\Jobs\ScheduledJobManager;
 use App\Models\ScheduledDatabaseBackup;
+use App\Support\ProxyMutationQueue;
 
 describe('deployment_queue helper', function () {
     test('uses the high queue on self-hosted', function () {
@@ -36,25 +37,16 @@ describe('crons_queue helper', function () {
 });
 
 describe('start action job routing', function () {
-    test('routes to the deployments queue on cloud', function (string $actionClass) {
-        config(['constants.coolify.self_hosted' => false]);
-
-        expect($actionClass::makeJob()->queue)->toBe('deployments');
+    test('routes database start actions to the authoritative proxy-mutations queue', function (string $actionClass) {
+        expect($actionClass::makeJob()->queue)->toBe(ProxyMutationQueue::NAME);
     })->with([
         StartDatabase::class,
         StartDatabaseProxy::class,
-        StartService::class,
     ]);
 
-    test('routes to the high queue on self-hosted', function (string $actionClass) {
-        config(['constants.coolify.self_hosted' => true]);
-
-        expect($actionClass::makeJob()->queue)->toBe('high');
-    })->with([
-        StartDatabase::class,
-        StartDatabaseProxy::class,
-        StartService::class,
-    ]);
+    test('routes service start actions to the authoritative proxy-mutations queue', function () {
+        expect(StartService::makeJob()->queue)->toBe(ProxyMutationQueue::NAME);
+    });
 });
 
 describe('scheduled job routing', function () {

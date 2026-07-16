@@ -1,0 +1,18 @@
+http:
+  routers:
+    candidateadoption:
+      entryPoints: [web]
+      middlewares: [candidateadoptionproof]
+      priority: 16
+      rule: PathPrefix(`/`)
+      service: candidateservice
+  middlewares:
+    candidateadoptionproof:
+      headers:
+        customResponseHeaders:
+          X-Coolify-Blue-Green-Phase: candidate-adoption
+  services:
+    candidateservice:
+      loadBalancer:
+        servers:
+          - url: http://candidate:3000

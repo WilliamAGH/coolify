@@ -2,28 +2,39 @@
 
 namespace App\Actions\Docker;
 
+use App\Actions\Application\ActiveApplicationContainerResolution;
+use App\Actions\Application\ResolveActiveApplicationContainer;
 use App\Actions\Application\StopApplication;
 use App\Actions\Database\StartDatabaseProxy;
 use App\Actions\Database\StopDatabaseProxy;
 use App\Actions\Shared\ComplexStatusCheck;
+use App\Contracts\ProxyMutation;
 use App\Events\ServiceChecked;
 use App\Models\ApplicationPreview;
 use App\Models\Server;
 use App\Models\ServiceDatabase;
 use App\Notifications\Application\RestartLimitReached as ApplicationRestartLimitReached;
 use App\Services\ContainerStatusAggregator;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use App\Traits\CalculatesExcludedStatus;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Lorisleiva\Actions\Concerns\AsAction;
+use Lorisleiva\Actions\Decorators\JobDecorator;
 
-class GetContainersStatus
+class GetContainersStatus implements ProxyMutation
 {
     use AsAction;
     use CalculatesExcludedStatus;
+    use UsesProxyMutationQueue;
 
-    public string $jobQueue = 'high';
+    public function configureJob(JobDecorator $job): void
+    {
+        ProxyMutationQueue::assign($job);
+    }
 
     public $applications;
 
@@ -39,8 +50,12 @@ class GetContainersStatus
 
     protected ?Collection $serviceContainerStatuses;
 
+    protected ?Collection $activeApplicationContainerResolutions;
+
     public function handle(Server $server, ?Collection $containers = null, ?Collection $containerReplicates = null)
     {
+        ProxyMutationQueue::ensureExecutionAllowed();
+
         $this->containers = $containers;
         $this->containerReplicates = $containerReplicates;
         $this->server = $server;
@@ -48,11 +63,13 @@ class GetContainersStatus
             return 'Server is not functional.';
         }
         $this->applications = $this->server->applications();
+        $this->activeApplicationContainerResolutions = (new ResolveActiveApplicationContainer)
+            ->resolveMany($this->applications, $this->server);
         $skip_these_applications = collect([]);
         foreach ($this->applications as $application) {
             if ($application->additional_servers->count() > 0) {
                 $skip_these_applications->push($application);
-                ComplexStatusCheck::run($application);
+                ComplexStatusCheck::run($application, $this->activeApplicationContainerResolutions);
                 $this->applications = $this->applications->filter(function ($value, $key) use ($application) {
                     return $value->id !== $application->id;
                 });
@@ -139,6 +156,14 @@ class GetContainersStatus
                 } else {
                     $application = $this->applications->where('id', $applicationId)->first();
                     if ($application) {
+                        $resolution = $this->activeApplicationContainerResolutions?->get(
+                            $application->id,
+                            ActiveApplicationContainerResolution::standard(),
+                        );
+                        if (! $resolution->accepts(data_get($container, 'Name'))) {
+                            continue;
+                        }
+
                         $foundApplications[] = $application->id;
                         // Store container status for aggregation
                         if (! isset($this->applicationContainerStatuses)) {
@@ -366,12 +391,42 @@ class GetContainersStatus
         $notRunningApplications = $this->applications->pluck('id')->diff($foundApplications);
         foreach ($notRunningApplications as $applicationId) {
             $application = $this->applications->where('id', $applicationId)->first();
-            if (str($application->status)->startsWith('exited')) {
+            // Only protection: If no containers at all, Docker query might have failed
+            if ($this->containers->isEmpty()) {
                 continue;
             }
 
-            // Only protection: If no containers at all, Docker query might have failed
-            if ($this->containers->isEmpty()) {
+            $resolution = $this->activeApplicationContainerResolutions?->get(
+                $application->id,
+                ActiveApplicationContainerResolution::standard(),
+            );
+            if ($resolution->failsClosed()) {
+                Log::error('Blue-green application status resolution failed closed.', [
+                    'application_id' => $application->id,
+                    'server_id' => $this->server->id,
+                    'reason' => $resolution->failureReason(),
+                ]);
+                $application->update(['status' => 'degraded:unhealthy']);
+
+                continue;
+            }
+            if ($resolution->requiresExpectedContainer()) {
+                Log::warning('Blue-green active application container was not observed.', [
+                    'application_id' => $application->id,
+                    'server_id' => $this->server->id,
+                    'expected_container' => $resolution->expectedContainerName(),
+                ]);
+                $application->update(['status' => 'degraded:unhealthy']);
+
+                continue;
+            }
+            if ($resolution->hasNoPublicContainer()) {
+                $application->update(['status' => 'exited']);
+
+                continue;
+            }
+
+            if (str($application->status)->startsWith('exited')) {
                 continue;
             }
 

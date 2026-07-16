@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Actions\Application\CleanupPreviewDeployment;
 use App\Actions\Application\LoadComposeFile;
+use App\Actions\Application\ResolveActiveApplicationContainer;
 use App\Actions\Application\StopApplication;
 use App\Enums\BuildPackTypes;
 use App\Http\Controllers\Controller;
@@ -2036,6 +2037,10 @@ class ApplicationsController extends Controller
                 ref: '#/components/responses/400',
             ),
             new OA\Response(
+                response: 409,
+                description: 'The active application routing state is inconsistent.',
+            ),
+            new OA\Response(
                 response: 404,
                 ref: '#/components/responses/404',
             ),
@@ -2056,7 +2061,26 @@ class ApplicationsController extends Controller
             return response()->json(['message' => 'Application not found.'], 404);
         }
 
-        $containers = getCurrentApplicationContainerStatus($application->destination->server, $application->id);
+        $server = $application->destination?->server;
+        if ($server === null) {
+            return response()->json([
+                'message' => 'Application destination is unavailable.',
+            ], 409);
+        }
+
+        $resolution = ResolveActiveApplicationContainer::run($application, $server);
+        if ($resolution->failsClosed()) {
+            return response()->json([
+                'message' => 'Application active routing state is inconsistent; refusing to select container logs.',
+            ], 409);
+        }
+        if ($resolution->hasNoPublicContainer()) {
+            return response()->json([
+                'message' => 'Application is not running.',
+            ], 400);
+        }
+
+        $containers = getCurrentApplicationContainerStatus($server, $application->id);
 
         if ($containers->count() == 0) {
             return response()->json([
@@ -2064,9 +2088,25 @@ class ApplicationsController extends Controller
             ], 400);
         }
 
-        $container = $containers->first();
+        if ($resolution->requiresUnambiguousContainer()) {
+            $containers = $containers
+                ->filter(fn (array $container) => $resolution->accepts(data_get($container, 'Names')))
+                ->filter(fn (array $container) => data_get($container, 'State') === 'running')
+                ->values();
+            if ($containers->count() !== 1) {
+                return response()->json([
+                    'message' => $containers->isEmpty()
+                        ? 'Application is not running.'
+                        : 'Application active routing is ambiguous; refusing to select container logs.',
+                ], $containers->isEmpty() ? 400 : 409);
+            }
+        }
 
-        $status = getContainerStatus($application->destination->server, $container['Names']);
+        $container = $resolution->requiresUnambiguousContainer()
+            ? $containers->sole()
+            : $containers->first();
+
+        $status = getContainerStatus($server, $container['Names']);
         if ($status !== 'running') {
             return response()->json([
                 'message' => 'Application is not running.',
@@ -2074,7 +2114,7 @@ class ApplicationsController extends Controller
         }
 
         $lines = $request->query->get('lines', 100) ?: 100;
-        $logs = getContainerLogs($application->destination->server, $container['ID'], $lines);
+        $logs = getContainerLogs($server, $container['ID'], $lines);
 
         return response()->json([
             'logs' => $logs,

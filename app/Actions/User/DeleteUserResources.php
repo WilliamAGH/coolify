@@ -2,7 +2,10 @@
 
 namespace App\Actions\User;
 
+use App\Actions\Application\BlueGreen\DeactivateBlueGreenApplication;
+use App\Models\Application;
 use App\Models\User;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Collection;
 
 class DeleteUserResources
@@ -50,14 +53,16 @@ class DeleteUserResources
             // Only delete resources from teams where user is the ONLY member
             // These teams will be fully deleted
 
+            $applications = $applications->merge(
+                Application::withTrashed()
+                    ->whereHas('environment.project', fn (Builder $query): Builder => $query->where('team_id', $team->id))
+                    ->get(),
+            );
+
             // Get all servers for this team
             $servers = $team->servers()->get();
 
             foreach ($servers as $server) {
-                // Get applications (custom method returns Collection)
-                $serverApplications = $server->applications();
-                $applications = $applications->merge($serverApplications);
-
                 // Get databases (custom method returns Collection)
                 $serverDatabases = $server->databases();
                 $databases = $databases->merge($serverDatabases);
@@ -96,8 +101,9 @@ class DeleteUserResources
         // Delete applications
         foreach ($resources['applications'] as $application) {
             try {
-                $application->forceDelete();
-                $deletedCounts['applications']++;
+                if ((new DeactivateBlueGreenApplication)->deletePermanently($application)) {
+                    $deletedCounts['applications']++;
+                }
             } catch (\Exception $e) {
                 \Log::error("Failed to delete application {$application->id}: ".$e->getMessage());
                 throw $e; // Re-throw to trigger rollback

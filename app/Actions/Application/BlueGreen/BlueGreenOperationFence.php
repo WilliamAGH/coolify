@@ -1,0 +1,189 @@
+<?php
+
+namespace App\Actions\Application\BlueGreen;
+
+use App\Enums\BlueGreenDeactivationPhase;
+use App\Enums\BlueGreenDeploymentColor;
+use App\Enums\BlueGreenDeploymentPhase;
+use App\Models\ApplicationBlueGreenDeactivation;
+use App\Models\ApplicationBlueGreenDeployment;
+use App\Models\ApplicationDeploymentQueue;
+use Illuminate\Cache\Lock;
+use Throwable;
+
+final readonly class BlueGreenOperationFence
+{
+    public function __construct(
+        private Lock $lock,
+        private int $leaseSeconds,
+    ) {
+        if ($this->leaseSeconds < 1) {
+            throw new \InvalidArgumentException('The blue-green operation fence lease must be positive.');
+        }
+    }
+
+    /**
+     * @param  non-empty-list<BlueGreenDeploymentPhase>  $expectedPhases
+     */
+    public function assertDeploymentOwnership(
+        BlueGreenDeploymentClaim $claim,
+        array $expectedPhases,
+    ): BlueGreenDeploymentPhase {
+        $this->refreshOwnedLock();
+
+        $state = ApplicationBlueGreenDeployment::query()->find($claim->stateId);
+        $deployment = ApplicationDeploymentQueue::query()
+            ->where('application_id', $claim->applicationId)
+            ->where('deployment_uuid', $claim->deploymentUuid)
+            ->first();
+        if ($state === null
+            || $deployment === null
+            || (int) $state->application_id !== $claim->applicationId
+            || (int) $state->standalone_docker_id !== $claim->standaloneDockerId
+            || ! in_array($state->phase, $expectedPhases, true)
+            || $state->operation_deployment_uuid !== $claim->deploymentUuid
+            || $state->routing_revision !== $claim->expectedRoutingRevision
+            || $state->operation_candidate_container_name !== $claim->candidateContainerName
+            || $state->operation_rollback_managed_filename !== $claim->rollbackManagedFilename
+            || (int) $deployment->application_id !== $claim->applicationId
+            || (int) $deployment->destination_id !== $claim->standaloneDockerId
+            || $deployment->pull_request_id !== 0
+            || $deployment->blue_green_phase !== $state->phase
+            || $deployment->blue_green_color !== $claim->pendingColor
+            || $deployment->blue_green_routing_revision !== $claim->expectedRoutingRevision
+            || ! $this->deploymentProvenanceMatches($state, $deployment, $claim)
+            || ! $this->stateShapeMatchesClaim($state, $claim)) {
+            throw new BlueGreenOperationFenceLostException('The blue-green deployment operation no longer owns the exact durable phase and provenance.');
+        }
+
+        return $state->phase;
+    }
+
+    public function assertDeactivationOwnership(BlueGreenDeactivationPreparation $preparation): void
+    {
+        $this->refreshOwnedLock();
+
+        $expected = $preparation->deactivation;
+        $deactivation = ApplicationBlueGreenDeactivation::query()->find($expected->id);
+        if ($deactivation === null
+            || (int) $deactivation->application_id !== (int) $expected->application_id
+            || (int) $deactivation->standalone_docker_id !== (int) $expected->standalone_docker_id
+            || $deactivation->operation_id !== $expected->operation_id
+            || $deactivation->started_at === null
+            || $expected->started_at === null
+            || ! $deactivation->started_at->equalTo($expected->started_at)
+            || $deactivation->phase !== BlueGreenDeactivationPhase::DEACTIVATING) {
+            throw new BlueGreenOperationFenceLostException('The blue-green deactivation no longer owns the exact durable operation and phase.');
+        }
+
+        $state = ApplicationBlueGreenDeployment::query()
+            ->where('application_id', $deactivation->application_id)
+            ->where('standalone_docker_id', $deactivation->standalone_docker_id)
+            ->first();
+        if ($preparation->state === null) {
+            if ($state !== null) {
+                throw new BlueGreenOperationFenceLostException('A blue-green deployment state appeared after deactivation preparation.');
+            }
+
+            return;
+        }
+        $matchesPreparedDeactivation = $state !== null
+            && $state->phase === BlueGreenDeploymentPhase::DEACTIVATING
+            && $state->operation_deployment_uuid === null
+            && $state->deactivation_operation_id === $deactivation->operation_id
+            && $state->deactivation_started_at !== null
+            && $state->deactivation_started_at->equalTo($deactivation->started_at);
+        $matchesFailedPreparation = $state !== null
+            && $preparation->invariantViolation !== null
+            && $state->phase === $preparation->state->phase
+            && $state->operation_deployment_uuid === $preparation->state->operation_deployment_uuid
+            && $state->deactivation_operation_id === $preparation->state->deactivation_operation_id
+            && (($state->deactivation_started_at === null && $preparation->state->deactivation_started_at === null)
+                || ($state->deactivation_started_at !== null
+                    && $preparation->state->deactivation_started_at !== null
+                    && $state->deactivation_started_at->equalTo($preparation->state->deactivation_started_at)));
+        if ($state === null
+            || $state->id !== $preparation->state->id
+            || (! $matchesPreparedDeactivation && ! $matchesFailedPreparation)
+            || $state->routing_revision !== $preparation->state->routing_revision
+            || $state->active_color !== $preparation->state->active_color
+            || $state->pending_color !== $preparation->state->pending_color
+            || $state->pending_deployment_uuid !== $preparation->state->pending_deployment_uuid
+            || $state->blue_deployment_uuid !== $preparation->state->blue_deployment_uuid
+            || $state->green_deployment_uuid !== $preparation->state->green_deployment_uuid
+            || $state->legacy_container_name !== $preparation->state->legacy_container_name) {
+            throw new BlueGreenOperationFenceLostException('The blue-green deactivation deployment state no longer matches its exact durable operation.');
+        }
+    }
+
+    public function assertLockOwnership(): void
+    {
+        $this->refreshOwnedLock();
+    }
+
+    public function releaseIfOwned(): bool
+    {
+        if (! $this->lock->isOwnedByCurrentProcess()) {
+            return false;
+        }
+
+        return (bool) $this->lock->release();
+    }
+
+    private function refreshOwnedLock(): void
+    {
+        try {
+            if (! $this->lock->refresh($this->leaseSeconds)) {
+                throw new BlueGreenOperationFenceLostException('The blue-green lifecycle lock expired or has a newer owner.');
+            }
+        } catch (BlueGreenOperationFenceLostException $exception) {
+            throw $exception;
+        } catch (Throwable $exception) {
+            throw new BlueGreenOperationFenceLostException(
+                'The blue-green lifecycle lock ownership could not be renewed.',
+                (int) $exception->getCode(),
+                $exception,
+            );
+        }
+    }
+
+    private function stateShapeMatchesClaim(
+        ApplicationBlueGreenDeployment $state,
+        BlueGreenDeploymentClaim $claim,
+    ): bool {
+        if ($state->phase === BlueGreenDeploymentPhase::IDLE) {
+            $deploymentColumn = match ($claim->pendingColor) {
+                BlueGreenDeploymentColor::BLUE => 'blue_deployment_uuid',
+                BlueGreenDeploymentColor::GREEN => 'green_deployment_uuid',
+            };
+
+            return $state->active_color === $claim->pendingColor
+                && $state->pending_color === null
+                && $state->pending_deployment_uuid === null
+                && $state->{$deploymentColumn} === $claim->deploymentUuid;
+        }
+
+        return $state->active_color === $claim->previousActiveColor
+            && $state->pending_color === $claim->pendingColor
+            && $state->pending_deployment_uuid === $claim->deploymentUuid
+            && $state->legacy_container_name === $claim->legacyContainerName;
+    }
+
+    private function deploymentProvenanceMatches(
+        ApplicationBlueGreenDeployment $state,
+        ApplicationDeploymentQueue $deployment,
+        BlueGreenDeploymentClaim $claim,
+    ): bool {
+        $stateRoutingMutatedAt = $state->operation_routing_mutated_at;
+        $deploymentRoutingMutatedAt = $deployment->blue_green_routing_mutated_at;
+
+        return $state->operation_previous_active_color === $claim->previousActiveColor
+            && $state->operation_previous_container_id === $deployment->blue_green_previous_container_id
+            && $state->operation_candidate_container_id === $deployment->blue_green_candidate_container_id
+            && $deployment->blue_green_rollback_managed_filename === $claim->rollbackManagedFilename
+            && (($stateRoutingMutatedAt === null && $deploymentRoutingMutatedAt === null)
+                || ($stateRoutingMutatedAt !== null
+                    && $deploymentRoutingMutatedAt !== null
+                    && $stateRoutingMutatedAt->equalTo($deploymentRoutingMutatedAt)));
+    }
+}

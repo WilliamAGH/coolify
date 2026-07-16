@@ -12,6 +12,7 @@ use App\Models\ApplicationPreview;
 use App\Models\Server;
 use App\Models\Service;
 use App\Models\Tag;
+use App\Support\ValidationPatterns;
 use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Http\Request;
 use OpenApi\Attributes as OA;
@@ -222,6 +223,7 @@ class DeployController extends Controller
         if (! $deployment) {
             return response()->json(['message' => 'Deployment not found.'], 404);
         }
+        $application = $deployment->application;
 
         // Check if the deployment belongs to the user's team
         $servers = Server::whereTeamId($teamId)->pluck('id');
@@ -364,6 +366,10 @@ class DeployController extends Controller
             return invalidTokenResponse();
         }
 
+        $request->validate([
+            'docker_tag' => ValidationPatterns::dockerImageTagRules(),
+        ]);
+
         $uuids = $request->input('uuid');
         $tags = $request->input('tag');
         $force = $request->input('force') ?? false;
@@ -405,6 +411,11 @@ class DeployController extends Controller
         foreach ($uuids as $uuid) {
             $resource = getResourceByUuid($uuid, $teamId);
             if ($resource) {
+                if ($dockerTag !== null && ! ($resource instanceof Application && $resource->build_pack === 'dockerimage')) {
+                    $deployments->push(['message' => 'docker_tag can only be used with Docker Image applications.', 'resource_uuid' => $uuid]);
+
+                    continue;
+                }
                 $dockerTagForResource = $dockerTag;
                 if ($pr !== 0) {
                     $preview = null;

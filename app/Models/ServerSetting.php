@@ -108,6 +108,8 @@ class ServerSetting extends Model
         'docker_cleanup_threshold' => 'integer',
         'sentinel_token' => 'encrypted',
         'is_reachable' => 'boolean',
+        'is_swarm_manager' => 'boolean',
+        'is_swarm_worker' => 'boolean',
         'is_usable' => 'boolean',
         'is_terminal_enabled' => 'boolean',
         'disable_application_image_retention' => 'boolean',
@@ -116,6 +118,21 @@ class ServerSetting extends Model
 
     protected static function booted()
     {
+        static::saving(function (ServerSetting $setting): void {
+            if (! $setting->isDirty(['is_swarm_manager', 'is_swarm_worker'])) {
+                return;
+            }
+
+            $wasSwarm = (bool) $setting->getOriginal('is_swarm_manager')
+                || (bool) $setting->getOriginal('is_swarm_worker');
+            $willBeSwarm = (bool) $setting->is_swarm_manager || (bool) $setting->is_swarm_worker;
+            if (! $wasSwarm && $willBeSwarm) {
+                $setting->server->assertBlueGreenTopologyCanChange(
+                    willBeSwarm: true,
+                    proxyType: $setting->server->proxyType(),
+                );
+            }
+        });
         static::creating(function ($setting) {
             try {
                 if (str($setting->sentinel_token)->isEmpty()) {

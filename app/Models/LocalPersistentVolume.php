@@ -21,6 +21,16 @@ class LocalPersistentVolume extends BaseModel
         'is_preview_suffix_enabled' => 'boolean',
     ];
 
+    protected static function booted(): void
+    {
+        static::creating(function (LocalPersistentVolume $volume): void {
+            Application::findBlueGreenStorageApplication(
+                $volume->resource_type,
+                $volume->resource_id,
+            )?->prepareBlueGreenStorageAddition();
+        });
+    }
+
     public function resource()
     {
         return $this->morphTo('resource');

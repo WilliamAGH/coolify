@@ -3,6 +3,9 @@
 namespace App\Models;
 
 use App\Enums\ApplicationDeploymentStatus;
+use App\Enums\BlueGreenDeactivationPhase;
+use App\Enums\BlueGreenDeploymentPhase;
+use App\Enums\ProxyTypes;
 use App\Services\ConfigurationGenerator;
 use App\Services\DeploymentConfiguration\ApplicationConfigurationSnapshot;
 use App\Services\DeploymentConfiguration\ConfigurationDiff;
@@ -11,11 +14,13 @@ use App\Traits\ClearsGlobalSearchCache;
 use App\Traits\HasConfiguration;
 use App\Traits\HasMetrics;
 use App\Traits\HasSafeStringAttribute;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
 use OpenApi\Attributes as OA;
@@ -117,7 +122,9 @@ use Visus\Cuid2\Cuid2;
 
 class Application extends BaseModel
 {
-    use ClearsGlobalSearchCache, HasConfiguration, HasFactory, HasMetrics, HasSafeStringAttribute, SoftDeletes;
+    use ClearsGlobalSearchCache, HasConfiguration, HasFactory, HasMetrics, HasSafeStringAttribute, SoftDeletes {
+        SoftDeletes::forceDelete as private forceDeleteWithoutDeploymentFence;
+    }
 
     private static $parserVersion = '5';
 
@@ -227,6 +234,8 @@ class Application extends BaseModel
             'manual_webhook_secret_gitlab' => 'encrypted',
             'manual_webhook_secret_bitbucket' => 'encrypted',
             'manual_webhook_secret_gitea' => 'encrypted',
+            'custom_healthcheck_found' => 'boolean',
+            'health_check_enabled' => 'boolean',
             'restart_count' => 'integer',
             'max_restart_count' => 'integer',
             'last_restart_at' => 'datetime',
@@ -323,6 +332,9 @@ class Application extends BaseModel
                     $application->custom_healthcheck_found = false;
                 }
             }
+            if ($application->hasBlueGreenEligibilityAffectingChanges()) {
+                $application->prepareBlueGreenConfigurationMutation();
+            }
         });
         static::created(function ($application) {
             ApplicationSetting::create([
@@ -347,8 +359,9 @@ class Application extends BaseModel
             }
         });
         static::forceDeleting(function ($application) {
-            $application->update(['fqdn' => null]);
+            $application->assertBlueGreenDeletionAuthorized();
             $application->settings()->delete();
+            $application->update(['fqdn' => null]);
             $application->persistentStorages()->delete();
             $application->environment_variables()->delete();
             $application->environment_variables_preview()->delete();
@@ -361,6 +374,89 @@ class Application extends BaseModel
                 $deployment->delete();
             }
         });
+    }
+
+    protected function performUpdate(Builder $query)
+    {
+        if (! $this->hasBlueGreenLifecycleAffectingChanges()) {
+            return parent::performUpdate($query);
+        }
+
+        return DB::transaction(function () use ($query): bool {
+            $application = self::withTrashed()
+                ->whereKey($this->getKey())
+                ->lockForUpdate()
+                ->first();
+            if ($application === null) {
+                throw new RuntimeException('Blue-green application configuration cannot be updated after the application is gone.');
+            }
+
+            $setting = ApplicationSetting::query()
+                ->where('application_id', $application->id)
+                ->lockForUpdate()
+                ->first();
+            $states = ApplicationBlueGreenDeployment::query()
+                ->where('application_id', $application->id)
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            ApplicationBlueGreenDeactivation::query()
+                ->where('application_id', $application->id)
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            $queueDeploymentUuids = $states
+                ->flatMap(static fn (ApplicationBlueGreenDeployment $state): array => [
+                    $state->blue_deployment_uuid,
+                    $state->green_deployment_uuid,
+                    $state->pending_deployment_uuid,
+                    $state->operation_deployment_uuid,
+                    $state->operation_previous_deployment_uuid,
+                ])
+                ->filter(static fn (mixed $deploymentUuid): bool => is_string($deploymentUuid) && $deploymentUuid !== '')
+                ->unique()
+                ->values();
+            if ($queueDeploymentUuids->isNotEmpty()) {
+                ApplicationDeploymentQueue::query()
+                    ->where('application_id', $application->id)
+                    ->whereIn('deployment_uuid', $queueDeploymentUuids)
+                    ->orderBy('id')
+                    ->lockForUpdate()
+                    ->get();
+            }
+
+            if ($states->contains(
+                static fn (ApplicationBlueGreenDeployment $state): bool => $state->phase !== BlueGreenDeploymentPhase::IDLE,
+            )) {
+                throw new RuntimeException('Blue-green routing and health configuration cannot change while a deployment operation is in progress. Wait for promotion or recovery to finish.');
+            }
+
+            if ($setting !== null) {
+                $this->setRelation('settings', $setting);
+            }
+
+            return parent::performUpdate($query);
+        }, attempts: 5);
+    }
+
+    public function forceDelete()
+    {
+        return DB::transaction(function (): bool {
+            $application = self::withTrashed()
+                ->whereKey($this->getKey())
+                ->lockForUpdate()
+                ->first();
+            if ($application === null) {
+                return false;
+            }
+
+            $deleted = (bool) $application->forceDeleteWithoutDeploymentFence();
+            if ($deleted) {
+                $this->exists = false;
+            }
+
+            return $deleted;
+        }, attempts: 5);
     }
 
     public function customNetworkAliases(): Attribute
@@ -1051,6 +1147,16 @@ class Application extends BaseModel
         return $this->hasMany(ApplicationDeploymentQueue::class);
     }
 
+    public function blueGreenDeployments(): HasMany
+    {
+        return $this->hasMany(ApplicationBlueGreenDeployment::class);
+    }
+
+    public function blueGreenDeactivations(): HasMany
+    {
+        return $this->hasMany(ApplicationBlueGreenDeactivation::class);
+    }
+
     public function destination()
     {
         return $this->morphTo();
@@ -1171,6 +1277,520 @@ class Application extends BaseModel
         }
 
         return false;
+    }
+
+    public function blueGreenDeploymentBackendPort(?ApplicationSetting $setting = null): ?int
+    {
+        $setting ??= $this->relationLoaded('settings')
+            ? $this->getRelation('settings')
+            : $this->settings()->first();
+        if ((bool) ($setting?->is_static ?? false)) {
+            $backendPort = 80;
+        } else {
+            $ports = $this->ports_exposes_array;
+            if (count($ports) !== 1) {
+                return null;
+            }
+
+            $configuredPort = trim((string) $ports[0]);
+            if (preg_match('/^[1-9][0-9]{0,4}$/D', $configuredPort) !== 1) {
+                return null;
+            }
+
+            $backendPort = (int) $configuredPort;
+            if ($backendPort > 65535) {
+                return null;
+            }
+        }
+
+        foreach (explode(',', (string) $this->fqdn) as $domain) {
+            try {
+                $domainPort = Url::fromString(trim($domain))->getPort();
+            } catch (\Throwable) {
+                return null;
+            }
+            if ($domainPort !== null && $domainPort !== $backendPort) {
+                return null;
+            }
+        }
+
+        return $backendPort;
+    }
+
+    /**
+     * @return Collection<int, int>
+     */
+    public function blueGreenConfiguredStandaloneDockerDestinationIds(): Collection
+    {
+        if (! $this->exists) {
+            return collect();
+        }
+
+        $destinationIds = collect();
+        $primaryDestinationId = $this->blueGreenPrimaryStandaloneDockerDestinationId();
+        if ($primaryDestinationId !== null) {
+            $destinationIds->push($primaryDestinationId);
+        }
+
+        return $destinationIds
+            ->merge(
+                DB::table('additional_destinations')
+                    ->where('application_id', $this->id)
+                    ->pluck('standalone_docker_id')
+                    ->map(fn (mixed $destinationId) => (int) $destinationId)
+            )
+            ->filter(fn (int $destinationId) => $destinationId >= 0)
+            ->unique()
+            ->values();
+    }
+
+    /**
+     * @return Collection<int, StandaloneDocker>
+     */
+    public function blueGreenConfiguredStandaloneDockerDestinations(): Collection
+    {
+        $destinationIds = $this->blueGreenConfiguredStandaloneDockerDestinationIds();
+        if ($destinationIds->isEmpty()) {
+            return collect();
+        }
+
+        return StandaloneDocker::query()
+            ->with('server')
+            ->whereIn('id', $destinationIds)
+            ->get();
+    }
+
+    public function blueGreenPrimaryStandaloneDockerDestinationId(): ?int
+    {
+        if (! in_array($this->destination_type, [
+            StandaloneDocker::class,
+            (new StandaloneDocker)->getMorphClass(),
+        ], true) || ! is_numeric($this->destination_id) || (int) $this->destination_id < 0) {
+            return null;
+        }
+
+        return (int) $this->destination_id;
+    }
+
+    public static function findBlueGreenStorageApplication(?string $resourceType, mixed $resourceId): ?self
+    {
+        if (! in_array($resourceType, [self::class, (new self)->getMorphClass()], true)
+            || ! is_numeric($resourceId)
+            || (int) $resourceId < 1) {
+            return null;
+        }
+
+        return self::query()->find((int) $resourceId);
+    }
+
+    /**
+     * @param  array<int, int|string>  $standaloneDockerIds
+     */
+    public static function hasBlueGreenTopologyProtectionForStandaloneDockerIds(array $standaloneDockerIds): bool
+    {
+        $destinationIds = collect($standaloneDockerIds)
+            ->filter(fn (mixed $destinationId): bool => is_numeric($destinationId) && (int) $destinationId >= 0)
+            ->map(fn (mixed $destinationId): int => (int) $destinationId)
+            ->unique()
+            ->values();
+        if ($destinationIds->isEmpty()) {
+            return false;
+        }
+
+        if (ApplicationBlueGreenDeployment::query()
+            ->whereIn('standalone_docker_id', $destinationIds)
+            ->exists()) {
+            return true;
+        }
+
+        $additionalApplicationIds = DB::table('additional_destinations')
+            ->whereIn('standalone_docker_id', $destinationIds)
+            ->pluck('application_id');
+        $standaloneDockerMorphClasses = [
+            StandaloneDocker::class,
+            (new StandaloneDocker)->getMorphClass(),
+        ];
+
+        return self::query()
+            ->where(function (Builder $applicationQuery) use ($destinationIds, $additionalApplicationIds, $standaloneDockerMorphClasses): void {
+                $applicationQuery
+                    ->where(function (Builder $primaryDestinationQuery) use ($destinationIds, $standaloneDockerMorphClasses): void {
+                        $primaryDestinationQuery
+                            ->whereIn('destination_type', $standaloneDockerMorphClasses)
+                            ->whereIn('destination_id', $destinationIds);
+                    })
+                    ->orWhereIn('id', $additionalApplicationIds);
+            })
+            ->where(function (Builder $blueGreenProtectionQuery): void {
+                $blueGreenProtectionQuery
+                    ->whereHas('settings', fn (Builder $settingQuery): Builder => $settingQuery->where('is_blue_green_deployment_enabled', true))
+                    ->orWhereHas('blueGreenDeployments');
+            })
+            ->exists();
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    public static function blueGreenEligibilityAffectingSettingAttributes(): array
+    {
+        return [
+            'is_blue_green_deployment_enabled',
+            'is_static',
+            'is_container_label_readonly_enabled',
+            'is_raw_compose_deployment_enabled',
+            'is_consistent_container_name_enabled',
+            'custom_internal_name',
+        ];
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    public static function blueGreenLifecycleAffectingSettingAttributes(): array
+    {
+        return [
+            ...self::blueGreenEligibilityAffectingSettingAttributes(),
+            'is_force_https_enabled',
+            'is_gzip_enabled',
+            'is_stripprefix_enabled',
+            'stop_grace_period',
+        ];
+    }
+
+    private function hasBlueGreenEligibilityAffectingChanges(): bool
+    {
+        return $this->isDirty([
+            'destination_id',
+            'destination_type',
+            'health_check_enabled',
+            'custom_healthcheck_found',
+            'build_pack',
+            'fqdn',
+            'ports_exposes',
+            'ports_mappings',
+            'custom_network_aliases',
+            'custom_docker_run_options',
+        ]);
+    }
+
+    private function hasBlueGreenLifecycleAffectingChanges(): bool
+    {
+        return $this->isDirty([
+            'uuid',
+            'destination_id',
+            'destination_type',
+            'build_pack',
+            'fqdn',
+            'ports_exposes',
+            'ports_mappings',
+            'custom_network_aliases',
+            'custom_docker_run_options',
+            'redirect',
+            'is_http_basic_auth_enabled',
+            'http_basic_auth_username',
+            'http_basic_auth_password',
+            'health_check_enabled',
+            'custom_healthcheck_found',
+            'health_check_path',
+            'health_check_port',
+            'health_check_host',
+            'health_check_method',
+            'health_check_return_code',
+            'health_check_scheme',
+            'health_check_response_text',
+            'health_check_interval',
+            'health_check_timeout',
+            'health_check_retries',
+            'health_check_start_period',
+            'health_check_type',
+            'health_check_command',
+        ]);
+    }
+
+    public function prepareBlueGreenConfigurationMutation(
+        ?ApplicationSetting $setting = null,
+        bool $allowPendingSettingOptOut = false,
+    ): void {
+        $setting ??= $this->settings()->first();
+        $hasDurableState = $this->blueGreenDeployments()->exists();
+        if (! $this->isBlueGreenDeploymentOptedIn($setting) && ! $hasDurableState) {
+            return;
+        }
+        if ($hasDurableState && ($topologyReason = $this->blueGreenDurableStateTopologyIneligibilityReason()) !== null) {
+            throw new RuntimeException($topologyReason);
+        }
+
+        $this->reconcileBlueGreenConfigurationIneligibility(
+            $this->blueGreenDeploymentIneligibilityReason($setting),
+            $hasDurableState,
+            $setting,
+            $allowPendingSettingOptOut,
+        );
+    }
+
+    public function prepareBlueGreenStorageAddition(): void
+    {
+        $setting = $this->settings()->first();
+        $hasDurableState = $this->blueGreenDeployments()->exists();
+        if (! $this->isBlueGreenDeploymentOptedIn($setting) && ! $hasDurableState) {
+            return;
+        }
+        if ($hasDurableState) {
+            throw new RuntimeException('Blue-green deployments cannot add writable storage while durable state exists. Stop the application and use the blue-green cleanup lifecycle first.');
+        }
+
+        throw new RuntimeException('Blue-green deployments cannot add writable storage while they are opted in. Disable blue-green deployment first.');
+    }
+
+    public function prepareBlueGreenAdditionalDestinationAddition(StandaloneDocker $destination): void
+    {
+        $setting = $this->settings()->first();
+        $hasDurableState = $this->blueGreenDeployments()->exists();
+        if (! $this->isBlueGreenDeploymentOptedIn($setting) && ! $hasDurableState) {
+            return;
+        }
+
+        $this->prepareBlueGreenConfigurationMutation($setting);
+
+        $configuredDestinationIds = $this->blueGreenConfiguredStandaloneDockerDestinationIds()
+            ->push((int) $destination->id)
+            ->unique()
+            ->values();
+        $configuredDestinations = $this->blueGreenConfiguredStandaloneDockerDestinations()
+            ->push($destination)
+            ->unique('id')
+            ->values();
+        $this->reconcileBlueGreenConfigurationIneligibility(
+            $this->blueGreenDestinationTopologyIneligibilityReason(
+                $configuredDestinationIds,
+                $configuredDestinations,
+            ),
+            $hasDurableState,
+            $setting,
+            false,
+        );
+    }
+
+    public function assertBlueGreenDestinationCanBeRemoved(int $standaloneDockerId): void
+    {
+        if ($this->blueGreenDeployments()
+            ->where('standalone_docker_id', $standaloneDockerId)
+            ->exists()) {
+            throw new RuntimeException('Blue-green deployments cannot remove a destination while durable state exists for it. Stop the application and use the blue-green cleanup lifecycle first.');
+        }
+    }
+
+    private function reconcileBlueGreenConfigurationIneligibility(
+        ?string $ineligibilityReason,
+        bool $hasDurableState,
+        ?ApplicationSetting $setting,
+        bool $allowPendingSettingOptOut,
+    ): void {
+        if ($ineligibilityReason === null) {
+            return;
+        }
+        if ($hasDurableState) {
+            throw new RuntimeException("Blue-green deployment configuration cannot become ineligible while durable state exists. {$ineligibilityReason} Stop the application and use the blue-green cleanup lifecycle first.");
+        }
+
+        if ($allowPendingSettingOptOut && $setting !== null && $setting->is_blue_green_deployment_enabled) {
+            $setting->is_blue_green_deployment_enabled = false;
+
+            return;
+        }
+
+        throw new RuntimeException("Blue-green deployment configuration cannot become ineligible while it is opted in. {$ineligibilityReason} Disable blue-green deployment first.");
+    }
+
+    private function blueGreenDurableStateTopologyIneligibilityReason(): ?string
+    {
+        $stateDestinationIds = $this->blueGreenDeployments()
+            ->pluck('standalone_docker_id')
+            ->map(fn (mixed $destinationId) => (int) $destinationId)
+            ->unique();
+        if ($stateDestinationIds->isEmpty()
+            || $stateDestinationIds->diff($this->blueGreenConfiguredStandaloneDockerDestinationIds())->isEmpty()) {
+            return null;
+        }
+
+        return 'Blue-green deployment destinations cannot change while durable state still references the previous topology. Stop the application and use the blue-green cleanup lifecycle first.';
+    }
+
+    public function blueGreenDeploymentIneligibilityReason(?ApplicationSetting $setting = null): ?string
+    {
+        $setting ??= $this->settings()->first();
+        $primaryDestinationId = $this->blueGreenPrimaryStandaloneDockerDestinationId();
+        if ($primaryDestinationId === null) {
+            return 'Blue-green deployments require a standalone Docker primary destination.';
+        }
+
+        $configuredDestinationIds = $this->blueGreenConfiguredStandaloneDockerDestinationIds();
+        $destinations = $this->blueGreenConfiguredStandaloneDockerDestinations();
+        if (($topologyReason = $this->blueGreenDestinationTopologyIneligibilityReason(
+            $configuredDestinationIds,
+            $destinations,
+        )) !== null) {
+            return $topologyReason;
+        }
+        if (! (bool) ($setting?->is_container_label_readonly_enabled ?? false)) {
+            return 'Blue-green deployments require generated, read-only container labels.';
+        }
+        if ($this->build_pack === 'dockercompose' || (bool) ($setting?->is_raw_compose_deployment_enabled ?? false)) {
+            return 'Blue-green deployments do not support Docker Compose applications.';
+        }
+        if (! (bool) $this->health_check_enabled && ! (bool) $this->custom_healthcheck_found) {
+            return 'Blue-green deployments require either an enabled Coolify healthcheck or a detected image healthcheck.';
+        }
+        if (str($this->fqdn)->trim()->isEmpty()) {
+            return 'Blue-green deployments require at least one FQDN.';
+        }
+        if ($this->blueGreenDeploymentBackendPort($setting) === null) {
+            return 'Blue-green deployments require exactly one valid exposed backend port; static applications use port 80 and every explicit FQDN port must match it.';
+        }
+        if (count($this->ports_mappings_array) > 0) {
+            return 'Blue-green deployments do not support ports mapped to the host.';
+        }
+        if ((bool) ($setting?->is_consistent_container_name_enabled ?? false)) {
+            return 'Blue-green deployments do not support consistent container names.';
+        }
+        if (str($setting?->custom_internal_name)->trim()->isNotEmpty()) {
+            return 'Blue-green deployments do not support custom container names.';
+        }
+        if (! empty($this->custom_network_aliases_array)) {
+            return 'Blue-green deployments do not support custom network aliases.';
+        }
+        if (str($this->custom_docker_run_options)->trim()->isNotEmpty()) {
+            return 'Blue-green deployments do not support custom Docker run options.';
+        }
+        if ($this->persistentStorages()->exists() || $this->fileStorages()->exists()) {
+            return 'Blue-green deployments require stateless applications without writable storage.';
+        }
+
+        return null;
+    }
+
+    /**
+     * @param  Collection<int, int>  $configuredDestinationIds
+     * @param  Collection<int, StandaloneDocker>  $destinations
+     */
+    public function blueGreenDestinationTopologyIneligibilityReason(
+        Collection $configuredDestinationIds,
+        Collection $destinations,
+    ): ?string {
+        if ($destinations->count() !== $configuredDestinationIds->count()) {
+            return 'Blue-green deployments require every configured standalone Docker destination to remain available.';
+        }
+        if ($destinations->isEmpty()) {
+            return 'Blue-green deployments require at least one standalone Docker destination.';
+        }
+        if ($destinations->count() !== 1) {
+            return 'Blue-green deployments support exactly one standalone Docker destination.';
+        }
+
+        foreach ($destinations as $destination) {
+            $server = $destination->server;
+            if ($server === null || $server->isSwarm()) {
+                return 'Blue-green deployments are not available for Docker Swarm destinations.';
+            }
+            if ($server->proxyType() !== ProxyTypes::TRAEFIK->value) {
+                return 'Blue-green deployments require Traefik as the proxy on every configured destination.';
+            }
+        }
+
+        return null;
+    }
+
+    public function assertBlueGreenDeletionAuthorized(): void
+    {
+        $setting = $this->settings()->first();
+        $hasState = $this->blueGreenDeployments()->exists();
+        $hasDeactivation = $this->blueGreenDeactivations()->exists();
+        if (! $this->isBlueGreenDeploymentOptedIn($setting) && ! $hasState && ! $hasDeactivation) {
+            return;
+        }
+        if (! $this->trashed()) {
+            throw new RuntimeException('Blue-green application deletion requires a durable application deletion fence and completed strict deactivation authorization.');
+        }
+        if ($hasState) {
+            throw new RuntimeException('Blue-green application deletion requires strict deactivation to remove every durable deployment state first.');
+        }
+        $deactivations = $this->blueGreenDeactivations()->get();
+        foreach ($deactivations as $deactivation) {
+            try {
+                $deactivation->assertValid();
+            } catch (\LogicException) {
+                throw new RuntimeException('Blue-green application deletion found malformed durable deactivation authorization.');
+            }
+            if ($deactivation->phase !== BlueGreenDeactivationPhase::COMPLETED) {
+                throw new RuntimeException('Blue-green application deletion requires every durable deactivation owner to complete without intervention.');
+            }
+            if ($this->deleted_at === null || ! $deactivation->started_at->gt($this->deleted_at)) {
+                throw new RuntimeException('Blue-green application deletion requires deactivation authorization created after the application deletion fence.');
+            }
+        }
+
+        $destinationIds = $this->blueGreenConfiguredStandaloneDockerDestinationIds();
+        if ($destinationIds->isEmpty()) {
+            throw new RuntimeException('Blue-green application deletion has no configured destination with durable deactivation authorization.');
+        }
+        $authorizedDestinationIds = $deactivations
+            ->pluck('standalone_docker_id')
+            ->map(fn (mixed $destinationId): int => (int) $destinationId)
+            ->unique();
+        if ($destinationIds->diff($authorizedDestinationIds)->isNotEmpty()) {
+            throw new RuntimeException('Blue-green application deletion requires completed strict deactivation authorization for every configured destination.');
+        }
+    }
+
+    public function isBlueGreenDeploymentEligible(): bool
+    {
+        return $this->blueGreenDeploymentIneligibilityReason() === null;
+    }
+
+    public function isBlueGreenDeploymentOptedIn(?ApplicationSetting $setting = null): bool
+    {
+        $setting ??= $this->settings()->first();
+
+        return (bool) ($setting?->is_blue_green_deployment_enabled ?? false);
+    }
+
+    public function isBlueGreenDeploymentEnabled(): bool
+    {
+        return $this->isBlueGreenDeploymentOptedIn() && $this->isBlueGreenDeploymentEligible();
+    }
+
+    public function blueGreenDeploymentOptOutBlockedReason(): ?string
+    {
+        $durableState = $this->blueGreenDeployments()->get([
+            'phase',
+            'active_color',
+            'pending_color',
+            'blue_deployment_uuid',
+            'green_deployment_uuid',
+            'pending_deployment_uuid',
+            'legacy_container_name',
+        ]);
+        if ($durableState->isEmpty()) {
+            return null;
+        }
+
+        $phase = $durableState
+            ->pluck('phase')
+            ->map(fn (BlueGreenDeploymentPhase $phase) => $phase->value)
+            ->unique()
+            ->implode(', ');
+        $trackedState = collect([
+            'active color' => $durableState->contains(fn (ApplicationBlueGreenDeployment $state) => $state->active_color !== null),
+            'pending color' => $durableState->contains(fn (ApplicationBlueGreenDeployment $state) => $state->pending_color !== null || $state->pending_deployment_uuid !== null),
+            'color deployments' => $durableState->contains(fn (ApplicationBlueGreenDeployment $state) => $state->blue_deployment_uuid !== null || $state->green_deployment_uuid !== null),
+            'legacy container' => $durableState->contains(fn (ApplicationBlueGreenDeployment $state) => $state->legacy_container_name !== null),
+        ])->filter()->keys()->implode(', ');
+        if ($trackedState === '') {
+            $trackedState = 'routing state';
+        }
+
+        return "Blue-green deployments cannot be disabled while durable state exists ({$trackedState}; phase: {$phase}). Stop the application and use the blue-green cleanup lifecycle first so active, pending, and legacy containers are confirmed stopped.";
     }
 
     public function workdir()
@@ -1362,11 +1982,6 @@ class Application extends BaseModel
         $base_command = 'git ls-remote';
 
         if ($this->deploymentType() === 'source') {
-            $source_html_url = data_get($this, 'source.html_url');
-            $url = parse_url(filter_var($source_html_url, FILTER_SANITIZE_URL));
-            $source_html_url_host = $url['host'];
-            $source_html_url_scheme = $url['scheme'];
-
             if ($this->source->getMorphClass() == 'App\Models\GithubApp') {
                 $escapedCustomRepository = escapeshellarg($customRepository);
                 if ($this->source->is_public) {
@@ -1374,16 +1989,24 @@ class Application extends BaseModel
                     $fullRepoUrl = "{$this->source->html_url}/{$customRepository}";
                     $base_command = "{$base_command} {$escapedRepoUrl}";
                 } else {
+                    $sourceHtmlUrl = filter_var(data_get($this, 'source.html_url'), FILTER_SANITIZE_URL);
+                    $sourceUrl = is_string($sourceHtmlUrl) ? parse_url($sourceHtmlUrl) : false;
+                    $sourceHtmlUrlHost = is_array($sourceUrl) ? ($sourceUrl['host'] ?? null) : null;
+                    $sourceHtmlUrlScheme = is_array($sourceUrl) ? ($sourceUrl['scheme'] ?? null) : null;
+                    if ($sourceHtmlUrlHost === null || $sourceHtmlUrlScheme === null) {
+                        throw new RuntimeException('The GitHub App URL must include a scheme and host.');
+                    }
+
                     $github_access_token = generateGithubInstallationToken($this->source);
                     $encodedToken = rawurlencode($github_access_token);
 
                     if ($exec_in_docker) {
-                        $repoUrl = "$source_html_url_scheme://x-access-token:$encodedToken@$source_html_url_host/{$customRepository}.git";
+                        $repoUrl = "$sourceHtmlUrlScheme://x-access-token:$encodedToken@$sourceHtmlUrlHost/{$customRepository}.git";
                         $escapedRepoUrl = escapeshellarg($repoUrl);
                         $base_command = "{$base_command} {$escapedRepoUrl}";
                         $fullRepoUrl = $repoUrl;
                     } else {
-                        $repoUrl = "$source_html_url_scheme://x-access-token:$encodedToken@$source_html_url_host/{$customRepository}";
+                        $repoUrl = "$sourceHtmlUrlScheme://x-access-token:$encodedToken@$sourceHtmlUrlHost/{$customRepository}";
                         $escapedRepoUrl = escapeshellarg($repoUrl);
                         $base_command = "{$base_command} {$escapedRepoUrl}";
                         $fullRepoUrl = $repoUrl;
@@ -2404,17 +3027,32 @@ class Application extends BaseModel
             'config.publish_directory' => 'required|string',
             'config.ports_exposes' => 'nullable|string',
             'config.settings.is_static' => 'required|boolean',
+            'config.settings.is_blue_green_deployment_enabled' => 'sometimes|boolean',
         ]);
         if ($deepValidator->fails()) {
             throw new \Exception('Invalid data');
         }
         $config = $deepValidator->validated()['config'];
 
+        $settings = data_get($config, 'settings', []);
+        data_forget($config, 'settings');
+        if (
+            array_key_exists('is_blue_green_deployment_enabled', $settings)
+            && ! filter_var($settings['is_blue_green_deployment_enabled'], FILTER_VALIDATE_BOOLEAN)
+            && ($blockedReason = $this->blueGreenDeploymentOptOutBlockedReason()) !== null
+        ) {
+            throw new RuntimeException($blockedReason);
+        }
+
         try {
-            $settings = data_get($config, 'settings', []);
-            data_forget($config, 'settings');
-            $this->update($config);
-            $this->settings()->update($settings);
+            DB::transaction(function () use ($config, $settings): void {
+                $this->update($config);
+
+                $setting = $this->settings()->firstOrFail();
+                $setting->fill($settings)->save();
+            });
+        } catch (RuntimeException $e) {
+            throw $e;
         } catch (\Exception $e) {
             throw new \Exception('Failed to update application settings');
         }

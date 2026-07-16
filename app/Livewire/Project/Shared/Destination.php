@@ -5,6 +5,7 @@ namespace App\Livewire\Project\Shared;
 use App\Actions\Application\StopApplicationOneServer;
 use App\Actions\Docker\GetContainersStatus;
 use App\Events\ApplicationStatusChanged;
+use App\Models\Application;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
 use Illuminate\Support\Collection;
@@ -117,6 +118,10 @@ class Destination extends Component
 
             $this->resource->getConnection()->transaction(function () use ($network, $server) {
                 $main_destination = $this->resource->destination;
+                if ($this->resource instanceof Application) {
+                    $this->resource->prepareBlueGreenAdditionalDestinationAddition($network);
+                }
+                $this->resource->additional_networks()->attach($main_destination->id, ['server_id' => $main_destination->server->id]);
                 $this->resource->update([
                     'destination_id' => $network->id,
                     'destination_type' => StandaloneDocker::class,
@@ -124,7 +129,6 @@ class Destination extends Component
                 $this->resource->additional_networks()
                     ->wherePivot('server_id', $server->id)
                     ->detach($network->id);
-                $this->resource->additional_networks()->attach($main_destination->id, ['server_id' => $main_destination->server->id]);
             });
             $this->resource->refresh();
             $this->refreshServers();
@@ -147,6 +151,9 @@ class Destination extends Component
             $network = StandaloneDocker::ownedByCurrentTeam()->where('server_id', $server->id)->findOrFail($network_id);
             $this->authorize('update', $this->resource);
 
+            if ($this->resource instanceof Application) {
+                $this->resource->prepareBlueGreenAdditionalDestinationAddition($network);
+            }
             $this->resource->additional_networks()->attach($network->id, ['server_id' => $server->id]);
             $this->dispatch('refresh');
         } catch (\Exception $e) {
@@ -168,6 +175,9 @@ class Destination extends Component
             }
             $server = Server::ownedByCurrentTeam()->findOrFail($server_id);
             StopApplicationOneServer::run($this->resource, $server);
+            if ($this->resource instanceof Application) {
+                $this->resource->assertBlueGreenDestinationCanBeRemoved($network_id);
+            }
             $this->resource->additional_networks()
                 ->wherePivot('server_id', $server_id)
                 ->detach($network_id);

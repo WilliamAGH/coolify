@@ -2,8 +2,11 @@
 
 namespace App\Jobs;
 
+use App\Contracts\ProxyMutation;
 use App\Models\ApplicationPreview;
 use App\Models\Server;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeEncrypted;
 use Illuminate\Contracts\Queue\ShouldBeUnique;
@@ -12,6 +15,7 @@ use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\Middleware\WithoutOverlapping;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -23,13 +27,17 @@ use Illuminate\Support\Facades\Log;
  * It scans all functional servers for containers with the `coolify.pullRequestId` label
  * and removes any where the corresponding ApplicationPreview record no longer exists.
  */
-class CleanupOrphanedPreviewContainersJob implements ShouldBeEncrypted, ShouldBeUnique, ShouldQueue
+class CleanupOrphanedPreviewContainersJob implements ProxyMutation, ShouldBeEncrypted, ShouldBeUnique, ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    use UsesProxyMutationQueue;
 
     public $timeout = 600; // 10 minutes max
 
-    public function __construct() {}
+    public function __construct()
+    {
+        ProxyMutationQueue::assign($this);
+    }
 
     public function middleware(): array
     {
@@ -38,6 +46,8 @@ class CleanupOrphanedPreviewContainersJob implements ShouldBeEncrypted, ShouldBe
 
     public function handle(): void
     {
+        ProxyMutationQueue::ensureExecutionAllowed();
+
         try {
             $servers = $this->getServersToCheck();
 
@@ -53,7 +63,7 @@ class CleanupOrphanedPreviewContainersJob implements ShouldBeEncrypted, ShouldBe
     /**
      * Get all functional servers to check for orphaned containers.
      */
-    private function getServersToCheck(): \Illuminate\Support\Collection
+    private function getServersToCheck(): Collection
     {
         $query = Server::whereRelation('settings', 'is_usable', true)
             ->whereRelation('settings', 'is_reachable', true)
@@ -99,7 +109,7 @@ class CleanupOrphanedPreviewContainersJob implements ShouldBeEncrypted, ShouldBe
     /**
      * Get all PR containers on a server (containers with pullRequestId > 0).
      */
-    private function getPRContainersOnServer(Server $server): \Illuminate\Support\Collection
+    private function getPRContainersOnServer(Server $server): Collection
     {
         try {
             $output = instant_remote_process([

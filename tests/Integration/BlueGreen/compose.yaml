@@ -1,0 +1,65 @@
+services:
+  switcher:
+    image: alpine:3.22.1@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1
+    command: ["/bin/sh", "-ec", "while :; do sleep 3600; done"]
+    restart: "no"
+    volumes:
+      - dynamic:/dynamic
+      - ./templates:/templates:ro
+    networks: [bluegreen]
+
+  legacy:
+    build: ./backend
+    restart: "no"
+    environment:
+      REVISION: legacy
+      STATE_DIRECTORY: /state
+    labels:
+      coolify.bluegreen-provider-lab: "true"
+      traefik.enable: "true"
+      traefik.http.routers.legacyrouter.entrypoints: web
+      traefik.http.routers.legacyrouter.rule: 'PathPrefix(`/`)'
+      traefik.http.routers.legacyrouter.service: legacyservice
+      traefik.http.services.legacyservice.loadbalancer.server.port: "3000"
+    volumes:
+      - transaction-state:/state
+    networks: [bluegreen]
+
+  candidate:
+    build: ./backend
+    restart: "no"
+    environment:
+      REVISION: candidate
+      STATE_DIRECTORY: /state
+    labels:
+      coolify.bluegreen-provider-lab: "true"
+      traefik.enable: "false"
+    volumes:
+      - ./probe.mjs:/probe/probe.mjs:ro
+      - ./held-traffic.mjs:/probe/held-traffic.mjs:ro
+      - ./traffic.mjs:/probe/traffic.mjs:ro
+      - transaction-state:/state
+    networks: [bluegreen]
+
+  traefik:
+    image: traefik:v3.6.17@sha256:802adc80a7bb20a6766c9385c2ad547f0de98564cd20d31d0b6d8f726f906f66
+    command: ["--configFile=/etc/traefik/traefik.yml"]
+    restart: "no"
+    depends_on:
+      candidate:
+        condition: service_started
+      legacy:
+        condition: service_started
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - dynamic:/etc/traefik/dynamic:ro
+      - ./traefik.yml:/etc/traefik/traefik.yml:ro
+    networks: [bluegreen]
+
+networks:
+  bluegreen:
+    driver: bridge
+
+volumes:
+  dynamic:
+  transaction-state:

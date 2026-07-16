@@ -2,6 +2,7 @@
 
 use App\Actions\Application\StopApplication;
 use App\Enums\ApplicationDeploymentStatus;
+use App\Exceptions\DeploymentException;
 use App\Jobs\ApplicationDeploymentJob;
 use App\Jobs\VolumeCloneJob;
 use App\Models\Application;
@@ -9,6 +10,9 @@ use App\Models\ApplicationDeploymentQueue;
 use App\Models\EnvironmentVariable;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
+use Illuminate\Contracts\Bus\Dispatcher;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 use Spatie\Url\Url;
 use Visus\Cuid2\Cuid2;
 
@@ -18,87 +22,136 @@ function queue_application_deployment(Application $application, string $deployme
     $application_id = $application->id;
     $deployment_link = Url::fromString($application->link()."/deployment/{$deployment_uuid}");
     $deployment_url = $deployment_link->getPath();
-    $server_id = $application->destination->server->id;
-    $server_name = $application->destination->server->name;
-    $destination_id = $application->destination->id;
+    $server_id = $server?->id ?? $destination?->server_id;
+    $destination_id = $destination?->id;
 
-    if ($server) {
-        $server_id = $server->id;
-        $server_name = $server->name;
-    }
-    if ($destination) {
-        $destination_id = $destination->id;
-    }
+    try {
+        $admission = DB::transaction(function () use (
+            $application_id,
+            $server_id,
+            $destination_id,
+            $deployment_uuid,
+            $deployment_url,
+            $pull_request_id,
+            $docker_registry_image_tag,
+            $force_rebuild,
+            $is_webhook,
+            $is_api,
+            $restart_only,
+            $commit,
+            $rollback,
+            $git_type,
+            $only_this_server,
+            $no_questions_asked,
+        ): array {
+            $lockedApplication = Application::withTrashed()
+                ->whereKey($application_id)
+                ->lockForUpdate()
+                ->first();
+            if ($lockedApplication === null || $lockedApplication->trashed()) {
+                return ['result' => [
+                    'status' => 'skipped',
+                    'message' => 'Application deletion is in progress; new deployment queues are permanently fenced.',
+                    'deployment_uuid' => null,
+                ]];
+            }
 
-    // Check if the deployment queue is full for this server
-    $serverForQueueCheck = $server ?? Server::find($server_id);
-    $queue_limit = $serverForQueueCheck->settings->deployment_queue_limit ?? 25;
-    $queued_count = ApplicationDeploymentQueue::where('server_id', $server_id)
-        ->where('status', ApplicationDeploymentStatus::QUEUED->value)
-        ->count();
+            $lockedApplication->settings()
+                ->lockForUpdate()
+                ->first();
 
-    if ($queued_count >= $queue_limit) {
+            $resolvedDestination = null;
+            if ($destination_id === null || $server_id === null) {
+                $resolvedDestination = $lockedApplication->destination()->first();
+            }
+            $resolvedDestinationId = $destination_id ?? $resolvedDestination?->getKey();
+            $resolvedServerId = $server_id ?? $resolvedDestination?->server_id;
+            if ($resolvedDestinationId === null || $resolvedServerId === null) {
+                return ['result' => [
+                    'status' => 'skipped',
+                    'message' => 'The deployment destination no longer exists.',
+                    'deployment_uuid' => null,
+                ]];
+            }
+
+            $lockedServer = Server::query()
+                ->whereKey($resolvedServerId)
+                ->lockForUpdate()
+                ->first();
+            if ($lockedServer === null) {
+                return ['result' => [
+                    'status' => 'skipped',
+                    'message' => 'The deployment server no longer exists.',
+                    'deployment_uuid' => null,
+                ]];
+            }
+
+            $queueLimit = $lockedServer->settings()->value('deployment_queue_limit') ?? 25;
+            $queuedCount = ApplicationDeploymentQueue::query()
+                ->where('server_id', $lockedServer->id)
+                ->where('status', ApplicationDeploymentStatus::QUEUED->value)
+                ->count();
+            if ($queuedCount >= $queueLimit) {
+                return ['result' => [
+                    'status' => 'queue_full',
+                    'message' => 'Deployment queue is full. Please wait for existing deployments to complete.',
+                ]];
+            }
+
+            $existingDeployment = ApplicationDeploymentQueue::query()
+                ->where('application_id', $lockedApplication->id)
+                ->where('commit', $commit)
+                ->where('pull_request_id', $pull_request_id)
+                ->where('docker_registry_image_tag', $docker_registry_image_tag)
+                ->whereIn('status', [
+                    ApplicationDeploymentStatus::IN_PROGRESS->value,
+                    ApplicationDeploymentStatus::QUEUED->value,
+                ])
+                ->first();
+            if ($existingDeployment !== null && ! $force_rebuild && ! $rollback && ! $no_questions_asked) {
+                return ['result' => [
+                    'status' => 'skipped',
+                    'message' => 'Deployment already queued for this commit.',
+                    'deployment_uuid' => $existingDeployment->deployment_uuid,
+                    'existing_deployment' => $existingDeployment,
+                ]];
+            }
+
+            return ['deployment' => ApplicationDeploymentQueue::create([
+                'application_id' => $lockedApplication->id,
+                'application_name' => $lockedApplication->name,
+                'server_id' => $lockedServer->id,
+                'server_name' => $lockedServer->name,
+                'destination_id' => $resolvedDestinationId,
+                'deployment_uuid' => $deployment_uuid,
+                'deployment_url' => $deployment_url,
+                'pull_request_id' => $pull_request_id,
+                'docker_registry_image_tag' => $docker_registry_image_tag,
+                'force_rebuild' => $force_rebuild,
+                'is_webhook' => $is_webhook,
+                'is_api' => $is_api,
+                'restart_only' => $restart_only,
+                'commit' => $commit,
+                'rollback' => $rollback,
+                'git_type' => $git_type,
+                'only_this_server' => $only_this_server,
+            ])];
+        }, attempts: 5);
+    } catch (DeploymentException $exception) {
         return [
-            'status' => 'queue_full',
-            'message' => 'Deployment queue is full. Please wait for existing deployments to complete.',
+            'status' => 'skipped',
+            'message' => $exception->getMessage(),
+            'deployment_uuid' => null,
         ];
     }
 
-    // Check if there's already a deployment in progress or queued for this application and commit
-    $existing_deployment = ApplicationDeploymentQueue::where('application_id', $application_id)
-        ->where('commit', $commit)
-        ->where('pull_request_id', $pull_request_id)
-        ->where('docker_registry_image_tag', $docker_registry_image_tag)
-        ->whereIn('status', [ApplicationDeploymentStatus::IN_PROGRESS->value, ApplicationDeploymentStatus::QUEUED->value])
-        ->first();
-
-    if ($existing_deployment) {
-        // If force_rebuild is true or rollback is true or no_questions_asked is true, we'll still create a new deployment
-        if (! $force_rebuild && ! $rollback && ! $no_questions_asked) {
-            // Return the existing deployment's details
-            return [
-                'status' => 'skipped',
-                'message' => 'Deployment already queued for this commit.',
-                'deployment_uuid' => $existing_deployment->deployment_uuid,
-                'existing_deployment' => $existing_deployment,
-            ];
-        }
+    if (isset($admission['result'])) {
+        return $admission['result'];
     }
+    $deployment = $admission['deployment'];
 
-    $deployment = ApplicationDeploymentQueue::create([
-        'application_id' => $application_id,
-        'application_name' => $application->name,
-        'server_id' => $server_id,
-        'server_name' => $server_name,
-        'destination_id' => $destination_id,
-        'deployment_uuid' => $deployment_uuid,
-        'deployment_url' => $deployment_url,
-        'pull_request_id' => $pull_request_id,
-        'docker_registry_image_tag' => $docker_registry_image_tag,
-        'force_rebuild' => $force_rebuild,
-        'is_webhook' => $is_webhook,
-        'is_api' => $is_api,
-        'restart_only' => $restart_only,
-        'commit' => $commit,
-        'rollback' => $rollback,
-        'git_type' => $git_type,
-        'only_this_server' => $only_this_server,
-    ]);
-
-    if ($no_questions_asked) {
-        $deployment->update([
-            'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
-        ]);
-        ApplicationDeploymentJob::dispatch(
-            application_deployment_queue_id: $deployment->id,
-        );
-    } elseif (next_queuable($server_id, $application_id, $commit, $pull_request_id)) {
-        $deployment->update([
-            'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
-        ]);
-        ApplicationDeploymentJob::dispatch(
-            application_deployment_queue_id: $deployment->id,
-        );
+    if ($deployment->claimForDispatch(bypassServerCapacity: $no_questions_asked)) {
+        dispatch_claimed_application_deployment($deployment);
     }
 
     return [
@@ -109,85 +162,75 @@ function queue_application_deployment(Application $application, string $deployme
 }
 function force_start_deployment(ApplicationDeploymentQueue $deployment)
 {
-    $deployment->update([
-        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
-    ]);
+    if (! $deployment->claimForDispatch(bypassServerCapacity: true)) {
+        return false;
+    }
 
-    ApplicationDeploymentJob::dispatch(
-        application_deployment_queue_id: $deployment->id,
-    );
+    dispatch_claimed_application_deployment($deployment);
+
+    return true;
 }
 function queue_next_deployment(Application $application)
 {
     $server_id = $application->destination->server_id;
     $queued_deployments = ApplicationDeploymentQueue::where('server_id', $server_id)
-        ->where('status', ApplicationDeploymentStatus::QUEUED)
+        ->where('status', ApplicationDeploymentStatus::QUEUED->value)
         ->get()
         ->sortBy('created_at');
 
     foreach ($queued_deployments as $next_deployment) {
-        // Check if this queued deployment can actually run
-        if (next_queuable($next_deployment->server_id, $next_deployment->application_id, $next_deployment->commit, $next_deployment->pull_request_id)) {
-            $next_deployment->update([
-                'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
-            ]);
-
-            ApplicationDeploymentJob::dispatch(
-                application_deployment_queue_id: $next_deployment->id,
-            );
+        if ($next_deployment->claimForDispatch()) {
+            dispatch_claimed_application_deployment($next_deployment);
         }
     }
-}
-
-function next_queuable(string $server_id, string $application_id, string $commit = 'HEAD', int $pull_request_id = 0): bool
-{
-    // Check if there's already a deployment in progress for this application with the same pull_request_id
-    // This allows normal deployments and PR deployments to run concurrently
-    $in_progress = ApplicationDeploymentQueue::where('application_id', $application_id)
-        ->where('pull_request_id', $pull_request_id)
-        ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
-        ->exists();
-
-    if ($in_progress) {
-        return false;
-    }
-
-    // Check server's concurrent build limit
-    $server = Server::find($server_id);
-    $concurrent_builds = $server->settings->concurrent_builds;
-    $active_deployments = ApplicationDeploymentQueue::where('server_id', $server_id)
-        ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
-        ->count();
-
-    if ($active_deployments >= $concurrent_builds) {
-        return false;
-    }
-
-    return true;
 }
 function next_after_cancel(?Server $server = null)
 {
     if ($server) {
         $next_found = ApplicationDeploymentQueue::where('server_id', data_get($server, 'id'))
-            ->where('status', ApplicationDeploymentStatus::QUEUED)
+            ->where('status', ApplicationDeploymentStatus::QUEUED->value)
             ->get()
             ->sortBy('created_at');
 
         if ($next_found->count() > 0) {
             foreach ($next_found as $next) {
-                // Use next_queuable to properly check if this deployment can run
-                if (next_queuable($next->server_id, $next->application_id, $next->commit, $next->pull_request_id)) {
-                    $next->update([
-                        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
-                    ]);
-
-                    ApplicationDeploymentJob::dispatch(
-                        application_deployment_queue_id: $next->id,
-                    );
+                if ($next->claimForDispatch()) {
+                    dispatch_claimed_application_deployment($next);
                 }
             }
         }
     }
+}
+
+function dispatch_claimed_application_deployment(ApplicationDeploymentQueue $deployment): bool
+{
+    DB::afterCommit(static function () use ($deployment): void {
+        $deployment->refresh();
+        $dispatchAttemptUuid = $deployment->horizon_job_id;
+        if (! is_string($dispatchAttemptUuid) || ! Str::isUuid($dispatchAttemptUuid)) {
+            throw new DeploymentException('The claimed deployment has no durable dispatch attempt identity.');
+        }
+
+        $job = (new ApplicationDeploymentJob(
+            application_deployment_queue_id: $deployment->id,
+            dispatch_attempt_uuid: $dispatchAttemptUuid,
+        ))->afterCommit();
+        app(Dispatcher::class)->dispatch($job);
+    });
+
+    return true;
+}
+
+function recover_stale_application_deployment_dispatches(
+    int $staleAfterSeconds = ApplicationDeploymentQueue::DISPATCH_STALE_AFTER_SECONDS,
+): int {
+    $recovered = ApplicationDeploymentQueue::recoverStaleDispatchAttempts($staleAfterSeconds);
+
+    foreach ($recovered as $deployment) {
+        dispatch_claimed_application_deployment($deployment);
+    }
+
+    return $recovered->count();
 }
 
 function clone_application(Application $source, $destination, array $overrides = [], bool $cloneVolumeData = false): Application

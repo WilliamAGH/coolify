@@ -1,0 +1,18 @@
+http:
+  routers:
+    managed-router:
+      rule: PathPrefix(`/`)
+      entryPoints: [web]
+      service: legacy-bridge-service
+      middlewares: [legacy-bridge-proof]
+      priority: 16
+  middlewares:
+    legacy-bridge-proof:
+      headers:
+        customResponseHeaders:
+          X-Coolify-Probe-Ack: "3333333333333333333333333333333333333333333333333333333333333333"
+  services:
+    legacy-bridge-service:
+      loadBalancer:
+        servers:
+          - url: http://legacy:3000

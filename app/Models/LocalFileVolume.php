@@ -43,6 +43,12 @@ class LocalFileVolume extends BaseModel
 
     protected static function booted()
     {
+        static::creating(function (LocalFileVolume $fileVolume): void {
+            Application::findBlueGreenStorageApplication(
+                $fileVolume->resource_type,
+                $fileVolume->resource_id,
+            )?->prepareBlueGreenStorageAddition();
+        });
         static::created(function (LocalFileVolume $fileVolume) {
             $fileVolume->load(['service']);
             dispatch(new ServerStorageSaveJob($fileVolume));

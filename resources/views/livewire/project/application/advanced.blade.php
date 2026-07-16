@@ -87,6 +87,17 @@
                     instantSave id="isStripprefixEnabled" label="Strip Prefixes" canGate="update" :canResource="$application" />
             @endif
             <h3 class="pt-4">Operations</h3>
+            @php
+                $blueGreenIneligibilityReason = $application->blueGreenDeploymentIneligibilityReason();
+                $blueGreenHelper = 'Blue-green deployments keep two stateless application colors and switch generated Traefik routes only after the pending color is healthy. This is a strict stateless scope: standalone non-Swarm Traefik, generated labels, an enabled healthcheck and FQDN, exactly one backend port (static applications use port 80), and no Docker Compose, host ports, custom Docker options or network aliases, custom or consistent container names, or writable storage. Because readiness and switching overlap two revisions, applications must be safe for concurrent execution and coordinate singleton or background work externally. After managed state exists, stop the application and use the blue-green cleanup lifecycle before disabling this setting.';
+                if ($blueGreenIneligibilityReason) {
+                    $blueGreenHelper .= '<br><br><span class="font-bold dark:text-warning">Unavailable: '.e($blueGreenIneligibilityReason).'</span>';
+                }
+            @endphp
+            <x-forms.checkbox
+                :helper="$blueGreenHelper"
+                instantSave="saveBlueGreenDeployment" id="isBlueGreenDeploymentEnabled" label="Blue-Green Deployments"
+                :disabled="$blueGreenIneligibilityReason !== null && !$isBlueGreenDeploymentEnabled" canGate="update" :canResource="$application" />
             <form class="flex items-end gap-2" wire:submit.prevent='saveStopGracePeriod'>
                 <x-forms.input
                     type="number"

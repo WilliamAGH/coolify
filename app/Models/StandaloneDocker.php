@@ -22,6 +22,14 @@ class StandaloneDocker extends BaseModel
     protected static function boot()
     {
         parent::boot();
+        static::saving(function (StandaloneDocker $standaloneDocker): void {
+            if ($standaloneDocker->isDirty(['server_id', 'network'])) {
+                $standaloneDocker->assertBlueGreenTopologyCanChange();
+            }
+        });
+        static::deleting(function (StandaloneDocker $standaloneDocker): void {
+            $standaloneDocker->assertBlueGreenTopologyCanChange();
+        });
         static::created(function ($newStandaloneDocker) {
             $server = $newStandaloneDocker->server;
             $safeNetwork = escapeshellarg($newStandaloneDocker->network);
@@ -145,5 +153,14 @@ class StandaloneDocker extends BaseModel
     public function attachedTo()
     {
         return $this->applications?->count() > 0 || $this->databases()->count() > 0;
+    }
+
+    private function assertBlueGreenTopologyCanChange(): void
+    {
+        if (! Application::hasBlueGreenTopologyProtectionForStandaloneDockerIds([$this->id])) {
+            return;
+        }
+
+        throw new \RuntimeException('A Docker destination with an opted-in or durable blue-green application cannot change topology or be removed. Disable blue-green deployment and complete its cleanup lifecycle first.');
     }
 }

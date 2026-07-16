@@ -1,0 +1,14 @@
+entryPoints:
+  http:
+    address: :80
+
+providers:
+  file:
+    directory: /dynamic
+    watch: true
+
+accessLog:
+  format: json
+
+log:
+  level: INFO

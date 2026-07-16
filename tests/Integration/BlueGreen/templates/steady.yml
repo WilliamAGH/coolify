@@ -1,0 +1,17 @@
+http:
+  routers:
+    candidatesteady:
+      entryPoints: [web]
+      middlewares: [candidatesteadyproof]
+      rule: PathPrefix(`/`)
+      service: candidateservice
+  middlewares:
+    candidatesteadyproof:
+      headers:
+        customResponseHeaders:
+          X-Coolify-Blue-Green-Phase: steady
+  services:
+    candidateservice:
+      loadBalancer:
+        servers:
+          - url: http://candidate:3000

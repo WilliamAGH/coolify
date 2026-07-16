@@ -44,7 +44,11 @@ class DeploymentNavbar extends Component
     public function force_start()
     {
         try {
-            force_start_deployment($this->application_deployment_queue);
+            if (! force_start_deployment($this->application_deployment_queue)) {
+                $this->application_deployment_queue->refresh();
+                $this->dispatch('refreshQueue');
+                $this->dispatch('warning', 'This deployment could not be force-started because its queue state or application deployment slot changed. The queue has been refreshed.');
+            }
         } catch (\Throwable $e) {
             return handleError($e, $this);
         }

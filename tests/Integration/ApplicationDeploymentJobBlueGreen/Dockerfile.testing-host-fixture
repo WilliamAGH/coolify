@@ -1,0 +1,20 @@
+# syntax=docker/dockerfile:1
+
+FROM docker:28.4.0-dind@sha256:2ceb471176ad51e37145d43ce7cbf0fa5d644a2b185bd537f0ef695fb3a37497
+
+USER root
+WORKDIR /root
+ENV PATH="/host/usr/local/sbin:/host/usr/local/bin:/host/usr/sbin:/host/usr/bin:/host/sbin:/host/bin:$PATH"
+
+RUN apk upgrade --no-cache \
+    && apk add --no-cache bash ca-certificates openssh-client openssh-server curl git jq jc \
+    && rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub \
+    && install -d -m 755 /run/sshd /root/.docker/cli-plugins
+
+COPY docker/testing-host/keygen.sh /usr/local/bin/coolify-testing-host-keygen
+COPY docker/testing-host/entrypoint.sh /usr/local/bin/coolify-testing-host-entrypoint
+RUN chmod 755 /usr/local/bin/coolify-testing-host-keygen /usr/local/bin/coolify-testing-host-entrypoint
+
+ENTRYPOINT []
+EXPOSE 22
+CMD ["/bin/sh", "/usr/local/bin/coolify-testing-host-entrypoint"]

@@ -1,0 +1,382 @@
+<?php
+
+namespace App\Actions\Application\BlueGreen;
+
+use App\Actions\Proxy\BlueGreenProxyConfiguration;
+use App\Actions\Proxy\BlueGreenRoutingTarget;
+use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
+use App\Enums\BlueGreenDeactivationPhase;
+use App\Enums\BlueGreenDeploymentColor;
+use App\Enums\BlueGreenDeploymentPhase;
+use App\Models\Application;
+use App\Models\ApplicationBlueGreenDeactivation;
+use App\Models\ApplicationBlueGreenDeployment;
+use App\Models\ApplicationDeploymentQueue;
+use App\Models\ApplicationSetting;
+use App\Models\StandaloneDocker;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Support\Facades\DB;
+use Lorisleiva\Actions\Concerns\AsAction;
+
+class ClaimBlueGreenDeployment
+{
+    use AsAction;
+
+    public function handle(
+        Application $application,
+        StandaloneDocker $standaloneDocker,
+        ApplicationDeploymentQueue $deployment,
+        ?string $detectedLegacyContainerName = null,
+        ?BlueGreenContainerExpectation $previousContainer = null,
+    ): BlueGreenDeploymentClaim {
+        return DB::transaction(function () use ($application, $standaloneDocker, $deployment, $detectedLegacyContainerName, $previousContainer): BlueGreenDeploymentClaim {
+            $lockedApplication = Application::withTrashed()
+                ->whereKey($application->id)
+                ->lockForUpdate()
+                ->first();
+            if ($lockedApplication === null || $lockedApplication->trashed()) {
+                throw new BlueGreenDeploymentTransitionException('Application deletion is in progress; blue-green deployment claims are permanently fenced.');
+            }
+
+            $setting = ApplicationSetting::query()
+                ->where('application_id', $lockedApplication->id)
+                ->lockForUpdate()
+                ->first();
+            if ($setting === null) {
+                throw new BlueGreenDeploymentTransitionException('The application has no durable settings row for a blue-green deployment claim.');
+            }
+            $lockedApplication->setRelation('settings', $setting);
+
+            $destination = StandaloneDocker::query()
+                ->with('server')
+                ->whereKey($standaloneDocker->id)
+                ->first();
+            if ($destination === null || $destination->server === null) {
+                throw new BlueGreenDeploymentTransitionException('The standalone Docker destination no longer has a server.');
+            }
+
+            if (! $lockedApplication->isBlueGreenDeploymentOptedIn($setting)) {
+                throw new BlueGreenDeploymentTransitionException('Blue-green deployment opt-in was disabled before this claim could be committed.');
+            }
+            $lockedApplication->setRelation('destination', $destination);
+            if (($ineligibilityReason = $lockedApplication->blueGreenDeploymentIneligibilityReason($setting)) !== null) {
+                throw new BlueGreenDeploymentTransitionException("Blue-green deployment is no longer eligible: {$ineligibilityReason}");
+            }
+
+            ApplicationBlueGreenDeployment::query()->fillAndInsertOrIgnore([
+                'application_id' => $lockedApplication->id,
+                'standalone_docker_id' => $destination->id,
+            ]);
+            $state = ApplicationBlueGreenDeployment::query()
+                ->where('application_id', $lockedApplication->id)
+                ->where('standalone_docker_id', $destination->id)
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->firstOrFail();
+            $deactivation = ApplicationBlueGreenDeactivation::query()
+                ->where('application_id', $lockedApplication->id)
+                ->where('standalone_docker_id', $destination->id)
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->first();
+            $queueDeploymentUuids = collect([
+                $deployment->deployment_uuid,
+                $state->blue_deployment_uuid,
+                $state->green_deployment_uuid,
+                $state->pending_deployment_uuid,
+                $state->operation_deployment_uuid,
+                $state->operation_previous_deployment_uuid,
+            ])
+                ->filter(static fn (mixed $deploymentUuid): bool => is_string($deploymentUuid) && $deploymentUuid !== '')
+                ->unique()
+                ->values();
+            $lockedDeployment = ApplicationDeploymentQueue::query()
+                ->where('application_id', $lockedApplication->id)
+                ->whereIn('deployment_uuid', $queueDeploymentUuids)
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get()
+                ->firstWhere('id', $deployment->getKey());
+            if ($lockedDeployment === null) {
+                throw new BlueGreenDeploymentTransitionException('The deployment queue entry no longer exists.');
+            }
+
+            $this->assertDeploymentScope($lockedApplication, $destination, $lockedDeployment);
+            $this->assertDeploymentIsPrimaryProductionQueue($lockedDeployment);
+            $this->assertNotFencedByDeactivation($deactivation, $lockedDeployment);
+            $this->assertStateIsIdle($state);
+            $this->assertDeploymentIsUnclaimed($lockedDeployment);
+
+            $pendingColor = match ($state->active_color) {
+                null => BlueGreenDeploymentColor::BLUE,
+                BlueGreenDeploymentColor::BLUE => BlueGreenDeploymentColor::GREEN,
+                BlueGreenDeploymentColor::GREEN => BlueGreenDeploymentColor::BLUE,
+            };
+            $legacyContainerName = $this->resolveLegacyContainerName($state, $detectedLegacyContainerName);
+            $expectedRoutingRevision = $state->routing_revision + 1;
+            $claim = new BlueGreenDeploymentClaim(
+                stateId: $state->id,
+                applicationId: $lockedApplication->id,
+                standaloneDockerId: $destination->id,
+                pendingColor: $pendingColor,
+                previousActiveColor: $state->active_color,
+                deploymentUuid: $lockedDeployment->deployment_uuid,
+                expectedRoutingRevision: $expectedRoutingRevision,
+                legacyContainerName: $legacyContainerName,
+                candidateContainerName: $lockedApplication->uuid.'-'.$pendingColor->value,
+                rollbackManagedFilename: $this->rollbackManagedFilename(
+                    $lockedApplication,
+                    $destination,
+                    $state->active_color ?? $pendingColor,
+                    $expectedRoutingRevision,
+                ),
+            );
+            $candidateContainer = $this->candidateContainer($claim);
+            $this->assertPreviousContainer($claim, $previousContainer);
+
+            $stateUpdated = $this->exactStateQuery($state)
+                ->update([
+                    'pending_color' => $pendingColor->value,
+                    'pending_deployment_uuid' => $lockedDeployment->deployment_uuid,
+                    'legacy_container_name' => $legacyContainerName,
+                    'operation_deployment_uuid' => $lockedDeployment->deployment_uuid,
+                    'operation_previous_active_color' => $state->active_color?->value,
+                    'operation_previous_deployment_uuid' => $previousContainer?->deploymentUuid,
+                    'operation_previous_routing_revision' => $previousContainer?->routingRevision,
+                    'operation_previous_container_name' => $previousContainer?->name,
+                    'operation_previous_container_id' => $previousContainer?->dockerId,
+                    'operation_candidate_container_name' => $candidateContainer->name,
+                    'operation_candidate_container_id' => null,
+                    'operation_rollback_managed_filename' => $claim->rollbackManagedFilename,
+                    'operation_routing_mutated_at' => null,
+                    'operation_legacy_routing_snapshot_version' => null,
+                    'operation_legacy_routing_snapshot' => null,
+                    'operation_legacy_routing_snapshot_sha256' => null,
+                    'phase' => BlueGreenDeploymentPhase::PREPARING->value,
+                    'routing_revision' => $expectedRoutingRevision,
+                ]);
+
+            if ($stateUpdated !== 1) {
+                throw new BlueGreenDeploymentTransitionException('The blue-green deployment state changed while it was being claimed.');
+            }
+
+            $deploymentUpdated = ApplicationDeploymentQueue::query()
+                ->whereKey($lockedDeployment->getKey())
+                ->where('application_id', $lockedApplication->id)
+                ->whereNull('blue_green_color')
+                ->whereNull('blue_green_phase')
+                ->whereNull('blue_green_routing_revision')
+                ->whereNull('blue_green_previous_container_id')
+                ->whereNull('blue_green_candidate_container_id')
+                ->whereNull('blue_green_rollback_managed_filename')
+                ->whereNull('blue_green_routing_mutated_at')
+                ->update([
+                    'blue_green_color' => $pendingColor->value,
+                    'blue_green_phase' => BlueGreenDeploymentPhase::PREPARING->value,
+                    'blue_green_routing_revision' => $expectedRoutingRevision,
+                    'blue_green_previous_container_id' => $previousContainer?->dockerId,
+                    'blue_green_candidate_container_id' => null,
+                    'blue_green_rollback_managed_filename' => $claim->rollbackManagedFilename,
+                    'blue_green_routing_mutated_at' => null,
+                ]);
+
+            if ($deploymentUpdated !== 1) {
+                throw new BlueGreenDeploymentTransitionException('The deployment queue entry changed while blue-green ownership was being claimed.');
+            }
+
+            return $claim;
+        }, attempts: 5);
+    }
+
+    private function assertDeploymentScope(
+        Application $application,
+        StandaloneDocker $standaloneDocker,
+        ApplicationDeploymentQueue $deployment,
+    ): void {
+        if ((int) $deployment->application_id !== $application->id) {
+            throw new BlueGreenDeploymentTransitionException('The deployment queue entry does not belong to this application.');
+        }
+
+        if ((int) $deployment->destination_id !== $standaloneDocker->id) {
+            throw new BlueGreenDeploymentTransitionException('The deployment queue destination does not match the standalone Docker destination.');
+        }
+
+        if ((int) $deployment->server_id !== $standaloneDocker->server_id) {
+            throw new BlueGreenDeploymentTransitionException('The deployment queue server does not own the standalone Docker destination.');
+        }
+
+        $isPrimaryDestination = (int) $application->destination_id === $standaloneDocker->id
+            && $application->destination_type === $standaloneDocker->getMorphClass();
+        $isConfiguredDestination = $isPrimaryDestination
+            || $application->additional_networks()
+                ->whereKey($standaloneDocker->id)
+                ->wherePivot('server_id', $standaloneDocker->server_id)
+                ->exists();
+
+        if (! $isConfiguredDestination) {
+            throw new BlueGreenDeploymentTransitionException('The standalone Docker destination is not configured for this application.');
+        }
+    }
+
+    private function assertDeploymentIsPrimaryProductionQueue(ApplicationDeploymentQueue $deployment): void
+    {
+        if ($deployment->pull_request_id !== 0) {
+            throw new BlueGreenDeploymentTransitionException('Pull-request deployment queues cannot claim the blue-green lifecycle.');
+        }
+    }
+
+    private function assertNotFencedByDeactivation(
+        ?ApplicationBlueGreenDeactivation $deactivation,
+        ApplicationDeploymentQueue $deployment,
+    ): void {
+        if ($deactivation === null) {
+            return;
+        }
+
+        try {
+            $deactivation->assertValid();
+        } catch (\LogicException $exception) {
+            throw new BlueGreenDeploymentTransitionException('The blue-green deactivation fence is malformed.', 0, $exception);
+        }
+        if ($deactivation->phase === BlueGreenDeactivationPhase::DEACTIVATING || $deactivation->fences($deployment)) {
+            throw new BlueGreenDeploymentTransitionException('The deployment queue is fenced by a blue-green deactivation.');
+        }
+    }
+
+    private function assertStateIsIdle(ApplicationBlueGreenDeployment $state): void
+    {
+        if ($state->phase !== BlueGreenDeploymentPhase::IDLE
+            || $state->pending_color !== null
+            || $state->pending_deployment_uuid !== null
+            || $state->deactivation_operation_id !== null
+            || $state->deactivation_started_at !== null) {
+            throw new BlueGreenDeploymentTransitionException('A blue-green deployment is already pending for this application destination.');
+        }
+        foreach (ApplicationBlueGreenDeployment::clearedOperationAttributes() as $attribute => $_) {
+            if ($state->{$attribute} !== null) {
+                throw new BlueGreenDeploymentTransitionException('The blue-green deployment state has unfinished operation provenance.');
+            }
+        }
+    }
+
+    private function assertDeploymentIsUnclaimed(ApplicationDeploymentQueue $deployment): void
+    {
+        if ($deployment->blue_green_color !== null
+            || $deployment->blue_green_phase !== null
+            || $deployment->blue_green_routing_revision !== null
+            || $deployment->blue_green_previous_container_id !== null
+            || $deployment->blue_green_candidate_container_id !== null
+            || $deployment->blue_green_rollback_managed_filename !== null
+            || $deployment->blue_green_routing_mutated_at !== null) {
+            throw new BlueGreenDeploymentTransitionException('The deployment queue entry already has blue-green provenance.');
+        }
+    }
+
+    private function assertPreviousContainer(
+        BlueGreenDeploymentClaim $claim,
+        ?BlueGreenContainerExpectation $previousContainer,
+    ): void {
+        if ($previousContainer === null) {
+            if ($claim->previousActiveColor !== null || $claim->legacyContainerName !== null) {
+                throw new BlueGreenDeploymentTransitionException('The claimed previous target is missing immutable container provenance.');
+            }
+
+            return;
+        }
+        if ($previousContainer->dockerId === null
+            || $previousContainer->applicationId !== $claim->applicationId
+            || $previousContainer->pullRequestId !== 0
+            || $previousContainer->color !== $claim->previousActiveColor) {
+            throw new BlueGreenDeploymentTransitionException('The previous target expectation does not match the claimed blue-green operation.');
+        }
+        if ($claim->previousActiveColor === null
+            && ($previousContainer->blueGreenManaged || $previousContainer->name !== $claim->legacyContainerName)) {
+            throw new BlueGreenDeploymentTransitionException('The legacy rollback target does not match the durable claim.');
+        }
+        if ($claim->previousActiveColor !== null && ! $previousContainer->blueGreenManaged) {
+            throw new BlueGreenDeploymentTransitionException('A fixed-color rollback target requires fixed-color provenance.');
+        }
+    }
+
+    private function candidateContainer(BlueGreenDeploymentClaim $claim): BlueGreenContainerExpectation
+    {
+        return new BlueGreenContainerExpectation(
+            name: $claim->candidateContainerName
+                ?? throw new BlueGreenDeploymentTransitionException('The blue-green claim has no candidate container identity.'),
+            dockerId: null,
+            applicationId: $claim->applicationId,
+            pullRequestId: 0,
+            blueGreenManaged: true,
+            deploymentUuid: $claim->deploymentUuid,
+            color: $claim->pendingColor,
+            routingRevision: $claim->expectedRoutingRevision,
+        );
+    }
+
+    private function rollbackManagedFilename(
+        Application $application,
+        StandaloneDocker $destination,
+        BlueGreenDeploymentColor $activeColor,
+        int $routingRevision,
+    ): string {
+        $port = $application->blueGreenDeploymentBackendPort($application->settings)
+            ?? throw new BlueGreenDeploymentTransitionException('The claimed blue-green application has no exact backend port.');
+        $configuration = CompileBlueGreenProxyConfiguration::run(
+            $application,
+            $destination,
+            new BlueGreenRoutingTarget(
+                destinationId: $destination->id,
+                activeColor: $activeColor,
+                blueContainerName: $application->uuid.'-blue',
+                greenContainerName: $application->uuid.'-green',
+                port: $port,
+                routingRevision: $routingRevision,
+            ),
+        );
+        BlueGreenProxyConfiguration::assertManagedFilename($configuration->managedFilename);
+
+        return $configuration->managedFilename;
+    }
+
+    private function resolveLegacyContainerName(
+        ApplicationBlueGreenDeployment $state,
+        ?string $detectedLegacyContainerName,
+    ): ?string {
+        if ($state->active_color !== null) {
+            return $state->legacy_container_name;
+        }
+
+        if ($state->legacy_container_name !== null
+            && $detectedLegacyContainerName !== null
+            && $state->legacy_container_name !== $detectedLegacyContainerName) {
+            throw new BlueGreenDeploymentTransitionException('The detected legacy container does not match the durable blue-green state.');
+        }
+
+        return $state->legacy_container_name ?? $detectedLegacyContainerName;
+    }
+
+    private function exactStateQuery(ApplicationBlueGreenDeployment $state): Builder
+    {
+        $query = ApplicationBlueGreenDeployment::query()
+            ->whereKey($state->getKey())
+            ->where('application_id', $state->application_id)
+            ->where('standalone_docker_id', $state->standalone_docker_id)
+            ->where('phase', BlueGreenDeploymentPhase::IDLE->value)
+            ->whereNull('pending_color')
+            ->whereNull('pending_deployment_uuid')
+            ->whereNull('deactivation_operation_id')
+            ->whereNull('deactivation_started_at')
+            ->where('routing_revision', $state->routing_revision);
+
+        foreach (ApplicationBlueGreenDeployment::clearedOperationAttributes() as $attribute => $_) {
+            $query->whereNull($attribute);
+        }
+        $query = $state->active_color === null
+            ? $query->whereNull('active_color')
+            : $query->where('active_color', $state->active_color->value);
+
+        return $state->legacy_container_name === null
+            ? $query->whereNull('legacy_container_name')
+            : $query->where('legacy_container_name', $state->legacy_container_name);
+    }
+}

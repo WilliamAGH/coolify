@@ -13,6 +13,15 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 
 uses(RefreshDatabase::class);
 
+function createUserDeletionPrivateKey(Team $team, string $name): PrivateKey
+{
+    return PrivateKey::create([
+        'name' => $name,
+        'private_key' => generateSSHKey('ed25519')['private'],
+        'team_id' => $team->id,
+    ]);
+}
+
 beforeEach(function () {
     // Create root team and admin user (instance admin)
     $this->rootTeam = Team::factory()->create(['id' => 0, 'name' => 'Root Team']);
@@ -28,14 +37,14 @@ it('deletes a user whose team has a github app with applications', function () {
     $targetTeam = $targetUser->teams()->first(); // created by User::created event
 
     // Create a private key for the team
-    $privateKey = PrivateKey::factory()->create(['team_id' => $targetTeam->id]);
+    $privateKey = createUserDeletionPrivateKey($targetTeam, 'Target team key');
 
     // Create a server and destination for the team
     $server = Server::factory()->create([
         'team_id' => $targetTeam->id,
         'private_key_id' => $privateKey->id,
     ]);
-    $destination = StandaloneDocker::factory()->create(['server_id' => $server->id]);
+    $destination = StandaloneDocker::where('server_id', $server->id)->firstOrFail();
 
     // Create a project and environment
     $project = Project::factory()->create(['team_id' => $targetTeam->id]);
@@ -75,7 +84,7 @@ it('deletes a user whose team has a github app with applications', function () {
 
 it('does not delete system-wide github apps when deleting a different team', function () {
     // Create a system-wide GitHub App owned by the root team
-    $rootPrivateKey = PrivateKey::factory()->create(['team_id' => $this->rootTeam->id]);
+    $rootPrivateKey = createUserDeletionPrivateKey($this->rootTeam, 'Root team key');
     $systemGithubApp = GithubApp::create([
         'name' => 'System GitHub App',
         'team_id' => $this->rootTeam->id,
@@ -91,12 +100,12 @@ it('does not delete system-wide github apps when deleting a different team', fun
     $targetTeam = $targetUser->teams()->first();
 
     // Create an application on the target team that uses the system-wide GitHub App
-    $privateKey = PrivateKey::factory()->create(['team_id' => $targetTeam->id]);
+    $privateKey = createUserDeletionPrivateKey($targetTeam, 'Target team key');
     $server = Server::factory()->create([
         'team_id' => $targetTeam->id,
         'private_key_id' => $privateKey->id,
     ]);
-    $destination = StandaloneDocker::factory()->create(['server_id' => $server->id]);
+    $destination = StandaloneDocker::where('server_id', $server->id)->firstOrFail();
     $project = Project::factory()->create(['team_id' => $targetTeam->id]);
     $environment = Environment::factory()->create(['project_id' => $project->id]);
 
@@ -123,7 +132,7 @@ it('transfers instance-wide github app to root team when owning user is deleted'
     $targetUser = User::factory()->create();
     $targetTeam = $targetUser->teams()->first();
 
-    $targetPrivateKey = PrivateKey::factory()->create(['team_id' => $targetTeam->id]);
+    $targetPrivateKey = createUserDeletionPrivateKey($targetTeam, 'Target team key');
     $instanceWideApp = GithubApp::create([
         'name' => 'Instance-Wide GitHub App',
         'team_id' => $targetTeam->id,
@@ -135,12 +144,12 @@ it('transfers instance-wide github app to root team when owning user is deleted'
     ]);
 
     // Create an application on the ROOT team that uses this instance-wide GitHub App
-    $rootPrivateKey = PrivateKey::factory()->create(['team_id' => $this->rootTeam->id]);
+    $rootPrivateKey = createUserDeletionPrivateKey($this->rootTeam, 'Root team key');
     $rootServer = Server::factory()->create([
         'team_id' => $this->rootTeam->id,
         'private_key_id' => $rootPrivateKey->id,
     ]);
-    $rootDestination = StandaloneDocker::factory()->create(['server_id' => $rootServer->id]);
+    $rootDestination = StandaloneDocker::where('server_id', $rootServer->id)->firstOrFail();
     $rootProject = Project::factory()->create(['team_id' => $this->rootTeam->id]);
     $rootEnvironment = Environment::factory()->create(['project_id' => $rootProject->id]);
 
@@ -174,7 +183,7 @@ it('transfers instance-wide github app to root team when team is deleted directl
     $targetUser = User::factory()->create();
     $targetTeam = $targetUser->teams()->first();
 
-    $targetPrivateKey = PrivateKey::factory()->create(['team_id' => $targetTeam->id]);
+    $targetPrivateKey = createUserDeletionPrivateKey($targetTeam, 'Target team key');
     $instanceWideApp = GithubApp::create([
         'name' => 'Instance-Wide GitHub App',
         'team_id' => $targetTeam->id,
@@ -186,12 +195,12 @@ it('transfers instance-wide github app to root team when team is deleted directl
     ]);
 
     // Create an application on the ROOT team that uses this instance-wide GitHub App
-    $rootPrivateKey = PrivateKey::factory()->create(['team_id' => $this->rootTeam->id]);
+    $rootPrivateKey = createUserDeletionPrivateKey($this->rootTeam, 'Root team key');
     $rootServer = Server::factory()->create([
         'team_id' => $this->rootTeam->id,
         'private_key_id' => $rootPrivateKey->id,
     ]);
-    $rootDestination = StandaloneDocker::factory()->create(['server_id' => $rootServer->id]);
+    $rootDestination = StandaloneDocker::where('server_id', $rootServer->id)->firstOrFail();
     $rootProject = Project::factory()->create(['team_id' => $this->rootTeam->id]);
     $rootEnvironment = Environment::factory()->create(['project_id' => $rootProject->id]);
 

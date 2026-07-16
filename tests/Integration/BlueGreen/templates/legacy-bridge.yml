@@ -1,0 +1,18 @@
+http:
+  routers:
+    legacybridge:
+      entryPoints: [web]
+      middlewares: [legacybridgeproof]
+      priority: 16
+      rule: PathPrefix(`/`)
+      service: legacybridgeservice
+  middlewares:
+    legacybridgeproof:
+      headers:
+        customResponseHeaders:
+          X-Coolify-Blue-Green-Phase: legacy-bridge
+  services:
+    legacybridgeservice:
+      loadBalancer:
+        servers:
+          - url: http://legacy:3000
