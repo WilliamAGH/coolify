@@ -16,6 +16,7 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Str;
+use Laravel\Horizon\Contracts\JobRepository;
 use Livewire\Livewire;
 
 uses(RefreshDatabase::class);
@@ -279,6 +280,11 @@ describe('ApplicationDeploymentQueue dispatch claims', function () {
             return 'redis-job-id';
         });
         app()->instance(Dispatcher::class, $recoveryDispatcher);
+        $this->mock(JobRepository::class)
+            ->shouldReceive('getJobs')
+            ->once()
+            ->with([$deployment->horizon_job_id])
+            ->andReturn(collect());
 
         expect(recover_stale_application_deployment_dispatches())->toBe(1)
             ->and($republishedJob)->toBeInstanceOf(ApplicationDeploymentJob::class)
@@ -316,6 +322,66 @@ describe('ApplicationDeploymentQueue dispatch claims', function () {
             ->and($fresh->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
             ->and($running->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
             ->and($running->fresh()->horizon_job_worker)->toBe('horizon-worker-1');
+    });
+
+    test('does not republish stale dispatch attempts that Horizon still tracks as live', function () {
+        $pendingApplication = makeApplication($this->environment->id, $this->destination->id, null);
+        $pendingDeployment = makeQueueAdmissionDeployment($pendingApplication, $this->server, 'queue-stale-pending');
+        $reservedApplication = makeApplication($this->environment->id, $this->destination->id, null);
+        $reservedDeployment = makeQueueAdmissionDeployment($reservedApplication, $this->server, 'queue-stale-reserved');
+        expect($pendingDeployment->claimForDispatch(bypassServerCapacity: true))->toBeTrue()
+            ->and($reservedDeployment->claimForDispatch(bypassServerCapacity: true))->toBeTrue();
+        $dispatchAttemptUuids = [
+            $pendingDeployment->horizon_job_id,
+            $reservedDeployment->horizon_job_id,
+        ];
+        ApplicationDeploymentQueue::query()
+            ->whereKey([$pendingDeployment->id, $reservedDeployment->id])
+            ->update(['updated_at' => now()->subMinutes(10)]);
+        $this->mock(JobRepository::class)
+            ->shouldReceive('getJobs')
+            ->once()
+            ->with($dispatchAttemptUuids)
+            ->andReturn(collect([
+                (object) ['id' => $dispatchAttemptUuids[0], 'status' => 'pending'],
+                (object) ['id' => $dispatchAttemptUuids[1], 'status' => 'reserved'],
+            ]));
+
+        expect(recover_stale_application_deployment_dispatches())->toBe(0)
+            ->and($pendingDeployment->fresh()->updated_at->lt(now()->subMinutes(5)))->toBeTrue()
+            ->and($reservedDeployment->fresh()->updated_at->lt(now()->subMinutes(5)))->toBeTrue();
+        Bus::assertNotDispatched(ApplicationDeploymentJob::class);
+    });
+
+    test('republishes stale dispatch attempts that Horizon tracks as terminal', function () {
+        $failedApplication = makeApplication($this->environment->id, $this->destination->id, null);
+        $failedDeployment = makeQueueAdmissionDeployment($failedApplication, $this->server, 'queue-stale-failed');
+        $completedApplication = makeApplication($this->environment->id, $this->destination->id, null);
+        $completedDeployment = makeQueueAdmissionDeployment($completedApplication, $this->server, 'queue-stale-completed');
+        expect($failedDeployment->claimForDispatch(bypassServerCapacity: true))->toBeTrue()
+            ->and($completedDeployment->claimForDispatch(bypassServerCapacity: true))->toBeTrue();
+        $dispatchAttemptUuids = [
+            $failedDeployment->horizon_job_id,
+            $completedDeployment->horizon_job_id,
+        ];
+        ApplicationDeploymentQueue::query()
+            ->whereKey([$failedDeployment->id, $completedDeployment->id])
+            ->update(['updated_at' => now()->subMinutes(10)]);
+        $this->mock(JobRepository::class)
+            ->shouldReceive('getJobs')
+            ->once()
+            ->with($dispatchAttemptUuids)
+            ->andReturn(collect([
+                (object) ['id' => $dispatchAttemptUuids[0], 'status' => 'failed'],
+                (object) ['id' => $dispatchAttemptUuids[1], 'status' => 'completed'],
+            ]));
+
+        expect(recover_stale_application_deployment_dispatches())->toBe(2)
+            ->and($failedDeployment->fresh()->updated_at->gt(now()->subMinute()))->toBeTrue()
+            ->and($completedDeployment->fresh()->updated_at->gt(now()->subMinute()))->toBeTrue();
+        Bus::assertDispatchedTimes(ApplicationDeploymentJob::class, 2);
+        Bus::assertDispatched(ApplicationDeploymentJob::class, fn (ApplicationDeploymentJob $job): bool => $job->dispatch_attempt_uuid === $dispatchAttemptUuids[0]);
+        Bus::assertDispatched(ApplicationDeploymentJob::class, fn (ApplicationDeploymentJob $job): bool => $job->dispatch_attempt_uuid === $dispatchAttemptUuids[1]);
     });
 
     test('uses the durable dispatch attempt as the physical queue payload UUID', function () {

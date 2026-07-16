@@ -7,6 +7,7 @@ use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Exceptions\DeploymentException;
+use Closure;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Collection as EloquentCollection;
@@ -363,9 +364,13 @@ class ApplicationDeploymentQueue extends Model
         }, attempts: 5);
     }
 
-    /** @return EloquentCollection<int, self> */
+    /**
+     * @param  (Closure(array<int, string>): array<int, string>)|null  $findLiveDispatchAttemptUuids
+     * @return EloquentCollection<int, self>
+     */
     public static function recoverStaleDispatchAttempts(
         int $staleAfterSeconds = self::DISPATCH_STALE_AFTER_SECONDS,
+        ?Closure $findLiveDispatchAttemptUuids = null,
     ): EloquentCollection {
         if ($staleAfterSeconds < 1) {
             throw new \InvalidArgumentException('The deployment dispatch stale window must be positive.');
@@ -381,8 +386,21 @@ class ApplicationDeploymentQueue extends Model
             ->whereNull('blue_green_phase')
             ->where('updated_at', '<=', $staleBefore)
             ->orderBy('id')
-            ->chunkById(100, function (EloquentCollection $deployments) use ($recovered, $staleBefore): void {
+            ->chunkById(100, function (EloquentCollection $deployments) use ($findLiveDispatchAttemptUuids, $recovered, $staleBefore): void {
+                $dispatchAttemptUuids = $deployments
+                    ->pluck('horizon_job_id')
+                    ->filter(static fn (mixed $dispatchAttemptUuid): bool => is_string($dispatchAttemptUuid) && Str::isUuid($dispatchAttemptUuid))
+                    ->unique()
+                    ->values()
+                    ->all();
+                $liveDispatchAttemptUuids = $findLiveDispatchAttemptUuids !== null && $dispatchAttemptUuids !== []
+                    ? array_fill_keys($findLiveDispatchAttemptUuids($dispatchAttemptUuids), true)
+                    : [];
+
                 foreach ($deployments as $deployment) {
+                    if (is_string($deployment->horizon_job_id) && isset($liveDispatchAttemptUuids[$deployment->horizon_job_id])) {
+                        continue;
+                    }
                     if ($deployment->reserveStaleDispatchRepublish($staleBefore)) {
                         $recovered->push($deployment->fresh());
                     }

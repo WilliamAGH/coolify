@@ -13,6 +13,7 @@ use App\Models\StandaloneDocker;
 use Illuminate\Contracts\Bus\Dispatcher;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
+use Laravel\Horizon\Contracts\JobRepository;
 use Spatie\Url\Url;
 use Visus\Cuid2\Cuid2;
 
@@ -224,7 +225,22 @@ function dispatch_claimed_application_deployment(ApplicationDeploymentQueue $dep
 function recover_stale_application_deployment_dispatches(
     int $staleAfterSeconds = ApplicationDeploymentQueue::DISPATCH_STALE_AFTER_SECONDS,
 ): int {
-    $recovered = ApplicationDeploymentQueue::recoverStaleDispatchAttempts($staleAfterSeconds);
+    $jobRepository = app(JobRepository::class);
+    $recovered = ApplicationDeploymentQueue::recoverStaleDispatchAttempts(
+        $staleAfterSeconds,
+        static function (array $dispatchAttemptUuids) use ($jobRepository): array {
+            return $jobRepository->getJobs($dispatchAttemptUuids)
+                ->filter(static fn (object $job): bool => in_array(
+                    data_get($job, 'status'),
+                    ['pending', 'reserved'],
+                    true,
+                ))
+                ->pluck('id')
+                ->filter(static fn (mixed $jobId): bool => is_string($jobId) && Str::isUuid($jobId))
+                ->values()
+                ->all();
+        },
+    );
 
     foreach ($recovered as $deployment) {
         dispatch_claimed_application_deployment($deployment);
