@@ -119,7 +119,7 @@ function createDeactivationTableWithShortOperationId(): void
         SQL);
 }
 
-beforeEach(function () {
+beforeEach(function (): void {
     Schema::dropAllTables();
 
     Schema::create('applications', fn (Blueprint $table) => $table->id());
@@ -131,7 +131,7 @@ beforeEach(function () {
     });
 });
 
-afterAll(function () {
+afterEach(function (): void {
     if (Schema::getConnection()->getDriverName() === 'pgsql') {
         Artisan::call('migrate:fresh', ['--force' => true]);
     }
