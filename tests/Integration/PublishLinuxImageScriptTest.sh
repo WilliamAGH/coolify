@@ -70,6 +70,24 @@ set_reference "${source_repository}@${old_index}" "$old_index"
 set_run_id "$old_index" 41
 set_run_id "$new_index" 42
 
+export REGCTL_FAIL_READ_REFERENCE="${ghcr_repository}:read-error"
+if "$helper" ensure-tag "$source_repository" "$ghcr_repository" read-error "$new_index" "$REGCTL_AMD64" "$REGCTL_ARM64" >/dev/null 2>&1; then
+    fail 'registry read error was treated as an absent immutable tag'
+fi
+unset REGCTL_FAIL_READ_REFERENCE
+[ ! -e "$(reference_path "${ghcr_repository}:read-error")" ] || fail 'registry read error allowed a tag mutation'
+
+for hostile_error in 'credential helper not found' 'authentication endpoint returned HTTP 404'; do
+    export REGCTL_FAIL_READ_REFERENCE="${ghcr_repository}:hostile-error"
+    export REGCTL_FAIL_READ_MESSAGE="$hostile_error"
+    if "$helper" ensure-tag "$source_repository" "$ghcr_repository" hostile-error "$new_index" "$REGCTL_AMD64" "$REGCTL_ARM64" >/dev/null 2>&1; then
+        fail "hostile registry error was misclassified as absence: $hostile_error"
+    fi
+    [ ! -e "$(reference_path "${ghcr_repository}:hostile-error")" ] \
+        || fail 'hostile registry error allowed a tag mutation'
+done
+unset REGCTL_FAIL_READ_REFERENCE REGCTL_FAIL_READ_MESSAGE
+
 "$helper" ensure-tag "$source_repository" "$ghcr_repository" 1.2.3 "$new_index" "$REGCTL_AMD64" "$REGCTL_ARM64" >/dev/null
 [ "$(get_reference "${ghcr_repository}:1.2.3")" = "$new_index" ] || fail 'new semantic tag was not created'
 [ "$(grep -c '^copy:' "$log")" -eq 1 ] || fail 'semantic tag was not copied exactly once'
@@ -133,6 +151,18 @@ set_reference "${ghcr_repository}@${old_index}" "$old_index"
 set_reference "${docker_repository}@${old_index}" "$old_index"
 set_reference "${ghcr_repository}@${new_index}" "$new_index"
 
+rollback_error="$state/rollback.err"
+export REGCTL_FAIL_TARGET="${docker_repository}:latest"
+export REGCTL_CONCURRENT_REFERENCE="${ghcr_repository}:latest"
+export REGCTL_CONCURRENT_DIGEST="$REGCTL_ARM64"
+if "$helper" promote-latest "$ghcr_repository" "$docker_repository" "$new_index" "$REGCTL_AMD64" "$REGCTL_ARM64" 42 >/dev/null 2>"$rollback_error"; then
+    fail 'third-party latest digest was treated as compensated'
+fi
+unset REGCTL_CONCURRENT_REFERENCE REGCTL_CONCURRENT_DIGEST REGCTL_FAIL_TARGET
+[ "$(get_reference "${ghcr_repository}:latest")" = "$REGCTL_ARM64" ] || fail 'third-party latest digest was overwritten during compensation'
+set_reference "${ghcr_repository}:latest" "$old_index"
+rm -f "$state/copy-failure-triggered"
+
 export REGCTL_IGNORE_COPY_TARGET="${ghcr_repository}:latest"
 if "$helper" promote-latest "$ghcr_repository" "$docker_repository" "$new_index" "$REGCTL_AMD64" "$REGCTL_ARM64" 42 >/dev/null 2>&1; then
     fail 'latest promotion without a moved GHCR alias unexpectedly succeeded'
@@ -140,6 +170,31 @@ fi
 unset REGCTL_IGNORE_COPY_TARGET
 [ "$(get_reference "${ghcr_repository}:latest")" = "$old_index" ] || fail 'GHCR latest changed after an unmoved-alias postflight failure'
 [ "$(get_reference "${docker_repository}:latest")" = "$old_index" ] || fail 'Docker Hub latest changed after an unmoved GHCR alias'
+
+export REGCTL_FAIL_TARGET="${docker_repository}:latest"
+export REGCTL_FAIL_COPY_SOURCE="${ghcr_repository}@${old_index}"
+if "$helper" promote-latest "$ghcr_repository" "$docker_repository" "$new_index" "$REGCTL_AMD64" "$REGCTL_ARM64" 42 >/dev/null 2>"$rollback_error"; then
+    fail 'partial latest promotion with failed rollback unexpectedly succeeded'
+fi
+unset REGCTL_FAIL_COPY_SOURCE
+unset REGCTL_FAIL_TARGET
+[ "$(get_reference "${ghcr_repository}:latest")" = "$new_index" ] || fail 'failed rollback did not retain observable promoted GHCR state'
+[ "$(get_reference "${docker_repository}:latest")" = "$old_index" ] || fail 'Docker Hub latest changed after failed promotion and rollback'
+grep -Fq 'unable to compensate GHCR latest after Docker Hub promotion failure' "$rollback_error" \
+    || fail 'failed rollback was not reported as the terminal promotion error'
+set_reference "${ghcr_repository}:latest" "$old_index"
+
+rm -f "$(reference_path "${ghcr_repository}:latest")" "$state/copy-failure-triggered"
+export REGCTL_FAIL_TARGET="${docker_repository}:latest"
+export REGCTL_FAIL_READ_AFTER_COPY_FAILURE_REFERENCE="${ghcr_repository}:latest"
+if "$helper" promote-latest "$ghcr_repository" "$docker_repository" "$new_index" "$REGCTL_AMD64" "$REGCTL_ARM64" 42 >/dev/null 2>"$rollback_error"; then
+    fail 'absent-previous latest rollback read failure unexpectedly succeeded'
+fi
+unset REGCTL_FAIL_READ_AFTER_COPY_FAILURE_REFERENCE REGCTL_FAIL_TARGET
+[ "$(get_reference "${ghcr_repository}:latest")" = "$new_index" ] || fail 'rollback read failure hid observable promoted GHCR state'
+grep -Fq 'unable to compensate GHCR latest after Docker Hub promotion failure' "$rollback_error" \
+    || fail 'absent-previous rollback read failure was not terminal'
+set_reference "${ghcr_repository}:latest" "$old_index"
 
 export REGCTL_FAIL_TARGET="${docker_repository}:latest"
 if "$helper" promote-latest "$ghcr_repository" "$docker_repository" "$new_index" "$REGCTL_AMD64" "$REGCTL_ARM64" 42 >/dev/null 2>&1; then

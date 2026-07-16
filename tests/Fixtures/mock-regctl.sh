@@ -18,7 +18,18 @@ reference_path() {
 read_reference() {
     local path
     path="$(reference_path "$1")"
-    [[ -f "$path" ]] || return 1
+    if [[ "${REGCTL_FAIL_READ_REFERENCE:-}" == "$1" ]]; then
+        printf '%s\n' "${REGCTL_FAIL_READ_MESSAGE:-registry transport unavailable}" >&2
+        return 70
+    fi
+    if [[ "${REGCTL_FAIL_READ_AFTER_COPY_FAILURE_REFERENCE:-}" == "$1" && -f "$REGCTL_STATE/copy-failure-triggered" ]]; then
+        printf 'registry rollback read unavailable\n' >&2
+        return 70
+    fi
+    if [[ ! -f "$path" ]]; then
+        printf 'manifest unknown: %s\n' "$1" >&2
+        return 1
+    fi
     cat "$path"
 }
 
@@ -28,6 +39,13 @@ write_reference() {
     printf '%s\n' "$2" > "$path"
 }
 
+maybe_apply_concurrent_reference() {
+    local target="$1"
+    if [[ "${REGCTL_CONCURRENT_REFERENCE:-}" == "$target" && -f "$REGCTL_STATE/copy-failure-triggered" ]]; then
+        write_reference "$target" "${REGCTL_CONCURRENT_DIGEST:?}"
+    fi
+}
+
 delete_reference() {
     rm -f "$(reference_path "$1")"
 }
@@ -35,6 +53,7 @@ delete_reference() {
 case "${1:-}:${2:-}" in
     image:digest)
         reference="$3"
+        maybe_apply_concurrent_reference "$reference"
         if [[ " $* " == *' --platform linux/amd64 '* ]]; then
             if [[ "${REGCTL_FAIL_PLATFORM_REFERENCE:-}" == "$reference" ]]; then
                 printf 'sha256:'
@@ -62,7 +81,11 @@ case "${1:-}:${2:-}" in
     image:copy)
         source="$3"
         target="$4"
+        if [[ "${REGCTL_FAIL_COPY_SOURCE:-}" == "$source" ]]; then
+            exit 1
+        fi
         if [[ "${REGCTL_FAIL_TARGET:-}" == "$target" ]]; then
+            : > "$REGCTL_STATE/copy-failure-triggered"
             exit 1
         fi
         if [[ "${REGCTL_IGNORE_COPY_TARGET:-}" == "$target" ]]; then

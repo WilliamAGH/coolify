@@ -15,7 +15,31 @@ require_digest() {
 }
 
 tag_digest_or_empty() {
-    regctl image digest "$1" 2>/dev/null || true
+    local reference="$1"
+    local error_file
+    local digest
+    local status
+
+    error_file="$(mktemp "${TMPDIR:-/tmp}/coolify-regctl-error.XXXXXX")"
+    if digest="$(regctl image digest "$reference" 2>"$error_file")"; then
+        rm -f "$error_file"
+        require_digest "$digest"
+        printf '%s\n' "$digest"
+        return 0
+    else
+        status=$?
+    fi
+
+    if grep -Eiq '^(manifest unknown|name unknown)(: .*)?$|^failed to (get|resolve) manifest [^[:space:]]+: (manifest unknown|not found)$' "$error_file"; then
+        rm -f "$error_file"
+        printf '\n'
+        return 0
+    fi
+
+    printf 'publish-linux-image: registry read failed for %s (status %s): ' "$reference" "$status" >&2
+    cat "$error_file" >&2
+    rm -f "$error_file"
+    return "$status"
 }
 
 verify_index() {
@@ -50,7 +74,9 @@ verify_tag_index() {
     local amd64_digest="$4"
     local arm64_digest="$5"
 
-    if [[ "$(tag_digest_or_empty "${repository}:${tag}")" != "$index_digest" ]]; then
+    local current_digest
+    current_digest="$(tag_digest_or_empty "${repository}:${tag}")" || return 1
+    if [[ "$current_digest" != "$index_digest" ]]; then
         printf 'publish-linux-image: tag digest mismatch for %s:%s\n' "$repository" "$tag" >&2
         return 1
     fi
@@ -79,7 +105,7 @@ ensure_tag() {
     local existing_digest
 
     require_digest "$index_digest"
-    existing_digest="$(tag_digest_or_empty "$target")"
+    existing_digest="$(tag_digest_or_empty "$target")" || die "unable to read immutable tag: $target"
 
     if [[ -n "$existing_digest" ]]; then
         [[ "$existing_digest" == "$index_digest" ]] || die "immutable tag conflict for ${target}: ${existing_digest} != ${index_digest}"
@@ -100,7 +126,7 @@ preflight_immutable_tag() {
     local arm64_digest="$5"
     local existing_digest
 
-    existing_digest="$(tag_digest_or_empty "${repository}:${tag}")"
+    existing_digest="$(tag_digest_or_empty "${repository}:${tag}")" || return 1
     if [[ -z "$existing_digest" ]]; then
         printf 'create\n'
         return 0
@@ -125,7 +151,7 @@ copy_preflighted_tag() {
     local existing_digest
     local copy_state
 
-    existing_digest="$(tag_digest_or_empty "${target_repository}:${tag}")"
+    existing_digest="$(tag_digest_or_empty "${target_repository}:${tag}")" || return 1
     if [[ -n "$existing_digest" ]]; then
         [[ "$existing_digest" == "$index_digest" ]] || return 1
         copy_state='equal'
@@ -144,9 +170,12 @@ remove_created_tag() {
     local index_digest="$3"
     local current_digest
 
-    current_digest="$(tag_digest_or_empty "${repository}:${tag}")"
-    [[ "$current_digest" == "$index_digest" ]] || return 0
-    regctl tag delete --ignore-missing "${repository}:${tag}"
+    current_digest="$(tag_digest_or_empty "${repository}:${tag}")" || return 1
+    [[ -n "$current_digest" ]] || return 0
+    [[ "$current_digest" == "$index_digest" ]] || return 1
+    regctl tag delete --ignore-missing "${repository}:${tag}" || return 1
+    current_digest="$(tag_digest_or_empty "${repository}:${tag}")" || return 1
+    [[ -z "$current_digest" ]]
 }
 
 ensure_tag_pair() {
@@ -173,7 +202,7 @@ ensure_tag_pair() {
 
     if [[ "$ghcr_state" == create ]]; then
         if ! ghcr_copy_state="$(copy_preflighted_tag "$source_repository" "$ghcr_repository" "$tag" "$index_digest" "$amd64_digest" "$arm64_digest")"; then
-            remove_created_tag "$ghcr_repository" "$tag" "$index_digest"
+            remove_created_tag "$ghcr_repository" "$tag" "$index_digest" || die 'unable to compensate GHCR immutable tag'
             die 'unable to create GHCR immutable tag'
         fi
         if [[ "$ghcr_copy_state" == created ]]; then
@@ -183,9 +212,9 @@ ensure_tag_pair() {
 
     if [[ "$docker_state" == create ]]; then
         if ! docker_copy_state="$(copy_preflighted_tag "$source_repository" "$docker_repository" "$tag" "$index_digest" "$amd64_digest" "$arm64_digest")"; then
-            remove_created_tag "$docker_repository" "$tag" "$index_digest"
+            remove_created_tag "$docker_repository" "$tag" "$index_digest" || die 'unable to compensate Docker Hub immutable tag'
             if [[ "$ghcr_created" == 'true' ]]; then
-                remove_created_tag "$ghcr_repository" "$tag" "$index_digest"
+                remove_created_tag "$ghcr_repository" "$tag" "$index_digest" || die 'unable to compensate GHCR immutable tag'
             fi
             die 'unable to create Docker Hub immutable tag; compensated GHCR'
         fi
@@ -197,10 +226,10 @@ ensure_tag_pair() {
     if ! verify_tag_index "$ghcr_repository" "$tag" "$index_digest" "$amd64_digest" "$arm64_digest" ||
         ! verify_tag_index "$docker_repository" "$tag" "$index_digest" "$amd64_digest" "$arm64_digest"; then
         if [[ "$ghcr_created" == 'true' ]]; then
-            remove_created_tag "$ghcr_repository" "$tag" "$index_digest"
+            remove_created_tag "$ghcr_repository" "$tag" "$index_digest" || die 'unable to compensate GHCR immutable tag after postflight failure'
         fi
         if [[ "$docker_created" == 'true' ]]; then
-            remove_created_tag "$docker_repository" "$tag" "$index_digest"
+            remove_created_tag "$docker_repository" "$tag" "$index_digest" || die 'unable to compensate Docker Hub immutable tag after postflight failure'
         fi
         die 'immutable tag postflight verification failed; compensated newly created tags'
     fi
@@ -212,15 +241,20 @@ restore_latest() {
     local promoted_digest="$3"
     local current_digest
 
-    current_digest="$(tag_digest_or_empty "${repository}:latest")"
-    [[ "$current_digest" == "$promoted_digest" ]] || return 0
+    current_digest="$(tag_digest_or_empty "${repository}:latest")" || return 1
+    if [[ "$current_digest" == "$previous_digest" ]]; then
+        return 0
+    fi
+    [[ "$current_digest" == "$promoted_digest" ]] || return 1
 
     if [[ -n "$previous_digest" ]]; then
         regctl image copy "${repository}@${previous_digest}" "${repository}:latest" || return 1
-        [[ "$(tag_digest_or_empty "${repository}:latest")" == "$previous_digest" ]]
+        current_digest="$(tag_digest_or_empty "${repository}:latest")" || return 1
+        [[ "$current_digest" == "$previous_digest" ]]
     else
         regctl tag delete --ignore-missing "${repository}:latest" || return 1
-        [[ -z "$(tag_digest_or_empty "${repository}:latest")" ]]
+        current_digest="$(tag_digest_or_empty "${repository}:latest")" || return 1
+        [[ -z "$current_digest" ]]
     fi
 }
 
@@ -237,7 +271,7 @@ preflight_latest() {
     [[ "$candidate_run_id" =~ ^[0-9]+$ ]] || die "release run id must be numeric"
 
     for current_repository in "$ghcr_repository" "$docker_repository"; do
-        current_digest="$(tag_digest_or_empty "${current_repository}:latest")"
+        current_digest="$(tag_digest_or_empty "${current_repository}:latest")" || return 1
         [[ -n "$current_digest" ]] || continue
         require_digest "$current_digest"
 
@@ -284,8 +318,8 @@ promote_latest() {
         return "$preflight_status"
     }
 
-    ghcr_previous="$(tag_digest_or_empty "${ghcr_repository}:latest")"
-    docker_previous="$(tag_digest_or_empty "${docker_repository}:latest")"
+    ghcr_previous="$(tag_digest_or_empty "${ghcr_repository}:latest")" || return 1
+    docker_previous="$(tag_digest_or_empty "${docker_repository}:latest")" || return 1
 
     for current_repository in "$ghcr_repository" "$docker_repository"; do
         if [[ "$current_repository" == "$ghcr_repository" ]]; then
@@ -320,7 +354,8 @@ promote_latest() {
     if [[ "$docker_previous" != "$desired_index" ]]; then
         if ! regctl image copy "${desired_repository}@${desired_index}" "${docker_repository}:latest"; then
             if [[ "$updated_ghcr" == 'true' ]]; then
-                restore_latest "$ghcr_repository" "$ghcr_previous" "$desired_index"
+                restore_latest "$ghcr_repository" "$ghcr_previous" "$desired_index" ||
+                    die 'unable to compensate GHCR latest after Docker Hub promotion failure'
             fi
             die "unable to promote Docker Hub latest; compensated GHCR"
         fi

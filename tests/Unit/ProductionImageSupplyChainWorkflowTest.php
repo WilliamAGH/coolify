@@ -494,6 +494,15 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
             $violations[] = "missing reusable output: {$output}";
         }
     }
+    foreach ([
+        'digest' => '${{ jobs.release.outputs.index_digest || jobs.repair-latest.outputs.index_digest || jobs.verify-authoritative-noop.outputs.index_digest }}',
+        'docker_image' => '${{ jobs.release.outputs.docker_image || jobs.repair-latest.outputs.docker_image || jobs.verify-authoritative-noop.outputs.docker_image }}',
+        'ghcr_image' => '${{ jobs.release.outputs.ghcr_image || jobs.repair-latest.outputs.ghcr_image || jobs.verify-authoritative-noop.outputs.ghcr_image }}',
+    ] as $output => $expectedValue) {
+        if (($workflowCall['outputs'][$output]['value'] ?? null) !== $expectedValue) {
+            $violations[] = "reusable output must retain authoritative no-op fallback: {$output}";
+        }
+    }
 
     if (($sharedWorkflow['permissions'] ?? null) !== []) {
         $violations[] = 'shared publication must not grant workflow-wide permissions';
@@ -509,6 +518,8 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
     $publicationStateStep = releaseWorkflowStepById($jobs['validate-inputs'] ?? [], 'publication');
     $publicationStateScript = (string) ($publicationStateStep['run'] ?? '');
     if (($jobs['validate-inputs']['outputs']['publish_required'] ?? null) !== '${{ steps.publication.outputs.publish_required }}' ||
+        ($jobs['validate-inputs']['outputs']['docker_image'] ?? null) !== '${{ steps.publication.outputs.docker_image }}' ||
+        ($jobs['validate-inputs']['outputs']['ghcr_image'] ?? null) !== '${{ steps.publication.outputs.ghcr_image }}' ||
         ! str_contains($publicationStateScript, 'ghcr_status=') ||
         ! str_contains($publicationStateScript, 'docker_status=') ||
         ! str_contains($publicationStateScript, '[Dd]ocker-[Cc]ontent-[Dd]igest') ||
@@ -550,6 +561,7 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
     $requiredGraph = [
         'validate-inputs' => [],
         'repair-latest' => ['validate-inputs'],
+        'verify-authoritative-noop' => ['validate-inputs'],
         'build-and-scan' => ['validate-inputs'],
         'stage-candidates' => ['validate-inputs', 'build-and-scan'],
         'attest-and-verify' => ['stage-candidates'],
@@ -574,6 +586,7 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
     foreach ([
         'validate-inputs' => [],
         'repair-latest' => ['contents' => 'read', 'packages' => 'write'],
+        'verify-authoritative-noop' => ['packages' => 'read'],
         'build-and-scan' => ['contents' => 'read'],
         'stage-candidates' => ['contents' => 'read', 'packages' => 'write'],
         'attest-and-verify' => [
@@ -599,6 +612,7 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
 
     $validateOnlyConditions = [
         'repair-latest' => "\${{ ! inputs.validate_only && needs.validate-inputs.outputs.repair_required == 'true' }}",
+        'verify-authoritative-noop' => "\${{ ! inputs.validate_only && needs.validate-inputs.outputs.publish_required == 'false' && needs.validate-inputs.outputs.repair_required == 'false' }}",
         'stage-candidates' => "\${{ ! inputs.validate_only && needs.validate-inputs.outputs.publish_required == 'true' }}",
         'attest-and-verify' => "\${{ ! inputs.validate_only && needs.stage-candidates.result == 'success' }}",
         'release' => "\${{ ! inputs.validate_only && needs.stage-candidates.result == 'success' }}",
@@ -1167,6 +1181,13 @@ set -eu
 output=
 headers=
 url=
+arguments=" $* "
+for contract in '--connect-timeout 10' '--max-time 30' '--retry 3' '--retry-all-errors' '--retry-delay 1'; do
+    case "$arguments" in
+        *" $contract "*) ;;
+        *) printf 'bounded retry contract missing: %s\n' "$contract" >&2; exit 64 ;;
+    esac
+done
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --output) output=$2; shift 2 ;;
@@ -1179,25 +1200,27 @@ case "$url" in
     *'/token?'*) printf '{"token":"fixture-token"}\n' ;;
     *ghcr.io/v2/*/manifests/latest)
         [ "${GHCR_LATEST_STATUS:?}" != network ] || exit 7
-        : > "${output:?}"
+        if [ "$GHCR_LATEST_STATUS" = 404 ]; then printf '%s\n' "${GHCR_404_BODY:-$DEFAULT_404_BODY}" > "${output:?}"; else : > "${output:?}"; fi
         printf 'Docker-Content-Digest: %s\r\n' "${GHCR_LATEST_DIGEST:-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" > "${headers:?}"
         printf '%s' "$GHCR_LATEST_STATUS"
         ;;
     *registry-1.docker.io/v2/*/manifests/latest)
         [ "${DOCKER_LATEST_STATUS:?}" != network ] || exit 7
-        : > "${output:?}"
+        if [ "$DOCKER_LATEST_STATUS" = 404 ]; then printf '%s\n' "${DOCKER_404_BODY:-$DEFAULT_404_BODY}" > "${output:?}"; else : > "${output:?}"; fi
         printf 'Docker-Content-Digest: %s\r\n' "${DOCKER_LATEST_DIGEST:-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" > "${headers:?}"
         printf '%s' "$DOCKER_LATEST_STATUS"
         ;;
     *ghcr.io/v2/*)
         [ "${GHCR_STATUS:?}" != network ] || exit 7
-        : > "${output:?}"
+        [ "$GHCR_STATUS" != timeout ] || exit 28
+        if [ "$GHCR_STATUS" = 404 ]; then printf '%s\n' "${GHCR_404_BODY:-$DEFAULT_404_BODY}" > "${output:?}"; else : > "${output:?}"; fi
         printf 'Docker-Content-Digest: %s\r\n' "${GHCR_DIGEST:-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" > "${headers:?}"
         printf '%s' "$GHCR_STATUS"
         ;;
     *registry-1.docker.io/v2/*)
         [ "${DOCKER_STATUS:?}" != network ] || exit 7
-        : > "${output:?}"
+        [ "$DOCKER_STATUS" != timeout ] || exit 28
+        if [ "$DOCKER_STATUS" = 404 ]; then printf '%s\n' "${DOCKER_404_BODY:-$DEFAULT_404_BODY}" > "${output:?}"; else : > "${output:?}"; fi
         printf 'Docker-Content-Digest: %s\r\n' "${DOCKER_DIGEST:-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" > "${headers:?}"
         printf '%s' "$DOCKER_STATUS"
         ;;
@@ -1217,11 +1240,13 @@ SH;
             'cross-registry semantic digest disagreement fails' => ['200', '200', 'a', 'b', '200', '200', 'a', 'a', false, null, null],
             'registry server failure fails' => ['500', '500', 'a', 'a', '200', '200', 'a', 'a', false, null, null],
             'registry transport failure fails' => ['network', '404', 'a', 'a', '200', '200', 'a', 'a', false, null, null],
+            'registry timeout fails' => ['timeout', '404', 'a', 'a', '200', '200', 'a', 'a', false, null, null],
         ] as $description => [$ghcrStatus, $dockerStatus, $ghcrDigest, $dockerDigest, $ghcrLatestStatus, $dockerLatestStatus, $ghcrLatestDigest, $dockerLatestDigest, $successful, $publishRequired, $repairRequired]) {
             $output = tempnam($fixture.'/runner', 'output-');
             expect($output)->not->toBeFalse();
             $process = new Process(['bash', '-c', $script], $root, [
                 'DOCKER_STATUS' => $dockerStatus,
+                'DEFAULT_404_BODY' => '{"errors":[{"code":"MANIFEST_UNKNOWN"}]}',
                 'DOCKER_DIGEST' => 'sha256:'.str_repeat($dockerDigest, 64),
                 'DOCKER_LATEST_DIGEST' => 'sha256:'.str_repeat($dockerLatestDigest, 64),
                 'DOCKER_LATEST_STATUS' => $dockerLatestStatus,
@@ -1238,7 +1263,7 @@ SH;
             ]);
             $process->run();
 
-            expect($process->isSuccessful())->toBe($successful, $description);
+            expect($process->isSuccessful())->toBe($successful, $description."\n".$process->getErrorOutput());
             if ($publishRequired !== null) {
                 $values = [];
                 foreach (file($output, FILE_IGNORE_NEW_LINES) ?: [] as $line) {
@@ -1247,6 +1272,114 @@ SH;
                 }
                 expect($values['publish_required'] ?? null)->toBe($publishRequired)
                     ->and($values['repair_required'] ?? null)->toBe($repairRequired);
+                if ($publishRequired === 'false' && $repairRequired === 'false') {
+                    $digest = 'sha256:'.str_repeat('a', 64);
+                    expect($values['index_digest'] ?? null)->toBe($digest)
+                        ->and($values['ghcr_image'] ?? null)->toBe("ghcr.io/coollabsio/coolify@{$digest}")
+                        ->and($values['docker_image'] ?? null)->toBe("docker.io/coollabsio/coolify@{$digest}");
+                } else {
+                    expect($values['ghcr_image'] ?? null)->toBe('')
+                        ->and($values['docker_image'] ?? null)->toBe('');
+                }
+            }
+        }
+
+        foreach ([
+            'unauthorized 404 body' => '{"errors":[{"code":"UNAUTHORIZED","message":"denied"}]}',
+            'arbitrary 404 body' => '{"message":"not found"}',
+        ] as $description => $body) {
+            $output = tempnam($fixture.'/runner', 'output-');
+            expect($output)->not->toBeFalse();
+            $process = new Process(['bash', '-c', $script], $root, [
+                'DOCKER_STATUS' => '404',
+                'DEFAULT_404_BODY' => '{"errors":[{"code":"MANIFEST_UNKNOWN"}]}',
+                'DOCKER_404_BODY' => $body,
+                'DOCKER_DIGEST' => 'sha256:'.str_repeat('a', 64),
+                'DOCKER_LATEST_DIGEST' => 'sha256:'.str_repeat('a', 64),
+                'DOCKER_LATEST_STATUS' => '200',
+                'GITHUB_OUTPUT' => $output,
+                'GHCR_STATUS' => '404',
+                'GHCR_DIGEST' => 'sha256:'.str_repeat('a', 64),
+                'GHCR_LATEST_DIGEST' => 'sha256:'.str_repeat('a', 64),
+                'GHCR_LATEST_STATUS' => '200',
+                'PATH' => $mockBin.':'.getenv('PATH'),
+                'RELEASE_KIND' => 'production',
+                'RUNNER_TEMP' => $fixture.'/runner',
+                'SEMANTIC_VERSION' => '4.1.4',
+                'VALIDATE_ONLY' => 'false',
+            ]);
+            $process->run();
+            expect($process->isSuccessful())->toBeFalse($description);
+        }
+    } finally {
+        $filesystem->remove($fixture);
+    }
+});
+
+it('verifies no-op aliases are multi-platform indexes with release provenance', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $step = releaseWorkflowStep($workflow['jobs']['verify-authoritative-noop'] ?? [], 'Verify index platforms and release provenance');
+    $script = (string) ($step['run'] ?? '');
+    $filesystem = new Filesystem;
+    $fixture = sys_get_temp_dir().'/coolify-noop-index-'.bin2hex(random_bytes(8));
+    $mockBin = $fixture.'/bin';
+    $filesystem->mkdir($mockBin);
+    file_put_contents($mockBin.'/regctl', <<<'SH'
+#!/bin/sh
+set -eu
+case "$1:$2" in
+    manifest:get) printf '%s\n' "${REGCTL_MEDIA_TYPE:?}" ;;
+    image:digest)
+        case "$*" in
+            *linux/amd64*) printf 'sha256:%064d\n' 1 ;;
+            *linux/arm64*)
+                if [ "${REGCTL_ARM64_SUFFIX:-2}" = invalid ]; then printf 'invalid\n'; else printf 'sha256:%064d\n' "$REGCTL_ARM64_SUFFIX"; fi
+                ;;
+            *) printf '%s\n' "${INDEX_DIGEST:?}" ;;
+        esac
+        ;;
+    image:config)
+        case "$*" in
+            *linux/arm64*) run_id="${REGCTL_ARM64_RUN_ID:-42}" ;;
+            *) run_id=42 ;;
+        esac
+        printf '{"config":{"Labels":{"io.coolify.release-run-id":"%s","io.coolify.release-run-attempt":"1","org.opencontainers.image.revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","org.opencontainers.image.version":"4.1.4"}}}\n' "$run_id"
+        ;;
+    *) exit 64 ;;
+esac
+SH);
+    chmod($mockBin.'/regctl', 0755);
+    $digest = 'sha256:'.str_repeat('a', 64);
+
+    try {
+        foreach ([
+            'valid OCI index' => ['application/vnd.oci.image.index.v1+json', '2', '42', true],
+            'single image manifest' => ['application/vnd.oci.image.manifest.v1+json', '2', '42', false],
+            'single architecture masquerading as an index' => ['application/vnd.oci.image.index.v1+json', '1', '42', false],
+            'invalid arm64 digest' => ['application/vnd.oci.image.index.v1+json', 'invalid', '42', false],
+            'mismatched arm64 provenance' => ['application/vnd.oci.image.index.v1+json', '2', '43', false],
+        ] as $description => [$mediaType, $arm64Suffix, $arm64RunId, $successful]) {
+            $output = tempnam($fixture, 'output-');
+            expect($output)->not->toBeFalse();
+            $process = new Process(['bash', '-c', $script], $root, [
+                'DOCKER_TARGET' => 'docker.io/coollabsio/coolify',
+                'GITHUB_OUTPUT' => $output,
+                'GHCR_TARGET' => 'ghcr.io/coollabsio/coolify',
+                'INDEX_DIGEST' => $digest,
+                'PATH' => $mockBin.PATH_SEPARATOR.(getenv('PATH') ?: ''),
+                'REGCTL_ARM64_SUFFIX' => $arm64Suffix,
+                'REGCTL_ARM64_RUN_ID' => $arm64RunId,
+                'REGCTL_MEDIA_TYPE' => $mediaType,
+                'SEMANTIC_VERSION' => '4.1.4',
+            ]);
+            $process->run();
+
+            expect($process->isSuccessful())->toBe($successful, $description);
+            if ($successful) {
+                expect((string) file_get_contents($output))->toContain("index_digest={$digest}")
+                    ->toContain("ghcr_image=ghcr.io/coollabsio/coolify@{$digest}")
+                    ->toContain("docker_image=docker.io/coollabsio/coolify@{$digest}");
             }
         }
     } finally {
@@ -1427,6 +1560,91 @@ it('compensates the whole alias transaction when latest publication fails', func
     'failure immediately after semantic publication' => ['ghcr', false],
     'failure between latest updates preserves a preexisting semantic alias' => ['docker', true],
 ]);
+
+it('fails closed when semantic snapshot or rollback registry reads fail', function (string $failureMode) {
+    $root = releaseWorkflowRepositoryRoot();
+    $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $step = releaseWorkflowStep($workflow['jobs']['release'] ?? [], 'Publish semantic and latest aliases atomically');
+    $filesystem = new Filesystem;
+    $state = sys_get_temp_dir().'/coolify-alias-read-'.bin2hex(random_bytes(8));
+    $mockBin = $state.'/bin';
+    $ghcr = 'ghcr.io/coollabsio/coolify';
+    $docker = 'docker.io/coollabsio/coolify';
+    $old = releaseWorkflowTestDigest('c');
+    $new = releaseWorkflowTestDigest('d');
+    $amd64 = releaseWorkflowTestDigest('a');
+    $arm64 = releaseWorkflowTestDigest('b');
+    $semantic = '4.2.0';
+    $filesystem->mkdir([$mockBin, $state.'/refs', $state.'/runs']);
+    $filesystem->copy($root.'/tests/Fixtures/mock-regctl.sh', $mockBin.'/regctl');
+    chmod($mockBin.'/regctl', 0755);
+    file_put_contents($state.'/regctl.log', '');
+    foreach ([$ghcr, $docker] as $repository) {
+        releaseWorkflowWriteRegistryReference($state, "{$repository}@{$old}", $old);
+        releaseWorkflowWriteRegistryReference($state, "{$repository}@{$new}", $new);
+        releaseWorkflowWriteRegistryReference($state, "{$repository}:{$semantic}", $old);
+        releaseWorkflowWriteRegistryReference($state, "{$repository}:latest", $old);
+    }
+    file_put_contents($state.'/runs/'.substr($old, 7), "41\n");
+    file_put_contents($state.'/runs/'.substr($new, 7), "42\n");
+
+    $environment = [
+        'AMD64_DIGEST' => $amd64,
+        'ARM64_DIGEST' => $arm64,
+        'DOCKER_TARGET' => $docker,
+        'GHCR_TARGET' => $ghcr,
+        'GITHUB_RUN_ID' => '42',
+        'INDEX_DIGEST' => $new,
+        'PATH' => $mockBin.PATH_SEPARATOR.(getenv('PATH') ?: ''),
+        'PUBLISH_LATEST' => 'true',
+        'REGCTL_AMD64' => $amd64,
+        'REGCTL_ARM64' => $arm64,
+        'REGCTL_LOG' => $state.'/regctl.log',
+        'REGCTL_STATE' => $state,
+        'SEMANTIC_VERSION' => $semantic,
+    ];
+    if (str_starts_with($failureMode, 'snapshot')) {
+        $environment['REGCTL_FAIL_READ_REFERENCE'] = "{$ghcr}:{$semantic}";
+        $environment['REGCTL_FAIL_READ_MESSAGE'] = match ($failureMode) {
+            'snapshot-credential' => 'credential helper not found',
+            'snapshot-auth404' => 'authentication endpoint returned HTTP 404',
+            default => 'registry transport unavailable',
+        };
+    } else {
+        $environment['REGCTL_FAIL_TARGET'] = "{$docker}:latest";
+        $environment['REGCTL_FAIL_READ_AFTER_COPY_FAILURE_REFERENCE'] = "{$ghcr}:latest";
+        releaseWorkflowWriteRegistryReference($state, "{$ghcr}:{$semantic}", $new);
+        releaseWorkflowWriteRegistryReference($state, "{$docker}:{$semantic}", $new);
+        if ($failureMode === 'rollback-absent') {
+            unlink(releaseWorkflowRegistryReferencePath($state, "{$ghcr}:latest"));
+        } elseif ($failureMode === 'rollback-cross-prior') {
+            releaseWorkflowWriteRegistryReference($state, "{$docker}:latest", $amd64);
+            releaseWorkflowWriteRegistryReference($state, "{$docker}@{$amd64}", $amd64);
+            file_put_contents($state.'/runs/'.substr($amd64, 7), "41\n");
+            $environment['REGCTL_CONCURRENT_REFERENCE'] = "{$ghcr}:latest";
+            $environment['REGCTL_CONCURRENT_DIGEST'] = $amd64;
+        }
+    }
+
+    try {
+        $process = new Process(['bash', '-c', (string) ($step['run'] ?? '')], $root, $environment);
+        $process->run();
+
+        expect($process->isSuccessful())->toBeFalse()
+            ->and(releaseWorkflowReadRegistryReference($state, "{$ghcr}:{$semantic}"))->not->toBeNull()
+            ->and(releaseWorkflowReadRegistryReference($state, "{$docker}:{$semantic}"))->not->toBeNull();
+        if (str_starts_with($failureMode, 'rollback')) {
+            expect($process->getErrorOutput())->toContain('compensation was incomplete');
+            if ($failureMode === 'rollback-absent') {
+                expect(releaseWorkflowReadRegistryReference($state, "{$ghcr}:latest"))->toBe($new);
+            } elseif ($failureMode === 'rollback-cross-prior') {
+                expect(releaseWorkflowReadRegistryReference($state, "{$ghcr}:latest"))->toBe($amd64);
+            }
+        }
+    } finally {
+        $filesystem->remove($state);
+    }
+})->with(['snapshot', 'snapshot-credential', 'snapshot-auth404', 'rollback', 'rollback-absent', 'rollback-cross-prior']);
 
 it('rejects a superseded candidate before creating its absent semantic aliases', function () {
     $root = releaseWorkflowRepositoryRoot();
