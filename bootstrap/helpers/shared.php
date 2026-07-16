@@ -968,16 +968,13 @@ function completeCronDispatchExecution(array $reservation, string $executionId):
             return false;
         }
 
-        $record['state'] = 'completed';
-        $record['execution_expires_at'] = null;
-        Cache::put($reservation['reservation_key'], $record, 2592000);
+        Cache::put($reservation['dedup_key'], $reservation['due_at'], 2592000);
+        Cache::forget($reservation['reservation_key']);
         $reservationPointerKey = 'cron-dispatch-reservation:'.hash('sha256', $reservation['dedup_key']);
         $pointer = Cache::get($reservationPointerKey);
         if (is_array($pointer)
             && ($pointer['reservation_key'] ?? null) === $reservation['reservation_key']) {
-            Cache::put($reservationPointerKey, array_merge($record, [
-                'reservation_key' => $reservation['reservation_key'],
-            ]), 2592000);
+            Cache::forget($reservationPointerKey);
         }
 
         return true;

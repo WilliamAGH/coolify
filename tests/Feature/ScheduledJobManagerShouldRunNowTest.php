@@ -224,6 +224,9 @@ it('releases occurrence ownership when the scheduled job requests a retry', func
         $counter->attempts++;
     });
 
-    expect(data_get(Cache::get($reservation['reservation_key']), 'state'))->toBe('completed')
+    $reservationPointerKey = 'cron-dispatch-reservation:'.hash('sha256', $reservation['dedup_key']);
+    expect(Cache::get($reservation['reservation_key']))->toBeNull()
+        ->and(Cache::get($reservationPointerKey))->toBeNull()
+        ->and(Cache::get($reservation['dedup_key']))->toBe($reservation['due_at'])
         ->and($counter->attempts)->toBe(2);
 });
