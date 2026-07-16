@@ -426,7 +426,7 @@ class Migration extends Command
                 );
                 $this->lockControlPlaneMigrationTables($connection);
 
-                $legacyRowCountBefore = $this->controlPlaneLegacyRowCounts($connection);
+                $legacyTableAttestationBefore = $this->controlPlaneLegacyTableAttestation($connection);
                 $this->assertNewControlPlaneTablesAreEmpty($connection, false);
                 $ledgerAttestation = $this->attestControlPlaneMigrationLedger(
                     $connection,
@@ -458,8 +458,8 @@ class Migration extends Command
                     $ledgerAttestation['expectedBatch'],
                     $authorizedMigrationNames,
                 );
-                if ($this->controlPlaneLegacyRowCounts($connection) !== $legacyRowCountBefore) {
-                    throw new RuntimeException('Control-plane expand changed a legacy table row count.');
+                if ($this->controlPlaneLegacyTableAttestation($connection) !== $legacyTableAttestationBefore) {
+                    throw new RuntimeException('Control-plane expand changed legacy table rows.');
                 }
                 $this->assertNewControlPlaneTablesAreEmpty($connection, true);
                 $this->attestAuthorizedControlPlaneSchema($authorizedMigrations);
@@ -506,7 +506,7 @@ class Migration extends Command
                 migrations,
                 application_settings,
                 application_deployment_queues
-            IN ACCESS EXCLUSIVE MODE
+            IN SHARE ROW EXCLUSIVE MODE
             SQL);
 
         foreach ($this->newControlPlaneTableNames() as $tableName) {
@@ -516,32 +516,60 @@ class Migration extends Command
                 false,
             );
             if ($tableExists === true) {
-                $connection->statement("LOCK TABLE {$tableName} IN ACCESS EXCLUSIVE MODE");
+                $connection->statement("LOCK TABLE {$tableName} IN SHARE ROW EXCLUSIVE MODE");
             }
         }
     }
 
-    /** @return array{applicationSettings: int, applicationDeploymentQueues: int} */
-    private function controlPlaneLegacyRowCounts(Connection $connection): array
+    /**
+     * @return array{
+     *     applicationSettingsRowCount: int,
+     *     applicationSettingsMutationCount: int,
+     *     applicationDeploymentQueuesRowCount: int,
+     *     applicationDeploymentQueuesMutationCount: int
+     * }
+     */
+    private function controlPlaneLegacyTableAttestation(Connection $connection): array
     {
-        $rowCounts = $connection->selectOne(<<<'SQL'
+        $attestation = $connection->selectOne(<<<'SQL'
             SELECT
-                (SELECT count(*) FROM application_settings) AS application_settings,
-                (SELECT count(*) FROM application_deployment_queues) AS application_deployment_queues
+                (SELECT count(*) FROM application_settings) AS application_settings_row_count,
+                COALESCE((
+                    SELECT n_tup_ins + n_tup_upd + n_tup_del
+                    FROM pg_stat_xact_user_tables
+                    WHERE relid = 'application_settings'::regclass
+                ), 0) AS application_settings_mutation_count,
+                (SELECT count(*) FROM application_deployment_queues) AS application_deployment_queues_row_count,
+                COALESCE((
+                    SELECT n_tup_ins + n_tup_upd + n_tup_del
+                    FROM pg_stat_xact_user_tables
+                    WHERE relid = 'application_deployment_queues'::regclass
+                ), 0) AS application_deployment_queues_mutation_count
             SQL, [], false);
-        $applicationSettings = is_object($rowCounts)
-            ? $this->nonNegativeInteger($rowCounts->application_settings ?? null)
+        $applicationSettingsRowCount = is_object($attestation)
+            ? $this->nonNegativeInteger($attestation->application_settings_row_count ?? null)
             : null;
-        $applicationDeploymentQueues = is_object($rowCounts)
-            ? $this->nonNegativeInteger($rowCounts->application_deployment_queues ?? null)
+        $applicationSettingsMutationCount = is_object($attestation)
+            ? $this->nonNegativeInteger($attestation->application_settings_mutation_count ?? null)
             : null;
-        if ($applicationSettings === null || $applicationDeploymentQueues === null) {
-            throw new RuntimeException('Control-plane legacy row-count query returned a malformed result.');
+        $applicationDeploymentQueuesRowCount = is_object($attestation)
+            ? $this->nonNegativeInteger($attestation->application_deployment_queues_row_count ?? null)
+            : null;
+        $applicationDeploymentQueuesMutationCount = is_object($attestation)
+            ? $this->nonNegativeInteger($attestation->application_deployment_queues_mutation_count ?? null)
+            : null;
+        if ($applicationSettingsRowCount === null
+            || $applicationSettingsMutationCount === null
+            || $applicationDeploymentQueuesRowCount === null
+            || $applicationDeploymentQueuesMutationCount === null) {
+            throw new RuntimeException('Control-plane legacy table attestation query returned a malformed result.');
         }
 
         return [
-            'applicationSettings' => $applicationSettings,
-            'applicationDeploymentQueues' => $applicationDeploymentQueues,
+            'applicationSettingsRowCount' => $applicationSettingsRowCount,
+            'applicationSettingsMutationCount' => $applicationSettingsMutationCount,
+            'applicationDeploymentQueuesRowCount' => $applicationDeploymentQueuesRowCount,
+            'applicationDeploymentQueuesMutationCount' => $applicationDeploymentQueuesMutationCount,
         ];
     }
 

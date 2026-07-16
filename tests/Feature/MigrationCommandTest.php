@@ -279,11 +279,21 @@ function controlPlaneMigrationHarness(object $identity, array $migrationNames): 
         'newControlPlaneTableChecks' => [],
         'newControlPlaneTableRowCounts' => [],
         'ledgerRows' => controlPlaneBaselineLedgerRows($migrationNames),
-        'legacyRowCounts' => [
-            ['application_settings' => 7, 'application_deployment_queues' => 11],
-            ['application_settings' => 7, 'application_deployment_queues' => 11],
+        'legacyTableAttestations' => [
+            [
+                'application_settings_row_count' => 7,
+                'application_settings_mutation_count' => 0,
+                'application_deployment_queues_row_count' => 11,
+                'application_deployment_queues_mutation_count' => 0,
+            ],
+            [
+                'application_settings_row_count' => 7,
+                'application_settings_mutation_count' => 0,
+                'application_deployment_queues_row_count' => 11,
+                'application_deployment_queues_mutation_count' => 0,
+            ],
         ],
-        'legacyRowCountReads' => [],
+        'legacyTableAttestationReads' => [],
         'transactionLevel' => 0,
         'outerTransactionCalls' => 0,
         'transactionAttempts' => [],
@@ -336,15 +346,15 @@ function controlPlaneMigrationHarness(object $identity, array $migrationNames): 
                 ];
             }
 
-            if (str_contains($sql, 'count(*) FROM application_settings')) {
+            if (str_contains($sql, 'pg_stat_xact_user_tables')) {
                 $index = min(
-                    count($state->legacyRowCountReads),
-                    count($state->legacyRowCounts) - 1,
+                    count($state->legacyTableAttestationReads),
+                    count($state->legacyTableAttestations) - 1,
                 );
-                $rowCounts = $state->legacyRowCounts[$index];
-                $state->legacyRowCountReads[] = $rowCounts;
+                $attestation = $state->legacyTableAttestations[$index];
+                $state->legacyTableAttestationReads[] = $attestation;
 
-                return (object) $rowCounts;
+                return (object) $attestation;
             }
 
             throw new RuntimeException("Unexpected PostgreSQL select-one query: {$sql}");
@@ -631,10 +641,9 @@ it('runs the exact authorized migration expansion on one PostgreSQL session and 
         ->and($state->outerTransactionCalls)->toBe(1)
         ->and($state->transactionAttempts)->toBe([1])
         ->and($state->nestedMigrationTransactionLevel)->toBe(1)
-        ->and($state->legacyRowCountReads)->toBe([
-            ['application_settings' => 7, 'application_deployment_queues' => 11],
-            ['application_settings' => 7, 'application_deployment_queues' => 11],
-        ])
+        ->and($state->legacyTableAttestationReads)->toBe($state->legacyTableAttestations)
+        ->and(implode("\n", $state->lockedTables))->toContain('IN SHARE ROW EXCLUSIVE MODE')
+        ->and(implode("\n", $state->lockedTables))->not->toContain('IN ACCESS EXCLUSIVE MODE')
         ->and(array_slice($state->ledgerRows, count(controlPlaneBaselineLedgerRows($migrationNames))))->toBe($expectedLedgerAppend)
         ->and($command->lines)->toContain('control-plane-migration-application-name='.$identity->migration_application_name)
         ->and($command->lines)->toContain('control-plane-migration-attempt-lock='.$identity->migration_attempt_lock_identity)
@@ -743,23 +752,56 @@ it('rejects a nested migration that does not append the exact authorized migrati
         ]);
 });
 
-it('rejects a nested migration that changes a legacy table row count', function () {
+it('rejects a nested migration with net-zero legacy row counts when mutation counters change', function () {
     $migrationNames = controlPlaneMigrationNames();
     $identity = configureControlPlaneMigrationEnvironment($migrationNames);
     prepareControlPlaneMigrationSchema($migrationNames);
     $state = controlPlaneMigrationHarness($identity, $migrationNames);
-    $state->legacyRowCounts = [
-        ['application_settings' => 7, 'application_deployment_queues' => 11],
-        ['application_settings' => 8, 'application_deployment_queues' => 11],
+    $state->legacyTableAttestations = [
+        [
+            'application_settings_row_count' => 7,
+            'application_settings_mutation_count' => 0,
+            'application_deployment_queues_row_count' => 11,
+            'application_deployment_queues_mutation_count' => 0,
+        ],
+        [
+            'application_settings_row_count' => 7,
+            'application_settings_mutation_count' => 2,
+            'application_deployment_queues_row_count' => 11,
+            'application_deployment_queues_mutation_count' => 0,
+        ],
     ];
     $command = controlPlaneMigrationCommand($state);
 
     expect(fn () => $command->handle())
-        ->toThrow(RuntimeException::class, 'Control-plane expand changed a legacy table row count.')
-        ->and($state->legacyRowCountReads)->toBe([
-            ['application_settings' => 7, 'application_deployment_queues' => 11],
-            ['application_settings' => 8, 'application_deployment_queues' => 11],
-        ]);
+        ->toThrow(RuntimeException::class, 'Control-plane expand changed legacy table rows.')
+        ->and($state->legacyTableAttestationReads)->toBe($state->legacyTableAttestations);
+});
+
+it('rejects a nested migration that changes a legacy row count when mutation counters do not change', function () {
+    $migrationNames = controlPlaneMigrationNames();
+    $identity = configureControlPlaneMigrationEnvironment($migrationNames);
+    prepareControlPlaneMigrationSchema($migrationNames);
+    $state = controlPlaneMigrationHarness($identity, $migrationNames);
+    $state->legacyTableAttestations = [
+        [
+            'application_settings_row_count' => 7,
+            'application_settings_mutation_count' => 0,
+            'application_deployment_queues_row_count' => 11,
+            'application_deployment_queues_mutation_count' => 0,
+        ],
+        [
+            'application_settings_row_count' => 0,
+            'application_settings_mutation_count' => 0,
+            'application_deployment_queues_row_count' => 11,
+            'application_deployment_queues_mutation_count' => 0,
+        ],
+    ];
+    $command = controlPlaneMigrationCommand($state);
+
+    expect(fn () => $command->handle())
+        ->toThrow(RuntimeException::class, 'Control-plane expand changed legacy table rows.')
+        ->and($state->legacyTableAttestationReads)->toBe($state->legacyTableAttestations);
 });
 
 it('requires exactly one explicit live or rehearsal mode', function (string $liveMode, string $rehearsalMode) {

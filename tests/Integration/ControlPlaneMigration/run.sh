@@ -20,6 +20,7 @@ MALFORMED_REJECTED=0
 COMMAND_GUARD_REJECTED=0
 FINAL_SCHEMA_REPLAYED=0
 FORWARD_ONLY_ROLLBACK_REJECTED=0
+TRANSACTION_ROLLBACK_REJECTED=0
 
 export CONTROL_PLANE_MIGRATION_REPOSITORY="$REPOSITORY_ROOT"
 export CONTROL_PLANE_MIGRATION_BASELINE="$BASELINE_ROOT"
@@ -452,6 +453,7 @@ expect_control_plane_transaction_rollback()
         || fail "controlled expand did not roll back legacy rows after: $label"
     assert_sql_scalar "$database_name" "SELECT count(*) FROM migrations WHERE migration LIKE '2026_07_12_%'" \
         0 "controlled expand authorized ledger rollback after $label"
+    TRANSACTION_ROLLBACK_REJECTED=$((TRANSACTION_ROLLBACK_REJECTED + 1))
     record "CONTROL_PLANE_TRANSACTION_ROLLBACK_PASS label=$label schema=true ledger=true legacy_rows=true"
 }
 
@@ -1105,26 +1107,61 @@ SQL
 expect_control_plane_transaction_rollback injected_batch_drift injected-batch-drift \
     'Control-plane migrations did not append the exact ordered authorized migration ledger batch.'
 
-clone_baseline injected_legacy_count_drift
-insert_immutable_baseline_surplus injected_legacy_count_drift 29
-psql_file injected_legacy_count_drift "$LAB_DIRECTORY/seed-existing-rows.sql" \
-    > "$ARTIFACT_DIRECTORY/injected-legacy-count-drift-seed.log"
-psql_database injected_legacy_count_drift >/dev/null <<'SQL'
-CREATE FUNCTION drift_legacy_row_count() RETURNS trigger LANGUAGE plpgsql AS $$
+clone_baseline injected_legacy_truncate_drift
+insert_immutable_baseline_surplus injected_legacy_truncate_drift 29
+psql_file injected_legacy_truncate_drift "$LAB_DIRECTORY/seed-existing-rows.sql" \
+    > "$ARTIFACT_DIRECTORY/injected-legacy-truncate-drift-seed.log"
+assert_sql_scalar injected_legacy_truncate_drift 'SELECT count(*) FROM application_settings' 8192 \
+    'legacy TRUNCATE injection nonempty-table precondition'
+psql_database injected_legacy_truncate_drift >/dev/null <<'SQL'
+CREATE FUNCTION drift_legacy_rows_with_truncate() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     IF NEW.migration = '2026_07_12_000012_add_blue_green_deactivation_proxy_snapshot' THEN
-        DELETE FROM application_settings
-        WHERE id = (SELECT min(id) FROM application_settings);
+        TRUNCATE TABLE application_settings;
     END IF;
     RETURN NEW;
 END;
 $$;
-CREATE TRIGGER drift_legacy_row_count
+CREATE TRIGGER drift_legacy_rows_with_truncate
 BEFORE INSERT ON migrations
-FOR EACH ROW EXECUTE FUNCTION drift_legacy_row_count();
+FOR EACH ROW EXECUTE FUNCTION drift_legacy_rows_with_truncate();
 SQL
-expect_control_plane_transaction_rollback injected_legacy_count_drift injected-legacy-count-drift \
-    'Control-plane expand changed a legacy table row count.'
+expect_control_plane_transaction_rollback injected_legacy_truncate_drift injected-legacy-truncate-drift \
+    'Control-plane expand changed legacy table rows.'
+
+clone_baseline injected_legacy_net_zero_mutation
+insert_immutable_baseline_surplus injected_legacy_net_zero_mutation 29
+psql_file injected_legacy_net_zero_mutation "$LAB_DIRECTORY/seed-existing-rows.sql" \
+    > "$ARTIFACT_DIRECTORY/injected-legacy-net-zero-mutation-seed.log"
+assert_sql_scalar injected_legacy_net_zero_mutation 'SELECT count(*) FROM application_settings' 8192 \
+    'legacy net-zero mutation application-settings row-count precondition'
+assert_sql_scalar injected_legacy_net_zero_mutation 'SELECT count(*) FROM application_deployment_queues' 2 \
+    'legacy net-zero mutation deployment-queue row-count precondition'
+psql_database injected_legacy_net_zero_mutation >/dev/null <<'SQL'
+CREATE FUNCTION drift_legacy_rows_without_count_change() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.migration = '2026_07_12_000012_add_blue_green_deactivation_proxy_snapshot' THEN
+        UPDATE application_deployment_queues
+        SET status = status
+        WHERE deployment_uuid = 'control-plane-migration-queued';
+
+        WITH deleted_application_setting AS (
+            DELETE FROM application_settings
+            WHERE id = (SELECT min(id) FROM application_settings)
+            RETURNING *
+        )
+        INSERT INTO application_settings
+        SELECT * FROM deleted_application_setting;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER drift_legacy_rows_without_count_change
+BEFORE INSERT ON migrations
+FOR EACH ROW EXECUTE FUNCTION drift_legacy_rows_without_count_change();
+SQL
+expect_control_plane_transaction_rollback injected_legacy_net_zero_mutation injected-legacy-net-zero-mutation \
+    'Control-plane expand changed legacy table rows.'
 
 clone_baseline injected_schema_drift
 insert_immutable_baseline_surplus injected_schema_drift 29
@@ -1146,7 +1183,7 @@ FOR EACH ROW EXECUTE FUNCTION drift_authorized_schema();
 SQL
 expect_control_plane_transaction_rollback injected_schema_drift injected-schema-drift \
     'Existing blue-green deactivation PostgreSQL catalog does not match the authorized schema.'
-record 'CONTROL_PLANE_ATOMIC_GATES_PASS injected_failure=true batch=true legacy_counts=true schema=true outer_transaction=true'
+record 'CONTROL_PLANE_ATOMIC_GATES_PASS injected_failure=true batch=true legacy_counts=true legacy_truncate=true legacy_net_zero=true schema=true outer_transaction=true'
 
 replay_number=0
 while IFS= read -r migration_name; do
@@ -1596,6 +1633,8 @@ record "INPUT_MANIFEST_STABLE runtime=true migrations=$current_migration_count d
     || fail "final-schema replay count changed: $FINAL_SCHEMA_REPLAYED"
 [ "$FORWARD_ONLY_ROLLBACK_REJECTED" -eq "$authorized_migration_count" ] \
     || fail "forward-only rollback rejection count changed: $FORWARD_ONLY_ROLLBACK_REJECTED"
+[ "$TRANSACTION_ROLLBACK_REJECTED" -eq 5 ] \
+    || fail "transaction rollback rejection count changed: $TRANSACTION_ROLLBACK_REJECTED"
 [ "$MALFORMED_REJECTED" -eq 27 ] \
     || fail "malformed catalog rejection count changed: $MALFORMED_REJECTED"
 
@@ -1603,5 +1642,5 @@ if [ "$GATE_FAILURES" -ne 0 ]; then
     fail "acceptance accumulated $GATE_FAILURES gate failures"
 fi
 
-record "ACCEPTANCE_COUNTS command_guards=11 concurrent_processes=3 transaction_rollbacks=4 final_schema_replays=$authorized_migration_count crash_replays=$authorized_migration_count rollback_rejections=$authorized_migration_count malformed_rejections=27 malformed_acceptances=0 operator_services=2"
+record "ACCEPTANCE_COUNTS command_guards=11 concurrent_processes=3 transaction_rollbacks=$TRANSACTION_ROLLBACK_REJECTED final_schema_replays=$authorized_migration_count crash_replays=$authorized_migration_count rollback_rejections=$authorized_migration_count malformed_rejections=27 malformed_acceptances=0 operator_services=2"
 record 'CONTROL_PLANE_MIGRATION_PASS'
