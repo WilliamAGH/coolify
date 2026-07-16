@@ -681,18 +681,307 @@ function shouldRunCronNow(string $frequency, string $timezone, ?string $dedupKey
         return $cron->isDue($executionTime);
     }
 
-    $previousDue = Carbon::instance($cron->getPreviousRunDate($executionTime, allowCurrentDate: true));
-    $lastDispatched = Cache::get($dedupKey);
+    $reservation = reserveCronDispatch($frequency, $timezone, $dedupKey, $executionTime);
+    if ($reservation === null) {
+        return false;
+    }
 
-    $shouldFire = $lastDispatched === null
-        ? $cron->isDue($executionTime)
-        : $previousDue->gt(Carbon::parse($lastDispatched));
+    return commitCronDispatchReservation($reservation);
+}
 
-    // Always write: seeds on first miss, refreshes on dispatch.
-    // 30-day static TTL covers all intervals; orphan keys self-clean.
-    Cache::put($dedupKey, ($shouldFire ? $executionTime : $previousDue)->toIso8601String(), 2592000);
+/** @return null|array{dedup_key: string, reservation_key: string, token: string, due_at: string} */
+function reserveCronDispatch(
+    string $frequency,
+    string $timezone,
+    string $dedupKey,
+    ?Carbon $executionTime = null,
+): ?array {
+    $cron = new Cron\CronExpression($frequency);
+    $executionTime = ($executionTime ?? Carbon::now())->copy()->setTimezone($timezone);
+    $lockKey = 'cron-dispatch-lock:'.hash('sha256', $dedupKey);
+    $reservationPointerKey = 'cron-dispatch-reservation:'.hash('sha256', $dedupKey);
 
-    return $shouldFire;
+    return Cache::lock($lockKey, 10)->block(5, function () use (
+        $cron,
+        $executionTime,
+        $dedupKey,
+        $reservationPointerKey,
+    ): ?array {
+        $activeReservationPointer = Cache::get($reservationPointerKey);
+        $activeReservationKey = is_array($activeReservationPointer)
+            ? ($activeReservationPointer['reservation_key'] ?? null)
+            : $activeReservationPointer;
+        if (is_string($activeReservationKey)) {
+            $activeReservation = Cache::get($activeReservationKey);
+            if (! is_array($activeReservation) && is_array($activeReservationPointer)) {
+                $activeReservation = $activeReservationPointer;
+                unset($activeReservation['reservation_key']);
+                Cache::put($activeReservationKey, $activeReservation, 2592000);
+            }
+            if (is_array($activeReservation) && ($activeReservation['state'] ?? null) === 'publishing') {
+                $reservedAt = Carbon::parse((string) ($activeReservation['reserved_at'] ?? $executionTime));
+                if ($reservedAt->lte($executionTime->copy()->subSeconds(30))) {
+                    $activeReservation['reserved_at'] = $executionTime->toIso8601String();
+                    Cache::put($activeReservationKey, $activeReservation, 2592000);
+                    Cache::put($reservationPointerKey, array_merge($activeReservation, [
+                        'reservation_key' => $activeReservationKey,
+                    ]), 2592000);
+
+                    return [
+                        'dedup_key' => $dedupKey,
+                        'reservation_key' => $activeReservationKey,
+                        'token' => (string) $activeReservation['token'],
+                        'due_at' => (string) $activeReservation['due_at'],
+                    ];
+                }
+
+                return null;
+            }
+        }
+
+        $previousDue = Carbon::instance($cron->getPreviousRunDate($executionTime, allowCurrentDate: true));
+        $lastDispatched = Cache::get($dedupKey);
+        $shouldFire = $lastDispatched === null
+            ? $cron->isDue($executionTime)
+            : $previousDue->gt(Carbon::parse($lastDispatched));
+
+        if (! $shouldFire) {
+            Cache::put(
+                $dedupKey,
+                $lastDispatched ?? $previousDue->toIso8601String(),
+                2592000,
+            );
+
+            return null;
+        }
+
+        $dueAt = $previousDue->toIso8601String();
+        $reservationKey = $reservationPointerKey.':'.hash('sha256', $dueAt);
+        $existingReservation = Cache::get($reservationKey);
+        if (is_array($existingReservation)) {
+            Cache::put($reservationPointerKey, array_merge($existingReservation, [
+                'reservation_key' => $reservationKey,
+            ]), 2592000);
+            if (($existingReservation['state'] ?? null) === 'publishing') {
+                $reservedAt = Carbon::parse((string) ($existingReservation['reserved_at'] ?? $executionTime));
+                if ($reservedAt->lte($executionTime->copy()->subSeconds(30))) {
+                    $existingReservation['reserved_at'] = $executionTime->toIso8601String();
+                    Cache::put($reservationKey, $existingReservation, 2592000);
+
+                    return [
+                        'dedup_key' => $dedupKey,
+                        'reservation_key' => $reservationKey,
+                        'token' => (string) $existingReservation['token'],
+                        'due_at' => (string) $existingReservation['due_at'],
+                    ];
+                }
+
+                return null;
+            }
+            if (in_array($existingReservation['state'] ?? null, ['published', 'executing', 'completed'], true)) {
+                Cache::put($dedupKey, $dueAt, 2592000);
+            }
+
+            return null;
+        }
+
+        $token = (string) Str::uuid();
+        $reservationRecord = [
+            'token' => $token,
+            'due_at' => $dueAt,
+            'state' => 'publishing',
+            'reserved_at' => $executionTime->toIso8601String(),
+            'execution_id' => null,
+            'execution_expires_at' => null,
+        ];
+        Cache::put($reservationPointerKey, array_merge($reservationRecord, [
+            'reservation_key' => $reservationKey,
+        ]), 2592000);
+        if (! Cache::add($reservationKey, $reservationRecord, 2592000)) {
+            return null;
+        }
+
+        return [
+            'dedup_key' => $dedupKey,
+            'reservation_key' => $reservationKey,
+            'token' => $token,
+            'due_at' => $dueAt,
+        ];
+    });
+}
+
+/** @param array{dedup_key: string, reservation_key: string, token: string, due_at: string} $reservation */
+function commitCronDispatchReservation(array $reservation): bool
+{
+    $lockKey = 'cron-dispatch-lock:'.hash('sha256', $reservation['dedup_key']);
+
+    return Cache::lock($lockKey, 10)->block(5, function () use ($reservation): bool {
+        $record = Cache::get($reservation['reservation_key']);
+        if (! is_array($record)
+            || ! hash_equals($reservation['token'], (string) ($record['token'] ?? ''))
+            || ! hash_equals($reservation['due_at'], (string) ($record['due_at'] ?? ''))) {
+            return false;
+        }
+
+        Cache::put($reservation['dedup_key'], $reservation['due_at'], 2592000);
+        if (($record['state'] ?? null) === 'publishing') {
+            $record['state'] = 'published';
+            Cache::put($reservation['reservation_key'], $record, 2592000);
+            $reservationPointerKey = 'cron-dispatch-reservation:'.hash('sha256', $reservation['dedup_key']);
+            $pointer = Cache::get($reservationPointerKey);
+            if (is_array($pointer)
+                && ($pointer['reservation_key'] ?? null) === $reservation['reservation_key']) {
+                Cache::put($reservationPointerKey, array_merge($record, [
+                    'reservation_key' => $reservation['reservation_key'],
+                ]), 2592000);
+            }
+        }
+
+        return true;
+    });
+}
+
+/** @param array{dedup_key: string, reservation_key: string, token: string, due_at: string} $reservation */
+function rollbackCronDispatchReservation(array $reservation): bool
+{
+    $lockKey = 'cron-dispatch-lock:'.hash('sha256', $reservation['dedup_key']);
+
+    return Cache::lock($lockKey, 10)->block(5, function () use ($reservation): bool {
+        $record = Cache::get($reservation['reservation_key']);
+        if (! is_array($record)
+            || ($record['state'] ?? null) !== 'publishing'
+            || ! hash_equals($reservation['token'], (string) ($record['token'] ?? ''))
+            || ! hash_equals($reservation['due_at'], (string) ($record['due_at'] ?? ''))) {
+            return false;
+        }
+
+        Cache::forget($reservation['reservation_key']);
+        $reservationPointerKey = 'cron-dispatch-reservation:'.hash('sha256', $reservation['dedup_key']);
+        $pointer = Cache::get($reservationPointerKey);
+        $pointedReservationKey = is_array($pointer) ? ($pointer['reservation_key'] ?? '') : $pointer;
+        if (hash_equals($reservation['reservation_key'], (string) $pointedReservationKey)) {
+            Cache::forget($reservationPointerKey);
+        }
+
+        return true;
+    });
+}
+
+/** @param array{dedup_key: string, reservation_key: string, token: string, due_at: string} $reservation */
+function acquireCronDispatchExecution(array $reservation, string $executionId, int $leaseSeconds): bool
+{
+    if (blank($executionId)) {
+        throw new InvalidArgumentException('The scheduled dispatch execution identity cannot be empty.');
+    }
+    if ($leaseSeconds < 1) {
+        throw new InvalidArgumentException('The scheduled dispatch execution lease must be positive.');
+    }
+
+    $lockKey = 'cron-dispatch-lock:'.hash('sha256', $reservation['dedup_key']);
+
+    return Cache::lock($lockKey, 10)->block(5, function () use ($reservation, $executionId, $leaseSeconds): bool {
+        $record = Cache::get($reservation['reservation_key']);
+        if (! is_array($record)
+            || ! hash_equals($reservation['token'], (string) ($record['token'] ?? ''))
+            || ! hash_equals($reservation['due_at'], (string) ($record['due_at'] ?? ''))) {
+            return false;
+        }
+
+        if (($record['state'] ?? null) === 'executing') {
+            $expiresAt = $record['execution_expires_at'] ?? null;
+            if (is_string($expiresAt) && Carbon::parse($expiresAt)->isFuture()) {
+                return false;
+            }
+            $record['state'] = 'published';
+            $record['execution_id'] = null;
+            $record['execution_expires_at'] = null;
+        }
+        if (($record['state'] ?? null) === 'completed') {
+            return false;
+        }
+        if (! in_array($record['state'] ?? null, ['publishing', 'published'], true)) {
+            return false;
+        }
+
+        $record['state'] = 'executing';
+        $record['execution_id'] = $executionId;
+        $record['execution_expires_at'] = now()->addSeconds($leaseSeconds)->toIso8601String();
+        Cache::put($reservation['reservation_key'], $record, 2592000);
+        Cache::put($reservation['dedup_key'], $reservation['due_at'], 2592000);
+        $reservationPointerKey = 'cron-dispatch-reservation:'.hash('sha256', $reservation['dedup_key']);
+        $pointer = Cache::get($reservationPointerKey);
+        if (is_array($pointer)
+            && ($pointer['reservation_key'] ?? null) === $reservation['reservation_key']) {
+            Cache::put($reservationPointerKey, array_merge($record, [
+                'reservation_key' => $reservation['reservation_key'],
+            ]), 2592000);
+        }
+
+        return true;
+    });
+}
+
+/** @param array{dedup_key: string, reservation_key: string, token: string, due_at: string} $reservation */
+function releaseCronDispatchExecution(array $reservation, string $executionId): bool
+{
+    $lockKey = 'cron-dispatch-lock:'.hash('sha256', $reservation['dedup_key']);
+
+    return Cache::lock($lockKey, 10)->block(5, function () use ($reservation, $executionId): bool {
+        $record = Cache::get($reservation['reservation_key']);
+        if (! is_array($record)
+            || ($record['state'] ?? null) !== 'executing'
+            || ! hash_equals($reservation['token'], (string) ($record['token'] ?? ''))
+            || ! hash_equals($reservation['due_at'], (string) ($record['due_at'] ?? ''))
+            || ! hash_equals($executionId, (string) ($record['execution_id'] ?? ''))) {
+            return false;
+        }
+
+        $record['state'] = 'published';
+        $record['execution_id'] = null;
+        $record['execution_expires_at'] = null;
+        Cache::put($reservation['reservation_key'], $record, 2592000);
+        $reservationPointerKey = 'cron-dispatch-reservation:'.hash('sha256', $reservation['dedup_key']);
+        $pointer = Cache::get($reservationPointerKey);
+        if (is_array($pointer)
+            && ($pointer['reservation_key'] ?? null) === $reservation['reservation_key']) {
+            Cache::put($reservationPointerKey, array_merge($record, [
+                'reservation_key' => $reservation['reservation_key'],
+            ]), 2592000);
+        }
+
+        return true;
+    });
+}
+
+/** @param array{dedup_key: string, reservation_key: string, token: string, due_at: string} $reservation */
+function completeCronDispatchExecution(array $reservation, string $executionId): bool
+{
+    $lockKey = 'cron-dispatch-lock:'.hash('sha256', $reservation['dedup_key']);
+
+    return Cache::lock($lockKey, 10)->block(5, function () use ($reservation, $executionId): bool {
+        $record = Cache::get($reservation['reservation_key']);
+        if (! is_array($record)
+            || ($record['state'] ?? null) !== 'executing'
+            || ! hash_equals($reservation['token'], (string) ($record['token'] ?? ''))
+            || ! hash_equals($reservation['due_at'], (string) ($record['due_at'] ?? ''))
+            || ! hash_equals($executionId, (string) ($record['execution_id'] ?? ''))) {
+            return false;
+        }
+
+        $record['state'] = 'completed';
+        $record['execution_expires_at'] = null;
+        Cache::put($reservation['reservation_key'], $record, 2592000);
+        $reservationPointerKey = 'cron-dispatch-reservation:'.hash('sha256', $reservation['dedup_key']);
+        $pointer = Cache::get($reservationPointerKey);
+        if (is_array($pointer)
+            && ($pointer['reservation_key'] ?? null) === $reservation['reservation_key']) {
+            Cache::put($reservationPointerKey, array_merge($record, [
+                'reservation_key' => $reservation['reservation_key'],
+            ]), 2592000);
+        }
+
+        return true;
+    });
 }
 
 function validate_timezone(string $timezone): bool

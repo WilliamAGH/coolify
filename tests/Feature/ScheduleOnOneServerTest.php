@@ -1,8 +1,10 @@
 <?php
 
 use App\Models\InstanceSettings;
+use App\Support\BlueGreenMaintenanceTiming;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Artisan;
 
 uses(RefreshDatabase::class);
 
@@ -47,4 +49,36 @@ it('schedules every production job with onOneServer', function () {
             "Scheduled job [{$event->description}] is missing ->onOneServer()"
         );
     });
+});
+
+it('registers and schedules both blue-green crash reconcilers on one server', function () {
+    $schedule = app(Schedule::class);
+    $events = collect($schedule->events());
+
+    foreach ([
+        'blue-green:reconcile' => 'blue-green:reconcile-interrupted-promotions',
+        'blue-green:resume-deactivations' => 'blue-green:resume-interrupted-deactivations',
+    ] as $command => $eventName) {
+        $event = $events->first(
+            fn ($scheduledEvent) => (string) $scheduledEvent->description === $eventName,
+        );
+
+        expect(Artisan::all())->toHaveKey($command)
+            ->and($event)->not->toBeNull()
+            ->and($event->onOneServer)->toBeTrue()
+            ->and($event->withoutOverlapping)->toBeTrue()
+            ->and($event->expiresAt)->toBe(BlueGreenMaintenanceTiming::SCHEDULE_LOCK_EXPIRY_MINUTES)
+            ->and($event->command)->toContain('--stale-after='.BlueGreenMaintenanceTiming::STALE_AFTER_SECONDS);
+    }
+});
+
+it('schedules unpublished deployment claim recovery as a single durable watchdog', function () {
+    $event = collect(app(Schedule::class)->events())->first(
+        fn ($scheduledEvent) => (string) $scheduledEvent->description === 'deployments:recover-unpublished-dispatches',
+    );
+
+    expect($event)->not->toBeNull()
+        ->and($event->onOneServer)->toBeTrue()
+        ->and($event->withoutOverlapping)->toBeTrue()
+        ->and($event->expiresAt)->toBe(6);
 });

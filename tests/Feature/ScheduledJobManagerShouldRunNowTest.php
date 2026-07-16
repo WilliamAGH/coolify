@@ -1,5 +1,6 @@
 <?php
 
+use App\Jobs\ScheduledDispatchOccurrence;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 
@@ -165,4 +166,64 @@ it('passes explicit execution time instead of using Carbon::now()', function () 
     $result = shouldRunCronNow('0 2 * * *', 'UTC', 'test-exec-time:1', $executionTime);
 
     expect($result)->toBeTrue();
+});
+
+it('atomically reserves a due occurrence and releases it after publish failure', function () {
+    Carbon::setTestNow(Carbon::create(2026, 2, 28, 2, 0, 0, 'UTC'));
+
+    $first = reserveCronDispatch('0 2 * * *', 'UTC', 'test-reservation:atomic');
+    $contender = reserveCronDispatch('0 2 * * *', 'UTC', 'test-reservation:atomic');
+
+    expect($first)->not->toBeNull()
+        ->and($contender)->toBeNull()
+        ->and(Cache::get('test-reservation:atomic'))->toBeNull()
+        ->and(rollbackCronDispatchReservation($first))->toBeTrue();
+
+    $retry = reserveCronDispatch('0 2 * * *', 'UTC', 'test-reservation:atomic');
+
+    expect($retry)->not->toBeNull()
+        ->and(commitCronDispatchReservation($retry))->toBeTrue()
+        ->and(Cache::get('test-reservation:atomic'))->toBe($retry['due_at'])
+        ->and(reserveCronDispatch('0 2 * * *', 'UTC', 'test-reservation:atomic'))->toBeNull();
+});
+
+it('recovers a publishing occurrence when the occurrence record was not persisted', function () {
+    Carbon::setTestNow(Carbon::create(2026, 2, 28, 2, 0, 0, 'UTC'));
+
+    $reservation = reserveCronDispatch('0 2 * * *', 'UTC', 'test-reservation:pointer-recovery');
+    expect($reservation)->not->toBeNull();
+    Cache::forget($reservation['reservation_key']);
+
+    Carbon::setTestNow(Carbon::create(2026, 2, 28, 2, 0, 31, 'UTC'));
+    $recovered = reserveCronDispatch('0 2 * * *', 'UTC', 'test-reservation:pointer-recovery');
+
+    expect($recovered)->not->toBeNull()
+        ->and($recovered['token'])->toBe($reservation['token'])
+        ->and($recovered['due_at'])->toBe($reservation['due_at'])
+        ->and(Cache::get($reservation['reservation_key']))->toBeArray()
+        ->and(rollbackCronDispatchReservation($recovered))->toBeTrue();
+});
+
+it('releases occurrence ownership when the scheduled job requests a retry', function () {
+    Carbon::setTestNow(Carbon::create(2026, 2, 28, 2, 0, 0, 'UTC'));
+    $reservation = reserveCronDispatch('0 2 * * *', 'UTC', 'test-reservation:retry');
+    expect($reservation)->not->toBeNull()
+        ->and(commitCronDispatchReservation($reservation))->toBeTrue();
+    $guard = new ScheduledDispatchOccurrence($reservation, 600);
+    $counter = (object) ['attempts' => 0];
+
+    expect(fn () => $guard->handle(new stdClass, function () use ($counter): never {
+        $counter->attempts++;
+
+        throw new RuntimeException('Retry scheduled work.');
+    }))->toThrow(RuntimeException::class, 'Retry scheduled work.');
+
+    expect(data_get(Cache::get($reservation['reservation_key']), 'state'))->toBe('published');
+
+    $guard->handle(new stdClass, function () use ($counter): void {
+        $counter->attempts++;
+    });
+
+    expect(data_get(Cache::get($reservation['reservation_key']), 'state'))->toBe('completed')
+        ->and($counter->attempts)->toBe(2);
 });

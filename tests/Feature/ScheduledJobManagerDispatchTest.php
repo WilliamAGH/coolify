@@ -1,5 +1,6 @@
 <?php
 
+use App\Jobs\ScheduledDispatchOccurrence;
 use App\Jobs\ScheduledJobManager;
 use App\Jobs\ScheduledTaskJob;
 use App\Models\Application;
@@ -10,6 +11,7 @@ use App\Models\ScheduledTask;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
 use App\Models\Team;
+use Illuminate\Contracts\Bus\Dispatcher;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
@@ -109,6 +111,68 @@ it('does not query relationships when constructing scheduled task jobs', functio
     expect(DB::getQueryLog())->toBeEmpty()
         ->and($job->queue)->toBe(crons_queue())
         ->and($job->timeout)->toBe(300);
+});
+
+it('reconciles an ambiguous post-publication failure and executes one physical copy', function () {
+    config(['constants.coolify.self_hosted' => true]);
+    Carbon::setTestNow(Carbon::create(2026, 5, 27, 0, 1, 0, 'UTC'));
+    $application = createScheduledTaskApplication();
+    $task = ScheduledTask::factory()->create([
+        'team_id' => $application->environment->project->team_id,
+        'application_id' => $application->id,
+        'frequency' => '* * * * *',
+        'enabled' => true,
+    ]);
+    $firstPublishedJob = null;
+    $dispatcher = Mockery::mock(Dispatcher::class);
+    $dispatcher->shouldReceive('dispatch')->once()->andReturnUsing(function (ScheduledTaskJob $job) use (&$firstPublishedJob): never {
+        $firstPublishedJob = $job;
+
+        throw new RuntimeException('Post-publication event failed.');
+    });
+    app()->instance(Dispatcher::class, $dispatcher);
+
+    (new ScheduledJobManager)->handle();
+
+    expect(Cache::get("scheduled-task:{$task->id}"))->toBeNull()
+        ->and($firstPublishedJob)->toBeInstanceOf(ScheduledTaskJob::class)
+        ->and(reserveCronDispatch('* * * * *', 'UTC', "scheduled-task:{$task->id}"))->toBeNull();
+
+    Carbon::setTestNow(Carbon::create(2026, 5, 27, 0, 2, 0, 'UTC'));
+    $republishedJob = null;
+    $recoveryDispatcher = Mockery::mock(Dispatcher::class);
+    $recoveryDispatcher->shouldReceive('dispatch')->once()->andReturnUsing(function (ScheduledTaskJob $job) use (&$republishedJob): string {
+        $republishedJob = $job;
+
+        return 'redis-job-id';
+    });
+    app()->instance(Dispatcher::class, $recoveryDispatcher);
+
+    (new ScheduledJobManager)->handle();
+
+    $firstGuard = collect($firstPublishedJob->middleware)
+        ->first(fn (object $middleware): bool => $middleware instanceof ScheduledDispatchOccurrence);
+    $recoveryGuard = collect($republishedJob->middleware)
+        ->first(fn (object $middleware): bool => $middleware instanceof ScheduledDispatchOccurrence);
+    $concurrentRedeliveryGuard = unserialize(serialize($firstGuard));
+    $executionCount = 0;
+    $firstGuard->handle($firstPublishedJob, function () use (&$executionCount, $concurrentRedeliveryGuard, $firstPublishedJob): void {
+        $executionCount++;
+        $concurrentRedeliveryGuard->handle($firstPublishedJob, function () use (&$executionCount): void {
+            $executionCount++;
+        });
+    });
+    $recoveryGuard->handle($republishedJob, function () use (&$executionCount): void {
+        $executionCount++;
+    });
+
+    expect($firstGuard)->toBeInstanceOf(ScheduledDispatchOccurrence::class)
+        ->and($recoveryGuard)->toBeInstanceOf(ScheduledDispatchOccurrence::class)
+        ->and($recoveryGuard->reservation['token'])->toBe($firstGuard->reservation['token'])
+        ->and($recoveryGuard->executionId)->not->toBe($firstGuard->executionId)
+        ->and($concurrentRedeliveryGuard->executionId)->toBe($firstGuard->executionId)
+        ->and($executionCount)->toBe(1)
+        ->and(Cache::get("scheduled-task:{$task->id}"))->toBe($firstGuard->reservation['due_at']);
 });
 
 function createScheduledTaskApplication(): Application
