@@ -14,7 +14,7 @@
   <coverage/>
   <php>
     <ini name="memory_limit" value="1G"/>
-    <env name="APP_ENV" value="testing"/>
+    <env name="APP_ENV" value="testing" force="true"/>
     <env name="APP_MAINTENANCE_DRIVER" value="file" force="true"/>
     <env name="APP_MAINTENANCE_STORE" value="array" force="true"/>
     <env name="BCRYPT_ROUNDS" value="4"/>
