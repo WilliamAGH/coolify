@@ -4,7 +4,6 @@ namespace App\Support;
 
 use Closure;
 use Illuminate\Queue\Jobs\RedisJob;
-use Illuminate\Queue\Jobs\SyncJob;
 use LogicException;
 
 class ProxyMutationExecutionPipe
@@ -24,11 +23,7 @@ class ProxyMutationExecutionPipe
         }
 
         ProxyMutationQueue::assertMarkedTransport($command);
-        if ($this->isSynchronousQueueExecution($command)) {
-            ProxyMutationQueue::assertSynchronousExecutionTarget($command);
-        } else {
-            ProxyMutationQueue::assertUntamperedDispatchTarget($command);
-        }
+        ProxyMutationQueue::assertUntamperedDispatchTarget($command);
 
         if ($queuedRedisJob !== null && $reservedJob === null) {
             throw new LogicException('Proxy-mutation work cannot execute from a noncanonical Redis queue.');
@@ -52,16 +47,6 @@ class ProxyMutationExecutionPipe
         }
 
         return $command->job;
-    }
-
-    private function isSynchronousQueueExecution(mixed $command): bool
-    {
-        if (! is_object($command) || ! isset($command->job) || ! $command->job instanceof SyncJob) {
-            return false;
-        }
-
-        return $command->job->getConnectionName() === 'sync'
-            && $command->job->getQueue() === 'sync';
     }
 
     private function reservedProxyMutationJob(?RedisJob $queuedRedisJob): ?RedisJob

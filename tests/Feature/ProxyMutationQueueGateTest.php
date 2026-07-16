@@ -21,6 +21,7 @@ use Illuminate\Queue\SyncQueue;
 use Illuminate\Support\Str;
 use Laravel\Horizon\RedisQueue as HorizonRedisQueue;
 use Lorisleiva\Actions\Decorators\JobDecorator;
+use Spatie\Activitylog\Models\Activity;
 use Tests\Support\ControlPlaneStateFixture;
 
 $proxyMutationQueueGateEnvironment = [
@@ -229,20 +230,13 @@ it('leaves unmarked commands outside the mutation lease', function () {
     expect($result)->toBe('handled')->and($handled)->toBeTrue();
 });
 
-it('admits framework-backed synchronous execution without weakening dispatch targets', function () {
+it('rejects framework-backed synchronous execution', function () {
     $command = (new ReflectionClass(CleanupStuckedResourcesJob::class))->newInstanceWithoutConstructor();
     ProxyMutationQueue::assign($command);
     $command->onConnection('sync');
     $command->setJob(new SyncJob(app(), '{}', 'sync', ProxyMutationQueue::NAME));
 
-    $result = (new ProxyMutationExecutionPipe)->handle($command, static fn (): string => 'handled');
-
-    expect($result)->toBe('handled');
-
-    $unbackedCommand = (new ReflectionClass(CleanupStuckedResourcesJob::class))->newInstanceWithoutConstructor();
-    ProxyMutationQueue::assign($unbackedCommand);
-    $unbackedCommand->onConnection('sync');
-    expect(fn (): mixed => (new ProxyMutationExecutionPipe)->handle($unbackedCommand, static fn (): null => null))
+    expect(fn (): mixed => (new ProxyMutationExecutionPipe)->handle($command, static fn (): null => null))
         ->toThrow(LogicException::class, 'cannot target connection');
 });
 
@@ -344,5 +338,50 @@ it('admits only a genuinely popped marker job under the drain lease', function (
         ]);
     } finally {
         $queue->clear(ProxyMutationQueue::NAME);
+    }
+});
+
+it('executes accepted nested proxy activity inline after the producer freeze', function () {
+    if (($unsupportedReason = ControlPlaneStateFixture::unsupportedReason()) !== null) {
+        $this->markTestSkipped($unsupportedReason);
+    }
+
+    $fixture = ControlPlaneStateFixture::create('coolify-proxy-mutation-inline-drain');
+    $epoch = 'operation-0123456789.inline-drain-freeze';
+    $queue = app(QueueManager::class)->connection(ProxyMutationQueue::CONNECTION);
+
+    try {
+        proxyMutationQueueGateConfigureFreeze($fixture, $epoch);
+        $fixture->writeMutationLease();
+        $queue->clear(ProxyMutationQueue::NAME);
+        $job = new CleanupStuckedResourcesJob;
+        $queue->push($job, '', ProxyMutationQueue::NAME);
+        $reservedJob = $queue->pop(ProxyMutationQueue::NAME);
+        expect($reservedJob)->toBeInstanceOf(RedisJob::class);
+        $job->setJob($reservedJob);
+        $fixture->writeMarker('mutation-freeze-epoch', $epoch);
+
+        ControlPlaneMode::withMutationDrainLease($reservedJob, function (): void {
+            $inlineTask = new ProxyMutationTask(
+                activity: new Activity,
+                ignore_errors: false,
+                call_event_on_finish: null,
+                call_event_data: null,
+                executeInline: true,
+            );
+
+            expect($inlineTask->connection)->toBeNull()
+                ->and(fn () => new ProxyMutationTask(
+                    activity: new Activity,
+                    ignore_errors: false,
+                    call_event_on_finish: null,
+                    call_event_data: null,
+                ))->toThrow(ControlPlaneMutationLockedException::class);
+        }, $job);
+
+        $reservedJob->delete();
+    } finally {
+        $queue->clear(ProxyMutationQueue::NAME);
+        $fixture->cleanup();
     }
 });

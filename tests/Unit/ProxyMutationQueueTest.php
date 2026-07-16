@@ -63,6 +63,20 @@ it('routes the concrete proxy activity task through the canonical queue', functi
         ->and(ProxyMutationQueue::isMarked($task))->toBeTrue();
 });
 
+it('keeps an accepted inline proxy activity off the producer queue', function () {
+    $task = new ProxyMutationTask(
+        activity: new Activity,
+        ignore_errors: false,
+        call_event_on_finish: null,
+        call_event_data: null,
+        executeInline: true,
+    );
+
+    expect($task->connection)->toBeNull()
+        ->and($task->queue)->not->toBe(ProxyMutationQueue::NAME)
+        ->and(ProxyMutationQueue::isMarked($task))->toBeTrue();
+});
+
 it('recognizes Laravel action and listener transports through their typed owners', function () {
     $action = StartProxy::makeJob();
     $listener = new ProxyStatusChangedNotification;

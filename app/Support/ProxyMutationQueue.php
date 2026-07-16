@@ -92,16 +92,6 @@ final class ProxyMutationQueue
         ]);
     }
 
-    public static function assertSynchronousExecutionTarget(object $transport): void
-    {
-        self::assertUntamperedTarget($transport, [
-            'connection' => 'sync',
-            'queue' => self::NAME,
-            'chainConnection' => self::CONNECTION,
-            'chainQueue' => self::NAME,
-        ]);
-    }
-
     public static function registerPayloadTargetGate(): void
     {
         Queue::createPayloadUsing(static function (string $connection, ?string $queue, array $payload): array {

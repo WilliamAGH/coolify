@@ -5,12 +5,10 @@ namespace App\Jobs;
 use App\Contracts\ProxyMutation;
 use App\Support\ProxyMutationQueue;
 use App\Support\UsesProxyMutationQueue;
-use Illuminate\Foundation\Bus\Dispatchable;
 use Spatie\Activitylog\Models\Activity;
 
 class ProxyMutationTask extends CoolifyTask implements ProxyMutation
 {
-    use Dispatchable;
     use UsesProxyMutationQueue;
 
     public function __construct(
@@ -18,6 +16,7 @@ class ProxyMutationTask extends CoolifyTask implements ProxyMutation
         bool $ignore_errors,
         mixed $call_event_on_finish,
         mixed $call_event_data,
+        bool $executeInline = false,
     ) {
         parent::__construct(
             activity: $activity,
@@ -26,8 +25,10 @@ class ProxyMutationTask extends CoolifyTask implements ProxyMutation
             call_event_data: $call_event_data,
         );
 
-        $this->onQueue(ProxyMutationQueue::NAME);
-        ProxyMutationQueue::assign($this);
+        if (! $executeInline) {
+            $this->onQueue(ProxyMutationQueue::NAME);
+            ProxyMutationQueue::assign($this);
+        }
     }
 
     public function handle(): void
