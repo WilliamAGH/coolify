@@ -42,6 +42,7 @@ ln -s "$FIXTURE_APP/docker" "$fixture/bin/docker"
 export PATH=$fixture/bin:$PATH
 export CONTROL_PLANE_QUEUE_FIXTURE_REPOSITORY_ROOT=$REPOSITORY_ROOT
 export CONTROL_PLANE_QUEUE_FIXTURE_QUEUE_PREFIX=$QUEUE_PREFIX
+export APP_CONFIG_CACHE=$fixture/config.php
 export APP_ENV=testing
 export CONTROL_PLANE_MODE=active
 export QUEUE_CONNECTION=redis
