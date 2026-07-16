@@ -2,6 +2,8 @@
 
 namespace App\Console\Commands;
 
+use App\Models\ApplicationBlueGreenDeployment;
+use App\Models\ApplicationDeploymentQueue;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 
@@ -42,19 +44,54 @@ class CleanupDatabase extends Command
         }
 
         // Cleanup activity_log table
-        $activity_log = DB::table('activity_log')->where('created_at', '<', now()->subDays($keep_days))->orderBy('created_at', 'desc')->skip(10);
-        $count = $activity_log->count();
+        $activityLogIds = DB::table('activity_log')
+            ->where('created_at', '<', now()->subDays($keep_days))
+            ->orderBy('created_at', 'desc')
+            ->pluck('id')
+            ->slice(10)
+            ->values();
+        $count = $activityLogIds->count();
         echo "Delete $count entries from activity_log.\n";
         if ($this->option('yes')) {
-            $activity_log->delete();
+            DB::table('activity_log')->whereIn('id', $activityLogIds)->delete();
         }
 
         // Cleanup application_deployment_queues table
-        $application_deployment_queues = DB::table('application_deployment_queues')->where('created_at', '<', now()->subDays($keep_days))->orderBy('created_at', 'desc')->skip(10);
-        $count = $application_deployment_queues->count();
+        $applicationDeploymentQueuesTable = (new ApplicationDeploymentQueue)->getTable();
+        $blueGreenDeploymentsTable = (new ApplicationBlueGreenDeployment)->getTable();
+        $applicationDeploymentQueues = DB::table($applicationDeploymentQueuesTable)
+            ->where('created_at', '<', now()->subDays($keep_days))
+            ->whereNotExists(function ($stateQuery) use ($applicationDeploymentQueuesTable, $blueGreenDeploymentsTable): void {
+                $stateQuery
+                    ->selectRaw('1')
+                    ->from($blueGreenDeploymentsTable)
+                    ->whereColumn("{$blueGreenDeploymentsTable}.application_id", "{$applicationDeploymentQueuesTable}.application_id")
+                    ->where(function ($provenanceQuery) use ($applicationDeploymentQueuesTable, $blueGreenDeploymentsTable): void {
+                        foreach ([
+                            'blue_deployment_uuid',
+                            'green_deployment_uuid',
+                            'pending_deployment_uuid',
+                            'operation_deployment_uuid',
+                            'operation_previous_deployment_uuid',
+                        ] as $column) {
+                            $provenanceQuery->orWhereColumn(
+                                "{$blueGreenDeploymentsTable}.{$column}",
+                                "{$applicationDeploymentQueuesTable}.deployment_uuid",
+                            );
+                        }
+                    });
+            })
+            ->orderBy('created_at', 'desc');
+        $applicationDeploymentQueueIds = (clone $applicationDeploymentQueues)
+            ->pluck('id')
+            ->slice(10)
+            ->values();
+        $count = $applicationDeploymentQueueIds->count();
         echo "Delete $count entries from application_deployment_queues.\n";
         if ($this->option('yes')) {
-            $application_deployment_queues->delete();
+            DB::table($applicationDeploymentQueuesTable)
+                ->whereIn('id', $applicationDeploymentQueueIds)
+                ->delete();
         }
 
         // Cleanup scheduled_task_executions table

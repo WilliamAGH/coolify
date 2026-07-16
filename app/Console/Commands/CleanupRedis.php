@@ -18,6 +18,10 @@ class CleanupRedis extends Command
         $dryRun = $this->option('dry-run');
         $skipOverlapping = $this->option('skip-overlapping');
 
+        if ($dryRun) {
+            $this->warn('DRY RUN MODE - No data will be deleted');
+        }
+
         $deletedCount = 0;
         $totalKeys = 0;
 

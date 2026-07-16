@@ -2,6 +2,8 @@
 
 namespace App\Console;
 
+use App\Actions\Application\BlueGreen\ReconcileBlueGreenDeployments;
+use App\Actions\Application\BlueGreen\ResumeBlueGreenDeactivations;
 use App\Jobs\ApiTokenExpirationWarningJob;
 use App\Jobs\CheckForUpdatesJob;
 use App\Jobs\CheckHelperImageJob;
@@ -16,8 +18,11 @@ use App\Jobs\ScheduledJobManager;
 use App\Jobs\ServerManagerJob;
 use App\Jobs\UpdateCoolifyJob;
 use App\Models\InstanceSettings;
+use App\Support\BlueGreenMaintenanceTiming;
+use App\Support\ControlPlaneMode;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Foundation\Console\Kernel as ConsoleKernel;
+use Lorisleiva\Actions\ActionManager;
 
 class Kernel extends ConsoleKernel
 {
@@ -31,6 +36,10 @@ class Kernel extends ConsoleKernel
 
     protected function schedule(Schedule $schedule): void
     {
+        if (! ControlPlaneMode::backgroundServicesAllowed()) {
+            return;
+        }
+
         $this->scheduleInstance = $schedule;
         $this->settings = instanceSettings();
         $this->updateCheckFrequency = $this->settings->update_check_frequency ?: '0 * * * *';
@@ -48,6 +57,25 @@ class Kernel extends ConsoleKernel
         $this->scheduleInstance->command('cleanup:redis --clear-locks')->daily();
         $this->scheduleInstance->command('sanctum:prune-expired --hours=1')->hourly()->onOneServer();
         $this->scheduleInstance->job(new ApiTokenExpirationWarningJob)->hourly()->onOneServer();
+        $this->scheduleInstance->call(fn (): int => recover_stale_application_deployment_dispatches())
+            ->name('deployments:recover-unpublished-dispatches')
+            ->everyMinute()
+            ->onOneServer()
+            ->withoutOverlapping(6);
+        $this->scheduleInstance->command(
+            'blue-green:reconcile --stale-after='.BlueGreenMaintenanceTiming::STALE_AFTER_SECONDS,
+        )
+            ->name('blue-green:reconcile-interrupted-promotions')
+            ->everyMinute()
+            ->onOneServer()
+            ->withoutOverlapping(BlueGreenMaintenanceTiming::SCHEDULE_LOCK_EXPIRY_MINUTES);
+        $this->scheduleInstance->command(
+            'blue-green:resume-deactivations --stale-after='.BlueGreenMaintenanceTiming::STALE_AFTER_SECONDS,
+        )
+            ->name('blue-green:resume-interrupted-deactivations')
+            ->everyMinute()
+            ->onOneServer()
+            ->withoutOverlapping(BlueGreenMaintenanceTiming::SCHEDULE_LOCK_EXPIRY_MINUTES);
 
         if (isDev()) {
             // Instance Jobs
@@ -120,6 +148,8 @@ class Kernel extends ConsoleKernel
 
     protected function commands(): void
     {
+        app(ActionManager::class)->registerCommandsForAction(ReconcileBlueGreenDeployments::class);
+        app(ActionManager::class)->registerCommandsForAction(ResumeBlueGreenDeactivations::class);
         $this->load(__DIR__.'/Commands');
 
         require base_path('routes/console.php');

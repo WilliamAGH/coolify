@@ -15,6 +15,7 @@ use App\Models\ScheduledTaskExecution;
 use App\Models\Server;
 use App\Models\StandalonePostgresql;
 use App\Models\User;
+use App\Support\ControlPlaneMode;
 use Carbon\Carbon;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Artisan;
@@ -33,6 +34,18 @@ class Init extends Command
 
     public function handle()
     {
+        if (! ControlPlaneMode::startupWorkAllowed()) {
+            $this->info('Control plane startup work is disabled: initialization skipped.');
+
+            return self::SUCCESS;
+        }
+
+        if (env('INIT_ENABLED', true) !== true) {
+            $this->info('Initialization is disabled on this server.');
+
+            return self::SUCCESS;
+        }
+
         Artisan::call('optimize:clear');
         Artisan::call('optimize');
 

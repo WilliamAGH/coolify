@@ -125,6 +125,12 @@ return [
 
     'key' => env('APP_KEY'),
 
+    'previous_keys' => [
+        ...array_filter(
+            explode(',', (string) env('APP_PREVIOUS_KEYS', '')),
+        ),
+    ],
+
     'cipher' => 'AES-256-CBC',
 
     /*
@@ -141,8 +147,8 @@ return [
     */
 
     'maintenance' => [
-        'driver' => 'cache',
-        'store' => 'redis',
+        'driver' => env('APP_MAINTENANCE_DRIVER', 'cache'),
+        'store' => env('APP_MAINTENANCE_STORE', 'redis'),
     ],
 
     /*

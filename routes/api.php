@@ -7,6 +7,7 @@ use App\Http\Controllers\Api\DeployController;
 use App\Http\Controllers\Api\GithubController;
 use App\Http\Controllers\Api\HetznerController;
 use App\Http\Controllers\Api\OtherController;
+use App\Http\Controllers\Api\PreflightController;
 use App\Http\Controllers\Api\ProjectController;
 use App\Http\Controllers\Api\ResourcesController;
 use App\Http\Controllers\Api\ScheduledTasksController;
@@ -16,9 +17,16 @@ use App\Http\Controllers\Api\ServersController;
 use App\Http\Controllers\Api\ServicesController;
 use App\Http\Controllers\Api\TeamController;
 use App\Http\Middleware\ApiAllowed;
+use App\Support\ControlPlaneReadOnlyRoutePolicy;
+use Illuminate\Routing\Middleware\ThrottleRequests;
 use Illuminate\Support\Facades\Route;
 
-Route::get('/health', [OtherController::class, 'healthcheck']);
+foreach (ControlPlaneReadOnlyRoutePolicy::apiRoutes() as $uri => $action) {
+    Route::get($uri, $action);
+}
+Route::get('/control-plane/probe', [PreflightController::class, 'directProbe']);
+Route::get('/control-plane/route-health', [PreflightController::class, 'routeHealth'])
+    ->withoutMiddleware(ThrottleRequests::class);
 Route::group([
     'prefix' => 'v1',
 ], function () {

@@ -2,17 +2,16 @@
 
 namespace App\Http\Middleware;
 
+use App\Support\ControlPlaneReadOnlyRoutePolicy;
 use Illuminate\Foundation\Http\Middleware\PreventRequestsDuringMaintenance as Middleware;
+use Illuminate\Http\Request;
 
 class PreventRequestsDuringMaintenance extends Middleware
 {
-    /**
-     * The URIs that should be reachable while maintenance mode is enabled.
-     *
-     * @var array<int, string>
-     */
-    protected $except = [
-        'webhooks/*',
-        '/api/health',
-    ];
+    protected function inExceptArray($request)
+    {
+        return parent::inExceptArray($request)
+            || ($request instanceof Request
+                && ControlPlaneReadOnlyRoutePolicy::allowsPassiveRequest($request));
+    }
 }

@@ -40,3 +40,8 @@ CHANGELOG.md
 /.workspaces
 tests/Browser/Screenshots
 tests/v4/Browser/Screenshots
+/.control-plane-labs/
+**/__pycache__/
+**/*.py[cod]
+tests/Integration/**/.artifacts/
+tests/Integration/**/.evidence/

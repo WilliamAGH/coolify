@@ -1,18 +1,16 @@
 <?php
 
-use App\Enums\ActivityTypes;
-use App\Enums\ProcessStatus;
 use App\Helpers\SshMultiplexingHelper;
 use App\Helpers\SshRetryHandler;
-use App\Jobs\CoolifyTask;
 use App\Models\Application;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\PrivateKey;
 use App\Models\Server;
+use App\Support\ControlPlaneMode;
+use App\Support\RemoteProcess;
 use Carbon\Carbon;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Collection;
-use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Str;
 use Spatie\Activitylog\Contracts\Activity;
@@ -25,151 +23,168 @@ function remote_process(
     ?Model $model = null,
     bool $ignore_errors = false,
     $callEventOnFinish = null,
-    $callEventData = null
+    $callEventData = null,
 ): Activity {
-    $type = $type ?? ActivityTypes::INLINE->value;
-    $command = $command instanceof Collection ? $command->toArray() : $command;
-
-    if ($server->isNonRoot()) {
-        $command = parseCommandsByLineForSudo(collect($command), $server);
-    }
-
-    $command_string = implode("\n", $command);
-
-    if (Auth::check()) {
-        $teams = Auth::user()->teams->pluck('id');
-        if (! $teams->contains($server->team_id) && ! $teams->contains(0)) {
-            throw new Exception('User is not part of the team that owns this server');
-        }
-    }
-
-    SshMultiplexingHelper::ensureMultiplexedConnection($server);
-
-    $properties = [
-        'server_uuid' => $server->uuid,
-        'command' => $command_string,
-        'type' => $type,
-        'type_uuid' => $type_uuid,
-        'status' => ProcessStatus::QUEUED->value,
-        'team_id' => $server->team_id,
-    ];
-
-    $activityLog = activity()
-        ->withProperties($properties)
-        ->event($type);
-
-    if ($model) {
-        $activityLog->performedOn($model);
-    }
-
-    $activity = $activityLog->log('[]');
-
-    dispatch(new CoolifyTask(
-        activity: $activity,
+    return RemoteProcess::mutation(
+        command: $command,
+        server: $server,
+        type: $type,
+        type_uuid: $type_uuid,
+        model: $model,
         ignore_errors: $ignore_errors,
-        call_event_on_finish: $callEventOnFinish,
-        call_event_data: $callEventData,
-    ));
+        callEventOnFinish: $callEventOnFinish,
+        callEventData: $callEventData,
+    );
+}
 
-    $activity->refresh();
-
-    return $activity;
+/**
+ * Queue an explicit proxy-write activity through the proxy-mutations boundary.
+ */
+function proxy_mutation_remote_process(
+    Collection|array $command,
+    Server $server,
+    ?string $type = null,
+    ?string $type_uuid = null,
+    ?Model $model = null,
+    bool $ignore_errors = false,
+    $callEventOnFinish = null,
+    $callEventData = null,
+): Activity {
+    return remote_process(
+        command: $command,
+        server: $server,
+        type: $type,
+        type_uuid: $type_uuid,
+        model: $model,
+        ignore_errors: $ignore_errors,
+        callEventOnFinish: $callEventOnFinish,
+        callEventData: $callEventData,
+    );
 }
 
 function instant_scp(string $source, string $dest, Server $server, $throwError = true)
 {
-    return SshRetryHandler::retry(
-        function () use ($source, $dest, $server) {
-            $scp_command = SshMultiplexingHelper::generateScpCommand($server, $source, $dest);
-            $process = Process::timeout(config('constants.ssh.command_timeout'))->run($scp_command);
+    ControlPlaneMode::ensureActive('Remote execution');
 
-            $output = trim($process->output());
-            $exitCode = $process->exitCode();
+    return ControlPlaneMode::withMutationOperationLease(function () use ($source, $dest, $server, $throwError) {
+        return SshRetryHandler::retry(
+            function () use ($source, $dest, $server) {
+                $scp_command = SshMultiplexingHelper::generateScpCommand($server, $source, $dest);
+                $process = Process::timeout(config('constants.ssh.command_timeout'))->run($scp_command);
 
-            if ($exitCode !== 0) {
-                excludeCertainErrors($process->errorOutput(), $exitCode);
-            }
+                $output = trim($process->output());
+                $exitCode = $process->exitCode();
 
-            return $output === 'null' ? null : $output;
-        },
-        [
-            'server' => $server->ip,
-            'source' => $source,
-            'dest' => $dest,
-            'function' => 'instant_scp',
-        ],
-        $throwError
-    );
+                if ($exitCode !== 0) {
+                    excludeCertainErrors($process->errorOutput(), $exitCode);
+                }
+
+                return $output === 'null' ? null : $output;
+            },
+            [
+                'server' => $server->ip,
+                'source' => $source,
+                'dest' => $dest,
+                'function' => 'instant_scp',
+            ],
+            $throwError
+        );
+    });
 }
 
 function instant_remote_process_with_timeout(Collection|array $command, Server $server, bool $throwError = true, bool $no_sudo = false): ?string
 {
-    $command = $command instanceof Collection ? $command->toArray() : $command;
-    if ($server->isNonRoot() && ! $no_sudo) {
-        $command = parseCommandsByLineForSudo(collect($command), $server);
-    }
-    $command_string = implode("\n", $command);
+    ControlPlaneMode::ensureActive('Remote execution');
 
-    return SshRetryHandler::retry(
-        function () use ($server, $command_string) {
-            $sshCommand = SshMultiplexingHelper::generateSshCommand($server, $command_string);
-            $process = Process::timeout(30)->run($sshCommand);
+    return ControlPlaneMode::withMutationOperationLease(function () use ($command, $server, $throwError, $no_sudo): ?string {
+        $command = $command instanceof Collection ? $command->toArray() : $command;
+        if ($server->isNonRoot() && ! $no_sudo) {
+            $command = parseCommandsByLineForSudo(collect($command), $server);
+        }
+        $command_string = implode("\n", $command);
 
-            $output = trim($process->output());
-            $exitCode = $process->exitCode();
+        return SshRetryHandler::retry(
+            function () use ($server, $command_string) {
+                $sshCommand = SshMultiplexingHelper::generateSshCommand($server, $command_string);
+                $process = Process::timeout(30)->run($sshCommand);
 
-            if ($exitCode !== 0) {
-                excludeCertainErrors($process->errorOutput(), $exitCode);
-            }
+                $output = trim($process->output());
+                $exitCode = $process->exitCode();
 
-            // Sanitize output to ensure valid UTF-8 encoding
-            $output = $output === 'null' ? null : sanitize_utf8_text($output);
+                if ($exitCode !== 0) {
+                    excludeCertainErrors($process->errorOutput(), $exitCode);
+                }
 
-            return $output;
-        },
-        [
-            'server' => $server->ip,
-            'command_preview' => substr($command_string, 0, 100),
-            'function' => 'instant_remote_process_with_timeout',
-        ],
-        $throwError
-    );
+                // Sanitize output to ensure valid UTF-8 encoding
+                $output = $output === 'null' ? null : sanitize_utf8_text($output);
+
+                return $output;
+            },
+            [
+                'server' => $server->ip,
+                'command_preview' => substr($command_string, 0, 100),
+                'function' => 'instant_remote_process_with_timeout',
+            ],
+            $throwError
+        );
+    });
 }
 
-function instant_remote_process(Collection|array $command, Server $server, bool $throwError = true, bool $no_sudo = false, ?int $timeout = null, bool $disableMultiplexing = false): ?string
+function instant_remote_process(Collection|array $command, Server $server, bool $throwError = true, bool $no_sudo = false, ?int $timeout = null, bool $disableMultiplexing = false, ?string $input = null): ?string
 {
-    $command = $command instanceof Collection ? $command->toArray() : $command;
+    ControlPlaneMode::ensureActive('Remote execution');
 
-    if ($server->isNonRoot() && ! $no_sudo) {
-        $command = parseCommandsByLineForSudo(collect($command), $server);
-    }
-    $command_string = implode("\n", $command);
-    $effectiveTimeout = $timeout ?? config('constants.ssh.command_timeout');
+    return ControlPlaneMode::withMutationOperationLease(function () use (
+        $command,
+        $server,
+        $throwError,
+        $no_sudo,
+        $timeout,
+        $disableMultiplexing,
+        $input,
+    ): ?string {
+        $command = $command instanceof Collection ? $command->toArray() : $command;
 
-    return SshRetryHandler::retry(
-        function () use ($server, $command_string, $effectiveTimeout, $disableMultiplexing) {
-            $sshCommand = SshMultiplexingHelper::generateSshCommand($server, $command_string, $disableMultiplexing);
-            $process = Process::timeout($effectiveTimeout)->run($sshCommand);
+        if ($server->isNonRoot() && ! $no_sudo) {
+            $command = parseCommandsByLineForSudo(collect($command), $server);
+        }
+        $command_string = implode("\n", $command);
+        $effectiveTimeout = $timeout ?? config('constants.ssh.command_timeout');
 
-            $output = trim($process->output());
-            $exitCode = $process->exitCode();
+        return SshRetryHandler::retry(
+            function () use ($server, $command_string, $effectiveTimeout, $disableMultiplexing, $input) {
+                $sshCommand = SshMultiplexingHelper::generateSshCommand(
+                    $server,
+                    $command_string,
+                    $disableMultiplexing,
+                    forwardInput: $input !== null,
+                );
+                $pendingProcess = Process::timeout($effectiveTimeout);
+                if ($input !== null) {
+                    $pendingProcess->input($input);
+                }
+                $process = $pendingProcess->run($sshCommand);
 
-            if ($exitCode !== 0) {
-                excludeCertainErrors($process->errorOutput(), $exitCode);
-            }
+                $output = trim($process->output());
+                $exitCode = $process->exitCode();
 
-            // Sanitize output to ensure valid UTF-8 encoding
-            $output = $output === 'null' ? null : sanitize_utf8_text($output);
+                if ($exitCode !== 0) {
+                    excludeCertainErrors($process->errorOutput(), $exitCode);
+                }
 
-            return $output;
-        },
-        [
-            'server' => $server->ip,
-            'command_preview' => substr($command_string, 0, 100),
-            'function' => 'instant_remote_process',
-        ],
-        $throwError
-    );
+                // Sanitize output to ensure valid UTF-8 encoding
+                $output = $output === 'null' ? null : sanitize_utf8_text($output);
+
+                return $output;
+            },
+            [
+                'server' => $server->ip,
+                'command_preview' => substr($command_string, 0, 100),
+                'function' => 'instant_remote_process',
+            ],
+            $throwError
+        );
+    });
 }
 
 function excludeCertainErrors(string $errorOutput, ?int $exitCode = null)

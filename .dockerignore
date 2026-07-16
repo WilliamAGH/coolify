@@ -33,6 +33,9 @@ docker/coolify-realtime/node_modules
 /storage/app/debugbar
 /storage/logs
 /storage/pail
-
-
+/.control-plane-labs/
+**/__pycache__/
+**/*.py[cod]
+tests/Integration/**/.artifacts/
+tests/Integration/**/.evidence/
 

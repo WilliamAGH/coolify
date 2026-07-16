@@ -4,10 +4,10 @@ namespace App\Jobs;
 
 use App\Actions\CoolifyTask\RunRemoteProcess;
 use App\Enums\ProcessStatus;
+use App\Support\ControlPlaneMode;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeEncrypted;
 use Illuminate\Contracts\Queue\ShouldQueue;
-use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
@@ -15,7 +15,7 @@ use Spatie\Activitylog\Models\Activity;
 
 class CoolifyTask implements ShouldBeEncrypted, ShouldQueue
 {
-    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    use InteractsWithQueue, Queueable, SerializesModels;
 
     /**
      * The number of times the job may be attempted.
@@ -35,13 +35,12 @@ class CoolifyTask implements ShouldBeEncrypted, ShouldQueue
     /**
      * Create a new job instance.
      */
-    public function __construct(
+    protected function __construct(
         public Activity $activity,
         public bool $ignore_errors,
         public $call_event_on_finish,
         public $call_event_data,
     ) {
-
         $this->onQueue('high');
     }
 
@@ -50,6 +49,8 @@ class CoolifyTask implements ShouldBeEncrypted, ShouldQueue
      */
     public function handle(): void
     {
+        ControlPlaneMode::ensureActive('Remote execution');
+
         $remote_process = resolve(RunRemoteProcess::class, [
             'activity' => $this->activity,
             'ignore_errors' => $this->ignore_errors,
@@ -57,7 +58,7 @@ class CoolifyTask implements ShouldBeEncrypted, ShouldQueue
             'call_event_data' => $this->call_event_data,
         ]);
 
-        $remote_process();
+        ControlPlaneMode::withMutationOperationLease($remote_process);
     }
 
     /**

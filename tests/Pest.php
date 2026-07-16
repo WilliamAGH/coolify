@@ -2,6 +2,38 @@
 
 use App\Models\Server;
 use Illuminate\Support\Once;
+use Tests\TestCase;
+
+(function (): void {
+    if (PHP_OS_FAMILY !== 'Darwin') {
+        return;
+    }
+
+    $homebrewPrefixes = [
+        getenv('HOMEBREW_PREFIX') ?: null,
+        '/opt/homebrew',
+        '/usr/local',
+    ];
+
+    foreach (array_unique($homebrewPrefixes) as $homebrewPrefix) {
+        if ($homebrewPrefix === null) {
+            continue;
+        }
+
+        $gnuCoreutilsBin = $homebrewPrefix.'/opt/coreutils/libexec/gnubin';
+
+        if (! is_executable($gnuCoreutilsBin.'/stat')) {
+            continue;
+        }
+
+        $path = $gnuCoreutilsBin.PATH_SEPARATOR.(getenv('PATH') ?: '');
+        putenv("PATH={$path}");
+        $_ENV['PATH'] = $path;
+        $_SERVER['PATH'] = $path;
+
+        break;
+    }
+})();
 
 /*
 |--------------------------------------------------------------------------
@@ -13,23 +45,15 @@ use Illuminate\Support\Once;
 | need to change it using the "uses()" function to bind a different classes or traits.
 |
 */
-uses(Tests\TestCase::class)->in('Feature', 'v4/Feature', 'v4/Browser');
+uses(TestCase::class)
+    ->beforeEach(function (): void {
+        // Flush the Once memoization cache to ensure tests get fresh data
+        Once::flush();
 
-/*
-|--------------------------------------------------------------------------
-| Test Hooks
-|--------------------------------------------------------------------------
-|
-| Global hooks that run before/after each test.
-|
-*/
-beforeEach(function () {
-    // Flush the Once memoization cache to ensure tests get fresh data
-    Once::flush();
-
-    // Flush the Server identity map cache to ensure tests get fresh data
-    Server::flushIdentityMap();
-});
+        // Flush the Server identity map cache to ensure tests get fresh data
+        Server::flushIdentityMap();
+    })
+    ->in('Feature', 'v4/Feature', 'v4/Browser');
 
 /*
 |--------------------------------------------------------------------------

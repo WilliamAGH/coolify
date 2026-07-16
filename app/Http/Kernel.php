@@ -11,6 +11,7 @@ use App\Http\Middleware\CanUpdateResource;
 use App\Http\Middleware\CheckForcePasswordReset;
 use App\Http\Middleware\DecideWhatToDoWithUser;
 use App\Http\Middleware\EncryptCookies;
+use App\Http\Middleware\EnforceControlPlaneMode;
 use App\Http\Middleware\EnsureMcpEnabled;
 use App\Http\Middleware\EnsureTokenBelongsToCurrentTeamMember;
 use App\Http\Middleware\PreventRequestsDuringMaintenance;
@@ -48,6 +49,7 @@ class Kernel extends HttpKernel
      * @var array<int, class-string|string>
      */
     protected $middleware = [
+        EnforceControlPlaneMode::class,
         TrustHosts::class,
         TrustProxies::class,
         HandleCors::class,

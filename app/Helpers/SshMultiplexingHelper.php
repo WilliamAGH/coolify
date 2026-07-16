@@ -134,8 +134,13 @@ class SshMultiplexingHelper
         return $scpCommand.escapeshellarg($source).' '.self::escapedUserAtHost($server).':'.escapeshellarg($dest);
     }
 
-    public static function generateSshCommand(Server $server, string $command, bool $disableMultiplexing = false, ?int $commandTimeout = null): string
-    {
+    public static function generateSshCommand(
+        Server $server,
+        string $command,
+        bool $disableMultiplexing = false,
+        ?int $commandTimeout = null,
+        bool $forwardInput = false,
+    ): string {
         if ($server->settings->force_disabled) {
             throw new \RuntimeException('Server is disabled.');
         }
@@ -166,6 +171,10 @@ class SshMultiplexingHelper
         }
 
         $sshCommand .= self::getCommonSshOptions($server, $sshKeyLocation, self::getConnectionTimeout($server), config('constants.ssh.server_interval'));
+
+        if ($forwardInput) {
+            return $sshCommand.self::escapedUserAtHost($server).' '.escapeshellarg($command);
+        }
 
         $delimiter = base64_encode(Hash::make($command));
         $command = str_replace($delimiter, '', $command);

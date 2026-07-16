@@ -1,0 +1,77 @@
+services:
+  postgres:
+    image: "postgres:15.18-alpine3.24@sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f"
+    restart: "no"
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: coolify
+      POSTGRES_PASSWORD: control-plane-migration-lab
+    command: ["postgres", "-c", "log_statement=all", "-c", "log_line_prefix=%p [%d] "]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coolify -d postgres"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  read-postgres:
+    image: "postgres:15.18-alpine3.24@sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f"
+    restart: "no"
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: coolify
+      POSTGRES_PASSWORD: control-plane-migration-lab
+    command: ["postgres", "-c", "log_statement=all", "-c", "log_line_prefix=%p [%d] "]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coolify -d postgres"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    volumes:
+      - read-postgres-data:/var/lib/postgresql/data
+
+  runner:
+    image: "serversideup/php:8.5-fpm-nginx-alpine@sha256:1854d81da23fc5c174a26bf039bc7724aeccec5743524717bbc6c10c1c927ac2"
+    user: root
+    read_only: true
+    restart: "no"
+    entrypoint: ["php"]
+    working_dir: /workspace
+    environment:
+      APP_ENV: testing
+      APP_DEBUG: "false"
+      APP_KEY: "base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+      APP_URL: http://control-plane-migration.invalid
+      LOG_CHANNEL: stderr
+      CACHE_DRIVER: array
+      CACHE_STORE: array
+      SESSION_DRIVER: array
+      QUEUE_CONNECTION: sync
+      BROADCAST_CONNECTION: log
+      FILESYSTEM_DISK: local
+      MAIL_MAILER: array
+      DB_CONNECTION: pgsql
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USERNAME: coolify
+      DB_PASSWORD: control-plane-migration-lab
+      DB_SSLMODE: disable
+      REDIS_HOST: redis.invalid
+      TELEMETRY_ENABLED: "false"
+    tmpfs:
+      - /tmp
+    volumes:
+      - "${CONTROL_PLANE_MIGRATION_REPOSITORY:?repository path is required}:/workspace:ro"
+      - "${CONTROL_PLANE_MIGRATION_BASELINE:?baseline path is required}:/baseline"
+      - runner-storage:/workspace/storage
+      - runner-bootstrap-cache:/workspace/bootstrap/cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  read-postgres-data:
+  runner-storage:
+  runner-bootstrap-cache:
