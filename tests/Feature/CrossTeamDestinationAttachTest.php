@@ -154,7 +154,8 @@ describe('Destination::promote GHSA-j395-3pqh-9r5g', function () {
         $this->applicationA->additional_networks()->attach($this->destinationA2->id, ['server_id' => $this->serverA2->id]);
 
         Livewire::test(Destination::class, ['resource' => $this->applicationA])
-            ->call('promote', $this->destinationA2->id, $this->serverA2->id);
+            ->call('promote', $this->destinationA2->id, $this->serverA2->id)
+            ->assertNotDispatched('error');
 
         $application = $this->applicationA->fresh();
         $additional = $application->additional_networks;
@@ -163,6 +164,52 @@ describe('Destination::promote GHSA-j395-3pqh-9r5g', function () {
         expect($additional)->toHaveCount(1);
         expect($additional->first()->id)->toBe($this->destinationA->id);
         expect($additional->first()->pivot->server_id)->toBe($this->serverA->id);
+    });
+
+    test('reloads a stale application topology before preserving the current main destination', function () {
+        $serverA3 = Server::factory()->create(['team_id' => $this->teamA->id]);
+        $destinationA3 = StandaloneDocker::factory()->create([
+            'server_id' => $serverA3->id,
+            'name' => 'dest-a3-'.fake()->unique()->word(),
+            'network' => 'coolify-a3-'.fake()->unique()->word(),
+        ]);
+        $this->applicationA->additional_networks()->attach($this->destinationA2->id, ['server_id' => $this->serverA2->id]);
+        $this->applicationA->additional_networks()->attach($destinationA3->id, ['server_id' => $serverA3->id]);
+        $staleComponent = Livewire::test(Destination::class, ['resource' => $this->applicationA->fresh()]);
+
+        Livewire::test(Destination::class, ['resource' => $this->applicationA->fresh()])
+            ->call('promote', $this->destinationA2->id, $this->serverA2->id)
+            ->assertNotDispatched('error');
+
+        $staleComponent->instance()->promote($destinationA3->id, $serverA3->id);
+
+        $application = $this->applicationA->fresh();
+        $additionalDestinationIds = $application->additional_networks
+            ->pluck('id')
+            ->sort()
+            ->values()
+            ->all();
+
+        expect($application->destination_id)->toBe($destinationA3->id)
+            ->and($additionalDestinationIds)->toBe(collect([
+                $this->destinationA->id,
+                $this->destinationA2->id,
+            ])->sort()->values()->all());
+    });
+
+    test('does not promote a destination removed after a stale component loaded it', function () {
+        $this->applicationA->additional_networks()->attach($this->destinationA2->id, ['server_id' => $this->serverA2->id]);
+        $staleComponent = Livewire::test(Destination::class, ['resource' => $this->applicationA->fresh()]);
+
+        Livewire::test(Destination::class, ['resource' => $this->applicationA->fresh()])
+            ->call('removeServer', $this->destinationA2->id, $this->serverA2->id, 'password');
+
+        $staleComponent->instance()->promote($this->destinationA2->id, $this->serverA2->id);
+
+        $application = $this->applicationA->fresh();
+
+        expect($application->destination_id)->toBe($this->destinationA->id)
+            ->and($application->additional_networks)->toHaveCount(0);
     });
 
     test('refresh failures after promote do not roll back promoted destination', function () {
@@ -210,6 +257,28 @@ describe('Destination::promote GHSA-j395-3pqh-9r5g', function () {
 });
 
 describe('Destination::removeServer', function () {
+    test('repeats the main destination fence after reloading a stale application topology', function () {
+        $this->applicationA->additional_networks()->attach($this->destinationA2->id, ['server_id' => $this->serverA2->id]);
+        $staleComponent = Livewire::test(Destination::class, ['resource' => $this->applicationA->fresh()]);
+
+        Livewire::test(Destination::class, ['resource' => $this->applicationA->fresh()])
+            ->call('promote', $this->destinationA2->id, $this->serverA2->id)
+            ->assertNotDispatched('error');
+
+        $result = $staleComponent->instance()->removeServer(
+            $this->destinationA2->id,
+            $this->serverA2->id,
+            'password',
+        );
+
+        $application = $this->applicationA->fresh();
+
+        expect($result)->toBeNull()
+            ->and($application->destination_id)->toBe($this->destinationA2->id)
+            ->and($application->additional_networks)->toHaveCount(1)
+            ->and($application->additional_networks->first()->id)->toBe($this->destinationA->id);
+    });
+
     test('only detaches the removed network for the selected pivot server', function () {
         $this->applicationA->additional_networks()->attach($this->destinationA2->id, ['server_id' => $this->serverA2->id]);
         $this->applicationA->additional_networks()->attach($this->destinationA2->id, ['server_id' => $this->serverA->id]);

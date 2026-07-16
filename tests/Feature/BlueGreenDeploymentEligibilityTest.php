@@ -152,6 +152,34 @@ it('atomically disables the opt-in only from an eligibility-setting save before 
         ->and($setting->fresh()->is_blue_green_deployment_enabled)->toBeFalse();
 });
 
+it('rebases a stale setting before evaluating a proposed blue-green opt-in', function () {
+    ['application' => $application] = blueGreenEligibilityContext();
+    $staleSetting = $application->settings()->firstOrFail();
+    $staleSetting->fresh()->update(['is_container_label_readonly_enabled' => false]);
+    $staleSetting->is_blue_green_deployment_enabled = true;
+
+    expect(fn () => $staleSetting->save())
+        ->toThrow(RuntimeException::class, 'require generated, read-only container labels');
+
+    expect($staleSetting->fresh()->is_container_label_readonly_enabled)->toBeFalse()
+        ->and($staleSetting->fresh()->is_blue_green_deployment_enabled)->toBeFalse();
+});
+
+it('preserves proposed dirty values while rebasing non-dirty attributes from the locked setting', function () {
+    ['application' => $application] = blueGreenEligibilityContext();
+    $staleSetting = $application->settings()->firstOrFail();
+    $staleSetting->fresh()->update(['is_debug_enabled' => true]);
+    $staleSetting->is_force_https_enabled = ! $staleSetting->is_force_https_enabled;
+    $proposedForceHttps = $staleSetting->is_force_https_enabled;
+
+    $staleSetting->save();
+
+    expect($staleSetting->is_debug_enabled)->toBeTrue()
+        ->and($staleSetting->is_force_https_enabled)->toBe($proposedForceHttps)
+        ->and($staleSetting->fresh()->is_debug_enabled)->toBeTrue()
+        ->and($staleSetting->fresh()->is_force_https_enabled)->toBe($proposedForceHttps);
+});
+
 it('rejects eligibility-setting drift while durable blue-green state exists', function () {
     ['application' => $application] = blueGreenEligibilityContext();
     enableEligibleBlueGreenDeployment($application);

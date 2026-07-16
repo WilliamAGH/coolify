@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
 use App\Enums\BlueGreenDeploymentPhase;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Casts\Attribute;
@@ -88,6 +89,19 @@ class ApplicationSetting extends Model
         });
     }
 
+    protected function performInsert(Builder $query)
+    {
+        if (! $this->is_blue_green_deployment_enabled) {
+            return parent::performInsert($query);
+        }
+
+        return DB::transaction(function () use ($query): bool {
+            BlueGreenTopologyLock::acquire();
+
+            return parent::performInsert($query);
+        }, attempts: 5);
+    }
+
     protected function performUpdate(Builder $query)
     {
         if (! $this->isDirty(Application::blueGreenLifecycleAffectingSettingAttributes())) {
@@ -95,6 +109,8 @@ class ApplicationSetting extends Model
         }
 
         return DB::transaction(function () use ($query): bool {
+            BlueGreenTopologyLock::acquire();
+            $proposedDirtyAttributes = $this->getDirty();
             $application = Application::withTrashed()
                 ->whereKey($this->application_id)
                 ->lockForUpdate()
@@ -109,6 +125,9 @@ class ApplicationSetting extends Model
             if ($lockedSetting === null || (int) $lockedSetting->application_id !== $application->id) {
                 throw new RuntimeException('Blue-green application settings changed while their persistence transaction was being acquired.');
             }
+            $lockedAttributes = $lockedSetting->getAttributes();
+            $this->setRawAttributes($lockedAttributes, sync: true);
+            $this->setRawAttributes(array_replace($lockedAttributes, $proposedDirtyAttributes));
 
             $states = ApplicationBlueGreenDeployment::query()
                 ->where('application_id', $application->id)
