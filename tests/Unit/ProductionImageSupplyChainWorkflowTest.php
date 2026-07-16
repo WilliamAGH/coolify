@@ -627,6 +627,7 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
         'docker_latest_before=',
         'restore_alias_if_owned',
         'trap compensate_aliases EXIT',
+        'preflight-latest',
         'promote-latest',
     ] as $atomicAliasContract) {
         if (! str_contains($aliasPublicationRun, $atomicAliasContract)) {
@@ -636,6 +637,13 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
     if (releaseWorkflowStep($jobs['release'] ?? [], 'Create or verify semantic version tags') !== [] ||
         releaseWorkflowStep($jobs['release'] ?? [], 'Promote latest monotonically across registries') !== []) {
         $violations[] = 'semantic and latest aliases must publish as one preflighted compensation-aware operation';
+    }
+    $latestPreflightIndex = strpos($aliasPublicationRun, 'preflight-latest');
+    $mutationStartedIndex = strpos($aliasPublicationRun, 'mutation_started=true');
+    $semanticPublishIndex = strpos($aliasPublicationRun, 'ensure-pair');
+    if (! is_int($latestPreflightIndex) || ! is_int($mutationStartedIndex) || ! is_int($semanticPublishIndex) ||
+        $latestPreflightIndex >= $mutationStartedIndex || $latestPreflightIndex >= $semanticPublishIndex) {
+        $violations[] = 'latest monotonicity must be preflighted before any semantic alias mutation';
     }
 
     $runTagStep = releaseWorkflowStep($jobs['release'] ?? [], 'Create or verify immutable run tags');
@@ -1193,6 +1201,73 @@ it('compensates the whole alias transaction when latest publication fails', func
     'failure immediately after semantic publication' => ['ghcr', false],
     'failure between latest updates preserves a preexisting semantic alias' => ['docker', true],
 ]);
+
+it('rejects a superseded candidate before creating its absent semantic aliases', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $sharedWorkflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $aliasStep = releaseWorkflowStep(
+        $sharedWorkflow['jobs']['release'] ?? [],
+        'Publish semantic and latest aliases atomically',
+    );
+    $script = (string) ($aliasStep['run'] ?? '');
+    $filesystem = new Filesystem;
+    $stateDirectory = sys_get_temp_dir().'/coolify-superseded-alias-'.bin2hex(random_bytes(8));
+    $mockBin = $stateDirectory.'/bin';
+    $log = $stateDirectory.'/regctl.log';
+    $ghcrRepository = 'ghcr.io/coollabsio/coolify';
+    $dockerRepository = 'docker.io/coollabsio/coolify';
+    $semanticVersion = '4.1.0';
+    $amd64Digest = releaseWorkflowTestDigest('a');
+    $arm64Digest = releaseWorkflowTestDigest('b');
+    $candidateIndex = releaseWorkflowTestDigest('c');
+    $newerIndex = releaseWorkflowTestDigest('d');
+
+    $filesystem->mkdir([$mockBin, $stateDirectory.'/refs', $stateDirectory.'/runs']);
+    $filesystem->copy($root.'/tests/Fixtures/mock-regctl.sh', $mockBin.'/regctl');
+    chmod($mockBin.'/regctl', 0755);
+    file_put_contents($log, '');
+
+    foreach ([$ghcrRepository, $dockerRepository] as $repository) {
+        releaseWorkflowWriteRegistryReference($stateDirectory, "{$repository}@{$candidateIndex}", $candidateIndex);
+        releaseWorkflowWriteRegistryReference($stateDirectory, "{$repository}@{$newerIndex}", $newerIndex);
+        releaseWorkflowWriteRegistryReference($stateDirectory, "{$repository}:latest", $newerIndex);
+    }
+    file_put_contents($stateDirectory.'/runs/'.substr($candidateIndex, strlen('sha256:')), "41\n");
+    file_put_contents($stateDirectory.'/runs/'.substr($newerIndex, strlen('sha256:')), "42\n");
+
+    $process = new Process(['bash', '-c', $script], $root, [
+        'AMD64_DIGEST' => $amd64Digest,
+        'ARM64_DIGEST' => $arm64Digest,
+        'DOCKER_TARGET' => $dockerRepository,
+        'GHCR_TARGET' => $ghcrRepository,
+        'GITHUB_RUN_ID' => '41',
+        'INDEX_DIGEST' => $candidateIndex,
+        'PATH' => $mockBin.PATH_SEPARATOR.(getenv('PATH') ?: ''),
+        'PUBLISH_LATEST' => 'true',
+        'REGCTL_AMD64' => $amd64Digest,
+        'REGCTL_ARM64' => $arm64Digest,
+        'REGCTL_LOG' => $log,
+        'REGCTL_STATE' => $stateDirectory,
+        'SEMANTIC_VERSION' => $semanticVersion,
+    ]);
+
+    try {
+        $process->setTimeout(15);
+        $process->run();
+        $registryLog = (string) file_get_contents($log);
+
+        expect($process->getExitCode())->toBe(3)
+            ->and($process->getErrorOutput())->toContain('classification=superseded')
+            ->and($registryLog)->not->toContain('copy:')
+            ->and($registryLog)->not->toContain('delete:')
+            ->and(releaseWorkflowReadRegistryReference($stateDirectory, "{$ghcrRepository}:{$semanticVersion}"))->toBeNull()
+            ->and(releaseWorkflowReadRegistryReference($stateDirectory, "{$dockerRepository}:{$semanticVersion}"))->toBeNull()
+            ->and(releaseWorkflowReadRegistryReference($stateDirectory, "{$ghcrRepository}:latest"))->toBe($newerIndex)
+            ->and(releaseWorkflowReadRegistryReference($stateDirectory, "{$dockerRepository}:latest"))->toBe($newerIndex);
+    } finally {
+        $filesystem->remove($stateDirectory);
+    }
+});
 
 it('executes immutable-tag, compensation, and platform-verification behavior against a registry double', function () {
     $process = new Process([

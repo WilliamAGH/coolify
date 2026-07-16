@@ -58,15 +58,6 @@ verify_tag_index() {
     verify_index "$repository" "$index_digest" "$amd64_digest" "$arm64_digest"
 }
 
-index_children() {
-    local repository="$1"
-    local index_digest="$2"
-
-    require_digest "$index_digest"
-    printf '%s\n' "$(regctl image digest "${repository}@${index_digest}" --platform "$AMD64_PLATFORM")"
-    printf '%s\n' "$(regctl image digest "${repository}@${index_digest}" --platform "$ARM64_PLATFORM")"
-}
-
 release_run_id() {
     local repository="$1"
     local index_digest="$2"
@@ -233,6 +224,35 @@ restore_latest() {
     fi
 }
 
+preflight_latest() {
+    local ghcr_repository="$1"
+    local docker_repository="$2"
+    local candidate_index="$3"
+    local candidate_run_id="$4"
+    local current_repository
+    local current_digest
+    local current_run_id
+
+    require_digest "$candidate_index"
+    [[ "$candidate_run_id" =~ ^[0-9]+$ ]] || die "release run id must be numeric"
+
+    for current_repository in "$ghcr_repository" "$docker_repository"; do
+        current_digest="$(tag_digest_or_empty "${current_repository}:latest")"
+        [[ -n "$current_digest" ]] || continue
+        require_digest "$current_digest"
+
+        current_run_id="$(release_run_id "$current_repository" "$current_digest")"
+        if (( current_run_id > candidate_run_id )); then
+            printf 'publish-linux-image: classification=superseded candidate_run_id=%s current_run_id=%s registry=%s digest=%s\n' \
+                "$candidate_run_id" "$current_run_id" "$current_repository" "$current_digest" >&2
+            return 3
+        fi
+        if (( current_run_id == candidate_run_id )) && [[ "$current_digest" != "$candidate_index" ]]; then
+            die "conflicting latest digests share release run id ${current_run_id}"
+        fi
+    done
+}
+
 promote_latest() {
     local ghcr_repository="$1"
     local docker_repository="$2"
@@ -250,14 +270,19 @@ promote_latest() {
     local current_repository
     local current_digest
     local current_run_id
-    local current_children
     local updated_ghcr='false'
     local updated_docker='false'
+    local preflight_status
 
     require_digest "$candidate_index"
     require_digest "$candidate_amd64"
     require_digest "$candidate_arm64"
     [[ "$candidate_run_id" =~ ^[0-9]+$ ]] || die "release run id must be numeric"
+
+    preflight_latest "$ghcr_repository" "$docker_repository" "$candidate_index" "$candidate_run_id" || {
+        preflight_status=$?
+        return "$preflight_status"
+    }
 
     ghcr_previous="$(tag_digest_or_empty "${ghcr_repository}:latest")"
     docker_previous="$(tag_digest_or_empty "${docker_repository}:latest")"
@@ -273,15 +298,9 @@ promote_latest() {
 
         current_run_id="$(release_run_id "$current_repository" "$current_digest")"
         if (( current_run_id > desired_run_id )); then
-            mapfile -t current_children < <(index_children "$current_repository" "$current_digest")
-            [[ "${#current_children[@]}" -eq 2 ]] || die "could not resolve platform children for ${current_repository}@${current_digest}"
-            require_digest "${current_children[0]}"
-            require_digest "${current_children[1]}"
-            desired_repository="$current_repository"
-            desired_index="$current_digest"
-            desired_amd64="${current_children[0]}"
-            desired_arm64="${current_children[1]}"
-            desired_run_id="$current_run_id"
+            printf 'publish-linux-image: classification=superseded candidate_run_id=%s current_run_id=%s registry=%s digest=%s\n' \
+                "$desired_run_id" "$current_run_id" "$current_repository" "$current_digest" >&2
+            return 3
         elif (( current_run_id == desired_run_id )) && [[ "$current_digest" != "$desired_index" ]]; then
             die "conflicting latest digests share release run id ${current_run_id}"
         fi
@@ -359,6 +378,11 @@ case "${1:-}" in
         shift
         ensure_tag_pair "$@"
         ;;
+    preflight-latest)
+        [[ "$#" -eq 5 ]] || die 'usage: preflight-latest GHCR_REPOSITORY DOCKER_REPOSITORY INDEX_DIGEST RUN_ID'
+        shift
+        preflight_latest "$@"
+        ;;
     promote-latest)
         [[ "$#" -eq 7 ]] || die 'usage: promote-latest GHCR_REPOSITORY DOCKER_REPOSITORY INDEX_DIGEST AMD64_DIGEST ARM64_DIGEST RUN_ID'
         shift
@@ -370,6 +394,6 @@ case "${1:-}" in
         cleanup_candidates "$@"
         ;;
     *)
-        die 'expected one of: verify-index, ensure-tag, ensure-pair, promote-latest, cleanup-candidates'
+        die 'expected one of: verify-index, ensure-tag, ensure-pair, preflight-latest, promote-latest, cleanup-candidates'
         ;;
 esac

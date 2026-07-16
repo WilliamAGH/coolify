@@ -1025,6 +1025,7 @@ jobs:
             docker_latest_before="$(alias_digest "$DOCKER_TARGET" latest)"
             verify_prior_alias "$GHCR_TARGET" latest "$ghcr_latest_before"
             verify_prior_alias "$DOCKER_TARGET" latest "$docker_latest_before"
+            scripts/publish-linux-image.sh preflight-latest "$GHCR_TARGET" "$DOCKER_TARGET" "$INDEX_DIGEST" "$GITHUB_RUN_ID"
           fi
 
           mutation_started=true

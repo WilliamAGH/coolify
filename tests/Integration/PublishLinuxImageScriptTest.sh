@@ -165,7 +165,14 @@ grep -Fq "platform:${ghcr_repository}@${new_index}:linux/amd64" "$log" || fail '
 grep -Fq "platform:${docker_repository}@${new_index}:linux/arm64" "$log" || fail 'Docker Hub arm64 postflight verification did not run'
 
 : > "$log"
-"$helper" promote-latest "$ghcr_repository" "$docker_repository" "$old_index" "$REGCTL_AMD64" "$REGCTL_ARM64" 41
+superseded_error="$state/superseded.err"
+if "$helper" promote-latest "$ghcr_repository" "$docker_repository" "$old_index" "$REGCTL_AMD64" "$REGCTL_ARM64" 41 2> "$superseded_error"; then
+    fail 'superseded release run unexpectedly succeeded'
+else
+    superseded_status=$?
+fi
+[ "$superseded_status" -eq 3 ] || fail 'superseded release did not return its classified status'
+grep -Fq 'classification=superseded' "$superseded_error" || fail 'superseded release did not report its classification'
 [ "$(get_reference "${ghcr_repository}:latest")" = "$new_index" ] || fail 'GHCR latest regressed to an older run'
 [ "$(get_reference "${docker_repository}:latest")" = "$new_index" ] || fail 'Docker Hub latest regressed to an older run'
 if grep -q '^copy:' "$log"; then
