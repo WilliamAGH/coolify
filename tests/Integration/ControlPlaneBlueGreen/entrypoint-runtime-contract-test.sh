@@ -310,7 +310,7 @@ first_promotion_output=$(su-exec www-data:www-data env \
     CONTROL_PLANE_PROMOTION_CONFIRM=blue-stopped \
     /usr/local/bin/coolify-entrypoint promote-writer 2>&1)
 [ "$first_promotion_output" = 'Control plane writer promotion completed.' ] \
-    || fail 'first promotion did not return the exact acknowledgement'
+    || fail "first promotion did not return the exact acknowledgement: $first_promotion_output"
 horizon_pid=$(wait_for_expected_artisan horizon horizon)
 scheduler_pid=$(wait_for_expected_artisan scheduler-worker schedule:work)
 [ "$(/command/s6-svstat -o up /run/service/nightwatch-agent)" = true ] \

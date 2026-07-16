@@ -475,7 +475,7 @@ process_runs_expected_artisan_command()
     esac
     [ -r "/proc/$process_pid/cmdline" ] || return 1
 
-    tr '\000' '\n' < "/proc/$process_pid/cmdline" | awk \
+    { tr '\000' '\n' < "/proc/$process_pid/cmdline"; } 2>/dev/null | awk \
         -v expected_artisan_command="$expected_artisan_command" '
             BEGIN { valid = 1 }
             NR == 1 {
@@ -504,7 +504,7 @@ process_is_fenced_sleeper()
     esac
     [ -r "/proc/$process_pid/cmdline" ] || return 1
 
-    tr '\000' '\n' < "/proc/$process_pid/cmdline" | awk '
+    { tr '\000' '\n' < "/proc/$process_pid/cmdline"; } 2>/dev/null | awk '
         BEGIN { valid = 1 }
         NR == 1 {
             if ($0 !~ /(^|\/)sleep$/) valid = 0
