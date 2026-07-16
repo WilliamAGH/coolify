@@ -10,6 +10,7 @@ use App\Models\StandaloneDocker;
 use App\Models\Team;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Route;
@@ -18,7 +19,7 @@ use Livewire\Livewire;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
-    InstanceSettings::create(['id' => 0]);
+    InstanceSettings::forceCreate(['id' => 0]);
     Queue::fake();
 
     $this->user = User::factory()->create([
@@ -44,11 +45,8 @@ beforeEach(function () {
     $this->actingAs($this->user);
     session(['currentTeam' => $this->team]);
 
-    // Bind route parameters so get_route_parameters() works in the Danger component
-    $route = Route::get('/test/{project_uuid}/{environment_uuid}', fn () => '')->name('test.danger');
+    Route::get('/test/{project_uuid}/{environment_uuid}', fn () => '')->name('test.danger');
     $request = Request::create("/test/{$this->project->uuid}/{$this->environment->uuid}");
-    $route->bind($request);
-    app('router')->setRoutes(app('router')->getRoutes());
     Route::dispatch($request);
 });
 
