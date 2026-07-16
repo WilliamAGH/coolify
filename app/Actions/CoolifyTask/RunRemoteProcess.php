@@ -7,6 +7,7 @@ use App\Enums\ProcessStatus;
 use App\Helpers\SshMultiplexingHelper;
 use App\Jobs\ApplicationDeploymentJob;
 use App\Models\Server;
+use App\Support\RemoteProcess;
 use Illuminate\Contracts\Process\ProcessResult;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -74,6 +75,13 @@ class RunRemoteProcess
     }
 
     public function __invoke(): ProcessResult
+    {
+        return RemoteProcess::withAcceptedMutationDrainRemoteConfiguration(
+            fn (): ProcessResult => $this->run(),
+        );
+    }
+
+    private function run(): ProcessResult
     {
         $this->time_start = hrtime(true);
 

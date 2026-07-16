@@ -90,6 +90,19 @@ it('serves the workflow-published semantic tag to consumers through versions.jso
         ->and(releaseContractVersionsJson()['coolify']['v4']['version'])->toBe($published);
 });
 
+it('publishes production only for an explicit increasing canonical version bump', function () {
+    $workflow = Yaml::parseFile(releaseContractRepositoryRoot().'/.github/workflows/coolify-production-build.yml');
+    $resolveVersion = $workflow['jobs']['resolve-version'];
+    $versionStep = collect($resolveVersion['steps'])->firstWhere('id', 'version');
+
+    expect($resolveVersion['outputs']['should_publish'] ?? null)->toBe('${{ steps.version.outputs.should_publish }}')
+        ->and($workflow['jobs']['publish']['if'] ?? null)->toBe("\${{ needs.resolve-version.outputs.should_publish == 'true' }}")
+        ->and($versionStep['env']['BEFORE_SHA'] ?? null)->toBe('${{ github.event.before }}')
+        ->and($versionStep['run'] ?? '')->toContain('version_compare')
+        ->toContain('should_publish=false')
+        ->toContain("jq -er '.coolify.v4.version' versions.json");
+});
+
 it('resolves the published tag through the install script versions.json parse pipeline', function () {
     // Replicates the exact LATEST_VERSION pipeline from scripts/install.sh so a
     // versions.json reshaping that breaks the installer fails this test first.

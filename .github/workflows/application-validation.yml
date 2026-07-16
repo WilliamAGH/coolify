@@ -43,7 +43,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           php artisan test --compact --testsuite=Unit
-          php artisan test --compact --testsuite=Feature
+          php artisan test --compact --testsuite=Feature --exclude-group=requires-redis
           php artisan test --compact tests/v4/Feature
 
   browser:
@@ -117,11 +117,15 @@ jobs:
           fetch-depth: 0
       - name: Validate workflows
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
-      - name: Require immutable external action references
+      - name: Require immutable external action and container references
         shell: bash
         run: |
           if grep -RInP 'uses:\s+(?!\./)[^@\s]+@(?![0-9a-f]{40}(?:\s|$))' .github/workflows; then
             echo 'External GitHub Actions must be pinned to a full commit SHA.' >&2
+            exit 1
+          fi
+          if grep -RInP '^(?: {6}| {8})image:\s+(?![^\s]+@sha256:[0-9a-f]{64}(?:\s|$))' .github/workflows; then
+            echo 'Workflow job container and service images must be pinned to an immutable SHA-256 digest.' >&2
             exit 1
           fi
       - name: ShellCheck changed shell scripts
@@ -181,7 +185,7 @@ jobs:
     runs-on: ubuntu-24.04
     services:
       postgres:
-        image: postgres:15-alpine
+        image: postgres:15-alpine@sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f
         env:
           POSTGRES_DB: coolify_testing
           POSTGRES_USER: postgres
@@ -194,7 +198,7 @@ jobs:
           --health-timeout 5s
           --health-retries 20
       redis:
-        image: redis:7-alpine
+        image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
         ports:
           - 6379:6379
         options: >-
@@ -223,14 +227,18 @@ jobs:
           extensions: mbstring, pdo_pgsql, redis
       - run: composer install --no-interaction --prefer-dist --optimize-autoloader
       - run: php artisan migrate:fresh --force
-      - name: Run concurrency, migration, lock, and queue tests
+      - name: Run PostgreSQL, Redis, concurrency, migration, lock, and queue tests
         run: |
           set -Eeuo pipefail
           tests=(
             tests/Feature/QueueApplicationDeploymentCommitTest.php
             tests/Feature/PostgresDeploymentClaimConcurrencyTest.php
+            tests/Feature/PostgresBlueGreenTopologyConcurrencyTest.php
+            tests/Feature/PostgresUserDeletionConcurrencyTest.php
             tests/Feature/BlueGreenDeploymentStateMachineTest.php
             tests/Feature/BlueGreenOperationFencingTest.php
+            tests/Feature/AcceptedProxyMutationRemoteProcessTest.php
+            tests/Feature/ProxyMutationQueueGateTest.php
             tests/Feature/ProductionSeederTest.php
             tests/Unit/Actions/Application/BlueGreen/BlueGreenDeploymentLockTest.php
             tests/Feature/BlueGreenMigrationReplayTest.php

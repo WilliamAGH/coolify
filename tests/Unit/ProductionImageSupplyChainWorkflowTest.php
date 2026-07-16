@@ -105,6 +105,33 @@ function releaseWorkflowActionReferences(array $workflow): array
 }
 
 /** @return list<string> */
+function releaseWorkflowContainerReferences(array $workflow): array
+{
+    $references = [];
+
+    foreach ($workflow['jobs'] ?? [] as $job) {
+        if (! is_array($job)) {
+            continue;
+        }
+
+        $container = $job['container'] ?? null;
+        if (is_string($container)) {
+            $references[] = $container;
+        } elseif (is_string($container['image'] ?? null)) {
+            $references[] = $container['image'];
+        }
+
+        foreach ($job['services'] ?? [] as $service) {
+            if (is_string($service['image'] ?? null)) {
+                $references[] = $service['image'];
+            }
+        }
+    }
+
+    return $references;
+}
+
+/** @return list<string> */
 function releaseWorkflowScalarValues(mixed $value): array
 {
     if (is_string($value)) {
@@ -200,6 +227,21 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
             $violations[] = "PHP application validation is missing backend suite: {$backendSuite}";
         }
     }
+
+    $redisFeatureTests = [
+        'tests/Feature/AcceptedProxyMutationRemoteProcessTest.php',
+        'tests/Feature/ProxyMutationQueueGateTest.php',
+    ];
+    if (! str_contains($phpTestScript, '--exclude-group=requires-redis')) {
+        $violations[] = 'PHP application validation must exclude Redis-bound feature tests';
+    }
+    foreach ($redisFeatureTests as $redisFeatureTest) {
+        $contents = file_get_contents(releaseWorkflowRepositoryRoot().'/'.$redisFeatureTest);
+        if (! is_string($contents) || ! str_contains($contents, "pest()->group('requires-redis');")) {
+            $violations[] = "Redis-bound feature test must declare the requires-redis group: {$redisFeatureTest}";
+        }
+    }
+
     if (str_contains($phpTestScript, 'tests/v4/Browser') ||
         trim($phpTestScript) === 'php artisan test --compact') {
         $violations[] = 'PHP application validation must not run browser tests in the composer-only job';
@@ -227,6 +269,53 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
     if (releaseWorkflowStep($workflowAndShell, 'Validate workflows') === [] ||
         releaseWorkflowStep($workflowAndShell, 'Verify pinned source provenance') === []) {
         $violations[] = 'application validation must verify workflow syntax and source provenance';
+    }
+    $immutableReferencesStep = releaseWorkflowStep(
+        $workflowAndShell,
+        'Require immutable external action and container references',
+    );
+    $immutableReferencesScript = (string) ($immutableReferencesStep['run'] ?? '');
+    if (! str_contains($immutableReferencesScript, 'uses:') ||
+        ! str_contains($immutableReferencesScript, 'image:') ||
+        ! str_contains($immutableReferencesScript, '@sha256:')) {
+        $violations[] = 'application validation must enforce immutable action and container references';
+    }
+
+    $postgresRedisJob = $applicationValidationJobs['postgres-redis'] ?? [];
+    $postgresRedisEnvironment = $postgresRedisJob['env'] ?? [];
+    foreach ([
+        'DB_CONNECTION' => 'pgsql',
+        'CACHE_STORE' => 'redis',
+        'COOLIFY_EXTERNAL_TEST_SERVICES' => true,
+        'REDIS_HOST' => '127.0.0.1',
+        'REDIS_PORT' => 6379,
+    ] as $name => $expectedValue) {
+        if (($postgresRedisEnvironment[$name] ?? null) !== $expectedValue) {
+            $violations[] = "PostgreSQL and Redis validation must set {$name} for its service-backed tests";
+        }
+    }
+    $postgresRedisTestScript = (string) (releaseWorkflowStep(
+        $postgresRedisJob,
+        'Run PostgreSQL, Redis, concurrency, migration, lock, and queue tests',
+    )['run'] ?? '');
+    foreach ([
+        ...$redisFeatureTests,
+        'tests/Feature/PostgresBlueGreenTopologyConcurrencyTest.php',
+        'tests/Feature/PostgresUserDeletionConcurrencyTest.php',
+    ] as $serviceBoundTest) {
+        if (! str_contains($postgresRedisTestScript, $serviceBoundTest)) {
+            $violations[] = "PostgreSQL and Redis validation must run service-bound test: {$serviceBoundTest}";
+        }
+    }
+
+    $validationServices = $postgresRedisJob['services'] ?? [];
+    foreach ([
+        'postgres' => 'postgres:15-alpine@sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f',
+        'redis' => 'redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99',
+    ] as $service => $expectedImage) {
+        if (($validationServices[$service]['image'] ?? null) !== $expectedImage) {
+            $violations[] = "application validation service image must use its reviewed immutable digest: {$service}";
+        }
     }
     $shellCheckScript = (string) (releaseWorkflowStep($workflowAndShell, 'ShellCheck changed shell scripts')['run'] ?? '');
     if (! str_contains($shellCheckScript, 'git cat-file -e') ||
@@ -720,6 +809,7 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
                 'publish_latest' => true,
                 'validate_only' => "\${{ github.repository != 'coollabsio/coolify' }}",
             ],
+            'publish_if' => "\${{ needs.resolve-version.outputs.should_publish == 'true' }}",
             'publish_needs' => ['resolve-version'],
             'jobs' => ['application-validation', 'resolve-version', 'publish'],
         ],
@@ -733,6 +823,7 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
                 'semantic_version' => '',
                 'publish_latest' => true,
             ],
+            'publish_if' => null,
             'publish_needs' => ['application-validation'],
             'jobs' => ['application-validation', 'authorize', 'publish'],
         ],
@@ -746,6 +837,7 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
                 'semantic_version' => '',
                 'publish_latest' => false,
             ],
+            'publish_if' => null,
             'publish_needs' => ['application-validation'],
             'jobs' => ['application-validation', 'authorize', 'publish'],
         ],
@@ -786,6 +878,10 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
             $violations[] = "{$callerName} publish dependency is invalid";
         }
 
+        if (($publish['if'] ?? null) !== $expectedContract['publish_if']) {
+            $violations[] = "{$callerName} has an invalid publication condition";
+        }
+
         $expectedSecrets = [
             'DOCKERHUB_TOKEN' => '${{ secrets.DOCKERHUB_TOKEN }}',
             'DOCKERHUB_USERNAME' => '${{ secrets.DOCKERHUB_USERNAME }}',
@@ -808,8 +904,12 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
 
     $versionStep = releaseWorkflowStep($productionJobs['resolve-version'] ?? [], 'Read semantic version from bootstrap');
     if (($productionJobs['resolve-version']['permissions'] ?? null) !== ['contents' => 'read'] ||
-        ! str_contains((string) ($versionStep['run'] ?? ''), 'php bootstrap/getVersion.php')) {
-        $violations[] = 'production semantic version must come from bootstrap/getVersion.php';
+        ($productionJobs['resolve-version']['outputs']['should_publish'] ?? null) !== '${{ steps.version.outputs.should_publish }}' ||
+        ! str_contains((string) ($versionStep['run'] ?? ''), 'php bootstrap/getVersion.php') ||
+        ($versionStep['env']['BEFORE_SHA'] ?? null) !== '${{ github.event.before }}' ||
+        ! str_contains((string) ($versionStep['run'] ?? ''), 'version_compare') ||
+        ! str_contains((string) ($versionStep['run'] ?? ''), 'should_publish=false')) {
+        $violations[] = 'production semantic publication must require an explicit increasing version bump';
     }
 
     $testingHostJobs = $callers['testing-host']['jobs'] ?? [];
@@ -856,6 +956,12 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
 
             if (preg_match('/^[^\/@\s]+(?:\/[^@\s]+)+@[a-f0-9]{40}$/', $reference) !== 1) {
                 $violations[] = 'every external action must use a full commit SHA';
+            }
+        }
+
+        foreach (releaseWorkflowContainerReferences($workflow) as $reference) {
+            if (preg_match('/^[^@\s]+@sha256:[a-f0-9]{64}$/', $reference) !== 1) {
+                $violations[] = 'every workflow service and job container image must use an immutable digest';
             }
         }
 

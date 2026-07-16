@@ -30,24 +30,54 @@ jobs:
       contents: read
     runs-on: ubuntu-24.04
     outputs:
+      should_publish: ${{ steps.version.outputs.should_publish }}
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - id: version
         name: Read semantic version from bootstrap
         env:
+          BEFORE_SHA: ${{ github.event.before }}
           SEMANTIC_VERSION_PATTERN: '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*))(\.((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?$'
         run: |
           set -eu
           version="$(php bootstrap/getVersion.php)"
           printf '%s' "$version" | grep -Eq "$SEMANTIC_VERSION_PATTERN"
+          [ "$(jq -er '.coolify.v4.version' versions.json)" = "$version" ]
+
+          should_publish=true
+          if printf '%s' "$BEFORE_SHA" | grep -Eq '^[0-9a-f]{40}$' &&
+            [ "$BEFORE_SHA" != '0000000000000000000000000000000000000000' ]; then
+            git cat-file -e "${BEFORE_SHA}^{commit}"
+            previous_constants="$RUNNER_TEMP/coolify-previous-constants.php"
+            git show "${BEFORE_SHA}:config/constants.php" > "$previous_constants"
+            # PHP receives its own positional arguments.
+            # shellcheck disable=SC2016
+            previous_version="$(php -r 'function env() { return null; } $constants = include $argv[1]; echo $constants["coolify"]["version"] ?? "";' "$previous_constants")"
+            printf '%s' "$previous_version" | grep -Eq "$SEMANTIC_VERSION_PATTERN"
+
+            if [ "$version" = "$previous_version" ]; then
+              should_publish=false
+            else
+              # PHP receives its own positional arguments.
+              # shellcheck disable=SC2016
+              php -r 'exit(version_compare($argv[1], $argv[2], ">") ? 0 : 1);' "$version" "$previous_version" || {
+                printf 'Production version must increase: %s -> %s\n' "$previous_version" "$version" >&2
+                exit 1
+              }
+            fi
+          fi
+
+          printf 'should_publish=%s\n' "$should_publish" >> "$GITHUB_OUTPUT"
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
   publish:
     name: Build and publish production Linux image
+    if: ${{ needs.resolve-version.outputs.should_publish == 'true' }}
     needs: resolve-version
     uses: ./.github/workflows/publish-linux-image.yml
     permissions:

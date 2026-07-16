@@ -266,6 +266,11 @@ enum ControlPlaneMode: string
         return self::acceptedMutationExecutionDepth() > 0;
     }
 
+    public static function acceptedMutationDrainExecutionActive(): bool
+    {
+        return self::acceptedMutationExecutionActive() && self::mutationFreezeActive();
+    }
+
     private static function acceptedMutationExecutionDepth(int $change = 0): int
     {
         static $depth = 0;

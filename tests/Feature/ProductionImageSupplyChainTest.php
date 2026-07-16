@@ -250,6 +250,16 @@ function productionImageSupplyChainWorkflowStep(array $job, string $stepName): a
     throw new RuntimeException("Workflow step is missing: {$stepName}");
 }
 
+it('pins the shared Dockerfile frontend to one reviewed multi-platform digest', function () {
+    $expected = '# syntax=docker/dockerfile:1@sha256:87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89';
+
+    foreach (['docker/production/Dockerfile', 'docker/testing-host/Dockerfile'] as $dockerfile) {
+        $firstLine = strtok((string) file_get_contents(base_path($dockerfile)), "\r\n");
+
+        expect($firstLine)->toBe($expected);
+    }
+});
+
 it('preserves immutable cloudflared pins and its structured builder-stage transfer', function () {
     $dockerfile = productionImageSupplyChainDockerfile('docker/production/Dockerfile');
 

@@ -23,6 +23,9 @@ use Laravel\Horizon\RedisQueue as HorizonRedisQueue;
 use Lorisleiva\Actions\Decorators\JobDecorator;
 use Spatie\Activitylog\Models\Activity;
 use Tests\Support\ControlPlaneStateFixture;
+use Tests\Support\ExternalTestServicesGuard;
+
+pest()->group('requires-redis');
 
 $proxyMutationQueueGateEnvironment = [
     'CONTROL_PLANE_MUTATION_FREEZE_EPOCH' => getenv('CONTROL_PLANE_MUTATION_FREEZE_EPOCH'),
@@ -31,6 +34,12 @@ $proxyMutationQueueGateEnvironment = [
 ];
 
 beforeEach(function (): void {
+    ExternalTestServicesGuard::assertSafe(
+        config(),
+        filter_var(env('COOLIFY_EXTERNAL_TEST_SERVICES'), FILTER_VALIDATE_BOOLEAN),
+        [ProxyMutationQueue::redisConnectionName()],
+    );
+
     $this->proxyMutationQueueGateConfiguration = [
         'control-plane.mutation_freeze_epoch' => config('control-plane.mutation_freeze_epoch'),
         'control-plane.mutation_freeze_marker_path' => config('control-plane.mutation_freeze_marker_path'),

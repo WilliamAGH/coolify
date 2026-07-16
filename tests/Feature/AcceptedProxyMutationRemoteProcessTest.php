@@ -1,6 +1,7 @@
 <?php
 
 use App\Contracts\ProxyMutation;
+use App\Enums\ActivityTypes;
 use App\Enums\ProcessStatus;
 use App\Jobs\CleanupStuckedResourcesJob;
 use App\Jobs\ConnectProxyToNetworksJob;
@@ -12,6 +13,7 @@ use App\Models\ServerSetting;
 use App\Models\Team;
 use App\Support\ControlPlaneMode;
 use App\Support\ProxyMutationQueue;
+use App\Support\ProxyMutationQueueState;
 use App\Support\ProxyMutationRedisQueue;
 use App\Support\RemoteProcess;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -25,7 +27,10 @@ use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Spatie\Activitylog\Models\Activity;
 use Tests\Support\ControlPlaneStateFixture;
+use Tests\Support\ExternalTestServicesGuard;
 use Visus\Cuid2\Cuid2;
+
+pest()->group('requires-redis');
 
 uses(RefreshDatabase::class);
 
@@ -36,6 +41,12 @@ $acceptedDrainRemoteProcessEnvironment = [
 ];
 
 beforeEach(function (): void {
+    ExternalTestServicesGuard::assertSafe(
+        config(),
+        filter_var(env('COOLIFY_EXTERNAL_TEST_SERVICES'), FILTER_VALIDATE_BOOLEAN),
+        [ProxyMutationQueue::redisConnectionName()],
+    );
+
     $this->acceptedDrainRemoteProcessConfiguration = [
         'constants.ssh.accepted_drain_command_timeout' => config('constants.ssh.accepted_drain_command_timeout'),
         'constants.ssh.accepted_drain_finalization_margin' => config('constants.ssh.accepted_drain_finalization_margin'),
@@ -147,6 +158,59 @@ function acceptedDrainRemoteProcessServer(): Server
     return $server->fresh(['privateKey', 'settings']);
 }
 
+/**
+ * Queue a real proxy task before the durable freeze, then reserve it for execution.
+ *
+ * @return array{0: ProxyMutationRedisQueue, 1: RedisJob, 2: Activity}
+ */
+function acceptedDrainQueuedProxyMutationTaskReservation(
+    Server $server,
+    ?ControlPlaneStateFixture $fixture,
+    string $epoch,
+): array {
+    $queue = app(QueueManager::class)->connection(ProxyMutationQueue::CONNECTION);
+    expect($queue)->toBeInstanceOf(ProxyMutationRedisQueue::class);
+    $queue->clear(ProxyMutationQueue::NAME);
+
+    $activity = activity()
+        ->withProperties([
+            'server_uuid' => $server->uuid,
+            'command' => 'printf accepted-drain',
+            'type' => ActivityTypes::INLINE->value,
+            'type_uuid' => null,
+            'status' => ProcessStatus::QUEUED->value,
+            'team_id' => $server->team_id,
+        ])
+        ->event(ActivityTypes::INLINE->value)
+        ->log('[]');
+
+    dispatch(new ProxyMutationTask(
+        activity: $activity,
+        ignore_errors: false,
+        call_event_on_finish: null,
+        call_event_data: null,
+    ));
+
+    expect(ProxyMutationQueueState::snapshot())->toBe([
+        'pending' => 1,
+        'reserved' => 0,
+        'delayed' => 0,
+        'running' => 0,
+    ]);
+
+    if ($fixture !== null) {
+        putenv("CONTROL_PLANE_MUTATION_FREEZE_EPOCH={$epoch}");
+        putenv('CONTROL_PLANE_MUTATION_FREEZE_MARKER_PATH='.$fixture->path('mutation-freeze-epoch'));
+        $fixture->writeMutationLease();
+    }
+
+    $reservedJob = $queue->pop(ProxyMutationQueue::NAME);
+    expect($reservedJob)->toBeInstanceOf(RedisJob::class);
+    $fixture?->writeMarker('mutation-freeze-epoch', $epoch);
+
+    return [$queue, $reservedJob, $activity];
+}
+
 it('fits accepted inline execution inside every declared proxy-mutation producer default timeout envelope', function () {
     $commandTimeout = config('constants.ssh.accepted_drain_command_timeout');
     $finalizationMargin = config('constants.ssh.accepted_drain_finalization_margin');
@@ -177,9 +241,11 @@ it('executes accepted remote mutation inline and records a terminal activity wit
     string $stderr,
     ProcessStatus $expectedStatus,
 ) {
-    $fixture = ControlPlaneStateFixture::unsupportedReason() === null
-        ? ControlPlaneStateFixture::create('coolify-accepted-drain-remote-process')
-        : null;
+    if (($unsupportedReason = ControlPlaneStateFixture::unsupportedReason()) !== null) {
+        $this->markTestSkipped($unsupportedReason);
+    }
+
+    $fixture = ControlPlaneStateFixture::create('coolify-accepted-drain-remote-process');
     $epoch = 'operation-0123456789.accepted-drain-remote';
     $originalCommandTimeout = config('constants.ssh.command_timeout');
     $originalMultiplexingEnabled = config('constants.ssh.mux_enabled');
@@ -245,13 +311,142 @@ it('executes accepted remote mutation inline and records a terminal activity wit
     'failed command' => [124, '', 'accepted drain timed out', ProcessStatus::ERROR],
 ]);
 
+it('bounds a queued-before-freeze reserved proxy task and preserves its terminal activity', function (
+    int $exitCode,
+    string $stdout,
+    string $stderr,
+    ProcessStatus $expectedStatus,
+) {
+    if (($unsupportedReason = ControlPlaneStateFixture::unsupportedReason()) !== null) {
+        $this->markTestSkipped($unsupportedReason);
+    }
+
+    $fixture = ControlPlaneStateFixture::create('coolify-accepted-reserved-proxy-task');
+    $epoch = 'operation-0123456789.reserved-proxy-task';
+    $queue = null;
+
+    try {
+        config()->set('constants.ssh.command_timeout', 3600);
+        config()->set('constants.ssh.mux_enabled', true);
+        $server = acceptedDrainRemoteProcessServer();
+        [$queue, $reservedJob, $activity] = acceptedDrainQueuedProxyMutationTaskReservation(
+            $server,
+            $fixture,
+            $epoch,
+        );
+        $pendingProcesses = [];
+        Process::fake(function (PendingProcess $process) use (&$pendingProcesses, $exitCode, $stdout, $stderr) {
+            $pendingProcesses[] = [
+                'command' => $process->command,
+                'timeout' => $process->timeout,
+                'configured_timeout' => config('constants.ssh.command_timeout'),
+                'multiplexing_enabled' => config('constants.ssh.mux_enabled'),
+            ];
+
+            return Process::result(
+                output: $stdout,
+                errorOutput: $stderr,
+                exitCode: $exitCode,
+            );
+        });
+
+        $exception = null;
+        try {
+            $reservedJob->fire();
+        } catch (RuntimeException $caughtException) {
+            $exception = $caughtException;
+            $reservedJob->fail($caughtException);
+        }
+
+        $activity->refresh();
+
+        expect($pendingProcesses)->toHaveCount(1)
+            ->and($pendingProcesses[0]['timeout'])->toBe(15)
+            ->and($pendingProcesses[0]['configured_timeout'])->toBe(15)
+            ->and($pendingProcesses[0]['multiplexing_enabled'])->toBeFalse()
+            ->and($pendingProcesses[0]['command'])->toContain('timeout 15 ssh ')
+            ->and($activity->getExtraProperty('status'))->toBe($expectedStatus->value)
+            ->and($activity->getExtraProperty('exitCode'))->toBe($exitCode)
+            ->and(rtrim((string) $activity->getExtraProperty('stdout')))->toBe($stdout)
+            ->and(rtrim((string) $activity->getExtraProperty('stderr')))->toBe($stderr)
+            ->and(config('constants.ssh.command_timeout'))->toBe(3600)
+            ->and(config('constants.ssh.mux_enabled'))->toBeTrue()
+            ->and(ProxyMutationQueueState::snapshot())->toBe([
+                'pending' => 0,
+                'reserved' => 0,
+                'delayed' => 0,
+                'running' => 0,
+            ]);
+
+        if ($expectedStatus === ProcessStatus::FINISHED) {
+            expect($exception)->toBeNull()
+                ->and($activity->getExtraProperty('error'))->toBeNull()
+                ->and($activity->getExtraProperty('failed_at'))->toBeNull();
+        } else {
+            expect($exception)->toBeInstanceOf(RuntimeException::class)
+                ->and($activity->getExtraProperty('error'))->toContain($stderr)
+                ->and($activity->getExtraProperty('failed_at'))->toBeString()->not->toBeEmpty();
+        }
+    } finally {
+        $queue?->clear(ProxyMutationQueue::NAME);
+        $fixture->cleanup();
+    }
+})->with([
+    'successful reserved task' => [0, 'accepted output', '', ProcessStatus::FINISHED],
+    'failed reserved task' => [124, '', 'accepted drain timed out', ProcessStatus::ERROR],
+]);
+
+it('keeps a normally active reserved proxy task at its configured timeout', function () {
+    $queue = null;
+
+    try {
+        config()->set('constants.ssh.command_timeout', 3600);
+        config()->set('constants.ssh.mux_enabled', true);
+        $server = acceptedDrainRemoteProcessServer();
+        [$queue, $reservedJob, $activity] = acceptedDrainQueuedProxyMutationTaskReservation(
+            $server,
+            null,
+            'operation-0123456789.normal-active-proxy-task',
+        );
+        $pendingProcesses = [];
+        Process::fake(function (PendingProcess $process) use (&$pendingProcesses) {
+            $pendingProcesses[] = $process;
+
+            return Process::result(output: 'normal active output');
+        });
+
+        $reservedJob->fire();
+        $activity->refresh();
+        $remoteProcess = collect($pendingProcesses)->first(
+            static fn (PendingProcess $process): bool => str_contains($process->command, 'timeout 3600 ssh '),
+        );
+
+        expect($remoteProcess)->toBeInstanceOf(PendingProcess::class)
+            ->and($remoteProcess->timeout)->toBe(3600)
+            ->and($remoteProcess->command)->toContain('-o ControlMaster=auto')
+            ->and($activity->getExtraProperty('status'))->toBe(ProcessStatus::FINISHED->value)
+            ->and(config('constants.ssh.command_timeout'))->toBe(3600)
+            ->and(config('constants.ssh.mux_enabled'))->toBeTrue()
+            ->and(ProxyMutationQueueState::snapshot())->toBe([
+                'pending' => 0,
+                'reserved' => 0,
+                'delayed' => 0,
+                'running' => 0,
+            ]);
+    } finally {
+        $queue?->clear(ProxyMutationQueue::NAME);
+    }
+});
+
 it('fails closed before remote side effects when the implicit queue timeout envelope is not provable', function (
     mixed $implicitQueueTimeout,
     string $expectedMessage,
 ) {
-    $fixture = ControlPlaneStateFixture::unsupportedReason() === null
-        ? ControlPlaneStateFixture::create('coolify-accepted-drain-timeout-envelope')
-        : null;
+    if (($unsupportedReason = ControlPlaneStateFixture::unsupportedReason()) !== null) {
+        $this->markTestSkipped($unsupportedReason);
+    }
+
+    $fixture = ControlPlaneStateFixture::create('coolify-accepted-drain-timeout-envelope');
     $epoch = 'operation-0123456789.unproven-timeout';
     $queue = null;
     $reservedJob = null;

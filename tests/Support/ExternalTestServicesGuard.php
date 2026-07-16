@@ -9,8 +9,14 @@ use RuntimeException;
 
 final class ExternalTestServicesGuard
 {
-    public static function assertSafe(Repository $config, bool $externalServicesConfirmed): void
-    {
+    /**
+     * @param  list<string>  $requiredRedisConnections
+     */
+    public static function assertSafe(
+        Repository $config,
+        bool $externalServicesConfirmed,
+        array $requiredRedisConnections = [],
+    ): void {
         $databaseConnection = (string) $config->get('database.default');
         $cacheStore = (string) $config->get('cache.default');
         $databaseConfiguration = self::resolveConfiguration(
@@ -26,12 +32,12 @@ final class ExternalTestServicesGuard
             && is_array($cacheConfiguration)
             && ($cacheConfiguration['driver'] ?? null) === 'array';
 
-        if ($usesInMemoryDatabase && $usesArrayCache) {
+        if ($usesInMemoryDatabase && $usesArrayCache && $requiredRedisConnections === []) {
             return;
         }
 
         if (! $externalServicesConfirmed) {
-            throw new RuntimeException('External test services require COOLIFY_EXTERNAL_TEST_SERVICES=true. Refusing to use inherited database or cache configuration.');
+            throw new RuntimeException('External test services require COOLIFY_EXTERNAL_TEST_SERVICES=true. Refusing to use inherited database, cache, or named Redis configuration.');
         }
 
         if (! $usesInMemoryDatabase) {
@@ -51,17 +57,10 @@ final class ExternalTestServicesGuard
                 throw new RuntimeException('External Redis tests require a loopback host.');
             }
 
-            foreach (array_unique([$redisConnection, $redisLockConnection]) as $connection) {
-                $redisConfiguration = self::resolveConfiguration(
-                    $config->get("database.redis.{$connection}"),
-                    'Redis',
-                );
-
-                if (! self::isLoopbackHost($redisConfiguration['host'] ?? null)) {
-                    throw new RuntimeException('External Redis tests require a loopback host.');
-                }
-            }
+            self::assertRedisConnectionsAreSafe($config, [$redisConnection, $redisLockConnection]);
         }
+
+        self::assertRedisConnectionsAreSafe($config, $requiredRedisConnections);
     }
 
     /**
@@ -79,6 +78,34 @@ final class ExternalTestServicesGuard
                 || ! str_ends_with($databaseName, '_testing')
                 || array_any($databaseHosts, fn (mixed $host): bool => ! self::isLoopbackHost($host))) {
                 throw new RuntimeException('External database tests require a loopback host and a database name ending in _testing.');
+            }
+        }
+    }
+
+    /**
+     * @param  list<string>  $connections
+     */
+    private static function assertRedisConnectionsAreSafe(Repository $config, array $connections): void
+    {
+        $checkedConnections = [];
+
+        foreach ($connections as $connection) {
+            if (! is_string($connection) || $connection === '') {
+                throw new RuntimeException('External Redis tests require a loopback host.');
+            }
+
+            if (in_array($connection, $checkedConnections, true)) {
+                continue;
+            }
+
+            $checkedConnections[] = $connection;
+            $redisConfiguration = self::resolveConfiguration(
+                $config->get("database.redis.{$connection}"),
+                'Redis',
+            );
+
+            if (! self::isLoopbackHost($redisConfiguration['host'] ?? null)) {
+                throw new RuntimeException('External Redis tests require a loopback host.');
             }
         }
     }

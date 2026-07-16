@@ -102,6 +102,22 @@ it('rejects confirmed Redis on a non-loopback host', function () {
     );
 })->throws(RuntimeException::class, 'External Redis tests require a loopback host');
 
+it('rejects a required named Redis connection without explicit confirmation', function () {
+    ExternalTestServicesGuard::assertSafe(
+        externalTestServicesConfig(redisHost: '127.0.0.1'),
+        false,
+        ['default'],
+    );
+})->throws(RuntimeException::class, 'COOLIFY_EXTERNAL_TEST_SERVICES=true');
+
+it('rejects a required named Redis connection on an unreachable host before it is used', function () {
+    ExternalTestServicesGuard::assertSafe(
+        externalTestServicesConfig(redisHost: 'redis.invalid'),
+        true,
+        ['default'],
+    );
+})->throws(RuntimeException::class, 'External Redis tests require a loopback host');
+
 it('rejects unsafe database URL overrides', function (string $databaseUrl) {
     ExternalTestServicesGuard::assertSafe(
         externalTestServicesConfig(

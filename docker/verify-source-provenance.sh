@@ -12,6 +12,10 @@ fail()
 dockerfile=$1
 test -f "$dockerfile" || fail "Dockerfile is absent: $dockerfile"
 
+dockerfile_frontend=$(sed -n 's/^# syntax=//p' "$dockerfile" | sed -n '1p')
+[ "$dockerfile_frontend" = 'docker/dockerfile:1@sha256:87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89' ] ||
+    fail 'Dockerfile frontend is not pinned to the reviewed multi-platform digest'
+
 argument_value()
 {
     name=$1

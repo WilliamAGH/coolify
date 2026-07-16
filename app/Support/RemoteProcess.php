@@ -28,12 +28,9 @@ final class RemoteProcess
         mixed $callEventData = null,
     ): Activity {
         ControlPlaneMode::ensureActive('Remote execution');
-        $executeInline = ControlPlaneMode::acceptedMutationExecutionActive();
+        $executeInline = ControlPlaneMode::acceptedMutationDrainExecutionActive();
         if ($executeInline) {
-            $commandTimeout = self::acceptedDrainCommandTimeout();
-
-            return self::withAcceptedDrainRemoteConfiguration(
-                $commandTimeout,
+            return self::withAcceptedMutationDrainRemoteConfiguration(
                 fn (): Activity => self::dispatch(
                     command: $command,
                     server: $server,
@@ -160,6 +157,24 @@ final class RemoteProcess
         return $commandTimeout;
     }
 
+    /**
+     * @template T
+     *
+     * @param  Closure(): T  $operation
+     * @return T
+     */
+    public static function withAcceptedMutationDrainRemoteConfiguration(Closure $operation): mixed
+    {
+        if (! ControlPlaneMode::acceptedMutationDrainExecutionActive()) {
+            return $operation();
+        }
+
+        return self::withAcceptedDrainRemoteConfiguration(
+            self::acceptedDrainCommandTimeout(),
+            $operation,
+        );
+    }
+
     private static function positiveTimeout(string $configurationKey): int
     {
         $configuredTimeout = config($configurationKey);
@@ -176,8 +191,13 @@ final class RemoteProcess
         return $configuredTimeout;
     }
 
-    /** @param Closure(): Activity $operation */
-    private static function withAcceptedDrainRemoteConfiguration(int $commandTimeout, Closure $operation): Activity
+    /**
+     * @template T
+     *
+     * @param  Closure(): T  $operation
+     * @return T
+     */
+    private static function withAcceptedDrainRemoteConfiguration(int $commandTimeout, Closure $operation): mixed
     {
         $originalCommandTimeout = config('constants.ssh.command_timeout');
         $originalMultiplexingEnabled = config('constants.ssh.mux_enabled');
