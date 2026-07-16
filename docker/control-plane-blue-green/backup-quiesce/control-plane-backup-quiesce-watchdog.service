@@ -1,0 +1,17 @@
+[Unit]
+Description=Reconcile expired Coolify control-plane backup fences
+After=docker.service network-online.target
+Wants=docker.service network-online.target
+ConditionPathIsExecutable=/usr/local/libexec/coolify/control-plane-backup-quiesce
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/libexec/coolify/control-plane-backup-quiesce watchdog-scan --state-directory /var/lib/coolify/control-plane-backup-quiesce
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/coolify/control-plane-backup-quiesce
+TimeoutStartSec=1200

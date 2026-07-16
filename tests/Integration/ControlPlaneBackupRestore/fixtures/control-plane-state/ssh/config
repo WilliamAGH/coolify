@@ -1,0 +1,3 @@
+Host lab-destination
+    HostName 192.0.2.10
+    User deploy

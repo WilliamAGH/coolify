@@ -1,0 +1,36 @@
+services:
+  coolify:
+    image: "${CONTROL_PLANE_LEGACY_IMAGE:?CONTROL_PLANE_LEGACY_IMAGE is required}"
+    env_file:
+      - "${CONTROL_PLANE_SOURCE_ENV_FILE:?CONTROL_PLANE_SOURCE_ENV_FILE is required}"
+    environment:
+      CONTROL_PLANE_COLOR: legacy
+      CONTROL_PLANE_MODE: active
+      CONTROL_PLANE_STARTUP_MODE: full
+      CONTROL_PLANE_BACKEND_PORT: "${CONTROL_PLANE_BACKEND_PORT:?CONTROL_PLANE_BACKEND_PORT is required}"
+      LAB_EXPECTED_HOST: "${CONTROL_PLANE_HOST:?CONTROL_PLANE_HOST is required}"
+    expose:
+      - "${CONTROL_PLANE_BACKEND_PORT:?CONTROL_PLANE_BACKEND_PORT is required}"
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:${CONTROL_PLANE_BACKEND_PORT:?CONTROL_PLANE_BACKEND_PORT is required}/api/health >/dev/null || exit 1"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.${CONTROL_PLANE_TRAEFIK_ROUTER:?CONTROL_PLANE_TRAEFIK_ROUTER is required}.rule=Host(`${CONTROL_PLANE_HOST:?CONTROL_PLANE_HOST is required}`)"
+      - "traefik.http.routers.${CONTROL_PLANE_TRAEFIK_ROUTER:?CONTROL_PLANE_TRAEFIK_ROUTER is required}.entrypoints=web"
+      - "traefik.http.routers.${CONTROL_PLANE_TRAEFIK_ROUTER:?CONTROL_PLANE_TRAEFIK_ROUTER is required}.priority=10"
+      - "traefik.http.routers.${CONTROL_PLANE_TRAEFIK_ROUTER:?CONTROL_PLANE_TRAEFIK_ROUTER is required}.service=${CONTROL_PLANE_TRAEFIK_SERVICE:?CONTROL_PLANE_TRAEFIK_SERVICE is required}"
+      - "traefik.http.services.${CONTROL_PLANE_TRAEFIK_SERVICE:?CONTROL_PLANE_TRAEFIK_SERVICE is required}.loadbalancer.server.port=8080"
+    volumes:
+      - type: bind
+        source: "${CONTROL_PLANE_SOURCE_ENV_FILE:?CONTROL_PLANE_SOURCE_ENV_FILE is required}"
+        target: /var/www/html/.env
+        read_only: true
+      - "${CONTROL_PLANE_SSH_DIRECTORY:?CONTROL_PLANE_SSH_DIRECTORY is required}:/var/www/html/storage/app/ssh"
+      - "${CONTROL_PLANE_APPLICATIONS_DIRECTORY:?CONTROL_PLANE_APPLICATIONS_DIRECTORY is required}:/var/www/html/storage/app/applications"
+      - "${CONTROL_PLANE_DATABASES_DIRECTORY:?CONTROL_PLANE_DATABASES_DIRECTORY is required}:/var/www/html/storage/app/databases"
+      - "${CONTROL_PLANE_SERVICES_DIRECTORY:?CONTROL_PLANE_SERVICES_DIRECTORY is required}:/var/www/html/storage/app/services"
+      - "${CONTROL_PLANE_BACKUPS_DIRECTORY:?CONTROL_PLANE_BACKUPS_DIRECTORY is required}:/var/www/html/storage/app/backups"
+      - "${LAB_RUNTIME_STATE_DIR:?LAB_RUNTIME_STATE_DIR is required}:/lab-state"

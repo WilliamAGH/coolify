@@ -1,0 +1,11 @@
+[Unit]
+Description=Continuously guard Coolify control-plane backup fence leases
+
+[Timer]
+OnBootSec=5s
+OnUnitInactiveSec=5s
+AccuracySec=1s
+Unit=control-plane-backup-quiesce-watchdog.service
+
+[Install]
+WantedBy=timers.target

@@ -5,6 +5,7 @@ namespace App\Livewire\Server\Proxy;
 use App\Enums\ProxyTypes;
 use App\Models\Server;
 use App\Rules\ValidProxyConfigFilename;
+use App\Support\ProxyDynamicConfigurationFilenamePolicy;
 use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
 use Livewire\Component;
 use Symfony\Component\Yaml\Yaml;
@@ -57,15 +58,15 @@ class NewDynamicConfiguration extends Component
                 if (! str($this->fileName)->endsWith('.yaml') && ! str($this->fileName)->endsWith('.yml')) {
                     $this->fileName = "{$this->fileName}.yaml";
                 }
-                if ($this->fileName === 'coolify.yaml') {
-                    $this->dispatch('error', 'File name is reserved.');
-
-                    return;
-                }
             } elseif ($proxy_type === 'CADDY') {
                 if (! str($this->fileName)->endsWith('.caddy')) {
                     $this->fileName = "{$this->fileName}.caddy";
                 }
+            }
+            if (ProxyDynamicConfigurationFilenamePolicy::isReadOnly($this->fileName)) {
+                $this->dispatch('error', 'Coolify-managed dynamic configurations are read-only.');
+
+                return;
             }
             $proxy_path = $this->server->proxyPath();
             $file = "{$proxy_path}/dynamic/{$this->fileName}";

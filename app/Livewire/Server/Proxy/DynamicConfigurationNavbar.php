@@ -3,6 +3,7 @@
 namespace App\Livewire\Server\Proxy;
 
 use App\Models\Server;
+use App\Support\ProxyDynamicConfigurationFilenamePolicy;
 use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
 use Livewire\Component;
 
@@ -23,22 +24,19 @@ class DynamicConfigurationNavbar extends Component
     public function delete(string $fileName)
     {
         $this->authorize('update', $this->server);
-        $proxy_path = $this->server->proxyPath();
-        $proxy_type = $this->server->proxyType();
 
-        // Decode filename: pipes are used to encode dots for Livewire property binding
-        // (e.g., 'my|service.yaml' -> 'my.service.yaml')
-        // This must happen BEFORE validation because validateFilenameSafe()
-        // rejects pipe characters through validateShellSafePath().
         $file = str_replace('|', '.', $fileName);
 
-        validateFilenameSafe($file, 'proxy configuration filename');
-
-        if ($proxy_type === 'CADDY' && $file === 'Caddyfile') {
-            $this->dispatch('error', 'Cannot delete Caddyfile.');
+        if (ProxyDynamicConfigurationFilenamePolicy::isReadOnly($file)) {
+            $this->dispatch('error', 'Coolify-managed dynamic configurations are read-only.');
 
             return;
         }
+
+        validateFilenameSafe($file, 'proxy configuration filename');
+
+        $proxy_path = $this->server->proxyPath();
+        $proxy_type = $this->server->proxyType();
 
         $fullPath = "{$proxy_path}/dynamic/{$file}";
         $escapedPath = escapeshellarg($fullPath);

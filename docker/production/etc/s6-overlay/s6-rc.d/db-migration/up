@@ -1,11 +1,8 @@
 #!/command/execlineb -P
 
-# Use with-contenv to ensure environment variables are available
 with-contenv
-cd /var/www/html
-foreground {
-    php
-    artisan
-    start:migration
-}
-
+/usr/local/bin/coolify-entrypoint
+run-startup
+MIGRATION_ENABLED
+true
+start:migration

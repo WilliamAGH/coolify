@@ -1,6 +1,7 @@
 <?php
 
 use App\Rules\ValidProxyConfigFilename;
+use App\Support\ProxyDynamicConfigurationFilenamePolicy;
 
 test('allows valid proxy config filenames', function () {
     $validFilenames = [
@@ -90,6 +91,42 @@ test('blocks reserved filename Caddyfile', function () {
     });
 
     expect($failed)->toBeTrue();
+});
+
+test('blocks Coolify-managed blue green proxy filenames', function () {
+    $rule = new ValidProxyConfigFilename;
+    $failed = false;
+
+    $rule->validate('fileName', 'coolify-blue-green-a5adf99dc3d81b09.yaml', function () use (&$failed) {
+        $failed = true;
+    });
+
+    expect($failed)->toBeTrue();
+});
+
+test('applies one read-only filename policy to validation', function (string $filename) {
+    $rule = new ValidProxyConfigFilename;
+    $failed = false;
+
+    $rule->validate('fileName', $filename, function () use (&$failed) {
+        $failed = true;
+    });
+
+    expect(ProxyDynamicConfigurationFilenamePolicy::isReadOnly($filename))->toBeTrue()
+        ->and($failed)->toBeTrue();
+})->with([
+    'traefik default configuration' => 'coolify.yaml',
+    'traefik alternate configuration' => 'coolify.yml',
+    'caddy dynamic configuration' => 'coolify.caddy',
+    'caddy main configuration' => 'Caddyfile',
+    'traefik maintenance configuration' => 'default_redirect_503.yaml',
+    'caddy maintenance configuration' => 'default_redirect_503.caddy',
+    'blue green generated configuration' => 'coolify-blue-green-a5adf99dc3d81b09.yaml',
+]);
+
+test('does not reserve ordinary dynamic configuration filenames', function () {
+    expect(ProxyDynamicConfigurationFilenamePolicy::isReadOnly('custom-router.yaml'))->toBeFalse()
+        ->and(ProxyDynamicConfigurationFilenamePolicy::isReadOnly('Caddyfile.backup'))->toBeFalse();
 });
 
 test('blocks filenames with invalid characters', function () {

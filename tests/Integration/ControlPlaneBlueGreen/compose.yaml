@@ -1,0 +1,87 @@
+services:
+  proxy:
+    image: "traefik:v3.6.13@sha256:5ae9c349154d5298a5d61a7b25e5f3a9f53314f1515e87632120b95051c7917c"
+    container_name: "${CONTROL_PLANE_PROXY_CONTAINER:?CONTROL_PLANE_PROXY_CONTAINER is required}"
+    command: ["--configFile=/etc/traefik/traefik.yml"]
+    restart: "no"
+    ports:
+      - "127.0.0.1:${LAB_TRAEFIK_PORT:?LAB_TRAEFIK_PORT is required}:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - "${LAB_DYNAMIC_DIR:?LAB_DYNAMIC_DIR is required}:/traefik/dynamic"
+      - "${LAB_TRAEFIK_STATIC_CONFIG:?LAB_TRAEFIK_STATIC_CONFIG is required}:/etc/traefik/traefik.yml:ro"
+    networks:
+      - lab
+
+  port-proxy:
+    image: "${CONTROL_PLANE_GREEN_IMAGE:?CONTROL_PLANE_GREEN_IMAGE is required}"
+    container_name: "${CONTROL_PLANE_PORT_PROXY_CONTAINER:?CONTROL_PLANE_PORT_PROXY_CONTAINER is required}"
+    restart: "no"
+    entrypoint: ["python3", "/usr/local/bin/control-plane-port-proxy"]
+    environment:
+      CONTROL_PLANE_LAB_PORT_CONFIG: /port-proxy/route
+      LAB_EXPECTED_HOST: "${CONTROL_PLANE_HOST:?CONTROL_PLANE_HOST is required}"
+    ports:
+      - "127.0.0.1:${LAB_PORT8000_PORT:?LAB_PORT8000_PORT is required}:8000"
+    volumes:
+      - "${LAB_PORT_CONFIG_DIR:?LAB_PORT_CONFIG_DIR is required}:/port-proxy:ro"
+    networks:
+      - lab
+
+  database:
+    image: "postgres:15.18-alpine3.24@sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f"
+    container_name: "${CONTROL_PLANE_DATABASE_CONTAINER:?CONTROL_PLANE_DATABASE_CONTAINER is required}"
+    restart: "no"
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - ./database-init.sql:/docker-entrypoint-initdb.d/01-queue.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    networks:
+      - lab
+
+  rehearsal-database:
+    image: "postgres:15.18-alpine3.24@sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f"
+    container_name: "${CONTROL_PLANE_REHEARSAL_DATABASE_CONTAINER:?CONTROL_PLANE_REHEARSAL_DATABASE_CONTAINER is required}"
+    restart: "no"
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - ./database-init.sql:/docker-entrypoint-initdb.d/01-queue.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    networks:
+      - rehearsal
+
+  redis:
+    image: "${CONTROL_PLANE_GREEN_IMAGE:?CONTROL_PLANE_GREEN_IMAGE is required}"
+    container_name: "${CONTROL_PLANE_REDIS_CONTAINER:?CONTROL_PLANE_REDIS_CONTAINER is required}"
+    restart: "no"
+    entrypoint: ["/usr/local/bin/control-plane-lab-dependency", "6379"]
+    networks:
+      - lab
+
+  realtime:
+    image: "${CONTROL_PLANE_GREEN_IMAGE:?CONTROL_PLANE_GREEN_IMAGE is required}"
+    container_name: "${CONTROL_PLANE_SOKETI_CONTAINER:?CONTROL_PLANE_SOKETI_CONTAINER is required}"
+    restart: "no"
+    entrypoint: ["/usr/local/bin/control-plane-lab-dependency", "6001", "6002"]
+    networks:
+      - lab
+
+networks:
+  lab:
+    name: "${CONTROL_PLANE_NETWORK:?CONTROL_PLANE_NETWORK is required}"
+    external: true
+  rehearsal:
+    name: "${CONTROL_PLANE_REHEARSAL_NETWORK:?CONTROL_PLANE_REHEARSAL_NETWORK is required}"
+    external: true

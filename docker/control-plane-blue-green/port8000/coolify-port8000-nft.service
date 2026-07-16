@@ -1,0 +1,27 @@
+[Unit]
+Description=Coolify control-plane port 8000 nftables capture
+Documentation=https://wiki.nftables.org/wiki-nftables/index.php/Configuring_chains
+DefaultDependencies=no
+Requires=coolify-port8000-haproxy@phase-a.service coolify-port8000-haproxy@phase-b.service
+After=local-fs.target coolify-port8000-haproxy@phase-a.service coolify-port8000-haproxy@phase-b.service
+Before=network-pre.target docker.service docker.socket
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/libexec/coolify-port8000-apply-active-nft
+ExecReload=/usr/local/libexec/coolify-port8000-apply-active-nft
+RemainAfterExit=yes
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/coolify-control-plane-port8000
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target
+RequiredBy=docker.service docker.socket

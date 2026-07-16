@@ -2,20 +2,12 @@
 
 namespace App\Rules;
 
+use App\Support\ProxyDynamicConfigurationFilenamePolicy;
 use Closure;
 use Illuminate\Contracts\Validation\ValidationRule;
 
 class ValidProxyConfigFilename implements ValidationRule
 {
-    /**
-     * Reserved filenames that cannot be used.
-     */
-    private const RESERVED_FILENAMES = [
-        'coolify.yaml',
-        'coolify.yml',
-        'Caddyfile',
-    ];
-
     /**
      * Run the validation rule.
      *
@@ -63,8 +55,7 @@ class ValidProxyConfigFilename implements ValidationRule
             return;
         }
 
-        // Check for reserved filenames (case-sensitive for coolify.yaml/yml, case-insensitive check not needed as Caddyfile is exact)
-        if (in_array($filename, self::RESERVED_FILENAMES, true)) {
+        if (ProxyDynamicConfigurationFilenamePolicy::isReadOnly($filename)) {
             $fail('The :attribute uses a reserved filename.');
 
             return;

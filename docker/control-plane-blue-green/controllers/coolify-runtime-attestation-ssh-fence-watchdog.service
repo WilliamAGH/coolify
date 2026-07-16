@@ -1,0 +1,25 @@
+[Unit]
+Description=Continuously reconcile the armed Coolify control-plane SSH fence
+After=docker.service
+BindsTo=docker.service
+PartOf=docker.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/coolify-runtime-attestation-ssh-fence/runtime.env
+ExecStart=/usr/local/libexec/coolify-runtime-attestation-ssh-fence watch
+Restart=always
+RestartSec=1
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/coolify-runtime-attestation-ssh-fence
+RestrictAddressFamilies=AF_NETLINK AF_UNIX
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+
+[Install]
+WantedBy=docker.service

@@ -1,0 +1,50 @@
+#!/bin/sh
+
+set -eu
+
+system_stat=/usr/bin/stat
+
+case "$(uname -s)" in
+    Darwin|FreeBSD|NetBSD|OpenBSD)
+        ;;
+    *)
+        exec "$system_stat" "$@"
+        ;;
+esac
+
+case "${1:-}" in
+    -c)
+        follow_links=0
+        ;;
+    -Lc)
+        follow_links=1
+        ;;
+    *)
+        exec "$system_stat" "$@"
+        ;;
+esac
+
+[ "$#" -eq 3 ] || exec "$system_stat" "$@"
+
+case "$2" in
+    '%a') bsd_format='%Lp' ;;
+    '%u') bsd_format='%u' ;;
+    '%g') bsd_format='%g' ;;
+    '%s') bsd_format='%z' ;;
+    '%d:%i') bsd_format='%d:%i' ;;
+    '%u:%g') bsd_format='%u:%g' ;;
+    '%u:%g:%a') bsd_format='%u:%g:%Lp' ;;
+    '%u:%g:%a:%s') bsd_format='%u:%g:%Lp:%z' ;;
+    '%a:%u') bsd_format='%Lp:%u' ;;
+    '%a:%u:%g') bsd_format='%Lp:%u:%g' ;;
+    '%u:%g:%a:%h') bsd_format='%u:%g:%Lp:%l' ;;
+    '%u:%g:%a:%h:%s') bsd_format='%u:%g:%Lp:%l:%z' ;;
+    '%d:%i:%u:%g:%a') bsd_format='%d:%i:%u:%g:%Lp' ;;
+    '%d:%i:%u:%g:%a:%s') bsd_format='%d:%i:%u:%g:%Lp:%z' ;;
+    *) exec "$system_stat" "$@" ;;
+esac
+
+if [ "$follow_links" = 1 ]; then
+    exec "$system_stat" -L -f "$bsd_format" "$3"
+fi
+exec "$system_stat" -f "$bsd_format" "$3"

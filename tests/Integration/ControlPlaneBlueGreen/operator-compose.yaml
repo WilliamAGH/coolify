@@ -1,0 +1,4 @@
+# The lab consumes the production candidate topology directly so service,
+# private-authority, shared-coordination, secret, and port contracts cannot drift.
+include:
+  - path: ../../../docker/control-plane-blue-green/compose.yaml

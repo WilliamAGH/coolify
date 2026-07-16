@@ -1,0 +1,23 @@
+#!/bin/sh
+
+set -eu
+
+if [ -n "${CONTROL_PLANE_TEST_INSTALL_PRECOPY_MARKER:-}" ]; then
+    [ "${CONTROL_PLANE_TEST_MODE:-0}" = 1 ] || exit 64
+    case "${CONTROL_PLANE_TEST_INSTALL_PRECOPY_HOLD_SECONDS:-0}" in
+        ''|*[!0-9]*) exit 64 ;;
+    esac
+    case "$CONTROL_PLANE_TEST_INSTALL_PRECOPY_MARKER" in
+        /var/lib/coolify/control-plane-backup-quiesce/*) ;;
+        *) exit 64 ;;
+    esac
+    for install_argument in "$@"; do
+        if [ "$install_argument" = /usr/local/sbin/control-plane-blue-green ]; then
+            : > "$CONTROL_PLANE_TEST_INSTALL_PRECOPY_MARKER"
+            sleep "${CONTROL_PLANE_TEST_INSTALL_PRECOPY_HOLD_SECONDS:-0}"
+            break
+        fi
+    done
+fi
+
+exec /usr/bin/install "$@"

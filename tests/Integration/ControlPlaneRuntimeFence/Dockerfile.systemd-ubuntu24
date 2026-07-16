@@ -1,0 +1,101 @@
+# syntax=docker/dockerfile:1.7
+
+# This image is deliberately a host-shaped test substrate, not an application
+# image. The outer host gate only accepts a locally available digest carrying the source
+# attestation label emitted by build-systemd-ubuntu24-image.sh.
+ARG UBUNTU_IMAGE=docker.io/library/ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
+FROM ${UBUNTU_IMAGE}
+
+ARG HOST_SOURCE_SHA256
+ARG APT_SNAPSHOT=https://snapshot.ubuntu.com/ubuntu/20260716T000000Z
+ARG DOCKER_IO_VERSION=29.1.3-0ubuntu3~24.04.2
+ARG NFTABLES_VERSION=1.0.9-1ubuntu0.1
+ARG CONNTRACK_VERSION=1:1.4.8-1ubuntu1
+
+LABEL io.coolify.runtime-fence.systemd-host=true \
+    io.coolify.runtime-fence.systemd-host-source-sha256=${HOST_SOURCE_SHA256} \
+    org.opencontainers.image.title="Coolify runtime-fence disposable Ubuntu 24.04 systemd host"
+
+ENV container=docker
+
+# The pinned base intentionally has no trust store. The build script supplies a
+# verified PEM only as a BuildKit secret for this signed HTTPS apt transaction.
+# apt's sandboxed downloader needs a readable temporary copy; it is verified,
+# shredded, and absent before this layer commits. ca-certificates then becomes
+# the image's sole persisted trust store.
+RUN --mount=type=secret,id=bootstrap-ca,target=/run/secrets/bootstrap-ca,required=true \
+    set -eux; \
+    bootstrap_ca=/run/secrets/bootstrap-ca; \
+    apt_ca_copy=/tmp/runtime-fence-bootstrap-ca.pem; \
+    apt_ca_configuration=/etc/apt/apt.conf.d/99runtime-fence-bootstrap-ca; \
+    test -f "$bootstrap_ca" && test ! -L "$bootstrap_ca" && test -s "$bootstrap_ca"; \
+    grep -F -q -- '-----BEGIN CERTIFICATE-----' "$bootstrap_ca"; \
+    grep -F -q -- '-----END CERTIFICATE-----' "$bootstrap_ca"; \
+    bootstrap_ca_sha256=$(sha256sum "$bootstrap_ca" | awk '{print $1}'); \
+    cp -- "$bootstrap_ca" "$apt_ca_copy"; \
+    chown root:root "$apt_ca_copy"; \
+    chmod 0644 "$apt_ca_copy"; \
+    test -f "$apt_ca_copy" && test ! -L "$apt_ca_copy" \
+        && test "$(stat -c '%u:%g:%a' "$apt_ca_copy")" = 0:0:644; \
+    test "$(sha256sum "$apt_ca_copy" | awk '{print $1}')" = "$bootstrap_ca_sha256"; \
+    cmp -s "$bootstrap_ca" "$apt_ca_copy"; \
+    case "$APT_SNAPSHOT" in https://*) ;; *) exit 1 ;; esac; \
+    printf 'Acquire::https::CaInfo "%s";\n' "$apt_ca_copy" > "$apt_ca_configuration"; \
+    rm -f /etc/apt/sources.list.d/ubuntu.sources; \
+    printf '%s\n' \
+        "deb [check-valid-until=no] ${APT_SNAPSHOT} noble main restricted universe multiverse" \
+        "deb [check-valid-until=no] ${APT_SNAPSHOT} noble-updates main restricted universe multiverse" \
+        "deb [check-valid-until=no] ${APT_SNAPSHOT} noble-security main restricted universe multiverse" \
+        > /etc/apt/sources.list; \
+    apt-get -o Acquire::AllowInsecureRepositories=false \
+        -o Acquire::AllowDowngradeToInsecureRepositories=false update; \
+    DEBIAN_FRONTEND=noninteractive apt-get \
+        -o APT::Get::AllowUnauthenticated=false install --yes --no-install-recommends \
+        bash ca-certificates conntrack=${CONNTRACK_VERSION} coreutils curl docker.io=${DOCKER_IO_VERSION} \
+        ipcalc iproute2 iptables jq nftables=${NFTABLES_VERSION} openssh-client openssh-server openssl \
+        procps systemd systemd-sysv util-linux; \
+    test "$(dpkg-query -W -f='${Version}' nftables)" = "${NFTABLES_VERSION}"; \
+    test "$(dpkg-query -W -f='${Version}' conntrack)" = "${CONNTRACK_VERSION}"; \
+    test "$(dpkg-query -W -f='${Version}' docker.io)" = "${DOCKER_IO_VERSION}"; \
+    shred --remove --zero "$apt_ca_copy"; \
+    rm -f "$apt_ca_configuration"; \
+    test ! -e "$apt_ca_copy" && test ! -e "$apt_ca_configuration"; \
+    rm -rf /var/lib/apt/lists/*
+
+COPY tests/Integration/ControlPlaneRuntimeFence/systemd-host-boot.sh \
+    /usr/local/libexec/coolify-runtime-fence-host-boot
+COPY tests/Integration/ControlPlaneRuntimeFence/coolify-runtime-fence-host-boot.service \
+    /etc/systemd/system/coolify-runtime-fence-host-boot.service
+
+RUN set -eux; \
+    install -d -m 0700 /root/.ssh /run/sshd /evidence; \
+    chmod 0700 /usr/local/libexec/coolify-runtime-fence-host-boot; \
+    install -d -m 0755 /etc/systemd/system/multi-user.target.wants \
+        /etc/systemd/system/docker.service.requires \
+        /etc/systemd/system/docker.socket.requires \
+        /etc/systemd/system/ssh.service.d; \
+    ln -sf /lib/systemd/system/docker.service /etc/systemd/system/multi-user.target.wants/docker.service; \
+    ln -sf /lib/systemd/system/ssh.service /etc/systemd/system/multi-user.target.wants/ssh.service; \
+    ln -sf /etc/systemd/system/coolify-runtime-fence-host-boot.service \
+        /etc/systemd/system/multi-user.target.wants/coolify-runtime-fence-host-boot.service; \
+    ln -sf /etc/systemd/system/coolify-runtime-fence-host-boot.service \
+        /etc/systemd/system/docker.service.requires/coolify-runtime-fence-host-boot.service; \
+    ln -sf /etc/systemd/system/coolify-runtime-fence-host-boot.service \
+        /etc/systemd/system/docker.socket.requires/coolify-runtime-fence-host-boot.service; \
+    printf '%s\n' \
+        '[Unit]' \
+        'Requires=coolify-runtime-fence-host-boot.service' \
+        'After=coolify-runtime-fence-host-boot.service' \
+        > /etc/systemd/system/ssh.service.d/runtime-fence-host.conf; \
+    printf '%s\n' \
+        '{' \
+        '  "ipv6": true,' \
+        '  "fixed-cidr-v6": "fd00:ca11:feed::/80",' \
+        '  "iptables": true,' \
+        '  "ip6tables": true,' \
+        '  "live-restore": false,' \
+        '  "log-level": "warn"' \
+        '}' > /etc/docker/daemon.json
+
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

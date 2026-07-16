@@ -1,11 +1,8 @@
-#!/bin/sh
+#!/command/execlineb -P
 
-cd /var/www/html
-
-if grep -qE '^NIGHTWATCH_ENABLED=true' .env 2>/dev/null; then
-    echo "   INFO  Nightwatch is enabled, starting..."
-    exec php artisan nightwatch:agent
-fi
-
-echo "   INFO  Nightwatch is disabled, sleeping."
-exec sleep infinity
+with-contenv
+/usr/local/bin/coolify-entrypoint
+run-background
+NIGHTWATCH_ENABLED
+false
+nightwatch:agent

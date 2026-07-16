@@ -1,0 +1,98 @@
+# Quarantined passive validation only. Production promotion is a separate operator-runbook action.
+name: coolify-preflight
+
+services:
+  coolify-preflight:
+    image: "${PREFLIGHT_IMAGE:-coolify:preflight}"
+    build:
+      context: .
+      dockerfile: docker/production/Dockerfile
+    restart: "no"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      CONTROL_PLANE_MODE: passive
+      APP_ENV: production
+      APP_DEBUG: "false"
+      APP_KEY: "${PREFLIGHT_APP_KEY:-base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}"
+      APP_URL: "http://127.0.0.1:${PREFLIGHT_PORT:-18080}"
+      DATABASE_URL: "${PREFLIGHT_DATABASE_URL:-postgresql://coolify_preflight_readonly:coolify-preflight-readonly@database:5432/coolify_preflight}"
+      DB_CONNECTION: pgsql
+      AUTORUN_ENABLED: "false"
+      MIGRATION_ENABLED: "false"
+      SEEDER_ENABLED: "false"
+      INIT_ENABLED: "false"
+      HORIZON_ENABLED: "false"
+      SCHEDULER_ENABLED: "false"
+      NIGHTWATCH_ENABLED: "false"
+      SENTRY_DSN: ""
+      SENTRY_ENABLE_TRACING: "false"
+      TELESCOPE_ENABLED: "false"
+      DEBUGBAR_ENABLED: "false"
+      RAY_ENABLED: "false"
+      QUEUE_CONNECTION: "null"
+      QUEUE_FAILED_DRIVER: "null"
+      CACHE_STORE: array
+      CACHE_DRIVER: array
+      SESSION_DRIVER: array
+      BROADCAST_DRIVER: "null"
+      MAIL_MAILER: array
+      LOG_CHANNEL: stderr
+      LOG_STACK: stderr
+    ports:
+      - "127.0.0.1:${PREFLIGHT_PORT:-18080}:8080"
+    depends_on:
+      database:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/api/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 20
+    networks:
+      - preflight
+
+  database:
+    image: postgres:15.18-alpine3.24@sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f
+    restart: "no"
+    environment:
+      POSTGRES_USER: coolify_preflight_owner
+      POSTGRES_PASSWORD: coolify-preflight-owner
+      POSTGRES_DB: coolify_preflight
+    tmpfs:
+      - /var/lib/postgresql/data
+    configs:
+      - source: preflight-database-init
+        target: /docker-entrypoint-initdb.d/01-read-only-role.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coolify_preflight_owner -d coolify_preflight"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    networks:
+      - preflight
+
+configs:
+  preflight-database-init:
+    content: |
+      CREATE ROLE coolify_preflight_readonly LOGIN PASSWORD 'coolify-preflight-readonly'
+        NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
+      REVOKE ALL ON DATABASE coolify_preflight FROM coolify_preflight_readonly;
+      REVOKE TEMPORARY ON DATABASE coolify_preflight FROM PUBLIC;
+      GRANT CONNECT ON DATABASE coolify_preflight TO coolify_preflight_readonly;
+      REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+      REVOKE ALL ON SCHEMA public FROM coolify_preflight_readonly;
+      GRANT USAGE ON SCHEMA public TO coolify_preflight_readonly;
+      REVOKE ALL ON ALL TABLES IN SCHEMA public FROM coolify_preflight_readonly;
+      GRANT SELECT ON ALL TABLES IN SCHEMA public TO coolify_preflight_readonly;
+      REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM coolify_preflight_readonly;
+      GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO coolify_preflight_readonly;
+      ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO coolify_preflight_readonly;
+      ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON SEQUENCES TO coolify_preflight_readonly;
+      ALTER ROLE coolify_preflight_readonly SET default_transaction_read_only = on;
+
+networks:
+  preflight:
+    internal: true

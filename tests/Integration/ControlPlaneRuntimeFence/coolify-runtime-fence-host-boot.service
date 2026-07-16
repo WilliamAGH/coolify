@@ -1,0 +1,21 @@
+[Unit]
+Description=Prepare the disposable runtime-fence systemd host before Docker and SSH
+DefaultDependencies=no
+After=local-fs.target
+Before=docker.service docker.socket ssh.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/libexec/coolify-runtime-fence-host-boot
+RemainAfterExit=yes
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=false
+ProtectSystem=strict
+ReadWritePaths=/evidence /root/.ssh /run /run/sshd
+
+[Install]
+WantedBy=multi-user.target
+RequiredBy=docker.service docker.socket

@@ -28,13 +28,11 @@
                     @if ($contents?->isNotEmpty())
                         @foreach ($contents as $fileName => $value)
                             <div class="flex flex-col gap-2 py-2">
-                                @if (str_replace('|', '.', $fileName) === 'coolify.yaml' ||
-                                        str_replace('|', '.', $fileName) === 'Caddyfile' ||
-                                        str_replace('|', '.', $fileName) === 'coolify.caddy' ||
-                                        str_replace('|', '.', $fileName) === 'default_redirect_503.yaml' ||
-                                        str_replace('|', '.', $fileName) === 'default_redirect_503.caddy')
+                                @php($filename = str_replace('|', '.', $fileName))
+                                @if (\App\Support\ProxyDynamicConfigurationFilenamePolicy::isReadOnly($filename))
                                     <div>
-                                        <h3 class="dark:text-white">File: {{ str_replace('|', '.', $fileName) }}</h3>
+                                        <h3 class="dark:text-white">File: {{ $filename }}</h3>
+                                        <div class="text-sm text-warning">Coolify-managed (read-only)</div>
                                     </div>
                                     <x-forms.textarea disabled name="proxy_settings"
                                         wire:model="contents.{{ $fileName }}" rows="5" />

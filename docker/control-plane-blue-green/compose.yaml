@@ -1,0 +1,300 @@
+# The operator owns two explicit web members per candidate generation. It never
+# scales a service and never manages the bootstrap legacy `coolify` container or
+# the existing proxy.
+services:
+  green-web-a:
+    image: "${CONTROL_PLANE_GREEN_IMAGE:?CONTROL_PLANE_GREEN_IMAGE must be an immutable digest reference}"
+    container_name: "${CONTROL_PLANE_GREEN_WEB_A_CONTAINER:?CONTROL_PLANE_GREEN_WEB_A_CONTAINER is required}"
+    restart: unless-stopped
+    working_dir: /var/www/html
+    env_file:
+      - "${CONTROL_PLANE_RUNTIME_ENV_FILE:?CONTROL_PLANE_RUNTIME_ENV_FILE is required}"
+    environment:
+      CONTROL_PLANE_COLOR: green
+      CONTROL_PLANE_MEMBER_ID: "${CONTROL_PLANE_GREEN_WEB_A_MEMBER_ID:?CONTROL_PLANE_GREEN_WEB_A_MEMBER_ID is required}"
+      CONTROL_PLANE_MODE: active
+      CONTROL_PLANE_STARTUP_MODE: web-only
+      CONTROL_PLANE_WRITER_EPOCH: "${CONTROL_PLANE_GREEN_WEB_A_WRITER_EPOCH:-}"
+      CONTROL_PLANE_WRITER_MARKER_PATH: "${CONTROL_PLANE_GREEN_WEB_A_WRITER_MARKER_PATH:-}"
+      CONTROL_PLANE_WEB_EPOCH: "${CONTROL_PLANE_GREEN_WEB_A_WEB_EPOCH:?CONTROL_PLANE_GREEN_WEB_A_WEB_EPOCH is required}"
+      CONTROL_PLANE_WEB_MARKER_PATH: /var/lib/coolify-control-plane/private/web-epoch
+      CONTROL_PLANE_ROUTE_DRAIN_EPOCH: "${CONTROL_PLANE_GREEN_WEB_A_ROUTE_DRAIN_EPOCH:?CONTROL_PLANE_GREEN_WEB_A_ROUTE_DRAIN_EPOCH is required}"
+      CONTROL_PLANE_ROUTE_DRAIN_MARKER_PATH: /var/lib/coolify-control-plane/private/route-drain-epoch
+      CONTROL_PLANE_MUTATION_FREEZE_EPOCH: "${CONTROL_PLANE_MUTATION_FREEZE_EPOCH:?CONTROL_PLANE_MUTATION_FREEZE_EPOCH is required}"
+      CONTROL_PLANE_MUTATION_FREEZE_MARKER_PATH: /var/lib/coolify-control-plane/coordination/mutation-freeze-epoch
+      CONTROL_PLANE_POOL_ACK_PATH: /run/secrets/control-plane-pool-ack
+      CONTROL_PLANE_TRUSTED_PROXY_ADDRESSES: "${CONTROL_PLANE_TRUSTED_PROXY_ADDRESSES:?CONTROL_PLANE_TRUSTED_PROXY_ADDRESSES is required}"
+      CONTROL_PLANE_DIRECT_PROBE_PATH: "${CONTROL_PLANE_DIRECT_PROBE_PATH:?CONTROL_PLANE_DIRECT_PROBE_PATH is required}"
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    expose:
+      - "${CONTROL_PLANE_BACKEND_PORT:?CONTROL_PLANE_BACKEND_PORT is required}"
+    ports:
+      - "127.0.0.1:${CONTROL_PLANE_GREEN_WEB_A_LOOPBACK_PORT:?CONTROL_PLANE_GREEN_WEB_A_LOOPBACK_PORT is required}:${CONTROL_PLANE_BACKEND_PORT:?CONTROL_PLANE_BACKEND_PORT is required}"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/control-plane-direct-probe-healthcheck"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+    labels:
+      - "${CONTROL_PLANE_POOL_LABEL_KEY:?CONTROL_PLANE_POOL_LABEL_KEY is required}=${CONTROL_PLANE_GREEN_POOL_LABEL_VALUE:?CONTROL_PLANE_GREEN_POOL_LABEL_VALUE is required}"
+    networks: [control-plane]
+    secrets:
+      - source: green-web-a-direct-probe-token
+        target: control-plane-direct-probe-token
+      - source: green-web-a-applied-ack
+        target: control-plane-applied-ack
+      - source: green-pool-route-health-token
+        target: control-plane-route-health-token
+      - source: green-pool-ack
+        target: control-plane-pool-ack
+    volumes:
+      - type: bind
+        source: "${CONTROL_PLANE_RUNTIME_ENV_FILE:?CONTROL_PLANE_RUNTIME_ENV_FILE is required}"
+        target: /var/www/html/.env
+        read_only: true
+      - "${CONTROL_PLANE_SSH_DIRECTORY:-/data/coolify/ssh}:/var/www/html/storage/app/ssh"
+      - "${CONTROL_PLANE_APPLICATIONS_DIRECTORY:-/data/coolify/applications}:/var/www/html/storage/app/applications"
+      - "${CONTROL_PLANE_DATABASES_DIRECTORY:-/data/coolify/databases}:/var/www/html/storage/app/databases"
+      - "${CONTROL_PLANE_SERVICES_DIRECTORY:-/data/coolify/services}:/var/www/html/storage/app/services"
+      - "${CONTROL_PLANE_BACKUPS_DIRECTORY:-/data/coolify/backups}:/var/www/html/storage/app/backups"
+      - type: volume
+        source: green-web-a-private
+        target: /var/lib/coolify-control-plane/private
+      - type: volume
+        source: control-plane-coordination
+        target: /var/lib/coolify-control-plane/coordination
+
+  green-web-b:
+    image: "${CONTROL_PLANE_GREEN_IMAGE:?CONTROL_PLANE_GREEN_IMAGE must be an immutable digest reference}"
+    container_name: "${CONTROL_PLANE_GREEN_WEB_B_CONTAINER:?CONTROL_PLANE_GREEN_WEB_B_CONTAINER is required}"
+    restart: unless-stopped
+    working_dir: /var/www/html
+    env_file:
+      - "${CONTROL_PLANE_RUNTIME_ENV_FILE:?CONTROL_PLANE_RUNTIME_ENV_FILE is required}"
+    environment:
+      CONTROL_PLANE_COLOR: green
+      CONTROL_PLANE_MEMBER_ID: "${CONTROL_PLANE_GREEN_WEB_B_MEMBER_ID:?CONTROL_PLANE_GREEN_WEB_B_MEMBER_ID is required}"
+      CONTROL_PLANE_MODE: active
+      CONTROL_PLANE_STARTUP_MODE: web-only
+      CONTROL_PLANE_WRITER_EPOCH: "${CONTROL_PLANE_GREEN_WEB_B_WRITER_EPOCH:-}"
+      CONTROL_PLANE_WRITER_MARKER_PATH: "${CONTROL_PLANE_GREEN_WEB_B_WRITER_MARKER_PATH:-}"
+      CONTROL_PLANE_WEB_EPOCH: "${CONTROL_PLANE_GREEN_WEB_B_WEB_EPOCH:?CONTROL_PLANE_GREEN_WEB_B_WEB_EPOCH is required}"
+      CONTROL_PLANE_WEB_MARKER_PATH: /var/lib/coolify-control-plane/private/web-epoch
+      CONTROL_PLANE_ROUTE_DRAIN_EPOCH: "${CONTROL_PLANE_GREEN_WEB_B_ROUTE_DRAIN_EPOCH:?CONTROL_PLANE_GREEN_WEB_B_ROUTE_DRAIN_EPOCH is required}"
+      CONTROL_PLANE_ROUTE_DRAIN_MARKER_PATH: /var/lib/coolify-control-plane/private/route-drain-epoch
+      CONTROL_PLANE_MUTATION_FREEZE_EPOCH: "${CONTROL_PLANE_MUTATION_FREEZE_EPOCH:?CONTROL_PLANE_MUTATION_FREEZE_EPOCH is required}"
+      CONTROL_PLANE_MUTATION_FREEZE_MARKER_PATH: /var/lib/coolify-control-plane/coordination/mutation-freeze-epoch
+      CONTROL_PLANE_POOL_ACK_PATH: /run/secrets/control-plane-pool-ack
+      CONTROL_PLANE_TRUSTED_PROXY_ADDRESSES: "${CONTROL_PLANE_TRUSTED_PROXY_ADDRESSES:?CONTROL_PLANE_TRUSTED_PROXY_ADDRESSES is required}"
+      CONTROL_PLANE_DIRECT_PROBE_PATH: "${CONTROL_PLANE_DIRECT_PROBE_PATH:?CONTROL_PLANE_DIRECT_PROBE_PATH is required}"
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    expose:
+      - "${CONTROL_PLANE_BACKEND_PORT:?CONTROL_PLANE_BACKEND_PORT is required}"
+    ports:
+      - "127.0.0.1:${CONTROL_PLANE_GREEN_WEB_B_LOOPBACK_PORT:?CONTROL_PLANE_GREEN_WEB_B_LOOPBACK_PORT is required}:${CONTROL_PLANE_BACKEND_PORT:?CONTROL_PLANE_BACKEND_PORT is required}"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/control-plane-direct-probe-healthcheck"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+    labels:
+      - "${CONTROL_PLANE_POOL_LABEL_KEY:?CONTROL_PLANE_POOL_LABEL_KEY is required}=${CONTROL_PLANE_GREEN_POOL_LABEL_VALUE:?CONTROL_PLANE_GREEN_POOL_LABEL_VALUE is required}"
+    networks: [control-plane]
+    secrets:
+      - source: green-web-b-direct-probe-token
+        target: control-plane-direct-probe-token
+      - source: green-web-b-applied-ack
+        target: control-plane-applied-ack
+      - source: green-pool-route-health-token
+        target: control-plane-route-health-token
+      - source: green-pool-ack
+        target: control-plane-pool-ack
+    volumes:
+      - type: bind
+        source: "${CONTROL_PLANE_RUNTIME_ENV_FILE:?CONTROL_PLANE_RUNTIME_ENV_FILE is required}"
+        target: /var/www/html/.env
+        read_only: true
+      - "${CONTROL_PLANE_SSH_DIRECTORY:-/data/coolify/ssh}:/var/www/html/storage/app/ssh"
+      - "${CONTROL_PLANE_APPLICATIONS_DIRECTORY:-/data/coolify/applications}:/var/www/html/storage/app/applications"
+      - "${CONTROL_PLANE_DATABASES_DIRECTORY:-/data/coolify/databases}:/var/www/html/storage/app/databases"
+      - "${CONTROL_PLANE_SERVICES_DIRECTORY:-/data/coolify/services}:/var/www/html/storage/app/services"
+      - "${CONTROL_PLANE_BACKUPS_DIRECTORY:-/data/coolify/backups}:/var/www/html/storage/app/backups"
+      - type: volume
+        source: green-web-b-private
+        target: /var/lib/coolify-control-plane/private
+      - type: volume
+        source: control-plane-coordination
+        target: /var/lib/coolify-control-plane/coordination
+
+  blue-web-a:
+    profiles: [replacement-blue]
+    image: "${CONTROL_PLANE_BLUE_IMAGE:?CONTROL_PLANE_BLUE_IMAGE must be an immutable digest reference}"
+    container_name: "${CONTROL_PLANE_BLUE_WEB_A_CONTAINER:?CONTROL_PLANE_BLUE_WEB_A_CONTAINER is required}"
+    restart: unless-stopped
+    working_dir: /var/www/html
+    env_file:
+      - "${CONTROL_PLANE_RUNTIME_ENV_FILE:?CONTROL_PLANE_RUNTIME_ENV_FILE is required}"
+    environment:
+      CONTROL_PLANE_COLOR: blue
+      CONTROL_PLANE_MEMBER_ID: "${CONTROL_PLANE_BLUE_WEB_A_MEMBER_ID:?CONTROL_PLANE_BLUE_WEB_A_MEMBER_ID is required}"
+      CONTROL_PLANE_MODE: active
+      CONTROL_PLANE_STARTUP_MODE: web-only
+      CONTROL_PLANE_WRITER_EPOCH: "${CONTROL_PLANE_BLUE_WEB_A_WRITER_EPOCH:-}"
+      CONTROL_PLANE_WRITER_MARKER_PATH: "${CONTROL_PLANE_BLUE_WEB_A_WRITER_MARKER_PATH:-}"
+      CONTROL_PLANE_WEB_EPOCH: "${CONTROL_PLANE_BLUE_WEB_A_WEB_EPOCH:?CONTROL_PLANE_BLUE_WEB_A_WEB_EPOCH is required}"
+      CONTROL_PLANE_WEB_MARKER_PATH: /var/lib/coolify-control-plane/private/web-epoch
+      CONTROL_PLANE_ROUTE_DRAIN_EPOCH: "${CONTROL_PLANE_BLUE_WEB_A_ROUTE_DRAIN_EPOCH:?CONTROL_PLANE_BLUE_WEB_A_ROUTE_DRAIN_EPOCH is required}"
+      CONTROL_PLANE_ROUTE_DRAIN_MARKER_PATH: /var/lib/coolify-control-plane/private/route-drain-epoch
+      CONTROL_PLANE_MUTATION_FREEZE_EPOCH: "${CONTROL_PLANE_MUTATION_FREEZE_EPOCH:?CONTROL_PLANE_MUTATION_FREEZE_EPOCH is required}"
+      CONTROL_PLANE_MUTATION_FREEZE_MARKER_PATH: /var/lib/coolify-control-plane/coordination/mutation-freeze-epoch
+      CONTROL_PLANE_POOL_ACK_PATH: /run/secrets/control-plane-pool-ack
+      CONTROL_PLANE_TRUSTED_PROXY_ADDRESSES: "${CONTROL_PLANE_TRUSTED_PROXY_ADDRESSES:?CONTROL_PLANE_TRUSTED_PROXY_ADDRESSES is required}"
+      CONTROL_PLANE_DIRECT_PROBE_PATH: "${CONTROL_PLANE_DIRECT_PROBE_PATH:?CONTROL_PLANE_DIRECT_PROBE_PATH is required}"
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    expose:
+      - "${CONTROL_PLANE_BACKEND_PORT:?CONTROL_PLANE_BACKEND_PORT is required}"
+    ports:
+      - "127.0.0.1:${CONTROL_PLANE_BLUE_WEB_A_LOOPBACK_PORT:?CONTROL_PLANE_BLUE_WEB_A_LOOPBACK_PORT is required}:${CONTROL_PLANE_BACKEND_PORT:?CONTROL_PLANE_BACKEND_PORT is required}"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/control-plane-direct-probe-healthcheck"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+    labels:
+      - "${CONTROL_PLANE_POOL_LABEL_KEY:?CONTROL_PLANE_POOL_LABEL_KEY is required}=${CONTROL_PLANE_BLUE_POOL_LABEL_VALUE:?CONTROL_PLANE_BLUE_POOL_LABEL_VALUE is required}"
+    networks: [control-plane]
+    secrets:
+      - source: blue-web-a-direct-probe-token
+        target: control-plane-direct-probe-token
+      - source: blue-web-a-applied-ack
+        target: control-plane-applied-ack
+      - source: blue-pool-route-health-token
+        target: control-plane-route-health-token
+      - source: blue-pool-ack
+        target: control-plane-pool-ack
+    volumes:
+      - type: bind
+        source: "${CONTROL_PLANE_RUNTIME_ENV_FILE:?CONTROL_PLANE_RUNTIME_ENV_FILE is required}"
+        target: /var/www/html/.env
+        read_only: true
+      - "${CONTROL_PLANE_SSH_DIRECTORY:-/data/coolify/ssh}:/var/www/html/storage/app/ssh"
+      - "${CONTROL_PLANE_APPLICATIONS_DIRECTORY:-/data/coolify/applications}:/var/www/html/storage/app/applications"
+      - "${CONTROL_PLANE_DATABASES_DIRECTORY:-/data/coolify/databases}:/var/www/html/storage/app/databases"
+      - "${CONTROL_PLANE_SERVICES_DIRECTORY:-/data/coolify/services}:/var/www/html/storage/app/services"
+      - "${CONTROL_PLANE_BACKUPS_DIRECTORY:-/data/coolify/backups}:/var/www/html/storage/app/backups"
+      - type: volume
+        source: blue-web-a-private
+        target: /var/lib/coolify-control-plane/private
+      - type: volume
+        source: control-plane-coordination
+        target: /var/lib/coolify-control-plane/coordination
+
+  blue-web-b:
+    profiles: [replacement-blue]
+    image: "${CONTROL_PLANE_BLUE_IMAGE:?CONTROL_PLANE_BLUE_IMAGE must be an immutable digest reference}"
+    container_name: "${CONTROL_PLANE_BLUE_WEB_B_CONTAINER:?CONTROL_PLANE_BLUE_WEB_B_CONTAINER is required}"
+    restart: unless-stopped
+    working_dir: /var/www/html
+    env_file:
+      - "${CONTROL_PLANE_RUNTIME_ENV_FILE:?CONTROL_PLANE_RUNTIME_ENV_FILE is required}"
+    environment:
+      CONTROL_PLANE_COLOR: blue
+      CONTROL_PLANE_MEMBER_ID: "${CONTROL_PLANE_BLUE_WEB_B_MEMBER_ID:?CONTROL_PLANE_BLUE_WEB_B_MEMBER_ID is required}"
+      CONTROL_PLANE_MODE: active
+      CONTROL_PLANE_STARTUP_MODE: web-only
+      CONTROL_PLANE_WRITER_EPOCH: "${CONTROL_PLANE_BLUE_WEB_B_WRITER_EPOCH:-}"
+      CONTROL_PLANE_WRITER_MARKER_PATH: "${CONTROL_PLANE_BLUE_WEB_B_WRITER_MARKER_PATH:-}"
+      CONTROL_PLANE_WEB_EPOCH: "${CONTROL_PLANE_BLUE_WEB_B_WEB_EPOCH:?CONTROL_PLANE_BLUE_WEB_B_WEB_EPOCH is required}"
+      CONTROL_PLANE_WEB_MARKER_PATH: /var/lib/coolify-control-plane/private/web-epoch
+      CONTROL_PLANE_ROUTE_DRAIN_EPOCH: "${CONTROL_PLANE_BLUE_WEB_B_ROUTE_DRAIN_EPOCH:?CONTROL_PLANE_BLUE_WEB_B_ROUTE_DRAIN_EPOCH is required}"
+      CONTROL_PLANE_ROUTE_DRAIN_MARKER_PATH: /var/lib/coolify-control-plane/private/route-drain-epoch
+      CONTROL_PLANE_MUTATION_FREEZE_EPOCH: "${CONTROL_PLANE_MUTATION_FREEZE_EPOCH:?CONTROL_PLANE_MUTATION_FREEZE_EPOCH is required}"
+      CONTROL_PLANE_MUTATION_FREEZE_MARKER_PATH: /var/lib/coolify-control-plane/coordination/mutation-freeze-epoch
+      CONTROL_PLANE_POOL_ACK_PATH: /run/secrets/control-plane-pool-ack
+      CONTROL_PLANE_TRUSTED_PROXY_ADDRESSES: "${CONTROL_PLANE_TRUSTED_PROXY_ADDRESSES:?CONTROL_PLANE_TRUSTED_PROXY_ADDRESSES is required}"
+      CONTROL_PLANE_DIRECT_PROBE_PATH: "${CONTROL_PLANE_DIRECT_PROBE_PATH:?CONTROL_PLANE_DIRECT_PROBE_PATH is required}"
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    expose:
+      - "${CONTROL_PLANE_BACKEND_PORT:?CONTROL_PLANE_BACKEND_PORT is required}"
+    ports:
+      - "127.0.0.1:${CONTROL_PLANE_BLUE_WEB_B_LOOPBACK_PORT:?CONTROL_PLANE_BLUE_WEB_B_LOOPBACK_PORT is required}:${CONTROL_PLANE_BACKEND_PORT:?CONTROL_PLANE_BACKEND_PORT is required}"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/control-plane-direct-probe-healthcheck"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+    labels:
+      - "${CONTROL_PLANE_POOL_LABEL_KEY:?CONTROL_PLANE_POOL_LABEL_KEY is required}=${CONTROL_PLANE_BLUE_POOL_LABEL_VALUE:?CONTROL_PLANE_BLUE_POOL_LABEL_VALUE is required}"
+    networks: [control-plane]
+    secrets:
+      - source: blue-web-b-direct-probe-token
+        target: control-plane-direct-probe-token
+      - source: blue-web-b-applied-ack
+        target: control-plane-applied-ack
+      - source: blue-pool-route-health-token
+        target: control-plane-route-health-token
+      - source: blue-pool-ack
+        target: control-plane-pool-ack
+    volumes:
+      - type: bind
+        source: "${CONTROL_PLANE_RUNTIME_ENV_FILE:?CONTROL_PLANE_RUNTIME_ENV_FILE is required}"
+        target: /var/www/html/.env
+        read_only: true
+      - "${CONTROL_PLANE_SSH_DIRECTORY:-/data/coolify/ssh}:/var/www/html/storage/app/ssh"
+      - "${CONTROL_PLANE_APPLICATIONS_DIRECTORY:-/data/coolify/applications}:/var/www/html/storage/app/applications"
+      - "${CONTROL_PLANE_DATABASES_DIRECTORY:-/data/coolify/databases}:/var/www/html/storage/app/databases"
+      - "${CONTROL_PLANE_SERVICES_DIRECTORY:-/data/coolify/services}:/var/www/html/storage/app/services"
+      - "${CONTROL_PLANE_BACKUPS_DIRECTORY:-/data/coolify/backups}:/var/www/html/storage/app/backups"
+      - type: volume
+        source: blue-web-b-private
+        target: /var/lib/coolify-control-plane/private
+      - type: volume
+        source: control-plane-coordination
+        target: /var/lib/coolify-control-plane/coordination
+
+networks:
+  control-plane:
+    name: "${CONTROL_PLANE_NETWORK:?CONTROL_PLANE_NETWORK is required}"
+    external: true
+
+secrets:
+  green-web-a-direct-probe-token:
+    file: "${CONTROL_PLANE_GREEN_WEB_A_DIRECT_PROBE_RUNTIME_FILE:?CONTROL_PLANE_GREEN_WEB_A_DIRECT_PROBE_RUNTIME_FILE is required}"
+  green-web-a-applied-ack:
+    file: "${CONTROL_PLANE_GREEN_WEB_A_APPLIED_ACK_RUNTIME_FILE:?CONTROL_PLANE_GREEN_WEB_A_APPLIED_ACK_RUNTIME_FILE is required}"
+  green-web-b-direct-probe-token:
+    file: "${CONTROL_PLANE_GREEN_WEB_B_DIRECT_PROBE_RUNTIME_FILE:?CONTROL_PLANE_GREEN_WEB_B_DIRECT_PROBE_RUNTIME_FILE is required}"
+  green-web-b-applied-ack:
+    file: "${CONTROL_PLANE_GREEN_WEB_B_APPLIED_ACK_RUNTIME_FILE:?CONTROL_PLANE_GREEN_WEB_B_APPLIED_ACK_RUNTIME_FILE is required}"
+  green-pool-route-health-token:
+    file: "${CONTROL_PLANE_GREEN_ROUTE_HEALTH_RUNTIME_FILE:?CONTROL_PLANE_GREEN_ROUTE_HEALTH_RUNTIME_FILE is required}"
+  green-pool-ack:
+    file: "${CONTROL_PLANE_GREEN_POOL_ACK_RUNTIME_FILE:?CONTROL_PLANE_GREEN_POOL_ACK_RUNTIME_FILE is required}"
+  blue-web-a-direct-probe-token:
+    file: "${CONTROL_PLANE_BLUE_WEB_A_DIRECT_PROBE_RUNTIME_FILE:?CONTROL_PLANE_BLUE_WEB_A_DIRECT_PROBE_RUNTIME_FILE is required}"
+  blue-web-a-applied-ack:
+    file: "${CONTROL_PLANE_BLUE_WEB_A_APPLIED_ACK_RUNTIME_FILE:?CONTROL_PLANE_BLUE_WEB_A_APPLIED_ACK_RUNTIME_FILE is required}"
+  blue-web-b-direct-probe-token:
+    file: "${CONTROL_PLANE_BLUE_WEB_B_DIRECT_PROBE_RUNTIME_FILE:?CONTROL_PLANE_BLUE_WEB_B_DIRECT_PROBE_RUNTIME_FILE is required}"
+  blue-web-b-applied-ack:
+    file: "${CONTROL_PLANE_BLUE_WEB_B_APPLIED_ACK_RUNTIME_FILE:?CONTROL_PLANE_BLUE_WEB_B_APPLIED_ACK_RUNTIME_FILE is required}"
+  blue-pool-route-health-token:
+    file: "${CONTROL_PLANE_BLUE_ROUTE_HEALTH_RUNTIME_FILE:?CONTROL_PLANE_BLUE_ROUTE_HEALTH_RUNTIME_FILE is required}"
+  blue-pool-ack:
+    file: "${CONTROL_PLANE_BLUE_POOL_ACK_RUNTIME_FILE:?CONTROL_PLANE_BLUE_POOL_ACK_RUNTIME_FILE is required}"
+
+volumes:
+  green-web-a-private:
+    name: "${CONTROL_PLANE_GREEN_WEB_A_PRIVATE_VOLUME:?CONTROL_PLANE_GREEN_WEB_A_PRIVATE_VOLUME is required}"
+  green-web-b-private:
+    name: "${CONTROL_PLANE_GREEN_WEB_B_PRIVATE_VOLUME:?CONTROL_PLANE_GREEN_WEB_B_PRIVATE_VOLUME is required}"
+  blue-web-a-private:
+    name: "${CONTROL_PLANE_BLUE_WEB_A_PRIVATE_VOLUME:?CONTROL_PLANE_BLUE_WEB_A_PRIVATE_VOLUME is required}"
+  blue-web-b-private:
+    name: "${CONTROL_PLANE_BLUE_WEB_B_PRIVATE_VOLUME:?CONTROL_PLANE_BLUE_WEB_B_PRIVATE_VOLUME is required}"
+  control-plane-coordination:
+    name: "${CONTROL_PLANE_COORDINATION_VOLUME:?CONTROL_PLANE_COORDINATION_VOLUME is required}"

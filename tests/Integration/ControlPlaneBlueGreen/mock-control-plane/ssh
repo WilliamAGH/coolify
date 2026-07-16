@@ -1,0 +1,23 @@
+#!/bin/sh
+
+set -eu
+
+# The Darwin Docker lab cannot install the host nftables rule. This executable is
+# confined to the mock image and reproduces the production fence probe's SSH result.
+[ "$#" -eq 16 ] \
+    && [ "$1" = -F ] && [ "$2" = /dev/null ] \
+    && [ "$3" = -o ] && [ "$4" = BatchMode=yes ] \
+    && [ "$5" = -o ] && [ "$6" = ConnectTimeout=2 ] \
+    && [ "$7" = -o ] && [ "$8" = ConnectionAttempts=1 ] \
+    && [ "$9" = -o ] && [ "${10}" = StrictHostKeyChecking=no ] \
+    && [ "${11}" = -o ] && [ "${12}" = UserKnownHostsFile=/dev/null ] \
+    && [ "${13}" = -p ] && [ "${14}" = 22 ] \
+    && [ "${15#root@}" != "${15}" ] && [ -n "${15#root@}" ] \
+    && [ "${16}" = true ] \
+    || {
+        printf '%s\n' 'CONTROL_PLANE_LAB_SSH unsupported invocation' >&2
+        exit 64
+    }
+
+printf 'ssh: connect to host %s port 22: Connection timed out\n' "${15#root@}" >&2
+exit 255

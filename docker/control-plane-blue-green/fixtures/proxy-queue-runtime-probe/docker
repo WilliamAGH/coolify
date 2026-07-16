@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+[[ ${1:-} == exec ]] || exit 64
+shift
+while [[ ${1:-} == --env ]]; do
+    shift 2
+done
+[[ $# -eq 4 ]] || exit 64
+shift
+[[ $1 == php && $2 == -r ]] || exit 64
+
+repository_root=${CONTROL_PLANE_QUEUE_FIXTURE_REPOSITORY_ROOT:-}
+[[ -d $repository_root && -f $repository_root/vendor/autoload.php \
+    && -f $repository_root/bootstrap/app.php ]] || exit 64
+
+php_program=${3//\/var\/www\/html/$repository_root}
+[[ $php_program == *"$repository_root/vendor/autoload.php"* \
+    && $php_program == *"$repository_root/bootstrap/app.php"* ]] || exit 64
+
+exec php -r "$php_program"

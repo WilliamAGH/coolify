@@ -1,0 +1,124 @@
+#!/bin/sh
+
+set -eu
+umask 077
+
+direct_probe_token_file=/run/secrets/control-plane-direct-probe-token
+applied_acknowledgement_file=/run/secrets/control-plane-applied-ack
+response_headers_file=
+
+cleanup()
+{
+    [ -z "$response_headers_file" ] || rm -f "$response_headers_file"
+}
+
+read_safe_token_file()
+{
+    token_file=$1
+
+    [ -f "$token_file" ] && [ ! -L "$token_file" ] && [ -r "$token_file" ] || return 1
+    token_value=$(cat "$token_file") || return 1
+
+    case "$token_value" in
+        ''|*[!A-Za-z0-9._:-]*) return 1 ;;
+    esac
+    [ "${#token_value}" -ge 16 ] && [ "${#token_value}" -le 128 ] || return 1
+
+    printf '%s\n' "$token_value"
+}
+
+configured_backend_port()
+{
+    backend_port=${CONTROL_PLANE_BACKEND_PORT-}
+
+    case "$backend_port" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "${#backend_port}" -le 5 ] && [ "$backend_port" -ge 1 ] \
+        && [ "$backend_port" -le 65535 ] || return 1
+
+    printf '%s\n' "$backend_port"
+}
+
+configured_direct_probe_path()
+{
+    direct_probe_path=${CONTROL_PLANE_DIRECT_PROBE_PATH-}
+
+    case "$direct_probe_path" in
+        /*) ;;
+        *) return 1 ;;
+    esac
+    case "$direct_probe_path" in
+        *[!A-Za-z0-9._~/%-]*) return 1 ;;
+    esac
+
+    printf '%s\n' "$direct_probe_path"
+}
+
+has_expected_response_status()
+{
+    status_header_file=$1
+
+    awk '
+        /^HTTP\/[0-9][0-9.]* [0-9][0-9][0-9]([[:space:]]|$)/ {
+            status_count++
+            status_code = $2
+        }
+        END { exit status_count != 1 || status_code != 204 }
+    ' "$status_header_file"
+}
+
+has_expected_applied_acknowledgement()
+{
+    acknowledgement_header_file=$1
+
+    awk -v acknowledgement_file="$applied_acknowledgement_file" '
+        BEGIN {
+            if ((getline expected_value < acknowledgement_file) != 1) exit 1
+            close(acknowledgement_file)
+            sub(/\r$/, "", expected_value)
+            expected_name = "x-control-plane-applied-config"
+        }
+        {
+            sub(/\r$/, "")
+            if ($0 ~ /^[ \t]/) {
+                if (previous_target) invalid = 1
+                next
+            }
+            previous_target = 0
+            separator = index($0, ":")
+            if (separator == 0) next
+            observed_name = tolower(substr($0, 1, separator - 1))
+            observed_value = substr($0, separator + 1)
+            gsub(/^[ \t]+|[ \t]+$/, "", observed_value)
+            if (observed_name == expected_name) {
+                acknowledgement_count++
+                previous_target = 1
+                if (observed_value != expected_value) invalid = 1
+            } else if (index(observed_name, expected_name) > 0 \
+                || index(expected_name, observed_name) > 0) {
+                invalid = 1
+            }
+        }
+        END { exit invalid || acknowledgement_count != 1 }
+    ' "$acknowledgement_header_file"
+}
+
+trap cleanup EXIT HUP INT TERM
+
+direct_probe_token=$(read_safe_token_file "$direct_probe_token_file") || exit 1
+read_safe_token_file "$applied_acknowledgement_file" >/dev/null || exit 1
+backend_port=$(configured_backend_port) || exit 1
+direct_probe_path=$(configured_direct_probe_path) || exit 1
+response_headers_file=$(mktemp "${TMPDIR:-/tmp}/control-plane-direct-probe.XXXXXX") || exit 1
+
+if ! {
+    printf '%s\n' 'silent' 'request = "GET"'
+    printf 'header = "X-Control-Plane-Probe: %s"\n' "$direct_probe_token"
+    printf 'url = "http://127.0.0.1:%s%s"\n' "$backend_port" "$direct_probe_path"
+} | curl --config - --dump-header "$response_headers_file" --output /dev/null >/dev/null 2>&1; then
+    exit 1
+fi
+
+has_expected_response_status "$response_headers_file" \
+    && has_expected_applied_acknowledgement "$response_headers_file"

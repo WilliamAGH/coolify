@@ -1,0 +1,12 @@
+#!/bin/sh
+
+set -eu
+
+if [ "${1:-}" = enable ] && [ "${2:-}" = --now ]; then
+    if [ -n "${CONTROL_PLANE_TEST_INSTALL_SYSTEMCTL_MARKER:-}" ]; then
+        : > "$CONTROL_PLANE_TEST_INSTALL_SYSTEMCTL_MARKER"
+    fi
+    sleep "${CONTROL_PLANE_TEST_INSTALL_SYSTEMCTL_HOLD_SECONDS:-0}"
+fi
+
+exit 0

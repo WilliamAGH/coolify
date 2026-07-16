@@ -1,0 +1,16 @@
+FROM docker.io/library/postgres@sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f
+
+RUN apk add --no-cache bash curl socat \
+    && delgroup www-data \
+    && addgroup -g 9999 www-data \
+    && adduser -D -u 9999 -G www-data www-data \
+    && mkdir -p /var/www/html /restored-state \
+    && chown 9999:9999 /var/www/html /restored-state
+COPY tests/Integration/ControlPlaneBackupRestore/hooks/candidate-entrypoint.sh \
+    /usr/local/bin/docker-entrypoint.sh
+COPY tests/Integration/ControlPlaneBackupRestore/hooks/probe-response.sh \
+    /usr/local/bin/probe-response
+RUN chown root:root /usr/local/bin/docker-entrypoint.sh /usr/local/bin/probe-response \
+    && chmod 755 /usr/local/bin/docker-entrypoint.sh /usr/local/bin/probe-response
+
+USER 9999:9999

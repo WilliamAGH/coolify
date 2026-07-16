@@ -1,0 +1,14 @@
+services:
+  coolify:
+    container_name: "${CONTROL_PLANE_BLUE_CONTAINER:?CONTROL_PLANE_BLUE_CONTAINER is required}"
+    working_dir: /var/www/html
+    restart: "no"
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    networks:
+      - lab
+
+networks:
+  lab:
+    name: "${CONTROL_PLANE_NETWORK:?CONTROL_PLANE_NETWORK is required}"
+    external: true

@@ -1,0 +1,1131 @@
+#!/bin/sh
+
+set -eu
+
+promotion_confirmation=blue-stopped
+web_activation_confirmation=route-switch-pending
+
+control_plane_state_group_id()
+{
+    if ! state_group_id="$(id -g www-data 2>/dev/null)"; then
+        printf '%s\n' 'The www-data group is required for control-plane state validation.' >&2
+        exit 78
+    fi
+
+    case "$state_group_id" in
+        ''|*[!0-9]*)
+            printf '%s\n' 'The www-data group id is invalid for control-plane state validation.' >&2
+            exit 78
+            ;;
+    esac
+
+    printf '%s\n' "$state_group_id"
+}
+
+require_control_plane_regular_file()
+{
+    required_file=$1
+    required_mode=$2
+    required_name=$3
+    required_group_id="$(control_plane_state_group_id)"
+
+    if [ -L "$required_file" ] || [ ! -f "$required_file" ]; then
+        printf '%s must be a non-symlink regular file: %s\n' "$required_name" "$required_file" >&2
+        exit 78
+    fi
+
+    if ! required_metadata="$(stat -c '%u:%g:%a' "$required_file" 2>/dev/null)" \
+        || [ "$required_metadata" != "0:${required_group_id}:${required_mode}" ]; then
+        printf '%s must be owned by root:www-data with mode 0%s: %s\n' \
+            "$required_name" "$required_mode" "$required_file" >&2
+        exit 78
+    fi
+}
+
+require_control_plane_state_directory()
+{
+    state_directory=$1
+    marker_environment_name=$2
+    required_group_id="$(control_plane_state_group_id)"
+
+    if [ -L "$state_directory" ] || [ ! -d "$state_directory" ]; then
+        printf '%s directory must be a non-symlink directory: %s\n' \
+            "$marker_environment_name" "$state_directory" >&2
+        exit 78
+    fi
+
+    if ! state_directory_metadata="$(stat -c '%u:%g:%a' "$state_directory" 2>/dev/null)" \
+        || [ "$state_directory_metadata" != "0:${required_group_id}:750" ]; then
+        printf '%s directory must be owned by root:www-data with mode 0750: %s\n' \
+            "$marker_environment_name" "$state_directory" >&2
+        exit 78
+    fi
+
+}
+
+require_control_plane_coordination_directory()
+{
+    coordination_directory=$1
+    marker_environment_name=$2
+
+    require_control_plane_state_directory "$coordination_directory" "$marker_environment_name"
+    require_control_plane_regular_file \
+        "$coordination_directory/mutation-inflight.lock" 660 \
+        'Control-plane mutation lease'
+}
+
+control_plane_marker_path()
+{
+    marker_environment_name=$1
+    marker_directory_kind=$2
+    marker="$(printenv "$marker_environment_name" 2>/dev/null || true)"
+
+    case "$marker" in
+        /tmp|/tmp/*|*/../*|*/./*|*/..|*/.|*[!A-Za-z0-9_./:-]*)
+            printf '%s must be an absolute persistent path without dot segments.\n' \
+                "$marker_environment_name" >&2
+            exit 64
+            ;;
+        /*)
+            ;;
+        *)
+            printf '%s must be an absolute persistent path without dot segments.\n' \
+                "$marker_environment_name" >&2
+            exit 64
+            ;;
+    esac
+
+    marker_directory="${marker%/*}"
+    if [ -z "$marker_directory" ]; then
+        marker_directory=/
+    fi
+    case "$marker_directory_kind" in
+        private)
+            require_control_plane_state_directory "$marker_directory" "$marker_environment_name"
+            ;;
+        coordination)
+            require_control_plane_coordination_directory "$marker_directory" "$marker_environment_name"
+            ;;
+        *)
+            printf 'Unsupported control plane marker directory kind: %s\n' "$marker_directory_kind" >&2
+            exit 64
+            ;;
+    esac
+    if [ -e "$marker" ] || [ -L "$marker" ]; then
+        require_control_plane_regular_file "$marker" 440 "$marker_environment_name"
+    fi
+
+    printf '%s\n' "$marker"
+}
+
+control_plane_mode()
+{
+    mode="${CONTROL_PLANE_MODE-active}"
+
+    case "$mode" in
+        active|passive)
+            printf '%s\n' "$mode"
+            ;;
+        *)
+            printf '%s\n' 'CONTROL_PLANE_MODE must be one of: active, passive.' >&2
+            exit 64
+            ;;
+    esac
+}
+
+control_plane_startup_mode()
+{
+    startup_mode="${CONTROL_PLANE_STARTUP_MODE-full}"
+
+    case "$startup_mode" in
+        full|web-only)
+            printf '%s\n' "$startup_mode"
+            ;;
+        *)
+            printf '%s\n' 'CONTROL_PLANE_STARTUP_MODE must be one of: full, web-only.' >&2
+            exit 64
+            ;;
+    esac
+}
+
+control_plane_writer_epoch()
+{
+    epoch="${CONTROL_PLANE_WRITER_EPOCH-}"
+
+    if [ "${#epoch}" -lt 16 ] || [ "${#epoch}" -gt 128 ]; then
+        printf '%s\n' 'CONTROL_PLANE_WRITER_EPOCH must contain 16 to 128 safe token characters.' >&2
+        exit 64
+    fi
+
+    case "$epoch" in
+        *[!A-Za-z0-9._:-]*)
+            printf '%s\n' 'CONTROL_PLANE_WRITER_EPOCH must contain 16 to 128 safe token characters.' >&2
+            exit 64
+            ;;
+    esac
+
+    printf '%s\n' "$epoch"
+}
+
+control_plane_writer_marker()
+{
+    control_plane_marker_path CONTROL_PLANE_WRITER_MARKER_PATH private
+}
+
+control_plane_web_epoch()
+{
+    epoch="${CONTROL_PLANE_WEB_EPOCH-}"
+
+    if [ "${#epoch}" -lt 16 ] || [ "${#epoch}" -gt 128 ]; then
+        printf '%s\n' 'CONTROL_PLANE_WEB_EPOCH must contain 16 to 128 safe token characters.' >&2
+        exit 64
+    fi
+
+    case "$epoch" in
+        *[!A-Za-z0-9._:-]*)
+            printf '%s\n' 'CONTROL_PLANE_WEB_EPOCH must contain 16 to 128 safe token characters.' >&2
+            exit 64
+            ;;
+    esac
+
+    printf '%s\n' "$epoch"
+}
+
+control_plane_web_marker()
+{
+    control_plane_marker_path CONTROL_PLANE_WEB_MARKER_PATH private
+}
+
+control_plane_route_drain_epoch()
+{
+    epoch="${CONTROL_PLANE_ROUTE_DRAIN_EPOCH-}"
+
+    if [ "${#epoch}" -lt 16 ] || [ "${#epoch}" -gt 128 ]; then
+        printf '%s\n' 'CONTROL_PLANE_ROUTE_DRAIN_EPOCH must contain 16 to 128 safe token characters.' >&2
+        exit 64
+    fi
+
+    case "$epoch" in
+        *[!A-Za-z0-9._:-]*)
+            printf '%s\n' 'CONTROL_PLANE_ROUTE_DRAIN_EPOCH must contain 16 to 128 safe token characters.' >&2
+            exit 64
+            ;;
+    esac
+
+    printf '%s\n' "$epoch"
+}
+
+control_plane_route_drain_marker()
+{
+    control_plane_marker_path CONTROL_PLANE_ROUTE_DRAIN_MARKER_PATH private
+}
+
+control_plane_mutation_freeze_epoch()
+{
+    epoch="${CONTROL_PLANE_MUTATION_FREEZE_EPOCH-}"
+
+    if [ "${#epoch}" -lt 16 ] || [ "${#epoch}" -gt 128 ]; then
+        printf '%s\n' 'CONTROL_PLANE_MUTATION_FREEZE_EPOCH must contain 16 to 128 safe token characters.' >&2
+        exit 64
+    fi
+
+    case "$epoch" in
+        *[!A-Za-z0-9._:-]*)
+            printf '%s\n' 'CONTROL_PLANE_MUTATION_FREEZE_EPOCH must contain 16 to 128 safe token characters.' >&2
+            exit 64
+            ;;
+    esac
+
+    printf '%s\n' "$epoch"
+}
+
+control_plane_mutation_freeze_marker()
+{
+    control_plane_marker_path CONTROL_PLANE_MUTATION_FREEZE_MARKER_PATH coordination
+}
+
+writer_marker_matches()
+{
+    marker_matches "$writer_marker" "$writer_epoch"
+}
+
+web_marker_matches()
+{
+    marker_matches "$web_marker" "$web_epoch"
+}
+
+marker_matches()
+{
+    expected_marker=$1
+    expected_epoch=$2
+
+    if [ ! -e "$expected_marker" ] && [ ! -L "$expected_marker" ]; then
+        return 1
+    fi
+
+    require_control_plane_regular_file "$expected_marker" 440 'Control-plane marker'
+
+    marker_size="$(wc -c < "$expected_marker" | tr -d '[:space:]')"
+    [ "$marker_size" = "${#expected_epoch}" ] && [ "$(cat "$expected_marker")" = "$expected_epoch" ]
+}
+
+require_matching_operator_marker()
+{
+    required_marker=$1
+    required_epoch=$2
+    required_action=$3
+
+    if ! marker_matches "$required_marker" "$required_epoch"; then
+        printf '%s requires an already-installed matching operator marker: %s\n' \
+            "$required_action" "$required_marker" >&2
+        exit 75
+    fi
+}
+
+configured_boolean()
+{
+    setting_name="$1"
+    default_value="$2"
+
+    case "$setting_name" in
+        INIT_ENABLED|MIGRATION_ENABLED|SEEDER_ENABLED|HORIZON_ENABLED|SCHEDULER_ENABLED|NIGHTWATCH_ENABLED)
+            ;;
+        *)
+            printf 'Unsupported control plane setting: %s\n' "$setting_name" >&2
+            exit 64
+            ;;
+    esac
+
+    if setting_value="$(printenv "$setting_name")"; then
+        :
+    else
+        setting_value="$default_value"
+        if [ -r /var/www/html/.env ]; then
+            env_line="$(grep -E "^${setting_name}=(true|false)$" /var/www/html/.env 2>/dev/null | tail -n 1 || true)"
+            if [ -n "$env_line" ]; then
+                setting_value="${env_line#*=}"
+            fi
+        fi
+    fi
+
+    case "$setting_value" in
+        true|false)
+            printf '%s\n' "$setting_value"
+            ;;
+        *)
+            printf '%s must be true or false.\n' "$setting_name" >&2
+            exit 64
+            ;;
+    esac
+}
+
+configured_service_enabled()
+{
+    setting_name="$1"
+    default_value="$2"
+
+    if [ "$mode" = passive ]; then
+        return 1
+    fi
+
+    [ "$(configured_boolean "$setting_name" "$default_value")" = true ]
+}
+
+background_service_enabled()
+{
+    setting_name=$1
+    default_value=$2
+
+    configured_service_enabled "$setting_name" "$default_value" || return $?
+
+    if [ "$startup_mode" = web-only ] && ! writer_marker_matches; then
+        return 1
+    fi
+
+    return 0
+}
+
+startup_service_enabled()
+{
+    setting_name=$1
+    default_value=$2
+
+    if [ "$startup_mode" = web-only ]; then
+        return 1
+    fi
+
+    configured_service_enabled "$setting_name" "$default_value"
+}
+
+run_startup()
+{
+    setting_name="$1"
+    default_value="$2"
+    artisan_command="$3"
+
+    case "${setting_name}:${artisan_command}" in
+        INIT_ENABLED:app:init)
+            disabled_message='Control plane initialization is disabled.'
+            ;;
+        MIGRATION_ENABLED:start:migration)
+            disabled_message='Control plane database migration is disabled.'
+            ;;
+        SEEDER_ENABLED:start:seeder)
+            disabled_message='Control plane database seeding is disabled.'
+            ;;
+        *)
+            printf 'Unsupported control plane startup command: %s:%s\n' "$setting_name" "$artisan_command" >&2
+            exit 64
+            ;;
+    esac
+
+    if startup_service_enabled "$setting_name" "$default_value"; then
+        cd /var/www/html
+        exec php artisan "$artisan_command"
+    else
+        status=$?
+        if [ "$status" -ne 1 ]; then
+            exit "$status"
+        fi
+    fi
+
+    printf '   INFO  %s\n' "$disabled_message"
+}
+
+background_service_details()
+{
+    setting_name=$1
+    artisan_command=$2
+
+    case "${setting_name}:${artisan_command}" in
+        HORIZON_ENABLED:horizon)
+            background_service_name=horizon
+            background_service_label=Horizon
+            ;;
+        SCHEDULER_ENABLED:schedule:work)
+            background_service_name=scheduler-worker
+            background_service_label=Scheduler
+            ;;
+        NIGHTWATCH_ENABLED:nightwatch:agent)
+            background_service_name=nightwatch-agent
+            background_service_label=Nightwatch
+            ;;
+        *)
+            printf 'Unsupported control plane background command: %s:%s\n' "$setting_name" "$artisan_command" >&2
+            exit 64
+            ;;
+    esac
+}
+
+run_background()
+{
+    setting_name="$1"
+    default_value="$2"
+    artisan_command="$3"
+
+    background_service_details "$setting_name" "$artisan_command"
+
+    if background_service_enabled "$setting_name" "$default_value"; then
+        printf '   INFO  %s is enabled, starting...\n' "$background_service_label"
+        cd /var/www/html
+        exec php artisan "$artisan_command"
+    else
+        status=$?
+        if [ "$status" -ne 1 ]; then
+            exit "$status"
+        fi
+    fi
+
+    printf '   INFO  %s is disabled, sleeping.\n' "$background_service_label"
+    exec sleep infinity
+}
+
+service_is_supervised_up()
+{
+    service_directory=$1
+    service_up=$(/command/s6-svstat -o up "$service_directory" 2>/dev/null) || return 2
+
+    case "$service_up" in
+        true) return 0 ;;
+        false) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+supervised_service_pid()
+{
+    service_directory=$1
+    service_pid=$(/command/s6-svstat -o pid "$service_directory" 2>/dev/null) || return 1
+
+    case "$service_pid" in
+        ''|0|*[!0-9]*) return 1 ;;
+    esac
+    [ -r "/proc/$service_pid/cmdline" ] || return 1
+
+    printf '%s\n' "$service_pid"
+}
+
+process_runs_expected_artisan_command()
+{
+    process_pid=$1
+    expected_artisan_command=$2
+
+    case "$process_pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ -r "/proc/$process_pid/cmdline" ] || return 1
+
+    tr '\000' '\n' < "/proc/$process_pid/cmdline" | awk \
+        -v expected_artisan_command="$expected_artisan_command" '
+            BEGIN { valid = 1 }
+            NR == 1 {
+                if ($0 !~ /(^|\/)php$/) valid = 0
+                next
+            }
+            NR == 2 {
+                if ($0 != "artisan") valid = 0
+                next
+            }
+            NR == 3 {
+                if ($0 != expected_artisan_command) valid = 0
+                next
+            }
+            { valid = 0 }
+            END { exit !(valid && NR == 3) }
+        '
+}
+
+process_is_fenced_sleeper()
+{
+    process_pid=$1
+
+    case "$process_pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ -r "/proc/$process_pid/cmdline" ] || return 1
+
+    tr '\000' '\n' < "/proc/$process_pid/cmdline" | awk '
+        BEGIN { valid = 1 }
+        NR == 1 {
+            if ($0 !~ /(^|\/)sleep$/) valid = 0
+            next
+        }
+        NR == 2 {
+            if ($0 != "infinity") valid = 0
+            next
+        }
+        { valid = 0 }
+        END { exit !(valid && NR == 2) }
+    '
+}
+
+wait_for_expected_artisan_command()
+{
+    service_directory=$1
+    service_name=$2
+    artisan_command=$3
+    attempt=0
+
+    while [ "$attempt" -lt 50 ]; do
+        if service_is_supervised_up "$service_directory"; then
+            if service_pid=$(supervised_service_pid "$service_directory") \
+                && process_runs_expected_artisan_command "$service_pid" "$artisan_command"; then
+                return 0
+            fi
+        else
+            service_status=$?
+            [ "$service_status" -eq 1 ] || break
+        fi
+        attempt=$((attempt + 1))
+        sleep 0.1
+    done
+
+    printf 'S6 service did not run its expected Artisan command: %s\n' "$service_name" >&2
+    return 1
+}
+
+wait_for_service_down()
+{
+    service_directory=$1
+    service_name=$2
+    attempt=0
+
+    while [ "$attempt" -lt 50 ]; do
+        if service_is_supervised_up "$service_directory"; then
+            :
+        else
+            service_status=$?
+            if [ "$service_status" -eq 1 ]; then
+                return 0
+            fi
+            break
+        fi
+        attempt=$((attempt + 1))
+        sleep 0.1
+    done
+
+    printf 'S6 service did not become supervised-down: %s\n' "$service_name" >&2
+    return 1
+}
+
+background_service_snapshot()
+{
+    service_directory=$1
+    service_name=$2
+    artisan_command=$3
+
+    if [ ! -d "$service_directory" ]; then
+        printf 'S6 service directory not found: %s\n' "$service_directory" >&2
+        return 1
+    fi
+    if service_is_supervised_up "$service_directory"; then
+        if ! service_pid=$(supervised_service_pid "$service_directory"); then
+            printf 'S6 service has no inspectable supervised process: %s\n' "$service_name" >&2
+            return 1
+        fi
+        if process_runs_expected_artisan_command "$service_pid" "$artisan_command"; then
+            observed_background_snapshot="artisan:$service_pid"
+            return 0
+        fi
+        if process_is_fenced_sleeper "$service_pid"; then
+            observed_background_snapshot="sleeper:$service_pid"
+            return 0
+        fi
+        printf 'S6 service has an unexpected supervised process: %s\n' "$service_name" >&2
+        return 1
+    fi
+    service_status=$?
+    if [ "$service_status" -eq 1 ]; then
+        observed_background_snapshot=down
+        return 0
+    fi
+    printf 'S6 service has an indeterminate supervision state: %s\n' "$service_name" >&2
+    return 1
+}
+
+snapshot_background_services()
+{
+    background_service_snapshot /run/service/horizon horizon horizon || return 1
+    horizon_background_snapshot=$observed_background_snapshot
+    background_service_snapshot /run/service/scheduler-worker scheduler-worker schedule:work \
+        || return 1
+    scheduler_background_snapshot=$observed_background_snapshot
+    background_service_snapshot /run/service/nightwatch-agent nightwatch-agent nightwatch:agent \
+        || return 1
+    nightwatch_background_snapshot=$observed_background_snapshot
+}
+
+revalidate_background_services()
+{
+    background_service_snapshot /run/service/horizon horizon horizon \
+        && [ "$observed_background_snapshot" = "$horizon_background_snapshot" ] \
+        || { printf '%s\n' 'Horizon changed after writer-promotion preflight.' >&2; return 1; }
+    background_service_snapshot /run/service/scheduler-worker scheduler-worker schedule:work \
+        && [ "$observed_background_snapshot" = "$scheduler_background_snapshot" ] \
+        || { printf '%s\n' 'Scheduler changed after writer-promotion preflight.' >&2; return 1; }
+    background_service_snapshot /run/service/nightwatch-agent nightwatch-agent nightwatch:agent \
+        && [ "$observed_background_snapshot" = "$nightwatch_background_snapshot" ] \
+        || { printf '%s\n' 'Nightwatch changed after writer-promotion preflight.' >&2; return 1; }
+}
+
+process_runs_writer_artisan()
+{
+    process_pid=$1
+
+    case "$process_pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ -r "/proc/$process_pid/cmdline" ] || return 1
+    { tr '\000' '\n' < "/proc/$process_pid/cmdline"; } 2>/dev/null | awk '
+        NR == 1 { php = ($0 ~ /(^|\/)php$/); next }
+        NR == 2 { artisan = ($0 == "artisan"); next }
+        END { exit !(php && artisan && NR >= 2) }
+    '
+}
+
+prove_no_writer_artisan_processes()
+{
+    for process_path in /proc/[0-9]*; do
+        process_pid=${process_path##*/}
+        if process_runs_writer_artisan "$process_pid"; then
+            printf 'Writer Artisan process remained after fencing: %s\n' "$process_pid" >&2
+            return 1
+        fi
+    done
+}
+
+require_writer_promotion_fault_attestation()
+{
+    if [ "${CONTROL_PLANE_TEST_PROMOTION_FAIL_AFTER_SERVICE+x}" != x ] \
+        && [ "${CONTROL_PLANE_TEST_FORCE_DOWN_FAILURE+x}" != x ]; then
+        return
+    fi
+
+    fault_attestation=/etc/coolify-control-plane-entrypoint-test-attestation
+    if [ -L "$fault_attestation" ] || [ ! -f "$fault_attestation" ] \
+        || [ "$(stat -c '%u:%g:%a' "$fault_attestation" 2>/dev/null || true)" != 0:0:444 ] \
+        || [ "$(cat "$fault_attestation" 2>/dev/null || true)" \
+            != writer-promotion-faults-v1 ]; then
+        printf '%s\n' 'Writer-promotion fault injection requires the root-owned lab attestation.' >&2
+        exit 64
+    fi
+}
+
+force_background_services_down()
+{
+    require_writer_promotion_fault_attestation
+    if [ "${CONTROL_PLANE_TEST_FORCE_DOWN_FAILURE:-0}" = 1 ]; then
+        printf '%s\n' 'Injected writer-promotion rollback proof failure.' >&2
+        return 1
+    fi
+    force_status=0
+    for service_name in horizon scheduler-worker nightwatch-agent; do
+        service_directory="/run/service/$service_name"
+        if [ ! -d "$service_directory" ]; then
+            printf 'S6 service directory not found while fencing: %s\n' "$service_directory" >&2
+            force_status=1
+            continue
+        fi
+        /command/s6-svc -d "$service_directory" || force_status=1
+    done
+    for service_name in horizon scheduler-worker nightwatch-agent; do
+        service_directory="/run/service/$service_name"
+        [ -d "$service_directory" ] || continue
+        wait_for_service_down "$service_directory" "$service_name" || force_status=1
+    done
+    prove_no_writer_artisan_processes || force_status=1
+    return "$force_status"
+}
+
+wait_for_fenced_sleeper()
+{
+    service_directory=$1
+    service_name=$2
+    attempt=0
+
+    while [ "$attempt" -lt 50 ]; do
+        if service_is_supervised_up "$service_directory" \
+            && service_pid=$(supervised_service_pid "$service_directory") \
+            && process_is_fenced_sleeper "$service_pid"; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        sleep 0.1
+    done
+    printf 'S6 service did not converge to its exact fenced sleeper: %s\n' "$service_name" >&2
+    return 1
+}
+
+fence_background_service_to_sleeper()
+{
+    service_directory=$1
+    service_name=$2
+
+    if [ ! -d "$service_directory" ]; then
+        printf 'S6 service directory not found: %s\n' "$service_directory" >&2
+        return 1
+    fi
+    if service_is_supervised_up "$service_directory" \
+        && service_pid=$(supervised_service_pid "$service_directory") \
+        && process_is_fenced_sleeper "$service_pid"; then
+        return 0
+    fi
+    /command/s6-svc -d "$service_directory" \
+        && wait_for_service_down "$service_directory" "$service_name" \
+        && /command/s6-svc -u "$service_directory" \
+        && wait_for_fenced_sleeper "$service_directory" "$service_name"
+}
+
+fence_background_services_to_sleepers()
+{
+    fence_background_service_to_sleeper /run/service/horizon horizon \
+        && fence_background_service_to_sleeper \
+            /run/service/scheduler-worker scheduler-worker \
+        && fence_background_service_to_sleeper \
+            /run/service/nightwatch-agent nightwatch-agent \
+        && prove_no_writer_artisan_processes
+}
+
+reconcile_enabled_background_service()
+{
+    service_directory=$1
+    service_name=$2
+    artisan_command=$3
+
+    if [ ! -d "$service_directory" ]; then
+        printf 'S6 service directory not found: %s\n' "$service_directory" >&2
+        return 1
+    fi
+
+    if service_is_supervised_up "$service_directory"; then
+        if ! service_pid=$(supervised_service_pid "$service_directory"); then
+            printf 'S6 service has no inspectable supervised process: %s\n' "$service_name" >&2
+            return 1
+        fi
+        if process_runs_expected_artisan_command "$service_pid" "$artisan_command"; then
+            return 0
+        fi
+        if ! process_is_fenced_sleeper "$service_pid"; then
+            printf 'S6 service has an unexpected supervised process: %s\n' "$service_name" >&2
+            return 1
+        fi
+        /command/s6-svc -r "$service_directory"
+    else
+        service_status=$?
+        if [ "$service_status" -ne 1 ]; then
+            printf 'S6 service has an indeterminate supervision state: %s\n' "$service_name" >&2
+            return 1
+        fi
+        /command/s6-svc -u "$service_directory"
+    fi
+
+    wait_for_expected_artisan_command "$service_directory" "$service_name" "$artisan_command"
+}
+
+reconcile_disabled_background_service()
+{
+    service_directory=$1
+    service_name=$2
+    artisan_command=$3
+
+    if [ ! -d "$service_directory" ]; then
+        printf 'S6 service directory not found: %s\n' "$service_directory" >&2
+        return 1
+    fi
+
+    if service_is_supervised_up "$service_directory"; then
+        if ! service_pid=$(supervised_service_pid "$service_directory"); then
+            printf 'S6 service has no inspectable supervised process: %s\n' "$service_name" >&2
+            return 1
+        fi
+        if process_is_fenced_sleeper "$service_pid"; then
+            return
+        fi
+        if ! process_runs_expected_artisan_command "$service_pid" "$artisan_command"; then
+            printf 'S6 service has an unexpected supervised process: %s\n' "$service_name" >&2
+            return 1
+        fi
+        /command/s6-svc -d "$service_directory"
+        wait_for_service_down "$service_directory" "$service_name"
+        return
+    fi
+
+    service_status=$?
+    if [ "$service_status" -ne 1 ]; then
+        printf 'S6 service has an indeterminate supervision state: %s\n' "$service_name" >&2
+        return 1
+    fi
+}
+
+reconcile_background_service()
+{
+    setting_name=$1
+    default_value=$2
+    artisan_command=$3
+
+    reconcile_background_service_value "$setting_name" "$artisan_command" \
+        "$(configured_boolean "$setting_name" "$default_value")"
+}
+
+reconcile_background_service_value()
+{
+    setting_name=$1
+    artisan_command=$2
+    enabled_value=$3
+
+    background_service_details "$setting_name" "$artisan_command"
+    service_directory="/run/service/$background_service_name"
+
+    if [ "$enabled_value" = true ]; then
+        reconcile_enabled_background_service "$service_directory" "$background_service_name" "$artisan_command"
+    else
+        reconcile_disabled_background_service "$service_directory" "$background_service_name" "$artisan_command"
+    fi
+}
+
+reconcile_background_services()
+{
+    reconcile_background_service HORIZON_ENABLED true horizon
+    reconcile_background_service SCHEDULER_ENABLED true schedule:work
+    reconcile_background_service NIGHTWATCH_ENABLED false nightwatch:agent
+}
+
+activate_web()
+{
+    if [ "$mode" != active ] || [ "$startup_mode" != web-only ]; then
+        printf '%s\n' 'Web activation requires active web-only control plane mode.' >&2
+        exit 64
+    fi
+
+    if [ "${CONTROL_PLANE_WEB_ACTIVATION_CONFIRM-}" != "$web_activation_confirmation" ]; then
+        printf '%s\n' 'Set CONTROL_PLANE_WEB_ACTIVATION_CONFIRM=route-switch-pending immediately before routing.' >&2
+        exit 64
+    fi
+
+    require_matching_operator_marker "$web_marker" "$web_epoch" 'Web activation'
+    printf '%s\n' 'Control plane web activation completed.'
+}
+
+promote_writer()
+{
+    require_writer_promotion_fault_attestation
+    promotion_failure=0
+    promotion_failure_after=${CONTROL_PLANE_TEST_PROMOTION_FAIL_AFTER_SERVICE-}
+
+    if [ "$mode" != active ] || [ "$startup_mode" != web-only ]; then
+        printf '%s\n' 'Writer promotion requires active web-only control plane mode.' >&2
+        exit 64
+    fi
+
+    if [ "${CONTROL_PLANE_PROMOTION_CONFIRM-}" != "$promotion_confirmation" ]; then
+        printf '%s\n' 'Set CONTROL_PLANE_PROMOTION_CONFIRM=blue-stopped only after the old writer is stopped.' >&2
+        exit 64
+    fi
+
+    require_matching_operator_marker "$writer_marker" "$writer_epoch" 'Writer promotion'
+    case "$promotion_failure_after" in
+        ''|horizon|scheduler-worker|nightwatch-agent) ;;
+        *)
+            printf '%s\n' 'CONTROL_PLANE_TEST_PROMOTION_FAIL_AFTER_SERVICE is invalid.' >&2
+            exit 64
+            ;;
+    esac
+    horizon_promotion_enabled=$(configured_boolean HORIZON_ENABLED true) || return 1
+    scheduler_promotion_enabled=$(configured_boolean SCHEDULER_ENABLED true) || return 1
+    nightwatch_promotion_enabled=$(configured_boolean NIGHTWATCH_ENABLED false) || return 1
+    snapshot_background_services || return 1
+    revalidate_background_services || return 1
+    [ "$(configured_boolean HORIZON_ENABLED true)" = "$horizon_promotion_enabled" ] \
+        && [ "$(configured_boolean SCHEDULER_ENABLED true)" = "$scheduler_promotion_enabled" ] \
+        && [ "$(configured_boolean NIGHTWATCH_ENABLED false)" = "$nightwatch_promotion_enabled" ] \
+        || { printf '%s\n' 'Background-service settings changed after writer-promotion preflight.' >&2; return 1; }
+
+    if ! reconcile_background_service_value HORIZON_ENABLED horizon \
+        "$horizon_promotion_enabled"; then
+        promotion_failure=1
+    elif [ "$promotion_failure_after" = horizon ]; then
+        printf '%s\n' 'Injected writer-promotion failure after Horizon apply.' >&2
+        promotion_failure=1
+    fi
+    if [ "$promotion_failure" -eq 0 ]; then
+        if ! reconcile_background_service_value SCHEDULER_ENABLED schedule:work \
+            "$scheduler_promotion_enabled"; then
+            promotion_failure=1
+        elif [ "$promotion_failure_after" = scheduler-worker ]; then
+            printf '%s\n' 'Injected writer-promotion failure after Scheduler apply.' >&2
+            promotion_failure=1
+        fi
+    fi
+    if [ "$promotion_failure" -eq 0 ]; then
+        if ! reconcile_background_service_value NIGHTWATCH_ENABLED nightwatch:agent \
+            "$nightwatch_promotion_enabled"; then
+            promotion_failure=1
+        elif [ "$promotion_failure_after" = nightwatch-agent ]; then
+            printf '%s\n' 'Injected writer-promotion failure after Nightwatch apply.' >&2
+            promotion_failure=1
+        fi
+    fi
+    if [ "$promotion_failure" -ne 0 ]; then
+        if ! force_background_services_down; then
+            printf '%s\n' 'Writer-promotion failure fencing could not prove all services down.' >&2
+            return 70
+        fi
+        return 1
+    fi
+    printf '%s\n' 'Control plane writer promotion completed.'
+}
+
+fence_writer()
+{
+    if [ "$mode" != active ] || [ "$startup_mode" != web-only ]; then
+        printf '%s\n' 'Writer fencing requires active web-only control plane mode.' >&2
+        exit 64
+    fi
+    if [ -e "$writer_marker" ] || [ -L "$writer_marker" ]; then
+        printf '%s\n' 'Writer fencing requires the operator marker to be absent.' >&2
+        exit 75
+    fi
+    if ! fence_background_services_to_sleepers; then
+        force_background_services_down \
+            || printf '%s\n' 'Writer fencing could not prove all services down.' >&2
+        return 1
+    fi
+    printf '%s\n' 'Control plane writer fencing completed.'
+}
+
+writer_is_fenced()
+{
+    [ ! -e "$writer_marker" ] && [ ! -L "$writer_marker" ] || return 1
+    background_service_snapshot /run/service/horizon horizon horizon || return 1
+    case "$observed_background_snapshot" in sleeper:*) ;; *) return 1 ;; esac
+    background_service_snapshot /run/service/scheduler-worker scheduler-worker schedule:work \
+        || return 1
+    case "$observed_background_snapshot" in sleeper:*) ;; *) return 1 ;; esac
+    background_service_snapshot /run/service/nightwatch-agent nightwatch-agent nightwatch:agent \
+        || return 1
+    case "$observed_background_snapshot" in sleeper:*) ;; *) return 1 ;; esac
+    prove_no_writer_artisan_processes
+}
+
+apply_passive_environment()
+{
+    export APP_DEBUG=false
+    export PHP_DISPLAY_ERRORS=Off
+    export PHP_DISPLAY_STARTUP_ERRORS=Off
+    export LOG_OUTPUT_LEVEL=warn
+
+    export AUTORUN_ENABLED=false
+    export AUTORUN_DEBUG=false
+    export AUTORUN_LARAVEL_CONFIG_CACHE=false
+    export AUTORUN_LARAVEL_EVENT_CACHE=false
+    export AUTORUN_LARAVEL_MIGRATION=false
+    export AUTORUN_LARAVEL_MIGRATION_SEED=false
+    export AUTORUN_LARAVEL_OPTIMIZE=false
+    export AUTORUN_LARAVEL_ROUTE_CACHE=false
+    export AUTORUN_LARAVEL_STORAGE_LINK=false
+    export AUTORUN_LARAVEL_VIEW_CACHE=false
+
+    export MIGRATION_ENABLED=false
+    export SEEDER_ENABLED=false
+    export INIT_ENABLED=false
+    export HORIZON_ENABLED=false
+    export SCHEDULER_ENABLED=false
+    export NIGHTWATCH_ENABLED=false
+    export NIGHTWATCH_TOKEN=
+    export SENTRY_DSN=
+    export SENTRY_LARAVEL_DSN=
+    export SENTRY_ENABLE_TRACING=false
+    export SENTRY_ENABLE_LOGS=false
+    export SENTRY_SPOTLIGHT=false
+    export SENTRY_TRACE_QUEUE_ENABLED=false
+    export SENTRY_TRACE_REDIS_COMMANDS=false
+    export SENTRY_SEND_DEFAULT_PII=false
+    export SENTRY_TRACES_SAMPLE_RATE=0
+    export SENTRY_PROFILES_SAMPLE_RATE=0
+    export TELESCOPE_ENABLED=false
+    export DEBUGBAR_ENABLED=false
+    export RAY_ENABLED=false
+
+    export QUEUE_CONNECTION=null
+    export QUEUE_FAILED_DRIVER=null
+    export CACHE_STORE=array
+    export CACHE_DRIVER=array
+    export SESSION_DRIVER=array
+    export BROADCAST_DRIVER=null
+    export MAIL_MAILER=array
+    export LOG_CHANNEL=stderr
+    export LOG_STACK=stderr
+
+    export AUTOUPDATE=false
+    export MUX_ENABLED=false
+    export SSH_MUX_ENABLED=false
+}
+
+mode="$(control_plane_mode)"
+startup_mode="$(control_plane_startup_mode)"
+writer_epoch=
+writer_marker=
+web_epoch=
+web_marker=
+
+if [ "$mode" = active ] && [ "$startup_mode" = web-only ]; then
+    if [ -n "${CONTROL_PLANE_WRITER_EPOCH-}" ] || [ -n "${CONTROL_PLANE_WRITER_MARKER_PATH-}" ]; then
+        writer_epoch="$(control_plane_writer_epoch)"
+        writer_marker="$(control_plane_writer_marker)"
+    fi
+    if [ -n "${CONTROL_PLANE_WEB_EPOCH-}" ] || [ -n "${CONTROL_PLANE_WEB_MARKER_PATH-}" ]; then
+        web_epoch="$(control_plane_web_epoch)"
+        web_marker="$(control_plane_web_marker)"
+    fi
+    if [ -n "${CONTROL_PLANE_ROUTE_DRAIN_EPOCH-}" ] || [ -n "${CONTROL_PLANE_ROUTE_DRAIN_MARKER_PATH-}" ]; then
+        control_plane_route_drain_epoch >/dev/null
+        control_plane_route_drain_marker >/dev/null
+    fi
+    if [ -n "${CONTROL_PLANE_MUTATION_FREEZE_EPOCH-}" ] || [ -n "${CONTROL_PLANE_MUTATION_FREEZE_MARKER_PATH-}" ]; then
+        control_plane_mutation_freeze_epoch >/dev/null
+        control_plane_mutation_freeze_marker >/dev/null
+    fi
+fi
+
+if [ -n "${CONTROL_PLANE_PROMOTION_IN_PROGRESS-}" ]; then
+    printf '%s\n' 'CONTROL_PLANE_PROMOTION_IN_PROGRESS is reserved for confirmed writer promotion.' >&2
+    exit 64
+fi
+
+if [ -n "${CONTROL_PLANE_WEB_ACTIVATION_IN_PROGRESS-}" ]; then
+    printf '%s\n' 'CONTROL_PLANE_WEB_ACTIVATION_IN_PROGRESS is reserved for confirmed web activation.' >&2
+    exit 64
+fi
+
+if [ "${1:-}" = mode ]; then
+    printf '%s\n' "$mode"
+    exit 0
+fi
+
+if [ "${1:-}" = startup-mode ]; then
+    printf '%s\n' "$startup_mode"
+    exit 0
+fi
+
+if [ "${1:-}" = service-enabled ]; then
+    if [ "$#" -ne 3 ]; then
+        printf '%s\n' 'Usage: coolify-entrypoint service-enabled <SETTING> <true|false>' >&2
+        exit 64
+    fi
+    background_service_enabled "$2" "$3"
+    exit $?
+fi
+
+if [ "${1:-}" = run-startup ]; then
+    if [ "$#" -ne 4 ]; then
+        printf '%s\n' 'Usage: coolify-entrypoint run-startup <SETTING> <true|false> <artisan-command>' >&2
+        exit 64
+    fi
+    run_startup "$2" "$3" "$4"
+    exit 0
+fi
+
+if [ "${1:-}" = run-background ]; then
+    if [ "$#" -ne 4 ]; then
+        printf '%s\n' 'Usage: coolify-entrypoint run-background <SETTING> <true|false> <artisan-command>' >&2
+        exit 64
+    fi
+    run_background "$2" "$3" "$4"
+fi
+
+if [ "${1:-}" = promote-writer ]; then
+    [ -n "$writer_epoch" ] && [ -n "$writer_marker" ] \
+        || { printf '%s\n' 'Writer promotion requires CONTROL_PLANE_WRITER_EPOCH and CONTROL_PLANE_WRITER_MARKER_PATH.' >&2; exit 64; }
+    promote_writer
+    exit 0
+fi
+
+if [ "${1:-}" = fence-writer ]; then
+    [ -n "$writer_epoch" ] && [ -n "$writer_marker" ] \
+        || { printf '%s\n' 'Writer fencing requires CONTROL_PLANE_WRITER_EPOCH and CONTROL_PLANE_WRITER_MARKER_PATH.' >&2; exit 64; }
+    fence_writer
+    exit 0
+fi
+
+if [ "${1:-}" = writer-fenced ]; then
+    [ -n "$writer_epoch" ] && [ -n "$writer_marker" ] && writer_is_fenced
+    exit $?
+fi
+
+if [ "${1:-}" = activate-web ]; then
+    [ -n "$web_epoch" ] && [ -n "$web_marker" ] \
+        || { printf '%s\n' 'Web activation requires CONTROL_PLANE_WEB_EPOCH and CONTROL_PLANE_WEB_MARKER_PATH.' >&2; exit 64; }
+    activate_web
+    exit 0
+fi
+
+if [ "${1:-}" = web-activated ]; then
+    [ -n "$web_epoch" ] && [ -n "$web_marker" ] && web_marker_matches
+    exit $?
+fi
+
+if [ "$mode" = passive ]; then
+    apply_passive_environment
+fi
+
+exec docker-php-serversideup-entrypoint "$@"

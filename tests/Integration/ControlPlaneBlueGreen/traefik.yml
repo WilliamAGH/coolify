@@ -1,0 +1,18 @@
+entryPoints:
+  web:
+    address: ":80"
+
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    exposedByDefault: false
+    constraints: "CONTROL_PLANE_DOCKER_PROVIDER_CONSTRAINT_PLACEHOLDER"
+  file:
+    directory: /traefik/dynamic
+    watch: true
+
+api:
+  dashboard: false
+
+log:
+  level: WARN
