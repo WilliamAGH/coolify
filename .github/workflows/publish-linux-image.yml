@@ -256,6 +256,12 @@ jobs:
     name: Repair latest from immutable semantic digest
     needs: validate-inputs
     if: ${{ ! inputs.validate_only && needs.validate-inputs.outputs.repair_required == 'true' }}
+    # Workflow-level concurrency is not documented to apply inside a
+    # workflow_call invocation, so alias mutation serializes here at the job
+    # level; release shares this group because both mutate the same aliases.
+    concurrency:
+      group: linux-image-alias-mutation-${{ inputs.target_repository }}
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
@@ -1135,6 +1141,12 @@ jobs:
     name: Publish immutable tags and aliases
     needs: [stage-candidates, attest-and-verify]
     if: ${{ ! inputs.validate_only && needs.stage-candidates.result == 'success' }}
+    # Shares the alias-mutation group with repair-latest: both preflight and
+    # copy the same semantic/latest aliases, and the run-id fence alone leaves
+    # a check-then-copy window between concurrent caller runs.
+    concurrency:
+      group: linux-image-alias-mutation-${{ inputs.target_repository }}
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write

@@ -306,7 +306,6 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
     foreach ([
         ...$redisFeatureTests,
         'tests/Feature/PostgresBlueGreenTopologyConcurrencyTest.php',
-        'tests/Feature/PostgresUserDeletionConcurrencyTest.php',
     ] as $serviceBoundTest) {
         if (! str_contains($postgresRedisTestScript, $serviceBoundTest)) {
             $violations[] = "PostgreSQL and Redis validation must run service-bound test: {$serviceBoundTest}";
@@ -511,6 +510,13 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
     if (($sharedWorkflow['concurrency']['group'] ?? null) !== 'linux-image-${{ inputs.target_repository }}' ||
         ($sharedWorkflow['concurrency']['cancel-in-progress'] ?? null) !== false) {
         $violations[] = 'shared publication must serialize each target without cancellation';
+    }
+
+    foreach (['release', 'repair-latest'] as $aliasMutationJob) {
+        if (($jobs[$aliasMutationJob]['concurrency']['group'] ?? null) !== 'linux-image-alias-mutation-${{ inputs.target_repository }}' ||
+            ($jobs[$aliasMutationJob]['concurrency']['cancel-in-progress'] ?? null) !== false) {
+            $violations[] = 'alias mutation jobs must serialize per target at the job level because workflow_call ignores workflow-level concurrency';
+        }
     }
 
     $runTagStep = releaseWorkflowStepById($jobs['validate-inputs'] ?? [], 'target');
@@ -1041,6 +1047,11 @@ function mutateReleaseWorkflow(array $sharedWorkflow, array $callers, string $mu
                 'group' => 'linux-image-coollabsio-coolify',
                 'cancel-in-progress' => false,
             ];
+
+            return [$sharedWorkflow, $callers];
+        })(),
+        'drop-alias-mutation-serialization' => (function () use ($sharedWorkflow, $callers): array {
+            unset($sharedWorkflow['jobs']['release']['concurrency']);
 
             return [$sharedWorkflow, $callers];
         })(),

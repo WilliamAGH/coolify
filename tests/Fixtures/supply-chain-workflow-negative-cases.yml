@@ -17,6 +17,9 @@ cases:
   - name: caller duplicates target concurrency ownership
     mutation: add-caller-target-concurrency
     expected: production must leave target serialization to the shared publication workflow
+  - name: alias mutation loses job-level serialization
+    mutation: drop-alias-mutation-serialization
+    expected: alias mutation jobs must serialize per target at the job level because workflow_call ignores workflow-level concurrency
   - name: immutable run tags are omitted after attestation
     mutation: remove-immutable-run-tags
     expected: 'missing lifecycle step: Create or verify immutable run tags'

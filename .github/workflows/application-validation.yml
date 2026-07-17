@@ -170,11 +170,58 @@ jobs:
             git diff --name-only -z --diff-filter=ACMR "$base_sha" "$GITHUB_SHA" -- \
               'docker-compose.yml' 'docker-compose.dev.yml' 'docker-compose-maxio.dev.yml' \
               'docker-compose.preflight.yml' 'docker-compose.prod.yml' \
-              'docker/**/compose.yaml' 'tests/Integration/**/compose.yaml'
+              'docker/**/compose.yaml' 'docker/**/compose.rehearsal.yaml' \
+              'tests/Integration/**/compose.yaml' 'tests/Integration/**/rehearsal-compose.yaml'
           )
           for compose_file in "${compose_files[@]}"; do
-            docker compose -f "$compose_file" config --quiet
+            case "$compose_file" in
+              docker-compose.dev.yml|docker-compose-maxio.dev.yml)
+                docker compose -f docker-compose.yml -f "$compose_file" config --no-interpolate --quiet
+                ;;
+              *)
+                docker compose -f "$compose_file" config --no-interpolate --quiet
+                ;;
+            esac
           done
+
+          fixture_sha256='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+          fixture_image="registry.example.invalid/coolify@sha256:${fixture_sha256}"
+          fixture_env_file="$GITHUB_WORKSPACE/.env.testing"
+
+          export CONTROL_PLANE_GREEN_IMAGE="$fixture_image"
+          export CONTROL_PLANE_REHEARSAL_RUNTIME_ENV_FILE="$fixture_env_file"
+          export CONTROL_PLANE_RUNTIME_ENV_FILE="$fixture_env_file"
+          export CONTROL_PLANE_LIVE_DATABASE_SYSTEM_IDENTIFIER='compose-validation-system'
+          export CONTROL_PLANE_EXPECTED_MIGRATION_LEDGER_SHA256="$fixture_sha256"
+          export CONTROL_PLANE_EXPECTED_MIGRATION_PENDING_SHA256="$fixture_sha256"
+          export CONTROL_PLANE_EXPECTED_MIGRATION_BATCH='1'
+          export CONTROL_PLANE_MIGRATION_LOCK_TIMEOUT='1000'
+          export CONTROL_PLANE_MIGRATION_STATEMENT_TIMEOUT='1000'
+          export CONTROL_PLANE_REHEARSAL_NETWORK='compose-validation-rehearsal'
+          export CONTROL_PLANE_NETWORK='compose-validation'
+
+          docker compose -f docker/control-plane-blue-green/compose.rehearsal.yaml config --quiet
+
+          CONTROL_PLANE_PROXY_CONTAINER='compose-validation-proxy' \
+          LAB_TRAEFIK_PORT='18080' \
+          LAB_DYNAMIC_DIR="$GITHUB_WORKSPACE" \
+          LAB_TRAEFIK_STATIC_CONFIG="$fixture_env_file" \
+          CONTROL_PLANE_PORT_PROXY_CONTAINER='compose-validation-port-proxy' \
+          CONTROL_PLANE_HOST='compose-validation.example.test' \
+          LAB_PORT8000_PORT='18000' \
+          LAB_PORT_CONFIG_DIR="$GITHUB_WORKSPACE" \
+          CONTROL_PLANE_DATABASE_CONTAINER='compose-validation-database' \
+          CONTROL_PLANE_REHEARSAL_DATABASE_CONTAINER='compose-validation-rehearsal-database' \
+          CONTROL_PLANE_REDIS_CONTAINER='compose-validation-redis' \
+          CONTROL_PLANE_SOKETI_CONTAINER='compose-validation-realtime' \
+            docker compose -f tests/Integration/ControlPlaneBlueGreen/compose.yaml config --quiet
+
+          LAB_RUNTIME_STATE_DIR="$GITHUB_WORKSPACE" \
+          CONTROL_PLANE_DATABASE_HOST='compose-validation-database' \
+          CONTROL_PLANE_DATABASE_PORT='5432' \
+          CONTROL_PLANE_DATABASE_USER='compose-validation' \
+          CONTROL_PLANE_DATABASE_NAME='compose-validation' \
+            docker compose -f tests/Integration/ControlPlaneBlueGreen/rehearsal-compose.yaml config --quiet
       - name: Verify pinned source provenance
         run: |
           docker/verify-source-provenance.sh docker/production/Dockerfile
