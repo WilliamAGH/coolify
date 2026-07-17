@@ -7,6 +7,33 @@ use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Tests\Support\BlueGreenDeactivationScenario;
 
+/**
+ * @param  resource  $socket
+ * @param  array<string, mixed>  $message
+ */
+function writePostgresUserDeletionMessage(mixed $socket, array $message): void
+{
+    $payload = json_encode($message, JSON_THROW_ON_ERROR)."\n";
+    if (fwrite($socket, $payload) !== strlen($payload)) {
+        throw new RuntimeException('Unable to write a PostgreSQL user-deletion concurrency message.');
+    }
+    fflush($socket);
+}
+
+/**
+ * @param  resource  $socket
+ * @return array<string, mixed>
+ */
+function readPostgresUserDeletionMessage(mixed $socket): array
+{
+    $payload = fgets($socket);
+    if ($payload === false) {
+        throw new RuntimeException('Unable to read a PostgreSQL user-deletion concurrency message.');
+    }
+
+    return json_decode($payload, true, flags: JSON_THROW_ON_ERROR);
+}
+
 beforeEach(function (): void {
     if (DB::getDriverName() !== 'pgsql') {
         $this->markTestSkipped('PostgreSQL row locking is required for this concurrency test.');
@@ -151,5 +178,193 @@ it('waits for a concurrent root membership removal before application deletion s
         }
         DB::reconnect();
         unlink($resultPath);
+    }
+});
+
+it('serializes a post-preflight member attachment through canonical user deletion', function () {
+    $rootTeam = Team::factory()->create(['id' => 0, 'name' => 'Root Team']);
+    $user = User::factory()->create();
+    $otherRootMember = User::factory()->create();
+    $concurrentMember = User::factory()->create();
+    $rootTeam->members()->attach($user->id, ['role' => 'owner']);
+    $rootTeam->members()->attach($otherRootMember->id, ['role' => 'owner']);
+
+    ['application' => $application, 'team' => $applicationTeam] = BlueGreenDeactivationScenario::context();
+    $applicationTeam->members()->attach($user->id, ['role' => 'owner']);
+
+    $deletionSockets = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+    if ($deletionSockets === false) {
+        throw new RuntimeException('Unable to create the user-deletion synchronization socket.');
+    }
+    stream_set_timeout($deletionSockets[0], 15);
+    stream_set_timeout($deletionSockets[1], 15);
+
+    $deletionProcessId = null;
+    $membershipProcessId = null;
+    $membershipSockets = null;
+    DB::disconnect();
+
+    try {
+        $deletionProcessId = pcntl_fork();
+        if ($deletionProcessId === -1) {
+            throw new RuntimeException('Unable to fork the user-deletion worker.');
+        }
+
+        if ($deletionProcessId === 0) {
+            fclose($deletionSockets[0]);
+            DB::purge();
+            $applicationDeletionStarted = false;
+
+            try {
+                Application::deleting(function (Application $deletingApplication) use ($application, $deletionSockets, &$applicationDeletionStarted): void {
+                    if ($applicationDeletionStarted || $deletingApplication->id !== $application->id) {
+                        return;
+                    }
+
+                    $applicationDeletionStarted = true;
+                    writePostgresUserDeletionMessage($deletionSockets[1], ['event' => 'post-preflight']);
+                    $command = readPostgresUserDeletionMessage($deletionSockets[1]);
+                    if (($command['command'] ?? null) !== 'continue') {
+                        throw new RuntimeException('The user-deletion worker received an unexpected command.');
+                    }
+                });
+
+                $deleted = User::query()->findOrFail($user->id)->delete();
+                writePostgresUserDeletionMessage($deletionSockets[1], [
+                    'event' => 'completed',
+                    'deleted' => $deleted,
+                    'application_deletion_started' => $applicationDeletionStarted,
+                ]);
+                exit(0);
+            } catch (Throwable $throwable) {
+                writePostgresUserDeletionMessage($deletionSockets[1], [
+                    'event' => 'failed',
+                    'exception' => $throwable::class,
+                    'message' => $throwable->getMessage(),
+                    'application_deletion_started' => $applicationDeletionStarted,
+                ]);
+                exit(1);
+            }
+        }
+        fclose($deletionSockets[1]);
+
+        $postPreflight = readPostgresUserDeletionMessage($deletionSockets[0]);
+        expect($postPreflight['event'])->toBe('post-preflight');
+
+        $membershipSockets = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        if ($membershipSockets === false) {
+            throw new RuntimeException('Unable to create the membership-mutation synchronization socket.');
+        }
+        stream_set_timeout($membershipSockets[0], 15);
+        stream_set_timeout($membershipSockets[1], 15);
+
+        $membershipProcessId = pcntl_fork();
+        if ($membershipProcessId === -1) {
+            throw new RuntimeException('Unable to fork the membership-mutation worker.');
+        }
+
+        if ($membershipProcessId === 0) {
+            fclose($membershipSockets[0]);
+            fclose($deletionSockets[0]);
+            DB::purge();
+
+            try {
+                $backendPid = (int) DB::selectOne('SELECT pg_backend_pid() AS pid')->pid;
+                writePostgresUserDeletionMessage($membershipSockets[1], [
+                    'event' => 'ready',
+                    'backend_pid' => $backendPid,
+                ]);
+                $applicationTeam->attachMember($concurrentMember, 'admin');
+                writePostgresUserDeletionMessage($membershipSockets[1], [
+                    'event' => 'unexpected-success',
+                ]);
+                exit(2);
+            } catch (RuntimeException $runtimeException) {
+                writePostgresUserDeletionMessage($membershipSockets[1], [
+                    'event' => 'rejected',
+                    'exception' => $runtimeException::class,
+                    'message' => $runtimeException->getMessage(),
+                ]);
+                exit(0);
+            } catch (Throwable $throwable) {
+                writePostgresUserDeletionMessage($membershipSockets[1], [
+                    'event' => 'failed',
+                    'exception' => $throwable::class,
+                    'message' => $throwable->getMessage(),
+                ]);
+                exit(1);
+            }
+        }
+        fclose($membershipSockets[1]);
+
+        $membershipReady = readPostgresUserDeletionMessage($membershipSockets[0]);
+        expect($membershipReady['event'])->toBe('ready');
+
+        DB::purge();
+        $membershipMutationBlocked = false;
+        for ($attempt = 0; $attempt < 200; $attempt++) {
+            $membershipMutationBlocked = (int) DB::selectOne(
+                <<<'SQL'
+                    SELECT CASE WHEN EXISTS (
+                        SELECT 1
+                        FROM pg_locks
+                        WHERE pid = ?
+                          AND NOT granted
+                    ) THEN 1 ELSE 0 END AS waiting
+                    SQL,
+                [(int) $membershipReady['backend_pid']],
+            )->waiting === 1;
+            if ($membershipMutationBlocked) {
+                break;
+            }
+            usleep(10_000);
+        }
+
+        writePostgresUserDeletionMessage($deletionSockets[0], ['command' => 'continue']);
+        $deletionResult = readPostgresUserDeletionMessage($deletionSockets[0]);
+        $membershipResult = readPostgresUserDeletionMessage($membershipSockets[0]);
+
+        pcntl_waitpid($deletionProcessId, $deletionStatus);
+        $deletionProcessId = null;
+        pcntl_waitpid($membershipProcessId, $membershipStatus);
+        $membershipProcessId = null;
+
+        expect($membershipMutationBlocked)->toBeTrue()
+            ->and($deletionResult['event'])->toBe('completed')
+            ->and($deletionResult['deleted'])->toBeTrue()
+            ->and($deletionResult['application_deletion_started'])->toBeTrue()
+            ->and($membershipResult)->toBe([
+                'event' => 'rejected',
+                'exception' => RuntimeException::class,
+                'message' => 'Team no longer exists; membership cannot be changed.',
+            ])
+            ->and(pcntl_wexitstatus($deletionStatus))->toBe(0)
+            ->and(pcntl_wexitstatus($membershipStatus))->toBe(0)
+            ->and(User::query()->whereKey($user->id)->exists())->toBeFalse()
+            ->and(Application::withTrashed()->whereKey($application->id)->exists())->toBeFalse()
+            ->and(Team::query()->whereKey($applicationTeam->id)->exists())->toBeFalse()
+            ->and(DB::table('team_user')->where('team_id', $applicationTeam->id)->where('user_id', $concurrentMember->id)->exists())->toBeFalse();
+    } finally {
+        if (is_resource($deletionSockets[0])) {
+            fclose($deletionSockets[0]);
+        }
+        if (is_resource($deletionSockets[1])) {
+            fclose($deletionSockets[1]);
+        }
+        if (is_array($membershipSockets)) {
+            if (is_resource($membershipSockets[0])) {
+                fclose($membershipSockets[0]);
+            }
+            if (is_resource($membershipSockets[1])) {
+                fclose($membershipSockets[1]);
+            }
+        }
+        if ($deletionProcessId !== null) {
+            pcntl_waitpid($deletionProcessId, $deletionStatus);
+        }
+        if ($membershipProcessId !== null) {
+            pcntl_waitpid($membershipProcessId, $membershipStatus);
+        }
+        DB::reconnect();
     }
 });

@@ -141,11 +141,11 @@ class DeleteUserTeams
                 $newOwner = $item['new_owner'];
 
                 // Update the new owner's role to owner
-                $team->members()->updateExistingPivot($newOwner->id, ['role' => 'owner']);
+                $team->updateMemberRole($newOwner, 'owner');
                 RevokeUserTeamTokens::forUserTeam($newOwner, $team->id);
 
                 // Remove the current user from the team
-                $team->members()->detach($this->user->id);
+                $team->detachMember($this->user);
                 RevokeUserTeamTokens::forUserTeam($this->user, $team->id);
 
                 $counts['transferred']++;
@@ -158,7 +158,7 @@ class DeleteUserTeams
         // Remove user from teams where they're just a member
         foreach ($preview['to_leave'] as $team) {
             try {
-                $team->members()->detach($this->user->id);
+                $team->detachMember($this->user);
                 RevokeUserTeamTokens::forUserTeam($this->user, $team->id);
                 $counts['left']++;
             } catch (\Exception $e) {

@@ -96,3 +96,41 @@ it('does not reuse stale team member relations during deletion', function () {
         ->and($applicationTeam->members()->whereKey($otherApplicationTeamMember->id)->exists())->toBeTrue();
     Process::assertNothingRan();
 });
+
+it('refuses direct user deletion before any mutation when blue-green permanent deletion is incomplete', function () {
+    $user = User::factory()->create();
+    ['application' => $application, 'destination' => $destination, 'team' => $team] = BlueGreenDeactivationScenario::context();
+    $team->members()->attach($user->id, ['role' => 'owner']);
+    BlueGreenDeactivationScenario::enableBlueGreen($application);
+    $state = BlueGreenDeactivationScenario::idleState($application, $destination);
+    Process::fake();
+
+    expect(fn () => $user->delete())
+        ->toThrow(RuntimeException::class, 'completed strict deactivation authorization');
+
+    expect($user->fresh())->not->toBeNull()
+        ->and($team->fresh())->not->toBeNull()
+        ->and($application->fresh())->not->toBeNull()
+        ->and($state->fresh()?->phase)->toBe($state->phase)
+        ->and($team->members()->whereKey($user->id)->first()?->pivot?->role)->toBe('owner');
+    Process::assertNothingRan();
+});
+
+it('refuses direct deletion for a sole non-owner team before preserving its blue-green resources', function () {
+    $user = User::factory()->create();
+    ['application' => $application, 'destination' => $destination, 'team' => $team] = BlueGreenDeactivationScenario::context();
+    $team->members()->attach($user->id, ['role' => 'admin']);
+    BlueGreenDeactivationScenario::enableBlueGreen($application);
+    $state = BlueGreenDeactivationScenario::idleState($application, $destination);
+    Process::fake();
+
+    expect(fn () => $user->delete())
+        ->toThrow(RuntimeException::class, 'Sole remaining team member is not an owner');
+
+    expect($user->fresh())->not->toBeNull()
+        ->and($team->fresh())->not->toBeNull()
+        ->and($application->fresh())->not->toBeNull()
+        ->and($state->fresh()?->phase)->toBe($state->phase)
+        ->and($team->members()->whereKey($user->id)->first()?->pivot?->role)->toBe('admin');
+    Process::assertNothingRan();
+});

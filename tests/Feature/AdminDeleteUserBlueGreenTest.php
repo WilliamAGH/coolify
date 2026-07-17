@@ -1,17 +1,13 @@
 <?php
 
-use App\Actions\Application\BlueGreen\BlueGreenDeactivationException;
 use App\Actions\User\DeleteUserServers;
 use App\Actions\User\DeleteUserTeams;
 use App\Console\Commands\AdminDeleteUser;
-use App\Enums\BlueGreenDeactivationPhase;
 use App\Models\Application;
-use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\Server;
 use App\Models\Team;
 use App\Models\User;
 use Illuminate\Database\Events\TransactionRolledBack;
-use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Cache;
@@ -28,71 +24,28 @@ afterEach(function (): void {
     Artisan::call('migrate:fresh', ['--no-interaction' => true]);
 });
 
-it('commits the deletion tombstone before administrative remote cleanup and fails closed', function () {
+it('refuses unsafe blue-green administrative deletion before any mutation or remote action', function () {
     ['application' => $application, 'destination' => $destination, 'team' => $team] = BlueGreenDeactivationScenario::context();
     $user = User::factory()->create();
     $team->members()->attach($user->id, ['role' => 'owner']);
     BlueGreenDeactivationScenario::enableBlueGreen($application);
-    BlueGreenDeactivationScenario::idleState($application, $destination);
-    config()->set('constants.ssh.mux_enabled', false);
-
-    $remoteTransactionLevels = [];
-    Process::fake(function (PendingProcess $process) use (&$remoteTransactionLevels) {
-        $remoteTransactionLevels[] = DB::transactionLevel();
-
-        return Process::result(exitCode: 255, errorOutput: 'ssh transport disconnected');
-    });
+    $state = BlueGreenDeactivationScenario::idleState($application, $destination);
+    Process::fake();
 
     $this->artisan('admin:delete-user', [
         'email' => $user->email,
         '--auto-confirm' => true,
         '--skip-stripe' => true,
     ])
-        ->expectsConfirmation('Do you want to continue with the deletion process?', 'yes')
-        ->expectsConfirmation('Are you sure you want to delete all these resources?', 'yes')
-        ->expectsOutputToContain('Phase 2 may have committed application tombstones or resource deletions; these were not rolled back.')
-        ->expectsOutputToContain('Phase 4–5 database changes were rolled back or never started.')
+        ->expectsOutputToContain('durable application deletion fence and completed strict deactivation authorization')
         ->assertExitCode(1);
 
-    $tombstonedApplication = Application::withTrashed()->findOrFail($application->id);
-
-    expect($remoteTransactionLevels)->not->toBeEmpty()
-        ->each->toBe(0)
-        ->and($tombstonedApplication->trashed())->toBeTrue()
-        ->and(ApplicationBlueGreenDeactivation::query()->sole()->phase)
-        ->toBe(BlueGreenDeactivationPhase::DEACTIVATING)
-        ->and(User::query()->whereKey($user->id)->exists())->toBeTrue()
-        ->and(DB::transactionLevel())->toBe(0);
-});
-
-it('finishes the root membership preflight transaction before direct application deactivation', function () {
-    ['application' => $application, 'destination' => $destination, 'team' => $team] = BlueGreenDeactivationScenario::context();
-    $user = User::factory()->create();
-    $team->members()->attach($user->id, ['role' => 'owner']);
-
-    $rootTeam = Team::factory()->create(['id' => 0, 'name' => 'Root Team']);
-    $otherRootMember = User::factory()->create();
-    $rootTeam->members()->attach($user->id, ['role' => 'owner']);
-    $rootTeam->members()->attach($otherRootMember->id, ['role' => 'owner']);
-
-    BlueGreenDeactivationScenario::enableBlueGreen($application);
-    BlueGreenDeactivationScenario::idleState($application, $destination);
-    config()->set('constants.ssh.mux_enabled', false);
-
-    $remoteTransactionLevels = [];
-    Process::fake(function (PendingProcess $process) use (&$remoteTransactionLevels) {
-        $remoteTransactionLevels[] = DB::transactionLevel();
-
-        return Process::result(exitCode: 255, errorOutput: 'ssh transport disconnected');
-    });
-
-    expect(fn () => $user->delete())
-        ->toThrow(BlueGreenDeactivationException::class, 'transport did not prove completion');
-
-    expect($remoteTransactionLevels)->not->toBeEmpty()
-        ->each->toBe(0)
-        ->and(User::query()->whereKey($user->id)->exists())->toBeTrue()
-        ->and(DB::transactionLevel())->toBe(0);
+    expect(User::query()->whereKey($user->id)->exists())->toBeTrue()
+        ->and(Team::query()->whereKey($team->id)->exists())->toBeTrue()
+        ->and(Application::withTrashed()->findOrFail($application->id)->trashed())->toBeFalse()
+        ->and($state->fresh()?->phase)->toBe($state->phase)
+        ->and($team->members()->whereKey($user->id)->first()?->pivot?->role)->toBe('owner');
+    Process::assertNothingRan();
 });
 
 it('preserves servers belonging to a shared team for owners and admins', function (string $role) {
@@ -133,31 +86,6 @@ it('fails closed when a sole team member is not an owner', function (string $rol
     expect(Team::query()->whereKey($team->id)->exists())->toBeTrue()
         ->and(User::query()->whereKey($user->id)->exists())->toBeTrue();
 })->with(['admin', 'member']);
-
-it('cannot cascade-delete a blue-green application through a sole non-owner team membership', function () {
-    ['application' => $application, 'destination' => $destination, 'server' => $server, 'team' => $team] = BlueGreenDeactivationScenario::context();
-    $user = User::factory()->create();
-    $team->members()->attach($user->id, ['role' => 'admin']);
-    BlueGreenDeactivationScenario::enableBlueGreen($application);
-    $deploymentState = BlueGreenDeactivationScenario::idleState($application, $destination);
-    Process::fake();
-
-    $this->artisan('admin:delete-user', [
-        'email' => $user->email,
-        '--auto-confirm' => true,
-        '--skip-stripe' => true,
-    ])
-        ->expectsConfirmation('Do you want to continue with the deletion process?', 'yes')
-        ->expectsOutputToContain('Sole remaining team member is not an owner')
-        ->assertExitCode(1);
-
-    expect(Team::query()->whereKey($team->id)->exists())->toBeTrue()
-        ->and(Server::query()->whereKey($server->id)->exists())->toBeTrue()
-        ->and(Application::withTrashed()->findOrFail($application->id)->trashed())->toBeFalse()
-        ->and($deploymentState->fresh())->not->toBeNull()
-        ->and(User::query()->whereKey($user->id)->exists())->toBeTrue();
-    Process::assertNothingRan();
-});
 
 it('refuses a skip-resource deletion invoked inside an outer transaction', function () {
     ['application' => $application, 'server' => $server, 'team' => $team] = BlueGreenDeactivationScenario::context();
@@ -209,7 +137,7 @@ it('refuses a dry run inside an outer transaction before cache or remote work', 
             ->and(User::query()->whereKey($user->id)->exists())->toBeTrue();
         Process::assertNothingRan();
 
-        $probeLock = Cache::lock("user_deletion_{$user->id}", 60);
+        $probeLock = Cache::lock(AdminDeleteUser::deletionLockKey($user->id), 60);
         expect($probeLock->get())->toBeTrue();
         $probeLock->release();
     } finally {
@@ -259,8 +187,8 @@ it('rolls back a command-owned transaction before releasing its lock during sign
         $property->setValue($command, $value);
     }
 
-    $beginMethod = $reflection->getMethod('beginCommandTransaction');
-    $beginMethod->invoke($command);
+    DB::beginTransaction();
+    $reflection->getProperty('databaseTransactionStarted')->setValue($command, true);
     expect(DB::transactionLevel())->toBe(1);
 
     $cleanupMethod = $reflection->getMethod('cleanUpAfterSignal');
@@ -323,7 +251,8 @@ it('retains its lock when signal transaction rollback reports a failure', functi
     ] as $propertyName => $value) {
         $reflection->getProperty($propertyName)->setValue($command, $value);
     }
-    $reflection->getMethod('beginCommandTransaction')->invoke($command);
+    DB::beginTransaction();
+    $reflection->getProperty('databaseTransactionStarted')->setValue($command, true);
     Event::listen(TransactionRolledBack::class, function (): never {
         throw new RuntimeException('simulated rollback reporting failure');
     });
@@ -342,10 +271,11 @@ it('retains its lock when signal transaction rollback reports a failure', functi
     $lock->release();
 });
 
-it('does not bypass or release a competing deletion lock in force mode', function () {
+it('does not bypass or release a competing deletion lock after the user email changes', function () {
     $user = User::factory()->create();
-    $competingLock = Cache::lock("user_deletion_{$user->id}", 86400);
+    $competingLock = Cache::lock(AdminDeleteUser::deletionLockKey($user->id), 86400);
     expect($competingLock->get())->toBeTrue();
+    $user->update(['email' => 'renamed-'.$user->email]);
     Process::fake();
 
     $this->artisan('admin:delete-user', [
@@ -361,13 +291,10 @@ it('does not bypass or release a competing deletion lock in force mode', functio
     $competingLock->release();
 });
 
-it('fails closed when its deletion lock expires and a competitor acquires ownership', function () {
-    ['application' => $application, 'destination' => $destination, 'server' => $server, 'team' => $team] = BlueGreenDeactivationScenario::context();
+it('keeps canonical deletion atomic when its cache lock expires during the transaction', function () {
+    ['application' => $application, 'server' => $server, 'team' => $team] = BlueGreenDeactivationScenario::context();
     $user = User::factory()->create();
     $team->members()->attach($user->id, ['role' => 'owner']);
-    BlueGreenDeactivationScenario::enableBlueGreen($application);
-    BlueGreenDeactivationScenario::idleState($application, $destination);
-    BlueGreenDeactivationScenario::fakeLifecycleProcesses([[$application, $destination]]);
 
     $competingLock = null;
     $expired = false;
@@ -378,7 +305,7 @@ it('fails closed when its deletion lock expires and a competitor acquires owners
 
         $expired = true;
         Carbon::setTestNow(now()->addDays(2));
-        $competingLock = Cache::lock("user_deletion_{$user->id}", 86400);
+        $competingLock = Cache::lock(AdminDeleteUser::deletionLockKey($user->id), 86400);
         $competingLock->get();
     });
 
@@ -390,47 +317,70 @@ it('fails closed when its deletion lock expires and a competitor acquires owners
         ])
             ->expectsConfirmation('Do you want to continue with the deletion process?', 'yes')
             ->expectsConfirmation('Are you sure you want to delete all these resources?', 'yes')
-            ->expectsOutputToContain('Deletion lock ownership was lost before Phase 3: Server Deletion')
-            ->assertExitCode(1);
+            ->expectsConfirmation('Are you sure you want to delete all these servers?', 'yes')
+            ->expectsConfirmation('Are you sure you want to proceed with these team changes?', 'yes')
+            ->expectsQuestion('Confirmation', "DELETE {$user->email}")
+            ->assertExitCode(0);
 
         expect($competingLock)->not->toBeNull()
             ->and($competingLock->isOwnedByCurrentProcess())->toBeTrue()
             ->and(Application::withTrashed()->whereKey($application->id)->doesntExist())->toBeTrue()
-            ->and(Server::query()->whereKey($server->id)->exists())->toBeTrue()
-            ->and(User::query()->whereKey($user->id)->exists())->toBeTrue();
+            ->and(Server::withTrashed()->whereKey($server->id)->doesntExist())->toBeTrue()
+            ->and(User::query()->whereKey($user->id)->doesntExist())->toBeTrue();
     } finally {
         $competingLock?->release();
         Carbon::setTestNow();
     }
 });
 
-it('deletes servers before opening the administrative database transaction', function () {
-    ['application' => $application, 'destination' => $destination, 'server' => $server, 'team' => $team] = BlueGreenDeactivationScenario::context();
+it('performs every destructive phase inside the canonical user transaction', function () {
+    ['application' => $application, 'server' => $server, 'team' => $team] = BlueGreenDeactivationScenario::context();
     $user = User::factory()->create();
     $team->members()->attach($user->id, ['role' => 'owner']);
-    BlueGreenDeactivationScenario::enableBlueGreen($application);
-    BlueGreenDeactivationScenario::idleState($application, $destination);
-    BlueGreenDeactivationScenario::fakeLifecycleProcesses([[$application, $destination]]);
 
-    $serverDeletionTransactionLevels = [];
-    Server::forceDeleting(function () use (&$serverDeletionTransactionLevels): void {
-        $serverDeletionTransactionLevels[] = DB::transactionLevel();
+    $mutationOrder = [];
+    $transactionLevels = [];
+    User::deleting(function (User $deletingUser) use ($user, &$mutationOrder, &$transactionLevels): void {
+        if ($deletingUser->id === $user->id) {
+            $mutationOrder[] = 'user';
+            $transactionLevels[] = DB::transactionLevel();
+        }
+    });
+    Application::deleting(function (Application $deletingApplication) use ($application, &$mutationOrder, &$transactionLevels): void {
+        if ($deletingApplication->id === $application->id) {
+            $mutationOrder[] = 'application';
+            $transactionLevels[] = DB::transactionLevel();
+        }
+    });
+    Server::forceDeleting(function (Server $deletingServer) use ($server, &$mutationOrder, &$transactionLevels): void {
+        if ($deletingServer->id === $server->id) {
+            $mutationOrder[] = 'server';
+            $transactionLevels[] = DB::transactionLevel();
+        }
+    });
+    Team::deleting(function (Team $deletingTeam) use ($team, &$mutationOrder, &$transactionLevels): void {
+        if ($deletingTeam->id === $team->id) {
+            $mutationOrder[] = 'team';
+            $transactionLevels[] = DB::transactionLevel();
+        }
     });
 
     $this->artisan('admin:delete-user', [
         'email' => $user->email,
+        '--auto-confirm' => true,
         '--skip-stripe' => true,
     ])
         ->expectsConfirmation('Do you want to continue with the deletion process?', 'yes')
         ->expectsConfirmation('Are you sure you want to delete all these resources?', 'yes')
-        ->expectsConfirmation('Phase 2 completed. Continue to Phase 3 (Delete Servers)?', 'yes')
         ->expectsConfirmation('Are you sure you want to delete all these servers?', 'yes')
-        ->expectsConfirmation('Phase 3 completed. Continue to Phase 4 (Handle Teams)?', 'no')
+        ->expectsConfirmation('Are you sure you want to proceed with these team changes?', 'yes')
+        ->expectsQuestion('Confirmation', "DELETE {$user->email}")
         ->assertExitCode(0);
 
-    expect($serverDeletionTransactionLevels)->toBe([0])
+    expect($mutationOrder)->toContain('user', 'application', 'server', 'team')
+        ->and($transactionLevels)->each->toBeGreaterThan(0)
         ->and(Server::withTrashed()->whereKey($server->id)->doesntExist())->toBeTrue()
         ->and(Application::withTrashed()->whereKey($application->id)->doesntExist())->toBeTrue()
-        ->and(User::query()->whereKey($user->id)->exists())->toBeTrue()
+        ->and(User::query()->whereKey($user->id)->doesntExist())->toBeTrue()
         ->and(DB::transactionLevel())->toBe(0);
 });

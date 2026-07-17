@@ -121,6 +121,7 @@ it('rejects a magic link when the invitation expired', function () {
 
     $this->assertGuest();
     $this->assertDatabaseMissing('team_invitations', ['id' => $invitation->id]);
+    $this->assertModelMissing($user);
 });
 
 it('rejects a malformed magic link token', function () {

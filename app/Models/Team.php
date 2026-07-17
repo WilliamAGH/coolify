@@ -74,6 +74,9 @@ class Team extends Model implements SendsDiscord, SendsEmail, SendsPushover, Sen
         });
 
         static::deleting(function (Team $team) {
+            if ($team->id === 0) {
+                throw new \RuntimeException('The root team cannot be deleted.');
+            }
             RevokeUserTeamTokens::forTeam($team->id);
 
             foreach ($team->privateKeys as $key) {
@@ -103,6 +106,45 @@ class Team extends Model implements SendsDiscord, SendsEmail, SendsPushover, Sen
                 $s3->delete();
             }
         });
+    }
+
+    public function attachMember(User $user, string $role): void
+    {
+        $this->getConnection()->transaction(function () use ($user, $role): void {
+            $team = $this->lockForMembershipMutation();
+            $team->members()->attach($user->getKey(), ['role' => $role]);
+        }, attempts: 5);
+    }
+
+    public function updateMemberRole(User $user, string $role): void
+    {
+        $this->getConnection()->transaction(function () use ($user, $role): void {
+            $team = $this->lockForMembershipMutation();
+            $team->members()->updateExistingPivot($user->getKey(), ['role' => $role]);
+        }, attempts: 5);
+    }
+
+    public function detachMember(User $user): void
+    {
+        $this->getConnection()->transaction(function () use ($user): void {
+            $team = $this->lockForMembershipMutation();
+            $team->members()->detach($user->getKey());
+        }, attempts: 5);
+    }
+
+    private function lockForMembershipMutation(): self
+    {
+        $teamId = $this->getRawOriginal($this->getKeyName()) ?? $this->getKey();
+        $team = static::query()
+            ->useWritePdo()
+            ->whereKey($teamId)
+            ->lockForUpdate()
+            ->first();
+        if ($team === null) {
+            throw new \RuntimeException('Team no longer exists; membership cannot be changed.');
+        }
+
+        return $team;
     }
 
     public static function serverLimitReached(?Team $team = null)

@@ -84,35 +84,35 @@ class FortifyServiceProvider extends ServiceProvider
 
         Fortify::authenticateUsing(function (Request $request) {
             $email = strtolower($request->email);
-            $user = User::where('email', $email)->with('teams')->first();
-            if (
-                $user &&
-                Hash::check($request->password, $user->password)
-            ) {
-                $user->updated_at = now();
-                $user->save();
-
-                // Check if user has a pending invitation they haven't accepted yet
-                $invitation = TeamInvitation::whereEmail($email)->first();
-                if ($invitation && $invitation->isValid()) {
-                    // User is logging in for the first time after being invited
-                    // Attach them to the invited team if not already attached
-                    if (! $user->teams()->where('team_id', $invitation->team->id)->exists()) {
-                        $user->teams()->attach($invitation->team->id, ['role' => $invitation->role]);
-                    }
-                    $user->currentTeam = $invitation->team;
-                    $invitation->delete();
-                } else {
-                    // Normal login - use personal team
-                    $user->currentTeam = $user->teams->firstWhere('personal_team', true);
-                    if (! $user->currentTeam) {
-                        $user->currentTeam = $user->recreate_personal_team();
-                    }
-                }
-                session(['currentTeam' => $user->currentTeam]);
-
-                return $user;
+            $user = User::whereEmail($email)->first();
+            if (! $user || ! Hash::check($request->password, $user->password)) {
+                return null;
             }
+
+            $user->load('teams');
+            $user->updated_at = now();
+            $user->save();
+
+            // Check if user has a pending invitation they haven't accepted yet
+            $invitation = TeamInvitation::whereEmail($email)->first();
+            if ($invitation && $invitation->isValid()) {
+                // User is logging in for the first time after being invited
+                // Attach them to the invited team if not already attached
+                if (! $user->teams()->where('team_id', $invitation->team->id)->exists()) {
+                    $invitation->team->attachMember($user, $invitation->role);
+                }
+                $user->currentTeam = $invitation->team;
+                $invitation->delete();
+            } else {
+                // Normal login - use personal team
+                $user->currentTeam = $user->teams->firstWhere('personal_team', true);
+                if (! $user->currentTeam) {
+                    $user->currentTeam = $user->recreate_personal_team();
+                }
+            }
+            session(['currentTeam' => $user->currentTeam]);
+
+            return $user;
         });
         Fortify::requestPasswordResetLinkView(function () {
             return view('auth.forgot-password');
