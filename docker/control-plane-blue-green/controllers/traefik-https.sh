@@ -1650,6 +1650,172 @@ is_any_managed_v2_route()
         && grep -F -x -q '# control-plane-ingress-pool-version: 2' "$inspected_route"
 }
 
+managed_route_comment_value()
+{
+    inspected_route=$1
+    comment_name=$2
+    comment_prefix="# control-plane-${comment_name}: "
+    comment_value=$(awk -v prefix="$comment_prefix" '
+        index($0, prefix) == 1 {
+            count++
+            value = substr($0, length(prefix) + 1)
+        }
+        END {
+            if (count != 1) {
+                exit 1
+            }
+            print value
+        }
+    ' "$inspected_route") \
+        || fail "managed HTTPS predecessor route comment is absent or duplicated: $comment_name"
+    validate_single_line "managed HTTPS predecessor $comment_name" "$comment_value"
+    printf '%s\n' "$comment_value"
+}
+
+managed_route_ack_value()
+{
+    inspected_route=$1
+    ack_prefix='          X-Control-Plane-Route-Ack: "'
+    ack_value=$(awk -v prefix="$ack_prefix" '
+        index($0, "X-Control-Plane-Route-Ack:") > 0 {
+            total++
+            if (index($0, prefix) == 1 && substr($0, length($0), 1) == "\"") {
+                exact++
+                value = substr($0, length(prefix) + 1, length($0) - length(prefix) - 1)
+            }
+        }
+        END {
+            if (total != 1 || exact != 1) {
+                exit 1
+            }
+            print value
+        }
+    ' "$inspected_route") \
+        || fail 'managed HTTPS predecessor route acknowledgement is absent, duplicated, or malformed'
+    validate_token managed-HTTPS-predecessor-route-ack "$ack_value"
+    printf '%s\n' "$ack_value"
+}
+
+write_predecessor_identity()
+{
+    printf 'predecessor_operation_id=%s\n' "$predecessor_operation_id"
+    printf 'predecessor_manifest_sha256=%s\n' "$predecessor_manifest_sha256"
+    printf 'predecessor_pool_plan_sha256=%s\n' "$predecessor_pool_plan_sha256"
+    printf 'predecessor_color=%s\n' "$predecessor_color"
+    printf 'predecessor_generation=%s\n' "$predecessor_generation"
+}
+
+assert_persisted_predecessor_identity()
+{
+    predecessor_state=$1
+    predecessor_state_label=$2
+    [ "$managed_predecessor_requested" = 1 ] \
+        || fail "$predecessor_state_label requires the exact managed predecessor inputs"
+    [ "$(state_value_from "$predecessor_state" predecessor_operation_id)" \
+            = "$predecessor_operation_id" ] \
+        && [ "$(state_value_from "$predecessor_state" predecessor_manifest_sha256)" \
+            = "$predecessor_manifest_sha256" ] \
+        && [ "$(state_value_from "$predecessor_state" predecessor_pool_plan_sha256)" \
+            = "$predecessor_pool_plan_sha256" ] \
+        && [ "$(state_value_from "$predecessor_state" predecessor_color)" \
+            = "$predecessor_color" ] \
+        && [ "$(state_value_from "$predecessor_state" predecessor_generation)" \
+            = "$predecessor_generation" ] \
+        || fail "$predecessor_state_label differs from the requested managed predecessor"
+}
+
+assert_managed_predecessor_route()
+{
+    inspected_route=$1
+    if ! { [ -f "$inspected_route" ] && [ ! -L "$inspected_route" ] \
+        && is_any_managed_v2_route "$inspected_route"; }; then
+        fail 'managed HTTPS predecessor route is absent or unsafe'
+    fi
+    route_predecessor_operation_id=$(managed_route_comment_value \
+        "$inspected_route" operation-id)
+    route_predecessor_manifest_sha256=$(managed_route_comment_value \
+        "$inspected_route" manifest-sha256)
+    route_predecessor_pool_plan_sha256=$(managed_route_comment_value \
+        "$inspected_route" parent-pool-plan-sha256)
+    route_predecessor_direction=$(managed_route_comment_value "$inspected_route" direction)
+    route_predecessor_color=$(managed_route_comment_value "$inspected_route" color)
+    route_predecessor_generation=$(managed_route_comment_value "$inspected_route" generation)
+    route_predecessor_ack=$(managed_route_ack_value "$inspected_route")
+    validate_identifier managed-HTTPS-predecessor-operation-id "$route_predecessor_operation_id"
+    validate_sha256 managed-HTTPS-predecessor-manifest-sha256 \
+        "$route_predecessor_manifest_sha256"
+    validate_sha256 managed-HTTPS-predecessor-pool-plan-sha256 \
+        "$route_predecessor_pool_plan_sha256"
+    validate_positive_integer managed-HTTPS-predecessor-generation \
+        "$route_predecessor_generation"
+    case "$route_predecessor_direction" in
+        bootstrap-forward|forward) ;;
+        *) fail 'managed HTTPS predecessor route is not a forward route' ;;
+    esac
+    [ "$route_predecessor_operation_id" = "$predecessor_operation_id" ] \
+        && [ "$route_predecessor_manifest_sha256" = "$predecessor_manifest_sha256" ] \
+        && [ "$route_predecessor_pool_plan_sha256" = "$predecessor_pool_plan_sha256" ] \
+        && [ "$route_predecessor_color" = "$predecessor_color" ] \
+        && [ "$route_predecessor_generation" = "$predecessor_generation" ] \
+        || fail 'managed HTTPS predecessor route differs from the exact predecessor identity'
+}
+
+assert_requested_managed_route()
+{
+    inspected_route=$1
+    is_managed_route "$inspected_route" \
+        || fail 'current managed HTTPS route belongs to another operation'
+    [ "$(managed_route_comment_value "$inspected_route" manifest-sha256)" \
+            = "$pool_manifest_sha256" ] \
+        && [ "$(managed_route_comment_value "$inspected_route" parent-pool-plan-sha256)" \
+            = "$parent_pool_plan_sha256" ] \
+        && [ "$(managed_route_comment_value "$inspected_route" direction)" = "$direction" ] \
+        && [ "$(managed_route_comment_value "$inspected_route" color)" = "$color" ] \
+        && [ "$(managed_route_comment_value "$inspected_route" generation)" = "$generation" ] \
+        && [ "$(managed_route_ack_value "$inspected_route")" = "$route_ack" ] \
+        || fail 'current managed HTTPS route differs from the exact requested ingress pool'
+}
+
+rollback_backup_kind()
+{
+    inspected_rollback_state=$1
+    backup_kind_count=$(awk -F= '$1 == "backup_kind" { count++ } END { print count + 0 }' \
+        "$inspected_rollback_state")
+    case "$backup_kind_count" in
+        0)
+            case "$(state_value_from "$inspected_rollback_state" backup_status)" in
+                present) printf '%s\n' legacy ;;
+                absent) printf '%s\n' absent ;;
+                *) fail 'durable HTTPS rollback state has no valid backup kind' ;;
+            esac
+            ;;
+        1) state_value_from "$inspected_rollback_state" backup_kind ;;
+        *) fail 'durable HTTPS rollback state contains duplicate backup kind' ;;
+    esac
+}
+
+assert_reverse_predecessor_context()
+{
+    [ "$managed_predecessor_requested" = 1 ] || return
+    [ "$direction" = reverse ] \
+        || fail 'managed HTTPS predecessor handoff is allowed only for a reverse ingress pool'
+    [ "$color" != "$predecessor_color" ] \
+        || fail 'reverse ingress pool color must differ from its managed predecessor'
+}
+
+assert_managed_predecessor_backup()
+{
+    inspected_rollback_state=$1
+    assert_persisted_predecessor_identity "$inspected_rollback_state" \
+        'durable HTTPS rollback predecessor identity'
+    managed_backup_checksum=$(state_value_from "$inspected_rollback_state" backup_checksum)
+    validate_sha256 managed-HTTPS-predecessor-backup-sha256 "$managed_backup_checksum"
+    [ -f "$backup_file" ] && [ ! -L "$backup_file" ] \
+        && [ "$(checksum "$backup_file")" = "$managed_backup_checksum" ] \
+        || fail 'durable managed HTTPS predecessor backup changed'
+    assert_managed_predecessor_route "$backup_file"
+}
+
 atomic_replace()
 {
     candidate=$1
@@ -1670,15 +1836,32 @@ prepare()
             || fail 'durable HTTPS rollback state belongs to another controller generation'
         rollback_status=$(state_value_from "$rollback_state_file" backup_status)
         rollback_checksum=$(state_value_from "$rollback_state_file" backup_checksum)
+        backup_kind=$(rollback_backup_kind "$rollback_state_file")
         case "$rollback_status" in
             present)
-                if [ ! -f "$backup_file" ] \
-                    || [ "$(checksum "$backup_file")" != "$rollback_checksum" ] \
-                    || is_any_managed_v2_route "$backup_file"; then
-                    fail 'durable HTTPS rollback backup changed or is another managed v2 route'
-                fi
+                case "$backup_kind" in
+                    legacy)
+                        [ "$managed_predecessor_requested" = 0 ] \
+                            || fail 'durable HTTPS rollback state is legacy, not the requested managed predecessor'
+                        if [ ! -f "$backup_file" ] \
+                            || [ "$(checksum "$backup_file")" != "$rollback_checksum" ] \
+                            || is_any_managed_v2_route "$backup_file"; then
+                            fail 'durable HTTPS rollback backup changed or is another managed v2 route'
+                        fi
+                        ;;
+                    managed-v2)
+                        assert_managed_predecessor_backup "$rollback_state_file"
+                        ;;
+                    *) fail 'durable HTTPS rollback backup kind is invalid' ;;
+                esac
                 ;;
-            absent) [ ! -e "$backup_file" ] || fail 'unexpected HTTPS rollback backup exists' ;;
+            absent)
+                [ "$backup_kind" = absent ] \
+                    || fail 'absent HTTPS rollback state has an invalid backup kind'
+                [ "$managed_predecessor_requested" = 0 ] \
+                    || fail 'managed HTTPS predecessor route was absent during durable prepare'
+                [ ! -e "$backup_file" ] || fail 'unexpected HTTPS rollback backup exists'
+                ;;
             *) fail 'durable HTTPS rollback state is invalid' ;;
         esac
         return
@@ -1686,14 +1869,31 @@ prepare()
     rollback_candidate="$operation_directory/.rollback-state.$$"
     if [ -e "$route_file" ]; then
         [ -f "$route_file" ] && [ ! -L "$route_file" ] || fail 'existing HTTPS route is unsafe'
-        ! is_any_managed_v2_route "$route_file" \
-            || fail 'refusing to capture another managed v2 route as legacy rollback state'
-        cp -p "$route_file" "$backup_file"
+        if [ "$managed_predecessor_requested" = 1 ]; then
+            assert_reverse_predecessor_context
+            assert_managed_predecessor_route "$route_file"
+            original_checksum=$(checksum "$route_file")
+            cp -p "$route_file" "$backup_file"
+            backup_checksum=$(checksum "$backup_file")
+            [ "$backup_checksum" = "$original_checksum" ] \
+                && [ "$(checksum "$route_file")" = "$original_checksum" ] \
+                || fail 'managed HTTPS predecessor route changed while it was captured'
+            assert_managed_predecessor_route "$backup_file"
+            backup_kind=managed-v2
+        else
+            ! is_any_managed_v2_route "$route_file" \
+                || fail 'refusing to capture another managed v2 route as legacy rollback state'
+            cp -p "$route_file" "$backup_file"
+            backup_checksum=$(checksum "$backup_file")
+            original_checksum=$(checksum "$route_file")
+            backup_kind=legacy
+        fi
         backup_status=present
-        backup_checksum=$(checksum "$backup_file")
-        original_checksum=$(checksum "$route_file")
     else
+        [ "$managed_predecessor_requested" = 0 ] \
+            || fail 'managed HTTPS predecessor route is absent'
         backup_status=absent
+        backup_kind=absent
         backup_checksum=none
         original_checksum=absent
     fi
@@ -1701,8 +1901,10 @@ prepare()
         printf 'version=2\n'
         printf 'operation_id=%s\n' "$operation_id"
         printf 'backup_status=%s\n' "$backup_status"
+        printf 'backup_kind=%s\n' "$backup_kind"
         printf 'backup_checksum=%s\n' "$backup_checksum"
         printf 'original_checksum=%s\n' "$original_checksum"
+        [ "$backup_kind" != managed-v2 ] || write_predecessor_identity
     } > "$rollback_candidate"
     atomic_replace "$rollback_candidate" "$rollback_state_file" 600
 }
@@ -1772,6 +1974,58 @@ capture_legacy_public_fingerprint()
     fail 'legacy public route did not produce a stable success response through the exact proxy'
 }
 
+capture_managed_predecessor_public_ack()
+{
+    required_managed_predecessor_public_ack_proof=${1:-}
+    assert_managed_predecessor_route "$backup_file"
+    expected_managed_predecessor_route_ack=$route_predecessor_ack
+    managed_predecessor_headers="$operation_directory/.managed-predecessor-public-headers.$$"
+    managed_predecessor_curl_config="$operation_directory/.managed-predecessor-public-curl.$$"
+    write_pinned_curl_config "$managed_predecessor_curl_config" "$public_url"
+    attempt=0
+    trap 'rm -f "$managed_predecessor_headers" "$managed_predecessor_curl_config"' \
+        EXIT HUP INT TERM
+    while [ "$attempt" -lt "$probe_attempts" ]; do
+        rm -f "$managed_predecessor_headers"
+        attest_proxy_runtime
+        managed_predecessor_proxy_tuple=$proxy_runtime_tuple
+        assert_public_proxy_binding
+        managed_predecessor_public_binding_tuple=$proxy_public_binding_tuple
+        status=0
+        curl --config "$managed_predecessor_curl_config" --fail \
+            --dump-header "$managed_predecessor_headers" --output /dev/null || status=$?
+        if [ "$status" -eq 0 ] \
+            && has_single_exact_response_header "$managed_predecessor_headers" \
+                X-Control-Plane-Route-Ack "$expected_managed_predecessor_route_ack"; then
+            managed_predecessor_public_ack_proof="cp-managed-v2.$(printf '%s\0' \
+                "$operation_id" "$backup_checksum" "$predecessor_operation_id" \
+                "$predecessor_manifest_sha256" "$predecessor_pool_plan_sha256" \
+                "$predecessor_color" "$predecessor_generation" \
+                "$expected_managed_predecessor_route_ack" "$public_url" \
+                "$public_host_header" "$expected_ipv4" \
+                "$managed_predecessor_public_binding_tuple" "$managed_predecessor_proxy_tuple" \
+                | sha256sum | awk '{print $1}')"
+            if [ -z "$required_managed_predecessor_public_ack_proof" ] \
+                || [ "$managed_predecessor_public_ack_proof" \
+                    = "$required_managed_predecessor_public_ack_proof" ]; then
+                attest_proxy_runtime
+                [ "$proxy_runtime_tuple" = "$managed_predecessor_proxy_tuple" ] \
+                    || fail 'exact Traefik proxy changed during managed predecessor public proof'
+                assert_public_proxy_binding
+                [ "$proxy_public_binding_tuple" = "$managed_predecessor_public_binding_tuple" ] \
+                    || fail 'exact Traefik public binding changed during managed predecessor public proof'
+                rm -f "$managed_predecessor_headers" "$managed_predecessor_curl_config"
+                trap - EXIT HUP INT TERM
+                return
+            fi
+        fi
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+    rm -f "$managed_predecessor_headers" "$managed_predecessor_curl_config"
+    fail 'managed HTTPS predecessor did not produce its exact public route acknowledgement'
+}
+
 write_lineage_state()
 {
     lineage_status_count=$(awk -F= '$1 == "lineage_status" { count++ } END { print count + 0 }' \
@@ -1790,16 +2044,32 @@ write_lineage_state()
     backup_status=$(state_value_from "$rollback_state_file" backup_status)
     backup_checksum=$(state_value_from "$rollback_state_file" backup_checksum)
     original_checksum=$(state_value_from "$rollback_state_file" original_checksum)
-    current_legacy_checksum=absent
-    [ ! -e "$route_file" ] || current_legacy_checksum=$(checksum "$route_file")
-    [ "$current_legacy_checksum" = "$original_checksum" ] \
-        || fail 'unbound rollback lineage can be reconciled only while the exact legacy route remains installed'
+    backup_kind=$(rollback_backup_kind "$rollback_state_file")
+    current_rollback_checksum=absent
+    [ ! -e "$route_file" ] || current_rollback_checksum=$(checksum "$route_file")
+    [ "$current_rollback_checksum" = "$original_checksum" ] \
+        || fail 'unbound rollback lineage requires the exact captured route to remain installed'
     attest_proxy_runtime
     assert_public_proxy_binding
-    capture_legacy_public_fingerprint
+    case "$backup_kind" in
+        legacy|absent)
+            [ "$managed_predecessor_requested" = 0 ] \
+                || fail 'legacy HTTPS rollback lineage cannot bind managed predecessor inputs'
+            capture_legacy_public_fingerprint
+            ;;
+        managed-v2)
+            assert_reverse_predecessor_context
+            [ "$backup_status" = present ] \
+                || fail 'managed HTTPS predecessor rollback must contain a backup'
+            assert_managed_predecessor_backup "$rollback_state_file"
+            capture_managed_predecessor_public_ack
+            ;;
+        *) fail 'HTTPS rollback lineage has an invalid backup kind' ;;
+    esac
     lineage_candidate="$operation_directory/.lineage.$$"
     {
         printf 'version=1\noperation_id=%s\n' "$operation_id"
+        printf 'backup_kind=%s\n' "$backup_kind"
         printf 'pool_manifest=%s\npool_manifest_sha256=%s\npool_manifest_metadata=%s\n' \
             "$pool_manifest_source" "$pool_manifest_sha256" "$manifest_validated_metadata"
         printf 'pool_plan_manifest=%s\npool_plan_manifest_sha256=%s\npool_plan_manifest_metadata=%s\n' \
@@ -1816,10 +2086,21 @@ write_lineage_state()
         printf 'public_url=%s\npublic_host_header=%s\nexpected_ipv4=%s\n' \
             "$public_url" "$public_host_header" "$expected_ipv4"
         printf 'proxy_public_binding_tuple=%s\n' "$proxy_public_binding_tuple"
-        printf 'legacy_public_status=%s\nlegacy_public_body_sha256=%s\n' \
-            "$legacy_public_status" "$legacy_public_body_sha256"
-        printf 'legacy_public_response_ack=%s\nlegacy_public_ack_proof=%s\n' \
-            "$legacy_public_response_ack" "$legacy_public_ack_proof"
+        case "$backup_kind" in
+            managed-v2)
+                write_predecessor_identity
+                printf 'managed_predecessor_route_ack=%s\n' \
+                    "$expected_managed_predecessor_route_ack"
+                printf 'managed_predecessor_public_ack_proof=%s\n' \
+                    "$managed_predecessor_public_ack_proof"
+                ;;
+            legacy|absent)
+                printf 'legacy_public_status=%s\nlegacy_public_body_sha256=%s\n' \
+                    "$legacy_public_status" "$legacy_public_body_sha256"
+                printf 'legacy_public_response_ack=%s\nlegacy_public_ack_proof=%s\n' \
+                    "$legacy_public_response_ack" "$legacy_public_ack_proof"
+                ;;
+        esac
     } > "$lineage_candidate"
     chmod 600 "$lineage_candidate"
     lineage_sha256=$(checksum "$lineage_candidate")
@@ -1850,13 +2131,19 @@ bind_rollback_lineage()
     binding_status=${1:-bound}
     case "$binding_status" in installing|bound) ;; *) fail 'rollback lineage binding status is invalid' ;; esac
     rollback_status=$(state_value_from "$rollback_state_file" backup_status)
+    backup_kind=$(rollback_backup_kind "$rollback_state_file")
     rollback_checksum=$(state_value_from "$rollback_state_file" backup_checksum)
     original_checksum=$(state_value_from "$rollback_state_file" original_checksum)
+    if [ "$backup_kind" = managed-v2 ]; then
+        assert_persisted_predecessor_identity "$rollback_state_file" \
+            'durable HTTPS rollback predecessor identity'
+    fi
     rollback_candidate="$operation_directory/.rollback-lineage.$$"
     {
         printf 'version=2\noperation_id=%s\n' "$operation_id"
-        printf 'backup_status=%s\nbackup_checksum=%s\noriginal_checksum=%s\n' \
-            "$rollback_status" "$rollback_checksum" "$original_checksum"
+        printf 'backup_status=%s\nbackup_kind=%s\nbackup_checksum=%s\noriginal_checksum=%s\n' \
+            "$rollback_status" "$backup_kind" "$rollback_checksum" "$original_checksum"
+        [ "$backup_kind" != managed-v2 ] || write_predecessor_identity
         printf 'lineage_status=%s\nlineage_file=%s\nlineage_sha256=%s\n' \
             "$binding_status" "$lineage_file" "$lineage_sha256"
     } > "$rollback_candidate"
@@ -1885,6 +2172,46 @@ load_restore_lineage()
     [ "$(state_value_from "$lineage_file" version)" = 1 ] \
         && [ "$(state_value_from "$lineage_file" operation_id)" = "$operation_id" ] \
         || fail 'immutable HTTPS lineage belongs to another operation'
+    backup_kind=$(rollback_backup_kind "$rollback_state_file")
+    lineage_backup_kind_count=$(awk -F= \
+        '$1 == "backup_kind" { count++ } END { print count + 0 }' "$lineage_file")
+    case "$lineage_backup_kind_count" in
+        0)
+            case "$backup_kind" in
+                legacy|absent) lineage_backup_kind=$backup_kind ;;
+                *) fail 'immutable managed HTTPS lineage has no backup kind' ;;
+            esac
+            ;;
+        1) lineage_backup_kind=$(state_value_from "$lineage_file" backup_kind) ;;
+        *) fail 'immutable HTTPS lineage contains duplicate backup kind' ;;
+    esac
+    [ "$lineage_backup_kind" = "$backup_kind" ] \
+        || fail 'immutable HTTPS lineage backup kind differs from rollback state'
+    case "$backup_kind" in
+        managed-v2)
+            [ "$(state_value_from "$rollback_state_file" backup_status)" = present ] \
+                || fail 'managed HTTPS predecessor lineage has no rollback backup'
+            assert_managed_predecessor_backup "$rollback_state_file"
+            assert_persisted_predecessor_identity "$lineage_file" \
+                'immutable HTTPS lineage predecessor identity'
+            expected_managed_predecessor_route_ack=$(state_value_from \
+                "$lineage_file" managed_predecessor_route_ack)
+            expected_managed_predecessor_public_ack_proof=$(state_value_from \
+                "$lineage_file" managed_predecessor_public_ack_proof)
+            validate_token managed-HTTPS-predecessor-lineage-route-ack \
+                "$expected_managed_predecessor_route_ack"
+            validate_token managed-HTTPS-predecessor-public-ack-proof \
+                "$expected_managed_predecessor_public_ack_proof"
+            assert_managed_predecessor_route "$backup_file"
+            [ "$route_predecessor_ack" = "$expected_managed_predecessor_route_ack" ] \
+                || fail 'immutable HTTPS predecessor route acknowledgement changed'
+            ;;
+        legacy|absent)
+            [ "$managed_predecessor_requested" = 0 ] \
+                || fail 'immutable HTTPS lineage is legacy, not the requested managed predecessor'
+            ;;
+        *) fail 'immutable HTTPS lineage backup kind is invalid' ;;
+    esac
     restored_pool_manifest=$(state_value_from "$lineage_file" pool_manifest)
     restored_pool_manifest_sha256=$(state_value_from "$lineage_file" pool_manifest_sha256)
     restored_pool_plan=$(state_value_from "$lineage_file" pool_plan_manifest)
@@ -1951,12 +2278,15 @@ load_restore_lineage()
         || fail 'restore caller expected IPv4 differs from immutable lineage'
     public_url=$lineage_public_url
     public_host_header=$lineage_public_host_header
-    expected_legacy_public_status=$(state_value_from "$lineage_file" legacy_public_status)
-    expected_legacy_public_body_sha256=$(state_value_from "$lineage_file" legacy_public_body_sha256)
-    expected_legacy_public_response_ack=$(state_value_from "$lineage_file" legacy_public_response_ack)
-    expected_legacy_public_ack_proof=$(state_value_from "$lineage_file" legacy_public_ack_proof)
+    if [ "$backup_kind" != managed-v2 ]; then
+        expected_legacy_public_status=$(state_value_from "$lineage_file" legacy_public_status)
+        expected_legacy_public_body_sha256=$(state_value_from "$lineage_file" legacy_public_body_sha256)
+        expected_legacy_public_response_ack=$(state_value_from "$lineage_file" legacy_public_response_ack)
+        expected_legacy_public_ack_proof=$(state_value_from "$lineage_file" legacy_public_ack_proof)
+    fi
     load_pool_manifest
     load_pool_plan
+    assert_reverse_predecessor_context
     attest_proxy_runtime
     [ "$proxy_id" = "$(state_value_from "$lineage_file" proxy_id)" ] \
         && [ "$proxy_pid" = "$(state_value_from "$lineage_file" proxy_pid)" ] \
@@ -2281,18 +2611,33 @@ durable_state_status()
     state_value status
 }
 
+load_reverse_predecessor_switch_context()
+{
+    load_pool_manifest
+    load_pool_plan
+    assert_reverse_predecessor_context
+}
+
 switch_pool()
 {
     attest_proxy_runtime
-    prepare
-    load_pool_manifest
-    load_pool_plan
+    if [ "$managed_predecessor_requested" = 1 ]; then
+        load_reverse_predecessor_switch_context
+        prepare
+    else
+        prepare
+        load_pool_manifest
+        load_pool_plan
+    fi
     write_lineage_state
     candidate="$dynamic_directory/.${dynamic_filename}.${operation_id}.new"
     trap 'rm -f "$candidate"' EXIT HUP INT TERM
     render_route "$candidate"
     [ "$(grep -F -c '          - url: ' "$candidate")" -eq 2 ] \
         || fail 'rendered HTTPS route does not contain exactly two servers'
+    if [ "$test_invalid_route" = 1 ]; then
+        printf '\n%s\n' 'http: [' >> "$candidate"
+    fi
     target_route_sha256=$(checksum "$candidate")
     if [ -e "$state_file" ]; then
         current_status=$(durable_state_status)
@@ -2506,24 +2851,50 @@ restore()
     trap 'rm -f "$restore_candidate"' EXIT HUP INT TERM
     case "$backup_status" in
         present)
-            if [ ! -f "$backup_file" ] \
-                || [ "$(checksum "$backup_file")" != "$backup_checksum" ] \
-                || is_any_managed_v2_route "$backup_file"; then
-                fail 'durable HTTPS rollback backup changed'
-            fi
-            if [ -e "$route_file" ] && ! is_managed_route \
-                && [ "$(checksum "$route_file")" != "$backup_checksum" ]; then
-                fail 'refusing to overwrite an unmanaged HTTPS route'
-            fi
-            cp -p "$backup_file" "$restore_candidate"
-            atomic_replace "$restore_candidate" "$route_file" 600
+            case "$backup_kind" in
+                legacy)
+                    if [ ! -f "$backup_file" ] \
+                        || [ "$(checksum "$backup_file")" != "$backup_checksum" ] \
+                        || is_any_managed_v2_route "$backup_file"; then
+                        fail 'durable HTTPS rollback backup changed'
+                    fi
+                    if [ -e "$route_file" ] && ! is_managed_route \
+                        && [ "$(checksum "$route_file")" != "$backup_checksum" ]; then
+                        fail 'refusing to overwrite an unmanaged HTTPS route'
+                    fi
+                    cp -p "$backup_file" "$restore_candidate"
+                    atomic_replace "$restore_candidate" "$route_file" 600
+                    restored_status=restored-legacy
+                    ;;
+                managed-v2)
+                    assert_managed_predecessor_backup "$rollback_state_file"
+                    if [ -e "$route_file" ] \
+                        && [ "$(checksum "$route_file")" = "$backup_checksum" ]; then
+                        assert_managed_predecessor_route "$route_file"
+                    else
+                        [ -e "$route_file" ] \
+                            || fail 'current managed HTTPS reverse route is absent before predecessor restore'
+                        assert_requested_managed_route "$route_file"
+                        cp -p "$backup_file" "$restore_candidate"
+                        atomic_replace "$restore_candidate" "$route_file" 600
+                    fi
+                    [ "$(checksum "$route_file")" = "$backup_checksum" ] \
+                        || fail 'restored managed HTTPS predecessor differs from its immutable backup'
+                    assert_managed_predecessor_route "$route_file"
+                    restored_status=restored-managed-v2
+                    ;;
+                *) fail 'present HTTPS rollback state has an invalid backup kind' ;;
+            esac
             ;;
         absent)
+            [ "$backup_kind" = absent ] \
+                || fail 'absent HTTPS rollback state has an invalid backup kind'
             if [ -e "$route_file" ] && ! is_managed_route; then
                 fail 'refusing to remove an unmanaged HTTPS route'
             fi
             rm -f "$route_file"
             sync "$dynamic_directory"
+            restored_status=restored-legacy
             ;;
         *) fail 'HTTPS rollback state is invalid' ;;
     esac
@@ -2532,7 +2903,11 @@ restore()
     {
         printf 'version=2\n'
         printf 'operation_id=%s\n' "$operation_id"
-        printf 'status=restored-legacy\n'
+        printf 'status=%s\n' "$restored_status"
+        if [ "$restored_status" = restored-managed-v2 ]; then
+            printf 'restored_route_sha256=%s\n' "$backup_checksum"
+            write_predecessor_identity
+        fi
     } > "$restored_candidate"
     atomic_replace "$restored_candidate" "$state_file" 600
     test_crash after-restore-state
@@ -2570,6 +2945,37 @@ ack_restored_legacy()
     printf '%s\n' "$legacy_public_ack_proof"
 }
 
+ack_restored_managed_predecessor()
+{
+    load_restore_lineage
+    [ "$(state_value version)" = 2 ] \
+        && [ "$(state_value operation_id)" = "$operation_id" ] \
+        && [ "$(state_value status)" = restored-managed-v2 ] \
+        || fail 'managed predecessor acknowledgement requires the exact durable restored state'
+    assert_persisted_predecessor_identity "$state_file" \
+        'durable restored HTTPS predecessor identity'
+    backup_status=$(state_value_from "$rollback_state_file" backup_status)
+    backup_checksum=$(state_value_from "$rollback_state_file" backup_checksum)
+    [ "$backup_kind" = managed-v2 ] && [ "$backup_status" = present ] \
+        || fail 'managed predecessor acknowledgement has no managed rollback backup'
+    [ "$(state_value restored_route_sha256)" = "$backup_checksum" ] \
+        || fail 'durable restored HTTPS predecessor checksum differs from rollback state'
+    assert_managed_predecessor_backup "$rollback_state_file"
+    [ -f "$route_file" ] && [ ! -L "$route_file" ] \
+        && [ "$(checksum "$route_file")" = "$backup_checksum" ] \
+        || fail 'managed predecessor acknowledgement route differs from the immutable rollback target'
+    assert_managed_predecessor_route "$route_file"
+    attest_proxy_runtime
+    assert_public_proxy_binding
+    capture_managed_predecessor_public_ack \
+        "$expected_managed_predecessor_public_ack_proof"
+    [ "$expected_managed_predecessor_route_ack" = "$route_predecessor_ack" ] \
+        && [ "$managed_predecessor_public_ack_proof" \
+            = "$expected_managed_predecessor_public_ack_proof" ] \
+        || fail 'restored managed HTTPS predecessor acknowledgement differs from immutable lineage'
+    printf '%s\n' "$managed_predecessor_public_ack_proof"
+}
+
 action=${1:-}
 operation_id=${CONTROL_PLANE_INGRESS_OPERATION_ID:-}
 operation_directory=${CONTROL_PLANE_INGRESS_OPERATION_DIR:-}
@@ -2594,6 +3000,12 @@ expected_ipv4=${CONTROL_PLANE_INGRESS_EXPECTED_IPV4:-}
 probe_attempts=${CONTROL_PLANE_INGRESS_PROBE_ATTEMPTS:-20}
 test_mode=${CONTROL_PLANE_INGRESS_TEST_MODE:-0}
 test_crash_at=${CONTROL_PLANE_INGRESS_TEST_CRASH_AT:-}
+test_invalid_route=${CONTROL_PLANE_INGRESS_TEST_INVALID_ROUTE:-0}
+predecessor_operation_id=${CONTROL_PLANE_INGRESS_PREDECESSOR_OPERATION_ID:-}
+predecessor_manifest_sha256=${CONTROL_PLANE_INGRESS_PREDECESSOR_MANIFEST_SHA256:-}
+predecessor_pool_plan_sha256=${CONTROL_PLANE_INGRESS_PREDECESSOR_POOL_PLAN_SHA256:-}
+predecessor_color=${CONTROL_PLANE_INGRESS_PREDECESSOR_COLOR:-}
+predecessor_generation=${CONTROL_PLANE_INGRESS_PREDECESSOR_GENERATION:-}
 expected_pool_manifest_metadata=
 expected_pool_plan_metadata=
 
@@ -2611,8 +3023,37 @@ validate_identifier CONTROL_PLANE_INGRESS_PROXY_CONTAINER "$proxy_container"
 validate_ipv4 CONTROL_PLANE_INGRESS_EXPECTED_IPV4 "$expected_ipv4"
 validate_positive_integer CONTROL_PLANE_INGRESS_PROBE_ATTEMPTS "$probe_attempts"
 case "$test_mode" in 0|1) ;; *) fail 'CONTROL_PLANE_INGRESS_TEST_MODE must be 0 or 1' ;; esac
+case "$test_invalid_route" in 0|1) ;; *) fail 'CONTROL_PLANE_INGRESS_TEST_INVALID_ROUTE must be 0 or 1' ;; esac
 [ -z "$test_crash_at" ] || [ "$test_mode" = 1 ] \
     || fail 'CONTROL_PLANE_INGRESS_TEST_CRASH_AT is forbidden outside test mode'
+[ "$test_invalid_route" = 0 ] || [ "$test_mode" = 1 ] \
+    || fail 'CONTROL_PLANE_INGRESS_TEST_INVALID_ROUTE is forbidden outside test mode'
+managed_predecessor_requested=0
+if [ -n "$predecessor_operation_id" ] \
+    || [ -n "$predecessor_manifest_sha256" ] \
+    || [ -n "$predecessor_pool_plan_sha256" ] \
+    || [ -n "$predecessor_color" ] \
+    || [ -n "$predecessor_generation" ]; then
+    require_value CONTROL_PLANE_INGRESS_PREDECESSOR_OPERATION_ID "$predecessor_operation_id"
+    require_value CONTROL_PLANE_INGRESS_PREDECESSOR_MANIFEST_SHA256 "$predecessor_manifest_sha256"
+    require_value CONTROL_PLANE_INGRESS_PREDECESSOR_POOL_PLAN_SHA256 \
+        "$predecessor_pool_plan_sha256"
+    require_value CONTROL_PLANE_INGRESS_PREDECESSOR_COLOR "$predecessor_color"
+    require_value CONTROL_PLANE_INGRESS_PREDECESSOR_GENERATION "$predecessor_generation"
+    validate_identifier CONTROL_PLANE_INGRESS_PREDECESSOR_OPERATION_ID \
+        "$predecessor_operation_id"
+    validate_sha256 CONTROL_PLANE_INGRESS_PREDECESSOR_MANIFEST_SHA256 \
+        "$predecessor_manifest_sha256"
+    validate_sha256 CONTROL_PLANE_INGRESS_PREDECESSOR_POOL_PLAN_SHA256 \
+        "$predecessor_pool_plan_sha256"
+    case "$predecessor_color" in
+        blue|green) ;;
+        *) fail 'CONTROL_PLANE_INGRESS_PREDECESSOR_COLOR must be blue or green' ;;
+    esac
+    validate_positive_integer CONTROL_PLANE_INGRESS_PREDECESSOR_GENERATION \
+        "$predecessor_generation"
+    managed_predecessor_requested=1
+fi
 [ -d "$dynamic_directory" ] && [ ! -L "$dynamic_directory" ] \
     || fail 'Traefik dynamic directory is absent or unsafe'
 resolved_dynamic_directory=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' \
@@ -2638,10 +3079,15 @@ case "$action" in
         ;;
 esac
 
-if [ "$action" = ack ] && [ -f "$state_file" ] \
-    && grep -F -x -q 'status=restored-legacy' "$state_file"; then
-    ack_restored_legacy
-    exit 0
+if [ "$action" = ack ] && [ -f "$state_file" ]; then
+    if grep -F -x -q 'status=restored-legacy' "$state_file"; then
+        ack_restored_legacy
+        exit 0
+    fi
+    if grep -F -x -q 'status=restored-managed-v2' "$state_file"; then
+        ack_restored_managed_predecessor
+        exit 0
+    fi
 fi
 
 case "$action" in
@@ -2657,6 +3103,9 @@ case "$action" in
         ;;
     prepare)
         attest_proxy_runtime
+        if [ "$managed_predecessor_requested" = 1 ]; then
+            load_reverse_predecessor_switch_context
+        fi
         prepare
         ;;
     switch|assert|verify|ack|drain|assert-drained|verify-drained)
