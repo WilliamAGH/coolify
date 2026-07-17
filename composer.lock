@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "297a4a0feaba342ef3f8719c505a4bce",
+    "content-hash": "df2866e5d7686fd9c0d7fcb718a9eafc",
     "packages": [
         {
             "name": "aws/aws-crt-php",
@@ -5291,23 +5291,24 @@
         },
         {
             "name": "pion/laravel-chunk-upload",
-            "version": "v1.5.6",
+            "version": "v1.5.7",
             "source": {
                 "type": "git",
                 "url": "https://github.com/pionl/laravel-chunk-upload.git",
-                "reference": "5cfdb8d9058bb4ecdf3a3100b6c7bb197c21e4d4"
+                "reference": "0a4ae45a7c7988da8a0a4e93f4f23df688cb6164"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/pionl/laravel-chunk-upload/zipball/5cfdb8d9058bb4ecdf3a3100b6c7bb197c21e4d4",
-                "reference": "5cfdb8d9058bb4ecdf3a3100b6c7bb197c21e4d4",
+                "url": "https://api.github.com/repos/pionl/laravel-chunk-upload/zipball/0a4ae45a7c7988da8a0a4e93f4f23df688cb6164",
+                "reference": "0a4ae45a7c7988da8a0a4e93f4f23df688cb6164",
                 "shasum": ""
             },
             "require": {
-                "illuminate/console": "5.2 - 5.8 | ^6.0 | ^7.0 | ^8.0 | ^9.0 | ^10.0 | ^11.0 | ^12.0",
-                "illuminate/filesystem": "5.2 - 5.8 | ^6.0 | ^7.0 | ^8.0 | ^9.0 | ^10.0 | ^11.0 | ^12.0",
-                "illuminate/http": "5.2 - 5.8 | ^6.0 | ^7.0 | ^8.0 | ^9.0 | ^10.0 | ^11.0 | ^12.0",
-                "illuminate/support": "5.2 - 5.8 | ^6.0 | ^7.0 | ^8.0 | ^9.0 | ^10.0 | ^11.0 | ^12.0"
+                "illuminate/console": "^9.0 | ^10.0 | ^11.0 | ^12.0 | ^13.0",
+                "illuminate/filesystem": "^9.0 | ^10.0 | ^11.0 | ^12.0 | ^13.0",
+                "illuminate/http": "^9.0 | ^10.0 | ^11.0 | ^12.0 | ^13.0",
+                "illuminate/support": "^9.0 | ^10.0 | ^11.0 | ^12.0 | ^13.0",
+                "php": ">=8.1"
             },
             "require-dev": {
                 "friendsofphp/php-cs-fixer": "^2.16.0 | ^3.52.0",
@@ -5341,7 +5342,7 @@
             "description": "Service for chunked upload with several js providers",
             "support": {
                 "issues": "https://github.com/pionl/laravel-chunk-upload/issues",
-                "source": "https://github.com/pionl/laravel-chunk-upload/tree/v1.5.6"
+                "source": "https://github.com/pionl/laravel-chunk-upload/tree/v1.5.7"
             },
             "funding": [
                 {
@@ -5353,7 +5354,7 @@
                     "type": "github"
                 }
             ],
-            "time": "2025-03-19T16:30:08+00:00"
+            "time": "2026-07-05T14:17:49+00:00"
         },
         {
             "name": "poliander/cron",
