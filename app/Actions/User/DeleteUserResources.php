@@ -2,8 +2,9 @@
 
 namespace App\Actions\User;
 
+use App\Models\Application;
 use App\Models\User;
-use Illuminate\Support\Collection;
+use Illuminate\Database\Eloquent\Builder;
 
 class DeleteUserResources
 {
@@ -75,8 +76,31 @@ class DeleteUserResources
         ];
     }
 
+    /**
+     * Refuse a user deletion before it can mutate resources when an application
+     * on any team the user would delete has not completed permanent deletion.
+     */
+    public function assertBlueGreenApplicationsReadyForPermanentDeletion(): void
+    {
+        foreach ($this->user->teams()->withCount('members')->useWritePdo()->get() as $team) {
+            if ($team->id === 0 || $team->members_count !== 1) {
+                continue;
+            }
+
+            Application::withTrashed()
+                ->whereHas('environment.project', fn (Builder $query): Builder => $query->where('team_id', $team->id))
+                ->useWritePdo()
+                ->get()
+                ->each(function (Application $application): void {
+                    $application->assertBlueGreenDeletionAuthorized();
+                });
+        }
+    }
+
     public function execute(): array
     {
+        $this->assertBlueGreenApplicationsReadyForPermanentDeletion();
+
         if ($this->isDryRun) {
             return [
                 'applications' => 0,
@@ -93,11 +117,13 @@ class DeleteUserResources
 
         $resources = $this->getResourcesPreview();
 
-        // Delete applications
+        // Delete applications only after their permanent-deletion fence has
+        // already completed; user deletion must never initiate blue-green remote cleanup.
         foreach ($resources['applications'] as $application) {
             try {
-                $application->forceDelete();
-                $deletedCounts['applications']++;
+                if ($application->forceDelete()) {
+                    $deletedCounts['applications']++;
+                }
             } catch (\Exception $e) {
                 \Log::error("Failed to delete application {$application->id}: ".$e->getMessage());
                 throw $e; // Re-throw to trigger rollback

@@ -20,12 +20,14 @@ class Member extends Component
         try {
             $this->authorize('manageMembers', currentTeam());
 
+            $memberRole = Role::tryFrom((string) $this->getMemberRole());
             if (Role::from(auth()->user()->role())->lt(Role::ADMIN)
-                || Role::from($this->getMemberRole())->gt(auth()->user()->role())) {
+                || $memberRole === null
+                || $memberRole->gt(auth()->user()->role())) {
                 throw new \Exception('You are not authorized to perform this action.');
             }
             $teamId = currentTeam()->id;
-            $this->member->teams()->updateExistingPivot($teamId, ['role' => Role::ADMIN->value]);
+            currentTeam()->updateMemberRole($this->member, Role::ADMIN->value);
             RevokeUserTeamTokens::forUserTeam($this->member, $teamId);
             $this->dispatch('reloadWindow');
         } catch (\Exception $e) {
@@ -38,12 +40,14 @@ class Member extends Component
         try {
             $this->authorize('manageMembers', currentTeam());
 
+            $memberRole = Role::tryFrom((string) $this->getMemberRole());
             if (Role::from(auth()->user()->role())->lt(Role::OWNER)
-                || Role::from($this->getMemberRole())->gt(auth()->user()->role())) {
+                || $memberRole === null
+                || $memberRole->gt(auth()->user()->role())) {
                 throw new \Exception('You are not authorized to perform this action.');
             }
             $teamId = currentTeam()->id;
-            $this->member->teams()->updateExistingPivot($teamId, ['role' => Role::OWNER->value]);
+            currentTeam()->updateMemberRole($this->member, Role::OWNER->value);
             RevokeUserTeamTokens::forUserTeam($this->member, $teamId);
             $this->dispatch('reloadWindow');
         } catch (\Exception $e) {
@@ -56,12 +60,14 @@ class Member extends Component
         try {
             $this->authorize('manageMembers', currentTeam());
 
+            $memberRole = Role::tryFrom((string) $this->getMemberRole());
             if (Role::from(auth()->user()->role())->lt(Role::ADMIN)
-                || Role::from($this->getMemberRole())->gt(auth()->user()->role())) {
+                || $memberRole === null
+                || $memberRole->gt(auth()->user()->role())) {
                 throw new \Exception('You are not authorized to perform this action.');
             }
             $teamId = currentTeam()->id;
-            $this->member->teams()->updateExistingPivot($teamId, ['role' => Role::MEMBER->value]);
+            currentTeam()->updateMemberRole($this->member, Role::MEMBER->value);
             RevokeUserTeamTokens::forUserTeam($this->member, $teamId);
             $this->dispatch('reloadWindow');
         } catch (\Exception $e) {
@@ -74,12 +80,14 @@ class Member extends Component
         try {
             $this->authorize('manageMembers', currentTeam());
 
+            $memberRole = Role::tryFrom((string) $this->getMemberRole());
             if (Role::from(auth()->user()->role())->lt(Role::ADMIN)
-                || Role::from($this->getMemberRole())->gt(auth()->user()->role())) {
+                || $memberRole === null
+                || $memberRole->gt(auth()->user()->role())) {
                 throw new \Exception('You are not authorized to perform this action.');
             }
             $teamId = currentTeam()->id;
-            $this->member->teams()->detach(currentTeam());
+            currentTeam()->detachMember($this->member);
             RevokeUserTeamTokens::forUserTeam($this->member, $teamId);
             // Clear cache for the removed user - both old and new key formats
             Cache::forget("team:{$this->member->id}");

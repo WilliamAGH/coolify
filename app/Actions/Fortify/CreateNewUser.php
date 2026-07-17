@@ -47,7 +47,7 @@ class CreateNewUser implements CreatesNewUsers
             $user->save();
             $team = $user->teams()->first() ?? Team::find(0);
             if ($team !== null && ! $user->teams()->where('team_id', $team->id)->exists()) {
-                $user->teams()->attach($team, ['role' => 'owner']);
+                $team->attachMember($user, 'owner');
             }
 
             // Disable registration after first user is created

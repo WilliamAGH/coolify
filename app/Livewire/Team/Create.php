@@ -34,7 +34,7 @@ class Create extends Component
                 'description' => $this->description,
                 'personal_team' => false,
             ]);
-            auth()->user()->teams()->attach($team, ['role' => 'admin']);
+            $team->attachMember(auth()->user(), 'admin');
             refreshSession($team);
 
             return redirectRoute($this, 'team.index');
