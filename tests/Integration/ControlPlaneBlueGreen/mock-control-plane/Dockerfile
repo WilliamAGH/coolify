@@ -12,10 +12,13 @@ RUN apk add --no-cache bash busybox-extras coreutils curl docker-cli php85 php85
     && chown -R 9999:9999 /var/lib/coolify-control-plane /lab-state /srv/www
 
 COPY --chmod=755 entrypoint.sh /usr/local/bin/coolify-entrypoint
+COPY --chmod=755 control-plane-direct-probe-healthcheck /usr/local/bin/control-plane-direct-probe-healthcheck
 COPY --chmod=755 rehearse-migration.sh /usr/local/bin/rehearse-migration
 COPY run-migrations.php /usr/local/bin/run-control-plane-migrations.php
 COPY --chmod=755 probe.sh /srv/www/cgi-bin/probe
 COPY --chmod=755 request.sh /srv/www/cgi-bin/request
+COPY --chmod=755 route-health.sh /srv/www/cgi-bin/route-health
+COPY --chmod=755 http-server.py /usr/local/bin/control-plane-lab-http-server
 COPY --chmod=755 lab-service.sh /usr/local/bin/control-plane-lab-service
 COPY --chmod=755 dependency.sh /usr/local/bin/control-plane-lab-dependency
 COPY --chmod=755 systemctl /usr/local/bin/systemctl

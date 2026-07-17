@@ -13,7 +13,7 @@ if [ "${HTTP_X_CONTROL_PLANE_PROBE:-}" != "$token" ]; then
     exit 0
 fi
 
+printf '%s\n' 'Status: 204 No Content'
 printf '%s\n' 'Content-Type: text/plain'
 printf 'X-Control-Plane-Lab-Host: %s\n' "$expected_host"
 printf 'X-Control-Plane-Applied-Config: %s\n\n' "$acknowledgement"
-printf '%s\n' 'ok'

@@ -26,8 +26,13 @@ LAB_PORT_SLOT_COUNT=$(((65535 - LAB_PORT_BASE - \
     ((LAB_PORT_BAND_COUNT - 1) * LAB_PORT_BAND_WIDTH + LAB_PORT_MAX_SCENARIO)) \
     / LAB_PORT_BLOCK_WIDTH + 1))
 MOCK_IMAGE="control-plane-blue-green-lab:$LAB_INVOCATION_TOKEN"
+MOCK_REGISTRY_IMAGE='registry@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373'
+MOCK_REGISTRY_CONTAINER="control-plane-blue-green-registry-$LAB_INVOCATION_TOKEN"
+MOCK_REGISTRY_TAG=
+MOCK_IMMUTABLE_IMAGE=
 active_lab=0
 registered_worker_pids=
+paused_dependency_container=
 PATH="$LAB_DIRECTORY:$PATH"
 PYTHONDONTWRITEBYTECODE=1
 export PATH PYTHONDONTWRITEBYTECODE
@@ -185,6 +190,8 @@ prepare_mock_image_context()
     mock_image_context="$LAB_ROOT/mock-control-plane-image"
     mkdir -p "$mock_image_context"
     cp -R "$LAB_DIRECTORY/mock-control-plane/." "$mock_image_context/"
+    cp "$REPOSITORY_ROOT/docker/production/bin/control-plane-direct-probe-healthcheck" \
+        "$mock_image_context/control-plane-direct-probe-healthcheck"
     mkdir -p "$mock_image_context/app/Support" "$mock_image_context/config" "$mock_image_context/migrations" \
         "$mock_image_context/vendor/composer" \
         "$mock_image_context/vendor/doctrine" \
@@ -570,10 +577,12 @@ assert_marker_equals()
     volume_name=$1
     expected_epoch=$2
 
-    actual_epoch=$(docker run --rm --network none \
+    docker run --rm --network none \
         --mount "type=volume,source=${volume_name},target=/state,readonly" \
-        --entrypoint /bin/sh "$MOCK_IMAGE" -ec 'cat /state/writer-epoch')
-    [ "$actual_epoch" = "$expected_epoch" ] || fail 'marker bytes did not equal the expected epoch'
+        --env "EXPECTED_EPOCH=$expected_epoch" \
+        --entrypoint /bin/sh "$MOCK_IMAGE" -ec \
+        'printf %s "$EXPECTED_EPOCH" | cmp -s - /state/writer-epoch' \
+        || fail 'marker bytes did not equal the expected epoch'
 }
 
 assert_mutation_freeze_marker_absent()
@@ -601,8 +610,9 @@ assert_mutation_freeze_marker_equals()
     volume_name=$1
     expected_epoch=$2
 
-    actual_epoch=$(docker run --rm --network none --user 0 \
+    docker run --rm --network none --user 0 \
         --mount "type=volume,source=${volume_name},target=/state,readonly" \
+        --env "EXPECTED_EPOCH=$expected_epoch" \
         --entrypoint /bin/sh "$MOCK_IMAGE" -ec '
             lease=/state/mutation-inflight.lock
             marker=/state/mutation-freeze-epoch
@@ -620,10 +630,8 @@ assert_mutation_freeze_marker_equals()
             exec 9< "$marker"
             test "$(stat -Lc %d:%i /proc/self/fd/9)" = "$marker_identity"
             test "$(stat -c %d:%i "$marker")" = "$marker_identity"
-            cat <&9
-        ') || fail 'mutation-freeze marker or exact lease identity is unsafe'
-    [ "$actual_epoch" = "$expected_epoch" ] \
-        || fail 'mutation-freeze marker bytes did not equal the expected epoch'
+            printf %s "$EXPECTED_EPOCH" | cmp -s - /proc/self/fd/9
+        ' || fail 'mutation-freeze marker bytes or exact lease identity is unsafe'
 }
 
 wait_for_mutation_freeze_exclusive_lease()
@@ -825,10 +833,10 @@ start_lab()
     CONTROL_PLANE_GREEN_WEB_B_ROUTE_DRAIN_EPOCH="green-${scenario_name}-drain-b-0123456789"
     CONTROL_PLANE_BLUE_WEB_A_ROUTE_DRAIN_EPOCH="blue-${scenario_name}-drain-a-0123456789"
     CONTROL_PLANE_BLUE_WEB_B_ROUTE_DRAIN_EPOCH="blue-${scenario_name}-drain-b-0123456789"
-    CONTROL_PLANE_GREEN_WEB_A_ROUTE_IDENTITY=green-web-a
-    CONTROL_PLANE_GREEN_WEB_B_ROUTE_IDENTITY=green-web-b
-    CONTROL_PLANE_BLUE_WEB_A_ROUTE_IDENTITY=blue-web-a
-    CONTROL_PLANE_BLUE_WEB_B_ROUTE_IDENTITY=blue-web-b
+    CONTROL_PLANE_GREEN_WEB_A_ROUTE_IDENTITY=green-web-a-route-identity
+    CONTROL_PLANE_GREEN_WEB_B_ROUTE_IDENTITY=green-web-b-route-identity
+    CONTROL_PLANE_BLUE_WEB_A_ROUTE_IDENTITY=blue-web-a-route-identity
+    CONTROL_PLANE_BLUE_WEB_B_ROUTE_IDENTITY=blue-web-b-route-identity
     CONTROL_PLANE_GREEN_POOL_LABEL_VALUE="${project_name}-green-pool"
     CONTROL_PLANE_BLUE_POOL_LABEL_VALUE="${project_name}-blue-pool"
     lab_port_block_base=$((LAB_PORT_BASE + LAB_PORT_SLOT * LAB_PORT_BLOCK_WIDTH))
@@ -851,8 +859,8 @@ start_lab()
     CONTROL_PLANE_NETWORK=$control_plane_network
     CONTROL_PLANE_TEST_PROXY_GATEWAY="10.$((LAB_PORT_SLOT + 1)).${scenario_number}.1"
     CONTROL_PLANE_TEST_PROXY_SUBNET="10.$((LAB_PORT_SLOT + 1)).${scenario_number}.0/24"
-    CONTROL_PLANE_GREEN_IMAGE=$MOCK_IMAGE
-    CONTROL_PLANE_BLUE_IMAGE=$MOCK_IMAGE
+    CONTROL_PLANE_GREEN_IMAGE=$MOCK_IMMUTABLE_IMAGE
+    CONTROL_PLANE_BLUE_IMAGE=$CONTROL_PLANE_GREEN_IMAGE
     CONTROL_PLANE_OPERATOR_TARGET=lab
     CONTROL_PLANE_TEST_MODE=1
     CONTROL_PLANE_OPERATOR_STATE_DIR="$scenario_directory/state"
@@ -936,7 +944,7 @@ start_lab()
         "$MOCK_IMAGE")
     CONTROL_PLANE_BACKUP_EXPECTED_SOURCE_REDIS_IMAGE_DIGEST=$MOCK_IMAGE
     CONTROL_PLANE_BACKUP_EXPECTED_SOURCE_REDIS_ENDPOINT="${CONTROL_PLANE_REDIS_CONTAINER}:6379"
-    CONTROL_PLANE_BACKUP_EXPECTED_CANDIDATE_IMAGE_DIGEST=$MOCK_IMAGE
+    CONTROL_PLANE_BACKUP_EXPECTED_CANDIDATE_IMAGE_DIGEST=$CONTROL_PLANE_GREEN_IMAGE
     CONTROL_PLANE_BACKUP_EXPECTED_RECIPIENT_FINGERPRINT=0123456789ABCDEF0123456789ABCDEF01234567
     CONTROL_PLANE_BACKUP_EXPECTED_QUIESCE_OPERATOR_SHA256=$(sha256sum "$OPERATOR" | awk '{print $1}')
     CONTROL_PLANE_BACKUP_EXPECTED_RESTORE_TARGET_IDENTITY=restore-host.lab.test
@@ -1134,7 +1142,11 @@ start_lab()
     export LAB_DYNAMIC_DIR LAB_PORT8000_PORT LAB_PORT_CONFIG_DIR LAB_RUNTIME_STATE_DIR
     export LAB_TRAEFIK_PORT LAB_TRAEFIK_STATIC_CONFIG
 
-    printf '%s\n' 'CONTROL_PLANE_BACKEND_PORT=8080' 'HORIZON_ENABLED=true' \
+    printf '%s\n' 'CONTROL_PLANE_BACKEND_PORT=8080' "LAB_EXPECTED_HOST=$CONTROL_PLANE_HOST" \
+        "DB_HOST=$CONTROL_PLANE_DATABASE_CONTAINER" 'DB_PORT=5432' \
+        'DB_DATABASE=postgres' 'DB_USERNAME=postgres' \
+        "REDIS_HOST=$CONTROL_PLANE_REDIS_CONTAINER" 'REDIS_PORT=6379' \
+        'HORIZON_ENABLED=true' \
         'SCHEDULER_ENABLED=true' 'NIGHTWATCH_ENABLED=true' > "$CONTROL_PLANE_SOURCE_ENV_FILE"
     chmod 600 "$CONTROL_PLANE_SOURCE_ENV_FILE"
     printf '%s\n' 'CONTROL_PLANE_BACKEND_PORT=8080' \
@@ -1432,19 +1444,56 @@ cleanup_on_exit()
             printf 'CONTROL_PLANE_BLUE_GREEN_LAB_CLEANUP_FAILURE backup quiesce state was preserved before Docker teardown\n' >&2
         fi
     fi
+    if [ -n "$paused_dependency_container" ]; then
+        docker unpause "$paused_dependency_container" >/dev/null 2>&1 || true
+    fi
     if [ "$exit_status" -ne 0 ]; then
         printf 'CONTROL_PLANE_BLUE_GREEN_LAB_PRESERVED root=%s;project=%s;scenario=%s\n' \
             "$LAB_ROOT" "${project_name:-none}" "${scenario_name:-none}" >&2
     fi
+    docker rm --force "$MOCK_REGISTRY_CONTAINER" >/dev/null 2>&1 || true
     exit "$exit_status"
 }
 
 remove_mock_image()
 {
-    docker image rm "$MOCK_IMAGE" >/dev/null \
-        || fail 'operation-owned mock image could not be removed'
+    docker rm --force "$MOCK_REGISTRY_CONTAINER" >/dev/null 2>&1 || true
+    docker image rm "$MOCK_IMMUTABLE_IMAGE" "$MOCK_REGISTRY_TAG" "$MOCK_IMAGE" \
+        >/dev/null 2>&1 || true
+    ! docker container inspect "$MOCK_REGISTRY_CONTAINER" >/dev/null 2>&1 \
+        || fail 'operation-owned mock registry container remained after removal'
+    ! docker image inspect "$MOCK_IMMUTABLE_IMAGE" >/dev/null 2>&1 \
+        || fail 'operation-owned immutable registry image remained after removal'
     ! docker image inspect "$MOCK_IMAGE" >/dev/null 2>&1 \
         || fail 'operation-owned mock image remained after removal'
+    ! docker image inspect "$MOCK_REGISTRY_TAG" >/dev/null 2>&1 \
+        || fail 'operation-owned registry image tag remained after removal'
+}
+
+publish_mock_image()
+{
+    docker run --detach --pull never --name "$MOCK_REGISTRY_CONTAINER" \
+        --publish 127.0.0.1::5000 "$MOCK_REGISTRY_IMAGE" >/dev/null
+    mock_registry_port=$(docker port "$MOCK_REGISTRY_CONTAINER" 5000/tcp | awk -F: '{print $NF}')
+    printf '%s' "$mock_registry_port" | grep -Eq '^[1-9][0-9]{0,4}$' \
+        || fail 'mock image registry exposed an invalid port'
+    mock_registry_attempt=0
+    until curl --fail --silent --show-error --max-time 2 \
+        "http://127.0.0.1:${mock_registry_port}/v2/" >/dev/null 2>&1
+    do
+        mock_registry_attempt=$((mock_registry_attempt + 1))
+        [ "$mock_registry_attempt" -lt 30 ] || fail 'mock image registry did not become ready'
+        sleep 0.1
+    done
+    MOCK_REGISTRY_TAG="localhost:${mock_registry_port}/control-plane-blue-green-lab:${LAB_INVOCATION_TOKEN}"
+    docker tag "$MOCK_IMAGE" "$MOCK_REGISTRY_TAG"
+    docker push "$MOCK_REGISTRY_TAG" >/dev/null
+    MOCK_IMMUTABLE_IMAGE=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+        "$MOCK_REGISTRY_TAG" | awk -v repository="${MOCK_REGISTRY_TAG%:*}@" \
+        'index($0, repository) == 1 { print; exit }')
+    printf '%s' "$MOCK_IMMUTABLE_IMAGE" \
+        | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/:@-]*@sha256:[a-f0-9]{64}$' \
+        || fail 'mock image registry did not produce an immutable digest reference'
 }
 
 exit_from_signal()
@@ -1599,28 +1648,61 @@ scenario_queue_gate_and_rehearsal()
         psql --username postgres --dbname postgres --command \
             "insert into application_deployment_queues (status, horizon_job_worker) values ('in_progress', 'other-worker');" >/dev/null
     live_insert_id_file="$scenario_directory/live-application-setting-id"
+    live_migration_gate=/lab-state/live-migration-concurrency-gate
+    live_migration_gate_host="$LAB_RUNTIME_STATE_DIR/live-migration-concurrency-gate"
+    rm -f "${live_migration_gate_host}.ready" "${live_migration_gate_host}.release"
     (
+        release_queue_blockers()
+        {
+            docker exec "$CONTROL_PLANE_BLUE_CONTAINER" \
+                /usr/local/bin/control-plane-lab-service set-reserved 0 >/dev/null 2>&1 || true
+            docker exec "$CONTROL_PLANE_DATABASE_CONTAINER" \
+                psql --username postgres --dbname postgres --command \
+                    "delete from application_deployment_queues where horizon_job_worker is not null;" \
+                >/dev/null 2>&1 || true
+        }
+
+        release_concurrency_gate()
+        {
+            touch "${live_migration_gate_host}.release"
+        }
+
+        trap 'release_queue_blockers; release_concurrency_gate' EXIT
+        migration_attempt_state_file="$operation_directory/live-expand-migration-attempts/attempt-1.state"
         running_attempt=0
-        until grep -F -x -q 'phase=live-expand-migrations-running' "$operation_directory/state"; do
+        until grep -F -x -q 'migration_status=running' "$operation_directory/state" \
+            && grep -F -x -q 'migration_attempt=1' "$operation_directory/state" \
+            && grep -F -x -q 'status=planned' "$migration_attempt_state_file" 2>/dev/null
+        do
             running_attempt=$((running_attempt + 1))
-            [ "$running_attempt" -lt 120 ] \
-                || fail 'live migration did not reach its running phase for concurrent write proof'
+            [ "$running_attempt" -lt 300 ] \
+                || fail 'live migration did not persist its planned attempt for concurrent write proof'
             sleep 1
         done
+        release_queue_blockers
+        running_attempt=0
+        until [ -e "${live_migration_gate_host}.ready" ]; do
+            running_attempt=$((running_attempt + 1))
+            [ "$running_attempt" -lt 600 ] \
+                || fail 'live migration runner did not reach its concurrent-write gate'
+            sleep 1
+        done
+        migration_runner_name=$(sed -n 's/^runner_name=//p' "$migration_attempt_state_file")
+        [ "$(docker inspect --format '{{.State.Running}}' "$migration_runner_name")" = true ] \
+            || fail 'live migration runner was not active during the concurrent write proof'
         docker exec "$CONTROL_PLANE_DATABASE_CONTAINER" \
             psql --username postgres --dbname postgres --tuples-only --no-align --command \
                 'INSERT INTO application_settings DEFAULT VALUES RETURNING id;' \
             | sed -n '1p' > "$live_insert_id_file"
-        docker exec "$CONTROL_PLANE_BLUE_CONTAINER" \
-            /usr/local/bin/control-plane-lab-service set-reserved 0
-        docker exec "$CONTROL_PLANE_DATABASE_CONTAINER" \
-            psql --username postgres --dbname postgres --command \
-                "delete from application_deployment_queues where horizon_job_worker is not null;" >/dev/null
+        release_concurrency_gate
+        trap - EXIT
     ) &
     release_pid=$!
     register_worker "$release_pid"
-    operator apply-migrations >/dev/null
+    CONTROL_PLANE_LAB_MIGRATION_GATE_FILE="$live_migration_gate" \
+        operator apply-migrations >/dev/null
     wait_registered_worker "$release_pid"
+    rm -f "${live_migration_gate_host}.ready" "${live_migration_gate_host}.release"
     operation_directory="$CONTROL_PLANE_OPERATOR_STATE_DIR/$CONTROL_PLANE_OPERATION_ID"
     grep -F -x -q 'phase=live-expand-migrations-applied' "$operation_directory/state"
     grep -F -x -q 'migration_status=applied' "$operation_directory/state"
@@ -1736,7 +1818,7 @@ run_restore_rehearsal_hook()
         CONTROL_PLANE_TEST_MODE=1 \
         CONTROL_PLANE_TEST_CRASH_AT="$restore_rehearsal_crash_at" \
         CONTROL_PLANE_OPERATION_ID="$restore_rehearsal_operation_id" \
-        CONTROL_PLANE_CANDIDATE_IMAGE_DIGEST="$MOCK_IMAGE" \
+        CONTROL_PLANE_CANDIDATE_IMAGE_DIGEST="$CONTROL_PLANE_GREEN_IMAGE" \
         CONTROL_PLANE_SOURCE_PG_SYSTEM_IDENTIFIER="$backup_source_system_identifier" \
         CONTROL_PLANE_RESTORE_PG_SYSTEM_IDENTIFIER="$rehearsal_system_identifier" \
         CONTROL_PLANE_RESTORE_DATABASE_CONTAINER="$CONTROL_PLANE_REHEARSAL_DATABASE_CONTAINER" \
@@ -2089,12 +2171,99 @@ scenario_concurrent_operator()
     operator rollback >/dev/null
 }
 
+assert_route_health_dependency_gate()
+{
+    route_health_token=$(cat "$CONTROL_PLANE_GREEN_ROUTE_HEALTH_RUNTIME_FILE")
+    route_health_status=$(docker exec "$CONTROL_PLANE_GREEN_CONTAINER" \
+        curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            --header "Host: $CONTROL_PLANE_HOST" \
+            --header "X-Control-Plane-Route-Health: $route_health_token" \
+            http://127.0.0.1:8080/api/control-plane/route-health)
+    [ "$route_health_status" = 204 ] \
+        || fail 'candidate route health was not ready before dependency-loss proof'
+
+    passive_status=$(docker exec \
+        --env CONTROL_PLANE_MODE=passive \
+        --env REQUEST_METHOD=GET \
+        --env "HTTP_HOST=$CONTROL_PLANE_HOST" \
+        --env "HTTP_X_CONTROL_PLANE_ROUTE_HEALTH=$route_health_token" \
+        "$CONTROL_PLANE_GREEN_CONTAINER" /srv/www/cgi-bin/route-health \
+        | sed -n 's/^Status: \([0-9][0-9][0-9]\).*/\1/p')
+    [ "$passive_status" = 404 ] \
+        || fail 'candidate route health accepted passive mode'
+    full_status=$(docker exec \
+        --env CONTROL_PLANE_STARTUP_MODE=full \
+        --env REQUEST_METHOD=GET \
+        --env "HTTP_HOST=$CONTROL_PLANE_HOST" \
+        --env "HTTP_X_CONTROL_PLANE_ROUTE_HEALTH=$route_health_token" \
+        "$CONTROL_PLANE_GREEN_CONTAINER" /srv/www/cgi-bin/route-health \
+        | sed -n 's/^Status: \([0-9][0-9][0-9]\).*/\1/p')
+    [ "$full_status" = 404 ] \
+        || fail 'candidate route health accepted full startup mode'
+
+    paused_dependency_container=$CONTROL_PLANE_REDIS_CONTAINER
+    docker pause "$CONTROL_PLANE_REDIS_CONTAINER" >/dev/null
+    route_health_command_status=0
+    route_health_status=$(docker exec "$CONTROL_PLANE_GREEN_CONTAINER" \
+        curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            --header "Host: $CONTROL_PLANE_HOST" \
+            --header "X-Control-Plane-Route-Health: $route_health_token" \
+            http://127.0.0.1:8080/api/control-plane/route-health) \
+        || route_health_command_status=$?
+    docker unpause "$CONTROL_PLANE_REDIS_CONTAINER" >/dev/null
+    paused_dependency_container=
+    [ "$route_health_command_status" -eq 0 ] && [ "$route_health_status" = 503 ] \
+        || fail 'candidate route health accepted an unavailable Redis dependency'
+
+    paused_dependency_container=$CONTROL_PLANE_DATABASE_CONTAINER
+    docker pause "$CONTROL_PLANE_DATABASE_CONTAINER" >/dev/null
+    route_health_command_status=0
+    route_health_status=$(docker exec "$CONTROL_PLANE_GREEN_CONTAINER" \
+        curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            --header "Host: $CONTROL_PLANE_HOST" \
+            --header "X-Control-Plane-Route-Health: $route_health_token" \
+            http://127.0.0.1:8080/api/control-plane/route-health) \
+        || route_health_command_status=$?
+    docker unpause "$CONTROL_PLANE_DATABASE_CONTAINER" >/dev/null
+    paused_dependency_container=
+    [ "$route_health_command_status" -eq 0 ] && [ "$route_health_status" = 503 ] \
+        || fail 'candidate route health accepted an unavailable PostgreSQL dependency'
+
+    route_health_attempt=0
+    while :; do
+        route_health_status=$(docker exec "$CONTROL_PLANE_GREEN_CONTAINER" \
+            curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+                --header "Host: $CONTROL_PLANE_HOST" \
+                --header "X-Control-Plane-Route-Health: $route_health_token" \
+                http://127.0.0.1:8080/api/control-plane/route-health)
+        [ "$route_health_status" = 204 ] && break
+        route_health_attempt=$((route_health_attempt + 1))
+        [ "$route_health_attempt" -lt 30 ] \
+            || fail 'candidate route health did not recover after Redis resumed'
+        sleep 0.1
+    done
+}
+
 scenario_router_reload_failure()
 {
     preflight_and_apply_migrations
-    if CONTROL_PLANE_TEST_INVALID_ROUTE=1 "$OPERATOR" cutover >/dev/null 2>&1; then
+    route_health_activation_log="$scenario_directory/route-health-activation.log"
+    if CONTROL_PLANE_TEST_CRASH_AT=after-green-web-activation "$OPERATOR" cutover \
+        > "$route_health_activation_log" 2>&1; then
+        fail 'route-health activation crash injection unexpectedly completed'
+    fi
+    grep -F -x -q 'phase=green-web-activated' \
+        "$CONTROL_PLANE_OPERATOR_STATE_DIR/$CONTROL_PLANE_OPERATION_ID/state" \
+        || fail 'route-health dependency proof did not begin from durable web activation'
+    assert_route_health_dependency_gate
+    router_reload_failure_log="$scenario_directory/router-reload-failure.log"
+    if CONTROL_PLANE_TEST_INVALID_ROUTE=1 "$OPERATOR" cutover \
+        > "$router_reload_failure_log" 2>&1; then
         fail 'cutover accepted a malformed Traefik dynamic file'
     fi
+    grep -F -q 'exact Traefik protected provider API did not prove the managed live route' \
+        "$router_reload_failure_log" \
+        || fail 'malformed route did not reach the live Traefik provider rejection gate'
     wait_for_blue
     operator rollback >/dev/null
 }
@@ -2682,13 +2851,35 @@ scenario_reverse_runtime_fence_rollback()
     docker inspect "$CONTROL_PLANE_REPLACEMENT_BLUE_CONTAINER" >/dev/null \
         || fail 'replacement blue was not present before reverse rollback'
 
+    reverse_abort_crash_log="$scenario_directory/reverse-abort-finalization-crash.log"
     if CONTROL_PLANE_TEST_CRASH_AT=after-reverse-fence-provisioner-finalization \
-        "$OPERATOR" abort-failback >/dev/null 2>&1; then
+        "$OPERATOR" abort-failback > "$reverse_abort_crash_log" 2>&1; then
         fail 'reverse post-fence-abort parent-state crash injection unexpectedly completed'
     fi
-    grep -F -x -q phase=reverse-fence-abort-intent "$operation_directory/state" \
-        || fail 'reverse subordinate abort crash lost its durable parent intent'
+    if ! grep -F -x -q phase=reverse-fence-abort-intent "$operation_directory/state"; then
+        sed -n '1,240p' "$reverse_abort_crash_log" >&2
+        fail 'reverse subordinate abort crash lost its durable parent intent'
+    fi
     "$OPERATOR" abort-failback >/dev/null
+    reverse_port8000_state="$operation_directory/ingress-port8000-rev01/state"
+    reverse_restored_green_ack=$(cat "$CONTROL_PLANE_GREEN_APPLIED_ACK_FILE")
+    if ! {
+        grep -F -x -q 'phase=restored' "$reverse_port8000_state" \
+            && grep -F -x -q 'color=green' "$reverse_port8000_state" \
+            && grep -F -x -q 'owner=permanent-b' "$reverse_port8000_state" \
+            && grep -F -x -q "backend=$CONTROL_PLANE_GREEN_CONTAINER" \
+                "$reverse_port8000_state" \
+            && grep -F -x -q "ack=$reverse_restored_green_ack" \
+                "$reverse_port8000_state" \
+            && grep -F -x -q 'color=green' "$CONTROL_PLANE_LAB_PORT_CONFIG" \
+            && grep -F -x -q 'owner=permanent-b' "$CONTROL_PLANE_LAB_PORT_CONFIG" \
+            && grep -F -x -q "backend=$CONTROL_PLANE_GREEN_CONTAINER" \
+                "$CONTROL_PLANE_LAB_PORT_CONFIG" \
+            && grep -F -x -q "ack=$reverse_restored_green_ack" \
+                "$CONTROL_PLANE_LAB_PORT_CONFIG"
+    }; then
+        fail 'reverse :8000 restore did not preserve the exact green incumbent route'
+    fi
     grep -F -x -q 'phase=green-writer-promoted' "$operation_directory/state"
     ingress_https_url="http://127.0.0.1:${LAB_TRAEFIK_PORT}/cgi-bin/request"
     ingress_port8000_url="http://127.0.0.1:${LAB_PORT8000_PORT}/cgi-bin/request"
@@ -2710,12 +2901,16 @@ scenario_reverse_runtime_fence_rollback()
             "$operation_directory/runtime-fence-rev01-port8000-ack" \
             | sha256sum | awk '{print $1}'
     )
+    reverse_generation_allocation_log="$scenario_directory/reverse-generation-allocation-crash.log"
     if CONTROL_PLANE_TEST_CRASH_AT=after-reverse-fence-generation-allocation \
-        "$OPERATOR" rollback >/dev/null 2>&1; then
+        "$OPERATOR" rollback > "$reverse_generation_allocation_log" 2>&1; then
         fail 'reverse generation-allocation crash injection unexpectedly completed'
     fi
-    grep -F -x -q 'phase=reverse-fence-artifacts-preparing' "$operation_directory/state" \
-        || fail 'fresh reverse failback did not durably reserve its artifact generation'
+    if ! grep -F -x -q 'phase=reverse-fence-artifacts-preparing' \
+        "$operation_directory/state"; then
+        sed -n '1,240p' "$reverse_generation_allocation_log" >&2
+        fail 'fresh reverse failback did not durably reserve its artifact generation'
+    fi
     grep -F -x -q 'reverse_fence_generation=2' "$operation_directory/state" \
         || fail 'fresh reverse failback did not advance monotonically to generation 2'
     grep -F -x -q "reverse_fence_operation_id=${CONTROL_PLANE_OPERATION_ID}.rev02" \
@@ -3283,10 +3478,14 @@ scenario_continuous_forward_reverse_availability()
 {
     preflight_and_apply_migrations
     start_availability_monitor
+    availability_https_crash_log="$scenario_directory/availability-https-crash.log"
     if CONTROL_PLANE_TEST_CRASH_AT=after-green-https-route \
-        "$OPERATOR" cutover >/dev/null 2>&1; then
+        "$OPERATOR" cutover > "$availability_https_crash_log" 2>&1; then
         fail 'availability HTTPS-route crash injection unexpectedly completed'
     fi
+    grep -F -x -q 'phase=green-https-routed' \
+        "$CONTROL_PLANE_OPERATOR_STATE_DIR/$CONTROL_PLANE_OPERATION_ID/state" \
+        || fail 'availability HTTPS-route crash injection did not persist the exact routed phase'
     operator cutover >/dev/null
     if CONTROL_PLANE_TEST_CRASH_AT=after-green-final-ingress-ack \
         "$OPERATOR" promote >/dev/null 2>&1; then
@@ -3297,9 +3496,15 @@ scenario_continuous_forward_reverse_availability()
         fail 'availability green-marker crash injection unexpectedly completed'
     fi
     operator recover-forward >/dev/null
+    availability_reverse_https_crash_log="$scenario_directory/availability-reverse-https-crash.log"
     if CONTROL_PLANE_TEST_CRASH_AT=after-failback-blue-https-route \
-        "$OPERATOR" rollback >/dev/null 2>&1; then
+        "$OPERATOR" rollback > "$availability_reverse_https_crash_log" 2>&1; then
         fail 'availability reverse HTTPS-route crash injection unexpectedly completed'
+    fi
+    if ! grep -F -x -q 'phase=failback-blue-https-routed' \
+        "$CONTROL_PLANE_OPERATOR_STATE_DIR/$CONTROL_PLANE_OPERATION_ID/state"; then
+        sed -n '1,240p' "$availability_reverse_https_crash_log" >&2
+        fail 'availability reverse HTTPS-route crash injection did not persist the exact routed phase'
     fi
     operator rollback >/dev/null
     stop_and_assert_availability_monitor
@@ -4605,14 +4810,17 @@ main()
         "$LAB_DIRECTORY/mock-control-plane/lab-service.sh" \
         "$LAB_DIRECTORY/mock-control-plane/probe.sh" \
         "$LAB_DIRECTORY/mock-control-plane/rehearse-migration.sh" \
-        "$LAB_DIRECTORY/mock-control-plane/request.sh"
+        "$LAB_DIRECTORY/mock-control-plane/request.sh" \
+        "$LAB_DIRECTORY/mock-control-plane/route-health.sh"
     shellcheck --shell=sh "$LAB_DIRECTORY/mock-control-plane/systemctl"
     shellcheck --shell=bash \
         "$REPOSITORY_ROOT/docker/control-plane-blue-green/backup-quiesce/install-host-prerequisites.sh"
     assert_backup_quiesce_source_pins
     "$LAB_DIRECTORY/entrypoint-runtime-contract-test.sh"
     prepare_mock_image_context
+    docker pull "$MOCK_REGISTRY_IMAGE" >/dev/null
     docker build --tag "$MOCK_IMAGE" "$mock_image_context" >/dev/null
+    publish_mock_image
     CONTROL_PLANE_BLUE_GREEN_SIMULATION_IMAGE=$MOCK_IMAGE \
         "$LAB_DIRECTORY/mock-control-plane-artisan-contract-test.sh"
     horizon_behavior_output=$(docker run --rm --network none \

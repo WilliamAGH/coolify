@@ -81,21 +81,32 @@ wait_for_expected_artisan()
             service_pid=$(/command/s6-svstat -o pid "/run/service/$service_name")
             if tr '\000' '\n' < "/proc/$service_pid/cmdline" | awk \
                 -v expected_artisan_command="$artisan_command" '
-                    BEGIN { valid = 1 }
+                    BEGIN { valid = 1; repeated_argv0 = 0; artisan = 0; command = 0 }
                     NR == 1 {
                         if ($0 != "php" && $0 !~ /(^|\/)php$/) valid = 0
                         next
                     }
                     NR == 2 {
-                        if ($0 != "artisan") valid = 0
+                        if ($0 == "artisan") artisan = 1
+                        else if ($0 == "php") repeated_argv0 = 1
+                        else valid = 0
                         next
                     }
                     NR == 3 {
-                        if ($0 != expected_artisan_command) valid = 0
+                        if (repeated_argv0) {
+                            if ($0 != "artisan") valid = 0
+                            else artisan = 1
+                        } else if ($0 == expected_artisan_command) command = 1
+                        else valid = 0
+                        next
+                    }
+                    NR == 4 {
+                        if (!repeated_argv0 || $0 != expected_artisan_command) valid = 0
+                        else command = 1
                         next
                     }
                     { valid = 0 }
-                    END { exit !(valid && NR == 3) }
+                    END { exit !(valid && artisan && command && (NR == 3 || NR == 4)) }
                 '; then
                 printf '%s\n' "$service_pid"
                 return 0
@@ -105,6 +116,9 @@ wait_for_expected_artisan()
         sleep 0.1
     done
 
+    [ ! -r /tmp/s6-svscan.log ] || cat /tmp/s6-svscan.log >&2
+    [ ! -r "$test_directory/$service_name.log" ] \
+        || cat "$test_directory/$service_name.log" >&2
     fail "expected Artisan command did not start: $service_name"
 }
 
@@ -117,17 +131,24 @@ wait_for_supervised_sleeper()
         if [ "$(/command/s6-svstat -o up "/run/service/$service_name" 2>/dev/null || true)" = true ]; then
             service_pid=$(/command/s6-svstat -o pid "/run/service/$service_name")
             if tr '\000' '\n' < "/proc/$service_pid/cmdline" | awk '
-                BEGIN { valid = 1 }
+                BEGIN { valid = 1; duration = 0; repeated_argv0 = 0 }
                 NR == 1 {
                     if ($0 !~ /(^|\/)sleep$/) valid = 0
                     next
                 }
                 NR == 2 {
-                    if ($0 != "infinity") valid = 0
+                    if ($0 == "infinity") duration = 1
+                    else if ($0 == "sleep") repeated_argv0 = 1
+                    else valid = 0
+                    next
+                }
+                NR == 3 {
+                    if (!repeated_argv0 || $0 != "infinity") valid = 0
+                    else duration = 1
                     next
                 }
                 { valid = 0 }
-                END { exit !(valid && NR == 2) }
+                END { exit !(valid && duration && (NR == 2 || NR == 3)) }
             '; then
                 return 0
             fi
@@ -136,6 +157,9 @@ wait_for_supervised_sleeper()
         sleep 0.1
     done
 
+    [ ! -r /tmp/s6-svscan.log ] || cat /tmp/s6-svscan.log >&2
+    [ ! -r "$test_directory/$service_name.log" ] \
+        || cat "$test_directory/$service_name.log" >&2
     fail "fenced sleeper did not start: $service_name"
 }
 
@@ -162,10 +186,21 @@ wait_for_unknown_process()
         if [ "$(/command/s6-svstat -o up "/run/service/$service_name" 2>/dev/null || true)" = true ]; then
             service_pid=$(/command/s6-svstat -o pid "/run/service/$service_name")
             if tr '\000' '\n' < "/proc/$service_pid/cmdline" 2>/dev/null | awk '
+                BEGIN { valid = 1; duration = 0; repeated_argv0 = 0 }
                 NR == 1 { valid = ($0 ~ /(^|\/)sleep$/); next }
-                NR == 2 { valid = valid && ($0 == "123"); next }
+                NR == 2 {
+                    if ($0 == "123") duration = 1
+                    else if ($0 == "sleep") repeated_argv0 = 1
+                    else valid = 0
+                    next
+                }
+                NR == 3 {
+                    if (!repeated_argv0 || $0 != "123") valid = 0
+                    else duration = 1
+                    next
+                }
                 { valid = 0 }
-                END { exit !(valid && NR == 2) }
+                END { exit !(valid && duration && (NR == 2 || NR == 3)) }
             '; then
                 printf '%s\n' "$service_pid"
                 return 0
@@ -182,9 +217,19 @@ assert_no_writer_artisan()
     for process_path in /proc/[0-9]*; do
         [ -r "$process_path/cmdline" ] || continue
         if { tr '\000' '\n' < "$process_path/cmdline"; } 2>/dev/null | awk '
-            NR == 1 { php = ($0 ~ /(^|\/)php$/); next }
-            NR == 2 { artisan = ($0 == "artisan"); next }
-            END { exit !(php && artisan && NR >= 2) }
+            BEGIN { valid = 1; repeated_argv0 = 0; artisan = 0 }
+            NR == 1 { valid = ($0 ~ /(^|\/)php$/); next }
+            NR == 2 {
+                if ($0 == "artisan") artisan = 1
+                else if ($0 == "php") repeated_argv0 = 1
+                else valid = 0
+                next
+            }
+            NR == 3 && repeated_argv0 {
+                if ($0 == "artisan") artisan = 1
+                else valid = 0
+            }
+            END { exit !(valid && artisan) }
         '; then
             fail "writer Artisan remained after promotion failure: ${process_path##*/}"
         fi

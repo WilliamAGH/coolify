@@ -32,7 +32,7 @@ services:
   # from blue to green and deliberately uses the same immutable green image.
   live-expand-migrations:
     image: "${CONTROL_PLANE_GREEN_IMAGE:?CONTROL_PLANE_GREEN_IMAGE must be an immutable digest reference}"
-    container_name: "${CONTROL_PLANE_MIGRATION_RUNNER_NAME:?CONTROL_PLANE_MIGRATION_RUNNER_NAME is required}"
+    container_name: "${CONTROL_PLANE_MIGRATION_RUNNER_NAME:-coolify-control-plane-unused-live-expand}"
     restart: "no"
     env_file:
       - "${CONTROL_PLANE_RUNTIME_ENV_FILE:?CONTROL_PLANE_RUNTIME_ENV_FILE is required}"
@@ -47,10 +47,10 @@ services:
       CONTROL_PLANE_EXPECTED_MIGRATION_BATCH: "${CONTROL_PLANE_EXPECTED_MIGRATION_BATCH:?CONTROL_PLANE_EXPECTED_MIGRATION_BATCH is required}"
       CONTROL_PLANE_MIGRATION_LOCK_TIMEOUT: "${CONTROL_PLANE_MIGRATION_LOCK_TIMEOUT:?CONTROL_PLANE_MIGRATION_LOCK_TIMEOUT is required}"
       CONTROL_PLANE_MIGRATION_STATEMENT_TIMEOUT: "${CONTROL_PLANE_MIGRATION_STATEMENT_TIMEOUT:?CONTROL_PLANE_MIGRATION_STATEMENT_TIMEOUT is required}"
-      CONTROL_PLANE_MIGRATION_OPERATION_ID: "${CONTROL_PLANE_MIGRATION_OPERATION_ID:?CONTROL_PLANE_MIGRATION_OPERATION_ID is required}"
-      CONTROL_PLANE_MIGRATION_ATTEMPT: "${CONTROL_PLANE_MIGRATION_ATTEMPT:?CONTROL_PLANE_MIGRATION_ATTEMPT is required}"
-      CONTROL_PLANE_MIGRATION_APPLICATION_NAME: "${CONTROL_PLANE_MIGRATION_APPLICATION_NAME:?CONTROL_PLANE_MIGRATION_APPLICATION_NAME is required}"
-      CONTROL_PLANE_MIGRATION_ATTEMPT_LOCK_IDENTITY: "${CONTROL_PLANE_MIGRATION_ATTEMPT_LOCK_IDENTITY:?CONTROL_PLANE_MIGRATION_ATTEMPT_LOCK_IDENTITY is required}"
+      CONTROL_PLANE_MIGRATION_OPERATION_ID: "${CONTROL_PLANE_MIGRATION_OPERATION_ID:-unused}"
+      CONTROL_PLANE_MIGRATION_ATTEMPT: "${CONTROL_PLANE_MIGRATION_ATTEMPT:-unused}"
+      CONTROL_PLANE_MIGRATION_APPLICATION_NAME: "${CONTROL_PLANE_MIGRATION_APPLICATION_NAME:-unused}"
+      CONTROL_PLANE_MIGRATION_ATTEMPT_LOCK_IDENTITY: "${CONTROL_PLANE_MIGRATION_ATTEMPT_LOCK_IDENTITY:-unused}"
       AUTORUN_ENABLED: "false"
       INIT_ENABLED: "false"
       SEEDER_ENABLED: "false"
@@ -58,10 +58,10 @@ services:
       SCHEDULER_ENABLED: "false"
       NIGHTWATCH_ENABLED: "false"
     labels:
-      io.coolify.control-plane.operation-id: "${CONTROL_PLANE_MIGRATION_OPERATION_ID}"
-      io.coolify.control-plane.migration-attempt: "${CONTROL_PLANE_MIGRATION_ATTEMPT}"
-      io.coolify.control-plane.pg-application-name: "${CONTROL_PLANE_MIGRATION_APPLICATION_NAME}"
-      io.coolify.control-plane.migration-attempt-lock: "${CONTROL_PLANE_MIGRATION_ATTEMPT_LOCK_IDENTITY}"
+      io.coolify.control-plane.operation-id: "${CONTROL_PLANE_MIGRATION_OPERATION_ID:-unused}"
+      io.coolify.control-plane.migration-attempt: "${CONTROL_PLANE_MIGRATION_ATTEMPT:-unused}"
+      io.coolify.control-plane.pg-application-name: "${CONTROL_PLANE_MIGRATION_APPLICATION_NAME:-unused}"
+      io.coolify.control-plane.migration-attempt-lock: "${CONTROL_PLANE_MIGRATION_ATTEMPT_LOCK_IDENTITY:-unused}"
     entrypoint: ["/bin/sh", "-ec"]
     command: |
       exec env PGOPTIONS="-c lock_timeout=$${CONTROL_PLANE_MIGRATION_LOCK_TIMEOUT} -c statement_timeout=$${CONTROL_PLANE_MIGRATION_STATEMENT_TIMEOUT}" php artisan start:migration --control-plane-expand

@@ -5872,6 +5872,28 @@ routed_phase_requires_post_revoke()
     return 1
 }
 
+routed_green_is_reverse_incumbent()
+{
+    case "$routed_color:$state_phase" in
+        green:reverse-fence-armed|green:reverse-fence-active|green:failback-*|\
+        green:reverse-rollback-*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+routed_green_reverse_fence_is_transitioning()
+{
+    case "$routed_color:$state_phase" in
+        green:reverse-fence-prepare-intent|green:reverse-fence-prepared|\
+        green:reverse-fence-captured)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
 reconcile_irreversible_revocation_phase()
 {
     case "$state_phase" in
@@ -5965,7 +5987,13 @@ routed_phase_allows_released_fence()
 routed_candidate_fence_phase()
 {
     case "$routed_color" in
-        green) routed_fence_status=$(runtime_fence_call status) ;;
+        green)
+            if routed_green_is_reverse_incumbent; then
+                routed_fence_status=$(reverse_runtime_fence_call status)
+            else
+                routed_fence_status=$(runtime_fence_call status)
+            fi
+            ;;
         blue) routed_fence_status=$(reverse_runtime_fence_call status) ;;
     esac
     routed_fence_phase=$(printf '%s\n' "$routed_fence_status" \
@@ -5975,31 +6003,45 @@ routed_candidate_fence_phase()
 
 verify_routed_candidate_fence()
 {
+    routed_green_reverse_fence_is_transitioning && return
     routed_candidate_fence_phase
+    if routed_green_is_reverse_incumbent; then
+        [ "$routed_fence_phase" = active ] \
+            || fail 'reverse fence is not active while green remains the routed incumbent'
+        reverse_runtime_fence_call verify
+        return
+    fi
     case "$routed_fence_phase" in
         active)
-            case "$routed_color" in
-                green)
-                    runtime_fence_call repin-pool "$state_green_id" "$state_green_web_b_id"
-                    ;;
-                blue)
-                    reverse_runtime_fence_call repin-pool "$state_replacement_blue_id" \
-                        "$state_replacement_blue_web_b_id"
-                    ;;
-            esac
             if routed_phase_requires_post_revoke; then
                 case "$routed_color" in
-                    green) runtime_fence_call verify-post-revoke ;;
-                    blue) reverse_runtime_fence_call verify-post-revoke ;;
+                    green)
+                        runtime_fence_call repin-pool "$state_green_id" \
+                            "$state_green_web_b_id"
+                        runtime_fence_call verify-post-revoke
+                        ;;
+                    blue)
+                        reverse_runtime_fence_call repin-pool "$state_replacement_blue_id" \
+                            "$state_replacement_blue_web_b_id"
+                        reverse_runtime_fence_call verify-post-revoke
+                        ;;
                 esac
             else
                 case "$routed_color" in
-                    green) runtime_fence_call verify ;;
-                    blue) reverse_runtime_fence_call verify ;;
+                    green)
+                        runtime_fence_call repin-pool "$state_green_id" \
+                            "$state_green_web_b_id"
+                        runtime_fence_call verify
+                        ;;
+                    blue)
+                        reverse_runtime_fence_call repin-pool "$state_replacement_blue_id" \
+                            "$state_replacement_blue_web_b_id"
+                        reverse_runtime_fence_call verify
+                        ;;
                 esac
             fi
             ;;
-        released)
+        released|finalized)
             routed_phase_allows_released_fence \
                 || fail "$routed_color candidate fence released before the operator release phase"
             case "$routed_color" in
@@ -6020,6 +6062,18 @@ verify_routed_candidate_fence()
             case "$routed_color" in
                 green) runtime_fence_call verify-released ;;
                 blue) reverse_runtime_fence_call verify-released ;;
+            esac
+            ;;
+        aborted)
+            case "$routed_color:$state_phase:$state_reverse_fence_generation" in
+                green:green-writer-promoted:none|green:reverse-fence-artifacts-preparing:none)
+                    fail 'green routed candidate has no reverse generation for an aborted fence'
+                    ;;
+                green:green-writer-promoted:*|green:reverse-fence-artifacts-preparing:*)
+                    ;;
+                *)
+                    fail "$routed_color routed candidate fence is aborted outside a terminal reverse rollback"
+                    ;;
             esac
             ;;
         *)
@@ -6118,7 +6172,13 @@ routed_recovery_provider_expectation()
 
 routed_runtime_fence_is_current()
 {
+    routed_green_reverse_fence_is_transitioning && return
     routed_candidate_fence_phase
+    if routed_green_is_reverse_incumbent; then
+        [ "$routed_fence_phase" = active ] || return 1
+        reverse_runtime_fence_call verify
+        return
+    fi
     case "$routed_fence_phase" in
         active)
             if routed_phase_requires_post_revoke; then
@@ -6133,7 +6193,7 @@ routed_runtime_fence_is_current()
                 esac
             fi
             ;;
-        released)
+        released|finalized)
             routed_phase_allows_released_fence || return 1
             case "$routed_color" in
                 green) runtime_fence_call verify-released ;;
@@ -6145,6 +6205,16 @@ routed_runtime_fence_is_current()
             case "$routed_color" in
                 green) runtime_fence_call release ;;
                 blue) reverse_runtime_fence_call release ;;
+            esac
+            ;;
+        aborted)
+            case "$routed_color:$state_phase:$state_reverse_fence_generation" in
+                green:green-writer-promoted:none|green:reverse-fence-artifacts-preparing:none)
+                    return 1
+                    ;;
+                green:green-writer-promoted:*|green:reverse-fence-artifacts-preparing:*)
+                    ;;
+                *) return 1 ;;
             esac
             ;;
         *)
@@ -6677,14 +6747,10 @@ assert_pool_member_runtime()
             and $bindings[$port][0].HostIp == "127.0.0.1"
             and $bindings[$port][0].HostPort == $host_port
         ' >/dev/null || fail "$expected_color $expected_role loopback port ownership differs"
-    docker inspect "$container_name" \
-        | jq --exit-status --arg health_url "http://127.0.0.1:${backend_port}${direct_probe_path}" \
-            --arg token_path /run/secrets/control-plane-direct-probe-token '
-            .[0].Config.Healthcheck.Test[0] == "CMD-SHELL"
-            and (.[0].Config.Healthcheck.Test[1] | contains($health_url))
-            and (.[0].Config.Healthcheck.Test[1] | contains($token_path))
-            and (.[0].Config.Healthcheck.Test[1] | contains("/api/health") | not)
-        ' >/dev/null || fail "$expected_color $expected_role readiness healthcheck differs"
+    docker inspect "$container_name" | jq --exit-status '
+        .[0].Config.Healthcheck.Test
+            == ["CMD", "/usr/local/bin/control-plane-direct-probe-healthcheck"]
+    ' >/dev/null || fail "$expected_color $expected_role readiness healthcheck differs"
     prove_candidate_background_services_down "$container_name"
     [ "$(container_image_reference "$container_name")" = "$expected_plan_image_reference" ] \
         && [ "$(container_image_id "$container_name")" = "$expected_plan_image_id" ] \
@@ -6912,24 +6978,29 @@ assert_replacement_blue_capability()
         --env CONTROL_PLANE_WRITER_MARKER_PATH="$WRITER_MARKER_PATH" \
         --env "CONTROL_PLANE_WEB_EPOCH=$blue_web_epoch" \
         --env CONTROL_PLANE_WEB_MARKER_PATH="$WEB_MARKER_PATH" \
+        --env CONTROL_PLANE_MUTATION_LEASE_PATH="$MUTATION_LEASE_PATH" \
         --env CONTROL_PLANE_WEB_ACTIVATION_CONFIRM=route-switch-pending \
         --entrypoint /bin/sh "$blue_image" -ec '
             state=/var/lib/coolify-control-plane
+            private=${CONTROL_PLANE_WEB_MARKER_PATH%/*}
+            coordination=${CONTROL_PLANE_MUTATION_LEASE_PATH%/*}
             chown 0:9999 "$state"
             chmod 0750 "$state"
-            install -m 0660 -o root -g 9999 /dev/null "$state/mutation-inflight.lock"
-            printf %s "$CONTROL_PLANE_WEB_EPOCH" > "$state/web-epoch"
-            chown 0:9999 "$state/web-epoch"
-            chmod 0440 "$state/web-epoch"
-            sync "$state/web-epoch"
-            sync "$state"
-            test "$(stat -c %u:%g:%a "$state")" = 0:9999:750
-            test "$(stat -c %u:%g:%a "$state/mutation-inflight.lock")" = 0:9999:660
-            test "$(stat -c %u:%g:%a "$state/web-epoch")" = 0:9999:440
+            install -d -m 0750 -o root -g 9999 "$private" "$coordination"
+            install -m 0660 -o root -g 9999 /dev/null "$CONTROL_PLANE_MUTATION_LEASE_PATH"
+            printf %s "$CONTROL_PLANE_WEB_EPOCH" > "$CONTROL_PLANE_WEB_MARKER_PATH"
+            chown 0:9999 "$CONTROL_PLANE_WEB_MARKER_PATH"
+            chmod 0440 "$CONTROL_PLANE_WEB_MARKER_PATH"
+            sync "$CONTROL_PLANE_WEB_MARKER_PATH"
+            sync "$private" "$coordination" "$state"
+            test "$(stat -c %u:%g:%a "$private")" = 0:9999:750
+            test "$(stat -c %u:%g:%a "$coordination")" = 0:9999:750
+            test "$(stat -c %u:%g:%a "$CONTROL_PLANE_MUTATION_LEASE_PATH")" = 0:9999:660
+            test "$(stat -c %u:%g:%a "$CONTROL_PLANE_WEB_MARKER_PATH")" = 0:9999:440
             test "$(su-exec 9999:9999 /usr/local/bin/coolify-entrypoint startup-mode)" = web-only
             su-exec 9999:9999 /usr/local/bin/coolify-entrypoint activate-web >/dev/null
             su-exec 9999:9999 /usr/local/bin/coolify-entrypoint web-activated
-            test ! -e /var/lib/coolify-control-plane/writer-epoch
+            test ! -e "$CONTROL_PLANE_WRITER_MARKER_PATH"
         ' || capability_status=$?
     docker rm --force "$capability_container" >/dev/null 2>&1 || true
     [ "$capability_status" -eq 0 ] \
@@ -7075,6 +7146,11 @@ ingress_controller_call()
             ingress_pool_plan_sha256=$state_forward_pool_plan_sha256
             ingress_operation_id=$state_runtime_fence_operation_id
             ingress_operation_directory="$operation_directory/ingress-$ingress_name"
+            ingress_predecessor_operation_id=
+            ingress_predecessor_manifest_sha256=
+            ingress_predecessor_pool_plan_sha256=
+            ingress_predecessor_color=
+            ingress_predecessor_generation=
             ;;
         blue)
             ingress_generation=$state_reverse_fence_generation
@@ -7084,6 +7160,11 @@ ingress_controller_call()
             ingress_pool_plan_sha256=$state_reverse_pool_plan_sha256
             ingress_operation_id=$state_reverse_fence_operation_id
             ingress_operation_directory="$operation_directory/ingress-$ingress_name-$reverse_generation_token"
+            ingress_predecessor_operation_id=$state_runtime_fence_operation_id
+            ingress_predecessor_manifest_sha256=$state_forward_ingress_pool_sha256
+            ingress_predecessor_pool_plan_sha256=$state_forward_pool_plan_sha256
+            ingress_predecessor_color=green
+            ingress_predecessor_generation=$forward_pool_generation
             ;;
         legacy)
             ingress_generation=
@@ -7091,8 +7172,14 @@ ingress_controller_call()
             ingress_pool_manifest_sha256=
             ingress_pool_plan=
             ingress_pool_plan_sha256=
-            ingress_operation_id=$operation_id
+            ingress_operation_id=${state_runtime_fence_operation_id:-$operation_id}
+            [ "$ingress_operation_id" != none ] || ingress_operation_id=$operation_id
             ingress_operation_directory="$operation_directory/ingress-$ingress_name"
+            ingress_predecessor_operation_id=
+            ingress_predecessor_manifest_sha256=
+            ingress_predecessor_pool_plan_sha256=
+            ingress_predecessor_color=
+            ingress_predecessor_generation=
             ;;
         *) fail "unknown ingress pool color: $ingress_color" ;;
     esac
@@ -7113,6 +7200,11 @@ ingress_controller_call()
     CONTROL_PLANE_INGRESS_POOL_MANIFEST_SHA256="$ingress_pool_manifest_sha256" \
     CONTROL_PLANE_INGRESS_POOL_PLAN_MANIFEST="$ingress_pool_plan" \
     CONTROL_PLANE_INGRESS_POOL_PLAN_MANIFEST_SHA256="$ingress_pool_plan_sha256" \
+    CONTROL_PLANE_INGRESS_PREDECESSOR_OPERATION_ID="$ingress_predecessor_operation_id" \
+    CONTROL_PLANE_INGRESS_PREDECESSOR_MANIFEST_SHA256="$ingress_predecessor_manifest_sha256" \
+    CONTROL_PLANE_INGRESS_PREDECESSOR_POOL_PLAN_SHA256="$ingress_predecessor_pool_plan_sha256" \
+    CONTROL_PLANE_INGRESS_PREDECESSOR_COLOR="$ingress_predecessor_color" \
+    CONTROL_PLANE_INGRESS_PREDECESSOR_GENERATION="$ingress_predecessor_generation" \
     CONTROL_PLANE_INGRESS_DRAIN_MEMBER="$ingress_drain_member" \
     CONTROL_PLANE_INGRESS_OPERATION_DIR="$ingress_operation_directory" \
     CONTROL_PLANE_INGRESS_PUBLIC_URL="$ingress_public_url" \
@@ -7127,6 +7219,7 @@ ingress_controller_call()
     CONTROL_PLANE_INGRESS_TRAEFIK_CERT_RESOLVER="$traefik_cert_resolver" \
     CONTROL_PLANE_INGRESS_TRAEFIK_ROUTER_PRIORITY="$traefik_router_priority" \
     CONTROL_PLANE_INGRESS_TEST_MODE="$test_mode" \
+    CONTROL_PLANE_INGRESS_TEST_INVALID_ROUTE="${CONTROL_PLANE_TEST_INVALID_ROUTE:-0}" \
     CONTROL_PLANE_INGRESS_TARGET="$operator_target" \
     CONTROL_PLANE_INGRESS_EXPECTED_IPV4="$expected_public_ipv4" \
     CONTROL_PLANE_INGRESS_BOOTSTRAP_PORT="$port8000_bootstrap_port" \
@@ -7146,11 +7239,30 @@ ingress_controller_call()
     "$controller" "$ingress_action"
 }
 
-assert_pooled_ingress_capabilities()
+assert_ingress_v2_capability_for_target()
 {
     assert_release_asset_identity https-controller
     assert_release_asset_identity port8000-controller
-    for capability_controller in "$https_controller" "$port8000_controller"; do
+    set -- "$https_controller"
+    case "$operator_target" in
+        production)
+            set -- "$@" "$port8000_controller"
+            ;;
+        lab)
+            # The lab adapter proves v2 artifact binding and single-target route continuity.
+            # HAProxy two-member balancing and drain remain production-controller contracts.
+            if ! { grep -Fq 'CONTROL_PLANE_LAB_PORT8000_V2_SINGLE_TARGET_ADAPTER=1' \
+                    "$port8000_controller" \
+                && grep -Fq 'CONTROL_PLANE_INGRESS_POOL_MANIFEST' \
+                    "$port8000_controller" \
+                && grep -Fq 'CONTROL_PLANE_INGRESS_POOL_PLAN_MANIFEST' \
+                    "$port8000_controller"; }; then
+                fail 'pinned lab :8000 controller lacks the v2 single-target adapter contract'
+            fi
+            ;;
+        *) fail "unknown ingress capability target: $operator_target" ;;
+    esac
+    for capability_controller in "$@"; do
         if ! grep -Fq 'CONTROL_PLANE_INGRESS_POOL_MANIFEST' "$capability_controller" \
             || ! grep -Fq 'CONTROL_PLANE_INGRESS_POOL_PLAN_MANIFEST' "$capability_controller" \
             || ! grep -Fq 'CONTROL_PLANE_INGRESS_DRAIN_MEMBER' "$capability_controller" \
@@ -7268,6 +7380,9 @@ ingress_controller_restore_reverse_generation()
     reverse_restore_ack=$4
     ingress_controller_call "$reverse_restore_name" restore blue \
         "$reverse_restore_backend" "$reverse_restore_port" "$reverse_restore_ack"
+    [ "$reverse_restore_name" != https ] \
+        || ingress_controller_call "$reverse_restore_name" ack blue \
+            "$reverse_restore_backend" "$reverse_restore_port" "$reverse_restore_ack"
 }
 
 ingress_controller_legacy_restore_status()
@@ -10790,7 +10905,7 @@ load_configuration()
     control_plane_host=${CONTROL_PLANE_HOST:-coolify.iocloudhost.net}
     traefik_entrypoint=${CONTROL_PLANE_TRAEFIK_ENTRYPOINT:-https}
     traefik_tls=${CONTROL_PLANE_TRAEFIK_TLS:-true}
-    traefik_cert_resolver=${CONTROL_PLANE_TRAEFIK_CERT_RESOLVER:-letsencrypt}
+    traefik_cert_resolver=${CONTROL_PLANE_TRAEFIK_CERT_RESOLVER:-}
     traefik_router_priority=${CONTROL_PLANE_TRAEFIK_ROUTER_PRIORITY:-100000}
     backend_port=${CONTROL_PLANE_BACKEND_PORT:-8080}
     direct_probe_path=${CONTROL_PLANE_DIRECT_PROBE_PATH:-/api/control-plane/probe}
@@ -11075,7 +11190,10 @@ load_configuration()
             ;;
     esac
     if [ "$traefik_tls" = true ]; then
+        traefik_cert_resolver=${traefik_cert_resolver:-letsencrypt}
         validate_identifier "$traefik_cert_resolver" CONTROL_PLANE_TRAEFIK_CERT_RESOLVER
+    elif [ -n "$traefik_cert_resolver" ]; then
+        fail 'CONTROL_PLANE_TRAEFIK_CERT_RESOLVER must be empty when TLS is disabled'
     fi
     validate_positive_integer "$traefik_router_priority" CONTROL_PLANE_TRAEFIK_ROUTER_PRIORITY
     validate_port "$backend_port" CONTROL_PLANE_BACKEND_PORT
@@ -12183,7 +12301,7 @@ controlled_failback_to_blue()
             assert_container_absent "$blue_container"
             assert_container_absent "$replacement_blue_container"
             assert_container_absent "$replacement_blue_web_b_container"
-            assert_pooled_ingress_capabilities
+            assert_ingress_v2_capability_for_target
             allocate_reverse_runtime_fence_generation
             ;;
     esac
@@ -12198,7 +12316,7 @@ controlled_failback_to_blue()
             assert_container_absent "$blue_container"
             assert_container_absent "$replacement_blue_container"
             assert_container_absent "$replacement_blue_web_b_container"
-            assert_pooled_ingress_capabilities
+            assert_ingress_v2_capability_for_target
             assert_fresh_marker_volume "$blue_state_volume" blue-web-a "$blue_writer_epoch"
             assert_fresh_marker_volume "$blue_state_volume" blue "$blue_web_epoch" web-epoch
             assert_fresh_marker_volume "$blue_state_volume" blue-web-a \

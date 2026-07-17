@@ -11,6 +11,17 @@ mutation_lease_acquired=0
 request_method=${REQUEST_METHOD:-GET}
 expected_host=${LAB_EXPECTED_HOST:-}
 
+marker_matches()
+{
+    marker_path=$1
+    expected_epoch=$2
+
+    [ -n "$expected_epoch" ] \
+        && [ -f "$marker_path" ] \
+        && [ ! -L "$marker_path" ] \
+        && printf '%s' "$expected_epoch" | cmp -s - "$marker_path"
+}
+
 status='200 OK'
 maintenance_state="/lab-state/services-${color}/maintenance"
 if [ -f "$maintenance_state" ]; then
@@ -29,9 +40,7 @@ if [ "$status" = '200 OK' ] && [ -n "$expected_host" ] \
 fi
 if [ "${CONTROL_PLANE_STARTUP_MODE:-full}" = web-only ]; then
     epoch=${CONTROL_PLANE_WEB_EPOCH:-}
-    if [ ! -f "$web_marker" ] \
-        || [ "$(wc -c < "$web_marker" | tr -d '[:space:]')" != "${#epoch}" ] \
-        || [ "$(cat "$web_marker")" != "$epoch" ]; then
+    if ! marker_matches "$web_marker" "$epoch"; then
         status='503 Service Unavailable'
     fi
 fi
@@ -39,11 +48,7 @@ if [ "$status" = '200 OK' ]; then
     exec 7>"$mutation_lease"
     flock -s 7
     mutation_lease_acquired=1
-    mutation_freeze_epoch=${CONTROL_PLANE_MUTATION_FREEZE_EPOCH:-}
-    if [ -n "$mutation_freeze_epoch" ] \
-        && [ -f "$mutation_freeze_marker" ] \
-        && [ "$(wc -c < "$mutation_freeze_marker" | tr -d '[:space:]')" = "${#mutation_freeze_epoch}" ] \
-        && [ "$(cat "$mutation_freeze_marker")" = "$mutation_freeze_epoch" ]; then
+    if [ -e "$mutation_freeze_marker" ] || [ -L "$mutation_freeze_marker" ]; then
         status='423 Locked'
     fi
     if [ "$status" = '200 OK' ] \

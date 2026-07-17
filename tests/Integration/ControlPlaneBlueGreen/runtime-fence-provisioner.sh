@@ -43,6 +43,9 @@ log=${state}.log
 environment=${state}.environment
 candidate_denial=${state}.candidate-denial
 candidate_runtime_digest=${state}.candidate-runtime-sha256
+member_b_runtime_digest=${state}.member-b-runtime-sha256
+member_b_identity=${state}.member-b-id
+ingress_pool_manifest_pin=${state}.ingress-pool-manifest-sha256
 daemon_recovery=${state}.daemon-recovery
 
 phase()
@@ -67,9 +70,110 @@ environment_value()
     environment_source=${2:-$environment}
     environment_key_count=$(awk -F= -v key="$environment_key" \
         '$1 == key { count++ } END { print count + 0 }' "$environment_source")
-    [ "$environment_key_count" -eq 1 ] \
+    if [ "$environment_key_count" -eq 1 ]; then
+        sed -n "s/^${environment_key}=//p" "$environment_source"
+        return
+    fi
+    [ "$environment_key_count" -eq 0 ] \
         || fail "runtime-fence environment has an invalid ${environment_key} record"
-    sed -n "s/^${environment_key}=//p" "$environment_source"
+
+    case "$environment_key" in
+        CONTROL_PLANE_RUNTIME_CANDIDATE_CONTAINER) plan_key=member_a_name ;;
+        CONTROL_PLANE_RUNTIME_CANDIDATE_IMAGE_ID) plan_key=member_a_image_id ;;
+        CONTROL_PLANE_RUNTIME_CANDIDATE_IMAGE_REFERENCE) plan_key=member_a_image_reference ;;
+        CONTROL_PLANE_RUNTIME_CANDIDATE_NETWORK_IDS) plan_key=member_a_network_ids ;;
+        CONTROL_PLANE_RUNTIME_CANDIDATE_REPIN_INTENT_FILE) plan_key=member_a_repin_intent_file ;;
+        CONTROL_PLANE_RUNTIME_LEGACY_CONTAINER) plan_key=retired_member_a_name ;;
+        *) fail "runtime-fence environment has an invalid ${environment_key} record" ;;
+    esac
+    pool_plan_value "$plan_key" "$environment_source"
+}
+
+environment_required_value()
+{
+    required_key=$1
+    required_source=${2:-$environment}
+    required_count=$(awk -F= -v key="$required_key" \
+        '$1 == key { count++ } END { print count + 0 }' "$required_source")
+    [ "$required_count" -eq 1 ] \
+        || fail "runtime-fence environment has an invalid ${required_key} record"
+    sed -n "s/^${required_key}=//p" "$required_source"
+}
+
+pool_plan_value()
+{
+    plan_key=$1
+    plan_environment=${2:-$environment}
+    plan_path=$(environment_required_value CONTROL_PLANE_RUNTIME_POOL_PLAN_MANIFEST \
+        "$plan_environment")
+    plan_sha256=$(environment_required_value CONTROL_PLANE_RUNTIME_POOL_PLAN_MANIFEST_SHA256 \
+        "$plan_environment")
+    plan_metadata=$(environment_required_value CONTROL_PLANE_RUNTIME_POOL_PLAN_MANIFEST_METADATA \
+        "$plan_environment")
+    [ -f "$plan_path" ] && [ ! -L "$plan_path" ] \
+        && printf '%s\n' "$plan_sha256" | grep -E -q '^[a-f0-9]{64}$' \
+        && printf '%s\n' "$plan_metadata" | grep -E -q '^[0-9]+:[0-9]+:600:[0-9]+$' \
+        && [ "$(stat -c '%u:%g:%a:%s' "$plan_path")" = "$plan_metadata" ] \
+        && [ "$(sha256sum "$plan_path" | awk '{print $1}')" = "$plan_sha256" ] \
+        || fail 'runtime-fence pool plan differs from its signed identity'
+    plan_key_count=$(awk -F= -v key="$plan_key" \
+        '$1 == key { count++ } END { print count + 0 }' "$plan_path")
+    [ "$plan_key_count" -eq 1 ] \
+        || fail "runtime-fence pool plan has an invalid ${plan_key} record"
+    sed -n "s/^${plan_key}=//p" "$plan_path"
+}
+
+pool_member_value()
+{
+    printf '%s\n' "$(pool_plan_value "member_${1}_${2}")"
+}
+
+assert_pool_member_plan()
+{
+    pool_member=$1
+    [ "$(pool_member_value "$pool_member" role)" = "web-${pool_member}" ] \
+        || fail "pool member $pool_member role is malformed"
+    printf '%s\n' "$(pool_member_value "$pool_member" name)" | grep -E -q \
+        '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$' \
+        || fail "pool member $pool_member name is malformed"
+    printf '%s\n' "$(pool_member_value "$pool_member" route_identity)" | grep -E -q \
+        '^[A-Za-z0-9._:-]{16,128}$' \
+        || fail "pool member $pool_member route identity is malformed"
+    printf '%s\n' "$(pool_member_value "$pool_member" image_reference)" | grep -E -q \
+        '^[A-Za-z0-9][A-Za-z0-9._/:@-]*$' \
+        || fail "pool member $pool_member image reference is malformed"
+    printf '%s\n' "$(pool_member_value "$pool_member" image_id)" | grep -E -q \
+        '^sha256:[a-f0-9]{64}$' \
+        || fail "pool member $pool_member image ID is malformed"
+    pool_network_ids=$(pool_member_value "$pool_member" network_ids)
+    printf '%s\n' "$pool_network_ids" | grep -E -q '^([a-f0-9]{64})(,[a-f0-9]{64})*$' \
+        && [ "$(printf '%s' "$pool_network_ids" | tr ',' '\n' | LC_ALL=C sort -u | paste -sd, -)" \
+            = "$pool_network_ids" ] \
+        || fail "pool member $pool_member network IDs are malformed"
+    pool_repin_intent=$(pool_member_value "$pool_member" repin_intent_file)
+    case "$pool_repin_intent" in
+        /*)
+            ;;
+        *)
+            fail "pool member $pool_member repin intent is malformed"
+            ;;
+    esac
+    printf '%s\n' "$pool_repin_intent" | grep -E -q '^/[A-Za-z0-9_./-]+$' \
+        || fail "pool member $pool_member repin intent is malformed"
+}
+
+assert_pool_plan()
+{
+    [ "$(pool_plan_value version)" = 2 ] \
+        && [ "$(pool_plan_value operation_id)" = \
+            "$(environment_required_value CONTROL_PLANE_RUNTIME_OPERATION_ID)" ] \
+        && [ "$(pool_plan_value member_count)" = 2 ] \
+        || fail 'pool plan does not belong to the active two-member operation'
+    assert_pool_member_plan a
+    assert_pool_member_plan b
+    [ "$(pool_member_value a name)" != "$(pool_member_value b name)" ] \
+        && [ "$(pool_member_value a route_identity)" != "$(pool_member_value b route_identity)" ] \
+        || fail 'pool plan duplicates a member authority'
 }
 
 assert_candidate_runtime_digest_absent()
@@ -370,6 +474,109 @@ assert_candidate_denial()
         || fail 'candidate SSH-denial evidence does not cover each active bridge gateway'
 }
 
+member_runtime_digest_value()
+{
+    member_digest_file=$1
+    [ -f "$member_digest_file" ] && [ ! -L "$member_digest_file" ] \
+        || fail 'pool member runtime digest is absent or unsafe'
+    member_runtime_digest=$(cat "$member_digest_file")
+    printf '%s\n' "$member_runtime_digest" | grep -E -q '^[a-f0-9]{64}$' \
+        && [ "$(wc -c < "$member_digest_file" | tr -d '[:space:]')" = 65 ] \
+        || fail 'pool member runtime digest is malformed'
+    printf '%s\n' "$member_runtime_digest"
+}
+
+pin_member_runtime_digest()
+{
+    member_container=$1
+    member_digest_file=$2
+    member_observed_digest=$(canonical_container_runtime_sha256 "$member_container")
+    if [ -e "$member_digest_file" ] || [ -L "$member_digest_file" ]; then
+        [ "$(member_runtime_digest_value "$member_digest_file")" = "$member_observed_digest" ] \
+            || fail 'pool member runtime differs from its denial pin'
+        return
+    fi
+    member_digest_candidate=${member_digest_file}.new.$$
+    (umask 077; printf '%s\n' "$member_observed_digest" > "$member_digest_candidate")
+    mv "$member_digest_candidate" "$member_digest_file"
+    sync
+}
+
+assert_member_runtime_digest()
+{
+    member_container=$1
+    member_digest_file=$2
+    [ "$(member_runtime_digest_value "$member_digest_file")" = \
+        "$(canonical_container_runtime_sha256 "$member_container")" ] \
+        || fail 'pool member runtime differs from its denial pin'
+}
+
+member_b_identity_value()
+{
+    [ -f "$member_b_identity" ] && [ ! -L "$member_b_identity" ] \
+        || fail 'web-b identity is absent or unsafe'
+    member_b_recorded_id=$(cat "$member_b_identity")
+    printf '%s\n' "$member_b_recorded_id" | grep -E -q '^[a-f0-9]{64}$' \
+        && [ "$(wc -c < "$member_b_identity" | tr -d '[:space:]')" = 65 ] \
+        || fail 'web-b identity is malformed'
+    printf '%s\n' "$member_b_recorded_id"
+}
+
+assert_pool_member_static()
+{
+    member_role=$1
+    member_container=$(pool_member_value "$member_role" name)
+    docker inspect "$member_container" >/dev/null
+    [ "$(candidate_image_id "$member_container")" = \
+        "$(pool_member_value "$member_role" image_id)" ] \
+        && [ "$(docker inspect --format '{{.Config.Image}}' "$member_container")" \
+            = "$(pool_member_value "$member_role" image_reference)" ] \
+        && [ "$(candidate_network_ids "$member_container")" \
+            = "$(pool_member_value "$member_role" network_ids)" ] \
+        || fail "pool member $member_role differs from its signed static plan"
+}
+
+assert_pool_member_repin_intent()
+{
+    member_role=$1
+    member_id=$2
+    member_intent=$(pool_member_value "$member_role" repin_intent_file)
+    [ -f "$member_intent" ] && [ ! -L "$member_intent" ] \
+        && [ "$(stat -c '%a' "$member_intent")" = 600 ] \
+        || fail "pool member $member_role repin intent is absent or unsafe"
+    awk -F= \
+        -v operation="$(environment_required_value CONTROL_PLANE_RUNTIME_OPERATION_ID)" \
+        -v candidate="$(pool_member_value "$member_role" name)" \
+        -v candidate_id="$member_id" \
+        -v image_id="$(pool_member_value "$member_role" image_id)" \
+        -v image_reference="$(pool_member_value "$member_role" image_reference)" '
+        BEGIN {
+            expected[1] = "version=1"
+            expected[2] = "operation_id=" operation
+            expected[3] = "candidate_name=" candidate
+            expected[4] = "candidate_id=" candidate_id
+            expected[5] = "candidate_image_id=" image_id
+            expected[6] = "candidate_image_reference=" image_reference
+            expected[7] = "restart_policy=always"
+        }
+        $0 != expected[NR] { exit 1 }
+        END { exit(NR == 7 ? 0 : 1) }
+    ' "$member_intent" \
+        || fail "pool member $member_role repin intent is malformed"
+}
+
+assert_pool_members_pinned()
+{
+    pool_member_a=$(pool_member_value a name)
+    pool_member_b=$(pool_member_value b name)
+    assert_candidate_denial "$pool_member_a"
+    assert_candidate_runtime_digest "$pool_member_a"
+    [ "$(member_b_identity_value)" = "$(candidate_container_id "$pool_member_b")" ] \
+        || fail 'web-b identity changed after denial proof'
+    assert_member_runtime_digest "$pool_member_b" "$member_b_runtime_digest"
+    probe_candidate_ssh_denied "$pool_member_b"
+}
+
 routed_runtime_recovery_kind()
 {
     recovery_kind_count=$(grep -E -c '^recovery_kind=' "$daemon_recovery" || true)
@@ -580,6 +787,76 @@ write_routed_candidate_recovery()
     sync
 }
 
+ingress_pool_value()
+{
+    ingress_key=$1
+    ingress_key_count=$(awk -F= -v key="$ingress_key" \
+        '$1 == key { count++ } END { print count + 0 }' "$ingress_pool_manifest")
+    [ "$ingress_key_count" -eq 1 ] \
+        || fail "ingress pool has an invalid ${ingress_key} record"
+    sed -n "s/^${ingress_key}=//p" "$ingress_pool_manifest"
+}
+
+assert_ingress_pool_member()
+{
+    ingress_member=$1
+    ingress_container=$(pool_member_value "$ingress_member" name)
+    [ "$(ingress_pool_value "member_${ingress_member}_role")" = "web-${ingress_member}" ] \
+        && [ "$(ingress_pool_value "member_${ingress_member}_name")" = "$ingress_container" ] \
+        && [ "$(ingress_pool_value "member_${ingress_member}_route_identity")" \
+            = "$(pool_member_value "$ingress_member" route_identity)" ] \
+        && [ "$(ingress_pool_value "member_${ingress_member}_id")" \
+            = "$(candidate_container_id "$ingress_container")" ] \
+        && [ "$(ingress_pool_value "member_${ingress_member}_image_reference")" \
+            = "$(pool_member_value "$ingress_member" image_reference)" ] \
+        && [ "$(ingress_pool_value "member_${ingress_member}_image_id")" \
+            = "$(pool_member_value "$ingress_member" image_id)" ] \
+        && [ "$(ingress_pool_value "member_${ingress_member}_runtime_sha256")" \
+            = "$(member_runtime_digest_value "$( [ "$ingress_member" = a ] \
+                && printf '%s\n' "$candidate_runtime_digest" \
+                || printf '%s\n' "$member_b_runtime_digest" )")" ] \
+        || fail "ingress pool member $ingress_member differs from its denial pin"
+}
+
+pin_ingress_pool_manifest()
+{
+    ingress_expected_sha256=$1
+    printf '%s\n' "$ingress_expected_sha256" | grep -E -q '^[a-f0-9]{64}$' \
+        || fail 'ingress pool pin checksum is malformed'
+    ingress_pool_manifest=$(pool_plan_value ingress_pool_manifest_path)
+    [ -f "$ingress_pool_manifest" ] && [ ! -L "$ingress_pool_manifest" ] \
+        && [ "$(sha256sum "$ingress_pool_manifest" | awk '{print $1}')" = "$ingress_expected_sha256" ] \
+        || fail 'ingress pool manifest differs from its requested checksum'
+    [ "$(ingress_pool_value version)" = 2 ] \
+        && [ "$(ingress_pool_value operation_id)" = \
+            "$(environment_required_value CONTROL_PLANE_RUNTIME_OPERATION_ID)" ] \
+        && [ "$(ingress_pool_value parent_pool_plan_sha256)" = \
+            "$(environment_required_value CONTROL_PLANE_RUNTIME_POOL_PLAN_MANIFEST_SHA256)" ] \
+        && [ "$(ingress_pool_value member_count)" = 2 ] \
+        || fail 'ingress pool does not descend from the active signed plan'
+    assert_ingress_pool_member a
+    assert_ingress_pool_member b
+    if ! {
+        [ "$(ingress_pool_value member_a_id)" != "$(ingress_pool_value member_b_id)" ] \
+            && printf '%s\n' "$(ingress_pool_value member_set_sha256)" \
+                | grep -E -q '^[a-f0-9]{64}$'
+    }; then
+        fail 'ingress pool member set is malformed'
+    fi
+    if [ -e "$ingress_pool_manifest_pin" ] || [ -L "$ingress_pool_manifest_pin" ]; then
+        [ -f "$ingress_pool_manifest_pin" ] && [ ! -L "$ingress_pool_manifest_pin" ] \
+            && [ "$(cat "$ingress_pool_manifest_pin")" = "$ingress_expected_sha256" ] \
+            || fail 'ingress pool manifest changed after its first pin'
+    else
+        ingress_pin_candidate=${ingress_pool_manifest_pin}.new.$$
+        (umask 077; printf '%s\n' "$ingress_expected_sha256" > "$ingress_pin_candidate")
+        mv "$ingress_pin_candidate" "$ingress_pool_manifest_pin"
+        sync
+    fi
+    [ "$(sha256sum "$ingress_pool_manifest" | awk '{print $1}')" = "$ingress_expected_sha256" ] \
+        || fail 'ingress pool manifest changed while it was being pinned'
+}
+
 case "$action" in
     prepare)
         environment_file=${2:-}
@@ -593,7 +870,8 @@ case "$action" in
             new|prepared)
                 ;;
             finalized|aborted)
-                rm -f "$candidate_denial" "$candidate_runtime_digest" "$daemon_recovery"
+                rm -f "$candidate_denial" "$candidate_runtime_digest" "$member_b_runtime_digest" \
+                    "$member_b_identity" "$ingress_pool_manifest_pin" "$daemon_recovery"
                 ;;
             *)
                 exit 1
@@ -602,6 +880,10 @@ case "$action" in
         assert_candidate_runtime_digest_absent
         cp "$environment_file" "${environment}.new"
         mv "${environment}.new" "$environment"
+        if awk -F= '$1 == "CONTROL_PLANE_RUNTIME_POOL_PLAN_MANIFEST" { found = 1 }
+            END { exit(found ? 0 : 1) }' "$environment"; then
+            assert_pool_plan
+        fi
         transition prepared
         ;;
     capture)
@@ -619,6 +901,101 @@ case "$action" in
         ! docker inspect "$candidate" >/dev/null 2>&1
         assert_candidate_runtime_digest_absent
         transition active
+        ;;
+    assert-pool-baseline)
+        [ "$#" -eq 1 ] && [ "$(phase)" = active ] || fail 'pool baseline is invalid'
+        assert_pool_plan
+        pool_web_a=$(pool_member_value a name)
+        pool_web_b=$(pool_member_value b name)
+        assert_pool_member_static a
+        assert_pool_member_static b
+        if [ -e "$candidate_denial" ] || [ -L "$candidate_denial" ] \
+            || [ -e "$member_b_identity" ] || [ -L "$member_b_identity" ] \
+            || [ -e "$member_b_runtime_digest" ] || [ -L "$member_b_runtime_digest" ]; then
+            [ -f "$candidate_denial" ] && [ ! -L "$candidate_denial" ] \
+                && [ -f "$candidate_runtime_digest" ] && [ ! -L "$candidate_runtime_digest" ] \
+                && [ -f "$member_b_identity" ] && [ ! -L "$member_b_identity" ] \
+                && [ -f "$member_b_runtime_digest" ] && [ ! -L "$member_b_runtime_digest" ] \
+                || fail 'pool baseline has partial denial evidence'
+            assert_pool_members_pinned
+        else
+            [ "$(candidate_restart_policy "$pool_web_a")" = unless-stopped ] \
+                && [ "$(candidate_restart_policy "$pool_web_b")" = unless-stopped ] \
+                || fail 'unproven pool member restart policy is not unless-stopped'
+            assert_candidate_runtime_digest_absent
+            [ ! -e "$member_b_runtime_digest" ] && [ ! -L "$member_b_runtime_digest" ] \
+                || fail 'web-b runtime digest exists before denial proof'
+        fi
+        printf '%s\n' assert-pool-baseline >> "$log"
+        ;;
+    prove-pool-denied)
+        [ "$#" -eq 1 ] && [ "$(phase)" = active ] || fail 'pool denial is invalid'
+        assert_pool_plan
+        pool_web_a=$(pool_member_value a name)
+        pool_web_b=$(pool_member_value b name)
+        assert_pool_member_static a
+        assert_pool_member_static b
+        pool_web_a_id=$(candidate_container_id "$pool_web_a")
+        pool_web_b_id=$(candidate_container_id "$pool_web_b")
+        if [ -e "$candidate_denial" ] || [ -L "$candidate_denial" ]; then
+            assert_candidate_denial "$pool_web_a"
+        else
+            [ "$(candidate_restart_policy "$pool_web_a")" = unless-stopped ] \
+                || fail 'initial web-a denial requires restart policy unless-stopped'
+            probe_candidate_ssh_denied "$pool_web_a"
+            record_candidate_denial "$pool_web_a" "$pool_web_a_id"
+        fi
+        pin_candidate_runtime_digest "$pool_web_a"
+        if [ -e "$member_b_identity" ] || [ -L "$member_b_identity" ] \
+            || [ -e "$member_b_runtime_digest" ] || [ -L "$member_b_runtime_digest" ]; then
+            [ "$(member_b_identity_value)" = "$pool_web_b_id" ] \
+                || fail 'web-b changed after its first denial proof'
+        else
+            [ "$(candidate_restart_policy "$pool_web_b")" = unless-stopped ] \
+                || fail 'initial web-b denial requires restart policy unless-stopped'
+            probe_candidate_ssh_denied "$pool_web_b"
+            (umask 077; printf '%s\n' "$pool_web_b_id" > "${member_b_identity}.new.$$")
+            mv "${member_b_identity}.new.$$" "$member_b_identity"
+        fi
+        pin_member_runtime_digest "$pool_web_b" "$member_b_runtime_digest"
+        assert_pool_members_pinned
+        printf '%s\n' prove-pool-denied prove-candidate-denied >> "$log"
+        ;;
+    pin-ingress-pool-manifest)
+        [ "$#" -eq 2 ] && [ "$(phase)" = active ] \
+            || fail 'ingress pool pin is invalid'
+        assert_pool_plan
+        assert_pool_members_pinned
+        pin_ingress_pool_manifest "$2"
+        printf '%s\n' pin-ingress-pool-manifest >> "$log"
+        ;;
+    repin-pool)
+        [ "$#" -eq 3 ] && [ "$(phase)" = active ] || fail 'pool repin is invalid'
+        printf '%s\n%s\n' "$2" "$3" | grep -E -q '^[a-f0-9]{64}$' \
+            && [ "$(printf '%s\n%s\n' "$2" "$3" | grep -E -c '^[a-f0-9]{64}$')" = 2 ] \
+            || fail 'pool repin IDs are malformed'
+        assert_pool_plan
+        pool_web_a=$(pool_member_value a name)
+        pool_web_b=$(pool_member_value b name)
+        assert_pool_member_static a
+        assert_pool_member_static b
+        [ "$(candidate_container_id "$pool_web_a")" = "$2" ] \
+            && [ "$(candidate_denial_value candidate_denial_id)" = "$2" ] \
+            && [ "$(candidate_container_id "$pool_web_b")" = "$3" ] \
+            && [ "$(member_b_identity_value)" = "$3" ] \
+            || fail 'pool repin changed an exact denied member ID'
+        assert_pool_member_repin_intent a "$2"
+        assert_pool_member_repin_intent b "$3"
+        [ "$(candidate_restart_policy "$pool_web_a")" = always ] \
+            && [ "$(candidate_restart_policy "$pool_web_b")" = always ] \
+            || fail 'pool repin did not observe restart policy always for both members'
+        assert_candidate_runtime_digest "$pool_web_a"
+        assert_member_runtime_digest "$pool_web_b" "$member_b_runtime_digest"
+        probe_candidate_ssh_denied "$pool_web_a"
+        record_candidate_denial "$pool_web_a" "$2"
+        probe_candidate_ssh_denied "$pool_web_b"
+        assert_pool_members_pinned
+        printf '%s\n' repin-pool repin-candidate >> "$log"
         ;;
     assert-candidate-baseline)
         [ "$(phase)" = active ]
@@ -722,10 +1099,10 @@ case "$action" in
         printf '%s\n' "$recovery_parent_phase" | grep -E -q '^[A-Za-z0-9_.-]+$' \
             || fail 'daemon recovery parent phase is invalid'
         case "$(phase)" in
-            active|released)
+            active|released|finalized)
                 ;;
             *)
-                fail 'daemon recovery requires an active or released fence'
+                fail 'daemon recovery requires an active or durably released fence'
                 ;;
         esac
         candidate=$(environment_value CONTROL_PLANE_RUNTIME_CANDIDATE_CONTAINER)
@@ -840,10 +1217,10 @@ case "$action" in
         printf '%s\n' "$recovery_parent_phase" | grep -E -q '^[A-Za-z0-9_.-]+$' \
             || fail 'routed runtime classification parent phase is invalid'
         case "$(phase)" in
-            active|released)
+            active|released|finalized)
                 ;;
             *)
-                fail 'routed runtime classification requires an active or released fence'
+                fail 'routed runtime classification requires an active or durably released fence'
                 ;;
         esac
         if [ -e "${state}.runtime-drift" ]; then
@@ -885,10 +1262,10 @@ case "$action" in
         printf '%s\n' "$recovery_parent_phase" | grep -E -q '^[A-Za-z0-9_.-]+$' \
             || fail 'routed runtime recovery parent phase is invalid'
         case "$(phase)" in
-            active|released)
+            active|released|finalized)
                 ;;
             *)
-                fail 'routed runtime recovery requires an active or released fence'
+                fail 'routed runtime recovery requires an active or durably released fence'
                 ;;
         esac
         candidate=$(environment_value CONTROL_PLANE_RUNTIME_CANDIDATE_CONTAINER)
@@ -1009,19 +1386,28 @@ case "$action" in
         [ "$(phase)" = active ] || [ "$(phase)" = released ]
         incumbent=$(environment_value CONTROL_PLANE_RUNTIME_LEGACY_CONTAINER)
         candidate=$(environment_value CONTROL_PLANE_RUNTIME_CANDIDATE_CONTAINER)
-        operation=$(environment_value CONTROL_PLANE_RUNTIME_OPERATION_ID)
+        expected_freeze=$(pool_plan_value mutation_freeze_epoch)
         ! docker inspect "$incumbent" >/dev/null 2>&1
         assert_candidate_denial "$candidate"
         assert_candidate_runtime_digest "$candidate"
-        docker exec --env "CONTROL_PLANE_EXPECTED_FREEZE=${operation}.mutation-freeze" \
+        docker exec --env "CONTROL_PLANE_EXPECTED_FREEZE=$expected_freeze" \
             "$candidate" /bin/sh -ec '
-                test "$(cat /var/lib/coolify-control-plane/mutation-freeze-epoch)" = \
-                    "$CONTROL_PLANE_EXPECTED_FREEZE"
+                marker=${CONTROL_PLANE_MUTATION_FREEZE_MARKER_PATH:-}
+                test -n "$marker"
+                test -f "$marker"
+                test ! -L "$marker"
+                marker_identity=$(stat -c %d:%i "$marker")
+                exec 9< "$marker"
+                test "$(stat -Lc %d:%i /proc/self/fd/9)" = "$marker_identity"
+                test ! -L "$marker"
+                test "$(stat -c %d:%i "$marker")" = "$marker_identity"
+                printf %s "$CONTROL_PLANE_EXPECTED_FREEZE" | cmp -s - /proc/self/fd/9
+                test "$(stat -c %d:%i "$marker")" = "$marker_identity"
             '
         transition released
         ;;
     verify-released)
-        [ "$(phase)" = released ]
+        [ "$(phase)" = released ] || [ "$(phase)" = finalized ]
         candidate=$(environment_value CONTROL_PLANE_RUNTIME_CANDIDATE_CONTAINER)
         assert_candidate_denial "$candidate"
         assert_candidate_runtime_digest "$candidate"
@@ -1036,8 +1422,22 @@ case "$action" in
     finalize-release)
         [ "$(phase)" = released ] || [ "$(phase)" = finalized ]
         candidate=$(environment_value CONTROL_PLANE_RUNTIME_CANDIDATE_CONTAINER)
-        docker exec "$candidate" \
-            test ! -e /var/lib/coolify-control-plane/mutation-freeze-epoch
+        docker exec "$candidate" /bin/sh -ec '
+            marker=${CONTROL_PLANE_MUTATION_FREEZE_MARKER_PATH:-}
+            test -n "$marker"
+            lease=${marker%/*}/mutation-inflight.lock
+            test -f "$lease"
+            test ! -L "$lease"
+            lease_identity=$(stat -c %d:%i "$lease")
+            exec 8< "$lease"
+            test "$(stat -Lc %d:%i /proc/self/fd/8)" = "$lease_identity"
+            flock -s 8
+            test "$(stat -c %d:%i "$lease")" = "$lease_identity"
+            test ! -e "$marker"
+            test ! -L "$marker"
+            test ! -e "$marker"
+            test "$(stat -c %d:%i "$lease")" = "$lease_identity"
+        '
         transition finalized
         ;;
     status)

@@ -18,7 +18,7 @@ trap stop_listeners TERM INT
 
 for port in "$@"; do
     while true; do
-        nc -l -p "$port" </dev/null >/dev/null 2>&1 || true
+        printf '+PONG\r\n' | nc -l -p "$port" >/dev/null 2>&1 || true
     done &
     listener_pids="$listener_pids $!"
 done

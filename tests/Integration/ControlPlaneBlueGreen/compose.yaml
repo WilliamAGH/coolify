@@ -2,13 +2,15 @@ services:
   proxy:
     image: "traefik:v3.6.13@sha256:5ae9c349154d5298a5d61a7b25e5f3a9f53314f1515e87632120b95051c7917c"
     container_name: "${CONTROL_PLANE_PROXY_CONTAINER:?CONTROL_PLANE_PROXY_CONTAINER is required}"
-    command: ["--configFile=/etc/traefik/traefik.yml"]
+    command:
+      - "--api.insecure=false"
+      - "--configFile=/etc/traefik/traefik.yml"
     restart: "no"
     ports:
       - "127.0.0.1:${LAB_TRAEFIK_PORT:?LAB_TRAEFIK_PORT is required}:80"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - "${LAB_DYNAMIC_DIR:?LAB_DYNAMIC_DIR is required}:/traefik/dynamic"
+      - "${LAB_DYNAMIC_DIR:?LAB_DYNAMIC_DIR is required}:/traefik/dynamic:ro"
       - "${LAB_TRAEFIK_STATIC_CONFIG:?LAB_TRAEFIK_STATIC_CONFIG is required}:/etc/traefik/traefik.yml:ro"
     networks:
       - lab

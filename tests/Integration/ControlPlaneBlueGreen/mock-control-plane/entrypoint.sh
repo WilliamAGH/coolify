@@ -10,24 +10,32 @@ marker_matches()
     marker_path=$1
     expected_epoch=$2
 
-    [ -f "$marker_path" ] \
-        && [ "$(wc -c < "$marker_path" | tr -d '[:space:]')" = "${#expected_epoch}" ] \
-        && [ "$(cat "$marker_path")" = "$expected_epoch" ]
+    [ -n "$expected_epoch" ] \
+        && [ -f "$marker_path" ] \
+        && [ ! -L "$marker_path" ] \
+        && printf '%s' "$expected_epoch" | cmp -s - "$marker_path"
 }
 
 write_marker()
 {
     marker_path=$1
     marker_epoch=$2
-    candidate="${marker_path}.$$"
 
     if marker_matches "$marker_path" "$marker_epoch"; then
         return
     fi
-    [ ! -e "$marker_path" ] || exit 75
     umask 077
+    candidate=$(mktemp "${marker_path}.XXXXXX") || exit 75
+    trap 'rm -f "$candidate"' EXIT
+    trap 'exit 75' HUP INT TERM
     printf '%s' "$marker_epoch" > "$candidate"
-    mv "$candidate" "$marker_path"
+    if ! ln "$candidate" "$marker_path" 2>/dev/null; then
+        rm -f "$candidate"
+        trap - EXIT HUP INT TERM
+        exit 75
+    fi
+    rm -f "$candidate"
+    trap - EXIT HUP INT TERM
     sync
 }
 
@@ -138,7 +146,7 @@ case "${1:-}" in
     '')
         /usr/local/bin/control-plane-lab-service initialize
         horizon_behavior &
-        exec httpd -f -p "${CONTROL_PLANE_BACKEND_PORT:-8080}" -h /srv/www
+        exec /usr/local/bin/control-plane-lab-http-server
         ;;
     *)
         exec "$@"
