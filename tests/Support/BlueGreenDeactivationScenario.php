@@ -21,6 +21,7 @@ use App\Models\Project;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
 use App\Models\Team;
+use Closure;
 use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\Process;
 use Symfony\Component\Yaml\Yaml;
@@ -80,8 +81,11 @@ final class BlueGreenDeactivationScenario
     /**
      * @param  list<array{Application, StandaloneDocker}>  $contexts
      */
-    public static function fakeLifecycleProcesses(array $contexts, string $fallbackOutput = ''): void
-    {
+    public static function fakeLifecycleProcesses(
+        array $contexts,
+        string $fallbackOutput = '',
+        ?Closure $beforeProcess = null,
+    ): void {
         $sourceOutputByFilename = [];
         foreach ($contexts as [$application, $destination]) {
             $state = ApplicationBlueGreenDeployment::query()
@@ -134,7 +138,8 @@ final class BlueGreenDeactivationScenario
             $sourceOutputByFilename[$managedFilename] = "2000000000\n".hash('sha256', $source)."\n".base64_encode($source);
         }
 
-        Process::fake(function (PendingProcess $process) use ($sourceOutputByFilename, $fallbackOutput) {
+        Process::fake(function (PendingProcess $process) use ($sourceOutputByFilename, $fallbackOutput, $beforeProcess) {
+            $beforeProcess?->__invoke($process);
             $command = is_array($process->command) ? implode(' ', $process->command) : (string) $process->command;
             if (preg_match_all('/[A-Za-z0-9+\/=]{40,}/', $command, $matches) < 1) {
                 return Process::result(output: $fallbackOutput);

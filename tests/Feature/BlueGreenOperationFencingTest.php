@@ -37,6 +37,14 @@ function invokeBlueGreenOperationFencingMethod(object $target, string $method, m
     return (new ReflectionClass($target))->getMethod($method)->invoke($target, ...$arguments);
 }
 
+/**
+ * Model store-side lease expiry without waiting for the production-length lease.
+ */
+function expireBlueGreenOperationFencingLock(string $key): void
+{
+    Cache::lock($key, 1)->forceRelease();
+}
+
 afterEach(function () {
     Carbon::setTestNow();
     foreach ([
@@ -62,7 +70,7 @@ it('does not release or reuse a lifecycle lock after its lease expires and a new
     expect($fence->assertDeploymentOwnership($operation->claim, [BlueGreenDeploymentPhase::PREPARING]))
         ->toBe(BlueGreenDeploymentPhase::PREPARING);
 
-    Carbon::setTestNow(now()->addSeconds(2));
+    expireBlueGreenOperationFencingLock($key);
     $newLock = Cache::lock($key, 60);
     expect($newLock->get())->toBeTrue()
         ->and(fn () => $fence->assertDeploymentOwnership($operation->claim, [BlueGreenDeploymentPhase::PREPARING]))
@@ -106,20 +114,14 @@ it('stops the deployment lifecycle before its next remote mutation after a newer
     setBlueGreenOperationFencingProperty($lifecycle, 'enabled', true);
     invokeBlueGreenOperationFencingMethod($lifecycle, 'acquireLifecycleLock');
     $claim = $lifecycle->claim();
-    $leaseSeconds = BlueGreenDeploymentLock::leaseSeconds(
-        max(30, (int) config('constants.ssh.command_timeout')),
-        $application->settings->deploymentStopGracePeriodSeconds(),
-    );
     $replacementLock = null;
     $startCandidateCalled = false;
     RemoveBlueGreenInactiveContainer::shouldRun()
         ->once()
-        ->andReturnUsing(function () use (&$replacementLock, $application, $destination, $leaseSeconds): void {
-            Carbon::setTestNow(now()->addSeconds($leaseSeconds + 1));
-            $replacementLock = Cache::lock(
-                BlueGreenDeploymentLock::key($application->id, $destination->id),
-                60,
-            );
+        ->andReturnUsing(function () use (&$replacementLock, $application, $destination): void {
+            $key = BlueGreenDeploymentLock::key($application->id, $destination->id);
+            expireBlueGreenOperationFencingLock($key);
+            $replacementLock = Cache::lock($key, 60);
             expect($replacementLock->get())->toBeTrue();
         });
     InspectBlueGreenContainer::shouldNotRun();
@@ -144,20 +146,14 @@ it('stops the deployment lifecycle before its next remote mutation after a newer
 it('defers reconciliation without intervention after its refreshed lease expires and a newer owner appears', function () {
     Carbon::setTestNow('2026-07-16 12:00:00');
     $scenario = BlueGreenRecoveryScenario::create();
-    $leaseSeconds = BlueGreenDeploymentLock::leaseSeconds(
-        (int) config('constants.ssh.command_timeout'),
-        $scenario->application->settings->deploymentStopGracePeriodSeconds(),
-    );
     $replacementLock = null;
     BlueGreenDeploymentQueueActivity::shouldRun()->once()->andReturnFalse();
     InspectBlueGreenContainer::shouldRun()
         ->once()
-        ->andReturnUsing(function () use (&$replacementLock, $scenario, $leaseSeconds): BlueGreenContainerInspection {
-            Carbon::setTestNow(now()->addSeconds($leaseSeconds + 1));
-            $replacementLock = Cache::lock(
-                BlueGreenDeploymentLock::key($scenario->application->id, $scenario->destination->id),
-                60,
-            );
+        ->andReturnUsing(function () use (&$replacementLock, $scenario): BlueGreenContainerInspection {
+            $key = BlueGreenDeploymentLock::key($scenario->application->id, $scenario->destination->id);
+            expireBlueGreenOperationFencingLock($key);
+            $replacementLock = Cache::lock($key, 60);
             expect($replacementLock->get())->toBeTrue();
 
             return new BlueGreenContainerInspection(
@@ -182,19 +178,13 @@ it('leaves a newer owner untouched when deactivation loses its lock between remo
     Carbon::setTestNow('2026-07-16 12:00:00');
     ['application' => $application, 'destination' => $destination] = BlueGreenDeactivationScenario::context();
     $state = BlueGreenDeactivationScenario::idleState($application, $destination);
-    $leaseSeconds = BlueGreenDeploymentLock::leaseSeconds(
-        (int) config('constants.ssh.command_timeout'),
-        $application->settings->deploymentStopGracePeriodSeconds(),
-    );
     $replacementLock = null;
     PrepareBlueGreenProxyDeactivation::shouldRun()
         ->once()
-        ->andReturnUsing(function () use (&$replacementLock, $application, $destination, $leaseSeconds): null {
-            Carbon::setTestNow(now()->addSeconds($leaseSeconds + 1));
-            $replacementLock = Cache::lock(
-                BlueGreenDeploymentLock::key($application->id, $destination->id),
-                60,
-            );
+        ->andReturnUsing(function () use (&$replacementLock, $application, $destination): null {
+            $key = BlueGreenDeploymentLock::key($application->id, $destination->id);
+            expireBlueGreenOperationFencingLock($key);
+            $replacementLock = Cache::lock($key, 60);
             expect($replacementLock->get())->toBeTrue();
 
             return null;

@@ -133,6 +133,7 @@ beforeEach(function (): void {
 
 afterEach(function (): void {
     if (Schema::getConnection()->getDriverName() === 'pgsql') {
+        Artisan::call('migrate:install', ['--no-interaction' => true]);
         Artisan::call('migrate:fresh', ['--force' => true]);
     }
 });

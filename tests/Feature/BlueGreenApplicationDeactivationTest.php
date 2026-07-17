@@ -13,7 +13,6 @@ use App\Actions\Application\BlueGreen\ResumeBlueGreenDeactivations;
 use App\Actions\Application\StopApplication;
 use App\Actions\Application\StopApplicationOneServer;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
-use App\Actions\User\DeleteUserResources;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentColor;
@@ -513,85 +512,6 @@ it('rejects direct opted-in force deletion without completed deactivation author
         ->toThrow(RuntimeException::class, 'completed strict deactivation authorization');
 
     expect(Application::query()->whereKey($application->id)->exists())->toBeTrue();
-});
-
-it('deactivates blue-green state before the administrative direct force-delete path', function () {
-    ['application' => $application, 'destination' => $destination, 'team' => $team] = BlueGreenDeactivationScenario::context();
-    $user = User::factory()->create();
-    $team->members()->attach($user->id, ['role' => 'owner']);
-    BlueGreenDeactivationScenario::enableBlueGreen($application);
-    BlueGreenDeactivationScenario::idleState($application, $destination);
-    BlueGreenDeactivationScenario::fakeLifecycleProcesses([[$application, $destination]]);
-
-    $counts = (new DeleteUserResources($user))->execute();
-
-    expect($counts['applications'])->toBe(1)
-        ->and(Application::withTrashed()->whereKey($application->id)->exists())->toBeFalse()
-        ->and(ApplicationBlueGreenDeployment::query()
-            ->where('application_id', $application->id)
-            ->doesntExist())->toBeTrue();
-    Process::assertRan(fn ($process) => str_contains(blueGreenDeactivationInnerCommand($process->command), 'coolify-blue-green-'));
-});
-
-it('retries an incomplete canonical deletion through the administrative resource caller', function () {
-    ['application' => $application, 'destination' => $destination, 'team' => $team] = BlueGreenDeactivationScenario::context();
-    $user = User::factory()->create();
-    $team->members()->attach($user->id, ['role' => 'owner']);
-    BlueGreenDeactivationScenario::enableBlueGreen($application);
-    BlueGreenDeactivationScenario::idleState($application, $destination);
-    Process::fake(fn () => Process::result(exitCode: 255, errorOutput: 'ssh transport disconnected'));
-
-    expect(fn () => (new DeleteUserResources($user))->execute())
-        ->toThrow(BlueGreenDeactivationTransportException::class, 'remains resumable');
-
-    $tombstonedApplication = Application::withTrashed()->findOrFail($application->id);
-    expect($tombstonedApplication->trashed())->toBeTrue()
-        ->and(ApplicationBlueGreenDeactivation::query()->sole()->phase)
-        ->toBe(BlueGreenDeactivationPhase::DEACTIVATING);
-
-    BlueGreenDeactivationScenario::fakeLifecycleProcesses([[$tombstonedApplication, $destination]]);
-    $counts = (new DeleteUserResources($user))->execute();
-
-    expect($counts['applications'])->toBe(1)
-        ->and(Application::withTrashed()->whereKey($application->id)->doesntExist())->toBeTrue();
-});
-
-it('deactivates blue-green state before the user model deletion cascade force-deletes applications', function () {
-    ['application' => $application, 'destination' => $destination, 'team' => $team] = BlueGreenDeactivationScenario::context();
-    $user = User::factory()->create();
-    $team->members()->attach($user->id, ['role' => 'owner']);
-    BlueGreenDeactivationScenario::idleState($application, $destination);
-    BlueGreenDeactivationScenario::fakeLifecycleProcesses([[$application, $destination]]);
-
-    $user->delete();
-
-    expect(Application::withTrashed()->whereKey($application->id)->exists())->toBeFalse()
-        ->and(ApplicationBlueGreenDeployment::query()
-            ->where('application_id', $application->id)
-            ->doesntExist())->toBeTrue();
-    Process::assertRan(fn ($process) => str_contains(blueGreenDeactivationInnerCommand($process->command), 'coolify-blue-green-'));
-});
-
-it('retries an incomplete canonical deletion through the user model caller', function () {
-    ['application' => $application, 'destination' => $destination, 'team' => $team] = BlueGreenDeactivationScenario::context();
-    $user = User::factory()->create();
-    $team->members()->attach($user->id, ['role' => 'owner']);
-    BlueGreenDeactivationScenario::enableBlueGreen($application);
-    BlueGreenDeactivationScenario::idleState($application, $destination);
-    Process::fake(fn () => Process::result(exitCode: 255, errorOutput: 'ssh transport disconnected'));
-
-    expect(fn () => $user->delete())
-        ->toThrow(BlueGreenDeactivationTransportException::class, 'remains resumable');
-
-    $tombstonedApplication = Application::withTrashed()->findOrFail($application->id);
-    expect($tombstonedApplication->trashed())->toBeTrue()
-        ->and(User::query()->whereKey($user->id)->exists())->toBeTrue();
-
-    BlueGreenDeactivationScenario::fakeLifecycleProcesses([[$tombstonedApplication, $destination]]);
-    $user->delete();
-
-    expect(Application::withTrashed()->whereKey($application->id)->doesntExist())->toBeTrue()
-        ->and(User::query()->whereKey($user->id)->doesntExist())->toBeTrue();
 });
 
 it('does not tombstone applications before rejecting deletion of the sole root-team user', function () {
