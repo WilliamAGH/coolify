@@ -20,6 +20,13 @@ require_observer_running()
         return 1
     fi
 }
+assert_world_readable_evidence()
+{
+    evidence_file=$1
+    evidence_mode=$(stat -c '%a' "$evidence_file" 2>/dev/null \
+        || stat -f '%Lp' "$evidence_file")
+    [ "$evidence_mode" = 644 ]
+}
 cleanup()
 {
     [ -z "$observer_pid" ] || kill "$observer_pid" >/dev/null 2>&1 || true
@@ -96,6 +103,7 @@ until [ -s "$runtime_evidence/observer-heartbeat" ]; do
     [ "$attempt" -lt 100 ]
     sleep 0.02
 done
+assert_world_readable_evidence "$runtime_evidence/observer-heartbeat"
 
 attempt=0
 until [ "$(cat "$cp_fault_count")" -eq 3 ]; do
@@ -142,6 +150,7 @@ until [ -s "$runtime_evidence/observer-final-flush.ack" ] \
     [ "$attempt" -lt 200 ]
     sleep 0.02
 done
+assert_world_readable_evidence "$runtime_evidence/observer-final-flush.ack"
 
 require_observer_running
 attempt=0

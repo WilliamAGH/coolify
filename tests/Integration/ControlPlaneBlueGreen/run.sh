@@ -1334,7 +1334,7 @@ start_lab()
     wait_for_blue
     case "$scenario_name" in
         proxy-enrollment-*) ;;
-        *) prepare_proxy_enrollment_legacy_lab ;;
+        *) prepare_proxy_enrollment_native_lab ;;
     esac
 }
 
@@ -1694,8 +1694,9 @@ assert_proxy_enrollment_runner_bootstraps_from_green()
     fi
 }
 
-prepare_proxy_enrollment_legacy_lab()
+prepare_proxy_enrollment_lab()
 {
+    proxy_enrollment_topology=$1
     proxy_enrollment_native_static_config="$scenario_directory/traefik-native.yml"
     proxy_enrollment_legacy_static_config="$scenario_directory/traefik-legacy.yml"
     proxy_enrollment_legacy_proxy_compose="$scenario_directory/proxy-legacy-compose.yaml"
@@ -1742,18 +1743,35 @@ prepare_proxy_enrollment_legacy_lab()
     } > "$proxy_enrollment_source_custom"
     chmod 600 "$proxy_enrollment_source_custom"
 
-    replace_lab_traefik_static_config "$proxy_enrollment_legacy_static_config"
-    docker compose --ansi never --project-name "$project_name" \
-        --file "$proxy_enrollment_legacy_proxy_compose" \
-        up --detach --force-recreate --no-build --pull never --no-deps proxy >/dev/null
-    CONTROL_PLANE_SOURCE_COMPOSE_CUSTOM=$proxy_enrollment_source_custom
-    export CONTROL_PLANE_SOURCE_COMPOSE_CUSTOM
-    docker compose --ansi never --project-name "$CONTROL_PLANE_SOURCE_COMPOSE_PROJECT" \
-        --env-file "$CONTROL_PLANE_SOURCE_ENV_FILE" \
-        --file "$CONTROL_PLANE_SOURCE_COMPOSE_BASE" --file "$CONTROL_PLANE_SOURCE_COMPOSE_PROD" \
-        --file "$CONTROL_PLANE_SOURCE_COMPOSE_CUSTOM" \
-        up --detach --force-recreate --no-build --pull never --no-deps \
-        "$CONTROL_PLANE_SOURCE_COMPOSE_SERVICE" >/dev/null
+    case "$proxy_enrollment_topology" in
+        native)
+            {
+                printf '%s\n' 'services:' '  coolify:' '    ports: !reset null'
+            } > "$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE"
+            chmod 600 "$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE"
+            {
+                printf 'phase=enrolled\n'
+                printf 'compose_override_sha256=%s\n' "$(sha256sum \
+                    "$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE" | awk '{print $1}')"
+            } > "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_STATE_FILE"
+            chmod 600 "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_STATE_FILE"
+            ;;
+        legacy)
+            replace_lab_traefik_static_config "$proxy_enrollment_legacy_static_config"
+            docker compose --ansi never --project-name "$project_name" \
+                --file "$proxy_enrollment_legacy_proxy_compose" \
+                up --detach --force-recreate --no-build --pull never --no-deps proxy >/dev/null
+            CONTROL_PLANE_SOURCE_COMPOSE_CUSTOM=$proxy_enrollment_source_custom
+            export CONTROL_PLANE_SOURCE_COMPOSE_CUSTOM
+            docker compose --ansi never --project-name "$CONTROL_PLANE_SOURCE_COMPOSE_PROJECT" \
+                --env-file "$CONTROL_PLANE_SOURCE_ENV_FILE" \
+                --file "$CONTROL_PLANE_SOURCE_COMPOSE_BASE" --file "$CONTROL_PLANE_SOURCE_COMPOSE_PROD" \
+                --file "$CONTROL_PLANE_SOURCE_COMPOSE_CUSTOM" \
+                up --detach --force-recreate --no-build --pull never --no-deps \
+                "$CONTROL_PLANE_SOURCE_COMPOSE_SERVICE" >/dev/null
+            ;;
+        *) fail 'proxy-enrollment fixture requested an unknown topology' ;;
+    esac
     cp "$LAB_DIRECTORY/proxy-enrollment-command.sh" "$proxy_enrollment_command"
     chmod 700 "$proxy_enrollment_command"
     export CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE
@@ -1773,10 +1791,23 @@ prepare_proxy_enrollment_legacy_lab()
     export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_DYNAMIC_DIRECTORY
     export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_SOURCE_COMPOSE_FILES
     export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_MODE
-    assert_proxy_enrollment_proxy_binding legacy
-    assert_proxy_enrollment_blue_binding legacy
+    assert_proxy_enrollment_proxy_binding "$proxy_enrollment_topology"
+    case "$proxy_enrollment_topology" in
+        native) assert_proxy_enrollment_blue_binding absent ;;
+        legacy) assert_proxy_enrollment_blue_binding legacy ;;
+    esac
     assert_source_traefik_identity
     wait_for_blue
+}
+
+prepare_proxy_enrollment_native_lab()
+{
+    prepare_proxy_enrollment_lab native
+}
+
+prepare_proxy_enrollment_legacy_lab()
+{
+    prepare_proxy_enrollment_lab legacy
 }
 
 scenario_proxy_enrollment_success()

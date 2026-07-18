@@ -12,6 +12,7 @@ heartbeat_file="$runtime_evidence_directory/observer-heartbeat"
 flush_request="$runtime_evidence_directory/observer-final-flush.request"
 flush_ack="$runtime_evidence_directory/observer-final-flush.ack"
 snapshot_directory=$(mktemp -d "${TMPDIR:-/tmp}/application-deployment-observer.XXXXXX")
+umask 022
 : >"$events_file"
 : >"$snapshots_file"
 : >"$compose_manifest"
@@ -97,7 +98,10 @@ capture_routes()
             observed_at_nano="$(date +%s%N)"
             if [ -n "$route_file" ]; then
                 target="$runtime_evidence_directory/proxy-route-$route_sha.yaml"
-                [ -e "$target" ] || cp "$route_snapshot" "$target"
+                if [ ! -e "$target" ]; then
+                    chmod 644 "$route_snapshot"
+                    cp "$route_snapshot" "$target"
+                fi
                 jq -cn --arg path "$route_file" --arg sha256 "$route_sha" --arg observedAtNano "$observed_at_nano" \
                     --argjson finalFlush "$final_flush" \
                     '{finalFlush: $finalFlush, observedAtNano: $observedAtNano, path: $path, present: true, sha256: $sha256}' >>"$route_manifest"
@@ -113,6 +117,7 @@ capture_routes()
             sync
             flush_ack_snapshot=$(mktemp "$snapshot_directory/flush-ack.XXXXXX")
             printf '%s\n' "$requested_flush" >"$flush_ack_snapshot"
+            chmod 644 "$flush_ack_snapshot"
             mv "$flush_ack_snapshot" "$flush_ack"
             sync
             acknowledged_flush=$requested_flush
@@ -148,6 +153,7 @@ capture_compose()
             fi
             target="$runtime_evidence_directory/generated-compose-$compose_sha.yaml"
             if [ ! -e "$target" ]; then
+                chmod 644 "$compose_snapshot"
                 cp "$compose_snapshot" "$target"
                 jq -cn \
                     --arg path "$compose_file" \
@@ -166,6 +172,7 @@ capture_traffic()
         [ -f "$traffic_file" ] || continue
         traffic_snapshot=$(mktemp "$snapshot_directory/traffic.XXXXXX")
         if copy_source_snapshot "$traffic_file" "$traffic_snapshot"; then
+            chmod 644 "$traffic_snapshot"
             cp "$traffic_snapshot" "$runtime_evidence_directory/$(basename "$traffic_file")"
         else
             snapshot_status=$?
@@ -184,6 +191,7 @@ write_heartbeat()
 {
     heartbeat_snapshot=$(mktemp "$snapshot_directory/heartbeat.XXXXXX")
     date +%s%N >"$heartbeat_snapshot"
+    chmod 644 "$heartbeat_snapshot"
     mv "$heartbeat_snapshot" "$heartbeat_file"
 }
 
