@@ -1408,7 +1408,7 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
     $publicationPermissions = [
         'artifact-metadata' => 'write',
         'attestations' => 'write',
-        'contents' => 'write',
+        'contents' => 'read',
         'id-token' => 'write',
         'packages' => 'write',
     ];

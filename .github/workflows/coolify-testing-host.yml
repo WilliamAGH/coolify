@@ -48,7 +48,7 @@ jobs:
     permissions:
       artifact-metadata: write
       attestations: write
-      contents: write
+      contents: read
       id-token: write
       packages: write
     with:
