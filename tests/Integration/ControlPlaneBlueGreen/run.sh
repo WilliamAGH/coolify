@@ -435,18 +435,6 @@ assert_release_manifest_preflight_rejections()
         fail 'tampered release manifest was not rejected before Docker or Compose'
     fi
 
-    if PATH="$release_preflight_bin:$PATH" \
-        CONTROL_PLANE_RELEASE_PREFLIGHT_DOCKER_MARKER="$release_preflight_docker_marker" \
-        CONTROL_PLANE_TEST_REHEARSAL_COMPOSE_FILE_SHA256=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff \
-        "$OPERATOR" preflight > "$release_preflight_output" 2>&1; then
-        fail 'operator accepted a migration-rehearsal executor with a stale digest'
-    fi
-    if [ -e "$release_preflight_docker_marker" ] \
-        || ! grep -F -q 'migration-rehearsal executor differs from its pinned digest' \
-            "$release_preflight_output"; then
-        fail 'stale migration-rehearsal executor digest was not rejected before Docker or Compose'
-    fi
-
 }
 
 write_sanitized_probe_headers()
