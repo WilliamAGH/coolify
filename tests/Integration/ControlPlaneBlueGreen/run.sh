@@ -1948,44 +1948,39 @@ scenario_proxy_enrollment_activating_recovery()
     assert_proxy_enrollment_blue_binding absent
 }
 
-scenario_proxy_enrollment_persisted_rollback_recovery()
+scenario_proxy_enrollment_persisted_release_rollback_retention()
 {
     prepare_proxy_enrollment_legacy_lab
     preflight_and_apply_migrations
-    [ -f "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_OPERATOR_STATE_FILE" ] \
-        || fail 'persisted rollback recovery fixture did not create durable operator state'
-    CONTROL_PLANE_TEST_PROXY_ENROLLMENT_MODE=crash-rollback-after-intent
-    export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_MODE
+    operation_state="$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_OPERATOR_STATE_FILE"
+    [ -f "$operation_state" ] \
+        || fail 'persisted release rollback fixture did not create durable operator state'
     if CONTROL_PLANE_TEST_INVALID_ROUTE=1 operator cutover \
-        > "$scenario_directory/proxy-enrollment-rolling-back-crash.log" 2>&1; then
+        > "$scenario_directory/proxy-enrollment-route-rejection.log" 2>&1; then
         fail 'invalid-route cutover fixture unexpectedly completed'
     fi
-    assert_proxy_enrollment_phase rolling-back
+    assert_proxy_enrollment_phase enrolled
     assert_proxy_enrollment_proxy_binding native
     assert_proxy_enrollment_blue_binding absent
     [ -f "$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE" ] \
-        || fail 'rolling-back crash lost the enrolled source compose override before restoration'
-
-    CONTROL_PLANE_TEST_PROXY_ENROLLMENT_MODE=normal
-    export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_MODE
-    if CONTROL_PLANE_TEST_CRASH_AT=after-proxy-enrollment-rollback-pending-legacy \
-        operator rollback > "$scenario_directory/proxy-enrollment-pending-legacy-crash.log" 2>&1; then
-        fail 'rollback-pending-legacy crash injection unexpectedly completed'
+        || fail 'failed route switch revoked the enrolled source compose override'
+    grep -F -x -q 'phase=live-expand-migrations-applied' "$operation_state" \
+        || fail 'failed route switch did not recover durable legacy application routing'
+    if grep -F -x -q rollback "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_LOG_FILE"; then
+        fail 'persisted operation attempted destructive native proxy-enrollment rollback'
     fi
-    assert_proxy_enrollment_phase rollback-pending-legacy
-    assert_proxy_enrollment_proxy_binding legacy
-    assert_proxy_enrollment_blue_binding absent
-    [ ! -e "$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE" ] \
-        || fail 'rollback-pending-legacy retained the source-port suppression override'
 
     operator rollback >/dev/null
-    assert_proxy_enrollment_phase rolled-back
-    assert_proxy_enrollment_proxy_binding legacy
-    assert_proxy_enrollment_blue_binding legacy
-    [ ! -e "$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE" ] \
-        || fail 'terminal persisted rollback retained the source-port suppression override'
-    [ "$(grep -F -x -c rollback "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_LOG_FILE")" -ge 3 ] \
-        || fail 'persisted rollback recovery did not retry the exact rollback action through both durable phases'
+    grep -F -x -q 'phase=rolled-back' "$operation_state" \
+        || fail 'release rollback did not reach its terminal durable state'
+    assert_proxy_enrollment_phase enrolled
+    assert_proxy_enrollment_proxy_binding native
+    assert_proxy_enrollment_blue_binding absent
+    [ -f "$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE" ] \
+        || fail 'terminal release rollback revoked retained native enrollment'
+    if grep -F -x -q rollback "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_LOG_FILE"; then
+        fail 'terminal release rollback attempted destructive native proxy-enrollment rollback'
+    fi
     assert_route_color "https://127.0.0.1:${LAB_TRAEFIK_PORT}/cgi-bin/request" legacy
     assert_route_color http://127.0.0.1:8000/cgi-bin/request legacy
 }
@@ -5295,7 +5290,7 @@ main()
         with_lab proxy-enrollment-success 38 scenario_proxy_enrollment_success
         with_lab proxy-enrollment-preidentity-recovery 39 scenario_proxy_enrollment_preidentity_recovery
         with_lab proxy-enrollment-activating-recovery 40 scenario_proxy_enrollment_activating_recovery
-        with_lab proxy-enrollment-persisted-rollback-recovery 41 scenario_proxy_enrollment_persisted_rollback_recovery
+        with_lab proxy-enrollment-persisted-release-rollback-retention 41 scenario_proxy_enrollment_persisted_release_rollback_retention
         with_lab proxy-enrollment-cross-operation-adoption 42 scenario_proxy_enrollment_cross_operation_adoption
         with_lab proxy-enrollment-partial-credential-recovery 43 scenario_proxy_enrollment_partial_credential_recovery
         remove_mock_image
