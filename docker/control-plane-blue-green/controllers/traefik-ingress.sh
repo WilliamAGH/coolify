@@ -1825,7 +1825,7 @@ assert_member_docker_service_contract()
             $router_prefix + "priority",
             $router_prefix + "rule",
             $router_prefix + "service"
-        ] | sort))
+        ] | sort)
         and ([$labels | keys[] | select(startswith("traefik.http.services."))] | sort) == ([
             $service_prefix + "healthcheck.followredirects",
             $service_prefix + "healthcheck.headers.X-Control-Plane-Route-Health",
