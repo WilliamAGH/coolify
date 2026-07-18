@@ -8,10 +8,26 @@ compose="$script_directory/compose.yaml"
 work_directory=$(mktemp -d "${TMPDIR:-/tmp}/verify-traefik-tombstone.XXXXXX")
 trap 'rm -rf "$work_directory"' EXIT INT TERM
 
-grep -qF "      - \${EVIDENCE_DIRECTORY:?Set EVIDENCE_DIRECTORY}/nested-images.tar:/evidence/nested-images.tar:ro" "$compose"
-grep -qF "      - \${EVIDENCE_DIRECTORY:?Set EVIDENCE_DIRECTORY}:/runtime-evidence" "$compose"
-[ "$(grep -cF "\${EVIDENCE_DIRECTORY:?Set EVIDENCE_DIRECTORY}/nested-images.tar:" "$compose")" = 1 ]
-[ "$(grep -cF "\${EVIDENCE_DIRECTORY:?Set EVIDENCE_DIRECTORY}:/runtime-evidence" "$compose")" = 2 ]
+awk '
+    $0 == "        source: ${EVIDENCE_DIRECTORY:?Set EVIDENCE_DIRECTORY}/nested-images.tar" {
+        getline target
+        getline read_only
+        if (target == "        target: /evidence/nested-images.tar" \
+            && read_only == "        read_only: true") {
+            matched++
+        }
+    }
+    END { exit matched != 1 }
+' "$compose"
+awk '
+    $0 == "        source: ${EVIDENCE_DIRECTORY:?Set EVIDENCE_DIRECTORY}" {
+        getline target
+        if (target == "        target: /runtime-evidence") {
+            matched++
+        }
+    }
+    END { exit matched != 2 }
+' "$compose"
 if grep -qF "\${EVIDENCE_DIRECTORY:?Set EVIDENCE_DIRECTORY}:/evidence" "$compose"; then
     exit 1
 fi

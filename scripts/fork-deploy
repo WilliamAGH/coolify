@@ -212,6 +212,7 @@ Usage:
   fork-deploy rollback --version VERSION [--dry-run]
   fork-deploy repair [--dry-run]
   fork-deploy recover-abort
+  fork-deploy recover-forward
   fork-deploy recover-quiesce
   fork-deploy status
   fork-deploy verify
@@ -225,6 +226,8 @@ require HTTPS unless restoring a previously recorded verified release.
 The production-only trust action installs the built-in expected Ed25519 public key locally.
 Rollback targets must be releases previously verified and recorded by this tool.
 Recover-abort is allowed only for a durable pending state that proves the candidate never started.
+Recover-forward retries the exact signed candidate after startup was declared and preserves all
+writes accepted by that candidate. Snapshot restore is forbidden after candidate startup.
 Recover-quiesce retries an attested backup-quiesce release that could not be confirmed during
 backup cleanup. No deploy action is allowed while that writer fence is unresolved.
 EOF
@@ -656,7 +659,7 @@ fd_parse_args() {
     ACTION=$1
     shift
     case $ACTION in
-        install|update|rollback|repair|recover-abort|recover-quiesce|status|trust|verify) ;;
+        install|update|rollback|repair|recover-abort|recover-forward|recover-quiesce|status|trust|verify) ;;
         -h|--help)
             usage
             exit 0
@@ -714,8 +717,12 @@ fd_parse_args() {
             [[ -n $VERSION && -z $MANIFEST_INPUT && -z $OFFLINE_MANIFEST && -z $TRUST_PUBLIC_KEY ]] || die 'rollback requires only --version'
             validate_version "$VERSION"
             ;;
-        repair|recover-abort|recover-quiesce|status|verify)
+        repair)
             [[ -z $VERSION && -z $MANIFEST_INPUT && -z $OFFLINE_MANIFEST && -z $TRUST_PUBLIC_KEY ]] || die "$ACTION does not accept release arguments"
+            ;;
+        recover-abort|recover-forward|recover-quiesce|status|verify)
+            [[ -z $VERSION && -z $MANIFEST_INPUT && -z $OFFLINE_MANIFEST && -z $TRUST_PUBLIC_KEY && $DRY_RUN == false ]] \
+                || die "$ACTION does not accept release arguments or --dry-run"
             ;;
         trust)
             [[ -n $TRUST_PUBLIC_KEY && -z $VERSION && -z $MANIFEST_INPUT && -z $OFFLINE_MANIFEST && $DRY_RUN == false ]] || die 'trust requires only --public-key ABSOLUTE_PATH'
@@ -1046,6 +1053,60 @@ fd_write_activation() {
     fd_append_history "$now"$'\t'"$ACTION"$'\t'"$VERSION"$'\t'"$MAIN_DIGEST"$'\t'"$REALTIME_DIGEST"$'\t'"$before"$'\t'"$after"
 }
 
+fd_activation_history_exists() {
+    local activated_at=$1 before=$2 after=$3
+
+    state_file_safe_or_missing "$HISTORY_FILE" 'activation history'
+    [[ -e $HISTORY_FILE ]] || return 1
+    awk -F '\t' \
+        -v activated_at="$activated_at" \
+        -v version="$VERSION" \
+        -v main_digest="$MAIN_DIGEST" \
+        -v realtime_digest="$REALTIME_DIGEST" \
+        -v before="$before" \
+        -v after="$after" '
+            $1 == activated_at && $2 == "recover-forward" \
+                && $3 == version && $4 == main_digest \
+                && $5 == realtime_digest && $6 == before && $7 == after { found = 1 }
+            END { exit !found }
+        ' "$HISTORY_FILE"
+}
+
+fd_reconcile_forward_activation() {
+    local before=$1 after=$2 rendered=$3 activation activated_at current
+
+    activation=$(fd_activation_file "$VERSION")
+    if [[ -e $activation || -L $activation ]]; then
+        fd_load_activation "$VERSION"
+        [[ $(fd_activation_field "$VERSION" MIGRATION_FINGERPRINT_BEFORE) == "$before" \
+            && $(fd_activation_field "$VERSION" MIGRATION_FINGERPRINT_AFTER) == "$after" \
+            && $(fd_activation_field "$VERSION" RENDERED_COMPOSE_SHA256) == "$rendered" ]] \
+            || die 'existing candidate activation differs from the forward-recovery result'
+        activated_at=$(read_field "$activation" ACTIVATED_AT "activation state for $VERSION")
+        [[ $activated_at =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
+            || die 'existing candidate activation timestamp is invalid'
+        if [[ -e $CURRENT_FILE || -L $CURRENT_FILE ]]; then
+            current=$(fd_current_version)
+            [[ $current == "$VERSION" ]] \
+                || die "forward recovery found active release $current; expected candidate $VERSION"
+        else
+            fd_atomic_write "$CURRENT_FILE" 'active release state' "$VERSION"
+        fi
+    else
+        activated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        fd_atomic_write "$activation" "activation state for $VERSION" \
+            "VERSION=$VERSION" \
+            "ACTIVATED_AT=$activated_at" \
+            "MIGRATION_FINGERPRINT_BEFORE=$before" \
+            "MIGRATION_FINGERPRINT_AFTER=$after" \
+            "RENDERED_COMPOSE_SHA256=$rendered"
+        fd_atomic_write "$CURRENT_FILE" 'active release state' "$VERSION"
+    fi
+    if ! fd_activation_history_exists "$activated_at" "$before" "$after"; then
+        fd_append_history "$activated_at"$'\t'recover-forward$'\t'"$VERSION"$'\t'"$MAIN_DIGEST"$'\t'"$REALTIME_DIGEST"$'\t'"$before"$'\t'"$after"
+    fi
+}
+
 fd_mark_pending() {
     fd_atomic_write "$PENDING_FILE" 'pending deployment state' \
         'STATE=pending-candidate' \
@@ -1060,8 +1121,7 @@ fd_mark_pending() {
     fd_remove_file "$CURRENT_FILE" 'active release state'
 }
 
-fd_mark_candidate_started() {
-    CANDIDATE_STARTED=true
+fd_write_candidate_started_pending() {
     fd_atomic_write "$PENDING_FILE" 'pending deployment state' \
         'STATE=pending-candidate' \
         "CANDIDATE_VERSION=$VERSION" \
@@ -1072,8 +1132,11 @@ fd_mark_candidate_started() {
         "BACKUP_SOURCE_VERSION=$DEPLOYMENT_BACKUP_SOURCE_VERSION" \
         "PRESTART_UNDO_SHA256=$DEPLOYMENT_PRESTART_UNDO_SHA256" \
         'CANDIDATE_STARTED=true'
+}
+
+fd_write_forward_failure_state() {
     fd_atomic_write "$FAILED_RESTORE_FILE" 'failed deployment recovery state' \
-        'STATE=failed-needs-restore' \
+        'STATE=failed-needs-forward-recovery' \
         "CANDIDATE_VERSION=$VERSION" \
         "PREVIOUS_VERSION=$PREVIOUS_CURRENT_VERSION" \
         "MIGRATION_FINGERPRINT_BEFORE=$DEPLOYMENT_MIGRATION_FINGERPRINT" \
@@ -1081,11 +1144,19 @@ fd_mark_candidate_started() {
         "BACKUP_ATTESTATION_SHA256=$DEPLOYMENT_BACKUP_ATTESTATION_SHA256" \
         "BACKUP_SOURCE_VERSION=$DEPLOYMENT_BACKUP_SOURCE_VERSION" \
         "PRESTART_UNDO_SHA256=$DEPLOYMENT_PRESTART_UNDO_SHA256" \
-        'RECOVERY=Use the control-plane backup/restore operator before any further fork-deploy action. Do not start the previous release automatically.'
+        "RECOVERY=Run $PROGRAM recover-forward to retry this exact signed candidate without restoring the pre-start snapshot. Do not start the previous release automatically."
+}
+
+fd_mark_candidate_started() {
+    CANDIDATE_STARTED=true
+    # Publish the conservative forward-only disposition before changing the pending phase. Either
+    # atomic file is sufficient for recover-forward to reconcile an interrupted transition.
+    fd_write_forward_failure_state
+    fd_write_candidate_started_pending
 }
 
 fd_ensure_no_unresolved() {
-    local pending_state pending_started
+    local pending_state pending_started failed_state candidate active activation
 
     if [[ -e $QUIESCE_RECOVERY_FILE || -L $QUIESCE_RECOVERY_FILE ]]; then
         require_regular_file "$QUIESCE_RECOVERY_FILE" 'backup quiesce recovery state'
@@ -1093,7 +1164,41 @@ fd_ensure_no_unresolved() {
     fi
     if [[ -e $FAILED_RESTORE_FILE || -L $FAILED_RESTORE_FILE ]]; then
         require_regular_file "$FAILED_RESTORE_FILE" 'failed deployment recovery state'
-        die "a deployment is marked failed-needs-restore; use the control-plane backup/restore operator before running $PROGRAM"
+        failed_state=$(read_field "$FAILED_RESTORE_FILE" STATE 'failed deployment recovery state')
+        case $failed_state in
+            failed-needs-forward-recovery)
+                die "a candidate-started deployment requires forward recovery; run $PROGRAM recover-forward"
+                ;;
+            failed-needs-restore)
+                if [[ -e $PENDING_FILE || -L $PENDING_FILE ]]; then
+                    require_regular_file "$PENDING_FILE" 'pending deployment state'
+                    pending_state=$(read_field "$PENDING_FILE" STATE 'pending deployment state')
+                    pending_started=$(read_field "$PENDING_FILE" CANDIDATE_STARTED \
+                        'pending deployment state')
+                    if [[ $pending_state == pending-candidate && $pending_started == true ]]; then
+                        die "a legacy candidate-started deployment forbids snapshot restore; run $PROGRAM recover-forward"
+                    fi
+                fi
+                candidate=$(awk -F= '
+                    $1 == "CANDIDATE_VERSION" { count++; value = substr($0, length($1) + 2) }
+                    END { if (count == 1) print value }
+                ' "$FAILED_RESTORE_FILE")
+                if [[ -n $candidate ]]; then
+                    validate_version "$candidate"
+                    activation=$(fd_activation_file "$candidate")
+                    if [[ ( -e $activation || -L $activation ) \
+                        && ( -e $CURRENT_FILE || -L $CURRENT_FILE ) ]]; then
+                        fd_load_activation "$candidate"
+                        active=$(fd_current_version)
+                        [[ $active == "$candidate" ]] \
+                            || die 'legacy failed state conflicts with the active release; manual recovery is required'
+                        die "a legacy candidate activation requires forward cleanup; run $PROGRAM recover-forward"
+                    fi
+                fi
+                die 'legacy failed state does not prove a safe restore boundary; snapshot restore is forbidden and manual recovery is required'
+                ;;
+            *) die 'failed deployment recovery state is invalid' ;;
+        esac
     fi
     if [[ -e $PENDING_FILE || -L $PENDING_FILE ]]; then
         require_regular_file "$PENDING_FILE" 'pending deployment state'
@@ -1103,6 +1208,9 @@ fd_ensure_no_unresolved() {
             || $pending_state == recover-abort-restoring || $pending_state == recover-abort-finalizing \
             || $pending_state == recover-abort-cleaning ) ]]; then
             die "a deployment is pending before candidate startup; run $PROGRAM recover-abort before running $PROGRAM"
+        fi
+        if [[ $pending_started == true && $pending_state == pending-candidate ]]; then
+            die "a candidate-started deployment requires forward recovery; run $PROGRAM recover-forward"
         fi
         die "a deployment is pending or was interrupted; inspect $PENDING_FILE before running $PROGRAM"
     fi
@@ -2481,18 +2589,10 @@ fd_deployment_failure() {
     set +e
     if [[ $CANDIDATE_STARTED == true ]]; then
         fd_remove_file "$CURRENT_FILE" 'active release state' || true
-        fd_atomic_write "$FAILED_RESTORE_FILE" 'failed deployment recovery state' \
-            'STATE=failed-needs-restore' \
-            "CANDIDATE_VERSION=$candidate_version" \
-            "PREVIOUS_VERSION=$PREVIOUS_CURRENT_VERSION" \
-            "MIGRATION_FINGERPRINT_BEFORE=$DEPLOYMENT_MIGRATION_FINGERPRINT" \
-            "CONFIGURATION_BACKUP=$DEPLOYMENT_BACKUP" \
-            "BACKUP_ATTESTATION_SHA256=$DEPLOYMENT_BACKUP_ATTESTATION_SHA256" \
-            "BACKUP_SOURCE_VERSION=$DEPLOYMENT_BACKUP_SOURCE_VERSION" \
-            "PRESTART_UNDO_SHA256=$DEPLOYMENT_PRESTART_UNDO_SHA256" \
-            'RECOVERY=Use the control-plane backup/restore operator before any further fork-deploy action. Do not start the previous release automatically.' || true
-        note 'Deployment failed after candidate startup. No previous release was started automatically.'
-        note "Recovery required: use the control-plane backup/restore operator. Configuration backup: $DEPLOYMENT_BACKUP"
+        VERSION=$candidate_version
+        fd_write_forward_failure_state || true
+        note 'Deployment failed after candidate startup. Snapshot restore and automatic rollback are forbidden because the candidate may have accepted writes.'
+        note "Recovery required: run $PROGRAM recover-forward to retry the exact signed candidate without discarding writes."
     fi
     if [[ $CANDIDATE_STARTED != true ]] \
         && (fd_validate_backup_attestation "$DEPLOYMENT_BACKUP" \
@@ -2675,7 +2775,7 @@ fd_recover_abort() {
 
     if [[ -e $FAILED_RESTORE_FILE || -L $FAILED_RESTORE_FILE ]]; then
         require_regular_file "$FAILED_RESTORE_FILE" 'failed deployment recovery state'
-        die 'recover-abort is forbidden after candidate startup; use forward recovery or an attested restore'
+        die "recover-abort and snapshot restore are forbidden after candidate startup; run $PROGRAM recover-forward"
     fi
     require_regular_file "$PENDING_FILE" 'pending deployment state'
     state=$(read_field "$PENDING_FILE" STATE 'pending deployment state')
@@ -2685,7 +2785,7 @@ fd_recover_abort() {
     esac
     started=$(read_field "$PENDING_FILE" CANDIDATE_STARTED 'pending deployment state')
     [[ $started == false ]] \
-        || die 'recover-abort is forbidden after candidate startup; use forward recovery or an attested restore'
+        || die "recover-abort and snapshot restore are forbidden after candidate startup; run $PROGRAM recover-forward"
     candidate=$(read_field "$PENDING_FILE" CANDIDATE_VERSION 'pending deployment state')
     validate_version "$candidate"
     previous=$(read_field "$PENDING_FILE" PREVIOUS_VERSION 'pending deployment state')
@@ -2750,6 +2850,133 @@ fd_recover_abort() {
     note 'Recovered the pre-start configuration and cleared the pending candidate without starting containers.'
 }
 
+fd_recover_forward() {
+    local state candidate previous migration backup attestation_sha source_version prestart_sha
+    local pending_started pending_state require_complete=false migration_after rendered field current relative
+    local recovery_file='' recovery_label='' failed_present=false pending_present=false
+    local legacy_forward_state=false release_directory
+
+    [[ ! -e $QUIESCE_RECOVERY_FILE && ! -L $QUIESCE_RECOVERY_FILE ]] \
+        || die 'recover-forward refuses while backup quiesce recovery is also unresolved'
+    if [[ -e $FAILED_RESTORE_FILE || -L $FAILED_RESTORE_FILE ]]; then
+        require_regular_file "$FAILED_RESTORE_FILE" 'failed deployment recovery state'
+        state=$(read_field "$FAILED_RESTORE_FILE" STATE 'failed deployment recovery state')
+        case $state in
+            failed-needs-forward-recovery) ;;
+            failed-needs-restore) legacy_forward_state=true ;;
+            *) die 'failed deployment state is not eligible for forward recovery' ;;
+        esac
+        recovery_file=$FAILED_RESTORE_FILE
+        recovery_label='failed deployment recovery state'
+        failed_present=true
+    fi
+    if [[ -e $PENDING_FILE || -L $PENDING_FILE ]]; then
+        require_regular_file "$PENDING_FILE" 'pending deployment state'
+        pending_state=$(read_field "$PENDING_FILE" STATE 'pending deployment state')
+        pending_started=$(read_field "$PENDING_FILE" CANDIDATE_STARTED 'pending deployment state')
+        [[ $pending_state == pending-candidate && ( $pending_started == true || $pending_started == false ) ]] \
+            || die 'pending deployment state is not eligible for forward recovery'
+        if [[ $pending_started == true && -z $recovery_file ]]; then
+            recovery_file=$PENDING_FILE
+            recovery_label='pending deployment state'
+        fi
+        pending_present=true
+    fi
+    [[ -n $recovery_file ]] \
+        || die 'forward recovery requires a durable candidate-started or failed-forward disposition'
+    if [[ $legacy_forward_state == true \
+        && ( $pending_present != true || $pending_started != true ) ]]; then
+        candidate=$(read_field "$recovery_file" CANDIDATE_VERSION "$recovery_label")
+        validate_version "$candidate"
+        if [[ ( -e $(fd_activation_file "$candidate") \
+            || -L $(fd_activation_file "$candidate") ) \
+            && ( -e $CURRENT_FILE || -L $CURRENT_FILE ) ]]; then
+            fd_load_activation "$candidate"
+            current=$(fd_current_version)
+            [[ $current == "$candidate" ]] \
+                || die 'legacy failed state conflicts with the active release; manual recovery is required'
+        else
+            die 'legacy failed state does not prove candidate startup; snapshot restore is forbidden and manual forward recovery is required'
+        fi
+    fi
+    if [[ $failed_present == true && $pending_present == true ]]; then
+        for field in CANDIDATE_VERSION PREVIOUS_VERSION MIGRATION_FINGERPRINT_BEFORE \
+            CONFIGURATION_BACKUP BACKUP_ATTESTATION_SHA256 BACKUP_SOURCE_VERSION PRESTART_UNDO_SHA256; do
+            [[ $(read_field "$PENDING_FILE" "$field" 'pending deployment state') \
+                == $(read_field "$FAILED_RESTORE_FILE" "$field" 'failed deployment recovery state') ]] \
+                || die "forward recovery state differs between pending and failed disposition: $field"
+        done
+    fi
+
+    candidate=$(read_field "$recovery_file" CANDIDATE_VERSION "$recovery_label")
+    validate_version "$candidate"
+    previous=$(read_field "$recovery_file" PREVIOUS_VERSION "$recovery_label")
+    [[ -z $previous ]] || validate_version "$previous"
+    migration=$(read_field "$recovery_file" MIGRATION_FINGERPRINT_BEFORE "$recovery_label")
+    [[ $migration == uninitialized || $migration =~ ^[0-9a-f]{32}$ ]] \
+        || die 'failed deployment migration fingerprint is invalid'
+    backup=$(read_field "$recovery_file" CONFIGURATION_BACKUP "$recovery_label")
+    validate_absolute_path "$backup" 'failed deployment backup'
+    relative=${backup#"$BACKUPS_DIR"/}
+    [[ $backup == "$BACKUPS_DIR"/backup.* && $relative != */* ]] \
+        || die 'failed deployment backup is outside the managed backup directory'
+    attestation_sha=$(read_field "$recovery_file" BACKUP_ATTESTATION_SHA256 "$recovery_label")
+    source_version=$(read_field "$recovery_file" BACKUP_SOURCE_VERSION "$recovery_label")
+    prestart_sha=$(read_field "$recovery_file" PRESTART_UNDO_SHA256 "$recovery_label")
+    case $source_version in
+        unmanaged) require_complete=false ;;
+        legacy-unmanaged) require_complete=true ;;
+        *) validate_version "$source_version"; require_complete=true ;;
+    esac
+
+    VERSION=$candidate
+    PREVIOUS_CURRENT_VERSION=$previous
+    DEPLOYMENT_MIGRATION_FINGERPRINT=$migration
+    DEPLOYMENT_BACKUP=$backup
+    DEPLOYMENT_BACKUP_ATTESTATION_SHA256=$attestation_sha
+    DEPLOYMENT_BACKUP_SOURCE_VERSION=$source_version
+    DEPLOYMENT_BACKUP_REQUIRE_COMPLETE=$require_complete
+    DEPLOYMENT_PRESTART_UNDO_SHA256=$prestart_sha
+    release_directory=$(fd_release_dir "$candidate")
+    if [[ $legacy_forward_state == true \
+        && ! -f $release_directory/verified ]]; then
+        die 'legacy candidate bundle was not durably recorded; snapshot restore is forbidden and manual forward recovery is required'
+    fi
+    fd_load_recorded_release "$candidate"
+    fd_validate_backup_attestation "$backup" "$attestation_sha" "$source_version" \
+        "$candidate" "$migration" "$require_complete" false
+    fd_write_forward_failure_state
+    fd_write_candidate_started_pending
+    if [[ -e $CURRENT_FILE || -L $CURRENT_FILE ]]; then
+        current=$(fd_current_version)
+        [[ $current == "$candidate" ]] \
+            || die "forward recovery found active release $current; expected candidate $candidate"
+    fi
+    [[ $(env_value "$SOURCE_DIR/.env" COOLIFY_FORK_VERSION) == "$candidate" ]] \
+        || die 'active environment does not identify the exact failed candidate'
+    fd_validate_active_assets "$(fd_release_dir "$candidate")"
+    fd_validate_active_environment
+    fd_validate_effective_images "$SOURCE_DIR"
+    fd_validate_effective_bindings "$SOURCE_DIR"
+    fd_compose_in "$SOURCE_DIR" config --quiet || die 'failed candidate Compose configuration is invalid'
+    # A durable forward disposition makes every pre-start restore path permanently ineligible.
+    # Cleanup may have been interrupted after removing any individual journal entry, so resume by
+    # deleting only the fixed, known plaintext paths rather than requiring an all-or-nothing state.
+    fd_finish_prestart_undo_finalization "$backup"
+
+    fd_ensure_network
+    fd_compose_in "$SOURCE_DIR" up --detach --remove-orphans
+    fd_verify_runtime
+    migration_after=$(fd_migration_fingerprint "$SOURCE_DIR/.env")
+    rendered=$(fd_rendered_sha "$SOURCE_DIR")
+    fd_reconcile_forward_activation "$migration" "$migration_after" "$rendered"
+    enforce_data_permissions
+    fd_prune_backups "$backup"
+    fd_remove_file "$PENDING_FILE" 'pending deployment state'
+    fd_remove_file "$FAILED_RESTORE_FILE" 'failed deployment recovery state'
+    note "Recovered $candidate forward from its exact signed bundle without restoring the pre-start snapshot."
+}
+
 fd_recover_quiesce() {
     local state operator operation token token_sha acquired
 
@@ -2810,19 +3037,19 @@ fd_start_candidate() {
         "$DEPLOYMENT_BACKUP_ATTESTATION_SHA256" "$DEPLOYMENT_BACKUP_SOURCE_VERSION" "$VERSION" \
         "$migration_before" "$DEPLOYMENT_BACKUP_REQUIRE_COMPLETE" true
     fd_validate_prestart_undo "$DEPLOYMENT_BACKUP" "$DEPLOYMENT_PRESTART_UNDO_SHA256"
+    [[ $record_bundle == true ]] && fd_commit_bundle "$staging"
     fd_mark_candidate_started
     fd_finalize_prestart_undo "$DEPLOYMENT_BACKUP"
     fd_compose_in "$SOURCE_DIR" up --detach --remove-orphans
     fd_verify_runtime
     migration_after=$(fd_migration_fingerprint "$SOURCE_DIR/.env")
     rendered=$(fd_rendered_sha "$SOURCE_DIR")
-    [[ $record_bundle == true ]] && fd_commit_bundle "$staging"
     fd_write_activation "$migration_before" "$migration_after" "$rendered"
     enforce_data_permissions
+    fd_prune_backups "$DEPLOYMENT_BACKUP"
     fd_remove_file "$PENDING_FILE" 'pending deployment state'
     fd_remove_file "$FAILED_RESTORE_FILE" 'failed deployment recovery state'
     fd_disarm_recovery
-    fd_prune_backups "$DEPLOYMENT_BACKUP"
     rm -rf "$staging"
 }
 
@@ -2979,6 +3206,7 @@ main() {
             fd_deploy_recorded
             ;;
         recover-abort) fd_recover_abort ;;
+        recover-forward) fd_recover_forward ;;
         status) fd_status ;;
         verify)
             fd_ensure_no_unresolved

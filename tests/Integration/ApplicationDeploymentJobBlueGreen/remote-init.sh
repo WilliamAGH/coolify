@@ -19,9 +19,12 @@ assert_image()
     }
     printf '%s %s\n' "$1" "$actual_id"
 }
-assert_image application-deployment-job-fixture:manifest sha256:44d49aefac1d1f238c33199c24fc935e5e42e61d1bb7a296104fa56d05256874
-assert_image ghcr.io/coollabsio/coolify-helper:1.0.14 sha256:976e161c2b9463b2e4cfac9a697856a285260e9c790653eb4ee325715581e924
-assert_image registry:2.8.3 sha256:33eeff39e0aaabe61ca826fd7502396183462451be0783133e1a8fa944fc7350
+: "${FIXTURE_IMAGE_ID:?FIXTURE_IMAGE_ID is required}"
+assert_image application-deployment-job-fixture:manifest "$FIXTURE_IMAGE_ID"
+: "${HELPER_IMAGE_ID:?HELPER_IMAGE_ID is required}"
+: "${REGISTRY_IMAGE_ID:?REGISTRY_IMAGE_ID is required}"
+assert_image ghcr.io/coollabsio/coolify-helper:1.0.14 "$HELPER_IMAGE_ID"
+assert_image registry:2.8.3 "$REGISTRY_IMAGE_ID"
 : "${TRAEFIK_IMAGE_ID:?TRAEFIK_IMAGE_ID is required}"
 : "${TRAEFIK_PLATFORM:?TRAEFIK_PLATFORM is required}"
 : "${TRAEFIK_VERSION:?TRAEFIK_VERSION is required}"
@@ -61,7 +64,7 @@ docker run --detach --pull never --name coolify-proxy --network coolify --publis
     "traefik:v$TRAEFIK_VERSION" \
     --configFile=/etc/traefik/traefik.yml >/dev/null
 
-[ "$(docker inspect fixture-registry --format '{{.Image}}')" = sha256:33eeff39e0aaabe61ca826fd7502396183462451be0783133e1a8fa944fc7350 ]
+[ "$(docker inspect fixture-registry --format '{{.Image}}')" = "$REGISTRY_IMAGE_ID" ]
 [ "$(docker inspect coolify-proxy --format '{{.Image}}')" = "$TRAEFIK_IMAGE_ID" ]
 
 attempt=0

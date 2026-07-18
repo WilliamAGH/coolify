@@ -80,6 +80,7 @@ new_fixture() {
     export COOLIFY_AUTHORIZED_KEYS=$FIXTURE/root/.ssh/authorized_keys
     export FORK_DEPLOY_MANIFEST_PUBLIC_KEY=$FIXTURE/trust/release-signing-ed25519.pub
     export FORK_DEPLOY_RUNTIME_MARKER=$FIXTURE/runtime-active
+    export FORK_DEPLOY_CANDIDATE_STARTED_MARKER=$FIXTURE/candidate-started
     export FORK_DEPLOY_DB_MARKER=$FIXTURE/database-active
     export FORK_DEPLOY_REDIS_MARKER=$FIXTURE/redis-active
     export FORK_DEPLOY_QUIESCE_MARKER=$FIXTURE/quiesce-active
@@ -96,7 +97,8 @@ new_fixture() {
         FORK_DEPLOY_FAIL_PG_RESTORE_CHECK FORK_DEPLOY_FAIL_REDIS_SAVE \
         FORK_DEPLOY_FAIL_REDIS_COPY FORK_DEPLOY_FAIL_REDIS_CHECK \
         FORK_DEPLOY_FAIL_QUIESCE_RELEASE FORK_DEPLOY_LEGACY_VOLUMES \
-        FORK_DEPLOY_LEGACY_VOLUME_ATTACHMENTS FORK_DEPLOY_DOCKER_UNAVAILABLE || true
+        FORK_DEPLOY_LEGACY_VOLUME_ATTACHMENTS FORK_DEPLOY_DOCKER_UNAVAILABLE \
+        FORK_DEPLOY_FAIL_CANDIDATE_RUNTIME_VERIFY || true
     unset FORK_DEPLOY_FAIL_ACTIVATED_CONFIG FORK_DEPLOY_KILL_ON_ACTIVE_CONFIG \
         FORK_DEPLOY_TEST_KILL_AFTER_RESTORE_PREVIOUS_CURRENT || true
 }
@@ -177,6 +179,52 @@ install_release() {
 
 update_release() {
     "$SUBJECT" update --offline-manifest "$MANIFEST_FILE"
+}
+
+replace_key_value() {
+    local file=$1 key=$2 value=$3 temporary
+
+    temporary=$file.rewrite.$$
+
+    awk -F= -v key="$key" -v value="$value" '
+        $1 == key { print key "=" value; replaced = 1; next }
+        { print }
+        END { exit !replaced }
+    ' "$file" >"$temporary"
+    chmod 0600 "$temporary"
+    mv -f "$temporary" "$file"
+}
+
+prepare_post_start_failure() {
+    write_manifest 4.13.0-fork.1
+    install_release >/dev/null || return 1
+    write_manifest 4.13.0-fork.2
+    rm -f "$FORK_DEPLOY_CANDIDATE_STARTED_MARKER"
+    export FORK_DEPLOY_FAIL_CANDIDATE_RUNTIME_VERIFY=true
+    : >"$LOG"
+    if FORWARD_FAILURE_OUTPUT=$(update_release 2>&1); then
+        unset FORK_DEPLOY_FAIL_CANDIDATE_RUNTIME_VERIFY
+        return 1
+    fi
+    unset FORK_DEPLOY_FAIL_CANDIDATE_RUNTIME_VERIFY
+    [[ -e $FORK_DEPLOY_CANDIDATE_STARTED_MARKER ]]
+}
+
+candidate_history_count() {
+    local version=${1:-4.13.0-fork.2}
+
+    awk -F '\t' -v version="$version" '$3 == version { count++ } END { print count + 0 }' \
+        "$ROOT/fork-deploy/history.tsv"
+}
+
+forward_parser_rejects() {
+    local expected=$1 output
+    shift
+
+    if output=$("$SUBJECT" recover-forward "$@" 2>&1); then
+        return 1
+    fi
+    [[ $output == *"$expected"* ]]
 }
 
 test_rejects_untrusted_caller_inputs() {
@@ -513,32 +561,281 @@ test_repair_rejects_corrupted_recorded_asset() {
     cleanup_fixture
 }
 
-test_failed_candidate_needs_operator_restore() {
+test_help_and_parser_describe_forward_recovery() {
+    new_fixture
+    local output
+    if output=$("$SUBJECT" --help 2>&1) \
+        && [[ $output == *'recover-forward'* \
+            && $output == *'exact signed candidate'* \
+            && $output == *'preserves all'* \
+            && $output == *'Snapshot restore is forbidden'* ]] \
+        && forward_parser_rejects 'does not accept release arguments or --dry-run' --dry-run \
+        && forward_parser_rejects 'does not accept release arguments or --dry-run' --plan \
+        && forward_parser_rejects 'does not accept release arguments or --dry-run' \
+            --version 4.13.0-fork.2 \
+        && forward_parser_rejects 'does not accept release arguments or --dry-run' \
+            --manifest https://example.invalid/release.manifest \
+        && forward_parser_rejects 'does not accept release arguments or --dry-run' \
+            --offline-manifest "$MANIFEST_FILE" \
+        && forward_parser_rejects 'does not accept release arguments or --dry-run' \
+            --public-key "$FORK_DEPLOY_MANIFEST_PUBLIC_KEY" \
+        && [[ ! -e $ROOT ]]; then
+        pass 'help and parser expose only argument-free forward recovery'
+    else
+        fail 'help and parser expose only argument-free forward recovery'
+    fi
+    cleanup_fixture
+}
+
+test_post_start_failure_has_forward_only_disposition() {
+    new_fixture
+    local backup
+    if ! prepare_post_start_failure; then
+        fail 'post-start failure records a durable forward-only disposition'
+        cleanup_fixture
+        return
+    fi
+    backup=$(awk -F= '$1 == "CONFIGURATION_BACKUP" { print substr($0, length($1) + 2) }' \
+        "$ROOT/fork-deploy/failed-needs-restore")
+    if [[ ! -e $ROOT/fork-deploy/current \
+        && -f $ROOT/fork-deploy/failed-needs-restore \
+        && -f $ROOT/fork-deploy/pending-candidate \
+        && -f $ROOT/fork-deploy/releases/4.13.0-fork.2/verified \
+        && -f $backup/configuration.tar.gpg \
+        && ! -e $backup/.env \
+        && ! -e $backup/prestart-undo.manifest ]] \
+        && grep -Fxq 'STATE=failed-needs-forward-recovery' \
+            "$ROOT/fork-deploy/failed-needs-restore" \
+        && grep -Fxq 'CANDIDATE_VERSION=4.13.0-fork.2' \
+            "$ROOT/fork-deploy/failed-needs-restore" \
+        && grep -Fxq 'CANDIDATE_STARTED=true' "$ROOT/fork-deploy/pending-candidate" \
+        && [[ $FORWARD_FAILURE_OUTPUT == *'Snapshot restore and automatic rollback are forbidden'* \
+            && $FORWARD_FAILURE_OUTPUT == *'recover-forward'* ]] \
+        && [[ $(grep -c 'compose .* up' "$LOG" || true) -eq 1 ]]; then
+        pass 'post-start failure records a durable forward-only disposition'
+    else
+        fail 'post-start failure records a durable forward-only disposition'
+    fi
+    cleanup_fixture
+}
+
+test_forward_recovery_preserves_writes_and_exact_candidate() {
+    new_fixture
+    local source_hash
+    if ! prepare_post_start_failure; then
+        fail 'forward recovery preserves writes and activates the exact recorded candidate'
+        cleanup_fixture
+        return
+    fi
+    source_hash=$(hash_file "$ROOT/source/docker-compose.custom.yml")
+    printf 'accepted-after-candidate-start\n' >"$ROOT/applications/post-start-write"
+    write_manifest 4.13.0-fork.99
+    : >"$LOG"
+    if "$SUBJECT" recover-forward >/dev/null \
+        && [[ $(<"$ROOT/fork-deploy/current") == 4.13.0-fork.2 ]] \
+        && [[ $(<"$ROOT/applications/post-start-write") == accepted-after-candidate-start ]] \
+        && [[ $(hash_file "$ROOT/source/docker-compose.custom.yml") == "$source_hash" ]] \
+        && [[ -f $ROOT/fork-deploy/activations/4.13.0-fork.2 \
+            && ! -e $ROOT/fork-deploy/failed-needs-restore \
+            && ! -e $ROOT/fork-deploy/pending-candidate ]] \
+        && [[ $(candidate_history_count) -eq 1 ]] \
+        && [[ $(grep -c 'compose .* up' "$LOG" || true) -eq 1 ]] \
+        && ! grep -Eq 'pg_restore .*(--dbname|-d )' "$LOG" \
+        && "$SUBJECT" verify >/dev/null; then
+        pass 'forward recovery preserves writes and activates the exact recorded candidate'
+    else
+        fail 'forward recovery preserves writes and activates the exact recorded candidate'
+    fi
+    cleanup_fixture
+}
+
+test_forward_recovery_retries_one_sided_and_cleanup_states() {
+    new_fixture
+    local pending=$ROOT/fork-deploy/pending-candidate
+    local failed=$ROOT/fork-deploy/failed-needs-restore backup
+    if ! prepare_post_start_failure; then
+        fail 'forward recovery retries one-sided and interrupted cleanup states idempotently'
+        cleanup_fixture
+        return
+    fi
+    cp "$pending" "$FIXTURE/saved-pending"
+    cp "$failed" "$FIXTURE/saved-failed"
+    backup=$(awk -F= '$1 == "CONFIGURATION_BACKUP" { print substr($0, length($1) + 2) }' \
+        "$failed")
+    mkdir "$backup/prestart-undo"
+    printf 'partially-finalized\n' >"$backup/prestart-undo/authorized_keys"
+    printf 'partially-finalized\n' >"$backup/.env"
+    printf 'accepted-after-candidate-start\n' >"$ROOT/applications/post-start-write"
+
+    export FORK_DEPLOY_FAIL_COMPOSE_UP=true
+    if "$SUBJECT" recover-forward >/dev/null 2>&1; then
+        unset FORK_DEPLOY_FAIL_COMPOSE_UP
+        fail 'forward recovery retries one-sided and interrupted cleanup states idempotently'
+        cleanup_fixture
+        return
+    fi
+    unset FORK_DEPLOY_FAIL_COMPOSE_UP
+    if [[ ! -f $pending || ! -f $failed \
+        || -e $backup/prestart-undo || -e $backup/.env \
+        || -e $ROOT/fork-deploy/current ]]; then
+        fail 'forward recovery retries one-sided and interrupted cleanup states idempotently'
+        cleanup_fixture
+        return
+    fi
+
+    rm -f "$pending"
+    if ! "$SUBJECT" recover-forward >/dev/null \
+        || [[ $(candidate_history_count) -ne 1 ]]; then
+        fail 'forward recovery retries one-sided and interrupted cleanup states idempotently'
+        cleanup_fixture
+        return
+    fi
+
+    cp "$FIXTURE/saved-pending" "$pending"
+    chmod 0600 "$pending"
+    if ! "$SUBJECT" recover-forward >/dev/null \
+        || [[ $(candidate_history_count) -ne 1 ]]; then
+        fail 'forward recovery retries one-sided and interrupted cleanup states idempotently'
+        cleanup_fixture
+        return
+    fi
+
+    cp "$FIXTURE/saved-failed" "$failed"
+    chmod 0600 "$failed"
+    replace_key_value "$failed" STATE failed-needs-restore
+    if ! "$SUBJECT" recover-forward >/dev/null \
+        || [[ $(candidate_history_count) -ne 1 ]]; then
+        fail 'forward recovery retries one-sided and interrupted cleanup states idempotently'
+        cleanup_fixture
+        return
+    fi
+
+    cp "$FIXTURE/saved-failed" "$failed"
+    cp "$FIXTURE/saved-pending" "$pending"
+    chmod 0600 "$failed" "$pending"
+    replace_key_value "$pending" CANDIDATE_STARTED false
+    if "$SUBJECT" recover-forward >/dev/null \
+        && [[ $(candidate_history_count) -eq 1 \
+            && $(<"$ROOT/fork-deploy/current") == 4.13.0-fork.2 \
+            && $(<"$ROOT/applications/post-start-write") == accepted-after-candidate-start \
+            && ! -e $pending && ! -e $failed ]]; then
+        pass 'forward recovery retries one-sided and interrupted cleanup states idempotently'
+    else
+        fail 'forward recovery retries one-sided and interrupted cleanup states idempotently'
+    fi
+    cleanup_fixture
+}
+
+test_forward_recovery_forbids_mismatch_abort_and_rollback() {
+    new_fixture
+    local pending=$ROOT/fork-deploy/pending-candidate
+    local rollback_output abort_output mismatch_output current_output environment_output
+    if ! prepare_post_start_failure; then
+        fail 'forward recovery fails closed on mismatch, abort, and rollback attempts'
+        cleanup_fixture
+        return
+    fi
+    cp "$pending" "$FIXTURE/saved-pending"
+    printf 'accepted-after-candidate-start\n' >"$ROOT/applications/post-start-write"
+    : >"$LOG"
+
+    if rollback_output=$("$SUBJECT" rollback --version 4.13.0-fork.1 2>&1); then
+        rollback_output=accepted
+    fi
+    abort_output=$("$SUBJECT" recover-abort 2>&1 || true)
+    replace_key_value "$pending" CANDIDATE_VERSION 4.13.0-fork.3
+    mismatch_output=$("$SUBJECT" recover-forward 2>&1 || true)
+    cp "$FIXTURE/saved-pending" "$pending"
+    chmod 0600 "$pending"
+    printf '4.13.0-fork.1\n' >"$ROOT/fork-deploy/current"
+    current_output=$("$SUBJECT" recover-forward 2>&1 || true)
+    rm -f "$ROOT/fork-deploy/current"
+    replace_key_value "$ROOT/source/.env" COOLIFY_FORK_VERSION 4.13.0-fork.1
+    environment_output=$("$SUBJECT" recover-forward 2>&1 || true)
+
+    if [[ $rollback_output == *'requires forward recovery'* \
+        && $abort_output == *'snapshot restore are forbidden'* \
+        && $mismatch_output == *'state differs between pending and failed disposition'* \
+        && $current_output == *'found active release 4.13.0-fork.1'* \
+        && $environment_output == *'does not identify the exact failed candidate'* \
+        && $(<"$ROOT/applications/post-start-write") == accepted-after-candidate-start \
+        && -f $ROOT/fork-deploy/failed-needs-restore \
+        && -f $pending ]] \
+        && ! grep -q 'compose .* up' "$LOG" \
+        && ! grep -Eq 'pg_restore .*(--dbname|-d )' "$LOG"; then
+        pass 'forward recovery fails closed on mismatch, abort, and rollback attempts'
+    else
+        fail 'forward recovery fails closed on mismatch, abort, and rollback attempts'
+    fi
+    cleanup_fixture
+}
+
+test_forward_recovery_reconciles_historical_rollback_activation() {
     new_fixture
     write_manifest 4.13.0-fork.1
     if ! install_release >/dev/null; then
-        fail 'candidate startup failure leaves durable recovery state'
+        fail 'forward recovery replaces a historical rollback activation safely'
         cleanup_fixture
         return
     fi
     write_manifest 4.13.0-fork.2
-    export FORK_DEPLOY_FAIL_COMPOSE_UP=true
+    if ! update_release >/dev/null; then
+        fail 'forward recovery replaces a historical rollback activation safely'
+        cleanup_fixture
+        return
+    fi
+
+    rm -f "$FORK_DEPLOY_CANDIDATE_STARTED_MARKER"
+    export FORK_DEPLOY_FAIL_CANDIDATE_RUNTIME_VERIFY=true
+    if "$SUBJECT" rollback --version 4.13.0-fork.1 >/dev/null 2>&1; then
+        unset FORK_DEPLOY_FAIL_CANDIDATE_RUNTIME_VERIFY
+        fail 'forward recovery replaces a historical rollback activation safely'
+        cleanup_fixture
+        return
+    fi
+    unset FORK_DEPLOY_FAIL_CANDIDATE_RUNTIME_VERIFY
+    printf 'accepted-during-rollback-recovery\n' >"$ROOT/applications/post-start-write"
     : >"$LOG"
-    local output backup
-    if output=$(update_release 2>&1); then
-        fail 'candidate startup failure leaves durable recovery state'
+
+    if "$SUBJECT" recover-forward >/dev/null \
+        && [[ $(<"$ROOT/fork-deploy/current") == 4.13.0-fork.1 \
+            && $(candidate_history_count 4.13.0-fork.1) -eq 2 \
+            && $(<"$ROOT/applications/post-start-write") == accepted-during-rollback-recovery \
+            && ! -e $ROOT/fork-deploy/pending-candidate \
+            && ! -e $ROOT/fork-deploy/failed-needs-restore ]] \
+        && ! grep -Eq 'pg_restore .*(--dbname|-d )' "$LOG" \
+        && "$SUBJECT" verify >/dev/null; then
+        pass 'forward recovery replaces a historical rollback activation safely'
     else
-        backup=$(awk -F= '$1 == "CONFIGURATION_BACKUP" { print substr($0, length($1) + 2) }' \
-            "$ROOT/fork-deploy/failed-needs-restore" 2>/dev/null || true)
-        if [[ ! -e $ROOT/fork-deploy/current && -f $ROOT/fork-deploy/failed-needs-restore \
-            && -n $backup && -f $backup/configuration.tar.gpg \
-            && ! -e $backup/.env && ! -e $backup/prestart-undo.manifest ]] \
-        && [[ $output == *'No previous release was started automatically'* ]] \
-        && [[ $(grep -c 'compose .* up' "$LOG" || true) -eq 1 ]]; then
-            pass 'candidate startup failure leaves durable recovery state'
-        else
-            fail 'candidate startup failure leaves durable recovery state'
-        fi
+        fail 'forward recovery replaces a historical rollback activation safely'
+    fi
+    cleanup_fixture
+}
+
+test_legacy_post_start_failure_without_bundle_fails_closed() {
+    new_fixture
+    if ! prepare_post_start_failure; then
+        fail 'legacy post-start failure without a recorded bundle fails closed'
+        cleanup_fixture
+        return
+    fi
+    replace_key_value "$ROOT/fork-deploy/failed-needs-restore" STATE failed-needs-restore
+    mv "$ROOT/fork-deploy/releases/4.13.0-fork.2" \
+        "$ROOT/fork-deploy/releases/4.13.0-fork.2.not-recorded"
+    printf 'accepted-after-candidate-start\n' >"$ROOT/applications/post-start-write"
+    : >"$LOG"
+    local output
+    if output=$("$SUBJECT" recover-forward 2>&1); then
+        fail 'legacy post-start failure without a recorded bundle fails closed'
+    elif [[ $output == *'snapshot restore is forbidden'* \
+        && $output == *'manual forward recovery is required'* \
+        && $(<"$ROOT/applications/post-start-write") == accepted-after-candidate-start \
+        && -f $ROOT/fork-deploy/failed-needs-restore \
+        && -f $ROOT/fork-deploy/pending-candidate ]] \
+        && ! grep -Eq 'pg_restore .*(--dbname|-d )' "$LOG"; then
+        pass 'legacy post-start failure without a recorded bundle fails closed'
+    else
+        fail 'legacy post-start failure without a recorded bundle fails closed'
     fi
     cleanup_fixture
 }
@@ -1298,9 +1595,11 @@ test_recover_abort_refuses_after_candidate_start() {
     local output
     if output=$("$SUBJECT" recover-abort 2>&1); then
         fail 'recover-abort refuses state after candidate startup'
-    elif [[ $output == *'forbidden after candidate startup'* ]] \
+    elif [[ $output == *'snapshot restore are forbidden after candidate startup'* \
+        && $output == *'recover-forward'* ]] \
         && [[ ! -e $ROOT/fork-deploy/current ]] \
-        && [[ -f $ROOT/fork-deploy/failed-needs-restore ]]; then
+        && grep -Fxq 'STATE=failed-needs-forward-recovery' \
+            "$ROOT/fork-deploy/failed-needs-restore"; then
         pass 'recover-abort refuses state after candidate startup'
     else
         fail 'recover-abort refuses state after candidate startup'
@@ -1325,7 +1624,13 @@ test_update_requires_verified_current_release
 test_update_requires_healthy_current_runtime
 test_repair_never_rewrites_verified_bundle
 test_repair_rejects_corrupted_recorded_asset
-test_failed_candidate_needs_operator_restore
+test_help_and_parser_describe_forward_recovery
+test_post_start_failure_has_forward_only_disposition
+test_forward_recovery_preserves_writes_and_exact_candidate
+test_forward_recovery_retries_one_sided_and_cleanup_states
+test_forward_recovery_forbids_mismatch_abort_and_rollback
+test_forward_recovery_reconciles_historical_rollback_activation
+test_legacy_post_start_failure_without_bundle_fails_closed
 test_invalid_ports_fail_before_activation
 test_rejects_release_asset_contract_hash_mismatch
 test_verify_rejects_all_unsafe_runtime_bindings

@@ -126,6 +126,7 @@ case $name in
                     [[ ! -e ${FORK_DEPLOY_QUIESCE_MARKER:-/nonexistent} ]] || exit 1
                     [[ ${FORK_DEPLOY_FAIL_COMPOSE_UP:-false} != true ]] || exit 1
                     : >"$FORK_DEPLOY_RUNTIME_MARKER"
+                    : >"${FORK_DEPLOY_CANDIDATE_STARTED_MARKER:-$FORK_DEPLOY_RUNTIME_MARKER}"
                     : >"${FORK_DEPLOY_DB_MARKER:-$FORK_DEPLOY_RUNTIME_MARKER}"
                     : >"${FORK_DEPLOY_REDIS_MARKER:-$FORK_DEPLOY_RUNTIME_MARKER}"
                 fi
@@ -214,6 +215,12 @@ case $name in
                 elif [[ $* == *State.Running* ]]; then
                     printf 'true\n'
                 elif [[ $* == *Config.Image* ]]; then
+                    if [[ ${FORK_DEPLOY_FAIL_CANDIDATE_RUNTIME_VERIFY:-false} == true \
+                        && -e ${FORK_DEPLOY_CANDIDATE_STARTED_MARKER:-/nonexistent} \
+                        && ${*: -1} == coolify ]]; then
+                        printf 'docker.iocloudhost.net/williamagh/coolify@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n'
+                        exit 0
+                    fi
                     case ${*: -1} in
                         coolify-realtime) printf 'docker.iocloudhost.net/williamagh/coolify-realtime@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' ;;
                         coolify-db) printf 'docker.io/library/postgres@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\n' ;;

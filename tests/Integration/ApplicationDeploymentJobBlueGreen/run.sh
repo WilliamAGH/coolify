@@ -118,6 +118,9 @@ sha256sum \
 
 docker buildx build --load --file "$LAB_DIRECTORY/Dockerfile.fixture" \
     --tag application-deployment-job-fixture:manifest "$LAB_DIRECTORY"
+FIXTURE_IMAGE_ID=$(docker image inspect application-deployment-job-fixture:manifest \
+    --format '{{.Id}}')
+export FIXTURE_IMAGE_ID
 
 docker_architecture=$(docker info --format '{{.Architecture}}')
 case "$docker_architecture" in
@@ -188,6 +191,10 @@ docker tag 'ghcr.io/coollabsio/coolify-helper:1.0.14@sha256:55acc11740d42a5646e7
     ghcr.io/coollabsio/coolify-helper:1.0.14
 docker tag 'registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373' \
     registry:2.8.3
+HELPER_IMAGE_ID=$(docker image inspect ghcr.io/coollabsio/coolify-helper:1.0.14 \
+    --format '{{.Id}}')
+REGISTRY_IMAGE_ID=$(docker image inspect registry:2.8.3 --format '{{.Id}}')
+export HELPER_IMAGE_ID REGISTRY_IMAGE_ID
 
 docker image inspect \
     "$CONTROL_PLANE_IMAGE" \

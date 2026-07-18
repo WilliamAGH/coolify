@@ -3,22 +3,26 @@ FROM docker.io/library/docker@sha256:862099ada15c669000bef53aa4cb9d821262829f45b
 RUN apk add --no-cache bash coreutils findutils gnupg openssl socat su-exec=0.3-r0 tar util-linux \
     && apk info -e su-exec=0.3-r0 >/dev/null
 
+COPY docker/control-plane-blue-green /opt/control-plane-blue-green
 COPY docker/control-plane-blue-green/backup /opt/control-plane-backup
-COPY docker/control-plane-blue-green/compose.yaml /opt/control-plane-blue-green/compose.yaml
-COPY docker/control-plane-blue-green/control-plane-blue-green.sh \
-    /opt/control-plane-blue-green/control-plane-blue-green.sh
-COPY docker/control-plane-blue-green/backup-quiesce \
-    /opt/control-plane-blue-green/backup-quiesce
 COPY tests/Integration/ControlPlaneBackupRestore/hooks /opt/lab-hooks
 COPY tests/Integration/ControlPlaneBackupRestore/fixtures /opt/lab-fixtures
 COPY tests/Integration/ControlPlaneBlueGreen/mock-control-plane/lab-service.sh \
     /usr/local/bin/control-plane-lab-service
 RUN chown -R root:root /opt/control-plane-backup /opt/lab-hooks /opt/lab-fixtures \
-    /opt/control-plane-blue-green /sbin/su-exec /usr/local/bin/control-plane-lab-service \
+        /opt/control-plane-blue-green /sbin/su-exec /usr/local/bin/control-plane-lab-service \
     && chmod 755 /opt/control-plane-backup/*.sh /opt/lab-hooks/*.sh \
-    /opt/control-plane-blue-green/control-plane-blue-green.sh \
-    /opt/control-plane-blue-green/backup-quiesce/*.sh \
-    /sbin/su-exec /usr/local/bin/control-plane-lab-service \
-    && chmod 644 /opt/control-plane-blue-green/compose.yaml \
+        /opt/control-plane-blue-green/control-plane-blue-green.sh \
+        /opt/control-plane-blue-green/backup-quiesce/*.sh \
+        /sbin/su-exec /usr/local/bin/control-plane-lab-service \
+    && chmod 600 /opt/control-plane-blue-green/compose.yaml \
+        /opt/control-plane-blue-green/compose.rehearsal.yaml \
+    && chmod 700 /opt/control-plane-blue-green/controllers/traefik-ingress.sh \
+        /opt/control-plane-blue-green/controllers/provision-runtime-attestation-ssh-fence.sh \
+        /opt/control-plane-blue-green/controllers/runtime-attestation-ssh-fence.sh \
+        /opt/control-plane-blue-green/controllers/self-ssh-controlmaster-reaper.sh \
+        /opt/control-plane-blue-green/controllers/traefik-docker-provider-freshness-probe.sh \
+        /opt/control-plane-blue-green/controllers/proxy-queue-zero-probe.sh \
+        /opt/control-plane-blue-green/controllers/control-plane-terminal-state-probe.sh \
     && test ! -L /sbin/su-exec \
     && test "$(stat -c '%u:%g:%a' /sbin/su-exec)" = 0:0:755

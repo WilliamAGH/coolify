@@ -2360,7 +2360,7 @@ start_watchdog()
     if [ "$q_watchdog_owner" = detached-test ]; then
         nohup "$q_controller_path" watchdog-wait \
             --state-directory "$quiesce_state_directory" \
-            --operation-id "$q_operation_id" 8>&- </dev/null >/dev/null 2>&1 &
+            --operation-id "$q_operation_id" 8>&- 9>&- </dev/null >/dev/null 2>&1 &
         watchdog_pid=$!
         kill -0 "$watchdog_pid" >/dev/null 2>&1 \
             || fail 'detached lab backup quiesce watchdog did not start'

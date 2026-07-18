@@ -496,10 +496,42 @@ run_tools bash --env "TARGET_CONTAINER=$TARGET_CONTAINER" \
         "$TARGET_CONTAINER" "$TARGET_CONTAINER" "$RESTORE_REDIS_HOST" \
         "redis-restore-password" > /lab/candidate.env
     printf "%s\n" "redis-restore-password" > /lab/redis-password
-    printf "%s\n" 0123456789abcdef0123456789abcdef > /lab/probe-token
-    printf "%s\n" fedcba9876543210fedcba9876543210 > /lab/probe-ack
+    printf "%s" 0123456789abcdef0123456789abcdef > /lab/probe-token
+    printf "%s" fedcba9876543210fedcba9876543210 > /lab/probe-ack
     chmod 755 /lab/state-proof.sh
     chmod 600 /lab/candidate.env /lab/redis-password /lab/probe-token /lab/probe-ack
+
+    release_id=backup-restore-lab-release-0001
+    release_manifest=/lab/release.manifest
+    printf "version|1\nrelease|%s\n" "$release_id" > "$release_manifest"
+    while IFS="|" read -r asset_role asset_path; do
+        asset_sha256=$(sha256sum "$asset_path")
+        asset_sha256=${asset_sha256%% *}
+        printf "asset|%s|%s|%s|%s|%s|%s\n" \
+            "$asset_role" "$asset_path" "$asset_sha256" \
+            "$(stat -c %u "$asset_path")" "$(stat -c %g "$asset_path")" \
+            "$(stat -c %a "$asset_path")" >> "$release_manifest"
+    done <<EOF
+operator|/opt/control-plane-blue-green/control-plane-blue-green.sh
+operator-compose|/opt/control-plane-blue-green/compose.yaml
+rehearsal-compose|/opt/control-plane-blue-green/compose.rehearsal.yaml
+ingress-controller|/opt/control-plane-blue-green/controllers/traefik-ingress.sh
+backup-attestation-verifier|/opt/control-plane-blue-green/backup/restore-attest.sh
+backup-quiesce-controller|/opt/control-plane-blue-green/backup-quiesce/control-plane-backup-quiesce.sh
+backup-quiesce-service-unit|/opt/control-plane-blue-green/backup-quiesce/control-plane-backup-quiesce-watchdog.service
+backup-quiesce-timer-unit|/opt/control-plane-blue-green/backup-quiesce/control-plane-backup-quiesce-watchdog.timer
+runtime-fence-provisioner|/opt/control-plane-blue-green/controllers/provision-runtime-attestation-ssh-fence.sh
+runtime-fence-controller|/opt/control-plane-blue-green/controllers/runtime-attestation-ssh-fence.sh
+runtime-fence-controlmaster-reaper|/opt/control-plane-blue-green/controllers/self-ssh-controlmaster-reaper.sh
+runtime-fence-provider-probe|/opt/control-plane-blue-green/controllers/traefik-docker-provider-freshness-probe.sh
+runtime-fence-queue-probe|/opt/control-plane-blue-green/controllers/proxy-queue-zero-probe.sh
+runtime-fence-terminal-probe|/opt/control-plane-blue-green/controllers/control-plane-terminal-state-probe.sh
+runtime-fence-service-unit|/opt/control-plane-blue-green/controllers/coolify-runtime-attestation-ssh-fence.service
+runtime-fence-watchdog-unit|/opt/control-plane-blue-green/controllers/coolify-runtime-attestation-ssh-fence-watchdog.service
+EOF
+    chmod 600 "$release_manifest"
+    release_manifest_sha256=$(sha256sum "$release_manifest")
+    printf "%s\n" "${release_manifest_sha256%% *}" > /lab/release-manifest.sha256
 '
 run_tools mkdir -- --mode=700 /source-state/ssh/mux
 run_tools chown -- 9999:9999 /source-state/ssh/mux
@@ -534,9 +566,15 @@ docker run --detach --name "$LIVE_CONTAINER" --user 9999:9999 \
 docker run --detach --name "$REALTIME_CONTAINER" --entrypoint sleep "$TOOLS_IMAGE" infinity \
     >/dev/null
 
+RELEASE_MANIFEST_SHA256=$(tr -d '[:space:]' < "$RUNTIME_DIRECTORY/release-manifest.sha256")
+
 QUIESCE_DOCKER_OPTIONS=(
     --env CONTROL_PLANE_TEST_MODE=1
     --env CONTROL_PLANE_OPERATOR_TARGET=lab
+    --env CONTROL_PLANE_TEST_GLOBAL_TRANSACTION_LOCK_FILE=/lab/control-plane-blue-green.lock
+    --env CONTROL_PLANE_RELEASE_MANIFEST_FILE=/lab/release.manifest
+    --env "CONTROL_PLANE_RELEASE_MANIFEST_SHA256=$RELEASE_MANIFEST_SHA256"
+    --env CONTROL_PLANE_RELEASE_ID=backup-restore-lab-release-0001
     --env "CONTROL_PLANE_TEST_BACKUP_QUIESCE_BOOT_ID=$BACKUP_QUIESCE_BOOT_ID"
     --env "CONTROL_PLANE_BACKUP_LIVE_CONTAINER=$LIVE_CONTAINER"
     --env "CONTROL_PLANE_BACKUP_REALTIME_CONTAINER=$REALTIME_CONTAINER"
@@ -546,7 +584,7 @@ QUIESCE_DOCKER_OPTIONS=(
     --env CONTROL_PLANE_BACKUP_APPLICATION_DATABASE_ROLE=coolify_app
     --env CONTROL_PLANE_BACKUP_QUIESCE_STATE_DIR=/lab/backup-quiesce-state
     --env CONTROL_PLANE_BACKUP_QUIESCE_DRAIN_TIMEOUT_SECONDS=3
-    --env CONTROL_PLANE_BACKUP_QUIESCE_PROBE_TIMEOUT_SECONDS=1
+    --env CONTROL_PLANE_BACKUP_QUIESCE_PROBE_TIMEOUT_SECONDS=3
     --env CONTROL_PLANE_S6_WAIT_MILLISECONDS=1000
     --env CONTROL_PLANE_BACKUP_QUIESCE_REALTIME_STOP_SECONDS=1
     --env CONTROL_PLANE_BACKUP_QUIESCE_MINIMUM_CAPTURE_SECONDS=2
@@ -555,6 +593,8 @@ QUIESCE_DOCKER_OPTIONS=(
 
 RECIPIENT_FINGERPRINT=$(tr -d '[:space:]' < "$RUNTIME_DIRECTORY/recipient-fingerprint")
 OPERATION_ID=backup-restore-lab
+CANDIDATE_RESOURCE_HASH=$(printf '%s' "$OPERATION_ID" \
+    | sha256sum | awk '{print substr($1, 1, 20)}')
 
 (
     write_count=0
@@ -681,6 +721,7 @@ CONCURRENT_WRITE_COUNT=$(tr -d '[:space:]' < "$RUNTIME_DIRECTORY/concurrent-writ
     || { printf '%s\n' 'concurrent source writer did not overlap capture' >&2; exit 1; }
 
 KILL_OPERATION=backup-restore-power-loss
+POWER_LOSS_LEASE_SECONDS=80
 docker run --detach --name "$KILL_CAPTURE_CONTAINER" --hostname source-host-lab \
     --volume /var/run/docker.sock:/var/run/docker.sock \
     --tmpfs /plaintext:rw,noexec,nosuid,nodev,mode=0700,uid=0,gid=0 \
@@ -704,7 +745,7 @@ docker exec "$KILL_CAPTURE_CONTAINER" /opt/control-plane-backup/capture.sh \
     --plaintext-tmpfs-root /plaintext \
     --quiesce-operator /opt/control-plane-blue-green/control-plane-blue-green.sh \
     --expected-quiesce-operator-sha256 "$QUIESCE_OPERATOR_SHA256" \
-    --quiesce-lease-seconds 40 \
+    --quiesce-lease-seconds "$POWER_LOSS_LEASE_SECONDS" \
     --restore-tool /opt/control-plane-backup/restore-attest.sh \
     > "$RUNTIME_DIRECTORY/power-loss-capture.log" 2>&1 &
 CAPTURE_PID=$!
@@ -723,7 +764,7 @@ docker kill --signal KILL "$KILL_CAPTURE_CONTAINER" >/dev/null
 wait "$CAPTURE_PID" >/dev/null 2>&1 || true
 CAPTURE_PID=
 docker rm "$KILL_CAPTURE_CONTAINER" >/dev/null
-sleep 41
+sleep "$((POWER_LOSS_LEASE_SECONDS + 1))"
 run_tools /opt/control-plane-blue-green/backup-quiesce/control-plane-backup-quiesce.sh \
     --env CONTROL_PLANE_TEST_MODE=1 \
     --env "CONTROL_PLANE_TEST_BACKUP_QUIESCE_BOOT_ID=$BACKUP_QUIESCE_BOOT_ID" -- \
@@ -1001,6 +1042,10 @@ docker network disconnect --force "$LAB_ID-candidate-network" "$TARGET_CONTAINER
 docker network disconnect --force "$LAB_ID-candidate-network" "$LAB_ID-redis-main" \
     >/dev/null 2>&1 || true
 docker volume rm "$LAB_ID-candidate-state" >/dev/null
+docker volume rm "backup-candidate-coordination-$CANDIDATE_RESOURCE_HASH" >/dev/null
+[[ -z $(docker volume ls --quiet \
+    --filter "name=^backup-candidate-coordination-${CANDIDATE_RESOURCE_HASH}$") ]] \
+    || { printf '%s\n' 'candidate coordination volume survived successful restore proof' >&2; exit 1; }
 docker network rm "$LAB_ID-candidate-network" >/dev/null
 docker rm -f "$LAB_ID-redis-main" >/dev/null
 docker volume rm "$LAB_ID-redis-data-main" >/dev/null

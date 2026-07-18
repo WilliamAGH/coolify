@@ -70,6 +70,9 @@ services:
       COOLIFY_TESTING_HOST_FIXTURE_ARCHITECTURE: ${TESTING_HOST_IMAGE_ARCHITECTURE:?Set TESTING_HOST_IMAGE_ARCHITECTURE}
       COOLIFY_TESTING_HOST_FIXTURE_ID: ${TESTING_HOST_IMAGE_ID:?Set TESTING_HOST_IMAGE_ID}
       COOLIFY_TESTING_HOST_FIXTURE_IMAGE: ${TESTING_HOST_IMAGE:?Set TESTING_HOST_IMAGE}
+      FIXTURE_IMAGE_ID: ${FIXTURE_IMAGE_ID:?Set FIXTURE_IMAGE_ID}
+      HELPER_IMAGE_ID: ${HELPER_IMAGE_ID:?Set HELPER_IMAGE_ID}
+      REGISTRY_IMAGE_ID: ${REGISTRY_IMAGE_ID:?Set REGISTRY_IMAGE_ID}
       TRAEFIK_IMAGE_ID: ${TRAEFIK_IMAGE_ID:?Set TRAEFIK_IMAGE_ID}
       TRAEFIK_MANIFEST_DIGEST: ${TRAEFIK_MANIFEST_DIGEST:?Set TRAEFIK_MANIFEST_DIGEST}
       TRAEFIK_PLATFORM: ${TRAEFIK_PLATFORM:?Set TRAEFIK_PLATFORM}
@@ -78,8 +81,13 @@ services:
       - coolify-data:/data/coolify
       - docker-run:/var/run
       - testing-host-public-key:/run/coolify-testing-host/public:ro
-      - ${EVIDENCE_DIRECTORY:?Set EVIDENCE_DIRECTORY}/nested-images.tar:/evidence/nested-images.tar:ro
-      - ${EVIDENCE_DIRECTORY:?Set EVIDENCE_DIRECTORY}:/runtime-evidence
+      - type: bind
+        source: ${EVIDENCE_DIRECTORY:?Set EVIDENCE_DIRECTORY}/nested-images.tar
+        target: /evidence/nested-images.tar
+        read_only: true
+      - type: bind
+        source: ${EVIDENCE_DIRECTORY:?Set EVIDENCE_DIRECTORY}
+        target: /runtime-evidence
       - ./remote-init.sh:/lab/remote-init.sh:ro
       - ./traefik.yml:/lab/traefik.yml:ro
       - ./verify-traefik-tombstone.sh:/lab/verify-traefik-tombstone.sh:ro
@@ -95,7 +103,9 @@ services:
     volumes:
       - coolify-data:/data/coolify:ro
       - docker-run:/var/run
-      - ${EVIDENCE_DIRECTORY:?Set EVIDENCE_DIRECTORY}:/runtime-evidence
+      - type: bind
+        source: ${EVIDENCE_DIRECTORY:?Set EVIDENCE_DIRECTORY}
+        target: /runtime-evidence
       - ./observer.sh:/lab/observer.sh:ro
 
   control-plane:

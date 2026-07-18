@@ -1236,11 +1236,6 @@ start_lab()
         printf 'authorized-pending-sha256=%s\n' "$authorized_pending_sha256"
         sed 's/^/authorized-pending-migration=/' "$CONTROL_PLANE_MIGRATION_NAMES_FILE"
     } > "$CONTROL_PLANE_MIGRATION_COMPATIBILITY_FILE"
-    {
-        printf 'backend=%s\n' "$CONTROL_PLANE_BLUE_CONTAINER"
-        printf '%s\n' 'port=8080' 'ack=none' 'owner=legacy' 'color=legacy'
-    } > "$CONTROL_PLANE_LAB_PORT_CONFIG"
-
     if [ "$scenario_number" = 1 ]; then
         assert_release_manifest_preflight_rejections
     fi
