@@ -9,6 +9,7 @@ import {
 import { FitAddon } from '@xterm/addon-fit';
 
 const terminalDebugEnabled = import.meta.env.DEV;
+let terminalComponentRegistered = false;
 
 function logTerminal(level, message, ...context) {
     if (!terminalDebugEnabled) {
@@ -19,6 +20,10 @@ function logTerminal(level, message, ...context) {
 }
 
 export function initializeTerminalComponent() {
+    if (terminalComponentRegistered || typeof window.Alpine?.data !== 'function') {
+        return;
+    }
+
     function terminalData() {
         return {
             fullscreen: false,
@@ -840,4 +845,5 @@ export function initializeTerminalComponent() {
     }
 
     window.Alpine.data('terminalData', terminalData);
+    terminalComponentRegistered = true;
 }
