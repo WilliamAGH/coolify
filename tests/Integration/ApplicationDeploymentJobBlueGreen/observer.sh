@@ -37,8 +37,17 @@ copy_source_snapshot()
         return 0
     fi
     current_identity=$(file_identity "$snapshot_source" || true)
-    [ "$current_identity" != "$snapshot_identity" ] || return 1
-    return 2
+    [ "$current_identity" = "$snapshot_identity" ] || return 2
+
+    sleep 0.02
+    stable_identity=$(file_identity "$snapshot_source" || true)
+    [ "$stable_identity" = "$current_identity" ] || return 2
+    if cp "$snapshot_source" "$snapshot_target" 2>/dev/null; then
+        return 0
+    fi
+    final_identity=$(file_identity "$snapshot_source" || true)
+    [ "$final_identity" = "$stable_identity" ] || return 2
+    return 1
 }
 
 capture_routes()

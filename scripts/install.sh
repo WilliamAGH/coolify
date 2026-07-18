@@ -931,8 +931,8 @@ SEEN_STATUS_FILE=false
 while [ $WAITED -lt $MAX_WAIT ]; do
     if [ -f "$UPGRADE_STATUS_FILE" ]; then
         SEEN_STATUS_FILE=true
-        STATUS=$(cat "$UPGRADE_STATUS_FILE" 2>/dev/null | cut -d'|' -f1)
-        MESSAGE=$(cat "$UPGRADE_STATUS_FILE" 2>/dev/null | cut -d'|' -f2)
+        STATUS=$(cut -d'|' -f1 "$UPGRADE_STATUS_FILE" 2>/dev/null)
+        MESSAGE=$(cut -d'|' -f2 "$UPGRADE_STATUS_FILE" 2>/dev/null)
         if [ "$STATUS" = "6" ]; then
             log "Upgrade completed: $MESSAGE"
             echo " - Upgrade complete!"

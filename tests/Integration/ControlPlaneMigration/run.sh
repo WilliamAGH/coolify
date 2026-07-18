@@ -528,7 +528,7 @@ trap cleanup EXIT HUP INT TERM
 mkdir -p "$BASELINE_ROOT" "$ARTIFACT_DIRECTORY"
 : > "$SUMMARY_FILE"
 
-for required_command in docker git php rg sort comm cmp diff jq mktemp shasum sha256sum shellcheck tar; do
+for required_command in docker git php grep sort comm cmp diff jq mktemp shasum sha256sum shellcheck tar; do
     require_command "$required_command"
 done
 
@@ -726,7 +726,7 @@ record "LIVE_LEDGER_SURPLUS_PASS baseline=340 immutable_surplus=3 candidate_pend
 if run_identity_guard normal_run normal_run "$ARTIFACT_DIRECTORY/identity-same-database.log"; then
     fail 'database identity guard accepted a rehearsal DSN pointing to the source database'
 fi
-rg --quiet 'Rehearsal database identity equals the source database identity' "$ARTIFACT_DIRECTORY/identity-same-database.log" \
+grep -Fq 'Rehearsal database identity equals the source database identity' "$ARTIFACT_DIRECTORY/identity-same-database.log" \
     || fail 'same-database identity guard failed for the wrong reason'
 run_identity_guard normal_run split_run "$ARTIFACT_DIRECTORY/identity-distinct-database.log" \
     || fail 'database identity guard rejected distinct database names'
@@ -1605,7 +1605,7 @@ if run_artisan_migrations_with_timeouts lock_contention "$ARTIFACT_DIRECTORY/loc
     "$(migration_path_argument 2026_07_12_000000_add_blue_green_deployment_setting_to_application_settings)"; then
     fail 'migration unexpectedly succeeded while an incompatible table lock was held'
 fi
-rg --quiet 'SQLSTATE\[55P03\]' "$ARTIFACT_DIRECTORY/lock-contention-failure.log" \
+grep -Fq 'SQLSTATE[55P03]' "$ARTIFACT_DIRECTORY/lock-contention-failure.log" \
     || fail 'lock contention did not surface SQLSTATE 55P03'
 psql_database lock_contention --command \
     "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'control-plane-migration-lock-holder' AND pid <> pg_backend_pid()" >/dev/null

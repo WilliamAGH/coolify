@@ -65,6 +65,14 @@ services:
       interval: 2s
       timeout: 2s
       retries: 30
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.coolify-bg-00ea1481ad9a0d9c-blue-discovery.rule=Host(`coolify-bg-00ea1481ad9a0d9c-blue-discovery.invalid`)"
+      - "traefik.http.routers.coolify-bg-00ea1481ad9a0d9c-blue-discovery.service=noop@internal"
+      - "traefik.http.services.coolify-bg-00ea1481ad9a0d9c-blue.loadbalancer.server.port=8080"
+      - "coolify.blueGreen.managed=true"
+      - "coolify.blueGreen.color=blue"
+      - "coolify.blueGreen.routingRevision=1"
     networks: [production-saga]
 
   production-green:
@@ -86,6 +94,14 @@ services:
       interval: 2s
       timeout: 2s
       retries: 30
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.coolify-bg-00ea1481ad9a0d9c-green-discovery.rule=Host(`coolify-bg-00ea1481ad9a0d9c-green-discovery.invalid`)"
+      - "traefik.http.routers.coolify-bg-00ea1481ad9a0d9c-green-discovery.service=noop@internal"
+      - "traefik.http.services.coolify-bg-00ea1481ad9a0d9c-green.loadbalancer.server.port=8080"
+      - "coolify.blueGreen.managed=true"
+      - "coolify.blueGreen.color=green"
+      - "coolify.blueGreen.routingRevision=2"
     networks: [production-saga]
 
   traefik:
@@ -93,6 +109,7 @@ services:
     command: ["--configFile=/etc/traefik/traefik.yml"]
     restart: "no"
     volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
       - dynamic:/dynamic:ro
       - ./traefik.yml:/etc/traefik/traefik.yml:ro
     depends_on:

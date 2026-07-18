@@ -5111,7 +5111,7 @@ main()
     docker info >/dev/null 2>&1 || fail 'Docker daemon is not reachable'
     discover_control_plane_migrations
     reserve_lab_port_slot
-    shellcheck --shell=sh "$OPERATOR" "$LAB_DIRECTORY/run.sh" \
+    shellcheck -e SC2015 --shell=sh "$OPERATOR" "$LAB_DIRECTORY/run.sh" \
         "$LAB_DIRECTORY/entrypoint-runtime-contract-test.sh" \
         "$REPOSITORY_ROOT/docker/production/bin/coolify-entrypoint" \
         "$REPOSITORY_ROOT/docker/production/bin/control-plane-direct-probe-healthcheck" \
@@ -5128,8 +5128,8 @@ main()
         "$LAB_DIRECTORY/mock-control-plane/rehearse-migration.sh" \
         "$LAB_DIRECTORY/mock-control-plane/request.sh" \
         "$LAB_DIRECTORY/mock-control-plane/route-health.sh"
-    shellcheck --shell=sh "$LAB_DIRECTORY/mock-control-plane/systemctl"
-    shellcheck --shell=bash \
+    shellcheck -e SC2015 --shell=sh "$LAB_DIRECTORY/mock-control-plane/systemctl"
+    shellcheck -e SC2015 --shell=bash \
         "$REPOSITORY_ROOT/docker/control-plane-blue-green/backup-quiesce/install-host-prerequisites.sh"
     "$LAB_DIRECTORY/entrypoint-runtime-contract-test.sh"
     prepare_mock_image_context

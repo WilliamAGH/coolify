@@ -30,6 +30,17 @@ hash_file() {
     sha256sum "$1" | awk '{print $1}'
 }
 
+file_mode() {
+    local path=$1 mode
+
+    if mode=$(stat -c '%a' "$path" 2>/dev/null); then
+        :
+    else
+        mode=$(stat -f '%Lp' "$path" 2>/dev/null) || return 1
+    fi
+    printf '%s\n' "$mode"
+}
+
 manifest_key_id() {
     "$FORK_DEPLOY_REAL_OPENSSL" pkey \
         -pubin \
@@ -679,7 +690,7 @@ test_rejects_hardlinked_privileged_state_before_chmod() {
     if output=$("$SUBJECT" status 2>&1); then
         fail 'hardlinked privileged state is rejected before permission mutation'
     elif [[ $output == *'must not be hardlinked'* ]] \
-        && [[ $(stat -f '%Lp' "$FIXTURE/shared-lock" 2>/dev/null || stat -c '%a' "$FIXTURE/shared-lock") == 644 ]]; then
+        && [[ $(file_mode "$FIXTURE/shared-lock") == 644 ]]; then
         pass 'hardlinked privileged state is rejected before permission mutation'
     else
         fail 'hardlinked privileged state is rejected before permission mutation'
@@ -1003,9 +1014,9 @@ test_prestart_failure_restores_exact_ssh_state() {
     authorized_hash=$(hash_file "$COOLIFY_AUTHORIZED_KEYS")
     private_hash=$(hash_file "$private_key")
     public_hash=$(hash_file "$public_key")
-    authorized_mode=$(stat -f '%Lp' "$COOLIFY_AUTHORIZED_KEYS" 2>/dev/null || stat -c '%a' "$COOLIFY_AUTHORIZED_KEYS")
-    private_mode=$(stat -f '%Lp' "$private_key" 2>/dev/null || stat -c '%a' "$private_key")
-    public_mode=$(stat -f '%Lp' "$public_key" 2>/dev/null || stat -c '%a' "$public_key")
+    authorized_mode=$(file_mode "$COOLIFY_AUTHORIZED_KEYS")
+    private_mode=$(file_mode "$private_key")
+    public_mode=$(file_mode "$public_key")
     write_manifest 4.13.0-fork.2
     export FORK_DEPLOY_FAIL_ACTIVATED_CONFIG=true
     if output=$(update_release 2>&1); then
@@ -1014,9 +1025,9 @@ test_prestart_failure_restores_exact_ssh_state() {
         && $(hash_file "$COOLIFY_AUTHORIZED_KEYS") == "$authorized_hash" \
         && $(hash_file "$private_key") == "$private_hash" \
         && $(hash_file "$public_key") == "$public_hash" \
-        && $(stat -f '%Lp' "$COOLIFY_AUTHORIZED_KEYS" 2>/dev/null || stat -c '%a' "$COOLIFY_AUTHORIZED_KEYS") == "$authorized_mode" \
-        && $(stat -f '%Lp' "$private_key" 2>/dev/null || stat -c '%a' "$private_key") == "$private_mode" \
-        && $(stat -f '%Lp' "$public_key" 2>/dev/null || stat -c '%a' "$public_key") == "$public_mode" \
+        && $(file_mode "$COOLIFY_AUTHORIZED_KEYS") == "$authorized_mode" \
+        && $(file_mode "$private_key") == "$private_mode" \
+        && $(file_mode "$public_key") == "$public_mode" \
         && ! -e $ROOT/fork-deploy/pending-candidate \
         && ! -e $ROOT/fork-deploy/failed-needs-restore ]] \
         && [[ $output == *'prior configuration was restored'* ]]; then

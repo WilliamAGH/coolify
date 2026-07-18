@@ -123,13 +123,10 @@ validate_provider_api_url()
 
 validate_local_ingress_url()
 {
-    local url=$1 port
+    local url=$1
 
     validate_url_value "$url" \
-        && [[ $url =~ ^http://127\.0\.0\.1:([1-9][0-9]{0,4})(/[A-Za-z0-9_./?\&=%~-]*)?$ ]] \
-        || return 1
-    port=${BASH_REMATCH[1]}
-    ((port <= 65535))
+        && [[ $url =~ ^http://127\.0\.0\.1:8000(/[A-Za-z0-9_./?\&=%~-]*)?$ ]]
 }
 
 validate_management_endpoints_value()

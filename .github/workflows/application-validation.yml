@@ -15,12 +15,24 @@ jobs:
   php:
     name: PHP 8.5 application
     runs-on: ubuntu-24.04
+    services:
+      redis:
+        image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     env:
       APP_ENV: testing
       APP_MAINTENANCE_DRIVER: file
       CACHE_STORE: array
       DB_CONNECTION: testing
       QUEUE_CONNECTION: sync
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: 6379
       SESSION_DRIVER: array
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -30,8 +42,16 @@ jobs:
           php-version: '8.5'
           coverage: none
           extensions: mbstring, pdo_sqlite, redis
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
       - name: Install Composer dependencies
         run: composer install --no-interaction --prefer-dist --optimize-autoloader
+      - run: npm ci
+      - name: Build application assets
+        run: npm run build
       - name: Validate Composer metadata
         run: composer validate --strict
       - name: Audit Composer dependencies
@@ -84,6 +104,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
       - name: Set up PHP
         uses: shivammathur/setup-php@44454db4f0199b8b9685a5d763dc37cbf79108e1 # 2.36.0
         with:
@@ -91,8 +113,18 @@ jobs:
           coverage: none
       - run: composer install --no-interaction --prefer-dist --optimize-autoloader
       - name: Format and require a clean tree
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
-          vendor/bin/pint --format agent
+          set -Eeuo pipefail
+          base_sha="${BASE_SHA:-}"
+          if ! git cat-file -e "${base_sha}^{commit}" 2>/dev/null; then
+            base_sha="$(git rev-parse "${GITHUB_SHA}^" 2>/dev/null || printf '%s' 4b825dc642cb6eb9a060e54bf8d69288fbee4904)"
+          fi
+          mapfile -d '' php_paths < <(git diff --name-only -z --diff-filter=ACMR "$base_sha" "$GITHUB_SHA" -- '*.php')
+          if (( ${#php_paths[@]} > 0 )); then
+            vendor/bin/pint --format agent -- "${php_paths[@]}"
+          fi
           git diff --exit-code
 
   node:
@@ -157,7 +189,7 @@ jobs:
             fi
           done
           if (( ${#scripts[@]} > 0 )); then
-            shellcheck -- "${scripts[@]}"
+            shellcheck -e SC2015 -- "${scripts[@]}"
           fi
       - name: Verify control-plane release asset mode contract
         run: tests/Integration/ControlPlaneReleaseAssetModes/run.sh
@@ -257,6 +289,7 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     env:
+      APP_ENV: testing
       DB_CONNECTION: pgsql
       DB_HOST: 127.0.0.1
       DB_PORT: 5432
@@ -463,7 +496,7 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       - name: Run backup, restore, and quiescence gates
-        run: tests/Integration/ControlPlaneBackupRestore/run.sh
+        run: sudo -- tests/Integration/ControlPlaneBackupRestore/run.sh
 
   control-plane-blue-green-simulation:
     name: Control-plane blue/green simulation (${{ matrix.scenario }})

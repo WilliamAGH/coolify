@@ -616,6 +616,18 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
         $applicationValidationJobs['php'] ?? [],
         'Run application tests',
     )['run'] ?? '');
+    $phpJob = $applicationValidationJobs['php'] ?? [];
+    $phpServices = $phpJob['services'] ?? [];
+    if (($phpServices['redis']['image'] ?? null) !== 'redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99' ||
+        ($phpValidationEnvironment['REDIS_HOST'] ?? null) !== '127.0.0.1' ||
+        ($phpValidationEnvironment['REDIS_PORT'] ?? null) !== 6379) {
+        $violations[] = 'PHP application validation must provide the pinned Redis service required by proxy mutation fencing';
+    }
+    foreach (['npm ci', 'npm run build'] as $phpAssetCommand) {
+        if (! collect(releaseWorkflowSteps($phpJob))->contains(fn (array $step): bool => trim((string) ($step['run'] ?? '')) === $phpAssetCommand)) {
+            $violations[] = "PHP application validation must build real Vite assets: {$phpAssetCommand}";
+        }
+    }
     foreach (['--testsuite=Unit', '--testsuite=Feature', 'tests/v4/Feature'] as $backendSuite) {
         if (! str_contains($phpTestScript, $backendSuite)) {
             $violations[] = "PHP application validation is missing backend suite: {$backendSuite}";
@@ -638,7 +650,7 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
 
     if (str_contains($phpTestScript, 'tests/v4/Browser') ||
         trim($phpTestScript) === 'php artisan test --compact') {
-        $violations[] = 'PHP application validation must not run browser tests in the composer-only job';
+        $violations[] = 'PHP application validation must not run browser tests in the backend job';
     }
 
     $browserSteps = collect(releaseWorkflowSteps($applicationValidationJobs['browser'] ?? []));
@@ -674,10 +686,36 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
         ! str_contains($immutableReferencesScript, '@sha256:')) {
         $violations[] = 'application validation must enforce immutable action and container references';
     }
+    $shellCheckScript = (string) (releaseWorkflowStep(
+        $workflowAndShell,
+        'ShellCheck changed shell scripts',
+    )['run'] ?? '');
+    if (! str_contains($shellCheckScript, 'shellcheck -e SC2015 -- "${scripts[@]}"')) {
+        $violations[] = 'changed-shell validation must retain warning and error diagnostics while excluding intentional SC2015 chains';
+    }
+
+    $formattingScript = (string) (releaseWorkflowStep(
+        $applicationValidationJobs['formatting'] ?? [],
+        'Format and require a clean tree',
+    )['run'] ?? '');
+    foreach (['git diff --name-only -z --diff-filter=ACMR', "-- '*.php'", 'vendor/bin/pint --format agent -- "${php_paths[@]}"', 'git diff --exit-code'] as $formattingContract) {
+        if (! str_contains($formattingScript, $formattingContract)) {
+            $violations[] = "PHP formatting must be limited to changed PHP paths and leave a clean tree: {$formattingContract}";
+        }
+    }
+
+    $backupRestoreScript = (string) (releaseWorkflowStep(
+        $applicationValidationJobs['control-plane-backup-restore'] ?? [],
+        'Run backup, restore, and quiescence gates',
+    )['run'] ?? '');
+    if (trim($backupRestoreScript) !== 'sudo -- tests/Integration/ControlPlaneBackupRestore/run.sh') {
+        $violations[] = 'backup and restore validation must preserve production root ownership semantics';
+    }
 
     $postgresRedisJob = $applicationValidationJobs['postgres-redis'] ?? [];
     $postgresRedisEnvironment = $postgresRedisJob['env'] ?? [];
     foreach ([
+        'APP_ENV' => 'testing',
         'DB_CONNECTION' => 'pgsql',
         'CACHE_STORE' => 'redis',
         'COOLIFY_EXTERNAL_TEST_SERVICES' => true,
@@ -715,7 +753,7 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
         ! str_contains($shellCheckScript, '4b825dc642cb6eb9a060e54bf8d69288fbee4904')) {
         $violations[] = 'manual validation dispatches must resolve a valid ShellCheck comparison base';
     }
-    foreach (['git diff --name-only -z', 'mapfile -d', '[[ -x "$path"', 'first_line', 'shellcheck -- "${scripts[@]}"'] as $shellCheckContract) {
+    foreach (['git diff --name-only -z', 'mapfile -d', '[[ -x "$path"', 'first_line', 'shellcheck -e SC2015 -- "${scripts[@]}"'] as $shellCheckContract) {
         if (! str_contains($shellCheckScript, $shellCheckContract)) {
             $violations[] = "ShellCheck selection is missing its safe executable-script contract: {$shellCheckContract}";
         }
