@@ -1264,6 +1264,12 @@ service = raw.get("services", {}).get(expected["service_key"])
 middleware = raw.get("middlewares", {}).get(expected["middleware_key"])
 member_a_service = raw.get("services", {}).get(expected["member_a_service"])
 member_b_service = raw.get("services", {}).get(expected["member_b_service"])
+member_a_service_name = expected["member_a_service"].removesuffix("@docker")
+member_b_service_name = expected["member_b_service"].removesuffix("@docker")
+member_a_router_key = f"{member_a_service_name}-discovery@docker"
+member_b_router_key = f"{member_b_service_name}-discovery@docker"
+member_a_router = raw.get("routers", {}).get(member_a_router_key)
+member_b_router = raw.get("routers", {}).get(member_b_router_key)
 weighted_services = [{"name": expected["weighted_a"], "weight": 1}]
 if expected["weighted_b"] != "absent":
     weighted_services.append({"name": expected["weighted_b"], "weight": 1})
@@ -1340,6 +1346,19 @@ def docker_service_matches(candidate, expected_status):
         and not candidate.get("error")
     )
 
+def docker_discovery_router_matches(candidate, service_name):
+    return (
+        isinstance(candidate, dict)
+        and candidate.get("status") == "enabled"
+        and candidate.get("service") == service_name
+        and candidate.get("rule") == f"Host(`{service_name}.invalid`)"
+        and candidate.get("entryPoints") == [expected["local_entrypoint"]]
+        and candidate.get("priority") == 1
+        and candidate.get("tls") is None
+        and not candidate.get("middlewares")
+        and not candidate.get("error")
+    )
+
 conflicting_api_router = [
     key
     for key, candidate in raw.get("routers", {}).items()
@@ -1355,17 +1374,17 @@ member_backend_router = [
     for key, candidate in raw.get("routers", {}).items()
     if isinstance(candidate, dict)
     and candidate.get("status") == "enabled"
-    and candidate.get("service") in {
-        expected["member_a_service"], expected["member_b_service"],
-    }
+    and candidate.get("service") in {member_a_service_name, member_b_service_name}
 ]
 valid = (
     weighted.get("services") == weighted_services
     and isinstance(weighted.get("healthCheck"), dict)
     and docker_service_matches(member_a_service, expected["member_a_status"])
     and docker_service_matches(member_b_service, expected["member_b_status"])
+    and docker_discovery_router_matches(member_a_router, member_a_service_name)
+    and docker_discovery_router_matches(member_b_router, member_b_service_name)
     and not conflicting_api_router
-    and not member_backend_router
+    and sorted(member_backend_router) == sorted([member_a_router_key, member_b_router_key])
 )
 raise SystemExit(0 if valid else 1)
 PY
@@ -1806,7 +1825,7 @@ assert_member_docker_service_contract()
         and ($labels["traefik.enable"] == "true")
         and ($labels[$router_prefix + "rule"] == $rule)
         and ($labels[$router_prefix + "entrypoints"] == $entrypoint)
-        and ($labels[$router_prefix + "service"] == "noop@internal")
+        and ($labels[$router_prefix + "service"] == $service)
         and ($labels[$router_prefix + "priority"] == "1")
         and ($labels[$service_prefix + "server.port"] == $port)
         and ($labels[$service_prefix + "server.scheme"] == "http")

@@ -12431,10 +12431,7 @@ rollback_before_green_promotion()
         assert_blue_state
     fi
     resume_legacy_blue_background
-    ingress_controller_adopt_rollback_owner
-    ingress_controller_legacy_restore_status \
-        || fail 'legacy rollback crossed the irreversible Traefik ownership boundary; keep green routed and run promote'
-
+    assert_proxy_enrollment_active
     ingress_controller_restore ingress
 
     revoke_pool_web_markers_if_safe green
@@ -13668,8 +13665,7 @@ recover_abort()
     fi
     assert_blue_state
     resume_legacy_blue_background
-    ingress_controller_adopt_rollback_owner
-    ingress_controller_legacy_restore_status
+    assert_proxy_enrollment_active
     if [ -f "$operation_directory/ingress-ingress/state" ]; then
         ingress_controller_restore ingress
     fi
