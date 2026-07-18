@@ -4054,19 +4054,47 @@ scenario_continuous_forward_reverse_availability()
         'Traefik Docker provider did not mark both candidate pool members healthy before route publication' \
         "$availability_https_crash_log" \
         || fail 'provider-health cutover rejection did not report the exact readiness failure'
+    availability_operation_directory="$CONTROL_PLANE_OPERATOR_STATE_DIR/$CONTROL_PLANE_OPERATION_ID"
+    grep -F -x -q 'phase=live-expand-migrations-applied' \
+        "$availability_operation_directory/state" \
+        || fail 'provider-health cutover rejection did not restore the exact retryable operator phase'
+    grep -F -x -q 'status=restored-legacy' \
+        "$availability_operation_directory/ingress-ingress/state" \
+        || fail 'provider-health cutover rejection did not retain the exact restored ingress state'
     [ "$(file_checksum_or_absent "$managed_route_file")" = "$legacy_route_sha256" ] \
         || fail 'route changed while a candidate provider member remained DOWN'
     assert_route_color \
         "https://127.0.0.1:${LAB_TRAEFIK_PORT}/cgi-bin/request" legacy
     docker unpause "$CONTROL_PLANE_GREEN_WEB_B_CONTAINER" >/dev/null
     paused_dependency_container=
-    if CONTROL_PLANE_TEST_CRASH_AT=after-green-ingress-route \
-        "$OPERATOR" cutover >> "$availability_https_crash_log" 2>&1; then
-        fail 'availability HTTPS-route crash injection unexpectedly completed'
+    availability_rearm_crash_status=0
+    CONTROL_PLANE_TEST_INGRESS_CRASH_AT=after-restored-legacy-rearm \
+        "$OPERATOR" cutover >> "$availability_https_crash_log" 2>&1 \
+        || availability_rearm_crash_status=$?
+    [ "$availability_rearm_crash_status" -ne 0 ] \
+        || fail 'restored ingress re-arm crash injection unexpectedly completed'
+    grep -F -x -q 'phase=live-expand-migrations-applied' \
+        "$availability_operation_directory/state" \
+        || fail 'restored ingress re-arm crash advanced the retryable operator phase'
+    grep -F -x -q 'status=restored-legacy' \
+        "$availability_operation_directory/ingress-ingress/state" \
+        || fail 'restored ingress re-arm crash did not recover the exact legacy ingress state'
+    [ "$(file_checksum_or_absent "$managed_route_file")" = "$legacy_route_sha256" ] \
+        || fail 'restored ingress re-arm crash changed the legacy route'
+    availability_https_route_crash_status=0
+    CONTROL_PLANE_TEST_CRASH_AT=after-green-ingress-route \
+        "$OPERATOR" cutover >> "$availability_https_crash_log" 2>&1 \
+        || availability_https_route_crash_status=$?
+    if [ "$availability_https_route_crash_status" -ne 137 ]; then
+        sed -n '1,320p' "$availability_https_crash_log" >&2
+        fail "availability HTTPS-route crash injection exited inexactly: status=$availability_https_route_crash_status"
     fi
     grep -F -x -q 'phase=green-routed' \
-        "$CONTROL_PLANE_OPERATOR_STATE_DIR/$CONTROL_PLANE_OPERATION_ID/state" \
+        "$availability_operation_directory/state" \
         || fail 'availability HTTPS-route crash injection did not persist the exact routed phase'
+    grep -F -x -q 'status=active' \
+        "$availability_operation_directory/ingress-ingress/state" \
+        || fail 'restored ingress retry did not persist the exact active ingress state'
     operator cutover >/dev/null
     if CONTROL_PLANE_TEST_CRASH_AT=after-green-final-ingress-ack \
         "$OPERATOR" promote >/dev/null 2>&1; then

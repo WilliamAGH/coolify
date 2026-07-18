@@ -3068,7 +3068,13 @@ switch_pool()
                 trap - EXIT HUP INT TERM
                 return
                 ;;
-            restored-legacy|drain-intent|drained)
+            restored-legacy)
+                ack_restored_legacy >/dev/null
+                rm -f "$state_file"
+                sync "$operation_directory"
+                test_crash after-restored-legacy-rearm
+                ;;
+            restored-managed-v2|drain-intent|drained)
                 fail "switch replay is forbidden from terminal or reduced pool state: $current_status"
                 ;;
             *) fail "switch replay refuses unknown durable state: $current_status" ;;
