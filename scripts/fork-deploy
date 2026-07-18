@@ -1152,7 +1152,7 @@ fd_mark_candidate_started() {
 }
 
 fd_ensure_no_unresolved() {
-    local pending_state pending_started failed_state
+    local pending_state pending_started failed_state candidate active activation
 
     if [[ -e $QUIESCE_RECOVERY_FILE || -L $QUIESCE_RECOVERY_FILE ]]; then
         require_regular_file "$QUIESCE_RECOVERY_FILE" 'backup quiesce recovery state'
@@ -1175,7 +1175,23 @@ fd_ensure_no_unresolved() {
                         die "a legacy candidate-started deployment forbids snapshot restore; run $PROGRAM recover-forward"
                     fi
                 fi
-                die "a pre-start deployment recovery failed; use the control-plane backup/restore operator before running $PROGRAM"
+                candidate=$(awk -F= '
+                    $1 == "CANDIDATE_VERSION" { count++; value = substr($0, length($1) + 2) }
+                    END { if (count == 1) print value }
+                ' "$FAILED_RESTORE_FILE")
+                if [[ -n $candidate ]]; then
+                    validate_version "$candidate"
+                    activation=$(fd_activation_file "$candidate")
+                    if [[ ( -e $activation || -L $activation ) \
+                        && ( -e $CURRENT_FILE || -L $CURRENT_FILE ) ]]; then
+                        fd_load_activation "$candidate"
+                        active=$(fd_current_version)
+                        [[ $active == "$candidate" ]] \
+                            || die 'legacy failed state conflicts with the active release; manual recovery is required'
+                        die "a legacy candidate activation requires forward cleanup; run $PROGRAM recover-forward"
+                    fi
+                fi
+                die 'legacy failed state does not prove a safe restore boundary; snapshot restore is forbidden and manual recovery is required'
                 ;;
             *) die 'failed deployment recovery state is invalid' ;;
         esac
@@ -2866,7 +2882,18 @@ fd_recover_forward() {
         || die 'forward recovery requires a durable candidate-started or failed-forward disposition'
     if [[ $legacy_forward_state == true \
         && ( $pending_present != true || $pending_started != true ) ]]; then
-        die 'legacy failed state does not prove candidate startup; forward recovery is forbidden'
+        candidate=$(read_field "$recovery_file" CANDIDATE_VERSION "$recovery_label")
+        validate_version "$candidate"
+        if [[ ( -e $(fd_activation_file "$candidate") \
+            || -L $(fd_activation_file "$candidate") ) \
+            && ( -e $CURRENT_FILE || -L $CURRENT_FILE ) ]]; then
+            fd_load_activation "$candidate"
+            current=$(fd_current_version)
+            [[ $current == "$candidate" ]] \
+                || die 'legacy failed state conflicts with the active release; manual recovery is required'
+        else
+            die 'legacy failed state does not prove candidate startup; snapshot restore is forbidden and manual forward recovery is required'
+        fi
     fi
     if [[ $failed_present == true && $pending_present == true ]]; then
         for field in CANDIDATE_VERSION PREVIOUS_VERSION MIGRATION_FINGERPRINT_BEFORE \

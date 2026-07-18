@@ -702,6 +702,7 @@ test_forward_recovery_retries_one_sided_and_cleanup_states() {
 
     cp "$FIXTURE/saved-failed" "$failed"
     chmod 0600 "$failed"
+    replace_key_value "$failed" STATE failed-needs-restore
     if ! "$SUBJECT" recover-forward >/dev/null \
         || [[ $(candidate_history_count) -ne 1 ]]; then
         fail 'forward recovery retries one-sided and interrupted cleanup states idempotently'
