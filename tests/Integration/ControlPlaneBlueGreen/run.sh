@@ -2126,11 +2126,11 @@ scenario_proxy_enrollment_cross_operation_adoption()
         || fail 'first native Traefik enrollment did not persist a valid host-stable token digest'
 
     operator rollback >/dev/null
-    assert_proxy_enrollment_phase rolled-back
-    assert_proxy_enrollment_proxy_binding legacy
-    assert_proxy_enrollment_blue_binding legacy
-    [ ! -e "$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE" ] \
-        || fail 'release rollback retained the native source compose override'
+    assert_proxy_enrollment_phase enrolled
+    assert_proxy_enrollment_proxy_binding native
+    assert_proxy_enrollment_blue_binding absent
+    [ -f "$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE" ] \
+        || fail 'release rollback revoked the retained native source compose override'
     assert_route_color "https://127.0.0.1:${LAB_TRAEFIK_PORT}/cgi-bin/request" legacy
     assert_route_color http://127.0.0.1:8000/cgi-bin/request legacy
 
@@ -2157,7 +2157,7 @@ scenario_proxy_enrollment_cross_operation_adoption()
     operator preflight >/dev/null
     [ -f "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_OPERATOR_STATE_FILE" ] \
         || fail 'second release preflight did not create an independent durable operation state'
-    assert_proxy_enrollment_phase activated
+    assert_proxy_enrollment_phase enrolled
     second_enrollment_operation=$(awk -F= '$1 == "operation_id" { print $2 }' \
         "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_STATE_FILE")
     second_enrollment_token_sha256=$(awk -F= '$1 == "token_sha256" { print $2 }' \
@@ -2165,9 +2165,9 @@ scenario_proxy_enrollment_cross_operation_adoption()
     [ "$second_enrollment_operation" = "$first_enrollment_operation" ] \
         && [ "$second_enrollment_token_sha256" = "$first_enrollment_token_sha256" ] \
         || fail 'second release could not adopt the exact existing native Traefik enrollment credentials'
-    [ "$(grep -F -x -c prepare "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_LOG_FILE")" = 2 ] \
-        && [ "$(grep -F -x -c activate "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_LOG_FILE")" = 2 ] \
-        || fail 'second release did not perform one exact enrollment after the prior terminal rollback'
+    [ "$(grep -F -x -c prepare "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_LOG_FILE")" = 1 ] \
+        && [ "$(grep -F -x -c activate "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_LOG_FILE")" = 1 ] \
+        || fail 'second release did not adopt the exact retained native enrollment'
     assert_proxy_enrollment_proxy_binding native
     assert_proxy_enrollment_blue_binding absent
 }
