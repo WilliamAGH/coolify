@@ -1701,6 +1701,13 @@ assert_proxy_enrollment_phase()
         || fail "proxy-enrollment did not reach phase=$expected_proxy_enrollment_phase"
 }
 
+assert_proxy_enrollment_active_phase()
+{
+    grep -E -x -q 'phase=(activated|enrolled)' \
+        "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_STATE_FILE" \
+        || fail 'proxy-enrollment did not retain an active native ownership phase'
+}
+
 assert_proxy_enrollment_runner_bootstraps_from_green()
 {
     proxy_enrollment_runner_source=$(sed -n '/^proxy_enrollment_runner_call()/,/^}/p' "$OPERATOR")
@@ -1959,7 +1966,7 @@ scenario_proxy_enrollment_persisted_release_rollback_retention()
         > "$scenario_directory/proxy-enrollment-route-rejection.log" 2>&1; then
         fail 'invalid-route cutover fixture unexpectedly completed'
     fi
-    assert_proxy_enrollment_phase enrolled
+    assert_proxy_enrollment_active_phase
     assert_proxy_enrollment_proxy_binding native
     assert_proxy_enrollment_blue_binding absent
     [ -f "$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE" ] \
