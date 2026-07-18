@@ -1935,7 +1935,13 @@ wait_for_member_provider_health()
         provider_health_proxy_tuple=$proxy_runtime_tuple
         rm -f "$provider_health_file"
         provider_health_curl_status=0
-        if [ -n "$provider_header_file" ]; then
+        if [ "$test_mode" = 1 ]; then
+            [ -z "$provider_header_file" ] \
+                || fail 'lab provider-health retrieval does not accept a host-only header file'
+            docker exec "$proxy_id" wget -qO- "$provider_api_url" \
+                > "$provider_health_file" 2>/dev/null \
+                || provider_health_curl_status=$?
+        elif [ -n "$provider_header_file" ]; then
             nsenter --target "$proxy_pid" --net -- \
                 curl --fail --silent --show-error --max-time 5 \
                 --header "@$provider_header_file" "$provider_api_url" \
