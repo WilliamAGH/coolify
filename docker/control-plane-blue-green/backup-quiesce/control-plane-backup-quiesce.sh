@@ -8,6 +8,7 @@ readonly INSTALLED_SERVICE_UNIT=/etc/systemd/system/control-plane-backup-quiesce
 readonly INSTALLED_TIMER_UNIT=/etc/systemd/system/control-plane-backup-quiesce-watchdog.timer
 readonly LEASE_CONTROLLER_MARGIN_SECONDS=10
 readonly REMOTE_MUTATION_DIRECTORY=/root/control-plane-backup-quiesce
+readonly REMOTE_MUTATION_REVOCATION_TIMEOUT_SECONDS=15
 
 watchdog_pid_file=
 test_systemd_watchdog=0
@@ -572,11 +573,22 @@ stop_remote_mutation()
             /bin/sh -n -c "$mutation_revocation_script" \
             || fail 'generated remote mutation revocation script is malformed'
     fi
-    timeout --kill-after=1s 5s docker exec --user 0 "$mutation_container" \
+    mutation_revocation_status=0
+    timeout --kill-after=2s "${REMOTE_MUTATION_REVOCATION_TIMEOUT_SECONDS}s" \
+        docker exec --user 0 "$mutation_container" \
         /bin/sh -ec "$mutation_revocation_script" sh \
         "$REMOTE_MUTATION_DIRECTORY" "$mutation_permit" "$mutation_active" \
-        "$mutation_revoking" \
-        || fail 'remote backup quiesce mutation ticket could not be revoked exactly'
+        "$mutation_revoking" || mutation_revocation_status=$?
+    case "$mutation_revocation_status" in
+        0)
+            ;;
+        124|137)
+            fail 'remote backup quiesce mutation ticket revocation exceeded its bounded deadline'
+            ;;
+        *)
+            fail 'remote backup quiesce mutation ticket could not be revoked exactly'
+            ;;
+    esac
 }
 
 test_fail_after_mutation_input()
