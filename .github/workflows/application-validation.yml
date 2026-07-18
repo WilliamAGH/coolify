@@ -17,6 +17,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       APP_ENV: testing
+      APP_MAINTENANCE_DRIVER: file
       CACHE_STORE: array
       DB_CONNECTION: testing
       QUEUE_CONNECTION: sync
@@ -51,6 +52,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       APP_ENV: testing
+      APP_MAINTENANCE_DRIVER: file
       CACHE_STORE: array
       DB_CONNECTION: testing
       QUEUE_CONNECTION: sync
