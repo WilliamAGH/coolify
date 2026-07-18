@@ -14,9 +14,9 @@ cases:
   - name: target concurrency cancels an active release
     mutation: cancel-target-publication
     expected: shared publication must serialize each target without cancellation
-  - name: caller loses complete publication serialization
-    mutation: drop-caller-target-concurrency
-    expected: production must serialize the complete publication invocation by target
+  - name: caller duplicates target concurrency ownership
+    mutation: add-caller-target-concurrency
+    expected: production must leave target serialization to the shared publication workflow
   - name: alias mutation loses job-level serialization
     mutation: drop-alias-mutation-serialization
     expected: alias mutation jobs must serialize per target at the job level because workflow_call ignores workflow-level concurrency

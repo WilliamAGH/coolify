@@ -40,7 +40,7 @@ live_stack_wait_for_terminal()
             && return
         sleep 1
     done
-    live_stack_blocked 'real TLS and native Traefik loopback route-health endpoints did not become available'
+    live_stack_blocked 'real local TLS and :8000 route-health endpoints did not become available'
 }
 
 live_stack_wait_for_provider()

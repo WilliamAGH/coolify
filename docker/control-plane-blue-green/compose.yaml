@@ -38,24 +38,6 @@ services:
       retries: 10
     labels:
       - "${CONTROL_PLANE_POOL_LABEL_KEY:?CONTROL_PLANE_POOL_LABEL_KEY is required}=${CONTROL_PLANE_GREEN_POOL_LABEL_VALUE:?CONTROL_PLANE_GREEN_POOL_LABEL_VALUE is required}"
-      - "traefik.enable=true"
-      - "traefik.docker.network=${CONTROL_PLANE_NETWORK:?CONTROL_PLANE_NETWORK is required}"
-      - "traefik.http.routers.control-plane-green-web-a-discovery.rule=Host(`control-plane-green-web-a.invalid`)"
-      - "traefik.http.routers.control-plane-green-web-a-discovery.entrypoints=${CONTROL_PLANE_LOCAL_INGRESS_ENTRYPOINT:-coolify-local}"
-      - "traefik.http.routers.control-plane-green-web-a-discovery.service=noop@internal"
-      - "traefik.http.routers.control-plane-green-web-a-discovery.priority=1"
-      - "traefik.http.services.control-plane-green-web-a.loadbalancer.server.port=${CONTROL_PLANE_BACKEND_PORT:?CONTROL_PLANE_BACKEND_PORT is required}"
-      - "traefik.http.services.control-plane-green-web-a.loadbalancer.server.scheme=http"
-      - "traefik.http.services.control-plane-green-web-a.loadbalancer.passhostheader=true"
-      - "traefik.http.services.control-plane-green-web-a.loadbalancer.healthcheck.path=/api/control-plane/route-health"
-      - "traefik.http.services.control-plane-green-web-a.loadbalancer.healthcheck.hostname=${CONTROL_PLANE_HOST:?CONTROL_PLANE_HOST is required}"
-      - "traefik.http.services.control-plane-green-web-a.loadbalancer.healthcheck.headers.X-Control-Plane-Route-Health=${CONTROL_PLANE_GREEN_ROUTE_HEALTH_TOKEN:?CONTROL_PLANE_GREEN_ROUTE_HEALTH_TOKEN is required}"
-      - "traefik.http.services.control-plane-green-web-a.loadbalancer.healthcheck.method=GET"
-      - "traefik.http.services.control-plane-green-web-a.loadbalancer.healthcheck.status=204"
-      - "traefik.http.services.control-plane-green-web-a.loadbalancer.healthcheck.interval=1s"
-      - "traefik.http.services.control-plane-green-web-a.loadbalancer.healthcheck.unhealthyinterval=1s"
-      - "traefik.http.services.control-plane-green-web-a.loadbalancer.healthcheck.timeout=1s"
-      - "traefik.http.services.control-plane-green-web-a.loadbalancer.healthcheck.followredirects=false"
     networks: [control-plane]
     secrets:
       - source: green-web-a-direct-probe-token
@@ -119,24 +101,6 @@ services:
       retries: 10
     labels:
       - "${CONTROL_PLANE_POOL_LABEL_KEY:?CONTROL_PLANE_POOL_LABEL_KEY is required}=${CONTROL_PLANE_GREEN_POOL_LABEL_VALUE:?CONTROL_PLANE_GREEN_POOL_LABEL_VALUE is required}"
-      - "traefik.enable=true"
-      - "traefik.docker.network=${CONTROL_PLANE_NETWORK:?CONTROL_PLANE_NETWORK is required}"
-      - "traefik.http.routers.control-plane-green-web-b-discovery.rule=Host(`control-plane-green-web-b.invalid`)"
-      - "traefik.http.routers.control-plane-green-web-b-discovery.entrypoints=${CONTROL_PLANE_LOCAL_INGRESS_ENTRYPOINT:-coolify-local}"
-      - "traefik.http.routers.control-plane-green-web-b-discovery.service=noop@internal"
-      - "traefik.http.routers.control-plane-green-web-b-discovery.priority=1"
-      - "traefik.http.services.control-plane-green-web-b.loadbalancer.server.port=${CONTROL_PLANE_BACKEND_PORT:?CONTROL_PLANE_BACKEND_PORT is required}"
-      - "traefik.http.services.control-plane-green-web-b.loadbalancer.server.scheme=http"
-      - "traefik.http.services.control-plane-green-web-b.loadbalancer.passhostheader=true"
-      - "traefik.http.services.control-plane-green-web-b.loadbalancer.healthcheck.path=/api/control-plane/route-health"
-      - "traefik.http.services.control-plane-green-web-b.loadbalancer.healthcheck.hostname=${CONTROL_PLANE_HOST:?CONTROL_PLANE_HOST is required}"
-      - "traefik.http.services.control-plane-green-web-b.loadbalancer.healthcheck.headers.X-Control-Plane-Route-Health=${CONTROL_PLANE_GREEN_ROUTE_HEALTH_TOKEN:?CONTROL_PLANE_GREEN_ROUTE_HEALTH_TOKEN is required}"
-      - "traefik.http.services.control-plane-green-web-b.loadbalancer.healthcheck.method=GET"
-      - "traefik.http.services.control-plane-green-web-b.loadbalancer.healthcheck.status=204"
-      - "traefik.http.services.control-plane-green-web-b.loadbalancer.healthcheck.interval=1s"
-      - "traefik.http.services.control-plane-green-web-b.loadbalancer.healthcheck.unhealthyinterval=1s"
-      - "traefik.http.services.control-plane-green-web-b.loadbalancer.healthcheck.timeout=1s"
-      - "traefik.http.services.control-plane-green-web-b.loadbalancer.healthcheck.followredirects=false"
     networks: [control-plane]
     secrets:
       - source: green-web-b-direct-probe-token
@@ -201,24 +165,6 @@ services:
       retries: 10
     labels:
       - "${CONTROL_PLANE_POOL_LABEL_KEY:?CONTROL_PLANE_POOL_LABEL_KEY is required}=${CONTROL_PLANE_BLUE_POOL_LABEL_VALUE:?CONTROL_PLANE_BLUE_POOL_LABEL_VALUE is required}"
-      - "traefik.enable=true"
-      - "traefik.docker.network=${CONTROL_PLANE_NETWORK:?CONTROL_PLANE_NETWORK is required}"
-      - "traefik.http.routers.control-plane-blue-web-a-discovery.rule=Host(`control-plane-blue-web-a.invalid`)"
-      - "traefik.http.routers.control-plane-blue-web-a-discovery.entrypoints=${CONTROL_PLANE_LOCAL_INGRESS_ENTRYPOINT:-coolify-local}"
-      - "traefik.http.routers.control-plane-blue-web-a-discovery.service=noop@internal"
-      - "traefik.http.routers.control-plane-blue-web-a-discovery.priority=1"
-      - "traefik.http.services.control-plane-blue-web-a.loadbalancer.server.port=${CONTROL_PLANE_BACKEND_PORT:?CONTROL_PLANE_BACKEND_PORT is required}"
-      - "traefik.http.services.control-plane-blue-web-a.loadbalancer.server.scheme=http"
-      - "traefik.http.services.control-plane-blue-web-a.loadbalancer.passhostheader=true"
-      - "traefik.http.services.control-plane-blue-web-a.loadbalancer.healthcheck.path=/api/control-plane/route-health"
-      - "traefik.http.services.control-plane-blue-web-a.loadbalancer.healthcheck.hostname=${CONTROL_PLANE_HOST:?CONTROL_PLANE_HOST is required}"
-      - "traefik.http.services.control-plane-blue-web-a.loadbalancer.healthcheck.headers.X-Control-Plane-Route-Health=${CONTROL_PLANE_BLUE_ROUTE_HEALTH_TOKEN:?CONTROL_PLANE_BLUE_ROUTE_HEALTH_TOKEN is required}"
-      - "traefik.http.services.control-plane-blue-web-a.loadbalancer.healthcheck.method=GET"
-      - "traefik.http.services.control-plane-blue-web-a.loadbalancer.healthcheck.status=204"
-      - "traefik.http.services.control-plane-blue-web-a.loadbalancer.healthcheck.interval=1s"
-      - "traefik.http.services.control-plane-blue-web-a.loadbalancer.healthcheck.unhealthyinterval=1s"
-      - "traefik.http.services.control-plane-blue-web-a.loadbalancer.healthcheck.timeout=1s"
-      - "traefik.http.services.control-plane-blue-web-a.loadbalancer.healthcheck.followredirects=false"
     networks: [control-plane]
     secrets:
       - source: blue-web-a-direct-probe-token
@@ -283,24 +229,6 @@ services:
       retries: 10
     labels:
       - "${CONTROL_PLANE_POOL_LABEL_KEY:?CONTROL_PLANE_POOL_LABEL_KEY is required}=${CONTROL_PLANE_BLUE_POOL_LABEL_VALUE:?CONTROL_PLANE_BLUE_POOL_LABEL_VALUE is required}"
-      - "traefik.enable=true"
-      - "traefik.docker.network=${CONTROL_PLANE_NETWORK:?CONTROL_PLANE_NETWORK is required}"
-      - "traefik.http.routers.control-plane-blue-web-b-discovery.rule=Host(`control-plane-blue-web-b.invalid`)"
-      - "traefik.http.routers.control-plane-blue-web-b-discovery.entrypoints=${CONTROL_PLANE_LOCAL_INGRESS_ENTRYPOINT:-coolify-local}"
-      - "traefik.http.routers.control-plane-blue-web-b-discovery.service=noop@internal"
-      - "traefik.http.routers.control-plane-blue-web-b-discovery.priority=1"
-      - "traefik.http.services.control-plane-blue-web-b.loadbalancer.server.port=${CONTROL_PLANE_BACKEND_PORT:?CONTROL_PLANE_BACKEND_PORT is required}"
-      - "traefik.http.services.control-plane-blue-web-b.loadbalancer.server.scheme=http"
-      - "traefik.http.services.control-plane-blue-web-b.loadbalancer.passhostheader=true"
-      - "traefik.http.services.control-plane-blue-web-b.loadbalancer.healthcheck.path=/api/control-plane/route-health"
-      - "traefik.http.services.control-plane-blue-web-b.loadbalancer.healthcheck.hostname=${CONTROL_PLANE_HOST:?CONTROL_PLANE_HOST is required}"
-      - "traefik.http.services.control-plane-blue-web-b.loadbalancer.healthcheck.headers.X-Control-Plane-Route-Health=${CONTROL_PLANE_BLUE_ROUTE_HEALTH_TOKEN:?CONTROL_PLANE_BLUE_ROUTE_HEALTH_TOKEN is required}"
-      - "traefik.http.services.control-plane-blue-web-b.loadbalancer.healthcheck.method=GET"
-      - "traefik.http.services.control-plane-blue-web-b.loadbalancer.healthcheck.status=204"
-      - "traefik.http.services.control-plane-blue-web-b.loadbalancer.healthcheck.interval=1s"
-      - "traefik.http.services.control-plane-blue-web-b.loadbalancer.healthcheck.unhealthyinterval=1s"
-      - "traefik.http.services.control-plane-blue-web-b.loadbalancer.healthcheck.timeout=1s"
-      - "traefik.http.services.control-plane-blue-web-b.loadbalancer.healthcheck.followredirects=false"
     networks: [control-plane]
     secrets:
       - source: blue-web-b-direct-probe-token

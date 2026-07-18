@@ -10,7 +10,6 @@ readonly REPOSITORY_ROOT
 readonly PROBE=$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/proxy-queue-zero-probe.sh
 readonly FIXTURE_APP=$REPOSITORY_ROOT/docker/control-plane-blue-green/fixtures/proxy-queue-runtime-probe
 readonly QUEUE_PREFIX='runtime-fence:'
-readonly REDIS_IMAGE='redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99'
 
 fail()
 {
@@ -18,21 +17,21 @@ fail()
     exit 1
 }
 
-REAL_DOCKER=$(command -v docker) || fail 'Docker CLI is required for the proxy queue probe test'
-readonly REAL_DOCKER
-"$REAL_DOCKER" image inspect "$REDIS_IMAGE" >/dev/null \
-    || fail 'the pinned Redis fixture image is not present'
+command -v redis-server >/dev/null || fail 'real redis-server is required for the proxy queue probe test'
+command -v redis-cli >/dev/null || fail 'real redis-cli is required for the proxy queue probe test'
 php -m | grep -Fx redis >/dev/null \
     || fail 'the PHP Redis extension is required for the proxy queue probe test'
 
-fixture=$(mktemp -d "${TMPDIR:-/tmp}/control-plane-proxy-queue.XXXXXX")
-redis_container=
+fixture=$(mktemp -d /tmp/control-plane-proxy-queue.XXXXXX)
+redis_pid=
 redis_port=
 
 cleanup()
 {
-    if [[ -n $redis_container ]]; then
-        "$REAL_DOCKER" rm --force "$redis_container" >/dev/null 2>&1 || true
+    if [[ -n $redis_pid ]] && kill -0 "$redis_pid" >/dev/null 2>&1; then
+        redis-cli --raw -h 127.0.0.1 -p "$redis_port" shutdown nosave >/dev/null 2>&1 \
+            || kill "$redis_pid" >/dev/null 2>&1 || true
+        wait "$redis_pid" >/dev/null 2>&1 || true
     fi
     rm -rf "$fixture"
 }
@@ -55,29 +54,29 @@ export HORIZON_PREFIX=$QUEUE_PREFIX
 
 start_real_redis()
 {
-    redis_container="control-plane-proxy-queue-redis-${PPID}-${BASHPID}"
-    "$REAL_DOCKER" run --detach --pull never --name "$redis_container" \
-        --publish 127.0.0.1::6379 --tmpfs /data:rw,mode=0700 \
-        "$REDIS_IMAGE" redis-server --save '' --appendonly no >/dev/null \
-        || fail 'the pinned Redis fixture could not start'
-    redis_port=$("$REAL_DOCKER" port "$redis_container" 6379/tcp | awk -F: 'NR == 1 { print $NF }')
-    [[ $redis_port =~ ^[1-9][0-9]{0,4}$ ]] || fail 'the pinned Redis fixture did not publish a valid port'
-
-    for _ in {1..50}; do
-        if "$REAL_DOCKER" exec "$redis_container" redis-cli --raw ping 2>/dev/null | grep -Fxq PONG; then
-            export CONTROL_PLANE_QUEUE_FIXTURE_REDIS_PORT=$redis_port
-            export REDIS_PORT=$redis_port
-            return
-        fi
-        sleep 0.05
+    for _ in {1..10}; do
+        redis_port=$((20000 + RANDOM % 20000))
+        redis-server --bind 127.0.0.1 --port "$redis_port" --save '' --appendonly no \
+            --dir "$fixture" > "$fixture/redis.log" 2>&1 &
+        redis_pid=$!
+        for _ in {1..50}; do
+            if redis-cli --raw -h 127.0.0.1 -p "$redis_port" ping 2>/dev/null | grep -Fxq PONG; then
+                export CONTROL_PLANE_QUEUE_FIXTURE_REDIS_PORT=$redis_port
+                export REDIS_PORT=$redis_port
+                return
+            fi
+            sleep 0.05
+        done
+        wait "$redis_pid" >/dev/null 2>&1 || true
+        redis_pid=
     done
 
-    fail 'the pinned Redis fixture did not become ready'
+    fail 'real Redis fixture did not become ready'
 }
 
 redis()
 {
-    "$REAL_DOCKER" exec "$redis_container" redis-cli --raw "$@"
+    redis-cli --raw -h 127.0.0.1 -p "$redis_port" "$@"
 }
 
 run_probe()

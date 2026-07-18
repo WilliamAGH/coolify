@@ -18,10 +18,10 @@ http:
       middlewares:
         - runtime-fence-route-health
       tls: {}
-    runtime-fence-local:
+    runtime-fence-legacy:
       rule: "PathPrefix(\`/\`)"
       entryPoints:
-        - coolify-local
+        - legacy
       service: runtime-fence-live-route
       middlewares:
         - runtime-fence-route-health

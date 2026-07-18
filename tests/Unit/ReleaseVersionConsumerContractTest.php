@@ -33,30 +33,16 @@ function releaseContractConstants(): array
     return include releaseContractRepositoryRoot().'/config/constants.php';
 }
 
-/** @return array{generic: array{shared: string, production: string}, fork: array{shared: string, entry: string}} */
+/** @return array{shared: string, production: string} */
 function releaseContractShellSemanticVersionPatterns(): array
 {
     $root = releaseContractRepositoryRoot();
     $shared = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
     $production = Yaml::parseFile($root.'/.github/workflows/coolify-production-build.yml');
-    $fork = Yaml::parseFile($root.'/.github/workflows/publish-fork.yml');
-    $sharedTarget = collect($shared['jobs']['validate-inputs']['steps'])->firstWhere('id', 'target');
-    $productionVersion = collect($production['jobs']['resolve-version']['steps'])->firstWhere('id', 'version');
-    $forkVersion = collect($fork['jobs']['resolve-tag']['steps'])->firstWhere('id', 'version');
-
-    expect($sharedTarget)->toBeArray()
-        ->and($productionVersion)->toBeArray()
-        ->and($forkVersion)->toBeArray();
 
     return [
-        'generic' => [
-            'shared' => (string) $sharedTarget['env']['SEMANTIC_VERSION_PATTERN'],
-            'production' => (string) $productionVersion['env']['SEMANTIC_VERSION_PATTERN'],
-        ],
-        'fork' => [
-            'shared' => (string) $sharedTarget['env']['FORK_SEMANTIC_VERSION_PATTERN'],
-            'entry' => (string) $forkVersion['env']['VERSION_PATTERN'],
-        ],
+        'shared' => (string) $shared['jobs']['validate-inputs']['steps'][0]['env']['SEMANTIC_VERSION_PATTERN'],
+        'production' => (string) $production['jobs']['resolve-version']['steps'][1]['env']['SEMANTIC_VERSION_PATTERN'],
     ];
 }
 
@@ -73,8 +59,7 @@ function releaseContractUpdateSemanticVersionPattern(): string
 dataset('release semantic versions', [
     'zero version' => ['0.0.0', true],
     'stable version' => ['4.2.10', true],
-    'fork prerelease' => ['4.2.10-fork', true],
-    'numbered fork prerelease' => ['4.2.10-fork.1', true],
+    'fork prerelease' => ['4.13.0-fork', true],
     'prerelease and build metadata' => ['4.2.10-rc.1+build.20260715', false],
     'build metadata only' => ['4.2.10+sha-deadbeef', false],
     'leading-zero major' => ['04.2.10', false],
@@ -85,19 +70,8 @@ dataset('release semantic versions', [
     'prefixed version' => ['v4.2.10', false],
 ]);
 
-dataset('fork release semantic versions', [
-    'numbered fork release' => ['4.2.10-fork.1', true],
-    'later numbered fork release' => ['4.2.10-fork.12', true],
-    'missing release number' => ['4.2.10-fork', false],
-    'zero release number' => ['4.2.10-fork.0', false],
-    'stable version' => ['4.2.10', false],
-    'different prerelease' => ['4.2.10-rc.1', false],
-    'leading-zero release number' => ['4.2.10-fork.01', false],
-    'prefixed version' => ['v4.2.10-fork.1', false],
-]);
-
 it('keeps release workflow and update validation on the same strict semantic version grammar', function (string $version, bool $valid) {
-    $patterns = releaseContractShellSemanticVersionPatterns()['generic'];
+    $patterns = releaseContractShellSemanticVersionPatterns();
 
     expect($patterns['shared'])->toBe($patterns['production'])
         ->and(preg_match(releaseContractUpdateSemanticVersionPattern(), $version) === 1)->toBe($valid);
@@ -111,41 +85,16 @@ it('keeps release workflow and update validation on the same strict semantic ver
     }
 })->with('release semantic versions');
 
-it('keeps fork release workflows on the same numbered fork version grammar', function (string $version, bool $valid) {
-    $patterns = releaseContractShellSemanticVersionPatterns()['fork'];
-
-    expect($patterns['shared'])->toBe($patterns['entry']);
-
-    foreach ($patterns as $pattern) {
-        $process = new Process(['grep', '-Eq', $pattern]);
-        $process->setInput($version);
-        $process->run();
-
-        expect($process->isSuccessful())->toBe($valid);
-    }
-})->with('fork release semantic versions');
-
 it('serves the workflow-published semantic tag to consumers through versions.json', function () {
     $published = releaseContractPublishedSemanticVersion();
-    $constants = releaseContractConstants();
 
-    expect($published)->toBe($constants['coolify']['version'])
+    expect($published)->toBe('4.13.0-fork')
         ->and(preg_match(releaseContractUpdateSemanticVersionPattern(), $published))->toBe(1)
         ->and(releaseContractVersionsJson()['coolify']['v4']['version'])->toBe($published);
-
-    foreach (releaseContractShellSemanticVersionPatterns()['fork'] as $pattern) {
-        $process = new Process(['grep', '-Eq', $pattern]);
-        $process->setInput($published);
-        $process->mustRun();
-    }
 });
 
 it('orders the fork prerelease below its corresponding upstream stable release', function () {
-    $published = releaseContractPublishedSemanticVersion();
-    $stable = explode('-fork.', $published, 2)[0];
-
-    expect($stable)->not->toBe($published)
-        ->and(version_compare($stable, $published, '>'))->toBeTrue();
+    expect(version_compare('4.13.0', releaseContractPublishedSemanticVersion(), '>'))->toBeTrue();
 });
 
 it('publishes production only for an explicit increasing semantic version bump', function () {
@@ -166,11 +115,10 @@ it('publishes production only for an explicit increasing semantic version bump',
 it('keeps the newest version publishable after an intermediate pending bump is evicted', function () {
     $root = releaseContractRepositoryRoot();
     $publishedVersion = releaseContractPublishedSemanticVersion();
-    [$versionCore, $forkRelease] = explode('-fork.', $publishedVersion, 2);
-    expect($forkRelease)->toMatch('/^[1-9]\d*$/');
+    expect($publishedVersion)->toBe('4.13.0-fork');
 
-    $baselineVersion = '0.0.0';
-    $nextVersion = $versionCore.'-fork.'.((int) $forkRelease + 1);
+    $baselineVersion = '4.12.99-fork';
+    $nextVersion = '4.13.1-fork';
     $workflow = Yaml::parseFile($root.'/.github/workflows/coolify-production-build.yml');
     $versionStep = collect($workflow['jobs']['resolve-version']['steps'])->firstWhere('id', 'version');
     $script = (string) ($versionStep['run'] ?? '');
@@ -188,7 +136,6 @@ it('keeps the newest version publishable after an intermediate pending bump is e
         (new Process(['git', 'init'], $repository))->mustRun();
         (new Process(['git', 'config', 'user.email', 'release-contract@coolify.invalid'], $repository))->mustRun();
         (new Process(['git', 'config', 'user.name', 'Release Contract'], $repository))->mustRun();
-        (new Process(['git', 'config', 'commit.gpgsign', 'false'], $repository))->mustRun();
 
         foreach (['config/constants.php', 'versions.json'] as $path) {
             $contents = (string) file_get_contents($repository.'/'.$path);
@@ -258,57 +205,26 @@ it('resolves the published tag through the install script versions.json parse pi
     expect(trim($process->getOutput()))->toBe(releaseContractPublishedSemanticVersion());
 });
 
-it('fails closed before the generic upstream installer or compose can use a numbered fork release', function () {
+it('hands the installer-resolved version to upgrade.sh as the production compose image tag', function () {
     $root = releaseContractRepositoryRoot();
-    $forkVersion = releaseContractPublishedSemanticVersion();
+
     $installScript = (string) file_get_contents($root.'/scripts/install.sh');
+    expect($installScript)->toContain('upgrade.sh "${LATEST_VERSION:-latest}"');
+
     $upgradeScript = (string) file_get_contents($root.'/scripts/upgrade.sh');
-
-    $installGuard = strpos($installScript, 'FORK_RELEASE_VERSION_PATTERN=');
-    $installUpgrade = strpos($installScript, 'upgrade.sh "${LATEST_VERSION:-latest}"');
-    $upgradeGuard = strpos($upgradeScript, 'FORK_RELEASE_VERSION_PATTERN=');
-    $composeDownload = strpos($upgradeScript, 'curl -fsSL -L $CDN/docker-compose.prod.yml');
-
-    expect($forkVersion)->toMatch('/^\d+\.\d+\.\d+-fork\.[1-9]\d*$/')
-        ->and($installGuard)->toBeInt()
-        ->and($installUpgrade)->toBeInt()
-        ->and($upgradeGuard)->toBeInt()
-        ->and($composeDownload)->toBeInt()
-        ->and($installGuard)->toBeLessThan($installUpgrade)
-        ->and($upgradeGuard)->toBeLessThan($composeDownload);
-
-    $process = new Process(['bash', $root.'/scripts/upgrade.sh', $forkVersion], $root);
-    $process->run();
-
-    expect($process->isSuccessful())->toBeFalse()
-        ->and($process->getErrorOutput())
-        ->toContain("Fork release {$forkVersion} is not published to ghcr.io/coollabsio/coolify.")
-        ->toContain('scripts/fork-deploy install --manifest');
-});
-
-it('keeps generic compose resolution for upstream image tags without changing its wire format', function () {
-    $root = releaseContractRepositoryRoot();
+    expect($upgradeScript)->toContain('LATEST_IMAGE=${1:-latest}');
 
     $compose = Yaml::parseFile($root.'/docker-compose.prod.yml');
     $image = $compose['services']['coolify']['image'];
     expect($image)->toBe('${REGISTRY_URL:-ghcr.io}/coollabsio/coolify:${LATEST_IMAGE:-latest}');
 
+    $published = releaseContractPublishedSemanticVersion();
     $resolved = str_replace(
         ['${REGISTRY_URL:-ghcr.io}', '${LATEST_IMAGE:-latest}'],
-        ['ghcr.io', '4.2.10'],
+        ['ghcr.io', $published],
         $image,
     );
-    expect($resolved)->toBe('ghcr.io/coollabsio/coolify:4.2.10');
-});
-
-it('keeps the signed fork deployment path separate from the rejected generic updater', function () {
-    $forkDeploy = (string) file_get_contents(releaseContractRepositoryRoot().'/scripts/fork-deploy');
-
-    expect($forkDeploy)->toContain('detached-signature-verified release manifest')
-        ->toContain('openssl pkeyutl -verify')
-        ->toContain('UPGRADE_SCRIPT_URL "$DISABLED_UPGRADE_SCRIPT_URL"')
-        ->not->toContain('bash /data/coolify/source/upgrade.sh')
-        ->not->toContain('bash scripts/upgrade.sh');
+    expect($resolved)->toBe("ghcr.io/coollabsio/coolify:{$published}");
 });
 
 it('keeps helper and realtime versions consistent across versions.json, constants, and production compose', function () {

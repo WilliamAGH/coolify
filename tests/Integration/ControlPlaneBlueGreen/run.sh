@@ -5,7 +5,7 @@ set -eu
 LAB_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 REPOSITORY_ROOT=$(CDPATH='' cd -- "$LAB_DIRECTORY/../../.." && pwd -P)
 OPERATOR="$REPOSITORY_ROOT/docker/control-plane-blue-green/control-plane-blue-green.sh"
-RELEASE_INSTALLER="$REPOSITORY_ROOT/docker/control-plane-blue-green/install-host-release-bundle.sh"
+RELEASE_INSTALLER="$REPOSITORY_ROOT/docker/control-plane-blue-green/install-host-release.sh"
 if [ -n "${CONTROL_PLANE_BLUE_GREEN_LAB_DIR:-}" ]; then
     mkdir -p "$CONTROL_PLANE_BLUE_GREEN_LAB_DIR"
     LAB_ROOT=$(mktemp -d "$CONTROL_PLANE_BLUE_GREEN_LAB_DIR/invocation.XXXXXX")
@@ -19,8 +19,8 @@ LAB_INVOCATION_TOKEN=$(printf '%s' "$LAB_ROOT" | sha256sum | awk '{print substr(
 LAB_PORT_SLOT=
 LAB_PORT_BASE=20000
 LAB_PORT_BAND_COUNT=8
-LAB_PORT_BAND_WIDTH=42
-LAB_PORT_MAX_SCENARIO=41
+LAB_PORT_BAND_WIDTH=40
+LAB_PORT_MAX_SCENARIO=37
 LAB_PORT_BLOCK_WIDTH=$((LAB_PORT_BAND_COUNT * LAB_PORT_BAND_WIDTH))
 LAB_PORT_SLOT_COUNT=$(((65535 - LAB_PORT_BASE - \
     ((LAB_PORT_BAND_COUNT - 1) * LAB_PORT_BAND_WIDTH + LAB_PORT_MAX_SCENARIO)) \
@@ -293,12 +293,7 @@ assert_lab_global_transaction_lock()
 
 install_lab_release_manifest()
 {
-    release_source_root="$REPOSITORY_ROOT/docker/control-plane-blue-green"
-    release_host_root="$scenario_directory/release-host"
-    mkdir "$release_host_root"
-    chmod 0700 "$release_host_root"
-    CONTROL_PLANE_RELEASE_MANIFEST_FILE="$release_host_root/etc/coolify-control-plane/release.manifest"
-    CONTROL_PLANE_RELEASES_ROOT="$release_host_root/usr/local/lib/coolify-control-plane/releases"
+    CONTROL_PLANE_RELEASE_MANIFEST_FILE="$scenario_directory/release.manifest"
     CONTROL_PLANE_RELEASE_ID="release-${scenario_number}-${LAB_INVOCATION_TOKEN}"
     CONTROL_PLANE_RELEASE_BACKUP_QUIESCE_CONTROLLER="$REPOSITORY_ROOT/docker/control-plane-blue-green/backup-quiesce/control-plane-backup-quiesce.sh"
     CONTROL_PLANE_RELEASE_RUNTIME_FENCE_CONTROLLER="$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/runtime-attestation-ssh-fence.sh"
@@ -307,11 +302,36 @@ install_lab_release_manifest()
     CONTROL_PLANE_RELEASE_RUNTIME_FENCE_QUEUE_PROBE="$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/proxy-queue-zero-probe.sh"
     CONTROL_PLANE_RELEASE_RUNTIME_FENCE_TERMINAL_PROBE="$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/control-plane-terminal-state-probe.sh"
 
-    release_directory="$CONTROL_PLANE_RELEASES_ROOT/$CONTROL_PLANE_RELEASE_ID"
-    release_install_output=$(CONTROL_PLANE_RELEASE_BUNDLE_TEST_MODE=1 \
-        CONTROL_PLANE_RELEASE_BUNDLE_TEST_ROOT="$release_host_root" \
-        CONTROL_PLANE_RELEASE_BUNDLE_SOURCE_ROOT="$release_source_root" \
-        "$RELEASE_INSTALLER" "$CONTROL_PLANE_RELEASE_ID")
+    printf '%s' "$CONTROL_PLANE_RELEASE_MANIFEST_FILE" \
+        | grep -Eq '^/[A-Za-z0-9_./-]+$' \
+        || fail 'lab release manifest path is not an absolute safe path'
+    case "$CONTROL_PLANE_RELEASE_MANIFEST_FILE" in
+        *'//'*|'/..'|'/../'*|*'/../'*|*'/..')
+            fail 'lab release manifest path is not an absolute safe path'
+            ;;
+    esac
+    [ ! -e "$CONTROL_PLANE_RELEASE_MANIFEST_FILE" ] \
+        && [ ! -L "$CONTROL_PLANE_RELEASE_MANIFEST_FILE" ] \
+        || fail 'lab release manifest path is not fresh'
+
+    release_install_output=$(CONTROL_PLANE_RELEASE_TEST_MODE=1 \
+        CONTROL_PLANE_RELEASE_MANIFEST_PATH="$CONTROL_PLANE_RELEASE_MANIFEST_FILE" \
+        "$RELEASE_INSTALLER" "$CONTROL_PLANE_RELEASE_ID" \
+        "operator=$OPERATOR" \
+        "operator-compose=$CONTROL_PLANE_OPERATOR_COMPOSE_FILE" \
+        "rehearsal-compose=$CONTROL_PLANE_REHEARSAL_COMPOSE_FILE" \
+        "https-controller=$CONTROL_PLANE_HTTPS_CONTROLLER" \
+        "port8000-controller=$CONTROL_PLANE_PORT8000_CONTROLLER" \
+        "port8000-external-policy-probe=$CONTROL_PLANE_PORT8000_EXTERNAL_POLICY_PROBE" \
+        "port8000-ipv6-inventory-probe=$CONTROL_PLANE_PORT8000_IPV6_INVENTORY_PROBE" \
+        "backup-attestation-verifier=$CONTROL_PLANE_BACKUP_ATTESTATION_VERIFIER" \
+        "backup-quiesce-controller=$CONTROL_PLANE_RELEASE_BACKUP_QUIESCE_CONTROLLER" \
+        "runtime-fence-provisioner=$CONTROL_PLANE_RUNTIME_FENCE_PROVISIONER" \
+        "runtime-fence-controller=$CONTROL_PLANE_RELEASE_RUNTIME_FENCE_CONTROLLER" \
+        "runtime-fence-controlmaster-reaper=$CONTROL_PLANE_RELEASE_RUNTIME_FENCE_REAPER" \
+        "runtime-fence-provider-probe=$CONTROL_PLANE_RELEASE_RUNTIME_FENCE_PROVIDER_PROBE" \
+        "runtime-fence-queue-probe=$CONTROL_PLANE_RELEASE_RUNTIME_FENCE_QUEUE_PROBE" \
+        "runtime-fence-terminal-probe=$CONTROL_PLANE_RELEASE_RUNTIME_FENCE_TERMINAL_PROBE")
 
     release_manifest_uid=$(id -u)
     release_manifest_gid=$(id -g)
@@ -324,59 +344,8 @@ install_lab_release_manifest()
     CONTROL_PLANE_RELEASE_MANIFEST_SHA256=$(sha256sum \
         "$CONTROL_PLANE_RELEASE_MANIFEST_FILE" | awk '{print $1}')
     [ "$release_install_output" = \
-        "CONTROL_PLANE_RELEASE_BUNDLE_INSTALL complete=true release_id=${CONTROL_PLANE_RELEASE_ID} manifest=${CONTROL_PLANE_RELEASE_MANIFEST_FILE} manifest_sha256=${CONTROL_PLANE_RELEASE_MANIFEST_SHA256} release_directory=${release_directory}" ] \
-        || fail 'lab release bundle output does not bind the exported manifest identity'
-
-    OPERATOR="$release_directory/control-plane-blue-green.sh"
-    CONTROL_PLANE_OPERATOR_COMPOSE_FILE="$release_directory/compose.yaml"
-    CONTROL_PLANE_REHEARSAL_COMPOSE_FILE="$release_directory/compose.rehearsal.yaml"
-    CONTROL_PLANE_INGRESS_CONTROLLER="$release_directory/controllers/traefik-ingress.sh"
-    CONTROL_PLANE_BACKUP_ATTESTATION_VERIFIER="$release_directory/backup/restore-attest.sh"
-    CONTROL_PLANE_RELEASE_BACKUP_QUIESCE_CONTROLLER="$release_directory/backup-quiesce/control-plane-backup-quiesce.sh"
-    CONTROL_PLANE_RUNTIME_FENCE_PROVISIONER="$release_directory/controllers/provision-runtime-attestation-ssh-fence.sh"
-    CONTROL_PLANE_RELEASE_RUNTIME_FENCE_CONTROLLER="$release_directory/controllers/runtime-attestation-ssh-fence.sh"
-    CONTROL_PLANE_RELEASE_RUNTIME_FENCE_REAPER="$release_directory/controllers/self-ssh-controlmaster-reaper.sh"
-    CONTROL_PLANE_RELEASE_RUNTIME_FENCE_PROVIDER_PROBE="$release_directory/controllers/traefik-docker-provider-freshness-probe.sh"
-    CONTROL_PLANE_RELEASE_RUNTIME_FENCE_QUEUE_PROBE="$release_directory/controllers/proxy-queue-zero-probe.sh"
-    CONTROL_PLANE_RELEASE_RUNTIME_FENCE_TERMINAL_PROBE="$release_directory/controllers/control-plane-terminal-state-probe.sh"
-}
-
-assert_release_manifest_asset_attestation()
-{
-    manifest_asset_role=$1
-    manifest_asset_path=$2
-    manifest_asset_expected_mode=$3
-    [ -f "$manifest_asset_path" ] && [ ! -L "$manifest_asset_path" ] \
-        || fail "reviewed release asset is unavailable or unsafe: $manifest_asset_role"
-    [ "$(file_mode "$manifest_asset_path")" = "$manifest_asset_expected_mode" ] \
-        || fail "reviewed release asset mode diverges from its release contract: $manifest_asset_role"
-    manifest_asset_expected_sha256=$(sha256sum "$manifest_asset_path" | awk '{print $1}')
-    manifest_asset_expected_line="asset|$manifest_asset_role|$manifest_asset_path|$manifest_asset_expected_sha256|$(file_uid "$manifest_asset_path")|$(file_gid "$manifest_asset_path")|$manifest_asset_expected_mode"
-    if ! manifest_asset_line=$(awk -F'|' -v expected_role="$manifest_asset_role" '
-        $1 == "asset" && $2 == expected_role { matches++; line = $0 }
-        END { if (matches != 1) exit 1; print line }
-    ' "$CONTROL_PLANE_RELEASE_MANIFEST_FILE"); then
-        fail "release manifest does not contain one attested asset: $manifest_asset_role"
-    fi
-    [ "$manifest_asset_line" = "$manifest_asset_expected_line" ] \
-        || fail "release manifest does not attest the reviewed source bytes: $manifest_asset_role"
-}
-
-assert_release_manifest_source_attestation()
-{
-    [ "$(sha256sum "$CONTROL_PLANE_RELEASE_MANIFEST_FILE" | awk '{print $1}')" \
-        = "$CONTROL_PLANE_RELEASE_MANIFEST_SHA256" ] \
-        || fail 'lab release manifest differs from its exported out-of-band identity'
-    assert_release_manifest_asset_attestation backup-quiesce-controller \
-        "$CONTROL_PLANE_RELEASE_BACKUP_QUIESCE_CONTROLLER" 755
-    assert_release_manifest_asset_attestation backup-quiesce-service-unit \
-        "$release_directory/backup-quiesce/control-plane-backup-quiesce-watchdog.service" 644
-    assert_release_manifest_asset_attestation backup-quiesce-timer-unit \
-        "$release_directory/backup-quiesce/control-plane-backup-quiesce-watchdog.timer" 644
-    grep -F -x -q '    verify_release_manifest' "$OPERATOR" \
-        || fail 'operator does not verify the release manifest before preflight work'
-    grep -F -x -q "        assert_release_asset_identity \"\$release_required_role\"" "$OPERATOR" \
-        || fail 'operator does not attest each manifest-selected release asset'
+        "CONTROL_PLANE_RELEASE_INSTALL complete=true release_id=${CONTROL_PLANE_RELEASE_ID} manifest=${CONTROL_PLANE_RELEASE_MANIFEST_FILE} sha256=${CONTROL_PLANE_RELEASE_MANIFEST_SHA256} owner=${release_manifest_uid}:${release_manifest_gid} mode=0600" ] \
+        || fail 'lab release installer output does not bind the exported manifest identity'
 }
 
 assert_release_manifest_preflight_rejections()
@@ -470,16 +439,22 @@ preserve_legacy_ingress_failure()
     chmod 700 "$legacy_evidence_directory"
     legacy_evidence_status_candidate="$legacy_evidence_directory/.status.$$"
     legacy_evidence_https_headers_candidate="$legacy_evidence_directory/.https-headers.$$"
+    legacy_evidence_port8000_headers_candidate="$legacy_evidence_directory/.port8000-headers.$$"
 
     {
         printf 'attempt=%s\n' "$legacy_readiness_attempt"
         printf 'https_curl_status=%s\n' "$legacy_https_curl_status"
         printf 'https_http_status=%s\n' "$legacy_https_http_status"
+        printf 'port8000_curl_status=%s\n' "$legacy_port8000_curl_status"
+        printf 'port8000_http_status=%s\n' "$legacy_port8000_http_status"
         printf 'https_body_sha256=%s\n' "$(file_checksum_or_absent "$legacy_https_body")"
+        printf 'port8000_body_sha256=%s\n' "$(file_checksum_or_absent "$legacy_port8000_body")"
     } > "$legacy_evidence_status_candidate"
     write_sanitized_probe_headers "$legacy_https_headers" "$legacy_evidence_https_headers_candidate"
+    write_sanitized_probe_headers "$legacy_port8000_headers" "$legacy_evidence_port8000_headers_candidate"
     mv "$legacy_evidence_status_candidate" "$legacy_evidence_directory/status"
     mv "$legacy_evidence_https_headers_candidate" "$legacy_evidence_directory/https.headers"
+    mv "$legacy_evidence_port8000_headers_candidate" "$legacy_evidence_directory/port8000.headers"
 }
 
 wait_for_blue()
@@ -487,10 +462,13 @@ wait_for_blue()
     legacy_evidence_directory=$scenario_directory/legacy-ingress-readiness
     legacy_https_headers="$legacy_evidence_directory/https.raw-headers"
     legacy_https_body="$legacy_evidence_directory/https.raw-body"
+    legacy_port8000_headers="$legacy_evidence_directory/port8000.raw-headers"
+    legacy_port8000_body="$legacy_evidence_directory/port8000.raw-body"
     mkdir -p "$legacy_evidence_directory"
     chmod 700 "$legacy_evidence_directory"
     rm -f "$legacy_evidence_directory/status" "$legacy_evidence_directory/https.headers" \
-        "$legacy_https_headers" "$legacy_https_body"
+        "$legacy_evidence_directory/port8000.headers" "$legacy_https_headers" \
+        "$legacy_https_body" "$legacy_port8000_headers" "$legacy_port8000_body"
     legacy_readiness_deadline=$(( $(date -u +%s) + 120 ))
     legacy_readiness_attempt=0
 
@@ -501,15 +479,30 @@ wait_for_blue()
             --header "Host: $CONTROL_PLANE_HOST" \
             --dump-header "$legacy_https_headers" --output "$legacy_https_body" \
             --write-out '%{http_code}' \
-            "https://127.0.0.1:${LAB_TRAEFIK_PORT}/cgi-bin/request") \
+            "http://127.0.0.1:${LAB_TRAEFIK_PORT}/cgi-bin/request") \
             || legacy_https_curl_status=$?
         legacy_https_http_status=${legacy_https_http_status:-000}
+        legacy_port8000_curl_status=0
+        legacy_port8000_http_status=$(curl --silent --show-error --connect-timeout 1 --max-time 2 \
+            --header "Host: $CONTROL_PLANE_HOST" \
+            --dump-header "$legacy_port8000_headers" --output "$legacy_port8000_body" \
+            --write-out '%{http_code}' \
+            "http://127.0.0.1:${LAB_PORT8000_PORT}/cgi-bin/request") \
+            || legacy_port8000_curl_status=$?
+        legacy_port8000_http_status=${legacy_port8000_http_status:-000}
         if [ "$legacy_https_curl_status" -eq 0 ] \
+            && [ "$legacy_port8000_curl_status" -eq 0 ] \
             && [ "$legacy_https_http_status" = 200 ] \
+            && [ "$legacy_port8000_http_status" = 200 ] \
             && response_header_equals_once "$legacy_https_headers" X-Control-Plane-Color legacy \
             && response_header_equals_once "$legacy_https_headers" X-Control-Plane-Lab-Host "$CONTROL_PLANE_HOST" \
-            && [ "$(tr -d '\r\n' < "$legacy_https_body")" = legacy ]; then
-            rm -f "$legacy_https_headers" "$legacy_https_body"
+            && response_header_equals_once "$legacy_port8000_headers" X-Control-Plane-Color legacy \
+            && response_header_equals_once "$legacy_port8000_headers" X-Control-Plane-Lab-Host "$CONTROL_PLANE_HOST" \
+            && response_header_equals_once "$legacy_port8000_headers" X-Control-Plane-Port-Owner legacy \
+            && [ "$(tr -d '\r\n' < "$legacy_https_body")" = legacy ] \
+            && [ "$(tr -d '\r\n' < "$legacy_port8000_body")" = legacy ]; then
+            rm -f "$legacy_https_headers" "$legacy_https_body" \
+                "$legacy_port8000_headers" "$legacy_port8000_body"
             return
         fi
 
@@ -517,7 +510,8 @@ wait_for_blue()
     done
 
     preserve_legacy_ingress_failure
-    rm -f "$legacy_https_headers" "$legacy_https_body"
+    rm -f "$legacy_https_headers" "$legacy_https_body" \
+        "$legacy_port8000_headers" "$legacy_port8000_body"
     fail "legacy ingress did not become ready within 120 seconds; sanitized evidence=$legacy_evidence_directory"
 }
 
@@ -751,34 +745,24 @@ assert_route_color()
         || fail "ingress did not remain acknowledged on $expected_color"
 }
 
-prepare_lab_tls()
+assert_port8000_permanent_phase_b()
 {
-    lab_tls_extension_file="$LAB_TRAEFIK_TLS_DIRECTORY/leaf.ext"
+    port8000_state="$CONTROL_PLANE_OPERATOR_STATE_DIR/$CONTROL_PLANE_OPERATION_ID/ingress-port8000/state"
+    if [ ! -f "$port8000_state" ] \
+        || ! grep -F -x -q 'phase=complete' "$port8000_state" \
+        || ! grep -F -x -q 'owner=permanent-b' "$CONTROL_PLANE_LAB_PORT_CONFIG"; then
+        fail 'one-shot promotion did not reconcile :8000 to acknowledged permanent phase B'
+    fi
+}
 
-    openssl req -x509 -new -nodes -newkey rsa:2048 -days 2 \
-        -subj '/CN=coolify-control-plane-lab-ca' \
-        -keyout "$LAB_TRAEFIK_TLS_DIRECTORY/ca.key" \
-        -out "$LAB_TRAEFIK_TLS_CA" >/dev/null 2>&1
-    openssl req -new -nodes -newkey rsa:2048 \
-        -subj '/CN=127.0.0.1' \
-        -keyout "$LAB_TRAEFIK_TLS_DIRECTORY/leaf.key" \
-        -out "$LAB_TRAEFIK_TLS_DIRECTORY/leaf.csr" >/dev/null 2>&1
-    printf 'subjectAltName=IP:127.0.0.1,DNS:localhost,DNS:%s\n' "$CONTROL_PLANE_HOST" \
-        > "$lab_tls_extension_file"
-    openssl x509 -req -days 2 \
-        -in "$LAB_TRAEFIK_TLS_DIRECTORY/leaf.csr" \
-        -CA "$LAB_TRAEFIK_TLS_CA" \
-        -CAkey "$LAB_TRAEFIK_TLS_DIRECTORY/ca.key" \
-        -CAcreateserial -extfile "$lab_tls_extension_file" \
-        -out "$LAB_TRAEFIK_TLS_DIRECTORY/leaf.crt" >/dev/null 2>&1
-    chmod 600 "$LAB_TRAEFIK_TLS_DIRECTORY/ca.key" "$LAB_TRAEFIK_TLS_DIRECTORY/leaf.key"
-    chmod 644 "$LAB_TRAEFIK_TLS_CA" "$LAB_TRAEFIK_TLS_DIRECTORY/leaf.crt"
-    {
-        printf '%s\n' 'tls:' '  certificates:' \
-            '    - certFile: "/etc/traefik/tls/leaf.crt"' \
-            '      keyFile: "/etc/traefik/tls/leaf.key"'
-    } > "$CONTROL_PLANE_TRAEFIK_DYNAMIC_DIR/tls.yml"
-    chmod 600 "$CONTROL_PLANE_TRAEFIK_DYNAMIC_DIR/tls.yml"
+assert_port8000_captured_phase_a()
+{
+    port8000_state="$CONTROL_PLANE_OPERATOR_STATE_DIR/$CONTROL_PLANE_OPERATION_ID/ingress-port8000/state"
+    if [ ! -f "$port8000_state" ] \
+        || ! grep -F -x -q 'phase=captured' "$port8000_state" \
+        || ! grep -F -x -q 'owner=bootstrap-a' "$CONTROL_PLANE_LAB_PORT_CONFIG"; then
+        fail 'pre-removal verification crossed the :8000 permanent Phase-B boundary'
+    fi
 }
 
 start_lab()
@@ -794,25 +778,8 @@ start_lab()
     managed_app_container=
     installer_test_container=
     foreign_router_container=
-    unset CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE
-    unset CONTROL_PLANE_PROXY_ENROLLMENT_COMMAND
-    unset CONTROL_PLANE_TEST_PROXY_ENROLLMENT_STATE_FILE
-    unset CONTROL_PLANE_TEST_PROXY_ENROLLMENT_LOG_FILE
-    unset CONTROL_PLANE_TEST_PROXY_ENROLLMENT_OPERATOR_STATE_FILE
-    unset CONTROL_PLANE_TEST_PROXY_ENROLLMENT_PROXY_CONTAINER
-    unset CONTROL_PLANE_TEST_PROXY_ENROLLMENT_BLUE_CONTAINER
-    unset CONTROL_PLANE_TEST_PROXY_ENROLLMENT_PROXY_PROJECT
-    unset CONTROL_PLANE_TEST_PROXY_ENROLLMENT_PROXY_NATIVE_COMPOSE
-    unset CONTROL_PLANE_TEST_PROXY_ENROLLMENT_PROXY_LEGACY_COMPOSE
-    unset CONTROL_PLANE_TEST_PROXY_ENROLLMENT_STATIC_CONFIG
-    unset CONTROL_PLANE_TEST_PROXY_ENROLLMENT_NATIVE_STATIC_CONFIG
-    unset CONTROL_PLANE_TEST_PROXY_ENROLLMENT_LEGACY_STATIC_CONFIG
-    unset CONTROL_PLANE_TEST_PROXY_ENROLLMENT_COMPOSE_OVERRIDE
-    unset CONTROL_PLANE_TEST_PROXY_ENROLLMENT_DYNAMIC_DIRECTORY
-    unset CONTROL_PLANE_TEST_PROXY_ENROLLMENT_SOURCE_COMPOSE_FILES
-    unset CONTROL_PLANE_TEST_PROXY_ENROLLMENT_MODE
-    mkdir -p "$scenario_directory/dynamic" "$scenario_directory/tls" "$scenario_directory/state" \
-        "$scenario_directory/runtime-state" \
+    mkdir -p "$scenario_directory/dynamic" "$scenario_directory/state" \
+        "$scenario_directory/port-config" "$scenario_directory/runtime-state" \
         "$scenario_directory/ssh" "$scenario_directory/applications" \
         "$scenario_directory/databases" "$scenario_directory/services" \
         "$scenario_directory/backups" "$scenario_directory/green-secrets" \
@@ -820,7 +787,11 @@ start_lab()
     chmod 777 "$scenario_directory/runtime-state"
     cp "$LAB_DIRECTORY/backup-attestation-verifier.sh" \
         "$scenario_directory/backup-attestation-verifier"
-    chmod 700 "$scenario_directory/backup-attestation-verifier"
+    cp "$LAB_DIRECTORY/external-blocked-probe.sh" "$scenario_directory/external-blocked-probe"
+    cp "$LAB_DIRECTORY/ipv6-inventory-probe.sh" "$scenario_directory/ipv6-inventory-probe"
+    chmod 700 "$scenario_directory/backup-attestation-verifier" \
+        "$scenario_directory/external-blocked-probe" \
+        "$scenario_directory/ipv6-inventory-probe"
 
     project_name="cpbg-${scenario_number}-${LAB_INVOCATION_TOKEN}"
     control_plane_network="${project_name}-network"
@@ -832,6 +803,7 @@ start_lab()
     CONTROL_PLANE_GREEN_CONTAINER=$CONTROL_PLANE_GREEN_WEB_A_CONTAINER
     CONTROL_PLANE_REPLACEMENT_BLUE_CONTAINER=$CONTROL_PLANE_BLUE_WEB_A_CONTAINER
     CONTROL_PLANE_PROXY_CONTAINER="${project_name}-proxy"
+    CONTROL_PLANE_PORT_PROXY_CONTAINER="${project_name}-port-proxy"
     CONTROL_PLANE_DATABASE_CONTAINER="${project_name}-database"
     CONTROL_PLANE_REHEARSAL_DATABASE_CONTAINER="${project_name}-rehearsal-database"
     CONTROL_PLANE_REDIS_CONTAINER="${project_name}-redis"
@@ -846,9 +818,6 @@ start_lab()
     CONTROL_PLANE_TRAEFIK_ROUTER="control-plane-${scenario_number}-${LAB_INVOCATION_TOKEN}"
     CONTROL_PLANE_TRAEFIK_SERVICE="${CONTROL_PLANE_TRAEFIK_ROUTER}-service"
     CONTROL_PLANE_HOST="${CONTROL_PLANE_TRAEFIK_ROUTER}.lab.test"
-    LAB_TRAEFIK_TLS_DIRECTORY="$scenario_directory/tls"
-    LAB_TRAEFIK_TLS_CA="$LAB_TRAEFIK_TLS_DIRECTORY/ca.crt"
-    CURL_CA_BUNDLE=$LAB_TRAEFIK_TLS_CA
     CONTROL_PLANE_OPERATION_ID="operation-${scenario_name}-0123456789"
     CONTROL_PLANE_MUTATION_FREEZE_EPOCH="${CONTROL_PLANE_OPERATION_ID}.mutation-freeze"
     CONTROL_PLANE_REVERSE_MUTATION_FREEZE_EPOCH="${CONTROL_PLANE_OPERATION_ID}.reverse-mutation-freeze"
@@ -872,6 +841,7 @@ start_lab()
     CONTROL_PLANE_BLUE_POOL_LABEL_VALUE="${project_name}-blue-pool"
     lab_port_block_base=$((LAB_PORT_BASE + LAB_PORT_SLOT * LAB_PORT_BLOCK_WIDTH))
     LAB_TRAEFIK_PORT=$((lab_port_block_base + scenario_number))
+    LAB_PORT8000_PORT=$((lab_port_block_base + LAB_PORT_BAND_WIDTH + scenario_number))
     CONTROL_PLANE_GREEN_LOOPBACK_PORT=$((lab_port_block_base + \
         2 * LAB_PORT_BAND_WIDTH + scenario_number))
     CONTROL_PLANE_GREEN_WEB_A_LOOPBACK_PORT=$CONTROL_PLANE_GREEN_LOOPBACK_PORT
@@ -882,6 +852,10 @@ start_lab()
     CONTROL_PLANE_BLUE_WEB_A_LOOPBACK_PORT=$CONTROL_PLANE_BLUE_LOOPBACK_PORT
     CONTROL_PLANE_BLUE_WEB_B_LOOPBACK_PORT=$((lab_port_block_base + \
         7 * LAB_PORT_BAND_WIDTH + scenario_number))
+    CONTROL_PLANE_PORT8000_BOOTSTRAP_PORT=$((lab_port_block_base + \
+        4 * LAB_PORT_BAND_WIDTH + scenario_number))
+    CONTROL_PLANE_EXTERNAL_BLOCKED_PORT=$((lab_port_block_base + \
+        5 * LAB_PORT_BAND_WIDTH + scenario_number))
     CONTROL_PLANE_NETWORK=$control_plane_network
     CONTROL_PLANE_TEST_PROXY_GATEWAY="10.$((LAB_PORT_SLOT + 1)).${scenario_number}.1"
     CONTROL_PLANE_TEST_PROXY_SUBNET="10.$((LAB_PORT_SLOT + 1)).${scenario_number}.0/24"
@@ -906,9 +880,7 @@ start_lab()
     CONTROL_PLANE_TRAEFIK_DYNAMIC_DIR="$scenario_directory/dynamic"
     CONTROL_PLANE_TRAEFIK_DYNAMIC_FILENAME=control-plane-blue-green.yaml
     CONTROL_PLANE_TRAEFIK_ENTRYPOINT=web
-    CONTROL_PLANE_LOCAL_INGRESS_ENTRYPOINT=coolify-local
-    CONTROL_PLANE_TRAEFIK_TLS=true
-    CONTROL_PLANE_TRAEFIK_CERT_RESOLVER=
+    CONTROL_PLANE_TRAEFIK_TLS=false
     CONTROL_PLANE_BACKEND_PORT=8080
     CONTROL_PLANE_DIRECT_PROBE_PATH=/cgi-bin/probe
     CONTROL_PLANE_SOURCE_ENV_FILE="$scenario_directory/runtime.env"
@@ -934,8 +906,23 @@ start_lab()
     CONTROL_PLANE_SECRET_UID=9999
     CONTROL_PLANE_SECRET_GID=9999
     chmod 700 "$CONTROL_PLANE_GREEN_SECRET_DIRECTORY" "$CONTROL_PLANE_BLUE_SECRET_DIRECTORY"
-    CONTROL_PLANE_PUBLIC_PROBE_URL="https://127.0.0.1:${LAB_TRAEFIK_PORT}/api/health"
-    CONTROL_PLANE_LOCAL_INGRESS_URL=http://127.0.0.1:8000/api/health
+    CONTROL_PLANE_PUBLIC_PROBE_URL="http://127.0.0.1:${LAB_TRAEFIK_PORT}/api/health"
+    # The production :8000 controller needs the route-proof response headers; terminal
+    # availability monitoring below deliberately uses the static health endpoint instead.
+    CONTROL_PLANE_PORT8000_HOST_LOCAL_URL="http://127.0.0.1:${LAB_PORT8000_PORT}/cgi-bin/request"
+    CONTROL_PLANE_PORT8000_CANARY_NETNS=control-plane-lab-canary
+    CONTROL_PLANE_PORT8000_CANARY_IPV4=192.0.2.2
+    CONTROL_PLANE_PORT8000_CANARY_IPV6=none
+    CONTROL_PLANE_PORT8000_CANARY_TARGET_IPV4=192.0.2.1
+    CONTROL_PLANE_PORT8000_CANARY_TARGET_IPV6=none
+    CONTROL_PLANE_PORT8000_EXTERNAL_POLICY_PROBE="$scenario_directory/external-blocked-probe"
+    CONTROL_PLANE_PORT8000_EXTERNAL_POLICY_PROBE_SHA256=$(sha256sum \
+        "$CONTROL_PLANE_PORT8000_EXTERNAL_POLICY_PROBE" | awk '{print $1}')
+    CONTROL_PLANE_PORT8000_EXTERNAL_BLOCKED_ENDPOINT="127.0.0.1:${CONTROL_PLANE_EXTERNAL_BLOCKED_PORT}"
+    CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE="$scenario_directory/ipv6-inventory"
+    CONTROL_PLANE_PORT8000_IPV6_INVENTORY_PROBE="$scenario_directory/ipv6-inventory-probe"
+    CONTROL_PLANE_PORT8000_IPV6_INVENTORY_PROBE_SHA256=$(sha256sum \
+        "$CONTROL_PLANE_PORT8000_IPV6_INVENTORY_PROBE" | awk '{print $1}')
     CONTROL_PLANE_PUBLIC_PROBE_HOST_HEADER=$CONTROL_PLANE_HOST
     CONTROL_PLANE_PUBLIC_PROBE_ATTEMPTS=15
     CONTROL_PLANE_CONTAINER_STOP_TIMEOUT=2
@@ -980,7 +967,6 @@ start_lab()
     grep -F -x -q "    constraints: \"$CONTROL_PLANE_DOCKER_PROVIDER_CONSTRAINT\"" \
         "$LAB_TRAEFIK_STATIC_CONFIG" \
         || fail 'lab Traefik static configuration lacks the exact source-project constraint'
-    prepare_lab_tls
     CONTROL_PLANE_COMPOSE_PROJECT="${project_name}-candidate"
     CONTROL_PLANE_OPERATOR_COMPOSE_FILE="$LAB_DIRECTORY/operator-compose.yaml"
     CONTROL_PLANE_REHEARSAL_COMPOSE_FILE="$LAB_DIRECTORY/rehearsal-compose.yaml"
@@ -1004,14 +990,31 @@ start_lab()
     CONTROL_PLANE_REHEARSAL_NETWORK="${project_name}-rehearsal"
     CONTROL_PLANE_MIGRATION_LOCK_TIMEOUT=750ms
     CONTROL_PLANE_MIGRATION_STATEMENT_TIMEOUT=30s
-    CONTROL_PLANE_INGRESS_CONTROLLER="$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/traefik-ingress.sh"
+    CONTROL_PLANE_HTTPS_CONTROLLER="$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/traefik-https.sh"
+    CONTROL_PLANE_PORT8000_CONTROLLER="$LAB_DIRECTORY/port8000-controller.sh"
     CONTROL_PLANE_EXPECTED_PUBLIC_IPV4=127.0.0.1
     configure_lab_global_transaction_lock
     install_lab_release_manifest
-    assert_release_manifest_source_attestation
+    assert_lab_global_transaction_lock
+    printf '%s\n' \
+        'version=1' \
+        "host=$CONTROL_PLANE_HOST" \
+        "observed_at_epoch=$(date -u +%s)" \
+        'default_route_sha256=none' \
+        'interface_global_ipv6=none' \
+        'dns_aaaa=none' \
+        'provider_endpoint=none' \
+        'external_vantage=none' \
+        'external_denial=none' \
+        > "$CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE"
+    chmod 600 "$CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE"
+    CONTROL_PLANE_PORT8000_IPV6_INVENTORY_SHA256=$(sha256sum \
+        "$CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE" | awk '{print $1}')
     CONTROL_PLANE_DRAIN_ATTEMPTS=12
     CONTROL_PLANE_DRAIN_STABLE_SECONDS=1
     LAB_DYNAMIC_DIR=$CONTROL_PLANE_TRAEFIK_DYNAMIC_DIR
+    LAB_PORT_CONFIG_DIR="$scenario_directory/port-config"
+    CONTROL_PLANE_LAB_PORT_CONFIG="$LAB_PORT_CONFIG_DIR/route"
     LAB_RUNTIME_STATE_DIR="$scenario_directory/runtime-state"
     CONTROL_PLANE_LEGACY_IMAGE=$MOCK_IMAGE
 
@@ -1105,8 +1108,16 @@ start_lab()
     export CONTROL_PLANE_RELEASE_RUNTIME_FENCE_QUEUE_PROBE
     export CONTROL_PLANE_RELEASE_RUNTIME_FENCE_REAPER
     export CONTROL_PLANE_RELEASE_RUNTIME_FENCE_TERMINAL_PROBE
-    export CONTROL_PLANE_INGRESS_CONTROLLER CONTROL_PLANE_LOCAL_INGRESS_ENTRYPOINT
-    export CONTROL_PLANE_LOCAL_INGRESS_URL
+    export CONTROL_PLANE_PORT8000_BOOTSTRAP_PORT CONTROL_PLANE_PORT8000_CONTROLLER
+    export CONTROL_PLANE_PORT8000_HOST_LOCAL_URL CONTROL_PLANE_PORT_PROXY_CONTAINER
+    export CONTROL_PLANE_PORT8000_CANARY_NETNS CONTROL_PLANE_PORT8000_CANARY_IPV4
+    export CONTROL_PLANE_PORT8000_CANARY_IPV6 CONTROL_PLANE_PORT8000_CANARY_TARGET_IPV4
+    export CONTROL_PLANE_PORT8000_CANARY_TARGET_IPV6 CONTROL_PLANE_PORT8000_EXTERNAL_POLICY_PROBE
+    export CONTROL_PLANE_PORT8000_EXTERNAL_POLICY_PROBE_SHA256
+    export CONTROL_PLANE_PORT8000_EXTERNAL_BLOCKED_ENDPOINT
+    export CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE CONTROL_PLANE_PORT8000_IPV6_INVENTORY_SHA256
+    export CONTROL_PLANE_PORT8000_IPV6_INVENTORY_PROBE
+    export CONTROL_PLANE_PORT8000_IPV6_INVENTORY_PROBE_SHA256
     export CONTROL_PLANE_PROXY_CONTAINER CONTROL_PLANE_PUBLIC_PROBE_ATTEMPTS
     export CONTROL_PLANE_PUBLIC_PROBE_HOST_HEADER CONTROL_PLANE_PUBLIC_PROBE_URL
     export CONTROL_PLANE_REDIS_CONTAINER CONTROL_PLANE_REDIS_HOST CONTROL_PLANE_REDIS_PORT
@@ -1124,14 +1135,12 @@ start_lab()
     export CONTROL_PLANE_TEST_MODE CONTROL_PLANE_TRAEFIK_DYNAMIC_DIR
     export CONTROL_PLANE_TRAEFIK_DYNAMIC_FILENAME CONTROL_PLANE_TRAEFIK_ENTRYPOINT
     export CONTROL_PLANE_TRAEFIK_ROUTER CONTROL_PLANE_TRAEFIK_SERVICE
-    export CONTROL_PLANE_TRAEFIK_TLS CONTROL_PLANE_TRAEFIK_CERT_RESOLVER
-    export CONTROL_PLANE_WRITER_EPOCH
+    export CONTROL_PLANE_TRAEFIK_TLS CONTROL_PLANE_WRITER_EPOCH CONTROL_PLANE_HTTPS_CONTROLLER
     export CONTROL_PLANE_EXPECTED_PUBLIC_IPV4
     export CONTROL_PLANE_DRAIN_ATTEMPTS CONTROL_PLANE_DRAIN_STABLE_SECONDS
-    export CONTROL_PLANE_LEGACY_IMAGE
-    export LAB_DYNAMIC_DIR LAB_RUNTIME_STATE_DIR
-    export LAB_TRAEFIK_PORT LAB_TRAEFIK_STATIC_CONFIG LAB_TRAEFIK_TLS_DIRECTORY
-    export LAB_TRAEFIK_TLS_CA CURL_CA_BUNDLE
+    export CONTROL_PLANE_LAB_PORT_CONFIG CONTROL_PLANE_LEGACY_IMAGE
+    export LAB_DYNAMIC_DIR LAB_PORT8000_PORT LAB_PORT_CONFIG_DIR LAB_RUNTIME_STATE_DIR
+    export LAB_TRAEFIK_PORT LAB_TRAEFIK_STATIC_CONFIG
 
     printf '%s\n' 'CONTROL_PLANE_BACKEND_PORT=8080' "LAB_EXPECTED_HOST=$CONTROL_PLANE_HOST" \
         "DB_HOST=$CONTROL_PLANE_DATABASE_CONTAINER" 'DB_PORT=5432' \
@@ -1508,7 +1517,6 @@ with_lab()
 operator()
 {
     "$OPERATOR" "$1"
-    assert_lab_global_transaction_lock
 }
 
 operator_without_backup_attestation_inputs()
@@ -1582,424 +1590,6 @@ preflight_and_apply_migrations()
         sed -n '1,240p' "$apply_migrations_log" >&2
         fail 'control-plane live migration failed'
     fi
-}
-
-replace_lab_traefik_static_config()
-{
-    replacement_static_config=$1
-    chmod 600 "$LAB_TRAEFIK_STATIC_CONFIG"
-    cp "$replacement_static_config" "$LAB_TRAEFIK_STATIC_CONFIG"
-    chmod 400 "$LAB_TRAEFIK_STATIC_CONFIG"
-}
-
-assert_proxy_enrollment_proxy_binding()
-{
-    expected_proxy_enrollment_binding=$1
-    case "$expected_proxy_enrollment_binding" in
-        native)
-            docker inspect "$CONTROL_PLANE_PROXY_CONTAINER" | jq --exit-status '
-                [ (.[0].NetworkSettings.Ports["8000/tcp"] // [])[]
-                    | [.HostIp, .HostPort]
-                ] == [["127.0.0.1", "8000"]]
-            ' >/dev/null
-            ;;
-        legacy)
-            docker inspect "$CONTROL_PLANE_PROXY_CONTAINER" | jq --exit-status '
-                [ (.[0].NetworkSettings.Ports["8000/tcp"] // [])[] ] == []
-            ' >/dev/null
-            ;;
-        *)
-            fail 'proxy-enrollment test requested an unknown proxy binding'
-            ;;
-    esac
-}
-
-assert_proxy_enrollment_blue_binding()
-{
-    expected_proxy_enrollment_binding=$1
-    case "$expected_proxy_enrollment_binding" in
-        legacy)
-            docker inspect "$CONTROL_PLANE_BLUE_CONTAINER" | jq --exit-status '
-                [ (.[0].NetworkSettings.Ports["8080/tcp"] // [])[]
-                    | [.HostIp, .HostPort]
-                ] == [["127.0.0.1", "8000"]]
-            ' >/dev/null
-            ;;
-        absent)
-            docker inspect "$CONTROL_PLANE_BLUE_CONTAINER" | jq --exit-status '
-                [ (.[0].NetworkSettings.Ports["8080/tcp"] // [])[] ] == []
-            ' >/dev/null
-            ;;
-        *)
-            fail 'proxy-enrollment test requested an unknown blue binding'
-            ;;
-    esac
-}
-
-assert_proxy_enrollment_phase()
-{
-    expected_proxy_enrollment_phase=$1
-    grep -F -x -q "phase=$expected_proxy_enrollment_phase" \
-        "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_STATE_FILE" \
-        || fail "proxy-enrollment did not reach phase=$expected_proxy_enrollment_phase"
-}
-
-assert_proxy_enrollment_runner_bootstraps_from_green()
-{
-    proxy_enrollment_runner_source=$(sed -n '/^proxy_enrollment_runner_call()/,/^}/p' "$OPERATOR")
-    # These assertions inspect literal source expressions.
-    # shellcheck disable=SC2016
-    printf '%s\n' "$proxy_enrollment_runner_source" \
-        | grep -F -q -- '--entrypoint php "$green_image"' \
-        || fail 'proxy-enrollment runner does not bootstrap the command from the pinned candidate image'
-    # shellcheck disable=SC2016
-    printf '%s\n' "$proxy_enrollment_runner_source" \
-        | grep -F -q 'assert_immutable_image "$green_image" CONTROL_PLANE_GREEN_IMAGE' \
-        || fail 'proxy-enrollment runner does not revalidate the pinned candidate image before each action'
-    # shellcheck disable=SC2016
-    printf '%s\n' "$proxy_enrollment_runner_source" \
-        | grep -F -q 'docker_container_presence "$runner_name"' \
-        || fail 'proxy-enrollment runner does not reject an exact leftover action container'
-    # This assertion rejects the literal legacy variable reference.
-    # shellcheck disable=SC2016
-    if printf '%s\n' "$proxy_enrollment_runner_source" | grep -F -q '$blue_container'; then
-        fail 'proxy-enrollment runner still uses the legacy container as its bootstrap executor'
-    fi
-}
-
-prepare_proxy_enrollment_legacy_lab()
-{
-    proxy_enrollment_native_static_config="$scenario_directory/traefik-native.yml"
-    proxy_enrollment_legacy_static_config="$scenario_directory/traefik-legacy.yml"
-    proxy_enrollment_legacy_proxy_compose="$scenario_directory/proxy-legacy-compose.yaml"
-    proxy_enrollment_source_custom="$scenario_directory/source-legacy-app-port.yml"
-    proxy_enrollment_command="$scenario_directory/proxy-enrollment-command"
-    CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE="$scenario_directory/proxy-enrollment.yml"
-    CONTROL_PLANE_PROXY_ENROLLMENT_COMMAND=$proxy_enrollment_command
-    CONTROL_PLANE_TEST_PROXY_ENROLLMENT_STATE_FILE="$scenario_directory/proxy-enrollment.state"
-    CONTROL_PLANE_TEST_PROXY_ENROLLMENT_LOG_FILE="$scenario_directory/proxy-enrollment.log"
-    CONTROL_PLANE_TEST_PROXY_ENROLLMENT_OPERATOR_STATE_FILE="$CONTROL_PLANE_OPERATOR_STATE_DIR/$CONTROL_PLANE_OPERATION_ID/state"
-    CONTROL_PLANE_TEST_PROXY_ENROLLMENT_PROXY_CONTAINER=$CONTROL_PLANE_PROXY_CONTAINER
-    CONTROL_PLANE_TEST_PROXY_ENROLLMENT_BLUE_CONTAINER=$CONTROL_PLANE_BLUE_CONTAINER
-    CONTROL_PLANE_TEST_PROXY_ENROLLMENT_PROXY_PROJECT=$project_name
-    CONTROL_PLANE_TEST_PROXY_ENROLLMENT_PROXY_NATIVE_COMPOSE="$LAB_DIRECTORY/compose.yaml"
-    CONTROL_PLANE_TEST_PROXY_ENROLLMENT_PROXY_LEGACY_COMPOSE=$proxy_enrollment_legacy_proxy_compose
-    CONTROL_PLANE_TEST_PROXY_ENROLLMENT_STATIC_CONFIG=$LAB_TRAEFIK_STATIC_CONFIG
-    CONTROL_PLANE_TEST_PROXY_ENROLLMENT_NATIVE_STATIC_CONFIG=$proxy_enrollment_native_static_config
-    CONTROL_PLANE_TEST_PROXY_ENROLLMENT_LEGACY_STATIC_CONFIG=$proxy_enrollment_legacy_static_config
-    CONTROL_PLANE_TEST_PROXY_ENROLLMENT_COMPOSE_OVERRIDE=$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE
-    CONTROL_PLANE_TEST_PROXY_ENROLLMENT_DYNAMIC_DIRECTORY=$CONTROL_PLANE_TRAEFIK_DYNAMIC_DIR
-    CONTROL_PLANE_TEST_PROXY_ENROLLMENT_SOURCE_COMPOSE_FILES="$CONTROL_PLANE_SOURCE_COMPOSE_BASE,$CONTROL_PLANE_SOURCE_COMPOSE_PROD,$CONTROL_PLANE_SOURCE_COMPOSE_CUSTOM,$CONTROL_PLANE_SOURCE_COMPOSE_POSTGRES"
-    CONTROL_PLANE_TEST_PROXY_ENROLLMENT_MODE=normal
-
-    cp "$LAB_TRAEFIK_STATIC_CONFIG" "$proxy_enrollment_native_static_config"
-    chmod 400 "$proxy_enrollment_native_static_config"
-    awk '
-        /^  coolify-local:$/ {
-            omit_local_entrypoint = 1
-            next
-        }
-        omit_local_entrypoint && /^    address: ":8000"$/ {
-            omit_local_entrypoint = 0
-            next
-        }
-        { print }
-    ' "$proxy_enrollment_native_static_config" > "$proxy_enrollment_legacy_static_config"
-    chmod 400 "$proxy_enrollment_legacy_static_config"
-    awk '$0 != "      - \\\"127.0.0.1:8000:8000\\\"" { print }' \
-        "$LAB_DIRECTORY/compose.yaml" > "$proxy_enrollment_legacy_proxy_compose"
-    chmod 600 "$proxy_enrollment_legacy_proxy_compose"
-    {
-        printf '%s\n' 'services:' '  coolify:' '    ports:' \
-            '      - "127.0.0.1:8000:8080"'
-    } > "$proxy_enrollment_source_custom"
-    chmod 600 "$proxy_enrollment_source_custom"
-
-    replace_lab_traefik_static_config "$proxy_enrollment_legacy_static_config"
-    docker compose --ansi never --project-name "$project_name" \
-        --file "$proxy_enrollment_legacy_proxy_compose" \
-        up --detach --force-recreate --no-build --pull never --no-deps proxy >/dev/null
-    CONTROL_PLANE_SOURCE_COMPOSE_CUSTOM=$proxy_enrollment_source_custom
-    export CONTROL_PLANE_SOURCE_COMPOSE_CUSTOM
-    docker compose --ansi never --project-name "$CONTROL_PLANE_SOURCE_COMPOSE_PROJECT" \
-        --env-file "$CONTROL_PLANE_SOURCE_ENV_FILE" \
-        --file "$CONTROL_PLANE_SOURCE_COMPOSE_BASE" --file "$CONTROL_PLANE_SOURCE_COMPOSE_PROD" \
-        --file "$CONTROL_PLANE_SOURCE_COMPOSE_CUSTOM" \
-        up --detach --force-recreate --no-build --pull never --no-deps \
-        "$CONTROL_PLANE_SOURCE_COMPOSE_SERVICE" >/dev/null
-    cp "$LAB_DIRECTORY/proxy-enrollment-command.sh" "$proxy_enrollment_command"
-    chmod 700 "$proxy_enrollment_command"
-    export CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE
-    export CONTROL_PLANE_PROXY_ENROLLMENT_COMMAND
-    export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_STATE_FILE
-    export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_LOG_FILE
-    export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_OPERATOR_STATE_FILE
-    export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_PROXY_CONTAINER
-    export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_BLUE_CONTAINER
-    export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_PROXY_PROJECT
-    export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_PROXY_NATIVE_COMPOSE
-    export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_PROXY_LEGACY_COMPOSE
-    export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_STATIC_CONFIG
-    export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_NATIVE_STATIC_CONFIG
-    export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_LEGACY_STATIC_CONFIG
-    export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_COMPOSE_OVERRIDE
-    export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_DYNAMIC_DIRECTORY
-    export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_SOURCE_COMPOSE_FILES
-    export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_MODE
-    assert_proxy_enrollment_proxy_binding legacy
-    assert_proxy_enrollment_blue_binding legacy
-    assert_source_traefik_identity
-    wait_for_blue
-}
-
-scenario_proxy_enrollment_success()
-{
-    prepare_proxy_enrollment_legacy_lab
-    assert_proxy_enrollment_runner_bootstraps_from_green
-    if docker exec "$CONTROL_PLANE_BLUE_CONTAINER" \
-        php artisan control-plane:proxy-enrollment status >/dev/null 2>&1; then
-        fail 'legacy latest unexpectedly provides the proxy-enrollment Artisan command'
-    fi
-
-    preflight_and_apply_migrations
-    assert_proxy_enrollment_phase activated
-    assert_proxy_enrollment_proxy_binding native
-    assert_proxy_enrollment_blue_binding absent
-    [ -f "$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE" ] \
-        || fail 'native enrollment did not retain the controlled source compose override'
-    operator cutover >/dev/null
-    assert_proxy_enrollment_phase enrolled
-    grep -F -x -q prepare "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_LOG_FILE"
-    grep -F -x -q activate "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_LOG_FILE"
-    grep -F -x -q finalize "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_LOG_FILE"
-}
-
-scenario_proxy_enrollment_preidentity_recovery()
-{
-    prepare_proxy_enrollment_legacy_lab
-    CONTROL_PLANE_TEST_PROXY_ENROLLMENT_MODE=fail-activate-before-proxy
-    export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_MODE
-    if CONTROL_PLANE_TEST_CRASH_AT=after-proxy-enrollment-rollback-pending-legacy \
-        operator preflight > "$scenario_directory/proxy-enrollment-prestate-crash.log" 2>&1; then
-        fail 'pre-state enrollment rollback crash injection unexpectedly completed'
-    fi
-    assert_proxy_enrollment_phase rollback-pending-legacy
-    assert_proxy_enrollment_proxy_binding legacy
-    assert_proxy_enrollment_blue_binding absent
-    [ ! -e "$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE" ] \
-        || fail 'rollback-pending legacy recovery retained the source-port suppression override'
-    [ ! -e "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_OPERATOR_STATE_FILE" ] \
-        || fail 'pre-state enrollment failure created durable operator state'
-
-    CONTROL_PLANE_TEST_PROXY_ENROLLMENT_MODE=normal
-    export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_MODE
-    operator preflight >/dev/null
-    assert_proxy_enrollment_phase activated
-    assert_proxy_enrollment_proxy_binding native
-    assert_proxy_enrollment_blue_binding absent
-}
-
-scenario_proxy_enrollment_activating_recovery()
-{
-    prepare_proxy_enrollment_legacy_lab
-    CONTROL_PLANE_TEST_PROXY_ENROLLMENT_MODE=crash-activate-after-proxy-removal
-    export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_MODE
-    if operator preflight > "$scenario_directory/proxy-enrollment-activating-crash.log" 2>&1; then
-        fail 'activating enrollment crash injection unexpectedly completed'
-    fi
-    assert_proxy_enrollment_phase activating
-    if docker inspect "$CONTROL_PLANE_PROXY_CONTAINER" >/dev/null 2>&1; then
-        fail 'activating crash fixture did not leave proxy identity unavailable before recovery'
-    fi
-
-    CONTROL_PLANE_TEST_PROXY_ENROLLMENT_MODE=normal
-    export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_MODE
-    operator preflight >/dev/null
-    assert_proxy_enrollment_phase activated
-    assert_proxy_enrollment_proxy_binding native
-    assert_proxy_enrollment_blue_binding absent
-}
-
-scenario_proxy_enrollment_persisted_rollback_recovery()
-{
-    prepare_proxy_enrollment_legacy_lab
-    preflight_and_apply_migrations
-    [ -f "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_OPERATOR_STATE_FILE" ] \
-        || fail 'persisted rollback recovery fixture did not create durable operator state'
-    CONTROL_PLANE_TEST_PROXY_ENROLLMENT_MODE=crash-rollback-after-intent
-    export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_MODE
-    if CONTROL_PLANE_TEST_INVALID_ROUTE=1 operator cutover \
-        > "$scenario_directory/proxy-enrollment-rolling-back-crash.log" 2>&1; then
-        fail 'invalid-route cutover fixture unexpectedly completed'
-    fi
-    assert_proxy_enrollment_phase rolling-back
-    assert_proxy_enrollment_proxy_binding native
-    assert_proxy_enrollment_blue_binding absent
-    [ -f "$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE" ] \
-        || fail 'rolling-back crash lost the enrolled source compose override before restoration'
-
-    CONTROL_PLANE_TEST_PROXY_ENROLLMENT_MODE=normal
-    export CONTROL_PLANE_TEST_PROXY_ENROLLMENT_MODE
-    if CONTROL_PLANE_TEST_CRASH_AT=after-proxy-enrollment-rollback-pending-legacy \
-        operator rollback > "$scenario_directory/proxy-enrollment-pending-legacy-crash.log" 2>&1; then
-        fail 'rollback-pending-legacy crash injection unexpectedly completed'
-    fi
-    assert_proxy_enrollment_phase rollback-pending-legacy
-    assert_proxy_enrollment_proxy_binding legacy
-    assert_proxy_enrollment_blue_binding absent
-    [ ! -e "$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE" ] \
-        || fail 'rollback-pending-legacy retained the source-port suppression override'
-
-    operator rollback >/dev/null
-    assert_proxy_enrollment_phase rolled-back
-    assert_proxy_enrollment_proxy_binding legacy
-    assert_proxy_enrollment_blue_binding legacy
-    [ ! -e "$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE" ] \
-        || fail 'terminal persisted rollback retained the source-port suppression override'
-    [ "$(grep -F -x -c rollback "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_LOG_FILE")" -ge 3 ] \
-        || fail 'persisted rollback recovery did not retry the exact rollback action through both durable phases'
-    assert_route_color "https://127.0.0.1:${LAB_TRAEFIK_PORT}/cgi-bin/request" legacy
-    assert_route_color http://127.0.0.1:8000/cgi-bin/request legacy
-}
-
-scenario_proxy_enrollment_partial_credential_recovery()
-{
-    prepare_proxy_enrollment_legacy_lab
-    proxy_enrollment_credential_file="$CONTROL_PLANE_OPERATOR_STATE_DIR/native-traefik-enrollment-v1.token"
-    if CONTROL_PLANE_TEST_CRASH_AT=after-proxy-enrollment-credential-candidate-created \
-        operator preflight > "$scenario_directory/proxy-enrollment-partial-credential-crash.log" 2>&1; then
-        fail 'native Traefik enrollment partial credential crash injection unexpectedly completed'
-    fi
-    [ ! -e "$proxy_enrollment_credential_file" ] \
-        || fail 'partial credential crash unexpectedly published a durable enrollment credential'
-    proxy_enrollment_partial_candidate=
-    for discovered_proxy_enrollment_candidate in \
-        "${proxy_enrollment_credential_file}".new.*
-    do
-        [ -f "$discovered_proxy_enrollment_candidate" ] \
-            && [ ! -L "$discovered_proxy_enrollment_candidate" ] \
-            || continue
-        proxy_enrollment_partial_candidate=$discovered_proxy_enrollment_candidate
-        break
-    done
-    [ -n "$proxy_enrollment_partial_candidate" ] \
-        || fail 'partial credential crash did not leave its mode-0600 candidate'
-    [ ! -s "$proxy_enrollment_partial_candidate" ] \
-        || fail 'partial credential crash did not leave an empty credential candidate'
-    [ "$(stat -c '%a' "$proxy_enrollment_partial_candidate" 2>/dev/null \
-        || stat -f '%Lp' "$proxy_enrollment_partial_candidate")" = 600 ] \
-        || fail 'partial credential crash candidate does not have mode 0600'
-    [ ! -e "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_OPERATOR_STATE_FILE" ] \
-        || fail 'partial credential crash created durable release state before enrollment'
-
-    operator preflight >/dev/null
-    [ -f "$proxy_enrollment_credential_file" ] \
-        || fail 'partial credential restart did not publish a replacement enrollment credential'
-    [ "$(stat -c '%h' "$proxy_enrollment_credential_file" 2>/dev/null \
-        || stat -f '%l' "$proxy_enrollment_credential_file")" = 1 ] \
-        || fail 'partial credential restart published an ambiguous enrollment credential link count'
-    [ ! -e "$proxy_enrollment_partial_candidate" ] \
-        || fail 'partial credential restart retained the unparseable staging candidate'
-    assert_proxy_enrollment_phase activated
-    assert_proxy_enrollment_proxy_binding native
-    assert_proxy_enrollment_blue_binding absent
-}
-
-scenario_proxy_enrollment_cross_operation_adoption()
-{
-    prepare_proxy_enrollment_legacy_lab
-    proxy_enrollment_credential_file="$CONTROL_PLANE_OPERATOR_STATE_DIR/native-traefik-enrollment-v1.token"
-    if CONTROL_PLANE_TEST_CRASH_AT=after-proxy-enrollment-credential-linked \
-        operator preflight > "$scenario_directory/proxy-enrollment-credential-publication-crash.log" 2>&1; then
-        fail 'native Traefik enrollment credential publication crash injection unexpectedly completed'
-    fi
-    [ -f "$proxy_enrollment_credential_file" ] \
-        || fail 'credential publication crash did not leave the durable native Traefik enrollment credential'
-    proxy_enrollment_credential_candidate=
-    for discovered_proxy_enrollment_candidate in \
-        "${proxy_enrollment_credential_file}".new.*
-    do
-        [ -f "$discovered_proxy_enrollment_candidate" ] \
-            && [ ! -L "$discovered_proxy_enrollment_candidate" ] \
-            || continue
-        proxy_enrollment_credential_candidate=$discovered_proxy_enrollment_candidate
-        break
-    done
-    [ -n "$proxy_enrollment_credential_candidate" ] \
-        || fail 'credential publication crash did not leave its linked staging candidate'
-    [ "$(stat -c '%d:%i' "$proxy_enrollment_credential_candidate" 2>/dev/null \
-        || stat -f '%d:%i' "$proxy_enrollment_credential_candidate")" = \
-        "$(stat -c '%d:%i' "$proxy_enrollment_credential_file" 2>/dev/null \
-        || stat -f '%d:%i' "$proxy_enrollment_credential_file")" ] \
-        || fail 'credential publication crash did not leave a same-inode staging link'
-    [ "$(stat -c '%h' "$proxy_enrollment_credential_file" 2>/dev/null \
-        || stat -f '%l' "$proxy_enrollment_credential_file")" = 2 ] \
-        || fail 'credential publication crash did not exercise the linked-before-unlink recovery state'
-    [ ! -e "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_OPERATOR_STATE_FILE" ] \
-        || fail 'credential publication crash created durable release state before enrollment'
-    operator preflight >/dev/null
-    [ "$(stat -c '%h' "$proxy_enrollment_credential_file" 2>/dev/null \
-        || stat -f '%l' "$proxy_enrollment_credential_file")" = 1 ] \
-        || fail 'credential publication restart did not reconcile the same-inode staging link'
-    [ ! -e "$proxy_enrollment_credential_candidate" ] \
-        || fail 'credential publication restart retained its linked staging candidate'
-    preflight_and_apply_migrations
-    operator cutover >/dev/null
-    assert_proxy_enrollment_phase enrolled
-    first_enrollment_operation=$(awk -F= '$1 == "operation_id" { print $2 }' \
-        "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_STATE_FILE")
-    first_enrollment_token_sha256=$(awk -F= '$1 == "token_sha256" { print $2 }' \
-        "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_STATE_FILE")
-    [ "$first_enrollment_operation" = native-traefik-enrollment-v1 ] \
-        || fail 'first native Traefik enrollment did not use the host-stable durable operation identity'
-    printf '%s' "$first_enrollment_token_sha256" | grep -Eq '^[0-9a-f]{64}$' \
-        || fail 'first native Traefik enrollment did not persist a valid host-stable token digest'
-
-    operator rollback >/dev/null
-    assert_proxy_enrollment_phase rolled-back
-    assert_proxy_enrollment_proxy_binding legacy
-    assert_proxy_enrollment_blue_binding legacy
-    [ ! -e "$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE" ] \
-        || fail 'release rollback retained the native source compose override'
-    assert_route_color "https://127.0.0.1:${LAB_TRAEFIK_PORT}/cgi-bin/request" legacy
-    assert_route_color http://127.0.0.1:8000/cgi-bin/request legacy
-
-    CONTROL_PLANE_OPERATION_ID="operation-${scenario_name}-second-0123456789"
-    CONTROL_PLANE_TEST_PROXY_ENROLLMENT_OPERATOR_STATE_FILE="$CONTROL_PLANE_OPERATOR_STATE_DIR/$CONTROL_PLANE_OPERATION_ID/state"
-    export CONTROL_PLANE_OPERATION_ID CONTROL_PLANE_TEST_PROXY_ENROLLMENT_OPERATOR_STATE_FILE
-    printf 'encrypted-database-dump=%s\n' "$CONTROL_PLANE_OPERATION_ID" \
-        > "$CONTROL_PLANE_BACKUP_DATABASE_DUMP_FILE"
-    printf 'encrypted-redis-snapshot=%s\n' "$CONTROL_PLANE_OPERATION_ID" \
-        > "$CONTROL_PLANE_BACKUP_REDIS_SNAPSHOT_FILE"
-    printf 'encrypted-control-plane-state=%s\n' "$CONTROL_PLANE_OPERATION_ID" \
-        > "$CONTROL_PLANE_BACKUP_STATE_ARCHIVE_FILE"
-    printf 'capture-manifest=%s\nsource_redis_image_id=%s\n' "$CONTROL_PLANE_OPERATION_ID" \
-        "$CONTROL_PLANE_BACKUP_EXPECTED_SOURCE_REDIS_IMAGE_ID" \
-        > "$CONTROL_PLANE_BACKUP_CAPTURE_MANIFEST_FILE"
-    printf 'restore-attestation=%s\n' "$CONTROL_PLANE_OPERATION_ID" \
-        > "$CONTROL_PLANE_BACKUP_ATTESTATION_FILE"
-    CONTROL_PLANE_BACKUP_CAPTURE_MANIFEST_SHA256=$(sha256sum \
-        "$CONTROL_PLANE_BACKUP_CAPTURE_MANIFEST_FILE" | awk '{print $1}')
-    CONTROL_PLANE_BACKUP_ATTESTATION_SHA256=$(sha256sum \
-        "$CONTROL_PLANE_BACKUP_ATTESTATION_FILE" | awk '{print $1}')
-    export CONTROL_PLANE_BACKUP_CAPTURE_MANIFEST_SHA256 CONTROL_PLANE_BACKUP_ATTESTATION_SHA256
-
-    operator preflight >/dev/null
-    [ -f "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_OPERATOR_STATE_FILE" ] \
-        || fail 'second release preflight did not create an independent durable operation state'
-    assert_proxy_enrollment_phase activated
-    second_enrollment_operation=$(awk -F= '$1 == "operation_id" { print $2 }' \
-        "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_STATE_FILE")
-    second_enrollment_token_sha256=$(awk -F= '$1 == "token_sha256" { print $2 }' \
-        "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_STATE_FILE")
-    [ "$second_enrollment_operation" = "$first_enrollment_operation" ] \
-        && [ "$second_enrollment_token_sha256" = "$first_enrollment_token_sha256" ] \
-        || fail 'second release could not adopt the exact existing native Traefik enrollment credentials'
-    [ "$(grep -F -x -c prepare "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_LOG_FILE")" = 2 ] \
-        && [ "$(grep -F -x -c activate "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_LOG_FILE")" = 2 ] \
-        || fail 'second release did not perform one exact enrollment after the prior terminal rollback'
-    assert_proxy_enrollment_proxy_binding native
-    assert_proxy_enrollment_blue_binding absent
 }
 
 scenario_queue_gate_and_rehearsal()
@@ -2681,7 +2271,7 @@ scenario_router_reload_failure()
 scenario_route_switch_crash()
 {
     preflight_and_apply_migrations
-    if CONTROL_PLANE_TEST_CRASH_AT=after-green-ingress-route "$OPERATOR" cutover >/dev/null 2>&1; then
+    if CONTROL_PLANE_TEST_CRASH_AT=after-green-port8000-route "$OPERATOR" cutover >/dev/null 2>&1; then
         fail 'route-switch crash injection unexpectedly completed'
     fi
     operator rollback >/dev/null
@@ -2698,6 +2288,7 @@ scenario_blue_revoke_crash()
     fi
     docker inspect "$CONTROL_PLANE_BLUE_CONTAINER" >/dev/null \
         || fail 'pre-revoke final-ingress crash crossed the blue removal boundary'
+    assert_port8000_captured_phase_a
     assert_marker_absent "$CONTROL_PLANE_GREEN_STATE_VOLUME"
     docker stop --time 2 "$CONTROL_PLANE_GREEN_CONTAINER" >/dev/null
     if operator promote >/dev/null 2>&1; then
@@ -2738,10 +2329,17 @@ scenario_blue_stop_crash_converges()
     fi
     [ "$(docker inspect --format '{{.State.Running}}' "$CONTROL_PLANE_BLUE_CONTAINER")" = false ] \
         || fail 'blue stop crash did not preserve the exact stopped container'
+    assert_port8000_captured_phase_a
+    if CONTROL_PLANE_TEST_CRASH_AT=after-green-port8000-permanent-ack \
+        "$OPERATOR" promote >/dev/null 2>&1; then
+        fail 'post-removal permanent-phase crash injection unexpectedly completed'
+    fi
+    assert_port8000_permanent_phase_b
     assert_marker_absent "$CONTROL_PLANE_GREEN_STATE_VOLUME"
     operator promote >/dev/null
     docker inspect "$CONTROL_PLANE_BLUE_CONTAINER" >/dev/null 2>&1 \
         && fail 'blue stop retry did not remove the exact stopped container'
+    assert_port8000_permanent_phase_b
     assert_marker_equals "$CONTROL_PLANE_GREEN_STATE_VOLUME" "$CONTROL_PLANE_WRITER_EPOCH"
     operator rollback >/dev/null
 }
@@ -2867,6 +2465,7 @@ scenario_green_promotion_failure()
     assert_marker_absent "$CONTROL_PLANE_GREEN_STATE_VOLUME"
     assert_marker_equals "$CONTROL_PLANE_BLUE_STATE_VOLUME" "$CONTROL_PLANE_BLUE_WRITER_EPOCH"
     operator promote >/dev/null
+    assert_port8000_permanent_phase_b
     assert_marker_equals "$CONTROL_PLANE_BLUE_STATE_VOLUME" "$CONTROL_PLANE_BLUE_WRITER_EPOCH"
 }
 
@@ -2931,7 +2530,7 @@ scenario_routed_replacement_blue_restart_converges()
     preflight_and_apply_migrations
     operator cutover >/dev/null
     operator promote >/dev/null
-    if CONTROL_PLANE_TEST_CRASH_AT=after-failback-blue-ingress-route \
+    if CONTROL_PLANE_TEST_CRASH_AT=after-failback-blue-port8000-route \
         "$OPERATOR" rollback >/dev/null 2>&1; then
         fail 'routed replacement blue crash injection unexpectedly completed'
     fi
@@ -3147,8 +2746,8 @@ scenario_forward_runtime_fence_promotion()
     grep -F -x -q 'phase=proxy-mutation-freeze-active' "$operation_directory/state" \
         || fail 'promotion crash did not retain the durable proxy mutation freeze'
     for dynamic_url in \
-        "https://127.0.0.1:${LAB_TRAEFIK_PORT}/cgi-bin/request" \
-        "http://127.0.0.1:8000/cgi-bin/request"
+        "http://127.0.0.1:${LAB_TRAEFIK_PORT}/cgi-bin/request" \
+        "http://127.0.0.1:${LAB_PORT8000_PORT}/cgi-bin/request"
     do
         for dynamic_method in GET HEAD OPTIONS POST; do
             dynamic_status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
@@ -3240,7 +2839,7 @@ scenario_reverse_runtime_fence_rollback()
     preflight_and_apply_migrations
     operator cutover >/dev/null
     operator promote >/dev/null
-    if CONTROL_PLANE_TEST_CRASH_AT=after-failback-blue-ingress-route \
+    if CONTROL_PLANE_TEST_CRASH_AT=after-failback-blue-port8000-route \
         "$OPERATOR" rollback >/dev/null 2>&1; then
         fail 'reverse route crash injection unexpectedly completed'
     fi
@@ -3262,14 +2861,30 @@ scenario_reverse_runtime_fence_rollback()
         fail 'reverse subordinate abort crash lost its durable parent intent'
     fi
     "$OPERATOR" abort-failback >/dev/null
-    reverse_ingress_state="$operation_directory/ingress-ingress-rev01/state"
-    grep -F -x -q 'status=restored-managed-v2' "$reverse_ingress_state" \
-        || fail 'reverse ingress restore did not preserve the managed green predecessor'
+    reverse_port8000_state="$operation_directory/ingress-port8000-rev01/state"
+    reverse_restored_green_ack=$(cat "$CONTROL_PLANE_GREEN_APPLIED_ACK_FILE")
+    if ! {
+        grep -F -x -q 'phase=restored' "$reverse_port8000_state" \
+            && grep -F -x -q 'color=green' "$reverse_port8000_state" \
+            && grep -F -x -q 'owner=permanent-b' "$reverse_port8000_state" \
+            && grep -F -x -q "backend=$CONTROL_PLANE_GREEN_CONTAINER" \
+                "$reverse_port8000_state" \
+            && grep -F -x -q "ack=$reverse_restored_green_ack" \
+                "$reverse_port8000_state" \
+            && grep -F -x -q 'color=green' "$CONTROL_PLANE_LAB_PORT_CONFIG" \
+            && grep -F -x -q 'owner=permanent-b' "$CONTROL_PLANE_LAB_PORT_CONFIG" \
+            && grep -F -x -q "backend=$CONTROL_PLANE_GREEN_CONTAINER" \
+                "$CONTROL_PLANE_LAB_PORT_CONFIG" \
+            && grep -F -x -q "ack=$reverse_restored_green_ack" \
+                "$CONTROL_PLANE_LAB_PORT_CONFIG"
+    }; then
+        fail 'reverse :8000 restore did not preserve the exact green incumbent route'
+    fi
     grep -F -x -q 'phase=green-writer-promoted' "$operation_directory/state"
-    ingress_https_url="https://127.0.0.1:${LAB_TRAEFIK_PORT}/cgi-bin/request"
-    ingress_local_url=http://127.0.0.1:8000/cgi-bin/request
+    ingress_https_url="http://127.0.0.1:${LAB_TRAEFIK_PORT}/cgi-bin/request"
+    ingress_port8000_url="http://127.0.0.1:${LAB_PORT8000_PORT}/cgi-bin/request"
     assert_route_color "$ingress_https_url" green
-    assert_route_color "$ingress_local_url" green
+    assert_route_color "$ingress_port8000_url" green
     docker inspect "$CONTROL_PLANE_REPLACEMENT_BLUE_CONTAINER" >/dev/null 2>&1 \
         && fail 'reverse rollback retained replacement blue'
     assert_marker_equals "$CONTROL_PLANE_GREEN_STATE_VOLUME" "$CONTROL_PLANE_WRITER_EPOCH"
@@ -3283,6 +2898,7 @@ scenario_reverse_runtime_fence_rollback()
         sha256sum \
             "$operation_directory/runtime-fence-rev01.env" \
             "$operation_directory/runtime-fence-rev01-https-ack" \
+            "$operation_directory/runtime-fence-rev01-port8000-ack" \
             | sha256sum | awk '{print $1}'
     )
     reverse_generation_allocation_log="$scenario_directory/reverse-generation-allocation-crash.log"
@@ -3320,6 +2936,7 @@ scenario_reverse_runtime_fence_rollback()
         sha256sum \
             "$operation_directory/runtime-fence-rev01.env" \
             "$operation_directory/runtime-fence-rev01-https-ack" \
+            "$operation_directory/runtime-fence-rev01-port8000-ack" \
             | sha256sum | awk '{print $1}'
     )
     [ "$rev01_artifact_sha256" = "$observed_rev01_artifact_sha256" ] \
@@ -3332,6 +2949,17 @@ scenario_reverse_runtime_fence_rollback()
 
 scenario_runtime_env_artifact_attestation()
 {
+    if CONTROL_PLANE_PORT8000_PUBLIC_PROBE_URL=http://203.0.113.10:8000/api/health \
+        "$OPERATOR" preflight >/dev/null 2>&1; then
+        fail 'preflight accepted the removed external :8000 success-probe contract'
+    fi
+    printf '%s\n' '# drift' >> "$CONTROL_PLANE_PORT8000_EXTERNAL_POLICY_PROBE"
+    if operator preflight >/dev/null 2>&1; then
+        fail 'preflight accepted a drifted external :8000 policy probe'
+    fi
+    cp "$LAB_DIRECTORY/external-blocked-probe.sh" "$CONTROL_PLANE_PORT8000_EXTERNAL_POLICY_PROBE"
+    chmod 700 "$CONTROL_PLANE_PORT8000_EXTERNAL_POLICY_PROBE"
+
     backup_source_system_identifier=$CONTROL_PLANE_BACKUP_EXPECTED_SOURCE_PG_SYSTEM_IDENTIFIER
     CONTROL_PLANE_BACKUP_EXPECTED_SOURCE_PG_SYSTEM_IDENTIFIER=1
     if operator preflight > "$scenario_directory/backup-live-identity-mismatch.log" 2>&1; then
@@ -3376,6 +3004,16 @@ scenario_runtime_env_artifact_attestation()
 
     chmod 600 "$green_runtime_env"
     printf '%s\n' 'unverified-crash-artifact=true' > "$green_runtime_env"
+    old_ipv6_inventory_timestamp=$(($(date -u +%s) - 3600))
+    sed "s/^observed_at_epoch=.*/observed_at_epoch=${old_ipv6_inventory_timestamp}/" \
+        "$CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE" \
+        > "$scenario_directory/ipv6-inventory.old-provenance"
+    mv "$scenario_directory/ipv6-inventory.old-provenance" \
+        "$CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE"
+    chmod 600 "$CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE"
+    CONTROL_PLANE_PORT8000_IPV6_INVENTORY_SHA256=$(sha256sum \
+        "$CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE" | awk '{print $1}')
+    export CONTROL_PLANE_PORT8000_IPV6_INVENTORY_SHA256
     operator preflight >/dev/null
     grep -F -x -q "green_runtime_env_sha256=$source_env_sha256" "$operation_directory/state"
     grep -F -x -q "blue_runtime_env_sha256=$source_env_sha256" "$operation_directory/state"
@@ -3383,6 +3021,22 @@ scenario_runtime_env_artifact_attestation()
     grep -F -x -q "green_probe_token_path=$CONTROL_PLANE_GREEN_DIRECT_PROBE_TOKEN_FILE" \
         "$operation_directory/state"
     grep -F -x -q "green_probe_token_sha256=$green_probe_token_sha256" \
+        "$operation_directory/state"
+    ipv6_inventory_sha256=$(sha256sum \
+        "$CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE" | awk '{print $1}')
+    grep -F -x -q \
+        "port8000_ipv6_inventory_path=$CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE" \
+        "$operation_directory/state"
+    grep -F -x -q \
+        "port8000_ipv6_inventory_last_sha256=$ipv6_inventory_sha256" \
+        "$operation_directory/state"
+    grep -Eq '^port8000_ipv6_inventory_last_verified_unix=[1-9][0-9]+$' \
+        "$operation_directory/state"
+    grep -F -x -q \
+        "port8000_ipv6_inventory_probe_path=$CONTROL_PLANE_PORT8000_IPV6_INVENTORY_PROBE" \
+        "$operation_directory/state"
+    grep -F -x -q \
+        "port8000_ipv6_inventory_probe_sha256=$CONTROL_PLANE_PORT8000_IPV6_INVENTORY_PROBE_SHA256" \
         "$operation_directory/state"
     grep -F -x -q \
         "backup_attestation_sha256=$CONTROL_PLANE_BACKUP_ATTESTATION_SHA256" \
@@ -3486,6 +3140,30 @@ scenario_runtime_env_artifact_attestation()
             --entrypoint /bin/sh "$MOCK_IMAGE" -ec 'test ! -r /runtime.env' \
             || fail 'an unauthorized host UID could read the runtime environment artifact'
     fi
+    ipv6_inventory_backup="$scenario_directory/ipv6-inventory.backup"
+    cp -p "$CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE" "$ipv6_inventory_backup"
+    printf '%s\n' 'external_denial=[2001:db8::1]:8000' \
+        >> "$CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE"
+    if operator apply-migrations > "$scenario_directory/drifted-ipv6-inventory.log" 2>&1; then
+        fail 'operation accepted IPv6 inventory bytes that differed from their configured digest'
+    fi
+    grep -F -q 'IPV6_INVENTORY_FILE checksum or mode changed' \
+        "$scenario_directory/drifted-ipv6-inventory.log" \
+        || fail 'IPv6 inventory drift did not reach the configured digest gate'
+    cp -p "$ipv6_inventory_backup" "$CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE"
+    ipv6_inventory_timestamp=$(sed -n 's/^observed_at_epoch=//p' \
+        "$CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE")
+    sed "s/^observed_at_epoch=.*/observed_at_epoch=$((ipv6_inventory_timestamp + 1))/" \
+        "$CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE" \
+        > "$scenario_directory/ipv6-inventory.refreshed"
+    mv "$scenario_directory/ipv6-inventory.refreshed" \
+        "$CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE"
+    chmod 600 "$CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE"
+    CONTROL_PLANE_PORT8000_IPV6_INVENTORY_SHA256=$(sha256sum \
+        "$CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE" | awk '{print $1}')
+    export CONTROL_PLANE_PORT8000_IPV6_INVENTORY_SHA256
+    [ "$CONTROL_PLANE_PORT8000_IPV6_INVENTORY_SHA256" != "$ipv6_inventory_sha256" ] \
+        || fail 'IPv6 inventory refresh did not change its reviewed digest'
     green_probe_token_backup="$scenario_directory/green-direct-probe.token.backup"
     cp -p "$CONTROL_PLANE_GREEN_DIRECT_PROBE_TOKEN_FILE" "$green_probe_token_backup"
     chmod 600 "$CONTROL_PLANE_GREEN_DIRECT_PROBE_TOKEN_FILE"
@@ -3554,6 +3232,7 @@ scenario_restart_persistence_and_failback()
     preflight_and_apply_migrations
     operator cutover >/dev/null
     operator promote >/dev/null
+    assert_port8000_permanent_phase_b
     assert_marker_equals "$CONTROL_PLANE_GREEN_STATE_VOLUME" "$CONTROL_PLANE_WRITER_EPOCH"
     docker restart "$CONTROL_PLANE_GREEN_CONTAINER" >/dev/null
     assert_marker_equals "$CONTROL_PLANE_GREEN_STATE_VOLUME" "$CONTROL_PLANE_WRITER_EPOCH"
@@ -3623,12 +3302,12 @@ scenario_routed_candidate_process_restart_recovers_service()
         || fail 'routed candidate restart did not produce fresh StartedAt and RestartCount evidence'
     captured_status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
         --header "Host: $CONTROL_PLANE_HOST" \
-        "https://127.0.0.1:${LAB_TRAEFIK_PORT}/api/health")
+        "http://127.0.0.1:${LAB_TRAEFIK_PORT}/api/health")
     [ "$captured_status" = 200 ] \
         || fail 'HTTPS health did not recover after the routed candidate process restart'
     captured_status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
         --header "Host: $CONTROL_PLANE_HOST" \
-        "http://127.0.0.1:8000/api/health")
+        "http://127.0.0.1:${LAB_PORT8000_PORT}/api/health")
     [ "$captured_status" = 200 ] \
         || fail ':8000 health did not recover after the routed candidate process restart'
     assert_marker_absent "$CONTROL_PLANE_GREEN_STATE_VOLUME"
@@ -3667,8 +3346,9 @@ scenario_routed_candidate_process_restart_recovers_service()
         || ! grep -F -x -q finalize-routed-runtime-recovery "$fixture_log"; then
         fail 'routed candidate recovery did not reconcile, repin, and finalize the fence'
     fi
-    assert_route_color "https://127.0.0.1:${LAB_TRAEFIK_PORT}/cgi-bin/request" green
-    assert_route_color "http://127.0.0.1:8000/cgi-bin/request" green
+    assert_route_color "http://127.0.0.1:${LAB_TRAEFIK_PORT}/cgi-bin/request" green
+    assert_route_color "http://127.0.0.1:${LAB_PORT8000_PORT}/cgi-bin/request" green
+    assert_port8000_permanent_phase_b
     assert_marker_equals "$CONTROL_PLANE_GREEN_STATE_VOLUME" "$CONTROL_PLANE_WRITER_EPOCH"
     docker exec "$CONTROL_PLANE_GREEN_CONTAINER" \
         /usr/local/bin/coolify-entrypoint web-activated \
@@ -3725,7 +3405,7 @@ capture_control_plane_route()
         --dump-header "$capture_headers" \
         --output "$capture_body" \
         --write-out '%{http_code}' \
-        "https://127.0.0.1:${LAB_TRAEFIK_PORT}/cgi-bin/request") \
+        "http://127.0.0.1:${LAB_TRAEFIK_PORT}/cgi-bin/request") \
         || capture_curl_status=$?
     {
         printf 'curl_status=%s\n' "$capture_curl_status"
@@ -3751,8 +3431,8 @@ start_availability_monitor()
         availability_iteration=0
         while [ ! -e "$availability_stop" ]; do
             for availability_endpoint in \
-                "https|https://127.0.0.1:${LAB_TRAEFIK_PORT}/api/health" \
-                "local-ingress|http://127.0.0.1:8000/api/health"
+                "https|http://127.0.0.1:${LAB_TRAEFIK_PORT}/api/health" \
+                "port8000|http://127.0.0.1:${LAB_PORT8000_PORT}/api/health"
             do
                 availability_name=${availability_endpoint%%|*}
                 availability_url=${availability_endpoint#*|}
@@ -3783,13 +3463,13 @@ stop_and_assert_availability_monitor()
     wait_registered_worker "$availability_monitor_pid" \
         || fail 'continuous availability monitor exited unsuccessfully'
     awk -F '\t' '
-        BEGIN { https = 0; local_ingress = 0; invalid = 0 }
+        BEGIN { https = 0; port8000 = 0; invalid = 0 }
         $2 == "https" { https++ }
-        $2 == "local-ingress" { local_ingress++ }
-        $2 != "https" && $2 != "local-ingress" { invalid = 1 }
+        $2 == "port8000" { port8000++ }
+        $2 != "https" && $2 != "port8000" { invalid = 1 }
         $3 != "0" || $4 != "200" { invalid = 1 }
         $5 != "health" { invalid = 1 }
-        END { exit invalid || https < 10 || local_ingress < 10 }
+        END { exit invalid || https < 10 || port8000 < 10 }
     ' "$availability_log" \
         || fail 'continuous health traffic observed a transport error, non-2xx response, or insufficient samples'
 }
@@ -3887,10 +3567,9 @@ start_installer_test_container()
         --volume /var/run/docker.sock:/var/run/docker.sock \
         --volume "$REPOSITORY_ROOT/docker/control-plane-blue-green:/reviewed:ro" \
         --volume "$CONTROL_PLANE_BACKUP_QUIESCE_STATE_DIR:/var/lib/coolify/control-plane-backup-quiesce" \
-        --volume "$CONTROL_PLANE_BACKUP_QUIESCE_STATE_DIR:/bundle-host/var/lib/coolify/control-plane-backup-quiesce" \
         --entrypoint sleep "$MOCK_IMAGE" infinity >/dev/null
     docker exec --user 0 "$installer_test_container" \
-        install -d -o root -g root -m 0755 /bundle-host
+        install -d -o root -g root -m 0755 /etc/systemd/system
 }
 
 installer_container_operator()
@@ -3917,7 +3596,7 @@ installer_container_operator()
         --env CONTROL_PLANE_DATABASE_ADMIN_USER=postgres \
         --env CONTROL_PLANE_BACKUP_APPLICATION_DATABASE_ROLE=postgres \
         --env "CONTROL_PLANE_BACKUP_REALTIME_CONTAINER=$CONTROL_PLANE_SOKETI_CONTAINER" \
-        --env CONTROL_PLANE_BACKUP_QUIESCE_STATE_DIR=/bundle-host/var/lib/coolify/control-plane-backup-quiesce \
+        --env CONTROL_PLANE_BACKUP_QUIESCE_STATE_DIR=/var/lib/coolify/control-plane-backup-quiesce \
         --env CONTROL_PLANE_BACKUP_QUIESCE_DRAIN_TIMEOUT_SECONDS=1 \
         --env CONTROL_PLANE_BACKUP_QUIESCE_PROBE_TIMEOUT_SECONDS=1 \
         --env CONTROL_PLANE_S6_WAIT_MILLISECONDS=1000 \
@@ -3927,13 +3606,12 @@ installer_container_operator()
         --env CONTROL_PLANE_BACKUP_QUIESCE_OWNER_PID=1 \
         --env CONTROL_PLANE_BACKUP_QUIESCE_OPERATOR_PATH=/reviewed/control-plane-blue-green.sh \
         --env "CONTROL_PLANE_BACKUP_QUIESCE_OPERATOR_SHA256=$installer_operator_sha256" \
-        --env CONTROL_PLANE_BACKUP_QUIESCE_CONTROLLER_PATH=/reviewed/backup-quiesce/control-plane-backup-quiesce.sh \
         --env "CONTROL_PLANE_BACKUP_QUIESCE_CONTROLLER_SHA256=$installer_controller_sha256" \
         --env CONTROL_PLANE_BACKUP_QUIESCE_SERVICE_UNIT_PATH=/reviewed/backup-quiesce/control-plane-backup-quiesce-watchdog.service \
         --env "CONTROL_PLANE_BACKUP_QUIESCE_SERVICE_UNIT_SHA256=$installer_service_sha256" \
         --env CONTROL_PLANE_BACKUP_QUIESCE_TIMER_UNIT_PATH=/reviewed/backup-quiesce/control-plane-backup-quiesce-watchdog.timer \
         --env "CONTROL_PLANE_BACKUP_QUIESCE_TIMER_UNIT_SHA256=$installer_timer_sha256" \
-        --env CONTROL_PLANE_TEST_BACKUP_QUIESCE_WATCHDOG_PID_FILE=/bundle-host/var/lib/coolify/control-plane-backup-quiesce/watchdog.pid \
+        --env CONTROL_PLANE_TEST_BACKUP_QUIESCE_WATCHDOG_PID_FILE=/var/lib/coolify/control-plane-backup-quiesce/watchdog.pid \
         --env "CONTROL_PLANE_TEST_BACKUP_QUIESCE_HOLD_AFTER_WATCHDOG_SECONDS=${installer_operator_hold_after_watchdog_seconds:-0}" \
         "$installer_test_container" \
         /reviewed/backup-quiesce/control-plane-backup-quiesce.sh "$@"
@@ -3941,27 +3619,17 @@ installer_container_operator()
 
 installer_installed_controller()
 {
-    installed_release_id=$1
+    installed_expected_controller_sha256=$1
     shift
-    installed_release_directory="/bundle-host/usr/local/lib/coolify-control-plane/releases/$installed_release_id"
-    installed_controller_path="$installed_release_directory/backup-quiesce/control-plane-backup-quiesce.sh"
     installed_operator_sha256=$(docker exec --user 0 "$installer_test_container" \
-        sha256sum "$installed_release_directory/control-plane-blue-green.sh" | awk '{print $1}')
-    installed_controller_sha256=$(docker exec --user 0 "$installer_test_container" \
-        sha256sum "$installed_controller_path" | awk '{print $1}')
+        sha256sum /usr/local/sbin/control-plane-blue-green | awk '{print $1}')
     installed_service_sha256=$(docker exec --user 0 "$installer_test_container" \
-        sha256sum /bundle-host/etc/systemd/system/control-plane-backup-quiesce-watchdog.service \
+        sha256sum /etc/systemd/system/control-plane-backup-quiesce-watchdog.service \
         | awk '{print $1}')
     installed_timer_sha256=$(docker exec --user 0 "$installer_test_container" \
-        sha256sum /bundle-host/etc/systemd/system/control-plane-backup-quiesce-watchdog.timer \
+        sha256sum /etc/systemd/system/control-plane-backup-quiesce-watchdog.timer \
         | awk '{print $1}')
     docker exec --user 0 \
-        --env CONTROL_PLANE_RELEASE_DISPATCH_TEST_MODE=1 \
-        --env CONTROL_PLANE_RELEASE_DISPATCH_TEST_ROOT=/bundle-host \
-        --env CONTROL_PLANE_RELEASE_MANIFEST_FILE=/bundle-host/etc/coolify-control-plane/release.manifest \
-        --env CONTROL_PLANE_RELEASES_ROOT=/bundle-host/usr/local/lib/coolify-control-plane/releases \
-        --env CONTROL_PLANE_RELEASE_DISPATCH_IMMUTABLE_UID=0 \
-        --env CONTROL_PLANE_RELEASE_DISPATCH_IMMUTABLE_GID=0 \
         --env CONTROL_PLANE_TEST_MODE=1 \
         --env "CONTROL_PLANE_BACKUP_LIVE_CONTAINER=$CONTROL_PLANE_BLUE_CONTAINER" \
         --env "CONTROL_PLANE_DATABASE_CONTAINER=$CONTROL_PLANE_DATABASE_CONTAINER" \
@@ -3969,7 +3637,7 @@ installer_installed_controller()
         --env CONTROL_PLANE_DATABASE_ADMIN_USER=postgres \
         --env CONTROL_PLANE_BACKUP_APPLICATION_DATABASE_ROLE=postgres \
         --env "CONTROL_PLANE_BACKUP_REALTIME_CONTAINER=$CONTROL_PLANE_SOKETI_CONTAINER" \
-        --env CONTROL_PLANE_BACKUP_QUIESCE_STATE_DIR=/bundle-host/var/lib/coolify/control-plane-backup-quiesce \
+        --env CONTROL_PLANE_BACKUP_QUIESCE_STATE_DIR=/var/lib/coolify/control-plane-backup-quiesce \
         --env CONTROL_PLANE_BACKUP_QUIESCE_DRAIN_TIMEOUT_SECONDS=1 \
         --env CONTROL_PLANE_BACKUP_QUIESCE_PROBE_TIMEOUT_SECONDS=1 \
         --env CONTROL_PLANE_S6_WAIT_MILLISECONDS=1000 \
@@ -3977,29 +3645,15 @@ installer_installed_controller()
         --env CONTROL_PLANE_BACKUP_QUIESCE_MINIMUM_CAPTURE_SECONDS=2 \
         --env CONTROL_PLANE_TEST_BACKUP_QUIESCE_BOOT_ID=lab-installer-boot-0123456789 \
         --env CONTROL_PLANE_BACKUP_QUIESCE_OWNER_PID=1 \
-        --env "CONTROL_PLANE_BACKUP_QUIESCE_OPERATOR_PATH=$installed_release_directory/control-plane-blue-green.sh" \
+        --env CONTROL_PLANE_BACKUP_QUIESCE_OPERATOR_PATH=/usr/local/sbin/control-plane-blue-green \
         --env "CONTROL_PLANE_BACKUP_QUIESCE_OPERATOR_SHA256=$installed_operator_sha256" \
-        --env "CONTROL_PLANE_BACKUP_QUIESCE_CONTROLLER_PATH=$installed_controller_path" \
-        --env "CONTROL_PLANE_BACKUP_QUIESCE_CONTROLLER_SHA256=$installed_controller_sha256" \
-        --env CONTROL_PLANE_BACKUP_QUIESCE_SERVICE_UNIT_PATH=/bundle-host/etc/systemd/system/control-plane-backup-quiesce-watchdog.service \
+        --env "CONTROL_PLANE_BACKUP_QUIESCE_CONTROLLER_SHA256=$installed_expected_controller_sha256" \
+        --env CONTROL_PLANE_BACKUP_QUIESCE_SERVICE_UNIT_PATH=/etc/systemd/system/control-plane-backup-quiesce-watchdog.service \
         --env "CONTROL_PLANE_BACKUP_QUIESCE_SERVICE_UNIT_SHA256=$installed_service_sha256" \
-        --env CONTROL_PLANE_BACKUP_QUIESCE_TIMER_UNIT_PATH=/bundle-host/etc/systemd/system/control-plane-backup-quiesce-watchdog.timer \
+        --env CONTROL_PLANE_BACKUP_QUIESCE_TIMER_UNIT_PATH=/etc/systemd/system/control-plane-backup-quiesce-watchdog.timer \
         --env "CONTROL_PLANE_BACKUP_QUIESCE_TIMER_UNIT_SHA256=$installed_timer_sha256" \
         "$installer_test_container" \
-        /bundle-host/usr/local/libexec/coolify-control-plane-release-dispatch \
-        backup-quiesce-controller "$@"
-}
-
-run_installer_release_bundle()
-{
-    installer_release_id=$1
-    shift
-    docker exec --user 0 \
-        --env CONTROL_PLANE_RELEASE_BUNDLE_TEST_MODE=1 \
-        --env CONTROL_PLANE_RELEASE_BUNDLE_TEST_ROOT=/bundle-host \
-        --env CONTROL_PLANE_RELEASE_BUNDLE_SOURCE_ROOT=/reviewed \
-        "$@" "$installer_test_container" \
-        /reviewed/backup-quiesce/install-host-prerequisites.sh "$installer_release_id"
+        /usr/local/libexec/coolify/control-plane-backup-quiesce "$@"
 }
 
 wait_for_file()
@@ -4073,24 +3727,12 @@ assert_quiesce_mutation_residue_absent()
 scenario_backup_quiesce_installer_lock()
 {
     start_installer_test_container
-    if docker exec --user 0 \
-        --env CONTROL_PLANE_RELEASE_BUNDLE_TEST_MODE=1 \
-        --env CONTROL_PLANE_RELEASE_BUNDLE_TEST_ROOT=/bundle-host \
-        --env CONTROL_PLANE_RELEASE_BUNDLE_SOURCE_ROOT=/reviewed \
+    install_marker="$CONTROL_PLANE_BACKUP_QUIESCE_STATE_DIR/installer-systemctl-held"
+    docker exec --user 0 \
+        --env CONTROL_PLANE_TEST_INSTALL_SYSTEMCTL_HOLD_SECONDS=3 \
+        --env CONTROL_PLANE_TEST_INSTALL_SYSTEMCTL_MARKER=/var/lib/coolify/control-plane-backup-quiesce/installer-systemctl-held \
         "$installer_test_container" \
         /reviewed/backup-quiesce/install-host-prerequisites.sh \
-        > "$scenario_directory/installer-no-release.log" 2>&1; then
-        fail 'retired component-only backup installer succeeded without a release ID'
-    fi
-    grep -F -q 'component-only installation is retired; provide RELEASE_ID' \
-        "$scenario_directory/installer-no-release.log" \
-        || fail 'backup component installer did not require the complete bundle interface'
-
-    installer_first_release=backup-bundle-release-first-000001
-    install_marker="$CONTROL_PLANE_BACKUP_QUIESCE_STATE_DIR/installer-bundle-locked"
-    run_installer_release_bundle "$installer_first_release" \
-        --env CONTROL_PLANE_RELEASE_BUNDLE_TEST_HOLD_LOCK_SECONDS=3 \
-        --env CONTROL_PLANE_RELEASE_BUNDLE_TEST_LOCK_MARKER=/bundle-host/var/lib/coolify/control-plane-backup-quiesce/installer-bundle-locked \
         > "$scenario_directory/installer-first.log" 2>&1 &
     installer_pid=$!
     register_worker "$installer_pid"
@@ -4111,58 +3753,90 @@ scenario_backup_quiesce_installer_lock()
     installer_container_operator release --operation-id "$installer_first_operation" \
         --fencing-token "$installer_first_token" >/dev/null
     assert_backup_quiesce_prestate up up up true absent:none unset none
-    docker exec --user 0 "$installer_test_container" /bin/sh -ec '
-        test -x /bundle-host/usr/local/libexec/coolify-control-plane-release-dispatch
-        test -x /bundle-host/usr/local/sbin/control-plane-blue-green
-        test -x "/bundle-host/usr/local/lib/coolify-control-plane/releases/$1/backup-quiesce/control-plane-backup-quiesce.sh"
-        grep -F -x -q "release|$1" /bundle-host/etc/coolify-control-plane/release.manifest
-        grep -F -x -q "ExecStart=/usr/local/sbin/control-plane-blue-green backup-quiesce watchdog-scan --state-directory /var/lib/coolify/control-plane-backup-quiesce" /bundle-host/etc/systemd/system/control-plane-backup-quiesce-watchdog.service
-    ' sh "$installer_first_release" \
-        || fail 'complete backup release bundle lacks its dispatcher, versioned controller, manifest, or stable unit'
 
+    docker exec --user 0 "$installer_test_container" /bin/sh -ec \
+        'printf "\n# stale controller race fixture\n" >> /usr/local/libexec/coolify/control-plane-backup-quiesce'
+    stale_installed_controller_sha256=$(docker exec --user 0 "$installer_test_container" \
+        sha256sum /usr/local/libexec/coolify/control-plane-backup-quiesce \
+        | awk '{print $1}')
+    install_precopy_marker="$CONTROL_PLANE_BACKUP_QUIESCE_STATE_DIR/installer-precopy-held"
+    docker exec --user 0 \
+        --env CONTROL_PLANE_TEST_MODE=1 \
+        --env CONTROL_PLANE_TEST_INSTALL_PRECOPY_HOLD_SECONDS=3 \
+        --env CONTROL_PLANE_TEST_INSTALL_PRECOPY_MARKER=/var/lib/coolify/control-plane-backup-quiesce/installer-precopy-held \
+        "$installer_test_container" \
+        /reviewed/backup-quiesce/install-host-prerequisites.sh \
+        > "$scenario_directory/installer-production-path-race.log" 2>&1 &
+    installer_race_pid=$!
+    register_worker "$installer_race_pid"
+    wait_for_file "$install_precopy_marker"
+    installer_race_operation=backup-quiesce-installer-race-0123456789
+    installer_race_token=abababababababababababababababababababababababababababababababab
+    installer_installed_controller "$stale_installed_controller_sha256" acquire \
+        --operation-id "$installer_race_operation" \
+        --fencing-token "$installer_race_token" --lease-seconds 120 \
+        > "$scenario_directory/installer-production-path-acquire.log" 2>&1 &
+    installer_race_acquire_pid=$!
+    register_worker "$installer_race_acquire_pid"
+    sleep 1
+    kill -0 "$installer_race_acquire_pid" 2>/dev/null \
+        || fail 'installed-path acquire did not wait on the installer-held canonical lock'
+    wait_registered_worker "$installer_race_pid" \
+        || fail 'production-path replacement race installer failed'
+    installer_race_status=0
+    wait_registered_worker "$installer_race_acquire_pid" || installer_race_status=$?
+    [ "$installer_race_status" -ne 0 ] \
+        || fail 'stale installed controller crossed replacement under the canonical lock'
+    grep -F -x -q \
+        'CONTROL_PLANE_BACKUP_QUIESCE_FAILURE backup quiesce controller differs from its pinned digest' \
+        "$scenario_directory/installer-production-path-acquire.log" \
+        || fail 'installed-path replacement race did not fail at post-lock pin validation'
+    [ ! -e "$CONTROL_PLANE_BACKUP_QUIESCE_STATE_DIR/$installer_race_operation" ] \
+        && [ ! -e "$CONTROL_PLANE_BACKUP_QUIESCE_STATE_DIR/active" ] \
+        || fail 'installed-path replacement race stranded backup quiesce state'
+
+    docker exec --user 0 "$installer_test_container" /bin/sh -ec \
+        'printf %s installer-sentinel > /usr/local/sbin/control-plane-blue-green; chmod 0755 /usr/local/sbin/control-plane-blue-green'
+    sentinel_sha256=$(docker exec --user 0 "$installer_test_container" \
+        sha256sum /usr/local/sbin/control-plane-blue-green | awk '{print $1}')
     installer_second_operation=backup-quiesce-installer-second-0123456789
     installer_second_token=8888888888888888888888888888888888888888888888888888888888888888
-    installer_installed_controller "$installer_first_release" acquire --operation-id "$installer_second_operation" \
+    installer_operator_hold_after_watchdog_seconds=3
+    installer_container_operator acquire --operation-id "$installer_second_operation" \
         --fencing-token "$installer_second_token" --lease-seconds 120 \
-        > "$scenario_directory/installer-second-acquire.log"
-    installer_second_release=backup-bundle-release-second-000002
-    if run_installer_release_bundle "$installer_second_release" \
-        > "$scenario_directory/installer-during-acquire.log" 2>&1; then
-        fail 'bundle installer activated a release while a backup lease was active'
-    fi
-    grep -F -q \
-        'CONTROL_PLANE_RELEASE_BUNDLE_INSTALL_FAILURE an active backup-quiesce lease forbids release activation' \
+        > "$scenario_directory/installer-second-acquire.log" 2>&1 &
+    installer_second_acquire_pid=$!
+    register_worker "$installer_second_acquire_pid"
+    installer_second_state="$CONTROL_PLANE_BACKUP_QUIESCE_STATE_DIR/$installer_second_operation/state"
+    installer_state_attempt=0
+    while ! grep -F -x -q phase=acquiring "$installer_second_state" 2>/dev/null; do
+        installer_state_attempt=$((installer_state_attempt + 1))
+        [ "$installer_state_attempt" -lt 100 ] \
+            || fail 'timed out waiting for installer-contention acquisition state'
+        sleep 0.1
+    done
+    docker exec --user 0 "$installer_test_container" \
+        /reviewed/backup-quiesce/install-host-prerequisites.sh \
+        > "$scenario_directory/installer-during-acquire.log" 2>&1 &
+    installer_during_acquire_pid=$!
+    register_worker "$installer_during_acquire_pid"
+    wait_registered_worker "$installer_second_acquire_pid" \
+        || fail 'installer contention broke backup quiesce acquisition'
+    installer_status=0
+    wait_registered_worker "$installer_during_acquire_pid" || installer_status=$?
+    [ "$installer_status" -ne 0 ] \
+        || fail 'installer replaced reviewed bytes while an acquired lease was active'
+    grep -F -x -q \
+        'CONTROL_PLANE_BACKUP_QUIESCE_INSTALL_FAILURE an active backup quiesce lease forbids operator/controller replacement' \
         "$scenario_directory/installer-during-acquire.log" \
-        || fail 'bundle installer did not enforce the active backup lease gate'
-    docker exec --user 0 "$installer_test_container" \
-        grep -F -x -q "release|$installer_first_release" \
-        /bundle-host/etc/coolify-control-plane/release.manifest \
-        || fail 'rejected bundle activation changed the selected release'
-    installer_installed_controller "$installer_first_release" release --operation-id "$installer_second_operation" \
+        || fail 'installer did not reject active state under the canonical lock'
+    [ "$(docker exec --user 0 "$installer_test_container" \
+        sha256sum /usr/local/sbin/control-plane-blue-green | awk '{print $1}')" \
+        = "$sentinel_sha256" ] \
+        || fail 'installer changed operator bytes while the lease state existed'
+    installer_container_operator release --operation-id "$installer_second_operation" \
         --fencing-token "$installer_second_token" >/dev/null
-
-    installer_crash_release=backup-bundle-release-crash-000003
-    installer_crash_status=0
-    run_installer_release_bundle "$installer_crash_release" \
-        --env CONTROL_PLANE_RELEASE_BUNDLE_TEST_CRASH_AT=after-release-manifest-replaced \
-        > "$scenario_directory/installer-crash.log" 2>&1 || installer_crash_status=$?
-    [ "$installer_crash_status" -eq 137 ] \
-        || fail 'bundle post-manifest crash seam did not terminate with status 137'
-    docker exec --user 0 "$installer_test_container" \
-        grep -F -x -q "release|$installer_crash_release" \
-        /bundle-host/etc/coolify-control-plane/release.manifest \
-        || fail 'post-publication crash did not leave the new release selected'
-    installer_recovery_operation=backup-quiesce-installer-recovery-0123456789
-    installer_recovery_token=9999999999999999999999999999999999999999999999999999999999999999
-    installer_installed_controller "$installer_crash_release" acquire \
-        --operation-id "$installer_recovery_operation" \
-        --fencing-token "$installer_recovery_token" --lease-seconds 120 >/dev/null
-    installer_installed_controller "$installer_crash_release" release \
-        --operation-id "$installer_recovery_operation" \
-        --fencing-token "$installer_recovery_token" >/dev/null
-    docker exec --user 0 "$installer_test_container" \
-        test ! -e /bundle-host/etc/coolify-control-plane/release.activation \
-        || fail 'first dispatcher invocation did not recover the interrupted bundle activation'
+    installer_operator_hold_after_watchdog_seconds=0
     [ ! -e "$CONTROL_PLANE_BACKUP_QUIESCE_STATE_DIR/active" ] \
         || fail 'installer/acquire contention stranded an active backup fence'
     assert_backup_quiesce_prestate up up up true absent:none unset none
@@ -4223,6 +3897,27 @@ assert_backup_quiesce_prestate()
         | tr -d '[:space:]')
     [ "$actual_role_setting" = "$expected_role_setting" ] \
         || fail 'backup quiesce did not restore the exact database-role prestate'
+}
+
+assert_backup_quiesce_source_pins()
+{
+    controller_sha256=$(sha256sum \
+        "$REPOSITORY_ROOT/docker/control-plane-blue-green/backup-quiesce/control-plane-backup-quiesce.sh" \
+        | awk '{print $1}')
+    service_sha256=$(sha256sum \
+        "$REPOSITORY_ROOT/docker/control-plane-blue-green/backup-quiesce/control-plane-backup-quiesce-watchdog.service" \
+        | awk '{print $1}')
+    timer_sha256=$(sha256sum \
+        "$REPOSITORY_ROOT/docker/control-plane-blue-green/backup-quiesce/control-plane-backup-quiesce-watchdog.timer" \
+        | awk '{print $1}')
+    if ! grep -F -x -q \
+        "readonly BACKUP_QUIESCE_CONTROLLER_SHA256=$controller_sha256" "$OPERATOR" \
+        || ! grep -F -x -q \
+            "readonly BACKUP_QUIESCE_SERVICE_UNIT_SHA256=$service_sha256" "$OPERATOR" \
+        || ! grep -F -x -q \
+            "readonly BACKUP_QUIESCE_TIMER_UNIT_SHA256=$timer_sha256" "$OPERATOR"; then
+        fail 'main operator backup-quiesce source pins do not match the reviewed source bytes'
+    fi
 }
 
 scenario_backup_quiesce_budget_bounds()
@@ -4595,7 +4290,7 @@ scenario_backup_quiesce_fence()
         "^backup-quiesce=status-passed;operation_id=${operation_name};fencing_token_sha256=${token_sha256};lease_expires_unix=[1-9][0-9]*$" \
         || fail 'backup quiesce status output was not the sole exact binding line'
     curl --fail --silent --show-error --header "Host: $CONTROL_PLANE_HOST" \
-        "https://127.0.0.1:${LAB_TRAEFIK_PORT}/api/health" >/dev/null \
+        "http://127.0.0.1:${LAB_TRAEFIK_PORT}/api/health" >/dev/null \
         || fail 'control-plane health endpoint was unavailable during backup quiesce'
     capture_control_plane_route foreign-router-filtered-during-quiesce POST
     [ "$captured_status" = 503 ] \
@@ -4652,7 +4347,7 @@ scenario_backup_quiesce_fence()
         --header "Host: $CONTROL_PLANE_HOST" \
         --header 'X-Maintenance-Bypass: preexisting-bypass' \
         --header 'Cookie: laravel_maintenance=preexisting-bypass' \
-        "https://127.0.0.1:${LAB_TRAEFIK_PORT}/cgi-bin/request")" = 200 ] \
+        "http://127.0.0.1:${LAB_TRAEFIK_PORT}/cgi-bin/request")" = 200 ] \
         || fail 'lab pre-existing maintenance secret did not model a working bypass before acquisition'
     docker stop --time 2 "$CONTROL_PLANE_SOKETI_CONTAINER" >/dev/null
     docker exec "$CONTROL_PLANE_DATABASE_CONTAINER" \
@@ -4669,7 +4364,7 @@ scenario_backup_quiesce_fence()
         --header "Host: $CONTROL_PLANE_HOST" \
         --header 'X-Maintenance-Bypass: preexisting-bypass' \
         --header 'Cookie: laravel_maintenance=preexisting-bypass' \
-        "https://127.0.0.1:${LAB_TRAEFIK_PORT}/cgi-bin/request")" = 503 ] \
+        "http://127.0.0.1:${LAB_TRAEFIK_PORT}/cgi-bin/request")" = 503 ] \
         || fail 'pre-existing maintenance secret or cookie bypassed the replacement backup fence'
     varied_state="$CONTROL_PLANE_BACKUP_QUIESCE_STATE_DIR/$varied_operation/state"
     varied_fence_sha256=$(sed -n 's/^fence_sha256=//p' "$varied_state")
@@ -5080,7 +4775,7 @@ time.sleep(60)
             --fencing-token "$reaper_new_token" >/dev/null
     assert_backup_quiesce_prestate up up up true absent:none unset none
     curl --fail --silent --show-error --header "Host: $CONTROL_PLANE_HOST" \
-        "https://127.0.0.1:${LAB_TRAEFIK_PORT}/api/health" >/dev/null \
+        "http://127.0.0.1:${LAB_TRAEFIK_PORT}/api/health" >/dev/null \
         || fail 'control-plane health route did not recover after simulated host reboot'
 }
 
@@ -5092,7 +4787,6 @@ main()
     require_command grep
     require_command mkfifo
     require_command mktemp
-    require_command openssl
     require_command php
     require_command ps
     require_command python3
@@ -5107,8 +4801,9 @@ main()
         "$LAB_DIRECTORY/runtime-fence-provisioner.sh" \
         "$REPOSITORY_ROOT/docker/control-plane-blue-green/backup-quiesce/control-plane-backup-quiesce.sh" \
         "$LAB_DIRECTORY/backup-attestation-verifier.sh" \
-        "$LAB_DIRECTORY/proxy-enrollment-command.sh" \
-        "$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/traefik-ingress.sh" \
+        "$LAB_DIRECTORY/external-blocked-probe.sh" \
+        "$LAB_DIRECTORY/ipv6-inventory-probe.sh" \
+        "$LAB_DIRECTORY/port8000-controller.sh" \
         "$LAB_DIRECTORY/mock-control-plane/dependency.sh" \
         "$LAB_DIRECTORY/mock-control-plane/entrypoint.sh" \
         "$LAB_DIRECTORY/mock-control-plane/install" \
@@ -5120,6 +4815,7 @@ main()
     shellcheck --shell=sh "$LAB_DIRECTORY/mock-control-plane/systemctl"
     shellcheck --shell=bash \
         "$REPOSITORY_ROOT/docker/control-plane-blue-green/backup-quiesce/install-host-prerequisites.sh"
+    assert_backup_quiesce_source_pins
     "$LAB_DIRECTORY/entrypoint-runtime-contract-test.sh"
     prepare_mock_image_context
     docker pull "$MOCK_REGISTRY_IMAGE" >/dev/null
@@ -5135,19 +4831,6 @@ main()
         = 'horizon-maintenance=passed;force=false;reservation_attempt=0;executed=0' ] \
         || fail 'real Horizon force=false maintenance behavior proof failed'
 
-    if [ "${1:-}" = proxy-enrollment ]; then
-        [ "$#" -eq 1 ] || fail 'proxy-enrollment lab selector accepts no additional arguments'
-        with_lab proxy-enrollment-success 38 scenario_proxy_enrollment_success
-        with_lab proxy-enrollment-preidentity-recovery 39 scenario_proxy_enrollment_preidentity_recovery
-        with_lab proxy-enrollment-activating-recovery 40 scenario_proxy_enrollment_activating_recovery
-        with_lab proxy-enrollment-persisted-rollback-recovery 41 scenario_proxy_enrollment_persisted_rollback_recovery
-        with_lab proxy-enrollment-cross-operation-adoption 42 scenario_proxy_enrollment_cross_operation_adoption
-        with_lab proxy-enrollment-partial-credential-recovery 43 scenario_proxy_enrollment_partial_credential_recovery
-        remove_mock_image
-        rm -rf "$LAB_ROOT"
-        printf '%s\n' 'CONTROL_PLANE_PROXY_ENROLLMENT_LAB_PASS'
-        return
-    fi
     if [ "${1:-}" = backup-quiesce-budget ]; then
         [ "$#" -eq 1 ] || fail 'backup-quiesce-budget lab selector accepts no additional arguments'
         with_lab backup-quiesce-budget 24 scenario_backup_quiesce_budget_only

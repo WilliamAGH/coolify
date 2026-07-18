@@ -52,42 +52,6 @@ live_stack_assert_sha256()
         || live_stack_blocked "$1 must be a SHA-256 evidence value"
 }
 
-live_stack_platform_from_uname()
-{
-    local system=$1 machine=$2
-
-    [[ $system == Linux ]] || live_stack_blocked "live stack requires native Linux: system=$system"
-    case "$machine" in
-        x86_64|amd64) printf '%s' linux/amd64 ;;
-        aarch64|arm64) printf '%s' linux/arm64 ;;
-        *) live_stack_blocked "live stack host architecture is unsupported: machine=$machine" ;;
-    esac
-}
-
-live_stack_host_platform()
-{
-    local expected_platform=${CONTROL_PLANE_RUNTIME_HOST_GATE_PLATFORM:-} native_platform
-
-    case "$expected_platform" in
-        linux/amd64|linux/arm64) ;;
-        *) live_stack_blocked 'live stack is missing an approved host-gate platform attestation' ;;
-    esac
-    native_platform=$(live_stack_platform_from_uname "$(uname -s)" "$(uname -m)")
-    [[ $native_platform == "$expected_platform" ]] \
-        || live_stack_blocked "live stack platform differs from the native inner host: expected=$expected_platform host=$native_platform"
-    printf '%s' "$native_platform"
-}
-
-live_stack_assert_native_docker_platform()
-{
-    local actual_platform
-
-    actual_platform=$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}') \
-        || live_stack_blocked 'live stack could not attest the nested Docker platform'
-    [[ $actual_platform == "$LIVE_STACK_PLATFORM" ]] \
-        || live_stack_blocked "live stack Docker platform differs from the native inner host: expected=$LIVE_STACK_PLATFORM actual=$actual_platform"
-}
-
 live_stack_assert_loaded_image()
 {
     local role=$1 image=$2
@@ -95,7 +59,7 @@ live_stack_assert_loaded_image()
     docker image inspect "$image" >/dev/null \
         || live_stack_blocked "inner Docker is missing the loaded immutable $role image"
     [[ $(docker image inspect --format '{{.Id}}' "$image") == "$image" \
-        && $(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image") == "$LIVE_STACK_PLATFORM" ]] \
+        && $(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image") == linux/amd64 ]] \
         || live_stack_blocked "inner Docker loaded the wrong immutable $role image content or platform"
 }
 
@@ -117,13 +81,6 @@ live_stack_check()
     grep -F -q 'target: control-plane-direct-probe-token' \
         "$LIVE_STACK_SOURCE_DIRECTORY/../../../docker/control-plane-blue-green/compose.yaml" \
         || live_stack_fail 'canonical Coolify direct-probe secret mount contract is absent'
-    [[ $(live_stack_platform_from_uname Linux x86_64) == linux/amd64 \
-        && $(live_stack_platform_from_uname Linux aarch64) == linux/arm64 ]] \
-        || live_stack_fail 'live-stack native platform mapping is incomplete'
-    if (live_stack_platform_from_uname Darwin arm64) >/dev/null 2>&1 \
-        || (live_stack_platform_from_uname Linux riscv64) >/dev/null 2>&1; then
-        live_stack_fail 'live-stack native platform mapping accepted Darwin or an unsupported architecture'
-    fi
     printf 'CONTROL_PLANE_RUNTIME_FENCE_LIVE_STACK check=passed\n'
 }
 
@@ -156,9 +113,6 @@ readonly LIVE_STACK_WEB_ARCHIVE_SHA256=${CONTROL_PLANE_RUNTIME_WEB_ARCHIVE_SHA25
 readonly LIVE_STACK_PROXY_ARCHIVE_SHA256=${CONTROL_PLANE_RUNTIME_PROXY_ARCHIVE_SHA256:-}
 readonly LIVE_STACK_WEB_CONTRACT_SHA256=${CONTROL_PLANE_RUNTIME_WEB_CONTRACT_SHA256:-}
 readonly LIVE_STACK_PROXY_CONTRACT_SHA256=${CONTROL_PLANE_RUNTIME_PROXY_CONTRACT_SHA256:-}
-LIVE_STACK_PLATFORM=$(live_stack_host_platform)
-readonly LIVE_STACK_PLATFORM
-live_stack_assert_native_docker_platform
 
 live_stack_assert_identifier operation "$LIVE_STACK_OPERATION"
 [[ $LIVE_STACK_ROOT == "/var/lib/coolify-runtime-fence-host-gate/${LIVE_STACK_OPERATION}" \

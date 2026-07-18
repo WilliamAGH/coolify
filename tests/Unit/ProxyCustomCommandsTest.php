@@ -1,18 +1,7 @@
 <?php
 
-use App\Actions\Proxy\ManageControlPlaneProxyEnrollment;
 use App\Enums\ProxyTypes;
 use Symfony\Component\Yaml\Yaml;
-use Tests\TestCase;
-
-uses(TestCase::class);
-
-beforeEach(function (): void {
-    config([
-        'control-plane.mode' => 'active',
-        'control-plane.startup_mode' => 'web-only',
-    ]);
-});
 
 it('extracts custom proxy commands from existing traefik configuration', function () {
     // Create a sample config with custom trustedIPs commands
@@ -24,7 +13,6 @@ it('extracts custom proxy commands from existing traefik configuration', functio
                     '--api.dashboard=true',
                     '--entrypoints.http.address=:80',
                     '--entrypoints.https.address=:443',
-                    '--entrypoints.coolify-local.address=:8000',
                     '--entrypoints.http.forwardedHeaders.trustedIPs=173.245.48.0/20,103.21.244.0/22',
                     '--entrypoints.https.forwardedHeaders.trustedIPs=173.245.48.0/20,103.21.244.0/22',
                     '--providers.docker=true',
@@ -39,17 +27,6 @@ it('extracts custom proxy commands from existing traefik configuration', functio
     // Mock a server with Traefik proxy type
     $server = Mockery::mock('App\Models\Server');
     $server->shouldReceive('proxyType')->andReturn(ProxyTypes::TRAEFIK->value);
-    $server->shouldReceive('isLocalhost')->andReturnTrue();
-    $server->shouldReceive('isSwarm')->andReturnFalse();
-    $server->shouldReceive('getSchemalessAttributes')->andReturn([]);
-    $server->shouldReceive('getAttribute')
-        ->with('proxy')
-        ->andReturn(collect([
-            ManageControlPlaneProxyEnrollment::STATE_KEY => [
-                'version' => 1,
-                'phase' => 'enrolled',
-            ],
-        ]));
 
     $customCommands = extractCustomProxyCommands($server, $yamlConfig);
 
@@ -70,7 +47,6 @@ it('returns empty array when only default commands exist', function () {
                     '--api.dashboard=true',
                     '--entrypoints.http.address=:80',
                     '--entrypoints.https.address=:443',
-                    '--entrypoints.coolify-local.address=:8000',
                     '--providers.docker=true',
                     '--providers.docker.exposedbydefault=false',
                 ],
@@ -82,71 +58,10 @@ it('returns empty array when only default commands exist', function () {
 
     $server = Mockery::mock('App\Models\Server');
     $server->shouldReceive('proxyType')->andReturn(ProxyTypes::TRAEFIK->value);
-    $server->shouldReceive('isLocalhost')->andReturnTrue();
-    $server->shouldReceive('isSwarm')->andReturnFalse();
-    $server->shouldReceive('getSchemalessAttributes')->andReturn([]);
-    $server->shouldReceive('getAttribute')
-        ->with('proxy')
-        ->andReturn(collect([
-            ManageControlPlaneProxyEnrollment::STATE_KEY => [
-                'version' => 1,
-                'phase' => 'enrolled',
-            ],
-        ]));
 
     $customCommands = extractCustomProxyCommands($server, $yamlConfig);
 
     expect($customCommands)->toBeArray()->toBeEmpty();
-});
-
-it('preserves the loopback command when durable enrollment state does not own it', function (?string $phase) {
-    $yamlConfig = Yaml::dump([
-        'services' => [
-            'traefik' => [
-                'command' => ['--entrypoints.coolify-local.address=:8000'],
-            ],
-        ],
-    ]);
-
-    $server = Mockery::mock('App\Models\Server');
-    $server->shouldReceive('proxyType')->andReturn(ProxyTypes::TRAEFIK->value);
-    $server->shouldReceive('isLocalhost')->andReturnTrue();
-    $server->shouldReceive('isSwarm')->andReturnFalse();
-    $server->shouldReceive('getSchemalessAttributes')->andReturn([]);
-    $state = $phase === null ? [] : [
-        ManageControlPlaneProxyEnrollment::STATE_KEY => ['version' => 1, 'phase' => $phase],
-    ];
-    $server->shouldReceive('getAttribute')->with('proxy')->andReturn(collect($state));
-
-    expect(extractCustomProxyCommands($server, $yamlConfig))
-        ->toBe(['--entrypoints.coolify-local.address=:8000']);
-})->with([
-    'unenrolled' => [null],
-    'reservation only' => ['reserving'],
-    'prepared' => ['prepared'],
-    'failed prepare' => ['prepare-failed'],
-    'rolled back' => ['rolled-back'],
-]);
-
-it('preserves a user-owned local entrypoint value after enrollment', function () {
-    $yamlConfig = Yaml::dump([
-        'services' => [
-            'traefik' => [
-                'command' => ['--entrypoints.coolify-local.address=:9000'],
-            ],
-        ],
-    ]);
-    $server = Mockery::mock('App\Models\Server');
-    $server->shouldReceive('proxyType')->andReturn(ProxyTypes::TRAEFIK->value);
-    $server->shouldReceive('isLocalhost')->andReturnTrue();
-    $server->shouldReceive('isSwarm')->andReturnFalse();
-    $server->shouldReceive('getSchemalessAttributes')->andReturn([]);
-    $server->shouldReceive('getAttribute')->with('proxy')->andReturn(collect([
-        ManageControlPlaneProxyEnrollment::STATE_KEY => ['version' => 1, 'phase' => 'enrolled'],
-    ]));
-
-    expect(extractCustomProxyCommands($server, $yamlConfig))
-        ->toBe(['--entrypoints.coolify-local.address=:9000']);
 });
 
 it('handles invalid yaml gracefully', function () {

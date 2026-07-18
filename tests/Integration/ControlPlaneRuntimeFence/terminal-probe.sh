@@ -29,7 +29,7 @@ printf 'active_web_a_id=%s\nactive_web_b_id=%s\n' "$active_web_a_id" "$active_we
 printf 'pool_manifest_sha256=%s\npool_plan_manifest_sha256=%s\npool_generation=%s\n' \
     "$CONTROL_PLANE_INGRESS_POOL_MANIFEST_SHA256" \
     "$CONTROL_PLANE_RUNTIME_POOL_PLAN_MANIFEST_SHA256" "$(manifest_value generation)"
-printf 'pool_member_set_sha256=%s\nhttps_pool_ack_sha256=%s\nlocal_ingress_pool_ack_sha256=%s\n' \
+printf 'pool_member_set_sha256=%s\nhttps_pool_ack_sha256=%s\nport8000_pool_ack_sha256=%s\n' \
     "$(manifest_value member_set_sha256)" "$pool_ack_sha256" "$pool_ack_sha256"
 printf 'retired_incumbent_set=absent\nprovider_fresh=passed\nprovider_snapshot_sha256=%064d\n' 0
 printf 'queue_zero=passed\nqueue_observed_at_epoch=%s\nqueue_probe_sha256=%s\n' \

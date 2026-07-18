@@ -780,6 +780,12 @@ collect_queue_zero_evidence()
     rm -f -- "$output"
 }
 
+validate_port8000_url()
+{
+    [[ $1 =~ ^http://(127\.0\.0\.1|\[::1\]):8000(/[A-Za-z0-9_./?&=%~-]*)?$ ]] \
+        || fail 'terminal port-8000 URL must use an exact loopback host and port 8000'
+}
+
 assert_active_member()
 {
     local member=$1 expected_name expected_route_identity expected_id expected_address expected_port
@@ -941,17 +947,6 @@ provider_freshness_sha256()
     printf '%s\n' "$snapshot"
 }
 
-validate_local_ingress_url()
-{
-    local url=$1 port
-
-    [[ $url =~ ^http://127\.0\.0\.1:([1-9][0-9]{0,4})(/[A-Za-z0-9_./?\&=%~-]*)?$ ]] \
-        || fail 'terminal local ingress URL must use the native Traefik loopback endpoint'
-    port=${BASH_REMATCH[1]}
-    ((port <= 65535)) \
-        || fail 'terminal local ingress URL port must be at most 65535'
-}
-
 terminal_action=${1:-probe}
 [[ $# -le 1 && $terminal_action =~ ^(probe|validate-pool-plan)$ ]] \
     || fail 'usage: control-plane-terminal-state-probe.sh [validate-pool-plan]'
@@ -1012,9 +1007,9 @@ pool_ack_source=$(document_value "$ingress_pool_manifest" pool_ack_file)
 pool_ack=$(read_token "${ARTIFACT_SNAPSHOTS[$pool_ack_source]}")
 probe_ack "${CONTROL_PLANE_RUNTIME_TERMINAL_HTTPS_URL:-}" \
     X-Control-Plane-Pool-Ack "$pool_ack"
-local_ingress_url=${CONTROL_PLANE_RUNTIME_TERMINAL_LOCAL_INGRESS_URL:-}
-validate_local_ingress_url "$local_ingress_url"
-probe_ack "$local_ingress_url" \
+port8000_url=${CONTROL_PLANE_RUNTIME_TERMINAL_PORT8000_URL:-}
+validate_port8000_url "$port8000_url"
+probe_ack "$port8000_url" \
     X-Control-Plane-Pool-Ack "$pool_ack"
 provider_snapshot_sha256=$(provider_freshness_sha256)
 collect_queue_zero_evidence
@@ -1026,7 +1021,7 @@ printf 'active_web_a_id=%s\nactive_web_b_id=%s\n' "$active_web_a_id" "$active_we
 printf 'pool_manifest_sha256=%s\npool_plan_manifest_sha256=%s\npool_generation=%s\n' \
     "$ingress_pool_manifest_sha256" "$pool_plan_manifest_sha256" \
     "$(document_value "$ingress_pool_manifest" generation)"
-printf 'pool_member_set_sha256=%s\nhttps_pool_ack_sha256=%s\nlocal_ingress_pool_ack_sha256=%s\n' \
+printf 'pool_member_set_sha256=%s\nhttps_pool_ack_sha256=%s\nport8000_pool_ack_sha256=%s\n' \
     "$(document_value "$ingress_pool_manifest" member_set_sha256)" \
     "$(document_value "$ingress_pool_manifest" pool_ack_sha256)" \
     "$(document_value "$ingress_pool_manifest" pool_ack_sha256)"

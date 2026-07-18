@@ -13,13 +13,10 @@ uses(TestCase::class, RefreshDatabase::class);
 
 beforeEach(function () {
     config([
-        'constants.coolify.version' => '4.1.2',
+        'constants.coolify.version' => '4.13.0-fork',
         'constants.coolify.versions_url' => 'https://cdn.coollabs.io/coolify/versions.json',
         'constants.coolify.upgrade_script_url' => 'https://cdn.coollabs.io/coolify/upgrade.sh',
     ]);
-    $this->forkVersion = include base_path('config/constants.php');
-    $this->forkVersion = $this->forkVersion['coolify']['version'];
-    expect($this->forkVersion)->toMatch('/^\d+\.\d+\.\d+-fork\.[1-9]\d*$/');
 
     $this->settings = (new InstanceSettings)->forceFill([
         'id' => 0,
@@ -83,36 +80,32 @@ it('uses validated cache when CDN fails and automatic updates are disabled', fun
         ->once();
 });
 
-it('does not contact or run the upstream updater for an automatic fork update', function () {
+it('does not automatically replace a guarded fork release while updates are disabled', function (string $availableVersion, bool $isNewer) {
     $this->settings->forceFill([
-        'is_auto_update_enabled' => true,
+        'is_auto_update_enabled' => false,
         'new_version_available' => true,
     ])->saveQuietly();
-    config(['constants.coolify.version' => $this->forkVersion]);
-    Http::preventStrayRequests();
-    Log::spy();
+
+    config(['constants.coolify.version' => '4.13.0-fork']);
+    Http::fake([
+        'https://cdn.coollabs.io/coolify/versions.json' => Http::response([
+            'coolify' => [
+                'v4' => ['version' => $availableVersion],
+                'helper' => ['version' => '1.0.14'],
+            ],
+        ]),
+    ]);
 
     $action = new UpdateCoolify;
     $action->handle(manual_update: false);
 
-    expect($action->latestVersion)->toBeNull()
-        ->and($this->settings->refresh()->new_version_available)->toBeFalse();
-    Http::assertNothingSent();
-    Log::shouldHaveReceived('warning')
-        ->with('Upstream updater disabled for fork release', Mockery::type('array'))
-        ->once();
-});
-
-it('requires the guarded deployment workflow for a manual fork update', function () {
-    config(['constants.coolify.version' => $this->forkVersion]);
-    Http::preventStrayRequests();
-
-    expect(fn () => (new UpdateCoolify)->handle(manual_update: true))->toThrow(
-        RuntimeException::class,
-        'Fork releases must be updated through the guarded fork deployment workflow.',
-    );
-    Http::assertNothingSent();
-});
+    expect(version_compare($availableVersion, '4.13.0-fork', '>'))->toBe($isNewer)
+        ->and($action->latestVersion)->toBe($availableVersion)
+        ->and($this->settings->refresh()->new_version_available)->toBeTrue();
+})->with([
+    'higher upstream stable release' => ['4.13.0', true],
+    'equal fork release' => ['4.13.0-fork', false],
+]);
 
 it('prevents downgrade even with manual update', function () {
     Http::fake([
@@ -123,14 +116,14 @@ it('prevents downgrade even with manual update', function () {
             ],
         ]),
     ]);
-    config(['constants.coolify.version' => '4.13.0']);
+    config(['constants.coolify.version' => '4.13.0-fork']);
     Log::spy();
 
     $action = new UpdateCoolify;
 
     expect(fn () => $action->handle(manual_update: true))->toThrow(
         Exception::class,
-        'Cannot downgrade from 4.13.0 to 4.12.9. If you need to downgrade, please do so manually via Docker commands.',
+        'Cannot downgrade from 4.13.0-fork to 4.12.9. If you need to downgrade, please do so manually via Docker commands.',
     );
     Log::shouldHaveReceived('error')
         ->with('Downgrade prevented', Mockery::type('array'))
@@ -196,12 +189,12 @@ it('quotes all dynamic guarded update command arguments', function () {
     $upgradeCommands = (new ReflectionMethod(UpdateCoolify::class, 'upgradeCommands'))->invoke(
         new UpdateCoolify,
         $upgradeScriptUrl,
-        $this->forkVersion,
+        '4.13.0-fork',
         '1.0.15',
     );
 
     expect($upgradeCommands)->toBe([
         "curl -fsSL -- '{$upgradeScriptUrl}' -o '/data/coolify/source/upgrade.sh'",
-        "bash '/data/coolify/source/upgrade.sh' '{$this->forkVersion}' '1.0.15'",
+        "bash '/data/coolify/source/upgrade.sh' '4.13.0-fork' '1.0.15'",
     ]);
 });

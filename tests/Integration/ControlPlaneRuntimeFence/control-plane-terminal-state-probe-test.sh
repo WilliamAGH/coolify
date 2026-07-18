@@ -21,7 +21,6 @@ fail()
     exit 1
 }
 
-# AF_UNIX paths are capped at roughly 100 bytes on common hosts; macOS TMPDIR is too long.
 fixture=$(readlink -f -- "$(mktemp -d /tmp/control-plane-terminal-probe.XXXXXX)")
 socket=$fixture/docker.sock
 socket_pid=
@@ -142,6 +141,7 @@ chmod 0700 "$fixture/provider-probe"
 run_probe()
 {
     local scenario=$1 output=$2
+    local port8000_url=${TERMINAL_TEST_PORT8000_URL:-http://127.0.0.1:8000/health}
     if [[ $scenario == healthy ]]; then
         rm -f -- "$fixture/docker-api-scenario"
     else
@@ -170,7 +170,7 @@ run_probe()
     CONTROL_PLANE_INGRESS_POOL_MANIFEST_METADATA="$(pool_fixture_metadata "$POOL_FIXTURE_INGRESS_POOL_MANIFEST")" \
     CONTROL_PLANE_RUNTIME_DOCKER_SOCKET="$socket" \
     CONTROL_PLANE_RUNTIME_TERMINAL_HTTPS_URL=https://coolify.example/health \
-    CONTROL_PLANE_RUNTIME_TERMINAL_LOCAL_INGRESS_URL=http://127.0.0.1:8000/health \
+    CONTROL_PLANE_RUNTIME_TERMINAL_PORT8000_URL="$port8000_url" \
     CONTROL_PLANE_RUNTIME_PROVIDER_PROBE="$fixture/provider-probe" \
         "$PROBE" > "$output" 2>&1
 }
@@ -253,6 +253,13 @@ fi
 grep -F -q 'terminal queue evidence was not exactly zero and operation-bound' \
     "$fixture/queue-nonzero.out" || fail 'nonzero terminal queue emitted an unexpected failure'
 rm -f -- "$fixture/queue-nonzero"
+
+if TERMINAL_TEST_PORT8000_URL=http://127.0.0.1:8001/health \
+    run_probe healthy "$fixture/port8000-wrong-port.out"; then
+    fail 'terminal probe accepted a loopback URL on a non-8000 port'
+fi
+grep -F -q 'terminal port-8000 URL must use an exact loopback host and port 8000' \
+    "$fixture/port8000-wrong-port.out" || fail 'wrong port-8000 URL emitted an unexpected failure'
 
 printf '%s\n' 'CONTROL_PLANE_TERMINAL_PROBE_TEST phase=manifest-attestation'
 cp "$POOL_FIXTURE_INGRESS_POOL_MANIFEST" "$fixture/ingress-pool.expected"

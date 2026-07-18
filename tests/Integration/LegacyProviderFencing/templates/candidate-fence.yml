@@ -1,0 +1,18 @@
+http:
+  routers:
+    managed-router:
+      rule: PathPrefix(`/`)
+      entryPoints: [web]
+      service: candidate-service
+      middlewares: [candidate-fence-proof]
+      priority: 16
+  middlewares:
+    candidate-fence-proof:
+      headers:
+        customResponseHeaders:
+          X-Coolify-Probe-Ack: "1111111111111111111111111111111111111111111111111111111111111111"
+  services:
+    candidate-service:
+      loadBalancer:
+        servers:
+          - url: http://candidate:3000

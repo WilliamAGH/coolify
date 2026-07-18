@@ -2,7 +2,6 @@
 
 namespace App\Jobs;
 
-use App\Actions\Server\UpdateCoolify;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeEncrypted;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -24,21 +23,13 @@ class CheckForUpdatesJob implements ShouldBeEncrypted, ShouldQueue
                 return;
             }
             $settings = instanceSettings();
-            $current_version = config('constants.coolify.version');
-            if (UpdateCoolify::isGuardedForkRelease($current_version)) {
-                $settings->update(['new_version_available' => false]);
-                Log::warning('Upstream update discovery disabled for fork release', [
-                    'current_version' => $current_version,
-                ]);
-
-                return;
-            }
-
             $response = Http::retry(3, 1000)->get(config('constants.coolify.versions_url'));
             if ($response->successful()) {
                 $versions = $response->json();
 
                 $latest_version = data_get($versions, 'coolify.v4.version');
+                $current_version = config('constants.coolify.version');
+
                 // Read existing cached version
                 $existingVersions = null;
                 $existingCoolifyVersion = null;

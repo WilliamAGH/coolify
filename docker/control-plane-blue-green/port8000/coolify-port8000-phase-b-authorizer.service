@@ -1,0 +1,29 @@
+[Unit]
+Description=Coolify permanent phase-B cold-boot start authorizer
+DefaultDependencies=no
+After=local-fs.target
+Before=coolify-port8000-haproxy@phase-b.service network-pre.target docker.service docker.socket
+ConditionPathExists=/var/lib/coolify-control-plane-port8000/phase-b.boot-identity
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=root
+Group=root
+RuntimeDirectory=coolify-control-plane-port8000
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+StateDirectory=coolify-control-plane-port8000
+StateDirectoryMode=0700
+ExecStart=/usr/local/libexec/coolify-haproxy-port8000-controller issue-phase-b-boot-start-authorization
+Restart=no
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/run/coolify-control-plane-port8000 /var/lib/coolify-control-plane-port8000
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+
+[Install]
+WantedBy=multi-user.target

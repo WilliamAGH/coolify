@@ -16,7 +16,7 @@ fail()
     exit 1
 }
 
-fixture=$(readlink -f -- "$(mktemp -d "${TMPDIR:-/tmp}/control-plane-pool-manifest-v2.XXXXXX")")
+fixture=$(readlink -f -- "$(mktemp -d /tmp/control-plane-pool-manifest-v2.XXXXXX)")
 trap 'rm -rf "$fixture"' EXIT HUP INT TERM
 fixture_uid=$(id -u)
 fixture_gid=$(id -g)

@@ -15,7 +15,7 @@ readonly RESTORE_SERVICE=coolify-runtime-attestation-ssh-fence.service
 readonly WATCHDOG_SERVICE=coolify-runtime-attestation-ssh-fence-watchdog.service
 readonly SYSTEMD_DIRECTORY=/etc/systemd/system
 readonly SYSTEMD_PROPERTIES='LoadState FragmentPath DropInPaths ExecStart EnvironmentFiles Before After Wants Requires BindsTo PartOf User Group SupplementaryGroups CapabilityBoundingSet AmbientCapabilities NoNewPrivileges PrivateTmp PrivateDevices PrivateNetwork PrivateUsers ProtectHome ProtectSystem ProtectControlGroups ProtectKernelModules ProtectKernelTunables ProtectClock ProtectHostname ReadWritePaths ReadOnlyPaths InaccessiblePaths RestrictAddressFamilies RestrictNamespaces LockPersonality MemoryDenyWriteExecute RestrictRealtime SystemCallFilter SystemCallArchitectures UMask DynamicUser DevicePolicy DeviceAllow IPAddressAllow IPAddressDeny Restart RestartUSec Type RemainAfterExit DefaultDependencies'
-readonly SEMANTIC_KEYS='CONTROL_PLANE_RUNTIME_OPERATION_ID CONTROL_PLANE_RUNTIME_PROXY_CONTAINER CONTROL_PLANE_RUNTIME_POOL_PLAN_MANIFEST CONTROL_PLANE_RUNTIME_POOL_PLAN_MANIFEST_SHA256 CONTROL_PLANE_RUNTIME_POOL_PLAN_MANIFEST_METADATA CONTROL_PLANE_RUNTIME_MANAGEMENT_ENDPOINTS CONTROL_PLANE_RUNTIME_ADDITIONAL_NETWORK_IDS CONTROL_PLANE_RUNTIME_SELF_SSH_TARGET CONTROL_PLANE_RUNTIME_PROBE_MAX_AGE_SECONDS CONTROL_PLANE_RUNTIME_QUEUE_STABLE_SECONDS CONTROL_PLANE_RUNTIME_PROVIDER_CAPTURE_EXPECTATION CONTROL_PLANE_RUNTIME_PROVIDER_API_URL CONTROL_PLANE_RUNTIME_PROVIDER_ROUTER CONTROL_PLANE_RUNTIME_PROVIDER_SERVICE CONTROL_PLANE_RUNTIME_PROVIDER_LEGACY_PORT CONTROL_PLANE_RUNTIME_PROVIDER_HEADER_FILE CONTROL_PLANE_RUNTIME_TERMINAL_HTTPS_URL CONTROL_PLANE_RUNTIME_TERMINAL_LOCAL_INGRESS_URL'
+readonly SEMANTIC_KEYS='CONTROL_PLANE_RUNTIME_OPERATION_ID CONTROL_PLANE_RUNTIME_PROXY_CONTAINER CONTROL_PLANE_RUNTIME_POOL_PLAN_MANIFEST CONTROL_PLANE_RUNTIME_POOL_PLAN_MANIFEST_SHA256 CONTROL_PLANE_RUNTIME_POOL_PLAN_MANIFEST_METADATA CONTROL_PLANE_RUNTIME_MANAGEMENT_ENDPOINTS CONTROL_PLANE_RUNTIME_ADDITIONAL_NETWORK_IDS CONTROL_PLANE_RUNTIME_SELF_SSH_TARGET CONTROL_PLANE_RUNTIME_PROBE_MAX_AGE_SECONDS CONTROL_PLANE_RUNTIME_QUEUE_STABLE_SECONDS CONTROL_PLANE_RUNTIME_PROVIDER_CAPTURE_EXPECTATION CONTROL_PLANE_RUNTIME_PROVIDER_API_URL CONTROL_PLANE_RUNTIME_PROVIDER_ROUTER CONTROL_PLANE_RUNTIME_PROVIDER_SERVICE CONTROL_PLANE_RUNTIME_PROVIDER_LEGACY_PORT CONTROL_PLANE_RUNTIME_PROVIDER_HEADER_FILE CONTROL_PLANE_RUNTIME_TERMINAL_HTTPS_URL CONTROL_PLANE_RUNTIME_TERMINAL_PORT8000_URL'
 
 declare -a SAFE_SNAPSHOTS=()
 declare -A PLAN_ARTIFACT_IDENTITIES=()
@@ -2097,7 +2097,9 @@ runtime_recovery_phase_class()
         forward:green:green-final-ingress-acknowledged|forward:green:blue-revoking)
             class=active-incumbent
             ;;
-        forward:green:blue-revoked|forward:green:proxy-mutation-freeze-activating|\
+        forward:green:blue-revoked|forward:green:green-port8000-permanent-reconciling|\
+        forward:green:green-port8000-permanent-acknowledged|\
+        forward:green:proxy-mutation-freeze-activating|\
         forward:green:proxy-mutation-freeze-active)
             class=active-absent
             ;;
@@ -2113,8 +2115,8 @@ runtime_recovery_phase_class()
         forward:green:failback-blue-web-activated|forward:green:failback-blue-https-routing)
             class=release
             ;;
-        reverse:blue:failback-blue-https-routed|reverse:blue:blue-failback-routed|\
-        reverse:blue:failback-green-scheduler-stopping|\
+        reverse:blue:failback-blue-https-routed|reverse:blue:failback-blue-port8000-routing|\
+        reverse:blue:blue-failback-routed|reverse:blue:failback-green-scheduler-stopping|\
         reverse:blue:failback-green-scheduler-stopped|reverse:blue:failback-green-horizon-pausing|\
         reverse:blue:failback-green-horizon-paused|\
         reverse:blue:failback-green-drain-inventory-recording|\
@@ -4213,7 +4215,7 @@ run_release_probe()
             ;;
         terminal)
             assert_probe_shape "$output" \
-                '^(version=3|terminal_state=passed|observed_at_epoch=[1-9][0-9]*|operation_id=[A-Za-z0-9_.-]+|semantic_config_sha256=[a-f0-9]{64}|active_web_a_id=[a-f0-9]{64}|active_web_b_id=[a-f0-9]{64}|pool_manifest_sha256=[a-f0-9]{64}|pool_plan_manifest_sha256=[a-f0-9]{64}|pool_generation=[1-9][0-9]*|pool_member_set_sha256=[a-f0-9]{64}|https_pool_ack_sha256=[a-f0-9]{64}|local_ingress_pool_ack_sha256=[a-f0-9]{64}|retired_incumbent_set=absent|provider_fresh=passed|provider_snapshot_sha256=[a-f0-9]{64}|queue_zero=passed|queue_observed_at_epoch=[1-9][0-9]*|queue_probe_sha256=[a-f0-9]{64}|queue_evidence_sha256=[a-f0-9]{64}|queue_pending=0|queue_reserved=0|queue_delayed=0|queue_running=0|mutation_freeze_epoch=[A-Za-z0-9._:-]{16,128})$' terminal-probe
+                '^(version=3|terminal_state=passed|observed_at_epoch=[1-9][0-9]*|operation_id=[A-Za-z0-9_.-]+|semantic_config_sha256=[a-f0-9]{64}|active_web_a_id=[a-f0-9]{64}|active_web_b_id=[a-f0-9]{64}|pool_manifest_sha256=[a-f0-9]{64}|pool_plan_manifest_sha256=[a-f0-9]{64}|pool_generation=[1-9][0-9]*|pool_member_set_sha256=[a-f0-9]{64}|https_pool_ack_sha256=[a-f0-9]{64}|port8000_pool_ack_sha256=[a-f0-9]{64}|retired_incumbent_set=absent|provider_fresh=passed|provider_snapshot_sha256=[a-f0-9]{64}|queue_zero=passed|queue_observed_at_epoch=[1-9][0-9]*|queue_probe_sha256=[a-f0-9]{64}|queue_evidence_sha256=[a-f0-9]{64}|queue_pending=0|queue_reserved=0|queue_delayed=0|queue_running=0|mutation_freeze_epoch=[A-Za-z0-9._:-]{16,128})$' terminal-probe
             [[ $(wc -l < "$output") -eq 25 && $(probe_value version "$output") == 3 \
                 && $(probe_value terminal_state "$output") == passed \
                 && $(probe_value operation_id "$output") == "$operation_id" \
@@ -4230,7 +4232,7 @@ run_release_probe()
                     == "$(ingress_value member_set_sha256)" \
                 && $(probe_value https_pool_ack_sha256 "$output") \
                     == "$(manifest_value pool_ack_sha256)" \
-                && $(probe_value local_ingress_pool_ack_sha256 "$output") \
+                && $(probe_value port8000_pool_ack_sha256 "$output") \
                     == "$(manifest_value pool_ack_sha256)" \
                 && $(probe_value retired_incumbent_set "$output") == absent \
                 && $(probe_value provider_fresh "$output") == passed \

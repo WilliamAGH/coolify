@@ -2,7 +2,6 @@
 
 namespace App\Jobs;
 
-use App\Actions\Server\UpdateCoolify;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeEncrypted;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -21,10 +20,6 @@ class CheckHelperImageJob implements ShouldBeEncrypted, ShouldQueue
 
     public function handle(): void
     {
-        if (UpdateCoolify::isGuardedForkRelease(config('constants.coolify.version'))) {
-            return;
-        }
-
         try {
             $response = Http::retry(3, 1000)->get(config('constants.coolify.versions_url'));
             if ($response->successful()) {

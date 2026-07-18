@@ -16,8 +16,6 @@ class UpdateCoolify
 
     private const string SEMANTIC_VERSION_PATTERN = '/\A(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:(?:0|[1-9]\d*)|(?:\d*[A-Za-z-][0-9A-Za-z-]*))(?:\.(?:(?:0|[1-9]\d*)|(?:\d*[A-Za-z-][0-9A-Za-z-]*)))*)?\z/D';
 
-    private const string FORK_VERSION_PATTERN = '/\A(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-fork\.[1-9]\d*\z/D';
-
     private const string HTTPS_URL_PATTERN = '/\Ahttps:\/\/[A-Za-z0-9.-]+(?::[0-9]{1,5})?(?:\/[A-Za-z0-9._~!$&\'()*+,=:@%\/-]*)?(?:\?[A-Za-z0-9._~!$&\'()*+,=:@%\/?-]*)?\z/D';
 
     private const string UPGRADE_SCRIPT_PATH = '/data/coolify/source/upgrade.sh';
@@ -47,23 +45,6 @@ class UpdateCoolify
             config('constants.coolify.version'),
             'configured Coolify version',
         );
-        if (self::isGuardedForkRelease($this->currentVersion)) {
-            Log::warning('Upstream updater disabled for fork release', [
-                'current_version' => $this->currentVersion,
-                'manual_update' => $manual_update,
-            ]);
-            $settings->new_version_available = false;
-            $settings->save();
-
-            if ($manual_update) {
-                throw new RuntimeException(
-                    'Fork releases must be updated through the guarded fork deployment workflow.'
-                );
-            }
-
-            return;
-        }
-
         $latestVersions = $this->latestVersions();
         $this->latestVersion = $latestVersions['applicationVersion'];
         $this->latestHelperImageVersion = $latestVersions['helperVersion'];
@@ -89,11 +70,6 @@ class UpdateCoolify
         $this->update();
         $settings->new_version_available = false;
         $settings->save();
-    }
-
-    public static function isGuardedForkRelease(mixed $version): bool
-    {
-        return is_string($version) && preg_match(self::FORK_VERSION_PATTERN, $version) === 1;
     }
 
     /**

@@ -3,15 +3,10 @@
 namespace App\Support;
 
 use App\Contracts\ProxyMutation;
-use App\Exceptions\ControlPlaneMutationLockedException;
-use App\Models\Server;
 use Closure;
-use Fiber;
 use Illuminate\Events\CallQueuedListener;
 use Illuminate\Queue\Jobs\RedisJob;
 use Illuminate\Queue\Queue;
-use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use JsonException;
 use LogicException;
@@ -26,14 +21,6 @@ final class ProxyMutationQueue
     public const PAYLOAD_MARKER = 'coolifyProxyMutation';
 
     private static bool $selfAssertedPayloadInFlight = false;
-
-    private static ?string $enrollmentReservationTokenSha256 = null;
-
-    private static int $operationSerializationDepth = 0;
-
-    private static ?string $operationSerializationContext = null;
-
-    private const OPERATION_LOCK_NAME = 'proxy-mutations:operation-serialization:v1';
 
     public static function assign(object $job): void
     {
@@ -80,13 +67,11 @@ final class ProxyMutationQueue
 
     public static function ensureDispatchAllowed(): void
     {
-        self::assertEnrollmentReservationAllowsMutation();
         ControlPlaneMode::withMutationLease(static fn (): null => null);
     }
 
     public static function ensureExecutionAllowed(): void
     {
-        self::assertEnrollmentReservationAllowsMutation();
         ControlPlaneMode::withMutationOperationLease(static fn (): null => null);
     }
 
@@ -241,137 +226,9 @@ final class ProxyMutationQueue
     }
 
     /** @template T @param Closure(): T $operation @return T */
-    public static function execute(Closure $operation, ?string $enrollmentReservationTokenSha256 = null): mixed
+    public static function execute(Closure $operation): mixed
     {
-        return self::withOperationSerialization(
-            static fn (): mixed => ControlPlaneMode::withMutationOperationLease($operation),
-            $enrollmentReservationTokenSha256,
-        );
-    }
-
-    public static function serializeMarkedExecution(Closure $operation): mixed
-    {
-        return self::withOperationSerialization($operation);
-    }
-
-    public static function operationLockName(): string
-    {
-        return self::OPERATION_LOCK_NAME;
-    }
-
-    public static function operationLockStoreName(): string
-    {
-        return app()->runningUnitTests() ? (string) config('cache.default', 'array') : 'redis';
-    }
-
-    public static function operationSerializationActive(): bool
-    {
-        return self::$operationSerializationDepth > 0;
-    }
-
-    private static function withOperationSerialization(
-        Closure $operation,
-        ?string $enrollmentReservationTokenSha256 = null,
-    ): mixed {
-        $context = self::synchronousOperationContext();
-        if (self::$operationSerializationDepth > 0) {
-            if (self::$operationSerializationContext !== $context) {
-                throw new LogicException(
-                    'Proxy-mutation operation-lock reentrancy is limited to one synchronous call stack.',
-                );
-            }
-            if ($enrollmentReservationTokenSha256 !== null
-                && (self::$enrollmentReservationTokenSha256 === null
-                    || ! hash_equals(
-                        self::$enrollmentReservationTokenSha256,
-                        $enrollmentReservationTokenSha256,
-                    ))) {
-                throw new LogicException('Nested proxy-mutation execution cannot change operation-lock ownership.');
-            }
-
-            self::$operationSerializationDepth++;
-            try {
-                self::assertEnrollmentReservationAllowsMutation();
-
-                return $operation();
-            } finally {
-                self::$operationSerializationDepth--;
-            }
-        }
-
-        $lockSeconds = max(1, (int) config('control-plane.proxy_mutation_operation_lock_seconds', 43200));
-        $waitSeconds = max(0, (int) config('control-plane.proxy_mutation_operation_lock_wait_seconds', 36000));
-        $lock = Cache::store(self::operationLockStoreName())->lock(self::OPERATION_LOCK_NAME, $lockSeconds);
-        $previousReservationTokenSha256 = self::$enrollmentReservationTokenSha256;
-
-        return $lock->block($waitSeconds, function () use (
-            $context,
-            $enrollmentReservationTokenSha256,
-            $operation,
-            $previousReservationTokenSha256,
-        ): mixed {
-            self::$operationSerializationDepth = 1;
-            self::$operationSerializationContext = $context;
-            self::$enrollmentReservationTokenSha256 = $enrollmentReservationTokenSha256;
-
-            try {
-                self::assertEnrollmentReservationAllowsMutation();
-
-                return $operation();
-            } finally {
-                self::$enrollmentReservationTokenSha256 = $previousReservationTokenSha256;
-                self::$operationSerializationDepth = 0;
-                self::$operationSerializationContext = null;
-            }
-        });
-    }
-
-    private static function synchronousOperationContext(): string
-    {
-        $fiber = Fiber::getCurrent();
-
-        return $fiber === null ? 'main' : 'fiber:'.spl_object_id($fiber);
-    }
-
-    /** @param array<string, mixed> $state */
-    public static function enrollmentReservationIsActive(array $state): bool
-    {
-        return ($state['version'] ?? null) === 1
-            && in_array($state['phase'] ?? null, [
-                'reserving',
-                'preparing',
-                'prepared',
-                'activating',
-                'activated',
-                'rollback-required',
-                'rolling-back',
-                'rollback-pending-legacy',
-                'intervention-required',
-            ], true);
-    }
-
-    private static function assertEnrollmentReservationAllowsMutation(): void
-    {
-        if (app()->runningUnitTests() && ! Schema::hasTable((new Server)->getTable())) {
-            return;
-        }
-
-        $server = Server::query()->find(0);
-        $state = $server?->proxy->get('control_plane_proxy_enrollment');
-        if (! is_array($state) || ! self::enrollmentReservationIsActive($state)) {
-            return;
-        }
-
-        $ownedTokenSha256 = $state['token_sha256'] ?? null;
-        if (is_string($ownedTokenSha256)
-            && is_string(self::$enrollmentReservationTokenSha256)
-            && hash_equals($ownedTokenSha256, self::$enrollmentReservationTokenSha256)) {
-            return;
-        }
-
-        throw new ControlPlaneMutationLockedException(
-            'Proxy mutations are reserved by an in-progress managed control-plane enrollment.',
-        );
+        return ControlPlaneMode::withMutationOperationLease($operation);
     }
 
     public static function redisConnectionName(): string

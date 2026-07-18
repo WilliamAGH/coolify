@@ -1,0 +1,46 @@
+[Unit]
+Description=Coolify control-plane port 8000 HAProxy (%i)
+Documentation=https://docs.haproxy.org/2.8/configuration.html
+DefaultDependencies=no
+After=local-fs.target
+Requires=coolify-port8000-phase-b-authorizer.service
+After=coolify-port8000-phase-b-authorizer.service
+Before=network-pre.target docker.service docker.socket coolify-port8000-nft.service
+ConditionPathExists=/etc/coolify-control-plane-port8000/%i.cfg
+
+[Service]
+Type=notify
+NotifyAccess=all
+User=root
+Group=root
+RuntimeDirectory=coolify-control-plane-port8000
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+StateDirectory=coolify-control-plane-port8000
+StateDirectoryMode=0700
+ExecStartPre=/bin/bash -c 'set -Eeuo pipefail; instance=$1; [[ $instance != phase-b ]] && exit 0; authorization=/run/coolify-control-plane-port8000/phase-b.start-authorization; [[ -f $authorization && ! -L $authorization ]] || exit 70; controller=$(sed -n "s/^controller_path=//p" "$authorization"); [[ $(grep -F -c "controller_path=" "$authorization") -eq 1 && $controller == /* && -f $controller && ! -L $controller && -x $controller ]] || exit 71; declared=$(sed -n "s/^controller_sha256=//p" "$authorization"); [[ $(grep -F -c "controller_sha256=" "$authorization") -eq 1 && $declared =~ ^[a-f0-9]{64}$ && $(sha256sum "$controller" | awk "{print \\$1}") == $declared ]] || exit 72; exec "$controller" consume-phase-b-start-authorization "$instance"' -- %i
+ExecStartPre=/usr/local/lib/coolify-control-plane-port8000/haproxy-2.8.26/haproxy -c -f /etc/coolify-control-plane-port8000/%i.cfg
+ExecStart=/usr/local/lib/coolify-control-plane-port8000/haproxy-2.8.26/haproxy -Ws -f /etc/coolify-control-plane-port8000/%i.cfg -p /run/coolify-control-plane-port8000/%i.pid
+ExecReload=/bin/bash -c 'set -Eeuo pipefail; [[ $1 == phase-a ]] || exit 75; exec /usr/local/lib/coolify-control-plane-port8000/haproxy-2.8.26/haproxy -c -f /etc/coolify-control-plane-port8000/phase-a.cfg' -- %i
+ExecReload=/bin/kill -USR2 $MAINPID
+KillMode=mixed
+Restart=no
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/run/coolify-control-plane-port8000 /var/lib/coolify-control-plane-port8000
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SETGID CAP_SETUID
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_SETGID CAP_SETUID
+
+[Install]
+WantedBy=multi-user.target

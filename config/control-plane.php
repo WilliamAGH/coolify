@@ -13,8 +13,6 @@ return [
     'route_drain_marker_path' => env('CONTROL_PLANE_ROUTE_DRAIN_MARKER_PATH'),
     'mutation_freeze_epoch' => env('CONTROL_PLANE_MUTATION_FREEZE_EPOCH'),
     'mutation_freeze_marker_path' => env('CONTROL_PLANE_MUTATION_FREEZE_MARKER_PATH'),
-    'proxy_mutation_operation_lock_seconds' => 43200,
-    'proxy_mutation_operation_lock_wait_seconds' => 36000,
     'trusted_proxy_addresses' => env('CONTROL_PLANE_TRUSTED_PROXY_ADDRESSES'),
     'direct_probe_token_path' => '/run/secrets/control-plane-direct-probe-token',
     'route_health_token_path' => '/run/secrets/control-plane-route-health-token',

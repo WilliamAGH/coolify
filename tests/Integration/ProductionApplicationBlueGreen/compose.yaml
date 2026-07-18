@@ -89,7 +89,7 @@ services:
     networks: [production-saga]
 
   traefik:
-    image: traefik:v3.6.23@sha256:f5dba1e65167778cd5f8d1b463fc5d200f49d40c6458fc9f4b391a68ebfb9534
+    image: traefik:v3.6.17@sha256:802adc80a7bb20a6766c9385c2ad547f0de98564cd20d31d0b6d8f726f906f66
     command: ["--configFile=/etc/traefik/traefik.yml"]
     restart: "no"
     volumes:

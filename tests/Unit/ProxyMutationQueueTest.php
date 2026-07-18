@@ -3,16 +3,11 @@
 use App\Actions\Proxy\StartProxy;
 use App\Contracts\ProxyMutation;
 use App\Events\ProxyStatusChanged;
-use App\Jobs\CleanupStuckedResourcesJob;
 use App\Jobs\CoolifyTask;
 use App\Jobs\ProxyMutationTask;
 use App\Listeners\ProxyStatusChangedNotification;
-use App\Support\ProxyMutationExecutionPipe;
 use App\Support\ProxyMutationQueue;
-use Illuminate\Database\QueryException;
 use Illuminate\Events\CallQueuedListener;
-use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\Schema;
 use Lorisleiva\Actions\Decorators\JobDecorator;
 use Spatie\Activitylog\Models\Activity;
 use Tests\TestCase;
@@ -53,107 +48,6 @@ it('uses the typed marker boundary as the canonical queue inventory', function (
         expect($implementation::proxyMutationQueue(), $implementation)->toBe(ProxyMutationQueue::NAME)
             ->and(ProxyMutationQueue::isMarked($transport), $implementation)->toBeTrue();
     }
-});
-
-it('does not query enrollment state in tests before the servers table exists', function () {
-    expect(app()->runningUnitTests())->toBeTrue();
-
-    expect(fn (): null => ProxyMutationQueue::ensureDispatchAllowed())
-        ->not->toThrow(Throwable::class);
-});
-
-it('does not use the test schema bypass outside the testing environment', function () {
-    $environment = app()->environment();
-    app()->instance('env', 'production');
-    Schema::shouldReceive('hasTable')->never();
-
-    try {
-        expect(fn (): null => ProxyMutationQueue::ensureDispatchAllowed())
-            ->toThrow(QueryException::class);
-    } finally {
-        app()->instance('env', $environment);
-    }
-});
-
-it('keeps the proxy-mutation reservation active while rollback is resumable', function () {
-    expect(ProxyMutationQueue::enrollmentReservationIsActive([
-        'version' => 1,
-        'phase' => 'rolling-back',
-    ]))->toBeTrue()
-        ->and(ProxyMutationQueue::enrollmentReservationIsActive([
-            'version' => 1,
-            'phase' => 'rolled-back',
-        ]))->toBeFalse();
-});
-
-it('holds one reentrant operation lock across marked pipe execution and nested direct execution', function () {
-    $command = (new ReflectionClass(CleanupStuckedResourcesJob::class))->newInstanceWithoutConstructor();
-
-    $result = (new ProxyMutationExecutionPipe)->handle($command, function (): string {
-        expect(ProxyMutationQueue::operationSerializationActive())->toBeTrue();
-        $competitor = Cache::store(ProxyMutationQueue::operationLockStoreName())->lock(
-            ProxyMutationQueue::operationLockName(),
-            60,
-        );
-        expect($competitor->get())->toBeFalse();
-
-        return ProxyMutationQueue::execute(function (): string {
-            expect(ProxyMutationQueue::operationSerializationActive())->toBeTrue();
-
-            return 'nested-complete';
-        });
-    });
-
-    expect($result)->toBe('nested-complete')
-        ->and(ProxyMutationQueue::operationSerializationActive())->toBeFalse();
-});
-
-it('always clears synchronous operation-lock ownership after an exception', function () {
-    expect(fn () => ProxyMutationQueue::serializeMarkedExecution(
-        static fn () => throw new RuntimeException('synthetic operation failure'),
-    ))->toThrow(RuntimeException::class, 'synthetic operation failure');
-
-    expect(ProxyMutationQueue::operationSerializationActive())->toBeFalse()
-        ->and(ProxyMutationQueue::execute(static fn (): string => 'next-operation'))
-        ->toBe('next-operation')
-        ->and(ProxyMutationQueue::operationSerializationActive())->toBeFalse();
-});
-
-it('rejects reentrancy from an interleaved Fiber while preserving same-stack nesting', function () {
-    $interleavedCallbackRan = false;
-
-    ProxyMutationQueue::serializeMarkedExecution(function () use (&$interleavedCallbackRan): void {
-        $fiber = new Fiber(function () use (&$interleavedCallbackRan): void {
-            ProxyMutationQueue::serializeMarkedExecution(function () use (&$interleavedCallbackRan): void {
-                $interleavedCallbackRan = true;
-            });
-        });
-
-        expect(fn () => $fiber->start())
-            ->toThrow(LogicException::class, 'limited to one synchronous call stack');
-    });
-
-    expect($interleavedCallbackRan)->toBeFalse()
-        ->and(ProxyMutationQueue::operationSerializationActive())->toBeFalse();
-});
-
-it('uses the configured test store but hard-pins production serialization to Redis', function () {
-    expect(ProxyMutationQueue::operationLockStoreName())->toBe((string) config('cache.default'));
-    $environment = app()->environment();
-    app()->instance('env', 'production');
-
-    try {
-        expect(ProxyMutationQueue::operationLockStoreName())->toBe('redis');
-    } finally {
-        app()->instance('env', $environment);
-    }
-});
-
-it('keeps the shared lock alive beyond every declared proxy-mutation timeout envelope', function () {
-    expect((int) config('control-plane.proxy_mutation_operation_lock_seconds'))
-        ->toBeGreaterThan((int) config('horizon.defaults.proxy-mutations.timeout'))
-        ->and((int) config('control-plane.proxy_mutation_operation_lock_wait_seconds'))
-        ->toBeGreaterThanOrEqual((int) config('horizon.defaults.proxy-mutations.timeout'));
 });
 
 it('routes the concrete proxy activity task through the canonical queue', function () {

@@ -24,6 +24,7 @@ COPY --chmod=755 dependency.sh /usr/local/bin/control-plane-lab-dependency
 COPY --chmod=755 systemctl /usr/local/bin/systemctl
 COPY --chmod=755 install /usr/local/bin/install
 COPY --chmod=755 ssh /usr/local/bin/ssh
+COPY --chmod=755 port-proxy.py /usr/local/bin/control-plane-port-proxy
 COPY health /srv/www/api/health
 COPY config/database.php /var/www/html/config/database.php
 COPY app/Support/ControlPlaneMigrationInventory.php /var/www/html/app/Support/ControlPlaneMigrationInventory.php

@@ -22,10 +22,6 @@ class StartSentinel implements ProxyMutation
 
     public function handle(Server $server, bool $restart = false, ?string $latestVersion = null, ?string $customImage = null)
     {
-        if (UpdateCoolify::isGuardedForkRelease(config('constants.coolify.version'))) {
-            return;
-        }
-
         ProxyMutationQueue::ensureExecutionAllowed();
 
         if ($server->isSwarm() || $server->isBuildServer()) {

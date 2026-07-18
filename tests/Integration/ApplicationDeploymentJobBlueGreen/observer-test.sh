@@ -93,5 +93,8 @@ jq -s -e 'last.present == false and last.finalFlush == true' \
 if grep -qE 'snapshot failed|exited unexpectedly' "$work_directory/observer.log"; then
     exit 1
 fi
+grep -qF "request_observer_final_flush" "$script_directory/run.sh"
+grep -qF "candidate observer exited during final flush" "$script_directory/run.sh"
+grep -qF "last.present == false and last.finalFlush == true" "$script_directory/run.sh"
 
 printf 'APPLICATION_DEPLOYMENT_OBSERVER_TEST_PASS\n'

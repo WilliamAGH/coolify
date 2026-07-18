@@ -78,9 +78,6 @@ jobs:
     name: Build and publish production Linux image
     if: ${{ needs.resolve-version.outputs.should_publish == 'true' }}
     needs: resolve-version
-    concurrency:
-      group: linux-image-release-coollabsio/coolify
-      cancel-in-progress: false
     uses: ./.github/workflows/publish-linux-image.yml
     permissions:
       artifact-metadata: write

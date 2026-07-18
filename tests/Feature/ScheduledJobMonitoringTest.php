@@ -187,18 +187,25 @@ test('scheduler log parser returns empty collection when no logs exist', functio
 })->skip(fn () => file_exists(storage_path('logs/scheduled-'.now()->format('Y-m-d').'.log')), 'Skipped: log file already exists from other tests');
 
 test('scheduler log parser parses skip entries correctly', function () {
-    withIsolatedScheduledLogsForMonitoringTest(function (string $logPath): void {
-        $logLine = '['.now()->format('Y-m-d H:i:s').'] production.INFO: Backup skipped {"type":"backup","skip_reason":"server_not_functional","execution_time":"'.now()->toIso8601String().'","backup_id":1,"team_id":5}';
-        file_put_contents($logPath, $logLine."\n");
+    $logPath = storage_path('logs/scheduled-'.now()->format('Y-m-d').'.log');
+    $logDir = dirname($logPath);
+    if (! is_dir($logDir)) {
+        mkdir($logDir, 0755, true);
+    }
 
-        $parser = new SchedulerLogParser;
-        $skips = $parser->getRecentSkips();
+    $logLine = '['.now()->format('Y-m-d H:i:s').'] production.INFO: Backup skipped {"type":"backup","skip_reason":"server_not_functional","execution_time":"'.now()->toIso8601String().'","backup_id":1,"team_id":5}';
+    file_put_contents($logPath, $logLine."\n");
 
-        expect($skips)->toHaveCount(1);
-        expect($skips->first()['type'])->toBe('backup');
-        expect($skips->first()['reason'])->toBe('server_not_functional');
-        expect($skips->first()['team_id'])->toBe(5);
-    });
+    $parser = new SchedulerLogParser;
+    $skips = $parser->getRecentSkips();
+
+    expect($skips)->toHaveCount(1);
+    expect($skips->first()['type'])->toBe('backup');
+    expect($skips->first()['reason'])->toBe('server_not_functional');
+    expect($skips->first()['team_id'])->toBe(5);
+
+    // Cleanup
+    @unlink($logPath);
 });
 
 test('scheduler log parser excludes started events from runs', function () {
@@ -238,22 +245,29 @@ test('scheduler log parser excludes started events from runs', function () {
 });
 
 test('scheduler log parser filters by team id', function () {
-    withIsolatedScheduledLogsForMonitoringTest(function (string $logPath): void {
-        $lines = [
-            '['.now()->format('Y-m-d H:i:s').'] production.INFO: Backup skipped {"type":"backup","skip_reason":"server_not_functional","team_id":1}',
-            '['.now()->format('Y-m-d H:i:s').'] production.INFO: Backup skipped {"type":"backup","skip_reason":"subscription_unpaid","team_id":2}',
-        ];
-        file_put_contents($logPath, implode("\n", $lines)."\n");
+    $logPath = storage_path('logs/scheduled-'.now()->format('Y-m-d').'.log');
+    $logDir = dirname($logPath);
+    if (! is_dir($logDir)) {
+        mkdir($logDir, 0755, true);
+    }
 
-        $parser = new SchedulerLogParser;
+    $lines = [
+        '['.now()->format('Y-m-d H:i:s').'] production.INFO: Backup skipped {"type":"backup","skip_reason":"server_not_functional","team_id":1}',
+        '['.now()->format('Y-m-d H:i:s').'] production.INFO: Backup skipped {"type":"backup","skip_reason":"subscription_unpaid","team_id":2}',
+    ];
+    file_put_contents($logPath, implode("\n", $lines)."\n");
 
-        $allSkips = $parser->getRecentSkips(100);
-        expect($allSkips)->toHaveCount(2);
+    $parser = new SchedulerLogParser;
 
-        $team1Skips = $parser->getRecentSkips(100, 1);
-        expect($team1Skips)->toHaveCount(1);
-        expect($team1Skips->first()['team_id'])->toBe(1);
-    });
+    $allSkips = $parser->getRecentSkips(100);
+    expect($allSkips)->toHaveCount(2);
+
+    $team1Skips = $parser->getRecentSkips(100, 1);
+    expect($team1Skips)->toHaveCount(1);
+    expect($team1Skips->first()['team_id'])->toBe(1);
+
+    // Cleanup
+    @unlink($logPath);
 });
 
 test('skipped jobs show fallback when resource is deleted', function () {

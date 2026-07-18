@@ -87,69 +87,11 @@ verify_tag_index() {
 release_run_id() {
     local repository="$1"
     local index_digest="$2"
-    local platform
-    local config
-    local label_state
-    local amd64_label_state
-    local arm64_label_state
-    local amd64_run_id
-    local arm64_run_id
+    local release_run_id
 
-    for platform in "$AMD64_PLATFORM" "$ARM64_PLATFORM"; do
-        if ! config="$(regctl image config "${repository}@${index_digest}" --platform "$platform")"; then
-            printf 'publish-linux-image: unable to read the release run id from %s@%s for %s\n' \
-                "$repository" "$index_digest" "$platform" >&2
-            return 1
-        fi
-        if ! label_state="$(jq -r '
-            .config.Labels as $labels
-            | if ($labels | type) == "object" then
-                if ($labels | has("io.coolify.release-run-id")) then
-                    if ($labels["io.coolify.release-run-id"] | type) == "string" then
-                        "present:\($labels["io.coolify.release-run-id"])"
-                    else
-                        "invalid"
-                    end
-                else
-                    "absent"
-                end
-            elif $labels == null then
-                "absent"
-            else
-                "invalid"
-            end
-        ' <<< "$config")"; then
-            printf 'publish-linux-image: invalid image config for %s@%s on %s\n' \
-                "$repository" "$index_digest" "$platform" >&2
-            return 1
-        fi
-
-        if [[ "$platform" == "$AMD64_PLATFORM" ]]; then
-            amd64_label_state="$label_state"
-        else
-            arm64_label_state="$label_state"
-        fi
-    done
-
-    if [[ "$amd64_label_state" == absent && "$arm64_label_state" == absent ]]; then
-        printf '\n'
-        return 0
-    fi
-    if [[ "$amd64_label_state" != present:* || "$arm64_label_state" != present:* ]]; then
-        printf 'publish-linux-image: release run id label is mixed or malformed across platforms for %s@%s\n' \
-            "$repository" "$index_digest" >&2
-        return 1
-    fi
-
-    amd64_run_id="${amd64_label_state#present:}"
-    arm64_run_id="${arm64_label_state#present:}"
-    if ! [[ "$amd64_run_id" =~ ^[0-9]+$ && "$arm64_run_id" =~ ^[0-9]+$ && "$amd64_run_id" == "$arm64_run_id" ]]; then
-        printf 'publish-linux-image: release run id label is inconsistent across platforms for %s@%s\n' \
-            "$repository" "$index_digest" >&2
-        return 1
-    fi
-
-    printf '%s\n' "$amd64_run_id"
+    release_run_id="$(regctl image config "${repository}@${index_digest}" --platform "$AMD64_PLATFORM" | jq -er '.config.Labels["io.coolify.release-run-id"]')"
+    [[ "$release_run_id" =~ ^[0-9]+$ ]] || die "missing monotonic release-run-id label on ${repository}@${index_digest}"
+    printf '%s\n' "$release_run_id"
 }
 
 ensure_tag() {
@@ -293,111 +235,75 @@ ensure_tag_pair() {
     fi
 }
 
-restore_alias() {
+restore_latest() {
     local repository="$1"
-    local tag="$2"
-    local previous_digest="$3"
-    local promoted_digest="$4"
+    local previous_digest="$2"
+    local promoted_digest="$3"
     local current_digest
 
-    current_digest="$(tag_digest_or_empty "${repository}:${tag}")" || return 1
+    current_digest="$(tag_digest_or_empty "${repository}:latest")" || return 1
     if [[ "$current_digest" == "$previous_digest" ]]; then
         return 0
     fi
     [[ "$current_digest" == "$promoted_digest" ]] || return 1
 
     if [[ -n "$previous_digest" ]]; then
-        regctl image copy "${repository}@${previous_digest}" "${repository}:${tag}" || return 1
-        current_digest="$(tag_digest_or_empty "${repository}:${tag}")" || return 1
+        regctl image copy "${repository}@${previous_digest}" "${repository}:latest" || return 1
+        current_digest="$(tag_digest_or_empty "${repository}:latest")" || return 1
         [[ "$current_digest" == "$previous_digest" ]]
     else
-        regctl tag delete --ignore-missing "${repository}:${tag}" || return 1
-        current_digest="$(tag_digest_or_empty "${repository}:${tag}")" || return 1
+        regctl tag delete --ignore-missing "${repository}:latest" || return 1
+        current_digest="$(tag_digest_or_empty "${repository}:latest")" || return 1
         [[ -z "$current_digest" ]]
     fi
 }
 
-preflight_alias() {
+preflight_latest() {
     local ghcr_repository="$1"
     local docker_repository="$2"
-    local tag="$3"
-    local candidate_index="$4"
-    local candidate_run_id="$5"
-    local expected_ghcr_previous="${6-}"
-    local expected_docker_previous="${7-}"
-    local candidate_attested_run_id
-    local ghcr_previous
-    local docker_previous
-    local ghcr_current_run_id
-    local docker_current_run_id
-    local current_amd64
-    local current_arm64
+    local candidate_index="$3"
+    local candidate_run_id="$4"
+    local current_repository
+    local current_digest
+    local current_run_id
 
     require_digest "$candidate_index"
     [[ "$candidate_run_id" =~ ^[0-9]+$ ]] || die "release run id must be numeric"
 
-    candidate_attested_run_id="$(release_run_id "$ghcr_repository" "$candidate_index")" || return 1
-    [[ -n "$candidate_attested_run_id" ]] \
-        || die "candidate ${ghcr_repository}@${candidate_index} is missing a monotonic release-run-id label"
-    [[ "$candidate_attested_run_id" == "$candidate_run_id" ]] \
-        || die "candidate release run id does not match ${ghcr_repository}@${candidate_index}"
+    for current_repository in "$ghcr_repository" "$docker_repository"; do
+        current_digest="$(tag_digest_or_empty "${current_repository}:latest")" || return 1
+        [[ -n "$current_digest" ]] || continue
+        require_digest "$current_digest"
 
-    ghcr_previous="$(tag_digest_or_empty "${ghcr_repository}:${tag}")" || return 1
-    docker_previous="$(tag_digest_or_empty "${docker_repository}:${tag}")" || return 1
-
-    if [[ "$#" -eq 7 ]] && [[ "$ghcr_previous" != "$expected_ghcr_previous" || "$docker_previous" != "$expected_docker_previous" ]]; then
-        die "alias changed during promotion: ${tag}"
-    fi
-
-    if [[ -z "$ghcr_previous" && -z "$docker_previous" ]]; then
-        return 0
-    fi
-    if [[ -z "$ghcr_previous" || -z "$docker_previous" ]]; then
-        die "alias state is split across registries for ${tag}"
-    fi
-    require_digest "$ghcr_previous"
-    require_digest "$docker_previous"
-    [[ "$ghcr_previous" == "$docker_previous" ]] \
-        || die "alias state is split across registries for ${tag}"
-
-    current_amd64="$(regctl image digest "${ghcr_repository}@${ghcr_previous}" --platform "$AMD64_PLATFORM")"
-    current_arm64="$(regctl image digest "${ghcr_repository}@${ghcr_previous}" --platform "$ARM64_PLATFORM")"
-    require_digest "$current_amd64"
-    require_digest "$current_arm64"
-    verify_index "$ghcr_repository" "$ghcr_previous" "$current_amd64" "$current_arm64" || return 1
-    verify_index "$docker_repository" "$docker_previous" "$current_amd64" "$current_arm64" || return 1
-
-    ghcr_current_run_id="$(release_run_id "$ghcr_repository" "$ghcr_previous")" || return 1
-    docker_current_run_id="$(release_run_id "$docker_repository" "$docker_previous")" || return 1
-    if [[ -z "$ghcr_current_run_id" && -z "$docker_current_run_id" ]]; then
-        return 0
-    fi
-    if [[ -z "$ghcr_current_run_id" || -z "$docker_current_run_id" ]]; then
-        die "alias state mixes legacy and release-labeled images for ${tag}"
-    fi
-    [[ "$ghcr_current_run_id" == "$docker_current_run_id" ]] \
-        || die "alias state has conflicting release run ids for ${tag}"
-
-    if (( ghcr_current_run_id > candidate_run_id )); then
-        printf 'publish-linux-image: classification=superseded candidate_run_id=%s current_run_id=%s tag=%s digest=%s\n' \
-            "$candidate_run_id" "$ghcr_current_run_id" "$tag" "$ghcr_previous" >&2
-        return 3
-    fi
-    if (( ghcr_current_run_id == candidate_run_id )) && [[ "$ghcr_previous" != "$candidate_index" ]]; then
-        die "conflicting ${tag} digests share release run id ${ghcr_current_run_id}"
-    fi
+        current_run_id="$(release_run_id "$current_repository" "$current_digest")"
+        if (( current_run_id > candidate_run_id )); then
+            printf 'publish-linux-image: classification=superseded candidate_run_id=%s current_run_id=%s registry=%s digest=%s\n' \
+                "$candidate_run_id" "$current_run_id" "$current_repository" "$current_digest" >&2
+            return 3
+        fi
+        if (( current_run_id == candidate_run_id )) && [[ "$current_digest" != "$candidate_index" ]]; then
+            die "conflicting latest digests share release run id ${current_run_id}"
+        fi
+    done
 }
 
-promote_alias() {
+promote_latest() {
     local ghcr_repository="$1"
     local docker_repository="$2"
-    local tag="$3"
-    local candidate_index="$4"
-    local candidate_amd64="$5"
-    local candidate_arm64="$6"
-    local candidate_run_id="$7"
+    local candidate_index="$3"
+    local candidate_amd64="$4"
+    local candidate_arm64="$5"
+    local candidate_run_id="$6"
     local ghcr_previous
     local docker_previous
+    local desired_repository="$ghcr_repository"
+    local desired_index="$candidate_index"
+    local desired_amd64="$candidate_amd64"
+    local desired_arm64="$candidate_arm64"
+    local desired_run_id="$candidate_run_id"
+    local current_repository
+    local current_digest
+    local current_run_id
     local updated_ghcr='false'
     local updated_docker='false'
     local preflight_status
@@ -407,60 +313,73 @@ promote_alias() {
     require_digest "$candidate_arm64"
     [[ "$candidate_run_id" =~ ^[0-9]+$ ]] || die "release run id must be numeric"
 
-    ghcr_previous="$(tag_digest_or_empty "${ghcr_repository}:${tag}")" || return 1
-    docker_previous="$(tag_digest_or_empty "${docker_repository}:${tag}")" || return 1
-
-    preflight_alias "$ghcr_repository" "$docker_repository" "$tag" "$candidate_index" "$candidate_run_id" \
-        "$ghcr_previous" "$docker_previous" || {
+    preflight_latest "$ghcr_repository" "$docker_repository" "$candidate_index" "$candidate_run_id" || {
         preflight_status=$?
         return "$preflight_status"
     }
 
-    if [[ "$ghcr_previous" != "$candidate_index" ]]; then
-        if ! regctl image copy "${ghcr_repository}@${candidate_index}" "${ghcr_repository}:${tag}"; then
-            die "unable to promote GHCR ${tag}"
+    ghcr_previous="$(tag_digest_or_empty "${ghcr_repository}:latest")" || return 1
+    docker_previous="$(tag_digest_or_empty "${docker_repository}:latest")" || return 1
+
+    for current_repository in "$ghcr_repository" "$docker_repository"; do
+        if [[ "$current_repository" == "$ghcr_repository" ]]; then
+            current_digest="$ghcr_previous"
+        else
+            current_digest="$docker_previous"
+        fi
+
+        [[ -n "$current_digest" ]] || continue
+
+        current_run_id="$(release_run_id "$current_repository" "$current_digest")"
+        if (( current_run_id > desired_run_id )); then
+            printf 'publish-linux-image: classification=superseded candidate_run_id=%s current_run_id=%s registry=%s digest=%s\n' \
+                "$desired_run_id" "$current_run_id" "$current_repository" "$current_digest" >&2
+            return 3
+        elif (( current_run_id == desired_run_id )) && [[ "$current_digest" != "$desired_index" ]]; then
+            die "conflicting latest digests share release run id ${current_run_id}"
+        fi
+    done
+
+    if [[ "$ghcr_previous" != "$desired_index" ]]; then
+        if ! regctl image copy "${desired_repository}@${desired_index}" "${ghcr_repository}:latest"; then
+            die "unable to promote GHCR latest"
         fi
         updated_ghcr='true'
-        if ! verify_tag_index "$ghcr_repository" "$tag" "$candidate_index" "$candidate_amd64" "$candidate_arm64"; then
-            restore_alias "$ghcr_repository" "$tag" "$ghcr_previous" "$candidate_index" \
-                || die "unable to compensate GHCR ${tag}"
-            die "GHCR ${tag} platform verification failed"
+        if ! verify_tag_index "$ghcr_repository" latest "$desired_index" "$desired_amd64" "$desired_arm64"; then
+            restore_latest "$ghcr_repository" "$ghcr_previous" "$desired_index" || die 'unable to compensate GHCR latest'
+            die "GHCR latest platform verification failed"
         fi
     fi
 
-    if [[ "$docker_previous" != "$candidate_index" ]]; then
-        if ! regctl image copy "${ghcr_repository}@${candidate_index}" "${docker_repository}:${tag}"; then
+    if [[ "$docker_previous" != "$desired_index" ]]; then
+        if ! regctl image copy "${desired_repository}@${desired_index}" "${docker_repository}:latest"; then
             if [[ "$updated_ghcr" == 'true' ]]; then
-                restore_alias "$ghcr_repository" "$tag" "$ghcr_previous" "$candidate_index" ||
-                    die "unable to compensate GHCR ${tag} after Docker Hub promotion failure"
+                restore_latest "$ghcr_repository" "$ghcr_previous" "$desired_index" ||
+                    die 'unable to compensate GHCR latest after Docker Hub promotion failure'
             fi
-            die "unable to promote Docker Hub ${tag}; compensated GHCR"
+            die "unable to promote Docker Hub latest; compensated GHCR"
         fi
         updated_docker='true'
-        if ! verify_tag_index "$docker_repository" "$tag" "$candidate_index" "$candidate_amd64" "$candidate_arm64"; then
+        if ! verify_tag_index "$docker_repository" latest "$desired_index" "$desired_amd64" "$desired_arm64"; then
             if [[ "$updated_ghcr" == 'true' ]]; then
-                restore_alias "$ghcr_repository" "$tag" "$ghcr_previous" "$candidate_index" \
-                    || die "unable to compensate GHCR ${tag}"
+                restore_latest "$ghcr_repository" "$ghcr_previous" "$desired_index" || die 'unable to compensate GHCR latest'
             fi
             if [[ "$updated_docker" == 'true' ]]; then
-                restore_alias "$docker_repository" "$tag" "$docker_previous" "$candidate_index" \
-                    || die "unable to compensate Docker Hub ${tag}"
+                restore_latest "$docker_repository" "$docker_previous" "$desired_index" || die 'unable to compensate Docker Hub latest'
             fi
-            die "Docker Hub ${tag} platform verification failed; compensated both registries"
+            die "Docker Hub latest platform verification failed; compensated both registries"
         fi
     fi
 
-    if ! verify_tag_index "$ghcr_repository" "$tag" "$candidate_index" "$candidate_amd64" "$candidate_arm64" ||
-        ! verify_tag_index "$docker_repository" "$tag" "$candidate_index" "$candidate_amd64" "$candidate_arm64"; then
+    if ! verify_tag_index "$ghcr_repository" latest "$desired_index" "$desired_amd64" "$desired_arm64" ||
+        ! verify_tag_index "$docker_repository" latest "$desired_index" "$desired_amd64" "$desired_arm64"; then
         if [[ "$updated_ghcr" == 'true' ]]; then
-            restore_alias "$ghcr_repository" "$tag" "$ghcr_previous" "$candidate_index" \
-                || die "unable to compensate GHCR ${tag}"
+            restore_latest "$ghcr_repository" "$ghcr_previous" "$desired_index" || die 'unable to compensate GHCR latest'
         fi
         if [[ "$updated_docker" == 'true' ]]; then
-            restore_alias "$docker_repository" "$tag" "$docker_previous" "$candidate_index" \
-                || die "unable to compensate Docker Hub ${tag}"
+            restore_latest "$docker_repository" "$docker_previous" "$desired_index" || die 'unable to compensate Docker Hub latest'
         fi
-        die "${tag} postflight verification failed; compensated registries"
+        die 'latest postflight verification failed; compensated registries'
     fi
 }
 
@@ -497,17 +416,12 @@ case "${1:-}" in
     preflight-latest)
         [[ "$#" -eq 5 ]] || die 'usage: preflight-latest GHCR_REPOSITORY DOCKER_REPOSITORY INDEX_DIGEST RUN_ID'
         shift
-        preflight_alias "$1" "$2" latest "$3" "$4"
+        preflight_latest "$@"
         ;;
     promote-latest)
         [[ "$#" -eq 7 ]] || die 'usage: promote-latest GHCR_REPOSITORY DOCKER_REPOSITORY INDEX_DIGEST AMD64_DIGEST ARM64_DIGEST RUN_ID'
         shift
-        promote_alias "$1" "$2" latest "$3" "$4" "$5" "$6"
-        ;;
-    promote-alias)
-        [[ "$#" -eq 8 ]] || die 'usage: promote-alias GHCR_REPOSITORY DOCKER_REPOSITORY TAG INDEX_DIGEST AMD64_DIGEST ARM64_DIGEST RUN_ID'
-        shift
-        promote_alias "$@"
+        promote_latest "$@"
         ;;
     cleanup-candidates)
         [[ "$#" -eq 4 ]] || die 'usage: cleanup-candidates CANDIDATE_REPOSITORY TARGET_REPOSITORY RUN_TAG'
@@ -515,6 +429,6 @@ case "${1:-}" in
         cleanup_candidates "$@"
         ;;
     *)
-        die 'expected one of: verify-index, ensure-tag, ensure-pair, preflight-latest, promote-latest, promote-alias, cleanup-candidates'
+        die 'expected one of: verify-index, ensure-tag, ensure-pair, preflight-latest, promote-latest, cleanup-candidates'
         ;;
 esac

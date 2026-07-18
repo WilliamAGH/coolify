@@ -7,19 +7,13 @@ ARG UBUNTU_IMAGE=docker.io/library/ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2
 FROM ${UBUNTU_IMAGE}
 
 ARG HOST_SOURCE_SHA256
-ARG HOST_PLATFORM
 ARG APT_SNAPSHOT=https://snapshot.ubuntu.com/ubuntu/20260716T000000Z
-# This native test substrate deliberately uses Ubuntu's pinned docker.io package.
-# Production bundle installation separately requires Docker CLI and Engine 29.6.2.
-ARG FIXTURE_DOCKER_IO_VERSION=29.1.3-0ubuntu3~24.04.2
+ARG DOCKER_IO_VERSION=29.1.3-0ubuntu3~24.04.2
 ARG NFTABLES_VERSION=1.0.9-1ubuntu0.1
 ARG CONNTRACK_VERSION=1:1.4.8-1ubuntu1
-ARG IPCALC_VERSION=0.51-1
-ARG BIND9_DNSUTILS_VERSION=1:9.18.39-0ubuntu0.24.04.5
 
 LABEL io.coolify.runtime-fence.systemd-host=true \
     io.coolify.runtime-fence.systemd-host-source-sha256=${HOST_SOURCE_SHA256} \
-    io.coolify.runtime-fence.systemd-host-platform=${HOST_PLATFORM} \
     org.opencontainers.image.title="Coolify runtime-fence disposable Ubuntu 24.04 systemd host"
 
 ENV container=docker
@@ -57,22 +51,12 @@ RUN --mount=type=secret,id=bootstrap-ca,target=/run/secrets/bootstrap-ca,require
         -o Acquire::AllowDowngradeToInsecureRepositories=false update; \
     DEBIAN_FRONTEND=noninteractive apt-get \
         -o APT::Get::AllowUnauthenticated=false install --yes --no-install-recommends \
-        bash bind9-dnsutils=${BIND9_DNSUTILS_VERSION} \
-        ca-certificates conntrack=${CONNTRACK_VERSION} coreutils curl docker.io=${FIXTURE_DOCKER_IO_VERSION} \
-        ipcalc=${IPCALC_VERSION} iproute2 iptables jq nftables=${NFTABLES_VERSION} \
-        openssh-client openssh-server openssl procps systemd \
-        systemd-sysv util-linux; \
+        bash ca-certificates conntrack=${CONNTRACK_VERSION} coreutils curl docker.io=${DOCKER_IO_VERSION} \
+        ipcalc iproute2 iptables jq nftables=${NFTABLES_VERSION} openssh-client openssh-server openssl \
+        procps systemd systemd-sysv util-linux; \
     test "$(dpkg-query -W -f='${Version}' nftables)" = "${NFTABLES_VERSION}"; \
     test "$(dpkg-query -W -f='${Version}' conntrack)" = "${CONNTRACK_VERSION}"; \
-    test "$(dpkg-query -W -f='${Version}' ipcalc)" = "${IPCALC_VERSION}"; \
-    test "$(dpkg-query -W -f='${Version}' bind9-dnsutils)" = "${BIND9_DNSUTILS_VERSION}"; \
-    test "$(dpkg-query -W -f='${Version}' docker.io)" = "${FIXTURE_DOCKER_IO_VERSION}"; \
-    for command in curl nft conntrack ipcalc dig; do \
-        command -v "$command" >/dev/null; \
-    done; \
-    for command in docker jq ip ssh ssh-keyscan nsenter unshare; do \
-        command -v "$command" >/dev/null; \
-    done; \
+    test "$(dpkg-query -W -f='${Version}' docker.io)" = "${DOCKER_IO_VERSION}"; \
     shred --remove --zero "$apt_ca_copy"; \
     rm -f "$apt_ca_configuration"; \
     test ! -e "$apt_ca_copy" && test ! -e "$apt_ca_configuration"; \

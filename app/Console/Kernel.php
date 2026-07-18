@@ -4,7 +4,6 @@ namespace App\Console;
 
 use App\Actions\Application\BlueGreen\ReconcileBlueGreenDeployments;
 use App\Actions\Application\BlueGreen\ResumeBlueGreenDeactivations;
-use App\Actions\Proxy\ManageControlPlaneProxyEnrollment;
 use App\Jobs\ApiTokenExpirationWarningJob;
 use App\Jobs\CheckForUpdatesJob;
 use App\Jobs\CheckHelperImageJob;
@@ -151,7 +150,6 @@ class Kernel extends ConsoleKernel
     {
         app(ActionManager::class)->registerCommandsForAction(ReconcileBlueGreenDeployments::class);
         app(ActionManager::class)->registerCommandsForAction(ResumeBlueGreenDeactivations::class);
-        app(ActionManager::class)->registerCommandsForAction(ManageControlPlaneProxyEnrollment::class);
         $this->load(__DIR__.'/Commands');
 
         require base_path('routes/console.php');

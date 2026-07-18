@@ -1,0 +1,20 @@
+#!/bin/sh
+
+set -eu
+
+last_argument=
+for argument in "$@"; do
+    last_argument=$argument
+done
+
+case "$last_argument" in
+    nftables)
+        printf '%s\n' 1.0.9-1ubuntu0.1
+        ;;
+    conntrack)
+        printf '%s\n' 1:1.4.8-1ubuntu1
+        ;;
+    *)
+        exit 64
+        ;;
+esac
