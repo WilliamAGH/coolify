@@ -1980,7 +1980,8 @@ scenario_proxy_enrollment_persisted_release_rollback_retention()
     operator rollback >/dev/null
     grep -F -x -q 'phase=rolled-back' "$operation_state" \
         || fail 'release rollback did not reach its terminal durable state'
-    assert_proxy_enrollment_active_phase
+    operator rollback >/dev/null
+    assert_proxy_enrollment_phase enrolled
     assert_proxy_enrollment_proxy_binding native
     assert_proxy_enrollment_blue_binding absent
     [ -f "$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE" ] \
