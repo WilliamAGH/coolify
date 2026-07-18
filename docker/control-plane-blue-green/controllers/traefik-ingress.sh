@@ -819,8 +819,10 @@ PY
 
 assert_local_ingress_proxy_binding()
 {
-    [ "$local_ingress_url" = "http://127.0.0.1:${local_ingress_host_port}/" ] \
-        || fail 'local ingress URL must be the native Traefik loopback endpoint'
+    case "$local_ingress_url" in
+        "http://127.0.0.1:${local_ingress_host_port}/"*) ;;
+        *) fail 'local ingress URL must use the exact native Traefik loopback endpoint' ;;
+    esac
     proxy_local_binding_inventory=$(docker inspect "$proxy_id" | jq -er \
         --arg host_port "$local_ingress_host_port" '
         .[0].NetworkSettings.Ports["8000/tcp"] as $bindings
@@ -3323,8 +3325,10 @@ validate_identifier CONTROL_PLANE_INGRESS_PROXY_CONTAINER "$proxy_container"
 validate_http_url CONTROL_PLANE_INGRESS_LOCAL_URL "$local_ingress_url"
 validate_port CONTROL_PLANE_INGRESS_APP_PORT "$local_ingress_host_port"
 validate_identifier CONTROL_PLANE_INGRESS_TRAEFIK_LOCAL_ENTRYPOINT "$local_ingress_entrypoint"
-[ "$local_ingress_url" = "http://127.0.0.1:${local_ingress_host_port}/" ] \
-    || fail 'CONTROL_PLANE_INGRESS_LOCAL_URL must exactly match CONTROL_PLANE_INGRESS_APP_PORT'
+case "$local_ingress_url" in
+    "http://127.0.0.1:${local_ingress_host_port}/"*) ;;
+    *) fail 'CONTROL_PLANE_INGRESS_LOCAL_URL must exactly match CONTROL_PLANE_INGRESS_APP_PORT' ;;
+esac
 validate_positive_integer CONTROL_PLANE_INGRESS_PROBE_ATTEMPTS "$probe_attempts"
 case "$test_mode" in 0|1) ;; *) fail 'CONTROL_PLANE_INGRESS_TEST_MODE must be 0 or 1' ;; esac
 if [ "$test_mode" = 0 ]; then
