@@ -7845,7 +7845,11 @@ preserve_proxy_enrollment_after_state_creation()
             assert_proxy_enrollment_active
             ;;
         activated)
-            finalize_proxy_enrollment_if_owned || return 1
+            proxy_enrollment_dynamic_path="$traefik_dynamic_directory/$dynamic_filename"
+            if [ -e "$proxy_enrollment_dynamic_path" ] \
+                || [ -L "$proxy_enrollment_dynamic_path" ]; then
+                finalize_proxy_enrollment_if_owned || return 1
+            fi
             assert_proxy_enrollment_active
             ;;
         activating)
@@ -13622,7 +13626,8 @@ recover_abort()
     load_state
     if [ "$state_phase" = recovery-aborted ]; then
         proxy_enrollment_status >/dev/null \
-            && [ "$proxy_enrollment_phase" = enrolled ] \
+            && { [ "$proxy_enrollment_phase" = activated ] \
+                || [ "$proxy_enrollment_phase" = enrolled ]; } \
             || fail 'recovery-aborted operation lost its retained native Traefik enrollment state'
         assert_proxy_enrollment_active
         note "recovery-already-aborted operation=$operation_id"
@@ -13709,7 +13714,7 @@ recover_abort()
     state_https_route_target=legacy
     runtime_fence_call recover-abort
     preserve_proxy_enrollment_after_state_creation \
-        || fail 'recovery-abort could not retain and finalize native Traefik enrollment after restoring the legacy dynamic route'
+        || fail 'recovery-abort could not retain native Traefik enrollment after restoring legacy routing'
     test_crash after-recovery-abort-proxy-enrollment-preserve
     state_phase=recovery-aborted
     write_state "$state_phase"
@@ -13758,7 +13763,8 @@ rollback()
     load_state
     if [ "$state_phase" = rolled-back ]; then
         proxy_enrollment_status >/dev/null \
-            && [ "$proxy_enrollment_phase" = enrolled ] \
+            && { [ "$proxy_enrollment_phase" = activated ] \
+                || [ "$proxy_enrollment_phase" = enrolled ]; } \
             || fail 'rolled-back operation lost its retained native Traefik enrollment state'
         assert_proxy_enrollment_active
         note "operation-already-rolled-back operation=$operation_id"

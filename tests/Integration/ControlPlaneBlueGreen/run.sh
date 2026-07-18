@@ -1701,13 +1701,6 @@ assert_proxy_enrollment_phase()
         || fail "proxy-enrollment did not reach phase=$expected_proxy_enrollment_phase"
 }
 
-assert_proxy_enrollment_active_phase()
-{
-    grep -E -x -q 'phase=(activated|enrolled)' \
-        "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_STATE_FILE" \
-        || fail 'proxy-enrollment did not retain an active native ownership phase'
-}
-
 assert_proxy_enrollment_runner_bootstraps_from_green()
 {
     proxy_enrollment_runner_source=$(sed -n '/^proxy_enrollment_runner_call()/,/^}/p' "$OPERATOR")
@@ -1966,7 +1959,7 @@ scenario_proxy_enrollment_persisted_release_rollback_retention()
         > "$scenario_directory/proxy-enrollment-route-rejection.log" 2>&1; then
         fail 'invalid-route cutover fixture unexpectedly completed'
     fi
-    assert_proxy_enrollment_active_phase
+    assert_proxy_enrollment_phase activated
     assert_proxy_enrollment_proxy_binding native
     assert_proxy_enrollment_blue_binding absent
     [ -f "$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE" ] \
@@ -1981,13 +1974,43 @@ scenario_proxy_enrollment_persisted_release_rollback_retention()
     grep -F -x -q 'phase=rolled-back' "$operation_state" \
         || fail 'release rollback did not reach its terminal durable state'
     operator rollback >/dev/null
-    assert_proxy_enrollment_phase enrolled
+    assert_proxy_enrollment_phase activated
     assert_proxy_enrollment_proxy_binding native
     assert_proxy_enrollment_blue_binding absent
     [ -f "$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE" ] \
         || fail 'terminal release rollback revoked retained native enrollment'
     if grep -F -x -q rollback "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_LOG_FILE"; then
         fail 'terminal release rollback attempted destructive native proxy-enrollment rollback'
+    fi
+    assert_route_color "https://127.0.0.1:${LAB_TRAEFIK_PORT}/cgi-bin/request" legacy
+    assert_route_color http://127.0.0.1:8000/cgi-bin/request legacy
+}
+
+scenario_proxy_enrollment_persisted_recover_abort_retention()
+{
+    prepare_proxy_enrollment_legacy_lab
+    preflight_and_apply_migrations
+    if CONTROL_PLANE_TEST_INVALID_ROUTE=1 operator cutover \
+        > "$scenario_directory/proxy-enrollment-recover-abort-route-rejection.log" 2>&1; then
+        fail 'recover-abort invalid-route cutover fixture unexpectedly completed'
+    fi
+    assert_proxy_enrollment_phase activated
+    [ ! -e "$CONTROL_PLANE_TRAEFIK_DYNAMIC_DIR/$CONTROL_PLANE_TRAEFIK_DYNAMIC_FILENAME" ] \
+        && [ ! -L "$CONTROL_PLANE_TRAEFIK_DYNAMIC_DIR/$CONTROL_PLANE_TRAEFIK_DYNAMIC_FILENAME" ] \
+        || fail 'failed route switch retained an unacknowledged managed dynamic route'
+
+    operator recover-abort >/dev/null
+    grep -F -x -q 'phase=recovery-aborted' \
+        "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_OPERATOR_STATE_FILE" \
+        || fail 'recover-abort did not reach its terminal durable state'
+    operator recover-abort >/dev/null
+    assert_proxy_enrollment_phase activated
+    assert_proxy_enrollment_proxy_binding native
+    assert_proxy_enrollment_blue_binding absent
+    [ -f "$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE" ] \
+        || fail 'terminal recover-abort revoked retained native enrollment'
+    if grep -F -x -q rollback "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_LOG_FILE"; then
+        fail 'terminal recover-abort attempted destructive native proxy-enrollment rollback'
     fi
     assert_route_color "https://127.0.0.1:${LAB_TRAEFIK_PORT}/cgi-bin/request" legacy
     assert_route_color http://127.0.0.1:8000/cgi-bin/request legacy
@@ -5299,6 +5322,7 @@ main()
         with_lab proxy-enrollment-preidentity-recovery 39 scenario_proxy_enrollment_preidentity_recovery
         with_lab proxy-enrollment-activating-recovery 40 scenario_proxy_enrollment_activating_recovery
         with_lab proxy-enrollment-persisted-release-rollback-retention 41 scenario_proxy_enrollment_persisted_release_rollback_retention
+        with_lab proxy-enrollment-persisted-recover-abort-retention 44 scenario_proxy_enrollment_persisted_recover_abort_retention
         with_lab proxy-enrollment-cross-operation-adoption 42 scenario_proxy_enrollment_cross_operation_adoption
         with_lab proxy-enrollment-partial-credential-recovery 43 scenario_proxy_enrollment_partial_credential_recovery
         remove_mock_image
