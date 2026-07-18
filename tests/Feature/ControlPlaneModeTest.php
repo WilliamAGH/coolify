@@ -10,13 +10,17 @@ use App\Providers\AppServiceProvider;
 use App\Support\ControlPlaneMode;
 use App\Support\ControlPlaneReadOnlyRoutePolicy;
 use Illuminate\Console\Command;
+use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Http\Kernel as HttpKernel;
 use Illuminate\Database\Connection;
+use Illuminate\Database\ConnectionResolverInterface;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Redis;
+use Illuminate\Support\Once;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\HttpKernel\Exception\HttpException;
 use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
@@ -980,6 +984,47 @@ it('does not expose route health outside active web-only mode', function () {
     expect($fullResponse->getStatusCode())->toBe(Response::HTTP_NOT_FOUND)
         ->and($passiveResponse->getStatusCode())->toBe(Response::HTTP_NOT_FOUND)
         ->and($passiveQueryResponse->getStatusCode())->toBe(Response::HTTP_SERVICE_UNAVAILABLE);
+});
+
+it('renders passive route health denial without querying instance settings', function () {
+    putenv('CONTROL_PLANE_MODE=passive');
+    config()->set('control-plane.mode', ControlPlaneMode::Passive->value);
+    Once::flush();
+    DB::flushQueryLog();
+    DB::enableQueryLog();
+
+    $this->get('/api/control-plane/route-health')->assertNotFound();
+
+    $queries = collect(DB::getQueryLog())->pluck('query');
+    DB::disableQueryLog();
+
+    $instanceSettingsQueries = $queries->filter(
+        fn (string $query): bool => str_contains($query, 'instance_settings'),
+    );
+    expect($instanceSettingsQueries->all())->toBeEmpty();
+});
+
+it('does not let exception reporting failures mask the original exception', function () {
+    putenv('CONTROL_PLANE_MODE=active');
+    config()->set([
+        'control-plane.mode' => ControlPlaneMode::Active->value,
+        'sentry.dsn' => 'https://public@example.invalid/1',
+    ]);
+
+    $originalResolver = Model::getConnectionResolver();
+    $failingResolver = Mockery::mock(ConnectionResolverInterface::class);
+    $failingResolver->shouldReceive('connection')->once()->andThrow(new RuntimeException('settings unavailable'));
+    Model::setConnectionResolver($failingResolver);
+
+    try {
+        app(ExceptionHandler::class)->report(
+            new LogicException('original application exception'),
+        );
+    } finally {
+        Model::setConnectionResolver($originalResolver);
+    }
+
+    expect(true)->toBeTrue();
 });
 
 it('allows only real non PHP public files through an unowned web only process', function () {

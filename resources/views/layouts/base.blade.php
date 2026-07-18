@@ -30,9 +30,11 @@
     <meta property="og:site_name" content="Coolify" />
     <meta property="og:image" content="https://cdn.coollabs.io/assets/coolify/og-image.png" />
     @use('App\Models\InstanceSettings')
+    @use('App\Support\ControlPlaneMode')
     @php
-
-        $instanceSettings = instanceSettings();
+        $instanceSettings = ControlPlaneMode::configured() === ControlPlaneMode::Passive
+            ? null
+            : instanceSettings();
         $name = null;
 
         if ($instanceSettings) {

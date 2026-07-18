@@ -70,6 +70,7 @@ assert_preflight_status()
     actual_status="$(preflight_curl --silent --output /dev/null --write-out '%{http_code}' "$@")"
 
     if [ "$actual_status" != "$expected_status" ]; then
+        docker logs "$application_container" >&2
         printf 'Expected %s to return HTTP %s, got %s.\n' "$*" "$expected_status" "$actual_status" >&2
         exit 1
     fi
@@ -279,26 +280,32 @@ do
     assert_environment "$hostile_environment" "$expected"
 done
 
-if docker run --rm --env CONTROL_PLANE_MODE=standby "$image" /usr/bin/true >"$invalid_mode_log" 2>&1; then
+if docker run --rm --env CONTROL_PLANE_MODE=standby "$image" /bin/true >"$invalid_mode_log" 2>&1; then
     printf '%s\n' 'Unknown CONTROL_PLANE_MODE unexpectedly started the image.' >&2
     exit 1
 fi
 
 grep -qF 'CONTROL_PLANE_MODE must be one of: active, passive.' "$invalid_mode_log"
 
-if docker run --rm --env CONTROL_PLANE_STARTUP_MODE=standby "$image" /usr/bin/true >"$invalid_startup_mode_log" 2>&1; then
+if docker run --rm --env CONTROL_PLANE_STARTUP_MODE=standby "$image" /bin/true >"$invalid_startup_mode_log" 2>&1; then
     printf '%s\n' 'Unknown CONTROL_PLANE_STARTUP_MODE unexpectedly started the image.' >&2
     exit 1
 fi
 
 grep -qF 'CONTROL_PLANE_STARTUP_MODE must be one of: full, web-only.' "$invalid_startup_mode_log"
 
+docker run --rm \
+    --env CONTROL_PLANE_MODE=active \
+    --env CONTROL_PLANE_STARTUP_MODE=web-only \
+    "$image" /bin/true >/dev/null
+
 if docker run --rm \
     --env CONTROL_PLANE_MODE=active \
     --env CONTROL_PLANE_STARTUP_MODE=web-only \
-    "$image" /usr/bin/true >"$invalid_writer_epoch_log" 2>&1
+    --env CONTROL_PLANE_WRITER_MARKER_PATH="$writer_marker_path" \
+    "$image" /bin/true >"$invalid_writer_epoch_log" 2>&1
 then
-    printf '%s\n' 'Active web-only mode unexpectedly started without a writer epoch.' >&2
+    printf '%s\n' 'Active web-only mode unexpectedly accepted a partial writer identity.' >&2
     exit 1
 fi
 
@@ -309,7 +316,7 @@ if docker run --rm \
     --env CONTROL_PLANE_STARTUP_MODE=web-only \
     --env CONTROL_PLANE_WRITER_EPOCH="$writer_epoch" \
     --env CONTROL_PLANE_WRITER_MARKER_PATH=/tmp/writer-epoch \
-    "$image" /usr/bin/true >"$invalid_writer_path_log" 2>&1
+    "$image" /bin/true >"$invalid_writer_path_log" 2>&1
 then
     printf '%s\n' 'Active web-only mode unexpectedly accepted an ephemeral writer marker.' >&2
     exit 1

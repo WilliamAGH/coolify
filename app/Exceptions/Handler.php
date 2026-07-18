@@ -4,6 +4,7 @@ namespace App\Exceptions;
 
 use App\Models\InstanceSettings;
 use App\Models\User;
+use App\Support\ControlPlaneMode;
 use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Auth\AuthenticationException;
 use Illuminate\Foundation\Exceptions\Handler as ExceptionHandler;
@@ -112,31 +113,39 @@ class Handler extends ExceptionHandler
             if ($e instanceof RuntimeException) {
                 return;
             }
-            $this->settings = instanceSettings();
-            if ($this->settings->do_not_track) {
-                return;
-            }
-            app('sentry')->configureScope(
-                function (Scope $scope) {
-                    $email = auth()?->user() ? auth()->user()->email : 'guest';
-                    $instanceAdmin = User::find(0)->email ?? 'admin@localhost';
-                    $scope->setUser(
-                        [
-                            'email' => $email,
-                            'instanceAdmin' => $instanceAdmin,
-                        ]
-                    );
+            try {
+                if (ControlPlaneMode::configured() === ControlPlaneMode::Passive || blank(config('sentry.dsn'))) {
+                    return;
                 }
-            );
-            // Check for errors that should not be reported to Sentry
-            if (str($e->getMessage())->contains('No space left on device')) {
-                // Log locally but don't send to Sentry
-                logger()->warning('Disk space error: '.$e->getMessage());
 
+                $this->settings = instanceSettings();
+                if ($this->settings->do_not_track) {
+                    return;
+                }
+                app('sentry')->configureScope(
+                    function (Scope $scope) {
+                        $email = auth()?->user() ? auth()->user()->email : 'guest';
+                        $instanceAdmin = User::find(0)->email ?? 'admin@localhost';
+                        $scope->setUser(
+                            [
+                                'email' => $email,
+                                'instanceAdmin' => $instanceAdmin,
+                            ]
+                        );
+                    }
+                );
+                // Check for errors that should not be reported to Sentry
+                if (str($e->getMessage())->contains('No space left on device')) {
+                    // Log locally but don't send to Sentry
+                    logger()->warning('Disk space error: '.$e->getMessage());
+
+                    return;
+                }
+
+                Integration::captureUnhandledException($e);
+            } catch (Throwable) {
                 return;
             }
-
-            Integration::captureUnhandledException($e);
         });
     }
 }

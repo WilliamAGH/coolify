@@ -29,6 +29,7 @@ use App\Models\StandaloneRedis;
 use App\Models\SwarmDocker;
 use App\Models\Team;
 use App\Models\User;
+use App\Support\ControlPlaneMode;
 use Carbon\CarbonImmutable;
 use DanHarrin\LivewireRateLimiting\Exceptions\TooManyRequestsException;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
@@ -3811,6 +3812,10 @@ function instanceSettings()
 
 function wireNavigate(): string
 {
+    if (ControlPlaneMode::configured() === ControlPlaneMode::Passive) {
+        return 'wire:navigate';
+    }
+
     try {
         $settings = instanceSettings();
 
