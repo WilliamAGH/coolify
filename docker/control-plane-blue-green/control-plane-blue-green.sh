@@ -454,7 +454,7 @@ configured_release_asset_path()
         operator-compose) printf '%s\n' "$operator_compose_file" ;;
         rehearsal-compose) printf '%s\n' "$release_rehearsal_compose_file" ;;
         ingress-controller) printf '%s\n' "$ingress_controller" ;;
-        backup-attestation-verifier) printf '%s\n' "$backup_attestation_verifier" ;;
+        backup-attestation-verifier) printf '%s\n' "$release_backup_attestation_verifier" ;;
         backup-quiesce-controller) printf '%s\n' "$release_backup_quiesce_controller" ;;
         backup-quiesce-service-unit) printf '%s\n' "$release_backup_quiesce_service_unit" ;;
         backup-quiesce-timer-unit) printf '%s\n' "$release_backup_quiesce_timer_unit" ;;
@@ -490,7 +490,8 @@ configure_and_verify_release_inventory()
     rehearsal_compose_file=${CONTROL_PLANE_TEST_REHEARSAL_COMPOSE_FILE:-$release_rehearsal_compose_file}
     rehearsal_compose_file_sha256=${CONTROL_PLANE_TEST_REHEARSAL_COMPOSE_FILE_SHA256:-}
     ingress_controller=${CONTROL_PLANE_INGRESS_CONTROLLER:-$SCRIPT_DIRECTORY/controllers/traefik-ingress.sh}
-    backup_attestation_verifier=${CONTROL_PLANE_BACKUP_ATTESTATION_VERIFIER:-$SCRIPT_DIRECTORY/backup/restore-attest.sh}
+    release_backup_attestation_verifier=${CONTROL_PLANE_RELEASE_BACKUP_ATTESTATION_VERIFIER:-$SCRIPT_DIRECTORY/backup/restore-attest.sh}
+    backup_attestation_verifier=${CONTROL_PLANE_BACKUP_ATTESTATION_VERIFIER:-$release_backup_attestation_verifier}
     release_runtime_fence_provisioner=$SCRIPT_DIRECTORY/controllers/provision-runtime-attestation-ssh-fence.sh
     runtime_fence_provisioner=${CONTROL_PLANE_RUNTIME_FENCE_PROVISIONER:-$release_runtime_fence_provisioner}
     release_backup_quiesce_service_unit=$SCRIPT_DIRECTORY/backup-quiesce/control-plane-backup-quiesce-watchdog.service

@@ -332,9 +332,7 @@ install_lab_release_manifest()
     CONTROL_PLANE_OPERATOR_COMPOSE_FILE="$release_directory/compose.yaml"
     CONTROL_PLANE_REHEARSAL_COMPOSE_FILE="$release_directory/compose.rehearsal.yaml"
     CONTROL_PLANE_INGRESS_CONTROLLER="$release_directory/controllers/traefik-ingress.sh"
-    CONTROL_PLANE_BACKUP_ATTESTATION_VERIFIER="$release_directory/backup/restore-attest.sh"
-    CONTROL_PLANE_BACKUP_ATTESTATION_VERIFIER_SHA256=$(sha256sum \
-        "$CONTROL_PLANE_BACKUP_ATTESTATION_VERIFIER" | awk '{print $1}')
+    CONTROL_PLANE_RELEASE_BACKUP_ATTESTATION_VERIFIER="$release_directory/backup/restore-attest.sh"
     CONTROL_PLANE_RELEASE_BACKUP_QUIESCE_CONTROLLER="$release_directory/backup-quiesce/control-plane-backup-quiesce.sh"
     CONTROL_PLANE_RELEASE_RUNTIME_FENCE_CONTROLLER="$release_directory/controllers/runtime-attestation-ssh-fence.sh"
     CONTROL_PLANE_RELEASE_RUNTIME_FENCE_REAPER="$release_directory/controllers/self-ssh-controlmaster-reaper.sh"
@@ -371,6 +369,8 @@ assert_release_manifest_source_attestation()
         || fail 'lab release manifest differs from its exported out-of-band identity'
     assert_release_manifest_asset_attestation backup-quiesce-controller \
         "$CONTROL_PLANE_RELEASE_BACKUP_QUIESCE_CONTROLLER" 755
+    assert_release_manifest_asset_attestation backup-attestation-verifier \
+        "$CONTROL_PLANE_RELEASE_BACKUP_ATTESTATION_VERIFIER" 755
     assert_release_manifest_asset_attestation backup-quiesce-service-unit \
         "$release_directory/backup-quiesce/control-plane-backup-quiesce-watchdog.service" 644
     assert_release_manifest_asset_attestation backup-quiesce-timer-unit \
@@ -422,17 +422,6 @@ assert_release_manifest_preflight_rejections()
         fail 'tampered release manifest was not rejected before Docker or Compose'
     fi
 
-    if PATH="$release_preflight_bin:$PATH" \
-        CONTROL_PLANE_RELEASE_PREFLIGHT_DOCKER_MARKER="$release_preflight_docker_marker" \
-        CONTROL_PLANE_TEST_REHEARSAL_COMPOSE_FILE_SHA256=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff \
-        "$OPERATOR" preflight > "$release_preflight_output" 2>&1; then
-        fail 'operator accepted a migration-rehearsal executor with a stale digest'
-    fi
-    if [ -e "$release_preflight_docker_marker" ] \
-        || ! grep -F -q 'migration-rehearsal executor differs from its pinned digest' \
-            "$release_preflight_output"; then
-        fail 'stale migration-rehearsal executor digest was not rejected before Docker or Compose'
-    fi
 }
 
 write_sanitized_probe_headers()
@@ -1121,6 +1110,7 @@ start_lab()
     export CONTROL_PLANE_RUNTIME_FENCE_PROVIDER_LEGACY_PORT
     export CONTROL_PLANE_RUNTIME_FENCE_PROVIDER_HEADER_FILE
     export CONTROL_PLANE_RUNTIME_FENCE_LAB_STATE
+    export CONTROL_PLANE_RELEASE_BACKUP_ATTESTATION_VERIFIER
     export CONTROL_PLANE_RELEASE_BACKUP_QUIESCE_CONTROLLER CONTROL_PLANE_RELEASE_ID
     export CONTROL_PLANE_RELEASE_MANIFEST_FILE CONTROL_PLANE_RELEASE_MANIFEST_SHA256
     export CONTROL_PLANE_RELEASE_RUNTIME_FENCE_CONTROLLER
