@@ -1609,6 +1609,23 @@ assert_operator_target_mode_binding_rejected()
         || fail 'rejected production-mode/lab-target operator invocation mutated operation state'
 }
 
+assert_enrollment_fallback_priority_binding_rejected()
+{
+    rejected_operation_id="enrollment-priority-rejection-${scenario_number}-0123456789"
+    rejected_operation_directory="$CONTROL_PLANE_OPERATOR_STATE_DIR/$rejected_operation_id"
+    rejected_log="$scenario_directory/enrollment-priority-rejected.log"
+    if env \
+        CONTROL_PLANE_OPERATION_ID="$rejected_operation_id" \
+        CONTROL_PLANE_TRAEFIK_ROUTER_PRIORITY=10 \
+        "$OPERATOR" preflight > "$rejected_log" 2>&1; then
+        fail 'operator accepted a managed router priority that cannot outrank enrollment fallback'
+    fi
+    grep -F -q 'must exceed the enrollment fallback priority (10)' "$rejected_log" \
+        || fail 'enrollment fallback priority rejection did not reach the exact binding gate'
+    [ ! -e "$rejected_operation_directory" ] \
+        || fail 'rejected enrollment fallback priority mutated operation state'
+}
+
 preflight_and_apply_migrations()
 {
     preflight_log="$scenario_directory/preflight.log"
@@ -1758,6 +1775,7 @@ prepare_proxy_enrollment_lab()
     case "$proxy_enrollment_topology" in
         native)
             {
+                # shellcheck disable=SC2016
                 printf '%s\n' \
                     'services:' \
                     '  coolify:' \
@@ -2115,6 +2133,7 @@ scenario_proxy_enrollment_cross_operation_adoption()
 scenario_queue_gate_and_rehearsal()
 {
     assert_operator_target_mode_binding_rejected
+    assert_enrollment_fallback_priority_binding_rejected
     live_operation_id=$CONTROL_PLANE_OPERATION_ID
     CONTROL_PLANE_OPERATION_ID="rehearsal-${scenario_name}-0123456789"
     export CONTROL_PLANE_OPERATION_ID

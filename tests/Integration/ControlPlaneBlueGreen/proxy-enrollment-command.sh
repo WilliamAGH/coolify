@@ -329,6 +329,7 @@ case "$enrollment_action" in
         assert_blue_binding legacy
         umask 077
         {
+            # shellcheck disable=SC2016
             printf '%s\n' \
                 'services:' \
                 '  coolify:' \

@@ -11722,6 +11722,8 @@ load_configuration()
         fail 'CONTROL_PLANE_TRAEFIK_CERT_RESOLVER must be empty when TLS is disabled'
     fi
     validate_positive_integer "$traefik_router_priority" CONTROL_PLANE_TRAEFIK_ROUTER_PRIORITY
+    [ "$traefik_router_priority" -gt 10 ] \
+        || fail 'CONTROL_PLANE_TRAEFIK_ROUTER_PRIORITY must exceed the enrollment fallback priority (10)'
     validate_port "$backend_port" CONTROL_PLANE_BACKEND_PORT
     validate_port "$green_loopback_port" CONTROL_PLANE_GREEN_WEB_A_LOOPBACK_PORT
     validate_port "$green_web_b_loopback_port" CONTROL_PLANE_GREEN_WEB_B_LOOPBACK_PORT
