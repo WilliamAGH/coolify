@@ -44,6 +44,18 @@ capture_runtime_evidence()
         --format '{{json .}}' >"$EVIDENCE_DIRECTORY/nested-images.jsonl" 2>&1 || true
 }
 
+print_failure_evidence()
+{
+    for evidence_name in control-plane.log control-plane-container.log db-state.log remote-init.log; do
+        evidence_path="$EVIDENCE_DIRECTORY/$evidence_name"
+        [ -f "$evidence_path" ] || continue
+        printf '%s\n' "--- $evidence_name (sanitized tail) ---" >&2
+        tail -n 240 "$evidence_path" \
+            | sed -E 's/((password|token|secret|private[_-]?key)[[:space:]]*[=:][[:space:]]*)[^[:space:]]+/\1[REDACTED]/Ig' \
+            >&2
+    done
+}
+
 request_observer_final_flush()
 {
     [ "$(compose ps --status running --quiet observer | wc -l | tr -d ' ')" = 1 ] \
@@ -225,6 +237,7 @@ compose up --detach observer
 
 if ! compose run --no-deps -T --name "$PROJECT_NAME-control-plane" control-plane >"$EVIDENCE_DIRECTORY/control-plane.log" 2>&1; then
     capture_runtime_evidence
+    print_failure_evidence
     fail 'real ApplicationDeploymentJob handle execution failed'
 fi
 capture_runtime_evidence

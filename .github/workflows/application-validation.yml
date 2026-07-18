@@ -522,7 +522,7 @@ jobs:
           coverage: none
       - run: composer install --no-interaction --prefer-dist --optimize-autoloader
       - name: Run selected promotion, rollback, and availability scenario
-        run: tests/Integration/ControlPlaneBlueGreen/run.sh "${{ matrix.scenario }}"
+        run: sudo -- tests/Integration/ControlPlaneBlueGreen/run.sh "${{ matrix.scenario }}"
 
   blue-green-provider-lab:
     name: Traefik Docker and File provider blue/green acceptance

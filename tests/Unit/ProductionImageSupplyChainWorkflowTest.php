@@ -711,6 +711,13 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
     if (trim($backupRestoreScript) !== 'sudo -- tests/Integration/ControlPlaneBackupRestore/run.sh') {
         $violations[] = 'backup and restore validation must preserve production root ownership semantics';
     }
+    $blueGreenSimulationScript = (string) (releaseWorkflowStep(
+        $applicationValidationJobs['control-plane-blue-green-simulation'] ?? [],
+        'Run selected promotion, rollback, and availability scenario',
+    )['run'] ?? '');
+    if (trim($blueGreenSimulationScript) !== 'sudo -- tests/Integration/ControlPlaneBlueGreen/run.sh "${{ matrix.scenario }}"') {
+        $violations[] = 'control-plane blue/green validation must preserve production root ownership semantics';
+    }
 
     $postgresRedisJob = $applicationValidationJobs['postgres-redis'] ?? [];
     $postgresRedisEnvironment = $postgresRedisJob['env'] ?? [];
