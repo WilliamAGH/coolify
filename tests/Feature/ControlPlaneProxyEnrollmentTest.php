@@ -59,6 +59,10 @@ final class ControlPlaneProxyEnrollmentHarness extends ManageControlPlaneProxyEn
         expect($proxyConfiguration)->toContain('--entrypoints.coolify-local.address=:8000');
         $this->events[] = 'validate-source-compose-with-enrollment-override';
         expect($composeOverride)->toContain('ports: !reset null');
+        expect($composeOverride)->toContain(
+            'traefik.http.routers.coolify-control-plane-enrollment-local.entrypoints=coolify-local',
+            'traefik.http.services.coolify-control-plane-enrollment-local.loadbalancer.server.port=8080',
+        );
 
         if ($this->failValidation) {
             throw new RuntimeException('synthetic source Compose validation failure');
@@ -323,6 +327,8 @@ it('prepares idempotently after validating both Compose boundaries and writes th
         )
         ->and($this->enrollment->files['/data/coolify/source/docker-compose.control-plane-enrolled.yml'])
         ->toContain('ports: !reset null')
+        ->and($this->enrollment->files['/data/coolify/source/docker-compose.control-plane-enrolled.yml'])
+        ->toContain('traefik.http.routers.coolify-control-plane-enrollment-local.entrypoints=coolify-local')
         ->and($first['source_compose_files'])->toBe([
             '/data/coolify/source/docker-compose.yml',
             '/data/coolify/source/docker-compose.prod.yml',

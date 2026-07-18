@@ -48,17 +48,26 @@ it('registers its Laravel Actions command entrypoint', function () {
     expect(Artisan::all())->toHaveKey('control-plane:proxy-enrollment');
 });
 
-it('renders a compose override that resets only the legacy listener ports', function () {
+it('renders a compose override that replaces the legacy listener with a local Traefik route', function () {
     $parsed = Yaml::parse(
         ManageControlPlaneProxyEnrollment::enrolledComposeOverride(),
         Yaml::PARSE_CUSTOM_TAGS,
     );
 
     $ports = data_get($parsed, 'services.coolify.ports');
+    $labels = data_get($parsed, 'services.coolify.labels');
 
     expect($ports)->toBeInstanceOf(TaggedValue::class)
         ->and($ports->getTag())->toBe('reset')
         ->and($ports->getValue())->toBeNull()
+        ->and($labels)->toBe([
+            'traefik.enable=true',
+            'traefik.http.routers.coolify-control-plane-enrollment-local.rule=PathPrefix(`/`)',
+            'traefik.http.routers.coolify-control-plane-enrollment-local.entrypoints=coolify-local',
+            'traefik.http.routers.coolify-control-plane-enrollment-local.priority=10',
+            'traefik.http.routers.coolify-control-plane-enrollment-local.service=coolify-control-plane-enrollment-local',
+            'traefik.http.services.coolify-control-plane-enrollment-local.loadbalancer.server.port=8080',
+        ])
         ->and(data_get($parsed, 'services'))->toHaveCount(1);
 });
 

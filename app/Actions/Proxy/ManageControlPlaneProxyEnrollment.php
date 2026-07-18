@@ -42,6 +42,10 @@ class ManageControlPlaneProxyEnrollment
 
     private const MANAGED_ENTRYPOINT_COMMAND = '--entrypoints.coolify-local.address=:8000';
 
+    private const LEGACY_LOCAL_ROUTER = 'coolify-control-plane-enrollment-local';
+
+    private const LEGACY_LOCAL_SERVICE = 'coolify-control-plane-enrollment-local';
+
     public string $commandSignature = 'control-plane:proxy-enrollment
         {action : prepare, activate, finalize, status, or rollback}
         {--operation= : Durable control-plane operation ID}
@@ -215,6 +219,14 @@ class ManageControlPlaneProxyEnrollment
             'services' => [
                 self::LEGACY_CONTAINER => [
                     'ports' => new TaggedValue('reset', null),
+                    'labels' => [
+                        'traefik.enable=true',
+                        'traefik.http.routers.'.self::LEGACY_LOCAL_ROUTER.'.rule=PathPrefix(`/`)',
+                        'traefik.http.routers.'.self::LEGACY_LOCAL_ROUTER.'.entrypoints=coolify-local',
+                        'traefik.http.routers.'.self::LEGACY_LOCAL_ROUTER.'.priority=10',
+                        'traefik.http.routers.'.self::LEGACY_LOCAL_ROUTER.'.service='.self::LEGACY_LOCAL_SERVICE,
+                        'traefik.http.services.'.self::LEGACY_LOCAL_SERVICE.'.loadbalancer.server.port=8080',
+                    ],
                 ],
             ],
         ], 6, 2, Yaml::DUMP_OBJECT_AS_MAP);

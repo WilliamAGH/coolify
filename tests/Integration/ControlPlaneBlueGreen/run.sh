@@ -1758,7 +1758,17 @@ prepare_proxy_enrollment_lab()
     case "$proxy_enrollment_topology" in
         native)
             {
-                printf '%s\n' 'services:' '  coolify:' '    ports: !reset null'
+                printf '%s\n' \
+                    'services:' \
+                    '  coolify:' \
+                    '    ports: !reset null' \
+                    '    labels:' \
+                    '      - "traefik.enable=true"' \
+                    '      - "traefik.http.routers.coolify-control-plane-enrollment-local.rule=PathPrefix(`/`)"' \
+                    '      - "traefik.http.routers.coolify-control-plane-enrollment-local.entrypoints=coolify-local"' \
+                    '      - "traefik.http.routers.coolify-control-plane-enrollment-local.priority=10"' \
+                    '      - "traefik.http.routers.coolify-control-plane-enrollment-local.service=coolify-control-plane-enrollment-local"' \
+                    '      - "traefik.http.services.coolify-control-plane-enrollment-local.loadbalancer.server.port=8080"'
             } > "$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE"
             chmod 600 "$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE"
             {
@@ -1864,6 +1874,7 @@ scenario_proxy_enrollment_success()
     assert_proxy_enrollment_phase activated
     assert_proxy_enrollment_proxy_binding native
     assert_proxy_enrollment_blue_binding absent
+    assert_route_color http://127.0.0.1:8000/cgi-bin/request legacy
     [ -f "$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE" ] \
         || fail 'native enrollment did not retain the controlled source compose override'
     operator cutover >/dev/null

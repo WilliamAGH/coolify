@@ -1206,7 +1206,7 @@ run_finalization_seams()
     [[ ${CONTROL_PLANE_RUNTIME_HOST_GATE_FINALIZE_SEAMS:-1} == 0 \
         || ${CONTROL_PLANE_RUNTIME_HOST_GATE_FINALIZE_SEAMS:-1} == 1 ]] \
         || fail 'finalization-seam switch must be exactly 0 or 1'
-    [[ ${CONTROL_PLANE_RUNTIME_HOST_GATE_FINALIZE_SEAMS:-1} == 1 ]] || return
+    [[ ${CONTROL_PLANE_RUNTIME_HOST_GATE_FINALIZE_SEAMS:-1} == 1 ]] || return 0
     mapfile -t seams < <(finalization_seams)
     ((${#seams[@]} > 0)) \
         || blocked 'installed provisioner exposes no deterministic finalize-terminal crash seam'

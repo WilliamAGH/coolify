@@ -7814,7 +7814,7 @@ assert_proxy_enrollment_rolled_back()
 
 adopt_proxy_enrollment_legacy_recreation()
 {
-    [ -e "$state_file" ] || return
+    [ -e "$state_file" ] || return 0
     [ "$(container_image_id "$blue_container")" = "$state_blue_image_id" ] \
         && [ "$(container_image_reference "$blue_container")" = "$state_blue_image_reference" ] \
         || fail 'proxy-enrollment legacy recreation changed the recorded immutable image'

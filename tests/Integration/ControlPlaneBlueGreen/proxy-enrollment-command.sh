@@ -120,22 +120,25 @@ emit_success()
     legacy_binding_json=$(jq --null-input --compact-output \
         --arg container "$blue_container" --arg app_port "$app_port" \
         '[{container: $container, container_port: "8080/tcp", host_ip: "127.0.0.1", host_port: $app_port}]')
-    rollback_proxy_command=$(docker inspect "$proxy_container" \
-        | jq --compact-output '.[0].Config.Cmd // []')
-    rollback_proxy_command_sha256=$(printf '%s' "$rollback_proxy_command" \
-        | sha256sum | awk '{print $1}')
-    rollback_proxy_json=$(docker inspect "$proxy_container" | jq --compact-output \
-        --arg command_sha256 "$rollback_proxy_command_sha256" '
-        .[0] | {
-            id: .Id,
-            image_id: .Image,
-            started_at: .State.StartedAt,
-            restart_count: .RestartCount,
-            pid: .State.Pid,
-            running: .State.Running,
-            command_sha256: $command_sha256
-        }
-    ')
+    rollback_proxy_json=null
+    if rollback_proxy_inspection=$(docker inspect "$proxy_container" 2>/dev/null); then
+        rollback_proxy_command=$(printf '%s\n' "$rollback_proxy_inspection" \
+            | jq --compact-output '.[0].Config.Cmd // []')
+        rollback_proxy_command_sha256=$(printf '%s' "$rollback_proxy_command" \
+            | sha256sum | awk '{print $1}')
+        rollback_proxy_json=$(printf '%s\n' "$rollback_proxy_inspection" \
+            | jq --compact-output --arg command_sha256 "$rollback_proxy_command_sha256" '
+                .[0] | {
+                    id: .Id,
+                    image_id: .Image,
+                    started_at: .State.StartedAt,
+                    restart_count: .RestartCount,
+                    pid: .State.Pid,
+                    running: .State.Running,
+                    command_sha256: $command_sha256
+                }
+            ')
+    fi
     local_url=$(local_url_for_public_url)
     jq --null-input --compact-output \
         --arg phase "$response_phase" \
@@ -326,7 +329,17 @@ case "$enrollment_action" in
         assert_blue_binding legacy
         umask 077
         {
-            printf '%s\n' 'services:' '  coolify:' '    ports: !reset null'
+            printf '%s\n' \
+                'services:' \
+                '  coolify:' \
+                '    ports: !reset null' \
+                '    labels:' \
+                '      - "traefik.enable=true"' \
+                '      - "traefik.http.routers.coolify-control-plane-enrollment-local.rule=PathPrefix(`/`)"' \
+                '      - "traefik.http.routers.coolify-control-plane-enrollment-local.entrypoints=coolify-local"' \
+                '      - "traefik.http.routers.coolify-control-plane-enrollment-local.priority=10"' \
+                '      - "traefik.http.routers.coolify-control-plane-enrollment-local.service=coolify-control-plane-enrollment-local"' \
+                '      - "traefik.http.services.coolify-control-plane-enrollment-local.loadbalancer.server.port=8080"'
         } > "$compose_override"
         chmod 600 "$compose_override"
         write_state prepared

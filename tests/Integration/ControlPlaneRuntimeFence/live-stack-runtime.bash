@@ -244,7 +244,7 @@ live_stack_release_lease()
 {
     local holder=$LIVE_STACK_ROOT/mutation-lease-holder.pid process
 
-    [[ -f $holder && ! -L $holder ]] || return
+    [[ -f $holder && ! -L $holder ]] || return 0
     process=$(<"$holder")
     [[ $process =~ ^[1-9][0-9]*$ ]] || live_stack_fail 'mutation lease holder PID is malformed'
     kill "$process" >/dev/null 2>&1 || true
