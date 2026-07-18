@@ -212,6 +212,7 @@ COPY --chmod=755 docker/production/etc/s6-overlay/ /etc/s6-overlay/
 RUN mkdir -p /etc/nginx/conf.d && \
     chown -R www-data:www-data /etc/nginx && \
     chmod -R 755 /etc/nginx && \
+    install -d -m 0700 -o www-data -g www-data /var/www/html/storage/app/ssh && \
     install -d -m 0750 -o root -g www-data /var/lib/coolify-control-plane && \
     install -m 0660 -o root -g www-data /dev/null /var/lib/coolify-control-plane/mutation-inflight.lock
 
