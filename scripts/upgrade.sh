@@ -9,7 +9,7 @@ SKIP_BACKUP=${4:-false}
 ENV_FILE="/data/coolify/source/.env"
 STATUS_FILE="/data/coolify/source/.upgrade-status"
 
-FORK_RELEASE_VERSION_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-fork\.[1-9][0-9]*$'
+FORK_RELEASE_VERSION_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-fork(\.[1-9][0-9]*)?$'
 if [[ "$LATEST_IMAGE" =~ $FORK_RELEASE_VERSION_PATTERN ]]; then
     echo "Fork release ${LATEST_IMAGE} is not published to ghcr.io/coollabsio/coolify." >&2
     echo "Use the signed fork deployment path instead: scripts/fork-deploy install --manifest <signed release manifest URL>." >&2

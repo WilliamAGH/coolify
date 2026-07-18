@@ -6,6 +6,7 @@ LAB_DIRECTORY="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 REPOSITORY_ROOT="$(CDPATH='' cd -- "$LAB_DIRECTORY/../../.." && pwd)"
 PROJECT_NAME="application-deployment-job-blue-green-$PPID-$$"
 CONTROL_PLANE_IMAGE="${CONTROL_PLANE_IMAGE:-coolify:application-deployment-job-blue-green-current}"
+CONTROL_PLANE_IMAGE_PROBE_CONTAINER="$PROJECT_NAME-control-plane-image-probe"
 DEFAULT_TESTING_HOST_IMAGE="application-deployment-job-testing-host-fixture:local"
 TESTING_HOST_IMAGE="${TESTING_HOST_IMAGE:-$DEFAULT_TESTING_HOST_IMAGE}"
 EVIDENCE_DIRECTORY="${APPLICATION_DEPLOYMENT_JOB_BLUE_GREEN_EVIDENCE_DIRECTORY:-/tmp/$PROJECT_NAME}"
@@ -18,6 +19,7 @@ compose()
 
 cleanup()
 {
+    docker rm --force "$CONTROL_PLANE_IMAGE_PROBE_CONTAINER" >/dev/null 2>&1 || true
     compose logs --no-color >"$EVIDENCE_DIRECTORY/compose.log" 2>&1 || true
     compose down --volumes --remove-orphans >/dev/null 2>&1 || true
 }
@@ -220,6 +222,27 @@ docker image inspect \
     'registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373' \
     application-deployment-job-fixture:manifest >"$EVIDENCE_DIRECTORY/images.start.json"
 
+if ! docker run --rm --name "$CONTROL_PLANE_IMAGE_PROBE_CONTAINER" \
+    --user 9999:9999 --entrypoint /bin/sh "$CONTROL_PLANE_IMAGE" -ec '
+        ssh_directory=/var/www/html/storage/app/ssh
+        process_identity="$(id -u):$(id -g)"
+        directory_identity="$(stat -c "%u:%g" "$ssh_directory")"
+        [ "$process_identity" = 9999:9999 ]
+        [ "$directory_identity" = 9999:9999 ]
+        ! awk '\''$5 == "/var/www/html/storage/app/ssh" { mounted = 1 } END { exit mounted ? 0 : 1 }'\'' /proc/self/mountinfo
+        probe_file="$ssh_directory/.image-ownership-probe-$$"
+        trap '\''rm -f "$probe_file"'\'' EXIT
+        : >"$probe_file"
+        printf "process=%s directory=%s writable=true\n" "$process_identity" "$directory_identity"
+    ' >"$EVIDENCE_DIRECTORY/control-plane-image-ssh-ownership.log" 2>&1; then
+    fail 'unmounted production image SSH directory is not owned by and writable for uid/gid 9999'
+fi
+[ -s "$EVIDENCE_DIRECTORY/control-plane-image-ssh-ownership.log" ] \
+    || fail 'production image SSH ownership probe produced no evidence'
+if docker container inspect "$CONTROL_PLANE_IMAGE_PROBE_CONTAINER" >/dev/null 2>&1; then
+    fail 'production image SSH ownership probe left a stale container'
+fi
+
 docker save --output "$EVIDENCE_DIRECTORY/nested-images.tar" \
     application-deployment-job-fixture:manifest \
     "$TESTING_HOST_IMAGE" \
@@ -245,6 +268,25 @@ docker cp "$PROJECT_NAME-control-plane:/tmp/application-deployment-job-blue-gree
     || fail 'real handle report could not be copied from the control plane'
 [ -s "$EVIDENCE_DIRECTORY/report.json" ] || fail 'real handle report was not persisted'
 request_observer_final_flush
+
+managed_container_ids=$(jq -c '.drainedContainerId | unique | sort' "$EVIDENCE_DIRECTORY/report.json")
+jq -s -e \
+    --arg fixtureImageId "$FIXTURE_IMAGE_ID" \
+    --argjson managedContainerIds "$managed_container_ids" \
+    '. as $healthSnapshots
+    | ($managedContainerIds | length == 2)
+    and all(
+        $managedContainerIds[];
+        . as $containerId
+        | any(
+            $healthSnapshots[];
+            . as $healthSnapshot
+            | ($containerId | startswith($healthSnapshot.containerId))
+                and $healthSnapshot.imageId == $fixtureImageId
+        )
+    )' \
+    "$EVIDENCE_DIRECTORY/candidate-health.jsonl" >/dev/null \
+    || fail 'observer candidate health did not prove both managed blue/green containers used the exact fixture image ID'
 
 first_not_found_at="$(jq -r '.deactivationTraffic.firstNotFoundAt' "$EVIDENCE_DIRECTORY/report.json")"
 first_tombstone_at="$(jq -r '.deactivationTraffic.firstTombstoneAt' "$EVIDENCE_DIRECTORY/report.json")"

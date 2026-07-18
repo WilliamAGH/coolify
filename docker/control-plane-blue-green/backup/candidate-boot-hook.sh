@@ -124,6 +124,37 @@ stage_candidate_secret()
         || fail 'candidate runtime secret staging differs from its attested source'
 }
 
+write_candidate_secret_owner()
+{
+    local owner_file="$candidate_secret_directory/.backup-restore-candidate-owner"
+
+    {
+        printf 'operation_id=%s\n' "$CONTROL_PLANE_OPERATION_ID"
+        printf 'candidate_runtime_container=%s\n' "$CONTROL_PLANE_CANDIDATE_RUNTIME_CONTAINER"
+    } > "$owner_file"
+    chmod 0400 "$owner_file"
+    [[ $(stat -c '%u:%g:%a' "$owner_file") == 0:0:400 ]] \
+        || fail 'candidate secret owner record is not root:root mode 0400'
+}
+
+cleanup_candidate_secret_directory()
+{
+    local owner_file="$candidate_secret_directory/.backup-restore-candidate-owner"
+
+    [[ -d $candidate_secret_directory && ! -L $candidate_secret_directory \
+        && $(stat -c '%u:%g:%a' "$candidate_secret_directory") == 0:0:700 \
+        && -f $owner_file && ! -L $owner_file \
+        && $(stat -c '%u:%g:%a' "$owner_file") == 0:0:400 \
+        && $(awk -F= '$1 == "operation_id" { print substr($0, length($1) + 2) }' \
+            "$owner_file") == "$CONTROL_PLANE_OPERATION_ID" \
+        && $(awk -F= '$1 == "candidate_runtime_container" { print substr($0, length($1) + 2) }' \
+            "$owner_file") == "$CONTROL_PLANE_CANDIDATE_RUNTIME_CONTAINER" ]] \
+        || return 1
+    rm -f -- "$candidate_secret_directory/direct-probe-token" \
+        "$candidate_secret_directory/applied-ack" "$owner_file"
+    rmdir -- "$candidate_secret_directory"
+}
+
 cleanup()
 {
     local exit_status=$?
@@ -158,12 +189,8 @@ cleanup()
     [[ -z ${override:-} ]] || rm -f -- "$override"
     [[ -z ${compose_log:-} ]] || rm -f -- "$compose_log"
     if [[ ${boot_succeeded:-0} != 1 ]]; then
-        [[ -z ${candidate_direct_probe_token_file:-} ]] \
-            || rm -f -- "$candidate_direct_probe_token_file"
-        [[ -z ${candidate_applied_ack_file:-} ]] \
-            || rm -f -- "$candidate_applied_ack_file"
         [[ -z ${candidate_secret_directory:-} ]] \
-            || rmdir -- "$candidate_secret_directory"
+            || cleanup_candidate_secret_directory || true
     fi
     exit "$exit_status"
 }
@@ -275,9 +302,18 @@ done
     && -z $(find "$CONTROL_PLANE_RESTORED_STATE_ROOT/backups" -mindepth 1 -print -quit) ]] \
     || fail 'candidate disposable backup directory is not empty service-owned mode 0700'
 
-candidate_secret_directory=$(mktemp -d \
-    "$(dirname "$CONTROL_PLANE_GREEN_DIRECT_PROBE_TOKEN_FILE")/.candidate-secrets.XXXXXX")
+candidate_secret_identity=$(printf '%s:%s' "$CONTROL_PLANE_OPERATION_ID" \
+    "$CONTROL_PLANE_CANDIDATE_RUNTIME_CONTAINER" | sha256sum | awk '{print substr($1, 1, 40)}')
+candidate_secret_directory="$(dirname "$CONTROL_PLANE_GREEN_DIRECT_PROBE_TOKEN_FILE")/.candidate-secrets.$candidate_secret_identity"
+if [[ -e $candidate_secret_directory || -L $candidate_secret_directory ]]; then
+    ! docker inspect "$CONTROL_PLANE_CANDIDATE_RUNTIME_CONTAINER" >/dev/null 2>&1 \
+        || fail 'candidate secret directory still belongs to an existing candidate'
+    cleanup_candidate_secret_directory \
+        || fail 'existing candidate secret directory lacks exact candidate ownership'
+fi
+mkdir --mode=0700 "$candidate_secret_directory"
 chmod 0700 "$candidate_secret_directory"
+write_candidate_secret_owner
 candidate_direct_probe_token_file="$candidate_secret_directory/direct-probe-token"
 candidate_applied_ack_file="$candidate_secret_directory/applied-ack"
 stage_candidate_secret "$CONTROL_PLANE_GREEN_DIRECT_PROBE_TOKEN_FILE" \
@@ -293,6 +329,8 @@ created_unix=$(date +%s)
     printf '      coolify.control-plane.backup-restore.operation: "%s"\n' \
         "$CONTROL_PLANE_OPERATION_ID"
     printf '      coolify.control-plane.backup-restore.created-unix: "%s"\n' "$created_unix"
+    printf '      coolify.control-plane.backup-restore.candidate-secrets: "%s"\n' \
+        "$candidate_secret_directory"
     printf '    environment:\n      CONTROL_PLANE_RESTORED_STATE_SELECTION: "%s"\n' \
         "$CONTROL_PLANE_RESTORED_STATE_SELECTION"
     printf '    volumes:\n'

@@ -70,6 +70,19 @@ function releaseContractUpdateSemanticVersionPattern(): string
     return (string) $constant->getValue();
 }
 
+function releaseContractExecuteForkReleaseGuard(string $script, string $versionVariable, string $version): Process
+{
+    preg_match('/^FORK_RELEASE_VERSION_PATTERN=.*?^fi$/ms', $script, $matches);
+
+    expect($matches)->toHaveCount(1);
+
+    $process = new Process(['bash', '-s']);
+    $process->setInput($versionVariable.'='.escapeshellarg($version)."\n".$matches[0]."\n");
+    $process->run();
+
+    return $process;
+}
+
 dataset('release semantic versions', [
     'zero version' => ['0.0.0', true],
     'stable version' => ['4.2.10', true],
@@ -86,14 +99,19 @@ dataset('release semantic versions', [
 ]);
 
 dataset('fork release semantic versions', [
-    'numbered fork release' => ['4.2.10-fork.1', true],
-    'later numbered fork release' => ['4.2.10-fork.12', true],
-    'missing release number' => ['4.2.10-fork', false],
+    'fork release' => ['4.2.10-fork', true],
+    'numbered fork release' => ['4.2.10-fork.1', false],
+    'later numbered fork release' => ['4.2.10-fork.12', false],
     'zero release number' => ['4.2.10-fork.0', false],
     'stable version' => ['4.2.10', false],
     'different prerelease' => ['4.2.10-rc.1', false],
     'leading-zero release number' => ['4.2.10-fork.01', false],
     'prefixed version' => ['v4.2.10-fork.1', false],
+]);
+
+dataset('guarded fork release versions', [
+    'canonical fork release' => ['4.2.10-fork'],
+    'legacy numbered fork release' => ['4.2.10-fork.1'],
 ]);
 
 it('keeps release workflow and update validation on the same strict semantic version grammar', function (string $version, bool $valid) {
@@ -111,7 +129,7 @@ it('keeps release workflow and update validation on the same strict semantic ver
     }
 })->with('release semantic versions');
 
-it('keeps fork release workflows on the same numbered fork version grammar', function (string $version, bool $valid) {
+it('keeps fork release workflows on the same fork version grammar', function (string $version, bool $valid) {
     $patterns = releaseContractShellSemanticVersionPatterns()['fork'];
 
     expect($patterns['shared'])->toBe($patterns['entry']);
@@ -142,7 +160,7 @@ it('serves the workflow-published semantic tag to consumers through versions.jso
 
 it('orders the fork prerelease below its corresponding upstream stable release', function () {
     $published = releaseContractPublishedSemanticVersion();
-    $stable = explode('-fork.', $published, 2)[0];
+    $stable = explode('-fork', $published, 2)[0];
 
     expect($stable)->not->toBe($published)
         ->and(version_compare($stable, $published, '>'))->toBeTrue();
@@ -166,11 +184,16 @@ it('publishes production only for an explicit increasing semantic version bump',
 it('keeps the newest version publishable after an intermediate pending bump is evicted', function () {
     $root = releaseContractRepositoryRoot();
     $publishedVersion = releaseContractPublishedSemanticVersion();
-    [$versionCore, $forkRelease] = explode('-fork.', $publishedVersion, 2);
-    expect($forkRelease)->toMatch('/^[1-9]\d*$/');
+    $versionCore = explode('-fork', $publishedVersion, 2)[0];
+    $versionParts = array_map('intval', explode('.', $versionCore));
+    expect($versionParts)->toHaveCount(3);
 
     $baselineVersion = '0.0.0';
-    $nextVersion = $versionCore.'-fork.'.((int) $forkRelease + 1);
+    $nextVersion = implode('.', [
+        $versionParts[0],
+        $versionParts[1],
+        $versionParts[2] + 1,
+    ]).'-fork';
     $workflow = Yaml::parseFile($root.'/.github/workflows/coolify-production-build.yml');
     $versionStep = collect($workflow['jobs']['resolve-version']['steps'])->firstWhere('id', 'version');
     $script = (string) ($versionStep['run'] ?? '');
@@ -258,9 +281,8 @@ it('resolves the published tag through the install script versions.json parse pi
     expect(trim($process->getOutput()))->toBe(releaseContractPublishedSemanticVersion());
 });
 
-it('fails closed before the generic upstream installer or compose can use a numbered fork release', function () {
+it('executes the guarded install and upgrade paths for canonical and legacy fork releases', function (string $forkVersion) {
     $root = releaseContractRepositoryRoot();
-    $forkVersion = releaseContractPublishedSemanticVersion();
     $installScript = (string) file_get_contents($root.'/scripts/install.sh');
     $upgradeScript = (string) file_get_contents($root.'/scripts/upgrade.sh');
 
@@ -269,7 +291,7 @@ it('fails closed before the generic upstream installer or compose can use a numb
     $upgradeGuard = strpos($upgradeScript, 'FORK_RELEASE_VERSION_PATTERN=');
     $composeDownload = strpos($upgradeScript, 'curl -fsSL -L $CDN/docker-compose.prod.yml');
 
-    expect($forkVersion)->toMatch('/^\d+\.\d+\.\d+-fork\.[1-9]\d*$/')
+    expect($forkVersion)->toMatch('/^\d+\.\d+\.\d+-fork(?:\.[1-9]\d*)?$/')
         ->and($installGuard)->toBeInt()
         ->and($installUpgrade)->toBeInt()
         ->and($upgradeGuard)->toBeInt()
@@ -277,14 +299,17 @@ it('fails closed before the generic upstream installer or compose can use a numb
         ->and($installGuard)->toBeLessThan($installUpgrade)
         ->and($upgradeGuard)->toBeLessThan($composeDownload);
 
-    $process = new Process(['bash', $root.'/scripts/upgrade.sh', $forkVersion], $root);
-    $process->run();
+    $installProcess = releaseContractExecuteForkReleaseGuard($installScript, 'LATEST_VERSION', $forkVersion);
+    $upgradeProcess = new Process(['bash', $root.'/scripts/upgrade.sh', $forkVersion], $root);
+    $upgradeProcess->run();
 
-    expect($process->isSuccessful())->toBeFalse()
-        ->and($process->getErrorOutput())
-        ->toContain("Fork release {$forkVersion} is not published to ghcr.io/coollabsio/coolify.")
-        ->toContain('scripts/fork-deploy install --manifest');
-});
+    foreach ([$installProcess, $upgradeProcess] as $process) {
+        expect($process->isSuccessful())->toBeFalse()
+            ->and($process->getErrorOutput())
+            ->toContain("Fork release {$forkVersion} is not published to ghcr.io/coollabsio/coolify.")
+            ->toContain('scripts/fork-deploy install --manifest');
+    }
+})->with('guarded fork release versions');
 
 it('keeps generic compose resolution for upstream image tags without changing its wire format', function () {
     $root = releaseContractRepositoryRoot();

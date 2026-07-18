@@ -513,6 +513,7 @@ jobs:
           - router-reload-failure
           - continuous-availability
           - routed-candidate-restart
+          - proxy-enrollment
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       - name: Set up PHP

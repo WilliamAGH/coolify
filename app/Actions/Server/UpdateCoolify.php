@@ -16,7 +16,7 @@ class UpdateCoolify
 
     private const string SEMANTIC_VERSION_PATTERN = '/\A(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:(?:0|[1-9]\d*)|(?:\d*[A-Za-z-][0-9A-Za-z-]*))(?:\.(?:(?:0|[1-9]\d*)|(?:\d*[A-Za-z-][0-9A-Za-z-]*)))*)?\z/D';
 
-    private const string FORK_VERSION_PATTERN = '/\A(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-fork\.[1-9]\d*\z/D';
+    private const string FORK_VERSION_PATTERN = '/\A(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-fork(?:\.[1-9]\d*)?\z/D';
 
     private const string HTTPS_URL_PATTERN = '/\Ahttps:\/\/[A-Za-z0-9.-]+(?::[0-9]{1,5})?(?:\/[A-Za-z0-9._~!$&\'()*+,=:@%\/-]*)?(?:\?[A-Za-z0-9._~!$&\'()*+,=:@%\/?-]*)?\z/D';
 

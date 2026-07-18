@@ -463,6 +463,34 @@ test_install_records_signed_immutable_bundle() {
     cleanup_fixture
 }
 
+test_install_accepts_bare_fork_version_convention() {
+    new_fixture
+    write_manifest 4.13.1-fork
+
+    if install_release >/dev/null \
+        && [[ $(<"$ROOT/fork-deploy/current") == 4.13.1-fork ]] \
+        && "$SUBJECT" verify >/dev/null; then
+        pass 'install accepts the bare fork version convention'
+    else
+        fail 'install accepts the bare fork version convention'
+    fi
+    cleanup_fixture
+}
+
+test_install_rejects_zero_historical_suffix() {
+    new_fixture
+    write_manifest 4.13.1-fork.0
+
+    if install_release >/dev/null 2>&1; then
+        fail 'install rejects a zero historical suffix'
+    elif [[ ! -e $ROOT/fork-deploy/current ]]; then
+        pass 'install rejects a zero historical suffix'
+    else
+        fail 'install rejects a zero historical suffix'
+    fi
+    cleanup_fixture
+}
+
 test_accepts_real_ed25519_raw_signature() {
     new_fixture
     write_manifest 4.13.0-fork.1
@@ -784,6 +812,8 @@ test_forward_recovery_reconciles_historical_rollback_activation() {
         cleanup_fixture
         return
     fi
+    replace_key_value "$ROOT/fork-deploy/activations/4.13.0-fork.1" \
+        MIGRATION_FINGERPRINT_BEFORE ffffffffffffffffffffffffffffffff
 
     rm -f "$FORK_DEPLOY_CANDIDATE_STARTED_MARKER"
     export FORK_DEPLOY_FAIL_CANDIDATE_RUNTIME_VERIFY=true
@@ -800,6 +830,8 @@ test_forward_recovery_reconciles_historical_rollback_activation() {
     if "$SUBJECT" recover-forward >/dev/null \
         && [[ $(<"$ROOT/fork-deploy/current") == 4.13.0-fork.1 \
             && $(candidate_history_count 4.13.0-fork.1) -eq 2 \
+            && $(awk -F= '$1 == "MIGRATION_FINGERPRINT_BEFORE" { print $2 }' \
+                "$ROOT/fork-deploy/activations/4.13.0-fork.1") != ffffffffffffffffffffffffffffffff \
             && $(<"$ROOT/applications/post-start-write") == accepted-during-rollback-recovery \
             && ! -e $ROOT/fork-deploy/pending-candidate \
             && ! -e $ROOT/fork-deploy/failed-needs-restore ]] \
@@ -1619,6 +1651,8 @@ test_dry_run_is_non_mutating
 test_status_does_not_mutate_authorized_keys
 test_trust_is_production_only_without_deployment_preflight
 test_install_records_signed_immutable_bundle
+test_install_accepts_bare_fork_version_convention
+test_install_rejects_zero_historical_suffix
 test_accepts_real_ed25519_raw_signature
 test_update_requires_verified_current_release
 test_update_requires_healthy_current_runtime

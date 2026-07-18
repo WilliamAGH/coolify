@@ -108,7 +108,7 @@ jobs:
           DOCKERFILE: ${{ inputs.dockerfile }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          FORK_SEMANTIC_VERSION_PATTERN: '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-fork\.[1-9][0-9]*$'
+          FORK_SEMANTIC_VERSION_PATTERN: '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-fork$'
           FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY: ${{ secrets.FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY }}
           GITHUB_REF_TYPE: ${{ github.ref_type }}
           NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
@@ -2825,7 +2825,7 @@ jobs:
           assert_active_fork_tag_protection() {
             local rulesets_file ruleset_file ruleset_id
             local -r fork_ruleset_name='Protect Coolify fork release tags'
-            local -r fork_tag_pattern='refs/tags/*.*.*-fork.*'
+            local -r fork_tag_pattern='refs/tags/*.*.*-fork*'
             rulesets_file="$(mktemp "$RUNNER_TEMP/coolify-fork-rulesets.XXXXXX")"
             ruleset_file="$(mktemp "$RUNNER_TEMP/coolify-fork-ruleset.XXXXXX")"
             github_api_get 'rulesets?targets=tag&includes_parents=true&per_page=100' "$rulesets_file"

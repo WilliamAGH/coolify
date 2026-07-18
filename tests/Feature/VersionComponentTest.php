@@ -3,14 +3,14 @@
 use Illuminate\Support\Facades\Blade;
 
 test('fork versions link to the owning fork release without a v prefix', function () {
-    config(['constants.coolify.version' => '4.13.0-fork.1']);
+    config(['constants.coolify.version' => '4.13.1-fork']);
 
     $html = Blade::render('<x-version />');
 
     expect($html)
-        ->toContain('href="https://github.com/WilliamAGH/coolify/releases/tag/4.13.0-fork.1"')
-        ->not->toContain('github.com/coollabsio/coolify/releases/tag/v4.13.0-fork.1')
-        ->toContain('v4.13.0-fork.1');
+        ->toContain('href="https://github.com/WilliamAGH/coolify/releases/tag/4.13.1-fork"')
+        ->not->toContain('github.com/coollabsio/coolify/releases/tag/v4.13.1-fork')
+        ->toContain('v4.13.1-fork');
 });
 
 test('upstream versions keep their upstream v-prefixed release links', function (string $version) {

@@ -11,6 +11,11 @@ use Tests\TestCase;
 
 uses(TestCase::class, RefreshDatabase::class);
 
+dataset('update coolify guarded fork releases', [
+    'canonical fork release' => ['4.2.10-fork'],
+    'legacy numbered fork release' => ['4.2.10-fork.1'],
+]);
+
 beforeEach(function () {
     config([
         'constants.coolify.version' => '4.1.2',
@@ -19,7 +24,7 @@ beforeEach(function () {
     ]);
     $this->forkVersion = include base_path('config/constants.php');
     $this->forkVersion = $this->forkVersion['coolify']['version'];
-    expect($this->forkVersion)->toMatch('/^\d+\.\d+\.\d+-fork\.[1-9]\d*$/');
+    expect($this->forkVersion)->toMatch('/^\d+\.\d+\.\d+-fork$/');
 
     $this->settings = (new InstanceSettings)->forceFill([
         'id' => 0,
@@ -83,12 +88,12 @@ it('uses validated cache when CDN fails and automatic updates are disabled', fun
         ->once();
 });
 
-it('does not contact or run the upstream updater for an automatic fork update', function () {
+it('does not contact or run the upstream updater for canonical and legacy fork updates', function (string $forkVersion) {
     $this->settings->forceFill([
         'is_auto_update_enabled' => true,
         'new_version_available' => true,
     ])->saveQuietly();
-    config(['constants.coolify.version' => $this->forkVersion]);
+    config(['constants.coolify.version' => $forkVersion]);
     Http::preventStrayRequests();
     Log::spy();
 
@@ -101,10 +106,10 @@ it('does not contact or run the upstream updater for an automatic fork update', 
     Log::shouldHaveReceived('warning')
         ->with('Upstream updater disabled for fork release', Mockery::type('array'))
         ->once();
-});
+})->with('update coolify guarded fork releases');
 
-it('requires the guarded deployment workflow for a manual fork update', function () {
-    config(['constants.coolify.version' => $this->forkVersion]);
+it('requires the guarded deployment workflow for canonical and legacy manual fork updates', function (string $forkVersion) {
+    config(['constants.coolify.version' => $forkVersion]);
     Http::preventStrayRequests();
 
     expect(fn () => (new UpdateCoolify)->handle(manual_update: true))->toThrow(
@@ -112,7 +117,7 @@ it('requires the guarded deployment workflow for a manual fork update', function
         'Fork releases must be updated through the guarded fork deployment workflow.',
     );
     Http::assertNothingSent();
-});
+})->with('update coolify guarded fork releases');
 
 it('prevents downgrade even with manual update', function () {
     Http::fake([

@@ -17,9 +17,27 @@ cleanup()
 
     trap - EXIT HUP INT TERM
     if [[ ${boot_succeeded:-0} != 1 && -n $candidate_secret_directory ]]; then
-        rm -rf -- "$candidate_secret_directory"
+        cleanup_candidate_secret_directory || true
     fi
     exit "$exit_status"
+}
+
+cleanup_candidate_secret_directory()
+{
+    local owner_file="$candidate_secret_directory/.backup-restore-candidate-owner"
+
+    [[ -d $candidate_secret_directory && ! -L $candidate_secret_directory \
+        && $(stat -c '%u:%g:%a' "$candidate_secret_directory") == 0:0:700 \
+        && -f $owner_file && ! -L $owner_file \
+        && $(stat -c '%u:%g:%a' "$owner_file") == 0:0:400 \
+        && $(awk -F= '$1 == "operation_id" { print substr($0, length($1) + 2) }' \
+            "$owner_file") == "$CONTROL_PLANE_OPERATION_ID" \
+        && $(awk -F= '$1 == "candidate_runtime_container" { print substr($0, length($1) + 2) }' \
+            "$owner_file") == "$LAB_CANDIDATE_CONTAINER" ]] \
+        || return 1
+    rm -f -- "$candidate_secret_directory/direct-probe-token" \
+        "$candidate_secret_directory/applied-ack" "$owner_file"
+    rmdir -- "$candidate_secret_directory"
 }
 
 stage_candidate_secret()
@@ -33,9 +51,20 @@ stage_candidate_secret()
             $(sha256sum "$source_file" | awk '{print $1}') ]]
 }
 
-candidate_secret_directory=$(mktemp -d \
-    "$LAB_HOST_RUNTIME_DIRECTORY/.lab-candidate-secrets.XXXXXX")
+candidate_secret_identity=$(printf '%s:%s' "$CONTROL_PLANE_OPERATION_ID" \
+    "$LAB_CANDIDATE_CONTAINER" | sha256sum | awk '{print substr($1, 1, 40)}')
+candidate_secret_directory="$LAB_HOST_RUNTIME_DIRECTORY/.candidate-secrets.$candidate_secret_identity"
+if [[ -e $candidate_secret_directory || -L $candidate_secret_directory ]]; then
+    ! docker inspect "$LAB_CANDIDATE_CONTAINER" >/dev/null 2>&1 || exit 70
+    cleanup_candidate_secret_directory || exit 70
+fi
+mkdir --mode=0700 "$candidate_secret_directory"
 chmod 0700 "$candidate_secret_directory"
+{
+    printf 'operation_id=%s\n' "$CONTROL_PLANE_OPERATION_ID"
+    printf 'candidate_runtime_container=%s\n' "$LAB_CANDIDATE_CONTAINER"
+} > "$candidate_secret_directory/.backup-restore-candidate-owner"
+chmod 0400 "$candidate_secret_directory/.backup-restore-candidate-owner"
 trap cleanup EXIT HUP INT TERM
 candidate_direct_probe_token_file="$candidate_secret_directory/direct-probe-token"
 candidate_applied_ack_file="$candidate_secret_directory/applied-ack"
@@ -62,6 +91,7 @@ docker create --name "$LAB_CANDIDATE_CONTAINER" --network "$LAB_NETWORK" \
     --label coolify.control-plane.backup-restore.candidate=true \
     --label "coolify.control-plane.backup-restore.operation=$CONTROL_PLANE_OPERATION_ID" \
     --label "coolify.control-plane.backup-restore.created-unix=$(date +%s)" \
+    --label "coolify.control-plane.backup-restore.candidate-secrets=$candidate_secret_directory" \
     --env "PGHOST=$CONTROL_PLANE_RESTORE_DATABASE_CONTAINER" \
     --env "PGUSER=$CONTROL_PLANE_RESTORE_DATABASE_USER" \
     --env "PGDATABASE=$CONTROL_PLANE_RESTORE_DATABASE_NAME" \

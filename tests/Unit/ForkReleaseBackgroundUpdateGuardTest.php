@@ -13,7 +13,7 @@ use Tests\TestCase;
 uses(TestCase::class);
 
 beforeEach(function () {
-    config(['constants.coolify.version' => '4.13.0-fork.1']);
+    config(['constants.coolify.version' => '4.13.1-fork']);
     Http::preventStrayRequests();
 });
 

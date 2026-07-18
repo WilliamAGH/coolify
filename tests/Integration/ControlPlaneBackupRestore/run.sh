@@ -28,7 +28,7 @@ SOURCE_REDIS_VOLUME="$LAB_ID-source-redis-data"
 TARGET_VOLUME="$LAB_ID-target-data"
 STATE_VOLUME="$LAB_ID-source-state"
 RESTORE_STATE_VOLUME="$LAB_ID-restored-state"
-RUNTIME_DIRECTORY=$(mktemp -d "/tmp/${LAB_ID}.XXXXXX")
+RUNTIME_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/${LAB_ID}.XXXXXX")
 WRITER_PID=
 CAPTURE_PID=
 NEGATIVE_COUNT=0
@@ -329,6 +329,7 @@ restore_attempt()
         --env "LAB_HOST_RUNTIME_DIRECTORY=$RUNTIME_DIRECTORY"
         --env "LAB_DIRECT_PROBE_TOKEN_FILE=$RUNTIME_DIRECTORY/probe-token"
         --env "LAB_APPLIED_ACK_FILE=$RUNTIME_DIRECTORY/probe-ack"
+        --env "CONTROL_PLANE_GREEN_DIRECT_PROBE_TOKEN_FILE=$RUNTIME_DIRECTORY/probe-token"
     )
 
     if [[ -n $fault_name ]]; then
@@ -423,12 +424,17 @@ canonical_restore_attempt()
 
 assert_failed_restore_cleanup()
 {
-    local suffix=$1 target_container=$2 candidate_container=$3 database_count
+    local suffix=$1 target_container=$2 candidate_container=$3 database_count secret_identity
 
     if docker inspect "$candidate_container" >/dev/null 2>&1; then
         printf '%s\n' "failed restore leaked candidate: $candidate_container" >&2
         exit 1
     fi
+    secret_identity=$(printf '%s:%s' "$OPERATION_ID" "$candidate_container" \
+        | sha256sum | awk '{print substr($1, 1, 40)}')
+    [[ ! -e $RUNTIME_DIRECTORY/.candidate-secrets.$secret_identity \
+        && ! -L $RUNTIME_DIRECTORY/.candidate-secrets.$secret_identity ]] \
+        || { printf '%s\n' "failed restore leaked owned candidate secrets: $suffix" >&2; exit 1; }
     database_count=$(docker exec "$target_container" psql --no-psqlrc --tuples-only --no-align \
         --quiet --username postgres --dbname postgres --command \
         "SELECT count(*) FROM pg_database WHERE datname = 'coolify'" | tr -d '[:space:]')
@@ -669,7 +675,7 @@ run_tools /opt/control-plane-backup/capture.sh \
     > "$RUNTIME_DIRECTORY/capture.log" 2>&1 &
 CAPTURE_PID=$!
 QUIESCE_STATE="$RUNTIME_DIRECTORY/backup-quiesce-state/$OPERATION_ID/state"
-for _ in $(seq 1 120); do
+for _ in $(seq 1 240); do
     [[ -f $QUIESCE_STATE ]] && grep -Fqx phase=acquiring "$QUIESCE_STATE" && break
     sleep 0.25
 done
@@ -750,7 +756,7 @@ docker exec "$KILL_CAPTURE_CONTAINER" /opt/control-plane-backup/capture.sh \
     > "$RUNTIME_DIRECTORY/power-loss-capture.log" 2>&1 &
 CAPTURE_PID=$!
 POWER_PLAINTEXT_OBSERVED=0
-for _ in $(seq 1 120); do
+for _ in $(seq 1 240); do
     if docker exec "$KILL_CAPTURE_CONTAINER" find /plaintext -type f \
         -name database.pgdump -size +0c -print -quit 2>/dev/null | grep -q .; then
         POWER_PLAINTEXT_OBSERVED=1
@@ -997,7 +1003,16 @@ run_tools /opt/control-plane-backup/restore-attest.sh \
         /run/secrets/control-plane-applied-ack) == 0:0:444 \
     && $(stat -c '%u:%g:%a' "$RUNTIME_DIRECTORY/probe-token") == 0:0:600 \
     && $(stat -c '%u:%g:%a' "$RUNTIME_DIRECTORY/probe-ack") == 0:0:600 ]] \
-    || { printf '%s\n' 'candidate secrets do not preserve host and runtime ownership' >&2; exit 1; }
+    || {
+        printf 'candidate secrets do not preserve host and runtime ownership (token=%s ack=%s host-token=%s host-ack=%s)\n' \
+            "$(docker exec "$CANDIDATE_CONTAINER" stat -c '%u:%g:%a' \
+                /run/secrets/control-plane-direct-probe-token 2>/dev/null || true)" \
+            "$(docker exec "$CANDIDATE_CONTAINER" stat -c '%u:%g:%a' \
+                /run/secrets/control-plane-applied-ack 2>/dev/null || true)" \
+            "$(stat -c '%u:%g:%a' "$RUNTIME_DIRECTORY/probe-token" 2>/dev/null || true)" \
+            "$(stat -c '%u:%g:%a' "$RUNTIME_DIRECTORY/probe-ack" 2>/dev/null || true)" >&2
+        exit 1
+    }
 CANDIDATE_DIRECT_PROBE_SOURCE=$(docker inspect --format \
     '{{range .Mounts}}{{if eq .Destination "/run/secrets/control-plane-direct-probe-token"}}{{.Source}}{{end}}{{end}}' \
     "$CANDIDATE_CONTAINER")
@@ -1009,6 +1024,16 @@ CANDIDATE_APPLIED_ACK_SOURCE=$(docker inspect --format \
     && -f $CANDIDATE_APPLIED_ACK_SOURCE && ! -L $CANDIDATE_APPLIED_ACK_SOURCE \
     && $(stat -c '%u:%g:%a' "$CANDIDATE_APPLIED_ACK_SOURCE") == 0:0:444 ]] \
     || { printf '%s\n' 'candidate restartable secret sources did not survive boot' >&2; exit 1; }
+CANDIDATE_SECRET_DIRECTORY=$(dirname "$CANDIDATE_DIRECT_PROBE_SOURCE")
+[[ $CANDIDATE_APPLIED_ACK_SOURCE == "$CANDIDATE_SECRET_DIRECTORY/applied-ack" \
+    && $(stat -c '%u:%g:%a' "$CANDIDATE_SECRET_DIRECTORY") == 0:0:700 \
+    && $(stat -c '%u:%g:%a' \
+        "$CANDIDATE_SECRET_DIRECTORY/.backup-restore-candidate-owner") == 0:0:400 \
+    && $(manifest_value "$CANDIDATE_SECRET_DIRECTORY/.backup-restore-candidate-owner" \
+        operation_id) == "$OPERATION_ID" \
+    && $(manifest_value "$CANDIDATE_SECRET_DIRECTORY/.backup-restore-candidate-owner" \
+        candidate_runtime_container) == "$CANDIDATE_CONTAINER" ]] \
+    || { printf '%s\n' 'candidate secret owner does not bind the exact operation and container' >&2; exit 1; }
 docker restart "$CANDIDATE_CONTAINER" >/dev/null
 CANDIDATE_RESTART_READY=0
 for _ in $(seq 1 30); do
@@ -1289,6 +1314,11 @@ if docker inspect "$LAB_ID-candidate-canonical-probe-failure" >/dev/null 2>&1; t
     printf '%s\n' 'canonical post-boot failure leaked candidate container' >&2
     exit 1
 fi
+CANONICAL_FAILURE_SECRET_IDENTITY=$(printf '%s:%s' "$OPERATION_ID" \
+    "$LAB_ID-candidate-canonical-probe-failure" | sha256sum | awk '{print substr($1, 1, 40)}')
+[[ ! -e $RUNTIME_DIRECTORY/.candidate-secrets.$CANONICAL_FAILURE_SECRET_IDENTITY \
+    && ! -L $RUNTIME_DIRECTORY/.candidate-secrets.$CANONICAL_FAILURE_SECRET_IDENTITY ]] \
+    || { printf '%s\n' 'canonical post-boot failure leaked owned candidate secrets' >&2; exit 1; }
 CANONICAL_FAILURE_DATABASE_COUNT=$(docker exec "$CANONICAL_PROBE_FAILURE_TARGET" psql \
     --no-psqlrc --tuples-only --no-align --quiet --username postgres --dbname postgres \
     --command "SELECT count(*) FROM pg_database WHERE datname = 'coolify'" | tr -d '[:space:]')
@@ -1368,6 +1398,33 @@ assert_failed_restore_cleanup runtime-identity "$RUNTIME_IDENTITY_TARGET" \
 docker rm -f "$LAB_ID-candidate-runtime-identity" "$RUNTIME_IDENTITY_TARGET" >/dev/null 2>&1 || true
 docker volume rm "$RUNTIME_IDENTITY_VOLUME" >/dev/null 2>&1 || true
 
+start_fresh_target interrupted-secret-reap "$POSTGRES_IMAGE"
+INTERRUPTED_SECRET_TARGET=$STARTED_TARGET
+INTERRUPTED_SECRET_VOLUME=$STARTED_VOLUME
+INTERRUPTED_SECRET_CANDIDATE="$LAB_ID-candidate-interrupted-secret-reap"
+INTERRUPTED_SECRET_IDENTITY=$(printf '%s:%s' "$OPERATION_ID" \
+    "$INTERRUPTED_SECRET_CANDIDATE" | sha256sum | awk '{print substr($1, 1, 40)}')
+INTERRUPTED_SECRET_DIRECTORY="$RUNTIME_DIRECTORY/.candidate-secrets.$INTERRUPTED_SECRET_IDENTITY"
+# shellcheck disable=SC2016
+run_tools sh --env "SECRET_DIRECTORY=$INTERRUPTED_SECRET_DIRECTORY" \
+    --env "SECRET_CANDIDATE=$INTERRUPTED_SECRET_CANDIDATE" -- -ec '
+    mkdir -m 700 "$SECRET_DIRECTORY"
+    printf "operation_id=%s\ncandidate_runtime_container=%s\n" \
+        backup-restore-lab "$SECRET_CANDIDATE" \
+        > "$SECRET_DIRECTORY/.backup-restore-candidate-owner"
+    cp /lab/probe-token "$SECRET_DIRECTORY/direct-probe-token"
+    cp /lab/probe-ack "$SECRET_DIRECTORY/applied-ack"
+    chmod 400 "$SECRET_DIRECTORY/.backup-restore-candidate-owner"
+    chmod 444 "$SECRET_DIRECTORY/direct-probe-token" "$SECRET_DIRECTORY/applied-ack"
+'
+expect_failure interrupted-post-container-removal-cleanup restore_attempt \
+    interrupted-secret-reap "$INTERRUPTED_SECRET_TARGET" "$INTERRUPTED_SECRET_CANDIDATE" \
+    LAB_FAIL_CANDIDATE_BOOT
+assert_failed_restore_cleanup interrupted-secret-reap "$INTERRUPTED_SECRET_TARGET" \
+    "$INTERRUPTED_SECRET_CANDIDATE"
+docker rm -f "$INTERRUPTED_SECRET_TARGET" >/dev/null 2>&1 || true
+docker volume rm "$INTERRUPTED_SECRET_VOLUME" >/dev/null 2>&1 || true
+
 start_fresh_target stale-reap "$POSTGRES_IMAGE"
 STALE_REAP_TARGET=$STARTED_TARGET
 STALE_REAP_VOLUME=$STARTED_VOLUME
@@ -1375,6 +1432,10 @@ STALE_REAP_CANDIDATE="$LAB_ID-candidate-stale-reap"
 STALE_RESOURCE_VOLUME="$LAB_ID-stale-candidate-state"
 STALE_RESOURCE_NETWORK="$LAB_ID-stale-candidate-network"
 STALE_RESTORE_STATE_VOLUME="$LAB_ID-stale-restored-state"
+STALE_SECRET_IDENTITY=$(printf '%s:%s' "$OPERATION_ID" "$STALE_REAP_CANDIDATE" \
+    | sha256sum | awk '{print substr($1, 1, 40)}')
+STALE_SECRET_PARENT="$RUNTIME_DIRECTORY/stale-candidate-secrets"
+STALE_SECRET_DIRECTORY="$STALE_SECRET_PARENT/.candidate-secrets.$STALE_SECRET_IDENTITY"
 LAB_VOLUMES+=("$STALE_RESOURCE_VOLUME" "$STALE_RESTORE_STATE_VOLUME")
 docker volume create \
     --label coolify.control-plane.backup-restore.resource=true \
@@ -1394,15 +1455,35 @@ run_tools bash --volume "$STALE_RESTORE_STATE_VOLUME:/stale-state" -- -c '
     printf "%s\n" stale > /stale-state/state/stale-plaintext
     chmod 400 /stale-state/state/.backup-restore-operation
 '
+# shellcheck disable=SC2016
+run_tools sh --env "STALE_SECRET_PARENT=$STALE_SECRET_PARENT" \
+    --env "STALE_SECRET_DIRECTORY=$STALE_SECRET_DIRECTORY" \
+    --env "STALE_REAP_CANDIDATE=$STALE_REAP_CANDIDATE" -- -ec '
+    mkdir -m 700 "$STALE_SECRET_PARENT" "$STALE_SECRET_DIRECTORY"
+    printf "operation_id=%s\ncandidate_runtime_container=%s\n" \
+        backup-restore-lab "$STALE_REAP_CANDIDATE" \
+        > "$STALE_SECRET_DIRECTORY/.backup-restore-candidate-owner"
+    cp /lab/probe-token "$STALE_SECRET_DIRECTORY/direct-probe-token"
+    cp /lab/probe-ack "$STALE_SECRET_DIRECTORY/applied-ack"
+    chmod 400 "$STALE_SECRET_DIRECTORY/.backup-restore-candidate-owner"
+    chmod 444 "$STALE_SECRET_DIRECTORY/direct-probe-token" \
+        "$STALE_SECRET_DIRECTORY/applied-ack"
+'
 docker exec "$STALE_REAP_TARGET" createdb --username postgres coolify
 docker create --name "$STALE_REAP_CANDIDATE" \
     --label coolify.control-plane.backup-restore.candidate=true \
     --label "coolify.control-plane.backup-restore.operation=$OPERATION_ID" \
     --label coolify.control-plane.backup-restore.created-unix=1 \
+    --label "coolify.control-plane.backup-restore.candidate-secrets=$STALE_SECRET_DIRECTORY" \
+    --mount "type=bind,src=$STALE_SECRET_DIRECTORY/direct-probe-token,dst=/run/secrets/control-plane-direct-probe-token,readonly" \
+    --mount "type=bind,src=$STALE_SECRET_DIRECTORY/applied-ack,dst=/run/secrets/control-plane-applied-ack,readonly" \
     "$POSTGRES_IMAGE" >/dev/null
+STALE_REAP_CANDIDATE_ID=$(docker inspect --format '{{.Id}}' "$STALE_REAP_CANDIDATE")
 restore_attempt stale-reap "$STALE_REAP_TARGET" "$STALE_REAP_CANDIDATE" \
     '' 1 /plaintext "$STALE_RESTORE_STATE_VOLUME" >/dev/null
 [[ -f $RUNTIME_DIRECTORY/attestations/failure-stale-reap.attestation \
+    && $(docker inspect --format '{{.Id}}' "$STALE_REAP_CANDIDATE") != \
+        "$STALE_REAP_CANDIDATE_ID" \
     && $(docker inspect --format \
         '{{index .Config.Labels "coolify.control-plane.backup-restore.created-unix"}}' \
         "$STALE_REAP_CANDIDATE") != 1 \
@@ -1410,6 +1491,7 @@ restore_attempt stale-reap "$STALE_REAP_TARGET" "$STALE_REAP_CANDIDATE" \
         /run/secrets/control-plane-direct-probe-token) == 0:0:444 \
     && $(docker exec "$STALE_REAP_CANDIDATE" stat -c '%u:%g:%a' \
         /run/secrets/control-plane-applied-ack) == 0:0:444 \
+    && ! -e $STALE_SECRET_DIRECTORY && ! -L $STALE_SECRET_DIRECTORY \
     && -z $(docker volume ls --quiet --filter "name=^${STALE_RESOURCE_VOLUME}$") \
     && -z $(docker network ls --quiet --filter "name=^${STALE_RESOURCE_NETWORK}$") ]] \
     || { printf '%s\n' 'stale state/database/candidate resources were not reaped' >&2; exit 1; }

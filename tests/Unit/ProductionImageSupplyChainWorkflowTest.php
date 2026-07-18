@@ -132,9 +132,9 @@ case "$url" in
         ;;
     "$api/rulesets/42")
         if [ "${FORK_RULESET_STATE:-matching}" = missing-deletion ]; then
-            printf '{"id":42,"name":"Protect Coolify fork release tags","target":"tag","enforcement":"active","conditions":{"ref_name":{"include":["refs/tags/*.*.*-fork.*"],"exclude":[]}},"rules":[{"type":"creation"},{"type":"update"}]}\n'
+            printf '{"id":42,"name":"Protect Coolify fork release tags","target":"tag","enforcement":"active","conditions":{"ref_name":{"include":["refs/tags/*.*.*-fork*"],"exclude":[]}},"rules":[{"type":"creation"},{"type":"update"}]}\n'
         else
-            printf '{"id":42,"name":"Protect Coolify fork release tags","target":"tag","enforcement":"active","conditions":{"ref_name":{"include":["refs/tags/*.*.*-fork.*"],"exclude":[]}},"rules":[{"type":"creation"},{"type":"update"},{"type":"deletion"}]}\n'
+            printf '{"id":42,"name":"Protect Coolify fork release tags","target":"tag","enforcement":"active","conditions":{"ref_name":{"include":["refs/tags/*.*.*-fork*"],"exclude":[]}},"rules":[{"type":"creation"},{"type":"update"},{"type":"deletion"}]}\n'
         fi
         ;;
     *)
@@ -149,7 +149,7 @@ SH);
         'curl_log' => $curlLog,
         'environment' => [
             'CURL_LOG' => $curlLog,
-            'GITHUB_REF' => 'refs/tags/4.13.0-fork.1',
+            'GITHUB_REF' => 'refs/tags/4.13.1-fork',
             'GITHUB_REPOSITORY' => 'WilliamAGH/coolify',
             'GITHUB_SHA' => str_repeat('a', 40),
             'MAIN_AMD64_DIGEST' => releaseWorkflowTestDigest('1'),
@@ -164,7 +164,7 @@ SH);
             'REGCTL_LOG' => $log,
             'REGCTL_STATE' => $state,
             'RUNNER_TEMP' => $fixture,
-            'SEMANTIC_VERSION' => '4.13.0-fork.1',
+            'SEMANTIC_VERSION' => '4.13.1-fork',
             'SOURCE_REVISION' => str_repeat('a', 40),
             'SOURCE_URL' => 'https://github.com/WilliamAGH/coolify',
         ],
@@ -206,8 +206,8 @@ function releaseWorkflowPrepareForkDraftRecoveryDouble(
     file_put_contents($bundle.'/SHA256SUMS', implode("\n", $checksumLines)."\n");
     file_put_contents($downloads.'/SHA256SUMS', $downloadContents['SHA256SUMS'] ?? (string) file_get_contents($bundle.'/SHA256SUMS'));
     file_put_contents($metadata, json_encode([
-        'tagName' => '4.13.0-fork.1',
-        'name' => 'Coolify fork 4.13.0-fork.1',
+        'tagName' => '4.13.1-fork',
+        'name' => 'Coolify fork 4.13.1-fork',
         'isDraft' => $isDraft,
         'isPrerelease' => true,
         'assets' => array_map(static fn (string $assetName): array => ['name' => $assetName], $draftAssets),
@@ -262,11 +262,11 @@ SH);
             'GH_CLI' => $bin.'/gh',
             'GH_LOG' => $ghLog,
             'GH_TOKEN' => 'fixture-token',
-            'GITHUB_REF' => 'refs/tags/4.13.0-fork.1',
+            'GITHUB_REF' => 'refs/tags/4.13.1-fork',
             'GITHUB_REPOSITORY' => 'WilliamAGH/coolify',
             'GITHUB_SHA' => str_repeat('a', 40),
             'RUNNER_TEMP' => $fixture,
-            'SEMANTIC_VERSION' => '4.13.0-fork.1',
+            'SEMANTIC_VERSION' => '4.13.1-fork',
             'SOURCE_REVISION' => str_repeat('a', 40),
         ],
         'gh_log' => $ghLog,
@@ -380,7 +380,7 @@ SH);
             'GH_CLI' => $bin.'/gh',
             'GH_LOG' => $ghLog,
             'GH_TOKEN' => 'fixture-token',
-            'GITHUB_REF' => 'refs/tags/4.13.0-fork.1',
+            'GITHUB_REF' => 'refs/tags/4.13.1-fork',
             'GITHUB_REPOSITORY' => 'WilliamAGH/coolify',
             'GITHUB_SHA' => str_repeat('a', 40),
             'PATH' => $bin.PATH_SEPARATOR.(getenv('PATH') ?: ''),
@@ -393,7 +393,7 @@ SH);
             'RELEASE_STATE' => $state,
             'RELEASE_TAG_TARGET' => $tagTargetCommit ?? str_repeat('a', 40),
             'RUNNER_TEMP' => $fixture,
-            'SEMANTIC_VERSION' => '4.13.0-fork.1',
+            'SEMANTIC_VERSION' => '4.13.1-fork',
             'SOURCE_REVISION' => str_repeat('a', 40),
         ],
         'gh_log' => $ghLog,
@@ -889,7 +889,7 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
 
     $blueGreenScenarios = $applicationValidationJobs['control-plane-blue-green-simulation']['strategy']['matrix']['scenario'] ?? [];
     sort($blueGreenScenarios);
-    if ($blueGreenScenarios !== ['continuous-availability', 'queue-gate', 'routed-candidate-restart', 'router-reload-failure']) {
+    if ($blueGreenScenarios !== ['continuous-availability', 'proxy-enrollment', 'queue-gate', 'routed-candidate-restart', 'router-reload-failure']) {
         $violations[] = 'control-plane blue/green simulation must cover queueing, rollback, routed restart, and continuous availability';
     }
     if (! str_contains(
@@ -919,10 +919,17 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
         ? file_get_contents($blueGreenProviderLabTraefikPath)
         : false;
     $expectedBlueGreenProviderLabTraefikImage = 'traefik:v3.6.23@sha256:f5dba1e65167778cd5f8d1b463fc5d200f49d40c6458fc9f4b391a68ebfb9534';
+    $controlPlaneOperator = file_get_contents(
+        releaseWorkflowRepositoryRoot().'/docker/control-plane-blue-green/control-plane-blue-green.sh',
+    );
 
     if (($blueGreenProviderLabTraefikService['image'] ?? null) !== $expectedBlueGreenProviderLabTraefikImage ||
         ! is_string($blueGreenProviderLabRunner) ||
-        ! str_contains($blueGreenProviderLabRunner, 'v3.6.23')) {
+        ! str_contains($blueGreenProviderLabRunner, 'v3.6.23') ||
+        ! str_contains(
+            $controlPlaneOperator,
+            'readonly EXPECTED_PROXY_DIGEST=sha256:f5dba1e65167778cd5f8d1b463fc5d200f49d40c6458fc9f4b391a68ebfb9534',
+        )) {
         $violations[] = 'Traefik provider lab must retain the reviewed Traefik 3.6.23 image digest';
     }
 
@@ -2404,7 +2411,7 @@ it('defines one referrerless fork release graph for both images and both platfor
         ->toContain('assert_live_fork_tag_binding')
         ->toContain('assert_active_fork_tag_protection')
         ->toContain('Protect Coolify fork release tags')
-        ->toContain('refs/tags/*.*.*-fork.*')
+        ->toContain('refs/tags/*.*.*-fork*')
         ->toContain('index("creation")')
         ->toContain('index("update")')
         ->toContain('index("deletion")')
@@ -2583,14 +2590,14 @@ it('requires exact fork tag source binding and rejects fork aliases', function (
     $semanticPattern = (string) ($targetStep['env']['SEMANTIC_VERSION_PATTERN'] ?? '');
     $forkPattern = (string) ($targetStep['env']['FORK_SEMANTIC_VERSION_PATTERN'] ?? '');
     $cases = [
-        'exact current fork tag' => ['4.13.0-fork.1', 'refs/tags/4.13.0-fork.1', 'tag', 'false', 'false', true],
-        'future fork prerelease' => ['4.14.0-fork.2', 'refs/tags/4.14.0-fork.2', 'tag', 'false', 'false', true],
-        'missing numeric fork release' => ['4.13.0-fork', 'refs/tags/4.13.0-fork', 'tag', 'false', 'false', false],
-        'zero fork release' => ['4.13.0-fork.0', 'refs/tags/4.13.0-fork.0', 'tag', 'false', 'false', false],
-        'v-prefixed alias' => ['4.13.0-fork.1', 'refs/tags/v4.13.0-fork.1', 'tag', 'false', 'false', false],
-        'branch ref' => ['4.13.0-fork.1', 'refs/heads/main', 'branch', 'false', 'false', false],
-        'latest publication' => ['4.13.0-fork.1', 'refs/tags/4.13.0-fork.1', 'tag', 'true', 'false', false],
-        'validate-only publication' => ['4.13.0-fork.1', 'refs/tags/4.13.0-fork.1', 'tag', 'false', 'true', false],
+        'exact current fork tag' => ['4.13.1-fork', 'refs/tags/4.13.1-fork', 'tag', 'false', 'false', true],
+        'future fork release' => ['4.14.0-fork', 'refs/tags/4.14.0-fork', 'tag', 'false', 'false', true],
+        'legacy numbered fork release' => ['4.13.1-fork.1', 'refs/tags/4.13.1-fork.1', 'tag', 'false', 'false', false],
+        'zero fork release' => ['4.13.1-fork.0', 'refs/tags/4.13.1-fork.0', 'tag', 'false', 'false', false],
+        'v-prefixed alias' => ['4.13.1-fork', 'refs/tags/v4.13.1-fork', 'tag', 'false', 'false', false],
+        'branch ref' => ['4.13.1-fork', 'refs/heads/main', 'branch', 'false', 'false', false],
+        'latest publication' => ['4.13.1-fork', 'refs/tags/4.13.1-fork', 'tag', 'true', 'false', false],
+        'validate-only publication' => ['4.13.1-fork', 'refs/tags/4.13.1-fork', 'tag', 'false', 'true', false],
     ];
 
     foreach ($cases as $description => [$version, $ref, $refType, $publishLatest, $validateOnly, $successful]) {
@@ -2669,14 +2676,14 @@ it('requires both fork application version sources to exactly match the immutabl
         $cases = [
             'matching version sources' => [$constants, $versions, true, ''],
             'constants version mismatch' => [
-                str_replace("'4.13.0-fork.1'", "'4.13.0-fork.2'", $constants),
+                str_replace("'4.13.1-fork'", "'4.13.2-fork'", $constants),
                 $versions,
                 false,
                 'config/constants.php Coolify version must equal the fork tag',
             ],
             'versions json mismatch' => [
                 $constants,
-                str_replace('"4.13.0-fork.1"', '"4.13.0-fork.2"', $versions),
+                str_replace('"4.13.1-fork"', '"4.13.2-fork"', $versions),
                 false,
                 'versions.json Coolify v4 version must equal the fork tag',
             ],
@@ -2687,7 +2694,7 @@ it('requires both fork application version sources to exactly match the immutabl
             file_put_contents($fixture.'/versions.json', $fixtureVersions);
             $process = new Process(['bash', '-c', $script], $root, [
                 'GITHUB_WORKSPACE' => $fixture,
-                'SEMANTIC_VERSION' => '4.13.0-fork.1',
+                'SEMANTIC_VERSION' => '4.13.1-fork',
             ]);
             $process->run();
 
@@ -2720,7 +2727,7 @@ it('permits only hash-matching known recovery draft assets before semantic promo
         $process->run();
 
         expect($process->isSuccessful())->toBeTrue($process->getErrorOutput())
-            ->and((string) file_get_contents($draft['gh_log']))->toContain('release download 4.13.0-fork.1')
+            ->and((string) file_get_contents($draft['gh_log']))->toContain('release download 4.13.1-fork')
             ->not->toContain('release create');
     } finally {
         $filesystem->remove($fixture);
@@ -2791,7 +2798,7 @@ it('accepts an exact published fork release during pre-promotion retry', functio
         expect($process->isSuccessful())->toBeTrue($process->getErrorOutput())
             ->and($process->getOutput())->toContain('accepting idempotent retry')
             ->and((string) file_get_contents($release['gh_log']))
-            ->toContain('api repos/WilliamAGH/coolify/commits/4.13.0-fork.1 --jq .sha')
+            ->toContain('api repos/WilliamAGH/coolify/commits/4.13.1-fork --jq .sha')
             ->not->toContain('release create');
     } finally {
         $filesystem->remove($fixture);
@@ -2874,9 +2881,9 @@ it('reconciles ambiguous fork release publication and accepts exact published re
             $ghLog = (string) file_get_contents($release['gh_log']);
             expect($process->isSuccessful())->toBeTrue($kind.': '.$process->getErrorOutput()."\n".$ghLog)
                 ->and(trim((string) file_get_contents($release['state'])))->toBe('false')
-                ->and(substr_count($ghLog, 'release edit 4.13.0-fork.1'))->toBe($expectedEdits)
+                ->and(substr_count($ghLog, 'release edit 4.13.1-fork'))->toBe($expectedEdits)
                 ->and($ghLog)->not->toContain('release upload')
-                ->toContain('api repos/WilliamAGH/coolify/commits/4.13.0-fork.1 --jq .sha');
+                ->toContain('api repos/WilliamAGH/coolify/commits/4.13.1-fork --jq .sha');
         } finally {
             $filesystem->remove($fixture);
         }
@@ -2983,11 +2990,11 @@ it('recovers a split fork semantic promotion without overwriting its matching pe
         expect($process->isSuccessful())->toBeTrue($process->getErrorOutput())
             ->and($process->getOutput())->toContain('accepting recovery state')
             ->and($registryLog)
-            ->not->toContain('image copy docker.iocloudhost.net/williamagh/coolify@'.releaseWorkflowTestDigest('3').' docker.iocloudhost.net/williamagh/coolify:4.13.0-fork.1')
-            ->toContain('image copy docker.iocloudhost.net/williamagh/coolify-realtime@'.releaseWorkflowTestDigest('6').' docker.iocloudhost.net/williamagh/coolify-realtime:4.13.0-fork.1')
+            ->not->toContain('image copy docker.iocloudhost.net/williamagh/coolify@'.releaseWorkflowTestDigest('3').' docker.iocloudhost.net/williamagh/coolify:4.13.1-fork')
+            ->toContain('image copy docker.iocloudhost.net/williamagh/coolify-realtime@'.releaseWorkflowTestDigest('6').' docker.iocloudhost.net/williamagh/coolify-realtime:4.13.1-fork')
             ->and(trim((string) file_get_contents($registry['state'].'/main')))->toBe(releaseWorkflowTestDigest('3'))
             ->and(trim((string) file_get_contents($registry['state'].'/realtime')))->toBe(releaseWorkflowTestDigest('6'))
-            ->and(substr_count((string) file_get_contents($registry['curl_log']), '/git/ref/tags/4.13.0-fork.1'))->toBe(2)
+            ->and(substr_count((string) file_get_contents($registry['curl_log']), '/git/ref/tags/4.13.1-fork'))->toBe(2)
             ->and(substr_count((string) file_get_contents($registry['curl_log']), 'rulesets?targets=tag&includes_parents=true&per_page=100'))->toBe(2);
     } finally {
         $filesystem->remove($fixture);

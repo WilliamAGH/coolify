@@ -39,7 +39,7 @@ it('has correct job configuration', function () {
 
 it('does not contact or cache upstream update metadata for a fork release', function () {
     $this->settings->update(['new_version_available' => true]);
-    config(['constants.coolify.version' => '4.13.0-fork.1']);
+    config(['constants.coolify.version' => '4.13.1-fork']);
     Http::preventStrayRequests();
     Illuminate\Support\Facades\Log::shouldReceive('warning')
         ->once()

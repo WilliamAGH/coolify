@@ -435,6 +435,18 @@ assert_release_manifest_preflight_rejections()
         fail 'tampered release manifest was not rejected before Docker or Compose'
     fi
 
+    if PATH="$release_preflight_bin:$PATH" \
+        CONTROL_PLANE_RELEASE_PREFLIGHT_DOCKER_MARKER="$release_preflight_docker_marker" \
+        CONTROL_PLANE_TEST_REHEARSAL_COMPOSE_FILE_SHA256=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff \
+        "$OPERATOR" preflight > "$release_preflight_output" 2>&1; then
+        fail 'operator accepted a migration-rehearsal executor with a stale digest'
+    fi
+    if [ -e "$release_preflight_docker_marker" ] \
+        || ! grep -F -q 'migration-rehearsal executor differs from its pinned digest' \
+            "$release_preflight_output"; then
+        fail 'stale migration-rehearsal executor digest was not rejected before Docker or Compose'
+    fi
+
 }
 
 write_sanitized_probe_headers()
@@ -1770,9 +1782,10 @@ prepare_proxy_enrollment_lab()
             ;;
         legacy)
             replace_lab_traefik_static_config "$proxy_enrollment_legacy_static_config"
-            docker compose --ansi never --project-name "$project_name" \
-                --file "$proxy_enrollment_legacy_proxy_compose" \
-                up --detach --force-recreate --no-build --pull never --no-deps proxy >/dev/null
+            docker rm --force "$CONTROL_PLANE_PROXY_CONTAINER" >/dev/null
+            if docker inspect "$CONTROL_PLANE_PROXY_CONTAINER" >/dev/null 2>&1; then
+                fail 'native proxy identity remained while preparing the legacy APP_PORT owner'
+            fi
             CONTROL_PLANE_SOURCE_COMPOSE_CUSTOM=$proxy_enrollment_source_custom
             export CONTROL_PLANE_SOURCE_COMPOSE_CUSTOM
             docker compose --ansi never --project-name "$CONTROL_PLANE_SOURCE_COMPOSE_PROJECT" \
@@ -1781,6 +1794,9 @@ prepare_proxy_enrollment_lab()
                 --file "$CONTROL_PLANE_SOURCE_COMPOSE_CUSTOM" \
                 up --detach --force-recreate --no-build --pull never --no-deps \
                 "$CONTROL_PLANE_SOURCE_COMPOSE_SERVICE" >/dev/null
+            docker compose --ansi never --project-name "$project_name" \
+                --file "$proxy_enrollment_legacy_proxy_compose" \
+                up --detach --force-recreate --no-build --pull never --no-deps proxy >/dev/null
             ;;
         *) fail 'proxy-enrollment fixture requested an unknown topology' ;;
     esac

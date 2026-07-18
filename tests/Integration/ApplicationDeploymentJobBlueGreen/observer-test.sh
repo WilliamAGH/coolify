@@ -41,6 +41,7 @@ mock_bin="$work_directory/bin"
 route="$coolify_data/proxy/dynamic/coolify-blue-green-race.yaml"
 compose="$coolify_data/applications/fixture/docker-compose.yaml"
 cp_fault_count="$work_directory/cp-fault-count"
+stale_copied_route="$work_directory/stale-copied-route.yaml"
 install -d "$coolify_data/proxy/dynamic" "$coolify_data/applications/fixture" \
     "$runtime_evidence" "$mock_bin"
 printf 'http:\n  revision: seeded\n' >"$route"
@@ -75,6 +76,7 @@ if [ "$1" = "$OBSERVER_TEST_CP_FAULT_SOURCE" ]; then
         exit 1
     fi
     if [ "$fault_count" -eq 2 ]; then
+        "$OBSERVER_TEST_REAL_CP" "$1" "$OBSERVER_TEST_STALE_COPIED_ROUTE"
         "$OBSERVER_TEST_REAL_CP" "$@"
         printf '# successful-copy-race\n' >>"$1"
         printf '3\n' >"$OBSERVER_TEST_CP_FAULT_COUNT"
@@ -92,6 +94,7 @@ env \
     OBSERVER_TEST_CP_FAULT_COUNT="$cp_fault_count" \
     OBSERVER_TEST_CP_FAULT_SOURCE="$route" \
     OBSERVER_TEST_REAL_CP="$(command -v cp)" \
+    OBSERVER_TEST_STALE_COPIED_ROUTE="$stale_copied_route" \
     PATH="$mock_bin:$PATH" \
     sh "$script_directory/observer.sh" >"$observer_log" 2>&1 &
 observer_pid=$!
@@ -121,7 +124,34 @@ while [ "$(cat "$runtime_evidence/observer-heartbeat")" = "$fault_heartbeat" ]; 
     [ "$attempt" -lt 100 ]
     sleep 0.02
 done
-jq -s -e 'any(.[]; .present == true)' "$runtime_evidence/proxy-route.jsonl" >/dev/null
+grep -Fx '# successful-copy-race' "$route" >/dev/null
+if grep -Fx '# successful-copy-race' "$stale_copied_route" >/dev/null; then
+    exit 1
+fi
+post_race_route_sha=$(sha256sum "$route" | awk '{print $1}')
+stale_copied_route_sha=$(sha256sum "$stale_copied_route" | awk '{print $1}')
+[ "$post_race_route_sha" != "$stale_copied_route_sha" ]
+post_race_snapshot="$runtime_evidence/proxy-route-$post_race_route_sha.yaml"
+
+attempt=0
+until [ -s "$post_race_snapshot" ]; do
+    require_observer_running
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 100 ]
+    sleep 0.02
+done
+
+assert_world_readable_evidence "$post_race_snapshot"
+[ "$(sha256sum "$post_race_snapshot" | awk '{print $1}')" = "$post_race_route_sha" ]
+cmp -s "$route" "$post_race_snapshot"
+jq -s -e \
+    --arg postRaceSha "$post_race_route_sha" \
+    --arg staleCopiedRouteSha "$stale_copied_route_sha" \
+    'map(select(.present == true)) as $accepted
+    | ($accepted | length == 1)
+    and ($accepted[0].sha256 == $postRaceSha)
+    and ([ $accepted[] | select(.sha256 == $staleCopiedRouteSha) ] | length == 0)' \
+    "$runtime_evidence/proxy-route.jsonl" >/dev/null
 
 iteration=0
 while [ "$iteration" -lt 200 ]; do

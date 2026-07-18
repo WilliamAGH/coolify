@@ -578,6 +578,10 @@ reap_stale_candidate()
     local candidate_operation candidate_created current_unix
 
     if ! docker inspect "$candidate_runtime_container" >/dev/null 2>&1; then
+        capture_orphaned_candidate_secrets \
+            || fail 'orphaned candidate secret ownership is invalid'
+        delete_captured_candidate_secrets \
+            || fail 'orphaned candidate secrets could not be removed'
         reap_stale_candidate_resources
         return 0
     fi
@@ -595,8 +599,145 @@ reap_stale_candidate()
     current_unix=$(date +%s)
     (( current_unix - candidate_created > stale_work_max_age_seconds )) \
         || fail 'candidate runtime container already exists and is not stale'
-    docker rm -f "$candidate_runtime_container" >/dev/null
+    capture_owned_candidate_secrets "$candidate_runtime_container" \
+        || fail 'stale candidate secret ownership is invalid'
+    docker rm -f "$candidate_runtime_container" >/dev/null \
+        || fail 'stale candidate runtime container could not be removed'
+    delete_captured_candidate_secrets \
+        || fail 'stale candidate secrets could not be removed'
     reap_stale_candidate_resources
+}
+
+capture_owned_candidate_secrets()
+{
+    local candidate_container=$1 secret_directory owner_file direct_source ack_source entry
+    local expected_secret_identity
+
+    captured_candidate_secret_container=
+    captured_candidate_secret_directory=
+    captured_candidate_secret_owner_file=
+    captured_candidate_direct_probe_source=
+    captured_candidate_applied_ack_source=
+
+    [[ $(docker inspect --format \
+        '{{index .Config.Labels "coolify.control-plane.backup-restore.candidate"}}' \
+        "$candidate_container" 2>/dev/null) == true \
+        && $(docker inspect --format \
+            '{{index .Config.Labels "coolify.control-plane.backup-restore.operation"}}' \
+            "$candidate_container" 2>/dev/null) == "$operation_id" ]] || return 1
+    secret_directory=$(docker inspect --format \
+        '{{with index .Config.Labels "coolify.control-plane.backup-restore.candidate-secrets"}}{{.}}{{end}}' \
+        "$candidate_container" 2>/dev/null) || return 1
+    [[ -n $secret_directory ]] || return 0
+    expected_secret_identity=$(printf '%s:%s' "$operation_id" "$candidate_container" \
+        | sha256sum | awk '{print substr($1, 1, 40)}')
+    [[ $secret_directory == /* \
+        && ${secret_directory##*/} == ".candidate-secrets.$expected_secret_identity" ]] \
+        || return 1
+    (assert_secure_directory "$secret_directory") >/dev/null 2>&1 || return 1
+    owner_file="$secret_directory/.backup-restore-candidate-owner"
+    (assert_root_file "$owner_file" 400) >/dev/null 2>&1 || return 1
+    (validate_key_order "$owner_file" 'operation_id candidate_runtime_container') \
+        >/dev/null 2>&1 || return 1
+    [[ $(field_value "$owner_file" operation_id) == "$operation_id" \
+        && $(field_value "$owner_file" candidate_runtime_container) == "$candidate_container" ]] \
+        || return 1
+    direct_source=$(docker inspect --format \
+        '{{range .Mounts}}{{if eq .Destination "/run/secrets/control-plane-direct-probe-token"}}{{.Source}}{{end}}{{end}}' \
+        "$candidate_container" 2>/dev/null) || return 1
+    ack_source=$(docker inspect --format \
+        '{{range .Mounts}}{{if eq .Destination "/run/secrets/control-plane-applied-ack"}}{{.Source}}{{end}}{{end}}' \
+        "$candidate_container" 2>/dev/null) || return 1
+    [[ $direct_source == "$secret_directory/direct-probe-token" \
+        && $ack_source == "$secret_directory/applied-ack" ]] || return 1
+    (assert_root_file "$direct_source" 444) >/dev/null 2>&1 || return 1
+    (assert_root_file "$ack_source" 444) >/dev/null 2>&1 || return 1
+    while IFS= read -r entry; do
+        case ${entry##*/} in
+            .backup-restore-candidate-owner|direct-probe-token|applied-ack) ;;
+            *) return 1 ;;
+        esac
+    done < <(find "$secret_directory" -xdev -mindepth 1 -maxdepth 1 -print)
+    captured_candidate_secret_container=$candidate_container
+    captured_candidate_secret_directory=$secret_directory
+    captured_candidate_secret_owner_file=$owner_file
+    captured_candidate_direct_probe_source=$direct_source
+    captured_candidate_applied_ack_source=$ack_source
+}
+
+capture_orphaned_candidate_secrets()
+{
+    local token_file=${CONTROL_PLANE_GREEN_DIRECT_PROBE_TOKEN_FILE:-}
+    local secret_directory owner_file direct_source ack_source entry expected_secret_identity
+
+    captured_candidate_secret_container=
+    captured_candidate_secret_directory=
+    captured_candidate_secret_owner_file=
+    captured_candidate_direct_probe_source=
+    captured_candidate_applied_ack_source=
+    [[ -n $token_file ]] || return 0
+    [[ $token_file == /* ]] || return 1
+    expected_secret_identity=$(printf '%s:%s' "$operation_id" "$candidate_runtime_container" \
+        | sha256sum | awk '{print substr($1, 1, 40)}')
+    secret_directory="$(dirname "$token_file")/.candidate-secrets.$expected_secret_identity"
+    [[ -e $secret_directory || -L $secret_directory ]] || return 0
+    (assert_secure_directory "$secret_directory") >/dev/null 2>&1 || return 1
+    owner_file="$secret_directory/.backup-restore-candidate-owner"
+    (assert_root_file "$owner_file" 400) >/dev/null 2>&1 || return 1
+    (validate_key_order "$owner_file" 'operation_id candidate_runtime_container') \
+        >/dev/null 2>&1 || return 1
+    [[ $(field_value "$owner_file" operation_id) == "$operation_id" \
+        && $(field_value "$owner_file" candidate_runtime_container) == \
+            "$candidate_runtime_container" ]] || return 1
+    direct_source="$secret_directory/direct-probe-token"
+    ack_source="$secret_directory/applied-ack"
+    (assert_root_file "$direct_source" 444) >/dev/null 2>&1 || return 1
+    (assert_root_file "$ack_source" 444) >/dev/null 2>&1 || return 1
+    while IFS= read -r entry; do
+        case ${entry##*/} in
+            .backup-restore-candidate-owner|direct-probe-token|applied-ack) ;;
+            *) return 1 ;;
+        esac
+    done < <(find "$secret_directory" -xdev -mindepth 1 -maxdepth 1 -print)
+    captured_candidate_secret_container=$candidate_runtime_container
+    captured_candidate_secret_directory=$secret_directory
+    captured_candidate_secret_owner_file=$owner_file
+    captured_candidate_direct_probe_source=$direct_source
+    captured_candidate_applied_ack_source=$ack_source
+}
+
+delete_captured_candidate_secrets()
+{
+    local entry
+
+    [[ -n $captured_candidate_secret_directory ]] || return 0
+    (assert_secure_directory "$captured_candidate_secret_directory") \
+        >/dev/null 2>&1 || return 1
+    (assert_root_file "$captured_candidate_secret_owner_file" 400) \
+        >/dev/null 2>&1 || return 1
+    (validate_key_order "$captured_candidate_secret_owner_file" \
+        'operation_id candidate_runtime_container') >/dev/null 2>&1 || return 1
+    [[ $(field_value "$captured_candidate_secret_owner_file" operation_id) == "$operation_id" \
+        && $(field_value "$captured_candidate_secret_owner_file" \
+            candidate_runtime_container) == "$captured_candidate_secret_container" \
+        && $captured_candidate_direct_probe_source == \
+            "$captured_candidate_secret_directory/direct-probe-token" \
+        && $captured_candidate_applied_ack_source == \
+            "$captured_candidate_secret_directory/applied-ack" ]] || return 1
+    (assert_root_file "$captured_candidate_direct_probe_source" 444) \
+        >/dev/null 2>&1 || return 1
+    (assert_root_file "$captured_candidate_applied_ack_source" 444) \
+        >/dev/null 2>&1 || return 1
+    while IFS= read -r entry; do
+        case ${entry##*/} in
+            .backup-restore-candidate-owner|direct-probe-token|applied-ack) ;;
+            *) return 1 ;;
+        esac
+    done < <(find "$captured_candidate_secret_directory" -xdev -mindepth 1 \
+        -maxdepth 1 -print)
+    rm -f -- "$captured_candidate_direct_probe_source" \
+        "$captured_candidate_applied_ack_source" "$captured_candidate_secret_owner_file"
+    rmdir -- "$captured_candidate_secret_directory"
 }
 
 cleanup_owned_candidate_resources()
@@ -631,14 +772,21 @@ cleanup_owned_candidate_resources()
 
 cleanup_after_failure()
 {
-    local exit_status=$?
+    local exit_status=$? candidate_secrets_captured=0
 
     trap - EXIT HUP INT TERM
 
     if [[ ${restore_succeeded:-0} != 1 && $command_name == restore ]]; then
         if [[ ${candidate_was_absent:-0} == 1 ]] \
             && docker inspect "$candidate_runtime_container" >/dev/null 2>&1; then
-            docker rm -f "$candidate_runtime_container" >/dev/null 2>&1 || true
+            if capture_owned_candidate_secrets "$candidate_runtime_container" \
+                >/dev/null 2>&1; then
+                candidate_secrets_captured=1
+            fi
+            if docker rm -f "$candidate_runtime_container" >/dev/null 2>&1 \
+                && [[ $candidate_secrets_captured == 1 ]]; then
+                delete_captured_candidate_secrets >/dev/null 2>&1 || true
+            fi
         fi
         cleanup_restore_redis
         cleanup_owned_candidate_resources
