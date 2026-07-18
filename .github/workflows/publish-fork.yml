@@ -86,6 +86,7 @@ jobs:
       attestations: write
       contents: write
       id-token: write
+      packages: write
     with:
       artifact_name: coolify-fork
       candidate_repository: williamagh/coolify-fork-candidates

@@ -244,6 +244,7 @@ jobs:
           LAB_TRAEFIK_PORT='18080' \
           LAB_DYNAMIC_DIR="$GITHUB_WORKSPACE" \
           LAB_TRAEFIK_STATIC_CONFIG="$fixture_env_file" \
+          LAB_TRAEFIK_TLS_DIRECTORY="$GITHUB_WORKSPACE" \
           CONTROL_PLANE_HOST='compose-validation.example.test' \
           CONTROL_PLANE_DATABASE_CONTAINER='compose-validation-database' \
           CONTROL_PLANE_REHEARSAL_DATABASE_CONTAINER='compose-validation-rehearsal-database' \

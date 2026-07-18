@@ -1408,7 +1408,7 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
     $publicationPermissions = [
         'artifact-metadata' => 'write',
         'attestations' => 'write',
-        'contents' => 'read',
+        'contents' => 'write',
         'id-token' => 'write',
         'packages' => 'write',
     ];
@@ -2555,7 +2555,13 @@ it('defines one referrerless fork release graph for both images and both platfor
         'FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY',
         'NEXUS_PASSWORD',
         'NEXUS_USERNAME',
-    ])->and($publish['permissions']['contents'] ?? null)->toBe('write')
+    ])->and($publish['permissions'] ?? null)->toBe([
+        'artifact-metadata' => 'write',
+        'attestations' => 'write',
+        'contents' => 'write',
+        'id-token' => 'write',
+        'packages' => 'write',
+    ])
         ->and((string) file_get_contents($root.'/.github/workflows/publish-linux-image.yml'))
         ->not->toContain('FORK_RELEASE_SIGNING_KEY_ID')
         ->and((string) file_get_contents($root.'/.github/workflows/publish-fork.yml'))

@@ -62,8 +62,13 @@ services:
     tmpfs:
       - /tmp
     volumes:
-      - "${CONTROL_PLANE_MIGRATION_REPOSITORY:?repository path is required}:/workspace:ro"
-      - "${CONTROL_PLANE_MIGRATION_BASELINE:?baseline path is required}:/baseline"
+      - type: bind
+        source: "${CONTROL_PLANE_MIGRATION_REPOSITORY:?repository path is required}"
+        target: /workspace
+        read_only: true
+      - type: bind
+        source: "${CONTROL_PLANE_MIGRATION_BASELINE:?baseline path is required}"
+        target: /baseline
       - runner-storage:/workspace/storage
       - runner-bootstrap-cache:/workspace/bootstrap/cache
     depends_on:

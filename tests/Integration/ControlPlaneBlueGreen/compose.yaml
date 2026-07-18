@@ -11,9 +11,18 @@ services:
       - "127.0.0.1:8000:8000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - "${LAB_DYNAMIC_DIR:?LAB_DYNAMIC_DIR is required}:/traefik/dynamic:ro"
-      - "${LAB_TRAEFIK_STATIC_CONFIG:?LAB_TRAEFIK_STATIC_CONFIG is required}:/etc/traefik/traefik.yml:ro"
-      - "${LAB_TRAEFIK_TLS_DIRECTORY:?LAB_TRAEFIK_TLS_DIRECTORY is required}:/etc/traefik/tls:ro"
+      - type: bind
+        source: "${LAB_DYNAMIC_DIR:?LAB_DYNAMIC_DIR is required}"
+        target: /traefik/dynamic
+        read_only: true
+      - type: bind
+        source: "${LAB_TRAEFIK_STATIC_CONFIG:?LAB_TRAEFIK_STATIC_CONFIG is required}"
+        target: /etc/traefik/traefik.yml
+        read_only: true
+      - type: bind
+        source: "${LAB_TRAEFIK_TLS_DIRECTORY:?LAB_TRAEFIK_TLS_DIRECTORY is required}"
+        target: /etc/traefik/tls
+        read_only: true
     networks:
       - lab
 

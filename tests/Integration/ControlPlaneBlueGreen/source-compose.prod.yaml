@@ -28,9 +28,21 @@ services:
         source: "${CONTROL_PLANE_SOURCE_ENV_FILE:?CONTROL_PLANE_SOURCE_ENV_FILE is required}"
         target: /var/www/html/.env
         read_only: true
-      - "${CONTROL_PLANE_SSH_DIRECTORY:?CONTROL_PLANE_SSH_DIRECTORY is required}:/var/www/html/storage/app/ssh"
-      - "${CONTROL_PLANE_APPLICATIONS_DIRECTORY:?CONTROL_PLANE_APPLICATIONS_DIRECTORY is required}:/var/www/html/storage/app/applications"
-      - "${CONTROL_PLANE_DATABASES_DIRECTORY:?CONTROL_PLANE_DATABASES_DIRECTORY is required}:/var/www/html/storage/app/databases"
-      - "${CONTROL_PLANE_SERVICES_DIRECTORY:?CONTROL_PLANE_SERVICES_DIRECTORY is required}:/var/www/html/storage/app/services"
-      - "${CONTROL_PLANE_BACKUPS_DIRECTORY:?CONTROL_PLANE_BACKUPS_DIRECTORY is required}:/var/www/html/storage/app/backups"
-      - "${LAB_RUNTIME_STATE_DIR:?LAB_RUNTIME_STATE_DIR is required}:/lab-state"
+      - type: bind
+        source: "${CONTROL_PLANE_SSH_DIRECTORY:?CONTROL_PLANE_SSH_DIRECTORY is required}"
+        target: /var/www/html/storage/app/ssh
+      - type: bind
+        source: "${CONTROL_PLANE_APPLICATIONS_DIRECTORY:?CONTROL_PLANE_APPLICATIONS_DIRECTORY is required}"
+        target: /var/www/html/storage/app/applications
+      - type: bind
+        source: "${CONTROL_PLANE_DATABASES_DIRECTORY:?CONTROL_PLANE_DATABASES_DIRECTORY is required}"
+        target: /var/www/html/storage/app/databases
+      - type: bind
+        source: "${CONTROL_PLANE_SERVICES_DIRECTORY:?CONTROL_PLANE_SERVICES_DIRECTORY is required}"
+        target: /var/www/html/storage/app/services
+      - type: bind
+        source: "${CONTROL_PLANE_BACKUPS_DIRECTORY:?CONTROL_PLANE_BACKUPS_DIRECTORY is required}"
+        target: /var/www/html/storage/app/backups
+      - type: bind
+        source: "${LAB_RUNTIME_STATE_DIR:?LAB_RUNTIME_STATE_DIR is required}"
+        target: /lab-state

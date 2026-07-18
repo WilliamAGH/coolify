@@ -12,7 +12,9 @@ services:
       PGOPTIONS: "-c lock_timeout=${CONTROL_PLANE_MIGRATION_LOCK_TIMEOUT:?CONTROL_PLANE_MIGRATION_LOCK_TIMEOUT is required} -c statement_timeout=${CONTROL_PLANE_MIGRATION_STATEMENT_TIMEOUT:?CONTROL_PLANE_MIGRATION_STATEMENT_TIMEOUT is required}"
     entrypoint: ["/usr/local/bin/rehearse-migration"]
     volumes:
-      - "${LAB_RUNTIME_STATE_DIR:?LAB_RUNTIME_STATE_DIR is required}:/lab-state"
+      - type: bind
+        source: "${LAB_RUNTIME_STATE_DIR:?LAB_RUNTIME_STATE_DIR is required}"
+        target: /lab-state
     networks:
       - rehearsal
 
@@ -50,7 +52,9 @@ services:
       io.coolify.control-plane.migration-attempt-lock: "${CONTROL_PLANE_MIGRATION_ATTEMPT_LOCK_IDENTITY:-unused}"
     entrypoint: ["/usr/local/bin/rehearse-migration"]
     volumes:
-      - "${LAB_RUNTIME_STATE_DIR:?LAB_RUNTIME_STATE_DIR is required}:/lab-state"
+      - type: bind
+        source: "${LAB_RUNTIME_STATE_DIR:?LAB_RUNTIME_STATE_DIR is required}"
+        target: /lab-state
     networks:
       - lab
 

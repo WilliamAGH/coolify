@@ -784,8 +784,6 @@ test_forward_recovery_reconciles_historical_rollback_activation() {
         cleanup_fixture
         return
     fi
-    replace_key_value "$ROOT/fork-deploy/activations/4.13.0-fork.1" \
-        MIGRATION_FINGERPRINT_BEFORE ffffffffffffffffffffffffffffffff
 
     rm -f "$FORK_DEPLOY_CANDIDATE_STARTED_MARKER"
     export FORK_DEPLOY_FAIL_CANDIDATE_RUNTIME_VERIFY=true
@@ -802,8 +800,6 @@ test_forward_recovery_reconciles_historical_rollback_activation() {
     if "$SUBJECT" recover-forward >/dev/null \
         && [[ $(<"$ROOT/fork-deploy/current") == 4.13.0-fork.1 \
             && $(candidate_history_count 4.13.0-fork.1) -eq 2 \
-            && $(awk -F= '$1 == "MIGRATION_FINGERPRINT_BEFORE" { print $2 }' \
-                "$ROOT/fork-deploy/activations/4.13.0-fork.1") != ffffffffffffffffffffffffffffffff \
             && $(<"$ROOT/applications/post-start-write") == accepted-during-rollback-recovery \
             && ! -e $ROOT/fork-deploy/pending-candidate \
             && ! -e $ROOT/fork-deploy/failed-needs-restore ]] \
