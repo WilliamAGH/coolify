@@ -296,7 +296,7 @@ for container_id in $(jq -r '.drainedContainerId[]' "$EVIDENCE_DIRECTORY/report.
         --argjson firstTombstoneAt "$first_tombstone_at" \
         --argjson firstNotFoundAt "$first_not_found_at" \
         --argjson lastStreamEndedAt "$last_stream_ended_at" \
-        'map(select(.id == $containerId and .action == "stop"))[0].timeNano / 1000000 as $stop
+        '(map(select(.id == $containerId and .action == "stop"))[0].timeNano / 1000000) as $stop
             | $stop > $firstTombstoneAt and $stop > $lastStreamEndedAt and $stop < $firstNotFoundAt' \
         "$EVIDENCE_DIRECTORY/docker-events.jsonl" >/dev/null \
         || fail 'managed target stop did not follow tombstone ACK and stream drain before final route absence'
