@@ -18,8 +18,8 @@ LAB_INVOCATION_TOKEN=$(printf '%s' "$LAB_ROOT" | sha256sum | awk '{print substr(
 LAB_PORT_SLOT=
 LAB_PORT_BASE=20000
 LAB_PORT_BAND_COUNT=8
-LAB_PORT_BAND_WIDTH=42
-LAB_PORT_MAX_SCENARIO=41
+LAB_PORT_BAND_WIDTH=45
+LAB_PORT_MAX_SCENARIO=44
 LAB_PORT_BLOCK_WIDTH=$((LAB_PORT_BAND_COUNT * LAB_PORT_BAND_WIDTH))
 LAB_PORT_SLOT_COUNT=$(((65535 - LAB_PORT_BASE - \
     ((LAB_PORT_BAND_COUNT - 1) * LAB_PORT_BAND_WIDTH + LAB_PORT_MAX_SCENARIO)) \
@@ -1537,6 +1537,12 @@ with_lab()
     scenario_name=$1
     scenario_number=$2
     scenario_function=$3
+    case "$scenario_number" in
+        ''|*[!0-9]*) fail "invalid lab scenario number: $scenario_number" ;;
+    esac
+    [ "$scenario_number" -ge 1 ] \
+        && [ "$scenario_number" -le "$LAB_PORT_MAX_SCENARIO" ] \
+        || fail "lab scenario number exceeds the reserved port band: $scenario_number"
 
     start_lab "$scenario_name" "$scenario_number"
     "$scenario_function"
