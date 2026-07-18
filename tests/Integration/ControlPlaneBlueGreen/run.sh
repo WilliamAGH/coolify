@@ -5,7 +5,6 @@ set -eu
 LAB_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 REPOSITORY_ROOT=$(CDPATH='' cd -- "$LAB_DIRECTORY/../../.." && pwd -P)
 OPERATOR="$REPOSITORY_ROOT/docker/control-plane-blue-green/control-plane-blue-green.sh"
-RELEASE_INSTALLER="$REPOSITORY_ROOT/docker/control-plane-blue-green/install-host-release-bundle.sh"
 if [ -n "${CONTROL_PLANE_BLUE_GREEN_LAB_DIR:-}" ]; then
     mkdir -p "$CONTROL_PLANE_BLUE_GREEN_LAB_DIR"
     LAB_ROOT=$(mktemp -d "$CONTROL_PLANE_BLUE_GREEN_LAB_DIR/invocation.XXXXXX")
@@ -295,6 +294,7 @@ install_lab_release_manifest()
 {
     release_source_root="$scenario_directory/release-source"
     cp -R "$REPOSITORY_ROOT/docker/control-plane-blue-green" "$release_source_root"
+    release_installer="$release_source_root/install-host-release-bundle.sh"
     release_host_root="$scenario_directory/release-host"
     mkdir "$release_host_root"
     chmod 0700 "$release_host_root"
@@ -312,7 +312,7 @@ install_lab_release_manifest()
     release_install_output=$(CONTROL_PLANE_RELEASE_BUNDLE_TEST_MODE=1 \
         CONTROL_PLANE_RELEASE_BUNDLE_TEST_ROOT="$release_host_root" \
         CONTROL_PLANE_RELEASE_BUNDLE_SOURCE_ROOT="$release_source_root" \
-        "$RELEASE_INSTALLER" "$CONTROL_PLANE_RELEASE_ID")
+        "$release_installer" "$CONTROL_PLANE_RELEASE_ID")
 
     release_manifest_uid=$(id -u)
     release_manifest_gid=$(id -g)
