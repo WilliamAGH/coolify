@@ -3,17 +3,19 @@
 set -Eeuo pipefail
 umask 077
 
+SCRIPT_DIRECTORY=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+readonly SCRIPT_DIRECTORY
 readonly CONFIG_DIRECTORY=/etc/coolify-runtime-attestation-ssh-fence
 readonly RUNTIME_ENV=$CONFIG_DIRECTORY/runtime.env
-readonly CONTROLLER=/usr/local/libexec/coolify-runtime-attestation-ssh-fence
-readonly REAPER=/usr/local/libexec/coolify-self-ssh-controlmaster-reaper
-readonly PROVIDER_PROBE=/usr/local/libexec/coolify-traefik-provider-freshness-probe
-readonly QUEUE_PROBE=/usr/local/libexec/coolify-proxy-queue-zero-probe
-readonly TERMINAL_PROBE=/usr/local/libexec/coolify-control-plane-terminal-state-probe
+readonly CONTROLLER="$SCRIPT_DIRECTORY/runtime-attestation-ssh-fence.sh"
+readonly REAPER="$SCRIPT_DIRECTORY/self-ssh-controlmaster-reaper.sh"
+readonly PROVIDER_PROBE="$SCRIPT_DIRECTORY/traefik-docker-provider-freshness-probe.sh"
+readonly QUEUE_PROBE="$SCRIPT_DIRECTORY/proxy-queue-zero-probe.sh"
+readonly TERMINAL_PROBE="$SCRIPT_DIRECTORY/control-plane-terminal-state-probe.sh"
 readonly RESTORE_SERVICE=coolify-runtime-attestation-ssh-fence.service
 readonly WATCHDOG_SERVICE=coolify-runtime-attestation-ssh-fence-watchdog.service
 readonly TRANSACTION_LOCK=/run/lock/coolify-runtime-attestation-ssh-fence-provision.lock
-readonly SEMANTIC_KEYS='CONTROL_PLANE_RUNTIME_OPERATION_ID CONTROL_PLANE_RUNTIME_PROXY_CONTAINER CONTROL_PLANE_RUNTIME_POOL_PLAN_MANIFEST CONTROL_PLANE_RUNTIME_POOL_PLAN_MANIFEST_SHA256 CONTROL_PLANE_RUNTIME_POOL_PLAN_MANIFEST_METADATA CONTROL_PLANE_RUNTIME_MANAGEMENT_ENDPOINTS CONTROL_PLANE_RUNTIME_ADDITIONAL_NETWORK_IDS CONTROL_PLANE_RUNTIME_SELF_SSH_TARGET CONTROL_PLANE_RUNTIME_PROBE_MAX_AGE_SECONDS CONTROL_PLANE_RUNTIME_QUEUE_STABLE_SECONDS CONTROL_PLANE_RUNTIME_PROVIDER_CAPTURE_EXPECTATION CONTROL_PLANE_RUNTIME_PROVIDER_API_URL CONTROL_PLANE_RUNTIME_PROVIDER_ROUTER CONTROL_PLANE_RUNTIME_PROVIDER_SERVICE CONTROL_PLANE_RUNTIME_PROVIDER_LEGACY_PORT CONTROL_PLANE_RUNTIME_PROVIDER_HEADER_FILE CONTROL_PLANE_RUNTIME_TERMINAL_HTTPS_URL CONTROL_PLANE_RUNTIME_TERMINAL_PORT8000_URL'
+readonly SEMANTIC_KEYS='CONTROL_PLANE_RUNTIME_OPERATION_ID CONTROL_PLANE_RUNTIME_PROXY_CONTAINER CONTROL_PLANE_RUNTIME_POOL_PLAN_MANIFEST CONTROL_PLANE_RUNTIME_POOL_PLAN_MANIFEST_SHA256 CONTROL_PLANE_RUNTIME_POOL_PLAN_MANIFEST_METADATA CONTROL_PLANE_RUNTIME_MANAGEMENT_ENDPOINTS CONTROL_PLANE_RUNTIME_ADDITIONAL_NETWORK_IDS CONTROL_PLANE_RUNTIME_SELF_SSH_TARGET CONTROL_PLANE_RUNTIME_PROBE_MAX_AGE_SECONDS CONTROL_PLANE_RUNTIME_QUEUE_STABLE_SECONDS CONTROL_PLANE_RUNTIME_PROVIDER_CAPTURE_EXPECTATION CONTROL_PLANE_RUNTIME_PROVIDER_API_URL CONTROL_PLANE_RUNTIME_PROVIDER_ROUTER CONTROL_PLANE_RUNTIME_PROVIDER_SERVICE CONTROL_PLANE_RUNTIME_PROVIDER_LEGACY_PORT CONTROL_PLANE_RUNTIME_PROVIDER_HEADER_FILE CONTROL_PLANE_RUNTIME_TERMINAL_HTTPS_URL CONTROL_PLANE_RUNTIME_TERMINAL_LOCAL_INGRESS_URL'
 
 fail()
 {
@@ -119,6 +121,17 @@ validate_provider_api_url()
         && [[ $resource =~ $resource_pattern ]]
 }
 
+validate_local_ingress_url()
+{
+    local url=$1 port
+
+    validate_url_value "$url" \
+        && [[ $url =~ ^http://127\.0\.0\.1:([1-9][0-9]{0,4})(/[A-Za-z0-9_./?\&=%~-]*)?$ ]] \
+        || return 1
+    port=${BASH_REMATCH[1]}
+    ((port <= 65535))
+}
+
 validate_management_endpoints_value()
 {
     local value=$1 endpoint interface address
@@ -168,9 +181,8 @@ validate_environment_value()
             [[ -z $value ]] || validate_absolute_path_value "$value" ;;
         CONTROL_PLANE_RUNTIME_TERMINAL_HTTPS_URL)
             validate_url_value "$value" && [[ $value == https://* ]] ;;
-        CONTROL_PLANE_RUNTIME_TERMINAL_PORT8000_URL)
-            validate_url_value "$value" \
-                && [[ $value =~ ^http://(127\.0\.0\.1|\[::1\]):8000(/[A-Za-z0-9_./?&=%~-]*)?$ ]] ;;
+        CONTROL_PLANE_RUNTIME_TERMINAL_LOCAL_INGRESS_URL)
+            validate_local_ingress_url "$value" ;;
         *)
             fail "environment source has an unknown setting: $key" ;;
     esac || fail "environment source has an unsafe value: $key"

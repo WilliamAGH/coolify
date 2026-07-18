@@ -99,8 +99,8 @@ docker image inspect "$PRODUCTION_APPLICATION_BLUE_GREEN_IMAGE" \
     --format '{{json .RepoTags}} {{.Id}}' >"$EVIDENCE_DIRECTORY/image.json"
 
 compose config >"$EVIDENCE_DIRECTORY/compose-config.yaml"
-grep -qF 'traefik:v3.6.17@sha256:802adc80a7bb20a6766c9385c2ad547f0de98564cd20d31d0b6d8f726f906f66' \
-    "$EVIDENCE_DIRECTORY/compose-config.yaml" || fail 'Traefik v3.6.17 is not pinned to the required digest'
+grep -qF 'traefik:v3.6.23@sha256:f5dba1e65167778cd5f8d1b463fc5d200f49d40c6458fc9f4b391a68ebfb9534' \
+    "$EVIDENCE_DIRECTORY/compose-config.yaml" || fail 'Traefik v3.6.23 is not pinned to the required digest'
 
 compose up --detach volume-init production-blue production-green traefik
 compose ps >"$EVIDENCE_DIRECTORY/initial-services.log"

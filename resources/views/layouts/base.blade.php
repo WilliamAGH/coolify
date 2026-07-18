@@ -62,8 +62,10 @@
             display: none !important;
         }
     </style>
-    @if (config('app.name') == 'Coolify Cloud')
+    @if (config('app.name') === 'Coolify Cloud' && config('app.analytics_enabled'))
         <script defer data-domain="app.coolify.io" src="https://analytics.coollabs.io/js/plausible.js"></script>
+    @endif
+    @if (config('app.name') === 'Coolify Cloud')
         <script src="https://js.sentry-cdn.com/0f8593910512b5cdd48c6da78d4093be.min.js" crossorigin="anonymous"></script>
     @endif
     @auth

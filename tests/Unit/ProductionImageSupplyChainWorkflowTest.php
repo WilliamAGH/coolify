@@ -14,6 +14,393 @@ function releaseWorkflowTestDigest(string $character): string
     return 'sha256:'.str_repeat($character, 64);
 }
 
+/**
+ * @return array{curl_log: string, environment: array<string, string>, log: string, state: string}
+ */
+function releaseWorkflowPrepareForkPromotionRegistryDouble(
+    string $fixture,
+    ?string $mainSemanticDigest,
+    ?string $realtimeSemanticDigest,
+): array {
+    $filesystem = new Filesystem;
+    $bin = $fixture.'/bin';
+    $curlLog = $fixture.'/curl.log';
+    $log = $fixture.'/regctl.log';
+    $state = $fixture.'/state';
+    $filesystem->mkdir([$bin, $state]);
+    file_put_contents($curlLog, '');
+    file_put_contents($log, '');
+    file_put_contents($state.'/main', ($mainSemanticDigest ?? 'absent')."\n");
+    file_put_contents($state.'/realtime', ($realtimeSemanticDigest ?? 'absent')."\n");
+    file_put_contents($bin.'/regctl', <<<'SH'
+#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${REGCTL_LOG:?}"
+main=${MAIN_TARGET:?}
+realtime=${REALTIME_TARGET:?}
+semantic=${SEMANTIC_VERSION:?}
+state=${REGCTL_STATE:?}
+
+semantic_digest() {
+    value="$(cat "$1")"
+    if [ "$value" = absent ]; then
+        printf '%s\n' 'manifest unknown' >&2
+        exit 1
+    fi
+    printf '%s\n' "$value"
+}
+
+case "$1:$2" in
+    image:digest)
+        reference=$3
+        case " $* " in
+            *' --platform linux/amd64 '*)
+                case "$reference" in
+                    "$main"@*) printf '%s\n' "$MAIN_AMD64_DIGEST" ;;
+                    "$realtime"@*) printf '%s\n' "$REALTIME_AMD64_DIGEST" ;;
+                    *) exit 64 ;;
+                esac
+                ;;
+            *' --platform linux/arm64 '*)
+                case "$reference" in
+                    "$main"@*) printf '%s\n' "$MAIN_ARM64_DIGEST" ;;
+                    "$realtime"@*) printf '%s\n' "$REALTIME_ARM64_DIGEST" ;;
+                    *) exit 64 ;;
+                esac
+                ;;
+            *)
+                case "$reference" in
+                    "$main:$semantic") semantic_digest "$state/main" ;;
+                    "$realtime:$semantic") semantic_digest "$state/realtime" ;;
+                    "$main"@*) printf '%s\n' "$MAIN_INDEX_DIGEST" ;;
+                    "$realtime"@*) printf '%s\n' "$REALTIME_INDEX_DIGEST" ;;
+                    *) exit 64 ;;
+                esac
+                ;;
+        esac
+        ;;
+    image:config)
+        printf '{"config":{"Labels":{"org.opencontainers.image.source":"%s","org.opencontainers.image.revision":"%s","org.opencontainers.image.version":"%s"}}}\n' "$SOURCE_URL" "$SOURCE_REVISION" "$SEMANTIC_VERSION"
+        ;;
+    manifest:get)
+        printf '{"mediaType":"application/vnd.oci.image.index.v1+json","annotations":{"org.opencontainers.image.source":"%s","org.opencontainers.image.revision":"%s","org.opencontainers.image.version":"%s"}}\n' "$SOURCE_URL" "$SOURCE_REVISION" "$SEMANTIC_VERSION"
+        ;;
+    image:copy)
+        source=$3
+        destination=$4
+        case "$destination" in
+            "$main:$semantic") printf '%s\n' "$MAIN_INDEX_DIGEST" > "$state/main" ;;
+            "$realtime:$semantic") printf '%s\n' "$REALTIME_INDEX_DIGEST" > "$state/realtime" ;;
+            *) exit 64 ;;
+        esac
+        ;;
+    *) exit 64 ;;
+esac
+SH);
+    chmod($bin.'/regctl', 0755);
+    file_put_contents($bin.'/curl', <<<'SH'
+#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${CURL_LOG:?}"
+api="https://api.github.com/repos/${GITHUB_REPOSITORY:?}"
+semantic=${SEMANTIC_VERSION:?}
+source_revision=${GITHUB_SHA:?}
+tag_one=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+tag_two=cccccccccccccccccccccccccccccccccccccccc
+url=''
+for argument in "$@"; do
+    case "$argument" in
+        https://api.github.com/*) url=$argument ;;
+    esac
+done
+
+case "$url" in
+    "$api/git/ref/tags/$semantic")
+        printf '{"ref":"refs/tags/%s","object":{"type":"tag","sha":"%s"}}\n' "$semantic" "$tag_one"
+        ;;
+    "$api/git/tags/$tag_one")
+        printf '{"object":{"type":"tag","sha":"%s"}}\n' "$tag_two"
+        ;;
+    "$api/git/tags/$tag_two")
+        if [ "${FORK_LIVE_TAG_STATE:-matching}" = mismatch ]; then
+            source_revision=dddddddddddddddddddddddddddddddddddddddd
+        fi
+        printf '{"object":{"type":"commit","sha":"%s"}}\n' "$source_revision"
+        ;;
+    "$api/rulesets?targets=tag&includes_parents=true&per_page=100")
+        printf '[{"id":42,"name":"Protect Coolify fork release tags","enforcement":"active"}]\n'
+        ;;
+    "$api/rulesets/42")
+        if [ "${FORK_RULESET_STATE:-matching}" = missing-deletion ]; then
+            printf '{"id":42,"name":"Protect Coolify fork release tags","target":"tag","enforcement":"active","conditions":{"ref_name":{"include":["refs/tags/*.*.*-fork.*"],"exclude":[]}},"rules":[{"type":"creation"},{"type":"update"}]}\n'
+        else
+            printf '{"id":42,"name":"Protect Coolify fork release tags","target":"tag","enforcement":"active","conditions":{"ref_name":{"include":["refs/tags/*.*.*-fork.*"],"exclude":[]}},"rules":[{"type":"creation"},{"type":"update"},{"type":"deletion"}]}\n'
+        fi
+        ;;
+    *)
+        printf 'unexpected curl URL: %s\n' "$url" >&2
+        exit 64
+        ;;
+esac
+SH);
+    chmod($bin.'/curl', 0755);
+
+    return [
+        'curl_log' => $curlLog,
+        'environment' => [
+            'CURL_LOG' => $curlLog,
+            'GITHUB_REF' => 'refs/tags/4.13.0-fork.1',
+            'GITHUB_REPOSITORY' => 'WilliamAGH/coolify',
+            'GITHUB_SHA' => str_repeat('a', 40),
+            'MAIN_AMD64_DIGEST' => releaseWorkflowTestDigest('1'),
+            'MAIN_ARM64_DIGEST' => releaseWorkflowTestDigest('2'),
+            'MAIN_INDEX_DIGEST' => releaseWorkflowTestDigest('3'),
+            'MAIN_TARGET' => 'docker.iocloudhost.net/williamagh/coolify',
+            'PATH' => $bin.PATH_SEPARATOR.(getenv('PATH') ?: ''),
+            'REALTIME_AMD64_DIGEST' => releaseWorkflowTestDigest('4'),
+            'REALTIME_ARM64_DIGEST' => releaseWorkflowTestDigest('5'),
+            'REALTIME_INDEX_DIGEST' => releaseWorkflowTestDigest('6'),
+            'REALTIME_TARGET' => 'docker.iocloudhost.net/williamagh/coolify-realtime',
+            'REGCTL_LOG' => $log,
+            'REGCTL_STATE' => $state,
+            'RUNNER_TEMP' => $fixture,
+            'SEMANTIC_VERSION' => '4.13.0-fork.1',
+            'SOURCE_REVISION' => str_repeat('a', 40),
+            'SOURCE_URL' => 'https://github.com/WilliamAGH/coolify',
+        ],
+        'log' => $log,
+        'state' => $state,
+    ];
+}
+
+/**
+ * @param  list<string>  $draftAssets
+ * @param  array<string, string>  $downloadContents
+ * @return array{environment: array<string, string>, gh_log: string, metadata: string}
+ */
+function releaseWorkflowPrepareForkDraftRecoveryDouble(
+    string $fixture,
+    array $draftAssets,
+    array $downloadContents = [],
+    bool $isDraft = true,
+    ?string $tagTargetCommit = null,
+): array {
+    $filesystem = new Filesystem;
+    $bin = $fixture.'/bin';
+    $bundle = $fixture.'/fork-release-bundles';
+    $downloads = $fixture.'/release-downloads';
+    $metadata = $fixture.'/release-metadata.json';
+    $ghLog = $fixture.'/gh.log';
+    $bundleAssets = [
+        'release-linux-amd64.env' => "PLATFORM=linux/amd64\n",
+        'release-linux-arm64.env' => "PLATFORM=linux/arm64\n",
+    ];
+    $checksumLines = [];
+
+    $filesystem->mkdir([$bin, $bundle, $downloads]);
+    foreach ($bundleAssets as $assetName => $contents) {
+        file_put_contents($bundle.'/'.$assetName, $contents);
+        file_put_contents($downloads.'/'.$assetName, $downloadContents[$assetName] ?? $contents);
+        $checksumLines[] = hash('sha256', $contents).'  ./'.$assetName;
+    }
+    file_put_contents($bundle.'/SHA256SUMS', implode("\n", $checksumLines)."\n");
+    file_put_contents($downloads.'/SHA256SUMS', $downloadContents['SHA256SUMS'] ?? (string) file_get_contents($bundle.'/SHA256SUMS'));
+    file_put_contents($metadata, json_encode([
+        'tagName' => '4.13.0-fork.1',
+        'name' => 'Coolify fork 4.13.0-fork.1',
+        'isDraft' => $isDraft,
+        'isPrerelease' => true,
+        'assets' => array_map(static fn (string $assetName): array => ['name' => $assetName], $draftAssets),
+    ], JSON_THROW_ON_ERROR));
+    file_put_contents($ghLog, '');
+    file_put_contents($bin.'/gh', <<<'SH'
+#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${GH_LOG:?}"
+
+case "$1:$2" in
+    release:view)
+        cat "${DRAFT_RELEASE_METADATA:?}"
+        ;;
+    release:download)
+        shift 2
+        pattern=''
+        directory=''
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --pattern) pattern=$2; shift 2 ;;
+                --dir) directory=$2; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        [ -n "$pattern" ]
+        [ -n "$directory" ]
+        cp "${DRAFT_RELEASE_DOWNLOADS:?}/$pattern" "$directory/$pattern"
+        ;;
+    release:create)
+        printf 'unexpected release creation\n' >&2
+        exit 64
+        ;;
+    api:*)
+        [ "$2" = "repos/${GITHUB_REPOSITORY:?}/commits/${SEMANTIC_VERSION:?}" ]
+        printf '%s\n' "${DRAFT_RELEASE_TAG_TARGET:?}"
+        ;;
+    *)
+        printf 'unexpected gh invocation: %s %s\n' "$1" "$2" >&2
+        exit 64
+        ;;
+esac
+SH);
+    chmod($bin.'/gh', 0755);
+
+    return [
+        'environment' => [
+            'BUNDLE_ARTIFACT_ID' => 'fixture-artifact',
+            'DRAFT_RELEASE_DOWNLOADS' => $downloads,
+            'DRAFT_RELEASE_METADATA' => $metadata,
+            'DRAFT_RELEASE_TAG_TARGET' => $tagTargetCommit ?? str_repeat('a', 40),
+            'GH_CLI' => $bin.'/gh',
+            'GH_LOG' => $ghLog,
+            'GH_TOKEN' => 'fixture-token',
+            'GITHUB_REF' => 'refs/tags/4.13.0-fork.1',
+            'GITHUB_REPOSITORY' => 'WilliamAGH/coolify',
+            'GITHUB_SHA' => str_repeat('a', 40),
+            'RUNNER_TEMP' => $fixture,
+            'SEMANTIC_VERSION' => '4.13.0-fork.1',
+            'SOURCE_REVISION' => str_repeat('a', 40),
+        ],
+        'gh_log' => $ghLog,
+        'metadata' => $metadata,
+    ];
+}
+
+/**
+ * @return array{environment: array<string, string>, gh_log: string, state: string}
+ */
+function releaseWorkflowPrepareForkPublicationDouble(
+    string $fixture,
+    bool $isDraft,
+    string $editMode = 'success',
+    ?string $tagTargetCommit = null,
+): array {
+    $filesystem = new Filesystem;
+    $bin = $fixture.'/bin';
+    $bundle = $fixture.'/fork-release-bundles';
+    $downloads = $fixture.'/release-downloads';
+    $ghLog = $fixture.'/gh.log';
+    $state = $fixture.'/release-state';
+    $bundleAssets = [
+        'release-linux-amd64.env' => "PLATFORM=linux/amd64\n",
+        'release-linux-arm64.env' => "PLATFORM=linux/arm64\n",
+    ];
+
+    $filesystem->mkdir([$bin, $bundle, $downloads]);
+    foreach ($bundleAssets as $assetName => $contents) {
+        file_put_contents($bundle.'/'.$assetName, $contents);
+    }
+    $privateKey = $fixture.'/release-signing-ed25519.pem';
+    (new Process(['openssl', 'genpkey', '-algorithm', 'Ed25519', '-out', $privateKey]))->mustRun();
+    (new Process([
+        'openssl', 'pkey', '-in', $privateKey, '-pubout', '-out', $bundle.'/release-signing-ed25519.pub',
+    ]))->mustRun();
+    foreach (array_keys($bundleAssets) as $manifest) {
+        (new Process([
+            'openssl', 'pkeyutl', '-sign', '-rawin', '-inkey', $privateKey,
+            '-in', $bundle.'/'.$manifest, '-out', $bundle.'/'.$manifest.'.sig',
+        ]))->mustRun();
+    }
+    $assetNames = [
+        'release-linux-amd64.env',
+        'release-linux-amd64.env.sig',
+        'release-linux-arm64.env',
+        'release-linux-arm64.env.sig',
+        'release-signing-ed25519.pub',
+    ];
+    $checksumLines = [];
+    foreach ($assetNames as $assetName) {
+        copy($bundle.'/'.$assetName, $downloads.'/'.$assetName);
+        $checksumLines[] = hash_file('sha256', $bundle.'/'.$assetName).'  ./'.$assetName;
+    }
+    file_put_contents($bundle.'/SHA256SUMS', implode("\n", $checksumLines)."\n");
+    copy($bundle.'/SHA256SUMS', $downloads.'/SHA256SUMS');
+    file_put_contents($ghLog, '');
+    file_put_contents($state, $isDraft ? "true\n" : "false\n");
+    file_put_contents($bin.'/gh', <<<'SH'
+#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${GH_LOG:?}"
+
+case "$1:$2" in
+    release:view)
+        printf '{"tagName":"%s","name":"Coolify fork %s","isDraft":%s,"isPrerelease":true,"assets":%s}\n' \
+            "${SEMANTIC_VERSION:?}" "$SEMANTIC_VERSION" "$(cat "${RELEASE_STATE:?}")" "${RELEASE_ASSETS_JSON:?}"
+        ;;
+    release:download)
+        shift 2
+        pattern=''
+        directory=''
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --pattern) pattern=$2; shift 2 ;;
+                --dir) directory=$2; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        [ -n "$pattern" ]
+        [ -n "$directory" ]
+        cp "${RELEASE_DOWNLOADS:?}/$pattern" "$directory/$pattern"
+        ;;
+    release:edit)
+        printf 'false\n' > "${RELEASE_STATE:?}"
+        if [ "${RELEASE_EDIT_MODE:?}" = ambiguous-success ]; then
+            exit 1
+        fi
+        ;;
+    release:upload)
+        printf 'unexpected release upload\n' >&2
+        exit 64
+        ;;
+    api:*)
+        [ "$2" = "repos/${GITHUB_REPOSITORY:?}/commits/${SEMANTIC_VERSION:?}" ]
+        printf '%s\n' "${RELEASE_TAG_TARGET:?}"
+        ;;
+    *)
+        printf 'unexpected gh invocation: %s %s\n' "$1" "$2" >&2
+        exit 64
+        ;;
+esac
+SH);
+    chmod($bin.'/gh', 0755);
+
+    $assetNames[] = 'SHA256SUMS';
+
+    return [
+        'environment' => [
+            'BUNDLE_ARTIFACT_ID' => 'fixture-artifact',
+            'GH_CLI' => $bin.'/gh',
+            'GH_LOG' => $ghLog,
+            'GH_TOKEN' => 'fixture-token',
+            'GITHUB_REF' => 'refs/tags/4.13.0-fork.1',
+            'GITHUB_REPOSITORY' => 'WilliamAGH/coolify',
+            'GITHUB_SHA' => str_repeat('a', 40),
+            'PATH' => $bin.PATH_SEPARATOR.(getenv('PATH') ?: ''),
+            'RELEASE_ASSETS_JSON' => json_encode(
+                array_map(static fn (string $assetName): array => ['name' => $assetName], $assetNames),
+                JSON_THROW_ON_ERROR,
+            ),
+            'RELEASE_DOWNLOADS' => $downloads,
+            'RELEASE_EDIT_MODE' => $editMode,
+            'RELEASE_STATE' => $state,
+            'RELEASE_TAG_TARGET' => $tagTargetCommit ?? str_repeat('a', 40),
+            'RUNNER_TEMP' => $fixture,
+            'SEMANTIC_VERSION' => '4.13.0-fork.1',
+            'SOURCE_REVISION' => str_repeat('a', 40),
+        ],
+        'gh_log' => $ghLog,
+        'state' => $state,
+    ];
+}
+
 function releaseWorkflowRegistryReferencePath(string $stateDirectory, string $reference): string
 {
     return $stateDirectory.'/refs/'.hash('sha256', $reference);
@@ -201,8 +588,10 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
         'control-plane-runtime-fence',
         'control-plane-backup-restore',
         'control-plane-blue-green-simulation',
+        'blue-green-provider-lab',
         'application-deployment-blue-green',
         'production-application-blue-green',
+        'fork-deploy',
     ];
     foreach ($requiredApplicationValidationJobs as $jobName) {
         if (! isset($applicationValidationJobs[$jobName])) {
@@ -342,8 +731,10 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
         'runtime-fence',
         'backup-restore',
         'blue-green-simulation',
+        'blue-green-provider-lab',
         'application-deployment-blue-green',
         'production-application-blue-green',
+        'fork-deploy',
     ] as $output) {
         if (! isset($integrationSelection['outputs'][$output]) ||
             ! str_contains($selectionScript, "echo \"{$output}=")) {
@@ -367,12 +758,28 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
         }
     }
     foreach ([
+        'tests/Integration/BlueGreen/*' => 'blue_green_provider_lab=true',
         'tests/Integration/ApplicationDeploymentJobBlueGreen/*' => 'application_deployment_blue_green=true',
         'tests/Integration/ProductionApplicationBlueGreen/*' => 'production_application_blue_green=true',
     ] as $acceptancePath => $selectionAssignment) {
         if (! str_contains($selectionScript, $acceptancePath) ||
             ! str_contains($selectionScript, $selectionAssignment)) {
             $violations[] = "real blue/green acceptance selection is incomplete: {$acceptancePath}";
+        }
+    }
+    foreach ([
+        '.github/workflows/application-validation.yml',
+        '.github/workflows/publish-fork.yml',
+        '.github/workflows/publish-linux-image.yml',
+        'scripts/fork-deploy',
+        'docker/fork-release-signing-ed25519.pub',
+        'tests/Integration/ForkDeploy/*',
+    ] as $forkDeployPath) {
+        if (! str_contains(
+            releaseWorkflowSelectionCaseBody($selectionScript, $forkDeployPath),
+            'fork_deploy=true',
+        )) {
+            $violations[] = "fork deployment selection is missing a signed deployment boundary: {$forkDeployPath}";
         }
     }
 
@@ -393,6 +800,10 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
             'output' => 'blue-green-simulation',
             'entrypoint' => 'tests/Integration/ControlPlaneBlueGreen/run.sh',
         ],
+        'blue-green-provider-lab' => [
+            'output' => 'blue-green-provider-lab',
+            'entrypoint' => 'tests/Integration/BlueGreen/run.sh',
+        ],
         'application-deployment-blue-green' => [
             'output' => 'application-deployment-blue-green',
             'entrypoint' => 'tests/Integration/ApplicationDeploymentJobBlueGreen/run.sh',
@@ -400,6 +811,10 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
         'production-application-blue-green' => [
             'output' => 'production-application-blue-green',
             'entrypoint' => 'tests/Integration/ProductionApplicationBlueGreen/run.sh',
+        ],
+        'fork-deploy' => [
+            'output' => 'fork-deploy',
+            'entrypoint' => 'tests/Integration/ForkDeploy/run.sh',
         ],
     ] as $jobName => $contract) {
         $job = $applicationValidationJobs[$jobName] ?? [];
@@ -417,6 +832,16 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
         }
     }
 
+    $forkDeployJob = $applicationValidationJobs['fork-deploy'] ?? [];
+    $forkDeployCheckout = collect(releaseWorkflowSteps($forkDeployJob))
+        ->first(fn (array $step): bool => str_starts_with((string) ($step['uses'] ?? ''), 'actions/checkout@'));
+    if (($forkDeployJob['permissions'] ?? null) !== ['contents' => 'read'] ||
+        ($forkDeployJob['timeout-minutes'] ?? null) !== 30 ||
+        ! is_array($forkDeployCheckout) ||
+        ($forkDeployCheckout['with']['persist-credentials'] ?? null) !== false) {
+        $violations[] = 'fork deployment validation must use read-only checkout permissions and a bounded timeout';
+    }
+
     $blueGreenScenarios = $applicationValidationJobs['control-plane-blue-green-simulation']['strategy']['matrix']['scenario'] ?? [];
     sort($blueGreenScenarios);
     if ($blueGreenScenarios !== ['continuous-availability', 'queue-gate', 'routed-candidate-restart', 'router-reload-failure']) {
@@ -428,7 +853,57 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
     )) {
         $violations[] = 'mock control-plane blue/green validation must be labeled as a simulation';
     }
+
+    $blueGreenProviderLabDirectory = releaseWorkflowRepositoryRoot().'/tests/Integration/BlueGreen';
+    $blueGreenProviderLabComposePath = $blueGreenProviderLabDirectory.'/compose.yaml';
+    $blueGreenProviderLabRunnerPath = $blueGreenProviderLabDirectory.'/run.sh';
+    $blueGreenProviderLabTraefikPath = $blueGreenProviderLabDirectory.'/traefik.yml';
+    $blueGreenProviderLabCompose = is_file($blueGreenProviderLabComposePath)
+        ? Yaml::parseFile($blueGreenProviderLabComposePath)
+        : [];
+    $blueGreenProviderLabServices = is_array($blueGreenProviderLabCompose['services'] ?? null)
+        ? $blueGreenProviderLabCompose['services']
+        : [];
+    $blueGreenProviderLabTraefikService = is_array($blueGreenProviderLabServices['traefik'] ?? null)
+        ? $blueGreenProviderLabServices['traefik']
+        : [];
+    $blueGreenProviderLabRunner = is_file($blueGreenProviderLabRunnerPath)
+        ? file_get_contents($blueGreenProviderLabRunnerPath)
+        : false;
+    $blueGreenProviderLabTraefik = is_file($blueGreenProviderLabTraefikPath)
+        ? file_get_contents($blueGreenProviderLabTraefikPath)
+        : false;
+    $expectedBlueGreenProviderLabTraefikImage = 'traefik:v3.6.23@sha256:f5dba1e65167778cd5f8d1b463fc5d200f49d40c6458fc9f4b391a68ebfb9534';
+
+    if (($blueGreenProviderLabTraefikService['image'] ?? null) !== $expectedBlueGreenProviderLabTraefikImage ||
+        ! is_string($blueGreenProviderLabRunner) ||
+        ! str_contains($blueGreenProviderLabRunner, 'v3.6.23')) {
+        $violations[] = 'Traefik provider lab must retain the reviewed Traefik 3.6.23 image digest';
+    }
+
+    if (! is_string($blueGreenProviderLabTraefik) ||
+        ! str_contains($blueGreenProviderLabTraefik, 'docker:') ||
+        ! str_contains($blueGreenProviderLabTraefik, 'file:') ||
+        ! str_contains($blueGreenProviderLabTraefik, 'providersThrottleDuration: 12s')) {
+        $violations[] = 'Traefik provider lab must exercise Docker and File provider coexistence with throttled eviction';
+    }
     foreach ([
+        'hold_traffic delay',
+        'hold_traffic sse',
+        'hold_traffic websocket',
+        'probe await-adoption',
+        'probe await-provider evicted',
+    ] as $providerLabContract) {
+        if (! is_string($blueGreenProviderLabRunner) || ! str_contains($blueGreenProviderLabRunner, $providerLabContract)) {
+            $violations[] = "Traefik provider lab is missing its held-traffic or provider-eviction contract: {$providerLabContract}";
+        }
+    }
+    if (is_dir(releaseWorkflowRepositoryRoot().'/tests/Integration/LegacyProviderFencing')) {
+        $violations[] = 'obsolete LegacyProviderFencing integration harness must not be retained alongside the Traefik provider lab';
+    }
+
+    foreach ([
+        'blue-green-provider-lab' => 30,
         'application-deployment-blue-green' => 120,
         'production-application-blue-green' => 90,
     ] as $acceptanceJobName => $expectedTimeout) {
@@ -447,8 +922,10 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
         'control-plane-runtime-fence',
         'control-plane-backup-restore',
         'control-plane-blue-green-simulation',
+        'blue-green-provider-lab',
         'application-deployment-blue-green',
         'production-application-blue-green',
+        'fork-deploy',
     ] as $jobName) {
         if (! str_contains($requiredValidationScript, "require_selected {$jobName}")) {
             $violations[] = "aggregate validation may ignore a selected integration gate: {$jobName}";
@@ -466,6 +943,7 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
         'candidate_repository',
         'target_repository',
         'semantic_version',
+        'staging_alias',
         'publish_latest',
         'validate_only',
     ] as $input) {
@@ -482,9 +960,15 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
         $violations[] = 'validate-only must be an explicit default-false reusable input';
     }
 
-    foreach (['DOCKERHUB_USERNAME', 'DOCKERHUB_TOKEN'] as $secret) {
-        if (($workflowCall['secrets'][$secret]['required'] ?? null) !== true) {
-            $violations[] = "missing required reusable secret: {$secret}";
+    foreach ([
+        'DOCKERHUB_USERNAME',
+        'DOCKERHUB_TOKEN',
+        'NEXUS_USERNAME',
+        'NEXUS_PASSWORD',
+        'FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY',
+    ] as $secret) {
+        if (($workflowCall['secrets'][$secret]['required'] ?? null) !== false) {
+            $violations[] = "conditional reusable secret must remain optional at the workflow boundary: {$secret}";
         }
     }
 
@@ -590,7 +1074,7 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
     }
 
     foreach ([
-        'validate-inputs' => [],
+        'validate-inputs' => ['contents' => 'read'],
         'repair-latest' => ['contents' => 'read', 'packages' => 'write'],
         'verify-authoritative-noop' => ['packages' => 'read'],
         'build-and-scan' => ['contents' => 'read'],
@@ -615,10 +1099,21 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
     if ($platforms !== ['linux/amd64', 'linux/arm64']) {
         $violations[] = 'shared build must publish only linux amd64 and arm64';
     }
+    $registryChecksums = array_column(
+        $jobs['build-and-scan']['strategy']['matrix']['include'] ?? [],
+        'regctl_sha256',
+        'arch',
+    );
+    if ($registryChecksums !== [
+        'amd64' => 'c93aa7638749f5aaac1a8e01787321889c78f0101809bb2880343478d0ba0467',
+        'arm64' => 'c4cf231e74cda685f1599f3d866b02b03c572e54b79ec8b062f32070b0ba4587',
+    ]) {
+        $violations[] = 'native host-gate registry client checksums must be pinned per architecture';
+    }
 
     $validateOnlyConditions = [
         'repair-latest' => "\${{ ! inputs.validate_only && needs.validate-inputs.outputs.repair_required == 'true' }}",
-        'verify-authoritative-noop' => "\${{ ! inputs.validate_only && needs.validate-inputs.outputs.publish_required == 'false' && needs.validate-inputs.outputs.repair_required == 'false' }}",
+        'verify-authoritative-noop' => "\${{ inputs.release_kind != 'fork' && ! inputs.validate_only && needs.validate-inputs.outputs.publish_required == 'false' && needs.validate-inputs.outputs.repair_required == 'false' }}",
         'stage-candidates' => "\${{ ! inputs.validate_only && needs.validate-inputs.outputs.publish_required == 'true' }}",
         'attest-and-verify' => "\${{ ! inputs.validate_only && needs.stage-candidates.result == 'success' }}",
         'release' => "\${{ ! inputs.validate_only && needs.stage-candidates.result == 'success' }}",
@@ -633,10 +1128,10 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
         $violations[] = 'validate-only must retain the complete build-and-scan job';
     }
     $requiredValidateOnlyProductionSteps = [
-        'Run native systemd host gate against exact OCI child' => "inputs.release_kind == 'production' && matrix.arch == 'amd64'",
-        'Package sanitized production host-gate evidence' => "always() && inputs.release_kind == 'production' && matrix.arch == 'amd64'",
-        'Upload sanitized production host-gate evidence' => "always() && inputs.release_kind == 'production' && matrix.arch == 'amd64'",
-        'Require native production host-gate success' => "always() && inputs.release_kind == 'production' && matrix.arch == 'amd64'",
+        'Run native systemd host gate against exact OCI child' => "inputs.release_kind == 'production'",
+        'Package sanitized production host-gate evidence' => "always() && inputs.release_kind == 'production'",
+        'Upload sanitized production host-gate evidence' => "always() && inputs.release_kind == 'production'",
+        'Require native production host-gate success' => "always() && inputs.release_kind == 'production'",
     ];
     foreach ($requiredValidateOnlyProductionSteps as $stepName => $expectedCondition) {
         $step = releaseWorkflowStep($jobs['build-and-scan'] ?? [], $stepName);
@@ -653,6 +1148,36 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
         ! str_contains($nativeHostGateRun, "fail 'the privileged production host gate requires a push to refs/heads/v4.x'")) {
         $violations[] = 'validate-only native production host gate must retain the trusted push and v4.x runtime guard';
     }
+    foreach ([
+        'CONTROL_PLANE_RUNTIME_HOST_GATE_PLATFORM="$PLATFORM"',
+        'docker pull --platform "$PLATFORM"',
+        'docker run --detach --pull never --platform "$PLATFORM"',
+        'docker run --rm --pull never --platform "$PLATFORM"',
+        'control-plane-runtime-fence-native-${ARCH}-evidence',
+        'runtime-fence-host-exited-${ARCH}-',
+        'runtime-fence-host-github-${ARCH}-',
+    ] as $nativeHostGateContract) {
+        if (! str_contains($nativeHostGateRun, $nativeHostGateContract)) {
+            $violations[] = 'native production host gate must remain platform- and architecture-bound';
+        }
+    }
+    foreach ([
+        'readonly versions_file="$GITHUB_WORKSPACE/versions.json"',
+        '.traefik."v3.6"',
+        'regctl image digest "docker.io/library/traefik:${traefik_version}"',
+        'readonly traefik_source="traefik@${traefik_digest}"',
+        'Version: ${traefik_version}',
+    ] as $traefikVersionContract) {
+        if (! str_contains($nativeHostGateRun, $traefikVersionContract)) {
+            $violations[] = 'native production host gate must derive its immutable Traefik image from versions.json';
+        }
+    }
+    if (preg_match('/3[.]6[.][0-9]+/', $nativeHostGateRun) === 1) {
+        $violations[] = 'native production host gate may not duplicate the canonical Traefik patch version';
+    }
+    if (str_contains($nativeHostGateRun, '--platform linux/amd64')) {
+        $violations[] = 'native production host gate may not hard-code the amd64 platform';
+    }
     $evidencePackageStep = releaseWorkflowStep(
         $jobs['build-and-scan'] ?? [],
         'Package sanitized production host-gate evidence',
@@ -667,10 +1192,21 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
     );
     if (($evidencePackageStep['id'] ?? null) !== 'package-production-host-gate-evidence' ||
         ($evidenceUploadStep['id'] ?? null) !== 'upload-production-host-gate-evidence' ||
+        ($evidencePackageStep['env']['PLATFORM'] ?? null) !== '${{ matrix.platform }}' ||
+        ! str_contains((string) ($evidencePackageStep['run'] ?? ''), '--mode "$mode" --platform "$PLATFORM"') ||
+        ! str_contains((string) ($evidenceUploadStep['with']['name'] ?? ''), '${{ matrix.arch }}') ||
         ($evidenceRequireStep['env']['HOST_GATE_OUTCOME'] ?? null) !== '${{ steps.production-host-gate.outcome }}' ||
         ($evidenceRequireStep['env']['PACKAGE_OUTCOME'] ?? null) !== '${{ steps.package-production-host-gate-evidence.outcome }}' ||
         ($evidenceRequireStep['env']['EVIDENCE_ARTIFACT_ID'] ?? null) !== '${{ steps.upload-production-host-gate-evidence.outputs.artifact-id }}') {
         $violations[] = 'validate-only production host-gate evidence chain is weakened or disconnected';
+    }
+    $registryClientVerificationStep = releaseWorkflowStep(
+        $jobs['build-and-scan'] ?? [],
+        'Verify registry client bytes for exact production host gate',
+    );
+    if (($registryClientVerificationStep['env']['REGCTL_SHA256'] ?? null) !== '${{ matrix.regctl_sha256 }}' ||
+        ! str_contains((string) ($registryClientVerificationStep['run'] ?? ''), '"$REGCTL_SHA256"')) {
+        $violations[] = 'native host-gate registry client verification must use the architecture-specific checksum';
     }
     foreach ($jobs as $jobName => $job) {
         $hasRegistryLogin = collect(releaseWorkflowSteps($job))
@@ -678,7 +1214,11 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
                 (string) ($step['uses'] ?? ''),
                 'docker/login-action@',
             ));
-        if ($hasRegistryLogin && ! isset($validateOnlyConditions[$jobName])) {
+        $isForkOnlyPublicationJob = str_contains(
+            (string) ($job['if'] ?? ''),
+            "inputs.release_kind == 'fork'",
+        );
+        if ($hasRegistryLogin && ! isset($validateOnlyConditions[$jobName]) && ! $isForkOnlyPublicationJob) {
             $violations[] = "validate-only may reach an external registry login: {$jobName}";
         }
     }
@@ -711,8 +1251,8 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
     if ($runtimeGateStep === []) {
         $violations[] = 'missing passive control-plane runtime gate in build-and-scan';
     } else {
-        if (($runtimeGateStep['if'] ?? null) !== "inputs.release_kind == 'production' && matrix.arch == 'amd64'") {
-            $violations[] = 'passive runtime gate must run for production amd64 builds';
+        if (($runtimeGateStep['if'] ?? null) !== "inputs.release_kind == 'production' || inputs.release_kind == 'staging'") {
+            $violations[] = 'passive runtime gate must run for both native production and staging architectures';
         }
         $runtimeGateRun = (string) ($runtimeGateStep['run'] ?? '');
         if (! str_contains($runtimeGateRun, 'tests/Integration/VerifyOciArchiveImage.sh') ||
@@ -847,6 +1387,7 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
                 'publish_latest' => true,
                 'validate_only' => "\${{ github.repository != 'coollabsio/coolify' }}",
             ],
+            'concurrency_group' => 'linux-image-release-coollabsio/coolify',
             'publish_if' => "\${{ needs.resolve-version.outputs.should_publish == 'true' }}",
             'publish_needs' => ['resolve-version'],
             'jobs' => ['application-validation', 'resolve-version', 'publish'],
@@ -861,6 +1402,7 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
                 'semantic_version' => '',
                 'publish_latest' => true,
             ],
+            'concurrency_group' => 'linux-image-release-coollabsio/coolify-testing-host',
             'publish_if' => null,
             'publish_needs' => ['application-validation'],
             'jobs' => ['application-validation', 'authorize', 'publish'],
@@ -873,11 +1415,13 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
                 'dockerfile' => 'docker/production/Dockerfile',
                 'release_kind' => 'staging',
                 'semantic_version' => '',
+                'staging_alias' => '${{ needs.resolve-staging-alias.outputs.staging_alias }}',
                 'publish_latest' => false,
             ],
+            'concurrency_group' => 'linux-image-release-coollabsio/coolify-staging',
             'publish_if' => null,
-            'publish_needs' => ['application-validation'],
-            'jobs' => ['application-validation', 'authorize', 'publish'],
+            'publish_needs' => ['application-validation', 'resolve-staging-alias'],
+            'jobs' => ['application-validation', 'authorize', 'export-staging-reference', 'publish', 'resolve-staging-alias'],
         ],
     ] as $callerName => $expectedContract) {
         $caller = $callers[$callerName] ?? [];
@@ -896,8 +1440,11 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
             $violations[] = "{$callerName} must not grant workflow-wide permissions";
         }
 
-        if (array_key_exists('concurrency', $caller)) {
-            $violations[] = "{$callerName} must leave target serialization to the shared publication workflow";
+        if (($publish['concurrency'] ?? null) !== [
+            'group' => $expectedContract['concurrency_group'],
+            'cancel-in-progress' => false,
+        ]) {
+            $violations[] = "{$callerName} must serialize the complete publication invocation by target";
         }
 
         if (($publish['uses'] ?? null) !== './.github/workflows/publish-linux-image.yml') {
@@ -962,7 +1509,7 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
     if (($stagingJobs['application-validation']['uses'] ?? null) !== './.github/workflows/application-validation.yml' ||
         releaseWorkflowNeeds($stagingJobs['application-validation'] ?? []) !== ['authorize'] ||
         ($stagingJobs['application-validation']['permissions'] ?? null) !== ['contents' => 'read'] ||
-        releaseWorkflowNeeds($stagingJobs['publish'] ?? []) !== ['application-validation']) {
+        releaseWorkflowNeeds($stagingJobs['publish'] ?? []) !== ['application-validation', 'resolve-staging-alias']) {
         $violations[] = 'staging publication must wait for canonical repository authorization and application validation';
     }
 
@@ -1042,11 +1589,8 @@ function mutateReleaseWorkflow(array $sharedWorkflow, array $callers, string $mu
 
             return [$sharedWorkflow, $callers];
         })(),
-        'add-caller-target-concurrency' => (function () use ($sharedWorkflow, $callers): array {
-            $callers['production']['concurrency'] = [
-                'group' => 'linux-image-coollabsio-coolify',
-                'cancel-in-progress' => false,
-            ];
+        'drop-caller-target-concurrency' => (function () use ($sharedWorkflow, $callers): array {
+            unset($callers['production']['jobs']['publish']['concurrency']);
 
             return [$sharedWorkflow, $callers];
         })(),
@@ -1153,6 +1697,8 @@ it('fails closed across canonical publication and fork validation modes', functi
                 'ARTIFACT_NAME' => 'coolify',
                 'CANDIDATE_REPOSITORY' => 'coollabsio/coolify-production-staging',
                 'DOCKERFILE' => 'docker/production/Dockerfile',
+                'DOCKERHUB_TOKEN' => 'fixture-token',
+                'DOCKERHUB_USERNAME' => 'fixture-user',
                 'GITHUB_OUTPUT' => $githubOutput,
                 'GITHUB_RUN_ATTEMPT' => '1',
                 'GITHUB_RUN_ID' => '1',
@@ -1419,6 +1965,8 @@ it('rejects OCI tags longer than 128 characters in input validation', function (
                 'ARTIFACT_NAME' => 'coolify',
                 'CANDIDATE_REPOSITORY' => 'coollabsio/coolify-production-staging',
                 'DOCKERFILE' => 'docker/production/Dockerfile',
+                'DOCKERHUB_TOKEN' => 'fixture-token',
+                'DOCKERHUB_USERNAME' => 'fixture-user',
                 'GITHUB_OUTPUT' => $githubOutput,
                 'GITHUB_RUN_ATTEMPT' => '1',
                 'GITHUB_RUN_ID' => $runId,
@@ -1572,7 +2120,7 @@ it('compensates the whole alias transaction when latest publication fails', func
     'failure between latest updates preserves a preexisting semantic alias' => ['docker', true],
 ]);
 
-it('fails closed when semantic snapshot or rollback registry reads fail', function (string $failureMode) {
+it('fails closed when alias snapshots, rollback reads, or cross-registry state are unsafe', function (string $failureMode) {
     $root = releaseWorkflowRepositoryRoot();
     $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
     $step = releaseWorkflowStep($workflow['jobs']['release'] ?? [], 'Publish semantic and latest aliases atomically');
@@ -1644,13 +2192,14 @@ it('fails closed when semantic snapshot or rollback registry reads fail', functi
         expect($process->isSuccessful())->toBeFalse()
             ->and(releaseWorkflowReadRegistryReference($state, "{$ghcr}:{$semantic}"))->not->toBeNull()
             ->and(releaseWorkflowReadRegistryReference($state, "{$docker}:{$semantic}"))->not->toBeNull();
-        if (str_starts_with($failureMode, 'rollback')) {
+        if ($failureMode === 'rollback') {
             expect($process->getErrorOutput())->toContain('compensation was incomplete');
-            if ($failureMode === 'rollback-absent') {
-                expect(releaseWorkflowReadRegistryReference($state, "{$ghcr}:latest"))->toBe($new);
-            } elseif ($failureMode === 'rollback-cross-prior') {
-                expect(releaseWorkflowReadRegistryReference($state, "{$ghcr}:latest"))->toBe($amd64);
-            }
+        } elseif ($failureMode === 'rollback-absent') {
+            expect($process->getErrorOutput())->toContain('alias state is split across registries for latest')
+                ->and(releaseWorkflowReadRegistryReference($state, "{$ghcr}:latest"))->toBeNull();
+        } elseif ($failureMode === 'rollback-cross-prior') {
+            expect($process->getErrorOutput())->toContain('alias state is split across registries for latest')
+                ->and(releaseWorkflowReadRegistryReference($state, "{$ghcr}:latest"))->toBe($old);
         }
     } finally {
         $filesystem->remove($state);
@@ -1733,4 +2282,742 @@ it('executes immutable-tag, compensation, and platform-verification behavior aga
 
     expect($process->isSuccessful())->toBeTrue($process->getErrorOutput())
         ->and($process->getOutput())->toContain('PUBLISH_LINUX_IMAGE_HELPER_PASS');
+});
+
+it('defines one referrerless fork release graph for both images and both platforms', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $caller = Yaml::parseFile($root.'/.github/workflows/publish-fork.yml');
+    $jobs = $workflow['jobs'] ?? [];
+
+    $matrix = $jobs['fork-build']['strategy']['matrix']['include'] ?? [];
+    $contracts = array_map(
+        static fn (array $entry): array => [
+            $entry['product'] ?? null,
+            $entry['dockerfile'] ?? null,
+            $entry['platform'] ?? null,
+            $entry['runner'] ?? null,
+        ],
+        $matrix,
+    );
+    expect($contracts)->toBe([
+        ['main', 'docker/production/Dockerfile', 'linux/amd64', 'ubuntu-24.04'],
+        ['main', 'docker/production/Dockerfile', 'linux/arm64', 'ubuntu-24.04-arm'],
+        ['realtime', 'docker/coolify-realtime/Dockerfile', 'linux/amd64', 'ubuntu-24.04'],
+        ['realtime', 'docker/coolify-realtime/Dockerfile', 'linux/arm64', 'ubuntu-24.04-arm'],
+    ]);
+
+    $buildStep = releaseWorkflowStep(
+        $jobs['fork-build'] ?? [],
+        'Build fork OCI archive with inline provenance and SBOM',
+    );
+    expect($buildStep['with']['provenance'] ?? null)->toBe('mode=max')
+        ->and($buildStep['with']['sbom'] ?? null)->toBeTrue()
+        ->and((string) ($buildStep['with']['labels'] ?? ''))
+        ->toContain('org.opencontainers.image.source=https://github.com/${{ github.repository }}')
+        ->toContain('org.opencontainers.image.revision=${{ github.sha }}')
+        ->toContain('org.opencontainers.image.version=${{ inputs.semantic_version }}');
+
+    $policyRun = (string) (releaseWorkflowStep(
+        $jobs['fork-registry-policy'] ?? [],
+        'Require Nexus hosted repository non-redeploy policy',
+    )['run'] ?? '');
+    $stageRun = (string) (releaseWorkflowStep(
+        $jobs['fork-stage'] ?? [],
+        'Stage both fork products with inline build attestations',
+    )['run'] ?? '');
+    $promotionRun = (string) (releaseWorkflowStep(
+        $jobs['fork-release'] ?? [],
+        'Promote realtime first and main last as the fork release commit marker',
+    )['run'] ?? '');
+    $forkRegistryPolicyStepNames = collect(releaseWorkflowSteps($jobs['fork-registry-policy'] ?? []))
+        ->pluck('name')
+        ->values()
+        ->all();
+    expect($policyRun)
+        ->toContain('.storage.writePolicy == "ALLOW_ONCE"')
+        ->toContain('/service/rest/v1/repositories/docker/hosted/$NEXUS_REPOSITORY')
+        ->and($forkRegistryPolicyStepNames)
+        ->not->toContain('Reject existing fork semantic tags before build')
+        ->and($stageRun)
+        ->toContain('stage_product main coolify "$MAIN_TARGET"')
+        ->toContain('stage_product realtime coolify-realtime "$REALTIME_TARGET"')
+        ->toContain('org.opencontainers.image.source')
+        ->toContain('org.opencontainers.image.revision')
+        ->toContain('org.opencontainers.image.version')
+        ->toContain('manifests: ((.[0].manifests + .[1].manifests) | unique_by(.digest))')
+        ->toContain('regctl manifest put')
+        ->not->toContain('regctl index create')
+        ->and($promotionRun)
+        ->toContain('preflight_semantic_tag')
+        ->toContain('promote_or_verify_semantic_tag')
+        ->toContain('does not match its expected immutable index digest')
+        ->toContain('accepting recovery state')
+        ->toContain('Physical registry atomicity is impossible')
+        ->toContain('main tag as the final commit marker')
+        ->toContain('assert_live_fork_tag_binding')
+        ->toContain('assert_active_fork_tag_protection')
+        ->toContain('Protect Coolify fork release tags')
+        ->toContain('refs/tags/*.*.*-fork.*')
+        ->toContain('index("creation")')
+        ->toContain('index("update")')
+        ->toContain('index("deletion")')
+        ->toContain('human authority remains a residual risk')
+        ->toContain('preflight_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"')
+        ->toContain('preflight_semantic_tag "$REALTIME_TARGET" "$REALTIME_INDEX_DIGEST"')
+        ->toContain('promote_or_verify_semantic_tag "$REALTIME_TARGET" "$REALTIME_INDEX_DIGEST"')
+        ->toContain('promote_or_verify_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"')
+        ->not->toContain(':latest');
+
+    $preflightRealtimePosition = strpos($promotionRun, 'preflight_semantic_tag "$REALTIME_TARGET" "$REALTIME_INDEX_DIGEST"');
+    $preWriteTagVerificationPosition = strpos($promotionRun, 'assert_live_fork_tag_binding', $preflightRealtimePosition ?: 0);
+    $realtimePromotionPosition = strpos($promotionRun, 'promote_or_verify_semantic_tag "$REALTIME_TARGET" "$REALTIME_INDEX_DIGEST"');
+    $mainPromotionPosition = strpos($promotionRun, 'promote_or_verify_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"');
+    $postWriteTagVerificationPosition = strpos($promotionRun, 'assert_live_fork_tag_binding', ($mainPromotionPosition ?: 0) + 1);
+    expect($preflightRealtimePosition)->not->toBeFalse()
+        ->and($preWriteTagVerificationPosition)->not->toBeFalse()
+        ->and($realtimePromotionPosition)->not->toBeFalse()
+        ->and($mainPromotionPosition)->not->toBeFalse()
+        ->and($postWriteTagVerificationPosition)->not->toBeFalse()
+        ->and($preWriteTagVerificationPosition)->toBeGreaterThan($preflightRealtimePosition)
+        ->and($realtimePromotionPosition)->toBeGreaterThan($preWriteTagVerificationPosition)
+        ->and($mainPromotionPosition)->toBeGreaterThan($realtimePromotionPosition)
+        ->and($postWriteTagVerificationPosition)->toBeGreaterThan($mainPromotionPosition);
+
+    $attestationJob = $jobs['fork-attest'] ?? [];
+    $forkAttestations = collect(releaseWorkflowSteps($attestationJob))
+        ->filter(fn (array $step): bool => str_starts_with((string) ($step['uses'] ?? ''), 'actions/attest@'));
+    expect($forkAttestations)->toHaveCount(10);
+    foreach ($forkAttestations as $attestation) {
+        expect($attestation['with']['push-to-registry'] ?? null)->toBeFalse()
+            ->and($attestation['with']['create-storage-record'] ?? null)->toBeFalse();
+    }
+    $bundleVerification = (string) (releaseWorkflowStep(
+        $attestationJob,
+        'Verify every signed fork bundle off-registry',
+    )['run'] ?? '');
+    expect($bundleVerification)
+        ->toContain('--bundle "$bundle"')
+        ->toContain('--source-digest "$GITHUB_SHA"')
+        ->toContain('--source-ref "$GITHUB_REF"')
+        ->not->toContain('--bundle-from-oci');
+
+    $releaseBundleDownload = releaseWorkflowStep(
+        $jobs['fork-release'] ?? [],
+        'Download verified fork release bundles',
+    );
+    $releasePublication = (string) (releaseWorkflowStep(
+        $jobs['fork-release'] ?? [],
+        'Publish immutable signed fork bundles to the tag release',
+    )['run'] ?? '');
+    $draftRecovery = (string) (releaseWorkflowStep(
+        $jobs['fork-release'] ?? [],
+        'Create or validate empty draft recovery release before semantic promotion',
+    )['run'] ?? '');
+    $forkRelease = $jobs['fork-release'] ?? [];
+    $finalPolicyStep = releaseWorkflowStep(
+        $forkRelease,
+        'Re-require Nexus non-redeploy policy before final tagging',
+    );
+    $finalLoginStep = releaseWorkflowStep(
+        $forkRelease,
+        'Login to Nexus fork registry for final promotion',
+    );
+    $forkReleaseNexusSecretSteps = collect(releaseWorkflowSteps($forkRelease))
+        ->filter(static fn (array $step): bool => collect(releaseWorkflowScalarValues($step))
+            ->contains(static fn (string $value): bool => in_array($value, [
+                '${{ secrets.NEXUS_PASSWORD }}',
+                '${{ secrets.NEXUS_USERNAME }}',
+            ], true)))
+        ->pluck('name')
+        ->values()
+        ->all();
+    expect($forkRelease['env'] ?? [])
+        ->not->toHaveKey('NEXUS_PASSWORD')
+        ->not->toHaveKey('NEXUS_USERNAME')
+        ->and($finalPolicyStep['env'] ?? [])
+        ->toBe([
+            'NEXUS_PASSWORD' => '${{ secrets.NEXUS_PASSWORD }}',
+            'NEXUS_USERNAME' => '${{ secrets.NEXUS_USERNAME }}',
+        ])
+        ->and($finalLoginStep['with']['password'] ?? null)
+        ->toBe('${{ secrets.NEXUS_PASSWORD }}')
+        ->and($finalLoginStep['with']['username'] ?? null)
+        ->toBe('${{ secrets.NEXUS_USERNAME }}')
+        ->and($forkReleaseNexusSecretSteps)
+        ->toBe([
+            'Re-require Nexus non-redeploy policy before final tagging',
+            'Login to Nexus fork registry for final promotion',
+        ]);
+    expect($forkRelease['permissions']['contents'] ?? null)->toBe('write')
+        ->and($releaseBundleDownload['with']['artifact-ids'] ?? null)
+        ->toBe('${{ needs.fork-attest.outputs.bundle_artifact_id }}')
+        ->and($draftRecovery)
+        ->toContain('"$GH_CLI" release create')
+        ->toContain('--verify-tag')
+        ->toContain('--draft '.chr(92)."\n".'    --prerelease')
+        ->toContain('--prerelease')
+        ->toContain('--latest=false')
+        ->toContain('assert_recovery_release_assets_are_exact')
+        ->toContain('assert_release_tag_targets_source_revision')
+        ->toContain('Published fork release exactly matches the immutable release contract; accepting idempotent retry.')
+        ->not->toContain('release upload')
+        ->and($releasePublication)
+        ->not->toContain('"$GH_CLI" release create')
+        ->toContain('Fork recovery draft is missing after semantic promotion; refusing to publish signed bundles.')
+        ->toContain('release upload')
+        ->toContain('release edit')
+        ->toContain('--draft=false')
+        ->toContain('if ! "$GH_CLI" release edit "$SEMANTIC_VERSION"')
+        ->toContain('Fork release publication returned an ambiguous failure; reconciling the observed release state.')
+        ->toContain('assert_release_tag_targets_source_revision')
+        ->toContain('if [[ "$(jq -r \'.isDraft\' "$release_metadata_file")" == true ]]; then')
+        ->toContain('"$GH_CLI" release upload "$SEMANTIC_VERSION"')
+        ->toContain('sha256sum --check --strict SHA256SUMS')
+        ->toContain('Fork tag release asset does not match the signed release bundle')
+        ->toContain('Published fork tag release assets are incomplete; refusing to modify a published release.')
+        ->not->toContain('--clobber');
+
+    $forkReleaseStepNames = array_map(
+        static fn (array $step): string => (string) ($step['name'] ?? ''),
+        releaseWorkflowSteps($forkRelease),
+    );
+    $draftRecoveryStepPosition = array_search('Create or validate empty draft recovery release before semantic promotion', $forkReleaseStepNames, true);
+    $promotionStepPosition = array_search('Promote realtime first and main last as the fork release commit marker', $forkReleaseStepNames, true);
+    $publicationStepPosition = array_search('Publish immutable signed fork bundles to the tag release', $forkReleaseStepNames, true);
+    expect($draftRecoveryStepPosition)->not->toBeFalse()
+        ->and($promotionStepPosition)->not->toBeFalse()
+        ->and($publicationStepPosition)->not->toBeFalse()
+        ->and($draftRecoveryStepPosition)->toBeLessThan($promotionStepPosition)
+        ->and($promotionStepPosition)->toBeLessThan($publicationStepPosition);
+
+    $draftRecoveryPosition = strpos($releasePublication, 'if [[ "$(jq -r \'.isDraft\' "$release_metadata_file")" == true ]]; then');
+    $draftInventoryCheckPosition = strpos($releasePublication, 'assert_release_assets_are_exact', $draftRecoveryPosition ?: 0);
+    $draftTagTargetCheckPosition = strpos($releasePublication, 'assert_release_tag_targets_source_revision', $draftRecoveryPosition ?: 0);
+    $draftPublicationPosition = strpos($releasePublication, '"$GH_CLI" release edit "$SEMANTIC_VERSION"', $draftRecoveryPosition ?: 0);
+    expect($draftRecoveryPosition)->not->toBeFalse()
+        ->and($draftInventoryCheckPosition)->not->toBeFalse()
+        ->and($draftTagTargetCheckPosition)->not->toBeFalse()
+        ->and($draftPublicationPosition)->not->toBeFalse()
+        ->and($draftInventoryCheckPosition)->toBeLessThan($draftPublicationPosition)
+        ->and($draftTagTargetCheckPosition)->toBeLessThan($draftPublicationPosition);
+
+    $publish = $caller['jobs']['publish'] ?? [];
+    expect($publish['with'] ?? null)->toBe([
+        'artifact_name' => 'coolify-fork',
+        'candidate_repository' => 'williamagh/coolify-fork-candidates',
+        'dockerfile' => 'docker/production/Dockerfile',
+        'publish_latest' => false,
+        'release_kind' => 'fork',
+        'semantic_version' => '${{ needs.resolve-tag.outputs.version }}',
+        'target_repository' => 'williamagh/coolify',
+        'validate_only' => false,
+    ])->and(array_keys($publish['secrets'] ?? []))->toBe([
+        'FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY',
+        'NEXUS_PASSWORD',
+        'NEXUS_USERNAME',
+    ])->and($publish['permissions']['contents'] ?? null)->toBe('write')
+        ->and((string) file_get_contents($root.'/.github/workflows/publish-linux-image.yml'))
+        ->not->toContain('FORK_RELEASE_SIGNING_KEY_ID')
+        ->and((string) file_get_contents($root.'/.github/workflows/publish-fork.yml'))
+        ->not->toContain('FORK_RELEASE_SIGNING_KEY_ID');
+});
+
+it('requires exact fork tag source binding and rejects fork aliases', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $targetStep = releaseWorkflowStepById($workflow['jobs']['validate-inputs'] ?? [], 'target');
+    $script = (string) ($targetStep['run'] ?? '');
+    $semanticPattern = (string) ($targetStep['env']['SEMANTIC_VERSION_PATTERN'] ?? '');
+    $forkPattern = (string) ($targetStep['env']['FORK_SEMANTIC_VERSION_PATTERN'] ?? '');
+    $cases = [
+        'exact current fork tag' => ['4.13.0-fork.1', 'refs/tags/4.13.0-fork.1', 'tag', 'false', 'false', true],
+        'future fork prerelease' => ['4.14.0-fork.2', 'refs/tags/4.14.0-fork.2', 'tag', 'false', 'false', true],
+        'missing numeric fork release' => ['4.13.0-fork', 'refs/tags/4.13.0-fork', 'tag', 'false', 'false', false],
+        'zero fork release' => ['4.13.0-fork.0', 'refs/tags/4.13.0-fork.0', 'tag', 'false', 'false', false],
+        'v-prefixed alias' => ['4.13.0-fork.1', 'refs/tags/v4.13.0-fork.1', 'tag', 'false', 'false', false],
+        'branch ref' => ['4.13.0-fork.1', 'refs/heads/main', 'branch', 'false', 'false', false],
+        'latest publication' => ['4.13.0-fork.1', 'refs/tags/4.13.0-fork.1', 'tag', 'true', 'false', false],
+        'validate-only publication' => ['4.13.0-fork.1', 'refs/tags/4.13.0-fork.1', 'tag', 'false', 'true', false],
+    ];
+
+    foreach ($cases as $description => [$version, $ref, $refType, $publishLatest, $validateOnly, $successful]) {
+        $output = tempnam(sys_get_temp_dir(), 'coolify-fork-target-');
+        expect($output)->not->toBeFalse();
+        try {
+            $process = new Process(['bash', '-c', $script], $root, [
+                'ARTIFACT_NAME' => 'coolify-fork',
+                'CANDIDATE_REPOSITORY' => 'williamagh/coolify-fork-candidates',
+                'DOCKERFILE' => 'docker/production/Dockerfile',
+                'FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY' => 'fixture-private-key',
+                'FORK_SEMANTIC_VERSION_PATTERN' => $forkPattern,
+                'GITHUB_OUTPUT' => $output,
+                'GITHUB_REF' => $ref,
+                'GITHUB_REF_TYPE' => $refType,
+                'GITHUB_RUN_ATTEMPT' => '1',
+                'GITHUB_RUN_ID' => '1',
+                'GITHUB_SHA' => str_repeat('a', 40),
+                'NEXUS_PASSWORD' => 'fixture-password',
+                'NEXUS_USERNAME' => 'fixture-user',
+                'PUBLISH_LATEST' => $publishLatest,
+                'RELEASE_KIND' => 'fork',
+                'REPOSITORY' => 'WilliamAGH/coolify',
+                'SEMANTIC_VERSION' => $version,
+                'SEMANTIC_VERSION_PATTERN' => $semanticPattern,
+                'TARGET_REPOSITORY' => 'williamagh/coolify',
+                'VALIDATE_ONLY' => $validateOnly,
+            ]);
+            $process->run();
+
+            expect($process->isSuccessful())->toBe($successful, $description);
+        } finally {
+            unlink($output);
+        }
+    }
+});
+
+it('requires both fork application version sources to exactly match the immutable tag before builds', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $validateInputs = $workflow['jobs']['validate-inputs'] ?? [];
+    $checkoutStep = releaseWorkflowStep(
+        $validateInputs,
+        'Check out exact fork source for version binding',
+    );
+    $versionStep = releaseWorkflowStep(
+        $validateInputs,
+        'Require fork application versions match the immutable tag',
+    );
+    $script = (string) ($versionStep['run'] ?? '');
+    $validateInputStepNames = array_map(
+        static fn (array $step): string => (string) ($step['name'] ?? ''),
+        releaseWorkflowSteps($validateInputs),
+    );
+    $checkoutPosition = array_search('Check out exact fork source for version binding', $validateInputStepNames, true);
+    $versionPosition = array_search('Require fork application versions match the immutable tag', $validateInputStepNames, true);
+    expect($checkoutStep['uses'] ?? null)
+        ->toBe('actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd')
+        ->and($validateInputs['permissions'] ?? null)->toBe(['contents' => 'read'])
+        ->and($checkoutStep['if'] ?? null)->toBe('${{ inputs.release_kind == \'fork\' }}')
+        ->and($checkoutStep['with'] ?? null)->toBe([
+            'ref' => '${{ github.sha }}',
+            'persist-credentials' => false,
+        ])
+        ->and($checkoutPosition)->not->toBeFalse()
+        ->and($versionPosition)->not->toBeFalse()
+        ->and($checkoutPosition)->toBeLessThan($versionPosition)
+        ->and($script)->toContain('source_root="${GITHUB_WORKSPACE:?}"');
+    $filesystem = new Filesystem;
+    $fixture = sys_get_temp_dir().'/coolify-fork-version-binding-'.bin2hex(random_bytes(8));
+    $constants = (string) file_get_contents($root.'/config/constants.php');
+    $versions = (string) file_get_contents($root.'/versions.json');
+
+    $filesystem->mkdir($fixture.'/config');
+    try {
+        $cases = [
+            'matching version sources' => [$constants, $versions, true, ''],
+            'constants version mismatch' => [
+                str_replace("'4.13.0-fork.1'", "'4.13.0-fork.2'", $constants),
+                $versions,
+                false,
+                'config/constants.php Coolify version must equal the fork tag',
+            ],
+            'versions json mismatch' => [
+                $constants,
+                str_replace('"4.13.0-fork.1"', '"4.13.0-fork.2"', $versions),
+                false,
+                'versions.json Coolify v4 version must equal the fork tag',
+            ],
+        ];
+
+        foreach ($cases as $description => [$fixtureConstants, $fixtureVersions, $successful, $error]) {
+            file_put_contents($fixture.'/config/constants.php', $fixtureConstants);
+            file_put_contents($fixture.'/versions.json', $fixtureVersions);
+            $process = new Process(['bash', '-c', $script], $root, [
+                'GITHUB_WORKSPACE' => $fixture,
+                'SEMANTIC_VERSION' => '4.13.0-fork.1',
+            ]);
+            $process->run();
+
+            expect($process->isSuccessful())->toBe($successful, $description);
+            if (! $successful) {
+                expect($process->getErrorOutput())->toContain($error);
+            }
+        }
+    } finally {
+        $filesystem->remove($fixture);
+    }
+});
+
+it('permits only hash-matching known recovery draft assets before semantic promotion', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $draftRecoveryRun = (string) (releaseWorkflowStep(
+        $workflow['jobs']['fork-release'] ?? [],
+        'Create or validate empty draft recovery release before semantic promotion',
+    )['run'] ?? '');
+    $filesystem = new Filesystem;
+    $fixture = sys_get_temp_dir().'/coolify-fork-recovery-draft-prefix-'.bin2hex(random_bytes(8));
+    $draft = releaseWorkflowPrepareForkDraftRecoveryDouble(
+        $fixture,
+        ['release-linux-amd64.env'],
+    );
+
+    try {
+        $process = new Process(['bash', '-c', $draftRecoveryRun], $fixture, $draft['environment']);
+        $process->run();
+
+        expect($process->isSuccessful())->toBeTrue($process->getErrorOutput())
+            ->and((string) file_get_contents($draft['gh_log']))->toContain('release download 4.13.0-fork.1')
+            ->not->toContain('release create');
+    } finally {
+        $filesystem->remove($fixture);
+    }
+});
+
+it('rejects corrupt, duplicate, and unexpected recovery draft assets before semantic promotion', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $draftRecoveryRun = (string) (releaseWorkflowStep(
+        $workflow['jobs']['fork-release'] ?? [],
+        'Create or validate empty draft recovery release before semantic promotion',
+    )['run'] ?? '');
+    $filesystem = new Filesystem;
+    $cases = [
+        'corrupt' => [
+            ['release-linux-amd64.env'],
+            ['release-linux-amd64.env' => "corrupt\n"],
+            'Fork recovery draft asset does not match the signed release bundle',
+        ],
+        'duplicate' => [
+            ['release-linux-amd64.env', 'release-linux-amd64.env'],
+            [],
+            'Fork recovery draft contains duplicate or unsafe asset names',
+        ],
+        'unexpected' => [
+            ['unexpected.txt'],
+            [],
+            'Fork recovery draft contains unexpected assets',
+        ],
+    ];
+
+    foreach ($cases as $kind => [$draftAssets, $downloadContents, $error]) {
+        $fixture = sys_get_temp_dir().'/coolify-fork-recovery-draft-'.$kind.'-'.bin2hex(random_bytes(8));
+        $draft = releaseWorkflowPrepareForkDraftRecoveryDouble($fixture, $draftAssets, $downloadContents);
+        try {
+            $process = new Process(['bash', '-c', $draftRecoveryRun], $fixture, $draft['environment']);
+            $process->run();
+
+            expect($process->isSuccessful())->toBeFalse($kind)
+                ->and($process->getErrorOutput())->toContain($error)
+                ->and((string) file_get_contents($draft['gh_log']))->not->toContain('release create');
+        } finally {
+            $filesystem->remove($fixture);
+        }
+    }
+});
+
+it('accepts an exact published fork release during pre-promotion retry', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $draftRecoveryRun = (string) (releaseWorkflowStep(
+        $workflow['jobs']['fork-release'] ?? [],
+        'Create or validate empty draft recovery release before semantic promotion',
+    )['run'] ?? '');
+    $filesystem = new Filesystem;
+    $fixture = sys_get_temp_dir().'/coolify-fork-published-recovery-'.bin2hex(random_bytes(8));
+    $release = releaseWorkflowPrepareForkDraftRecoveryDouble(
+        $fixture,
+        ['release-linux-amd64.env', 'release-linux-arm64.env', 'SHA256SUMS'],
+        isDraft: false,
+    );
+
+    try {
+        $process = new Process(['bash', '-c', $draftRecoveryRun], $fixture, $release['environment']);
+        $process->run();
+
+        expect($process->isSuccessful())->toBeTrue($process->getErrorOutput())
+            ->and($process->getOutput())->toContain('accepting idempotent retry')
+            ->and((string) file_get_contents($release['gh_log']))
+            ->toContain('api repos/WilliamAGH/coolify/commits/4.13.0-fork.1 --jq .sha')
+            ->not->toContain('release create');
+    } finally {
+        $filesystem->remove($fixture);
+    }
+});
+
+it('rejects published fork release identity, inventory, digest, and tag target mismatches', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $draftRecoveryRun = (string) (releaseWorkflowStep(
+        $workflow['jobs']['fork-release'] ?? [],
+        'Create or validate empty draft recovery release before semantic promotion',
+    )['run'] ?? '');
+    $filesystem = new Filesystem;
+    $exactAssets = ['release-linux-amd64.env', 'release-linux-arm64.env', 'SHA256SUMS'];
+    $cases = [
+        'release identity' => [$exactAssets, [], str_repeat('a', 40), true, null],
+        'asset inventory' => [array_slice($exactAssets, 0, 2), [], str_repeat('a', 40), false, 'do not exactly match'],
+        'asset digest' => [
+            $exactAssets,
+            ['release-linux-amd64.env' => "corrupt\n"],
+            str_repeat('a', 40),
+            false,
+            'does not match the signed release bundle',
+        ],
+        'tag target' => [$exactAssets, [], str_repeat('d', 40), false, 'does not target the immutable workflow source revision'],
+    ];
+
+    foreach ($cases as $kind => [$assets, $downloads, $tagTarget, $mutateIdentity, $error]) {
+        $fixture = sys_get_temp_dir().'/coolify-fork-published-mismatch-'.str_replace(' ', '-', $kind).'-'.bin2hex(random_bytes(8));
+        $release = releaseWorkflowPrepareForkDraftRecoveryDouble(
+            $fixture,
+            $assets,
+            $downloads,
+            false,
+            $tagTarget,
+        );
+        if ($mutateIdentity) {
+            $metadata = json_decode((string) file_get_contents($release['metadata']), true, flags: JSON_THROW_ON_ERROR);
+            $metadata['name'] = 'Unexpected release identity';
+            file_put_contents($release['metadata'], json_encode($metadata, JSON_THROW_ON_ERROR));
+        }
+
+        try {
+            $process = new Process(['bash', '-c', $draftRecoveryRun], $fixture, $release['environment']);
+            $process->run();
+
+            expect($process->isSuccessful())->toBeFalse($kind)
+                ->and($process->getOutput())->not->toContain('accepting idempotent retry')
+                ->and((string) file_get_contents($release['gh_log']))->not->toContain('release create');
+            if ($error !== null) {
+                expect($process->getErrorOutput())->toContain($error);
+            }
+        } finally {
+            $filesystem->remove($fixture);
+        }
+    }
+});
+
+it('reconciles ambiguous fork release publication and accepts exact published reruns', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $publicationRun = (string) (releaseWorkflowStep(
+        $workflow['jobs']['fork-release'] ?? [],
+        'Publish immutable signed fork bundles to the tag release',
+    )['run'] ?? '');
+    $filesystem = new Filesystem;
+    $cases = [
+        'ambiguous successful edit' => [true, 'ambiguous-success', 1],
+        'exact published rerun' => [false, 'success', 0],
+    ];
+
+    foreach ($cases as $kind => [$isDraft, $editMode, $expectedEdits]) {
+        $fixture = sys_get_temp_dir().'/coolify-fork-publication-retry-'.str_replace(' ', '-', $kind).'-'.bin2hex(random_bytes(8));
+        $release = releaseWorkflowPrepareForkPublicationDouble($fixture, $isDraft, $editMode);
+        try {
+            $process = new Process(['bash', '-c', $publicationRun], $fixture, $release['environment']);
+            $process->run();
+
+            $ghLog = (string) file_get_contents($release['gh_log']);
+            expect($process->isSuccessful())->toBeTrue($kind.': '.$process->getErrorOutput()."\n".$ghLog)
+                ->and(trim((string) file_get_contents($release['state'])))->toBe('false')
+                ->and(substr_count($ghLog, 'release edit 4.13.0-fork.1'))->toBe($expectedEdits)
+                ->and($ghLog)->not->toContain('release upload')
+                ->toContain('api repos/WilliamAGH/coolify/commits/4.13.0-fork.1 --jq .sha');
+        } finally {
+            $filesystem->remove($fixture);
+        }
+    }
+});
+
+it('requires the fork tag commit to be reachable from the trusted v4.x branch before publication', function () {
+    $caller = Yaml::parseFile(releaseWorkflowRepositoryRoot().'/.github/workflows/publish-fork.yml');
+    $resolveTag = $caller['jobs']['resolve-tag'] ?? [];
+    $resolveTagRun = (string) (releaseWorkflowStepById($resolveTag, 'version')['run'] ?? '');
+
+    expect($resolveTag['needs'] ?? null)->toBe('application-validation')
+        ->and($resolveTagRun)
+        ->toContain("git fetch --no-tags origin '+refs/heads/v4.x:refs/remotes/origin/v4.x'")
+        ->toContain("git rev-parse --verify 'refs/remotes/origin/v4.x^{commit}'")
+        ->toContain('git merge-base --is-ancestor "$SOURCE_REVISION" "$trusted_default_branch"');
+});
+
+it('emits the strict signed fork deploy manifest schema', function () {
+    $workflow = Yaml::parseFile(releaseWorkflowRepositoryRoot().'/.github/workflows/publish-linux-image.yml');
+    $manifestRun = (string) (releaseWorkflowStep(
+        $workflow['jobs']['fork-attest'] ?? [],
+        'Generate and Ed25519-sign strict fork deploy manifests',
+    )['run'] ?? '');
+    $expectedKeys = [
+        'SCHEMA',
+        'KEY_ID',
+        'VERSION',
+        'SOURCE_REVISION',
+        'SOURCE_TAG',
+        'PLATFORM',
+        'MAIN_IMAGE',
+        'MAIN_INDEX_DIGEST',
+        'MAIN_PLATFORM_DIGEST',
+        'REALTIME_IMAGE',
+        'REALTIME_INDEX_DIGEST',
+        'REALTIME_PLATFORM_DIGEST',
+        'POSTGRES_IMAGE',
+        'POSTGRES_DIGEST',
+        'POSTGRES_MAJOR',
+        'REDIS_IMAGE',
+        'REDIS_DIGEST',
+        'REDIS_MAJOR',
+        'MAIN_OCI_LABELS_SHA256',
+        'REALTIME_OCI_LABELS_SHA256',
+        'MAIN_SBOM_SHA256',
+        'REALTIME_SBOM_SHA256',
+        'MAIN_PROVENANCE_SHA256',
+        'REALTIME_PROVENANCE_SHA256',
+        'DOCKERFILE_MAIN_SHA256',
+        'DOCKERFILE_REALTIME_SHA256',
+        'COMPOSE_SHA256',
+        'COMPOSE_PROD_SHA256',
+        'COMPOSE_OVERLAY_SHA256',
+        'ENV_PRODUCTION_SHA256',
+        'RELEASE_ASSET_CONTRACT_SHA256',
+    ];
+    $previousPosition = -1;
+    foreach ($expectedKeys as $key) {
+        $position = strpos($manifestRun, "printf '{$key}=");
+        expect($position)->not->toBeFalse("Manifest key is missing: {$key}")
+            ->and($position)->toBeGreaterThan($previousPosition, "Manifest key is out of order: {$key}");
+        $previousPosition = $position;
+    }
+
+    expect($manifestRun)
+        ->toContain('openssl pkeyutl -sign -rawin')
+        ->toContain('openssl pkeyutl -verify -rawin -pubin')
+        ->toContain('committed_public_key=docker/fork-release-signing-ed25519.pub')
+        ->toContain('openssl pkey -pubin -in "$committed_public_key" -pubout -outform DER -out "$committed_public_der"')
+        ->toContain('cmp --silent "$derived_public_der" "$committed_public_der"')
+        ->toContain('key_id="sha256:$(sha256sum "$committed_public_der"')
+        ->toContain("grep -Eq '^sha256:[0-9a-f]{64}$'")
+        ->not->toContain('FORK_RELEASE_SIGNING_KEY_ID')
+        ->toContain('release-${platform//\//-}.env')
+        ->toContain('write_manifest linux/amd64')
+        ->toContain('write_manifest linux/arm64')
+        ->toContain('docker-compose.linux-amd64.custom.yml')
+        ->toContain('docker-compose.linux-arm64.custom.yml')
+        ->toContain('sha256_of docker/control-plane-blue-green/release-assets.contract')
+        ->not->toContain('RELEASE_ASSET_MANIFEST_SHA256');
+});
+
+it('recovers a split fork semantic promotion without overwriting its matching peer', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $promotionRun = (string) (releaseWorkflowStep(
+        $workflow['jobs']['fork-release'] ?? [],
+        'Promote realtime first and main last as the fork release commit marker',
+    )['run'] ?? '');
+    $filesystem = new Filesystem;
+    $fixture = sys_get_temp_dir().'/coolify-fork-split-recovery-'.bin2hex(random_bytes(8));
+    $registry = releaseWorkflowPrepareForkPromotionRegistryDouble(
+        $fixture,
+        releaseWorkflowTestDigest('3'),
+        null,
+    );
+
+    try {
+        $process = new Process(['bash', '-c', $promotionRun], $root, $registry['environment']);
+        $process->run();
+
+        $registryLog = (string) file_get_contents($registry['log']);
+        expect($process->isSuccessful())->toBeTrue($process->getErrorOutput())
+            ->and($process->getOutput())->toContain('accepting recovery state')
+            ->and($registryLog)
+            ->not->toContain('image copy docker.iocloudhost.net/williamagh/coolify@'.releaseWorkflowTestDigest('3').' docker.iocloudhost.net/williamagh/coolify:4.13.0-fork.1')
+            ->toContain('image copy docker.iocloudhost.net/williamagh/coolify-realtime@'.releaseWorkflowTestDigest('6').' docker.iocloudhost.net/williamagh/coolify-realtime:4.13.0-fork.1')
+            ->and(trim((string) file_get_contents($registry['state'].'/main')))->toBe(releaseWorkflowTestDigest('3'))
+            ->and(trim((string) file_get_contents($registry['state'].'/realtime')))->toBe(releaseWorkflowTestDigest('6'))
+            ->and(substr_count((string) file_get_contents($registry['curl_log']), '/git/ref/tags/4.13.0-fork.1'))->toBe(2)
+            ->and(substr_count((string) file_get_contents($registry['curl_log']), 'rulesets?targets=tag&includes_parents=true&per_page=100'))->toBe(2);
+    } finally {
+        $filesystem->remove($fixture);
+    }
+});
+
+it('fails closed on missing fork tag protection before any semantic registry write', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $promotionRun = (string) (releaseWorkflowStep(
+        $workflow['jobs']['fork-release'] ?? [],
+        'Promote realtime first and main last as the fork release commit marker',
+    )['run'] ?? '');
+    $filesystem = new Filesystem;
+    $fixture = sys_get_temp_dir().'/coolify-fork-ruleset-rejection-'.bin2hex(random_bytes(8));
+    $registry = releaseWorkflowPrepareForkPromotionRegistryDouble($fixture, null, null);
+    $registry['environment']['FORK_RULESET_STATE'] = 'missing-deletion';
+
+    try {
+        $process = new Process(['bash', '-c', $promotionRun], $root, $registry['environment']);
+        $process->run();
+
+        expect($process->isSuccessful())->toBeFalse()
+            ->and($process->getErrorOutput())->toContain('creation, update, and deletion controls')
+            ->and((string) file_get_contents($registry['log']))->not->toContain('image copy')
+            ->and(trim((string) file_get_contents($registry['state'].'/main')))->toBe('absent')
+            ->and(trim((string) file_get_contents($registry['state'].'/realtime')))->toBe('absent');
+    } finally {
+        $filesystem->remove($fixture);
+    }
+});
+
+it('fails closed when the live fork tag no longer resolves to the workflow source revision', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $promotionRun = (string) (releaseWorkflowStep(
+        $workflow['jobs']['fork-release'] ?? [],
+        'Promote realtime first and main last as the fork release commit marker',
+    )['run'] ?? '');
+    $filesystem = new Filesystem;
+    $fixture = sys_get_temp_dir().'/coolify-fork-live-tag-rejection-'.bin2hex(random_bytes(8));
+    $registry = releaseWorkflowPrepareForkPromotionRegistryDouble($fixture, null, null);
+    $registry['environment']['FORK_LIVE_TAG_STATE'] = 'mismatch';
+
+    try {
+        $process = new Process(['bash', '-c', $promotionRun], $root, $registry['environment']);
+        $process->run();
+
+        expect($process->isSuccessful())->toBeFalse()
+            ->and($process->getErrorOutput())->toContain('no longer resolves to the immutable workflow source revision')
+            ->and((string) file_get_contents($registry['log']))->not->toContain('image copy')
+            ->and(trim((string) file_get_contents($registry['state'].'/main')))->toBe('absent')
+            ->and(trim((string) file_get_contents($registry['state'].'/realtime')))->toBe('absent');
+    } finally {
+        $filesystem->remove($fixture);
+    }
+});
+
+it('rejects a mismatched fork semantic tag before it promotes a missing peer', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $promotionRun = (string) (releaseWorkflowStep(
+        $workflow['jobs']['fork-release'] ?? [],
+        'Promote realtime first and main last as the fork release commit marker',
+    )['run'] ?? '');
+    $filesystem = new Filesystem;
+    $fixture = sys_get_temp_dir().'/coolify-fork-mismatch-rejection-'.bin2hex(random_bytes(8));
+    $registry = releaseWorkflowPrepareForkPromotionRegistryDouble(
+        $fixture,
+        releaseWorkflowTestDigest('f'),
+        null,
+    );
+
+    try {
+        $process = new Process(['bash', '-c', $promotionRun], $root, $registry['environment']);
+        $process->run();
+
+        expect($process->isSuccessful())->toBeFalse()
+            ->and($process->getErrorOutput())->toContain('does not match its expected immutable index digest')
+            ->and((string) file_get_contents($registry['log']))->not->toContain('image copy')
+            ->and(trim((string) file_get_contents($registry['state'].'/realtime')))->toBe('absent');
+    } finally {
+        $filesystem->remove($fixture);
+    }
 });

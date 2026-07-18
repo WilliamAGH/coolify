@@ -13,8 +13,6 @@ class CompileBlueGreenProxyConfiguration
 {
     use AsAction;
 
-    private const GENERATED_FILE_PREFIX = 'coolify-blue-green-';
-
     public function handle(
         Application $application,
         StandaloneDocker $destination,
@@ -47,9 +45,6 @@ class CompileBlueGreenProxyConfiguration
         array $generatedLabels,
         BlueGreenRoutingTarget $target,
     ): BlueGreenProxyConfiguration {
-        if (preg_match('/^[A-Za-z0-9][A-Za-z0-9_-]*$/D', $applicationUuid) !== 1) {
-            throw new InvalidArgumentException('A Docker-safe application UUID is required to compile blue/green routing.');
-        }
         $parsed = $this->parseGeneratedLabels($generatedLabels);
         if ($parsed['traefikEnabled'] !== true) {
             throw new InvalidArgumentException('Canonical application labels must enable Traefik.');
@@ -58,10 +53,8 @@ class CompileBlueGreenProxyConfiguration
             throw new InvalidArgumentException('Canonical application labels did not generate any Traefik routers.');
         }
 
-        $scope = substr(hash('sha256', $applicationUuid."\0".$target->destinationId), 0, 16);
-        $namePrefix = "coolify-bg-{$scope}-";
-        $activeServiceName = $namePrefix.$target->activeColor->value;
-        $inactiveServiceName = $namePrefix.$target->inactiveColor()->value;
+        $namePrefix = BlueGreenRoutingTarget::routingNamePrefix($applicationUuid, $target->destinationId);
+        $activeServiceName = BlueGreenRoutingTarget::activeServiceName($applicationUuid, $target->destinationId);
         $publicServiceName = $target->mode === BlueGreenRoutingMode::LegacyRecoveryBridge
             ? $namePrefix.'legacy-recovery-bridge'
             : $activeServiceName;
@@ -99,7 +92,11 @@ class CompileBlueGreenProxyConfiguration
                 $probeRule = '('.$router['rule'].') && Header(`'.$target->probeHeaderName.'`, `'.$target->probeToken.'`)';
                 $probeRouter = $router;
                 $probeRouter['rule'] = $probeRule;
-                $probeRouter['service'] = $namePrefix.$target->probeColor->value;
+                $probeRouter['service'] = BlueGreenRoutingTarget::memberServiceReference(
+                    $applicationUuid,
+                    $target->destinationId,
+                    $target->probeColor,
+                );
                 unset($probeRouter['priority']);
                 $probeRouter['middlewares'] = array_values(array_merge(
                     [$probeMiddlewareName],
@@ -151,8 +148,18 @@ class CompileBlueGreenProxyConfiguration
         ksort($routers);
         ksort($middlewares);
         $services = [
-            $activeServiceName => $this->service($target->containerName($target->activeColor), $target->port),
-            $inactiveServiceName => $this->service($target->containerName($target->inactiveColor()), $target->port),
+            $activeServiceName => [
+                'weighted' => [
+                    'services' => [[
+                        'name' => BlueGreenRoutingTarget::memberServiceReference(
+                            $applicationUuid,
+                            $target->destinationId,
+                            $target->activeColor,
+                        ),
+                        'weight' => 1,
+                    ]],
+                ],
+            ],
         ];
         if ($target->mode === BlueGreenRoutingMode::LegacyRecoveryBridge) {
             $services[$publicServiceName] = $this->service(
@@ -180,7 +187,7 @@ class CompileBlueGreenProxyConfiguration
             throw new InvalidArgumentException('Generated blue/green Traefik YAML did not round-trip exactly.');
         }
 
-        $managedFilename = self::GENERATED_FILE_PREFIX.$scope.'.yaml';
+        $managedFilename = BlueGreenRoutingTarget::managedFilename($applicationUuid, $target->destinationId);
 
         return new BlueGreenProxyConfiguration(
             managedFilename: $managedFilename,

@@ -92,6 +92,29 @@ test('global destinations page renders a single empty state when no usable serve
         ->assertSee('No destinations found.');
 });
 
+test('global destinations page directs users to server review when no deployment server is eligible', function (array $serverSettings) {
+    $server = Server::factory()->create(['team_id' => $this->team->id]);
+    $server->settings()->update($serverSettings);
+
+    $this->get(route('destination.index'))
+        ->assertSuccessful()
+        ->assertSee('No destinations are available.')
+        ->assertSee('An eligible deployment server is required before you can create a destination.')
+        ->assertSee('Review servers')
+        ->assertSee('href="'.route('server.index').'"', false)
+        ->assertDontSee('No destinations found.');
+})->with([
+    'unreachable and unusable server' => [[
+        'is_reachable' => false,
+        'is_usable' => false,
+    ]],
+    'validated reachable build-only server' => [[
+        'is_reachable' => true,
+        'is_usable' => true,
+        'is_build_server' => true,
+    ]],
+]);
+
 test('adding a discovered swarm destination stores the selected network name', function () {
     $server = Server::factory()->create(['team_id' => $this->team->id]);
     $server->settings()->update([

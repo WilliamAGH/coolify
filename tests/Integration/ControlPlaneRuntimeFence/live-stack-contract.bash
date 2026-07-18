@@ -25,7 +25,7 @@ live_stack_contract_keys()
         web_b_direct_probe_token_file web_b_direct_probe_runtime_file \
         web_a_applied_ack_file web_a_applied_ack_runtime_file \
         web_b_applied_ack_file web_b_applied_ack_runtime_file web_a_ingress_address \
-        web_b_ingress_address terminal_https_url terminal_port8000_url management_endpoints \
+        web_b_ingress_address terminal_https_url terminal_local_ingress_url management_endpoints \
         self_ssh_target provider_api_url provider_router provider_service provider_legacy_port \
         provider_header_file
 }
@@ -92,7 +92,7 @@ api:
 entryPoints:
   websecure:
     address: ":8443"
-  legacy:
+  coolify-local:
     address: ":8000"
   provider:
     address: ":18080"
@@ -271,7 +271,7 @@ live_stack_write_contract()
         printf 'web_a_ingress_address=%s\nweb_b_ingress_address=%s\n' \
             "$LIVE_STACK_GREEN_WEB_A_IP" "$LIVE_STACK_GREEN_WEB_B_IP"
         printf 'terminal_https_url=https://127.0.0.1:8443/api/control-plane/route-health\n'
-        printf 'terminal_port8000_url=http://127.0.0.1:8000/api/control-plane/route-health\n'
+        printf 'terminal_local_ingress_url=http://127.0.0.1:8000/api/control-plane/route-health\n'
         printf 'management_endpoints=lo=127.0.0.1\nself_ssh_target=127.0.0.1\n'
         printf 'provider_api_url=http://127.0.0.1:18080/api/rawdata\n'
         printf 'provider_router=coolify@docker\nprovider_service=coolify@docker\nprovider_legacy_port=8080\n'

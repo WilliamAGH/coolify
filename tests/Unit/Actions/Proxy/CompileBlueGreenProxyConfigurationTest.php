@@ -114,7 +114,7 @@ function applicationForBlueGreenDestination(StandaloneDocker $primaryDestination
     return $application;
 }
 
-it('compiles the exact HTTP generated-label output into fixed blue and green services', function () {
+it('compiles the exact HTTP generated-label output through one Docker-backed active service', function () {
     ['artifact' => $artifact, 'parsed' => $parsed] = compileCanonicalTraefikLabels(
         canonicalTraefikLabels(['http://example.test']),
         blueGreenTarget(probeHeader: null, probeToken: null, probeColor: null),
@@ -130,7 +130,7 @@ it('compiles the exact HTTP generated-label output into fixed blue and green ser
                     $routerName => [
                         'rule' => 'Host(`example.test`) && PathPrefix(`/`)',
                         'entryPoints' => ['http'],
-                        'service' => "coolify-bg-{$scope}-blue",
+                        'service' => "coolify-bg-{$scope}-active",
                         'middlewares' => [
                             "coolify-bg-{$scope}-public-applied-proof",
                             "coolify-bg-{$scope}-gzip",
@@ -151,15 +151,18 @@ it('compiles the exact HTTP generated-label output into fixed blue and green ser
                     ],
                 ],
                 'services' => [
-                    "coolify-bg-{$scope}-blue" => [
-                        'loadBalancer' => ['servers' => [['url' => 'http://app-fixed-blue:8080']]],
-                    ],
-                    "coolify-bg-{$scope}-green" => [
-                        'loadBalancer' => ['servers' => [['url' => 'http://app-fixed-green:8080']]],
+                    "coolify-bg-{$scope}-active" => [
+                        'weighted' => [
+                            'services' => [[
+                                'name' => "coolify-bg-{$scope}-blue@docker",
+                                'weight' => 1,
+                            ]],
+                        ],
                     ],
                 ],
             ],
         ])
+        ->and($artifact->yaml)->not->toContain('app-fixed-blue', 'app-fixed-green', 'http://')
         ->and($artifact->yaml)->toStartWith(
             "# This file is generated and managed by Coolify.\n".
             "# coolify.blue-green.managed: \"true\"\n".
@@ -170,7 +173,32 @@ it('compiles the exact HTTP generated-label output into fixed blue and green ser
         );
 });
 
+it('does not let application routing claim the control-plane loopback entrypoint', function () {
+    $compiled = (new CompileBlueGreenProxyConfiguration)->compileGeneratedLabels(
+        applicationUuid: 'app-test',
+        generatedLabels: canonicalTraefikLabels(['https://example.test']),
+        target: blueGreenTarget(probeHeader: null, probeToken: null, probeColor: null),
+    );
+    $parsed = Yaml::parse($compiled->yaml);
+    $routers = $parsed['http']['routers'];
+
+    expect(collect($routers)->pluck('entryPoints')->flatten()->all())
+        ->not->toContain('coolify-local')
+        ->and($parsed['http']['services'])->toBe([
+            'coolify-bg-a5adf99dc3d81b09-active' => [
+                'weighted' => [
+                    'services' => [[
+                        'name' => 'coolify-bg-a5adf99dc3d81b09-blue@docker',
+                        'weight' => 1,
+                    ]],
+                ],
+            ],
+        ]);
+});
+
 it('compiles against the actual additional destination without mutating the application primary destination', function () {
+    $originalControlPlaneMode = getenv('CONTROL_PLANE_MODE');
+    putenv('CONTROL_PLANE_MODE=passive');
     $primary = blueGreenDestination(1, ProxyTypes::CADDY, 'primary-network');
     $additional = blueGreenDestination(9, ProxyTypes::TRAEFIK, 'additional-network', false);
     $application = applicationForBlueGreenDestination($primary);
@@ -183,34 +211,40 @@ it('compiles against the actual additional destination without mutating the appl
         routingRevision: 7,
     );
 
-    $compiled = (new CompileBlueGreenProxyConfiguration)->handle($application, $additional, $target);
+    try {
+        $compiled = (new CompileBlueGreenProxyConfiguration)->handle($application, $additional, $target);
 
-    expect(Yaml::parse($compiled->yaml)['http']['routers'])->not->toBeEmpty()
-        ->and($application->destination)->toBe($primary)
-        ->and(fn () => (new CompileBlueGreenProxyConfiguration)->handle(
-            $application,
-            $primary,
-            new BlueGreenRoutingTarget(
-                destinationId: 1,
-                activeColor: BlueGreenDeploymentColor::BLUE,
-                blueContainerName: 'app-fixed-blue',
-                greenContainerName: 'app-fixed-green',
-                port: 8080,
-                routingRevision: 7,
-            ),
-        ))->toThrow(InvalidArgumentException::class, 'Traefik destination')
-        ->and(fn () => (new CompileBlueGreenProxyConfiguration)->handle(
-            $application,
-            $additional,
-            new BlueGreenRoutingTarget(
-                destinationId: 10,
-                activeColor: BlueGreenDeploymentColor::BLUE,
-                blueContainerName: 'app-fixed-blue',
-                greenContainerName: 'app-fixed-green',
-                port: 8080,
-                routingRevision: 7,
-            ),
-        ))->toThrow(InvalidArgumentException::class, 'actual deployment destination');
+        expect(Yaml::parse($compiled->yaml)['http']['routers'])->not->toBeEmpty()
+            ->and($application->destination)->toBe($primary)
+            ->and(fn () => (new CompileBlueGreenProxyConfiguration)->handle(
+                $application,
+                $primary,
+                new BlueGreenRoutingTarget(
+                    destinationId: 1,
+                    activeColor: BlueGreenDeploymentColor::BLUE,
+                    blueContainerName: 'app-fixed-blue',
+                    greenContainerName: 'app-fixed-green',
+                    port: 8080,
+                    routingRevision: 7,
+                ),
+            ))->toThrow(InvalidArgumentException::class, 'Traefik destination')
+            ->and(fn () => (new CompileBlueGreenProxyConfiguration)->handle(
+                $application,
+                $additional,
+                new BlueGreenRoutingTarget(
+                    destinationId: 10,
+                    activeColor: BlueGreenDeploymentColor::BLUE,
+                    blueContainerName: 'app-fixed-blue',
+                    greenContainerName: 'app-fixed-green',
+                    port: 8080,
+                    routingRevision: 7,
+                ),
+            ))->toThrow(InvalidArgumentException::class, 'actual deployment destination');
+    } finally {
+        putenv($originalControlPlaneMode === false
+            ? 'CONTROL_PLANE_MODE'
+            : "CONTROL_PLANE_MODE={$originalControlPlaneMode}");
+    }
 });
 
 it('preserves HTTPS TLS and force-redirect routers from generated labels', function () {
@@ -301,7 +335,7 @@ it('adds secret probe routes to the inactive color without public metadata heade
         '8080',
     ]), 'opaque-probe-token-1234');
 
-    expect($probeRouter['service'])->toBe('coolify-bg-a5adf99dc3d81b09-blue')
+    expect($probeRouter['service'])->toBe('coolify-bg-a5adf99dc3d81b09-blue@docker')
         ->and($probeRouter['rule'])->toContain('Header(`X-Coolify-Probe`, `opaque-probe-token-1234`)')
         ->and($probeRouter)->not->toHaveKey('priority')
         ->and($probeRouter['middlewares'][0])->toBe('coolify-bg-a5adf99dc3d81b09-probe-header-strip')
@@ -348,8 +382,8 @@ it('can acknowledge the promoted active color after the public switch', function
     $probeMiddleware = $parsed['http']['middlewares']['coolify-bg-a5adf99dc3d81b09-probe-header-strip'];
     $publicProofMiddleware = $parsed['http']['middlewares']['coolify-bg-a5adf99dc3d81b09-public-applied-proof'];
 
-    expect($publicRouter['service'])->toBe('coolify-bg-a5adf99dc3d81b09-blue')
-        ->and($probeRouter['service'])->toBe('coolify-bg-a5adf99dc3d81b09-blue')
+    expect($publicRouter['service'])->toBe('coolify-bg-a5adf99dc3d81b09-active')
+        ->and($probeRouter['service'])->toBe('coolify-bg-a5adf99dc3d81b09-blue@docker')
         ->and($artifact->yaml)->not->toContain('opaque-public-proof-token-5678')
         ->and($publicProofMiddleware['headers']['customResponseHeaders'])->toBe([
             BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER => $target->publicAcknowledgement(),
@@ -516,13 +550,43 @@ it('rejects empty canonical router fields and unsafe probe matcher inputs', func
         ))->toThrow(InvalidArgumentException::class, 'Docker-safe application UUID');
 });
 
-it('emits only private routing labels for blue green containers', function () {
-    $labels = generateBlueGreenApplicationContainerLabels(BlueGreenDeploymentColor::GREEN, 12);
+it('emits deterministic Docker discovery and canonical HTTP health labels for blue green members', function () {
+    $application = new Application;
+    $application->uuid = 'app-test';
+    $application->health_check_enabled = true;
+    $application->health_check_type = 'http';
+    $application->health_check_path = '/health';
+    $application->health_check_host = 'example.test';
+    $application->health_check_method = 'GET';
+    $application->health_check_return_code = 204;
+    $application->health_check_scheme = 'http';
+    $application->health_check_interval = 5;
+    $application->health_check_timeout = 2;
+    $application->health_check_port = 8081;
+
+    $labels = generateBlueGreenApplicationContainerLabels(
+        $application,
+        5,
+        BlueGreenDeploymentColor::GREEN,
+        12,
+        8080,
+    );
 
     expect($labels)->toBe([
-        'traefik.enable=false',
+        'traefik.enable=true',
+        'traefik.http.routers.coolify-bg-a5adf99dc3d81b09-green-discovery.rule=Host(`coolify-bg-a5adf99dc3d81b09-green-discovery.invalid`)',
+        'traefik.http.routers.coolify-bg-a5adf99dc3d81b09-green-discovery.service=noop@internal',
+        'traefik.http.services.coolify-bg-a5adf99dc3d81b09-green.loadbalancer.server.port=8080',
         'coolify.blueGreen.managed=true',
         'coolify.blueGreen.color=green',
         'coolify.blueGreen.routingRevision=12',
-    ])->and(array_filter($labels, fn (string $label): bool => str_starts_with($label, 'traefik.http.')))->toBe([]);
+        'traefik.http.services.coolify-bg-a5adf99dc3d81b09-green.loadbalancer.healthcheck.path=/health',
+        'traefik.http.services.coolify-bg-a5adf99dc3d81b09-green.loadbalancer.healthcheck.hostname=example.test',
+        'traefik.http.services.coolify-bg-a5adf99dc3d81b09-green.loadbalancer.healthcheck.method=GET',
+        'traefik.http.services.coolify-bg-a5adf99dc3d81b09-green.loadbalancer.healthcheck.status=204',
+        'traefik.http.services.coolify-bg-a5adf99dc3d81b09-green.loadbalancer.healthcheck.scheme=http',
+        'traefik.http.services.coolify-bg-a5adf99dc3d81b09-green.loadbalancer.healthcheck.interval=5s',
+        'traefik.http.services.coolify-bg-a5adf99dc3d81b09-green.loadbalancer.healthcheck.timeout=2s',
+        'traefik.http.services.coolify-bg-a5adf99dc3d81b09-green.loadbalancer.healthcheck.port=8081',
+    ])->and(implode("\n", $labels))->not->toContain('app-fixed-', 'http://');
 });

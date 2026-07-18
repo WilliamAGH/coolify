@@ -20,12 +20,9 @@ class GetProxyConfiguration
             return 'OK';
         }
 
-        $proxy_configuration = null;
+        $proxy_configuration = $server->proxy->get('last_saved_proxy_configuration');
 
         if (! $forceRegenerate) {
-            // Primary source: database
-            $proxy_configuration = $server->proxy->get('last_saved_proxy_configuration');
-
             // Validate stored config matches current proxy type
             if (! empty(trim($proxy_configuration ?? ''))) {
                 if (! $this->configMatchesProxyType($proxyType, $proxy_configuration)) {
@@ -41,6 +38,8 @@ class GetProxyConfiguration
             if (empty(trim($proxy_configuration ?? ''))) {
                 $proxy_configuration = $this->backfillFromDisk($server);
             }
+        } elseif (empty(trim($proxy_configuration ?? ''))) {
+            $proxy_configuration = $this->backfillFromDisk($server);
         }
 
         // Generate default configuration as last resort

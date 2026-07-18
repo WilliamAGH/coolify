@@ -7,7 +7,7 @@
 image_transport_contract_keys()
 {
     printf '%s\n' \
-        version operation_id web_source_reference proxy_source_reference \
+        version operation_id host_platform web_source_reference proxy_source_reference \
         web_archive_name web_archive_sha256 web_archive_metadata web_image_digest web_platform \
         web_contract_sha256 proxy_archive_name proxy_archive_sha256 proxy_archive_metadata \
         proxy_image_digest proxy_platform proxy_contract_sha256
@@ -35,6 +35,51 @@ image_transport_assert_image_digest()
         || image_transport_blocked "$1 must be an immutable image config digest"
 }
 
+image_transport_host_platform()
+{
+    local platform=${CONTROL_PLANE_RUNTIME_HOST_GATE_PLATFORM:-}
+
+    case "$platform" in
+        linux/amd64|linux/arm64) printf '%s' "$platform" ;;
+        *) image_transport_blocked 'CONTROL_PLANE_RUNTIME_HOST_GATE_PLATFORM must explicitly identify linux/amd64 or linux/arm64' ;;
+    esac
+}
+
+image_transport_assert_native_docker_platform()
+{
+    local expected_platform actual_platform
+
+    expected_platform=$(image_transport_host_platform)
+    actual_platform=$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}') \
+        || image_transport_blocked 'image transport could not attest the Docker engine platform'
+    [[ $actual_platform == "$expected_platform" ]] \
+        || image_transport_blocked "image transport Docker engine platform differs from the native host-gate platform: expected=$expected_platform actual=$actual_platform"
+}
+
+image_transport_temporary_root()
+{
+    local root=${TMPDIR:-/tmp} canonical
+
+    root=${root%/}
+    [[ -n $root ]] || root=/
+    [[ $root == /* && $root != *$'\n'* && -d $root && ! -L $root ]] \
+        || image_transport_blocked 'TMPDIR must be an existing absolute non-symlink directory'
+    canonical=$(cd -- "$root" && pwd -P) \
+        || image_transport_blocked 'TMPDIR could not be resolved canonically'
+    [[ $canonical == /* && -d $canonical && ! -L $canonical ]] \
+        || image_transport_blocked 'TMPDIR did not resolve to a safe canonical directory'
+    printf '%s' "$canonical"
+}
+
+image_transport_mismatched_platform()
+{
+    case "$1" in
+        linux/amd64) printf '%s' linux/arm64 ;;
+        linux/arm64) printf '%s' linux/amd64 ;;
+        *) image_transport_fail 'cannot derive a mismatched platform from an unapproved platform' ;;
+    esac
+}
+
 image_transport_file_metadata()
 {
     stat -c '%u:%g:%a:%s' "$1"
@@ -42,13 +87,14 @@ image_transport_file_metadata()
 
 image_transport_web_contract_sha256()
 {
-    local image=$1 entrypoint
+    local image=$1 entrypoint platform
 
+    platform=$(image_transport_host_platform)
     entrypoint=$(docker image inspect --format '{{index .Config.Entrypoint 0}}' "$image")
     [[ $entrypoint == /usr/local/bin/coolify-entrypoint ]] \
         || image_transport_blocked 'the transported web image lacks the production Coolify entrypoint'
     # shellcheck disable=SC2016 # This literal is evaluated by the isolated image shell, not this script.
-    docker run --rm --pull never --platform linux/amd64 --network none --entrypoint /bin/sh "$image" -ec '
+    docker run --rm --pull never --platform "$platform" --network none --entrypoint /bin/sh "$image" -ec '
         test -x /usr/local/bin/coolify-entrypoint
         test -x /usr/local/bin/control-plane-direct-probe-healthcheck
         test -f /var/www/html/artisan
@@ -69,9 +115,10 @@ image_transport_web_contract_sha256()
 
 image_transport_proxy_contract_sha256()
 {
-    local image=$1 version
+    local image=$1 version platform
 
-    version=$(docker run --rm --pull never --platform linux/amd64 --network none \
+    platform=$(image_transport_host_platform)
+    version=$(docker run --rm --pull never --platform "$platform" --network none \
         --entrypoint traefik "$image" version)
     grep -q '^Version:' <<< "$version" \
         || image_transport_blocked 'the transported proxy image is not a runnable Traefik image'
@@ -80,8 +127,9 @@ image_transport_proxy_contract_sha256()
 
 image_transport_outer_inspect_image()
 {
-    local role=$1 reference=$2 repo_digests image_digest platform contract_sha256
+    local role=$1 reference=$2 repo_digests image_digest platform contract_sha256 expected_platform
 
+    expected_platform=$(image_transport_host_platform)
     image_transport_assert_source_reference "$role source image" "$reference"
     docker image inspect "$reference" >/dev/null \
         || image_transport_blocked "the supplied $role repository digest is not available locally"
@@ -91,8 +139,8 @@ image_transport_outer_inspect_image()
     image_digest=$(docker image inspect --format '{{.Id}}' "$reference")
     image_transport_assert_image_digest "$role source image" "$image_digest"
     platform=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$reference")
-    [[ $platform == linux/amd64 ]] \
-        || image_transport_blocked "the supplied $role image is not linux/amd64: $platform"
+    [[ $platform == "$expected_platform" ]] \
+        || image_transport_blocked "the supplied $role image is not the required native $expected_platform platform: $platform"
     case "$role" in
         web) contract_sha256=$(image_transport_web_contract_sha256 "$reference") ;;
         proxy) contract_sha256=$(image_transport_proxy_contract_sha256 "$reference") ;;
@@ -105,7 +153,10 @@ image_transport_outer_inspect_image()
 
 image_transport_outer_evidence_run()
 {
-    docker run --rm --pull never --platform linux/amd64 --network none --entrypoint /bin/sh \
+    local platform
+
+    platform=$(image_transport_host_platform)
+    docker run --rm --pull never --platform "$platform" --network none --entrypoint /bin/sh \
         --mount "type=volume,source=${EVIDENCE_VOLUME},target=/evidence" \
         "$CONTROL_PLANE_RUNTIME_HOST_IMAGE" "$@"
 }
@@ -123,12 +174,13 @@ image_transport_outer_prepare_directory()
 
 image_transport_outer_copy_file()
 {
-    local operation=$1 filename=$2 source=$3
+    local operation=$1 filename=$2 source=$3 platform
 
+    platform=$(image_transport_host_platform)
     [[ -f $source && ! -L $source ]] \
         || image_transport_blocked 'outer transport did not create a safe immutable file candidate'
     # shellcheck disable=SC2016 # This literal is evaluated by the isolated evidence helper shell.
-    docker run --rm --pull never --platform linux/amd64 --network none --entrypoint /bin/sh \
+    docker run --rm --pull never --platform "$platform" --network none --entrypoint /bin/sh \
         --mount "type=bind,source=${source},target=/input/archive,readonly" \
         --mount "type=volume,source=${EVIDENCE_VOLUME},target=/evidence" \
         "$CONTROL_PLANE_RUNTIME_HOST_IMAGE" -ec '
@@ -159,9 +211,10 @@ image_transport_outer_file_evidence()
 
 image_transport_outer_capture_archive()
 {
-    local operation=$1 reference=$2 filename=$3 transfer_directory archive_candidate
+    local operation=$1 reference=$2 filename=$3 transfer_directory archive_candidate temporary_root
 
-    transfer_directory=$(mktemp -d "/private/tmp/coolify-runtime-fence-image-export.${operation}.XXXXXX")
+    temporary_root=$(image_transport_temporary_root)
+    transfer_directory=$(mktemp -d "$temporary_root/coolify-runtime-fence-image-export.${operation}.XXXXXX")
     archive_candidate=$transfer_directory/archive
     if ! docker save --output "$archive_candidate" "$reference"; then
         rm -f -- "$archive_candidate"
@@ -180,9 +233,10 @@ image_transport_outer_capture_archive()
 
 image_transport_outer_publish_manifest()
 {
-    local operation=$1 manifest=$2 transfer_directory manifest_candidate
+    local operation=$1 manifest=$2 transfer_directory manifest_candidate temporary_root
 
-    transfer_directory=$(mktemp -d "/private/tmp/coolify-runtime-fence-image-manifest.${operation}.XXXXXX")
+    temporary_root=$(image_transport_temporary_root)
+    transfer_directory=$(mktemp -d "$temporary_root/coolify-runtime-fence-image-manifest.${operation}.XXXXXX")
     manifest_candidate=$transfer_directory/images.env
     printf '%s\n' "$manifest" > "$manifest_candidate"
     chmod 0600 "$manifest_candidate"
@@ -197,9 +251,11 @@ image_transport_outer_publish_manifest()
 
 image_transport_outer_export()
 {
-    local operation=$1 manifest
+    local operation=$1 manifest host_platform
     local -a web_evidence=() proxy_evidence=() web_archive=() proxy_archive=() manifest_evidence=()
 
+    host_platform=$(image_transport_host_platform)
+    image_transport_assert_native_docker_platform
     image_transport_outer_prepare_directory "$operation"
     mapfile -t web_evidence < <(image_transport_outer_inspect_image web "$CONTROL_PLANE_RUNTIME_WEB_A_IMAGE")
     mapfile -t proxy_evidence < <(image_transport_outer_inspect_image proxy "$CONTROL_PLANE_RUNTIME_PROXY_IMAGE")
@@ -214,7 +270,7 @@ image_transport_outer_export()
         && ${web_archive[1]} =~ ^0:0:600:[1-9][0-9]*$ && ${proxy_archive[1]} =~ ^0:0:600:[1-9][0-9]*$ ]] \
         || image_transport_blocked 'outer image archive metadata is incomplete or unsafe'
     manifest=$(
-        printf 'version=1\noperation_id=%s\n' "$operation"
+        printf 'version=1\noperation_id=%s\nhost_platform=%s\n' "$operation" "$host_platform"
         printf 'web_source_reference=%s\nproxy_source_reference=%s\n' \
             "$CONTROL_PLANE_RUNTIME_WEB_A_IMAGE" "$CONTROL_PLANE_RUNTIME_PROXY_IMAGE"
         printf 'web_archive_name=web-image.tar\nweb_archive_sha256=%s\nweb_archive_metadata=%s\n' \
@@ -269,13 +325,15 @@ image_transport_value()
 
 image_transport_validate_manifest()
 {
-    local operation=$1 expected_web=$2 expected_proxy=$3
+    local operation=$1 expected_web=$2 expected_proxy=$3 expected_platform
     local kind value
 
+    expected_platform=$(image_transport_host_platform)
     [[ $(image_transport_value version) == 1 && $(image_transport_value operation_id) == "$operation" \
+        && $(image_transport_value host_platform) == "$expected_platform" \
         && $(image_transport_value web_source_reference) == "$expected_web" \
         && $(image_transport_value proxy_source_reference) == "$expected_proxy" ]] \
-        || image_transport_blocked 'image transport manifest does not bind the supplied immutable input'
+        || image_transport_blocked 'image transport manifest does not bind the supplied immutable input and exact host platform'
     image_transport_assert_source_reference web-source-reference "$(image_transport_value web_source_reference)"
     image_transport_assert_source_reference proxy-source-reference "$(image_transport_value proxy_source_reference)"
     [[ $(image_transport_value web_archive_name) == web-image.tar \
@@ -289,8 +347,8 @@ image_transport_validate_manifest()
         [[ $value =~ ^0:0:600:[1-9][0-9]*$ ]] \
             || image_transport_blocked "image transport $kind archive metadata is malformed"
         image_transport_assert_image_digest "$kind image" "$(image_transport_value "${kind}_image_digest")"
-        [[ $(image_transport_value "${kind}_platform") == linux/amd64 ]] \
-            || image_transport_blocked "image transport $kind image platform is not linux/amd64"
+        [[ $(image_transport_value "${kind}_platform") == "$expected_platform" ]] \
+            || image_transport_blocked "image transport $kind image platform does not match required native $expected_platform"
         value=$(image_transport_value "${kind}_contract_sha256")
         [[ $value =~ ^[a-f0-9]{64}$ ]] \
             || image_transport_blocked "image transport $kind content evidence is malformed"
@@ -392,16 +450,23 @@ image_transport_expect_rejection()
 
 image_transport_run_negatives()
 {
-    local manifest=$1 archive_directory=$2 operation=$3 expected_web=$4 expected_proxy=$5 candidate
+    local manifest=$1 archive_directory=$2 operation=$3 expected_web=$4 expected_proxy=$5 candidate expected_platform mismatched_platform
     local zeros=0000000000000000000000000000000000000000000000000000000000000000
 
+    expected_platform=$(image_transport_host_platform)
+    mismatched_platform=$(image_transport_mismatched_platform "$expected_platform")
     candidate=$(mktemp /run/coolify-runtime-fence-image-transport-tamper.XXXXXX)
     image_transport_write_candidate_manifest "$manifest" "$candidate" web_archive_sha256 "$zeros"
     image_transport_expect_rejection 'tampered immutable web archive evidence' 'archive hash' \
         "$candidate" "$archive_directory" "$operation" "$expected_web" "$expected_proxy"
     rm -f -- "$candidate"
     candidate=$(mktemp /run/coolify-runtime-fence-image-transport-platform.XXXXXX)
-    image_transport_write_candidate_manifest "$manifest" "$candidate" web_platform linux/arm64
+    image_transport_write_candidate_manifest "$manifest" "$candidate" host_platform "$mismatched_platform"
+    image_transport_expect_rejection 'wrong-host-platform immutable image evidence' 'exact host platform' \
+        "$candidate" "$archive_directory" "$operation" "$expected_web" "$expected_proxy"
+    rm -f -- "$candidate"
+    candidate=$(mktemp /run/coolify-runtime-fence-image-transport-platform.XXXXXX)
+    image_transport_write_candidate_manifest "$manifest" "$candidate" web_platform "$mismatched_platform"
     image_transport_expect_rejection 'wrong-platform immutable web image evidence' 'platform' \
         "$candidate" "$archive_directory" "$operation" "$expected_web" "$expected_proxy"
     rm -f -- "$candidate"
@@ -433,6 +498,7 @@ image_transport_import_inner()
 
     [[ $expected_manifest_sha256 =~ ^[a-f0-9]{64}$ ]] \
         || image_transport_blocked 'outer host did not provide an immutable image transport manifest hash'
+    image_transport_assert_native_docker_platform
     archive_directory=/evidence/image-transport/$operation
     manifest=$archive_directory/images.env
     [[ -d $archive_directory && ! -L $archive_directory ]] \
@@ -451,6 +517,7 @@ image_transport_restore_inner()
 
     [[ $expected_manifest_sha256 =~ ^[a-f0-9]{64}$ ]] \
         || image_transport_blocked 'outer host did not provide an immutable image transport manifest hash'
+    image_transport_assert_native_docker_platform
     archive_directory=/evidence/image-transport/$operation
     manifest=$archive_directory/images.env
     [[ -d $archive_directory && ! -L $archive_directory ]] \

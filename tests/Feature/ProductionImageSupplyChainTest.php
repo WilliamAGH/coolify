@@ -268,7 +268,7 @@ it('excludes local-only repository data from the Docker build context', function
         ->toContain('/storage/debugbar')
         ->toContain('.env*')
         ->toContain('!/.env.development.example')
-        ->toContain('!/.env.windows-docker-desktop.example')
+        ->not->toContain('!/.env.windows-docker-desktop.example')
         ->not->toContain('.env')
         ->not->toContain('.env.production')
         ->not->toContain('.env.secrets');
@@ -415,7 +415,7 @@ it('parses the reusable testing-host publication and attestation contract', func
     }
 });
 
-it('runs provenance and control-plane prerequisite checks in an explicit simulation', function () {
+it('runs source provenance checks in an explicit simulation', function () {
     $process = new Process([
         'bash',
         base_path('tests/Integration/ProductionImageSupplyChain/run-simulations.sh'),

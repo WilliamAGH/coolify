@@ -22,6 +22,10 @@ on:
         default: ''
         required: false
         type: string
+      staging_alias:
+        default: ''
+        required: false
+        type: string
       publish_latest:
         default: false
         required: false
@@ -32,9 +36,15 @@ on:
         type: boolean
     secrets:
       DOCKERHUB_USERNAME:
-        required: true
+        required: false
       DOCKERHUB_TOKEN:
-        required: true
+        required: false
+      NEXUS_USERNAME:
+        required: false
+      NEXUS_PASSWORD:
+        required: false
+      FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY:
+        required: false
     outputs:
       digest:
         description: Published multi-platform index digest.
@@ -45,6 +55,24 @@ on:
       docker_image:
         description: Immutable Docker Hub image reference.
         value: ${{ jobs.release.outputs.docker_image || jobs.repair-latest.outputs.docker_image || jobs.verify-authoritative-noop.outputs.docker_image }}
+      staging_digest:
+        description: Published staging multi-platform index digest.
+        value: ${{ jobs.release.outputs.staging_digest }}
+      staging_image:
+        description: Docker Hub staging alias reference.
+        value: ${{ jobs.release.outputs.staging_image }}
+      fork_main_digest:
+        description: Published fork main-image index digest.
+        value: ${{ jobs.fork-release.outputs.main_digest }}
+      fork_main_image:
+        description: Immutable fork main-image reference.
+        value: ${{ jobs.fork-release.outputs.main_image }}
+      fork_realtime_digest:
+        description: Published fork realtime-image index digest.
+        value: ${{ jobs.fork-release.outputs.realtime_digest }}
+      fork_realtime_image:
+        description: Immutable fork realtime-image reference.
+        value: ${{ jobs.fork-release.outputs.realtime_image }}
 
 permissions: {}
 
@@ -55,7 +83,8 @@ concurrency:
 jobs:
   validate-inputs:
     name: Validate release target
-    permissions: {}
+    permissions:
+      contents: read
     runs-on: ubuntu-24.04
     outputs:
       docker_image: ${{ steps.publication.outputs.docker_image }}
@@ -65,27 +94,48 @@ jobs:
       repair_required: ${{ steps.publication.outputs.repair_required }}
       run_tag: ${{ steps.target.outputs.run_tag }}
     steps:
+      - name: Check out exact fork source for version binding
+        if: ${{ inputs.release_kind == 'fork' }}
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
       - id: target
         env:
           ARTIFACT_NAME: ${{ inputs.artifact_name }}
           CANDIDATE_REPOSITORY: ${{ inputs.candidate_repository }}
           DOCKERFILE: ${{ inputs.dockerfile }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          FORK_SEMANTIC_VERSION_PATTERN: '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-fork\.[1-9][0-9]*$'
+          FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY: ${{ secrets.FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY }}
+          GITHUB_REF_TYPE: ${{ github.ref_type }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
           PUBLISH_LATEST: ${{ inputs.publish_latest }}
           RELEASE_KIND: ${{ inputs.release_kind }}
           REPOSITORY: ${{ github.repository }}
           SEMANTIC_VERSION: ${{ inputs.semantic_version }}
           SEMANTIC_VERSION_PATTERN: '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*))(\.((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?$'
+          STAGING_ALIAS: ${{ inputs.staging_alias }}
           TARGET_REPOSITORY: ${{ inputs.target_repository }}
           VALIDATE_ONLY: ${{ inputs.validate_only }}
         run: |
           set -eu
+          require_dockerhub_credentials() {
+            [ -n "$DOCKERHUB_USERNAME" ]
+            [ -n "$DOCKERHUB_TOKEN" ]
+          }
           case "$RELEASE_KIND" in
             production)
+              require_dockerhub_credentials
               [ "$ARTIFACT_NAME" = 'coolify' ]
               [ "$DOCKERFILE" = 'docker/production/Dockerfile' ]
               [ "$TARGET_REPOSITORY" = 'coollabsio/coolify' ]
               [ "$CANDIDATE_REPOSITORY" = 'coollabsio/coolify-production-staging' ]
               printf '%s' "$SEMANTIC_VERSION" | grep -Eq "$SEMANTIC_VERSION_PATTERN"
+              [ -z "${STAGING_ALIAS:-}" ]
               [ "$PUBLISH_LATEST" = true ]
               if [ "$REPOSITORY" = 'coollabsio/coolify' ]; then
                 [ "$VALIDATE_ONLY" = false ]
@@ -94,20 +144,43 @@ jobs:
               fi
               ;;
             testing-host)
+              require_dockerhub_credentials
               [ "$ARTIFACT_NAME" = 'coolify-testing-host' ]
               [ "$DOCKERFILE" = 'docker/testing-host/Dockerfile' ]
               [ "$TARGET_REPOSITORY" = 'coollabsio/coolify-testing-host' ]
               [ "$CANDIDATE_REPOSITORY" = 'coollabsio/coolify-testing-host-staging' ]
               [ -z "$SEMANTIC_VERSION" ]
+              [ -z "${STAGING_ALIAS:-}" ]
               [ "$PUBLISH_LATEST" = true ]
               ;;
             staging)
+              require_dockerhub_credentials
               [ "$ARTIFACT_NAME" = 'coolify-staging' ]
               [ "$DOCKERFILE" = 'docker/production/Dockerfile' ]
               [ "$TARGET_REPOSITORY" = 'coollabsio/coolify-staging' ]
               [ "$CANDIDATE_REPOSITORY" = 'coollabsio/coolify-staging-candidates' ]
               [ -z "$SEMANTIC_VERSION" ]
+              [ -n "${STAGING_ALIAS:-}" ]
+              [ "$STAGING_ALIAS" != latest ]
+              printf '%s' "$STAGING_ALIAS" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]*$'
               [ "$PUBLISH_LATEST" = false ]
+              ;;
+            fork)
+              [ "$ARTIFACT_NAME" = 'coolify-fork' ]
+              [ "$DOCKERFILE" = 'docker/production/Dockerfile' ]
+              [ "$TARGET_REPOSITORY" = 'williamagh/coolify' ]
+              [ "$CANDIDATE_REPOSITORY" = 'williamagh/coolify-fork-candidates' ]
+              [ "$REPOSITORY" = 'WilliamAGH/coolify' ]
+              printf '%s' "$SEMANTIC_VERSION" | grep -Eq "$FORK_SEMANTIC_VERSION_PATTERN"
+              [ "$GITHUB_REF_TYPE" = tag ]
+              [ "$GITHUB_REF" = "refs/tags/$SEMANTIC_VERSION" ]
+              printf '%s' "$GITHUB_SHA" | grep -Eq '^[0-9a-f]{40}$'
+              [ "$PUBLISH_LATEST" = false ]
+              [ -z "${STAGING_ALIAS:-}" ]
+              [ "$VALIDATE_ONLY" = false ]
+              [ -n "$NEXUS_USERNAME" ]
+              [ -n "$NEXUS_PASSWORD" ]
+              [ -n "$FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY" ]
               ;;
             *)
               echo "Unknown release kind: $RELEASE_KIND" >&2
@@ -133,8 +206,47 @@ jobs:
           if [ -n "$SEMANTIC_VERSION" ]; then
             validate_tag_length "$SEMANTIC_VERSION"
           fi
+          if [ -n "${STAGING_ALIAS:-}" ]; then
+            validate_tag_length "$STAGING_ALIAS"
+          fi
 
           printf 'run_tag=%s\n' "$run_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Require fork application versions match the immutable tag
+        if: ${{ inputs.release_kind == 'fork' }}
+        env:
+          SEMANTIC_VERSION: ${{ inputs.semantic_version }}
+        run: |
+          set -Eeuo pipefail
+
+          source_root="${GITHUB_WORKSPACE:?}"
+          constants_file="$source_root/config/constants.php"
+          versions_file="$source_root/versions.json"
+          [[ -f "$constants_file" && ! -L "$constants_file" ]]
+          [[ -f "$versions_file" && ! -L "$versions_file" ]]
+          command -v php >/dev/null
+          command -v jq >/dev/null
+
+          # shellcheck disable=SC2016 # PHP code is intentionally single-quoted for the shell.
+          constants_version="$(php -r '
+            function env($key, $default = null) { return $default; }
+            $constants = require $argv[1];
+            $version = $constants["coolify"]["version"] ?? null;
+            if (! is_string($version) || $version === "") { exit(1); }
+            echo $version;
+          ' "$constants_file")"
+          versions_json_version="$(jq -er '.coolify.v4.version | strings' "$versions_file")"
+
+          [[ "$constants_version" == "$SEMANTIC_VERSION" ]] || {
+            printf 'config/constants.php Coolify version must equal the fork tag: expected %s, found %s.\n' \
+              "$SEMANTIC_VERSION" "$constants_version" >&2
+            exit 1
+          }
+          [[ "$versions_json_version" == "$SEMANTIC_VERSION" ]] || {
+            printf 'versions.json Coolify v4 version must equal the fork tag: expected %s, found %s.\n' \
+              "$SEMANTIC_VERSION" "$versions_json_version" >&2
+            exit 1
+          }
 
       - id: publication
         name: Check authoritative semantic tag state
@@ -144,6 +256,17 @@ jobs:
           VALIDATE_ONLY: ${{ inputs.validate_only }}
         run: |
           set -eu
+
+          if [ "$RELEASE_KIND" = fork ]; then
+            {
+              printf 'index_digest=\n'
+              printf 'docker_image=\n'
+              printf 'ghcr_image=\n'
+              printf 'publish_required=false\n'
+              printf 'repair_required=false\n'
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           if [ "$RELEASE_KIND" != production ] || [ "$VALIDATE_ONLY" = true ]; then
             {
@@ -326,7 +449,7 @@ jobs:
   verify-authoritative-noop:
     name: Verify authoritative no-op image
     needs: validate-inputs
-    if: ${{ ! inputs.validate_only && needs.validate-inputs.outputs.publish_required == 'false' && needs.validate-inputs.outputs.repair_required == 'false' }}
+    if: ${{ inputs.release_kind != 'fork' && ! inputs.validate_only && needs.validate-inputs.outputs.publish_required == 'false' && needs.validate-inputs.outputs.repair_required == 'false' }}
     permissions:
       packages: read
     runs-on: ubuntu-24.04
@@ -417,10 +540,12 @@ jobs:
           - arch: amd64
             oci_arch: amd64
             platform: linux/amd64
+            regctl_sha256: c93aa7638749f5aaac1a8e01787321889c78f0101809bb2880343478d0ba0467
             runner: ubuntu-24.04
           - arch: arm64
             oci_arch: arm64
             platform: linux/arm64
+            regctl_sha256: c4cf231e74cda685f1599f3d866b02b03c572e54b79ec8b062f32070b0ba4587
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
@@ -445,6 +570,15 @@ jobs:
             || { echo 'The release build must use the local Unix Docker socket.' >&2; exit 1; }
           [[ -S /var/run/docker.sock ]] \
             || { echo 'The local Unix Docker socket is absent.' >&2; exit 1; }
+          [[ $(uname -s) == Linux ]] \
+            || { echo 'The release build requires a native Linux runner.' >&2; exit 1; }
+          case "$(uname -m)" in
+            x86_64|amd64) native_platform=linux/amd64 ;;
+            aarch64|arm64) native_platform=linux/arm64 ;;
+            *) echo "The release build runner architecture is unsupported: $(uname -m)." >&2; exit 1 ;;
+          esac
+          [[ $native_platform == "$PLATFORM" ]] \
+            || { echo "Native runner platform does not match $PLATFORM: $native_platform." >&2; exit 1; }
           [[ $(docker version --format '{{.Server.Os}}/{{.Server.Arch}}') == "$PLATFORM" ]] \
             || { echo "Docker daemon platform does not match $PLATFORM." >&2; exit 1; }
 
@@ -593,7 +727,7 @@ jobs:
           TESTING_HOST_IMAGE="$image" tests/Integration/TestingHostImageTest.sh
 
       - name: Run passive control-plane runtime gate
-        if: inputs.release_kind == 'production' && matrix.arch == 'amd64'
+        if: inputs.release_kind == 'production' || inputs.release_kind == 'staging'
         env:
           ARCH: ${{ matrix.arch }}
           ARTIFACT_NAME: ${{ inputs.artifact_name }}
@@ -616,20 +750,22 @@ jobs:
           PREFLIGHT_IMAGE="$image" tests/Integration/PassiveControlPlaneImageTest.sh
 
       - name: Install registry client for exact production host gate
-        if: inputs.release_kind == 'production' && matrix.arch == 'amd64'
+        if: inputs.release_kind == 'production'
         uses: regclient/actions/regctl-installer@1b705e32d40851370799ea5814e83d0a5f6a70dc # v0.1.0
         with:
           release: v0.11.5
 
       - name: Verify registry client bytes for exact production host gate
-        if: inputs.release_kind == 'production' && matrix.arch == 'amd64'
+        if: inputs.release_kind == 'production'
+        env:
+          REGCTL_SHA256: ${{ matrix.regctl_sha256 }}
         run: |
           set -eu
-          printf '%s  %s\n' c93aa7638749f5aaac1a8e01787321889c78f0101809bb2880343478d0ba0467 "$(command -v regctl)" | sha256sum --check --strict -
+          printf '%s  %s\n' "$REGCTL_SHA256" "$(command -v regctl)" | sha256sum --check --strict -
 
       - name: Run native systemd host gate against exact OCI child
         id: production-host-gate
-        if: inputs.release_kind == 'production' && matrix.arch == 'amd64'
+        if: inputs.release_kind == 'production'
         continue-on-error: true
         env:
           ARCH: ${{ matrix.arch }}
@@ -639,17 +775,14 @@ jobs:
           set -Eeuo pipefail
           umask 077
 
-          readonly evidence_directory="$RUNNER_TEMP/control-plane-runtime-fence-native-amd64-evidence"
-          readonly exited_operation="runtime-fence-host-exited-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          readonly full_operation="runtime-fence-host-github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          readonly evidence_directory="$RUNNER_TEMP/control-plane-runtime-fence-native-${ARCH}-evidence"
+          readonly exited_operation="runtime-fence-host-exited-${ARCH}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          readonly full_operation="runtime-fence-host-github-${ARCH}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           readonly host_build_script=tests/Integration/ControlPlaneRuntimeFence/build-systemd-ubuntu24-image.sh
           readonly host_acceptance_script=tests/Integration/ControlPlaneRuntimeFence/linux-host-acceptance.sh
           readonly local_registry_image='docker.io/library/registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373'
-          # Docker records the official-image RepoDigest as "traefik@…", not
-          # "docker.io/library/traefik@…". Keep this literal aligned with the
-          # value attested below and pass the same immutable reference onward.
-          readonly traefik_source='traefik@sha256:34d5089d0b414945342848518b383f11f5b3a645504ed87b77ffeb9d683d0e48'
-          readonly registry_container="coolify-runtime-fence-exact-oci-registry-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          readonly versions_file="$GITHUB_WORKSPACE/versions.json"
+          readonly registry_container="coolify-runtime-fence-exact-oci-registry-${ARCH}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
           fail() {
             printf 'CONTROL_PLANE_RUNTIME_FENCE_CI_FAILURE %s\n' "$1" >&2
@@ -670,7 +803,7 @@ jobs:
           local_repo_digest() {
             local reference=$1 candidate_reference
 
-            docker pull --platform linux/amd64 "$reference" >/dev/null
+            docker pull --platform "$PLATFORM" "$reference" >/dev/null
             while IFS= read -r candidate_reference; do
               [[ $candidate_reference == "$reference" ]] && break
             done < <(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$reference")
@@ -690,7 +823,27 @@ jobs:
 
           [[ $GITHUB_EVENT_NAME == push && $GITHUB_REF == refs/heads/v4.x ]] \
             || fail 'the privileged production host gate requires a push to refs/heads/v4.x'
-          [[ $PLATFORM == linux/amd64 ]] || fail 'the production host gate requires linux/amd64'
+          case "$PLATFORM" in
+            linux/amd64|linux/arm64) ;;
+            *) fail 'the production host gate requires native linux/amd64 or linux/arm64' ;;
+          esac
+          [[ $RUNNER_TEMP == /* && -d $RUNNER_TEMP && ! -L $RUNNER_TEMP \
+            && $(cd -- "$RUNNER_TEMP" && pwd -P) == "$RUNNER_TEMP" ]] \
+            || fail 'RUNNER_TEMP must be an existing canonical absolute non-symlink directory'
+          [[ -f $versions_file && ! -L $versions_file ]] \
+            || fail 'versions.json must be a regular non-symlink file'
+          traefik_version="$(jq -er '.traefik."v3.6" | strings | select(test("^3[.]6[.][0-9]+$"))' "$versions_file")" \
+            || fail 'versions.json does not define one valid Traefik v3.6 release'
+          readonly traefik_version
+          traefik_digest="$(regctl image digest "docker.io/library/traefik:${traefik_version}")" \
+            || fail "could not resolve the canonical Traefik ${traefik_version} release"
+          [[ $traefik_digest =~ ^sha256:[a-f0-9]{64}$ ]] \
+            || fail 'the canonical Traefik release did not resolve to an immutable index digest'
+          readonly traefik_digest
+          # Docker records the official-image RepoDigest as "traefik@…", not
+          # "docker.io/library/traefik@…". Resolve the canonical version once,
+          # then pass only that immutable reference to the native runtime gate.
+          readonly traefik_source="traefik@${traefik_digest}"
 
           archive="linux-image/${ARTIFACT_NAME}-${ARCH}.oci.tar"
           candidate="linux-image/${ARTIFACT_NAME}-${ARCH}.candidate.env"
@@ -707,7 +860,8 @@ jobs:
             || fail 'VerifyOciArchiveImage did not retain the exact loaded release image'
 
           install -d -m 0700 "$evidence_directory"
-          host_output="$(mktemp)"
+          host_output="$(mktemp "$RUNNER_TEMP/control-plane-runtime-fence-host-image.${ARCH}.XXXXXX")"
+          CONTROL_PLANE_RUNTIME_HOST_GATE_PLATFORM="$PLATFORM" \
           CONTROL_PLANE_RUNTIME_HOST_IMAGE_BUILD_MODE=loopback-registry \
           CONTROL_PLANE_RUNTIME_BUILD_CA_FILE=/etc/ssl/certs/ca-certificates.crt \
             "$host_build_script" "coolify-runtime-fence/systemd-host:${GITHUB_SHA}" | tee "$host_output"
@@ -719,13 +873,14 @@ jobs:
           readonly host_image=${host_references[0]}
 
           CONTROL_PLANE_RUNTIME_HOST_GATE_EXECUTE=1 \
+          CONTROL_PLANE_RUNTIME_HOST_GATE_PLATFORM="$PLATFORM" \
           CONTROL_PLANE_RUNTIME_HOST_GATE_EVIDENCE_DIRECTORY="$evidence_directory" \
           CONTROL_PLANE_RUNTIME_HOST_GATE_OPERATION="$exited_operation" \
           CONTROL_PLANE_RUNTIME_HOST_IMAGE="$host_image" \
             "$host_acceptance_script" --test-exited-container-evidence
 
-          docker pull "$local_registry_image" >/dev/null
-          docker run --detach --pull never --name "$registry_container" \
+          docker pull --platform "$PLATFORM" "$local_registry_image" >/dev/null
+          docker run --detach --pull never --platform "$PLATFORM" --name "$registry_container" \
             --tmpfs /var/lib/registry:rw,mode=0700 \
             --publish 127.0.0.1::5000 "$local_registry_image" >/dev/null
           registry_binding="$(docker port "$registry_container" 5000/tcp)"
@@ -746,19 +901,20 @@ jobs:
             || fail 'loopback registry rewrote or did not retain the verified OCI child digest'
           web_image="$(local_repo_digest "${web_tag%:*}@${child_digest}")"
           [[ $(docker image inspect --format '{{.Id}}' "$web_image") == "$(docker image inspect --format '{{.Id}}' "$image")" \
-            && $(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$web_image") == linux/amd64 ]] \
+            && $(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$web_image") == "$PLATFORM" ]] \
             || fail 'the loopback RepoDigest is not the exact loaded production OCI image'
 
-          docker pull --platform linux/amd64 "$traefik_source" >/dev/null
+          docker pull --platform "$PLATFORM" "$traefik_source" >/dev/null
           docker image inspect "$traefik_source" >/dev/null
           docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$traefik_source" \
             | grep -F -x "$traefik_source" >/dev/null
-          [[ $(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$traefik_source") == linux/amd64 ]] \
-            || fail 'the pinned Traefik v3.6.13 platform digest is not linux/amd64'
-          docker run --rm --pull never --platform linux/amd64 --entrypoint traefik "$traefik_source" version \
-            | grep -F -x 'Version: 3.6.13' >/dev/null
+          [[ $(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$traefik_source") == "$PLATFORM" ]] \
+            || fail "the pinned Traefik ${traefik_version} index did not select $PLATFORM"
+          docker run --rm --pull never --platform "$PLATFORM" --entrypoint traefik "$traefik_source" version \
+            | grep -F -x "Version: ${traefik_version}" >/dev/null
 
           CONTROL_PLANE_RUNTIME_HOST_GATE_EXECUTE=1 \
+          CONTROL_PLANE_RUNTIME_HOST_GATE_PLATFORM="$PLATFORM" \
           CONTROL_PLANE_RUNTIME_HOST_GATE_EVIDENCE_DIRECTORY="$evidence_directory" \
           CONTROL_PLANE_RUNTIME_HOST_GATE_OPERATION="$full_operation" \
           CONTROL_PLANE_RUNTIME_HOST_IMAGE="$host_image" \
@@ -769,17 +925,19 @@ jobs:
 
       - name: Package sanitized production host-gate evidence
         id: package-production-host-gate-evidence
-        if: always() && inputs.release_kind == 'production' && matrix.arch == 'amd64'
+        if: always() && inputs.release_kind == 'production'
         continue-on-error: true
         env:
+          ARCH: ${{ matrix.arch }}
           ARTIFACT_NAME: ${{ inputs.artifact_name }}
+          PLATFORM: ${{ matrix.platform }}
         run: |
           set -Eeuo pipefail
           umask 077
 
-          readonly evidence_directory="$RUNNER_TEMP/control-plane-runtime-fence-native-amd64-evidence"
-          readonly exited_operation="runtime-fence-host-exited-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          readonly full_operation="runtime-fence-host-github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          readonly evidence_directory="$RUNNER_TEMP/control-plane-runtime-fence-native-${ARCH}-evidence"
+          readonly exited_operation="runtime-fence-host-exited-${ARCH}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          readonly full_operation="runtime-fence-host-github-${ARCH}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           readonly package_directory="$GITHUB_WORKSPACE/linux-image/host-gate-evidence"
           package_count=0
           package_failure_count=0
@@ -795,7 +953,7 @@ jobs:
               continue
             fi
             if ! sudo "$GITHUB_WORKSPACE/tests/Integration/ControlPlaneRuntimeFence/package-host-gate-evidence.sh" \
-              --mode "$mode" "$operation_directory" "$operation" "$output"; then
+              --mode "$mode" --platform "$PLATFORM" "$operation_directory" "$operation" "$output"; then
               package_failure_count=$((package_failure_count + 1))
               continue
             fi
@@ -814,18 +972,18 @@ jobs:
 
       - name: Upload sanitized production host-gate evidence
         id: upload-production-host-gate-evidence
-        if: always() && inputs.release_kind == 'production' && matrix.arch == 'amd64'
+        if: always() && inputs.release_kind == 'production'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: control-plane-runtime-fence-native-amd64-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          name: control-plane-runtime-fence-native-${{ matrix.arch }}-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            linux-image/host-gate-evidence/${{ inputs.artifact_name }}-runtime-fence-host-exited-${{ github.run_id }}-${{ github.run_attempt }}.tar
-            linux-image/host-gate-evidence/${{ inputs.artifact_name }}-runtime-fence-host-github-${{ github.run_id }}-${{ github.run_attempt }}.tar
+            linux-image/host-gate-evidence/${{ inputs.artifact_name }}-runtime-fence-host-exited-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}.tar
+            linux-image/host-gate-evidence/${{ inputs.artifact_name }}-runtime-fence-host-github-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}.tar
           if-no-files-found: ignore
           retention-days: 14
 
       - name: Require native production host-gate success
-        if: always() && inputs.release_kind == 'production' && matrix.arch == 'amd64'
+        if: always() && inputs.release_kind == 'production'
         env:
           EVIDENCE_ARTIFACT_ID: ${{ steps.upload-production-host-gate-evidence.outputs.artifact-id }}
           HOST_GATE_OUTCOME: ${{ steps.production-host-gate.outcome }}
@@ -1155,6 +1313,8 @@ jobs:
       docker_image: ${{ steps.references.outputs.docker_image }}
       ghcr_image: ${{ steps.references.outputs.ghcr_image }}
       index_digest: ${{ needs.stage-candidates.outputs.index_digest }}
+      staging_digest: ${{ steps.staging-alias.outputs.digest }}
+      staging_image: ${{ steps.staging-alias.outputs.image }}
     env:
       AMD64_DIGEST: ${{ needs.stage-candidates.outputs.amd64_digest }}
       ARM64_DIGEST: ${{ needs.stage-candidates.outputs.arm64_digest }}
@@ -1362,6 +1522,19 @@ jobs:
           committed=true
           trap - EXIT
 
+      - id: staging-alias
+        name: Promote verified staging alias
+        if: ${{ inputs.release_kind == 'staging' }}
+        env:
+          STAGING_ALIAS: ${{ inputs.staging_alias }}
+        run: |
+          set -eu
+          scripts/publish-linux-image.sh promote-alias "$GHCR_TARGET" "$DOCKER_TARGET" "$STAGING_ALIAS" "$INDEX_DIGEST" "$AMD64_DIGEST" "$ARM64_DIGEST" "$GITHUB_RUN_ID"
+          {
+            printf 'digest=%s\n' "$INDEX_DIGEST"
+            printf 'image=%s:%s\n' "$DOCKER_TARGET" "$STAGING_ALIAS"
+          } >> "$GITHUB_OUTPUT"
+
       - id: references
         name: Record immutable image references
         run: |
@@ -1420,3 +1593,1561 @@ jobs:
           scripts/publish-linux-image.sh cleanup-candidates "$CANDIDATE_REPOSITORY" "$GHCR_TARGET" "$RUN_TAG"
           regctl tag delete --ignore-missing "$GHCR_TARGET:quarantine-$RUN_TAG"
           regctl tag delete --ignore-missing "$DOCKER_TARGET:quarantine-$RUN_TAG"
+
+  fork-registry-policy:
+    name: Require fork registry first-write policy
+    needs: validate-inputs
+    if: ${{ inputs.release_kind == 'fork' }}
+    permissions: {}
+    runs-on: ubuntu-24.04
+    env:
+      MAIN_TARGET: docker.iocloudhost.net/williamagh/coolify
+      NEXUS_API_URL: https://sonatype.popos-sf6.com
+      NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+      NEXUS_REPOSITORY: docker-hosted
+      NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+      REALTIME_TARGET: docker.iocloudhost.net/williamagh/coolify-realtime
+      SEMANTIC_VERSION: ${{ inputs.semantic_version }}
+    steps:
+      - name: Require Nexus hosted repository non-redeploy policy
+        run: |
+          set -Eeuo pipefail
+          umask 077
+
+          policy_file="$(mktemp "$RUNNER_TEMP/coolify-fork-nexus-policy.XXXXXX")"
+          trap 'rm -f "$policy_file"' EXIT
+          status="$(curl --silent --show-error --location \
+            --connect-timeout 10 --max-time 30 --retry 3 --retry-all-errors --retry-delay 1 \
+            --user "$NEXUS_USERNAME:$NEXUS_PASSWORD" \
+            --output "$policy_file" --write-out '%{http_code}' \
+            "$NEXUS_API_URL/service/rest/v1/repositories/docker/hosted/$NEXUS_REPOSITORY")"
+          [[ "$status" == 200 ]] || {
+            printf 'Nexus repository policy query returned HTTP %s.\n' "$status" >&2
+            exit 1
+          }
+          jq -e --arg repository "$NEXUS_REPOSITORY" '
+            .name == $repository and
+            .online == true and
+            .storage.writePolicy == "ALLOW_ONCE"
+          ' "$policy_file" >/dev/null || {
+            printf 'Nexus hosted repository must be online with writePolicy=ALLOW_ONCE before fork publication.\n' >&2
+            exit 1
+          }
+
+  fork-build:
+    name: Build and scan fork ${{ matrix.product }} OCI (${{ matrix.arch }})
+    needs: [validate-inputs, fork-registry-policy]
+    if: ${{ inputs.release_kind == 'fork' && needs.fork-registry-policy.result == 'success' }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - product: main
+            artifact_name: coolify
+            dockerfile: docker/production/Dockerfile
+            arch: amd64
+            oci_arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - product: main
+            artifact_name: coolify
+            dockerfile: docker/production/Dockerfile
+            arch: arm64
+            oci_arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+          - product: realtime
+            artifact_name: coolify-realtime
+            dockerfile: docker/coolify-realtime/Dockerfile
+            arch: amd64
+            oci_arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - product: realtime
+            artifact_name: coolify-realtime
+            dockerfile: docker/coolify-realtime/Dockerfile
+            arch: arm64
+            oci_arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: Preflight native fork build host
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -Eeuo pipefail
+          [[ -z ${DOCKER_HOST:-} && -z ${DOCKER_CONTEXT:-} ]]
+          [[ $(docker context show) == default ]]
+          [[ $(docker context inspect default --format '{{.Endpoints.docker.Host}}') == unix:///var/run/docker.sock ]]
+          [[ -S /var/run/docker.sock ]]
+          [[ $(uname -s) == Linux ]]
+          case "$(uname -m)" in
+            x86_64|amd64) native_platform=linux/amd64 ;;
+            aarch64|arm64) native_platform=linux/arm64 ;;
+            *) printf 'Unsupported native fork build architecture: %s\n' "$(uname -m)" >&2; exit 1 ;;
+          esac
+          [[ "$native_platform" == "$PLATFORM" ]]
+          [[ $(docker version --format '{{.Server.Os}}/{{.Server.Arch}}') == "$PLATFORM" ]]
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Verify reviewed fork Dockerfile sources
+        env:
+          DOCKERFILE: ${{ matrix.dockerfile }}
+          PRODUCT: ${{ matrix.product }}
+        run: |
+          set -Eeuo pipefail
+          if [[ "$PRODUCT" == main ]]; then
+            docker/verify-source-provenance.sh "$DOCKERFILE"
+            exit 0
+          fi
+
+          expected_frontend='# syntax=docker/dockerfile:1@sha256:87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89'
+          [[ "$(sed -n '1p' "$DOCKERFILE")" == "$expected_frontend" ]]
+          for argument in CLOUDFLARED_VERSION CLOUDFLARED_TAG CLOUDFLARED_COMMIT CLOUDFLARED_SOURCE_SHA256 CLOUDFLARED_RELEASE_DATE; do
+            realtime_value="$(sed -n "s/^ARG ${argument}=//p" "$DOCKERFILE" | sed -n '1p')"
+            production_value="$(sed -n "s/^ARG ${argument}=//p" docker/production/Dockerfile | sed -n '1p')"
+            [[ -n "$realtime_value" && "$realtime_value" == "$production_value" ]]
+          done
+          docker/verify-source-provenance.sh docker/production/Dockerfile
+
+      - name: Prepare fork OCI evidence directory
+        run: install -d -m 0700 fork-image
+
+      - name: Build fork OCI archive with inline provenance and SBOM
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          annotations: |
+            index:org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            index:org.opencontainers.image.revision=${{ github.sha }}
+            index:org.opencontainers.image.version=${{ inputs.semantic_version }}
+          context: .
+          file: ${{ matrix.dockerfile }}
+          labels: |
+            io.coolify.release-run-attempt=${{ github.run_attempt }}
+            io.coolify.release-run-id=${{ github.run_id }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ inputs.semantic_version }}
+          outputs: type=oci,dest=fork-image/${{ matrix.artifact_name }}-${{ matrix.arch }}.oci.tar,name=local/${{ matrix.artifact_name }}:${{ github.sha }}-${{ matrix.arch }},oci-mediatypes=true
+          platforms: ${{ matrix.platform }}
+          provenance: mode=max
+          push: false
+          sbom: true
+
+      - name: Verify fork OCI labels and inline attestations
+        env:
+          ARCH: ${{ matrix.arch }}
+          ARTIFACT_NAME: ${{ matrix.artifact_name }}
+          OCI_ARCH: ${{ matrix.oci_arch }}
+          SOURCE_URL: https://github.com/${{ github.repository }}
+          SOURCE_REVISION: ${{ github.sha }}
+          VERSION: ${{ inputs.semantic_version }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          archive="fork-image/${ARTIFACT_NAME}-${ARCH}.oci.tar"
+          layout="fork-image/layout-${ARTIFACT_NAME}-${ARCH}"
+          install -d -m 0700 "$layout"
+          tar -xf "$archive" -C "$layout"
+
+          child_digest="$(jq -er --arg arch "$OCI_ARCH" '
+            [.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch)] |
+            if length == 1 then .[0].digest else error("expected one native image manifest") end
+          ' "$layout/index.json")"
+          printf '%s' "$child_digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          child_blob="$layout/blobs/sha256/${child_digest#sha256:}"
+          [[ -f "$child_blob" ]]
+          printf '%s  %s\n' "${child_digest#sha256:}" "$child_blob" | sha256sum --check --strict -
+
+          config_digest="$(jq -er '.config.digest' "$child_blob")"
+          config_blob="$layout/blobs/sha256/${config_digest#sha256:}"
+          [[ -f "$config_blob" ]]
+          printf '%s  %s\n' "${config_digest#sha256:}" "$config_blob" | sha256sum --check --strict -
+          jq -e \
+            --arg revision "$SOURCE_REVISION" \
+            --arg source "$SOURCE_URL" \
+            --arg version "$VERSION" '
+              .config.Labels["org.opencontainers.image.source"] == $source and
+              .config.Labels["org.opencontainers.image.revision"] == $revision and
+              .config.Labels["org.opencontainers.image.version"] == $version
+            ' "$config_blob" >/dev/null
+
+          jq -e \
+            --arg revision "$SOURCE_REVISION" \
+            --arg source "$SOURCE_URL" \
+            --arg version "$VERSION" '
+              .annotations["org.opencontainers.image.source"] == $source and
+              .annotations["org.opencontainers.image.revision"] == $revision and
+              .annotations["org.opencontainers.image.version"] == $version
+            ' "$layout/index.json" >/dev/null
+
+          predicate_types="$layout/predicate-types.txt"
+          : > "$predicate_types"
+          while IFS= read -r attestation_digest; do
+            [[ -n "$attestation_digest" ]]
+            attestation_blob="$layout/blobs/sha256/${attestation_digest#sha256:}"
+            [[ -f "$attestation_blob" ]]
+            printf '%s  %s\n' "${attestation_digest#sha256:}" "$attestation_blob" | sha256sum --check --strict -
+            jq -r '.layers[]?.annotations["in-toto.io/predicate-type"] // empty' "$attestation_blob" >> "$predicate_types"
+          done < <(jq -r --arg child "$child_digest" '
+            .manifests[] |
+            select(.platform.os == "unknown" and .platform.architecture == "unknown") |
+            select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") |
+            select(.annotations["vnd.docker.reference.digest"] == $child) |
+            .digest
+          ' "$layout/index.json")
+          grep -Eq '^https://slsa\.dev/provenance/' "$predicate_types"
+          grep -Eq '^https://spdx\.dev/Document' "$predicate_types"
+
+          {
+            printf 'CHILD_DIGEST=%s\n' "$child_digest"
+            printf 'ARCHIVE_SHA256=%s\n' "$(sha256sum "$archive" | awk '{print $1}')"
+          } > "fork-image/${ARTIFACT_NAME}-${ARCH}.candidate.env"
+
+      - name: Generate standalone fork SPDX SBOM
+        id: fork-sbom
+        continue-on-error: true
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          artifact-name: fork-${{ matrix.artifact_name }}-${{ matrix.arch }}-${{ github.sha }}.spdx.json
+          format: spdx-json
+          image: oci-archive:fork-image/${{ matrix.artifact_name }}-${{ matrix.arch }}.oci.tar
+          output-file: fork-image/${{ matrix.artifact_name }}-${{ matrix.arch }}.sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Scan fork OCI for high and critical vulnerabilities
+        id: fork-vulnerability
+        if: always()
+        continue-on-error: true
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          fail-build: true
+          image: oci-archive:fork-image/${{ matrix.artifact_name }}-${{ matrix.arch }}.oci.tar
+          only-fixed: false
+          output-file: fork-image/${{ matrix.artifact_name }}-${{ matrix.arch }}.vulnerabilities.json
+          output-format: json
+          severity-cutoff: high
+
+      - name: Scan fork OCI for secrets
+        id: fork-secret
+        if: always()
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          exit-code: '1'
+          format: json
+          input: fork-image/${{ matrix.artifact_name }}-${{ matrix.arch }}.oci.tar
+          output: fork-image/${{ matrix.artifact_name }}-${{ matrix.arch }}.secrets.json
+          scan-type: image
+          scanners: secret
+
+      - name: Enforce fork supply-chain scans
+        if: always()
+        env:
+          SBOM_OUTCOME: ${{ steps.fork-sbom.outcome }}
+          SECRET_OUTCOME: ${{ steps.fork-secret.outcome }}
+          VULNERABILITY_OUTCOME: ${{ steps.fork-vulnerability.outcome }}
+        run: |
+          set -eu
+          [ "$SBOM_OUTCOME" = success ]
+          [ "$VULNERABILITY_OUTCOME" = success ]
+          [ "$SECRET_OUTCOME" = success ]
+
+      - name: Retain verified fork OCI evidence
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          compression-level: 0
+          if-no-files-found: error
+          name: fork-image-${{ matrix.artifact_name }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.arch }}
+          path: |
+            fork-image/${{ matrix.artifact_name }}-${{ matrix.arch }}.oci.tar
+            fork-image/${{ matrix.artifact_name }}-${{ matrix.arch }}.candidate.env
+            fork-image/${{ matrix.artifact_name }}-${{ matrix.arch }}.sbom.spdx.json
+            fork-image/${{ matrix.artifact_name }}-${{ matrix.arch }}.vulnerabilities.json
+            fork-image/${{ matrix.artifact_name }}-${{ matrix.arch }}.secrets.json
+          retention-days: 7
+
+  fork-stage:
+    name: Stage both verified fork indexes
+    needs: [validate-inputs, fork-registry-policy, fork-build]
+    if: ${{ inputs.release_kind == 'fork' && needs.fork-build.result == 'success' }}
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    outputs:
+      main_amd64_digest: ${{ steps.stage.outputs.main_amd64_digest }}
+      main_arm64_digest: ${{ steps.stage.outputs.main_arm64_digest }}
+      main_index_digest: ${{ steps.stage.outputs.main_index_digest }}
+      realtime_amd64_digest: ${{ steps.stage.outputs.realtime_amd64_digest }}
+      realtime_arm64_digest: ${{ steps.stage.outputs.realtime_arm64_digest }}
+      realtime_index_digest: ${{ steps.stage.outputs.realtime_index_digest }}
+      run_tag: ${{ needs.validate-inputs.outputs.run_tag }}
+    steps:
+      - name: Download all verified fork OCI evidence
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          merge-multiple: true
+          path: fork-candidate-input
+          pattern: fork-image-*-${{ github.run_id }}-${{ github.run_attempt }}-*
+
+      - name: Install registry client for fork staging
+        uses: regclient/actions/regctl-installer@1b705e32d40851370799ea5814e83d0a5f6a70dc # v0.1.0
+        with:
+          release: v0.11.5
+
+      - name: Verify fork staging registry client bytes
+        run: |
+          set -eu
+          printf '%s  %s\n' c93aa7638749f5aaac1a8e01787321889c78f0101809bb2880343478d0ba0467 "$(command -v regctl)" | sha256sum --check --strict -
+
+      - name: Login to Nexus fork registry for staging
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          password: ${{ secrets.NEXUS_PASSWORD }}
+          registry: docker.iocloudhost.net
+          username: ${{ secrets.NEXUS_USERNAME }}
+
+      - name: Stage both fork products with inline build attestations
+        id: stage
+        env:
+          MAIN_TARGET: docker.iocloudhost.net/williamagh/coolify
+          REALTIME_TARGET: docker.iocloudhost.net/williamagh/coolify-realtime
+          RUN_TAG: ${{ needs.validate-inputs.outputs.run_tag }}
+          SEMANTIC_VERSION: ${{ inputs.semantic_version }}
+          SOURCE_REVISION: ${{ github.sha }}
+          SOURCE_URL: https://github.com/${{ github.repository }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+
+          digest_or_absent() {
+            local reference=$1 error_file digest
+            error_file="$(mktemp "$RUNNER_TEMP/coolify-fork-stage-read.XXXXXX")"
+            if digest="$(regctl image digest "$reference" 2>"$error_file")"; then
+              rm -f "$error_file"
+              printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
+              printf '%s\n' "$digest"
+              return 0
+            fi
+            if grep -Eiq '^(manifest unknown|name unknown)(: .*)?$|^failed to (get|resolve) manifest [^[:space:]]+: (manifest unknown|not found)$' "$error_file"; then
+              rm -f "$error_file"
+              printf '\n'
+              return 0
+            fi
+            cat "$error_file" >&2
+            rm -f "$error_file"
+            return 1
+          }
+
+          require_absent() {
+            local reference=$1 existing
+            existing="$(digest_or_absent "$reference")"
+            [[ -z "$existing" ]] || {
+              printf 'Disposable fork staging tag already exists: %s\n' "$reference" >&2
+              return 1
+            }
+          }
+
+          verify_index() {
+            local repository=$1 index_digest=$2 expected_amd64=$3 expected_arm64=$4
+            local index_file platform child_digest descriptor_count attestation_file predicate_file
+            index_file="$(mktemp "$RUNNER_TEMP/coolify-fork-index.XXXXXX")"
+            regctl manifest get "$repository@$index_digest" --format raw-body > "$index_file"
+            jq -e \
+              --arg revision "$SOURCE_REVISION" \
+              --arg source "$SOURCE_URL" \
+              --arg version "$SEMANTIC_VERSION" '
+                .mediaType == "application/vnd.oci.image.index.v1+json" and
+                .annotations["org.opencontainers.image.source"] == $source and
+                .annotations["org.opencontainers.image.revision"] == $revision and
+                .annotations["org.opencontainers.image.version"] == $version and
+                ([.manifests[] | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64"))] | length) == 2
+              ' "$index_file" >/dev/null
+
+            for platform in linux/amd64 linux/arm64; do
+              child_digest="$(regctl image digest "$repository@$index_digest" --platform "$platform")"
+              if [[ "$platform" == linux/amd64 ]]; then
+                [[ "$child_digest" == "$expected_amd64" ]]
+              else
+                [[ "$child_digest" == "$expected_arm64" ]]
+              fi
+              regctl image config "$repository@$index_digest" --platform "$platform" | jq -e \
+                --arg revision "$SOURCE_REVISION" \
+                --arg source "$SOURCE_URL" \
+                --arg version "$SEMANTIC_VERSION" '
+                  .config.Labels["org.opencontainers.image.source"] == $source and
+                  .config.Labels["org.opencontainers.image.revision"] == $revision and
+                  .config.Labels["org.opencontainers.image.version"] == $version
+                ' >/dev/null
+
+              descriptor_count="$(jq -r --arg child "$child_digest" '[
+                .manifests[] |
+                select(.platform.os == "unknown" and .platform.architecture == "unknown") |
+                select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") |
+                select(.annotations["vnd.docker.reference.digest"] == $child)
+              ] | length' "$index_file")"
+              [[ "$descriptor_count" -ge 1 ]]
+              predicate_file="$(mktemp "$RUNNER_TEMP/coolify-fork-predicates.XXXXXX")"
+              : > "$predicate_file"
+              while IFS= read -r attestation_digest; do
+                attestation_file="$(mktemp "$RUNNER_TEMP/coolify-fork-attestation.XXXXXX")"
+                regctl manifest get "$repository@$attestation_digest" --format raw-body > "$attestation_file"
+                jq -r '.layers[]?.annotations["in-toto.io/predicate-type"] // empty' "$attestation_file" >> "$predicate_file"
+                rm -f "$attestation_file"
+              done < <(jq -r --arg child "$child_digest" '
+                .manifests[] |
+                select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") |
+                select(.annotations["vnd.docker.reference.digest"] == $child) |
+                .digest
+              ' "$index_file")
+              grep -Eq '^https://slsa\.dev/provenance/' "$predicate_file"
+              grep -Eq '^https://spdx\.dev/Document' "$predicate_file"
+              rm -f "$predicate_file"
+            done
+            rm -f "$index_file"
+          }
+
+          stage_product() {
+            local product=$1 artifact=$2 repository=$3
+            local amd64_digest arm64_digest index_digest arch archive child_digest
+            local amd64_index arm64_index merged_index
+            amd64_digest="$(sed -n 's/^CHILD_DIGEST=//p' "fork-candidate-input/${artifact}-amd64.candidate.env")"
+            arm64_digest="$(sed -n 's/^CHILD_DIGEST=//p' "fork-candidate-input/${artifact}-arm64.candidate.env")"
+            for child_digest in "$amd64_digest" "$arm64_digest"; do
+              printf '%s' "$child_digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
+            done
+
+            for arch in amd64 arm64; do
+              archive="fork-candidate-input/${artifact}-${arch}.oci.tar"
+              require_absent "$repository:${RUN_TAG}-${arch}"
+              regctl image import "$repository:${RUN_TAG}-${arch}" "$archive"
+              if [[ "$arch" == amd64 ]]; then
+                [[ "$(regctl image digest "$repository:${RUN_TAG}-${arch}" --platform linux/amd64)" == "$amd64_digest" ]]
+              else
+                [[ "$(regctl image digest "$repository:${RUN_TAG}-${arch}" --platform linux/arm64)" == "$arm64_digest" ]]
+              fi
+            done
+
+            require_absent "$repository:$RUN_TAG"
+            amd64_index="$(mktemp "$RUNNER_TEMP/coolify-fork-amd64-index.XXXXXX")"
+            arm64_index="$(mktemp "$RUNNER_TEMP/coolify-fork-arm64-index.XXXXXX")"
+            merged_index="$(mktemp "$RUNNER_TEMP/coolify-fork-merged-index.XXXXXX")"
+            regctl manifest get "$repository:${RUN_TAG}-amd64" --format raw-body > "$amd64_index"
+            regctl manifest get "$repository:${RUN_TAG}-arm64" --format raw-body > "$arm64_index"
+            jq -e '.mediaType == "application/vnd.oci.image.index.v1+json"' "$amd64_index" >/dev/null
+            jq -e '.mediaType == "application/vnd.oci.image.index.v1+json"' "$arm64_index" >/dev/null
+            jq -s \
+              --arg revision "$SOURCE_REVISION" \
+              --arg source "$SOURCE_URL" \
+              --arg version "$SEMANTIC_VERSION" '
+                {
+                  schemaVersion: 2,
+                  mediaType: "application/vnd.oci.image.index.v1+json",
+                  manifests: ((.[0].manifests + .[1].manifests) | unique_by(.digest)),
+                  annotations: {
+                    "org.opencontainers.image.source": $source,
+                    "org.opencontainers.image.revision": $revision,
+                    "org.opencontainers.image.version": $version
+                  }
+                }
+              ' "$amd64_index" "$arm64_index" > "$merged_index"
+            regctl manifest put \
+              --content-type application/vnd.oci.image.index.v1+json \
+              "$repository:$RUN_TAG" < "$merged_index"
+            rm -f "$amd64_index" "$arm64_index" "$merged_index"
+            index_digest="$(regctl image digest "$repository:$RUN_TAG")"
+            printf '%s' "$index_digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
+            verify_index "$repository" "$index_digest" "$amd64_digest" "$arm64_digest"
+            {
+              printf '%s_amd64_digest=%s\n' "$product" "$amd64_digest"
+              printf '%s_arm64_digest=%s\n' "$product" "$arm64_digest"
+              printf '%s_index_digest=%s\n' "$product" "$index_digest"
+            } >> "$GITHUB_OUTPUT"
+          }
+
+          stage_product main coolify "$MAIN_TARGET"
+          stage_product realtime coolify-realtime "$REALTIME_TARGET"
+
+          install -d -m 0700 fork-binding
+          jq -n \
+            --arg mainAmd64 "$(sed -n 's/^CHILD_DIGEST=//p' fork-candidate-input/coolify-amd64.candidate.env)" \
+            --arg mainArm64 "$(sed -n 's/^CHILD_DIGEST=//p' fork-candidate-input/coolify-arm64.candidate.env)" \
+            --arg mainIndex "$(regctl image digest "$MAIN_TARGET:$RUN_TAG")" \
+            --arg mainRepository "$MAIN_TARGET" \
+            --arg realtimeAmd64 "$(sed -n 's/^CHILD_DIGEST=//p' fork-candidate-input/coolify-realtime-amd64.candidate.env)" \
+            --arg realtimeArm64 "$(sed -n 's/^CHILD_DIGEST=//p' fork-candidate-input/coolify-realtime-arm64.candidate.env)" \
+            --arg realtimeIndex "$(regctl image digest "$REALTIME_TARGET:$RUN_TAG")" \
+            --arg realtimeRepository "$REALTIME_TARGET" \
+            --arg runTag "$RUN_TAG" \
+            --arg sourceRef "$GITHUB_REF" \
+            --arg sourceRepository "$GITHUB_REPOSITORY" \
+            --arg sourceRevision "$SOURCE_REVISION" \
+            --arg sourceUrl "$SOURCE_URL" \
+            --arg version "$SEMANTIC_VERSION" '
+              {
+                predicateVersion: 1,
+                semanticVersion: $version,
+                runTag: $runTag,
+                source: {repository: $sourceRepository, url: $sourceUrl, ref: $sourceRef, revision: $sourceRevision},
+                expectedLabels: {source: $sourceUrl, revision: $sourceRevision, version: $version},
+                images: {
+                  main: {repository: $mainRepository, indexDigest: $mainIndex, childDigests: {amd64: $mainAmd64, arm64: $mainArm64}},
+                  realtime: {repository: $realtimeRepository, indexDigest: $realtimeIndex, childDigests: {amd64: $realtimeAmd64, arm64: $realtimeArm64}}
+                }
+              }
+            ' > fork-binding/release-binding.json
+
+      - name: Retain unsigned fork release binding
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          if-no-files-found: error
+          name: fork-binding-${{ inputs.semantic_version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: fork-binding/release-binding.json
+          retention-days: 90
+
+  fork-attest:
+    name: Sign and verify off-registry fork bundles
+    needs: [validate-inputs, fork-stage]
+    if: ${{ inputs.release_kind == 'fork' && needs.fork-stage.result == 'success' }}
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: read
+      id-token: write
+    runs-on: ubuntu-24.04
+    outputs:
+      bundle_artifact_id: ${{ steps.upload-fork-bundles.outputs.artifact-id }}
+    env:
+      MAIN_TARGET: docker.iocloudhost.net/williamagh/coolify
+      POSTGRES_AMD64_DIGEST: sha256:cae15a3b718f23497a60b7cafdcf205216d7949680972da0584db00fb68bf3e6
+      POSTGRES_ARM64_DIGEST: sha256:b462a1ee492ec44a74cef7a6ca37084c48d0dee6e4b53099acd1fc53ec997357
+      POSTGRES_IMAGE: docker.io/library/postgres
+      POSTGRES_INDEX_DIGEST: sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f
+      REALTIME_TARGET: docker.iocloudhost.net/williamagh/coolify-realtime
+      REDIS_AMD64_DIGEST: sha256:b1addbe72465a718643cff9e60a58e6df1841e29d6d7d60c9a85d8d72f08d1a7
+      REDIS_ARM64_DIGEST: sha256:084f4bcb3fedf990ba43d26774f58ed4697a2c044156544ac4717934ad1d57c8
+      REDIS_IMAGE: docker.io/library/redis
+      REDIS_INDEX_DIGEST: sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download fork SBOM evidence
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          merge-multiple: true
+          path: fork-attestation-input
+          pattern: fork-image-*-${{ github.run_id }}-${{ github.run_attempt }}-*
+
+      - name: Download fork release binding
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: fork-binding-${{ inputs.semantic_version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: fork-attestation-input
+
+      - name: Login to Nexus fork registry for bundle verification
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          password: ${{ secrets.NEXUS_PASSWORD }}
+          registry: docker.iocloudhost.net
+          username: ${{ secrets.NEXUS_USERNAME }}
+
+      - name: Sign main amd64 SBOM bundle off-registry
+        id: main-amd64-sbom
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          create-storage-record: false
+          push-to-registry: false
+          sbom-path: fork-attestation-input/coolify-amd64.sbom.spdx.json
+          subject-digest: ${{ needs.fork-stage.outputs.main_amd64_digest }}
+          subject-name: ${{ env.MAIN_TARGET }}
+
+      - name: Sign main arm64 SBOM bundle off-registry
+        id: main-arm64-sbom
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          create-storage-record: false
+          push-to-registry: false
+          sbom-path: fork-attestation-input/coolify-arm64.sbom.spdx.json
+          subject-digest: ${{ needs.fork-stage.outputs.main_arm64_digest }}
+          subject-name: ${{ env.MAIN_TARGET }}
+
+      - name: Sign realtime amd64 SBOM bundle off-registry
+        id: realtime-amd64-sbom
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          create-storage-record: false
+          push-to-registry: false
+          sbom-path: fork-attestation-input/coolify-realtime-amd64.sbom.spdx.json
+          subject-digest: ${{ needs.fork-stage.outputs.realtime_amd64_digest }}
+          subject-name: ${{ env.REALTIME_TARGET }}
+
+      - name: Sign realtime arm64 SBOM bundle off-registry
+        id: realtime-arm64-sbom
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          create-storage-record: false
+          push-to-registry: false
+          sbom-path: fork-attestation-input/coolify-realtime-arm64.sbom.spdx.json
+          subject-digest: ${{ needs.fork-stage.outputs.realtime_arm64_digest }}
+          subject-name: ${{ env.REALTIME_TARGET }}
+
+      - name: Sign main provenance bundle off-registry
+        id: main-provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          create-storage-record: false
+          push-to-registry: false
+          subject-digest: ${{ needs.fork-stage.outputs.main_index_digest }}
+          subject-name: ${{ env.MAIN_TARGET }}
+
+      - name: Sign realtime provenance bundle off-registry
+        id: realtime-provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          create-storage-record: false
+          push-to-registry: false
+          subject-digest: ${{ needs.fork-stage.outputs.realtime_index_digest }}
+          subject-name: ${{ env.REALTIME_TARGET }}
+
+      - name: Sign main release-binding bundle off-registry
+        id: main-binding
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          create-storage-record: false
+          predicate-path: fork-attestation-input/release-binding.json
+          predicate-type: https://coolify.io/attestations/fork-release-binding/v1
+          push-to-registry: false
+          subject-digest: ${{ needs.fork-stage.outputs.main_index_digest }}
+          subject-name: ${{ env.MAIN_TARGET }}
+
+      - name: Sign realtime release-binding bundle off-registry
+        id: realtime-binding
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          create-storage-record: false
+          predicate-path: fork-attestation-input/release-binding.json
+          predicate-type: https://coolify.io/attestations/fork-release-binding/v1
+          push-to-registry: false
+          subject-digest: ${{ needs.fork-stage.outputs.realtime_index_digest }}
+          subject-name: ${{ env.REALTIME_TARGET }}
+
+      - name: Collect signed fork bundles
+        env:
+          MAIN_AMD64_SBOM_BUNDLE: ${{ steps.main-amd64-sbom.outputs.bundle-path }}
+          MAIN_ARM64_SBOM_BUNDLE: ${{ steps.main-arm64-sbom.outputs.bundle-path }}
+          MAIN_BINDING_BUNDLE: ${{ steps.main-binding.outputs.bundle-path }}
+          MAIN_PROVENANCE_BUNDLE: ${{ steps.main-provenance.outputs.bundle-path }}
+          REALTIME_AMD64_SBOM_BUNDLE: ${{ steps.realtime-amd64-sbom.outputs.bundle-path }}
+          REALTIME_ARM64_SBOM_BUNDLE: ${{ steps.realtime-arm64-sbom.outputs.bundle-path }}
+          REALTIME_BINDING_BUNDLE: ${{ steps.realtime-binding.outputs.bundle-path }}
+          REALTIME_PROVENANCE_BUNDLE: ${{ steps.realtime-provenance.outputs.bundle-path }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          install -d -m 0700 fork-signed-bundles
+          install -m 0600 "$MAIN_AMD64_SBOM_BUNDLE" fork-signed-bundles/main-amd64.sbom.sigstore.json
+          install -m 0600 "$MAIN_ARM64_SBOM_BUNDLE" fork-signed-bundles/main-arm64.sbom.sigstore.json
+          install -m 0600 "$MAIN_PROVENANCE_BUNDLE" fork-signed-bundles/main.provenance.sigstore.json
+          install -m 0600 "$MAIN_BINDING_BUNDLE" fork-signed-bundles/main.binding.sigstore.json
+          install -m 0600 "$REALTIME_AMD64_SBOM_BUNDLE" fork-signed-bundles/realtime-amd64.sbom.sigstore.json
+          install -m 0600 "$REALTIME_ARM64_SBOM_BUNDLE" fork-signed-bundles/realtime-arm64.sbom.sigstore.json
+          install -m 0600 "$REALTIME_PROVENANCE_BUNDLE" fork-signed-bundles/realtime.provenance.sigstore.json
+          install -m 0600 "$REALTIME_BINDING_BUNDLE" fork-signed-bundles/realtime.binding.sigstore.json
+          install -m 0600 fork-attestation-input/coolify-amd64.sbom.spdx.json fork-signed-bundles/main-amd64.sbom.spdx.json
+          install -m 0600 fork-attestation-input/coolify-arm64.sbom.spdx.json fork-signed-bundles/main-arm64.sbom.spdx.json
+          install -m 0600 fork-attestation-input/coolify-realtime-amd64.sbom.spdx.json fork-signed-bundles/realtime-amd64.sbom.spdx.json
+          install -m 0600 fork-attestation-input/coolify-realtime-arm64.sbom.spdx.json fork-signed-bundles/realtime-arm64.sbom.spdx.json
+          install -m 0600 fork-attestation-input/release-binding.json fork-signed-bundles/release-binding.json
+
+      - name: Verify pinned Postgres and Redis dependency indexes
+        run: |
+          set -Eeuo pipefail
+          umask 077
+
+          verify_dependency_index() {
+            local image=$1 index_digest=$2 amd64_digest=$3 arm64_digest=$4 major=$5
+            local index_file
+            index_file="$(mktemp "$RUNNER_TEMP/coolify-fork-dependency-index.XXXXXX")"
+            docker buildx imagetools inspect --raw "$image@$index_digest" > "$index_file"
+            printf '%s  %s\n' "${index_digest#sha256:}" "$index_file" | sha256sum --check --strict -
+            jq -e \
+              --arg amd64 "$amd64_digest" \
+              --arg arm64 "$arm64_digest" \
+              --arg major "$major" '
+                any(.manifests[];
+                  .digest == $amd64 and .platform.os == "linux" and .platform.architecture == "amd64" and
+                  (.annotations["org.opencontainers.image.version"] | startswith($major + "."))) and
+                any(.manifests[];
+                  .digest == $arm64 and .platform.os == "linux" and .platform.architecture == "arm64" and
+                  (.annotations["org.opencontainers.image.version"] | startswith($major + ".")))
+              ' "$index_file" >/dev/null
+            rm -f "$index_file"
+          }
+
+          verify_dependency_index "$POSTGRES_IMAGE" "$POSTGRES_INDEX_DIGEST" "$POSTGRES_AMD64_DIGEST" "$POSTGRES_ARM64_DIGEST" 15
+          verify_dependency_index "$REDIS_IMAGE" "$REDIS_INDEX_DIGEST" "$REDIS_AMD64_DIGEST" "$REDIS_ARM64_DIGEST" 7
+
+      - name: Generate and Ed25519-sign strict fork deploy manifests
+        env:
+          FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY: ${{ secrets.FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY }}
+          MAIN_AMD64_DIGEST: ${{ needs.fork-stage.outputs.main_amd64_digest }}
+          MAIN_ARM64_DIGEST: ${{ needs.fork-stage.outputs.main_arm64_digest }}
+          MAIN_INDEX_DIGEST: ${{ needs.fork-stage.outputs.main_index_digest }}
+          REALTIME_AMD64_DIGEST: ${{ needs.fork-stage.outputs.realtime_amd64_digest }}
+          REALTIME_ARM64_DIGEST: ${{ needs.fork-stage.outputs.realtime_arm64_digest }}
+          REALTIME_INDEX_DIGEST: ${{ needs.fork-stage.outputs.realtime_index_digest }}
+          SEMANTIC_VERSION: ${{ inputs.semantic_version }}
+          SOURCE_REVISION: ${{ github.sha }}
+          SOURCE_TAG: ${{ github.ref_name }}
+          SOURCE_URL: https://github.com/${{ github.repository }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+
+          [[ "$GITHUB_REF" == "refs/tags/$SEMANTIC_VERSION" ]]
+          [[ "$SOURCE_TAG" == "$SEMANTIC_VERSION" ]]
+
+          private_key="$RUNNER_TEMP/coolify-fork-release-signing-ed25519.pem"
+          committed_public_key=docker/fork-release-signing-ed25519.pub
+          public_key=fork-signed-bundles/release-signing-ed25519.pub
+          derived_public_der="$RUNNER_TEMP/coolify-fork-release-signing-derived.der"
+          committed_public_der="$RUNNER_TEMP/coolify-fork-release-signing-committed.der"
+          printf '%s\n' "$FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY" > "$private_key"
+          chmod 0600 "$private_key"
+          [[ -f "$committed_public_key" && ! -L "$committed_public_key" ]]
+          openssl pkey -in "$private_key" -text_pub -noout | grep -F 'ED25519 Public-Key' >/dev/null
+          openssl pkey -in "$private_key" -pubout -outform DER -out "$derived_public_der"
+          openssl pkey -pubin -in "$committed_public_key" -pubout -outform DER -out "$committed_public_der"
+          cmp --silent "$derived_public_der" "$committed_public_der" || {
+            printf 'Fork release signing private key does not match the committed public key.\n' >&2
+            exit 1
+          }
+          key_id="sha256:$(sha256sum "$committed_public_der" | awk '{print $1}')"
+          printf '%s' "$key_id" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          install -m 0600 "$committed_public_key" "$public_key"
+          printf '%s\n' "$key_id" > fork-signed-bundles/release-signing-key-id.txt
+
+          write_labels() {
+            local output=$1
+            {
+              printf 'org.opencontainers.image.source=%s\n' "$SOURCE_URL"
+              printf 'org.opencontainers.image.revision=%s\n' "$SOURCE_REVISION"
+              printf 'org.opencontainers.image.version=%s\n' "$SEMANTIC_VERSION"
+            } > "$output"
+          }
+          write_labels fork-signed-bundles/main.oci-labels.env
+          write_labels fork-signed-bundles/realtime.oci-labels.env
+
+          write_overlay() {
+            local output=$1 main_digest=$2 realtime_digest=$3 postgres_digest=$4 redis_digest=$5
+            {
+              printf 'services:\n'
+              printf '  coolify:\n'
+              printf '    image: "%s@%s"\n' "$MAIN_TARGET" "$main_digest"
+              printf '    ports: !override\n'
+              # shellcheck disable=SC2016
+              printf '%s\n' '      - "127.0.0.1:${APP_PORT:-8000}:8080"'
+              printf '    environment:\n'
+              printf '      AUTOUPDATE: "false"\n'
+              printf '  soketi:\n'
+              printf '    image: "%s@%s"\n' "$REALTIME_TARGET" "$realtime_digest"
+              printf '    ports: !override\n'
+              # shellcheck disable=SC2016
+              printf '%s\n' '      - "127.0.0.1:${SOKETI_PORT:-6001}:6001"'
+              printf '      - "127.0.0.1:6002:6002"\n'
+              printf '  postgres:\n'
+              printf '    image: "%s@%s"\n' "$POSTGRES_IMAGE" "$postgres_digest"
+              printf '  redis:\n'
+              printf '    image: "%s@%s"\n' "$REDIS_IMAGE" "$redis_digest"
+            } > "$output"
+          }
+          write_overlay fork-signed-bundles/docker-compose.linux-amd64.custom.yml \
+            "$MAIN_AMD64_DIGEST" "$REALTIME_AMD64_DIGEST" "$POSTGRES_AMD64_DIGEST" "$REDIS_AMD64_DIGEST"
+          write_overlay fork-signed-bundles/docker-compose.linux-arm64.custom.yml \
+            "$MAIN_ARM64_DIGEST" "$REALTIME_ARM64_DIGEST" "$POSTGRES_ARM64_DIGEST" "$REDIS_ARM64_DIGEST"
+
+          sha256_of() {
+            sha256sum "$1" | awk '{print $1}'
+          }
+
+          main_labels_sha256="$(sha256_of fork-signed-bundles/main.oci-labels.env)"
+          realtime_labels_sha256="$(sha256_of fork-signed-bundles/realtime.oci-labels.env)"
+          main_provenance_sha256="$(sha256_of fork-signed-bundles/main.provenance.sigstore.json)"
+          realtime_provenance_sha256="$(sha256_of fork-signed-bundles/realtime.provenance.sigstore.json)"
+          dockerfile_main_sha256="$(sha256_of docker/production/Dockerfile)"
+          dockerfile_realtime_sha256="$(sha256_of docker/coolify-realtime/Dockerfile)"
+          compose_sha256="$(sha256_of docker-compose.yml)"
+          compose_prod_sha256="$(sha256_of docker-compose.prod.yml)"
+          env_production_sha256="$(sha256_of .env.production)"
+          release_asset_contract_sha256="$(sha256_of docker/control-plane-blue-green/release-assets.contract)"
+
+          write_manifest() {
+            local platform=$1 main_platform_digest=$2 realtime_platform_digest=$3
+            local postgres_digest=$4 redis_digest=$5 sbom_suffix=$6 overlay=$7 manifest
+            manifest="fork-signed-bundles/release-${platform//\//-}.env"
+            {
+              printf 'SCHEMA=coolify-fork-release/v1\n'
+              printf 'KEY_ID=%s\n' "$key_id"
+              printf 'VERSION=%s\n' "$SEMANTIC_VERSION"
+              printf 'SOURCE_REVISION=%s\n' "$SOURCE_REVISION"
+              printf 'SOURCE_TAG=%s\n' "$SOURCE_TAG"
+              printf 'PLATFORM=%s\n' "$platform"
+              printf 'MAIN_IMAGE=%s\n' "$MAIN_TARGET"
+              printf 'MAIN_INDEX_DIGEST=%s\n' "$MAIN_INDEX_DIGEST"
+              printf 'MAIN_PLATFORM_DIGEST=%s\n' "$main_platform_digest"
+              printf 'REALTIME_IMAGE=%s\n' "$REALTIME_TARGET"
+              printf 'REALTIME_INDEX_DIGEST=%s\n' "$REALTIME_INDEX_DIGEST"
+              printf 'REALTIME_PLATFORM_DIGEST=%s\n' "$realtime_platform_digest"
+              printf 'POSTGRES_IMAGE=%s\n' "$POSTGRES_IMAGE"
+              printf 'POSTGRES_DIGEST=%s\n' "$postgres_digest"
+              printf 'POSTGRES_MAJOR=15\n'
+              printf 'REDIS_IMAGE=%s\n' "$REDIS_IMAGE"
+              printf 'REDIS_DIGEST=%s\n' "$redis_digest"
+              printf 'REDIS_MAJOR=7\n'
+              printf 'MAIN_OCI_LABELS_SHA256=%s\n' "$main_labels_sha256"
+              printf 'REALTIME_OCI_LABELS_SHA256=%s\n' "$realtime_labels_sha256"
+              printf 'MAIN_SBOM_SHA256=%s\n' "$(sha256_of "fork-signed-bundles/main-${sbom_suffix}.sbom.sigstore.json")"
+              printf 'REALTIME_SBOM_SHA256=%s\n' "$(sha256_of "fork-signed-bundles/realtime-${sbom_suffix}.sbom.sigstore.json")"
+              printf 'MAIN_PROVENANCE_SHA256=%s\n' "$main_provenance_sha256"
+              printf 'REALTIME_PROVENANCE_SHA256=%s\n' "$realtime_provenance_sha256"
+              printf 'DOCKERFILE_MAIN_SHA256=%s\n' "$dockerfile_main_sha256"
+              printf 'DOCKERFILE_REALTIME_SHA256=%s\n' "$dockerfile_realtime_sha256"
+              printf 'COMPOSE_SHA256=%s\n' "$compose_sha256"
+              printf 'COMPOSE_PROD_SHA256=%s\n' "$compose_prod_sha256"
+              printf 'COMPOSE_OVERLAY_SHA256=%s\n' "$(sha256_of "$overlay")"
+              printf 'ENV_PRODUCTION_SHA256=%s\n' "$env_production_sha256"
+              printf 'RELEASE_ASSET_CONTRACT_SHA256=%s\n' "$release_asset_contract_sha256"
+            } > "$manifest"
+            openssl pkeyutl -sign -rawin -inkey "$private_key" -in "$manifest" -out "$manifest.sig"
+            openssl pkeyutl -verify -rawin -pubin -inkey "$public_key" -in "$manifest" -sigfile "$manifest.sig"
+          }
+
+          write_manifest linux/amd64 "$MAIN_AMD64_DIGEST" "$REALTIME_AMD64_DIGEST" \
+            "$POSTGRES_AMD64_DIGEST" "$REDIS_AMD64_DIGEST" amd64 \
+            fork-signed-bundles/docker-compose.linux-amd64.custom.yml
+          write_manifest linux/arm64 "$MAIN_ARM64_DIGEST" "$REALTIME_ARM64_DIGEST" \
+            "$POSTGRES_ARM64_DIGEST" "$REDIS_ARM64_DIGEST" arm64 \
+            fork-signed-bundles/docker-compose.linux-arm64.custom.yml
+          rm -f "$private_key" "$derived_public_der" "$committed_public_der"
+
+      - name: Sign amd64 deploy manifest off-registry
+        id: amd64-deploy-manifest
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          create-storage-record: false
+          push-to-registry: false
+          subject-path: fork-signed-bundles/release-linux-amd64.env
+
+      - name: Sign arm64 deploy manifest off-registry
+        id: arm64-deploy-manifest
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          create-storage-record: false
+          push-to-registry: false
+          subject-path: fork-signed-bundles/release-linux-arm64.env
+
+      - name: Collect deploy-manifest attestation bundles and checksums
+        env:
+          AMD64_DEPLOY_MANIFEST_BUNDLE: ${{ steps.amd64-deploy-manifest.outputs.bundle-path }}
+          ARM64_DEPLOY_MANIFEST_BUNDLE: ${{ steps.arm64-deploy-manifest.outputs.bundle-path }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          install -m 0600 "$AMD64_DEPLOY_MANIFEST_BUNDLE" fork-signed-bundles/release-linux-amd64.attestation.sigstore.json
+          install -m 0600 "$ARM64_DEPLOY_MANIFEST_BUNDLE" fork-signed-bundles/release-linux-arm64.attestation.sigstore.json
+          (cd fork-signed-bundles && sha256sum ./* > SHA256SUMS)
+
+      - name: Install pinned GitHub CLI for fork bundle verification
+        id: fork-gh-cli
+        run: |
+          set -eu
+          archive="$RUNNER_TEMP/gh_2.96.0_linux_amd64.tar.gz"
+          curl -fsSLo "$archive" https://github.com/cli/cli/releases/download/v2.96.0/gh_2.96.0_linux_amd64.tar.gz
+          printf '%s  %s\n' 83d5c2ccad5498f58bf6368acb1ab32588cf43ab3a4b1c301bf36328b1c8bd60 "$archive" | sha256sum --check --strict -
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          install -Dm0755 "$RUNNER_TEMP/gh_2.96.0_linux_amd64/bin/gh" "$RUNNER_TEMP/pinned-fork-gh/bin/gh"
+          printf 'path=%s\n' "$RUNNER_TEMP/pinned-fork-gh/bin/gh" >> "$GITHUB_OUTPUT"
+
+      - name: Verify every signed fork bundle off-registry
+        env:
+          GH_CLI: ${{ steps.fork-gh-cli.outputs.path }}
+          GH_TOKEN: ${{ github.token }}
+          MAIN_AMD64_DIGEST: ${{ needs.fork-stage.outputs.main_amd64_digest }}
+          MAIN_ARM64_DIGEST: ${{ needs.fork-stage.outputs.main_arm64_digest }}
+          MAIN_INDEX_DIGEST: ${{ needs.fork-stage.outputs.main_index_digest }}
+          REALTIME_AMD64_DIGEST: ${{ needs.fork-stage.outputs.realtime_amd64_digest }}
+          REALTIME_ARM64_DIGEST: ${{ needs.fork-stage.outputs.realtime_arm64_digest }}
+          REALTIME_INDEX_DIGEST: ${{ needs.fork-stage.outputs.realtime_index_digest }}
+        run: |
+          set -Eeuo pipefail
+
+          verify_bundle() {
+            local subject=$1 bundle=$2 predicate=$3
+            "$GH_CLI" attestation verify "$subject" \
+              --bundle "$bundle" \
+              --predicate-type "$predicate" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/publish-linux-image.yml" \
+              --source-digest "$GITHUB_SHA" \
+              --source-ref "$GITHUB_REF"
+          }
+
+          verify_bundle "oci://${MAIN_TARGET}@${MAIN_AMD64_DIGEST}" fork-signed-bundles/main-amd64.sbom.sigstore.json https://spdx.dev/Document/v2.3
+          verify_bundle "oci://${MAIN_TARGET}@${MAIN_ARM64_DIGEST}" fork-signed-bundles/main-arm64.sbom.sigstore.json https://spdx.dev/Document/v2.3
+          verify_bundle "oci://${REALTIME_TARGET}@${REALTIME_AMD64_DIGEST}" fork-signed-bundles/realtime-amd64.sbom.sigstore.json https://spdx.dev/Document/v2.3
+          verify_bundle "oci://${REALTIME_TARGET}@${REALTIME_ARM64_DIGEST}" fork-signed-bundles/realtime-arm64.sbom.sigstore.json https://spdx.dev/Document/v2.3
+          verify_bundle "oci://${MAIN_TARGET}@${MAIN_INDEX_DIGEST}" fork-signed-bundles/main.provenance.sigstore.json https://slsa.dev/provenance/v1
+          verify_bundle "oci://${REALTIME_TARGET}@${REALTIME_INDEX_DIGEST}" fork-signed-bundles/realtime.provenance.sigstore.json https://slsa.dev/provenance/v1
+          verify_bundle "oci://${MAIN_TARGET}@${MAIN_INDEX_DIGEST}" fork-signed-bundles/main.binding.sigstore.json https://coolify.io/attestations/fork-release-binding/v1
+          verify_bundle "oci://${REALTIME_TARGET}@${REALTIME_INDEX_DIGEST}" fork-signed-bundles/realtime.binding.sigstore.json https://coolify.io/attestations/fork-release-binding/v1
+          "$GH_CLI" attestation verify fork-signed-bundles/release-linux-amd64.env \
+            --bundle fork-signed-bundles/release-linux-amd64.attestation.sigstore.json \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/publish-linux-image.yml" \
+            --source-digest "$GITHUB_SHA" \
+            --source-ref "$GITHUB_REF"
+          "$GH_CLI" attestation verify fork-signed-bundles/release-linux-arm64.env \
+            --bundle fork-signed-bundles/release-linux-arm64.attestation.sigstore.json \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/publish-linux-image.yml" \
+            --source-digest "$GITHUB_SHA" \
+            --source-ref "$GITHUB_REF"
+          for manifest in fork-signed-bundles/release-linux-amd64.env fork-signed-bundles/release-linux-arm64.env; do
+            openssl pkeyutl -verify -rawin -pubin \
+              -inkey fork-signed-bundles/release-signing-ed25519.pub \
+              -in "$manifest" -sigfile "$manifest.sig"
+          done
+          (cd fork-signed-bundles && sha256sum --check --strict SHA256SUMS)
+
+      - name: Upload verified downloadable fork bundles
+        id: upload-fork-bundles
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          if-no-files-found: error
+          name: fork-supply-chain-${{ inputs.semantic_version }}-${{ github.sha }}
+          path: fork-signed-bundles/
+          retention-days: 90
+
+  fork-release:
+    name: Coordinate both fork semantic promotions
+    needs: [validate-inputs, fork-registry-policy, fork-stage, fork-attest]
+    if: ${{ inputs.release_kind == 'fork' && needs.fork-attest.result == 'success' }}
+    concurrency:
+      group: fork-semantic-promotion-${{ inputs.semantic_version }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    outputs:
+      main_digest: ${{ needs.fork-stage.outputs.main_index_digest }}
+      main_image: ${{ steps.references.outputs.main_image }}
+      realtime_digest: ${{ needs.fork-stage.outputs.realtime_index_digest }}
+      realtime_image: ${{ steps.references.outputs.realtime_image }}
+    env:
+      BUNDLE_ARTIFACT_ID: ${{ needs.fork-attest.outputs.bundle_artifact_id }}
+      MAIN_AMD64_DIGEST: ${{ needs.fork-stage.outputs.main_amd64_digest }}
+      MAIN_ARM64_DIGEST: ${{ needs.fork-stage.outputs.main_arm64_digest }}
+      MAIN_INDEX_DIGEST: ${{ needs.fork-stage.outputs.main_index_digest }}
+      MAIN_TARGET: docker.iocloudhost.net/williamagh/coolify
+      NEXUS_API_URL: https://sonatype.popos-sf6.com
+      NEXUS_REPOSITORY: docker-hosted
+      REALTIME_AMD64_DIGEST: ${{ needs.fork-stage.outputs.realtime_amd64_digest }}
+      REALTIME_ARM64_DIGEST: ${{ needs.fork-stage.outputs.realtime_arm64_digest }}
+      REALTIME_INDEX_DIGEST: ${{ needs.fork-stage.outputs.realtime_index_digest }}
+      REALTIME_TARGET: docker.iocloudhost.net/williamagh/coolify-realtime
+      SEMANTIC_VERSION: ${{ inputs.semantic_version }}
+      SOURCE_REVISION: ${{ github.sha }}
+      SOURCE_URL: https://github.com/${{ github.repository }}
+    steps:
+      - name: Re-require Nexus non-redeploy policy before final tagging
+        env:
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          [[ -n "$BUNDLE_ARTIFACT_ID" ]]
+          [[ "$GITHUB_REF" == "refs/tags/$SEMANTIC_VERSION" ]]
+          [[ "$GITHUB_SHA" == "$SOURCE_REVISION" ]]
+
+          policy_file="$(mktemp "$RUNNER_TEMP/coolify-fork-final-policy.XXXXXX")"
+          trap 'rm -f "$policy_file"' EXIT
+          status="$(curl --silent --show-error --location \
+            --connect-timeout 10 --max-time 30 --retry 3 --retry-all-errors --retry-delay 1 \
+            --user "$NEXUS_USERNAME:$NEXUS_PASSWORD" \
+            --output "$policy_file" --write-out '%{http_code}' \
+            "$NEXUS_API_URL/service/rest/v1/repositories/docker/hosted/$NEXUS_REPOSITORY")"
+          [[ "$status" == 200 ]]
+          jq -e --arg repository "$NEXUS_REPOSITORY" '
+            .name == $repository and
+            .online == true and
+            .storage.writePolicy == "ALLOW_ONCE"
+          ' "$policy_file" >/dev/null
+
+      - name: Install registry client for final fork promotion
+        uses: regclient/actions/regctl-installer@1b705e32d40851370799ea5814e83d0a5f6a70dc # v0.1.0
+        with:
+          release: v0.11.5
+
+      - name: Verify final fork promotion registry client bytes
+        run: |
+          set -eu
+          printf '%s  %s\n' c93aa7638749f5aaac1a8e01787321889c78f0101809bb2880343478d0ba0467 "$(command -v regctl)" | sha256sum --check --strict -
+
+      - name: Login to Nexus fork registry for final promotion
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          password: ${{ secrets.NEXUS_PASSWORD }}
+          registry: docker.iocloudhost.net
+          username: ${{ secrets.NEXUS_USERNAME }}
+
+      - name: Download verified fork release bundles
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          artifact-ids: ${{ needs.fork-attest.outputs.bundle_artifact_id }}
+          path: fork-release-bundles
+
+      - name: Install pinned GitHub CLI for fork release publication
+        id: fork-release-gh-cli
+        run: |
+          set -eu
+          archive="$RUNNER_TEMP/gh_2.96.0_linux_amd64.tar.gz"
+          curl -fsSLo "$archive" https://github.com/cli/cli/releases/download/v2.96.0/gh_2.96.0_linux_amd64.tar.gz
+          printf '%s  %s\n' 83d5c2ccad5498f58bf6368acb1ab32588cf43ab3a4b1c301bf36328b1c8bd60 "$archive" | sha256sum --check --strict -
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          install -Dm0755 "$RUNNER_TEMP/gh_2.96.0_linux_amd64/bin/gh" "$RUNNER_TEMP/pinned-fork-release-gh/bin/gh"
+          printf 'path=%s\n' "$RUNNER_TEMP/pinned-fork-release-gh/bin/gh" >> "$GITHUB_OUTPUT"
+
+      - name: Create or validate empty draft recovery release before semantic promotion
+        env:
+          GH_CLI: ${{ steps.fork-release-gh-cli.outputs.path }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+
+          expected_release_name="Coolify fork $SEMANTIC_VERSION"
+          bundle_directory=fork-release-bundles
+          expected_assets_file="$(mktemp "$RUNNER_TEMP/coolify-fork-recovery-expected-assets.XXXXXX")"
+          current_assets_file="$(mktemp "$RUNNER_TEMP/coolify-fork-recovery-current-assets.XXXXXX")"
+          unexpected_assets_file="$(mktemp "$RUNNER_TEMP/coolify-fork-recovery-unexpected-assets.XXXXXX")"
+          release_metadata_file="$(mktemp "$RUNNER_TEMP/coolify-fork-recovery-release.XXXXXX")"
+          trap 'rm -f "$expected_assets_file" "$current_assets_file" "$unexpected_assets_file" "$release_metadata_file"' EXIT
+          [[ -n "$GH_TOKEN" ]]
+          [[ -x "$GH_CLI" ]]
+          [[ "$GITHUB_REF" == "refs/tags/$SEMANTIC_VERSION" ]]
+          [[ "$GITHUB_SHA" == "$SOURCE_REVISION" ]]
+          [[ -d "$bundle_directory" && ! -L "$bundle_directory" ]]
+          [[ -f "$bundle_directory/SHA256SUMS" && ! -L "$bundle_directory/SHA256SUMS" ]]
+          (cd "$bundle_directory" && sha256sum --check --strict SHA256SUMS)
+
+          while IFS= read -r checksum_line; do
+            [[ "$checksum_line" =~ ^([0-9a-f]{64})\ \ \./([A-Za-z0-9._-]+)$ ]] || {
+              printf 'Fork release checksum manifest contains an invalid entry.\n' >&2
+              exit 1
+            }
+            asset_name="${BASH_REMATCH[2]}"
+            [[ "$asset_name" != SHA256SUMS ]]
+            [[ -f "$bundle_directory/$asset_name" && ! -L "$bundle_directory/$asset_name" ]]
+            printf '%s\n' "$asset_name" >> "$expected_assets_file"
+          done < "$bundle_directory/SHA256SUMS"
+          printf '%s\n' SHA256SUMS >> "$expected_assets_file"
+          sort -u -o "$expected_assets_file" "$expected_assets_file"
+          [[ -s "$expected_assets_file" ]]
+
+          refresh_release_metadata() {
+            "$GH_CLI" release view "$SEMANTIC_VERSION" --repo "$GITHUB_REPOSITORY" \
+              --json tagName,name,isDraft,isPrerelease,assets > "$release_metadata_file"
+          }
+
+          validate_release_identity() {
+            jq -e --arg tag "$SEMANTIC_VERSION" --arg name "$expected_release_name" '
+              .tagName == $tag and
+              .name == $name and
+              .isPrerelease == true and
+              (.isDraft | type == "boolean") and
+              (.assets | type == "array")
+            ' "$release_metadata_file" >/dev/null
+          }
+
+          assert_release_tag_targets_source_revision() {
+            local tag_target_commit
+            if ! tag_target_commit="$("$GH_CLI" api "repos/$GITHUB_REPOSITORY/commits/$SEMANTIC_VERSION" --jq '.sha')"; then
+              printf 'Unable to resolve the fork release tag target commit.\n' >&2
+              return 1
+            fi
+            printf '%s' "$tag_target_commit" | grep -Eq '^[0-9a-f]{40}$'
+            [[ "$tag_target_commit" == "$GITHUB_SHA" && "$tag_target_commit" == "$SOURCE_REVISION" ]] || {
+              printf 'Fork release tag does not target the immutable workflow source revision.\n' >&2
+              return 1
+            }
+          }
+
+          sha256_of() {
+            sha256sum "$1" | awk '{print $1}'
+          }
+
+          verify_recovery_release_asset_hash() {
+            local asset_name=$1 download_directory
+            download_directory="$(mktemp -d "$RUNNER_TEMP/coolify-fork-recovery-download.XXXXXX")"
+            "$GH_CLI" release download "$SEMANTIC_VERSION" --repo "$GITHUB_REPOSITORY" \
+              --pattern "$asset_name" --dir "$download_directory"
+            [[ -f "$download_directory/$asset_name" && ! -L "$download_directory/$asset_name" ]]
+            [[ "$(sha256_of "$bundle_directory/$asset_name")" == "$(sha256_of "$download_directory/$asset_name")" ]] || {
+              printf 'Fork recovery draft asset does not match the signed release bundle: %s\n' "$asset_name" >&2
+              return 1
+            }
+            rm -f "$download_directory/$asset_name"
+            rmdir "$download_directory"
+          }
+
+          assert_recovery_release_assets_are_safe() {
+            local asset_name
+            jq -e '
+              [.assets[].name] |
+              all(type == "string" and test("^[A-Za-z0-9._-]+$")) and
+              length == (unique | length)
+            ' "$release_metadata_file" >/dev/null || {
+              printf 'Fork recovery draft contains duplicate or unsafe asset names and will not be used.\n' >&2
+              return 1
+            }
+            jq -r '.assets[].name' "$release_metadata_file" | sort > "$current_assets_file"
+            comm -23 "$current_assets_file" "$expected_assets_file" > "$unexpected_assets_file"
+            [[ ! -s "$unexpected_assets_file" ]] || {
+              printf 'Fork recovery draft contains unexpected assets and will not be used:\n' >&2
+              cat "$unexpected_assets_file" >&2
+              return 1
+            }
+            while IFS= read -r asset_name; do
+              verify_recovery_release_asset_hash "$asset_name"
+            done < "$current_assets_file"
+          }
+
+          assert_recovery_release_assets_are_exact() {
+            assert_recovery_release_assets_are_safe
+            cmp --silent "$current_assets_file" "$expected_assets_file" || {
+              printf 'Published fork recovery release assets do not exactly match the expected immutable bundle set.\n' >&2
+              return 1
+            }
+          }
+
+          if ! refresh_release_metadata; then
+            if ! "$GH_CLI" release create "$SEMANTIC_VERSION" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --draft \
+              --prerelease \
+              --latest=false \
+              --title "$expected_release_name" \
+              --notes "Recovery record for immutable signed fork release bundles at source revision $SOURCE_REVISION."; then
+              refresh_release_metadata || {
+                printf 'Fork recovery draft creation failed and no recoverable release is available.\n' >&2
+                exit 1
+              }
+            else
+              refresh_release_metadata
+            fi
+          fi
+
+          validate_release_identity
+          # A prior interrupted upload may leave a prefix of the expected signed
+          # bundle set. Missing assets are recoverable; duplicate, unexpected, or
+          # hash-mismatched assets are not safe to carry across semantic tag writes.
+          if [[ "$(jq -r '.isDraft' "$release_metadata_file")" == true ]]; then
+            assert_recovery_release_assets_are_safe
+          else
+            assert_recovery_release_assets_are_exact
+            assert_release_tag_targets_source_revision
+            printf 'Published fork release exactly matches the immutable release contract; accepting idempotent retry.\n'
+          fi
+
+      - name: Promote realtime first and main last as the fork release commit marker
+        run: |
+          set -Eeuo pipefail
+          umask 077
+
+          github_api_get() {
+            local endpoint=$1 output_file=$2
+            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+              --connect-timeout 10 --max-time 30 --retry 3 --retry-all-errors --retry-delay 1 \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/$endpoint" > "$output_file"
+          }
+
+          assert_live_fork_tag_binding() {
+            local reference_file tag_object_file object_type object_sha depth=0
+            reference_file="$(mktemp "$RUNNER_TEMP/coolify-fork-live-tag-reference.XXXXXX")"
+            tag_object_file="$(mktemp "$RUNNER_TEMP/coolify-fork-live-tag-object.XXXXXX")"
+            github_api_get "git/ref/tags/$SEMANTIC_VERSION" "$reference_file"
+            jq -e --arg ref "refs/tags/$SEMANTIC_VERSION" '.ref == $ref' "$reference_file" >/dev/null
+            object_type="$(jq -er '.object.type' "$reference_file")"
+            object_sha="$(jq -er '.object.sha' "$reference_file")"
+
+            while [[ "$object_type" == tag ]]; do
+              ((depth += 1))
+              [[ "$depth" -le 8 ]] || {
+                printf 'Fork release tag exceeds the permitted annotated-tag recursion depth.\n' >&2
+                return 1
+              }
+              printf '%s' "$object_sha" | grep -Eq '^[0-9a-f]{40}$'
+              github_api_get "git/tags/$object_sha" "$tag_object_file"
+              object_type="$(jq -er '.object.type' "$tag_object_file")"
+              object_sha="$(jq -er '.object.sha' "$tag_object_file")"
+            done
+
+            [[ "$object_type" == commit ]] || {
+              printf 'Fork release tag does not recursively resolve to a commit.\n' >&2
+              return 1
+            }
+            printf '%s' "$object_sha" | grep -Eq '^[0-9a-f]{40}$'
+            [[ "$object_sha" == "$GITHUB_SHA" && "$object_sha" == "$SOURCE_REVISION" ]] || {
+              printf 'Fork release tag no longer resolves to the immutable workflow source revision.\n' >&2
+              return 1
+            }
+          }
+
+          assert_active_fork_tag_protection() {
+            local rulesets_file ruleset_file ruleset_id
+            local -r fork_ruleset_name='Protect Coolify fork release tags'
+            local -r fork_tag_pattern='refs/tags/*.*.*-fork.*'
+            rulesets_file="$(mktemp "$RUNNER_TEMP/coolify-fork-rulesets.XXXXXX")"
+            ruleset_file="$(mktemp "$RUNNER_TEMP/coolify-fork-ruleset.XXXXXX")"
+            github_api_get 'rulesets?targets=tag&includes_parents=true&per_page=100' "$rulesets_file"
+            ruleset_id="$(jq -er --arg name "$fork_ruleset_name" '
+              [.[] | select(.name == $name and .enforcement == "active")] |
+              if length == 1 then .[0].id else error("expected exactly one active fork tag ruleset") end
+            ' "$rulesets_file")"
+            printf '%s' "$ruleset_id" | grep -Eq '^[1-9][0-9]*$'
+            github_api_get "rulesets/$ruleset_id" "$ruleset_file"
+            jq -e --arg name "$fork_ruleset_name" --arg pattern "$fork_tag_pattern" '
+              (
+                .name == $name and
+                .target == "tag" and
+                .enforcement == "active" and
+                .conditions.ref_name.include == [$pattern] and
+                ((.conditions.ref_name.exclude // []) == [])
+              ) and
+              (([.rules[].type] | unique) as $rule_types |
+                (($rule_types | index("creation")) != null) and
+                (($rule_types | index("update")) != null) and
+                (($rule_types | index("deletion")) != null)
+              )
+            ' "$ruleset_file" >/dev/null || {
+              printf 'The active fork release tag ruleset does not exactly protect %s with creation, update, and deletion controls.\n' \
+                "$fork_tag_pattern" >&2
+              return 1
+            }
+
+            # A named ruleset can intentionally grant bypass actors. That explicit
+            # human authority remains a residual risk; this gate fail-closes unless
+            # the observed policy protects the release tag at each semantic-write boundary.
+          }
+
+          digest_or_absent() {
+            local reference=$1 error_file digest
+            error_file="$(mktemp "$RUNNER_TEMP/coolify-fork-final-read.XXXXXX")"
+            if digest="$(regctl image digest "$reference" 2>"$error_file")"; then
+              rm -f "$error_file"
+              printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
+              printf '%s\n' "$digest"
+              return 0
+            fi
+            if grep -Eiq '^(manifest unknown|name unknown)(: .*)?$|^failed to (get|resolve) manifest [^[:space:]]+: (manifest unknown|not found)$' "$error_file"; then
+              rm -f "$error_file"
+              printf '\n'
+              return 0
+            fi
+            cat "$error_file" >&2
+            rm -f "$error_file"
+            return 1
+          }
+
+          verify_exact_index() {
+            local repository=$1 index_digest=$2 amd64_digest=$3 arm64_digest=$4
+            local index_file
+            [[ "$(regctl image digest "$repository@$index_digest" --platform linux/amd64)" == "$amd64_digest" ]]
+            [[ "$(regctl image digest "$repository@$index_digest" --platform linux/arm64)" == "$arm64_digest" ]]
+            for platform in linux/amd64 linux/arm64; do
+              regctl image config "$repository@$index_digest" --platform "$platform" | jq -e \
+                --arg revision "$SOURCE_REVISION" \
+                --arg source "$SOURCE_URL" \
+                --arg version "$SEMANTIC_VERSION" '
+                  .config.Labels["org.opencontainers.image.source"] == $source and
+                  .config.Labels["org.opencontainers.image.revision"] == $revision and
+                  .config.Labels["org.opencontainers.image.version"] == $version
+                ' >/dev/null
+            done
+            index_file="$(mktemp "$RUNNER_TEMP/coolify-fork-final-index.XXXXXX")"
+            regctl manifest get "$repository@$index_digest" --format raw-body > "$index_file"
+            jq -e \
+              --arg revision "$SOURCE_REVISION" \
+              --arg source "$SOURCE_URL" \
+              --arg version "$SEMANTIC_VERSION" '
+                .mediaType == "application/vnd.oci.image.index.v1+json" and
+                .annotations["org.opencontainers.image.source"] == $source and
+                .annotations["org.opencontainers.image.revision"] == $revision and
+                .annotations["org.opencontainers.image.version"] == $version
+              ' "$index_file" >/dev/null
+            rm -f "$index_file"
+          }
+
+          verify_exact_index "$MAIN_TARGET" "$MAIN_INDEX_DIGEST" "$MAIN_AMD64_DIGEST" "$MAIN_ARM64_DIGEST"
+          verify_exact_index "$REALTIME_TARGET" "$REALTIME_INDEX_DIGEST" "$REALTIME_AMD64_DIGEST" "$REALTIME_ARM64_DIGEST"
+
+          # Physical registry atomicity is impossible: Nexus has no cross-repository
+          # atomic tag operation. The consumable-release contract is therefore
+          # an unpublished recovery draft plus verified realtime first, then the
+          # main tag as the final commit marker. Signed bundles are published only
+          # after both tags and the live GitHub source tag are revalidated. ALLOW_ONCE
+          # reruns may repair only an absent peer whose eventual digest matches.
+          preflight_semantic_tag() {
+            local repository=$1 expected_index_digest=$2 existing
+            existing="$(digest_or_absent "$repository:$SEMANTIC_VERSION")"
+            if [[ -z "$existing" ]]; then
+              return 0
+            fi
+            [[ "$existing" == "$expected_index_digest" ]] || {
+              printf 'Fork semantic tag does not match its expected immutable index digest: %s:%s expected %s, found %s\n' \
+                "$repository" "$SEMANTIC_VERSION" "$expected_index_digest" "$existing" >&2
+              return 1
+            }
+            printf 'Fork semantic tag already maps to its expected immutable index digest; accepting recovery state: %s:%s\n' \
+              "$repository" "$SEMANTIC_VERSION"
+          }
+
+          promote_or_verify_semantic_tag() {
+            local repository=$1 expected_index_digest=$2 existing
+            existing="$(digest_or_absent "$repository:$SEMANTIC_VERSION")"
+            if [[ -z "$existing" ]]; then
+              if ! regctl image copy "$repository@$expected_index_digest" "$repository:$SEMANTIC_VERSION"; then
+                existing="$(digest_or_absent "$repository:$SEMANTIC_VERSION")"
+                [[ "$existing" == "$expected_index_digest" ]] || {
+                  printf 'Fork semantic tag promotion did not produce its expected immutable index digest: %s:%s\n' \
+                    "$repository" "$SEMANTIC_VERSION" >&2
+                  return 1
+                }
+              fi
+            else
+              [[ "$existing" == "$expected_index_digest" ]] || {
+                printf 'Fork semantic tag does not match its expected immutable index digest: %s:%s expected %s, found %s\n' \
+                  "$repository" "$SEMANTIC_VERSION" "$expected_index_digest" "$existing" >&2
+                return 1
+              }
+            fi
+            [[ "$(regctl image digest "$repository:$SEMANTIC_VERSION")" == "$expected_index_digest" ]]
+          }
+
+          preflight_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"
+          preflight_semantic_tag "$REALTIME_TARGET" "$REALTIME_INDEX_DIGEST"
+
+          assert_live_fork_tag_binding
+          assert_active_fork_tag_protection
+
+          promote_or_verify_semantic_tag "$REALTIME_TARGET" "$REALTIME_INDEX_DIGEST"
+          verify_exact_index "$REALTIME_TARGET" "$REALTIME_INDEX_DIGEST" "$REALTIME_AMD64_DIGEST" "$REALTIME_ARM64_DIGEST"
+
+          promote_or_verify_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"
+          verify_exact_index "$REALTIME_TARGET" "$REALTIME_INDEX_DIGEST" "$REALTIME_AMD64_DIGEST" "$REALTIME_ARM64_DIGEST"
+          verify_exact_index "$MAIN_TARGET" "$MAIN_INDEX_DIGEST" "$MAIN_AMD64_DIGEST" "$MAIN_ARM64_DIGEST"
+          assert_live_fork_tag_binding
+          assert_active_fork_tag_protection
+
+      - name: Publish immutable signed fork bundles to the tag release
+        env:
+          GH_CLI: ${{ steps.fork-release-gh-cli.outputs.path }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+
+          bundle_directory=fork-release-bundles
+          expected_release_name="Coolify fork $SEMANTIC_VERSION"
+          expected_assets_file="$(mktemp "$RUNNER_TEMP/coolify-fork-release-expected-assets.XXXXXX")"
+          current_assets_file="$(mktemp "$RUNNER_TEMP/coolify-fork-release-current-assets.XXXXXX")"
+          unexpected_assets_file="$(mktemp "$RUNNER_TEMP/coolify-fork-release-unexpected-assets.XXXXXX")"
+          release_metadata_file="$(mktemp "$RUNNER_TEMP/coolify-fork-release-metadata.XXXXXX")"
+          trap 'rm -f "$expected_assets_file" "$current_assets_file" "$unexpected_assets_file" "$release_metadata_file"' EXIT
+
+          [[ -n "$BUNDLE_ARTIFACT_ID" ]]
+          [[ -n "$GH_TOKEN" ]]
+          [[ -x "$GH_CLI" ]]
+          [[ "$GITHUB_REF" == "refs/tags/$SEMANTIC_VERSION" ]]
+          [[ "$GITHUB_SHA" == "$SOURCE_REVISION" ]]
+          [[ -d "$bundle_directory" && ! -L "$bundle_directory" ]]
+          [[ -f "$bundle_directory/SHA256SUMS" && ! -L "$bundle_directory/SHA256SUMS" ]]
+          (cd "$bundle_directory" && sha256sum --check --strict SHA256SUMS)
+          for manifest in release-linux-amd64.env release-linux-arm64.env; do
+            [[ -f "$bundle_directory/$manifest" && ! -L "$bundle_directory/$manifest" ]]
+            [[ -f "$bundle_directory/$manifest.sig" && ! -L "$bundle_directory/$manifest.sig" ]]
+            openssl pkeyutl -verify -rawin -pubin \
+              -inkey "$bundle_directory/release-signing-ed25519.pub" \
+              -in "$bundle_directory/$manifest" -sigfile "$bundle_directory/$manifest.sig"
+          done
+
+          while IFS= read -r checksum_line; do
+            [[ "$checksum_line" =~ ^([0-9a-f]{64})\ \ \./([A-Za-z0-9._-]+)$ ]] || {
+              printf 'Fork release checksum manifest contains an invalid entry.\n' >&2
+              exit 1
+            }
+            expected_checksum="${BASH_REMATCH[1]}"
+            asset_name="${BASH_REMATCH[2]}"
+            [[ "$asset_name" != SHA256SUMS ]]
+            [[ -f "$bundle_directory/$asset_name" && ! -L "$bundle_directory/$asset_name" ]]
+            [[ "$(sha256sum "$bundle_directory/$asset_name" | awk '{print $1}')" == "$expected_checksum" ]]
+            printf '%s\n' "$asset_name" >> "$expected_assets_file"
+          done < "$bundle_directory/SHA256SUMS"
+          printf '%s\n' SHA256SUMS >> "$expected_assets_file"
+          sort -u -o "$expected_assets_file" "$expected_assets_file"
+          [[ -s "$expected_assets_file" ]]
+
+          refresh_release_metadata() {
+            "$GH_CLI" release view "$SEMANTIC_VERSION" --repo "$GITHUB_REPOSITORY" \
+              --json tagName,name,isDraft,isPrerelease,assets > "$release_metadata_file"
+          }
+
+          validate_release_identity() {
+            jq -e --arg tag "$SEMANTIC_VERSION" --arg name "$expected_release_name" '
+              .tagName == $tag and
+              .name == $name and
+              .isPrerelease == true and
+              (.isDraft | type == "boolean") and
+              (.assets | type == "array")
+            ' "$release_metadata_file" >/dev/null
+          }
+
+          assert_release_tag_targets_source_revision() {
+            local tag_target_commit
+            if ! tag_target_commit="$("$GH_CLI" api "repos/$GITHUB_REPOSITORY/commits/$SEMANTIC_VERSION" --jq '.sha')"; then
+              printf 'Unable to resolve the fork release tag target commit.\n' >&2
+              return 1
+            fi
+            printf '%s' "$tag_target_commit" | grep -Eq '^[0-9a-f]{40}$'
+            [[ "$tag_target_commit" == "$GITHUB_SHA" && "$tag_target_commit" == "$SOURCE_REVISION" ]] || {
+              printf 'Fork release tag does not target the immutable workflow source revision.\n' >&2
+              return 1
+            }
+          }
+
+          sha256_of() {
+            sha256sum "$1" | awk '{print $1}'
+          }
+
+          current_release_asset_count() {
+            jq -r --arg asset "$1" '[.assets[] | select(.name == $asset)] | length' "$release_metadata_file"
+          }
+
+          verify_release_asset_hash() {
+            local asset_name=$1 download_directory
+            download_directory="$(mktemp -d "$RUNNER_TEMP/coolify-fork-release-download.XXXXXX")"
+            "$GH_CLI" release download "$SEMANTIC_VERSION" --repo "$GITHUB_REPOSITORY" \
+              --pattern "$asset_name" --dir "$download_directory"
+            [[ -f "$download_directory/$asset_name" && ! -L "$download_directory/$asset_name" ]]
+            [[ "$(sha256_of "$bundle_directory/$asset_name")" == "$(sha256_of "$download_directory/$asset_name")" ]] || {
+              printf 'Fork tag release asset does not match the signed release bundle: %s\n' "$asset_name" >&2
+              return 1
+            }
+            rm -f "$download_directory/$asset_name"
+            rmdir "$download_directory"
+          }
+
+          assert_release_assets_are_known() {
+            local asset_name
+            jq -e '[.assets[].name] | length == (unique | length)' "$release_metadata_file" >/dev/null
+            jq -r '.assets[].name' "$release_metadata_file" | sort > "$current_assets_file"
+            comm -23 "$current_assets_file" "$expected_assets_file" > "$unexpected_assets_file"
+            [[ ! -s "$unexpected_assets_file" ]] || {
+              printf 'Fork tag release contains unexpected assets and will not be modified:\n' >&2
+              cat "$unexpected_assets_file" >&2
+              return 1
+            }
+            while IFS= read -r asset_name; do
+              verify_release_asset_hash "$asset_name"
+            done < "$current_assets_file"
+          }
+
+          assert_release_assets_are_exact() {
+            assert_release_assets_are_known
+            cmp --silent "$current_assets_file" "$expected_assets_file" || {
+              printf 'Published fork tag release assets are incomplete; refusing to modify a published release.\n' >&2
+              return 1
+            }
+          }
+
+          refresh_release_metadata || {
+            printf 'Fork recovery draft is missing after semantic promotion; refusing to publish signed bundles.\n' >&2
+            exit 1
+          }
+
+          validate_release_identity
+          assert_release_assets_are_known
+          if [[ "$(jq -r '.isDraft' "$release_metadata_file")" == true ]]; then
+            while IFS= read -r asset_name; do
+              refresh_release_metadata
+              validate_release_identity
+              assert_release_assets_are_known
+              asset_count="$(current_release_asset_count "$asset_name")"
+              case "$asset_count" in
+                0)
+                  if ! "$GH_CLI" release upload "$SEMANTIC_VERSION" --repo "$GITHUB_REPOSITORY" \
+                    "$bundle_directory/$asset_name"; then
+                    refresh_release_metadata
+                  fi
+                  ;;
+                1)
+                  ;;
+                *)
+                  printf 'Fork tag release has duplicate asset names: %s\n' "$asset_name" >&2
+                  exit 1
+                  ;;
+              esac
+              refresh_release_metadata
+              validate_release_identity
+              assert_release_assets_are_known
+              [[ "$(current_release_asset_count "$asset_name")" == 1 ]]
+              verify_release_asset_hash "$asset_name"
+            done < "$expected_assets_file"
+            refresh_release_metadata
+            validate_release_identity
+            assert_release_assets_are_exact
+            assert_release_tag_targets_source_revision
+            if ! "$GH_CLI" release edit "$SEMANTIC_VERSION" --repo "$GITHUB_REPOSITORY" --draft=false; then
+              printf 'Fork release publication returned an ambiguous failure; reconciling the observed release state.\n' >&2
+            fi
+            refresh_release_metadata || {
+              printf 'Unable to refresh fork release state after publication; a retry will reconcile the immutable release.\n' >&2
+              exit 1
+            }
+            validate_release_identity
+          fi
+
+          [[ "$(jq -r '.isDraft' "$release_metadata_file")" == false ]] || {
+            printf 'Fork release publication did not converge to a published release.\n' >&2
+            exit 1
+          }
+          assert_release_assets_are_exact
+          assert_release_tag_targets_source_revision
+
+      - id: references
+        name: Record immutable fork image references
+        run: |
+          set -eu
+          {
+            printf 'main_image=%s@%s\n' "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"
+            printf 'realtime_image=%s@%s\n' "$REALTIME_TARGET" "$REALTIME_INDEX_DIGEST"
+          } >> "$GITHUB_OUTPUT"

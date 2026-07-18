@@ -9,6 +9,45 @@ final readonly class BlueGreenRoutingTarget
 {
     public const PROBE_ACKNOWLEDGEMENT_HEADER = 'X-Coolify-Probe-Ack';
 
+    public static function managedFilename(string $applicationUuid, int $destinationId): string
+    {
+        return 'coolify-blue-green-'.self::routingScope($applicationUuid, $destinationId).'.yaml';
+    }
+
+    public static function routingNamePrefix(string $applicationUuid, int $destinationId): string
+    {
+        return 'coolify-bg-'.self::routingScope($applicationUuid, $destinationId).'-';
+    }
+
+    public static function activeServiceName(string $applicationUuid, int $destinationId): string
+    {
+        return self::routingNamePrefix($applicationUuid, $destinationId).'active';
+    }
+
+    public static function memberServiceName(
+        string $applicationUuid,
+        int $destinationId,
+        BlueGreenDeploymentColor $color,
+    ): string {
+        return self::routingNamePrefix($applicationUuid, $destinationId).$color->value;
+    }
+
+    public static function memberServiceReference(
+        string $applicationUuid,
+        int $destinationId,
+        BlueGreenDeploymentColor $color,
+    ): string {
+        return self::memberServiceName($applicationUuid, $destinationId, $color).'@docker';
+    }
+
+    public static function memberDiscoveryRouterName(
+        string $applicationUuid,
+        int $destinationId,
+        BlueGreenDeploymentColor $color,
+    ): string {
+        return self::memberServiceName($applicationUuid, $destinationId, $color).'-discovery';
+    }
+
     public function __construct(
         public int $destinationId,
         public BlueGreenDeploymentColor $activeColor,
@@ -121,6 +160,18 @@ final readonly class BlueGreenRoutingTarget
         if (preg_match('/^[A-Za-z0-9._~+\/=:-]{16,512}$/D', $token) !== 1) {
             throw new InvalidArgumentException("The {$role} token must be an opaque single-line token of at least 16 characters.");
         }
+    }
+
+    private static function routingScope(string $applicationUuid, int $destinationId): string
+    {
+        if (preg_match('/^[A-Za-z0-9][A-Za-z0-9_-]*$/D', $applicationUuid) !== 1) {
+            throw new InvalidArgumentException('A Docker-safe application UUID is required to compile blue/green routing.');
+        }
+        if ($destinationId < 0) {
+            throw new InvalidArgumentException('The destination ID must be a nonnegative integer.');
+        }
+
+        return substr(hash('sha256', $applicationUuid."\0".$destinationId), 0, 16);
     }
 
     private function acknowledgement(

@@ -37,7 +37,18 @@
                 </a>
             @endif
         @empty
-            <div>No destinations found.</div>
+            @if ($servers->isEmpty())
+                <div class="max-w-xl text-neutral-600 dark:text-neutral-400 lg:col-span-2">
+                    <div class="font-medium text-black dark:text-white">No destinations are available.</div>
+                    <p class="mt-1">An eligible deployment server is required before you can create a destination.</p>
+                    <a class="inline-flex items-center gap-1 mt-2 rounded-sm text-coollabs hover:underline focus-visible:ring-2 focus-visible:ring-coollabs dark:text-warning dark:focus-visible:ring-warning"
+                        href="{{ route('server.index') }}" {{ wireNavigate() }}>
+                        Review servers
+                    </a>
+                </div>
+            @else
+                <div>No destinations found.</div>
+            @endif
         @endforelse
     </div>
 </div>

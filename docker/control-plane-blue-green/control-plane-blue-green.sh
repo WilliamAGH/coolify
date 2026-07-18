@@ -10,7 +10,7 @@ OPERATOR_PATH="$SCRIPT_DIRECTORY/${0##*/}"
 readonly OPERATOR_PATH
 readonly STATE_VERSION=5
 readonly RELEASE_MANIFEST_VERSION=1
-readonly RELEASE_REQUIRED_ASSET_ROLES='operator operator-compose rehearsal-compose https-controller port8000-controller port8000-external-policy-probe port8000-ipv6-inventory-probe backup-attestation-verifier backup-quiesce-controller runtime-fence-provisioner runtime-fence-controller runtime-fence-controlmaster-reaper runtime-fence-provider-probe runtime-fence-queue-probe runtime-fence-terminal-probe'
+readonly RELEASE_REQUIRED_ASSET_ROLES='operator operator-compose rehearsal-compose ingress-controller backup-attestation-verifier backup-quiesce-controller backup-quiesce-service-unit backup-quiesce-timer-unit runtime-fence-provisioner runtime-fence-controller runtime-fence-controlmaster-reaper runtime-fence-provider-probe runtime-fence-queue-probe runtime-fence-terminal-probe runtime-fence-service-unit runtime-fence-watchdog-unit'
 readonly GLOBAL_TRANSACTION_LOCK=/run/lock/coolify-control-plane-blue-green.lock
 readonly PRODUCTION_RELEASE_MANIFEST=/etc/coolify-control-plane/release.manifest
 readonly EXPECTED_PROXY_DIGEST=sha256:5ae9c349154d5298a5d61a7b25e5f3a9f53314f1515e87632120b95051c7917c
@@ -24,12 +24,10 @@ readonly POOL_LABEL_KEY=coolify.control-plane.pool
 readonly PROXY_DYNAMIC_CONTAINER_PATH=/traefik/dynamic
 readonly IMMUTABLE_BASELINE_SURPLUS_PATH=database/migrations/control-plane-immutable-baseline-surplus.list
 readonly CONTROL_PLANE_MIGRATION_FINGERPRINT_PATH=database/migrations/control-plane-migration-inventory.fingerprint
-readonly BACKUP_QUIESCE_CONTROLLER_SHA256=d9324a6856b5cb7d578c11b155b8b542909968c2b2f1389579dd2c913671da2d
-readonly BACKUP_QUIESCE_SERVICE_UNIT_SHA256=0424c5a69f741dcd62c930f407e46fc3cb7960fd6c4591a137abe8e11b8eb392
-readonly BACKUP_QUIESCE_TIMER_UNIT_SHA256=f423a34d0710427f9fcee885a6b9ac0b28f746aec9b31683090cd8a8bb339478
-readonly INSTALLED_BACKUP_QUIESCE_CONTROLLER=/usr/local/libexec/coolify/control-plane-backup-quiesce
 readonly INSTALLED_BACKUP_QUIESCE_SERVICE_UNIT=/etc/systemd/system/control-plane-backup-quiesce-watchdog.service
 readonly INSTALLED_BACKUP_QUIESCE_TIMER_UNIT=/etc/systemd/system/control-plane-backup-quiesce-watchdog.timer
+proxy_enrollment_compose_override=
+proxy_enrollment_override_active=0
 
 fail()
 {
@@ -120,6 +118,51 @@ validate_host()
     fi
 }
 
+validate_globally_routable_ipv4()
+{
+    ipv4_value=$1
+    ipv4_name=$2
+
+    if ! printf '%s\n' "$ipv4_value" | awk '
+        BEGIN { valid = 1 }
+        NR != 1 { valid = 0; next }
+        {
+            if (split($0, octet, /\./) != 4) {
+                valid = 0
+                next
+            }
+            for (position = 1; position <= 4; position++) {
+                if (octet[position] !~ /^[0-9]+$/ || length(octet[position]) > 3 ||
+                    (length(octet[position]) > 1 && substr(octet[position], 1, 1) == "0") ||
+                    octet[position] + 0 > 255) {
+                    valid = 0
+                }
+                value[position] = octet[position] + 0
+            }
+            if (valid && (value[1] == 0 || value[1] == 10 || value[1] == 127 ||
+                value[1] >= 224 ||
+                (value[1] == 100 && value[2] >= 64 && value[2] <= 127) ||
+                (value[1] == 169 && value[2] == 254) ||
+                (value[1] == 172 && value[2] >= 16 && value[2] <= 31) ||
+                (value[1] == 192 && value[2] == 0 &&
+                    (value[3] == 0 || value[3] == 2)) ||
+                (value[1] == 192 && value[2] == 31 && value[3] == 196) ||
+                (value[1] == 192 && value[2] == 52 && value[3] == 193) ||
+                (value[1] == 192 && value[2] == 88 && value[3] == 99) ||
+                (value[1] == 192 && value[2] == 168) ||
+                (value[1] == 192 && value[2] == 175 && value[3] == 48) ||
+                (value[1] == 198 && (value[2] == 18 || value[2] == 19)) ||
+                (value[1] == 198 && value[2] == 51 && value[3] == 100) ||
+                (value[1] == 203 && value[2] == 0 && value[3] == 113))) {
+                valid = 0
+            }
+        }
+        END { exit !(valid && NR == 1) }
+    '; then
+        fail "$ipv4_name must be a globally routable public IPv4 address"
+    fi
+}
+
 validate_path()
 {
     path_value=$1
@@ -152,6 +195,75 @@ validate_port()
     if [ "$port_value" -gt 65535 ]; then
         fail "$port_name is not a valid TCP port"
     fi
+}
+
+source_environment_app_port()
+{
+    source_environment_path=$1
+    awk '
+        BEGIN { matches = 0; invalid = 0 }
+        /^[[:space:]]*APP_PORT[[:space:]]*=/ {
+            matches++
+            value = $0
+            sub(/^[[:space:]]*APP_PORT[[:space:]]*=[[:space:]]*/, "", value)
+            sub(/[[:space:]]*$/, "", value)
+            if (value ~ /^"[0-9]+"$/ || value ~ /^\047[0-9]+\047$/) {
+                value = substr(value, 2, length(value) - 2)
+            }
+            if (value !~ /^[0-9]+$/) {
+                invalid = 1
+            }
+            result = value
+        }
+        END {
+            if (matches > 1 || invalid) {
+                exit 1
+            }
+            if (matches == 1) {
+                print result
+            }
+        }
+    ' "$source_environment_path"
+}
+
+derive_local_ingress_url()
+{
+    derived_public_url=$1
+    derived_app_port=$2
+    case "$derived_public_url" in
+        https://*) ;;
+        *) fail 'CONTROL_PLANE_PUBLIC_PROBE_URL must be a canonical HTTPS URL' ;;
+    esac
+    derived_authority_and_suffix=${derived_public_url#https://}
+    case "$derived_authority_and_suffix" in
+        ''|*'#'*) fail 'CONTROL_PLANE_PUBLIC_PROBE_URL must not contain a fragment' ;;
+    esac
+    case "$derived_authority_and_suffix" in
+        */*)
+            derived_authority=${derived_authority_and_suffix%%/*}
+            derived_path_and_query=/${derived_authority_and_suffix#*/}
+            case "$derived_path_and_query" in
+                *'?') derived_path_and_query=${derived_path_and_query%?} ;;
+            esac
+            ;;
+        *'?'*)
+            derived_authority=${derived_authority_and_suffix%%\?*}
+            derived_query=${derived_authority_and_suffix#*\?}
+            if [ -n "$derived_query" ]; then
+                derived_path_and_query="/?$derived_query"
+            else
+                derived_path_and_query=/
+            fi
+            ;;
+        *)
+            derived_authority=$derived_authority_and_suffix
+            derived_path_and_query=/
+            ;;
+    esac
+    case "$derived_authority" in
+        ''|*@*|*'?'*) fail 'CONTROL_PLANE_PUBLIC_PROBE_URL has an invalid authority' ;;
+    esac
+    printf 'http://127.0.0.1:%s%s\n' "$derived_app_port" "$derived_path_and_query"
 }
 
 validate_positive_integer()
@@ -341,18 +453,19 @@ configured_release_asset_path()
         operator) printf '%s\n' "$OPERATOR_PATH" ;;
         operator-compose) printf '%s\n' "$operator_compose_file" ;;
         rehearsal-compose) printf '%s\n' "$rehearsal_compose_file" ;;
-        https-controller) printf '%s\n' "$https_controller" ;;
-        port8000-controller) printf '%s\n' "$port8000_controller" ;;
-        port8000-external-policy-probe) printf '%s\n' "$port8000_external_policy_probe" ;;
-        port8000-ipv6-inventory-probe) printf '%s\n' "$port8000_ipv6_inventory_probe" ;;
+        ingress-controller) printf '%s\n' "$ingress_controller" ;;
         backup-attestation-verifier) printf '%s\n' "$backup_attestation_verifier" ;;
         backup-quiesce-controller) printf '%s\n' "$release_backup_quiesce_controller" ;;
+        backup-quiesce-service-unit) printf '%s\n' "$release_backup_quiesce_service_unit" ;;
+        backup-quiesce-timer-unit) printf '%s\n' "$release_backup_quiesce_timer_unit" ;;
         runtime-fence-provisioner) printf '%s\n' "$runtime_fence_provisioner" ;;
         runtime-fence-controller) printf '%s\n' "$release_runtime_fence_controller" ;;
         runtime-fence-controlmaster-reaper) printf '%s\n' "$release_runtime_fence_reaper" ;;
         runtime-fence-provider-probe) printf '%s\n' "$release_runtime_fence_provider_probe" ;;
         runtime-fence-queue-probe) printf '%s\n' "$release_runtime_fence_queue_probe" ;;
         runtime-fence-terminal-probe) printf '%s\n' "$release_runtime_fence_terminal_probe" ;;
+        runtime-fence-service-unit) printf '%s\n' "$release_runtime_fence_service_unit" ;;
+        runtime-fence-watchdog-unit) printf '%s\n' "$release_runtime_fence_watchdog_unit" ;;
         *) fail "unknown configured release asset role: $1" ;;
     esac
 }
@@ -374,12 +487,13 @@ configure_and_verify_release_inventory()
 {
     operator_compose_file=${CONTROL_PLANE_OPERATOR_COMPOSE_FILE:-$SCRIPT_DIRECTORY/compose.yaml}
     rehearsal_compose_file=${CONTROL_PLANE_REHEARSAL_COMPOSE_FILE:-$SCRIPT_DIRECTORY/compose.rehearsal.yaml}
-    https_controller=${CONTROL_PLANE_HTTPS_CONTROLLER:-$SCRIPT_DIRECTORY/controllers/traefik-https.sh}
-    port8000_controller=${CONTROL_PLANE_PORT8000_CONTROLLER:-$SCRIPT_DIRECTORY/controllers/haproxy-port8000.sh}
-    port8000_external_policy_probe=${CONTROL_PLANE_PORT8000_EXTERNAL_POLICY_PROBE:-}
-    port8000_ipv6_inventory_probe=${CONTROL_PLANE_PORT8000_IPV6_INVENTORY_PROBE:-}
+    ingress_controller=${CONTROL_PLANE_INGRESS_CONTROLLER:-$SCRIPT_DIRECTORY/controllers/traefik-ingress.sh}
     backup_attestation_verifier=${CONTROL_PLANE_BACKUP_ATTESTATION_VERIFIER:-$SCRIPT_DIRECTORY/backup/restore-attest.sh}
-    runtime_fence_provisioner=${CONTROL_PLANE_RUNTIME_FENCE_PROVISIONER:-/usr/local/sbin/coolify-runtime-fence-provision}
+    runtime_fence_provisioner=${CONTROL_PLANE_RUNTIME_FENCE_PROVISIONER:-$SCRIPT_DIRECTORY/controllers/provision-runtime-attestation-ssh-fence.sh}
+    release_backup_quiesce_service_unit=$SCRIPT_DIRECTORY/backup-quiesce/control-plane-backup-quiesce-watchdog.service
+    release_backup_quiesce_timer_unit=$SCRIPT_DIRECTORY/backup-quiesce/control-plane-backup-quiesce-watchdog.timer
+    release_runtime_fence_service_unit=$SCRIPT_DIRECTORY/controllers/coolify-runtime-attestation-ssh-fence.service
+    release_runtime_fence_watchdog_unit=$SCRIPT_DIRECTORY/controllers/coolify-runtime-attestation-ssh-fence-watchdog.service
     if is_test_mode; then
         release_manifest_file=${CONTROL_PLANE_RELEASE_MANIFEST_FILE:-}
         require_value CONTROL_PLANE_RELEASE_MANIFEST_FILE "$release_manifest_file"
@@ -394,18 +508,39 @@ configure_and_verify_release_inventory()
             || [ "$CONTROL_PLANE_RELEASE_MANIFEST_FILE" = "$PRODUCTION_RELEASE_MANIFEST" ] \
             || fail 'production operator release manifest path is fixed'
         release_manifest_file=$PRODUCTION_RELEASE_MANIFEST
-        release_backup_quiesce_controller=${CONTROL_PLANE_RELEASE_BACKUP_QUIESCE_CONTROLLER:-$INSTALLED_BACKUP_QUIESCE_CONTROLLER}
-        release_runtime_fence_controller=${CONTROL_PLANE_RELEASE_RUNTIME_FENCE_CONTROLLER:-/usr/local/libexec/coolify-runtime-attestation-ssh-fence}
-        release_runtime_fence_reaper=${CONTROL_PLANE_RELEASE_RUNTIME_FENCE_REAPER:-/usr/local/libexec/coolify-self-ssh-controlmaster-reaper}
-        release_runtime_fence_provider_probe=${CONTROL_PLANE_RELEASE_RUNTIME_FENCE_PROVIDER_PROBE:-/usr/local/libexec/coolify-traefik-provider-freshness-probe}
-        release_runtime_fence_queue_probe=${CONTROL_PLANE_RELEASE_RUNTIME_FENCE_QUEUE_PROBE:-/usr/local/libexec/coolify-proxy-queue-zero-probe}
-        release_runtime_fence_terminal_probe=${CONTROL_PLANE_RELEASE_RUNTIME_FENCE_TERMINAL_PROBE:-/usr/local/libexec/coolify-control-plane-terminal-state-probe}
+        release_backup_quiesce_controller=${CONTROL_PLANE_RELEASE_BACKUP_QUIESCE_CONTROLLER:-$SCRIPT_DIRECTORY/backup-quiesce/control-plane-backup-quiesce.sh}
+        release_runtime_fence_controller=${CONTROL_PLANE_RELEASE_RUNTIME_FENCE_CONTROLLER:-$SCRIPT_DIRECTORY/controllers/runtime-attestation-ssh-fence.sh}
+        release_runtime_fence_reaper=${CONTROL_PLANE_RELEASE_RUNTIME_FENCE_REAPER:-$SCRIPT_DIRECTORY/controllers/self-ssh-controlmaster-reaper.sh}
+        release_runtime_fence_provider_probe=${CONTROL_PLANE_RELEASE_RUNTIME_FENCE_PROVIDER_PROBE:-$SCRIPT_DIRECTORY/controllers/traefik-docker-provider-freshness-probe.sh}
+        release_runtime_fence_queue_probe=${CONTROL_PLANE_RELEASE_RUNTIME_FENCE_QUEUE_PROBE:-$SCRIPT_DIRECTORY/controllers/proxy-queue-zero-probe.sh}
+        release_runtime_fence_terminal_probe=${CONTROL_PLANE_RELEASE_RUNTIME_FENCE_TERMINAL_PROBE:-$SCRIPT_DIRECTORY/controllers/control-plane-terminal-state-probe.sh}
     fi
     release_manifest_sha256=${CONTROL_PLANE_RELEASE_MANIFEST_SHA256:-}
     release_id=${CONTROL_PLANE_RELEASE_ID:-}
     require_value CONTROL_PLANE_RELEASE_MANIFEST_SHA256 "$release_manifest_sha256"
     require_value CONTROL_PLANE_RELEASE_ID "$release_id"
     verify_release_manifest
+}
+
+release_asset_expected_mode()
+{
+    case "$1" in
+        operator-compose|rehearsal-compose)
+            printf '%s\n' 600
+            ;;
+        backup-quiesce-service-unit|backup-quiesce-timer-unit|runtime-fence-service-unit|runtime-fence-watchdog-unit)
+            printf '%s\n' 644
+            ;;
+        operator|backup-attestation-verifier|backup-quiesce-controller)
+            printf '%s\n' 755
+            ;;
+        ingress-controller|runtime-fence-provisioner|runtime-fence-controller|runtime-fence-controlmaster-reaper|runtime-fence-provider-probe|runtime-fence-queue-probe|runtime-fence-terminal-probe)
+            printf '%s\n' 700
+            ;;
+        *)
+            fail "release asset role has no mode contract: $1"
+            ;;
+    esac
 }
 
 assert_release_asset_identity()
@@ -442,28 +577,23 @@ assert_release_asset_identity()
         || fail "release asset bytes or metadata changed: $release_identity_role"
     [ "$release_identity_uid:$release_identity_gid" = "$immutable_uid:$immutable_gid" ] \
         || fail "release asset owner is not immutable-owner authorized: $release_identity_role"
-    case "$release_identity_role" in
-        operator-compose|rehearsal-compose)
+    release_identity_expected_mode=$(release_asset_expected_mode "$release_identity_role")
+    case "$release_identity_expected_mode" in
+        600|644)
             [ $((0$release_identity_mode & 0133)) -eq 0 ] \
                 || fail "release data asset mode is unsafe: $release_identity_role"
-            [ "$test_mode" = 1 ] || [ "$release_identity_mode" = 600 ] \
-                || fail "production release data asset must have mode 0600: $release_identity_role"
             ;;
-        backup-attestation-verifier)
+        700|755)
             [ -x "$release_identity_path" ] \
                 && [ $((0$release_identity_mode & 0022)) -eq 0 ] \
                 || fail "release executable mode is unsafe: $release_identity_role"
-            [ "$test_mode" = 1 ] || [ "$release_identity_mode" = 755 ] \
-                || fail 'production backup attestation verifier must have mode 0755'
             ;;
         *)
-            [ -x "$release_identity_path" ] \
-                && [ $((0$release_identity_mode & 0022)) -eq 0 ] \
-                || fail "release executable mode is unsafe: $release_identity_role"
-            [ "$test_mode" = 1 ] || [ "$release_identity_mode" = 700 ] \
-                || fail "production release executable must have mode 0700: $release_identity_role"
+            fail "release asset mode contract is invalid: $release_identity_role"
             ;;
     esac
+    [ "$test_mode" = 1 ] || [ "$release_identity_mode" = "$release_identity_expected_mode" ] \
+        || fail "production release asset must have mode 0$release_identity_expected_mode: $release_identity_role"
 }
 
 verify_release_manifest()
@@ -485,7 +615,10 @@ verify_release_manifest()
     release_manifest_observed_sha256=$(sha256_file "$release_manifest_file")
     [ "$release_manifest_observed_sha256" = "$release_manifest_sha256" ] \
         || fail 'host release manifest differs from its expected out-of-band hash'
+    release_expected_asset_count=$(printf '%s\n' "$RELEASE_REQUIRED_ASSET_ROLES" | wc -w | tr -d ' ')
+    release_expected_manifest_line_count=$((release_expected_asset_count + 2))
     awk -F'|' -v expected_version="$RELEASE_MANIFEST_VERSION" \
+        -v expected_line_count="$release_expected_manifest_line_count" \
         -v expected_release="$release_id" '
         NR == 1 { if ($0 != "version|" expected_version) { invalid = 1; exit }; next }
         NR == 2 { if ($0 != "release|" expected_release) { invalid = 1; exit }; next }
@@ -493,7 +626,7 @@ verify_release_manifest()
             || $3 !~ /^\/[A-Za-z0-9_.\/-]+$/ || $4 !~ /^[a-f0-9]{64}$/ \
             || $5 !~ /^[0-9]+$/ || $6 !~ /^[0-9]+$/ || $7 !~ /^[0-7]{3,4}$/ \
             { invalid = 1; exit }
-        END { exit(!invalid && NR == 17 ? 0 : 1) }
+        END { exit(!invalid && NR == expected_line_count ? 0 : 1) }
     ' "$release_manifest_file" \
         || fail 'host release manifest structure or canonical inventory is invalid'
     release_observed_roles=$(sed -n 's/^asset|\([^|]*\)|.*/\1/p' \
@@ -842,17 +975,16 @@ state_key_type()
         reverse_pool_plan_sha256|reverse_ingress_pool_sha256|\
         runtime_fence_provisioner_sha256|\
         runtime_fence_base_config_sha256|runtime_fence_environment_sha256|\
-        runtime_fence_https_ack_sha256|runtime_fence_port8000_ack_sha256|\
+        runtime_fence_https_ack_sha256|\
         runtime_fence_provider_header_source_sha256|runtime_fence_provider_header_copy_sha256|\
         reverse_fence_provisioner_sha256|reverse_fence_environment_sha256|\
-        reverse_fence_https_ack_sha256|reverse_fence_port8000_ack_sha256|\
+        reverse_fence_https_ack_sha256|\
         reverse_fence_provider_header_sha256|source_compose_checksum|source_runtime_sha256|\
         source_rendered_sha256|source_base_sha256|source_prod_sha256|source_env_sha256|\
         green_runtime_env_sha256|blue_runtime_env_sha256|green_ack_sha256|blue_ack_sha256|\
         green_ack_snapshot_sha256|blue_ack_snapshot_sha256|green_probe_token_sha256|\
-        blue_probe_token_sha256|https_controller_sha256|port8000_controller_sha256|\
-        port8000_external_policy_probe_sha256|port8000_ipv6_inventory_last_sha256|\
-        port8000_ipv6_inventory_probe_sha256|backup_attestation_configuration_sha256|\
+        blue_probe_token_sha256|ingress_controller_sha256|\
+        backup_attestation_configuration_sha256|\
         backup_attestation_sha256|drain_queue_sha256|migration_attempt_state_sha256|\
         migration_compatibility_sha256|migration_manifest_sha256|migration_ledger_before_sha256|\
         migration_relfilenode_before_sha256|migration_row_counts_before_sha256|migration_schema_before_sha256|\
@@ -868,16 +1000,15 @@ state_key_type()
         operator_path|operator_compose_path|rehearsal_compose_path|\
         runtime_fence_provisioner_path|runtime_fence_base_config_path|\
         runtime_fence_environment_path|runtime_fence_https_ack_path|\
-        runtime_fence_port8000_ack_path|runtime_fence_provider_header_source_path|\
+        runtime_fence_provider_header_source_path|\
         runtime_fence_provider_header_copy_path|\
         reverse_fence_provisioner_path|\
         reverse_fence_environment_path|reverse_fence_https_ack_path|\
-        reverse_fence_port8000_ack_path|reverse_fence_provider_header_path|\
+        reverse_fence_provider_header_path|\
         source_base_path|source_prod_path|source_custom_path|source_postgres_path|source_env_path|\
         green_runtime_env_path|blue_runtime_env_path|green_ack_path|blue_ack_path|\
         green_ack_snapshot_path|blue_ack_snapshot_path|green_probe_token_path|\
-        blue_probe_token_path|port8000_external_policy_probe_path|\
-        port8000_ipv6_inventory_path|port8000_ipv6_inventory_probe_path)
+        blue_probe_token_path)
             printf '%s\n' path-or-none
             ;;
         release_manifest_uid|release_manifest_gid|release_manifest_size|\
@@ -903,15 +1034,13 @@ state_key_type()
         runtime_fence_environment_uid|runtime_fence_environment_gid|\
         runtime_fence_environment_size|runtime_fence_https_ack_uid|\
         runtime_fence_https_ack_gid|runtime_fence_https_ack_size|\
-        runtime_fence_port8000_ack_uid|runtime_fence_port8000_ack_gid|\
-        runtime_fence_port8000_ack_size|runtime_fence_provider_header_source_uid|\
+        runtime_fence_provider_header_source_uid|\
         runtime_fence_provider_header_source_gid|runtime_fence_provider_header_source_size|\
         runtime_fence_provider_header_copy_uid|runtime_fence_provider_header_copy_gid|\
         runtime_fence_provider_header_copy_size|reverse_fence_environment_uid|\
         reverse_fence_environment_gid|reverse_fence_environment_size|\
         reverse_fence_https_ack_uid|reverse_fence_https_ack_gid|reverse_fence_https_ack_size|\
-        reverse_fence_port8000_ack_uid|reverse_fence_port8000_ack_gid|\
-        reverse_fence_port8000_ack_size|reverse_fence_provider_header_uid|\
+        reverse_fence_provider_header_uid|\
         reverse_fence_provider_header_gid|reverse_fence_provider_header_size|\
         source_env_uid|source_env_gid|source_env_size|runtime_env_uid|runtime_env_gid|\
         green_ack_uid|green_ack_gid|green_ack_size|blue_ack_uid|blue_ack_gid|blue_ack_size|\
@@ -919,8 +1048,6 @@ state_key_type()
         blue_ack_snapshot_uid|blue_ack_snapshot_gid|blue_ack_snapshot_size|\
         green_probe_token_uid|green_probe_token_gid|green_probe_token_size|\
         blue_probe_token_uid|blue_probe_token_gid|blue_probe_token_size|\
-        port8000_ipv6_inventory_last_verified_unix|port8000_ipv6_inventory_probe_uid|\
-        port8000_ipv6_inventory_probe_gid|port8000_ipv6_inventory_probe_size|\
         backup_attestation_last_verified_unix|migration_attempt|migration_expected_batch|\
         live_database_system_identifier|\
         recovery_abort_generation)
@@ -934,12 +1061,12 @@ state_key_type()
         operator_mode|operator_compose_mode|rehearsal_compose_mode|\
         runtime_fence_provisioner_mode|runtime_fence_base_config_mode|\
         runtime_fence_environment_mode|runtime_fence_https_ack_mode|\
-        runtime_fence_port8000_ack_mode|runtime_fence_provider_header_source_mode|\
+        runtime_fence_provider_header_source_mode|\
         runtime_fence_provider_header_copy_mode|reverse_fence_environment_mode|\
-        reverse_fence_https_ack_mode|reverse_fence_port8000_ack_mode|\
-        reverse_fence_provider_header_mode|source_env_mode|green_ack_mode|blue_ack_mode|\
+        reverse_fence_https_ack_mode|reverse_fence_provider_header_mode|source_env_mode|\
+        green_ack_mode|blue_ack_mode|\
         green_ack_snapshot_mode|blue_ack_snapshot_mode|green_probe_token_mode|\
-        blue_probe_token_mode|port8000_ipv6_inventory_probe_mode)
+        blue_probe_token_mode)
             printf '%s\n' mode-or-none
             ;;
         reverse_fence_generation)
@@ -951,7 +1078,7 @@ state_key_type()
         rollback_backup_checksum|route_original_checksum)
             printf '%s\n' checksum-or-none
             ;;
-        blue_bridge_ip|expected_public_ipv4)
+        blue_bridge_ip)
             printf '%s\n' host
             ;;
         phase|operation_id|green_restart_policy_status|green_web_b_restart_policy_status|\
@@ -963,8 +1090,8 @@ state_key_type()
         replacement_blue_web_b_container|green_state_volume|green_web_b_private_volume|\
         blue_state_volume|blue_web_b_private_volume|coordination_volume|\
         blue_restore_status|blue_compose_project|blue_compose_service|runtime_fence_operation_id|\
-        reverse_fence_operation_id|recovery_abort_from_phase|port8000_external_blocked_endpoint|\
-        rollback_backup_status|route_target|https_route_target|port8000_route_target|\
+        reverse_fence_operation_id|recovery_abort_from_phase|\
+        rollback_backup_status|route_target|https_route_target|\
         migration_status)
             printf '%s\n' atom
             ;;
@@ -1509,12 +1636,6 @@ write_state()
         printf 'runtime_fence_https_ack_gid=%s\n' "$state_runtime_fence_https_ack_gid"
         printf 'runtime_fence_https_ack_mode=%s\n' "$state_runtime_fence_https_ack_mode"
         printf 'runtime_fence_https_ack_size=%s\n' "$state_runtime_fence_https_ack_size"
-        printf 'runtime_fence_port8000_ack_path=%s\n' "$state_runtime_fence_port8000_ack_path"
-        printf 'runtime_fence_port8000_ack_sha256=%s\n' "$state_runtime_fence_port8000_ack_sha256"
-        printf 'runtime_fence_port8000_ack_uid=%s\n' "$state_runtime_fence_port8000_ack_uid"
-        printf 'runtime_fence_port8000_ack_gid=%s\n' "$state_runtime_fence_port8000_ack_gid"
-        printf 'runtime_fence_port8000_ack_mode=%s\n' "$state_runtime_fence_port8000_ack_mode"
-        printf 'runtime_fence_port8000_ack_size=%s\n' "$state_runtime_fence_port8000_ack_size"
         printf 'runtime_fence_provider_header_source_path=%s\n' \
             "$state_runtime_fence_provider_header_source_path"
         printf 'runtime_fence_provider_header_source_sha256=%s\n' \
@@ -1554,12 +1675,6 @@ write_state()
         printf 'reverse_fence_https_ack_gid=%s\n' "$state_reverse_fence_https_ack_gid"
         printf 'reverse_fence_https_ack_mode=%s\n' "$state_reverse_fence_https_ack_mode"
         printf 'reverse_fence_https_ack_size=%s\n' "$state_reverse_fence_https_ack_size"
-        printf 'reverse_fence_port8000_ack_path=%s\n' "$state_reverse_fence_port8000_ack_path"
-        printf 'reverse_fence_port8000_ack_sha256=%s\n' "$state_reverse_fence_port8000_ack_sha256"
-        printf 'reverse_fence_port8000_ack_uid=%s\n' "$state_reverse_fence_port8000_ack_uid"
-        printf 'reverse_fence_port8000_ack_gid=%s\n' "$state_reverse_fence_port8000_ack_gid"
-        printf 'reverse_fence_port8000_ack_mode=%s\n' "$state_reverse_fence_port8000_ack_mode"
-        printf 'reverse_fence_port8000_ack_size=%s\n' "$state_reverse_fence_port8000_ack_size"
         printf 'reverse_fence_provider_header_path=%s\n' "$state_reverse_fence_provider_header_path"
         printf 'reverse_fence_provider_header_sha256=%s\n' "$state_reverse_fence_provider_header_sha256"
         printf 'reverse_fence_provider_header_uid=%s\n' "$state_reverse_fence_provider_header_uid"
@@ -1632,32 +1747,14 @@ write_state()
         printf 'blue_probe_token_gid=%s\n' "$state_blue_probe_token_gid"
         printf 'blue_probe_token_mode=%s\n' "$state_blue_probe_token_mode"
         printf 'blue_probe_token_size=%s\n' "$state_blue_probe_token_size"
-        printf 'https_controller_sha256=%s\n' "$state_https_controller_sha256"
-        printf 'port8000_controller_sha256=%s\n' "$state_port8000_controller_sha256"
-        printf 'port8000_external_policy_probe_path=%s\n' "$state_port8000_external_policy_probe_path"
-        printf 'port8000_external_policy_probe_sha256=%s\n' "$state_port8000_external_policy_probe_sha256"
-        printf 'port8000_external_blocked_endpoint=%s\n' "$state_port8000_external_blocked_endpoint"
-        printf 'port8000_ipv6_inventory_path=%s\n' "$state_port8000_ipv6_inventory_path"
-        printf 'port8000_ipv6_inventory_last_sha256=%s\n' "$state_port8000_ipv6_inventory_last_sha256"
-        printf 'port8000_ipv6_inventory_last_verified_unix=%s\n' "$state_port8000_ipv6_inventory_last_verified_unix"
-        printf 'port8000_ipv6_inventory_probe_path=%s\n' "$state_port8000_ipv6_inventory_probe_path"
-        printf 'port8000_ipv6_inventory_probe_sha256=%s\n' "$state_port8000_ipv6_inventory_probe_sha256"
-        printf 'port8000_ipv6_inventory_probe_uid=%s\n' "$state_port8000_ipv6_inventory_probe_uid"
-        printf 'port8000_ipv6_inventory_probe_gid=%s\n' "$state_port8000_ipv6_inventory_probe_gid"
-        printf 'port8000_ipv6_inventory_probe_mode=%s\n' "$state_port8000_ipv6_inventory_probe_mode"
-        printf 'port8000_ipv6_inventory_probe_size=%s\n' "$state_port8000_ipv6_inventory_probe_size"
-        printf 'expected_public_ipv4=%s\n' "$state_expected_public_ipv4"
+        printf 'ingress_controller_sha256=%s\n' "$state_ingress_controller_sha256"
         printf 'backup_attestation_configuration_sha256=%s\n' \
             "$state_backup_attestation_configuration_sha256"
         printf 'backup_attestation_sha256=%s\n' "$state_backup_attestation_sha256"
         printf 'backup_attestation_last_verified_unix=%s\n' \
             "$state_backup_attestation_last_verified_unix"
-        printf 'rollback_backup_status=%s\n' "$state_rollback_backup_status"
-        printf 'rollback_backup_checksum=%s\n' "$state_rollback_backup_checksum"
-        printf 'route_original_checksum=%s\n' "$state_route_original_checksum"
         printf 'route_target=%s\n' "$state_route_target"
         printf 'https_route_target=%s\n' "$state_https_route_target"
-        printf 'port8000_route_target=%s\n' "$state_port8000_route_target"
         printf 'drain_queue_sha256=%s\n' "$state_drain_queue_sha256"
         printf 'migration_status=%s\n' "$state_migration_status"
         printf 'migration_attempt=%s\n' "$state_migration_attempt"
@@ -1692,7 +1789,6 @@ set_reverse_runtime_fence_generation_paths()
     reverse_generation_token=$(printf 'rev%02d' "$reverse_generation")
     reverse_runtime_fence_environment_file="$operation_directory/runtime-fence-${reverse_generation_token}.env"
     reverse_runtime_fence_https_ack_file="$operation_directory/runtime-fence-${reverse_generation_token}-https-ack"
-    reverse_runtime_fence_port8000_ack_file="$operation_directory/runtime-fence-${reverse_generation_token}-port8000-ack"
     reverse_pool_plan_file="$operation_directory/${reverse_generation_token}-pool-plan.manifest"
     reverse_ingress_pool_file="$operation_directory/${reverse_generation_token}-ingress-pool.manifest"
     reverse_route_health_root_file="$operation_directory/${reverse_generation_token}-route-health-token.root"
@@ -2039,12 +2135,6 @@ load_state()
     state_runtime_fence_https_ack_gid=$(state_value runtime_fence_https_ack_gid)
     state_runtime_fence_https_ack_mode=$(state_value runtime_fence_https_ack_mode)
     state_runtime_fence_https_ack_size=$(state_value runtime_fence_https_ack_size)
-    state_runtime_fence_port8000_ack_path=$(state_value runtime_fence_port8000_ack_path)
-    state_runtime_fence_port8000_ack_sha256=$(state_value runtime_fence_port8000_ack_sha256)
-    state_runtime_fence_port8000_ack_uid=$(state_value runtime_fence_port8000_ack_uid)
-    state_runtime_fence_port8000_ack_gid=$(state_value runtime_fence_port8000_ack_gid)
-    state_runtime_fence_port8000_ack_mode=$(state_value runtime_fence_port8000_ack_mode)
-    state_runtime_fence_port8000_ack_size=$(state_value runtime_fence_port8000_ack_size)
     state_runtime_fence_provider_header_source_path=$(state_value \
         runtime_fence_provider_header_source_path)
     state_runtime_fence_provider_header_source_sha256=$(state_value \
@@ -2084,12 +2174,6 @@ load_state()
     state_reverse_fence_https_ack_gid=$(state_value reverse_fence_https_ack_gid)
     state_reverse_fence_https_ack_mode=$(state_value reverse_fence_https_ack_mode)
     state_reverse_fence_https_ack_size=$(state_value reverse_fence_https_ack_size)
-    state_reverse_fence_port8000_ack_path=$(state_value reverse_fence_port8000_ack_path)
-    state_reverse_fence_port8000_ack_sha256=$(state_value reverse_fence_port8000_ack_sha256)
-    state_reverse_fence_port8000_ack_uid=$(state_value reverse_fence_port8000_ack_uid)
-    state_reverse_fence_port8000_ack_gid=$(state_value reverse_fence_port8000_ack_gid)
-    state_reverse_fence_port8000_ack_mode=$(state_value reverse_fence_port8000_ack_mode)
-    state_reverse_fence_port8000_ack_size=$(state_value reverse_fence_port8000_ack_size)
     state_reverse_fence_provider_header_path=$(state_value reverse_fence_provider_header_path)
     state_reverse_fence_provider_header_sha256=$(state_value reverse_fence_provider_header_sha256)
     state_reverse_fence_provider_header_uid=$(state_value reverse_fence_provider_header_uid)
@@ -2160,12 +2244,6 @@ load_state()
                 && [ "$state_reverse_fence_https_ack_gid" = none ] \
                 && [ "$state_reverse_fence_https_ack_mode" = none ] \
                 && [ "$state_reverse_fence_https_ack_size" = none ] \
-                && [ "$state_reverse_fence_port8000_ack_path" = none ] \
-                && [ "$state_reverse_fence_port8000_ack_sha256" = none ] \
-                && [ "$state_reverse_fence_port8000_ack_uid" = none ] \
-                && [ "$state_reverse_fence_port8000_ack_gid" = none ] \
-                && [ "$state_reverse_fence_port8000_ack_mode" = none ] \
-                && [ "$state_reverse_fence_port8000_ack_size" = none ] \
                 && [ "$state_reverse_fence_provider_header_path" = none ] \
                 && [ "$state_reverse_fence_provider_header_sha256" = none ] \
                 && [ "$state_reverse_fence_provider_header_uid" = none ] \
@@ -2183,7 +2261,6 @@ load_state()
                 && [ "$state_reverse_fence_provisioner_sha256" = "$runtime_fence_provisioner_sha256" ] \
                 && [ "$state_reverse_fence_environment_path" = "$reverse_runtime_fence_environment_file" ] \
                 && [ "$state_reverse_fence_https_ack_path" = "$reverse_runtime_fence_https_ack_file" ] \
-                && [ "$state_reverse_fence_port8000_ack_path" = "$reverse_runtime_fence_port8000_ack_file" ] \
                 || fail 'reverse runtime-fence operation identity changed during this operation'
             if [ "$state_runtime_fence_provider_header_copy_path" != none ]; then
                 [ "$state_reverse_fence_provider_header_path" = \
@@ -2216,11 +2293,6 @@ load_state()
                         && [ "$state_reverse_fence_https_ack_gid" = none ] \
                         && [ "$state_reverse_fence_https_ack_mode" = none ] \
                         && [ "$state_reverse_fence_https_ack_size" = none ] \
-                        && [ "$state_reverse_fence_port8000_ack_sha256" = none ] \
-                        && [ "$state_reverse_fence_port8000_ack_uid" = none ] \
-                        && [ "$state_reverse_fence_port8000_ack_gid" = none ] \
-                        && [ "$state_reverse_fence_port8000_ack_mode" = none ] \
-                        && [ "$state_reverse_fence_port8000_ack_size" = none ] \
                         && [ "$state_reverse_fence_environment_uid" = none ] \
                         && [ "$state_reverse_fence_environment_gid" = none ] \
                         && [ "$state_reverse_fence_environment_mode" = none ] \
@@ -2269,25 +2341,7 @@ load_state()
     state_blue_probe_token_gid=$(state_value blue_probe_token_gid)
     state_blue_probe_token_mode=$(state_value blue_probe_token_mode)
     state_blue_probe_token_size=$(state_value blue_probe_token_size)
-    state_https_controller_sha256=$(state_value https_controller_sha256)
-    state_port8000_controller_sha256=$(state_value port8000_controller_sha256)
-    state_port8000_external_policy_probe_path=$(state_value port8000_external_policy_probe_path)
-    state_port8000_external_policy_probe_sha256=$(state_value port8000_external_policy_probe_sha256)
-    state_port8000_external_blocked_endpoint=$(state_value port8000_external_blocked_endpoint)
-    state_port8000_ipv6_inventory_path=$(state_value port8000_ipv6_inventory_path)
-    state_port8000_ipv6_inventory_last_sha256=$(state_value port8000_ipv6_inventory_last_sha256)
-    state_port8000_ipv6_inventory_last_verified_unix=$(state_value port8000_ipv6_inventory_last_verified_unix)
-    state_port8000_ipv6_inventory_probe_path=$(state_value port8000_ipv6_inventory_probe_path)
-    state_port8000_ipv6_inventory_probe_sha256=$(state_value port8000_ipv6_inventory_probe_sha256)
-    state_port8000_ipv6_inventory_probe_uid=$(state_value port8000_ipv6_inventory_probe_uid)
-    state_port8000_ipv6_inventory_probe_gid=$(state_value port8000_ipv6_inventory_probe_gid)
-    state_port8000_ipv6_inventory_probe_mode=$(state_value port8000_ipv6_inventory_probe_mode)
-    state_port8000_ipv6_inventory_probe_size=$(state_value port8000_ipv6_inventory_probe_size)
-    if ! printf '%s' "$state_port8000_ipv6_inventory_last_sha256" | grep -Eq '^[0-9a-f]{64}$' \
-        || ! printf '%s' "$state_port8000_ipv6_inventory_last_verified_unix" | grep -Eq '^[1-9][0-9]*$'; then
-        fail ':8000 IPv6 inventory verification state is malformed'
-    fi
-    state_expected_public_ipv4=$(state_value expected_public_ipv4)
+    state_ingress_controller_sha256=$(state_value ingress_controller_sha256)
     state_backup_attestation_configuration_sha256=$(state_value \
         backup_attestation_configuration_sha256)
     state_backup_attestation_sha256=$(state_value backup_attestation_sha256)
@@ -2297,20 +2351,8 @@ load_state()
         || ! printf '%s' "$state_backup_attestation_last_verified_unix" | grep -Eq '^[1-9][0-9]*$'; then
         fail 'backup/restore attestation verification state is malformed'
     fi
-    [ "$state_port8000_external_policy_probe_path" = "$port8000_external_policy_probe" ] \
-        && [ "$state_port8000_external_policy_probe_sha256" = "$port8000_external_policy_probe_sha256" ] \
-        && [ "$state_port8000_external_blocked_endpoint" = "$port8000_external_blocked_endpoint" ] \
-        && [ "$state_port8000_ipv6_inventory_path" = "$port8000_ipv6_inventory_file" ] \
-        && [ "$state_port8000_ipv6_inventory_probe_path" = "$port8000_ipv6_inventory_probe" ] \
-        && [ "$state_port8000_ipv6_inventory_probe_sha256" = "$port8000_ipv6_inventory_probe_sha256" ] \
-        && [ "$state_expected_public_ipv4" = "$expected_public_ipv4" ] \
-        || fail ':8000 external policy identity changed during this operation'
-    state_rollback_backup_status=$(state_value rollback_backup_status)
-    state_rollback_backup_checksum=$(state_value rollback_backup_checksum)
-    state_route_original_checksum=$(state_value route_original_checksum)
     state_route_target=$(state_value route_target)
     state_https_route_target=$(state_value https_route_target)
-    state_port8000_route_target=$(state_value port8000_route_target)
     state_drain_queue_sha256=$(state_value drain_queue_sha256)
     state_migration_status=$(state_value migration_status)
     state_migration_attempt=$(state_value migration_attempt)
@@ -2333,33 +2375,73 @@ load_state()
     state_migration_statement_timeout=$(state_value migration_statement_timeout)
 }
 
-source_compose()
+source_compose_without_proxy_enrollment_override()
 {
     if [ "$(path_presence "$source_compose_custom")" = present ]; then
         if [ "$(path_presence "$source_compose_postgres")" = present ]; then
-            docker compose --ansi never --project-name "$source_compose_project" \
+            APP_PORT="$app_port" docker compose --ansi never --project-name "$source_compose_project" \
                 --env-file "$source_env_file" \
                 --file "$source_compose_base" --file "$source_compose_prod" \
                 --file "$source_compose_custom" --file "$source_compose_postgres" "$@"
         else
-            docker compose --ansi never --project-name "$source_compose_project" \
+            APP_PORT="$app_port" docker compose --ansi never --project-name "$source_compose_project" \
                 --env-file "$source_env_file" \
                 --file "$source_compose_base" --file "$source_compose_prod" \
                 --file "$source_compose_custom" "$@"
         fi
     elif [ "$(path_presence "$source_compose_postgres")" = present ]; then
-        docker compose --ansi never --project-name "$source_compose_project" \
+        APP_PORT="$app_port" docker compose --ansi never --project-name "$source_compose_project" \
             --env-file "$source_env_file" \
             --file "$source_compose_base" --file "$source_compose_prod" \
             --file "$source_compose_postgres" "$@"
     else
-        docker compose --ansi never --project-name "$source_compose_project" \
+        APP_PORT="$app_port" docker compose --ansi never --project-name "$source_compose_project" \
             --env-file "$source_env_file" \
             --file "$source_compose_base" --file "$source_compose_prod" "$@"
     fi
 }
 
-ordered_source_compose_paths()
+source_compose_with_proxy_enrollment_override()
+{
+    [ "$(path_presence "$proxy_enrollment_compose_override")" = present ] \
+        || fail 'managed proxy-enrollment compose override is absent while enrolled'
+
+    if [ "$(path_presence "$source_compose_custom")" = present ]; then
+        if [ "$(path_presence "$source_compose_postgres")" = present ]; then
+            APP_PORT="$app_port" docker compose --ansi never --project-name "$source_compose_project" \
+                --env-file "$source_env_file" \
+                --file "$source_compose_base" --file "$source_compose_prod" \
+                --file "$source_compose_custom" --file "$source_compose_postgres" \
+                --file "$proxy_enrollment_compose_override" "$@"
+        else
+            APP_PORT="$app_port" docker compose --ansi never --project-name "$source_compose_project" \
+                --env-file "$source_env_file" \
+                --file "$source_compose_base" --file "$source_compose_prod" \
+                --file "$source_compose_custom" --file "$proxy_enrollment_compose_override" "$@"
+        fi
+    elif [ "$(path_presence "$source_compose_postgres")" = present ]; then
+        APP_PORT="$app_port" docker compose --ansi never --project-name "$source_compose_project" \
+            --env-file "$source_env_file" \
+            --file "$source_compose_base" --file "$source_compose_prod" \
+            --file "$source_compose_postgres" --file "$proxy_enrollment_compose_override" "$@"
+    else
+        APP_PORT="$app_port" docker compose --ansi never --project-name "$source_compose_project" \
+            --env-file "$source_env_file" \
+            --file "$source_compose_base" --file "$source_compose_prod" \
+            --file "$proxy_enrollment_compose_override" "$@"
+    fi
+}
+
+source_compose()
+{
+    case "$proxy_enrollment_override_active" in
+        0) source_compose_without_proxy_enrollment_override "$@" ;;
+        1) source_compose_with_proxy_enrollment_override "$@" ;;
+        *) fail 'managed proxy-enrollment compose override mode is invalid' ;;
+    esac
+}
+
+ordered_source_compose_paths_without_proxy_enrollment_override()
 {
     printf '%s,%s' "$source_compose_base" "$source_compose_prod"
     if [ "$(path_presence "$source_compose_custom")" = present ]; then
@@ -2367,6 +2449,17 @@ ordered_source_compose_paths()
     fi
     if [ "$(path_presence "$source_compose_postgres")" = present ]; then
         printf ',%s' "$source_compose_postgres"
+    fi
+    printf '\n'
+}
+
+ordered_source_compose_paths()
+{
+    ordered_source_compose_paths_without_proxy_enrollment_override | tr -d '\n'
+    if [ "$proxy_enrollment_override_active" = 1 ]; then
+        [ "$(path_presence "$proxy_enrollment_compose_override")" = present ] \
+            || fail 'managed proxy-enrollment compose override is absent while enrolled'
+        printf ',%s' "$proxy_enrollment_compose_override"
     fi
     printf '\n'
 }
@@ -2568,7 +2661,7 @@ render_runtime_fence_base_configuration()
         printf 'CONTROL_PLANE_RUNTIME_PROVIDER_LEGACY_PORT=%s\n' "$runtime_fence_provider_legacy_port"
         printf 'CONTROL_PLANE_RUNTIME_PROVIDER_HEADER_FILE=%s\n' "$base_provider_header_path"
         printf 'CONTROL_PLANE_RUNTIME_TERMINAL_HTTPS_URL=%s\n' "$public_probe_url"
-        printf 'CONTROL_PLANE_RUNTIME_TERMINAL_PORT8000_URL=%s\n' "$port8000_host_local_url"
+        printf 'CONTROL_PLANE_RUNTIME_TERMINAL_LOCAL_INGRESS_URL=%s\n' "$local_ingress_url"
     } > "$base_configuration_destination"
 }
 
@@ -3005,20 +3098,12 @@ prepare_runtime_fence_artifacts()
 
     install_atomic_operation_copy "$green_ack_snapshot_file" "$runtime_fence_https_ack_file" \
         600 'forward runtime-fence HTTPS acknowledgement'
-    install_atomic_operation_copy "$green_ack_snapshot_file" "$runtime_fence_port8000_ack_file" \
-        600 'forward runtime-fence :8000 acknowledgement'
     state_runtime_fence_https_ack_path=$runtime_fence_https_ack_file
     state_runtime_fence_https_ack_sha256=$(sha256_file "$runtime_fence_https_ack_file")
     state_runtime_fence_https_ack_uid=$(file_uid "$runtime_fence_https_ack_file")
     state_runtime_fence_https_ack_gid=$(file_gid "$runtime_fence_https_ack_file")
     state_runtime_fence_https_ack_mode=$(file_mode "$runtime_fence_https_ack_file")
     state_runtime_fence_https_ack_size=$(file_size "$runtime_fence_https_ack_file")
-    state_runtime_fence_port8000_ack_path=$runtime_fence_port8000_ack_file
-    state_runtime_fence_port8000_ack_sha256=$(sha256_file "$runtime_fence_port8000_ack_file")
-    state_runtime_fence_port8000_ack_uid=$(file_uid "$runtime_fence_port8000_ack_file")
-    state_runtime_fence_port8000_ack_gid=$(file_gid "$runtime_fence_port8000_ack_file")
-    state_runtime_fence_port8000_ack_mode=$(file_mode "$runtime_fence_port8000_ack_file")
-    state_runtime_fence_port8000_ack_size=$(file_size "$runtime_fence_port8000_ack_file")
 
     if [ -n "$runtime_fence_provider_header_file" ]; then
         assert_non_symlink_regular_file "$runtime_fence_provider_header_file" \
@@ -3143,13 +3228,7 @@ assert_runtime_fence_artifacts()
         "$state_runtime_fence_https_ack_uid" "$state_runtime_fence_https_ack_gid" \
         "$state_runtime_fence_https_ack_mode" "$state_runtime_fence_https_ack_size" \
         'forward runtime-fence HTTPS acknowledgement'
-    assert_file_identity "$runtime_fence_port8000_ack_file" \
-        "$state_runtime_fence_port8000_ack_path" "$state_runtime_fence_port8000_ack_sha256" \
-        "$state_runtime_fence_port8000_ack_uid" "$state_runtime_fence_port8000_ack_gid" \
-        "$state_runtime_fence_port8000_ack_mode" "$state_runtime_fence_port8000_ack_size" \
-        'forward runtime-fence :8000 acknowledgement'
     [ "$state_runtime_fence_https_ack_sha256" = "$state_green_ack_sha256" ] \
-        && [ "$state_runtime_fence_port8000_ack_sha256" = "$state_green_ack_sha256" ] \
         || fail 'forward runtime-fence acknowledgements differ from pinned green bytes'
     if [ "$state_runtime_fence_provider_header_source_path" != none ]; then
         [ "$runtime_fence_provider_header_file" = \
@@ -3204,9 +3283,6 @@ assert_runtime_fence_artifacts()
         && [ "$state_runtime_fence_https_ack_uid" = "$operator_uid" ] \
         && [ "$state_runtime_fence_https_ack_gid" = "$operator_gid" ] \
         && [ "$state_runtime_fence_https_ack_mode" = 600 ] \
-        && [ "$state_runtime_fence_port8000_ack_uid" = "$operator_uid" ] \
-        && [ "$state_runtime_fence_port8000_ack_gid" = "$operator_gid" ] \
-        && [ "$state_runtime_fence_port8000_ack_mode" = 600 ] \
         || fail 'forward runtime-fence artifact ownership or mode changed'
 }
 
@@ -3307,12 +3383,6 @@ allocate_reverse_runtime_fence_generation()
     state_reverse_fence_https_ack_gid=none
     state_reverse_fence_https_ack_mode=none
     state_reverse_fence_https_ack_size=none
-    state_reverse_fence_port8000_ack_path=$reverse_runtime_fence_port8000_ack_file
-    state_reverse_fence_port8000_ack_sha256=none
-    state_reverse_fence_port8000_ack_uid=none
-    state_reverse_fence_port8000_ack_gid=none
-    state_reverse_fence_port8000_ack_mode=none
-    state_reverse_fence_port8000_ack_size=none
     if [ "$state_runtime_fence_provider_header_copy_path" != none ]; then
         state_reverse_fence_provider_header_path=$state_runtime_fence_provider_header_copy_path
         state_reverse_fence_provider_header_sha256=$state_runtime_fence_provider_header_copy_sha256
@@ -3540,10 +3610,8 @@ prepare_reverse_runtime_fence_artifacts()
     set_reverse_runtime_fence_generation_paths "$state_reverse_fence_generation"
     prepare_reverse_pool_plan
     reverse_https_candidate="${reverse_runtime_fence_https_ack_file}.new.$$"
-    reverse_port8000_candidate="${reverse_runtime_fence_port8000_ack_file}.new.$$"
     reverse_environment_candidate="${reverse_runtime_fence_environment_file}.new.$$"
     [ ! -e "$reverse_https_candidate" ] && [ ! -L "$reverse_https_candidate" ] \
-        && [ ! -e "$reverse_port8000_candidate" ] && [ ! -L "$reverse_port8000_candidate" ] \
         && [ ! -e "$reverse_environment_candidate" ] && [ ! -L "$reverse_environment_candidate" ] \
         || fail 'reverse runtime-fence artifact candidate already exists'
     assert_file_identity "$blue_ack_snapshot_file" "$state_blue_ack_snapshot_path" \
@@ -3551,15 +3619,11 @@ prepare_reverse_runtime_fence_artifacts()
         "$state_blue_ack_snapshot_gid" "$state_blue_ack_snapshot_mode" \
         "$state_blue_ack_snapshot_size" 'blue acknowledgement snapshot'
     (umask 077; cp -- "$blue_ack_snapshot_file" "$reverse_https_candidate")
-    (umask 077; cp -- "$blue_ack_snapshot_file" "$reverse_port8000_candidate")
-    chmod 600 "$reverse_https_candidate" "$reverse_port8000_candidate"
+    chmod 600 "$reverse_https_candidate"
     [ "$(sha256_file "$reverse_https_candidate")" = "$state_blue_ack_sha256" ] \
-        && [ "$(sha256_file "$reverse_port8000_candidate")" = "$state_blue_ack_sha256" ] \
         || fail 'reverse runtime-fence acknowledgement bytes changed before persistence'
     install_immutable_reverse_runtime_fence_artifact "$reverse_https_candidate" \
         "$reverse_runtime_fence_https_ack_file" 'reverse runtime-fence HTTPS acknowledgement'
-    install_immutable_reverse_runtime_fence_artifact "$reverse_port8000_candidate" \
-        "$reverse_runtime_fence_port8000_ack_file" 'reverse runtime-fence :8000 acknowledgement'
 
     {
         cat "$runtime_fence_base_config_file"
@@ -3587,11 +3651,6 @@ prepare_reverse_runtime_fence_artifacts()
     state_reverse_fence_https_ack_gid=$(file_gid "$reverse_runtime_fence_https_ack_file")
     state_reverse_fence_https_ack_mode=$(file_mode "$reverse_runtime_fence_https_ack_file")
     state_reverse_fence_https_ack_size=$(file_size "$reverse_runtime_fence_https_ack_file")
-    state_reverse_fence_port8000_ack_sha256=$(sha256_file "$reverse_runtime_fence_port8000_ack_file")
-    state_reverse_fence_port8000_ack_uid=$(file_uid "$reverse_runtime_fence_port8000_ack_file")
-    state_reverse_fence_port8000_ack_gid=$(file_gid "$reverse_runtime_fence_port8000_ack_file")
-    state_reverse_fence_port8000_ack_mode=$(file_mode "$reverse_runtime_fence_port8000_ack_file")
-    state_reverse_fence_port8000_ack_size=$(file_size "$reverse_runtime_fence_port8000_ack_file")
     assert_reverse_runtime_fence_artifacts
 }
 
@@ -3631,14 +3690,7 @@ assert_reverse_runtime_fence_artifacts()
         "$state_reverse_fence_https_ack_uid" "$state_reverse_fence_https_ack_gid" \
         "$state_reverse_fence_https_ack_mode" "$state_reverse_fence_https_ack_size" \
         'reverse runtime-fence HTTPS acknowledgement'
-    assert_file_identity "$reverse_runtime_fence_port8000_ack_file" \
-        "$state_reverse_fence_port8000_ack_path" "$state_reverse_fence_port8000_ack_sha256" \
-        "$state_reverse_fence_port8000_ack_uid" "$state_reverse_fence_port8000_ack_gid" \
-        "$state_reverse_fence_port8000_ack_mode" "$state_reverse_fence_port8000_ack_size" \
-        'reverse runtime-fence :8000 acknowledgement'
     [ "$state_reverse_fence_https_ack_sha256" = "$state_blue_ack_snapshot_sha256" ] \
-        && [ "$state_reverse_fence_port8000_ack_sha256" = \
-            "$state_blue_ack_snapshot_sha256" ] \
         || fail 'reverse runtime-fence acknowledgements differ from the immutable blue snapshot'
     [ "$state_reverse_fence_environment_uid" = "$operator_uid" ] \
         && [ "$state_reverse_fence_environment_gid" = "$operator_gid" ] \
@@ -3646,9 +3698,6 @@ assert_reverse_runtime_fence_artifacts()
         && [ "$state_reverse_fence_https_ack_uid" = "$operator_uid" ] \
         && [ "$state_reverse_fence_https_ack_gid" = "$operator_gid" ] \
         && [ "$state_reverse_fence_https_ack_mode" = 600 ] \
-        && [ "$state_reverse_fence_port8000_ack_uid" = "$operator_uid" ] \
-        && [ "$state_reverse_fence_port8000_ack_gid" = "$operator_gid" ] \
-        && [ "$state_reverse_fence_port8000_ack_mode" = 600 ] \
         || fail 'reverse runtime-fence artifact ownership or mode changed'
     if [ "$state_runtime_fence_provider_header_copy_path" != none ]; then
         [ "$state_reverse_fence_provider_header_path" = \
@@ -3745,6 +3794,11 @@ converge_fence_abort_intent()
         aborted|finalized) ;;
         *) fail 'runtime-fence provisioner did not reach an exact abort terminal state' ;;
     esac
+    if [ "$abort_direction" = forward ]; then
+        preserve_proxy_enrollment_after_state_creation \
+            || fail 'forward runtime-fence abort could not retain native Traefik enrollment after restoring the legacy dynamic route'
+        test_crash after-forward-proxy-enrollment-preserve
+    fi
     state_phase=$abort_terminal_phase
     write_state "$state_phase"
 }
@@ -3935,7 +3989,6 @@ reset_uncommitted_operation_directory()
         "$runtime_fence_base_config_file" "$runtime_fence_base_config_file.new" \
         "$runtime_fence_environment_file" "$runtime_fence_environment_file.new" \
         "$runtime_fence_https_ack_file" "$runtime_fence_https_ack_file.new" \
-        "$runtime_fence_port8000_ack_file" "$runtime_fence_port8000_ack_file.new" \
         "$runtime_fence_provider_header_copy" "$runtime_fence_provider_header_copy.new"
     do
         if [ -e "$generated_path" ] || [ -L "$generated_path" ]; then
@@ -4096,29 +4149,13 @@ assert_source_identity()
         && [ "$(file_mode "$blue_direct_probe_token_file")" = "$state_blue_probe_token_mode" ] \
         && [ "$(file_size "$blue_direct_probe_token_file")" = "$state_blue_probe_token_size" ] \
         || fail 'blue direct-probe token identity or metadata changed during this operation'
-    [ "$(sha256_file "$port8000_external_policy_probe")" = "$state_port8000_external_policy_probe_sha256" ] \
-        || fail ':8000 external policy probe identity changed during this operation'
-    assert_non_symlink_regular_file "$port8000_ipv6_inventory_file" \
-        CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE
-    [ "$(sha256_file "$port8000_ipv6_inventory_file")" = "$port8000_ipv6_inventory_sha256" ] \
-        && [ "$(file_mode "$port8000_ipv6_inventory_file")" = 600 ] \
-        || fail ':8000 IPv6 inventory identity or metadata changed during this operation'
-    assert_non_symlink_regular_file "$port8000_ipv6_inventory_probe" \
-        CONTROL_PLANE_PORT8000_IPV6_INVENTORY_PROBE
-    [ "$(sha256_file "$port8000_ipv6_inventory_probe")" = "$state_port8000_ipv6_inventory_probe_sha256" ] \
-        && [ "$(file_uid "$port8000_ipv6_inventory_probe")" = "$state_port8000_ipv6_inventory_probe_uid" ] \
-        && [ "$(file_gid "$port8000_ipv6_inventory_probe")" = "$state_port8000_ipv6_inventory_probe_gid" ] \
-        && [ "$(file_mode "$port8000_ipv6_inventory_probe")" = "$state_port8000_ipv6_inventory_probe_mode" ] \
-        && [ "$(file_size "$port8000_ipv6_inventory_probe")" = "$state_port8000_ipv6_inventory_probe_size" ] \
-        || fail ':8000 IPv6 inventory probe identity or metadata changed during this operation'
-    [ "$(sha256_file "$https_controller")" = "$state_https_controller_sha256" ] \
-        || fail 'HTTPS ingress controller identity changed during this operation'
-    [ "$(sha256_file "$port8000_controller")" = "$state_port8000_controller_sha256" ] \
-        || fail ':8000 ingress controller identity changed during this operation'
+    [ "$(sha256_file "$ingress_controller")" = "$state_ingress_controller_sha256" ] \
+        || fail 'Traefik ingress controller identity changed during this operation'
 }
 
 assert_common_state_identity()
 {
+    assert_proxy_enrollment_active
     assert_source_identity
     [ "$(container_id "$proxy_container")" = "$state_proxy_id" ] \
         || fail 'proxy container identity changed during this operation'
@@ -5158,10 +5195,11 @@ assert_backup_attestation()
     if ! is_test_mode; then
         [ "$backup_attestation_verifier" = "$SCRIPT_DIRECTORY/backup/restore-attest.sh" ] \
             || fail 'production mode only accepts the bundled backup/restore attestation verifier'
+        backup_attestation_verifier_expected_mode=$(release_asset_expected_mode backup-attestation-verifier)
         [ "$(file_uid "$backup_attestation_verifier")" = 0 ] \
             && [ "$(file_gid "$backup_attestation_verifier")" = 0 ] \
-            && [ "$(file_mode "$backup_attestation_verifier")" = 755 ] \
-            || fail 'production backup/restore attestation verifier must be root:root mode 0755'
+            && [ "$(file_mode "$backup_attestation_verifier")" = "$backup_attestation_verifier_expected_mode" ] \
+            || fail "production backup/restore attestation verifier must be root:root mode 0$backup_attestation_verifier_expected_mode"
     fi
     require_migration_timeouts
     backup_configuration_sha256=$(backup_attestation_configuration_sha256)
@@ -5321,6 +5359,10 @@ compose()
     CONTROL_PLANE_BLUE_IMAGE="$blue_image" \
     CONTROL_PLANE_NETWORK="$control_plane_network" \
     CONTROL_PLANE_BACKEND_PORT="$backend_port" \
+    CONTROL_PLANE_HOST="$control_plane_host" \
+    CONTROL_PLANE_LOCAL_INGRESS_ENTRYPOINT="$local_ingress_entrypoint" \
+    CONTROL_PLANE_GREEN_ROUTE_HEALTH_TOKEN="$green_route_health_token" \
+    CONTROL_PLANE_BLUE_ROUTE_HEALTH_TOKEN="$blue_route_health_token" \
     CONTROL_PLANE_DIRECT_PROBE_PATH="$direct_probe_path" \
     CONTROL_PLANE_SSH_DIRECTORY="$ssh_directory" \
     CONTROL_PLANE_APPLICATIONS_DIRECTORY="$applications_directory" \
@@ -5835,7 +5877,6 @@ select_routed_candidate_context()
             routed_web_b_container_id=$state_green_web_b_id
             routed_web_b_state_volume=$green_web_b_private_volume
             routed_web_b_epoch=$green_web_b_epoch
-            routed_loopback_port=$green_loopback_port
             routed_ack_file=$green_applied_ack_file
             routed_mutation_freeze_epoch=$mutation_freeze_epoch
             ;;
@@ -5850,7 +5891,6 @@ select_routed_candidate_context()
             routed_web_b_container_id=$state_replacement_blue_web_b_id
             routed_web_b_state_volume=$blue_web_b_private_volume
             routed_web_b_epoch=$blue_web_b_epoch
-            routed_loopback_port=$blue_loopback_port
             routed_ack_file=$blue_applied_ack_file
             routed_mutation_freeze_epoch=$reverse_mutation_freeze_epoch
             ;;
@@ -5867,9 +5907,8 @@ select_routed_candidate_context()
 routed_phase_requires_post_revoke()
 {
     case "$routed_color:$state_phase" in
-        green:blue-revoked|green:green-port8000-permanent-reconciling|\
-        green:green-port8000-permanent-acknowledged|\
-        green:proxy-mutation-freeze-activating|green:proxy-mutation-freeze-active|\
+        green:blue-revoked|green:proxy-mutation-freeze-activating|\
+        green:proxy-mutation-freeze-active|\
         green:fence-release-intent|\
         blue:failback-green-revoked|blue:reverse-proxy-mutation-freeze-activating|\
         blue:reverse-proxy-mutation-freeze-active|blue:reverse-fence-release-intent)
@@ -5962,7 +6001,7 @@ routed_phase_allows_released_fence()
         green:failback-blue-starting|green:failback-blue-started-unproven|\
         green:failback-blue-started|green:failback-blue-web-activating|\
         green:failback-blue-web-activated|green:failback-blue-https-routing|\
-        green:failback-blue-https-routed|green:failback-blue-port8000-routing|\
+        green:failback-blue-https-routed|\
         green:blue-failback-routed|green:failback-green-scheduler-stopping|\
         green:failback-green-scheduler-stopped|green:failback-green-horizon-pausing|\
         green:failback-green-horizon-paused|\
@@ -6138,12 +6177,8 @@ assert_routed_candidate_contract()
             ;;
     esac
     if [ "$state_https_route_target" = "$routed_color" ]; then
-        ingress_controller_assert https "$routed_color" "$routed_container" \
+        ingress_controller_assert ingress "$routed_color" "$routed_container" \
             "$backend_port" "$routed_ack_file"
-    fi
-    if [ "$state_port8000_route_target" = "$routed_color" ]; then
-        ingress_controller_assert port8000 "$routed_color" 127.0.0.1 \
-            "$routed_loopback_port" "$routed_ack_file"
     fi
 }
 
@@ -6164,9 +6199,8 @@ routed_recovery_provider_expectation()
         return
     fi
     case "$routed_color:$recovery_context_phase" in
-        green:blue-revoked|green:green-port8000-permanent-reconciling|\
-        green:green-port8000-permanent-acknowledged|\
-        green:proxy-mutation-freeze-activating|green:proxy-mutation-freeze-active|\
+        green:blue-revoked|green:proxy-mutation-freeze-activating|\
+        green:proxy-mutation-freeze-active|\
         blue:failback-green-revoked|blue:reverse-proxy-mutation-freeze-activating|\
         blue:reverse-proxy-mutation-freeze-active)
             printf '%s\n' absent
@@ -6296,12 +6330,12 @@ validate_routed_daemon_route_proof()
     expected_ack_sha256=$(sha256_file "$routed_ack_file")
     awk -F= '
         BEGIN {
-            split("version operation_id generation direction color parent_phase provider_expectation candidate_id candidate_image_id writer_status mutation_freeze_status https_ack_sha256 port8000_ack_sha256 proven_at_epoch", keys, /[[:space:]]+/)
+            split("version operation_id generation direction color parent_phase provider_expectation candidate_id candidate_image_id writer_status mutation_freeze_status https_ack_sha256 proven_at_epoch", keys, /[[:space:]]+/)
             for (key_index in keys) allowed[keys[key_index]] = 1
         }
         NF < 2 || $1 == "" || !($1 in allowed) || seen[$1] { invalid = 1; exit }
         { seen[$1] = 1; seen_count++ }
-        END { exit(!invalid && seen_count == 14 ? 0 : 1) }
+        END { exit(!invalid && seen_count == 13 ? 0 : 1) }
     ' "$route_proof_document" \
         || fail 'routed daemon recovery route proof has an unknown, duplicate, or malformed record'
     [ "$(routed_route_proof_value "$route_proof_document" version)" = 1 ] \
@@ -6326,8 +6360,6 @@ validate_routed_daemon_route_proof()
         && [ "$(routed_route_proof_value "$route_proof_document" mutation_freeze_status)" \
             = "$expected_freeze_status" ] \
         && [ "$(routed_route_proof_value "$route_proof_document" https_ack_sha256)" \
-            = "$expected_ack_sha256" ] \
-        && [ "$(routed_route_proof_value "$route_proof_document" port8000_ack_sha256)" \
             = "$expected_ack_sha256" ] \
         || fail 'routed daemon recovery route proof differs from its exact recovery context'
     printf '%s\n' "$(routed_route_proof_value "$route_proof_document" proven_at_epoch)" \
@@ -6421,11 +6453,8 @@ write_routed_daemon_route_proof()
         esac
     fi
     [ "$state_https_route_target" = "$routed_color" ] \
-        && [ "$state_port8000_route_target" = "$routed_color" ] \
-        || fail 'daemon recovery cannot finalize before both persisted ingress targets agree'
-    ingress_controller_assert https "$routed_color" "$routed_container" "$backend_port" \
-        "$routed_ack_file" >&2
-    ingress_controller_assert port8000 "$routed_color" 127.0.0.1 "$routed_loopback_port" \
+        || fail 'daemon recovery cannot finalize before the persisted ingress target agrees'
+    ingress_controller_assert ingress "$routed_color" "$routed_container" "$backend_port" \
         "$routed_ack_file" >&2
     case "$recovery_writer_status" in
         absent)
@@ -6465,9 +6494,8 @@ write_routed_daemon_route_proof()
         test_crash "after-${routed_color}-routed-recovery-route-proof-candidate-header"
         printf 'candidate_id=%s\ncandidate_image_id=%s\nwriter_status=%s\n' \
             "$routed_container_id" "$routed_image_id" "$recovery_writer_status"
-        printf 'mutation_freeze_status=%s\nhttps_ack_sha256=%s\nport8000_ack_sha256=%s\n' \
-            "$recovery_freeze_status" "$(sha256_file "$routed_ack_file")" \
-            "$(sha256_file "$routed_ack_file")"
+        printf 'mutation_freeze_status=%s\nhttps_ack_sha256=%s\n' \
+            "$recovery_freeze_status" "$(sha256_file "$routed_ack_file")"
         printf 'proven_at_epoch=%s\n' "$(date -u +%s)"
     } >> "$recovery_route_candidate"
     test_crash "after-${routed_color}-routed-recovery-route-proof-candidate-write"
@@ -6512,8 +6540,7 @@ write_routed_daemon_route_proof()
 finalize_routed_daemon_recovery_if_ready()
 {
     [ "$state_routed_recovery_status" = runtime-verified ] || return 0
-    [ "$state_https_route_target" = "$routed_color" ] \
-        && [ "$state_port8000_route_target" = "$routed_color" ] || return 0
+    [ "$state_https_route_target" = "$routed_color" ] || return 0
     write_routed_daemon_route_proof
     recovery_route_proof=$(route_proof_file)
     recovery_route_proof_sha256=$(sha256_file "$recovery_route_proof")
@@ -7095,11 +7122,8 @@ direct_origin_probe()
 ingress_controller_path()
 {
     case "$1" in
-        https)
-            printf '%s\n' "$https_controller"
-            ;;
-        port8000)
-            printf '%s\n' "$port8000_controller"
+        ingress)
+            printf '%s\n' "$ingress_controller"
             ;;
         *)
             fail "unknown ingress controller: $1"
@@ -7115,34 +7139,12 @@ ingress_controller_call()
     ingress_backend=${4:-none}
     ingress_backend_port=${5:-0}
     ingress_ack_file=${6:-none}
-    ingress_rollback_owner_id=${7:-none}
     ingress_drain_member=${8:-}
     controller=$(ingress_controller_path "$ingress_name")
-    case "$ingress_name" in
-        https) controller_role=https-controller ;;
-        port8000) controller_role=port8000-controller ;;
-        *) fail "unknown ingress controller role: $ingress_name" ;;
-    esac
-    if [ "$ingress_name" = port8000 ]; then
-        ingress_public_url=$port8000_host_local_url
-        case "$ingress_color" in
-            green)
-                ingress_direct_probe_token_file=$green_direct_probe_token_file
-                ;;
-            blue)
-                ingress_direct_probe_token_file=$blue_direct_probe_token_file
-                ;;
-            legacy)
-                ingress_direct_probe_token_file=none
-                ;;
-            *)
-                fail "unknown :8000 direct-probe color: $ingress_color"
-                ;;
-        esac
-    else
-        ingress_public_url=$public_probe_url
-        ingress_direct_probe_token_file=none
-    fi
+    [ "$ingress_name" = ingress ] || fail "unknown ingress controller role: $ingress_name"
+    controller_role=ingress-controller
+    ingress_public_url=$public_probe_url
+    ingress_direct_probe_token_file=none
 
     case "$ingress_color" in
         green)
@@ -7200,7 +7202,6 @@ ingress_controller_call()
     CONTROL_PLANE_INGRESS_ACK_FILE="$ingress_ack_file" \
     CONTROL_PLANE_INGRESS_DIRECT_PROBE_TOKEN_FILE="$ingress_direct_probe_token_file" \
     CONTROL_PLANE_INGRESS_DIRECT_PROBE_PATH="$direct_probe_path" \
-    CONTROL_PLANE_PORT8000_ROLLBACK_OWNER_ID="$ingress_rollback_owner_id" \
     CONTROL_PLANE_INGRESS_OPERATION_ID="$ingress_operation_id" \
     CONTROL_PLANE_INGRESS_GENERATION="$ingress_generation" \
     CONTROL_PLANE_INGRESS_POOL_MANIFEST="$ingress_pool_manifest" \
@@ -7215,60 +7216,29 @@ ingress_controller_call()
     CONTROL_PLANE_INGRESS_DRAIN_MEMBER="$ingress_drain_member" \
     CONTROL_PLANE_INGRESS_OPERATION_DIR="$ingress_operation_directory" \
     CONTROL_PLANE_INGRESS_PUBLIC_URL="$ingress_public_url" \
+    CONTROL_PLANE_INGRESS_LOCAL_URL="$local_ingress_url" \
+    CONTROL_PLANE_INGRESS_APP_PORT="$app_port" \
     CONTROL_PLANE_INGRESS_PUBLIC_HOST_HEADER="$public_probe_host_header" \
+    CONTROL_PLANE_INGRESS_EXPECTED_IPV4="$expected_ipv4" \
     CONTROL_PLANE_INGRESS_PROBE_ATTEMPTS="$public_probe_attempts" \
     CONTROL_PLANE_INGRESS_PROXY_CONTAINER="$proxy_container" \
     CONTROL_PLANE_INGRESS_DYNAMIC_DIR="$traefik_dynamic_directory" \
     CONTROL_PLANE_INGRESS_DYNAMIC_FILENAME="$dynamic_filename" \
     CONTROL_PLANE_INGRESS_HOST="$control_plane_host" \
     CONTROL_PLANE_INGRESS_TRAEFIK_ENTRYPOINT="$traefik_entrypoint" \
+    CONTROL_PLANE_INGRESS_TRAEFIK_LOCAL_ENTRYPOINT="$local_ingress_entrypoint" \
     CONTROL_PLANE_INGRESS_TRAEFIK_TLS="$traefik_tls" \
     CONTROL_PLANE_INGRESS_TRAEFIK_CERT_RESOLVER="$traefik_cert_resolver" \
     CONTROL_PLANE_INGRESS_TRAEFIK_ROUTER_PRIORITY="$traefik_router_priority" \
     CONTROL_PLANE_INGRESS_TEST_MODE="$test_mode" \
     CONTROL_PLANE_INGRESS_TEST_INVALID_ROUTE="${CONTROL_PLANE_TEST_INVALID_ROUTE:-0}" \
-    CONTROL_PLANE_INGRESS_TARGET="$operator_target" \
-    CONTROL_PLANE_INGRESS_EXPECTED_IPV4="$expected_public_ipv4" \
-    CONTROL_PLANE_INGRESS_BOOTSTRAP_PORT="$port8000_bootstrap_port" \
-    CONTROL_PLANE_PORT8000_HOST_LOCAL_URL="$port8000_host_local_url" \
-    CONTROL_PLANE_PORT8000_CANARY_NETNS="$port8000_canary_netns" \
-    CONTROL_PLANE_PORT8000_CANARY_IPV4="$port8000_canary_ipv4" \
-    CONTROL_PLANE_PORT8000_CANARY_IPV6="$port8000_canary_ipv6" \
-    CONTROL_PLANE_PORT8000_CANARY_TARGET_IPV4="$port8000_canary_target_ipv4" \
-    CONTROL_PLANE_PORT8000_CANARY_TARGET_IPV6="$port8000_canary_target_ipv6" \
-    CONTROL_PLANE_PORT8000_EXTERNAL_POLICY_PROBE="$port8000_external_policy_probe" \
-    CONTROL_PLANE_PORT8000_EXTERNAL_POLICY_PROBE_SHA256="$port8000_external_policy_probe_sha256" \
-    CONTROL_PLANE_PORT8000_EXTERNAL_BLOCKED_ENDPOINT="$port8000_external_blocked_endpoint" \
-    CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE="$port8000_ipv6_inventory_file" \
-    CONTROL_PLANE_PORT8000_IPV6_INVENTORY_SHA256="$port8000_ipv6_inventory_sha256" \
-    CONTROL_PLANE_PORT8000_IPV6_INVENTORY_PROBE="$port8000_ipv6_inventory_probe" \
-    CONTROL_PLANE_PORT8000_IPV6_INVENTORY_PROBE_SHA256="$port8000_ipv6_inventory_probe_sha256" \
     "$controller" "$ingress_action"
 }
 
 assert_ingress_v2_capability_for_target()
 {
-    assert_release_asset_identity https-controller
-    assert_release_asset_identity port8000-controller
-    set -- "$https_controller"
-    case "$operator_target" in
-        production)
-            set -- "$@" "$port8000_controller"
-            ;;
-        lab)
-            # The lab adapter proves v2 artifact binding and single-target route continuity.
-            # HAProxy two-member balancing and drain remain production-controller contracts.
-            if ! { grep -Fq 'CONTROL_PLANE_LAB_PORT8000_V2_SINGLE_TARGET_ADAPTER=1' \
-                    "$port8000_controller" \
-                && grep -Fq 'CONTROL_PLANE_INGRESS_POOL_MANIFEST' \
-                    "$port8000_controller" \
-                && grep -Fq 'CONTROL_PLANE_INGRESS_POOL_PLAN_MANIFEST' \
-                    "$port8000_controller"; }; then
-                fail 'pinned lab :8000 controller lacks the v2 single-target adapter contract'
-            fi
-            ;;
-        *) fail "unknown ingress capability target: $operator_target" ;;
-    esac
+    assert_release_asset_identity ingress-controller
+    set -- "$ingress_controller"
     for capability_controller in "$@"; do
         if ! grep -Fq 'CONTROL_PLANE_INGRESS_POOL_MANIFEST' "$capability_controller" \
             || ! grep -Fq 'CONTROL_PLANE_INGRESS_POOL_PLAN_MANIFEST' "$capability_controller" \
@@ -7281,27 +7251,9 @@ assert_ingress_v2_capability_for_target()
     done
 }
 
-ingress_controller_policy_status()
-{
-    ingress_name=$1
-    ingress_color=$2
-    ingress_backend=$3
-    ingress_backend_port=$4
-    ingress_ack_file=$5
-    [ "$ingress_name" != port8000 ] || {
-        ingress_controller_call port8000 policy-status "$ingress_color" \
-            "$ingress_backend" "$ingress_backend_port" "$ingress_ack_file" || return 1
-        ingress_controller_call port8000 external-blocked-status "$ingress_color" \
-            "$ingress_backend" "$ingress_backend_port" "$ingress_ack_file" || return 1
-        state_port8000_ipv6_inventory_last_sha256=$port8000_ipv6_inventory_sha256
-        state_port8000_ipv6_inventory_last_verified_unix=$(date -u +%s)
-    }
-}
-
 ingress_controller_preflight()
 {
     ingress_controller_call "$1" preflight legacy none 0 none
-    ingress_controller_policy_status "$1" legacy none 0 none
 }
 
 ingress_controller_prepare()
@@ -7334,24 +7286,16 @@ ingress_controller_switch()
         "$ingress_backend" "$ingress_backend_port" "$ingress_ack_file" || return 1
     ingress_controller_call "$ingress_name" ack "$ingress_color" \
         "$ingress_backend" "$ingress_backend_port" "$ingress_ack_file" || return 1
-    ingress_controller_policy_status "$ingress_name" "$ingress_color" \
-        "$ingress_backend" "$ingress_backend_port" "$ingress_ack_file" || return 1
 }
 
 ingress_controller_assert()
 {
     ingress_controller_call "$1" assert "$2" "$3" "$4" "$5" || return 1
     ingress_controller_call "$1" ack "$2" "$3" "$4" "$5" || return 1
-    ingress_controller_policy_status "$1" "$2" "$3" "$4" "$5" || return 1
 }
 
 ingress_controller_verify_ack()
 {
-    if [ "$1" = port8000 ]; then
-        ingress_controller_call "$1" verify-ack "$2" "$3" "$4" "$5" || return 1
-        ingress_controller_policy_status "$1" "$2" "$3" "$4" "$5" || return 1
-        return
-    fi
     ingress_controller_call "$1" verify "$2" "$3" "$4" "$5"
     ingress_controller_call "$1" ack "$2" "$3" "$4" "$5"
 }
@@ -7376,7 +7320,6 @@ ingress_controller_restore()
 {
     ingress_controller_call "$1" restore legacy none 0 none
     ingress_controller_call "$1" ack legacy none 0 none
-    ingress_controller_policy_status "$1" legacy none 0 none
 }
 
 ingress_controller_restore_reverse_generation()
@@ -7387,189 +7330,768 @@ ingress_controller_restore_reverse_generation()
     reverse_restore_ack=$4
     ingress_controller_call "$reverse_restore_name" restore blue \
         "$reverse_restore_backend" "$reverse_restore_port" "$reverse_restore_ack"
-    [ "$reverse_restore_name" != https ] \
-        || ingress_controller_call "$reverse_restore_name" ack blue \
-            "$reverse_restore_backend" "$reverse_restore_port" "$reverse_restore_ack"
+    ingress_controller_call "$reverse_restore_name" ack blue \
+        "$reverse_restore_backend" "$reverse_restore_port" "$reverse_restore_ack"
 }
 
-ingress_controller_legacy_restore_status()
+reconcile_proxy_enrollment_credential_candidates()
 {
-    ingress_controller_call port8000 legacy-restore-status legacy none 0 none
-}
-
-ingress_controller_adopt_rollback_owner()
-{
-    [ "$state_blue_rollback_replacement_id" != none ] || return 0
-    [ "$state_blue_id" = "$state_blue_rollback_replacement_id" ] \
-        || fail 'rollback replacement blue lineage does not match the active incumbent before :8000 adoption'
-    ingress_controller_call port8000 adopt-rollback-owner legacy none 0 none "$state_blue_id"
-}
-
-render_dynamic_route()
-{
-    route_container=$1
-    route_color=$2
-    route_acknowledgement=$green_applied_acknowledgement
-    route_candidate="$traefik_dynamic_directory/.${dynamic_filename}.${operation_id}.new"
-
-    if is_test_mode && [ "${CONTROL_PLANE_TEST_INVALID_ROUTE:-0}" = 1 ]; then
-        printf '%s\n' 'http: [' > "$route_candidate"
-        return
-    fi
-
-    {
-        printf '# control-plane-operation-id: %s\n' "$operation_id"
-        printf 'http:\n'
-        printf '  routers:\n'
-        printf '    control-plane-blue-green:\n'
-        printf "      rule: \"Host(\`%s\`)\"\\n" "$control_plane_host"
-        printf '      entryPoints:\n'
-        printf '        - %s\n' "$traefik_entrypoint"
-        printf '      service: control-plane-%s\n' "$route_color"
-        printf '      priority: %s\n' "$traefik_router_priority"
-        printf '      middlewares:\n'
-        printf '        - control-plane-route-ack\n'
-        if [ "$traefik_tls" = true ]; then
-            printf '      tls:\n'
-            printf '        certResolver: %s\n' "$traefik_cert_resolver"
+    proxy_enrollment_credential_file=$1
+    for proxy_enrollment_credential_random in \
+        "${proxy_enrollment_credential_file}".new.*.random
+    do
+        [ -e "$proxy_enrollment_credential_random" ] \
+            || [ -L "$proxy_enrollment_credential_random" ] \
+            || continue
+        assert_non_symlink_regular_file "$proxy_enrollment_credential_random" \
+            'native Traefik enrollment credential entropy candidate'
+        [ "$(file_uid "$proxy_enrollment_credential_random")" = "$operator_uid" ] \
+            && [ "$(file_gid "$proxy_enrollment_credential_random")" = "$operator_gid" ] \
+            && [ "$(file_mode "$proxy_enrollment_credential_random")" = 600 ] \
+            && [ "$(file_link_count "$proxy_enrollment_credential_random")" = 1 ] \
+            || fail 'native Traefik enrollment credential entropy candidate metadata is unsafe'
+        rm -f "$proxy_enrollment_credential_random"
+    done
+    for proxy_enrollment_credential_candidate in \
+        "${proxy_enrollment_credential_file}".new.*
+    do
+        [ -e "$proxy_enrollment_credential_candidate" ] \
+            || [ -L "$proxy_enrollment_credential_candidate" ] \
+            || continue
+        case "$proxy_enrollment_credential_candidate" in
+            *.random)
+                continue
+                ;;
+        esac
+        assert_non_symlink_regular_file "$proxy_enrollment_credential_candidate" \
+            'native Traefik enrollment credential candidate'
+        [ "$(file_uid "$proxy_enrollment_credential_candidate")" = "$operator_uid" ] \
+            && [ "$(file_gid "$proxy_enrollment_credential_candidate")" = "$operator_gid" ] \
+            && [ "$(file_mode "$proxy_enrollment_credential_candidate")" = 600 ] \
+            || fail 'native Traefik enrollment credential candidate metadata is unsafe'
+        if [ -e "$proxy_enrollment_credential_file" ] \
+            || [ -L "$proxy_enrollment_credential_file" ]; then
+            assert_non_symlink_regular_file "$proxy_enrollment_credential_file" \
+                'native Traefik enrollment credential'
+            if [ "$(file_device_inode "$proxy_enrollment_credential_candidate")" = \
+                "$(file_device_inode "$proxy_enrollment_credential_file")" ]; then
+                [ "$(file_link_count "$proxy_enrollment_credential_candidate")" -ge 2 ] \
+                    || fail 'linked native Traefik enrollment credential candidate has an invalid link count'
+                proxy_enrollment_candidate_token=$(cat "$proxy_enrollment_credential_candidate")
+                validate_safe_token "$proxy_enrollment_candidate_token" \
+                    'linked native Traefik enrollment credential candidate'
+                rm -f "$proxy_enrollment_credential_candidate"
+            else
+                [ "$(file_link_count "$proxy_enrollment_credential_candidate")" = 1 ] \
+                    || fail 'stale native Traefik enrollment credential candidate has an invalid link count'
+                rm -f "$proxy_enrollment_credential_candidate"
+            fi
+        else
+            rm -f "$proxy_enrollment_credential_candidate"
         fi
-        printf '  middlewares:\n'
-        printf '    control-plane-route-ack:\n'
-        printf '      headers:\n'
-        printf '        customResponseHeaders:\n'
-        printf '          X-Control-Plane-Route-Ack: "%s"\n' "$route_acknowledgement"
-        printf '  services:\n'
-        printf '    control-plane-%s:\n' "$route_color"
-        printf '      loadBalancer:\n'
-        printf '        servers:\n'
-        printf '          - url: "http://%s:%s"\n' "$route_container" "$backend_port"
-    } > "$route_candidate"
+    done
 }
 
-managed_route_is_ours()
+proxy_enrollment_operation_context()
 {
-    [ -f "$dynamic_route_file" ] \
-        && grep -F -q "# control-plane-operation-id: $operation_id" "$dynamic_route_file"
-}
+    proxy_enrollment_operation_id=native-traefik-enrollment-v1
+    proxy_enrollment_credential_file="$state_directory/$proxy_enrollment_operation_id.token"
+    validate_path "$proxy_enrollment_credential_file" 'native Traefik enrollment credential path'
+    [ -d "$state_directory" ] && [ ! -L "$state_directory" ] \
+        || fail 'operator state directory must be a non-symlink directory before native Traefik enrollment'
+    chmod 700 "$state_directory"
+    [ "$(file_uid "$state_directory")" = "$operator_uid" ] \
+        && [ "$(file_gid "$state_directory")" = "$operator_gid" ] \
+        && [ "$(file_mode "$state_directory")" = 700 ] \
+        || fail 'operator state directory ownership or mode is unsafe for native Traefik enrollment'
+    reconcile_proxy_enrollment_credential_candidates "$proxy_enrollment_credential_file"
 
-prepare_rollback_backup()
-{
-    [ "$state_rollback_backup_status" = unprepared ] || return 0
-
-    if [ -e "$dynamic_route_file" ]; then
-        cp -p "$dynamic_route_file" "$rollback_backup_file"
-        state_rollback_backup_status=present
-        state_rollback_backup_checksum=$(file_checksum "$rollback_backup_file")
-        state_route_original_checksum=$(file_checksum "$dynamic_route_file")
-    else
-        state_rollback_backup_status=absent
-        state_rollback_backup_checksum=none
-        state_route_original_checksum=absent
+    if [ ! -e "$proxy_enrollment_credential_file" ] \
+        && [ ! -L "$proxy_enrollment_credential_file" ]; then
+        proxy_enrollment_credential_candidate="${proxy_enrollment_credential_file}.new.$$"
+        proxy_enrollment_credential_random="${proxy_enrollment_credential_candidate}.random"
+        [ ! -e "$proxy_enrollment_credential_candidate" ] \
+            && [ ! -L "$proxy_enrollment_credential_candidate" ] \
+            && [ ! -e "$proxy_enrollment_credential_random" ] \
+            && [ ! -L "$proxy_enrollment_credential_random" ] \
+            || fail 'native Traefik enrollment credential staging path is unexpectedly occupied'
+        umask 077
+        : > "$proxy_enrollment_credential_candidate"
+        chmod 600 "$proxy_enrollment_credential_candidate"
+        assert_non_symlink_regular_file "$proxy_enrollment_credential_candidate" \
+            'native Traefik enrollment credential candidate'
+        [ "$(file_uid "$proxy_enrollment_credential_candidate")" = "$operator_uid" ] \
+            && [ "$(file_gid "$proxy_enrollment_credential_candidate")" = "$operator_gid" ] \
+            && [ "$(file_mode "$proxy_enrollment_credential_candidate")" = 600 ] \
+            && [ "$(file_link_count "$proxy_enrollment_credential_candidate")" = 1 ] \
+            || fail 'native Traefik enrollment credential candidate metadata is unsafe'
+        test_crash after-proxy-enrollment-credential-candidate-created
+        dd if=/dev/urandom of="$proxy_enrollment_credential_random" bs=32 count=1 2>/dev/null
+        [ "$(file_size "$proxy_enrollment_credential_random")" = 32 ] \
+            || fail 'native Traefik enrollment credential entropy generation was incomplete'
+        sha256sum "$proxy_enrollment_credential_random" | awk '{print $1}' \
+            > "$proxy_enrollment_credential_candidate"
+        rm -f "$proxy_enrollment_credential_random"
+        chmod 600 "$proxy_enrollment_credential_candidate"
+        assert_non_symlink_regular_file "$proxy_enrollment_credential_candidate" \
+            'native Traefik enrollment credential candidate'
+        [ "$(file_uid "$proxy_enrollment_credential_candidate")" = "$operator_uid" ] \
+            && [ "$(file_gid "$proxy_enrollment_credential_candidate")" = "$operator_gid" ] \
+            && [ "$(file_mode "$proxy_enrollment_credential_candidate")" = 600 ] \
+            && [ "$(file_link_count "$proxy_enrollment_credential_candidate")" = 1 ] \
+            || fail 'native Traefik enrollment credential candidate metadata is unsafe'
+        proxy_enrollment_token=$(cat "$proxy_enrollment_credential_candidate")
+        validate_safe_token "$proxy_enrollment_token" 'native Traefik enrollment credential candidate'
+        if ln "$proxy_enrollment_credential_candidate" \
+            "$proxy_enrollment_credential_file" 2>/dev/null; then
+            test_crash after-proxy-enrollment-credential-linked
+            rm -f "$proxy_enrollment_credential_candidate"
+        else
+            rm -f "$proxy_enrollment_credential_candidate"
+        fi
     fi
-    sync
+    assert_non_symlink_regular_file "$proxy_enrollment_credential_file" \
+        'native Traefik enrollment credential'
+    [ "$(file_uid "$proxy_enrollment_credential_file")" = "$operator_uid" ] \
+        && [ "$(file_gid "$proxy_enrollment_credential_file")" = "$operator_gid" ] \
+        && [ "$(file_mode "$proxy_enrollment_credential_file")" = 600 ] \
+        && [ "$(file_link_count "$proxy_enrollment_credential_file")" = 1 ] \
+        || fail 'native Traefik enrollment credential metadata is unsafe'
+    proxy_enrollment_token=$(cat "$proxy_enrollment_credential_file")
+    proxy_enrollment_public_host=${public_probe_host_header:-$control_plane_host}
+    proxy_enrollment_public_host=$(printf '%s' "$proxy_enrollment_public_host" \
+        | tr '[:upper:]' '[:lower:]')
+    validate_identifier "$proxy_enrollment_operation_id" 'proxy enrollment operation ID'
+    validate_safe_token "$proxy_enrollment_token" 'proxy enrollment token'
+    validate_host "$proxy_enrollment_public_host" 'proxy enrollment public Host header'
+}
+
+proxy_enrollment_runner_call()
+{
+    runner_action=$1
+    runner_dynamic_sha256=$2
+    assert_immutable_image "$green_image" CONTROL_PLANE_GREEN_IMAGE
+    runner_identity=$(printf '%s\0%s\0' "$proxy_enrollment_operation_id" "$runner_action" \
+        | sha256sum | awk '{print substr($1, 1, 24)}')
+    runner_name="coolify-proxy-enrollment-${runner_identity}"
+    validate_identifier "$runner_name" 'proxy enrollment runner name'
+    docker_container_presence "$runner_name"
+    [ "$container_presence" = absent ] \
+        || fail 'a proxy-enrollment runner already exists for this exact lifecycle action'
+
+    set -- artisan control-plane:proxy-enrollment "$runner_action" \
+        "--operation=$proxy_enrollment_operation_id" \
+        "--token=$proxy_enrollment_token"
+    case "$runner_action" in
+        prepare)
+            set -- "$@" "--app-port=$app_port" "--public-url=$public_probe_url" \
+                "--public-host=$proxy_enrollment_public_host" \
+                "--dynamic-filename=$dynamic_filename"
+            ;;
+        finalize)
+            set -- "$@" "--app-port=$app_port" \
+                "--dynamic-sha256=$runner_dynamic_sha256"
+            ;;
+        activate|rollback)
+            set -- "$@" "--app-port=$app_port"
+            ;;
+        status) ;;
+    esac
+
+    docker run --rm --pull never --name "$runner_name" --user 0:0 \
+        --label 'coolify.control-plane.proxy-enrollment-runner=true' \
+        --label "coolify.control-plane.operation-id=$operation_id" \
+        --network "$control_plane_network" \
+        --add-host host.docker.internal:host-gateway \
+        --env-file "$source_env_file" \
+        --env "APP_PORT=$app_port" \
+        --env CONTROL_PLANE_MODE=active \
+        --env CONTROL_PLANE_STARTUP_MODE=web-only \
+        --mount "type=bind,source=$source_env_file,target=/var/www/html/.env,readonly" \
+        --mount "type=bind,source=$proxy_enrollment_docker_socket,target=/var/run/docker.sock" \
+        --volume "$ssh_directory:/var/www/html/storage/app/ssh" \
+        --volume "$applications_directory:/var/www/html/storage/app/applications" \
+        --volume "$databases_directory:/var/www/html/storage/app/databases" \
+        --volume "$services_directory:/var/www/html/storage/app/services" \
+        --volume "$backups_directory:/var/www/html/storage/app/backups" \
+        --workdir /var/www/html --entrypoint php "$green_image" "$@"
+}
+
+validate_proxy_enrollment_output()
+{
+    validated_enrollment_action=$1
+    proxy_enrollment_token_sha256=$(printf '%s' "$proxy_enrollment_token" \
+        | sha256sum | awk '{print $1}')
+    if ! proxy_enrollment_output=$(printf '%s\n' "$proxy_enrollment_output" \
+        | jq --exit-status --compact-output --slurp \
+            --arg operation "$proxy_enrollment_operation_id" \
+            --arg token_sha256 "$proxy_enrollment_token_sha256" \
+            --arg public_url "$public_probe_url" \
+            --arg public_host "$proxy_enrollment_public_host" \
+            --arg local_url "$local_ingress_url" \
+            --arg dynamic_filename "$dynamic_filename" \
+            --arg compose_override_path "$proxy_enrollment_compose_override" \
+            --argjson app_port "$app_port" '
+            if length == 1
+                and (.[0] | type == "object")
+                and .[0].ok == true
+                and .[0].operation_id == $operation
+                and .[0].token_sha256 == $token_sha256
+                and .[0].app_port == $app_port
+                and .[0].public_url == $public_url
+                and .[0].public_host == $public_host
+                and .[0].local_url == $local_url
+                and .[0].dynamic_filename == $dynamic_filename
+                and .[0].compose_override_path == $compose_override_path
+                and (.[0].phase | type == "string")
+            then .[0]
+            else error("invalid proxy enrollment response")
+            end
+        '); then
+        return 1
+    fi
+    proxy_enrollment_phase=$(printf '%s\n' "$proxy_enrollment_output" | jq -r '.phase')
+    case "$proxy_enrollment_phase" in
+        reserving|prepare-failed|preparing|prepared|activating|activated|enrolled|rolling-back|\
+        rollback-required|intervention-required|rollback-pending-legacy|rolled-back)
+            ;;
+        *) return 1 ;;
+    esac
+    case "$validated_enrollment_action:$proxy_enrollment_phase" in
+        prepare:prepared|activate:activated|finalize:enrolled|\
+        status:*|rollback:rolling-back|rollback:rollback-pending-legacy|rollback:rolled-back)
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+proxy_enrollment_call()
+{
+    proxy_enrollment_action=$1
+    proxy_enrollment_dynamic_sha256=${2:-}
+    case "$proxy_enrollment_action" in
+        prepare|activate|finalize|status|rollback)
+            ;;
+        *)
+            fail 'proxy enrollment action is invalid'
+            ;;
+    esac
+    if [ -n "$proxy_enrollment_dynamic_sha256" ]; then
+        validate_sha256 "$proxy_enrollment_dynamic_sha256" 'proxy enrollment dynamic configuration SHA-256'
+    fi
+    proxy_enrollment_operation_context
+
+    if is_test_mode && [ -n "$proxy_enrollment_command" ]; then
+        if ! proxy_enrollment_output=$( \
+            CONTROL_PLANE_PROXY_ENROLLMENT_ACTION="$proxy_enrollment_action" \
+            CONTROL_PLANE_PROXY_ENROLLMENT_OPERATION="$proxy_enrollment_operation_id" \
+            CONTROL_PLANE_PROXY_ENROLLMENT_TOKEN="$proxy_enrollment_token" \
+            CONTROL_PLANE_PROXY_ENROLLMENT_APP_PORT="$app_port" \
+            CONTROL_PLANE_PROXY_ENROLLMENT_PUBLIC_URL="$public_probe_url" \
+            CONTROL_PLANE_PROXY_ENROLLMENT_PUBLIC_HOST="$proxy_enrollment_public_host" \
+            CONTROL_PLANE_PROXY_ENROLLMENT_DYNAMIC_FILENAME="$dynamic_filename" \
+            CONTROL_PLANE_PROXY_ENROLLMENT_DYNAMIC_SHA256="$proxy_enrollment_dynamic_sha256" \
+            CONTROL_PLANE_PROXY_ENROLLMENT_OPERATOR_PID="$$" \
+            "$proxy_enrollment_command" 2>&1
+        ); then
+            return 1
+        fi
+    elif ! proxy_enrollment_output=$(proxy_enrollment_runner_call \
+        "$proxy_enrollment_action" "$proxy_enrollment_dynamic_sha256" 2>&1); then
+        return 1
+    fi
+    validate_proxy_enrollment_output "$proxy_enrollment_action"
+}
+
+proxy_enrollment_status()
+{
+    proxy_enrollment_call status || return 1
+    printf '%s\n' "$proxy_enrollment_phase"
+}
+
+proxy_enrollment_status_is_absent()
+{
+    printf '%s\n' "$proxy_enrollment_output" | jq --exit-status --slurp '
+        length == 1
+        and (.[0] | type == "object")
+        and .[0].ok == false
+        and .[0].error == "No exact token-owned managed proxy enrollment state exists."
+    ' >/dev/null
+}
+
+validate_proxy_enrollment_prepared_contract()
+{
+    expected_source_compose_files=$(ordered_source_compose_paths_without_proxy_enrollment_override)
+    printf '%s\n' "$proxy_enrollment_output" | jq --exit-status \
+        --arg expected_source_compose_files "$expected_source_compose_files" '
+        (.static_config_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+        and (.compose_override_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+        and (.proxy_rendered_config_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+        and (.source_rendered_config_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+        and (.source_compose_files | type == "array" and length >= 2)
+        and ((.source_compose_files | join(",")) == $expected_source_compose_files)
+        and (.proxy_before | type == "object" and .running == true)
+        and (.legacy_before | type == "object" and .running == true)
+        and (.legacy_binding_before | type == "array" and length >= 1)
+        and (.public_proof_before | type == "object")
+        and (.local_proof_before | type == "object")
+    ' >/dev/null
+}
+
+assert_proxy_enrollment_override_identity()
+{
+    validate_proxy_enrollment_prepared_contract \
+        || fail 'durable proxy-enrollment preparation contract is invalid'
+    enrollment_override_sha256=$(printf '%s\n' "$proxy_enrollment_output" \
+        | jq --raw-output '.compose_override_sha256')
+    assert_non_symlink_regular_file "$proxy_enrollment_compose_override" \
+        'managed proxy-enrollment compose override'
+    [ "$(sha256_file "$proxy_enrollment_compose_override")" = \
+        "$enrollment_override_sha256" ] \
+        && [ "$(file_mode "$proxy_enrollment_compose_override")" = 600 ] \
+        || fail 'managed proxy-enrollment compose override bytes or mode differ from durable state'
+    if is_test_mode; then
+        [ "$(file_uid "$proxy_enrollment_compose_override")" = "$operator_uid" ] \
+            && [ "$(file_gid "$proxy_enrollment_compose_override")" = "$operator_gid" ] \
+            || fail 'lab proxy-enrollment compose override owner differs from durable state'
+    else
+        [ "$(file_uid "$proxy_enrollment_compose_override")" = 0 ] \
+            && [ "$(file_gid "$proxy_enrollment_compose_override")" = 0 ] \
+            || fail 'production proxy-enrollment compose override is not root-owned'
+    fi
+}
+
+source_compose_recreate_from_proxy_enrollment_output()
+{
+    enrollment_include_override=$1
+    case "$enrollment_include_override" in
+        0|1) ;;
+        *) fail 'proxy-enrollment source compose override selection is invalid' ;;
+    esac
+    validate_proxy_enrollment_prepared_contract \
+        || fail 'proxy-enrollment source compose inventory is invalid'
+    set -- env "APP_PORT=$app_port" docker compose --ansi never \
+        --project-name "$source_compose_project" --env-file "$source_env_file"
+    enrollment_source_file_count=$(printf '%s\n' "$proxy_enrollment_output" \
+        | jq '.source_compose_files | length')
+    enrollment_source_file_index=0
+    while [ "$enrollment_source_file_index" -lt "$enrollment_source_file_count" ]; do
+        enrollment_source_file=$(printf '%s\n' "$proxy_enrollment_output" \
+            | jq --exit-status --raw-output \
+                --argjson index "$enrollment_source_file_index" \
+                '.source_compose_files[$index] | select(type == "string")') \
+            || fail 'proxy-enrollment source compose path is invalid'
+        validate_path "$enrollment_source_file" 'proxy-enrollment source compose path'
+        assert_non_symlink_regular_file "$enrollment_source_file" \
+            'proxy-enrollment source compose path'
+        set -- "$@" --file "$enrollment_source_file"
+        enrollment_source_file_index=$((enrollment_source_file_index + 1))
+    done
+    if [ "$enrollment_include_override" = 1 ]; then
+        assert_proxy_enrollment_override_identity
+        set -- "$@" --file "$proxy_enrollment_compose_override"
+    fi
+    "$@" up --detach --no-deps --force-recreate --wait --no-build --pull never \
+        "$source_compose_service"
+}
+
+proxy_enrollment_running_port_bindings()
+{
+    enrollment_port_inventory='[]'
+    enrollment_container_ids=$(docker ps --no-trunc --quiet)
+    [ -n "$enrollment_container_ids" ] \
+        || fail 'proxy-enrollment Docker binding inventory is empty'
+    for enrollment_container_id in $enrollment_container_ids; do
+        validate_container_id "$enrollment_container_id" \
+            'proxy-enrollment Docker inventory container ID'
+        enrollment_container_bindings=$(docker inspect "$enrollment_container_id" \
+            | jq --exit-status --compact-output '
+                .[0] as $container
+                | [($container.NetworkSettings.Ports // {})
+                    | to_entries[]
+                    | .key as $container_port
+                    | .value[]?
+                    | {
+                        container: ($container.Name | ltrimstr("/")),
+                        container_id: $container.Id,
+                        container_port: $container_port,
+                        host_ip: .HostIp,
+                        host_port: .HostPort
+                    }]
+            ') || fail 'proxy-enrollment Docker binding inventory is malformed'
+        enrollment_port_inventory=$(jq --null-input --compact-output \
+            --argjson inventory "$enrollment_port_inventory" \
+            --argjson bindings "$enrollment_container_bindings" \
+            '$inventory + $bindings')
+    done
+    printf '%s\n' "$enrollment_port_inventory"
+}
+
+proxy_enrollment_app_port_is_unowned()
+{
+    enrollment_port_inventory=$(proxy_enrollment_running_port_bindings)
+    printf '%s\n' "$enrollment_port_inventory" | jq --exit-status \
+        --arg app_port "$app_port" '
+        [.[] | select(.container_port == "8000/tcp" or .host_port == $app_port)] == []
+    ' >/dev/null
+}
+
+proxy_enrollment_has_native_binding()
+{
+    enrollment_binding_tuple="$proxy_container|8000/tcp|127.0.0.1|$app_port"
+    printf '%s\n' "$proxy_enrollment_output" | jq --exit-status \
+        --arg binding_tuple "$enrollment_binding_tuple" '
+        .proxy_after.binding_tuple == $binding_tuple
+    ' >/dev/null || return 1
+    assert_container_running "$proxy_container"
+    enrollment_port_inventory=$(proxy_enrollment_running_port_bindings)
+    printf '%s\n' "$enrollment_port_inventory" | jq --exit-status \
+        --arg container "$proxy_container" --arg app_port "$app_port" '
+        [.[] | select(.container_port == "8000/tcp" or .host_port == $app_port)] as $owners
+        | ($owners | length) == 1
+        and $owners[0].container == $container
+        and $owners[0].container_port == "8000/tcp"
+        and $owners[0].host_ip == "127.0.0.1"
+        and $owners[0].host_port == $app_port
+    ' >/dev/null
+}
+
+proxy_enrollment_has_legacy_binding()
+{
+    assert_container_running "$blue_container"
+    enrollment_port_inventory=$(proxy_enrollment_running_port_bindings)
+    enrollment_expected_legacy_bindings=$(printf '%s\n' "$proxy_enrollment_output" \
+        | jq --compact-output '.legacy_binding_before')
+    printf '%s\n' "$enrollment_port_inventory" | jq --exit-status \
+        --arg container "$blue_container" --arg app_port "$app_port" \
+        --argjson expected "$enrollment_expected_legacy_bindings" '
+        ([.[] | select(.host_port == $app_port) | {
+            container,
+            container_port,
+            host_ip,
+            host_port
+        }] | sort_by(.container, .container_port, .host_ip, .host_port))
+            == ($expected | sort_by(.container, .container_port, .host_ip, .host_port))
+        and ($expected | length) >= 1
+        and all($expected[];
+            .container == $container
+            and .container_port == "8080/tcp"
+            and .host_port == $app_port)
+        and ([.[] | select(.container_port == "8000/tcp")] | length) == 0
+    ' >/dev/null
+}
+
+assert_proxy_enrollment_rolled_back()
+{
+    printf '%s\n' "$proxy_enrollment_output" | jq --exit-status '
+        .phase == "rolled-back"
+        and .legacy_restore_required == false
+        and .legacy_binding_rollback_observed == .legacy_binding_before
+        and (.rollback_proxy | type == "object")
+        and (.rollback_proxy.id | type == "string" and length > 0)
+        and .rollback_proxy.running == true
+        and (.rollback_proxy.command_sha256
+            | type == "string" and test("^[a-f0-9]{64}$"))
+        and (.public_proof_rollback.status == .public_proof_before.status)
+        and (.public_proof_rollback.response_fingerprint_sha256
+            == .public_proof_before.response_fingerprint_sha256)
+        and (.local_proof_rollback.status == .local_proof_before.status)
+        and (.local_proof_rollback.response_fingerprint_sha256
+            == .local_proof_before.response_fingerprint_sha256)
+    ' >/dev/null || fail 'terminal proxy-enrollment rollback evidence is incomplete or changed'
+    enrollment_rollback_proxy_id=$(printf '%s\n' "$proxy_enrollment_output" \
+        | jq --exit-status --raw-output '.rollback_proxy.id') \
+        || fail 'terminal proxy-enrollment rollback proxy identity is invalid'
+    [ "$(container_id "$proxy_container")" = "$enrollment_rollback_proxy_id" ] \
+        || fail 'terminal proxy-enrollment rollback proxy identity differs from the running proxy'
+    proxy_enrollment_has_legacy_binding \
+        || fail 'terminal proxy-enrollment rollback did not restore exact legacy APP_PORT ownership'
+}
+
+adopt_proxy_enrollment_legacy_recreation()
+{
+    [ -e "$state_file" ] || return
+    [ "$(container_image_id "$blue_container")" = "$state_blue_image_id" ] \
+        && [ "$(container_image_reference "$blue_container")" = "$state_blue_image_reference" ] \
+        || fail 'proxy-enrollment legacy recreation changed the recorded immutable image'
+    [ "$(container_label "$blue_container" com.docker.compose.project)" = \
+        "$state_blue_compose_project" ] \
+        && [ "$(container_label "$blue_container" com.docker.compose.service)" = \
+            "$state_blue_compose_service" ] \
+        && [ "$(container_label "$blue_container" com.docker.compose.project.config_files)" = \
+            "$(ordered_source_compose_paths_without_proxy_enrollment_override)" ] \
+        || fail 'proxy-enrollment legacy recreation changed its source compose identity'
+    state_blue_id=$(container_id "$blue_container")
+    state_blue_rollback_replacement_id=$state_blue_id
+    state_blue_compose_config_files=$(ordered_source_compose_paths_without_proxy_enrollment_override)
+    state_blue_bridge_ip=$(docker inspect --format \
+        "{{with index .NetworkSettings.Networks \"${control_plane_network}\"}}{{.IPAddress}}{{end}}" \
+        "$blue_container")
+    [ -n "$state_blue_bridge_ip" ] \
+        || fail 'proxy-enrollment legacy recreation has no control-plane network address'
+    state_blue_restore_status=adopted
     write_state "$state_phase"
 }
 
-assert_dynamic_route_unchanged_before_switch()
+preserve_proxy_enrollment_after_state_creation()
 {
-    case "$state_route_original_checksum" in
-        absent)
-            { [ ! -e "$dynamic_route_file" ] || managed_route_is_ours; } \
-                || fail 'an unmanaged dynamic route appeared during this operation'
+    proxy_enrollment_status >/dev/null || return 1
+    case "$proxy_enrollment_phase" in
+        enrolled)
+            assert_proxy_enrollment_active
+            ;;
+        activated)
+            finalize_proxy_enrollment_if_owned || return 1
+            assert_proxy_enrollment_active
+            ;;
+        activating)
+            proxy_enrollment_override_active=1
+            assert_proxy_enrollment_override_identity || return 1
+            proxy_enrollment_call activate || return 1
+            proxy_enrollment_has_native_binding || return 1
+            finalize_proxy_enrollment_if_owned || return 1
+            assert_proxy_enrollment_active
             ;;
         *)
-            { [ -f "$dynamic_route_file" ] \
-                && { [ "$(file_checksum "$dynamic_route_file")" = "$state_route_original_checksum" ] \
-                    || managed_route_is_ours; }; } \
-                || fail 'the dynamic route changed during this operation'
+            return 1
             ;;
     esac
 }
 
-atomic_route_switch()
+rollback_proxy_enrollment_if_owned()
 {
-    route_container=$1
-    route_color=$2
-
-    assert_dynamic_route_unchanged_before_switch
-    render_dynamic_route "$route_container" "$route_color"
-    mv -f "$traefik_dynamic_directory/.${dynamic_filename}.${operation_id}.new" "$dynamic_route_file"
-    sync
-}
-
-restore_dynamic_route()
-{
-    restore_candidate="$traefik_dynamic_directory/.${dynamic_filename}.${operation_id}.restore"
-
-    case "$state_rollback_backup_status" in
-        present)
-            [ "$(file_checksum "$rollback_backup_file")" = "$state_rollback_backup_checksum" ] \
-                || fail 'durable rollback backup identity changed'
-            if [ -e "$dynamic_route_file" ] \
-                && ! managed_route_is_ours \
-                && [ "$(file_checksum "$dynamic_route_file")" != "$state_rollback_backup_checksum" ]; then
-                fail 'refusing to overwrite a dynamic route not owned by this operation'
-            fi
-            cp -p "$rollback_backup_file" "$restore_candidate"
-            mv -f "$restore_candidate" "$dynamic_route_file"
+    [ ! -e "$state_file" ] && [ ! -L "$state_file" ] \
+        || fail 'destructive native Traefik enrollment rollback is only permitted before durable operator state exists'
+    proxy_enrollment_status >/dev/null \
+        || fail 'exact token-owned proxy-enrollment state is unavailable during rollback'
+    case "$proxy_enrollment_phase" in
+        rolled-back)
+            proxy_enrollment_override_active=0
+            assert_proxy_enrollment_rolled_back
+            return
             ;;
-        absent)
-            if [ -e "$dynamic_route_file" ] && ! managed_route_is_ours; then
-                fail 'refusing to remove a dynamic route not owned by this operation'
-            fi
-            rm -f "$dynamic_route_file"
+        reserving|prepare-failed|preparing)
+            proxy_enrollment_call prepare \
+                || fail 'interrupted proxy-enrollment preparation could not converge before rollback'
+            ;;
+        prepared|activating|activated|enrolled|rolling-back|rollback-required|\
+        intervention-required|rollback-pending-legacy)
             ;;
         *)
-            fail 'rollback backup was not prepared'
+            return 1
             ;;
     esac
-    sync
-}
 
-public_probe()
-{
-    expected_ack=$1
-    header_file="$operation_directory/public-probe.headers"
-    attempt=0
-
-    while [ "$attempt" -lt "$public_probe_attempts" ]; do
-        rm -f "$header_file"
-        if [ -n "$public_probe_host_header" ]; then
-            if curl --fail --silent --show-error --max-time 5 \
-                --header "Host: $public_probe_host_header" \
-                --dump-header "$header_file" --output /dev/null "$public_probe_url"; then
-                if [ "$expected_ack" = present ] \
-                    && http_headers_match_ack "$header_file" X-Control-Plane-Route-Ack \
-                        present "$green_applied_acknowledgement"; then
-                    rm -f "$header_file"
-                    return
-                fi
-                if [ "$expected_ack" = absent ] \
-                    && http_headers_match_ack "$header_file" X-Control-Plane-Route-Ack absent; then
-                    rm -f "$header_file"
-                    return
-                fi
-            fi
-        elif curl --fail --silent --show-error --max-time 5 \
-            --dump-header "$header_file" --output /dev/null "$public_probe_url"; then
-            if [ "$expected_ack" = present ] \
-                && http_headers_match_ack "$header_file" X-Control-Plane-Route-Ack \
-                    present "$green_applied_acknowledgement"; then
-                rm -f "$header_file"
-                return
-            fi
-            if [ "$expected_ack" = absent ] \
-                && http_headers_match_ack "$header_file" X-Control-Plane-Route-Ack absent; then
-                rm -f "$header_file"
-                return
-            fi
-        fi
-        attempt=$((attempt + 1))
-        sleep 1
+    proxy_enrollment_rollback_attempt=0
+    while [ "$proxy_enrollment_phase" != rollback-pending-legacy ] \
+        && [ "$proxy_enrollment_phase" != rolled-back ]; do
+        proxy_enrollment_rollback_attempt=$((proxy_enrollment_rollback_attempt + 1))
+        [ "$proxy_enrollment_rollback_attempt" -le 2 ] || return 1
+        proxy_enrollment_call rollback || return 1
+        case "$proxy_enrollment_phase" in
+            rolling-back|rollback-required|intervention-required|rollback-pending-legacy|rolled-back)
+                ;;
+            *)
+                return 1
+                ;;
+        esac
     done
+    if [ "$proxy_enrollment_phase" = rollback-pending-legacy ]; then
+        proxy_enrollment_override_active=0
+        test_crash after-proxy-enrollment-rollback-pending-legacy
+        source_compose_recreate_from_proxy_enrollment_output 0 || return 1
+        assert_container_running "$blue_container"
+        proxy_enrollment_has_legacy_binding || return 1
+        adopt_proxy_enrollment_legacy_recreation
+        test_crash after-proxy-enrollment-legacy-recreate
+        proxy_enrollment_call rollback || return 1
+    fi
+    [ "$proxy_enrollment_phase" = rolled-back ] || return 1
+    proxy_enrollment_override_active=0
+    assert_proxy_enrollment_rolled_back
+}
 
-    rm -f "$header_file"
-    return 1
+reconcile_proxy_enrollment_before_preflight()
+{
+    if ! proxy_enrollment_status >/dev/null; then
+        if [ -e "$state_file" ]; then
+            fail 'persisted operation lost its exact token-owned native Traefik enrollment state'
+        fi
+        proxy_enrollment_status_is_absent \
+            || fail 'proxy-enrollment status failed for a reason other than absent owned state'
+        return
+    fi
+
+    if [ -e "$state_file" ]; then
+        case "$proxy_enrollment_phase" in
+            activated|enrolled)
+                assert_proxy_enrollment_active
+                ;;
+            activating)
+                proxy_enrollment_override_active=1
+                assert_proxy_enrollment_override_identity
+                proxy_enrollment_call activate \
+                    || fail 'persisted native Traefik activation could not converge before preflight'
+                proxy_enrollment_has_native_binding \
+                    || fail 'persisted native Traefik activation did not restore its loopback APP_PORT binding'
+                ;;
+            rolling-back|rollback-pending-legacy|rollback-required|intervention-required|rolled-back)
+                fail 'persisted operation has an unsafe destructive native Traefik rollback phase; retain native enrollment and repair the durable action state explicitly'
+            ;;
+            *)
+                fail 'persisted operation has an unsupported native Traefik enrollment phase before preflight'
+                ;;
+        esac
+        return
+    fi
+
+    case "$proxy_enrollment_phase" in
+        rolling-back|rollback-pending-legacy|rollback-required|intervention-required)
+            proxy_enrollment_override_active=0
+            rollback_proxy_enrollment_if_owned \
+                || fail 'native Traefik enrollment could not finish its durable legacy rollback before a new preflight'
+            ;;
+        activating)
+            proxy_enrollment_override_active=1
+            assert_proxy_enrollment_override_identity
+            proxy_enrollment_call activate \
+                || fail 'interrupted native Traefik activation could not converge before proxy identity checks'
+            proxy_enrollment_has_native_binding \
+                || fail 'interrupted native Traefik activation did not restore its loopback APP_PORT binding'
+            ;;
+        activated|enrolled)
+            assert_proxy_enrollment_active
+            ;;
+        reserving|prepare-failed|preparing|prepared|rolled-back)
+            proxy_enrollment_override_active=0
+            ;;
+        *)
+            fail 'native Traefik enrollment has an unsupported durable phase before preflight'
+            ;;
+    esac
+}
+
+enroll_proxy_if_needed()
+{
+    if proxy_enrollment_status >/dev/null; then
+        case "$proxy_enrollment_phase" in
+            activated|enrolled)
+                assert_proxy_enrollment_active
+                return
+                ;;
+            activating)
+                proxy_enrollment_override_active=1
+                assert_proxy_enrollment_override_identity
+                if ! proxy_enrollment_call activate; then
+                    rollback_proxy_enrollment_if_owned \
+                        || fail 'activation recovery also failed to restore the legacy listener'
+                    fail 'interrupted native Traefik activation could not converge'
+                fi
+                proxy_enrollment_has_native_binding \
+                    || fail 'activation recovery did not prove the exact loopback native Traefik binding'
+                return
+                ;;
+            prepared)
+                ;;
+            reserving|prepare-failed|preparing|rolled-back)
+                if ! proxy_enrollment_call prepare; then
+                    if proxy_enrollment_status >/dev/null \
+                        && [ "$proxy_enrollment_phase" = intervention-required ]; then
+                        rollback_proxy_enrollment_if_owned \
+                            || fail 'failed proxy-enrollment preparation also failed cleanup'
+                    fi
+                    fail 'native Traefik enrollment could not capture the exact legacy pre-state'
+                fi
+                ;;
+            rolling-back|rollback-pending-legacy|rollback-required|intervention-required)
+                rollback_proxy_enrollment_if_owned \
+                    || fail 'native Traefik enrollment could not complete interrupted rollback'
+                proxy_enrollment_call prepare \
+                    || fail 'native Traefik enrollment could not restart after exact rollback'
+                ;;
+            *) fail 'native Traefik enrollment has an unsupported preflight phase' ;;
+        esac
+    else
+        proxy_enrollment_status_is_absent \
+            || fail 'proxy-enrollment status failed for a reason other than absent owned state'
+        proxy_enrollment_call prepare \
+            || fail 'native Traefik enrollment could not capture the exact legacy pre-state'
+    fi
+
+    [ "$proxy_enrollment_phase" = prepared ] \
+        || fail 'native Traefik enrollment did not reach exact prepared state'
+    assert_proxy_enrollment_override_identity
+    test_crash after-proxy-enrollment-prepare
+    proxy_enrollment_override_active=1
+    if ! source_compose_recreate_from_proxy_enrollment_output 1; then
+        rollback_proxy_enrollment_if_owned \
+            || fail 'native Traefik enrollment failed to restore the legacy listener after source recreation failure'
+        fail 'native Traefik enrollment could not release the legacy APP_PORT listener'
+    fi
+    assert_container_running "$blue_container"
+    proxy_enrollment_app_port_is_unowned \
+        || fail 'native Traefik enrollment source handoff did not release every APP_PORT or managed container-port owner'
+    test_crash after-proxy-enrollment-source-recreate
+    if ! proxy_enrollment_call activate; then
+        rollback_proxy_enrollment_if_owned \
+            || fail 'native Traefik enrollment activation failed and legacy restoration also failed'
+        fail 'native Traefik enrollment could not atomically recreate the proxy static configuration'
+    fi
+    proxy_enrollment_has_native_binding \
+        || fail 'native Traefik enrollment did not establish the exact loopback APP_PORT binding'
+    test_crash after-proxy-enrollment-activate
+}
+
+assert_proxy_enrollment_active()
+{
+    proxy_enrollment_status >/dev/null \
+        || fail 'durable native Traefik enrollment state is unavailable'
+    case "$proxy_enrollment_phase" in
+        activated|enrolled) ;;
+        *) fail 'durable native Traefik enrollment is not active' ;;
+    esac
+    proxy_enrollment_override_active=1
+    assert_proxy_enrollment_override_identity
+    proxy_enrollment_has_native_binding \
+        || fail 'durable native Traefik enrollment does not own the exact loopback APP_PORT binding'
+}
+
+validate_proxy_enrollment_finalized_contract()
+{
+    printf '%s\n' "$proxy_enrollment_output" | jq --exit-status '
+        .phase == "enrolled"
+        and (.dynamic_config_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+        and (.route_acknowledgement_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+        and (.public_proof_after | type == "object")
+        and (.local_proof_after | type == "object")
+    ' >/dev/null
+}
+
+finalize_proxy_enrollment_if_owned()
+{
+    if ! proxy_enrollment_status >/dev/null; then
+        return 1
+    fi
+    case "$proxy_enrollment_phase" in
+        enrolled)
+            validate_proxy_enrollment_finalized_contract || return 1
+            proxy_enrollment_has_native_binding
+            return
+            ;;
+        activated)
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    proxy_enrollment_dynamic_path="$traefik_dynamic_directory/$dynamic_filename"
+    assert_non_symlink_regular_file "$proxy_enrollment_dynamic_path" \
+        'managed Traefik dynamic configuration'
+    proxy_enrollment_dynamic_sha256=$(sha256_file "$proxy_enrollment_dynamic_path")
+    proxy_enrollment_call finalize "$proxy_enrollment_dynamic_sha256" || return 1
+    validate_proxy_enrollment_finalized_contract || return 1
+    proxy_enrollment_has_native_binding || return 1
+    proxy_enrollment_status >/dev/null && [ "$proxy_enrollment_phase" = enrolled ]
 }
 
 assert_container_identity_present()
@@ -10897,6 +11419,9 @@ load_configuration()
     source_compose_prod=${CONTROL_PLANE_SOURCE_COMPOSE_PROD:-/data/coolify/source/docker-compose.prod.yml}
     source_compose_custom=${CONTROL_PLANE_SOURCE_COMPOSE_CUSTOM:-/data/coolify/source/docker-compose.custom.yml}
     source_compose_postgres=${CONTROL_PLANE_SOURCE_COMPOSE_POSTGRES:-/data/coolify/source/docker-compose.postgres-upgrade.yml}
+    proxy_enrollment_compose_override=${CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE:-/data/coolify/source/docker-compose.control-plane-enrolled.yml}
+    proxy_enrollment_command=${CONTROL_PLANE_PROXY_ENROLLMENT_COMMAND:-}
+    proxy_enrollment_docker_socket=${CONTROL_PLANE_PROXY_ENROLLMENT_DOCKER_SOCKET:-/var/run/docker.sock}
     source_env_file=${CONTROL_PLANE_SOURCE_ENV_FILE:-/data/coolify/source/.env}
     source_compose_project=${CONTROL_PLANE_SOURCE_COMPOSE_PROJECT:-coolify}
     source_compose_service=${CONTROL_PLANE_SOURCE_COMPOSE_SERVICE:-coolify}
@@ -10911,10 +11436,13 @@ load_configuration()
     dynamic_filename=${CONTROL_PLANE_TRAEFIK_DYNAMIC_FILENAME:-coolify-control-plane-blue-green.yaml}
     control_plane_host=${CONTROL_PLANE_HOST:-coolify.iocloudhost.net}
     traefik_entrypoint=${CONTROL_PLANE_TRAEFIK_ENTRYPOINT:-https}
+    local_ingress_entrypoint=${CONTROL_PLANE_LOCAL_INGRESS_ENTRYPOINT:-coolify-local}
     traefik_tls=${CONTROL_PLANE_TRAEFIK_TLS:-true}
     traefik_cert_resolver=${CONTROL_PLANE_TRAEFIK_CERT_RESOLVER:-}
     traefik_router_priority=${CONTROL_PLANE_TRAEFIK_ROUTER_PRIORITY:-100000}
     backend_port=${CONTROL_PLANE_BACKEND_PORT:-8080}
+    configured_app_port=${APP_PORT:-}
+    app_port=
     direct_probe_path=${CONTROL_PLANE_DIRECT_PROBE_PATH:-/api/control-plane/probe}
     green_direct_probe_token_file=${CONTROL_PLANE_GREEN_WEB_A_DIRECT_PROBE_RUNTIME_FILE:-}
     green_applied_ack_file=${CONTROL_PLANE_GREEN_WEB_A_APPLIED_ACK_RUNTIME_FILE:-}
@@ -10966,22 +11494,11 @@ load_configuration()
     drain_attempts=${CONTROL_PLANE_DRAIN_ATTEMPTS:-60}
     drain_stable_seconds=${CONTROL_PLANE_DRAIN_STABLE_SECONDS:-2}
     s6_wait_milliseconds=${CONTROL_PLANE_S6_WAIT_MILLISECONDS:-30000}
-    https_controller=${CONTROL_PLANE_HTTPS_CONTROLLER:-$SCRIPT_DIRECTORY/controllers/traefik-https.sh}
-    port8000_controller=${CONTROL_PLANE_PORT8000_CONTROLLER:-$SCRIPT_DIRECTORY/controllers/haproxy-port8000.sh}
+    ingress_controller=${CONTROL_PLANE_INGRESS_CONTROLLER:-$SCRIPT_DIRECTORY/controllers/traefik-ingress.sh}
     public_probe_url=${CONTROL_PLANE_PUBLIC_PROBE_URL:-}
-    port8000_host_local_url=${CONTROL_PLANE_PORT8000_HOST_LOCAL_URL:-}
-    port8000_canary_netns=${CONTROL_PLANE_PORT8000_CANARY_NETNS:-}
-    port8000_canary_ipv4=${CONTROL_PLANE_PORT8000_CANARY_IPV4:-none}
-    port8000_canary_ipv6=${CONTROL_PLANE_PORT8000_CANARY_IPV6:-none}
-    port8000_canary_target_ipv4=${CONTROL_PLANE_PORT8000_CANARY_TARGET_IPV4:-none}
-    port8000_canary_target_ipv6=${CONTROL_PLANE_PORT8000_CANARY_TARGET_IPV6:-none}
-    port8000_external_policy_probe=${CONTROL_PLANE_PORT8000_EXTERNAL_POLICY_PROBE:-}
-    port8000_external_policy_probe_sha256=${CONTROL_PLANE_PORT8000_EXTERNAL_POLICY_PROBE_SHA256:-}
-    port8000_external_blocked_endpoint=${CONTROL_PLANE_PORT8000_EXTERNAL_BLOCKED_ENDPOINT:-}
-    port8000_ipv6_inventory_file=${CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE:-}
-    port8000_ipv6_inventory_sha256=${CONTROL_PLANE_PORT8000_IPV6_INVENTORY_SHA256:-}
-    port8000_ipv6_inventory_probe=${CONTROL_PLANE_PORT8000_IPV6_INVENTORY_PROBE:-}
-    port8000_ipv6_inventory_probe_sha256=${CONTROL_PLANE_PORT8000_IPV6_INVENTORY_PROBE_SHA256:-}
+    expected_ipv4=${CONTROL_PLANE_EXPECTED_PUBLIC_IPV4:-}
+    configured_local_ingress_url=${CONTROL_PLANE_LOCAL_INGRESS_URL:-}
+    local_ingress_url=
     public_probe_host_header=${CONTROL_PLANE_PUBLIC_PROBE_HOST_HEADER:-}
     public_probe_attempts=${CONTROL_PLANE_PUBLIC_PROBE_ATTEMPTS:-20}
     container_stop_timeout=${CONTROL_PLANE_CONTAINER_STOP_TIMEOUT:-30}
@@ -11026,8 +11543,6 @@ load_configuration()
     rehearsal_expected_migration_batch=${CONTROL_PLANE_REHEARSAL_EXPECTED_MIGRATION_BATCH:-}
     migration_lock_timeout=${CONTROL_PLANE_MIGRATION_LOCK_TIMEOUT:-}
     migration_statement_timeout=${CONTROL_PLANE_MIGRATION_STATEMENT_TIMEOUT:-}
-    expected_public_ipv4=${CONTROL_PLANE_EXPECTED_PUBLIC_IPV4:-75.8.210.180}
-    port8000_bootstrap_port=${CONTROL_PLANE_PORT8000_BOOTSTRAP_PORT:-18000}
     runtime_fence_provisioner=${CONTROL_PLANE_RUNTIME_FENCE_PROVISIONER:-/usr/local/sbin/coolify-runtime-fence-provision}
     runtime_fence_provisioner_sha256=${CONTROL_PLANE_RUNTIME_FENCE_PROVISIONER_SHA256:-}
     runtime_fence_management_endpoints=${CONTROL_PLANE_RUNTIME_FENCE_MANAGEMENT_ENDPOINTS:-}
@@ -11078,16 +11593,7 @@ load_configuration()
     require_value CONTROL_PLANE_BLUE_ROUTE_HEALTH_RUNTIME_FILE "$blue_route_health_token_file"
     require_value CONTROL_PLANE_BLUE_POOL_ACK_RUNTIME_FILE "$blue_pool_ack_file"
     require_value CONTROL_PLANE_PUBLIC_PROBE_URL "$public_probe_url"
-    require_value CONTROL_PLANE_PORT8000_HOST_LOCAL_URL "$port8000_host_local_url"
-    require_value CONTROL_PLANE_PORT8000_CANARY_NETNS "$port8000_canary_netns"
-    require_value CONTROL_PLANE_PORT8000_EXTERNAL_POLICY_PROBE "$port8000_external_policy_probe"
-    require_value CONTROL_PLANE_PORT8000_EXTERNAL_POLICY_PROBE_SHA256 "$port8000_external_policy_probe_sha256"
-    require_value CONTROL_PLANE_PORT8000_EXTERNAL_BLOCKED_ENDPOINT "$port8000_external_blocked_endpoint"
-    require_value CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE "$port8000_ipv6_inventory_file"
-    require_value CONTROL_PLANE_PORT8000_IPV6_INVENTORY_SHA256 "$port8000_ipv6_inventory_sha256"
-    require_value CONTROL_PLANE_PORT8000_IPV6_INVENTORY_PROBE "$port8000_ipv6_inventory_probe"
-    require_value CONTROL_PLANE_PORT8000_IPV6_INVENTORY_PROBE_SHA256 "$port8000_ipv6_inventory_probe_sha256"
-    require_value CONTROL_PLANE_EXPECTED_PUBLIC_IPV4 "$expected_public_ipv4"
+    require_value CONTROL_PLANE_EXPECTED_PUBLIC_IPV4 "$expected_ipv4"
     require_value CONTROL_PLANE_RUNTIME_FENCE_PROVISIONER "$runtime_fence_provisioner"
     require_value CONTROL_PLANE_RUNTIME_FENCE_PROVISIONER_SHA256 "$runtime_fence_provisioner_sha256"
     require_value CONTROL_PLANE_RUNTIME_FENCE_MANAGEMENT_ENDPOINTS "$runtime_fence_management_endpoints"
@@ -11174,11 +11680,11 @@ load_configuration()
     [ "$(sha256_file "$runtime_fence_provisioner")" = "$runtime_fence_provisioner_sha256" ] \
         || fail 'runtime fence provisioner differs from its pinned digest'
     if ! is_test_mode; then
-        [ "$runtime_fence_provisioner" = /usr/local/sbin/coolify-runtime-fence-provision ] \
+        [ "$runtime_fence_provisioner" = "$SCRIPT_DIRECTORY/controllers/provision-runtime-attestation-ssh-fence.sh" ] \
             && [ "$(file_uid "$runtime_fence_provisioner")" = 0 ] \
             && [ "$(file_gid "$runtime_fence_provisioner")" = 0 ] \
             && [ "$(file_mode "$runtime_fence_provisioner")" = 700 ] \
-            || fail 'production runtime fence provisioner must be the installed root:root mode 0700 executable'
+            || fail 'production runtime fence provisioner must be the active release root:root mode 0700 executable'
     fi
     case "$dynamic_filename" in
         *.yaml|*.yml)
@@ -11189,6 +11695,9 @@ load_configuration()
     esac
     validate_host "$control_plane_host" CONTROL_PLANE_HOST
     validate_identifier "$traefik_entrypoint" CONTROL_PLANE_TRAEFIK_ENTRYPOINT
+    validate_identifier "$local_ingress_entrypoint" CONTROL_PLANE_LOCAL_INGRESS_ENTRYPOINT
+    [ "$local_ingress_entrypoint" != "$traefik_entrypoint" ] \
+        || fail 'local and public Traefik entrypoints must be distinct'
     case "$traefik_tls" in
         true|false)
             ;;
@@ -11197,8 +11706,10 @@ load_configuration()
             ;;
     esac
     if [ "$traefik_tls" = true ]; then
-        traefik_cert_resolver=${traefik_cert_resolver:-letsencrypt}
-        validate_identifier "$traefik_cert_resolver" CONTROL_PLANE_TRAEFIK_CERT_RESOLVER
+        if [ "$test_mode" != 1 ] || [ -n "$traefik_cert_resolver" ]; then
+            traefik_cert_resolver=${traefik_cert_resolver:-letsencrypt}
+            validate_identifier "$traefik_cert_resolver" CONTROL_PLANE_TRAEFIK_CERT_RESOLVER
+        fi
     elif [ -n "$traefik_cert_resolver" ]; then
         fail 'CONTROL_PLANE_TRAEFIK_CERT_RESOLVER must be empty when TLS is disabled'
     fi
@@ -11216,7 +11727,6 @@ load_configuration()
     validate_port "$redis_port" CONTROL_PLANE_REDIS_PORT
     validate_port "$soketi_port" CONTROL_PLANE_SOKETI_PORT
     validate_port "$soketi_metrics_port" CONTROL_PLANE_SOKETI_METRICS_PORT
-    validate_port "$port8000_bootstrap_port" CONTROL_PLANE_PORT8000_BOOTSTRAP_PORT
     validate_host "$database_host" CONTROL_PLANE_DATABASE_HOST
     validate_host "$redis_host" CONTROL_PLANE_REDIS_HOST
     validate_host "$soketi_host" CONTROL_PLANE_SOKETI_HOST
@@ -11235,38 +11745,53 @@ load_configuration()
     validate_path "$source_compose_prod" CONTROL_PLANE_SOURCE_COMPOSE_PROD
     validate_path "$source_compose_custom" CONTROL_PLANE_SOURCE_COMPOSE_CUSTOM
     validate_path "$source_compose_postgres" CONTROL_PLANE_SOURCE_COMPOSE_POSTGRES
+    validate_path "$proxy_enrollment_compose_override" CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE
+    validate_path "$proxy_enrollment_docker_socket" CONTROL_PLANE_PROXY_ENROLLMENT_DOCKER_SOCKET
     validate_path "$source_env_file" CONTROL_PLANE_SOURCE_ENV_FILE
     validate_path "$ssh_directory" CONTROL_PLANE_SSH_DIRECTORY
     validate_path "$applications_directory" CONTROL_PLANE_APPLICATIONS_DIRECTORY
     validate_path "$databases_directory" CONTROL_PLANE_DATABASES_DIRECTORY
     validate_path "$services_directory" CONTROL_PLANE_SERVICES_DIRECTORY
     validate_path "$backups_directory" CONTROL_PLANE_BACKUPS_DIRECTORY
-    validate_path "$port8000_external_policy_probe" CONTROL_PLANE_PORT8000_EXTERNAL_POLICY_PROBE
-    validate_path "$port8000_ipv6_inventory_file" CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE
-    validate_path "$port8000_ipv6_inventory_probe" CONTROL_PLANE_PORT8000_IPV6_INVENTORY_PROBE
-    if is_test_mode; then
-        case "$port8000_external_blocked_endpoint" in
-            "${expected_public_ipv4}:"*)
-                lab_external_blocked_port=${port8000_external_blocked_endpoint##*:}
-                ;;
-            *)
-                fail 'lab external IPv4 blocked endpoint must bind CONTROL_PLANE_EXPECTED_PUBLIC_IPV4'
-                ;;
-        esac
-        validate_positive_integer "$lab_external_blocked_port" \
-            CONTROL_PLANE_PORT8000_EXTERNAL_BLOCKED_ENDPOINT
-        [ "$lab_external_blocked_port" -le 65535 ] \
-            || fail 'lab external IPv4 blocked endpoint port exceeds 65535'
-    else
-        [ "$port8000_external_blocked_endpoint" = "${expected_public_ipv4}:8000" ] \
-            || fail 'external IPv4 blocked endpoint must exactly bind CONTROL_PLANE_EXPECTED_PUBLIC_IPV4 on TCP/8000'
-    fi
     validate_path "$state_directory" CONTROL_PLANE_OPERATOR_STATE_DIR
     validate_path "$traefik_dynamic_directory" CONTROL_PLANE_TRAEFIK_DYNAMIC_DIR
     assert_non_symlink_regular_file "$source_compose_base" CONTROL_PLANE_SOURCE_COMPOSE_BASE
     assert_non_symlink_regular_file "$source_compose_prod" CONTROL_PLANE_SOURCE_COMPOSE_PROD
     path_presence "$source_compose_custom" >/dev/null
     path_presence "$source_compose_postgres" >/dev/null
+    if [ "$(path_presence "$proxy_enrollment_compose_override")" = present ]; then
+        assert_non_symlink_regular_file "$proxy_enrollment_compose_override" \
+            CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE
+        [ "$(file_mode "$proxy_enrollment_compose_override")" = 600 ] \
+            || fail 'managed proxy-enrollment compose override must have mode 0600'
+        if is_test_mode; then
+            [ "$(file_uid "$proxy_enrollment_compose_override")" = "$operator_uid" ] \
+                && [ "$(file_gid "$proxy_enrollment_compose_override")" = "$operator_gid" ] \
+                || fail 'lab managed proxy-enrollment compose override owner changed'
+        else
+            [ "$(file_uid "$proxy_enrollment_compose_override")" = 0 ] \
+                && [ "$(file_gid "$proxy_enrollment_compose_override")" = 0 ] \
+                || fail 'managed proxy-enrollment compose override must be root-owned'
+        fi
+    fi
+    if is_test_mode; then
+        if [ -n "$proxy_enrollment_command" ]; then
+            validate_path "$proxy_enrollment_command" CONTROL_PLANE_PROXY_ENROLLMENT_COMMAND
+            assert_non_symlink_regular_file "$proxy_enrollment_command" \
+                CONTROL_PLANE_PROXY_ENROLLMENT_COMMAND
+            [ -x "$proxy_enrollment_command" ] \
+                && [ "$(file_uid "$proxy_enrollment_command")" = "$operator_uid" ] \
+                && [ "$(file_gid "$proxy_enrollment_command")" = "$operator_gid" ] \
+                && [ "$(file_mode "$proxy_enrollment_command")" = 700 ] \
+                || fail 'lab proxy-enrollment command must be an operator-owned mode 0700 executable'
+        fi
+    elif [ -n "$proxy_enrollment_command" ]; then
+        fail 'CONTROL_PLANE_PROXY_ENROLLMENT_COMMAND is unavailable in production mode'
+    fi
+    if ! is_test_mode || [ -z "$proxy_enrollment_command" ]; then
+        [ -S "$proxy_enrollment_docker_socket" ] && [ ! -L "$proxy_enrollment_docker_socket" ] \
+            || fail 'managed proxy-enrollment runner requires a non-symlink Docker socket'
+    fi
     assert_non_symlink_regular_file "$source_env_file" CONTROL_PLANE_SOURCE_ENV_FILE
     [ "$(file_mode "$source_env_file")" = 600 ] \
         || fail 'CONTROL_PLANE_SOURCE_ENV_FILE must have mode 0600'
@@ -11279,6 +11804,21 @@ load_configuration()
             && [ "$(file_gid "$source_env_file")" = 0 ] \
             || fail 'production source environment must be owned by root:root'
     fi
+    if ! source_environment_app_port_value=$(source_environment_app_port "$source_env_file"); then
+        fail 'CONTROL_PLANE_SOURCE_ENV_FILE must contain at most one numeric APP_PORT value'
+    fi
+    if [ -n "$configured_app_port" ]; then
+        app_port=$configured_app_port
+    elif [ -n "$source_environment_app_port_value" ]; then
+        app_port=$source_environment_app_port_value
+    else
+        app_port=8000
+    fi
+    validate_port "$app_port" APP_PORT
+    derived_local_ingress_url=$(derive_local_ingress_url "$public_probe_url" "$app_port")
+    local_ingress_url=${configured_local_ingress_url:-$derived_local_ingress_url}
+    [ "$local_ingress_url" = "$derived_local_ingress_url" ] \
+        || fail 'CONTROL_PLANE_LOCAL_INGRESS_URL must exactly preserve the public proof path and query on the APP_PORT loopback endpoint'
     [ -d "$ssh_directory" ] && [ ! -L "$ssh_directory" ] \
         || fail 'CONTROL_PLANE_SSH_DIRECTORY must be a non-symlink directory'
     [ -d "$applications_directory" ] && [ ! -L "$applications_directory" ] \
@@ -11291,32 +11831,6 @@ load_configuration()
         || fail 'CONTROL_PLANE_BACKUPS_DIRECTORY must be a non-symlink directory'
     [ -z "${CONTROL_PLANE_RUNTIME_ENV_FILE:-}" ] \
         || fail 'CONTROL_PLANE_RUNTIME_ENV_FILE is operator-owned and must not be configured'
-    [ -z "${CONTROL_PLANE_PORT8000_PUBLIC_PROBE_URL:-}" ] \
-        || fail 'CONTROL_PLANE_PORT8000_PUBLIC_PROBE_URL is invalid because external :8000 must remain blocked'
-    assert_non_symlink_regular_file "$port8000_external_policy_probe" \
-        CONTROL_PLANE_PORT8000_EXTERNAL_POLICY_PROBE
-    [ -x "$port8000_external_policy_probe" ] \
-        || fail 'CONTROL_PLANE_PORT8000_EXTERNAL_POLICY_PROBE must be executable'
-    printf '%s' "$port8000_external_policy_probe_sha256" | grep -Eq '^[0-9a-f]{64}$' \
-        || fail 'CONTROL_PLANE_PORT8000_EXTERNAL_POLICY_PROBE_SHA256 is malformed'
-    [ "$(sha256_file "$port8000_external_policy_probe")" = "$port8000_external_policy_probe_sha256" ] \
-        || fail 'CONTROL_PLANE_PORT8000_EXTERNAL_POLICY_PROBE checksum changed'
-    assert_non_symlink_regular_file "$port8000_ipv6_inventory_file" \
-        CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE
-    printf '%s' "$port8000_ipv6_inventory_sha256" | grep -Eq '^[0-9a-f]{64}$' \
-        || fail 'CONTROL_PLANE_PORT8000_IPV6_INVENTORY_SHA256 is malformed'
-    [ "$(sha256_file "$port8000_ipv6_inventory_file")" = "$port8000_ipv6_inventory_sha256" ] \
-        && [ "$(file_mode "$port8000_ipv6_inventory_file")" = 600 ] \
-        || fail 'CONTROL_PLANE_PORT8000_IPV6_INVENTORY_FILE checksum or mode changed'
-    assert_non_symlink_regular_file "$port8000_ipv6_inventory_probe" \
-        CONTROL_PLANE_PORT8000_IPV6_INVENTORY_PROBE
-    [ -x "$port8000_ipv6_inventory_probe" ] \
-        || fail 'CONTROL_PLANE_PORT8000_IPV6_INVENTORY_PROBE must be executable'
-    printf '%s' "$port8000_ipv6_inventory_probe_sha256" | grep -Eq '^[0-9a-f]{64}$' \
-        || fail 'CONTROL_PLANE_PORT8000_IPV6_INVENTORY_PROBE_SHA256 is malformed'
-    [ "$(sha256_file "$port8000_ipv6_inventory_probe")" = "$port8000_ipv6_inventory_probe_sha256" ] \
-        && [ "$(file_mode "$port8000_ipv6_inventory_probe")" = 700 ] \
-        || fail 'CONTROL_PLANE_PORT8000_IPV6_INVENTORY_PROBE checksum or mode changed'
     assert_secret_file_metadata "$green_direct_probe_token_file" \
         CONTROL_PLANE_GREEN_WEB_A_DIRECT_PROBE_RUNTIME_FILE
     assert_secret_file_metadata "$green_applied_ack_file" \
@@ -11350,10 +11864,8 @@ load_configuration()
     done)
     [ "$(printf '%s\n' "$pool_secret_digest_inventory" | LC_ALL=C sort -u | wc -l | tr -d '[:space:]')" = 12 ] \
         || fail 'all member and pool authorization artifacts must have distinct bytes'
-    assert_non_symlink_regular_file "$https_controller" CONTROL_PLANE_HTTPS_CONTROLLER
-    assert_non_symlink_regular_file "$port8000_controller" CONTROL_PLANE_PORT8000_CONTROLLER
-    [ -x "$https_controller" ] || fail 'HTTPS ingress controller is not executable'
-    [ -x "$port8000_controller" ] || fail ':8000 ingress controller is not executable'
+    assert_non_symlink_regular_file "$ingress_controller" CONTROL_PLANE_INGRESS_CONTROLLER
+    [ -x "$ingress_controller" ] || fail 'Traefik ingress controller is not executable'
     assert_non_symlink_regular_file "$OPERATOR_PATH" 'executing control-plane operator'
     assert_non_symlink_regular_file "$operator_compose_file" CONTROL_PLANE_OPERATOR_COMPOSE_FILE
     assert_non_symlink_regular_file "$rehearsal_compose_file" CONTROL_PLANE_REHEARSAL_COMPOSE_FILE
@@ -11365,18 +11877,29 @@ load_configuration()
     [ -d "$traefik_dynamic_directory" ] || fail 'Traefik dynamic directory does not exist'
     green_applied_acknowledgement=$(cat "$green_applied_ack_file")
     green_web_b_applied_acknowledgement=$(cat "$green_web_b_applied_ack_file")
+    green_route_health_token=$(cat "$green_route_health_token_file")
     green_pool_acknowledgement=$(cat "$green_pool_ack_file")
     blue_applied_acknowledgement=$(cat "$blue_applied_ack_file")
     blue_web_b_applied_acknowledgement=$(cat "$blue_web_b_applied_ack_file")
+    blue_route_health_token=$(cat "$blue_route_health_token_file")
     blue_pool_acknowledgement=$(cat "$blue_pool_ack_file")
     validate_safe_token "$green_applied_acknowledgement" CONTROL_PLANE_GREEN_WEB_A_APPLIED_ACK_RUNTIME_FILE
     validate_safe_token "$green_web_b_applied_acknowledgement" CONTROL_PLANE_GREEN_WEB_B_APPLIED_ACK_RUNTIME_FILE
+    validate_safe_token "$green_route_health_token" CONTROL_PLANE_GREEN_ROUTE_HEALTH_RUNTIME_FILE
     validate_safe_token "$green_pool_acknowledgement" CONTROL_PLANE_GREEN_POOL_ACK_RUNTIME_FILE
     validate_safe_token "$blue_applied_acknowledgement" CONTROL_PLANE_BLUE_WEB_A_APPLIED_ACK_RUNTIME_FILE
     validate_safe_token "$blue_web_b_applied_acknowledgement" CONTROL_PLANE_BLUE_WEB_B_APPLIED_ACK_RUNTIME_FILE
+    validate_safe_token "$blue_route_health_token" CONTROL_PLANE_BLUE_ROUTE_HEALTH_RUNTIME_FILE
     validate_safe_token "$blue_pool_acknowledgement" CONTROL_PLANE_BLUE_POOL_ACK_RUNTIME_FILE
     if [ -n "$public_probe_host_header" ]; then
         validate_host "$public_probe_host_header" CONTROL_PLANE_PUBLIC_PROBE_HOST_HEADER
+    fi
+    if is_test_mode; then
+        validate_host "$expected_ipv4" CONTROL_PLANE_EXPECTED_PUBLIC_IPV4
+        printf '%s\n' "$expected_ipv4" | grep -Eq '^[0-9]+(\.[0-9]+){3}$' \
+            || fail 'CONTROL_PLANE_EXPECTED_PUBLIC_IPV4 must be an IPv4 address'
+    else
+        validate_globally_routable_ipv4 "$expected_ipv4" CONTROL_PLANE_EXPECTED_PUBLIC_IPV4
     fi
 
     if ! is_test_mode; then
@@ -11387,6 +11910,8 @@ load_configuration()
             && [ "$source_compose_prod" = /data/coolify/source/docker-compose.prod.yml ] \
             && [ "$source_compose_custom" = /data/coolify/source/docker-compose.custom.yml ] \
             && [ "$source_compose_postgres" = /data/coolify/source/docker-compose.postgres-upgrade.yml ] \
+            && [ "$proxy_enrollment_compose_override" = /data/coolify/source/docker-compose.control-plane-enrolled.yml ] \
+            && [ "$proxy_enrollment_docker_socket" = /var/run/docker.sock ] \
             && [ "$source_env_file" = /data/coolify/source/.env ] \
             || fail 'production source invocation must use the exact ordered /data/coolify/source compose files and .env'
         [ "$operator_compose_file" = "$SCRIPT_DIRECTORY/compose.yaml" ] \
@@ -11400,23 +11925,6 @@ load_configuration()
                 fail 'production public probe must use the configured HTTPS control-plane host without credentials'
                 ;;
         esac
-        case "$port8000_host_local_url" in
-            'http://127.0.0.1:8000/'*)
-                ;;
-            *)
-                fail 'production :8000 probe must use host-local 127.0.0.1:8000 without credentials'
-                ;;
-        esac
-        [ "$(file_uid "$port8000_external_policy_probe")" = 0 ] \
-            && [ "$(file_gid "$port8000_external_policy_probe")" = 0 ] \
-            && [ "$(file_mode "$port8000_external_policy_probe")" = 700 ] \
-            || fail 'production external :8000 policy probe must be root:root mode 0700'
-        [ "$(file_uid "$port8000_ipv6_inventory_file")" = 0 ] \
-            && [ "$(file_gid "$port8000_ipv6_inventory_file")" = 0 ] \
-            || fail 'production IPv6 inventory must be owned by root:root'
-        [ "$(file_uid "$port8000_ipv6_inventory_probe")" = 0 ] \
-            && [ "$(file_gid "$port8000_ipv6_inventory_probe")" = 0 ] \
-            || fail 'production IPv6 inventory probe must be owned by root:root'
         [ -z "${CONTROL_PLANE_TEST_CRASH_AT:-}" ] \
             && [ -z "${CONTROL_PLANE_TEST_INVALID_ROUTE:-}" ] \
             && [ -z "${CONTROL_PLANE_TEST_BLUE_STOP_FAILURE:-}" ] \
@@ -11438,8 +11946,6 @@ load_configuration()
     fi
 
     mkdir -p "$state_directory"
-    dynamic_route_file="$traefik_dynamic_directory/$dynamic_filename"
-    rollback_backup_file="$operation_directory/traefik-before.yaml"
     migration_artifact_directory="$operation_directory/live-expand-migration-artifact"
     migration_compatibility_artifact_file="$migration_artifact_directory/compatibility"
     migration_manifest_artifact_file="$migration_artifact_directory/manifest"
@@ -11482,7 +11988,6 @@ load_configuration()
     runtime_fence_base_config_file="$operation_directory/runtime-fence-base.env"
     runtime_fence_environment_file="$operation_directory/runtime-fence.env"
     runtime_fence_https_ack_file="$operation_directory/runtime-fence-https-ack"
-    runtime_fence_port8000_ack_file="$operation_directory/runtime-fence-port8000-ack"
     runtime_fence_provider_header_copy="$operation_directory/runtime-fence-provider-header"
     rehearsal_runtime_env_artifact_file="$operation_directory/rehearsal-runtime.env"
     rehearsal_compatibility_artifact_file="$operation_directory/rehearsal-compatibility"
@@ -11502,14 +12007,21 @@ preflight()
         load_state
     fi
     assert_backup_attestation
+    reconcile_proxy_enrollment_before_preflight
     assert_proxy_identity
     assert_proxy_dynamic_mount
-    ingress_controller_preflight https
-    ingress_controller_preflight port8000
     assert_container_running "$blue_container"
-    if [ -e "$state_file" ]; then
+    if [ ! -e "$state_file" ]; then
+        enroll_proxy_if_needed
+        assert_proxy_identity
+        assert_proxy_dynamic_mount
+        assert_container_running "$blue_container"
+    else
         assert_common_state_identity
         assert_blue_state
+    fi
+    ingress_controller_preflight ingress
+    if [ -e "$state_file" ]; then
         complete_forward_runtime_fence
         complete_green_preflight
         return
@@ -11645,12 +12157,6 @@ preflight()
     state_reverse_fence_https_ack_gid=none
     state_reverse_fence_https_ack_mode=none
     state_reverse_fence_https_ack_size=none
-    state_reverse_fence_port8000_ack_path=none
-    state_reverse_fence_port8000_ack_sha256=none
-    state_reverse_fence_port8000_ack_uid=none
-    state_reverse_fence_port8000_ack_gid=none
-    state_reverse_fence_port8000_ack_mode=none
-    state_reverse_fence_port8000_ack_size=none
     state_reverse_fence_provider_header_path=none
     state_reverse_fence_provider_header_sha256=none
     state_reverse_fence_provider_header_uid=none
@@ -11674,27 +12180,9 @@ preflight()
     state_blue_probe_token_gid=$(file_gid "$blue_direct_probe_token_file")
     state_blue_probe_token_mode=$(file_mode "$blue_direct_probe_token_file")
     state_blue_probe_token_size=$(file_size "$blue_direct_probe_token_file")
-    state_https_controller_sha256=$(sha256_file "$https_controller")
-    state_port8000_controller_sha256=$(sha256_file "$port8000_controller")
-    state_port8000_external_policy_probe_path=$port8000_external_policy_probe
-    state_port8000_external_policy_probe_sha256=$port8000_external_policy_probe_sha256
-    state_port8000_external_blocked_endpoint=$port8000_external_blocked_endpoint
-    state_port8000_ipv6_inventory_path=$port8000_ipv6_inventory_file
-    state_port8000_ipv6_inventory_last_sha256=$port8000_ipv6_inventory_sha256
-    state_port8000_ipv6_inventory_last_verified_unix=$(date -u +%s)
-    state_port8000_ipv6_inventory_probe_path=$port8000_ipv6_inventory_probe
-    state_port8000_ipv6_inventory_probe_sha256=$port8000_ipv6_inventory_probe_sha256
-    state_port8000_ipv6_inventory_probe_uid=$(file_uid "$port8000_ipv6_inventory_probe")
-    state_port8000_ipv6_inventory_probe_gid=$(file_gid "$port8000_ipv6_inventory_probe")
-    state_port8000_ipv6_inventory_probe_mode=$(file_mode "$port8000_ipv6_inventory_probe")
-    state_port8000_ipv6_inventory_probe_size=$(file_size "$port8000_ipv6_inventory_probe")
-    state_expected_public_ipv4=$expected_public_ipv4
-    state_rollback_backup_status=unprepared
-    state_rollback_backup_checksum=none
-    state_route_original_checksum=none
+    state_ingress_controller_sha256=$(sha256_file "$ingress_controller")
     state_route_target=legacy
     state_https_route_target=legacy
-    state_port8000_route_target=legacy
     state_drain_queue_sha256=none
     state_migration_status=not-applied
     state_migration_attempt=0
@@ -11817,12 +12305,10 @@ activate_color_web()
 
 recover_cutover_to_legacy()
 {
-    ingress_controller_restore port8000
-    ingress_controller_restore https
+    ingress_controller_restore ingress
     revoke_pool_web_markers_if_safe green
     state_route_target=legacy
     state_https_route_target=legacy
-    state_port8000_route_target=legacy
     state_phase=live-expand-migrations-applied
     write_state "$state_phase"
 }
@@ -11853,10 +12339,8 @@ cutover()
     runtime_fence_call verify
     direct_origin_probe "$green_container"
 
-    ingress_controller_preflight https
-    ingress_controller_preflight port8000
-    ingress_controller_prepare https
-    ingress_controller_prepare port8000
+    ingress_controller_preflight ingress
+    ingress_controller_prepare ingress
 
     if [ "$state_phase" = live-expand-migrations-applied ]; then
         activate_color_web "$green_container" "$green_state_volume" green "$green_web_epoch" web-a
@@ -11889,34 +12373,28 @@ cutover()
 
     if [ "$state_phase" = green-web-activated ]; then
         runtime_fence_call verify
-        if ! ingress_controller_switch https green "$green_container" "$backend_port" "$green_applied_ack_file"; then
+        if ! ingress_controller_switch ingress green "$green_container" "$backend_port" "$green_applied_ack_file"; then
             recover_cutover_to_legacy
+            preserve_proxy_enrollment_after_state_creation \
+                || fail 'failed green route switch also failed to retain native Traefik enrollment after legacy route recovery'
             fail 'green HTTPS route was not atomically switched and acknowledged'
         fi
-        state_https_route_target=green
-        state_phase=green-https-routed
-        write_state "$state_phase"
-        test_crash after-green-https-route
-    else
-        ingress_controller_assert https green "$green_container" "$backend_port" "$green_applied_ack_file"
-    fi
-
-    if [ "$state_phase" = green-https-routed ]; then
-        runtime_fence_call verify
-        if ! ingress_controller_switch port8000 green 127.0.0.1 "$green_loopback_port" "$green_applied_ack_file"; then
+        if ! finalize_proxy_enrollment_if_owned; then
             recover_cutover_to_legacy
-            fail 'green :8000 route was not atomically switched and acknowledged'
+            preserve_proxy_enrollment_after_state_creation \
+                || fail 'failed enrollment finalization also failed to preserve native Traefik ownership after legacy route recovery'
+            fail 'green native Traefik route was acknowledged but one-time enrollment finalization failed'
         fi
-        state_port8000_route_target=green
+        state_https_route_target=green
         state_route_target=green
         state_phase=green-routed
         write_state "$state_phase"
-        test_crash after-green-port8000-route
+        test_crash after-green-ingress-route
     else
-        ingress_controller_assert port8000 green 127.0.0.1 "$green_loopback_port" "$green_applied_ack_file"
+        ingress_controller_assert ingress green "$green_container" "$backend_port" "$green_applied_ack_file"
     fi
 
-    note "green-routed-both-ingresses operation=$operation_id green=$green_container"
+    note "green-routed-native-traefik operation=$operation_id green=$green_container"
 }
 
 rollback_before_green_promotion()
@@ -11933,10 +12411,9 @@ rollback_before_green_promotion()
     resume_legacy_blue_background
     ingress_controller_adopt_rollback_owner
     ingress_controller_legacy_restore_status \
-        || fail 'legacy rollback crossed the irreversible :8000 ownership boundary; keep green routed and run promote'
+        || fail 'legacy rollback crossed the irreversible Traefik ownership boundary; keep green routed and run promote'
 
-    ingress_controller_restore port8000
-    ingress_controller_restore https
+    ingress_controller_restore ingress
 
     revoke_pool_web_markers_if_safe green
     docker_container_presence "$green_container"
@@ -11963,7 +12440,6 @@ rollback_before_green_promotion()
 
     state_route_target=legacy
     state_https_route_target=legacy
-    state_port8000_route_target=legacy
     if [ "$state_blue_rollback_replacement_id" != none ]; then
         [ "$state_blue_id" = "$state_blue_rollback_replacement_id" ] \
             || fail 'rollback replacement blue lineage does not match the active incumbent'
@@ -12159,27 +12635,21 @@ rollback_reverse_failback_before_release()
     state_phase=reverse-rollback-routing-green
     write_state "$state_phase"
     case "$reverse_rollback_from_phase" in
-        failback-blue-https-routing|failback-blue-https-routed|\
-        failback-blue-port8000-routing|blue-failback-routed|\
+        failback-blue-https-routing|failback-blue-https-routed|blue-failback-routed|\
         failback-green-*|failback-blue-final-*|reverse-rollback-routing-green)
-            ingress_controller_restore_reverse_generation port8000 127.0.0.1 \
-                "$green_loopback_port" "$green_applied_ack_file"
-            ingress_controller_restore_reverse_generation https "$green_container" \
+            ingress_controller_restore_reverse_generation ingress "$green_container" \
                 "$backend_port" "$green_applied_ack_file"
             ;;
         reverse-rollback-green-routed)
             ;;
         *)
             [ "$state_https_route_target" = green ] \
-                && [ "$state_port8000_route_target" = green ] \
                 || fail 'reverse rollback found changed ingress before controller preparation'
             ;;
     esac
-    ingress_controller_assert https green "$green_container" "$backend_port" "$green_applied_ack_file"
-    ingress_controller_assert port8000 green 127.0.0.1 "$green_loopback_port" "$green_applied_ack_file"
+    ingress_controller_assert ingress green "$green_container" "$backend_port" "$green_applied_ack_file"
     state_route_target=green
     state_https_route_target=green
-    state_port8000_route_target=green
     state_phase=reverse-rollback-green-routed
     write_state "$state_phase"
 
@@ -12268,7 +12738,7 @@ abort_failback()
         forward-candidate-cleanup-intent)
             complete_forward_candidate_cleanup
             ;;
-        reverse-fence-artifacts-preparing|reverse-fence-prepare-intent|reverse-fence-prepared|reverse-fence-captured|reverse-fence-armed|reverse-fence-active|failback-blue-starting|failback-blue-started-unproven|failback-blue-started|failback-blue-web-activating|failback-blue-web-activated|failback-blue-https-routing|failback-blue-https-routed|failback-blue-port8000-routing|blue-failback-routed|failback-green-scheduler-stopping|failback-green-scheduler-stopped|failback-green-horizon-pausing|failback-green-horizon-paused|failback-green-drain-inventory-recording|failback-green-drain-inventory-recorded|failback-green-background-drain-first|failback-green-background-zero-first|failback-green-background-zero-proven|failback-green-horizon-stopping|failback-green-horizon-stopped|failback-green-nightwatch-stopping|failback-green-nightwatch-stopped|failback-green-http-drain-first|failback-green-http-zero-first|failback-green-drained|failback-blue-final-ingress-verifying|failback-blue-final-ingress-acknowledged|reverse-rollback-routing-green|reverse-rollback-green-routed)
+        reverse-fence-artifacts-preparing|reverse-fence-prepare-intent|reverse-fence-prepared|reverse-fence-captured|reverse-fence-armed|reverse-fence-active|failback-blue-starting|failback-blue-started-unproven|failback-blue-started|failback-blue-web-activating|failback-blue-web-activated|failback-blue-https-routing|failback-blue-https-routed|blue-failback-routed|failback-green-scheduler-stopping|failback-green-scheduler-stopped|failback-green-horizon-pausing|failback-green-horizon-paused|failback-green-drain-inventory-recording|failback-green-drain-inventory-recorded|failback-green-background-drain-first|failback-green-background-zero-first|failback-green-background-zero-proven|failback-green-horizon-stopping|failback-green-horizon-stopped|failback-green-nightwatch-stopping|failback-green-nightwatch-stopped|failback-green-http-drain-first|failback-green-http-zero-first|failback-green-drained|failback-blue-final-ingress-verifying|failback-blue-final-ingress-acknowledged|reverse-rollback-routing-green|reverse-rollback-green-routed)
             rollback_reverse_failback_before_release
             ;;
         failback-green-revoking)
@@ -12303,8 +12773,7 @@ controlled_failback_to_blue()
             assert_green_state
             assert_pool_web_markers green matching
             assert_pool_writer_authority green matching
-            ingress_controller_assert https green "$green_container" "$backend_port" "$green_applied_ack_file"
-            ingress_controller_assert port8000 green 127.0.0.1 "$green_loopback_port" "$green_applied_ack_file"
+            ingress_controller_assert ingress green "$green_container" "$backend_port" "$green_applied_ack_file"
             assert_container_absent "$blue_container"
             assert_container_absent "$replacement_blue_container"
             assert_container_absent "$replacement_blue_web_b_container"
@@ -12318,8 +12787,7 @@ controlled_failback_to_blue()
             assert_green_state
             assert_pool_web_markers green matching
             assert_pool_writer_authority green matching
-            ingress_controller_assert https green "$green_container" "$backend_port" "$green_applied_ack_file"
-            ingress_controller_assert port8000 green 127.0.0.1 "$green_loopback_port" "$green_applied_ack_file"
+            ingress_controller_assert ingress green "$green_container" "$backend_port" "$green_applied_ack_file"
             assert_container_absent "$blue_container"
             assert_container_absent "$replacement_blue_container"
             assert_container_absent "$replacement_blue_web_b_container"
@@ -12413,10 +12881,8 @@ controlled_failback_to_blue()
             reverse_runtime_fence_call verify
             direct_origin_probe "$replacement_blue_container"
             direct_origin_probe "$replacement_blue_web_b_container"
-            ingress_controller_prepare_managed https blue "$replacement_blue_container" \
+            ingress_controller_prepare_managed ingress blue "$replacement_blue_container" \
                 "$backend_port" "$blue_applied_ack_file"
-            ingress_controller_prepare_managed port8000 blue 127.0.0.1 \
-                "$blue_loopback_port" "$blue_applied_ack_file"
             state_phase=failback-blue-web-activating
             write_state "$state_phase"
             activate_color_web "$replacement_blue_container" "$blue_state_volume" blue \
@@ -12451,31 +12917,15 @@ controlled_failback_to_blue()
             state_phase=failback-blue-https-routing
             write_state "$state_phase"
             reverse_runtime_fence_call verify
-            if ! ingress_controller_switch https blue "$replacement_blue_container" "$backend_port" "$blue_applied_ack_file"; then
+            if ! ingress_controller_switch ingress blue "$replacement_blue_container" "$backend_port" "$blue_applied_ack_file"; then
                 rollback_reverse_failback_before_release
                 fail 'replacement blue HTTPS route was not acknowledged; green remained public'
             fi
             state_https_route_target=blue
-            state_phase=failback-blue-https-routed
-            write_state "$state_phase"
-            test_crash after-failback-blue-https-route
-            ;;
-    esac
-
-    case "$state_phase" in
-        failback-blue-https-routed|failback-blue-port8000-routing)
-            state_phase=failback-blue-port8000-routing
-            write_state "$state_phase"
-            reverse_runtime_fence_call verify
-            if ! ingress_controller_switch port8000 blue 127.0.0.1 "$blue_loopback_port" "$blue_applied_ack_file"; then
-                rollback_reverse_failback_before_release
-                fail 'replacement blue :8000 route was not acknowledged; green remained public'
-            fi
-            state_port8000_route_target=blue
             state_route_target=blue
             state_phase=blue-failback-routed
             write_state "$state_phase"
-            test_crash after-failback-blue-port8000-route
+            test_crash after-failback-blue-ingress-route
             ;;
     esac
 
@@ -12484,8 +12934,7 @@ controlled_failback_to_blue()
             assert_green_state
             reconcile_replacement_blue_state
             reverse_runtime_fence_call verify
-            ingress_controller_assert https blue "$replacement_blue_container" "$backend_port" "$blue_applied_ack_file"
-            ingress_controller_assert port8000 blue 127.0.0.1 "$blue_loopback_port" "$blue_applied_ack_file"
+            ingress_controller_assert ingress blue "$replacement_blue_container" "$backend_port" "$blue_applied_ack_file"
             select_pool_writer_context green
             drain_color "$writer_container" failback-green blue-failback-routed
             [ "$state_phase" != failback-green-drained ] || assert_pool_http_drained green
@@ -12500,10 +12949,9 @@ controlled_failback_to_blue()
             reconcile_replacement_blue_state
             assert_green_state
             reverse_runtime_fence_call verify
-            ingress_controller_verify_ack https blue "$replacement_blue_container" "$backend_port" "$blue_applied_ack_file"
+            ingress_controller_verify_ack ingress blue "$replacement_blue_container" "$backend_port" "$blue_applied_ack_file"
             reconcile_replacement_blue_state
             assert_green_state
-            ingress_controller_verify_ack port8000 blue 127.0.0.1 "$blue_loopback_port" "$blue_applied_ack_file"
             assert_replacement_blue_state
             assert_green_state
             reverse_runtime_fence_call verify
@@ -13134,7 +13582,7 @@ assert_recovery_abort_reversible_phase()
     case "$recovery_phase" in
         fence-captured|fence-armed|fence-active|green-starting|green-started-unproven|green-started|preflight-ready|live-expand-migrations-planned|live-expand-migrations-quiescing|live-expand-migrations-scheduler-stopped|live-expand-migrations-schedule-idle|live-expand-migrations-horizon-paused|live-expand-migrations-drain-inventory-recorded|live-expand-migrations-quiesced|live-expand-migrations-running|live-expand-migrations-resuming|live-expand-migrations-resumed|live-expand-migrations-failed|live-expand-migrations-blocked|live-expand-migrations-applied|green-web-activated|green-https-routed|green-routed|blue-scheduler-stopping|blue-scheduler-stopped|blue-horizon-pausing|blue-horizon-paused|blue-drain-inventory-recording|blue-drain-inventory-recorded|blue-background-drain-first|blue-background-zero-first|blue-background-zero-proven|blue-horizon-stopping|blue-horizon-stopped|blue-nightwatch-stopping|blue-nightwatch-stopped|blue-http-drain-first|blue-http-zero-first|blue-drained|green-final-ingress-verifying|green-final-ingress-acknowledged|blue-revoking)
             ;;
-        blue-revoked|green-port8000-permanent-reconciling|green-port8000-permanent-acknowledged|proxy-mutation-freeze-activating|proxy-mutation-freeze-active|fence-release-intent)
+        blue-revoked|proxy-mutation-freeze-activating|proxy-mutation-freeze-active|fence-release-intent)
             fail "recovery-abort cannot restore legacy ingress from phase: $recovery_phase; use recover-forward"
             ;;
         *)
@@ -13147,7 +13595,29 @@ recover_abort()
 {
     acquire_lock
     load_state
-    assert_source_identity
+    if [ "$state_phase" = recovery-aborted ]; then
+        proxy_enrollment_status >/dev/null \
+            && [ "$proxy_enrollment_phase" = enrolled ] \
+            || fail 'recovery-aborted operation lost its retained native Traefik enrollment state'
+        assert_proxy_enrollment_active
+        note "recovery-already-aborted operation=$operation_id"
+        return
+    fi
+    proxy_enrollment_status >/dev/null \
+        || fail 'recovery-abort lost exact token-owned proxy-enrollment state'
+    case "$proxy_enrollment_phase" in
+        activated|enrolled)
+            assert_proxy_enrollment_active
+            assert_source_identity
+            ;;
+        rolling-back|rollback-pending-legacy|rollback-required|intervention-required)
+            fail 'recovery-abort found an unsafe destructive native Traefik rollback phase; preserve the managed listener instead'
+            ;;
+        rolled-back)
+            fail 'recovery-abort found a revoked native Traefik enrollment; direct APP_PORT legacy recreation is forbidden'
+            ;;
+        *) fail 'recovery-abort found an unsafe proxy-enrollment phase' ;;
+    esac
     reconcile_recovery_migration_runner
 
     docker_container_presence "$blue_container"
@@ -13178,11 +13648,8 @@ recover_abort()
     resume_legacy_blue_background
     ingress_controller_adopt_rollback_owner
     ingress_controller_legacy_restore_status
-    if [ -f "$operation_directory/ingress-port8000/state" ]; then
-        ingress_controller_restore port8000
-    fi
-    if [ -f "$operation_directory/ingress-https/state" ]; then
-        ingress_controller_restore https
+    if [ -f "$operation_directory/ingress-ingress/state" ]; then
+        ingress_controller_restore ingress
     fi
 
     adopt_green_cleanup_member_identity_if_required web-a
@@ -13216,8 +13683,10 @@ recover_abort()
     fi
     state_route_target=legacy
     state_https_route_target=legacy
-    state_port8000_route_target=legacy
     runtime_fence_call recover-abort
+    preserve_proxy_enrollment_after_state_creation \
+        || fail 'recovery-abort could not retain and finalize native Traefik enrollment after restoring the legacy dynamic route'
+    test_crash after-recovery-abort-proxy-enrollment-preserve
     state_phase=recovery-aborted
     write_state "$state_phase"
     note "recovery-aborted operation=$operation_id from=$state_recovery_abort_from_phase generation=1"
@@ -13232,7 +13701,7 @@ recover_forward()
     reconcile_recovery_migration_runner
 
     case "$state_phase" in
-        blue-revoking|blue-revoked|green-port8000-permanent-reconciling|green-port8000-permanent-acknowledged|proxy-mutation-freeze-activating|proxy-mutation-freeze-active|fence-release-intent|fence-released|green-writer-promoting|green-writer-promoted-freeze-active|green-promoted-finalizing|green-writer-promoted)
+        blue-revoking|blue-revoked|proxy-mutation-freeze-activating|proxy-mutation-freeze-active|fence-release-intent|fence-released|green-writer-promoting|green-writer-promoted-freeze-active|green-promoted-finalizing|green-writer-promoted)
             promote_green
             ;;
         *)
@@ -13263,7 +13732,28 @@ rollback()
 {
     acquire_lock
     load_state
-    assert_common_state_identity
+    if [ "$state_phase" = rolled-back ]; then
+        proxy_enrollment_status >/dev/null \
+            && [ "$proxy_enrollment_phase" = enrolled ] \
+            || fail 'rolled-back operation lost its retained native Traefik enrollment state'
+        assert_proxy_enrollment_active
+        note "operation-already-rolled-back operation=$operation_id"
+        return
+    fi
+    proxy_enrollment_status >/dev/null \
+        || fail 'rollback lost exact token-owned proxy-enrollment state'
+    case "$proxy_enrollment_phase" in
+        activated|enrolled)
+            assert_proxy_enrollment_active
+            ;;
+        rolling-back|rollback-pending-legacy|rollback-required|intervention-required)
+            fail 'rollback found an unsafe destructive native Traefik rollback phase; preserve the managed listener instead'
+            ;;
+        rolled-back)
+            fail 'rollback found a revoked native Traefik enrollment; direct APP_PORT legacy recreation is forbidden'
+            ;;
+        *) fail 'rollback found an unsafe proxy-enrollment phase' ;;
+    esac
     case "$state_phase" in
         forward-candidate-cleanup-intent|fence-abort-intent|reverse-fence-abort-intent) ;;
         *) reconcile_routed_candidate ;;
@@ -13311,7 +13801,7 @@ rollback()
             note "rolled-back-before-route-switch operation=$operation_id"
             ;;
         live-expand-migrations-applied)
-            if [ -f "$operation_directory/ingress-https/state" ] \
+            if [ -f "$operation_directory/ingress-ingress/state" ] \
                 || [ "$(marker_status "$green_state_volume" "$green_web_epoch" web-epoch)" = matching ]; then
                 rollback_before_green_promotion
             else
@@ -13334,10 +13824,10 @@ rollback()
                 rollback_before_green_promotion
             fi
             ;;
-        blue-revoked|green-port8000-permanent-reconciling|green-port8000-permanent-acknowledged|proxy-mutation-freeze-activating|proxy-mutation-freeze-active|fence-release-intent|fence-released|green-writer-promoting|green-writer-promoted-freeze-active|green-promoted-finalizing)
+        blue-revoked|proxy-mutation-freeze-activating|proxy-mutation-freeze-active|fence-release-intent|fence-released|green-writer-promoting|green-writer-promoted-freeze-active|green-promoted-finalizing)
             fail 'legacy blue is irrevocably removed; use recover-forward before failback'
             ;;
-        green-writer-promoted|reverse-fence-artifacts-preparing|reverse-fence-prepare-intent|reverse-fence-prepared|reverse-fence-captured|reverse-fence-armed|reverse-fence-active|failback-blue-starting|failback-blue-started-unproven|failback-blue-started|failback-blue-web-activating|failback-blue-web-activated|failback-blue-https-routing|failback-blue-https-routed|failback-blue-port8000-routing|blue-failback-routed|failback-green-scheduler-stopping|failback-green-scheduler-stopped|failback-green-horizon-pausing|failback-green-horizon-paused|failback-green-drain-inventory-recording|failback-green-drain-inventory-recorded|failback-green-background-drain-first|failback-green-background-zero-first|failback-green-background-zero-proven|failback-green-horizon-stopping|failback-green-horizon-stopped|failback-green-nightwatch-stopping|failback-green-nightwatch-stopped|failback-green-http-drain-first|failback-green-http-zero-first|failback-green-drained|failback-blue-final-ingress-verifying|failback-blue-final-ingress-acknowledged)
+        green-writer-promoted|reverse-fence-artifacts-preparing|reverse-fence-prepare-intent|reverse-fence-prepared|reverse-fence-captured|reverse-fence-armed|reverse-fence-active|failback-blue-starting|failback-blue-started-unproven|failback-blue-started|failback-blue-web-activating|failback-blue-web-activated|failback-blue-https-routing|failback-blue-https-routed|blue-failback-routed|failback-green-scheduler-stopping|failback-green-scheduler-stopped|failback-green-horizon-pausing|failback-green-horizon-paused|failback-green-drain-inventory-recording|failback-green-drain-inventory-recorded|failback-green-background-drain-first|failback-green-background-zero-first|failback-green-background-zero-proven|failback-green-horizon-stopping|failback-green-horizon-stopped|failback-green-nightwatch-stopping|failback-green-nightwatch-stopped|failback-green-http-drain-first|failback-green-http-zero-first|failback-green-drained|failback-blue-final-ingress-verifying|failback-blue-final-ingress-acknowledged)
             controlled_failback_to_blue
             ;;
         failback-green-revoking)
@@ -13355,7 +13845,7 @@ rollback()
             controlled_failback_to_blue
             ;;
         rolled-back)
-            fail 'operation is already rolled back'
+            note "operation-already-rolled-back operation=$operation_id"
             ;;
         *)
             fail "unknown operation phase: $state_phase"
@@ -13370,7 +13860,7 @@ promote_green()
         green-routed|blue-scheduler-stopping|blue-scheduler-stopped|blue-horizon-pausing|blue-horizon-paused|blue-drain-inventory-recording|blue-drain-inventory-recorded|blue-background-drain-first|blue-background-zero-first|blue-background-zero-proven|blue-horizon-stopping|blue-horizon-stopped|blue-nightwatch-stopping|blue-nightwatch-stopped|blue-http-drain-first|blue-http-zero-first|blue-drained|green-final-ingress-verifying|green-final-ingress-acknowledged|blue-revoking)
             runtime_fence_call verify
             ;;
-        blue-revoked|green-port8000-permanent-reconciling|green-port8000-permanent-acknowledged|proxy-mutation-freeze-activating|proxy-mutation-freeze-active)
+        blue-revoked|proxy-mutation-freeze-activating|proxy-mutation-freeze-active)
             runtime_fence_call verify-post-revoke
             ;;
     esac
@@ -13378,14 +13868,10 @@ promote_green()
     case "$state_phase" in
         green-routed|blue-scheduler-stopping|blue-scheduler-stopped|blue-horizon-pausing|blue-horizon-paused|blue-drain-inventory-recording|blue-drain-inventory-recorded|blue-background-drain-first|blue-background-zero-first|blue-background-zero-proven|blue-horizon-stopping|blue-horizon-stopped|blue-nightwatch-stopping|blue-nightwatch-stopped|blue-http-drain-first|blue-http-zero-first|blue-drained|green-final-ingress-verifying|green-final-ingress-acknowledged|blue-revoking)
             assert_blue_state
-            ingress_controller_verify_ack https green "$green_container" "$backend_port" "$green_applied_ack_file"
-            assert_green_state
-            assert_blue_state
-            ingress_controller_verify_ack port8000 green 127.0.0.1 "$green_loopback_port" "$green_applied_ack_file"
+            ingress_controller_verify_ack ingress green "$green_container" "$backend_port" "$green_applied_ack_file"
             ;;
         green-writer-promoted)
-            ingress_controller_assert https green "$green_container" "$backend_port" "$green_applied_ack_file"
-            ingress_controller_assert port8000 green 127.0.0.1 "$green_loopback_port" "$green_applied_ack_file"
+            ingress_controller_assert ingress green "$green_container" "$backend_port" "$green_applied_ack_file"
             ;;
     esac
     [ "$(marker_status "$green_state_volume" "$green_web_epoch" web-epoch)" = matching ] \
@@ -13406,10 +13892,7 @@ promote_green()
             assert_common_state_identity
             assert_green_state
             assert_blue_state
-            ingress_controller_verify_ack https green "$green_container" "$backend_port" "$green_applied_ack_file"
-            assert_green_state
-            assert_blue_state
-            ingress_controller_verify_ack port8000 green 127.0.0.1 "$green_loopback_port" "$green_applied_ack_file"
+            ingress_controller_verify_ack ingress green "$green_container" "$backend_port" "$green_applied_ack_file"
             assert_green_state
             assert_blue_state
             state_phase=green-final-ingress-acknowledged
@@ -13431,16 +13914,8 @@ promote_green()
     esac
 
     case "$state_phase" in
-        blue-revoked|green-port8000-permanent-reconciling|green-port8000-permanent-acknowledged)
+        blue-revoked)
             runtime_fence_call verify-post-revoke
-            state_phase=green-port8000-permanent-reconciling
-            write_state "$state_phase"
-            assert_common_state_identity
-            assert_green_state
-            ingress_controller_assert port8000 green 127.0.0.1 "$green_loopback_port" "$green_applied_ack_file"
-            state_phase=green-port8000-permanent-acknowledged
-            write_state "$state_phase"
-            test_crash after-green-port8000-permanent-ack
             state_phase=proxy-mutation-freeze-activating
             write_state "$state_phase"
             ;;
@@ -13527,10 +14002,10 @@ promote()
     reconcile_routed_candidate
 
     case "$state_phase" in
-        green-routed|blue-scheduler-stopping|blue-scheduler-stopped|blue-horizon-pausing|blue-horizon-paused|blue-drain-inventory-recording|blue-drain-inventory-recorded|blue-background-drain-first|blue-background-zero-first|blue-background-zero-proven|blue-horizon-stopping|blue-horizon-stopped|blue-nightwatch-stopping|blue-nightwatch-stopped|blue-http-drain-first|blue-http-zero-first|blue-drained|green-final-ingress-verifying|green-final-ingress-acknowledged|blue-revoking|blue-revoked|green-port8000-permanent-reconciling|green-port8000-permanent-acknowledged|proxy-mutation-freeze-activating|proxy-mutation-freeze-active|fence-release-intent|fence-released|green-writer-promoting|green-writer-promoted-freeze-active|green-promoted-finalizing|green-writer-promoted)
+        green-routed|blue-scheduler-stopping|blue-scheduler-stopped|blue-horizon-pausing|blue-horizon-paused|blue-drain-inventory-recording|blue-drain-inventory-recorded|blue-background-drain-first|blue-background-zero-first|blue-background-zero-proven|blue-horizon-stopping|blue-horizon-stopped|blue-nightwatch-stopping|blue-nightwatch-stopped|blue-http-drain-first|blue-http-zero-first|blue-drained|green-final-ingress-verifying|green-final-ingress-acknowledged|blue-revoking|blue-revoked|proxy-mutation-freeze-activating|proxy-mutation-freeze-active|fence-release-intent|fence-released|green-writer-promoting|green-writer-promoted-freeze-active|green-promoted-finalizing|green-writer-promoted)
             promote_green
             ;;
-        reverse-fence-artifacts-preparing|reverse-fence-prepare-intent|reverse-fence-prepared|reverse-fence-captured|reverse-fence-armed|reverse-fence-active|failback-blue-starting|failback-blue-started-unproven|failback-blue-started|failback-blue-web-activating|failback-blue-web-activated|failback-blue-https-routing|failback-blue-https-routed|failback-blue-port8000-routing|blue-failback-routed|failback-green-scheduler-stopping|failback-green-scheduler-stopped|failback-green-horizon-pausing|failback-green-horizon-paused|failback-green-drain-inventory-recording|failback-green-drain-inventory-recorded|failback-green-background-drain-first|failback-green-background-zero-first|failback-green-background-zero-proven|failback-green-horizon-stopping|failback-green-horizon-stopped|failback-green-nightwatch-stopping|failback-green-nightwatch-stopped|failback-green-http-drain-first|failback-green-http-zero-first|failback-green-drained|failback-blue-final-ingress-verifying|failback-blue-final-ingress-acknowledged|failback-green-revoking|failback-green-revoked|reverse-proxy-mutation-freeze-activating|reverse-proxy-mutation-freeze-active|reverse-fence-release-intent|reverse-fence-released|blue-writer-promoting|blue-writer-promoted-freeze-active|blue-promoted-finalizing|blue-writer-promoted)
+        reverse-fence-artifacts-preparing|reverse-fence-prepare-intent|reverse-fence-prepared|reverse-fence-captured|reverse-fence-armed|reverse-fence-active|failback-blue-starting|failback-blue-started-unproven|failback-blue-started|failback-blue-web-activating|failback-blue-web-activated|failback-blue-https-routing|failback-blue-https-routed|blue-failback-routed|failback-green-scheduler-stopping|failback-green-scheduler-stopped|failback-green-horizon-pausing|failback-green-horizon-paused|failback-green-drain-inventory-recording|failback-green-drain-inventory-recorded|failback-green-background-drain-first|failback-green-background-zero-first|failback-green-background-zero-proven|failback-green-horizon-stopping|failback-green-horizon-stopped|failback-green-nightwatch-stopping|failback-green-nightwatch-stopped|failback-green-http-drain-first|failback-green-http-zero-first|failback-green-drained|failback-blue-final-ingress-verifying|failback-blue-final-ingress-acknowledged|failback-green-revoking|failback-green-revoked|reverse-proxy-mutation-freeze-activating|reverse-proxy-mutation-freeze-active|reverse-fence-release-intent|reverse-fence-released|blue-writer-promoting|blue-writer-promoted-freeze-active|blue-promoted-finalizing|blue-writer-promoted)
             controlled_failback_to_blue
             ;;
         *)
@@ -13681,27 +14156,37 @@ backup_quiesce_dispatch()
     require_command tr
     configure_and_verify_release_inventory
     backup_quiesce_controller=$release_backup_quiesce_controller
+    backup_quiesce_controller_sha256=$(sha256_file "$backup_quiesce_controller")
+    backup_quiesce_service_unit_sha256=$(sha256_file "$release_backup_quiesce_service_unit")
+    backup_quiesce_timer_unit_sha256=$(sha256_file "$release_backup_quiesce_timer_unit")
     assert_non_symlink_regular_file "$backup_quiesce_controller" 'backup quiesce controller'
+    assert_non_symlink_regular_file "$release_backup_quiesce_service_unit" \
+        'release backup quiesce watchdog service unit'
+    assert_non_symlink_regular_file "$release_backup_quiesce_timer_unit" \
+        'release backup quiesce watchdog timer unit'
     assert_non_symlink_regular_file "$backup_quiesce_service_unit" 'backup quiesce watchdog service unit'
     assert_non_symlink_regular_file "$backup_quiesce_timer_unit" 'backup quiesce watchdog timer unit'
-    [ "$(sha256_file "$backup_quiesce_controller")" = "$BACKUP_QUIESCE_CONTROLLER_SHA256" ] \
-        && [ "$(sha256_file "$backup_quiesce_service_unit")" = "$BACKUP_QUIESCE_SERVICE_UNIT_SHA256" ] \
-        && [ "$(sha256_file "$backup_quiesce_timer_unit")" = "$BACKUP_QUIESCE_TIMER_UNIT_SHA256" ] \
+    [ "$(sha256_file "$backup_quiesce_service_unit")" = "$backup_quiesce_service_unit_sha256" ] \
+        && [ "$(sha256_file "$backup_quiesce_timer_unit")" = "$backup_quiesce_timer_unit_sha256" ] \
         || fail 'backup quiesce controller or permanent watchdog unit differs from reviewed bytes'
-    backup_quiesce_operator=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)/$(basename -- "$0")
     if [ "$backup_quiesce_test_mode" = 0 ]; then
-        [ "$backup_quiesce_operator" = /usr/local/sbin/control-plane-blue-green ] \
-            || fail 'production backup quiesce requires the immutable installed operator path'
+        backup_quiesce_operator=/usr/local/sbin/control-plane-blue-green
+    else
+        backup_quiesce_operator=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)/$(basename -- "$0")
     fi
+    assert_non_symlink_regular_file "$backup_quiesce_operator" \
+        'backup quiesce installed dispatcher'
     CONTROL_PLANE_BACKUP_QUIESCE_OPERATOR_PATH=$backup_quiesce_operator
     CONTROL_PLANE_BACKUP_QUIESCE_OPERATOR_SHA256=$(sha256_file "$backup_quiesce_operator")
-    CONTROL_PLANE_BACKUP_QUIESCE_CONTROLLER_SHA256=$BACKUP_QUIESCE_CONTROLLER_SHA256
+    CONTROL_PLANE_BACKUP_QUIESCE_CONTROLLER_PATH=$backup_quiesce_controller
+    CONTROL_PLANE_BACKUP_QUIESCE_CONTROLLER_SHA256=$backup_quiesce_controller_sha256
     CONTROL_PLANE_BACKUP_QUIESCE_SERVICE_UNIT_PATH=$backup_quiesce_service_unit
-    CONTROL_PLANE_BACKUP_QUIESCE_SERVICE_UNIT_SHA256=$BACKUP_QUIESCE_SERVICE_UNIT_SHA256
+    CONTROL_PLANE_BACKUP_QUIESCE_SERVICE_UNIT_SHA256=$backup_quiesce_service_unit_sha256
     CONTROL_PLANE_BACKUP_QUIESCE_TIMER_UNIT_PATH=$backup_quiesce_timer_unit
-    CONTROL_PLANE_BACKUP_QUIESCE_TIMER_UNIT_SHA256=$BACKUP_QUIESCE_TIMER_UNIT_SHA256
+    CONTROL_PLANE_BACKUP_QUIESCE_TIMER_UNIT_SHA256=$backup_quiesce_timer_unit_sha256
     export CONTROL_PLANE_BACKUP_QUIESCE_OPERATOR_PATH
     export CONTROL_PLANE_BACKUP_QUIESCE_OPERATOR_SHA256
+    export CONTROL_PLANE_BACKUP_QUIESCE_CONTROLLER_PATH
     export CONTROL_PLANE_BACKUP_QUIESCE_CONTROLLER_SHA256
     export CONTROL_PLANE_BACKUP_QUIESCE_SERVICE_UNIT_PATH
     export CONTROL_PLANE_BACKUP_QUIESCE_SERVICE_UNIT_SHA256
@@ -13736,6 +14221,7 @@ main()
     require_command curl
     require_command cp
     require_command date
+    require_command dd
     require_command docker
     require_command grep
     require_command hostname

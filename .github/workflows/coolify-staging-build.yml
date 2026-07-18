@@ -32,6 +32,31 @@ jobs:
           set -eu
           [ "$REPOSITORY" = 'coollabsio/coolify' ]
 
+  resolve-staging-alias:
+    name: Resolve stable staging branch alias
+    needs: authorize
+    permissions: {}
+    runs-on: ubuntu-24.04
+    outputs:
+      staging_alias: ${{ steps.alias.outputs.staging_alias }}
+    steps:
+      - id: alias
+        name: Sanitize branch name for OCI tag
+        shell: bash
+        env:
+          BRANCH_NAME: ${{ github.ref_name }}
+        run: |
+          set -eu
+          branch_alias="$(printf '%s' "$BRANCH_NAME" | tr '/' '-')"
+          branch_hash="$(printf '%s' "$BRANCH_NAME" | sha256sum | awk '{print $1}')"
+          max_alias_prefix_length=$((128 - 1 - ${#branch_hash}))
+          staging_alias="${branch_alias:0:max_alias_prefix_length}-${branch_hash}"
+          if ! printf '%s' "$staging_alias" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'; then
+            printf 'Branch cannot form an OCI staging tag: %s\n' "$BRANCH_NAME" >&2
+            exit 1
+          fi
+          printf 'staging_alias=%s\n' "$staging_alias" >> "$GITHUB_OUTPUT"
+
   application-validation:
     name: Validate application before image publication
     needs: authorize
@@ -41,8 +66,11 @@ jobs:
 
   publish:
     name: Build and publish staging Linux image
-    needs: application-validation
+    needs: [application-validation, resolve-staging-alias]
     uses: ./.github/workflows/publish-linux-image.yml
+    concurrency:
+      group: linux-image-release-coollabsio/coolify-staging
+      cancel-in-progress: false
     permissions:
       artifact-metadata: write
       attestations: write
@@ -56,7 +84,26 @@ jobs:
       publish_latest: false
       release_kind: staging
       semantic_version: ''
+      staging_alias: ${{ needs.resolve-staging-alias.outputs.staging_alias }}
       target_repository: coollabsio/coolify-staging
     secrets:
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+
+  export-staging-reference:
+    name: Export staged image reference
+    needs: publish
+    permissions: {}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Write staged image reference to the workflow summary
+        env:
+          STAGING_DIGEST: ${{ needs.publish.outputs.staging_digest }}
+          STAGING_IMAGE: ${{ needs.publish.outputs.staging_image }}
+        run: |
+          set -eu
+          {
+            printf '## Staged image\n\n'
+            printf '%s%s%s\n' '- Immutable digest: `' "$STAGING_DIGEST" '`'
+            printf '%s%s%s\n' '- Consumer image: `' "$STAGING_IMAGE" '`'
+          } >> "$GITHUB_STEP_SUMMARY"

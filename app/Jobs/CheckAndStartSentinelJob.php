@@ -3,6 +3,7 @@
 namespace App\Jobs;
 
 use App\Actions\Server\StartSentinel;
+use App\Actions\Server\UpdateCoolify;
 use App\Contracts\ProxyMutation;
 use App\Models\Server;
 use App\Support\ProxyMutationQueue;
@@ -28,6 +29,10 @@ class CheckAndStartSentinelJob implements ProxyMutation, ShouldBeEncrypted, Shou
 
     public function handle(): void
     {
+        if (UpdateCoolify::isGuardedForkRelease(config('constants.coolify.version'))) {
+            return;
+        }
+
         ProxyMutationQueue::ensureExecutionAllowed();
 
         $latestVersion = get_latest_sentinel_version();

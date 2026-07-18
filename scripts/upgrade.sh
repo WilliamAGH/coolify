@@ -9,6 +9,13 @@ SKIP_BACKUP=${4:-false}
 ENV_FILE="/data/coolify/source/.env"
 STATUS_FILE="/data/coolify/source/.upgrade-status"
 
+FORK_RELEASE_VERSION_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-fork\.[1-9][0-9]*$'
+if [[ "$LATEST_IMAGE" =~ $FORK_RELEASE_VERSION_PATTERN ]]; then
+    echo "Fork release ${LATEST_IMAGE} is not published to ghcr.io/coollabsio/coolify." >&2
+    echo "Use the signed fork deployment path instead: scripts/fork-deploy install --manifest <signed release manifest URL>." >&2
+    exit 1
+fi
+
 DATE=$(date +%Y-%m-%d-%H-%M-%S)
 LOGFILE="/data/coolify/source/upgrade-${DATE}.log"
 
@@ -19,10 +26,12 @@ log() {
 
 # Helper function to log section headers
 log_section() {
-    echo "" >>"$LOGFILE"
-    echo "============================================================" >>"$LOGFILE"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >>"$LOGFILE"
-    echo "============================================================" >>"$LOGFILE"
+    {
+        echo ""
+        echo "============================================================"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+        echo "============================================================"
+    } >>"$LOGFILE"
 }
 
 # Helper function to write upgrade status for API polling
@@ -39,13 +48,15 @@ echo "=========================================="
 echo ""
 
 # Initialize log file with header
-echo "============================================================" >>"$LOGFILE"
-echo "Coolify Upgrade Log" >>"$LOGFILE"
-echo "Started: $(date '+%Y-%m-%d %H:%M:%S')" >>"$LOGFILE"
-echo "Target Version: ${LATEST_IMAGE}" >>"$LOGFILE"
-echo "Helper Version: ${LATEST_HELPER_VERSION}" >>"$LOGFILE"
-echo "Registry URL: ${REGISTRY_URL}" >>"$LOGFILE"
-echo "============================================================" >>"$LOGFILE"
+{
+    echo "============================================================"
+    echo "Coolify Upgrade Log"
+    echo "Started: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "Target Version: ${LATEST_IMAGE}"
+    echo "Helper Version: ${LATEST_HELPER_VERSION}"
+    echo "Registry URL: ${REGISTRY_URL}"
+    echo "============================================================"
+} >>"$LOGFILE"
 
 log_section "Step 1/6: Downloading configuration files"
 write_status "1" "Downloading configuration files"
@@ -80,6 +91,8 @@ fi
 
 # Get all unique images from docker compose config
 # LATEST_IMAGE env var is needed for image substitution in compose files
+# COMPOSE_FILES deliberately expands to separate -f arguments for docker compose.
+# shellcheck disable=SC2086
 IMAGES=$(LATEST_IMAGE=${LATEST_IMAGE} docker compose --env-file "$ENV_FILE" $COMPOSE_FILES config --images 2>/dev/null | sort -u)
 
 if [ -z "$IMAGES" ]; then
@@ -90,7 +103,7 @@ if [ -z "$IMAGES" ]; then
 fi
 
 log "Images to pull:"
-echo "$IMAGES" | while read img; do log "  - $img"; done
+echo "$IMAGES" | while IFS= read -r img; do log "  - $img"; done
 
 # Backup existing .env file before making any changes
 if [ "$SKIP_BACKUP" != "true" ]; then

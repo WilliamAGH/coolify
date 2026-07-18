@@ -113,10 +113,10 @@ for script in "$LAB_DIRECTORY/access-log-summary.mjs" "$LAB_DIRECTORY/held-traff
 done
 compose config -q
 
-EXPECTED_TRAEFIK_IMAGE="$(compose config --images | grep -E '^traefik:v3\.6\.17@sha256:[[:xdigit:]]{64}$')"
+EXPECTED_TRAEFIK_IMAGE="$(compose config --images | grep -E '^traefik:v3\.6\.23@sha256:[[:xdigit:]]{64}$')"
 readonly EXPECTED_TRAEFIK_IMAGE
 if [ -z "$EXPECTED_TRAEFIK_IMAGE" ]; then
-  fail "compose does not pin the expected Traefik v3.6.17 image digest"
+  fail "compose does not pin the expected Traefik v3.6.23 image digest"
 fi
 EXPECTED_TRAEFIK_DIGEST="${EXPECTED_TRAEFIK_IMAGE#*@}"
 readonly EXPECTED_TRAEFIK_DIGEST
