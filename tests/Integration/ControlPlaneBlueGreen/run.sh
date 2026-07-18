@@ -3945,9 +3945,17 @@ start_availability_monitor()
                     --dump-header "$availability_headers" --output /dev/null \
                     --write-out '%{http_code}' "$availability_url") \
                     || availability_curl_status=$?
-                printf '%s\t%s\t%s\t%s\t%s\n' "$availability_iteration" \
+                availability_sampled_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+                availability_phase=state-absent
+                if [ -f "$CONTROL_PLANE_OPERATOR_STATE_DIR/$CONTROL_PLANE_OPERATION_ID/state" ]; then
+                    availability_phase=$(sed -n 's/^phase=//p' \
+                        "$CONTROL_PLANE_OPERATOR_STATE_DIR/$CONTROL_PLANE_OPERATION_ID/state")
+                    [ -n "$availability_phase" ] || availability_phase=phase-absent
+                fi
+                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$availability_iteration" \
                     "$availability_name" "$availability_curl_status" \
-                    "$availability_status" health \
+                    "$availability_status" health "$availability_sampled_at" \
+                    "$availability_phase" \
                     >> "$availability_log"
             done
             availability_iteration=$((availability_iteration + 1))
@@ -3996,8 +4004,64 @@ scenario_continuous_forward_reverse_availability()
     preflight_and_apply_migrations
     start_availability_monitor
     availability_https_crash_log="$scenario_directory/availability-https-crash.log"
+    provider_health_barrier="$scenario_directory/provider-health-barrier"
+    mkdir "$provider_health_barrier"
+    chmod 700 "$provider_health_barrier"
+    managed_route_file="$CONTROL_PLANE_TRAEFIK_DYNAMIC_DIR/$CONTROL_PLANE_TRAEFIK_DYNAMIC_FILENAME"
+    legacy_route_sha256=$(file_checksum_or_absent "$managed_route_file")
+    CONTROL_PLANE_PUBLIC_PROBE_ATTEMPTS=3 \
+    CONTROL_PLANE_TEST_INGRESS_PROVIDER_HEALTH_BARRIER_DIR="$provider_health_barrier" \
+        "$OPERATOR" cutover > "$availability_https_crash_log" 2>&1 &
+    availability_cutover_pid=$!
+    register_worker "$availability_cutover_pid"
+    provider_barrier_attempt=0
+    while [ ! -e "$provider_health_barrier/reached" ]; do
+        if ! kill -0 "$availability_cutover_pid" 2>/dev/null; then
+            wait_registered_worker "$availability_cutover_pid" || true
+            sed -n '1,240p' "$availability_https_crash_log" >&2
+            fail 'cutover exited before reaching the provider-health barrier'
+        fi
+        provider_barrier_attempt=$((provider_barrier_attempt + 1))
+        [ "$provider_barrier_attempt" -lt 1200 ] \
+            || fail 'timed out waiting for the provider-health barrier'
+        sleep 0.1
+    done
+    paused_dependency_container=$CONTROL_PLANE_GREEN_WEB_B_CONTAINER
+    docker pause "$CONTROL_PLANE_GREEN_WEB_B_CONTAINER" >/dev/null
+    provider_down_attempt=0
+    while :; do
+        provider_rawdata=$(docker exec "$CONTROL_PLANE_PROXY_CONTAINER" \
+            wget -qO- http://127.0.0.1:8080/api/rawdata 2>/dev/null || true)
+        if printf '%s\n' "$provider_rawdata" | jq --exit-status \
+            --arg service 'control-plane-green-web-b@docker' '
+                (.services[$service].serverStatus // {}) as $statuses
+                | ($statuses | length) == 1
+                    and all($statuses[]; . == "DOWN")
+            ' >/dev/null 2>&1; then
+            break
+        fi
+        provider_down_attempt=$((provider_down_attempt + 1))
+        [ "$provider_down_attempt" -lt 120 ] \
+            || fail 'Traefik did not mark the paused candidate pool member DOWN'
+        sleep 0.25
+    done
+    touch "$provider_health_barrier/release"
+    chmod 600 "$provider_health_barrier/release"
+    if wait_registered_worker "$availability_cutover_pid"; then
+        fail 'cutover published a route while a candidate provider member remained DOWN'
+    fi
+    grep -F -q \
+        'Traefik Docker provider did not mark both candidate pool members healthy before route publication' \
+        "$availability_https_crash_log" \
+        || fail 'provider-health cutover rejection did not report the exact readiness failure'
+    [ "$(file_checksum_or_absent "$managed_route_file")" = "$legacy_route_sha256" ] \
+        || fail 'route changed while a candidate provider member remained DOWN'
+    assert_route_color \
+        "https://127.0.0.1:${LAB_TRAEFIK_PORT}/cgi-bin/request" legacy
+    docker unpause "$CONTROL_PLANE_GREEN_WEB_B_CONTAINER" >/dev/null
+    paused_dependency_container=
     if CONTROL_PLANE_TEST_CRASH_AT=after-green-ingress-route \
-        "$OPERATOR" cutover > "$availability_https_crash_log" 2>&1; then
+        "$OPERATOR" cutover >> "$availability_https_crash_log" 2>&1; then
         fail 'availability HTTPS-route crash injection unexpectedly completed'
     fi
     grep -F -x -q 'phase=green-routed' \

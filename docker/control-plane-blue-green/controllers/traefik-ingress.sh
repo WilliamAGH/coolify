@@ -97,6 +97,42 @@ validate_http_url()
         || fail "$1 contains unsafe URL bytes"
 }
 
+validate_provider_api_url()
+{
+    validate_single_line "$1" "$2"
+    python3 - "$2" <<'PY' || fail "$1 must use exact loopback HTTP authority and /api/rawdata"
+import re
+import sys
+import urllib.parse
+
+url = sys.argv[1]
+parsed = urllib.parse.urlsplit(url)
+try:
+    port = parsed.port
+except ValueError:
+    port = None
+expected_authorities = set()
+if port is not None:
+    expected_authorities = {f"127.0.0.1:{port}", f"[::1]:{port}"}
+query_pattern = re.compile(r"(?:[A-Za-z0-9._~/:+,=&@?-]|%[A-Fa-f0-9]{2})*")
+valid = (
+    url.startswith("http://")
+    and all(0x21 <= ord(character) <= 0x7e for character in url)
+    and parsed.scheme == "http"
+    and parsed.hostname in ("127.0.0.1", "::1")
+    and parsed.netloc in expected_authorities
+    and port is not None
+    and 1 <= port <= 65535
+    and parsed.path == "/api/rawdata"
+    and query_pattern.fullmatch(parsed.query) is not None
+    and not parsed.fragment
+    and parsed.username is None
+    and parsed.password is None
+)
+raise SystemExit(0 if valid else 1)
+PY
+}
+
 validate_http_host_header()
 {
     validate_single_line "$1" "$2"
@@ -1331,7 +1367,7 @@ def docker_service_matches(candidate, expected_status):
         and health.get("status") == 204
         and health.get("interval") == "1s"
         and health.get("unhealthyInterval") == "1s"
-        and health.get("timeout") == "1s"
+        and health.get("timeout") == "3s"
         and health.get("followRedirects") is False
         and health.get("headers", {}).get("X-Control-Plane-Route-Health")
             == expected["route_health_token"]
@@ -1417,6 +1453,26 @@ test_crash()
     if [ "$test_mode" = 1 ] && [ "$test_crash_at" = "$crash_stage" ]; then
         kill -9 "$$"
     fi
+}
+
+test_provider_health_barrier()
+{
+    [ -n "$test_provider_health_barrier_directory" ] || return 0
+    [ "$test_mode" = 1 ] \
+        || fail 'provider-health test barrier is forbidden outside test mode'
+    barrier_reached="$test_provider_health_barrier_directory/reached"
+    barrier_release="$test_provider_health_barrier_directory/release"
+    [ ! -e "$barrier_reached" ] && [ ! -L "$barrier_reached" ] \
+        || fail 'provider-health test barrier was already reached'
+    touch "$barrier_reached"
+    chmod 600 "$barrier_reached"
+    barrier_attempt=0
+    while [ ! -f "$barrier_release" ] || [ -L "$barrier_release" ]; do
+        barrier_attempt=$((barrier_attempt + 1))
+        [ "$barrier_attempt" -lt 1200 ] \
+            || fail 'provider-health test barrier was not released'
+        sleep 0.1
+    done
 }
 
 compute_member_set_sha256()
@@ -1776,8 +1832,9 @@ assert_member_docker_service_contract()
     member_role=$1
     member_name=$2
     member_id=$3
-    member_port=$4
-    member_service=$5
+    member_address=$4
+    member_port=$5
+    member_service=$6
     member_router="${member_service}-discovery"
     member_rule="Host(\`${member_service}.invalid\`)"
     member_inspect=$(docker inspect "$member_id" 2>/dev/null) \
@@ -1785,6 +1842,7 @@ assert_member_docker_service_contract()
     printf '%s\n' "$member_inspect" | jq --exit-status \
         --arg id "$member_id" \
         --arg name "/$member_name" \
+        --arg address "$member_address" \
         --arg port "$member_port" \
         --arg service "$member_service" \
         --arg router "$member_router" \
@@ -1801,8 +1859,15 @@ assert_member_docker_service_contract()
         | ($container.Id == $id)
         and ($container.Name == $name)
         and ($container.State.Running == true)
+        and ($container.State.Paused == false)
+        and ($container.State.Restarting == false)
+        and ($container.State.Dead == false)
         and ($network | length > 0)
         and ($container.NetworkSettings.Networks[$network] != null)
+        and ([$container.NetworkSettings.Networks[$network].IPAddress,
+            $container.NetworkSettings.Networks[$network].GlobalIPv6Address]
+            | map(select(type == "string" and length > 0))
+            | index($address) != null)
         and ($labels["traefik.enable"] == "true")
         and ($labels[$router_prefix + "rule"] == $rule)
         and ($labels[$router_prefix + "entrypoints"] == $entrypoint)
@@ -1818,7 +1883,7 @@ assert_member_docker_service_contract()
         and ($labels[$service_prefix + "healthcheck.status"] == "204")
         and ($labels[$service_prefix + "healthcheck.interval"] == "1s")
         and ($labels[$service_prefix + "healthcheck.unhealthyinterval"] == "1s")
-        and ($labels[$service_prefix + "healthcheck.timeout"] == "1s")
+        and ($labels[$service_prefix + "healthcheck.timeout"] == "3s")
         and ($labels[$service_prefix + "healthcheck.followredirects"] == "false")
         and ([$labels | keys[] | select(startswith("traefik.http.routers."))] | sort) == ([
             $router_prefix + "entrypoints",
@@ -1846,9 +1911,9 @@ assert_member_docker_service_contract()
 assert_member_docker_services()
 {
     assert_member_docker_service_contract web-a "$member_a_name" "$member_a_id" \
-        "$member_a_port" "$member_a_docker_service"
+        "$member_a_address" "$member_a_port" "$member_a_docker_service"
     assert_member_docker_service_contract web-b "$member_b_name" "$member_b_id" \
-        "$member_b_port" "$member_b_docker_service"
+        "$member_b_address" "$member_b_port" "$member_b_docker_service"
 }
 
 prove_pool()
@@ -1858,6 +1923,91 @@ prove_pool()
         "$member_a_route_identity" "$member_a_applied_ack"
     probe_member web-b "$member_b_address" "$member_b_port" \
         "$member_b_route_identity" "$member_b_applied_ack"
+}
+
+wait_for_member_provider_health()
+{
+    provider_health_file="$operation_directory/.traefik-provider-health.$$"
+    attempt=0
+    trap 'rm -f "$provider_health_file"' EXIT HUP INT TERM
+    while [ "$attempt" -lt "$probe_attempts" ]; do
+        attest_proxy_runtime
+        provider_health_proxy_tuple=$proxy_runtime_tuple
+        rm -f "$provider_health_file"
+        provider_health_curl_status=0
+        if [ -n "$provider_header_file" ]; then
+            nsenter --target "$proxy_pid" --net -- \
+                curl --fail --silent --show-error --max-time 5 \
+                --header "@$provider_header_file" "$provider_api_url" \
+                > "$provider_health_file" 2>/dev/null \
+                || provider_health_curl_status=$?
+        else
+            nsenter --target "$proxy_pid" --net -- \
+                curl --fail --silent --show-error --max-time 5 "$provider_api_url" \
+                > "$provider_health_file" 2>/dev/null \
+                || provider_health_curl_status=$?
+        fi
+        if [ "$provider_health_curl_status" -eq 0 ] \
+            && python3 - "$provider_health_file" \
+                "${member_a_docker_service}@docker" \
+                "${member_b_docker_service}@docker" \
+                "$member_a_address" "$member_a_port" \
+                "$member_b_address" "$member_b_port" \
+                "$control_plane_host" "$route_health_token" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    raw = json.load(source)
+
+expected_host = sys.argv[8]
+expected_token = sys.argv[9]
+
+def backend_origin(address, port):
+    authority = f"[{address}]" if ":" in address else address
+    return f"http://{authority}:{port}"
+
+def service_ready(key, address, port):
+    service = raw.get("services", {}).get(key)
+    if not isinstance(service, dict) or service.get("status") != "enabled" or service.get("error"):
+        return False
+    load_balancer = service.get("loadBalancer", {})
+    health = load_balancer.get("healthCheck", {})
+    statuses = service.get("serverStatus", {})
+    expected_origin = backend_origin(address, port)
+    return (
+        load_balancer.get("servers") == [{"url": expected_origin}]
+        and health.get("path") == "/api/control-plane/route-health"
+        and health.get("hostname") == expected_host
+        and health.get("method") == "GET"
+        and health.get("status") == 204
+        and health.get("interval") == "1s"
+        and health.get("unhealthyInterval") == "1s"
+        and health.get("timeout") == "3s"
+        and health.get("followRedirects") is False
+        and health.get("headers", {}).get("X-Control-Plane-Route-Health") == expected_token
+        and statuses == {expected_origin: "UP"}
+    )
+
+ready = (
+    service_ready(sys.argv[2], sys.argv[4], sys.argv[5])
+    and service_ready(sys.argv[3], sys.argv[6], sys.argv[7])
+)
+raise SystemExit(0 if ready else 1)
+PY
+        then
+            assert_member_docker_services
+            attest_proxy_runtime
+            [ "$proxy_runtime_tuple" = "$provider_health_proxy_tuple" ] \
+                || fail 'exact Traefik proxy process changed during candidate provider health proof'
+            rm -f "$provider_health_file"
+            trap - EXIT HUP INT TERM
+            return
+        fi
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+    fail 'Traefik Docker provider did not mark both candidate pool members healthy before route publication'
 }
 
 state_value()
@@ -2917,6 +3067,8 @@ switch_pool()
     fi
     assert_route_switchable "$target_route_sha256"
     prove_pool
+    test_provider_health_barrier
+    wait_for_member_provider_health
     if [ ! -e "$route_file" ] || [ "$(checksum "$route_file")" != "$target_route_sha256" ]; then
         atomic_replace "$candidate" "$route_file" 600
         test_crash after-switch-route
@@ -3290,6 +3442,8 @@ pool_manifest_sha256=${CONTROL_PLANE_INGRESS_POOL_MANIFEST_SHA256:-}
 pool_plan_manifest_source=${CONTROL_PLANE_INGRESS_POOL_PLAN_MANIFEST:-}
 pool_plan_manifest_sha256=${CONTROL_PLANE_INGRESS_POOL_PLAN_MANIFEST_SHA256:-}
 proxy_container=${CONTROL_PLANE_INGRESS_PROXY_CONTAINER:-}
+provider_api_url=${CONTROL_PLANE_INGRESS_PROVIDER_API_URL:-}
+provider_header_file=${CONTROL_PLANE_INGRESS_PROVIDER_HEADER_FILE:-}
 drain_member=${CONTROL_PLANE_INGRESS_DRAIN_MEMBER:-}
 public_url=${CONTROL_PLANE_INGRESS_PUBLIC_URL:-}
 local_ingress_url=${CONTROL_PLANE_INGRESS_LOCAL_URL:-}
@@ -3300,6 +3454,7 @@ probe_attempts=${CONTROL_PLANE_INGRESS_PROBE_ATTEMPTS:-20}
 test_mode=${CONTROL_PLANE_INGRESS_TEST_MODE:-0}
 test_crash_at=${CONTROL_PLANE_INGRESS_TEST_CRASH_AT:-}
 test_invalid_route=${CONTROL_PLANE_INGRESS_TEST_INVALID_ROUTE:-0}
+test_provider_health_barrier_directory=${CONTROL_PLANE_INGRESS_TEST_PROVIDER_HEALTH_BARRIER_DIR:-}
 predecessor_operation_id=${CONTROL_PLANE_INGRESS_PREDECESSOR_OPERATION_ID:-}
 predecessor_manifest_sha256=${CONTROL_PLANE_INGRESS_PREDECESSOR_MANIFEST_SHA256:-}
 predecessor_pool_plan_sha256=${CONTROL_PLANE_INGRESS_PREDECESSOR_POOL_PLAN_SHA256:-}
@@ -3313,6 +3468,7 @@ require_value CONTROL_PLANE_INGRESS_OPERATION_DIR "$operation_directory"
 require_value CONTROL_PLANE_INGRESS_DYNAMIC_DIR "$dynamic_directory"
 require_value CONTROL_PLANE_INGRESS_DYNAMIC_FILENAME "$dynamic_filename"
 require_value CONTROL_PLANE_INGRESS_PROXY_CONTAINER "$proxy_container"
+require_value CONTROL_PLANE_INGRESS_PROVIDER_API_URL "$provider_api_url"
 require_value CONTROL_PLANE_INGRESS_EXPECTED_IPV4 "$expected_ipv4"
 require_value CONTROL_PLANE_INGRESS_LOCAL_URL "$local_ingress_url"
 require_value CONTROL_PLANE_INGRESS_APP_PORT "$local_ingress_host_port"
@@ -3322,6 +3478,24 @@ validate_absolute_path CONTROL_PLANE_INGRESS_OPERATION_DIR "$operation_directory
 validate_absolute_path CONTROL_PLANE_INGRESS_DYNAMIC_DIR "$dynamic_directory"
 validate_identifier CONTROL_PLANE_INGRESS_DYNAMIC_FILENAME "$dynamic_filename"
 validate_identifier CONTROL_PLANE_INGRESS_PROXY_CONTAINER "$proxy_container"
+validate_provider_api_url CONTROL_PLANE_INGRESS_PROVIDER_API_URL "$provider_api_url"
+if [ -n "$provider_header_file" ]; then
+    validate_absolute_path CONTROL_PLANE_INGRESS_PROVIDER_HEADER_FILE "$provider_header_file"
+    [ -f "$provider_header_file" ] && [ ! -L "$provider_header_file" ] \
+        && [ -r "$provider_header_file" ] \
+        || fail 'provider header file must be a readable regular non-symlink file'
+    provider_header_expected_uid=0
+    provider_header_expected_gid=0
+    if [ "$test_mode" = 1 ]; then
+        provider_header_expected_uid=$(id -u)
+        provider_header_expected_gid=$(id -g)
+    fi
+    provider_header_metadata_prefix="${provider_header_expected_uid}:${provider_header_expected_gid}:600:"
+    case "$(file_metadata "$provider_header_file")" in
+        "$provider_header_metadata_prefix"*:*) ;;
+        *) fail 'provider header file must have immutable-owner mode 0600 metadata' ;;
+    esac
+fi
 validate_http_url CONTROL_PLANE_INGRESS_LOCAL_URL "$local_ingress_url"
 validate_port CONTROL_PLANE_INGRESS_APP_PORT "$local_ingress_host_port"
 validate_identifier CONTROL_PLANE_INGRESS_TRAEFIK_LOCAL_ENTRYPOINT "$local_ingress_entrypoint"
@@ -3341,6 +3515,15 @@ case "$test_invalid_route" in 0|1) ;; *) fail 'CONTROL_PLANE_INGRESS_TEST_INVALI
     || fail 'CONTROL_PLANE_INGRESS_TEST_CRASH_AT is forbidden outside test mode'
 [ "$test_invalid_route" = 0 ] || [ "$test_mode" = 1 ] \
     || fail 'CONTROL_PLANE_INGRESS_TEST_INVALID_ROUTE is forbidden outside test mode'
+if [ -n "$test_provider_health_barrier_directory" ]; then
+    [ "$test_mode" = 1 ] \
+        || fail 'CONTROL_PLANE_INGRESS_TEST_PROVIDER_HEALTH_BARRIER_DIR is forbidden outside test mode'
+    validate_absolute_path CONTROL_PLANE_INGRESS_TEST_PROVIDER_HEALTH_BARRIER_DIR \
+        "$test_provider_health_barrier_directory"
+    [ -d "$test_provider_health_barrier_directory" ] \
+        && [ ! -L "$test_provider_health_barrier_directory" ] \
+        || fail 'provider-health test barrier directory is absent or unsafe'
+fi
 managed_predecessor_requested=0
 if [ -n "$predecessor_operation_id" ] \
     || [ -n "$predecessor_manifest_sha256" ] \

@@ -6,6 +6,11 @@ services:
       - "--api.insecure=false"
       - "--configFile=/etc/traefik/traefik.yml"
     restart: "no"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.control-plane-provider-lab.rule=Path(`/api/rawdata`)"
+      - "traefik.http.routers.control-plane-provider-lab.entrypoints=provider"
+      - "traefik.http.routers.control-plane-provider-lab.service=api@internal"
     ports:
       - "127.0.0.1:${LAB_TRAEFIK_PORT:?LAB_TRAEFIK_PORT is required}:443"
       - "127.0.0.1:8000:8000"

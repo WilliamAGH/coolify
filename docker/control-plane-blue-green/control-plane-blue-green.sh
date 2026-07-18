@@ -7149,6 +7149,11 @@ ingress_controller_call()
     controller_role=ingress-controller
     ingress_public_url=$public_probe_url
     ingress_direct_probe_token_file=none
+    ingress_provider_header_file=$runtime_fence_provider_header_file
+    if [ -n "$ingress_provider_header_file" ] \
+        && [ -f "$runtime_fence_provider_header_copy" ]; then
+        ingress_provider_header_file=$runtime_fence_provider_header_copy
+    fi
 
     case "$ingress_color" in
         green)
@@ -7226,6 +7231,8 @@ ingress_controller_call()
     CONTROL_PLANE_INGRESS_EXPECTED_IPV4="$expected_ipv4" \
     CONTROL_PLANE_INGRESS_PROBE_ATTEMPTS="$public_probe_attempts" \
     CONTROL_PLANE_INGRESS_PROXY_CONTAINER="$proxy_container" \
+    CONTROL_PLANE_INGRESS_PROVIDER_API_URL="$runtime_fence_provider_api_url" \
+    CONTROL_PLANE_INGRESS_PROVIDER_HEADER_FILE="$ingress_provider_header_file" \
     CONTROL_PLANE_INGRESS_DYNAMIC_DIR="$traefik_dynamic_directory" \
     CONTROL_PLANE_INGRESS_DYNAMIC_FILENAME="$dynamic_filename" \
     CONTROL_PLANE_INGRESS_HOST="$control_plane_host" \
@@ -7236,6 +7243,7 @@ ingress_controller_call()
     CONTROL_PLANE_INGRESS_TRAEFIK_ROUTER_PRIORITY="$traefik_router_priority" \
     CONTROL_PLANE_INGRESS_TEST_MODE="$test_mode" \
     CONTROL_PLANE_INGRESS_TEST_INVALID_ROUTE="${CONTROL_PLANE_TEST_INVALID_ROUTE:-0}" \
+    CONTROL_PLANE_INGRESS_TEST_PROVIDER_HEALTH_BARRIER_DIR="${CONTROL_PLANE_TEST_INGRESS_PROVIDER_HEALTH_BARRIER_DIR:-}" \
     "$controller" "$ingress_action"
 }
 

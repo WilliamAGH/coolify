@@ -54,7 +54,7 @@ services:
       - "traefik.http.services.control-plane-green-web-a.loadbalancer.healthcheck.status=204"
       - "traefik.http.services.control-plane-green-web-a.loadbalancer.healthcheck.interval=1s"
       - "traefik.http.services.control-plane-green-web-a.loadbalancer.healthcheck.unhealthyinterval=1s"
-      - "traefik.http.services.control-plane-green-web-a.loadbalancer.healthcheck.timeout=1s"
+      - "traefik.http.services.control-plane-green-web-a.loadbalancer.healthcheck.timeout=3s"
       - "traefik.http.services.control-plane-green-web-a.loadbalancer.healthcheck.followredirects=false"
     networks: [control-plane]
     secrets:
@@ -135,7 +135,7 @@ services:
       - "traefik.http.services.control-plane-green-web-b.loadbalancer.healthcheck.status=204"
       - "traefik.http.services.control-plane-green-web-b.loadbalancer.healthcheck.interval=1s"
       - "traefik.http.services.control-plane-green-web-b.loadbalancer.healthcheck.unhealthyinterval=1s"
-      - "traefik.http.services.control-plane-green-web-b.loadbalancer.healthcheck.timeout=1s"
+      - "traefik.http.services.control-plane-green-web-b.loadbalancer.healthcheck.timeout=3s"
       - "traefik.http.services.control-plane-green-web-b.loadbalancer.healthcheck.followredirects=false"
     networks: [control-plane]
     secrets:
@@ -217,7 +217,7 @@ services:
       - "traefik.http.services.control-plane-blue-web-a.loadbalancer.healthcheck.status=204"
       - "traefik.http.services.control-plane-blue-web-a.loadbalancer.healthcheck.interval=1s"
       - "traefik.http.services.control-plane-blue-web-a.loadbalancer.healthcheck.unhealthyinterval=1s"
-      - "traefik.http.services.control-plane-blue-web-a.loadbalancer.healthcheck.timeout=1s"
+      - "traefik.http.services.control-plane-blue-web-a.loadbalancer.healthcheck.timeout=3s"
       - "traefik.http.services.control-plane-blue-web-a.loadbalancer.healthcheck.followredirects=false"
     networks: [control-plane]
     secrets:
@@ -299,7 +299,7 @@ services:
       - "traefik.http.services.control-plane-blue-web-b.loadbalancer.healthcheck.status=204"
       - "traefik.http.services.control-plane-blue-web-b.loadbalancer.healthcheck.interval=1s"
       - "traefik.http.services.control-plane-blue-web-b.loadbalancer.healthcheck.unhealthyinterval=1s"
-      - "traefik.http.services.control-plane-blue-web-b.loadbalancer.healthcheck.timeout=1s"
+      - "traefik.http.services.control-plane-blue-web-b.loadbalancer.healthcheck.timeout=3s"
       - "traefik.http.services.control-plane-blue-web-b.loadbalancer.healthcheck.followredirects=false"
     networks: [control-plane]
     secrets:

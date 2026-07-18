@@ -3,6 +3,8 @@ entryPoints:
     address: ":443"
   coolify-local:
     address: ":8000"
+  provider:
+    address: ":8080"
 
 providers:
   docker:
@@ -15,6 +17,7 @@ providers:
 
 api:
   dashboard: false
+  insecure: false
 
 log:
   level: WARN
