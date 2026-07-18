@@ -76,7 +76,7 @@ it('never downgrades from current running version', function () {
     // CDN has older version
     Http::fake([
         '*' => Http::response([
-            'coolify' => ['v4' => ['version' => '4.0.0']],
+            'coolify' => ['v4' => ['version' => '4.12.8']],
             'traefik' => ['v3.5' => '3.5.6'],
         ], 200),
     ]);
@@ -88,21 +88,21 @@ it('never downgrades from current running version', function () {
 
     File::shouldReceive('get')
         ->with(base_path('versions.json'))
-        ->andReturn(json_encode(['coolify' => ['v4' => ['version' => '4.0.5']]]));
+        ->andReturn(json_encode(['coolify' => ['v4' => ['version' => '4.12.9']]]));
 
     File::shouldReceive('put')
         ->once()
         ->with(base_path('versions.json'), Mockery::on(function ($json) {
             $data = json_decode($json, true);
 
-            // Should use running version (4.0.10), not CDN (4.0.0) or cache (4.0.5)
-            return $data['coolify']['v4']['version'] === '4.0.10';
+            // Should use the running fork release, not the older CDN or cache prerelease.
+            return $data['coolify']['v4']['version'] === '4.13.0-fork';
         }));
 
     Cache::shouldReceive('forget')->once();
 
-    // Running version is newest
-    config(['constants.coolify.version' => '4.0.10']);
+    // Running fork prerelease is newer than the CDN and cached releases.
+    config(['constants.coolify.version' => '4.13.0-fork']);
 
     Illuminate\Support\Facades\Log::shouldReceive('warning')
         ->once()

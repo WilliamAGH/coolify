@@ -59,6 +59,7 @@ function releaseContractUpdateSemanticVersionPattern(): string
 dataset('release semantic versions', [
     'zero version' => ['0.0.0', true],
     'stable version' => ['4.2.10', true],
+    'fork prerelease' => ['4.13.0-fork', true],
     'prerelease and build metadata' => ['4.2.10-rc.1+build.20260715', false],
     'build metadata only' => ['4.2.10+sha-deadbeef', false],
     'leading-zero major' => ['04.2.10', false],
@@ -87,11 +88,16 @@ it('keeps release workflow and update validation on the same strict semantic ver
 it('serves the workflow-published semantic tag to consumers through versions.json', function () {
     $published = releaseContractPublishedSemanticVersion();
 
-    expect($published)->toMatch('/^\d+\.\d+\.\d+$/')
+    expect($published)->toBe('4.13.0-fork')
+        ->and(preg_match(releaseContractUpdateSemanticVersionPattern(), $published))->toBe(1)
         ->and(releaseContractVersionsJson()['coolify']['v4']['version'])->toBe($published);
 });
 
-it('publishes production only for an explicit increasing canonical version bump', function () {
+it('orders the fork prerelease below its corresponding upstream stable release', function () {
+    expect(version_compare('4.13.0', releaseContractPublishedSemanticVersion(), '>'))->toBeTrue();
+});
+
+it('publishes production only for an explicit increasing semantic version bump', function () {
     $workflow = Yaml::parseFile(releaseContractRepositoryRoot().'/.github/workflows/coolify-production-build.yml');
     $applicationValidation = Yaml::parseFile(releaseContractRepositoryRoot().'/.github/workflows/application-validation.yml');
     $resolveVersion = $workflow['jobs']['resolve-version'];
@@ -108,6 +114,11 @@ it('publishes production only for an explicit increasing canonical version bump'
 
 it('keeps the newest version publishable after an intermediate pending bump is evicted', function () {
     $root = releaseContractRepositoryRoot();
+    $publishedVersion = releaseContractPublishedSemanticVersion();
+    expect($publishedVersion)->toBe('4.13.0-fork');
+
+    $baselineVersion = '4.12.99-fork';
+    $nextVersion = '4.13.1-fork';
     $workflow = Yaml::parseFile($root.'/.github/workflows/coolify-production-build.yml');
     $versionStep = collect($workflow['jobs']['resolve-version']['steps'])->firstWhere('id', 'version');
     $script = (string) ($versionStep['run'] ?? '');
@@ -128,7 +139,7 @@ it('keeps the newest version publishable after an intermediate pending bump is e
 
         foreach (['config/constants.php', 'versions.json'] as $path) {
             $contents = (string) file_get_contents($repository.'/'.$path);
-            file_put_contents($repository.'/'.$path, str_replace('4.1.3', '4.1.2', $contents));
+            file_put_contents($repository.'/'.$path, str_replace($publishedVersion, $baselineVersion, $contents));
         }
         (new Process(['git', 'add', '.'], $repository))->mustRun();
         (new Process(['git', 'commit', '-m', 'baseline'], $repository))->mustRun();
@@ -142,7 +153,7 @@ it('keeps the newest version publishable after an intermediate pending bump is e
 
         foreach (['config/constants.php', 'versions.json'] as $path) {
             $contents = (string) file_get_contents($repository.'/'.$path);
-            file_put_contents($repository.'/'.$path, str_replace('4.1.3', '4.1.4', $contents));
+            file_put_contents($repository.'/'.$path, str_replace($publishedVersion, $nextVersion, $contents));
         }
         (new Process(['git', 'add', '.'], $repository))->mustRun();
         (new Process(['git', 'commit', '-m', 'pending bump'], $repository))->mustRun();
@@ -175,9 +186,9 @@ it('keeps the newest version publishable after an intermediate pending bump is e
         }
 
         expect($decisions)->toBe([
-            ['should_publish' => 'true', 'version' => '4.1.3'],
-            ['should_publish' => 'true', 'version' => '4.1.4'],
-            ['should_publish' => 'false', 'version' => '4.1.4'],
+            ['should_publish' => 'true', 'version' => $publishedVersion],
+            ['should_publish' => 'true', 'version' => $nextVersion],
+            ['should_publish' => 'false', 'version' => $nextVersion],
         ]);
     } finally {
         $filesystem->remove($repository);

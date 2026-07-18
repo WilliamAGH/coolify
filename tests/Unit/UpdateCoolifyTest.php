@@ -13,7 +13,7 @@ uses(TestCase::class, RefreshDatabase::class);
 
 beforeEach(function () {
     config([
-        'constants.coolify.version' => '4.1.2',
+        'constants.coolify.version' => '4.13.0-fork',
         'constants.coolify.versions_url' => 'https://cdn.coollabs.io/coolify/versions.json',
         'constants.coolify.upgrade_script_url' => 'https://cdn.coollabs.io/coolify/upgrade.sh',
     ]);
@@ -80,23 +80,50 @@ it('uses validated cache when CDN fails and automatic updates are disabled', fun
         ->once();
 });
 
-it('prevents downgrade even with manual update', function () {
+it('does not automatically replace a guarded fork release while updates are disabled', function (string $availableVersion, bool $isNewer) {
+    $this->settings->forceFill([
+        'is_auto_update_enabled' => false,
+        'new_version_available' => true,
+    ])->saveQuietly();
+
+    config(['constants.coolify.version' => '4.13.0-fork']);
     Http::fake([
-        '*' => Http::response([
+        'https://cdn.coollabs.io/coolify/versions.json' => Http::response([
             'coolify' => [
-                'v4' => ['version' => '4.0.0'],
+                'v4' => ['version' => $availableVersion],
                 'helper' => ['version' => '1.0.14'],
             ],
         ]),
     ]);
-    config(['constants.coolify.version' => '4.0.10']);
+
+    $action = new UpdateCoolify;
+    $action->handle(manual_update: false);
+
+    expect(version_compare($availableVersion, '4.13.0-fork', '>'))->toBe($isNewer)
+        ->and($action->latestVersion)->toBe($availableVersion)
+        ->and($this->settings->refresh()->new_version_available)->toBeTrue();
+})->with([
+    'higher upstream stable release' => ['4.13.0', true],
+    'equal fork release' => ['4.13.0-fork', false],
+]);
+
+it('prevents downgrade even with manual update', function () {
+    Http::fake([
+        '*' => Http::response([
+            'coolify' => [
+                'v4' => ['version' => '4.12.9'],
+                'helper' => ['version' => '1.0.14'],
+            ],
+        ]),
+    ]);
+    config(['constants.coolify.version' => '4.13.0-fork']);
     Log::spy();
 
     $action = new UpdateCoolify;
 
     expect(fn () => $action->handle(manual_update: true))->toThrow(
         Exception::class,
-        'Cannot downgrade from 4.0.10 to 4.0.0. If you need to downgrade, please do so manually via Docker commands.',
+        'Cannot downgrade from 4.13.0-fork to 4.12.9. If you need to downgrade, please do so manually via Docker commands.',
     );
     Log::shouldHaveReceived('error')
         ->with('Downgrade prevented', Mockery::type('array'))
@@ -144,7 +171,7 @@ it('rejects unsafe configured upgrade script URLs before remote processing', fun
     Http::fake([
         '*' => Http::response([
             'coolify' => [
-                'v4' => ['version' => '4.2.0'],
+                'v4' => ['version' => '4.14.0'],
                 'helper' => ['version' => '1.0.15'],
             ],
         ]),
@@ -157,16 +184,17 @@ it('rejects unsafe configured upgrade script URLs before remote processing', fun
         ->toThrow(UnexpectedValueException::class, 'Coolify upgrade script URL must be a valid HTTPS URL.');
 });
 
-it('quotes all dynamic upgrade command arguments', function () {
+it('quotes all dynamic guarded update command arguments', function () {
+    $upgradeScriptUrl = 'https://127.0.0.1:65535/coolify/upgrade.sh?channel=fork&safe=1';
     $upgradeCommands = (new ReflectionMethod(UpdateCoolify::class, 'upgradeCommands'))->invoke(
         new UpdateCoolify,
-        'https://cdn.coollabs.io/coolify/upgrade.sh?channel=v4&safe=1',
-        '4.2.0',
+        $upgradeScriptUrl,
+        '4.13.0-fork',
         '1.0.15',
     );
 
     expect($upgradeCommands)->toBe([
-        "curl -fsSL -- 'https://cdn.coollabs.io/coolify/upgrade.sh?channel=v4&safe=1' -o '/data/coolify/source/upgrade.sh'",
-        "bash '/data/coolify/source/upgrade.sh' '4.2.0' '1.0.15'",
+        "curl -fsSL -- '{$upgradeScriptUrl}' -o '/data/coolify/source/upgrade.sh'",
+        "bash '/data/coolify/source/upgrade.sh' '4.13.0-fork' '1.0.15'",
     ]);
 });

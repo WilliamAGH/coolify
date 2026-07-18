@@ -260,6 +260,20 @@ it('pins the shared Dockerfile frontend to one reviewed multi-platform digest', 
     }
 });
 
+it('excludes local-only repository data from the Docker build context', function () {
+    $ignorePatterns = file(base_path('.dockerignore'), FILE_IGNORE_NEW_LINES);
+
+    expect($ignorePatterns)
+        ->toContain('/.git')
+        ->toContain('/storage/debugbar')
+        ->toContain('.env*')
+        ->toContain('!/.env.development.example')
+        ->toContain('!/.env.windows-docker-desktop.example')
+        ->not->toContain('.env')
+        ->not->toContain('.env.production')
+        ->not->toContain('.env.secrets');
+});
+
 it('preserves immutable cloudflared pins and its structured builder-stage transfer', function () {
     $dockerfile = productionImageSupplyChainDockerfile('docker/production/Dockerfile');
 
