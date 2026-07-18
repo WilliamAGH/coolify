@@ -12,7 +12,6 @@ readonly BACKUP_COMPONENT_INSTALLER="$REPOSITORY_ROOT/docker/control-plane-blue-
 readonly RUNTIME_COMPONENT_INSTALLER="$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/install-runtime-attestation-ssh-fence.sh"
 readonly COLD_BOOT_ACCEPTANCE="$REPOSITORY_ROOT/docker/control-plane-blue-green/backup-quiesce/cold-boot-acceptance.sh"
 readonly SYSTEMD_ENABLEMENT_UNITS='control-plane-backup-quiesce-watchdog.timer coolify-runtime-attestation-ssh-fence.service coolify-runtime-attestation-ssh-fence-watchdog.service'
-readonly LEGACY_PORT8000_UNITS='coolify-port8000-nft.service coolify-port8000-haproxy@phase-a.service coolify-port8000-haproxy@phase-b.service coolify-port8000-phase-b-authorizer.service'
 
 fail()
 {
@@ -99,10 +98,7 @@ prepare_fake_systemctl()
             '        if [ -f "$state_file" ]; then' \
             '            state=$(sed -n '\''1p'\'' "$state_file")' \
             '        else' \
-            '            case "$1" in' \
-            '                coolify-port8000-haproxy@phase-a.service|coolify-port8000-haproxy@phase-b.service) definition=coolify-port8000-haproxy@.service ;;' \
-            '                *) definition=$1 ;;' \
-            '            esac' \
+            '            definition=$1' \
             '            if [ -f "${FAKE_SYSTEMD_UNIT_ROOT:?}/$definition" ]; then state=disabled; else state=not-found; fi' \
             '        fi' \
             '        printf '\''is-enabled-result|%s|%s\n'\'' "$1" "$state" >> "$state_directory/commands.log"' \
@@ -243,92 +239,6 @@ assert_activation_enablements()
         recorded_target=$(awk -F'|' -v unit="$unit" '$1 == "unit" && $2 == unit { print $4 }' "$enablements")
         [ "$recorded_target" = "$(systemd_target_state "$unit")" ] \
             || fail "systemd enablement journal target differs: $unit"
-    done
-}
-
-prepare_legacy_port8000_installation()
-{
-    host_root=$1
-    state_directory=$2
-    unit_root="$host_root/etc/systemd/system"
-    config_root="$host_root/etc/coolify-control-plane-port8000"
-    state_root="$host_root/var/lib/coolify-control-plane-port8000"
-    runtime_root="$host_root/run/coolify-control-plane-port8000"
-    library_root="$host_root/usr/local/lib/coolify-control-plane-port8000/haproxy-2.8.26"
-    mkdir -p "$unit_root/multi-user.target.wants" \
-        "$unit_root/docker.service.requires" "$unit_root/docker.socket.requires" \
-        "$config_root" "$state_root/haproxy/phase-a/0123456789abcdefabcd" \
-        "$runtime_root" "$library_root"
-    chmod 0700 "$config_root" "$state_root" "$state_root/haproxy" \
-        "$state_root/haproxy/phase-a" "$state_root/haproxy/phase-a/0123456789abcdefabcd"
-    chmod 0755 "$runtime_root" "$host_root/usr/local/lib/coolify-control-plane-port8000" \
-        "$library_root"
-
-    printf '%s' 'W1VuaXRdCkRlc2NyaXB0aW9uPUNvb2xpZnkgY29udHJvbC1wbGFuZSBwb3J0IDgwMDAgbmZ0YWJsZXMgY2FwdHVyZQpEb2N1bWVudGF0aW9uPWh0dHBzOi8vd2lraS5uZnRhYmxlcy5vcmcvd2lraS1uZnRhYmxlcy9pbmRleC5waHAvQ29uZmlndXJpbmdfY2hhaW5zCkRlZmF1bHREZXBlbmRlbmNpZXM9bm8KUmVxdWlyZXM9Y29vbGlmeS1wb3J0ODAwMC1oYXByb3h5QHBoYXNlLWEuc2VydmljZSBjb29saWZ5LXBvcnQ4MDAwLWhhcHJveHlAcGhhc2UtYi5zZXJ2aWNlCkFmdGVyPWxvY2FsLWZzLnRhcmdldCBjb29saWZ5LXBvcnQ4MDAwLWhhcHJveHlAcGhhc2UtYS5zZXJ2aWNlIGNvb2xpZnktcG9ydDgwMDAtaGFwcm94eUBwaGFzZS1iLnNlcnZpY2UKQmVmb3JlPW5ldHdvcmstcHJlLnRhcmdldCBkb2NrZXIuc2VydmljZSBkb2NrZXIuc29ja2V0CgpbU2VydmljZV0KVHlwZT1vbmVzaG90ClVzZXI9cm9vdApHcm91cD1yb290CkV4ZWNTdGFydD0vdXNyL2xvY2FsL2xpYmV4ZWMvY29vbGlmeS1wb3J0ODAwMC1hcHBseS1hY3RpdmUtbmZ0CkV4ZWNSZWxvYWQ9L3Vzci9sb2NhbC9saWJleGVjL2Nvb2xpZnktcG9ydDgwMDAtYXBwbHktYWN0aXZlLW5mdApSZW1haW5BZnRlckV4aXQ9eWVzCk5vTmV3UHJpdmlsZWdlcz10cnVlClByaXZhdGVUbXA9dHJ1ZQpQcm90ZWN0SG9tZT10cnVlClByb3RlY3RTeXN0ZW09c3RyaWN0ClJlYWRPbmx5UGF0aHM9L2V0Yy9jb29saWZ5LWNvbnRyb2wtcGxhbmUtcG9ydDgwMDAKUmVzdHJpY3RBZGRyZXNzRmFtaWxpZXM9QUZfSU5FVCBBRl9JTkVUNiBBRl9ORVRMSU5LIEFGX1VOSVgKQ2FwYWJpbGl0eUJvdW5kaW5nU2V0PUNBUF9ORVRfQURNSU4KQW1iaWVudENhcGFiaWxpdGllcz1DQVBfTkVUX0FETUlOCgpbSW5zdGFsbF0KV2FudGVkQnk9bXVsdGktdXNlci50YXJnZXQKUmVxdWlyZWRCeT1kb2NrZXIuc2VydmljZSBkb2NrZXIuc29ja2V0Cg==' \
-        | base64 --decode > "$unit_root/coolify-port8000-nft.service"
-    chmod 0644 "$unit_root/coolify-port8000-nft.service"
-    [ "$(sha256_file "$unit_root/coolify-port8000-nft.service")" \
-        = 680f1e563b2537fe482424d279d2466cda12594d6940f96932668d25336533dd ] \
-        || fail 'legacy port8000 nft fixture no longer matches the installer allowlist'
-
-    ln -s /etc/systemd/system/coolify-port8000-haproxy@.service \
-        "$unit_root/multi-user.target.wants/coolify-port8000-haproxy@phase-a.service"
-    ln -s /etc/systemd/system/coolify-port8000-haproxy@.service \
-        "$unit_root/multi-user.target.wants/coolify-port8000-haproxy@phase-b.service"
-    ln -s /etc/systemd/system/coolify-port8000-phase-b-authorizer.service \
-        "$unit_root/multi-user.target.wants/coolify-port8000-phase-b-authorizer.service"
-    ln -s /etc/systemd/system/coolify-port8000-nft.service \
-        "$unit_root/multi-user.target.wants/coolify-port8000-nft.service"
-    ln -s /etc/systemd/system/coolify-port8000-nft.service \
-        "$unit_root/docker.service.requires/coolify-port8000-nft.service"
-    ln -s /etc/systemd/system/coolify-port8000-nft.service \
-        "$unit_root/docker.socket.requires/coolify-port8000-nft.service"
-
-    printf '%s\n' '# control-plane-instance: phase-a' 'global' \
-        > "$config_root/phase-a.cfg"
-    chmod 0600 "$config_root/phase-a.cfg"
-    printf '%s\n' '# server state fixture' \
-        > "$state_root/haproxy/phase-a/0123456789abcdefabcd/server-state"
-    chmod 0600 "$state_root/haproxy/phase-a/0123456789abcdefabcd/server-state"
-    printf '%s\n' '#!/bin/sh' 'exit 0' > "$library_root/haproxy"
-    chmod 0755 "$library_root/haproxy"
-    legacy_binary_sha256=$(sha256_file "$library_root/haproxy")
-    {
-        printf '%s\n' 'version=1' 'haproxy_version=2.8.26'
-        printf '%s\n' 'haproxy_source_sha256=88c28dae25ea46672e66f8db0dadd1fb5920e06ee2415ceb9f281c256b537727'
-        printf '%s\n' 'haproxy_build_options=TARGET=linux-glibc USE_SYSTEMD=1'
-        printf '%s\n' 'haproxy_binary=/usr/local/lib/coolify-control-plane-port8000/haproxy-2.8.26/haproxy'
-        printf 'haproxy_binary_sha256=%s\n' "$legacy_binary_sha256"
-    } > "$library_root/provenance"
-    chmod 0600 "$library_root/provenance"
-
-    for unit in $LEGACY_PORT8000_UNITS; do
-        set_fake_systemd_state "$state_directory" "$unit" enabled
-        set_fake_systemd_active_state "$state_directory" "$unit" active
-    done
-}
-
-assert_legacy_port8000_removed()
-{
-    host_root=$1
-    for legacy_path in \
-        "$host_root/etc/systemd/system/coolify-port8000-haproxy@.service" \
-        "$host_root/etc/systemd/system/coolify-port8000-phase-b-authorizer.service" \
-        "$host_root/etc/systemd/system/coolify-port8000-nft.service" \
-        "$host_root/usr/local/libexec/coolify-port8000-apply-active-nft" \
-        "$host_root/usr/local/libexec/coolify-haproxy-port8000-controller" \
-        "$host_root/etc/systemd/system/multi-user.target.wants/coolify-port8000-haproxy@phase-a.service" \
-        "$host_root/etc/systemd/system/multi-user.target.wants/coolify-port8000-haproxy@phase-b.service" \
-        "$host_root/etc/systemd/system/multi-user.target.wants/coolify-port8000-phase-b-authorizer.service" \
-        "$host_root/etc/systemd/system/multi-user.target.wants/coolify-port8000-nft.service" \
-        "$host_root/etc/systemd/system/docker.service.requires/coolify-port8000-nft.service" \
-        "$host_root/etc/systemd/system/docker.socket.requires/coolify-port8000-nft.service" \
-        "$host_root/etc/coolify-control-plane-port8000" \
-        "$host_root/var/lib/coolify-control-plane-port8000" \
-        "$host_root/run/coolify-control-plane-port8000" \
-        "$host_root/usr/local/lib/coolify-control-plane-port8000"; do
-        [ ! -e "$legacy_path" ] && [ ! -L "$legacy_path" ] \
-            || fail "legacy port8000 artifact survived deprovision: $legacy_path"
     done
 }
 
@@ -933,81 +843,6 @@ test_post_manifest_timer_recovery()
         || fail 'timer crash recovery retained the activation journal'
 }
 
-test_legacy_port8000_deprovision()
-{
-    success_host="$TEST_ROOT/host-legacy-port8000"
-    success_source="$TEST_ROOT/source-legacy-port8000"
-    success_state="$TEST_ROOT/state-legacy-port8000"
-    mkdir -p "$success_host" "$success_state"
-    success_host=$(CDPATH='' cd -- "$success_host" && pwd -P)
-    prepare_source "$success_source" legacy-port8000
-    success_source=$(CDPATH='' cd -- "$success_source" && pwd -P)
-    prepare_legacy_port8000_installation "$success_host" "$success_state"
-    run_bundle_with_systemd "$success_host" "$success_source" \
-        release-legacy-port8000-000001 "$success_state" >/dev/null
-    assert_manifest_release "$success_host" release-legacy-port8000-000001
-    assert_legacy_port8000_removed "$success_host"
-    for unit in $LEGACY_PORT8000_UNITS; do
-        grep -F -q "disable|$unit" "$success_state/commands.log" \
-            || fail "legacy port8000 unit was not disabled: $unit"
-        grep -F -q "stop|$unit" "$success_state/commands.log" \
-            || fail "legacy port8000 unit was not stopped: $unit"
-    done
-
-    recovery_host="$TEST_ROOT/host-legacy-port8000-recovery"
-    recovery_source="$TEST_ROOT/source-legacy-port8000-recovery"
-    recovery_state="$TEST_ROOT/state-legacy-port8000-recovery"
-    mkdir -p "$recovery_host" "$recovery_state"
-    recovery_host=$(CDPATH='' cd -- "$recovery_host" && pwd -P)
-    prepare_source "$recovery_source" legacy-port8000-recovery
-    recovery_source=$(CDPATH='' cd -- "$recovery_source" && pwd -P)
-    prepare_legacy_port8000_installation "$recovery_host" "$recovery_state"
-    if run_bundle_with_systemd "$recovery_host" "$recovery_source" \
-        release-legacy-port8000-recovery-000001 "$recovery_state" \
-        env FAKE_SYSTEMD_FAIL_ACTION=stop:coolify-port8000-haproxy@phase-a.service \
-        > "$TEST_ROOT/legacy-port8000-stop-failure-output" 2>&1; then
-        fail 'legacy port8000 deprovision swallowed a systemd stop failure'
-    fi
-    assert_manifest_release "$recovery_host" release-legacy-port8000-recovery-000001
-    [ -f "$recovery_host/etc/coolify-control-plane/release.activation/legacy-port8000-deprovision" ] \
-        || fail 'failed legacy port8000 deprovision did not retain its activation marker'
-    if dispatch_with_systemd "$recovery_host" "$recovery_state" \
-        "$recovery_host/usr/local/sbin/control-plane-blue-green" blocked-pending-migration \
-        > "$TEST_ROOT/legacy-port8000-dispatch-block-output" 2>&1; then
-        fail 'dispatcher executed a target release with unfinished legacy port8000 deprovision'
-    fi
-    grep -F -q 'requires installer-owned legacy port8000 deprovision recovery' \
-        "$TEST_ROOT/legacy-port8000-dispatch-block-output" \
-        || fail 'dispatcher blocked unfinished deprovision for an unexpected reason'
-    run_bundle_with_systemd "$recovery_host" "$recovery_source" \
-        release-legacy-port8000-recovery-000001 "$recovery_state" >/dev/null
-    assert_legacy_port8000_removed "$recovery_host"
-    [ ! -e "$recovery_host/etc/coolify-control-plane/release.activation" ] \
-        || fail 'recovered legacy port8000 deprovision retained its journal'
-
-    unsafe_host="$TEST_ROOT/host-legacy-port8000-unsafe"
-    unsafe_source="$TEST_ROOT/source-legacy-port8000-unsafe"
-    unsafe_state="$TEST_ROOT/state-legacy-port8000-unsafe"
-    mkdir -p "$unsafe_host" "$unsafe_state"
-    unsafe_host=$(CDPATH='' cd -- "$unsafe_host" && pwd -P)
-    prepare_source "$unsafe_source" legacy-port8000-unsafe
-    unsafe_source=$(CDPATH='' cd -- "$unsafe_source" && pwd -P)
-    prepare_legacy_port8000_installation "$unsafe_host" "$unsafe_state"
-    printf '%s\n' '# local replacement' \
-        >> "$unsafe_host/etc/systemd/system/coolify-port8000-nft.service"
-    if run_bundle_with_systemd "$unsafe_host" "$unsafe_source" \
-        release-legacy-port8000-unsafe-000001 "$unsafe_state" \
-        > "$TEST_ROOT/legacy-port8000-unsafe-output" 2>&1; then
-        fail 'legacy port8000 deprovision removed an unrecognized unit identity'
-    fi
-    grep -F -q 'legacy port8000 asset identity is unrecognized: nft-unit' \
-        "$TEST_ROOT/legacy-port8000-unsafe-output" \
-        || fail 'unrecognized legacy port8000 unit failed for an unexpected reason'
-    [ -f "$unsafe_host/etc/systemd/system/coolify-port8000-nft.service" ] \
-        && [ ! -e "$unsafe_host/etc/coolify-control-plane/release.manifest" ] \
-        || fail 'unrecognized legacy port8000 identity was mutated or activated'
-}
-
 test_release_id_safety()
 {
     host_root="$TEST_ROOT/host-release-id"
@@ -1121,7 +956,6 @@ main()
     test_dispatcher_source_is_immutable_owner_trusted
     test_systemd_enablement_transaction
     test_post_manifest_timer_recovery
-    test_legacy_port8000_deprovision
     test_release_id_safety
     test_cold_boot_uses_manifest_selected_assets
     test_component_installers_delegate_to_bundle

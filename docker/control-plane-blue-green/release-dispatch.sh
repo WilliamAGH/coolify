@@ -443,19 +443,6 @@ validate_activation_journal()
         fi
     done
     validate_activation_enablements
-    legacy_port8000_deprovision_required=0
-    if [ -e "$activation_path/legacy-port8000-deprovision" ] \
-        || [ -L "$activation_path/legacy-port8000-deprovision" ]; then
-        assert_regular_single_link "$activation_path/legacy-port8000-deprovision" \
-            'legacy port8000 activation migration marker'
-        [ "$(file_uid "$activation_path/legacy-port8000-deprovision"):$(file_gid "$activation_path/legacy-port8000-deprovision"):$(file_mode "$activation_path/legacy-port8000-deprovision")" \
-            = "$immutable_uid:$immutable_gid:600" ] \
-            && [ "$(sed -n '1p' "$activation_path/legacy-port8000-deprovision")" = version=1 ] \
-            && [ "$(sed -n '2p' "$activation_path/legacy-port8000-deprovision")" = migration=legacy-port8000-deprovision ] \
-            && [ "$(wc -l < "$activation_path/legacy-port8000-deprovision" | tr -d ' ')" = 2 ] \
-            || fail 'legacy port8000 activation migration marker is unsafe'
-        legacy_port8000_deprovision_required=1
-    fi
 }
 
 install_recovery_file()
@@ -529,8 +516,6 @@ recover_interrupted_activation()
         assert_target_stable_assets
         assert_target_systemd_enablements
         activate_backup_quiesce_timer
-        [ "$legacy_port8000_deprovision_required" = 0 ] \
-            || fail 'target release requires installer-owned legacy port8000 deprovision recovery'
     elif [ "$journal_previous_state" = present ] \
         && { [ "$active_manifest_sha256" = "$journal_previous_sha256" ] \
             || [ "$active_manifest_sha256" = absent ]; }; then

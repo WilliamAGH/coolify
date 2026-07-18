@@ -21,9 +21,6 @@ readonly PRODUCTION_LAUNCHER=/usr/local/sbin/control-plane-blue-green
 readonly BACKUP_QUIESCE_TIMER_UNIT=control-plane-backup-quiesce-watchdog.timer
 readonly STABLE_ASSET_KEYS='release-dispatcher release-launcher backup-quiesce-service-unit backup-quiesce-timer-unit runtime-fence-service-unit runtime-fence-watchdog-unit'
 readonly SYSTEMD_ENABLEMENT_UNITS='control-plane-backup-quiesce-watchdog.timer coolify-runtime-attestation-ssh-fence.service coolify-runtime-attestation-ssh-fence-watchdog.service'
-readonly LEGACY_PORT8000_FIXED_ASSETS='haproxy-unit authorizer-unit nft-unit nft-helper controller'
-readonly LEGACY_PORT8000_UNITS='coolify-port8000-nft.service coolify-port8000-haproxy@phase-a.service coolify-port8000-haproxy@phase-b.service coolify-port8000-phase-b-authorizer.service'
-readonly LEGACY_PORT8000_LINKS='phase-a-wants phase-b-wants authorizer-wants nft-wants docker-service-requires docker-socket-requires'
 
 fail()
 {
@@ -262,393 +259,6 @@ assert_installed_asset()
         = "$immutable_uid:$immutable_gid:$installed_mode" ] \
         && [ "$(sha256_file "$installed_path")" = "$installed_sha256" ] \
         || fail "installed release asset bytes or metadata changed: $installed_role"
-}
-
-legacy_port8000_fixed_asset_path()
-{
-    case "$1" in
-        haproxy-unit) host_path /etc/systemd/system/coolify-port8000-haproxy@.service ;;
-        authorizer-unit) host_path /etc/systemd/system/coolify-port8000-phase-b-authorizer.service ;;
-        nft-unit) host_path /etc/systemd/system/coolify-port8000-nft.service ;;
-        nft-helper) host_path /usr/local/libexec/coolify-port8000-apply-active-nft ;;
-        controller) host_path /usr/local/libexec/coolify-haproxy-port8000-controller ;;
-        *) fail "unknown legacy port8000 fixed asset: $1" ;;
-    esac
-}
-
-legacy_port8000_fixed_asset_mode()
-{
-    case "$1" in
-        haproxy-unit|authorizer-unit|nft-unit) printf '%s\n' 644 ;;
-        nft-helper) printf '%s\n' 755 ;;
-        controller) printf '%s\n' 700 ;;
-        *) fail "unknown legacy port8000 fixed asset mode: $1" ;;
-    esac
-}
-
-legacy_port8000_fixed_asset_sha256_is_allowed()
-{
-    case "$1:$2" in
-        haproxy-unit:3bc4f84334ee9c8844327c9e4f38bad0491cfe5dbce0949e8f40510c0356747b|\
-        authorizer-unit:5f0a159bcdd5f225a42b62d8a4a57f6676972f710c0de5bf06dce34e71b13901|\
-        authorizer-unit:dc0aaded899dd928bf383658f512b2e3472d97b9ac126b7150c4854923a939f3|\
-        nft-unit:680f1e563b2537fe482424d279d2466cda12594d6940f96932668d25336533dd|\
-        nft-unit:c35deaae3ffbe8f48de3ae0f729ea3a42637b34b21426a566941c92f6d9c4f86|\
-        nft-helper:d1c7687a30f3e600fb2cfb8380ffbfe9c0e42d4a619de9a1f3d176156e97f914|\
-        controller:aa3abf6bcdb7d210a67beeaf7ade10e306a32ef5948d3434550c371e53be40f2|\
-        controller:526665ca3a905bd1894df1539631e985ee48805dc4c1b3614ed565b1f7593a83|\
-        controller:6e76e288bf31ecf94c397ca1635cf01e12e7b6c4330e4fdf7ae0038083e262c8)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-legacy_port8000_link_path()
-{
-    case "$1" in
-        phase-a-wants) host_path /etc/systemd/system/multi-user.target.wants/coolify-port8000-haproxy@phase-a.service ;;
-        phase-b-wants) host_path /etc/systemd/system/multi-user.target.wants/coolify-port8000-haproxy@phase-b.service ;;
-        authorizer-wants) host_path /etc/systemd/system/multi-user.target.wants/coolify-port8000-phase-b-authorizer.service ;;
-        nft-wants) host_path /etc/systemd/system/multi-user.target.wants/coolify-port8000-nft.service ;;
-        docker-service-requires) host_path /etc/systemd/system/docker.service.requires/coolify-port8000-nft.service ;;
-        docker-socket-requires) host_path /etc/systemd/system/docker.socket.requires/coolify-port8000-nft.service ;;
-        *) fail "unknown legacy port8000 dependency link: $1" ;;
-    esac
-}
-
-legacy_port8000_link_target()
-{
-    case "$1" in
-        phase-a-wants|phase-b-wants)
-            printf '%s\n' /etc/systemd/system/coolify-port8000-haproxy@.service
-            ;;
-        authorizer-wants)
-            printf '%s\n' /etc/systemd/system/coolify-port8000-phase-b-authorizer.service
-            ;;
-        nft-wants|docker-service-requires|docker-socket-requires)
-            printf '%s\n' /etc/systemd/system/coolify-port8000-nft.service
-            ;;
-        *) fail "unknown legacy port8000 dependency target: $1" ;;
-    esac
-}
-
-assert_legacy_port8000_directory_root()
-{
-    legacy_directory=$1
-    legacy_modes=$2
-    legacy_label=$3
-    [ -d "$legacy_directory" ] && [ ! -L "$legacy_directory" ] \
-        || fail "$legacy_label is not a regular directory"
-    [ "$(file_uid "$legacy_directory"):$(file_gid "$legacy_directory")" \
-        = "$immutable_uid:$immutable_gid" ] \
-        || fail "$legacy_label owner is unsafe"
-    case ":$legacy_modes:" in
-        *:"$(file_mode "$legacy_directory")":*) ;;
-        *) fail "$legacy_label mode is unsafe" ;;
-    esac
-    [ -z "$(find "$legacy_directory" -type l -print -quit)" ] \
-        || fail "$legacy_label contains a symlink"
-}
-
-assert_legacy_port8000_config_directory()
-{
-    legacy_config_directory=$(host_path /etc/coolify-control-plane-port8000)
-    [ -e "$legacy_config_directory" ] || [ -L "$legacy_config_directory" ] || return 0
-    assert_legacy_port8000_directory_root "$legacy_config_directory" 700 \
-        'legacy port8000 configuration directory'
-    for legacy_config_entry in "$legacy_config_directory"/* "$legacy_config_directory"/.[!.]* "$legacy_config_directory"/..?*; do
-        [ -e "$legacy_config_entry" ] || [ -L "$legacy_config_entry" ] || continue
-        case "${legacy_config_entry##*/}" in
-            phase-a.cfg|phase-b.cfg|active.nft) ;;
-            *) fail "legacy port8000 configuration contains an unknown artifact: ${legacy_config_entry##*/}" ;;
-        esac
-        assert_regular_single_link "$legacy_config_entry" \
-            "legacy port8000 configuration ${legacy_config_entry##*/}"
-        [ "$(file_uid "$legacy_config_entry"):$(file_gid "$legacy_config_entry"):$(file_mode "$legacy_config_entry")" \
-            = "$immutable_uid:$immutable_gid:600" ] \
-            || fail "legacy port8000 configuration metadata is unsafe: ${legacy_config_entry##*/}"
-        case "${legacy_config_entry##*/}" in
-            phase-a.cfg)
-                grep -F -x -q '# control-plane-instance: phase-a' "$legacy_config_entry" \
-                    || fail 'legacy phase-a configuration identity is unrecognized'
-                ;;
-            phase-b.cfg)
-                grep -F -x -q '# control-plane-instance: phase-b' "$legacy_config_entry" \
-                    || fail 'legacy phase-b configuration identity is unrecognized'
-                ;;
-            active.nft)
-                [ "$(sed -n '1p' "$legacy_config_entry")" = '# coolify-port8000-active-bundle-format=1' ] \
-                    || fail 'legacy port8000 nft bundle identity is unrecognized'
-                ;;
-        esac
-    done
-}
-
-assert_legacy_port8000_state_directory()
-{
-    legacy_state_directory=$(host_path /var/lib/coolify-control-plane-port8000)
-    [ -e "$legacy_state_directory" ] || [ -L "$legacy_state_directory" ] || return 0
-    assert_legacy_port8000_directory_root "$legacy_state_directory" 700 \
-        'legacy port8000 state directory'
-    find "$legacy_state_directory" -mindepth 1 -print | while IFS= read -r legacy_state_entry; do
-        legacy_state_relative=${legacy_state_entry#"$legacy_state_directory"/}
-        [ "$(file_uid "$legacy_state_entry"):$(file_gid "$legacy_state_entry")" \
-            = "$immutable_uid:$immutable_gid" ] \
-            || fail "legacy port8000 state owner is unsafe: $legacy_state_relative"
-        case "$legacy_state_relative" in
-            phase-b.boot-identity|phase-b.boot-receipt)
-                assert_regular_single_link "$legacy_state_entry" \
-                    "legacy port8000 state $legacy_state_relative"
-                [ "$(file_mode "$legacy_state_entry")" = 600 ] \
-                    || fail "legacy port8000 state mode is unsafe: $legacy_state_relative"
-                ;;
-            haproxy|haproxy/phase-a|haproxy/phase-b)
-                [ -d "$legacy_state_entry" ] && [ ! -L "$legacy_state_entry" ] \
-                    && [ "$(file_mode "$legacy_state_entry")" = 700 ] \
-                    || fail "legacy port8000 state directory is unsafe: $legacy_state_relative"
-                ;;
-            haproxy/phase-a/*|haproxy/phase-b/*)
-                legacy_state_suffix=${legacy_state_relative#haproxy/phase-a/}
-                [ "$legacy_state_suffix" != "$legacy_state_relative" ] \
-                    || legacy_state_suffix=${legacy_state_relative#haproxy/phase-b/}
-                case "$legacy_state_suffix" in
-                    */server-state)
-                        legacy_backend_identity=${legacy_state_suffix%/server-state}
-                        ;;
-                    *)
-                        legacy_backend_identity=$legacy_state_suffix
-                        ;;
-                esac
-                printf '%s' "$legacy_backend_identity" | grep -Eq '^[a-f0-9]{20}$' \
-                    || fail "legacy port8000 backend state identity is unsafe: $legacy_state_relative"
-                case "$legacy_state_suffix" in
-                    */server-state)
-                        assert_regular_single_link "$legacy_state_entry" \
-                            "legacy port8000 server state $legacy_state_relative"
-                        [ "$(file_mode "$legacy_state_entry")" = 600 ] \
-                            || fail "legacy port8000 server state mode is unsafe: $legacy_state_relative"
-                        ;;
-                    *)
-                        [ -d "$legacy_state_entry" ] && [ ! -L "$legacy_state_entry" ] \
-                            && [ "$(file_mode "$legacy_state_entry")" = 700 ] \
-                            || fail "legacy port8000 backend state directory is unsafe: $legacy_state_relative"
-                        ;;
-                esac
-                ;;
-            *)
-                fail "legacy port8000 state contains an unknown artifact: $legacy_state_relative"
-                ;;
-        esac
-    done
-}
-
-assert_legacy_port8000_runtime_directory()
-{
-    legacy_runtime_directory=$(host_path /run/coolify-control-plane-port8000)
-    [ -e "$legacy_runtime_directory" ] || [ -L "$legacy_runtime_directory" ] || return 0
-    assert_legacy_port8000_directory_root "$legacy_runtime_directory" '700:755' \
-        'legacy port8000 runtime directory'
-    for legacy_runtime_entry in "$legacy_runtime_directory"/* "$legacy_runtime_directory"/.[!.]* "$legacy_runtime_directory"/..?*; do
-        [ -e "$legacy_runtime_entry" ] || [ -L "$legacy_runtime_entry" ] || continue
-        legacy_runtime_name=${legacy_runtime_entry##*/}
-        case "$legacy_runtime_name" in
-            phase-a.sock|phase-b.sock)
-                [ -S "$legacy_runtime_entry" ] && [ ! -L "$legacy_runtime_entry" ] \
-                    || fail "legacy port8000 runtime socket is unsafe: $legacy_runtime_name"
-                ;;
-            phase-a.pid|phase-b.pid|phase-b.start-authorization|phase-b.boot-authorizer.lock|.phase-b.start-authorization.*)
-                assert_regular_single_link "$legacy_runtime_entry" \
-                    "legacy port8000 runtime $legacy_runtime_name"
-                ;;
-            *)
-                fail "legacy port8000 runtime contains an unknown artifact: $legacy_runtime_name"
-                ;;
-        esac
-        [ "$(file_uid "$legacy_runtime_entry"):$(file_gid "$legacy_runtime_entry")" \
-            = "$immutable_uid:$immutable_gid" ] \
-            || fail "legacy port8000 runtime owner is unsafe: $legacy_runtime_name"
-    done
-}
-
-assert_legacy_port8000_library_directory()
-{
-    legacy_library_root=$(host_path /usr/local/lib/coolify-control-plane-port8000)
-    [ -e "$legacy_library_root" ] || [ -L "$legacy_library_root" ] || return 0
-    assert_legacy_port8000_directory_root "$legacy_library_root" 755 \
-        'legacy port8000 library root'
-    legacy_haproxy_directory="$legacy_library_root/haproxy-2.8.26"
-    for legacy_library_entry in "$legacy_library_root"/* "$legacy_library_root"/.[!.]* "$legacy_library_root"/..?*; do
-        [ -e "$legacy_library_entry" ] || [ -L "$legacy_library_entry" ] || continue
-        [ "$legacy_library_entry" = "$legacy_haproxy_directory" ] \
-            || fail "legacy port8000 library contains an unknown artifact: ${legacy_library_entry##*/}"
-    done
-    [ -e "$legacy_haproxy_directory" ] || [ -L "$legacy_haproxy_directory" ] || return 0
-    assert_legacy_port8000_directory_root "$legacy_haproxy_directory" 755 \
-        'legacy port8000 HAProxy runtime directory'
-    for legacy_haproxy_entry in "$legacy_haproxy_directory"/* "$legacy_haproxy_directory"/.[!.]* "$legacy_haproxy_directory"/..?*; do
-        [ -e "$legacy_haproxy_entry" ] || [ -L "$legacy_haproxy_entry" ] || continue
-        case "${legacy_haproxy_entry##*/}" in
-            haproxy|provenance) ;;
-            *) fail "legacy port8000 HAProxy runtime contains an unknown artifact: ${legacy_haproxy_entry##*/}" ;;
-        esac
-    done
-    legacy_haproxy_binary="$legacy_haproxy_directory/haproxy"
-    legacy_haproxy_provenance="$legacy_haproxy_directory/provenance"
-    if [ -e "$legacy_haproxy_binary" ] || [ -L "$legacy_haproxy_binary" ]; then
-        assert_regular_single_link "$legacy_haproxy_binary" 'legacy port8000 HAProxy binary'
-        [ "$(file_uid "$legacy_haproxy_binary"):$(file_gid "$legacy_haproxy_binary"):$(file_mode "$legacy_haproxy_binary")" \
-            = "$immutable_uid:$immutable_gid:755" ] \
-            || fail 'legacy port8000 HAProxy binary metadata is unsafe'
-    fi
-    if [ -e "$legacy_haproxy_provenance" ] || [ -L "$legacy_haproxy_provenance" ]; then
-        assert_regular_single_link "$legacy_haproxy_provenance" 'legacy port8000 HAProxy provenance'
-        [ "$(file_uid "$legacy_haproxy_provenance"):$(file_gid "$legacy_haproxy_provenance"):$(file_mode "$legacy_haproxy_provenance")" \
-            = "$immutable_uid:$immutable_gid:600" ] \
-            || fail 'legacy port8000 HAProxy provenance metadata is unsafe'
-        [ -f "$legacy_haproxy_binary" ] \
-            || fail 'legacy port8000 HAProxy provenance has no binary'
-        legacy_declared_binary_sha256=$(sed -n '6s/^haproxy_binary_sha256=//p' "$legacy_haproxy_provenance")
-        [ "$(sed -n '1p' "$legacy_haproxy_provenance")" = version=1 ] \
-            && [ "$(sed -n '2p' "$legacy_haproxy_provenance")" = haproxy_version=2.8.26 ] \
-            && [ "$(sed -n '3p' "$legacy_haproxy_provenance")" = haproxy_source_sha256=88c28dae25ea46672e66f8db0dadd1fb5920e06ee2415ceb9f281c256b537727 ] \
-            && [ "$(sed -n '4p' "$legacy_haproxy_provenance")" = 'haproxy_build_options=TARGET=linux-glibc USE_SYSTEMD=1' ] \
-            && [ "$(sed -n '5p' "$legacy_haproxy_provenance")" = haproxy_binary=/usr/local/lib/coolify-control-plane-port8000/haproxy-2.8.26/haproxy ] \
-            && [ "$(wc -l < "$legacy_haproxy_provenance" | tr -d ' ')" = 6 ] \
-            && [ "$legacy_declared_binary_sha256" = "$(sha256_file "$legacy_haproxy_binary")" ] \
-            || fail 'legacy port8000 HAProxy provenance identity is unrecognized'
-    elif [ -e "$legacy_haproxy_binary" ] || [ -L "$legacy_haproxy_binary" ]; then
-        fail 'legacy port8000 HAProxy binary has no provenance'
-    fi
-}
-
-classify_legacy_port8000_installation()
-{
-    legacy_port8000_deprovision_required=0
-    for legacy_asset in $LEGACY_PORT8000_FIXED_ASSETS; do
-        legacy_asset_path=$(legacy_port8000_fixed_asset_path "$legacy_asset")
-        [ -e "$legacy_asset_path" ] || [ -L "$legacy_asset_path" ] || continue
-        legacy_port8000_deprovision_required=1
-        legacy_asset_mode=$(legacy_port8000_fixed_asset_mode "$legacy_asset")
-        assert_regular_single_link "$legacy_asset_path" "legacy port8000 asset $legacy_asset"
-        [ "$(file_uid "$legacy_asset_path"):$(file_gid "$legacy_asset_path"):$(file_mode "$legacy_asset_path")" \
-            = "$immutable_uid:$immutable_gid:$legacy_asset_mode" ] \
-            || fail "legacy port8000 asset metadata is unsafe: $legacy_asset"
-        legacy_asset_sha256=$(sha256_file "$legacy_asset_path")
-        legacy_port8000_fixed_asset_sha256_is_allowed "$legacy_asset" "$legacy_asset_sha256" \
-            || fail "legacy port8000 asset identity is unrecognized: $legacy_asset"
-    done
-    for legacy_link in $LEGACY_PORT8000_LINKS; do
-        legacy_link_path=$(legacy_port8000_link_path "$legacy_link")
-        [ -e "$legacy_link_path" ] || [ -L "$legacy_link_path" ] || continue
-        legacy_port8000_deprovision_required=1
-        [ -L "$legacy_link_path" ] \
-            || fail "legacy port8000 dependency is not a symlink: $legacy_link"
-        assert_safe_parent_chain "$legacy_link_path"
-        [ "$(readlink "$legacy_link_path")" = "$(legacy_port8000_link_target "$legacy_link")" ] \
-            || fail "legacy port8000 dependency target is unrecognized: $legacy_link"
-    done
-    for legacy_directory in \
-        "$(host_path /etc/coolify-control-plane-port8000)" \
-        "$(host_path /var/lib/coolify-control-plane-port8000)" \
-        "$(host_path /run/coolify-control-plane-port8000)" \
-        "$(host_path /usr/local/lib/coolify-control-plane-port8000)"; do
-        if [ -e "$legacy_directory" ] || [ -L "$legacy_directory" ]; then
-            legacy_port8000_deprovision_required=1
-        fi
-    done
-    assert_legacy_port8000_config_directory
-    assert_legacy_port8000_state_directory
-    assert_legacy_port8000_runtime_directory
-    assert_legacy_port8000_library_directory
-    [ "$legacy_port8000_deprovision_required" = 0 ] \
-        || [ "$bundle_manage_systemd" = 1 ] \
-        || fail 'legacy port8000 deprovision requires managed systemd activation'
-}
-
-legacy_port8000_systemd_active_state()
-{
-    legacy_unit=$1
-    if legacy_active_output=$(systemctl is-active "$legacy_unit" 2>&1); then
-        legacy_active_status=0
-    else
-        legacy_active_status=$?
-    fi
-    case "$legacy_active_output:$legacy_active_status" in
-        active:0) printf '%s\n' active ;;
-        inactive:3|failed:3|unknown:4) printf '%s\n' inactive ;;
-        *) fail "legacy port8000 unit has an unsupported active state: $legacy_unit" ;;
-    esac
-}
-
-legacy_port8000_systemd_enablement_state()
-{
-    legacy_unit=$1
-    if legacy_enablement_output=$(systemctl is-enabled "$legacy_unit" 2>&1); then
-        legacy_enablement_status=0
-    else
-        legacy_enablement_status=$?
-    fi
-    case "$legacy_enablement_output:$legacy_enablement_status" in
-        enabled:0) printf '%s\n' enabled ;;
-        disabled:1|not-found:4) printf '%s\n' disabled ;;
-        *) fail "legacy port8000 unit has an unsupported enablement state: $legacy_unit" ;;
-    esac
-}
-
-deprovision_legacy_port8000_installation()
-{
-    classify_legacy_port8000_installation
-    [ "$legacy_port8000_deprovision_required" = 1 ] || return 0
-    for legacy_unit in $LEGACY_PORT8000_UNITS; do
-        if [ "$(legacy_port8000_systemd_enablement_state "$legacy_unit")" = enabled ]; then
-            systemctl disable "$legacy_unit" >/dev/null
-            [ "$(legacy_port8000_systemd_enablement_state "$legacy_unit")" = disabled ] \
-                || fail "legacy port8000 unit disable did not converge: $legacy_unit"
-        fi
-    done
-    for legacy_unit in $LEGACY_PORT8000_UNITS; do
-        if [ "$(legacy_port8000_systemd_active_state "$legacy_unit")" = active ]; then
-            systemctl stop "$legacy_unit"
-        fi
-        [ "$(legacy_port8000_systemd_active_state "$legacy_unit")" = inactive ] \
-            || fail "legacy port8000 unit stop did not converge: $legacy_unit"
-    done
-    for legacy_link in $LEGACY_PORT8000_LINKS; do
-        legacy_link_path=$(legacy_port8000_link_path "$legacy_link")
-        if [ -e "$legacy_link_path" ] || [ -L "$legacy_link_path" ]; then
-            rm -f -- "$legacy_link_path"
-        fi
-        [ ! -e "$legacy_link_path" ] && [ ! -L "$legacy_link_path" ] \
-            || fail "legacy port8000 dependency removal failed: $legacy_link"
-    done
-    for legacy_asset in $LEGACY_PORT8000_FIXED_ASSETS; do
-        legacy_asset_path=$(legacy_port8000_fixed_asset_path "$legacy_asset")
-        if [ -e "$legacy_asset_path" ] || [ -L "$legacy_asset_path" ]; then
-            rm -f -- "$legacy_asset_path"
-        fi
-        [ ! -e "$legacy_asset_path" ] && [ ! -L "$legacy_asset_path" ] \
-            || fail "legacy port8000 asset removal failed: $legacy_asset"
-    done
-    systemctl daemon-reload
-    for legacy_directory in \
-        "$(host_path /etc/coolify-control-plane-port8000)" \
-        "$(host_path /var/lib/coolify-control-plane-port8000)" \
-        "$(host_path /run/coolify-control-plane-port8000)" \
-        "$(host_path /usr/local/lib/coolify-control-plane-port8000)"; do
-        if [ -e "$legacy_directory" ] || [ -L "$legacy_directory" ]; then
-            rm -rf -- "$legacy_directory"
-        fi
-        [ ! -e "$legacy_directory" ] && [ ! -L "$legacy_directory" ] \
-            || fail "legacy port8000 managed-directory removal failed: $legacy_directory"
-    done
-    for legacy_unit in $LEGACY_PORT8000_UNITS; do
-        [ "$(legacy_port8000_systemd_enablement_state "$legacy_unit")" = disabled ] \
-            && [ "$(legacy_port8000_systemd_active_state "$legacy_unit")" = inactive ] \
-            || fail "legacy port8000 unit survived deprovision: $legacy_unit"
-    done
 }
 
 validate_release_directory()
@@ -1101,19 +711,6 @@ validate_activation_journal()
         fi
     done
     validate_activation_enablements
-    legacy_port8000_deprovision_required=0
-    if [ -e "$activation_path/legacy-port8000-deprovision" ] \
-        || [ -L "$activation_path/legacy-port8000-deprovision" ]; then
-        assert_regular_single_link "$activation_path/legacy-port8000-deprovision" \
-            'legacy port8000 activation migration marker'
-        [ "$(file_uid "$activation_path/legacy-port8000-deprovision"):$(file_gid "$activation_path/legacy-port8000-deprovision"):$(file_mode "$activation_path/legacy-port8000-deprovision")" \
-            = "$immutable_uid:$immutable_gid:600" ] \
-            && [ "$(sed -n '1p' "$activation_path/legacy-port8000-deprovision")" = version=1 ] \
-            && [ "$(sed -n '2p' "$activation_path/legacy-port8000-deprovision")" = migration=legacy-port8000-deprovision ] \
-            && [ "$(wc -l < "$activation_path/legacy-port8000-deprovision" | tr -d ' ')" = 2 ] \
-            || fail 'legacy port8000 activation migration marker is unsafe'
-        legacy_port8000_deprovision_required=1
-    fi
 }
 
 remove_activation_journal()
@@ -1191,9 +788,6 @@ recover_interrupted_activation()
         assert_target_stable_assets
         assert_target_systemd_enablements
         activate_backup_quiesce_timer
-        if [ "$legacy_port8000_deprovision_required" = 1 ]; then
-            deprovision_legacy_port8000_installation
-        fi
     elif [ "$journal_previous_state" = present ] \
         && { [ "$active_manifest_sha256" = "$journal_previous_sha256" ] \
             || [ "$active_manifest_sha256" = absent ]; }; then
@@ -1309,15 +903,6 @@ prepare_activation_journal()
     fi
     chmod 0600 "$activation_candidate/metadata"
     sync_path "$activation_candidate/metadata"
-    if [ "$legacy_port8000_deprovision_required" = 1 ]; then
-        printf 'version=1\nmigration=legacy-port8000-deprovision\n' \
-            > "$activation_candidate/legacy-port8000-deprovision"
-        if [ "$bundle_test_mode" = 0 ]; then
-            chown root:root "$activation_candidate/legacy-port8000-deprovision"
-        fi
-        chmod 0600 "$activation_candidate/legacy-port8000-deprovision"
-        sync_path "$activation_candidate/legacy-port8000-deprovision"
-    fi
     sync_path "$activation_candidate"
     mv -- "$activation_candidate" "$activation_path"
     activation_candidate=
@@ -1452,7 +1037,6 @@ release_candidate=
 activation_candidate=
 manifest_candidate=
 manifest_inventory=
-legacy_port8000_deprovision_required=0
 trap 'rm -rf -- "${release_candidate:-}" "${activation_candidate:-}" 2>/dev/null || true; rm -f -- "${manifest_candidate:-}" "${manifest_inventory:-}" 2>/dev/null || true' 0 HUP INT TERM
 recover_interrupted_activation
 
@@ -1500,7 +1084,6 @@ if [ -e "$release_directory" ] || [ -L "$release_directory" ]; then
 else
     stage_release_directory
 fi
-classify_legacy_port8000_installation
 prepare_activation_journal
 publish_stable_assets
 if [ "$bundle_manage_systemd" = 1 ]; then
@@ -1510,9 +1093,6 @@ publish_release_manifest
 
 if [ "$bundle_manage_systemd" = 1 ]; then
     activate_backup_quiesce_timer
-fi
-if [ "$legacy_port8000_deprovision_required" = 1 ]; then
-    deprovision_legacy_port8000_installation
 fi
 remove_activation_journal
 validate_release_directory "$release_directory"
