@@ -22,6 +22,7 @@ permissions: {}
 jobs:
   authorize:
     name: Authorize canonical release source
+    if: ${{ github.repository == 'coollabsio/coolify' }}
     permissions: {}
     runs-on: ubuntu-24.04
     steps:

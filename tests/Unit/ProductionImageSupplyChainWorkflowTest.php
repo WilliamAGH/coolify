@@ -1554,7 +1554,8 @@ function releaseWorkflowViolations(array $sharedWorkflow, array $applicationVali
     $stagingAuthorizeJob = $stagingJobs['authorize'] ?? [];
     $stagingAuthorizeStep = releaseWorkflowStep($stagingAuthorizeJob, 'Require the canonical repository');
     $stagingAuthorizeRun = (string) ($stagingAuthorizeStep['run'] ?? '');
-    if (releaseWorkflowNeeds($stagingAuthorizeJob) !== [] ||
+    if (($stagingAuthorizeJob['if'] ?? null) !== "\${{ github.repository == 'coollabsio/coolify' }}" ||
+        releaseWorkflowNeeds($stagingAuthorizeJob) !== [] ||
         ($stagingAuthorizeJob['permissions'] ?? null) !== [] ||
         ($stagingAuthorizeStep['env']['REPOSITORY'] ?? null) !== '${{ github.repository }}' ||
         ! str_contains($stagingAuthorizeRun, "[ \"\$REPOSITORY\" = 'coollabsio/coolify' ]")) {
