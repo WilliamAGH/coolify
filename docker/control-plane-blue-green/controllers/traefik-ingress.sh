@@ -6,7 +6,7 @@ umask 077
 fail()
 {
     [ -z "${plan_identity_file:-}" ] || rm -f "$plan_identity_file"
-    printf 'CONTROL_PLANE_HTTPS_CONTROLLER_FAILURE %s\n' "$1" >&2
+    printf 'CONTROL_PLANE_INGRESS_CONTROLLER_FAILURE %s\n' "$1" >&2
     exit 1
 }
 
@@ -118,6 +118,26 @@ validate_ipv4()
             }
         }
     ' || fail "$1 must be one canonical IPv4 address"
+}
+
+validate_globally_routable_ipv4()
+{
+    validate_ipv4 "$1" "$2"
+    printf '%s\n' "$2" | awk -F. '
+        ($1 == 0 || $1 == 10 || $1 == 127 || $1 >= 224) { exit 1 }
+        ($1 == 100 && $2 >= 64 && $2 <= 127) { exit 1 }
+        ($1 == 169 && $2 == 254) { exit 1 }
+        ($1 == 172 && $2 >= 16 && $2 <= 31) { exit 1 }
+        ($1 == 192 && $2 == 0 && ($3 == 0 || $3 == 2)) { exit 1 }
+        ($1 == 192 && $2 == 31 && $3 == 196) { exit 1 }
+        ($1 == 192 && $2 == 52 && $3 == 193) { exit 1 }
+        ($1 == 192 && $2 == 88 && $3 == 99) { exit 1 }
+        ($1 == 192 && $2 == 168) { exit 1 }
+        ($1 == 192 && $2 == 175 && $3 == 48) { exit 1 }
+        ($1 == 198 && ($2 == 18 || $2 == 19)) { exit 1 }
+        ($1 == 198 && $2 == 51 && $3 == 100) { exit 1 }
+        ($1 == 203 && $2 == 0 && $3 == 113) { exit 1 }
+    ' || fail "$1 must be a globally routable public IPv4 address"
 }
 
 assert_distinct_values()
@@ -797,6 +817,67 @@ PY
     proxy_public_binding_tuple="$proxy_public_container_binding|$proxy_public_host_ip|$proxy_public_host_port|$expected_ipv4"
 }
 
+assert_local_ingress_proxy_binding()
+{
+    [ "$local_ingress_url" = "http://127.0.0.1:${local_ingress_host_port}/" ] \
+        || fail 'local ingress URL must be the native Traefik loopback endpoint'
+    proxy_local_binding_inventory=$(docker inspect "$proxy_id" | jq -er \
+        --arg host_port "$local_ingress_host_port" '
+        .[0].NetworkSettings.Ports["8000/tcp"] as $bindings
+        | select(($bindings | type) == "array" and ($bindings | length) == 1)
+        | $bindings[0]
+        | select(.HostIp == "127.0.0.1" and .HostPort == $host_port)
+        | ["8000/tcp", .HostIp, .HostPort]
+        | @tsv
+    ') || fail 'native Traefik container port must have one exact loopback host binding'
+    [ -n "$proxy_local_binding_inventory" ] \
+        || fail 'native Traefik loopback port is not singularly published on the configured APP_PORT'
+    proxy_local_container_binding=${proxy_local_binding_inventory%%	*}
+    proxy_local_binding_remainder=${proxy_local_binding_inventory#*	}
+    proxy_local_host_ip=${proxy_local_binding_remainder%%	*}
+    proxy_local_host_port=${proxy_local_binding_remainder##*	}
+    [ "$proxy_local_host_ip:$proxy_local_host_port" = "127.0.0.1:${local_ingress_host_port}" ] \
+        || fail 'native Traefik loopback binding changed during attestation'
+
+    running_container_ids=$(docker ps --no-trunc --quiet) \
+        || fail 'could not enumerate running containers for loopback binding ownership proof'
+    [ -n "$running_container_ids" ] \
+        || fail 'running container inventory is empty during loopback binding ownership proof'
+    global_local_binding_inventory=
+    while IFS= read -r running_container_id; do
+        validate_sha256 running-container-id "$running_container_id"
+        running_container_inspect=$(docker inspect "$running_container_id" 2>/dev/null) \
+            || fail 'running container disappeared during loopback binding ownership proof'
+        [ "$(printf '%s\n' "$running_container_inspect" | jq -r 'length')" -eq 1 ] \
+            || fail 'running container lookup was not singular during loopback binding ownership proof'
+        running_container_bindings=$(printf '%s\n' "$running_container_inspect" | jq -r \
+            --arg container_id "$running_container_id" \
+            --arg host_port "$local_ingress_host_port" '
+            .[0].NetworkSettings.Ports // {}
+            | to_entries[] as $binding
+            | $binding.value[]?
+            | select($binding.key == "8000/tcp" or .HostPort == $host_port)
+            | [$container_id, $binding.key, .HostIp, .HostPort]
+            | @tsv
+        ') || fail 'could not inspect loopback binding ownership for a running container'
+        if [ -n "$running_container_bindings" ]; then
+            if [ -n "$global_local_binding_inventory" ]; then
+                global_local_binding_inventory="$global_local_binding_inventory
+$running_container_bindings"
+            else
+                global_local_binding_inventory=$running_container_bindings
+            fi
+        fi
+    done <<EOF
+$running_container_ids
+EOF
+    expected_global_local_binding=$(printf '%s\t8000/tcp\t127.0.0.1\t%s' \
+        "$proxy_id" "$local_ingress_host_port")
+    [ "$global_local_binding_inventory" = "$expected_global_local_binding" ] \
+        || fail 'configured APP_PORT or native Traefik container port has another or ambiguous owner'
+    proxy_local_binding_tuple="$proxy_local_container_binding|$proxy_local_host_ip|$proxy_local_host_port"
+}
+
 write_pinned_curl_config()
 {
     curl_config_path=$1
@@ -811,6 +892,17 @@ write_pinned_curl_config()
         [ "$public_url_hostname" = "$expected_ipv4" ] \
             || printf 'resolve = "%s:%s:%s"\n' \
                 "$public_url_hostname" "$public_binding_port" "$expected_ipv4"
+    } > "$curl_config_path"
+    chmod 600 "$curl_config_path"
+}
+
+write_local_ingress_curl_config()
+{
+    curl_config_path=$1
+    {
+        printf 'silent\nshow-error\nmax-time = 5\n'
+        printf 'url = "%s"\n' "$local_ingress_url"
+        printf 'header = "Host: %s"\n' "$public_host_header"
     } > "$curl_config_path"
     chmod 600 "$curl_config_path"
 }
@@ -847,6 +939,8 @@ write_live_proxy_expectation()
         printf 'route_health_token=%s\n' "$route_health_token"
         printf 'control_plane_host=%s\n' "$control_plane_host"
         printf 'entrypoint=%s\n' "$entrypoint"
+        printf 'local_router_key=control-plane-blue-green-local@file\n'
+        printf 'local_entrypoint=%s\n' "$local_ingress_entrypoint"
         printf 'router_priority=%s\nprovider_router_priority=%s\n' \
             "$router_priority" "$provider_router_priority"
         printf 'tls=%s\ncert_resolver=%s\n' "$tls" "${cert_resolver:-none}"
@@ -854,23 +948,32 @@ write_live_proxy_expectation()
             "$rule_quote" "$control_plane_host" "$rule_quote" "$rule_quote" "$rule_quote" \
             "$rule_quote" "$rule_quote" "$rule_quote" "$route_health_token" "$rule_quote"
         printf 'router_rule=Host(%s%s%s)\n' "$rule_quote" "$control_plane_host" "$rule_quote"
+        printf 'local_router_rule=PathPrefix(%s/%s)\n' "$rule_quote" "$rule_quote"
+        printf 'member_a_service=%s@docker\n' "$member_a_docker_service"
+        printf 'member_b_service=%s@docker\n' "$member_b_docker_service"
         case "$expected_members" in
             both)
-                printf 'server_a=%s\n' "$(yaml_member_url "$member_a_address" "$member_a_port")"
-                printf 'server_b=%s\n' "$(yaml_member_url "$member_b_address" "$member_b_port")"
-                printf 'status_a=UP\nstatus_b=UP\n'
+                printf 'weighted_a=%s@docker\nweighted_b=%s@docker\n' \
+                    "$member_a_docker_service" "$member_b_docker_service"
+                printf 'member_a_status=UP\nmember_b_status=UP\n'
                 ;;
-            web-a) printf 'server_a=%s\nserver_b=absent\nstatus_a=UP\nstatus_b=absent\n' "$(yaml_member_url "$member_a_address" "$member_a_port")" ;;
-            web-b) printf 'server_a=%s\nserver_b=absent\nstatus_a=UP\nstatus_b=absent\n' "$(yaml_member_url "$member_b_address" "$member_b_port")" ;;
+            web-a)
+                printf 'weighted_a=%s@docker\nweighted_b=absent\n' "$member_a_docker_service"
+                printf 'member_a_status=UP\nmember_b_status=DOWN\n'
+                ;;
+            web-b)
+                printf 'weighted_a=%s@docker\nweighted_b=absent\n' "$member_b_docker_service"
+                printf 'member_a_status=DOWN\nmember_b_status=UP\n'
+                ;;
             drain-pending-web-a)
-                printf 'server_a=%s\n' "$(yaml_member_url "$member_a_address" "$member_a_port")"
-                printf 'server_b=%s\nstatus_a=DOWN\nstatus_b=UP\n' \
-                    "$(yaml_member_url "$member_b_address" "$member_b_port")"
+                printf 'weighted_a=%s@docker\nweighted_b=%s@docker\n' \
+                    "$member_a_docker_service" "$member_b_docker_service"
+                printf 'member_a_status=DOWN\nmember_b_status=UP\n'
                 ;;
             drain-pending-web-b)
-                printf 'server_a=%s\n' "$(yaml_member_url "$member_a_address" "$member_a_port")"
-                printf 'server_b=%s\nstatus_a=UP\nstatus_b=DOWN\n' \
-                    "$(yaml_member_url "$member_b_address" "$member_b_port")"
+                printf 'weighted_a=%s@docker\nweighted_b=%s@docker\n' \
+                    "$member_a_docker_service" "$member_b_docker_service"
+                printf 'member_a_status=UP\nmember_b_status=DOWN\n'
                 ;;
             *) fail 'live proxy expectation names an invalid active member set' ;;
         esac
@@ -902,6 +1005,7 @@ except Exception as error:
     raise SystemExit(0)
 
 router = raw.get("routers", {}).get(expected.get("router_key"), {})
+local_router = raw.get("routers", {}).get(expected.get("local_router_key"), {})
 provider = raw.get("routers", {}).get(expected.get("provider_router_key"), {})
 service = raw.get("services", {}).get(expected.get("service_key"), {})
 health = service.get("loadBalancer", {}).get("healthCheck", {})
@@ -915,6 +1019,10 @@ print(
     f"router_rule_sha256={digest(router.get('rule', 'absent'))} "
     f"router_priority={router.get('priority', 'absent')} "
     f"router_tls={json.dumps(router.get('tls', 'absent'), sort_keys=True)} "
+    f"local_router_status={local_router.get('status', 'absent')} "
+    f"local_router_service={local_router.get('service', 'absent')} "
+    f"local_router_rule_sha256={digest(local_router.get('rule', 'absent'))} "
+    f"local_router_priority={local_router.get('priority', 'absent')} "
     f"provider_status={provider.get('status', 'absent')} "
     f"provider_rule_sha256={digest(provider.get('rule', 'absent'))} "
     f"provider_priority={provider.get('priority', 'absent')} "
@@ -935,6 +1043,8 @@ assert_live_proxy_route()
     attest_proxy_runtime
     assert_public_proxy_binding
     captured_public_binding_tuple=$proxy_public_binding_tuple
+    assert_local_ingress_proxy_binding
+    captured_local_binding_tuple=$proxy_local_binding_tuple
     provider_api_url=$(python3 - "$public_url" <<'PY'
 import sys
 import urllib.parse
@@ -954,6 +1064,8 @@ PY
         if assert_proxy_config_file "$expected_route_sha256" \
             && assert_public_proxy_binding \
             && [ "$proxy_public_binding_tuple" = "$captured_public_binding_tuple" ] \
+            && assert_local_ingress_proxy_binding \
+            && [ "$proxy_local_binding_tuple" = "$captured_local_binding_tuple" ] \
             && curl --config "$provider_curl_config" > "$raw_api_file" 2>/dev/null \
             && python3 - "$raw_api_file" "$expectation_file" <<'PY'
 import json
@@ -1144,12 +1256,15 @@ def rule_can_serve_api(rule, host, path):
     return True in outcomes
 
 router = raw.get("routers", {}).get(expected["router_key"])
+local_router = raw.get("routers", {}).get(expected["local_router_key"])
 provider_router = raw.get("routers", {}).get(expected["provider_router_key"])
 service = raw.get("services", {}).get(expected["service_key"])
 middleware = raw.get("middlewares", {}).get(expected["middleware_key"])
-servers = [expected["server_a"]]
-if expected["server_b"] != "absent":
-    servers.append(expected["server_b"])
+member_a_service = raw.get("services", {}).get(expected["member_a_service"])
+member_b_service = raw.get("services", {}).get(expected["member_b_service"])
+weighted_services = [{"name": expected["weighted_a"], "weight": 1}]
+if expected["weighted_b"] != "absent":
+    weighted_services.append({"name": expected["weighted_b"], "weight": 1})
 valid = (
     isinstance(router, dict)
     and router.get("status") == "enabled"
@@ -1158,6 +1273,13 @@ valid = (
     and router.get("entryPoints") == [expected["entrypoint"]]
     and router.get("middlewares") == [expected["middleware_key"]]
     and router.get("priority") == int(expected["router_priority"])
+    and isinstance(local_router, dict)
+    and local_router.get("status") == "enabled"
+    and local_router.get("service") == expected["service_name"]
+    and local_router.get("rule") == expected["local_router_rule"]
+    and local_router.get("entryPoints") == [expected["local_entrypoint"]]
+    and local_router.get("middlewares") == [expected["middleware_key"]]
+    and local_router.get("priority") == int(expected["router_priority"])
     and isinstance(provider_router, dict)
     and provider_router.get("status") == "enabled"
     and provider_router.get("service") == "api@internal"
@@ -1166,7 +1288,9 @@ valid = (
     and provider_router.get("priority") == int(expected["provider_router_priority"])
     and isinstance(service, dict)
     and service.get("status") == "enabled"
-    and service.get("usedBy") == [expected["router_key"]]
+    and sorted(service.get("usedBy", [])) == sorted([
+        expected["router_key"], expected["local_router_key"],
+    ])
     and isinstance(middleware, dict)
     and middleware.get("status") == "enabled"
     and middleware.get("headers", {}).get("customResponseHeaders", {}).get(
@@ -1181,16 +1305,39 @@ for inspected_router in (router, provider_router):
     inspected_tls = inspected_router.get("tls")
     if expected_tls:
         valid = valid and isinstance(inspected_tls, dict)
-        valid = valid and inspected_tls.get("certResolver") == expected_cert_resolver
+        if expected_cert_resolver == "none":
+            valid = valid and not inspected_tls.get("certResolver")
+        else:
+            valid = valid and inspected_tls.get("certResolver") == expected_cert_resolver
     else:
         valid = valid and inspected_tls is None
+valid = valid and local_router.get("tls") is None
 if not valid:
     raise SystemExit(1)
-load_balancer = service.get("loadBalancer", {})
-configured_servers = load_balancer.get("servers", [])
-configured_urls = [entry.get("url") for entry in configured_servers]
-health = load_balancer.get("healthCheck", {})
-statuses = service.get("serverStatus", {})
+weighted = service.get("weighted", {})
+
+def docker_service_matches(candidate, expected_status):
+    if not isinstance(candidate, dict) or candidate.get("status") != "enabled":
+        return False
+    load_balancer = candidate.get("loadBalancer", {})
+    health = load_balancer.get("healthCheck", {})
+    statuses = candidate.get("serverStatus", {})
+    return (
+        health.get("path") == "/api/control-plane/route-health"
+        and health.get("hostname") == expected["control_plane_host"]
+        and health.get("method") == "GET"
+        and health.get("status") == 204
+        and health.get("interval") == "1s"
+        and health.get("unhealthyInterval") == "1s"
+        and health.get("timeout") == "1s"
+        and health.get("followRedirects") is False
+        and health.get("headers", {}).get("X-Control-Plane-Route-Health")
+            == expected["route_health_token"]
+        and len(statuses) == 1
+        and next(iter(statuses.values()), None) == expected_status
+        and not candidate.get("error")
+    )
+
 conflicting_api_router = [
     key
     for key, candidate in raw.get("routers", {}).items()
@@ -1201,24 +1348,22 @@ conflicting_api_router = [
     and expected["entrypoint"] in candidate.get("entryPoints", [])
     and rule_can_serve_api(candidate.get("rule"), expected["control_plane_host"], "/api/rawdata")
 ]
+member_backend_router = [
+    key
+    for key, candidate in raw.get("routers", {}).items()
+    if isinstance(candidate, dict)
+    and candidate.get("status") == "enabled"
+    and candidate.get("service") in {
+        expected["member_a_service"], expected["member_b_service"],
+    }
+]
 valid = (
-    configured_urls == servers
-    and all(entry.get("weight") == 1 for entry in configured_servers)
-    and load_balancer.get("strategy") == "wrr"
-    and health.get("path") == expected["route_health_path"]
-    and health.get("method") == "GET"
-    and health.get("status") == 204
-    and health.get("interval") == "1s"
-    and health.get("unhealthyInterval") == "1s"
-    and health.get("timeout") == "1s"
-    and health.get("hostname") == expected["control_plane_host"]
-    and health.get("followRedirects") is False
-    and health.get("headers", {}).get("X-Control-Plane-Route-Health")
-        == expected["route_health_token"]
-    and sorted(statuses) == sorted(servers)
-    and statuses[servers[0]] == expected["status_a"]
-    and (len(servers) == 1 or statuses[servers[1]] == expected["status_b"])
+    weighted.get("services") == weighted_services
+    and isinstance(weighted.get("healthCheck"), dict)
+    and docker_service_matches(member_a_service, expected["member_a_status"])
+    and docker_service_matches(member_b_service, expected["member_b_status"])
     and not conflicting_api_router
+    and not member_backend_router
 )
 raise SystemExit(0 if valid else 1)
 PY
@@ -1229,6 +1374,9 @@ PY
             assert_public_proxy_binding
             [ "$proxy_public_binding_tuple" = "$captured_public_binding_tuple" ] \
                 || fail 'exact Traefik public binding changed during live provider proof'
+            assert_local_ingress_proxy_binding
+            [ "$proxy_local_binding_tuple" = "$captured_local_binding_tuple" ] \
+                || fail 'native Traefik loopback binding changed during live provider proof'
             rm -f "$raw_api_file" "$expectation_file" "$provider_curl_config"
             trap - EXIT HUP INT TERM
             return
@@ -1472,6 +1620,10 @@ load_pool_manifest()
     validate_token member_a_applied_ack "$member_a_applied_ack"
     validate_token member_b_applied_ack "$member_b_applied_ack"
     validate_token route_health_token "$route_health_token"
+    member_a_docker_service="control-plane-${color}-${member_a_role}"
+    member_b_docker_service="control-plane-${color}-${member_b_role}"
+    validate_identifier member_a_docker_service "$member_a_docker_service"
+    validate_identifier member_b_docker_service "$member_b_docker_service"
     route_ack=$(compute_route_ack)
 }
 
@@ -1617,8 +1769,89 @@ probe_draining_member()
     fail "$role did not prove its exact authenticated generation-bound drain state (transport=$status http=${http_status:-absent})"
 }
 
+assert_member_docker_service_contract()
+{
+    member_role=$1
+    member_name=$2
+    member_id=$3
+    member_port=$4
+    member_service=$5
+    member_router="${member_service}-discovery"
+    member_rule="Host(\`${member_service}.invalid\`)"
+    member_inspect=$(docker inspect "$member_id" 2>/dev/null) \
+        || fail "$member_role Docker-provider service container is unavailable"
+    printf '%s\n' "$member_inspect" | jq --exit-status \
+        --arg id "$member_id" \
+        --arg name "/$member_name" \
+        --arg port "$member_port" \
+        --arg service "$member_service" \
+        --arg router "$member_router" \
+        --arg rule "$member_rule" \
+        --arg entrypoint "$local_ingress_entrypoint" \
+        --arg host "$control_plane_host" \
+        --arg token "$route_health_token" '
+        length == 1
+        and (.[0] as $container
+        | ($container.Config.Labels // {}) as $labels
+        | ("traefik.http.routers." + $router + ".") as $router_prefix
+        | ("traefik.http.services." + $service + ".loadbalancer.") as $service_prefix
+        | ($labels["traefik.docker.network"] // "") as $network
+        | ($container.Id == $id)
+        and ($container.Name == $name)
+        and ($container.State.Running == true)
+        and ($network | length > 0)
+        and ($container.NetworkSettings.Networks[$network] != null)
+        and ($labels["traefik.enable"] == "true")
+        and ($labels[$router_prefix + "rule"] == $rule)
+        and ($labels[$router_prefix + "entrypoints"] == $entrypoint)
+        and ($labels[$router_prefix + "service"] == "noop@internal")
+        and ($labels[$router_prefix + "priority"] == "1")
+        and ($labels[$service_prefix + "server.port"] == $port)
+        and ($labels[$service_prefix + "server.scheme"] == "http")
+        and ($labels[$service_prefix + "passhostheader"] == "true")
+        and ($labels[$service_prefix + "healthcheck.path"] == "/api/control-plane/route-health")
+        and ($labels[$service_prefix + "healthcheck.hostname"] == $host)
+        and ($labels[$service_prefix + "healthcheck.headers.X-Control-Plane-Route-Health"] == $token)
+        and ($labels[$service_prefix + "healthcheck.method"] == "GET")
+        and ($labels[$service_prefix + "healthcheck.status"] == "204")
+        and ($labels[$service_prefix + "healthcheck.interval"] == "1s")
+        and ($labels[$service_prefix + "healthcheck.unhealthyinterval"] == "1s")
+        and ($labels[$service_prefix + "healthcheck.timeout"] == "1s")
+        and ($labels[$service_prefix + "healthcheck.followredirects"] == "false")
+        and ([$labels | keys[] | select(startswith("traefik.http.routers."))] | sort) == ([
+            $router_prefix + "entrypoints",
+            $router_prefix + "priority",
+            $router_prefix + "rule",
+            $router_prefix + "service"
+        ] | sort))
+        and ([$labels | keys[] | select(startswith("traefik.http.services."))] | sort) == ([
+            $service_prefix + "healthcheck.followredirects",
+            $service_prefix + "healthcheck.headers.X-Control-Plane-Route-Health",
+            $service_prefix + "healthcheck.hostname",
+            $service_prefix + "healthcheck.interval",
+            $service_prefix + "healthcheck.method",
+            $service_prefix + "healthcheck.path",
+            $service_prefix + "healthcheck.status",
+            $service_prefix + "healthcheck.timeout",
+            $service_prefix + "healthcheck.unhealthyinterval",
+            $service_prefix + "passhostheader",
+            $service_prefix + "server.port",
+            $service_prefix + "server.scheme"
+        ] | sort))
+    ' >/dev/null || fail "$member_role Docker-provider service labels differ from the exact authenticated backend contract"
+}
+
+assert_member_docker_services()
+{
+    assert_member_docker_service_contract web-a "$member_a_name" "$member_a_id" \
+        "$member_a_port" "$member_a_docker_service"
+    assert_member_docker_service_contract web-b "$member_b_name" "$member_b_id" \
+        "$member_b_port" "$member_b_docker_service"
+}
+
 prove_pool()
 {
+    assert_member_docker_services
     probe_member web-a "$member_a_address" "$member_a_port" \
         "$member_a_route_identity" "$member_a_applied_ack"
     probe_member web-b "$member_b_address" "$member_b_port" \
@@ -2051,6 +2284,7 @@ write_lineage_state()
         || fail 'unbound rollback lineage requires the exact captured route to remain installed'
     attest_proxy_runtime
     assert_public_proxy_binding
+    assert_local_ingress_proxy_binding
     case "$backup_kind" in
         legacy|absent)
             [ "$managed_predecessor_requested" = 0 ] \
@@ -2086,6 +2320,8 @@ write_lineage_state()
         printf 'public_url=%s\npublic_host_header=%s\nexpected_ipv4=%s\n' \
             "$public_url" "$public_host_header" "$expected_ipv4"
         printf 'proxy_public_binding_tuple=%s\n' "$proxy_public_binding_tuple"
+        printf 'local_ingress_url=%s\nlocal_ingress_entrypoint=%s\nproxy_local_binding_tuple=%s\n' \
+            "$local_ingress_url" "$local_ingress_entrypoint" "$proxy_local_binding_tuple"
         case "$backup_kind" in
             managed-v2)
                 write_predecessor_identity
@@ -2236,6 +2472,8 @@ load_restore_lineage()
     lineage_generation=$(state_value_from "$lineage_file" generation)
     lineage_control_plane_host=$(state_value_from "$lineage_file" control_plane_host)
     lineage_entrypoint=$(state_value_from "$lineage_file" entrypoint)
+    lineage_local_ingress_url=$(state_value_from "$lineage_file" local_ingress_url)
+    lineage_local_ingress_entrypoint=$(state_value_from "$lineage_file" local_ingress_entrypoint)
     lineage_tls=$(state_value_from "$lineage_file" tls)
     restored_cert_resolver=$(state_value_from "$lineage_file" cert_resolver)
     lineage_router_priority=$(state_value_from "$lineage_file" router_priority)
@@ -2249,6 +2487,11 @@ load_restore_lineage()
         || fail 'caller host differs from immutable HTTPS lineage'
     [ -z "$entrypoint" ] || [ "$entrypoint" = "$lineage_entrypoint" ] \
         || fail 'caller entrypoint differs from immutable HTTPS lineage'
+    [ -z "$local_ingress_url" ] || [ "$local_ingress_url" = "$lineage_local_ingress_url" ] \
+        || fail 'caller loopback URL differs from immutable ingress lineage'
+    [ -z "$local_ingress_entrypoint" ] \
+        || [ "$local_ingress_entrypoint" = "$lineage_local_ingress_entrypoint" ] \
+        || fail 'caller loopback entrypoint differs from immutable ingress lineage'
     [ -z "$tls" ] || [ "$tls" = "$lineage_tls" ] \
         || fail 'caller TLS setting differs from immutable HTTPS lineage'
     requested_cert_resolver=${cert_resolver:-none}
@@ -2260,6 +2503,8 @@ load_restore_lineage()
     requested_generation=$lineage_generation
     control_plane_host=$lineage_control_plane_host
     entrypoint=$lineage_entrypoint
+    local_ingress_url=$lineage_local_ingress_url
+    local_ingress_entrypoint=$lineage_local_ingress_entrypoint
     tls=$lineage_tls
     case "$restored_cert_resolver" in none) cert_resolver= ;; *) cert_resolver=$restored_cert_resolver ;; esac
     router_priority=$lineage_router_priority
@@ -2301,6 +2546,9 @@ load_restore_lineage()
     assert_public_proxy_binding
     [ "$proxy_public_binding_tuple" = "$(state_value_from "$lineage_file" proxy_public_binding_tuple)" ] \
         || fail 'exact Traefik public binding differs from immutable rollback lineage'
+    assert_local_ingress_proxy_binding
+    [ "$proxy_local_binding_tuple" = "$(state_value_from "$lineage_file" proxy_local_binding_tuple)" ] \
+        || fail 'native Traefik loopback binding differs from immutable rollback lineage'
 }
 
 state_value_from()
@@ -2335,20 +2583,10 @@ assert_route_switchable()
     esac
 }
 
-yaml_member_url()
-{
-    case "$1" in
-        *:*) printf 'http://[%s]:%s' "$1" "$2" ;;
-        *) printf 'http://%s:%s' "$1" "$2" ;;
-    esac
-}
-
 render_route()
 {
     candidate=$1
     active_members=${2:-both}
-    member_a_url=$(yaml_member_url "$member_a_address" "$member_a_port")
-    member_b_url=$(yaml_member_url "$member_b_address" "$member_b_port")
     rule_quote=$(printf '\140')
     {
         printf '# control-plane-ingress-pool-version: 2\n'
@@ -2371,9 +2609,21 @@ render_route()
         printf '      middlewares:\n'
         printf '        - control-plane-route-ack\n'
         if [ "$tls" = true ]; then
-            printf '      tls:\n'
-            printf '        certResolver: %s\n' "$cert_resolver"
+            if [ -n "$cert_resolver" ]; then
+                printf '      tls:\n'
+                printf '        certResolver: %s\n' "$cert_resolver"
+            else
+                printf '      tls: {}\n'
+            fi
         fi
+        printf '    control-plane-blue-green-local:\n'
+        printf '      rule: "PathPrefix(%s/%s)"\n' "$rule_quote" "$rule_quote"
+        printf '      entryPoints:\n'
+        printf '        - %s\n' "$local_ingress_entrypoint"
+        printf '      service: control-plane-%s-pool\n' "$color"
+        printf '      priority: %s\n' "$router_priority"
+        printf '      middlewares:\n'
+        printf '        - control-plane-route-ack\n'
         printf '    control-plane-provider-proof:\n'
         printf '      rule: "Host(%s%s%s) && Path(%s/api/rawdata%s) && Header(%sX-Control-Plane-Provider-Proof%s, %s%s%s)"\n' \
             "$rule_quote" "$control_plane_host" "$rule_quote" "$rule_quote" "$rule_quote" \
@@ -2383,8 +2633,12 @@ render_route()
         printf '      service: api@internal\n'
         printf '      priority: %s\n' "$provider_router_priority"
         if [ "$tls" = true ]; then
-            printf '      tls:\n'
-            printf '        certResolver: %s\n' "$cert_resolver"
+            if [ -n "$cert_resolver" ]; then
+                printf '      tls:\n'
+                printf '        certResolver: %s\n' "$cert_resolver"
+            else
+                printf '      tls: {}\n'
+            fi
         fi
         printf '  middlewares:\n'
         printf '    control-plane-route-ack:\n'
@@ -2393,28 +2647,17 @@ render_route()
         printf '          X-Control-Plane-Route-Ack: "%s"\n' "$route_ack"
         printf '  services:\n'
         printf '    control-plane-%s-pool:\n' "$color"
-        printf '      loadBalancer:\n'
-        printf '        strategy: wrr\n'
-        printf '        servers:\n'
+        printf '      weighted:\n'
+        printf '        healthCheck: {}\n'
+        printf '        services:\n'
         if [ "$active_members" = both ] || [ "$active_members" = web-a ]; then
-            printf '          - url: "%s"\n' "$member_a_url"
+            printf '          - name: "%s@docker"\n' "$member_a_docker_service"
             printf '            weight: 1\n'
         fi
         if [ "$active_members" = both ] || [ "$active_members" = web-b ]; then
-            printf '          - url: "%s"\n' "$member_b_url"
+            printf '          - name: "%s@docker"\n' "$member_b_docker_service"
             printf '            weight: 1\n'
         fi
-        printf '        healthCheck:\n'
-        printf '          path: "%s"\n' "$route_health_path"
-        printf '          hostname: "%s"\n' "$control_plane_host"
-        printf '          method: GET\n'
-        printf '          status: 204\n'
-        printf '          interval: "1s"\n'
-        printf '          unhealthyInterval: "1s"\n'
-        printf '          timeout: "1s"\n'
-        printf '          followRedirects: false\n'
-        printf '          headers:\n'
-        printf '            X-Control-Plane-Route-Health: "%s"\n' "$route_health_token"
     } > "$candidate"
 }
 
@@ -2442,6 +2685,8 @@ write_active_state()
             "$proxy_command_sha256" "$proxy_static_api_sha256"
         printf 'expected_ipv4=%s\nproxy_public_binding_tuple=%s\n' \
             "$expected_ipv4" "$proxy_public_binding_tuple"
+        printf 'local_ingress_url=%s\nlocal_ingress_entrypoint=%s\nproxy_local_binding_tuple=%s\n' \
+            "$local_ingress_url" "$local_ingress_entrypoint" "$proxy_local_binding_tuple"
         printf 'control_plane_host=%s\n' "$control_plane_host"
         printf 'entrypoint=%s\n' "$entrypoint"
         printf 'tls=%s\n' "$tls"
@@ -2481,6 +2726,8 @@ write_drain_state()
             "$proxy_command_sha256" "$proxy_static_api_sha256"
         printf 'expected_ipv4=%s\nproxy_public_binding_tuple=%s\n' \
             "$expected_ipv4" "$proxy_public_binding_tuple"
+        printf 'local_ingress_url=%s\nlocal_ingress_entrypoint=%s\nproxy_local_binding_tuple=%s\n' \
+            "$local_ingress_url" "$local_ingress_entrypoint" "$proxy_local_binding_tuple"
         printf 'control_plane_host=%s\n' "$control_plane_host"
         printf 'entrypoint=%s\n' "$entrypoint"
         printf 'tls=%s\n' "$tls"
@@ -2525,19 +2772,20 @@ assert_drained_route()
         || fail 'managed HTTPS drained route changed'
     case "$drain_member" in
         web-a)
-            [ "$(grep -F -x -c "          - url: \"$(yaml_member_url "$member_a_address" "$member_a_port")\"" "$route_file")" -eq 0 ] \
-                && [ "$(grep -F -x -c "          - url: \"$(yaml_member_url "$member_b_address" "$member_b_port")\"" "$route_file")" -eq 1 ] \
+            [ "$(grep -F -x -c "          - name: \"${member_a_docker_service}@docker\"" "$route_file")" -eq 0 ] \
+                && [ "$(grep -F -x -c "          - name: \"${member_b_docker_service}@docker\"" "$route_file")" -eq 1 ] \
                 && [ "$(grep -F -x -c '# control-plane-active-members: web-b' "$route_file")" -eq 1 ] \
                 || fail 'managed HTTPS drain removed the wrong member'
             ;;
         web-b)
-            [ "$(grep -F -x -c "          - url: \"$(yaml_member_url "$member_a_address" "$member_a_port")\"" "$route_file")" -eq 1 ] \
-                && [ "$(grep -F -x -c "          - url: \"$(yaml_member_url "$member_b_address" "$member_b_port")\"" "$route_file")" -eq 0 ] \
+            [ "$(grep -F -x -c "          - name: \"${member_a_docker_service}@docker\"" "$route_file")" -eq 1 ] \
+                && [ "$(grep -F -x -c "          - name: \"${member_b_docker_service}@docker\"" "$route_file")" -eq 0 ] \
                 && [ "$(grep -F -x -c '# control-plane-active-members: web-a' "$route_file")" -eq 1 ] \
                 || fail 'managed HTTPS drain removed the wrong member'
             ;;
     esac
-    [ "$(grep -F -c '          - url: ' "$route_file")" -eq 1 ] \
+    [ "$(grep -F -c '          - name: ' "$route_file")" -eq 1 ] \
+        && ! grep -F -q '          - url: ' "$route_file" \
         && [ "$(count_exact_line "          X-Control-Plane-Route-Ack: \"$route_ack\"" "$route_file")" -eq 1 ] \
         || fail 'managed HTTPS drained route is not an exact one-survivor route'
     case "$drain_member" in web-a) live_survivor=web-b ;; web-b) live_survivor=web-a ;; esac
@@ -2557,11 +2805,13 @@ assert_state_and_route()
     validate_sha256 route_sha256 "$expected_route_sha256"
     [ "$(checksum "$route_file")" = "$expected_route_sha256" ] \
         || fail 'managed HTTPS pool route changed'
-    [ "$(grep -F -x -c "          - url: \"$(yaml_member_url "$member_a_address" "$member_a_port")\"" "$route_file")" -eq 1 ] \
-        && [ "$(grep -F -x -c "          - url: \"$(yaml_member_url "$member_b_address" "$member_b_port")\"" "$route_file")" -eq 1 ] \
+    [ "$(grep -F -x -c "          - name: \"${member_a_docker_service}@docker\"" "$route_file")" -eq 1 ] \
+        && [ "$(grep -F -x -c "          - name: \"${member_b_docker_service}@docker\"" "$route_file")" -eq 1 ] \
+        && [ "$(count_exact_line '        healthCheck: {}' "$route_file")" -eq 1 ] \
+        && ! grep -F -q '          - url: ' "$route_file" \
+        && [ "$(count_exact_line '    control-plane-blue-green-local:' "$route_file")" -eq 1 ] \
+        && [ "$(count_exact_line "        - $local_ingress_entrypoint" "$route_file")" -eq 1 ] \
         && [ "$(count_exact_line "          X-Control-Plane-Route-Ack: \"$route_ack\"" "$route_file")" -eq 1 ] \
-        && [ "$(count_exact_line "            X-Control-Plane-Route-Health: \"$route_health_token\"" "$route_file")" -eq 1 ] \
-        && [ "$(grep -F -x -c "          hostname: \"$control_plane_host\"" "$route_file")" -eq 1 ] \
         && [ "$(grep -F -x -c '# control-plane-active-members: both' "$route_file")" -eq 1 ] \
         || fail 'managed HTTPS pool route does not contain the exact two-member contract'
     assert_live_proxy_route "$live_expected_members" "$expected_route_sha256"
@@ -2570,6 +2820,7 @@ assert_state_and_route()
 assert_state_lineage()
 {
     assert_public_proxy_binding
+    assert_local_ingress_proxy_binding
     [ "$(state_value operation_id)" = "$operation_id" ] \
         && [ "$(state_value pool_manifest)" = "$pool_manifest_source" ] \
         && [ "$(state_value pool_manifest_sha256)" = "$pool_manifest_sha256" ] \
@@ -2587,6 +2838,9 @@ assert_state_lineage()
         && [ "$(state_value proxy_static_api_sha256)" = "$proxy_static_api_sha256" ] \
         && [ "$(state_value expected_ipv4)" = "$expected_ipv4" ] \
         && [ "$(state_value proxy_public_binding_tuple)" = "$proxy_public_binding_tuple" ] \
+        && [ "$(state_value local_ingress_url)" = "$local_ingress_url" ] \
+        && [ "$(state_value local_ingress_entrypoint)" = "$local_ingress_entrypoint" ] \
+        && [ "$(state_value proxy_local_binding_tuple)" = "$proxy_local_binding_tuple" ] \
         && [ "$(state_value control_plane_host)" = "$control_plane_host" ] \
         && [ "$(state_value entrypoint)" = "$entrypoint" ] \
         && [ "$(state_value tls)" = "$tls" ] \
@@ -2633,8 +2887,10 @@ switch_pool()
     candidate="$dynamic_directory/.${dynamic_filename}.${operation_id}.new"
     trap 'rm -f "$candidate"' EXIT HUP INT TERM
     render_route "$candidate"
-    [ "$(grep -F -c '          - url: ' "$candidate")" -eq 2 ] \
-        || fail 'rendered HTTPS route does not contain exactly two servers'
+    [ "$(grep -F -c '          - name: ' "$candidate")" -eq 2 ] \
+        || fail 'rendered ingress route does not contain exactly two weighted Docker services'
+    ! grep -F -q '          - url: ' "$candidate" \
+        || fail 'rendered ingress route does not contain exactly two weighted Docker services'
     if [ "$test_invalid_route" = 1 ]; then
         printf '\n%s\n' 'http: [' >> "$candidate"
     fi
@@ -2705,6 +2961,40 @@ probe_public()
     fail 'public HTTPS route did not acknowledge the exact generation-bound pool'
 }
 
+probe_local_ingress()
+{
+    attest_proxy_runtime
+    local_proxy_tuple=$proxy_runtime_tuple
+    assert_local_ingress_proxy_binding
+    local_binding_tuple=$proxy_local_binding_tuple
+    headers="$operation_directory/.local-ingress-headers.$$"
+    local_curl_config="$operation_directory/.local-ingress-curl.$$"
+    write_local_ingress_curl_config "$local_curl_config"
+    attempt=0
+    trap 'rm -f "$headers" "$local_curl_config"' EXIT HUP INT TERM
+    while [ "$attempt" -lt "$probe_attempts" ]; do
+        rm -f "$headers"
+        status=0
+        curl --config "$local_curl_config" --fail \
+            --dump-header "$headers" --output /dev/null || status=$?
+        if [ "$status" -eq 0 ] \
+            && has_single_exact_response_header "$headers" X-Control-Plane-Route-Ack "$route_ack"; then
+            attest_proxy_runtime
+            [ "$proxy_runtime_tuple" = "$local_proxy_tuple" ] \
+                || fail 'exact Traefik proxy process changed during loopback acknowledgement proof'
+            assert_local_ingress_proxy_binding
+            [ "$proxy_local_binding_tuple" = "$local_binding_tuple" ] \
+                || fail 'native Traefik loopback binding changed during acknowledgement proof'
+            rm -f "$headers" "$local_curl_config"
+            trap - EXIT HUP INT TERM
+            return
+        fi
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+    fail 'native Traefik loopback route did not acknowledge the exact generation-bound pool'
+}
+
 assert_pool()
 {
     load_pool_manifest
@@ -2717,6 +3007,7 @@ verify_pool()
 {
     assert_pool
     probe_public
+    probe_local_ingress
 }
 
 select_drain_member()
@@ -2789,8 +3080,10 @@ drain_pool_member()
     candidate="$dynamic_directory/.${dynamic_filename}.${operation_id}.drain"
     trap 'rm -f "$candidate"' EXIT HUP INT TERM
     render_route "$candidate" "$surviving_role"
-    [ "$(grep -F -c '          - url: ' "$candidate")" -eq 1 ] \
-        || fail 'rendered HTTPS drain route did not retain exactly one healthy peer'
+    [ "$(grep -F -c '          - name: ' "$candidate")" -eq 1 ] \
+        || fail 'rendered ingress drain route did not retain exactly one Docker service'
+    ! grep -F -q '          - url: ' "$candidate" \
+        || fail 'rendered ingress drain route did not retain exactly one Docker service'
     target_route_sha256=$(checksum "$candidate")
     current_route_sha256=$(checksum "$route_file")
     case "$current_status" in
@@ -2840,6 +3133,7 @@ verify_drained_pool()
 {
     assert_drained_pool
     probe_public
+    probe_local_ingress
 }
 
 restore()
@@ -2983,6 +3277,7 @@ dynamic_directory=${CONTROL_PLANE_INGRESS_DYNAMIC_DIR:-}
 dynamic_filename=${CONTROL_PLANE_INGRESS_DYNAMIC_FILENAME:-}
 control_plane_host=${CONTROL_PLANE_INGRESS_HOST:-}
 entrypoint=${CONTROL_PLANE_INGRESS_TRAEFIK_ENTRYPOINT:-}
+local_ingress_entrypoint=${CONTROL_PLANE_INGRESS_TRAEFIK_LOCAL_ENTRYPOINT:-}
 tls=${CONTROL_PLANE_INGRESS_TRAEFIK_TLS:-}
 cert_resolver=${CONTROL_PLANE_INGRESS_TRAEFIK_CERT_RESOLVER:-}
 router_priority=${CONTROL_PLANE_INGRESS_TRAEFIK_ROUTER_PRIORITY:-}
@@ -2995,6 +3290,8 @@ pool_plan_manifest_sha256=${CONTROL_PLANE_INGRESS_POOL_PLAN_MANIFEST_SHA256:-}
 proxy_container=${CONTROL_PLANE_INGRESS_PROXY_CONTAINER:-}
 drain_member=${CONTROL_PLANE_INGRESS_DRAIN_MEMBER:-}
 public_url=${CONTROL_PLANE_INGRESS_PUBLIC_URL:-}
+local_ingress_url=${CONTROL_PLANE_INGRESS_LOCAL_URL:-}
+local_ingress_host_port=${CONTROL_PLANE_INGRESS_APP_PORT:-}
 public_host_header=${CONTROL_PLANE_INGRESS_PUBLIC_HOST_HEADER:-}
 expected_ipv4=${CONTROL_PLANE_INGRESS_EXPECTED_IPV4:-}
 probe_attempts=${CONTROL_PLANE_INGRESS_PROBE_ATTEMPTS:-20}
@@ -3015,14 +3312,26 @@ require_value CONTROL_PLANE_INGRESS_DYNAMIC_DIR "$dynamic_directory"
 require_value CONTROL_PLANE_INGRESS_DYNAMIC_FILENAME "$dynamic_filename"
 require_value CONTROL_PLANE_INGRESS_PROXY_CONTAINER "$proxy_container"
 require_value CONTROL_PLANE_INGRESS_EXPECTED_IPV4 "$expected_ipv4"
+require_value CONTROL_PLANE_INGRESS_LOCAL_URL "$local_ingress_url"
+require_value CONTROL_PLANE_INGRESS_APP_PORT "$local_ingress_host_port"
+require_value CONTROL_PLANE_INGRESS_TRAEFIK_LOCAL_ENTRYPOINT "$local_ingress_entrypoint"
 validate_identifier CONTROL_PLANE_INGRESS_OPERATION_ID "$operation_id"
 validate_absolute_path CONTROL_PLANE_INGRESS_OPERATION_DIR "$operation_directory"
 validate_absolute_path CONTROL_PLANE_INGRESS_DYNAMIC_DIR "$dynamic_directory"
 validate_identifier CONTROL_PLANE_INGRESS_DYNAMIC_FILENAME "$dynamic_filename"
 validate_identifier CONTROL_PLANE_INGRESS_PROXY_CONTAINER "$proxy_container"
-validate_ipv4 CONTROL_PLANE_INGRESS_EXPECTED_IPV4 "$expected_ipv4"
+validate_http_url CONTROL_PLANE_INGRESS_LOCAL_URL "$local_ingress_url"
+validate_port CONTROL_PLANE_INGRESS_APP_PORT "$local_ingress_host_port"
+validate_identifier CONTROL_PLANE_INGRESS_TRAEFIK_LOCAL_ENTRYPOINT "$local_ingress_entrypoint"
+[ "$local_ingress_url" = "http://127.0.0.1:${local_ingress_host_port}/" ] \
+    || fail 'CONTROL_PLANE_INGRESS_LOCAL_URL must exactly match CONTROL_PLANE_INGRESS_APP_PORT'
 validate_positive_integer CONTROL_PLANE_INGRESS_PROBE_ATTEMPTS "$probe_attempts"
 case "$test_mode" in 0|1) ;; *) fail 'CONTROL_PLANE_INGRESS_TEST_MODE must be 0 or 1' ;; esac
+if [ "$test_mode" = 0 ]; then
+    validate_globally_routable_ipv4 CONTROL_PLANE_INGRESS_EXPECTED_IPV4 "$expected_ipv4"
+else
+    validate_ipv4 CONTROL_PLANE_INGRESS_EXPECTED_IPV4 "$expected_ipv4"
+fi
 case "$test_invalid_route" in 0|1) ;; *) fail 'CONTROL_PLANE_INGRESS_TEST_INVALID_ROUTE must be 0 or 1' ;; esac
 [ -z "$test_crash_at" ] || [ "$test_mode" = 1 ] \
     || fail 'CONTROL_PLANE_INGRESS_TEST_CRASH_AT is forbidden outside test mode'
@@ -3094,12 +3403,17 @@ case "$action" in
     preflight)
         require_value CONTROL_PLANE_INGRESS_HOST "$control_plane_host"
         require_value CONTROL_PLANE_INGRESS_PUBLIC_URL "$public_url"
+        require_value CONTROL_PLANE_INGRESS_TRAEFIK_ENTRYPOINT "$entrypoint"
         validate_hostname CONTROL_PLANE_INGRESS_HOST "$control_plane_host"
         validate_http_url CONTROL_PLANE_INGRESS_PUBLIC_URL "$public_url"
+        validate_identifier CONTROL_PLANE_INGRESS_TRAEFIK_ENTRYPOINT "$entrypoint"
+        [ "$entrypoint" != "$local_ingress_entrypoint" ] \
+            || fail 'public and loopback Traefik entrypoints must be distinct'
         [ -z "$public_host_header" ] \
             || validate_http_host_header CONTROL_PLANE_INGRESS_PUBLIC_HOST_HEADER "$public_host_header"
         attest_proxy_runtime
         assert_public_proxy_binding
+        assert_local_ingress_proxy_binding
         ;;
     prepare)
         attest_proxy_runtime
@@ -3119,14 +3433,19 @@ case "$action" in
         require_value CONTROL_PLANE_INGRESS_TRAEFIK_TLS "$tls"
         require_value CONTROL_PLANE_INGRESS_TRAEFIK_ROUTER_PRIORITY "$router_priority"
         validate_identifier CONTROL_PLANE_INGRESS_TRAEFIK_ENTRYPOINT "$entrypoint"
+        [ "$entrypoint" != "$local_ingress_entrypoint" ] \
+            || fail 'public and loopback Traefik entrypoints must be distinct'
         case "$tls" in true|false) ;; *) fail 'Traefik TLS setting must be true or false' ;; esac
         validate_positive_integer CONTROL_PLANE_INGRESS_TRAEFIK_ROUTER_PRIORITY "$router_priority"
         [ "$router_priority" -lt 2147483647 ] \
             || fail 'Traefik router priority leaves no reserved provider-proof priority'
         provider_router_priority=$((router_priority + 1))
         if [ "$tls" = true ]; then
-            require_value CONTROL_PLANE_INGRESS_TRAEFIK_CERT_RESOLVER "$cert_resolver"
-            validate_identifier CONTROL_PLANE_INGRESS_TRAEFIK_CERT_RESOLVER "$cert_resolver"
+            if [ -n "$cert_resolver" ]; then
+                validate_identifier CONTROL_PLANE_INGRESS_TRAEFIK_CERT_RESOLVER "$cert_resolver"
+            elif [ "$test_mode" != 1 ]; then
+                fail 'Traefik certificate resolver is required outside the lab'
+            fi
         else
             [ -z "$cert_resolver" ] \
                 || fail 'Traefik certificate resolver must be empty when TLS is disabled'
@@ -3163,6 +3482,6 @@ case "$action" in
         restore
         ;;
     *)
-        fail 'usage: traefik-https.sh {preflight|prepare|switch|assert|verify|ack|drain|assert-drained|verify-drained|restore}; managed routing requires ingress-pool.manifest v2'
+        fail 'usage: traefik-ingress.sh {preflight|prepare|switch|assert|verify|ack|drain|assert-drained|verify-drained|restore}; managed routing requires ingress-pool.manifest v2'
         ;;
 esac

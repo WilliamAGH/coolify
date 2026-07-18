@@ -24,7 +24,7 @@ fail()
 usage()
 {
     printf '%s\n' \
-        'usage: package-host-gate-evidence.sh --mode full|exited OPERATION_DIRECTORY OPERATION OUTPUT_TAR' \
+        'usage: package-host-gate-evidence.sh --mode full|exited --platform linux/amd64|linux/arm64 OPERATION_DIRECTORY OPERATION OUTPUT_TAR' \
         'Validates an exported host-gate operation tree and writes one sanitized tar.'
 }
 
@@ -225,9 +225,9 @@ record_package_file()
 
 validate_image_transport()
 {
-    local key value archive expected_size
+    local key value archive expected_size host_platform
     local -a expected_keys=(
-        version operation_id web_source_reference proxy_source_reference
+        version operation_id host_platform web_source_reference proxy_source_reference
         web_archive_name web_archive_sha256 web_archive_metadata web_image_digest web_platform
         web_contract_sha256 proxy_archive_name proxy_archive_sha256 proxy_archive_metadata
         proxy_image_digest proxy_platform proxy_contract_sha256
@@ -251,6 +251,13 @@ validate_image_transport()
     [[ $(record_value "$manifest" version 'image transport manifest') == 1 \
         && $(record_value "$manifest" operation_id 'image transport manifest') == "$operation" ]] \
         || fail 'image transport manifest does not belong to this operation'
+    host_platform=$(record_value "$manifest" host_platform 'image transport manifest')
+    case "$host_platform" in
+        linux/amd64|linux/arm64) ;;
+        *) fail 'image transport manifest has an unsupported host platform' ;;
+    esac
+    [[ $host_platform == "$expected_platform" ]] \
+        || fail 'image transport manifest platform differs from the requested evidence platform'
     for key in web_source_reference proxy_source_reference; do
         value=$(record_value "$manifest" "$key" 'image transport manifest')
         [[ $value =~ ^[A-Za-z0-9][A-Za-z0-9._/:@-]*@sha256:[a-f0-9]{64}$ ]] \
@@ -262,9 +269,9 @@ validate_image_transport()
     for key in web_contract_sha256 proxy_contract_sha256 web_archive_sha256 proxy_archive_sha256; do
         assert_sha256_sum "$key" "$(record_value "$manifest" "$key" 'image transport manifest')"
     done
-    [[ $(record_value "$manifest" web_platform 'image transport manifest') == linux/amd64 \
-        && $(record_value "$manifest" proxy_platform 'image transport manifest') == linux/amd64 ]] \
-        || fail 'image transport manifest has a non-amd64 platform'
+    [[ $(record_value "$manifest" web_platform 'image transport manifest') == "$host_platform" \
+        && $(record_value "$manifest" proxy_platform 'image transport manifest') == "$host_platform" ]] \
+        || fail 'image transport manifest image platforms do not bind the exact host platform'
     [[ $(record_value "$manifest" web_archive_name 'image transport manifest') == web-image.tar \
         && $(record_value "$manifest" proxy_archive_name 'image transport manifest') == proxy-image.tar ]] \
         || fail 'image transport manifest has non-canonical archive names'
@@ -392,12 +399,17 @@ validate_outer_diagnostics()
 
 validate_host_evidence()
 {
-    local entry phase=
+    local entry phase='' host_platform
 
     assert_direct_entries_are_known "$operation_directory" 'host-gate operation' \
         boot-generation boot-record runtime-fence-host.phase runtime-fence-host.reboot-record \
         host-readiness-diagnostics outer-container-inspect.json outer-container-inspect.status \
-        outer-container-logs.txt outer-container-logs.status image-transport
+        outer-container-logs.txt outer-container-logs.status host-platform image-transport
+    assert_small_file "$operation_directory/host-platform" host-platform
+    host_platform=$(<"$operation_directory/host-platform")
+    [[ $host_platform == "$expected_platform" ]] \
+        || fail 'host-platform evidence differs from the requested evidence platform'
+    record_package_file host-platform
     validate_optional_control_files
 
     for entry in boot-generation boot-record runtime-fence-host.phase runtime-fence-host.reboot-record \
@@ -529,16 +541,21 @@ create_package()
         || fail 'published sanitized tar has an unsafe hard-link count'
 }
 
-[[ $# == 5 && $1 == --mode ]] || {
+[[ $# == 7 && $1 == --mode && $3 == --platform ]] || {
     usage >&2
     exit 64
 }
 mode=$2
-operation_directory=$3
-operation=$4
-output_tar=$5
+expected_platform=$4
+operation_directory=$5
+operation=$6
+output_tar=$7
 case "$mode" in
     full|exited) ;;
+    *) usage >&2; exit 64 ;;
+esac
+case "$expected_platform" in
+    linux/amd64|linux/arm64) ;;
     *) usage >&2; exit 64 ;;
 esac
 [[ $EUID -eq 0 ]] || fail 'packager must run as root to create a root-owned evidence snapshot'
@@ -579,5 +596,5 @@ validate_host_evidence
 [[ ${#package_paths[@]} -gt 0 ]] || fail 'no allowlisted evidence files are available to package'
 snapshot_package_files
 create_package
-printf 'CONTROL_PLANE_RUNTIME_FENCE_EVIDENCE_PACKAGE_PASS mode=%s operation=%s tar=%s\n' \
-    "$mode" "$operation" "$output_tar"
+printf 'CONTROL_PLANE_RUNTIME_FENCE_EVIDENCE_PACKAGE_PASS mode=%s platform=%s operation=%s tar=%s\n' \
+    "$mode" "$expected_platform" "$operation" "$output_tar"

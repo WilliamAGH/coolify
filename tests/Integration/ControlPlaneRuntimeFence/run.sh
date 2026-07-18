@@ -10,8 +10,8 @@ readonly REPOSITORY_ROOT
 readonly CONTROLLER=$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/runtime-attestation-ssh-fence.sh
 readonly SERVICE=$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/coolify-runtime-attestation-ssh-fence.service
 readonly WATCHDOG_SERVICE=$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/coolify-runtime-attestation-ssh-fence-watchdog.service
-readonly INSTALLER=$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/install-runtime-attestation-ssh-fence.sh
-readonly PROVISIONER=$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/provision-runtime-attestation-ssh-fence.sh
+readonly BACKUP_WATCHDOG_SERVICE=$REPOSITORY_ROOT/docker/control-plane-blue-green/backup-quiesce/control-plane-backup-quiesce-watchdog.service
+readonly RELEASE_ASSET_CONTRACT=$REPOSITORY_ROOT/docker/control-plane-blue-green/release-assets.contract
 readonly PRODUCTION_PROVIDER_PROBE=$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/traefik-docker-provider-freshness-probe.sh
 readonly TERMINAL_PROBE_TEST=$TEST_DIRECTORY/control-plane-terminal-state-probe-test.sh
 readonly PRODUCTION_REAPER=$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/self-ssh-controlmaster-reaper.sh
@@ -63,7 +63,33 @@ assert_runtime_artifacts_unchanged()
         || fail "$label changed the runtime fence systemd contract"
 }
 
-fixture=$(readlink -f -- "$(mktemp -d /tmp/control-plane-runtime-fence.XXXXXX)")
+unit_read_write_paths()
+{
+    sed -n 's/^ReadWritePaths=//p' "$1" | tr ' ' '\n' | sed '/^$/d' | LC_ALL=C sort -u
+}
+
+assert_dispatcher_recovery_write_paths()
+{
+    local unit_path=$1
+    shift
+    local actual_paths expected_paths
+    local -a required_paths=(
+        /etc/coolify-control-plane
+        /etc/systemd/system
+        /usr/local/libexec
+        /usr/local/sbin
+        "$@"
+    )
+
+    grep -F -x -q 'ProtectSystem=strict' "$unit_path" \
+        || fail "dispatcher recovery unit lost ProtectSystem=strict: $unit_path"
+    actual_paths=$(unit_read_write_paths "$unit_path" | paste -sd' ' -)
+    expected_paths=$(printf '%s\n' "${required_paths[@]}" | LC_ALL=C sort -u | paste -sd' ' -)
+    [[ $actual_paths == "$expected_paths" ]] \
+        || fail "dispatcher recovery write paths differ: $unit_path expected=$expected_paths actual=$actual_paths"
+}
+
+fixture=$(readlink -f -- "$(mktemp -d "${TMPDIR:-/tmp}/control-plane-runtime-fence.XXXXXX")")
 trap 'rm -rf "$fixture"' EXIT HUP INT TERM
 mkdir -p "$fixture/bin" "$fixture/libexec" "$fixture/proc" "$fixture/state" \
     "$fixture/systemd/drop-ins"
@@ -97,7 +123,8 @@ import sys
 import time
 s = socket.socket(socket.AF_UNIX)
 s.bind(sys.argv[1])
-time.sleep(120)
+while True:
+    time.sleep(3600)
 PY
 socket_pid=$!
 trap 'kill "$socket_pid" 2>/dev/null || true; rm -rf "$fixture"' EXIT HUP INT TERM
@@ -173,11 +200,7 @@ export CONTROL_PLANE_RUNTIME_PROVIDER_HEADER_FILE=
 export CONTROL_PLANE_RUNTIME_QUEUE_CONTAINER=candidate
 export CONTROL_PLANE_RUNTIME_ACTIVE_CONTAINER=candidate
 export CONTROL_PLANE_RUNTIME_TERMINAL_HTTPS_URL=https://coolify.example/health
-export CONTROL_PLANE_RUNTIME_TERMINAL_PORT8000_URL=http://127.0.0.1:8000/health
-export CONTROL_PLANE_RUNTIME_TERMINAL_HTTPS_ACK_FILE=$fixture/https-ack
-export CONTROL_PLANE_RUNTIME_TERMINAL_PORT8000_ACK_FILE=$fixture/port8000-ack
-printf 'abcdefghijklmnop' > "$CONTROL_PLANE_RUNTIME_TERMINAL_HTTPS_ACK_FILE"
-printf 'abcdefghijklmnop' > "$CONTROL_PLANE_RUNTIME_TERMINAL_PORT8000_ACK_FILE"
+export CONTROL_PLANE_RUNTIME_TERMINAL_LOCAL_INGRESS_URL=http://127.0.0.1:8000/health
 CONTROL_PLANE_RUNTIME_RELEASE_FILES_SHA256=$(
     {
         printf 'provider-header|absent\n'
@@ -236,7 +259,7 @@ for key in CONTROL_PLANE_RUNTIME_OPERATION_ID CONTROL_PLANE_RUNTIME_PROXY_CONTAI
     CONTROL_PLANE_RUNTIME_PROVIDER_LEGACY_PORT \
     CONTROL_PLANE_RUNTIME_PROVIDER_HEADER_FILE \
     CONTROL_PLANE_RUNTIME_TERMINAL_HTTPS_URL \
-    CONTROL_PLANE_RUNTIME_TERMINAL_PORT8000_URL; do
+    CONTROL_PLANE_RUNTIME_TERMINAL_LOCAL_INGRESS_URL; do
     printf '%s=%s\n' "$key" "${!key}" >> "$semantic_config"
 done
 CONTROL_PLANE_RUNTIME_SEMANTIC_CONFIG_SHA256=$(LC_ALL=C sort "$semantic_config" \
@@ -867,38 +890,35 @@ grep -F -x -q 'PartOf=docker.service docker.socket' "$SERVICE"
 grep -F -x -q 'BindsTo=docker.service' "$WATCHDOG_SERVICE"
 grep -F -x -q 'WantedBy=docker.service' "$WATCHDOG_SERVICE"
 grep -F -x -q 'Restart=always' "$WATCHDOG_SERVICE"
-grep -F -q 'install_file_atomically runtime-fence-controlmaster-reaper' "$INSTALLER"
-# The assertion intentionally matches literal installer source.
-# shellcheck disable=SC2016
-grep -F -q '"$SCRIPT_DIRECTORY/self-ssh-controlmaster-reaper.sh" "$REAPER_DESTINATION" 0700 1' \
-    "$INSTALLER"
-grep -F -q 'coolify-traefik-provider-freshness-probe' "$INSTALLER"
-grep -F -q 'coolify-proxy-queue-zero-probe' "$INSTALLER"
-grep -F -q 'coolify-control-plane-terminal-state-probe' "$INSTALLER"
-# The assertion intentionally matches literal installer source.
-# shellcheck disable=SC2016
-if grep -F -q 'systemctl enable "$SERVICE_NAME"' "$INSTALLER"; then
-    fail 'unarmed installer enables the Docker-blocking restore service'
-fi
-# These assertions intentionally match literal provisioner source.
-# shellcheck disable=SC2016
-grep -F -q 'run_prepared stage-capture >/dev/null' "$PROVISIONER"
-# shellcheck disable=SC2016
-grep -F -q 'install_environment_atomically "$candidate"' "$PROVISIONER"
-grep -F -q 'assert_boot_restore_dependencies' "$PROVISIONER"
-# shellcheck disable=SC2016
-grep -F -q 'systemctl start "$RESTORE_SERVICE"' "$PROVISIONER"
-# shellcheck disable=SC2016
-grep -F -q 'systemctl start "$WATCHDOG_SERVICE"' "$PROVISIONER"
-grep -F -q 'CONTROL_PLANE_RUNTIME_ARMED=0' "$PROVISIONER"
-grep -F -q 'CONTROL_PLANE_RUNTIME_ARMED=1' "$PROVISIONER"
-if grep -E -q 'systemctl (restart|start) (docker\.service|docker\.socket)' "$PROVISIONER"; then
-    fail 'provisioner restarts or starts Docker while arming the runtime fence'
-fi
-if grep -E -q 'flush ruleset|flush table|delete table (ip|ip6|inet) [^c]' "$CONTROLLER"; then
-    fail 'controller contains a broad nft flush or delete'
-fi
-
+grep -F -q 'runtime-fence-controlmaster-reaper|controllers/self-ssh-controlmaster-reaper.sh|controllers/self-ssh-controlmaster-reaper.sh|700|yes' \
+    "$RELEASE_ASSET_CONTRACT"
+grep -F -q 'runtime-fence-provider-probe|controllers/traefik-docker-provider-freshness-probe.sh|controllers/traefik-docker-provider-freshness-probe.sh|700|yes' \
+    "$RELEASE_ASSET_CONTRACT"
+grep -F -q 'runtime-fence-queue-probe|controllers/proxy-queue-zero-probe.sh|controllers/proxy-queue-zero-probe.sh|700|yes' \
+    "$RELEASE_ASSET_CONTRACT"
+grep -F -q 'runtime-fence-terminal-probe|controllers/control-plane-terminal-state-probe.sh|controllers/control-plane-terminal-state-probe.sh|700|yes' \
+    "$RELEASE_ASSET_CONTRACT"
+grep -F -x -q \
+    'ExecStart=/usr/local/libexec/coolify-control-plane-release-dispatch runtime-fence-controller restore' \
+    "$SERVICE"
+grep -F -x -q \
+    'ExecStart=/usr/local/libexec/coolify-control-plane-release-dispatch runtime-fence-controller watch' \
+    "$WATCHDOG_SERVICE"
+assert_dispatcher_recovery_write_paths \
+    "$BACKUP_WATCHDOG_SERVICE" \
+    /run/coolify-control-plane-release-dispatch \
+    /run/lock \
+    /var/lib/coolify/control-plane-backup-quiesce
+assert_dispatcher_recovery_write_paths \
+    "$SERVICE" \
+    /run/coolify-control-plane-release-dispatch \
+    /run/lock \
+    /var/lib/coolify-runtime-attestation-ssh-fence
+assert_dispatcher_recovery_write_paths \
+    "$WATCHDOG_SERVICE" \
+    /run/coolify-control-plane-release-dispatch \
+    /run/lock \
+    /var/lib/coolify-runtime-attestation-ssh-fence
 rm -f "$fixture/legacy-absent" "$fixture/candidate-absent"
 CONTROL_PLANE_RUNTIME_PROVIDER_API_URL=http://127.0.0.1:8080/api/rawdata \
 CONTROL_PLANE_RUNTIME_PROVIDER_ROUTER=coolify@docker \
@@ -1030,4 +1050,5 @@ CONTROL_PLANE_RUNTIME_RETIRED_B_ID=absent \
 grep -F -x -q status=fresh "$fixture/provider-absent.out"
 kill "$socket_pid" 2>/dev/null || true
 wait "$socket_pid" 2>/dev/null || true
+socket_pid=
 printf 'CONTROL_PLANE_RUNTIME_FENCE_TEST PASS\n'

@@ -10,9 +10,12 @@ umask 077
 
 readonly REPOSITORY_ROOT=/workspace
 readonly TEST_DIRECTORY=$REPOSITORY_ROOT/tests/Integration/ControlPlaneRuntimeFence
-readonly INSTALLER=$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/install-runtime-attestation-ssh-fence.sh
-readonly PROVISIONER=/usr/local/sbin/coolify-runtime-fence-provision
-readonly CONTROLLER=/usr/local/libexec/coolify-runtime-attestation-ssh-fence
+readonly REVIEWED_RELEASE_SOURCE=$REPOSITORY_ROOT/docker/control-plane-blue-green
+readonly RELEASE_ID=runtime-fence-host-release-000001
+readonly RELEASE_DIRECTORY=/usr/local/lib/coolify-control-plane/releases/$RELEASE_ID
+readonly PROVISIONER=$RELEASE_DIRECTORY/controllers/provision-runtime-attestation-ssh-fence.sh
+readonly CONTROLLER=$RELEASE_DIRECTORY/controllers/runtime-attestation-ssh-fence.sh
+readonly RELEASE_DISPATCHER=/usr/local/libexec/coolify-control-plane-release-dispatch
 readonly CONFIG_DIRECTORY=/etc/coolify-runtime-attestation-ssh-fence
 readonly RUNTIME_ENV=$CONFIG_DIRECTORY/runtime.env
 readonly HOST_GATE_DIRECTORY=/var/lib/coolify-runtime-fence-host-gate
@@ -65,6 +68,43 @@ assert_image_digest()
         || blocked "$1 is not an immutable inner image config digest"
 }
 
+host_gate_platform_from_uname()
+{
+    local system=$1 machine=$2
+
+    [[ $system == Linux ]] || fail "inner host is not native Linux: system=$system"
+    case "$machine" in
+        x86_64|amd64) printf '%s' linux/amd64 ;;
+        aarch64|arm64) printf '%s' linux/arm64 ;;
+        *) fail "inner host architecture is unsupported: machine=$machine" ;;
+    esac
+}
+
+host_gate_platform()
+{
+    local expected_platform=${CONTROL_PLANE_RUNTIME_HOST_GATE_PLATFORM:-}
+    local native_platform
+
+    case "$expected_platform" in
+        linux/amd64|linux/arm64) ;;
+        *) blocked 'inner host is missing an approved host-gate platform attestation' ;;
+    esac
+    native_platform=$(host_gate_platform_from_uname "$(uname -s)" "$(uname -m)")
+    [[ $native_platform == "$expected_platform" ]] \
+        || blocked "inner native host differs from the propagated host-gate platform: expected=$expected_platform host=$native_platform"
+    printf '%s' "$native_platform"
+}
+
+assert_inner_native_docker_platform()
+{
+    local actual_platform
+
+    actual_platform=$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}') \
+        || blocked 'inner host could not attest the nested Docker platform'
+    [[ $actual_platform == "$HOST_GATE_PLATFORM" ]] \
+        || blocked "nested Docker platform differs from the native inner host; emulation is forbidden: expected=$HOST_GATE_PLATFORM actual=$actual_platform"
+}
+
 assert_sha256_evidence()
 {
     [[ $2 =~ ^[a-f0-9]{64}$ ]] \
@@ -79,7 +119,7 @@ assert_loaded_transport_image()
     docker image inspect "$image" >/dev/null \
         || blocked "inner Docker is missing the imported $role image"
     [[ $(docker image inspect --format '{{.Id}}' "$image") == "$image" \
-        && $(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image") == linux/amd64 ]] \
+        && $(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image") == "$HOST_GATE_PLATFORM" ]] \
         || fail "inner Docker transport image content or platform differs for $role"
 }
 
@@ -160,7 +200,7 @@ stack_contract_keys()
         web_b_direct_probe_token_file web_b_direct_probe_runtime_file \
         web_a_applied_ack_file web_a_applied_ack_runtime_file \
         web_b_applied_ack_file web_b_applied_ack_runtime_file web_a_ingress_address \
-        web_b_ingress_address terminal_https_url terminal_port8000_url management_endpoints \
+        web_b_ingress_address terminal_https_url terminal_local_ingress_url management_endpoints \
         self_ssh_target provider_api_url provider_router provider_service provider_legacy_port \
         provider_header_file
 }
@@ -266,9 +306,10 @@ assert_stack_contract()
         && $(stack_value web_a_loopback_port) =~ ^[1-9][0-9]{0,4}$ \
         && $(stack_value web_b_loopback_port) =~ ^[1-9][0-9]{0,4}$ ]] \
         || fail 'stack writer, ownership, or port contract is malformed'
-    [[ $(stack_value terminal_https_url) == https://127.0.0.1:8443/api/control-plane/route-health \
-        && $(stack_value terminal_port8000_url) == http://127.0.0.1:8000/api/control-plane/route-health ]] \
-        || fail 'stack terminal endpoints differ from the isolated loopback contract'
+    [[ $(stack_value terminal_https_url) == https://127.0.0.1:8443/api/control-plane/route-health ]] \
+        || fail 'stack terminal endpoint differs from the isolated loopback contract'
+    [[ $(stack_value terminal_local_ingress_url) == http://127.0.0.1:8000/api/control-plane/route-health ]] \
+        || fail 'stack native Traefik loopback endpoint differs from the isolated loopback contract'
     [[ $(stack_value management_endpoints) == lo=127.0.0.1 \
         && $(stack_value self_ssh_target) == 127.0.0.1 ]] \
         || fail 'stack management or self-SSH endpoint differs from the disposable-host contract'
@@ -327,12 +368,13 @@ stack_action()
     # the exact ordered contract after bootstrap, support start-green,
     # start-green-wrong-coordination-mount, start-green-wrong-private-volume,
     # remove-retired, lease/marker negative actions, and cleanup. Its stack is
-    # real only when the supplied immutable images, TLS, :8000, provider, queue,
+    # real only when the supplied immutable images, TLS, provider, queue,
     # and self-SSH observations are available; absent inputs must fail, not stub.
     contract=$(stack_contract_path "$operation")
     install -d -m 0700 -o root -g root "$(stack_operation_directory "$operation")"
     env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
         CONTROL_PLANE_RUNTIME_HOST_GATE_OPERATION="$operation" \
+        CONTROL_PLANE_RUNTIME_HOST_GATE_PLATFORM="$HOST_GATE_PLATFORM" \
         CONTROL_PLANE_RUNTIME_HOST_GATE_ROOT="$(stack_operation_directory "$operation")" \
         CONTROL_PLANE_RUNTIME_WEB_A_IMAGE="$CONTROL_PLANE_RUNTIME_WEB_A_IMAGE" \
         CONTROL_PLANE_RUNTIME_WEB_B_IMAGE="$CONTROL_PLANE_RUNTIME_WEB_B_IMAGE" \
@@ -379,6 +421,7 @@ assert_disposable_host()
         && ! -L /run/coolify-runtime-fence-host-boot-generation \
         && $(file_metadata /run/coolify-runtime-fence-host-boot-generation) == 0:0:400:* ]] \
         || fail 'inner /run boot-generation marker is absent or unsafe'
+    assert_inner_native_docker_platform
     docker info >/dev/null || fail 'nested Docker daemon is unavailable'
     ssh -F /dev/null -i /root/.ssh/id_ed25519 -o BatchMode=yes -o ConnectTimeout=3 \
         -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@127.0.0.1 true >/dev/null \
@@ -408,21 +451,106 @@ restore_immutable_images()
         "$CONTROL_PLANE_RUNTIME_WEB_A_IMAGE" "$CONTROL_PLANE_RUNTIME_PROXY_IMAGE"
 }
 
+assert_installed_dispatcher_recovery_write_paths()
+{
+    local unit actual_paths recovery_path
+    local -a units=(
+        control-plane-backup-quiesce-watchdog.service
+        coolify-runtime-attestation-ssh-fence.service
+        coolify-runtime-attestation-ssh-fence-watchdog.service
+    )
+    local -a recovery_paths=(
+        /etc/coolify-control-plane
+        /etc/systemd/system
+        /usr/local/libexec
+        /usr/local/sbin
+    )
+
+    for unit in "${units[@]}"; do
+        [[ $(systemctl show "$unit" --property=ProtectSystem --value) == strict ]] \
+            || fail "installed dispatcher recovery unit lost ProtectSystem=strict: $unit"
+        actual_paths=$(systemctl show "$unit" --property=ReadWritePaths --value)
+        for recovery_path in "${recovery_paths[@]}"; do
+            [[ " $actual_paths " == *" $recovery_path "* ]] \
+                || fail "installed dispatcher recovery unit cannot restore $recovery_path: $unit"
+        done
+    done
+}
+
+assert_dispatcher_recovery_sandbox_write_access()
+{
+    local marker directory
+    local -a recovery_directories=(
+        /etc/coolify-control-plane
+        /etc/systemd/system
+        /usr/local/libexec
+        /usr/local/sbin
+    )
+
+    marker="coolify-release-dispatch-sandbox-${RANDOM}-${RANDOM}"
+    # shellcheck disable=SC2016 # This literal script runs in the transient systemd service.
+    if ! systemd-run --quiet --wait --collect \
+        --unit=coolify-release-dispatch-sandbox-recovery \
+        --property=ProtectSystem=strict \
+        '--property=ReadWritePaths=/etc/coolify-control-plane /etc/systemd/system /usr/local/libexec /usr/local/sbin' \
+        /bin/bash -ceu '
+            marker=$1
+            shift
+            for directory in "$@"; do
+                candidate="$directory/.$marker"
+                : > "$candidate"
+                [[ -f $candidate && ! -L $candidate ]]
+                rm -f -- "$candidate"
+            done
+            if (: > "/etc/.$marker") 2>/dev/null; then
+                rm -f -- "/etc/.$marker"
+                exit 1
+            fi
+        ' bash "$marker" "${recovery_directories[@]}"; then
+        for directory in "${recovery_directories[@]}"; do
+            rm -f -- "$directory/.$marker"
+        done
+        fail 'ProtectSystem=strict sandbox cannot perform the dispatcher recovery writes'
+    fi
+    for directory in "${recovery_directories[@]}"; do
+        [[ ! -e $directory/.$marker && ! -L $directory/.$marker ]] \
+            || fail "dispatcher recovery sandbox left a temporary file: $directory"
+    done
+}
+
 assert_installed_assets()
 {
-    local source destination
+    local source destination installer
+    local staged_release_source=/run/coolify-control-plane-release-source
     local -a assets=(
         "$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/runtime-attestation-ssh-fence.sh:$CONTROLLER"
         "$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/provision-runtime-attestation-ssh-fence.sh:$PROVISIONER"
-        "$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/traefik-docker-provider-freshness-probe.sh:/usr/local/libexec/coolify-traefik-provider-freshness-probe"
-        "$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/proxy-queue-zero-probe.sh:/usr/local/libexec/coolify-proxy-queue-zero-probe"
-        "$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/control-plane-terminal-state-probe.sh:/usr/local/libexec/coolify-control-plane-terminal-state-probe"
-        "$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/self-ssh-controlmaster-reaper.sh:/usr/local/libexec/coolify-self-ssh-controlmaster-reaper"
+        "$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/traefik-docker-provider-freshness-probe.sh:$RELEASE_DIRECTORY/controllers/traefik-docker-provider-freshness-probe.sh"
+        "$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/proxy-queue-zero-probe.sh:$RELEASE_DIRECTORY/controllers/proxy-queue-zero-probe.sh"
+        "$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/control-plane-terminal-state-probe.sh:$RELEASE_DIRECTORY/controllers/control-plane-terminal-state-probe.sh"
+        "$REPOSITORY_ROOT/docker/control-plane-blue-green/controllers/self-ssh-controlmaster-reaper.sh:$RELEASE_DIRECTORY/controllers/self-ssh-controlmaster-reaper.sh"
     )
 
-    "$INSTALLER" | grep -F -x -q \
-        'CONTROL_PLANE_RUNTIME_FENCE_INSTALL complete=true armed=false services_enabled=false' \
-        || fail 'real runtime-fence installer did not report an unarmed installation'
+    rm -rf -- "$staged_release_source"
+    mkdir -p "$staged_release_source"
+    cp -R "$REVIEWED_RELEASE_SOURCE/." "$staged_release_source/"
+    installer=$staged_release_source/controllers/install-runtime-attestation-ssh-fence.sh
+    [[ -x $installer && $(file_metadata "$installer") == 0:0:*:* ]] \
+        || fail 'runtime-fence installer staging did not produce a root-owned reviewed source tree'
+    if "$installer" > /run/runtime-fence-component-no-release.out 2>&1; then
+        fail 'retired component-only runtime-fence installation succeeded without a release ID'
+    fi
+    grep -F -q 'component-only installation is retired; provide RELEASE_ID' \
+        /run/runtime-fence-component-no-release.out \
+        || fail 'runtime-fence component installer did not require the complete bundle interface'
+    "$installer" "$RELEASE_ID" | grep -E -x -q \
+        "CONTROL_PLANE_RELEASE_BUNDLE_INSTALL complete=true release_id=${RELEASE_ID} manifest=/etc/coolify-control-plane/release.manifest manifest_sha256=[a-f0-9]{64} release_directory=${RELEASE_DIRECTORY}" \
+        || fail 'runtime-fence component installer did not publish the complete release bundle'
+    [[ -f $RELEASE_DISPATCHER && ! -L $RELEASE_DISPATCHER \
+        && $(file_metadata "$RELEASE_DISPATCHER") == 0:0:700:* ]] \
+        || fail 'complete release bundle did not publish the stable dispatcher'
+    grep -F -x -q "release|$RELEASE_ID" /etc/coolify-control-plane/release.manifest \
+        || fail 'complete release manifest does not select the installed release ID'
     for source in "${assets[@]}"; do
         destination=${source#*:}
         source=${source%%:*}
@@ -430,9 +558,19 @@ assert_installed_assets()
             && $(sha256_file "$destination") == "$(sha256_file "$source")" ]] \
             || fail "installed production asset differs from reviewed source: $destination"
     done
+    grep -F -x -q \
+        'ExecStart=/usr/local/libexec/coolify-control-plane-release-dispatch runtime-fence-controller restore' \
+        /etc/systemd/system/$RESTORE_SERVICE \
+        || fail 'restore unit does not traverse the crash-safe release dispatcher'
+    grep -F -x -q \
+        'ExecStart=/usr/local/libexec/coolify-control-plane-release-dispatch runtime-fence-controller watch' \
+        /etc/systemd/system/$WATCHDOG_SERVICE \
+        || fail 'watchdog unit does not traverse the crash-safe release dispatcher'
     systemd-analyze verify \
         /etc/systemd/system/$RESTORE_SERVICE \
         /etc/systemd/system/$WATCHDOG_SERVICE
+    assert_installed_dispatcher_recovery_write_paths
+    assert_dispatcher_recovery_sandbox_write_access
 }
 
 assert_exact_volume_mount()
@@ -488,8 +626,8 @@ assert_bootstrap_stack()
         "$(stack_value blue_web_b_private_volume)" "$(stack_value coordination_volume)"
     curl --fail --silent --show-error --max-time 5 "$(stack_value terminal_https_url)" >/dev/null \
         || blocked 'real TLS terminal endpoint is unavailable before the fence is armed'
-    curl --fail --silent --show-error --max-time 5 "$(stack_value terminal_port8000_url)" >/dev/null \
-        || blocked 'real loopback :8000 terminal endpoint is unavailable before the fence is armed'
+    curl --fail --silent --show-error --max-time 5 "$(stack_value terminal_local_ingress_url)" >/dev/null \
+        || blocked 'real native Traefik loopback endpoint is unavailable before the fence is armed'
 }
 
 set_live_fixture_environment()
@@ -596,8 +734,7 @@ write_semantic_configuration()
         printf 'CONTROL_PLANE_RUNTIME_PROVIDER_LEGACY_PORT=%s\n' "$(stack_value provider_legacy_port)"
         printf 'CONTROL_PLANE_RUNTIME_PROVIDER_HEADER_FILE=%s\n' "$(stack_value provider_header_file)"
         printf 'CONTROL_PLANE_RUNTIME_TERMINAL_HTTPS_URL=%s\n' "$(stack_value terminal_https_url)"
-        printf 'CONTROL_PLANE_RUNTIME_TERMINAL_PORT8000_URL=%s\n' \
-            "$(stack_value terminal_port8000_url)"
+        printf 'CONTROL_PLANE_RUNTIME_TERMINAL_LOCAL_INGRESS_URL=%s\n' "$(stack_value terminal_local_ingress_url)"
     } > "$candidate"
     publish_root_file "$configuration" "$candidate"
     printf '%s\n' "$configuration"
@@ -1158,7 +1295,8 @@ operation=$2
 }
 assert_identifier host-gate-operation "$operation"
 for required in \
-    CONTROL_PLANE_RUNTIME_HOST_GATE_OPERATION CONTROL_PLANE_RUNTIME_LIVE_STACK_COMMAND \
+    CONTROL_PLANE_RUNTIME_HOST_GATE_OPERATION CONTROL_PLANE_RUNTIME_HOST_GATE_PLATFORM \
+    CONTROL_PLANE_RUNTIME_LIVE_STACK_COMMAND \
     CONTROL_PLANE_RUNTIME_WEB_A_IMAGE \
     CONTROL_PLANE_RUNTIME_WEB_B_IMAGE CONTROL_PLANE_RUNTIME_PROXY_IMAGE \
     CONTROL_PLANE_RUNTIME_IMAGE_TRANSPORT_MANIFEST_SHA256; do
@@ -1166,6 +1304,8 @@ for required in \
 done
 [[ $CONTROL_PLANE_RUNTIME_HOST_GATE_OPERATION == "$operation" ]] \
     || fail 'inner host-gate operation environment differs from the requested operation'
+HOST_GATE_PLATFORM=$(host_gate_platform)
+readonly HOST_GATE_PLATFORM
 
 assert_disposable_host
 copy_image_transport

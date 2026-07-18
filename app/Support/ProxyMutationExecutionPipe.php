@@ -30,13 +30,19 @@ class ProxyMutationExecutionPipe
         }
 
         if ($reservedJob === null) {
-            return ControlPlaneMode::withMutationLease(static fn (): mixed => $next($command));
+            return ProxyMutationQueue::serializeMarkedExecution(
+                static fn (): mixed => ControlPlaneMode::withMutationLease(
+                    static fn (): mixed => $next($command),
+                ),
+            );
         }
 
-        return ControlPlaneMode::withMutationDrainLease(
-            $reservedJob,
-            static fn (): mixed => $next($command),
-            $command,
+        return ProxyMutationQueue::serializeMarkedExecution(
+            static fn (): mixed => ControlPlaneMode::withMutationDrainLease(
+                $reservedJob,
+                static fn (): mixed => $next($command),
+                $command,
+            ),
         );
     }
 

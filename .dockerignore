@@ -6,7 +6,6 @@
 /vendor
 .env*
 !/.env.development.example
-!/.env.windows-docker-desktop.example
 .phpunit.result.cache
 Homestead.json
 Homestead.yaml

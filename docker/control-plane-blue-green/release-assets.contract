@@ -1,0 +1,16 @@
+operator|control-plane-blue-green.sh|control-plane-blue-green.sh|755|yes
+operator-compose|compose.yaml|compose.yaml|600|no
+rehearsal-compose|compose.rehearsal.yaml|compose.rehearsal.yaml|600|no
+ingress-controller|controllers/traefik-ingress.sh|controllers/traefik-ingress.sh|700|yes
+backup-attestation-verifier|backup/restore-attest.sh|backup/restore-attest.sh|755|yes
+backup-quiesce-controller|backup-quiesce/control-plane-backup-quiesce.sh|backup-quiesce/control-plane-backup-quiesce.sh|755|yes
+backup-quiesce-service-unit|backup-quiesce/control-plane-backup-quiesce-watchdog.service|backup-quiesce/control-plane-backup-quiesce-watchdog.service|644|no
+backup-quiesce-timer-unit|backup-quiesce/control-plane-backup-quiesce-watchdog.timer|backup-quiesce/control-plane-backup-quiesce-watchdog.timer|644|no
+runtime-fence-provisioner|controllers/provision-runtime-attestation-ssh-fence.sh|controllers/provision-runtime-attestation-ssh-fence.sh|700|yes
+runtime-fence-controller|controllers/runtime-attestation-ssh-fence.sh|controllers/runtime-attestation-ssh-fence.sh|700|yes
+runtime-fence-controlmaster-reaper|controllers/self-ssh-controlmaster-reaper.sh|controllers/self-ssh-controlmaster-reaper.sh|700|yes
+runtime-fence-provider-probe|controllers/traefik-docker-provider-freshness-probe.sh|controllers/traefik-docker-provider-freshness-probe.sh|700|yes
+runtime-fence-queue-probe|controllers/proxy-queue-zero-probe.sh|controllers/proxy-queue-zero-probe.sh|700|yes
+runtime-fence-terminal-probe|controllers/control-plane-terminal-state-probe.sh|controllers/control-plane-terminal-state-probe.sh|700|yes
+runtime-fence-service-unit|controllers/coolify-runtime-attestation-ssh-fence.service|controllers/coolify-runtime-attestation-ssh-fence.service|644|no
+runtime-fence-watchdog-unit|controllers/coolify-runtime-attestation-ssh-fence-watchdog.service|controllers/coolify-runtime-attestation-ssh-fence-watchdog.service|644|no

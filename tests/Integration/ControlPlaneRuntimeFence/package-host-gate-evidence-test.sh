@@ -70,8 +70,11 @@ write_root_file()
 
 new_operation()
 {
+    local platform=${2:-linux/amd64}
+
     operation_directory=$test_root/evidence/$1
     install -d -m 0700 -o root -g root "$operation_directory"
+    write_root_file "$operation_directory/host-platform" "$platform"$'\n'
 }
 
 write_outer_diagnostics()
@@ -100,7 +103,12 @@ write_control_records()
 
 write_transport_manifest()
 {
-    local operation=$1 version=${2:-1} transport web_size proxy_size web_sha proxy_sha
+    local operation=$1 version=${2:-1} host_platform web_platform proxy_platform
+    local transport web_size proxy_size web_sha proxy_sha
+
+    host_platform=${3:-linux/amd64}
+    web_platform=${4:-$host_platform}
+    proxy_platform=${5:-$host_platform}
     readonly_digest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     contract_digest=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
     transport=$operation_directory/image-transport/$operation
@@ -114,49 +122,54 @@ write_transport_manifest()
     write_root_file "$transport/images.env" \
         "version=$version"$'\n'\
         "operation_id=$operation"$'\n'\
+        "host_platform=$host_platform"$'\n'\
         "web_source_reference=registry.invalid/web@sha256:$readonly_digest"$'\n'\
         "proxy_source_reference=registry.invalid/proxy@sha256:$readonly_digest"$'\n'\
         'web_archive_name=web-image.tar'$'\n'\
         "web_archive_sha256=$web_sha"$'\n'\
         "web_archive_metadata=0:0:600:$web_size"$'\n'\
         "web_image_digest=sha256:$readonly_digest"$'\n'\
-        'web_platform=linux/amd64'$'\n'\
+        "web_platform=$web_platform"$'\n'\
         "web_contract_sha256=$contract_digest"$'\n'\
         'proxy_archive_name=proxy-image.tar'$'\n'\
         "proxy_archive_sha256=$proxy_sha"$'\n'\
         "proxy_archive_metadata=0:0:600:$proxy_size"$'\n'\
         "proxy_image_digest=sha256:$readonly_digest"$'\n'\
-        'proxy_platform=linux/amd64'$'\n'\
+        "proxy_platform=$proxy_platform"$'\n'\
         "proxy_contract_sha256=$contract_digest"$'\n'
 }
 
 make_exited_operation()
 {
-    new_operation "$1"
+    new_operation "$1" "${2:-linux/amd64}"
     write_outer_diagnostics
 }
 
 make_complete_full_operation()
 {
-    new_operation "$1"
-    write_control_records "$1"
-    write_transport_manifest "$1"
+    local operation=$1 platform=${2:-linux/amd64}
+
+    new_operation "$operation" "$platform"
+    write_control_records "$operation"
+    write_transport_manifest "$operation" 1 "$platform"
 }
 
 run_packager()
 {
-    local mode=$1 operation=$2 output=$3
+    local mode=$1 operation=$2 output=$3 platform=${4:-linux/amd64}
 
-    "$packager" --mode "$mode" "$test_root/evidence/$operation" "$operation" "$output"
+    "$packager" --mode "$mode" --platform "$platform" \
+        "$test_root/evidence/$operation" "$operation" "$output"
 }
 
 expect_rejection()
 {
-    local label=$1 mode=$2 operation=$3 output
+    local label=$1 mode=$2 operation=$3 platform=${4:-linux/amd64} output
 
     output=$test_root/output/$operation.tar
 
-    if run_packager "$mode" "$operation" "$output" > "$test_root/$operation.failure.log" 2>&1; then
+    if run_packager "$mode" "$operation" "$output" "$platform" \
+        > "$test_root/$operation.failure.log" 2>&1; then
         fail "$label unexpectedly passed"
     fi
     [[ ! -e $output && ! -L $output ]] || fail "$label published an output tar"
@@ -212,6 +225,9 @@ assert_workflow_contract()
         "$workflow" >/dev/null || fail 'workflow package output does not use the absolute package directory'
     grep -F -x "$expected_invocation" \
         "$workflow" >/dev/null || fail 'workflow does not invoke the exact packager by absolute path'
+    # shellcheck disable=SC2016 # This is a literal GitHub Actions shell contract.
+    grep -F -x '              --mode "$mode" --platform "$PLATFORM" "$operation_directory" "$operation" "$output"; then' \
+        "$workflow" >/dev/null || fail 'workflow does not bind packaged evidence to the native matrix platform'
     grep -F -x '        id: upload-production-host-gate-evidence' "$workflow" >/dev/null \
         || fail 'workflow evidence upload has no stable step id'
     grep -F "$expected_artifact" \
@@ -229,7 +245,7 @@ assert_signal_contracts()
     chmod 0600 "$operation_directory/host-readiness-diagnostics"
     output=$test_root/output/$operation.tar
     set +e
-    "$packager" --mode exited "$operation_directory" "$operation" "$output" \
+    "$packager" --mode exited --platform linux/amd64 "$operation_directory" "$operation" "$output" \
         > "$test_root/packager-signal.log" 2>&1 &
     packager_pid=$!
     for ((attempt = 0; attempt < 100; attempt++)); do
@@ -299,6 +315,9 @@ assert_tar_member_matches_source "$test_root/output/complete-full.tar" \
     "$test_root/evidence/complete-full/image-transport/complete-full/images.env" \
     image-transport/complete-full/images.env
 
+make_complete_full_operation positive-arm64 linux/arm64
+run_packager full positive-arm64 "$test_root/output/positive-arm64.tar" linux/arm64 >/dev/null
+
 new_operation partial-failed-full
 write_root_file "$operation_directory/host-readiness-diagnostics" 'docker.service failed'$'\n'
 run_packager full partial-failed-full "$test_root/output/partial-failed-full.tar" >/dev/null
@@ -359,6 +378,18 @@ make_complete_full_operation negative-manifest
 write_transport_manifest negative-manifest 2
 expect_rejection malformed-manifest full negative-manifest
 
+make_complete_full_operation negative-platform-mismatch linux/arm64
+write_transport_manifest negative-platform-mismatch 1 linux/arm64 linux/amd64 linux/arm64
+expect_rejection mismatched-platform full negative-platform-mismatch linux/arm64
+
+make_complete_full_operation negative-host-platform-evidence linux/arm64
+write_root_file "$operation_directory/host-platform" 'linux/amd64'$'\n'
+expect_rejection host-platform-evidence full negative-host-platform-evidence linux/arm64
+
+make_complete_full_operation negative-unsupported-host-platform
+write_transport_manifest negative-unsupported-host-platform 1 linux/386
+expect_rejection unsupported-host-platform full negative-unsupported-host-platform
+
 make_exited_operation negative-output-collision
 write_root_file "$test_root/output/negative-output-collision.tar" 'existing output'$'\n'
 if run_packager exited negative-output-collision \
@@ -377,4 +408,4 @@ fi
 
 assert_workflow_contract
 assert_signal_contracts
-printf 'CONTROL_PLANE_RUNTIME_FENCE_EVIDENCE_PACKAGE_TEST_PASS cases=19 absolute_workflow_caller=true signal_status_preserved=true tar_member_identity=true\n'
+printf 'CONTROL_PLANE_RUNTIME_FENCE_EVIDENCE_PACKAGE_TEST_PASS cases=23 absolute_workflow_caller=true signal_status_preserved=true tar_member_identity=true arm64_transport=true\n'

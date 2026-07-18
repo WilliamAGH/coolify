@@ -4,7 +4,6 @@ set -eu
 
 readonly DEFAULT_STATE_DIRECTORY=/var/lib/coolify/control-plane-backup-quiesce
 readonly INSTALLED_OPERATOR=/usr/local/sbin/control-plane-blue-green
-readonly INSTALLED_CONTROLLER=/usr/local/libexec/coolify/control-plane-backup-quiesce
 readonly INSTALLED_SERVICE_UNIT=/etc/systemd/system/control-plane-backup-quiesce-watchdog.service
 readonly INSTALLED_TIMER_UNIT=/etc/systemd/system/control-plane-backup-quiesce-watchdog.timer
 readonly LEASE_CONTROLLER_MARGIN_SECONDS=10
@@ -1287,6 +1286,7 @@ load_public_configuration()
     minimum_capture_seconds=${CONTROL_PLANE_BACKUP_QUIESCE_MINIMUM_CAPTURE_SECONDS:-300}
     operator_path=${CONTROL_PLANE_BACKUP_QUIESCE_OPERATOR_PATH:-}
     operator_sha256=${CONTROL_PLANE_BACKUP_QUIESCE_OPERATOR_SHA256:-}
+    expected_controller_path=${CONTROL_PLANE_BACKUP_QUIESCE_CONTROLLER_PATH:-}
     expected_controller_sha256=${CONTROL_PLANE_BACKUP_QUIESCE_CONTROLLER_SHA256:-}
     service_unit_path=${CONTROL_PLANE_BACKUP_QUIESCE_SERVICE_UNIT_PATH:-}
     expected_service_unit_sha256=${CONTROL_PLANE_BACKUP_QUIESCE_SERVICE_UNIT_SHA256:-}
@@ -1311,6 +1311,7 @@ load_public_configuration()
     require_value CONTROL_PLANE_BACKUP_APPLICATION_DATABASE_ROLE "$application_database_role"
     require_value CONTROL_PLANE_BACKUP_QUIESCE_OPERATOR_PATH "$operator_path"
     require_value CONTROL_PLANE_BACKUP_QUIESCE_OPERATOR_SHA256 "$operator_sha256"
+    require_value CONTROL_PLANE_BACKUP_QUIESCE_CONTROLLER_PATH "$expected_controller_path"
     require_value CONTROL_PLANE_BACKUP_QUIESCE_CONTROLLER_SHA256 "$expected_controller_sha256"
     require_value CONTROL_PLANE_BACKUP_QUIESCE_SERVICE_UNIT_PATH "$service_unit_path"
     require_value CONTROL_PLANE_BACKUP_QUIESCE_SERVICE_UNIT_SHA256 "$expected_service_unit_sha256"
@@ -1356,6 +1357,7 @@ load_public_configuration()
         || fail 'configured backup quiesce acquisition and capture budgets exceed the maximum lease'
     validate_path "$operator_path" CONTROL_PLANE_BACKUP_QUIESCE_OPERATOR_PATH
     validate_sha256 "$operator_sha256" CONTROL_PLANE_BACKUP_QUIESCE_OPERATOR_SHA256
+    validate_path "$expected_controller_path" CONTROL_PLANE_BACKUP_QUIESCE_CONTROLLER_PATH
     validate_sha256 "$expected_controller_sha256" CONTROL_PLANE_BACKUP_QUIESCE_CONTROLLER_SHA256
     validate_path "$service_unit_path" CONTROL_PLANE_BACKUP_QUIESCE_SERVICE_UNIT_PATH
     validate_sha256 "$expected_service_unit_sha256" CONTROL_PLANE_BACKUP_QUIESCE_SERVICE_UNIT_SHA256
@@ -1424,6 +1426,8 @@ validate_lease_budget()
 assert_pinned_runtime()
 {
     controller_path=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)/$(basename -- "$0")
+    [ "$controller_path" = "$expected_controller_path" ] \
+        || fail 'backup quiesce controller path differs from its pinned release path'
     assert_regular_non_symlink "$operator_path" 'backup quiesce operator'
     assert_regular_non_symlink "$controller_path" 'backup quiesce controller'
     assert_regular_non_symlink "$service_unit_path" 'backup quiesce watchdog service unit'
@@ -1438,10 +1442,13 @@ assert_pinned_runtime()
         || fail 'backup quiesce watchdog timer unit differs from its pinned digest'
     if [ "$test_mode" = 0 ]; then
         [ "$operator_path" = "$INSTALLED_OPERATOR" ] \
-            && [ "$controller_path" = "$INSTALLED_CONTROLLER" ] \
             && [ "$service_unit_path" = "$INSTALLED_SERVICE_UNIT" ] \
             && [ "$timer_unit_path" = "$INSTALLED_TIMER_UNIT" ] \
             || fail 'production backup quiesce must use immutable installed operator/controller/unit paths'
+        case "$controller_path" in
+            /usr/local/lib/coolify-control-plane/releases/*/backup-quiesce/control-plane-backup-quiesce.sh) ;;
+            *) fail 'production backup quiesce controller is outside the active versioned release' ;;
+        esac
         for immutable_path in "$operator_path" "$controller_path" "$service_unit_path" "$timer_unit_path"; do
             [ "$(file_uid "$immutable_path")" = 0 ] \
                 && [ "$(file_gid "$immutable_path")" = 0 ] \

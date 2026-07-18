@@ -41,7 +41,7 @@ docker run --rm --volume "$REPOSITORY_ROOT:/workspace:ro" "$UBUNTU_IMAGE" \
                 printf "CONTROL_PLANE_RUNTIME_PROVIDER_LEGACY_PORT=8080\n"
                 printf "CONTROL_PLANE_RUNTIME_PROVIDER_HEADER_FILE=/run/provider-header\n"
                 printf "CONTROL_PLANE_RUNTIME_TERMINAL_HTTPS_URL=https://coolify.example/api/health\n"
-                printf "CONTROL_PLANE_RUNTIME_TERMINAL_PORT8000_URL=http://127.0.0.1:8000/api/health\n"
+                printf "CONTROL_PLANE_RUNTIME_TERMINAL_LOCAL_INGRESS_URL=http://127.0.0.1:8000/api/health\n"
             } > "$destination"
             chmod 0600 "$destination"
         }
@@ -59,17 +59,17 @@ docker run --rm --volume "$REPOSITORY_ROOT:/workspace:ro" "$UBUNTU_IMAGE" \
             || fail "container is not Ubuntu 24.04"
         [[ $(readlink -f /usr/bin/awk) == /usr/bin/mawk ]] \
             || fail "Ubuntu /usr/bin/awk is not the expected mawk implementation"
-        install -d -m 0700 /etc/coolify-runtime-attestation-ssh-fence /usr/local/libexec
+        install -d -m 0700 /etc/coolify-runtime-attestation-ssh-fence /usr/local/sbin
         install -m 0700 /workspace/docker/control-plane-blue-green/controllers/runtime-attestation-ssh-fence.sh \
-            /usr/local/libexec/coolify-runtime-attestation-ssh-fence
+            /usr/local/sbin/runtime-attestation-ssh-fence.sh
         install -m 0700 /workspace/docker/control-plane-blue-green/controllers/self-ssh-controlmaster-reaper.sh \
-            /usr/local/libexec/coolify-self-ssh-controlmaster-reaper
+            /usr/local/sbin/self-ssh-controlmaster-reaper.sh
         install -m 0700 /workspace/docker/control-plane-blue-green/controllers/traefik-docker-provider-freshness-probe.sh \
-            /usr/local/libexec/coolify-traefik-provider-freshness-probe
+            /usr/local/sbin/traefik-docker-provider-freshness-probe.sh
         install -m 0700 /workspace/docker/control-plane-blue-green/controllers/proxy-queue-zero-probe.sh \
-            /usr/local/libexec/coolify-proxy-queue-zero-probe
+            /usr/local/sbin/proxy-queue-zero-probe.sh
         install -m 0700 /workspace/docker/control-plane-blue-green/controllers/control-plane-terminal-state-probe.sh \
-            /usr/local/libexec/coolify-control-plane-terminal-state-probe
+            /usr/local/sbin/control-plane-terminal-state-probe.sh
         install -m 0700 /workspace/docker/control-plane-blue-green/controllers/provision-runtime-attestation-ssh-fence.sh \
             /usr/local/sbin/coolify-runtime-fence-provision
         install -m 0600 /dev/null /run/provider-header
@@ -136,10 +136,10 @@ docker run --rm --volume "$REPOSITORY_ROOT:/workspace:ro" "$UBUNTU_IMAGE" \
             /run/single.env > /run/provider-port.env
         chmod 0600 /run/provider-port.env
         expect_prepare_failure provider-port /run/provider-port.env
-        sed "s#^CONTROL_PLANE_RUNTIME_TERMINAL_PORT8000_URL=.*#CONTROL_PLANE_RUNTIME_TERMINAL_PORT8000_URL=http://127.0.0.1:8001/api/health#" \
-            /run/single.env > /run/terminal-port8000.env
-        chmod 0600 /run/terminal-port8000.env
-        expect_prepare_failure terminal-port8000 /run/terminal-port8000.env
+        sed "s#^CONTROL_PLANE_RUNTIME_TERMINAL_LOCAL_INGRESS_URL=.*#CONTROL_PLANE_RUNTIME_TERMINAL_LOCAL_INGRESS_URL=http://127.0.0.1:8001/api/health#" \
+            /run/single.env > /run/terminal-local-ingress.env
+        chmod 0600 /run/terminal-local-ingress.env
+        expect_prepare_failure terminal-local-ingress /run/terminal-local-ingress.env
         sed "/^CONTROL_PLANE_RUNTIME_POOL_PLAN_MANIFEST_SHA256=/d" /run/single.env > /run/missing.env
         chmod 0600 /run/missing.env
         expect_prepare_failure missing /run/missing.env

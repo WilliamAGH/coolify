@@ -3204,9 +3204,14 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         $persistent_file_volumes = $this->application->fileStorages()->get();
         $volume_names = $this->generate_local_persistent_volumes_only_volume_names();
         if ($blueGreenClaim !== null) {
+            $blueGreenBackendPort = $this->application->blueGreenDeploymentBackendPort()
+                ?? throw new DeploymentException('The blue-green backend port became ambiguous before member discovery labels were generated.');
             $labels = collect(generateBlueGreenApplicationContainerLabels(
+                $this->application,
+                (int) $this->destination->id,
                 $blueGreenClaim->pendingColor,
                 $blueGreenClaim->expectedRoutingRevision,
+                $blueGreenBackendPort,
             ));
             $labels->push("coolify.blueGreen.deploymentUuid={$blueGreenClaim->deploymentUuid}");
         } elseif (data_get($this->application, 'custom_labels')) {

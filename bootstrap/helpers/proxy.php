@@ -1,11 +1,14 @@
 <?php
 
+use App\Actions\Proxy\ManageControlPlaneProxyEnrollment;
 use App\Actions\Proxy\SaveProxyConfiguration;
 use App\Enums\ProxyTypes;
 use App\Models\Application;
 use App\Models\Server;
+use App\Support\ControlPlaneMode;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
+use Symfony\Component\Yaml\Exception\ParseException;
 use Symfony\Component\Yaml\Yaml;
 
 /**
@@ -206,6 +209,12 @@ function extractCustomProxyCommands(Server $server, string $existing_config): ar
         // Extract commands that don't match default prefixes (these are custom)
         foreach ($existing_commands as $command) {
             $is_default = false;
+            if ($command === '--entrypoints.coolify-local.address=:8000'
+                && $server->isLocalhost()
+                && ! $server->isSwarm()
+                && ManageControlPlaneProxyEnrollment::ownsManagedStaticConfiguration($server)) {
+                continue;
+            }
             foreach ($default_command_prefixes as $prefix) {
                 if (str_starts_with($command, $prefix)) {
                     $is_default = true;
@@ -216,15 +225,26 @@ function extractCustomProxyCommands(Server $server, string $existing_config): ar
                 $custom_commands[] = $command;
             }
         }
-    } catch (Exception $e) {
-        // If we can't parse the config, return empty array
-        // Silently fail to avoid breaking the proxy regeneration
+    } catch (ParseException) {
+        // Invalid historical YAML cannot contribute safe custom commands.
     }
 
     return $custom_commands;
 }
-function generateDefaultProxyConfiguration(Server $server, array $custom_commands = [])
+
+function usesManagedControlPlaneLoopbackProxy(Server $server): bool
 {
+    return ControlPlaneMode::isActiveWebOnly()
+        && $server->isLocalhost()
+        && ! $server->isSwarm()
+        && ManageControlPlaneProxyEnrollment::shouldRenderManagedStaticConfiguration($server);
+}
+
+function generateDefaultProxyConfiguration(
+    Server $server,
+    array $custom_commands = [],
+    bool $save = true,
+): string {
     Log::info('Generating default proxy configuration', [
         'server_id' => $server->id,
         'server_name' => $server->name,
@@ -264,6 +284,7 @@ function generateDefaultProxyConfiguration(Server $server, array $custom_command
         $filtered_networks->push($network);
     });
     if ($proxy_type === ProxyTypes::TRAEFIK->value) {
+        $usesManagedControlPlaneLoopbackProxy = usesManagedControlPlaneLoopbackProxy($server);
         $labels = [
             'traefik.enable=true',
             'traefik.http.routers.traefik.entrypoints=http',
@@ -321,6 +342,10 @@ function generateDefaultProxyConfiguration(Server $server, array $custom_command
                 ],
             ],
         ];
+        if ($usesManagedControlPlaneLoopbackProxy) {
+            $config['services']['traefik']['ports'][] = '127.0.0.1:'.config('app.port').':8000';
+            $config['services']['traefik']['command'][] = '--entrypoints.coolify-local.address=:8000';
+        }
         if (isDev()) {
             $config['services']['traefik']['command'][] = '--api.insecure=true';
             $config['services']['traefik']['command'][] = '--log.level=debug';
@@ -396,7 +421,9 @@ function generateDefaultProxyConfiguration(Server $server, array $custom_command
     }
 
     $config = Yaml::dump($config, 12, 2);
-    SaveProxyConfiguration::run($server, $config);
+    if ($save) {
+        SaveProxyConfiguration::run($server, $config);
+    }
 
     return $config;
 }

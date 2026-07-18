@@ -28,6 +28,11 @@ fail()
     exit 1
 }
 
+TRAEFIK_VERSION=$(jq -er '.traefik["v3.6"]' "$REPOSITORY_ROOT/versions.json")
+[ "$TRAEFIK_VERSION" = 3.6.23 ] \
+    || fail "canonical Traefik v3.6 release must be exactly 3.6.23, observed $TRAEFIK_VERSION"
+export TRAEFIK_VERSION
+
 capture_runtime_evidence()
 {
     docker logs "$PROJECT_NAME-control-plane" >"$EVIDENCE_DIRECTORY/control-plane-container.log" 2>&1 || true
@@ -78,6 +83,10 @@ request_observer_final_flush()
 trap cleanup EXIT INT TERM
 mkdir -p "$EVIDENCE_DIRECTORY"
 
+sh "$LAB_DIRECTORY/observer-test.sh" >"$EVIDENCE_DIRECTORY/observer-test.log"
+sh "$LAB_DIRECTORY/verify-traefik-tombstone-test.sh" \
+    >"$EVIDENCE_DIRECTORY/verify-traefik-tombstone-test.log"
+
 sha256sum \
     "$REPOSITORY_ROOT/app/Actions/Application/BlueGreen/BlueGreenProxyDeactivationSnapshot.php" \
     "$REPOSITORY_ROOT/app/Actions/Application/BlueGreen/BlueGreenDeactivationPreparation.php" \
@@ -114,17 +123,13 @@ docker_architecture=$(docker info --format '{{.Architecture}}')
 case "$docker_architecture" in
     aarch64 | arm64)
         testing_host_architecture=arm64
-        TRAEFIK_PRODUCTION_MANIFEST_DIGEST=sha256:fa2d74d82a13db11d067c25b5b761262003774de8cd96e5ed8306bdd8f6a480d
-        TRAEFIK_PRODUCTION_IMAGE_ID=sha256:f6812724be8993ef6b8935543d68c5305fba26ddd800c141752d152d8005538c
-        TRAEFIK_CANDIDATE_MANIFEST_DIGEST=sha256:acacb46feeef8c402e666d36d4ba63013446cbaffc78d6b2e6297c53e991f45d
-        TRAEFIK_CANDIDATE_IMAGE_ID=sha256:6a74c416e0c4aa1898229dad35767314379a35a824cfbaf6b56870a7d4e6df92
+        TRAEFIK_MANIFEST_DIGEST=sha256:5bb4874e6ed29907a6d7a3bff6704c7e31fd5c5d7cf557ef7ff24296ec76f150
+        TRAEFIK_IMAGE_ID=sha256:80a1d834ed38003b48708d2154afef424b6593ff597a44e834a573ce39f2b8a4
         ;;
     x86_64 | amd64)
         testing_host_architecture=amd64
-        TRAEFIK_PRODUCTION_MANIFEST_DIGEST=sha256:6f4b3a3b43d82dd33ed740cc3d6b85ccae4c311b77f114e6c55c98d5dbf9b1b1
-        TRAEFIK_PRODUCTION_IMAGE_ID=sha256:e861a9b21b1200af43526c8954fc7031c9d842cb5b40bd8bef773750cdce45f4
-        TRAEFIK_CANDIDATE_MANIFEST_DIGEST=sha256:18d36de0b283a62956cd290fef284a474aa1242f18c005a856a8ef5d8f5fc93b
-        TRAEFIK_CANDIDATE_IMAGE_ID=sha256:67838d6e3bef0d6a7c0670b582e440804f33de34d79b99484e6428b2d2a85d1e
+        TRAEFIK_MANIFEST_DIGEST=sha256:895fcd96315a34e37270fc3f73034c16125251265a84174ad4fdaf7cd0f2966e
+        TRAEFIK_IMAGE_ID=sha256:fe87da91c413a0b9e154bd2e293cb737e9ce52364d95ef34d72a78673a2b99f8
         ;;
     *)
         fail "unsupported Docker daemon architecture: $docker_architecture"
@@ -146,9 +151,8 @@ TESTING_HOST_IMAGE_ID=$(docker image inspect "$TESTING_HOST_IMAGE" --format '{{.
     || fail "testing-host fixture architecture $testing_host_image_architecture does not match Docker daemon $testing_host_architecture"
 export TESTING_HOST_IMAGE_ARCHITECTURE="$testing_host_image_architecture" TESTING_HOST_IMAGE_ID
 
-TRAEFIK_MATRIX_PLATFORM="linux/$testing_host_architecture"
-TRAEFIK_PRODUCTION_SOURCE="traefik@$TRAEFIK_PRODUCTION_MANIFEST_DIGEST"
-TRAEFIK_CANDIDATE_SOURCE="traefik@$TRAEFIK_CANDIDATE_MANIFEST_DIGEST"
+TRAEFIK_PLATFORM="linux/$testing_host_architecture"
+TRAEFIK_SOURCE="traefik@$TRAEFIK_MANIFEST_DIGEST"
 
 verify_traefik_source()
 {
@@ -157,11 +161,11 @@ verify_traefik_source()
     expected_version=$3
     target=$4
 
-    docker pull --platform "$TRAEFIK_MATRIX_PLATFORM" "$source" >/dev/null
+    docker pull --platform "$TRAEFIK_PLATFORM" "$source" >/dev/null
     [ "$(docker image inspect "$source" --format '{{.Id}}')" = "$expected_id" ] \
         || fail "exact Traefik $expected_version image identity drifted"
     [ "$(docker image inspect "$source" --format '{{.Os}}/{{.Architecture}}')" = \
-        "$TRAEFIK_MATRIX_PLATFORM" ] \
+        "$TRAEFIK_PLATFORM" ] \
         || fail "Traefik $expected_version image platform drifted"
     [ "$(docker image inspect "$source" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = \
         "v$expected_version" ] \
@@ -171,12 +175,19 @@ verify_traefik_source()
         || fail "Traefik $expected_version local tag identity drifted"
 }
 
-verify_traefik_source "$TRAEFIK_PRODUCTION_SOURCE" "$TRAEFIK_PRODUCTION_IMAGE_ID" 3.6.13 \
-    traefik:production-3.6.13
-verify_traefik_source "$TRAEFIK_CANDIDATE_SOURCE" "$TRAEFIK_CANDIDATE_IMAGE_ID" 3.6.17 \
-    traefik:v3.6.17
-export TRAEFIK_CANDIDATE_IMAGE_ID TRAEFIK_CANDIDATE_MANIFEST_DIGEST TRAEFIK_MATRIX_PLATFORM \
-    TRAEFIK_PRODUCTION_IMAGE_ID TRAEFIK_PRODUCTION_MANIFEST_DIGEST
+verify_traefik_source "$TRAEFIK_SOURCE" "$TRAEFIK_IMAGE_ID" "$TRAEFIK_VERSION" \
+    "traefik:v$TRAEFIK_VERSION"
+export TRAEFIK_IMAGE_ID TRAEFIK_MANIFEST_DIGEST TRAEFIK_PLATFORM
+
+docker pull 'docker:28.4.0-dind@sha256:2ceb471176ad51e37145d43ce7cbf0fa5d644a2b185bd537f0ef695fb3a37497' >/dev/null
+docker pull 'postgres:15.18-alpine3.24@sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f' >/dev/null
+docker pull 'redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99' >/dev/null
+docker pull 'ghcr.io/coollabsio/coolify-helper:1.0.14@sha256:55acc11740d42a5646e74108276ab252cc040abce0679fc6b36c81b464849d52' >/dev/null
+docker pull 'registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373' >/dev/null
+docker tag 'ghcr.io/coollabsio/coolify-helper:1.0.14@sha256:55acc11740d42a5646e74108276ab252cc040abce0679fc6b36c81b464849d52' \
+    ghcr.io/coollabsio/coolify-helper:1.0.14
+docker tag 'registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373' \
+    registry:2.8.3
 
 docker image inspect \
     "$CONTROL_PLANE_IMAGE" \
@@ -184,10 +195,8 @@ docker image inspect \
     'docker:28.4.0-dind@sha256:2ceb471176ad51e37145d43ce7cbf0fa5d644a2b185bd537f0ef695fb3a37497' \
     'postgres:15.18-alpine3.24@sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f' \
     'redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99' \
-    "$TRAEFIK_CANDIDATE_SOURCE" \
-    "$TRAEFIK_PRODUCTION_SOURCE" \
-    'traefik:v3.6.17' \
-    'traefik:production-3.6.13' \
+    "$TRAEFIK_SOURCE" \
+    "traefik:v$TRAEFIK_VERSION" \
     'ghcr.io/coollabsio/coolify-helper:1.0.14@sha256:55acc11740d42a5646e74108276ab252cc040abce0679fc6b36c81b464849d52' \
     'registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373' \
     application-deployment-job-fixture:manifest >"$EVIDENCE_DIRECTORY/images.start.json"
@@ -195,8 +204,7 @@ docker image inspect \
 docker save --output "$EVIDENCE_DIRECTORY/nested-images.tar" \
     application-deployment-job-fixture:manifest \
     "$TESTING_HOST_IMAGE" \
-    traefik:v3.6.17 \
-    traefik:production-3.6.13 \
+    "traefik:v$TRAEFIK_VERSION" \
     ghcr.io/coollabsio/coolify-helper:1.0.14 \
     registry:2.8.3
 sha256sum "$EVIDENCE_DIRECTORY/nested-images.tar" >"$EVIDENCE_DIRECTORY/nested-images.sha256"
@@ -232,15 +240,14 @@ for container_id in $(jq -r '.drainedContainerId[]' "$EVIDENCE_DIRECTORY/report.
         || fail 'managed target stop did not follow tombstone ACK and stream drain before final route absence'
 done
 jq -s -e \
-    --arg platform "$TRAEFIK_MATRIX_PLATFORM" \
-    --arg productionImageId "$TRAEFIK_PRODUCTION_IMAGE_ID" \
-    --arg candidateImageId "$TRAEFIK_CANDIDATE_IMAGE_ID" \
-    'length == 2
-    and (map(.status) | all(. == 418))
-    and (map(.version) | sort) == ["3.6.13", "3.6.17"]
-    and (map(.platform) | all(. == $platform))
-    and (map(select(.version == "3.6.13" and .imageId == $productionImageId)) | length) == 1
-    and (map(select(.version == "3.6.17" and .imageId == $candidateImageId)) | length) == 1' \
+    --arg platform "$TRAEFIK_PLATFORM" \
+    --arg imageId "$TRAEFIK_IMAGE_ID" \
+    --arg version "$TRAEFIK_VERSION" \
+    'length == 1
+    and .[0].status == 418
+    and .[0].version == $version
+    and .[0].platform == $platform
+    and .[0].imageId == $imageId' \
     "$EVIDENCE_DIRECTORY/traefik-tombstone-matrix.jsonl" >/dev/null \
     || fail 'exact production/candidate Traefik tombstone contract matrix failed'
 jq -s -e 'last.present == false and last.finalFlush == true' "$EVIDENCE_DIRECTORY/proxy-route.jsonl" >/dev/null \
@@ -285,10 +292,8 @@ docker image inspect \
     'docker:28.4.0-dind@sha256:2ceb471176ad51e37145d43ce7cbf0fa5d644a2b185bd537f0ef695fb3a37497' \
     'postgres:15.18-alpine3.24@sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f' \
     'redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99' \
-    "$TRAEFIK_CANDIDATE_SOURCE" \
-    "$TRAEFIK_PRODUCTION_SOURCE" \
-    'traefik:v3.6.17' \
-    'traefik:production-3.6.13' \
+    "$TRAEFIK_SOURCE" \
+    "traefik:v$TRAEFIK_VERSION" \
     'ghcr.io/coollabsio/coolify-helper:1.0.14@sha256:55acc11740d42a5646e74108276ab252cc040abce0679fc6b36c81b464849d52' \
     'registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373' \
     application-deployment-job-fixture:manifest >"$EVIDENCE_DIRECTORY/images.end.json"

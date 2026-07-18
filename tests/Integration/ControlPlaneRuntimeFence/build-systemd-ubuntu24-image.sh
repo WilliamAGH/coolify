@@ -21,6 +21,62 @@ fail()
     exit 1
 }
 
+host_gate_platform_from_uname()
+{
+    local system=$1 machine=$2
+
+    [[ $system == Linux ]] \
+        || fail "the systemd host image must be built on native Linux; detected system=$system"
+    case "$machine" in
+        x86_64|amd64) printf '%s' linux/amd64 ;;
+        aarch64|arm64) printf '%s' linux/arm64 ;;
+        *) fail "the systemd host image builder supports only native amd64 and arm64; detected machine=$machine" ;;
+    esac
+}
+
+host_gate_platform()
+{
+    local native_platform requested_platform
+
+    native_platform=$(host_gate_platform_from_uname "$(uname -s)" "$(uname -m)")
+    requested_platform=${CONTROL_PLANE_RUNTIME_HOST_GATE_PLATFORM:-$native_platform}
+    case "$requested_platform" in
+        linux/amd64|linux/arm64) ;;
+        *) fail 'CONTROL_PLANE_RUNTIME_HOST_GATE_PLATFORM must be one of linux/amd64 or linux/arm64' ;;
+    esac
+    [[ $requested_platform == "$native_platform" ]] \
+        || fail "requested host-image platform differs from the native Linux builder: requested=$requested_platform native=$native_platform"
+    printf '%s' "$native_platform"
+}
+
+assert_native_local_docker()
+{
+    local expected_platform=$1 context endpoint engine_platform
+
+    [[ -z ${DOCKER_HOST:-} && -z ${DOCKER_CONTEXT:-} ]] \
+        || fail 'the systemd host image builder rejects ambient Docker endpoint overrides'
+    context=$(docker context show) || fail 'could not attest the active Docker context'
+    endpoint=$(docker context inspect "$context" --format '{{.Endpoints.docker.Host}}') \
+        || fail 'could not attest the active Docker endpoint'
+    [[ $context == default && $endpoint == unix:///var/run/docker.sock && -S /var/run/docker.sock ]] \
+        || fail 'the systemd host image builder requires the local default Unix Docker socket'
+    engine_platform=$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}') \
+        || fail 'could not attest the Docker engine platform'
+    [[ $engine_platform == "$expected_platform" ]] \
+        || fail "Docker engine platform differs from the native Linux builder; emulation is forbidden: expected=$expected_platform actual=$engine_platform"
+}
+
+run_host_gate_platform_contract_tests()
+{
+    [[ $(host_gate_platform_from_uname Linux x86_64) == linux/amd64 \
+        && $(host_gate_platform_from_uname Linux aarch64) == linux/arm64 ]] \
+        || fail 'host-image build platform derivation is incomplete'
+    if (host_gate_platform_from_uname Darwin arm64) >/dev/null 2>&1 \
+        || (host_gate_platform_from_uname Linux riscv64) >/dev/null 2>&1; then
+        fail 'host-image build platform derivation accepted Darwin or an unsupported architecture'
+    fi
+}
+
 source_attestation_sha256()
 {
     local path
@@ -81,6 +137,11 @@ static_check()
         || ! grep -F -q -- '--sbom=true' "$SCRIPT_DIRECTORY/build-systemd-ubuntu24-image.sh"; then
         fail 'the host image build no longer emits explicit provenance and SBOM attestations'
     fi
+    if ! grep -F -x -q 'ARG HOST_PLATFORM' "$DOCKERFILE" \
+        || ! grep -F -q "io.coolify.runtime-fence.systemd-host-platform=\${HOST_PLATFORM}" "$DOCKERFILE"; then
+        fail 'the host Dockerfile no longer binds its platform label to the build platform input'
+    fi
+    run_host_gate_platform_contract_tests
     source_attestation_sha256 >/dev/null
     printf 'CONTROL_PLANE_RUNTIME_FENCE_HOST_IMAGE_BUILD check=passed\n'
 }
@@ -91,26 +152,29 @@ usage()
         'usage: CONTROL_PLANE_RUNTIME_HOST_IMAGE_BUILD_MODE=loopback-registry|push build-systemd-ubuntu24-image.sh IMAGE_REPOSITORY:TAG' \
         'Default mode is loopback-registry: it pushes only to an ephemeral 127.0.0.1 registry, pulls the resulting RepoDigest locally, and prints it.' \
         'Set CONTROL_PLANE_RUNTIME_HOST_IMAGE_BUILD_MODE=push to explicitly publish IMAGE_REPOSITORY:TAG externally.' \
-        'CONTROL_PLANE_RUNTIME_BUILD_CA_FILE defaults to /etc/ssl/cert.pem and must be a readable non-symlink PEM bundle.'
+        'CONTROL_PLANE_RUNTIME_BUILD_CA_FILE defaults to /etc/ssl/cert.pem and must be a readable non-symlink PEM bundle.' \
+        'CONTROL_PLANE_RUNTIME_HOST_GATE_PLATFORM defaults to the native Linux platform and may be linux/amd64 or linux/arm64 only.'
 }
 
 build_and_push()
 {
-    local destination=$1 source_sha256=$2 ca_file=$3
+    local destination=$1 source_sha256=$2 ca_file=$3 platform=$4
 
-    docker buildx build --platform linux/amd64 --provenance=mode=max --sbom=true \
+    docker buildx build --platform "$platform" --provenance=mode=max --sbom=true \
         --secret "id=${BUILD_CA_SECRET_ID},src=${ca_file}" \
         --build-arg "HOST_SOURCE_SHA256=$source_sha256" \
+        --build-arg "HOST_PLATFORM=$platform" \
         --file "$DOCKERFILE" --push --tag "$destination" "$REPOSITORY_ROOT"
 }
 
 build_and_load()
 {
-    local destination=$1 source_sha256=$2 ca_file=$3
+    local destination=$1 source_sha256=$2 ca_file=$3 platform=$4
 
-    docker buildx build --platform linux/amd64 --provenance=mode=max --sbom=true \
+    docker buildx build --platform "$platform" --provenance=mode=max --sbom=true \
         --secret "id=${BUILD_CA_SECRET_ID},src=${ca_file}" \
         --build-arg "HOST_SOURCE_SHA256=$source_sha256" \
+        --build-arg "HOST_PLATFORM=$platform" \
         --file "$DOCKERFILE" --load --tag "$destination" "$REPOSITORY_ROOT"
 }
 
@@ -134,14 +198,14 @@ cleanup_local_registry()
 
 start_local_registry()
 {
-    local binding
+    local platform=$1 binding
 
     local_registry_container="coolify-runtime-fence-build-registry-$$"
     ! docker container inspect "$local_registry_container" >/dev/null 2>&1 \
         || fail 'refusing to reuse a local build registry container'
-    docker pull "$LOCAL_REGISTRY_IMAGE" >/dev/null \
+    docker pull --platform "$platform" "$LOCAL_REGISTRY_IMAGE" >/dev/null \
         || fail 'could not pull the pinned local loopback registry image'
-    docker run --detach --pull never --name "$local_registry_container" \
+    docker run --detach --pull never --platform "$platform" --name "$local_registry_container" \
         --tmpfs /var/lib/registry:rw,mode=0700 \
         --publish 127.0.0.1::5000 "$LOCAL_REGISTRY_IMAGE" >/dev/null
     binding=$(docker port "$local_registry_container" 5000/tcp)
@@ -157,11 +221,26 @@ start_local_registry()
     fail 'the local loopback registry did not become ready'
 }
 
+assert_local_host_image()
+{
+    local reference=$1 expected_source_sha=$2 expected_platform=$3 source_sha platform_label
+
+    source_sha=$(docker image inspect \
+        --format '{{ index .Config.Labels "io.coolify.runtime-fence.systemd-host-source-sha256" }}' \
+        "$reference")
+    platform_label=$(docker image inspect \
+        --format '{{ index .Config.Labels "io.coolify.runtime-fence.systemd-host-platform" }}' \
+        "$reference")
+    [[ $(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$reference") == "$expected_platform" \
+        && $platform_label == "$expected_platform" && $source_sha == "$expected_source_sha" ]] \
+        || fail "the locally published systemd host image lacks the exact $expected_platform platform and source attestations"
+}
+
 local_repo_digest()
 {
-    local image_tag=$1 candidate repo_digest=
+    local image_tag=$1 expected_source_sha=$2 platform=$3 candidate repo_digest=
 
-    docker pull "$image_tag" >/dev/null \
+    docker pull --platform "$platform" "$image_tag" >/dev/null \
         || fail 'could not pull the image back from the local loopback registry'
     while IFS= read -r candidate; do
         if [[ $candidate == "${image_tag%:*}"@sha256:* ]]; then
@@ -173,6 +252,7 @@ local_repo_digest()
         || fail 'the local loopback registry image did not retain a RepoDigest'
     docker image inspect "$repo_digest" >/dev/null \
         || fail 'the local loopback RepoDigest is not available to the host gate'
+    assert_local_host_image "$repo_digest" "$expected_source_sha" "$platform"
     printf '%s' "$repo_digest"
 }
 
@@ -201,6 +281,11 @@ esac
 for command in docker grep openssl sha256sum; do
     command -v "$command" >/dev/null || fail "required command is unavailable: $command"
 done
+HOST_GATE_PLATFORM=$(host_gate_platform)
+readonly HOST_GATE_PLATFORM
+CONTROL_PLANE_RUNTIME_HOST_GATE_PLATFORM=$HOST_GATE_PLATFORM
+export CONTROL_PLANE_RUNTIME_HOST_GATE_PLATFORM
+assert_native_local_docker "$HOST_GATE_PLATFORM"
 docker buildx version >/dev/null || fail 'docker buildx is unavailable'
 
 build_ca_file=${CONTROL_PLANE_RUNTIME_BUILD_CA_FILE:-$DEFAULT_BUILD_CA_FILE}
@@ -209,17 +294,17 @@ source_sha256=$(source_attestation_sha256)
 
 case "$build_mode" in
     push)
-        build_and_push "$image_tag" "$source_sha256" "$build_ca_file"
+        build_and_push "$image_tag" "$source_sha256" "$build_ca_file" "$HOST_GATE_PLATFORM"
         host_reference=$(published_reference "$image_tag")
         ;;
     loopback-registry)
         command -v curl >/dev/null || fail 'curl is required for loopback-registry mode'
         trap cleanup_local_registry EXIT
-        start_local_registry
+        start_local_registry "$HOST_GATE_PLATFORM"
         local_image_tag="127.0.0.1:${LOCAL_REGISTRY_PORT}/${LOCAL_REGISTRY_REPOSITORY}:${image_tag##*:}"
-        build_and_load "$local_image_tag" "$source_sha256" "$build_ca_file"
+        build_and_load "$local_image_tag" "$source_sha256" "$build_ca_file" "$HOST_GATE_PLATFORM"
         docker push "$local_image_tag" >/dev/null
-        host_reference=$(local_repo_digest "$local_image_tag")
+        host_reference=$(local_repo_digest "$local_image_tag" "$source_sha256" "$HOST_GATE_PLATFORM")
         cleanup_local_registry
         trap - EXIT
         ;;

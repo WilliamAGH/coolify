@@ -7,11 +7,11 @@ readonly TEST_ROOT=/run/control-plane-runtime-fence-boot-atomicity
 readonly CONFIG_DIRECTORY=/etc/coolify-runtime-attestation-ssh-fence
 readonly RUNTIME_ENV=$CONFIG_DIRECTORY/runtime.env
 readonly PROVISIONER=/usr/local/sbin/coolify-runtime-fence-provision
-readonly CONTROLLER=/usr/local/libexec/coolify-runtime-attestation-ssh-fence
-readonly REAPER=/usr/local/libexec/coolify-self-ssh-controlmaster-reaper
-readonly PROVIDER_PROBE=/usr/local/libexec/coolify-traefik-provider-freshness-probe
-readonly QUEUE_PROBE=/usr/local/libexec/coolify-proxy-queue-zero-probe
-readonly TERMINAL_PROBE=/usr/local/libexec/coolify-control-plane-terminal-state-probe
+readonly CONTROLLER=/usr/local/sbin/runtime-attestation-ssh-fence.sh
+readonly REAPER=/usr/local/sbin/self-ssh-controlmaster-reaper.sh
+readonly PROVIDER_PROBE=/usr/local/sbin/traefik-docker-provider-freshness-probe.sh
+readonly QUEUE_PROBE=/usr/local/sbin/proxy-queue-zero-probe.sh
+readonly TERMINAL_PROBE=/usr/local/sbin/control-plane-terminal-state-probe.sh
 readonly SYSTEMCTL=/usr/local/bin/systemctl
 readonly RESTORE_SERVICE=coolify-runtime-attestation-ssh-fence.service
 readonly WATCHDOG_SERVICE=coolify-runtime-attestation-ssh-fence-watchdog.service
@@ -46,7 +46,7 @@ write_environment()
         printf 'CONTROL_PLANE_RUNTIME_PROVIDER_LEGACY_PORT=8080\n'
         printf 'CONTROL_PLANE_RUNTIME_PROVIDER_HEADER_FILE=\n'
         printf 'CONTROL_PLANE_RUNTIME_TERMINAL_HTTPS_URL=https://coolify.example/api/health\n'
-        printf 'CONTROL_PLANE_RUNTIME_TERMINAL_PORT8000_URL=http://127.0.0.1:8000/api/health\n'
+        printf 'CONTROL_PLANE_RUNTIME_TERMINAL_LOCAL_INGRESS_URL=http://127.0.0.1:8000/api/health\n'
     } > "$SOURCE_ENV"
     chmod 0600 "$SOURCE_ENV"
 }
@@ -252,7 +252,7 @@ install_fixture()
     # shellcheck disable=SC1091
     [[ $(. /etc/os-release; printf '%s:%s' "$ID" "$VERSION_ID") == ubuntu:24.04 ]] \
         || fail 'boot-atomicity test did not run in the pinned Ubuntu 24.04 image'
-    install -d -m 0700 "$CONFIG_DIRECTORY" /usr/local/libexec "$TEST_ROOT"
+    install -d -m 0700 "$CONFIG_DIRECTORY" /usr/local/sbin "$TEST_ROOT"
     install -d -m 0755 /usr/local/bin
     install -m 0700 "$COMMAND_FIXTURE" "$CONTROLLER"
     install -m 0700 "$COMMAND_FIXTURE" "$REAPER"

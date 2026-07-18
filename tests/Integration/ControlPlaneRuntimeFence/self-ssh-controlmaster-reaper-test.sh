@@ -20,7 +20,7 @@ fail()
     exit 1
 }
 
-fixture=$(mktemp -d /tmp/control-plane-self-ssh-reaper.XXXXXX)
+fixture=$(mktemp -d "${TMPDIR:-/tmp}/control-plane-self-ssh-reaper.XXXXXX")
 trap 'rm -rf "$fixture"' EXIT HUP INT TERM
 proc_root=$fixture/proc
 bin_directory=$fixture/bin

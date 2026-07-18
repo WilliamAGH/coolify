@@ -425,6 +425,13 @@ if [ "$1" != "" ]; then
     LATEST_VERSION="${LATEST_VERSION#v}"
 fi
 
+FORK_RELEASE_VERSION_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-fork\.[1-9][0-9]*$'
+if [[ "$LATEST_VERSION" =~ $FORK_RELEASE_VERSION_PATTERN ]]; then
+    echo "Fork release ${LATEST_VERSION} is not published to ghcr.io/coollabsio/coolify." >&2
+    echo "Use the signed fork deployment path instead: scripts/fork-deploy install --manifest <signed release manifest URL>." >&2
+    exit 1
+fi
+
 echo "---------------------------------------------"
 echo "| Operating System  | $OS_TYPE $OS_VERSION"
 echo "| Docker            | $DOCKER_VERSION"

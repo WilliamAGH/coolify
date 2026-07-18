@@ -37,6 +37,20 @@ it('has correct job configuration', function () {
     expect($interfaces)->toContain(ShouldBeEncrypted::class);
 });
 
+it('does not contact or cache upstream update metadata for a fork release', function () {
+    $this->settings->update(['new_version_available' => true]);
+    config(['constants.coolify.version' => '4.13.0-fork.1']);
+    Http::preventStrayRequests();
+    Illuminate\Support\Facades\Log::shouldReceive('warning')
+        ->once()
+        ->with('Upstream update discovery disabled for fork release', Mockery::type('array'));
+
+    (new CheckForUpdatesJob)->handle();
+
+    Http::assertNothingSent();
+    expect($this->settings->refresh()->new_version_available)->toBeFalse();
+});
+
 it('uses max of CDN and cache versions', function () {
     // CDN has older version
     Http::fake([
@@ -73,6 +87,8 @@ it('uses max of CDN and cache versions', function () {
 });
 
 it('never downgrades from current running version', function () {
+    $currentVersion = '4.13.0';
+
     // CDN has older version
     Http::fake([
         '*' => Http::response([
@@ -92,17 +108,17 @@ it('never downgrades from current running version', function () {
 
     File::shouldReceive('put')
         ->once()
-        ->with(base_path('versions.json'), Mockery::on(function ($json) {
+        ->with(base_path('versions.json'), Mockery::on(function ($json) use ($currentVersion) {
             $data = json_decode($json, true);
 
-            // Should use the running fork release, not the older CDN or cache prerelease.
-            return $data['coolify']['v4']['version'] === '4.13.0-fork';
+            // Should use the running release, not the older CDN or cache release.
+            return $data['coolify']['v4']['version'] === $currentVersion;
         }));
 
     Cache::shouldReceive('forget')->once();
 
-    // Running fork prerelease is newer than the CDN and cached releases.
-    config(['constants.coolify.version' => '4.13.0-fork']);
+    // Running release is newer than the CDN and cached releases.
+    config(['constants.coolify.version' => $currentVersion]);
 
     Illuminate\Support\Facades\Log::shouldReceive('warning')
         ->once()

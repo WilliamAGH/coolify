@@ -492,10 +492,10 @@ case "$command_name" in
                         printf 'loaded\n'
                         ;;
                     coolify-runtime-attestation-ssh-fence.service:ExecStart)
-                        printf '{ path=/usr/local/libexec/coolify-runtime-attestation-ssh-fence ; argv[]=/usr/local/libexec/coolify-runtime-attestation-ssh-fence restore ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n'
+                        printf '{ path=/usr/local/libexec/coolify-control-plane-release-dispatch ; argv[]=/usr/local/libexec/coolify-control-plane-release-dispatch runtime-fence-controller restore ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n'
                         ;;
                     coolify-runtime-attestation-ssh-fence-watchdog.service:ExecStart)
-                        printf '{ path=/usr/local/libexec/coolify-runtime-attestation-ssh-fence ; argv[]=/usr/local/libexec/coolify-runtime-attestation-ssh-fence watch ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n'
+                        printf '{ path=/usr/local/libexec/coolify-control-plane-release-dispatch ; argv[]=/usr/local/libexec/coolify-control-plane-release-dispatch runtime-fence-controller watch ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n'
                         ;;
                     coolify-runtime-attestation-ssh-fence.service:EnvironmentFiles|\
                     coolify-runtime-attestation-ssh-fence-watchdog.service:EnvironmentFiles)
@@ -545,7 +545,7 @@ case "$command_name" in
                         ;;
                     coolify-runtime-attestation-ssh-fence.service:ReadWritePaths|\
                     coolify-runtime-attestation-ssh-fence-watchdog.service:ReadWritePaths)
-                        printf '/var/lib/coolify-runtime-attestation-ssh-fence\n'
+                        printf '%s\n' '/etc/coolify-control-plane /etc/systemd/system /run/coolify-control-plane-release-dispatch /run/lock /usr/local/libexec /usr/local/sbin /var/lib/coolify-runtime-attestation-ssh-fence'
                         ;;
                     coolify-runtime-attestation-ssh-fence.service:RestrictAddressFamilies|\
                     coolify-runtime-attestation-ssh-fence-watchdog.service:RestrictAddressFamilies)

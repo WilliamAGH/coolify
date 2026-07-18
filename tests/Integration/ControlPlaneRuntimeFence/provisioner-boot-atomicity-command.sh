@@ -5,7 +5,7 @@ set -Eeuo pipefail
 readonly TEST_ROOT=/run/control-plane-runtime-fence-boot-atomicity
 readonly CONFIG_DIRECTORY=/etc/coolify-runtime-attestation-ssh-fence
 readonly RUNTIME_ENV=$CONFIG_DIRECTORY/runtime.env
-readonly CONTROLLER=/usr/local/libexec/coolify-runtime-attestation-ssh-fence
+readonly CONTROLLER=/usr/local/sbin/runtime-attestation-ssh-fence.sh
 readonly RESTORE_SERVICE=coolify-runtime-attestation-ssh-fence.service
 readonly WATCHDOG_SERVICE=coolify-runtime-attestation-ssh-fence-watchdog.service
 
@@ -259,7 +259,7 @@ terminal_probe()
 case "${0##*/}" in
     systemctl) systemctl_command "$@" ;;
     sync) sync_command "$@" ;;
-    coolify-runtime-attestation-ssh-fence) controller "$@" ;;
-    coolify-control-plane-terminal-state-probe) terminal_probe "$@" ;;
+    runtime-attestation-ssh-fence.sh) controller "$@" ;;
+    control-plane-terminal-state-probe.sh) terminal_probe "$@" ;;
     *) fail "unsupported fake command identity: ${0##*/}" ;;
 esac

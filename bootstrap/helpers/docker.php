@@ -1,5 +1,6 @@
 <?php
 
+use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\ProxyTypes;
 use App\Models\Application;
@@ -793,18 +794,52 @@ function generateLabelsApplication(Application $application, ?ApplicationPreview
     return $labels->all();
 }
 
-function generateBlueGreenApplicationContainerLabels(BlueGreenDeploymentColor $color, int $routingRevision): array
-{
+function generateBlueGreenApplicationContainerLabels(
+    Application $application,
+    int $destinationId,
+    BlueGreenDeploymentColor $color,
+    int $routingRevision,
+    int $backendPort,
+): array {
     if ($routingRevision < 0) {
         throw new InvalidArgumentException('The routing revision must be a nonnegative integer.');
     }
+    if ($backendPort < 1 || $backendPort > 65535) {
+        throw new InvalidArgumentException('The blue/green backend port must be between 1 and 65535.');
+    }
 
-    return [
-        'traefik.enable=false',
+    $applicationUuid = (string) $application->uuid;
+    $serviceName = BlueGreenRoutingTarget::memberServiceName($applicationUuid, $destinationId, $color);
+    $discoveryRouterName = BlueGreenRoutingTarget::memberDiscoveryRouterName(
+        $applicationUuid,
+        $destinationId,
+        $color,
+    );
+    $labels = [
+        'traefik.enable=true',
+        "traefik.http.routers.{$discoveryRouterName}.rule=Host(`{$discoveryRouterName}.invalid`)",
+        "traefik.http.routers.{$discoveryRouterName}.service=noop@internal",
+        "traefik.http.services.{$serviceName}.loadbalancer.server.port={$backendPort}",
         'coolify.blueGreen.managed=true',
         "coolify.blueGreen.color={$color->value}",
         "coolify.blueGreen.routingRevision={$routingRevision}",
     ];
+
+    if ((bool) $application->health_check_enabled && $application->health_check_type === 'http') {
+        $healthCheckPrefix = "traefik.http.services.{$serviceName}.loadbalancer.healthcheck";
+        $labels[] = "{$healthCheckPrefix}.path={$application->health_check_path}";
+        $labels[] = "{$healthCheckPrefix}.hostname={$application->health_check_host}";
+        $labels[] = "{$healthCheckPrefix}.method={$application->health_check_method}";
+        $labels[] = "{$healthCheckPrefix}.status={$application->health_check_return_code}";
+        $labels[] = "{$healthCheckPrefix}.scheme={$application->health_check_scheme}";
+        $labels[] = "{$healthCheckPrefix}.interval={$application->health_check_interval}s";
+        $labels[] = "{$healthCheckPrefix}.timeout={$application->health_check_timeout}s";
+        if ($application->health_check_port !== null) {
+            $labels[] = "{$healthCheckPrefix}.port={$application->health_check_port}";
+        }
+    }
+
+    return $labels;
 }
 
 function isDatabaseImage(?string $image = null, ?array $serviceConfig = null)

@@ -157,6 +157,10 @@ jobs:
           if (( ${#scripts[@]} > 0 )); then
             shellcheck -- "${scripts[@]}"
           fi
+      - name: Verify control-plane release asset mode contract
+        run: tests/Integration/ControlPlaneReleaseAssetModes/run.sh
+      - name: Verify crash-safe control-plane host release bundles
+        run: tests/Integration/ControlPlaneHostReleaseBundle/run.sh
       - name: Render Linux Compose contracts
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
@@ -206,10 +210,7 @@ jobs:
           LAB_TRAEFIK_PORT='18080' \
           LAB_DYNAMIC_DIR="$GITHUB_WORKSPACE" \
           LAB_TRAEFIK_STATIC_CONFIG="$fixture_env_file" \
-          CONTROL_PLANE_PORT_PROXY_CONTAINER='compose-validation-port-proxy' \
           CONTROL_PLANE_HOST='compose-validation.example.test' \
-          LAB_PORT8000_PORT='18000' \
-          LAB_PORT_CONFIG_DIR="$GITHUB_WORKSPACE" \
           CONTROL_PLANE_DATABASE_CONTAINER='compose-validation-database' \
           CONTROL_PLANE_REHEARSAL_DATABASE_CONTAINER='compose-validation-rehearsal-database' \
           CONTROL_PLANE_REDIS_CONTAINER='compose-validation-redis' \
@@ -302,8 +303,10 @@ jobs:
       runtime-fence: ${{ steps.paths.outputs.runtime-fence }}
       backup-restore: ${{ steps.paths.outputs.backup-restore }}
       blue-green-simulation: ${{ steps.paths.outputs.blue-green-simulation }}
+      blue-green-provider-lab: ${{ steps.paths.outputs.blue-green-provider-lab }}
       application-deployment-blue-green: ${{ steps.paths.outputs.application-deployment-blue-green }}
       production-application-blue-green: ${{ steps.paths.outputs.production-application-blue-green }}
+      fork-deploy: ${{ steps.paths.outputs.fork-deploy }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
@@ -320,8 +323,10 @@ jobs:
           runtime_fence=false
           backup_restore=false
           blue_green_simulation=false
+          blue_green_provider_lab=false
           application_deployment_blue_green=false
           production_application_blue_green=false
+          fork_deploy=false
           base_sha="${BASE_SHA:-}"
 
           if [[ -z "$base_sha" || "$base_sha" =~ ^0+$ ]] || ! git cat-file -e "${base_sha}^{commit}" 2>/dev/null; then
@@ -329,8 +334,10 @@ jobs:
             runtime_fence=true
             backup_restore=true
             blue_green_simulation=true
+            blue_green_provider_lab=true
             application_deployment_blue_green=true
             production_application_blue_green=true
+            fork_deploy=true
           else
             while IFS= read -r path; do
               case "$path" in
@@ -339,8 +346,10 @@ jobs:
                   runtime_fence=true
                   backup_restore=true
                   blue_green_simulation=true
+                  blue_green_provider_lab=true
                   application_deployment_blue_green=true
                   production_application_blue_green=true
+                  fork_deploy=true
                   ;;
                 app/Console/Commands/Migration.php|database/migrations/2026_07_12_*|database/migrations/control-plane-*)
                   migration=true
@@ -372,6 +381,9 @@ jobs:
                 docker/control-plane-blue-green/*|tests/Integration/ControlPlaneBlueGreen/*)
                   blue_green_simulation=true
                   ;;
+                tests/Integration/BlueGreen/*)
+                  blue_green_provider_lab=true
+                  ;;
                 docker/production/*|tests/Integration/ProductionApplicationBlueGreen/*)
                   production_application_blue_green=true
                   application_deployment_blue_green=true
@@ -379,8 +391,11 @@ jobs:
                 docker/testing-host/*|tests/Integration/ApplicationDeploymentJobBlueGreen/*)
                   application_deployment_blue_green=true
                   ;;
+                .github/workflows/publish-fork.yml|.github/workflows/publish-linux-image.yml|scripts/fork-deploy|docker/fork-release-signing-ed25519.pub|tests/Integration/ForkDeploy/*)
+                  fork_deploy=true
+                  ;;
               esac
-            done < <(git diff --name-only --diff-filter=ACMR "$base_sha" "$GITHUB_SHA")
+            done < <(git diff --name-only --diff-filter=ACMRD "$base_sha" "$GITHUB_SHA")
           fi
 
           {
@@ -388,8 +403,10 @@ jobs:
             echo "runtime-fence=$runtime_fence"
             echo "backup-restore=$backup_restore"
             echo "blue-green-simulation=$blue_green_simulation"
+            echo "blue-green-provider-lab=$blue_green_provider_lab"
             echo "application-deployment-blue-green=$application_deployment_blue_green"
             echo "production-application-blue-green=$production_application_blue_green"
+            echo "fork-deploy=$fork_deploy"
           } >> "$GITHUB_OUTPUT"
 
   control-plane-migration:
@@ -420,6 +437,18 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Set up PHP
+        uses: shivammathur/setup-php@44454db4f0199b8b9685a5d763dc37cbf79108e1 # 2.36.0
+        with:
+          php-version: '8.5'
+          coverage: none
+          extensions: mbstring, pdo_pgsql, redis
+      - name: Install Composer dependencies
+        run: composer install --no-interaction --prefer-dist --optimize-autoloader
+      - name: Preload pinned Ubuntu 24.04 test image
+        run: docker pull docker.io/library/ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
+      - name: Preload pinned Redis queue-probe image
+        run: docker pull redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
       - name: Run runtime fencing and terminal-state gates
         run: tests/Integration/ControlPlaneRuntimeFence/run.sh
 
@@ -459,6 +488,17 @@ jobs:
       - name: Run selected promotion, rollback, and availability scenario
         run: tests/Integration/ControlPlaneBlueGreen/run.sh "${{ matrix.scenario }}"
 
+  blue-green-provider-lab:
+    name: Traefik Docker and File provider blue/green acceptance
+    if: needs.integration-changes.outputs.blue-green-provider-lab == 'true'
+    needs: integration-changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Run real Traefik provider coexistence, eviction, and held-traffic gate
+        run: tests/Integration/BlueGreen/run.sh
+
   application-deployment-blue-green:
     name: Application deployment job blue/green acceptance
     if: needs.integration-changes.outputs.application-deployment-blue-green == 'true'
@@ -497,6 +537,21 @@ jobs:
       - name: Run the production-image acceptance gate
         run: tests/Integration/ProductionApplicationBlueGreen/run.sh
 
+  fork-deploy:
+    name: Signed fork deployment contract
+    if: needs.integration-changes.outputs.fork-deploy == 'true'
+    needs: integration-changes
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - name: Run signed fork deployment contract
+        run: tests/Integration/ForkDeploy/run.sh
+
   required:
     name: Application validation required
     if: always()
@@ -512,8 +567,10 @@ jobs:
       - control-plane-runtime-fence
       - control-plane-backup-restore
       - control-plane-blue-green-simulation
+      - blue-green-provider-lab
       - application-deployment-blue-green
       - production-application-blue-green
+      - fork-deploy
     runs-on: ubuntu-24.04
     steps:
       - name: Require every validation job
@@ -533,10 +590,14 @@ jobs:
           BACKUP_RESTORE_RESULT: ${{ needs.control-plane-backup-restore.result }}
           BLUE_GREEN_SIMULATION_SELECTED: ${{ needs.integration-changes.outputs.blue-green-simulation }}
           BLUE_GREEN_SIMULATION_RESULT: ${{ needs.control-plane-blue-green-simulation.result }}
+          BLUE_GREEN_PROVIDER_LAB_SELECTED: ${{ needs.integration-changes.outputs.blue-green-provider-lab }}
+          BLUE_GREEN_PROVIDER_LAB_RESULT: ${{ needs.blue-green-provider-lab.result }}
           APPLICATION_DEPLOYMENT_BLUE_GREEN_SELECTED: ${{ needs.integration-changes.outputs.application-deployment-blue-green }}
           APPLICATION_DEPLOYMENT_BLUE_GREEN_RESULT: ${{ needs.application-deployment-blue-green.result }}
           PRODUCTION_APPLICATION_BLUE_GREEN_SELECTED: ${{ needs.integration-changes.outputs.production-application-blue-green }}
           PRODUCTION_APPLICATION_BLUE_GREEN_RESULT: ${{ needs.production-application-blue-green.result }}
+          FORK_DEPLOY_SELECTED: ${{ needs.integration-changes.outputs.fork-deploy }}
+          FORK_DEPLOY_RESULT: ${{ needs.fork-deploy.result }}
         run: |
           set -Eeuo pipefail
 
@@ -569,5 +630,7 @@ jobs:
           require_selected control-plane-runtime-fence "$RUNTIME_FENCE_SELECTED" "$RUNTIME_FENCE_RESULT"
           require_selected control-plane-backup-restore "$BACKUP_RESTORE_SELECTED" "$BACKUP_RESTORE_RESULT"
           require_selected control-plane-blue-green-simulation "$BLUE_GREEN_SIMULATION_SELECTED" "$BLUE_GREEN_SIMULATION_RESULT"
+          require_selected blue-green-provider-lab "$BLUE_GREEN_PROVIDER_LAB_SELECTED" "$BLUE_GREEN_PROVIDER_LAB_RESULT"
           require_selected application-deployment-blue-green "$APPLICATION_DEPLOYMENT_BLUE_GREEN_SELECTED" "$APPLICATION_DEPLOYMENT_BLUE_GREEN_RESULT"
           require_selected production-application-blue-green "$PRODUCTION_APPLICATION_BLUE_GREEN_SELECTED" "$PRODUCTION_APPLICATION_BLUE_GREEN_RESULT"
+          require_selected fork-deploy "$FORK_DEPLOY_SELECTED" "$FORK_DEPLOY_RESULT"

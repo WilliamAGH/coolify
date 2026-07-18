@@ -63,10 +63,54 @@ assert_safe_identifier()
         || fail "$1 is not a safe host-gate identifier"
 }
 
-assert_native_amd64_engine_platform()
+host_gate_platform_from_uname()
 {
-    [[ $1 == linux/amd64 ]] \
-        || blocked 'the production host gate requires a native linux/amd64 Docker engine; CPU emulation is not accepted'
+    local system=$1 machine=$2
+
+    [[ $system == Linux ]] \
+        || blocked "the production host gate requires a native Linux host; detected system=$system"
+    case "$machine" in
+        x86_64|amd64) printf '%s' linux/amd64 ;;
+        aarch64|arm64) printf '%s' linux/arm64 ;;
+        *) blocked "the production host gate supports only native amd64 and arm64 hosts; detected machine=$machine" ;;
+    esac
+}
+
+host_gate_platform()
+{
+    local native_platform requested_platform
+
+    native_platform=$(host_gate_platform_from_uname "$(uname -s)" "$(uname -m)")
+    requested_platform=${CONTROL_PLANE_RUNTIME_HOST_GATE_PLATFORM:-$native_platform}
+    case "$requested_platform" in
+        linux/amd64|linux/arm64) ;;
+        *) blocked 'CONTROL_PLANE_RUNTIME_HOST_GATE_PLATFORM must be one of linux/amd64 or linux/arm64' ;;
+    esac
+    [[ $requested_platform == "$native_platform" ]] \
+        || blocked "CONTROL_PLANE_RUNTIME_HOST_GATE_PLATFORM does not match the native Linux host: requested=$requested_platform native=$native_platform"
+    printf '%s' "$native_platform"
+}
+
+assert_native_engine_platform()
+{
+    local host_platform=$1 actual_platform=$2
+
+    [[ $actual_platform == "$host_platform" ]] \
+        || blocked "the production host gate requires a native $host_platform Docker engine matching the Linux host; CPU emulation or platform mismatch is not accepted (engine=$actual_platform)"
+}
+
+host_gate_temporary_root()
+{
+    local root=${TMPDIR:-/tmp} canonical
+
+    root=${root%/}
+    [[ -n $root ]] || root=/
+    [[ $root == /* && $root != *$'\n'* && -d $root && ! -L $root ]] \
+        || fail 'TMPDIR must be an existing absolute non-symlink directory'
+    canonical=$(cd -- "$root" && pwd -P) || fail 'TMPDIR could not be resolved canonically'
+    [[ $canonical == /* && -d $canonical && ! -L $canonical ]] \
+        || fail 'TMPDIR did not resolve to a safe canonical directory'
+    printf '%s' "$canonical"
 }
 
 assert_local_docker_endpoint_contract()
@@ -83,7 +127,8 @@ assert_absolute_directory()
 
 assert_local_host_image()
 {
-    local expected_source_sha=$1 reference=$2 source_sha repo_digests
+    local expected_source_sha=$1 expected_platform=$2 reference=$3
+    local source_sha repo_digests image_platform platform_label
 
     docker image inspect "$reference" >/dev/null \
         || blocked 'the digest-pinned systemd host image is not present locally; build it with build-systemd-ubuntu24-image.sh and retain that exact local RepoDigest'
@@ -93,11 +138,15 @@ assert_local_host_image()
     source_sha=$(docker image inspect \
         --format '{{ index .Config.Labels "io.coolify.runtime-fence.systemd-host-source-sha256" }}' \
         "$reference")
+    image_platform=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$reference")
+    platform_label=$(docker image inspect \
+        --format '{{ index .Config.Labels "io.coolify.runtime-fence.systemd-host-platform" }}' \
+        "$reference")
     [[ $(docker image inspect \
         --format '{{ index .Config.Labels "io.coolify.runtime-fence.systemd-host" }}' "$reference") == true \
-        && $(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$reference") == linux/amd64 \
+        && $image_platform == "$expected_platform" && $platform_label == "$expected_platform" \
         && $source_sha == "$expected_source_sha" ]] \
-        || blocked 'the digest-pinned host image lacks the exact source attestation for this checkout'
+        || blocked "the digest-pinned host image lacks the exact source and $expected_platform platform attestations for this checkout"
 }
 
 assert_stack_adapter()
@@ -284,7 +333,7 @@ persist_outer_docker_diagnostic()
     esac
     [[ -f $source && ! -L $source ]] || return 1
     bounded_outer_docker "$HOST_GATE_DIAGNOSTIC_DOCKER_CALL_TIMEOUT_SECONDS" \
-        run --rm --pull never --platform linux/amd64 --network none --entrypoint /bin/sh \
+        run --rm --pull never --platform "$HOST_GATE_PLATFORM" --network none --entrypoint /bin/sh \
         --mount "type=bind,source=$source,target=/input/diagnostic,readonly" \
         --mount "type=volume,source=$EVIDENCE_VOLUME,target=/evidence" \
         "$CONTROL_PLANE_RUNTIME_HOST_IMAGE" -ec '
@@ -314,7 +363,7 @@ capture_outer_docker_diagnostic()
     local filename=$1 staging_directory candidate status_candidate status persisted=0
 
     shift
-    staging_directory=$(mktemp -d "${TMPDIR:-/tmp}/coolify-runtime-fence-host-diagnostic.XXXXXX") \
+    staging_directory=$(mktemp -d "$HOST_GATE_TEMPORARY_ROOT/coolify-runtime-fence-host-diagnostic.XXXXXX") \
         || return 1
     candidate=$staging_directory/$filename
     if bounded_outer_docker "$HOST_GATE_DIAGNOSTIC_DOCKER_CALL_TIMEOUT_SECONDS" "$@" \
@@ -402,7 +451,7 @@ wait_for_container_stop()
 evidence_value()
 {
     bounded_outer_docker "$HOST_GATE_DIAGNOSTIC_DOCKER_CALL_TIMEOUT_SECONDS" \
-        run --rm --pull never --platform linux/amd64 --network none --entrypoint /bin/cat \
+        run --rm --pull never --platform "$HOST_GATE_PLATFORM" --network none --entrypoint /bin/cat \
         --mount "type=volume,source=$EVIDENCE_VOLUME,target=/evidence,readonly" \
         "$CONTROL_PLANE_RUNTIME_HOST_IMAGE" "/evidence/$1"
 }
@@ -411,6 +460,7 @@ inner_environment_arguments()
 {
     printf '%s\0' \
         "--env" "CONTROL_PLANE_RUNTIME_HOST_GATE_OPERATION=$HOST_GATE_OPERATION" \
+        "--env" "CONTROL_PLANE_RUNTIME_HOST_GATE_PLATFORM=$HOST_GATE_PLATFORM" \
         "--env" "CONTROL_PLANE_RUNTIME_LIVE_STACK_COMMAND=$LIVE_STACK_COMMAND_INNER" \
         "--env" "CONTROL_PLANE_RUNTIME_WEB_A_IMAGE=$CONTROL_PLANE_RUNTIME_WEB_A_IMAGE" \
         "--env" "CONTROL_PLANE_RUNTIME_WEB_B_IMAGE=$CONTROL_PLANE_RUNTIME_WEB_B_IMAGE" \
@@ -467,7 +517,7 @@ export_evidence()
     }
     # shellcheck disable=SC2016 # This literal is evaluated by the immutable host-image helper.
     bounded_outer_docker "$HOST_GATE_EVIDENCE_EXPORT_TIMEOUT_SECONDS" \
-        run --rm --pull never --platform linux/amd64 --network none --entrypoint /bin/sh \
+        run --rm --pull never --platform "$HOST_GATE_PLATFORM" --network none --entrypoint /bin/sh \
         --mount "type=volume,source=$EVIDENCE_VOLUME,target=/evidence,readonly" \
         --mount "type=bind,source=$leaf,target=/export" \
         "$CONTROL_PLANE_RUNTIME_HOST_IMAGE" -ec '
@@ -544,7 +594,7 @@ run_exclusive_evidence_export_contract_tests()
 {
     local parent operation=host-gate-evidence-export-test leaf stale binding binding_name binding_token
 
-    parent=$(mktemp -d "${TMPDIR:-/tmp}/coolify-runtime-fence-export-contract.XXXXXX")
+    parent=$(mktemp -d "$HOST_GATE_TEMPORARY_ROOT/coolify-runtime-fence-export-contract.XXXXXX")
     parent=$(cd -- "$parent" && pwd -P)
     leaf=$parent/$operation
     create_exclusive_evidence_export_leaf "$parent" "$operation" \
@@ -618,6 +668,22 @@ write_host_gate_fake_docker()
     chmod 0700 "$directory/docker"
 }
 
+# shellcheck disable=SC2016 # This function writes literal child-shell source for the isolated fake uname binary.
+write_host_gate_fake_uname()
+{
+    local directory=$1
+
+    printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'set -Eeuo pipefail' \
+        'case "${1:-}" in' \
+        '    -s) printf "%s\\n" "$FAKE_UNAME_SYSTEM" ;;' \
+        '    -m) printf "%s\\n" "$FAKE_UNAME_MACHINE" ;;' \
+        '    *) exit 64 ;;' \
+        'esac' > "$directory/uname"
+    chmod 0700 "$directory/uname"
+}
+
 assert_fake_docker_has_no_mutation()
 {
     local trace=$1
@@ -629,22 +695,26 @@ assert_fake_docker_has_no_mutation()
 run_host_gate_preflight_fake_docker_test()
 {
     local label=$1 expected_message=$2 docker_host=$3 docker_context=$4 active_context=$5 active_endpoint=$6
-    local architecture=$7 expected_trace=$8
+    local host_system=$7 host_machine=$8 engine_architecture=$9 requested_platform=${10} expected_trace=${11}
     local directory trace output status
     local -a environment=()
 
-    directory=$(mktemp -d "${TMPDIR:-/tmp}/coolify-runtime-fence-preflight-contract.XXXXXX")
+    directory=$(mktemp -d "$HOST_GATE_TEMPORARY_ROOT/coolify-runtime-fence-preflight-contract.XXXXXX")
     trace=$directory/docker.trace
     output=$directory/output
     : > "$trace"
     write_host_gate_fake_docker "$directory"
+    write_host_gate_fake_uname "$directory"
     environment=(
         env -u DOCKER_HOST -u DOCKER_CONTEXT
         "PATH=$directory:$PATH"
         "FAKE_DOCKER_TRACE=$trace"
         "FAKE_DOCKER_ACTIVE_CONTEXT=$active_context"
         "FAKE_DOCKER_ACTIVE_ENDPOINT=$active_endpoint"
-        "FAKE_DOCKER_ENGINE_ARCHITECTURE=$architecture"
+        "FAKE_DOCKER_ENGINE_ARCHITECTURE=$engine_architecture"
+        "FAKE_UNAME_SYSTEM=$host_system"
+        "FAKE_UNAME_MACHINE=$host_machine"
+        "CONTROL_PLANE_RUNTIME_HOST_GATE_PLATFORM=$requested_platform"
         CONTROL_PLANE_RUNTIME_HOST_GATE_EXECUTE=1
         CONTROL_PLANE_RUNTIME_TEST_MODE=0
         CONTROL_PLANE_RUNTIME_PROVISION_TEST_MODE=0
@@ -683,36 +753,70 @@ run_host_gate_preflight_fake_docker_tests()
 {
     run_host_gate_preflight_fake_docker_test \
         remote-docker-host 'rejects ambient DOCKER_HOST and DOCKER_CONTEXT overrides' \
-        ssh://control-plane.example '' default unix:///var/run/docker.sock amd64 ''
+        ssh://control-plane.example '' default unix:///var/run/docker.sock \
+        Linux x86_64 amd64 linux/amd64 ''
     run_host_gate_preflight_fake_docker_test \
         remote-docker-context 'rejects ambient DOCKER_HOST and DOCKER_CONTEXT overrides' \
-        '' remote default unix:///var/run/docker.sock amd64 ''
+        '' remote default unix:///var/run/docker.sock Linux x86_64 amd64 linux/amd64 ''
     run_host_gate_preflight_fake_docker_test \
         remote-active-context 'requires the local default Docker context' \
-        '' '' remote ssh://control-plane.example amd64 \
+        '' '' remote ssh://control-plane.example Linux x86_64 amd64 linux/amd64 \
         $'context show\ncontext inspect remote --format {{.Endpoints.docker.Host}}'
     run_host_gate_preflight_fake_docker_test \
         remote-active-endpoint 'requires the local default Docker context' \
-        '' '' default ssh://control-plane.example amd64 \
+        '' '' default ssh://control-plane.example Linux x86_64 amd64 linux/amd64 \
         $'context show\ncontext inspect default --format {{.Endpoints.docker.Host}}'
     run_host_gate_preflight_fake_docker_test \
-        arm64-engine 'requires a native linux/amd64 Docker engine' \
-        '' '' default unix:///var/run/docker.sock arm64 \
+        arm64-engine-for-amd64-host 'requires a native linux/amd64 Docker engine matching the Linux host' \
+        '' '' default unix:///var/run/docker.sock Linux x86_64 arm64 linux/amd64 \
         $'context show\ncontext inspect default --format {{.Endpoints.docker.Host}}\nversion --format {{.Server.Os}}/{{.Server.Arch}}'
+    run_host_gate_preflight_fake_docker_test \
+        amd64-engine-for-arm64-host 'requires a native linux/arm64 Docker engine matching the Linux host' \
+        '' '' default unix:///var/run/docker.sock Linux aarch64 amd64 linux/arm64 \
+        $'context show\ncontext inspect default --format {{.Endpoints.docker.Host}}\nversion --format {{.Server.Os}}/{{.Server.Arch}}'
+    run_host_gate_preflight_fake_docker_test \
+        darwin-host 'requires a native Linux host' \
+        '' '' default unix:///var/run/docker.sock Darwin arm64 arm64 linux/arm64 ''
+    run_host_gate_preflight_fake_docker_test \
+        unsupported-linux-host 'supports only native amd64 and arm64 hosts' \
+        '' '' default unix:///var/run/docker.sock Linux riscv64 riscv64 linux/arm64 ''
+    run_host_gate_preflight_fake_docker_test \
+        requested-platform-mismatch 'does not match the native Linux host' \
+        '' '' default unix:///var/run/docker.sock Linux aarch64 arm64 linux/amd64 ''
+}
+
+run_host_gate_platform_contract_tests()
+{
+    [[ $(host_gate_platform_from_uname Linux x86_64) == linux/amd64 \
+        && $(host_gate_platform_from_uname Linux aarch64) == linux/arm64 ]] \
+        || fail 'host-gate platform derivation does not map native amd64 and arm64 hosts'
+    assert_native_engine_platform linux/amd64 linux/amd64
+    assert_native_engine_platform linux/arm64 linux/arm64
+    if (assert_native_engine_platform linux/arm64 linux/amd64) >/dev/null 2>&1; then
+        fail 'host-gate platform contract accepted an emulated amd64 engine for linux/arm64'
+    fi
+    if (host_gate_platform_from_uname Darwin arm64) >/dev/null 2>&1 \
+        || (host_gate_platform_from_uname Linux riscv64) >/dev/null 2>&1; then
+        fail 'host-gate platform contract accepted Darwin or an unsupported native architecture'
+    fi
 }
 
 run_exited_container_evidence_export_configuration_test()
 {
     local directory trace output status
 
-    directory=$(mktemp -d "${TMPDIR:-/tmp}/coolify-runtime-fence-exited-evidence-config.XXXXXX")
+    directory=$(mktemp -d "$HOST_GATE_TEMPORARY_ROOT/coolify-runtime-fence-exited-evidence-config.XXXXXX")
     trace=$directory/docker.trace
     output=$directory/output
     : > "$trace"
     write_host_gate_fake_docker "$directory"
+    write_host_gate_fake_uname "$directory"
     if env -u DOCKER_HOST -u DOCKER_CONTEXT \
         "PATH=$directory:$PATH" \
         "FAKE_DOCKER_TRACE=$trace" \
+        FAKE_UNAME_SYSTEM=Linux \
+        FAKE_UNAME_MACHINE=x86_64 \
+        CONTROL_PLANE_RUNTIME_HOST_GATE_PLATFORM=linux/amd64 \
         CONTROL_PLANE_RUNTIME_HOST_GATE_EXECUTE=1 \
         CONTROL_PLANE_RUNTIME_TEST_MODE=0 \
         CONTROL_PLANE_RUNTIME_PROVISION_TEST_MODE=0 \
@@ -749,7 +853,7 @@ run_bounded_outer_docker_contract_test()
 {
     local directory trace started elapsed status
 
-    directory=$(mktemp -d "${TMPDIR:-/tmp}/coolify-runtime-fence-timeout-contract.XXXXXX")
+    directory=$(mktemp -d "$HOST_GATE_TEMPORARY_ROOT/coolify-runtime-fence-timeout-contract.XXXXXX")
     trace=$directory/docker.trace
     : > "$trace"
     write_host_gate_fake_docker "$directory"
@@ -808,7 +912,7 @@ run_host_gate_cleanup_contract_tests()
 {
     local directory trace original_path
 
-    directory=$(mktemp -d "${TMPDIR:-/tmp}/coolify-runtime-fence-cleanup-contract.XXXXXX")
+    directory=$(mktemp -d "$HOST_GATE_TEMPORARY_ROOT/coolify-runtime-fence-cleanup-contract.XXXXXX")
     trace=$directory/docker.trace
     : > "$trace"
     write_host_gate_cleanup_fake_docker "$directory"
@@ -969,13 +1073,29 @@ remove_tracked_docker_resource()
     docker_resource_is_absent "$resource_kind" "$resource"
 }
 
+publish_host_platform_evidence()
+{
+    # shellcheck disable=SC2016 # This literal is evaluated by the immutable host-image helper.
+    image_transport_outer_evidence_run -ec '
+        destination=/evidence/host-platform
+        candidate=${destination}.candidate.$$
+        test ! -e "$destination" && test ! -L "$destination"
+        printf "%s\n" "$1" > "$candidate"
+        chown root:root "$candidate"
+        chmod 0600 "$candidate"
+        mv -f -- "$candidate" "$destination"
+        test -f "$destination" && test ! -L "$destination"
+        test "$(stat -c '\''%u:%g:%a'\'' "$destination")" = 0:0:600
+    ' sh "$HOST_GATE_PLATFORM"
+}
+
 run_partial_resource_cleanup_test()
 {
-    local export_directory marker
+    local export_directory marker platform_evidence
 
     [[ $HOST_GATE_CONTAINER_CREATED == 0 ]] \
         || fail 'partial-resource cleanup test must run before host container creation'
-    export_directory=$(mktemp -d /private/tmp/coolify-runtime-fence-partial-cleanup.XXXXXX)
+    export_directory=$(mktemp -d "$HOST_GATE_TEMPORARY_ROOT/coolify-runtime-fence-partial-cleanup.XXXXXX")
     image_transport_outer_evidence_run -ec '
         umask 077
         printf partial-resource-evidence > /evidence/partial-resource.marker
@@ -983,8 +1103,12 @@ run_partial_resource_cleanup_test()
     CONTROL_PLANE_RUNTIME_HOST_GATE_EVIDENCE_DIRECTORY=$export_directory export_evidence \
         || fail 'partial-resource cleanup could not export evidence without a host container'
     marker=$export_directory/$HOST_GATE_OPERATION/partial-resource.marker
+    platform_evidence=$export_directory/$HOST_GATE_OPERATION/host-platform
     [[ -f $marker && ! -L $marker && $(tr -d '\n' < "$marker") == partial-resource-evidence ]] \
         || fail 'partial-resource cleanup did not export evidence without a host container'
+    [[ -f $platform_evidence && ! -L $platform_evidence \
+        && $(tr -d '\n' < "$platform_evidence") == "$HOST_GATE_PLATFORM" ]] \
+        || fail 'partial-resource cleanup did not export exact host-platform evidence'
     remove_host_gate_resources
     [[ $HOST_GATE_RESOURCES_CREATED == 0 \
         && $HOST_GATE_CONTAINER_CREATED == 0 \
@@ -992,7 +1116,7 @@ run_partial_resource_cleanup_test()
         && $HOST_GATE_INNER_DOCKER_VOLUME_CREATED == 0 \
         && $HOST_GATE_EVIDENCE_VOLUME_CREATED == 0 ]] \
         || fail 'partial-resource cleanup retained a tracked Docker resource'
-    rm -f -- "$marker"
+    rm -f -- "$marker" "$platform_evidence"
     rmdir -- "$export_directory/$HOST_GATE_OPERATION" "$export_directory"
     printf 'CONTROL_PLANE_RUNTIME_FENCE_HOST_GATE partial_cleanup_test=passed container_created=false evidence_export=volume\n'
 }
@@ -1001,7 +1125,7 @@ run_partial_resource_cleanup_test()
 evidence_file_metadata()
 {
     bounded_outer_docker "$HOST_GATE_DIAGNOSTIC_DOCKER_CALL_TIMEOUT_SECONDS" \
-        run --rm --pull never --platform linux/amd64 --network none --entrypoint /bin/sh \
+        run --rm --pull never --platform "$HOST_GATE_PLATFORM" --network none --entrypoint /bin/sh \
         --mount "type=volume,source=$EVIDENCE_VOLUME,target=/evidence,readonly" \
         "$CONTROL_PLANE_RUNTIME_HOST_IMAGE" -ec '
             source=/evidence/$1
@@ -1016,7 +1140,7 @@ exported_evidence_file_evidence()
     local export_leaf=$1 filename=$2
 
     bounded_outer_docker "$HOST_GATE_DIAGNOSTIC_DOCKER_CALL_TIMEOUT_SECONDS" \
-        run --rm --pull never --platform linux/amd64 --network none --entrypoint /bin/sh \
+        run --rm --pull never --platform "$HOST_GATE_PLATFORM" --network none --entrypoint /bin/sh \
         --mount "type=bind,source=$export_leaf,target=/export,readonly" \
         "$CONTROL_PLANE_RUNTIME_HOST_IMAGE" -ec '
             source=/export/$1
@@ -1031,7 +1155,7 @@ exported_evidence_value()
     local export_leaf=$1 filename=$2
 
     bounded_outer_docker "$HOST_GATE_DIAGNOSTIC_DOCKER_CALL_TIMEOUT_SECONDS" \
-        run --rm --pull never --platform linux/amd64 --network none --entrypoint /bin/cat \
+        run --rm --pull never --platform "$HOST_GATE_PLATFORM" --network none --entrypoint /bin/cat \
         --mount "type=bind,source=$export_leaf,target=/export,readonly" \
         "$CONTROL_PLANE_RUNTIME_HOST_IMAGE" "/export/$filename"
 }
@@ -1050,6 +1174,7 @@ assert_exited_container_exported_evidence()
         && $(local_file_mode "$export_leaf") == 700 ]] \
         || fail 'exited-host diagnostic export leaf is not a private canonical directory'
     for filename in \
+        host-platform \
         outer-container-inspect.json outer-container-inspect.status \
         outer-container-logs.txt outer-container-logs.status; do
         source_sha=$(evidence_value "$filename" | sha256sum | awk '{print $1}')
@@ -1059,6 +1184,8 @@ assert_exited_container_exported_evidence()
     done
     inspect_output=$(exported_evidence_value "$export_leaf" outer-container-inspect.json)
     logs_status=$(exported_evidence_value "$export_leaf" outer-container-logs.status)
+    [[ $(exported_evidence_value "$export_leaf" host-platform) == "$HOST_GATE_PLATFORM" ]] \
+        || fail 'exited-host diagnostic export changed host-platform evidence'
     jq --exit-status . <<< "$inspect_output" >/dev/null \
         || fail 'exited-host diagnostic export did not preserve valid outer Docker inspect JSON'
     grep -F -q "\"Name\": \"/$HOST_CONTAINER\"" <<< "$inspect_output" \
@@ -1072,7 +1199,7 @@ run_exited_container_evidence_test()
     local inspect_output logs_status filename
 
     bounded_outer_docker "$HOST_GATE_DIAGNOSTIC_DOCKER_CALL_TIMEOUT_SECONDS" \
-        create --pull never --platform linux/amd64 --privileged --cgroupns=private \
+        create --pull never --platform "$HOST_GATE_PLATFORM" --privileged --cgroupns=private \
         --name "$HOST_CONTAINER" \
         --hostname "$HOST_CONTAINER" --network "$OUTER_NETWORK" \
         --tmpfs /run --tmpfs /run/lock --tmpfs /tmp \
@@ -1094,7 +1221,7 @@ run_exited_container_evidence_test()
         || fail 'exited-host diagnostic evidence did not retain outer Docker inspect output'
     grep -F -q outer_docker_exit_status=0 <<< "$logs_status" \
         || fail 'exited-host diagnostic evidence did not retain outer Docker logs output'
-    for filename in \
+    for filename in host-platform \
         outer-container-inspect.json outer-container-inspect.status \
         outer-container-logs.txt outer-container-logs.status; do
         [[ $(evidence_file_metadata "$filename") == 0:0:600 ]] \
@@ -1159,6 +1286,9 @@ usage()
         'use --check for a non-mutating source-contract check.'
 }
 
+HOST_GATE_TEMPORARY_ROOT=$(host_gate_temporary_root)
+readonly HOST_GATE_TEMPORARY_ROOT
+
 if [[ ${1:-} == --check ]]; then
     for path in "$HOST_DOCKERFILE" "$HOST_BOOT_SCRIPT" "$HOST_BOOT_UNIT" "$HOST_BUILD_SCRIPT" \
         "$TEST_DIRECTORY/linux-host-acceptance-inner.sh" "$TEST_DIRECTORY/live-host-fixture.bash" \
@@ -1180,10 +1310,7 @@ if [[ ${1:-} == --check ]]; then
     "$LIVE_STACK_ADAPTER" --check >/dev/null
     "$HOST_BUILD_SCRIPT" --check >/dev/null
     assert_isolated_container_contract_representations
-    assert_native_amd64_engine_platform linux/amd64
-    if (assert_native_amd64_engine_platform linux/arm64) >/dev/null 2>&1; then
-        fail 'native-amd64 engine preflight accepted an emulated host architecture'
-    fi
+    run_host_gate_platform_contract_tests
     assert_local_docker_endpoint_contract default unix:///var/run/docker.sock
     if (assert_local_docker_endpoint_contract remote ssh://control-plane.example) \
         >/dev/null 2>&1; then
@@ -1219,6 +1346,10 @@ esac
 [[ ${CONTROL_PLANE_RUNTIME_TEST_MODE:-0} == 0 \
     && ${CONTROL_PLANE_RUNTIME_PROVISION_TEST_MODE:-0} == 0 ]] \
     || fail 'the production host-gate path forbids controller and provisioner test mode'
+HOST_GATE_PLATFORM=$(host_gate_platform)
+readonly HOST_GATE_PLATFORM
+CONTROL_PLANE_RUNTIME_HOST_GATE_PLATFORM=$HOST_GATE_PLATFORM
+export CONTROL_PLANE_RUNTIME_HOST_GATE_PLATFORM
 if [[ $HOST_GATE_EXECUTION_MODE == exited-container-evidence-test ]]; then
     evidence_export_directory=${CONTROL_PLANE_RUNTIME_HOST_GATE_EVIDENCE_DIRECTORY:-}
     [[ -n $evidence_export_directory && -d $evidence_export_directory \
@@ -1239,14 +1370,15 @@ docker_endpoint=$(docker context inspect "$docker_context" --format '{{.Endpoint
 assert_local_docker_endpoint_contract "$docker_context" "$docker_endpoint"
 engine_platform=$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}') \
     || blocked 'the production host gate could not attest the Docker engine platform'
-assert_native_amd64_engine_platform "$engine_platform"
+assert_native_engine_platform "$HOST_GATE_PLATFORM" "$engine_platform"
 [[ -S /var/run/docker.sock ]] \
     || blocked 'the production host gate requires a local Unix Docker socket at /var/run/docker.sock'
 [[ -n ${CONTROL_PLANE_RUNTIME_HOST_IMAGE:-} ]] \
     || blocked 'missing required real-stack input: CONTROL_PLANE_RUNTIME_HOST_IMAGE'
 
 assert_digest_reference host-image "$CONTROL_PLANE_RUNTIME_HOST_IMAGE"
-assert_local_host_image "$(source_attestation_sha256)" "$CONTROL_PLANE_RUNTIME_HOST_IMAGE"
+assert_local_host_image "$(source_attestation_sha256)" "$HOST_GATE_PLATFORM" \
+    "$CONTROL_PLANE_RUNTIME_HOST_IMAGE"
 if [[ $HOST_GATE_EXECUTION_MODE != partial-cleanup-test \
     && $HOST_GATE_EXECUTION_MODE != exited-container-evidence-test ]]; then
     for required in \
@@ -1298,6 +1430,7 @@ docker volume create "$INNER_DOCKER_VOLUME" >/dev/null
 HOST_GATE_INNER_DOCKER_VOLUME_CREATED=1
 docker volume create "$EVIDENCE_VOLUME" >/dev/null
 HOST_GATE_EVIDENCE_VOLUME_CREATED=1
+publish_host_platform_evidence
 if [[ $HOST_GATE_EXECUTION_MODE == partial-cleanup-test ]]; then
     run_partial_resource_cleanup_test
     exit 0
@@ -1318,7 +1451,7 @@ if [[ $HOST_GATE_EXECUTION_MODE == image-export-test ]]; then
         "$IMAGE_TRANSPORT_MANIFEST_SHA256"
     exit 0
 fi
-docker run --detach --pull never --platform linux/amd64 --privileged --cgroupns=private \
+docker run --detach --pull never --platform "$HOST_GATE_PLATFORM" --privileged --cgroupns=private \
     --name "$HOST_CONTAINER" \
     --hostname "$HOST_CONTAINER" --network "$OUTER_NETWORK" \
     --tmpfs /run --tmpfs /run/lock --tmpfs /tmp \
@@ -1336,7 +1469,7 @@ else
     initial_status=$?
 fi
 [[ $initial_status -ne 78 ]] \
-    || blocked 'the inner host cannot obtain a required real Coolify/Traefik image, TLS, :8000, SSH, provider, or queue input'
+    || blocked 'the inner host cannot obtain a required real Coolify/Traefik image, TLS, native loopback, SSH, provider, or queue input'
 [[ $(evidence_value runtime-fence-host.phase) == reboot-pending ]] \
     || fail 'inner runner did not persist a reboot-pending phase before systemctl reboot'
 started_before=$(bounded_outer_docker "$HOST_GATE_READINESS_DOCKER_CALL_TIMEOUT_SECONDS" \
@@ -1354,8 +1487,8 @@ if run_inner --resume; then
 else
     resume_status=$?
     [[ $resume_status -ne 78 ]] \
-        || blocked 'the inner host cannot obtain a required real Coolify/Traefik image, TLS, :8000, SSH, provider, or queue input'
+        || blocked 'the inner host cannot obtain a required real Coolify/Traefik image, TLS, native loopback, SSH, provider, or queue input'
     fail 'inner runner did not converge after the actual disposable-host reboot'
 fi
-printf 'CONTROL_PLANE_RUNTIME_FENCE_HOST_GATE PASS operation=%s host_image=%s isolated=true reboot_boundary=true\n' \
-    "$HOST_GATE_OPERATION" "$CONTROL_PLANE_RUNTIME_HOST_IMAGE"
+printf 'CONTROL_PLANE_RUNTIME_FENCE_HOST_GATE PASS operation=%s host_image=%s platform=%s isolated=true reboot_boundary=true\n' \
+    "$HOST_GATE_OPERATION" "$CONTROL_PLANE_RUNTIME_HOST_IMAGE" "$HOST_GATE_PLATFORM"
