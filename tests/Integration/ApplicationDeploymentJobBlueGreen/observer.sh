@@ -35,7 +35,11 @@ copy_source_snapshot()
     snapshot_identity=$(file_identity "$snapshot_source" || true)
     [ -n "$snapshot_identity" ] || return 2
     if cp "$snapshot_source" "$snapshot_target" 2>/dev/null; then
-        return 0
+        copied_identity=$(file_identity "$snapshot_source" || true)
+        [ "$copied_identity" = "$snapshot_identity" ] && return 0
+        rm -f "$snapshot_target"
+        snapshot_identity=$copied_identity
+        [ -n "$snapshot_identity" ] || return 2
     fi
     current_identity=$(file_identity "$snapshot_source" || true)
     [ "$current_identity" = "$snapshot_identity" ] || return 2
@@ -44,7 +48,10 @@ copy_source_snapshot()
     stable_identity=$(file_identity "$snapshot_source" || true)
     [ "$stable_identity" = "$current_identity" ] || return 2
     if cp "$snapshot_source" "$snapshot_target" 2>/dev/null; then
-        return 0
+        copied_identity=$(file_identity "$snapshot_source" || true)
+        [ "$copied_identity" = "$stable_identity" ] && return 0
+        rm -f "$snapshot_target"
+        return 2
     fi
     final_identity=$(file_identity "$snapshot_source" || true)
     [ "$final_identity" = "$stable_identity" ] || return 2

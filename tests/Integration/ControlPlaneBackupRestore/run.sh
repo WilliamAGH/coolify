@@ -998,6 +998,46 @@ run_tools /opt/control-plane-backup/restore-attest.sh \
     && $(stat -c '%u:%g:%a' "$RUNTIME_DIRECTORY/probe-token") == 0:0:600 \
     && $(stat -c '%u:%g:%a' "$RUNTIME_DIRECTORY/probe-ack") == 0:0:600 ]] \
     || { printf '%s\n' 'candidate secrets do not preserve host and runtime ownership' >&2; exit 1; }
+CANDIDATE_DIRECT_PROBE_SOURCE=$(docker inspect --format \
+    '{{range .Mounts}}{{if eq .Destination "/run/secrets/control-plane-direct-probe-token"}}{{.Source}}{{end}}{{end}}' \
+    "$CANDIDATE_CONTAINER")
+CANDIDATE_APPLIED_ACK_SOURCE=$(docker inspect --format \
+    '{{range .Mounts}}{{if eq .Destination "/run/secrets/control-plane-applied-ack"}}{{.Source}}{{end}}{{end}}' \
+    "$CANDIDATE_CONTAINER")
+[[ -f $CANDIDATE_DIRECT_PROBE_SOURCE && ! -L $CANDIDATE_DIRECT_PROBE_SOURCE \
+    && $(stat -c '%u:%g:%a' "$CANDIDATE_DIRECT_PROBE_SOURCE") == 0:0:444 \
+    && -f $CANDIDATE_APPLIED_ACK_SOURCE && ! -L $CANDIDATE_APPLIED_ACK_SOURCE \
+    && $(stat -c '%u:%g:%a' "$CANDIDATE_APPLIED_ACK_SOURCE") == 0:0:444 ]] \
+    || { printf '%s\n' 'candidate restartable secret sources did not survive boot' >&2; exit 1; }
+docker restart "$CANDIDATE_CONTAINER" >/dev/null
+CANDIDATE_RESTART_READY=0
+for _ in $(seq 1 30); do
+    if [[ $(docker inspect --format '{{.State.Running}}' "$CANDIDATE_CONTAINER") == true \
+        && $(docker exec "$CANDIDATE_CONTAINER" \
+            cat /run/secrets/control-plane-direct-probe-token) \
+            == "$(cat "$RUNTIME_DIRECTORY/probe-token")" \
+        && $(docker exec "$CANDIDATE_CONTAINER" \
+            cat /run/secrets/control-plane-applied-ack) \
+            == "$(cat "$RUNTIME_DIRECTORY/probe-ack")" ]] \
+        && docker exec "$CANDIDATE_CONTAINER" sh -ec '
+            probe_token=$(cat /run/secrets/control-plane-direct-probe-token)
+            expected_ack=$(cat /run/secrets/control-plane-applied-ack)
+            response=$(mktemp)
+            trap '\''rm -f "$response"'\'' EXIT
+            status=$(curl --silent --show-error --output /dev/null --dump-header "$response" \
+                --write-out "%{http_code}" --header "X-Control-Plane-Probe: $probe_token" \
+                http://127.0.0.1:8080/api/control-plane/probe)
+            [ "$status" = 204 ]
+            [ "$(sed -n '\''s/^X-Control-Plane-Applied-Config: \(.*\)\r$/\1/p'\'' "$response")" \
+                = "$expected_ack" ]
+        ' 2>/dev/null; then
+        CANDIDATE_RESTART_READY=1
+        break
+    fi
+    sleep 1
+done
+[[ $CANDIDATE_RESTART_READY == 1 ]] \
+    || { printf '%s\n' 'candidate API and secrets were unavailable after restart' >&2; exit 1; }
 CANONICAL_CANDIDATE_NETWORK="$LAB_ID-candidate-network"
 EXPECTED_CANDIDATE_MEMBERS=$(printf '%s\n' "$CANDIDATE_CONTAINER" "$TARGET_CONTAINER" \
     "$LAB_ID-redis-main" | LC_ALL=C sort)

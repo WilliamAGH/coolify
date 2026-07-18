@@ -458,7 +458,7 @@ configured_release_asset_path()
         backup-quiesce-controller) printf '%s\n' "$release_backup_quiesce_controller" ;;
         backup-quiesce-service-unit) printf '%s\n' "$release_backup_quiesce_service_unit" ;;
         backup-quiesce-timer-unit) printf '%s\n' "$release_backup_quiesce_timer_unit" ;;
-        runtime-fence-provisioner) printf '%s\n' "$runtime_fence_provisioner" ;;
+        runtime-fence-provisioner) printf '%s\n' "$release_runtime_fence_provisioner" ;;
         runtime-fence-controller) printf '%s\n' "$release_runtime_fence_controller" ;;
         runtime-fence-controlmaster-reaper) printf '%s\n' "$release_runtime_fence_reaper" ;;
         runtime-fence-provider-probe) printf '%s\n' "$release_runtime_fence_provider_probe" ;;
@@ -489,7 +489,8 @@ configure_and_verify_release_inventory()
     rehearsal_compose_file=${CONTROL_PLANE_REHEARSAL_COMPOSE_FILE:-$SCRIPT_DIRECTORY/compose.rehearsal.yaml}
     ingress_controller=${CONTROL_PLANE_INGRESS_CONTROLLER:-$SCRIPT_DIRECTORY/controllers/traefik-ingress.sh}
     backup_attestation_verifier=${CONTROL_PLANE_BACKUP_ATTESTATION_VERIFIER:-$SCRIPT_DIRECTORY/backup/restore-attest.sh}
-    runtime_fence_provisioner=${CONTROL_PLANE_RUNTIME_FENCE_PROVISIONER:-$SCRIPT_DIRECTORY/controllers/provision-runtime-attestation-ssh-fence.sh}
+    release_runtime_fence_provisioner=$SCRIPT_DIRECTORY/controllers/provision-runtime-attestation-ssh-fence.sh
+    runtime_fence_provisioner=${CONTROL_PLANE_RUNTIME_FENCE_PROVISIONER:-$release_runtime_fence_provisioner}
     release_backup_quiesce_service_unit=$SCRIPT_DIRECTORY/backup-quiesce/control-plane-backup-quiesce-watchdog.service
     release_backup_quiesce_timer_unit=$SCRIPT_DIRECTORY/backup-quiesce/control-plane-backup-quiesce-watchdog.timer
     release_runtime_fence_service_unit=$SCRIPT_DIRECTORY/controllers/coolify-runtime-attestation-ssh-fence.service

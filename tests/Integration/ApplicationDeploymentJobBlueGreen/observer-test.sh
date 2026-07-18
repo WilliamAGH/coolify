@@ -67,6 +67,12 @@ if [ "$1" = "$OBSERVER_TEST_CP_FAULT_SOURCE" ]; then
         printf '%s\n' "$fault_count" >"$OBSERVER_TEST_CP_FAULT_COUNT"
         exit 1
     fi
+    if [ "$fault_count" -eq 2 ]; then
+        "$OBSERVER_TEST_REAL_CP" "$@"
+        printf '# successful-copy-race\n' >>"$1"
+        printf '3\n' >"$OBSERVER_TEST_CP_FAULT_COUNT"
+        exit 0
+    fi
 fi
 
 exec "$OBSERVER_TEST_REAL_CP" "$@"
@@ -92,7 +98,7 @@ until [ -s "$runtime_evidence/observer-heartbeat" ]; do
 done
 
 attempt=0
-until [ "$(cat "$cp_fault_count")" -eq 2 ]; do
+until [ "$(cat "$cp_fault_count")" -eq 3 ]; do
     require_observer_running
     attempt=$((attempt + 1))
     [ "$attempt" -lt 100 ]

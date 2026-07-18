@@ -59,6 +59,7 @@ docker tag application-deployment-job-fixture:manifest \
 docker push 127.0.0.1:5000/application-deployment-job-fixture:manifest >/dev/null
 
 docker run --detach --pull never --name coolify-proxy --network coolify --publish 80:80 \
+    --volume /var/run/docker.sock:/var/run/docker.sock:ro \
     --volume /data/coolify/proxy/dynamic:/dynamic:ro \
     --volume /data/coolify/proxy/traefik.yml:/etc/traefik/traefik.yml:ro \
     "traefik:v$TRAEFIK_VERSION" \

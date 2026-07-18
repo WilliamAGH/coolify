@@ -99,6 +99,10 @@ final class BlueGreenDeactivationScenario
             $managedFilename = $metadataOwner->managedFilenameFor($application->uuid, $destination->id);
             $scope = pathinfo($managedFilename, PATHINFO_FILENAME);
             $routerName = str_replace('coolify-blue-green-', 'coolify-bg-', $scope).'-app-public';
+            $activeServiceName = BlueGreenRoutingTarget::activeServiceName(
+                $application->uuid,
+                $destination->id,
+            );
             $host = parse_url($application->fqdn, PHP_URL_HOST);
             $scheme = parse_url($application->fqdn, PHP_URL_SCHEME);
             $entryPoint = $scheme === 'https' ? 'https' : 'http';
@@ -113,7 +117,7 @@ final class BlueGreenDeactivationScenario
                         $routerName => [
                             'rule' => "Host(`{$host}`) && PathPrefix(`/`)",
                             'entryPoints' => [$entryPoint],
-                            'service' => $routerName.'-service',
+                            'service' => $activeServiceName,
                             'middlewares' => [$routerName.'-ack'],
                         ],
                     ],
@@ -127,9 +131,16 @@ final class BlueGreenDeactivationScenario
                         ],
                     ],
                     'services' => [
-                        $routerName.'-service' => [
-                            'loadBalancer' => [
-                                'servers' => [['url' => "http://{$application->uuid}-blue:3000"]],
+                        $activeServiceName => [
+                            'weighted' => [
+                                'services' => [[
+                                    'name' => BlueGreenRoutingTarget::memberServiceReference(
+                                        $application->uuid,
+                                        $destination->id,
+                                        $state->active_color,
+                                    ),
+                                    'weight' => 1,
+                                ]],
                             ],
                         ],
                     ],

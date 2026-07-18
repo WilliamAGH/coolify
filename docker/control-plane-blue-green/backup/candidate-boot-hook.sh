@@ -157,11 +157,14 @@ cleanup()
     fi
     [[ -z ${override:-} ]] || rm -f -- "$override"
     [[ -z ${compose_log:-} ]] || rm -f -- "$compose_log"
-    [[ -z ${candidate_direct_probe_token_file:-} ]] \
-        || rm -f -- "$candidate_direct_probe_token_file"
-    [[ -z ${candidate_applied_ack_file:-} ]] \
-        || rm -f -- "$candidate_applied_ack_file"
-    [[ -z ${candidate_secret_directory:-} ]] || rmdir -- "$candidate_secret_directory"
+    if [[ ${boot_succeeded:-0} != 1 ]]; then
+        [[ -z ${candidate_direct_probe_token_file:-} ]] \
+            || rm -f -- "$candidate_direct_probe_token_file"
+        [[ -z ${candidate_applied_ack_file:-} ]] \
+            || rm -f -- "$candidate_applied_ack_file"
+        [[ -z ${candidate_secret_directory:-} ]] \
+            || rmdir -- "$candidate_secret_directory"
+    fi
     exit "$exit_status"
 }
 

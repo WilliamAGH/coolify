@@ -8,14 +8,17 @@ set -Eeuo pipefail
 runtime_image=${LAB_CANDIDATE_RUNTIME_IMAGE_OVERRIDE:-$CONTROL_PLANE_CANDIDATE_IMAGE_DIGEST}
 restored_state_mounts=()
 candidate_secret_directory=
+boot_succeeded=0
 
-# shellcheck disable=SC2329 # Invoked by the EXIT and signal traps below.
+# shellcheck disable=SC2317,SC2329 # Invoked by the EXIT and signal traps below.
 cleanup()
 {
     local exit_status=$?
 
     trap - EXIT HUP INT TERM
-    [[ -z $candidate_secret_directory ]] || rm -rf -- "$candidate_secret_directory"
+    if [[ ${boot_succeeded:-0} != 1 && -n $candidate_secret_directory ]]; then
+        rm -rf -- "$candidate_secret_directory"
+    fi
     exit "$exit_status"
 }
 
@@ -78,6 +81,7 @@ docker start "$LAB_CANDIDATE_CONTAINER" >/dev/null
 
 for _ in $(seq 1 30); do
     if [[ $(docker inspect --format '{{.State.Running}}' "$LAB_CANDIDATE_CONTAINER") == true ]]; then
+        boot_succeeded=1
         printf '%s\n' 'control-plane-candidate-boot=passed'
         exit 0
     fi

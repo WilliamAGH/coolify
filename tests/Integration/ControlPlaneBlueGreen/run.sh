@@ -333,7 +333,6 @@ install_lab_release_manifest()
     CONTROL_PLANE_INGRESS_CONTROLLER="$release_directory/controllers/traefik-ingress.sh"
     CONTROL_PLANE_BACKUP_ATTESTATION_VERIFIER="$release_directory/backup/restore-attest.sh"
     CONTROL_PLANE_RELEASE_BACKUP_QUIESCE_CONTROLLER="$release_directory/backup-quiesce/control-plane-backup-quiesce.sh"
-    CONTROL_PLANE_RUNTIME_FENCE_PROVISIONER="$release_directory/controllers/provision-runtime-attestation-ssh-fence.sh"
     CONTROL_PLANE_RELEASE_RUNTIME_FENCE_CONTROLLER="$release_directory/controllers/runtime-attestation-ssh-fence.sh"
     CONTROL_PLANE_RELEASE_RUNTIME_FENCE_REAPER="$release_directory/controllers/self-ssh-controlmaster-reaper.sh"
     CONTROL_PLANE_RELEASE_RUNTIME_FENCE_PROVIDER_PROBE="$release_directory/controllers/traefik-docker-provider-freshness-probe.sh"
@@ -1519,8 +1518,10 @@ with_lab()
 
 operator()
 {
-    "$OPERATOR" "$1"
+    operator_status=0
+    "$OPERATOR" "$1" || operator_status=$?
     assert_lab_global_transaction_lock
+    return "$operator_status"
 }
 
 operator_without_backup_attestation_inputs()

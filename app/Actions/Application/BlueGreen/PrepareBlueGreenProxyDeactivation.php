@@ -5,6 +5,7 @@ namespace App\Actions\Application\BlueGreen;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\RemoveBlueGreenProxyConfiguration;
 use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
+use App\Enums\BlueGreenDeploymentColor;
 use App\Models\Application;
 use App\Models\Server;
 use Illuminate\Support\Facades\DB;
@@ -41,6 +42,8 @@ class PrepareBlueGreenProxyDeactivation
         );
         $this->assertMetadata($sourceYaml, $application, $preparation);
         $snapshot = $this->compileSnapshot(
+            application: $application,
+            preparation: $preparation,
             managedFilename: $managedFilename,
             sourceYaml: $sourceYaml,
             sourceSha256: $sourceSha256,
@@ -123,6 +126,8 @@ class PrepareBlueGreenProxyDeactivation
     }
 
     private function compileSnapshot(
+        Application $application,
+        BlueGreenDeactivationPreparation $preparation,
         string $managedFilename,
         string $sourceYaml,
         string $sourceSha256,
@@ -143,16 +148,27 @@ class PrepareBlueGreenProxyDeactivation
         $middlewareName = pathinfo($managedFilename, PATHINFO_FILENAME).'-eviction-ack';
         $tombstoneRouters = [];
         $routes = [];
+        $activeColor = $preparation->activeColor()
+            ?? throw new BlueGreenDeactivationException('The active managed proxy snapshot has no active color.');
         foreach ($routers as $routerName => $router) {
             if (! is_string($routerName) || ! str_ends_with($routerName, '-public') || ! is_array($router)) {
                 throw new BlueGreenDeactivationException('The active managed proxy snapshot is not a finalized public-route configuration.');
+            }
+            $routerService = $router['service'] ?? null;
+            if (! is_string($routerService) || ! array_key_exists($routerService, $services)) {
+                throw new BlueGreenDeactivationException('The active managed proxy router references an unknown service.');
             }
             $routes = [...$routes, ...$this->routesFor($routerName, $router)];
             $router['service'] = 'noop@internal';
             $router['middlewares'] = [$middlewareName];
             $tombstoneRouters[$routerName] = $router;
         }
-        $backendPort = $this->backendPort($services);
+        $backendPort = $this->backendPort(
+            services: $services,
+            application: $application,
+            destinationId: $preparation->destination->id,
+            activeColor: $activeColor,
+        );
         $tombstone = [
             'http' => [
                 'routers' => $tombstoneRouters,
@@ -219,27 +235,52 @@ class PrepareBlueGreenProxyDeactivation
     }
 
     /** @param array<string, mixed> $services */
-    private function backendPort(array $services): int
-    {
-        $ports = [];
+    private function backendPort(
+        array $services,
+        Application $application,
+        int $destinationId,
+        BlueGreenDeploymentColor $activeColor,
+    ): int {
+        $activeServiceName = BlueGreenRoutingTarget::activeServiceName(
+            $application->uuid,
+            $destinationId,
+        );
+        $expectedServices = [
+            $activeServiceName => [
+                'weighted' => [
+                    'services' => [[
+                        'name' => BlueGreenRoutingTarget::memberServiceReference(
+                            $application->uuid,
+                            $destinationId,
+                            $activeColor,
+                        ),
+                        'weight' => 1,
+                    ]],
+                ],
+            ],
+        ];
+        $backendPort = $application->blueGreenDeploymentBackendPort();
+        if ($backendPort === null) {
+            throw new BlueGreenDeactivationException('The application has no exact blue/green backend port.');
+        }
+        if ($services === $expectedServices) {
+            return $backendPort;
+        }
+
         foreach ($services as $service) {
             $servers = is_array($service) ? data_get($service, 'loadBalancer.servers') : null;
             if (! is_array($servers) || $servers === []) {
-                throw new BlueGreenDeactivationException('Managed proxy service has no backend server inventory.');
+                throw new BlueGreenDeactivationException('Managed proxy services do not match the exact active weighted member or a legacy backend inventory.');
             }
             foreach ($servers as $server) {
                 $url = is_array($server) ? ($server['url'] ?? null) : null;
                 $port = is_string($url) ? parse_url($url, PHP_URL_PORT) : false;
-                if (! is_int($port)) {
-                    throw new BlueGreenDeactivationException('Managed proxy service has no exact backend port.');
+                if ($port !== $backendPort) {
+                    throw new BlueGreenDeactivationException('Managed legacy proxy service does not match the application backend port.');
                 }
-                $ports[$port] = true;
             }
         }
-        if (count($ports) !== 1) {
-            throw new BlueGreenDeactivationException('Managed proxy services do not share one exact backend port.');
-        }
 
-        return (int) array_key_first($ports);
+        return $backendPort;
     }
 }
