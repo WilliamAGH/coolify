@@ -1110,8 +1110,11 @@ import json
 import re
 import sys
 
-with open(sys.argv[1], encoding="utf-8") as source:
-    raw = json.load(source)
+try:
+    with open(sys.argv[1], encoding="utf-8") as source:
+        raw = json.load(source)
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(1)
 expected = dict(line.rstrip("\n").split("=", 1) for line in open(sys.argv[2], encoding="ascii"))
 provider_objects = [
     value
@@ -1836,7 +1839,7 @@ assert_member_docker_service_contract()
     member_port=$5
     member_service=$6
     member_router="${member_service}-discovery"
-    member_rule="Host(\`${member_service}.invalid\`)"
+    member_rule="Host(\`${member_service}.invalid\`) && !Host(\`${member_service}.invalid\`)"
     member_inspect=$(docker inspect "$member_id" 2>/dev/null) \
         || fail "$member_role Docker-provider service container is unavailable"
     printf '%s\n' "$member_inspect" | jq --exit-status \
@@ -1871,7 +1874,7 @@ assert_member_docker_service_contract()
         and ($labels["traefik.enable"] == "true")
         and ($labels[$router_prefix + "rule"] == $rule)
         and ($labels[$router_prefix + "entrypoints"] == $entrypoint)
-        and ($labels[$router_prefix + "service"] == "noop@internal")
+        and ($labels[$router_prefix + "service"] == $service)
         and ($labels[$router_prefix + "priority"] == "1")
         and ($labels[$service_prefix + "server.port"] == $port)
         and ($labels[$service_prefix + "server.scheme"] == "http")
