@@ -20,6 +20,7 @@ services:
       - "traefik.enable=true"
       - "traefik.http.routers.${CONTROL_PLANE_TRAEFIK_ROUTER:?CONTROL_PLANE_TRAEFIK_ROUTER is required}.rule=Host(`${CONTROL_PLANE_HOST:?CONTROL_PLANE_HOST is required}`)"
       - "traefik.http.routers.${CONTROL_PLANE_TRAEFIK_ROUTER:?CONTROL_PLANE_TRAEFIK_ROUTER is required}.entrypoints=web"
+      - "traefik.http.routers.${CONTROL_PLANE_TRAEFIK_ROUTER:?CONTROL_PLANE_TRAEFIK_ROUTER is required}.tls=${CONTROL_PLANE_TRAEFIK_TLS:?CONTROL_PLANE_TRAEFIK_TLS is required}"
       - "traefik.http.routers.${CONTROL_PLANE_TRAEFIK_ROUTER:?CONTROL_PLANE_TRAEFIK_ROUTER is required}.priority=10"
       - "traefik.http.routers.${CONTROL_PLANE_TRAEFIK_ROUTER:?CONTROL_PLANE_TRAEFIK_ROUTER is required}.service=${CONTROL_PLANE_TRAEFIK_SERVICE:?CONTROL_PLANE_TRAEFIK_SERVICE is required}"
       - "traefik.http.services.${CONTROL_PLANE_TRAEFIK_SERVICE:?CONTROL_PLANE_TRAEFIK_SERVICE is required}.loadbalancer.server.port=8080"

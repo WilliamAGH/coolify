@@ -7,6 +7,38 @@ set -Eeuo pipefail
 : "${LAB_APPLIED_ACK_FILE:?}"
 runtime_image=${LAB_CANDIDATE_RUNTIME_IMAGE_OVERRIDE:-$CONTROL_PLANE_CANDIDATE_IMAGE_DIGEST}
 restored_state_mounts=()
+candidate_secret_directory=
+
+# shellcheck disable=SC2329 # Invoked by the EXIT and signal traps below.
+cleanup()
+{
+    local exit_status=$?
+
+    trap - EXIT HUP INT TERM
+    [[ -z $candidate_secret_directory ]] || rm -rf -- "$candidate_secret_directory"
+    exit "$exit_status"
+}
+
+stage_candidate_secret()
+{
+    local source_file=$1 staged_file=$2
+
+    cp -- "$source_file" "$staged_file"
+    chmod 0444 "$staged_file"
+    [[ $(stat -c '%u:%g:%a' "$staged_file") == 0:0:444 \
+        && $(sha256sum "$staged_file" | awk '{print $1}') == \
+            $(sha256sum "$source_file" | awk '{print $1}') ]]
+}
+
+candidate_secret_directory=$(mktemp -d \
+    "$LAB_HOST_RUNTIME_DIRECTORY/.lab-candidate-secrets.XXXXXX")
+chmod 0700 "$candidate_secret_directory"
+trap cleanup EXIT HUP INT TERM
+candidate_direct_probe_token_file="$candidate_secret_directory/direct-probe-token"
+candidate_applied_ack_file="$candidate_secret_directory/applied-ack"
+stage_candidate_secret "$LAB_DIRECT_PROBE_TOKEN_FILE" "$candidate_direct_probe_token_file"
+stage_candidate_secret "$LAB_APPLIED_ACK_FILE" "$candidate_applied_ack_file"
+
 if [[ -n ${LAB_RESTORED_STATE_VOLUME:-} ]]; then
     for selected in ssh applications databases services backups; do
         restored_state_mounts+=(--mount \
@@ -33,8 +65,8 @@ docker create --name "$LAB_CANDIDATE_CONTAINER" --network "$LAB_NETWORK" \
     --env "REDIS_HOST=$CONTROL_PLANE_RESTORE_REDIS_CONTAINER" \
     --env CONTROL_PLANE_STARTUP_MODE=web-only \
     --env "CONTROL_PLANE_RESTORED_STATE_SELECTION=$CONTROL_PLANE_RESTORED_STATE_SELECTION" \
-    --mount "type=bind,src=$LAB_DIRECT_PROBE_TOKEN_FILE,dst=/run/secrets/control-plane-direct-probe-token,readonly" \
-    --mount "type=bind,src=$LAB_APPLIED_ACK_FILE,dst=/run/secrets/control-plane-applied-ack,readonly" \
+    --mount "type=bind,src=$candidate_direct_probe_token_file,dst=/run/secrets/control-plane-direct-probe-token,readonly" \
+    --mount "type=bind,src=$candidate_applied_ack_file,dst=/run/secrets/control-plane-applied-ack,readonly" \
     "${restored_state_mounts[@]}" \
     --entrypoint /usr/local/bin/candidate-entrypoint \
     "$runtime_image" >/dev/null

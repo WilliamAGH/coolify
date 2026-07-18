@@ -537,6 +537,7 @@ assert_source_traefik_identity()
             and ($labels["traefik.enable"] == "true")
             and ($labels["traefik.http.routers." + $router + ".rule"] == ("Host(`" + $host + "`)"))
             and ($labels["traefik.http.routers." + $router + ".entrypoints"] == "web")
+            and ($labels["traefik.http.routers." + $router + ".tls"] == "true")
             and ($labels["traefik.http.routers." + $router + ".priority"] == "10")
             and ($labels["traefik.http.routers." + $router + ".service"] == $service)
             and ($labels["traefik.http.services." + $service + ".loadbalancer.server.port"] == $backend_port)
@@ -776,7 +777,12 @@ prepare_lab_tls()
     {
         printf '%s\n' 'tls:' '  certificates:' \
             '    - certFile: "/etc/traefik/tls/leaf.crt"' \
-            '      keyFile: "/etc/traefik/tls/leaf.key"'
+            '      keyFile: "/etc/traefik/tls/leaf.key"' \
+            '  stores:' \
+            '    default:' \
+            '      defaultCertificate:' \
+            '        certFile: "/etc/traefik/tls/leaf.crt"' \
+            '        keyFile: "/etc/traefik/tls/leaf.key"'
     } > "$CONTROL_PLANE_TRAEFIK_DYNAMIC_DIR/tls.yml"
     chmod 600 "$CONTROL_PLANE_TRAEFIK_DYNAMIC_DIR/tls.yml"
 }

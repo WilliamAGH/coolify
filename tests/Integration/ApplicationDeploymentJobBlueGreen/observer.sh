@@ -24,7 +24,8 @@ events_pid=$!
 
 file_identity()
 {
-    stat -c '%d:%i' "$1" 2>/dev/null || stat -f '%d:%i' "$1" 2>/dev/null
+    stat -c '%d:%i:%s:%y:%z' "$1" 2>/dev/null \
+        || stat -f '%d:%i:%z:%m:%c' "$1" 2>/dev/null
 }
 
 copy_source_snapshot()

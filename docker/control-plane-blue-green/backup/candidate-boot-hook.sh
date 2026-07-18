@@ -112,6 +112,17 @@ initialize_candidate_volumes()
         ' >/dev/null \
         || fail 'candidate coordination volume is not an exact root-owned lease volume'
 }
+stage_candidate_secret()
+{
+    local source_file=$1 staged_file=$2
+
+    cp -- "$source_file" "$staged_file"
+    chmod 0444 "$staged_file"
+    [[ $(stat -c '%u:%g:%a' "$staged_file") == 0:0:444 \
+        && $(sha256sum "$staged_file" | awk '{print $1}') == \
+            $(sha256sum "$source_file" | awk '{print $1}') ]] \
+        || fail 'candidate runtime secret staging differs from its attested source'
+}
 
 cleanup()
 {
@@ -146,6 +157,11 @@ cleanup()
     fi
     [[ -z ${override:-} ]] || rm -f -- "$override"
     [[ -z ${compose_log:-} ]] || rm -f -- "$compose_log"
+    [[ -z ${candidate_direct_probe_token_file:-} ]] \
+        || rm -f -- "$candidate_direct_probe_token_file"
+    [[ -z ${candidate_applied_ack_file:-} ]] \
+        || rm -f -- "$candidate_applied_ack_file"
+    [[ -z ${candidate_secret_directory:-} ]] || rmdir -- "$candidate_secret_directory"
     exit "$exit_status"
 }
 
@@ -169,6 +185,9 @@ boot_succeeded=0
 candidate_network_owned=0
 override=
 compose_log=
+candidate_secret_directory=
+candidate_direct_probe_token_file=
+candidate_applied_ack_file=
 candidate_hash=$(printf '%s' "$CONTROL_PLANE_OPERATION_ID" \
     | sha256sum | awk '{print substr($1, 1, 20)}')
 candidate_project="backup-candidate-$candidate_hash"
@@ -253,6 +272,16 @@ done
     && -z $(find "$CONTROL_PLANE_RESTORED_STATE_ROOT/backups" -mindepth 1 -print -quit) ]] \
     || fail 'candidate disposable backup directory is not empty service-owned mode 0700'
 
+candidate_secret_directory=$(mktemp -d \
+    "$(dirname "$CONTROL_PLANE_GREEN_DIRECT_PROBE_TOKEN_FILE")/.candidate-secrets.XXXXXX")
+chmod 0700 "$candidate_secret_directory"
+candidate_direct_probe_token_file="$candidate_secret_directory/direct-probe-token"
+candidate_applied_ack_file="$candidate_secret_directory/applied-ack"
+stage_candidate_secret "$CONTROL_PLANE_GREEN_DIRECT_PROBE_TOKEN_FILE" \
+    "$candidate_direct_probe_token_file"
+stage_candidate_secret "$CONTROL_PLANE_GREEN_APPLIED_ACK_FILE" \
+    "$candidate_applied_ack_file"
+
 override=$(mktemp "$(dirname "$CONTROL_PLANE_CANDIDATE_STATE_PROOF_FILE")/candidate.XXXXXX.yaml")
 created_unix=$(date +%s)
 {
@@ -333,18 +362,18 @@ export CONTROL_PLANE_GREEN_WEB_B_PRIVATE_VOLUME="backup-unused-green-web-b-state
 export CONTROL_PLANE_BLUE_WEB_A_PRIVATE_VOLUME="backup-unused-blue-web-a-state-$candidate_hash"
 export CONTROL_PLANE_BLUE_WEB_B_PRIVATE_VOLUME="backup-unused-blue-web-b-state-$candidate_hash"
 export CONTROL_PLANE_COORDINATION_VOLUME="backup-candidate-coordination-$candidate_hash"
-export CONTROL_PLANE_GREEN_WEB_A_DIRECT_PROBE_RUNTIME_FILE="$CONTROL_PLANE_GREEN_DIRECT_PROBE_TOKEN_FILE"
-export CONTROL_PLANE_GREEN_WEB_B_DIRECT_PROBE_RUNTIME_FILE="$CONTROL_PLANE_GREEN_DIRECT_PROBE_TOKEN_FILE"
-export CONTROL_PLANE_BLUE_WEB_A_DIRECT_PROBE_RUNTIME_FILE="$CONTROL_PLANE_GREEN_DIRECT_PROBE_TOKEN_FILE"
-export CONTROL_PLANE_BLUE_WEB_B_DIRECT_PROBE_RUNTIME_FILE="$CONTROL_PLANE_GREEN_DIRECT_PROBE_TOKEN_FILE"
-export CONTROL_PLANE_GREEN_WEB_A_APPLIED_ACK_RUNTIME_FILE="$CONTROL_PLANE_GREEN_APPLIED_ACK_FILE"
-export CONTROL_PLANE_GREEN_WEB_B_APPLIED_ACK_RUNTIME_FILE="$CONTROL_PLANE_GREEN_APPLIED_ACK_FILE"
-export CONTROL_PLANE_BLUE_WEB_A_APPLIED_ACK_RUNTIME_FILE="$CONTROL_PLANE_GREEN_APPLIED_ACK_FILE"
-export CONTROL_PLANE_BLUE_WEB_B_APPLIED_ACK_RUNTIME_FILE="$CONTROL_PLANE_GREEN_APPLIED_ACK_FILE"
-export CONTROL_PLANE_GREEN_ROUTE_HEALTH_RUNTIME_FILE="$CONTROL_PLANE_GREEN_DIRECT_PROBE_TOKEN_FILE"
-export CONTROL_PLANE_GREEN_POOL_ACK_RUNTIME_FILE="$CONTROL_PLANE_GREEN_APPLIED_ACK_FILE"
-export CONTROL_PLANE_BLUE_ROUTE_HEALTH_RUNTIME_FILE="$CONTROL_PLANE_GREEN_DIRECT_PROBE_TOKEN_FILE"
-export CONTROL_PLANE_BLUE_POOL_ACK_RUNTIME_FILE="$CONTROL_PLANE_GREEN_APPLIED_ACK_FILE"
+export CONTROL_PLANE_GREEN_WEB_A_DIRECT_PROBE_RUNTIME_FILE="$candidate_direct_probe_token_file"
+export CONTROL_PLANE_GREEN_WEB_B_DIRECT_PROBE_RUNTIME_FILE="$candidate_direct_probe_token_file"
+export CONTROL_PLANE_BLUE_WEB_A_DIRECT_PROBE_RUNTIME_FILE="$candidate_direct_probe_token_file"
+export CONTROL_PLANE_BLUE_WEB_B_DIRECT_PROBE_RUNTIME_FILE="$candidate_direct_probe_token_file"
+export CONTROL_PLANE_GREEN_WEB_A_APPLIED_ACK_RUNTIME_FILE="$candidate_applied_ack_file"
+export CONTROL_PLANE_GREEN_WEB_B_APPLIED_ACK_RUNTIME_FILE="$candidate_applied_ack_file"
+export CONTROL_PLANE_BLUE_WEB_A_APPLIED_ACK_RUNTIME_FILE="$candidate_applied_ack_file"
+export CONTROL_PLANE_BLUE_WEB_B_APPLIED_ACK_RUNTIME_FILE="$candidate_applied_ack_file"
+export CONTROL_PLANE_GREEN_ROUTE_HEALTH_RUNTIME_FILE="$candidate_direct_probe_token_file"
+export CONTROL_PLANE_GREEN_POOL_ACK_RUNTIME_FILE="$candidate_applied_ack_file"
+export CONTROL_PLANE_BLUE_ROUTE_HEALTH_RUNTIME_FILE="$candidate_direct_probe_token_file"
+export CONTROL_PLANE_BLUE_POOL_ACK_RUNTIME_FILE="$candidate_applied_ack_file"
 # The isolated candidate has no Traefik route. Keep its label token public and
 # deliberately unmatched so the direct-probe credential never enters metadata.
 export CONTROL_PLANE_GREEN_ROUTE_HEALTH_TOKEN="backup-route-health-$candidate_hash"

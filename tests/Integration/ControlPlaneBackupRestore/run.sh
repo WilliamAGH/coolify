@@ -991,6 +991,13 @@ run_tools /opt/control-plane-backup/restore-attest.sh \
     && $(docker exec "$CANDIDATE_CONTAINER" \
         sed -n '1p' /restored-state/applications/operation-state) == revision=7 ]] \
     || { printf '%s\n' 'functional restored-state candidate proof is absent' >&2; exit 1; }
+[[ $(docker exec "$CANDIDATE_CONTAINER" stat -c '%u:%g:%a' \
+        /run/secrets/control-plane-direct-probe-token) == 0:0:444 \
+    && $(docker exec "$CANDIDATE_CONTAINER" stat -c '%u:%g:%a' \
+        /run/secrets/control-plane-applied-ack) == 0:0:444 \
+    && $(stat -c '%u:%g:%a' "$RUNTIME_DIRECTORY/probe-token") == 0:0:600 \
+    && $(stat -c '%u:%g:%a' "$RUNTIME_DIRECTORY/probe-ack") == 0:0:600 ]] \
+    || { printf '%s\n' 'candidate secrets do not preserve host and runtime ownership' >&2; exit 1; }
 CANONICAL_CANDIDATE_NETWORK="$LAB_ID-candidate-network"
 EXPECTED_CANDIDATE_MEMBERS=$(printf '%s\n' "$CANDIDATE_CONTAINER" "$TARGET_CONTAINER" \
     "$LAB_ID-redis-main" | LC_ALL=C sort)
@@ -1359,6 +1366,10 @@ restore_attempt stale-reap "$STALE_REAP_TARGET" "$STALE_REAP_CANDIDATE" \
     && $(docker inspect --format \
         '{{index .Config.Labels "coolify.control-plane.backup-restore.created-unix"}}' \
         "$STALE_REAP_CANDIDATE") != 1 \
+    && $(docker exec "$STALE_REAP_CANDIDATE" stat -c '%u:%g:%a' \
+        /run/secrets/control-plane-direct-probe-token) == 0:0:444 \
+    && $(docker exec "$STALE_REAP_CANDIDATE" stat -c '%u:%g:%a' \
+        /run/secrets/control-plane-applied-ack) == 0:0:444 \
     && -z $(docker volume ls --quiet --filter "name=^${STALE_RESOURCE_VOLUME}$") \
     && -z $(docker network ls --quiet --filter "name=^${STALE_RESOURCE_NETWORK}$") ]] \
     || { printf '%s\n' 'stale state/database/candidate resources were not reaped' >&2; exit 1; }
