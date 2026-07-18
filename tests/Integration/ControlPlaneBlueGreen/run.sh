@@ -1758,7 +1758,7 @@ prepare_proxy_enrollment_lab()
         { print }
     ' "$proxy_enrollment_native_static_config" > "$proxy_enrollment_legacy_static_config"
     chmod 400 "$proxy_enrollment_legacy_static_config"
-    awk '$0 != "      - \\\"127.0.0.1:8000:8000\\\"" { print }' \
+    awk '$0 != "      - \"127.0.0.1:8000:8000\"" { print }' \
         "$LAB_DIRECTORY/compose.yaml" > "$proxy_enrollment_legacy_proxy_compose"
     chmod 600 "$proxy_enrollment_legacy_proxy_compose"
     {
@@ -1779,6 +1779,22 @@ prepare_proxy_enrollment_lab()
                     "$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE" | awk '{print $1}')"
             } > "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_STATE_FILE"
             chmod 600 "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_STATE_FILE"
+            set -- docker compose --ansi never \
+                --project-name "$CONTROL_PLANE_SOURCE_COMPOSE_PROJECT" \
+                --env-file "$CONTROL_PLANE_SOURCE_ENV_FILE" \
+                --file "$CONTROL_PLANE_SOURCE_COMPOSE_BASE" \
+                --file "$CONTROL_PLANE_SOURCE_COMPOSE_PROD"
+            if [ -f "$CONTROL_PLANE_SOURCE_COMPOSE_CUSTOM" ] \
+                && [ ! -L "$CONTROL_PLANE_SOURCE_COMPOSE_CUSTOM" ]; then
+                set -- "$@" --file "$CONTROL_PLANE_SOURCE_COMPOSE_CUSTOM"
+            fi
+            if [ -f "$CONTROL_PLANE_SOURCE_COMPOSE_POSTGRES" ] \
+                && [ ! -L "$CONTROL_PLANE_SOURCE_COMPOSE_POSTGRES" ]; then
+                set -- "$@" --file "$CONTROL_PLANE_SOURCE_COMPOSE_POSTGRES"
+            fi
+            set -- "$@" --file "$CONTROL_PLANE_PROXY_ENROLLMENT_COMPOSE_OVERRIDE"
+            "$@" up --detach --force-recreate --no-build --pull never --no-deps \
+                "$CONTROL_PLANE_SOURCE_COMPOSE_SERVICE" >/dev/null
             ;;
         legacy)
             replace_lab_traefik_static_config "$proxy_enrollment_legacy_static_config"
