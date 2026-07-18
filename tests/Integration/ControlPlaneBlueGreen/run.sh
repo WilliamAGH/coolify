@@ -293,7 +293,8 @@ assert_lab_global_transaction_lock()
 
 install_lab_release_manifest()
 {
-    release_source_root="$REPOSITORY_ROOT/docker/control-plane-blue-green"
+    release_source_root="$scenario_directory/release-source"
+    cp -R "$REPOSITORY_ROOT/docker/control-plane-blue-green" "$release_source_root"
     release_host_root="$scenario_directory/release-host"
     mkdir "$release_host_root"
     chmod 0700 "$release_host_root"
