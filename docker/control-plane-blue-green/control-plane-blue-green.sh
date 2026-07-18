@@ -12036,7 +12036,6 @@ preflight()
     assert_proxy_identity
     assert_proxy_dynamic_mount
     assert_container_running "$blue_container"
-    control_plane_trusted_proxy_addresses=$(control_plane_proxy_peer_addresses)
     if [ ! -e "$state_file" ]; then
         enroll_proxy_if_needed
         assert_proxy_identity
@@ -12046,6 +12045,7 @@ preflight()
         assert_common_state_identity
         assert_blue_state
     fi
+    control_plane_trusted_proxy_addresses=$(control_plane_proxy_peer_addresses)
     ingress_controller_preflight ingress
     if [ -e "$state_file" ]; then
         complete_forward_runtime_fence
