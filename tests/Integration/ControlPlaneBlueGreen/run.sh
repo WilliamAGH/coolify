@@ -994,7 +994,8 @@ start_lab()
     CONTROL_PLANE_SOURCE_COMPOSE_POSTGRES="$scenario_directory/absent-postgres.yaml"
     CONTROL_PLANE_SOURCE_COMPOSE_PROJECT=$project_name
     CONTROL_PLANE_SOURCE_COMPOSE_SERVICE=coolify
-    CONTROL_PLANE_DOCKER_PROVIDER_CONSTRAINT="Label(\`com.docker.compose.project\`,\`${CONTROL_PLANE_SOURCE_COMPOSE_PROJECT}\`)"
+    CONTROL_PLANE_COMPOSE_PROJECT="${project_name}-candidate"
+    CONTROL_PLANE_DOCKER_PROVIDER_CONSTRAINT="Label(\`com.docker.compose.project\`,\`${CONTROL_PLANE_SOURCE_COMPOSE_PROJECT}\`) || Label(\`com.docker.compose.project\`,\`${CONTROL_PLANE_COMPOSE_PROJECT}\`)"
     LAB_TRAEFIK_STATIC_CONFIG="$scenario_directory/traefik.yml"
     sed "s|CONTROL_PLANE_DOCKER_PROVIDER_CONSTRAINT_PLACEHOLDER|$CONTROL_PLANE_DOCKER_PROVIDER_CONSTRAINT|" \
         "$LAB_DIRECTORY/traefik.yml" > "$LAB_TRAEFIK_STATIC_CONFIG"
@@ -1003,7 +1004,6 @@ start_lab()
         "$LAB_TRAEFIK_STATIC_CONFIG" \
         || fail 'lab Traefik static configuration lacks the exact source-project constraint'
     prepare_lab_tls
-    CONTROL_PLANE_COMPOSE_PROJECT="${project_name}-candidate"
     CONTROL_PLANE_OPERATOR_COMPOSE_FILE="$LAB_DIRECTORY/operator-compose.yaml"
     CONTROL_PLANE_REHEARSAL_COMPOSE_FILE="$LAB_DIRECTORY/rehearsal-compose.yaml"
     CONTROL_PLANE_TEST_REHEARSAL_COMPOSE_FILE="$CONTROL_PLANE_REHEARSAL_COMPOSE_FILE"
@@ -3898,11 +3898,11 @@ scenario_continuous_forward_reverse_availability()
     preflight_and_apply_migrations
     start_availability_monitor
     availability_https_crash_log="$scenario_directory/availability-https-crash.log"
-    if CONTROL_PLANE_TEST_CRASH_AT=after-green-https-route \
+    if CONTROL_PLANE_TEST_CRASH_AT=after-green-ingress-route \
         "$OPERATOR" cutover > "$availability_https_crash_log" 2>&1; then
         fail 'availability HTTPS-route crash injection unexpectedly completed'
     fi
-    grep -F -x -q 'phase=green-https-routed' \
+    grep -F -x -q 'phase=green-routed' \
         "$CONTROL_PLANE_OPERATOR_STATE_DIR/$CONTROL_PLANE_OPERATION_ID/state" \
         || fail 'availability HTTPS-route crash injection did not persist the exact routed phase'
     operator cutover >/dev/null
@@ -3916,11 +3916,11 @@ scenario_continuous_forward_reverse_availability()
     fi
     operator recover-forward >/dev/null
     availability_reverse_https_crash_log="$scenario_directory/availability-reverse-https-crash.log"
-    if CONTROL_PLANE_TEST_CRASH_AT=after-failback-blue-https-route \
+    if CONTROL_PLANE_TEST_CRASH_AT=after-failback-blue-ingress-route \
         "$OPERATOR" rollback > "$availability_reverse_https_crash_log" 2>&1; then
         fail 'availability reverse HTTPS-route crash injection unexpectedly completed'
     fi
-    if ! grep -F -x -q 'phase=failback-blue-https-routed' \
+    if ! grep -F -x -q 'phase=blue-failback-routed' \
         "$CONTROL_PLANE_OPERATOR_STATE_DIR/$CONTROL_PLANE_OPERATION_ID/state"; then
         sed -n '1,240p' "$availability_reverse_https_crash_log" >&2
         fail 'availability reverse HTTPS-route crash injection did not persist the exact routed phase'
