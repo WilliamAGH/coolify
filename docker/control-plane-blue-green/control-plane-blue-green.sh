@@ -452,7 +452,7 @@ configured_release_asset_path()
     case "$1" in
         operator) printf '%s\n' "$OPERATOR_PATH" ;;
         operator-compose) printf '%s\n' "$operator_compose_file" ;;
-        rehearsal-compose) printf '%s\n' "$rehearsal_compose_file" ;;
+        rehearsal-compose) printf '%s\n' "$release_rehearsal_compose_file" ;;
         ingress-controller) printf '%s\n' "$ingress_controller" ;;
         backup-attestation-verifier) printf '%s\n' "$backup_attestation_verifier" ;;
         backup-quiesce-controller) printf '%s\n' "$release_backup_quiesce_controller" ;;
@@ -486,7 +486,9 @@ configure_global_transaction_lock()
 configure_and_verify_release_inventory()
 {
     operator_compose_file=${CONTROL_PLANE_OPERATOR_COMPOSE_FILE:-$SCRIPT_DIRECTORY/compose.yaml}
-    rehearsal_compose_file=${CONTROL_PLANE_REHEARSAL_COMPOSE_FILE:-$SCRIPT_DIRECTORY/compose.rehearsal.yaml}
+    release_rehearsal_compose_file=${CONTROL_PLANE_REHEARSAL_COMPOSE_FILE:-$SCRIPT_DIRECTORY/compose.rehearsal.yaml}
+    rehearsal_compose_file=${CONTROL_PLANE_TEST_REHEARSAL_COMPOSE_FILE:-$release_rehearsal_compose_file}
+    rehearsal_compose_file_sha256=${CONTROL_PLANE_TEST_REHEARSAL_COMPOSE_FILE_SHA256:-}
     ingress_controller=${CONTROL_PLANE_INGRESS_CONTROLLER:-$SCRIPT_DIRECTORY/controllers/traefik-ingress.sh}
     backup_attestation_verifier=${CONTROL_PLANE_BACKUP_ATTESTATION_VERIFIER:-$SCRIPT_DIRECTORY/backup/restore-attest.sh}
     release_runtime_fence_provisioner=$SCRIPT_DIRECTORY/controllers/provision-runtime-attestation-ssh-fence.sh
@@ -4053,7 +4055,7 @@ assert_operator_configuration_identity()
         "$state_operator_compose_sha256" "$state_operator_compose_uid" \
         "$state_operator_compose_gid" "$state_operator_compose_mode" \
         "$state_operator_compose_size" 'candidate Compose file'
-    assert_file_identity "$rehearsal_compose_file" "$state_rehearsal_compose_path" \
+    assert_file_identity "$release_rehearsal_compose_file" "$state_rehearsal_compose_path" \
         "$state_rehearsal_compose_sha256" "$state_rehearsal_compose_uid" \
         "$state_rehearsal_compose_gid" "$state_rehearsal_compose_mode" \
         "$state_rehearsal_compose_size" 'migration-rehearsal Compose file'
@@ -11531,7 +11533,8 @@ load_configuration()
     backup_expected_candidate_api_probe_hook_sha256=${CONTROL_PLANE_BACKUP_EXPECTED_CANDIDATE_API_PROBE_HOOK_SHA256:-}
     backup_expected_state_proof_tool_sha256=${CONTROL_PLANE_BACKUP_EXPECTED_STATE_PROOF_TOOL_SHA256:-}
     operator_compose_file=${CONTROL_PLANE_OPERATOR_COMPOSE_FILE:-$SCRIPT_DIRECTORY/compose.yaml}
-    rehearsal_compose_file=${CONTROL_PLANE_REHEARSAL_COMPOSE_FILE:-$SCRIPT_DIRECTORY/compose.rehearsal.yaml}
+    release_rehearsal_compose_file=${CONTROL_PLANE_REHEARSAL_COMPOSE_FILE:-$SCRIPT_DIRECTORY/compose.rehearsal.yaml}
+    rehearsal_compose_file=${CONTROL_PLANE_TEST_REHEARSAL_COMPOSE_FILE:-$release_rehearsal_compose_file}
     compose_project=${CONTROL_PLANE_COMPOSE_PROJECT:-coolify-control-plane-blue-green}
     migration_compatibility_file=${CONTROL_PLANE_MIGRATION_COMPATIBILITY_FILE:-}
     rehearsal_runtime_env_file=${CONTROL_PLANE_REHEARSAL_RUNTIME_ENV_FILE:-}
@@ -11869,7 +11872,22 @@ load_configuration()
     [ -x "$ingress_controller" ] || fail 'Traefik ingress controller is not executable'
     assert_non_symlink_regular_file "$OPERATOR_PATH" 'executing control-plane operator'
     assert_non_symlink_regular_file "$operator_compose_file" CONTROL_PLANE_OPERATOR_COMPOSE_FILE
-    assert_non_symlink_regular_file "$rehearsal_compose_file" CONTROL_PLANE_REHEARSAL_COMPOSE_FILE
+    assert_non_symlink_regular_file "$release_rehearsal_compose_file" \
+        CONTROL_PLANE_REHEARSAL_COMPOSE_FILE
+    assert_non_symlink_regular_file "$rehearsal_compose_file" \
+        CONTROL_PLANE_TEST_REHEARSAL_COMPOSE_FILE
+    if [ "$rehearsal_compose_file" != "$release_rehearsal_compose_file" ]; then
+        is_test_mode \
+            || fail 'a migration-rehearsal executor override is unavailable outside the lab'
+        require_value CONTROL_PLANE_TEST_REHEARSAL_COMPOSE_FILE_SHA256 \
+            "$rehearsal_compose_file_sha256"
+        validate_sha256 "$rehearsal_compose_file_sha256" \
+            CONTROL_PLANE_TEST_REHEARSAL_COMPOSE_FILE_SHA256
+        [ "$(sha256_file "$rehearsal_compose_file")" = "$rehearsal_compose_file_sha256" ] \
+            || fail 'migration-rehearsal executor differs from its pinned digest'
+    elif [ -n "${CONTROL_PLANE_TEST_REHEARSAL_COMPOSE_FILE_SHA256:-}" ]; then
+        fail 'migration-rehearsal executor digest requires an explicit lab executor override'
+    fi
     operation_directory="$state_directory/$operation_id"
     state_file="$operation_directory/state"
     if [ -e "$state_file" ] || [ -L "$state_file" ]; then
@@ -11917,7 +11935,9 @@ load_configuration()
             || fail 'production source invocation must use the exact ordered /data/coolify/source compose files and .env'
         [ "$operator_compose_file" = "$SCRIPT_DIRECTORY/compose.yaml" ] \
             || fail 'production mode only accepts the bundled operator compose file'
-        [ "$rehearsal_compose_file" = "$SCRIPT_DIRECTORY/compose.rehearsal.yaml" ] \
+        [ "$release_rehearsal_compose_file" = "$SCRIPT_DIRECTORY/compose.rehearsal.yaml" ] \
+            && [ "$rehearsal_compose_file" = "$release_rehearsal_compose_file" ] \
+            && [ -z "${CONTROL_PLANE_TEST_REHEARSAL_COMPOSE_FILE:-}" ] \
             || fail 'production mode only accepts the bundled rehearsal compose file'
         case "$public_probe_url" in
             "https://${control_plane_host}/"*)

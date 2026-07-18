@@ -147,7 +147,7 @@ services:
       - ./control-plane-entrypoint.sh:/lab/control-plane-entrypoint.sh:ro
       - ./db-evidence.php:/lab/db-evidence.php:ro
       - ./job.php:/lab/job.php:ro
-      - testing-host-private-key:/var/www/html/storage/app/ssh/testing-host:ro
+      - testing-host-private-key:/var/www/html/storage/app/ssh
     networks: [control]
 
 networks:

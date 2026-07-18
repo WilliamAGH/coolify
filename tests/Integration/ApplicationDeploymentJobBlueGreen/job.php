@@ -77,7 +77,7 @@ function waitForRemoteFile(Server $server, string $path, string $container): voi
     ], $server);
 }
 
-$privateKeyBytes = file_get_contents('/var/www/html/storage/app/ssh/testing-host/testing-host');
+$privateKeyBytes = file_get_contents('/var/www/html/storage/app/ssh/testing-host');
 assertLab(is_string($privateKeyBytes) && $privateKeyBytes !== '', 'Runtime SSH private key is unavailable.');
 
 $instanceSettings = new InstanceSettings;

@@ -333,6 +333,8 @@ install_lab_release_manifest()
     CONTROL_PLANE_REHEARSAL_COMPOSE_FILE="$release_directory/compose.rehearsal.yaml"
     CONTROL_PLANE_INGRESS_CONTROLLER="$release_directory/controllers/traefik-ingress.sh"
     CONTROL_PLANE_BACKUP_ATTESTATION_VERIFIER="$release_directory/backup/restore-attest.sh"
+    CONTROL_PLANE_BACKUP_ATTESTATION_VERIFIER_SHA256=$(sha256sum \
+        "$CONTROL_PLANE_BACKUP_ATTESTATION_VERIFIER" | awk '{print $1}')
     CONTROL_PLANE_RELEASE_BACKUP_QUIESCE_CONTROLLER="$release_directory/backup-quiesce/control-plane-backup-quiesce.sh"
     CONTROL_PLANE_RELEASE_RUNTIME_FENCE_CONTROLLER="$release_directory/controllers/runtime-attestation-ssh-fence.sh"
     CONTROL_PLANE_RELEASE_RUNTIME_FENCE_REAPER="$release_directory/controllers/self-ssh-controlmaster-reaper.sh"
@@ -418,6 +420,18 @@ assert_release_manifest_preflight_rejections()
         || ! grep -F -q 'host release manifest differs from its expected out-of-band hash' \
             "$release_preflight_output"; then
         fail 'tampered release manifest was not rejected before Docker or Compose'
+    fi
+
+    if PATH="$release_preflight_bin:$PATH" \
+        CONTROL_PLANE_RELEASE_PREFLIGHT_DOCKER_MARKER="$release_preflight_docker_marker" \
+        CONTROL_PLANE_TEST_REHEARSAL_COMPOSE_FILE_SHA256=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff \
+        "$OPERATOR" preflight > "$release_preflight_output" 2>&1; then
+        fail 'operator accepted a migration-rehearsal executor with a stale digest'
+    fi
+    if [ -e "$release_preflight_docker_marker" ] \
+        || ! grep -F -q 'migration-rehearsal executor differs from its pinned digest' \
+            "$release_preflight_output"; then
+        fail 'stale migration-rehearsal executor digest was not rejected before Docker or Compose'
     fi
 }
 
@@ -990,6 +1004,9 @@ start_lab()
     CONTROL_PLANE_COMPOSE_PROJECT="${project_name}-candidate"
     CONTROL_PLANE_OPERATOR_COMPOSE_FILE="$LAB_DIRECTORY/operator-compose.yaml"
     CONTROL_PLANE_REHEARSAL_COMPOSE_FILE="$LAB_DIRECTORY/rehearsal-compose.yaml"
+    CONTROL_PLANE_TEST_REHEARSAL_COMPOSE_FILE="$CONTROL_PLANE_REHEARSAL_COMPOSE_FILE"
+    CONTROL_PLANE_TEST_REHEARSAL_COMPOSE_FILE_SHA256=$(sha256sum \
+        "$CONTROL_PLANE_TEST_REHEARSAL_COMPOSE_FILE" | awk '{print $1}')
     CONTROL_PLANE_DATABASE_USER=postgres
     CONTROL_PLANE_DATABASE_NAME=postgres
     CONTROL_PLANE_DATABASE_HOST=$CONTROL_PLANE_DATABASE_CONTAINER
@@ -1117,6 +1134,8 @@ start_lab()
     export CONTROL_PLANE_PUBLIC_PROBE_HOST_HEADER CONTROL_PLANE_PUBLIC_PROBE_URL
     export CONTROL_PLANE_REDIS_CONTAINER CONTROL_PLANE_REDIS_HOST CONTROL_PLANE_REDIS_PORT
     export CONTROL_PLANE_REHEARSAL_COMPOSE_FILE CONTROL_PLANE_REHEARSAL_NETWORK
+    export CONTROL_PLANE_TEST_REHEARSAL_COMPOSE_FILE
+    export CONTROL_PLANE_TEST_REHEARSAL_COMPOSE_FILE_SHA256
     export CONTROL_PLANE_REHEARSAL_RUNTIME_ENV_FILE CONTROL_PLANE_REPLACEMENT_BLUE_CONTAINER
     export CONTROL_PLANE_SECRET_GID CONTROL_PLANE_SECRET_UID
     export CONTROL_PLANE_SERVICES_DIRECTORY CONTROL_PLANE_SSH_DIRECTORY
@@ -2252,7 +2271,7 @@ run_restore_rehearsal_hook()
         CONTROL_PLANE_RESTORE_REDIS_CONTAINER="$CONTROL_PLANE_REHEARSAL_DATABASE_CONTAINER" \
         CONTROL_PLANE_RESTORE_REDIS_ENDPOINT="${CONTROL_PLANE_REHEARSAL_DATABASE_CONTAINER}:6379" \
         CONTROL_PLANE_RESTORE_REDIS_NETWORK="$CONTROL_PLANE_REHEARSAL_NETWORK" \
-        CONTROL_PLANE_REHEARSAL_COMPOSE_FILE="$CONTROL_PLANE_REHEARSAL_COMPOSE_FILE" \
+        CONTROL_PLANE_REHEARSAL_COMPOSE_FILE="$CONTROL_PLANE_TEST_REHEARSAL_COMPOSE_FILE" \
         CONTROL_PLANE_EXPECTED_REHEARSAL_COMPOSE_SHA256="$restore_rehearsal_compose_sha256" \
         CONTROL_PLANE_REHEARSAL_RUNTIME_ENV_FILE="$CONTROL_PLANE_REHEARSAL_RUNTIME_ENV_FILE" \
         CONTROL_PLANE_REHEARSAL_NETWORK="$CONTROL_PLANE_REHEARSAL_NETWORK" \
@@ -2271,7 +2290,7 @@ scenario_restore_rehearsal_crash_recovery()
     restore_rehearsal_crash_point=${CONTROL_PLANE_RESTORE_REHEARSAL_CRASH_POINT:-after-restore-rehearsal-terminal-state}
     restore_rehearsal_operation_id="restore-rehearsal-crash-${scenario_name}-0123456789"
     restore_rehearsal_compose_sha256=$(sha256sum \
-        "$CONTROL_PLANE_REHEARSAL_COMPOSE_FILE" | awk '{print $1}')
+        "$CONTROL_PLANE_TEST_REHEARSAL_COMPOSE_FILE" | awk '{print $1}')
 
     if run_restore_rehearsal_hook "$restore_rehearsal_crash_point" \
         > "$scenario_directory/restore-rehearsal-crash.log" 2>&1; then
