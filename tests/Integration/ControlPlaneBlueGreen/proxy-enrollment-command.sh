@@ -264,8 +264,16 @@ replace_static_config()
 recreate_proxy()
 {
     proxy_compose=$1
-    docker compose --ansi never --project-name "$proxy_project" --file "$proxy_compose" \
-        up --detach --force-recreate --no-build --pull never --no-deps proxy >/dev/null
+    recreate_proxy_output="$state_file.compose-output.$$"
+    umask 077
+    if ! docker compose --ansi never --project-name "$proxy_project" --file "$proxy_compose" \
+        up --detach --force-recreate --no-build --pull never --no-deps proxy \
+        > "$recreate_proxy_output" 2>&1; then
+        cat "$recreate_proxy_output" >&2
+        rm -f "$recreate_proxy_output"
+        return 1
+    fi
+    rm -f "$recreate_proxy_output"
 }
 
 restore_legacy_proxy()

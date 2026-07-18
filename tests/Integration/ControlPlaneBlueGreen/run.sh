@@ -1332,6 +1332,10 @@ start_lab()
         || fail 'intentional start failure after Docker resources were created'
     assert_source_traefik_identity
     wait_for_blue
+    case "$scenario_name" in
+        proxy-enrollment-*) ;;
+        *) prepare_proxy_enrollment_legacy_lab ;;
+    esac
 }
 
 reconcile_active_backup_quiesce()
