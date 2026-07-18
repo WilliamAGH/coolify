@@ -43,6 +43,19 @@ fail()
     exit 1
 }
 
+assert_proxy_digest_contract()
+{
+    operator_proxy_digest=$(sed -n \
+        's/^readonly EXPECTED_PROXY_DIGEST=\(sha256:[a-f0-9]\{64\}\)$/\1/p' "$OPERATOR")
+    compose_proxy_digest=$(sed -n \
+        's/^[[:space:]]*image: "traefik:[^@]*@\(sha256:[a-f0-9]\{64\}\)"$/\1/p' \
+        "$LAB_DIRECTORY/compose.yaml")
+    [ -n "$operator_proxy_digest" ] && [ "$operator_proxy_digest" = "$compose_proxy_digest" ] \
+        || fail 'operator preserved Traefik digest differs from the lab Compose release digest'
+}
+
+assert_proxy_digest_contract
+
 discover_control_plane_migrations()
 {
     if ! (
