@@ -2004,6 +2004,9 @@ scenario_proxy_enrollment_persisted_recover_abort_retention()
     [ ! -e "$CONTROL_PLANE_TRAEFIK_DYNAMIC_DIR/$CONTROL_PLANE_TRAEFIK_DYNAMIC_FILENAME" ] \
         && [ ! -L "$CONTROL_PLANE_TRAEFIK_DYNAMIC_DIR/$CONTROL_PLANE_TRAEFIK_DYNAMIC_FILENAME" ] \
         || fail 'failed route switch retained an unacknowledged managed dynamic route'
+    [ ! -e "${CONTROL_PLANE_RUNTIME_FENCE_LAB_STATE}.runtime-drift" ] \
+        || fail 'recover-abort fixture unexpectedly began with runtime drift'
+    touch "${CONTROL_PLANE_RUNTIME_FENCE_LAB_STATE}.runtime-drift"
 
     recover_abort_log="$scenario_directory/proxy-enrollment-recover-abort.log"
     if ! operator recover-abort > "$recover_abort_log" 2>&1; then
