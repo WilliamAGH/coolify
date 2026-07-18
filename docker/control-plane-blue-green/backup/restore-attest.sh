@@ -787,7 +787,7 @@ cleanup_after_failure()
                 && [[ $candidate_secrets_captured == 1 ]]; then
                 delete_captured_candidate_secrets >/dev/null 2>&1 || true
             fi
-        elif [[ ${candidate_was_absent:-0} == 1 ]] \
+        elif ! docker inspect "$candidate_runtime_container" >/dev/null 2>&1 \
             && capture_orphaned_candidate_secrets >/dev/null 2>&1; then
             delete_captured_candidate_secrets >/dev/null 2>&1 || true
         fi

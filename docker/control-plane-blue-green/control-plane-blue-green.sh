@@ -11662,7 +11662,10 @@ load_configuration()
     validate_identifier "$control_plane_network" CONTROL_PLANE_NETWORK
     [ -z "${CONTROL_PLANE_TRUSTED_PROXY_ADDRESSES:-}" ] \
         || fail 'CONTROL_PLANE_TRUSTED_PROXY_ADDRESSES is operator-owned and must not be configured'
-    control_plane_trusted_proxy_addresses=$(control_plane_proxy_peer_addresses)
+    control_plane_trusted_proxy_addresses=
+    if [ "$command_name" != preflight ]; then
+        control_plane_trusted_proxy_addresses=$(control_plane_proxy_peer_addresses)
+    fi
     container_name_inventory=$(printf '%s\n' "$blue_container" "$green_container" \
         "$green_web_b_container" "$replacement_blue_container" \
         "$replacement_blue_web_b_container" "$proxy_container" "$database_container")
@@ -12033,6 +12036,7 @@ preflight()
     assert_proxy_identity
     assert_proxy_dynamic_mount
     assert_container_running "$blue_container"
+    control_plane_trusted_proxy_addresses=$(control_plane_proxy_peer_addresses)
     if [ ! -e "$state_file" ]; then
         enroll_proxy_if_needed
         assert_proxy_identity

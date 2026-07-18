@@ -2,7 +2,6 @@
 
 set -Eeuo pipefail
 
-[[ ${LAB_FAIL_CANDIDATE_BOOT:-0} != 1 ]] || exit 70
 : "${LAB_DIRECT_PROBE_TOKEN_FILE:?}"
 : "${LAB_APPLIED_ACK_FILE:?}"
 runtime_image=${LAB_CANDIDATE_RUNTIME_IMAGE_OVERRIDE:-$CONTROL_PLANE_CANDIDATE_IMAGE_DIGEST}
@@ -58,6 +57,7 @@ if [[ -e $candidate_secret_directory || -L $candidate_secret_directory ]]; then
     ! docker inspect "$LAB_CANDIDATE_CONTAINER" >/dev/null 2>&1 || exit 70
     cleanup_candidate_secret_directory || exit 70
 fi
+[[ ${LAB_FAIL_CANDIDATE_BOOT:-0} != 1 ]] || exit 70
 mkdir --mode=0700 "$candidate_secret_directory"
 chmod 0700 "$candidate_secret_directory"
 {

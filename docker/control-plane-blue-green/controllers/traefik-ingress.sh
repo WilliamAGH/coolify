@@ -2031,7 +2031,7 @@ rollback_backup_kind()
 
 assert_reverse_predecessor_context()
 {
-    [ "$managed_predecessor_requested" = 1 ] || return
+    [ "$managed_predecessor_requested" = 1 ] || return 0
     [ "$direction" = reverse ] \
         || fail 'managed HTTPS predecessor handoff is allowed only for a reverse ingress pool'
     [ "$color" != "$predecessor_color" ] \

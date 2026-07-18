@@ -2770,9 +2770,19 @@ scenario_router_reload_failure()
         > "$router_reload_failure_log" 2>&1; then
         fail 'cutover accepted a malformed Traefik dynamic file'
     fi
-    grep -F -q 'exact Traefik protected provider API did not prove the managed live route' \
+    if ! grep -F -q \
+        'exact Traefik protected provider API did not prove the managed live route' \
+        "$router_reload_failure_log"; then
+        sed -n '1,240p' "$router_reload_failure_log" >&2
+        fail 'malformed route did not reach the live Traefik provider rejection gate'
+    fi
+    if ! grep -F -q 'green HTTPS route was not atomically switched and acknowledged' \
         "$router_reload_failure_log" \
-        || fail 'malformed route did not reach the live Traefik provider rejection gate'
+        || ! grep -F -x -q 'phase=live-expand-migrations-applied' \
+            "$CONTROL_PLANE_OPERATOR_STATE_DIR/$CONTROL_PLANE_OPERATION_ID/state"; then
+        sed -n '1,240p' "$router_reload_failure_log" >&2
+        fail 'malformed route failure did not complete durable legacy-route recovery'
+    fi
     wait_for_blue
     operator rollback >/dev/null
 }
@@ -3881,7 +3891,7 @@ stop_and_assert_availability_monitor()
     touch "$availability_stop"
     wait_registered_worker "$availability_monitor_pid" \
         || fail 'continuous availability monitor exited unsuccessfully'
-    awk -F '\t' '
+    if ! awk -F '\t' '
         BEGIN { https = 0; local_ingress = 0; invalid = 0 }
         $2 == "https" { https++ }
         $2 == "local-ingress" { local_ingress++ }
@@ -3889,8 +3899,24 @@ stop_and_assert_availability_monitor()
         $3 != "0" || $4 != "200" { invalid = 1 }
         $5 != "health" { invalid = 1 }
         END { exit invalid || https < 10 || local_ingress < 10 }
-    ' "$availability_log" \
-        || fail 'continuous health traffic observed a transport error, non-2xx response, or insufficient samples'
+    ' "$availability_log"; then
+        awk -F '\t' '
+            BEGIN { https = 0; local_ingress = 0; invalid = 0 }
+            $2 == "https" { https++ }
+            $2 == "local-ingress" { local_ingress++ }
+            $2 != "https" && $2 != "local-ingress" { invalid++ }
+            $3 != "0" || $4 != "200" || $5 != "health" { invalid++ }
+            END {
+                printf "availability_summary https=%d local_ingress=%d invalid=%d\n", \
+                    https, local_ingress, invalid > "/dev/stderr"
+            }
+        ' "$availability_log"
+        awk -F '\t' \
+            '$2 != "https" && $2 != "local-ingress" \
+                || $3 != "0" || $4 != "200" || $5 != "health" { print }' \
+            "$availability_log" | sed -n '1,40p' >&2
+        fail 'continuous health traffic observed a transport error, non-2xx response, or insufficient samples'
+    fi
 }
 
 scenario_continuous_forward_reverse_availability()
