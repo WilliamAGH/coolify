@@ -2005,11 +2005,18 @@ scenario_proxy_enrollment_persisted_recover_abort_retention()
         && [ ! -L "$CONTROL_PLANE_TRAEFIK_DYNAMIC_DIR/$CONTROL_PLANE_TRAEFIK_DYNAMIC_FILENAME" ] \
         || fail 'failed route switch retained an unacknowledged managed dynamic route'
 
-    operator recover-abort >/dev/null
+    recover_abort_log="$scenario_directory/proxy-enrollment-recover-abort.log"
+    if ! operator recover-abort > "$recover_abort_log" 2>&1; then
+        sed -n '1,240p' "$recover_abort_log" >&2
+        fail 'proxy-enrollment recover-abort did not converge'
+    fi
     grep -F -x -q 'phase=recovery-aborted' \
         "$CONTROL_PLANE_TEST_PROXY_ENROLLMENT_OPERATOR_STATE_FILE" \
         || fail 'recover-abort did not reach its terminal durable state'
-    operator recover-abort >/dev/null
+    if ! operator recover-abort > "$recover_abort_log" 2>&1; then
+        sed -n '1,240p' "$recover_abort_log" >&2
+        fail 'idempotent proxy-enrollment recover-abort did not converge'
+    fi
     assert_proxy_enrollment_phase activated
     assert_proxy_enrollment_proxy_binding native
     assert_proxy_enrollment_blue_binding absent

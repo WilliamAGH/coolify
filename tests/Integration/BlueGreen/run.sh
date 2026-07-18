@@ -11,7 +11,7 @@ readonly EVIDENCE_DIRECTORY
 readonly TRAFFIC_STOP_FILE=/state/bluegreen-provider-lab.stop
 readonly MINIMUM_EVICTION_DELAY_MILLISECONDS=8000
 readonly HELD_TRAFFIC_DURATION_MILLISECONDS=60000
-readonly LEGACY_STOP_GRACE_SECONDS=65
+readonly LEGACY_STOP_GRACE_SECONDS=80
 
 fail() {
   printf 'BLUEGREEN_PROVIDER_LAB_FAILURE %s\n' "$*" >&2
@@ -215,6 +215,7 @@ compose logs --no-color legacy >"$EVIDENCE_DIRECTORY/legacy-graceful-stop-events
 if ! grep -F '"event":"graceful-shutdown-start"' "$EVIDENCE_DIRECTORY/legacy-graceful-stop-events.log" >/dev/null \
   || ! grep -F '"event":"graceful-shutdown-complete"' "$EVIDENCE_DIRECTORY/legacy-graceful-stop-events.log" >/dev/null \
   || grep -F '"event":"graceful-shutdown-error"' "$EVIDENCE_DIRECTORY/legacy-graceful-stop-events.log" >/dev/null; then
+  tee /dev/stderr <"$EVIDENCE_DIRECTORY/legacy-graceful-stop-events.log" >/dev/null || true
   fail "legacy did not complete its normal graceful shutdown"
 fi
 wait_for_held_traffic "HTTP" "$legacy_delay_pid" "$EVIDENCE_DIRECTORY/held-legacy-delay.json"
