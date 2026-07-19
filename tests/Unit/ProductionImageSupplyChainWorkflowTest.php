@@ -675,7 +675,7 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
         $violations[] = 'application validation must serialize pushes without cancellation while superseding stale pull requests';
     }
 
-    $genericJobs = ['php', 'browser', 'formatting', 'node', 'workflow-and-shell'];
+    $genericJobs = ['php', 'blue-green-lifecycle', 'browser', 'formatting', 'node', 'workflow-and-shell'];
     foreach ($genericJobs as $jobName) {
         if (! isset($applicationJobs[$jobName])) {
             $violations[] = "missing generic application validation job: {$jobName}";

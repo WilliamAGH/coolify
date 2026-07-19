@@ -75,7 +75,7 @@ final class RecordBlueGreenRoutingMutation
             }
 
             $mutatedAt = now();
-            $stateUpdated = ApplicationBlueGreenDeployment::query()
+            $stateQuery = ApplicationBlueGreenDeployment::query()
                 ->whereKey($state->getKey())
                 ->where('operation_deployment_uuid', $claim->deploymentUuid)
                 ->where('destination_fence_epoch', $replacementState->destinationFenceEpoch)
@@ -86,7 +86,6 @@ final class RecordBlueGreenRoutingMutation
                 ->whereNull('deactivation_started_at')
                 ->where('supersession_generation', $claim->supersessionGeneration)
                 ->whereNull('operation_routing_mutated_at')
-                ->whereHas('application')
                 ->whereHas('operationDeployment', function ($query) use ($claim, $state): void {
                     $query->where('application_id', $claim->applicationId)
                         ->where('deployment_uuid', $claim->deploymentUuid)
@@ -94,10 +93,13 @@ final class RecordBlueGreenRoutingMutation
                         ->where('pull_request_id', 0)
                         ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
                         ->where('blue_green_supersession_generation', $claim->supersessionGeneration)
-                        ->where('blue_green_phase', $state->phase->value)
-                        ->whereHas('application');
-                })
-                ->update(['operation_routing_mutated_at' => $mutatedAt]);
+                        ->where('blue_green_phase', $state->phase->value);
+                    BlueGreenLifecycleDatabaseLocks::constrainLiveApplication($query, $claim->applicationId);
+                });
+            $stateUpdated = BlueGreenLifecycleDatabaseLocks::constrainLiveApplication(
+                $stateQuery,
+                $claim->applicationId,
+            )->update(['operation_routing_mutated_at' => $mutatedAt]);
             $deploymentQuery = ApplicationDeploymentQueue::query()
                 ->whereKey($deployment->getKey())
                 ->where('application_id', $claim->applicationId)

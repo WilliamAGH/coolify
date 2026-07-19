@@ -155,11 +155,10 @@ final readonly class BlueGreenLifecycleDatabaseLocks
             ->where('blue_green_server_boot_id', $claim->serverBootId)
             ->where('blue_green_topology_digest', $claim->topologyDigest)
             ->where('blue_green_routing_config_digest', $claim->routingConfigDigest)
-            ->whereHas('application')
             ->whereExists(function ($stateQuery) use ($claim, $expectedStatePhase, $stateRetainsOperationIdentity): void {
                 $stateQuery->selectRaw('1')
                     ->from('application_blue_green_deployments as owner_state')
-                    ->whereColumn('owner_state.application_id', 'application_deployment_queues.application_id')
+                    ->where('owner_state.application_id', $claim->applicationId)
                     ->where('owner_state.id', $claim->stateId)
                     ->where('owner_state.standalone_docker_id', $claim->standaloneDockerId)
                     ->where('owner_state.phase', $expectedStatePhase->value)
@@ -170,8 +169,19 @@ final readonly class BlueGreenLifecycleDatabaseLocks
                     ? $stateQuery->whereColumn('owner_state.operation_deployment_uuid', 'application_deployment_queues.deployment_uuid')
                     : $stateQuery->whereNull('owner_state.operation_deployment_uuid');
             });
+        $query = self::constrainLiveApplication($query, $claim->applicationId);
 
         return self::constrainQueueStatus($query, $expectedStatePhase);
+    }
+
+    public static function constrainLiveApplication(Builder $query, int $applicationId): Builder
+    {
+        return $query->whereExists(function ($applicationQuery) use ($applicationId): void {
+            $applicationQuery->selectRaw('1')
+                ->from('applications as live_blue_green_application')
+                ->where('live_blue_green_application.id', $applicationId)
+                ->whereNull('live_blue_green_application.deleted_at');
+        });
     }
 
     public static function constrainTerminalQueueOwner(
@@ -182,12 +192,17 @@ final readonly class BlueGreenLifecycleDatabaseLocks
             ->where('application_id', $snapshot->application_id)
             ->where('deployment_uuid', $snapshot->deployment_uuid)
             ->where('pull_request_id', $snapshot->pull_request_id)
-            ->whereHas('application')
-            ->whereNotExists(function ($deactivationQuery): void {
+            ->whereExists(function ($applicationQuery) use ($snapshot): void {
+                $applicationQuery->selectRaw('1')
+                    ->from('applications as terminal_application')
+                    ->where('terminal_application.id', (int) $snapshot->application_id)
+                    ->whereNull('terminal_application.deleted_at');
+            })
+            ->whereNotExists(function ($deactivationQuery) use ($snapshot): void {
                 $deactivationQuery->selectRaw('1')
                     ->from('application_blue_green_deactivations as terminal_deactivation')
-                    ->whereColumn('terminal_deactivation.application_id', 'application_deployment_queues.application_id')
-                    ->whereColumn('terminal_deactivation.standalone_docker_id', 'application_deployment_queues.destination_id');
+                    ->where('terminal_deactivation.application_id', (int) $snapshot->application_id)
+                    ->where('terminal_deactivation.standalone_docker_id', (int) $snapshot->destination_id);
             });
         $query = $snapshot->destination_id === null
             ? $query->whereNull('destination_id')
@@ -208,10 +223,10 @@ final readonly class BlueGreenLifecycleDatabaseLocks
             ->whereExists(function ($stateQuery) use ($snapshot): void {
                 $stateQuery->selectRaw('1')
                     ->from('application_blue_green_deployments as terminal_owner_state')
-                    ->whereColumn('terminal_owner_state.application_id', 'application_deployment_queues.application_id')
-                    ->whereColumn('terminal_owner_state.standalone_docker_id', 'application_deployment_queues.destination_id')
-                    ->whereColumn('terminal_owner_state.operation_deployment_uuid', 'application_deployment_queues.deployment_uuid')
-                    ->whereColumn('terminal_owner_state.phase', 'application_deployment_queues.blue_green_phase')
+                    ->where('terminal_owner_state.application_id', (int) $snapshot->application_id)
+                    ->where('terminal_owner_state.standalone_docker_id', (int) $snapshot->destination_id)
+                    ->where('terminal_owner_state.operation_deployment_uuid', $snapshot->deployment_uuid)
+                    ->where('terminal_owner_state.phase', $snapshot->blue_green_phase?->value)
                     ->where('terminal_owner_state.supersession_generation', $snapshot->blue_green_supersession_generation)
                     ->whereNull('terminal_owner_state.deactivation_operation_id')
                     ->whereNull('terminal_owner_state.deactivation_started_at');

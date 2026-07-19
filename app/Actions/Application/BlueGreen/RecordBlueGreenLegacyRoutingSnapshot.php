@@ -59,7 +59,7 @@ final class RecordBlueGreenLegacyRoutingSnapshot
                 throw new BlueGreenDeploymentTransitionException('Legacy routing was already mutated before its pre-stop snapshot could be persisted.');
             }
 
-            $updated = ApplicationBlueGreenDeployment::query()
+            $query = ApplicationBlueGreenDeployment::query()
                 ->whereKey($state->id)
                 ->where('phase', BlueGreenDeploymentPhase::PREPARING->value)
                 ->where('operation_deployment_uuid', $claim->deploymentUuid)
@@ -74,7 +74,6 @@ final class RecordBlueGreenLegacyRoutingSnapshot
                 ->whereNull('operation_legacy_routing_snapshot_version')
                 ->whereNull('operation_legacy_routing_snapshot')
                 ->whereNull('operation_legacy_routing_snapshot_sha256')
-                ->whereHas('application')
                 ->whereHas('operationDeployment', function ($query) use ($claim): void {
                     $query->where('application_id', $claim->applicationId)
                         ->where('deployment_uuid', $claim->deploymentUuid)
@@ -82,14 +81,17 @@ final class RecordBlueGreenLegacyRoutingSnapshot
                         ->where('pull_request_id', 0)
                         ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
                         ->where('blue_green_supersession_generation', $claim->supersessionGeneration)
-                        ->where('blue_green_phase', BlueGreenDeploymentPhase::PREPARING->value)
-                        ->whereHas('application');
-                })
-                ->update([
-                    'operation_legacy_routing_snapshot_version' => $encoded->version,
-                    'operation_legacy_routing_snapshot' => $encoded->bytes,
-                    'operation_legacy_routing_snapshot_sha256' => $encoded->sha256,
-                ]);
+                        ->where('blue_green_phase', BlueGreenDeploymentPhase::PREPARING->value);
+                    BlueGreenLifecycleDatabaseLocks::constrainLiveApplication($query, $claim->applicationId);
+                });
+            $updated = BlueGreenLifecycleDatabaseLocks::constrainLiveApplication(
+                $query,
+                $claim->applicationId,
+            )->update([
+                'operation_legacy_routing_snapshot_version' => $encoded->version,
+                'operation_legacy_routing_snapshot' => $encoded->bytes,
+                'operation_legacy_routing_snapshot_sha256' => $encoded->sha256,
+            ]);
             if ($updated !== 1) {
                 throw new BlueGreenDeploymentTransitionException('The legacy routing snapshot owner changed while it was being persisted.');
             }

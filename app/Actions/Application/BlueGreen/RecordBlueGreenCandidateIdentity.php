@@ -63,7 +63,7 @@ final class RecordBlueGreenCandidateIdentity
                 return $state;
             }
 
-            $stateUpdated = ApplicationBlueGreenDeployment::query()
+            $stateQuery = ApplicationBlueGreenDeployment::query()
                 ->whereKey($state->getKey())
                 ->whereNull('operation_candidate_container_id')
                 ->where('operation_deployment_uuid', $claim->deploymentUuid)
@@ -73,18 +73,20 @@ final class RecordBlueGreenCandidateIdentity
                 ->whereNull('deactivation_operation_id')
                 ->whereNull('deactivation_started_at')
                 ->where('supersession_generation', $claim->supersessionGeneration)
-                ->whereHas('application')
                 ->whereHas('operationDeployment', function ($query) use ($claim, $state): void {
                     $query->where('application_id', $claim->applicationId)
                         ->where('deployment_uuid', $claim->deploymentUuid)
                         ->where('destination_id', $claim->standaloneDockerId)
                         ->where('pull_request_id', 0)
                         ->where('blue_green_supersession_generation', $claim->supersessionGeneration)
-                        ->where('blue_green_phase', $state->phase->value)
-                        ->whereHas('application');
+                        ->where('blue_green_phase', $state->phase->value);
+                    BlueGreenLifecycleDatabaseLocks::constrainLiveApplication($query, $claim->applicationId);
                     BlueGreenLifecycleDatabaseLocks::constrainQueueStatus($query, $state->phase);
-                })
-                ->update(['operation_candidate_container_id' => $inspection->dockerId]);
+                });
+            $stateUpdated = BlueGreenLifecycleDatabaseLocks::constrainLiveApplication(
+                $stateQuery,
+                $claim->applicationId,
+            )->update(['operation_candidate_container_id' => $inspection->dockerId]);
             $deploymentQuery = ApplicationDeploymentQueue::query()
                 ->whereKey($deployment->getKey())
                 ->where('application_id', $claim->applicationId)
