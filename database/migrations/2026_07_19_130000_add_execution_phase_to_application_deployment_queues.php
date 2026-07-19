@@ -33,7 +33,7 @@ return new class extends Migration
         $columns = collect(Schema::getColumns('application_deployment_queues'))->keyBy('name');
         $phase = $columns->get('execution_phase');
         $payload = $columns->get('prepared_activation_payload');
-        $phaseDefault = strtolower(trim((string) ($phase['default'] ?? ''), "()'\""));
+        $phaseDefault = $this->normalizeColumnDefault($phase['default'] ?? null);
 
         if (! is_array($phase)
             || ($phase['nullable'] ?? null) !== false
@@ -47,6 +47,13 @@ return new class extends Migration
             || ($payload['default'] ?? null) !== null) {
             throw new RuntimeException('Application deployment prepared activation payload does not match the authorized schema.');
         }
+    }
+
+    public function normalizeColumnDefault(mixed $default): string
+    {
+        $expression = explode('::', (string) $default, 2)[0];
+
+        return strtolower(trim($expression, "()'\" "));
     }
 
     public function down(): void

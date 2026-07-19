@@ -28,6 +28,15 @@ it('replays and attests the complete deployment execution phase schema', functio
         );
 });
 
+it('normalizes PostgreSQL and SQLite string default expressions', function (mixed $defaultExpression) {
+    expect(applicationDeploymentExecutionPhaseMigration()->normalizeColumnDefault($defaultExpression))
+        ->toBe('prepare');
+})->with([
+    "'prepare'",
+    "'prepare'::character varying",
+    "('prepare'::character varying)",
+]);
+
 it('refuses a partial execution phase schema replay', function () {
     Schema::table('application_deployment_queues', function (Blueprint $table): void {
         $table->dropColumn('prepared_activation_payload');
