@@ -3,12 +3,43 @@
 use App\Enums\ActivityTypes;
 use App\Enums\ProcessStatus;
 use App\Jobs\ProxyMutationTask;
+use App\Support\ControlPlaneMode;
 use App\Support\ProxyMutationQueue;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Queue;
 use Spatie\Activitylog\Models\Activity;
 
 uses(RefreshDatabase::class);
+
+$originalControlPlaneMode = [
+    'process' => getenv('CONTROL_PLANE_MODE'),
+    'environment' => $_ENV['CONTROL_PLANE_MODE'] ?? null,
+    'server' => $_SERVER['CONTROL_PLANE_MODE'] ?? null,
+];
+
+beforeEach(function (): void {
+    $this->originalControlPlaneModeConfiguration = config('control-plane.mode');
+    putenv('CONTROL_PLANE_MODE='.ControlPlaneMode::Active->value);
+    $_ENV['CONTROL_PLANE_MODE'] = ControlPlaneMode::Active->value;
+    $_SERVER['CONTROL_PLANE_MODE'] = ControlPlaneMode::Active->value;
+    config()->set('control-plane.mode', ControlPlaneMode::Active->value);
+});
+
+afterEach(function () use ($originalControlPlaneMode): void {
+    putenv($originalControlPlaneMode['process'] === false
+        ? 'CONTROL_PLANE_MODE'
+        : "CONTROL_PLANE_MODE={$originalControlPlaneMode['process']}");
+
+    foreach (['environment' => &$_ENV, 'server' => &$_SERVER] as $source => &$variables) {
+        if ($originalControlPlaneMode[$source] === null) {
+            unset($variables['CONTROL_PLANE_MODE']);
+        } else {
+            $variables['CONTROL_PLANE_MODE'] = $originalControlPlaneMode[$source];
+        }
+    }
+
+    config()->set('control-plane.mode', $this->originalControlPlaneModeConfiguration);
+});
 
 function coolifyTaskRetryActivity(): Activity
 {
