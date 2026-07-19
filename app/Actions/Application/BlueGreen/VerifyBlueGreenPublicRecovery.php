@@ -64,6 +64,7 @@ class VerifyBlueGreenPublicRecovery
         Application $application,
         array $route,
         ?string $expectedAcknowledgement,
+        ?string $expectedReleaseProof = null,
         ?string $probeHeader = null,
         ?string $probeToken = null,
         string $nonceParameter = self::RECOVERY_NONCE_PARAMETER,
@@ -78,7 +79,7 @@ class VerifyBlueGreenPublicRecovery
             $server,
             input: $request['input'],
         );
-        $this->assertResponse($route, $headers, $expectedAcknowledgement);
+        $this->assertResponse($route, $headers, $expectedAcknowledgement, $expectedReleaseProof);
     }
 
     /**
@@ -163,11 +164,15 @@ class VerifyBlueGreenPublicRecovery
     }
 
     /** @param array{router: string, url: string} $route */
-    public function assertResponse(array $route, string $headers, ?string $expectedAcknowledgement): void
-    {
+    public function assertResponse(
+        array $route,
+        string $headers,
+        ?string $expectedAcknowledgement,
+        ?string $expectedReleaseProof = null,
+    ): void {
         ['status' => $status, 'acknowledgements' => $acknowledgements] = $this->responseFor($headers);
-        if ($status === 0 || $status === 404 || $status >= 500) {
-            throw new RuntimeException("The restored router {$route['router']} returned gateway/server status {$status}.");
+        if ($status < 200 || $status >= 400) {
+            throw new RuntimeException("The restored router {$route['router']} returned an ineligible public status {$status}.");
         }
         if ($expectedAcknowledgement === null) {
             if ($acknowledgements !== []) {
@@ -178,6 +183,17 @@ class VerifyBlueGreenPublicRecovery
         }
         if ($acknowledgements !== [$expectedAcknowledgement]) {
             throw new RuntimeException("The restored router {$route['router']} did not return its exact opaque acknowledgement.");
+        }
+        if ($expectedReleaseProof === null) {
+            return;
+        }
+        preg_match_all('/^'.preg_quote(BlueGreenRoutingTarget::RELEASE_PROOF_HEADER, '/').':\s*(.*?)\s*$/mi', $headers, $releaseProofMatches);
+        $releaseProofs = array_values(array_unique(array_filter(
+            $releaseProofMatches[1],
+            static fn (string $releaseProof): bool => trim($releaseProof) !== '',
+        )));
+        if ($releaseProofs !== [$expectedReleaseProof]) {
+            throw new RuntimeException("The restored router {$route['router']} did not return the exact application release proof.");
         }
     }
 }

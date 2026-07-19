@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Actions\Application\CancelApplicationDeployment;
 use App\Actions\Database\StartDatabase;
 use App\Actions\Service\StartService;
 use App\Enums\ApplicationDeploymentStatus;
@@ -249,11 +250,12 @@ class DeployController extends Controller
             $kill_command = "docker rm -f {$deployment_uuid}";
             $build_server_id = $deployment->build_server_id ?? $deployment->server_id;
 
-            // Mark deployment as cancelled
-            $deployment->update([
-                'status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
-            ]);
-            $deploymentCancelled = true;
+            $deploymentCancelled = CancelApplicationDeployment::run($deployment);
+            if (! $deploymentCancelled) {
+                return response()->json([
+                    'message' => "Deployment cannot be cancelled. Current status: {$deployment->status}",
+                ], 400);
+            }
 
             // Get the server
             $server = Server::whereTeamId($teamId)->find($build_server_id);

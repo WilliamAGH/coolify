@@ -8,6 +8,7 @@ use Illuminate\Database\Eloquent\Model;
 class ApplicationSetting extends Model
 {
     protected $attributes = [
+        'blue_green_inactive_retention_seconds' => DEFAULT_BLUE_GREEN_INACTIVE_RETENTION_SECONDS,
         'is_blue_green_deployment_enabled' => false,
     ];
 
@@ -31,6 +32,7 @@ class ApplicationSetting extends Model
         'is_git_shallow_clone_enabled' => 'boolean',
         'docker_images_to_keep' => 'integer',
         'stop_grace_period' => 'integer',
+        'blue_green_inactive_retention_seconds' => 'integer',
         'is_blue_green_deployment_enabled' => 'boolean',
     ];
 
@@ -71,6 +73,7 @@ class ApplicationSetting extends Model
         'include_source_commit_in_build',
         'docker_images_to_keep',
         'stop_grace_period',
+        'blue_green_inactive_retention_seconds',
         'is_blue_green_deployment_enabled',
     ];
 
@@ -93,6 +96,18 @@ class ApplicationSetting extends Model
         }
 
         return $this->stopGracePeriodSeconds();
+    }
+
+    public function blueGreenInactiveRetentionSeconds(): int
+    {
+        $retentionSeconds = $this->blue_green_inactive_retention_seconds;
+        if (is_int($retentionSeconds)
+            && $retentionSeconds >= MIN_BLUE_GREEN_INACTIVE_RETENTION_SECONDS
+            && $retentionSeconds <= MAX_BLUE_GREEN_INACTIVE_RETENTION_SECONDS) {
+            return $retentionSeconds;
+        }
+
+        return DEFAULT_BLUE_GREEN_INACTIVE_RETENTION_SECONDS;
     }
 
     public function isStatic(): Attribute

@@ -2,6 +2,7 @@
 
 namespace App\Actions\Application;
 
+use App\Actions\Application\BlueGreen\AssertBlueGreenApplicationStopIsSafe;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationException;
 use App\Actions\Application\BlueGreen\DeactivateBlueGreenApplication;
 use App\Models\Application;
@@ -30,6 +31,7 @@ class StopApplicationOneServer
             return;
         }
 
+        AssertBlueGreenApplicationStopIsSafe::run($application);
         if ($application->destination->server->isSwarm()) {
             return;
         }

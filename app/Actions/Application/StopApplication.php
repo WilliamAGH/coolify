@@ -2,6 +2,7 @@
 
 namespace App\Actions\Application;
 
+use App\Actions\Application\BlueGreen\AssertBlueGreenApplicationStopIsSafe;
 use App\Actions\Application\BlueGreen\DeactivateBlueGreenApplication;
 use App\Actions\Server\CleanupDocker;
 use App\Events\ServiceStatusChanged;
@@ -19,6 +20,7 @@ class StopApplication
         if (! $previewDeployments && $application->requiresBlueGreenDeactivation()) {
             DeactivateBlueGreenApplication::make()->stop($application);
         } else {
+            AssertBlueGreenApplicationStopIsSafe::run($application);
             $servers = collect([$application->destination->server]);
             if ($application?->additional_servers?->count() > 0) {
                 $servers = $servers->merge($application->additional_servers);

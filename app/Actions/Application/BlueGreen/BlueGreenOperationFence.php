@@ -31,6 +31,7 @@ final readonly class BlueGreenOperationFence
         array $expectedPhases,
         ?BlueGreenProxyState $expectedDestinationState = null,
         bool $verifyDestinationState = false,
+        bool $allowCancelledRollbackEntry = false,
     ): BlueGreenDeploymentPhase {
         $this->refreshOwnedLock();
         (new ComputeBlueGreenDeploymentFingerprint)->assertMatchesClaim($claim);
@@ -62,7 +63,11 @@ final readonly class BlueGreenOperationFence
             || (int) $deployment->application_id !== $claim->applicationId
             || (int) $deployment->destination_id !== $claim->standaloneDockerId
             || $deployment->pull_request_id !== 0
-            || ! BlueGreenLifecycleDatabaseLocks::queueStatusOwnsPhase($deployment->status, $state->phase)
+            || ! BlueGreenLifecycleDatabaseLocks::queueStatusOwnsPhase(
+                $deployment->status,
+                $state->phase,
+                $allowCancelledRollbackEntry,
+            )
             || $deployment->blue_green_phase !== $state->phase
             || $deployment->blue_green_color !== $claim->pendingColor
             || $deployment->blue_green_routing_revision !== $claim->expectedRoutingRevision
@@ -221,6 +226,19 @@ final readonly class BlueGreenOperationFence
                 && $state->pending_color === null
                 && $state->pending_deployment_uuid === null
                 && $state->{$deploymentColumn} === $claim->deploymentUuid;
+        }
+
+        if ($state->phase === BlueGreenDeploymentPhase::DRAINING) {
+            $deploymentColumn = match ($claim->pendingColor) {
+                BlueGreenDeploymentColor::BLUE => 'blue_deployment_uuid',
+                BlueGreenDeploymentColor::GREEN => 'green_deployment_uuid',
+            };
+
+            return $state->active_color === $claim->pendingColor
+                && $state->pending_color === null
+                && $state->pending_deployment_uuid === null
+                && $state->{$deploymentColumn} === $claim->deploymentUuid
+                && $state->legacy_container_name === $claim->legacyContainerName;
         }
 
         return $state->active_color === $claim->previousActiveColor

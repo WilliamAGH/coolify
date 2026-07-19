@@ -53,6 +53,8 @@ function applicationValidationWorkflowViolations(array $workflow): array
         'tests/Feature/ApplicationDeploymentBlueGreenDestinationFenceTest.php',
         'tests/Feature/BlueGreenApplicationDeactivationTest.php',
         'tests/Feature/BlueGreenCancellationCompensationTest.php',
+        'tests/Feature/BlueGreenContinuousAvailabilityAcceptanceTest.php',
+        'tests/Feature/BlueGreenCrashBoundaryAcceptanceTest.php',
         'tests/Feature/BlueGreenMigrationReplayTest.php',
         'tests/Feature/BlueGreenSupersessionGenerationTest.php',
     ] as $requiredTest) {

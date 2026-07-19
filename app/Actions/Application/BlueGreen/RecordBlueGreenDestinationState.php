@@ -51,6 +51,7 @@ final class RecordBlueGreenDestinationState
             if (! in_array($state->phase, [
                 BlueGreenDeploymentPhase::PREPARING,
                 BlueGreenDeploymentPhase::SWITCHING,
+                BlueGreenDeploymentPhase::DRAINING,
                 BlueGreenDeploymentPhase::ROLLING_BACK,
                 BlueGreenDeploymentPhase::IDLE,
             ], true)

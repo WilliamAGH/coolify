@@ -419,3 +419,50 @@ it('requires exact provider proof and rejects acknowledgement leaks', function (
         ->and(fn () => $verifier->handle(new Server, new Application, [], 'not-an-opaque-acknowledgement'))
         ->toThrow(InvalidArgumentException::class, 'one exact opaque acknowledgement');
 });
+
+it('rejects every ineligible public status instead of treating authentication failures as readiness', function (int $status) {
+    $verifier = new VerifyBlueGreenPublicRecovery;
+    $route = ['router' => 'managed-public', 'url' => 'https://app.example.test/health'];
+    $headers = "HTTP/1.1 {$status} Test\r\n".BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.': '.str_repeat('a', 64)."\r\n\r\n";
+
+    expect(fn () => $verifier->assertResponse($route, $headers, str_repeat('a', 64)))
+        ->toThrow(RuntimeException::class, "ineligible public status {$status}");
+})->with([401, 403, 404, 502, 503]);
+
+it('requires an application-returned deployment release proof on the candidate probe', function () {
+    $verifier = new VerifyBlueGreenPublicRecovery;
+    $route = ['router' => 'managed-probe', 'url' => 'https://app.example.test/health'];
+    $acknowledgement = str_repeat('a', 64);
+    $expectedReleaseProof = BlueGreenRoutingTarget::durableReleaseProofToken('deployment-proof');
+    $headers = "HTTP/1.1 200 OK\r\n"
+        .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$acknowledgement}\r\n"
+        .BlueGreenRoutingTarget::RELEASE_PROOF_HEADER.": {$expectedReleaseProof}\r\n\r\n";
+
+    expect(fn () => $verifier->assertResponse($route, $headers, $acknowledgement, $expectedReleaseProof))
+        ->not->toThrow(RuntimeException::class)
+        ->and(fn () => $verifier->assertResponse(
+            $route,
+            $headers,
+            $acknowledgement,
+            BlueGreenRoutingTarget::durableReleaseProofToken('other-deployment'),
+        ))->toThrow(RuntimeException::class, 'exact application release proof');
+});
+
+it('requires the candidate application release proof on a public handoff route', function () {
+    $verifier = new VerifyBlueGreenPublicRecovery;
+    $route = ['router' => 'managed-public', 'url' => 'https://app.example.test/health'];
+    $acknowledgement = str_repeat('a', 64);
+    $expectedReleaseProof = BlueGreenRoutingTarget::durableReleaseProofToken('deployment-public-handoff');
+    $headers = "HTTP/1.1 200 OK\r\n"
+        .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$acknowledgement}\r\n"
+        .BlueGreenRoutingTarget::RELEASE_PROOF_HEADER.": {$expectedReleaseProof}\r\n\r\n";
+
+    expect(fn () => $verifier->assertResponse($route, $headers, $acknowledgement, $expectedReleaseProof))
+        ->not->toThrow(RuntimeException::class)
+        ->and(fn () => $verifier->assertResponse(
+            $route,
+            $headers,
+            $acknowledgement,
+            BlueGreenRoutingTarget::durableReleaseProofToken('previous-deployment'),
+        ))->toThrow(RuntimeException::class, 'exact application release proof');
+});

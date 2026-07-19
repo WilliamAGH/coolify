@@ -5,6 +5,7 @@ namespace App\Livewire\Project\Application;
 use App\Actions\Application\StopApplication;
 use App\Actions\Docker\GetContainersStatus;
 use App\Models\Application;
+use App\Models\ApplicationBlueGreenDeployment;
 use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
 use Livewire\Component;
 use Visus\Cuid2\Cuid2;
@@ -18,6 +19,9 @@ class Heading extends Component
     public ?string $lastDeploymentInfo = null;
 
     public ?string $lastDeploymentLink = null;
+
+    /** @var array<string, int|string|null>|null */
+    public ?array $blueGreenInactiveRetirement = null;
 
     public array $parameters;
 
@@ -47,15 +51,44 @@ class Heading extends Component
         $lastDeployment = $this->application->get_last_successful_deployment();
         $this->lastDeploymentInfo = data_get_str($lastDeployment, 'commit')->limit(7).' '.data_get($lastDeployment, 'commit_message');
         $this->lastDeploymentLink = $this->application->gitCommitLink(data_get($lastDeployment, 'commit'));
+        $this->refreshBlueGreenInactiveRetirement();
     }
 
     public function checkStatus()
     {
+        $this->refreshBlueGreenInactiveRetirement();
         if ($this->application->destination->server->isFunctional()) {
             GetContainersStatus::dispatch($this->application->destination->server);
         } else {
             $this->dispatch('error', 'Server is not functional.');
         }
+    }
+
+    private function refreshBlueGreenInactiveRetirement(): void
+    {
+        $state = ApplicationBlueGreenDeployment::query()
+            ->where('application_id', $this->application->id)
+            ->whereNotNull('inactive_retirement_owner_deployment_uuid')
+            ->first();
+        if ($state === null) {
+            $this->blueGreenInactiveRetirement = null;
+
+            return;
+        }
+
+        $status = match (true) {
+            $state->inactive_retirement_intervention_required_at !== null => 'intervention_required',
+            $state->inactive_retirement_stopped_at !== null => 'stopped',
+            $state->inactive_retirement_observed_at !== null => 'draining',
+            default => 'retained',
+        };
+        $this->blueGreenInactiveRetirement = [
+            'color' => $state->inactive_retirement_color?->value,
+            'containerId' => $state->inactive_retirement_container_id,
+            'notBeforeAt' => $state->inactive_retirement_not_before_at?->toIso8601String(),
+            'activeConnections' => $state->inactive_retirement_last_observed_connections,
+            'status' => $status,
+        ];
     }
 
     public function manualCheckStatus()

@@ -17,6 +17,7 @@ final class CompleteBlueGreenDeploymentOperation
 
     public function handle(
         BlueGreenDeploymentClaim|BlueGreenDeploymentRecoveryOperation $completion,
+        ?int $inactiveRetentionSeconds = null,
     ): ApplicationBlueGreenDeployment {
         $operation = $completion instanceof BlueGreenDeploymentRecoveryOperation ? $completion : null;
         $claim = $operation?->claim ?? $completion;
@@ -25,7 +26,7 @@ final class CompleteBlueGreenDeploymentOperation
         }
         (new ComputeBlueGreenDeploymentFingerprint)->assertMatchesClaim($claim);
 
-        return DB::transaction(function () use ($claim, $operation): ApplicationBlueGreenDeployment {
+        return DB::transaction(function () use ($claim, $operation, $inactiveRetentionSeconds): ApplicationBlueGreenDeployment {
             $locks = BlueGreenLifecycleDatabaseLocks::forDestination(
                 $claim->applicationId,
                 $claim->standaloneDockerId,
@@ -34,12 +35,12 @@ final class CompleteBlueGreenDeploymentOperation
             $state = $locks->state;
             $deployment = $locks->queue($claim->deploymentUuid);
             $application = $locks->application;
-            $destination = StandaloneDocker::query()->find($claim->standaloneDockerId);
+            $destination = StandaloneDocker::query()->with('server.settings')->find($claim->standaloneDockerId);
             if ($state === null
                 || $state->id !== $claim->stateId
                 || $deployment === null
                 || $application->trashed()
-                || $destination === null) {
+                || $destination?->server === null) {
                 throw new BlueGreenDeploymentTransitionException('The finalized blue-green operation no longer exists.');
             }
 
@@ -47,8 +48,7 @@ final class CompleteBlueGreenDeploymentOperation
                 BlueGreenDeploymentColor::BLUE => 'blue_deployment_uuid',
                 BlueGreenDeploymentColor::GREEN => 'green_deployment_uuid',
             };
-            $isExactFinalizedCycle = $state->phase === BlueGreenDeploymentPhase::IDLE
-                && $state->active_color === $claim->pendingColor
+            $hasExactPromotedRoute = $state->active_color === $claim->pendingColor
                 && $state->pending_color === null
                 && $state->pending_deployment_uuid === null
                 && $state->{$deploymentColumn} === $claim->deploymentUuid
@@ -59,7 +59,6 @@ final class CompleteBlueGreenDeploymentOperation
                 && $state->managed_file_sha256 !== null
                 && $state->destination_topology_digest === $claim->topologyDigest
                 && $state->application_routing_config_digest === $claim->routingConfigDigest
-                && $deployment->blue_green_phase === BlueGreenDeploymentPhase::IDLE
                 && $deployment->blue_green_color === $claim->pendingColor
                 && $deployment->blue_green_routing_revision === $claim->expectedRoutingRevision
                 && $deployment->blue_green_destination_fence_epoch === $claim->destinationFenceEpoch
@@ -73,8 +72,17 @@ final class CompleteBlueGreenDeploymentOperation
                 && $deployment->pull_request_id === 0
                 && (int) $deployment->destination_id === $claim->standaloneDockerId
                 && (int) $deployment->server_id === $destination->server_id;
+            $isExactCompletedCycle = $state->phase === BlueGreenDeploymentPhase::IDLE
+                && $hasExactPromotedRoute
+                && $deployment->blue_green_phase === BlueGreenDeploymentPhase::IDLE;
+            $isExactFinalizationCycle = in_array($state->phase, [
+                BlueGreenDeploymentPhase::DRAINING,
+                BlueGreenDeploymentPhase::IDLE,
+            ], true)
+                && $hasExactPromotedRoute
+                && $deployment->blue_green_phase === $state->phase;
             if ($state->operation_deployment_uuid === null) {
-                if (! $isExactFinalizedCycle
+                if (! $isExactCompletedCycle
                     || $state->legacy_container_name !== null
                     || ! $this->operationProvenanceIsCleared($state)
                     || ! in_array($deployment->status, [
@@ -92,7 +100,8 @@ final class CompleteBlueGreenDeploymentOperation
             $expectedPreviousContainerName = $claim->previousActiveColor === null
                 ? $claim->legacyContainerName
                 : $application->uuid.'-'.$claim->previousActiveColor->value;
-            if (! $isExactFinalizedCycle
+            $completionPhase = $state->phase;
+            if (! $isExactFinalizationCycle
                 || $state->legacy_container_name !== $claim->legacyContainerName
                 || $state->active_color !== $claim->pendingColor
                 || $state->operation_deployment_uuid !== $claim->deploymentUuid
@@ -115,9 +124,55 @@ final class CompleteBlueGreenDeploymentOperation
                 throw new BlueGreenDeploymentTransitionException('The finalized operation changed before durable cleanup completed.');
             }
 
+            $inactiveRetirement = ApplicationBlueGreenDeployment::clearedInactiveRetirementAttributes();
+            if ($claim->previousActiveColor !== null
+                && $state->operation_previous_deployment_uuid !== null
+                && $state->operation_previous_container_id !== null
+                && $state->operation_previous_routing_revision !== null) {
+                $retentionSeconds = $inactiveRetentionSeconds ?? $application->settings->blueGreenInactiveRetentionSeconds();
+                if ($retentionSeconds < MIN_BLUE_GREEN_INACTIVE_RETENTION_SECONDS
+                    || $retentionSeconds > MAX_BLUE_GREEN_INACTIVE_RETENTION_SECONDS) {
+                    throw new BlueGreenDeploymentTransitionException('The frozen inactive retention is outside its bounded interval.');
+                }
+                $stopGraceSeconds = $application->settings->deploymentStopGracePeriodSeconds();
+                $boundedRemoteTimeout = max(
+                    (int) config('constants.ssh.command_timeout'),
+                    (int) $destination->server?->settings->dynamic_timeout,
+                );
+                $retirementLeaseSeconds = BlueGreenDeploymentLock::inactiveRetirementLeaseSeconds(
+                    $boundedRemoteTimeout,
+                    $stopGraceSeconds,
+                );
+                $notBeforeAt = now()->addSeconds($retentionSeconds);
+                $inactiveRetirement = [
+                    'inactive_retirement_owner_deployment_uuid' => $claim->deploymentUuid,
+                    'inactive_retirement_color' => $claim->previousActiveColor->value,
+                    'inactive_retirement_deployment_uuid' => $state->operation_previous_deployment_uuid,
+                    'inactive_retirement_container_id' => $state->operation_previous_container_id,
+                    'inactive_retirement_container_routing_revision' => $state->operation_previous_routing_revision,
+                    'inactive_retirement_owner_routing_revision' => $claim->expectedRoutingRevision,
+                    'inactive_retirement_supersession_generation' => $claim->supersessionGeneration,
+                    'inactive_retirement_destination_fence_epoch' => $state->destination_fence_epoch,
+                    'inactive_retirement_server_boot_id' => $claim->serverBootId,
+                    'inactive_retirement_topology_digest' => $claim->topologyDigest,
+                    'inactive_retirement_routing_config_digest' => $claim->routingConfigDigest,
+                    'inactive_retirement_not_before_at' => $notBeforeAt,
+                    'inactive_retirement_drain_deadline_at' => $notBeforeAt->copy()->addSeconds(
+                        $stopGraceSeconds,
+                    ),
+                    'inactive_retirement_stop_grace_seconds' => $stopGraceSeconds,
+                    'inactive_retirement_lease_seconds' => $retirementLeaseSeconds,
+                    'inactive_retirement_last_observed_connections' => $retentionSeconds === 0 ? 0 : null,
+                    'inactive_retirement_observed_at' => $retentionSeconds === 0 ? now() : null,
+                    'inactive_retirement_attempts' => 0,
+                    'inactive_retirement_stopped_at' => $retentionSeconds === 0 ? now() : null,
+                    'inactive_retirement_intervention_required_at' => null,
+                ];
+            }
+
             $stateQuery = ApplicationBlueGreenDeployment::query()
                 ->whereKey($state->getKey())
-                ->where('phase', BlueGreenDeploymentPhase::IDLE->value)
+                ->where('phase', $completionPhase->value)
                 ->where('active_color', $claim->pendingColor->value)
                 ->where('routing_revision', $claim->expectedRoutingRevision)
                 ->where('operation_deployment_uuid', $claim->deploymentUuid)
@@ -129,24 +184,26 @@ final class CompleteBlueGreenDeploymentOperation
                 ->whereNull('deactivation_operation_id')
                 ->whereNull('deactivation_started_at')
                 ->where('supersession_generation', $claim->supersessionGeneration)
-                ->whereHas('operationDeployment', function ($query) use ($claim): void {
+                ->whereHas('operationDeployment', function ($query) use ($claim, $completionPhase): void {
                     $query->where('application_id', $claim->applicationId)
                         ->where('deployment_uuid', $claim->deploymentUuid)
                         ->where('destination_id', $claim->standaloneDockerId)
                         ->where('pull_request_id', 0)
                         ->where('blue_green_supersession_generation', $claim->supersessionGeneration)
-                        ->where('blue_green_phase', BlueGreenDeploymentPhase::IDLE->value);
+                        ->where('blue_green_phase', $completionPhase->value);
                     BlueGreenLifecycleDatabaseLocks::constrainLiveApplication($query, $claim->applicationId);
                     BlueGreenLifecycleDatabaseLocks::constrainQueueStatus(
                         $query,
-                        BlueGreenDeploymentPhase::IDLE,
+                        $completionPhase,
                     );
                 });
             $stateUpdated = BlueGreenLifecycleDatabaseLocks::constrainLiveApplication(
                 $stateQuery,
                 $claim->applicationId,
             )->update([
+                'phase' => BlueGreenDeploymentPhase::IDLE->value,
                 'legacy_container_name' => null,
+                ...$inactiveRetirement,
                 ...ApplicationBlueGreenDeployment::clearedOperationAttributes(),
             ]);
             $deploymentQuery = ApplicationDeploymentQueue::query()
@@ -156,7 +213,7 @@ final class CompleteBlueGreenDeploymentOperation
                 ->where('destination_id', $claim->standaloneDockerId)
                 ->where('pull_request_id', 0)
                 ->where('blue_green_supersession_generation', $claim->supersessionGeneration)
-                ->where('blue_green_phase', BlueGreenDeploymentPhase::IDLE->value)
+                ->where('blue_green_phase', $completionPhase->value)
                 ->where('blue_green_color', $claim->pendingColor->value)
                 ->where('blue_green_routing_revision', $claim->expectedRoutingRevision)
                 ->where('blue_green_destination_fence_epoch', $claim->destinationFenceEpoch)
@@ -167,10 +224,11 @@ final class CompleteBlueGreenDeploymentOperation
             $deploymentUpdated = BlueGreenLifecycleDatabaseLocks::constrainDeploymentQueueOwner(
                 $deploymentQuery,
                 $claim,
-                BlueGreenDeploymentPhase::IDLE,
+                $completionPhase,
                 BlueGreenDeploymentPhase::IDLE,
                 false,
             )->update([
+                'blue_green_phase' => BlueGreenDeploymentPhase::IDLE->value,
                 'status' => $deployment->status === ApplicationDeploymentStatus::CANCELLED_BY_USER->value
                     ? ApplicationDeploymentStatus::CANCELLED_BY_USER->value
                     : ApplicationDeploymentStatus::FINISHED->value,

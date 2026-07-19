@@ -156,7 +156,10 @@ it('converges when each authorized schema commit exists without its migration le
     expect(Schema::hasColumn('application_settings', 'is_blue_green_deployment_enabled'))->toBeTrue()
         ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_routing_mutated_at'))->toBeTrue()
         ->and(Schema::hasColumn('application_blue_green_deployments', 'deactivation_started_at'))->toBeTrue()
-        ->and(Schema::hasColumn('application_blue_green_deactivations', 'proxy_snapshot'))->toBeTrue();
+        ->and(Schema::hasColumn('application_blue_green_deactivations', 'proxy_snapshot'))->toBeTrue()
+        ->and(Schema::hasColumn('application_blue_green_deployments', 'supersession_generation'))->toBeTrue()
+        ->and(Schema::hasColumn('application_blue_green_deactivations', 'supersession_generation'))->toBeTrue()
+        ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_supersession_generation'))->toBeTrue();
 });
 
 it('replays every earlier migration against the complete later schema', function () {
@@ -173,7 +176,14 @@ it('replays every earlier migration against the complete later schema', function
     expect(Schema::hasColumns('application_blue_green_deployments', [
         'deactivation_operation_id',
         'deactivation_started_at',
-    ]))->toBeTrue();
+        'operation_drain_started_at',
+        'operation_drain_deadline_at',
+        'operation_drain_last_observed_connections',
+        'operation_drain_observed_at',
+        'supersession_generation',
+    ]))->toBeTrue()
+        ->and(Schema::hasColumn('application_blue_green_deactivations', 'supersession_generation'))->toBeTrue()
+        ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_supersession_generation'))->toBeTrue();
 });
 
 it('attests the complete schema through each migration public contract', function () {
@@ -188,7 +198,10 @@ it('attests the complete schema through each migration public contract', functio
     }
 
     expect(Schema::hasTable('application_blue_green_deactivations'))->toBeTrue()
-        ->and(Schema::hasColumn('application_blue_green_deactivations', 'proxy_snapshot'))->toBeTrue();
+        ->and(Schema::hasColumn('application_blue_green_deactivations', 'proxy_snapshot'))->toBeTrue()
+        ->and(Schema::hasColumn('application_blue_green_deployments', 'supersession_generation'))->toBeTrue()
+        ->and(Schema::hasColumn('application_blue_green_deactivations', 'supersession_generation'))->toBeTrue()
+        ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_supersession_generation'))->toBeTrue();
 });
 
 it('keeps all expand schema intact because every authorized migration is forward-only', function () {
@@ -202,8 +215,11 @@ it('keeps all expand schema intact because every authorized migration is forward
     $queueColumns = Schema::getColumnListing('application_deployment_queues');
 
     foreach ($migrationNames as $migrationName) {
+        $prefix = str_contains($migrationName, 'inactive_retention') || str_contains($migrationName, 'inactive_retirement')
+            ? 'Application blue-green'
+            : 'Control-plane';
         expect(fn () => blueGreenMigration($migrationName)->down())
-            ->toThrow(RuntimeException::class, "Control-plane expand migration is forward-only: {$migrationName}.");
+            ->toThrow(RuntimeException::class, "{$prefix} expand migration is forward-only: {$migrationName}.");
     }
 
     expect(Schema::getColumnListing('application_blue_green_deployments'))->toBe($deploymentColumns)
@@ -220,6 +236,63 @@ it('fails closed on a partial queue provenance schema', function () {
 
     expect(fn () => blueGreenMigration('2026_07_12_000002_add_blue_green_provenance_to_application_deployment_queues')->up())
         ->toThrow(RuntimeException::class, 'partial');
+});
+
+it('rejects an inactive retention setting with the wrong exact type', function () {
+    Schema::table('application_settings', function (Blueprint $table): void {
+        $table->string('blue_green_inactive_retention_seconds')->default('0');
+    });
+
+    expect(fn () => blueGreenMigration('2026_07_19_120000_add_blue_green_inactive_retention_setting')->up())
+        ->toThrow(RuntimeException::class, 'does not match the authorized');
+});
+
+it('fails closed on malformed postgres inactive retention defaults', function () {
+    if (Schema::getConnection()->getDriverName() !== 'pgsql') {
+        $this->markTestSkipped('PostgreSQL default expressions are not represented by SQLite.');
+    }
+
+    DB::statement('alter table application_settings alter column blue_green_inactive_retention_seconds set default 1');
+
+    expect(fn () => blueGreenMigration('2026_07_19_120000_add_blue_green_inactive_retention_setting')->assertExactSchema())
+        ->toThrow(RuntimeException::class, 'does not match the authorized PostgreSQL catalog');
+});
+
+it('fails closed on malformed postgres inactive retirement attempt defaults', function () {
+    if (Schema::getConnection()->getDriverName() !== 'pgsql') {
+        $this->markTestSkipped('PostgreSQL default expressions are not represented by SQLite.');
+    }
+
+    DB::statement('alter table application_blue_green_deployments alter column inactive_retirement_attempts set default 1');
+
+    expect(fn () => blueGreenMigration('2026_07_19_120001_add_blue_green_inactive_retirement_provenance')->assertExactSchema())
+        ->toThrow(RuntimeException::class, 'does not match the authorized PostgreSQL catalog');
+});
+
+it('rejects malformed inactive retirement column and index shapes', function () {
+    blueGreenMigration('2026_07_12_000001_create_application_blue_green_deployments_table')->up();
+    $migration = blueGreenMigration('2026_07_19_120001_add_blue_green_inactive_retirement_provenance');
+    $migration->up();
+
+    Schema::table('application_blue_green_deployments', function (Blueprint $table): void {
+        $table->string('inactive_retirement_attempts')->default('0')->change();
+    });
+    expect(fn () => $migration->assertExactSchema())
+        ->toThrow(RuntimeException::class, 'does not match');
+
+    Schema::drop('application_blue_green_deployments');
+    blueGreenMigration('2026_07_12_000001_create_application_blue_green_deployments_table')->up();
+    $migration->up();
+    Schema::table('application_blue_green_deployments', function (Blueprint $table): void {
+        $table->dropIndex('app_blue_green_inactive_retirement_due_index');
+        $table->index(
+            ['inactive_retirement_not_before_at'],
+            'app_blue_green_inactive_retirement_due_index',
+        );
+    });
+
+    expect(fn () => $migration->assertExactSchema())
+        ->toThrow(RuntimeException::class, 'does not match');
 });
 
 it('fails closed on a partial deactivation provenance schema', function () {
@@ -452,6 +525,21 @@ it('fails closed on malformed postgres destination-fencing queue columns', funct
 
     expect(fn () => blueGreenMigration('2026_07_19_025448_add_destination_fencing_to_blue_green_operations')->up())
         ->toThrow(RuntimeException::class, 'queue columns do not match the authorized PostgreSQL catalog');
+});
+
+it('fails closed on malformed postgres drain provenance columns', function () {
+    if (Schema::getConnection()->getDriverName() !== 'pgsql') {
+        $this->markTestSkipped('PostgreSQL drain provenance catalogs are not represented by SQLite.');
+    }
+
+    removeBlueGreenExpandSchema();
+    foreach (blueGreenMigrationNames() as $migrationName) {
+        blueGreenMigration($migrationName)->up();
+    }
+    DB::statement('alter table application_blue_green_deployments alter column operation_drain_last_observed_connections type smallint');
+
+    expect(fn () => blueGreenMigration('2026_07_19_030000_add_blue_green_drain_provenance')->up())
+        ->toThrow(RuntimeException::class, 'drain provenance columns do not match the authorized PostgreSQL catalog');
 });
 
 it('fails closed on malformed postgres supersession-generation columns', function () {

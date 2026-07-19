@@ -104,6 +104,41 @@ return new class extends Migration
                 'operation_previous_managed_file_sha256',
             ],
             ['supersession_generation'],
+            [
+                'operation_drain_started_at',
+                'operation_drain_deadline_at',
+                'operation_drain_last_observed_connections',
+                'operation_drain_observed_at',
+            ],
+            [
+                'operation_previous_proxy_state',
+                'operation_previous_proxy_state_sha256',
+                'operation_rollback_proxy_state',
+                'operation_rollback_proxy_state_sha256',
+            ],
+            [
+                'inactive_retirement_owner_deployment_uuid',
+                'inactive_retirement_color',
+                'inactive_retirement_deployment_uuid',
+                'inactive_retirement_container_id',
+                'inactive_retirement_container_routing_revision',
+                'inactive_retirement_owner_routing_revision',
+                'inactive_retirement_supersession_generation',
+                'inactive_retirement_destination_fence_epoch',
+                'inactive_retirement_server_boot_id',
+                'inactive_retirement_topology_digest',
+                'inactive_retirement_routing_config_digest',
+                'inactive_retirement_not_before_at',
+                'inactive_retirement_drain_deadline_at',
+                'inactive_retirement_stop_grace_seconds',
+                'inactive_retirement_lease_seconds',
+                'inactive_retirement_last_observed_connections',
+                'inactive_retirement_observed_at',
+                'inactive_retirement_attempts',
+                'inactive_retirement_stopped_at',
+                'inactive_retirement_intervention_required_at',
+                'inactive_retirement_dispatch_reserved_until_at',
+            ],
         ];
         $laterOwnedColumns = array_merge(...$laterOwnedColumnGroups);
         $columnNames = $columns->keys()->values()->all();
@@ -287,7 +322,36 @@ return new class extends Migration
                           'operation_topology_digest',
                           'operation_routing_config_digest',
                           'operation_previous_managed_file_sha256',
-                          'supersession_generation'
+                          'supersession_generation',
+                          'operation_drain_started_at',
+                          'operation_drain_deadline_at',
+                          'operation_drain_last_observed_connections',
+                          'operation_drain_observed_at',
+                          'operation_previous_proxy_state',
+                          'operation_previous_proxy_state_sha256',
+                          'operation_rollback_proxy_state',
+                          'operation_rollback_proxy_state_sha256',
+                          'inactive_retirement_owner_deployment_uuid',
+                          'inactive_retirement_color',
+                          'inactive_retirement_deployment_uuid',
+                          'inactive_retirement_container_id',
+                          'inactive_retirement_container_routing_revision',
+                          'inactive_retirement_owner_routing_revision',
+                          'inactive_retirement_supersession_generation',
+                          'inactive_retirement_destination_fence_epoch',
+                          'inactive_retirement_server_boot_id',
+                          'inactive_retirement_topology_digest',
+                          'inactive_retirement_routing_config_digest',
+                          'inactive_retirement_not_before_at',
+                          'inactive_retirement_drain_deadline_at',
+                          'inactive_retirement_stop_grace_seconds',
+                          'inactive_retirement_lease_seconds',
+                          'inactive_retirement_last_observed_connections',
+                          'inactive_retirement_observed_at',
+                          'inactive_retirement_attempts',
+                          'inactive_retirement_stopped_at',
+                          'inactive_retirement_intervention_required_at',
+                          'inactive_retirement_dispatch_reserved_until_at'
                       )
                 )
                 and (select count(*) from actual_all
@@ -309,6 +373,44 @@ return new class extends Migration
                     )) in (0, 12)
                 and (select count(*) from actual_all
                     where name = 'supersession_generation') in (0, 1)
+                and (select count(*) from actual_all
+                    where name in (
+                        'operation_drain_started_at',
+                        'operation_drain_deadline_at',
+                        'operation_drain_last_observed_connections',
+                        'operation_drain_observed_at'
+                    )) in (0, 4)
+                and (select count(*) from actual_all
+                    where name in (
+                        'operation_previous_proxy_state',
+                        'operation_previous_proxy_state_sha256',
+                        'operation_rollback_proxy_state',
+                        'operation_rollback_proxy_state_sha256'
+                    )) in (0, 4)
+                and (select count(*) from actual_all
+                    where name in (
+                        'inactive_retirement_owner_deployment_uuid',
+                        'inactive_retirement_color',
+                        'inactive_retirement_deployment_uuid',
+                        'inactive_retirement_container_id',
+                        'inactive_retirement_container_routing_revision',
+                        'inactive_retirement_owner_routing_revision',
+                        'inactive_retirement_supersession_generation',
+                        'inactive_retirement_destination_fence_epoch',
+                        'inactive_retirement_server_boot_id',
+                        'inactive_retirement_topology_digest',
+                        'inactive_retirement_routing_config_digest',
+                        'inactive_retirement_not_before_at',
+                        'inactive_retirement_drain_deadline_at',
+                        'inactive_retirement_stop_grace_seconds',
+                        'inactive_retirement_lease_seconds',
+                        'inactive_retirement_last_observed_connections',
+                        'inactive_retirement_observed_at',
+                        'inactive_retirement_attempts',
+                        'inactive_retirement_stopped_at',
+                        'inactive_retirement_intervention_required_at',
+                        'inactive_retirement_dispatch_reserved_until_at'
+                    )) in (0, 21)
                 and (select count(*) = 4
                     and count(*) filter (where conname = 'application_blue_green_deployments_pkey'
                         and contype = 'p' and conkey = array[1]::smallint[]
@@ -329,7 +431,7 @@ return new class extends Migration
                     from pg_constraint
                     where conrelid = 'application_blue_green_deployments'::regclass
                       and conname <> 'app_blue_green_deployments_generation_owner_check')
-                and (select count(*) = 3
+                and (select count(*) in (3, 4)
                     and bool_and(indisvalid and indisready and indislive
                         and indexprs is null and indpred is null
                         and indnatts = indnkeyatts and access_method = 'btree'
@@ -343,6 +445,8 @@ return new class extends Migration
                     and count(*) filter (where index_name = 'app_blue_green_standalone_docker_index'
                         and not indisprimary and not indisunique and indkey::text = '3'
                         and opclass_name = array['pg_catalog.int8_ops']::text[]) = 1
+                    and count(*) filter (where index_name = 'app_blue_green_inactive_retirement_due_index'
+                        and not indisprimary and not indisunique) in (0, 1)
                     from index_catalog)
             SQL, [], false);
 

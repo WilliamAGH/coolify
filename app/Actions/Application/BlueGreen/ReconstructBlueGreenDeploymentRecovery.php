@@ -54,6 +54,13 @@ final class ReconstructBlueGreenDeploymentRecovery
         );
         $candidateContainer = $this->candidateContainer($state, $claim);
 
+        $rollbackKey = $this->rollbackKey(
+            $state,
+            $application,
+            $claim,
+            $routingMutationRecorded,
+        );
+
         return new BlueGreenDeploymentRecoveryOperation(
             claim: $claim,
             application: $application,
@@ -63,10 +70,12 @@ final class ReconstructBlueGreenDeploymentRecovery
             previousContainer: $previousContainer,
             legacyRoutingSnapshot: $legacyRoutingSnapshot,
             candidateContainer: $candidateContainer,
-            rollbackKey: $this->rollbackKey(
+            rollbackKey: $rollbackKey,
+            currentDestinationState: $this->currentDestinationState(
                 $state,
                 $application,
                 $claim,
+                $rollbackKey,
                 $routingMutationRecorded,
             ),
             recoveredPhase: $state->phase,
@@ -192,7 +201,11 @@ final class ReconstructBlueGreenDeploymentRecovery
             || $state->supersession_generation !== $claim->supersessionGeneration
             || $state->deactivation_operation_id !== null
             || $state->deactivation_started_at !== null
-            || ! BlueGreenLifecycleDatabaseLocks::queueStatusOwnsPhase($deployment->status, $state->phase)
+            || ! BlueGreenLifecycleDatabaseLocks::queueStatusOwnsPhase(
+                $deployment->status,
+                $state->phase,
+                true,
+            )
             || $deployment->blue_green_color !== $claim->pendingColor
             || $deployment->blue_green_phase !== $state->phase
             || $deployment->blue_green_routing_revision !== $claim->expectedRoutingRevision
@@ -238,10 +251,12 @@ final class ReconstructBlueGreenDeploymentRecovery
             BlueGreenDeploymentPhase::IDLE,
             BlueGreenDeploymentPhase::PREPARING,
             BlueGreenDeploymentPhase::SWITCHING,
+            BlueGreenDeploymentPhase::DRAINING,
             BlueGreenDeploymentPhase::ROLLING_BACK,
         ], true)
             || ($phase === BlueGreenDeploymentPhase::IDLE && ! $wasFinalized)
             || (in_array($phase, [BlueGreenDeploymentPhase::PREPARING, BlueGreenDeploymentPhase::SWITCHING], true) && ! $isPending)
+            || ($phase === BlueGreenDeploymentPhase::DRAINING && ! $wasFinalized)
             || ($phase === BlueGreenDeploymentPhase::ROLLING_BACK && ! $isPending && ! $wasFinalized)) {
             throw new BlueGreenDeploymentTransitionException('The interrupted operation does not own its exact durable phase and state shape.');
         }
@@ -253,11 +268,23 @@ final class ReconstructBlueGreenDeploymentRecovery
     ): bool {
         $stateTimestamp = $state->operation_routing_mutated_at;
         $queueTimestamp = $deployment->blue_green_routing_mutated_at;
+        $durableDestinationMutation = is_string($state->operation_deployment_uuid)
+            && is_int($state->operation_destination_fence_epoch)
+            && $state->destination_fence_operation_id === $state->operation_deployment_uuid
+            && $state->destination_fence_epoch >= $state->operation_destination_fence_epoch
+            && $state->destination_fence_mutation_sequence > 0
+            && is_string($state->managed_file_sha256)
+            && $state->destination_topology_digest === $state->operation_topology_digest
+            && $state->application_routing_config_digest === $state->operation_routing_config_digest;
         if ($stateTimestamp === null && $queueTimestamp === null) {
-            return false;
+            return $durableDestinationMutation;
         }
         if ($stateTimestamp === null || $queueTimestamp === null || ! $stateTimestamp->equalTo($queueTimestamp)) {
-            throw new BlueGreenDeploymentTransitionException('The routing-mutation timestamp disagrees between state and queue provenance.');
+            if ($durableDestinationMutation) {
+                return true;
+            }
+
+            throw new BlueGreenDeploymentTransitionException('The routing-mutation timestamp disagrees without exact durable destination provenance.');
         }
 
         return true;
@@ -401,8 +428,26 @@ final class ReconstructBlueGreenDeploymentRecovery
         BlueGreenDeploymentClaim $claim,
         bool $routingMutationRecorded,
     ): BlueGreenProxyRollbackKey {
+        if ($state->operation_rollback_proxy_state !== null
+            || $state->operation_rollback_proxy_state_sha256 !== null) {
+            return $this->persistedRollbackKey($state, $claim);
+        }
         if ($state->operation_previous_managed_file_sha256 !== null) {
-            throw new BlueGreenDeploymentTransitionException('The durable operation does not retain the exact predecessor fence identity required for safe recovery.');
+            $previousState = $this->persistedPreviousProxyState($state, $claim)
+                ?? throw new BlueGreenDeploymentTransitionException('The durable fixed-color operation has no exact predecessor proxy state.');
+            if ($routingMutationRecorded) {
+                throw new BlueGreenDeploymentTransitionException('The routed fixed-color operation has no persisted rollback replacement state.');
+            }
+
+            return new BlueGreenProxyRollbackKey(
+                operationId: $claim->deploymentUuid,
+                expectedState: $previousState,
+                replacementState: $previousState->withDestinationFenceEpoch(
+                    $previousState->destinationFenceEpoch + 1,
+                    $claim->deploymentUuid,
+                    $previousState->mutationSequence + 1,
+                ),
+            );
         }
         if (! is_int($state->operation_previous_destination_fence_epoch)
             || $state->operation_previous_destination_fence_epoch !== 0) {
@@ -418,6 +463,98 @@ final class ReconstructBlueGreenDeploymentRecovery
             expectedState: null,
             replacementState: $replacementState,
         );
+    }
+
+    private function persistedRollbackKey(
+        ApplicationBlueGreenDeployment $state,
+        BlueGreenDeploymentClaim $claim,
+    ): BlueGreenProxyRollbackKey {
+        $replacementBytes = $state->operation_rollback_proxy_state;
+        $replacementSha256 = $state->operation_rollback_proxy_state_sha256;
+        if (! is_string($replacementBytes)
+            || ! is_string($replacementSha256)
+            || ! hash_equals($replacementSha256, hash('sha256', $replacementBytes))) {
+            throw new BlueGreenDeploymentTransitionException('The persisted rollback replacement state is incomplete or corrupt.');
+        }
+        $replacementState = BlueGreenProxyState::parse($replacementBytes);
+
+        $previousState = $this->persistedPreviousProxyState($state, $claim);
+        if ($replacementState->operationId !== $claim->deploymentUuid
+            || $replacementState->managedFilename !== $claim->rollbackManagedFilename
+            || $replacementState->destinationId !== $claim->standaloneDockerId
+            || $replacementState->destinationFenceEpoch !== $claim->destinationFenceEpoch
+            || $replacementState->destinationTopologyDigest !== $claim->topologyDigest
+            || $replacementState->applicationRoutingConfigDigest !== $claim->routingConfigDigest
+            || $previousState?->managedSha256 !== $state->operation_previous_managed_file_sha256
+            || ($previousState?->destinationFenceEpoch ?? 0) !== $state->operation_previous_destination_fence_epoch) {
+            throw new BlueGreenDeploymentTransitionException('The persisted rollback key does not match the exact interrupted claim.');
+        }
+
+        return new BlueGreenProxyRollbackKey(
+            operationId: $claim->deploymentUuid,
+            expectedState: $previousState,
+            replacementState: $replacementState,
+        );
+    }
+
+    private function persistedPreviousProxyState(
+        ApplicationBlueGreenDeployment $state,
+        BlueGreenDeploymentClaim $claim,
+    ): ?BlueGreenProxyState {
+        $previousBytes = $state->operation_previous_proxy_state;
+        $previousSha256 = $state->operation_previous_proxy_state_sha256;
+        if (($previousBytes === null) !== ($previousSha256 === null)) {
+            throw new BlueGreenDeploymentTransitionException('The persisted rollback predecessor state is partial.');
+        }
+        if ($previousBytes === null || $previousSha256 === null) {
+            return null;
+        }
+        if (! is_string($previousBytes)
+            || ! is_string($previousSha256)
+            || ! hash_equals($previousSha256, hash('sha256', $previousBytes))) {
+            throw new BlueGreenDeploymentTransitionException('The persisted rollback predecessor state checksum is invalid.');
+        }
+        $previousState = BlueGreenProxyState::parse($previousBytes);
+        if ($previousState->managedFilename !== $claim->rollbackManagedFilename
+            || $previousState->destinationId !== $claim->standaloneDockerId
+            || $previousState->managedSha256 !== $state->operation_previous_managed_file_sha256
+            || $previousState->destinationFenceEpoch !== $state->operation_previous_destination_fence_epoch) {
+            throw new BlueGreenDeploymentTransitionException('The persisted predecessor proxy state does not match the exact claim.');
+        }
+
+        return $previousState;
+    }
+
+    private function currentDestinationState(
+        ApplicationBlueGreenDeployment $state,
+        Application $application,
+        BlueGreenDeploymentClaim $claim,
+        BlueGreenProxyRollbackKey $rollbackKey,
+        bool $routingMutationRecorded,
+    ): ?BlueGreenProxyState {
+        if (! $routingMutationRecorded) {
+            return $rollbackKey->expectedState;
+        }
+        if ($state->phase === BlueGreenDeploymentPhase::ROLLING_BACK
+            && $state->destination_fence_operation_id === $claim->deploymentUuid
+            && $state->destination_fence_epoch > $claim->destinationFenceEpoch
+            && $state->destination_fence_mutation_sequence > $rollbackKey->replacementState->mutationSequence
+            && $state->managed_file_sha256 === $rollbackKey->expectedState?->managedSha256) {
+            $mutationSequence = $state->destination_fence_mutation_sequence;
+            $destinationFenceEpoch = $state->destination_fence_epoch;
+
+            return $rollbackKey->expectedState?->withDestinationFenceEpoch(
+                $destinationFenceEpoch,
+                $claim->deploymentUuid,
+                $mutationSequence,
+            ) ?? $rollbackKey->replacementState->withoutManagedRoute(
+                $destinationFenceEpoch,
+                $claim->deploymentUuid,
+                $mutationSequence,
+            );
+        }
+
+        return $this->recordedReplacementState($state, $application, $claim);
     }
 
     private function recordedReplacementState(

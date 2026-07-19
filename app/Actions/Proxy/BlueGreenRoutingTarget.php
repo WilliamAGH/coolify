@@ -9,6 +9,8 @@ final readonly class BlueGreenRoutingTarget
 {
     public const PROBE_ACKNOWLEDGEMENT_HEADER = 'X-Coolify-Probe-Ack';
 
+    public const RELEASE_PROOF_HEADER = 'X-Coolify-Deployment';
+
     public static function managedFilename(string $applicationUuid, int $destinationId): string
     {
         return 'coolify-blue-green-'.self::routingScope($applicationUuid, $destinationId).'.yaml';
@@ -59,8 +61,19 @@ final readonly class BlueGreenRoutingTarget
         public ?string $probeHeaderName = null,
         public ?string $probeToken = null,
         public ?BlueGreenDeploymentColor $probeColor = null,
+        public ?string $releaseProofToken = null,
         public ?string $publicProofToken = null,
         public ?string $legacyContainerName = null,
+        public ?string $fallbackContainerName = null,
+        public string $healthCheckType = 'http',
+        public string $healthCheckPath = '/',
+        public int $healthCheckIntervalSeconds = 5,
+        public int $healthCheckTimeoutSeconds = 5,
+        public string $healthCheckScheme = 'http',
+        public string $healthCheckHostname = 'localhost',
+        public string $healthCheckMethod = 'GET',
+        public int $healthCheckStatus = 200,
+        public ?int $healthCheckPort = null,
         public ?int $destinationFenceEpoch = null,
         public ?string $operationId = null,
         public ?int $mutationSequence = null,
@@ -96,11 +109,31 @@ final readonly class BlueGreenRoutingTarget
         if ($probeToken !== null) {
             $this->assertOpaqueToken($probeToken, 'probe');
         }
+        if ($releaseProofToken !== null) {
+            $this->assertOpaqueToken($releaseProofToken, 'release proof');
+        }
         if ($publicProofToken !== null) {
             $this->assertOpaqueToken($publicProofToken, 'public proof');
         }
         if ($probeToken !== null && $publicProofToken !== null && hash_equals($probeToken, $publicProofToken)) {
             throw new InvalidArgumentException('Probe and public proof tokens must be distinct.');
+        }
+        if ($releaseProofToken !== null
+            && $mode === BlueGreenRoutingMode::ProbeOnly
+            && $probeToken === null) {
+            throw new InvalidArgumentException('A probe-only release-proof token requires a candidate probe route.');
+        }
+        if ($fallbackContainerName !== null) {
+            $this->assertContainerName($fallbackContainerName);
+        }
+        if ($mode === BlueGreenRoutingMode::Failover && $fallbackContainerName === null) {
+            throw new InvalidArgumentException('A blue-green failover route requires the exact previous container name.');
+        }
+        if ($mode !== BlueGreenRoutingMode::ProbeOnly && $fallbackContainerName !== null) {
+            $this->assertHttpFailoverHealthCheck();
+        }
+        if ($mode === BlueGreenRoutingMode::ProbeOnly && $publicProofToken !== null) {
+            throw new InvalidArgumentException('A probe-only route cannot publish a public proof token.');
         }
         if ($mode === BlueGreenRoutingMode::LegacyRecoveryBridge) {
             if ($legacyContainerName === null) {
@@ -163,11 +196,32 @@ final readonly class BlueGreenRoutingTarget
 
     public function publicAcknowledgement(): ?string
     {
-        if ($this->publicProofToken === null) {
+        if ($this->mode === BlueGreenRoutingMode::ProbeOnly || $this->publicProofToken === null) {
             return null;
         }
 
         return $this->acknowledgement('public', $this->publicProofToken, $this->activeColor);
+    }
+
+    /**
+     * @return array{path: string, interval: string, timeout: string, scheme: string, hostname: string, method: string, status: int, port?: int}
+     */
+    public function failoverHealthCheck(): array
+    {
+        $healthCheck = [
+            'path' => $this->healthCheckPath,
+            'interval' => $this->healthCheckIntervalSeconds.'s',
+            'timeout' => $this->healthCheckTimeoutSeconds.'s',
+            'scheme' => $this->healthCheckScheme,
+            'hostname' => $this->healthCheckHostname,
+            'method' => $this->healthCheckMethod,
+            'status' => $this->healthCheckStatus,
+        ];
+        if ($this->healthCheckPort !== null) {
+            $healthCheck['port'] = $this->healthCheckPort;
+        }
+
+        return $healthCheck;
     }
 
     public static function durablePublicProofToken(string $operationId): string
@@ -177,6 +231,24 @@ final readonly class BlueGreenRoutingTarget
         }
 
         return 'public:'.hash('sha256', "coolify-blue-green-public-proof-v1\0{$operationId}");
+    }
+
+    public static function durableReleaseProofToken(string $operationId): string
+    {
+        if (preg_match('/^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/D', $operationId) !== 1) {
+            throw new InvalidArgumentException('The durable release proof operation ID is invalid.');
+        }
+
+        return 'release:'.hash('sha256', "coolify-blue-green-release-proof-v1\0{$operationId}");
+    }
+
+    public static function durableProbeToken(string $operationId): string
+    {
+        if (preg_match('/^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/D', $operationId) !== 1) {
+            throw new InvalidArgumentException('The durable probe operation ID is invalid.');
+        }
+
+        return 'probe:'.hash('sha256', "coolify-blue-green-probe-v1\0{$operationId}");
     }
 
     public function fencedState(
@@ -228,6 +300,34 @@ final readonly class BlueGreenRoutingTarget
         }
     }
 
+    private function assertHttpFailoverHealthCheck(): void
+    {
+        if ($this->healthCheckType !== 'http') {
+            throw new InvalidArgumentException('Blue-green failover supports only the application HTTP health-check contract.');
+        }
+        if (preg_match('#^/[A-Za-z0-9/_.~%:;,@+\-]*$#D', $this->healthCheckPath) !== 1) {
+            throw new InvalidArgumentException('The failover health-check path is invalid.');
+        }
+        if ($this->healthCheckIntervalSeconds < 1 || $this->healthCheckTimeoutSeconds < 1) {
+            throw new InvalidArgumentException('The failover health-check interval and timeout must be positive.');
+        }
+        if (! in_array($this->healthCheckScheme, ['http', 'https'], true)) {
+            throw new InvalidArgumentException('The failover health-check scheme is invalid.');
+        }
+        if (preg_match('/^[A-Za-z0-9._-]+$/D', $this->healthCheckHostname) !== 1) {
+            throw new InvalidArgumentException('The failover health-check hostname is invalid.');
+        }
+        if (! in_array($this->healthCheckMethod, ['GET', 'HEAD', 'POST', 'OPTIONS'], true)) {
+            throw new InvalidArgumentException('The failover health-check method is invalid.');
+        }
+        if ($this->healthCheckStatus < 100 || $this->healthCheckStatus > 599) {
+            throw new InvalidArgumentException('The failover health-check status must be a valid HTTP status code.');
+        }
+        if ($this->healthCheckPort !== null && ($this->healthCheckPort < 1 || $this->healthCheckPort > 65535)) {
+            throw new InvalidArgumentException('The failover health-check port must be between 1 and 65535.');
+        }
+    }
+
     private static function routingScope(string $applicationUuid, int $destinationId): string
     {
         if (preg_match('/^[A-Za-z0-9][A-Za-z0-9_-]*$/D', $applicationUuid) !== 1) {
@@ -259,6 +359,9 @@ final readonly class BlueGreenRoutingTarget
         ];
         if ($this->legacyContainerName !== null) {
             $identity[] = $this->legacyContainerName;
+        }
+        if ($this->fallbackContainerName !== null) {
+            $identity[] = $this->fallbackContainerName;
         }
 
         return hash_hmac('sha256', implode("\0", $identity), $token);

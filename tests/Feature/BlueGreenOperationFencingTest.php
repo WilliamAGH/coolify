@@ -155,16 +155,6 @@ it('enters rollback after cancellation and preserves the terminal cancellation s
     ]);
 
     $state = TransitionsBlueGreenDeployment::beginRollback($claim);
-    ApplicationBlueGreenDeployment::query()
-        ->whereKey($state->id)
-        ->update([
-            'destination_fence_epoch' => $claim->destinationFenceEpoch,
-            'destination_fence_operation_id' => $claim->deploymentUuid,
-            'destination_fence_mutation_sequence' => 1,
-            'destination_topology_digest' => $claim->topologyDigest,
-            'application_routing_config_digest' => $claim->routingConfigDigest,
-        ]);
-
     $state = TransitionsBlueGreenDeployment::finishRollback($claim);
 
     expect($state->phase)->toBe(BlueGreenDeploymentPhase::IDLE)

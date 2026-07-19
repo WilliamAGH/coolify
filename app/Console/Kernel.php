@@ -60,11 +60,23 @@ class Kernel extends ConsoleKernel
             ->onOneServer()
             ->withoutOverlapping(16)
             ->runInBackground();
-        $this->scheduleInstance->command('blue-green:reconcile-idle-routes --limit=1')
-            ->name('blue-green:reconcile-idle-routes')
+        $this->scheduleInstance->command('blue-green:reconcile --stale-after=300 --limit=1')
+            ->name('blue-green:reconcile')
             ->everyMinute()
             ->onOneServer()
-            ->withoutOverlapping(6)
+            ->withoutOverlapping(16)
+            ->runInBackground();
+        $this->scheduleInstance->command('blue-green:retire-inactive --limit=10')
+            ->name('blue-green:retire-inactive')
+            ->everyMinute()
+            ->onOneServer()
+            ->withoutOverlapping(16)
+            ->runInBackground();
+        $this->scheduleInstance->command('blue-green:repair-steady --limit=1')
+            ->name('blue-green:repair-steady')
+            ->everyFiveMinutes()
+            ->onOneServer()
+            ->withoutOverlapping(16)
             ->runInBackground();
 
         if (isDev()) {

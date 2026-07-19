@@ -58,6 +58,7 @@ class CompileBlueGreenProxyConfiguration
         $publicServiceName = $target->mode === BlueGreenRoutingMode::LegacyRecoveryBridge
             ? $namePrefix.'legacy-recovery-bridge'
             : $activeServiceName;
+        $shouldEmitPublicRoutes = $target->mode !== BlueGreenRoutingMode::ProbeOnly;
         $middlewareNames = [];
         $middlewares = [];
 
@@ -67,13 +68,15 @@ class CompileBlueGreenProxyConfiguration
             $middlewares[$compiledName] = $this->compileMiddleware($middlewareName, $properties);
         }
         $publicAcknowledgementMiddlewareName = $namePrefix.'public-applied-proof';
-        $middlewares[$publicAcknowledgementMiddlewareName] = [
-            'headers' => [
-                'customResponseHeaders' => [
-                    BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER => $target->publicAcknowledgement() ?? '',
+        if ($shouldEmitPublicRoutes && $target->publicAcknowledgement() !== null) {
+            $middlewares[$publicAcknowledgementMiddlewareName] = [
+                'headers' => [
+                    'customResponseHeaders' => [
+                        BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER => $target->publicAcknowledgement() ?? '',
+                    ],
                 ],
-            ],
-        ];
+            ];
+        }
 
         $routers = [];
         foreach ($parsed['routers'] as $routerName => $properties) {
@@ -115,11 +118,15 @@ class CompileBlueGreenProxyConfiguration
                     ],
                 ];
             }
-            $router['middlewares'] = array_values(array_merge(
-                [$publicAcknowledgementMiddlewareName],
-                $router['middlewares'] ?? [],
-            ));
-            $routers[$publicRouterName] = $router;
+            if ($shouldEmitPublicRoutes) {
+                if ($target->publicAcknowledgement() !== null) {
+                    $router['middlewares'] = array_values(array_merge(
+                        [$publicAcknowledgementMiddlewareName],
+                        $router['middlewares'] ?? [],
+                    ));
+                }
+                $routers[$publicRouterName] = $router;
+            }
         }
 
         $referencedServices = [];
@@ -147,8 +154,9 @@ class CompileBlueGreenProxyConfiguration
 
         ksort($routers);
         ksort($middlewares);
-        $services = [
-            $activeServiceName => [
+        $services = [];
+        if ($target->mode !== BlueGreenRoutingMode::ProbeOnly) {
+            $services[$activeServiceName] = [
                 'weighted' => [
                     'services' => [[
                         'name' => BlueGreenRoutingTarget::memberServiceReference(
@@ -159,8 +167,30 @@ class CompileBlueGreenProxyConfiguration
                         'weight' => 1,
                     ]],
                 ],
-            ],
-        ];
+            ];
+        }
+        if ($target->mode !== BlueGreenRoutingMode::ProbeOnly && $target->fallbackContainerName !== null) {
+            $candidateServiceName = $namePrefix.'candidate-main';
+            $fallbackServiceName = $namePrefix.'previous-fallback';
+            $services[$candidateServiceName] = $this->service(
+                $target->containerName($target->activeColor),
+                $target->port,
+                $target->failoverHealthCheck(),
+            );
+            $services[$fallbackServiceName] = $this->service(
+                $target->fallbackContainerName
+                    ?? throw new InvalidArgumentException('A failover route has no exact previous backend identity.'),
+                $target->port,
+                $target->failoverHealthCheck(),
+            );
+            $services[$activeServiceName] = [
+                'failover' => [
+                    'service' => $candidateServiceName,
+                    'fallback' => $fallbackServiceName,
+                    'healthCheck' => [],
+                ],
+            ];
+        }
         if ($target->mode === BlueGreenRoutingMode::LegacyRecoveryBridge) {
             $services[$publicServiceName] = $this->service(
                 $target->legacyContainerName
@@ -414,16 +444,27 @@ class CompileBlueGreenProxyConfiguration
             || preg_match('/^caddy_\d+\.basicauth\.[^=]+$/D', $key) === 1;
     }
 
-    /** @return array{loadBalancer: array{servers: list<array{url: string}>}} */
-    private function service(string $containerName, int $port): array
-    {
-        return [
+    /**
+     * @param  array{path: string, interval: string, timeout: string, scheme: string, hostname: string, method: string, status: int, port?: int}|null  $healthCheck
+     * @return array{loadBalancer: array{servers: list<array{url: string}>, healthCheck?: array<string, int|string>}}
+     */
+    private function service(
+        string $containerName,
+        int $port,
+        ?array $healthCheck = null,
+    ): array {
+        $service = [
             'loadBalancer' => [
                 'servers' => [
                     ['url' => "http://{$containerName}:{$port}"],
                 ],
             ],
         ];
+        if ($healthCheck !== null) {
+            $service['loadBalancer']['healthCheck'] = $healthCheck;
+        }
+
+        return $service;
     }
 
     private function metadataHeader(
