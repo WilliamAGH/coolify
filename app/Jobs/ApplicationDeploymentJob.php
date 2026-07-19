@@ -5124,7 +5124,9 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
     private function completeDeployment(): void
     {
         if ($this->blueGreenLifecycle?->isEnabled()) {
-            $this->blueGreenLifecycle->retirePreviousContainer();
+            if (! $this->blueGreenLifecycle->shouldDeferPreviousContainerRetirement()) {
+                $this->blueGreenLifecycle->retirePreviousContainer();
+            }
             $this->blueGreenLifecycle->complete();
             $this->transitionToStatus(ApplicationDeploymentStatus::FINISHED);
 

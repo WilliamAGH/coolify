@@ -167,6 +167,7 @@ class ClaimBlueGreenDeployment
 
             $stateUpdated = $this->exactStateQuery($state, $lockedDeployment)
                 ->update([
+                    ...ApplicationBlueGreenDeployment::clearedInactiveRetirementAttributes(),
                     'pending_color' => $pendingColor->value,
                     'pending_deployment_uuid' => $lockedDeployment->deployment_uuid,
                     'legacy_container_name' => $legacyContainerName,

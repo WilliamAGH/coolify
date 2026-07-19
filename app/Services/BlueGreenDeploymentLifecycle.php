@@ -49,6 +49,7 @@ use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Exceptions\DeploymentException;
+use App\Jobs\RetireBlueGreenInactiveContainerJob;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
@@ -115,6 +116,8 @@ final class BlueGreenDeploymentLifecycle
 
     private bool $rollbackCompleted = false;
 
+    private readonly int $inactiveRetentionSeconds;
+
     /** @param Closure(): void $checkForCancellation */
     public function __construct(
         private readonly Application $application,
@@ -123,7 +126,9 @@ final class BlueGreenDeploymentLifecycle
         private readonly Server $server,
         private readonly int $timeout,
         private readonly Closure $checkForCancellation,
-    ) {}
+    ) {
+        $this->inactiveRetentionSeconds = $this->application->settings->blueGreenInactiveRetentionSeconds();
+    }
 
     public function initialize(): void
     {
@@ -320,10 +325,44 @@ final class BlueGreenDeploymentLifecycle
         $this->assertOperationOwned(BlueGreenDeploymentPhase::DRAINING);
         $this->retireStoppedLegacyContainer();
         $this->assertOperationOwned(BlueGreenDeploymentPhase::DRAINING);
-        CompleteBlueGreenDeploymentOperation::run($claim);
+        $state = CompleteBlueGreenDeploymentOperation::run($claim, $this->inactiveRetentionSeconds);
         $this->application->update(['status' => 'running:healthy']);
         $this->promotionCommitted = true;
         $this->deployment->refresh();
+        $this->dispatchInactiveRetirement($state, $claim);
+    }
+
+    public function shouldDeferPreviousContainerRetirement(): bool
+    {
+        return $this->previousContainerExpectation?->blueGreenManaged === true
+            && $this->inactiveRetentionSeconds > 0;
+    }
+
+    private function dispatchInactiveRetirement(
+        ApplicationBlueGreenDeployment $state,
+        BlueGreenDeploymentClaim $claim,
+    ): void {
+        if ($state->inactive_retirement_owner_deployment_uuid !== $claim->deploymentUuid) {
+            return;
+        }
+        if ($state->inactive_retirement_stopped_at !== null) {
+            $this->deployment->addLogEntry(
+                "Inactive {$state->inactive_retirement_color->value} container {$state->inactive_retirement_container_id} was stopped and retained for fast rollback.",
+            );
+
+            return;
+        }
+        RetireBlueGreenInactiveContainerJob::dispatch(
+            $state->id,
+            $claim->deploymentUuid,
+            $claim->supersessionGeneration,
+            BlueGreenDeploymentLock::inactiveRetirementJobTimeoutSeconds(
+                $state->inactive_retirement_lease_seconds,
+            ),
+        )->delay($state->inactive_retirement_not_before_at);
+        $this->deployment->addLogEntry(
+            "Inactive {$state->inactive_retirement_color->value} container {$state->inactive_retirement_container_id} remains running until {$state->inactive_retirement_not_before_at->toIso8601String()} for fast rollback; embedded workers, schedulers, and cron processes remain active until retirement.",
+        );
     }
 
     public function retirePreviousContainer(): void

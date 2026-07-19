@@ -33,4 +33,29 @@ final class BlueGreenDeploymentLock
             $stopGraceSeconds + 60,
         );
     }
+
+    public static function inactiveRetirementLeaseSeconds(
+        int $boundedRemoteTimeout,
+        int $stopGraceSeconds,
+    ): int {
+        if ($boundedRemoteTimeout < 1
+            || $stopGraceSeconds < 1
+            || $stopGraceSeconds > intdiv(PHP_INT_MAX - $boundedRemoteTimeout - 60, 2)) {
+            throw new \InvalidArgumentException('The inactive retirement timeout inputs are outside their safe integer bounds.');
+        }
+
+        return max(
+            self::RENEWABLE_LEASE_SECONDS,
+            $boundedRemoteTimeout + ($stopGraceSeconds * 2) + 60,
+        );
+    }
+
+    public static function inactiveRetirementJobTimeoutSeconds(int $leaseSeconds): int
+    {
+        if ($leaseSeconds < 1 || $leaseSeconds > PHP_INT_MAX - 60) {
+            throw new \InvalidArgumentException('The inactive retirement lease is outside its safe integer bounds.');
+        }
+
+        return $leaseSeconds + 60;
+    }
 }

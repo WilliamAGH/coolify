@@ -101,6 +101,21 @@
                 />
                 <x-forms.button canGate="update" :canResource="$application" type="submit">Save</x-forms.button>
             </form>
+            @if ($application->settings->is_blue_green_deployment_enabled)
+                <form class="flex items-end gap-2" wire:submit.prevent='saveBlueGreenInactiveRetention'>
+                    <x-forms.input
+                        type="number"
+                        id="blueGreenInactiveRetentionSeconds"
+                        label="Blue-Green Inactive Retention (seconds)"
+                        helper="How long the unrouted previous color remains running for fast rollback before it is drained and stopped. Use 0 for immediate safe retirement. While retained, embedded queue workers, schedulers, and cron processes continue running against external services. Range: {{ MIN_BLUE_GREEN_INACTIVE_RETENTION_SECONDS }}-{{ MAX_BLUE_GREEN_INACTIVE_RETENTION_SECONDS }} seconds."
+                        min="{{ MIN_BLUE_GREEN_INACTIVE_RETENTION_SECONDS }}"
+                        max="{{ MAX_BLUE_GREEN_INACTIVE_RETENTION_SECONDS }}"
+                        canGate="update"
+                        :canResource="$application"
+                    />
+                    <x-forms.button canGate="update" :canResource="$application" type="submit">Save</x-forms.button>
+                </form>
+            @endif
             <form class="flex items-end gap-2" wire:submit.prevent='saveMaxRestartCount'>
                 <x-forms.input
                     type="number"

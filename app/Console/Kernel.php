@@ -66,6 +66,12 @@ class Kernel extends ConsoleKernel
             ->onOneServer()
             ->withoutOverlapping(16)
             ->runInBackground();
+        $this->scheduleInstance->command('blue-green:retire-inactive --limit=10')
+            ->name('blue-green:retire-inactive')
+            ->everyMinute()
+            ->onOneServer()
+            ->withoutOverlapping(16)
+            ->runInBackground();
         $this->scheduleInstance->command('blue-green:repair-steady --limit=1')
             ->name('blue-green:repair-steady')
             ->everyFiveMinutes()

@@ -215,8 +215,11 @@ it('keeps all expand schema intact because every authorized migration is forward
     $queueColumns = Schema::getColumnListing('application_deployment_queues');
 
     foreach ($migrationNames as $migrationName) {
+        $prefix = str_contains($migrationName, 'inactive_retention') || str_contains($migrationName, 'inactive_retirement')
+            ? 'Application blue-green'
+            : 'Control-plane';
         expect(fn () => blueGreenMigration($migrationName)->down())
-            ->toThrow(RuntimeException::class, "Control-plane expand migration is forward-only: {$migrationName}.");
+            ->toThrow(RuntimeException::class, "{$prefix} expand migration is forward-only: {$migrationName}.");
     }
 
     expect(Schema::getColumnListing('application_blue_green_deployments'))->toBe($deploymentColumns)
@@ -233,6 +236,41 @@ it('fails closed on a partial queue provenance schema', function () {
 
     expect(fn () => blueGreenMigration('2026_07_12_000002_add_blue_green_provenance_to_application_deployment_queues')->up())
         ->toThrow(RuntimeException::class, 'partial');
+});
+
+it('rejects an inactive retention setting with the wrong exact type', function () {
+    Schema::table('application_settings', function (Blueprint $table): void {
+        $table->string('blue_green_inactive_retention_seconds')->default('0');
+    });
+
+    expect(fn () => blueGreenMigration('2026_07_19_120000_add_blue_green_inactive_retention_setting')->up())
+        ->toThrow(RuntimeException::class, 'does not match the authorized');
+});
+
+it('rejects malformed inactive retirement column and index shapes', function () {
+    blueGreenMigration('2026_07_12_000001_create_application_blue_green_deployments_table')->up();
+    $migration = blueGreenMigration('2026_07_19_120001_add_blue_green_inactive_retirement_provenance');
+    $migration->up();
+
+    Schema::table('application_blue_green_deployments', function (Blueprint $table): void {
+        $table->string('inactive_retirement_attempts')->default('0')->change();
+    });
+    expect(fn () => $migration->assertExactSchema())
+        ->toThrow(RuntimeException::class, 'does not match');
+
+    Schema::drop('application_blue_green_deployments');
+    blueGreenMigration('2026_07_12_000001_create_application_blue_green_deployments_table')->up();
+    $migration->up();
+    Schema::table('application_blue_green_deployments', function (Blueprint $table): void {
+        $table->dropIndex('app_blue_green_inactive_retirement_due_index');
+        $table->index(
+            ['inactive_retirement_not_before_at'],
+            'app_blue_green_inactive_retirement_due_index',
+        );
+    });
+
+    expect(fn () => $migration->assertExactSchema())
+        ->toThrow(RuntimeException::class, 'does not match');
 });
 
 it('fails closed on a partial deactivation provenance schema', function () {

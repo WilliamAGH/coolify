@@ -17,6 +17,7 @@ final class CompleteBlueGreenDeploymentOperation
 
     public function handle(
         BlueGreenDeploymentClaim|BlueGreenDeploymentRecoveryOperation $completion,
+        ?int $inactiveRetentionSeconds = null,
     ): ApplicationBlueGreenDeployment {
         $operation = $completion instanceof BlueGreenDeploymentRecoveryOperation ? $completion : null;
         $claim = $operation?->claim ?? $completion;
@@ -25,7 +26,7 @@ final class CompleteBlueGreenDeploymentOperation
         }
         (new ComputeBlueGreenDeploymentFingerprint)->assertMatchesClaim($claim);
 
-        return DB::transaction(function () use ($claim, $operation): ApplicationBlueGreenDeployment {
+        return DB::transaction(function () use ($claim, $operation, $inactiveRetentionSeconds): ApplicationBlueGreenDeployment {
             $locks = BlueGreenLifecycleDatabaseLocks::forDestination(
                 $claim->applicationId,
                 $claim->standaloneDockerId,
@@ -34,12 +35,12 @@ final class CompleteBlueGreenDeploymentOperation
             $state = $locks->state;
             $deployment = $locks->queue($claim->deploymentUuid);
             $application = $locks->application;
-            $destination = StandaloneDocker::query()->find($claim->standaloneDockerId);
+            $destination = StandaloneDocker::query()->with('server.settings')->find($claim->standaloneDockerId);
             if ($state === null
                 || $state->id !== $claim->stateId
                 || $deployment === null
                 || $application->trashed()
-                || $destination === null) {
+                || $destination?->server === null) {
                 throw new BlueGreenDeploymentTransitionException('The finalized blue-green operation no longer exists.');
             }
 
@@ -123,6 +124,52 @@ final class CompleteBlueGreenDeploymentOperation
                 throw new BlueGreenDeploymentTransitionException('The finalized operation changed before durable cleanup completed.');
             }
 
+            $inactiveRetirement = ApplicationBlueGreenDeployment::clearedInactiveRetirementAttributes();
+            if ($claim->previousActiveColor !== null
+                && $state->operation_previous_deployment_uuid !== null
+                && $state->operation_previous_container_id !== null
+                && $state->operation_previous_routing_revision !== null) {
+                $retentionSeconds = $inactiveRetentionSeconds ?? $application->settings->blueGreenInactiveRetentionSeconds();
+                if ($retentionSeconds < MIN_BLUE_GREEN_INACTIVE_RETENTION_SECONDS
+                    || $retentionSeconds > MAX_BLUE_GREEN_INACTIVE_RETENTION_SECONDS) {
+                    throw new BlueGreenDeploymentTransitionException('The frozen inactive retention is outside its bounded interval.');
+                }
+                $stopGraceSeconds = $application->settings->deploymentStopGracePeriodSeconds();
+                $boundedRemoteTimeout = max(
+                    (int) config('constants.ssh.command_timeout'),
+                    (int) $destination->server?->settings->dynamic_timeout,
+                );
+                $retirementLeaseSeconds = BlueGreenDeploymentLock::inactiveRetirementLeaseSeconds(
+                    $boundedRemoteTimeout,
+                    $stopGraceSeconds,
+                );
+                $notBeforeAt = now()->addSeconds($retentionSeconds);
+                $inactiveRetirement = [
+                    'inactive_retirement_owner_deployment_uuid' => $claim->deploymentUuid,
+                    'inactive_retirement_color' => $claim->previousActiveColor->value,
+                    'inactive_retirement_deployment_uuid' => $state->operation_previous_deployment_uuid,
+                    'inactive_retirement_container_id' => $state->operation_previous_container_id,
+                    'inactive_retirement_container_routing_revision' => $state->operation_previous_routing_revision,
+                    'inactive_retirement_owner_routing_revision' => $claim->expectedRoutingRevision,
+                    'inactive_retirement_supersession_generation' => $claim->supersessionGeneration,
+                    'inactive_retirement_destination_fence_epoch' => $state->destination_fence_epoch,
+                    'inactive_retirement_server_boot_id' => $claim->serverBootId,
+                    'inactive_retirement_topology_digest' => $claim->topologyDigest,
+                    'inactive_retirement_routing_config_digest' => $claim->routingConfigDigest,
+                    'inactive_retirement_not_before_at' => $notBeforeAt,
+                    'inactive_retirement_drain_deadline_at' => $notBeforeAt->copy()->addSeconds(
+                        $stopGraceSeconds,
+                    ),
+                    'inactive_retirement_stop_grace_seconds' => $stopGraceSeconds,
+                    'inactive_retirement_lease_seconds' => $retirementLeaseSeconds,
+                    'inactive_retirement_last_observed_connections' => $retentionSeconds === 0 ? 0 : null,
+                    'inactive_retirement_observed_at' => $retentionSeconds === 0 ? now() : null,
+                    'inactive_retirement_attempts' => 0,
+                    'inactive_retirement_stopped_at' => $retentionSeconds === 0 ? now() : null,
+                    'inactive_retirement_intervention_required_at' => null,
+                ];
+            }
+
             $stateUpdated = ApplicationBlueGreenDeployment::query()
                 ->whereKey($state->getKey())
                 ->where('phase', $completionPhase->value)
@@ -154,6 +201,7 @@ final class CompleteBlueGreenDeploymentOperation
                 ->update([
                     'phase' => BlueGreenDeploymentPhase::IDLE->value,
                     'legacy_container_name' => null,
+                    ...$inactiveRetirement,
                     ...ApplicationBlueGreenDeployment::clearedOperationAttributes(),
                 ]);
             $deploymentQuery = ApplicationDeploymentQueue::query()
