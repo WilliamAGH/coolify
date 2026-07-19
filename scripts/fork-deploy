@@ -1320,7 +1320,7 @@ fd_validate_effective_bindings() {
         esac
         count=$((count + 1))
     done
-    [[ $loopback_count -eq 2 && $public_count -le 1 && $count -eq $((loopback_count + public_count)) ]] \
+    [[ $loopback_count -eq 2 && $public_count -eq 1 && $count -eq $((loopback_count + public_count)) ]] \
         || die "effective Compose must contain one public APP_PORT and two loopback realtime bindings"
     for target in 8080 6001 6002; do
         [[ $(fd_count "$compact" "\"target\":$target") -eq 1 ]] || die "effective Compose must contain exactly one target port $target"
@@ -1860,6 +1860,7 @@ fd_ensure_network() {
 
 fd_validate_runtime_bindings() {
     local app_port soketi_port container bindings runtime_port host_ip host_port app_seen=0 realtime_seen=0 metrics_seen=0
+    local app_unspecified_seen=0 app_ipv4_seen=0 app_ipv6_seen=0
 
     app_port=$(env_value "$SOURCE_DIR/.env" APP_PORT)
     soketi_port=$(env_value "$SOURCE_DIR/.env" SOKETI_PORT)
@@ -1872,8 +1873,17 @@ fd_validate_runtime_bindings() {
             [[ -z $runtime_port ]] && continue
             case "$container:$runtime_port:$host_port" in
                 "coolify:8080/tcp:$app_port")
-                    [[ -z $host_ip || $host_ip == 0.0.0.0 || $host_ip == :: ]] || {
-                        note "ERROR: $container $runtime_port does not use the public APP_PORT binding" >&2
+                    case $host_ip in
+                        '') app_unspecified_seen=$((app_unspecified_seen + 1)) ;;
+                        0.0.0.0) app_ipv4_seen=$((app_ipv4_seen + 1)) ;;
+                        ::) app_ipv6_seen=$((app_ipv6_seen + 1)) ;;
+                        *)
+                            note "ERROR: $container $runtime_port does not use the public APP_PORT binding" >&2
+                            return 1
+                            ;;
+                    esac
+                    [[ $app_unspecified_seen -le 1 && $app_ipv4_seen -le 1 && $app_ipv6_seen -le 1 ]] || {
+                        note "ERROR: $container $runtime_port repeats a public APP_PORT binding" >&2
                         return 1
                     }
                     app_seen=$((app_seen + 1))
@@ -1899,7 +1909,7 @@ fd_validate_runtime_bindings() {
             esac
         done <<<"$bindings"
     done
-    [[ $app_seen -eq 1 && $realtime_seen -eq 1 && $metrics_seen -eq 1 ]] || {
+    [[ $app_seen -ge 1 && $app_seen -le 2 && $realtime_seen -eq 1 && $metrics_seen -eq 1 ]] || {
         note 'ERROR: runtime bindings are missing or duplicated' >&2
         return 1
     }

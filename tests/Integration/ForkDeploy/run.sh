@@ -95,6 +95,7 @@ new_fixture() {
         FORK_DEPLOY_USE_REAL_OPENSSL FORK_DEPLOY_ENV_EXTRA \
         FORK_DEPLOY_COMPOSE_VERSION FORK_DEPLOY_LEGACY_VOLUMES \
         FORK_DEPLOY_APP_HOST_IP FORK_DEPLOY_REALTIME_HOST_IP \
+        FORK_DEPLOY_APP_DUAL_STACK FORK_DEPLOY_COMPOSE_OMIT_APP_HOST_IP \
         FORK_DEPLOY_DOCKER_UNAVAILABLE \
         FORK_DEPLOY_FAIL_CANDIDATE_RUNTIME_VERIFY || true
     unset FORK_DEPLOY_FAIL_ACTIVATED_CONFIG FORK_DEPLOY_KILL_ON_ACTIVE_CONFIG \
@@ -877,6 +878,39 @@ test_invalid_ports_fail_before_activation() {
     cleanup_fixture
 }
 
+test_effective_compose_requires_public_app_binding() {
+    new_fixture
+    export FORK_DEPLOY_COMPOSE_OMIT_APP_HOST_IP=true
+    write_manifest 4.13.0-fork.1
+    local output
+    if output=$(install_release 2>&1); then
+        fail 'effective Compose requires an explicit public APP_PORT binding'
+    elif [[ $output == *'one public APP_PORT and two loopback realtime bindings'* ]] \
+        && [[ ! -e $ROOT/source/docker-compose.yml ]]; then
+        pass 'effective Compose requires an explicit public APP_PORT binding'
+    else
+        fail 'effective Compose requires an explicit public APP_PORT binding'
+    fi
+    cleanup_fixture
+}
+
+test_verify_accepts_dual_stack_public_app_binding() {
+    new_fixture
+    write_manifest 4.13.0-fork.1
+    if ! install_release >/dev/null; then
+        fail 'runtime verifier accepts distinct IPv4 and IPv6 APP_PORT bindings'
+        cleanup_fixture
+        return
+    fi
+    export FORK_DEPLOY_APP_DUAL_STACK=true
+    if "$SUBJECT" verify >/dev/null 2>&1; then
+        pass 'runtime verifier accepts distinct IPv4 and IPv6 APP_PORT bindings'
+    else
+        fail 'runtime verifier accepts distinct IPv4 and IPv6 APP_PORT bindings'
+    fi
+    cleanup_fixture
+}
+
 test_verify_rejects_all_unsafe_runtime_bindings() {
     new_fixture
     write_manifest 4.13.0-fork.1
@@ -1588,6 +1622,8 @@ test_forward_recovery_forbids_mismatch_abort_and_rollback
 test_forward_recovery_reconciles_historical_rollback_activation
 test_forward_recovery_requires_recorded_bundle
 test_invalid_ports_fail_before_activation
+test_effective_compose_requires_public_app_binding
+test_verify_accepts_dual_stack_public_app_binding
 test_verify_rejects_all_unsafe_runtime_bindings
 test_rejects_invalid_manifest_signature
 test_rejects_out_of_order_manifest_schema

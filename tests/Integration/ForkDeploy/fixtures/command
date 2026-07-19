@@ -80,7 +80,9 @@ case $name in
                     exit 1
                 fi
                 if [[ $* == *'--format json'* ]]; then
-                    printf '%s\n' '{"services":{"coolify":{"ports":[{"host_ip":"0.0.0.0","published":"8000","target":8080}]},"soketi":{"ports":[{"host_ip":"127.0.0.1","published":"6001","target":6001},{"host_ip":"127.0.0.1","published":"6002","target":6002}]}}}'
+                    app_host_field='"host_ip":"0.0.0.0",'
+                    if [[ ${FORK_DEPLOY_COMPOSE_OMIT_APP_HOST_IP:-false} == true ]]; then app_host_field=; fi
+                    printf '{"services":{"coolify":{"ports":[{%s"published":"8000","target":8080}]},"soketi":{"ports":[{"host_ip":"127.0.0.1","published":"6001","target":6001},{"host_ip":"127.0.0.1","published":"6002","target":6002}]}}}\n' "$app_host_field"
                 elif [[ $* == *--images* ]]; then
                     printf '%s\n' \
                         'docker.iocloudhost.net/williamagh/coolify@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
@@ -122,6 +124,9 @@ case $name in
                         coolify)
                             host_ip=${FORK_DEPLOY_APP_HOST_IP:-${FORK_DEPLOY_HOST_IP:-0.0.0.0}}
                             printf '8080/tcp\t%s\t%s\n' "$host_ip" "${FORK_DEPLOY_APP_PORT:-8000}"
+                            if [[ ${FORK_DEPLOY_APP_DUAL_STACK:-false} == true ]]; then
+                                printf '8080/tcp\t::\t%s\n' "${FORK_DEPLOY_APP_PORT:-8000}"
+                            fi
                             ;;
                         coolify-realtime)
                             host_ip=${FORK_DEPLOY_REALTIME_HOST_IP:-${FORK_DEPLOY_HOST_IP:-127.0.0.1}}
