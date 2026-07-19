@@ -233,7 +233,9 @@ jobs:
             [ "$OPERATIONAL_FAILURE_MODE" = none ]
           case "$RELEASE_KIND" in
             production)
-              require_dockerhub_credentials
+              if [ "$VALIDATE_ONLY" = false ]; then
+                require_dockerhub_credentials
+              fi
               [ "$ARTIFACT_NAME" = 'coolify' ]
               [ "$DOCKERFILE" = 'docker/production/Dockerfile' ]
               [ "$TARGET_REPOSITORY" = 'coollabsio/coolify' ]

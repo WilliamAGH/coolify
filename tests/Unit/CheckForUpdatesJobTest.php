@@ -42,9 +42,13 @@ it('has correct job configuration', function () {
     expect($interfaces)->toContain(ShouldBeEncrypted::class);
 });
 
-it('does not contact or cache upstream update metadata for a fork release', function () {
+it('does not contact or mutate upstream update metadata for a fork release', function () {
     config(['constants.coolify.version' => '4.13.1-fork']);
     Http::preventStrayRequests();
+    File::shouldReceive('exists')->never();
+    File::shouldReceive('get')->never();
+    File::shouldReceive('put')->never();
+    Cache::shouldReceive('forget')->never();
     $this->settings->shouldReceive('update')
         ->once()
         ->with(['new_version_available' => false]);

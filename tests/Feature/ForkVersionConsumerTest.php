@@ -20,7 +20,7 @@ it('keeps the upgrade UI on the guarded fork release without upstream discovery'
     {
         public function __construct(private readonly InstanceSettings $settings) {}
 
-        protected function instanceSettings(): ?InstanceSettings
+        protected function instanceSettings(): InstanceSettings
         {
             return $this->settings;
         }
