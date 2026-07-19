@@ -23,6 +23,21 @@ final class InstallControlPlaneCandidateHealthMarkers
         return implode("\n", $commands);
     }
 
+    /**
+     * @param  array<string, array{container_id: string, image_id: string}>  $candidateRuntime
+     */
+    public function handleExact(ControlPlaneCandidateHealthMarker $marker, array $candidateRuntime): string
+    {
+        $candidateRuntime = $this->normalizeCandidateRuntime($candidateRuntime);
+        $commands = ['set -eu'];
+        foreach ($candidateRuntime as $candidateName => $identity) {
+            $commands[] = $this->attestCommand($candidateName, $identity['container_id'], $identity['image_id']);
+            $commands[] = $this->installCommand($marker, $identity['container_id']);
+        }
+
+        return implode("\n", $commands);
+    }
+
     private function installCommand(ControlPlaneCandidateHealthMarker $marker, string $candidateName): string
     {
         $arguments = [
@@ -38,6 +53,16 @@ final class InstallControlPlaneCandidateHealthMarkers
         ];
 
         return implode(' ', array_map(static fn (string $argument): string => escapeshellarg($argument), $arguments));
+    }
+
+    private function attestCommand(string $candidateName, string $containerId, string $imageId): string
+    {
+        $expected = "{$containerId}|/{$candidateName}|{$imageId}|true";
+
+        return implode("\n", [
+            'candidate_inspection=$(docker inspect --type container --format '.escapeshellarg('{{.Id}}|{{.Name}}|{{.Image}}|{{.State.Running}}').' '.escapeshellarg($containerId).' 2>/dev/null)',
+            '[ "$candidate_inspection" = '.escapeshellarg($expected).' ]',
+        ]);
     }
 
     private function containerScript(): string
@@ -92,5 +117,35 @@ final class InstallControlPlaneCandidateHealthMarkers
         sort($candidateNames, SORT_STRING);
 
         return array_values($candidateNames);
+    }
+
+    /**
+     * @param  array<string, array{container_id: string, image_id: string}>  $candidateRuntime
+     * @return array<string, array{container_id: string, image_id: string}>
+     */
+    private function normalizeCandidateRuntime(array $candidateRuntime): array
+    {
+        if ($candidateRuntime === [] || array_is_list($candidateRuntime)) {
+            throw new InvalidArgumentException('The exact control-plane candidate runtime must be a non-empty member map.');
+        }
+
+        $candidateNames = array_keys($candidateRuntime);
+        $normalizedNames = $this->normalizeCandidateNames($candidateNames);
+        if ($candidateNames !== $normalizedNames) {
+            throw new InvalidArgumentException('The exact control-plane candidate runtime member names must be sorted.');
+        }
+
+        foreach ($candidateRuntime as $identity) {
+            if (! is_array($identity)
+                || array_keys($identity) !== ['container_id', 'image_id']
+                || ! is_string($identity['container_id'])
+                || preg_match('/\A[a-f0-9]{64}\z/D', $identity['container_id']) !== 1
+                || ! is_string($identity['image_id'])
+                || preg_match('/\Asha256:[a-f0-9]{64}\z/D', $identity['image_id']) !== 1) {
+                throw new InvalidArgumentException('An exact control-plane candidate runtime identity is invalid.');
+            }
+        }
+
+        return $candidateRuntime;
     }
 }

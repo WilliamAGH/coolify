@@ -44,3 +44,31 @@ it('rejects empty, duplicate, and unsafe candidate sets before rendering', funct
     expect(fn (): string => InstallControlPlaneCandidateHealthMarkers::run($marker, ['coolify-web-a; curl attacker.test']))
         ->toThrow(InvalidArgumentException::class, 'Docker-safe DNS name');
 });
+
+it('attests exact candidate container and image identities before installing by Docker ID', function (): void {
+    $marker = markerForCandidateHealthInstallation(hash_hmac('sha256', 'coolify-control-plane-health-check-v1', 'raw-enrollment-token'));
+    $containerId = str_repeat('a', 64);
+    $imageId = 'sha256:'.str_repeat('b', 64);
+    $command = (new InstallControlPlaneCandidateHealthMarkers)->handleExact($marker, [
+        'coolify-web-a' => ['container_id' => $containerId, 'image_id' => $imageId],
+    ]);
+
+    expect($command)->toContain("'docker' 'exec' '{$containerId}' 'sh' '-ceu'")
+        ->and($command)->toContain("'{$containerId}|/coolify-web-a|{$imageId}|true'")
+        ->and($command)->toContain('docker inspect --type container')
+        ->and($command)->not->toContain("'docker' 'exec' 'coolify-web-a'");
+});
+
+it('rejects malformed and unsorted exact candidate runtime identities', function (): void {
+    $marker = markerForCandidateHealthInstallation(hash_hmac('sha256', 'coolify-control-plane-health-check-v1', 'raw-enrollment-token'));
+
+    expect(fn (): string => (new InstallControlPlaneCandidateHealthMarkers)->handleExact($marker, []))
+        ->toThrow(InvalidArgumentException::class, 'non-empty member map')
+        ->and(fn (): string => (new InstallControlPlaneCandidateHealthMarkers)->handleExact($marker, [
+            'coolify-web-b' => ['container_id' => str_repeat('b', 64), 'image_id' => 'sha256:'.str_repeat('b', 64)],
+            'coolify-web-a' => ['container_id' => str_repeat('a', 64), 'image_id' => 'sha256:'.str_repeat('a', 64)],
+        ]))->toThrow(InvalidArgumentException::class, 'must be sorted')
+        ->and(fn (): string => (new InstallControlPlaneCandidateHealthMarkers)->handleExact($marker, [
+            'coolify-web-a' => ['container_id' => 'short', 'image_id' => 'latest'],
+        ]))->toThrow(InvalidArgumentException::class, 'identity is invalid');
+});

@@ -137,3 +137,47 @@ it('rejects malformed transcripts and unsafe proof input before verification', f
         healthCheckProof: hash_hmac('sha256', 'coolify-control-plane-health-check-v1', 'raw-enrollment-token'),
     ))->toThrow(InvalidArgumentException::class, 'expected member');
 });
+
+it('reattests exact candidate runtime identity before every direct proof attempt', function (): void {
+    $containerId = str_repeat('a', 64);
+    $imageId = 'sha256:'.str_repeat('b', 64);
+    $proof = new ControlPlaneCandidateMembersProof(
+        candidateNames: ['coolify-web-a'],
+        expectedMember: 'blue',
+        expectedRevision: 'revision-42',
+        dynamicSha256: hash('sha256', 'coolify.yaml replacement'),
+        healthCheckProof: hash_hmac('sha256', 'coolify-control-plane-health-check-v1', 'raw-enrollment-token'),
+        candidateRuntime: [
+            'coolify-web-a' => ['container_id' => $containerId, 'image_id' => $imageId],
+        ],
+    );
+    $command = $proof->shellCommand();
+
+    expect(substr_count($command, 'docker inspect --type container'))->toBe(2)
+        ->and(substr_count($command, "'docker' 'exec' '{$containerId}'"))->toBe(2)
+        ->and($command)->toContain("'{$containerId}|/coolify-web-a|{$imageId}|true'")
+        ->and($command)->not->toContain("'docker' 'exec' 'coolify-web-a'");
+});
+
+it('requires exact runtime identities to match the candidate set', function (): void {
+    $arguments = [
+        'candidateNames' => ['coolify-web-a'],
+        'expectedMember' => 'blue',
+        'expectedRevision' => 'revision-42',
+        'dynamicSha256' => hash('sha256', 'coolify.yaml replacement'),
+        'healthCheckProof' => hash_hmac('sha256', 'coolify-control-plane-health-check-v1', 'raw-enrollment-token'),
+    ];
+
+    expect(fn (): ControlPlaneCandidateMembersProof => new ControlPlaneCandidateMembersProof(
+        ...$arguments,
+        candidateRuntime: [
+            'coolify-web-b' => ['container_id' => str_repeat('a', 64), 'image_id' => 'sha256:'.str_repeat('b', 64)],
+        ],
+    ))->toThrow(InvalidArgumentException::class, 'must match the candidate member set')
+        ->and(fn (): ControlPlaneCandidateMembersProof => new ControlPlaneCandidateMembersProof(
+            ...$arguments,
+            candidateRuntime: [
+                'coolify-web-a' => ['container_id' => 'short', 'image_id' => 'latest'],
+            ],
+        ))->toThrow(InvalidArgumentException::class, 'identity is invalid');
+});

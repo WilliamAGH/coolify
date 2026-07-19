@@ -17,6 +17,9 @@ final readonly class ControlPlaneCandidateMembersProof
     /** @var list<string> */
     public array $candidateNames;
 
+    /** @var array<string, array{container_id: string, image_id: string}> */
+    public array $candidateRuntime;
+
     /**
      * @param  list<string>  $candidateNames
      */
@@ -26,8 +29,13 @@ final readonly class ControlPlaneCandidateMembersProof
         public string $expectedRevision,
         public string $dynamicSha256,
         public string $healthCheckProof,
+        array $candidateRuntime = [],
     ) {
         $this->candidateNames = $this->normalizeCandidateNames($candidateNames);
+        $this->candidateRuntime = $this->normalizeCandidateRuntime($candidateRuntime);
+        if ($this->candidateRuntime !== [] && array_keys($this->candidateRuntime) !== $this->candidateNames) {
+            throw new InvalidArgumentException('The exact control-plane candidate runtime must match the candidate member set.');
+        }
         $this->assertIdentifier($expectedMember, 'expected member');
         $this->assertIdentifier($expectedRevision, 'expected revision');
         if (preg_match('/^[a-f0-9]{64}$/D', $dynamicSha256) !== 1) {
@@ -62,10 +70,12 @@ final readonly class ControlPlaneCandidateMembersProof
 
     private function attemptCommand(string $candidateName, int $attempt): string
     {
+        $runtimeIdentity = $this->candidateRuntime[$candidateName] ?? null;
+        $containerSelector = $runtimeIdentity['container_id'] ?? $candidateName;
         $arguments = [
             'docker',
             'exec',
-            $candidateName,
+            $containerSelector,
             'curl',
             '--fail',
             '--silent',
@@ -88,11 +98,18 @@ final readonly class ControlPlaneCandidateMembersProof
             self::LOCAL_HEALTH_URL,
         ];
 
-        return implode("\n", [
+        $commands = [
             "printf '%s\\n' ".escapeshellarg(self::TRANSCRIPT_BEGIN." {$candidateName} {$attempt}"),
-            implode(' ', array_map(static fn (string $argument): string => escapeshellarg($argument), $arguments)),
-            "printf '%s\\n' ".escapeshellarg(self::TRANSCRIPT_END),
-        ]);
+        ];
+        if ($runtimeIdentity !== null) {
+            $expected = "{$runtimeIdentity['container_id']}|/{$candidateName}|{$runtimeIdentity['image_id']}|true";
+            $commands[] = 'candidate_inspection=$(docker inspect --type container --format '.escapeshellarg('{{.Id}}|{{.Name}}|{{.Image}}|{{.State.Running}}').' '.escapeshellarg($runtimeIdentity['container_id']).' 2>/dev/null)';
+            $commands[] = '[ "$candidate_inspection" = '.escapeshellarg($expected).' ]';
+        }
+        $commands[] = implode(' ', array_map(static fn (string $argument): string => escapeshellarg($argument), $arguments));
+        $commands[] = "printf '%s\\n' ".escapeshellarg(self::TRANSCRIPT_END);
+
+        return implode("\n", $commands);
     }
 
     /**
@@ -116,6 +133,39 @@ final readonly class ControlPlaneCandidateMembersProof
         sort($candidateNames, SORT_STRING);
 
         return array_values($candidateNames);
+    }
+
+    /**
+     * @param  array<string, array{container_id: string, image_id: string}>  $candidateRuntime
+     * @return array<string, array{container_id: string, image_id: string}>
+     */
+    private function normalizeCandidateRuntime(array $candidateRuntime): array
+    {
+        if ($candidateRuntime === []) {
+            return [];
+        }
+        if (array_is_list($candidateRuntime)) {
+            throw new InvalidArgumentException('The exact control-plane candidate runtime must be a member map.');
+        }
+        foreach ($candidateRuntime as $candidateName => $identity) {
+            if (! is_string($candidateName)
+                || preg_match('/\A[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\z/D', $candidateName) !== 1
+                || ! is_array($identity)
+                || array_keys($identity) !== ['container_id', 'image_id']
+                || ! is_string($identity['container_id'])
+                || preg_match('/\A[a-f0-9]{64}\z/D', $identity['container_id']) !== 1
+                || ! is_string($identity['image_id'])
+                || preg_match('/\Asha256:[a-f0-9]{64}\z/D', $identity['image_id']) !== 1) {
+                throw new InvalidArgumentException('An exact control-plane candidate runtime identity is invalid.');
+            }
+        }
+        $sorted = $candidateRuntime;
+        ksort($sorted, SORT_STRING);
+        if ($candidateRuntime !== $sorted) {
+            throw new InvalidArgumentException('The exact control-plane candidate runtime member names must be sorted.');
+        }
+
+        return $candidateRuntime;
     }
 
     private function assertIdentifier(string $value, string $role): void
