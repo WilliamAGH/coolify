@@ -65,6 +65,20 @@ function applicationValidationWorkflowViolations(array $workflow): array
         }
     }
 
+    $phpApplication = is_array($jobs) ? ($jobs['php'] ?? []) : [];
+    $controlPlaneScript = collect($phpApplication['steps'] ?? [])
+        ->firstWhere('name', 'Run native Traefik control-plane tests')['run'] ?? '';
+    foreach ([
+        'tests/Feature/Proxy/ControlPlane',
+        'tests/Unit/Actions/Proxy/ControlPlane',
+    ] as $requiredPath) {
+        if (! str_contains((string) $controlPlaneScript, $requiredPath)) {
+            $violations[] = 'application validation must execute every native Traefik control-plane test';
+
+            break;
+        }
+    }
+
     foreach (is_array($jobs) ? $jobs : [] as $job) {
         foreach ($job['steps'] ?? [] as $step) {
             $uses = (string) ($step['uses'] ?? '');
@@ -103,4 +117,14 @@ it('rejects omitting a blue-green ownership gate from PostgreSQL validation', fu
 
     expect(applicationValidationWorkflowViolations($workflow))
         ->toContain('blue-green lifecycle validation must execute every ownership and migration gate');
+});
+
+it('rejects omitting the native Traefik control-plane suite', function () {
+    $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
+    $step = collect($workflow['jobs']['php']['steps'])
+        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Run native Traefik control-plane tests');
+    $workflow['jobs']['php']['steps'][$step]['run'] = 'php artisan test --compact tests/Feature/Proxy/ControlPlane';
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('application validation must execute every native Traefik control-plane test');
 });

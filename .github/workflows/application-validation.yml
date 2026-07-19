@@ -75,6 +75,11 @@ jobs:
             tests/Unit/StagingImageReferenceWorkflowTest.php \
             tests/Unit/UpdateCoolifyTest.php \
             tests/Feature/ForkVersionConsumerTest.php
+      - name: Run native Traefik control-plane tests
+        run: |
+          php artisan test --compact \
+            tests/Feature/Proxy/ControlPlane \
+            tests/Unit/Actions/Proxy/ControlPlane
 
   blue-green-lifecycle:
     name: Blue-green lifecycle (PostgreSQL)
