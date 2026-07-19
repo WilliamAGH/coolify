@@ -403,6 +403,8 @@ function generateDefaultProxyConfiguration(Server $server, array $custom_command
         $config = match ($enrollment->phase) {
             ControlPlaneProxyEnrollmentPhase::Preparing,
             ControlPlaneProxyEnrollmentPhase::Prepared => $enrollment->staticPredecessorBytes,
+            ControlPlaneProxyEnrollmentPhase::RollingBack,
+            ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement => $enrollment->staticPredecessorBytes,
             ControlPlaneProxyEnrollmentPhase::Enrolled => (new CompileControlPlaneStaticProxyConfiguration)
                 ->compileProxyConfiguration($config, $enrollment->exposure),
             ControlPlaneProxyEnrollmentPhase::RolledBack => $config,

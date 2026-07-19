@@ -118,9 +118,29 @@ it('freezes the canonical dynamic owner and preserves the managed static listene
         '2026-07-18T12:02:00Z',
     );
     $active = generateDefaultProxyConfiguration($server->fresh(), save: false);
+    $repository->transition(
+        $server,
+        'enrollment-op',
+        'secret-token',
+        ControlPlaneProxyEnrollmentPhase::Activating,
+        ControlPlaneProxyEnrollmentPhase::RollingBack,
+        '2026-07-18T12:03:00Z',
+    );
+    $rollingBack = generateDefaultProxyConfiguration($server->fresh(), save: false);
+    $repository->transition(
+        $server,
+        'enrollment-op',
+        'secret-token',
+        ControlPlaneProxyEnrollmentPhase::RollingBack,
+        ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement,
+        '2026-07-18T12:04:00Z',
+    );
+    $awaitingRollbackAcknowledgement = generateDefaultProxyConfiguration($server->fresh(), save: false);
 
     expect($predecessor)->toBe($state->staticPredecessorBytes)
         ->and($active)->toBe($state->staticReplacementBytes)
+        ->and($rollingBack)->toBe($state->staticPredecessorBytes)
+        ->and($awaitingRollbackAcknowledgement)->toBe($state->staticPredecessorBytes)
         ->and(data_get(Yaml::parse($active), 'services.traefik.ports'))->toContain('8000:8000');
     Process::assertNothingRan();
 });
