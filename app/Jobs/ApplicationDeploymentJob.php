@@ -2244,7 +2244,10 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         $this->handoffScheduled = true;
         $activationDeployment = $this->application_deployment_queue->fresh()
             ?? throw new DeploymentException('Prepared deployment disappeared before activation dispatch.');
-        dispatch_claimed_application_deployment($activationDeployment);
+        dispatch_claimed_application_deployment(
+            $activationDeployment,
+            preserveActivationForRecoveryOnFailure: true,
+        );
 
         return true;
     }

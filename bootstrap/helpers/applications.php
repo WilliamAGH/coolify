@@ -16,6 +16,7 @@ use App\Support\ProxyMutationQueue;
 use App\Support\ProxyMutationQueueFrozenException;
 use Illuminate\Contracts\Bus\Dispatcher;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Laravel\Horizon\Contracts\JobRepository;
 use Spatie\Url\Url;
@@ -175,9 +176,11 @@ function next_after_cancel(ApplicationDeploymentQueue $cancelledDeployment): voi
     queue_next_deployment($cancelledDeployment);
 }
 
-function dispatch_claimed_application_deployment(ApplicationDeploymentQueue $deployment): bool
-{
-    DB::afterCommit(static function () use ($deployment): void {
+function dispatch_claimed_application_deployment(
+    ApplicationDeploymentQueue $deployment,
+    bool $preserveActivationForRecoveryOnFailure = false,
+): bool {
+    DB::afterCommit(static function () use ($deployment, $preserveActivationForRecoveryOnFailure): void {
         $deployment->refresh();
         $dispatchAttemptUuid = $deployment->horizon_job_id;
         if (! is_string($dispatchAttemptUuid) || ! Str::isUuid($dispatchAttemptUuid)) {
@@ -200,6 +203,13 @@ function dispatch_claimed_application_deployment(ApplicationDeploymentQueue $dep
         } catch (ProxyMutationQueueFrozenException) {
             // The durable dispatch attempt remains recoverable after the owning
             // control-plane operation explicitly releases admission.
+        } catch (Throwable $exception) {
+            if (! $preserveActivationForRecoveryOnFailure) {
+                throw $exception;
+            }
+            Log::warning(
+                "Activation publication failed for deployment {$deployment->deployment_uuid}; the durable activation remains recoverable: {$exception->getMessage()}",
+            );
         }
     });
 

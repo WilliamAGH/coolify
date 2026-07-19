@@ -172,6 +172,34 @@ describe('proxy mutation freeze recovery', function () {
             ->and($deployment->fresh()->horizon_job_worker)->toBeNull();
     });
 
+    test('keeps a post-handoff publication failure durably recoverable', function () {
+        $application = makeApplication($this->environment->id, $this->destination->id, null);
+        $deployment = makeQueueAdmissionDeployment(
+            $application,
+            $this->server,
+            'queue-handoff-publication-failure',
+        );
+        expect($deployment->claimForDispatch(bypassServerCapacity: true))->toBeTrue();
+        $deployment->update(['execution_phase' => ApplicationDeploymentExecutionPhase::Activate]);
+        $deployment->refresh();
+        $dispatchAttemptUuid = $deployment->horizon_job_id;
+        $dispatcher = Mockery::mock(Dispatcher::class);
+        $dispatcher->shouldReceive('dispatch')
+            ->once()
+            ->andThrow(new RuntimeException('Transient activation queue outage.'));
+        app()->instance(Dispatcher::class, $dispatcher);
+
+        expect(dispatch_claimed_application_deployment(
+            $deployment,
+            preserveActivationForRecoveryOnFailure: true,
+        ))->toBeTrue()
+            ->and($deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+            ->and($deployment->fresh()->execution_phase)->toBe(ApplicationDeploymentExecutionPhase::Activate)
+            ->and($deployment->fresh()->horizon_job_id)->toBe($dispatchAttemptUuid)
+            ->and($deployment->fresh()->horizon_job_worker)->toBeNull()
+            ->and($deployment->fresh()->finished_at)->toBeNull();
+    });
+
     test('recovers preparation without publishing activation while proxy mutations are frozen', function () {
         $prepareApplication = makeApplication($this->environment->id, $this->destination->id, null);
         $prepareDeployment = makeQueueAdmissionDeployment(
