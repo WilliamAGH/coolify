@@ -83,6 +83,7 @@ function applicationValidationWorkflowViolations(array $workflow): array
     $controlPlaneScript = collect($phpApplication['steps'] ?? [])
         ->firstWhere('name', 'Run native Traefik control-plane tests')['run'] ?? '';
     foreach ([
+        'tests/Feature/InspectProxyMutationQueueTest.php',
         'tests/Feature/Proxy/ControlPlane',
         'tests/Unit/Actions/Proxy/ControlPlane',
     ] as $requiredPath) {
@@ -155,6 +156,20 @@ it('rejects omitting the native Traefik control-plane suite', function () {
     $step = collect($workflow['jobs']['php']['steps'])
         ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Run native Traefik control-plane tests');
     $workflow['jobs']['php']['steps'][$step]['run'] = 'php artisan test --compact tests/Feature/Proxy/ControlPlane';
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('application validation must execute every native Traefik control-plane test');
+});
+
+it('rejects omitting explicit proxy-mutation payload diagnostics', function () {
+    $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
+    $step = collect($workflow['jobs']['php']['steps'])
+        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Run native Traefik control-plane tests');
+    $workflow['jobs']['php']['steps'][$step]['run'] = str_replace(
+        'tests/Feature/InspectProxyMutationQueueTest.php',
+        '',
+        $workflow['jobs']['php']['steps'][$step]['run'],
+    );
 
     expect(applicationValidationWorkflowViolations($workflow))
         ->toContain('application validation must execute every native Traefik control-plane test');

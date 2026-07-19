@@ -81,6 +81,7 @@ jobs:
       - name: Run native Traefik control-plane tests
         run: |
           php artisan test --compact \
+            tests/Feature/InspectProxyMutationQueueTest.php \
             tests/Feature/Proxy/ControlPlane \
             tests/Unit/Actions/Proxy/ControlPlane
 
