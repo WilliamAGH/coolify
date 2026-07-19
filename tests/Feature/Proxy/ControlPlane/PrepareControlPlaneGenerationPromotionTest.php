@@ -371,9 +371,11 @@ it('prepares a replacement from the exact restored tuple after rollback', functi
             'rollback_started_at' => '2026-07-19T12:01:00Z',
         ])
         ->withPhase(ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement, '2026-07-19T12:02:00Z')
-        ->withPhase(ControlPlaneGenerationPromotionPhase::RolledBack, '2026-07-19T12:03:00Z', [
+        ->withPhase(ControlPlaneGenerationPromotionPhase::RollbackUnfreezing, '2026-07-19T12:03:00Z', [
             'rollback_acknowledged_at' => '2026-07-19T12:03:00Z',
-            'rolled_back_at' => '2026-07-19T12:03:00Z',
+        ])
+        ->withPhase(ControlPlaneGenerationPromotionPhase::RolledBack, '2026-07-19T12:04:00Z', [
+            'rolled_back_at' => '2026-07-19T12:04:00Z',
         ]);
     $server->proxy->set(StoreControlPlaneGenerationPromotionState::STATE_KEY, $rolledBack->toArray());
     $server->save();
@@ -384,10 +386,10 @@ it('prepares a replacement from the exact restored tuple after rollback', functi
         operationId: 'promotion-after-rollback',
         token: 'promotion-after-rollback-token',
         predecessorDynamicYaml: $enrollment->dynamicReplacementBytes,
-        writerEpoch: 3,
+        writerEpoch: 2,
     );
 
     expect($replacement->state->predecessor)->toBe($rolledBack->predecessor)
         ->and($replacement->state->successor['dynamic_revision'])->toBe(2)
-        ->and($replacement->state->writerEpoch)->toBe(3);
+        ->and($replacement->state->writerEpoch)->toBe(2);
 });

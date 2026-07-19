@@ -17,6 +17,7 @@ final class RollbackControlPlaneGenerationPromotion
         private readonly StoreControlPlaneGenerationPromotionState $promotionStore,
         private readonly StoreControlPlaneProxyEnrollmentState $enrollmentStore,
         private readonly ManagedTraefikDocumentWriter $dynamicWriter,
+        private readonly ControlPlaneGenerationWriterAuthority $writerAuthority,
         private readonly VerifyControlPlaneRestoredRoutes $restoredRoutesVerifier,
     ) {}
 
@@ -52,6 +53,7 @@ final class RollbackControlPlaneGenerationPromotion
         if (! in_array($state->phase, [
             ControlPlaneGenerationPromotionPhase::RollingBack,
             ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement,
+            ControlPlaneGenerationPromotionPhase::RollbackUnfreezing,
         ], true)) {
             $startedAt = now()->toIso8601String();
             $state = $this->promotionStore->transition(
@@ -75,8 +77,16 @@ final class RollbackControlPlaneGenerationPromotion
 
         if ($state->phase === ControlPlaneGenerationPromotionPhase::RollingBack) {
             if ($mustRestoreDynamicDocument) {
+                $this->assertRecordedFreeze($state, ProxyMutationQueue::snapshot());
+                $mutation = $this->dynamicMutation($server, $state, $successorYaml);
                 $this->assertExactOutput(
-                    $execute($this->dynamicWriter->rollbackCommandFor($this->dynamicMutation($server, $state, $successorYaml))),
+                    $execute($this->dynamicWriter->rollbackCommandForRequiringPredecessorAuthority(
+                        mutation: $mutation,
+                        predecessorAuthority: $this->writerAuthority->predecessor($state),
+                        allowInitialOrPreWriteReconciliation: $state->dynamicWritten === null
+                            && $this->isInitialGeneration($server, $state),
+                        allowMissingArtifactNoop: $state->dynamicWritten === null,
+                    )),
                     ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT,
                     'dynamic Traefik document rollback',
                 );
@@ -94,7 +104,11 @@ final class RollbackControlPlaneGenerationPromotion
             );
         }
 
-        return $this->acknowledgeRestoredRoutes($server, $state, $operationId, $token, $execute);
+        if ($state->phase === ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement) {
+            $state = $this->acknowledgeRestoredRoutes($server, $state, $operationId, $token, $execute);
+        }
+
+        return $this->completeRollbackUnfreeze($server, $state, $operationId, $token);
     }
 
     /** @param Closure(string): ?string $execute */
@@ -110,7 +124,7 @@ final class RollbackControlPlaneGenerationPromotion
         }
 
         $enrollment = $this->enrolledRouteAnchor($server);
-        $this->assertRecordedFreeze($state, ProxyMutationQueue::snapshot(), allowReleased: true);
+        $this->assertRecordedFreeze($state, ProxyMutationQueue::snapshot());
 
         $proof = new ControlPlaneRestoredRoutesProof(
             canonicalHost: $enrollment->canonicalHost,
@@ -125,8 +139,8 @@ final class RollbackControlPlaneGenerationPromotion
             throw new RuntimeException('The restored control-plane generation route proof returned no transcript.');
         }
         $this->restoredRoutesVerifier->handle($proof, $transcript);
+        $this->assertRecordedFreeze($state, ProxyMutationQueue::snapshot());
 
-        $this->releaseMutationFreeze($state);
         $acknowledgedAt = now()->toIso8601String();
 
         return $this->promotionStore->transition(
@@ -134,12 +148,33 @@ final class RollbackControlPlaneGenerationPromotion
             $operationId,
             $token,
             ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement,
-            ControlPlaneGenerationPromotionPhase::RolledBack,
+            ControlPlaneGenerationPromotionPhase::RollbackUnfreezing,
             $acknowledgedAt,
-            [
-                'rollback_acknowledged_at' => $acknowledgedAt,
-                'rolled_back_at' => $acknowledgedAt,
-            ],
+            ['rollback_acknowledged_at' => $acknowledgedAt],
+        );
+    }
+
+    private function completeRollbackUnfreeze(
+        Server $server,
+        ControlPlaneGenerationPromotionState $state,
+        string $operationId,
+        string $token,
+    ): ControlPlaneGenerationPromotionState {
+        if ($state->phase !== ControlPlaneGenerationPromotionPhase::RollbackUnfreezing) {
+            throw new RuntimeException("Control-plane generation rollback cannot unfreeze from {$state->phase->value}.");
+        }
+
+        $this->releaseMutationFreeze($state);
+        $rolledBackAt = now()->toIso8601String();
+
+        return $this->promotionStore->transition(
+            $server,
+            $operationId,
+            $token,
+            ControlPlaneGenerationPromotionPhase::RollbackUnfreezing,
+            ControlPlaneGenerationPromotionPhase::RolledBack,
+            $rolledBackAt,
+            ['rolled_back_at' => $rolledBackAt],
         );
     }
 
@@ -147,7 +182,10 @@ final class RollbackControlPlaneGenerationPromotion
         ControlPlaneGenerationPromotionState $state,
         ?string $successorYaml,
     ): bool {
-        if ($state->phase === ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement) {
+        if (in_array($state->phase, [
+            ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement,
+            ControlPlaneGenerationPromotionPhase::RollbackUnfreezing,
+        ], true)) {
             return false;
         }
 
@@ -216,10 +254,19 @@ final class RollbackControlPlaneGenerationPromotion
         return $enrollment;
     }
 
+    private function isInitialGeneration(
+        Server $server,
+        ControlPlaneGenerationPromotionState $state,
+    ): bool {
+        $enrollment = $this->enrolledRouteAnchor($server);
+
+        return $state->writerEpoch === 2
+            && $state->matchesEnrolledPredecessor($enrollment);
+    }
+
     private function assertRecordedFreeze(
         ControlPlaneGenerationPromotionState $state,
         ProxyMutationQueueSnapshot $snapshot,
-        bool $allowReleased = false,
     ): void {
         if ($snapshot->freezeOperationId !== null
             && ! hash_equals($state->operationId, $snapshot->freezeOperationId)) {
@@ -233,9 +280,6 @@ final class RollbackControlPlaneGenerationPromotion
             return;
         }
         if ($snapshot->freezeOperationId === null) {
-            if ($allowReleased) {
-                return;
-            }
             throw new RuntimeException('The recorded control-plane generation mutation freeze is missing.');
         }
     }
@@ -243,7 +287,10 @@ final class RollbackControlPlaneGenerationPromotion
     private function releaseMutationFreeze(ControlPlaneGenerationPromotionState $state): void
     {
         $snapshot = ProxyMutationQueue::snapshot();
-        $this->assertRecordedFreeze($state, $snapshot, allowReleased: true);
+        if ($snapshot->freezeOperationId !== null
+            && ! hash_equals($state->operationId, $snapshot->freezeOperationId)) {
+            throw new RuntimeException('The control-plane generation mutation freeze is owned by another operation.');
+        }
         if (! $snapshot->isEmpty()) {
             throw new RuntimeException('The control-plane generation mutation queue must be empty before rollback completion.');
         }

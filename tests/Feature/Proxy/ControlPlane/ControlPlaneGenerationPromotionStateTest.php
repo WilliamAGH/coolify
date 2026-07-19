@@ -4,6 +4,7 @@ use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
 use App\Actions\Proxy\ControlPlane\ControlPlaneGenerationPromotionPhase;
 use App\Actions\Proxy\ControlPlane\ControlPlaneGenerationPromotionState;
 use App\Actions\Proxy\ControlPlane\ControlPlaneGenerationRuntime;
+use App\Actions\Proxy\ControlPlane\ControlPlaneGenerationWriterAuthority;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentPhase;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentState;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyExposure;
@@ -14,6 +15,18 @@ use App\Models\Team;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 
 uses(RefreshDatabase::class);
+
+it('refuses every late rollback transition in the canonical phase owner', function (): void {
+    foreach ([
+        ControlPlaneGenerationPromotionPhase::Retiring,
+        ControlPlaneGenerationPromotionPhase::WriterPromoting,
+        ControlPlaneGenerationPromotionPhase::FenceReleasing,
+        ControlPlaneGenerationPromotionPhase::Unfreezing,
+    ] as $phase) {
+        expect(fn () => $phase->assertCanTransitionTo(ControlPlaneGenerationPromotionPhase::RollingBack))
+            ->toThrow(InvalidArgumentException::class);
+    }
+});
 
 function generationPromotionEnrollment(Server $server): ControlPlaneProxyEnrollmentState
 {
@@ -184,14 +197,25 @@ it('serializes a strict canonical promotion state without retaining the raw toke
     $server = Server::factory()->create(['team_id' => Team::factory()->create()->id]);
     $state = generationPromotionState($server);
     $serialized = $state->toArray();
+    $authority = new ControlPlaneGenerationWriterAuthority;
+    $predecessorAuthority = $authority->predecessor($state);
+    $successorAuthority = $authority->successor($state);
 
     expect($serialized['version'])->toBe(ControlPlaneGenerationPromotionState::VERSION)
         ->and($serialized['predecessor']['dynamic_sha256'])->toBe($state->predecessor['dynamic_sha256'])
         ->and(json_encode($serialized, JSON_THROW_ON_ERROR))->not->toContain('promotion-secret-token')
-        ->and(ControlPlaneGenerationPromotionState::fromArray($serialized)->toArray())->toBe($serialized);
+        ->and(ControlPlaneGenerationPromotionState::fromArray($serialized)->toArray())->toBe($serialized)
+        ->and($predecessorAuthority->epoch)->toBe(1)
+        ->and($predecessorAuthority->containerName)->toBe('coolify-web-a')
+        ->and($successorAuthority->epoch)->toBe(2)
+        ->and($successorAuthority->containerName)->toBe('coolify-web-c');
 
     expect(fn () => ControlPlaneGenerationPromotionState::fromArray([...$serialized, 'unexpected' => true]))
-        ->toThrow(InvalidArgumentException::class, 'unexpected shape');
+        ->toThrow(InvalidArgumentException::class, 'unexpected shape')
+        ->and(fn () => ControlPlaneGenerationPromotionState::fromArray([
+            ...$serialized,
+            'writer' => [...$serialized['writer'], 'epoch' => 1],
+        ]))->toThrow(InvalidArgumentException::class, 'writer epoch');
 });
 
 it('enforces safe phase transitions and durable rollback timestamps', function () {
@@ -208,15 +232,60 @@ it('enforces safe phase transitions and durable rollback timestamps', function (
         ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement,
         '2026-07-19T12:02:00Z',
     );
-    $rolledBack = $awaitingAcknowledgement->withPhase(ControlPlaneGenerationPromotionPhase::RolledBack, '2026-07-19T12:03:00Z', [
+    $rollbackUnfreezing = $awaitingAcknowledgement->withPhase(ControlPlaneGenerationPromotionPhase::RollbackUnfreezing, '2026-07-19T12:03:00Z', [
         'rollback_acknowledged_at' => '2026-07-19T12:03:00Z',
-        'rolled_back_at' => '2026-07-19T12:03:00Z',
+    ]);
+    $rolledBack = $rollbackUnfreezing->withPhase(ControlPlaneGenerationPromotionPhase::RolledBack, '2026-07-19T12:04:00Z', [
+        'rolled_back_at' => '2026-07-19T12:04:00Z',
     ]);
 
     expect($rollingBack->rollbackStartedAt)->toBe('2026-07-19T12:01:00Z')
         ->and($rolledBack->phase)->toBe(ControlPlaneGenerationPromotionPhase::RolledBack)
         ->and($rolledBack->rollbackAcknowledgedAt)->toBe('2026-07-19T12:03:00Z')
-        ->and($rolledBack->rolledBackAt)->toBe('2026-07-19T12:03:00Z');
+        ->and($rolledBack->rolledBackAt)->toBe('2026-07-19T12:04:00Z');
+});
+
+it('allows intervention rollback only before retirement has started', function (): void {
+    $server = Server::factory()->create(['team_id' => Team::factory()->create()->id]);
+    $prepared = generationPromotionState($server);
+    $preRetirementIntervention = $prepared->withPhase(
+        ControlPlaneGenerationPromotionPhase::InterventionRequired,
+        '2026-07-19T12:01:00Z',
+        ['intervention_required_at' => '2026-07-19T12:01:00Z'],
+    );
+    $rollingBack = $preRetirementIntervention->withPhase(
+        ControlPlaneGenerationPromotionPhase::RollingBack,
+        '2026-07-19T12:02:00Z',
+        ['rollback_started_at' => '2026-07-19T12:02:00Z'],
+    );
+
+    $late = switchingGenerationPromotionState(generationPromotionState($server, operationId: 'late-intervention'));
+    $late = $late->withPhase(ControlPlaneGenerationPromotionPhase::AwaitingAcknowledgement, '2026-07-19T12:08:00Z', [
+        'dynamic_written' => generationPromotionSuccessorObservation($late, '2026-07-19T12:08:00Z'),
+    ]);
+    $late = $late->withPhase(ControlPlaneGenerationPromotionPhase::Draining, '2026-07-19T12:09:00Z', [
+        'dual_route' => generationPromotionSuccessorObservation($late, '2026-07-19T12:09:00Z'),
+        'draining' => ['deadline_at' => '2026-07-19T12:20:00Z', 'stable_zero_observations' => []],
+    ]);
+    $late = $late->withPhase(ControlPlaneGenerationPromotionPhase::Retiring, '2026-07-19T12:11:00Z', [
+        'draining' => [
+            'deadline_at' => '2026-07-19T12:20:00Z',
+            'stable_zero_observations' => [
+                generationPromotionZeroObservation($late, '2026-07-19T12:10:00Z'),
+                generationPromotionZeroObservation($late, '2026-07-19T12:11:00Z'),
+            ],
+        ],
+    ]);
+    $late = $late->withPhase(ControlPlaneGenerationPromotionPhase::InterventionRequired, '2026-07-19T12:12:00Z', [
+        'intervention_required_at' => '2026-07-19T12:12:00Z',
+    ]);
+
+    expect($rollingBack->phase)->toBe(ControlPlaneGenerationPromotionPhase::RollingBack)
+        ->and(fn () => $late->withPhase(
+            ControlPlaneGenerationPromotionPhase::RollingBack,
+            '2026-07-19T12:13:00Z',
+            ['rollback_started_at' => '2026-07-19T12:13:00Z'],
+        ))->toThrow(InvalidArgumentException::class, 'after predecessor retirement');
 });
 
 it('reserves one exact owner, preserves enrollment, and rejects stale and foreign ownership', function () {
@@ -316,7 +385,7 @@ it('replaces a completed terminal state only from its exact successor tuple', fu
         writerMember: 'purple',
         writerEpoch: $completed->writerEpoch,
         timestamp: '2026-07-19T13:00:00Z',
-    ))->toThrow(InvalidArgumentException::class, 'strictly advance');
+    ))->toThrow(InvalidArgumentException::class, 'by one');
 });
 
 it('replaces a rolled-back terminal state from its restored predecessor with a newer writer epoch', function (): void {
@@ -328,9 +397,11 @@ it('replaces a rolled-back terminal state from its restored predecessor with a n
             'rollback_started_at' => '2026-07-19T12:01:00Z',
         ])
         ->withPhase(ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement, '2026-07-19T12:02:00Z')
-        ->withPhase(ControlPlaneGenerationPromotionPhase::RolledBack, '2026-07-19T12:03:00Z', [
+        ->withPhase(ControlPlaneGenerationPromotionPhase::RollbackUnfreezing, '2026-07-19T12:03:00Z', [
             'rollback_acknowledged_at' => '2026-07-19T12:03:00Z',
-            'rolled_back_at' => '2026-07-19T12:03:00Z',
+        ])
+        ->withPhase(ControlPlaneGenerationPromotionPhase::RolledBack, '2026-07-19T12:04:00Z', [
+            'rolled_back_at' => '2026-07-19T12:04:00Z',
         ]);
     $server->proxy->set(StoreControlPlaneGenerationPromotionState::STATE_KEY, $rolledBack->toArray());
     $server->save();
@@ -348,13 +419,13 @@ it('replaces a rolled-back terminal state from its restored predecessor with a n
         successorConfigurationAcknowledgement: 'ack:'.str_repeat('d', 64),
         runtime: generationPromotionRuntime(),
         writerMember: 'green',
-        writerEpoch: 3,
+        writerEpoch: 2,
         timestamp: '2026-07-19T13:00:00Z',
     );
 
     expect($store->reserve($server, $replacement, 'promotion-after-rollback-token')->predecessor)
         ->toBe($rolledBack->predecessor)
-        ->and($replacement->writerEpoch)->toBe(3);
+        ->and($replacement->writerEpoch)->toBe(2);
 });
 
 it('binds write and route observations to the exact successor', function () {

@@ -65,12 +65,20 @@ it('requires sorted independent member maps and a successor writer identity', fu
     $mismatchedWriterId = $payload;
     $mismatchedWriterId['writer']['container_id'] = str_repeat('0', 64);
 
+    $noncanonicalWriter = $payload;
+    $noncanonicalWriter['writer'] = [
+        'name' => 'coolify-web-d',
+        'container_id' => str_repeat('1', 64),
+    ];
+
     expect(fn (): ControlPlaneGenerationRuntime => ControlPlaneGenerationRuntime::fromArray($unsorted))
         ->toThrow(InvalidArgumentException::class, 'sorted and unique');
     expect(fn (): ControlPlaneGenerationRuntime => ControlPlaneGenerationRuntime::fromArray($unknownWriter))
         ->toThrow(InvalidArgumentException::class, 'must identify a successor');
     expect(fn (): ControlPlaneGenerationRuntime => ControlPlaneGenerationRuntime::fromArray($mismatchedWriterId))
         ->toThrow(InvalidArgumentException::class, 'must match its successor');
+    expect(fn (): ControlPlaneGenerationRuntime => ControlPlaneGenerationRuntime::fromArray($noncanonicalWriter))
+        ->toThrow(InvalidArgumentException::class, 'canonical first successor');
 });
 
 it('rejects unsafe names, weak identifiers, unexpected member shapes, and noncanonical JSON', function (): void {

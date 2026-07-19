@@ -3,6 +3,8 @@
 namespace App\Actions\Proxy\ControlPlane;
 
 use App\Models\Server;
+use App\Support\ProxyMutationQueue;
+use App\Support\ProxyMutationQueueSnapshot;
 use Closure;
 use DateInterval;
 use DateTimeImmutable;
@@ -21,18 +23,24 @@ final class SwitchControlPlaneGenerationRoutes
     /** @var Closure(DateTimeImmutable): DateTimeImmutable */
     private readonly Closure $drainDeadline;
 
+    /** @var Closure(ControlPlaneGenerationPromotionState): ProxyMutationQueueSnapshot */
+    private readonly Closure $queueSnapshot;
+
     public function __construct(
         private readonly StoreControlPlaneGenerationPromotionState $promotionStore,
         private readonly StoreControlPlaneProxyEnrollmentState $enrollmentStore,
         private readonly ManagedTraefikDocumentWriter $dynamicWriter,
+        private readonly ControlPlaneGenerationWriterAuthority $writerAuthority,
         private readonly VerifyControlPlaneProxyRoutes $routeVerifier,
         ?Closure $clock = null,
         ?Closure $drainDeadline = null,
+        ?Closure $queueSnapshot = null,
     ) {
         $this->clock = $clock ?? static fn (): DateTimeImmutable => now()->toImmutable();
         $this->drainDeadline = $drainDeadline ?? static fn (DateTimeImmutable $acknowledgedAt): DateTimeImmutable => $acknowledgedAt->add(
             new DateInterval('PT'.self::DRAIN_WINDOW_SECONDS.'S'),
         );
+        $this->queueSnapshot = $queueSnapshot ?? static fn (): ProxyMutationQueueSnapshot => ProxyMutationQueue::snapshot();
     }
 
     /** @param null|Closure(string): ?string $remoteExecutor */
@@ -76,11 +84,18 @@ final class SwitchControlPlaneGenerationRoutes
             );
         }
         if ($state->phase === ControlPlaneGenerationPromotionPhase::Switching) {
+            $this->assertOwnedFrozenEmpty($state);
+            $mutation = $this->dynamicMutation($server, $state, $successorYaml);
             $this->assertExactOutput(
-                $execute($this->dynamicWriter->writeCommandFor($this->dynamicMutation($server, $state, $successorYaml))),
+                $execute($this->dynamicWriter->writeCommandForRequiringAuthority(
+                    mutation: $mutation,
+                    activeAuthority: $this->writerAuthority->predecessor($state),
+                    allowBootstrap: $this->isInitialGeneration($state, $enrollment),
+                )),
                 ManagedTraefikDocumentWriter::APPLIED_OUTPUT,
                 'dynamic Traefik document',
             );
+            $this->assertOwnedFrozenEmpty($state);
             $dynamicWrittenAt = $this->now();
             $state = $this->promotionStore->transition(
                 $server,
@@ -93,12 +108,14 @@ final class SwitchControlPlaneGenerationRoutes
             );
         }
         if ($state->phase === ControlPlaneGenerationPromotionPhase::AwaitingAcknowledgement) {
+            $this->assertOwnedFrozenEmpty($state);
             $proof = $this->routeProof($enrollment, $state);
             $transcript = $execute($proof->shellCommand());
             if (! is_string($transcript)) {
                 throw new RuntimeException('The control-plane successor route proof returned no transcript.');
             }
             $this->routeVerifier->handle($proof, $transcript);
+            $this->assertOwnedFrozenEmpty($state);
 
             $acknowledgedAt = $this->now();
             $deadline = $this->boundedDrainDeadline($acknowledgedAt);
@@ -152,6 +169,34 @@ final class SwitchControlPlaneGenerationRoutes
         }
 
         return $enrollment;
+    }
+
+    private function isInitialGeneration(
+        ControlPlaneGenerationPromotionState $state,
+        ControlPlaneProxyEnrollmentState $enrollment,
+    ): bool {
+        return $state->writerEpoch === 2
+            && $state->matchesEnrolledPredecessor($enrollment);
+    }
+
+    private function assertOwnedFrozenEmpty(
+        ControlPlaneGenerationPromotionState $state,
+    ): ProxyMutationQueueSnapshot {
+        $snapshot = ($this->queueSnapshot)($state);
+        if (! $snapshot instanceof ProxyMutationQueueSnapshot) {
+            throw new RuntimeException('The control-plane generation mutation queue snapshot is invalid.');
+        }
+        if ($state->mutationFreeze === null
+            || ! hash_equals($state->operationId, $state->mutationFreeze['operation_id'])
+            || $snapshot->freezeOperationId === null
+            || ! hash_equals($state->operationId, $snapshot->freezeOperationId)) {
+            throw new RuntimeException('The control-plane generation mutation freeze is missing or owned by another operation.');
+        }
+        if (! $snapshot->isEmpty()) {
+            throw new RuntimeException('The control-plane generation mutation queue must be empty during route mutation.');
+        }
+
+        return $snapshot;
     }
 
     private function assertSuccessorYaml(ControlPlaneGenerationPromotionState $state, string $successorYaml): void

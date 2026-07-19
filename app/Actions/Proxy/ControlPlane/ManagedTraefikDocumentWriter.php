@@ -2,6 +2,7 @@
 
 namespace App\Actions\Proxy\ControlPlane;
 
+use InvalidArgumentException;
 use Lorisleiva\Actions\Concerns\AsAction;
 
 final class ManagedTraefikDocumentWriter
@@ -12,6 +13,8 @@ final class ManagedTraefikDocumentWriter
 
     public const ROLLED_BACK_OUTPUT = 'coolify-managed-traefik-document:rolled-back';
 
+    public const WRITER_AUTHORITY_PROMOTED_OUTPUT = 'coolify-managed-traefik-writer-authority:promoted';
+
     private const ARTIFACT_MAGIC = 'coolify-managed-traefik-document-rollback-v1';
 
     private const JOURNAL_MAGIC = 'coolify-managed-traefik-document-journal-v1';
@@ -21,14 +24,77 @@ final class ManagedTraefikDocumentWriter
         return $this->commandFor($mutation, false);
     }
 
-    public function rollbackCommandFor(ManagedTraefikDocumentMutation $mutation): string
-    {
-        return $this->commandFor($mutation, true);
+    public function rollbackCommandFor(
+        ManagedTraefikDocumentMutation $mutation,
+        bool $allowMissingArtifactNoop = false,
+    ): string {
+        return $this->commandFor(
+            mutation: $mutation,
+            rollback: true,
+            allowMissingArtifactNoop: $allowMissingArtifactNoop,
+        );
     }
 
-    private function commandFor(ManagedTraefikDocumentMutation $mutation, bool $rollback): string
-    {
+    public function writeCommandForRequiringAuthority(
+        ManagedTraefikDocumentMutation $mutation,
+        ManagedTraefikDocumentWriterAuthority $activeAuthority,
+        bool $allowBootstrap,
+    ): string {
+        $this->assertDocumentWriteAuthority($mutation, $activeAuthority, $allowBootstrap);
+
+        return $this->commandFor(
+            mutation: $mutation,
+            rollback: false,
+            requiredAuthority: $activeAuthority,
+            allowAuthorityBootstrap: $allowBootstrap,
+        );
+    }
+
+    public function promoteWriterAuthorityCommandFor(
+        string $stateDirectory,
+        string $filename,
+        ManagedTraefikDocumentWriterAuthority $expectedAuthority,
+        ManagedTraefikDocumentWriterAuthority $nextAuthority,
+    ): string {
+        $this->assertWriterAuthorityContext($stateDirectory, $filename);
+        $this->assertAuthorityPromotion($expectedAuthority, $nextAuthority);
+
+        return $this->authorityPromotionCommandFor(
+            stateDirectory: $stateDirectory,
+            filename: $filename,
+            expectedAuthority: $expectedAuthority,
+            nextAuthority: $nextAuthority,
+        );
+    }
+
+    public function rollbackCommandForRequiringPredecessorAuthority(
+        ManagedTraefikDocumentMutation $mutation,
+        ManagedTraefikDocumentWriterAuthority $predecessorAuthority,
+        bool $allowInitialOrPreWriteReconciliation = false,
+        bool $allowMissingArtifactNoop = false,
+    ): string {
+        $this->assertRollbackAuthority($mutation, $predecessorAuthority);
+
+        return $this->commandFor(
+            mutation: $mutation,
+            rollback: true,
+            requiredAuthority: $predecessorAuthority,
+            allowMissingArtifactNoop: $allowMissingArtifactNoop,
+            allowAuthorityAbsence: $allowInitialOrPreWriteReconciliation,
+        );
+    }
+
+    private function commandFor(
+        ManagedTraefikDocumentMutation $mutation,
+        bool $rollback,
+        ?ManagedTraefikDocumentWriterAuthority $requiredAuthority = null,
+        bool $allowMissingArtifactNoop = false,
+        bool $allowAuthorityBootstrap = false,
+        bool $allowAuthorityAbsence = false,
+    ): string {
         $expectedSidecar = $mutation->expectedSidecar();
+        $authorityMode = $requiredAuthority === null ? 'none' : 'require';
+        $requiredAuthority = $requiredAuthority?->toJson();
 
         return implode("\n", [
             'set -eu',
@@ -44,6 +110,13 @@ final class ManagedTraefikDocumentWriter
             'lock_path='.escapeshellarg($mutation->lockPath()),
             'journal_path='.escapeshellarg($mutation->journalPath()),
             'artifact_path='.escapeshellarg($mutation->rollbackArtifactPath()),
+            'authority_path='.escapeshellarg($mutation->writerAuthorityPath()),
+            'authority_mode='.escapeshellarg($authorityMode),
+            'authority_required_base64='.escapeshellarg($requiredAuthority === null ? 'absent' : base64_encode($requiredAuthority)),
+            'authority_maximum_bytes='.escapeshellarg((string) ManagedTraefikDocumentWriterAuthority::MAXIMUM_SERIALIZED_BYTES),
+            'allow_authority_bootstrap='.escapeshellarg($allowAuthorityBootstrap ? 'true' : 'false'),
+            'allow_authority_absence='.escapeshellarg($allowAuthorityAbsence ? 'true' : 'false'),
+            'allow_missing_artifact_noop='.escapeshellarg($allowMissingArtifactNoop ? 'true' : 'false'),
             'original_expected_document_sha='.escapeshellarg($mutation->expectedSha256 ?? 'absent'),
             'original_replacement_document_sha='.escapeshellarg($mutation->replacementSha256()),
             'original_expected_sidecar_base64='.escapeshellarg($expectedSidecar === null ? 'absent' : base64_encode($expectedSidecar)),
@@ -82,6 +155,40 @@ final class ManagedTraefikDocumentWriter
             '  fi',
             '  test -e "$sidecar_candidate" && test ! -L "$sidecar_candidate" && test -f "$sidecar_candidate" || return 1',
             '  cmp -s "$sidecar_candidate" "$expected_sidecar_file"',
+            '}',
+            'authority_matches() {',
+            '  authority_candidate=$1',
+            '  authority_expected=$2',
+            '  test -e "$authority_candidate" && test ! -L "$authority_candidate" && test -f "$authority_candidate" || return 1',
+            '  authority_size=$(wc -c < "$authority_candidate" | tr -d "[:space:]") || return 1',
+            '  case "$authority_size" in ""|*[!0-9]*) return 1 ;; esac',
+            '  test "$authority_size" -le "$authority_maximum_bytes" || return 1',
+            '  cmp -s "$authority_candidate" "$authority_expected"',
+            '}',
+            'authorize_writer() {',
+            '  case "$authority_mode" in',
+            '    none)',
+            '      test ! -e "$authority_path" && test ! -L "$authority_path" || fail',
+            '      ;;',
+            '    require)',
+            '      if [ -e "$authority_path" ] || [ -L "$authority_path" ]; then',
+            '        authority_matches "$authority_path" "$authority_required_file" || fail',
+            '        return',
+            '      fi',
+            '      if [ "$allow_authority_bootstrap" = true ]; then',
+            '        atomic_replace "$authority_path" "$authority_required_file" "$state_directory"',
+            '        authority_matches "$authority_path" "$authority_required_file" || fail',
+            '        return',
+            '      fi',
+            '      test "$allow_authority_absence" = true || fail',
+            '      ;;',
+            '    *)',
+            '      fail',
+            '      ;;',
+            '  esac',
+            '}',
+            'crash_after_authority_if_requested() {',
+            '  if [ "$mode" = write ] && [ "${COOLIFY_MANAGED_TRAEFIK_DOCUMENT_CRASH_AFTER_AUTHORITY:-}" = 1 ]; then exit 75; fi',
             '}',
             'atomic_replace() {',
             '  replacement_target=$1',
@@ -229,6 +336,7 @@ final class ManagedTraefikDocumentWriter
             'assert_regular_or_absent "$sidecar_path"',
             'assert_regular_or_absent "$journal_path"',
             'assert_regular_or_absent "$artifact_path"',
+            'assert_regular_or_absent "$authority_path"',
             'assert_regular_or_absent "$lock_path"',
             'command -v flock >/dev/null 2>&1 || fail',
             'exec 9> "$lock_path" || fail',
@@ -237,12 +345,14 @@ final class ManagedTraefikDocumentWriter
             'assert_regular_or_absent "$sidecar_path"',
             'assert_regular_or_absent "$journal_path"',
             'assert_regular_or_absent "$artifact_path"',
+            'assert_regular_or_absent "$authority_path"',
             'scratch=$(mktemp -d "$state_directory/.managed-traefik-document.XXXXXX") || fail',
             'expected_sidecar_file="$scratch/expected-sidecar"',
             'replacement_sidecar_file="$scratch/replacement-sidecar"',
             'replacement_payload_file="$scratch/replacement-payload"',
             'expected_journal="$scratch/expected-journal"',
-            'cleanup() { rm -f "$expected_sidecar_file" "$replacement_sidecar_file" "$replacement_payload_file" "$expected_journal" "$scratch/predecessor-document"; rmdir "$scratch" 2>/dev/null || true; }',
+            'authority_required_file="$scratch/authority-required"',
+            'cleanup() { rm -f "$expected_sidecar_file" "$replacement_sidecar_file" "$replacement_payload_file" "$expected_journal" "$authority_required_file" "$scratch/predecessor-document"; rmdir "$scratch" 2>/dev/null || true; }',
             'trap cleanup 0 HUP INT TERM',
             'expected_document_sha=$original_expected_document_sha',
             'replacement_document_sha=$original_replacement_document_sha',
@@ -259,6 +369,7 @@ final class ManagedTraefikDocumentWriter
             '    replacement_sidecar_base64=$original_expected_sidecar_base64',
             '    replacement_payload_base64=$artifact_predecessor_payload_base64',
             '  else',
+            '    test "$allow_missing_artifact_noop" = true || fail',
             '    rollback_without_artifact=true',
             '    replacement_document_sha=$original_expected_document_sha',
             '    replacement_sidecar_base64=$original_expected_sidecar_base64',
@@ -268,7 +379,22 @@ final class ManagedTraefikDocumentWriter
             'if [ "$expected_sidecar_base64" = absent ]; then : > "$expected_sidecar_file"; else printf %s "$expected_sidecar_base64" | base64 -d > "$expected_sidecar_file" || fail; fi',
             'if [ "$replacement_sidecar_base64" = absent ]; then : > "$replacement_sidecar_file"; else printf %s "$replacement_sidecar_base64" | base64 -d > "$replacement_sidecar_file" || fail; fi',
             'if [ "$replacement_payload_base64" = absent ]; then : > "$replacement_payload_file"; else printf %s "$replacement_payload_base64" | base64 -d > "$replacement_payload_file" || fail; fi',
+            'case "$allow_missing_artifact_noop" in true|false) ;; *) fail ;; esac',
+            'if [ "$authority_required_base64" = absent ]; then : > "$authority_required_file"; else printf %s "$authority_required_base64" | base64 -d > "$authority_required_file" || fail; fi',
+            'case "$allow_authority_bootstrap" in true|false) ;; *) fail ;; esac',
+            'case "$allow_authority_absence" in true|false) ;; *) fail ;; esac',
+            'case "$authority_mode" in',
+            '  none)',
+            '    test "$authority_required_base64" = absent && test "$allow_authority_bootstrap" = false && test "$allow_authority_absence" = false || fail',
+            '    ;;',
+            '  require)',
+            '    test "$authority_required_base64" != absent || fail',
+            '    if [ "$allow_authority_bootstrap" = true ] && [ "$allow_authority_absence" = true ]; then fail; fi',
+            '    ;;',
+            '  *) fail ;;',
+            'esac',
             'if [ "$rollback_without_artifact" = true ]; then',
+            '  authorize_writer',
             '  test ! -e "$journal_path" && test ! -L "$journal_path" || fail',
             '  document_matches "$document_path" "$original_expected_document_sha" || fail',
             '  sidecar_matches "$sidecar_path" "$original_expected_sidecar_base64" "$expected_sidecar_file" || fail',
@@ -283,10 +409,18 @@ final class ManagedTraefikDocumentWriter
             'if [ -e "$journal_path" ] || [ -L "$journal_path" ]; then',
             '  assert_regular_or_absent "$journal_path"',
             '  cmp -s "$journal_path" "$expected_journal" || fail',
+            '  if [ "$mode" = write ]; then validate_artifact; fi',
+            '  authorize_writer',
+            '  crash_after_authority_if_requested',
             '  apply_journal',
             'elif document_matches "$document_path" "$replacement_document_sha" && sidecar_matches "$sidecar_path" "$replacement_sidecar_base64" "$replacement_sidecar_file"; then',
             '  if [ "$mode" = write ]; then validate_artifact; fi',
+            '  authorize_writer',
+            '  crash_after_authority_if_requested',
             'elif document_matches "$document_path" "$expected_document_sha" && sidecar_matches "$sidecar_path" "$expected_sidecar_base64" "$expected_sidecar_file"; then',
+            '  if [ "$mode" = write ] && { [ -e "$artifact_path" ] || [ -L "$artifact_path" ]; }; then validate_artifact; fi',
+            '  authorize_writer',
+            '  crash_after_authority_if_requested',
             '  if [ "$mode" = write ]; then create_artifact_if_missing; fi',
             '  write_journal',
             '  apply_journal',
@@ -295,5 +429,127 @@ final class ManagedTraefikDocumentWriter
             'fi',
             'if [ "$mode" = rollback ]; then printf %s "$rolled_back_output"; else printf %s "$applied_output"; fi',
         ]);
+    }
+
+    private function authorityPromotionCommandFor(
+        string $stateDirectory,
+        string $filename,
+        ManagedTraefikDocumentWriterAuthority $expectedAuthority,
+        ManagedTraefikDocumentWriterAuthority $nextAuthority,
+    ): string {
+        $lockPath = rtrim($stateDirectory, '/').'/.'.$filename.'.lock';
+        $authorityPath = rtrim($stateDirectory, '/').'/.'.$filename.'.writer-authority.json';
+
+        return implode("\n", [
+            'set -eu',
+            'umask 077',
+            'state_directory='.escapeshellarg($stateDirectory),
+            'lock_path='.escapeshellarg($lockPath),
+            'authority_path='.escapeshellarg($authorityPath),
+            'expected_authority_base64='.escapeshellarg(base64_encode($expectedAuthority->toJson())),
+            'next_authority_base64='.escapeshellarg(base64_encode($nextAuthority->toJson())),
+            'authority_maximum_bytes='.escapeshellarg((string) ManagedTraefikDocumentWriterAuthority::MAXIMUM_SERIALIZED_BYTES),
+            'promoted_output='.escapeshellarg(self::WRITER_AUTHORITY_PROMOTED_OUTPUT),
+            '',
+            'fail() { exit 1; }',
+            'assert_directory() { test -d "$1" && test ! -L "$1" || fail; }',
+            'assert_regular_or_absent() {',
+            '  if [ -e "$1" ] || [ -L "$1" ]; then',
+            '    test ! -L "$1" && test -f "$1" || fail',
+            '  fi',
+            '}',
+            'authority_matches() {',
+            '  authority_candidate=$1',
+            '  authority_expected=$2',
+            '  test -e "$authority_candidate" && test ! -L "$authority_candidate" && test -f "$authority_candidate" || return 1',
+            '  authority_size=$(wc -c < "$authority_candidate" | tr -d "[:space:]") || return 1',
+            '  case "$authority_size" in ""|*[!0-9]*) return 1 ;; esac',
+            '  test "$authority_size" -le "$authority_maximum_bytes" || return 1',
+            '  cmp -s "$authority_candidate" "$authority_expected"',
+            '}',
+            'atomic_replace() {',
+            '  replacement_target=$1',
+            '  replacement_source=$2',
+            '  replacement_stage=$(mktemp "$state_directory/.managed-traefik-authority.XXXXXX") || fail',
+            '  cp "$replacement_source" "$replacement_stage" || fail',
+            '  chmod 600 "$replacement_stage" || fail',
+            '  sync -f "$replacement_stage" || fail',
+            '  mv -f "$replacement_stage" "$replacement_target" || fail',
+            '  sync -f "$state_directory" || fail',
+            '}',
+            '',
+            'mkdir -p "$state_directory" || fail',
+            'assert_directory "$state_directory"',
+            'assert_regular_or_absent "$authority_path"',
+            'assert_regular_or_absent "$lock_path"',
+            'command -v flock >/dev/null 2>&1 || fail',
+            'exec 9> "$lock_path" || fail',
+            'flock -x 9 || fail',
+            'assert_regular_or_absent "$authority_path"',
+            'scratch=$(mktemp -d "$state_directory/.managed-traefik-authority.XXXXXX") || fail',
+            'expected_authority_file="$scratch/expected-authority"',
+            'next_authority_file="$scratch/next-authority"',
+            'cleanup() { rm -f "$expected_authority_file" "$next_authority_file"; rmdir "$scratch" 2>/dev/null || true; }',
+            'trap cleanup 0 HUP INT TERM',
+            'printf %s "$expected_authority_base64" | base64 -d > "$expected_authority_file" || fail',
+            'printf %s "$next_authority_base64" | base64 -d > "$next_authority_file" || fail',
+            'if authority_matches "$authority_path" "$next_authority_file"; then',
+            '  printf %s "$promoted_output"',
+            '  exit 0',
+            'fi',
+            'authority_matches "$authority_path" "$expected_authority_file" || fail',
+            'atomic_replace "$authority_path" "$next_authority_file"',
+            'authority_matches "$authority_path" "$next_authority_file" || fail',
+            'if [ "${COOLIFY_MANAGED_TRAEFIK_DOCUMENT_CRASH_AFTER_AUTHORITY:-}" = 1 ]; then exit 75; fi',
+            'printf %s "$promoted_output"',
+        ]);
+    }
+
+    private function assertDocumentWriteAuthority(
+        ManagedTraefikDocumentMutation $mutation,
+        ManagedTraefikDocumentWriterAuthority $activeAuthority,
+        bool $allowBootstrap,
+    ): void {
+        if ($allowBootstrap) {
+            if ($activeAuthority->epoch !== 1 || ! $activeAuthority->matchesPredecessor($mutation)) {
+                throw new InvalidArgumentException('Managed Traefik document writer authority bootstrap is limited to the exact initial epoch-one predecessor authority.');
+            }
+
+            return;
+        }
+
+        if (! $activeAuthority->matchesPredecessor($mutation)) {
+            throw new InvalidArgumentException('The managed Traefik document write must require the exact active predecessor authority.');
+        }
+    }
+
+    private function assertAuthorityPromotion(
+        ManagedTraefikDocumentWriterAuthority $expectedAuthority,
+        ManagedTraefikDocumentWriterAuthority $nextAuthority,
+    ): void {
+        if ($nextAuthority->epoch !== $expectedAuthority->epoch + 1) {
+            throw new InvalidArgumentException('A managed Traefik document writer authority promotion must advance exactly one epoch.');
+        }
+    }
+
+    private function assertWriterAuthorityContext(string $stateDirectory, string $filename): void
+    {
+        if (! str_starts_with($stateDirectory, '/') || str_contains($stateDirectory, "\0")) {
+            throw new InvalidArgumentException('The managed Traefik document writer authority state directory must be an absolute NUL-free path.');
+        }
+
+        if (basename($filename) !== $filename
+            || preg_match('/\A[a-z0-9][a-z0-9.-]{0,127}\.ya?ml\z/D', $filename) !== 1) {
+            throw new InvalidArgumentException('The managed Traefik document writer authority filename is invalid.');
+        }
+    }
+
+    private function assertRollbackAuthority(
+        ManagedTraefikDocumentMutation $mutation,
+        ManagedTraefikDocumentWriterAuthority $predecessorAuthority,
+    ): void {
+        if (! $predecessorAuthority->matchesPredecessor($mutation)) {
+            throw new InvalidArgumentException('The managed Traefik document rollback must require the exact predecessor authority and cannot downgrade a successor authority.');
+        }
     }
 }

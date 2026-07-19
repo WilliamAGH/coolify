@@ -98,6 +98,11 @@ final readonly class ManagedTraefikDocumentMutation
         return rtrim($this->stateDirectory, '/').'/.'.$this->filename.'.'.$this->operationId.'.r'.$this->revision.'.rollback';
     }
 
+    public function writerAuthorityPath(): string
+    {
+        return rtrim($this->stateDirectory, '/').'/.'.$this->filename.'.writer-authority.json';
+    }
+
     private function sidecar(string $operationId, int $revision, string $sha256): string
     {
         return json_encode([

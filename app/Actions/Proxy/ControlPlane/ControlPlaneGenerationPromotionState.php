@@ -75,7 +75,10 @@ final readonly class ControlPlaneGenerationPromotionState
             throw new InvalidArgumentException('The control-plane generation runtime must match the routed backend sets exactly.');
         }
         self::assertIdentifier($writerMember, 'writer member');
-        if ($writerEpoch < 1) {
+        if (! hash_equals($writerMember, $successor['member'])) {
+            throw new InvalidArgumentException('The control-plane generation writer member must match the successor member.');
+        }
+        if ($writerEpoch < 2) {
             throw new InvalidArgumentException('The control-plane generation promotion writer epoch is invalid.');
         }
         foreach ([
@@ -123,6 +126,9 @@ final readonly class ControlPlaneGenerationPromotionState
     ): self {
         if ($token === '') {
             throw new InvalidArgumentException('The control-plane generation promotion token must not be empty.');
+        }
+        if ($writerEpoch !== 2) {
+            throw new InvalidArgumentException('The initial control-plane generation writer epoch must be two.');
         }
 
         return self::newReservation(
@@ -174,8 +180,11 @@ final readonly class ControlPlaneGenerationPromotionState
         if ($completedPromotion->phase !== ControlPlaneGenerationPromotionPhase::Completed) {
             throw new InvalidArgumentException('A new control-plane generation promotion requires a completed predecessor.');
         }
-        if ($writerEpoch <= $completedPromotion->writerEpoch) {
-            throw new InvalidArgumentException('A new control-plane generation writer epoch must strictly advance its completed predecessor.');
+        if ($writerEpoch !== $completedPromotion->writerEpoch + 1) {
+            throw new InvalidArgumentException('A new control-plane generation writer epoch must advance its completed predecessor by one.');
+        }
+        if ($runtime->predecessorRuntime !== $completedPromotion->runtime->successorRuntime) {
+            throw new InvalidArgumentException('A new control-plane generation runtime must preserve the exact completed successor runtime.');
         }
         if ($token === '') {
             throw new InvalidArgumentException('The control-plane generation promotion token must not be empty.');
@@ -230,8 +239,11 @@ final readonly class ControlPlaneGenerationPromotionState
         if ($rolledBackPromotion->phase !== ControlPlaneGenerationPromotionPhase::RolledBack) {
             throw new InvalidArgumentException('A replacement control-plane generation promotion requires a rolled-back predecessor.');
         }
-        if ($writerEpoch <= $rolledBackPromotion->writerEpoch) {
-            throw new InvalidArgumentException('A replacement control-plane generation writer epoch must strictly advance its rolled-back predecessor.');
+        if ($writerEpoch !== $rolledBackPromotion->writerEpoch) {
+            throw new InvalidArgumentException('A replacement control-plane generation must reuse the unpromoted writer epoch.');
+        }
+        if ($runtime->predecessorRuntime !== $rolledBackPromotion->runtime->predecessorRuntime) {
+            throw new InvalidArgumentException('A replacement control-plane generation runtime must preserve the exact rolled-back predecessor runtime.');
         }
         if ($token === '') {
             throw new InvalidArgumentException('The control-plane generation promotion token must not be empty.');
@@ -350,7 +362,7 @@ final readonly class ControlPlaneGenerationPromotionState
         return $rolledBackPromotion->phase === ControlPlaneGenerationPromotionPhase::RolledBack
             && $this->managedFilename === $rolledBackPromotion->managedFilename
             && $this->predecessor === $rolledBackPromotion->predecessor
-            && $this->writerEpoch > $rolledBackPromotion->writerEpoch;
+            && $this->writerEpoch === $rolledBackPromotion->writerEpoch;
     }
 
     public function sameReservationAs(self $other): bool
@@ -369,6 +381,15 @@ final readonly class ControlPlaneGenerationPromotionState
         return hash('sha256', json_encode([
             'predecessor' => $this->runtime->predecessorRuntime,
         ], JSON_THROW_ON_ERROR));
+    }
+
+    public function hasRetirementStarted(): bool
+    {
+        return ($this->draining !== null && $this->draining['stable_zero_observations'] !== [])
+            || $this->retiredAt !== null
+            || $this->writerPromotedAt !== null
+            || $this->fenceReleasedAt !== null
+            || $this->unfrozenAt !== null;
     }
 
     /** @return array<string, mixed> */
@@ -628,12 +649,26 @@ final readonly class ControlPlaneGenerationPromotionState
         if (in_array($this->phase, [
             ControlPlaneGenerationPromotionPhase::RollingBack,
             ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement,
+            ControlPlaneGenerationPromotionPhase::RollbackUnfreezing,
             ControlPlaneGenerationPromotionPhase::RolledBack,
         ], true) && $this->rollbackStartedAt === null) {
             throw new InvalidArgumentException('The control-plane generation promotion requires a rollback-start timestamp.');
         }
-        if ($this->phase === ControlPlaneGenerationPromotionPhase::RolledBack
-            && ($this->rollbackAcknowledgedAt === null || $this->rolledBackAt === null)) {
+        if (in_array($this->phase, [
+            ControlPlaneGenerationPromotionPhase::RollingBack,
+            ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement,
+            ControlPlaneGenerationPromotionPhase::RollbackUnfreezing,
+            ControlPlaneGenerationPromotionPhase::RolledBack,
+        ], true) && $this->hasRetirementStarted()) {
+            throw new InvalidArgumentException('A control-plane generation cannot roll back after predecessor retirement has started.');
+        }
+        if (in_array($this->phase, [
+            ControlPlaneGenerationPromotionPhase::RollbackUnfreezing,
+            ControlPlaneGenerationPromotionPhase::RolledBack,
+        ], true) && $this->rollbackAcknowledgedAt === null) {
+            throw new InvalidArgumentException('The control-plane generation promotion requires durable rollback acknowledgement.');
+        }
+        if ($this->phase === ControlPlaneGenerationPromotionPhase::RolledBack && $this->rolledBackAt === null) {
             throw new InvalidArgumentException('The control-plane generation promotion requires durable rollback acknowledgement.');
         }
         if ($this->phase === ControlPlaneGenerationPromotionPhase::InterventionRequired && $this->interventionRequiredAt === null) {

@@ -23,6 +23,7 @@ enum ControlPlaneGenerationPromotionPhase: string
     case Completed = 'completed';
     case RollingBack = 'rolling_back';
     case AwaitingRollbackAcknowledgement = 'awaiting_rollback_acknowledgement';
+    case RollbackUnfreezing = 'rollback_unfreezing';
     case RolledBack = 'rolled_back';
     case InterventionRequired = 'intervention_required';
 
@@ -43,13 +44,14 @@ enum ControlPlaneGenerationPromotionPhase: string
             self::Switching => [self::AwaitingAcknowledgement, self::RollingBack, self::InterventionRequired],
             self::AwaitingAcknowledgement => [self::Draining, self::RollingBack, self::InterventionRequired],
             self::Draining => [self::Retiring, self::RollingBack, self::InterventionRequired],
-            self::Retiring => [self::WriterPromoting, self::RollingBack, self::InterventionRequired],
-            self::WriterPromoting => [self::FenceReleasing, self::RollingBack, self::InterventionRequired],
-            self::FenceReleasing => [self::Unfreezing, self::RollingBack, self::InterventionRequired],
-            self::Unfreezing => [self::Completed, self::RollingBack, self::InterventionRequired],
+            self::Retiring => [self::WriterPromoting, self::InterventionRequired],
+            self::WriterPromoting => [self::FenceReleasing, self::InterventionRequired],
+            self::FenceReleasing => [self::Unfreezing, self::InterventionRequired],
+            self::Unfreezing => [self::Completed, self::InterventionRequired],
             self::Completed, self::RolledBack => [],
             self::RollingBack => [self::AwaitingRollbackAcknowledgement, self::InterventionRequired],
-            self::AwaitingRollbackAcknowledgement => [self::RolledBack, self::InterventionRequired],
+            self::AwaitingRollbackAcknowledgement => [self::RollbackUnfreezing, self::InterventionRequired],
+            self::RollbackUnfreezing => [self::RolledBack, self::InterventionRequired],
             self::InterventionRequired => [self::RollingBack],
         };
 

@@ -45,6 +45,9 @@ final readonly class ControlPlaneGenerationRuntime
         if (! hash_equals($successorRuntime[$writerContainerName]['container_id'], $writerContainerId)) {
             throw new InvalidArgumentException('The control-plane writer container ID must match its successor runtime member.');
         }
+        if (array_key_first($successorRuntime) !== $writerContainerName) {
+            throw new InvalidArgumentException('The control-plane writer must be the canonical first successor runtime member.');
+        }
     }
 
     public static function fromJson(string $json): self
@@ -104,6 +107,21 @@ final readonly class ControlPlaneGenerationRuntime
     public function successorDockerIdFor(string $routedDnsName): string
     {
         return $this->dockerIdFor($this->successorRuntime, $routedDnsName, 'successor');
+    }
+
+    /** @return array{name: string, container_id: string, image_id: string} */
+    public function predecessorWriterIdentity(): array
+    {
+        $name = array_key_first($this->predecessorRuntime);
+        if (! is_string($name)) {
+            throw new InvalidArgumentException('The control-plane predecessor writer identity is missing.');
+        }
+
+        return [
+            'name' => $name,
+            'container_id' => $this->predecessorRuntime[$name]['container_id'],
+            'image_id' => $this->predecessorRuntime[$name]['image_id'],
+        ];
     }
 
     /** @return array{name: string, container_id: string, image_id: string} */

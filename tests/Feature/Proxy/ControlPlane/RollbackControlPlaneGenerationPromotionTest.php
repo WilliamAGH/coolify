@@ -4,6 +4,7 @@ use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
 use App\Actions\Proxy\ControlPlane\ControlPlaneGenerationPromotionPhase;
 use App\Actions\Proxy\ControlPlane\ControlPlaneGenerationPromotionState;
 use App\Actions\Proxy\ControlPlane\ControlPlaneGenerationRuntime;
+use App\Actions\Proxy\ControlPlane\ControlPlaneGenerationWriterAuthority;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentPhase;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentState;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyExposure;
@@ -260,6 +261,7 @@ function rollbackControlPlaneGenerationAction(array $fixture): RollbackControlPl
         $fixture['promotion_store'],
         $fixture['enrollment_store'],
         new ManagedTraefikDocumentWriter,
+        new ControlPlaneGenerationWriterAuthority,
         new VerifyControlPlaneRestoredRoutes,
     );
 }
@@ -281,6 +283,18 @@ function rollbackControlPlaneGenerationMutation(
         expectedOperationId: $state->predecessor['operation_id'],
         expectedRevision: $state->predecessor['dynamic_revision'],
         replacementBytes: $successorYaml,
+    );
+}
+
+function rollbackControlPlaneGenerationWriterCommand(
+    ControlPlaneGenerationPromotionState $state,
+    ManagedTraefikDocumentMutation $mutation,
+): string {
+    return (new ManagedTraefikDocumentWriter)->rollbackCommandForRequiringPredecessorAuthority(
+        mutation: $mutation,
+        predecessorAuthority: (new ControlPlaneGenerationWriterAuthority)->predecessor($state),
+        allowInitialOrPreWriteReconciliation: true,
+        allowMissingArtifactNoop: true,
     );
 }
 
@@ -358,6 +372,7 @@ it('rolls back an exact successor document, releases its own empty freeze, and i
     $fixture = rollbackControlPlaneGenerationFixture();
     $switching = rollbackControlPlaneGenerationSwitching($fixture);
     $mutation = rollbackControlPlaneGenerationMutation($fixture['server'], $switching, $fixture['successor_yaml']);
+    $writerCommand = rollbackControlPlaneGenerationWriterCommand($switching, $mutation);
     $proof = rollbackControlPlaneGenerationProof($fixture['enrollment'], $switching);
     $commands = [];
     [, $cleanup] = rollbackControlPlaneGenerationIsolatedQueue($fixture['server']);
@@ -369,11 +384,11 @@ it('rolls back an exact successor document, releases its own empty freeze, and i
             $switching->operationId,
             $fixture['token'],
             $fixture['successor_yaml'],
-            function (string $command) use (&$commands, $mutation, $proof): string {
+            function (string $command) use (&$commands, $proof, $writerCommand): string {
                 $commands[] = $command;
 
                 return match ($command) {
-                    (new ManagedTraefikDocumentWriter)->rollbackCommandFor($mutation) => ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT,
+                    $writerCommand => ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT,
                     $proof->shellCommand() => rollbackControlPlaneGenerationTranscript($proof),
                     default => throw new RuntimeException("Unexpected generation rollback command: {$command}"),
                 };
@@ -391,7 +406,7 @@ it('rolls back an exact successor document, releases its own empty freeze, and i
             ->and($rolledBack->rollbackAcknowledgedAt)->toBe($rolledBack->rolledBackAt)
             ->and($replayed->toArray())->toBe($rolledBack->toArray())
             ->and($commands)->toBe([
-                (new ManagedTraefikDocumentWriter)->rollbackCommandFor($mutation),
+                $writerCommand,
                 $proof->shellCommand(),
             ])
             ->and(ProxyMutationQueue::snapshot()->freezeOperationId)->toBeNull();
@@ -432,7 +447,7 @@ it('persists rolling back before a dynamic rollback crash and retries the exact 
     $switching = rollbackControlPlaneGenerationSwitching($fixture);
     $mutation = rollbackControlPlaneGenerationMutation($fixture['server'], $switching, $fixture['successor_yaml']);
     $proof = rollbackControlPlaneGenerationProof($fixture['enrollment'], $switching);
-    $writerCommand = (new ManagedTraefikDocumentWriter)->rollbackCommandFor($mutation);
+    $writerCommand = rollbackControlPlaneGenerationWriterCommand($switching, $mutation);
     $recoveredCommands = [];
     [, $cleanup] = rollbackControlPlaneGenerationIsolatedQueue($fixture['server']);
 
@@ -483,6 +498,7 @@ it('keeps an acknowledged document rollback durable when predecessor routes do n
     $fixture = rollbackControlPlaneGenerationFixture();
     $switching = rollbackControlPlaneGenerationSwitching($fixture);
     $mutation = rollbackControlPlaneGenerationMutation($fixture['server'], $switching, $fixture['successor_yaml']);
+    $writerCommand = rollbackControlPlaneGenerationWriterCommand($switching, $mutation);
     $proof = rollbackControlPlaneGenerationProof($fixture['enrollment'], $switching);
     $staleTranscript = str_replace(
         $proof->expectedDynamicPredecessorSha256,
@@ -498,9 +514,9 @@ it('keeps an acknowledged document rollback durable when predecessor routes do n
             $switching->operationId,
             $fixture['token'],
             $fixture['successor_yaml'],
-            function (string $command) use ($mutation, $proof, $staleTranscript): string {
+            function (string $command) use ($proof, $staleTranscript, $writerCommand): string {
                 return match ($command) {
-                    (new ManagedTraefikDocumentWriter)->rollbackCommandFor($mutation) => ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT,
+                    $writerCommand => ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT,
                     $proof->shellCommand() => $staleTranscript,
                     default => throw new RuntimeException("Unexpected route-mismatch command: {$command}"),
                 };
@@ -533,6 +549,7 @@ it('completes replay after its own freeze was released following route acknowled
     $fixture = rollbackControlPlaneGenerationFixture();
     $switching = rollbackControlPlaneGenerationSwitching($fixture);
     $mutation = rollbackControlPlaneGenerationMutation($fixture['server'], $switching, $fixture['successor_yaml']);
+    $writerCommand = rollbackControlPlaneGenerationWriterCommand($switching, $mutation);
     $proof = rollbackControlPlaneGenerationProof($fixture['enrollment'], $switching);
     [, $cleanup] = rollbackControlPlaneGenerationIsolatedQueue($fixture['server']);
 
@@ -543,9 +560,9 @@ it('completes replay after its own freeze was released following route acknowled
             $switching->operationId,
             $fixture['token'],
             $fixture['successor_yaml'],
-            function (string $command) use ($mutation, $proof): string {
+            function (string $command) use ($proof, $writerCommand): string {
                 return match ($command) {
-                    (new ManagedTraefikDocumentWriter)->rollbackCommandFor($mutation) => ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT,
+                    $writerCommand => ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT,
                     $proof->shellCommand() => throw new RuntimeException('Route acknowledgement disconnected.'),
                     default => throw new RuntimeException("Unexpected rollback command: {$command}"),
                 };
@@ -554,17 +571,22 @@ it('completes replay after its own freeze was released following route acknowled
         expect($fixture['promotion_store']->read($fixture['server'])?->phase)
             ->toBe(ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement);
 
+        $fixture['promotion_store']->transition(
+            $fixture['server'],
+            $switching->operationId,
+            $fixture['token'],
+            ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement,
+            ControlPlaneGenerationPromotionPhase::RollbackUnfreezing,
+            '2026-07-19T12:08:00Z',
+            ['rollback_acknowledged_at' => '2026-07-19T12:08:00Z'],
+        );
         ProxyMutationQueue::unfreeze($switching->operationId);
         $recovered = rollbackControlPlaneGenerationAction($fixture)->handle(
             $fixture['server'],
             $switching->operationId,
             $fixture['token'],
             null,
-            function (string $command) use ($proof): string {
-                expect($command)->toBe($proof->shellCommand());
-
-                return rollbackControlPlaneGenerationTranscript($proof);
-            },
+            static fn (): never => throw new RuntimeException('Durably acknowledged rollback must not repeat remote route proof.'),
         );
 
         expect($recovered->phase)->toBe(ControlPlaneGenerationPromotionPhase::RolledBack)

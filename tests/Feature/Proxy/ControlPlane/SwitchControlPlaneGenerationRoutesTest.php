@@ -4,6 +4,7 @@ use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
 use App\Actions\Proxy\ControlPlane\ControlPlaneGenerationPromotionPhase;
 use App\Actions\Proxy\ControlPlane\ControlPlaneGenerationPromotionState;
 use App\Actions\Proxy\ControlPlane\ControlPlaneGenerationRuntime;
+use App\Actions\Proxy\ControlPlane\ControlPlaneGenerationWriterAuthority;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentPhase;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentState;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyExposure;
@@ -16,6 +17,7 @@ use App\Actions\Proxy\ControlPlane\SwitchControlPlaneGenerationRoutes;
 use App\Actions\Proxy\ControlPlane\VerifyControlPlaneProxyRoutes;
 use App\Models\Server;
 use App\Models\Team;
+use App\Support\ProxyMutationQueueSnapshot;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 
 uses(RefreshDatabase::class);
@@ -221,14 +223,22 @@ function switchControlPlaneGenerationRoutesAction(
     StoreControlPlaneProxyEnrollmentState $enrollmentStore,
     ?Closure $clock = null,
     ?Closure $drainDeadline = null,
+    ?Closure $queueSnapshot = null,
 ): SwitchControlPlaneGenerationRoutes {
     return new SwitchControlPlaneGenerationRoutes(
         $promotionStore,
         $enrollmentStore,
         new ManagedTraefikDocumentWriter,
+        new ControlPlaneGenerationWriterAuthority,
         new VerifyControlPlaneProxyRoutes,
         $clock,
         $drainDeadline,
+        $queueSnapshot ?? static fn (ControlPlaneGenerationPromotionState $state): ProxyMutationQueueSnapshot => new ProxyMutationQueueSnapshot(
+            freezeOperationId: $state->operationId,
+            pending: 0,
+            reserved: 0,
+            delayed: 0,
+        ),
     );
 }
 
@@ -249,6 +259,18 @@ function switchControlPlaneGenerationRoutesMutation(
         expectedOperationId: $state->predecessor['operation_id'],
         expectedRevision: $state->predecessor['dynamic_revision'],
         replacementBytes: $successorYaml,
+    );
+}
+
+function switchControlPlaneGenerationRoutesWriterCommand(
+    ControlPlaneGenerationPromotionState $state,
+    ManagedTraefikDocumentMutation $mutation,
+    bool $allowBootstrap,
+): string {
+    return (new ManagedTraefikDocumentWriter)->writeCommandForRequiringAuthority(
+        mutation: $mutation,
+        activeAuthority: (new ControlPlaneGenerationWriterAuthority)->predecessor($state),
+        allowBootstrap: $allowBootstrap,
     );
 }
 
@@ -309,6 +331,7 @@ it('persists a Traefik-only switch, dual-route acknowledgement, and one bounded 
         $fixture['successorYaml'],
     );
     $proof = switchControlPlaneGenerationRoutesProof($fixture['enrollment'], $fixture['quiesced']);
+    $writerCommand = switchControlPlaneGenerationRoutesWriterCommand($fixture['quiesced'], $mutation, true);
     $commands = [];
 
     $draining = $action->handle(
@@ -316,11 +339,11 @@ it('persists a Traefik-only switch, dual-route acknowledgement, and one bounded 
         'switch-routes',
         'switch-routes-token',
         $fixture['successorYaml'],
-        function (string $command) use (&$commands, $mutation, $proof): string {
+        function (string $command) use (&$commands, $proof, $writerCommand): string {
             $commands[] = $command;
 
             return match ($command) {
-                (new ManagedTraefikDocumentWriter)->writeCommandFor($mutation) => ManagedTraefikDocumentWriter::APPLIED_OUTPUT,
+                $writerCommand => ManagedTraefikDocumentWriter::APPLIED_OUTPUT,
                 $proof->shellCommand() => switchControlPlaneGenerationRoutesTranscript($proof),
                 default => throw new RuntimeException("Unexpected control-plane route-switch command: {$command}"),
             };
@@ -347,7 +370,7 @@ it('persists a Traefik-only switch, dual-route acknowledgement, and one bounded 
         ->and($replayed->toArray())->toBe($draining->toArray())
         ->and($fixture['promotionStore']->read($fixture['server'])?->toArray())->toBe($draining->toArray())
         ->and($commands)->toHaveCount(2)
-        ->and($commands[0])->toBe((new ManagedTraefikDocumentWriter)->writeCommandFor($mutation))
+        ->and($commands[0])->toBe($writerCommand)
         ->and($commands[0])->not->toContain('restart')
         ->and($commands[0])->not->toContain('docker compose')
         ->and($commands[1])->toBe($proof->shellCommand());
@@ -379,6 +402,86 @@ it('rejects successor bytes that do not match the reserved checksum before chang
     expect($remoteCalls)->toBe(0)
         ->and($fixture['promotionStore']->read($fixture['server'])?->phase)
         ->toBe(ControlPlaneGenerationPromotionPhase::Quiesced);
+});
+
+it('fails closed before route mutation when the live queue freeze is missing or foreign', function (?string $freezeOperationId): void {
+    $fixture = switchControlPlaneGenerationRoutesFixture();
+    $remoteCalls = 0;
+    $action = switchControlPlaneGenerationRoutesAction(
+        $fixture['promotionStore'],
+        $fixture['enrollmentStore'],
+        queueSnapshot: static fn (): ProxyMutationQueueSnapshot => new ProxyMutationQueueSnapshot(
+            freezeOperationId: $freezeOperationId,
+            pending: 0,
+            reserved: 0,
+            delayed: 0,
+        ),
+    );
+
+    expect(fn (): ControlPlaneGenerationPromotionState => $action->handle(
+        $fixture['server'],
+        'switch-routes',
+        'switch-routes-token',
+        $fixture['successorYaml'],
+        function () use (&$remoteCalls): never {
+            $remoteCalls++;
+
+            throw new RuntimeException('Unexpected route mutation.');
+        },
+    ))->toThrow(RuntimeException::class, 'freeze is missing or owned by another operation');
+
+    expect($remoteCalls)->toBe(0)
+        ->and($fixture['promotionStore']->read($fixture['server'])?->phase)
+        ->toBe(ControlPlaneGenerationPromotionPhase::Switching);
+})->with([null, 'foreign-route-switch']);
+
+it('does not acknowledge routes when the live freeze changes during provider proof', function (): void {
+    $fixture = switchControlPlaneGenerationRoutesFixture();
+    $snapshotCalls = 0;
+    $remoteCalls = 0;
+    $action = switchControlPlaneGenerationRoutesAction(
+        $fixture['promotionStore'],
+        $fixture['enrollmentStore'],
+        queueSnapshot: static function (ControlPlaneGenerationPromotionState $state) use (&$snapshotCalls): ProxyMutationQueueSnapshot {
+            $snapshotCalls++;
+
+            return new ProxyMutationQueueSnapshot(
+                freezeOperationId: $snapshotCalls <= 3 ? $state->operationId : 'replacement-route-owner',
+                pending: 0,
+                reserved: 0,
+                delayed: 0,
+            );
+        },
+    );
+    $mutation = switchControlPlaneGenerationRoutesMutation(
+        $fixture['server'],
+        $fixture['quiesced'],
+        $fixture['successorYaml'],
+    );
+    $writerCommand = switchControlPlaneGenerationRoutesWriterCommand($fixture['quiesced'], $mutation, true);
+    $proof = switchControlPlaneGenerationRoutesProof($fixture['enrollment'], $fixture['quiesced']);
+    $remote = function (string $command) use (&$remoteCalls, $proof, $writerCommand): string {
+        $remoteCalls++;
+
+        return match ($command) {
+            $writerCommand => ManagedTraefikDocumentWriter::APPLIED_OUTPUT,
+            $proof->shellCommand() => switchControlPlaneGenerationRoutesTranscript($proof),
+            default => throw new RuntimeException('Unexpected route command.'),
+        };
+    };
+
+    expect(fn (): ControlPlaneGenerationPromotionState => $action->handle(
+        $fixture['server'],
+        'switch-routes',
+        'switch-routes-token',
+        $fixture['successorYaml'],
+        $remote,
+    ))->toThrow(RuntimeException::class, 'owned by another operation');
+
+    expect($remoteCalls)->toBe(2)
+        ->and($snapshotCalls)->toBe(4)
+        ->and($fixture['promotionStore']->read($fixture['server'])?->phase)
+        ->toBe(ControlPlaneGenerationPromotionPhase::AwaitingAcknowledgement);
 });
 
 it('rejects a stale enrolled predecessor before writing the successor document', function (): void {
@@ -454,6 +557,7 @@ it('uses the permanent enrollment only as the route owner for a verified chained
     $freshServer->save();
     $mutation = switchControlPlaneGenerationRoutesMutation($fixture['server'], $chainedState, $fixture['successorYaml']);
     $proof = switchControlPlaneGenerationRoutesProof($fixture['enrollment'], $chainedState);
+    $writerCommand = switchControlPlaneGenerationRoutesWriterCommand($chainedState, $mutation, false);
     $action = switchControlPlaneGenerationRoutesAction(
         $fixture['promotionStore'],
         $fixture['enrollmentStore'],
@@ -466,7 +570,7 @@ it('uses the permanent enrollment only as the route owner for a verified chained
         'switch-routes-token',
         $fixture['successorYaml'],
         static fn (string $command): string => match ($command) {
-            (new ManagedTraefikDocumentWriter)->writeCommandFor($mutation) => ManagedTraefikDocumentWriter::APPLIED_OUTPUT,
+            $writerCommand => ManagedTraefikDocumentWriter::APPLIED_OUTPUT,
             $proof->shellCommand() => switchControlPlaneGenerationRoutesTranscript($proof),
             default => throw new RuntimeException('Unexpected chained generation route-switch command.'),
         },
@@ -497,9 +601,10 @@ it('keeps the crash boundary awaiting acknowledgement and resumes an already-app
     );
     $mutation = switchControlPlaneGenerationRoutesMutation($fixture['server'], $switching, $fixture['successorYaml']);
     $proof = switchControlPlaneGenerationRoutesProof($fixture['enrollment'], $switching);
+    $writerCommand = switchControlPlaneGenerationRoutesWriterCommand($switching, $mutation, true);
     $writeCalls = 0;
-    $crashingExecutor = function (string $command) use (&$writeCalls, $mutation, $proof): string {
-        if ($command === (new ManagedTraefikDocumentWriter)->writeCommandFor($mutation)) {
+    $crashingExecutor = function (string $command) use (&$writeCalls, $proof, $writerCommand): string {
+        if ($command === $writerCommand) {
             $writeCalls++;
 
             return ManagedTraefikDocumentWriter::APPLIED_OUTPUT;
