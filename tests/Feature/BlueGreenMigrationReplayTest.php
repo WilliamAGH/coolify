@@ -252,9 +252,11 @@ it('fails closed on malformed postgres inactive retention defaults', function ()
         $this->markTestSkipped('PostgreSQL default expressions are not represented by SQLite.');
     }
 
+    $migration = blueGreenMigration('2026_07_19_120000_add_blue_green_inactive_retention_setting');
+    $migration->up();
     DB::statement('alter table application_settings alter column blue_green_inactive_retention_seconds set default 1');
 
-    expect(fn () => blueGreenMigration('2026_07_19_120000_add_blue_green_inactive_retention_setting')->assertExactSchema())
+    expect(fn () => $migration->assertExactSchema())
         ->toThrow(RuntimeException::class, 'does not match the authorized PostgreSQL catalog');
 });
 
@@ -263,9 +265,12 @@ it('fails closed on malformed postgres inactive retirement attempt defaults', fu
         $this->markTestSkipped('PostgreSQL default expressions are not represented by SQLite.');
     }
 
+    blueGreenMigration('2026_07_12_000001_create_application_blue_green_deployments_table')->up();
+    $migration = blueGreenMigration('2026_07_19_120001_add_blue_green_inactive_retirement_provenance');
+    $migration->up();
     DB::statement('alter table application_blue_green_deployments alter column inactive_retirement_attempts set default 1');
 
-    expect(fn () => blueGreenMigration('2026_07_19_120001_add_blue_green_inactive_retirement_provenance')->assertExactSchema())
+    expect(fn () => $migration->assertExactSchema())
         ->toThrow(RuntimeException::class, 'does not match the authorized PostgreSQL catalog');
 });
 
