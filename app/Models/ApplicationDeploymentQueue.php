@@ -264,6 +264,58 @@ class ApplicationDeploymentQueue extends Model
         return true;
     }
 
+    public function releaseCurrentProcessOwnership(string $dispatchAttemptUuid, string $processId): bool
+    {
+        if (! Str::isUuid($dispatchAttemptUuid)) {
+            throw new \InvalidArgumentException('The deployment dispatch attempt must be a valid UUID.');
+        }
+        if (blank($processId)) {
+            throw new \InvalidArgumentException('The deployment process identity cannot be empty.');
+        }
+
+        $updated = self::query()
+            ->whereKey($this->getKey())
+            ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
+            ->where('horizon_job_id', $dispatchAttemptUuid)
+            ->where('current_process_id', $processId)
+            ->update(['current_process_id' => null]);
+
+        if ($updated !== 1) {
+            return false;
+        }
+
+        $this->setAttribute('current_process_id', null);
+        $this->syncOriginalAttribute('current_process_id');
+
+        return true;
+    }
+
+    public function claimCurrentProcessOwnership(string $dispatchAttemptUuid, string $processId): bool
+    {
+        if (! Str::isUuid($dispatchAttemptUuid)) {
+            throw new \InvalidArgumentException('The deployment dispatch attempt must be a valid UUID.');
+        }
+        if (blank($processId)) {
+            throw new \InvalidArgumentException('The deployment process identity cannot be empty.');
+        }
+
+        $updated = self::query()
+            ->whereKey($this->getKey())
+            ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
+            ->where('horizon_job_id', $dispatchAttemptUuid)
+            ->whereNull('current_process_id')
+            ->update(['current_process_id' => $processId]);
+
+        if ($updated !== 1) {
+            return false;
+        }
+
+        $this->setAttribute('current_process_id', $processId);
+        $this->syncOriginalAttribute('current_process_id');
+
+        return true;
+    }
+
     /**
      * @param  array<string, mixed>  $preparedActivationPayload
      */

@@ -309,6 +309,49 @@ describe('application deployment execution phase handoff', function () {
             ->and($deployment->fresh()->execution_phase)->toBe(ApplicationDeploymentExecutionPhase::Prepare)
             ->and($deployment->fresh()->horizon_job_id)->toBe($prepareAttemptUuid);
     });
+
+    test('only the owning attempt can clear its completed remote process', function () {
+        $application = makeApplication($this->environment->id, $this->destination->id, null);
+        $deployment = makeQueueAdmissionDeployment(
+            $application,
+            $this->server,
+            'queue-process-owner-cas',
+        );
+        expect($deployment->claimForDispatch(bypassServerCapacity: true))->toBeTrue();
+        $deployment = $deployment->fresh();
+        $prepareAttemptUuid = $deployment->horizon_job_id;
+        expect($deployment->acquireDispatchExecution($prepareAttemptUuid, 'prepare-worker-a'))->toBeTrue();
+        expect($deployment->claimCurrentProcessOwnership(
+            (string) Str::uuid(),
+            'process-123',
+        ))->toBeFalse()
+            ->and($deployment->fresh()->current_process_id)->toBeNull()
+            ->and($deployment->claimCurrentProcessOwnership(
+                $prepareAttemptUuid,
+                'process-123',
+            ))->toBeTrue()
+            ->and($deployment->fresh()->current_process_id)->toBe('process-123')
+            ->and($deployment->claimCurrentProcessOwnership(
+                $prepareAttemptUuid,
+                'process-456',
+            ))->toBeFalse();
+
+        expect($deployment->releaseCurrentProcessOwnership(
+            (string) Str::uuid(),
+            'process-123',
+        ))->toBeFalse()
+            ->and($deployment->fresh()->current_process_id)->toBe('process-123')
+            ->and($deployment->releaseCurrentProcessOwnership(
+                $prepareAttemptUuid,
+                'stale-process',
+            ))->toBeFalse()
+            ->and($deployment->fresh()->current_process_id)->toBe('process-123')
+            ->and($deployment->releaseCurrentProcessOwnership(
+                $prepareAttemptUuid,
+                'process-123',
+            ))->toBeTrue()
+            ->and($deployment->fresh()->current_process_id)->toBeNull();
+    });
 });
 
 describe('queue_application_deployment commit resolution', function () {
