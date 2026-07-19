@@ -275,6 +275,40 @@ describe('application deployment execution phase handoff', function () {
         expect($activationAttemptUuid)->toBeString()
             ->and($deployment->handoffToActivation($prepareAttemptUuid, 'prepare-worker-a', $payload))->toBeNull();
     });
+
+    test('revalidates prepared input against the locked deployment row', function () {
+        $application = makeApplication($this->environment->id, $this->destination->id, null);
+        $deployment = makeQueueAdmissionDeployment(
+            $application,
+            $this->server,
+            'queue-phase-locked-identity',
+        );
+        expect($deployment->claimForDispatch(bypassServerCapacity: true))->toBeTrue();
+        $deployment = $deployment->fresh();
+        $prepareAttemptUuid = $deployment->horizon_job_id;
+        expect($deployment->acquireDispatchExecution($prepareAttemptUuid, 'prepare-worker-a'))->toBeTrue();
+        $payload = [
+            'schema_version' => 1,
+            'deployment_id' => (int) $deployment->id,
+            'application_id' => (int) $deployment->application_id,
+            'server_id' => (int) $deployment->server_id,
+            'destination_id' => (int) $deployment->destination_id,
+            'prepared_commit' => $deployment->commit,
+            'input_fingerprint' => hash('sha256', 'phase-locked-identity-input'),
+            'artifact' => [],
+        ];
+        ApplicationDeploymentQueue::query()
+            ->whereKey($deployment->id)
+            ->update(['commit' => 'newer-commit-after-preparation']);
+
+        expect(fn () => $deployment->handoffToActivation(
+            $prepareAttemptUuid,
+            'prepare-worker-a',
+            $payload,
+        ))->toThrow(InvalidArgumentException::class, 'prepared activation payload is malformed')
+            ->and($deployment->fresh()->execution_phase)->toBe(ApplicationDeploymentExecutionPhase::Prepare)
+            ->and($deployment->fresh()->horizon_job_id)->toBe($prepareAttemptUuid);
+    });
 });
 
 describe('queue_application_deployment commit resolution', function () {

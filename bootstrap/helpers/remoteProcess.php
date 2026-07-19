@@ -25,7 +25,10 @@ function remote_process(
     ?Model $model = null,
     bool $ignore_errors = false,
     $callEventOnFinish = null,
-    $callEventData = null
+    $callEventData = null,
+    bool $runSynchronously = false,
+    ?int $timeout = null,
+    ?Closure $onActivityCreated = null,
 ): Activity {
     $type = $type ?? ActivityTypes::INLINE->value;
     $command = $command instanceof Collection ? $command->toArray() : $command;
@@ -53,6 +56,9 @@ function remote_process(
         'status' => ProcessStatus::QUEUED->value,
         'team_id' => $server->team_id,
     ];
+    if ($timeout !== null) {
+        $properties['command_timeout'] = $timeout;
+    }
 
     $activityLog = activity()
         ->withProperties($properties)
@@ -63,13 +69,19 @@ function remote_process(
     }
 
     $activity = $activityLog->log('[]');
+    $onActivityCreated?->__invoke($activity);
 
-    dispatch(new CoolifyTask(
+    $task = new CoolifyTask(
         activity: $activity,
         ignore_errors: $ignore_errors,
         call_event_on_finish: $callEventOnFinish,
         call_event_data: $callEventData,
-    ));
+    );
+    if ($runSynchronously) {
+        dispatch_sync($task);
+    } else {
+        dispatch($task);
+    }
 
     $activity->refresh();
 

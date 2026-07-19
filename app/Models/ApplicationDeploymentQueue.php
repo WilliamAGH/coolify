@@ -294,6 +294,7 @@ class ApplicationDeploymentQueue extends Model
                 || $deployment->finished_at !== null) {
                 return null;
             }
+            $deployment->assertPreparedActivationPayload($preparedActivationPayload);
 
             $activationAttemptUuid = (string) Str::uuid();
             $handoffAt = now();

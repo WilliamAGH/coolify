@@ -1,5 +1,6 @@
 <?php
 
+use App\Actions\Proxy\RemoveProxyConnectedNetwork;
 use App\Actions\Proxy\StartProxy;
 use App\Actions\Proxy\StopProxy;
 use App\Contracts\AdoptsLegacyProxyMutationDispatch;
@@ -33,6 +34,7 @@ it('marks and pins every surviving proxy repair transport', function () {
     $transports = [
         StartProxy::makeJob($server),
         StopProxy::makeJob($server),
+        RemoveProxyConnectedNetwork::makeJob($server, 'coolify'),
         new RestartProxyJob($server),
         new ConnectProxyToNetworksJob($server),
     ];

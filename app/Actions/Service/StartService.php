@@ -2,6 +2,7 @@
 
 namespace App\Actions\Service;
 
+use App\Jobs\ConnectProxyToNetworksAfterActivityJob;
 use App\Models\Service;
 use Lorisleiva\Actions\Concerns\AsAction;
 use Lorisleiva\Actions\Decorators\JobDecorator;
@@ -41,7 +42,6 @@ class StartService
         }
         $commands[] = 'echo Starting service.';
         $commands[] = "docker compose --project-directory {$workdir} -f {$workdir}/docker-compose.yml --project-name {$service->uuid} up -d --remove-orphans --force-recreate --build";
-        $commands[] = "docker network connect $service->uuid coolify-proxy >/dev/null 2>&1 || true";
         if (data_get($service, 'connect_to_docker_network')) {
             $compose = data_get($service, 'docker_compose', []);
             $safeNetwork = escapeshellarg($service->destination->network);
@@ -52,7 +52,14 @@ class StartService
         }
         $commands = array_merge($commands, $this->logDrainNetworkConnectCommands($service));
 
-        return remote_process($commands, $service->server, type_uuid: $service->uuid, callEventOnFinish: 'ServiceStatusChanged');
+        $activity = remote_process($commands, $service->server, type_uuid: $service->uuid, callEventOnFinish: 'ServiceStatusChanged');
+        ConnectProxyToNetworksAfterActivityJob::dispatch(
+            $activity,
+            $service->server,
+            [$service->uuid],
+        );
+
+        return $activity;
     }
 
     private function logDrainNetworkConnectCommands(Service $service): array

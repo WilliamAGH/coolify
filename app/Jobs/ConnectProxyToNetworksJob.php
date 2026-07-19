@@ -40,8 +40,11 @@ class ConnectProxyToNetworksJob implements ProxyMutation, ShouldBeEncrypted, Sho
         ];
     }
 
-    public function __construct(public Server $server)
-    {
+    /** @param array<int, string> $requiredNetworks */
+    public function __construct(
+        public Server $server,
+        public array $requiredNetworks = [],
+    ) {
         ProxyMutationQueue::assign($this);
     }
 
@@ -51,7 +54,7 @@ class ConnectProxyToNetworksJob implements ProxyMutation, ShouldBeEncrypted, Sho
             return;
         }
 
-        $connectProxyToDockerNetworks = connectProxyToNetworks($this->server);
+        $connectProxyToDockerNetworks = connectProxyToNetworks($this->server, $this->requiredNetworks);
 
         if (empty($connectProxyToDockerNetworks)) {
             return;

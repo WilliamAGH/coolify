@@ -78,7 +78,7 @@ class RunRemoteProcess
         $this->time_start = hrtime(true);
 
         $status = ProcessStatus::IN_PROGRESS;
-        $timeout = config('constants.ssh.command_timeout');
+        $timeout = $this->commandTimeout();
         $process = Process::timeout($timeout)->start($this->getCommand(), $this->handleOutput(...));
         $this->activity->properties = $this->activity->properties->merge([
             'process_id' => $process->id(),
@@ -119,6 +119,16 @@ class RunRemoteProcess
         }
 
         return $processResult;
+    }
+
+    private function commandTimeout(): int
+    {
+        $activityTimeout = $this->activity->getExtraProperty('command_timeout');
+        if (is_int($activityTimeout) && $activityTimeout > 0) {
+            return $activityTimeout;
+        }
+
+        return (int) config('constants.ssh.command_timeout');
     }
 
     protected function getCommand(): string

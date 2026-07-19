@@ -2,6 +2,7 @@
 
 namespace App\Livewire\Destination;
 
+use App\Actions\Proxy\RemoveProxyConnectedNetwork;
 use App\Models\StandaloneDocker;
 use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
 use Livewire\Attributes\Locked;
@@ -74,9 +75,10 @@ class Show extends Component
                 if ($this->destination->attachedTo()) {
                     return $this->dispatch('error', 'You must delete all resources before deleting this destination.');
                 }
-                $safeNetwork = escapeshellarg($this->destination->network);
-                instant_remote_process(["docker network disconnect {$safeNetwork} coolify-proxy"], $this->destination->server, throwError: false);
-                instant_remote_process(["docker network rm -f {$safeNetwork}"], $this->destination->server);
+                RemoveProxyConnectedNetwork::dispatch(
+                    $this->destination->server,
+                    $this->destination->network,
+                );
             }
             $this->destination->delete();
 

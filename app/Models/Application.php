@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Actions\Proxy\RemoveProxyConnectedNetwork;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\ProxyTypes;
@@ -512,10 +513,8 @@ class Application extends BaseModel
 
     public function deleteConnectedNetworks()
     {
-        $uuid = $this->uuid;
         $server = data_get($this, 'destination.server');
-        instant_remote_process(["docker network disconnect {$uuid} coolify-proxy"], $server, false);
-        instant_remote_process(["docker network rm {$uuid}"], $server, false);
+        RemoveProxyConnectedNetwork::dispatch($server, $this->uuid);
     }
 
     public function additional_servers()

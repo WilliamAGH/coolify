@@ -6,6 +6,7 @@ use App\Actions\Proxy\SaveProxyConfiguration;
 use App\Enums\ProxyTypes;
 use App\Models\Application;
 use App\Models\Server;
+use App\Support\ValidationPatterns;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
 use Symfony\Component\Yaml\Yaml;
@@ -107,9 +108,15 @@ function collectDockerNetworksByServer(Server $server)
         'allNetworks' => $allNetworks,
     ];
 }
-function connectProxyToNetworks(Server $server)
+function connectProxyToNetworks(Server $server, array $requiredNetworks = [])
 {
     ['networks' => $networks] = collectDockerNetworksByServer($server);
+    foreach ($requiredNetworks as $requiredNetwork) {
+        if (! is_string($requiredNetwork) || ! ValidationPatterns::isValidDockerNetwork($requiredNetwork)) {
+            throw new InvalidArgumentException('Required proxy network name is invalid.');
+        }
+    }
+    $networks = $networks->merge($requiredNetworks)->unique();
     if ($server->isSwarm()) {
         $commands = $networks->map(function ($network) {
             $safe = escapeshellarg($network);

@@ -5,7 +5,6 @@ namespace App\Jobs;
 use App\Actions\Proxy\GetProxyConfiguration;
 use App\Actions\Proxy\SaveProxyConfiguration;
 use App\Contracts\ProxyMutation;
-use App\Enums\ProcessStatus;
 use App\Enums\ProxyTypes;
 use App\Events\ProxyStatusChangedUI;
 use App\Models\Server;
@@ -19,14 +18,14 @@ use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\Middleware\WithoutOverlapping;
 use Illuminate\Queue\SerializesModels;
-use Illuminate\Support\Sleep;
-use RuntimeException;
 use Spatie\Activitylog\Models\Activity;
 
 class RestartProxyJob implements ProxyMutation, ShouldBeEncrypted, ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
     use UsesProxyMutationQueue;
+
+    public const REMOTE_TIMEOUT_SECONDS = 600;
 
     public $tries = 1;
 
@@ -55,19 +54,15 @@ class RestartProxyJob implements ProxyMutation, ShouldBeEncrypted, ShouldQueue
             // Build combined stop + start commands for a single activity
             $commands = $this->buildRestartCommands();
 
-            // Create activity and dispatch immediately - returns Activity right away
-            // The remote_process runs asynchronously, so UI gets activity ID instantly
-            $activity = remote_process(
+            remote_process(
                 $commands,
                 $this->server,
                 callEventOnFinish: 'ProxyStatusChanged',
-                callEventData: $this->server->id
+                callEventData: $this->server->id,
+                runSynchronously: true,
+                timeout: self::REMOTE_TIMEOUT_SECONDS,
+                onActivityCreated: $this->announceActivity(...),
             );
-
-            // Store activity ID and notify UI immediately with it
-            $this->activity_id = $activity->id;
-            ProxyStatusChangedUI::dispatch($this->server->team_id, $this->activity_id);
-            $this->waitForActivity($activity);
 
         } catch (\Throwable $e) {
             // Set error status
@@ -84,22 +79,10 @@ class RestartProxyJob implements ProxyMutation, ShouldBeEncrypted, ShouldQueue
         }
     }
 
-    private function waitForActivity(Activity $activity): void
+    private function announceActivity(Activity $activity): void
     {
-        for ($attempt = 0; $attempt < 600; $attempt++) {
-            $activity->refresh();
-            $status = $activity->getExtraProperty('status');
-            if ($status === ProcessStatus::FINISHED->value) {
-                return;
-            }
-            if ($status === ProcessStatus::ERROR->value) {
-                throw new RuntimeException('Proxy restart remote activity failed.');
-            }
-
-            Sleep::for(1)->seconds();
-        }
-
-        throw new RuntimeException('Proxy restart remote activity did not finish within 600 seconds.');
+        $this->activity_id = $activity->id;
+        ProxyStatusChangedUI::dispatch($this->server->team_id, $this->activity_id);
     }
 
     /**
