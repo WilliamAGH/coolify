@@ -223,7 +223,7 @@ function extractCustomProxyCommands(Server $server, string $existing_config): ar
 
     return $custom_commands;
 }
-function generateDefaultProxyConfiguration(Server $server, array $custom_commands = [])
+function generateDefaultProxyConfiguration(Server $server, array $custom_commands = [], bool $save = true): ?string
 {
     Log::info('Generating default proxy configuration', [
         'server_id' => $server->id,
@@ -396,7 +396,9 @@ function generateDefaultProxyConfiguration(Server $server, array $custom_command
     }
 
     $config = Yaml::dump($config, 12, 2);
-    SaveProxyConfiguration::run($server, $config);
+    if ($save) {
+        SaveProxyConfiguration::run($server, $config);
+    }
 
     return $config;
 }
