@@ -16,6 +16,10 @@ class WriteBlueGreenProxyConfiguration
 
     private const CONTAINER_MUTATION_JOURNAL_MAGIC = 'coolify-blue-green-container-mutation-v1';
 
+    public const IDLE_ROUTE_UNCHANGED_OUTPUT = 'coolify-blue-green-idle-route-unchanged';
+
+    public const IDLE_ROUTE_REPAIRED_OUTPUT = 'coolify-blue-green-idle-route-repaired';
+
     public function handle(
         Server $server,
         BlueGreenProxyConfiguration $configuration,
@@ -54,6 +58,50 @@ class WriteBlueGreenProxyConfiguration
         }
 
         return $this->mutationCommandFor($proxyPath, null, $rollbackKey, $expectedBootId);
+    }
+
+    /**
+     * Reinstates only a missing or changed managed route whose durable sidecar still
+     * exactly matches the expected state. The sidecar is never changed by this path.
+     */
+    public function repairExactStateCommandFor(
+        string $proxyPath,
+        BlueGreenProxyConfiguration $configuration,
+        BlueGreenProxyState $expectedState,
+        string $expectedBootId,
+    ): string {
+        $this->assertBootId($expectedBootId);
+        $this->validate($configuration);
+        $this->assertStateScope($configuration->managedFilename, $expectedState);
+        if ($configuration->state->serialize() !== $expectedState->serialize()
+            || $configuration->sha256 !== $expectedState->managedSha256) {
+            throw new InvalidArgumentException('The idle route repair configuration does not exactly match its durable destination state.');
+        }
+
+        $activePath = $this->managedPath($proxyPath, $configuration->managedFilename);
+        $statePath = $this->statePath($proxyPath, $configuration->managedFilename);
+        $safeActivePath = escapeshellarg($activePath);
+
+        return implode("\n", [
+            ...$this->lockedCommandPrefix($proxyPath, $configuration->managedFilename),
+            $this->bootIdentityAssertionCommand(escapeshellarg($expectedBootId)),
+            ...$this->assertSerializedStateCommands($expectedState, $statePath),
+            'if [ -e '.$safeActivePath.' ] || [ -L '.$safeActivePath.' ]; then',
+            '  test -f '.$safeActivePath,
+            '  test ! -L '.$safeActivePath,
+            'fi',
+            'if [ -f '.$safeActivePath.' ] && [ ! -L '.$safeActivePath.' ]; then',
+            '  managed_checksum=$(sha256sum '.$safeActivePath.')',
+            '  if [ "${managed_checksum%% *}" = '.escapeshellarg($expectedState->managedSha256).' ]; then',
+            '    printf %s '.escapeshellarg(self::IDLE_ROUTE_UNCHANGED_OUTPUT),
+            '    exit 0',
+            '  fi',
+            'fi',
+            ...$this->atomicManagedConfigurationReplaceCommands($activePath, $configuration),
+            ...$this->afterManagedMutationCommands(),
+            ...$this->assertManagedFileCommands($expectedState, $activePath),
+            'printf %s '.escapeshellarg(self::IDLE_ROUTE_REPAIRED_OUTPUT),
+        ]);
     }
 
     public function managedPath(string $proxyPath, string $managedFilename): string
@@ -392,8 +440,18 @@ class WriteBlueGreenProxyConfiguration
         string $activePath,
         string $statePath,
     ): array {
+        return [
+            ...$this->assertSerializedStateCommands($state, $statePath),
+            ...$this->assertManagedFileCommands($state, $activePath),
+        ];
+    }
+
+    /** @return list<string> */
+    private function assertSerializedStateCommands(BlueGreenProxyState $state, string $statePath): array
+    {
         $safeStatePath = escapeshellarg($statePath);
-        $commands = [
+
+        return [
             'test -f '.$safeStatePath,
             'test ! -L '.$safeStatePath,
             'state_owner=$(stat -c %u -- '.$safeStatePath.' 2>/dev/null || stat -f %u -- '.$safeStatePath.')',
@@ -402,8 +460,6 @@ class WriteBlueGreenProxyConfiguration
             'test "$state_mode" = 600',
             'test "$(base64 < '.$safeStatePath.' | tr -d \'\\n\')" = '.escapeshellarg(base64_encode($state->serialize())),
         ];
-
-        return [...$commands, ...$this->assertManagedFileCommands($state, $activePath)];
     }
 
     /** @return list<string> */
@@ -983,6 +1039,27 @@ class WriteBlueGreenProxyConfiguration
             'chmod 600 "$state_stage"',
             'sync -f "$state_stage"',
             'mv -f -- "$state_stage" '.escapeshellarg($statePath),
+            'sync -f '.escapeshellarg($directory),
+            'trap - 0 HUP INT TERM',
+        ];
+    }
+
+    /** @return list<string> */
+    private function atomicManagedConfigurationReplaceCommands(
+        string $activePath,
+        BlueGreenProxyConfiguration $configuration,
+    ): array {
+        $directory = dirname($activePath);
+
+        return [
+            'managed_stage=$(mktemp '.escapeshellarg($directory.'/.blue-green-managed.XXXXXX').')',
+            'trap \'rm -f -- "$managed_stage"\' 0 HUP INT TERM',
+            'printf %s '.escapeshellarg(base64_encode($configuration->yaml)).' | base64 -d > "$managed_stage"',
+            'managed_checksum=$(sha256sum "$managed_stage")',
+            'test "${managed_checksum%% *}" = '.escapeshellarg($configuration->sha256),
+            'chmod 600 "$managed_stage"',
+            'sync -f "$managed_stage"',
+            'mv -f -- "$managed_stage" '.escapeshellarg($activePath),
             'sync -f '.escapeshellarg($directory),
             'trap - 0 HUP INT TERM',
         ];

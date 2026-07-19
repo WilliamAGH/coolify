@@ -60,6 +60,12 @@ class Kernel extends ConsoleKernel
             ->onOneServer()
             ->withoutOverlapping(16)
             ->runInBackground();
+        $this->scheduleInstance->command('blue-green:reconcile-idle-routes --limit=1')
+            ->name('blue-green:reconcile-idle-routes')
+            ->everyMinute()
+            ->onOneServer()
+            ->withoutOverlapping(6)
+            ->runInBackground();
 
         if (isDev()) {
             // Instance Jobs

@@ -286,6 +286,21 @@ final class BlueGreenDeploymentLifecycle
         } catch (BlueGreenDestinationStateRecordingException) {
             $this->reconcilePendingDestinationState();
         }
+        if ($expectation->blueGreenManaged) {
+            return;
+        }
+
+        $this->assertExactCandidateStillHealthy();
+        $this->assertOperationOwned(BlueGreenDeploymentPhase::IDLE);
+        try {
+            $this->destinationState = $this->executeDestinationMutation([
+                ...(new InspectBlueGreenContainer)->exactMutationAssertionsFor($expectation),
+                "docker rm {$containerId} >/dev/null",
+            ], (new InspectBlueGreenContainer)->absentMutationCompletionAssertionsFor($expectation));
+        } catch (BlueGreenDestinationStateRecordingException) {
+            $this->reconcilePendingDestinationState();
+        }
+        $this->assertExactCandidateStillHealthy();
     }
 
     public function release(): void

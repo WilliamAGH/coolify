@@ -2,7 +2,10 @@
 
 use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
+use App\Actions\Application\BlueGreen\BlueGreenOperationFence;
 use App\Actions\Application\BlueGreen\FindBlueGreenDeactivationFence;
+use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
+use App\Actions\Application\BlueGreen\ReconstructBlueGreenDeploymentRecovery;
 use App\Actions\Application\BlueGreen\RecordBlueGreenDestinationState;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeactivationPhase;
@@ -21,11 +24,13 @@ use App\Models\Server;
 use App\Models\StandaloneDocker;
 use App\Models\Team;
 use App\Services\BlueGreenDeploymentLifecycle;
+use Illuminate\Cache\Lock;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\Notification;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Storage;
+use Tests\Support\BlueGreenRecoveryScenario;
 
 uses(RefreshDatabase::class);
 
@@ -162,6 +167,178 @@ function createNewerApplicationDestinationFence(array $fixture): ApplicationBlue
     ]);
 }
 
+/**
+ * @return array{
+ *     candidate: BlueGreenContainerExpectation,
+ *     claim: BlueGreenDeploymentClaim,
+ *     lifecycle: BlueGreenDeploymentLifecycle,
+ *     previous: BlueGreenContainerExpectation,
+ *     server: Server,
+ *     state: ApplicationBlueGreenDeployment
+ * }
+ */
+function makeApplicationDeploymentBlueGreenLegacyRetirementFixture(int $lockRefreshes): array
+{
+    $scenario = BlueGreenRecoveryScenario::create();
+    $privateKey = PrivateKey::create([
+        'name' => 'blue-green-legacy-retirement-key',
+        'private_key' => generateSSHKey('ed25519')['private'],
+        'team_id' => $scenario->server->team_id,
+    ]);
+    Storage::fake('ssh-keys');
+    Storage::disk('ssh-keys')->put("ssh_key@{$privateKey->uuid}", $privateKey->private_key);
+    $scenario->server->update(['private_key_id' => $privateKey->id]);
+    $scenario->server->refresh();
+    $recovery = ReconstructBlueGreenDeploymentRecovery::run($scenario->state);
+    $previous = $recovery->previousContainer
+        ?? throw new LogicException('The recovery fixture must have an exact legacy previous container.');
+    $lock = Mockery::mock(Lock::class);
+    $lock->shouldReceive('refresh')->times($lockRefreshes)->with(30)->andReturnTrue();
+    $lifecycle = new BlueGreenDeploymentLifecycle(
+        application: $recovery->application,
+        deployment: $recovery->deployment,
+        destination: $recovery->destination,
+        server: $recovery->server,
+        timeout: 30,
+        checkForCancellation: static function (): void {},
+    );
+    setApplicationDeploymentBlueGreenProperty($lifecycle, 'enabled', true);
+    setApplicationDeploymentBlueGreenProperty($lifecycle, 'claim', $recovery->claim);
+    setApplicationDeploymentBlueGreenProperty($lifecycle, 'previousContainerExpectation', $previous);
+    setApplicationDeploymentBlueGreenProperty($lifecycle, 'candidateContainerExpectation', $recovery->candidateContainer);
+    setApplicationDeploymentBlueGreenProperty($lifecycle, 'destinationState', $recovery->rollbackKey->replacementState);
+    setApplicationDeploymentBlueGreenProperty($lifecycle, 'operationFence', new BlueGreenOperationFence($lock, 30));
+
+    return [
+        'candidate' => $recovery->candidateContainer,
+        'claim' => $recovery->claim,
+        'lifecycle' => $lifecycle,
+        'previous' => $previous,
+        'server' => $recovery->server,
+        'state' => $scenario->state,
+    ];
+}
+
+function applicationDeploymentBlueGreenContainerInspectionOutput(
+    BlueGreenContainerExpectation $expectation,
+    string $status = 'running',
+    string $health = 'healthy',
+    ?string $dockerId = null,
+): string {
+    $dockerId ??= $expectation->dockerId;
+    if ($dockerId === null) {
+        throw new LogicException('A test container inspection requires a complete Docker ID.');
+    }
+    $labels = [
+        'coolify.applicationId' => (string) $expectation->applicationId,
+        'coolify.pullRequestId' => (string) $expectation->pullRequestId,
+    ];
+    if ($expectation->blueGreenManaged) {
+        $labels += [
+            'coolify.blueGreen.managed' => 'true',
+            'coolify.blueGreen.deploymentUuid' => (string) $expectation->deploymentUuid,
+            'coolify.blueGreen.color' => $expectation->color?->value,
+            'coolify.blueGreen.routingRevision' => (string) $expectation->routingRevision,
+        ];
+    }
+
+    return json_encode([
+        'Id' => $dockerId,
+        'Name' => '/'.$expectation->name,
+        'State' => [
+            'Status' => $status,
+            'Health' => ['Status' => $health],
+        ],
+        'Config' => ['Labels' => $labels],
+    ], JSON_THROW_ON_ERROR);
+}
+
+function applicationDeploymentBlueGreenMutationScript(string $command): ?string
+{
+    preg_match_all('/(?<![A-Za-z0-9+\\/=])([A-Za-z0-9+\\/]{20,}={0,2})(?![A-Za-z0-9+\\/=])/', $command, $matches);
+
+    foreach ($matches[1] as $payload) {
+        $script = base64_decode($payload, true);
+        if (is_string($script)
+            && str_starts_with($script, "set -eu\n")
+            && (str_contains($script, 'docker stop --time=') || str_contains($script, 'docker rm '))) {
+            return $script;
+        }
+    }
+
+    return null;
+}
+
+/**
+ * @param  array{candidate_health: string, candidate_status: string, legacy_exists: bool, legacy_status: string, removals: int, stop_operations: int}  $remote
+ */
+function fakeApplicationDeploymentBlueGreenRetirement(
+    BlueGreenContainerExpectation $previous,
+    BlueGreenContainerExpectation $candidate,
+    array &$remote,
+    bool $restartBeforeRemoval = false,
+): Closure {
+    return function (PendingProcess $process) use ($previous, $candidate, &$remote, $restartBeforeRemoval) {
+        $command = $process->command;
+        $mutationScript = applicationDeploymentBlueGreenMutationScript($command);
+        if ($mutationScript !== null) {
+            if (str_contains($mutationScript, 'docker stop --time=')) {
+                $remote['stop_operations']++;
+                $remote['legacy_status'] = 'exited';
+            }
+            if (str_contains($mutationScript, 'docker rm ')) {
+                if ($restartBeforeRemoval) {
+                    $remote['legacy_status'] = 'running';
+                }
+                if ($remote['legacy_status'] === 'running') {
+                    return Process::result(output: '', errorOutput: 'container is running', exitCode: 1);
+                }
+                if (str_contains($mutationScript, 'docker rm -f')
+                    || ! str_contains($mutationScript, 'docker rm '.escapeshellarg((string) $previous->dockerId))) {
+                    return Process::result(output: '', errorOutput: 'retirement must remove only the exact stopped Docker identity', exitCode: 1);
+                }
+                $remote['removals']++;
+                $remote['legacy_exists'] = false;
+            }
+
+            return Process::result(output: '', exitCode: 0);
+        }
+        if (str_contains($command, '/proc/sys/kernel/random/boot_id')) {
+            return Process::result(output: '11111111-2222-3333-4444-555555555555', exitCode: 0);
+        }
+        if (str_contains($command, 'coolify-blue-green-container:missing')) {
+            if (str_contains($command, escapeshellarg((string) $previous->dockerId))) {
+                return Process::result(
+                    output: $remote['legacy_exists']
+                        ? applicationDeploymentBlueGreenContainerInspectionOutput(
+                            $previous,
+                            $remote['legacy_status'],
+                        )
+                        : 'coolify-blue-green-container:missing',
+                    exitCode: 0,
+                );
+            }
+            if (str_contains($command, escapeshellarg((string) $candidate->dockerId))) {
+                return Process::result(
+                    output: applicationDeploymentBlueGreenContainerInspectionOutput(
+                        $candidate,
+                        $remote['candidate_status'],
+                        $remote['candidate_health'],
+                    ),
+                    exitCode: 0,
+                );
+            }
+            if (str_contains($command, escapeshellarg($previous->name))) {
+                return Process::result(output: 'coolify-blue-green-container:missing', exitCode: 0);
+            }
+
+            throw new LogicException('The retirement test received an inspection for an unexpected container identity.');
+        }
+
+        return Process::result(output: '', exitCode: 0);
+    };
+}
+
 beforeEach(function () {
     config(['constants.ssh.mux_enabled' => false]);
     Notification::fake();
@@ -169,6 +346,163 @@ beforeEach(function () {
 
 afterEach(function () {
     app()->forgetInstance(RecordBlueGreenDestinationState::class);
+});
+
+it('removes an exact stopped first-adoption legacy container so it is absent and not restartable while its candidate stays healthy', function () {
+    $fixture = makeApplicationDeploymentBlueGreenLegacyRetirementFixture(lockRefreshes: 2);
+    $remote = [
+        'candidate_health' => 'healthy',
+        'candidate_status' => 'running',
+        'legacy_exists' => true,
+        'legacy_status' => 'running',
+        'removals' => 0,
+        'stop_operations' => 0,
+    ];
+    Process::fake(fakeApplicationDeploymentBlueGreenRetirement(
+        $fixture['previous'],
+        $fixture['candidate'],
+        $remote,
+    ));
+
+    $fixture['lifecycle']->retirePreviousContainer();
+
+    $legacy = InspectBlueGreenContainer::run($fixture['server'], $fixture['previous']);
+    $candidate = InspectBlueGreenContainer::run($fixture['server'], $fixture['candidate']);
+    $state = $fixture['state']->fresh();
+
+    expect($legacy->exists)->toBeFalse()
+        ->and($candidate->exists)->toBeTrue()
+        ->and($candidate->dockerId)->toBe($fixture['candidate']->dockerId)
+        ->and($candidate->status)->toBe('running')
+        ->and($candidate->health)->toBe('healthy')
+        ->and($remote['stop_operations'])->toBe(1)
+        ->and($remote['removals'])->toBe(1)
+        ->and($state->operation_deployment_uuid)->toBe($fixture['claim']->deploymentUuid)
+        ->and($state->legacy_container_name)->toBe($fixture['previous']->name)
+        ->and($state->destination_fence_operation_id)->toBe($fixture['claim']->deploymentUuid)
+        ->and($state->destination_fence_mutation_sequence)->toBe(3);
+});
+
+it('refuses a same-name legacy replacement before it can mutate the destination', function () {
+    $fixture = makeApplicationDeploymentBlueGreenLegacyRetirementFixture(lockRefreshes: 1);
+    $replacementId = str_repeat('c', 64);
+    $mutationAttempts = 0;
+    Process::fake(function (PendingProcess $process) use ($fixture, $replacementId, &$mutationAttempts) {
+        $command = $process->command;
+        if (applicationDeploymentBlueGreenMutationScript($command) !== null) {
+            $mutationAttempts++;
+
+            return Process::result(output: '', exitCode: 0);
+        }
+        if (str_contains($command, '/proc/sys/kernel/random/boot_id')) {
+            return Process::result(output: '11111111-2222-3333-4444-555555555555', exitCode: 0);
+        }
+        if (str_contains($command, 'coolify-blue-green-container:missing')) {
+            if (str_contains($command, escapeshellarg((string) $fixture['previous']->dockerId))) {
+                return Process::result(output: 'coolify-blue-green-container:missing', exitCode: 0);
+            }
+            if (str_contains($command, escapeshellarg($fixture['previous']->name))) {
+                return Process::result(
+                    output: applicationDeploymentBlueGreenContainerInspectionOutput(
+                        $fixture['previous'],
+                        dockerId: $replacementId,
+                    ),
+                    exitCode: 0,
+                );
+            }
+        }
+
+        return Process::result(output: '', exitCode: 0);
+    });
+
+    expect(fn (): mixed => $fixture['lifecycle']->retirePreviousContainer())
+        ->toThrow(RuntimeException::class, "The persisted container name {$fixture['previous']->name} was reused by another Docker identity.");
+
+    $state = $fixture['state']->fresh();
+    expect($mutationAttempts)->toBe(0)
+        ->and($state->operation_deployment_uuid)->toBe($fixture['claim']->deploymentUuid)
+        ->and($state->legacy_container_name)->toBe($fixture['previous']->name)
+        ->and($state->destination_fence_operation_id)->toBe($fixture['claim']->deploymentUuid)
+        ->and($state->destination_fence_mutation_sequence)->toBe(1);
+});
+
+it('fails closed when a stopped legacy container restarts before its exact removal and preserves operation ownership', function () {
+    $fixture = makeApplicationDeploymentBlueGreenLegacyRetirementFixture(lockRefreshes: 2);
+    $remote = [
+        'candidate_health' => 'healthy',
+        'candidate_status' => 'running',
+        'legacy_exists' => true,
+        'legacy_status' => 'running',
+        'removals' => 0,
+        'stop_operations' => 0,
+    ];
+    Process::fake(fakeApplicationDeploymentBlueGreenRetirement(
+        $fixture['previous'],
+        $fixture['candidate'],
+        $remote,
+        restartBeforeRemoval: true,
+    ));
+
+    expect(fn (): mixed => $fixture['lifecycle']->retirePreviousContainer())
+        ->toThrow(RuntimeException::class, 'container is running');
+
+    $legacy = InspectBlueGreenContainer::run($fixture['server'], $fixture['previous']);
+    $candidate = InspectBlueGreenContainer::run($fixture['server'], $fixture['candidate']);
+    $state = $fixture['state']->fresh();
+
+    expect($legacy->exists)->toBeTrue()
+        ->and($legacy->dockerId)->toBe($fixture['previous']->dockerId)
+        ->and($legacy->status)->toBe('running')
+        ->and($candidate->exists)->toBeTrue()
+        ->and($candidate->status)->toBe('running')
+        ->and($candidate->health)->toBe('healthy')
+        ->and($remote['stop_operations'])->toBe(1)
+        ->and($remote['removals'])->toBe(0)
+        ->and($state->operation_deployment_uuid)->toBe($fixture['claim']->deploymentUuid)
+        ->and($state->legacy_container_name)->toBe($fixture['previous']->name)
+        ->and($state->destination_fence_operation_id)->toBe($fixture['claim']->deploymentUuid)
+        ->and($state->destination_fence_mutation_sequence)->toBe(2);
+});
+
+it('stops but retains a managed previous color', function () {
+    $fixture = makeApplicationDeploymentBlueGreenLegacyRetirementFixture(lockRefreshes: 1);
+    $managedPrevious = new BlueGreenContainerExpectation(
+        name: substr($fixture['candidate']->name, 0, -strlen('-blue')).'-green',
+        dockerId: str_repeat('c', 64),
+        applicationId: $fixture['candidate']->applicationId,
+        pullRequestId: 0,
+        blueGreenManaged: true,
+        deploymentUuid: 'previous-green-deployment',
+        color: BlueGreenDeploymentColor::GREEN,
+        routingRevision: 1,
+    );
+    setApplicationDeploymentBlueGreenProperty($fixture['lifecycle'], 'previousContainerExpectation', $managedPrevious);
+    $remote = [
+        'candidate_health' => 'healthy',
+        'candidate_status' => 'running',
+        'legacy_exists' => true,
+        'legacy_status' => 'running',
+        'removals' => 0,
+        'stop_operations' => 0,
+    ];
+    Process::fake(fakeApplicationDeploymentBlueGreenRetirement(
+        $managedPrevious,
+        $fixture['candidate'],
+        $remote,
+    ));
+
+    $fixture['lifecycle']->retirePreviousContainer();
+
+    $previous = InspectBlueGreenContainer::run($fixture['server'], $managedPrevious);
+    $state = $fixture['state']->fresh();
+
+    expect($previous->exists)->toBeTrue()
+        ->and($previous->dockerId)->toBe($managedPrevious->dockerId)
+        ->and($previous->status)->toBe('exited')
+        ->and($remote['stop_operations'])->toBe(1)
+        ->and($remote['removals'])->toBe(0)
+        ->and($state->destination_fence_operation_id)->toBe($fixture['claim']->deploymentUuid)
+        ->and($state->destination_fence_mutation_sequence)->toBe(2);
 });
 
 it('sends job-generated candidate start commands through the lifecycle destination fence', function () {
