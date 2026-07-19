@@ -2,10 +2,12 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Actions\Proxy\ControlPlane\RespondToControlPlaneHealthCheck;
 use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use OpenApi\Attributes as OA;
+use Symfony\Component\HttpFoundation\Response;
 
 class OtherController extends Controller
 {
@@ -306,8 +308,8 @@ class OtherController extends Controller
             ),
         ]
     )]
-    public function healthcheck(Request $request)
+    public function healthcheck(Request $request): Response
     {
-        return 'OK';
+        return RespondToControlPlaneHealthCheck::run($request);
     }
 }

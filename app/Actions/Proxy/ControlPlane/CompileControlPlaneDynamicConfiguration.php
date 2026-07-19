@@ -24,6 +24,7 @@ final class CompileControlPlaneDynamicConfiguration
         string $expectedRevision,
         string $expectedMember,
         string $configurationAcknowledgement,
+        string $healthCheckProof,
         string $publicScheme = 'https',
         int $backendPort = 8080,
         array $realtimeRouterFragments = [],
@@ -36,6 +37,7 @@ final class CompileControlPlaneDynamicConfiguration
         $this->assertIdentifier($expectedRevision, 'expected revision');
         $this->assertIdentifier($expectedMember, 'expected member');
         $this->assertAcknowledgement($configurationAcknowledgement);
+        $this->assertOpaqueToken($healthCheckProof, 'health-check proof');
         if (! in_array($publicScheme, ['http', 'https'], true)) {
             throw new InvalidArgumentException('The control-plane public route scheme must be http or https.');
         }
@@ -76,6 +78,7 @@ final class CompileControlPlaneDynamicConfiguration
             expectedRevision: $expectedRevision,
             expectedMember: $expectedMember,
             configurationAcknowledgement: $configurationAcknowledgement,
+            healthCheckProof: $healthCheckProof,
             publicScheme: $publicScheme,
             backendPort: $backendPort,
             realtimeRouterFragments: $realtimeRouterFragments,
@@ -114,6 +117,7 @@ final class CompileControlPlaneDynamicConfiguration
         string $expectedRevision,
         string $expectedMember,
         string $configurationAcknowledgement,
+        string $healthCheckProof,
         string $publicScheme,
         int $backendPort,
         array $realtimeRouterFragments,
@@ -187,7 +191,7 @@ final class CompileControlPlaneDynamicConfiguration
                         'method' => 'GET',
                         'status' => 204,
                         'headers' => [
-                            ControlPlaneDynamicConfiguration::CONFIGURATION_ACKNOWLEDGEMENT_HEADER => $configurationAcknowledgement,
+                            ControlPlaneDynamicConfiguration::HEALTH_PROOF_HEADER => $healthCheckProof,
                         ],
                         'interval' => '1s',
                         'unhealthyInterval' => '1s',
@@ -341,6 +345,13 @@ final class CompileControlPlaneDynamicConfiguration
     {
         if (preg_match('/^[A-Za-z0-9._~+\/=:-]{16,512}$/D', $acknowledgement) !== 1) {
             throw new InvalidArgumentException('The control-plane configuration acknowledgement must be an opaque token.');
+        }
+    }
+
+    private function assertOpaqueToken(string $token, string $role): void
+    {
+        if (preg_match('/^[A-Za-z0-9._~+\/=:-]{16,512}$/D', $token) !== 1) {
+            throw new InvalidArgumentException("The control-plane {$role} must be an opaque token.");
         }
     }
 

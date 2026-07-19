@@ -26,6 +26,8 @@ final readonly class ControlPlaneDynamicConfiguration
 
     public const CONFIGURATION_ACKNOWLEDGEMENT_HEADER = 'X-Coolify-Control-Plane-Config-Ack';
 
+    public const HEALTH_PROOF_HEADER = 'X-Coolify-Control-Plane-Health-Proof';
+
     public function __construct(
         public string $managedFilename,
         public string $yaml,

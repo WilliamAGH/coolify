@@ -13,6 +13,7 @@ function compileControlPlaneDynamicConfiguration(): ControlPlaneDynamicConfigura
         expectedRevision: 'generation-42',
         expectedMember: 'blue',
         configurationAcknowledgement: 'ack:'.str_repeat('a', 64),
+        healthCheckProof: str_repeat('b', 64),
         realtimeRouterFragments: [
             'coolify-realtime-wss' => [
                 'rule' => 'Host(`dashboard.example.test`) && PathPrefix(`/app`)',
@@ -96,7 +97,7 @@ it('compiles one deterministic File-provider snapshot with shared HTTPS and APP_
             'method' => 'GET',
             'status' => 204,
             'headers' => [
-                ControlPlaneDynamicConfiguration::CONFIGURATION_ACKNOWLEDGEMENT_HEADER => 'ack:'.str_repeat('a', 64),
+                ControlPlaneDynamicConfiguration::HEALTH_PROOF_HEADER => str_repeat('b', 64),
             ],
             'interval' => '1s',
             'unhealthyInterval' => '1s',
@@ -134,6 +135,7 @@ it('preserves an HTTP dashboard without inventing TLS or a redirect', function (
         expectedRevision: 'generation-42',
         expectedMember: 'blue',
         configurationAcknowledgement: 'ack:'.str_repeat('a', 64),
+        healthCheckProof: str_repeat('b', 64),
         publicScheme: 'http',
     );
     $parsed = Yaml::parse($compiled->yaml);
@@ -154,6 +156,7 @@ it('rejects unsafe ingress, backend, acknowledgement, port, and predecessor rout
         expectedRevision: 'generation-42',
         expectedMember: 'blue',
         configurationAcknowledgement: 'ack:'.str_repeat('a', 64),
+        healthCheckProof: str_repeat('b', 64),
     ))->toThrow(InvalidArgumentException::class, 'host');
 
     expect(fn (): ControlPlaneDynamicConfiguration => CompileControlPlaneDynamicConfiguration::run(
@@ -163,6 +166,7 @@ it('rejects unsafe ingress, backend, acknowledgement, port, and predecessor rout
         expectedRevision: 'generation-42',
         expectedMember: 'blue',
         configurationAcknowledgement: 'ack:'.str_repeat('a', 64),
+        healthCheckProof: str_repeat('b', 64),
         backendPort: 0,
     ))->toThrow(InvalidArgumentException::class, 'port');
 
@@ -173,6 +177,7 @@ it('rejects unsafe ingress, backend, acknowledgement, port, and predecessor rout
         expectedRevision: 'generation-42',
         expectedMember: 'blue',
         configurationAcknowledgement: 'ack:'.str_repeat('a', 64),
+        healthCheckProof: str_repeat('b', 64),
     ))->toThrow(InvalidArgumentException::class, 'backend');
 
     expect(fn (): ControlPlaneDynamicConfiguration => CompileControlPlaneDynamicConfiguration::run(
@@ -182,6 +187,7 @@ it('rejects unsafe ingress, backend, acknowledgement, port, and predecessor rout
         expectedRevision: 'generation-42',
         expectedMember: 'blue',
         configurationAcknowledgement: 'short',
+        healthCheckProof: str_repeat('b', 64),
     ))->toThrow(InvalidArgumentException::class, 'acknowledgement');
 
     expect(fn (): ControlPlaneDynamicConfiguration => CompileControlPlaneDynamicConfiguration::run(
@@ -191,6 +197,7 @@ it('rejects unsafe ingress, backend, acknowledgement, port, and predecessor rout
         expectedRevision: 'generation-42',
         expectedMember: 'blue',
         configurationAcknowledgement: 'ack:'.str_repeat('a', 64),
+        healthCheckProof: str_repeat('b', 64),
         publicScheme: 'ftp',
     ))->toThrow(InvalidArgumentException::class, 'scheme');
 
@@ -201,6 +208,7 @@ it('rejects unsafe ingress, backend, acknowledgement, port, and predecessor rout
         expectedRevision: 'generation-42',
         expectedMember: 'blue',
         configurationAcknowledgement: 'ack:'.str_repeat('a', 64),
+        healthCheckProof: str_repeat('b', 64),
         realtimeRouterFragments: [
             'coolify-realtime-wss' => [
                 'rule' => 'Host(`dashboard.example.test`) && PathPrefix(`/wrong`)',

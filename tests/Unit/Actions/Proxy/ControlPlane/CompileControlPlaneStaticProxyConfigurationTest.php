@@ -67,6 +67,32 @@ it('supports explicit loopback exposure without changing unrelated services', fu
         ->and(data_get($proxy, 'services.traefik.image'))->toBe('traefik:v3.6');
 });
 
+it('adds only hashed proof credentials and immutable backend identity to the source override', function (): void {
+    $compiler = new CompileControlPlaneStaticProxyConfiguration;
+    $configuration = $compiler->compile(
+        controlPlaneProxyCompose(),
+        controlPlaneSourceCompose(),
+        8000,
+    );
+    $configuration = $compiler->withHealthProofIdentity(
+        configuration: $configuration,
+        proofTokenSha256: hash('sha256', 'route-proof-token'),
+        healthProofTokenSha256: hash('sha256', 'health-proof-token'),
+        configurationAcknowledgement: 'ack:'.str_repeat('a', 64),
+        expectedMember: 'blue',
+        expectedRevision: 'revision-42',
+    );
+    $override = Yaml::parse($configuration->sourceOverrideYaml, Yaml::PARSE_CUSTOM_TAGS);
+
+    expect(data_get($override, 'services.coolify.environment'))->toBe([
+        'COOLIFY_CONTROL_PLANE_HEALTH_ACK' => 'ack:'.str_repeat('a', 64),
+        'COOLIFY_CONTROL_PLANE_PROOF_TOKEN_SHA256' => hash('sha256', 'route-proof-token'),
+        'COOLIFY_CONTROL_PLANE_HEALTH_PROOF_TOKEN_SHA256' => hash('sha256', 'health-proof-token'),
+        'COOLIFY_CONTROL_PLANE_MEMBER' => 'blue',
+        'COOLIFY_CONTROL_PLANE_REVISION' => 'revision-42',
+    ])->and($configuration->sourceOverrideYaml)->not->toContain('route-proof-token');
+});
+
 it('reapplies the managed listener to a newly generated canonical proxy configuration', function () {
     $compiler = new CompileControlPlaneStaticProxyConfiguration;
     $first = $compiler->compileProxyConfiguration(

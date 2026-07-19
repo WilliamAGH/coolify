@@ -20,6 +20,14 @@ return [
         'releases_url' => env('RELEASES_URL', 'https://raw.githubusercontent.com/coollabsio/coolify-cdn/main/json/releases.json'),
     ],
 
+    'control_plane_health' => [
+        'configuration_acknowledgement' => env('COOLIFY_CONTROL_PLANE_HEALTH_ACK'),
+        'proof_token_sha256' => env('COOLIFY_CONTROL_PLANE_PROOF_TOKEN_SHA256'),
+        'health_proof_token_sha256' => env('COOLIFY_CONTROL_PLANE_HEALTH_PROOF_TOKEN_SHA256'),
+        'member' => env('COOLIFY_CONTROL_PLANE_MEMBER'),
+        'revision' => env('COOLIFY_CONTROL_PLANE_REVISION'),
+    ],
+
     'urls' => [
         'docs' => 'https://coolify.io/docs',
         'contact' => 'https://coolify.io/docs/contact',

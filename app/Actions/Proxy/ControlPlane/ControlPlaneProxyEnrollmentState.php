@@ -6,7 +6,7 @@ use InvalidArgumentException;
 
 final readonly class ControlPlaneProxyEnrollmentState
 {
-    public const VERSION = 1;
+    public const VERSION = 2;
 
     public function __construct(
         public ControlPlaneProxyEnrollmentPhase $phase,
@@ -17,6 +17,11 @@ final readonly class ControlPlaneProxyEnrollmentState
         public ControlPlaneProxyExposure $exposure,
         public string $managedFilename,
         public int $dynamicRevision,
+        public string $canonicalHost,
+        public string $publicScheme,
+        public string $expectedMember,
+        public string $expectedRevision,
+        public string $configurationAcknowledgement,
         public string $staticPredecessorBytes,
         public string $staticReplacementBytes,
         public string $sourceOverrideBytes,
@@ -35,6 +40,16 @@ final readonly class ControlPlaneProxyEnrollmentState
         if ($managedFilename !== ControlPlaneDynamicConfiguration::MANAGED_FILENAME) {
             throw new InvalidArgumentException('The control-plane enrollment must own the canonical dynamic filename.');
         }
+        $this->assertHost($canonicalHost);
+        if (! in_array($publicScheme, ['http', 'https'], true)) {
+            throw new InvalidArgumentException('The public control-plane route scheme must be http or https.');
+        }
+        foreach (['member' => $expectedMember, 'revision' => $expectedRevision] as $role => $value) {
+            $this->assertIdentifier($value, $role);
+        }
+        if (preg_match('/\A[A-Za-z0-9._~+\/=:-]{16,512}\z/D', $configurationAcknowledgement) !== 1) {
+            throw new InvalidArgumentException('The control-plane configuration acknowledgement must be opaque and single-line.');
+        }
         foreach ([$staticPredecessorBytes, $staticReplacementBytes, $sourceOverrideBytes, $dynamicReplacementBytes] as $bytes) {
             if ($bytes === '') {
                 throw new InvalidArgumentException('Control-plane enrollment artifacts must not be empty.');
@@ -52,6 +67,11 @@ final readonly class ControlPlaneProxyEnrollmentState
         int $appPort,
         ControlPlaneProxyExposure $exposure,
         int $dynamicRevision,
+        string $canonicalHost,
+        string $publicScheme,
+        string $expectedMember,
+        string $expectedRevision,
+        string $configurationAcknowledgement,
         ControlPlaneStaticProxyConfiguration $staticConfiguration,
         ControlPlaneDynamicConfiguration $dynamicConfiguration,
         ?string $dynamicPredecessorBytes,
@@ -73,6 +93,11 @@ final readonly class ControlPlaneProxyEnrollmentState
             exposure: $exposure,
             managedFilename: $dynamicConfiguration->managedFilename,
             dynamicRevision: $dynamicRevision,
+            canonicalHost: $canonicalHost,
+            publicScheme: $publicScheme,
+            expectedMember: $expectedMember,
+            expectedRevision: $expectedRevision,
+            configurationAcknowledgement: $configurationAcknowledgement,
             staticPredecessorBytes: $staticConfiguration->predecessorProxyYaml,
             staticReplacementBytes: $staticConfiguration->replacementProxyYaml,
             sourceOverrideBytes: $staticConfiguration->sourceOverrideYaml,
@@ -99,6 +124,11 @@ final readonly class ControlPlaneProxyEnrollmentState
             exposure: $this->exposure,
             managedFilename: $this->managedFilename,
             dynamicRevision: $this->dynamicRevision,
+            canonicalHost: $this->canonicalHost,
+            publicScheme: $this->publicScheme,
+            expectedMember: $this->expectedMember,
+            expectedRevision: $this->expectedRevision,
+            configurationAcknowledgement: $this->configurationAcknowledgement,
             staticPredecessorBytes: $this->staticPredecessorBytes,
             staticReplacementBytes: $this->staticReplacementBytes,
             sourceOverrideBytes: $this->sourceOverrideBytes,
@@ -128,6 +158,11 @@ final readonly class ControlPlaneProxyEnrollmentState
             'exposure' => $this->exposure->value,
             'managed_filename' => $this->managedFilename,
             'dynamic_revision' => $this->dynamicRevision,
+            'canonical_host' => $this->canonicalHost,
+            'public_scheme' => $this->publicScheme,
+            'expected_member' => $this->expectedMember,
+            'expected_revision' => $this->expectedRevision,
+            'configuration_acknowledgement' => $this->configurationAcknowledgement,
             'static_predecessor' => $this->artifact($this->staticPredecessorBytes),
             'static_replacement' => $this->artifact($this->staticReplacementBytes),
             'source_override' => $this->artifact($this->sourceOverrideBytes),
@@ -145,7 +180,8 @@ final readonly class ControlPlaneProxyEnrollmentState
     {
         self::assertExactKeys($state, [
             'version', 'phase', 'operation_id', 'token_sha256', 'server_id', 'app_port', 'exposure',
-            'managed_filename', 'dynamic_revision', 'static_predecessor', 'static_replacement',
+            'managed_filename', 'dynamic_revision', 'canonical_host', 'public_scheme', 'expected_member',
+            'expected_revision', 'configuration_acknowledgement', 'static_predecessor', 'static_replacement',
             'source_override', 'dynamic_predecessor', 'dynamic_replacement', 'created_at', 'updated_at',
         ]);
         if ($state['version'] !== self::VERSION) {
@@ -161,6 +197,11 @@ final readonly class ControlPlaneProxyEnrollmentState
             exposure: ControlPlaneProxyExposure::from(self::requiredString($state, 'exposure')),
             managedFilename: self::requiredString($state, 'managed_filename'),
             dynamicRevision: self::requiredInteger($state, 'dynamic_revision'),
+            canonicalHost: self::requiredString($state, 'canonical_host'),
+            publicScheme: self::requiredString($state, 'public_scheme'),
+            expectedMember: self::requiredString($state, 'expected_member'),
+            expectedRevision: self::requiredString($state, 'expected_revision'),
+            configurationAcknowledgement: self::requiredString($state, 'configuration_acknowledgement'),
             staticPredecessorBytes: self::decodeArtifact($state['static_predecessor'], 'static predecessor'),
             staticReplacementBytes: self::decodeArtifact($state['static_replacement'], 'static replacement'),
             sourceOverrideBytes: self::decodeArtifact($state['source_override'], 'source override'),
@@ -234,6 +275,22 @@ final readonly class ControlPlaneProxyEnrollmentState
     {
         if (preg_match('/\A[a-f0-9]{64}\z/D', $value) !== 1) {
             throw new InvalidArgumentException("The control-plane enrollment {$label} is invalid.");
+        }
+    }
+
+    private function assertHost(string $host): void
+    {
+        $isIpv4Address = filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false;
+        $isDnsName = preg_match('/\A(?=.{1,253}\z)[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\z/D', $host) === 1;
+        if (! $isIpv4Address && ! $isDnsName) {
+            throw new InvalidArgumentException('The canonical control-plane host must be a safe DNS name or IPv4 address.');
+        }
+    }
+
+    private function assertIdentifier(string $value, string $role): void
+    {
+        if (preg_match('/\A[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\z/D', $value) !== 1) {
+            throw new InvalidArgumentException("The control-plane {$role} is invalid.");
         }
     }
 }
