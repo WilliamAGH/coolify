@@ -4,7 +4,6 @@ namespace App\Actions\Application\BlueGreen;
 
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Enums\ApplicationDeploymentStatus;
-use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\Application;
@@ -138,7 +137,9 @@ class ClaimBlueGreenDeployment
                 $state,
             );
             if ($expectedDestinationState !== null
-                && $expectedDestinationState->destinationTopologyDigest !== $fingerprint->topologyDigest) {
+                && $expectedDestinationState->destinationTopologyDigest !== $fingerprint->topologyDigest
+                && ! ($state->phase === BlueGreenDeploymentPhase::STOPPED
+                    && $expectedDestinationState->managedSha256 === null)) {
                 throw new BlueGreenDeploymentTransitionException('The durable destination topology changed before the operation could be claimed.');
             }
             $claim = new BlueGreenDeploymentClaim(
@@ -305,14 +306,14 @@ class ClaimBlueGreenDeployment
         } catch (\LogicException $exception) {
             throw new BlueGreenDeploymentTransitionException('The blue-green deactivation fence is malformed.', 0, $exception);
         }
-        if ($deactivation->phase === BlueGreenDeactivationPhase::DEACTIVATING || $deactivation->fences($deployment)) {
+        if ($deactivation->phase->fencesDeploymentClaims() || $deactivation->fences($deployment)) {
             throw new BlueGreenDeploymentTransitionException('The deployment queue is fenced by a blue-green deactivation.');
         }
     }
 
     private function assertStateIsIdle(ApplicationBlueGreenDeployment $state): void
     {
-        if ($state->phase !== BlueGreenDeploymentPhase::IDLE
+        if (! in_array($state->phase, [BlueGreenDeploymentPhase::IDLE, BlueGreenDeploymentPhase::STOPPED], true)
             || $state->pending_color !== null
             || $state->pending_deployment_uuid !== null
             || $state->deactivation_operation_id !== null
@@ -417,7 +418,7 @@ class ClaimBlueGreenDeployment
             ->whereKey($state->getKey())
             ->where('application_id', $state->application_id)
             ->where('standalone_docker_id', $state->standalone_docker_id)
-            ->where('phase', BlueGreenDeploymentPhase::IDLE->value)
+            ->where('phase', $state->phase->value)
             ->whereNull('pending_color')
             ->whereNull('pending_deployment_uuid')
             ->whereNull('deactivation_operation_id')

@@ -7,6 +7,7 @@ use App\Actions\Application\BlueGreen\BlueGreenDeactivationPreparation;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteOutcome;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteResult;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationTransportException;
+use App\Actions\Application\BlueGreen\DeactivateBlueGreenApplication;
 use App\Actions\Application\BlueGreen\DeactivateBlueGreenApplicationDestination;
 use App\Actions\Application\BlueGreen\DrainAndRemoveBlueGreenApplicationContainers;
 use App\Actions\Application\BlueGreen\ExecuteBlueGreenDeactivationRemoteCommand;
@@ -268,7 +269,6 @@ it('retries the exact stale deactivation owner to completion', function () {
     fakeBlueGreenRemoteProcessSequence(
         BlueGreenDeactivationScenario::BOOT_ID,
         blueGreenDeactivationRemoteOutput(BlueGreenDeactivationRemoteOutcome::Success, 0),
-        blueGreenDeactivationRemoteOutput(BlueGreenDeactivationRemoteOutcome::Success, 0),
     );
 
     $results = ResumeBlueGreenDeactivations::run(staleAfterSeconds: 300);
@@ -279,7 +279,7 @@ it('retries the exact stale deactivation owner to completion', function () {
         ->and($deactivation->phase)->toBe(BlueGreenDeactivationPhase::COMPLETED)
         ->and($deactivation->completed_at)->not->toBeNull()
         ->and($state->newQuery()->whereKey($state->id)->doesntExist())->toBeTrue();
-    Process::assertRanTimes(fn () => true, 3);
+    Process::assertRanTimes(fn () => true, 2);
 });
 
 it('keeps transport-ambiguous remote failures resumable under the exact generation', function () {
@@ -322,4 +322,67 @@ it('marks a proven remote invariant failure for intervention instead of continui
         ->and($state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
         ->and($state->fresh()->supersession_generation)->toBe($deactivation->supersession_generation);
     Process::assertRanTimes(fn () => true, 2);
+});
+
+it('supersedes a completed live manual stop with a strict soft-delete deactivation', function () {
+    ['application' => $application, 'destination' => $destination] = BlueGreenDeactivationScenario::context();
+    $state = BlueGreenDeactivationScenario::routeLessState($application, $destination, supersessionGeneration: 3);
+    Process::fake(function (PendingProcess $process) {
+        if (str_contains($process->command, '/proc/sys/kernel/random/boot_id')) {
+            return Process::result(output: BlueGreenDeactivationScenario::BOOT_ID, exitCode: 0);
+        }
+
+        return Process::result(output: blueGreenDeactivationRemoteOutput(
+            BlueGreenDeactivationRemoteOutcome::Success,
+            0,
+        ));
+    });
+
+    $stops = (new DeactivateBlueGreenApplication)->stop($application, $destination->id);
+    $manualStop = ApplicationBlueGreenDeactivation::query()->sole();
+    $stoppedState = $state->fresh();
+
+    expect($stops)->toHaveCount(1)
+        ->and($application->fresh()->trashed())->toBeFalse()
+        ->and($manualStop->phase)->toBe(BlueGreenDeactivationPhase::STOPPED)
+        ->and($manualStop->completed_at)->not->toBeNull()
+        ->and($stoppedState->phase)->toBe(BlueGreenDeploymentPhase::STOPPED)
+        ->and($stoppedState->supersession_generation)->toBe($manualStop->supersession_generation);
+
+    $deactivations = DeactivateBlueGreenApplication::run($application);
+    $deactivation = ApplicationBlueGreenDeactivation::query()->sole();
+    $tombstonedApplication = $application->newQuery()
+        ->withTrashed()
+        ->findOrFail($application->id);
+
+    expect($deactivations)->toHaveCount(1)
+        ->and($tombstonedApplication->trashed())->toBeTrue()
+        ->and($deactivation->phase)->toBe(BlueGreenDeactivationPhase::COMPLETED)
+        ->and($deactivation->completed_at)->not->toBeNull()
+        ->and($deactivation->supersession_generation)->toBeGreaterThan($manualStop->supersession_generation)
+        ->and($deactivation->operation_id)->not->toBe($manualStop->operation_id)
+        ->and($deactivation->started_at)->toBeGreaterThan($tombstonedApplication->deleted_at)
+        ->and(ApplicationBlueGreenDeployment::query()->whereKey($state->id)->doesntExist())->toBeTrue();
+});
+
+it('does not treat a completed manual stop as strict deletion authorization', function () {
+    ['application' => $application, 'destination' => $destination] = BlueGreenDeactivationScenario::context();
+    $application->delete();
+    $tombstonedApplication = $application->newQuery()
+        ->withTrashed()
+        ->findOrFail($application->id);
+    $startedAt = $tombstonedApplication->deleted_at->copy()->addSecond();
+    ApplicationBlueGreenDeactivation::query()->create([
+        'application_id' => $application->id,
+        'standalone_docker_id' => $destination->id,
+        'operation_id' => str_repeat('f', 64),
+        'started_at' => $startedAt,
+        'queue_cutoff_id' => 0,
+        'supersession_generation' => 1,
+        'phase' => BlueGreenDeactivationPhase::STOPPED,
+        'completed_at' => $startedAt->copy()->addSecond(),
+    ]);
+
+    expect(fn () => $tombstonedApplication->assertBlueGreenDeletionAuthorized())
+        ->toThrow(RuntimeException::class, 'requires every durable deactivation owner to complete without intervention');
 });

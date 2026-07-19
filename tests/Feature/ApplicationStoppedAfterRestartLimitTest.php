@@ -1,8 +1,41 @@
 <?php
 
+use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteOutcome;
+use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteResult;
+use App\Actions\Application\BlueGreen\ExecuteBlueGreenDeactivationRemoteCommand;
 use App\Actions\Application\StopApplication;
+use App\Enums\BlueGreenDeactivationPhase;
+use App\Events\ServiceStatusChanged;
 use App\Models\Application;
+use App\Models\ApplicationBlueGreenDeactivation;
 use App\Notifications\Application\RestartLimitReached;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Process\PendingProcess;
+use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Process;
+use Tests\Support\BlueGreenDeactivationScenario;
+
+uses(RefreshDatabase::class);
+
+function fakeRestartLimitBlueGreenStopRemoteSuccess(): void
+{
+    Process::fake(function (PendingProcess $process) {
+        if (str_contains($process->command, '/proc/sys/kernel/random/boot_id')) {
+            return Process::result(output: BlueGreenDeactivationScenario::BOOT_ID, exitCode: 0);
+        }
+
+        return Process::result(
+            output: (new ExecuteBlueGreenDeactivationRemoteCommand)->encode(
+                new BlueGreenDeactivationRemoteResult(
+                    outcome: BlueGreenDeactivationRemoteOutcome::Success,
+                    exitStatus: 0,
+                    output: '',
+                ),
+            ),
+            exitCode: 0,
+        );
+    });
+}
 
 function applicationWithRestartState(array $attributes = []): Application
 {
@@ -48,12 +81,34 @@ it('does not show the restart limit warning for a normal manual stop', function 
     expect($html)->not->toContain('Stopped after reaching restart limit');
 });
 
-it('keeps restart tracking configurable when stopping an application', function () {
-    $method = new ReflectionMethod(StopApplication::class, 'handle');
-    $resetRestartCount = collect($method->getParameters())->firstWhere('name', 'resetRestartCount');
+it('preserves restart-limit tracking through the fenced blue-green stop bridge', function () {
+    $context = BlueGreenDeactivationScenario::context();
+    $application = $context['application'];
+    $destination = $context['destination'];
+    $lastRestartAt = now()->subMinute()->startOfSecond();
 
-    expect($resetRestartCount)->not->toBeNull()
-        ->and($resetRestartCount->getDefaultValue())->toBeTrue();
+    $application->update([
+        'status' => 'exited:unhealthy',
+        'restart_count' => 2,
+        'max_restart_count' => 2,
+        'last_restart_type' => 'crash',
+        'last_restart_at' => $lastRestartAt,
+    ]);
+    BlueGreenDeactivationScenario::routeLessState($application, $destination);
+    fakeRestartLimitBlueGreenStopRemoteSuccess();
+    Event::fake([ServiceStatusChanged::class]);
+
+    $result = StopApplication::run($application, dockerCleanup: false, resetRestartCount: false);
+    $stoppedApplication = $application->fresh();
+    $deactivation = ApplicationBlueGreenDeactivation::query()->sole();
+
+    expect($result)->toBeNull()
+        ->and($stoppedApplication->status)->toBe('exited:unhealthy')
+        ->and($stoppedApplication->restart_count)->toBe(2)
+        ->and($stoppedApplication->last_restart_type)->toBe('crash')
+        ->and($stoppedApplication->last_restart_at?->equalTo($lastRestartAt))->toBeTrue()
+        ->and($stoppedApplication->stoppedAfterRestartLimit())->toBeTrue()
+        ->and($deactivation->phase)->toBe(BlueGreenDeactivationPhase::STOPPED);
 });
 
 it('uses the application link for restart limit notifications', function () {

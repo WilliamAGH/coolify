@@ -57,7 +57,7 @@ function successfulBlueGreenDeactivationProcessOutputsForResumeCommand(int $coun
     );
 
     return collect(range(1, $count))
-        ->flatMap(fn (): array => [BlueGreenDeactivationScenario::BOOT_ID, $success, $success])
+        ->flatMap(fn (): array => [BlueGreenDeactivationScenario::BOOT_ID, $success])
         ->all();
 }
 
@@ -70,7 +70,7 @@ it('resumes only one stale deactivation by default', function (): void {
     expect($deactivations[0]->fresh()->phase)->toBe(BlueGreenDeactivationPhase::COMPLETED)
         ->and($deactivations[1]->fresh()->phase)->toBe(BlueGreenDeactivationPhase::DEACTIVATING)
         ->and($deactivations[2]->fresh()->phase)->toBe(BlueGreenDeactivationPhase::DEACTIVATING);
-    Process::assertRanTimes(fn (): bool => true, 3);
+    Process::assertRanTimes(fn (): bool => true, 2);
 });
 
 it('resumes the explicit bounded limit in deterministic ID order', function (): void {
@@ -82,7 +82,7 @@ it('resumes the explicit bounded limit in deterministic ID order', function (): 
     expect($deactivations[0]->fresh()->phase)->toBe(BlueGreenDeactivationPhase::COMPLETED)
         ->and($deactivations[1]->fresh()->phase)->toBe(BlueGreenDeactivationPhase::COMPLETED)
         ->and($deactivations[2]->fresh()->phase)->toBe(BlueGreenDeactivationPhase::DEACTIVATING);
-    Process::assertRanTimes(fn (): bool => true, 6);
+    Process::assertRanTimes(fn (): bool => true, 4);
 });
 
 it('refuses non-positive resume limits from both entrypoints', function (): void {

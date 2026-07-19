@@ -611,3 +611,156 @@ it('asserts the expected boot inside the route lock before write rollback and re
             ->and($command)->toContain('/proc/sys/kernel/random/boot_id');
     }
 });
+
+it('refreshes operation fingerprints only for absent route states', function () {
+    $managedState = compileDestinationFencedBlueGreenConfiguration(
+        epoch: 2,
+        activeColor: BlueGreenDeploymentColor::BLUE,
+        deploymentUuid: 'deployment-absent-refresh',
+        containerId: '0123456789abcdef',
+        operationId: 'absent-refresh-managed',
+    )->state;
+    $absentState = $managedState->withoutManagedRoute(2, 'absent-refresh-expected');
+    $replacementState = $absentState->withAbsentRouteMutationOwner(
+        'absent-refresh-replacement',
+        hash('sha256', 'refreshed-routing-inputs'),
+        hash('sha256', 'refreshed-topology-inputs'),
+    );
+
+    expect($replacementState->hasSameAbsentRouteScope($absentState))->toBeTrue()
+        ->and($replacementState->managedFilename)->toBe($absentState->managedFilename)
+        ->and($replacementState->applicationUuid)->toBe($absentState->applicationUuid)
+        ->and($replacementState->destinationId)->toBe($absentState->destinationId)
+        ->and($replacementState->destinationFenceEpoch)->toBe($absentState->destinationFenceEpoch)
+        ->and($replacementState->routingRevision)->toBe($absentState->routingRevision)
+        ->and($replacementState->operationId)->toBe('absent-refresh-replacement')
+        ->and($replacementState->mutationSequence)->toBe(1)
+        ->and($replacementState->managedSha256)->toBeNull()
+        ->and($replacementState->activeColor)->toBeNull()
+        ->and($replacementState->applicationRoutingConfigDigest)->toBe(hash('sha256', 'refreshed-routing-inputs'))
+        ->and($replacementState->destinationTopologyDigest)->toBe(hash('sha256', 'refreshed-topology-inputs'))
+        ->and($managedState->hasSameAbsentRouteScope($replacementState))->toBeFalse();
+
+    expect(fn () => $managedState->withAbsentRouteMutationOwner(
+        'managed-refresh-replacement',
+        hash('sha256', 'refreshed-routing-inputs'),
+        hash('sha256', 'refreshed-topology-inputs'),
+    ))->toThrow(InvalidArgumentException::class);
+});
+
+it('allows only exact absent-route scopes to refresh operation fingerprints', function () {
+    $filesystem = new Filesystem;
+    $proxyPath = sys_get_temp_dir().'/coolify-blue-green-absent-refresh-'.bin2hex(random_bytes(8));
+    $filesystem->mkdir($proxyPath.'/dynamic', 0700);
+
+    try {
+        $writer = destinationFenceWriter();
+        $managedState = compileDestinationFencedBlueGreenConfiguration(
+            epoch: 2,
+            activeColor: BlueGreenDeploymentColor::BLUE,
+            deploymentUuid: 'deployment-absent-refresh-writer',
+            containerId: '0123456789abcdef',
+            operationId: 'absent-refresh-writer-managed',
+        )->state;
+        $expectedState = $managedState->withoutManagedRoute(2, 'absent-refresh-writer-expected');
+        $replacementState = $expectedState->withAbsentRouteMutationOwner(
+            'absent-refresh-writer-replacement',
+            hash('sha256', 'writer-refreshed-routing-inputs'),
+            hash('sha256', 'writer-refreshed-topology-inputs'),
+        );
+        $statePath = $writer->statePath($proxyPath, $expectedState->managedFilename);
+        $markerPath = $proxyPath.'/absent-refresh-marker';
+        $filesystem->mkdir(dirname($statePath), 0700);
+        file_put_contents($statePath, $expectedState->serialize());
+        chmod($statePath, 0600);
+
+        runDestinationFenceCommand($writer->fencedDestinationCommandFor(
+            proxyPath: $proxyPath,
+            managedFilename: $expectedState->managedFilename,
+            expectedState: $expectedState,
+            replacementState: $replacementState,
+            expectedBootId: destinationFenceBootId(),
+            commands: ['printf %s '.escapeshellarg('absent-refresh-applied').' > '.escapeshellarg($markerPath)],
+            completionCommands: destinationFenceFileAttestation($markerPath, 'absent-refresh-applied'),
+        ));
+        expect(file_get_contents($markerPath))->toBe('absent-refresh-applied')
+            ->and(BlueGreenProxyState::parse(file_get_contents($statePath))->serialize())
+            ->toBe($replacementState->serialize());
+
+        $managedReplacementState = new BlueGreenProxyState(
+            managedFilename: $replacementState->managedFilename,
+            applicationUuid: $replacementState->applicationUuid,
+            destinationId: $replacementState->destinationId,
+            operationId: $replacementState->operationId,
+            mutationSequence: $replacementState->mutationSequence,
+            destinationFenceEpoch: $replacementState->destinationFenceEpoch,
+            routingRevision: $replacementState->routingRevision,
+            managedSha256: hash('sha256', 'managed-absent-refresh-replacement'),
+            activeColor: BlueGreenDeploymentColor::GREEN,
+            activeDeploymentUuid: 'deployment-managed-replacement',
+            activeContainerName: 'app-fenced-green',
+            activeContainerId: 'abcdef0123456789',
+            applicationRoutingConfigDigest: $replacementState->applicationRoutingConfigDigest,
+            destinationTopologyDigest: $replacementState->destinationTopologyDigest,
+        );
+        $scopeChangedReplacementState = new BlueGreenProxyState(
+            managedFilename: $replacementState->managedFilename,
+            applicationUuid: 'different-fenced-app',
+            destinationId: $replacementState->destinationId,
+            operationId: $replacementState->operationId,
+            mutationSequence: $replacementState->mutationSequence,
+            destinationFenceEpoch: $replacementState->destinationFenceEpoch,
+            routingRevision: $replacementState->routingRevision,
+            managedSha256: null,
+            activeColor: null,
+            activeDeploymentUuid: null,
+            activeContainerName: null,
+            activeContainerId: null,
+            applicationRoutingConfigDigest: $replacementState->applicationRoutingConfigDigest,
+            destinationTopologyDigest: $replacementState->destinationTopologyDigest,
+        );
+        $epochChangedReplacementState = $expectedState
+            ->withDestinationFenceEpoch($expectedState->destinationFenceEpoch + 1)
+            ->withAbsentRouteMutationOwner(
+                $replacementState->operationId,
+                $replacementState->applicationRoutingConfigDigest,
+                $replacementState->destinationTopologyDigest,
+            );
+        $routingRevisionChangedReplacementState = new BlueGreenProxyState(
+            managedFilename: $replacementState->managedFilename,
+            applicationUuid: $replacementState->applicationUuid,
+            destinationId: $replacementState->destinationId,
+            operationId: $replacementState->operationId,
+            mutationSequence: $replacementState->mutationSequence,
+            destinationFenceEpoch: $replacementState->destinationFenceEpoch,
+            routingRevision: $replacementState->routingRevision + 1,
+            managedSha256: null,
+            activeColor: null,
+            activeDeploymentUuid: null,
+            activeContainerName: null,
+            activeContainerId: null,
+            applicationRoutingConfigDigest: $replacementState->applicationRoutingConfigDigest,
+            destinationTopologyDigest: $replacementState->destinationTopologyDigest,
+        );
+
+        foreach ([
+            [$managedState, $replacementState],
+            [$expectedState, $managedReplacementState],
+            [$expectedState, $scopeChangedReplacementState],
+            [$expectedState, $epochChangedReplacementState],
+            [$expectedState, $routingRevisionChangedReplacementState],
+        ] as [$rejectedExpectedState, $rejectedReplacementState]) {
+            expect(fn () => $writer->fencedDestinationCommandFor(
+                proxyPath: $proxyPath,
+                managedFilename: $expectedState->managedFilename,
+                expectedState: $rejectedExpectedState,
+                replacementState: $rejectedReplacementState,
+                expectedBootId: destinationFenceBootId(),
+                commands: ['true'],
+                completionCommands: ['true'],
+            ))->toThrow(InvalidArgumentException::class);
+        }
+    } finally {
+        $filesystem->remove($proxyPath);
+    }
+});

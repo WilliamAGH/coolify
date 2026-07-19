@@ -5,7 +5,6 @@ namespace App\Actions\Application\BlueGreen;
 use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
-use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeactivation;
@@ -48,12 +47,14 @@ class PrepareBlueGreenProxyDeactivation
                 throw new BlueGreenDeactivationException('A route-less deactivation has unexpected durable proxy state.');
             }
 
-            $this->attestState(
-                $preparation->destination->server,
-                BlueGreenRoutingTarget::managedFilename((string) $application->uuid, $preparation->destination->id),
-                $expectedState,
-                $expectedServerBootId,
-            );
+            if ($preparation->state === null) {
+                $this->attestState(
+                    $preparation->destination->server,
+                    BlueGreenRoutingTarget::managedFilename((string) $application->uuid, $preparation->destination->id),
+                    $expectedState,
+                    $expectedServerBootId,
+                );
+            }
 
             return null;
         }
@@ -96,15 +97,15 @@ class PrepareBlueGreenProxyDeactivation
                 $preparation->deactivation->standalone_docker_id,
             );
             $deactivation = $locks->deactivation;
-            if (! $locks->application->trashed()
-                || $deactivation === null
+            if ($deactivation === null
+                || ! $deactivation->ownsApplicationLifecycle($locks->application)
                 || $deactivation->id !== $preparation->deactivation->id
                 || $deactivation->operation_id !== $preparation->deactivation->operation_id
                 || (int) $deactivation->supersession_generation !== (int) $preparation->deactivation->supersession_generation
                 || $deactivation->started_at === null
                 || $preparation->deactivation->started_at === null
                 || ! $deactivation->started_at->equalTo($preparation->deactivation->started_at)
-                || $deactivation->phase !== BlueGreenDeactivationPhase::DEACTIVATING) {
+                || ! $deactivation->phase->isInProgress()) {
                 throw new BlueGreenDeactivationException('The durable deactivation owner changed before proxy snapshot persistence.');
             }
             if (is_array($deactivation->proxy_snapshot)) {
@@ -120,7 +121,7 @@ class PrepareBlueGreenProxyDeactivation
                     ->where('operation_id', $deactivation->operation_id)
                     ->where('started_at', $deactivation->started_at)
                     ->where('supersession_generation', $deactivation->supersession_generation)
-                    ->where('phase', BlueGreenDeactivationPhase::DEACTIVATING->value)
+                    ->where('phase', $deactivation->phase->value)
                     ->whereNull('proxy_snapshot')
                     ->update(['proxy_snapshot' => $encryptedSnapshot]) !== 1) {
                 throw new BlueGreenDeactivationException('The exact proxy deactivation snapshot could not be persisted.');

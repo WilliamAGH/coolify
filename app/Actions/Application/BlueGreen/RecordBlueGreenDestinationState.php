@@ -24,7 +24,9 @@ final class RecordBlueGreenDestinationState
             throw new BlueGreenDeploymentTransitionException('The destination state is not the next mutation owned by this deployment.');
         }
         $expectedEpoch = $expectedState?->destinationFenceEpoch ?? 0;
-        $isContainerOnlyMutation = $expectedState !== null && $replacementState->hasSameRouteIdentity($expectedState);
+        $isContainerOnlyMutation = $expectedState !== null
+            && ($replacementState->hasSameRouteIdentity($expectedState)
+                || $replacementState->hasSameAbsentRouteScope($expectedState));
         if ($replacementState->destinationId !== $claim->standaloneDockerId
             || $replacementState->destinationTopologyDigest !== $claim->topologyDigest
             || ($expectedState === null && ($replacementState->destinationFenceEpoch !== 0 || $replacementState->managedSha256 !== null))

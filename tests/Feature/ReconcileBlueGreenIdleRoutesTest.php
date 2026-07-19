@@ -246,6 +246,20 @@ it('returns repaired only for a regenerated exact idle route and unchanged for a
         ->and($state->managed_file_sha256)->toBe($fixture['configuration']->sha256);
 });
 
+it('does not repair or resurrect a stopped durable state', function (): void {
+    $fixture = makeIdleRouteReconciliationFixture();
+    $fixture['state']->update(['phase' => BlueGreenDeploymentPhase::STOPPED]);
+    $fixture['deployment']->update(['blue_green_phase' => BlueGreenDeploymentPhase::STOPPED]);
+    $reconciler = idleRouteReconciler();
+
+    expect(fn () => $reconciler->handle($fixture['application'], $fixture['destination']))
+        ->toThrow(BlueGreenDeploymentTransitionException::class)
+        ->and($reconciler->repairCalls)->toBe(0)
+        ->and($fixture['state']->fresh()->phase)->toBe(BlueGreenDeploymentPhase::STOPPED)
+        ->and($fixture['deployment']->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::STOPPED)
+        ->and($fixture['state']->fresh()->managed_file_sha256)->toBe($fixture['configuration']->sha256);
+});
+
 it('returns busy without a remote route mutation when another lifecycle owner holds the destination', function () {
     $fixture = makeIdleRouteReconciliationFixture();
     $reconciler = idleRouteReconciler();

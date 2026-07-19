@@ -209,16 +209,28 @@ it('fails explicitly when the cursor cannot be persisted and reaches later route
         ->and($later['outcomes'][0]['state_id'])->toBe($states[1]['state']->id);
 });
 
-it('selects only exact idle route states', function (): void {
-    $state = idleRouteReconciliationCommandStates(1)[0];
-    $state['state']->update(['phase' => BlueGreenDeploymentPhase::PREPARING]);
+it('skips stopped route states while dispatching the next exact idle route', function (): void {
+    $states = idleRouteReconciliationCommandStates(2);
+    $stoppedState = $states[0];
+    $idleState = $states[1];
+    $stoppedState['state']->update(['phase' => BlueGreenDeploymentPhase::STOPPED]);
 
-    ReconcileBlueGreenIdleRoutes::shouldNotRun();
+    ReconcileBlueGreenIdleRoutes::mock()
+        ->shouldReceive('handle')
+        ->once()
+        ->withArgs(function (Application $application, StandaloneDocker $destination) use ($idleState): bool {
+            return $application->is($idleState['application'])
+                && $destination->is($idleState['destination']);
+        })
+        ->andReturn(BlueGreenIdleRouteReconciliationOutcome::Unchanged);
 
     $this->artisan('blue-green:reconcile-idle-routes')
-        ->expectsOutput('No exact idle blue-green routes were found.')
-        ->expectsOutput('repaired=0 unchanged=0 busy=0 failed=0')
+        ->expectsOutput("state={$idleState['state']->id} outcome=unchanged The exact idle blue-green route was already current.")
+        ->expectsOutput('repaired=0 unchanged=1 busy=0 failed=0')
         ->assertSuccessful();
+
+    expect($stoppedState['state']->fresh()->phase)->toBe(BlueGreenDeploymentPhase::STOPPED)
+        ->and(Cache::get('blue-green:idle-route-reconciliation:last-state-id'))->toBe($idleState['state']->id);
 });
 
 it('refuses non-positive reconciliation limits from both entrypoints', function (): void {

@@ -26,7 +26,11 @@ final class PrepareBlueGreenDeactivation
         ?int $expectedDeactivationId = null,
         ?string $expectedOperationId = null,
         ?int $expectedSupersessionGeneration = null,
+        BlueGreenDeactivationPhase $requestedPhase = BlueGreenDeactivationPhase::DEACTIVATING,
     ): BlueGreenDeactivationPreparation {
+        if (! $requestedPhase->isInProgress()) {
+            throw new \InvalidArgumentException('A blue-green deactivation must begin in an in-progress phase.');
+        }
         $this->assertExpectedOwnerArguments(
             $expectedDeactivationId,
             $expectedOperationId,
@@ -40,6 +44,7 @@ final class PrepareBlueGreenDeactivation
                 $expectedDeactivationId,
                 $expectedOperationId,
                 $expectedSupersessionGeneration,
+                $requestedPhase,
             ),
             attempts: 5,
         );
@@ -51,11 +56,19 @@ final class PrepareBlueGreenDeactivation
         ?int $expectedDeactivationId,
         ?string $expectedOperationId,
         ?int $expectedSupersessionGeneration,
+        BlueGreenDeactivationPhase $requestedPhase,
     ): BlueGreenDeactivationPreparation {
-        $locks = BlueGreenLifecycleDatabaseLocks::forDestination($application->id, $standaloneDockerId);
+        $locks = BlueGreenLifecycleDatabaseLocks::forDestination(
+            $application->id,
+            $standaloneDockerId,
+            ensureDeploymentState: $requestedPhase === BlueGreenDeactivationPhase::STOPPING,
+        );
         $application = $locks->application;
-        if (! $application->trashed()) {
-            throw new BlueGreenDeactivationException('Blue-green deletion deactivation requires an exact soft-deleted application owner.');
+        $isExactManualStopResume = $requestedPhase === BlueGreenDeactivationPhase::STOPPING
+            && $expectedDeactivationId !== null;
+        if (($requestedPhase === BlueGreenDeactivationPhase::DEACTIVATING && ! $application->trashed())
+            || ($requestedPhase === BlueGreenDeactivationPhase::STOPPING && $application->trashed() && ! $isExactManualStopResume)) {
+            throw new BlueGreenDeactivationException('The blue-green deactivation mode no longer matches the application lifecycle.');
         }
         $destination = StandaloneDocker::query()
             ->whereKey($standaloneDockerId)
@@ -64,25 +77,40 @@ final class PrepareBlueGreenDeactivation
         if ($destination === null || $destination->server === null) {
             throw new BlueGreenDeactivationException('The blue-green destination no longer has a server and requires intervention.');
         }
-        $this->assertConfiguredDestination($application, $destination);
-
         $state = $locks->state;
+        $this->assertConfiguredDestination(
+            $application,
+            $destination,
+            $state,
+            $locks->deactivation,
+            $requestedPhase,
+            $expectedDeactivationId,
+            $expectedOperationId,
+            $expectedSupersessionGeneration,
+        );
+        if ($requestedPhase === BlueGreenDeactivationPhase::STOPPING && $state !== null) {
+            $this->adoptRouteLessLegacyContainer($application, $state);
+        }
         $this->assertNoPromotionOwnership($state);
         $this->assertExpectedOwner(
             $locks->deactivation,
             $expectedDeactivationId,
             $expectedOperationId,
             $expectedSupersessionGeneration,
+            $requestedPhase,
         );
         $deactivation = $this->claimDeactivationFence(
             $application,
             $destination,
             $state,
             $locks->deactivation,
+            $requestedPhase,
         );
-        if ($deactivation->started_at === null
-            || $application->deleted_at === null
-            || ! $deactivation->started_at->gt($application->deleted_at)) {
+        if ($deactivation->started_at === null) {
+            throw new BlueGreenDeactivationException('The durable deactivation authorization has no start time.');
+        }
+        if (! $requestedPhase->isManualStop()
+            && ($application->deleted_at === null || ! $deactivation->started_at->gt($application->deleted_at))) {
             throw new BlueGreenDeactivationException('The durable deactivation authorization must begin strictly after application deletion.');
         }
         if ($state !== null) {
@@ -143,9 +171,38 @@ final class PrepareBlueGreenDeactivation
             blueRoutingRevision: null,
             greenContainerName: $application->uuid.'-green',
             greenRoutingRevision: null,
-            legacyContainerName: null,
+            legacyContainerName: (string) $application->uuid,
             stopGracePeriodSeconds: $application->settings->stopGracePeriodSeconds(),
         );
+    }
+
+    private function adoptRouteLessLegacyContainer(
+        Application $application,
+        ApplicationBlueGreenDeployment $state,
+    ): void {
+        if ($state->phase !== BlueGreenDeploymentPhase::IDLE
+            || $state->active_color !== null
+            || $state->blue_deployment_uuid !== null
+            || $state->green_deployment_uuid !== null
+            || $state->legacy_container_name !== null
+            || $state->routing_revision !== 0) {
+            return;
+        }
+
+        if (ApplicationBlueGreenDeployment::query()
+            ->whereKey($state->id)
+            ->where('application_id', $state->application_id)
+            ->where('standalone_docker_id', $state->standalone_docker_id)
+            ->where('phase', BlueGreenDeploymentPhase::IDLE->value)
+            ->whereNull('active_color')
+            ->whereNull('blue_deployment_uuid')
+            ->whereNull('green_deployment_uuid')
+            ->whereNull('legacy_container_name')
+            ->where('routing_revision', 0)
+            ->update(['legacy_container_name' => (string) $application->uuid]) !== 1) {
+            throw new BlueGreenDeactivationInProgressException('The route-less blue-green state changed while its legacy container identity was adopted.');
+        }
+        $state->legacy_container_name = (string) $application->uuid;
     }
 
     private function claimDeactivationFence(
@@ -153,23 +210,30 @@ final class PrepareBlueGreenDeactivation
         StandaloneDocker $destination,
         ?ApplicationBlueGreenDeployment $state,
         ?ApplicationBlueGreenDeactivation $deactivation,
+        BlueGreenDeactivationPhase $requestedPhase,
     ): ApplicationBlueGreenDeactivation {
         if ($state?->phase === BlueGreenDeploymentPhase::DEACTIVATING) {
-            return $this->assertMatchingDeactivationFence($state, $deactivation);
+            return $this->assertMatchingDeactivationFence($state, $deactivation, $requestedPhase);
         }
         if ($deactivation !== null) {
             $this->assertDeactivationFence($deactivation);
-            if ($deactivation->phase === BlueGreenDeactivationPhase::DEACTIVATING) {
+            if ($deactivation->phase->isInProgress()) {
+                if ($deactivation->phase !== $requestedPhase) {
+                    throw new BlueGreenDeactivationInProgressException('A different blue-green deactivation mode already owns this destination.');
+                }
+
                 return $deactivation;
             }
         }
 
         $supersessionGeneration = $this->nextSupersessionGeneration($state, $deactivation);
         $startedAt = now()->startOfSecond();
-        $deletedAt = $application->deleted_at
-            ?? throw new BlueGreenDeactivationException('The deleted application has no durable deletion timestamp.');
-        if ($startedAt->lte($deletedAt)) {
-            $startedAt = $deletedAt->copy()->startOfSecond()->addSecond();
+        if (! $requestedPhase->isManualStop()) {
+            $deletedAt = $application->deleted_at
+                ?? throw new BlueGreenDeactivationException('The deleted application has no durable deletion timestamp.');
+            if ($startedAt->lte($deletedAt)) {
+                $startedAt = $deletedAt->copy()->startOfSecond()->addSecond();
+            }
         }
         $attributes = [
             'operation_id' => bin2hex(random_bytes(32)),
@@ -177,7 +241,7 @@ final class PrepareBlueGreenDeactivation
             'queue_cutoff_id' => $this->queueCutoffId(),
             'proxy_snapshot' => null,
             'supersession_generation' => $supersessionGeneration,
-            'phase' => BlueGreenDeactivationPhase::DEACTIVATING->value,
+            'phase' => $requestedPhase->value,
             'completed_at' => null,
         ];
         if ($deactivation === null) {
@@ -213,12 +277,14 @@ final class PrepareBlueGreenDeactivation
     private function assertMatchingDeactivationFence(
         ApplicationBlueGreenDeployment $state,
         ?ApplicationBlueGreenDeactivation $deactivation,
+        ?BlueGreenDeactivationPhase $requestedPhase = null,
     ): ApplicationBlueGreenDeactivation {
         if ($deactivation === null) {
             throw new BlueGreenDeactivationException('The deactivating blue-green state has no durable deactivation fence and requires intervention.');
         }
         $this->assertDeactivationFence($deactivation);
-        if ($deactivation->phase !== BlueGreenDeactivationPhase::DEACTIVATING
+        if (! $deactivation->phase->isInProgress()
+            || ($requestedPhase !== null && $deactivation->phase !== $requestedPhase)
             || (int) $state->supersession_generation !== (int) $deactivation->supersession_generation
             || $state->deactivation_operation_id !== $deactivation->operation_id
             || $state->deactivation_started_at === null
@@ -371,7 +437,10 @@ final class PrepareBlueGreenDeactivation
             ->whereKey($state->id)
             ->where('application_id', $state->application_id)
             ->where('standalone_docker_id', $state->standalone_docker_id)
-            ->where('phase', BlueGreenDeploymentPhase::IDLE->value)
+            ->whereIn('phase', [
+                BlueGreenDeploymentPhase::IDLE->value,
+                BlueGreenDeploymentPhase::STOPPED->value,
+            ])
             ->whereNull('operation_deployment_uuid')
             ->whereNull('pending_color')
             ->whereNull('pending_deployment_uuid')
@@ -437,6 +506,7 @@ final class PrepareBlueGreenDeactivation
         ?int $expectedDeactivationId,
         ?string $expectedOperationId,
         ?int $expectedSupersessionGeneration,
+        BlueGreenDeactivationPhase $requestedPhase,
     ): void {
         if ($expectedDeactivationId === null) {
             return;
@@ -445,7 +515,8 @@ final class PrepareBlueGreenDeactivation
             || $deactivation->id !== $expectedDeactivationId
             || $deactivation->operation_id !== $expectedOperationId
             || (int) $deactivation->supersession_generation !== $expectedSupersessionGeneration
-            || $deactivation->phase !== BlueGreenDeactivationPhase::DEACTIVATING) {
+            || $deactivation->phase !== $requestedPhase
+            || ! $deactivation->phase->isInProgress()) {
             throw new BlueGreenDeactivationInProgressException('The exact durable deactivation owner selected for resume is no longer current.');
         }
     }
@@ -464,7 +535,7 @@ final class PrepareBlueGreenDeactivation
 
             return;
         }
-        if ($state->phase !== BlueGreenDeploymentPhase::IDLE
+        if (! in_array($state->phase, [BlueGreenDeploymentPhase::IDLE, BlueGreenDeploymentPhase::STOPPED], true)
             || $state->operation_deployment_uuid !== null
             || $state->pending_color !== null
             || $state->pending_deployment_uuid !== null) {
@@ -475,8 +546,16 @@ final class PrepareBlueGreenDeactivation
         }
     }
 
-    private function assertConfiguredDestination(Application $application, StandaloneDocker $destination): void
-    {
+    private function assertConfiguredDestination(
+        Application $application,
+        StandaloneDocker $destination,
+        ?ApplicationBlueGreenDeployment $state,
+        ?ApplicationBlueGreenDeactivation $deactivation,
+        BlueGreenDeactivationPhase $requestedPhase,
+        ?int $expectedDeactivationId,
+        ?string $expectedOperationId,
+        ?int $expectedSupersessionGeneration,
+    ): void {
         $isPrimaryDestination = (int) $application->destination_id === $destination->id
             && $application->destination_type === $destination->getMorphClass();
         $isConfiguredDestination = $isPrimaryDestination
@@ -485,7 +564,32 @@ final class PrepareBlueGreenDeactivation
                 ->wherePivot('server_id', $destination->server_id)
                 ->exists();
 
-        if (! $isConfiguredDestination) {
+        $isCompletedDetachedDestination = $requestedPhase === BlueGreenDeactivationPhase::DEACTIVATING
+            && $expectedDeactivationId === null
+            && $expectedOperationId === null
+            && $expectedSupersessionGeneration === null
+            && $state?->phase === BlueGreenDeploymentPhase::STOPPED
+            && $state->deactivation_operation_id === null
+            && $state->deactivation_started_at === null
+            && (int) $state->supersession_generation > 0
+            && $deactivation?->phase === BlueGreenDeactivationPhase::STOPPED
+            && $deactivation->completed_at !== null
+            && (int) $deactivation->supersession_generation === (int) $state->supersession_generation;
+        $isExactDetachedDeletionResume = $requestedPhase === BlueGreenDeactivationPhase::DEACTIVATING
+            && $expectedDeactivationId !== null
+            && $expectedOperationId !== null
+            && $expectedSupersessionGeneration !== null
+            && $state?->phase === BlueGreenDeploymentPhase::DEACTIVATING
+            && $state->deactivation_operation_id === $expectedOperationId
+            && (int) $state->supersession_generation === $expectedSupersessionGeneration
+            && $deactivation?->id === $expectedDeactivationId
+            && $deactivation->operation_id === $expectedOperationId
+            && $state->deactivation_started_at !== null
+            && $deactivation->started_at !== null
+            && $state->deactivation_started_at->equalTo($deactivation->started_at)
+            && (int) $deactivation->supersession_generation === $expectedSupersessionGeneration
+            && $deactivation->phase === BlueGreenDeactivationPhase::DEACTIVATING;
+        if (! $isConfiguredDestination && ! $isCompletedDetachedDestination && ! $isExactDetachedDeletionResume) {
             throw new BlueGreenDeactivationException('The durable blue-green destination is no longer configured for this application and requires intervention.');
         }
     }

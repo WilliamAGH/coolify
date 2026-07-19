@@ -68,9 +68,22 @@ final class ExecuteBlueGreenDestinationMutation
         }
         if ($expectedState->managedFilename !== $managedFilename
             || $expectedState->applicationUuid !== (string) $application->uuid
-            || $expectedState->destinationId !== $claim->standaloneDockerId
-            || $expectedState->destinationTopologyDigest !== $claim->topologyDigest) {
+            || $expectedState->destinationId !== $claim->standaloneDockerId) {
             throw new BlueGreenDeploymentTransitionException('The current destination state does not match the claimed application topology.');
+        }
+        $isRefreshableAbsentRoute = $expectedState->managedSha256 === null
+            && $claim->previousActiveColor === null;
+        if ($expectedState->destinationTopologyDigest !== $claim->topologyDigest
+            && ! $isRefreshableAbsentRoute) {
+            throw new BlueGreenDeploymentTransitionException('The current destination state does not match the claimed application topology.');
+        }
+
+        if ($isRefreshableAbsentRoute) {
+            return $expectedState->withAbsentRouteMutationOwner(
+                $claim->deploymentUuid,
+                $claim->routingConfigDigest,
+                $claim->topologyDigest,
+            );
         }
 
         return $expectedState->withMutationOwner($claim->deploymentUuid);

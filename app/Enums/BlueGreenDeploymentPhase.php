@@ -9,5 +9,6 @@ enum BlueGreenDeploymentPhase: string
     case SWITCHING = 'switching';
     case ROLLING_BACK = 'rolling_back';
     case DEACTIVATING = 'deactivating';
+    case STOPPED = 'stopped';
     case INTERVENTION_REQUIRED = 'intervention_required';
 }

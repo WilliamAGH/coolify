@@ -71,6 +71,15 @@ final class ApplicationBlueGreenDeactivation extends Model
             || ($deployment->created_at !== null && $deployment->created_at->lt($this->started_at));
     }
 
+    public function ownsApplicationLifecycle(Application $application): bool
+    {
+        return match ($this->phase) {
+            BlueGreenDeactivationPhase::STOPPING => true,
+            BlueGreenDeactivationPhase::STOPPED => ! $application->trashed(),
+            default => $application->trashed(),
+        };
+    }
+
     public function assertValid(): void
     {
         if (! is_string($this->operation_id)
@@ -78,7 +87,7 @@ final class ApplicationBlueGreenDeactivation extends Model
             || $this->started_at === null
             || $this->queue_cutoff_id < 0
             || $this->supersession_generation < 1
-            || ($this->phase === BlueGreenDeactivationPhase::COMPLETED) !== ($this->completed_at !== null)) {
+            || (in_array($this->phase, [BlueGreenDeactivationPhase::COMPLETED, BlueGreenDeactivationPhase::STOPPED], true)) !== ($this->completed_at !== null)) {
             throw new \LogicException('The blue-green deactivation fence is malformed.');
         }
         if ($this->proxy_snapshot !== null) {

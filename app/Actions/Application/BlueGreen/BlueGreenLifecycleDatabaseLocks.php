@@ -3,7 +3,6 @@
 namespace App\Actions\Application\BlueGreen;
 
 use App\Enums\ApplicationDeploymentStatus;
-use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeactivation;
@@ -37,6 +36,7 @@ final readonly class BlueGreenLifecycleDatabaseLocks
         int $applicationId,
         int $standaloneDockerId,
         array $additionalQueueDeploymentUuids = [],
+        bool $ensureDeploymentState = false,
     ): self {
         $application = Application::withTrashed()
             ->whereKey($applicationId)
@@ -55,6 +55,12 @@ final readonly class BlueGreenLifecycleDatabaseLocks
         }
         $application->setRelation('settings', $setting);
 
+        if ($ensureDeploymentState) {
+            ApplicationBlueGreenDeployment::query()->fillAndInsertOrIgnore([
+                'application_id' => $application->id,
+                'standalone_docker_id' => $standaloneDockerId,
+            ]);
+        }
         $state = ApplicationBlueGreenDeployment::query()
             ->where('application_id', $application->id)
             ->where('standalone_docker_id', $standaloneDockerId)
@@ -127,7 +133,7 @@ final readonly class BlueGreenLifecycleDatabaseLocks
         } catch (\LogicException $exception) {
             throw new BlueGreenDeploymentTransitionException('The blue-green deactivation owner is malformed.', 0, $exception);
         }
-        if ($this->deactivation->phase === BlueGreenDeactivationPhase::DEACTIVATING
+        if ($this->deactivation->phase->fencesDeploymentClaims()
             || $this->deactivation->fences($deployment)) {
             throw new BlueGreenDeploymentTransitionException('The blue-green deployment is fenced by its durable deactivation owner.');
         }

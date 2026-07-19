@@ -229,6 +229,44 @@ final readonly class BlueGreenProxyState
         );
     }
 
+    public function withAbsentRouteMutationOwner(
+        string $operationId,
+        string $applicationRoutingConfigDigest,
+        string $destinationTopologyDigest,
+    ): self {
+        if ($this->managedSha256 !== null || $this->activeColor !== null) {
+            throw new InvalidArgumentException('Only an absent blue-green route can refresh its operation fingerprints.');
+        }
+
+        return new self(
+            managedFilename: $this->managedFilename,
+            applicationUuid: $this->applicationUuid,
+            destinationId: $this->destinationId,
+            operationId: $operationId,
+            mutationSequence: $this->nextMutationSequence($operationId),
+            destinationFenceEpoch: $this->destinationFenceEpoch,
+            routingRevision: $this->routingRevision,
+            managedSha256: null,
+            activeColor: null,
+            activeDeploymentUuid: null,
+            activeContainerName: null,
+            activeContainerId: null,
+            applicationRoutingConfigDigest: $applicationRoutingConfigDigest,
+            destinationTopologyDigest: $destinationTopologyDigest,
+        );
+    }
+
+    public function hasSameAbsentRouteScope(self $other): bool
+    {
+        return $this->managedSha256 === null
+            && $other->managedSha256 === null
+            && $this->activeColor === null
+            && $other->activeColor === null
+            && $this->hasSameScope($other)
+            && $this->destinationFenceEpoch === $other->destinationFenceEpoch
+            && $this->routingRevision === $other->routingRevision;
+    }
+
     public function isMutationSuccessorOf(?self $expectedState, string $operationId): bool
     {
         if (! hash_equals($this->operationId, $operationId)) {

@@ -286,7 +286,8 @@ class WriteBlueGreenProxyConfiguration
             if ($replacementState->destinationFenceEpoch !== 0 || $replacementState->managedSha256 !== null) {
                 throw new InvalidArgumentException('A first fenced destination mutation must adopt an absent epoch-zero route state.');
             }
-        } elseif (! $replacementState->hasSameRouteIdentity($expectedState)) {
+        } elseif (! $replacementState->hasSameRouteIdentity($expectedState)
+            && ! $replacementState->hasSameAbsentRouteScope($expectedState)) {
             throw new InvalidArgumentException('A container-only destination mutation cannot change the managed route identity.');
         }
         $this->assertCommandList($commands, 'mutation');

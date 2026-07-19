@@ -34,7 +34,10 @@ final class ResumeBlueGreenDeactivations
         }
 
         return ApplicationBlueGreenDeactivation::query()
-            ->where('phase', BlueGreenDeactivationPhase::DEACTIVATING->value)
+            ->whereIn('phase', [
+                BlueGreenDeactivationPhase::DEACTIVATING->value,
+                BlueGreenDeactivationPhase::STOPPING->value,
+            ])
             ->where(function ($query) use ($staleAfterSeconds): void {
                 $query->whereNull('started_at')
                     ->orWhere('started_at', '<=', now()->subSeconds($staleAfterSeconds));
@@ -78,10 +81,10 @@ final class ResumeBlueGreenDeactivations
                 'The application no longer exists.',
             );
         }
-        if (! $deactivation->application->trashed()
+        if (! $deactivation->ownsApplicationLifecycle($deactivation->application)
             || ! is_string($deactivation->operation_id)
             || (int) $deactivation->supersession_generation < 1
-            || $deactivation->phase !== BlueGreenDeactivationPhase::DEACTIVATING) {
+            || ! $deactivation->phase->isInProgress()) {
             return new BlueGreenDeactivationResumeResult(
                 $deactivation->id,
                 BlueGreenDeactivationResumeResult::INTERVENTION_REQUIRED,
@@ -96,6 +99,7 @@ final class ResumeBlueGreenDeactivations
                 $deactivation->id,
                 $deactivation->operation_id,
                 (int) $deactivation->supersession_generation,
+                $deactivation->phase,
             );
 
             return new BlueGreenDeactivationResumeResult(

@@ -7,7 +7,6 @@ use App\Actions\Proxy\BlueGreenProxyRollbackArtifact;
 use App\Actions\Proxy\BlueGreenProxyRollbackKey;
 use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
-use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\ProxyTypes;
 use App\Models\ApplicationBlueGreenDeployment;
@@ -161,8 +160,8 @@ final class InstallBlueGreenProxyEvictionTombstone
             );
             $deactivation = $locks->deactivation;
             $state = $locks->state;
-            if (! $locks->application->trashed()
-                || $deactivation === null
+            if ($deactivation === null
+                || ! $deactivation->ownsApplicationLifecycle($locks->application)
                 || $state === null
                 || $preparation->state === null
                 || $deactivation->id !== $preparation->deactivation->id
@@ -171,7 +170,7 @@ final class InstallBlueGreenProxyEvictionTombstone
                 || $deactivation->started_at === null
                 || $preparation->deactivation->started_at === null
                 || ! $deactivation->started_at->equalTo($preparation->deactivation->started_at)
-                || $deactivation->phase !== BlueGreenDeactivationPhase::DEACTIVATING
+                || ! $deactivation->phase->isInProgress()
                 || $state->id !== $preparation->state->id
                 || $state->phase !== BlueGreenDeploymentPhase::DEACTIVATING
                 || $state->deactivation_operation_id !== $deactivation->operation_id

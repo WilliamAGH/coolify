@@ -2,6 +2,7 @@
 
 namespace App\Actions\Application\BlueGreen;
 
+use App\Enums\BlueGreenDeactivationPhase;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationBlueGreenDeployment;
@@ -133,6 +134,80 @@ final class DeactivateBlueGreenApplication
         $preparations = $this->beginDeletion($application);
         $tombstonedApplication = Application::withTrashed()->findOrFail($application->id);
 
+        return $this->deactivatePreparedDestinations($tombstonedApplication, $preparations);
+    }
+
+    /** @return Collection<int, BlueGreenDeactivationPreparation> */
+    public function stop(Application $application, ?int $standaloneDockerId = null): Collection
+    {
+        $stoppingEveryDestination = $standaloneDockerId === null;
+        $destinationIds = $application->blueGreenConfiguredStandaloneDockerDestinationIds();
+        if ($standaloneDockerId !== null) {
+            if (! $destinationIds->contains($standaloneDockerId)) {
+                throw new BlueGreenDeactivationException('The requested blue-green stop destination is not configured for this application.');
+            }
+            $destinationIds = collect([$standaloneDockerId]);
+        }
+
+        $destinationFences = $this->acquireDestinationFences($application->id, $destinationIds);
+        $releasedEveryFence = false;
+
+        try {
+            $preparations = DB::transaction(function () use ($application, $destinationIds, $destinationFences, $stoppingEveryDestination): Collection {
+                $liveApplication = Application::withTrashed()
+                    ->whereKey($application->id)
+                    ->lockForUpdate()
+                    ->firstOrFail();
+                if ($liveApplication->trashed()) {
+                    throw new BlueGreenDeactivationException('A deleted blue-green application cannot be manually stopped.');
+                }
+
+                $this->refreshDestinationFences($destinationFences);
+                $currentDestinationIds = $stoppingEveryDestination
+                    ? $liveApplication->blueGreenConfiguredStandaloneDockerDestinationIds()
+                    : $destinationIds;
+                $this->assertEveryDestinationIsLocked($currentDestinationIds, $destinationFences);
+
+                $preparations = $currentDestinationIds->map(function (int $destinationId) use ($liveApplication, $destinationFences): BlueGreenDeactivationPreparation {
+                    $this->refreshDestinationFences($destinationFences);
+
+                    return PrepareBlueGreenDeactivation::run(
+                        $liveApplication,
+                        $destinationId,
+                        requestedPhase: BlueGreenDeactivationPhase::STOPPING,
+                    );
+                });
+
+                if ($stoppingEveryDestination) {
+                    $this->refreshDestinationFences($destinationFences);
+                    $this->assertEveryDestinationIsLocked(
+                        $liveApplication->blueGreenConfiguredStandaloneDockerDestinationIds(),
+                        $destinationFences,
+                    );
+                }
+
+                return $preparations;
+            }, attempts: 5);
+        } finally {
+            $releasedEveryFence = $this->releaseDestinationFences($destinationFences);
+        }
+
+        if (! $releasedEveryFence) {
+            throw new BlueGreenDeactivationInProgressException('Blue-green application stop prepared its durable owners, but one or more destination lifecycle locks could not be released safely.');
+        }
+
+        return $this->deactivatePreparedDestinations(
+            Application::withTrashed()->findOrFail($application->id),
+            $preparations,
+        );
+    }
+
+    /**
+     * @param  Collection<int, BlueGreenDeactivationPreparation>  $preparations
+     * @return Collection<int, BlueGreenDeactivationPreparation>
+     */
+    private function deactivatePreparedDestinations(Application $application, Collection $preparations): Collection
+    {
         foreach ($preparations as $preparation) {
             $deactivation = $preparation->deactivation;
             $operationId = $deactivation->operation_id;
@@ -142,11 +217,12 @@ final class DeactivateBlueGreenApplication
             }
 
             if (! DeactivateBlueGreenApplicationDestination::run(
-                $tombstonedApplication,
+                $application,
                 (int) $deactivation->standalone_docker_id,
                 (int) $deactivation->id,
                 $operationId,
                 $supersessionGeneration,
+                $deactivation->phase,
             )) {
                 throw new BlueGreenDeactivationException('Blue-green destination deactivation did not prove completion.');
             }

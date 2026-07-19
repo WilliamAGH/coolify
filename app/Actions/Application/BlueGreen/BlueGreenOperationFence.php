@@ -3,7 +3,6 @@
 namespace App\Actions\Application\BlueGreen;
 
 use App\Actions\Proxy\BlueGreenProxyState;
-use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\Application;
@@ -83,7 +82,7 @@ final readonly class BlueGreenOperationFence
             } catch (\LogicException $exception) {
                 throw new BlueGreenOperationFenceLostException('The blue-green deactivation owner is malformed.', 0, $exception);
             }
-            if ($deactivation->phase === BlueGreenDeactivationPhase::DEACTIVATING
+            if ($deactivation->phase->fencesDeploymentClaims()
                 || $deactivation->fences($deployment)) {
                 throw new BlueGreenOperationFenceLostException('The blue-green deployment operation is fenced by deactivation.');
             }
@@ -121,8 +120,8 @@ final readonly class BlueGreenOperationFence
         $application = Application::withTrashed()->find($expected->application_id);
         $deactivation = ApplicationBlueGreenDeactivation::query()->find($expected->id);
         if ($application === null
-            || ! $application->trashed()
             || $deactivation === null
+            || ! $deactivation->ownsApplicationLifecycle($application)
             || (int) $deactivation->application_id !== (int) $expected->application_id
             || (int) $deactivation->standalone_docker_id !== (int) $expected->standalone_docker_id
             || $deactivation->operation_id !== $expected->operation_id
@@ -131,7 +130,8 @@ final readonly class BlueGreenOperationFence
             || ! $deactivation->started_at->equalTo($expected->started_at)
             || $deactivation->supersession_generation < 1
             || $deactivation->supersession_generation !== $expected->supersession_generation
-            || $deactivation->phase !== BlueGreenDeactivationPhase::DEACTIVATING) {
+            || $deactivation->phase !== $expected->phase
+            || ! $deactivation->phase->isInProgress()) {
             throw new BlueGreenOperationFenceLostException('The blue-green deactivation no longer owns the exact durable operation and phase.');
         }
 
