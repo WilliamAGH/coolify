@@ -51,7 +51,6 @@ use App\Models\ApplicationDeploymentQueue;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
 use App\Support\ValidationPatterns;
-use Carbon\Carbon;
 use Closure;
 use Illuminate\Cache\Lock;
 use Illuminate\Support\Collection;
@@ -116,8 +115,6 @@ final class BlueGreenDeploymentLifecycle
     public function initialize(): void
     {
         $this->assertNotFencedByDeactivation();
-        $this->acquireLifecycleLock();
-        $this->assertNotFencedByDeactivation();
         $durableState = ApplicationBlueGreenDeployment::query()
             ->where('application_id', $this->application->id)
             ->where('standalone_docker_id', $this->destination->id)
@@ -131,6 +128,8 @@ final class BlueGreenDeploymentLifecycle
 
         $this->enabled = true;
         if ($durableState?->phase === BlueGreenDeploymentPhase::DRAINING) {
+            $this->acquireLifecycleLock();
+            $this->assertNotFencedByDeactivation();
             $this->initializeDrainingRecovery($durableState);
 
             return;
@@ -222,6 +221,8 @@ final class BlueGreenDeploymentLifecycle
         }
 
         ($this->checkForCancellation)();
+        $this->assertNotFencedByDeactivation();
+        $this->acquireLifecycleLock();
         $this->assertNotFencedByDeactivation();
         $this->assertEligibility();
         $serverBootId = $this->serverBootId
@@ -399,7 +400,7 @@ final class BlueGreenDeploymentLifecycle
 
     private function acquireLifecycleLock(): void
     {
-        $leaseSeconds = BlueGreenDeploymentLock::leaseSeconds(
+        $leaseSeconds = BlueGreenDeploymentLock::deploymentLeaseSeconds(
             max($this->timeout, (int) config('constants.ssh.command_timeout')),
             $this->application->settings->deploymentStopGracePeriodSeconds(),
         );
@@ -419,11 +420,6 @@ final class BlueGreenDeploymentLifecycle
         if (FindBlueGreenDeactivationFence::run($this->deployment) === null) {
             return;
         }
-        $this->deployment->update([
-            'status' => ApplicationDeploymentStatus::FAILED->value,
-            'finished_at' => Carbon::now()->toImmutable(),
-        ]);
-
         throw new DeploymentException('The queued deployment is fenced by a completed or in-progress application deactivation.');
     }
 
@@ -1397,13 +1393,16 @@ final class BlueGreenDeploymentLifecycle
 
         try {
             $this->assertLifecycleLockOwned();
+            $this->deployment->refresh();
+            if ($this->deployment->status !== ApplicationDeploymentStatus::CANCELLED_BY_USER->value) {
+                $this->assertOperationOwned(
+                    BlueGreenDeploymentPhase::PREPARING,
+                    BlueGreenDeploymentPhase::SWITCHING,
+                );
+            }
+            TransitionsBlueGreenDeployment::beginRollback($claim);
             $this->reconcilePendingDestinationState();
             $this->reconcileAppliedRoutingState();
-            $this->assertOperationOwned(
-                BlueGreenDeploymentPhase::PREPARING,
-                BlueGreenDeploymentPhase::SWITCHING,
-            );
-            TransitionsBlueGreenDeployment::beginRollback($claim);
             if ($this->proxyChanged) {
                 $rollbackKey = $this->rollbackKey
                     ?? throw new DeploymentException('Blue-green routing changed without a durable rollback key.');

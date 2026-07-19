@@ -182,6 +182,7 @@ it('uses the canonical direct-origin planner and verifier for deployment and rec
         'managed_file_sha256' => $configuration->state->managedSha256,
         'destination_topology_digest' => $configuration->state->destinationTopologyDigest,
         'application_routing_config_digest' => $configuration->state->applicationRoutingConfigDigest,
+        'supersession_generation' => 1,
         'phase' => BlueGreenDeploymentPhase::PREPARING,
         'routing_revision' => 1,
     ]);
@@ -193,6 +194,7 @@ it('uses the canonical direct-origin planner and verifier for deployment and rec
         'blue_green_server_boot_id' => $bootId,
         'blue_green_topology_digest' => $fingerprint->topologyDigest,
         'blue_green_routing_config_digest' => $fingerprint->routingConfigDigest,
+        'blue_green_supersession_generation' => 1,
         'blue_green_previous_container_id' => $previousId,
         'blue_green_candidate_container_id' => $candidateId,
         'blue_green_rollback_managed_filename' => $configuration->managedFilename,
@@ -209,6 +211,7 @@ it('uses the canonical direct-origin planner and verifier for deployment and rec
         serverBootId: $bootId,
         topologyDigest: $fingerprint->topologyDigest,
         routingConfigDigest: $fingerprint->routingConfigDigest,
+        supersessionGeneration: 1,
         legacyContainerName: null,
         candidateContainerName: $application->uuid.'-blue',
         rollbackManagedFilename: $configuration->managedFilename,

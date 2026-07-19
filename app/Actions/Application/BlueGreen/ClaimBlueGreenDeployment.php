@@ -3,6 +3,7 @@
 namespace App\Actions\Application\BlueGreen;
 
 use App\Actions\Proxy\BlueGreenRoutingTarget;
+use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
@@ -114,6 +115,14 @@ class ClaimBlueGreenDeployment
             $legacyContainerName = $this->resolveLegacyContainerName($state, $detectedLegacyContainerName);
             $expectedRoutingRevision = $state->routing_revision + 1;
             $destinationFenceEpoch = $state->destination_fence_epoch + 1;
+            $previousSupersessionGeneration = max(
+                $state->supersession_generation,
+                $deactivation?->supersession_generation ?? 0,
+            );
+            if ($previousSupersessionGeneration < 0 || $previousSupersessionGeneration === PHP_INT_MAX) {
+                throw new BlueGreenDeploymentTransitionException('The blue-green supersession generation is invalid or exhausted.');
+            }
+            $supersessionGeneration = $previousSupersessionGeneration + 1;
             $fingerprint = ComputeBlueGreenDeploymentFingerprint::run(
                 $lockedApplication,
                 $destination,
@@ -144,6 +153,7 @@ class ClaimBlueGreenDeployment
                 serverBootId: $serverBootId,
                 topologyDigest: $fingerprint->topologyDigest,
                 routingConfigDigest: $fingerprint->routingConfigDigest,
+                supersessionGeneration: $supersessionGeneration,
                 legacyContainerName: $legacyContainerName,
                 candidateContainerName: $lockedApplication->uuid.'-'.$pendingColor->value,
                 rollbackManagedFilename: $this->rollbackManagedFilename(
@@ -154,7 +164,7 @@ class ClaimBlueGreenDeployment
             $candidateContainer = $this->candidateContainer($claim);
             $this->assertPreviousContainer($claim, $previousContainer);
 
-            $stateUpdated = $this->exactStateQuery($state)
+            $stateUpdated = $this->exactStateQuery($state, $lockedDeployment)
                 ->update([
                     'pending_color' => $pendingColor->value,
                     'pending_deployment_uuid' => $lockedDeployment->deployment_uuid,
@@ -178,6 +188,7 @@ class ClaimBlueGreenDeployment
                     'operation_topology_digest' => $fingerprint->topologyDigest,
                     'operation_routing_config_digest' => $fingerprint->routingConfigDigest,
                     'operation_previous_managed_file_sha256' => $state->managed_file_sha256,
+                    'supersession_generation' => $supersessionGeneration,
                     'phase' => BlueGreenDeploymentPhase::PREPARING->value,
                     'routing_revision' => $expectedRoutingRevision,
                 ]);
@@ -189,6 +200,9 @@ class ClaimBlueGreenDeployment
             $deploymentUpdated = ApplicationDeploymentQueue::query()
                 ->whereKey($lockedDeployment->getKey())
                 ->where('application_id', $lockedApplication->id)
+                ->where('destination_id', $destination->id)
+                ->where('pull_request_id', 0)
+                ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
                 ->whereNull('blue_green_color')
                 ->whereNull('blue_green_phase')
                 ->whereNull('blue_green_routing_revision')
@@ -196,10 +210,23 @@ class ClaimBlueGreenDeployment
                 ->whereNull('blue_green_server_boot_id')
                 ->whereNull('blue_green_topology_digest')
                 ->whereNull('blue_green_routing_config_digest')
+                ->whereNull('blue_green_supersession_generation')
                 ->whereNull('blue_green_previous_container_id')
                 ->whereNull('blue_green_candidate_container_id')
                 ->whereNull('blue_green_rollback_managed_filename')
                 ->whereNull('blue_green_routing_mutated_at')
+                ->whereHas('application')
+                ->whereExists(function ($query) use ($state, $lockedApplication, $destination, $supersessionGeneration): void {
+                    $query->selectRaw('1')
+                        ->from('application_blue_green_deployments as claimed_state')
+                        ->where('claimed_state.id', $state->id)
+                        ->where('claimed_state.application_id', $lockedApplication->id)
+                        ->where('claimed_state.standalone_docker_id', $destination->id)
+                        ->whereColumn('claimed_state.operation_deployment_uuid', 'application_deployment_queues.deployment_uuid')
+                        ->where('claimed_state.supersession_generation', $supersessionGeneration)
+                        ->whereNull('claimed_state.deactivation_operation_id')
+                        ->whereNull('claimed_state.deactivation_started_at');
+                })
                 ->update([
                     'blue_green_color' => $pendingColor->value,
                     'blue_green_phase' => BlueGreenDeploymentPhase::PREPARING->value,
@@ -208,6 +235,7 @@ class ClaimBlueGreenDeployment
                     'blue_green_server_boot_id' => $serverBootId,
                     'blue_green_topology_digest' => $fingerprint->topologyDigest,
                     'blue_green_routing_config_digest' => $fingerprint->routingConfigDigest,
+                    'blue_green_supersession_generation' => $supersessionGeneration,
                     'blue_green_previous_container_id' => $previousContainer?->dockerId,
                     'blue_green_candidate_container_id' => null,
                     'blue_green_rollback_managed_filename' => $claim->rollbackManagedFilename,
@@ -257,6 +285,9 @@ class ClaimBlueGreenDeployment
         if ($deployment->pull_request_id !== 0) {
             throw new BlueGreenDeploymentTransitionException('Pull-request deployment queues cannot claim the blue-green lifecycle.');
         }
+        if ($deployment->status !== ApplicationDeploymentStatus::IN_PROGRESS->value) {
+            throw new BlueGreenDeploymentTransitionException('Only the in-progress queue owner can claim the blue-green lifecycle.');
+        }
     }
 
     private function assertNotFencedByDeactivation(
@@ -302,6 +333,7 @@ class ClaimBlueGreenDeployment
             || $deployment->blue_green_server_boot_id !== null
             || $deployment->blue_green_topology_digest !== null
             || $deployment->blue_green_routing_config_digest !== null
+            || $deployment->blue_green_supersession_generation !== null
             || $deployment->blue_green_previous_container_id !== null
             || $deployment->blue_green_candidate_container_id !== null
             || $deployment->blue_green_rollback_managed_filename !== null
@@ -375,8 +407,10 @@ class ClaimBlueGreenDeployment
         return $state->legacy_container_name ?? $detectedLegacyContainerName;
     }
 
-    private function exactStateQuery(ApplicationBlueGreenDeployment $state): Builder
-    {
+    private function exactStateQuery(
+        ApplicationBlueGreenDeployment $state,
+        ApplicationDeploymentQueue $deployment,
+    ): Builder {
         $query = ApplicationBlueGreenDeployment::query()
             ->whereKey($state->getKey())
             ->where('application_id', $state->application_id)
@@ -386,7 +420,20 @@ class ClaimBlueGreenDeployment
             ->whereNull('pending_deployment_uuid')
             ->whereNull('deactivation_operation_id')
             ->whereNull('deactivation_started_at')
-            ->where('routing_revision', $state->routing_revision);
+            ->where('supersession_generation', $state->supersession_generation)
+            ->where('routing_revision', $state->routing_revision)
+            ->whereHas('application')
+            ->whereExists(function ($query) use ($deployment): void {
+                $query->selectRaw('1')
+                    ->from('application_deployment_queues as claim_queue')
+                    ->whereColumn('claim_queue.application_id', 'application_blue_green_deployments.application_id')
+                    ->where('claim_queue.id', $deployment->getKey())
+                    ->where('claim_queue.deployment_uuid', $deployment->deployment_uuid)
+                    ->where('claim_queue.destination_id', $deployment->destination_id)
+                    ->where('claim_queue.pull_request_id', 0)
+                    ->where('claim_queue.status', ApplicationDeploymentStatus::IN_PROGRESS->value)
+                    ->whereNull('claim_queue.blue_green_supersession_generation');
+            });
 
         foreach (ApplicationBlueGreenDeployment::clearedOperationAttributes() as $attribute => $_) {
             $query->whereNull($attribute);

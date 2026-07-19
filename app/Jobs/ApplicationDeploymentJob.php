@@ -2,6 +2,7 @@
 
 namespace App\Jobs;
 
+use App\Actions\Application\BlueGreen\BlueGreenLifecycleDatabaseLocks;
 use App\Actions\Application\BlueGreen\FindBlueGreenDeactivationFence;
 use App\Actions\Application\WaitForSwarmStackConvergence;
 use App\Actions\Docker\GetContainersStatus;
@@ -42,6 +43,7 @@ use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Sleep;
 use Illuminate\Support\Str;
 use JsonException;
@@ -316,11 +318,11 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
 
         if ($this->destination instanceof StandaloneDocker
             && FindBlueGreenDeactivationFence::run($this->application_deployment_queue) !== null) {
-            $this->application_deployment_queue->update([
-                'status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
-                'finished_at' => Carbon::now()->toImmutable(),
-            ]);
-            $this->application_deployment_queue->addLogEntry('Deployment was cancelled because application deactivation owns this destination.');
+            $this->application_deployment_queue->refresh();
+            if ($this->application_deployment_queue->status === ApplicationDeploymentStatus::CANCELLED_BY_USER->value) {
+                $this->application_deployment_queue->addLogEntry('Deployment was cancelled because application deactivation owns this destination.');
+                queue_next_deployment($this->application_deployment_queue);
+            }
 
             return;
         }
@@ -429,12 +431,19 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
             // with Laravel's job failure handling and status updates
             if (! $drainRecoveryScheduled) {
                 try {
-                    $this->application_deployment_queue->update([
-                        'finished_at' => Carbon::now()->toImmutable(),
-                    ]);
+                    ApplicationDeploymentQueue::query()
+                        ->whereKey($this->application_deployment_queue->getKey())
+                        ->whereNull('finished_at')
+                        ->when(
+                            $this->dispatch_attempt_uuid !== null,
+                            fn ($query) => $query->where('horizon_job_id', $this->dispatch_attempt_uuid),
+                        )
+                        ->update([
+                            'finished_at' => Carbon::now()->toImmutable(),
+                        ]);
                 } catch (Exception $e) {
                     // Log but don't fail - finished_at is not critical
-                    \Log::warning('Failed to update finished_at for deployment '.$this->deployment_uuid.': '.$e->getMessage());
+                    Log::warning('Failed to update finished_at for deployment '.$this->deployment_uuid.': '.$e->getMessage());
                 }
             }
 
@@ -454,20 +463,20 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
                 $this->graceful_shutdown_container($this->deployment_uuid, skipRemove: true);
             } catch (Exception $e) {
                 // Log but don't fail - container cleanup errors are expected when container is already gone
-                \Log::warning('Failed to shutdown container '.$this->deployment_uuid.': '.$e->getMessage());
+                Log::warning('Failed to shutdown container '.$this->deployment_uuid.': '.$e->getMessage());
             }
 
             try {
                 ServiceStatusChanged::dispatch(data_get($this->application, 'environment.project.team.id'));
             } catch (Exception $e) {
                 // Log but don't fail - event dispatch errors shouldn't prevent status updates
-                \Log::warning('Failed to dispatch ServiceStatusChanged for deployment '.$this->deployment_uuid.': '.$e->getMessage());
+                Log::warning('Failed to dispatch ServiceStatusChanged for deployment '.$this->deployment_uuid.': '.$e->getMessage());
             }
 
             try {
                 $this->blueGreenLifecycle?->release();
             } catch (Throwable $e) {
-                \Log::warning('Failed to release blue-green lifecycle ownership for deployment '.$this->deployment_uuid.': '.$e->getMessage());
+                Log::warning('Failed to release blue-green lifecycle ownership for deployment '.$this->deployment_uuid.': '.$e->getMessage());
             }
         }
     }
@@ -655,7 +664,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         try {
             GetContainersStatus::dispatch($this->server);
         } catch (Exception $e) {
-            \Log::warning('Failed to dispatch GetContainersStatus for deployment '.$this->deployment_uuid.': '.$e->getMessage());
+            Log::warning('Failed to dispatch GetContainersStatus for deployment '.$this->deployment_uuid.': '.$e->getMessage());
         }
 
         if ($this->pull_request_id !== 0) {
@@ -663,7 +672,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
                 try {
                     ApplicationPullRequestUpdateJob::dispatch(application: $this->application, preview: $this->preview, deployment_uuid: $this->deployment_uuid, status: ProcessStatus::FINISHED);
                 } catch (Exception $e) {
-                    \Log::warning('Failed to dispatch PR update for deployment '.$this->deployment_uuid.': '.$e->getMessage());
+                    Log::warning('Failed to dispatch PR update for deployment '.$this->deployment_uuid.': '.$e->getMessage());
                 }
             }
         }
@@ -671,7 +680,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         try {
             $this->run_post_deployment_command();
         } catch (Exception $e) {
-            \Log::warning('Post deployment command failed for '.$this->deployment_uuid.': '.$e->getMessage());
+            Log::warning('Post deployment command failed for '.$this->deployment_uuid.': '.$e->getMessage());
         }
 
     }
@@ -4988,7 +4997,9 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
             return;
         }
 
-        $this->updateDeploymentStatus($status);
+        if (! $this->updateDeploymentStatus($status)) {
+            return;
+        }
         $this->handleStatusTransition($status);
         queue_next_deployment($this->application_deployment_queue);
     }
@@ -5020,11 +5031,28 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
     /**
      * Update the deployment status in the database.
      */
-    private function updateDeploymentStatus(ApplicationDeploymentStatus $status): void
+    private function updateDeploymentStatus(ApplicationDeploymentStatus $status): bool
     {
-        $this->application_deployment_queue->update([
+        $query = ApplicationDeploymentQueue::query()
+            ->whereKey($this->application_deployment_queue->getKey())
+            ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
+            ->when(
+                $this->dispatch_attempt_uuid !== null,
+                fn ($query) => $query->where('horizon_job_id', $this->dispatch_attempt_uuid),
+            );
+        $updated = BlueGreenLifecycleDatabaseLocks::constrainTerminalQueueOwner(
+            $query,
+            $this->application_deployment_queue,
+        )->update([
             'status' => $status->value,
         ]);
+        if ($updated !== 1) {
+            return false;
+        }
+        $this->application_deployment_queue->setAttribute('status', $status->value);
+        $this->application_deployment_queue->syncOriginalAttribute('status');
+
+        return true;
     }
 
     /**
@@ -5056,7 +5084,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         try {
             $this->application->markDeploymentConfigurationApplied($this->application_deployment_queue);
         } catch (Exception $e) {
-            \Log::warning('Failed to mark configuration as applied for deployment '.$this->deployment_uuid.': '.$e->getMessage());
+            Log::warning('Failed to mark configuration as applied for deployment '.$this->deployment_uuid.': '.$e->getMessage());
         }
 
         event(new ApplicationConfigurationChanged($this->application->team()->id));

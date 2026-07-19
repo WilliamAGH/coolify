@@ -2,8 +2,7 @@
 
 namespace App\Livewire\Server;
 
-use App\Actions\Server\DeleteServer;
-use App\Jobs\DeleteResourceJob;
+use App\Actions\Server\QueueServerDeletion;
 use App\Models\Server;
 use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
 use Livewire\Component;
@@ -45,19 +44,10 @@ class Delete extends Component
                 return;
             }
 
-            if ($this->force_delete_resources) {
-                foreach ($this->server->definedResources() as $resource) {
-                    DeleteResourceJob::dispatch($resource);
-                }
-            }
-
-            $this->server->delete();
-            DeleteServer::dispatch(
-                $this->server->id,
+            QueueServerDeletion::run(
+                $this->server,
+                $this->force_delete_resources,
                 $this->delete_from_hetzner,
-                $this->server->hetzner_server_id,
-                $this->server->cloud_provider_token_id,
-                $this->server->team_id
             );
 
             return redirectRoute($this, 'server.index');

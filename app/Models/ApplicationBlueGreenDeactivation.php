@@ -11,6 +11,7 @@ final class ApplicationBlueGreenDeactivation extends Model
 {
     protected $attributes = [
         'phase' => BlueGreenDeactivationPhase::DEACTIVATING->value,
+        'supersession_generation' => 0,
     ];
 
     protected $fillable = [
@@ -20,6 +21,7 @@ final class ApplicationBlueGreenDeactivation extends Model
         'started_at',
         'queue_cutoff_id',
         'proxy_snapshot',
+        'supersession_generation',
         'phase',
         'completed_at',
     ];
@@ -34,6 +36,7 @@ final class ApplicationBlueGreenDeactivation extends Model
             'started_at' => 'datetime',
             'queue_cutoff_id' => 'integer',
             'proxy_snapshot' => 'encrypted:array',
+            'supersession_generation' => 'integer',
             'phase' => BlueGreenDeactivationPhase::class,
             'completed_at' => 'datetime',
         ];
@@ -53,8 +56,8 @@ final class ApplicationBlueGreenDeactivation extends Model
     {
         $this->assertValid();
 
-        if ((int) $deployment->application_id !== $this->application_id
-            || (int) $deployment->destination_id !== $this->standalone_docker_id) {
+        if ((int) $deployment->application_id !== (int) $this->application_id
+            || (int) $deployment->destination_id !== (int) $this->standalone_docker_id) {
             return false;
         }
         if ($this->application()->whereNotNull('deleted_at')->exists()) {
@@ -74,6 +77,7 @@ final class ApplicationBlueGreenDeactivation extends Model
             || preg_match('/^[0-9a-f]{64}$/D', $this->operation_id) !== 1
             || $this->started_at === null
             || $this->queue_cutoff_id < 0
+            || $this->supersession_generation < 1
             || ($this->phase === BlueGreenDeactivationPhase::COMPLETED) !== ($this->completed_at !== null)) {
             throw new \LogicException('The blue-green deactivation fence is malformed.');
         }

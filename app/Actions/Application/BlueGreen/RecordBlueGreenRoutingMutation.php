@@ -3,6 +3,7 @@
 namespace App\Actions\Application\BlueGreen;
 
 use App\Actions\Proxy\BlueGreenProxyState;
+use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
@@ -33,14 +34,18 @@ final class RecordBlueGreenRoutingMutation
             );
             $state = $locks->state;
             $deployment = $locks->queue($claim->deploymentUuid);
-            if ($state === null || $state->id !== $claim->stateId || $deployment === null
-                || ! in_array($state->phase, [BlueGreenDeploymentPhase::PREPARING, BlueGreenDeploymentPhase::SWITCHING], true)
+            if ($state === null || $state->id !== $claim->stateId || $deployment === null) {
+                throw new BlueGreenDeploymentTransitionException('The routing mutation no longer belongs to the exact pending operation.');
+            }
+            $locks->assertDeploymentOwner($claim, $deployment);
+            if (! in_array($state->phase, [BlueGreenDeploymentPhase::PREPARING, BlueGreenDeploymentPhase::SWITCHING], true)
                 || $state->pending_color !== $claim->pendingColor
                 || $state->pending_deployment_uuid !== $claim->deploymentUuid
                 || $state->operation_deployment_uuid !== $claim->deploymentUuid
                 || $state->operation_destination_fence_epoch !== $claim->destinationFenceEpoch
                 || $state->operation_topology_digest !== $claim->topologyDigest
                 || $state->operation_routing_config_digest !== $claim->routingConfigDigest
+                || $state->supersession_generation !== $claim->supersessionGeneration
                 || $state->operation_candidate_container_id === null
                 || $state->operation_rollback_managed_filename === null
                 || $state->destination_fence_epoch !== $replacementState->destinationFenceEpoch
@@ -77,15 +82,39 @@ final class RecordBlueGreenRoutingMutation
                 ->where('destination_fence_operation_id', $replacementState->operationId)
                 ->where('destination_fence_mutation_sequence', $replacementState->mutationSequence)
                 ->where('managed_file_sha256', $replacementState->managedSha256)
+                ->whereNull('deactivation_operation_id')
+                ->whereNull('deactivation_started_at')
+                ->where('supersession_generation', $claim->supersessionGeneration)
                 ->whereNull('operation_routing_mutated_at')
+                ->whereHas('application')
+                ->whereHas('operationDeployment', function ($query) use ($claim, $state): void {
+                    $query->where('application_id', $claim->applicationId)
+                        ->where('deployment_uuid', $claim->deploymentUuid)
+                        ->where('destination_id', $claim->standaloneDockerId)
+                        ->where('pull_request_id', 0)
+                        ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
+                        ->where('blue_green_supersession_generation', $claim->supersessionGeneration)
+                        ->where('blue_green_phase', $state->phase->value)
+                        ->whereHas('application');
+                })
                 ->update(['operation_routing_mutated_at' => $mutatedAt]);
-            $deploymentUpdated = ApplicationDeploymentQueue::query()
+            $deploymentQuery = ApplicationDeploymentQueue::query()
                 ->whereKey($deployment->getKey())
+                ->where('application_id', $claim->applicationId)
+                ->where('deployment_uuid', $claim->deploymentUuid)
+                ->where('destination_id', $claim->standaloneDockerId)
+                ->where('pull_request_id', 0)
+                ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
+                ->where('blue_green_supersession_generation', $claim->supersessionGeneration)
                 ->where('blue_green_destination_fence_epoch', $claim->destinationFenceEpoch)
                 ->where('blue_green_topology_digest', $claim->topologyDigest)
                 ->where('blue_green_routing_config_digest', $claim->routingConfigDigest)
-                ->whereNull('blue_green_routing_mutated_at')
-                ->update(['blue_green_routing_mutated_at' => $mutatedAt]);
+                ->whereNull('blue_green_routing_mutated_at');
+            $deploymentUpdated = BlueGreenLifecycleDatabaseLocks::constrainDeploymentQueueOwner(
+                $deploymentQuery,
+                $claim,
+                $state->phase,
+            )->update(['blue_green_routing_mutated_at' => $mutatedAt]);
             if ($stateUpdated !== 1 || $deploymentUpdated !== 1) {
                 throw new BlueGreenDeploymentTransitionException('The routing mutation owner changed while durable progress was recorded.');
             }

@@ -6,6 +6,7 @@ use App\Actions\Proxy\BlueGreenProxyState;
 use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
+use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
@@ -35,12 +36,19 @@ final readonly class BlueGreenOperationFence
         $this->refreshOwnedLock();
         (new ComputeBlueGreenDeploymentFingerprint)->assertMatchesClaim($claim);
 
+        $application = Application::withTrashed()->find($claim->applicationId);
         $state = ApplicationBlueGreenDeployment::query()->find($claim->stateId);
         $deployment = ApplicationDeploymentQueue::query()
             ->where('application_id', $claim->applicationId)
             ->where('deployment_uuid', $claim->deploymentUuid)
             ->first();
-        if ($state === null
+        $deactivation = ApplicationBlueGreenDeactivation::query()
+            ->where('application_id', $claim->applicationId)
+            ->where('standalone_docker_id', $claim->standaloneDockerId)
+            ->first();
+        if ($application === null
+            || $application->trashed()
+            || $state === null
             || $deployment === null
             || (int) $state->application_id !== $claim->applicationId
             || (int) $state->standalone_docker_id !== $claim->standaloneDockerId
@@ -49,9 +57,13 @@ final readonly class BlueGreenOperationFence
             || $state->routing_revision !== $claim->expectedRoutingRevision
             || $state->operation_candidate_container_name !== $claim->candidateContainerName
             || $state->operation_rollback_managed_filename !== $claim->rollbackManagedFilename
+            || $state->deactivation_operation_id !== null
+            || $state->deactivation_started_at !== null
+            || $state->supersession_generation !== $claim->supersessionGeneration
             || (int) $deployment->application_id !== $claim->applicationId
             || (int) $deployment->destination_id !== $claim->standaloneDockerId
             || $deployment->pull_request_id !== 0
+            || ! BlueGreenLifecycleDatabaseLocks::queueStatusOwnsPhase($deployment->status, $state->phase)
             || $deployment->blue_green_phase !== $state->phase
             || $deployment->blue_green_color !== $claim->pendingColor
             || $deployment->blue_green_routing_revision !== $claim->expectedRoutingRevision
@@ -59,10 +71,22 @@ final readonly class BlueGreenOperationFence
             || $deployment->blue_green_server_boot_id !== $claim->serverBootId
             || $deployment->blue_green_topology_digest !== $claim->topologyDigest
             || $deployment->blue_green_routing_config_digest !== $claim->routingConfigDigest
+            || $deployment->blue_green_supersession_generation !== $claim->supersessionGeneration
             || ! $this->deploymentProvenanceMatches($state, $deployment, $claim)
             || ! $this->stateShapeMatchesClaim($state, $claim)
             || ($verifyDestinationState && ! $this->destinationStateMatches($state, $expectedDestinationState))) {
             throw new BlueGreenOperationFenceLostException('The blue-green deployment operation no longer owns the exact durable phase and provenance.');
+        }
+        if ($deactivation !== null) {
+            try {
+                $deactivation->assertValid();
+            } catch (\LogicException $exception) {
+                throw new BlueGreenOperationFenceLostException('The blue-green deactivation owner is malformed.', 0, $exception);
+            }
+            if ($deactivation->phase === BlueGreenDeactivationPhase::DEACTIVATING
+                || $deactivation->fences($deployment)) {
+                throw new BlueGreenOperationFenceLostException('The blue-green deployment operation is fenced by deactivation.');
+            }
         }
 
         return $state->phase;
@@ -94,14 +118,19 @@ final readonly class BlueGreenOperationFence
         $this->refreshOwnedLock();
 
         $expected = $preparation->deactivation;
+        $application = Application::withTrashed()->find($expected->application_id);
         $deactivation = ApplicationBlueGreenDeactivation::query()->find($expected->id);
-        if ($deactivation === null
+        if ($application === null
+            || ! $application->trashed()
+            || $deactivation === null
             || (int) $deactivation->application_id !== (int) $expected->application_id
             || (int) $deactivation->standalone_docker_id !== (int) $expected->standalone_docker_id
             || $deactivation->operation_id !== $expected->operation_id
             || $deactivation->started_at === null
             || $expected->started_at === null
             || ! $deactivation->started_at->equalTo($expected->started_at)
+            || $deactivation->supersession_generation < 1
+            || $deactivation->supersession_generation !== $expected->supersession_generation
             || $deactivation->phase !== BlueGreenDeactivationPhase::DEACTIVATING) {
             throw new BlueGreenOperationFenceLostException('The blue-green deactivation no longer owns the exact durable operation and phase.');
         }
@@ -119,6 +148,7 @@ final readonly class BlueGreenOperationFence
         }
         $matchesPreparedDeactivation = $state !== null
             && $state->phase === BlueGreenDeploymentPhase::DEACTIVATING
+            && $state->supersession_generation === $deactivation->supersession_generation
             && $state->operation_deployment_uuid === null
             && $state->deactivation_operation_id === $deactivation->operation_id
             && $state->deactivation_started_at !== null

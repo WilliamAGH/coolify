@@ -2,8 +2,10 @@
 
 use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
+use App\Actions\Application\BlueGreen\FindBlueGreenDeactivationFence;
 use App\Actions\Application\BlueGreen\RecordBlueGreenDestinationState;
 use App\Enums\ApplicationDeploymentStatus;
+use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Events\ApplicationConfigurationChanged;
@@ -11,6 +13,7 @@ use App\Exceptions\DeploymentException;
 use App\Jobs\ApplicationDeploymentJob;
 use App\Jobs\ResumeBlueGreenDrainingDeploymentJob;
 use App\Models\Application;
+use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\InstanceSettings;
@@ -85,6 +88,7 @@ KEY,
         'server_name' => $server->name,
         'destination_id' => $destination->id,
         'deployment_uuid' => 'application-destination-fence',
+        'pull_request_id' => 0,
         'commit' => 'destination-fence-commit',
         'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
         'only_this_server' => true,
@@ -117,6 +121,7 @@ function applicationDeploymentBlueGreenClaim(
         serverBootId: '11111111-2222-3333-4444-555555555555',
         topologyDigest: hash('sha256', 'application-destination-topology'),
         routingConfigDigest: hash('sha256', 'application-routing-configuration'),
+        supersessionGeneration: 1,
         legacyContainerName: null,
         candidateContainerName: $application->uuid.'-blue',
         rollbackManagedFilename: 'application-destination-fence.rollback.yaml',
@@ -421,4 +426,88 @@ it('does not mutate the destination or newer fence after cancellation', function
         ->and($newerState->fresh()->destination_fence_operation_id)->toBe('newer-destination-owner')
         ->and($newerState->fresh()->destination_fence_mutation_sequence)->toBe(3);
     Process::assertNothingRan();
+});
+
+it('does not overwrite cancellation when a deactivation fence becomes visible', function () {
+    $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
+    $deactivation = ApplicationBlueGreenDeactivation::query()->create([
+        'application_id' => $fixture['application']->id,
+        'standalone_docker_id' => $fixture['destination']->id,
+        'operation_id' => str_repeat('a', 64),
+        'started_at' => now()->subMinute(),
+        'queue_cutoff_id' => $fixture['deployment']->id,
+        'supersession_generation' => 1,
+        'phase' => BlueGreenDeactivationPhase::COMPLETED,
+        'completed_at' => now(),
+    ]);
+    expect($deactivation->fences($fixture['deployment']))->toBeTrue();
+    expect(FindBlueGreenDeactivationFence::run($fixture['deployment']))->not->toBeNull();
+    ApplicationDeploymentQueue::query()
+        ->whereKey($fixture['deployment']->id)
+        ->update([
+            'status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+            'finished_at' => now(),
+        ]);
+    $lifecycle = applicationDeploymentBlueGreenLifecycle($fixture);
+
+    expect(fn () => invokeApplicationDeploymentBlueGreenMethod($lifecycle, 'assertNotFencedByDeactivation'))
+        ->toThrow(DeploymentException::class, 'fenced by a completed or in-progress application deactivation');
+
+    expect($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::CANCELLED_BY_USER->value);
+});
+
+it('atomically refuses a terminal update after deletion supersedes the job snapshot', function () {
+    $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
+    $fixture['application']->delete();
+    $deactivation = ApplicationBlueGreenDeactivation::query()->create([
+        'application_id' => $fixture['application']->id,
+        'standalone_docker_id' => $fixture['destination']->id,
+        'operation_id' => str_repeat('b', 64),
+        'started_at' => now(),
+        'queue_cutoff_id' => $fixture['deployment']->id,
+        'supersession_generation' => 1,
+        'phase' => BlueGreenDeactivationPhase::DEACTIVATING,
+    ]);
+    ApplicationDeploymentQueue::query()
+        ->whereKey($fixture['deployment']->id)
+        ->update(['blue_green_supersession_generation' => $deactivation->supersession_generation]);
+
+    $updated = invokeApplicationDeploymentBlueGreenMethod(
+        $fixture['job'],
+        'updateDeploymentStatus',
+        ApplicationDeploymentStatus::FINISHED,
+    );
+
+    expect($updated)->toBeFalse()
+        ->and($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+        ->and($fixture['deployment']->fresh()->blue_green_supersession_generation)->toBe(1);
+});
+
+it('atomically refuses a terminal update after a newer state generation supersedes the job', function () {
+    $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
+    ApplicationDeploymentQueue::query()
+        ->whereKey($fixture['deployment']->id)
+        ->update([
+            'blue_green_phase' => BlueGreenDeploymentPhase::PREPARING->value,
+            'blue_green_supersession_generation' => 1,
+        ]);
+    $job = new ApplicationDeploymentJob($fixture['deployment']->id);
+    ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $fixture['application']->id,
+        'standalone_docker_id' => $fixture['destination']->id,
+        'phase' => BlueGreenDeploymentPhase::PREPARING,
+        'routing_revision' => 2,
+        'operation_deployment_uuid' => 'newer-generation-owner',
+        'supersession_generation' => 2,
+    ]);
+
+    $updated = invokeApplicationDeploymentBlueGreenMethod(
+        $job,
+        'updateDeploymentStatus',
+        ApplicationDeploymentStatus::FAILED,
+    );
+
+    expect($updated)->toBeFalse()
+        ->and($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+        ->and($fixture['deployment']->fresh()->blue_green_supersession_generation)->toBe(1);
 });

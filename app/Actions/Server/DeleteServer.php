@@ -33,6 +33,10 @@ class DeleteServer
             return; // Server already force deleted from Coolify
         }
 
+        if (! $server->trashed()) {
+            $server->delete();
+        }
+
         ray('force deleting server from Coolify', ['server_id' => $server->id]);
 
         try {

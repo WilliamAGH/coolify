@@ -60,7 +60,10 @@ return new class extends Migration
         }
         $columns = collect(Schema::getColumns('application_blue_green_deactivations'))->keyBy('name');
 
-        if ($columns->keys()->values()->all() !== array_keys($expectedColumns)) {
+        $columnNames = $columns->keys()->values()->all();
+        $unexpectedColumns = array_diff($columnNames, [...array_keys($expectedColumns), 'supersession_generation']);
+        if ($unexpectedColumns !== []
+            || array_diff(array_keys($expectedColumns), $columnNames) !== []) {
             throw new RuntimeException('Existing blue-green deactivation table has an unexpected column set.');
         }
 
@@ -152,6 +155,7 @@ return new class extends Migration
                  and attribute_default.adnum = attribute.attnum
                 where namespace.nspname = current_schema()
                   and relation.relname = 'application_blue_green_deactivations'
+                  and attribute.attname <> 'supersession_generation'
                   and attribute.attnum > 0
                   and not attribute.attisdropped
             ),

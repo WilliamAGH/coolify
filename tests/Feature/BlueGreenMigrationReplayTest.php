@@ -47,6 +47,7 @@ function removeBlueGreenExpandSchema(): void
         'blue_green_server_boot_id',
         'blue_green_topology_digest',
         'blue_green_routing_config_digest',
+        'blue_green_supersession_generation',
     ];
     $presentQueueColumns = array_values(array_filter(
         $queueColumns,
@@ -155,7 +156,10 @@ it('converges when each authorized schema commit exists without its migration le
     expect(Schema::hasColumn('application_settings', 'is_blue_green_deployment_enabled'))->toBeTrue()
         ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_routing_mutated_at'))->toBeTrue()
         ->and(Schema::hasColumn('application_blue_green_deployments', 'deactivation_started_at'))->toBeTrue()
-        ->and(Schema::hasColumn('application_blue_green_deactivations', 'proxy_snapshot'))->toBeTrue();
+        ->and(Schema::hasColumn('application_blue_green_deactivations', 'proxy_snapshot'))->toBeTrue()
+        ->and(Schema::hasColumn('application_blue_green_deployments', 'supersession_generation'))->toBeTrue()
+        ->and(Schema::hasColumn('application_blue_green_deactivations', 'supersession_generation'))->toBeTrue()
+        ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_supersession_generation'))->toBeTrue();
 });
 
 it('replays every earlier migration against the complete later schema', function () {
@@ -176,7 +180,10 @@ it('replays every earlier migration against the complete later schema', function
         'operation_drain_deadline_at',
         'operation_drain_last_observed_connections',
         'operation_drain_observed_at',
-    ]))->toBeTrue();
+        'supersession_generation',
+    ]))->toBeTrue()
+        ->and(Schema::hasColumn('application_blue_green_deactivations', 'supersession_generation'))->toBeTrue()
+        ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_supersession_generation'))->toBeTrue();
 });
 
 it('attests the complete schema through each migration public contract', function () {
@@ -191,7 +198,10 @@ it('attests the complete schema through each migration public contract', functio
     }
 
     expect(Schema::hasTable('application_blue_green_deactivations'))->toBeTrue()
-        ->and(Schema::hasColumn('application_blue_green_deactivations', 'proxy_snapshot'))->toBeTrue();
+        ->and(Schema::hasColumn('application_blue_green_deactivations', 'proxy_snapshot'))->toBeTrue()
+        ->and(Schema::hasColumn('application_blue_green_deployments', 'supersession_generation'))->toBeTrue()
+        ->and(Schema::hasColumn('application_blue_green_deactivations', 'supersession_generation'))->toBeTrue()
+        ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_supersession_generation'))->toBeTrue();
 });
 
 it('keeps all expand schema intact because every authorized migration is forward-only', function () {
@@ -470,6 +480,21 @@ it('fails closed on malformed postgres drain provenance columns', function () {
 
     expect(fn () => blueGreenMigration('2026_07_19_030000_add_blue_green_drain_provenance')->up())
         ->toThrow(RuntimeException::class, 'drain provenance columns do not match the authorized PostgreSQL catalog');
+});
+
+it('fails closed on malformed postgres supersession-generation columns', function () {
+    if (Schema::getConnection()->getDriverName() !== 'pgsql') {
+        $this->markTestSkipped('PostgreSQL supersession-generation catalogs are not represented by SQLite.');
+    }
+
+    removeBlueGreenExpandSchema();
+    foreach (blueGreenMigrationNames() as $migrationName) {
+        blueGreenMigration($migrationName)->up();
+    }
+    DB::statement('alter table application_blue_green_deployments alter column supersession_generation drop not null');
+
+    expect(fn () => blueGreenMigration('2026_07_19_025449_add_blue_green_supersession_generation')->up())
+        ->toThrow(RuntimeException::class, 'do not match the authorized PostgreSQL catalog');
 });
 
 it('fails closed on an extra postgres deployment index', function () {

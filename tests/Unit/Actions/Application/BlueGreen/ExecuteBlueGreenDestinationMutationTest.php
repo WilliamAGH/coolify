@@ -37,6 +37,7 @@ it('requires reconciliation before a distinct successor mutation can run', funct
             serverBootId: '11111111-2222-3333-4444-555555555555',
             topologyDigest: hash('sha256', 'topology'),
             routingConfigDigest: hash('sha256', 'routing'),
+            supersessionGeneration: 1,
             legacyContainerName: null,
         );
         $writer = new class extends WriteBlueGreenProxyConfiguration

@@ -1,0 +1,491 @@
+<?php
+
+namespace App\Actions\Application\BlueGreen;
+
+use App\Actions\Proxy\BlueGreenProxyRollbackKey;
+use App\Actions\Proxy\BlueGreenProxyState;
+use App\Actions\Proxy\BlueGreenRoutingTarget;
+use App\Enums\BlueGreenDeploymentColor;
+use App\Enums\BlueGreenDeploymentPhase;
+use App\Models\Application;
+use App\Models\ApplicationBlueGreenDeployment;
+use App\Models\ApplicationDeploymentQueue;
+use App\Models\StandaloneDocker;
+use Lorisleiva\Actions\Concerns\AsAction;
+
+final class ReconstructBlueGreenDeploymentRecovery
+{
+    use AsAction;
+
+    public function handle(ApplicationBlueGreenDeployment $state): BlueGreenDeploymentRecoveryOperation
+    {
+        $state->refresh();
+        $operationUuid = $this->operationUuid($state);
+        $application = Application::withTrashed()->find($state->application_id);
+        $destination = StandaloneDocker::query()->with('server')->find($state->standalone_docker_id);
+        $deployment = ApplicationDeploymentQueue::query()
+            ->where('application_id', $state->application_id)
+            ->where('deployment_uuid', $operationUuid)
+            ->first();
+
+        if ($application === null || $destination === null || $destination->server === null || $deployment === null) {
+            throw new BlueGreenDeploymentTransitionException('The interrupted operation no longer has an exact application, destination, server, and queue owner.');
+        }
+
+        $this->assertApplicationOwnership($application, $state);
+        $this->assertDeploymentScope($application, $destination, $deployment);
+        $claim = $this->claim($state, $application, $destination, $deployment, $operationUuid);
+        $this->assertQueueProvenance($state, $deployment, $claim);
+
+        [$isPending, $wasFinalized] = $this->operationShape($state, $claim);
+        $this->assertOperationPhase($state, $isPending, $wasFinalized);
+
+        $routingMutationRecorded = $this->routingMutationRecorded($state, $deployment);
+        if ($wasFinalized && ! $routingMutationRecorded) {
+            throw new BlueGreenDeploymentTransitionException('A finalized operation has no durable routing-mutation provenance.');
+        }
+
+        $previousContainer = $this->previousContainer($state, $claim, $deployment);
+        $legacyRoutingSnapshot = $this->legacyRoutingSnapshot(
+            $state,
+            $claim,
+            $previousContainer,
+            $routingMutationRecorded,
+        );
+        $candidateContainer = $this->candidateContainer($state, $claim);
+
+        return new BlueGreenDeploymentRecoveryOperation(
+            claim: $claim,
+            application: $application,
+            destination: $destination,
+            server: $destination->server,
+            deployment: $deployment,
+            previousContainer: $previousContainer,
+            legacyRoutingSnapshot: $legacyRoutingSnapshot,
+            candidateContainer: $candidateContainer,
+            rollbackKey: $this->rollbackKey(
+                $state,
+                $application,
+                $claim,
+                $routingMutationRecorded,
+            ),
+            recoveredPhase: $state->phase,
+            routingMutationRecorded: $routingMutationRecorded,
+            wasFinalized: $wasFinalized,
+        );
+    }
+
+    private function operationUuid(ApplicationBlueGreenDeployment $state): string
+    {
+        if (! is_string($state->operation_deployment_uuid) || $state->operation_deployment_uuid === '') {
+            throw new BlueGreenDeploymentTransitionException('The interrupted state has no durable deployment operation identity.');
+        }
+
+        return $state->operation_deployment_uuid;
+    }
+
+    private function assertApplicationOwnership(
+        Application $application,
+        ApplicationBlueGreenDeployment $state,
+    ): void {
+        $deletedAt = $application->getRawOriginal('deleted_at');
+        $ownership = Application::withTrashed()
+            ->whereKey($application->getKey())
+            ->where('id', $state->application_id);
+        $deletedAt === null
+            ? $ownership->whereNull('deleted_at')
+            : $ownership->where('deleted_at', $deletedAt);
+
+        if (! $ownership->exists()) {
+            throw new BlueGreenDeploymentTransitionException('The interrupted application deletion state changed while recovery ownership was reconstructed.');
+        }
+    }
+
+    private function assertDeploymentScope(
+        Application $application,
+        StandaloneDocker $destination,
+        ApplicationDeploymentQueue $deployment,
+    ): void {
+        if ((int) $deployment->application_id !== (int) $application->id
+            || (int) $deployment->destination_id !== (int) $destination->id
+            || (int) $deployment->server_id !== (int) $destination->server_id
+            || $deployment->pull_request_id !== 0) {
+            throw new BlueGreenDeploymentTransitionException('The interrupted queue no longer targets the exact durable application, destination, and server.');
+        }
+
+        $isPrimaryDestination = (int) $application->destination_id === (int) $destination->id
+            && $application->destination_type === $destination->getMorphClass();
+        $isAdditionalDestination = $application->additional_networks()
+            ->whereKey($destination->id)
+            ->wherePivot('server_id', $destination->server_id)
+            ->exists();
+        if (! $isPrimaryDestination && ! $isAdditionalDestination) {
+            throw new BlueGreenDeploymentTransitionException('The interrupted destination is no longer configured for the application.');
+        }
+    }
+
+    private function claim(
+        ApplicationBlueGreenDeployment $state,
+        Application $application,
+        StandaloneDocker $destination,
+        ApplicationDeploymentQueue $deployment,
+        string $operationUuid,
+    ): BlueGreenDeploymentClaim {
+        $pendingColor = $deployment->blue_green_color;
+        $routingRevision = $deployment->blue_green_routing_revision;
+        $destinationFenceEpoch = $state->operation_destination_fence_epoch;
+        $serverBootId = $state->operation_server_boot_id;
+        $topologyDigest = $state->operation_topology_digest;
+        $routingConfigDigest = $state->operation_routing_config_digest;
+        $supersessionGeneration = $state->supersession_generation;
+        $candidateContainerName = $state->operation_candidate_container_name;
+        $rollbackManagedFilename = $state->operation_rollback_managed_filename;
+
+        if (! $pendingColor instanceof BlueGreenDeploymentColor
+            || ! is_int($routingRevision)
+            || ! is_int($destinationFenceEpoch)
+            || ! is_string($serverBootId)
+            || ! is_string($topologyDigest)
+            || ! is_string($routingConfigDigest)
+            || ! is_int($supersessionGeneration)
+            || ! is_string($candidateContainerName)
+            || ! is_string($rollbackManagedFilename)
+            || $state->routing_revision !== $routingRevision
+            || $rollbackManagedFilename !== BlueGreenRoutingTarget::managedFilename(
+                (string) $application->uuid,
+                (int) $destination->id,
+            )) {
+            throw new BlueGreenDeploymentTransitionException('The interrupted state has incomplete or non-canonical claim provenance.');
+        }
+
+        return new BlueGreenDeploymentClaim(
+            stateId: $state->id,
+            applicationId: $application->id,
+            standaloneDockerId: $destination->id,
+            pendingColor: $pendingColor,
+            previousActiveColor: $state->operation_previous_active_color,
+            deploymentUuid: $operationUuid,
+            expectedRoutingRevision: $routingRevision,
+            destinationFenceEpoch: $destinationFenceEpoch,
+            serverBootId: $serverBootId,
+            topologyDigest: $topologyDigest,
+            routingConfigDigest: $routingConfigDigest,
+            supersessionGeneration: $supersessionGeneration,
+            legacyContainerName: $state->operation_previous_active_color === null
+                ? $state->legacy_container_name
+                : null,
+            candidateContainerName: $candidateContainerName,
+            rollbackManagedFilename: $rollbackManagedFilename,
+        );
+    }
+
+    private function assertQueueProvenance(
+        ApplicationBlueGreenDeployment $state,
+        ApplicationDeploymentQueue $deployment,
+        BlueGreenDeploymentClaim $claim,
+    ): void {
+        if ($state->operation_deployment_uuid !== $claim->deploymentUuid
+            || $state->operation_destination_fence_epoch !== $claim->destinationFenceEpoch
+            || $state->operation_server_boot_id !== $claim->serverBootId
+            || $state->operation_topology_digest !== $claim->topologyDigest
+            || $state->operation_routing_config_digest !== $claim->routingConfigDigest
+            || $state->supersession_generation !== $claim->supersessionGeneration
+            || $state->deactivation_operation_id !== null
+            || $state->deactivation_started_at !== null
+            || ! BlueGreenLifecycleDatabaseLocks::queueStatusOwnsPhase($deployment->status, $state->phase)
+            || $deployment->blue_green_color !== $claim->pendingColor
+            || $deployment->blue_green_phase !== $state->phase
+            || $deployment->blue_green_routing_revision !== $claim->expectedRoutingRevision
+            || $deployment->blue_green_destination_fence_epoch !== $claim->destinationFenceEpoch
+            || $deployment->blue_green_server_boot_id !== $claim->serverBootId
+            || $deployment->blue_green_topology_digest !== $claim->topologyDigest
+            || $deployment->blue_green_routing_config_digest !== $claim->routingConfigDigest
+            || $deployment->blue_green_supersession_generation !== $claim->supersessionGeneration
+            || $deployment->blue_green_previous_container_id !== $state->operation_previous_container_id
+            || $deployment->blue_green_candidate_container_id !== $state->operation_candidate_container_id
+            || $deployment->blue_green_rollback_managed_filename !== $claim->rollbackManagedFilename) {
+            throw new BlueGreenDeploymentTransitionException('The interrupted queue is not the exact live generation and provenance owner.');
+        }
+    }
+
+    /** @return array{bool, bool} */
+    private function operationShape(
+        ApplicationBlueGreenDeployment $state,
+        BlueGreenDeploymentClaim $claim,
+    ): array {
+        $deploymentColumn = match ($claim->pendingColor) {
+            BlueGreenDeploymentColor::BLUE => 'blue_deployment_uuid',
+            BlueGreenDeploymentColor::GREEN => 'green_deployment_uuid',
+        };
+        $isPending = $state->active_color === $claim->previousActiveColor
+            && $state->pending_color === $claim->pendingColor
+            && $state->pending_deployment_uuid === $claim->deploymentUuid;
+        $wasFinalized = $state->active_color === $claim->pendingColor
+            && $state->pending_color === null
+            && $state->pending_deployment_uuid === null
+            && $state->{$deploymentColumn} === $claim->deploymentUuid;
+
+        return [$isPending, $wasFinalized];
+    }
+
+    private function assertOperationPhase(
+        ApplicationBlueGreenDeployment $state,
+        bool $isPending,
+        bool $wasFinalized,
+    ): void {
+        $phase = $state->phase;
+        if (! in_array($phase, [
+            BlueGreenDeploymentPhase::IDLE,
+            BlueGreenDeploymentPhase::PREPARING,
+            BlueGreenDeploymentPhase::SWITCHING,
+            BlueGreenDeploymentPhase::ROLLING_BACK,
+        ], true)
+            || ($phase === BlueGreenDeploymentPhase::IDLE && ! $wasFinalized)
+            || (in_array($phase, [BlueGreenDeploymentPhase::PREPARING, BlueGreenDeploymentPhase::SWITCHING], true) && ! $isPending)
+            || ($phase === BlueGreenDeploymentPhase::ROLLING_BACK && ! $isPending && ! $wasFinalized)) {
+            throw new BlueGreenDeploymentTransitionException('The interrupted operation does not own its exact durable phase and state shape.');
+        }
+    }
+
+    private function routingMutationRecorded(
+        ApplicationBlueGreenDeployment $state,
+        ApplicationDeploymentQueue $deployment,
+    ): bool {
+        $stateTimestamp = $state->operation_routing_mutated_at;
+        $queueTimestamp = $deployment->blue_green_routing_mutated_at;
+        if ($stateTimestamp === null && $queueTimestamp === null) {
+            return false;
+        }
+        if ($stateTimestamp === null || $queueTimestamp === null || ! $stateTimestamp->equalTo($queueTimestamp)) {
+            throw new BlueGreenDeploymentTransitionException('The routing-mutation timestamp disagrees between state and queue provenance.');
+        }
+
+        return true;
+    }
+
+    private function previousContainer(
+        ApplicationBlueGreenDeployment $state,
+        BlueGreenDeploymentClaim $claim,
+        ApplicationDeploymentQueue $deployment,
+    ): ?BlueGreenContainerExpectation {
+        $name = $state->operation_previous_container_name;
+        $dockerId = $state->operation_previous_container_id;
+        if ($name === null && $dockerId === null && $claim->previousActiveColor === null && $claim->legacyContainerName === null) {
+            return null;
+        }
+        if (! is_string($name) || ! is_string($dockerId)) {
+            throw new BlueGreenDeploymentTransitionException('The previous rollback target is missing its exact name or immutable Docker ID.');
+        }
+        if ($claim->previousActiveColor === null) {
+            if ($name !== $claim->legacyContainerName
+                || $state->operation_previous_deployment_uuid !== null
+                || $state->operation_previous_routing_revision !== null) {
+                throw new BlueGreenDeploymentTransitionException('The legacy rollback target provenance is inconsistent.');
+            }
+
+            return new BlueGreenContainerExpectation(
+                name: $name,
+                dockerId: $dockerId,
+                applicationId: $claim->applicationId,
+                pullRequestId: 0,
+                blueGreenManaged: false,
+            );
+        }
+
+        $previousDeploymentUuid = $state->operation_previous_deployment_uuid;
+        $previousRoutingRevision = $state->operation_previous_routing_revision;
+        if (! is_string($previousDeploymentUuid)
+            || ! is_int($previousRoutingRevision)
+            || $previousRoutingRevision !== $claim->expectedRoutingRevision - 1) {
+            throw new BlueGreenDeploymentTransitionException('The fixed rollback target is missing deployment or revision provenance.');
+        }
+        $previousDeployment = ApplicationDeploymentQueue::query()
+            ->where('application_id', $claim->applicationId)
+            ->where('deployment_uuid', $previousDeploymentUuid)
+            ->first();
+        if ($previousDeployment === null
+            || (int) $previousDeployment->destination_id !== $claim->standaloneDockerId
+            || (int) $previousDeployment->server_id !== (int) $deployment->server_id
+            || $previousDeployment->pull_request_id !== 0
+            || $previousDeployment->blue_green_color !== $claim->previousActiveColor
+            || $previousDeployment->blue_green_routing_revision !== $previousRoutingRevision) {
+            throw new BlueGreenDeploymentTransitionException('The previous fixed-color queue provenance is missing or inconsistent.');
+        }
+        $previousColumn = match ($claim->previousActiveColor) {
+            BlueGreenDeploymentColor::BLUE => 'blue_deployment_uuid',
+            BlueGreenDeploymentColor::GREEN => 'green_deployment_uuid',
+        };
+        if ($state->{$previousColumn} !== $previousDeploymentUuid) {
+            throw new BlueGreenDeploymentTransitionException('The previous fixed-color slot no longer points to its proven deployment.');
+        }
+
+        return new BlueGreenContainerExpectation(
+            name: $name,
+            dockerId: $dockerId,
+            applicationId: $claim->applicationId,
+            pullRequestId: 0,
+            blueGreenManaged: true,
+            deploymentUuid: $previousDeploymentUuid,
+            color: $claim->previousActiveColor,
+            routingRevision: $previousRoutingRevision,
+        );
+    }
+
+    private function legacyRoutingSnapshot(
+        ApplicationBlueGreenDeployment $state,
+        BlueGreenDeploymentClaim $claim,
+        ?BlueGreenContainerExpectation $previousContainer,
+        bool $routingMutationRecorded,
+    ): ?BlueGreenLegacyRoutingSnapshot {
+        $snapshotAttributes = [
+            $state->operation_legacy_routing_snapshot_version,
+            $state->operation_legacy_routing_snapshot,
+            $state->operation_legacy_routing_snapshot_sha256,
+        ];
+        $requiresSnapshot = $claim->previousActiveColor === null && $claim->legacyContainerName !== null;
+        if (! $requiresSnapshot) {
+            if ($snapshotAttributes !== [null, null, null]) {
+                throw new BlueGreenDeploymentTransitionException('A non-legacy operation unexpectedly contains legacy routing snapshot provenance.');
+            }
+
+            return null;
+        }
+        if ($snapshotAttributes === [null, null, null] && ! $routingMutationRecorded) {
+            return null;
+        }
+        if (! is_int($state->operation_legacy_routing_snapshot_version)
+            || ! is_string($state->operation_legacy_routing_snapshot)
+            || ! is_string($state->operation_legacy_routing_snapshot_sha256)
+            || $previousContainer === null) {
+            throw new BlueGreenDeploymentTransitionException('The first-adoption operation has no complete durable legacy routing snapshot.');
+        }
+
+        $snapshot = (new BlueGreenLegacyRoutingSnapshotCodec)->decode(
+            $state->operation_legacy_routing_snapshot_version,
+            $state->operation_legacy_routing_snapshot,
+            $state->operation_legacy_routing_snapshot_sha256,
+        );
+        if ($snapshot->containerName !== $previousContainer->name
+            || $snapshot->dockerId !== $previousContainer->dockerId) {
+            throw new BlueGreenDeploymentTransitionException('The durable legacy routing snapshot belongs to a different Docker identity.');
+        }
+
+        return $snapshot;
+    }
+
+    private function candidateContainer(
+        ApplicationBlueGreenDeployment $state,
+        BlueGreenDeploymentClaim $claim,
+    ): BlueGreenContainerExpectation {
+        if ($state->operation_candidate_container_id !== null
+            && ! is_string($state->operation_candidate_container_id)) {
+            throw new BlueGreenDeploymentTransitionException('The interrupted candidate Docker identity is malformed.');
+        }
+
+        return new BlueGreenContainerExpectation(
+            name: $claim->candidateContainerName
+                ?? throw new BlueGreenDeploymentTransitionException('The interrupted operation has no candidate container name.'),
+            dockerId: $state->operation_candidate_container_id,
+            applicationId: $claim->applicationId,
+            pullRequestId: 0,
+            blueGreenManaged: true,
+            deploymentUuid: $claim->deploymentUuid,
+            color: $claim->pendingColor,
+            routingRevision: $claim->expectedRoutingRevision,
+        );
+    }
+
+    private function rollbackKey(
+        ApplicationBlueGreenDeployment $state,
+        Application $application,
+        BlueGreenDeploymentClaim $claim,
+        bool $routingMutationRecorded,
+    ): BlueGreenProxyRollbackKey {
+        if ($state->operation_previous_managed_file_sha256 !== null) {
+            throw new BlueGreenDeploymentTransitionException('The durable operation does not retain the exact predecessor fence identity required for safe recovery.');
+        }
+        if (! is_int($state->operation_previous_destination_fence_epoch)
+            || $state->operation_previous_destination_fence_epoch !== 0) {
+            throw new BlueGreenDeploymentTransitionException('The first-adoption recovery has inconsistent predecessor destination-fence provenance.');
+        }
+
+        $replacementState = $routingMutationRecorded
+            ? $this->recordedReplacementState($state, $application, $claim)
+            : $this->unrecordedReplacementState($state, $application, $claim);
+
+        return new BlueGreenProxyRollbackKey(
+            operationId: $claim->deploymentUuid,
+            expectedState: null,
+            replacementState: $replacementState,
+        );
+    }
+
+    private function recordedReplacementState(
+        ApplicationBlueGreenDeployment $state,
+        Application $application,
+        BlueGreenDeploymentClaim $claim,
+    ): BlueGreenProxyState {
+        if ($state->destination_fence_epoch !== $claim->destinationFenceEpoch
+            || $state->destination_fence_operation_id !== $claim->deploymentUuid
+            || ! is_int($state->destination_fence_mutation_sequence)
+            || $state->destination_fence_mutation_sequence < 1
+            || ! is_string($state->managed_file_sha256)
+            || $state->destination_topology_digest !== $claim->topologyDigest
+            || $state->application_routing_config_digest !== $claim->routingConfigDigest
+            || ! is_string($state->operation_candidate_container_id)) {
+            throw new BlueGreenDeploymentTransitionException('The recorded destination state does not match the exact claimed routing mutation.');
+        }
+
+        return new BlueGreenProxyState(
+            managedFilename: $claim->rollbackManagedFilename
+                ?? throw new BlueGreenDeploymentTransitionException('The recorded routing mutation has no managed filename.'),
+            applicationUuid: (string) $application->uuid,
+            destinationId: $claim->standaloneDockerId,
+            operationId: $claim->deploymentUuid,
+            mutationSequence: $state->destination_fence_mutation_sequence,
+            destinationFenceEpoch: $state->destination_fence_epoch,
+            routingRevision: $claim->expectedRoutingRevision,
+            managedSha256: $state->managed_file_sha256,
+            activeColor: $claim->pendingColor,
+            activeDeploymentUuid: $claim->deploymentUuid,
+            activeContainerName: $claim->candidateContainerName,
+            activeContainerId: $state->operation_candidate_container_id,
+            applicationRoutingConfigDigest: $claim->routingConfigDigest,
+            destinationTopologyDigest: $claim->topologyDigest,
+        );
+    }
+
+    private function unrecordedReplacementState(
+        ApplicationBlueGreenDeployment $state,
+        Application $application,
+        BlueGreenDeploymentClaim $claim,
+    ): BlueGreenProxyState {
+        if ($state->destination_fence_epoch !== 0
+            || $state->destination_fence_operation_id !== null
+            || $state->destination_fence_mutation_sequence !== 0
+            || $state->managed_file_sha256 !== null
+            || $state->destination_topology_digest !== null
+            || $state->application_routing_config_digest !== null
+            || $claim->destinationFenceEpoch !== 1) {
+            throw new BlueGreenDeploymentTransitionException('The unrecorded operation has no exact first-adoption destination state.');
+        }
+
+        return new BlueGreenProxyState(
+            managedFilename: $claim->rollbackManagedFilename
+                ?? throw new BlueGreenDeploymentTransitionException('The unrecorded operation has no managed filename.'),
+            applicationUuid: (string) $application->uuid,
+            destinationId: $claim->standaloneDockerId,
+            operationId: $claim->deploymentUuid,
+            mutationSequence: 1,
+            destinationFenceEpoch: $claim->destinationFenceEpoch,
+            routingRevision: $claim->expectedRoutingRevision - 1,
+            managedSha256: null,
+            activeColor: null,
+            activeDeploymentUuid: null,
+            activeContainerName: null,
+            activeContainerId: null,
+            applicationRoutingConfigDigest: $claim->routingConfigDigest,
+            destinationTopologyDigest: $claim->topologyDigest,
+        );
+    }
+}

@@ -46,6 +46,21 @@ it('schedules bounded deployment recovery through one non-overlapping owner', fu
         ->and($event->expression)->toBe('* * * * *');
 });
 
+it('schedules one bounded resumable blue-green deactivation in the background', function () {
+    $schedule = app(Schedule::class);
+
+    $event = collect($schedule->events())->first(
+        fn ($event) => (string) $event->description === 'blue-green:resume-deactivations'
+    );
+
+    expect($event)->not->toBeNull()
+        ->and($event->onOneServer)->toBeTrue()
+        ->and($event->withoutOverlapping)->toBeTrue()
+        ->and($event->runInBackground)->toBeTrue()
+        ->and($event->command)->toContain('blue-green:resume-deactivations --stale-after=300 --limit=1')
+        ->and($event->expression)->toBe('* * * * *');
+});
+
 it('schedules every production job with onOneServer', function () {
     $schedule = app(Schedule::class);
 

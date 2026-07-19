@@ -103,6 +103,7 @@ return new class extends Migration
                 'operation_routing_config_digest',
                 'operation_previous_managed_file_sha256',
             ],
+            ['supersession_generation'],
             [
                 'operation_drain_started_at',
                 'operation_drain_deadline_at',
@@ -292,6 +293,7 @@ return new class extends Migration
                           'operation_topology_digest',
                           'operation_routing_config_digest',
                           'operation_previous_managed_file_sha256',
+                          'supersession_generation',
                           'operation_drain_started_at',
                           'operation_drain_deadline_at',
                           'operation_drain_last_observed_connections',
@@ -315,6 +317,8 @@ return new class extends Migration
                         'operation_routing_config_digest',
                         'operation_previous_managed_file_sha256'
                     )) in (0, 12)
+                and (select count(*) from actual_all
+                    where name = 'supersession_generation') in (0, 1)
                 and (select count(*) from actual_all
                     where name in (
                         'operation_drain_started_at',

@@ -42,18 +42,22 @@ final class RecordBlueGreenDestinationState
             $state = $locks->state;
             $deployment = $locks->queue($claim->deploymentUuid);
             $application = $locks->application;
-            if ($state === null || $state->id !== $claim->stateId || $deployment === null
-                || ! in_array($state->phase, [
-                    BlueGreenDeploymentPhase::PREPARING,
-                    BlueGreenDeploymentPhase::SWITCHING,
-                    BlueGreenDeploymentPhase::DRAINING,
-                    BlueGreenDeploymentPhase::ROLLING_BACK,
-                    BlueGreenDeploymentPhase::IDLE,
-                ], true)
+            if ($state === null || $state->id !== $claim->stateId || $deployment === null) {
+                throw new BlueGreenDeploymentTransitionException('The destination mutation no longer belongs to the exact claimed operation.');
+            }
+            $locks->assertDeploymentOwner($claim, $deployment);
+            if (! in_array($state->phase, [
+                BlueGreenDeploymentPhase::PREPARING,
+                BlueGreenDeploymentPhase::SWITCHING,
+                BlueGreenDeploymentPhase::DRAINING,
+                BlueGreenDeploymentPhase::ROLLING_BACK,
+                BlueGreenDeploymentPhase::IDLE,
+            ], true)
                 || $state->operation_deployment_uuid !== $claim->deploymentUuid
                 || $state->operation_destination_fence_epoch !== $claim->destinationFenceEpoch
                 || $state->operation_topology_digest !== $claim->topologyDigest
                 || $state->operation_routing_config_digest !== $claim->routingConfigDigest
+                || $state->supersession_generation !== $claim->supersessionGeneration
                 || $deployment->blue_green_destination_fence_epoch !== $claim->destinationFenceEpoch
                 || $deployment->blue_green_topology_digest !== $claim->topologyDigest
                 || $deployment->blue_green_routing_config_digest !== $claim->routingConfigDigest
@@ -66,7 +70,27 @@ final class RecordBlueGreenDestinationState
             }
             $query = ApplicationBlueGreenDeployment::query()
                 ->whereKey($state->getKey())
-                ->where('operation_deployment_uuid', $claim->deploymentUuid);
+                ->where('application_id', $claim->applicationId)
+                ->where('standalone_docker_id', $claim->standaloneDockerId)
+                ->where('operation_deployment_uuid', $claim->deploymentUuid)
+                ->where('operation_destination_fence_epoch', $claim->destinationFenceEpoch)
+                ->where('operation_server_boot_id', $claim->serverBootId)
+                ->where('operation_topology_digest', $claim->topologyDigest)
+                ->where('operation_routing_config_digest', $claim->routingConfigDigest)
+                ->whereNull('deactivation_operation_id')
+                ->whereNull('deactivation_started_at')
+                ->where('supersession_generation', $claim->supersessionGeneration)
+                ->whereHas('application')
+                ->whereHas('operationDeployment', function ($query) use ($claim, $state): void {
+                    $query->where('application_id', $claim->applicationId)
+                        ->where('deployment_uuid', $claim->deploymentUuid)
+                        ->where('destination_id', $claim->standaloneDockerId)
+                        ->where('pull_request_id', 0)
+                        ->where('blue_green_supersession_generation', $claim->supersessionGeneration)
+                        ->where('blue_green_phase', $state->phase->value)
+                        ->whereHas('application');
+                    BlueGreenLifecycleDatabaseLocks::constrainQueueStatus($query, $state->phase);
+                });
             $this->constrainExpectedState($query, $expectedState);
             $updated = $query->update([
                 'destination_fence_epoch' => $replacementState->destinationFenceEpoch,
