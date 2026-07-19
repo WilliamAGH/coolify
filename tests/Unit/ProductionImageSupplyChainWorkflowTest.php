@@ -706,6 +706,19 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
             $violations[] = "workflow validation is missing required step: {$stepName}";
         }
     }
+    $actionlintScript = (string) (releaseWorkflowStep($workflowAndShell, 'Validate workflows')['run'] ?? '');
+    foreach ([
+        '.github/workflows/application-validation.yml',
+        '.github/workflows/coolify-production-build.yml',
+        '.github/workflows/coolify-staging-build.yml',
+        '.github/workflows/coolify-testing-host.yml',
+        '.github/workflows/publish-fork.yml',
+        '.github/workflows/publish-linux-image.yml',
+    ] as $workflowPath) {
+        if (! str_contains($actionlintScript, $workflowPath)) {
+            $violations[] = "workflow validation must lint owned workflow: {$workflowPath}";
+        }
+    }
     $provenanceScript = (string) (releaseWorkflowStep(
         $workflowAndShell,
         'Verify pinned source provenance',
@@ -1272,6 +1285,36 @@ it('rejects omission of either image source-provenance gate', function (string $
 })->with([
     'production image' => 'docker/production/Dockerfile',
     'testing-host image' => 'docker/testing-host/Dockerfile',
+]);
+
+it('rejects omission of an owned workflow from actionlint', function (string $workflowPath): void {
+    $root = releaseWorkflowRepositoryRoot();
+    $sharedWorkflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $applicationValidationWorkflow = Yaml::parseFile($root.'/.github/workflows/application-validation.yml');
+    $callers = [
+        'production' => Yaml::parseFile($root.'/.github/workflows/coolify-production-build.yml'),
+        'testing-host' => Yaml::parseFile($root.'/.github/workflows/coolify-testing-host.yml'),
+        'staging' => Yaml::parseFile($root.'/.github/workflows/coolify-staging-build.yml'),
+    ];
+    foreach ($applicationValidationWorkflow['jobs']['workflow-and-shell']['steps'] as $index => $step) {
+        if (($step['name'] ?? null) === 'Validate workflows') {
+            $applicationValidationWorkflow['jobs']['workflow-and-shell']['steps'][$index]['run'] = str_replace(
+                $workflowPath,
+                '',
+                (string) ($step['run'] ?? ''),
+            );
+        }
+    }
+
+    expect(releaseFoundationWorkflowViolations($sharedWorkflow, $applicationValidationWorkflow, $callers))
+        ->toContain("workflow validation must lint owned workflow: {$workflowPath}");
+})->with([
+    'application validation' => '.github/workflows/application-validation.yml',
+    'production caller' => '.github/workflows/coolify-production-build.yml',
+    'staging caller' => '.github/workflows/coolify-staging-build.yml',
+    'testing-host caller' => '.github/workflows/coolify-testing-host.yml',
+    'fork publisher' => '.github/workflows/publish-fork.yml',
+    'reusable publisher' => '.github/workflows/publish-linux-image.yml',
 ]);
 
 it('rejects parsed workflow policy regressions', function () {

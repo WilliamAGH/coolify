@@ -164,7 +164,14 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Validate workflows
-        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+        run: |
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 \
+            .github/workflows/application-validation.yml \
+            .github/workflows/coolify-production-build.yml \
+            .github/workflows/coolify-staging-build.yml \
+            .github/workflows/coolify-testing-host.yml \
+            .github/workflows/publish-fork.yml \
+            .github/workflows/publish-linux-image.yml
       - name: Verify pinned source provenance
         run: |
           docker/verify-source-provenance.sh docker/production/Dockerfile
