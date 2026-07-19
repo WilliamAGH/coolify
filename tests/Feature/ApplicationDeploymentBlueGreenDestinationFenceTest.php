@@ -198,7 +198,6 @@ function createCompletedApplicationDeploymentBlueGreenState(array $fixture): App
         'blue_green_topology_digest' => $topologyDigest,
         'blue_green_routing_config_digest' => $routingConfigDigest,
     ]);
-
     return $state;
 }
 
