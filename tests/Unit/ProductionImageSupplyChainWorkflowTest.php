@@ -688,6 +688,12 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
         ($browserJob['env']['REDIS_PORT'] ?? null) !== 6379) {
         $violations[] = 'browser validation must provide its Redis runtime dependency';
     }
+    if (($browserJob['env']['DB_DATABASE'] ?? null) !== 'database/browser-testing.sqlite' ||
+        ! collect(releaseWorkflowSteps($browserJob))->contains(
+            fn (array $step): bool => str_contains((string) ($step['run'] ?? ''), 'touch database/browser-testing.sqlite'),
+        )) {
+        $violations[] = 'browser validation must use a file-backed SQLite database';
+    }
     $requiredJobs = [...$genericJobs, 'fork-deploy'];
     $requiredNeeds = releaseWorkflowNeeds($applicationJobs['required'] ?? []);
     sort($requiredJobs);
@@ -1289,6 +1295,21 @@ it('rejects removing the browser Redis runtime dependency', function () {
 
     expect(releaseFoundationWorkflowViolations($sharedWorkflow, $applicationValidationWorkflow, $callers))
         ->toContain('browser validation must provide its Redis runtime dependency');
+});
+
+it('rejects an in-memory browser database', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $sharedWorkflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $applicationValidationWorkflow = Yaml::parseFile($root.'/.github/workflows/application-validation.yml');
+    $callers = [
+        'production' => Yaml::parseFile($root.'/.github/workflows/coolify-production-build.yml'),
+        'testing-host' => Yaml::parseFile($root.'/.github/workflows/coolify-testing-host.yml'),
+        'staging' => Yaml::parseFile($root.'/.github/workflows/coolify-staging-build.yml'),
+    ];
+    $applicationValidationWorkflow['jobs']['browser']['env']['DB_DATABASE'] = ':memory:';
+
+    expect(releaseFoundationWorkflowViolations($sharedWorkflow, $applicationValidationWorkflow, $callers))
+        ->toContain('browser validation must use a file-backed SQLite database');
 });
 
 it('rejects applying legacy ShellCheck severity to new scripts', function () {

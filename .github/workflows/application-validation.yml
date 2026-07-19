@@ -93,6 +93,7 @@ jobs:
       APP_MAINTENANCE_DRIVER: file
       CACHE_STORE: array
       DB_CONNECTION: testing
+      DB_DATABASE: database/browser-testing.sqlite
       QUEUE_CONNECTION: sync
       REDIS_HOST: 127.0.0.1
       REDIS_PORT: 6379
@@ -114,6 +115,8 @@ jobs:
           cache: npm
       - run: composer install --no-interaction --prefer-dist --optimize-autoloader
       - run: npm ci
+      - name: Prepare file-backed browser database
+        run: touch database/browser-testing.sqlite
       - name: Install Chromium and system dependencies
         run: npx playwright install --with-deps chromium
       - name: Build browser assets
