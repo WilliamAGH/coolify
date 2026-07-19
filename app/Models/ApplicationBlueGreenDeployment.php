@@ -10,6 +10,8 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 class ApplicationBlueGreenDeployment extends Model
 {
     protected $attributes = [
+        'destination_fence_epoch' => 0,
+        'destination_fence_mutation_sequence' => 0,
         'phase' => BlueGreenDeploymentPhase::IDLE->value,
         'routing_revision' => 0,
     ];
@@ -38,6 +40,18 @@ class ApplicationBlueGreenDeployment extends Model
         'operation_legacy_routing_snapshot_sha256',
         'deactivation_operation_id',
         'deactivation_started_at',
+        'destination_fence_epoch',
+        'destination_fence_operation_id',
+        'destination_fence_mutation_sequence',
+        'managed_file_sha256',
+        'destination_topology_digest',
+        'application_routing_config_digest',
+        'operation_destination_fence_epoch',
+        'operation_previous_destination_fence_epoch',
+        'operation_server_boot_id',
+        'operation_topology_digest',
+        'operation_routing_config_digest',
+        'operation_previous_managed_file_sha256',
         'phase',
         'routing_revision',
     ];
@@ -52,6 +66,10 @@ class ApplicationBlueGreenDeployment extends Model
             'operation_routing_mutated_at' => 'datetime',
             'operation_legacy_routing_snapshot_version' => 'integer',
             'deactivation_started_at' => 'datetime',
+            'destination_fence_epoch' => 'integer',
+            'destination_fence_mutation_sequence' => 'integer',
+            'operation_destination_fence_epoch' => 'integer',
+            'operation_previous_destination_fence_epoch' => 'integer',
             'phase' => BlueGreenDeploymentPhase::class,
             'routing_revision' => 'integer',
         ];
@@ -99,6 +117,12 @@ class ApplicationBlueGreenDeployment extends Model
             'operation_legacy_routing_snapshot_version' => null,
             'operation_legacy_routing_snapshot' => null,
             'operation_legacy_routing_snapshot_sha256' => null,
+            'operation_destination_fence_epoch' => null,
+            'operation_previous_destination_fence_epoch' => null,
+            'operation_server_boot_id' => null,
+            'operation_topology_digest' => null,
+            'operation_routing_config_digest' => null,
+            'operation_previous_managed_file_sha256' => null,
         ];
     }
 }

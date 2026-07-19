@@ -87,15 +87,36 @@ return new class extends Migration
             'updated_at' => ['typeNames' => ['timestamp', 'datetime'], 'nullable' => true],
         ];
         $columns = collect(Schema::getColumns('application_blue_green_deployments'))->keyBy('name');
-        $laterOwnedColumns = ['deactivation_operation_id', 'deactivation_started_at'];
+        $laterOwnedColumnGroups = [
+            ['deactivation_operation_id', 'deactivation_started_at'],
+            [
+                'destination_fence_epoch',
+                'destination_fence_operation_id',
+                'destination_fence_mutation_sequence',
+                'managed_file_sha256',
+                'destination_topology_digest',
+                'application_routing_config_digest',
+                'operation_destination_fence_epoch',
+                'operation_previous_destination_fence_epoch',
+                'operation_server_boot_id',
+                'operation_topology_digest',
+                'operation_routing_config_digest',
+                'operation_previous_managed_file_sha256',
+            ],
+        ];
+        $laterOwnedColumns = array_merge(...$laterOwnedColumnGroups);
         $columnNames = $columns->keys()->values()->all();
         $unexpectedColumns = array_diff($columnNames, [...array_keys($expectedColumns), ...$laterOwnedColumns]);
         $missingColumns = array_diff(array_keys($expectedColumns), $columnNames);
-        $presentLaterOwnedColumns = array_values(array_intersect($laterOwnedColumns, $columnNames));
+        $hasPartialLaterOwnedGroup = collect($laterOwnedColumnGroups)->contains(function (array $group) use ($columnNames): bool {
+            $presentCount = count(array_intersect($group, $columnNames));
+
+            return ! in_array($presentCount, [0, count($group)], true);
+        });
 
         if ($unexpectedColumns !== []
             || $missingColumns !== []
-            || ! in_array(count($presentLaterOwnedColumns), [0, count($laterOwnedColumns)], true)) {
+            || $hasPartialLaterOwnedGroup) {
             throw new RuntimeException('Existing blue-green deployment table has an unexpected column set.');
         }
 
@@ -250,10 +271,40 @@ return new class extends Migration
                 and not exists (
                     select 1 from actual_all
                     where name not in (select name from expected)
-                      and name not in ('deactivation_operation_id', 'deactivation_started_at')
+                      and name not in (
+                          'deactivation_operation_id',
+                          'deactivation_started_at',
+                          'destination_fence_epoch',
+                          'destination_fence_operation_id',
+                          'destination_fence_mutation_sequence',
+                          'managed_file_sha256',
+                          'destination_topology_digest',
+                          'application_routing_config_digest',
+                          'operation_destination_fence_epoch',
+                          'operation_previous_destination_fence_epoch',
+                          'operation_server_boot_id',
+                          'operation_topology_digest',
+                          'operation_routing_config_digest',
+                          'operation_previous_managed_file_sha256'
+                      )
                 )
                 and (select count(*) from actual_all
                     where name in ('deactivation_operation_id', 'deactivation_started_at')) in (0, 2)
+                and (select count(*) from actual_all
+                    where name in (
+                        'destination_fence_epoch',
+                        'destination_fence_operation_id',
+                        'destination_fence_mutation_sequence',
+                        'managed_file_sha256',
+                        'destination_topology_digest',
+                        'application_routing_config_digest',
+                        'operation_destination_fence_epoch',
+                        'operation_previous_destination_fence_epoch',
+                        'operation_server_boot_id',
+                        'operation_topology_digest',
+                        'operation_routing_config_digest',
+                        'operation_previous_managed_file_sha256'
+                    )) in (0, 12)
                 and (select count(*) = 4
                     and count(*) filter (where conname = 'application_blue_green_deployments_pkey'
                         and contype = 'p' and conkey = array[1]::smallint[]

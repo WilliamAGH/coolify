@@ -2,6 +2,7 @@
 
 namespace App\Rules;
 
+use App\Actions\Proxy\BlueGreenProxyConfiguration;
 use Closure;
 use Illuminate\Contracts\Validation\ValidationRule;
 
@@ -68,6 +69,10 @@ class ValidProxyConfigFilename implements ValidationRule
             $fail('The :attribute uses a reserved filename.');
 
             return;
+        }
+
+        if (BlueGreenProxyConfiguration::isManagedFilename($filename)) {
+            $fail('The :attribute is reserved for a Coolify-managed blue-green route.');
         }
     }
 }

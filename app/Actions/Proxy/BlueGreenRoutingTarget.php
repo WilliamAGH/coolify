@@ -61,6 +61,12 @@ final readonly class BlueGreenRoutingTarget
         public ?BlueGreenDeploymentColor $probeColor = null,
         public ?string $publicProofToken = null,
         public ?string $legacyContainerName = null,
+        public ?int $destinationFenceEpoch = null,
+        public ?string $operationId = null,
+        public ?int $mutationSequence = null,
+        public ?string $activeDeploymentUuid = null,
+        public ?string $activeContainerId = null,
+        public ?string $destinationTopologyDigest = null,
     ) {
         if ($destinationId < 0) {
             throw new InvalidArgumentException('The destination ID must be a nonnegative integer.');
@@ -104,6 +110,31 @@ final readonly class BlueGreenRoutingTarget
         } elseif ($legacyContainerName !== null) {
             throw new InvalidArgumentException('Only a legacy recovery bridge may override the public backend container.');
         }
+
+        $fenceIdentity = [
+            $destinationFenceEpoch,
+            $operationId,
+            $mutationSequence,
+            $activeDeploymentUuid,
+            $activeContainerId,
+            $destinationTopologyDigest,
+        ];
+        $fenceIdentityCount = count(array_filter($fenceIdentity, static fn (mixed $value): bool => $value !== null));
+        if ($fenceIdentityCount !== 0 && $fenceIdentityCount !== count($fenceIdentity)) {
+            throw new InvalidArgumentException('The complete destination fence identity must be supplied together.');
+        }
+        if ($destinationFenceEpoch !== null && $destinationFenceEpoch < 1) {
+            throw new InvalidArgumentException('The destination fence epoch must be positive.');
+        }
+        if ($operationId !== null && preg_match('/^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/D', $operationId) !== 1) {
+            throw new InvalidArgumentException('The destination mutation operation ID is invalid.');
+        }
+        if ($mutationSequence !== null && $mutationSequence < 1) {
+            throw new InvalidArgumentException('The destination mutation sequence must be positive.');
+        }
+        if ($destinationTopologyDigest !== null && preg_match('/^[a-f0-9]{64}$/D', $destinationTopologyDigest) !== 1) {
+            throw new InvalidArgumentException('The destination topology digest must be a SHA-256 value.');
+        }
     }
 
     public function containerName(BlueGreenDeploymentColor $color): string
@@ -146,6 +177,41 @@ final readonly class BlueGreenRoutingTarget
         }
 
         return 'public:'.hash('sha256', "coolify-blue-green-public-proof-v1\0{$operationId}");
+    }
+
+    public function fencedState(
+        string $applicationUuid,
+        string $managedFilename,
+        string $managedSha256,
+        string $applicationRoutingConfigDigest,
+    ): BlueGreenProxyState {
+        if ($this->destinationFenceEpoch === null
+            || $this->operationId === null
+            || $this->mutationSequence === null
+            || $this->activeDeploymentUuid === null
+            || $this->activeContainerId === null
+            || $this->destinationTopologyDigest === null) {
+            throw new InvalidArgumentException('Compiling a managed blue/green route requires its durable destination fence identity.');
+        }
+
+        return new BlueGreenProxyState(
+            managedFilename: $managedFilename,
+            applicationUuid: $applicationUuid,
+            destinationId: $this->destinationId,
+            operationId: $this->operationId,
+            mutationSequence: $this->mutationSequence,
+            destinationFenceEpoch: $this->destinationFenceEpoch,
+            routingRevision: $this->routingRevision,
+            managedSha256: $managedSha256,
+            activeColor: $this->activeColor,
+            activeDeploymentUuid: $this->activeDeploymentUuid,
+            activeContainerName: $this->mode === BlueGreenRoutingMode::LegacyRecoveryBridge
+                ? $this->legacyContainerName
+                : $this->containerName($this->activeColor),
+            activeContainerId: $this->activeContainerId,
+            applicationRoutingConfigDigest: $applicationRoutingConfigDigest,
+            destinationTopologyDigest: $this->destinationTopologyDigest,
+        );
     }
 
     private function assertContainerName(string $containerName): void

@@ -3,6 +3,7 @@
 namespace App\Models;
 
 use App\Enums\ApplicationDeploymentStatus;
+use App\Enums\ProxyTypes;
 use App\Services\ConfigurationGenerator;
 use App\Services\DeploymentConfiguration\ApplicationConfigurationSnapshot;
 use App\Services\DeploymentConfiguration\ConfigurationDiff;
@@ -16,6 +17,7 @@ use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
 use OpenApi\Attributes as OA;
@@ -1176,6 +1178,169 @@ class Application extends BaseModel
         }
 
         return false;
+    }
+
+    public function blueGreenDeploymentBackendPort(?ApplicationSetting $setting = null): ?int
+    {
+        $setting ??= $this->relationLoaded('settings')
+            ? $this->getRelation('settings')
+            : $this->settings()->first();
+        if ((bool) ($setting?->is_static ?? false)) {
+            $backendPort = 80;
+        } else {
+            $ports = $this->ports_exposes_array;
+            if (count($ports) !== 1) {
+                return null;
+            }
+
+            $configuredPort = trim((string) $ports[0]);
+            if (preg_match('/^[1-9][0-9]{0,4}$/D', $configuredPort) !== 1) {
+                return null;
+            }
+            $backendPort = (int) $configuredPort;
+            if ($backendPort > 65535) {
+                return null;
+            }
+        }
+
+        foreach (explode(',', (string) $this->fqdn) as $domain) {
+            try {
+                $domainPort = Url::fromString(trim($domain))->getPort();
+            } catch (\Throwable) {
+                return null;
+            }
+            if ($domainPort !== null && $domainPort !== $backendPort) {
+                return null;
+            }
+        }
+
+        return $backendPort;
+    }
+
+    /** @return Collection<int, int> */
+    public function blueGreenConfiguredStandaloneDockerDestinationIds(): Collection
+    {
+        if (! $this->exists) {
+            return collect();
+        }
+
+        $destinationIds = collect();
+        $primaryDestinationId = $this->blueGreenPrimaryStandaloneDockerDestinationId();
+        if ($primaryDestinationId !== null) {
+            $destinationIds->push($primaryDestinationId);
+        }
+
+        return $destinationIds
+            ->merge(
+                DB::table('additional_destinations')
+                    ->where('application_id', $this->id)
+                    ->pluck('standalone_docker_id')
+                    ->map(fn (mixed $destinationId): int => (int) $destinationId)
+            )
+            ->filter(fn (int $destinationId): bool => $destinationId >= 0)
+            ->unique()
+            ->values();
+    }
+
+    /** @return Collection<int, StandaloneDocker> */
+    public function blueGreenConfiguredStandaloneDockerDestinations(): Collection
+    {
+        $destinationIds = $this->blueGreenConfiguredStandaloneDockerDestinationIds();
+        if ($destinationIds->isEmpty()) {
+            return collect();
+        }
+
+        return StandaloneDocker::query()
+            ->with('server')
+            ->whereIn('id', $destinationIds)
+            ->get();
+    }
+
+    public function blueGreenPrimaryStandaloneDockerDestinationId(): ?int
+    {
+        if (! in_array($this->destination_type, [
+            StandaloneDocker::class,
+            (new StandaloneDocker)->getMorphClass(),
+        ], true) || ! is_numeric($this->destination_id) || (int) $this->destination_id < 0) {
+            return null;
+        }
+
+        return (int) $this->destination_id;
+    }
+
+    public function blueGreenDeploymentIneligibilityReason(?ApplicationSetting $setting = null): ?string
+    {
+        $setting ??= $this->settings()->first();
+        $configuredDestinationIds = $this->blueGreenConfiguredStandaloneDockerDestinationIds();
+        if ($this->blueGreenPrimaryStandaloneDockerDestinationId() === null) {
+            return 'Blue-green deployments require a standalone Docker primary destination.';
+        }
+        $destinations = $this->blueGreenConfiguredStandaloneDockerDestinations();
+        if ($destinations->count() !== $configuredDestinationIds->count()) {
+            return 'Blue-green deployments require every configured standalone Docker destination to remain available.';
+        }
+        if ($destinations->count() !== 1) {
+            return 'Blue-green deployments support exactly one standalone Docker destination.';
+        }
+        $destinationServer = $destinations->first()?->server;
+        if ($destinationServer === null || $destinationServer->isSwarm()) {
+            return 'Blue-green deployments are not available for Docker Swarm destinations.';
+        }
+        if ($destinationServer->proxyType() !== ProxyTypes::TRAEFIK->value) {
+            return 'Blue-green deployments require Traefik as the proxy on every configured destination.';
+        }
+        if (! (bool) ($setting?->is_container_label_readonly_enabled ?? false)) {
+            return 'Blue-green deployments require generated, read-only container labels.';
+        }
+        if ($this->build_pack === 'dockercompose' || (bool) ($setting?->is_raw_compose_deployment_enabled ?? false)) {
+            return 'Blue-green deployments do not support Docker Compose applications.';
+        }
+        if (! (bool) $this->health_check_enabled && ! (bool) $this->custom_healthcheck_found) {
+            return 'Blue-green deployments require either an enabled Coolify healthcheck or a detected image healthcheck.';
+        }
+        if (str($this->fqdn)->trim()->isEmpty()) {
+            return 'Blue-green deployments require at least one FQDN.';
+        }
+        if ($this->blueGreenDeploymentBackendPort($setting) === null) {
+            return 'Blue-green deployments require exactly one valid exposed backend port; static applications use port 80 and every explicit FQDN port must match it.';
+        }
+        if (count($this->ports_mappings_array) > 0) {
+            return 'Blue-green deployments do not support ports mapped to the host.';
+        }
+        if ((bool) ($setting?->is_consistent_container_name_enabled ?? false)) {
+            return 'Blue-green deployments do not support consistent container names.';
+        }
+        if (str($setting?->custom_internal_name)->trim()->isNotEmpty()) {
+            return 'Blue-green deployments do not support custom container names.';
+        }
+        if (! empty($this->custom_network_aliases_array)) {
+            return 'Blue-green deployments do not support custom network aliases.';
+        }
+        if (str($this->custom_docker_run_options)->trim()->isNotEmpty()) {
+            return 'Blue-green deployments do not support custom Docker run options.';
+        }
+        if ($this->persistentStorages()->exists() || $this->fileStorages()->exists()) {
+            return 'Blue-green deployments require stateless applications without writable storage.';
+        }
+
+        return null;
+    }
+
+    public function isBlueGreenDeploymentEligible(): bool
+    {
+        return $this->blueGreenDeploymentIneligibilityReason() === null;
+    }
+
+    public function isBlueGreenDeploymentOptedIn(?ApplicationSetting $setting = null): bool
+    {
+        $setting ??= $this->settings()->first();
+
+        return (bool) ($setting?->is_blue_green_deployment_enabled ?? false);
+    }
+
+    public function isBlueGreenDeploymentEnabled(): bool
+    {
+        return $this->isBlueGreenDeploymentOptedIn() && $this->isBlueGreenDeploymentEligible();
     }
 
     public function workdir()

@@ -1,0 +1,298 @@
+<?php
+
+use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
+use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
+use App\Actions\Application\BlueGreen\RecordBlueGreenDestinationState;
+use App\Enums\ApplicationDeploymentStatus;
+use App\Enums\BlueGreenDeploymentColor;
+use App\Enums\BlueGreenDeploymentPhase;
+use App\Exceptions\DeploymentException;
+use App\Jobs\ApplicationDeploymentJob;
+use App\Models\Application;
+use App\Models\ApplicationBlueGreenDeployment;
+use App\Models\ApplicationDeploymentQueue;
+use App\Models\InstanceSettings;
+use App\Models\PrivateKey;
+use App\Models\Project;
+use App\Models\Server;
+use App\Models\StandaloneDocker;
+use App\Models\Team;
+use App\Services\BlueGreenDeploymentLifecycle;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Process\PendingProcess;
+use Illuminate\Support\Facades\Notification;
+use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Facades\Storage;
+
+uses(RefreshDatabase::class);
+
+/**
+ * @return array{
+ *     application: Application,
+ *     deployment: ApplicationDeploymentQueue,
+ *     destination: StandaloneDocker,
+ *     job: ApplicationDeploymentJob,
+ *     server: Server
+ * }
+ */
+function makeApplicationDeploymentBlueGreenDestinationFenceFixture(): array
+{
+    InstanceSettings::unguarded(
+        fn () => InstanceSettings::query()->firstOrCreate(['id' => 0]),
+    );
+    $team = Team::factory()->create();
+    $privateKey = PrivateKey::create([
+        'name' => 'application-destination-fence-key',
+        'private_key' => <<<'KEY'
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACBbhpqHhqv6aI67Mj9abM3DVbmcfYhZAhC7ca4d9UCevAAAAJi/QySHv0Mk
+hwAAAAtzc2gtZWQyNTUxOQAAACBbhpqHhqv6aI67Mj9abM3DVbmcfYhZAhC7ca4d9UCevA
+AAAECBQw4jg1WRT2IGHMncCiZhURCts2s24HoDS0thHnnRKVuGmoeGq/pojrsyP1pszcNV
+uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
+-----END OPENSSH PRIVATE KEY-----
+KEY,
+        'team_id' => $team->id,
+    ]);
+    Storage::fake('ssh-keys');
+    Storage::disk('ssh-keys')->put("ssh_key@{$privateKey->uuid}", $privateKey->private_key);
+    $server = Server::factory()->create([
+        'team_id' => $team->id,
+        'private_key_id' => $privateKey->id,
+    ]);
+    $project = Project::factory()->create(['team_id' => $team->id]);
+    $environment = $project->environments()->where('name', 'production')->firstOrFail();
+    $destination = $server->standaloneDockers()->firstOrFail();
+    $application = Application::factory()->create([
+        'environment_id' => $environment->id,
+        'destination_id' => $destination->id,
+        'destination_type' => $destination->getMorphClass(),
+        'build_pack' => 'nixpacks',
+        'base_directory' => '/',
+        'ports_exposes' => '3000',
+    ]);
+    $application->settings()->update(['is_blue_green_deployment_enabled' => true]);
+    $deployment = ApplicationDeploymentQueue::query()->create([
+        'application_id' => $application->id,
+        'application_name' => $application->name,
+        'server_id' => $server->id,
+        'server_name' => $server->name,
+        'destination_id' => $destination->id,
+        'deployment_uuid' => 'application-destination-fence',
+        'commit' => 'destination-fence-commit',
+        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+        'only_this_server' => true,
+    ]);
+
+    return [
+        'application' => $application,
+        'deployment' => $deployment,
+        'destination' => $destination,
+        'job' => new ApplicationDeploymentJob($deployment->id),
+        'server' => $server,
+    ];
+}
+
+function applicationDeploymentBlueGreenClaim(
+    Application $application,
+    ApplicationDeploymentQueue $deployment,
+    StandaloneDocker $destination,
+): BlueGreenDeploymentClaim {
+    return new BlueGreenDeploymentClaim(
+        stateId: 1,
+        applicationId: $application->id,
+        standaloneDockerId: $destination->id,
+        pendingColor: BlueGreenDeploymentColor::BLUE,
+        previousActiveColor: null,
+        deploymentUuid: $deployment->deployment_uuid,
+        expectedRoutingRevision: 1,
+        destinationFenceEpoch: 1,
+        serverBootId: '11111111-2222-3333-4444-555555555555',
+        topologyDigest: hash('sha256', 'application-destination-topology'),
+        routingConfigDigest: hash('sha256', 'application-routing-configuration'),
+        legacyContainerName: null,
+        candidateContainerName: $application->uuid.'-blue',
+        rollbackManagedFilename: 'application-destination-fence.rollback.yaml',
+    );
+}
+
+function applicationDeploymentBlueGreenLifecycle(array $fixture): BlueGreenDeploymentLifecycle
+{
+    return new BlueGreenDeploymentLifecycle(
+        application: $fixture['application'],
+        deployment: $fixture['deployment'],
+        destination: $fixture['destination'],
+        server: $fixture['server'],
+        timeout: 30,
+        checkForCancellation: static function (): void {},
+    );
+}
+
+function setApplicationDeploymentBlueGreenProperty(object $target, string $property, mixed $value): void
+{
+    $reflection = new ReflectionProperty($target, $property);
+    $reflection->setValue($target, $value);
+}
+
+function invokeApplicationDeploymentBlueGreenMethod(object $target, string $method, mixed ...$arguments): mixed
+{
+    $reflection = new ReflectionMethod($target, $method);
+
+    return $reflection->invoke($target, ...$arguments);
+}
+
+function createNewerApplicationDestinationFence(array $fixture): ApplicationBlueGreenDeployment
+{
+    return ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $fixture['application']->id,
+        'standalone_docker_id' => $fixture['destination']->id,
+        'phase' => BlueGreenDeploymentPhase::IDLE,
+        'routing_revision' => 7,
+        'destination_fence_epoch' => 9,
+        'destination_fence_operation_id' => 'newer-destination-owner',
+        'destination_fence_mutation_sequence' => 3,
+        'managed_file_sha256' => hash('sha256', 'newer-managed-route'),
+        'destination_topology_digest' => hash('sha256', 'newer-destination-topology'),
+        'application_routing_config_digest' => hash('sha256', 'newer-routing-configuration'),
+    ]);
+}
+
+beforeEach(function () {
+    config(['constants.ssh.mux_enabled' => false]);
+    Notification::fake();
+});
+
+afterEach(function () {
+    app()->forgetInstance(RecordBlueGreenDestinationState::class);
+});
+
+it('sends job-generated candidate start commands through the lifecycle destination fence', function () {
+    $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
+    $configurationDirectory = sys_get_temp_dir().'/coolify-job-destination-fence-'.bin2hex(random_bytes(6));
+    setApplicationDeploymentBlueGreenProperty($fixture['job'], 'configuration_dir', $configurationDirectory);
+    setApplicationDeploymentBlueGreenProperty($fixture['job'], 'workdir', $configurationDirectory.'/workdir');
+
+    $candidateStartCommands = invokeApplicationDeploymentBlueGreenMethod(
+        $fixture['job'],
+        'startByComposeFileCommands',
+    );
+    $claim = applicationDeploymentBlueGreenClaim(
+        $fixture['application'],
+        $fixture['deployment'],
+        $fixture['destination'],
+    );
+    $lifecycle = applicationDeploymentBlueGreenLifecycle($fixture);
+    setApplicationDeploymentBlueGreenProperty($lifecycle, 'enabled', true);
+    setApplicationDeploymentBlueGreenProperty($lifecycle, 'claim', $claim);
+
+    $recordedMutation = null;
+    $recorder = Mockery::mock();
+    $recorder->shouldReceive('handle')
+        ->once()
+        ->andReturnUsing(function (
+            BlueGreenDeploymentClaim $recordedClaim,
+            mixed $expectedState,
+            mixed $replacementState,
+        ) use (&$recordedMutation, $claim): ApplicationBlueGreenDeployment {
+            expect($recordedClaim)->toBe($claim)
+                ->and($expectedState)->toBeNull();
+            $recordedMutation = $replacementState;
+
+            return new ApplicationBlueGreenDeployment;
+        });
+    app()->instance(RecordBlueGreenDestinationState::class, $recorder);
+    Process::fake(['*' => Process::result(output: '', exitCode: 0)]);
+
+    $destinationState = invokeApplicationDeploymentBlueGreenMethod(
+        $lifecycle,
+        'executeDestinationMutation',
+        $candidateStartCommands,
+        ['test 1 -eq 1'],
+    );
+
+    expect($candidateStartCommands)->toHaveCount(2)
+        ->and($candidateStartCommands[0])->toBe("touch {$configurationDirectory}/.env")
+        ->and($destinationState)->toBe($recordedMutation)
+        ->and($destinationState->operationId)->toBe($fixture['deployment']->deployment_uuid)
+        ->and($destinationState->mutationSequence)->toBe(1);
+    Process::assertRanTimes(
+        fn (PendingProcess $process): bool => str_contains(
+            $process->command,
+            base64_encode(implode("\n", ['set -eu', ...$candidateStartCommands])."\n"),
+        )
+            && str_contains($process->command, $destinationState->managedFilename.'.state.json'),
+        1,
+    );
+});
+
+it('does not complete the job until previous-container retirement owns a destination fence', function () {
+    $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
+    $claim = applicationDeploymentBlueGreenClaim(
+        $fixture['application'],
+        $fixture['deployment'],
+        $fixture['destination'],
+    );
+    $lifecycle = applicationDeploymentBlueGreenLifecycle($fixture);
+    setApplicationDeploymentBlueGreenProperty($lifecycle, 'enabled', true);
+    setApplicationDeploymentBlueGreenProperty($lifecycle, 'claim', $claim);
+    setApplicationDeploymentBlueGreenProperty(
+        $lifecycle,
+        'previousContainerExpectation',
+        new BlueGreenContainerExpectation(
+            name: $fixture['application']->uuid.'-green',
+            dockerId: str_repeat('a', 64),
+            applicationId: $fixture['application']->id,
+            pullRequestId: 0,
+            blueGreenManaged: true,
+            deploymentUuid: 'previous-green-deployment',
+            color: BlueGreenDeploymentColor::GREEN,
+            routingRevision: 6,
+        ),
+    );
+    setApplicationDeploymentBlueGreenProperty($fixture['job'], 'blueGreenLifecycle', $lifecycle);
+    Process::fake();
+
+    expect(fn () => invokeApplicationDeploymentBlueGreenMethod($fixture['job'], 'completeDeployment'))
+        ->toThrow(DeploymentException::class, 'no owned cache lock to fence remote work');
+
+    expect($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
+    Process::assertNothingRan();
+});
+
+it('does not use generic candidate cleanup or overwrite newer destination state after failure', function () {
+    $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
+    $newerState = createNewerApplicationDestinationFence($fixture);
+    $lifecycle = applicationDeploymentBlueGreenLifecycle($fixture);
+    setApplicationDeploymentBlueGreenProperty($lifecycle, 'enabled', true);
+    setApplicationDeploymentBlueGreenProperty($fixture['job'], 'blueGreenLifecycle', $lifecycle);
+    Process::fake();
+
+    $fixture['job']->failed(new RuntimeException('candidate failed after a newer owner advanced the fence'));
+
+    expect($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value)
+        ->and((string) $fixture['deployment']->fresh()->logs)
+        ->not->toContain('Deployment failed. Removing the new version of your application.')
+        ->and($newerState->fresh()->destination_fence_epoch)->toBe(9)
+        ->and($newerState->fresh()->destination_fence_operation_id)->toBe('newer-destination-owner')
+        ->and($newerState->fresh()->destination_fence_mutation_sequence)->toBe(3);
+    Process::assertNothingRan();
+});
+
+it('does not mutate the destination or newer fence after cancellation', function () {
+    $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
+    $newerState = createNewerApplicationDestinationFence($fixture);
+    $lifecycle = applicationDeploymentBlueGreenLifecycle($fixture);
+    setApplicationDeploymentBlueGreenProperty($lifecycle, 'enabled', true);
+    setApplicationDeploymentBlueGreenProperty($fixture['job'], 'blueGreenLifecycle', $lifecycle);
+    $fixture['deployment']->update(['status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value]);
+    Process::fake();
+
+    expect(fn () => invokeApplicationDeploymentBlueGreenMethod($fixture['job'], 'rolling_update'))
+        ->toThrow(DeploymentException::class, 'Deployment cancelled by user');
+
+    expect($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::CANCELLED_BY_USER->value)
+        ->and($newerState->fresh()->destination_fence_epoch)->toBe(9)
+        ->and($newerState->fresh()->destination_fence_operation_id)->toBe('newer-destination-owner')
+        ->and($newerState->fresh()->destination_fence_mutation_sequence)->toBe(3);
+    Process::assertNothingRan();
+});

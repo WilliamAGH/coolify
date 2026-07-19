@@ -2,6 +2,7 @@
 
 namespace App\Console\Commands;
 
+use App\Support\ControlPlaneMigrationInventory;
 use Illuminate\Console\Command;
 
 class Migration extends Command
@@ -9,6 +10,19 @@ class Migration extends Command
     protected $signature = 'start:migration';
 
     protected $description = 'Start Migration';
+
+    /** @return list<string> */
+    public static function controlPlaneMigrationNames(
+        ?string $migrationDirectory = null,
+        ?string $fingerprintPath = null,
+        bool $requireExclusiveMigrationDirectory = false,
+    ): array {
+        return ControlPlaneMigrationInventory::names(
+            $migrationDirectory,
+            $fingerprintPath,
+            $requireExclusiveMigrationDirectory,
+        );
+    }
 
     public function handle()
     {

@@ -40,10 +40,20 @@ return new class extends Migration
         ];
         $columns = collect(Schema::getColumns('application_deployment_queues'))->keyBy('name');
         $present = collect(array_keys($expectedColumns))->filter(fn (string $name) => $columns->has($name));
+        $laterOwnedColumns = [
+            'blue_green_destination_fence_epoch',
+            'blue_green_server_boot_id',
+            'blue_green_topology_digest',
+            'blue_green_routing_config_digest',
+        ];
+        $presentLaterOwnedCount = collect($laterOwnedColumns)->filter(fn (string $name) => $columns->has($name))->count();
         if ($present->count() !== count($expectedColumns)) {
             throw new RuntimeException($present->isEmpty()
                 ? 'Queue provenance schema is missing.'
                 : 'Queue provenance schema is partial; refusing a non-convergent replay.');
+        }
+        if (! in_array($presentLaterOwnedCount, [0, count($laterOwnedColumns)], true)) {
+            throw new RuntimeException('Later-owned queue provenance schema is partial; refusing a non-convergent replay.');
         }
 
         $driver = Schema::getConnection()->getDriverName();
@@ -75,7 +85,15 @@ return new class extends Migration
                      and attribute_default.adnum = attribute.attnum
                     where namespace.nspname = current_schema()
                       and relation.relname = 'application_deployment_queues'
-                      and attribute.attname like 'blue_green_%'
+                      and attribute.attname in (
+                          'blue_green_color',
+                          'blue_green_phase',
+                          'blue_green_routing_revision',
+                          'blue_green_previous_container_id',
+                          'blue_green_candidate_container_id',
+                          'blue_green_rollback_managed_filename',
+                          'blue_green_routing_mutated_at'
+                      )
                       and attribute.attnum > 0
                       and not attribute.attisdropped
                 )

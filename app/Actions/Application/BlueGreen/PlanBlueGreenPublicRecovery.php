@@ -126,24 +126,45 @@ class PlanBlueGreenPublicRecovery
 
     private function compiledRouteInventory(BlueGreenDeploymentRecoveryOperation $operation): string
     {
+        $expectedState = $operation->rollbackKey->expectedState;
+        if ($expectedState === null
+            || $expectedState->managedSha256 === null
+            || $expectedState->activeColor === null
+            || $expectedState->activeDeploymentUuid === null
+            || $expectedState->activeContainerId === null) {
+            throw new RuntimeException('The durable predecessor has no managed route inventory to reconstruct.');
+        }
         $port = $operation->application->blueGreenDeploymentBackendPort();
         if ($port === null) {
             throw new RuntimeException('The application no longer has one unambiguous blue-green backend port.');
         }
         $applicationUuid = (string) $operation->application->uuid;
         $target = new BlueGreenRoutingTarget(
-            destinationId: $operation->destination->id,
-            activeColor: $operation->claim->previousActiveColor ?? $operation->claim->pendingColor,
+            destinationId: $expectedState->destinationId,
+            activeColor: $expectedState->activeColor,
             blueContainerName: "{$applicationUuid}-".BlueGreenDeploymentColor::BLUE->value,
             greenContainerName: "{$applicationUuid}-".BlueGreenDeploymentColor::GREEN->value,
             port: $port,
-            routingRevision: $operation->restoredRoutingRevision(),
+            routingRevision: $expectedState->routingRevision,
+            publicProofToken: BlueGreenRoutingTarget::durablePublicProofToken($expectedState->operationId),
+            destinationFenceEpoch: $expectedState->destinationFenceEpoch,
+            operationId: $expectedState->operationId,
+            mutationSequence: $expectedState->mutationSequence,
+            activeDeploymentUuid: $expectedState->activeDeploymentUuid,
+            activeContainerId: $expectedState->activeContainerId,
+            destinationTopologyDigest: $expectedState->destinationTopologyDigest,
         );
 
-        return CompileBlueGreenProxyConfiguration::run(
+        $configuration = CompileBlueGreenProxyConfiguration::run(
             $operation->application,
             $operation->destination,
             $target,
-        )->yaml;
+        );
+        if (! hash_equals($expectedState->managedSha256, $configuration->sha256)
+            || ! hash_equals($expectedState->applicationRoutingConfigDigest, $configuration->routingConfigDigest)) {
+            throw new RuntimeException('The reconstructed predecessor route does not match its durable checksums.');
+        }
+
+        return $configuration->yaml;
     }
 }

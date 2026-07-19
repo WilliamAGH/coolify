@@ -1,5 +1,6 @@
 <?php
 
+use App\Actions\Proxy\BlueGreenProxyConfiguration;
 use App\Rules\ValidProxyConfigFilename;
 
 test('allows valid proxy config filenames', function () {
@@ -90,6 +91,27 @@ test('blocks reserved filename Caddyfile', function () {
     });
 
     expect($failed)->toBeTrue();
+});
+
+test('blocks the canonical Coolify-managed blue-green filename while allowing similar user filenames', function () {
+    $managedFilename = 'coolify-blue-green-0123456789abcdef.yaml';
+    $rule = new ValidProxyConfigFilename;
+    $failed = false;
+
+    expect(BlueGreenProxyConfiguration::isManagedFilename($managedFilename))->toBeTrue();
+    $rule->validate('fileName', $managedFilename, function () use (&$failed): void {
+        $failed = true;
+    });
+
+    expect($failed)->toBeTrue();
+
+    foreach (['coolify-blue-green-0123456789abcde.yaml', 'coolify-blue-green-0123456789abcdef.yml', 'my-coolify-blue-green-0123456789abcdef.yaml'] as $filename) {
+        $failed = false;
+        $rule->validate('fileName', $filename, function () use (&$failed): void {
+            $failed = true;
+        });
+        expect($failed)->toBeFalse();
+    }
 });
 
 test('blocks filenames with invalid characters', function () {

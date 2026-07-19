@@ -108,3 +108,94 @@ it('replays queue provenance and refuses its partial foundation schema', functio
     expect(fn () => $migration->up())
         ->toThrow(RuntimeException::class, 'partial; refusing a non-convergent replay');
 });
+
+it('replays destination fencing only when both owned column groups are complete', function () {
+    Schema::create('application_blue_green_deployments', function (Blueprint $table) {
+        $table->id();
+    });
+    Schema::create('application_deployment_queues', function (Blueprint $table) {
+        $table->id();
+    });
+
+    $migration = require database_path('migrations/2026_07_19_025448_add_destination_fencing_to_blue_green_operations.php');
+    $migration->up();
+    $migration->up();
+
+    expect(Schema::hasColumns('application_blue_green_deployments', [
+        'destination_fence_epoch',
+        'destination_fence_operation_id',
+        'destination_fence_mutation_sequence',
+        'managed_file_sha256',
+        'destination_topology_digest',
+        'application_routing_config_digest',
+        'operation_destination_fence_epoch',
+        'operation_previous_destination_fence_epoch',
+        'operation_server_boot_id',
+        'operation_topology_digest',
+        'operation_routing_config_digest',
+        'operation_previous_managed_file_sha256',
+    ]))->toBeTrue()
+        ->and(Schema::hasColumns('application_deployment_queues', [
+            'blue_green_destination_fence_epoch',
+            'blue_green_server_boot_id',
+            'blue_green_topology_digest',
+            'blue_green_routing_config_digest',
+        ]))->toBeTrue()
+        ->and(fn () => $migration->down())
+        ->toThrow(RuntimeException::class, 'forward-only');
+
+    Schema::drop('application_blue_green_deployments');
+    Schema::create('application_blue_green_deployments', function (Blueprint $table) {
+        $table->id();
+        $table->unsignedBigInteger('destination_fence_epoch')->default(0);
+    });
+
+    $migration = require database_path('migrations/2026_07_19_025448_add_destination_fencing_to_blue_green_operations.php');
+
+    expect(fn () => $migration->up())
+        ->toThrow(RuntimeException::class, 'state columns are partial');
+});
+
+it('rejects complete destination-fencing state columns with a malformed shape', function () {
+    Schema::create('application_blue_green_deployments', function (Blueprint $table) {
+        $table->id();
+        $table->unsignedBigInteger('destination_fence_epoch')->nullable();
+        $table->string('destination_fence_operation_id')->nullable();
+        $table->unsignedBigInteger('destination_fence_mutation_sequence')->default(0);
+        $table->string('managed_file_sha256', 64)->nullable();
+        $table->string('destination_topology_digest', 64)->nullable();
+        $table->string('application_routing_config_digest', 64)->nullable();
+        $table->unsignedBigInteger('operation_destination_fence_epoch')->nullable();
+        $table->unsignedBigInteger('operation_previous_destination_fence_epoch')->nullable();
+        $table->string('operation_server_boot_id', 36)->nullable();
+        $table->string('operation_topology_digest', 64)->nullable();
+        $table->string('operation_routing_config_digest', 64)->nullable();
+        $table->string('operation_previous_managed_file_sha256', 64)->nullable();
+    });
+    Schema::create('application_deployment_queues', function (Blueprint $table) {
+        $table->id();
+    });
+
+    $migration = require database_path('migrations/2026_07_19_025448_add_destination_fencing_to_blue_green_operations.php');
+
+    expect(fn () => $migration->up())
+        ->toThrow(RuntimeException::class, 'authorized SQLite schema');
+});
+
+it('rejects complete destination-fencing queue columns with a malformed shape', function () {
+    Schema::create('application_blue_green_deployments', function (Blueprint $table) {
+        $table->id();
+    });
+    Schema::create('application_deployment_queues', function (Blueprint $table) {
+        $table->id();
+        $table->unsignedBigInteger('blue_green_destination_fence_epoch')->nullable();
+        $table->integer('blue_green_server_boot_id')->nullable();
+        $table->string('blue_green_topology_digest', 64)->nullable();
+        $table->string('blue_green_routing_config_digest', 64)->nullable();
+    });
+
+    $migration = require database_path('migrations/2026_07_19_025448_add_destination_fencing_to_blue_green_operations.php');
+
+    expect(fn () => $migration->up())
+        ->toThrow(RuntimeException::class, 'authorized SQLite schema');
+});

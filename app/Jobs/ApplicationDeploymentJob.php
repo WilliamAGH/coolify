@@ -2,6 +2,7 @@
 
 namespace App\Jobs;
 
+use App\Actions\Application\BlueGreen\FindBlueGreenDeactivationFence;
 use App\Actions\Application\WaitForSwarmStackConvergence;
 use App\Actions\Docker\GetContainersStatus;
 use App\Contracts\AdoptsLegacyProxyMutationDispatch;
@@ -22,6 +23,7 @@ use App\Models\StandaloneDocker;
 use App\Models\SwarmDocker;
 use App\Notifications\Application\DeploymentFailed;
 use App\Notifications\Application\DeploymentSuccess;
+use App\Services\BlueGreenDeploymentLifecycle;
 use App\Support\ProxyMutationQueue;
 use App\Support\UsesProxyMutationQueue;
 use App\Support\ValidationPatterns;
@@ -195,6 +197,8 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
 
     private Collection|string $build_secrets;
 
+    private ?BlueGreenDeploymentLifecycle $blueGreenLifecycle = null;
+
     public ?string $dispatch_attempt_uuid = null;
 
     public function tags()
@@ -305,6 +309,17 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
             return;
         }
 
+        if ($this->destination instanceof StandaloneDocker
+            && FindBlueGreenDeactivationFence::run($this->application_deployment_queue) !== null) {
+            $this->application_deployment_queue->update([
+                'status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+                'finished_at' => Carbon::now()->toImmutable(),
+            ]);
+            $this->application_deployment_queue->addLogEntry('Deployment was cancelled because application deactivation owns this destination.');
+
+            return;
+        }
+
         if ($this->server->isFunctional() === false) {
             $this->application_deployment_queue->addLogEntry('Server is not functional.');
             $this->fail('Server is not functional.');
@@ -314,6 +329,19 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         try {
             // Make sure the private key is stored in the filesystem
             $this->server->privateKey->storeInFileSystem();
+            if ($this->pull_request_id === 0 && $this->destination instanceof StandaloneDocker) {
+                $this->blueGreenLifecycle = new BlueGreenDeploymentLifecycle(
+                    application: $this->application,
+                    deployment: $this->application_deployment_queue,
+                    destination: $this->destination,
+                    server: $this->mainServer,
+                    timeout: $this->timeout,
+                    checkForCancellation: function (): void {
+                        $this->checkForCancellation();
+                    },
+                );
+                $this->blueGreenLifecycle->initialize();
+            }
             // Generate custom host<->ip mapping
             $safeNetwork = escapeshellarg($this->destination->network);
             $allContainers = instant_remote_process(["docker network inspect {$safeNetwork} -f '{{json .Containers}}' "], $this->server);
@@ -372,12 +400,13 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
             }
             $this->detectBuildKitCapabilities();
             $this->decide_what_to_do();
-        } catch (Exception $e) {
+        } catch (Throwable $e) {
+            $failure = $this->blueGreenLifecycle?->rollback($e) ?? $e;
             if ($this->pull_request_id !== 0 && $this->application->is_github_based()) {
                 ApplicationPullRequestUpdateJob::dispatch(application: $this->application, preview: $this->preview, deployment_uuid: $this->deployment_uuid, status: ProcessStatus::ERROR);
             }
-            $this->fail($e);
-            throw $e;
+            $this->fail($failure);
+            throw $failure;
         } finally {
             // Wrap cleanup operations in try-catch to prevent exceptions from interfering
             // with Laravel's job failure handling and status updates
@@ -414,6 +443,12 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
             } catch (Exception $e) {
                 // Log but don't fail - event dispatch errors shouldn't prevent status updates
                 \Log::warning('Failed to dispatch ServiceStatusChanged for deployment '.$this->deployment_uuid.': '.$e->getMessage());
+            }
+
+            try {
+                $this->blueGreenLifecycle?->release();
+            } catch (Throwable $e) {
+                \Log::warning('Failed to release blue-green lifecycle ownership for deployment '.$this->deployment_uuid.': '.$e->getMessage());
             }
         }
     }
@@ -1987,6 +2022,24 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
     {
         try {
             $this->checkForCancellation();
+            if ($this->blueGreenLifecycle?->isEnabled()) {
+                $this->blueGreenLifecycle->promote(
+                    prepareCandidateStart: function (): void {
+                        if ($this->use_build_server) {
+                            $this->write_deployment_configurations();
+                            $this->server = $this->mainServer;
+                        }
+                    },
+                    startCandidate: function (): array {
+                        $this->checkForCancellation();
+
+                        return $this->startByComposeFileCommands();
+                    },
+                );
+                $this->newVersionIsHealthy = true;
+
+                return;
+            }
             if ($this->server->isSwarm()) {
                 $this->application_deployment_queue->addLogEntry('Rolling update started.');
                 WaitForSwarmStackConvergence::make()->deployAndWait(
@@ -2275,6 +2328,9 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
     {
         if ($this->application->additional_networks->count() === 0) {
             return;
+        }
+        if ($this->blueGreenLifecycle?->isEnabled()) {
+            throw new DeploymentException('Blue-green deployments are single-destination and cannot fan out to additional destinations.');
         }
         if ($this->pull_request_id !== 0) {
             return;
@@ -3183,12 +3239,28 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
     private function generate_compose_file()
     {
         $this->checkForCancellation();
+        $blueGreenClaim = $this->blueGreenLifecycle?->claim();
+        if ($blueGreenClaim !== null) {
+            $this->container_name = $blueGreenClaim->candidateContainerName
+                ?? throw new DeploymentException('The blue-green claim has no durable candidate container identity.');
+        }
         $this->create_workdir();
         $ports = $this->application->main_port();
         $persistent_storages = $this->generate_local_persistent_volumes();
         $persistent_file_volumes = $this->application->fileStorages()->get();
         $volume_names = $this->generate_local_persistent_volumes_only_volume_names();
-        if (data_get($this->application, 'custom_labels')) {
+        if ($blueGreenClaim !== null) {
+            $blueGreenBackendPort = $this->application->blueGreenDeploymentBackendPort()
+                ?? throw new DeploymentException('The blue-green backend port became ambiguous before member discovery labels were generated.');
+            $labels = collect(generateBlueGreenApplicationContainerLabels(
+                $this->application,
+                (int) $this->destination->id,
+                $blueGreenClaim->pendingColor,
+                $blueGreenClaim->expectedRoutingRevision,
+                $blueGreenBackendPort,
+            ));
+            $labels->push("coolify.blueGreen.deploymentUuid={$blueGreenClaim->deploymentUuid}");
+        } elseif (data_get($this->application, 'custom_labels')) {
             $this->application->parseContainerLabels();
             $labels = collect(preg_split("/\r\n|\n|\r/", base64_decode($this->application->custom_labels)));
             $labels = $labels->filter(function ($value, $key) {
@@ -3201,7 +3273,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
                 $labels = collect(generateLabelsApplication($this->application, $this->preview));
             }
         }
-        if ($this->pull_request_id !== 0) {
+        if ($blueGreenClaim === null && $this->pull_request_id !== 0) {
             $labels = collect(generateLabelsApplication($this->application, $this->preview));
         }
         if ($this->application->settings->is_container_label_escape_enabled) {
@@ -3222,7 +3294,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
             $this->application->parseHealthcheckFromDockerfile($this->saved_outputs->get('dockerfile_from_repo'));
         }
         $custom_network_aliases = [];
-        if (! empty($this->application->custom_network_aliases_array)) {
+        if ($blueGreenClaim === null && ! empty($this->application->custom_network_aliases_array)) {
             $custom_network_aliases = $this->application->custom_network_aliases_array;
         }
         $docker_compose = [
@@ -3998,32 +4070,46 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
     private function start_by_compose_file()
     {
         try {
-            // Ensure .env file exists before docker compose tries to load it (defensive programming)
-            $this->execute_remote_command(
-                ["touch {$this->configuration_dir}/.env", 'hidden' => true],
-            );
-
-            if ($this->application->build_pack === 'dockerimage') {
-                $this->application_deployment_queue->addLogEntry('Pulling latest images from the registry.');
-                $this->execute_remote_command(
-                    [executeInDocker($this->deployment_uuid, "docker compose --project-name {$this->application->uuid} --project-directory {$this->workdir} pull"), 'hidden' => true],
-                    [executeInDocker($this->deployment_uuid, "{$this->coolify_variables} docker compose --project-name {$this->application->uuid} --project-directory {$this->workdir} up --build -d"), 'hidden' => true],
-                );
-            } else {
-                if ($this->use_build_server) {
-                    $this->execute_remote_command(
-                        ["{$this->coolify_variables} docker compose --project-name {$this->application->uuid} --project-directory {$this->configuration_dir} -f {$this->configuration_dir}{$this->docker_compose_location} up --pull always --build -d", 'hidden' => true],
-                    );
-                } else {
-                    $this->execute_remote_command(
-                        [executeInDocker($this->deployment_uuid, "{$this->coolify_variables} docker compose --project-name {$this->application->uuid} --project-directory {$this->workdir} -f {$this->workdir}{$this->docker_compose_location} up --build -d"), 'hidden' => true],
-                    );
-                }
+            foreach ($this->startByComposeFileCommands() as $command) {
+                $this->execute_remote_command([$command, 'hidden' => true]);
             }
             $this->application_deployment_queue->addLogEntry('New container started.');
         } catch (Exception $e) {
             throw new DeploymentException("Failed to start container: {$e->getMessage()}", $e->getCode(), $e);
         }
+    }
+
+    /** @return non-empty-list<string> */
+    private function startByComposeFileCommands(): array
+    {
+        $commands = ["touch {$this->configuration_dir}/.env"];
+
+        if ($this->application->build_pack === 'dockerimage') {
+            $this->application_deployment_queue->addLogEntry('Pulling latest images from the registry.');
+            $commands[] = executeInDocker(
+                $this->deployment_uuid,
+                "docker compose --project-name {$this->application->uuid} --project-directory {$this->workdir} pull",
+            );
+            $commands[] = executeInDocker(
+                $this->deployment_uuid,
+                "{$this->coolify_variables} docker compose --project-name {$this->application->uuid} --project-directory {$this->workdir} up --build -d",
+            );
+
+            return $commands;
+        }
+
+        if ($this->use_build_server) {
+            $commands[] = "{$this->coolify_variables} docker compose --project-name {$this->application->uuid} --project-directory {$this->configuration_dir} -f {$this->configuration_dir}{$this->docker_compose_location} up --pull always --build -d";
+
+            return $commands;
+        }
+
+        $commands[] = executeInDocker(
+            $this->deployment_uuid,
+            "{$this->coolify_variables} docker compose --project-name {$this->application->uuid} --project-directory {$this->workdir} -f {$this->workdir}{$this->docker_compose_location} up --build -d",
+        );
+
+        return $commands;
     }
 
     private function analyzeBuildTimeVariables($variables)
@@ -4710,6 +4796,29 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         if (empty($this->application->pre_deployment_command)) {
             return;
         }
+        if ($this->blueGreenLifecycle?->isEnabled()) {
+            $containerName = $this->blueGreenLifecycle->previousContainerName();
+            if ($containerName === null) {
+                $this->application_deployment_queue->addLogEntry('Pre-deployment command: No previous active container exists. Skipping.');
+
+                return;
+            }
+            $this->application_deployment_queue->addLogEntry('Executing pre-deployment command in the durable previous active container (see debug log for output/errors).');
+            $preCommand = str_replace(["\r\n", "\r", "\n"], ' ', $this->application->pre_deployment_command);
+            $cmd = "sh -c '".str_replace("'", "'\''", $preCommand)."'";
+            $deploymentServer = $this->server;
+            $this->server = $this->mainServer;
+            try {
+                $this->execute_remote_command([
+                    'command' => "docker exec {$this->validateContainerName($containerName)} {$cmd}",
+                    'hidden' => true,
+                ]);
+            } finally {
+                $this->server = $deploymentServer;
+            }
+
+            return;
+        }
         $containers = getCurrentApplicationContainerStatus($this->server, $this->application->id, $this->pull_request_id);
         if ($containers->count() == 0) {
             $this->application_deployment_queue->addLogEntry('Pre-deployment command: No running containers found. Skipping.');
@@ -4754,6 +4863,30 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         }
         $this->application_deployment_queue->addLogEntry('----------------------------------------');
         $this->application_deployment_queue->addLogEntry('Executing post-deployment command (see debug log for output).');
+
+        if ($this->blueGreenLifecycle?->isEnabled()) {
+            if (! $this->blueGreenLifecycle->isFinalized()) {
+                throw new DeploymentException('Post-deployment command cannot run before blue-green routing is finalized.');
+            }
+            $postCommand = str_replace(["\r\n", "\r", "\n"], ' ', $this->application->post_deployment_command);
+            $cmd = "sh -c '".str_replace("'", "'\''", $postCommand)."'";
+            $containerName = $this->validateContainerName($this->container_name);
+            try {
+                $this->execute_remote_command([
+                    'command' => "docker exec {$containerName} {$cmd}",
+                    'hidden' => true,
+                    'save' => 'post-deployment-command-output',
+                ]);
+            } catch (Exception $e) {
+                $post_deployment_command_output = $this->saved_outputs->get('post-deployment-command-output');
+                if ($post_deployment_command_output) {
+                    $this->application_deployment_queue->addLogEntry('Post-deployment command failed.');
+                    $this->application_deployment_queue->addLogEntry($post_deployment_command_output, 'stderr');
+                }
+            }
+
+            return;
+        }
 
         $containers = getCurrentApplicationContainerStatus($this->server, $this->application->id, $this->pull_request_id);
         if ($containers->count() == 0) {
@@ -4924,6 +5057,14 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
      */
     private function completeDeployment(): void
     {
+        if ($this->blueGreenLifecycle?->isEnabled()) {
+            $this->blueGreenLifecycle->retirePreviousContainer();
+            $this->blueGreenLifecycle->complete();
+            $this->handleStatusTransition(ApplicationDeploymentStatus::FINISHED);
+            queue_next_deployment($this->application_deployment_queue);
+
+            return;
+        }
         $this->transitionToStatus(ApplicationDeploymentStatus::FINISHED);
     }
 
@@ -4941,6 +5082,8 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         if ($this->deploymentOwnedByAnotherDispatchAttempt()) {
             return;
         }
+
+        $exception = $this->blueGreenLifecycle?->rollback($exception) ?? $exception;
 
         $this->failDeployment();
 
@@ -4976,7 +5119,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         }
         $this->application_deployment_queue->addLogEntry('========================================', 'stderr');
 
-        if ($this->application->build_pack !== 'dockercompose') {
+        if (! ($this->blueGreenLifecycle?->isEnabled() ?? false) && $this->application->build_pack !== 'dockercompose') {
             $code = $exception->getCode();
             if ($code !== 69420) {
                 // 69420 means failed to push the image to the registry, so we don't need to remove the new version as it is the currently running one

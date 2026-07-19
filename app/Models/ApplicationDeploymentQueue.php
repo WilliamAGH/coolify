@@ -48,6 +48,10 @@ use OpenApi\Attributes as OA;
         'blue_green_color' => ['type' => 'string', 'nullable' => true],
         'blue_green_phase' => ['type' => 'string', 'nullable' => true],
         'blue_green_routing_revision' => ['type' => 'integer', 'nullable' => true],
+        'blue_green_destination_fence_epoch' => ['type' => 'integer', 'nullable' => true],
+        'blue_green_server_boot_id' => ['type' => 'string', 'nullable' => true],
+        'blue_green_topology_digest' => ['type' => 'string', 'nullable' => true],
+        'blue_green_routing_config_digest' => ['type' => 'string', 'nullable' => true],
     ],
 )]
 class ApplicationDeploymentQueue extends Model
@@ -88,6 +92,10 @@ class ApplicationDeploymentQueue extends Model
         'blue_green_color',
         'blue_green_phase',
         'blue_green_routing_revision',
+        'blue_green_destination_fence_epoch',
+        'blue_green_server_boot_id',
+        'blue_green_topology_digest',
+        'blue_green_routing_config_digest',
         'blue_green_previous_container_id',
         'blue_green_candidate_container_id',
         'blue_green_rollback_managed_filename',
@@ -115,6 +123,7 @@ class ApplicationDeploymentQueue extends Model
         'blue_green_color' => BlueGreenDeploymentColor::class,
         'blue_green_phase' => BlueGreenDeploymentPhase::class,
         'blue_green_routing_revision' => 'integer',
+        'blue_green_destination_fence_epoch' => 'integer',
         'blue_green_routing_mutated_at' => 'datetime',
     ];
 
