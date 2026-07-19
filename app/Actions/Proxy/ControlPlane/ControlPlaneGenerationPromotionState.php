@@ -232,6 +232,12 @@ final readonly class ControlPlaneGenerationPromotionState
 
             throw new InvalidArgumentException('Control-plane generation promotion evidence is immutable after it is recorded.');
         }
+        if ($this->draining !== null
+            && array_key_exists('draining', $updates)
+            && (! is_array($updates['draining'])
+                || ($updates['draining']['deadline_at'] ?? null) !== $this->draining['deadline_at'])) {
+            throw new InvalidArgumentException('The control-plane generation promotion drain deadline is immutable.');
+        }
 
         $next = $this->toArray();
         foreach ($updates as $key => $value) {
@@ -890,7 +896,7 @@ final readonly class ControlPlaneGenerationPromotionState
             }
             $observedAt = new DateTimeImmutable($observation['observed_at']);
             if (($routeAcknowledgedAt !== null && $observedAt < $routeAcknowledgedAt)
-                || $observedAt > $deadline
+                || $observedAt >= $deadline
                 || ($previous !== null && $observedAt->getTimestamp() - $previous->getTimestamp() < 1)) {
                 throw new InvalidArgumentException('The control-plane generation promotion stable zero observations must be ordered.');
             }

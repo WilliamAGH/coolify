@@ -327,6 +327,24 @@ it('uses absolute instants for causal drain proof and keeps terminal evidence im
     ]);
     expect(fn () => $draining->withPhase(ControlPlaneGenerationPromotionPhase::Retiring, '2026-07-19T12:10:00Z', [
         'draining' => [
+            'deadline_at' => '2026-07-19T12:30:00Z',
+            'stable_zero_observations' => [
+                generationPromotionZeroObservation($draining, '2026-07-19T12:10:00Z'),
+                generationPromotionZeroObservation($draining, '2026-07-19T12:11:00Z'),
+            ],
+        ],
+    ]))->toThrow(InvalidArgumentException::class, 'deadline is immutable');
+    expect(fn () => $draining->withPhase(ControlPlaneGenerationPromotionPhase::Retiring, '2026-07-19T12:20:00Z', [
+        'draining' => [
+            'deadline_at' => '2026-07-19T12:20:00Z',
+            'stable_zero_observations' => [
+                generationPromotionZeroObservation($draining, '2026-07-19T12:19:59Z'),
+                generationPromotionZeroObservation($draining, '2026-07-19T12:20:00Z'),
+            ],
+        ],
+    ]))->toThrow(InvalidArgumentException::class, 'must be ordered');
+    expect(fn () => $draining->withPhase(ControlPlaneGenerationPromotionPhase::Retiring, '2026-07-19T12:10:00Z', [
+        'draining' => [
             'deadline_at' => '2026-07-19T12:20:00Z',
             'stable_zero_observations' => [
                 generationPromotionZeroObservation($draining, '2026-07-19T12:10:00+01:00'),
