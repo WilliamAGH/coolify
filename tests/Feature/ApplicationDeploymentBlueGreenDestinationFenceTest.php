@@ -180,15 +180,15 @@ function createNewerApplicationDestinationFence(array $fixture): ApplicationBlue
 function makeApplicationDeploymentBlueGreenLegacyRetirementFixture(int $lockRefreshes): array
 {
     $scenario = BlueGreenRecoveryScenario::create();
-    $privateKey = PrivateKey::create([
-        'name' => 'blue-green-legacy-retirement-key',
-        'private_key' => generateSSHKey('ed25519')['private'],
-        'team_id' => $scenario->server->team_id,
-    ]);
     Storage::fake('ssh-keys');
+    $privateKey = PrivateKey::query()->find($scenario->server->private_key_id)
+        ?? PrivateKey::unguarded(fn (): PrivateKey => PrivateKey::query()->create([
+            'id' => $scenario->server->private_key_id,
+            'name' => 'blue-green-legacy-retirement-key',
+            'private_key' => generateSSHKey('ed25519')['private'],
+            'team_id' => $scenario->server->team_id,
+        ]));
     Storage::disk('ssh-keys')->put("ssh_key@{$privateKey->uuid}", $privateKey->private_key);
-    $scenario->server->update(['private_key_id' => $privateKey->id]);
-    $scenario->server->refresh();
     $recovery = ReconstructBlueGreenDeploymentRecovery::run($scenario->state);
     $previous = $recovery->previousContainer
         ?? throw new LogicException('The recovery fixture must have an exact legacy previous container.');
