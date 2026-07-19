@@ -5,6 +5,7 @@ use App\Actions\Proxy\ControlPlane\CompileControlPlaneStaticProxyConfiguration;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentPhase;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentState;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyExposure;
+use App\Actions\Proxy\ControlPlane\ExtractControlPlaneDynamicFragments;
 use App\Actions\Proxy\ControlPlane\PrepareControlPlaneProxyEnrollment;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
 use App\Enums\ProxyTypes;
@@ -49,10 +50,13 @@ function prepareControlPlaneEnrollment(
     ControlPlaneProxyExposure $exposure = ControlPlaneProxyExposure::Public,
     bool $hasProvenAlternateRoute = false,
     string $publicScheme = 'https',
+    bool $supplyExplicitFragments = true,
+    ?string $existingDynamicYaml = null,
 ): ControlPlaneProxyEnrollmentState {
     return (new PrepareControlPlaneProxyEnrollment(
         new CompileControlPlaneStaticProxyConfiguration,
         new CompileControlPlaneDynamicConfiguration,
+        new ExtractControlPlaneDynamicFragments,
         new StoreControlPlaneProxyEnrollmentState,
     ))->handle(
         server: $server,
@@ -61,34 +65,34 @@ function prepareControlPlaneEnrollment(
         appPort: 8000,
         exposure: $exposure,
         sourceComposeYaml: preparedControlPlaneSourceCompose(),
-        existingDynamicYaml: "http:\n  routers:\n    legacy: {}\n",
+        existingDynamicYaml: $existingDynamicYaml ?? "http:\n  routers:\n    legacy:\n      rule: Host(`legacy.example.test`)\n      entryPoints: [https]\n      service: legacy@docker\n",
         activeBackendDnsNames: ['coolify-web-b', 'coolify-web-a'],
         host: 'dashboard.example.test',
         expectedRevision: 'revision-42',
         expectedMember: 'blue',
         configurationAcknowledgement: 'ack:'.str_repeat('a', 64),
         publicScheme: $publicScheme,
-        realtimeRouterFragments: [
+        realtimeRouterFragments: $supplyExplicitFragments ? [
             'coolify-realtime-wss' => [
                 'rule' => 'Host(`dashboard.example.test`) && PathPrefix(`/app`)',
                 'entryPoints' => ['https'],
                 'service' => 'coolify-realtime@docker',
                 'tls' => ['certResolver' => 'letsencrypt'],
             ],
-        ],
-        terminalRouterFragments: [
+        ] : [],
+        terminalRouterFragments: $supplyExplicitFragments ? [
             'coolify-terminal-wss' => [
                 'rule' => 'Host(`dashboard.example.test`) && PathPrefix(`/terminal/ws`)',
                 'entryPoints' => ['https'],
                 'service' => 'coolify-terminal@docker',
                 'tls' => ['certResolver' => 'letsencrypt'],
             ],
-        ],
-        preservedServices: [
+        ] : [],
+        preservedServices: $supplyExplicitFragments ? [
             'coolify-realtime' => ['loadBalancer' => ['servers' => [['url' => 'http://coolify-realtime:6001']]]],
             'coolify-terminal' => ['loadBalancer' => ['servers' => [['url' => 'http://coolify-realtime:6002']]]],
-        ],
-        preservedMiddlewares: ['gzip' => ['compress' => true]],
+        ] : [],
+        preservedMiddlewares: $supplyExplicitFragments ? ['gzip' => ['compress' => true]] : [],
         hasProvenAlternateRoute: $hasProvenAlternateRoute,
     );
 }
@@ -104,7 +108,7 @@ it('compiles and reserves one public control-plane enrollment without retaining 
         ->and($state->dynamicReplacementBytes)->toContain('coolify-realtime-wss')
         ->and($state->dynamicReplacementBytes)->toContain('coolify-terminal-wss')
         ->and($state->dynamicReplacementBytes)->toContain('redirect-to-https')
-        ->and($state->dynamicPredecessorBytes)->toBe("http:\n  routers:\n    legacy: {}\n")
+        ->and($state->dynamicPredecessorBytes)->toContain('legacy.example.test')
         ->and(data_get(Yaml::parse($state->sourceOverrideBytes, Yaml::PARSE_CUSTOM_TAGS), 'services.coolify.environment'))->toBe([
             'COOLIFY_CONTROL_PLANE_HEALTH_ACK' => 'ack:'.str_repeat('a', 64),
             'COOLIFY_CONTROL_PLANE_HEALTH_PROOF_TOKEN_SHA256' => hash(
@@ -118,6 +122,35 @@ it('compiles and reserves one public control-plane enrollment without retaining 
         ->and($state->sourceOverrideBytes)->not->toContain('raw-token-must-not-persist')
         ->and(json_encode($stored, JSON_THROW_ON_ERROR))->not->toContain('raw-token-must-not-persist')
         ->and($state->tokenSha256)->toBe(hash('sha256', 'raw-token-must-not-persist'));
+});
+
+it('automatically preserves websocket and terminal routes from the predecessor snapshot', function (): void {
+    $existingDynamicYaml = Yaml::dump([
+        'http' => [
+            'routers' => [
+                'existing-realtime' => [
+                    'rule' => 'Host(`dashboard.example.test`) && PathPrefix(`/app`)',
+                    'entryPoints' => ['https'],
+                    'service' => 'realtime@docker',
+                ],
+                'existing-terminal' => [
+                    'rule' => 'Host(`dashboard.example.test`) && PathPrefix(`/terminal/ws`)',
+                    'entryPoints' => ['https'],
+                    'service' => 'terminal@docker',
+                ],
+            ],
+        ],
+    ], 20, 2);
+
+    $state = prepareControlPlaneEnrollment(
+        preparedControlPlaneEnrollmentServer(),
+        supplyExplicitFragments: false,
+        existingDynamicYaml: $existingDynamicYaml,
+    );
+
+    expect($state->dynamicReplacementBytes)->toContain('existing-realtime')
+        ->and($state->dynamicReplacementBytes)->toContain('existing-terminal')
+        ->and($state->dynamicPredecessorBytes)->toBe($existingDynamicYaml);
 });
 
 it('preserves an explicitly configured HTTP dashboard route', function (): void {

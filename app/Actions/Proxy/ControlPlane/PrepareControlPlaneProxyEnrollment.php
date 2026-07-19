@@ -15,6 +15,7 @@ final class PrepareControlPlaneProxyEnrollment
     public function __construct(
         private readonly CompileControlPlaneStaticProxyConfiguration $staticConfigurationCompiler,
         private readonly CompileControlPlaneDynamicConfiguration $dynamicConfigurationCompiler,
+        private readonly ExtractControlPlaneDynamicFragments $dynamicFragmentExtractor,
         private readonly StoreControlPlaneProxyEnrollmentState $stateStore,
     ) {}
 
@@ -57,6 +58,34 @@ final class PrepareControlPlaneProxyEnrollment
             exposure: $exposure,
         );
         $healthCheckProof = hash_hmac('sha256', 'coolify-control-plane-health-check-v1', $token);
+        $extractedFragments = $existingDynamicYaml === null
+            ? [
+                'realtimeRouterFragments' => [],
+                'terminalRouterFragments' => [],
+                'preservedServices' => [],
+                'preservedMiddlewares' => [],
+            ]
+            : $this->dynamicFragmentExtractor->handle($existingDynamicYaml);
+        $realtimeRouterFragments = $this->mergePreservedDefinitions(
+            $extractedFragments['realtimeRouterFragments'],
+            $realtimeRouterFragments,
+            'realtime router',
+        );
+        $terminalRouterFragments = $this->mergePreservedDefinitions(
+            $extractedFragments['terminalRouterFragments'],
+            $terminalRouterFragments,
+            'terminal router',
+        );
+        $preservedServices = $this->mergePreservedDefinitions(
+            $extractedFragments['preservedServices'],
+            $preservedServices,
+            'service',
+        );
+        $preservedMiddlewares = $this->mergePreservedDefinitions(
+            $extractedFragments['preservedMiddlewares'],
+            $preservedMiddlewares,
+            'middleware',
+        );
         $dynamicConfiguration = $this->dynamicConfigurationCompiler->handle(
             host: $host,
             appPortEntrypoint: 'coolify',
@@ -129,6 +158,22 @@ final class PrepareControlPlaneProxyEnrollment
         if ($server->proxyType() !== ProxyTypes::TRAEFIK->value) {
             throw new InvalidArgumentException('Control-plane proxy enrollment requires the existing Traefik proxy.');
         }
+    }
+
+    /**
+     * @param  array<string, array<string, mixed>>  $extracted
+     * @param  array<string, array<string, mixed>>  $additional
+     * @return array<string, array<string, mixed>>
+     */
+    private function mergePreservedDefinitions(array $extracted, array $additional, string $role): array
+    {
+        if (array_intersect_key($extracted, $additional) !== []) {
+            throw new InvalidArgumentException("An explicitly supplied control-plane {$role} duplicates the preserved snapshot owner.");
+        }
+        $merged = [...$extracted, ...$additional];
+        ksort($merged, SORT_STRING);
+
+        return $merged;
     }
 
     private function assertSamePreparedArtifacts(
