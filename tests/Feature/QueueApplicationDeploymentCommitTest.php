@@ -49,18 +49,99 @@ function makeQueueAdmissionDeployment(
     Application $application,
     Server $server,
     string $deploymentUuid,
+    ?StandaloneDocker $destination = null,
 ): ApplicationDeploymentQueue {
     return ApplicationDeploymentQueue::create([
         'application_id' => $application->id,
         'application_name' => $application->name,
         'server_id' => $server->id,
         'server_name' => $server->name,
-        'destination_id' => $application->destination_id,
+        'destination_id' => $destination?->id ?? $application->destination_id,
         'deployment_uuid' => $deploymentUuid,
         'commit' => "commit-{$deploymentUuid}",
         'status' => ApplicationDeploymentStatus::QUEUED->value,
     ]);
 }
+
+describe('deployment queue draining across destinations', function () {
+    test('dispatches a third destination after the second destination finishes', function () {
+        $serverB = Server::factory()->create(['team_id' => $this->team->id]);
+        $serverC = Server::factory()->create(['team_id' => $this->team->id]);
+        $destinationB = StandaloneDocker::factory()->create([
+            'server_id' => $serverB->id,
+            'network' => 'queue-destination-b',
+        ]);
+        $destinationC = StandaloneDocker::factory()->create([
+            'server_id' => $serverC->id,
+            'network' => 'queue-destination-c',
+        ]);
+        $application = makeApplication($this->environment->id, $this->destination->id, null);
+        $secondDestination = makeQueueAdmissionDeployment(
+            $application,
+            $serverB,
+            'queue-destination-b-deployment',
+            $destinationB,
+        );
+        $thirdDestination = makeQueueAdmissionDeployment(
+            $application,
+            $serverC,
+            'queue-destination-c-deployment',
+            $destinationC,
+        );
+
+        expect($secondDestination->claimForDispatch(bypassServerCapacity: true))->toBeTrue()
+            ->and($thirdDestination->claimForDispatch())->toBeFalse();
+
+        $secondDestination->update(['status' => ApplicationDeploymentStatus::FINISHED->value]);
+        queue_next_deployment($secondDestination);
+
+        expect($thirdDestination->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+            ->and($thirdDestination->fresh()->horizon_job_id)->not->toBeNull();
+        Bus::assertDispatched(
+            ApplicationDeploymentJob::class,
+            fn (ApplicationDeploymentJob $job): bool => $job->application_deployment_queue_id === $thirdDestination->id,
+        );
+    });
+
+    test('dispatches the next destination after cancellation mid fan-out', function () {
+        $serverB = Server::factory()->create(['team_id' => $this->team->id]);
+        $serverC = Server::factory()->create(['team_id' => $this->team->id]);
+        $destinationB = StandaloneDocker::factory()->create([
+            'server_id' => $serverB->id,
+            'network' => 'queue-cancel-destination-b',
+        ]);
+        $destinationC = StandaloneDocker::factory()->create([
+            'server_id' => $serverC->id,
+            'network' => 'queue-cancel-destination-c',
+        ]);
+        $application = makeApplication($this->environment->id, $this->destination->id, null);
+        $cancelledDestination = makeQueueAdmissionDeployment(
+            $application,
+            $serverB,
+            'queue-cancel-destination-b-deployment',
+            $destinationB,
+        );
+        $nextDestination = makeQueueAdmissionDeployment(
+            $application,
+            $serverC,
+            'queue-cancel-destination-c-deployment',
+            $destinationC,
+        );
+
+        expect($cancelledDestination->claimForDispatch(bypassServerCapacity: true))->toBeTrue()
+            ->and($nextDestination->claimForDispatch())->toBeFalse();
+
+        $cancelledDestination->update(['status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value]);
+        next_after_cancel($cancelledDestination);
+
+        expect($nextDestination->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+            ->and($nextDestination->fresh()->horizon_job_id)->not->toBeNull();
+        Bus::assertDispatched(
+            ApplicationDeploymentJob::class,
+            fn (ApplicationDeploymentJob $job): bool => $job->application_deployment_queue_id === $nextDestination->id,
+        );
+    });
+});
 
 describe('queue_application_deployment commit resolution', function () {
     test('uses application git_commit_sha when commit parameter omitted', function () {

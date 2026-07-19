@@ -138,7 +138,7 @@ class DeploymentNavbar extends Component
             $this->application_deployment_queue->update([
                 'current_process_id' => null,
             ]);
-            next_after_cancel($server);
+            next_after_cancel($this->application_deployment_queue);
         }
     }
 }

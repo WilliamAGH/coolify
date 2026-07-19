@@ -110,17 +110,32 @@ function force_start_deployment(ApplicationDeploymentQueue $deployment)
 
     return true;
 }
-function queue_next_deployment(Application $application)
-{
-    $server_id = $application->destination->server_id;
-    $queued_deployments = ApplicationDeploymentQueue::where('server_id', $server_id)
-        ->where('status', ApplicationDeploymentStatus::QUEUED)
-        ->get()
-        ->sortBy('created_at');
 
-    foreach ($queued_deployments as $next_deployment) {
-        if ($next_deployment->claimForDispatch()) {
-            dispatch_claimed_application_deployment($next_deployment);
+/**
+ * Drain the finishing server and the serialized application/PR lane.
+ */
+function queue_next_deployment(ApplicationDeploymentQueue $finishedDeployment): void
+{
+    $finishedDeployment->refresh();
+
+    $queuedDeployments = ApplicationDeploymentQueue::query()
+        ->where('status', ApplicationDeploymentStatus::QUEUED->value)
+        ->where(function ($query) use ($finishedDeployment): void {
+            $query->where('server_id', $finishedDeployment->server_id)
+                ->orWhere(function ($serializedApplicationLane) use ($finishedDeployment): void {
+                    $serializedApplicationLane
+                        ->where('application_id', $finishedDeployment->application_id)
+                        ->where('pull_request_id', $finishedDeployment->pull_request_id);
+                });
+        })
+        ->orderBy('created_at')
+        ->orderBy('id')
+        ->get()
+        ->values();
+
+    foreach ($queuedDeployments as $nextDeployment) {
+        if ($nextDeployment->claimForDispatch()) {
+            dispatch_claimed_application_deployment($nextDeployment);
         }
     }
 }
@@ -151,22 +166,9 @@ function next_queuable(string $server_id, string $application_id, string $commit
 
     return true;
 }
-function next_after_cancel(?Server $server = null)
+function next_after_cancel(ApplicationDeploymentQueue $cancelledDeployment): void
 {
-    if ($server) {
-        $next_found = ApplicationDeploymentQueue::where('server_id', data_get($server, 'id'))
-            ->where('status', ApplicationDeploymentStatus::QUEUED)
-            ->get()
-            ->sortBy('created_at');
-
-        if ($next_found->count() > 0) {
-            foreach ($next_found as $next) {
-                if ($next->claimForDispatch()) {
-                    dispatch_claimed_application_deployment($next);
-                }
-            }
-        }
-    }
+    queue_next_deployment($cancelledDeployment);
 }
 
 function dispatch_claimed_application_deployment(ApplicationDeploymentQueue $deployment): bool

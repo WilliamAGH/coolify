@@ -4811,7 +4811,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
 
         $this->updateDeploymentStatus($status);
         $this->handleStatusTransition($status);
-        queue_next_deployment($this->application);
+        queue_next_deployment($this->application_deployment_queue);
     }
 
     /**

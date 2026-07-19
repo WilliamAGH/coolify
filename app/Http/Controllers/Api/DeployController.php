@@ -288,6 +288,7 @@ class DeployController extends Controller
                 'application_uuid' => $application?->uuid,
                 'server_id' => $deployment->server_id,
             ]);
+            next_after_cancel($deployment);
 
             return response()->json([
                 'message' => 'Deployment cancelled successfully.',
