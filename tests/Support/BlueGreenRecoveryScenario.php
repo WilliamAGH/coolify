@@ -15,10 +15,12 @@ use App\Enums\ProxyTypes;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
+use App\Models\PrivateKey;
 use App\Models\Project;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
 use App\Models\Team;
+use Illuminate\Support\Facades\Storage;
 
 final readonly class BlueGreenRecoveryScenario
 {
@@ -41,7 +43,17 @@ final readonly class BlueGreenRecoveryScenario
         bool $routingMutationRecorded = true,
     ): self {
         $team = Team::factory()->create();
-        $server = Server::factory()->create(['team_id' => $team->id]);
+        $privateKey = PrivateKey::query()->create([
+            'name' => 'Blue-green recovery test key',
+            'private_key' => generateSSHKey('ed25519')['private'],
+            'team_id' => $team->id,
+        ]);
+        Storage::fake('ssh-keys');
+        Storage::disk('ssh-keys')->put("ssh_key@{$privateKey->uuid}", $privateKey->private_key);
+        $server = Server::factory()->create([
+            'team_id' => $team->id,
+            'private_key_id' => $privateKey->id,
+        ]);
         $server->proxy->set('type', ProxyTypes::TRAEFIK->value);
         $server->save();
         $destination = $server->standaloneDockers()->firstOrFail();
