@@ -1,4 +1,5 @@
 [mcp_servers.laravel-boost]
-command = "php"
-args = ["artisan", "boost:mcp"]
-cwd = "/Users/heyandras/devel/coolify"
+url = "http://localhost:9100/laravel-boost/mcp"
+
+[mcp_servers.laravel-boost.tools.search-docs]
+approval_mode = "approve"
