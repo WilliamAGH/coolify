@@ -112,14 +112,14 @@ function completedGenerationPromotionState(ControlPlaneGenerationPromotionState 
             ],
         ],
     ]);
-    $state = $state->withPhase(ControlPlaneGenerationPromotionPhase::FenceReleasing, '2026-07-19T12:12:00Z', [
+    $state = $state->withPhase(ControlPlaneGenerationPromotionPhase::WriterPromoting, '2026-07-19T12:12:00Z', [
         'retired_at' => '2026-07-19T12:12:00Z',
     ]);
-    $state = $state->withPhase(ControlPlaneGenerationPromotionPhase::WriterPromoting, '2026-07-19T12:13:00Z', [
-        'fence_released_at' => '2026-07-19T12:13:00Z',
+    $state = $state->withPhase(ControlPlaneGenerationPromotionPhase::FenceReleasing, '2026-07-19T12:13:00Z', [
+        'writer_promoted_at' => '2026-07-19T12:13:00Z',
     ]);
     $state = $state->withPhase(ControlPlaneGenerationPromotionPhase::Unfreezing, '2026-07-19T12:14:00Z', [
-        'writer_promoted_at' => '2026-07-19T12:14:00Z',
+        'fence_released_at' => '2026-07-19T12:14:00Z',
     ]);
 
     return $state->withPhase(ControlPlaneGenerationPromotionPhase::Completed, '2026-07-19T12:15:00Z', [

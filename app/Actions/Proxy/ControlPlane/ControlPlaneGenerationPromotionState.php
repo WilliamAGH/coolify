@@ -542,25 +542,25 @@ final readonly class ControlPlaneGenerationPromotionState
             throw new InvalidArgumentException('The control-plane generation promotion requires two stable zero-drain observations.');
         }
         if (in_array($this->phase, [
-            ControlPlaneGenerationPromotionPhase::FenceReleasing,
             ControlPlaneGenerationPromotionPhase::WriterPromoting,
+            ControlPlaneGenerationPromotionPhase::FenceReleasing,
             ControlPlaneGenerationPromotionPhase::Unfreezing,
             ControlPlaneGenerationPromotionPhase::Completed,
         ], true) && $this->retiredAt === null) {
             throw new InvalidArgumentException('The control-plane generation promotion requires a retirement timestamp.');
         }
         if (in_array($this->phase, [
-            ControlPlaneGenerationPromotionPhase::WriterPromoting,
-            ControlPlaneGenerationPromotionPhase::Unfreezing,
-            ControlPlaneGenerationPromotionPhase::Completed,
-        ], true) && $this->fenceReleasedAt === null) {
-            throw new InvalidArgumentException('The control-plane generation promotion requires a fence-release timestamp.');
-        }
-        if (in_array($this->phase, [
+            ControlPlaneGenerationPromotionPhase::FenceReleasing,
             ControlPlaneGenerationPromotionPhase::Unfreezing,
             ControlPlaneGenerationPromotionPhase::Completed,
         ], true) && $this->writerPromotedAt === null) {
             throw new InvalidArgumentException('The control-plane generation promotion requires a writer-promotion timestamp.');
+        }
+        if (in_array($this->phase, [
+            ControlPlaneGenerationPromotionPhase::Unfreezing,
+            ControlPlaneGenerationPromotionPhase::Completed,
+        ], true) && $this->fenceReleasedAt === null) {
+            throw new InvalidArgumentException('The control-plane generation promotion requires a fence-release timestamp.');
         }
         if ($this->phase === ControlPlaneGenerationPromotionPhase::Completed && $this->unfrozenAt === null) {
             throw new InvalidArgumentException('The control-plane generation promotion requires an unfreeze timestamp.');
@@ -603,9 +603,9 @@ final readonly class ControlPlaneGenerationPromotionState
             throw new InvalidArgumentException('The predecessor retirement predates stable drain proof.');
         }
         foreach ([
-            [$this->retiredAt, $this->fenceReleasedAt],
-            [$this->fenceReleasedAt, $this->writerPromotedAt],
-            [$this->writerPromotedAt, $this->unfrozenAt],
+            [$this->retiredAt, $this->writerPromotedAt],
+            [$this->writerPromotedAt, $this->fenceReleasedAt],
+            [$this->fenceReleasedAt, $this->unfrozenAt],
         ] as [$before, $after]) {
             if ($before !== null && $after !== null
                 && new DateTimeImmutable($after) < new DateTimeImmutable($before)) {
