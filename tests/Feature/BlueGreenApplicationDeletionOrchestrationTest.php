@@ -8,6 +8,7 @@ use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeactivation;
+use App\Models\ApplicationDeploymentQueue;
 use App\Models\StandaloneDocker;
 use Illuminate\Cache\Lock;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -222,4 +223,26 @@ it('acquires the sorted configured and durable destination union before deletion
             ->sort()
             ->values()
             ->all())->toBe($destinationIds->all());
+});
+
+it('cancels fenced preview queues before blue-green deletion can proceed', function () {
+    ['application' => $application, 'destination' => $destination] = BlueGreenDeactivationScenario::context();
+    $application->settings()->update(['is_blue_green_deployment_enabled' => true]);
+    Process::fake();
+    $previewDeployment = ApplicationDeploymentQueue::query()->create([
+        'application_id' => $application->id,
+        'deployment_uuid' => 'preview-before-deactivation',
+        'pull_request_id' => 42,
+        'destination_id' => $destination->id,
+        'server_id' => $destination->server_id,
+        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+    ]);
+
+    (new DeactivateBlueGreenApplication)->beginDeletion($application);
+
+    $deactivation = ApplicationBlueGreenDeactivation::query()->sole();
+    expect($previewDeployment->fresh()->status)->toBe(ApplicationDeploymentStatus::CANCELLED_BY_USER->value)
+        ->and($previewDeployment->fresh()->finished_at)->not->toBeNull()
+        ->and($previewDeployment->fresh()->blue_green_supersession_generation)
+        ->toBe($deactivation->supersession_generation);
 });

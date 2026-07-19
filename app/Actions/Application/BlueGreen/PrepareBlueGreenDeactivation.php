@@ -280,7 +280,6 @@ final class PrepareBlueGreenDeactivation
                     $fencedQueueQuery
                         ->where('destination_id', $destination->id)
                         ->where('server_id', $destination->server_id)
-                        ->where('pull_request_id', 0)
                         ->whereIn('status', [
                             ApplicationDeploymentStatus::QUEUED->value,
                             ApplicationDeploymentStatus::IN_PROGRESS->value,
@@ -305,7 +304,6 @@ final class PrepareBlueGreenDeactivation
         $fencedQueueIds = $queues
             ->filter(static fn (ApplicationDeploymentQueue $queue): bool => (int) $queue->destination_id === $destination->id
                 && (int) $queue->server_id === $destination->server_id
-                && $queue->pull_request_id === 0
                 && in_array($queue->status, [
                     ApplicationDeploymentStatus::QUEUED->value,
                     ApplicationDeploymentStatus::IN_PROGRESS->value,
@@ -321,7 +319,6 @@ final class PrepareBlueGreenDeactivation
             ->where('application_id', $deactivation->application_id)
             ->where('destination_id', $destination->id)
             ->where('server_id', $destination->server_id)
-            ->where('pull_request_id', 0)
             ->whereIn('status', [
                 ApplicationDeploymentStatus::QUEUED->value,
                 ApplicationDeploymentStatus::IN_PROGRESS->value,

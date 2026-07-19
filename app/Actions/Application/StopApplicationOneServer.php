@@ -2,6 +2,7 @@
 
 namespace App\Actions\Application;
 
+use App\Actions\Application\BlueGreen\AssertBlueGreenApplicationStopIsSafe;
 use App\Models\Application;
 use App\Models\Server;
 use Lorisleiva\Actions\Concerns\AsAction;
@@ -12,6 +13,7 @@ class StopApplicationOneServer
 
     public function handle(Application $application, Server $server)
     {
+        AssertBlueGreenApplicationStopIsSafe::run($application);
         if ($application->destination->server->isSwarm()) {
             return;
         }

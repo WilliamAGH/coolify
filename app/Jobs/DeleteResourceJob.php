@@ -62,6 +62,11 @@ class DeleteResourceJob implements ShouldBeEncrypted, ShouldQueue
                 case 'application':
                     if ($requiresBlueGreenDeactivation) {
                         DeactivateBlueGreenApplication::run($this->resource);
+                        StopApplication::run(
+                            $this->resource,
+                            previewDeployments: true,
+                            dockerCleanup: $this->dockerCleanup,
+                        );
                     } else {
                         StopApplication::run($this->resource, previewDeployments: true, dockerCleanup: $this->dockerCleanup);
                     }
