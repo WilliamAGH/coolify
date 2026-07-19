@@ -202,7 +202,7 @@ return [
             'balance' => false,
             'queue' => ProxyMutationQueue::NAME,
             'minProcesses' => 1,
-            'maxProcesses' => env('HORIZON_PROXY_MUTATION_MAX_PROCESSES', 4),
+            'maxProcesses' => 1,
             'maxTime' => env('HORIZON_MAX_TIME', 0),
             'maxJobs' => 400,
             'memory' => 128,

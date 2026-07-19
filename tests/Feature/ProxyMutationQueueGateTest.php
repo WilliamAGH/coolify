@@ -3,6 +3,7 @@
 use App\Contracts\ProxyMutation;
 use App\Support\ProxyMutationExecutionPipe;
 use App\Support\ProxyMutationQueue;
+use App\Support\ProxyMutationQueueFrozenException;
 use App\Support\ProxyMutationRedisQueue;
 use App\Support\UsesProxyMutationQueue;
 use Illuminate\Bus\Queueable;
@@ -10,6 +11,7 @@ use Illuminate\Container\Container;
 use Illuminate\Queue\Queue;
 use Illuminate\Queue\QueueManager;
 use Illuminate\Queue\SyncQueue;
+use Illuminate\Support\Str;
 use Laravel\Horizon\RedisQueue as HorizonRedisQueue;
 
 class ProxyMutationQueueGateJob implements ProxyMutation
@@ -47,6 +49,11 @@ function proxyMutationGateQueue(Container $container): ProxyMutationRedisQueue
                 $callback,
             );
         }
+
+        public function delayedRawForTest(int $delay, string $payload): mixed
+        {
+            return $this->laterRaw($delay, $payload, ProxyMutationQueue::NAME);
+        }
     };
     $queue->setConnectionName(ProxyMutationQueue::CONNECTION);
     $queue->setContainer($container);
@@ -59,6 +66,94 @@ it('resolves Redis through the Horizon-compatible proxy mutation gate', function
 
     expect($queue)->toBeInstanceOf(ProxyMutationRedisQueue::class)
         ->toBeInstanceOf(HorizonRedisQueue::class);
+});
+
+it('atomically freezes ready and delayed admission using cardinality-only snapshots', function () {
+    $queueKey = 'queues:proxy-mutation-test-'.Str::uuid();
+    $queue = new class(app('redis'), ProxyMutationQueue::NAME, 'default', 86400, null, true, $queueKey) extends ProxyMutationRedisQueue
+    {
+        public function __construct(
+            mixed $redis,
+            string $default,
+            string $connection,
+            int $retryAfter,
+            mixed $blockFor,
+            bool $dispatchAfterCommit,
+            private readonly string $testQueueKey,
+        ) {
+            parent::__construct($redis, $default, $connection, $retryAfter, $blockFor, $dispatchAfterCommit);
+        }
+
+        #[Override]
+        public function getQueue($queue): string
+        {
+            return $this->testQueueKey;
+        }
+
+        public function delayedRawForTest(int $delay, string $payload): mixed
+        {
+            return $this->laterRaw($delay, $payload, ProxyMutationQueue::NAME);
+        }
+    };
+    $queue->setConnectionName(ProxyMutationQueue::CONNECTION);
+    $queue->setContainer(app());
+    $operationId = 'test-freeze-'.Str::uuid();
+    $payload = json_encode([
+        'id' => (string) Str::uuid(),
+        'uuid' => (string) Str::uuid(),
+        'displayName' => ProxyMutationQueueGateJob::class,
+        ProxyMutationQueue::PAYLOAD_MARKER => true,
+    ], JSON_THROW_ON_ERROR);
+
+    try {
+        $frozen = ProxyMutationQueue::freeze($operationId, $queue);
+        expect($frozen->freezeOperationId)->toBe($operationId)
+            ->and($frozen->isEmpty())->toBeTrue()
+            ->and(fn (): mixed => $queue->pushRaw($payload, ProxyMutationQueue::NAME))
+            ->toThrow(ProxyMutationQueueFrozenException::class)
+            ->and(fn (): mixed => $queue->delayedRawForTest(60, $payload))
+            ->toThrow(ProxyMutationQueueFrozenException::class)
+            ->and(ProxyMutationQueue::snapshot($queue)->isEmpty())->toBeTrue();
+
+        ProxyMutationQueue::unfreeze($operationId, $queue);
+        expect($queue->pushRaw($payload, ProxyMutationQueue::NAME))->not->toBeNull()
+            ->and($queue->delayedRawForTest(60, $payload))->not->toBeNull();
+        $admitted = ProxyMutationQueue::snapshot($queue);
+        expect($admitted->isFrozen())->toBeFalse()
+            ->and($admitted->pending)->toBe(1)
+            ->and($admitted->reserved)->toBe(0)
+            ->and($admitted->delayed)->toBe(1);
+    } finally {
+        $snapshot = ProxyMutationQueue::snapshot($queue);
+        if ($snapshot->freezeOperationId === $operationId) {
+            ProxyMutationQueue::unfreeze($operationId, $queue);
+        }
+        $queue->getConnection()->del(
+            $queueKey,
+            $queueKey.':reserved',
+            $queueKey.':delayed',
+            $queueKey.':notify',
+        );
+    }
+});
+
+it('keeps freeze ownership fail closed across replay and foreign release attempts', function () {
+    $queue = proxyMutationGateQueue(app());
+    $operationId = 'test-owner-'.Str::uuid();
+
+    try {
+        expect(ProxyMutationQueue::freeze($operationId, $queue)->freezeOperationId)->toBe($operationId)
+            ->and(ProxyMutationQueue::freeze($operationId, $queue)->freezeOperationId)->toBe($operationId)
+            ->and(fn (): mixed => ProxyMutationQueue::freeze('foreign-'.Str::uuid(), $queue))
+            ->toThrow(RuntimeException::class, 'another control-plane operation')
+            ->and(fn (): mixed => ProxyMutationQueue::unfreeze('foreign-'.Str::uuid(), $queue))
+            ->toThrow(RuntimeException::class, 'owning operation');
+    } finally {
+        $snapshot = ProxyMutationQueue::snapshot($queue);
+        if ($snapshot->freezeOperationId === $operationId) {
+            ProxyMutationQueue::unfreeze($operationId, $queue);
+        }
+    }
 });
 
 it('serializes typed mutations only on the canonical Redis queue', function () {

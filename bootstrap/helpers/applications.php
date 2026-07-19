@@ -10,6 +10,8 @@ use App\Models\ApplicationDeploymentQueue;
 use App\Models\EnvironmentVariable;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
+use App\Support\ProxyMutationQueue;
+use App\Support\ProxyMutationQueueFrozenException;
 use Illuminate\Contracts\Bus\Dispatcher;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
@@ -184,7 +186,12 @@ function dispatch_claimed_application_deployment(ApplicationDeploymentQueue $dep
             application_deployment_queue_id: $deployment->id,
             dispatch_attempt_uuid: $dispatchAttemptUuid,
         ))->afterCommit();
-        app(Dispatcher::class)->dispatch($job);
+        try {
+            app(Dispatcher::class)->dispatch($job);
+        } catch (ProxyMutationQueueFrozenException) {
+            // The durable dispatch attempt remains recoverable after the owning
+            // control-plane operation explicitly releases admission.
+        }
     });
 
     return true;
@@ -194,6 +201,10 @@ function recover_stale_application_deployment_dispatches(
     int $staleAfterSeconds = ApplicationDeploymentQueue::DISPATCH_STALE_AFTER_SECONDS,
     int $limit = ApplicationDeploymentQueue::DISPATCH_RECOVERY_LIMIT_PER_RUN,
 ): int {
+    if (ProxyMutationQueue::snapshot()->isFrozen()) {
+        return 0;
+    }
+
     $jobRepository = app(JobRepository::class);
 
     return ApplicationDeploymentQueue::recoverStaleDispatchAttempts(

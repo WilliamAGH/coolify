@@ -9,6 +9,8 @@ use App\Models\Project;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
 use App\Models\Team;
+use App\Support\ProxyMutationQueue;
+use App\Support\ProxyMutationQueueFrozenException;
 use Illuminate\Contracts\Bus\Dispatcher;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Bus;
@@ -140,6 +142,45 @@ describe('deployment queue draining across destinations', function () {
             ApplicationDeploymentJob::class,
             fn (ApplicationDeploymentJob $job): bool => $job->application_deployment_queue_id === $nextDestination->id,
         );
+    });
+});
+
+describe('proxy mutation freeze recovery', function () {
+    test('keeps a rejected physical publication durably recoverable', function () {
+        $application = makeApplication($this->environment->id, $this->destination->id, null);
+        $deployment = makeQueueAdmissionDeployment(
+            $application,
+            $this->server,
+            'queue-freeze-durable-dispatch',
+        );
+        expect($deployment->claimForDispatch(bypassServerCapacity: true))->toBeTrue();
+        $dispatchAttemptUuid = $deployment->horizon_job_id;
+        $dispatcher = Mockery::mock(Dispatcher::class);
+        $dispatcher->shouldReceive('dispatch')
+            ->once()
+            ->andThrow(new ProxyMutationQueueFrozenException('test-freeze-owner'));
+        app()->instance(Dispatcher::class, $dispatcher);
+
+        expect(dispatch_claimed_application_deployment($deployment))->toBeTrue()
+            ->and($deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+            ->and($deployment->fresh()->horizon_job_id)->toBe($dispatchAttemptUuid)
+            ->and($deployment->fresh()->horizon_job_worker)->toBeNull();
+    });
+
+    test('does not scan or republish stale dispatch attempts while frozen', function () {
+        $operationId = 'test-recovery-freeze-'.Str::uuid();
+        $this->mock(JobRepository::class)->shouldNotReceive('getJobs');
+
+        try {
+            ProxyMutationQueue::freeze($operationId);
+
+            expect(recover_stale_application_deployment_dispatches(limit: 2))->toBe(0);
+        } finally {
+            $snapshot = ProxyMutationQueue::snapshot();
+            if ($snapshot->freezeOperationId === $operationId) {
+                ProxyMutationQueue::unfreeze($operationId);
+            }
+        }
     });
 });
 

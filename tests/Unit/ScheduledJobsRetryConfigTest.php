@@ -98,7 +98,7 @@ it('isolates proxy mutations from build workers with bounded dedicated capacity'
         ->and($proxySupervisor['queue'])->toBe(ProxyMutationQueue::NAME)
         ->and($proxySupervisor['balance'])->toBeFalse()
         ->and($proxySupervisor['minProcesses'])->toBe(1)
-        ->and($proxySupervisor['maxProcesses'])->toBeGreaterThan(1)
+        ->and($proxySupervisor['maxProcesses'])->toBe(1)
         ->and($horizon['waits']['redis:proxy-mutations'])->toBe(60)
         ->and($queue['connections']['redis']['retry_after'])->toBeGreaterThan($proxySupervisor['timeout']);
 });
