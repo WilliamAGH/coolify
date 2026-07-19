@@ -64,6 +64,9 @@ use Throwable;
 
 final class BlueGreenDeploymentLifecycle
 {
+    /** @var list<string> */
+    private const STOPPED_LEGACY_CONTAINER_STATES = ['created', 'exited', 'dead'];
+
     private bool $enabled = false;
 
     private ?BlueGreenDeploymentClaim $claim = null;
@@ -83,6 +86,8 @@ final class BlueGreenDeploymentLifecycle
     private ?BlueGreenContainerExpectation $previousContainerExpectation = null;
 
     private ?BlueGreenContainerExpectation $candidateContainerExpectation = null;
+
+    private ?BlueGreenContainerExpectation $stoppedLegacyContainerExpectation = null;
 
     private ?BlueGreenLegacyRoutingSnapshot $legacyRoutingSnapshot = null;
 
@@ -241,6 +246,7 @@ final class BlueGreenDeploymentLifecycle
         $serverBootId = $this->serverBootId
             ?? throw new DeploymentException('Blue-green deployment has no captured server boot identity.');
         ReadBlueGreenServerBootIdentity::run($this->server, $serverBootId);
+        $this->captureStoppedLegacyContainerForRetirement();
 
         $this->claim = ClaimBlueGreenDeployment::run(
             application: $this->application,
@@ -311,6 +317,8 @@ final class BlueGreenDeploymentLifecycle
             || $this->application->additional_networks()->exists()) {
             throw new DeploymentException('Blue-green deployment completion requires exactly one configured destination.');
         }
+        $this->assertOperationOwned(BlueGreenDeploymentPhase::DRAINING);
+        $this->retireStoppedLegacyContainer();
         $this->assertOperationOwned(BlueGreenDeploymentPhase::DRAINING);
         CompleteBlueGreenDeploymentOperation::run($claim);
         $this->application->update(['status' => 'running:healthy']);
@@ -567,6 +575,7 @@ final class BlueGreenDeploymentLifecycle
         $this->server->privateKey->storeInFileSystem();
         ReadBlueGreenServerBootIdentity::run($this->server, $operation->claim->serverBootId);
         $this->assertOperationOwned(BlueGreenDeploymentPhase::DRAINING);
+        $this->captureStoppedLegacyContainerForRetirement();
         $this->finalized = true;
         $this->drainingRecovery = true;
         $this->deployment->addLogEntry(
@@ -694,6 +703,114 @@ final class BlueGreenDeploymentLifecycle
             throw new DeploymentException("Previous blue-green container {$containerName} is not an exact running, healthy rollback target.");
         }
         $this->previousContainerExpectation = $expectation->withDockerId($inspection->dockerId);
+    }
+
+    private function captureStoppedLegacyContainerForRetirement(): void
+    {
+        if ($this->previousActiveColor === null) {
+            return;
+        }
+        $this->assertLifecycleLockOwned();
+        $fixedNames = [
+            $this->containerName(BlueGreenDeploymentColor::BLUE),
+            $this->containerName(BlueGreenDeploymentColor::GREEN),
+        ];
+        $legacyContainers = getCurrentApplicationContainerStatus(
+            $this->server,
+            $this->application->id,
+            pullRequestId: 0,
+        )
+            ->filter(
+                static fn (mixed $container): bool => is_array($container)
+                    && ! in_array(data_get($container, 'Names'), $fixedNames, true),
+            )
+            ->values();
+        $runningLegacyContainers = $legacyContainers->filter(
+            static fn (array $container): bool => data_get($container, 'State') === 'running',
+        );
+        if ($runningLegacyContainers->isNotEmpty()) {
+            throw new DeploymentException('Unexpected running legacy application containers exist beside the durable active color. Reconciliation is required.');
+        }
+        $transientLegacyContainers = $legacyContainers->filter(
+            static fn (array $container): bool => ! in_array(
+                data_get($container, 'State'),
+                self::STOPPED_LEGACY_CONTAINER_STATES,
+                true,
+            ),
+        );
+        if ($transientLegacyContainers->isNotEmpty()) {
+            throw new DeploymentException('Unexpected transient legacy application containers exist beside the durable active color. Reconciliation is required.');
+        }
+
+        $legacyBaseName = $this->legacyBaseContainerName();
+        $stoppedLegacyContainers = $legacyContainers->filter(
+            static fn (array $container): bool => data_get($container, 'Names') === $legacyBaseName,
+        );
+        if ($stoppedLegacyContainers->count() > 1) {
+            throw new DeploymentException('More than one stopped legacy base-name application container was detected. Reconciliation is required.');
+        }
+        if ($stoppedLegacyContainers->isEmpty()) {
+            return;
+        }
+
+        $expectation = new BlueGreenContainerExpectation(
+            name: $legacyBaseName,
+            dockerId: null,
+            applicationId: $this->application->id,
+            pullRequestId: 0,
+            blueGreenManaged: false,
+        );
+        $inspection = InspectBlueGreenContainer::run($this->server, $expectation);
+        if (! $inspection->exists) {
+            return;
+        }
+        if ($inspection->dockerId === null
+            || ! in_array($inspection->status, self::STOPPED_LEGACY_CONTAINER_STATES, true)) {
+            throw new DeploymentException("Stopped legacy base-name container {$legacyBaseName} changed state before retirement could be authorized.");
+        }
+
+        $this->stoppedLegacyContainerExpectation = $expectation->withDockerId($inspection->dockerId);
+    }
+
+    private function retireStoppedLegacyContainer(): void
+    {
+        $expectation = $this->stoppedLegacyContainerExpectation;
+        if ($expectation === null) {
+            return;
+        }
+        $this->assertOperationOwned(BlueGreenDeploymentPhase::DRAINING);
+        $inspection = InspectBlueGreenContainer::run($this->server, $expectation);
+        if (! $inspection->exists) {
+            return;
+        }
+        if ($inspection->dockerId !== $expectation->dockerId
+            || ! in_array($inspection->status, self::STOPPED_LEGACY_CONTAINER_STATES, true)) {
+            throw new DeploymentException("Stopped legacy base-name container {$expectation->name} changed before exact retirement.");
+        }
+
+        $containerId = escapeshellarg($expectation->dockerId);
+        $status = escapeshellarg($inspection->status);
+        try {
+            $this->destinationState = $this->executeDestinationMutation(
+                [
+                    ...(new InspectBlueGreenContainer)->exactMutationAssertionsFor($expectation),
+                    'test "$(docker inspect --format='.escapeshellarg('{{.State.Status}}').' '.$containerId.')" = '.$status,
+                    "docker rm {$containerId} >/dev/null",
+                    "! docker container inspect {$containerId} >/dev/null 2>&1",
+                ],
+                (new InspectBlueGreenContainer)->absentMutationCompletionAssertionsFor($expectation),
+            );
+        } catch (BlueGreenDestinationStateRecordingException) {
+            $this->reconcilePendingDestinationState();
+        }
+        $this->deployment->addLogEntry(
+            "Blue-green stopped legacy container {$expectation->name} was removed before lifecycle completion.",
+        );
+    }
+
+    private function legacyBaseContainerName(): string
+    {
+        return $this->validateContainerName((string) $this->application->uuid);
     }
 
     private function assertExactPreviousContainerHealthy(): void
