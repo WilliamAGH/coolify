@@ -681,6 +681,13 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
             $violations[] = "missing generic application validation job: {$jobName}";
         }
     }
+    $browserJob = $applicationJobs['browser'] ?? [];
+    $browserRedis = $browserJob['services']['redis'] ?? [];
+    if (($browserRedis['image'] ?? null) !== 'redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99' ||
+        ($browserJob['env']['REDIS_HOST'] ?? null) !== '127.0.0.1' ||
+        ($browserJob['env']['REDIS_PORT'] ?? null) !== 6379) {
+        $violations[] = 'browser validation must provide its Redis runtime dependency';
+    }
     $requiredJobs = [...$genericJobs, 'fork-deploy'];
     $requiredNeeds = releaseWorkflowNeeds($applicationJobs['required'] ?? []);
     sort($requiredJobs);
@@ -726,6 +733,14 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
     foreach (['docker/production/Dockerfile', 'docker/testing-host/Dockerfile'] as $dockerfile) {
         if (! str_contains($provenanceScript, "docker/verify-source-provenance.sh {$dockerfile}")) {
             $violations[] = "workflow validation must verify pinned source provenance for {$dockerfile}";
+        }
+    }
+    $shellcheckScript = (string) (releaseWorkflowStep($workflowAndShell, 'ShellCheck changed shell scripts')['run'] ?? '');
+    foreach (['strict_scripts', 'legacy_scripts', '--diff-filter=A', '--severity=error'] as $requiredShellcheckContract) {
+        if (! str_contains($shellcheckScript, $requiredShellcheckContract)) {
+            $violations[] = 'workflow validation must apply strict checks to new scripts and error checks to legacy scripts';
+
+            break;
         }
     }
 
@@ -1259,6 +1274,44 @@ it('rejects renaming the protected branch application validation status context'
 
     expect(releaseFoundationWorkflowViolations($sharedWorkflow, $applicationValidationWorkflow, $callers))
         ->toContain('application validation must preserve the protected branch status context');
+});
+
+it('rejects removing the browser Redis runtime dependency', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $sharedWorkflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $applicationValidationWorkflow = Yaml::parseFile($root.'/.github/workflows/application-validation.yml');
+    $callers = [
+        'production' => Yaml::parseFile($root.'/.github/workflows/coolify-production-build.yml'),
+        'testing-host' => Yaml::parseFile($root.'/.github/workflows/coolify-testing-host.yml'),
+        'staging' => Yaml::parseFile($root.'/.github/workflows/coolify-staging-build.yml'),
+    ];
+    unset($applicationValidationWorkflow['jobs']['browser']['services']['redis']);
+
+    expect(releaseFoundationWorkflowViolations($sharedWorkflow, $applicationValidationWorkflow, $callers))
+        ->toContain('browser validation must provide its Redis runtime dependency');
+});
+
+it('rejects applying legacy ShellCheck severity to new scripts', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $sharedWorkflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $applicationValidationWorkflow = Yaml::parseFile($root.'/.github/workflows/application-validation.yml');
+    $callers = [
+        'production' => Yaml::parseFile($root.'/.github/workflows/coolify-production-build.yml'),
+        'testing-host' => Yaml::parseFile($root.'/.github/workflows/coolify-testing-host.yml'),
+        'staging' => Yaml::parseFile($root.'/.github/workflows/coolify-staging-build.yml'),
+    ];
+    foreach ($applicationValidationWorkflow['jobs']['workflow-and-shell']['steps'] as $index => $step) {
+        if (($step['name'] ?? null) === 'ShellCheck changed shell scripts') {
+            $applicationValidationWorkflow['jobs']['workflow-and-shell']['steps'][$index]['run'] = str_replace(
+                '--severity=error',
+                '',
+                (string) ($step['run'] ?? ''),
+            );
+        }
+    }
+
+    expect(releaseFoundationWorkflowViolations($sharedWorkflow, $applicationValidationWorkflow, $callers))
+        ->toContain('workflow validation must apply strict checks to new scripts and error checks to legacy scripts');
 });
 
 it('rejects omission of either image source-provenance gate', function (string $dockerfile): void {

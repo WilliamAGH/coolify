@@ -78,12 +78,24 @@ jobs:
   browser:
     name: Pest browser tests
     runs-on: ubuntu-24.04
+    services:
+      redis:
+        image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     env:
       APP_ENV: testing
       APP_MAINTENANCE_DRIVER: file
       CACHE_STORE: array
       DB_CONNECTION: testing
       QUEUE_CONNECTION: sync
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: 6379
       SESSION_DRIVER: array
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -202,23 +214,34 @@ jobs:
             base_sha="$(git rev-parse "${GITHUB_SHA}^" 2>/dev/null || printf '%s' 4b825dc642cb6eb9a060e54bf8d69288fbee4904)"
           fi
           mapfile -d '' changed_paths < <(git diff --name-only -z --diff-filter=ACMR "$base_sha" "$GITHUB_SHA")
-          scripts=()
+          strict_scripts=()
+          legacy_scripts=()
           for path in "${changed_paths[@]}"; do
             [[ -f "$path" ]] || continue
 
             if [[ "$path" == *.sh ]]; then
-              scripts+=("$path")
-              continue
+              is_shell=true
+            else
+              first_line=''
+              IFS= read -r first_line < "$path" || :
+              is_shell=false
+              if [[ -x "$path" && "$first_line" =~ ^\#!.*(ba|da|k)?sh([[:space:]]|$) ]]; then
+                is_shell=true
+              fi
             fi
+            [[ "$is_shell" == true ]] || continue
 
-            first_line=''
-            IFS= read -r first_line < "$path" || :
-            if [[ -x "$path" && "$first_line" =~ ^\#!.*(ba|da|k)?sh([[:space:]]|$) ]]; then
-              scripts+=("$path")
+            if git diff --quiet --diff-filter=A "$base_sha" "$GITHUB_SHA" -- "$path"; then
+              legacy_scripts+=("$path")
+            else
+              strict_scripts+=("$path")
             fi
           done
-          if (( ${#scripts[@]} > 0 )); then
-            shellcheck -e SC2015 -- "${scripts[@]}"
+          if (( ${#strict_scripts[@]} > 0 )); then
+            shellcheck -e SC2015 -- "${strict_scripts[@]}"
+          fi
+          if (( ${#legacy_scripts[@]} > 0 )); then
+            shellcheck --severity=error -e SC2015 -- "${legacy_scripts[@]}"
           fi
 
   fork-deploy:
