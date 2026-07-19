@@ -27,7 +27,13 @@ class EmailChannel
         try {
             // Get team and validate membership before proceeding
             $teamId = data_get($notifiable, 'id');
-            $members = ($this->teamModel ?? new Team)->find($teamId)->members;
+            $team = ($this->teamModel ?? new Team)->find($teamId);
+
+            if ($team === null) {
+                throw new NonReportableException('Unable to send email notification because the team no longer exists.');
+            }
+
+            $members = $team->members;
 
             $useInstanceEmailSettings = $notifiable->emailNotificationSettings->use_instance_email_settings;
             $isTransactionalEmail = data_get($notification, 'isTransactionalEmail', false);
@@ -160,6 +166,8 @@ class EmailChannel
         } catch (TransporterException $e) {
             send_internal_notification("Resend Transport Error: {$e->getMessage()}");
             throw new Exception('Unable to connect to Resend API. Please check your internet connection and try again.', 0, $e);
+        } catch (NonReportableException $e) {
+            throw $e;
         } catch (\Throwable $e) {
             // Check if this is a Resend domain verification error on cloud instances
             if (isCloud() && str_contains($e->getMessage(), 'domain is not verified')) {
