@@ -1,0 +1,2463 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 077
+
+PROGRAM=$(basename "$0")
+TEST_MODE=${FORK_DEPLOY_TEST_MODE:-false}
+ROOT=
+SOURCE_DIR=
+STATE_DIR=
+RELEASES_DIR=
+ACTIVATIONS_DIR=
+UNDO_DIRS_DIR=
+CURRENT_FILE=
+HISTORY_FILE=
+LOCK_FILE=
+PENDING_FILE=
+FORWARD_RECOVERY_FILE=
+REGISTRY=docker.iocloudhost.net
+MAIN_REPOSITORY=$REGISTRY/williamagh/coolify
+REALTIME_REPOSITORY=$REGISTRY/williamagh/coolify-realtime
+POSTGRES_REPOSITORY=docker.io/library/postgres
+REDIS_REPOSITORY=docker.io/library/redis
+GITHUB_RAW_BASE=https://raw.githubusercontent.com/WilliamAGH/coolify
+DISABLED_VERSIONS_URL=http://127.0.0.1:9/fork-deploy-disabled/versions.json
+DISABLED_UPGRADE_SCRIPT_URL=http://127.0.0.1:9/fork-deploy-disabled/upgrade.sh
+DISABLED_RELEASES_URL=http://127.0.0.1:9/fork-deploy-disabled/releases
+readonly PRODUCTION_MANIFEST_PUBLIC_KEY=/etc/coolify-fork/release-signing-ed25519.pub
+readonly PRODUCTION_MANIFEST_KEY_ID=sha256:d6c0ad5138ad9c35b6a69e50296e2b127add3df63462dfaa001f3fd7da8fa6e8
+DRY_RUN=false
+ACTION=
+VERSION=
+MAIN_DIGEST=
+REALTIME_DIGEST=
+POSTGRES_DIGEST=
+REDIS_DIGEST=
+SOURCE_REVISION=
+HEALTH_ATTEMPTS=${COOLIFY_HEALTH_ATTEMPTS:-60}
+AUTHORIZED_KEYS=
+MANIFEST_INPUT=
+OFFLINE_MANIFEST=
+MANIFEST_PATH=
+MANIFEST_PUBLIC_KEY=
+MANIFEST_SIGNATURE=
+MANIFEST_KEY_ID=
+MANIFEST_TRUST_KEY_ID=
+TRUST_PUBLIC_KEY=
+SOURCE_TAG=
+MAIN_INDEX_DIGEST=
+REALTIME_INDEX_DIGEST=
+POSTGRES_MAJOR=
+REDIS_MAJOR=
+MAIN_IMAGE=
+REALTIME_IMAGE=
+POSTGRES_IMAGE=
+REDIS_IMAGE=
+RECOVERY_ARMED=false
+RECOVERY_HANDLED=false
+CANDIDATE_STARTED=false
+DEPLOYMENT_UNDO=
+DEPLOYMENT_MIGRATION_FINGERPRINT=
+DEPLOYMENT_PRESTART_UNDO_SHA256=
+PREVIOUS_CURRENT_VERSION=
+UPDATE_FROM_VERSION=
+DEPLOYMENT_STAGING=
+
+test_mode() {
+    [[ $TEST_MODE == true ]]
+}
+
+validate_absolute_path() {
+    local path=$1 label=$2 component
+    local -a components
+    local IFS=/
+
+    [[ $path == /* && $path != / ]] || die "$label must be an absolute non-root path"
+    [[ $path != *$'\n'* && $path != *$'\r'* && $path != *'//' && ${path: -1} != / ]] || die "$label contains an unsafe path component"
+    read -r -a components <<<"${path#/}"
+    for component in "${components[@]}"; do
+        [[ -n $component && $component != . && $component != .. ]] || die "$label contains an unsafe path component"
+    done
+}
+
+assert_no_symlink_ancestors() {
+    local path=$1 label=$2 component current=
+    local -a components
+    local IFS=/
+
+    validate_absolute_path "$path" "$label"
+    read -r -a components <<<"${path#/}"
+    for component in "${components[@]}"; do
+        current=$current/$component
+        [[ ! -L $current ]] || die "$label contains a symbolic link: $current"
+        if [[ $current != "$path" && -e $current && ! -d $current ]]; then
+            die "$label has a non-directory ancestor: $current"
+        fi
+    done
+}
+
+require_regular_file() {
+    local path=$1 label=$2
+
+    assert_no_symlink_ancestors "$path" "$label"
+    [[ -f $path && ! -L $path ]] || die "$label must be a regular non-symlink file: $path"
+    [[ $(file_link_count "$path") == 1 ]] || die "$label must not be hardlinked: $path"
+}
+
+file_link_count() {
+    local path=$1 count
+
+    if count=$(stat -c '%h' "$path" 2>/dev/null); then
+        :
+    else
+        count=$(stat -f '%l' "$path" 2>/dev/null) || die "could not inspect file link count: $path"
+    fi
+    [[ $count =~ ^[1-9][0-9]*$ ]] || die "invalid file link count: $path"
+    printf '%s\n' "$count"
+}
+
+file_mode() {
+    local path=$1 mode
+
+    if mode=$(stat -c '%a' "$path" 2>/dev/null); then
+        :
+    else
+        mode=$(stat -f '%Lp' "$path" 2>/dev/null) || die "could not inspect file mode: $path"
+    fi
+    printf '%s\n' "$mode"
+}
+
+file_owner() {
+    local path=$1 owner
+
+    if owner=$(stat -c '%u:%g' "$path" 2>/dev/null); then
+        :
+    else
+        owner=$(stat -f '%u:%g' "$path" 2>/dev/null) || die "could not inspect file owner: $path"
+    fi
+    printf '%s\n' "$owner"
+}
+
+require_directory_or_missing() {
+    local path=$1 label=$2
+
+    assert_no_symlink_ancestors "$path" "$label"
+    if [[ -e $path ]]; then
+        [[ -d $path && ! -L $path ]] || die "$label must be a directory: $path"
+    fi
+}
+
+configure_paths() {
+    case $TEST_MODE in
+        true|false) ;;
+        *) die 'FORK_DEPLOY_TEST_MODE must be exactly true when test-only paths are enabled' ;;
+    esac
+    if test_mode; then
+        ROOT=${COOLIFY_ROOT:-}
+        AUTHORIZED_KEYS=${COOLIFY_AUTHORIZED_KEYS:-}
+        [[ -n $ROOT && -n $AUTHORIZED_KEYS ]] || die 'COOLIFY_ROOT and COOLIFY_AUTHORIZED_KEYS are required when FORK_DEPLOY_TEST_MODE=true'
+    else
+        [[ -z ${COOLIFY_ROOT:-} || $COOLIFY_ROOT == /data/coolify ]] || die 'production Coolify root must canonicalize exactly to /data/coolify'
+        [[ -z ${COOLIFY_AUTHORIZED_KEYS:-} || $COOLIFY_AUTHORIZED_KEYS == /root/.ssh/authorized_keys ]] || die 'production authorized_keys path must be exactly /root/.ssh/authorized_keys'
+        ROOT=/data/coolify
+        AUTHORIZED_KEYS=/root/.ssh/authorized_keys
+    fi
+    assert_no_symlink_ancestors "$ROOT" 'Coolify root'
+    SOURCE_DIR=$ROOT/source
+    STATE_DIR=$ROOT/fork-deploy
+    RELEASES_DIR=$STATE_DIR/releases
+    ACTIVATIONS_DIR=$STATE_DIR/activations
+    UNDO_DIRS_DIR=$STATE_DIR/prestart
+    CURRENT_FILE=$STATE_DIR/current
+    HISTORY_FILE=$STATE_DIR/history.tsv
+    LOCK_FILE=$STATE_DIR/deploy.lock
+    PENDING_FILE=$STATE_DIR/pending-candidate
+    FORWARD_RECOVERY_FILE=$STATE_DIR/forward-recovery
+    validate_authorized_keys_path
+}
+
+usage() {
+    cat <<'EOF'
+Usage:
+  fork-deploy install|update (--manifest HTTPS_URL | --offline-manifest ABSOLUTE_PATH) [--dry-run]
+  fork-deploy rollback --version VERSION [--dry-run]
+  fork-deploy repair [--dry-run]
+  fork-deploy recover-abort
+  fork-deploy recover-forward
+  fork-deploy status
+  fork-deploy verify
+  fork-deploy trust --public-key ABSOLUTE_PATH
+
+Install and update inputs are accepted only from a detached-signature-verified release manifest.
+In production the manifest signature must verify against
+/etc/coolify-fork/release-signing-ed25519.pub.
+Offline manifests provide only the signed manifest and detached signature; release assets still
+require HTTPS unless restoring a previously recorded verified release.
+The production-only trust action installs the built-in expected Ed25519 public key locally.
+Rollback targets must be releases previously verified and recorded by this tool.
+Recover-abort is allowed only for a durable pending state that proves the candidate never started.
+Recover-forward retries the exact signed candidate after startup was declared and preserves all
+writes accepted by that candidate. Pre-start undo is forbidden after candidate startup.
+Existing unmanaged state is never adopted by this release tool; migrate it through the
+control-plane enrollment path before installing a managed release.
+EOF
+}
+
+die() {
+    printf 'ERROR: %s\n' "$*" >&2
+    if [[ $RECOVERY_ARMED == true && $RECOVERY_HANDLED == false ]]; then
+        deployment_failure 1
+    fi
+    exit 1
+}
+
+note() {
+    printf '%s\n' "$*"
+}
+
+run() {
+    if "$DRY_RUN"; then
+        printf 'PLAN:'
+        printf ' %q' "$@"
+        printf '\n'
+        return 0
+    fi
+    "$@"
+}
+
+validate_version() {
+    [[ $1 =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-fork(\.[1-9][0-9]*)?$ ]] \
+        || die "invalid fork release version: $1"
+}
+
+fd_numeric_compare() {
+    local left=$1 right=$2
+
+    if ((${#left} < ${#right})); then
+        printf '%s\n' -1
+    elif ((${#left} > ${#right})); then
+        printf '%s\n' 1
+    elif [[ $left < $right ]]; then
+        printf '%s\n' -1
+    elif [[ $left > $right ]]; then
+        printf '%s\n' 1
+    else
+        printf '%s\n' 0
+    fi
+}
+
+fd_version_compare() {
+    local left=$1 right=$2 left_suffix right_suffix comparison index
+    local -a left_parts right_parts
+
+    validate_version "$left"
+    validate_version "$right"
+    [[ $left =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)-fork(\.([1-9][0-9]*))?$ ]]
+    left_parts=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}")
+    left_suffix=${BASH_REMATCH[5]:-}
+    [[ $right =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)-fork(\.([1-9][0-9]*))?$ ]]
+    right_parts=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}")
+    right_suffix=${BASH_REMATCH[5]:-}
+    for index in 0 1 2; do
+        comparison=$(fd_numeric_compare "${left_parts[index]}" "${right_parts[index]}")
+        [[ $comparison == 0 ]] || {
+            printf '%s\n' "$comparison"
+            return 0
+        }
+    done
+    if [[ -z $left_suffix && -n $right_suffix ]]; then
+        printf '%s\n' -1
+    elif [[ -n $left_suffix && -z $right_suffix ]]; then
+        printf '%s\n' 1
+    elif [[ -z $left_suffix ]]; then
+        printf '%s\n' 0
+    else
+        fd_numeric_compare "$left_suffix" "$right_suffix"
+    fi
+}
+
+validate_digest() {
+    [[ $1 =~ ^sha256:[0-9a-f]{64}$ ]] || die "invalid sha256 digest: $1"
+}
+
+validate_revision() {
+    [[ $1 =~ ^[0-9a-f]{40}$ ]] || die "source revision must be a full 40-character lowercase Git SHA"
+}
+
+validate_positive_integer() {
+    [[ $1 =~ ^[1-9][0-9]*$ ]] || die "COOLIFY_HEALTH_ATTEMPTS must be a positive integer"
+}
+
+validate_port() {
+    local port=$1 name=$2
+
+    if [[ ! $port =~ ^[1-9][0-9]{0,4}$ ]] || ((10#$port > 65535)); then
+        die "$name must be an integer from 1 through 65535"
+    fi
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+host_platform() {
+    local machine
+    machine=$(uname -m)
+    case $machine in
+        x86_64) printf 'linux/amd64\n' ;;
+        aarch64|arm64) printf 'linux/arm64\n' ;;
+        *) die "unsupported host architecture: $machine" ;;
+    esac
+}
+
+preflight() {
+    local raw_version version major minor patch
+
+    validate_authorized_keys_path
+    [[ $(uname -s) == Linux ]] || die 'Coolify deployment requires Linux'
+    if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+        if [[ $TEST_MODE != true || ${COOLIFY_ALLOW_NON_ROOT:-false} != true ]]; then
+            die 'run as root (or set COOLIFY_ALLOW_NON_ROOT=true only with FORK_DEPLOY_TEST_MODE=true)'
+        fi
+    fi
+    for command in docker curl sha256sum flock awk grep openssl ssh-keygen mktemp stat find \
+        sed date sort wc tr; do
+        require_command "$command"
+    done
+    docker info >/dev/null 2>&1 || die 'Docker daemon is unavailable'
+    raw_version=$(docker compose version --short 2>/dev/null) || die 'Docker Compose v2 is unavailable'
+    version=${raw_version#v}
+    [[ $version =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || die "could not parse Docker Compose version: $raw_version"
+    major=${BASH_REMATCH[1]}
+    minor=${BASH_REMATCH[2]}
+    patch=${BASH_REMATCH[3]}
+    if ((10#$major < 2 || (10#$major == 2 && 10#$minor < 24) || (10#$major == 2 && 10#$minor == 24 && 10#$patch < 4))); then
+        die "Docker Compose 2.24.4 or later is required for !override; found $raw_version"
+    fi
+    host_platform >/dev/null
+}
+
+validate_authorized_keys_path() {
+    if ! test_mode; then
+        [[ $AUTHORIZED_KEYS == /root/.ssh/authorized_keys ]] || die 'production authorized_keys path must be exactly /root/.ssh/authorized_keys'
+    fi
+    assert_no_symlink_ancestors "$AUTHORIZED_KEYS" 'authorized_keys path'
+    if [[ -e $AUTHORIZED_KEYS ]]; then
+        require_regular_file "$AUTHORIZED_KEYS" 'authorized_keys file'
+    fi
+}
+
+ensure_secure_directory() {
+    local path=$1 label=$2
+
+    require_directory_or_missing "$path" "$label"
+    if [[ ! -e $path ]]; then
+        mkdir -p "$path"
+    fi
+    require_directory_or_missing "$path" "$label"
+    chmod 0700 "$path"
+}
+
+ensure_state_layout() {
+    ensure_secure_directory "$ROOT" 'Coolify root'
+    chown root:root "$ROOT"
+    chmod 0711 "$ROOT"
+    ensure_secure_directory "$STATE_DIR" 'fork-deploy state directory'
+    chown root:root "$STATE_DIR"
+    ensure_secure_directory "$RELEASES_DIR" 'fork-deploy releases directory'
+    ensure_secure_directory "$ACTIVATIONS_DIR" 'fork-deploy activations directory'
+    ensure_secure_directory "$UNDO_DIRS_DIR" 'fork-deploy pre-start directory'
+}
+
+state_file_safe_or_missing() {
+    local path=$1 label=$2
+
+    assert_no_symlink_ancestors "$path" "$label"
+    if [[ -e $path || -L $path ]]; then
+        require_regular_file "$path" "$label"
+    fi
+}
+
+acquire_lock() {
+    if "$DRY_RUN"; then
+        return 0
+    fi
+    ensure_state_layout
+    state_file_safe_or_missing "$LOCK_FILE" 'deployment lock'
+    if [[ ! -e $LOCK_FILE && ! -L $LOCK_FILE ]]; then
+        (
+            umask 077
+            set -C
+            : >"$LOCK_FILE"
+        ) 2>/dev/null || true
+    fi
+    require_regular_file "$LOCK_FILE" 'deployment lock'
+    chmod 0600 "$LOCK_FILE"
+    exec 9>>"$LOCK_FILE"
+    flock -n 9 || die 'another fork-deploy operation is already running'
+}
+
+image_ref_main() { printf '%s@%s\n' "$MAIN_REPOSITORY" "$MAIN_DIGEST"; }
+image_ref_realtime() { printf '%s@%s\n' "$REALTIME_REPOSITORY" "$REALTIME_DIGEST"; }
+image_ref_postgres() { printf '%s@%s\n' "$POSTGRES_REPOSITORY" "$POSTGRES_DIGEST"; }
+image_ref_redis() { printf '%s@%s\n' "$REDIS_REPOSITORY" "$REDIS_DIGEST"; }
+
+validate_image_for_host() {
+    local ref=$1 expected_platform=$2 actual_os actual_arch actual_platform
+    run docker pull "$ref"
+    if "$DRY_RUN"; then return 0; fi
+    actual_os=$(docker image inspect --format '{{.Os}}' "$ref")
+    actual_arch=$(docker image inspect --format '{{.Architecture}}' "$ref")
+    actual_platform=$actual_os/$actual_arch
+    [[ $actual_platform == "$expected_platform" ]] || die "image $ref is $actual_platform, expected $expected_platform"
+}
+
+download_asset() {
+    local name=$1 destination=$2 url
+    url=$GITHUB_RAW_BASE/$SOURCE_REVISION/$name
+    run curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "$url" --output "$destination"
+}
+
+write_overlay() {
+    local path=$1 main_ref realtime_ref
+    main_ref=$(image_ref_main)
+    realtime_ref=$(image_ref_realtime)
+    if "$DRY_RUN"; then
+        note "PLAN: write immutable image overlay $path"
+        return 0
+    fi
+    {
+        printf 'services:\n'
+        printf '  coolify:\n'
+        printf '    image: "%s"\n' "$main_ref"
+        printf '    ports: !override\n'
+        printf '%s\n' "      - \"127.0.0.1:\${APP_PORT:-8000}:8080\""
+        printf '    environment:\n'
+        printf '      AUTOUPDATE: "false"\n'
+        printf '  soketi:\n'
+        printf '    image: "%s"\n' "$realtime_ref"
+        printf '    ports: !override\n'
+        printf '%s\n' "      - \"127.0.0.1:\${SOKETI_PORT:-6001}:6001\""
+        printf '      - "127.0.0.1:6002:6002"\n'
+        printf '  postgres:\n'
+        printf '    image: "%s"\n' "$(image_ref_postgres)"
+        printf '  redis:\n'
+        printf '    image: "%s"\n' "$(image_ref_redis)"
+    } >"$path"
+    chmod 600 "$path"
+}
+
+set_env_value() {
+    local file=$1 key=$2 value=$3 temporary
+    temporary=$file.tmp.$$
+    awk -F= -v key="$key" -v value="$value" '
+        BEGIN { written=0 }
+        $1 == key { if (!written) print key "=" value; written=1; next }
+        { print }
+        END { if (!written) print key "=" value }
+    ' "$file" >"$temporary"
+    chmod --reference="$file" "$temporary" 2>/dev/null || chmod 600 "$temporary"
+    mv "$temporary" "$file"
+}
+
+env_value() {
+    local file=$1 key=$2 value
+
+    require_regular_file "$file" 'environment file'
+    value=$(awk -F= -v wanted="$key" '
+        $1 == wanted {
+            count++
+            value = substr($0, index($0, "=") + 1)
+        }
+        END {
+            if (count != 1) {
+                exit 1
+            }
+            print value
+        }
+    ' "$file") || die "environment field is missing or duplicated: $key"
+    printf '%s\n' "$value"
+}
+
+optional_env_value() {
+    local file=$1 key=$2 value
+
+    require_regular_file "$file" 'environment file'
+    value=$(awk -F= -v wanted="$key" '
+        $1 == wanted {
+            count++
+            value = substr($0, index($0, "=") + 1)
+        }
+        END {
+            if (count > 1) {
+                exit 1
+            }
+            if (count == 1) {
+                print value
+            }
+        }
+    ' "$file") || die "environment field is duplicated: $key"
+    printf '%s\n' "$value"
+}
+
+read_field() {
+    local file=$1 key=$2 label=$3 value
+
+    [[ $key =~ ^[A-Z0-9_]+$ ]] || die "invalid field name for $label: $key"
+    require_regular_file "$file" "$label"
+    value=$(awk -F= -v wanted="$key" '
+        $1 == wanted {
+            count++
+            value = substr($0, index($0, "=") + 1)
+        }
+        END {
+            if (count != 1) {
+                exit 1
+            }
+            print value
+        }
+    ' "$file") || die "$label field is missing or duplicated: $key"
+    printf '%s\n' "$value"
+}
+
+bootstrap_directories() {
+    local directory
+
+    if "$DRY_RUN"; then
+        note "PLAN: securely create and validate Coolify data directories below $ROOT"
+        return 0
+    fi
+    for directory in \
+        "$ROOT" "$SOURCE_DIR" "$ROOT/ssh" "$ROOT/ssh/keys" "$ROOT/ssh/mux" \
+        "$ROOT/applications" "$ROOT/databases" "$ROOT/backups" "$ROOT/services" \
+        "$ROOT/proxy" "$ROOT/proxy/dynamic" "$ROOT/sentinel"; do
+        require_directory_or_missing "$directory" 'Coolify data directory'
+        if [[ ! -e $directory ]]; then
+            mkdir "$directory"
+        fi
+        require_directory_or_missing "$directory" 'Coolify data directory'
+    done
+}
+
+fd_assert_tree_safe_for_privileged_mutation() {
+    local path=$1 label=$2 discovered
+
+    require_directory_or_missing "$path" "$label"
+    [[ -d $path ]] || return 0
+    discovered=$(find "$path" -xdev -type l -print -quit)
+    [[ -z $discovered ]] || die "$label contains a symbolic link: $discovered"
+    discovered=$(find "$path" -xdev -type f -links +1 -print -quit)
+    [[ -z $discovered ]] || die "$label contains a hardlinked file: $discovered"
+}
+
+enforce_data_permissions() {
+    local directory
+    if "$DRY_RUN"; then note "PLAN: enforce 9999:root ownership and 0700 modes below $ROOT"; return 0; fi
+    chown root:root "$ROOT"
+    chmod 0711 "$ROOT"
+    for directory in source applications databases backups services proxy sentinel; do
+        [[ -e $ROOT/$directory ]] || continue
+        fd_assert_tree_safe_for_privileged_mutation "$ROOT/$directory" "Coolify $directory tree"
+        chown -R 9999:root "$ROOT/$directory"
+        chmod -R 0700 "$ROOT/$directory"
+        fd_assert_tree_safe_for_privileged_mutation "$ROOT/$directory" "Coolify $directory tree"
+    done
+    fd_release_ssh_runtime_ownership
+}
+
+fd_assert_locked_ssh_directory() {
+    local path=$1 label=$2
+
+    require_directory_or_missing "$path" "$label"
+    [[ -d $path ]] || die "$label is missing: $path"
+    [[ $(file_mode "$path") == 700 ]] || die "$label must have mode 0700 during privileged SSH mutation"
+    if ! test_mode; then
+        [[ $(file_owner "$path") == 0:0 ]] \
+            || die "$label must be owned by root:root during privileged SSH mutation"
+    fi
+}
+
+fd_lock_localhost_ssh_directories() {
+    local ssh_directory=$ROOT/ssh key_directory=$ROOT/ssh/keys swap_target
+
+    require_directory_or_missing "$ssh_directory" 'localhost SSH directory'
+    [[ -d $ssh_directory ]] || mkdir "$ssh_directory"
+    chown root:root "$ssh_directory"
+    chmod 0700 "$ssh_directory"
+    fd_assert_locked_ssh_directory "$ssh_directory" 'localhost SSH directory'
+
+    require_directory_or_missing "$key_directory" 'localhost SSH key directory'
+    [[ -d $key_directory ]] || mkdir "$key_directory"
+    if test_mode && [[ ${FORK_DEPLOY_TEST_SWAP_SSH_KEYS_DURING_LOCK:-false} == true ]]; then
+        swap_target=${FORK_DEPLOY_TEST_SSH_SWAP_TARGET:-}
+        validate_absolute_path "$swap_target" 'test SSH swap target'
+        mv "$key_directory" "$key_directory.raced"
+        ln -s "$swap_target" "$key_directory"
+    fi
+    require_directory_or_missing "$key_directory" 'localhost SSH key directory'
+    chown root:root "$key_directory"
+    chmod 0700 "$key_directory"
+    fd_assert_locked_ssh_directory "$key_directory" 'localhost SSH key directory'
+}
+
+fd_release_ssh_runtime_ownership() {
+    local ssh_directory=$ROOT/ssh
+
+    require_directory_or_missing "$ssh_directory" 'localhost SSH directory'
+    [[ -d $ssh_directory ]] || die "localhost SSH directory is missing: $ssh_directory"
+    if ! test_mode && [[ $(file_owner "$ssh_directory") == 9999:0 ]]; then
+        [[ $(file_mode "$ssh_directory") == 700 ]] \
+            || die 'localhost SSH directory must have mode 0700 for runtime ownership'
+        fd_assert_tree_safe_for_privileged_mutation "$ssh_directory" 'Coolify ssh tree'
+        return 0
+    fi
+    fd_assert_locked_ssh_directory "$ssh_directory" 'localhost SSH directory'
+    fd_assert_tree_safe_for_privileged_mutation "$ssh_directory" 'Coolify ssh tree'
+    find "$ssh_directory" -xdev -mindepth 1 -type d -exec chmod 0700 {} +
+    find "$ssh_directory" -xdev -mindepth 1 -depth -exec chown 9999:root {} +
+    chown 9999:root "$ssh_directory"
+    chmod 0700 "$ssh_directory"
+    fd_assert_tree_safe_for_privileged_mutation "$ssh_directory" 'Coolify ssh tree'
+}
+
+adopt_localhost_ssh_key() {
+    local private_key=$ROOT/ssh/keys/id.root@host.docker.internal public_key authorized_directory
+    authorized_directory=${AUTHORIZED_KEYS%/*}
+    validate_authorized_keys_path
+    if "$DRY_RUN"; then note "PLAN: create or adopt localhost SSH identity $private_key without rotating it"; return 0; fi
+    fd_assert_locked_ssh_directory "$ROOT/ssh" 'localhost SSH directory'
+    fd_assert_locked_ssh_directory "$ROOT/ssh/keys" 'localhost SSH key directory'
+    require_directory_or_missing "$authorized_directory" 'authorized_keys directory'
+    if [[ ! -e $authorized_directory ]]; then
+        mkdir -p "$authorized_directory"
+    fi
+    require_directory_or_missing "$authorized_directory" 'authorized_keys directory'
+    chown root:root "$authorized_directory"
+    chmod 0700 "$authorized_directory"
+    if ! test_mode; then
+        [[ $(file_owner "$authorized_directory") == 0:0 ]] \
+            || die 'authorized_keys directory must remain owned by root:root during privileged SSH mutation'
+    fi
+    assert_no_symlink_ancestors "$AUTHORIZED_KEYS" 'authorized_keys path'
+    touch "$AUTHORIZED_KEYS"
+    require_regular_file "$AUTHORIZED_KEYS" 'authorized_keys file'
+    chmod 0600 "$AUTHORIZED_KEYS"
+    assert_no_symlink_ancestors "$private_key" 'localhost Coolify SSH private key'
+    if [[ ! -e $private_key ]]; then
+        ssh-keygen -t ed25519 -a 100 -f "$private_key" -q -N '' -C coolify
+    fi
+    require_regular_file "$private_key" 'localhost Coolify SSH private key'
+    public_key=$(ssh-keygen -y -f "$private_key") || die 'could not derive the localhost Coolify public key'
+    [[ -n $public_key ]] || die 'localhost Coolify public key is empty'
+    if ! awk -v key="$public_key" '($1 " " $2) == key {found=1} END {exit !found}' "$AUTHORIZED_KEYS"; then
+        printf '%s coolify\n' "$public_key" >>"$AUTHORIZED_KEYS"
+    fi
+    chown 9999:root "$private_key"
+    chmod 0600 "$private_key"
+}
+
+wait_for_health() {
+    local attempt container status
+    for ((attempt = 1; attempt <= HEALTH_ATTEMPTS; attempt++)); do
+        for container in coolify coolify-db coolify-redis coolify-realtime; do
+            status=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container" 2>/dev/null || true)
+            [[ $status == healthy || $status == running ]] || break
+        done
+        if [[ $container == coolify-realtime && ( $status == healthy || $status == running ) ]]; then return 0; fi
+        sleep 2
+    done
+    note "ERROR: containers did not become healthy after $HEALTH_ATTEMPTS checks" >&2
+    return 1
+}
+
+fd_parse_args() {
+    (($# > 0)) || {
+        usage >&2
+        exit 2
+    }
+    ACTION=$1
+    shift
+    case $ACTION in
+        install|update|rollback|repair|recover-abort|recover-forward|status|trust|verify) ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *) die "unknown action: $ACTION" ;;
+    esac
+    while (($# > 0)); do
+        case $1 in
+            --manifest)
+                (($# >= 2)) || die '--manifest requires an HTTPS URL'
+                MANIFEST_INPUT=$2
+                shift 2
+                ;;
+            --offline-manifest)
+                (($# >= 2)) || die '--offline-manifest requires an absolute path'
+                OFFLINE_MANIFEST=$2
+                shift 2
+                ;;
+            --version)
+                (($# >= 2)) || die '--version requires a value'
+                VERSION=$2
+                shift 2
+                ;;
+            --public-key)
+                (($# >= 2)) || die '--public-key requires an absolute path'
+                [[ -z $TRUST_PUBLIC_KEY ]] || die '--public-key may be supplied only once'
+                TRUST_PUBLIC_KEY=$2
+                shift 2
+                ;;
+            --dry-run|--plan)
+                DRY_RUN=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            --main-digest|--realtime-digest|--postgres-digest|--redis-digest|--source-revision)
+                die "$1 is not accepted: a signed release manifest is the only source of deploy inputs"
+                ;;
+            *) die "unknown argument: $1" ;;
+        esac
+    done
+    if [[ $ACTION != trust ]]; then
+        validate_positive_integer "$HEALTH_ATTEMPTS"
+    fi
+    case $ACTION in
+        install|update)
+            [[ -n $MANIFEST_INPUT || -n $OFFLINE_MANIFEST ]] || die "$ACTION requires --manifest or --offline-manifest"
+            [[ -z $MANIFEST_INPUT || -z $OFFLINE_MANIFEST ]] || die 'use only one of --manifest and --offline-manifest'
+            [[ -z $VERSION ]] || die 'deploy version must come from the signed release manifest'
+            [[ -z $TRUST_PUBLIC_KEY ]] || die "$ACTION does not accept --public-key"
+            ;;
+        rollback)
+            [[ -n $VERSION && -z $MANIFEST_INPUT && -z $OFFLINE_MANIFEST && -z $TRUST_PUBLIC_KEY ]] || die 'rollback requires only --version'
+            validate_version "$VERSION"
+            ;;
+        repair)
+            [[ -z $VERSION && -z $MANIFEST_INPUT && -z $OFFLINE_MANIFEST && -z $TRUST_PUBLIC_KEY ]] || die "$ACTION does not accept release arguments"
+            ;;
+        recover-abort|recover-forward|status|verify)
+            [[ -z $VERSION && -z $MANIFEST_INPUT && -z $OFFLINE_MANIFEST && -z $TRUST_PUBLIC_KEY && $DRY_RUN == false ]] \
+                || die "$ACTION does not accept release arguments or --dry-run"
+            ;;
+        trust)
+            [[ -n $TRUST_PUBLIC_KEY && -z $VERSION && -z $MANIFEST_INPUT && -z $OFFLINE_MANIFEST && $DRY_RUN == false ]] || die 'trust requires only --public-key ABSOLUTE_PATH'
+            ;;
+    esac
+}
+
+fd_assert_production_trust_parent() {
+    local path=$1 parent component current='' metadata owner mode
+    local -a components
+    local IFS=/
+
+    test_mode && return 0
+    parent=$(fd_parent "$path")
+    assert_no_symlink_ancestors "$parent" 'production release signing key directory'
+    require_directory_or_missing "$parent" 'production release signing key directory'
+    [[ -d $parent ]] || die 'production release signing key directory is missing'
+    read -r -a components <<<"${parent#/}"
+    for component in "${components[@]}"; do
+        current=$current/$component
+        metadata=$(stat -c '%u:%a' "$current") || die "could not inspect release signing trust path: $current"
+        owner=${metadata%%:*}
+        mode=${metadata#*:}
+        [[ $owner == 0 ]] || die "release signing trust path is not root-owned: $current"
+        (( (8#$mode & 022) == 0 )) || die "release signing trust path is group- or world-writable: $current"
+    done
+}
+
+fd_assert_production_trust_path() {
+    local path=$1 metadata owner mode
+
+    test_mode && return 0
+    fd_assert_production_trust_parent "$path"
+    assert_no_symlink_ancestors "$path" 'production release signing key'
+    require_regular_file "$path" 'production release signing key'
+    metadata=$(stat -c '%u:%a' "$path") || die "could not inspect release signing trust path: $path"
+    owner=${metadata%%:*}
+    mode=${metadata#*:}
+    [[ $owner == 0 ]] || die 'production release signing key is not root-owned'
+    [[ $mode == 644 ]] || die 'production release signing key must have mode 0644'
+}
+
+fd_manifest_key_id() {
+    local key=$1 key_hash
+
+    openssl pkey -pubin -in "$key" -text_pub -noout | grep -F 'ED25519 Public-Key' >/dev/null \
+        || die 'release signing key must be an Ed25519 public key'
+    key_hash=$(openssl pkey -pubin -in "$key" -pubout -outform DER | sha256sum | awk '{print $1}') \
+        || die 'could not derive the release signing key identifier'
+    [[ $key_hash =~ ^[0-9a-f]{64}$ ]] || die 'release signing key identifier is invalid'
+    printf 'sha256:%s\n' "$key_hash"
+}
+
+fd_preflight_trust() {
+    local uid
+
+    case $TEST_MODE in
+        false) ;;
+        true) die 'trust is available only in production' ;;
+        *) die 'FORK_DEPLOY_TEST_MODE must be exactly true when test-only paths are enabled' ;;
+    esac
+    [[ $(uname -s) == Linux ]] || die 'production trust bootstrap requires Linux'
+    uid=$(command -p id -u) || die 'could not determine effective user ID'
+    [[ $uid == 0 ]] || die 'run trust as root'
+    for command in awk chmod chown cp grep mkdir mktemp mv openssl rm sha256sum stat; do
+        require_command "$command"
+    done
+}
+
+fd_install_production_trust_key() {
+    local source=$1 path=$PRODUCTION_MANIFEST_PUBLIC_KEY parent temporary key_id
+
+    test_mode && die 'trust is available only in production'
+    validate_absolute_path "$source" 'release signing public key'
+    require_regular_file "$source" 'release signing public key'
+    parent=$(fd_parent "$path")
+    assert_no_symlink_ancestors "$path" 'production release signing key'
+    require_directory_or_missing "$parent" 'production release signing key directory'
+    if [[ ! -e $parent ]]; then
+        mkdir -p "$parent"
+    fi
+    fd_assert_production_trust_parent "$path"
+    state_file_safe_or_missing "$path" 'production release signing key'
+    temporary=$(mktemp "$parent/.release-signing-ed25519.pub.XXXXXX")
+    chmod 0600 "$temporary"
+    if ! cp "$source" "$temporary"; then
+        rm -f "$temporary"
+        die 'could not copy release signing public key'
+    fi
+    key_id=$(fd_manifest_key_id "$temporary")
+    if [[ $key_id != "$PRODUCTION_MANIFEST_KEY_ID" ]]; then
+        rm -f "$temporary"
+        die "release signing public key does not match required KEY_ID $PRODUCTION_MANIFEST_KEY_ID"
+    fi
+    chown root:root "$temporary"
+    chmod 0644 "$temporary"
+    mv -f "$temporary" "$path"
+    fd_assert_production_trust_path "$path"
+    [[ $(fd_manifest_key_id "$path") == "$PRODUCTION_MANIFEST_KEY_ID" ]] || die 'installed release signing public key changed unexpectedly'
+    note "Installed production release signing key at $path"
+}
+
+fd_configure_manifest_trust() {
+    if test_mode; then
+        MANIFEST_PUBLIC_KEY=${FORK_DEPLOY_MANIFEST_PUBLIC_KEY:-}
+        [[ -n $MANIFEST_PUBLIC_KEY ]] || die 'FORK_DEPLOY_MANIFEST_PUBLIC_KEY is required in FORK_DEPLOY_TEST_MODE'
+    else
+        MANIFEST_PUBLIC_KEY=$PRODUCTION_MANIFEST_PUBLIC_KEY
+    fi
+    assert_no_symlink_ancestors "$MANIFEST_PUBLIC_KEY" 'release signing key'
+    require_regular_file "$MANIFEST_PUBLIC_KEY" 'release signing key'
+    fd_assert_production_trust_path "$MANIFEST_PUBLIC_KEY"
+    MANIFEST_TRUST_KEY_ID=$(fd_manifest_key_id "$MANIFEST_PUBLIC_KEY")
+    if ! test_mode; then
+        [[ $MANIFEST_TRUST_KEY_ID == "$PRODUCTION_MANIFEST_KEY_ID" ]] || die 'production release signing key does not match the built-in trusted key'
+    fi
+}
+
+fd_download_manifest() {
+    local destination
+
+    if [[ -n $OFFLINE_MANIFEST ]]; then
+        validate_absolute_path "$OFFLINE_MANIFEST" 'offline release manifest'
+        require_regular_file "$OFFLINE_MANIFEST" 'offline release manifest'
+        require_regular_file "$OFFLINE_MANIFEST.sig" 'offline release manifest signature'
+        if "$DRY_RUN"; then
+            MANIFEST_PATH=$OFFLINE_MANIFEST
+            MANIFEST_SIGNATURE=$OFFLINE_MANIFEST.sig
+            return 0
+        fi
+        destination=$(mktemp "$STATE_DIR/manifest.XXXXXX")
+        cp -p "$OFFLINE_MANIFEST" "$destination"
+        cp -p "$OFFLINE_MANIFEST.sig" "$destination.sig"
+        chmod 0600 "$destination" "$destination.sig"
+        MANIFEST_PATH=$destination
+        MANIFEST_SIGNATURE=$destination.sig
+        return 0
+    fi
+    [[ $MANIFEST_INPUT == https://* && $MANIFEST_INPUT != *$'\n'* && $MANIFEST_INPUT != *$'\r'* && $MANIFEST_INPUT != *' '* ]] || die '--manifest must be an HTTPS URL'
+    destination=$(mktemp "$STATE_DIR/manifest.XXXXXX")
+    chmod 0600 "$destination"
+    curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 "$MANIFEST_INPUT" --output "$destination"
+    curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 "$MANIFEST_INPUT.sig" --output "$destination.sig"
+    chmod 0600 "$destination.sig"
+    MANIFEST_PATH=$destination
+    MANIFEST_SIGNATURE=$destination.sig
+}
+
+fd_assign_manifest_field() {
+    local key=$1 value=$2
+
+    case $key in
+        SCHEMA) [[ $value == coolify-fork-release/v1 ]] || die 'unsupported release manifest schema' ;;
+        KEY_ID)
+            MANIFEST_KEY_ID=$value
+            [[ $MANIFEST_KEY_ID =~ ^sha256:[0-9a-f]{64}$ ]] || die 'invalid release manifest KEY_ID'
+            [[ $MANIFEST_KEY_ID == "$MANIFEST_TRUST_KEY_ID" ]] || die 'release manifest KEY_ID does not match the trusted Ed25519 public key'
+            ;;
+        VERSION) VERSION=$value; validate_version "$VERSION" ;;
+        SOURCE_REVISION) SOURCE_REVISION=$value; validate_revision "$SOURCE_REVISION" ;;
+        SOURCE_TAG) SOURCE_TAG=$value; [[ $SOURCE_TAG =~ ^[A-Za-z0-9._/-]{1,128}$ ]] || die 'invalid release manifest SOURCE_TAG' ;;
+        PLATFORM) [[ $value == "$(host_platform)" ]] || die "release manifest platform $value does not match host $(host_platform)" ;;
+        MAIN_IMAGE) MAIN_IMAGE=$value; [[ $MAIN_IMAGE == "$MAIN_REPOSITORY" ]] || die 'release manifest MAIN_IMAGE is not the approved Coolify repository' ;;
+        MAIN_INDEX_DIGEST) MAIN_INDEX_DIGEST=$value; validate_digest "$MAIN_INDEX_DIGEST" ;;
+        MAIN_PLATFORM_DIGEST) MAIN_DIGEST=$value; validate_digest "$MAIN_DIGEST" ;;
+        REALTIME_IMAGE) REALTIME_IMAGE=$value; [[ $REALTIME_IMAGE == "$REALTIME_REPOSITORY" ]] || die 'release manifest REALTIME_IMAGE is not the approved realtime repository' ;;
+        REALTIME_INDEX_DIGEST) REALTIME_INDEX_DIGEST=$value; validate_digest "$REALTIME_INDEX_DIGEST" ;;
+        REALTIME_PLATFORM_DIGEST) REALTIME_DIGEST=$value; validate_digest "$REALTIME_DIGEST" ;;
+        POSTGRES_IMAGE) POSTGRES_IMAGE=$value; [[ $POSTGRES_IMAGE == "$POSTGRES_REPOSITORY" ]] || die 'release manifest POSTGRES_IMAGE is not the approved PostgreSQL repository' ;;
+        POSTGRES_DIGEST) POSTGRES_DIGEST=$value; validate_digest "$POSTGRES_DIGEST" ;;
+        POSTGRES_MAJOR) POSTGRES_MAJOR=$value; [[ $POSTGRES_MAJOR =~ ^[1-9][0-9]*$ ]] || die 'invalid release manifest POSTGRES_MAJOR' ;;
+        REDIS_IMAGE) REDIS_IMAGE=$value; [[ $REDIS_IMAGE == "$REDIS_REPOSITORY" ]] || die 'release manifest REDIS_IMAGE is not the approved Redis repository' ;;
+        REDIS_DIGEST) REDIS_DIGEST=$value; validate_digest "$REDIS_DIGEST" ;;
+        REDIS_MAJOR) REDIS_MAJOR=$value; [[ $REDIS_MAJOR =~ ^[1-9][0-9]*$ ]] || die 'invalid release manifest REDIS_MAJOR' ;;
+        *SHA256) [[ $value =~ ^[0-9a-f]{64}$ ]] || die "invalid release manifest hash: $key"; printf -v "$key" '%s' "$value" ;;
+        *) die "unknown release manifest field: $key" ;;
+    esac
+}
+
+fd_load_manifest() {
+    local index=0 line key value
+    local -a expected=(
+        SCHEMA KEY_ID VERSION SOURCE_REVISION SOURCE_TAG PLATFORM
+        MAIN_IMAGE MAIN_INDEX_DIGEST MAIN_PLATFORM_DIGEST
+        REALTIME_IMAGE REALTIME_INDEX_DIGEST REALTIME_PLATFORM_DIGEST
+        POSTGRES_IMAGE POSTGRES_DIGEST POSTGRES_MAJOR
+        REDIS_IMAGE REDIS_DIGEST REDIS_MAJOR
+        MAIN_OCI_LABELS_SHA256 REALTIME_OCI_LABELS_SHA256
+        MAIN_SBOM_SHA256 REALTIME_SBOM_SHA256
+        MAIN_PROVENANCE_SHA256 REALTIME_PROVENANCE_SHA256
+        DOCKERFILE_MAIN_SHA256 DOCKERFILE_REALTIME_SHA256
+        COMPOSE_SHA256 COMPOSE_PROD_SHA256 COMPOSE_OVERLAY_SHA256
+        ENV_PRODUCTION_SHA256
+    )
+
+    require_regular_file "$MANIFEST_PATH" 'release manifest'
+    require_regular_file "$MANIFEST_SIGNATURE" 'release manifest signature'
+    openssl pkeyutl -verify -pubin -inkey "$MANIFEST_PUBLIC_KEY" -rawin -in "$MANIFEST_PATH" -sigfile "$MANIFEST_SIGNATURE" >/dev/null 2>&1 || die 'release manifest signature verification failed'
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line == *=* && $line != =* && $line != *$'\r'* ]] || die 'release manifest contains an invalid line'
+        key=${line%%=*}
+        value=${line#*=}
+        [[ $index -lt ${#expected[@]} && $key == "${expected[index]}" ]] || die "release manifest has an unexpected, duplicate, or out-of-order field: $key"
+        fd_assign_manifest_field "$key" "$value"
+        index=$((index + 1))
+    done <"$MANIFEST_PATH"
+    [[ $index -eq ${#expected[@]} ]] || die 'release manifest is incomplete'
+    [[ $SOURCE_TAG == "$VERSION" ]] || die 'release manifest SOURCE_TAG must exactly match VERSION'
+}
+
+fd_parent() {
+    printf '%s\n' "${1%/*}"
+}
+
+fd_atomic_write() {
+    local path=$1 label=$2 parent base temporary
+    shift 2
+
+    parent=$(fd_parent "$path")
+    require_directory_or_missing "$parent" "$label parent"
+    [[ -d $parent ]] || die "$label parent is missing: $parent"
+    state_file_safe_or_missing "$path" "$label"
+    base=$(basename "$path")
+    temporary=$(mktemp "$parent/.$base.XXXXXX")
+    chmod 0600 "$temporary"
+    printf '%s\n' "$@" >"$temporary"
+    mv -f "$temporary" "$path"
+    state_file_safe_or_missing "$path" "$label"
+}
+
+fd_atomic_copy() {
+    local source=$1 destination=$2 label=$3 parent base temporary
+
+    require_regular_file "$source" "$label source"
+    parent=$(fd_parent "$destination")
+    require_directory_or_missing "$parent" "$label destination parent"
+    [[ -d $parent ]] || die "$label destination parent is missing: $parent"
+    state_file_safe_or_missing "$destination" "$label destination"
+    base=$(basename "$destination")
+    temporary=$(mktemp "$parent/.$base.XXXXXX")
+    cp -p "$source" "$temporary"
+    chmod --reference="$source" "$temporary" 2>/dev/null || chmod 0600 "$temporary"
+    mv -f "$temporary" "$destination"
+    state_file_safe_or_missing "$destination" "$label destination"
+}
+
+fd_remove_file() {
+    local path=$1 label=$2
+
+    assert_no_symlink_ancestors "$path" "$label"
+    if [[ -e $path || -L $path ]]; then
+        [[ -f $path || -L $path ]] || die "$label must be a file when present: $path"
+        rm -f "$path"
+    fi
+}
+
+fd_release_dir() {
+    validate_version "$1"
+    printf '%s/%s\n' "$RELEASES_DIR" "$1"
+}
+
+fd_activation_file() {
+    validate_version "$1"
+    printf '%s/%s\n' "$ACTIVATIONS_DIR" "$1"
+}
+
+fd_verify_recorded_bundle() {
+    local dir=$1 asset expected actual
+
+    require_regular_file "$dir/release.manifest" 'recorded release manifest'
+    require_regular_file "$dir/release.manifest.sig" 'recorded release manifest signature'
+    openssl pkeyutl -verify -pubin -inkey "$MANIFEST_PUBLIC_KEY" -rawin -in "$dir/release.manifest" -sigfile "$dir/release.manifest.sig" >/dev/null 2>&1 || die 'recorded release manifest signature verification failed'
+    MANIFEST_PATH=$dir/release.manifest
+    MANIFEST_SIGNATURE=$dir/release.manifest.sig
+    fd_load_manifest
+    for asset in docker-compose.yml docker-compose.prod.yml docker-compose.custom.yml .env.production; do
+        case $asset in
+            docker-compose.yml) expected=$COMPOSE_SHA256 ;;
+            docker-compose.prod.yml) expected=$COMPOSE_PROD_SHA256 ;;
+            docker-compose.custom.yml) expected=$COMPOSE_OVERLAY_SHA256 ;;
+            .env.production) expected=$ENV_PRODUCTION_SHA256 ;;
+        esac
+        require_regular_file "$dir/$asset" "recorded release asset $asset"
+        actual=$(sha256sum "$dir/$asset" | awk '{print $1}')
+        [[ $actual == "$expected" ]] || die "recorded release asset hash mismatch: $asset"
+    done
+}
+
+fd_load_recorded_release() {
+    local requested=$1 dir
+
+    dir=$(fd_release_dir "$requested")
+    require_regular_file "$dir/verified" "release $requested verified marker"
+    fd_verify_recorded_bundle "$dir"
+    [[ $VERSION == "$requested" ]] || die 'recorded release manifest version does not match its directory'
+}
+
+fd_load_activation() {
+    local version=$1 file
+
+    file=$(fd_activation_file "$version")
+    require_regular_file "$file" "activation state for $version"
+    [[ $(read_field "$file" VERSION "activation state for $version") == "$version" ]] || die "activation state version does not match $version"
+    read_field "$file" MIGRATION_FINGERPRINT_AFTER "activation state for $version" >/dev/null
+    read_field "$file" RENDERED_COMPOSE_SHA256 "activation state for $version" >/dev/null
+}
+
+fd_activation_field() {
+    read_field "$(fd_activation_file "$1")" "$2" "activation state for $1"
+}
+
+fd_current_version() {
+    local value
+
+    require_regular_file "$CURRENT_FILE" 'active release state'
+    read -r value <"$CURRENT_FILE"
+    validate_version "$value"
+    printf '%s\n' "$value"
+}
+
+fd_write_activation() {
+    local before=$1 after=$2 rendered=$3 now
+
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    fd_atomic_write "$(fd_activation_file "$VERSION")" "activation state for $VERSION" "VERSION=$VERSION" "ACTIVATED_AT=$now" "MIGRATION_FINGERPRINT_BEFORE=$before" "MIGRATION_FINGERPRINT_AFTER=$after" "RENDERED_COMPOSE_SHA256=$rendered"
+    fd_atomic_write "$CURRENT_FILE" 'active release state' "$VERSION"
+    fd_append_history "$now"$'\t'"$ACTION"$'\t'"$VERSION"$'\t'"$MAIN_DIGEST"$'\t'"$REALTIME_DIGEST"$'\t'"$before"$'\t'"$after"
+}
+
+fd_activation_history_exists() {
+    local activated_at=$1 before=$2 after=$3
+
+    state_file_safe_or_missing "$HISTORY_FILE" 'activation history'
+    [[ -e $HISTORY_FILE ]] || return 1
+    awk -F '\t' \
+        -v activated_at="$activated_at" \
+        -v version="$VERSION" \
+        -v main_digest="$MAIN_DIGEST" \
+        -v realtime_digest="$REALTIME_DIGEST" \
+        -v before="$before" \
+        -v after="$after" '
+            $1 == activated_at && $2 == "recover-forward" \
+                && $3 == version && $4 == main_digest \
+                && $5 == realtime_digest && $6 == before && $7 == after { found = 1 }
+            END { exit !found }
+        ' "$HISTORY_FILE"
+}
+
+fd_reconcile_forward_activation() {
+    local before=$1 after=$2 rendered=$3 activation activated_at current
+
+    activation=$(fd_activation_file "$VERSION")
+    if [[ -e $CURRENT_FILE || -L $CURRENT_FILE ]]; then
+        current=$(fd_current_version)
+        [[ $current == "$VERSION" ]] \
+            || die "forward recovery found active release $current; expected candidate $VERSION"
+        fd_load_activation "$VERSION"
+        [[ $(fd_activation_field "$VERSION" MIGRATION_FINGERPRINT_BEFORE) == "$before" \
+            && $(fd_activation_field "$VERSION" MIGRATION_FINGERPRINT_AFTER) == "$after" \
+            && $(fd_activation_field "$VERSION" RENDERED_COMPOSE_SHA256) == "$rendered" ]] \
+            || die 'existing candidate activation differs from the forward-recovery result'
+        activated_at=$(read_field "$activation" ACTIVATED_AT "activation state for $VERSION")
+        [[ $activated_at =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
+            || die 'existing candidate activation timestamp is invalid'
+    else
+        activated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        fd_atomic_write "$activation" "activation state for $VERSION" \
+            "VERSION=$VERSION" \
+            "ACTIVATED_AT=$activated_at" \
+            "MIGRATION_FINGERPRINT_BEFORE=$before" \
+            "MIGRATION_FINGERPRINT_AFTER=$after" \
+            "RENDERED_COMPOSE_SHA256=$rendered"
+        fd_atomic_write "$CURRENT_FILE" 'active release state' "$VERSION"
+    fi
+    if ! fd_activation_history_exists "$activated_at" "$before" "$after"; then
+        fd_append_history "$activated_at"$'\t'recover-forward$'\t'"$VERSION"$'\t'"$MAIN_DIGEST"$'\t'"$REALTIME_DIGEST"$'\t'"$before"$'\t'"$after"
+    fi
+}
+
+fd_mark_pending() {
+    fd_atomic_write "$PENDING_FILE" 'pending deployment state' \
+        'STATE=pending-candidate' \
+        "CANDIDATE_VERSION=$VERSION" \
+        "PREVIOUS_VERSION=$PREVIOUS_CURRENT_VERSION" \
+        "MIGRATION_FINGERPRINT_BEFORE=$DEPLOYMENT_MIGRATION_FINGERPRINT" \
+        "PRESTART_UNDO=$DEPLOYMENT_UNDO" \
+        "PRESTART_UNDO_SHA256=$DEPLOYMENT_PRESTART_UNDO_SHA256" \
+        'CANDIDATE_STARTED=false'
+    if test_mode && [[ ${FORK_DEPLOY_TEST_KILL_AFTER_PENDING_WRITE:-false} == true ]]; then
+        kill -KILL "$BASHPID"
+    fi
+    fd_remove_file "$CURRENT_FILE" 'active release state'
+}
+
+fd_write_candidate_started_pending() {
+    fd_atomic_write "$PENDING_FILE" 'pending deployment state' \
+        'STATE=pending-candidate' \
+        "CANDIDATE_VERSION=$VERSION" \
+        "PREVIOUS_VERSION=$PREVIOUS_CURRENT_VERSION" \
+        "MIGRATION_FINGERPRINT_BEFORE=$DEPLOYMENT_MIGRATION_FINGERPRINT" \
+        "PRESTART_UNDO=$DEPLOYMENT_UNDO" \
+        "PRESTART_UNDO_SHA256=$DEPLOYMENT_PRESTART_UNDO_SHA256" \
+        'CANDIDATE_STARTED=true'
+}
+
+fd_write_forward_failure_state() {
+    fd_atomic_write "$FORWARD_RECOVERY_FILE" 'forward recovery state' \
+        'STATE=forward-recovery-required' \
+        "CANDIDATE_VERSION=$VERSION" \
+        "PREVIOUS_VERSION=$PREVIOUS_CURRENT_VERSION" \
+        "MIGRATION_FINGERPRINT_BEFORE=$DEPLOYMENT_MIGRATION_FINGERPRINT" \
+        "PRESTART_UNDO=$DEPLOYMENT_UNDO" \
+        "PRESTART_UNDO_SHA256=$DEPLOYMENT_PRESTART_UNDO_SHA256" \
+        "RECOVERY=Run $PROGRAM recover-forward to retry this exact signed candidate without applying pre-start undo. Do not start the previous release automatically."
+}
+
+fd_mark_candidate_started() {
+    CANDIDATE_STARTED=true
+    # Publish the conservative forward-only disposition before changing the pending phase. Either
+    # atomic file is sufficient for recover-forward to reconcile an interrupted transition.
+    fd_write_forward_failure_state
+    if test_mode && [[ ${FORK_DEPLOY_TEST_KILL_AFTER_FORWARD_RECORD:-false} == true ]]; then
+        kill -KILL "$BASHPID"
+    fi
+    fd_write_candidate_started_pending
+}
+
+fd_ensure_no_unresolved() {
+    local pending_state pending_started state
+
+    if [[ -e $FORWARD_RECOVERY_FILE || -L $FORWARD_RECOVERY_FILE ]]; then
+        require_regular_file "$FORWARD_RECOVERY_FILE" 'forward recovery state'
+        state=$(read_field "$FORWARD_RECOVERY_FILE" STATE 'forward recovery state')
+        [[ $state == forward-recovery-required ]] || die 'forward recovery state is invalid'
+        die "a candidate-started deployment requires forward recovery; run $PROGRAM recover-forward"
+    fi
+    if [[ -e $PENDING_FILE || -L $PENDING_FILE ]]; then
+        require_regular_file "$PENDING_FILE" 'pending deployment state'
+        pending_state=$(read_field "$PENDING_FILE" STATE 'pending deployment state')
+        pending_started=$(read_field "$PENDING_FILE" CANDIDATE_STARTED 'pending deployment state')
+        if [[ $pending_started == false && ( $pending_state == pending-candidate \
+            || $pending_state == recover-abort-restoring || $pending_state == recover-abort-finalizing \
+            || $pending_state == recover-abort-cleaning ) ]]; then
+            die "a deployment is pending before candidate startup; run $PROGRAM recover-abort before running $PROGRAM"
+        fi
+        if [[ $pending_started == true && $pending_state == pending-candidate ]]; then
+            die "a candidate-started deployment requires forward recovery; run $PROGRAM recover-forward"
+        fi
+        die "a deployment is pending or was interrupted; inspect $PENDING_FILE before running $PROGRAM"
+    fi
+}
+
+fd_validate_ports() {
+    local environment=$1 app_port soketi_port
+
+    app_port=$(optional_env_value "$environment" APP_PORT)
+    soketi_port=$(optional_env_value "$environment" SOKETI_PORT)
+    app_port=${app_port:-8000}
+    soketi_port=${soketi_port:-6001}
+    validate_port "$app_port" APP_PORT
+    validate_port "$soketi_port" SOKETI_PORT
+    [[ $app_port != "$soketi_port" && $app_port != 6002 && $soketi_port != 6002 ]] || die 'APP_PORT, SOKETI_PORT, and the fixed Soketi metrics port 6002 must be distinct'
+}
+
+fd_normalize_staged_ports() {
+    local environment=$1 app_port soketi_port
+
+    app_port=$(optional_env_value "$environment" APP_PORT)
+    soketi_port=$(optional_env_value "$environment" SOKETI_PORT)
+    app_port=${app_port:-8000}
+    soketi_port=${soketi_port:-6001}
+    fd_validate_ports "$environment"
+    set_env_value "$environment" APP_PORT "$app_port"
+    set_env_value "$environment" SOKETI_PORT "$soketi_port"
+}
+
+fd_prepare_staged_environment() {
+    local staging=$1 environment source entry key generator value
+
+    environment=$staging/.env
+    source=$SOURCE_DIR/.env
+
+    require_regular_file "$staging/.env.production" 'staged .env.production'
+    require_directory_or_missing "$SOURCE_DIR" 'Coolify source directory'
+    if [[ -e $source || -L $source ]]; then
+        require_regular_file "$source" 'existing .env'
+        cp -p "$source" "$environment"
+    else
+        cp -p "$staging/.env.production" "$environment"
+    fi
+    chmod 0600 "$environment"
+    for entry in APP_ID:hex16 APP_KEY:appkey DB_PASSWORD:base64 REDIS_PASSWORD:base64 PUSHER_APP_ID:hex32 PUSHER_APP_KEY:hex32 PUSHER_APP_SECRET:hex32; do
+        key=${entry%%:*}
+        generator=${entry#*:}
+        if ! awk -F= -v key="$key" '$1 == key && length(substr($0, length($1) + 2)) > 0 { found=1 } END { exit !found }' "$environment"; then
+            case $generator in
+                hex16) value=$(openssl rand -hex 16) ;;
+                hex32) value=$(openssl rand -hex 32) ;;
+                base64) value=$(openssl rand -base64 32 | tr -d '\n') ;;
+                appkey) value=base64:$(openssl rand -base64 32 | tr -d '\n') ;;
+            esac
+            set_env_value "$environment" "$key" "$value"
+        fi
+    done
+    fd_normalize_staged_ports "$environment"
+    set_env_value "$environment" AUTOUPDATE false
+    set_env_value "$environment" COOLIFY_FORK_VERSION "$VERSION"
+    set_env_value "$environment" VERSIONS_URL "$DISABLED_VERSIONS_URL"
+    set_env_value "$environment" UPGRADE_SCRIPT_URL "$DISABLED_UPGRADE_SCRIPT_URL"
+    set_env_value "$environment" RELEASES_URL "$DISABLED_RELEASES_URL"
+}
+
+fd_compose_in() {
+    local directory=$1
+    shift
+
+    docker compose --env-file "$directory/.env" --file "$directory/docker-compose.yml" --file "$directory/docker-compose.prod.yml" --file "$directory/docker-compose.custom.yml" "$@"
+}
+
+fd_count() {
+    local value=$1 needle=$2 count=0
+
+    while [[ $value == *"$needle"* ]]; do
+        value=${value#*"$needle"}
+        count=$((count + 1))
+    done
+    printf '%s\n' "$count"
+}
+
+fd_validate_effective_images() {
+    local directory=$1 images reference expected found count=0
+
+    images=$(fd_compose_in "$directory" config --images) || die 'could not render effective Compose images'
+    for reference in "$(image_ref_main)" "$(image_ref_realtime)" "$(image_ref_postgres)" "$(image_ref_redis)"; do
+        found=false
+        while IFS= read -r expected; do
+            if [[ $expected == "$reference" ]]; then
+                found=true
+                break
+            fi
+        done <<<"$images"
+        "$found" || die "effective Compose is missing immutable image $reference"
+    done
+    while IFS= read -r reference; do
+        [[ -z $reference ]] || {
+            [[ $reference =~ @sha256:[0-9a-f]{64}$ ]] || die "effective Compose contains mutable image reference: $reference"
+            count=$((count + 1))
+        }
+    done <<<"$images"
+    [[ $count -eq 4 ]] || die "effective Compose must contain exactly four immutable service images, found $count"
+}
+
+fd_validate_effective_bindings() {
+    local directory=$1 json compact remainder host_ip count=0 target app_port soketi_port
+
+    app_port=$(env_value "$directory/.env" APP_PORT)
+    soketi_port=$(env_value "$directory/.env" SOKETI_PORT)
+    validate_port "$app_port" APP_PORT
+    validate_port "$soketi_port" SOKETI_PORT
+    [[ $app_port != "$soketi_port" && $app_port != 6002 && $soketi_port != 6002 ]] || die 'APP_PORT, SOKETI_PORT, and the fixed Soketi metrics port 6002 must be distinct'
+    json=$(fd_compose_in "$directory" config --format json) || die 'could not render effective Compose port bindings'
+    compact=${json//[[:space:]]/}
+    remainder=$compact
+    while [[ $remainder == *'"host_ip":'* ]]; do
+        remainder=${remainder#*'"host_ip":'}
+        [[ $remainder == \"* ]] || die 'effective Compose has an invalid host_ip binding'
+        remainder=${remainder#\"}
+        host_ip=${remainder%%\"*}
+        remainder=${remainder#*\"}
+        [[ $host_ip == 127.0.0.1 ]] || die "effective Compose contains a non-loopback port binding: $host_ip"
+        count=$((count + 1))
+    done
+    [[ $count -eq 3 ]] || die "effective Compose must contain exactly three loopback port bindings, found $count"
+    for target in 8080 6001 6002; do
+        [[ $(fd_count "$compact" "\"target\":$target") -eq 1 ]] || die "effective Compose must contain exactly one loopback target port $target"
+    done
+    [[ $(fd_count "$compact" '"published":') -eq 3 ]] || die 'effective Compose must contain exactly three published ports'
+    for target in "$app_port" "$soketi_port" 6002; do
+        [[ $compact == *"\"published\":\"$target\""* || $compact == *"\"published\":$target"* ]] || die "effective Compose is missing loopback host port $target"
+    done
+}
+
+fd_validate_staging() {
+    local staging=$1 asset
+
+    for asset in docker-compose.yml docker-compose.prod.yml docker-compose.custom.yml .env.production .env; do
+        require_regular_file "$staging/$asset" "staged $asset"
+    done
+    fd_compose_in "$staging" config --quiet || die 'staged Compose configuration is invalid'
+    fd_validate_effective_images "$staging"
+    fd_validate_effective_bindings "$staging"
+}
+
+fd_assert_staged_hashes() {
+    local staging=$1 asset expected actual
+
+    for asset in docker-compose.yml docker-compose.prod.yml docker-compose.custom.yml .env.production; do
+        case $asset in
+            docker-compose.yml) expected=$COMPOSE_SHA256 ;;
+            docker-compose.prod.yml) expected=$COMPOSE_PROD_SHA256 ;;
+            docker-compose.custom.yml) expected=$COMPOSE_OVERLAY_SHA256 ;;
+            .env.production) expected=$ENV_PRODUCTION_SHA256 ;;
+        esac
+        actual=$(sha256sum "$staging/$asset" | awk '{print $1}')
+        [[ $actual == "$expected" ]] || die "staged $asset does not match the signed release manifest"
+    done
+}
+
+fd_new_staging() {
+    local staging
+
+    staging=$(mktemp -d "$STATE_DIR/staging.XXXXXX")
+    chmod 0700 "$staging"
+    assert_no_symlink_ancestors "$staging" 'staging directory'
+    printf '%s\n' "$staging"
+}
+
+fd_validate_staging_path() {
+    local path=$1 relative
+
+    validate_absolute_path "$path" 'staging directory'
+    relative=${path#"$STATE_DIR"/}
+    [[ $path == "$STATE_DIR"/staging.* && $relative != */* \
+        && $relative =~ ^staging\.[A-Za-z0-9]{6}$ ]] \
+        || die 'staging directory is outside the managed release state directory'
+}
+
+fd_remove_staging_directory() {
+    local staging=$1
+
+    fd_validate_staging_path "$staging"
+    assert_no_symlink_ancestors "$staging" 'staging directory'
+    if [[ -e $staging || -L $staging ]]; then
+        require_directory_or_missing "$staging" 'staging directory'
+        if ! test_mode; then
+            [[ $(file_owner "$staging") == 0:0 ]] \
+                || die 'staging directory must be owned by root:root'
+        fi
+        rm -rf -- "$staging"
+    fi
+    [[ ! -e $staging && ! -L $staging ]] || die 'staging directory remains after cleanup'
+}
+
+fd_cleanup_staging_directories() {
+    local staging
+
+    for staging in "$STATE_DIR"/staging.*; do
+        [[ -e $staging || -L $staging ]] || continue
+        fd_remove_staging_directory "$staging"
+    done
+}
+
+fd_cleanup_tracked_staging() {
+    local status=$1 staging=$DEPLOYMENT_STAGING
+
+    trap - EXIT
+    if [[ -n $staging ]]; then
+        fd_remove_staging_directory "$staging"
+        DEPLOYMENT_STAGING=
+    fi
+    exit "$status"
+}
+
+fd_track_staging() {
+    local staging=$1
+
+    fd_validate_staging_path "$staging"
+    DEPLOYMENT_STAGING=$staging
+    trap 'fd_cleanup_tracked_staging $?' EXIT
+}
+
+fd_release_tracked_staging() {
+    local staging=$1
+
+    [[ $DEPLOYMENT_STAGING == "$staging" ]] || die 'tracked staging directory changed unexpectedly'
+    fd_remove_staging_directory "$staging"
+    DEPLOYMENT_STAGING=
+    trap - EXIT
+}
+
+fd_stage_remote() {
+    local staging=$1
+
+    download_asset docker-compose.yml "$staging/docker-compose.yml"
+    download_asset docker-compose.prod.yml "$staging/docker-compose.prod.yml"
+    download_asset .env.production "$staging/.env.production"
+    write_overlay "$staging/docker-compose.custom.yml"
+    fd_prepare_staged_environment "$staging"
+    fd_assert_staged_hashes "$staging"
+    fd_validate_staging "$staging"
+}
+
+fd_stage_recorded() {
+    local staging=$1 dir asset
+
+    dir=$(fd_release_dir "$VERSION")
+    fd_verify_recorded_bundle "$dir"
+    for asset in docker-compose.yml docker-compose.prod.yml docker-compose.custom.yml .env.production; do
+        cp -p "$dir/$asset" "$staging/$asset"
+    done
+    fd_prepare_staged_environment "$staging"
+    fd_assert_staged_hashes "$staging"
+    fd_validate_staging "$staging"
+}
+
+fd_append_history() {
+    local line=$1 temporary
+
+    state_file_safe_or_missing "$HISTORY_FILE" 'activation history'
+    temporary=$(mktemp "$STATE_DIR/.history.XXXXXX")
+    chmod 0600 "$temporary"
+    if [[ -f $HISTORY_FILE ]]; then
+        cp -p "$HISTORY_FILE" "$temporary"
+    fi
+    printf '%s\n' "$line" >>"$temporary"
+    mv -f "$temporary" "$HISTORY_FILE"
+    state_file_safe_or_missing "$HISTORY_FILE" 'activation history'
+}
+
+fd_migration_fingerprint() {
+    local environment=$1 username database table_exists fingerprint
+
+    if ! docker inspect coolify-db >/dev/null 2>&1; then
+        printf 'uninitialized\n'
+        return 0
+    fi
+    username=$(env_value "$environment" DB_USERNAME)
+    database=$(env_value "$environment" DB_DATABASE)
+    table_exists=$(docker exec coolify-db psql -U "$username" -d "$database" -Atc "SELECT COALESCE(to_regclass('public.migrations')::text, '');") || die 'could not inspect the Coolify migration table'
+    if [[ $table_exists != migrations && $table_exists != public.migrations ]]; then
+        printf 'uninitialized\n'
+        return 0
+    fi
+    fingerprint=$(docker exec coolify-db psql -U "$username" -d "$database" -Atc "SELECT md5(COALESCE(string_agg(migration || ':' || batch::text, ',' ORDER BY migration), '')) FROM migrations;") || die 'could not fingerprint Coolify migrations'
+    [[ $fingerprint =~ ^[0-9a-f]{32}$ ]] || die 'database returned an invalid migration fingerprint'
+    printf '%s\n' "$fingerprint"
+}
+
+fd_container_exists() {
+    docker inspect "$1" >/dev/null 2>&1
+}
+
+fd_unmanaged_state_present() {
+    local container directory discovered volumes volume
+
+    for container in coolify coolify-realtime coolify-db coolify-redis; do
+        fd_container_exists "$container" && return 0
+    done
+    require_directory_or_missing "$SOURCE_DIR" 'unmanaged Coolify source directory'
+    if [[ -d $SOURCE_DIR ]]; then
+        discovered=$(find "$SOURCE_DIR" -mindepth 1 -print -quit)
+        [[ -z $discovered ]] || return 0
+    fi
+    for directory in applications backups databases proxy sentinel services ssh; do
+        require_directory_or_missing "$ROOT/$directory" "unmanaged Coolify $directory directory"
+        [[ -d $ROOT/$directory ]] || continue
+        discovered=$(find "$ROOT/$directory" -mindepth 1 -print -quit)
+        [[ -z $discovered ]] || return 0
+    done
+    volumes=$(docker volume ls --format '{{.Name}}') \
+        || die 'could not list Docker volumes while checking unmanaged Coolify state'
+    while IFS= read -r volume; do
+        case $volume in
+            coolify-db|coolify-redis|coolify-db-pg[0-9]*) return 0 ;;
+        esac
+    done <<<"$volumes"
+    return 1
+}
+
+fd_assert_clean_install_state() {
+    if fd_unmanaged_state_present; then
+        die 'unmanaged Coolify state detected; use the control-plane migration and enrollment path before fork-deploy install. This release tool will not adopt existing source, database, Redis, container, volume, or persistent state'
+    fi
+}
+
+fd_validate_undo_path() {
+    local path=$1 relative
+
+    validate_absolute_path "$path" 'pre-start undo path'
+    relative=${path#"$UNDO_DIRS_DIR"/}
+    [[ $path == "$UNDO_DIRS_DIR"/undo.* && $relative != */* \
+        && $relative =~ ^undo\.[A-Za-z0-9.-]+\.[A-Za-z0-9]{6}$ ]] \
+        || die 'pre-start undo path is outside the managed temporary directory'
+}
+
+fd_assert_private_undo_file() {
+    local path=$1 label=$2
+
+    require_regular_file "$path" "$label"
+    [[ -s $path ]] || die "$label is empty: $path"
+    [[ $(file_mode "$path") == 600 ]] || die "$label must have mode 0600: $path"
+    if ! test_mode; then
+        [[ $(file_owner "$path") == 0:0 ]] || die "$label must be owned by root:root: $path"
+    fi
+}
+
+fd_assert_private_undo_directory() {
+    local path=$1 label=$2
+
+    fd_validate_undo_path "$path"
+    require_directory_or_missing "$path" "$label"
+    [[ -d $path ]] || die "$label is missing: $path"
+    [[ $(file_mode "$path") == 700 ]] || die "$label must have mode 0700: $path"
+    if ! test_mode; then
+        [[ $(file_owner "$path") == 0:0 ]] || die "$label must be owned by root:root: $path"
+    fi
+}
+
+fd_configuration_record() {
+    local manifest=$1 asset=$2
+
+    awk -F= -v wanted="$asset" '
+        $1 == wanted { count++; value = substr($0, length($1) + 2) }
+        END { if (count != 1) exit 1; print value }
+    ' "$manifest" || die "configuration undo manifest is invalid for $asset"
+}
+
+fd_validate_configuration_undo() {
+    local journal=$1 expected_manifest_sha=$2 manifest record state expected_hash actual_hash asset
+
+    manifest=$journal/configuration.manifest
+    fd_assert_private_undo_file "$manifest" 'configuration undo manifest'
+    [[ $(sha256sum "$manifest" | awk '{print $1}') == "$expected_manifest_sha" ]] \
+        || die 'configuration undo manifest hash changed'
+    for asset in .env .env.production docker-compose.yml docker-compose.prod.yml docker-compose.custom.yml; do
+        record=$(fd_configuration_record "$manifest" "$asset")
+        state=${record%%:*}
+        expected_hash=${record#*:}
+        case $state in
+            present)
+                validate_digest "sha256:$expected_hash"
+                fd_assert_private_undo_file "$journal/$asset" "configuration undo $asset"
+                actual_hash=$(sha256sum "$journal/$asset" | awk '{print $1}')
+                [[ $actual_hash == "$expected_hash" ]] || die "configuration undo changed: $asset"
+                ;;
+            absent)
+                [[ $expected_hash == none && ! -e $journal/$asset && ! -L $journal/$asset ]] \
+                    || die "configuration undo absence record is invalid for $asset"
+                ;;
+            *) die "configuration undo state is invalid for $asset" ;;
+        esac
+    done
+}
+
+fd_capture_ssh_undo() {
+    local journal=$1 undo manifest
+    local private_key=$ROOT/ssh/keys/id.root@host.docker.internal
+    local public_key authorized_directory=${AUTHORIZED_KEYS%/*}
+    local key path destination hash mode owner uid gid
+
+    undo=$journal/prestart-undo
+    manifest=$journal/ssh-undo.manifest
+    public_key=$private_key.pub
+
+    fd_assert_locked_ssh_directory "$ROOT/ssh" 'localhost SSH directory'
+    fd_assert_locked_ssh_directory "$ROOT/ssh/keys" 'localhost SSH key directory'
+    mkdir "$undo"
+    chmod 0700 "$undo"
+    : >"$manifest"
+    chmod 0600 "$manifest"
+    assert_no_symlink_ancestors "$authorized_directory" 'authorized_keys directory'
+    if [[ -e $authorized_directory ]]; then
+        require_directory_or_missing "$authorized_directory" 'authorized_keys directory'
+        mode=$(file_mode "$authorized_directory")
+        owner=$(file_owner "$authorized_directory")
+        printf 'AUTHORIZED_DIRECTORY=present:%s:%s\n' "$mode" "$owner" >>"$manifest"
+    else
+        printf 'AUTHORIZED_DIRECTORY=absent:none:none:none\n' >>"$manifest"
+    fi
+    for key in AUTHORIZED_KEYS PRIVATE_KEY PUBLIC_KEY; do
+        case $key in
+            AUTHORIZED_KEYS) path=$AUTHORIZED_KEYS; destination=authorized_keys ;;
+            PRIVATE_KEY) path=$private_key; destination=localhost-private-key ;;
+            PUBLIC_KEY) path=$public_key; destination=localhost-public-key ;;
+        esac
+        assert_no_symlink_ancestors "$path" "pre-start SSH state $key"
+        if [[ -e $path || -L $path ]]; then
+            require_regular_file "$path" "pre-start SSH state $key"
+            hash=$(sha256sum "$path" | awk '{print $1}')
+            mode=$(file_mode "$path")
+            owner=$(file_owner "$path")
+            uid=${owner%%:*}
+            gid=${owner#*:}
+            cp -p "$path" "$undo/$destination"
+            chmod 0600 "$undo/$destination"
+            if ! test_mode; then chown root:root "$undo/$destination"; fi
+            printf '%s=present:%s:%s:%s:%s\n' "$key" "$hash" "$mode" "$uid" "$gid" >>"$manifest"
+        else
+            printf '%s=absent:none:none:none:none\n' "$key" >>"$manifest"
+        fi
+    done
+}
+
+fd_ssh_undo_record() {
+    local manifest=$1 key=$2
+
+    awk -F= -v wanted="$key" '
+        $1 == wanted { count++; value = substr($0, length($1) + 2) }
+        END { if (count != 1) exit 1; print value }
+    ' "$manifest" || die "pre-start SSH undo manifest is invalid for $key"
+}
+
+fd_validate_prestart_undo() {
+    local journal=$1 expected_sha=$2 manifest
+    local config_sha ssh_sha record state hash mode uid gid key destination actual directory_record
+
+    fd_assert_private_undo_directory "$journal" 'pre-start undo directory'
+    manifest=$journal/prestart-undo.manifest
+    fd_assert_private_undo_file "$manifest" 'pre-start undo manifest'
+    [[ $(sha256sum "$manifest" | awk '{print $1}') == "$expected_sha" ]] \
+        || die 'pre-start undo manifest hash changed'
+    config_sha=$(read_field "$manifest" CONFIGURATION_MANIFEST_SHA256 'pre-start undo manifest')
+    ssh_sha=$(read_field "$manifest" SSH_UNDO_MANIFEST_SHA256 'pre-start undo manifest')
+    validate_digest "sha256:$config_sha"
+    validate_digest "sha256:$ssh_sha"
+    fd_validate_configuration_undo "$journal" "$config_sha"
+    fd_assert_private_undo_file "$journal/ssh-undo.manifest" 'pre-start SSH undo manifest'
+    [[ $(sha256sum "$journal/ssh-undo.manifest" | awk '{print $1}') == "$ssh_sha" ]] \
+        || die 'pre-start SSH undo manifest hash changed'
+    directory_record=$(fd_ssh_undo_record "$journal/ssh-undo.manifest" AUTHORIZED_DIRECTORY)
+    IFS=: read -r state mode uid gid <<<"$directory_record"
+    case $state in
+        present)
+            [[ $mode =~ ^[0-7]{3,4}$ && $uid =~ ^[0-9]+$ && $gid =~ ^[0-9]+$ ]] \
+                || die 'pre-start authorized_keys directory metadata is invalid'
+            ;;
+        absent)
+            [[ $mode == none && $uid == none && $gid == none ]] \
+                || die 'pre-start authorized_keys directory absence record is invalid'
+            ;;
+        *) die 'pre-start authorized_keys directory state is invalid' ;;
+    esac
+    for key in AUTHORIZED_KEYS PRIVATE_KEY PUBLIC_KEY; do
+        record=$(fd_ssh_undo_record "$journal/ssh-undo.manifest" "$key")
+        IFS=: read -r state hash mode uid gid <<<"$record"
+        case $key in
+            AUTHORIZED_KEYS) destination=authorized_keys ;;
+            PRIVATE_KEY) destination=localhost-private-key ;;
+            PUBLIC_KEY) destination=localhost-public-key ;;
+        esac
+        case $state in
+            present)
+                validate_digest "sha256:$hash"
+                [[ $mode =~ ^[0-7]{3,4}$ && $uid =~ ^[0-9]+$ && $gid =~ ^[0-9]+$ ]] \
+                    || die "pre-start SSH metadata is invalid for $key"
+                require_regular_file "$journal/prestart-undo/$destination" "pre-start SSH undo $key"
+                [[ $(file_mode "$journal/prestart-undo/$destination") == 600 ]] \
+                    || die "pre-start SSH undo copy must have mode 0600 for $key"
+                actual=$(sha256sum "$journal/prestart-undo/$destination" | awk '{print $1}')
+                [[ $actual == "$hash" ]] || die "pre-start SSH undo copy changed for $key"
+                ;;
+            absent)
+                [[ $hash == none && $mode == none && $uid == none && $gid == none \
+                    && ! -e $journal/prestart-undo/$destination \
+                    && ! -L $journal/prestart-undo/$destination ]] \
+                    || die "pre-start SSH absence record is invalid for $key"
+                ;;
+            *) die "pre-start SSH state is invalid for $key" ;;
+        esac
+    done
+}
+
+fd_restore_ssh_undo() {
+    local journal=$1 manifest record state hash mode uid gid
+    local key source destination authorized_directory=${AUTHORIZED_KEYS%/*} directory_record directory_state
+
+    fd_lock_localhost_ssh_directories
+    manifest=$journal/ssh-undo.manifest
+    for key in AUTHORIZED_KEYS PRIVATE_KEY PUBLIC_KEY; do
+        record=$(fd_ssh_undo_record "$manifest" "$key")
+        IFS=: read -r state hash mode uid gid <<<"$record"
+        case $key in
+            AUTHORIZED_KEYS) source=$journal/prestart-undo/authorized_keys; destination=$AUTHORIZED_KEYS ;;
+            PRIVATE_KEY) source=$journal/prestart-undo/localhost-private-key; destination=$ROOT/ssh/keys/id.root@host.docker.internal ;;
+            PUBLIC_KEY) source=$journal/prestart-undo/localhost-public-key; destination=$ROOT/ssh/keys/id.root@host.docker.internal.pub ;;
+        esac
+        case $state in
+            present)
+                fd_atomic_copy "$source" "$destination" "restore pre-start SSH state $key"
+                chown "$uid:$gid" "$destination"
+                chmod "$mode" "$destination"
+                ;;
+            absent) fd_remove_file "$destination" "restore absent pre-start SSH state $key" ;;
+            *) die "pre-start SSH state is invalid for $key" ;;
+        esac
+    done
+    directory_record=$(fd_ssh_undo_record "$manifest" AUTHORIZED_DIRECTORY)
+    IFS=: read -r directory_state mode uid gid <<<"$directory_record"
+    case $directory_state in
+        present)
+            chown "$uid:$gid" "$authorized_directory"
+            chmod "$mode" "$authorized_directory"
+            ;;
+        absent)
+            rmdir "$authorized_directory" 2>/dev/null \
+                || die 'could not remove the authorized_keys directory created by the aborted deployment'
+            ;;
+        *) die 'pre-start authorized_keys directory state is invalid' ;;
+    esac
+}
+
+fd_create_prestart_undo() {
+    local journal manifest asset hash
+
+    journal=$(mktemp -d "$UNDO_DIRS_DIR/undo.$VERSION.XXXXXX")
+    chmod 0700 "$journal"
+    fd_validate_undo_path "$journal"
+    manifest=$journal/configuration.manifest
+    : >"$manifest"
+    chmod 0600 "$manifest"
+    require_directory_or_missing "$SOURCE_DIR" 'Coolify source directory'
+    for asset in .env .env.production docker-compose.yml docker-compose.prod.yml docker-compose.custom.yml; do
+        if [[ -e $SOURCE_DIR/$asset || -L $SOURCE_DIR/$asset ]]; then
+            require_regular_file "$SOURCE_DIR/$asset" "existing source asset $asset"
+            cp -p "$SOURCE_DIR/$asset" "$journal/$asset"
+            chmod 0600 "$journal/$asset"
+            hash=$(sha256sum "$journal/$asset" | awk '{print $1}')
+            printf '%s=present:%s\n' "$asset" "$hash" >>"$manifest"
+        else
+            printf '%s=absent:none\n' "$asset" >>"$manifest"
+        fi
+    done
+    fd_capture_ssh_undo "$journal"
+    {
+        printf 'CONFIGURATION_MANIFEST_SHA256=%s\n' "$(sha256sum "$manifest" | awk '{print $1}')"
+        printf 'SSH_UNDO_MANIFEST_SHA256=%s\n' "$(sha256sum "$journal/ssh-undo.manifest" | awk '{print $1}')"
+    } >"$journal/prestart-undo.manifest"
+    chmod 0600 "$journal/prestart-undo.manifest"
+    if ! test_mode; then
+        chown -R root:root "$journal"
+    fi
+    hash=$(sha256sum "$journal/prestart-undo.manifest" | awk '{print $1}')
+    fd_validate_prestart_undo "$journal" "$hash"
+    printf '%s\n' "$journal"
+}
+
+fd_restore_prestart_undo() {
+    local journal=$1 asset record state
+
+    ensure_secure_directory "$SOURCE_DIR" 'Coolify source directory'
+    for asset in .env .env.production docker-compose.yml docker-compose.prod.yml docker-compose.custom.yml; do
+        record=$(fd_configuration_record "$journal/configuration.manifest" "$asset")
+        state=${record%%:*}
+        case $state in
+            present) fd_atomic_copy "$journal/$asset" "$SOURCE_DIR/$asset" "restore $asset" ;;
+            absent) fd_remove_file "$SOURCE_DIR/$asset" "restore $asset" ;;
+            *) die "configuration undo state is invalid for $asset" ;;
+        esac
+    done
+    fd_restore_ssh_undo "$journal"
+}
+
+fd_remove_prestart_undo_plaintext() {
+    local journal=$1 asset undo_directory=$1/prestart-undo
+
+    fd_validate_undo_path "$journal"
+    if [[ -e $undo_directory || -L $undo_directory ]]; then
+        require_directory_or_missing "$undo_directory" 'pre-start SSH undo directory'
+        for asset in authorized_keys localhost-private-key localhost-public-key; do
+            fd_remove_file "$undo_directory/$asset" "finalized pre-start SSH undo $asset"
+        done
+        rmdir "$undo_directory" || die 'could not finalize the pre-start SSH undo directory'
+    fi
+    for asset in .env .env.production docker-compose.yml docker-compose.prod.yml docker-compose.custom.yml \
+        configuration.manifest ssh-undo.manifest prestart-undo.manifest; do
+        fd_remove_file "$journal/$asset" "finalized pre-start undo $asset"
+    done
+    rmdir "$journal" || die 'could not finalize the pre-start undo directory'
+}
+
+fd_assert_prestart_undo_finalized() {
+    local journal=$1
+
+    [[ ! -e $journal && ! -L $journal ]] || die 'pre-start undo remains after finalization'
+}
+
+fd_finalize_prestart_undo() {
+    local journal=$1
+
+    fd_validate_prestart_undo "$journal" "$DEPLOYMENT_PRESTART_UNDO_SHA256"
+    fd_remove_prestart_undo_plaintext "$journal"
+    fd_assert_prestart_undo_finalized "$journal"
+}
+
+fd_finish_prestart_undo_finalization() {
+    local journal=$1
+
+    if [[ -e $journal || -L $journal ]]; then
+        fd_remove_prestart_undo_plaintext "$journal"
+    fi
+    fd_assert_prestart_undo_finalized "$journal"
+}
+
+
+fd_activate_staging() {
+    local staging=$1 asset
+
+    ensure_secure_directory "$SOURCE_DIR" 'Coolify source directory'
+    for asset in .env .env.production docker-compose.yml docker-compose.prod.yml docker-compose.custom.yml; do
+        fd_atomic_copy "$staging/$asset" "$SOURCE_DIR/$asset" "activate $asset"
+    done
+}
+
+fd_ensure_network() {
+    if ! docker network inspect coolify >/dev/null 2>&1; then
+        docker network create coolify >/dev/null || die 'could not create the Coolify Docker network'
+    fi
+}
+
+fd_validate_runtime_bindings() {
+    local app_port soketi_port container bindings runtime_port host_ip host_port app_seen=0 realtime_seen=0 metrics_seen=0
+
+    app_port=$(env_value "$SOURCE_DIR/.env" APP_PORT)
+    soketi_port=$(env_value "$SOURCE_DIR/.env" SOKETI_PORT)
+    for container in coolify coolify-realtime coolify-db coolify-redis; do
+        bindings=$(docker inspect --format '{{range $port, $bindings := .NetworkSettings.Ports}}{{range $binding := $bindings}}{{printf "%s\t%s\t%s\n" $port $binding.HostIp $binding.HostPort}}{{end}}{{end}}' "$container") || {
+            note "ERROR: $container is missing" >&2
+            return 1
+        }
+        while IFS=$'\t' read -r runtime_port host_ip host_port; do
+            [[ -z $runtime_port ]] && continue
+            [[ $host_ip == 127.0.0.1 ]] || {
+                note "ERROR: $container $runtime_port binds to unsafe host IP $host_ip" >&2
+                return 1
+            }
+            case "$container:$runtime_port:$host_port" in
+                "coolify:8080/tcp:$app_port") app_seen=$((app_seen + 1)) ;;
+                "coolify-realtime:6001/tcp:$soketi_port") realtime_seen=$((realtime_seen + 1)) ;;
+                'coolify-realtime:6002/tcp:6002') metrics_seen=$((metrics_seen + 1)) ;;
+                *)
+                    note "ERROR: unexpected published runtime binding $container $runtime_port -> $host_ip:$host_port" >&2
+                    return 1
+                    ;;
+            esac
+        done <<<"$bindings"
+    done
+    [[ $app_seen -eq 1 && $realtime_seen -eq 1 && $metrics_seen -eq 1 ]] || {
+        note 'ERROR: runtime bindings are missing or duplicated' >&2
+        return 1
+    }
+}
+
+fd_verify_runtime() {
+    local expected actual container platform
+
+    platform=$(host_platform)
+    for container in coolify coolify-realtime coolify-db coolify-redis; do
+        case $container in
+            coolify) expected=$(image_ref_main) ;;
+            coolify-realtime) expected=$(image_ref_realtime) ;;
+            coolify-db) expected=$(image_ref_postgres) ;;
+            coolify-redis) expected=$(image_ref_redis) ;;
+        esac
+        actual=$(docker inspect --format '{{.Config.Image}}' "$container") || return 1
+        [[ $actual == "$expected" ]] || {
+            note "ERROR: $container runs $actual, expected $expected" >&2
+            return 1
+        }
+        validate_image_for_host "$expected" "$platform"
+    done
+    fd_validate_runtime_bindings
+    wait_for_health
+}
+
+fd_commit_bundle() {
+    local staging=$1 dir temporary asset expected actual
+
+    dir=$(fd_release_dir "$VERSION")
+    if [[ -e $dir || -L $dir ]]; then
+        fd_verify_recorded_bundle "$dir"
+        for asset in docker-compose.yml docker-compose.prod.yml docker-compose.custom.yml .env.production; do
+            case $asset in
+                docker-compose.yml) expected=$COMPOSE_SHA256 ;;
+                docker-compose.prod.yml) expected=$COMPOSE_PROD_SHA256 ;;
+                docker-compose.custom.yml) expected=$COMPOSE_OVERLAY_SHA256 ;;
+                .env.production) expected=$ENV_PRODUCTION_SHA256 ;;
+            esac
+            actual=$(sha256sum "$staging/$asset" | awk '{print $1}')
+            [[ $actual == "$expected" ]] || die "candidate $asset differs from the immutable verified release bundle"
+        done
+        return 0
+    fi
+    temporary=$(mktemp -d "$RELEASES_DIR/.bundle.$VERSION.XXXXXX")
+    chmod 0700 "$temporary"
+    for asset in docker-compose.yml docker-compose.prod.yml docker-compose.custom.yml .env.production; do
+        cp -p "$staging/$asset" "$temporary/$asset"
+    done
+    cp -p "$MANIFEST_PATH" "$temporary/release.manifest"
+    cp -p "$MANIFEST_SIGNATURE" "$temporary/release.manifest.sig"
+    printf 'VERSION=%s\n' "$VERSION" >"$temporary/verified"
+    chmod 0600 "$temporary/verified" "$temporary/release.manifest" "$temporary/release.manifest.sig"
+    mv "$temporary" "$dir"
+    fd_verify_recorded_bundle "$dir"
+}
+
+fd_restore_previous_current() {
+    local previous=$1
+
+    [[ -z $previous ]] && return 0
+    fd_load_recorded_release "$previous"
+    fd_load_activation "$previous"
+    fd_atomic_write "$CURRENT_FILE" 'active release state' "$previous"
+    if test_mode && [[ ${FORK_DEPLOY_TEST_KILL_AFTER_RESTORE_PREVIOUS_CURRENT:-false} == true ]]; then
+        kill -KILL "$BASHPID"
+    fi
+}
+
+fd_deployment_failure() {
+    local code=${1:-1} candidate_version=$VERSION
+
+    if [[ $RECOVERY_ARMED != true || $RECOVERY_HANDLED == true ]]; then
+        exit "$code"
+    fi
+    RECOVERY_HANDLED=true
+    RECOVERY_ARMED=false
+    trap - ERR
+    set +e
+    if [[ $CANDIDATE_STARTED == true ]]; then
+        fd_remove_file "$CURRENT_FILE" 'active release state' || true
+        VERSION=$candidate_version
+        fd_write_forward_failure_state || true
+        fd_finish_prestart_undo_finalization "$DEPLOYMENT_UNDO" || true
+        fd_release_ssh_runtime_ownership || true
+        note 'Deployment failed after candidate startup. Pre-start undo and automatic rollback are forbidden because the candidate may have accepted writes.'
+        note "Recovery required: run $PROGRAM recover-forward to retry the exact signed candidate without discarding writes."
+    elif fd_validate_prestart_undo "$DEPLOYMENT_UNDO" "$DEPLOYMENT_PRESTART_UNDO_SHA256"; then
+        if (
+            set -e
+            fd_write_recover_abort_state recover-abort-restoring "$candidate_version" \
+                "$PREVIOUS_CURRENT_VERSION" "$DEPLOYMENT_MIGRATION_FINGERPRINT" \
+                "$DEPLOYMENT_UNDO" "$DEPLOYMENT_PRESTART_UNDO_SHA256"
+            fd_restore_prestart_undo "$DEPLOYMENT_UNDO"
+            fd_restore_previous_current "$PREVIOUS_CURRENT_VERSION"
+            fd_write_recover_abort_state recover-abort-finalizing "$candidate_version" \
+                "$PREVIOUS_CURRENT_VERSION" "$DEPLOYMENT_MIGRATION_FINGERPRINT" \
+                "$DEPLOYMENT_UNDO" "$DEPLOYMENT_PRESTART_UNDO_SHA256"
+            fd_validate_prestart_undo "$DEPLOYMENT_UNDO" "$DEPLOYMENT_PRESTART_UNDO_SHA256"
+            fd_write_recover_abort_state recover-abort-cleaning "$candidate_version" \
+                "$PREVIOUS_CURRENT_VERSION" "$DEPLOYMENT_MIGRATION_FINGERPRINT" \
+                "$DEPLOYMENT_UNDO" "$DEPLOYMENT_PRESTART_UNDO_SHA256"
+            fd_finish_prestart_undo_finalization "$DEPLOYMENT_UNDO"
+            fd_release_ssh_runtime_ownership
+        ); then
+            fd_remove_file "$PENDING_FILE" 'pending deployment state' || true
+            note 'Deployment failed before candidate startup; the exact prior configuration and SSH state were restored without starting containers.'
+        else
+            note "Deployment failed during durable pre-start recovery; run $PROGRAM recover-abort."
+        fi
+    else
+        note "Deployment failed before candidate startup and its pre-start undo could not be validated. State remains fail-closed; inspect $PENDING_FILE before recovery."
+    fi
+    exit "$code"
+}
+
+
+deployment_failure() {
+    fd_deployment_failure "$@"
+}
+
+fd_arm_recovery() {
+    RECOVERY_ARMED=true
+    RECOVERY_HANDLED=false
+    CANDIDATE_STARTED=false
+    trap 'fd_deployment_failure $?' ERR
+    trap 'fd_deployment_failure 129' HUP
+    trap 'fd_deployment_failure 130' INT
+    trap 'fd_deployment_failure 143' TERM
+}
+
+fd_disarm_recovery() {
+    RECOVERY_ARMED=false
+    trap - ERR HUP INT TERM
+}
+
+fd_rendered_sha() {
+    fd_compose_in "$1" config | sha256sum | awk '{print $1}'
+}
+
+fd_validate_active_assets() {
+    local dir=$1 asset expected actual
+
+    for asset in docker-compose.yml docker-compose.prod.yml docker-compose.custom.yml .env.production; do
+        case $asset in
+            docker-compose.yml) expected=$COMPOSE_SHA256 ;;
+            docker-compose.prod.yml) expected=$COMPOSE_PROD_SHA256 ;;
+            docker-compose.custom.yml) expected=$COMPOSE_OVERLAY_SHA256 ;;
+            .env.production) expected=$ENV_PRODUCTION_SHA256 ;;
+        esac
+        require_regular_file "$SOURCE_DIR/$asset" "active source asset $asset"
+        actual=$(sha256sum "$SOURCE_DIR/$asset" | awk '{print $1}')
+        [[ $actual == "$expected" ]] || die "$asset differs from the verified release; run repair"
+    done
+}
+
+fd_validate_active_environment() {
+    local environment=$SOURCE_DIR/.env
+
+    [[ $(env_value "$environment" AUTOUPDATE) == false ]] || die 'managed environment does not disable automatic updates; run repair'
+    [[ $(env_value "$environment" VERSIONS_URL) == "$DISABLED_VERSIONS_URL" ]] || die 'managed environment versions URL is not fail-closed; run repair'
+    [[ $(env_value "$environment" UPGRADE_SCRIPT_URL) == "$DISABLED_UPGRADE_SCRIPT_URL" ]] || die 'managed environment upgrade URL is not fail-closed; run repair'
+    [[ $(env_value "$environment" RELEASES_URL) == "$DISABLED_RELEASES_URL" ]] || die 'managed environment releases URL are not fail-closed; run repair'
+    fd_validate_ports "$environment"
+}
+
+fd_require_verified_current() {
+    fd_verify_current
+}
+
+fd_validate_existing_candidate() {
+    local dir=$1 candidate_hash recorded_hash
+
+    [[ ! -e $dir && ! -L $dir ]] && return 0
+    require_regular_file "$dir/release.manifest" 'existing release manifest'
+    candidate_hash=$(sha256sum "$MANIFEST_PATH" | awk '{print $1}')
+    recorded_hash=$(sha256sum "$dir/release.manifest" | awk '{print $1}')
+    [[ $candidate_hash == "$recorded_hash" ]] || die "version $VERSION is already bound to a different signed release manifest"
+}
+
+fd_validate_update_target() {
+    local current=$1 activation comparison
+
+    activation=$(fd_activation_file "$VERSION")
+    if [[ -e $activation || -L $activation ]]; then
+        require_regular_file "$activation" "activation state for $VERSION"
+        die "update refused: $VERSION was already activated; use rollback or repair"
+    fi
+    comparison=$(fd_version_compare "$VERSION" "$current")
+    [[ $comparison == 1 ]] \
+        || die "update refused: target $VERSION is not newer than active release $current"
+}
+
+fd_write_recover_abort_state() {
+    local state=$1 candidate=$2 previous=$3 migration=$4 journal=$5 prestart_sha=$6
+
+    fd_atomic_write "$PENDING_FILE" 'pending deployment state' \
+        "STATE=$state" \
+        "CANDIDATE_VERSION=$candidate" \
+        "PREVIOUS_VERSION=$previous" \
+        "MIGRATION_FINGERPRINT_BEFORE=$migration" \
+        "PRESTART_UNDO=$journal" \
+        "PRESTART_UNDO_SHA256=$prestart_sha" \
+        'CANDIDATE_STARTED=false'
+}
+
+
+fd_assert_recover_abort_current() {
+    local previous=$1 phase=$2 current
+
+    case $phase in
+        clear)
+            if [[ ! -e $CURRENT_FILE && ! -L $CURRENT_FILE ]]; then
+                return 0
+            fi
+            ;;
+        restoring)
+            [[ -e $CURRENT_FILE || -L $CURRENT_FILE ]] || return 0
+            ;;
+        restored) ;;
+        *) die 'recover-abort current-pointer phase is invalid' ;;
+    esac
+    if [[ -z $previous ]]; then
+        [[ ! -e $CURRENT_FILE && ! -L $CURRENT_FILE ]] \
+            || die 'recover-abort found an unexpected active release without a previous release'
+        return 0
+    fi
+    current=$(fd_current_version)
+    [[ $current == "$previous" ]] \
+        || die "recover-abort found active release $current; expected prior release $previous"
+}
+
+fd_recover_abort() {
+    local state candidate previous migration journal started prestart_sha
+
+    fd_cleanup_staging_directories
+    if [[ -e $FORWARD_RECOVERY_FILE || -L $FORWARD_RECOVERY_FILE ]]; then
+        require_regular_file "$FORWARD_RECOVERY_FILE" 'forward recovery state'
+        die "recover-abort and pre-start undo are forbidden after candidate startup; run $PROGRAM recover-forward"
+    fi
+    require_regular_file "$PENDING_FILE" 'pending deployment state'
+    state=$(read_field "$PENDING_FILE" STATE 'pending deployment state')
+    case $state in
+        pending-candidate|recover-abort-restoring|recover-abort-finalizing|recover-abort-cleaning) ;;
+        *) die 'pending deployment state is not recoverable' ;;
+    esac
+    started=$(read_field "$PENDING_FILE" CANDIDATE_STARTED 'pending deployment state')
+    [[ $started == false ]] \
+        || die "recover-abort and pre-start undo are forbidden after candidate startup; run $PROGRAM recover-forward"
+    candidate=$(read_field "$PENDING_FILE" CANDIDATE_VERSION 'pending deployment state')
+    validate_version "$candidate"
+    previous=$(read_field "$PENDING_FILE" PREVIOUS_VERSION 'pending deployment state')
+    [[ -z $previous ]] || validate_version "$previous"
+    migration=$(read_field "$PENDING_FILE" MIGRATION_FINGERPRINT_BEFORE 'pending deployment state')
+    [[ $migration == uninitialized || $migration =~ ^[0-9a-f]{32}$ ]] \
+        || die 'pending deployment migration fingerprint is invalid'
+    journal=$(read_field "$PENDING_FILE" PRESTART_UNDO 'pending deployment state')
+    fd_validate_undo_path "$journal"
+    prestart_sha=$(read_field "$PENDING_FILE" PRESTART_UNDO_SHA256 'pending deployment state')
+    VERSION=$candidate
+    DEPLOYMENT_UNDO=$journal
+    DEPLOYMENT_PRESTART_UNDO_SHA256=$prestart_sha
+    case $state in
+        pending-candidate)
+            fd_assert_recover_abort_current "$previous" clear
+            fd_validate_prestart_undo "$journal" "$prestart_sha"
+            fd_write_recover_abort_state recover-abort-restoring "$candidate" "$previous" \
+                "$migration" "$journal" "$prestart_sha"
+            fd_restore_prestart_undo "$journal"
+            fd_restore_previous_current "$previous"
+            fd_write_recover_abort_state recover-abort-finalizing "$candidate" "$previous" \
+                "$migration" "$journal" "$prestart_sha"
+            ;;
+        recover-abort-restoring)
+            fd_assert_recover_abort_current "$previous" restoring
+            fd_validate_prestart_undo "$journal" "$prestart_sha"
+            fd_restore_prestart_undo "$journal"
+            fd_restore_previous_current "$previous"
+            fd_write_recover_abort_state recover-abort-finalizing "$candidate" "$previous" \
+                "$migration" "$journal" "$prestart_sha"
+            ;;
+    esac
+    if [[ $state == pending-candidate || $state == recover-abort-restoring \
+        || $state == recover-abort-finalizing ]]; then
+        fd_assert_recover_abort_current "$previous" restored
+        fd_validate_prestart_undo "$journal" "$prestart_sha"
+        fd_write_recover_abort_state recover-abort-cleaning "$candidate" "$previous" \
+            "$migration" "$journal" "$prestart_sha"
+        fd_finish_prestart_undo_finalization "$journal"
+    else
+        fd_assert_recover_abort_current "$previous" restored
+        fd_finish_prestart_undo_finalization "$journal"
+    fi
+    fd_release_ssh_runtime_ownership
+    fd_remove_file "$PENDING_FILE" 'pending deployment state'
+    note 'Recovered the exact pre-start configuration and SSH state without starting containers.'
+}
+
+
+fd_recover_forward() {
+    local candidate previous migration journal prestart_sha pending_started pending_state
+    local migration_after rendered field current recovery_file='' recovery_label=''
+    local forward_present=false pending_present=false release_directory state
+
+    if [[ -e $FORWARD_RECOVERY_FILE || -L $FORWARD_RECOVERY_FILE ]]; then
+        require_regular_file "$FORWARD_RECOVERY_FILE" 'forward recovery state'
+        state=$(read_field "$FORWARD_RECOVERY_FILE" STATE 'forward recovery state')
+        [[ $state == forward-recovery-required ]] || die 'forward recovery state is invalid'
+        recovery_file=$FORWARD_RECOVERY_FILE
+        recovery_label='forward recovery state'
+        forward_present=true
+    fi
+    fd_cleanup_staging_directories
+    if [[ -e $PENDING_FILE || -L $PENDING_FILE ]]; then
+        require_regular_file "$PENDING_FILE" 'pending deployment state'
+        pending_state=$(read_field "$PENDING_FILE" STATE 'pending deployment state')
+        pending_started=$(read_field "$PENDING_FILE" CANDIDATE_STARTED 'pending deployment state')
+        [[ $pending_state == pending-candidate ]] \
+            || die 'pending deployment state is not eligible for forward recovery'
+        case $pending_started in
+            true) ;;
+            false)
+                [[ $forward_present == true ]] \
+                    || die 'pending deployment state does not prove candidate startup'
+                ;;
+            *) die 'pending deployment candidate-started disposition is invalid' ;;
+        esac
+        if [[ -z $recovery_file ]]; then
+            recovery_file=$PENDING_FILE
+            recovery_label='pending deployment state'
+        fi
+        pending_present=true
+    fi
+    [[ -n $recovery_file ]] \
+        || die 'forward recovery requires a durable candidate-started disposition'
+    if [[ $forward_present == true && $pending_present == true ]]; then
+        for field in CANDIDATE_VERSION PREVIOUS_VERSION MIGRATION_FINGERPRINT_BEFORE \
+            PRESTART_UNDO PRESTART_UNDO_SHA256; do
+            [[ $(read_field "$PENDING_FILE" "$field" 'pending deployment state') \
+                == $(read_field "$FORWARD_RECOVERY_FILE" "$field" 'forward recovery state') ]] \
+                || die "forward recovery state differs between durable records: $field"
+        done
+    fi
+
+    candidate=$(read_field "$recovery_file" CANDIDATE_VERSION "$recovery_label")
+    validate_version "$candidate"
+    previous=$(read_field "$recovery_file" PREVIOUS_VERSION "$recovery_label")
+    [[ -z $previous ]] || validate_version "$previous"
+    migration=$(read_field "$recovery_file" MIGRATION_FINGERPRINT_BEFORE "$recovery_label")
+    [[ $migration == uninitialized || $migration =~ ^[0-9a-f]{32}$ ]] \
+        || die 'forward recovery migration fingerprint is invalid'
+    journal=$(read_field "$recovery_file" PRESTART_UNDO "$recovery_label")
+    fd_validate_undo_path "$journal"
+    prestart_sha=$(read_field "$recovery_file" PRESTART_UNDO_SHA256 "$recovery_label")
+    validate_digest "sha256:$prestart_sha"
+
+    VERSION=$candidate
+    PREVIOUS_CURRENT_VERSION=$previous
+    DEPLOYMENT_MIGRATION_FINGERPRINT=$migration
+    DEPLOYMENT_UNDO=$journal
+    DEPLOYMENT_PRESTART_UNDO_SHA256=$prestart_sha
+    release_directory=$(fd_release_dir "$candidate")
+    require_regular_file "$release_directory/verified" 'forward recovery verified release marker'
+    fd_load_recorded_release "$candidate"
+    fd_write_forward_failure_state
+    fd_write_candidate_started_pending
+    if [[ -e $CURRENT_FILE || -L $CURRENT_FILE ]]; then
+        current=$(fd_current_version)
+        [[ $current == "$candidate" ]] \
+            || die "forward recovery found active release $current; expected candidate $candidate"
+    fi
+    [[ $(env_value "$SOURCE_DIR/.env" COOLIFY_FORK_VERSION) == "$candidate" ]] \
+        || die 'active environment does not identify the exact failed candidate'
+    fd_validate_active_assets "$release_directory"
+    fd_validate_active_environment
+    fd_validate_effective_images "$SOURCE_DIR"
+    fd_validate_effective_bindings "$SOURCE_DIR"
+    fd_compose_in "$SOURCE_DIR" config --quiet || die 'failed candidate Compose configuration is invalid'
+    fd_finish_prestart_undo_finalization "$journal"
+    fd_release_ssh_runtime_ownership
+
+    fd_ensure_network
+    fd_compose_in "$SOURCE_DIR" up --detach --remove-orphans
+    fd_verify_runtime
+    migration_after=$(fd_migration_fingerprint "$SOURCE_DIR/.env")
+    rendered=$(fd_rendered_sha "$SOURCE_DIR")
+    fd_reconcile_forward_activation "$migration" "$migration_after" "$rendered"
+    enforce_data_permissions
+    fd_remove_file "$PENDING_FILE" 'pending deployment state'
+    fd_remove_file "$FORWARD_RECOVERY_FILE" 'forward recovery state'
+    note "Recovered $candidate forward from its exact signed bundle without applying pre-start undo."
+}
+
+
+fd_start_candidate() {
+    local staging=$1 migration_before=$2 record_bundle=$3 migration_after rendered
+
+    if [[ -e $CURRENT_FILE || -L $CURRENT_FILE ]]; then
+        PREVIOUS_CURRENT_VERSION=$(fd_current_version)
+    else
+        PREVIOUS_CURRENT_VERSION=
+    fi
+    DEPLOYMENT_MIGRATION_FINGERPRINT=$migration_before
+    fd_lock_localhost_ssh_directories
+    DEPLOYMENT_UNDO=$(fd_create_prestart_undo)
+    DEPLOYMENT_PRESTART_UNDO_SHA256=$(sha256sum "$DEPLOYMENT_UNDO/prestart-undo.manifest" | awk '{print $1}')
+    fd_validate_prestart_undo "$DEPLOYMENT_UNDO" "$DEPLOYMENT_PRESTART_UNDO_SHA256"
+    fd_arm_recovery
+    fd_mark_pending
+    adopt_localhost_ssh_key
+    fd_activate_staging "$staging"
+    fd_ensure_network
+    fd_compose_in "$SOURCE_DIR" config --quiet || die 'activated Compose configuration is invalid'
+    fd_validate_prestart_undo "$DEPLOYMENT_UNDO" "$DEPLOYMENT_PRESTART_UNDO_SHA256"
+    [[ $record_bundle == true ]] && fd_commit_bundle "$staging"
+    fd_mark_candidate_started
+    fd_finalize_prestart_undo "$DEPLOYMENT_UNDO"
+    fd_release_ssh_runtime_ownership
+    fd_compose_in "$SOURCE_DIR" up --detach --remove-orphans
+    fd_verify_runtime
+    migration_after=$(fd_migration_fingerprint "$SOURCE_DIR/.env")
+    rendered=$(fd_rendered_sha "$SOURCE_DIR")
+    fd_write_activation "$migration_before" "$migration_after" "$rendered"
+    enforce_data_permissions
+    fd_remove_file "$PENDING_FILE" 'pending deployment state'
+    fd_remove_file "$FORWARD_RECOVERY_FILE" 'forward recovery state'
+    fd_disarm_recovery
+    fd_release_tracked_staging "$staging"
+}
+
+
+fd_deploy_new() {
+    local platform staging migration_before release_directory
+
+    platform=$(host_platform)
+    validate_image_for_host "$(image_ref_main)" "$platform"
+    validate_image_for_host "$(image_ref_realtime)" "$platform"
+    validate_image_for_host "$(image_ref_postgres)" "$platform"
+    validate_image_for_host "$(image_ref_redis)" "$platform"
+    if "$DRY_RUN"; then
+        note "PLAN: verify signed manifest, stage all assets and environment, then atomically activate release $VERSION"
+        return 0
+    fi
+    release_directory=$(fd_release_dir "$VERSION")
+    fd_validate_existing_candidate "$release_directory"
+    bootstrap_directories
+    fd_cleanup_staging_directories
+    staging=$(fd_new_staging)
+    fd_track_staging "$staging"
+    fd_stage_remote "$staging"
+    migration_before=$(fd_migration_fingerprint "$staging/.env")
+    fd_start_candidate "$staging" "$migration_before" true
+    note "Verified and recorded $VERSION. Roll back with: $PROGRAM rollback --version $VERSION"
+}
+
+fd_deploy_recorded() {
+    local target=$VERSION staging migration_before compatible
+
+    fd_load_recorded_release "$target"
+    fd_load_activation "$target"
+    migration_before=$(fd_migration_fingerprint "$SOURCE_DIR/.env")
+    compatible=$(fd_activation_field "$target" MIGRATION_FINGERPRINT_AFTER)
+    if [[ $ACTION == rollback && $migration_before != "$compatible" ]]; then
+        die "rollback refused: current migration fingerprint $migration_before is not explicitly compatible with target $target ($compatible). Use the control-plane migration recovery path for a schema-changing rollback"
+    fi
+    if [[ $ACTION == repair && $migration_before != "$compatible" ]]; then
+        die 'repair refused: current migration fingerprint differs from the verified release; use the control-plane migration recovery path'
+    fi
+    if "$DRY_RUN"; then
+        note "PLAN: validate and atomically activate verified release $target, then start and verify it"
+        return 0
+    fi
+    bootstrap_directories
+    fd_cleanup_staging_directories
+    staging=$(fd_new_staging)
+    fd_track_staging "$staging"
+    fd_stage_recorded "$staging"
+    fd_start_candidate "$staging" "$migration_before" false
+}
+
+fd_status() {
+    local current manifest line
+
+    if [[ -e $FORWARD_RECOVERY_FILE || -L $FORWARD_RECOVERY_FILE ]]; then
+        require_regular_file "$FORWARD_RECOVERY_FILE" 'forward recovery state'
+        note 'Fork deploy forward recovery state:'
+        while IFS= read -r line; do note "  $line"; done <"$FORWARD_RECOVERY_FILE"
+        return 1
+    fi
+    if [[ -e $PENDING_FILE || -L $PENDING_FILE ]]; then
+        require_regular_file "$PENDING_FILE" 'pending deployment state'
+        note 'Fork deploy pending state:'
+        while IFS= read -r line; do note "  $line"; done <"$PENDING_FILE"
+        return 1
+    fi
+    if [[ ! -e $CURRENT_FILE && ! -L $CURRENT_FILE ]]; then
+        note 'Fork deploy status: unmanaged (no verified release recorded)'
+        return 1
+    fi
+    current=$(fd_current_version)
+    fd_load_recorded_release "$current"
+    manifest=$(fd_release_dir "$current")/release.manifest
+    note "Fork deploy version: $current"
+    note "Source revision: $(read_field "$manifest" SOURCE_REVISION 'recorded release manifest')"
+    note "Main digest: $MAIN_DIGEST"
+    note "Realtime digest: $REALTIME_DIGEST"
+    docker ps --filter name='^/coolify' --format '{{.Names}} {{.Status}}' || true
+}
+
+fd_verify_current() {
+    local current dir rendered migrations
+
+    current=$(fd_current_version)
+    fd_load_recorded_release "$current"
+    fd_load_activation "$current"
+    dir=$(fd_release_dir "$current")
+    fd_validate_active_assets "$dir"
+    fd_validate_active_environment
+    rendered=$(fd_rendered_sha "$SOURCE_DIR")
+    [[ $rendered == "$(fd_activation_field "$current" RENDERED_COMPOSE_SHA256)" ]] || die 'effective rendered Compose differs from the active verified state; run repair'
+    fd_validate_effective_images "$SOURCE_DIR"
+    fd_validate_effective_bindings "$SOURCE_DIR"
+    migrations=$(fd_migration_fingerprint "$SOURCE_DIR/.env")
+    [[ $migrations == "$(fd_activation_field "$current" MIGRATION_FINGERPRINT_AFTER)" ]] || die 'database migration fingerprint differs from the active verified state; investigate before update or rollback'
+    fd_verify_runtime
+    note "Release $current is healthy and matches its immutable verified bundle and active state."
+}
+
+main() {
+    [[ -n ${BASH_VERSION:-} ]] || die 'this script requires Bash'
+    fd_parse_args "$@"
+    if [[ $ACTION == trust ]]; then
+        fd_preflight_trust
+        fd_install_production_trust_key "$TRUST_PUBLIC_KEY"
+        return
+    fi
+    configure_paths
+    preflight
+    acquire_lock
+    fd_configure_manifest_trust
+    case $ACTION in
+        install)
+            fd_ensure_no_unresolved
+            [[ ! -e $CURRENT_FILE && ! -L $CURRENT_FILE ]] || die 'a managed release already exists; use update'
+            fd_assert_clean_install_state
+            fd_download_manifest
+            fd_load_manifest
+            fd_deploy_new
+            ;;
+        update)
+            fd_ensure_no_unresolved
+            fd_require_verified_current
+            UPDATE_FROM_VERSION=$(fd_current_version)
+            fd_download_manifest
+            fd_load_manifest
+            fd_validate_update_target "$UPDATE_FROM_VERSION"
+            fd_deploy_new
+            ;;
+        rollback)
+            fd_ensure_no_unresolved
+            fd_deploy_recorded
+            ;;
+        repair)
+            fd_ensure_no_unresolved
+            VERSION=$(fd_current_version)
+            ACTION=repair
+            fd_deploy_recorded
+            ;;
+        recover-abort) fd_recover_abort ;;
+        recover-forward) fd_recover_forward ;;
+        status) fd_status ;;
+        verify)
+            fd_ensure_no_unresolved
+            fd_verify_current
+            ;;
+    esac
+}
+
+main "$@"

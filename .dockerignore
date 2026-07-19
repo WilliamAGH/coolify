@@ -4,9 +4,8 @@
 /public/hot
 /public/storage
 /vendor
-.env
-.env.backup
-.env.secrets
+.env*
+!/.env.development.example
 .phpunit.result.cache
 Homestead.json
 Homestead.yaml
@@ -14,6 +13,7 @@ auth.json
 npm-debug.log
 yarn-error.log
 /.fleet
+/.git
 /.idea
 /.vscode
 /.npm
@@ -22,7 +22,6 @@ yarn-error.log
 .rnd
 /.ssh
 .ignition.json
-.env.dusk.local
 docker/coolify-realtime/node_modules
 
 /storage/*.key
@@ -31,8 +30,11 @@ docker/coolify-realtime/node_modules
 /storage/app/ssh/mux
 /storage/app/tmp
 /storage/app/debugbar
+/storage/debugbar
 /storage/logs
 /storage/pail
-
-
-
+/.control-plane-labs/
+**/__pycache__/
+**/*.py[cod]
+tests/Integration/**/.artifacts/
+tests/Integration/**/.evidence/

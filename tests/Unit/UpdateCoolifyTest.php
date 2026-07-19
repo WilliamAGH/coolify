@@ -5,6 +5,21 @@ use App\Models\InstanceSettings;
 use App\Models\Server;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Tests\TestCase;
+
+uses(TestCase::class);
+
+function updateCoolifyActionForTest(Server $server, InstanceSettings $settings): UpdateCoolify
+{
+    $action = Mockery::mock(UpdateCoolify::class)
+        ->makePartial()
+        ->shouldAllowMockingProtectedMethods();
+    $action->server = $server;
+    $action->shouldReceive('instanceSettings')->andReturn($settings);
+
+    return $action;
+}
 
 beforeEach(function () {
     // Mock Server
@@ -13,8 +28,11 @@ beforeEach(function () {
 
     // Mock InstanceSettings
     $this->settings = Mockery::mock(InstanceSettings::class);
-    $this->settings->is_auto_update_enabled = true;
-    $this->settings->shouldReceive('save')->andReturn(true);
+    $this->settings->shouldReceive('getAttribute')
+        ->with('is_auto_update_enabled')
+        ->byDefault()
+        ->andReturn(true);
+    $this->settings->shouldReceive('update')->byDefault()->andReturn(true);
 });
 
 afterEach(function () {
@@ -25,17 +43,47 @@ it('has UpdateCoolify action class', function () {
     expect(class_exists(UpdateCoolify::class))->toBeTrue();
 });
 
+it('recognizes only guarded fork release versions', function () {
+    expect(UpdateCoolify::isGuardedForkRelease('4.13.1-fork'))->toBeTrue()
+        ->and(UpdateCoolify::isGuardedForkRelease('4.13.1-fork.2'))->toBeTrue()
+        ->and(UpdateCoolify::isGuardedForkRelease('4.13.1'))->toBeFalse()
+        ->and(UpdateCoolify::isGuardedForkRelease('4.13.1-fork.0'))->toBeFalse();
+});
+
+it('does not contact upstream or run the generic updater for a fork release', function () {
+    config(['constants.coolify.version' => '4.13.1-fork']);
+    Http::preventStrayRequests();
+    $this->settings->shouldReceive('update')
+        ->once()
+        ->with(['new_version_available' => false]);
+    Log::shouldReceive('warning')
+        ->once()
+        ->with('Upstream updater disabled for fork release', Mockery::type('array'));
+    $action = updateCoolifyActionForTest($this->mockServer, $this->settings);
+
+    $action->handle();
+
+    Http::assertNothingSent();
+});
+
+it('directs manual fork updates to the guarded deployment workflow', function () {
+    config(['constants.coolify.version' => '4.13.1-fork']);
+    Http::preventStrayRequests();
+    $this->settings->shouldReceive('update')
+        ->once()
+        ->with(['new_version_available' => false]);
+    Log::shouldReceive('warning')
+        ->once()
+        ->with('Upstream updater disabled for fork release', Mockery::type('array'));
+    $action = updateCoolifyActionForTest($this->mockServer, $this->settings);
+
+    expect(fn () => $action->handle(manual_update: true))
+        ->toThrow(RuntimeException::class, 'guarded fork deployment workflow');
+
+    Http::assertNothingSent();
+});
+
 it('validates cache against running version before fallback', function () {
-    // Mock Server::find to return our mock server
-    Server::shouldReceive('find')
-        ->with(0)
-        ->andReturn($this->mockServer);
-
-    // Mock instanceSettings
-    $this->app->instance('App\Models\InstanceSettings', function () {
-        return $this->settings;
-    });
-
     // CDN fails
     Http::fake(['*' => Http::response(null, 500)]);
 
@@ -45,13 +93,13 @@ it('validates cache against running version before fallback', function () {
 
     config(['constants.coolify.version' => '4.0.10']);
 
-    $action = new UpdateCoolify;
+    $action = updateCoolifyActionForTest($this->mockServer, $this->settings);
 
     // Should throw exception - cache is older than running
     try {
         $action->handle(manual_update: false);
         expect(false)->toBeTrue('Expected exception was not thrown');
-    } catch (\Exception $e) {
+    } catch (Exception $e) {
         expect($e->getMessage())->toContain('cache version');
         expect($e->getMessage())->toContain('4.0.5');
         expect($e->getMessage())->toContain('4.0.10');
@@ -59,16 +107,6 @@ it('validates cache against running version before fallback', function () {
 });
 
 it('uses validated cache when CDN fails and cache is newer', function () {
-    // Mock Server::find
-    Server::shouldReceive('find')
-        ->with(0)
-        ->andReturn($this->mockServer);
-
-    // Mock instanceSettings
-    $this->app->instance('App\Models\InstanceSettings', function () {
-        return $this->settings;
-    });
-
     // CDN fails
     Http::fake(['*' => Http::response(null, 500)]);
 
@@ -79,11 +117,10 @@ it('uses validated cache when CDN fails and cache is newer', function () {
     config(['constants.coolify.version' => '4.0.5']);
 
     // Mock the update method to prevent actual update
-    $action = Mockery::mock(UpdateCoolify::class)->makePartial();
+    $action = updateCoolifyActionForTest($this->mockServer, $this->settings);
     $action->shouldReceive('update')->once();
-    $action->server = $this->mockServer;
 
-    \Illuminate\Support\Facades\Log::shouldReceive('warning')
+    Log::shouldReceive('warning')
         ->once()
         ->with('Failed to fetch fresh version from CDN, using validated cache', Mockery::type('array'));
 
@@ -94,16 +131,6 @@ it('uses validated cache when CDN fails and cache is newer', function () {
 });
 
 it('prevents downgrade even with manual update', function () {
-    // Mock Server::find
-    Server::shouldReceive('find')
-        ->with(0)
-        ->andReturn($this->mockServer);
-
-    // Mock instanceSettings
-    $this->app->instance('App\Models\InstanceSettings', function () {
-        return $this->settings;
-    });
-
     // CDN returns older version
     Http::fake([
         '*' => Http::response([
@@ -114,9 +141,9 @@ it('prevents downgrade even with manual update', function () {
     // Current version is newer
     config(['constants.coolify.version' => '4.0.10']);
 
-    $action = new UpdateCoolify;
+    $action = updateCoolifyActionForTest($this->mockServer, $this->settings);
 
-    \Illuminate\Support\Facades\Log::shouldReceive('error')
+    Log::shouldReceive('error')
         ->once()
         ->with('Downgrade prevented', Mockery::type('array'));
 
@@ -124,7 +151,7 @@ it('prevents downgrade even with manual update', function () {
     try {
         $action->handle(manual_update: true);
         expect(false)->toBeTrue('Expected exception was not thrown');
-    } catch (\Exception $e) {
+    } catch (Exception $e) {
         expect($e->getMessage())->toContain('Cannot downgrade');
         expect($e->getMessage())->toContain('4.0.10');
         expect($e->getMessage())->toContain('4.0.0');

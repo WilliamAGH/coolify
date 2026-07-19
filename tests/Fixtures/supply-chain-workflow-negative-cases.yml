@@ -1,0 +1,46 @@
+cases:
+  - name: production bypasses application validation
+    mutation: remove-production-validation
+    expected: production publication must wait for application validation
+  - name: testing host targets the production image
+    mutation: testing-host-targets-production
+    expected: testing-host has an invalid target_repository
+  - name: staging creates a mutable compatibility alias
+    mutation: staging-publishes-latest
+    expected: staging has an invalid publish_latest
+  - name: staging targets the production repository
+    mutation: staging-targets-production
+    expected: staging has an invalid target_repository
+  - name: target concurrency cancels an active release
+    mutation: cancel-target-publication
+    expected: shared publication must serialize each target without cancellation
+  - name: caller loses complete publication serialization
+    mutation: drop-caller-target-concurrency
+    expected: production must serialize the complete publication invocation by target
+  - name: alias mutation loses job-level serialization
+    mutation: drop-alias-mutation-serialization
+    expected: alias mutation jobs must serialize per target at the job level because workflow_call ignores workflow-level concurrency
+  - name: latest repair loses job-level serialization
+    mutation: drop-repair-alias-mutation-serialization
+    expected: alias mutation jobs must serialize per target at the job level because workflow_call ignores workflow-level concurrency
+  - name: latest repair bypasses its forward-only owner
+    mutation: repair-latest-bypasses-forward-helper
+    expected: automatic latest repair must delegate provenance validation and forward mutation to the helper
+  - name: latest repair permits a non-production target
+    mutation: repair-latest-allows-non-production
+    expected: automatic latest repair must run only for a validated production repair
+  - name: immutable run tags are omitted after attestation
+    mutation: remove-immutable-run-tags
+    expected: 'missing lifecycle step: Create or verify immutable run tags'
+  - name: immutable run tags omit the source commit
+    mutation: unprovenanced-run-tags
+    expected: immutable run tags must begin with the source commit and include the run provenance
+  - name: attestation verification trusts the caller rather than the reusable signer
+    mutation: caller-workflow-signer
+    expected: attestation verification must require the reusable workflow signer
+  - name: semantic tags are published sequentially
+    mutation: semantic-tags-sequential
+    expected: semantic tags must use a preflighted cross-registry publisher
+  - name: an external action is mutable
+    mutation: make-checkout-mutable
+    expected: every external action must use a full commit SHA

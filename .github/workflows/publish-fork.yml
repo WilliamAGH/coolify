@@ -1,0 +1,102 @@
+name: Publish fork images
+
+on:
+  push:
+    tags:
+      - '*.*.*-fork'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: fork-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  application-validation:
+    uses: ./.github/workflows/application-validation.yml
+    permissions:
+      contents: read
+
+  resolve-tag:
+    name: Bind fork version tag to source commit
+    needs: application-validation
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: version
+        name: Require an exact fork tag and commit binding
+        env:
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          SOURCE_REVISION: ${{ github.sha }}
+          VERSION_PATTERN: '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-fork$'
+        run: |
+          set -Eeuo pipefail
+          [[ "$REF_TYPE" == tag ]]
+          [[ "$REF" == "refs/tags/$REF_NAME" ]]
+          printf '%s' "$REF_NAME" | grep -Eq "$VERSION_PATTERN"
+          printf '%s' "$SOURCE_REVISION" | grep -Eq '^[0-9a-f]{40}$'
+          [[ "$(git rev-parse --verify "${REF}^{commit}")" == "$SOURCE_REVISION" ]]
+          [[ "$(git cat-file -t "$SOURCE_REVISION")" == commit ]]
+          git fetch --no-tags origin '+refs/heads/v4.x:refs/remotes/origin/v4.x'
+          trusted_default_branch="$(git rev-parse --verify 'refs/remotes/origin/v4.x^{commit}')"
+          git merge-base --is-ancestor "$SOURCE_REVISION" "$trusted_default_branch"
+
+          command -v php >/dev/null
+          command -v jq >/dev/null
+          [[ -f config/constants.php && ! -L config/constants.php ]]
+          [[ -f versions.json && ! -L versions.json ]]
+          # shellcheck disable=SC2016 # PHP code is intentionally single-quoted for the shell.
+          constants_version="$(php -r '
+            function env($key, $default = null) { return $default; }
+            $constants = require $argv[1];
+            $version = $constants["coolify"]["version"] ?? null;
+            if (! is_string($version) || $version === "") { exit(1); }
+            echo $version;
+          ' config/constants.php)"
+          versions_json_version="$(jq -er '.coolify.v4.version | strings' versions.json)"
+          [[ "$constants_version" == "$REF_NAME" ]] || {
+            printf 'config/constants.php Coolify version must equal the fork tag: expected %s, found %s.\n' \
+              "$REF_NAME" "$constants_version" >&2
+            exit 1
+          }
+          [[ "$versions_json_version" == "$REF_NAME" ]] || {
+            printf 'versions.json Coolify v4 version must equal the fork tag: expected %s, found %s.\n' \
+              "$REF_NAME" "$versions_json_version" >&2
+            exit 1
+          }
+          printf 'version=%s\n' "$REF_NAME" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Build, attest, and coordinate fork publication
+    needs: resolve-tag
+    uses: ./.github/workflows/publish-linux-image.yml
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: write
+      id-token: write
+      packages: write
+    with:
+      artifact_name: coolify-fork
+      candidate_repository: williamagh/coolify-fork-candidates
+      dockerfile: docker/production/Dockerfile
+      publish_latest: false
+      release_kind: fork
+      semantic_version: ${{ needs.resolve-tag.outputs.version }}
+      target_repository: williamagh/coolify
+      validate_only: false
+    secrets:
+      FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY: ${{ secrets.FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY }}
+      NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+      NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}

@@ -1,0 +1,257 @@
+name: Application validation
+
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: application-validation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  php:
+    name: PHP 8.5 application
+    runs-on: ubuntu-24.04
+    services:
+      redis:
+        image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      APP_ENV: testing
+      APP_MAINTENANCE_DRIVER: file
+      CACHE_STORE: array
+      DB_CONNECTION: testing
+      QUEUE_CONNECTION: sync
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: 6379
+      SESSION_DRIVER: array
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - name: Set up PHP
+        uses: shivammathur/setup-php@44454db4f0199b8b9685a5d763dc37cbf79108e1 # 2.36.0
+        with:
+          php-version: '8.5'
+          coverage: none
+          extensions: mbstring, pdo_sqlite, redis
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install Composer dependencies
+        run: composer install --no-interaction --prefer-dist --optimize-autoloader
+      - run: npm ci
+      - name: Build application assets
+        run: npm run build
+      - name: Validate Composer metadata
+        run: composer validate --strict
+      - name: Audit Composer dependencies
+        run: composer audit --locked --no-interaction
+      - name: Discover packages and boot the application
+        run: |
+          php artisan package:discover --ansi
+          php artisan about --only=environment
+      - name: Run release and version-consumer tests
+        run: |
+          set -Eeuo pipefail
+          php artisan test --compact \
+            tests/Unit/CheckForUpdatesJobTest.php \
+            tests/Unit/ProductionImageSupplyChainWorkflowTest.php \
+            tests/Unit/ReleasePlatformAcceptanceWorkflowTest.php \
+            tests/Unit/ReleasePublicationSerializationTest.php \
+            tests/Unit/ReleaseVersionConsumerContractTest.php \
+            tests/Unit/StagingImageReferenceWorkflowTest.php \
+            tests/Unit/UpdateCoolifyTest.php \
+            tests/Feature/ForkVersionConsumerTest.php
+
+  browser:
+    name: Pest browser tests
+    runs-on: ubuntu-24.04
+    env:
+      APP_ENV: testing
+      APP_MAINTENANCE_DRIVER: file
+      CACHE_STORE: array
+      DB_CONNECTION: testing
+      QUEUE_CONNECTION: sync
+      SESSION_DRIVER: array
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - name: Set up PHP
+        uses: shivammathur/setup-php@44454db4f0199b8b9685a5d763dc37cbf79108e1 # 2.36.0
+        with:
+          php-version: '8.5'
+          coverage: none
+          extensions: mbstring, pdo_sqlite
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: composer install --no-interaction --prefer-dist --optimize-autoloader
+      - run: npm ci
+      - name: Install Chromium and system dependencies
+        run: npx playwright install --with-deps chromium
+      - name: Build browser assets
+        run: npm run build
+      - name: Run Pest browser tests
+        run: php artisan test --compact tests/v4/Browser
+
+  formatting:
+    name: PHP formatting
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up PHP
+        uses: shivammathur/setup-php@44454db4f0199b8b9685a5d763dc37cbf79108e1 # 2.36.0
+        with:
+          php-version: '8.5'
+          coverage: none
+      - run: composer install --no-interaction --prefer-dist --optimize-autoloader
+      - name: Format and require a clean tree
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -Eeuo pipefail
+          base_sha="${BASE_SHA:-}"
+          if ! git cat-file -e "${base_sha}^{commit}" 2>/dev/null; then
+            base_sha="$(git rev-parse "${GITHUB_SHA}^" 2>/dev/null || printf '%s' 4b825dc642cb6eb9a060e54bf8d69288fbee4904)"
+          fi
+          mapfile -d '' php_paths < <(git diff --name-only -z --diff-filter=ACMR "$base_sha" "$GITHUB_SHA" -- '*.php')
+          if (( ${#php_paths[@]} > 0 )); then
+            vendor/bin/pint --format agent -- "${php_paths[@]}"
+          fi
+          git diff --exit-code
+
+  node:
+    name: Node 22 application
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm audit --audit-level=high
+      - run: npm test
+      - run: npm run build
+
+  workflow-and-shell:
+    name: Workflow and shell contracts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: Verify pinned source provenance
+        run: |
+          docker/verify-source-provenance.sh docker/production/Dockerfile
+          docker/verify-source-provenance.sh docker/testing-host/Dockerfile
+      - name: Require immutable external action and container references
+        shell: bash
+        run: |
+          if grep -RInP 'uses:\s+(?!\./)[^@\s]+@(?![0-9a-f]{40}(?:\s|$))' .github/workflows; then
+            echo 'External GitHub Actions must be pinned to a full commit SHA.' >&2
+            exit 1
+          fi
+          if grep -RInP '^(?: {6}| {8})image:\s+(?![^\s]+@sha256:[0-9a-f]{64}(?:\s|$))' .github/workflows; then
+            echo 'Workflow job container and service images must be pinned to an immutable SHA-256 digest.' >&2
+            exit 1
+          fi
+      - name: ShellCheck changed shell scripts
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -Eeuo pipefail
+          base_sha="${BASE_SHA:-}"
+          if ! git cat-file -e "${base_sha}^{commit}" 2>/dev/null; then
+            base_sha="$(git rev-parse "${GITHUB_SHA}^" 2>/dev/null || printf '%s' 4b825dc642cb6eb9a060e54bf8d69288fbee4904)"
+          fi
+          mapfile -d '' changed_paths < <(git diff --name-only -z --diff-filter=ACMR "$base_sha" "$GITHUB_SHA")
+          scripts=()
+          for path in "${changed_paths[@]}"; do
+            [[ -f "$path" ]] || continue
+
+            if [[ "$path" == *.sh ]]; then
+              scripts+=("$path")
+              continue
+            fi
+
+            first_line=''
+            IFS= read -r first_line < "$path" || :
+            if [[ -x "$path" && "$first_line" =~ ^\#!.*(ba|da|k)?sh([[:space:]]|$) ]]; then
+              scripts+=("$path")
+            fi
+          done
+          if (( ${#scripts[@]} > 0 )); then
+            shellcheck -e SC2015 -- "${scripts[@]}"
+          fi
+
+  fork-deploy:
+    name: Signed fork deployment contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - name: Run signed fork deployment integration
+        run: tests/Integration/ForkDeploy/run.sh
+
+  required:
+    name: Required application validation
+    if: always()
+    needs:
+      - php
+      - browser
+      - formatting
+      - fork-deploy
+      - node
+      - workflow-and-shell
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every generic validation job
+        env:
+          BROWSER_RESULT: ${{ needs.browser.result }}
+          FORMATTING_RESULT: ${{ needs.formatting.result }}
+          FORK_DEPLOY_RESULT: ${{ needs.fork-deploy.result }}
+          NODE_RESULT: ${{ needs.node.result }}
+          PHP_RESULT: ${{ needs.php.result }}
+          WORKFLOW_RESULT: ${{ needs.workflow-and-shell.result }}
+        run: |
+          set -Eeuo pipefail
+          for result in \
+            "$PHP_RESULT" \
+            "$BROWSER_RESULT" \
+            "$FORMATTING_RESULT" \
+            "$FORK_DEPLOY_RESULT" \
+            "$NODE_RESULT" \
+            "$WORKFLOW_RESULT"; do
+            [[ "$result" == success ]] || {
+              echo "A required generic application validation job did not succeed: $result" >&2
+              exit 1
+            }
+          done
