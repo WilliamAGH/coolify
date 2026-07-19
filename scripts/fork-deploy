@@ -433,7 +433,7 @@ write_overlay() {
         printf '  coolify:\n'
         printf '    image: "%s"\n' "$main_ref"
         printf '    ports: !override\n'
-        printf '%s\n' "      - \"127.0.0.1:\${APP_PORT:-8000}:8080\""
+        printf '%s\n' "      - \"\${APP_PORT:-8000}:8080\""
         printf '    environment:\n'
         printf '      AUTOUPDATE: "false"\n'
         printf '  soketi:\n'
@@ -1297,7 +1297,7 @@ fd_validate_effective_images() {
 }
 
 fd_validate_effective_bindings() {
-    local directory=$1 json compact remainder host_ip count=0 target app_port soketi_port
+    local directory=$1 json compact remainder host_ip count=0 public_count=0 loopback_count=0 target app_port soketi_port
 
     app_port=$(env_value "$directory/.env" APP_PORT)
     soketi_port=$(env_value "$directory/.env" SOKETI_PORT)
@@ -1313,16 +1313,21 @@ fd_validate_effective_bindings() {
         remainder=${remainder#\"}
         host_ip=${remainder%%\"*}
         remainder=${remainder#*\"}
-        [[ $host_ip == 127.0.0.1 ]] || die "effective Compose contains a non-loopback port binding: $host_ip"
+        case $host_ip in
+            ''|0.0.0.0|::) public_count=$((public_count + 1)) ;;
+            127.0.0.1) loopback_count=$((loopback_count + 1)) ;;
+            *) die "effective Compose contains an unsupported host binding: $host_ip" ;;
+        esac
         count=$((count + 1))
     done
-    [[ $count -eq 3 ]] || die "effective Compose must contain exactly three loopback port bindings, found $count"
+    [[ $loopback_count -eq 2 && $public_count -le 1 && $count -eq $((loopback_count + public_count)) ]] \
+        || die "effective Compose must contain one public APP_PORT and two loopback realtime bindings"
     for target in 8080 6001 6002; do
-        [[ $(fd_count "$compact" "\"target\":$target") -eq 1 ]] || die "effective Compose must contain exactly one loopback target port $target"
+        [[ $(fd_count "$compact" "\"target\":$target") -eq 1 ]] || die "effective Compose must contain exactly one target port $target"
     done
     [[ $(fd_count "$compact" '"published":') -eq 3 ]] || die 'effective Compose must contain exactly three published ports'
     for target in "$app_port" "$soketi_port" 6002; do
-        [[ $compact == *"\"published\":\"$target\""* || $compact == *"\"published\":$target"* ]] || die "effective Compose is missing loopback host port $target"
+        [[ $compact == *"\"published\":\"$target\""* || $compact == *"\"published\":$target"* ]] || die "effective Compose is missing host port $target"
     done
 }
 
@@ -1865,14 +1870,28 @@ fd_validate_runtime_bindings() {
         }
         while IFS=$'\t' read -r runtime_port host_ip host_port; do
             [[ -z $runtime_port ]] && continue
-            [[ $host_ip == 127.0.0.1 ]] || {
-                note "ERROR: $container $runtime_port binds to unsafe host IP $host_ip" >&2
-                return 1
-            }
             case "$container:$runtime_port:$host_port" in
-                "coolify:8080/tcp:$app_port") app_seen=$((app_seen + 1)) ;;
-                "coolify-realtime:6001/tcp:$soketi_port") realtime_seen=$((realtime_seen + 1)) ;;
-                'coolify-realtime:6002/tcp:6002') metrics_seen=$((metrics_seen + 1)) ;;
+                "coolify:8080/tcp:$app_port")
+                    [[ -z $host_ip || $host_ip == 0.0.0.0 || $host_ip == :: ]] || {
+                        note "ERROR: $container $runtime_port does not use the public APP_PORT binding" >&2
+                        return 1
+                    }
+                    app_seen=$((app_seen + 1))
+                    ;;
+                "coolify-realtime:6001/tcp:$soketi_port")
+                    [[ $host_ip == 127.0.0.1 ]] || {
+                        note "ERROR: $container $runtime_port binds to unsafe host IP $host_ip" >&2
+                        return 1
+                    }
+                    realtime_seen=$((realtime_seen + 1))
+                    ;;
+                'coolify-realtime:6002/tcp:6002')
+                    [[ $host_ip == 127.0.0.1 ]] || {
+                        note "ERROR: $container $runtime_port binds to unsafe host IP $host_ip" >&2
+                        return 1
+                    }
+                    metrics_seen=$((metrics_seen + 1))
+                    ;;
                 *)
                     note "ERROR: unexpected published runtime binding $container $runtime_port -> $host_ip:$host_port" >&2
                     return 1

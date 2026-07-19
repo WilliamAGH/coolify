@@ -94,6 +94,7 @@ new_fixture() {
         FORK_DEPLOY_FAIL_COMPOSE_UP FORK_DEPLOY_OPENSSL_VERIFY_FAIL \
         FORK_DEPLOY_USE_REAL_OPENSSL FORK_DEPLOY_ENV_EXTRA \
         FORK_DEPLOY_COMPOSE_VERSION FORK_DEPLOY_LEGACY_VOLUMES \
+        FORK_DEPLOY_APP_HOST_IP FORK_DEPLOY_REALTIME_HOST_IP \
         FORK_DEPLOY_DOCKER_UNAVAILABLE \
         FORK_DEPLOY_FAIL_CANDIDATE_RUNTIME_VERIFY || true
     unset FORK_DEPLOY_FAIL_ACTIVATED_CONFIG FORK_DEPLOY_KILL_ON_ACTIVE_CONFIG \
@@ -123,7 +124,7 @@ write_assets() {
     {
         printf 'services:\n'
         printf '  coolify:\n    image: "%s"\n    ports: !override\n' "docker.iocloudhost.net/williamagh/coolify@$DIGEST_A"
-        printf '%s\n' "      - \"127.0.0.1:\${APP_PORT:-8000}:8080\""
+        printf '%s\n' "      - \"\${APP_PORT:-8000}:8080\""
         printf '    environment:\n      AUTOUPDATE: "false"\n'
         printf '  soketi:\n    image: "%s"\n    ports: !override\n' "docker.iocloudhost.net/williamagh/coolify-realtime@$DIGEST_B"
         printf '%s\n' "      - \"127.0.0.1:\${SOKETI_PORT:-6001}:6001\""
@@ -356,10 +357,10 @@ test_real_compose_config_when_available() {
         && [[ $output == *'"published": "8010"'* ]] \
         && [[ $output == *'"published": "6011"'* ]] \
         && [[ $output == *'"published": "6002"'* ]] \
-        && [[ $output != *'0.0.0.0'* && $output != *'9999'* ]]; then
-        pass 'real Compose config honors !override and loopback-only ports'
+        && [[ $output != *'9999'* ]]; then
+        pass 'real Compose config honors !override, public APP_PORT, and loopback realtime ports'
     else
-        fail 'real Compose config honors !override and loopback-only ports'
+        fail 'real Compose config honors !override, public APP_PORT, and loopback realtime ports'
     fi
     cleanup_fixture
 }

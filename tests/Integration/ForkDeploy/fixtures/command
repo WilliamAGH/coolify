@@ -80,7 +80,7 @@ case $name in
                     exit 1
                 fi
                 if [[ $* == *'--format json'* ]]; then
-                    printf '%s\n' '{"services":{"coolify":{"ports":[{"host_ip":"127.0.0.1","published":"8000","target":8080}]},"soketi":{"ports":[{"host_ip":"127.0.0.1","published":"6001","target":6001},{"host_ip":"127.0.0.1","published":"6002","target":6002}]}}}'
+                    printf '%s\n' '{"services":{"coolify":{"ports":[{"host_ip":"0.0.0.0","published":"8000","target":8080}]},"soketi":{"ports":[{"host_ip":"127.0.0.1","published":"6001","target":6001},{"host_ip":"127.0.0.1","published":"6002","target":6002}]}}}'
                 elif [[ $* == *--images* ]]; then
                     printf '%s\n' \
                         'docker.iocloudhost.net/williamagh/coolify@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
@@ -118,14 +118,18 @@ case $name in
                 esac
                 if [[ $* == *NetworkSettings.Ports* ]]; then
                     if [[ ${FORK_DEPLOY_HOST_IP:-} == absent ]]; then exit 1; fi
-                    host_ip=${FORK_DEPLOY_HOST_IP:-127.0.0.1}
                     case ${*: -1} in
-                        coolify) printf '8080/tcp\t%s\t%s\n' "$host_ip" "${FORK_DEPLOY_APP_PORT:-8000}" ;;
+                        coolify)
+                            host_ip=${FORK_DEPLOY_APP_HOST_IP:-${FORK_DEPLOY_HOST_IP:-0.0.0.0}}
+                            printf '8080/tcp\t%s\t%s\n' "$host_ip" "${FORK_DEPLOY_APP_PORT:-8000}"
+                            ;;
                         coolify-realtime)
+                            host_ip=${FORK_DEPLOY_REALTIME_HOST_IP:-${FORK_DEPLOY_HOST_IP:-127.0.0.1}}
                             printf '6001/tcp\t%s\t%s\n' "$host_ip" "${FORK_DEPLOY_SOKETI_PORT:-6001}"
                             printf '6002/tcp\t%s\t6002\n' "$host_ip"
                             ;;
                         *)
+                            host_ip=${FORK_DEPLOY_HOST_IP:-127.0.0.1}
                             if [[ ${FORK_DEPLOY_EXTRA_BINDING:-false} == true ]]; then printf '9999/tcp\t%s\t9999\n' "$host_ip"; fi
                             ;;
                     esac

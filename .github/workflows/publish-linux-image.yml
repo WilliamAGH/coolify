@@ -2221,7 +2221,7 @@ jobs:
               printf '    image: "%s@%s"\n' "$MAIN_TARGET" "$main_digest"
               printf '    ports: !override\n'
               # shellcheck disable=SC2016
-              printf '%s\n' '      - "127.0.0.1:${APP_PORT:-8000}:8080"'
+              printf '%s\n' '      - "${APP_PORT:-8000}:8080"'
               printf '    environment:\n'
               printf '      AUTOUPDATE: "false"\n'
               printf '  soketi:\n'
