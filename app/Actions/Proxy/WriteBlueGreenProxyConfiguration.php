@@ -6,11 +6,18 @@ use App\Enums\ProxyTypes;
 use App\Models\Server;
 use InvalidArgumentException;
 use Lorisleiva\Actions\Concerns\AsAction;
+use RuntimeException;
 use Symfony\Component\Yaml\Yaml;
 
 class WriteBlueGreenProxyConfiguration
 {
     use AsAction;
+
+    public const REPAIR_HEALTHY_OUTPUT = 'coolify-blue-green-managed-route:healthy';
+
+    public const REPAIR_MISSING_OUTPUT = 'coolify-blue-green-managed-route:repaired-missing';
+
+    public const REPAIR_DRIFT_OUTPUT = 'coolify-blue-green-managed-route:repaired-drift';
 
     private const MUTATION_JOURNAL_MAGIC = 'coolify-blue-green-proxy-mutation-v1';
 
@@ -54,6 +61,72 @@ class WriteBlueGreenProxyConfiguration
         }
 
         return $this->mutationCommandFor($proxyPath, null, $rollbackKey, $expectedBootId);
+    }
+
+    public function repairManagedConfiguration(
+        Server $server,
+        BlueGreenProxyConfiguration $configuration,
+        string $expectedBootId,
+    ): string {
+        $this->assertTraefik($server);
+        $output = trim((string) instant_remote_process([
+            $this->repairCommandFor($server->proxyPath(), $configuration, $expectedBootId),
+        ], $server));
+        if (! in_array($output, [
+            self::REPAIR_HEALTHY_OUTPUT,
+            self::REPAIR_MISSING_OUTPUT,
+            self::REPAIR_DRIFT_OUTPUT,
+        ], true)) {
+            throw new RuntimeException('The managed blue/green route repair returned an invalid outcome.');
+        }
+
+        return $output;
+    }
+
+    public function repairCommandFor(
+        string $proxyPath,
+        BlueGreenProxyConfiguration $configuration,
+        string $expectedBootId,
+    ): string {
+        $this->validate($configuration);
+        $this->assertBootId($expectedBootId);
+        $state = $configuration->state;
+        $activePath = $this->managedPath($proxyPath, $configuration->managedFilename);
+        $statePath = $this->statePath($proxyPath, $configuration->managedFilename);
+        $safeActivePath = escapeshellarg($activePath);
+        $directory = dirname($activePath);
+
+        return implode("\n", [
+            ...$this->lockedCommandPrefix($proxyPath, $configuration->managedFilename),
+            $this->bootIdentityAssertionCommand(escapeshellarg($expectedBootId)),
+            ...$this->assertStateSidecarCommands($state, $statePath),
+            'repair_outcome='.escapeshellarg(self::REPAIR_HEALTHY_OUTPUT),
+            'if [ -L '.$safeActivePath.' ]; then exit 1; fi',
+            'if [ ! -e '.$safeActivePath.' ]; then',
+            '  repair_outcome='.escapeshellarg(self::REPAIR_MISSING_OUTPUT),
+            'else',
+            '  test -f '.$safeActivePath,
+            '  repair_checksum=$(sha256sum '.$safeActivePath.')',
+            '  if [ "${repair_checksum%% *}" != '.escapeshellarg($configuration->sha256).' ]; then',
+            '    repair_outcome='.escapeshellarg(self::REPAIR_DRIFT_OUTPUT),
+            '  fi',
+            'fi',
+            'if [ "$repair_outcome" != '.escapeshellarg(self::REPAIR_HEALTHY_OUTPUT).' ]; then',
+            '  repair_stage=$(mktemp '.escapeshellarg($directory.'/.blue-green-managed-repair.XXXXXX').')',
+            '  trap \'rm -f -- "$repair_stage"\' 0 HUP INT TERM',
+            '  printf %s '.escapeshellarg(base64_encode($configuration->yaml)).' | base64 -d > "$repair_stage"',
+            '  repair_checksum=$(sha256sum "$repair_stage")',
+            '  test "${repair_checksum%% *}" = '.escapeshellarg($configuration->sha256),
+            '  chmod 600 "$repair_stage"',
+            '  sync -f "$repair_stage"',
+            '  mv -f -- "$repair_stage" '.$safeActivePath,
+            '  sync -f '.escapeshellarg($directory),
+            '  trap - 0 HUP INT TERM',
+            'fi',
+            ...$this->assertStateSidecarCommands($state, $statePath),
+            ...$this->assertManagedFileCommands($state, $activePath),
+            'printf %s "$repair_outcome"',
+        ]);
     }
 
     public function managedPath(string $proxyPath, string $managedFilename): string
@@ -449,8 +522,18 @@ class WriteBlueGreenProxyConfiguration
         string $activePath,
         string $statePath,
     ): array {
+        return [
+            ...$this->assertStateSidecarCommands($state, $statePath),
+            ...$this->assertManagedFileCommands($state, $activePath),
+        ];
+    }
+
+    /** @return list<string> */
+    private function assertStateSidecarCommands(BlueGreenProxyState $state, string $statePath): array
+    {
         $safeStatePath = escapeshellarg($statePath);
-        $commands = [
+
+        return [
             'test -f '.$safeStatePath,
             'test ! -L '.$safeStatePath,
             'state_owner=$(stat -c %u -- '.$safeStatePath.' 2>/dev/null || stat -f %u -- '.$safeStatePath.')',
@@ -459,8 +542,6 @@ class WriteBlueGreenProxyConfiguration
             'test "$state_mode" = 600',
             'test "$(base64 < '.$safeStatePath.' | tr -d \'\\n\')" = '.escapeshellarg(base64_encode($state->serialize())),
         ];
-
-        return [...$commands, ...$this->assertManagedFileCommands($state, $activePath)];
     }
 
     /** @return list<string> */

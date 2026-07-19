@@ -6,6 +6,7 @@ use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Actions\Application\BlueGreen\MarkBlueGreenRecoveryInterventionRequired;
 use App\Actions\Application\BlueGreen\ReconcileBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\ReconcileBlueGreenDeployments;
+use App\Actions\Proxy\BlueGreenProxyRollbackArtifactReader;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentColor;
@@ -127,6 +128,7 @@ it('leaves a deactivation-owned state untouched', function (): void {
 
 it('converges only a stale unmutated operation whose exact candidate is proven absent', function (): void {
     InspectBlueGreenContainer::shouldRun()->andReturn(BlueGreenContainerInspection::missing());
+    BlueGreenProxyRollbackArtifactReader::shouldRun()->andReturnNull();
     $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
     blueGreenReconciliationMakeQueueStale($scenario->deployment);
 
@@ -172,4 +174,17 @@ it('schedules one bounded blue-green reconciliation in the background', function
         ->and($event->runInBackground)->toBeTrue()
         ->and($event->command)->toContain('blue-green:reconcile --stale-after=300 --limit=1')
         ->and($event->expression)->toBe('* * * * *');
+});
+
+it('schedules one bounded steady-state repair in the background', function (): void {
+    $event = collect(app(Schedule::class)->events())->first(
+        fn ($event) => (string) $event->description === 'blue-green:repair-steady',
+    );
+
+    expect($event)->not->toBeNull()
+        ->and($event->onOneServer)->toBeTrue()
+        ->and($event->withoutOverlapping)->toBeTrue()
+        ->and($event->runInBackground)->toBeTrue()
+        ->and($event->command)->toContain('blue-green:repair-steady --limit=1')
+        ->and($event->expression)->toBe('*/5 * * * *');
 });

@@ -7,6 +7,7 @@ use App\Actions\Proxy\BlueGreenProxyRollbackArtifactReader;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifactRestorer;
 use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
+use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
@@ -153,6 +154,44 @@ final class ReconcileBlueGreenDeployment
                 [$operation->recoveredPhase],
                 allowCancelledRollbackEntry: true,
             );
+            if (! $operation->routingMutationRecorded
+                && in_array($operation->recoveredPhase, [
+                    BlueGreenDeploymentPhase::PREPARING,
+                    BlueGreenDeploymentPhase::SWITCHING,
+                ], true)) {
+                $discoveredArtifact = BlueGreenProxyRollbackArtifactReader::run(
+                    $operation->server,
+                    $operation->rollbackKey,
+                );
+                if ($discoveredArtifact !== null) {
+                    $replacementState = $operation->rollbackKey->replacementState;
+                    if ($replacementState->activeColor !== $operation->claim->pendingColor
+                        || $replacementState->activeDeploymentUuid !== $operation->claim->deploymentUuid
+                        || $replacementState->activeContainerId !== $operation->candidateContainer->dockerId
+                        || $replacementState->routingRevision !== $operation->claim->expectedRoutingRevision
+                        || $replacementState->destinationTopologyDigest !== $operation->claim->topologyDigest
+                        || $replacementState->applicationRoutingConfigDigest !== $operation->claim->routingConfigDigest) {
+                        throw new BlueGreenDeploymentTransitionException('The discovered routing mutation does not target the exact claimed candidate.');
+                    }
+                    $attestation = trim((string) instant_remote_process([
+                        (new WriteBlueGreenProxyConfiguration)->attestStateCommandFor(
+                            $operation->server->proxyPath(),
+                            $replacementState->managedFilename,
+                            $replacementState,
+                        ),
+                    ], $operation->server));
+                    if ($attestation !== 'coolify-blue-green-destination-state-attested') {
+                        throw new BlueGreenDeploymentTransitionException('The discovered remote routing mutation did not attest its exact state.');
+                    }
+                    RecordBlueGreenDestinationState::run(
+                        $operation->claim,
+                        $operation->currentDestinationState,
+                        $replacementState,
+                    );
+                    RecordBlueGreenRoutingMutation::run($operation->claim, $replacementState);
+                    $operation = $operation->withDiscoveredRoutingMutation($operation->rollbackKey);
+                }
+            }
             if ($operation->recoveredPhase === BlueGreenDeploymentPhase::SWITCHING
                 && $operation->routingMutationRecorded
                 && $operation->deployment->status === ApplicationDeploymentStatus::IN_PROGRESS->value) {

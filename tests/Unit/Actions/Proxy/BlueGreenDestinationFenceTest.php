@@ -548,6 +548,49 @@ it('restores the original predecessor after later mutations owned by the same de
     }
 });
 
+it('repairs only missing or drifted regular managed files under the exact sidecar', function () {
+    $filesystem = new Filesystem;
+    $proxyPath = sys_get_temp_dir().'/coolify-blue-green-steady-repair-'.bin2hex(random_bytes(8));
+    $filesystem->mkdir($proxyPath.'/dynamic', 0700);
+
+    try {
+        $writer = destinationFenceWriter();
+        $configuration = compileDestinationFencedBlueGreenConfiguration(
+            epoch: 1,
+            activeColor: BlueGreenDeploymentColor::BLUE,
+            deploymentUuid: 'deployment-steady-repair',
+            containerId: '0123456789abcdef',
+            operationId: 'steady-repair-owner',
+        );
+        $key = new BlueGreenProxyRollbackKey('steady-repair-owner', null, $configuration->state);
+        runDestinationFenceCommand($writer->commandFor($proxyPath, $configuration, $key, destinationFenceBootId()));
+        $managedPath = $writer->managedPath($proxyPath, $configuration->managedFilename);
+        $statePath = $writer->statePath($proxyPath, $configuration->managedFilename);
+
+        expect(trim(runDestinationFenceCommand($writer->repairCommandFor($proxyPath, $configuration, destinationFenceBootId()))))
+            ->toBe(WriteBlueGreenProxyConfiguration::REPAIR_HEALTHY_OUTPUT);
+
+        unlink($managedPath);
+        expect(trim(runDestinationFenceCommand($writer->repairCommandFor($proxyPath, $configuration, destinationFenceBootId()))))
+            ->toBe(WriteBlueGreenProxyConfiguration::REPAIR_MISSING_OUTPUT)
+            ->and(file_get_contents($managedPath))->toBe($configuration->yaml);
+
+        file_put_contents($managedPath, 'manual drift');
+        expect(trim(runDestinationFenceCommand($writer->repairCommandFor($proxyPath, $configuration, destinationFenceBootId()))))
+            ->toBe(WriteBlueGreenProxyConfiguration::REPAIR_DRIFT_OUTPUT)
+            ->and(file_get_contents($managedPath))->toBe($configuration->yaml)
+            ->and(BlueGreenProxyState::parse(file_get_contents($statePath))->serialize())
+            ->toBe($configuration->state->serialize());
+
+        unlink($managedPath);
+        symlink('/dev/null', $managedPath);
+        expect(failedDestinationFenceCommand($writer->repairCommandFor($proxyPath, $configuration, destinationFenceBootId()))->isSuccessful())
+            ->toBeFalse();
+    } finally {
+        $filesystem->remove($proxyPath);
+    }
+});
+
 it('reconciles a completed container removal after a crash without replaying the destructive command', function () {
     $filesystem = new Filesystem;
     $proxyPath = sys_get_temp_dir().'/coolify-blue-green-container-journal-'.bin2hex(random_bytes(8));

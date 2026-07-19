@@ -55,4 +55,23 @@ final readonly class BlueGreenDeploymentRecoveryOperation
             $mutationSequence,
         );
     }
+
+    public function withDiscoveredRoutingMutation(BlueGreenProxyRollbackKey $rollbackKey): self
+    {
+        return new self(
+            claim: $this->claim,
+            application: $this->application,
+            destination: $this->destination,
+            server: $this->server,
+            deployment: $this->deployment,
+            previousContainer: $this->previousContainer,
+            legacyRoutingSnapshot: $this->legacyRoutingSnapshot,
+            candidateContainer: $this->candidateContainer,
+            rollbackKey: $rollbackKey,
+            currentDestinationState: $rollbackKey->replacementState,
+            recoveredPhase: $this->recoveredPhase,
+            routingMutationRecorded: true,
+            wasFinalized: $this->wasFinalized,
+        );
+    }
 }

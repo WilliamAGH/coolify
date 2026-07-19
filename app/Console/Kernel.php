@@ -66,6 +66,12 @@ class Kernel extends ConsoleKernel
             ->onOneServer()
             ->withoutOverlapping(16)
             ->runInBackground();
+        $this->scheduleInstance->command('blue-green:repair-steady --limit=1')
+            ->name('blue-green:repair-steady')
+            ->everyFiveMinutes()
+            ->onOneServer()
+            ->withoutOverlapping(16)
+            ->runInBackground();
 
         if (isDev()) {
             // Instance Jobs
