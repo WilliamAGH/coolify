@@ -242,6 +242,8 @@ class DeployController extends Controller
         }
 
         // Perform the cancellation
+        $deploymentCancelled = false;
+
         try {
             $deployment_uuid = $deployment->deployment_uuid;
             $kill_command = "docker rm -f {$deployment_uuid}";
@@ -251,6 +253,7 @@ class DeployController extends Controller
             $deployment->update([
                 'status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
             ]);
+            $deploymentCancelled = true;
 
             // Get the server
             $server = Server::whereTeamId($teamId)->find($build_server_id);
@@ -288,7 +291,6 @@ class DeployController extends Controller
                 'application_uuid' => $application?->uuid,
                 'server_id' => $deployment->server_id,
             ]);
-            next_after_cancel($deployment);
 
             return response()->json([
                 'message' => 'Deployment cancelled successfully.',
@@ -299,6 +301,10 @@ class DeployController extends Controller
             return response()->json([
                 'message' => 'Failed to cancel deployment: '.$e->getMessage(),
             ], 500);
+        } finally {
+            if ($deploymentCancelled) {
+                next_after_cancel($deployment);
+            }
         }
     }
 

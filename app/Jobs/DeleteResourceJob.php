@@ -7,7 +7,9 @@ use App\Actions\Database\StopDatabase;
 use App\Actions\Server\CleanupDocker;
 use App\Actions\Service\DeleteService;
 use App\Actions\Service\StopService;
+use App\Enums\ApplicationDeploymentStatus;
 use App\Models\Application;
+use App\Models\ApplicationDeploymentQueue;
 use App\Models\ApplicationPreview;
 use App\Models\Service;
 use App\Models\StandaloneClickhouse;
@@ -125,20 +127,23 @@ class DeleteResourceJob implements ShouldBeEncrypted, ShouldQueue
         }
 
         // Cancel any active deployments for this PR (same logic as API cancel_deployment)
-        $activeDeployments = \App\Models\ApplicationDeploymentQueue::where('application_id', $application->id)
+        $activeDeployments = ApplicationDeploymentQueue::where('application_id', $application->id)
             ->where('pull_request_id', $pull_request_id)
             ->whereIn('status', [
-                \App\Enums\ApplicationDeploymentStatus::QUEUED->value,
-                \App\Enums\ApplicationDeploymentStatus::IN_PROGRESS->value,
+                ApplicationDeploymentStatus::QUEUED->value,
+                ApplicationDeploymentStatus::IN_PROGRESS->value,
             ])
             ->get();
 
         foreach ($activeDeployments as $activeDeployment) {
+            $deploymentCancelled = false;
+
             try {
                 // Mark deployment as cancelled
                 $activeDeployment->update([
-                    'status' => \App\Enums\ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+                    'status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
                 ]);
+                $deploymentCancelled = true;
 
                 // Add cancellation log entry
                 $activeDeployment->addLogEntry('Deployment cancelled: Pull request closed.', 'stderr');
@@ -158,6 +163,10 @@ class DeleteResourceJob implements ShouldBeEncrypted, ShouldQueue
 
             } catch (\Throwable $e) {
                 // Silently handle errors during deployment cancellation
+            } finally {
+                if ($deploymentCancelled) {
+                    next_after_cancel($activeDeployment);
+                }
             }
         }
 

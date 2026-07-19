@@ -7,6 +7,7 @@ use App\Models\Project;
 use App\Models\Server;
 use App\Models\Team;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Spatie\Activitylog\Models\Activity;
 
 uses(RefreshDatabase::class);
 
@@ -69,4 +70,26 @@ it('retains aged deployment provenance referenced by blue-green state', function
     expect(ApplicationDeploymentQueue::query()
         ->whereIn('id', $unreferencedDeployments->pluck('id'))
         ->count())->toBe(10);
+});
+
+it('retains the ten newest aged activity records', function () {
+    $activities = collect(range(1, 12))->map(fn (int $index): Activity => Activity::query()->create([
+        'log_name' => 'cleanup-test',
+        'description' => "cleanup activity {$index}",
+    ]));
+    $activities->each(function (Activity $activity, int $index): void {
+        $activity->newQuery()
+            ->whereKey($activity->getKey())
+            ->update([
+                'created_at' => now()->subDays(90)->addSeconds($index),
+                'updated_at' => now()->subDays(90)->addSeconds($index),
+            ]);
+    });
+
+    $this->artisan('cleanup:database', ['--yes' => true, '--keep-days' => 1])
+        ->assertSuccessful();
+
+    expect(Activity::query()->count())->toBe(10)
+        ->and(Activity::query()->orderBy('created_at')->pluck('id')->all())
+        ->toBe($activities->slice(2)->pluck('id')->all());
 });
