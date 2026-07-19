@@ -36,6 +36,7 @@ function resumableControlPlaneEnrollment(): array
         expectedMember: 'blue',
         expectedRevision: 'revision-42',
         configurationAcknowledgement: 'ack:'.str_repeat('a', 64),
+        activeBackendDnsNames: ['coolify-web-a', 'coolify-web-b'],
         staticConfiguration: new ControlPlaneStaticProxyConfiguration(
             predecessorProxyYaml: "services:\n  traefik:\n    ports: ['80:80']\n",
             replacementProxyYaml: "services:\n  traefik:\n    ports: ['80:80', '8000:8000']\n",

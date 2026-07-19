@@ -42,6 +42,7 @@ function activatableControlPlaneEnrollment(): array
         expectedMember: 'blue',
         expectedRevision: 'revision-42',
         configurationAcknowledgement: 'ack:'.str_repeat('a', 64),
+        activeBackendDnsNames: ['coolify-web-a', 'coolify-web-b'],
         staticConfiguration: $static,
         dynamicConfiguration: $dynamic,
         dynamicPredecessorBytes: "http:\n  routers:\n    legacy: {}\n",

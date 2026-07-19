@@ -24,6 +24,7 @@ function staticListenerHandoffState(
         expectedMember: 'blue',
         expectedRevision: 'revision-42',
         configurationAcknowledgement: 'ack:'.str_repeat('a', 64),
+        activeBackendDnsNames: ['coolify-web-a'],
         staticPredecessorBytes: "name: coolify-proxy\nservices:\n  traefik:\n    image: traefik:v3.6\n    ports:\n      - 80:80\n",
         staticReplacementBytes: "name: coolify-proxy\nservices:\n  traefik:\n    image: traefik:v3.6\n    command:\n      - --entrypoints.coolify.address=:8000\n    ports:\n      - 80:80\n      - 8000:8000\n",
         sourceOverrideBytes: "services:\n  coolify:\n    ports: !reset []\n",

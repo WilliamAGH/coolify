@@ -6,7 +6,7 @@ use InvalidArgumentException;
 
 final readonly class ControlPlaneProxyEnrollmentState
 {
-    public const VERSION = 2;
+    public const VERSION = 3;
 
     public function __construct(
         public ControlPlaneProxyEnrollmentPhase $phase,
@@ -22,6 +22,7 @@ final readonly class ControlPlaneProxyEnrollmentState
         public string $expectedMember,
         public string $expectedRevision,
         public string $configurationAcknowledgement,
+        public array $activeBackendDnsNames,
         public string $staticPredecessorBytes,
         public string $staticReplacementBytes,
         public string $sourceOverrideBytes,
@@ -50,6 +51,7 @@ final readonly class ControlPlaneProxyEnrollmentState
         if (preg_match('/\A[A-Za-z0-9._~+\/=:-]{16,512}\z/D', $configurationAcknowledgement) !== 1) {
             throw new InvalidArgumentException('The control-plane configuration acknowledgement must be opaque and single-line.');
         }
+        $this->assertBackendDnsNames($activeBackendDnsNames);
         foreach ([$staticPredecessorBytes, $staticReplacementBytes, $sourceOverrideBytes, $dynamicReplacementBytes] as $bytes) {
             if ($bytes === '') {
                 throw new InvalidArgumentException('Control-plane enrollment artifacts must not be empty.');
@@ -72,6 +74,7 @@ final readonly class ControlPlaneProxyEnrollmentState
         string $expectedMember,
         string $expectedRevision,
         string $configurationAcknowledgement,
+        array $activeBackendDnsNames,
         ControlPlaneStaticProxyConfiguration $staticConfiguration,
         ControlPlaneDynamicConfiguration $dynamicConfiguration,
         ?string $dynamicPredecessorBytes,
@@ -83,6 +86,8 @@ final readonly class ControlPlaneProxyEnrollmentState
         if ($staticConfiguration->appPort !== $appPort || $staticConfiguration->exposure !== $exposure) {
             throw new InvalidArgumentException('The static enrollment configuration does not match its durable owner.');
         }
+
+        $activeBackendDnsNames = self::normalizeBackendDnsNames($activeBackendDnsNames);
 
         return new self(
             phase: ControlPlaneProxyEnrollmentPhase::Preparing,
@@ -98,6 +103,7 @@ final readonly class ControlPlaneProxyEnrollmentState
             expectedMember: $expectedMember,
             expectedRevision: $expectedRevision,
             configurationAcknowledgement: $configurationAcknowledgement,
+            activeBackendDnsNames: $activeBackendDnsNames,
             staticPredecessorBytes: $staticConfiguration->predecessorProxyYaml,
             staticReplacementBytes: $staticConfiguration->replacementProxyYaml,
             sourceOverrideBytes: $staticConfiguration->sourceOverrideYaml,
@@ -129,6 +135,7 @@ final readonly class ControlPlaneProxyEnrollmentState
             expectedMember: $this->expectedMember,
             expectedRevision: $this->expectedRevision,
             configurationAcknowledgement: $this->configurationAcknowledgement,
+            activeBackendDnsNames: $this->activeBackendDnsNames,
             staticPredecessorBytes: $this->staticPredecessorBytes,
             staticReplacementBytes: $this->staticReplacementBytes,
             sourceOverrideBytes: $this->sourceOverrideBytes,
@@ -163,6 +170,7 @@ final readonly class ControlPlaneProxyEnrollmentState
             'expected_member' => $this->expectedMember,
             'expected_revision' => $this->expectedRevision,
             'configuration_acknowledgement' => $this->configurationAcknowledgement,
+            'active_backend_dns_names' => $this->activeBackendDnsNames,
             'static_predecessor' => $this->artifact($this->staticPredecessorBytes),
             'static_replacement' => $this->artifact($this->staticReplacementBytes),
             'source_override' => $this->artifact($this->sourceOverrideBytes),
@@ -181,7 +189,7 @@ final readonly class ControlPlaneProxyEnrollmentState
         self::assertExactKeys($state, [
             'version', 'phase', 'operation_id', 'token_sha256', 'server_id', 'app_port', 'exposure',
             'managed_filename', 'dynamic_revision', 'canonical_host', 'public_scheme', 'expected_member',
-            'expected_revision', 'configuration_acknowledgement', 'static_predecessor', 'static_replacement',
+            'expected_revision', 'configuration_acknowledgement', 'active_backend_dns_names', 'static_predecessor', 'static_replacement',
             'source_override', 'dynamic_predecessor', 'dynamic_replacement', 'created_at', 'updated_at',
         ]);
         if ($state['version'] !== self::VERSION) {
@@ -202,6 +210,7 @@ final readonly class ControlPlaneProxyEnrollmentState
             expectedMember: self::requiredString($state, 'expected_member'),
             expectedRevision: self::requiredString($state, 'expected_revision'),
             configurationAcknowledgement: self::requiredString($state, 'configuration_acknowledgement'),
+            activeBackendDnsNames: self::requiredStringList($state, 'active_backend_dns_names'),
             staticPredecessorBytes: self::decodeArtifact($state['static_predecessor'], 'static predecessor'),
             staticReplacementBytes: self::decodeArtifact($state['static_replacement'], 'static replacement'),
             sourceOverrideBytes: self::decodeArtifact($state['source_override'], 'source override'),
@@ -259,6 +268,24 @@ final readonly class ControlPlaneProxyEnrollmentState
 
     /**
      * @param  array<string, mixed>  $value
+     * @return list<string>
+     */
+    private static function requiredStringList(array $value, string $key): array
+    {
+        if (! is_array($value[$key]) || ! array_is_list($value[$key])) {
+            throw new InvalidArgumentException("The control-plane enrollment {$key} is invalid.");
+        }
+        foreach ($value[$key] as $item) {
+            if (! is_string($item)) {
+                throw new InvalidArgumentException("The control-plane enrollment {$key} is invalid.");
+            }
+        }
+
+        return $value[$key];
+    }
+
+    /**
+     * @param  array<string, mixed>  $value
      * @param  list<string>  $expected
      */
     private static function assertExactKeys(array $value, array $expected): void
@@ -292,5 +319,34 @@ final readonly class ControlPlaneProxyEnrollmentState
         if (preg_match('/\A[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\z/D', $value) !== 1) {
             throw new InvalidArgumentException("The control-plane {$role} is invalid.");
         }
+    }
+
+    /** @param list<string> $backendDnsNames */
+    private function assertBackendDnsNames(array $backendDnsNames): void
+    {
+        if ($backendDnsNames === [] || ! array_is_list($backendDnsNames)) {
+            throw new InvalidArgumentException('The control-plane active backend set must be a non-empty list.');
+        }
+        foreach ($backendDnsNames as $backendDnsName) {
+            if (preg_match('/\A[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\z/D', $backendDnsName) !== 1) {
+                throw new InvalidArgumentException('The control-plane active backend set contains an unsafe DNS name.');
+            }
+        }
+        $normalized = self::normalizeBackendDnsNames($backendDnsNames);
+        if ($normalized !== $backendDnsNames) {
+            throw new InvalidArgumentException('The control-plane active backend set must be unique and sorted.');
+        }
+    }
+
+    /**
+     * @param  list<string>  $backendDnsNames
+     * @return list<string>
+     */
+    private static function normalizeBackendDnsNames(array $backendDnsNames): array
+    {
+        $backendDnsNames = array_values(array_unique($backendDnsNames, SORT_STRING));
+        sort($backendDnsNames, SORT_STRING);
+
+        return $backendDnsNames;
     }
 }

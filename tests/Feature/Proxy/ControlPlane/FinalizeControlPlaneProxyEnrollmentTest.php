@@ -32,6 +32,7 @@ function finalizableControlPlaneEnrollment(): array
         expectedMember: 'blue',
         expectedRevision: 'revision-42',
         configurationAcknowledgement: 'ack:'.str_repeat('a', 64),
+        activeBackendDnsNames: ['coolify-web-a'],
         staticPredecessorBytes: "services:\n  traefik:\n    ports: ['80:80']\n",
         staticReplacementBytes: "services:\n  traefik:\n    ports: ['80:80', '8000:8000']\n",
         sourceOverrideBytes: "services:\n  coolify:\n    ports: !reset []\n",
