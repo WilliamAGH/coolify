@@ -92,9 +92,13 @@ class VerifyBlueGreenPublicRecovery
         ?string $probeHeader = null,
         ?string $probeToken = null,
         string $nonceParameter = self::RECOVERY_NONCE_PARAMETER,
+        int $maxTimeSeconds = 15,
     ): array {
         if (($probeHeader === null) !== ($probeToken === null)) {
             throw new InvalidArgumentException('The probe header and token must either both be set or both be omitted.');
+        }
+        if ($maxTimeSeconds < 1 || $maxTimeSeconds > 15) {
+            throw new InvalidArgumentException('The direct-origin request timeout must be between 1 and 15 seconds.');
         }
         $url = Url::fromString($route['url']);
         $port = match ($url->getScheme()) {
@@ -113,11 +117,12 @@ class VerifyBlueGreenPublicRecovery
             'http1.1',
             'noproxy = '.$this->curlConfigValue('*'),
             'connect-timeout = 5',
-            'max-time = 15',
+            'max-time = '.$maxTimeSeconds,
             'output = '.$this->curlConfigValue('/dev/null'),
             'dump-header = '.$this->curlConfigValue('-'),
             'header = '.$this->curlConfigValue('Cache-Control: no-cache, no-store, max-age=0'),
             'header = '.$this->curlConfigValue('Pragma: no-cache'),
+            'header = '.$this->curlConfigValue('Connection: close'),
             'resolve = '.$this->curlConfigValue("{$host}:{$port}:127.0.0.1"),
         ];
         if ($application->is_http_basic_auth_enabled) {
@@ -143,6 +148,21 @@ class VerifyBlueGreenPublicRecovery
         ).'"';
     }
 
+    /** @return array{status: int, acknowledgements: list<string>} */
+    public function responseFor(string $headers): array
+    {
+        preg_match_all('/^HTTP\/(?:1\.[01]|2|3)\s+(\d{3})\b/mi', $headers, $statusMatches);
+        $statuses = $statusMatches[1];
+        $status = (int) (end($statuses) ?: 0);
+        preg_match_all('/^'.preg_quote(BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER, '/').':\s*(.*?)\s*$/mi', $headers, $acknowledgementMatches);
+        $acknowledgements = array_values(array_unique(array_filter(
+            $acknowledgementMatches[1],
+            static fn (string $acknowledgement): bool => trim($acknowledgement) !== '',
+        )));
+
+        return compact('status', 'acknowledgements');
+    }
+
     /** @param array{router: string, url: string} $route */
     public function assertResponse(
         array $route,
@@ -150,17 +170,10 @@ class VerifyBlueGreenPublicRecovery
         ?string $expectedAcknowledgement,
         ?string $expectedReleaseProof = null,
     ): void {
-        preg_match_all('/^HTTP\/(?:1\.[01]|2|3)\s+(\d{3})\b/mi', $headers, $statusMatches);
-        $statuses = $statusMatches[1];
-        $status = (int) (end($statuses) ?: 0);
+        ['status' => $status, 'acknowledgements' => $acknowledgements] = $this->responseFor($headers);
         if ($status < 200 || $status >= 400) {
             throw new RuntimeException("The restored router {$route['router']} returned an ineligible public status {$status}.");
         }
-        preg_match_all('/^'.preg_quote(BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER, '/').':\s*(.*?)\s*$/mi', $headers, $acknowledgementMatches);
-        $acknowledgements = array_values(array_unique(array_filter(
-            $acknowledgementMatches[1],
-            static fn (string $acknowledgement): bool => trim($acknowledgement) !== '',
-        )));
         if ($expectedAcknowledgement === null) {
             if ($acknowledgements !== []) {
                 throw new RuntimeException("The restored router {$route['router']} leaked the reserved probe acknowledgement.");

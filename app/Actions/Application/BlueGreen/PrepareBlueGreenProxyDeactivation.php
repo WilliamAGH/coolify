@@ -227,7 +227,11 @@ class PrepareBlueGreenProxyDeactivation
         $acknowledgement = hash('sha256', "coolify-blue-green-deactivation-tombstone-v1\0{$operationId}");
         $middlewareName = pathinfo($managedFilename, PATHINFO_FILENAME).'-eviction-ack';
         $tombstoneRouters = [];
-        $routes = [];
+        $routes = (new PlanBlueGreenPublicRecovery)->routesForYaml(
+            $sourceYaml,
+            requireEntryPoints: true,
+            requiredRouterSuffix: '-public',
+        );
         $activeColor = $preparation->activeColor()
             ?? throw new BlueGreenDeactivationException('The active managed proxy snapshot has no active color.');
         foreach ($routers as $routerName => $router) {
@@ -238,7 +242,6 @@ class PrepareBlueGreenProxyDeactivation
             if (! is_string($routerService) || ! array_key_exists($routerService, $services)) {
                 throw new BlueGreenDeactivationException('The active managed proxy router references an unknown service.');
             }
-            $routes = [...$routes, ...$this->routesFor($routerName, $router)];
             $router['service'] = 'noop@internal';
             $router['middlewares'] = [$middlewareName];
             $tombstoneRouters[$routerName] = $router;
@@ -286,33 +289,6 @@ class PrepareBlueGreenProxyDeactivation
             deactivationDeadlineUnixSeconds: $destinationClockObservedAtUnixSeconds
                 + BlueGreenProxyDeactivationSnapshot::DEACTIVATION_WINDOW_SECONDS,
         );
-    }
-
-    /**
-     * @param  array<string, mixed>  $router
-     * @return list<array{router: string, url: string}>
-     */
-    private function routesFor(string $routerName, array $router): array
-    {
-        $rule = $router['rule'] ?? null;
-        $entryPoints = $router['entryPoints'] ?? null;
-        if (! is_string($rule) || ! is_array($entryPoints)
-            || preg_match('/Host\(`([^`]+)`\)/', $rule, $hostMatch) !== 1
-            || preg_match('/PathPrefix\(`([^`]+)`\)/', $rule, $pathMatch) !== 1) {
-            throw new BlueGreenDeactivationException("Managed router {$routerName} has no canonical route identity.");
-        }
-
-        return array_values(array_map(
-            static fn (mixed $entryPoint): array => [
-                'router' => $routerName,
-                'url' => match ($entryPoint) {
-                    'http' => "http://{$hostMatch[1]}{$pathMatch[1]}",
-                    'https' => "https://{$hostMatch[1]}{$pathMatch[1]}",
-                    default => throw new BlueGreenDeactivationException("Managed router {$routerName} has an unsupported entry point."),
-                },
-            ],
-            $entryPoints,
-        ));
     }
 
     /** @param array<string, mixed> $services */

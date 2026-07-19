@@ -3,6 +3,7 @@
 use App\Actions\Application\BlueGreen\BlueGreenContainerRemovalPlan;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationException;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationInProgressException;
+use App\Actions\Application\BlueGreen\BlueGreenDeactivationPreparation;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteOutcome;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteResult;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationTransportException;
@@ -10,17 +11,23 @@ use App\Actions\Application\BlueGreen\DeactivateBlueGreenApplicationDestination;
 use App\Actions\Application\BlueGreen\DrainAndRemoveBlueGreenApplicationContainers;
 use App\Actions\Application\BlueGreen\ExecuteBlueGreenDeactivationRemoteCommand;
 use App\Actions\Application\BlueGreen\PrepareBlueGreenDeactivation;
+use App\Actions\Application\BlueGreen\PrepareBlueGreenProxyDeactivation;
 use App\Actions\Application\BlueGreen\ResumeBlueGreenDeactivations;
+use App\Actions\Proxy\BlueGreenProxyState;
+use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeactivationPhase;
+use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\ApplicationBlueGreenDeactivation;
+use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\InstanceSettings;
 use App\Notifications\Application\BlueGreenInterventionRequired;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\Notification;
 use Illuminate\Support\Facades\Process;
+use Symfony\Component\Yaml\Yaml;
 use Tests\Support\BlueGreenDeactivationScenario;
 
 uses(RefreshDatabase::class);
@@ -103,6 +110,117 @@ it('defers a typed 240-second drain attempt without marking intervention', funct
         ->and($state->fresh()->supersession_generation)->toBe($deactivation->supersession_generation)
         ->and($state->fresh()->deactivation_operation_id)->toBe($deactivation->operation_id);
     Process::assertRanTimes(fn () => true, 1);
+});
+
+it('fails closed before tombstone persistence when any public router has no entry point', function () {
+    ['application' => $application, 'destination' => $destination, 'server' => $server] = BlueGreenDeactivationScenario::context();
+    $application->delete();
+    $operationId = str_repeat('b', 64);
+    $deactivation = ApplicationBlueGreenDeactivation::query()->create([
+        'application_id' => $application->id,
+        'standalone_docker_id' => $destination->id,
+        'operation_id' => $operationId,
+        'started_at' => now(),
+        'queue_cutoff_id' => 0,
+        'supersession_generation' => 1,
+        'phase' => BlueGreenDeactivationPhase::DEACTIVATING,
+    ]);
+    $activeService = BlueGreenRoutingTarget::activeServiceName((string) $application->uuid, (int) $destination->id);
+    $sourceYaml = Yaml::dump([
+        'http' => [
+            'routers' => [
+                'managed-valid-public' => [
+                    'rule' => 'Host(`blue-green-deactivation.example.test`) && PathPrefix(`/`)',
+                    'entryPoints' => ['https'],
+                    'service' => $activeService,
+                ],
+                'managed-empty-public' => [
+                    'rule' => 'Host(`blue-green-deactivation.example.test`) && PathPrefix(`/`)',
+                    'entryPoints' => [],
+                    'service' => $activeService,
+                ],
+            ],
+            'services' => [
+                $activeService => [
+                    'weighted' => [
+                        'services' => [[
+                            'name' => BlueGreenRoutingTarget::memberServiceReference(
+                                (string) $application->uuid,
+                                (int) $destination->id,
+                                BlueGreenDeploymentColor::BLUE,
+                            ),
+                            'weight' => 1,
+                        ]],
+                    ],
+                ],
+            ],
+        ],
+    ]);
+    $sourceSha256 = hash('sha256', $sourceYaml);
+    $state = new ApplicationBlueGreenDeployment([
+        'application_id' => $application->id,
+        'standalone_docker_id' => $destination->id,
+        'active_color' => BlueGreenDeploymentColor::BLUE,
+        'routing_revision' => 1,
+    ]);
+    $preparation = new BlueGreenDeactivationPreparation(
+        state: $state,
+        destination: $destination,
+        containerRemovalPlan: new BlueGreenContainerRemovalPlan(
+            applicationId: $application->id,
+            blueContainerName: $application->uuid.'-blue',
+            blueRoutingRevision: 1,
+            greenContainerName: $application->uuid.'-green',
+            greenRoutingRevision: null,
+            legacyContainerName: null,
+            stopGracePeriodSeconds: 1,
+        ),
+        deactivation: $deactivation,
+    );
+    $managedFilename = BlueGreenRoutingTarget::managedFilename((string) $application->uuid, (int) $destination->id);
+    $expectedState = new BlueGreenProxyState(
+        managedFilename: $managedFilename,
+        applicationUuid: (string) $application->uuid,
+        destinationId: $destination->id,
+        operationId: $operationId,
+        mutationSequence: 1,
+        destinationFenceEpoch: 1,
+        routingRevision: 1,
+        managedSha256: $sourceSha256,
+        activeColor: BlueGreenDeploymentColor::BLUE,
+        activeDeploymentUuid: 'deactivation-active-blue',
+        activeContainerName: $application->uuid.'-blue',
+        activeContainerId: str_repeat('a', 64),
+        applicationRoutingConfigDigest: hash('sha256', 'routing'),
+        destinationTopologyDigest: hash('sha256', 'topology'),
+    );
+    fakeBlueGreenRemoteProcessSequence(blueGreenDeactivationRemoteOutput(
+        BlueGreenDeactivationRemoteOutcome::Success,
+        0,
+        implode("\n", [
+            '1700000000',
+            $sourceSha256,
+            base64_encode($sourceYaml),
+        ]),
+    ));
+
+    $exception = null;
+    try {
+        PrepareBlueGreenProxyDeactivation::run(
+            $application,
+            $preparation,
+            $expectedState,
+            BlueGreenDeactivationScenario::BOOT_ID,
+        );
+    } catch (BlueGreenDeactivationException $caught) {
+        $exception = $caught;
+    }
+
+    expect($exception)->toBeInstanceOf(BlueGreenDeactivationException::class)
+        ->and($exception->getPrevious()?->getMessage())
+        ->toContain('managed-empty-public has no entry point to verify')
+        ->and($deactivation->fresh()->proxy_snapshot)->toBeNull();
+    Process::assertRanTimes(fn (): bool => true, 1);
 });
 
 it('bounds every deactivation transport attempt inside the renewable lock lease', function () {
