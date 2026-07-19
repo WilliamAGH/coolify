@@ -8,6 +8,7 @@ use App\Actions\Proxy\ControlPlane\ControlPlaneProxyExposure;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyRouteProof;
 use App\Actions\Proxy\ControlPlane\ControlPlaneStaticListenerHandoff;
 use App\Actions\Proxy\ControlPlane\ControlPlaneStaticProxyConfiguration;
+use App\Actions\Proxy\ControlPlane\ExecuteControlPlaneProxyEnrollmentRollback;
 use App\Actions\Proxy\ControlPlane\FinalizeControlPlaneProxyEnrollment;
 use App\Actions\Proxy\ControlPlane\ManagedTraefikDocumentWriter;
 use App\Actions\Proxy\ControlPlane\ResumeControlPlaneProxyEnrollment;
@@ -60,6 +61,11 @@ function resumableControlPlaneEnrollment(): array
             new ControlPlaneStaticListenerHandoff,
         ),
         new FinalizeControlPlaneProxyEnrollment($store, new VerifyControlPlaneProxyRoutes),
+        new ExecuteControlPlaneProxyEnrollmentRollback(
+            $store,
+            new ControlPlaneStaticListenerHandoff,
+            new ManagedTraefikDocumentWriter,
+        ),
     );
 
     return [$server, $store, $state, $action];
@@ -110,5 +116,6 @@ it('resumes a fenced enrollment across self-replacement without exposing its tok
         ->and($enrolled->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Enrolled)
         ->and($remoteCalls)->toBe(5)
         ->and($action->commandSignature)->not->toContain('token')
+        ->and($action->commandSignature)->toContain('--rollback')
         ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Enrolled);
 });

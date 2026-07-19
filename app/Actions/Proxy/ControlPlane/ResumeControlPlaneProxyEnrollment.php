@@ -15,7 +15,8 @@ final class ResumeControlPlaneProxyEnrollment
 
     public string $commandSignature = 'control-plane:proxy-enrollment
         {server_id : Local Coolify server ID}
-        {operation_id : Exact durable enrollment operation ID}';
+        {operation_id : Exact durable enrollment operation ID}
+        {--rollback : Restore the exact pre-enrollment listener and dynamic document}';
 
     public string $commandDescription = 'Resume an existing fenced control-plane Traefik enrollment.';
 
@@ -23,6 +24,7 @@ final class ResumeControlPlaneProxyEnrollment
         private readonly StoreControlPlaneProxyEnrollmentState $stateStore,
         private readonly ActivateControlPlaneProxyEnrollment $activator,
         private readonly FinalizeControlPlaneProxyEnrollment $finalizer,
+        private readonly ExecuteControlPlaneProxyEnrollmentRollback $rollback,
     ) {}
 
     /** @param null|Closure(string): ?string $remoteExecutor */
@@ -31,11 +33,15 @@ final class ResumeControlPlaneProxyEnrollment
         string $operationId,
         string $token,
         ?Closure $remoteExecutor = null,
+        bool $rollback = false,
     ): ControlPlaneProxyEnrollmentState {
         $state = $this->stateStore->read($server)
             ?? throw new RuntimeException('The durable control-plane enrollment state is missing.');
         if (! $state->isOwnedBy($operationId, $token)) {
             throw new RuntimeException('The durable control-plane enrollment state is owned by another operation.');
+        }
+        if ($rollback || $state->phase === ControlPlaneProxyEnrollmentPhase::RollingBack) {
+            return $this->rollback->handle($server, $operationId, $token, $remoteExecutor);
         }
         if (in_array($state->phase, [
             ControlPlaneProxyEnrollmentPhase::Preparing,
@@ -73,7 +79,12 @@ final class ResumeControlPlaneProxyEnrollment
         }
         $server = Server::query()->find($serverId)
             ?? throw new RuntimeException('The control-plane enrollment server does not exist.');
-        $state = $this->handle($server, $operationId, $token);
+        $state = $this->handle(
+            $server,
+            $operationId,
+            $token,
+            rollback: (bool) $command->option('rollback'),
+        );
         $command->info("Control-plane enrollment phase: {$state->phase->value}");
 
         return Command::SUCCESS;
