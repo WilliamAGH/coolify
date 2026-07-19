@@ -33,8 +33,12 @@ class PlanBlueGreenPublicRecovery
      *
      * @return list<array{router: string, url: string}>
      */
-    public function routesForYaml(string $yaml, bool $probe = false, bool $requireEntryPoints = false): array
-    {
+    public function routesForYaml(
+        string $yaml,
+        bool $probe = false,
+        bool $requireEntryPoints = false,
+        ?string $requiredRouterSuffix = null,
+    ): array {
         $parsed = Yaml::parse(
             $yaml,
             Yaml::PARSE_EXCEPTION_ON_ALIAS | Yaml::PARSE_EXCEPTION_ON_INVALID_TYPE,
@@ -48,6 +52,9 @@ class PlanBlueGreenPublicRecovery
         foreach ($routers as $routerName => $router) {
             if (! is_string($routerName) || ! is_array($router) || str_ends_with($routerName, '-probe') !== $probe) {
                 continue;
+            }
+            if ($requiredRouterSuffix !== null && ! str_ends_with($routerName, $requiredRouterSuffix)) {
+                throw new RuntimeException("The restored router {$routerName} is not in the required managed router set.");
             }
             $rule = data_get($router, 'rule');
             $entryPoints = data_get($router, 'entryPoints');

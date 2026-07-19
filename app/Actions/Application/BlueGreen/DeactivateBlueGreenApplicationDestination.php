@@ -176,6 +176,7 @@ final class DeactivateBlueGreenApplicationDestination
             $operationFence->assertDeactivationOwnership($preparation);
             WaitForBlueGreenProxyEviction::run(
                 $server,
+                $application,
                 $snapshot,
                 BlueGreenProxyEvictionState::Absent,
                 $expectedServerBootId,
@@ -187,6 +188,7 @@ final class DeactivateBlueGreenApplicationDestination
         $operationFence->assertDeactivationOwnership($preparation);
         WaitForBlueGreenProxyEviction::run(
             $server,
+            $application,
             $snapshot,
             BlueGreenProxyEvictionState::Tombstone,
             $expectedServerBootId,
@@ -209,6 +211,7 @@ final class DeactivateBlueGreenApplicationDestination
         $operationFence->assertDeactivationOwnership($preparation);
         WaitForBlueGreenProxyEviction::run(
             $server,
+            $application,
             $snapshot,
             BlueGreenProxyEvictionState::Absent,
             $expectedServerBootId,

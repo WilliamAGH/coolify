@@ -1,13 +1,21 @@
 <?php
 
+use App\Actions\Application\BlueGreen\BlueGreenDeactivationInProgressException;
+use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteOutcome;
+use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteResult;
+use App\Actions\Application\BlueGreen\BlueGreenProxyDeactivationSnapshot;
+use App\Actions\Application\BlueGreen\BlueGreenProxyEvictionState;
+use App\Actions\Application\BlueGreen\ExecuteBlueGreenDeactivationRemoteCommand;
 use App\Actions\Application\BlueGreen\PlanBlueGreenPublicRecovery;
 use App\Actions\Application\BlueGreen\VerifyBlueGreenPublicRecovery;
+use App\Actions\Application\BlueGreen\WaitForBlueGreenProxyEviction;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Models\Application;
 use App\Models\PrivateKey;
 use App\Models\Server;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Storage;
 use Symfony\Component\Yaml\Yaml;
@@ -48,6 +56,17 @@ KEY;
     );
 
     return $server;
+}
+
+function blueGreenPublicRecoveryEvictionRemoteOutput(string $output = ''): string
+{
+    return (new ExecuteBlueGreenDeactivationRemoteCommand)->encode(
+        new BlueGreenDeactivationRemoteResult(
+            BlueGreenDeactivationRemoteOutcome::Success,
+            0,
+            $output,
+        ),
+    );
 }
 
 /** @param array<string, array<string, mixed>> $routerOverrides */
@@ -103,17 +122,28 @@ it('provides one canonical public and probe direct-origin inventory', function (
 
 it('fails closed when a required direct-origin route has no entry point', function () {
     $planner = new PlanBlueGreenPublicRecovery;
-    $yaml = blueGreenPublicRecoveryYaml([
-        'managed-https' => [
-            'rule' => 'Host(`app.example.test`) && PathPrefix(`/health`)',
-            'entryPoints' => [],
-            'middlewares' => ['managed-acknowledgement'],
-            'service' => 'managed-blue',
+    $yaml = Yaml::dump([
+        'http' => [
+            'routers' => [
+                'managed-valid-public' => [
+                    'rule' => 'Host(`app.example.test`) && PathPrefix(`/health`)',
+                    'entryPoints' => ['https'],
+                    'service' => 'managed-blue',
+                ],
+                'managed-empty-public' => [
+                    'rule' => 'Host(`app.example.test`) && PathPrefix(`/health`)',
+                    'entryPoints' => [],
+                    'service' => 'managed-blue',
+                ],
+            ],
         ],
     ]);
 
-    expect(fn () => $planner->routesForYaml($yaml, requireEntryPoints: true))
-        ->toThrow(RuntimeException::class, 'managed-https has no entry point to verify');
+    expect(fn () => $planner->routesForYaml(
+        $yaml,
+        requireEntryPoints: true,
+        requiredRouterSuffix: '-public',
+    ))->toThrow(RuntimeException::class, 'managed-empty-public has no entry point to verify');
 });
 
 it('derives one exact provider acknowledgement from all public routes', function () {
@@ -204,6 +234,161 @@ it('passes direct-origin curl configuration over standard input', function () {
         && str_ends_with($process->command, " 'curl --config -'")
         && str_contains((string) $process->input, 'user = "route-user:route-password"')
         && str_contains((string) $process->input, 'header = "X-Coolify-Blue-Green-Probe: probe-secret"'));
+});
+
+it('reuses canonical stdin direct-origin transport for forward and rollback recovery', function () {
+    config(['constants.ssh.mux_enabled' => false]);
+    $acknowledgement = str_repeat('a', 64);
+    $headers = "HTTP/1.1 200 OK\r\n".BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$acknowledgement}\r\n\r\n";
+    Process::fake(['*' => Process::sequence([
+        Process::result(output: $headers),
+        Process::result(output: $headers),
+    ])]);
+    $verifier = new VerifyBlueGreenPublicRecovery;
+    $application = new Application;
+    $application->is_http_basic_auth_enabled = true;
+    $application->http_basic_auth_username = 'route-user';
+    $application->http_basic_auth_password = 'route-password';
+    $server = makeBlueGreenPublicRecoveryServer();
+    $route = ['router' => 'managed-public', 'url' => 'https://app.example.test/health'];
+
+    $verifier->verifyRoute(
+        $server,
+        $application,
+        $route,
+        $acknowledgement,
+        nonceParameter: VerifyBlueGreenPublicRecovery::DEPLOYMENT_NONCE_PARAMETER,
+    );
+    $verifier->verifyRoute(
+        $server,
+        $application,
+        $route,
+        $acknowledgement,
+        nonceParameter: VerifyBlueGreenPublicRecovery::RECOVERY_NONCE_PARAMETER,
+    );
+
+    Process::assertRanTimes(
+        fn (PendingProcess $process): bool => str_ends_with($process->command, " 'curl --config -'")
+            && ! str_contains($process->command, 'route-password')
+            && str_contains((string) $process->input, 'user = "route-user:route-password"'),
+        2,
+    );
+    Process::assertRan(fn (PendingProcess $process): bool => str_contains(
+        (string) $process->input,
+        VerifyBlueGreenPublicRecovery::DEPLOYMENT_NONCE_PARAMETER.'=',
+    ));
+    Process::assertRan(fn (PendingProcess $process): bool => str_contains(
+        (string) $process->input,
+        VerifyBlueGreenPublicRecovery::RECOVERY_NONCE_PARAMETER.'=',
+    ));
+});
+
+it('proves exact tombstone and absence states through canonical direct-origin transport', function () {
+    config(['constants.ssh.mux_enabled' => false]);
+    $application = new Application;
+    $application->is_http_basic_auth_enabled = true;
+    $application->http_basic_auth_username = 'route-user';
+    $application->http_basic_auth_password = 'route-password';
+    $server = makeBlueGreenPublicRecoveryServer();
+    $route = ['router' => 'managed-public', 'url' => 'https://app.example.test/health'];
+    $sourceYaml = "http:\n  routers: {}\n";
+    $tombstoneYaml = "http:\n  routers: {}\n";
+    $destinationClockObservedAt = 1_700_000_000;
+    $snapshot = new BlueGreenProxyDeactivationSnapshot(
+        managedFilename: BlueGreenRoutingTarget::managedFilename('direct-origin-test', 1),
+        sourceYaml: $sourceYaml,
+        sourceSha256: hash('sha256', $sourceYaml),
+        tombstoneYaml: $tombstoneYaml,
+        tombstoneSha256: hash('sha256', $tombstoneYaml),
+        tombstoneAcknowledgement: str_repeat('a', 64),
+        routes: [$route],
+        backendPort: 3000,
+        destinationClockObservedAtUnixSeconds: $destinationClockObservedAt,
+        drainDeadlineUnixSeconds: $destinationClockObservedAt + 840,
+        deactivationDeadlineUnixSeconds: $destinationClockObservedAt + 900,
+    );
+    Process::fake(['*' => Process::sequence([
+        Process::result(output: blueGreenPublicRecoveryEvictionRemoteOutput()),
+        Process::result(output: blueGreenPublicRecoveryEvictionRemoteOutput('1700000000')),
+        Process::result(output: blueGreenPublicRecoveryEvictionRemoteOutput('1700000000')),
+        Process::result(output: "HTTP/1.1 418 I'm a teapot\r\n".BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$snapshot->tombstoneAcknowledgement}\r\n\r\n"),
+        Process::result(output: blueGreenPublicRecoveryEvictionRemoteOutput('1700000000')),
+        Process::result(output: blueGreenPublicRecoveryEvictionRemoteOutput()),
+        Process::result(output: blueGreenPublicRecoveryEvictionRemoteOutput()),
+        Process::result(output: blueGreenPublicRecoveryEvictionRemoteOutput('1700000000')),
+        Process::result(output: blueGreenPublicRecoveryEvictionRemoteOutput('1700000000')),
+        Process::result(output: "HTTP/1.1 404 Not Found\r\n\r\n"),
+        Process::result(output: blueGreenPublicRecoveryEvictionRemoteOutput('1700000000')),
+        Process::result(output: blueGreenPublicRecoveryEvictionRemoteOutput()),
+    ])]);
+
+    WaitForBlueGreenProxyEviction::run(
+        $server,
+        $application,
+        $snapshot,
+        BlueGreenProxyEvictionState::Tombstone,
+        '11111111-2222-3333-4444-555555555555',
+        attempts: 1,
+    );
+    WaitForBlueGreenProxyEviction::run(
+        $server,
+        $application,
+        $snapshot,
+        BlueGreenProxyEvictionState::Absent,
+        '11111111-2222-3333-4444-555555555555',
+        attempts: 1,
+    );
+
+    Process::assertRanTimes(
+        fn (PendingProcess $process): bool => str_ends_with($process->command, " 'curl --config -'")
+            && ! str_contains($process->command, 'route-password')
+            && str_contains((string) $process->input, 'user = "route-user:route-password"')
+            && str_contains((string) $process->input, '__coolify_blue_green_eviction='),
+        2,
+    );
+    Process::assertRanTimes(fn (): bool => true, 12);
+});
+
+it('rejects a matching eviction response that arrives after the bounded attempt deadline', function () {
+    config(['constants.ssh.mux_enabled' => false]);
+    $application = new Application;
+    $server = makeBlueGreenPublicRecoveryServer();
+    $route = ['router' => 'managed-public', 'url' => 'https://app.example.test/health'];
+    $sourceYaml = "http:\n  routers: {}\n";
+    $snapshot = new BlueGreenProxyDeactivationSnapshot(
+        managedFilename: BlueGreenRoutingTarget::managedFilename('deadline-test', 1),
+        sourceYaml: $sourceYaml,
+        sourceSha256: hash('sha256', $sourceYaml),
+        tombstoneYaml: $sourceYaml,
+        tombstoneSha256: hash('sha256', $sourceYaml),
+        tombstoneAcknowledgement: str_repeat('a', 64),
+        routes: [$route],
+        backendPort: 3000,
+        destinationClockObservedAtUnixSeconds: 1_700_000_000,
+        drainDeadlineUnixSeconds: 1_700_000_840,
+        deactivationDeadlineUnixSeconds: 1_700_000_900,
+    );
+    Process::fake(['*' => Process::sequence([
+        Process::result(output: blueGreenPublicRecoveryEvictionRemoteOutput()),
+        Process::result(output: blueGreenPublicRecoveryEvictionRemoteOutput('1700000000')),
+        Process::result(output: blueGreenPublicRecoveryEvictionRemoteOutput('1700000239')),
+        Process::result(output: "HTTP/1.1 418 I'm a teapot\r\n".BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$snapshot->tombstoneAcknowledgement}\r\n\r\n"),
+        Process::result(output: blueGreenPublicRecoveryEvictionRemoteOutput('1700000240')),
+    ])]);
+
+    expect(fn () => WaitForBlueGreenProxyEviction::run(
+        $server,
+        $application,
+        $snapshot,
+        BlueGreenProxyEvictionState::Tombstone,
+        '11111111-2222-3333-4444-555555555555',
+        attempts: 1,
+    ))->toThrow(
+        BlueGreenDeactivationInProgressException::class,
+        'bounded route-convergence attempt ended',
+    );
+    Process::assertRan(fn (PendingProcess $process): bool => str_starts_with($process->command, 'timeout 6 ssh ')
+        && str_contains((string) $process->input, 'max-time = 1'));
 });
 
 it('applies the requested timeout to stdin-safe SSH transport', function () {

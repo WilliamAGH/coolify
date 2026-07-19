@@ -2,11 +2,12 @@
 
 namespace App\Actions\Application\BlueGreen;
 
-use App\Actions\Proxy\BlueGreenRoutingTarget;
+use App\Models\Application;
 use App\Models\Server;
+use Illuminate\Support\Sleep;
 use InvalidArgumentException;
 use Lorisleiva\Actions\Concerns\AsAction;
-use Spatie\Url\Url;
+use Throwable;
 
 final class WaitForBlueGreenProxyEviction
 {
@@ -14,14 +15,16 @@ final class WaitForBlueGreenProxyEviction
 
     public function handle(
         Server $server,
+        Application $application,
         BlueGreenProxyDeactivationSnapshot $snapshot,
         BlueGreenProxyEvictionState $expectedState,
         string $expectedServerBootId,
         int $attempts = BlueGreenProxyDeactivationSnapshot::ROUTE_CONVERGENCE_ATTEMPTS,
     ): void {
-        $bootAssertion = (new ReadBlueGreenServerBootIdentity)->assertionCommandFor($expectedServerBootId).' || exit 75';
         try {
-            $command = $this->commandFor($snapshot, $expectedState, $attempts);
+            $this->assertBootIdentity($server, $expectedServerBootId);
+            $this->waitForExpectedRoutes($server, $application, $snapshot, $expectedState, $attempts);
+            $this->assertBootIdentity($server, $expectedServerBootId);
         } catch (InvalidArgumentException $exception) {
             throw new BlueGreenDeactivationException(
                 'The durable route-convergence snapshot is malformed and requires intervention: '.$exception->getMessage(),
@@ -29,127 +32,148 @@ final class WaitForBlueGreenProxyEviction
                 $exception,
             );
         }
-        ExecuteBlueGreenDeactivationRemoteCommand::run(
-            $server,
-            implode("\n", [
-                $bootAssertion,
-                $command,
-                $bootAssertion,
-            ]),
-        );
     }
 
-    public function commandFor(
+    private function waitForExpectedRoutes(
+        Server $server,
+        Application $application,
         BlueGreenProxyDeactivationSnapshot $snapshot,
         BlueGreenProxyEvictionState $expectedState,
         int $attempts,
-    ): string {
+    ): void {
         if ($attempts < 1 || $attempts > 300) {
             throw new InvalidArgumentException('Traefik eviction attempts must be between 1 and 300.');
         }
 
-        $commands = [
-            'set -eu',
-            'headers_file=$(mktemp)',
-            'trap \'rm -f "$headers_file"\' EXIT INT TERM',
-            'attempt_deadline=$(($(date +%s) + '.(string) BlueGreenProxyDeactivationSnapshot::DRAIN_ATTEMPT_SECONDS.'))',
-            'attempt=1',
-            'while [ "$attempt" -le '.(string) $attempts.' ]; do',
-            '  all_routes_expected=1',
-        ];
-        foreach ($snapshot->routes as $index => $route) {
-            array_push(
-                $commands,
-                ...$this->routeCommands(
-                    $route,
-                    $index,
-                    $snapshot->tombstoneAcknowledgement,
+        $attemptDeadlineUnixSeconds = $this->destinationUnixSeconds($server)
+            + BlueGreenProxyDeactivationSnapshot::DRAIN_ATTEMPT_SECONDS;
+        $requests = new VerifyBlueGreenPublicRecovery;
+        for ($attempt = 1; $attempt <= $attempts; $attempt++) {
+            $allRoutesExpected = true;
+            foreach ($snapshot->routes as $route) {
+                $remainingSeconds = $this->remainingDeadlineSeconds(
+                    $server,
+                    $attemptDeadlineUnixSeconds,
                     $snapshot->deactivationDeadlineUnixSeconds,
-                    $expectedState,
-                ),
-            );
+                );
+                $response = $this->requestResponse(
+                    $server,
+                    $application,
+                    $requests,
+                    $route,
+                    min(15, $remainingSeconds),
+                );
+                $this->remainingDeadlineSeconds(
+                    $server,
+                    $attemptDeadlineUnixSeconds,
+                    $snapshot->deactivationDeadlineUnixSeconds,
+                );
+                if ($response['status'] === 0) {
+                    throw new BlueGreenDeactivationInProgressException("Managed router {$route['router']} did not return an HTTP status during eviction.");
+                }
+                if ($response['status'] >= 500) {
+                    throw new BlueGreenDeactivationException("Managed router {$route['router']} returned an unsafe gateway/server status during eviction.");
+                }
+                if (! $this->matchesExpectedState($response, $snapshot, $expectedState)) {
+                    $allRoutesExpected = false;
+                }
+            }
+            if ($allRoutesExpected) {
+                return;
+            }
+            if ($attempt < $attempts) {
+                Sleep::for(1)->seconds();
+            }
         }
-        array_push(
-            $commands,
-            '  if [ "$all_routes_expected" -eq 1 ]; then exit 0; fi',
-            '  if [ "$attempt" -lt '.(string) $attempts.' ]; then sleep 1; fi',
-            '  attempt=$((attempt + 1))',
-            'done',
-            'printf \'%s\n\' '.escapeshellarg(
-                $expectedState === BlueGreenProxyEvictionState::Tombstone
-                    ? 'Traefik did not acknowledge every exact blue-green tombstone route before the deadline.'
-                    : 'Traefik did not prove every exact blue-green route absent before the deadline.'
-            ).' >&2',
-            'exit 75',
-        );
 
-        return implode("\n", $commands);
+        throw new BlueGreenDeactivationInProgressException(
+            $expectedState === BlueGreenProxyEvictionState::Tombstone
+                ? 'Traefik did not acknowledge every exact blue-green tombstone route before the deadline.'
+                : 'Traefik did not prove every exact blue-green route absent before the deadline.',
+        );
     }
 
-    /**
-     * @param  array{router: string, url: string}  $route
-     * @return list<string>
-     */
-    private function routeCommands(
-        array $route,
-        int $index,
-        string $tombstoneAcknowledgement,
+    private function assertBootIdentity(Server $server, string $expectedServerBootId): void
+    {
+        ExecuteBlueGreenDeactivationRemoteCommand::run(
+            $server,
+            (new ReadBlueGreenServerBootIdentity)->assertionCommandFor($expectedServerBootId).' || exit 75',
+        );
+    }
+
+    private function destinationUnixSeconds(Server $server): int
+    {
+        $destinationUnixSeconds = ExecuteBlueGreenDeactivationRemoteCommand::run($server, 'date +%s');
+        if (preg_match('/^[1-9][0-9]*$/D', $destinationUnixSeconds) !== 1) {
+            throw new BlueGreenDeactivationTransportException('The destination did not return a valid clock value for bounded route convergence.');
+        }
+
+        return (int) $destinationUnixSeconds;
+    }
+
+    private function remainingDeadlineSeconds(
+        Server $server,
+        int $attemptDeadlineUnixSeconds,
         int $deactivationDeadlineUnixSeconds,
-        BlueGreenProxyEvictionState $expectedState,
+    ): int {
+        $destinationUnixSeconds = $this->destinationUnixSeconds($server);
+        if ($destinationUnixSeconds >= $deactivationDeadlineUnixSeconds) {
+            throw new BlueGreenDeactivationException('The durable blue-green deactivation deadline expired before Traefik converged.');
+        }
+        if ($destinationUnixSeconds >= $attemptDeadlineUnixSeconds) {
+            throw new BlueGreenDeactivationInProgressException('This bounded route-convergence attempt ended before the durable overall deadline; resume the same operation.');
+        }
+
+        return min($attemptDeadlineUnixSeconds, $deactivationDeadlineUnixSeconds) - $destinationUnixSeconds;
+    }
+
+    /** @param array{router: string, url: string} $route */
+    private function requestResponse(
+        Server $server,
+        Application $application,
+        VerifyBlueGreenPublicRecovery $requests,
+        array $route,
+        int $maxTimeSeconds,
     ): array {
-        $url = Url::fromString($route['url']);
-        $port = match ($url->getScheme()) {
-            'http' => 80,
-            'https' => 443,
-            default => throw new InvalidArgumentException("Managed router {$route['router']} has an unsupported URL scheme."),
+        $request = $requests->requestFor(
+            $application,
+            $route,
+            nonceParameter: '__coolify_blue_green_eviction',
+            maxTimeSeconds: $maxTimeSeconds,
+        );
+        try {
+            $headers = (string) instant_remote_process(
+                [$request['command']],
+                $server,
+                timeout: min(
+                    BlueGreenDeploymentLock::deactivationRemoteTimeoutSeconds(),
+                    $maxTimeSeconds + 5,
+                ),
+                input: $request['input'],
+                retry: false,
+            );
+        } catch (Throwable $exception) {
+            throw new BlueGreenDeactivationInProgressException(
+                "Managed router {$route['router']} reset or timed out during eviction.",
+                (int) $exception->getCode(),
+                $exception,
+            );
+        }
+
+        return $requests->responseFor($headers);
+    }
+
+    /** @param array{status: int, acknowledgements: list<string>} $response */
+    private function matchesExpectedState(
+        array $response,
+        BlueGreenProxyDeactivationSnapshot $snapshot,
+        BlueGreenProxyEvictionState $expectedState,
+    ): bool {
+        return match ($expectedState) {
+            BlueGreenProxyEvictionState::Tombstone => $response['status'] === 418
+                && $response['acknowledgements'] === [$snapshot->tombstoneAcknowledgement],
+            BlueGreenProxyEvictionState::Absent => $response['status'] === 404
+                && $response['acknowledgements'] === [],
         };
-        $host = $url->getHost();
-        if ($host === '') {
-            throw new InvalidArgumentException("Managed router {$route['router']} has no URL host.");
-        }
-
-        $curl = "curl --silent --show-error --http1.1 --noproxy '*' --connect-timeout 5 --max-time 15 --output /dev/null --dump-header \"\$headers_file\" --write-out '%{http_code}'";
-        if ($url->getScheme() === 'https') {
-            $curl .= ' --insecure';
-        }
-        $curl .= ' --header '.escapeshellarg('Cache-Control: no-cache, no-store, max-age=0');
-        $curl .= ' --header '.escapeshellarg('Pragma: no-cache');
-        $curl .= ' --header '.escapeshellarg('Connection: close');
-        $curl .= ' --resolve '.escapeshellarg("{$host}:{$port}:127.0.0.1");
-        $curl .= ' --url '.escapeshellarg($route['url']).'"?__coolify_blue_green_eviction=${nonce}-'.$index.'"';
-        $acknowledgementHeader = strtolower(BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER);
-
-        $commands = [
-            '  if [ "$(date +%s)" -ge '.(string) $deactivationDeadlineUnixSeconds.' ]; then',
-            '    printf \'%s\n\' \'The durable blue-green deactivation deadline expired before Traefik converged.\' >&2',
-            '    exit 1',
-            '  fi',
-            '  if [ "$(date +%s)" -ge "$attempt_deadline" ]; then',
-            '    printf \'%s\n\' \'This bounded route-convergence attempt ended before the durable overall deadline; resume the same operation.\' >&2',
-            '    exit 75',
-            '  fi',
-            '  nonce=$(cat /proc/sys/kernel/random/uuid)',
-            '  : >"$headers_file"',
-            "  if ! status=\$({$curl}); then",
-            '    printf \'%s\n\' '.escapeshellarg("Managed router {$route['router']} reset or timed out during eviction.").' >&2',
-            '    exit 75',
-            '  fi',
-            '  case "$status" in 000) printf \'%s\n\' '.escapeshellarg("Managed router {$route['router']} did not return an HTTP status during eviction.").' >&2; exit 75 ;; 5??) printf \'%s\n\' '.escapeshellarg("Managed router {$route['router']} returned an unsafe gateway/server status during eviction.").' >&2; exit 1 ;; esac',
-            '  acknowledgements=$(awk -F \': *\' \'tolower($1) == "'.$acknowledgementHeader.'" { gsub("\\r", "", $2); if (length($2) > 0) print $2 }\' "$headers_file")',
-        ];
-
-        if ($expectedState === BlueGreenProxyEvictionState::Tombstone) {
-            return [
-                ...$commands,
-                '  if [ "$status" != 418 ] || [ "$acknowledgements" != '.escapeshellarg($tombstoneAcknowledgement).' ]; then',
-                '    all_routes_expected=0',
-                '  fi',
-            ];
-        }
-
-        return [
-            ...$commands,
-            '  if [ "$status" != 404 ] || [ -n "$acknowledgements" ]; then all_routes_expected=0; fi',
-        ];
     }
 }
