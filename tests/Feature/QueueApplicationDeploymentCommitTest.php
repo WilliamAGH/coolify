@@ -1,5 +1,6 @@
 <?php
 
+use App\Enums\ApplicationDeploymentExecutionPhase;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Jobs\ApplicationDeploymentJob;
 use App\Models\Application;
@@ -14,6 +15,7 @@ use App\Support\ProxyMutationQueueFrozenException;
 use Illuminate\Contracts\Bus\Dispatcher;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Laravel\Horizon\Contracts\JobRepository;
 
@@ -181,6 +183,97 @@ describe('proxy mutation freeze recovery', function () {
                 ProxyMutationQueue::unfreeze($operationId);
             }
         }
+    });
+});
+
+describe('application deployment execution phase handoff', function () {
+    test('atomically transfers preparation ownership to an encrypted activation attempt', function () {
+        $application = makeApplication($this->environment->id, $this->destination->id, null);
+        $deployment = makeQueueAdmissionDeployment(
+            $application,
+            $this->server,
+            'queue-phase-handoff',
+        );
+        expect($deployment->claimForDispatch(bypassServerCapacity: true))->toBeTrue();
+        $deployment = $deployment->fresh();
+        $prepareAttemptUuid = $deployment->horizon_job_id;
+        $prepareWorker = 'prepare-worker-a';
+        expect($deployment->acquireDispatchExecution($prepareAttemptUuid, $prepareWorker))->toBeTrue();
+
+        $payload = [
+            'schema_version' => 1,
+            'deployment_id' => (int) $deployment->id,
+            'application_id' => (int) $deployment->application_id,
+            'server_id' => (int) $deployment->server_id,
+            'destination_id' => (int) $deployment->destination_id,
+            'prepared_commit' => $deployment->commit,
+            'input_fingerprint' => hash('sha256', 'phase-handoff-input'),
+            'artifact' => [
+                'kind' => 'container-image',
+                'reference' => 'registry.example.test/coolify/application@sha256:'.str_repeat('a', 64),
+                'runtime_secret' => 'phase-handoff-secret',
+            ],
+        ];
+
+        $activationAttemptUuid = $deployment->handoffToActivation(
+            $prepareAttemptUuid,
+            $prepareWorker,
+            $payload,
+        );
+        $persisted = $deployment->fresh();
+        $rawPayload = DB::table('application_deployment_queues')
+            ->where('id', $deployment->id)
+            ->value('prepared_activation_payload');
+
+        expect($activationAttemptUuid)->toBeString()
+            ->and(Str::isUuid($activationAttemptUuid))->toBeTrue()
+            ->and($activationAttemptUuid)->not->toBe($prepareAttemptUuid)
+            ->and($persisted->execution_phase)->toBe(ApplicationDeploymentExecutionPhase::Activate)
+            ->and($persisted->horizon_job_id)->toBe($activationAttemptUuid)
+            ->and($persisted->horizon_job_worker)->toBeNull()
+            ->and($persisted->prepared_activation_payload)->toBe($payload)
+            ->and($persisted->toArray())->not->toHaveKey('prepared_activation_payload')
+            ->and($rawPayload)->toBeString()
+            ->and($rawPayload)->not->toContain('phase-handoff-secret');
+    });
+
+    test('rejects stale preparation owners and malformed activation identities', function () {
+        $application = makeApplication($this->environment->id, $this->destination->id, null);
+        $deployment = makeQueueAdmissionDeployment(
+            $application,
+            $this->server,
+            'queue-phase-stale-owner',
+        );
+        expect($deployment->claimForDispatch(bypassServerCapacity: true))->toBeTrue();
+        $deployment = $deployment->fresh();
+        $prepareAttemptUuid = $deployment->horizon_job_id;
+        expect($deployment->acquireDispatchExecution($prepareAttemptUuid, 'prepare-worker-a'))->toBeTrue();
+        $payload = [
+            'schema_version' => 1,
+            'deployment_id' => (int) $deployment->id,
+            'application_id' => (int) $deployment->application_id,
+            'server_id' => (int) $deployment->server_id,
+            'destination_id' => (int) $deployment->destination_id,
+            'prepared_commit' => $deployment->commit,
+            'input_fingerprint' => hash('sha256', 'phase-stale-owner-input'),
+            'artifact' => [],
+        ];
+
+        expect($deployment->handoffToActivation($prepareAttemptUuid, 'foreign-worker', $payload))->toBeNull()
+            ->and(fn () => $deployment->handoffToActivation(
+                $prepareAttemptUuid,
+                'prepare-worker-a',
+                [...$payload, 'destination_id' => (int) $deployment->destination_id + 1],
+            ))->toThrow(InvalidArgumentException::class, 'invalid destination_id');
+
+        $activationAttemptUuid = $deployment->handoffToActivation(
+            $prepareAttemptUuid,
+            'prepare-worker-a',
+            $payload,
+        );
+
+        expect($activationAttemptUuid)->toBeString()
+            ->and($deployment->handoffToActivation($prepareAttemptUuid, 'prepare-worker-a', $payload))->toBeNull();
     });
 });
 

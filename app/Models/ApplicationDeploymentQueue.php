@@ -3,6 +3,7 @@
 namespace App\Models;
 
 use App\Casts\EncryptedArrayCast;
+use App\Enums\ApplicationDeploymentExecutionPhase;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
@@ -102,6 +103,8 @@ class ApplicationDeploymentQueue extends Model
         'blue_green_candidate_container_id',
         'blue_green_rollback_managed_filename',
         'blue_green_routing_mutated_at',
+        'execution_phase',
+        'prepared_activation_payload',
     ];
 
     /**
@@ -115,6 +118,7 @@ class ApplicationDeploymentQueue extends Model
     protected $hidden = [
         'configuration_snapshot',
         'configuration_diff',
+        'prepared_activation_payload',
     ];
 
     protected $casts = [
@@ -122,6 +126,8 @@ class ApplicationDeploymentQueue extends Model
         'finished_at' => 'datetime',
         'configuration_snapshot' => EncryptedArrayCast::class,
         'configuration_diff' => EncryptedArrayCast::class,
+        'execution_phase' => ApplicationDeploymentExecutionPhase::class,
+        'prepared_activation_payload' => EncryptedArrayCast::class,
         'blue_green_color' => BlueGreenDeploymentColor::class,
         'blue_green_phase' => BlueGreenDeploymentPhase::class,
         'blue_green_routing_revision' => 'integer',
@@ -256,6 +262,80 @@ class ApplicationDeploymentQueue extends Model
         $this->syncOriginalAttribute('horizon_job_worker');
 
         return true;
+    }
+
+    /**
+     * @param  array<string, mixed>  $preparedActivationPayload
+     */
+    public function handoffToActivation(
+        string $prepareAttemptUuid,
+        string $prepareWorker,
+        array $preparedActivationPayload,
+    ): ?string {
+        if (! Str::isUuid($prepareAttemptUuid)) {
+            throw new \InvalidArgumentException('The deployment preparation attempt must be a valid UUID.');
+        }
+        if (blank($prepareWorker)) {
+            throw new \InvalidArgumentException('The deployment preparation worker identity cannot be empty.');
+        }
+        $this->assertPreparedActivationPayload($preparedActivationPayload);
+
+        return DB::transaction(function () use ($prepareAttemptUuid, $prepareWorker, $preparedActivationPayload): ?string {
+            $deployment = self::query()
+                ->whereKey($this->getKey())
+                ->lockForUpdate()
+                ->first();
+            if ($deployment === null
+                || $deployment->status !== ApplicationDeploymentStatus::IN_PROGRESS->value
+                || $deployment->execution_phase !== ApplicationDeploymentExecutionPhase::Prepare
+                || $deployment->horizon_job_id !== $prepareAttemptUuid
+                || $deployment->horizon_job_worker !== $prepareWorker
+                || $deployment->current_process_id !== null
+                || $deployment->finished_at !== null) {
+                return null;
+            }
+
+            $activationAttemptUuid = (string) Str::uuid();
+            $handoffAt = now();
+            $updated = self::query()
+                ->whereKey($deployment->getKey())
+                ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
+                ->where('execution_phase', ApplicationDeploymentExecutionPhase::Prepare->value)
+                ->where('horizon_job_id', $prepareAttemptUuid)
+                ->where('horizon_job_worker', $prepareWorker)
+                ->whereNull('current_process_id')
+                ->whereNull('finished_at')
+                ->update([
+                    'execution_phase' => ApplicationDeploymentExecutionPhase::Activate->value,
+                    'prepared_activation_payload' => (new EncryptedArrayCast)->set(
+                        $deployment,
+                        'prepared_activation_payload',
+                        $preparedActivationPayload,
+                        $deployment->getAttributes(),
+                    ),
+                    'horizon_job_id' => $activationAttemptUuid,
+                    'horizon_job_worker' => null,
+                    'updated_at' => $handoffAt,
+                ]);
+            if ($updated !== 1) {
+                return null;
+            }
+
+            $this->setAttribute('execution_phase', ApplicationDeploymentExecutionPhase::Activate);
+            $this->setAttribute('prepared_activation_payload', $preparedActivationPayload);
+            $this->setAttribute('horizon_job_id', $activationAttemptUuid);
+            $this->setAttribute('horizon_job_worker', null);
+            $this->setAttribute('updated_at', $handoffAt);
+            $this->syncOriginalAttributes([
+                'execution_phase',
+                'prepared_activation_payload',
+                'horizon_job_id',
+                'horizon_job_worker',
+                'updated_at',
+            ]);
+
+            return $activationAttemptUuid;
+        }, attempts: 5);
     }
 
     public function deferLiveDispatchRecovery(Carbon $staleBefore, string $dispatchAttemptUuid): bool
@@ -555,5 +635,28 @@ class ApplicationDeploymentQueue extends Model
             // Save without triggering events to prevent potential race conditions
             $this->saveQuietly();
         });
+    }
+
+    /** @param array<string, mixed> $payload */
+    private function assertPreparedActivationPayload(array $payload): void
+    {
+        $expectedIdentity = [
+            'deployment_id' => (int) $this->getKey(),
+            'application_id' => (int) $this->application_id,
+            'server_id' => (int) $this->server_id,
+            'destination_id' => (int) $this->destination_id,
+        ];
+        foreach ($expectedIdentity as $key => $value) {
+            if (($payload[$key] ?? null) !== $value) {
+                throw new \InvalidArgumentException("The prepared activation payload has an invalid {$key}.");
+            }
+        }
+        if (($payload['schema_version'] ?? null) !== 1
+            || ($payload['prepared_commit'] ?? null) !== $this->commit
+            || ! is_string($payload['input_fingerprint'] ?? null)
+            || preg_match('/\A[a-f0-9]{64}\z/D', $payload['input_fingerprint']) !== 1
+            || ! is_array($payload['artifact'] ?? null)) {
+            throw new \InvalidArgumentException('The prepared activation payload is malformed.');
+        }
     }
 }
