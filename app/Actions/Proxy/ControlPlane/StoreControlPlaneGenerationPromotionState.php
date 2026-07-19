@@ -50,7 +50,7 @@ final class StoreControlPlaneGenerationPromotionState
                 return $state;
             }
             if ($current->phase === ControlPlaneGenerationPromotionPhase::RolledBack) {
-                if (! $state->matchesEnrolledPredecessor($enrollment)) {
+                if (! $state->matchesRolledBackPredecessor($current)) {
                     throw new RuntimeException('The control-plane generation promotion predecessor is stale.');
                 }
                 $this->writeTo($lockedServer, $state);

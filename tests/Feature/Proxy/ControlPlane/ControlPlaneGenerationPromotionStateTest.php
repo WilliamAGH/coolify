@@ -300,6 +300,61 @@ it('replaces a completed terminal state only from its exact successor tuple', fu
     expect($replaced->operationId)->toBe('promotion-two')
         ->and($replaced->predecessor['dynamic_revision'])->toBe(2)
         ->and($server->fresh()->proxy->get(StoreControlPlaneProxyEnrollmentState::STATE_KEY))->toBe($enrollment->toArray());
+
+    expect(fn () => ControlPlaneGenerationPromotionState::reserveAfterCompleted(
+        operationId: 'stale-writer-epoch',
+        token: 'stale-writer-token',
+        serverId: (int) $server->getKey(),
+        completedPromotion: $completed,
+        successorDynamicRevision: 3,
+        successorDynamicSha256: hash('sha256', 'stale-writer-document'),
+        successorMember: 'purple',
+        successorReleaseRevision: 'release-3',
+        successorBackends: ['coolify-web-e', 'coolify-web-f'],
+        successorConfigurationAcknowledgement: 'ack:'.str_repeat('c', 64),
+        runtime: $next->runtime,
+        writerMember: 'purple',
+        writerEpoch: $completed->writerEpoch,
+        timestamp: '2026-07-19T13:00:00Z',
+    ))->toThrow(InvalidArgumentException::class, 'strictly advance');
+});
+
+it('replaces a rolled-back terminal state from its restored predecessor with a newer writer epoch', function (): void {
+    $server = Server::factory()->create(['team_id' => Team::factory()->create()->id]);
+    $enrollment = installGenerationPromotionEnrollment($server);
+    $store = new StoreControlPlaneGenerationPromotionState;
+    $rolledBack = generationPromotionState($server, $enrollment)
+        ->withPhase(ControlPlaneGenerationPromotionPhase::RollingBack, '2026-07-19T12:01:00Z', [
+            'rollback_started_at' => '2026-07-19T12:01:00Z',
+        ])
+        ->withPhase(ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement, '2026-07-19T12:02:00Z')
+        ->withPhase(ControlPlaneGenerationPromotionPhase::RolledBack, '2026-07-19T12:03:00Z', [
+            'rollback_acknowledged_at' => '2026-07-19T12:03:00Z',
+            'rolled_back_at' => '2026-07-19T12:03:00Z',
+        ]);
+    $server->proxy->set(StoreControlPlaneGenerationPromotionState::STATE_KEY, $rolledBack->toArray());
+    $server->save();
+
+    $replacement = ControlPlaneGenerationPromotionState::reserveAfterRolledBack(
+        operationId: 'promotion-after-rollback',
+        token: 'promotion-after-rollback-token',
+        serverId: (int) $server->getKey(),
+        rolledBackPromotion: $rolledBack,
+        successorDynamicRevision: 2,
+        successorDynamicSha256: hash('sha256', 'replacement-generation'),
+        successorMember: 'green',
+        successorReleaseRevision: 'release-2-retry',
+        successorBackends: ['coolify-web-c', 'coolify-web-d'],
+        successorConfigurationAcknowledgement: 'ack:'.str_repeat('d', 64),
+        runtime: generationPromotionRuntime(),
+        writerMember: 'green',
+        writerEpoch: 3,
+        timestamp: '2026-07-19T13:00:00Z',
+    );
+
+    expect($store->reserve($server, $replacement, 'promotion-after-rollback-token')->predecessor)
+        ->toBe($rolledBack->predecessor)
+        ->and($replacement->writerEpoch)->toBe(3);
 });
 
 it('binds write and route observations to the exact successor', function () {

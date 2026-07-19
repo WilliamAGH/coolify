@@ -197,6 +197,28 @@ it('rolls back only the replacement owner to its exact predecessor bytes and rej
     }
 });
 
+it('treats an exact predecessor without a rollback artifact as a pre-write rollback replay', function () {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $predecessor = managedTraefikDocumentMutation($root, 'control-plane-predecessor', 1, "http:\n  middlewares: {}\n");
+        $successor = managedTraefikDocumentMutation($root, 'control-plane-successor', 2, "http:\n  middlewares:\n    auth: {}\n", $predecessor);
+
+        expect(runManagedTraefikDocumentCommand($writer->writeCommandFor($predecessor))->isSuccessful())->toBeTrue();
+        $result = runManagedTraefikDocumentCommand($writer->rollbackCommandFor($successor));
+
+        expect($result->isSuccessful())->toBeTrue()
+            ->and(trim($result->getOutput()))->toBe(ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT)
+            ->and(file_get_contents($successor->documentPath()))->toBe($predecessor->replacementBytes)
+            ->and(file_get_contents($successor->sidecarPath()))->toBe($predecessor->replacementSidecar())
+            ->and(file_exists($successor->rollbackArtifactPath()))->toBeFalse();
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
 it('fails closed when a managed document path is a symlink', function () {
     $filesystem = new Filesystem;
     $root = managedTraefikDocumentRoot();

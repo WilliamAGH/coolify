@@ -361,3 +361,33 @@ it('chains a successor from the exact completed-generation tuple', function (): 
         ->and($server->fresh()->proxy->get(StoreControlPlaneGenerationPromotionState::STATE_KEY))
         ->toBe($next->state->toArray());
 });
+
+it('prepares a replacement from the exact restored tuple after rollback', function (): void {
+    $server = prepareGenerationPromotionServer();
+    $enrollment = installPrepareGenerationPromotionEnrollment($server);
+    $first = prepareGenerationPromotion($server, $enrollment);
+    $rolledBack = $first->state
+        ->withPhase(ControlPlaneGenerationPromotionPhase::RollingBack, '2026-07-19T12:01:00Z', [
+            'rollback_started_at' => '2026-07-19T12:01:00Z',
+        ])
+        ->withPhase(ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement, '2026-07-19T12:02:00Z')
+        ->withPhase(ControlPlaneGenerationPromotionPhase::RolledBack, '2026-07-19T12:03:00Z', [
+            'rollback_acknowledged_at' => '2026-07-19T12:03:00Z',
+            'rolled_back_at' => '2026-07-19T12:03:00Z',
+        ]);
+    $server->proxy->set(StoreControlPlaneGenerationPromotionState::STATE_KEY, $rolledBack->toArray());
+    $server->save();
+
+    $replacement = prepareGenerationPromotion(
+        $server,
+        $enrollment,
+        operationId: 'promotion-after-rollback',
+        token: 'promotion-after-rollback-token',
+        predecessorDynamicYaml: $enrollment->dynamicReplacementBytes,
+        writerEpoch: 3,
+    );
+
+    expect($replacement->state->predecessor)->toBe($rolledBack->predecessor)
+        ->and($replacement->state->successor['dynamic_revision'])->toBe(2)
+        ->and($replacement->state->writerEpoch)->toBe(3);
+});

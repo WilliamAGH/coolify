@@ -44,8 +44,10 @@ final class PrepareControlPlaneGenerationPromotion
         $enrollment = $this->enrolledState($server);
         $currentPromotion = $this->promotionStateStore->read($server);
         $isCompletedPredecessor = $currentPromotion?->phase === ControlPlaneGenerationPromotionPhase::Completed;
+        $isRolledBackPredecessor = $currentPromotion?->phase === ControlPlaneGenerationPromotionPhase::RolledBack;
         $isChainedReplay = $currentPromotion !== null
             && ! $isCompletedPredecessor
+            && ! $isRolledBackPredecessor
             && $currentPromotion->isOwnedBy($operationId, $token)
             && ! $currentPromotion->matchesEnrolledPredecessor($enrollment);
 
@@ -53,7 +55,7 @@ final class PrepareControlPlaneGenerationPromotion
             $predecessorDynamicRevision = $currentPromotion->successor['dynamic_revision'];
             $predecessorDynamicSha256 = $currentPromotion->successor['dynamic_sha256'];
             $predecessorBackends = $currentPromotion->successor['backends'];
-        } elseif ($isChainedReplay) {
+        } elseif ($isRolledBackPredecessor || $isChainedReplay) {
             $predecessorDynamicRevision = $currentPromotion->predecessor['dynamic_revision'];
             $predecessorDynamicSha256 = $currentPromotion->predecessor['dynamic_sha256'];
             $predecessorBackends = $currentPromotion->predecessor['backends'];
@@ -66,7 +68,7 @@ final class PrepareControlPlaneGenerationPromotion
         $this->assertExactPredecessorBytes(
             $predecessorDynamicYaml,
             $predecessorDynamicSha256,
-            $isCompletedPredecessor || $isChainedReplay ? null : $enrollment->dynamicReplacementBytes,
+            $isCompletedPredecessor || $isRolledBackPredecessor || $isChainedReplay ? null : $enrollment->dynamicReplacementBytes,
         );
         $successorBackendDnsNames = $this->normalizeSuccessorBackends($successorBackendDnsNames);
         $this->assertExactRuntime(
@@ -152,8 +154,8 @@ final class PrepareControlPlaneGenerationPromotion
             return new PreparedControlPlaneGenerationPromotion($state, $successorConfiguration);
         }
 
-        $desiredState = $isCompletedPredecessor
-            ? ControlPlaneGenerationPromotionState::reserveAfterCompleted(
+        if ($isCompletedPredecessor) {
+            $desiredState = ControlPlaneGenerationPromotionState::reserveAfterCompleted(
                 operationId: $operationId,
                 token: $token,
                 serverId: (int) $server->getKey(),
@@ -168,8 +170,26 @@ final class PrepareControlPlaneGenerationPromotion
                 writerMember: $writerMember,
                 writerEpoch: $writerEpoch,
                 timestamp: now()->toIso8601String(),
-            )
-            : ControlPlaneGenerationPromotionState::reserve(
+            );
+        } elseif ($isRolledBackPredecessor) {
+            $desiredState = ControlPlaneGenerationPromotionState::reserveAfterRolledBack(
+                operationId: $operationId,
+                token: $token,
+                serverId: (int) $server->getKey(),
+                rolledBackPromotion: $currentPromotion,
+                successorDynamicRevision: $successorDynamicRevision,
+                successorDynamicSha256: $successorConfiguration->sha256,
+                successorMember: $successorMember,
+                successorReleaseRevision: $successorReleaseRevision,
+                successorBackends: $successorBackendDnsNames,
+                successorConfigurationAcknowledgement: $configurationAcknowledgement,
+                runtime: $runtime,
+                writerMember: $writerMember,
+                writerEpoch: $writerEpoch,
+                timestamp: now()->toIso8601String(),
+            );
+        } else {
+            $desiredState = ControlPlaneGenerationPromotionState::reserve(
                 operationId: $operationId,
                 token: $token,
                 serverId: (int) $server->getKey(),
@@ -185,6 +205,7 @@ final class PrepareControlPlaneGenerationPromotion
                 writerEpoch: $writerEpoch,
                 timestamp: now()->toIso8601String(),
             );
+        }
         $state = $this->promotionStateStore->reserve($server, $desiredState, $token);
 
         return new PreparedControlPlaneGenerationPromotion($state, $successorConfiguration);

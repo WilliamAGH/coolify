@@ -174,6 +174,9 @@ final readonly class ControlPlaneGenerationPromotionState
         if ($completedPromotion->phase !== ControlPlaneGenerationPromotionPhase::Completed) {
             throw new InvalidArgumentException('A new control-plane generation promotion requires a completed predecessor.');
         }
+        if ($writerEpoch <= $completedPromotion->writerEpoch) {
+            throw new InvalidArgumentException('A new control-plane generation writer epoch must strictly advance its completed predecessor.');
+        }
         if ($token === '') {
             throw new InvalidArgumentException('The control-plane generation promotion token must not be empty.');
         }
@@ -192,6 +195,54 @@ final readonly class ControlPlaneGenerationPromotionState
                 'backends' => $completedPromotion->successor['backends'],
                 'configuration_acknowledgement' => $completedPromotion->successor['configuration_acknowledgement'],
             ],
+            successorDynamicRevision: $successorDynamicRevision,
+            successorDynamicSha256: $successorDynamicSha256,
+            successorMember: $successorMember,
+            successorReleaseRevision: $successorReleaseRevision,
+            successorBackends: $successorBackends,
+            successorConfigurationAcknowledgement: $successorConfigurationAcknowledgement,
+            runtime: $runtime,
+            writerMember: $writerMember,
+            writerEpoch: $writerEpoch,
+            timestamp: $timestamp,
+        );
+    }
+
+    /**
+     * @param  list<string>  $successorBackends
+     */
+    public static function reserveAfterRolledBack(
+        string $operationId,
+        string $token,
+        int $serverId,
+        self $rolledBackPromotion,
+        int $successorDynamicRevision,
+        string $successorDynamicSha256,
+        string $successorMember,
+        string $successorReleaseRevision,
+        array $successorBackends,
+        string $successorConfigurationAcknowledgement,
+        ControlPlaneGenerationRuntime $runtime,
+        string $writerMember,
+        int $writerEpoch,
+        string $timestamp,
+    ): self {
+        if ($rolledBackPromotion->phase !== ControlPlaneGenerationPromotionPhase::RolledBack) {
+            throw new InvalidArgumentException('A replacement control-plane generation promotion requires a rolled-back predecessor.');
+        }
+        if ($writerEpoch <= $rolledBackPromotion->writerEpoch) {
+            throw new InvalidArgumentException('A replacement control-plane generation writer epoch must strictly advance its rolled-back predecessor.');
+        }
+        if ($token === '') {
+            throw new InvalidArgumentException('The control-plane generation promotion token must not be empty.');
+        }
+
+        return self::newReservation(
+            operationId: $operationId,
+            tokenSha256: hash('sha256', $token),
+            serverId: $serverId,
+            managedFilename: $rolledBackPromotion->managedFilename,
+            predecessor: $rolledBackPromotion->predecessor,
             successorDynamicRevision: $successorDynamicRevision,
             successorDynamicSha256: $successorDynamicSha256,
             successorMember: $successorMember,
@@ -292,6 +343,14 @@ final readonly class ControlPlaneGenerationPromotionState
             && hash_equals($this->predecessor['release_revision'], $completedPromotion->successor['release_revision'])
             && $this->predecessor['backends'] === $completedPromotion->successor['backends']
             && hash_equals($this->predecessor['configuration_acknowledgement'], $completedPromotion->successor['configuration_acknowledgement']);
+    }
+
+    public function matchesRolledBackPredecessor(self $rolledBackPromotion): bool
+    {
+        return $rolledBackPromotion->phase === ControlPlaneGenerationPromotionPhase::RolledBack
+            && $this->managedFilename === $rolledBackPromotion->managedFilename
+            && $this->predecessor === $rolledBackPromotion->predecessor
+            && $this->writerEpoch > $rolledBackPromotion->writerEpoch;
     }
 
     public function sameReservationAs(self $other): bool
