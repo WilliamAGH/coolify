@@ -74,9 +74,12 @@ final class CompleteBlueGreenDeploymentOperation
             $isExactCompletedCycle = $state->phase === BlueGreenDeploymentPhase::IDLE
                 && $hasExactPromotedRoute
                 && $deployment->blue_green_phase === BlueGreenDeploymentPhase::IDLE;
-            $isExactDrainingCycle = $state->phase === BlueGreenDeploymentPhase::DRAINING
+            $isExactFinalizationCycle = in_array($state->phase, [
+                BlueGreenDeploymentPhase::DRAINING,
+                BlueGreenDeploymentPhase::IDLE,
+            ], true)
                 && $hasExactPromotedRoute
-                && $deployment->blue_green_phase === BlueGreenDeploymentPhase::DRAINING;
+                && $deployment->blue_green_phase === $state->phase;
             if ($state->operation_deployment_uuid === null) {
                 if (! $isExactCompletedCycle
                     || $state->legacy_container_name !== null
@@ -96,7 +99,8 @@ final class CompleteBlueGreenDeploymentOperation
             $expectedPreviousContainerName = $claim->previousActiveColor === null
                 ? $claim->legacyContainerName
                 : $application->uuid.'-'.$claim->previousActiveColor->value;
-            if (! $isExactDrainingCycle
+            $completionPhase = $state->phase;
+            if (! $isExactFinalizationCycle
                 || $state->legacy_container_name !== $claim->legacyContainerName
                 || $state->active_color !== $claim->pendingColor
                 || $state->operation_deployment_uuid !== $claim->deploymentUuid
@@ -121,7 +125,7 @@ final class CompleteBlueGreenDeploymentOperation
 
             $stateUpdated = ApplicationBlueGreenDeployment::query()
                 ->whereKey($state->getKey())
-                ->where('phase', BlueGreenDeploymentPhase::DRAINING->value)
+                ->where('phase', $completionPhase->value)
                 ->where('active_color', $claim->pendingColor->value)
                 ->where('routing_revision', $claim->expectedRoutingRevision)
                 ->where('operation_deployment_uuid', $claim->deploymentUuid)
@@ -134,17 +138,17 @@ final class CompleteBlueGreenDeploymentOperation
                 ->whereNull('deactivation_started_at')
                 ->where('supersession_generation', $claim->supersessionGeneration)
                 ->whereHas('application')
-                ->whereHas('operationDeployment', function ($query) use ($claim): void {
+                ->whereHas('operationDeployment', function ($query) use ($claim, $completionPhase): void {
                     $query->where('application_id', $claim->applicationId)
                         ->where('deployment_uuid', $claim->deploymentUuid)
                         ->where('destination_id', $claim->standaloneDockerId)
                         ->where('pull_request_id', 0)
                         ->where('blue_green_supersession_generation', $claim->supersessionGeneration)
-                        ->where('blue_green_phase', BlueGreenDeploymentPhase::DRAINING->value)
+                        ->where('blue_green_phase', $completionPhase->value)
                         ->whereHas('application');
                     BlueGreenLifecycleDatabaseLocks::constrainQueueStatus(
                         $query,
-                        BlueGreenDeploymentPhase::DRAINING,
+                        $completionPhase,
                     );
                 })
                 ->update([
@@ -159,7 +163,7 @@ final class CompleteBlueGreenDeploymentOperation
                 ->where('destination_id', $claim->standaloneDockerId)
                 ->where('pull_request_id', 0)
                 ->where('blue_green_supersession_generation', $claim->supersessionGeneration)
-                ->where('blue_green_phase', BlueGreenDeploymentPhase::DRAINING->value)
+                ->where('blue_green_phase', $completionPhase->value)
                 ->where('blue_green_color', $claim->pendingColor->value)
                 ->where('blue_green_routing_revision', $claim->expectedRoutingRevision)
                 ->where('blue_green_destination_fence_epoch', $claim->destinationFenceEpoch)
@@ -171,7 +175,7 @@ final class CompleteBlueGreenDeploymentOperation
             $deploymentUpdated = BlueGreenLifecycleDatabaseLocks::constrainDeploymentQueueOwner(
                 $deploymentQuery,
                 $claim,
-                BlueGreenDeploymentPhase::DRAINING,
+                $completionPhase,
                 BlueGreenDeploymentPhase::IDLE,
                 false,
             )->update([
@@ -239,7 +243,7 @@ final class CompleteBlueGreenDeploymentOperation
             return true;
         }
 
-        return $operation->recoveredPhase === BlueGreenDeploymentPhase::DRAINING
+        return $operation->recoveredPhase === BlueGreenDeploymentPhase::IDLE
             && $operation->routingMutationRecorded
             && $operation->destination->id === $state->standalone_docker_id
             && $operation->server->id === (int) $deployment->server_id

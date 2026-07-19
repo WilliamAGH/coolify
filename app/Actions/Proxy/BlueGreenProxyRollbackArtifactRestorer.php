@@ -35,4 +35,25 @@ class BlueGreenProxyRollbackArtifactRestorer
             $expectedBootId,
         );
     }
+
+    public function restoreFromCurrentState(
+        Server $server,
+        BlueGreenProxyRollbackKey $rollbackKey,
+        BlueGreenProxyState $currentState,
+        BlueGreenProxyState $restoredState,
+        string $expectedBootId,
+    ): void {
+        if ($server->proxyType() !== ProxyTypes::TRAEFIK->value) {
+            throw new InvalidArgumentException('Blue/green proxy rollback requires a Traefik server.');
+        }
+        instant_remote_process([
+            (new WriteBlueGreenProxyConfiguration)->rollbackArtifactRestoreFromStateCommandFor(
+                $server->proxyPath(),
+                $rollbackKey,
+                $currentState,
+                $restoredState,
+                $expectedBootId,
+            ),
+        ], $server);
+    }
 }

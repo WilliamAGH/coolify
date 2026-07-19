@@ -6,13 +6,14 @@ use RuntimeException;
 
 final class ControlPlaneMigrationInventory
 {
-    private const FILENAME_PATTERN = '/\A(?:2026_07_12_[0-9]{6}_[a-z0-9_]+|2026_07_19_(?:025448_add_destination_fencing_to_blue_green_operations|025449_add_blue_green_supersession_generation|030000_add_blue_green_drain_provenance))\.php\z/';
+    private const FILENAME_PATTERN = '/\A(?:2026_07_12_[0-9]{6}_[a-z0-9_]+|2026_07_19_(?:025448_add_destination_fencing_to_blue_green_operations|025449_add_blue_green_supersession_generation|030000_add_blue_green_drain_provenance|064536_add_blue_green_recovery_predecessor_state))\.php\z/';
 
     private const GLOBS = [
         '2026_07_12_*.php',
         '2026_07_19_025448_add_destination_fencing_to_blue_green_operations.php',
         '2026_07_19_025449_add_blue_green_supersession_generation.php',
         '2026_07_19_030000_add_blue_green_drain_provenance.php',
+        '2026_07_19_064536_add_blue_green_recovery_predecessor_state.php',
     ];
 
     private const FINGERPRINT_PATH = 'database/migrations/control-plane-migration-inventory.fingerprint';

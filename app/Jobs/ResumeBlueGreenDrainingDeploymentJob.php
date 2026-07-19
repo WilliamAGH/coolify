@@ -97,11 +97,10 @@ final class ResumeBlueGreenDrainingDeploymentJob implements ShouldQueue
             return;
         }
 
-        try {
-            (new ApplicationDeploymentJob($deployment->id))->failBlueGreenDrainRecovery($exception);
-        } catch (Throwable $failure) {
-            report($failure);
-        }
+        $deployment->addLogEntry(
+            'Blue-green drain recovery worker failed before exact lifecycle intervention ownership was proven; durable state was left for the scheduled reconciler: '.$exception->getMessage(),
+            'stderr',
+        );
     }
 
     public function scheduleNextAttempt(ApplicationDeploymentQueue $deployment): bool
@@ -136,15 +135,23 @@ final class ResumeBlueGreenDrainingDeploymentJob implements ShouldQueue
         ?BlueGreenDeploymentLifecycle $lifecycle,
         Throwable $exception,
     ): void {
-        if ($lifecycle?->isDrainingRecovery()) {
-            try {
-                $lifecycle->requireDrainingRecoveryIntervention();
-            } catch (Throwable $interventionFailure) {
-                $deployment->addLogEntry(
-                    'Blue-green drain recovery could not atomically mark durable intervention: '.$interventionFailure->getMessage(),
-                    'stderr',
-                );
-            }
+        if (! $lifecycle?->isDrainingRecovery()) {
+            $deployment->addLogEntry(
+                'Blue-green drain recovery could not prove exact lifecycle ownership; durable state and queue status were left unchanged for reconciliation.',
+                'stderr',
+            );
+
+            return;
+        }
+        try {
+            $lifecycle->requireDrainingRecoveryIntervention();
+        } catch (Throwable $interventionFailure) {
+            $deployment->addLogEntry(
+                'Blue-green drain recovery could not atomically mark durable intervention: '.$interventionFailure->getMessage(),
+                'stderr',
+            );
+
+            return;
         }
 
         $deployment->addLogEntry(

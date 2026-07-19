@@ -97,13 +97,18 @@ final class TransitionsBlueGreenDeployment
                 throw new BlueGreenDeploymentTransitionException('The previous active routing revision does not match the failed claim.');
             }
             $previousDestinationEpoch = $state->operation_previous_destination_fence_epoch;
-            if (! is_int($previousDestinationEpoch)
-                || $state->destination_fence_operation_id !== $claim->deploymentUuid
-                || $state->destination_fence_mutation_sequence < 1
-                || $state->destination_fence_epoch < $previousDestinationEpoch
-                || ($state->operation_routing_mutated_at !== null && $state->destination_fence_epoch <= $claim->destinationFenceEpoch)
-                || $state->managed_file_sha256 !== $state->operation_previous_managed_file_sha256
-                || $state->destination_topology_digest !== $claim->topologyDigest) {
+            $restoredAfterMutation = is_int($previousDestinationEpoch)
+                && $state->destination_fence_operation_id === $claim->deploymentUuid
+                && $state->destination_fence_mutation_sequence >= 1
+                && $state->destination_fence_epoch > $claim->destinationFenceEpoch
+                && $state->managed_file_sha256 === $state->operation_previous_managed_file_sha256
+                && $state->destination_topology_digest === $claim->topologyDigest;
+            $unchangedBeforeMutation = is_int($previousDestinationEpoch)
+                && $state->operation_routing_mutated_at === null
+                && $deployment->blue_green_routing_mutated_at === null
+                && $state->destination_fence_epoch === $previousDestinationEpoch
+                && $state->managed_file_sha256 === $state->operation_previous_managed_file_sha256;
+            if (! $restoredAfterMutation && ! $unchangedBeforeMutation) {
                 throw new BlueGreenDeploymentTransitionException('The rollback did not restore the exact previous destination state at a newer fence epoch.');
             }
 

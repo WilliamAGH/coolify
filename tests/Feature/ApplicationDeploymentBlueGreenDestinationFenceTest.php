@@ -358,7 +358,7 @@ it('completes an exact durable IDLE state when recovery restarts after lifecycle
     Event::assertDispatchedTimes(ApplicationConfigurationChanged::class, 1);
 });
 
-it('routes an unexpected drain recovery state through canonical failure exactly once', function () {
+it('leaves an unowned drain recovery failure nonterminal for the scheduled reconciler', function () {
     $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
     $fixture['team']->emailNotificationSettings()->update([
         'use_instance_email_settings' => true,
@@ -376,9 +376,9 @@ it('routes an unexpected drain recovery state through canonical failure exactly 
     $resume->handle();
     $resume->handle();
 
-    expect($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value)
-        ->and($fixture['deployment']->fresh()->finished_at)->not->toBeNull()
-        ->and(Notification::sent($fixture['team'], DeploymentFailed::class))->toHaveCount(1);
+    expect($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+        ->and($fixture['deployment']->fresh()->finished_at)->toBeNull()
+        ->and(Notification::sent($fixture['team'], DeploymentFailed::class))->toHaveCount(0);
 });
 
 it('rejects a command health-check contract before public failover compilation', function () {

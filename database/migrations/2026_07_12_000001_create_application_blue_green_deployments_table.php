@@ -110,6 +110,12 @@ return new class extends Migration
                 'operation_drain_last_observed_connections',
                 'operation_drain_observed_at',
             ],
+            [
+                'operation_previous_proxy_state',
+                'operation_previous_proxy_state_sha256',
+                'operation_rollback_proxy_state',
+                'operation_rollback_proxy_state_sha256',
+            ],
         ];
         $laterOwnedColumns = array_merge(...$laterOwnedColumnGroups);
         $columnNames = $columns->keys()->values()->all();
@@ -297,7 +303,11 @@ return new class extends Migration
                           'operation_drain_started_at',
                           'operation_drain_deadline_at',
                           'operation_drain_last_observed_connections',
-                          'operation_drain_observed_at'
+                          'operation_drain_observed_at',
+                          'operation_previous_proxy_state',
+                          'operation_previous_proxy_state_sha256',
+                          'operation_rollback_proxy_state',
+                          'operation_rollback_proxy_state_sha256'
                       )
                 )
                 and (select count(*) from actual_all
@@ -325,6 +335,13 @@ return new class extends Migration
                         'operation_drain_deadline_at',
                         'operation_drain_last_observed_connections',
                         'operation_drain_observed_at'
+                    )) in (0, 4)
+                and (select count(*) from actual_all
+                    where name in (
+                        'operation_previous_proxy_state',
+                        'operation_previous_proxy_state_sha256',
+                        'operation_rollback_proxy_state',
+                        'operation_rollback_proxy_state_sha256'
                     )) in (0, 4)
                 and (select count(*) = 4
                     and count(*) filter (where conname = 'application_blue_green_deployments_pkey'

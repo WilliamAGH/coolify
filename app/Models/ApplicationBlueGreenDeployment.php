@@ -57,6 +57,10 @@ class ApplicationBlueGreenDeployment extends Model
         'operation_topology_digest',
         'operation_routing_config_digest',
         'operation_previous_managed_file_sha256',
+        'operation_previous_proxy_state',
+        'operation_previous_proxy_state_sha256',
+        'operation_rollback_proxy_state',
+        'operation_rollback_proxy_state_sha256',
         'supersession_generation',
         'phase',
         'routing_revision',
@@ -143,6 +147,10 @@ class ApplicationBlueGreenDeployment extends Model
             'operation_topology_digest' => null,
             'operation_routing_config_digest' => null,
             'operation_previous_managed_file_sha256' => null,
+            'operation_previous_proxy_state' => null,
+            'operation_previous_proxy_state_sha256' => null,
+            'operation_rollback_proxy_state' => null,
+            'operation_rollback_proxy_state_sha256' => null,
         ];
     }
 }

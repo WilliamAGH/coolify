@@ -5217,6 +5217,12 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         if ($this->application_deployment_queue->status !== ApplicationDeploymentStatus::IN_PROGRESS->value) {
             throw new DeploymentException('Blue-green drain recovery lost canonical queue ownership before publishing failure.');
         }
+        $supersessionGeneration = $this->application_deployment_queue->blue_green_supersession_generation;
+        if ($this->application_deployment_queue->blue_green_phase !== BlueGreenDeploymentPhase::INTERVENTION_REQUIRED
+            || ! is_int($supersessionGeneration)
+            || $supersessionGeneration < 1) {
+            throw new DeploymentException('Blue-green drain recovery cannot publish failure without exact intervention ownership.');
+        }
 
         $this->application_deployment_queue->addLogEntry(
             'Blue-green drain recovery requires intervention and is publishing the canonical deployment failure: '
@@ -5225,7 +5231,24 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         );
         $failed = ApplicationDeploymentQueue::query()
             ->whereKey($this->application_deployment_queue->getKey())
+            ->where('application_id', $this->application_deployment_queue->application_id)
+            ->where('destination_id', $this->application_deployment_queue->destination_id)
+            ->where('deployment_uuid', $this->application_deployment_queue->deployment_uuid)
+            ->where('pull_request_id', 0)
             ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
+            ->where('blue_green_phase', BlueGreenDeploymentPhase::INTERVENTION_REQUIRED->value)
+            ->where('blue_green_supersession_generation', $supersessionGeneration)
+            ->whereExists(function ($stateQuery) use ($supersessionGeneration): void {
+                $stateQuery->selectRaw('1')
+                    ->from('application_blue_green_deployments as drain_failure_state')
+                    ->whereColumn('drain_failure_state.application_id', 'application_deployment_queues.application_id')
+                    ->whereColumn('drain_failure_state.standalone_docker_id', 'application_deployment_queues.destination_id')
+                    ->whereColumn('drain_failure_state.operation_deployment_uuid', 'application_deployment_queues.deployment_uuid')
+                    ->where('drain_failure_state.phase', BlueGreenDeploymentPhase::INTERVENTION_REQUIRED->value)
+                    ->where('drain_failure_state.supersession_generation', $supersessionGeneration)
+                    ->whereNull('drain_failure_state.deactivation_operation_id')
+                    ->whereNull('drain_failure_state.deactivation_started_at');
+            })
             ->update([
                 'status' => ApplicationDeploymentStatus::FAILED->value,
                 'finished_at' => Carbon::now()->toImmutable(),

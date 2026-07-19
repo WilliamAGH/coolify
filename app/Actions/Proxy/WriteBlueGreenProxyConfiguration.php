@@ -181,6 +181,63 @@ class WriteBlueGreenProxyConfiguration
         ]);
     }
 
+    public function rollbackArtifactRestoreFromStateCommandFor(
+        string $proxyPath,
+        BlueGreenProxyRollbackKey $rollbackKey,
+        BlueGreenProxyState $currentState,
+        BlueGreenProxyState $restoredState,
+        string $expectedBootId,
+    ): string {
+        $this->assertBootId($expectedBootId);
+        if (! $currentState->hasSameScope($rollbackKey->replacementState)
+            || ! $restoredState->isMutationSuccessorOf($currentState, $rollbackKey->operationId)
+            || $restoredState->destinationFenceEpoch !== $currentState->destinationFenceEpoch + 1
+            || $restoredState->managedSha256 !== $rollbackKey->expectedState?->managedSha256) {
+            throw new InvalidArgumentException('Recovery rollback states do not form one exact monotonic destination mutation.');
+        }
+
+        $managedFilename = $rollbackKey->managedFilename();
+        $activePath = $this->managedPath($proxyPath, $managedFilename);
+        $statePath = $this->statePath($proxyPath, $managedFilename);
+        $artifactPath = $this->rollbackArtifactPath($proxyPath, $rollbackKey);
+        $journalPath = $this->mutationJournalPath($proxyPath, $managedFilename);
+
+        return implode("\n", [
+            ...$this->lockedCommandPrefix($proxyPath, $managedFilename),
+            $this->bootIdentityAssertionCommand(escapeshellarg($expectedBootId)),
+            ...$this->idempotentStateReplayCommands(
+                state: $restoredState,
+                activePath: $activePath,
+                statePath: $statePath,
+                replayCommands: [
+                    ...$this->validateRollbackArtifactCommands($artifactPath, $rollbackKey),
+                    ...$this->discardDecodedRollbackCommands(),
+                    'exit 0',
+                ],
+            ),
+            ...$this->assertStateCommands($currentState, $activePath, $statePath),
+            ...$this->validateRollbackArtifactCommands($artifactPath, $rollbackKey),
+            ...$this->createMutationJournalIfMissingCommands(
+                journalPath: $journalPath,
+                operationId: $rollbackKey->operationId,
+                expectedBootId: $expectedBootId,
+                expectedState: $currentState,
+                replacementState: $restoredState,
+                replacementPayloadCommand: 'base64 < "$rollback_decoded" | tr -d \'\\n\'',
+            ),
+            ...$this->discardDecodedRollbackCommands(),
+            ...$this->validateMutationJournalCommands(
+                journalPath: $journalPath,
+                managedFilename: $managedFilename,
+            ),
+            ...$this->applyDecodedJournalManagedReplacementCommands($activePath),
+            ...$this->afterManagedMutationCommands(),
+            ...$this->atomicStateReplaceCommands($statePath, $restoredState),
+            ...$this->assertStateCommands($restoredState, $activePath, $statePath),
+            ...$this->cleanupMutationJournalCommands($journalPath),
+        ]);
+    }
+
     public function rollbackArtifactCommitCommandFor(string $proxyPath, BlueGreenProxyRollbackKey $rollbackKey): string
     {
         $artifactPath = $this->rollbackArtifactPath($proxyPath, $rollbackKey);

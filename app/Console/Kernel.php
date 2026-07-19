@@ -60,6 +60,12 @@ class Kernel extends ConsoleKernel
             ->onOneServer()
             ->withoutOverlapping(16)
             ->runInBackground();
+        $this->scheduleInstance->command('blue-green:reconcile --stale-after=300 --limit=1')
+            ->name('blue-green:reconcile')
+            ->everyMinute()
+            ->onOneServer()
+            ->withoutOverlapping(16)
+            ->runInBackground();
 
         if (isDev()) {
             // Instance Jobs

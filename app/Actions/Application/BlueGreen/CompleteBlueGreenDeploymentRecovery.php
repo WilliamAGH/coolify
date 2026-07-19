@@ -1,0 +1,84 @@
+<?php
+
+namespace App\Actions\Application\BlueGreen;
+
+use App\Enums\BlueGreenDeploymentPhase;
+use App\Models\ApplicationBlueGreenDeployment;
+use App\Models\ApplicationDeploymentQueue;
+use Lorisleiva\Actions\Concerns\AsAction;
+
+final class CompleteBlueGreenDeploymentRecovery
+{
+    use AsAction;
+
+    public function handle(BlueGreenDeploymentRecoveryOperation $operation): ApplicationBlueGreenDeployment
+    {
+        if ($operation->wasFinalized || $operation->recoveredPhase === BlueGreenDeploymentPhase::DRAINING) {
+            throw new BlueGreenDeploymentTransitionException('A finalized or draining operation cannot complete rollback recovery.');
+        }
+
+        $claim = $operation->claim;
+        $state = ApplicationBlueGreenDeployment::query()->find($claim->stateId);
+        $deployment = ApplicationDeploymentQueue::query()
+            ->where('application_id', $claim->applicationId)
+            ->where('deployment_uuid', $claim->deploymentUuid)
+            ->first();
+        if ($state === null || $deployment === null) {
+            throw new BlueGreenDeploymentTransitionException('The recovery owner disappeared before rollback could complete.');
+        }
+        $this->assertExactRollback($state, $deployment, $operation);
+
+        return TransitionsBlueGreenDeployment::finishRollback($claim);
+    }
+
+    private function assertExactRollback(
+        ApplicationBlueGreenDeployment $state,
+        ApplicationDeploymentQueue $deployment,
+        BlueGreenDeploymentRecoveryOperation $operation,
+    ): void {
+        $claim = $operation->claim;
+        $currentDestinationState = $operation->currentDestinationState;
+        $destinationWasRestored = ! $operation->routingMutationRecorded
+            || ($currentDestinationState !== null
+                && $state->destination_fence_operation_id === $claim->deploymentUuid
+                && $state->destination_fence_epoch > $currentDestinationState->destinationFenceEpoch
+                && $state->destination_fence_mutation_sequence > $currentDestinationState->mutationSequence
+                && $state->managed_file_sha256 === $operation->rollbackKey->expectedState?->managedSha256
+                && $state->destination_topology_digest === $claim->topologyDigest);
+        if (! $destinationWasRestored
+            || $state->phase !== BlueGreenDeploymentPhase::ROLLING_BACK
+            || $deployment->blue_green_phase !== BlueGreenDeploymentPhase::ROLLING_BACK
+            || (int) $state->application_id !== $claim->applicationId
+            || (int) $state->standalone_docker_id !== $claim->standaloneDockerId
+            || $state->operation_deployment_uuid !== $claim->deploymentUuid
+            || $state->operation_previous_active_color !== $claim->previousActiveColor
+            || $state->operation_previous_container_id !== $operation->previousContainer?->dockerId
+            || $state->operation_candidate_container_name !== $operation->candidateContainer->name
+            || $state->operation_candidate_container_id !== $operation->candidateContainer->dockerId
+            || $state->operation_rollback_managed_filename !== $operation->rollbackKey->managedFilename()
+            || $state->routing_revision !== $claim->expectedRoutingRevision
+            || $state->supersession_generation !== $claim->supersessionGeneration
+            || $state->operation_destination_fence_epoch !== $claim->destinationFenceEpoch
+            || $state->operation_server_boot_id !== $claim->serverBootId
+            || $state->operation_topology_digest !== $claim->topologyDigest
+            || $state->operation_routing_config_digest !== $claim->routingConfigDigest
+            || $state->deactivation_operation_id !== null
+            || $state->deactivation_started_at !== null
+            || (int) $deployment->application_id !== $claim->applicationId
+            || $deployment->deployment_uuid !== $claim->deploymentUuid
+            || (int) $deployment->destination_id !== $claim->standaloneDockerId
+            || $deployment->pull_request_id !== 0
+            || $deployment->blue_green_color !== $claim->pendingColor
+            || $deployment->blue_green_routing_revision !== $claim->expectedRoutingRevision
+            || $deployment->blue_green_destination_fence_epoch !== $claim->destinationFenceEpoch
+            || $deployment->blue_green_server_boot_id !== $claim->serverBootId
+            || $deployment->blue_green_topology_digest !== $claim->topologyDigest
+            || $deployment->blue_green_routing_config_digest !== $claim->routingConfigDigest
+            || $deployment->blue_green_supersession_generation !== $claim->supersessionGeneration
+            || $deployment->blue_green_previous_container_id !== $operation->previousContainer?->dockerId
+            || $deployment->blue_green_candidate_container_id !== $operation->candidateContainer->dockerId
+            || $deployment->blue_green_rollback_managed_filename !== $operation->rollbackKey->managedFilename()) {
+            throw new BlueGreenDeploymentTransitionException('The recovery owner changed before rollback could complete.');
+        }
+    }
+}

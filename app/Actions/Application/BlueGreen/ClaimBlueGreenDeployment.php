@@ -141,6 +141,7 @@ class ClaimBlueGreenDeployment
                 && $expectedDestinationState->destinationTopologyDigest !== $fingerprint->topologyDigest) {
                 throw new BlueGreenDeploymentTransitionException('The durable destination topology changed before the operation could be claimed.');
             }
+            $previousProxyState = $expectedDestinationState?->serialize();
             $claim = new BlueGreenDeploymentClaim(
                 stateId: $state->id,
                 applicationId: $lockedApplication->id,
@@ -188,6 +189,10 @@ class ClaimBlueGreenDeployment
                     'operation_topology_digest' => $fingerprint->topologyDigest,
                     'operation_routing_config_digest' => $fingerprint->routingConfigDigest,
                     'operation_previous_managed_file_sha256' => $state->managed_file_sha256,
+                    'operation_previous_proxy_state' => $previousProxyState,
+                    'operation_previous_proxy_state_sha256' => $previousProxyState === null
+                        ? null
+                        : hash('sha256', $previousProxyState),
                     'supersession_generation' => $supersessionGeneration,
                     'phase' => BlueGreenDeploymentPhase::PREPARING->value,
                     'routing_revision' => $expectedRoutingRevision,

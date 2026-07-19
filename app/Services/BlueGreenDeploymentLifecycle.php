@@ -24,6 +24,7 @@ use App\Actions\Application\BlueGreen\RecordBlueGreenCandidateIdentity;
 use App\Actions\Application\BlueGreen\RecordBlueGreenDestinationState;
 use App\Actions\Application\BlueGreen\RecordBlueGreenDrainObservation;
 use App\Actions\Application\BlueGreen\RecordBlueGreenLegacyRoutingSnapshot;
+use App\Actions\Application\BlueGreen\RecordBlueGreenRollbackKey;
 use App\Actions\Application\BlueGreen\RecordBlueGreenRoutingMutation;
 use App\Actions\Application\BlueGreen\RemoveBlueGreenInactiveContainer;
 use App\Actions\Application\BlueGreen\RemoveExactBlueGreenCandidate;
@@ -316,6 +317,10 @@ final class BlueGreenDeploymentLifecycle
         $this->assertOperationOwned(BlueGreenDeploymentPhase::DRAINING);
         $inspection = InspectBlueGreenContainer::run($this->server, $expectation);
         if (! $inspection->exists) {
+            if (! $expectation->blueGreenManaged) {
+                $this->normalizeLegacyRetirement($claim, $expectation, false);
+            }
+
             return;
         }
         if ($inspection->dockerId !== $expectation->dockerId) {
@@ -365,6 +370,41 @@ final class BlueGreenDeploymentLifecycle
 
             throw $exception;
         }
+
+        if (! $expectation->blueGreenManaged) {
+            $this->normalizeLegacyRetirement($claim, $expectation, true);
+        }
+    }
+
+    private function normalizeLegacyRetirement(
+        BlueGreenDeploymentClaim $claim,
+        BlueGreenContainerExpectation $expectation,
+        bool $removeContainer,
+    ): void {
+        $this->writeAndVerifyRouting(
+            $this->routingTarget(
+                activeColor: $claim->pendingColor,
+                mode: BlueGreenRoutingMode::Steady,
+                publicProofToken: BlueGreenRoutingTarget::durablePublicProofToken($claim->deploymentUuid),
+            ),
+            recordRoutingMutation: false,
+            expectedPhase: BlueGreenDeploymentPhase::DRAINING,
+        );
+        if (! $removeContainer) {
+            return;
+        }
+
+        $containerId = escapeshellarg($expectation->dockerId);
+        $this->destinationState = $this->executeDestinationMutation(
+            [
+                ...(new InspectBlueGreenContainer)->exactMutationAssertionsFor($expectation),
+                "docker rm -f {$containerId} >/dev/null; ! docker container inspect {$containerId} >/dev/null 2>&1",
+            ],
+            (new InspectBlueGreenContainer)->absentMutationCompletionAssertionsFor($expectation),
+        );
+        $this->deployment->addLogEntry(
+            "Blue-green legacy container {$expectation->name} was removed after the canonical steady route was verified.",
+        );
     }
 
     public function resumeDrainingOperation(): void
@@ -514,6 +554,7 @@ final class BlueGreenDeploymentLifecycle
         $serverBootId = $state->operation_server_boot_id;
         $topologyDigest = $state->operation_topology_digest;
         $routingConfigDigest = $state->operation_routing_config_digest;
+        $supersessionGeneration = $state->supersession_generation;
         $candidateContainerName = $state->operation_candidate_container_name;
         $rollbackManagedFilename = $state->operation_rollback_managed_filename;
         if ($state->pending_color !== null
@@ -525,6 +566,8 @@ final class BlueGreenDeploymentLifecycle
             || ! is_string($serverBootId)
             || ! is_string($topologyDigest)
             || ! is_string($routingConfigDigest)
+            || ! is_int($supersessionGeneration)
+            || $supersessionGeneration < 1
             || ! is_string($candidateContainerName)
             || ! is_string($rollbackManagedFilename)
             || $state->operation_drain_started_at === null
@@ -544,6 +587,7 @@ final class BlueGreenDeploymentLifecycle
             serverBootId: $serverBootId,
             topologyDigest: $topologyDigest,
             routingConfigDigest: $routingConfigDigest,
+            supersessionGeneration: $supersessionGeneration,
             legacyContainerName: $state->legacy_container_name,
             candidateContainerName: $candidateContainerName,
             rollbackManagedFilename: $rollbackManagedFilename,
@@ -1086,6 +1130,7 @@ final class BlueGreenDeploymentLifecycle
 
         $this->rollbackKey ??= $routingMutationKey;
         $this->latestRoutingMutationKey = $routingMutationKey;
+        RecordBlueGreenRollbackKey::run($claim, $this->rollbackKey);
         $this->assertOperationOwned($expectedPhase);
         try {
             $this->assertServerBootIdentity();

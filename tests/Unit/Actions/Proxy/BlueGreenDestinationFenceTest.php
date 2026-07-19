@@ -489,6 +489,65 @@ it('validates prior route identity and advances the destination epoch through ro
     }
 });
 
+it('restores the original predecessor after later mutations owned by the same deployment', function () {
+    $filesystem = new Filesystem;
+    $proxyPath = sys_get_temp_dir().'/coolify-blue-green-fence-multi-step-'.bin2hex(random_bytes(8));
+    $filesystem->mkdir($proxyPath.'/dynamic', 0700);
+
+    try {
+        $writer = destinationFenceWriter();
+        $blue = compileDestinationFencedBlueGreenConfiguration(
+            epoch: 1,
+            activeColor: BlueGreenDeploymentColor::BLUE,
+            deploymentUuid: 'deployment-blue-original',
+            containerId: '0123456789abcdef',
+            operationId: 'deploy-blue-original',
+        );
+        $blueKey = new BlueGreenProxyRollbackKey('deploy-blue-original', null, $blue->state);
+        runDestinationFenceCommand($writer->commandFor($proxyPath, $blue, $blueKey, destinationFenceBootId()));
+        runDestinationFenceCommand($writer->rollbackArtifactCommitCommandFor($proxyPath, $blueKey));
+
+        $firstGreen = compileDestinationFencedBlueGreenConfiguration(
+            epoch: 2,
+            activeColor: BlueGreenDeploymentColor::GREEN,
+            deploymentUuid: 'deployment-green-multi',
+            containerId: 'fedcba9876543210',
+            operationId: 'deploy-green-multi',
+            mutationSequence: 1,
+        );
+        $originalRollbackKey = new BlueGreenProxyRollbackKey('deploy-green-multi', $blue->state, $firstGreen->state);
+        runDestinationFenceCommand($writer->commandFor($proxyPath, $firstGreen, $originalRollbackKey, destinationFenceBootId()));
+
+        $finalGreen = compileDestinationFencedBlueGreenConfiguration(
+            epoch: 3,
+            activeColor: BlueGreenDeploymentColor::GREEN,
+            deploymentUuid: 'deployment-green-multi',
+            containerId: 'fedcba9876543210',
+            operationId: 'deploy-green-multi',
+            mutationSequence: 2,
+        );
+        $finalMutationKey = new BlueGreenProxyRollbackKey('deploy-green-multi', $firstGreen->state, $finalGreen->state);
+        runDestinationFenceCommand($writer->commandFor($proxyPath, $finalGreen, $finalMutationKey, destinationFenceBootId()));
+
+        $restoredState = $blue->state->withDestinationFenceEpoch(4, 'deploy-green-multi', 3);
+        runDestinationFenceCommand($writer->rollbackArtifactRestoreFromStateCommandFor(
+            $proxyPath,
+            $originalRollbackKey,
+            $finalGreen->state,
+            $restoredState,
+            destinationFenceBootId(),
+        ));
+
+        $managedPath = $writer->managedPath($proxyPath, $blue->managedFilename);
+        $statePath = $writer->statePath($proxyPath, $blue->managedFilename);
+        expect(file_get_contents($managedPath))->toBe($blue->yaml)
+            ->and(BlueGreenProxyState::parse(file_get_contents($statePath))->serialize())
+            ->toBe($restoredState->serialize());
+    } finally {
+        $filesystem->remove($proxyPath);
+    }
+});
+
 it('reconciles a completed container removal after a crash without replaying the destructive command', function () {
     $filesystem = new Filesystem;
     $proxyPath = sys_get_temp_dir().'/coolify-blue-green-container-journal-'.bin2hex(random_bytes(8));
