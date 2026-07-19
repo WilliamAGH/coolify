@@ -88,6 +88,19 @@ function replaceV4FixtureModelId(string $serialized, string $class, int $fixture
     return $replaced;
 }
 
+function replaceV4FixtureConnection(string $serialized, string $fixtureConnection, string $connection): string
+{
+    $fixtureConnectionIdentifier = 's:10:"connection";s:'.strlen($fixtureConnection).':"'.$fixtureConnection.'";';
+    $currentConnectionIdentifier = 's:10:"connection";s:'.strlen($connection).':"'.$connection.'";';
+    $replaced = str_replace($fixtureConnectionIdentifier, $currentConnectionIdentifier, $serialized, $count);
+
+    if ($count === 0) {
+        throw new LogicException("The v4.x fixture does not contain the {$fixtureConnection} database connection.");
+    }
+
+    return $replaced;
+}
+
 function legacyV4ApplicationDeploymentJob(ApplicationDeploymentQueue $deployment): ApplicationDeploymentJob
 {
     $serialized = base64_decode(UPSTREAM_V4_APPLICATION_DEPLOYMENT_JOB, strict: true);
@@ -117,6 +130,11 @@ function legacyV4ApplicationDeploymentJob(ApplicationDeploymentQueue $deployment
         StandaloneDocker::class,
         2,
         (int) $deployment->destination_id,
+    );
+    $serialized = replaceV4FixtureConnection(
+        $serialized,
+        'testing',
+        $deployment->getConnectionName(),
     );
 
     $command = unserialize($serialized, ['allowed_classes' => true]);
