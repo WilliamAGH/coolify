@@ -10,11 +10,15 @@ final readonly class ControlPlaneDynamicConfiguration
 
     public const HTTPS_ROUTER = 'coolify-https';
 
+    public const HTTP_ROUTER = 'coolify-http';
+
     public const APP_PORT_ROUTER = 'coolify-app-port';
 
     public const SERVICE = 'coolify-control-plane';
 
     public const IDENTITY_MIDDLEWARE = 'coolify-control-plane-identity';
+
+    public const HTTPS_REDIRECT_MIDDLEWARE = 'redirect-to-https';
 
     public const COLOR_HEADER = 'X-Coolify-Control-Plane-Color';
 

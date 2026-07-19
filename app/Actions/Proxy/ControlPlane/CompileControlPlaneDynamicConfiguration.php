@@ -24,6 +24,7 @@ final class CompileControlPlaneDynamicConfiguration
         string $expectedRevision,
         string $expectedMember,
         string $configurationAcknowledgement,
+        string $publicScheme = 'https',
         int $backendPort = 8080,
         array $realtimeRouterFragments = [],
         array $terminalRouterFragments = [],
@@ -35,6 +36,9 @@ final class CompileControlPlaneDynamicConfiguration
         $this->assertIdentifier($expectedRevision, 'expected revision');
         $this->assertIdentifier($expectedMember, 'expected member');
         $this->assertAcknowledgement($configurationAcknowledgement);
+        if (! in_array($publicScheme, ['http', 'https'], true)) {
+            throw new InvalidArgumentException('The control-plane public route scheme must be http or https.');
+        }
         $this->assertPort($backendPort);
 
         $activeBackendDnsNames = $this->normalizeBackendDnsNames($activeBackendDnsNames, 'active');
@@ -55,7 +59,11 @@ final class CompileControlPlaneDynamicConfiguration
         if (count(array_unique($fragmentRouterNames, SORT_STRING)) !== count($fragmentRouterNames)) {
             throw new InvalidArgumentException('Realtime and terminal router fragments must not share a router name.');
         }
-        foreach ([ControlPlaneDynamicConfiguration::HTTPS_ROUTER, ControlPlaneDynamicConfiguration::APP_PORT_ROUTER] as $managedRouterName) {
+        foreach ([
+            ControlPlaneDynamicConfiguration::HTTP_ROUTER,
+            ControlPlaneDynamicConfiguration::HTTPS_ROUTER,
+            ControlPlaneDynamicConfiguration::APP_PORT_ROUTER,
+        ] as $managedRouterName) {
             if (in_array($managedRouterName, $fragmentRouterNames, true)) {
                 throw new InvalidArgumentException('A predecessor router fragment cannot replace a managed control-plane router.');
             }
@@ -68,6 +76,7 @@ final class CompileControlPlaneDynamicConfiguration
             expectedRevision: $expectedRevision,
             expectedMember: $expectedMember,
             configurationAcknowledgement: $configurationAcknowledgement,
+            publicScheme: $publicScheme,
             backendPort: $backendPort,
             realtimeRouterFragments: $realtimeRouterFragments,
             terminalRouterFragments: $terminalRouterFragments,
@@ -105,6 +114,7 @@ final class CompileControlPlaneDynamicConfiguration
         string $expectedRevision,
         string $expectedMember,
         string $configurationAcknowledgement,
+        string $publicScheme,
         int $backendPort,
         array $realtimeRouterFragments,
         array $terminalRouterFragments,
@@ -112,13 +122,6 @@ final class CompileControlPlaneDynamicConfiguration
         array $preservedMiddlewares,
     ): array {
         $routers = [
-            ControlPlaneDynamicConfiguration::HTTPS_ROUTER => [
-                'rule' => "Host(`{$host}`)",
-                'entryPoints' => ['https'],
-                'service' => ControlPlaneDynamicConfiguration::SERVICE,
-                'middlewares' => [ControlPlaneDynamicConfiguration::IDENTITY_MIDDLEWARE],
-                'tls' => ['certResolver' => 'letsencrypt'],
-            ],
             ControlPlaneDynamicConfiguration::APP_PORT_ROUTER => [
                 'rule' => 'PathPrefix(`/`)',
                 'entryPoints' => [$appPortEntrypoint],
@@ -128,6 +131,28 @@ final class CompileControlPlaneDynamicConfiguration
             ...$realtimeRouterFragments,
             ...$terminalRouterFragments,
         ];
+        if ($publicScheme === 'https') {
+            $routers[ControlPlaneDynamicConfiguration::HTTP_ROUTER] = [
+                'rule' => "Host(`{$host}`)",
+                'entryPoints' => ['http'],
+                'service' => ControlPlaneDynamicConfiguration::SERVICE,
+                'middlewares' => [ControlPlaneDynamicConfiguration::HTTPS_REDIRECT_MIDDLEWARE],
+            ];
+            $routers[ControlPlaneDynamicConfiguration::HTTPS_ROUTER] = [
+                'rule' => "Host(`{$host}`)",
+                'entryPoints' => ['https'],
+                'service' => ControlPlaneDynamicConfiguration::SERVICE,
+                'middlewares' => [ControlPlaneDynamicConfiguration::IDENTITY_MIDDLEWARE],
+                'tls' => ['certResolver' => 'letsencrypt'],
+            ];
+        } else {
+            $routers[ControlPlaneDynamicConfiguration::HTTP_ROUTER] = [
+                'rule' => "Host(`{$host}`)",
+                'entryPoints' => ['http'],
+                'service' => ControlPlaneDynamicConfiguration::SERVICE,
+                'middlewares' => [ControlPlaneDynamicConfiguration::IDENTITY_MIDDLEWARE],
+            ];
+        }
         ksort($routers, SORT_STRING);
 
         $middlewares = [
@@ -142,6 +167,11 @@ final class CompileControlPlaneDynamicConfiguration
                 ],
             ],
         ];
+        if ($publicScheme === 'https') {
+            $middlewares[ControlPlaneDynamicConfiguration::HTTPS_REDIRECT_MIDDLEWARE] = [
+                'redirectScheme' => ['scheme' => 'https'],
+            ];
+        }
         $services = [
             ...$preservedServices,
             ControlPlaneDynamicConfiguration::SERVICE => [

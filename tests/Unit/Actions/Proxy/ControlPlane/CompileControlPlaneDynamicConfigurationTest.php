@@ -56,6 +56,7 @@ it('compiles one deterministic File-provider snapshot with shared HTTPS and APP_
         ->and($compiled->yaml)->toBe(compileControlPlaneDynamicConfiguration()->yaml)
         ->and(array_keys(data_get($parsed, 'http.routers')))->toBe([
             'coolify-app-port',
+            'coolify-http',
             'coolify-https',
             'coolify-realtime-wss',
             'coolify-terminal-wss',
@@ -125,6 +126,26 @@ it('compiles one deterministic File-provider snapshot with shared HTTPS and APP_
         ->and(data_get($parsed, 'http.middlewares.gzip'))->toBe(['compress' => true]);
 });
 
+it('preserves an HTTP dashboard without inventing TLS or a redirect', function (): void {
+    $compiled = CompileControlPlaneDynamicConfiguration::run(
+        host: 'dashboard.example.test',
+        appPortEntrypoint: 'app-port',
+        activeBackendDnsNames: ['coolify-web-a'],
+        expectedRevision: 'generation-42',
+        expectedMember: 'blue',
+        configurationAcknowledgement: 'ack:'.str_repeat('a', 64),
+        publicScheme: 'http',
+    );
+    $parsed = Yaml::parse($compiled->yaml);
+
+    expect(data_get($parsed, 'http.routers.coolify-http'))->toMatchArray([
+        'entryPoints' => ['http'],
+        'service' => ControlPlaneDynamicConfiguration::SERVICE,
+        'middlewares' => [ControlPlaneDynamicConfiguration::IDENTITY_MIDDLEWARE],
+    ])->and(data_get($parsed, 'http.routers.coolify-https'))->toBeNull()
+        ->and(data_get($parsed, 'http.middlewares.redirect-to-https'))->toBeNull();
+});
+
 it('rejects unsafe ingress, backend, acknowledgement, port, and predecessor router inputs', function (): void {
     expect(fn (): ControlPlaneDynamicConfiguration => CompileControlPlaneDynamicConfiguration::run(
         host: 'dashboard`.example.test',
@@ -162,6 +183,16 @@ it('rejects unsafe ingress, backend, acknowledgement, port, and predecessor rout
         expectedMember: 'blue',
         configurationAcknowledgement: 'short',
     ))->toThrow(InvalidArgumentException::class, 'acknowledgement');
+
+    expect(fn (): ControlPlaneDynamicConfiguration => CompileControlPlaneDynamicConfiguration::run(
+        host: 'dashboard.example.test',
+        appPortEntrypoint: 'app-port',
+        activeBackendDnsNames: ['coolify-web-a'],
+        expectedRevision: 'generation-42',
+        expectedMember: 'blue',
+        configurationAcknowledgement: 'ack:'.str_repeat('a', 64),
+        publicScheme: 'ftp',
+    ))->toThrow(InvalidArgumentException::class, 'scheme');
 
     expect(fn (): ControlPlaneDynamicConfiguration => CompileControlPlaneDynamicConfiguration::run(
         host: 'dashboard.example.test',

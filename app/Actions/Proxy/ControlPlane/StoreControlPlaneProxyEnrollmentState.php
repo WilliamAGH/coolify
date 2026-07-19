@@ -26,6 +26,11 @@ final class StoreControlPlaneProxyEnrollmentState
                 if ($current->toArray() === $state->toArray() && $current->isOwnedBy($state->operationId, $token)) {
                     return $current;
                 }
+                if ($current->phase === ControlPlaneProxyEnrollmentPhase::RolledBack) {
+                    $this->writeTo($lockedServer, $state);
+
+                    return $state;
+                }
 
                 throw new RuntimeException('Another durable control-plane enrollment state already owns this server.');
             }

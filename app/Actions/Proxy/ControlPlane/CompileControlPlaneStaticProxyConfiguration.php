@@ -2,6 +2,7 @@
 
 namespace App\Actions\Proxy\ControlPlane;
 
+use App\Actions\Proxy\GetProxyConfiguration;
 use App\Enums\ProxyTypes;
 use App\Models\Server;
 use InvalidArgumentException;
@@ -26,10 +27,7 @@ class CompileControlPlaneStaticProxyConfiguration
             throw new InvalidArgumentException('Control-plane proxy enrollment requires the existing Traefik proxy.');
         }
 
-        $proxyComposeYaml = generateDefaultProxyConfiguration($server, save: false);
-        if ($proxyComposeYaml === null) {
-            throw new InvalidArgumentException('The canonical Traefik proxy configuration could not be generated.');
-        }
+        $proxyComposeYaml = GetProxyConfiguration::run($server);
 
         return $this->compile($proxyComposeYaml, $sourceComposeYaml, $appPort, $exposure);
     }
@@ -50,7 +48,7 @@ class CompileControlPlaneStaticProxyConfiguration
         }
 
         $sourcePorts = data_get($source, 'services.coolify.ports');
-        if (! is_array($sourcePorts) || count($sourcePorts) !== 1 || ! $this->publishesContainerPort($sourcePorts[0], 8080)) {
+        if ($sourcePorts !== ['${APP_PORT:-8000}:8080']) {
             throw new InvalidArgumentException('Enrollment requires exactly one canonical Coolify APP_PORT publication.');
         }
 

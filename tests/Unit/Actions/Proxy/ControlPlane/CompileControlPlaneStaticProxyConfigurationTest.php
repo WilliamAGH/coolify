@@ -97,7 +97,8 @@ it('fails closed for ambiguous or already-owned listener state', function (array
         8000,
     ))->toThrow(InvalidArgumentException::class, $message);
 })->with([
-    'duplicate proxy owner' => [['80:80', '8000:8000'], ['8000:8080'], 'already owned'],
+    'duplicate proxy owner' => [['80:80', '8000:8000'], ['${APP_PORT:-8000}:8080'], 'already owned'],
     'multiple source owners' => [['80:80'], ['8000:8080', '9000:8080'], 'exactly one'],
     'wrong source target' => [['80:80'], ['8000:8081'], 'exactly one'],
+    'custom source host mapping' => [['80:80'], ['127.0.0.1:${APP_PORT:-8000}:8080'], 'exactly one'],
 ]);

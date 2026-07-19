@@ -160,3 +160,34 @@ it('rejects foreign owners, stale phases, invalid transitions, and corrupted art
     expect(fn () => ControlPlaneProxyEnrollmentState::fromArray($corrupt))
         ->toThrow(InvalidArgumentException::class, 'checksum');
 });
+
+it('allows a new owner only after the previous enrollment has durably rolled back', function () {
+    $team = Team::factory()->create();
+    $server = Server::factory()->create(['team_id' => $team->id]);
+    $repository = new StoreControlPlaneProxyEnrollmentState;
+    $first = controlPlaneEnrollmentState($server, 'first-op', 'first-token');
+    $repository->reserve($server, $first, 'first-token');
+    $repository->transition(
+        $server,
+        'first-op',
+        'first-token',
+        ControlPlaneProxyEnrollmentPhase::Preparing,
+        ControlPlaneProxyEnrollmentPhase::RollingBack,
+        '2026-07-18T12:01:00Z',
+    );
+    $repository->transition(
+        $server,
+        'first-op',
+        'first-token',
+        ControlPlaneProxyEnrollmentPhase::RollingBack,
+        ControlPlaneProxyEnrollmentPhase::RolledBack,
+        '2026-07-18T12:02:00Z',
+    );
+
+    $second = controlPlaneEnrollmentState($server, 'second-op', 'second-token');
+    $reserved = $repository->reserve($server, $second, 'second-token');
+
+    expect($reserved->operationId)->toBe('second-op')
+        ->and($reserved->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Preparing)
+        ->and($repository->read($server)?->operationId)->toBe('second-op');
+});
