@@ -35,6 +35,34 @@ function applicationValidationWorkflowViolations(array $workflow): array
         $violations[] = 'application validation must aggregate every validation job';
     }
 
+    $blueGreen = is_array($jobs) ? ($jobs['blue-green-lifecycle'] ?? []) : [];
+    $postgres = $blueGreen['services']['postgres'] ?? [];
+    if (($postgres['image'] ?? null) !== 'postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777'
+        || ($blueGreen['env']['DB_CONNECTION'] ?? null) !== 'pgsql'
+        || ($blueGreen['env']['DB_HOST'] ?? null) !== '127.0.0.1') {
+        $violations[] = 'blue-green lifecycle validation must use its pinned PostgreSQL service';
+    }
+    $blueGreenScript = collect($blueGreen['steps'] ?? [])->firstWhere('name', 'Run blue-green lifecycle tests')['run'] ?? '';
+    if (! str_contains(
+        (string) $blueGreenScript,
+        'php -d memory_limit=1G vendor/bin/pest --compact --do-not-cache-result',
+    )) {
+        $violations[] = 'blue-green lifecycle validation must run Pest with its bounded explicit memory contract';
+    }
+    foreach ([
+        'tests/Feature/ApplicationDeploymentBlueGreenDestinationFenceTest.php',
+        'tests/Feature/BlueGreenApplicationDeactivationTest.php',
+        'tests/Feature/BlueGreenCancellationCompensationTest.php',
+        'tests/Feature/BlueGreenMigrationReplayTest.php',
+        'tests/Feature/BlueGreenSupersessionGenerationTest.php',
+    ] as $requiredTest) {
+        if (! str_contains((string) $blueGreenScript, $requiredTest)) {
+            $violations[] = 'blue-green lifecycle validation must execute every ownership and migration gate';
+
+            break;
+        }
+    }
+
     foreach (is_array($jobs) ? $jobs : [] as $job) {
         foreach ($job['steps'] ?? [] as $step) {
             $uses = (string) ($step['uses'] ?? '');
@@ -59,4 +87,18 @@ it('rejects renaming the protected branch validation context', function () {
 
     expect(applicationValidationWorkflowViolations($workflow))
         ->toContain('application validation must preserve the protected branch status context');
+});
+
+it('rejects omitting a blue-green ownership gate from PostgreSQL validation', function () {
+    $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
+    $step = collect($workflow['jobs']['blue-green-lifecycle']['steps'])
+        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Run blue-green lifecycle tests');
+    $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'] = str_replace(
+        'tests/Feature/BlueGreenCancellationCompensationTest.php',
+        'tests/Feature/BlueGreenApplicationDeactivationTest.php',
+        $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'],
+    );
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('blue-green lifecycle validation must execute every ownership and migration gate');
 });

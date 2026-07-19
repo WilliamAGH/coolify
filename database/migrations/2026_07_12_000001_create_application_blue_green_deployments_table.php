@@ -327,7 +327,8 @@ return new class extends Migration
                         and confupdtype = 'a' and confdeltype = 'c' and confmatchtype = 's'
                         and not condeferrable and not condeferred and convalidated) = 1
                     from pg_constraint
-                    where conrelid = 'application_blue_green_deployments'::regclass)
+                    where conrelid = 'application_blue_green_deployments'::regclass
+                      and conname <> 'app_blue_green_deployments_generation_owner_check')
                 and (select count(*) = 3
                     and bool_and(indisvalid and indisready and indislive
                         and indexprs is null and indpred is null

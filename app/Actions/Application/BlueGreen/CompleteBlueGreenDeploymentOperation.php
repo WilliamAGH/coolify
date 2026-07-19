@@ -115,7 +115,7 @@ final class CompleteBlueGreenDeploymentOperation
                 throw new BlueGreenDeploymentTransitionException('The finalized operation changed before durable cleanup completed.');
             }
 
-            $stateUpdated = ApplicationBlueGreenDeployment::query()
+            $stateQuery = ApplicationBlueGreenDeployment::query()
                 ->whereKey($state->getKey())
                 ->where('phase', BlueGreenDeploymentPhase::IDLE->value)
                 ->where('active_color', $claim->pendingColor->value)
@@ -129,24 +129,26 @@ final class CompleteBlueGreenDeploymentOperation
                 ->whereNull('deactivation_operation_id')
                 ->whereNull('deactivation_started_at')
                 ->where('supersession_generation', $claim->supersessionGeneration)
-                ->whereHas('application')
                 ->whereHas('operationDeployment', function ($query) use ($claim): void {
                     $query->where('application_id', $claim->applicationId)
                         ->where('deployment_uuid', $claim->deploymentUuid)
                         ->where('destination_id', $claim->standaloneDockerId)
                         ->where('pull_request_id', 0)
                         ->where('blue_green_supersession_generation', $claim->supersessionGeneration)
-                        ->where('blue_green_phase', BlueGreenDeploymentPhase::IDLE->value)
-                        ->whereHas('application');
+                        ->where('blue_green_phase', BlueGreenDeploymentPhase::IDLE->value);
+                    BlueGreenLifecycleDatabaseLocks::constrainLiveApplication($query, $claim->applicationId);
                     BlueGreenLifecycleDatabaseLocks::constrainQueueStatus(
                         $query,
                         BlueGreenDeploymentPhase::IDLE,
                     );
-                })
-                ->update([
-                    'legacy_container_name' => null,
-                    ...ApplicationBlueGreenDeployment::clearedOperationAttributes(),
-                ]);
+                });
+            $stateUpdated = BlueGreenLifecycleDatabaseLocks::constrainLiveApplication(
+                $stateQuery,
+                $claim->applicationId,
+            )->update([
+                'legacy_container_name' => null,
+                ...ApplicationBlueGreenDeployment::clearedOperationAttributes(),
+            ]);
             $deploymentQuery = ApplicationDeploymentQueue::query()
                 ->whereKey($deployment->getKey())
                 ->where('application_id', $claim->applicationId)
@@ -161,8 +163,7 @@ final class CompleteBlueGreenDeploymentOperation
                 ->where('blue_green_server_boot_id', $claim->serverBootId)
                 ->where('blue_green_topology_digest', $claim->topologyDigest)
                 ->where('blue_green_routing_config_digest', $claim->routingConfigDigest)
-                ->where('blue_green_candidate_container_id', $state->operation_candidate_container_id)
-                ->whereHas('application');
+                ->where('blue_green_candidate_container_id', $state->operation_candidate_container_id);
             $deploymentUpdated = BlueGreenLifecycleDatabaseLocks::constrainDeploymentQueueOwner(
                 $deploymentQuery,
                 $claim,

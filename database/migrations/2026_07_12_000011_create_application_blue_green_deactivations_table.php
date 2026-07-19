@@ -220,7 +220,8 @@ return new class extends Migration
                         and confupdtype = 'a' and confdeltype = 'c' and confmatchtype = 's'
                         and not condeferrable and not condeferred and convalidated) = 1
                     from pg_constraint
-                    where conrelid = 'application_blue_green_deactivations'::regclass)
+                    where conrelid = 'application_blue_green_deactivations'::regclass
+                      and conname <> 'app_blue_green_deactivations_generation_check')
                 and (select count(*) = 4
                     and bool_and(indisvalid and indisready and indislive
                         and indexprs is null and indpred is null

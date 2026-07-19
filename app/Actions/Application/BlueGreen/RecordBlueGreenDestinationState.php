@@ -79,17 +79,17 @@ final class RecordBlueGreenDestinationState
                 ->whereNull('deactivation_operation_id')
                 ->whereNull('deactivation_started_at')
                 ->where('supersession_generation', $claim->supersessionGeneration)
-                ->whereHas('application')
                 ->whereHas('operationDeployment', function ($query) use ($claim, $state): void {
                     $query->where('application_id', $claim->applicationId)
                         ->where('deployment_uuid', $claim->deploymentUuid)
                         ->where('destination_id', $claim->standaloneDockerId)
                         ->where('pull_request_id', 0)
                         ->where('blue_green_supersession_generation', $claim->supersessionGeneration)
-                        ->where('blue_green_phase', $state->phase->value)
-                        ->whereHas('application');
+                        ->where('blue_green_phase', $state->phase->value);
+                    BlueGreenLifecycleDatabaseLocks::constrainLiveApplication($query, $claim->applicationId);
                     BlueGreenLifecycleDatabaseLocks::constrainQueueStatus($query, $state->phase);
                 });
+            $query = BlueGreenLifecycleDatabaseLocks::constrainLiveApplication($query, $claim->applicationId);
             $this->constrainExpectedState($query, $expectedState);
             $updated = $query->update([
                 'destination_fence_epoch' => $replacementState->destinationFenceEpoch,

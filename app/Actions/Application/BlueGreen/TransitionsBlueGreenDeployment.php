@@ -392,10 +392,10 @@ final class TransitionsBlueGreenDeployment
             ->whereNull('deactivation_operation_id')
             ->whereNull('deactivation_started_at')
             ->where('supersession_generation', $claim->supersessionGeneration)
-            ->whereHas('application')
             ->whereHas('operationDeployment', function (Builder $query) use ($claim, $expectedPhase, $allowCancelledRollbackEntry): void {
                 self::constrainLiveQueue($query, $claim, $expectedPhase, $allowCancelledRollbackEntry);
             });
+        $query = BlueGreenLifecycleDatabaseLocks::constrainLiveApplication($query, $claim->applicationId);
 
         $query = $claim->previousActiveColor === null
             ? $query->whereNull('active_color')
@@ -434,10 +434,10 @@ final class TransitionsBlueGreenDeployment
             ->whereNull('deactivation_operation_id')
             ->whereNull('deactivation_started_at')
             ->where('supersession_generation', $claim->supersessionGeneration)
-            ->whereHas('application')
             ->whereHas('operationDeployment', function (Builder $query) use ($claim): void {
                 self::constrainLiveQueue($query, $claim, BlueGreenDeploymentPhase::IDLE);
             });
+        $query = BlueGreenLifecycleDatabaseLocks::constrainLiveApplication($query, $claim->applicationId);
 
         return $claim->legacyContainerName === null
             ? $query->whereNull('legacy_container_name')
@@ -461,8 +461,8 @@ final class TransitionsBlueGreenDeployment
             ->where('blue_green_destination_fence_epoch', $claim->destinationFenceEpoch)
             ->where('blue_green_server_boot_id', $claim->serverBootId)
             ->where('blue_green_topology_digest', $claim->topologyDigest)
-            ->where('blue_green_routing_config_digest', $claim->routingConfigDigest)
-            ->whereHas('application');
+            ->where('blue_green_routing_config_digest', $claim->routingConfigDigest);
+        BlueGreenLifecycleDatabaseLocks::constrainLiveApplication($query, $claim->applicationId);
         BlueGreenLifecycleDatabaseLocks::constrainQueueStatus(
             $query,
             $expectedPhase,
