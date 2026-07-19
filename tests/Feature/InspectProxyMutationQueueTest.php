@@ -20,15 +20,15 @@ function proxyMutationDiagnosticPayload(string $uuid, string $displayName, strin
 function proxyMutationDiagnosticsFixture(array $pending, array $reserved, array $delayed): array
 {
     $connection = Mockery::mock();
-    $connection->shouldReceive('lrange')->once()->with('queues:proxy-mutations', 0, 99)->andReturn($pending);
-    $connection->shouldReceive('zrange')->once()->with('queues:proxy-mutations:reserved', 0, 99)->andReturn($reserved);
-    $connection->shouldReceive('zrange')->once()->with('queues:proxy-mutations:delayed', 0, 99)->andReturn($delayed);
+    $connection->shouldNotReceive('lrange', 'zrange');
     $connection->shouldReceive('eval')->once()->andReturn([
-        0,
         '',
         count($pending),
         count($reserved),
         count($delayed),
+        $pending,
+        $reserved,
+        $delayed,
     ]);
 
     $queue = Mockery::mock(ProxyMutationRedisQueue::class);
@@ -72,6 +72,23 @@ test('fails closed for malformed or unmarked payloads without echoing their bodi
     $this->artisan('proxy-mutations:inspect')
         ->expectsOutputToContain('INVALID:')
         ->expectsOutputToContain('Raw payload bodies were not printed')
+        ->doesntExpectOutputToContain('production-secret')
+        ->assertFailed();
+});
+
+test('fails closed for duplicate and cross-state payload identities from one atomic snapshot', function () {
+    $duplicate = proxyMutationDiagnosticPayload('duplicate-uuid', 'DuplicateMutation', 'duplicate-production-secret');
+    $overlap = proxyMutationDiagnosticPayload('overlap-uuid', 'OverlapMutation', 'overlap-production-secret');
+    [$diagnostics] = proxyMutationDiagnosticsFixture(
+        [$duplicate, $duplicate, $overlap],
+        [$overlap],
+        [],
+    );
+    app()->instance(ProxyMutationQueueDiagnostics::class, $diagnostics);
+
+    $this->artisan('proxy-mutations:inspect')
+        ->expectsOutputToContain('identity is duplicated')
+        ->expectsOutputToContain('identity also exists in pending')
         ->doesntExpectOutputToContain('production-secret')
         ->assertFailed();
 });
