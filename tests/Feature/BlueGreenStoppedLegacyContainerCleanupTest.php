@@ -19,9 +19,8 @@ use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Process;
 use Tests\Support\BlueGreenDeactivationScenario;
-use Tests\TestCase;
 
-uses(TestCase::class, RefreshDatabase::class);
+uses(RefreshDatabase::class);
 
 function setStoppedLegacyLifecycleProperty(
     BlueGreenDeploymentLifecycle $lifecycle,
