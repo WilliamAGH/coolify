@@ -45,6 +45,41 @@ assert_no_mutation() {
     fi
 }
 
+prepare_failure_injection_alias_pair() {
+    local ghcr_target="$1"
+    local docker_target="$2"
+    local tag="$3"
+
+    set_reference "${ghcr_target}:${tag}" "$old_index"
+    set_reference "${docker_target}:${tag}" "$old_index"
+    set_reference "${ghcr_target}@${old_index}" "$old_index"
+    set_reference "${docker_target}@${old_index}" "$old_index"
+    set_reference "${ghcr_target}@${new_index}" "$new_index"
+    set_reference "${docker_target}@${new_index}" "$new_index"
+}
+
+assert_failure_injection_refusal() {
+    local description="$1"
+    local ghcr_target="$2"
+    local docker_target="$3"
+    local candidate_index="$4"
+    local candidate_run_id="$5"
+    shift 5
+
+    prepare_failure_injection_alias_pair "$ghcr_target" "$docker_target" "$failure_injection_tag"
+    : > "$log"
+    if env "$@" "$helper" promote-alias \
+        "$ghcr_target" "$docker_target" "$failure_injection_tag" "$candidate_index" \
+        "$REGCTL_AMD64" "$REGCTL_ARM64" "$candidate_run_id" >/dev/null 2>&1; then
+        fail "$description unexpectedly succeeded"
+    fi
+    [ "$(get_reference "${ghcr_target}:${failure_injection_tag}")" = "$old_index" ] \
+        || fail "$description moved GHCR before the failure injection guards completed"
+    [ "$(get_reference "${docker_target}:${failure_injection_tag}")" = "$old_index" ] \
+        || fail "$description moved Docker Hub before the failure injection guards completed"
+    assert_no_mutation "$description attempted a registry mutation"
+}
+
 cleanup() {
     rm -rf "$state"
 }
@@ -556,5 +591,98 @@ grep -Fq 'classification=superseded' "$superseded_error" || fail 'superseded rel
 if grep -q '^copy:' "$log"; then
     fail 'older release run moved latest'
 fi
+
+failure_injection_tag='staging'
+failure_issue7_ghcr='ghcr.io/williamagh/coolify-remediation-issue7'
+failure_issue7_docker='docker.io/williamagh/coolify-remediation-issue7'
+failure_issue9_ghcr='ghcr.io/williamagh/coolify-remediation-issue9'
+failure_issue9_docker='docker.io/williamagh/coolify-remediation-issue9'
+failure_issue18_ghcr='ghcr.io/williamagh/coolify-remediation-issue18'
+failure_issue18_docker='docker.io/williamagh/coolify-remediation-issue18'
+
+export PUBLISH_LINUX_IMAGE_FAILURE_INJECTION='docker-alias-before-copy'
+export GITHUB_REPOSITORY='WilliamAGH/coolify'
+export GITHUB_EVENT_NAME='repository_dispatch'
+export GITHUB_REF='refs/heads/v4.x'
+export GITHUB_REF_PROTECTED='true'
+
+assert_failure_injection_refusal \
+    'unsupported release failure injection mode' \
+    "$failure_issue7_ghcr" "$failure_issue7_docker" "$new_index" 42 \
+    PUBLISH_LINUX_IMAGE_FAILURE_INJECTION='wrong-mode'
+assert_failure_injection_refusal \
+    'wrong GitHub repository context' \
+    "$failure_issue7_ghcr" "$failure_issue7_docker" "$new_index" 42 \
+    GITHUB_REPOSITORY='WilliamAGH/not-coolify'
+assert_failure_injection_refusal \
+    'wrong GitHub event context' \
+    "$failure_issue7_ghcr" "$failure_issue7_docker" "$new_index" 42 \
+    GITHUB_EVENT_NAME='workflow_dispatch'
+assert_failure_injection_refusal \
+    'wrong GitHub ref context' \
+    "$failure_issue7_ghcr" "$failure_issue7_docker" "$new_index" 42 \
+    GITHUB_REF='refs/heads/not-v4.x'
+assert_failure_injection_refusal \
+    'unprotected GitHub ref context' \
+    "$failure_issue7_ghcr" "$failure_issue7_docker" "$new_index" 42 \
+    GITHUB_REF_PROTECTED='false'
+assert_failure_injection_refusal \
+    'nonallowlisted disposable target pair' \
+    'ghcr.io/williamagh/coolify-remediation-issue99' \
+    'docker.io/williamagh/coolify-remediation-issue99' "$new_index" 42
+assert_failure_injection_refusal \
+    'mixed disposable target pair' \
+    "$failure_issue7_ghcr" "$failure_issue9_docker" "$new_index" 42
+assert_failure_injection_refusal \
+    'production target pair' \
+    "$ghcr_repository" "$docker_repository" "$new_index" 42
+assert_failure_injection_refusal \
+    'non-distinct candidate and alias predecessor' \
+    "$failure_issue7_ghcr" "$failure_issue7_docker" "$old_index" 41
+
+prepare_failure_injection_alias_pair "$failure_issue7_ghcr" "$failure_issue7_docker" "$failure_injection_tag"
+: > "$log"
+failure_injection_error="$state/failure-injection-alias.err"
+if "$helper" promote-alias \
+    "$failure_issue7_ghcr" "$failure_issue7_docker" "$failure_injection_tag" "$new_index" \
+    "$REGCTL_AMD64" "$REGCTL_ARM64" 42 > /dev/null 2> "$failure_injection_error"; then
+    fail 'allowlisted promote-alias failure injection unexpectedly succeeded'
+fi
+grep -Fq 'injected failure after GHCR staging promotion before Docker Hub copy' "$failure_injection_error" \
+    || fail 'allowlisted promote-alias failure injection did not report its boundary'
+[ "$(get_reference "${failure_issue7_ghcr}:${failure_injection_tag}")" = "$new_index" ] \
+    || fail 'allowlisted promote-alias failure injection did not leave GHCR at the candidate'
+[ "$(get_reference "${failure_issue7_docker}:${failure_injection_tag}")" = "$old_index" ] \
+    || fail 'allowlisted promote-alias failure injection moved Docker Hub before its boundary'
+grep -Fq "copy:${failure_issue7_ghcr}@${new_index}:${failure_issue7_ghcr}:${failure_injection_tag}" "$log" \
+    || fail 'allowlisted promote-alias failure injection did not move GHCR before stopping'
+if grep -Fq "copy:${failure_issue7_ghcr}@${new_index}:${failure_issue7_docker}:${failure_injection_tag}" "$log"; then
+    fail 'allowlisted promote-alias failure injection attempted the Docker Hub copy'
+fi
+
+prepare_failure_injection_alias_pair "$failure_issue9_ghcr" "$failure_issue9_docker" latest
+: > "$log"
+if "$helper" promote-latest \
+    "$failure_issue9_ghcr" "$failure_issue9_docker" "$new_index" \
+    "$REGCTL_AMD64" "$REGCTL_ARM64" 42 > /dev/null 2> "$failure_injection_error"; then
+    fail 'allowlisted promote-latest failure injection unexpectedly succeeded'
+fi
+[ "$(get_reference "${failure_issue9_ghcr}:latest")" = "$new_index" ] \
+    || fail 'allowlisted promote-latest failure injection did not leave GHCR at the candidate'
+[ "$(get_reference "${failure_issue9_docker}:latest")" = "$old_index" ] \
+    || fail 'allowlisted promote-latest failure injection moved Docker Hub before its boundary'
+
+prepare_failure_injection_alias_pair "$failure_issue18_ghcr" "$failure_issue18_docker" "$failure_injection_tag"
+: > "$log"
+if "$helper" promote-alias \
+    "$failure_issue18_ghcr" "$failure_issue18_docker" "$failure_injection_tag" "$new_index" \
+    "$REGCTL_AMD64" "$REGCTL_ARM64" 42 > /dev/null 2> "$failure_injection_error"; then
+    fail 'issue18 promote-alias failure injection unexpectedly succeeded'
+fi
+[ "$(get_reference "${failure_issue18_ghcr}:${failure_injection_tag}")" = "$new_index" ] \
+    || fail 'issue18 failure injection did not leave GHCR at the candidate'
+[ "$(get_reference "${failure_issue18_docker}:${failure_injection_tag}")" = "$old_index" ] \
+    || fail 'issue18 failure injection moved Docker Hub before its boundary'
+unset PUBLISH_LINUX_IMAGE_FAILURE_INJECTION GITHUB_REPOSITORY GITHUB_EVENT_NAME GITHUB_REF GITHUB_REF_PROTECTED
 
 printf 'PUBLISH_LINUX_IMAGE_HELPER_PASS\n'
