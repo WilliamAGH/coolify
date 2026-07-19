@@ -718,7 +718,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         $this->save_runtime_environment_variables();
 
         $this->push_to_docker_registry();
-        $this->rolling_update();
+        $this->activate_prepared_runtime();
     }
 
     private function deploy_dockerimage_buildpack()
@@ -738,7 +738,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         // Save runtime environment variables (including empty .env file if no variables defined)
         $this->save_runtime_environment_variables();
 
-        $this->rolling_update();
+        $this->activate_prepared_runtime();
     }
 
     private function resolveDockerImageTag(): string
@@ -929,6 +929,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         // This overwrites the build-time .env with ALL variables (build-time + runtime)
         $this->save_runtime_environment_variables();
 
+        $this->run_pre_deployment_command();
         $this->stop_running_container(force: true);
         $this->application_deployment_queue->addLogEntry('Starting new application.');
         $networkId = $this->application->uuid;
@@ -1066,7 +1067,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         $this->save_runtime_environment_variables();
 
         $this->push_to_docker_registry();
-        $this->rolling_update();
+        $this->activate_prepared_runtime();
     }
 
     private function deploy_nixpacks_buildpack()
@@ -1099,7 +1100,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         // This overwrites the build-time .env with ALL variables (build-time + runtime)
         $this->save_runtime_environment_variables();
         $this->push_to_docker_registry();
-        $this->rolling_update();
+        $this->activate_prepared_runtime();
     }
 
     private function deploy_railpack_buildpack(): void
@@ -1130,7 +1131,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         // Save runtime environment variables AFTER the build
         $this->save_runtime_environment_variables();
         $this->push_to_docker_registry();
-        $this->rolling_update();
+        $this->activate_prepared_runtime();
     }
 
     private function deploy_static_buildpack()
@@ -1162,7 +1163,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         $this->save_runtime_environment_variables();
 
         $this->push_to_docker_registry();
-        $this->rolling_update();
+        $this->activate_prepared_runtime();
     }
 
     private function write_deployment_configurations()
@@ -1404,7 +1405,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
                 $this->save_runtime_environment_variables();
 
                 $this->push_to_docker_registry();
-                $this->rolling_update();
+                $this->activate_prepared_runtime();
 
                 return true;
             }
@@ -1418,7 +1419,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
                 $this->save_runtime_environment_variables();
 
                 $this->push_to_docker_registry();
-                $this->rolling_update();
+                $this->activate_prepared_runtime();
 
                 return true;
             } else {
@@ -2063,7 +2064,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         return [$nixpacks_php_fallback_path, $nixpacks_php_root_dir];
     }
 
-    private function rolling_update()
+    protected function rolling_update()
     {
         try {
             $this->checkForCancellation();
@@ -2140,6 +2141,12 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         } catch (Exception $e) {
             throw new DeploymentException('Rolling update failed ('.get_class($e).'): '.$e->getMessage(), $e->getCode(), $e);
         }
+    }
+
+    protected function activate_prepared_runtime(): void
+    {
+        $this->run_pre_deployment_command();
+        $this->rolling_update();
     }
 
     private function health_check()
@@ -2279,7 +2286,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         // This overwrites the build-time .env with ALL variables (build-time + runtime)
         $this->save_runtime_environment_variables();
         $this->push_to_docker_registry();
-        $this->rolling_update();
+        $this->activate_prepared_runtime();
     }
 
     private function create_workdir()
@@ -2354,7 +2361,6 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
                 'command' => executeInDocker($this->deployment_uuid, "mkdir -p {$this->basedir}"),
             ],
         );
-        $this->run_pre_deployment_command();
     }
 
     private function restart_builder_container_with_actual_commit()
@@ -4840,7 +4846,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         return null;
     }
 
-    private function run_pre_deployment_command()
+    protected function run_pre_deployment_command()
     {
         if (empty($this->application->pre_deployment_command)) {
             return;
