@@ -2,6 +2,9 @@
 
 namespace App\Actions\Proxy\ControlPlane;
 
+use App\Support\ProxyMutationQueue;
+use App\Support\ProxyMutationQueueSnapshot;
+use Closure;
 use DateTimeImmutable;
 use DateTimeZone;
 use InvalidArgumentException;
@@ -17,17 +20,15 @@ final class VerifyControlPlaneGenerationDrainProof
     public function handle(
         ControlPlaneGenerationPromotionState $state,
         string $transcript,
-        string $freezeOperationId,
-        int $pending = 0,
-        int $reserved = 0,
-        int $delayed = 0,
+        ?Closure $queueSnapshotProvider = null,
     ): array {
+        $queueSnapshot = ($queueSnapshotProvider ?? static fn (): ProxyMutationQueueSnapshot => ProxyMutationQueue::snapshot())();
+        if (! $queueSnapshot instanceof ProxyMutationQueueSnapshot) {
+            throw new InvalidArgumentException('The control-plane generation drain proof queue snapshot is invalid.');
+        }
         $window = $this->assertContext(
             state: $state,
-            freezeOperationId: $freezeOperationId,
-            pending: $pending,
-            reserved: $reserved,
-            delayed: $delayed,
+            queueSnapshot: $queueSnapshot,
         );
         $records = $this->parseTranscript($transcript);
         $expectedRuntime = $state->runtime->predecessorRuntime;
@@ -63,9 +64,9 @@ final class VerifyControlPlaneGenerationDrainProof
 
         return [
             'observed_at' => $latestObservedAtValue,
-            'pending' => $pending,
-            'reserved' => $reserved,
-            'delayed' => $delayed,
+            'pending' => $queueSnapshot->pending,
+            'reserved' => $queueSnapshot->reserved,
+            'delayed' => $queueSnapshot->delayed,
             'tcp_connection_count' => 0,
             'predecessor_runtime_sha256' => $state->predecessorRuntimeSha256(),
         ];
@@ -76,18 +77,15 @@ final class VerifyControlPlaneGenerationDrainProof
      */
     private function assertContext(
         ControlPlaneGenerationPromotionState $state,
-        string $freezeOperationId,
-        int $pending,
-        int $reserved,
-        int $delayed,
+        ProxyMutationQueueSnapshot $queueSnapshot,
     ): array {
-        if (preg_match('/\A[a-z0-9][a-z0-9._-]{0,127}\z/D', $freezeOperationId) !== 1
-            || ! hash_equals($state->operationId, $freezeOperationId)
+        if ($queueSnapshot->freezeOperationId === null
+            || ! hash_equals($state->operationId, $queueSnapshot->freezeOperationId)
             || $state->mutationFreeze === null
-            || ! hash_equals($state->mutationFreeze['operation_id'], $freezeOperationId)) {
+            || ! hash_equals($state->mutationFreeze['operation_id'], $queueSnapshot->freezeOperationId)) {
             throw new InvalidArgumentException('The control-plane generation drain proof requires the exact mutation freeze owner operation ID.');
         }
-        if ($pending !== 0 || $reserved !== 0 || $delayed !== 0) {
+        if (! $queueSnapshot->isEmpty()) {
             throw new InvalidArgumentException('The control-plane generation drain proof requires an empty canonical mutation queue.');
         }
         if ($state->dualRoute === null || $state->draining === null) {
