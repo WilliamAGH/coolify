@@ -2,6 +2,7 @@
 
 namespace App\Jobs;
 
+use App\Actions\Application\WaitForSwarmStackConvergence;
 use App\Actions\Docker\GetContainersStatus;
 use App\Contracts\AdoptsLegacyProxyMutationDispatch;
 use App\Contracts\ProxyMutation;
@@ -1988,10 +1989,20 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
             $this->checkForCancellation();
             if ($this->server->isSwarm()) {
                 $this->application_deployment_queue->addLogEntry('Rolling update started.');
-                $this->execute_remote_command(
-                    [
-                        executeInDocker($this->deployment_uuid, "docker stack deploy --detach=true --with-registry-auth -c {$this->workdir}{$this->docker_compose_location} {$this->application->uuid}"),
-                    ],
+                WaitForSwarmStackConvergence::make()->deployAndWait(
+                    $this->server,
+                    $this->application->uuid,
+                    (int) $this->application->health_check_start_period,
+                    (int) $this->application->health_check_interval,
+                    (int) $this->application->health_check_retries,
+                    deploy: function (): void {
+                        $this->execute_remote_command(
+                            [
+                                executeInDocker($this->deployment_uuid, "docker stack deploy --detach=true --with-registry-auth -c {$this->workdir}{$this->docker_compose_location} {$this->application->uuid}"),
+                            ],
+                        );
+                        $this->application_deployment_queue->addLogEntry('Waiting for Swarm services to converge.');
+                    },
                 );
                 $this->application_deployment_queue->addLogEntry('Rolling update completed.');
             } else {

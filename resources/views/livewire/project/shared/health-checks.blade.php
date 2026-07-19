@@ -15,6 +15,11 @@
     </div>
     <div class="mt-1 pb-4">Define how your resource's health should be checked.</div>
     <div class="flex flex-col gap-4">
+        @if ($resource instanceof \App\Models\Application && $resource->destination?->server?->isSwarm())
+            <x-callout type="warning" title="Swarm readiness requirement">
+                <p>Swarm start-first rolling updates require an enabled healthcheck to wait for the replacement task to become ready. Coolify verifies service convergence either way, but zero-downtime replacement is not guaranteed without a healthcheck.</p>
+            </x-callout>
+        @endif
         @if ($customHealthcheckFound)
             <x-callout type="warning" title="Caution">
                 <p>A custom health check has been detected. If you enable this health check, it will disable the custom one and use this instead.</p>
