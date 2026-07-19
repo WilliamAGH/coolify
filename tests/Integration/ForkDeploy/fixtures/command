@@ -8,6 +8,39 @@ name=${0##*/}
     printf '\n'
 } >>"$FORK_DEPLOY_TEST_LOG"
 
+control_plane_listener_override_is_active() {
+    local path=$1
+
+    [[ -f $path && ! -L $path ]] || return 1
+    awk '
+        $0 ~ /^  coolify:[[:space:]]*$/ { in_coolify = 1; next }
+        in_coolify && $0 ~ /^  [^[:space:]]/ { exit }
+        in_coolify && $0 ~ /^    ports:[[:space:]]*!reset[[:space:]]*\[\][[:space:]]*$/ {
+            found = 1
+            exit
+        }
+        END { exit !found }
+    ' "$path"
+}
+
+compose_uses_control_plane_listener_override() {
+    local argument previous='' listener_override=''
+
+    for argument in "$@"; do
+        if [[ $previous == --file || $previous == -f ]]; then
+            if [[ $argument == */docker-compose.control-plane-listener.yml ]]; then
+                listener_override=$argument
+            fi
+            previous=
+            continue
+        fi
+        case $argument in
+            --file|-f) previous=$argument ;;
+        esac
+    done
+    [[ -n $listener_override ]] && control_plane_listener_override_is_active "$listener_override"
+}
+
 case $name in
     uname)
         if [[ ${1:-} == -s ]]; then printf 'Linux\n'; else printf 'x86_64\n'; fi
@@ -61,6 +94,10 @@ case $name in
                     if [[ ${3:-} == --short ]]; then printf '%s\n' "${FORK_DEPLOY_COMPOSE_VERSION:-v2.24.4}"; fi
                     exit 0
                 fi
+                listener_override_active=false
+                if compose_uses_control_plane_listener_override "$@"; then
+                    listener_override_active=true
+                fi
                 if [[ $* == *' up '* ]]; then
                     [[ ${FORK_DEPLOY_FAIL_COMPOSE_UP:-false} != true ]] || exit 1
                     : >"$FORK_DEPLOY_RUNTIME_MARKER"
@@ -80,9 +117,13 @@ case $name in
                     exit 1
                 fi
                 if [[ $* == *'--format json'* ]]; then
-                    app_host_field='"host_ip":"0.0.0.0",'
-                    if [[ ${FORK_DEPLOY_COMPOSE_OMIT_APP_HOST_IP:-false} == true ]]; then app_host_field=; fi
-                    printf '{"services":{"coolify":{"ports":[{%s"published":"8000","target":8080}]},"soketi":{"ports":[{"host_ip":"127.0.0.1","published":"6001","target":6001},{"host_ip":"127.0.0.1","published":"6002","target":6002}]}}}\n' "$app_host_field"
+                    if "$listener_override_active"; then
+                        printf '%s\n' '{"services":{"coolify":{"ports":[]},"soketi":{"ports":[{"host_ip":"127.0.0.1","published":"6001","target":6001},{"host_ip":"127.0.0.1","published":"6002","target":6002}]}}}'
+                    else
+                        app_host_field='"host_ip":"0.0.0.0",'
+                        if [[ ${FORK_DEPLOY_COMPOSE_OMIT_APP_HOST_IP:-false} == true ]]; then app_host_field=; fi
+                        printf '{"services":{"coolify":{"ports":[{%s"published":"8000","target":8080}]},"soketi":{"ports":[{"host_ip":"127.0.0.1","published":"6001","target":6001},{"host_ip":"127.0.0.1","published":"6002","target":6002}]}}}\n' "$app_host_field"
+                    fi
                 elif [[ $* == *--images* ]]; then
                     printf '%s\n' \
                         'docker.iocloudhost.net/williamagh/coolify@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
@@ -122,10 +163,12 @@ case $name in
                     if [[ ${FORK_DEPLOY_HOST_IP:-} == absent ]]; then exit 1; fi
                     case ${*: -1} in
                         coolify)
-                            host_ip=${FORK_DEPLOY_APP_HOST_IP:-${FORK_DEPLOY_HOST_IP:-0.0.0.0}}
-                            printf '8080/tcp\t%s\t%s\n' "$host_ip" "${FORK_DEPLOY_APP_PORT:-8000}"
-                            if [[ ${FORK_DEPLOY_APP_DUAL_STACK:-false} == true ]]; then
-                                printf '8080/tcp\t::\t%s\n' "${FORK_DEPLOY_APP_PORT:-8000}"
+                            if ! control_plane_listener_override_is_active "${FORK_DEPLOY_ACTIVE_SOURCE:-/nonexistent}/docker-compose.control-plane-listener.yml"; then
+                                host_ip=${FORK_DEPLOY_APP_HOST_IP:-${FORK_DEPLOY_HOST_IP:-0.0.0.0}}
+                                printf '8080/tcp\t%s\t%s\n' "$host_ip" "${FORK_DEPLOY_APP_PORT:-8000}"
+                                if [[ ${FORK_DEPLOY_APP_DUAL_STACK:-false} == true ]]; then
+                                    printf '8080/tcp\t::\t%s\n' "${FORK_DEPLOY_APP_PORT:-8000}"
+                                fi
                             fi
                             ;;
                         coolify-realtime)

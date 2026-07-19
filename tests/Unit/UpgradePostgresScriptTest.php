@@ -56,6 +56,18 @@ it('keeps postgres upgrade compose override in future upgrade compose commands',
     'nightly upgrade' => 'other/nightly/upgrade.sh',
 ]);
 
+it('keeps the safe control-plane listener override last in stable upgrade compose commands', function () {
+    $script = file_get_contents(getcwd().'/scripts/upgrade.sh');
+
+    expect($script)
+        ->toContain('CONTROL_PLANE_LISTENER_OVERRIDE="/data/coolify/source/docker-compose.control-plane-listener.yml"')
+        ->toContain('[[ -f "$override" && ! -L "$override" ]] || return 1')
+        ->toContain('ports:[[:space:]]*!reset[[:space:]]*\\[\\]')
+        ->toContain('COMPOSE_FILES="$COMPOSE_FILES -f $override"');
+
+    expect(substr_count($script, 'if ! append_control_plane_listener_override; then'))->toBe(2);
+});
+
 it('uses postgres 18 compatible mount path in generated override and restore container', function () {
     $script = file_get_contents(getcwd().'/scripts/upgrade-postgres.sh');
 

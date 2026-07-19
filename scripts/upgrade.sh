@@ -8,6 +8,7 @@ REGISTRY_URL=${3:-ghcr.io}
 SKIP_BACKUP=${4:-false}
 ENV_FILE="/data/coolify/source/.env"
 STATUS_FILE="/data/coolify/source/.upgrade-status"
+CONTROL_PLANE_LISTENER_OVERRIDE="/data/coolify/source/docker-compose.control-plane-listener.yml"
 
 FORK_RELEASE_VERSION_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-fork(\.[1-9][0-9]*)?$'
 if [[ "$LATEST_IMAGE" =~ $FORK_RELEASE_VERSION_PATTERN ]]; then
@@ -38,6 +39,38 @@ write_status() {
     local message="$2"
     echo "${step}|${message}|$(date -Iseconds)" > "$STATUS_FILE"
 }
+
+control_plane_listener_override() {
+    local override="$CONTROL_PLANE_LISTENER_OVERRIDE"
+
+    if [[ -e "$override" || -L "$override" ]]; then
+        [[ -f "$override" && ! -L "$override" ]] || return 1
+        awk '
+            $0 ~ /^  coolify:[[:space:]]*$/ { in_coolify = 1; next }
+            in_coolify && $0 ~ /^  [^[:space:]]/ { exit }
+            in_coolify && $0 ~ /^    ports:[[:space:]]*!reset[[:space:]]*\[\][[:space:]]*$/ {
+                found = 1
+                exit
+            }
+            END { exit !found }
+        ' "$override" || return 1
+        printf '%s\n' "$override"
+    fi
+
+    return 0
+}
+
+append_control_plane_listener_override() {
+    local override
+
+    override=$(control_plane_listener_override) || return 1
+    if [[ -n "$override" ]]; then
+        COMPOSE_FILES="$COMPOSE_FILES -f $override"
+    fi
+}
+
+LISTENER_OVERRIDE_HELPERS="$(declare -f control_plane_listener_override)
+$(declare -f append_control_plane_listener_override)"
 
 echo ""
 echo "=========================================="
@@ -83,6 +116,16 @@ fi
 if [ -f /data/coolify/source/docker-compose.postgres-upgrade.yml ]; then
     COMPOSE_FILES="$COMPOSE_FILES -f /data/coolify/source/docker-compose.postgres-upgrade.yml"
     log "Including PostgreSQL upgrade compose override in image extraction"
+fi
+
+if ! append_control_plane_listener_override; then
+    log "ERROR: Control-plane listener Compose override is unsafe or does not reset Coolify ports"
+    write_status "error" "Invalid control-plane listener Compose override"
+    echo "     ERROR: Invalid control-plane listener Compose override. Aborting upgrade."
+    exit 1
+fi
+if [[ "$COMPOSE_FILES" == *"$CONTROL_PLANE_LISTENER_OVERRIDE"* ]]; then
+    log "Including control-plane listener Compose override in image extraction"
 fi
 
 # Get all unique images from docker compose config
@@ -231,6 +274,8 @@ nohup bash -c "
     REGISTRY_URL='$REGISTRY_URL'
     LATEST_HELPER_VERSION='$LATEST_HELPER_VERSION'
     LATEST_IMAGE='$LATEST_IMAGE'
+    CONTROL_PLANE_LISTENER_OVERRIDE='$CONTROL_PLANE_LISTENER_OVERRIDE'
+    $LISTENER_OVERRIDE_HELPERS
 
     log() {
         echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] \$1\" >>\"\$LOGFILE\"
@@ -269,6 +314,15 @@ nohup bash -c "
     if [ -f /data/coolify/source/docker-compose.postgres-upgrade.yml ]; then
         log 'Using PostgreSQL upgrade compose override'
         COMPOSE_FILES=\"\$COMPOSE_FILES -f /data/coolify/source/docker-compose.postgres-upgrade.yml\"
+    fi
+
+    if ! append_control_plane_listener_override; then
+        log 'ERROR: Control-plane listener Compose override is unsafe or does not reset Coolify ports'
+        write_status 'error' 'Invalid control-plane listener Compose override'
+        exit 1
+    fi
+    if [[ \$COMPOSE_FILES == *\$CONTROL_PLANE_LISTENER_OVERRIDE* ]]; then
+        log 'Using control-plane listener Compose override'
     fi
 
     log 'Running docker compose up...'

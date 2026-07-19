@@ -182,6 +182,24 @@ update_release() {
     "$SUBJECT" update --offline-manifest "$MANIFEST_FILE"
 }
 
+control_plane_listener_override_path() {
+    printf '%s\n' "$ROOT/source/docker-compose.control-plane-listener.yml"
+}
+
+source_compose_mutations_apply_listener_override_last() {
+    local override line suffix invocations=0
+
+    override=$(control_plane_listener_override_path)
+    while IFS= read -r line; do
+        [[ $line == docker\ compose* && $line == *"$ROOT/source/docker-compose.yml"* && $line == *' up '* ]] || continue
+        [[ $line == *"--file $override"* ]] || return 1
+        suffix=${line#*"--file $override"}
+        [[ $suffix != *'--file '* ]] || return 1
+        invocations=$((invocations + 1))
+    done <"$LOG"
+    [[ $invocations -gt 0 ]]
+}
+
 replace_key_value() {
     local file=$1 key=$2 value=$3 temporary
 
@@ -911,6 +929,84 @@ test_verify_accepts_dual_stack_public_app_binding() {
     cleanup_fixture
 }
 
+test_update_preserves_control_plane_listener_override() {
+    new_fixture
+    write_manifest 4.13.0-fork.1
+    if ! install_release >/dev/null; then
+        fail 'fork-deploy update preserves enrolled Traefik APP_PORT ownership'
+        cleanup_fixture
+        return
+    fi
+    local override source_hash output
+    override=$(control_plane_listener_override_path)
+    printf 'services:\n  coolify:\n    ports: !reset []\n' >"$override"
+    chmod 600 "$override"
+    source_hash=$(hash_file "$override")
+    write_manifest 4.13.0-fork.2
+    : >"$LOG"
+    if output=$({ update_release && "$SUBJECT" verify; } 2>&1) \
+        && [[ $(hash_file "$override") == "$source_hash" ]] \
+        && source_compose_mutations_apply_listener_override_last; then
+        pass 'fork-deploy update preserves enrolled Traefik APP_PORT ownership'
+    else
+        printf 'control-plane listener persistence diagnostic: %s\n' "$output" >&2
+        fail 'fork-deploy update preserves enrolled Traefik APP_PORT ownership'
+    fi
+    cleanup_fixture
+}
+
+test_update_rejects_symlinked_control_plane_listener_override() {
+    new_fixture
+    write_manifest 4.13.0-fork.1
+    if ! install_release >/dev/null; then
+        fail 'fork-deploy rejects a symlinked control-plane listener override'
+        cleanup_fixture
+        return
+    fi
+    local override output
+    override=$(control_plane_listener_override_path)
+    printf 'services:\n  coolify:\n    ports: !reset []\n' >"$FIXTURE/listener-target.yml"
+    ln -s "$FIXTURE/listener-target.yml" "$override"
+    write_manifest 4.13.0-fork.2
+    : >"$LOG"
+    if output=$(update_release 2>&1); then
+        fail 'fork-deploy rejects a symlinked control-plane listener override'
+    elif [[ $output == *'symbolic link'* && $(<"$ROOT/fork-deploy/current") == 4.13.0-fork.1 ]] \
+        && ! grep -q 'compose .* up' "$LOG"; then
+        pass 'fork-deploy rejects a symlinked control-plane listener override'
+    else
+        printf 'symlinked listener rejection diagnostic: %s\n' "$output" >&2
+        fail 'fork-deploy rejects a symlinked control-plane listener override'
+    fi
+    cleanup_fixture
+}
+
+test_update_rejects_partial_control_plane_listener_override() {
+    new_fixture
+    write_manifest 4.13.0-fork.1
+    if ! install_release >/dev/null; then
+        fail 'fork-deploy rejects a partial control-plane listener override'
+        cleanup_fixture
+        return
+    fi
+    local override output
+    override=$(control_plane_listener_override_path)
+    printf 'services:\n  coolify:\n    environment:\n      COOLIFY_CONTROL_PLANE_MEMBER: blue\n' >"$override"
+    chmod 600 "$override"
+    write_manifest 4.13.0-fork.2
+    : >"$LOG"
+    if output=$(update_release 2>&1); then
+        fail 'fork-deploy rejects a partial control-plane listener override'
+    elif [[ $output == *'must reset Coolify ports'* && $(<"$ROOT/fork-deploy/current") == 4.13.0-fork.1 ]] \
+        && ! grep -q 'compose .* up' "$LOG"; then
+        pass 'fork-deploy rejects a partial control-plane listener override'
+    else
+        printf 'partial listener rejection diagnostic: %s\n' "$output" >&2
+        fail 'fork-deploy rejects a partial control-plane listener override'
+    fi
+    cleanup_fixture
+}
+
 test_verify_rejects_all_unsafe_runtime_bindings() {
     new_fixture
     write_manifest 4.13.0-fork.1
@@ -1595,6 +1691,15 @@ test_recover_abort_refuses_after_candidate_start() {
     cleanup_fixture
 }
 
+if [[ ${FORK_DEPLOY_TEST_FILTER:-} == control-plane-listener ]]; then
+    test_update_preserves_control_plane_listener_override
+    test_update_rejects_symlinked_control_plane_listener_override
+    test_update_rejects_partial_control_plane_listener_override
+    printf '%s passing, %s failing\n' "$PASS" "$FAIL"
+    ((FAIL == 0))
+    exit
+fi
+
 test_rejects_untrusted_caller_inputs
 test_install_and_update_are_self_contained
 test_rejects_production_alternate_root
@@ -1624,6 +1729,9 @@ test_forward_recovery_requires_recorded_bundle
 test_invalid_ports_fail_before_activation
 test_effective_compose_requires_public_app_binding
 test_verify_accepts_dual_stack_public_app_binding
+test_update_preserves_control_plane_listener_override
+test_update_rejects_symlinked_control_plane_listener_override
+test_update_rejects_partial_control_plane_listener_override
 test_verify_rejects_all_unsafe_runtime_bindings
 test_rejects_invalid_manifest_signature
 test_rejects_out_of_order_manifest_schema

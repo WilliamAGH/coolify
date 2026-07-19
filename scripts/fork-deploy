@@ -1256,11 +1256,44 @@ fd_prepare_staged_environment() {
     set_env_value "$environment" RELEASES_URL "$DISABLED_RELEASES_URL"
 }
 
-fd_compose_in() {
+fd_control_plane_listener_override() {
+    local directory=$1
+    local path=$directory/docker-compose.control-plane-listener.yml
+
+    if [[ -e $path || -L $path ]]; then
+        require_regular_file "$path" 'control-plane listener Compose override'
+        awk '
+            $0 ~ /^  coolify:[[:space:]]*$/ { in_coolify = 1; next }
+            in_coolify && $0 ~ /^  [^[:space:]]/ { exit }
+            in_coolify && $0 ~ /^    ports:[[:space:]]*!reset[[:space:]]*\[\][[:space:]]*$/ {
+                found = 1
+                exit
+            }
+            END { exit !found }
+        ' "$path" || die 'control-plane listener Compose override must reset Coolify ports'
+        printf '%s\n' "$path"
+    fi
+
+    return 0
+}
+
+fd_compose_base_in() {
     local directory=$1
     shift
 
     docker compose --env-file "$directory/.env" --file "$directory/docker-compose.yml" --file "$directory/docker-compose.prod.yml" --file "$directory/docker-compose.custom.yml" "$@"
+}
+
+fd_compose_in() {
+    local directory=$1 listener_override
+    shift
+
+    listener_override=$(fd_control_plane_listener_override "$directory")
+    if [[ -n $listener_override ]]; then
+        fd_compose_base_in "$directory" --file "$listener_override" "$@"
+    else
+        fd_compose_base_in "$directory" "$@"
+    fi
 }
 
 fd_count() {
@@ -1297,8 +1330,9 @@ fd_validate_effective_images() {
 }
 
 fd_validate_effective_bindings() {
-    local directory=$1 json compact remainder host_ip count=0 public_count=0 loopback_count=0 target app_port soketi_port
+    local directory=$1 json compact remainder host_ip count=0 public_count=0 loopback_count=0 target app_port soketi_port listener_override
 
+    listener_override=$(fd_control_plane_listener_override "$directory")
     app_port=$(env_value "$directory/.env" APP_PORT)
     soketi_port=$(env_value "$directory/.env" SOKETI_PORT)
     validate_port "$app_port" APP_PORT
@@ -1320,15 +1354,29 @@ fd_validate_effective_bindings() {
         esac
         count=$((count + 1))
     done
-    [[ $loopback_count -eq 2 && $public_count -eq 1 && $count -eq $((loopback_count + public_count)) ]] \
-        || die "effective Compose must contain one public APP_PORT and two loopback realtime bindings"
-    for target in 8080 6001 6002; do
-        [[ $(fd_count "$compact" "\"target\":$target") -eq 1 ]] || die "effective Compose must contain exactly one target port $target"
-    done
-    [[ $(fd_count "$compact" '"published":') -eq 3 ]] || die 'effective Compose must contain exactly three published ports'
-    for target in "$app_port" "$soketi_port" 6002; do
-        [[ $compact == *"\"published\":\"$target\""* || $compact == *"\"published\":$target"* ]] || die "effective Compose is missing host port $target"
-    done
+    if [[ -n $listener_override ]]; then
+        [[ $loopback_count -eq 2 && $public_count -eq 0 && $count -eq $loopback_count ]] \
+            || die 'control-plane listener override must remove Coolify APP_PORT publication'
+        [[ $(fd_count "$compact" '"target":8080') -eq 0 ]] \
+            || die 'control-plane listener override must remove Coolify APP_PORT target'
+        for target in 6001 6002; do
+            [[ $(fd_count "$compact" "\"target\":$target") -eq 1 ]] || die "effective Compose must contain exactly one target port $target"
+        done
+        [[ $(fd_count "$compact" '"published":') -eq 2 ]] || die 'control-plane listener override must leave only loopback realtime publications'
+        for target in "$soketi_port" 6002; do
+            [[ $compact == *"\"published\":\"$target\""* || $compact == *"\"published\":$target"* ]] || die "effective Compose is missing host port $target"
+        done
+    else
+        [[ $loopback_count -eq 2 && $public_count -eq 1 && $count -eq $((loopback_count + public_count)) ]] \
+            || die "effective Compose must contain one public APP_PORT and two loopback realtime bindings"
+        for target in 8080 6001 6002; do
+            [[ $(fd_count "$compact" "\"target\":$target") -eq 1 ]] || die "effective Compose must contain exactly one target port $target"
+        done
+        [[ $(fd_count "$compact" '"published":') -eq 3 ]] || die 'effective Compose must contain exactly three published ports'
+        for target in "$app_port" "$soketi_port" 6002; do
+            [[ $compact == *"\"published\":\"$target\""* || $compact == *"\"published\":$target"* ]] || die "effective Compose is missing host port $target"
+        done
+    fi
 }
 
 fd_validate_staging() {
@@ -1859,9 +1907,10 @@ fd_ensure_network() {
 }
 
 fd_validate_runtime_bindings() {
-    local app_port soketi_port container bindings runtime_port host_ip host_port app_seen=0 realtime_seen=0 metrics_seen=0
+    local app_port soketi_port container bindings runtime_port host_ip host_port app_seen=0 realtime_seen=0 metrics_seen=0 listener_override
     local app_unspecified_seen=0 app_ipv4_seen=0 app_ipv6_seen=0
 
+    listener_override=$(fd_control_plane_listener_override "$SOURCE_DIR")
     app_port=$(env_value "$SOURCE_DIR/.env" APP_PORT)
     soketi_port=$(env_value "$SOURCE_DIR/.env" SOKETI_PORT)
     for container in coolify coolify-realtime coolify-db coolify-redis; do
@@ -1909,10 +1958,17 @@ fd_validate_runtime_bindings() {
             esac
         done <<<"$bindings"
     done
-    [[ $app_seen -ge 1 && $app_seen -le 2 && $realtime_seen -eq 1 && $metrics_seen -eq 1 ]] || {
-        note 'ERROR: runtime bindings are missing or duplicated' >&2
-        return 1
-    }
+    if [[ -n $listener_override ]]; then
+        [[ $app_seen -eq 0 && $realtime_seen -eq 1 && $metrics_seen -eq 1 ]] || {
+            note 'ERROR: enrolled control-plane source lets Coolify own APP_PORT or has invalid realtime bindings' >&2
+            return 1
+        }
+    else
+        [[ $app_seen -ge 1 && $app_seen -le 2 && $realtime_seen -eq 1 && $metrics_seen -eq 1 ]] || {
+            note 'ERROR: runtime bindings are missing or duplicated' >&2
+            return 1
+        }
+    fi
 }
 
 fd_verify_runtime() {
@@ -2048,7 +2104,7 @@ fd_disarm_recovery() {
 }
 
 fd_rendered_sha() {
-    fd_compose_in "$1" config | sha256sum | awk '{print $1}'
+    fd_compose_base_in "$1" config | sha256sum | awk '{print $1}'
 }
 
 fd_validate_active_assets() {
