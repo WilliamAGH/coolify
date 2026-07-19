@@ -2,16 +2,31 @@
 
 namespace App\Actions\Proxy;
 
+use App\Contracts\ProxyMutation;
 use App\Enums\ProxyTypes;
 use App\Events\ProxyStatusChanged;
 use App\Events\ProxyStatusChangedUI;
 use App\Models\Server;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Lorisleiva\Actions\Concerns\AsAction;
+use Lorisleiva\Actions\Decorators\JobDecorator;
 use Spatie\Activitylog\Models\Activity;
 
-class StartProxy
+class StartProxy implements ProxyMutation
 {
     use AsAction;
+    use UsesProxyMutationQueue;
+
+    public function configureJob(JobDecorator $job): void
+    {
+        ProxyMutationQueue::assign($job);
+    }
+
+    public function asJob(Server $server, bool $async = true, bool $force = false, bool $restarting = false): string|Activity
+    {
+        return $this->handle($server, async: false, force: $force, restarting: $restarting);
+    }
 
     public function handle(Server $server, bool $async = true, bool $force = false, bool $restarting = false): string|Activity
     {

@@ -57,6 +57,8 @@ function applicationValidationWorkflowViolations(array $workflow): array
         'tests/Feature/BlueGreenCrashBoundaryAcceptanceTest.php',
         'tests/Feature/BlueGreenMigrationReplayTest.php',
         'tests/Feature/BlueGreenSupersessionGenerationTest.php',
+        'tests/Feature/ProxyMutationQueueGateTest.php',
+        'tests/Unit/ScheduledJobsRetryConfigTest.php',
     ] as $requiredTest) {
         if (! str_contains((string) $blueGreenScript, $requiredTest)) {
             $violations[] = 'blue-green lifecycle validation must execute every ownership and migration gate';

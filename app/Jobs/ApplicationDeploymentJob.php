@@ -59,6 +59,8 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
 
     public const BUILD_TIME_ENV_PATH = '/artifacts/build-time.env';
 
+    public const QUEUE = 'application-deployments';
+
     private const BUILD_SCRIPT_PATH = '/artifacts/build.sh';
 
     private const NIXPACKS_PLAN_PATH = '/artifacts/thegameplan.json';

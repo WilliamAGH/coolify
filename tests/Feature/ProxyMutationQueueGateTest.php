@@ -1,6 +1,8 @@
 <?php
 
+use App\Actions\Proxy\StartProxy;
 use App\Contracts\ProxyMutation;
+use App\Models\Server;
 use App\Support\ProxyMutationExecutionPipe;
 use App\Support\ProxyMutationQueue;
 use App\Support\ProxyMutationQueueFrozenException;
@@ -169,6 +171,17 @@ it('serializes typed mutations only on the canonical Redis queue', function () {
     $job->onQueue('high');
     expect(fn (): array => $queue->payloadFor($job))
         ->toThrow(LogicException::class, 'cannot target queue');
+});
+
+it('marks Laravel Action decorators with their canonical action identity', function () {
+    $queue = proxyMutationGateQueue(app());
+    $job = StartProxy::makeJob(new Server);
+    $payload = $queue->payloadFor($job);
+
+    expect($payload[ProxyMutationQueue::PAYLOAD_MARKER])->toBeTrue()
+        ->and($payload['displayName'])->toBe(StartProxy::class)
+        ->and($job->connection)->toBe(ProxyMutationQueue::CONNECTION)
+        ->and($job->queue)->toBe(ProxyMutationQueue::NAME);
 });
 
 it('rejects unmarked canonical payloads before physical enqueue', function () {

@@ -2,10 +2,16 @@
 
 namespace Tests\Unit\Jobs;
 
+use App\Contracts\ProxyMutation;
+use App\Enums\ProcessStatus;
 use App\Jobs\RestartProxyJob;
 use App\Models\Server;
+use App\Support\ProxyMutationQueue;
 use Illuminate\Queue\Middleware\WithoutOverlapping;
+use Illuminate\Support\Sleep;
 use Mockery;
+use ReflectionMethod;
+use Spatie\Activitylog\Models\Activity;
 use Tests\TestCase;
 
 /**
@@ -43,8 +49,11 @@ class RestartProxyJobTest extends TestCase
         $job = new RestartProxyJob($server);
 
         $this->assertEquals(1, $job->tries);
-        $this->assertEquals(120, $job->timeout);
+        $this->assertEquals(660, $job->timeout);
         $this->assertNull($job->activity_id);
+        $this->assertInstanceOf(ProxyMutation::class, $job);
+        $this->assertSame(ProxyMutationQueue::CONNECTION, $job->connection);
+        $this->assertSame(ProxyMutationQueue::NAME, $job->queue);
     }
 
     public function test_job_stores_server()
@@ -54,5 +63,22 @@ class RestartProxyJobTest extends TestCase
         $job = new RestartProxyJob($server);
 
         $this->assertSame($server, $job->server);
+    }
+
+    public function test_job_holds_the_canonical_worker_until_the_remote_activity_finishes()
+    {
+        Sleep::fake();
+        $job = new RestartProxyJob(Mockery::mock(Server::class));
+        $activity = Mockery::mock(Activity::class);
+        $activity->shouldReceive('refresh')->twice()->andReturnSelf();
+        $activity->shouldReceive('getExtraProperty')
+            ->with('status')
+            ->twice()
+            ->andReturn(ProcessStatus::IN_PROGRESS->value, ProcessStatus::FINISHED->value);
+
+        $waitForActivity = new ReflectionMethod($job, 'waitForActivity');
+        $waitForActivity->invoke($job, $activity);
+
+        Sleep::assertSleptTimes(1);
     }
 }

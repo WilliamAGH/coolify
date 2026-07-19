@@ -155,12 +155,14 @@ jobs:
             tests/Feature/BlueGreenOperationFencingTest.php \
             tests/Feature/BlueGreenSupersessionGenerationTest.php \
             tests/Feature/DeleteResourceJobBlueGreenTest.php \
+            tests/Feature/ProxyMutationQueueGateTest.php \
             tests/Feature/QueueServerDeletionTest.php \
             tests/Feature/ScheduleOnOneServerTest.php \
             tests/Unit/Actions/Application/BlueGreen/BlueGreenDeploymentLockTest.php \
             tests/Unit/Actions/Application/BlueGreen/BlueGreenOperationFenceTest.php \
             tests/Unit/Actions/Application/BlueGreen/ExecuteBlueGreenDestinationMutationTest.php \
-            tests/Unit/Actions/Application/BlueGreenPublicRecoveryTest.php
+            tests/Unit/Actions/Application/BlueGreenPublicRecoveryTest.php \
+            tests/Unit/ScheduledJobsRetryConfigTest.php
 
   browser:
     name: Pest browser tests

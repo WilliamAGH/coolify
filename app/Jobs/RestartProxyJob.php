@@ -4,10 +4,14 @@ namespace App\Jobs;
 
 use App\Actions\Proxy\GetProxyConfiguration;
 use App\Actions\Proxy\SaveProxyConfiguration;
+use App\Contracts\ProxyMutation;
+use App\Enums\ProcessStatus;
 use App\Enums\ProxyTypes;
 use App\Events\ProxyStatusChangedUI;
 use App\Models\Server;
 use App\Services\ProxyDashboardCacheService;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeEncrypted;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -15,23 +19,30 @@ use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\Middleware\WithoutOverlapping;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Sleep;
+use RuntimeException;
+use Spatie\Activitylog\Models\Activity;
 
-class RestartProxyJob implements ShouldBeEncrypted, ShouldQueue
+class RestartProxyJob implements ProxyMutation, ShouldBeEncrypted, ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    use UsesProxyMutationQueue;
 
     public $tries = 1;
 
-    public $timeout = 120;
+    public $timeout = 660;
 
     public ?int $activity_id = null;
 
     public function middleware(): array
     {
-        return [(new WithoutOverlapping('restart-proxy-'.$this->server->uuid))->expireAfter(120)->dontRelease()];
+        return [(new WithoutOverlapping('restart-proxy-'.$this->server->uuid))->expireAfter(660)->dontRelease()];
     }
 
-    public function __construct(public Server $server) {}
+    public function __construct(public Server $server)
+    {
+        ProxyMutationQueue::assign($this);
+    }
 
     public function handle()
     {
@@ -56,6 +67,7 @@ class RestartProxyJob implements ShouldBeEncrypted, ShouldQueue
             // Store activity ID and notify UI immediately with it
             $this->activity_id = $activity->id;
             ProxyStatusChangedUI::dispatch($this->server->team_id, $this->activity_id);
+            $this->waitForActivity($activity);
 
         } catch (\Throwable $e) {
             // Set error status
@@ -70,6 +82,24 @@ class RestartProxyJob implements ShouldBeEncrypted, ShouldQueue
 
             return handleError($e);
         }
+    }
+
+    private function waitForActivity(Activity $activity): void
+    {
+        for ($attempt = 0; $attempt < 600; $attempt++) {
+            $activity->refresh();
+            $status = $activity->getExtraProperty('status');
+            if ($status === ProcessStatus::FINISHED->value) {
+                return;
+            }
+            if ($status === ProcessStatus::ERROR->value) {
+                throw new RuntimeException('Proxy restart remote activity failed.');
+            }
+
+            Sleep::for(1)->seconds();
+        }
+
+        throw new RuntimeException('Proxy restart remote activity did not finish within 600 seconds.');
     }
 
     /**

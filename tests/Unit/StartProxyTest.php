@@ -1,87 +1,44 @@
 <?php
 
-// Test the proxy restart container cleanup logic
-it('ensures container cleanup includes wait loop in command sequence', function () {
-    // This test verifies that the StartProxy action includes proper container
-    // cleanup with a wait loop to prevent "container name already in use" errors
+use App\Actions\Proxy\StartProxy;
+use App\Models\Server;
+use App\Support\ProxyMutationQueue;
 
-    // Simulate the command generation pattern from StartProxy
-    $commands = collect([
-        'mkdir -p /data/coolify/proxy/dynamic',
-        'cd /data/coolify/proxy',
-        "echo 'Creating required Docker Compose file.'",
-        "echo 'Pulling docker image.'",
-        'docker compose pull',
-        'if docker ps -a --format "{{.Names}}" | grep -q "^coolify-proxy$"; then',
-        "    echo 'Stopping and removing existing coolify-proxy.'",
-        '    docker stop coolify-proxy 2>/dev/null || true',
-        '    docker rm -f coolify-proxy 2>/dev/null || true',
-        '    # Wait for container to be fully removed',
-        '    for i in {1..10}; do',
-        '        if ! docker ps -a --format "{{.Names}}" | grep -q "^coolify-proxy$"; then',
-        '            break',
-        '        fi',
-        '        echo "Waiting for coolify-proxy to be removed... ($i/10)"',
-        '        sleep 1',
-        '    done',
-        "    echo 'Successfully stopped and removed existing coolify-proxy.'",
-        'fi',
-        "echo 'Starting coolify-proxy.'",
-        'docker compose up -d --wait --remove-orphans',
-        "echo 'Successfully started coolify-proxy.'",
-    ]);
+it('pins queued proxy starts to the canonical mutation lane', function () {
+    $job = StartProxy::makeJob(Mockery::mock(Server::class));
 
-    $commandsString = $commands->implode("\n");
-
-    // Verify the cleanup sequence includes all required components
-    expect($commandsString)->toContain('docker stop coolify-proxy 2>/dev/null || true')
-        ->and($commandsString)->toContain('docker rm -f coolify-proxy 2>/dev/null || true')
-        ->and($commandsString)->toContain('for i in {1..10}; do')
-        ->and($commandsString)->toContain('if ! docker ps -a --format "{{.Names}}" | grep -q "^coolify-proxy$"; then')
-        ->and($commandsString)->toContain('break')
-        ->and($commandsString)->toContain('sleep 1')
-        ->and($commandsString)->toContain('docker compose up -d --wait --remove-orphans');
-
-    // Verify the order: cleanup must come before compose up
-    $stopPosition = strpos($commandsString, 'docker stop coolify-proxy');
-    $waitLoopPosition = strpos($commandsString, 'for i in {1..10}');
-    $composeUpPosition = strpos($commandsString, 'docker compose up -d');
-
-    expect($stopPosition)->toBeLessThan($waitLoopPosition)
-        ->and($waitLoopPosition)->toBeLessThan($composeUpPosition);
+    expect(ProxyMutationQueue::isMarked($job))->toBeTrue()
+        ->and($job->connection)->toBe(ProxyMutationQueue::CONNECTION)
+        ->and($job->queue)->toBe(ProxyMutationQueue::NAME);
 });
 
-it('includes error suppression in container cleanup commands', function () {
-    // Test that cleanup commands suppress errors to prevent failures
-    // when the container doesn't exist
+it('executes admitted proxy start jobs synchronously inside their queue worker', function () {
+    $server = Mockery::mock(Server::class);
+    $action = new class extends StartProxy
+    {
+        /** @var array{async: bool, force: bool, restarting: bool}|null */
+        public ?array $received = null;
 
-    $cleanupCommands = [
-        '    docker stop coolify-proxy 2>/dev/null || true',
-        '    docker rm -f coolify-proxy 2>/dev/null || true',
-    ];
+        public function handle(Server $server, bool $async = true, bool $force = false, bool $restarting = false): string
+        {
+            $this->received = compact('async', 'force', 'restarting');
 
-    foreach ($cleanupCommands as $command) {
-        expect($command)->toContain('2>/dev/null || true');
-    }
+            return 'OK';
+        }
+    };
+
+    expect($action->asJob($server, async: true, force: true, restarting: true))->toBe('OK')
+        ->and($action->received)->toBe([
+            'async' => false,
+            'force' => true,
+            'restarting' => true,
+        ]);
 });
 
-it('waits up to 10 seconds for container removal', function () {
-    // Verify the wait loop has correct bounds
+it('rejects a queued proxy start retargeted outside the canonical lane', function () {
+    $job = StartProxy::makeJob(Mockery::mock(Server::class));
+    $job->onQueue('high');
 
-    $waitLoop = [
-        '    for i in {1..10}; do',
-        '        if ! docker ps -a --format "{{.Names}}" | grep -q "^coolify-proxy$"; then',
-        '            break',
-        '        fi',
-        '        echo "Waiting for coolify-proxy to be removed... ($i/10)"',
-        '        sleep 1',
-        '    done',
-    ];
-
-    $loopString = implode("\n", $waitLoop);
-
-    // Verify loop iterates 10 times
-    expect($loopString)->toContain('{1..10}')
-        ->and($loopString)->toContain('sleep 1')
-        ->and($loopString)->toContain('break'); // Early exit when container is gone
+    expect(fn () => ProxyMutationQueue::assertUntamperedDispatchTarget($job))
+        ->toThrow(LogicException::class, 'cannot target queue');
 });

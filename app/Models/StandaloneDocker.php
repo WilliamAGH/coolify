@@ -28,7 +28,7 @@ class StandaloneDocker extends BaseModel
             instant_remote_process([
                 "docker network inspect {$safeNetwork} >/dev/null 2>&1 || docker network create --driver overlay --attachable {$safeNetwork} >/dev/null",
             ], $server, false);
-            ConnectProxyToNetworksJob::dispatchSync($server);
+            ConnectProxyToNetworksJob::dispatch($server);
         });
     }
 

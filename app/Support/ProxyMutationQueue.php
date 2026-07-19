@@ -11,6 +11,7 @@ use Illuminate\Queue\Queue;
 use Illuminate\Queue\QueueManager;
 use JsonException;
 use LogicException;
+use Lorisleiva\Actions\Decorators\JobDecorator;
 use RuntimeException;
 
 final class ProxyMutationQueue
@@ -40,7 +41,12 @@ final class ProxyMutationQueue
 
     public static function isMarked(mixed $transport): bool
     {
-        return $transport instanceof ProxyMutation;
+        if ($transport instanceof ProxyMutation) {
+            return true;
+        }
+
+        return $transport instanceof JobDecorator
+            && $transport->getAction() instanceof ProxyMutation;
     }
 
     public static function assertMarkedTransport(object $transport): void
@@ -406,8 +412,11 @@ LUA;
     {
         self::assertMarkedTransport($transport);
         self::assertMarkedPayload($state, $payload);
+        $displayName = $transport instanceof JobDecorator
+            ? $transport->getAction()::class
+            : $transport::class;
 
-        if (($payload['displayName'] ?? null) !== $transport::class) {
+        if (($payload['displayName'] ?? null) !== $displayName) {
             throw new LogicException("The {$state} proxy-mutation payload does not match its transport.");
         }
     }

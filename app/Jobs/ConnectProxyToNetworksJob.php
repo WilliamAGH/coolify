@@ -2,7 +2,10 @@
 
 namespace App\Jobs;
 
+use App\Contracts\ProxyMutation;
 use App\Models\Server;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeEncrypted;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -18,9 +21,10 @@ use Laravel\Horizon\Contracts\Silenced;
  * This job is dispatched from PushServerUpdateJob when the proxy is found running
  * to ensure it's connected to all required networks without blocking the status update.
  */
-class ConnectProxyToNetworksJob implements ShouldBeEncrypted, ShouldQueue, Silenced
+class ConnectProxyToNetworksJob implements ProxyMutation, ShouldBeEncrypted, ShouldQueue, Silenced
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    use UsesProxyMutationQueue;
 
     public $tries = 1;
 
@@ -36,7 +40,10 @@ class ConnectProxyToNetworksJob implements ShouldBeEncrypted, ShouldQueue, Silen
         ];
     }
 
-    public function __construct(public Server $server) {}
+    public function __construct(public Server $server)
+    {
+        ProxyMutationQueue::assign($this);
+    }
 
     public function handle()
     {

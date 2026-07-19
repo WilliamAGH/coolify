@@ -1518,11 +1518,7 @@ $schema://$host {
             $this->proxy->set('last_applied_settings', null);
             $this->save();
             if ($this->proxySet()) {
-                if ($async) {
-                    StartProxy::dispatch($this);
-                } else {
-                    StartProxy::run($this);
-                }
+                StartProxy::dispatch($this);
             }
         } else {
             throw new \Exception('Invalid proxy type.');

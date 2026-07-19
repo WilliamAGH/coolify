@@ -145,6 +145,9 @@ it('rate-limits ConnectProxyToNetworksJob dispatch to every 10 minutes', functio
     $job->handle();
 
     Queue::assertPushed(ConnectProxyToNetworksJob::class, 1);
+    Queue::assertPushed(ConnectProxyToNetworksJob::class, function (ConnectProxyToNetworksJob $job): bool {
+        return $job->connection === 'redis' && $job->queue === 'proxy-mutations';
+    });
 
     // Second push: should NOT dispatch ConnectProxyToNetworksJob (rate-limited)
     Queue::fake();
