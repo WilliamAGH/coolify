@@ -15,6 +15,7 @@ use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentState;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyExposure;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyRouteProof;
 use App\Actions\Proxy\ControlPlane\ControlPlaneRestoredRoutesProof;
+use App\Actions\Proxy\ControlPlane\ManagedTraefikDocumentMutation;
 use App\Actions\Proxy\ControlPlane\ManagedTraefikDocumentWriter;
 use App\Actions\Proxy\ControlPlane\ResumeControlPlaneGenerationPromotion;
 use App\Actions\Proxy\ControlPlane\RollbackControlPlaneGenerationPromotion;
@@ -385,6 +386,45 @@ function resumeControlPlaneGenerationAction(
     );
 }
 
+function resumeControlPlaneGenerationRollbackWriterCommand(
+    Server $server,
+    ControlPlaneProxyEnrollmentState $enrollment,
+    ControlPlaneGenerationPromotionState $state,
+    string $successorYaml,
+): string {
+    $proxyPath = rtrim((string) $server->proxyPath(), '/');
+    $mutation = new ManagedTraefikDocumentMutation(
+        dynamicDirectory: $proxyPath.'/dynamic',
+        stateDirectory: $proxyPath.'/.control-plane-managed-traefik',
+        filename: $state->managedFilename,
+        operationId: $state->operationId,
+        revision: $state->successor['dynamic_revision'],
+        expectedSha256: $state->predecessor['dynamic_sha256'],
+        expectedOperationId: $state->predecessor['operation_id'],
+        expectedRevision: $state->predecessor['dynamic_revision'],
+        replacementBytes: $successorYaml,
+        expectedWriterOperationId: $state->predecessorWriterOperationId,
+    );
+    $authority = new ControlPlaneGenerationWriterAuthority;
+    if ($state->legacyWriterAuthorityReconciliationRequired) {
+        return (new ManagedTraefikDocumentWriter)->reconcileRolledBackWriterAuthorityCommandFor(
+            mutation: $mutation,
+            predecessorAuthority: $authority->predecessor($state),
+            rolledBackAuthority: $authority->rolledBack($state),
+        );
+    }
+
+    return (new ManagedTraefikDocumentWriter)->rollbackCommandForRequiringPredecessorAuthority(
+        mutation: $mutation,
+        predecessorAuthority: $authority->predecessor($state),
+        rolledBackAuthority: $authority->rolledBack($state),
+        allowInitialOrPreWriteReconciliation: $state->dynamicWritten === null
+            && ($state->legacyWriterAuthorityReconciliationRequired
+                || $state->matchesEnrolledWriterPredecessor($enrollment)),
+        allowMissingArtifactNoop: $state->dynamicWritten === null,
+    );
+}
+
 function resumeControlPlaneGenerationDrainTranscript(
     ControlPlaneGenerationPromotionState $state,
     string $timestamp,
@@ -428,18 +468,35 @@ function resumeControlPlaneGenerationRemote(array $outputs, array &$commands, ar
     };
 }
 
+/**
+ * @param  array<string, string|Throwable>  $outputsByCommand
+ * @param  list<string>  $commands
+ * @param  list<int>  $timeouts
+ * @return Closure(string, int): ?string
+ */
+function resumeControlPlaneGenerationCommandAwareRemote(array $outputsByCommand, array &$commands, array &$timeouts): Closure
+{
+    return static function (string $command, int $timeout) use ($outputsByCommand, &$commands, &$timeouts): ?string {
+        $commands[] = $command;
+        $timeouts[] = $timeout;
+        if (! array_key_exists($command, $outputsByCommand)) {
+            throw new RuntimeException("Unexpected control-plane generation remote command: {$command}");
+        }
+
+        $output = $outputsByCommand[$command];
+        if ($output instanceof Throwable) {
+            throw $output;
+        }
+
+        return $output;
+    };
+}
+
 function resumeControlPlaneGenerationRollbackTranscript(
     ControlPlaneProxyEnrollmentState $enrollment,
     ControlPlaneGenerationPromotionState $state,
 ): string {
-    $proof = new ControlPlaneRestoredRoutesProof(
-        canonicalHost: $enrollment->canonicalHost,
-        publicScheme: $enrollment->publicScheme,
-        appPort: $enrollment->appPort,
-        expectedBackendMember: $state->predecessor['member'],
-        expectedBackendRevision: $state->predecessor['release_revision'],
-        expectedDynamicPredecessorSha256: $state->predecessor['dynamic_sha256'],
-    );
+    $proof = resumeControlPlaneGenerationRollbackProof($enrollment, $state);
     $headers = [];
     foreach ($proof->expectedResponseHeaders() as $header => $value) {
         $headers[] = "{$header}: {$value}";
@@ -460,6 +517,20 @@ function resumeControlPlaneGenerationRollbackTranscript(
     }
 
     return implode("\n", [...$records, ControlPlaneRestoredRoutesProof::TRANSCRIPT_CONVERGED.' 2']);
+}
+
+function resumeControlPlaneGenerationRollbackProof(
+    ControlPlaneProxyEnrollmentState $enrollment,
+    ControlPlaneGenerationPromotionState $state,
+): ControlPlaneRestoredRoutesProof {
+    return new ControlPlaneRestoredRoutesProof(
+        canonicalHost: $enrollment->canonicalHost,
+        publicScheme: $enrollment->publicScheme,
+        appPort: $enrollment->appPort,
+        expectedBackendMember: $state->predecessor['member'],
+        expectedBackendRevision: $state->predecessor['release_revision'],
+        expectedDynamicPredecessorSha256: $state->predecessor['dynamic_sha256'],
+    );
 }
 
 function resumeControlPlaneGenerationRouteTranscript(
@@ -499,12 +570,13 @@ function resumeControlPlaneGenerationRouteTranscript(
     return implode("\n", [...$records, '__COOLIFY_ROUTE_PROOF_CONVERGED__ 2']);
 }
 
-function resumeControlPlaneGenerationFenceReleasing(array $fixture): ControlPlaneGenerationPromotionState
+function resumeControlPlaneGenerationRetiring(array $fixture): ControlPlaneGenerationPromotionState
 {
     $state = $fixture['promotion'];
     $store = $fixture['promotion_store'];
     $token = $fixture['token'];
-    $state = $store->transition(
+
+    return $store->transition(
         $fixture['server'],
         $state->operationId,
         $token,
@@ -535,6 +607,13 @@ function resumeControlPlaneGenerationFenceReleasing(array $fixture): ControlPlan
             ],
         ],
     );
+}
+
+function resumeControlPlaneGenerationFenceReleasing(array $fixture): ControlPlaneGenerationPromotionState
+{
+    $state = resumeControlPlaneGenerationRetiring($fixture);
+    $store = $fixture['promotion_store'];
+    $token = $fixture['token'];
     $state = $store->transition(
         $fixture['server'],
         $state->operationId,
@@ -619,11 +698,18 @@ it('completes exactly two full-map proofs, drains each predecessor, hands off th
     }
 });
 
-it('rejects forward work before draining and delegates explicit pre-retirement rollback', function (): void {
+it('rejects forward work before draining and delegates exact pre-retirement rollback', function (): void {
     $fixture = resumeControlPlaneGenerationFixture(draining: false);
     [, $cleanup] = resumeControlPlaneGenerationIsolatedQueue($fixture['server']);
     $commands = [];
     $timeouts = [];
+    $writerCommand = resumeControlPlaneGenerationRollbackWriterCommand(
+        $fixture['server'],
+        $fixture['enrollment'],
+        $fixture['promotion'],
+        $fixture['successor_yaml'],
+    );
+    $proof = resumeControlPlaneGenerationRollbackProof($fixture['enrollment'], $fixture['promotion']);
 
     try {
         expect(fn (): ControlPlaneGenerationPromotionState => resumeControlPlaneGenerationAction($fixture)->handle(
@@ -639,17 +725,69 @@ it('rejects forward work before draining and delegates explicit pre-retirement r
             $fixture['server'],
             $fixture['promotion']->operationId,
             $fixture['token'],
-            remoteExecutor: resumeControlPlaneGenerationRemote([
-                resumeControlPlaneGenerationRollbackTranscript($fixture['enrollment'], $fixture['promotion']),
+            successorYaml: $fixture['successor_yaml'],
+            remoteExecutor: resumeControlPlaneGenerationCommandAwareRemote([
+                $writerCommand => ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT,
+                $proof->shellCommand() => resumeControlPlaneGenerationRollbackTranscript($fixture['enrollment'], $fixture['promotion']),
             ], $commands, $timeouts),
             rollback: true,
         );
 
         expect($rolledBack->phase)->toBe(ControlPlaneGenerationPromotionPhase::RolledBack)
-            ->and($commands)->toHaveCount(1)
-            ->and($timeouts)->toBe([121]);
+            ->and($commands)->toBe([$writerCommand, $proof->shellCommand()])
+            ->and($timeouts)->toBe([121, 121]);
     } finally {
         $cleanup($fixture['promotion']->operationId);
+    }
+});
+
+it('forces an active legacy v1 promotion through fenced rollback before any forward resume', function (): void {
+    $fixture = resumeControlPlaneGenerationFixture(draining: false);
+    [, $cleanup] = resumeControlPlaneGenerationIsolatedQueue($fixture['server']);
+    $legacyPayload = $fixture['promotion']->toArray();
+    $legacyPayload['version'] = 1;
+    unset(
+        $legacyPayload['rollback_writer_authority'],
+        $legacyPayload['legacy_writer_authority_reconciliation_required'],
+        $legacyPayload['writer']['predecessor_operation_id'],
+    );
+    $freshServer = $fixture['server']->fresh();
+    $freshServer->proxy->set(StoreControlPlaneGenerationPromotionState::STATE_KEY, $legacyPayload);
+    $freshServer->save();
+    $legacyState = $fixture['promotion_store']->read($fixture['server']);
+    $writerCommand = resumeControlPlaneGenerationRollbackWriterCommand(
+        $fixture['server'],
+        $fixture['enrollment'],
+        $legacyState,
+        $fixture['successor_yaml'],
+    );
+    $proof = resumeControlPlaneGenerationRollbackProof($fixture['enrollment'], $legacyState);
+    $commands = [];
+    $timeouts = [];
+
+    try {
+        $rolledBack = resumeControlPlaneGenerationAction($fixture)->handle(
+            $fixture['server'],
+            $legacyState->operationId,
+            $fixture['token'],
+            remoteExecutor: resumeControlPlaneGenerationCommandAwareRemote([
+                $writerCommand => ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT,
+                $proof->shellCommand() => resumeControlPlaneGenerationRollbackTranscript($fixture['enrollment'], $legacyState),
+            ], $commands, $timeouts),
+        );
+
+        expect($legacyState->legacyWriterAuthorityReconciliationRequired)->toBeTrue()
+            ->and($rolledBack->phase)->toBe(ControlPlaneGenerationPromotionPhase::RolledBack)
+            ->and($rolledBack->legacyWriterAuthorityReconciliationRequired)->toBeFalse()
+            ->and($rolledBack->rollbackWriterAuthority)->toBe([
+                'operation_id' => $legacyState->operationId,
+                'epoch' => $legacyState->writerEpoch,
+                'fenced' => true,
+            ])
+            ->and($commands)->toBe([$writerCommand, $proof->shellCommand()])
+            ->and($timeouts)->toBe([121, 121]);
+    } finally {
+        $cleanup($legacyState->operationId);
     }
 });
 
@@ -850,6 +988,73 @@ it('keeps predecessors running when successor route reattestation drifts before 
     }
 });
 
+it('replays retiring after the drain deadline for already-stopped predecessors and records retirement', function (): void {
+    $fixture = resumeControlPlaneGenerationFixture(deadline: '2026-07-19T12:10:03Z');
+    $retiring = resumeControlPlaneGenerationRetiring($fixture);
+    [$queue, $cleanup] = resumeControlPlaneGenerationIsolatedQueue($fixture['server']);
+    $commands = [];
+    $timeouts = [];
+    $routeProof = new ControlPlaneProxyRouteProof(
+        canonicalHost: $fixture['enrollment']->canonicalHost,
+        publicScheme: $fixture['enrollment']->publicScheme,
+        appPort: $fixture['enrollment']->appPort,
+        expectedColor: $retiring->successor['member'],
+        expectedGeneration: $retiring->successor['release_revision'],
+        expectedBackendMember: $retiring->successor['member'],
+        expectedBackendRevision: $retiring->successor['release_revision'],
+        dynamicReplacementSha256: $retiring->successor['dynamic_sha256'],
+        configurationAcknowledgement: $retiring->successor['configuration_acknowledgement'],
+    );
+    $deadlineEpoch = (new DateTimeImmutable($retiring->draining['deadline_at']))->getTimestamp();
+    $drain = new ControlPlaneGenerationDrain;
+    $stopCommands = [];
+    foreach ($retiring->runtime->predecessorRuntime as $containerName => $identity) {
+        $stopCommands[] = $drain->commandFor(
+            predecessorDockerId: $identity['container_id'],
+            containerName: $containerName,
+            backendPort: $fixture['enrollment']->appPort,
+            drainDeadlineEpoch: $deadlineEpoch,
+            stopTimeoutSeconds: 1,
+            allowExpiredRecovery: true,
+        );
+    }
+
+    try {
+        ProxyMutationQueue::freeze($retiring->operationId, $queue);
+        $completed = resumeControlPlaneGenerationAction(
+            $fixture,
+            clock: static fn (): DateTimeImmutable => new DateTimeImmutable('2026-07-19T12:10:04Z'),
+        )->handle(
+            $fixture['server'],
+            $retiring->operationId,
+            $fixture['token'],
+            remoteExecutor: static function (string $command, int $timeout) use ($fixture, $retiring, $routeProof, $stopCommands, &$commands, &$timeouts): string {
+                $commands[] = $command;
+                $timeouts[] = $timeout;
+
+                return match (true) {
+                    $command === $routeProof->shellCommand() => resumeControlPlaneGenerationRouteTranscript($fixture['enrollment'], $retiring),
+                    in_array($command, $stopCommands, true) => ControlPlaneGenerationDrain::COMPLETION_MARKER."\n",
+                    str_contains($command, "completion_marker='".ControlPlaneGenerationWriterHandoff::COMPLETION_MARKER."'") => ControlPlaneGenerationWriterHandoff::COMPLETION_MARKER."\n",
+                    str_contains($command, "promoted_output='".ManagedTraefikDocumentWriter::WRITER_AUTHORITY_PROMOTED_OUTPUT."'") => ManagedTraefikDocumentWriter::WRITER_AUTHORITY_PROMOTED_OUTPUT,
+                    default => throw new RuntimeException("Unexpected post-deadline retirement command: {$command}"),
+                };
+            },
+        );
+
+        expect($completed->phase)->toBe(ControlPlaneGenerationPromotionPhase::Completed)
+            ->and($completed->retiredAt)->toBe('2026-07-19T12:10:04+00:00')
+            ->and($commands)->toHaveCount(9)
+            ->and(array_values(array_intersect($commands, $stopCommands)))->toBe($stopCommands)
+            ->and(ProxyMutationQueue::snapshot($queue)->freezeOperationId)->toBeNull();
+        foreach ($timeouts as $timeout) {
+            expect($timeout)->toBe(121);
+        }
+    } finally {
+        $cleanup($retiring->operationId);
+    }
+});
+
 it('does not persist drain completion when the queue changes during the second proof', function (): void {
     $fixture = resumeControlPlaneGenerationFixture();
     [$queue, $cleanup] = resumeControlPlaneGenerationIsolatedQueue($fixture['server']);
@@ -883,6 +1088,56 @@ it('does not persist drain completion when the queue changes during the second p
         expect($proofCalls)->toBe(2)
             ->and($fixture['promotion_store']->read($fixture['server'])?->phase)
             ->toBe(ControlPlaneGenerationPromotionPhase::Draining);
+    } finally {
+        $cleanup($fixture['promotion']->operationId);
+    }
+});
+
+it('rolls back the exact successor document after a pre-retirement resume failure and rethrows the original error', function (): void {
+    $fixture = resumeControlPlaneGenerationFixture();
+    [$queue, $cleanup] = resumeControlPlaneGenerationIsolatedQueue($fixture['server']);
+    $commands = [];
+    $timeouts = [];
+    $drainProofCommand = (new GenerationDrainProof)->commandFor(
+        state: $fixture['promotion'],
+        backendPort: $fixture['enrollment']->appPort,
+        freezeOperationId: $fixture['promotion']->operationId,
+    );
+    $writerCommand = resumeControlPlaneGenerationRollbackWriterCommand(
+        $fixture['server'],
+        $fixture['enrollment'],
+        $fixture['promotion'],
+        $fixture['successor_yaml'],
+    );
+    $rollbackProof = resumeControlPlaneGenerationRollbackProof($fixture['enrollment'], $fixture['promotion']);
+    $remote = resumeControlPlaneGenerationCommandAwareRemote([
+        $drainProofCommand => new RuntimeException('forward drain proof interrupted'),
+        $writerCommand => ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT,
+        $rollbackProof->shellCommand() => resumeControlPlaneGenerationRollbackTranscript($fixture['enrollment'], $fixture['promotion']),
+    ], $commands, $timeouts);
+
+    try {
+        ProxyMutationQueue::freeze($fixture['promotion']->operationId, $queue);
+
+        expect(fn (): ControlPlaneGenerationPromotionState => resumeControlPlaneGenerationAction(
+            $fixture,
+            clock: static fn (): DateTimeImmutable => new DateTimeImmutable('2026-07-19T12:10:03Z'),
+        )->handle(
+            $fixture['server'],
+            $fixture['promotion']->operationId,
+            $fixture['token'],
+            successorYaml: $fixture['successor_yaml'],
+            remoteExecutor: $remote,
+        ))->toThrow(RuntimeException::class, 'forward drain proof interrupted');
+
+        $rolledBack = $fixture['promotion_store']->read($fixture['server']);
+        expect($rolledBack?->phase)->toBe(ControlPlaneGenerationPromotionPhase::RolledBack)
+            ->and($rolledBack?->rollbackStartedAt)->not->toBeNull()
+            ->and($rolledBack?->rollbackAcknowledgedAt)->not->toBeNull()
+            ->and($rolledBack?->rolledBackAt)->not->toBeNull()
+            ->and($commands)->toBe([$drainProofCommand, $writerCommand, $rollbackProof->shellCommand()])
+            ->and($timeouts)->toBe([597, 121, 121])
+            ->and(ProxyMutationQueue::snapshot($queue)->freezeOperationId)->toBeNull();
     } finally {
         $cleanup($fixture['promotion']->operationId);
     }
@@ -957,7 +1212,7 @@ it('replays a durable writer marker after a crash before writer-promotion eviden
         ProxyMutationQueue::freeze($fixture['promotion']->operationId, $queue);
         $clock = static function () use (&$clockCalls): DateTimeImmutable {
             $clockCalls++;
-            if ($clockCalls === 9) {
+            if ($clockCalls === 6) {
                 throw new RuntimeException('crash after writer marker');
             }
 

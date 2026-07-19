@@ -53,6 +53,9 @@ final class SwitchControlPlaneGenerationRoutes
     ): ControlPlaneGenerationPromotionState {
         $state = $this->ownedState($server, $operationId, $token);
         $this->assertSuccessorYaml($state, $successorYaml);
+        if ($state->legacyWriterAuthorityReconciliationRequired) {
+            throw new RuntimeException('Legacy control-plane writer authority must be reconciled through rollback before route switching.');
+        }
         if ($state->phase === ControlPlaneGenerationPromotionPhase::Draining) {
             return $state;
         }
@@ -175,8 +178,7 @@ final class SwitchControlPlaneGenerationRoutes
         ControlPlaneGenerationPromotionState $state,
         ControlPlaneProxyEnrollmentState $enrollment,
     ): bool {
-        return $state->writerEpoch === 2
-            && $state->matchesEnrolledPredecessor($enrollment);
+        return $state->matchesEnrolledWriterPredecessor($enrollment);
     }
 
     private function assertOwnedFrozenEmpty(
@@ -223,6 +225,7 @@ final class SwitchControlPlaneGenerationRoutes
             expectedOperationId: $state->predecessor['operation_id'],
             expectedRevision: $state->predecessor['dynamic_revision'],
             replacementBytes: $successorYaml,
+            expectedWriterOperationId: $state->predecessorWriterOperationId,
         );
     }
 

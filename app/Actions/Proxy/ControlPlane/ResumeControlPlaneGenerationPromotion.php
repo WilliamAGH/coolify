@@ -78,6 +78,15 @@ final class ResumeControlPlaneGenerationPromotion
         bool $rollback = false,
     ): ControlPlaneGenerationPromotionState {
         $state = $this->ownedState($server, $operationId, $token);
+        if ($state->legacyWriterAuthorityReconciliationRequired && ! $state->hasRetirementStarted()) {
+            return $this->rollback->handle(
+                server: $server,
+                operationId: $operationId,
+                token: $token,
+                successorYaml: $successorYaml,
+                remoteExecutor: $this->rollbackExecutor($remoteExecutor),
+            );
+        }
         if (in_array($state->phase, [
             ControlPlaneGenerationPromotionPhase::Completed,
             ControlPlaneGenerationPromotionPhase::RolledBack,
@@ -272,7 +281,7 @@ final class ResumeControlPlaneGenerationPromotion
     ): ControlPlaneGenerationPromotionState {
         $this->assertOwnedFrozenEmpty($state);
         $proof = $this->successorRouteProof($enrollment, $state);
-        $transcript = $execute($proof->shellCommand(), $this->drainRemoteTimeout($state));
+        $transcript = $execute($proof->shellCommand(), $this->steadyRemoteTimeout());
         if (! is_string($transcript)) {
             throw new RuntimeException('The control-plane successor route reattestation returned no transcript.');
         }
@@ -281,12 +290,9 @@ final class ResumeControlPlaneGenerationPromotion
 
         foreach ($state->runtime->predecessorRuntime as $containerName => $identity) {
             $this->assertOwnedFrozenEmpty($state);
-            $timeout = $this->drainRemoteTimeout($state);
+            $timeout = $this->steadyRemoteTimeout();
             $remainingSeconds = $this->remainingDrainSeconds($state);
-            $stopTimeout = min(self::MAXIMUM_STOP_TIMEOUT_SECONDS, $remainingSeconds);
-            if ($stopTimeout < 1) {
-                throw new RuntimeException('The immutable control-plane generation drain deadline has elapsed.');
-            }
+            $stopTimeout = max(1, min(self::MAXIMUM_STOP_TIMEOUT_SECONDS, $remainingSeconds));
 
             $output = $execute(
                 $this->drain->commandFor(
@@ -295,6 +301,7 @@ final class ResumeControlPlaneGenerationPromotion
                     backendPort: $enrollment->appPort,
                     drainDeadlineEpoch: $this->drainDeadline($state)->getTimestamp(),
                     stopTimeoutSeconds: $stopTimeout,
+                    allowExpiredRecovery: $remainingSeconds <= 0,
                 ),
                 $timeout,
             );
@@ -349,7 +356,10 @@ final class ResumeControlPlaneGenerationPromotion
             expectedPhase: ControlPlaneGenerationPromotionPhase::WriterPromoting,
             nextPhase: ControlPlaneGenerationPromotionPhase::FenceReleasing,
             timestamp: $promotedAt,
-            updates: ['writer_promoted_at' => $promotedAt],
+            updates: [
+                'writer_promoted_at' => $promotedAt,
+                'legacy_writer_authority_reconciliation_required' => false,
+            ],
         );
     }
 

@@ -5,14 +5,19 @@ use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
 use App\Actions\Proxy\ControlPlane\ControlPlaneGenerationPromotionPhase;
 use App\Actions\Proxy\ControlPlane\ControlPlaneGenerationPromotionState;
 use App\Actions\Proxy\ControlPlane\ControlPlaneGenerationRuntime;
+use App\Actions\Proxy\ControlPlane\ControlPlaneGenerationWriterAuthority;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentPhase;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentState;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyExposure;
+use App\Actions\Proxy\ControlPlane\ControlPlaneRestoredRoutesProof;
 use App\Actions\Proxy\ControlPlane\ExtractControlPlaneDynamicFragments;
+use App\Actions\Proxy\ControlPlane\ManagedTraefikDocumentMutation;
+use App\Actions\Proxy\ControlPlane\ManagedTraefikDocumentWriter;
 use App\Actions\Proxy\ControlPlane\PrepareControlPlaneGenerationPromotion;
 use App\Actions\Proxy\ControlPlane\PreparedControlPlaneGenerationPromotion;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneGenerationPromotionState;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
+use App\Actions\Proxy\ControlPlane\VerifyControlPlaneRestoredRoutes;
 use App\Models\Server;
 use App\Models\Team;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -101,6 +106,9 @@ function prepareGenerationPromotionAction(): PrepareControlPlaneGenerationPromot
         new ExtractControlPlaneDynamicFragments,
         new StoreControlPlaneProxyEnrollmentState,
         new StoreControlPlaneGenerationPromotionState,
+        new ManagedTraefikDocumentWriter,
+        new ControlPlaneGenerationWriterAuthority,
+        new VerifyControlPlaneRestoredRoutes,
     );
 }
 
@@ -146,6 +154,7 @@ function prepareGenerationPromotion(
     array $successorBackendDnsNames = ['coolify-web-d', 'coolify-web-c'],
     string $writerMember = 'green',
     int $writerEpoch = 2,
+    ?Closure $remoteExecutor = null,
 ): PreparedControlPlaneGenerationPromotion {
     return prepareGenerationPromotionAction()->handle(
         server: $server,
@@ -158,7 +167,32 @@ function prepareGenerationPromotion(
         writerMember: $writerMember,
         writerEpoch: $writerEpoch,
         predecessorDynamicYaml: $predecessorDynamicYaml ?? $enrollment->dynamicReplacementBytes,
+        remoteExecutor: $remoteExecutor,
     );
+}
+
+function prepareGenerationPromotionRestoredTranscript(ControlPlaneRestoredRoutesProof $proof): string
+{
+    $headers = [];
+    foreach ($proof->expectedResponseHeaders() as $header => $value) {
+        $headers[] = "{$header}: {$value}";
+    }
+    $records = [];
+    foreach ([1, 2] as $attempt) {
+        foreach (['public', 'app-port'] as $route) {
+            $records[] = implode("\n", [
+                ControlPlaneRestoredRoutesProof::TRANSCRIPT_BEGIN." {$route} {$attempt}",
+                'HTTP/2 200',
+                ...$headers,
+                '',
+                ControlPlaneRestoredRoutesProof::TRANSCRIPT_STATUS.' 200',
+                ControlPlaneRestoredRoutesProof::TRANSCRIPT_CURL_EXIT.' 0',
+                ControlPlaneRestoredRoutesProof::TRANSCRIPT_END,
+            ]);
+        }
+    }
+
+    return implode("\n", [...$records, ControlPlaneRestoredRoutesProof::TRANSCRIPT_CONVERGED.' 2']);
 }
 
 function completedPrepareGenerationPromotionState(
@@ -370,7 +404,13 @@ it('prepares a replacement from the exact restored tuple after rollback', functi
         ->withPhase(ControlPlaneGenerationPromotionPhase::RollingBack, '2026-07-19T12:01:00Z', [
             'rollback_started_at' => '2026-07-19T12:01:00Z',
         ])
-        ->withPhase(ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement, '2026-07-19T12:02:00Z')
+        ->withPhase(ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement, '2026-07-19T12:02:00Z', [
+            'rollback_writer_authority' => [
+                'operation_id' => $first->state->operationId,
+                'epoch' => $first->state->writerEpoch,
+                'fenced' => true,
+            ],
+        ])
         ->withPhase(ControlPlaneGenerationPromotionPhase::RollbackUnfreezing, '2026-07-19T12:03:00Z', [
             'rollback_acknowledged_at' => '2026-07-19T12:03:00Z',
         ])
@@ -380,16 +420,135 @@ it('prepares a replacement from the exact restored tuple after rollback', functi
     $server->proxy->set(StoreControlPlaneGenerationPromotionState::STATE_KEY, $rolledBack->toArray());
     $server->save();
 
+    expect(fn (): PreparedControlPlaneGenerationPromotion => prepareGenerationPromotion(
+        $server,
+        $enrollment,
+        operationId: 'promotion-after-rollback-stale-epoch',
+        token: 'promotion-after-rollback-stale-epoch-token',
+        predecessorDynamicYaml: $enrollment->dynamicReplacementBytes,
+        writerEpoch: 2,
+    ))->toThrow(InvalidArgumentException::class, 'advance its rolled-back predecessor by one');
+
     $replacement = prepareGenerationPromotion(
         $server,
         $enrollment,
         operationId: 'promotion-after-rollback',
         token: 'promotion-after-rollback-token',
         predecessorDynamicYaml: $enrollment->dynamicReplacementBytes,
-        writerEpoch: 2,
+        writerEpoch: 3,
+    );
+    $replayed = prepareGenerationPromotion(
+        $server,
+        $enrollment,
+        operationId: 'promotion-after-rollback',
+        token: 'promotion-after-rollback-token',
+        predecessorDynamicYaml: $enrollment->dynamicReplacementBytes,
+        writerEpoch: 3,
     );
 
     expect($replacement->state->predecessor)->toBe($rolledBack->predecessor)
         ->and($replacement->state->successor['dynamic_revision'])->toBe(2)
-        ->and($replacement->state->writerEpoch)->toBe(2);
+        ->and($replacement->state->writerEpoch)->toBe(3)
+        ->and($replacement->state->predecessorWriterOperationId)->toBe($rolledBack->operationId)
+        ->and($replayed->state->toArray())->toBe($replacement->state->toArray())
+        ->and($replayed->successorConfiguration->yaml)->toBe($replacement->successorConfiguration->yaml);
+});
+
+it('reconciles a terminal legacy rollback without its discarded token or successor YAML before replacement', function (): void {
+    $server = prepareGenerationPromotionServer();
+    $enrollment = installPrepareGenerationPromotionEnrollment($server);
+    $first = prepareGenerationPromotion($server, $enrollment);
+    $rolledBack = $first->state
+        ->withPhase(ControlPlaneGenerationPromotionPhase::RollingBack, '2026-07-19T12:01:00Z', [
+            'rollback_started_at' => '2026-07-19T12:01:00Z',
+        ])
+        ->withPhase(ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement, '2026-07-19T12:02:00Z', [
+            'rollback_writer_authority' => [
+                'operation_id' => $first->state->operationId,
+                'epoch' => $first->state->writerEpoch,
+                'fenced' => true,
+            ],
+        ])
+        ->withPhase(ControlPlaneGenerationPromotionPhase::RollbackUnfreezing, '2026-07-19T12:03:00Z', [
+            'rollback_acknowledged_at' => '2026-07-19T12:03:00Z',
+        ])
+        ->withPhase(ControlPlaneGenerationPromotionPhase::RolledBack, '2026-07-19T12:04:00Z', [
+            'rolled_back_at' => '2026-07-19T12:04:00Z',
+        ]);
+    $legacyPayload = $rolledBack->toArray();
+    $legacyPayload['version'] = 1;
+    unset(
+        $legacyPayload['rollback_writer_authority'],
+        $legacyPayload['legacy_writer_authority_reconciliation_required'],
+        $legacyPayload['writer']['predecessor_operation_id'],
+    );
+    $server->proxy->set(StoreControlPlaneGenerationPromotionState::STATE_KEY, $legacyPayload);
+    $server->save();
+    $legacyState = (new StoreControlPlaneGenerationPromotionState)->read($server);
+    $proxyPath = rtrim((string) $server->proxyPath(), '/');
+    $mutation = new ManagedTraefikDocumentMutation(
+        dynamicDirectory: $proxyPath.'/dynamic',
+        stateDirectory: $proxyPath.'/.control-plane-managed-traefik',
+        filename: $legacyState->managedFilename,
+        operationId: $legacyState->operationId,
+        revision: $legacyState->successor['dynamic_revision'],
+        expectedSha256: $legacyState->predecessor['dynamic_sha256'],
+        expectedOperationId: $legacyState->predecessor['operation_id'],
+        expectedRevision: $legacyState->predecessor['dynamic_revision'],
+        replacementBytes: '',
+        expectedWriterOperationId: $legacyState->predecessorWriterOperationId,
+    );
+    $writerAuthority = new ControlPlaneGenerationWriterAuthority;
+    $writerCommand = (new ManagedTraefikDocumentWriter)->reconcileRolledBackWriterAuthorityCommandFor(
+        mutation: $mutation,
+        predecessorAuthority: $writerAuthority->predecessor($legacyState),
+        rolledBackAuthority: $writerAuthority->rolledBack($legacyState),
+    );
+    $proof = new ControlPlaneRestoredRoutesProof(
+        canonicalHost: $enrollment->canonicalHost,
+        publicScheme: $enrollment->publicScheme,
+        appPort: $enrollment->appPort,
+        expectedBackendMember: $legacyState->predecessor['member'],
+        expectedBackendRevision: $legacyState->predecessor['release_revision'],
+        expectedDynamicPredecessorSha256: $legacyState->predecessor['dynamic_sha256'],
+    );
+    $commands = [];
+
+    expect(fn (): PreparedControlPlaneGenerationPromotion => prepareGenerationPromotion(
+        $server,
+        $enrollment,
+        operationId: 'promotion-after-legacy-rollback',
+        token: 'replacement-token',
+        predecessorDynamicYaml: $enrollment->dynamicReplacementBytes,
+        writerEpoch: 3,
+        remoteExecutor: static fn (string $command): ?string => $command === $writerCommand
+            ? ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT
+            : null,
+    ))->toThrow(RuntimeException::class, 'restored-route proof returned no transcript');
+    expect((new StoreControlPlaneGenerationPromotionState)->read($server)?->legacyWriterAuthorityReconciliationRequired)
+        ->toBeTrue();
+
+    $replacement = prepareGenerationPromotion(
+        $server,
+        $enrollment,
+        operationId: 'promotion-after-legacy-rollback',
+        token: 'replacement-token',
+        predecessorDynamicYaml: $enrollment->dynamicReplacementBytes,
+        writerEpoch: 3,
+        remoteExecutor: function (string $command) use (&$commands, $proof, $writerCommand): string {
+            $commands[] = $command;
+
+            return match ($command) {
+                $writerCommand => ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT,
+                $proof->shellCommand() => prepareGenerationPromotionRestoredTranscript($proof),
+                default => throw new RuntimeException("Unexpected terminal legacy reconciliation command: {$command}"),
+            };
+        },
+    );
+
+    expect($legacyState->legacyWriterAuthorityReconciliationRequired)->toBeTrue()
+        ->and($replacement->state->operationId)->toBe('promotion-after-legacy-rollback')
+        ->and($replacement->state->predecessorWriterOperationId)->toBe($legacyState->operationId)
+        ->and($replacement->state->writerEpoch)->toBe(3)
+        ->and($commands)->toBe([$writerCommand, $proof->shellCommand()]);
 });

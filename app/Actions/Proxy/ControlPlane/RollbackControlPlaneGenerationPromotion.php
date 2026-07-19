@@ -30,6 +30,37 @@ final class RollbackControlPlaneGenerationPromotion
         ?Closure $remoteExecutor = null,
     ): ControlPlaneGenerationPromotionState {
         $state = $this->ownedState($server, $operationId, $token);
+        $execute = $remoteExecutor ?? static fn (string $command): ?string => instant_remote_process(
+            [$command],
+            $server,
+            timeout: 120,
+            disableMultiplexing: true,
+            retry: false,
+        );
+        if ($state->legacyWriterAuthorityReconciliationRequired
+            && in_array($state->phase, [
+                ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement,
+                ControlPlaneGenerationPromotionPhase::RollbackUnfreezing,
+                ControlPlaneGenerationPromotionPhase::RolledBack,
+            ], true)) {
+            $mutation = $this->legacyReconciliationMutation($server, $state);
+            $this->assertExactOutput(
+                $execute($this->dynamicWriter->reconcileRolledBackWriterAuthorityCommandFor(
+                    mutation: $mutation,
+                    predecessorAuthority: $this->writerAuthority->predecessor($state),
+                    rolledBackAuthority: $this->writerAuthority->rolledBack($state),
+                )),
+                ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT,
+                'legacy dynamic Traefik document rollback reconciliation',
+            );
+            $this->proveRestoredRoutes($server, $state, $execute);
+            $state = $this->promotionStore->reconcileLegacyRollbackWriterAuthority(
+                $server,
+                $operationId,
+                $token,
+                now()->toIso8601String(),
+            );
+        }
         if ($state->phase === ControlPlaneGenerationPromotionPhase::RolledBack) {
             return $state;
         }
@@ -45,8 +76,8 @@ final class RollbackControlPlaneGenerationPromotion
             throw new RuntimeException('A control-plane generation cannot be rolled back after predecessor retirement has started.');
         }
 
-        $mustRestoreDynamicDocument = $this->mustRestoreDynamicDocument($state, $successorYaml);
-        if ($mustRestoreDynamicDocument) {
+        $mustRestoreDynamicDocument = $this->mustRestoreDynamicDocument($state);
+        if ($mustRestoreDynamicDocument && ! $state->legacyWriterAuthorityReconciliationRequired) {
             $this->assertSuccessorYaml($state, $successorYaml);
         }
 
@@ -67,26 +98,29 @@ final class RollbackControlPlaneGenerationPromotion
             );
         }
 
-        $execute = $remoteExecutor ?? static fn (string $command): ?string => instant_remote_process(
-            [$command],
-            $server,
-            timeout: 120,
-            disableMultiplexing: true,
-            retry: false,
-        );
-
         if ($state->phase === ControlPlaneGenerationPromotionPhase::RollingBack) {
             if ($mustRestoreDynamicDocument) {
                 $this->assertRecordedFreeze($state, ProxyMutationQueue::snapshot());
-                $mutation = $this->dynamicMutation($server, $state, $successorYaml);
-                $this->assertExactOutput(
-                    $execute($this->dynamicWriter->rollbackCommandForRequiringPredecessorAuthority(
+                if ($state->legacyWriterAuthorityReconciliationRequired) {
+                    $mutation = $this->legacyReconciliationMutation($server, $state);
+                    $command = $this->dynamicWriter->reconcileRolledBackWriterAuthorityCommandFor(
                         mutation: $mutation,
                         predecessorAuthority: $this->writerAuthority->predecessor($state),
+                        rolledBackAuthority: $this->writerAuthority->rolledBack($state),
+                    );
+                } else {
+                    $mutation = $this->dynamicMutation($server, $state, $successorYaml);
+                    $command = $this->dynamicWriter->rollbackCommandForRequiringPredecessorAuthority(
+                        mutation: $mutation,
+                        predecessorAuthority: $this->writerAuthority->predecessor($state),
+                        rolledBackAuthority: $this->writerAuthority->rolledBack($state),
                         allowInitialOrPreWriteReconciliation: $state->dynamicWritten === null
                             && $this->isInitialGeneration($server, $state),
                         allowMissingArtifactNoop: $state->dynamicWritten === null,
-                    )),
+                    );
+                }
+                $this->assertExactOutput(
+                    $execute($command),
                     ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT,
                     'dynamic Traefik document rollback',
                 );
@@ -101,6 +135,11 @@ final class RollbackControlPlaneGenerationPromotion
                 ControlPlaneGenerationPromotionPhase::RollingBack,
                 ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement,
                 now()->toIso8601String(),
+                ['rollback_writer_authority' => [
+                    'operation_id' => $state->operationId,
+                    'epoch' => $state->writerEpoch,
+                    'fenced' => true,
+                ], 'legacy_writer_authority_reconciliation_required' => false],
             );
         }
 
@@ -123,22 +162,8 @@ final class RollbackControlPlaneGenerationPromotion
             throw new RuntimeException("Control-plane generation rollback cannot acknowledge from {$state->phase->value}.");
         }
 
-        $enrollment = $this->enrolledRouteAnchor($server);
         $this->assertRecordedFreeze($state, ProxyMutationQueue::snapshot());
-
-        $proof = new ControlPlaneRestoredRoutesProof(
-            canonicalHost: $enrollment->canonicalHost,
-            publicScheme: $enrollment->publicScheme,
-            appPort: $enrollment->appPort,
-            expectedBackendMember: $state->predecessor['member'],
-            expectedBackendRevision: $state->predecessor['release_revision'],
-            expectedDynamicPredecessorSha256: $state->predecessor['dynamic_sha256'],
-        );
-        $transcript = $execute($proof->shellCommand());
-        if (! is_string($transcript)) {
-            throw new RuntimeException('The restored control-plane generation route proof returned no transcript.');
-        }
-        $this->restoredRoutesVerifier->handle($proof, $transcript);
+        $this->proveRestoredRoutes($server, $state, $execute);
         $this->assertRecordedFreeze($state, ProxyMutationQueue::snapshot());
 
         $acknowledgedAt = now()->toIso8601String();
@@ -152,6 +177,28 @@ final class RollbackControlPlaneGenerationPromotion
             $acknowledgedAt,
             ['rollback_acknowledged_at' => $acknowledgedAt],
         );
+    }
+
+    /** @param Closure(string): ?string $execute */
+    private function proveRestoredRoutes(
+        Server $server,
+        ControlPlaneGenerationPromotionState $state,
+        Closure $execute,
+    ): void {
+        $enrollment = $this->enrolledRouteAnchor($server);
+        $proof = new ControlPlaneRestoredRoutesProof(
+            canonicalHost: $enrollment->canonicalHost,
+            publicScheme: $enrollment->publicScheme,
+            appPort: $enrollment->appPort,
+            expectedBackendMember: $state->predecessor['member'],
+            expectedBackendRevision: $state->predecessor['release_revision'],
+            expectedDynamicPredecessorSha256: $state->predecessor['dynamic_sha256'],
+        );
+        $transcript = $execute($proof->shellCommand());
+        if (! is_string($transcript)) {
+            throw new RuntimeException('The restored control-plane generation route proof returned no transcript.');
+        }
+        $this->restoredRoutesVerifier->handle($proof, $transcript);
     }
 
     private function completeRollbackUnfreeze(
@@ -180,7 +227,6 @@ final class RollbackControlPlaneGenerationPromotion
 
     private function mustRestoreDynamicDocument(
         ControlPlaneGenerationPromotionState $state,
-        ?string $successorYaml,
     ): bool {
         if (in_array($state->phase, [
             ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement,
@@ -189,26 +235,7 @@ final class RollbackControlPlaneGenerationPromotion
             return false;
         }
 
-        if ($state->dynamicWritten !== null) {
-            return true;
-        }
-
-        if (in_array($state->phase, [
-            ControlPlaneGenerationPromotionPhase::Switching,
-            ControlPlaneGenerationPromotionPhase::AwaitingAcknowledgement,
-            ControlPlaneGenerationPromotionPhase::Draining,
-            ControlPlaneGenerationPromotionPhase::Retiring,
-            ControlPlaneGenerationPromotionPhase::WriterPromoting,
-            ControlPlaneGenerationPromotionPhase::FenceReleasing,
-            ControlPlaneGenerationPromotionPhase::Unfreezing,
-        ], true)) {
-            return true;
-        }
-
-        return in_array($state->phase, [
-            ControlPlaneGenerationPromotionPhase::RollingBack,
-            ControlPlaneGenerationPromotionPhase::InterventionRequired,
-        ], true) && $successorYaml !== null;
+        return true;
     }
 
     private function assertSuccessorYaml(ControlPlaneGenerationPromotionState $state, ?string $successorYaml): void
@@ -240,6 +267,27 @@ final class RollbackControlPlaneGenerationPromotion
             expectedOperationId: $state->predecessor['operation_id'],
             expectedRevision: $state->predecessor['dynamic_revision'],
             replacementBytes: $successorYaml,
+            expectedWriterOperationId: $state->predecessorWriterOperationId,
+        );
+    }
+
+    private function legacyReconciliationMutation(
+        Server $server,
+        ControlPlaneGenerationPromotionState $state,
+    ): ManagedTraefikDocumentMutation {
+        $proxyPath = rtrim((string) $server->proxyPath(), '/');
+
+        return new ManagedTraefikDocumentMutation(
+            dynamicDirectory: $proxyPath.'/dynamic',
+            stateDirectory: $proxyPath.'/.control-plane-managed-traefik',
+            filename: $state->managedFilename,
+            operationId: $state->operationId,
+            revision: $state->successor['dynamic_revision'],
+            expectedSha256: $state->predecessor['dynamic_sha256'],
+            expectedOperationId: $state->predecessor['operation_id'],
+            expectedRevision: $state->predecessor['dynamic_revision'],
+            replacementBytes: '',
+            expectedWriterOperationId: $state->predecessorWriterOperationId,
         );
     }
 
@@ -260,8 +308,7 @@ final class RollbackControlPlaneGenerationPromotion
     ): bool {
         $enrollment = $this->enrolledRouteAnchor($server);
 
-        return $state->writerEpoch === 2
-            && $state->matchesEnrolledPredecessor($enrollment);
+        return $state->matchesEnrolledWriterPredecessor($enrollment);
     }
 
     private function assertRecordedFreeze(
@@ -291,11 +338,14 @@ final class RollbackControlPlaneGenerationPromotion
             && ! hash_equals($state->operationId, $snapshot->freezeOperationId)) {
             throw new RuntimeException('The control-plane generation mutation freeze is owned by another operation.');
         }
+        if ($snapshot->freezeOperationId === null) {
+            return;
+        }
+        if ($state->mutationFreeze === null) {
+            throw new RuntimeException('The control-plane generation mutation freeze was never durably recorded.');
+        }
         if (! $snapshot->isEmpty()) {
             throw new RuntimeException('The control-plane generation mutation queue must be empty before rollback completion.');
-        }
-        if ($state->mutationFreeze === null || $snapshot->freezeOperationId === null) {
-            return;
         }
 
         $released = ProxyMutationQueue::unfreeze($state->operationId);

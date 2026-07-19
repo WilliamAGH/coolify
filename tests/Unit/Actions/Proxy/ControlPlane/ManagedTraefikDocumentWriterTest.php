@@ -61,6 +61,23 @@ function managedTraefikDocumentWriterAuthority(
     );
 }
 
+function managedTraefikDocumentRollbackAuthority(
+    ManagedTraefikDocumentMutation $predecessor,
+    ManagedTraefikDocumentMutation $rolledBackMutation,
+    ManagedTraefikDocumentWriterAuthority $predecessorAuthority,
+): ManagedTraefikDocumentWriterAuthority {
+    return new ManagedTraefikDocumentWriterAuthority(
+        epoch: $predecessorAuthority->epoch + 1,
+        operationId: $rolledBackMutation->operationId,
+        member: $predecessorAuthority->member,
+        containerId: $predecessorAuthority->containerId,
+        containerName: $predecessorAuthority->containerName,
+        imageId: $predecessorAuthority->imageId,
+        dynamicRevision: $predecessor->revision,
+        dynamicSha256: $predecessor->replacementSha256(),
+    );
+}
+
 it('atomically writes one managed file-provider document and replays its owner idempotently', function () {
     $filesystem = new Filesystem;
     $root = managedTraefikDocumentRoot();
@@ -441,7 +458,7 @@ it('rejects malformed authority promotion contexts, skipped epochs, and foreign 
     }
 });
 
-it('allows rollback only before promotion with the predecessor authority or explicit absent reconciliation', function () {
+it('tombstones a rolled-back generation so a captured stale forward shell command cannot resurrect it', function () {
     $filesystem = new Filesystem;
     $root = managedTraefikDocumentRoot();
 
@@ -450,59 +467,481 @@ it('allows rollback only before promotion with the predecessor authority or expl
         $first = managedTraefikDocumentMutation($root, 'control-plane-authority-first', 1, "http:\n  routers:\n    first: {}\n");
         $firstAuthority = managedTraefikDocumentWriterAuthority($first, epoch: 1, identity: 'a');
         $second = managedTraefikDocumentMutation($root, 'control-plane-authority-second', 2, "http:\n  routers:\n    second: {}\n", $first);
-        $secondAuthority = managedTraefikDocumentWriterAuthority($second, epoch: 2, identity: 'b');
+        $rolledBackAuthority = managedTraefikDocumentRollbackAuthority($first, $second, $firstAuthority);
 
         $legacyFirst = runManagedTraefikDocumentCommand($writer->writeCommandFor($first));
-        $absentPreWriteRollback = runManagedTraefikDocumentCommand(
+        $capturedForwardCommand = $writer->writeCommandForRequiringAuthority(
+            $second,
+            $firstAuthority,
+            allowBootstrap: true,
+        );
+        $forward = runManagedTraefikDocumentCommand($capturedForwardCommand);
+        $rollbackCommand = $writer->rollbackCommandForRequiringPredecessorAuthority(
+            $second,
+            $firstAuthority,
+            $rolledBackAuthority,
+        );
+        $rolledBack = runManagedTraefikDocumentCommand($rollbackCommand);
+        $replayedRollback = runManagedTraefikDocumentCommand($rollbackCommand);
+        $staleForward = runManagedTraefikDocumentCommand($capturedForwardCommand);
+
+        expect($legacyFirst->isSuccessful())->toBeTrue()
+            ->and($forward->isSuccessful())->toBeTrue()
+            ->and(trim($forward->getOutput()))->toBe(ManagedTraefikDocumentWriter::APPLIED_OUTPUT)
+            ->and($rolledBack->isSuccessful())->toBeTrue()
+            ->and(trim($rolledBack->getOutput()))->toBe(ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT)
+            ->and($replayedRollback->isSuccessful())->toBeTrue()
+            ->and($staleForward->isSuccessful())->toBeFalse()
+            ->and(file_get_contents($second->documentPath()))->toBe($first->replacementBytes)
+            ->and(file_get_contents($second->sidecarPath()))->toBe($first->replacementSidecar())
+            ->and(file_get_contents($second->writerAuthorityPath()))->toBe($rolledBackAuthority->toJson());
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('fences and reconciles an exact forward journal left before document apply', function (): void {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $first = managedTraefikDocumentMutation($root, 'control-plane-journal-first', 1, "http:\n  routers:\n    first: {}\n");
+        $firstAuthority = managedTraefikDocumentWriterAuthority($first, epoch: 1, identity: 'a');
+        $second = managedTraefikDocumentMutation($root, 'control-plane-journal-second', 2, "http:\n  routers:\n    second: {}\n", $first);
+        $rolledBackAuthority = managedTraefikDocumentRollbackAuthority($first, $second, $firstAuthority);
+
+        expect(runManagedTraefikDocumentCommand($writer->writeCommandFor($first))->isSuccessful())->toBeTrue();
+
+        $capturedForwardCommand = $writer->writeCommandForRequiringAuthority(
+            $second,
+            $firstAuthority,
+            allowBootstrap: true,
+        );
+        $crashedForward = runManagedTraefikDocumentCommand(
+            $capturedForwardCommand,
+            ['COOLIFY_MANAGED_TRAEFIK_DOCUMENT_CRASH_AFTER_JOURNAL' => '1'],
+        );
+        $documentBeforeRollback = file_get_contents($second->documentPath());
+        $authorityBeforeRollback = file_get_contents($second->writerAuthorityPath());
+        $journalBeforeRollback = file_get_contents($second->journalPath());
+        $rollbackCommand = $writer->rollbackCommandForRequiringPredecessorAuthority(
+            $second,
+            $firstAuthority,
+            $rolledBackAuthority,
+        );
+        $crashedRollback = runManagedTraefikDocumentCommand(
+            $rollbackCommand,
+            ['COOLIFY_MANAGED_TRAEFIK_DOCUMENT_CRASH_AFTER_JOURNAL' => '1'],
+        );
+        $staleForward = runManagedTraefikDocumentCommand($capturedForwardCommand);
+        $journalAfterRollbackCrash = file_get_contents($second->journalPath());
+        $documentAfterRollbackCrash = file_get_contents($second->documentPath());
+        $authorityAfterRollbackCrash = file_get_contents($second->writerAuthorityPath());
+        $rolledBack = runManagedTraefikDocumentCommand($rollbackCommand);
+
+        expect($crashedForward->isSuccessful())->toBeFalse()
+            ->and($documentBeforeRollback)->toBe($first->replacementBytes)
+            ->and($authorityBeforeRollback)->toBe($firstAuthority->toJson())
+            ->and($journalBeforeRollback)->toContain("coolify-managed-traefik-document-journal-v1\nwrite\n")
+            ->and($crashedRollback->isSuccessful())->toBeFalse()
+            ->and($journalAfterRollbackCrash)->toContain("coolify-managed-traefik-document-journal-v1\nrollback\n")
+            ->and($documentAfterRollbackCrash)->toBe($first->replacementBytes)
+            ->and($authorityAfterRollbackCrash)->toBe($rolledBackAuthority->toJson())
+            ->and($staleForward->isSuccessful())->toBeFalse()
+            ->and($rolledBack->getErrorOutput())->toBe('')
+            ->and($rolledBack->isSuccessful())->toBeTrue()
+            ->and(trim($rolledBack->getOutput()))->toBe(ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT)
+            ->and(file_exists($second->journalPath()))->toBeFalse()
+            ->and(file_get_contents($second->documentPath()))->toBe($first->replacementBytes)
+            ->and(file_get_contents($second->sidecarPath()))->toBe($first->replacementSidecar())
+            ->and(file_get_contents($second->writerAuthorityPath()))->toBe($rolledBackAuthority->toJson());
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('requires the exact successor tombstone authority for pre-write rollback reconciliation', function () {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $first = managedTraefikDocumentMutation($root, 'control-plane-authority-first', 1, "http:\n  routers:\n    first: {}\n");
+        $firstAuthority = managedTraefikDocumentWriterAuthority($first, epoch: 1, identity: 'a');
+        $second = managedTraefikDocumentMutation($root, 'control-plane-authority-second', 2, "http:\n  routers:\n    second: {}\n", $first);
+        $rolledBackAuthority = managedTraefikDocumentRollbackAuthority($first, $second, $firstAuthority);
+        $foreignTombstone = managedTraefikDocumentWriterAuthority($first, epoch: 2, identity: 'a');
+
+        $legacyFirst = runManagedTraefikDocumentCommand($writer->writeCommandFor($first));
+        $reconciled = runManagedTraefikDocumentCommand(
             $writer->rollbackCommandForRequiringPredecessorAuthority(
                 $second,
                 $firstAuthority,
+                $rolledBackAuthority,
                 allowInitialOrPreWriteReconciliation: true,
                 allowMissingArtifactNoop: true,
             ),
         );
-        $authorityAbsentAfterPreWriteRollback = file_exists($second->writerAuthorityPath());
-        $strictPreWriteRollback = runManagedTraefikDocumentCommand(
-            $writer->rollbackCommandForRequiringPredecessorAuthority($second, $firstAuthority),
-        );
-        $bootstrapped = runManagedTraefikDocumentCommand(
-            $writer->writeCommandForRequiringAuthority($second, $firstAuthority, allowBootstrap: true),
-        );
-        $rolledBackBeforePromotion = runManagedTraefikDocumentCommand(
-            $writer->rollbackCommandForRequiringPredecessorAuthority($second, $firstAuthority),
-        );
-        $documentAfterRollbackBeforePromotion = file_get_contents($second->documentPath());
-        $authorityAfterRollbackBeforePromotion = file_get_contents($second->writerAuthorityPath());
-        $switched = runManagedTraefikDocumentCommand(
-            $writer->writeCommandForRequiringAuthority($second, $firstAuthority, allowBootstrap: false),
-        );
-        $promoted = runManagedTraefikDocumentCommand(
-            $writer->promoteWriterAuthorityCommandFor(
-                $second->stateDirectory,
-                $second->filename,
+        $replayed = runManagedTraefikDocumentCommand(
+            $writer->rollbackCommandForRequiringPredecessorAuthority(
+                $second,
                 $firstAuthority,
-                $secondAuthority,
+                $rolledBackAuthority,
+                allowInitialOrPreWriteReconciliation: true,
+                allowMissingArtifactNoop: true,
             ),
-        );
-        $rollbackAfterPromotion = runManagedTraefikDocumentCommand(
-            $writer->rollbackCommandForRequiringPredecessorAuthority($second, $firstAuthority),
         );
 
         expect($legacyFirst->isSuccessful())->toBeTrue()
-            ->and($absentPreWriteRollback->isSuccessful())->toBeTrue()
-            ->and($authorityAbsentAfterPreWriteRollback)->toBeFalse()
-            ->and($strictPreWriteRollback->isSuccessful())->toBeFalse()
-            ->and($bootstrapped->isSuccessful())->toBeTrue()
-            ->and($rolledBackBeforePromotion->isSuccessful())->toBeTrue()
-            ->and($documentAfterRollbackBeforePromotion)->toBe($first->replacementBytes)
-            ->and($authorityAfterRollbackBeforePromotion)->toBe($firstAuthority->toJson())
-            ->and($switched->isSuccessful())->toBeTrue()
-            ->and($promoted->isSuccessful())->toBeTrue()
-            ->and($rollbackAfterPromotion->isSuccessful())->toBeFalse()
-            ->and(file_get_contents($second->documentPath()))->toBe($second->replacementBytes)
-            ->and(file_get_contents($second->writerAuthorityPath()))->toBe($secondAuthority->toJson())
-            ->and(fn () => $writer->rollbackCommandForRequiringPredecessorAuthority($second, $secondAuthority))
-            ->toThrow(InvalidArgumentException::class);
+            ->and($reconciled->isSuccessful())->toBeTrue()
+            ->and(trim($reconciled->getOutput()))->toBe(ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT)
+            ->and($replayed->isSuccessful())->toBeTrue()
+            ->and(file_get_contents($second->documentPath()))->toBe($first->replacementBytes)
+            ->and(file_get_contents($second->sidecarPath()))->toBe($first->replacementSidecar())
+            ->and(file_get_contents($second->writerAuthorityPath()))->toBe($rolledBackAuthority->toJson())
+            ->and(fn () => $writer->rollbackCommandForRequiringPredecessorAuthority(
+                $second,
+                $firstAuthority,
+                $foreignTombstone,
+            ))->toThrow(InvalidArgumentException::class, 'exact generation attempt');
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('reconciles terminal legacy rollback authority from exact restored bytes without successor payload or token', function () {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $first = managedTraefikDocumentMutation($root, 'control-plane-legacy-first', 1, "http:\n  routers:\n    first: {}\n");
+        $firstAuthority = managedTraefikDocumentWriterAuthority($first, epoch: 1, identity: 'a');
+        $second = managedTraefikDocumentMutation($root, 'control-plane-legacy-second', 2, 'not-retained', $first);
+        $rolledBackAuthority = managedTraefikDocumentRollbackAuthority($first, $second, $firstAuthority);
+
+        $legacyFirst = runManagedTraefikDocumentCommand($writer->writeCommandFor($first));
+        $reconcileCommand = $writer->reconcileRolledBackWriterAuthorityCommandFor(
+            $second,
+            $firstAuthority,
+            $rolledBackAuthority,
+        );
+        expect($reconcileCommand)->not->toContain('16777216', 'artifact_count', 'relevant_artifact_count');
+        file_put_contents($second->journalPath(), "pending\n");
+        $pendingJournal = runManagedTraefikDocumentCommand($reconcileCommand);
+        unlink($second->journalPath());
+        $crashed = runManagedTraefikDocumentCommand(
+            $reconcileCommand,
+            ['COOLIFY_MANAGED_TRAEFIK_DOCUMENT_CRASH_AFTER_AUTHORITY' => '1'],
+        );
+        $staleForward = runManagedTraefikDocumentCommand(
+            $writer->writeCommandForRequiringAuthority($second, $firstAuthority, allowBootstrap: true),
+        );
+        $replayed = runManagedTraefikDocumentCommand($reconcileCommand);
+        $restoredDocument = file_get_contents($second->documentPath());
+        $restoredSidecar = file_get_contents($second->sidecarPath());
+        $restoredAuthority = file_get_contents($second->writerAuthorityPath());
+        $replacement = new ManagedTraefikDocumentMutation(
+            dynamicDirectory: $root.'/dynamic',
+            stateDirectory: $root.'/state',
+            filename: 'coolify-control-plane.yaml',
+            operationId: 'control-plane-legacy-replacement',
+            revision: 3,
+            expectedSha256: $first->replacementSha256(),
+            expectedOperationId: $first->operationId,
+            expectedRevision: $first->revision,
+            replacementBytes: "http:\n  routers:\n    replacement: {}\n",
+            expectedWriterOperationId: $rolledBackAuthority->operationId,
+        );
+        $replacementWrite = runManagedTraefikDocumentCommand(
+            $writer->writeCommandForRequiringAuthority($replacement, $rolledBackAuthority, allowBootstrap: false),
+        );
+        $delayedReconciliation = runManagedTraefikDocumentCommand($reconcileCommand);
+
+        expect($legacyFirst->isSuccessful())->toBeTrue()
+            ->and($pendingJournal->isSuccessful())->toBeFalse()
+            ->and($crashed->isSuccessful())->toBeFalse()
+            ->and($crashed->getExitCode())->toBe(75)
+            ->and($restoredDocument)->toBe($first->replacementBytes)
+            ->and($restoredSidecar)->toBe($first->replacementSidecar())
+            ->and($restoredAuthority)->toBe($rolledBackAuthority->toJson())
+            ->and($staleForward->isSuccessful())->toBeFalse()
+            ->and($replayed->isSuccessful())->toBeTrue()
+            ->and(trim($replayed->getOutput()))->toBe(ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT)
+            ->and($replacementWrite->isSuccessful())->toBeTrue()
+            ->and($delayedReconciliation->isSuccessful())->toBeFalse()
+            ->and(file_get_contents($replacement->documentPath()))->toBe($replacement->replacementBytes)
+            ->and(file_get_contents($replacement->sidecarPath()))->toBe($replacement->replacementSidecar());
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('tombstones and restores an exact pending legacy forward journal without retained successor input', function () {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $first = managedTraefikDocumentMutation($root, 'control-plane-pending-first', 1, "http:\n  routers:\n    first: {}\n");
+        $firstAuthority = managedTraefikDocumentWriterAuthority($first, epoch: 1, identity: 'a');
+        $second = managedTraefikDocumentMutation($root, 'control-plane-pending-second', 2, "http:\n  routers:\n    second: {}\n", $first);
+        $rolledBackAuthority = managedTraefikDocumentRollbackAuthority($first, $second, $firstAuthority);
+
+        expect(runManagedTraefikDocumentCommand($writer->writeCommandFor($first))->isSuccessful())->toBeTrue();
+        $capturedForward = $writer->writeCommandForRequiringAuthority($second, $firstAuthority, allowBootstrap: true);
+        $crashedForward = runManagedTraefikDocumentCommand(
+            $capturedForward,
+            ['COOLIFY_MANAGED_TRAEFIK_DOCUMENT_CRASH_AFTER_JOURNAL' => '1'],
+        );
+        $reconciled = runManagedTraefikDocumentCommand(
+            $writer->reconcileRolledBackWriterAuthorityCommandFor($second, $firstAuthority, $rolledBackAuthority),
+        );
+        $staleForward = runManagedTraefikDocumentCommand($capturedForward);
+
+        expect($crashedForward->isSuccessful())->toBeFalse()
+            ->and(file_exists($second->journalPath()))->toBeFalse()
+            ->and($reconciled->isSuccessful())->toBeTrue()
+            ->and(trim($reconciled->getOutput()))->toBe(ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT)
+            ->and(file_get_contents($second->documentPath()))->toBe($first->replacementBytes)
+            ->and(file_get_contents($second->sidecarPath()))->toBe($first->replacementSidecar())
+            ->and(file_get_contents($second->writerAuthorityPath()))->toBe($rolledBackAuthority->toJson())
+            ->and($staleForward->isSuccessful())->toBeFalse();
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('restores a legacy sibling successor that won before the current terminal rollback tombstone', function () {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $first = managedTraefikDocumentMutation($root, 'control-plane-sibling-first', 1, "http:\n  routers:\n    first: {}\n");
+        $firstAuthority = managedTraefikDocumentWriterAuthority($first, epoch: 1, identity: 'a');
+        $sibling = managedTraefikDocumentMutation($root, 'control-plane-sibling-a', 2, "http:\n  routers:\n    sibling: {}\n", $first);
+        $current = managedTraefikDocumentMutation($root, 'control-plane-sibling-b', 2, 'not-retained', $first);
+        $rolledBackAuthority = managedTraefikDocumentRollbackAuthority($first, $current, $firstAuthority);
+
+        expect(runManagedTraefikDocumentCommand($writer->writeCommandFor($first))->isSuccessful())->toBeTrue();
+        $capturedSiblingForward = $writer->writeCommandForRequiringAuthority($sibling, $firstAuthority, allowBootstrap: true);
+        $siblingForward = runManagedTraefikDocumentCommand($capturedSiblingForward);
+        file_put_contents(
+            $root.'/state/.coolify-control-plane.yaml.000-history.r1.rollback',
+            implode("\n", [
+                'coolify-managed-traefik-document-rollback-v1',
+                'coolify-control-plane.yaml',
+                'historical-operation',
+                '1',
+                str_repeat('0', 64),
+                str_repeat('1', 64),
+                base64_encode("historical-sidecar\n"),
+                base64_encode("historical-document\n"),
+                '',
+            ]),
+        );
+        $reconciled = runManagedTraefikDocumentCommand(
+            $writer->reconcileRolledBackWriterAuthorityCommandFor($current, $firstAuthority, $rolledBackAuthority),
+        );
+        $staleSiblingForward = runManagedTraefikDocumentCommand($capturedSiblingForward);
+
+        expect($siblingForward->isSuccessful())->toBeTrue()
+            ->and($reconciled->isSuccessful())->toBeTrue()
+            ->and(trim($reconciled->getOutput()))->toBe(ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT)
+            ->and(file_get_contents($current->documentPath()))->toBe($first->replacementBytes)
+            ->and(file_get_contents($current->sidecarPath()))->toBe($first->replacementSidecar())
+            ->and(file_get_contents($current->writerAuthorityPath()))->toBe($rolledBackAuthority->toJson())
+            ->and($staleSiblingForward->isSuccessful())->toBeFalse();
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('finishes an exact legacy sibling rollback journal before admitting the current replacement', function () {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $first = managedTraefikDocumentMutation($root, 'control-plane-rollback-journal-first', 1, "http:\n  routers:\n    first: {}\n");
+        $firstAuthority = managedTraefikDocumentWriterAuthority($first, epoch: 1, identity: 'a');
+        $sibling = managedTraefikDocumentMutation($root, 'control-plane-rollback-journal-a', 2, "http:\n  routers:\n    sibling: {}\n", $first);
+        $current = managedTraefikDocumentMutation($root, 'control-plane-rollback-journal-b', 2, 'not-retained', $first);
+        $rolledBackAuthority = managedTraefikDocumentRollbackAuthority($first, $current, $firstAuthority);
+
+        expect(runManagedTraefikDocumentCommand($writer->writeCommandFor($first))->isSuccessful())->toBeTrue()
+            ->and(runManagedTraefikDocumentCommand($writer->writeCommandFor($sibling))->isSuccessful())->toBeTrue();
+        $crashedSiblingRollback = runManagedTraefikDocumentCommand(
+            $writer->rollbackCommandFor($sibling),
+            ['COOLIFY_MANAGED_TRAEFIK_DOCUMENT_CRASH_AFTER_JOURNAL' => '1'],
+        );
+        $reconciled = runManagedTraefikDocumentCommand(
+            $writer->reconcileRolledBackWriterAuthorityCommandFor($current, $firstAuthority, $rolledBackAuthority),
+        );
+
+        expect($crashedSiblingRollback->isSuccessful())->toBeFalse()
+            ->and($crashedSiblingRollback->getExitCode())->toBe(75)
+            ->and($reconciled->isSuccessful())->toBeTrue()
+            ->and(trim($reconciled->getOutput()))->toBe(ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT)
+            ->and(file_exists($current->journalPath()))->toBeFalse()
+            ->and(file_get_contents($current->documentPath()))->toBe($first->replacementBytes)
+            ->and(file_get_contents($current->sidecarPath()))->toBe($first->replacementSidecar())
+            ->and(file_get_contents($current->writerAuthorityPath()))->toBe($rolledBackAuthority->toJson());
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('rejects a foreign operation authority at PHP command construction even when its writer identity and document match', function () {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $first = managedTraefikDocumentMutation($root, 'control-plane-authority-first', 1, "http:\n  routers:\n    first: {}\n");
+        $firstAuthority = managedTraefikDocumentWriterAuthority($first, epoch: 1, identity: 'a');
+        $second = managedTraefikDocumentMutation($root, 'control-plane-authority-second', 2, "http:\n  routers:\n    second: {}\n", $first);
+        $rolledBackAuthority = managedTraefikDocumentRollbackAuthority($first, $second, $firstAuthority);
+        $foreignOperationAuthority = new ManagedTraefikDocumentWriterAuthority(
+            epoch: $firstAuthority->epoch,
+            operationId: 'foreign-control-plane-authority',
+            member: $firstAuthority->member,
+            containerId: $firstAuthority->containerId,
+            containerName: $firstAuthority->containerName,
+            imageId: $firstAuthority->imageId,
+            dynamicRevision: $first->revision,
+            dynamicSha256: $first->replacementSha256(),
+        );
+
+        expect($foreignOperationAuthority->matchesPredecessorDocument($second))->toBeTrue()
+            ->and($foreignOperationAuthority->hasSameWriterIdentityAs($firstAuthority))->toBeTrue()
+            ->and(fn () => $writer->writeCommandForRequiringAuthority(
+                $second,
+                $foreignOperationAuthority,
+                allowBootstrap: false,
+            ))->toThrow(InvalidArgumentException::class, 'exact active predecessor authority')
+            ->and(fn () => $writer->rollbackCommandForRequiringPredecessorAuthority(
+                $second,
+                $foreignOperationAuthority,
+                $rolledBackAuthority,
+            ))->toThrow(InvalidArgumentException::class, 'exact predecessor authority');
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('writes the rollback tombstone before a crash so stale forward commands cannot resurrect the successor', function () {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $first = managedTraefikDocumentMutation($root, 'control-plane-authority-first', 1, "http:\n  routers:\n    first: {}\n");
+        $firstAuthority = managedTraefikDocumentWriterAuthority($first, epoch: 1, identity: 'a');
+        $second = managedTraefikDocumentMutation($root, 'control-plane-authority-second', 2, "http:\n  routers:\n    second: {}\n", $first);
+        $rolledBackAuthority = managedTraefikDocumentRollbackAuthority($first, $second, $firstAuthority);
+
+        $legacyFirst = runManagedTraefikDocumentCommand($writer->writeCommandFor($first));
+        $capturedForwardCommand = $writer->writeCommandForRequiringAuthority(
+            $second,
+            $firstAuthority,
+            allowBootstrap: true,
+        );
+        $forward = runManagedTraefikDocumentCommand($capturedForwardCommand);
+        $rollbackCommand = $writer->rollbackCommandForRequiringPredecessorAuthority(
+            $second,
+            $firstAuthority,
+            $rolledBackAuthority,
+        );
+        $crashedRollback = runManagedTraefikDocumentCommand(
+            $rollbackCommand,
+            ['COOLIFY_MANAGED_TRAEFIK_DOCUMENT_CRASH_AFTER_AUTHORITY' => '1'],
+        );
+        $authorityAfterCrash = file_get_contents($second->writerAuthorityPath());
+        $documentAfterCrash = file_get_contents($second->documentPath());
+        $sidecarAfterCrash = file_get_contents($second->sidecarPath());
+        $staleForward = runManagedTraefikDocumentCommand($capturedForwardCommand);
+        $documentAfterStaleForward = file_get_contents($second->documentPath());
+        $sidecarAfterStaleForward = file_get_contents($second->sidecarPath());
+        $replayedRollback = runManagedTraefikDocumentCommand($rollbackCommand);
+
+        expect($legacyFirst->isSuccessful())->toBeTrue()
+            ->and($forward->isSuccessful())->toBeTrue()
+            ->and($crashedRollback->isSuccessful())->toBeFalse()
+            ->and($crashedRollback->getExitCode())->toBe(75)
+            ->and($authorityAfterCrash)->toBe($rolledBackAuthority->toJson())
+            ->and($documentAfterCrash)->toBe($second->replacementBytes)
+            ->and($sidecarAfterCrash)->toBe($second->replacementSidecar())
+            ->and($staleForward->isSuccessful())->toBeFalse()
+            ->and($documentAfterStaleForward)->toBe($second->replacementBytes)
+            ->and($sidecarAfterStaleForward)->toBe($second->replacementSidecar())
+            ->and($replayedRollback->isSuccessful())->toBeTrue()
+            ->and(trim($replayedRollback->getOutput()))->toBe(ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT)
+            ->and(file_get_contents($second->documentPath()))->toBe($first->replacementBytes)
+            ->and(file_get_contents($second->sidecarPath()))->toBe($first->replacementSidecar())
+            ->and(file_get_contents($second->writerAuthorityPath()))->toBe($rolledBackAuthority->toJson());
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('allows a third generation to require the rollback tombstone instead of the original predecessor authority', function () {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $first = managedTraefikDocumentMutation($root, 'control-plane-authority-first', 1, "http:\n  routers:\n    first: {}\n");
+        $firstAuthority = managedTraefikDocumentWriterAuthority($first, epoch: 1, identity: 'a');
+        $second = managedTraefikDocumentMutation($root, 'control-plane-authority-second', 2, "http:\n  routers:\n    second: {}\n", $first);
+        $rolledBackAuthority = managedTraefikDocumentRollbackAuthority($first, $second, $firstAuthority);
+        $third = new ManagedTraefikDocumentMutation(
+            dynamicDirectory: $root.'/dynamic',
+            stateDirectory: $root.'/state',
+            filename: 'coolify-control-plane.yaml',
+            operationId: 'control-plane-authority-third',
+            revision: 3,
+            expectedSha256: $first->replacementSha256(),
+            expectedOperationId: $first->operationId,
+            expectedRevision: $first->revision,
+            replacementBytes: "http:\n  routers:\n    third: {}\n",
+            expectedWriterOperationId: $rolledBackAuthority->operationId,
+        );
+
+        $legacyFirst = runManagedTraefikDocumentCommand($writer->writeCommandFor($first));
+        $forward = runManagedTraefikDocumentCommand(
+            $writer->writeCommandForRequiringAuthority($second, $firstAuthority, allowBootstrap: true),
+        );
+        $rolledBack = runManagedTraefikDocumentCommand(
+            $writer->rollbackCommandForRequiringPredecessorAuthority(
+                $second,
+                $firstAuthority,
+                $rolledBackAuthority,
+            ),
+        );
+        $thirdForwardCommand = $writer->writeCommandForRequiringAuthority(
+            $third,
+            $rolledBackAuthority,
+            allowBootstrap: false,
+        );
+        $thirdForward = runManagedTraefikDocumentCommand($thirdForwardCommand);
+
+        expect($legacyFirst->isSuccessful())->toBeTrue()
+            ->and($forward->isSuccessful())->toBeTrue()
+            ->and($rolledBack->isSuccessful())->toBeTrue()
+            ->and($third->expectedWriterOperationId())->toBe($rolledBackAuthority->operationId)
+            ->and(fn () => $writer->writeCommandForRequiringAuthority(
+                $third,
+                $firstAuthority,
+                allowBootstrap: false,
+            ))->toThrow(InvalidArgumentException::class, 'exact active predecessor authority')
+            ->and($thirdForward->isSuccessful())->toBeTrue()
+            ->and(trim($thirdForward->getOutput()))->toBe(ManagedTraefikDocumentWriter::APPLIED_OUTPUT)
+            ->and(file_get_contents($third->documentPath()))->toBe($third->replacementBytes)
+            ->and(file_get_contents($third->sidecarPath()))->toBe($third->replacementSidecar())
+            ->and(file_get_contents($third->writerAuthorityPath()))->toBe($rolledBackAuthority->toJson());
     } finally {
         $filesystem->remove($root);
     }

@@ -25,6 +25,7 @@ final class ControlPlaneGenerationDrain
         int $drainDeadlineEpoch,
         int $stopTimeoutSeconds,
         int $requiredConsecutiveZeroObservations = 2,
+        bool $allowExpiredRecovery = false,
     ): string {
         return $this->commandFor(
             predecessorDockerId: $predecessorDockerId,
@@ -33,6 +34,7 @@ final class ControlPlaneGenerationDrain
             drainDeadlineEpoch: $drainDeadlineEpoch,
             stopTimeoutSeconds: $stopTimeoutSeconds,
             requiredConsecutiveZeroObservations: $requiredConsecutiveZeroObservations,
+            allowExpiredRecovery: $allowExpiredRecovery,
         );
     }
 
@@ -43,6 +45,7 @@ final class ControlPlaneGenerationDrain
         int $drainDeadlineEpoch,
         int $stopTimeoutSeconds,
         int $requiredConsecutiveZeroObservations = 2,
+        bool $allowExpiredRecovery = false,
     ): string {
         $this->assertArguments(
             predecessorDockerId: $predecessorDockerId,
@@ -51,6 +54,7 @@ final class ControlPlaneGenerationDrain
             drainDeadlineEpoch: $drainDeadlineEpoch,
             stopTimeoutSeconds: $stopTimeoutSeconds,
             requiredConsecutiveZeroObservations: $requiredConsecutiveZeroObservations,
+            allowExpiredRecovery: $allowExpiredRecovery,
         );
 
         $portHex = strtoupper(str_pad(dechex($backendPort), 4, '0', STR_PAD_LEFT));
@@ -62,6 +66,7 @@ backend_port_hex=__BACKEND_PORT_HEX__
 drain_deadline_epoch=__DRAIN_DEADLINE_EPOCH__
 stop_timeout_seconds=__STOP_TIMEOUT_SECONDS__
 required_consecutive_zero_observations=__REQUIRED_CONSECUTIVE_ZERO_OBSERVATIONS__
+allow_expired_recovery=__ALLOW_EXPIRED_RECOVERY__
 proc_root=__PROC_ROOT__
 completion_marker=__COMPLETION_MARKER__
 
@@ -90,11 +95,15 @@ inspect_predecessor() {
     fi
 }
 
-assert_before_deadline() {
+observe_deadline() {
     drain_now_epoch=$(date -u +%s 2>/dev/null) || fail
     case "$drain_now_epoch" in ''|*[!0-9]*) fail ;; esac
-    [ "$drain_now_epoch" -lt "$drain_deadline_epoch" ] || fail
-    drain_remaining_seconds=$((drain_deadline_epoch - drain_now_epoch))
+    if [ "$drain_now_epoch" -lt "$drain_deadline_epoch" ]; then
+        drain_remaining_seconds=$((drain_deadline_epoch - drain_now_epoch))
+    else
+        [ "$allow_expired_recovery" = true ] || fail
+        drain_remaining_seconds=0
+    fi
 }
 
 count_active_connections() {
@@ -138,8 +147,9 @@ while :; do
         printf '%s\n' "$completion_marker"
         exit 0
     fi
-    assert_before_deadline
+    observe_deadline
     count_active_connections
+    if [ "$drain_remaining_seconds" -eq 0 ] && [ "$drain_active_connections" -ne 0 ]; then fail; fi
     if [ "$drain_active_connections" -eq 0 ]; then
         if [ "$zero_observation_pid" = "$drain_pid" ]; then
             consecutive_zero_observations=$((consecutive_zero_observations + 1))
@@ -167,10 +177,15 @@ while :; do
         sleep 1 || fail
         continue
     fi
-    assert_before_deadline
-    [ "$stop_timeout_seconds" -le "$drain_remaining_seconds" ] || fail
+    observe_deadline
+    if [ "$drain_remaining_seconds" -gt 0 ]; then
+        [ "$stop_timeout_seconds" -le "$drain_remaining_seconds" ] || fail
+    else
+        [ "$allow_expired_recovery" = true ] && [ "$stop_timeout_seconds" -eq 1 ] || fail
+    fi
     count_active_connections
     if [ "$drain_active_connections" -ne 0 ]; then
+        [ "$drain_remaining_seconds" -gt 0 ] || fail
         consecutive_zero_observations=0
         zero_observation_pid=''
         sleep 1 || fail
@@ -191,6 +206,7 @@ SH;
             '__DRAIN_DEADLINE_EPOCH__' => escapeshellarg((string) $drainDeadlineEpoch),
             '__STOP_TIMEOUT_SECONDS__' => escapeshellarg((string) $stopTimeoutSeconds),
             '__REQUIRED_CONSECUTIVE_ZERO_OBSERVATIONS__' => escapeshellarg((string) $requiredConsecutiveZeroObservations),
+            '__ALLOW_EXPIRED_RECOVERY__' => escapeshellarg($allowExpiredRecovery ? 'true' : 'false'),
             '__PROC_ROOT__' => escapeshellarg($this->procRoot),
             '__COMPLETION_MARKER__' => escapeshellarg(self::COMPLETION_MARKER),
         ]);
@@ -203,6 +219,7 @@ SH;
         int $drainDeadlineEpoch,
         int $stopTimeoutSeconds,
         int $requiredConsecutiveZeroObservations,
+        bool $allowExpiredRecovery,
     ): void {
         if (preg_match('/\A[a-f0-9]{64}\z/D', $predecessorDockerId) !== 1) {
             throw new InvalidArgumentException('The control-plane generation drain requires one exact Docker ID.');

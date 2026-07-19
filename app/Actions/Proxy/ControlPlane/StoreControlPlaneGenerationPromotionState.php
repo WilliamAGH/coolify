@@ -27,7 +27,7 @@ final class StoreControlPlaneGenerationPromotionState
             $enrollment = $this->enrolledState($lockedServer);
             $current = $this->readFrom($lockedServer);
             if ($current === null) {
-                if (! $state->matchesEnrolledPredecessor($enrollment)) {
+                if (! $state->matchesEnrolledWriterPredecessor($enrollment)) {
                     throw new RuntimeException('The control-plane generation promotion predecessor is stale.');
                 }
                 $this->writeTo($lockedServer, $state);
@@ -96,6 +96,54 @@ final class StoreControlPlaneGenerationPromotionState
             $this->writeTo($lockedServer, $next);
 
             return $next;
+        }, 3);
+    }
+
+    public function reconcileLegacyRollbackWriterAuthority(
+        Server $server,
+        string $operationId,
+        string $token,
+        string $timestamp,
+    ): ControlPlaneGenerationPromotionState {
+        return DB::transaction(function () use ($server, $operationId, $token, $timestamp): ControlPlaneGenerationPromotionState {
+            $lockedServer = $this->lockServer($server);
+            $current = $this->readFrom($lockedServer)
+                ?? throw new RuntimeException('The durable control-plane generation promotion state is missing.');
+            if (! $current->isOwnedBy($operationId, $token)) {
+                throw new RuntimeException('The durable control-plane generation promotion state is owned by another operation.');
+            }
+            if (! $current->legacyWriterAuthorityReconciliationRequired) {
+                return $current;
+            }
+
+            $reconciled = $current->withReconciledLegacyRollbackWriterAuthority($timestamp);
+            $this->writeTo($lockedServer, $reconciled);
+
+            return $reconciled;
+        }, 3);
+    }
+
+    public function reconcileLegacyTerminalRollbackWriterAuthority(
+        Server $server,
+        ControlPlaneGenerationPromotionState $expectedState,
+        string $timestamp,
+    ): ControlPlaneGenerationPromotionState {
+        return DB::transaction(function () use ($server, $expectedState, $timestamp): ControlPlaneGenerationPromotionState {
+            $lockedServer = $this->lockServer($server);
+            $current = $this->readFrom($lockedServer)
+                ?? throw new RuntimeException('The durable control-plane generation promotion state is missing.');
+            if ($current->toArray() !== $expectedState->toArray()) {
+                throw new RuntimeException('The durable legacy rollback state changed during writer authority reconciliation.');
+            }
+            if ($current->phase !== ControlPlaneGenerationPromotionPhase::RolledBack
+                || ! $current->legacyWriterAuthorityReconciliationRequired) {
+                throw new RuntimeException('The durable control-plane generation promotion is not a terminal legacy rollback.');
+            }
+
+            $reconciled = $current->withReconciledLegacyRollbackWriterAuthority($timestamp);
+            $this->writeTo($lockedServer, $reconciled);
+
+            return $reconciled;
         }, 3);
     }
 

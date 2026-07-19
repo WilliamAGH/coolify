@@ -60,11 +60,27 @@ final readonly class ManagedTraefikDocumentWriterAuthority
     public function matchesPredecessor(ManagedTraefikDocumentMutation $mutation): bool
     {
         return $mutation->expectedSha256 !== null
-            && $mutation->expectedOperationId !== null
+            && $mutation->expectedWriterOperationId() !== null
             && $mutation->expectedRevision !== null
-            && $this->operationId === $mutation->expectedOperationId
+            && hash_equals($this->operationId, $mutation->expectedWriterOperationId())
             && $this->dynamicRevision === $mutation->expectedRevision
             && hash_equals($this->dynamicSha256, $mutation->expectedSha256);
+    }
+
+    public function matchesPredecessorDocument(ManagedTraefikDocumentMutation $mutation): bool
+    {
+        return $mutation->expectedSha256 !== null
+            && $mutation->expectedRevision !== null
+            && $this->dynamicRevision === $mutation->expectedRevision
+            && hash_equals($this->dynamicSha256, $mutation->expectedSha256);
+    }
+
+    public function hasSameWriterIdentityAs(self $other): bool
+    {
+        return hash_equals($this->member, $other->member)
+            && hash_equals($this->containerId, $other->containerId)
+            && hash_equals($this->containerName, $other->containerName)
+            && hash_equals($this->imageId, $other->imageId);
     }
 
     private function assertOperationId(string $operationId): void

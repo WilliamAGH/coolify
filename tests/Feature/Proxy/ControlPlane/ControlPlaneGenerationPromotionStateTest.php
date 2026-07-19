@@ -203,9 +203,11 @@ it('serializes a strict canonical promotion state without retaining the raw toke
 
     expect($serialized['version'])->toBe(ControlPlaneGenerationPromotionState::VERSION)
         ->and($serialized['predecessor']['dynamic_sha256'])->toBe($state->predecessor['dynamic_sha256'])
+        ->and($serialized['writer']['predecessor_operation_id'])->toBe('enrolled-control-plane')
         ->and(json_encode($serialized, JSON_THROW_ON_ERROR))->not->toContain('promotion-secret-token')
         ->and(ControlPlaneGenerationPromotionState::fromArray($serialized)->toArray())->toBe($serialized)
         ->and($predecessorAuthority->epoch)->toBe(1)
+        ->and($predecessorAuthority->operationId)->toBe('enrolled-control-plane')
         ->and($predecessorAuthority->containerName)->toBe('coolify-web-a')
         ->and($successorAuthority->epoch)->toBe(2)
         ->and($successorAuthority->containerName)->toBe('coolify-web-c');
@@ -231,6 +233,11 @@ it('enforces safe phase transitions and durable rollback timestamps', function (
     $awaitingAcknowledgement = $rollingBack->withPhase(
         ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement,
         '2026-07-19T12:02:00Z',
+        ['rollback_writer_authority' => [
+            'operation_id' => $rollingBack->operationId,
+            'epoch' => $rollingBack->writerEpoch,
+            'fenced' => true,
+        ]],
     );
     $rollbackUnfreezing = $awaitingAcknowledgement->withPhase(ControlPlaneGenerationPromotionPhase::RollbackUnfreezing, '2026-07-19T12:03:00Z', [
         'rollback_acknowledged_at' => '2026-07-19T12:03:00Z',
@@ -396,7 +403,13 @@ it('replaces a rolled-back terminal state from its restored predecessor with a n
         ->withPhase(ControlPlaneGenerationPromotionPhase::RollingBack, '2026-07-19T12:01:00Z', [
             'rollback_started_at' => '2026-07-19T12:01:00Z',
         ])
-        ->withPhase(ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement, '2026-07-19T12:02:00Z')
+        ->withPhase(ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement, '2026-07-19T12:02:00Z', [
+            'rollback_writer_authority' => [
+                'operation_id' => 'promotion-one',
+                'epoch' => 2,
+                'fenced' => true,
+            ],
+        ])
         ->withPhase(ControlPlaneGenerationPromotionPhase::RollbackUnfreezing, '2026-07-19T12:03:00Z', [
             'rollback_acknowledged_at' => '2026-07-19T12:03:00Z',
         ])
@@ -405,6 +418,45 @@ it('replaces a rolled-back terminal state from its restored predecessor with a n
         ]);
     $server->proxy->set(StoreControlPlaneGenerationPromotionState::STATE_KEY, $rolledBack->toArray());
     $server->save();
+
+    $legacyPayload = $rolledBack->toArray();
+    $legacyPayload['version'] = 1;
+    unset(
+        $legacyPayload['rollback_writer_authority'],
+        $legacyPayload['legacy_writer_authority_reconciliation_required'],
+        $legacyPayload['writer']['predecessor_operation_id'],
+    );
+    $legacyRolledBack = ControlPlaneGenerationPromotionState::fromArray($legacyPayload);
+    $legacySerialized = $legacyRolledBack->toArray();
+    $reserveAfterLegacyRollback = fn (): ControlPlaneGenerationPromotionState => ControlPlaneGenerationPromotionState::reserveAfterRolledBack(
+        operationId: 'promotion-after-legacy-rollback',
+        token: 'promotion-after-legacy-rollback-token',
+        serverId: (int) $server->getKey(),
+        rolledBackPromotion: $legacyRolledBack,
+        successorDynamicRevision: 2,
+        successorDynamicSha256: hash('sha256', 'legacy-replacement-generation'),
+        successorMember: 'green',
+        successorReleaseRevision: 'release-2-retry',
+        successorBackends: ['coolify-web-c', 'coolify-web-d'],
+        successorConfigurationAcknowledgement: 'ack:'.str_repeat('d', 64),
+        runtime: generationPromotionRuntime(),
+        writerMember: 'green',
+        writerEpoch: $legacyRolledBack->writerEpoch,
+        timestamp: '2026-07-19T13:00:00Z',
+    );
+
+    expect($legacySerialized['version'])->toBe(ControlPlaneGenerationPromotionState::VERSION)
+        ->and($legacySerialized['writer']['predecessor_operation_id'])->toBe($rolledBack->predecessor['operation_id'])
+        ->and($legacyRolledBack->rollbackWriterAuthority)->toBe([
+            'operation_id' => $rolledBack->predecessor['operation_id'],
+            'epoch' => $legacyRolledBack->writerEpoch - 1,
+            'fenced' => false,
+        ])
+        ->and($legacyRolledBack->legacyWriterAuthorityReconciliationRequired)->toBeTrue()
+        ->and($legacySerialized['rollback_writer_authority'])->toBe($legacyRolledBack->rollbackWriterAuthority);
+
+    expect($reserveAfterLegacyRollback)
+        ->toThrow(InvalidArgumentException::class, 'reconciliation');
 
     $replacement = ControlPlaneGenerationPromotionState::reserveAfterRolledBack(
         operationId: 'promotion-after-rollback',
@@ -419,13 +471,36 @@ it('replaces a rolled-back terminal state from its restored predecessor with a n
         successorConfigurationAcknowledgement: 'ack:'.str_repeat('d', 64),
         runtime: generationPromotionRuntime(),
         writerMember: 'green',
-        writerEpoch: 2,
+        writerEpoch: 3,
         timestamp: '2026-07-19T13:00:00Z',
     );
 
     expect($store->reserve($server, $replacement, 'promotion-after-rollback-token')->predecessor)
         ->toBe($rolledBack->predecessor)
-        ->and($replacement->writerEpoch)->toBe(2);
+        ->and($rolledBack->rollbackWriterAuthority)->toBe([
+            'operation_id' => $rolledBack->operationId,
+            'epoch' => $rolledBack->writerEpoch,
+            'fenced' => true,
+        ])
+        ->and($replacement->writerEpoch)->toBe($rolledBack->writerEpoch + 1)
+        ->and($replacement->predecessorWriterOperationId)->toBe($rolledBack->operationId);
+
+    expect(fn () => ControlPlaneGenerationPromotionState::reserveAfterRolledBack(
+        operationId: 'stale-rollback-writer-epoch',
+        token: 'stale-rollback-writer-token',
+        serverId: (int) $server->getKey(),
+        rolledBackPromotion: $rolledBack,
+        successorDynamicRevision: 2,
+        successorDynamicSha256: hash('sha256', 'stale-rollback-writer-document'),
+        successorMember: 'green',
+        successorReleaseRevision: 'release-2-retry',
+        successorBackends: ['coolify-web-c', 'coolify-web-d'],
+        successorConfigurationAcknowledgement: 'ack:'.str_repeat('d', 64),
+        runtime: generationPromotionRuntime(),
+        writerMember: 'green',
+        writerEpoch: 2,
+        timestamp: '2026-07-19T13:00:00Z',
+    ))->toThrow(InvalidArgumentException::class, 'advance its rolled-back predecessor by one');
 });
 
 it('binds write and route observations to the exact successor', function () {

@@ -104,14 +104,18 @@ function runControlPlaneGenerationDrainCommand(string $command, array $fixture, 
 }
 
 /** @param array{proc: string, docker_id: string, container_name: string} $fixture */
-function controlPlaneGenerationDrainCommand(array $fixture, int $deadline = 200): string
-{
+function controlPlaneGenerationDrainCommand(
+    array $fixture,
+    int $deadline = 200,
+    bool $allowExpiredRecovery = false,
+): string {
     return (new ControlPlaneGenerationDrain($fixture['proc']))->commandFor(
         predecessorDockerId: $fixture['docker_id'],
         containerName: $fixture['container_name'],
         backendPort: 8000,
         drainDeadlineEpoch: $deadline,
-        stopTimeoutSeconds: 5,
+        stopTimeoutSeconds: $allowExpiredRecovery ? 1 : 5,
+        allowExpiredRecovery: $allowExpiredRecovery,
     );
 }
 
@@ -137,6 +141,50 @@ it('stops only an exactly attested predecessor after two zero observations and r
             ->and($command)->not->toContain('docker rm')
             ->and($command)->not->toContain('Authorization')
             ->and($command)->not->toContain('Bearer');
+    } finally {
+        $filesystem->remove($fixture['root']);
+    }
+});
+
+it('completes an exactly attested already-stopped predecessor at and after its immutable deadline without stopping it', function (string $nowEpoch): void {
+    $filesystem = new Filesystem;
+    $fixture = controlPlaneGenerationDrainFixture(running: 'false', pid: 0);
+
+    try {
+        $result = runControlPlaneGenerationDrainCommand(
+            controlPlaneGenerationDrainCommand($fixture, 200),
+            $fixture,
+            ['FAKE_DATE_EPOCH' => $nowEpoch],
+        );
+
+        expect($result->isSuccessful())->toBeTrue()
+            ->and($result->getOutput())->toBe(ControlPlaneGenerationDrain::COMPLETION_MARKER."\n")
+            ->and(file_get_contents($fixture['log']))->toBe('inspect '.$fixture['docker_id']."\n")
+            ->and(file_get_contents($fixture['log']))->not->toContain('stop ');
+    } finally {
+        $filesystem->remove($fixture['root']);
+    }
+})->with([
+    'at immutable deadline' => '200',
+    'after immutable deadline' => '201',
+]);
+
+it('finishes a half-retired generation after its deadline only after fresh zero-connection observations', function (): void {
+    $filesystem = new Filesystem;
+    $fixture = controlPlaneGenerationDrainFixture();
+
+    try {
+        $result = runControlPlaneGenerationDrainCommand(
+            controlPlaneGenerationDrainCommand($fixture, deadline: 200, allowExpiredRecovery: true),
+            $fixture,
+            ['FAKE_DATE_EPOCH' => '201'],
+        );
+
+        expect($result->isSuccessful())->toBeTrue()
+            ->and($result->getOutput())->toBe(ControlPlaneGenerationDrain::COMPLETION_MARKER."\n")
+            ->and(substr_count(file_get_contents($fixture['log']), 'inspect '))->toBeGreaterThanOrEqual(3)
+            ->and(substr_count(file_get_contents($fixture['log']), 'stop '))->toBe(1)
+            ->and(file_get_contents($fixture['log']))->toContain('stop --time=1 '.$fixture['docker_id']);
     } finally {
         $filesystem->remove($fixture['root']);
     }
