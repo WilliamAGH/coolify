@@ -186,8 +186,16 @@ it('allows a new owner only after the previous enrollment has durably rolled bac
         'first-op',
         'first-token',
         ControlPlaneProxyEnrollmentPhase::RollingBack,
-        ControlPlaneProxyEnrollmentPhase::RolledBack,
+        ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement,
         '2026-07-18T12:02:00Z',
+    );
+    $repository->transition(
+        $server,
+        'first-op',
+        'first-token',
+        ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement,
+        ControlPlaneProxyEnrollmentPhase::RolledBack,
+        '2026-07-18T12:03:00Z',
     );
 
     $second = controlPlaneEnrollmentState($server, 'second-op', 'second-token');

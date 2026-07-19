@@ -304,7 +304,9 @@ it('rolls back a post-success static listener handoff once and replays exact leg
             $writer->rollbackCommandFor($state, $state->operationId, 'test-token'),
             $fixture,
         );
-        $rolledBackState = $state->withPhase(ControlPlaneProxyEnrollmentPhase::RolledBack, '2026-07-19T00:02:00Z');
+        $rolledBackState = $state
+            ->withPhase(ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement, '2026-07-19T00:02:00Z')
+            ->withPhase(ControlPlaneProxyEnrollmentPhase::RolledBack, '2026-07-19T00:03:00Z');
         $second = runStaticListenerHandoffCommand(
             $writer->rollbackCommandFor($rolledBackState, $rolledBackState->operationId, 'test-token'),
             $fixture,

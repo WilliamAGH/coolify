@@ -15,6 +15,8 @@ final class ExecuteControlPlaneProxyEnrollmentRollback
         private readonly StoreControlPlaneProxyEnrollmentState $stateStore,
         private readonly ControlPlaneStaticListenerHandoff $staticHandoff,
         private readonly ManagedTraefikDocumentWriter $dynamicWriter,
+        private readonly InstallControlPlaneCandidateHealthMarkers $candidateMarkerInstaller,
+        private readonly VerifyControlPlaneRestoredRoutes $restoredRoutesVerifier,
     ) {}
 
     /** @param null|Closure(string): ?string $remoteExecutor */
@@ -27,6 +29,17 @@ final class ExecuteControlPlaneProxyEnrollmentRollback
         $state = $this->ownedState($server, $operationId, $token);
         if ($state->phase === ControlPlaneProxyEnrollmentPhase::RolledBack) {
             return $state;
+        }
+
+        $execute = $remoteExecutor ?? static fn (string $command): ?string => instant_remote_process(
+            [$command],
+            $server,
+            timeout: 120,
+            disableMultiplexing: true,
+            retry: false,
+        );
+        if ($state->phase === ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement) {
+            return $this->acknowledgeRestoredRoutes($server, $state, $operationId, $token, $execute);
         }
 
         $wasAlreadyRollingBack = $state->phase === ControlPlaneProxyEnrollmentPhase::RollingBack;
@@ -49,13 +62,6 @@ final class ExecuteControlPlaneProxyEnrollmentRollback
             timestamp: now()->toIso8601String(),
             dynamicDirectory: $proxyPath.'/dynamic',
             stateDirectory: $proxyPath.'/.control-plane-managed-traefik',
-        );
-        $execute = $remoteExecutor ?? static fn (string $command): ?string => instant_remote_process(
-            [$command],
-            $server,
-            timeout: 120,
-            disableMultiplexing: true,
-            retry: false,
         );
         $this->assertExactOutput(
             $execute($this->staticHandoff->rollbackCommandFor($state, $operationId, $token)),
@@ -80,6 +86,55 @@ final class ExecuteControlPlaneProxyEnrollmentRollback
             $operationId,
             $token,
             ControlPlaneProxyEnrollmentPhase::RollingBack,
+            ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement,
+            now()->toIso8601String(),
+        );
+    }
+
+    /** @param Closure(string): ?string $execute */
+    private function acknowledgeRestoredRoutes(
+        Server $server,
+        ControlPlaneProxyEnrollmentState $state,
+        string $operationId,
+        string $token,
+        Closure $execute,
+    ): ControlPlaneProxyEnrollmentState {
+        $expectedMember = 'coolify';
+        $expectedRevision = 'rollback-'.$state->dynamicRevision;
+        $expectedDynamicSha256 = hash('sha256', $state->dynamicPredecessorBytes ?? '');
+        $derivedHealthProof = hash_hmac(
+            'sha256',
+            ControlPlaneDynamicConfiguration::HEALTH_PROOF_DERIVATION_CONTEXT,
+            $token,
+        );
+        $marker = ControlPlaneCandidateHealthMarker::fromDerivedHealthProof(
+            operationId: $operationId,
+            expectedMember: $expectedMember,
+            expectedRevision: $expectedRevision,
+            dynamicSha256: $expectedDynamicSha256,
+            derivedHealthProof: $derivedHealthProof,
+        );
+        $execute($this->candidateMarkerInstaller->handle($marker, ['coolify']));
+
+        $proof = new ControlPlaneRestoredRoutesProof(
+            canonicalHost: $state->canonicalHost,
+            publicScheme: $state->publicScheme,
+            appPort: $state->appPort,
+            expectedBackendMember: $expectedMember,
+            expectedBackendRevision: $expectedRevision,
+            expectedDynamicPredecessorSha256: $expectedDynamicSha256,
+        );
+        $transcript = $execute($proof->shellCommand());
+        if (! is_string($transcript)) {
+            throw new RuntimeException('The restored control-plane route proof returned no transcript.');
+        }
+        $this->restoredRoutesVerifier->handle($proof, $transcript);
+
+        return $this->stateStore->transition(
+            $server,
+            $operationId,
+            $token,
+            ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement,
             ControlPlaneProxyEnrollmentPhase::RolledBack,
             now()->toIso8601String(),
         );

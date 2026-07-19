@@ -40,7 +40,10 @@ final class ResumeControlPlaneProxyEnrollment
         if (! $state->isOwnedBy($operationId, $token)) {
             throw new RuntimeException('The durable control-plane enrollment state is owned by another operation.');
         }
-        if ($rollback || $state->phase === ControlPlaneProxyEnrollmentPhase::RollingBack) {
+        if ($rollback || in_array($state->phase, [
+            ControlPlaneProxyEnrollmentPhase::RollingBack,
+            ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement,
+        ], true)) {
             return $this->rollback->handle($server, $operationId, $token, $remoteExecutor);
         }
         if (in_array($state->phase, [

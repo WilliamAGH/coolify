@@ -17,6 +17,7 @@ use App\Actions\Proxy\ControlPlane\ResumeControlPlaneProxyEnrollment;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
 use App\Actions\Proxy\ControlPlane\VerifyControlPlaneCandidateMembers;
 use App\Actions\Proxy\ControlPlane\VerifyControlPlaneProxyRoutes;
+use App\Actions\Proxy\ControlPlane\VerifyControlPlaneRestoredRoutes;
 use App\Models\Server;
 use App\Models\Team;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -71,6 +72,8 @@ function resumableControlPlaneEnrollment(): array
             $store,
             new ControlPlaneStaticListenerHandoff,
             new ManagedTraefikDocumentWriter,
+            new InstallControlPlaneCandidateHealthMarkers,
+            new VerifyControlPlaneRestoredRoutes,
         ),
     );
 

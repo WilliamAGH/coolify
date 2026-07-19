@@ -17,6 +17,7 @@ use App\Actions\Proxy\ControlPlane\ResumeControlPlaneProxyEnrollment;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
 use App\Actions\Proxy\ControlPlane\VerifyControlPlaneCandidateMembers;
 use App\Actions\Proxy\ControlPlane\VerifyControlPlaneProxyRoutes;
+use App\Actions\Proxy\ControlPlane\VerifyControlPlaneRestoredRoutes;
 use App\Enums\ProxyTypes;
 use App\Models\Server;
 use App\Models\Team;
@@ -36,7 +37,13 @@ function hostPreparedEnrollmentAction(StoreControlPlaneProxyEnrollmentState $sto
         $staticHandoff,
     );
     $finalizer = new FinalizeControlPlaneProxyEnrollment($store, new VerifyControlPlaneProxyRoutes);
-    $rollback = new ExecuteControlPlaneProxyEnrollmentRollback($store, $staticHandoff, $dynamicWriter);
+    $rollback = new ExecuteControlPlaneProxyEnrollmentRollback(
+        $store,
+        $staticHandoff,
+        $dynamicWriter,
+        new InstallControlPlaneCandidateHealthMarkers,
+        new VerifyControlPlaneRestoredRoutes,
+    );
     $resumer = new ResumeControlPlaneProxyEnrollment($store, $activator, $finalizer, $rollback);
 
     return new PrepareControlPlaneProxyEnrollmentFromHost(

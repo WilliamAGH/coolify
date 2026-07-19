@@ -13,6 +13,7 @@ enum ControlPlaneProxyEnrollmentPhase: string
     case Finalizing = 'finalizing';
     case Enrolled = 'enrolled';
     case RollingBack = 'rolling_back';
+    case AwaitingRollbackAcknowledgement = 'awaiting_rollback_acknowledgement';
     case RolledBack = 'rolled_back';
     case InterventionRequired = 'intervention_required';
 
@@ -29,7 +30,8 @@ enum ControlPlaneProxyEnrollmentPhase: string
             self::Active => [self::Finalizing, self::RollingBack, self::InterventionRequired],
             self::Finalizing => [self::Enrolled, self::RollingBack, self::InterventionRequired],
             self::Enrolled => [self::RollingBack, self::InterventionRequired],
-            self::RollingBack => [self::RolledBack, self::InterventionRequired],
+            self::RollingBack => [self::AwaitingRollbackAcknowledgement, self::InterventionRequired],
+            self::AwaitingRollbackAcknowledgement => [self::RolledBack, self::InterventionRequired],
             self::RolledBack => [],
             self::InterventionRequired => [self::RollingBack],
         };

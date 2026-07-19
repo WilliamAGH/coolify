@@ -71,7 +71,7 @@ it('plans an owned rollback that restores the exact dynamic predecessor and carr
         $writer = new ManagedTraefikDocumentWriter;
 
         expect($plan->rollingBackState->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RollingBack)
-            ->and($plan->rolledBackState->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack)
+            ->and($plan->awaitingAcknowledgementState->phase)->toBe(ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement)
             ->and($plan->staticPredecessorBytes)->toBe("services:\n  traefik:\n    ports: ['80:80']\n")
             ->and($plan->sourceOverrideBytes)->toBe("services:\n  coolify:\n    ports: !reset []\n")
             ->and($plan->dynamicMutation)->not->toBeNull();
@@ -119,6 +119,7 @@ it('does not schedule another dynamic mutation for an already rolled-back owner 
     $token = 'control-plane-rollback-token';
     $state = controlPlaneRollbackState($token, null)
         ->withPhase(ControlPlaneProxyEnrollmentPhase::RollingBack, '2026-07-19T12:01:00Z')
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement, '2026-07-19T12:02:00Z')
         ->withPhase(ControlPlaneProxyEnrollmentPhase::RolledBack, '2026-07-19T12:02:00Z');
 
     $plan = RollBackControlPlaneProxyEnrollment::plan(
@@ -131,6 +132,6 @@ it('does not schedule another dynamic mutation for an already rolled-back owner 
     );
 
     expect($plan->rollingBackState)->toBe($state)
-        ->and($plan->rolledBackState)->toBe($state)
+        ->and($plan->awaitingAcknowledgementState)->toBe($state)
         ->and($plan->dynamicRollbackCommand(new ManagedTraefikDocumentWriter))->toBeNull();
 });

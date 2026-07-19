@@ -14,7 +14,7 @@ final readonly class RollBackControlPlaneProxyEnrollment
 {
     private function __construct(
         public ControlPlaneProxyEnrollmentState $rollingBackState,
-        public ControlPlaneProxyEnrollmentState $rolledBackState,
+        public ControlPlaneProxyEnrollmentState $awaitingAcknowledgementState,
         public ?ManagedTraefikDocumentMutation $dynamicMutation,
         public string $staticPredecessorBytes,
         public string $sourceOverrideBytes,
@@ -37,7 +37,7 @@ final readonly class RollBackControlPlaneProxyEnrollment
         if ($state->phase === ControlPlaneProxyEnrollmentPhase::RolledBack) {
             return new self(
                 rollingBackState: $state,
-                rolledBackState: $state,
+                awaitingAcknowledgementState: $state,
                 dynamicMutation: null,
                 staticPredecessorBytes: $state->staticPredecessorBytes,
                 sourceOverrideBytes: $state->sourceOverrideBytes,
@@ -50,7 +50,10 @@ final readonly class RollBackControlPlaneProxyEnrollment
 
         return new self(
             rollingBackState: $rollingBackState,
-            rolledBackState: $rollingBackState->withPhase(ControlPlaneProxyEnrollmentPhase::RolledBack, $timestamp),
+            awaitingAcknowledgementState: $rollingBackState->withPhase(
+                ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement,
+                $timestamp,
+            ),
             dynamicMutation: new ManagedTraefikDocumentMutation(
                 dynamicDirectory: $dynamicDirectory,
                 stateDirectory: $stateDirectory,
