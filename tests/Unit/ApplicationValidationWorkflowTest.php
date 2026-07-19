@@ -56,6 +56,7 @@ function applicationValidationWorkflowViolations(array $workflow): array
         'tests/Feature/BlueGreenContinuousAvailabilityAcceptanceTest.php',
         'tests/Feature/BlueGreenCrashBoundaryAcceptanceTest.php',
         'tests/Feature/BlueGreenMigrationReplayTest.php',
+        'tests/Feature/DatabaseMigrationReadinessTest.php',
         'tests/Feature/BlueGreenSupersessionGenerationTest.php',
         'tests/Feature/LegacyProxyMutationPayloadAdoptionTest.php',
         'tests/Feature/ProxyMutationQueueGateTest.php',
@@ -95,6 +96,11 @@ function applicationValidationWorkflowViolations(array $workflow): array
     }
 
     $workflowAndShell = is_array($jobs) ? ($jobs['workflow-and-shell'] ?? []) : [];
+    $databaseMigrationScript = collect($workflowAndShell['steps'] ?? [])
+        ->firstWhere('name', 'Verify database migration S6 exit propagation')['run'] ?? '';
+    if (! str_contains((string) $databaseMigrationScript, 'tests/Integration/DatabaseMigrationS6/run.sh')) {
+        $violations[] = 'application validation must execute the database migration S6 exit propagation integration';
+    }
     $traefikRuntimeScript = collect($workflowAndShell['steps'] ?? [])
         ->firstWhere('name', 'Run native Traefik runtime integration')['run'] ?? '';
     if (! str_contains((string) $traefikRuntimeScript, 'tests/Integration/ControlPlaneTraefik/run.sh')) {
@@ -134,6 +140,20 @@ it('rejects omitting a blue-green ownership gate from PostgreSQL validation', fu
     $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'] = str_replace(
         'tests/Feature/BlueGreenCancellationCompensationTest.php',
         'tests/Feature/BlueGreenApplicationDeactivationTest.php',
+        $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'],
+    );
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('blue-green lifecycle validation must execute every ownership and migration gate');
+});
+
+it('rejects omitting delayed database-startup coverage from PostgreSQL validation', function () {
+    $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
+    $step = collect($workflow['jobs']['blue-green-lifecycle']['steps'])
+        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Run blue-green lifecycle tests');
+    $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'] = str_replace(
+        'tests/Feature/DatabaseMigrationReadinessTest.php',
+        '',
         $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'],
     );
 
@@ -183,4 +203,14 @@ it('rejects omitting the native Traefik runtime integration', function () {
 
     expect(applicationValidationWorkflowViolations($workflow))
         ->toContain('application validation must execute the native Traefik runtime integration');
+});
+
+it('rejects omitting database migration S6 exit propagation coverage', function () {
+    $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
+    $step = collect($workflow['jobs']['workflow-and-shell']['steps'])
+        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Verify database migration S6 exit propagation');
+    $workflow['jobs']['workflow-and-shell']['steps'][$step]['run'] = 'true';
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('application validation must execute the database migration S6 exit propagation integration');
 });
