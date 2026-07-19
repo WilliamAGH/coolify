@@ -94,7 +94,7 @@ return new class extends Migration
                         ('inactive_retirement_lease_seconds', 'bigint', false, null::text, '', ''),
                         ('inactive_retirement_last_observed_connections', 'integer', false, null::text, '', ''),
                         ('inactive_retirement_observed_at', 'timestamp(0) without time zone', false, null::text, '', ''),
-                        ('inactive_retirement_attempts', 'integer', true, '''0''::integer', '', ''),
+                        ('inactive_retirement_attempts', 'integer', true, '0', '', ''),
                         ('inactive_retirement_stopped_at', 'timestamp(0) without time zone', false, null::text, '', ''),
                         ('inactive_retirement_intervention_required_at', 'timestamp(0) without time zone', false, null::text, '', ''),
                         ('inactive_retirement_dispatch_reserved_until_at', 'timestamp(0) without time zone', false, null::text, '', '')

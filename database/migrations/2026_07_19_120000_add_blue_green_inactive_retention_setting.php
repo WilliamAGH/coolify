@@ -25,7 +25,7 @@ return new class extends Migration
                 select count(*) = 1
                    and bool_and(format_type(attribute.atttypid, attribute.atttypmod) = 'integer')
                    and bool_and(attribute.attnotnull)
-                   and bool_and(pg_get_expr(attribute_default.adbin, attribute_default.adrelid) = '''0''::integer')
+                   and bool_and(pg_get_expr(attribute_default.adbin, attribute_default.adrelid) = '0')
                    and bool_and(attribute.attgenerated = '')
                    and bool_and(attribute.attidentity = '')
                 from pg_attribute as attribute
