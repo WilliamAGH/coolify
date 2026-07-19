@@ -2,6 +2,7 @@
 
 namespace App\Actions\Proxy\ControlPlane;
 
+use App\Actions\Proxy\SaveProxyConfiguration;
 use App\Models\Server;
 use Closure;
 use Lorisleiva\Actions\Concerns\AsAction;
@@ -104,6 +105,8 @@ final class ActivateControlPlaneProxyEnrollment
             ControlPlaneStaticListenerHandoff::APPLIED_OUTPUT,
             'static listener handoff',
         );
+        $server->refresh();
+        (new SaveProxyConfiguration)->persistDatabaseState($server, $state->staticReplacementBytes);
 
         if (! $wasAlreadyActivating) {
             return $state;

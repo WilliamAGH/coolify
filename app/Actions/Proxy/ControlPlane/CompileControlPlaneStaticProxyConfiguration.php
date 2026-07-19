@@ -94,6 +94,7 @@ class CompileControlPlaneStaticProxyConfiguration
             }
         }
 
+        $proxy['services']['traefik']['image'] = get_exact_traefik_image();
         $proxy['services']['traefik']['ports'][] = $exposure->publishedPort();
         $proxy['services']['traefik']['command'][] = '--entrypoints.coolify.address=:8000';
         $replacementProxyYaml = $this->dumpCompose($proxy);

@@ -322,7 +322,7 @@ preflight() {
             die 'run as root (or set COOLIFY_ALLOW_NON_ROOT=true only with FORK_DEPLOY_TEST_MODE=true)'
         fi
     fi
-    for command in docker curl sha256sum flock awk grep openssl ssh-keygen mktemp stat find \
+    for command in docker curl sha256sum flock awk grep jq openssl ssh-keygen mktemp stat find \
         sed date sort wc tr; do
         require_command "$command"
     done
@@ -1296,16 +1296,6 @@ fd_compose_in() {
     fi
 }
 
-fd_count() {
-    local value=$1 needle=$2 count=0
-
-    while [[ $value == *"$needle"* ]]; do
-        value=${value#*"$needle"}
-        count=$((count + 1))
-    done
-    printf '%s\n' "$count"
-}
-
 fd_validate_effective_images() {
     local directory=$1 images reference expected found count=0
 
@@ -1330,7 +1320,7 @@ fd_validate_effective_images() {
 }
 
 fd_validate_effective_bindings() {
-    local directory=$1 json compact remainder host_ip count=0 public_count=0 loopback_count=0 target app_port soketi_port listener_override
+    local directory=$1 json app_port soketi_port listener_override
 
     listener_override=$(fd_control_plane_listener_override "$directory")
     app_port=$(env_value "$directory/.env" APP_PORT)
@@ -1339,43 +1329,56 @@ fd_validate_effective_bindings() {
     validate_port "$soketi_port" SOKETI_PORT
     [[ $app_port != "$soketi_port" && $app_port != 6002 && $soketi_port != 6002 ]] || die 'APP_PORT, SOKETI_PORT, and the fixed Soketi metrics port 6002 must be distinct'
     json=$(fd_compose_in "$directory" config --format json) || die 'could not render effective Compose port bindings'
-    compact=${json//[[:space:]]/}
-    remainder=$compact
-    while [[ $remainder == *'"host_ip":'* ]]; do
-        remainder=${remainder#*'"host_ip":'}
-        [[ $remainder == \"* ]] || die 'effective Compose has an invalid host_ip binding'
-        remainder=${remainder#\"}
-        host_ip=${remainder%%\"*}
-        remainder=${remainder#*\"}
-        case $host_ip in
-            ''|0.0.0.0|::) public_count=$((public_count + 1)) ;;
-            127.0.0.1) loopback_count=$((loopback_count + 1)) ;;
-            *) die "effective Compose contains an unsupported host binding: $host_ip" ;;
-        esac
-        count=$((count + 1))
-    done
     if [[ -n $listener_override ]]; then
-        [[ $loopback_count -eq 2 && $public_count -eq 0 && $count -eq $loopback_count ]] \
+        jq -e --arg soketi_port "$soketi_port" '
+            def ports($service):
+                [.services[$service].ports[]? | {
+                    host_ip: (.host_ip // ""),
+                    published: (.published | tostring),
+                    target: (.target | tostring)
+                }];
+            def exact($ports; $host_ip; $published; $target):
+                ([$ports[] | select(
+                    .host_ip == $host_ip
+                    and .published == $published
+                    and .target == $target
+                )] | length) == 1;
+            ([.services[]?.ports[]?] | length) == 2
+            and (ports("coolify") | length) == 0
+            and (ports("soketi") as $ports
+                | ($ports | length) == 2
+                and exact($ports; "127.0.0.1"; $soketi_port; "6001")
+                and exact($ports; "127.0.0.1"; "6002"; "6002"))
+        ' <<<"$json" >/dev/null \
             || die 'control-plane listener override must remove Coolify APP_PORT publication'
-        [[ $(fd_count "$compact" '"target":8080') -eq 0 ]] \
-            || die 'control-plane listener override must remove Coolify APP_PORT target'
-        for target in 6001 6002; do
-            [[ $(fd_count "$compact" "\"target\":$target") -eq 1 ]] || die "effective Compose must contain exactly one target port $target"
-        done
-        [[ $(fd_count "$compact" '"published":') -eq 2 ]] || die 'control-plane listener override must leave only loopback realtime publications'
-        for target in "$soketi_port" 6002; do
-            [[ $compact == *"\"published\":\"$target\""* || $compact == *"\"published\":$target"* ]] || die "effective Compose is missing host port $target"
-        done
     else
-        [[ $loopback_count -eq 2 && $public_count -eq 1 && $count -eq $((loopback_count + public_count)) ]] \
-            || die "effective Compose must contain one public APP_PORT and two loopback realtime bindings"
-        for target in 8080 6001 6002; do
-            [[ $(fd_count "$compact" "\"target\":$target") -eq 1 ]] || die "effective Compose must contain exactly one target port $target"
-        done
-        [[ $(fd_count "$compact" '"published":') -eq 3 ]] || die 'effective Compose must contain exactly three published ports'
-        for target in "$app_port" "$soketi_port" 6002; do
-            [[ $compact == *"\"published\":\"$target\""* || $compact == *"\"published\":$target"* ]] || die "effective Compose is missing host port $target"
-        done
+        jq -e --arg app_port "$app_port" --arg soketi_port "$soketi_port" '
+            def ports($service):
+                [.services[$service].ports[]? | {
+                    host_ip: (.host_ip // ""),
+                    published: (.published | tostring),
+                    target: (.target | tostring)
+                }];
+            def exact($ports; $host_ip; $published; $target):
+                ([$ports[] | select(
+                    .host_ip == $host_ip
+                    and .published == $published
+                    and .target == $target
+                )] | length) == 1;
+            ([.services[]?.ports[]?] | length) == 3
+            and (ports("coolify") as $ports
+                | ($ports | length) == 1
+                and ([$ports[] | select(
+                    (.host_ip == "" or .host_ip == "0.0.0.0" or .host_ip == "::")
+                    and .published == $app_port
+                    and .target == "8080"
+                )] | length) == 1)
+            and (ports("soketi") as $ports
+                | ($ports | length) == 2
+                and exact($ports; "127.0.0.1"; $soketi_port; "6001")
+                and exact($ports; "127.0.0.1"; "6002"; "6002"))
+        ' <<<"$json" >/dev/null \
+            || die 'effective Compose must contain one public APP_PORT and two loopback realtime bindings'
     fi
 }
 

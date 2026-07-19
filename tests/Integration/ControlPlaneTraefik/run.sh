@@ -5,6 +5,8 @@ set -euo pipefail
 SCRIPT_DIRECTORY="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIRECTORY
 readonly COMPOSE_FILE="$SCRIPT_DIRECTORY/compose.yaml"
+REPOSITORY_ROOT="$(cd -- "$SCRIPT_DIRECTORY/../../.." && pwd)"
+readonly REPOSITORY_ROOT
 readonly CONTROL_PLANE_HOST='control-plane.test'
 readonly DOCKER_PROVIDER_HOST='docker-provider.test'
 readonly PRIVATE_HEALTH_HEADER='X-Coolify-Control-Plane-Health-Proof'
@@ -25,6 +27,7 @@ COMPOSE_STARTED=0
 TRAEFIK_HTTPS_PORT=''
 TRAEFIK_APP_PORT=''
 TRAEFIK_API_PORT=''
+TRAEFIK_IMAGE=''
 COMPOSE_STARTED_AT_MS=0
 TRANSITION_OBSERVER_PID=''
 
@@ -665,7 +668,7 @@ main() {
     local restart_started_at
     local total_route_requests
 
-    for command in docker curl openssl python3 mktemp awk sed tr cp mv wc; do
+    for command in docker curl openssl python3 mktemp awk sed tr cp mv wc jq; do
         require_command "$command"
     done
     if ! docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
@@ -697,8 +700,10 @@ main() {
     TRAEFIK_HTTPS_PORT=$(next_port)
     TRAEFIK_APP_PORT=$(next_port)
     TRAEFIK_API_PORT=$(next_port)
+    TRAEFIK_IMAGE="traefik:$(jq -er '.traefik["v3.6"] | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' "$REPOSITORY_ROOT/versions.json")" \
+        || fail 'versions.json does not own an exact Traefik 3.6 release'
     export PROJECT_NAME TRAEFIK_CERT_DIR TRAEFIK_DOCKER_SOCKET BACKEND_BLUE_STATE_DIR BACKEND_GREEN_STATE_DIR
-    export CONTROL_PLANE_HEALTH_PROOF TRAEFIK_HTTPS_PORT TRAEFIK_APP_PORT TRAEFIK_API_PORT
+    export CONTROL_PLANE_HEALTH_PROOF TRAEFIK_HTTPS_PORT TRAEFIK_APP_PORT TRAEFIK_API_PORT TRAEFIK_IMAGE
     export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
 
     mkdir -p "$TRAEFIK_CERT_DIR" "$BACKEND_BLUE_STATE_DIR" "$BACKEND_GREEN_STATE_DIR"
@@ -716,6 +721,8 @@ main() {
     COMPOSE_STARTED=1
     COMPOSE_STARTED_AT_MS=$(now_ms)
     compose up -d --remove-orphans
+    [ "$(docker inspect --format '{{.Config.Image}}' "$(traefik_container_id)")" = "$TRAEFIK_IMAGE" ] \
+        || fail 'Traefik did not start from the exact versions.json image'
     atomic_replace_snapshot "$initial_snapshot"
 
     wait_for_runtime_shared_service

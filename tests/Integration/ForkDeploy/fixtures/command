@@ -119,8 +119,11 @@ case $name in
                 if [[ $* == *'--format json'* ]]; then
                     if "$listener_override_active"; then
                         printf '%s\n' '{"services":{"coolify":{"ports":[]},"soketi":{"ports":[{"host_ip":"127.0.0.1","published":"6001","target":6001},{"host_ip":"127.0.0.1","published":"6002","target":6002}]}}}'
+                    elif [[ ${FORK_DEPLOY_COMPOSE_SWAP_BINDINGS:-false} == true ]]; then
+                        printf '%s\n' '{"services":{"coolify":{"ports":[{"host_ip":"127.0.0.1","published":"6001","target":8080}]},"soketi":{"ports":[{"host_ip":"0.0.0.0","published":"8000","target":6001},{"host_ip":"127.0.0.1","published":"6002","target":6002}]}}}'
                     else
                         app_host_field='"host_ip":"0.0.0.0",'
+                        if [[ ${FORK_DEPLOY_COMPOSE_APP_LOOPBACK:-false} == true ]]; then app_host_field='"host_ip":"127.0.0.1",'; fi
                         if [[ ${FORK_DEPLOY_COMPOSE_OMIT_APP_HOST_IP:-false} == true ]]; then app_host_field=; fi
                         printf '{"services":{"coolify":{"ports":[{%s"published":"8000","target":8080}]},"soketi":{"ports":[{"host_ip":"127.0.0.1","published":"6001","target":6001},{"host_ip":"127.0.0.1","published":"6002","target":6002}]}}}\n' "$app_host_field"
                     fi

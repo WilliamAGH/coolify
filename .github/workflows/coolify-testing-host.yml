@@ -7,8 +7,12 @@ on:
       - .github/workflows/application-validation.yml
       - .github/workflows/coolify-testing-host.yml
       - .github/workflows/publish-linux-image.yml
+      - docker-compose-maxio.dev.yml
+      - docker-compose.dev.yml
+      - docker-compose.windows.yml
       - docker/testing-host/**
       - docker/verify-source-provenance.sh
+      - other/nightly/docker-compose.windows.yml
       - scripts/publish-linux-image.sh
       - tests/Integration/TestingHostImageTest.sh
       - tests/Integration/VerifyOciArchiveImage.sh
@@ -19,6 +23,7 @@ permissions: {}
 jobs:
   authorize:
     name: Authorize canonical release source
+    if: ${{ github.repository == 'coollabsio/coolify' && github.ref == 'refs/heads/next' }}
     permissions: {}
     runs-on: ubuntu-24.04
     steps:

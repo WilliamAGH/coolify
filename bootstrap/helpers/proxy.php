@@ -280,7 +280,7 @@ function generateDefaultProxyConfiguration(Server $server, array $custom_command
             'services' => [
                 'traefik' => [
                     'container_name' => 'coolify-proxy',
-                    'image' => 'traefik:v3.6',
+                    'image' => get_exact_traefik_image(),
                     'restart' => RESTART_MODE,
                     'extra_hosts' => [
                         'host.docker.internal:host-gateway',
@@ -403,6 +403,8 @@ function generateDefaultProxyConfiguration(Server $server, array $custom_command
         $config = match ($enrollment->phase) {
             ControlPlaneProxyEnrollmentPhase::Preparing,
             ControlPlaneProxyEnrollmentPhase::Prepared => $enrollment->staticPredecessorBytes,
+            ControlPlaneProxyEnrollmentPhase::RollingBack,
+            ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement => $enrollment->staticPredecessorBytes,
             ControlPlaneProxyEnrollmentPhase::Enrolled => (new CompileControlPlaneStaticProxyConfiguration)
                 ->compileProxyConfiguration($config, $enrollment->exposure),
             ControlPlaneProxyEnrollmentPhase::RolledBack => $config,

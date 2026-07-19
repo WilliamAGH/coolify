@@ -1,6 +1,6 @@
 services:
   traefik:
-    image: traefik:v3.6
+    image: ${TRAEFIK_IMAGE:?}
     command:
       - --api.insecure=true
       - --entrypoints.https.address=:8443

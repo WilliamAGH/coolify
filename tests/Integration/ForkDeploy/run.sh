@@ -95,7 +95,9 @@ new_fixture() {
         FORK_DEPLOY_USE_REAL_OPENSSL FORK_DEPLOY_ENV_EXTRA \
         FORK_DEPLOY_COMPOSE_VERSION FORK_DEPLOY_LEGACY_VOLUMES \
         FORK_DEPLOY_APP_HOST_IP FORK_DEPLOY_REALTIME_HOST_IP \
-        FORK_DEPLOY_APP_DUAL_STACK FORK_DEPLOY_COMPOSE_OMIT_APP_HOST_IP \
+        FORK_DEPLOY_APP_DUAL_STACK FORK_DEPLOY_COMPOSE_APP_LOOPBACK \
+        FORK_DEPLOY_COMPOSE_OMIT_APP_HOST_IP \
+        FORK_DEPLOY_COMPOSE_SWAP_BINDINGS \
         FORK_DEPLOY_DOCKER_UNAVAILABLE \
         FORK_DEPLOY_FAIL_CANDIDATE_RUNTIME_VERIFY || true
     unset FORK_DEPLOY_FAIL_ACTIVATED_CONFIG FORK_DEPLOY_KILL_ON_ACTIVE_CONFIG \
@@ -372,10 +374,25 @@ test_real_compose_config_when_available() {
             --file "$ASSETS/docker-compose.custom.yml" \
             config --format json 2>&1
     ) \
-        && [[ $output == *'"host_ip": "127.0.0.1"'* ]] \
-        && [[ $output == *'"published": "8010"'* ]] \
-        && [[ $output == *'"published": "6011"'* ]] \
-        && [[ $output == *'"published": "6002"'* ]] \
+        && jq -e '
+            ([.services[]?.ports[]?] | length) == 3
+            and (.services.coolify.ports | length) == 1
+            and (.services.soketi.ports | length) == 2
+            and ([.services.coolify.ports[]
+                | select((.target | tostring) == "8080"
+                    and (.published | tostring) == "8010"
+                    and ((.host_ip // "") == ""
+                        or .host_ip == "0.0.0.0"
+                        or .host_ip == "::"))] | length) == 1
+            and ([.services.soketi.ports[]
+                | select((.target | tostring) == "6001"
+                    and (.published | tostring) == "6011"
+                    and .host_ip == "127.0.0.1")] | length) == 1
+            and ([.services.soketi.ports[]
+                | select((.target | tostring) == "6002"
+                    and (.published | tostring) == "6002"
+                    and .host_ip == "127.0.0.1")] | length) == 1
+        ' <<<"$output" >/dev/null \
         && [[ $output != *'9999'* ]]; then
         pass 'real Compose config honors !override, public APP_PORT, and loopback realtime ports'
     else
@@ -896,18 +913,46 @@ test_invalid_ports_fail_before_activation() {
     cleanup_fixture
 }
 
-test_effective_compose_requires_public_app_binding() {
+test_effective_compose_rejects_loopback_app_binding() {
     new_fixture
-    export FORK_DEPLOY_COMPOSE_OMIT_APP_HOST_IP=true
+    export FORK_DEPLOY_COMPOSE_APP_LOOPBACK=true
     write_manifest 4.13.0-fork.1
     local output
     if output=$(install_release 2>&1); then
-        fail 'effective Compose requires an explicit public APP_PORT binding'
+        fail 'effective Compose rejects a loopback APP_PORT binding'
     elif [[ $output == *'one public APP_PORT and two loopback realtime bindings'* ]] \
         && [[ ! -e $ROOT/source/docker-compose.yml ]]; then
-        pass 'effective Compose requires an explicit public APP_PORT binding'
+        pass 'effective Compose rejects a loopback APP_PORT binding'
     else
-        fail 'effective Compose requires an explicit public APP_PORT binding'
+        fail 'effective Compose rejects a loopback APP_PORT binding'
+    fi
+    cleanup_fixture
+}
+
+test_effective_compose_accepts_default_public_app_binding() {
+    new_fixture
+    export FORK_DEPLOY_COMPOSE_OMIT_APP_HOST_IP=true
+    write_manifest 4.13.0-fork.1
+    if install_release >/dev/null; then
+        pass 'effective Compose accepts the default public APP_PORT binding'
+    else
+        fail 'effective Compose accepts the default public APP_PORT binding'
+    fi
+    cleanup_fixture
+}
+
+test_effective_compose_rejects_swapped_bindings() {
+    new_fixture
+    export FORK_DEPLOY_COMPOSE_SWAP_BINDINGS=true
+    write_manifest 4.13.0-fork.1
+    local output
+    if output=$(install_release 2>&1); then
+        fail 'effective Compose associates host bindings with their service and target'
+    elif [[ $output == *'one public APP_PORT and two loopback realtime bindings'* ]] \
+        && [[ ! -e $ROOT/source/docker-compose.yml ]]; then
+        pass 'effective Compose associates host bindings with their service and target'
+    else
+        fail 'effective Compose associates host bindings with their service and target'
     fi
     cleanup_fixture
 }
@@ -1727,7 +1772,9 @@ test_forward_recovery_forbids_mismatch_abort_and_rollback
 test_forward_recovery_reconciles_historical_rollback_activation
 test_forward_recovery_requires_recorded_bundle
 test_invalid_ports_fail_before_activation
-test_effective_compose_requires_public_app_binding
+test_effective_compose_rejects_loopback_app_binding
+test_effective_compose_accepts_default_public_app_binding
+test_effective_compose_rejects_swapped_bindings
 test_verify_accepts_dual_stack_public_app_binding
 test_update_preserves_control_plane_listener_override
 test_update_rejects_symlinked_control_plane_listener_override
