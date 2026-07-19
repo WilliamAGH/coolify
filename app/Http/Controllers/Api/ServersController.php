@@ -2,12 +2,11 @@
 
 namespace App\Http\Controllers\Api;
 
-use App\Actions\Server\DeleteServer;
+use App\Actions\Server\QueueServerDeletion;
 use App\Actions\Server\ValidateServer;
 use App\Enums\ProxyStatus;
 use App\Enums\ProxyTypes;
 use App\Http\Controllers\Controller;
-use App\Jobs\DeleteResourceJob;
 use App\Models\Application;
 use App\Models\PrivateKey;
 use App\Models\Project;
@@ -835,23 +834,10 @@ class ServersController extends Controller
             return response()->json(['message' => 'Local server cannot be deleted.'], 400);
         }
 
-        if ($force) {
-            foreach ($server->definedResources() as $resource) {
-                DeleteResourceJob::dispatch($resource);
-            }
-        }
-
         $deletedUuid = $server->uuid;
         $deletedName = $server->name;
         $deletedIp = $server->ip;
-        $server->delete();
-        DeleteServer::dispatch(
-            $server->id,
-            false, // Don't delete from Hetzner via API
-            $server->hetzner_server_id,
-            $server->cloud_provider_token_id,
-            $server->team_id
-        );
+        QueueServerDeletion::run($server, $force);
 
         auditLog('api.server.deleted', [
             'team_id' => $teamId,

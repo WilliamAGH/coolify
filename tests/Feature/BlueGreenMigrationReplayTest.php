@@ -47,6 +47,7 @@ function removeBlueGreenExpandSchema(): void
         'blue_green_server_boot_id',
         'blue_green_topology_digest',
         'blue_green_routing_config_digest',
+        'blue_green_supersession_generation',
     ];
     $presentQueueColumns = array_values(array_filter(
         $queueColumns,
@@ -451,6 +452,21 @@ it('fails closed on malformed postgres destination-fencing queue columns', funct
 
     expect(fn () => blueGreenMigration('2026_07_19_025448_add_destination_fencing_to_blue_green_operations')->up())
         ->toThrow(RuntimeException::class, 'queue columns do not match the authorized PostgreSQL catalog');
+});
+
+it('fails closed on malformed postgres supersession-generation columns', function () {
+    if (Schema::getConnection()->getDriverName() !== 'pgsql') {
+        $this->markTestSkipped('PostgreSQL supersession-generation catalogs are not represented by SQLite.');
+    }
+
+    removeBlueGreenExpandSchema();
+    foreach (blueGreenMigrationNames() as $migrationName) {
+        blueGreenMigration($migrationName)->up();
+    }
+    DB::statement('alter table application_blue_green_deployments alter column supersession_generation drop not null');
+
+    expect(fn () => blueGreenMigration('2026_07_19_025449_add_blue_green_supersession_generation')->up())
+        ->toThrow(RuntimeException::class, 'do not match the authorized PostgreSQL catalog');
 });
 
 it('fails closed on an extra postgres deployment index', function () {

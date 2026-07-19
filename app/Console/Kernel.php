@@ -18,6 +18,7 @@ use App\Jobs\UpdateCoolifyJob;
 use App\Models\InstanceSettings;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Foundation\Console\Kernel as ConsoleKernel;
+use Lorisleiva\Actions\Facades\Actions;
 
 class Kernel extends ConsoleKernel
 {
@@ -53,6 +54,12 @@ class Kernel extends ConsoleKernel
             ->everyMinute()
             ->onOneServer()
             ->withoutOverlapping(6);
+        $this->scheduleInstance->command('blue-green:resume-deactivations --stale-after=300 --limit=1')
+            ->name('blue-green:resume-deactivations')
+            ->everyMinute()
+            ->onOneServer()
+            ->withoutOverlapping(16)
+            ->runInBackground();
 
         if (isDev()) {
             // Instance Jobs
@@ -125,6 +132,7 @@ class Kernel extends ConsoleKernel
 
     protected function commands(): void
     {
+        Actions::registerCommands(app_path('Actions/Application/BlueGreen'));
         $this->load(__DIR__.'/Commands');
 
         require base_path('routes/console.php');

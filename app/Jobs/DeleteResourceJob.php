@@ -2,6 +2,7 @@
 
 namespace App\Jobs;
 
+use App\Actions\Application\BlueGreen\DeactivateBlueGreenApplication;
 use App\Actions\Application\StopApplication;
 use App\Actions\Database\StopDatabase;
 use App\Actions\Server\CleanupDocker;
@@ -27,6 +28,7 @@ use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\Log;
 
 class DeleteResourceJob implements ShouldBeEncrypted, ShouldQueue
 {
@@ -44,6 +46,10 @@ class DeleteResourceJob implements ShouldBeEncrypted, ShouldQueue
 
     public function handle()
     {
+        $requiresBlueGreenDeactivation = $this->resource instanceof Application
+            && $this->resource->requiresBlueGreenDeactivation();
+        $resourceCleanupCompleted = false;
+
         try {
             // Handle ApplicationPreview instances separately
             if ($this->resource instanceof ApplicationPreview) {
@@ -54,7 +60,11 @@ class DeleteResourceJob implements ShouldBeEncrypted, ShouldQueue
 
             switch ($this->resource->type()) {
                 case 'application':
-                    StopApplication::run($this->resource, previewDeployments: true, dockerCleanup: $this->dockerCleanup);
+                    if ($requiresBlueGreenDeactivation) {
+                        DeactivateBlueGreenApplication::run($this->resource);
+                    } else {
+                        StopApplication::run($this->resource, previewDeployments: true, dockerCleanup: $this->dockerCleanup);
+                    }
                     break;
                 case 'standalone-postgresql':
                 case 'standalone-redis':
@@ -101,10 +111,13 @@ class DeleteResourceJob implements ShouldBeEncrypted, ShouldQueue
             if ($this->deleteConnectedNetworks && $this->resource->type() === 'application') {
                 $this->resource->deleteConnectedNetworks();
             }
+            $resourceCleanupCompleted = true;
         } catch (\Throwable $e) {
             throw $e;
         } finally {
-            $this->resource->forceDelete();
+            if (! $requiresBlueGreenDeactivation || $resourceCleanupCompleted) {
+                $this->resource->forceDelete();
+            }
             if ($this->dockerCleanup) {
                 $server = data_get($this->resource, 'server') ?? data_get($this->resource, 'destination.server');
                 if ($server) {
@@ -180,7 +193,7 @@ class DeleteResourceJob implements ShouldBeEncrypted, ShouldQueue
             }
         } catch (\Throwable $e) {
             // Log the error but don't fail the job
-            \Log::warning('Error stopping preview containers for application '.$application->uuid.', PR #'.$pull_request_id.': '.$e->getMessage());
+            Log::warning('Error stopping preview containers for application '.$application->uuid.', PR #'.$pull_request_id.': '.$e->getMessage());
         }
 
         // Finally, force delete to trigger resource cleanup

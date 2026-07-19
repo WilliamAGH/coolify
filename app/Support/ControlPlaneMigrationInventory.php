@@ -6,11 +6,11 @@ use RuntimeException;
 
 final class ControlPlaneMigrationInventory
 {
-    private const FILENAME_PATTERN = '/\A(?:2026_07_12_[0-9]{6}_[a-z0-9_]+|2026_07_19_025448_add_destination_fencing_to_blue_green_operations)\.php\z/';
+    private const FILENAME_PATTERN = '/\A(?:2026_07_12_[0-9]{6}_[a-z0-9_]+|2026_07_19_02544[89]_[a-z0-9_]+)\.php\z/';
 
     private const GLOBS = [
         '2026_07_12_*.php',
-        '2026_07_19_025448_add_destination_fencing_to_blue_green_operations.php',
+        '2026_07_19_02544[89]_*.php',
     ];
 
     private const FINGERPRINT_PATH = 'database/migrations/control-plane-migration-inventory.fingerprint';

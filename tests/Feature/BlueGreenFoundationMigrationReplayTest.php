@@ -199,3 +199,88 @@ it('rejects complete destination-fencing queue columns with a malformed shape', 
     expect(fn () => $migration->up())
         ->toThrow(RuntimeException::class, 'authorized SQLite schema');
 });
+
+it('replays supersession generation only when all owner columns are complete', function () {
+    Schema::create('application_blue_green_deployments', function (Blueprint $table) {
+        $table->id();
+    });
+    Schema::create('application_blue_green_deactivations', function (Blueprint $table) {
+        $table->id();
+    });
+    Schema::create('application_deployment_queues', function (Blueprint $table) {
+        $table->id();
+    });
+    DB::table('application_blue_green_deactivations')->insert(['id' => 1]);
+
+    $migration = require database_path('migrations/2026_07_19_025449_add_blue_green_supersession_generation.php');
+    $migration->up();
+    $migration->up();
+
+    expect(Schema::hasColumn('application_blue_green_deployments', 'supersession_generation'))->toBeTrue()
+        ->and(Schema::hasColumn('application_blue_green_deactivations', 'supersession_generation'))->toBeTrue()
+        ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_supersession_generation'))->toBeTrue()
+        ->and(DB::table('application_blue_green_deactivations')->where('id', 1)->value('supersession_generation'))->toBe(1)
+        ->and(fn () => $migration->down())
+        ->toThrow(RuntimeException::class, 'forward-only');
+
+    Schema::drop('application_blue_green_deployments');
+    Schema::create('application_blue_green_deployments', function (Blueprint $table) {
+        $table->id();
+        $table->unsignedBigInteger('supersession_generation')->default(0);
+    });
+    Schema::drop('application_blue_green_deactivations');
+    Schema::create('application_blue_green_deactivations', function (Blueprint $table) {
+        $table->id();
+    });
+    Schema::drop('application_deployment_queues');
+    Schema::create('application_deployment_queues', function (Blueprint $table) {
+        $table->id();
+    });
+
+    expect(fn () => $migration->up())
+        ->toThrow(RuntimeException::class, 'columns are partial');
+});
+
+it('rejects malformed supersession-generation column shapes', function () {
+    Schema::create('application_blue_green_deployments', function (Blueprint $table) {
+        $table->id();
+        $table->unsignedBigInteger('supersession_generation')->nullable();
+    });
+    Schema::create('application_blue_green_deactivations', function (Blueprint $table) {
+        $table->id();
+        $table->unsignedBigInteger('supersession_generation')->default(0);
+    });
+    Schema::create('application_deployment_queues', function (Blueprint $table) {
+        $table->id();
+        $table->unsignedBigInteger('blue_green_supersession_generation')->nullable();
+    });
+
+    $migration = require database_path('migrations/2026_07_19_025449_add_blue_green_supersession_generation.php');
+
+    expect(fn () => $migration->up())
+        ->toThrow(RuntimeException::class, 'authorized SQLite schema');
+});
+
+it('requires unversioned active owners to drain before generation expansion', function () {
+    Schema::create('application_blue_green_deployments', function (Blueprint $table) {
+        $table->id();
+        $table->string('operation_deployment_uuid')->nullable();
+    });
+    Schema::create('application_blue_green_deactivations', function (Blueprint $table) {
+        $table->id();
+        $table->string('phase');
+    });
+    Schema::create('application_deployment_queues', function (Blueprint $table) {
+        $table->id();
+        $table->string('blue_green_phase')->nullable();
+        $table->string('status');
+    });
+    DB::table('application_blue_green_deployments')->insert([
+        'operation_deployment_uuid' => 'unversioned-live-owner',
+    ]);
+
+    $migration = require database_path('migrations/2026_07_19_025449_add_blue_green_supersession_generation.php');
+
+    expect(fn () => $migration->up())
+        ->toThrow(RuntimeException::class, 'must drain before supersession-generation expansion');
+});

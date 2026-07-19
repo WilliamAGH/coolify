@@ -103,6 +103,7 @@ it('rejects invalid blue-green deployment claims before remote work starts', fun
         serverBootId: '11111111-2222-3333-4444-555555555555',
         topologyDigest: str_repeat('a', 64),
         routingConfigDigest: str_repeat('b', 64),
+        supersessionGeneration: 1,
         legacyContainerName: null,
     ))->toThrow(InvalidArgumentException::class, 'routing revision must be positive');
 
@@ -118,6 +119,7 @@ it('rejects invalid blue-green deployment claims before remote work starts', fun
         serverBootId: '11111111-2222-3333-4444-555555555555',
         topologyDigest: str_repeat('a', 64),
         routingConfigDigest: str_repeat('b', 64),
+        supersessionGeneration: 1,
         legacyContainerName: null,
         candidateContainerName: 'candidate',
     ))->toThrow(InvalidArgumentException::class, 'must be present together');
@@ -134,6 +136,7 @@ it('rejects invalid blue-green deployment claims before remote work starts', fun
         serverBootId: '11111111-2222-3333-4444-555555555555',
         topologyDigest: str_repeat('a', 64),
         routingConfigDigest: str_repeat('b', 64),
+        supersessionGeneration: 1,
         legacyContainerName: null,
     ))->toThrow(InvalidArgumentException::class, 'fence epoch must be positive');
 
@@ -149,6 +152,7 @@ it('rejects invalid blue-green deployment claims before remote work starts', fun
         serverBootId: '11111111-2222-3333-4444-555555555555',
         topologyDigest: 'not-a-digest',
         routingConfigDigest: str_repeat('b', 64),
+        supersessionGeneration: 1,
         legacyContainerName: null,
     ))->toThrow(InvalidArgumentException::class, 'lowercase SHA-256');
 
@@ -164,6 +168,7 @@ it('rejects invalid blue-green deployment claims before remote work starts', fun
         serverBootId: 'NOT-A-BOOT-ID',
         topologyDigest: str_repeat('a', 64),
         routingConfigDigest: str_repeat('b', 64),
+        supersessionGeneration: 1,
         legacyContainerName: null,
     ))->toThrow(InvalidArgumentException::class, 'canonical lowercase UUID');
 });

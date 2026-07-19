@@ -109,9 +109,14 @@ final class TransitionsBlueGreenDeployment
                 BlueGreenDeploymentPhase::ROLLING_BACK,
                 BlueGreenDeploymentPhase::IDLE,
                 [
-                    'status' => ApplicationDeploymentStatus::FAILED->value,
-                    'finished_at' => now(),
+                    'status' => $deployment->status === ApplicationDeploymentStatus::CANCELLED_BY_USER->value
+                        ? ApplicationDeploymentStatus::CANCELLED_BY_USER->value
+                        : ApplicationDeploymentStatus::FAILED->value,
+                    'finished_at' => $deployment->status === ApplicationDeploymentStatus::CANCELLED_BY_USER->value
+                        ? ($deployment->finished_at ?? now())
+                        : now(),
                 ],
+                false,
             );
 
             return $state->fresh();
@@ -121,7 +126,7 @@ final class TransitionsBlueGreenDeployment
     public static function beginRollback(BlueGreenDeploymentClaim $claim): ApplicationBlueGreenDeployment
     {
         return DB::transaction(function () use ($claim): ApplicationBlueGreenDeployment {
-            [$state, $deployment] = self::lockedLifecycle($claim);
+            [$state, $deployment] = self::lockedLifecycle($claim, true);
             $expectedPhase = $state->phase;
 
             if (! in_array($expectedPhase, [
@@ -132,16 +137,17 @@ final class TransitionsBlueGreenDeployment
             }
 
             self::assertExactClaim($state, $claim, $expectedPhase);
-            self::assertExactDeployment($deployment, $claim, $expectedPhase);
+            self::assertExactDeployment($deployment, $claim, $expectedPhase, true);
 
             self::updateExactState($state, $claim, $expectedPhase, [
                 'phase' => BlueGreenDeploymentPhase::ROLLING_BACK->value,
-            ]);
+            ], true);
             self::updateExactDeployment(
                 $deployment,
                 $claim,
                 $expectedPhase,
                 BlueGreenDeploymentPhase::ROLLING_BACK,
+                allowCancelledRollbackEntry: true,
             );
 
             return $state->fresh();
@@ -201,8 +207,10 @@ final class TransitionsBlueGreenDeployment
     /**
      * @return array{ApplicationBlueGreenDeployment, ApplicationDeploymentQueue}
      */
-    private static function lockedLifecycle(BlueGreenDeploymentClaim $claim): array
-    {
+    private static function lockedLifecycle(
+        BlueGreenDeploymentClaim $claim,
+        bool $allowCancelledRollbackEntry = false,
+    ): array {
         (new ComputeBlueGreenDeploymentFingerprint)->assertMatchesClaim($claim);
         $locks = BlueGreenLifecycleDatabaseLocks::forDestination(
             $claim->applicationId,
@@ -219,6 +227,7 @@ final class TransitionsBlueGreenDeployment
         if ($deployment === null) {
             throw new BlueGreenDeploymentTransitionException('The claimed deployment queue entry no longer exists.');
         }
+        $locks->assertDeploymentOwner($claim, $deployment, $allowCancelledRollbackEntry);
 
         return [$state, $deployment];
     }
@@ -236,6 +245,9 @@ final class TransitionsBlueGreenDeployment
             || $state->operation_server_boot_id !== $claim->serverBootId
             || $state->operation_topology_digest !== $claim->topologyDigest
             || $state->operation_routing_config_digest !== $claim->routingConfigDigest
+            || $state->deactivation_operation_id !== null
+            || $state->deactivation_started_at !== null
+            || $state->supersession_generation !== $claim->supersessionGeneration
             || $state->active_color !== $claim->previousActiveColor
             || $state->legacy_container_name !== $claim->legacyContainerName) {
             throw new BlueGreenDeploymentTransitionException('The blue-green deployment claim is stale or no longer owns the pending transition.');
@@ -246,8 +258,17 @@ final class TransitionsBlueGreenDeployment
         ApplicationDeploymentQueue $deployment,
         BlueGreenDeploymentClaim $claim,
         BlueGreenDeploymentPhase $expectedPhase,
+        bool $allowCancelledRollbackEntry = false,
     ): void {
         if ($deployment->blue_green_color !== $claim->pendingColor
+            || ! BlueGreenLifecycleDatabaseLocks::queueStatusOwnsPhase(
+                $deployment->status,
+                $expectedPhase,
+                $allowCancelledRollbackEntry,
+            )
+            || $deployment->blue_green_supersession_generation !== $claim->supersessionGeneration
+            || (int) $deployment->destination_id !== $claim->standaloneDockerId
+            || $deployment->pull_request_id !== 0
             || $deployment->blue_green_phase !== $expectedPhase
             || $deployment->blue_green_routing_revision !== $claim->expectedRoutingRevision
             || $deployment->blue_green_destination_fence_epoch !== $claim->destinationFenceEpoch
@@ -291,8 +312,14 @@ final class TransitionsBlueGreenDeployment
         BlueGreenDeploymentClaim $claim,
         BlueGreenDeploymentPhase $expectedPhase,
         array $attributes,
+        bool $allowCancelledRollbackEntry = false,
     ): void {
-        $updated = self::exactStateQuery($state, $claim, $expectedPhase)->update($attributes);
+        $updated = self::exactStateQuery(
+            $state,
+            $claim,
+            $expectedPhase,
+            $allowCancelledRollbackEntry,
+        )->update($attributes);
 
         if ($updated !== 1) {
             throw new BlueGreenDeploymentTransitionException('The blue-green deployment state changed during its transition.');
@@ -305,22 +332,39 @@ final class TransitionsBlueGreenDeployment
         BlueGreenDeploymentPhase $expectedPhase,
         BlueGreenDeploymentPhase $nextPhase,
         array $additionalAttributes = [],
+        bool $stateRetainsOperationIdentity = true,
+        bool $allowCancelledRollbackEntry = false,
     ): void {
-        $updated = ApplicationDeploymentQueue::query()
+        $query = ApplicationDeploymentQueue::query()
             ->whereKey($deployment->getKey())
             ->where('application_id', $claim->applicationId)
             ->where('deployment_uuid', $claim->deploymentUuid)
+            ->where('destination_id', $claim->standaloneDockerId)
+            ->where('pull_request_id', 0)
+            ->where('blue_green_supersession_generation', $claim->supersessionGeneration)
             ->where('blue_green_color', $claim->pendingColor->value)
             ->where('blue_green_phase', $expectedPhase->value)
             ->where('blue_green_routing_revision', $claim->expectedRoutingRevision)
             ->where('blue_green_destination_fence_epoch', $claim->destinationFenceEpoch)
             ->where('blue_green_server_boot_id', $claim->serverBootId)
             ->where('blue_green_topology_digest', $claim->topologyDigest)
-            ->where('blue_green_routing_config_digest', $claim->routingConfigDigest)
-            ->update([
-                'blue_green_phase' => $nextPhase->value,
-                ...$additionalAttributes,
-            ]);
+            ->where('blue_green_routing_config_digest', $claim->routingConfigDigest);
+        $updated = BlueGreenLifecycleDatabaseLocks::constrainDeploymentQueueOwner(
+            $query,
+            $claim,
+            $expectedPhase,
+            $nextPhase,
+            $stateRetainsOperationIdentity,
+        );
+        $query = BlueGreenLifecycleDatabaseLocks::constrainQueueStatus(
+            $query,
+            $expectedPhase,
+            $allowCancelledRollbackEntry,
+        );
+        $updated = $query->update([
+            'blue_green_phase' => $nextPhase->value,
+            ...$additionalAttributes,
+        ]);
 
         if ($updated !== 1) {
             throw new BlueGreenDeploymentTransitionException('The deployment queue provenance changed during the blue-green transition.');
@@ -331,6 +375,7 @@ final class TransitionsBlueGreenDeployment
         ApplicationBlueGreenDeployment $state,
         BlueGreenDeploymentClaim $claim,
         BlueGreenDeploymentPhase $expectedPhase,
+        bool $allowCancelledRollbackEntry = false,
     ): Builder {
         $query = ApplicationBlueGreenDeployment::query()
             ->whereKey($state->getKey())
@@ -343,7 +388,14 @@ final class TransitionsBlueGreenDeployment
             ->where('operation_destination_fence_epoch', $claim->destinationFenceEpoch)
             ->where('operation_server_boot_id', $claim->serverBootId)
             ->where('operation_topology_digest', $claim->topologyDigest)
-            ->where('operation_routing_config_digest', $claim->routingConfigDigest);
+            ->where('operation_routing_config_digest', $claim->routingConfigDigest)
+            ->whereNull('deactivation_operation_id')
+            ->whereNull('deactivation_started_at')
+            ->where('supersession_generation', $claim->supersessionGeneration)
+            ->whereHas('application')
+            ->whereHas('operationDeployment', function (Builder $query) use ($claim, $expectedPhase, $allowCancelledRollbackEntry): void {
+                self::constrainLiveQueue($query, $claim, $expectedPhase, $allowCancelledRollbackEntry);
+            });
 
         $query = $claim->previousActiveColor === null
             ? $query->whereNull('active_color')
@@ -378,10 +430,43 @@ final class TransitionsBlueGreenDeployment
             ->where('operation_server_boot_id', $claim->serverBootId)
             ->where('destination_topology_digest', $claim->topologyDigest)
             ->where('application_routing_config_digest', $claim->routingConfigDigest)
-            ->where($deploymentColumn, $claim->deploymentUuid);
+            ->where($deploymentColumn, $claim->deploymentUuid)
+            ->whereNull('deactivation_operation_id')
+            ->whereNull('deactivation_started_at')
+            ->where('supersession_generation', $claim->supersessionGeneration)
+            ->whereHas('application')
+            ->whereHas('operationDeployment', function (Builder $query) use ($claim): void {
+                self::constrainLiveQueue($query, $claim, BlueGreenDeploymentPhase::IDLE);
+            });
 
         return $claim->legacyContainerName === null
             ? $query->whereNull('legacy_container_name')
             : $query->where('legacy_container_name', $claim->legacyContainerName);
+    }
+
+    private static function constrainLiveQueue(
+        Builder $query,
+        BlueGreenDeploymentClaim $claim,
+        BlueGreenDeploymentPhase $expectedPhase,
+        bool $allowCancelledRollbackEntry = false,
+    ): void {
+        $query->where('application_id', $claim->applicationId)
+            ->where('deployment_uuid', $claim->deploymentUuid)
+            ->where('destination_id', $claim->standaloneDockerId)
+            ->where('pull_request_id', 0)
+            ->where('blue_green_supersession_generation', $claim->supersessionGeneration)
+            ->where('blue_green_color', $claim->pendingColor->value)
+            ->where('blue_green_phase', $expectedPhase->value)
+            ->where('blue_green_routing_revision', $claim->expectedRoutingRevision)
+            ->where('blue_green_destination_fence_epoch', $claim->destinationFenceEpoch)
+            ->where('blue_green_server_boot_id', $claim->serverBootId)
+            ->where('blue_green_topology_digest', $claim->topologyDigest)
+            ->where('blue_green_routing_config_digest', $claim->routingConfigDigest)
+            ->whereHas('application');
+        BlueGreenLifecycleDatabaseLocks::constrainQueueStatus(
+            $query,
+            $expectedPhase,
+            $allowCancelledRollbackEntry,
+        );
     }
 }

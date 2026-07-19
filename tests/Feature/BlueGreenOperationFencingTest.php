@@ -45,6 +45,7 @@ function makeBlueGreenOperationBootFixture(string $deploymentUuid): array
         'server_name' => $server->name,
         'destination_id' => $destination->id,
         'deployment_uuid' => $deploymentUuid,
+        'pull_request_id' => 0,
         'commit' => 'boot-fence-commit',
         'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
         'only_this_server' => true,
@@ -121,6 +122,72 @@ it('persists a fresh idle claim server boot identity without changing durable ro
         ->and($state->operation_server_boot_id)->toBe($bootId)
         ->and($fixture['deployment']->fresh()->blue_green_server_boot_id)->toBe($bootId)
         ->and($state->destination_topology_digest)->toBeNull();
+});
+
+it('advances state and queue phases together for the exact live generation', function () {
+    $fixture = makeBlueGreenOperationBootFixture('live-generation-phase-transition');
+    $claim = ClaimBlueGreenDeployment::run(
+        application: $fixture['application'],
+        standaloneDocker: $fixture['destination'],
+        deployment: $fixture['deployment'],
+        serverBootId: '11111111-2222-3333-4444-555555555555',
+    );
+
+    $state = TransitionsBlueGreenDeployment::markSwitching($claim);
+
+    expect($state->phase)->toBe(BlueGreenDeploymentPhase::SWITCHING)
+        ->and($state->supersession_generation)->toBe($claim->supersessionGeneration)
+        ->and($fixture['deployment']->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::SWITCHING)
+        ->and($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
+});
+
+it('enters rollback after cancellation and preserves the terminal cancellation status', function () {
+    $fixture = makeBlueGreenOperationBootFixture('cancelled-generation-rollback');
+    $claim = ClaimBlueGreenDeployment::run(
+        application: $fixture['application'],
+        standaloneDocker: $fixture['destination'],
+        deployment: $fixture['deployment'],
+        serverBootId: '11111111-2222-3333-4444-555555555555',
+    );
+    $fixture['deployment']->update([
+        'status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+        'finished_at' => now(),
+    ]);
+
+    $state = TransitionsBlueGreenDeployment::beginRollback($claim);
+    ApplicationBlueGreenDeployment::query()
+        ->whereKey($state->id)
+        ->update([
+            'destination_fence_epoch' => $claim->destinationFenceEpoch,
+            'destination_fence_operation_id' => $claim->deploymentUuid,
+            'destination_fence_mutation_sequence' => 1,
+            'destination_topology_digest' => $claim->topologyDigest,
+            'application_routing_config_digest' => $claim->routingConfigDigest,
+        ]);
+
+    $state = TransitionsBlueGreenDeployment::finishRollback($claim);
+
+    expect($state->phase)->toBe(BlueGreenDeploymentPhase::IDLE)
+        ->and($state->operation_deployment_uuid)->toBeNull()
+        ->and($fixture['deployment']->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::IDLE)
+        ->and($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::CANCELLED_BY_USER->value);
+});
+
+it('does not allow a cancelled queue to continue a forward transition', function () {
+    $fixture = makeBlueGreenOperationBootFixture('cancelled-forward-transition');
+    $claim = ClaimBlueGreenDeployment::run(
+        application: $fixture['application'],
+        standaloneDocker: $fixture['destination'],
+        deployment: $fixture['deployment'],
+        serverBootId: '11111111-2222-3333-4444-555555555555',
+    );
+    $fixture['deployment']->update([
+        'status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+        'finished_at' => now(),
+    ]);
+
+    expect(fn () => TransitionsBlueGreenDeployment::markSwitching($claim))
+        ->toThrow(RuntimeException::class, 'cancelled, deactivated, or superseded');
 });
 
 it('rejects changed persisted boot identity before a transition', function () {

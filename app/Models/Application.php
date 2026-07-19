@@ -3,6 +3,7 @@
 namespace App\Models;
 
 use App\Enums\ApplicationDeploymentStatus;
+use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\ProxyTypes;
 use App\Services\ConfigurationGenerator;
 use App\Services\DeploymentConfiguration\ApplicationConfigurationSnapshot;
@@ -349,6 +350,7 @@ class Application extends BaseModel
             }
         });
         static::forceDeleting(function ($application) {
+            $application->assertBlueGreenDeletionAuthorized();
             $application->update(['fqdn' => null]);
             $application->settings()->delete();
             $application->persistentStorages()->delete();
@@ -1058,6 +1060,11 @@ class Application extends BaseModel
         return $this->hasMany(ApplicationBlueGreenDeployment::class);
     }
 
+    public function blueGreenDeactivations(): HasMany
+    {
+        return $this->hasMany(ApplicationBlueGreenDeactivation::class);
+    }
+
     public function destination()
     {
         return $this->morphTo();
@@ -1324,6 +1331,54 @@ class Application extends BaseModel
         }
 
         return null;
+    }
+
+    public function assertBlueGreenDeletionAuthorized(): void
+    {
+        if (! $this->requiresBlueGreenDeactivation()) {
+            return;
+        }
+        if (! $this->trashed()) {
+            throw new RuntimeException('Blue-green application deletion requires a durable application deletion fence and completed strict deactivation authorization.');
+        }
+        if ($this->blueGreenDeployments()->exists()) {
+            throw new RuntimeException('Blue-green application deletion requires strict deactivation to remove every durable deployment state first.');
+        }
+
+        $deactivations = $this->blueGreenDeactivations()->get();
+        foreach ($deactivations as $deactivation) {
+            try {
+                $deactivation->assertValid();
+            } catch (\LogicException) {
+                throw new RuntimeException('Blue-green application deletion found malformed durable deactivation authorization.');
+            }
+            if ($deactivation->phase !== BlueGreenDeactivationPhase::COMPLETED
+                || $deactivation->supersession_generation < 1) {
+                throw new RuntimeException('Blue-green application deletion requires every durable deactivation owner to complete without intervention.');
+            }
+            if ($this->deleted_at === null || ! $deactivation->started_at->gt($this->deleted_at)) {
+                throw new RuntimeException('Blue-green application deletion requires deactivation authorization created after the application deletion fence.');
+            }
+        }
+
+        $destinationIds = $this->blueGreenConfiguredStandaloneDockerDestinationIds();
+        if ($destinationIds->isEmpty()) {
+            throw new RuntimeException('Blue-green application deletion has no configured destination with durable deactivation authorization.');
+        }
+        $authorizedDestinationIds = $deactivations
+            ->pluck('standalone_docker_id')
+            ->map(fn (mixed $destinationId): int => (int) $destinationId)
+            ->unique();
+        if ($destinationIds->diff($authorizedDestinationIds)->isNotEmpty()) {
+            throw new RuntimeException('Blue-green application deletion requires completed strict deactivation authorization for every configured destination.');
+        }
+    }
+
+    public function requiresBlueGreenDeactivation(): bool
+    {
+        return $this->isBlueGreenDeploymentOptedIn($this->settings()->first())
+            || $this->blueGreenDeployments()->exists()
+            || $this->blueGreenDeactivations()->exists();
     }
 
     public function isBlueGreenDeploymentEligible(): bool

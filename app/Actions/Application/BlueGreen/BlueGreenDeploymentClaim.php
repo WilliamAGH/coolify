@@ -18,6 +18,7 @@ final readonly class BlueGreenDeploymentClaim
         public string $serverBootId,
         public string $topologyDigest,
         public string $routingConfigDigest,
+        public int $supersessionGeneration,
         public ?string $legacyContainerName,
         public ?string $candidateContainerName = null,
         public ?string $rollbackManagedFilename = null,
@@ -27,6 +28,9 @@ final readonly class BlueGreenDeploymentClaim
         }
         if ($this->destinationFenceEpoch < 1) {
             throw new \InvalidArgumentException('The destination fence epoch must be positive.');
+        }
+        if ($this->supersessionGeneration < 1) {
+            throw new \InvalidArgumentException('The supersession generation must be positive.');
         }
         if (preg_match('/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/D', $this->serverBootId) !== 1) {
             throw new \InvalidArgumentException('The server boot identity must be a canonical lowercase UUID.');

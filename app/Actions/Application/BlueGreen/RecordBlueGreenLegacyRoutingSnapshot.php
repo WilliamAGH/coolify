@@ -2,6 +2,7 @@
 
 namespace App\Actions\Application\BlueGreen;
 
+use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\ApplicationBlueGreenDeployment;
 use Illuminate\Support\Facades\DB;
@@ -28,8 +29,10 @@ final class RecordBlueGreenLegacyRoutingSnapshot
                 [$claim->deploymentUuid],
             );
             $state = $locks->state;
+            $deployment = $locks->queue($claim->deploymentUuid);
             if ($state === null
                 || $state->id !== $claim->stateId
+                || $deployment === null
                 || $state->phase !== BlueGreenDeploymentPhase::PREPARING
                 || $state->pending_color !== $claim->pendingColor
                 || $state->pending_deployment_uuid !== $claim->deploymentUuid
@@ -38,6 +41,7 @@ final class RecordBlueGreenLegacyRoutingSnapshot
                 || $state->operation_previous_container_id !== $snapshot->dockerId) {
                 throw new BlueGreenDeploymentTransitionException('The first-adoption operation changed before its legacy routing snapshot was recorded.');
             }
+            $locks->assertDeploymentOwner($claim, $deployment);
 
             $existing = [
                 $state->operation_legacy_routing_snapshot_version,
@@ -59,10 +63,28 @@ final class RecordBlueGreenLegacyRoutingSnapshot
                 ->whereKey($state->id)
                 ->where('phase', BlueGreenDeploymentPhase::PREPARING->value)
                 ->where('operation_deployment_uuid', $claim->deploymentUuid)
+                ->where('operation_destination_fence_epoch', $claim->destinationFenceEpoch)
+                ->where('operation_server_boot_id', $claim->serverBootId)
+                ->where('operation_topology_digest', $claim->topologyDigest)
+                ->where('operation_routing_config_digest', $claim->routingConfigDigest)
+                ->whereNull('deactivation_operation_id')
+                ->whereNull('deactivation_started_at')
+                ->where('supersession_generation', $claim->supersessionGeneration)
                 ->whereNull('operation_routing_mutated_at')
                 ->whereNull('operation_legacy_routing_snapshot_version')
                 ->whereNull('operation_legacy_routing_snapshot')
                 ->whereNull('operation_legacy_routing_snapshot_sha256')
+                ->whereHas('application')
+                ->whereHas('operationDeployment', function ($query) use ($claim): void {
+                    $query->where('application_id', $claim->applicationId)
+                        ->where('deployment_uuid', $claim->deploymentUuid)
+                        ->where('destination_id', $claim->standaloneDockerId)
+                        ->where('pull_request_id', 0)
+                        ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
+                        ->where('blue_green_supersession_generation', $claim->supersessionGeneration)
+                        ->where('blue_green_phase', BlueGreenDeploymentPhase::PREPARING->value)
+                        ->whereHas('application');
+                })
                 ->update([
                     'operation_legacy_routing_snapshot_version' => $encoded->version,
                     'operation_legacy_routing_snapshot' => $encoded->bytes,

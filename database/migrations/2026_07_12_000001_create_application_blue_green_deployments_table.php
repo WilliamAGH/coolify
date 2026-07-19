@@ -103,6 +103,7 @@ return new class extends Migration
                 'operation_routing_config_digest',
                 'operation_previous_managed_file_sha256',
             ],
+            ['supersession_generation'],
         ];
         $laterOwnedColumns = array_merge(...$laterOwnedColumnGroups);
         $columnNames = $columns->keys()->values()->all();
@@ -285,7 +286,8 @@ return new class extends Migration
                           'operation_server_boot_id',
                           'operation_topology_digest',
                           'operation_routing_config_digest',
-                          'operation_previous_managed_file_sha256'
+                          'operation_previous_managed_file_sha256',
+                          'supersession_generation'
                       )
                 )
                 and (select count(*) from actual_all
@@ -305,6 +307,8 @@ return new class extends Migration
                         'operation_routing_config_digest',
                         'operation_previous_managed_file_sha256'
                     )) in (0, 12)
+                and (select count(*) from actual_all
+                    where name = 'supersession_generation') in (0, 1)
                 and (select count(*) = 4
                     and count(*) filter (where conname = 'application_blue_green_deployments_pkey'
                         and contype = 'p' and conkey = array[1]::smallint[]

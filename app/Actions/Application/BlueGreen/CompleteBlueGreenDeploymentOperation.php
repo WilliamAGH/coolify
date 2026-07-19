@@ -66,6 +66,10 @@ final class CompleteBlueGreenDeploymentOperation
                 && $deployment->blue_green_server_boot_id === $claim->serverBootId
                 && $deployment->blue_green_topology_digest === $claim->topologyDigest
                 && $deployment->blue_green_routing_config_digest === $claim->routingConfigDigest
+                && $state->supersession_generation === $claim->supersessionGeneration
+                && $deployment->blue_green_supersession_generation === $claim->supersessionGeneration
+                && $state->deactivation_operation_id === null
+                && $state->deactivation_started_at === null
                 && $deployment->pull_request_id === 0
                 && (int) $deployment->destination_id === $claim->standaloneDockerId
                 && (int) $deployment->server_id === $destination->server_id;
@@ -73,13 +77,17 @@ final class CompleteBlueGreenDeploymentOperation
                 if (! $isExactFinalizedCycle
                     || $state->legacy_container_name !== null
                     || ! $this->operationProvenanceIsCleared($state)
-                    || $deployment->status !== ApplicationDeploymentStatus::FINISHED->value
+                    || ! in_array($deployment->status, [
+                        ApplicationDeploymentStatus::FINISHED->value,
+                        ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+                    ], true)
                     || $deployment->finished_at === null) {
                     throw new BlueGreenDeploymentTransitionException('The completed blue-green operation does not match the exact finalized claim cycle.');
                 }
 
                 return $state;
             }
+            $locks->assertDeploymentOwner($claim, $deployment);
 
             $expectedPreviousContainerName = $claim->previousActiveColor === null
                 ? $claim->legacyContainerName
@@ -118,12 +126,34 @@ final class CompleteBlueGreenDeploymentOperation
                 ->where('operation_server_boot_id', $claim->serverBootId)
                 ->where('destination_topology_digest', $claim->topologyDigest)
                 ->where('application_routing_config_digest', $claim->routingConfigDigest)
+                ->whereNull('deactivation_operation_id')
+                ->whereNull('deactivation_started_at')
+                ->where('supersession_generation', $claim->supersessionGeneration)
+                ->whereHas('application')
+                ->whereHas('operationDeployment', function ($query) use ($claim): void {
+                    $query->where('application_id', $claim->applicationId)
+                        ->where('deployment_uuid', $claim->deploymentUuid)
+                        ->where('destination_id', $claim->standaloneDockerId)
+                        ->where('pull_request_id', 0)
+                        ->where('blue_green_supersession_generation', $claim->supersessionGeneration)
+                        ->where('blue_green_phase', BlueGreenDeploymentPhase::IDLE->value)
+                        ->whereHas('application');
+                    BlueGreenLifecycleDatabaseLocks::constrainQueueStatus(
+                        $query,
+                        BlueGreenDeploymentPhase::IDLE,
+                    );
+                })
                 ->update([
                     'legacy_container_name' => null,
                     ...ApplicationBlueGreenDeployment::clearedOperationAttributes(),
                 ]);
-            $deploymentUpdated = ApplicationDeploymentQueue::query()
+            $deploymentQuery = ApplicationDeploymentQueue::query()
                 ->whereKey($deployment->getKey())
+                ->where('application_id', $claim->applicationId)
+                ->where('deployment_uuid', $claim->deploymentUuid)
+                ->where('destination_id', $claim->standaloneDockerId)
+                ->where('pull_request_id', 0)
+                ->where('blue_green_supersession_generation', $claim->supersessionGeneration)
                 ->where('blue_green_phase', BlueGreenDeploymentPhase::IDLE->value)
                 ->where('blue_green_color', $claim->pendingColor->value)
                 ->where('blue_green_routing_revision', $claim->expectedRoutingRevision)
@@ -132,10 +162,19 @@ final class CompleteBlueGreenDeploymentOperation
                 ->where('blue_green_topology_digest', $claim->topologyDigest)
                 ->where('blue_green_routing_config_digest', $claim->routingConfigDigest)
                 ->where('blue_green_candidate_container_id', $state->operation_candidate_container_id)
-                ->update([
-                    'status' => ApplicationDeploymentStatus::FINISHED->value,
-                    'finished_at' => now(),
-                ]);
+                ->whereHas('application');
+            $deploymentUpdated = BlueGreenLifecycleDatabaseLocks::constrainDeploymentQueueOwner(
+                $deploymentQuery,
+                $claim,
+                BlueGreenDeploymentPhase::IDLE,
+                BlueGreenDeploymentPhase::IDLE,
+                false,
+            )->update([
+                'status' => $deployment->status === ApplicationDeploymentStatus::CANCELLED_BY_USER->value
+                    ? ApplicationDeploymentStatus::CANCELLED_BY_USER->value
+                    : ApplicationDeploymentStatus::FINISHED->value,
+                'finished_at' => $deployment->finished_at ?? now(),
+            ]);
             if ($stateUpdated !== 1 || $deploymentUpdated !== 1) {
                 throw new BlueGreenDeploymentTransitionException('The finalized operation changed while durable cleanup was completing.');
             }
@@ -202,6 +241,6 @@ final class CompleteBlueGreenDeploymentOperation
             && $operation->previousContainer?->name === $state->operation_previous_container_name
             && $operation->previousContainer?->dockerId === $state->operation_previous_container_id
             && $operation->candidateContainer->dockerId === $state->operation_candidate_container_id
-            && $operation->rollbackKey->managedFilename === $state->operation_rollback_managed_filename;
+            && $operation->rollbackKey->managedFilename() === $state->operation_rollback_managed_filename;
     }
 }

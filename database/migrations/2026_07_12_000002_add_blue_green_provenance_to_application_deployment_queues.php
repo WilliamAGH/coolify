@@ -40,19 +40,26 @@ return new class extends Migration
         ];
         $columns = collect(Schema::getColumns('application_deployment_queues'))->keyBy('name');
         $present = collect(array_keys($expectedColumns))->filter(fn (string $name) => $columns->has($name));
-        $laterOwnedColumns = [
-            'blue_green_destination_fence_epoch',
-            'blue_green_server_boot_id',
-            'blue_green_topology_digest',
-            'blue_green_routing_config_digest',
+        $laterOwnedColumnGroups = [
+            [
+                'blue_green_destination_fence_epoch',
+                'blue_green_server_boot_id',
+                'blue_green_topology_digest',
+                'blue_green_routing_config_digest',
+            ],
+            ['blue_green_supersession_generation'],
         ];
-        $presentLaterOwnedCount = collect($laterOwnedColumns)->filter(fn (string $name) => $columns->has($name))->count();
         if ($present->count() !== count($expectedColumns)) {
             throw new RuntimeException($present->isEmpty()
                 ? 'Queue provenance schema is missing.'
                 : 'Queue provenance schema is partial; refusing a non-convergent replay.');
         }
-        if (! in_array($presentLaterOwnedCount, [0, count($laterOwnedColumns)], true)) {
+        $hasPartialLaterOwnedGroup = collect($laterOwnedColumnGroups)->contains(function (array $group) use ($columns): bool {
+            $presentCount = collect($group)->filter(fn (string $name) => $columns->has($name))->count();
+
+            return ! in_array($presentCount, [0, count($group)], true);
+        });
+        if ($hasPartialLaterOwnedGroup) {
             throw new RuntimeException('Later-owned queue provenance schema is partial; refusing a non-convergent replay.');
         }
 

@@ -14,6 +14,7 @@ class ApplicationBlueGreenDeployment extends Model
         'destination_fence_mutation_sequence' => 0,
         'phase' => BlueGreenDeploymentPhase::IDLE->value,
         'routing_revision' => 0,
+        'supersession_generation' => 0,
     ];
 
     protected $fillable = [
@@ -52,6 +53,7 @@ class ApplicationBlueGreenDeployment extends Model
         'operation_topology_digest',
         'operation_routing_config_digest',
         'operation_previous_managed_file_sha256',
+        'supersession_generation',
         'phase',
         'routing_revision',
     ];
@@ -70,6 +72,7 @@ class ApplicationBlueGreenDeployment extends Model
             'destination_fence_mutation_sequence' => 'integer',
             'operation_destination_fence_epoch' => 'integer',
             'operation_previous_destination_fence_epoch' => 'integer',
+            'supersession_generation' => 'integer',
             'phase' => BlueGreenDeploymentPhase::class,
             'routing_revision' => 'integer',
         ];
@@ -98,6 +101,11 @@ class ApplicationBlueGreenDeployment extends Model
     public function pendingDeployment(): BelongsTo
     {
         return $this->belongsTo(ApplicationDeploymentQueue::class, 'pending_deployment_uuid', 'deployment_uuid');
+    }
+
+    public function operationDeployment(): BelongsTo
+    {
+        return $this->belongsTo(ApplicationDeploymentQueue::class, 'operation_deployment_uuid', 'deployment_uuid');
     }
 
     /** @return array<string, null> */

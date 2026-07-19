@@ -12,11 +12,21 @@ it('scopes deployment locks to the application destination pair', function () {
         ->not->toBe(BlueGreenDeploymentLock::key(42, 7));
 });
 
-it('leases long enough for the largest bounded deployment phase', function () {
-    expect(BlueGreenDeploymentLock::leaseSeconds(0))
-        ->toBe(7200)
-        ->and(BlueGreenDeploymentLock::leaseSeconds(3600, 300))
-        ->toBe(7800)
-        ->and(BlueGreenDeploymentLock::leaseSeconds(300, 3900))
-        ->toBe(8400);
+it('uses a short renewable lease below the durable deactivation window', function () {
+    expect(BlueGreenDeploymentLock::deactivationLeaseSeconds())
+        ->toBe(300)
+        ->toBeLessThan(900)
+        ->and(BlueGreenDeploymentLock::deactivationRemoteTimeoutSeconds())
+        ->toBe(270)
+        ->toBeGreaterThan(240)
+        ->toBeLessThan(BlueGreenDeploymentLock::deactivationLeaseSeconds());
+});
+
+it('covers bounded deployment work without weakening the deactivation heartbeat', function () {
+    expect(BlueGreenDeploymentLock::deploymentLeaseSeconds(3600, 300))
+        ->toBe(3660)
+        ->and(BlueGreenDeploymentLock::deploymentLeaseSeconds(300, 3900))
+        ->toBe(3960)
+        ->and(BlueGreenDeploymentLock::deactivationLeaseSeconds())
+        ->toBe(300);
 });

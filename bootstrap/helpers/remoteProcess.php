@@ -136,7 +136,7 @@ function instant_remote_process_with_timeout(Collection|array $command, Server $
     );
 }
 
-function instant_remote_process(Collection|array $command, Server $server, bool $throwError = true, bool $no_sudo = false, ?int $timeout = null, bool $disableMultiplexing = false, ?string $input = null): ?string
+function instant_remote_process(Collection|array $command, Server $server, bool $throwError = true, bool $no_sudo = false, ?int $timeout = null, bool $disableMultiplexing = false, ?string $input = null, bool $retry = true): ?string
 {
     $command = $command instanceof Collection ? $command->toArray() : $command;
 
@@ -146,25 +146,38 @@ function instant_remote_process(Collection|array $command, Server $server, bool 
     $command_string = implode("\n", $command);
     $effectiveTimeout = $timeout ?? config('constants.ssh.command_timeout');
 
-    return SshRetryHandler::retry(
-        function () use ($server, $command_string, $effectiveTimeout, $disableMultiplexing, $input) {
-            $sshCommand = $input === null
-                ? SshMultiplexingHelper::generateSshCommand($server, $command_string, $disableMultiplexing, commandTimeout: $effectiveTimeout)
-                : SshMultiplexingHelper::generateSshCommandWithInput($server, $command_string, $disableMultiplexing, commandTimeout: $effectiveTimeout);
-            $process = Process::input($input)->timeout($effectiveTimeout)->run($sshCommand);
+    $execute = function () use ($server, $command_string, $effectiveTimeout, $disableMultiplexing, $input) {
+        $sshCommand = $input === null
+            ? SshMultiplexingHelper::generateSshCommand($server, $command_string, $disableMultiplexing, commandTimeout: $effectiveTimeout)
+            : SshMultiplexingHelper::generateSshCommandWithInput($server, $command_string, $disableMultiplexing, commandTimeout: $effectiveTimeout);
+        $process = Process::input($input)->timeout($effectiveTimeout)->run($sshCommand);
 
-            $output = trim($process->output());
-            $exitCode = $process->exitCode();
+        $output = trim($process->output());
+        $exitCode = $process->exitCode();
 
-            if ($exitCode !== 0) {
-                excludeCertainErrors($process->errorOutput(), $exitCode);
+        if ($exitCode !== 0) {
+            excludeCertainErrors($process->errorOutput(), $exitCode);
+        }
+
+        // Sanitize output to ensure valid UTF-8 encoding
+        $output = $output === 'null' ? null : sanitize_utf8_text($output);
+
+        return $output;
+    };
+    if (! $retry) {
+        try {
+            return $execute();
+        } catch (Throwable $exception) {
+            if ($throwError) {
+                throw $exception;
             }
 
-            // Sanitize output to ensure valid UTF-8 encoding
-            $output = $output === 'null' ? null : sanitize_utf8_text($output);
+            return null;
+        }
+    }
 
-            return $output;
-        },
+    return SshRetryHandler::retry(
+        $execute,
         [
             'server' => $server->ip,
             'command_preview' => substr($command_string, 0, 100),
