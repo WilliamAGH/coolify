@@ -34,6 +34,18 @@ on:
         default: false
         required: false
         type: boolean
+      operational_acceptance:
+        default: false
+        required: false
+        type: boolean
+      operational_scenario:
+        default: ''
+        required: false
+        type: string
+      operational_failure_mode:
+        default: none
+        required: false
+        type: string
     secrets:
       DOCKERHUB_USERNAME:
         required: false
@@ -111,8 +123,14 @@ jobs:
           FORK_SEMANTIC_VERSION_PATTERN: '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-fork$'
           FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY: ${{ secrets.FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY }}
           GITHUB_REF_TYPE: ${{ github.ref_type }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
           NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
           NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          OPERATIONAL_ACCEPTANCE: ${{ inputs.operational_acceptance }}
+          OPERATIONAL_FAILURE_MODE: ${{ inputs.operational_failure_mode }}
+          OPERATIONAL_SCENARIO: ${{ inputs.operational_scenario }}
           PUBLISH_LATEST: ${{ inputs.publish_latest }}
           RELEASE_KIND: ${{ inputs.release_kind }}
           REPOSITORY: ${{ github.repository }}
@@ -123,10 +141,96 @@ jobs:
           VALIDATE_ONLY: ${{ inputs.validate_only }}
         run: |
           set -eu
+          GITHUB_EVENT_NAME="${GITHUB_EVENT_NAME:-}"
+          GITHUB_REF="${GITHUB_REF:-}"
+          GITHUB_REF_PROTECTED="${GITHUB_REF_PROTECTED:-false}"
+          OPERATIONAL_ACCEPTANCE="${OPERATIONAL_ACCEPTANCE:-false}"
+          OPERATIONAL_FAILURE_MODE="${OPERATIONAL_FAILURE_MODE:-none}"
+          OPERATIONAL_SCENARIO="${OPERATIONAL_SCENARIO:-}"
           require_dockerhub_credentials() {
             [ -n "$DOCKERHUB_USERNAME" ]
             [ -n "$DOCKERHUB_TOKEN" ]
           }
+
+          if [ "$OPERATIONAL_ACCEPTANCE" = true ]; then
+            require_dockerhub_credentials
+            [ "$REPOSITORY" = 'WilliamAGH/coolify' ]
+            [ "$GITHUB_EVENT_NAME" = 'repository_dispatch' ]
+            [ "$GITHUB_REF" = 'refs/heads/v4.x' ]
+            [ "$GITHUB_REF_PROTECTED" = true ]
+            printf '%s' "$GITHUB_SHA" | grep -Eq '^[0-9a-f]{40}$'
+            [ "$DOCKERFILE" = 'docker/production/Dockerfile' ]
+            [ "$VALIDATE_ONLY" = false ]
+
+            case "$OPERATIONAL_SCENARIO" in
+              issue7-staging-success)
+                expected_kind=staging
+                expected_artifact=coolify-operational-issue7
+                expected_candidate=williamagh/coolify-remediation-issue7-candidates
+                expected_target=williamagh/coolify-remediation-issue7
+                expected_semantic=''
+                expected_staging=v4.x
+                expected_latest=false
+                expected_failure=none
+                ;;
+              issue7-staging-failed-build)
+                expected_kind=staging
+                expected_artifact=coolify-operational-issue7
+                expected_candidate=williamagh/coolify-remediation-issue7-candidates
+                expected_target=williamagh/coolify-remediation-issue7
+                expected_semantic=''
+                expected_staging=v4.x
+                expected_latest=false
+                expected_failure=build-after-gates
+                ;;
+              issue9-latest-bootstrap|issue9-latest-mixed|issue9-latest-malformed|issue9-latest-split|issue9-latest-forward-repair)
+                expected_kind=production
+                expected_artifact=coolify-operational-issue9
+                expected_candidate=williamagh/coolify-remediation-issue9-candidates
+                expected_target=williamagh/coolify-remediation-issue9
+                expected_semantic="0.0.0-operational.$GITHUB_RUN_ID"
+                expected_staging=''
+                expected_latest=true
+                expected_failure=none
+                ;;
+              issue9-latest-compensation)
+                expected_kind=production
+                expected_artifact=coolify-operational-issue9
+                expected_candidate=williamagh/coolify-remediation-issue9-candidates
+                expected_target=williamagh/coolify-remediation-issue9
+                expected_semantic="0.0.0-operational.$GITHUB_RUN_ID"
+                expected_staging=''
+                expected_latest=true
+                expected_failure=docker-alias-before-copy
+                ;;
+              issue18-serialization)
+                expected_kind=staging
+                expected_artifact=coolify-operational-issue18
+                expected_candidate=williamagh/coolify-remediation-issue18-candidates
+                expected_target=williamagh/coolify-remediation-issue18
+                expected_semantic=''
+                expected_staging=v4.x
+                expected_latest=false
+                expected_failure=none
+                ;;
+              *)
+                echo "Unknown operational acceptance scenario: $OPERATIONAL_SCENARIO" >&2
+                exit 1
+                ;;
+            esac
+
+            [ "$RELEASE_KIND" = "$expected_kind" ]
+            [ "$ARTIFACT_NAME" = "$expected_artifact" ]
+            [ "$CANDIDATE_REPOSITORY" = "$expected_candidate" ]
+            [ "$TARGET_REPOSITORY" = "$expected_target" ]
+            [ "$SEMANTIC_VERSION" = "$expected_semantic" ]
+            [ "$STAGING_ALIAS" = "$expected_staging" ]
+            [ "$PUBLISH_LATEST" = "$expected_latest" ]
+            [ "$OPERATIONAL_FAILURE_MODE" = "$expected_failure" ]
+          else
+            [ "$OPERATIONAL_ACCEPTANCE" = false ]
+            [ -z "$OPERATIONAL_SCENARIO" ]
+            [ "$OPERATIONAL_FAILURE_MODE" = none ]
           case "$RELEASE_KIND" in
             production)
               require_dockerhub_credentials
@@ -187,6 +291,7 @@ jobs:
               exit 1
               ;;
           esac
+          fi
 
           [ "$CANDIDATE_REPOSITORY" != "$TARGET_REPOSITORY" ]
           run_tag="sha-$GITHUB_SHA-run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
@@ -253,6 +358,7 @@ jobs:
         env:
           RELEASE_KIND: ${{ inputs.release_kind }}
           SEMANTIC_VERSION: ${{ inputs.semantic_version }}
+          TARGET_REPOSITORY: ${{ inputs.target_repository }}
           VALIDATE_ONLY: ${{ inputs.validate_only }}
         run: |
           set -eu
@@ -329,11 +435,11 @@ jobs:
           }
 
           ghcr_status="$(manifest_status \
-            "https://ghcr.io/token?scope=repository:coollabsio/coolify:pull" \
-            "https://ghcr.io/v2/coollabsio/coolify/manifests/$SEMANTIC_VERSION")"
+            "https://ghcr.io/token?scope=repository:$TARGET_REPOSITORY:pull" \
+            "https://ghcr.io/v2/$TARGET_REPOSITORY/manifests/$SEMANTIC_VERSION")"
           docker_status="$(manifest_status \
-            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:coollabsio/coolify:pull" \
-            "https://registry-1.docker.io/v2/coollabsio/coolify/manifests/$SEMANTIC_VERSION")"
+            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$TARGET_REPOSITORY:pull" \
+            "https://registry-1.docker.io/v2/$TARGET_REPOSITORY/manifests/$SEMANTIC_VERSION")"
 
           if [ "$ghcr_status" = 404 ] && [ "$docker_status" = 404 ]; then
             docker_image=''
@@ -344,17 +450,17 @@ jobs:
           elif [ "$ghcr_status" = "$docker_status" ] && printf '%s' "$ghcr_status" | grep -Eq '^200 sha256:[0-9a-f]{64}$'; then
             index_digest="${ghcr_status#200 }"
             ghcr_latest_status="$(manifest_status \
-              "https://ghcr.io/token?scope=repository:coollabsio/coolify:pull" \
-              "https://ghcr.io/v2/coollabsio/coolify/manifests/latest")"
+              "https://ghcr.io/token?scope=repository:$TARGET_REPOSITORY:pull" \
+              "https://ghcr.io/v2/$TARGET_REPOSITORY/manifests/latest")"
             docker_latest_status="$(manifest_status \
-              "https://auth.docker.io/token?service=registry.docker.io&scope=repository:coollabsio/coolify:pull" \
-              "https://registry-1.docker.io/v2/coollabsio/coolify/manifests/latest")"
+              "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$TARGET_REPOSITORY:pull" \
+              "https://registry-1.docker.io/v2/$TARGET_REPOSITORY/manifests/latest")"
 
             publish_required=false
             if [ "$ghcr_latest_status" = "200 $index_digest" ] &&
               [ "$docker_latest_status" = "200 $index_digest" ]; then
-              docker_image="docker.io/coollabsio/coolify@$index_digest"
-              ghcr_image="ghcr.io/coollabsio/coolify@$index_digest"
+              docker_image="docker.io/$TARGET_REPOSITORY@$index_digest"
+              ghcr_image="ghcr.io/$TARGET_REPOSITORY@$index_digest"
               repair_required=false
             else
               docker_image=''
@@ -739,7 +845,6 @@ jobs:
             OCI_PLATFORM="$PLATFORM" \
             tests/Integration/VerifyOciArchiveImage.sh
 
-
       - name: Verify retained OCI evidence files
         if: success()
         env:
@@ -766,6 +871,21 @@ jobs:
             linux-image/${{ inputs.artifact_name }}-${{ matrix.arch }}.secrets.json
             linux-image/${{ inputs.artifact_name }}-${{ matrix.arch }}.runner-environment.txt
           retention-days: 7
+
+      - name: Inject guarded operational failure after retained build evidence
+        if: ${{ inputs.operational_acceptance && inputs.operational_failure_mode == 'build-after-gates' }}
+        env:
+          OPERATIONAL_SCENARIO: ${{ inputs.operational_scenario }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+        run: |
+          set -eu
+          [ "$GITHUB_REPOSITORY" = 'WilliamAGH/coolify' ]
+          [ "$GITHUB_EVENT_NAME" = 'repository_dispatch' ]
+          [ "$GITHUB_REF" = 'refs/heads/v4.x' ]
+          [ "$REF_PROTECTED" = true ]
+          [ "$OPERATIONAL_SCENARIO" = 'issue7-staging-failed-build' ]
+          echo 'Injecting the issue #7 post-gate build failure before any registry publication.' >&2
+          exit 1
 
   stage-candidates:
     name: Stage verified Linux candidates
@@ -1099,6 +1219,8 @@ jobs:
       - name: Publish semantic and latest aliases atomically
         if: ${{ inputs.semantic_version != '' || inputs.publish_latest }}
         env:
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+          PUBLISH_LINUX_IMAGE_FAILURE_INJECTION: ${{ inputs.operational_failure_mode == 'docker-alias-before-copy' && 'docker-alias-before-copy' || '' }}
           PUBLISH_LATEST: ${{ inputs.publish_latest }}
           SEMANTIC_VERSION: ${{ inputs.semantic_version }}
         run: |

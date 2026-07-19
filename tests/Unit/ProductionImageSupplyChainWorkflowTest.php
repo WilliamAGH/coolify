@@ -727,6 +727,7 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
         '.github/workflows/coolify-testing-host.yml',
         '.github/workflows/publish-fork.yml',
         '.github/workflows/publish-linux-image.yml',
+        '.github/workflows/release-operational-acceptance.yml',
     ] as $workflowPath) {
         if (! str_contains($ownedWorkflows, $workflowPath)) {
             $violations[] = "workflow validation must lint owned workflow: {$workflowPath}";
@@ -1087,6 +1088,7 @@ SH;
                 'RELEASE_KIND' => 'production',
                 'RUNNER_TEMP' => $fixture.'/runner',
                 'SEMANTIC_VERSION' => '4.1.4',
+                'TARGET_REPOSITORY' => 'coollabsio/coolify',
                 'VALIDATE_ONLY' => 'false',
             ]);
             $process->run();
@@ -1385,6 +1387,7 @@ it('rejects omission of an owned workflow from actionlint', function (string $wo
     'testing-host caller' => '.github/workflows/coolify-testing-host.yml',
     'fork publisher' => '.github/workflows/publish-fork.yml',
     'reusable publisher' => '.github/workflows/publish-linux-image.yml',
+    'operational acceptance' => '.github/workflows/release-operational-acceptance.yml',
 ]);
 
 it('rejects parsed workflow policy regressions', function () {

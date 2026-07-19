@@ -397,6 +397,40 @@ preflight_alias() {
     fi
 }
 
+validate_docker_alias_before_copy_failure_injection() {
+    local ghcr_repository="$1"
+    local docker_repository="$2"
+    local candidate_index="$3"
+    local ghcr_previous="$4"
+    local docker_previous="$5"
+
+    [[ "${PUBLISH_LINUX_IMAGE_FAILURE_INJECTION:-}" == 'docker-alias-before-copy' ]] \
+        || die 'unsupported release failure injection mode'
+    [[ "${GITHUB_REPOSITORY:-}" == 'WilliamAGH/coolify' ]] \
+        || die 'release failure injection requires the WilliamAGH/coolify repository'
+    [[ "${GITHUB_EVENT_NAME:-}" == 'repository_dispatch' ]] \
+        || die 'release failure injection requires a repository_dispatch event'
+    [[ "${GITHUB_REF:-}" == 'refs/heads/v4.x' ]] \
+        || die 'release failure injection requires refs/heads/v4.x'
+    [[ "${GITHUB_REF_PROTECTED:-}" == 'true' ]] \
+        || die 'release failure injection requires a protected ref'
+
+    case "${ghcr_repository}|${docker_repository}" in
+        'ghcr.io/williamagh/coolify-remediation-issue7|docker.io/williamagh/coolify-remediation-issue7' | \
+        'ghcr.io/williamagh/coolify-remediation-issue9|docker.io/williamagh/coolify-remediation-issue9' | \
+        'ghcr.io/williamagh/coolify-remediation-issue18|docker.io/williamagh/coolify-remediation-issue18')
+            ;;
+        *)
+            die 'release failure injection target pair is not allowlisted'
+            ;;
+    esac
+
+    [[ -n "$ghcr_previous" && -n "$docker_previous" ]] \
+        || die 'release failure injection requires both aliases to have predecessors'
+    [[ "$candidate_index" != "$ghcr_previous" && "$candidate_index" != "$docker_previous" ]] \
+        || die 'release failure injection requires a candidate distinct from both alias predecessors'
+}
+
 promote_alias() {
     local ghcr_repository="$1"
     local docker_repository="$2"
@@ -410,6 +444,7 @@ promote_alias() {
     local updated_ghcr='false'
     local updated_docker='false'
     local preflight_status
+    local inject_docker_alias_before_copy='false'
 
     require_digest "$candidate_index"
     require_digest "$candidate_amd64"
@@ -425,6 +460,12 @@ promote_alias() {
         return "$preflight_status"
     }
 
+    if [[ -n "${PUBLISH_LINUX_IMAGE_FAILURE_INJECTION:-}" ]]; then
+        validate_docker_alias_before_copy_failure_injection \
+            "$ghcr_repository" "$docker_repository" "$candidate_index" "$ghcr_previous" "$docker_previous"
+        inject_docker_alias_before_copy='true'
+    fi
+
     if [[ "$ghcr_previous" != "$candidate_index" ]]; then
         if ! regctl image copy "${ghcr_repository}@${candidate_index}" "${ghcr_repository}:${tag}"; then
             die "unable to promote GHCR ${tag}"
@@ -435,6 +476,10 @@ promote_alias() {
                 || die "unable to compensate GHCR ${tag}"
             die "GHCR ${tag} platform verification failed"
         fi
+    fi
+
+    if [[ "$inject_docker_alias_before_copy" == 'true' ]]; then
+        die "injected failure after GHCR ${tag} promotion before Docker Hub copy"
     fi
 
     if [[ "$docker_previous" != "$candidate_index" ]]; then
