@@ -6,6 +6,7 @@ use App\Actions\Proxy\ControlPlane\ControlPlaneGenerationPromotionPhase;
 use App\Actions\Proxy\ControlPlane\ControlPlaneGenerationPromotionState;
 use App\Actions\Proxy\ControlPlane\ControlPlaneGenerationRuntime;
 use App\Actions\Proxy\ControlPlane\VerifyControlPlaneGenerationDrainProof;
+use App\Support\ProxyMutationQueueSnapshot;
 
 function controlPlaneGenerationDrainProofVerifierState(): ControlPlaneGenerationPromotionState
 {
@@ -122,12 +123,26 @@ function successfulControlPlaneGenerationDrainProofTranscript(ControlPlaneGenera
     ]);
 }
 
+function controlPlaneGenerationDrainProofQueueSnapshot(
+    ?string $operationId = 'promotion-one',
+    int $pending = 0,
+    int $reserved = 0,
+    int $delayed = 0,
+): Closure {
+    return static fn (): ProxyMutationQueueSnapshot => new ProxyMutationQueueSnapshot(
+        $operationId,
+        $pending,
+        $reserved,
+        $delayed,
+    );
+}
+
 it('returns the canonical durable zero observation with a state-derived predecessor checksum', function (): void {
     $state = controlPlaneGenerationDrainProofVerifierState();
     $observation = VerifyControlPlaneGenerationDrainProof::run(
         state: $state,
         transcript: successfulControlPlaneGenerationDrainProofTranscript($state),
-        freezeOperationId: $state->operationId,
+        queueSnapshotProvider: controlPlaneGenerationDrainProofQueueSnapshot(),
     );
 
     expect($observation)->toBe([
@@ -144,7 +159,7 @@ it('rejects forged Docker ID, name, and immutable image records', function (stri
     $state = controlPlaneGenerationDrainProofVerifierState();
     $transcript = str_replace($search, $replace, successfulControlPlaneGenerationDrainProofTranscript($state));
 
-    expect(fn (): array => VerifyControlPlaneGenerationDrainProof::run($state, $transcript, $state->operationId))
+    expect(fn (): array => VerifyControlPlaneGenerationDrainProof::run($state, $transcript, controlPlaneGenerationDrainProofQueueSnapshot()))
         ->toThrow(InvalidArgumentException::class, 'stale predecessor runtime identity');
 })->with([
     'Docker ID' => [str_repeat('a', 64), str_repeat('1', 64)],
@@ -172,13 +187,13 @@ it('rejects partial, extra, duplicate, and malformed predecessor runtime records
     );
     $malformed = ControlPlaneGenerationDrainProof::TRANSCRIPT_BEGIN."\nmalformed\n".ControlPlaneGenerationDrainProof::TRANSCRIPT_END;
 
-    expect(fn (): array => VerifyControlPlaneGenerationDrainProof::run($state, $partial, $state->operationId))
+    expect(fn (): array => VerifyControlPlaneGenerationDrainProof::run($state, $partial, controlPlaneGenerationDrainProofQueueSnapshot()))
         ->toThrow(InvalidArgumentException::class, 'partial')
-        ->and(fn (): array => VerifyControlPlaneGenerationDrainProof::run($state, $extra, $state->operationId))
+        ->and(fn (): array => VerifyControlPlaneGenerationDrainProof::run($state, $extra, controlPlaneGenerationDrainProofQueueSnapshot()))
         ->toThrow(InvalidArgumentException::class, 'extra member')
-        ->and(fn (): array => VerifyControlPlaneGenerationDrainProof::run($state, $duplicate, $state->operationId))
+        ->and(fn (): array => VerifyControlPlaneGenerationDrainProof::run($state, $duplicate, controlPlaneGenerationDrainProofQueueSnapshot()))
         ->toThrow(InvalidArgumentException::class, 'repeats')
-        ->and(fn (): array => VerifyControlPlaneGenerationDrainProof::run($state, $malformed, $state->operationId))
+        ->and(fn (): array => VerifyControlPlaneGenerationDrainProof::run($state, $malformed, controlPlaneGenerationDrainProofQueueSnapshot()))
         ->toThrow(InvalidArgumentException::class, 'malformed sentinel record');
 });
 
@@ -190,7 +205,7 @@ it('refuses a nonzero TCP count instead of creating a resettable zero observatio
         successfulControlPlaneGenerationDrainProofTranscript($state),
     );
 
-    expect(fn (): array => VerifyControlPlaneGenerationDrainProof::run($state, $transcript, $state->operationId))
+    expect(fn (): array => VerifyControlPlaneGenerationDrainProof::run($state, $transcript, controlPlaneGenerationDrainProofQueueSnapshot()))
         ->toThrow(InvalidArgumentException::class, 'active backend TCP connections');
 });
 
@@ -200,12 +215,12 @@ it('requires the exact freeze owner, zero queue counts, and timestamps inside th
     $beforeRouteAcknowledgement = str_replace('2026-07-19T12:10:10Z', '2026-07-19T12:08:59Z', $successful);
     $atDeadline = str_replace('2026-07-19T12:10:10Z', '2026-07-19T12:20:00Z', $successful);
 
-    expect(fn (): array => VerifyControlPlaneGenerationDrainProof::run($state, $successful, 'another-operation'))
+    expect(fn (): array => VerifyControlPlaneGenerationDrainProof::run($state, $successful, controlPlaneGenerationDrainProofQueueSnapshot('another-operation')))
         ->toThrow(InvalidArgumentException::class, 'exact mutation freeze owner')
-        ->and(fn (): array => VerifyControlPlaneGenerationDrainProof::run($state, $successful, $state->operationId, pending: 1))
+        ->and(fn (): array => VerifyControlPlaneGenerationDrainProof::run($state, $successful, controlPlaneGenerationDrainProofQueueSnapshot(pending: 1)))
         ->toThrow(InvalidArgumentException::class, 'empty canonical mutation queue')
-        ->and(fn (): array => VerifyControlPlaneGenerationDrainProof::run($state, $beforeRouteAcknowledgement, $state->operationId))
+        ->and(fn (): array => VerifyControlPlaneGenerationDrainProof::run($state, $beforeRouteAcknowledgement, controlPlaneGenerationDrainProofQueueSnapshot()))
         ->toThrow(InvalidArgumentException::class, 'acknowledged immutable drain window')
-        ->and(fn (): array => VerifyControlPlaneGenerationDrainProof::run($state, $atDeadline, $state->operationId))
+        ->and(fn (): array => VerifyControlPlaneGenerationDrainProof::run($state, $atDeadline, controlPlaneGenerationDrainProofQueueSnapshot()))
         ->toThrow(InvalidArgumentException::class, 'acknowledged immutable drain window');
 });
