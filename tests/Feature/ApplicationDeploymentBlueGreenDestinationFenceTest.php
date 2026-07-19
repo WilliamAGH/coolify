@@ -182,6 +182,7 @@ function createCompletedApplicationDeploymentBlueGreenState(array $fixture): App
         'blue_deployment_uuid' => $fixture['deployment']->deployment_uuid,
         'phase' => BlueGreenDeploymentPhase::IDLE,
         'routing_revision' => 1,
+        'supersession_generation' => 1,
         'destination_fence_epoch' => 1,
         'destination_fence_operation_id' => $fixture['deployment']->deployment_uuid,
         'destination_fence_mutation_sequence' => 1,
@@ -193,6 +194,7 @@ function createCompletedApplicationDeploymentBlueGreenState(array $fixture): App
         'blue_green_color' => BlueGreenDeploymentColor::BLUE->value,
         'blue_green_phase' => BlueGreenDeploymentPhase::IDLE->value,
         'blue_green_routing_revision' => 1,
+        'blue_green_supersession_generation' => 1,
         'blue_green_destination_fence_epoch' => 1,
         'blue_green_server_boot_id' => '11111111-2222-3333-4444-555555555555',
         'blue_green_topology_digest' => $topologyDigest,
@@ -318,7 +320,10 @@ it('keeps a drain timeout nonterminal, schedules bounded recovery, and emits suc
             && $job->recoveryAttempt === 1,
     );
 
-    $fixture['deployment']->update(['blue_green_phase' => BlueGreenDeploymentPhase::DRAINING]);
+    $fixture['deployment']->update([
+        'blue_green_phase' => BlueGreenDeploymentPhase::DRAINING,
+        'blue_green_supersession_generation' => 1,
+    ]);
     $resume = new ResumeBlueGreenDrainingDeploymentJob($fixture['deployment']->id);
     expect($resume->scheduleNextAttempt($fixture['deployment']))->toBeTrue()
         ->and($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
@@ -372,6 +377,7 @@ it('leaves an unowned drain recovery failure nonterminal for the scheduled recon
         'phase' => BlueGreenDeploymentPhase::IDLE,
         'routing_revision' => 1,
         'operation_deployment_uuid' => 'another-deployment',
+        'supersession_generation' => 1,
     ]);
     $resume = new ResumeBlueGreenDrainingDeploymentJob($fixture['deployment']->id);
 

@@ -297,6 +297,34 @@ return new class extends Migration
                 join pg_am as access_method on access_method.oid = index_relation.relam
                 where namespace.nspname = current_schema()
                   and table_relation.relname = 'application_blue_green_deployments'
+            ),
+            authorized_index_catalog as (
+                select
+                    index_catalog.*,
+                    index_name = 'app_blue_green_inactive_retirement_due_index'
+                        and not indisprimary
+                        and not indisunique
+                        and array(
+                            select indexed_attribute.attname::text
+                            from unnest(indkey::smallint[]) with ordinality as indexed_key(attribute_number, position)
+                            join pg_attribute as indexed_attribute
+                              on indexed_attribute.attrelid = indrelid
+                             and indexed_attribute.attnum = indexed_key.attribute_number
+                            where indexed_key.position <= indnkeyatts
+                            order by indexed_key.position
+                        ) = array[
+                            'inactive_retirement_not_before_at',
+                            'inactive_retirement_stopped_at',
+                            'inactive_retirement_intervention_required_at',
+                            'inactive_retirement_dispatch_reserved_until_at'
+                        ]::text[]
+                        and opclass_name = array[
+                            'pg_catalog.timestamp_ops',
+                            'pg_catalog.timestamp_ops',
+                            'pg_catalog.timestamp_ops',
+                            'pg_catalog.timestamp_ops'
+                        ]::text[] as is_authorized_inactive_retirement_due_index
+                from index_catalog
             )
             select
                 not exists (
@@ -431,7 +459,7 @@ return new class extends Migration
                     from pg_constraint
                     where conrelid = 'application_blue_green_deployments'::regclass
                       and conname <> 'app_blue_green_deployments_generation_owner_check')
-                and (select count(*) in (3, 4)
+                and (select count(*) = 3 + count(*) filter (where is_authorized_inactive_retirement_due_index)
                     and bool_and(indisvalid and indisready and indislive
                         and indexprs is null and indpred is null
                         and indnatts = indnkeyatts and access_method = 'btree'
@@ -445,9 +473,8 @@ return new class extends Migration
                     and count(*) filter (where index_name = 'app_blue_green_standalone_docker_index'
                         and not indisprimary and not indisunique and indkey::text = '3'
                         and opclass_name = array['pg_catalog.int8_ops']::text[]) = 1
-                    and count(*) filter (where index_name = 'app_blue_green_inactive_retirement_due_index'
-                        and not indisprimary and not indisunique) in (0, 1)
-                    from index_catalog)
+                    and count(*) filter (where is_authorized_inactive_retirement_due_index) in (0, 1)
+                    from authorized_index_catalog)
             SQL, [], false);
 
         if ($schemaIsExact !== true) {
