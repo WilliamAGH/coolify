@@ -10,6 +10,7 @@ use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
+use App\Notifications\Application\BlueGreenInterventionRequired;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Lorisleiva\Actions\Concerns\AsAction;
@@ -243,7 +244,7 @@ final class DeactivateBlueGreenApplicationDestination
         BlueGreenDeactivationException $exception,
     ): void {
         try {
-            DB::transaction(function () use ($preparation): void {
+            $applicationId = DB::transaction(function () use ($preparation): int {
                 $locks = BlueGreenLifecycleDatabaseLocks::forDestination(
                     $preparation->deactivation->application_id,
                     $preparation->deactivation->standalone_docker_id,
@@ -277,7 +278,7 @@ final class DeactivateBlueGreenApplicationDestination
                     throw new BlueGreenDeactivationException('The durable deactivation owner changed while intervention was being recorded.');
                 }
                 if ($preparation->state === null) {
-                    return;
+                    return $locks->application->id;
                 }
                 $state = $locks->state;
                 if ($state === null || $state->id !== $preparation->state->id) {
@@ -311,7 +312,10 @@ final class DeactivateBlueGreenApplicationDestination
                 ]) !== 1) {
                     throw new BlueGreenDeactivationException('The durable deployment provenance changed while intervention was being recorded.');
                 }
+
+                return $locks->application->id;
             }, attempts: 5);
+            $this->notifyIntervention($applicationId);
         } catch (Throwable $markingException) {
             throw new BlueGreenDeactivationException(
                 $exception->getMessage().' The durable state could not be marked for intervention: '.$markingException->getMessage(),
@@ -319,6 +323,14 @@ final class DeactivateBlueGreenApplicationDestination
                 $markingException,
             );
         }
+    }
+
+    private function notifyIntervention(int $applicationId): void
+    {
+        $application = Application::withTrashed()
+            ->with('environment.project.team')
+            ->find($applicationId);
+        $application?->team()?->notify(new BlueGreenInterventionRequired($application));
     }
 
     /** @return array<string, int|string|null> */

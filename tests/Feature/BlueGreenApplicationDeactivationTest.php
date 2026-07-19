@@ -15,8 +15,11 @@ use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\ApplicationBlueGreenDeactivation;
+use App\Models\InstanceSettings;
+use App\Notifications\Application\BlueGreenInterventionRequired;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Process\PendingProcess;
+use Illuminate\Support\Facades\Notification;
 use Illuminate\Support\Facades\Process;
 use Tests\Support\BlueGreenDeactivationScenario;
 
@@ -185,6 +188,15 @@ it('keeps transport-ambiguous remote failures resumable under the exact generati
 
 it('marks a proven remote invariant failure for intervention instead of continuing deletion', function () {
     ['application' => $application, 'destination' => $destination] = BlueGreenDeactivationScenario::context();
+    InstanceSettings::unguarded(
+        fn () => InstanceSettings::query()->firstOrCreate(['id' => 0]),
+    );
+    Notification::fake();
+    $application->team()->emailNotificationSettings()->update([
+        'use_instance_email_settings' => true,
+        'deployment_failure_email_notifications' => true,
+    ]);
+    expect($application->team()->fresh()->getEnabledChannels('deployment_failure'))->not->toBeEmpty();
     $state = BlueGreenDeactivationScenario::routeLessState($application, $destination);
     $application->delete();
     fakeBlueGreenRemoteProcessSequence(
@@ -203,5 +215,10 @@ it('marks a proven remote invariant failure for intervention instead of continui
     expect($deactivation->phase)->toBe(BlueGreenDeactivationPhase::INTERVENTION_REQUIRED)
         ->and($state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
         ->and($state->fresh()->supersession_generation)->toBe($deactivation->supersession_generation);
+    Notification::assertSentToTimes(
+        $application->team(),
+        BlueGreenInterventionRequired::class,
+        1,
+    );
     Process::assertRanTimes(fn () => true, 2);
 });

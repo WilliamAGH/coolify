@@ -5,8 +5,10 @@ namespace App\Actions\Application\BlueGreen;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
+use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
+use App\Notifications\Application\BlueGreenInterventionRequired;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Facades\DB;
 use Lorisleiva\Actions\Concerns\AsAction;
@@ -23,7 +25,17 @@ final class MarkBlueGreenRecoveryInterventionRequired
         ?string $expectedOperationUuid,
         ?int $expectedSupersessionGeneration = null,
     ): bool {
-        return DB::transaction(function () use ($stateId, $expectedOperationUuid, $expectedSupersessionGeneration): bool {
+        $notificationApplicationId = null;
+        $notificationOperationUuid = null;
+        $recorded = DB::transaction(function () use (
+            $stateId,
+            $expectedOperationUuid,
+            $expectedSupersessionGeneration,
+            &$notificationApplicationId,
+            &$notificationOperationUuid,
+        ): bool {
+            $notificationApplicationId = null;
+            $notificationOperationUuid = null;
             $identity = ApplicationBlueGreenDeployment::query()->find($stateId);
             if ($identity === null) {
                 return false;
@@ -65,10 +77,21 @@ final class MarkBlueGreenRecoveryInterventionRequired
             }
             if ($state->operation_deployment_uuid === null
                 && ($operationUuid === null || $locks->queue($operationUuid) === null)) {
-                return $this->terminalizeStateWithoutQueue($state, $generation, $operationUuid);
+                $recorded = $this->terminalizeStateWithoutQueue($state, $generation, $operationUuid);
+                if ($recorded) {
+                    $notificationApplicationId = $locks->application->id;
+                    $notificationOperationUuid = $operationUuid;
+                }
+
+                return $recorded;
             }
             if ($operationUuid === null) {
-                return $this->terminalizeStateWithoutQueue($state, $generation, null);
+                $recorded = $this->terminalizeStateWithoutQueue($state, $generation, null);
+                if ($recorded) {
+                    $notificationApplicationId = $locks->application->id;
+                }
+
+                return $recorded;
             }
 
             $deployment = $locks->queue($operationUuid);
@@ -108,8 +131,25 @@ final class MarkBlueGreenRecoveryInterventionRequired
                 throw new BlueGreenDeploymentTransitionException('The blue-green operation changed while reconciliation intervention was recorded.');
             }
 
+            $notificationApplicationId = $locks->application->id;
+            $notificationOperationUuid = $operationUuid;
+
             return true;
         }, attempts: 5);
+
+        if ($notificationApplicationId !== null) {
+            $this->notifyIntervention($notificationApplicationId, $notificationOperationUuid);
+        }
+
+        return $recorded;
+    }
+
+    private function notifyIntervention(int $applicationId, ?string $operationUuid): void
+    {
+        $application = Application::query()
+            ->with('environment.project.team')
+            ->find($applicationId);
+        $application?->team()?->notify(new BlueGreenInterventionRequired($application, $operationUuid));
     }
 
     private function terminalizeStateWithoutQueue(

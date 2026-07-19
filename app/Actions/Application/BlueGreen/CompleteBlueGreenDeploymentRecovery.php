@@ -5,6 +5,8 @@ namespace App\Actions\Application\BlueGreen;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
+use App\Notifications\Application\BlueGreenDeploymentRolledBack;
+use Illuminate\Support\Facades\DB;
 use Lorisleiva\Actions\Concerns\AsAction;
 
 final class CompleteBlueGreenDeploymentRecovery
@@ -17,18 +19,27 @@ final class CompleteBlueGreenDeploymentRecovery
             throw new BlueGreenDeploymentTransitionException('A finalized or draining operation cannot complete rollback recovery.');
         }
 
-        $claim = $operation->claim;
-        $state = ApplicationBlueGreenDeployment::query()->find($claim->stateId);
-        $deployment = ApplicationDeploymentQueue::query()
-            ->where('application_id', $claim->applicationId)
-            ->where('deployment_uuid', $claim->deploymentUuid)
-            ->first();
-        if ($state === null || $deployment === null) {
-            throw new BlueGreenDeploymentTransitionException('The recovery owner disappeared before rollback could complete.');
-        }
-        $this->assertExactRollback($state, $deployment, $operation);
+        $completed = DB::transaction(function () use ($operation): ApplicationBlueGreenDeployment {
+            $claim = $operation->claim;
+            $state = ApplicationBlueGreenDeployment::query()->find($claim->stateId);
+            $deployment = ApplicationDeploymentQueue::query()
+                ->where('application_id', $claim->applicationId)
+                ->where('deployment_uuid', $claim->deploymentUuid)
+                ->first();
+            if ($state === null || $deployment === null) {
+                throw new BlueGreenDeploymentTransitionException('The recovery owner disappeared before rollback could complete.');
+            }
+            $this->assertExactRollback($state, $deployment, $operation);
 
-        return TransitionsBlueGreenDeployment::finishRollback($claim);
+            return TransitionsBlueGreenDeployment::finishRollback($claim);
+        }, attempts: 5);
+        $operation->application->loadMissing('environment.project.team');
+        $operation->application->team()?->notify(new BlueGreenDeploymentRolledBack(
+            $operation->application,
+            $operation->claim->deploymentUuid,
+        ));
+
+        return $completed;
     }
 
     private function assertExactRollback(

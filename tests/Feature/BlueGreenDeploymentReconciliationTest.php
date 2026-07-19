@@ -15,9 +15,12 @@ use App\Jobs\ResumeBlueGreenDrainingDeploymentJob;
 use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\InstanceSettings;
+use App\Notifications\Application\BlueGreenDeploymentRolledBack;
+use App\Notifications\Application\BlueGreenInterventionRequired;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Notification;
 use Illuminate\Support\Facades\Queue;
 use Tests\Support\BlueGreenRecoveryScenario;
 
@@ -69,7 +72,12 @@ it('defers durable draining states to the dedicated resume job without forward c
 });
 
 it('atomically marks an unsafe stale preparation as requiring intervention', function (): void {
+    Notification::fake();
     $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: true);
+    $scenario->application->team()->emailNotificationSettings()->update([
+        'use_instance_email_settings' => true,
+        'deployment_failure_email_notifications' => true,
+    ]);
     blueGreenReconciliationMakeQueueStale($scenario->deployment);
 
     $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
@@ -84,6 +92,11 @@ it('atomically marks an unsafe stale preparation as requiring intervention', fun
 
     expect($repeat->outcome)->toBe(BlueGreenReconciliationResult::INTERVENTION_REQUIRED)
         ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value);
+    Notification::assertSentToTimes(
+        $scenario->application->team(),
+        BlueGreenInterventionRequired::class,
+        1,
+    );
 });
 
 it('leaves a newer supersession generation untouched', function (): void {
@@ -127,9 +140,14 @@ it('leaves a deactivation-owned state untouched', function (): void {
 });
 
 it('converges only a stale unmutated operation whose exact candidate is proven absent', function (): void {
+    Notification::fake();
     InspectBlueGreenContainer::shouldRun()->andReturn(BlueGreenContainerInspection::missing());
     BlueGreenProxyRollbackArtifactReader::shouldRun()->andReturnNull();
     $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
+    $scenario->application->team()->emailNotificationSettings()->update([
+        'use_instance_email_settings' => true,
+        'deployment_failure_email_notifications' => true,
+    ]);
     blueGreenReconciliationMakeQueueStale($scenario->deployment);
 
     $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
@@ -141,6 +159,11 @@ it('converges only a stale unmutated operation whose exact candidate is proven a
         ->and($scenario->deployment->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::IDLE)
         ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value)
         ->and($scenario->deployment->fresh()->finished_at)->not->toBeNull();
+    Notification::assertSentToTimes(
+        $scenario->application->team(),
+        BlueGreenDeploymentRolledBack::class,
+        1,
+    );
 });
 
 it('reconciles one interrupted state per bounded deterministic scan', function (): void {

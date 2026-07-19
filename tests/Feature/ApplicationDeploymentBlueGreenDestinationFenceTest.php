@@ -22,6 +22,8 @@ use App\Models\Project;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
 use App\Models\Team;
+use App\Notifications\Application\BlueGreenDeploymentRolledBack;
+use App\Notifications\Application\BlueGreenInterventionRequired;
 use App\Notifications\Application\DeploymentFailed;
 use App\Services\BlueGreenDeploymentLifecycle;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -406,6 +408,8 @@ it('does not use generic candidate cleanup or overwrite newer destination state 
         ->and($newerState->fresh()->destination_fence_epoch)->toBe(9)
         ->and($newerState->fresh()->destination_fence_operation_id)->toBe('newer-destination-owner')
         ->and($newerState->fresh()->destination_fence_mutation_sequence)->toBe(3);
+    Notification::assertNotSentTo($fixture['team'], BlueGreenInterventionRequired::class);
+    Notification::assertNotSentTo($fixture['team'], BlueGreenDeploymentRolledBack::class);
     Process::assertNothingRan();
 });
 
