@@ -1,6 +1,7 @@
 <?php
 
 use App\Actions\Proxy\ControlPlane\ActivateControlPlaneProxyEnrollment;
+use App\Actions\Proxy\ControlPlane\ControlPlaneCandidateHealthMarker;
 use App\Actions\Proxy\ControlPlane\ControlPlaneCandidateMembersProof;
 use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentPhase;
@@ -8,6 +9,7 @@ use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentState;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyExposure;
 use App\Actions\Proxy\ControlPlane\ControlPlaneStaticListenerHandoff;
 use App\Actions\Proxy\ControlPlane\ControlPlaneStaticProxyConfiguration;
+use App\Actions\Proxy\ControlPlane\InstallControlPlaneCandidateHealthMarkers;
 use App\Actions\Proxy\ControlPlane\ManagedTraefikDocumentWriter;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
 use App\Actions\Proxy\ControlPlane\VerifyControlPlaneCandidateMembers;
@@ -60,6 +62,7 @@ function controlPlaneActivationAction(StoreControlPlaneProxyEnrollmentState $sto
 {
     return new ActivateControlPlaneProxyEnrollment(
         $store,
+        new InstallControlPlaneCandidateHealthMarkers,
         new VerifyControlPlaneCandidateMembers,
         new ManagedTraefikDocumentWriter,
         new ControlPlaneStaticListenerHandoff,
@@ -94,9 +97,10 @@ it('persists activation before self-replacement and requires a fresh replay to b
     $executor = function (string $command) use (&$commands, $state): string {
         $commands[] = $command;
 
-        return match (count($commands) % 3) {
-            1 => activationCandidateProofTranscript($state),
-            2 => ManagedTraefikDocumentWriter::APPLIED_OUTPUT,
+        return match (count($commands) % 4) {
+            1 => '',
+            2 => activationCandidateProofTranscript($state),
+            3 => ManagedTraefikDocumentWriter::APPLIED_OUTPUT,
             0 => ControlPlaneStaticListenerHandoff::APPLIED_OUTPUT,
         };
     };
@@ -109,10 +113,11 @@ it('persists activation before self-replacement and requires a fresh replay to b
     expect($submitted->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Activating)
         ->and($resumed->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Active)
         ->and($replayed->toArray())->toBe($resumed->toArray())
-        ->and($commands)->toHaveCount(6)
-        ->and($commands[0])->toContain("'docker' 'exec'")
-        ->and($commands[1])->toContain('coolify.yaml')
-        ->and($commands[2])->toContain('docker-compose.control-plane-listener.yml')
+        ->and($commands)->toHaveCount(8)
+        ->and($commands[0])->toContain(ControlPlaneCandidateHealthMarker::CONTAINER_MARKER_PATH)
+        ->and($commands[1])->toContain("'docker' 'exec'")
+        ->and($commands[2])->toContain('coolify.yaml')
+        ->and($commands[3])->toContain('docker-compose.control-plane-listener.yml')
         ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Active);
 });
 
@@ -124,9 +129,12 @@ it('keeps an ambiguous self-replacement durably activating and resumes safely', 
         expect($command)->not->toBeEmpty();
         $calls++;
         if ($calls === 1) {
-            return activationCandidateProofTranscript($state);
+            return '';
         }
         if ($calls === 2) {
+            return activationCandidateProofTranscript($state);
+        }
+        if ($calls === 3) {
             return ManagedTraefikDocumentWriter::APPLIED_OUTPUT;
         }
 
@@ -147,9 +155,10 @@ it('keeps an ambiguous self-replacement durably activating and resumes safely', 
             $replayCalls++;
 
             return match ($replayCalls) {
-                1 => activationCandidateProofTranscript($state),
-                2 => ManagedTraefikDocumentWriter::APPLIED_OUTPUT,
-                3 => ControlPlaneStaticListenerHandoff::APPLIED_OUTPUT,
+                1 => '',
+                2 => activationCandidateProofTranscript($state),
+                3 => ManagedTraefikDocumentWriter::APPLIED_OUTPUT,
+                4 => ControlPlaneStaticListenerHandoff::APPLIED_OUTPUT,
             };
         },
     );
@@ -169,7 +178,7 @@ it('rejects a stale candidate before mutating the managed Traefik document', fun
     $executor = function (string $command) use (&$commands, $staleTranscript): string {
         $commands[] = $command;
 
-        return $staleTranscript;
+        return count($commands) === 1 ? '' : $staleTranscript;
     };
     expect(fn () => controlPlaneActivationAction($store)->handle(
         $server,
@@ -177,8 +186,8 @@ it('rejects a stale candidate before mutating the managed Traefik document', fun
         'activate-token',
         $executor,
     ))->toThrow(InvalidArgumentException::class, 'Dynamic-Sha256');
-    expect($commands)->toHaveCount(1)
-        ->and($commands[0])->not->toContain('coolify.yaml')
+    expect($commands)->toHaveCount(2)
+        ->and($commands[1])->not->toContain('coolify.yaml')
         ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Prepared);
 });
 

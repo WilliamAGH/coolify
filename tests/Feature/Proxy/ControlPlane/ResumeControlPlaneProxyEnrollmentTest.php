@@ -11,6 +11,7 @@ use App\Actions\Proxy\ControlPlane\ControlPlaneStaticListenerHandoff;
 use App\Actions\Proxy\ControlPlane\ControlPlaneStaticProxyConfiguration;
 use App\Actions\Proxy\ControlPlane\ExecuteControlPlaneProxyEnrollmentRollback;
 use App\Actions\Proxy\ControlPlane\FinalizeControlPlaneProxyEnrollment;
+use App\Actions\Proxy\ControlPlane\InstallControlPlaneCandidateHealthMarkers;
 use App\Actions\Proxy\ControlPlane\ManagedTraefikDocumentWriter;
 use App\Actions\Proxy\ControlPlane\ResumeControlPlaneProxyEnrollment;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
@@ -60,6 +61,7 @@ function resumableControlPlaneEnrollment(): array
         $store,
         new ActivateControlPlaneProxyEnrollment(
             $store,
+            new InstallControlPlaneCandidateHealthMarkers,
             new VerifyControlPlaneCandidateMembers,
             new ManagedTraefikDocumentWriter,
             new ControlPlaneStaticListenerHandoff,
@@ -99,8 +101,8 @@ function resumedControlPlaneCandidateTranscript(ControlPlaneProxyEnrollmentState
 function resumedControlPlaneTranscript(ControlPlaneProxyEnrollmentState $state): string
 {
     $records = [];
-    foreach ([ControlPlaneProxyRouteProof::PUBLIC_ROUTE, ControlPlaneProxyRouteProof::APP_PORT_ROUTE] as $route) {
-        foreach ([1, 2] as $attempt) {
+    foreach ([1, 2] as $attempt) {
+        foreach ([ControlPlaneProxyRouteProof::PUBLIC_ROUTE, ControlPlaneProxyRouteProof::APP_PORT_ROUTE] as $route) {
             $records[] = implode("\n", [
                 "__COOLIFY_ROUTE_PROOF_BEGIN__ {$route} {$attempt}",
                 'HTTP/2 200',
@@ -112,12 +114,13 @@ function resumedControlPlaneTranscript(ControlPlaneProxyEnrollmentState $state):
                 ControlPlaneProxyRouteProof::DYNAMIC_SHA256_HEADER.': '.hash('sha256', $state->dynamicReplacementBytes),
                 '',
                 '__COOLIFY_ROUTE_PROOF_STATUS__ 200',
+                '__COOLIFY_ROUTE_PROOF_CURL_EXIT__ 0',
                 '__COOLIFY_ROUTE_PROOF_END__',
             ]);
         }
     }
 
-    return implode("\n", $records);
+    return implode("\n", [...$records, '__COOLIFY_ROUTE_PROOF_CONVERGED__ 2']);
 }
 
 it('resumes a fenced enrollment across self-replacement without exposing its token in the command signature', function (): void {
@@ -127,10 +130,11 @@ it('resumes a fenced enrollment across self-replacement without exposing its tok
         $remoteCalls++;
 
         return match ($remoteCalls) {
-            1, 4 => resumedControlPlaneCandidateTranscript($state),
-            2, 5 => ManagedTraefikDocumentWriter::APPLIED_OUTPUT,
-            3, 6 => ControlPlaneStaticListenerHandoff::APPLIED_OUTPUT,
-            7 => resumedControlPlaneTranscript($state),
+            1, 5 => '',
+            2, 6 => resumedControlPlaneCandidateTranscript($state),
+            3, 7 => ManagedTraefikDocumentWriter::APPLIED_OUTPUT,
+            4, 8 => ControlPlaneStaticListenerHandoff::APPLIED_OUTPUT,
+            9 => resumedControlPlaneTranscript($state),
             default => throw new RuntimeException("Unexpected remote call {$remoteCalls}: {$command}"),
         };
     };
@@ -140,7 +144,7 @@ it('resumes a fenced enrollment across self-replacement without exposing its tok
 
     expect($submitted->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Activating)
         ->and($enrolled->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Enrolled)
-        ->and($remoteCalls)->toBe(7)
+        ->and($remoteCalls)->toBe(9)
         ->and($action->commandSignature)->not->toContain('token')
         ->and($action->commandSignature)->toContain('--rollback')
         ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Enrolled);

@@ -50,8 +50,8 @@ function finalizableControlPlaneEnrollment(): array
 function finalizationTranscript(ControlPlaneProxyEnrollmentState $state): string
 {
     $records = [];
-    foreach ([ControlPlaneProxyRouteProof::PUBLIC_ROUTE, ControlPlaneProxyRouteProof::APP_PORT_ROUTE] as $route) {
-        foreach ([1, 2] as $attempt) {
+    foreach ([1, 2] as $attempt) {
+        foreach ([ControlPlaneProxyRouteProof::PUBLIC_ROUTE, ControlPlaneProxyRouteProof::APP_PORT_ROUTE] as $route) {
             $records[] = implode("\n", [
                 "__COOLIFY_ROUTE_PROOF_BEGIN__ {$route} {$attempt}",
                 'HTTP/2 200',
@@ -63,12 +63,13 @@ function finalizationTranscript(ControlPlaneProxyEnrollmentState $state): string
                 ControlPlaneProxyRouteProof::DYNAMIC_SHA256_HEADER.': '.hash('sha256', $state->dynamicReplacementBytes),
                 '',
                 '__COOLIFY_ROUTE_PROOF_STATUS__ 200',
+                '__COOLIFY_ROUTE_PROOF_CURL_EXIT__ 0',
                 '__COOLIFY_ROUTE_PROOF_END__',
             ]);
         }
     }
 
-    return implode("\n", $records);
+    return implode("\n", [...$records, '__COOLIFY_ROUTE_PROOF_CONVERGED__ 2']);
 }
 
 it('finalizes one exact active owner and performs no remote work on replay', function (): void {
@@ -78,7 +79,9 @@ it('finalizes one exact active owner and performs no remote work on replay', fun
     $executor = function (string $command) use (&$remoteCalls, $state): string {
         $remoteCalls++;
         expect($command)->toContain('http://127.0.0.1:8000/api/health')
-            ->and($command)->not->toContain('finalize-token');
+            ->and($command)->not->toContain('finalize-token')
+            ->and($command)->not->toContain('Authorization')
+            ->and($command)->not->toContain('Bearer');
 
         return finalizationTranscript($state);
     };

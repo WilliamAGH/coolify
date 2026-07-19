@@ -9,6 +9,7 @@ use App\Actions\Proxy\ControlPlane\ControlPlaneStaticListenerHandoff;
 use App\Actions\Proxy\ControlPlane\ExecuteControlPlaneProxyEnrollmentRollback;
 use App\Actions\Proxy\ControlPlane\ExtractControlPlaneDynamicFragments;
 use App\Actions\Proxy\ControlPlane\FinalizeControlPlaneProxyEnrollment;
+use App\Actions\Proxy\ControlPlane\InstallControlPlaneCandidateHealthMarkers;
 use App\Actions\Proxy\ControlPlane\ManagedTraefikDocumentWriter;
 use App\Actions\Proxy\ControlPlane\PrepareControlPlaneProxyEnrollment;
 use App\Actions\Proxy\ControlPlane\PrepareControlPlaneProxyEnrollmentFromHost;
@@ -29,6 +30,7 @@ function hostPreparedEnrollmentAction(StoreControlPlaneProxyEnrollmentState $sto
     $dynamicWriter = new ManagedTraefikDocumentWriter;
     $activator = new ActivateControlPlaneProxyEnrollment(
         $store,
+        new InstallControlPlaneCandidateHealthMarkers,
         new VerifyControlPlaneCandidateMembers,
         $dynamicWriter,
         $staticHandoff,

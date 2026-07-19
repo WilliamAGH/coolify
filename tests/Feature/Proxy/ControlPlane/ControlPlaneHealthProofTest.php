@@ -1,7 +1,10 @@
 <?php
 
+use App\Actions\Proxy\ControlPlane\ControlPlaneCandidateHealthMarker;
 use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyRouteProof;
+use App\Actions\Proxy\ControlPlane\RespondToControlPlaneHealthCheck;
+use Illuminate\Http\Request;
 
 beforeEach(function (): void {
     config([
@@ -93,4 +96,48 @@ it('omits backend identity from ordinary health when enrollment identity is inco
         ->assertSeeText('OK')
         ->assertHeaderMissing(ControlPlaneProxyRouteProof::BACKEND_MEMBER_HEADER)
         ->assertHeaderMissing(ControlPlaneProxyRouteProof::DYNAMIC_SHA256_HEADER);
+});
+
+it('uses the exact container-local candidate marker before static handoff', function (): void {
+    config([
+        'constants.control_plane_health.configuration_acknowledgement' => null,
+        'constants.control_plane_health.health_proof_token_sha256' => null,
+        'constants.control_plane_health.dynamic_sha256' => null,
+        'constants.control_plane_health.member' => null,
+        'constants.control_plane_health.revision' => null,
+    ]);
+    $derivedHealthProof = hash_hmac(
+        'sha256',
+        ControlPlaneDynamicConfiguration::HEALTH_PROOF_DERIVATION_CONTEXT,
+        'candidate-enrollment-token',
+    );
+    $marker = ControlPlaneCandidateHealthMarker::fromDerivedHealthProof(
+        operationId: 'candidate-operation',
+        expectedMember: 'green',
+        expectedRevision: 'revision-43',
+        dynamicSha256: str_repeat('e', 64),
+        derivedHealthProof: $derivedHealthProof,
+    );
+    $markerPath = tempnam(sys_get_temp_dir(), 'coolify-candidate-health-');
+    expect($markerPath)->toBeString();
+    file_put_contents($markerPath, $marker->toJson());
+
+    try {
+        $request = Request::create('/api/health');
+        $request->headers->set(ControlPlaneDynamicConfiguration::HEALTH_PROOF_HEADER, $derivedHealthProof);
+        $response = (new RespondToControlPlaneHealthCheck($markerPath))->handle($request);
+
+        expect($response->getStatusCode())->toBe(204)
+            ->and($response->headers->get(ControlPlaneProxyRouteProof::BACKEND_MEMBER_HEADER))->toBe('green')
+            ->and($response->headers->get(ControlPlaneProxyRouteProof::BACKEND_REVISION_HEADER))->toBe('revision-43')
+            ->and($response->headers->get(ControlPlaneProxyRouteProof::DYNAMIC_SHA256_HEADER))->toBe(str_repeat('e', 64));
+
+        $invalidRequest = Request::create('/api/health');
+        $invalidRequest->headers->set(ControlPlaneDynamicConfiguration::HEALTH_PROOF_HEADER, str_repeat('0', 64));
+        expect((new RespondToControlPlaneHealthCheck($markerPath))->handle($invalidRequest)->getStatusCode())->toBe(401);
+    } finally {
+        if (is_string($markerPath) && is_file($markerPath)) {
+            unlink($markerPath);
+        }
+    }
 });

@@ -26,6 +26,10 @@ final readonly class ControlPlaneProxyRouteProof
         public string $expectedBackendRevision,
         public string $dynamicReplacementSha256,
         public string $configurationAcknowledgement,
+        public int $maximumAttempts = 5,
+        public int $pollIntervalSeconds = 3,
+        public int $connectTimeoutSeconds = 2,
+        public int $requestTimeoutSeconds = 3,
     ) {
         $this->assertHost($canonicalHost);
         if (! in_array($publicScheme, ['http', 'https'], true)) {
@@ -47,6 +51,18 @@ final readonly class ControlPlaneProxyRouteProof
         }
         if (preg_match('/^[A-Za-z0-9._~+\/=:-]{16,512}$/D', $configurationAcknowledgement) !== 1) {
             throw new InvalidArgumentException('The control-plane configuration acknowledgement must be opaque and single-line.');
+        }
+        if ($maximumAttempts < 2 || $maximumAttempts > 10) {
+            throw new InvalidArgumentException('The control-plane route proof must allow between two and ten polling attempts.');
+        }
+        if ($pollIntervalSeconds < 0 || $pollIntervalSeconds > 60) {
+            throw new InvalidArgumentException('The control-plane route proof polling interval must be between zero and sixty seconds.');
+        }
+        if ($connectTimeoutSeconds < 1 || $connectTimeoutSeconds > $requestTimeoutSeconds) {
+            throw new InvalidArgumentException('The control-plane route proof connection timeout must not exceed its request timeout.');
+        }
+        if ($requestTimeoutSeconds < 1 || $requestTimeoutSeconds > 15) {
+            throw new InvalidArgumentException('The control-plane route proof request timeout must be between one and fifteen seconds.');
         }
     }
 
@@ -80,17 +96,39 @@ final readonly class ControlPlaneProxyRouteProof
 
     public function shellCommand(): string
     {
-        $commands = ['set -eu'];
+        $commands = [
+            'set -eu',
+            'consecutive_successful_rounds=0',
+            'round=1',
+            "while [ \"\$round\" -le {$this->maximumAttempts} ]; do",
+            '  round_successful=1',
+        ];
         foreach ([self::PUBLIC_ROUTE, self::APP_PORT_ROUTE] as $route) {
-            foreach ([1, 2] as $attempt) {
-                $commands[] = $this->attemptCommand($route, $attempt);
-            }
+            $commands[] = '  '.str_replace("\n", "\n  ", $this->attemptCommand($route));
         }
+        $commands = [
+            ...$commands,
+            '  if [ "$round_successful" -eq 1 ]; then',
+            '    consecutive_successful_rounds=$((consecutive_successful_rounds + 1))',
+            '  else',
+            '    consecutive_successful_rounds=0',
+            '  fi',
+            '  if [ "$consecutive_successful_rounds" -ge 2 ]; then',
+            "    printf '%s %s\\n' '__COOLIFY_ROUTE_PROOF_CONVERGED__' \"\$round\"",
+            '    exit 0',
+            '  fi',
+            "  if [ \"\$round\" -lt {$this->maximumAttempts} ]; then",
+            "    sleep {$this->pollIntervalSeconds}",
+            '  fi',
+            '  round=$((round + 1))',
+            'done',
+            "printf '%s %s\\n' '__COOLIFY_ROUTE_PROOF_TIMEOUT__' {$this->maximumAttempts}",
+        ];
 
         return implode("\n", $commands);
     }
 
-    private function attemptCommand(string $route, int $attempt): string
+    private function attemptCommand(string $route): string
     {
         $url = match ($route) {
             self::PUBLIC_ROUTE => $this->canonicalPublicUrl(),
@@ -101,11 +139,10 @@ final readonly class ControlPlaneProxyRouteProof
             'curl',
             '--fail',
             '--silent',
-            '--show-error',
             '--connect-timeout',
-            '5',
+            (string) $this->connectTimeoutSeconds,
             '--max-time',
-            '15',
+            (string) $this->requestTimeoutSeconds,
             '--request',
             'GET',
         ];
@@ -126,9 +163,25 @@ final readonly class ControlPlaneProxyRouteProof
         ];
 
         return implode("\n", [
-            "printf '%s\\n' ".escapeshellarg("__COOLIFY_ROUTE_PROOF_BEGIN__ {$route} {$attempt}"),
-            implode(' ', array_map(static fn (string $argument): string => escapeshellarg($argument), $arguments)),
-            "printf '%s\\n' ".escapeshellarg('__COOLIFY_ROUTE_PROOF_END__'),
+            "printf '%s %s\\n' ".escapeshellarg("__COOLIFY_ROUTE_PROOF_BEGIN__ {$route}").' "$round"',
+            'curl_exit=0',
+            'if output=$('.implode(' ', array_map(static fn (string $argument): string => escapeshellarg($argument), $arguments)).' 2>/dev/null); then',
+            '  :',
+            'else',
+            '  curl_exit=$?',
+            'fi',
+            "printf '%s\\n' \"\$output\"",
+            "printf '%s %s\\n' '__COOLIFY_ROUTE_PROOF_CURL_EXIT__' \"\$curl_exit\"",
+            "printf '%s\\n' '__COOLIFY_ROUTE_PROOF_END__'",
+            "status=\$(printf '%s\\n' \"\$output\" | sed -n 's/^__COOLIFY_ROUTE_PROOF_STATUS__ \\([0-9][0-9][0-9]\\)$/\\1/p')",
+            'case "'.$route.':$curl_exit:$status" in',
+            "  {$route}:0:200)",
+            '    :',
+            '    ;;',
+            "  {$route}:*)",
+            '    round_successful=0',
+            '    ;;',
+            'esac',
         ]);
     }
 

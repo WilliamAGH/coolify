@@ -13,6 +13,7 @@ final class ActivateControlPlaneProxyEnrollment
 
     public function __construct(
         private readonly StoreControlPlaneProxyEnrollmentState $stateStore,
+        private readonly InstallControlPlaneCandidateHealthMarkers $candidateMarkerInstaller,
         private readonly VerifyControlPlaneCandidateMembers $candidateVerifier,
         private readonly ManagedTraefikDocumentWriter $dynamicWriter,
         private readonly ControlPlaneStaticListenerHandoff $staticHandoff,
@@ -54,16 +55,26 @@ final class ActivateControlPlaneProxyEnrollment
             disableMultiplexing: true,
             retry: false,
         );
+        $derivedHealthProof = hash_hmac(
+            'sha256',
+            ControlPlaneDynamicConfiguration::HEALTH_PROOF_DERIVATION_CONTEXT,
+            $token,
+        );
+        $candidateMarker = ControlPlaneCandidateHealthMarker::fromDerivedHealthProof(
+            operationId: $state->operationId,
+            expectedMember: $state->expectedMember,
+            expectedRevision: $state->expectedRevision,
+            dynamicSha256: hash('sha256', $state->dynamicReplacementBytes),
+            derivedHealthProof: $derivedHealthProof,
+        );
+        $execute($this->candidateMarkerInstaller->handle($candidateMarker, $state->activeBackendDnsNames));
+
         $candidateProof = new ControlPlaneCandidateMembersProof(
             candidateNames: $state->activeBackendDnsNames,
             expectedMember: $state->expectedMember,
             expectedRevision: $state->expectedRevision,
             dynamicSha256: hash('sha256', $state->dynamicReplacementBytes),
-            healthCheckProof: hash_hmac(
-                'sha256',
-                ControlPlaneDynamicConfiguration::HEALTH_PROOF_DERIVATION_CONTEXT,
-                $token,
-            ),
+            healthCheckProof: $derivedHealthProof,
         );
         $candidateTranscript = $execute($candidateProof->shellCommand());
         if (! is_string($candidateTranscript)) {
