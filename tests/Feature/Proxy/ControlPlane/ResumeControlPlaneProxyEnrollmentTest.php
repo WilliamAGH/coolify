@@ -1,6 +1,7 @@
 <?php
 
 use App\Actions\Proxy\ControlPlane\ActivateControlPlaneProxyEnrollment;
+use App\Actions\Proxy\ControlPlane\ControlPlaneCandidateMembersProof;
 use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentPhase;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentState;
@@ -13,6 +14,7 @@ use App\Actions\Proxy\ControlPlane\FinalizeControlPlaneProxyEnrollment;
 use App\Actions\Proxy\ControlPlane\ManagedTraefikDocumentWriter;
 use App\Actions\Proxy\ControlPlane\ResumeControlPlaneProxyEnrollment;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
+use App\Actions\Proxy\ControlPlane\VerifyControlPlaneCandidateMembers;
 use App\Actions\Proxy\ControlPlane\VerifyControlPlaneProxyRoutes;
 use App\Models\Server;
 use App\Models\Team;
@@ -58,6 +60,7 @@ function resumableControlPlaneEnrollment(): array
         $store,
         new ActivateControlPlaneProxyEnrollment(
             $store,
+            new VerifyControlPlaneCandidateMembers,
             new ManagedTraefikDocumentWriter,
             new ControlPlaneStaticListenerHandoff,
         ),
@@ -70,6 +73,27 @@ function resumableControlPlaneEnrollment(): array
     );
 
     return [$server, $store, $state, $action];
+}
+
+function resumedControlPlaneCandidateTranscript(ControlPlaneProxyEnrollmentState $state): string
+{
+    $records = [];
+    foreach ($state->activeBackendDnsNames as $candidateName) {
+        foreach ([1, 2] as $attempt) {
+            $records[] = implode("\n", [
+                ControlPlaneCandidateMembersProof::TRANSCRIPT_BEGIN." {$candidateName} {$attempt}",
+                'HTTP/2 204',
+                ControlPlaneProxyRouteProof::BACKEND_MEMBER_HEADER.': '.$state->expectedMember,
+                ControlPlaneProxyRouteProof::BACKEND_REVISION_HEADER.': '.$state->expectedRevision,
+                ControlPlaneProxyRouteProof::DYNAMIC_SHA256_HEADER.': '.hash('sha256', $state->dynamicReplacementBytes),
+                '',
+                ControlPlaneCandidateMembersProof::TRANSCRIPT_STATUS.' 204',
+                ControlPlaneCandidateMembersProof::TRANSCRIPT_END,
+            ]);
+        }
+    }
+
+    return implode("\n", $records);
 }
 
 function resumedControlPlaneTranscript(ControlPlaneProxyEnrollmentState $state): string
@@ -103,9 +127,10 @@ it('resumes a fenced enrollment across self-replacement without exposing its tok
         $remoteCalls++;
 
         return match ($remoteCalls) {
-            1, 3 => ManagedTraefikDocumentWriter::APPLIED_OUTPUT,
-            2, 4 => ControlPlaneStaticListenerHandoff::APPLIED_OUTPUT,
-            5 => resumedControlPlaneTranscript($state),
+            1, 4 => resumedControlPlaneCandidateTranscript($state),
+            2, 5 => ManagedTraefikDocumentWriter::APPLIED_OUTPUT,
+            3, 6 => ControlPlaneStaticListenerHandoff::APPLIED_OUTPUT,
+            7 => resumedControlPlaneTranscript($state),
             default => throw new RuntimeException("Unexpected remote call {$remoteCalls}: {$command}"),
         };
     };
@@ -115,7 +140,7 @@ it('resumes a fenced enrollment across self-replacement without exposing its tok
 
     expect($submitted->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Activating)
         ->and($enrolled->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Enrolled)
-        ->and($remoteCalls)->toBe(5)
+        ->and($remoteCalls)->toBe(7)
         ->and($action->commandSignature)->not->toContain('token')
         ->and($action->commandSignature)->toContain('--rollback')
         ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Enrolled);

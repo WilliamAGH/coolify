@@ -14,6 +14,7 @@ use App\Actions\Proxy\ControlPlane\PrepareControlPlaneProxyEnrollment;
 use App\Actions\Proxy\ControlPlane\PrepareControlPlaneProxyEnrollmentFromHost;
 use App\Actions\Proxy\ControlPlane\ResumeControlPlaneProxyEnrollment;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
+use App\Actions\Proxy\ControlPlane\VerifyControlPlaneCandidateMembers;
 use App\Actions\Proxy\ControlPlane\VerifyControlPlaneProxyRoutes;
 use App\Enums\ProxyTypes;
 use App\Models\Server;
@@ -26,7 +27,12 @@ function hostPreparedEnrollmentAction(StoreControlPlaneProxyEnrollmentState $sto
 {
     $staticHandoff = new ControlPlaneStaticListenerHandoff;
     $dynamicWriter = new ManagedTraefikDocumentWriter;
-    $activator = new ActivateControlPlaneProxyEnrollment($store, $dynamicWriter, $staticHandoff);
+    $activator = new ActivateControlPlaneProxyEnrollment(
+        $store,
+        new VerifyControlPlaneCandidateMembers,
+        $dynamicWriter,
+        $staticHandoff,
+    );
     $finalizer = new FinalizeControlPlaneProxyEnrollment($store, new VerifyControlPlaneProxyRoutes);
     $rollback = new ExecuteControlPlaneProxyEnrollmentRollback($store, $staticHandoff, $dynamicWriter);
     $resumer = new ResumeControlPlaneProxyEnrollment($store, $activator, $finalizer, $rollback);

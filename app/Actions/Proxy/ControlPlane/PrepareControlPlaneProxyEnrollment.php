@@ -57,7 +57,7 @@ final class PrepareControlPlaneProxyEnrollment
             appPort: $appPort,
             exposure: $exposure,
         );
-        $healthCheckProof = hash_hmac('sha256', 'coolify-control-plane-health-check-v1', $token);
+        $healthCheckProof = hash_hmac('sha256', ControlPlaneDynamicConfiguration::HEALTH_PROOF_DERIVATION_CONTEXT, $token);
         $extractedFragments = $existingDynamicYaml === null
             ? [
                 'realtimeRouterFragments' => [],

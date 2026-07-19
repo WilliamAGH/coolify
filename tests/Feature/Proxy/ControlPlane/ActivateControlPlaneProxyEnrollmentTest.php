@@ -1,6 +1,7 @@
 <?php
 
 use App\Actions\Proxy\ControlPlane\ActivateControlPlaneProxyEnrollment;
+use App\Actions\Proxy\ControlPlane\ControlPlaneCandidateMembersProof;
 use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentPhase;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentState;
@@ -9,6 +10,7 @@ use App\Actions\Proxy\ControlPlane\ControlPlaneStaticListenerHandoff;
 use App\Actions\Proxy\ControlPlane\ControlPlaneStaticProxyConfiguration;
 use App\Actions\Proxy\ControlPlane\ManagedTraefikDocumentWriter;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
+use App\Actions\Proxy\ControlPlane\VerifyControlPlaneCandidateMembers;
 use App\Models\Server;
 use App\Models\Team;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -58,20 +60,45 @@ function controlPlaneActivationAction(StoreControlPlaneProxyEnrollmentState $sto
 {
     return new ActivateControlPlaneProxyEnrollment(
         $store,
+        new VerifyControlPlaneCandidateMembers,
         new ManagedTraefikDocumentWriter,
         new ControlPlaneStaticListenerHandoff,
     );
 }
 
+function activationCandidateProofTranscript(ControlPlaneProxyEnrollmentState $state): string
+{
+    $records = [];
+    foreach ($state->activeBackendDnsNames as $candidateName) {
+        foreach ([1, 2] as $attempt) {
+            $records[] = implode("\n", [
+                ControlPlaneCandidateMembersProof::TRANSCRIPT_BEGIN." {$candidateName} {$attempt}",
+                'HTTP/2 204',
+                'X-Coolify-Control-Plane-Backend-Member: '.$state->expectedMember,
+                'X-Coolify-Control-Plane-Backend-Revision: '.$state->expectedRevision,
+                'X-Coolify-Control-Plane-Dynamic-Sha256: '.hash('sha256', $state->dynamicReplacementBytes),
+                '',
+                ControlPlaneCandidateMembersProof::TRANSCRIPT_STATUS.' 204',
+                ControlPlaneCandidateMembersProof::TRANSCRIPT_END,
+            ]);
+        }
+    }
+
+    return implode("\n", $records);
+}
+
 it('persists activation before self-replacement and requires a fresh replay to become active', function (): void {
     [$server, $store] = activatableControlPlaneEnrollment();
+    $state = $store->read($server);
     $commands = [];
-    $executor = function (string $command) use (&$commands): string {
+    $executor = function (string $command) use (&$commands, $state): string {
         $commands[] = $command;
 
-        return count($commands) % 2 === 1
-            ? ManagedTraefikDocumentWriter::APPLIED_OUTPUT
-            : ControlPlaneStaticListenerHandoff::APPLIED_OUTPUT;
+        return match (count($commands) % 3) {
+            1 => activationCandidateProofTranscript($state),
+            2 => ManagedTraefikDocumentWriter::APPLIED_OUTPUT,
+            0 => ControlPlaneStaticListenerHandoff::APPLIED_OUTPUT,
+        };
     };
     $action = controlPlaneActivationAction($store);
 
@@ -82,19 +109,24 @@ it('persists activation before self-replacement and requires a fresh replay to b
     expect($submitted->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Activating)
         ->and($resumed->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Active)
         ->and($replayed->toArray())->toBe($resumed->toArray())
-        ->and($commands)->toHaveCount(4)
-        ->and($commands[0])->toContain('coolify.yaml')
-        ->and($commands[1])->toContain('docker-compose.control-plane-listener.yml')
+        ->and($commands)->toHaveCount(6)
+        ->and($commands[0])->toContain("'docker' 'exec'")
+        ->and($commands[1])->toContain('coolify.yaml')
+        ->and($commands[2])->toContain('docker-compose.control-plane-listener.yml')
         ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Active);
 });
 
 it('keeps an ambiguous self-replacement durably activating and resumes safely', function (): void {
     [$server, $store] = activatableControlPlaneEnrollment();
+    $state = $store->read($server);
     $calls = 0;
-    $ambiguousExecutor = function (string $command) use (&$calls): string {
+    $ambiguousExecutor = function (string $command) use (&$calls, $state): string {
         expect($command)->not->toBeEmpty();
         $calls++;
         if ($calls === 1) {
+            return activationCandidateProofTranscript($state);
+        }
+        if ($calls === 2) {
             return ManagedTraefikDocumentWriter::APPLIED_OUTPUT;
         }
 
@@ -111,16 +143,43 @@ it('keeps an ambiguous self-replacement durably activating and resumes safely', 
         $server,
         'activate-control-plane',
         'activate-token',
-        function () use (&$replayCalls): string {
+        function () use (&$replayCalls, $state): string {
             $replayCalls++;
 
-            return $replayCalls === 1
-                ? ManagedTraefikDocumentWriter::APPLIED_OUTPUT
-                : ControlPlaneStaticListenerHandoff::APPLIED_OUTPUT;
+            return match ($replayCalls) {
+                1 => activationCandidateProofTranscript($state),
+                2 => ManagedTraefikDocumentWriter::APPLIED_OUTPUT,
+                3 => ControlPlaneStaticListenerHandoff::APPLIED_OUTPUT,
+            };
         },
     );
 
     expect($resumed->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Active);
+});
+
+it('rejects a stale candidate before mutating the managed Traefik document', function (): void {
+    [$server, $store] = activatableControlPlaneEnrollment();
+    $state = $store->read($server);
+    $commands = [];
+    $staleTranscript = str_replace(
+        hash('sha256', $state->dynamicReplacementBytes),
+        str_repeat('0', 64),
+        activationCandidateProofTranscript($state),
+    );
+    $executor = function (string $command) use (&$commands, $staleTranscript): string {
+        $commands[] = $command;
+
+        return $staleTranscript;
+    };
+    expect(fn () => controlPlaneActivationAction($store)->handle(
+        $server,
+        'activate-control-plane',
+        'activate-token',
+        $executor,
+    ))->toThrow(InvalidArgumentException::class, 'Dynamic-Sha256');
+    expect($commands)->toHaveCount(1)
+        ->and($commands[0])->not->toContain('coolify.yaml')
+        ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Prepared);
 });
 
 it('rejects foreign owners and performs no remote work after activation', function (): void {
