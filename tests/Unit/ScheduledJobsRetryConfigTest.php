@@ -3,6 +3,7 @@
 use App\Jobs\CoolifyTask;
 use App\Jobs\DatabaseBackupJob;
 use App\Jobs\ScheduledTaskJob;
+use App\Support\ProxyMutationQueue;
 
 it('CoolifyTask has correct retry properties defined', function () {
     $reflection = new ReflectionClass(CoolifyTask::class);
@@ -74,4 +75,30 @@ it('DatabaseBackupJob enforces minimum timeout of 60 seconds', function () {
     expect($constructorSource)
         ->toContain('max(')
         ->toContain('60');
+});
+
+it('isolates proxy mutations from build workers with bounded dedicated capacity', function () {
+    $originalQueues = getenv('HORIZON_QUEUES');
+    putenv('HORIZON_QUEUES=high,proxy-mutations,default,proxy-mutations');
+
+    try {
+        $horizon = require dirname(__DIR__, 2).'/config/horizon.php';
+    } finally {
+        $originalQueues === false
+            ? putenv('HORIZON_QUEUES')
+            : putenv("HORIZON_QUEUES={$originalQueues}");
+    }
+
+    $sharedQueues = explode(',', $horizon['defaults']['s6']['queue']);
+    $proxySupervisor = $horizon['defaults']['proxy-mutations'];
+    $queue = require dirname(__DIR__, 2).'/config/queue.php';
+
+    expect($sharedQueues)->toBe(['high', 'default'])
+        ->and($proxySupervisor['connection'])->toBe(ProxyMutationQueue::CONNECTION)
+        ->and($proxySupervisor['queue'])->toBe(ProxyMutationQueue::NAME)
+        ->and($proxySupervisor['balance'])->toBeFalse()
+        ->and($proxySupervisor['minProcesses'])->toBe(1)
+        ->and($proxySupervisor['maxProcesses'])->toBeGreaterThan(1)
+        ->and($horizon['waits']['redis:proxy-mutations'])->toBe(60)
+        ->and($queue['connections']['redis']['retry_after'])->toBeGreaterThan($proxySupervisor['timeout']);
 });

@@ -7,6 +7,10 @@ use Illuminate\Database\Eloquent\Model;
 
 class ApplicationSetting extends Model
 {
+    protected $attributes = [
+        'is_blue_green_deployment_enabled' => false,
+    ];
+
     protected $casts = [
         'is_static' => 'boolean',
         'is_spa' => 'boolean',
@@ -27,6 +31,7 @@ class ApplicationSetting extends Model
         'is_git_shallow_clone_enabled' => 'boolean',
         'docker_images_to_keep' => 'integer',
         'stop_grace_period' => 'integer',
+        'is_blue_green_deployment_enabled' => 'boolean',
     ];
 
     protected $fillable = [
@@ -66,6 +71,7 @@ class ApplicationSetting extends Model
         'include_source_commit_in_build',
         'docker_images_to_keep',
         'stop_grace_period',
+        'is_blue_green_deployment_enabled',
     ];
 
     public function stopGracePeriodSeconds(): int

@@ -48,6 +48,11 @@ class Kernel extends ConsoleKernel
         $this->scheduleInstance->command('cleanup:redis --clear-locks')->daily();
         $this->scheduleInstance->command('sanctum:prune-expired --hours=1')->hourly()->onOneServer();
         $this->scheduleInstance->job(new ApiTokenExpirationWarningJob)->hourly()->onOneServer();
+        $this->scheduleInstance->call(fn (): int => recover_stale_application_deployment_dispatches())
+            ->name('deployments:recover-unpublished-dispatches')
+            ->everyMinute()
+            ->onOneServer()
+            ->withoutOverlapping(6);
 
         if (isDev()) {
             // Instance Jobs

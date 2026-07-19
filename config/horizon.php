@@ -1,5 +1,6 @@
 <?php
 
+use App\Support\ProxyMutationQueue;
 use Illuminate\Support\Str;
 
 return [
@@ -85,6 +86,7 @@ return [
 
     'waits' => [
         'redis:default' => 60,
+        'redis:proxy-mutations' => 60,
     ],
 
     /*
@@ -183,7 +185,24 @@ return [
         's6' => [
             'connection' => 'redis',
             'balance' => env('HORIZON_BALANCE', 'false'),
-            'queue' => env('HORIZON_QUEUES', 'high,default'),
+            'queue' => implode(',', array_filter(
+                array_map('trim', explode(',', (string) env('HORIZON_QUEUES', 'high,default'))),
+                static fn (string $queue): bool => $queue !== '' && $queue !== ProxyMutationQueue::NAME,
+            )),
+            'maxTime' => env('HORIZON_MAX_TIME', 0),
+            'maxJobs' => 400,
+            'memory' => 128,
+            'tries' => 1,
+            'nice' => 0,
+            'sleep' => 3,
+            'timeout' => env('HORIZON_TIMEOUT', 36000),
+        ],
+        'proxy-mutations' => [
+            'connection' => 'redis',
+            'balance' => false,
+            'queue' => ProxyMutationQueue::NAME,
+            'minProcesses' => 1,
+            'maxProcesses' => env('HORIZON_PROXY_MUTATION_MAX_PROCESSES', 4),
             'maxTime' => env('HORIZON_MAX_TIME', 0),
             'maxJobs' => 400,
             'memory' => 128,

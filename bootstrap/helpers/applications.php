@@ -2,6 +2,7 @@
 
 use App\Actions\Application\StopApplication;
 use App\Enums\ApplicationDeploymentStatus;
+use App\Exceptions\DeploymentException;
 use App\Jobs\ApplicationDeploymentJob;
 use App\Jobs\VolumeCloneJob;
 use App\Models\Application;
@@ -9,6 +10,10 @@ use App\Models\ApplicationDeploymentQueue;
 use App\Models\EnvironmentVariable;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
+use Illuminate\Contracts\Bus\Dispatcher;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
+use Laravel\Horizon\Contracts\JobRepository;
 use Spatie\Url\Url;
 use Visus\Cuid2\Cuid2;
 
@@ -85,20 +90,8 @@ function queue_application_deployment(Application $application, string $deployme
         'only_this_server' => $only_this_server,
     ]);
 
-    if ($no_questions_asked) {
-        $deployment->update([
-            'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
-        ]);
-        ApplicationDeploymentJob::dispatch(
-            application_deployment_queue_id: $deployment->id,
-        );
-    } elseif (next_queuable($server_id, $application_id, $commit, $pull_request_id)) {
-        $deployment->update([
-            'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
-        ]);
-        ApplicationDeploymentJob::dispatch(
-            application_deployment_queue_id: $deployment->id,
-        );
+    if ($deployment->claimForDispatch(bypassServerCapacity: $no_questions_asked)) {
+        dispatch_claimed_application_deployment($deployment);
     }
 
     return [
@@ -109,13 +102,13 @@ function queue_application_deployment(Application $application, string $deployme
 }
 function force_start_deployment(ApplicationDeploymentQueue $deployment)
 {
-    $deployment->update([
-        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
-    ]);
+    if (! $deployment->claimForDispatch(bypassServerCapacity: true)) {
+        return false;
+    }
 
-    ApplicationDeploymentJob::dispatch(
-        application_deployment_queue_id: $deployment->id,
-    );
+    dispatch_claimed_application_deployment($deployment);
+
+    return true;
 }
 function queue_next_deployment(Application $application)
 {
@@ -126,15 +119,8 @@ function queue_next_deployment(Application $application)
         ->sortBy('created_at');
 
     foreach ($queued_deployments as $next_deployment) {
-        // Check if this queued deployment can actually run
-        if (next_queuable($next_deployment->server_id, $next_deployment->application_id, $next_deployment->commit, $next_deployment->pull_request_id)) {
-            $next_deployment->update([
-                'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
-            ]);
-
-            ApplicationDeploymentJob::dispatch(
-                application_deployment_queue_id: $next_deployment->id,
-            );
+        if ($next_deployment->claimForDispatch()) {
+            dispatch_claimed_application_deployment($next_deployment);
         }
     }
 }
@@ -175,19 +161,58 @@ function next_after_cancel(?Server $server = null)
 
         if ($next_found->count() > 0) {
             foreach ($next_found as $next) {
-                // Use next_queuable to properly check if this deployment can run
-                if (next_queuable($next->server_id, $next->application_id, $next->commit, $next->pull_request_id)) {
-                    $next->update([
-                        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
-                    ]);
-
-                    ApplicationDeploymentJob::dispatch(
-                        application_deployment_queue_id: $next->id,
-                    );
+                if ($next->claimForDispatch()) {
+                    dispatch_claimed_application_deployment($next);
                 }
             }
         }
     }
+}
+
+function dispatch_claimed_application_deployment(ApplicationDeploymentQueue $deployment): bool
+{
+    DB::afterCommit(static function () use ($deployment): void {
+        $deployment->refresh();
+        $dispatchAttemptUuid = $deployment->horizon_job_id;
+        if (! is_string($dispatchAttemptUuid) || ! Str::isUuid($dispatchAttemptUuid)) {
+            throw new DeploymentException('The claimed deployment has no durable dispatch attempt identity.');
+        }
+
+        $job = (new ApplicationDeploymentJob(
+            application_deployment_queue_id: $deployment->id,
+            dispatch_attempt_uuid: $dispatchAttemptUuid,
+        ))->afterCommit();
+        app(Dispatcher::class)->dispatch($job);
+    });
+
+    return true;
+}
+
+function recover_stale_application_deployment_dispatches(
+    int $staleAfterSeconds = ApplicationDeploymentQueue::DISPATCH_STALE_AFTER_SECONDS,
+    int $limit = ApplicationDeploymentQueue::DISPATCH_RECOVERY_LIMIT_PER_RUN,
+): int {
+    $jobRepository = app(JobRepository::class);
+
+    return ApplicationDeploymentQueue::recoverStaleDispatchAttempts(
+        $staleAfterSeconds,
+        static function (array $dispatchAttemptUuids) use ($jobRepository): array {
+            return $jobRepository->getJobs($dispatchAttemptUuids)
+                ->filter(static fn (object $job): bool => in_array(
+                    data_get($job, 'status'),
+                    ['pending', 'reserved'],
+                    true,
+                ))
+                ->pluck('id')
+                ->filter(static fn (mixed $jobId): bool => is_string($jobId) && Str::isUuid($jobId))
+                ->values()
+                ->all();
+        },
+        static function (ApplicationDeploymentQueue $recoveredDeployment): void {
+            dispatch_claimed_application_deployment($recoveredDeployment);
+        },
+        $limit,
+    );
 }
 
 function clone_application(Application $source, $destination, array $overrides = [], bool $cloneVolumeData = false): Application

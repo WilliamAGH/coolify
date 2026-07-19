@@ -3,6 +3,8 @@
 namespace App\Jobs;
 
 use App\Actions\Docker\GetContainersStatus;
+use App\Contracts\AdoptsLegacyProxyMutationDispatch;
+use App\Contracts\ProxyMutation;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\ProcessStatus;
 use App\Events\ApplicationConfigurationChanged;
@@ -19,6 +21,8 @@ use App\Models\StandaloneDocker;
 use App\Models\SwarmDocker;
 use App\Notifications\Application\DeploymentFailed;
 use App\Notifications\Application\DeploymentSuccess;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use App\Support\ValidationPatterns;
 use App\Traits\EnvironmentVariableAnalyzer;
 use App\Traits\ExecuteRemoteCommand;
@@ -39,9 +43,10 @@ use Symfony\Component\Yaml\Yaml;
 use Throwable;
 use Visus\Cuid2\Cuid2;
 
-class ApplicationDeploymentJob implements ShouldBeEncrypted, ShouldQueue
+class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, ProxyMutation, ShouldBeEncrypted, ShouldQueue
 {
     use Dispatchable, EnvironmentVariableAnalyzer, ExecuteRemoteCommand, InteractsWithQueue, Queueable, SerializesModels;
+    use UsesProxyMutationQueue;
 
     public const BUILD_TIME_ENV_PATH = '/artifacts/build-time.env';
 
@@ -189,15 +194,20 @@ class ApplicationDeploymentJob implements ShouldBeEncrypted, ShouldQueue
 
     private Collection|string $build_secrets;
 
+    public ?string $dispatch_attempt_uuid = null;
+
     public function tags()
     {
         // Do not remove this one, it needs to properly identify which worker is running the job
         return ['App\Models\ApplicationDeploymentQueue:'.$this->application_deployment_queue_id];
     }
 
-    public function __construct(public int $application_deployment_queue_id)
-    {
-        $this->onQueue(deployment_queue());
+    public function __construct(
+        public int $application_deployment_queue_id,
+        ?string $dispatch_attempt_uuid = null,
+    ) {
+        $this->dispatch_attempt_uuid = $dispatch_attempt_uuid;
+        ProxyMutationQueue::assign($this);
 
         $this->application_deployment_queue = ApplicationDeploymentQueue::find($this->application_deployment_queue_id);
         $this->nixpacks_plan_json = collect([]);
@@ -282,6 +292,10 @@ class ApplicationDeploymentJob implements ShouldBeEncrypted, ShouldQueue
 
     public function handle(): void
     {
+        if (! $this->acquireDeploymentExecutionOwnership()) {
+            return;
+        }
+
         // Check if deployment was cancelled before we even started
         $this->application_deployment_queue->refresh();
         if ($this->application_deployment_queue->status === ApplicationDeploymentStatus::CANCELLED_BY_USER->value) {
@@ -290,10 +304,6 @@ class ApplicationDeploymentJob implements ShouldBeEncrypted, ShouldQueue
             return;
         }
 
-        $this->application_deployment_queue->update([
-            'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
-            'horizon_job_worker' => gethostname(),
-        ]);
         if ($this->server->isFunctional() === false) {
             $this->application_deployment_queue->addLogEntry('Server is not functional.');
             $this->fail('Server is not functional.');
@@ -405,6 +415,77 @@ class ApplicationDeploymentJob implements ShouldBeEncrypted, ShouldQueue
                 \Log::warning('Failed to dispatch ServiceStatusChanged for deployment '.$this->deployment_uuid.': '.$e->getMessage());
             }
         }
+    }
+
+    public function acquireDeploymentExecutionOwnership(): bool
+    {
+        $this->application_deployment_queue->refresh();
+
+        if ($this->application_deployment_queue->status === ApplicationDeploymentStatus::QUEUED->value
+            && ! $this->application_deployment_queue->claimForDispatch()) {
+            return false;
+        }
+
+        $queuedJobUuid = $this->job?->uuid();
+        $dispatchAttemptUuid = $this->dispatch_attempt_uuid;
+        if ($dispatchAttemptUuid === null && is_string($queuedJobUuid) && Str::isUuid($queuedJobUuid)) {
+            $dispatchAttemptUuid = $queuedJobUuid;
+        }
+        $dispatchAttemptUuid ??= $this->application_deployment_queue->horizon_job_id;
+
+        if (is_string($dispatchAttemptUuid)
+            && Str::isUuid($dispatchAttemptUuid)
+            && $this->application_deployment_queue->horizon_job_id === null
+            && ! $this->application_deployment_queue->adoptLegacyDispatchAttempt($dispatchAttemptUuid)) {
+            return false;
+        }
+
+        if (! is_string($dispatchAttemptUuid) || ! Str::isUuid($dispatchAttemptUuid)) {
+            return false;
+        }
+
+        $this->dispatch_attempt_uuid = $dispatchAttemptUuid;
+        $worker = gethostname();
+
+        return $this->application_deployment_queue->acquireDispatchExecution(
+            $dispatchAttemptUuid,
+            is_string($worker) && $worker !== '' ? $worker : 'unknown-worker',
+        );
+    }
+
+    public function adoptLegacyProxyMutationDispatch(): bool
+    {
+        $deployment = $this->application_deployment_queue->fresh();
+        if ($deployment === null) {
+            return false;
+        }
+
+        if ($deployment->status === ApplicationDeploymentStatus::QUEUED->value) {
+            return $deployment->claimForDispatch()
+                && dispatch_claimed_application_deployment($deployment);
+        }
+
+        if ($deployment->status !== ApplicationDeploymentStatus::IN_PROGRESS->value) {
+            return false;
+        }
+
+        return $deployment->reserveStaleDispatchRepublish()
+            && dispatch_claimed_application_deployment($deployment);
+    }
+
+    private function deploymentOwnedByAnotherDispatchAttempt(): bool
+    {
+        $deployment = $this->application_deployment_queue->fresh();
+        if ($deployment === null) {
+            return false;
+        }
+
+        $activeAttempt = $deployment->horizon_job_id;
+        if (! is_string($activeAttempt) || $activeAttempt === '') {
+            return false;
+        }
+
+        return $this->dispatch_attempt_uuid !== $activeAttempt;
     }
 
     private function detectBuildKitCapabilities(): void
@@ -4724,6 +4805,10 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
             return;
         }
 
+        if ($status === ApplicationDeploymentStatus::FAILED && $this->deploymentOwnedByAnotherDispatchAttempt()) {
+            return;
+        }
+
         $this->updateDeploymentStatus($status);
         $this->handleStatusTransition($status);
         queue_next_deployment($this->application);
@@ -4842,6 +4927,10 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
 
     public function failed(Throwable $exception): void
     {
+        if ($this->deploymentOwnedByAnotherDispatchAttempt()) {
+            return;
+        }
+
         $this->failDeployment();
 
         // Log comprehensive error information

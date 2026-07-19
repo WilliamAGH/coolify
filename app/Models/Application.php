@@ -1051,6 +1051,11 @@ class Application extends BaseModel
         return $this->hasMany(ApplicationDeploymentQueue::class);
     }
 
+    public function blueGreenDeployments(): HasMany
+    {
+        return $this->hasMany(ApplicationBlueGreenDeployment::class);
+    }
+
     public function destination()
     {
         return $this->morphTo();

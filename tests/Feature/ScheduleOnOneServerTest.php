@@ -33,6 +33,19 @@ it('schedules ssh mux cleanup locally on every scheduler host', function () {
     expect($event->getSummaryForDisplay())->toBe('cleanup:ssh-mux');
 });
 
+it('schedules bounded deployment recovery through one non-overlapping owner', function () {
+    $schedule = app(Schedule::class);
+
+    $event = collect($schedule->events())->first(
+        fn ($event) => (string) $event->description === 'deployments:recover-unpublished-dispatches'
+    );
+
+    expect($event)->not->toBeNull()
+        ->and($event->onOneServer)->toBeTrue()
+        ->and($event->withoutOverlapping)->toBeTrue()
+        ->and($event->expression)->toBe('* * * * *');
+});
+
 it('schedules every production job with onOneServer', function () {
     $schedule = app(Schedule::class);
 
