@@ -228,6 +228,15 @@ esac
 SH
     );
     chmod($bin.'/docker', 0700);
+    file_put_contents($bin.'/sync', <<<'SH'
+#!/bin/sh
+set -eu
+[ "$#" = 1 ]
+case "$1" in -*) exit 64 ;; esac
+printf 'sync %s\n' "$1" >> "$FAKE_DOCKER_LOG"
+SH
+    );
+    chmod($bin.'/sync', 0700);
 
     return [
         'root' => $root,
@@ -290,9 +299,8 @@ it('renders one deterministic, secret-free, full-ID writer handoff command', fun
         ->and($command)->toContain('docker exec "$expected_docker_id" sh -ceu')
         ->and($command)->toContain('mktemp')
         ->and($command)->toContain('chmod 0600')
-        ->and($command)->toContain('sync -f "$temporary_path"')
-        ->and($command)->toContain('sync -f "$marker_directory"')
-        ->and($command)->toContain('mv -f')
+        ->and($command)->toContain('durable_remote_replace "$temporary_path" "$marker_path" "$marker_directory"')
+        ->and($command)->not->toContain('sync -f')
         ->and($command)->toContain('cmp -s')
         ->and($command)->not->toContain('writer-handoff-secret-token')
         ->and($command)->not->toContain('token_sha256')
@@ -318,6 +326,9 @@ it('attests the exact successor writer, writes its authority marker atomically, 
             ->and(fileperms($fixture['marker']) & 0777)->toBe(0600)
             ->and($log)->toContain('inspect '.$fixture['docker_id'])
             ->and($log)->toContain('exec '.$fixture['docker_id'])
+            ->and($log)->toContain('sync '.$fixture['marker'])
+            ->and($log)->toContain('sync '.dirname($fixture['marker']))
+            ->and($log)->not->toContain('sync -f')
             ->and($log)->not->toContain('exec '.$fixture['container_name'])
             ->and($command)->not->toContain('writer-handoff-secret-token');
     } finally {

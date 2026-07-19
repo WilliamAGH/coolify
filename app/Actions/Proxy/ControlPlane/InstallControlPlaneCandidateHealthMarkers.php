@@ -2,6 +2,7 @@
 
 namespace App\Actions\Proxy\ControlPlane;
 
+use App\Actions\Proxy\DurableRemoteArtifact;
 use InvalidArgumentException;
 use Lorisleiva\Actions\Concerns\AsAction;
 
@@ -71,6 +72,7 @@ final class InstallControlPlaneCandidateHealthMarkers
             'marker_path=$1',
             'marker_json=$2',
             'marker_directory=${marker_path%/*}',
+            ...DurableRemoteArtifact::shellFunctions(),
             'test -n "$marker_directory" || exit 64',
             'test -d "$marker_directory" || exit 65',
             'test ! -L "$marker_directory" || exit 65',
@@ -88,7 +90,7 @@ final class InstallControlPlaneCandidateHealthMarkers
             'chmod 0644 "$temporary_path"',
             'test -f "$temporary_path" || exit 65',
             'test ! -L "$temporary_path" || exit 65',
-            'mv -f "$temporary_path" "$marker_path"',
+            'durable_remote_replace "$temporary_path" "$marker_path" "$marker_directory" || exit 65',
             'temporary_path=',
             'test -f "$marker_path" || exit 65',
             'test ! -L "$marker_path" || exit 65',

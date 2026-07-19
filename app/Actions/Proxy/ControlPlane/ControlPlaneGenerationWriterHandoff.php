@@ -2,6 +2,7 @@
 
 namespace App\Actions\Proxy\ControlPlane;
 
+use App\Actions\Proxy\DurableRemoteArtifact;
 use InvalidArgumentException;
 use Lorisleiva\Actions\Concerns\AsAction;
 
@@ -94,7 +95,9 @@ SH;
 
     private function writeMarkerScript(): string
     {
-        return <<<'SH'
+        return implode("\n", [
+            ...DurableRemoteArtifact::shellFunctions(),
+            <<<'SH'
 marker_path=$1
 expected_marker=$2
 allow_marker_create=$3
@@ -118,14 +121,12 @@ printf '%s' "$expected_marker" > "$temporary_path"
 chmod 0600 "$temporary_path" || exit 65
 [ -f "$temporary_path" ] || exit 65
 [ ! -L "$temporary_path" ] || exit 65
-sync -f "$temporary_path" || exit 65
 
 if [ -e "$marker_path" ]; then
     [ -f "$marker_path" ] || exit 65
     [ ! -L "$marker_path" ] || exit 65
     cmp -s "$temporary_path" "$marker_path" || exit 65
-    sync -f "$marker_path" || exit 65
-    sync -f "$marker_directory" || exit 65
+    durable_remote_reaffirm "$marker_path" "$marker_directory" || exit 65
     exit 0
 fi
 [ "$allow_marker_create" = true ] || exit 65
@@ -135,16 +136,15 @@ if [ -e "$marker_path" ]; then
     [ -f "$marker_path" ] || exit 65
     [ ! -L "$marker_path" ] || exit 65
     cmp -s "$temporary_path" "$marker_path" || exit 65
-    sync -f "$marker_path" || exit 65
-    sync -f "$marker_directory" || exit 65
+    durable_remote_reaffirm "$marker_path" "$marker_directory" || exit 65
     exit 0
 fi
-mv -f "$temporary_path" "$marker_path" || exit 65
+durable_remote_replace "$temporary_path" "$marker_path" "$marker_directory" || exit 65
 temporary_path=''
-sync -f "$marker_directory" || exit 65
 [ -f "$marker_path" ] || exit 65
 [ ! -L "$marker_path" ] || exit 65
-SH;
+SH,
+        ]);
     }
 
     private function readMarkerScript(): string

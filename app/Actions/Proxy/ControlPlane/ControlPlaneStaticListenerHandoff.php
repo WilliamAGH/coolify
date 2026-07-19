@@ -2,6 +2,7 @@
 
 namespace App\Actions\Proxy\ControlPlane;
 
+use App\Actions\Proxy\DurableRemoteArtifact;
 use InvalidArgumentException;
 use Lorisleiva\Actions\Concerns\AsAction;
 
@@ -191,6 +192,8 @@ final class ControlPlaneStaticListenerHandoff
             'checksum_matches "$source_override_file" "$source_override_sha256" || fail',
             'if matches "$proxy_compose_path" "$replacement_proxy_file" && matches_if_present "$source_override_path" "$source_override_file"; then',
             '  handoff_started=1',
+            '  durable_remote_reaffirm "$proxy_compose_path" "$proxy_directory" || fail',
+            '  durable_remote_reaffirm "$source_override_path" "$source_directory" || fail',
             '  verify_enrolled',
             '  completed=1',
             '  printf %s "$applied_output"',
@@ -208,6 +211,8 @@ final class ControlPlaneStaticListenerHandoff
             'if [ "${COOLIFY_CONTROL_PLANE_HANDOFF_FAIL_AFTER_COOLIFY:-}" = 1 ]; then fail; fi',
             'recreate_traefik',
             'verify_enrolled',
+            'durable_remote_reaffirm "$proxy_compose_path" "$proxy_directory" || fail',
+            'durable_remote_reaffirm "$source_override_path" "$source_directory" || fail',
             'completed=1',
             'printf %s "$applied_output"',
         ]);
@@ -369,6 +374,9 @@ final class ControlPlaneStaticListenerHandoff
             '  matches "$proxy_compose_path" "$predecessor_proxy_file" || fail',
             '  is_absent "$source_override_path" || fail',
             '  verify_legacy',
+            '  durable_remote_reaffirm "$proxy_compose_path" "$proxy_directory" || fail',
+            '  durable_remote_remove "$source_override_path" "$source_directory" || fail',
+            '  durable_remote_reaffirm "$rollback_journal_path" "$proxy_directory" || fail',
             '  printf %s "$rolled_back_output"',
             '  exit 0',
             'fi',
@@ -377,11 +385,17 @@ final class ControlPlaneStaticListenerHandoff
             '  is_absent "$source_override_path" || fail',
             '  verify_legacy',
             '  complete_rollback_journal',
+            '  durable_remote_reaffirm "$proxy_compose_path" "$proxy_directory" || fail',
+            '  durable_remote_remove "$source_override_path" "$source_directory" || fail',
+            '  durable_remote_reaffirm "$rollback_journal_path" "$proxy_directory" || fail',
             '  printf %s "$rolled_back_output"',
             '  exit 0',
             'fi',
             'if matches "$proxy_compose_path" "$predecessor_proxy_file" && is_absent "$source_override_path" && legacy_is_verified; then',
             '  complete_rollback_journal',
+            '  durable_remote_reaffirm "$proxy_compose_path" "$proxy_directory" || fail',
+            '  durable_remote_remove "$source_override_path" "$source_directory" || fail',
+            '  durable_remote_reaffirm "$rollback_journal_path" "$proxy_directory" || fail',
             '  printf %s "$rolled_back_output"',
             '  exit 0',
             'fi',
@@ -398,6 +412,9 @@ final class ControlPlaneStaticListenerHandoff
             'recreate_legacy_coolify',
             'verify_legacy',
             'complete_rollback_journal',
+            'durable_remote_reaffirm "$proxy_compose_path" "$proxy_directory" || fail',
+            'durable_remote_remove "$source_override_path" "$source_directory" || fail',
+            'durable_remote_reaffirm "$rollback_journal_path" "$proxy_directory" || fail',
             'printf %s "$rolled_back_output"',
         ]);
     }
@@ -407,6 +424,7 @@ final class ControlPlaneStaticListenerHandoff
     {
         return [
             'fail() { exit 1; }',
+            ...DurableRemoteArtifact::shellFunctions(),
             'assert_directory() { test -d "$1" && test ! -L "$1" || fail; }',
             'assert_regular() { test -e "$1" && test ! -L "$1" && test -f "$1" || fail; }',
             'assert_regular_or_absent() {',
@@ -426,9 +444,7 @@ final class ControlPlaneStaticListenerHandoff
             '  stage=$(mktemp "$target_directory/.control-plane-listener.XXXXXX") || fail',
             '  cp "$source" "$stage" || fail',
             '  chmod 600 "$stage" || fail',
-            '  sync -f "$stage" || fail',
-            '  mv -f "$stage" "$target" || fail',
-            '  sync -f "$target_directory" || fail',
+            '  durable_remote_replace "$stage" "$target" "$target_directory" || fail',
             '}',
         ];
     }
@@ -441,8 +457,7 @@ final class ControlPlaneStaticListenerHandoff
             '  target=$1',
             '  target_directory=$2',
             $allowAbsent ? '  assert_regular_or_absent "$target"' : '  assert_regular "$target"',
-            '  rm -f "$target" || fail',
-            '  sync -f "$target_directory" || fail',
+            '  durable_remote_remove "$target" "$target_directory" || fail',
             '}',
         ];
     }
