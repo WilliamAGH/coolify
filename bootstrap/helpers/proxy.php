@@ -1,5 +1,7 @@
 <?php
 
+use App\Actions\Proxy\ControlPlane\CompileControlPlaneStaticProxyConfiguration;
+use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentPhase;
 use App\Actions\Proxy\SaveProxyConfiguration;
 use App\Enums\ProxyTypes;
 use App\Models\Application;
@@ -396,6 +398,17 @@ function generateDefaultProxyConfiguration(Server $server, array $custom_command
     }
 
     $config = Yaml::dump($config, 12, 2);
+    $enrollment = $server->controlPlaneProxyEnrollmentState();
+    if ($enrollment !== null) {
+        $config = match ($enrollment->phase) {
+            ControlPlaneProxyEnrollmentPhase::Preparing,
+            ControlPlaneProxyEnrollmentPhase::Prepared => $enrollment->staticPredecessorBytes,
+            ControlPlaneProxyEnrollmentPhase::Enrolled => (new CompileControlPlaneStaticProxyConfiguration)
+                ->compileProxyConfiguration($config, $enrollment->exposure),
+            ControlPlaneProxyEnrollmentPhase::RolledBack => $config,
+            default => $enrollment->staticReplacementBytes,
+        };
+    }
     if ($save) {
         SaveProxyConfiguration::run($server, $config);
     }

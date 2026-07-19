@@ -2,6 +2,9 @@
 
 namespace App\Models;
 
+use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentPhase;
+use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentState;
+use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
 use App\Actions\Proxy\StartProxy;
 use App\Actions\Server\InstallDocker;
 use App\Actions\Server\InstallPrerequisites;
@@ -446,6 +449,11 @@ class Server extends BaseModel
 
     public function setupDynamicProxyConfiguration()
     {
+        $enrollment = $this->controlPlaneProxyEnrollmentState();
+        if ($enrollment !== null && $enrollment->phase !== ControlPlaneProxyEnrollmentPhase::RolledBack) {
+            return;
+        }
+
         $settings = instanceSettings();
         $dynamic_config_path = $this->proxyPath().'/dynamic';
         if ($this->proxyType() === ProxyTypes::TRAEFIK->value) {
@@ -604,6 +612,19 @@ $schema://$host {
                 $this->reloadCaddy();
             }
         }
+    }
+
+    public function controlPlaneProxyEnrollmentState(): ?ControlPlaneProxyEnrollmentState
+    {
+        $state = $this->proxy->get(StoreControlPlaneProxyEnrollmentState::STATE_KEY);
+        if ($state === null) {
+            return null;
+        }
+        if (! is_array($state)) {
+            throw new \RuntimeException('The durable control-plane enrollment state is malformed.');
+        }
+
+        return ControlPlaneProxyEnrollmentState::fromArray($state);
     }
 
     public function reloadCaddy()

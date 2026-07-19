@@ -67,6 +67,24 @@ it('supports explicit loopback exposure without changing unrelated services', fu
         ->and(data_get($proxy, 'services.traefik.image'))->toBe('traefik:v3.6');
 });
 
+it('reapplies the managed listener to a newly generated canonical proxy configuration', function () {
+    $compiler = new CompileControlPlaneStaticProxyConfiguration;
+    $first = $compiler->compileProxyConfiguration(
+        controlPlaneProxyCompose(),
+        ControlPlaneProxyExposure::Public,
+    );
+    $regenerated = Yaml::parse(controlPlaneProxyCompose());
+    $regenerated['services']['traefik']['image'] = 'traefik:v3.7';
+    $second = $compiler->compileProxyConfiguration(
+        Yaml::dump($regenerated, 12, 2),
+        ControlPlaneProxyExposure::Public,
+    );
+
+    expect(data_get(Yaml::parse($first), 'services.traefik.ports'))->toContain('${APP_PORT:-8000}:8000')
+        ->and(data_get(Yaml::parse($second), 'services.traefik.image'))->toBe('traefik:v3.7')
+        ->and(data_get(Yaml::parse($second), 'services.traefik.ports'))->toContain('${APP_PORT:-8000}:8000');
+});
+
 it('fails closed for ambiguous or already-owned listener state', function (array $proxyPorts, array $sourcePorts, string $message) {
     $proxy = Yaml::parse(controlPlaneProxyCompose());
     $source = Yaml::parse(controlPlaneSourceCompose());

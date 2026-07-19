@@ -9,6 +9,8 @@ use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
 use App\Models\Server;
 use App\Models\Team;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Process;
+use Symfony\Component\Yaml\Yaml;
 
 uses(RefreshDatabase::class);
 
@@ -74,7 +76,47 @@ it('durably reserves and advances one exact enrollment owner idempotently', func
         ->and(json_encode($server->fresh()->proxy->get(StoreControlPlaneProxyEnrollmentState::STATE_KEY), JSON_THROW_ON_ERROR))
         ->not->toContain('secret-token')
         ->and($repository->read($server)?->dynamicPredecessorBytes)
-        ->toBe("http:\n  routers:\n    legacy: {}\n");
+        ->toBe("http:\n  routers:\n    legacy: {}\n")
+        ->and($server->fresh()->controlPlaneProxyEnrollmentState()?->phase)
+        ->toBe(ControlPlaneProxyEnrollmentPhase::Prepared);
+});
+
+it('freezes the canonical dynamic owner and preserves the managed static listener', function () {
+    Process::fake();
+    $team = Team::factory()->create();
+    $server = Server::factory()->create(['team_id' => $team->id]);
+    $server->proxy->set('type', 'TRAEFIK');
+    $server->save();
+    $repository = new StoreControlPlaneProxyEnrollmentState;
+    $state = controlPlaneEnrollmentState($server);
+    $repository->reserve($server, $state, 'secret-token');
+
+    $reservedServer = $server->fresh();
+    $reservedServer->setupDynamicProxyConfiguration();
+    $predecessor = generateDefaultProxyConfiguration($reservedServer, save: false);
+
+    $repository->transition(
+        $server,
+        'enrollment-op',
+        'secret-token',
+        ControlPlaneProxyEnrollmentPhase::Preparing,
+        ControlPlaneProxyEnrollmentPhase::Prepared,
+        '2026-07-18T12:01:00Z',
+    );
+    $repository->transition(
+        $server,
+        'enrollment-op',
+        'secret-token',
+        ControlPlaneProxyEnrollmentPhase::Prepared,
+        ControlPlaneProxyEnrollmentPhase::Activating,
+        '2026-07-18T12:02:00Z',
+    );
+    $active = generateDefaultProxyConfiguration($server->fresh(), save: false);
+
+    expect($predecessor)->toBe($state->staticPredecessorBytes)
+        ->and($active)->toBe($state->staticReplacementBytes)
+        ->and(data_get(Yaml::parse($active), 'services.traefik.ports'))->toContain('8000:8000');
+    Process::assertNothingRan();
 });
 
 it('rejects foreign owners, stale phases, invalid transitions, and corrupted artifacts', function () {

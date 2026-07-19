@@ -44,12 +44,7 @@ class CompileControlPlaneStaticProxyConfiguration
             throw new InvalidArgumentException('APP_PORT must be a valid TCP port.');
         }
 
-        $proxy = $this->parseCompose($proxyComposeYaml, 'proxy');
         $source = $this->parseCompose($sourceComposeYaml, 'source');
-        $traefik = data_get($proxy, 'services.traefik');
-        if (! is_array($traefik)) {
-            throw new InvalidArgumentException('The canonical proxy Compose has no Traefik service.');
-        }
         if (! is_array(data_get($source, 'services.coolify'))) {
             throw new InvalidArgumentException('The source Compose has no canonical Coolify service.');
         }
@@ -59,6 +54,32 @@ class CompileControlPlaneStaticProxyConfiguration
             throw new InvalidArgumentException('Enrollment requires exactly one canonical Coolify APP_PORT publication.');
         }
 
+        $replacementProxyYaml = $this->compileProxyConfiguration($proxyComposeYaml, $exposure);
+        $sourceOverrideYaml = Yaml::dump([
+            'services' => [
+                'coolify' => [
+                    'ports' => new TaggedValue('reset', []),
+                ],
+            ],
+        ], 6, 2, Yaml::DUMP_OBJECT_AS_MAP | Yaml::DUMP_EXCEPTION_ON_INVALID_TYPE);
+
+        return new ControlPlaneStaticProxyConfiguration(
+            predecessorProxyYaml: $proxyComposeYaml,
+            replacementProxyYaml: $replacementProxyYaml,
+            sourceOverrideYaml: $sourceOverrideYaml,
+            appPort: $appPort,
+            exposure: $exposure,
+        );
+    }
+
+    public function compileProxyConfiguration(
+        string $proxyComposeYaml,
+        ControlPlaneProxyExposure $exposure,
+    ): string {
+        $proxy = $this->parseCompose($proxyComposeYaml, 'proxy');
+        if (! is_array(data_get($proxy, 'services.traefik'))) {
+            throw new InvalidArgumentException('The canonical proxy Compose has no Traefik service.');
+        }
         $proxyPorts = data_get($proxy, 'services.traefik.ports');
         $proxyCommands = data_get($proxy, 'services.traefik.command');
         if (! is_array($proxyPorts) || ! is_array($proxyCommands)) {
@@ -78,26 +99,13 @@ class CompileControlPlaneStaticProxyConfiguration
         $proxy['services']['traefik']['ports'][] = $exposure->publishedPort();
         $proxy['services']['traefik']['command'][] = '--entrypoints.coolify.address=:8000';
         $replacementProxyYaml = $this->dumpCompose($proxy);
-        $sourceOverrideYaml = Yaml::dump([
-            'services' => [
-                'coolify' => [
-                    'ports' => new TaggedValue('reset', []),
-                ],
-            ],
-        ], 6, 2, Yaml::DUMP_OBJECT_AS_MAP | Yaml::DUMP_EXCEPTION_ON_INVALID_TYPE);
 
         $replacement = $this->parseCompose($replacementProxyYaml, 'replacement proxy');
         if ($replacement !== $proxy) {
             throw new InvalidArgumentException('The enrolled Traefik Compose did not round-trip exactly.');
         }
 
-        return new ControlPlaneStaticProxyConfiguration(
-            predecessorProxyYaml: $proxyComposeYaml,
-            replacementProxyYaml: $replacementProxyYaml,
-            sourceOverrideYaml: $sourceOverrideYaml,
-            appPort: $appPort,
-            exposure: $exposure,
-        );
+        return $replacementProxyYaml;
     }
 
     /** @return array<string, mixed> */
