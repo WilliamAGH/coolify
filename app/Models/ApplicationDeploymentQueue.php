@@ -391,6 +391,39 @@ class ApplicationDeploymentQueue extends Model
         }, attempts: 5);
     }
 
+    /** @param array<string, mixed> $artifact @return array<string, mixed> */
+    public function makePreparedActivationPayload(array $artifact): array
+    {
+        ksort($artifact);
+        $identity = [
+            'deployment_id' => (int) $this->getKey(),
+            'application_id' => (int) $this->application_id,
+            'server_id' => (int) $this->server_id,
+            'destination_id' => (int) $this->destination_id,
+            'prepared_commit' => $this->commit,
+            'artifact' => $artifact,
+        ];
+        $encodedIdentity = json_encode($identity, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
+
+        return [
+            'schema_version' => 1,
+            ...$identity,
+            'input_fingerprint' => hash('sha256', $encodedIdentity),
+        ];
+    }
+
+    /** @return array<string, mixed> */
+    public function validatedPreparedActivationPayload(): array
+    {
+        $deployment = $this->fresh();
+        if ($deployment === null || ! is_array($deployment->prepared_activation_payload)) {
+            throw new \RuntimeException('The deployment has no prepared activation payload.');
+        }
+        $deployment->assertPreparedActivationPayload($deployment->prepared_activation_payload);
+
+        return $deployment->prepared_activation_payload;
+    }
+
     public function deferLiveDispatchRecovery(Carbon $staleBefore, string $dispatchAttemptUuid): bool
     {
         if (! Str::isUuid($dispatchAttemptUuid)) {
@@ -710,6 +743,11 @@ class ApplicationDeploymentQueue extends Model
             || preg_match('/\A[a-f0-9]{64}\z/D', $payload['input_fingerprint']) !== 1
             || ! is_array($payload['artifact'] ?? null)) {
             throw new \InvalidArgumentException('The prepared activation payload is malformed.');
+        }
+
+        $expectedPayload = $this->makePreparedActivationPayload($payload['artifact']);
+        if (! hash_equals($expectedPayload['input_fingerprint'], $payload['input_fingerprint'])) {
+            throw new \InvalidArgumentException('The prepared activation payload fingerprint is invalid.');
         }
     }
 }

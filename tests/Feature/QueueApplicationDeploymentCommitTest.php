@@ -200,20 +200,11 @@ describe('application deployment execution phase handoff', function () {
         $prepareWorker = 'prepare-worker-a';
         expect($deployment->acquireDispatchExecution($prepareAttemptUuid, $prepareWorker))->toBeTrue();
 
-        $payload = [
-            'schema_version' => 1,
-            'deployment_id' => (int) $deployment->id,
-            'application_id' => (int) $deployment->application_id,
-            'server_id' => (int) $deployment->server_id,
-            'destination_id' => (int) $deployment->destination_id,
-            'prepared_commit' => $deployment->commit,
-            'input_fingerprint' => hash('sha256', 'phase-handoff-input'),
-            'artifact' => [
-                'kind' => 'container-image',
-                'reference' => 'registry.example.test/coolify/application@sha256:'.str_repeat('a', 64),
-                'runtime_secret' => 'phase-handoff-secret',
-            ],
-        ];
+        $payload = $deployment->makePreparedActivationPayload([
+            'kind' => 'container-image',
+            'reference' => 'registry.example.test/coolify/application@sha256:'.str_repeat('a', 64),
+            'runtime_secret' => 'phase-handoff-secret',
+        ]);
 
         $activationAttemptUuid = $deployment->handoffToActivation(
             $prepareAttemptUuid,
@@ -235,6 +226,8 @@ describe('application deployment execution phase handoff', function () {
             ->and($persisted->toArray())->not->toHaveKey('prepared_activation_payload')
             ->and($rawPayload)->toBeString()
             ->and($rawPayload)->not->toContain('phase-handoff-secret');
+
+        expect($persisted->validatedPreparedActivationPayload())->toBe($payload);
     });
 
     test('rejects stale preparation owners and malformed activation identities', function () {
@@ -248,16 +241,7 @@ describe('application deployment execution phase handoff', function () {
         $deployment = $deployment->fresh();
         $prepareAttemptUuid = $deployment->horizon_job_id;
         expect($deployment->acquireDispatchExecution($prepareAttemptUuid, 'prepare-worker-a'))->toBeTrue();
-        $payload = [
-            'schema_version' => 1,
-            'deployment_id' => (int) $deployment->id,
-            'application_id' => (int) $deployment->application_id,
-            'server_id' => (int) $deployment->server_id,
-            'destination_id' => (int) $deployment->destination_id,
-            'prepared_commit' => $deployment->commit,
-            'input_fingerprint' => hash('sha256', 'phase-stale-owner-input'),
-            'artifact' => [],
-        ];
+        $payload = $deployment->makePreparedActivationPayload([]);
 
         expect($deployment->handoffToActivation($prepareAttemptUuid, 'foreign-worker', $payload))->toBeNull()
             ->and(fn () => $deployment->handoffToActivation(
@@ -265,6 +249,14 @@ describe('application deployment execution phase handoff', function () {
                 'prepare-worker-a',
                 [...$payload, 'destination_id' => (int) $deployment->destination_id + 1],
             ))->toThrow(InvalidArgumentException::class, 'invalid destination_id');
+
+        $tamperedPayload = $payload;
+        $tamperedPayload['artifact']['image'] = 'sha256:tampered';
+        expect(fn () => $deployment->handoffToActivation(
+            $prepareAttemptUuid,
+            'prepare-worker-a',
+            $tamperedPayload,
+        ))->toThrow(InvalidArgumentException::class, 'fingerprint is invalid');
 
         $activationAttemptUuid = $deployment->handoffToActivation(
             $prepareAttemptUuid,
@@ -287,16 +279,7 @@ describe('application deployment execution phase handoff', function () {
         $deployment = $deployment->fresh();
         $prepareAttemptUuid = $deployment->horizon_job_id;
         expect($deployment->acquireDispatchExecution($prepareAttemptUuid, 'prepare-worker-a'))->toBeTrue();
-        $payload = [
-            'schema_version' => 1,
-            'deployment_id' => (int) $deployment->id,
-            'application_id' => (int) $deployment->application_id,
-            'server_id' => (int) $deployment->server_id,
-            'destination_id' => (int) $deployment->destination_id,
-            'prepared_commit' => $deployment->commit,
-            'input_fingerprint' => hash('sha256', 'phase-locked-identity-input'),
-            'artifact' => [],
-        ];
+        $payload = $deployment->makePreparedActivationPayload([]);
         ApplicationDeploymentQueue::query()
             ->whereKey($deployment->id)
             ->update(['commit' => 'newer-commit-after-preparation']);
