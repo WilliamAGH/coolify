@@ -118,6 +118,7 @@ it('persists activation before self-replacement and requires a fresh replay to b
         ->and($commands[1])->toContain("'docker' 'exec'")
         ->and($commands[2])->toContain('coolify.yaml')
         ->and($commands[3])->toContain('docker-compose.control-plane-listener.yml')
+        ->and($server->fresh()?->proxy->get('last_saved_proxy_configuration'))->toBe($state->staticReplacementBytes)
         ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Active);
 });
 

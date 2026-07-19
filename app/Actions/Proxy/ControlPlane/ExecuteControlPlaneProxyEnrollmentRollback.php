@@ -2,6 +2,7 @@
 
 namespace App\Actions\Proxy\ControlPlane;
 
+use App\Actions\Proxy\SaveProxyConfiguration;
 use App\Models\Server;
 use Closure;
 use Lorisleiva\Actions\Concerns\AsAction;
@@ -68,6 +69,8 @@ final class ExecuteControlPlaneProxyEnrollmentRollback
             ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT,
             'static listener rollback',
         );
+        $server->refresh();
+        (new SaveProxyConfiguration)->persistDatabaseState($server, $state->staticPredecessorBytes);
 
         if (! $wasAlreadyRollingBack) {
             return $state;

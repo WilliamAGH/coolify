@@ -111,6 +111,7 @@ it('persists rollback before self-replacement and requires a fresh replay to fin
         ->and($rolledBack->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack)
         ->and($replayed->toArray())->toBe($rolledBack->toArray())
         ->and($calls)->toBe(5)
+        ->and($server->fresh()?->proxy->get('last_saved_proxy_configuration'))->toBe($rolledBack->staticPredecessorBytes)
         ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack);
 });
 

@@ -45,10 +45,12 @@ it('moves the canonical APP_PORT listener to Traefik with public exposure by def
     $override = Yaml::parse($configuration->sourceOverrideYaml, Yaml::PARSE_CUSTOM_TAGS);
 
     expect(data_get($proxy, 'services.traefik.ports'))->toContain('${APP_PORT:-8000}:8000')
+        ->and(data_get($proxy, 'services.traefik.image'))->toBe('traefik:3.6.23')
         ->and(data_get($proxy, 'services.traefik.command'))->toContain('--entrypoints.coolify.address=:8000')
         ->and(data_get($proxy, 'services.traefik.volumes'))->toBe(['/data/coolify/proxy:/traefik'])
         ->and(data_get($override, 'services.coolify.ports'))->toBeInstanceOf(TaggedValue::class)
         ->and(data_get($override, 'services.coolify.ports')->getTag())->toBe('reset')
+        ->and($configuration->predecessorProxyYaml)->toBe(controlPlaneProxyCompose())
         ->and($configuration->replacementProxySha256)->toBe(hash('sha256', $configuration->replacementProxyYaml));
 });
 
@@ -64,7 +66,7 @@ it('supports explicit loopback exposure without changing unrelated services', fu
 
     expect(data_get($proxy, 'services.traefik.ports'))
         ->toContain('127.0.0.1:${APP_PORT:-8000}:8000')
-        ->and(data_get($proxy, 'services.traefik.image'))->toBe('traefik:v3.6');
+        ->and(data_get($proxy, 'services.traefik.image'))->toBe('traefik:3.6.23');
 });
 
 it('adds only hashed proof credentials and immutable backend identity to the source override', function (): void {
@@ -100,14 +102,14 @@ it('reapplies the managed listener to a newly generated canonical proxy configur
         ControlPlaneProxyExposure::Public,
     );
     $regenerated = Yaml::parse(controlPlaneProxyCompose());
-    $regenerated['services']['traefik']['image'] = 'traefik:v3.7';
+    $regenerated['services']['traefik']['image'] = 'traefik:3.6.11';
     $second = $compiler->compileProxyConfiguration(
         Yaml::dump($regenerated, 12, 2),
         ControlPlaneProxyExposure::Public,
     );
 
     expect(data_get(Yaml::parse($first), 'services.traefik.ports'))->toContain('${APP_PORT:-8000}:8000')
-        ->and(data_get(Yaml::parse($second), 'services.traefik.image'))->toBe('traefik:v3.7')
+        ->and(data_get(Yaml::parse($second), 'services.traefik.image'))->toBe('traefik:3.6.23')
         ->and(data_get(Yaml::parse($second), 'services.traefik.ports'))->toContain('${APP_PORT:-8000}:8000');
 });
 

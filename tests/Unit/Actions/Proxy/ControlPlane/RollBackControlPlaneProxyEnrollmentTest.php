@@ -91,6 +91,11 @@ it('fails closed for a foreign owner or a missing dynamic rollback artifact', fu
     $token = 'control-plane-rollback-token';
 
     try {
+        $filesystem->mkdir($root.'/dynamic', 0700);
+        file_put_contents(
+            $root.'/dynamic/'.ControlPlaneDynamicConfiguration::MANAGED_FILENAME,
+            "http:\n  routers:\n    coolify: {}\n",
+        );
         $plan = RollBackControlPlaneProxyEnrollment::plan(
             state: controlPlaneRollbackState($token, null),
             operationId: 'control-plane-rollback',
