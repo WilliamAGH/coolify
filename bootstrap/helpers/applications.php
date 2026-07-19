@@ -1,8 +1,10 @@
 <?php
 
 use App\Actions\Application\StopApplication;
+use App\Enums\ApplicationDeploymentExecutionPhase;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Exceptions\DeploymentException;
+use App\Jobs\ActivateApplicationDeploymentJob;
 use App\Jobs\ApplicationDeploymentJob;
 use App\Jobs\VolumeCloneJob;
 use App\Models\Application;
@@ -182,10 +184,17 @@ function dispatch_claimed_application_deployment(ApplicationDeploymentQueue $dep
             throw new DeploymentException('The claimed deployment has no durable dispatch attempt identity.');
         }
 
-        $job = (new ApplicationDeploymentJob(
-            application_deployment_queue_id: $deployment->id,
-            dispatch_attempt_uuid: $dispatchAttemptUuid,
-        ))->afterCommit();
+        $job = match ($deployment->execution_phase) {
+            ApplicationDeploymentExecutionPhase::Prepare => new ApplicationDeploymentJob(
+                application_deployment_queue_id: $deployment->id,
+                dispatch_attempt_uuid: $dispatchAttemptUuid,
+            ),
+            ApplicationDeploymentExecutionPhase::Activate => new ActivateApplicationDeploymentJob(
+                application_deployment_queue_id: $deployment->id,
+                dispatch_attempt_uuid: $dispatchAttemptUuid,
+            ),
+        };
+        $job->afterCommit();
         try {
             app(Dispatcher::class)->dispatch($job);
         } catch (ProxyMutationQueueFrozenException) {
@@ -201,9 +210,9 @@ function recover_stale_application_deployment_dispatches(
     int $staleAfterSeconds = ApplicationDeploymentQueue::DISPATCH_STALE_AFTER_SECONDS,
     int $limit = ApplicationDeploymentQueue::DISPATCH_RECOVERY_LIMIT_PER_RUN,
 ): int {
-    if (ProxyMutationQueue::snapshot()->isFrozen()) {
-        return 0;
-    }
+    $recoverablePhase = ProxyMutationQueue::snapshot()->isFrozen()
+        ? ApplicationDeploymentExecutionPhase::Prepare
+        : null;
 
     $jobRepository = app(JobRepository::class);
 
@@ -225,6 +234,7 @@ function recover_stale_application_deployment_dispatches(
             dispatch_claimed_application_deployment($recoveredDeployment);
         },
         $limit,
+        $recoverablePhase,
     );
 }
 

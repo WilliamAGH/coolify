@@ -247,11 +247,7 @@ final class ProxyMutationQueue
             return false;
         }
 
-        try {
-            $payload = json_decode($queuedRedisJob->getRawBody(), true, flags: JSON_THROW_ON_ERROR);
-        } catch (JsonException) {
-            return false;
-        }
+        $payload = self::decodeQueuedPayload($queuedRedisJob);
 
         if (! is_array($payload) || ($payload[self::PAYLOAD_MARKER] ?? null) === true) {
             return false;
@@ -259,6 +255,13 @@ final class ProxyMutationQueue
 
         return ($payload['displayName'] ?? null) === ApplicationDeploymentJob::class
             && ($payload['data']['commandName'] ?? null) === ApplicationDeploymentJob::class;
+    }
+
+    public static function queuedPayloadIsMarked(RedisJob $queuedRedisJob): bool
+    {
+        $payload = self::decodeQueuedPayload($queuedRedisJob);
+
+        return is_array($payload) && ($payload[self::PAYLOAD_MARKER] ?? null) === true;
     }
 
     private static function assertCanonicalPayloadTarget(mixed $connection, mixed $queue): void
@@ -271,6 +274,18 @@ final class ProxyMutationQueue
     private static function isCanonicalPayloadQueue(mixed $queue): bool
     {
         return $queue === self::NAME || $queue === 'queues:'.self::NAME;
+    }
+
+    /** @return array<string, mixed>|null */
+    private static function decodeQueuedPayload(RedisJob $queuedRedisJob): ?array
+    {
+        try {
+            $payload = json_decode($queuedRedisJob->getRawBody(), true, flags: JSON_THROW_ON_ERROR);
+        } catch (JsonException) {
+            return null;
+        }
+
+        return is_array($payload) ? $payload : null;
     }
 
     private static function assertOperationId(string $operationId): void

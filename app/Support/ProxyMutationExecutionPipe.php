@@ -11,21 +11,27 @@ class ProxyMutationExecutionPipe
 {
     public function handle(mixed $command, Closure $next): mixed
     {
+        $queuedRedisJob = $this->queuedRedisJob($command);
+        if ($queuedRedisJob !== null && ProxyMutationQueue::isLegacyPreFencePayload($queuedRedisJob, $command)) {
+            if ($command instanceof AdoptsLegacyProxyMutationDispatch) {
+                $command->adoptLegacyProxyMutationDispatch();
+            }
+
+            return null;
+        }
+
+        if ($queuedRedisJob !== null
+            && ProxyMutationQueue::queuedPayloadIsMarked($queuedRedisJob)
+            && ! $this->isCanonicalTarget($queuedRedisJob)) {
+            throw new LogicException('Proxy-mutation work cannot execute from a noncanonical Redis queue.');
+        }
+
         if (! ProxyMutationQueue::isMarked($command)) {
             return $next($command);
         }
 
         ProxyMutationQueue::assertMarkedTransport($command);
-        $queuedRedisJob = $this->queuedRedisJob($command);
         if ($queuedRedisJob !== null && ! $this->isCanonicalTarget($queuedRedisJob)) {
-            if (ProxyMutationQueue::isLegacyPreFencePayload($queuedRedisJob, $command)) {
-                if ($command instanceof AdoptsLegacyProxyMutationDispatch) {
-                    $command->adoptLegacyProxyMutationDispatch();
-                }
-
-                return null;
-            }
-
             throw new LogicException('Proxy-mutation work cannot execute from a noncanonical Redis queue.');
         }
 

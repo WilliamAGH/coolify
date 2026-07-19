@@ -2,6 +2,7 @@
 
 use App\Enums\ApplicationDeploymentExecutionPhase;
 use App\Enums\ApplicationDeploymentStatus;
+use App\Jobs\ActivateApplicationDeploymentJob;
 use App\Jobs\ApplicationDeploymentJob;
 use App\Models\Application;
 use App\Models\ApplicationDeploymentQueue;
@@ -22,7 +23,7 @@ use Laravel\Horizon\Contracts\JobRepository;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
-    Bus::fake([ApplicationDeploymentJob::class]);
+    Bus::fake([ActivateApplicationDeploymentJob::class, ApplicationDeploymentJob::class]);
 
     $this->team = Team::factory()->create();
     $this->server = Server::factory()->create(['team_id' => $this->team->id]);
@@ -156,6 +157,8 @@ describe('proxy mutation freeze recovery', function () {
             'queue-freeze-durable-dispatch',
         );
         expect($deployment->claimForDispatch(bypassServerCapacity: true))->toBeTrue();
+        $deployment->update(['execution_phase' => ApplicationDeploymentExecutionPhase::Activate]);
+        $deployment->refresh();
         $dispatchAttemptUuid = $deployment->horizon_job_id;
         $dispatcher = Mockery::mock(Dispatcher::class);
         $dispatcher->shouldReceive('dispatch')
@@ -169,20 +172,59 @@ describe('proxy mutation freeze recovery', function () {
             ->and($deployment->fresh()->horizon_job_worker)->toBeNull();
     });
 
-    test('does not scan or republish stale dispatch attempts while frozen', function () {
+    test('recovers preparation without publishing activation while proxy mutations are frozen', function () {
+        $prepareApplication = makeApplication($this->environment->id, $this->destination->id, null);
+        $prepareDeployment = makeQueueAdmissionDeployment(
+            $prepareApplication,
+            $this->server,
+            'queue-freeze-prepare-recovery',
+        );
+        expect($prepareDeployment->claimForDispatch(bypassServerCapacity: true))->toBeTrue();
+        $activationApplication = makeApplication($this->environment->id, $this->destination->id, null);
+        $activationDeployment = makeQueueAdmissionDeployment(
+            $activationApplication,
+            $this->server,
+            'queue-freeze-activation-recovery',
+        );
+        expect($activationDeployment->claimForDispatch(bypassServerCapacity: true))->toBeTrue();
+        $activationDeployment->update(['execution_phase' => ApplicationDeploymentExecutionPhase::Activate]);
+        ApplicationDeploymentQueue::query()
+            ->whereKey([$prepareDeployment->id, $activationDeployment->id])
+            ->update(['updated_at' => now()->subMinutes(10)]);
         $operationId = 'test-recovery-freeze-'.Str::uuid();
-        $this->mock(JobRepository::class)->shouldNotReceive('getJobs');
+        $jobRepository = $this->mock(JobRepository::class);
+        $jobRepository
+            ->shouldReceive('getJobs')
+            ->once()
+            ->with([$prepareDeployment->horizon_job_id])
+            ->andReturn(collect());
+        $jobRepository
+            ->shouldReceive('getJobs')
+            ->once()
+            ->with([$activationDeployment->horizon_job_id])
+            ->andReturn(collect());
 
         try {
             ProxyMutationQueue::freeze($operationId);
 
-            expect(recover_stale_application_deployment_dispatches(limit: 2))->toBe(0);
+            expect(recover_stale_application_deployment_dispatches(limit: 2))->toBe(1);
+            Bus::assertDispatched(ApplicationDeploymentJob::class, fn (ApplicationDeploymentJob $job): bool => $job->application_deployment_queue_id === $prepareDeployment->id);
+            Bus::assertNotDispatched(ActivateApplicationDeploymentJob::class);
+            expect($activationDeployment->fresh()->updated_at->lt(now()->subMinutes(5)))->toBeTrue();
         } finally {
             $snapshot = ProxyMutationQueue::snapshot();
             if ($snapshot->freezeOperationId === $operationId) {
                 ProxyMutationQueue::unfreeze($operationId);
             }
         }
+
+        expect(recover_stale_application_deployment_dispatches(limit: 2))->toBe(1);
+        Bus::assertDispatched(ActivateApplicationDeploymentJob::class, function (ActivateApplicationDeploymentJob $job) use ($activationDeployment): bool {
+            return $job->application_deployment_queue_id === $activationDeployment->id
+                && $job->dispatch_attempt_uuid === $activationDeployment->horizon_job_id
+                && $job->connection === ProxyMutationQueue::CONNECTION
+                && $job->queue === ProxyMutationQueue::NAME;
+        });
     });
 });
 
@@ -228,6 +270,14 @@ describe('application deployment execution phase handoff', function () {
             ->and($rawPayload)->not->toContain('phase-handoff-secret');
 
         expect($persisted->validatedPreparedActivationPayload())->toBe($payload);
+
+        dispatch_claimed_application_deployment($persisted);
+        Bus::assertDispatched(ActivateApplicationDeploymentJob::class, function (ActivateApplicationDeploymentJob $job) use ($persisted): bool {
+            return $job->application_deployment_queue_id === $persisted->id
+                && $job->dispatch_attempt_uuid === $persisted->horizon_job_id
+                && $job->connection === ProxyMutationQueue::CONNECTION
+                && $job->queue === ProxyMutationQueue::NAME;
+        });
     });
 
     test('rejects stale preparation owners and malformed activation identities', function () {
@@ -335,6 +385,29 @@ describe('application deployment execution phase handoff', function () {
             ))->toBeTrue()
             ->and($deployment->fresh()->current_process_id)->toBeNull();
     });
+
+    test('only the owning preparation attempt can persist its build server', function () {
+        $application = makeApplication($this->environment->id, $this->destination->id, null);
+        $buildServer = Server::factory()->create(['team_id' => $this->team->id]);
+        $deployment = makeQueueAdmissionDeployment(
+            $application,
+            $this->server,
+            'queue-build-server-owner-cas',
+        );
+        expect($deployment->claimForDispatch(bypassServerCapacity: true))->toBeTrue();
+        $deployment = $deployment->fresh();
+        $prepareAttemptUuid = $deployment->horizon_job_id;
+
+        expect($deployment->recordPreparationBuildServer($prepareAttemptUuid, $buildServer->id))->toBeFalse()
+            ->and($deployment->acquireDispatchExecution($prepareAttemptUuid, 'prepare-worker-a'))->toBeTrue()
+            ->and($deployment->recordPreparationBuildServer((string) Str::uuid(), $buildServer->id))->toBeFalse()
+            ->and($deployment->recordPreparationBuildServer($prepareAttemptUuid, $buildServer->id))->toBeTrue()
+            ->and($deployment->fresh()->build_server_id)->toBe($buildServer->id);
+
+        $deployment->update(['execution_phase' => ApplicationDeploymentExecutionPhase::Activate]);
+        expect($deployment->recordPreparationBuildServer($prepareAttemptUuid, $this->server->id))->toBeFalse()
+            ->and($deployment->fresh()->build_server_id)->toBe($buildServer->id);
+    });
 });
 
 describe('queue_application_deployment commit resolution', function () {
@@ -403,6 +476,63 @@ describe('queue_application_deployment commit resolution', function () {
 });
 
 describe('ApplicationDeploymentQueue stale dispatch recovery', function () {
+    test('reclaims an abandoned exact worker attempt with one new dispatch identity', function () {
+        $application = makeApplication($this->environment->id, $this->destination->id, null);
+        $deployment = makeQueueAdmissionDeployment($application, $this->server, 'queue-abandoned-worker');
+        expect($deployment->claimForDispatch(bypassServerCapacity: true))->toBeTrue();
+        $originalAttemptUuid = $deployment->horizon_job_id;
+        $abandonedWorkerUuid = (string) Str::uuid();
+        expect($deployment->acquireDispatchExecution($originalAttemptUuid, $abandonedWorkerUuid))->toBeTrue();
+        ApplicationDeploymentQueue::query()
+            ->whereKey($deployment->id)
+            ->update(['updated_at' => now()->subMinutes(10)]);
+        $lookups = [];
+        $recoveredIds = [];
+
+        $recovered = ApplicationDeploymentQueue::recoverStaleDispatchAttempts(
+            staleAfterSeconds: 60,
+            findLiveDispatchAttemptUuids: function (array $uuids) use (&$lookups): array {
+                $lookups = $uuids;
+
+                return [];
+            },
+            onRecovered: function (ApplicationDeploymentQueue $recoveredDeployment) use (&$recoveredIds): void {
+                $recoveredIds[] = $recoveredDeployment->id;
+            },
+        );
+        $persisted = $deployment->fresh();
+
+        expect($recovered)->toBe(1)
+            ->and($lookups)->toBe([$abandonedWorkerUuid])
+            ->and($recoveredIds)->toBe([$deployment->id])
+            ->and($persisted->horizon_job_worker)->toBeNull()
+            ->and(Str::isUuid($persisted->horizon_job_id))->toBeTrue()
+            ->and($persisted->horizon_job_id)->not->toBe($originalAttemptUuid)
+            ->and($deployment->reserveStaleDispatchRepublish(now(), $abandonedWorkerUuid))->toBeFalse();
+    });
+
+    test('does not reclaim a worker attempt still present in Horizon', function () {
+        $application = makeApplication($this->environment->id, $this->destination->id, null);
+        $deployment = makeQueueAdmissionDeployment($application, $this->server, 'queue-live-worker');
+        expect($deployment->claimForDispatch(bypassServerCapacity: true))->toBeTrue();
+        $attemptUuid = $deployment->horizon_job_id;
+        $workerUuid = (string) Str::uuid();
+        expect($deployment->acquireDispatchExecution($attemptUuid, $workerUuid))->toBeTrue();
+        ApplicationDeploymentQueue::query()
+            ->whereKey($deployment->id)
+            ->update(['updated_at' => now()->subMinutes(10)]);
+
+        $recovered = ApplicationDeploymentQueue::recoverStaleDispatchAttempts(
+            staleAfterSeconds: 60,
+            findLiveDispatchAttemptUuids: fn (array $uuids): array => $uuids,
+        );
+
+        expect($recovered)->toBe(0)
+            ->and($deployment->fresh()->horizon_job_id)->toBe($attemptUuid)
+            ->and($deployment->fresh()->horizon_job_worker)->toBe($workerUuid)
+            ->and($deployment->fresh()->updated_at->gt(now()->subMinute()))->toBeTrue();
+    });
+
     test('caps stale recovery candidates in id order and preserves retry UUIDs across runs', function () {
         $staleDeployments = collect(range(1, 5))->map(function (int $index): ApplicationDeploymentQueue {
             $application = makeApplication($this->environment->id, $this->destination->id, null);

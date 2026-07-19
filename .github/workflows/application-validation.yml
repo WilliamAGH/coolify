@@ -155,14 +155,20 @@ jobs:
             tests/Feature/BlueGreenOperationFencingTest.php \
             tests/Feature/BlueGreenSupersessionGenerationTest.php \
             tests/Feature/DeleteResourceJobBlueGreenTest.php \
+            tests/Feature/LegacyProxyMutationPayloadAdoptionTest.php \
             tests/Feature/ProxyMutationQueueGateTest.php \
+            tests/Feature/QueueApplicationDeploymentCommitTest.php \
             tests/Feature/QueueServerDeletionTest.php \
             tests/Feature/ScheduleOnOneServerTest.php \
             tests/Unit/Actions/Application/BlueGreen/BlueGreenDeploymentLockTest.php \
             tests/Unit/Actions/Application/BlueGreen/BlueGreenOperationFenceTest.php \
             tests/Unit/Actions/Application/BlueGreen/ExecuteBlueGreenDestinationMutationTest.php \
             tests/Unit/Actions/Application/BlueGreenPublicRecoveryTest.php \
+            tests/Unit/ApplicationDeploymentActivationOrderTest.php \
+            tests/Unit/ProxyMutationQueueTest.php \
             tests/Unit/ScheduledJobsRetryConfigTest.php
+      - name: Validate deployment activation configuration fence
+        run: php artisan test --compact tests/Unit/DeploymentConfiguration/ApplicationConfigurationSnapshotTest.php --filter='fences deployment command'
 
   browser:
     name: Pest browser tests

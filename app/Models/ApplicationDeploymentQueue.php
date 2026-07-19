@@ -264,6 +264,33 @@ class ApplicationDeploymentQueue extends Model
         return true;
     }
 
+    public function recordPreparationBuildServer(string $dispatchAttemptUuid, int $buildServerId): bool
+    {
+        if (! Str::isUuid($dispatchAttemptUuid)) {
+            throw new \InvalidArgumentException('The deployment dispatch attempt must be a valid UUID.');
+        }
+        if ($buildServerId < 1) {
+            throw new \InvalidArgumentException('The deployment build server identity must be positive.');
+        }
+
+        $updated = self::query()
+            ->whereKey($this->getKey())
+            ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
+            ->where('execution_phase', ApplicationDeploymentExecutionPhase::Prepare->value)
+            ->where('horizon_job_id', $dispatchAttemptUuid)
+            ->whereNotNull('horizon_job_worker')
+            ->update(['build_server_id' => $buildServerId]);
+
+        if ($updated !== 1) {
+            return false;
+        }
+
+        $this->setAttribute('build_server_id', $buildServerId);
+        $this->syncOriginalAttribute('build_server_id');
+
+        return true;
+    }
+
     public function releaseCurrentProcessOwnership(string $dispatchAttemptUuid, string $processId): bool
     {
         if (! Str::isUuid($dispatchAttemptUuid)) {
@@ -424,8 +451,11 @@ class ApplicationDeploymentQueue extends Model
         return $deployment->prepared_activation_payload;
     }
 
-    public function deferLiveDispatchRecovery(Carbon $staleBefore, string $dispatchAttemptUuid): bool
-    {
+    public function deferLiveDispatchRecovery(
+        Carbon $staleBefore,
+        string $dispatchAttemptUuid,
+        ?string $worker = null,
+    ): bool {
         if (! Str::isUuid($dispatchAttemptUuid)) {
             throw new \InvalidArgumentException('The live deployment dispatch attempt must be a valid UUID.');
         }
@@ -435,7 +465,11 @@ class ApplicationDeploymentQueue extends Model
             ->whereKey($this->getKey())
             ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
             ->where('horizon_job_id', $dispatchAttemptUuid)
-            ->whereNull('horizon_job_worker')
+            ->when(
+                $worker === null,
+                fn ($query) => $query->whereNull('horizon_job_worker'),
+                fn ($query) => $query->where('horizon_job_worker', $worker),
+            )
             ->whereNull('current_process_id')
             ->whereNull('blue_green_phase')
             ->where('updated_at', '<=', $staleBefore)
@@ -479,9 +513,11 @@ class ApplicationDeploymentQueue extends Model
             ->exists();
     }
 
-    public function reserveStaleDispatchRepublish(?Carbon $staleBefore = null): bool
-    {
-        return DB::transaction(function () use ($staleBefore): bool {
+    public function reserveStaleDispatchRepublish(
+        ?Carbon $staleBefore = null,
+        ?string $expectedWorker = null,
+    ): bool {
+        return DB::transaction(function () use ($staleBefore, $expectedWorker): bool {
             $application = Application::withTrashed()
                 ->whereKey($this->application_id)
                 ->lockForUpdate()
@@ -505,7 +541,7 @@ class ApplicationDeploymentQueue extends Model
                 ->first();
             if ($deployment === null
                 || $deployment->status !== ApplicationDeploymentStatus::IN_PROGRESS->value
-                || $deployment->horizon_job_worker !== null
+                || $deployment->horizon_job_worker !== $expectedWorker
                 || $deployment->current_process_id !== null
                 || $deployment->blue_green_phase !== null
                 || ($staleBefore !== null && ($deployment->updated_at === null || $deployment->updated_at->gt($staleBefore)))) {
@@ -513,14 +549,18 @@ class ApplicationDeploymentQueue extends Model
             }
 
             $dispatchAttemptUuid = $deployment->horizon_job_id;
-            if (! is_string($dispatchAttemptUuid) || ! Str::isUuid($dispatchAttemptUuid)) {
+            if ($expectedWorker !== null || ! is_string($dispatchAttemptUuid) || ! Str::isUuid($dispatchAttemptUuid)) {
                 $dispatchAttemptUuid = (string) Str::uuid();
             }
             $reservedAt = now();
             $reserved = self::query()
                 ->whereKey($deployment->getKey())
                 ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
-                ->whereNull('horizon_job_worker')
+                ->when(
+                    $expectedWorker === null,
+                    fn ($query) => $query->whereNull('horizon_job_worker'),
+                    fn ($query) => $query->where('horizon_job_worker', $expectedWorker),
+                )
                 ->whereNull('current_process_id')
                 ->whereNull('blue_green_phase')
                 ->when(
@@ -529,6 +569,7 @@ class ApplicationDeploymentQueue extends Model
                 )
                 ->update([
                     'horizon_job_id' => $dispatchAttemptUuid,
+                    'horizon_job_worker' => null,
                     'updated_at' => $reservedAt,
                 ]);
             if ($reserved !== 1) {
@@ -536,8 +577,9 @@ class ApplicationDeploymentQueue extends Model
             }
 
             $this->setAttribute('horizon_job_id', $dispatchAttemptUuid);
+            $this->setAttribute('horizon_job_worker', null);
             $this->setAttribute('updated_at', $reservedAt);
-            $this->syncOriginalAttributes(['horizon_job_id', 'updated_at']);
+            $this->syncOriginalAttributes(['horizon_job_id', 'horizon_job_worker', 'updated_at']);
 
             return true;
         }, attempts: 5);
@@ -552,6 +594,7 @@ class ApplicationDeploymentQueue extends Model
         ?Closure $findLiveDispatchAttemptUuids = null,
         ?Closure $onRecovered = null,
         int $limit = self::DISPATCH_RECOVERY_LIMIT_PER_RUN,
+        ?ApplicationDeploymentExecutionPhase $executionPhase = null,
     ): int {
         if ($staleAfterSeconds < 1) {
             throw new \InvalidArgumentException('The deployment dispatch stale window must be positive.');
@@ -563,16 +606,25 @@ class ApplicationDeploymentQueue extends Model
         $staleBefore = now()->subSeconds($staleAfterSeconds);
         $candidates = self::query()
             ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
-            ->whereNull('horizon_job_worker')
+            ->where(static fn ($query) => $query
+                ->whereNull('horizon_job_worker')
+                ->orWhere('horizon_job_worker', 'like', '________-____-____-____-____________'))
             ->whereNull('current_process_id')
             ->whereNull('blue_green_phase')
+            ->when(
+                $executionPhase !== null,
+                fn ($query) => $query->where('execution_phase', $executionPhase->value),
+            )
             ->where('updated_at', '<=', $staleBefore)
             ->orderBy('id')
             ->limit($limit)
-            ->get();
+            ->get()
+            ->filter(static fn (self $deployment): bool => $deployment->horizon_job_worker === null
+                || (is_string($deployment->horizon_job_worker) && Str::isUuid($deployment->horizon_job_worker)))
+            ->values();
 
         $candidateAttemptUuids = $candidates
-            ->pluck('horizon_job_id')
+            ->map(static fn (self $deployment): mixed => $deployment->horizon_job_worker ?? $deployment->horizon_job_id)
             ->filter(static fn (mixed $dispatchAttemptUuid): bool => is_string($dispatchAttemptUuid) && Str::isUuid($dispatchAttemptUuid))
             ->unique()
             ->values()
@@ -583,12 +635,17 @@ class ApplicationDeploymentQueue extends Model
 
         $recovered = 0;
         foreach ($candidates as $deployment) {
-            if (is_string($deployment->horizon_job_id) && isset($liveDispatchAttemptUuids[$deployment->horizon_job_id])) {
-                $deployment->deferLiveDispatchRecovery($staleBefore, $deployment->horizon_job_id);
+            $lookupUuid = $deployment->horizon_job_worker ?? $deployment->horizon_job_id;
+            if (is_string($lookupUuid) && isset($liveDispatchAttemptUuids[$lookupUuid])) {
+                $deployment->deferLiveDispatchRecovery(
+                    $staleBefore,
+                    (string) $deployment->horizon_job_id,
+                    $deployment->horizon_job_worker,
+                );
 
                 continue;
             }
-            if (! $deployment->reserveStaleDispatchRepublish($staleBefore)) {
+            if (! $deployment->reserveStaleDispatchRepublish($staleBefore, $deployment->horizon_job_worker)) {
                 continue;
             }
 

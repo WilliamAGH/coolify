@@ -74,6 +74,40 @@ it('detects redeploy-only domain changes', function () {
         ->and(collect($diff->changes())->pluck('label'))->toContain('Domains');
 });
 
+it('fences deployment command changes without exposing command contents', function (string $attribute, string $label) {
+    $application = snapshotTestApplication([$attribute => 'php artisan old:command']);
+    markSnapshotTestApplicationDeployed($application);
+
+    $application->update([$attribute => 'php artisan new:command --token=secret']);
+    $diff = $application->refresh()->pendingDeploymentConfigurationDiff();
+    $encodedDiff = json_encode($diff->toArray(), JSON_THROW_ON_ERROR);
+
+    expect($diff->isChanged())->toBeTrue()
+        ->and($diff->requiresBuild())->toBeFalse()
+        ->and(collect($diff->changes())->pluck('label'))->toContain($label)
+        ->and($encodedDiff)->not->toContain('old:command')
+        ->and($encodedDiff)->not->toContain('new:command')
+        ->and($encodedDiff)->not->toContain('token=secret');
+})->with([
+    ['pre_deployment_command', 'Pre-deployment command'],
+    ['post_deployment_command', 'Post-deployment command'],
+]);
+
+it('fences deployment command container changes', function (string $attribute, string $label) {
+    $application = snapshotTestApplication([$attribute => 'web']);
+    markSnapshotTestApplicationDeployed($application);
+
+    $application->update([$attribute => 'worker']);
+    $diff = $application->refresh()->pendingDeploymentConfigurationDiff();
+
+    expect($diff->isChanged())->toBeTrue()
+        ->and($diff->requiresBuild())->toBeFalse()
+        ->and(collect($diff->changes())->pluck('label'))->toContain($label);
+})->with([
+    ['pre_deployment_command_container', 'Pre-deployment command container'],
+    ['post_deployment_command_container', 'Post-deployment command container'],
+]);
+
 it('detects environment variable value changes without exposing secret values', function () {
     $application = snapshotTestApplication();
     EnvironmentVariable::create([

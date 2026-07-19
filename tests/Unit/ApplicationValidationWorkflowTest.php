@@ -57,7 +57,11 @@ function applicationValidationWorkflowViolations(array $workflow): array
         'tests/Feature/BlueGreenCrashBoundaryAcceptanceTest.php',
         'tests/Feature/BlueGreenMigrationReplayTest.php',
         'tests/Feature/BlueGreenSupersessionGenerationTest.php',
+        'tests/Feature/LegacyProxyMutationPayloadAdoptionTest.php',
         'tests/Feature/ProxyMutationQueueGateTest.php',
+        'tests/Feature/QueueApplicationDeploymentCommitTest.php',
+        'tests/Unit/ApplicationDeploymentActivationOrderTest.php',
+        'tests/Unit/ProxyMutationQueueTest.php',
         'tests/Unit/ScheduledJobsRetryConfigTest.php',
     ] as $requiredTest) {
         if (! str_contains((string) $blueGreenScript, $requiredTest)) {
@@ -65,6 +69,14 @@ function applicationValidationWorkflowViolations(array $workflow): array
 
             break;
         }
+    }
+    $activationConfigurationStep = collect($blueGreen['steps'] ?? [])
+        ->firstWhere('name', 'Validate deployment activation configuration fence')['run'] ?? '';
+    if (! str_contains(
+        (string) $activationConfigurationStep,
+        "tests/Unit/DeploymentConfiguration/ApplicationConfigurationSnapshotTest.php --filter='fences deployment command'",
+    )) {
+        $violations[] = 'blue-green lifecycle validation must fail closed when activation-time commands change after preparation';
     }
 
     $phpApplication = is_array($jobs) ? ($jobs['php'] ?? []) : [];
@@ -126,6 +138,16 @@ it('rejects omitting a blue-green ownership gate from PostgreSQL validation', fu
 
     expect(applicationValidationWorkflowViolations($workflow))
         ->toContain('blue-green lifecycle validation must execute every ownership and migration gate');
+});
+
+it('rejects omitting the activation configuration fence from PostgreSQL validation', function () {
+    $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
+    $step = collect($workflow['jobs']['blue-green-lifecycle']['steps'])
+        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Validate deployment activation configuration fence');
+    $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'] = 'true';
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('blue-green lifecycle validation must fail closed when activation-time commands change after preparation');
 });
 
 it('rejects omitting the native Traefik control-plane suite', function () {

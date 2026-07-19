@@ -1,6 +1,7 @@
 <?php
 
 use App\Enums\ApplicationDeploymentStatus;
+use App\Jobs\ActivateApplicationDeploymentJob;
 use App\Jobs\ApplicationDeploymentJob;
 use App\Models\Application;
 use App\Models\ApplicationDeploymentQueue;
@@ -31,7 +32,7 @@ const UPSTREAM_V4_APPLICATION_DEPLOYMENT_JOB = 'TzozMzoiQXBwXEpvYnNcQXBwbGljYXRp
 const UPSTREAM_V4_DEPLOYMENT_ID = 987654321;
 
 beforeEach(function () {
-    Bus::fake([ApplicationDeploymentJob::class]);
+    Bus::fake([ActivateApplicationDeploymentJob::class, ApplicationDeploymentJob::class]);
     Notification::fake();
 
     InstanceSettings::unguarded(fn () => InstanceSettings::query()->create(['id' => 0]));
@@ -191,8 +192,8 @@ describe('legacy proxy-mutation payload adoption', function () {
         Bus::assertDispatched(ApplicationDeploymentJob::class, function (ApplicationDeploymentJob $job) use ($deployment): bool {
             return $job->application_deployment_queue_id === $deployment->id
                 && $job->dispatch_attempt_uuid === $deployment->fresh()->horizon_job_id
-                && $job->connection === ProxyMutationQueue::CONNECTION
-                && $job->queue === ProxyMutationQueue::NAME;
+                && $job->connection === 'redis'
+                && $job->queue === ApplicationDeploymentJob::QUEUE;
         });
     });
 
@@ -214,7 +215,7 @@ describe('legacy proxy-mutation payload adoption', function () {
 
         Bus::assertDispatchedTimes(ApplicationDeploymentJob::class, 1);
         Bus::assertDispatched(ApplicationDeploymentJob::class, fn (ApplicationDeploymentJob $job): bool => $job->dispatch_attempt_uuid === $durableAttempt
-            && $job->queue === ProxyMutationQueue::NAME);
+            && $job->queue === ApplicationDeploymentJob::QUEUE);
     });
 
     test('does not execute or republish a retry after another attempt owns the deployment', function () {

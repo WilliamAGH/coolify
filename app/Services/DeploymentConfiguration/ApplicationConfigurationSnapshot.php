@@ -143,6 +143,10 @@ class ApplicationConfigurationSnapshot
     {
         return [
             $this->item('start_command', 'Start command', $this->application->start_command, 'redeploy'),
+            $this->item('pre_deployment_command', 'Pre-deployment command', $this->application->pre_deployment_command, 'redeploy', sensitive: true),
+            $this->item('pre_deployment_command_container', 'Pre-deployment command container', $this->application->pre_deployment_command_container, 'redeploy'),
+            $this->item('post_deployment_command', 'Post-deployment command', $this->application->post_deployment_command, 'redeploy', sensitive: true),
+            $this->item('post_deployment_command_container', 'Post-deployment command container', $this->application->post_deployment_command_container, 'redeploy'),
             $this->item('docker_compose_custom_start_command', 'Docker Compose custom start command', $this->application->docker_compose_custom_start_command, 'redeploy'),
             $this->item('ports_exposes', 'Exposed ports', $this->application->ports_exposes, 'redeploy'),
             $this->item('ports_mappings', 'Port mappings', $this->application->ports_mappings, 'redeploy'),
