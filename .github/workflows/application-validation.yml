@@ -222,7 +222,7 @@ jobs:
         run: tests/Integration/ForkDeploy/run.sh
 
   required:
-    name: Required application validation
+    name: Application validation required
     if: always()
     needs:
       - php

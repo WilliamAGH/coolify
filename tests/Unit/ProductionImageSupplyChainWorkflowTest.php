@@ -685,6 +685,9 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
     $requiredNeeds = releaseWorkflowNeeds($applicationJobs['required'] ?? []);
     sort($requiredJobs);
     sort($requiredNeeds);
+    if (($applicationJobs['required']['name'] ?? null) !== 'Application validation required') {
+        $violations[] = 'application validation must preserve the protected branch status context';
+    }
     if ($requiredNeeds !== $requiredJobs || ($applicationJobs['required']['if'] ?? null) !== 'always()') {
         $violations[] = 'release foundation validation must require every owned job';
     }
@@ -1228,6 +1231,21 @@ it('uses isolated database and cache stores in release validation', function () 
 
     expect($environment['DB_CONNECTION'] ?? null)->toBe('testing')
         ->and($environment['CACHE_STORE'] ?? null)->toBe('array');
+});
+
+it('rejects renaming the protected branch application validation status context', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $sharedWorkflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $applicationValidationWorkflow = Yaml::parseFile($root.'/.github/workflows/application-validation.yml');
+    $applicationValidationWorkflow['jobs']['required']['name'] = 'Renamed application validation';
+    $callers = [
+        'production' => Yaml::parseFile($root.'/.github/workflows/coolify-production-build.yml'),
+        'testing-host' => Yaml::parseFile($root.'/.github/workflows/coolify-testing-host.yml'),
+        'staging' => Yaml::parseFile($root.'/.github/workflows/coolify-staging-build.yml'),
+    ];
+
+    expect(releaseFoundationWorkflowViolations($sharedWorkflow, $applicationValidationWorkflow, $callers))
+        ->toContain('application validation must preserve the protected branch status context');
 });
 
 it('rejects omission of either image source-provenance gate', function (string $dockerfile): void {
