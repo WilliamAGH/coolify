@@ -7,6 +7,7 @@ enum BlueGreenDeploymentPhase: string
     case IDLE = 'idle';
     case PREPARING = 'preparing';
     case SWITCHING = 'switching';
+    case DRAINING = 'draining';
     case ROLLING_BACK = 'rolling_back';
     case DEACTIVATING = 'deactivating';
     case INTERVENTION_REQUIRED = 'intervention_required';

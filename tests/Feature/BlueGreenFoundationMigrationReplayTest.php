@@ -199,3 +199,48 @@ it('rejects complete destination-fencing queue columns with a malformed shape', 
     expect(fn () => $migration->up())
         ->toThrow(RuntimeException::class, 'authorized SQLite schema');
 });
+
+it('replays drain provenance only against a complete authorized schema', function () {
+    Schema::create('application_blue_green_deployments', function (Blueprint $table) {
+        $table->id();
+    });
+
+    $migration = require database_path('migrations/2026_07_19_030000_add_blue_green_drain_provenance.php');
+    $migration->up();
+    $migration->up();
+
+    expect(Schema::hasColumns('application_blue_green_deployments', [
+        'operation_drain_started_at',
+        'operation_drain_deadline_at',
+        'operation_drain_last_observed_connections',
+        'operation_drain_observed_at',
+    ]))->toBeTrue()
+        ->and(fn () => $migration->down())
+        ->toThrow(RuntimeException::class, 'Control-plane expand migration is forward-only: 2026_07_19_030000_add_blue_green_drain_provenance.');
+
+    Schema::drop('application_blue_green_deployments');
+    Schema::create('application_blue_green_deployments', function (Blueprint $table) {
+        $table->id();
+        $table->timestamp('operation_drain_started_at')->nullable();
+    });
+
+    $migration = require database_path('migrations/2026_07_19_030000_add_blue_green_drain_provenance.php');
+
+    expect(fn () => $migration->up())
+        ->toThrow(RuntimeException::class, 'partial; refusing a non-convergent replay');
+});
+
+it('rejects complete drain provenance columns with a malformed SQLite shape', function () {
+    Schema::create('application_blue_green_deployments', function (Blueprint $table) {
+        $table->id();
+        $table->timestamp('operation_drain_started_at')->nullable();
+        $table->timestamp('operation_drain_deadline_at')->nullable();
+        $table->string('operation_drain_last_observed_connections')->nullable();
+        $table->timestamp('operation_drain_observed_at')->nullable();
+    });
+
+    $migration = require database_path('migrations/2026_07_19_030000_add_blue_green_drain_provenance.php');
+
+    expect(fn () => $migration->up())
+        ->toThrow(RuntimeException::class, 'authorized SQLite schema');
+});

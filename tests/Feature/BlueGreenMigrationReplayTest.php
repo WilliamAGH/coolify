@@ -172,6 +172,10 @@ it('replays every earlier migration against the complete later schema', function
     expect(Schema::hasColumns('application_blue_green_deployments', [
         'deactivation_operation_id',
         'deactivation_started_at',
+        'operation_drain_started_at',
+        'operation_drain_deadline_at',
+        'operation_drain_last_observed_connections',
+        'operation_drain_observed_at',
     ]))->toBeTrue();
 });
 
@@ -451,6 +455,21 @@ it('fails closed on malformed postgres destination-fencing queue columns', funct
 
     expect(fn () => blueGreenMigration('2026_07_19_025448_add_destination_fencing_to_blue_green_operations')->up())
         ->toThrow(RuntimeException::class, 'queue columns do not match the authorized PostgreSQL catalog');
+});
+
+it('fails closed on malformed postgres drain provenance columns', function () {
+    if (Schema::getConnection()->getDriverName() !== 'pgsql') {
+        $this->markTestSkipped('PostgreSQL drain provenance catalogs are not represented by SQLite.');
+    }
+
+    removeBlueGreenExpandSchema();
+    foreach (blueGreenMigrationNames() as $migrationName) {
+        blueGreenMigration($migrationName)->up();
+    }
+    DB::statement('alter table application_blue_green_deployments alter column operation_drain_last_observed_connections type smallint');
+
+    expect(fn () => blueGreenMigration('2026_07_19_030000_add_blue_green_drain_provenance')->up())
+        ->toThrow(RuntimeException::class, 'drain provenance columns do not match the authorized PostgreSQL catalog');
 });
 
 it('fails closed on an extra postgres deployment index', function () {

@@ -5,14 +5,18 @@ namespace App\Jobs;
 use App\Actions\Application\BlueGreen\FindBlueGreenDeactivationFence;
 use App\Actions\Application\WaitForSwarmStackConvergence;
 use App\Actions\Docker\GetContainersStatus;
+use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Contracts\AdoptsLegacyProxyMutationDispatch;
 use App\Contracts\ProxyMutation;
 use App\Enums\ApplicationDeploymentStatus;
+use App\Enums\BlueGreenDeploymentColor;
+use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\ProcessStatus;
 use App\Events\ApplicationConfigurationChanged;
 use App\Events\ServiceStatusChanged;
 use App\Exceptions\DeploymentException;
 use App\Models\Application;
+use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\ApplicationPreview;
 use App\Models\EnvironmentVariable;
@@ -297,6 +301,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
 
     public function handle(): void
     {
+        $drainRecoveryScheduled = false;
         if (! $this->acquireDeploymentExecutionOwnership()) {
             return;
         }
@@ -341,6 +346,12 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
                     },
                 );
                 $this->blueGreenLifecycle->initialize();
+                if ($this->blueGreenLifecycle->isDrainingRecovery()) {
+                    $this->blueGreenLifecycle->resumeDrainingOperation();
+                    $this->transitionToStatus(ApplicationDeploymentStatus::FINISHED);
+
+                    return;
+                }
             }
             // Generate custom host<->ip mapping
             $safeNetwork = escapeshellarg($this->destination->network);
@@ -402,6 +413,12 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
             $this->decide_what_to_do();
         } catch (Throwable $e) {
             $failure = $this->blueGreenLifecycle?->rollback($e) ?? $e;
+            if ($this->blueGreenLifecycle?->isRetryableDrainTimeout($failure)) {
+                $this->deferBlueGreenDrainRecovery();
+                $drainRecoveryScheduled = true;
+
+                return;
+            }
             if ($this->pull_request_id !== 0 && $this->application->is_github_based()) {
                 ApplicationPullRequestUpdateJob::dispatch(application: $this->application, preview: $this->preview, deployment_uuid: $this->deployment_uuid, status: ProcessStatus::ERROR);
             }
@@ -410,13 +427,15 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         } finally {
             // Wrap cleanup operations in try-catch to prevent exceptions from interfering
             // with Laravel's job failure handling and status updates
-            try {
-                $this->application_deployment_queue->update([
-                    'finished_at' => Carbon::now()->toImmutable(),
-                ]);
-            } catch (Exception $e) {
-                // Log but don't fail - finished_at is not critical
-                \Log::warning('Failed to update finished_at for deployment '.$this->deployment_uuid.': '.$e->getMessage());
+            if (! $drainRecoveryScheduled) {
+                try {
+                    $this->application_deployment_queue->update([
+                        'finished_at' => Carbon::now()->toImmutable(),
+                    ]);
+                } catch (Exception $e) {
+                    // Log but don't fail - finished_at is not critical
+                    \Log::warning('Failed to update finished_at for deployment '.$this->deployment_uuid.': '.$e->getMessage());
+                }
             }
 
             try {
@@ -1586,6 +1605,18 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         }
 
         // Return the generated environment variables instead of storing them globally
+        $blueGreenClaim = $this->blueGreenLifecycle?->claim();
+        if ($blueGreenClaim !== null) {
+            $envs = $envs->reject(static fn (string $environmentVariable): bool => str_starts_with(
+                $environmentVariable,
+                'COOLIFY_DEPLOYMENT_RELEASE_PROOF=',
+            ));
+            $envs->push(
+                'COOLIFY_DEPLOYMENT_RELEASE_PROOF='
+                .BlueGreenRoutingTarget::durableReleaseProofToken($blueGreenClaim->deploymentUuid),
+            );
+        }
+
         return $envs;
     }
 
@@ -3260,6 +3291,10 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
                 $blueGreenBackendPort,
             ));
             $labels->push("coolify.blueGreen.deploymentUuid={$blueGreenClaim->deploymentUuid}");
+            $labels->push(
+                'coolify.blueGreen.releaseProof='
+                .BlueGreenRoutingTarget::durableReleaseProofToken($blueGreenClaim->deploymentUuid),
+            );
         } elseif (data_get($this->application, 'custom_labels')) {
             $this->application->parseContainerLabels();
             $labels = collect(preg_split("/\r\n|\n|\r/", base64_decode($this->application->custom_labels)));
@@ -5060,8 +5095,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         if ($this->blueGreenLifecycle?->isEnabled()) {
             $this->blueGreenLifecycle->retirePreviousContainer();
             $this->blueGreenLifecycle->complete();
-            $this->handleStatusTransition(ApplicationDeploymentStatus::FINISHED);
-            queue_next_deployment($this->application_deployment_queue);
+            $this->transitionToStatus(ApplicationDeploymentStatus::FINISHED);
 
             return;
         }
@@ -5075,6 +5109,115 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
     protected function failDeployment(): void
     {
         $this->transitionToStatus(ApplicationDeploymentStatus::FAILED);
+    }
+
+    public function completeBlueGreenDrainRecovery(): void
+    {
+        $this->application_deployment_queue->refresh();
+        if ($this->application_deployment_queue->status === ApplicationDeploymentStatus::FINISHED->value) {
+            return;
+        }
+        $state = ApplicationBlueGreenDeployment::query()
+            ->where('application_id', $this->application->id)
+            ->where('standalone_docker_id', $this->destination->id)
+            ->first();
+        $deploymentColumn = match ($state?->active_color) {
+            BlueGreenDeploymentColor::BLUE => 'blue_deployment_uuid',
+            BlueGreenDeploymentColor::GREEN => 'green_deployment_uuid',
+            null => null,
+        };
+        if ($this->application_deployment_queue->status !== ApplicationDeploymentStatus::IN_PROGRESS->value
+            || $state === null
+            || $deploymentColumn === null
+            || $state->phase !== BlueGreenDeploymentPhase::IDLE
+            || $state->legacy_container_name !== null
+            || $state->{$deploymentColumn} !== $this->application_deployment_queue->deployment_uuid
+            || $this->application_deployment_queue->blue_green_phase !== BlueGreenDeploymentPhase::IDLE
+            || $this->application_deployment_queue->blue_green_color !== $state->active_color
+            || $this->application_deployment_queue->blue_green_routing_revision !== $state->routing_revision
+            || $this->application_deployment_queue->blue_green_destination_fence_epoch !== $state->destination_fence_epoch
+            || $this->application_deployment_queue->blue_green_topology_digest !== $state->destination_topology_digest
+            || $this->application_deployment_queue->blue_green_routing_config_digest !== $state->application_routing_config_digest) {
+            throw new DeploymentException('Blue-green drain recovery cannot mark deployment success before its exact durable IDLE completion state is present.');
+        }
+        foreach (ApplicationBlueGreenDeployment::clearedOperationAttributes() as $attribute => $_) {
+            if ($state->{$attribute} !== null) {
+                throw new DeploymentException('Blue-green drain recovery cannot mark deployment success while operation provenance remains.');
+            }
+        }
+
+        $completed = ApplicationDeploymentQueue::query()
+            ->whereKey($this->application_deployment_queue->getKey())
+            ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
+            ->update([
+                'status' => ApplicationDeploymentStatus::FINISHED->value,
+                'finished_at' => Carbon::now()->toImmutable(),
+            ]);
+        if ($completed !== 1) {
+            $this->application_deployment_queue->refresh();
+            if ($this->application_deployment_queue->status === ApplicationDeploymentStatus::FINISHED->value) {
+                return;
+            }
+
+            throw new DeploymentException('Blue-green drain recovery lost queue ownership before publishing success.');
+        }
+        $this->application_deployment_queue->refresh();
+        $this->handleStatusTransition(ApplicationDeploymentStatus::FINISHED);
+        queue_next_deployment($this->application_deployment_queue);
+    }
+
+    public function deferBlueGreenDrainRecovery(): void
+    {
+        ResumeBlueGreenDrainingDeploymentJob::dispatch($this->application_deployment_queue->id)
+            ->delay(now()->addSecond());
+        $this->application_deployment_queue->addLogEntry(
+            'Blue-green drain timed out at its immutable deadline; queued the fenced drain recovery owner without marking this release complete.',
+            'stderr',
+        );
+    }
+
+    public function failBlueGreenDrainRecovery(Throwable $exception): void
+    {
+        $this->application_deployment_queue->refresh();
+        if (in_array($this->application_deployment_queue->status, [
+            ApplicationDeploymentStatus::FINISHED->value,
+            ApplicationDeploymentStatus::FAILED->value,
+            ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+        ], true)) {
+            return;
+        }
+        if ($this->application_deployment_queue->status !== ApplicationDeploymentStatus::IN_PROGRESS->value) {
+            throw new DeploymentException('Blue-green drain recovery lost canonical queue ownership before publishing failure.');
+        }
+
+        $this->application_deployment_queue->addLogEntry(
+            'Blue-green drain recovery requires intervention and is publishing the canonical deployment failure: '
+            .$exception->getMessage(),
+            'stderr',
+        );
+        $failed = ApplicationDeploymentQueue::query()
+            ->whereKey($this->application_deployment_queue->getKey())
+            ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
+            ->update([
+                'status' => ApplicationDeploymentStatus::FAILED->value,
+                'finished_at' => Carbon::now()->toImmutable(),
+            ]);
+        if ($failed !== 1) {
+            $this->application_deployment_queue->refresh();
+            if (in_array($this->application_deployment_queue->status, [
+                ApplicationDeploymentStatus::FAILED->value,
+                ApplicationDeploymentStatus::FINISHED->value,
+                ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+            ], true)) {
+                return;
+            }
+
+            throw new DeploymentException('Blue-green drain recovery lost queue ownership before publishing failure.');
+        }
+
+        $this->application_deployment_queue->refresh();
+        $this->handleStatusTransition(ApplicationDeploymentStatus::FAILED);
+        queue_next_deployment($this->application_deployment_queue);
     }
 
     public function failed(Throwable $exception): void

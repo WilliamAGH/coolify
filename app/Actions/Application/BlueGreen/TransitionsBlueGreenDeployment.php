@@ -38,9 +38,15 @@ final class TransitionsBlueGreenDeployment
         }, attempts: 5);
     }
 
-    public static function finalize(BlueGreenDeploymentClaim $claim): ApplicationBlueGreenDeployment
-    {
-        return DB::transaction(function () use ($claim): ApplicationBlueGreenDeployment {
+    public static function markDraining(
+        BlueGreenDeploymentClaim $claim,
+        int $drainTimeoutSeconds,
+    ): ApplicationBlueGreenDeployment {
+        if ($drainTimeoutSeconds < 1) {
+            throw new BlueGreenDeploymentTransitionException('The blue-green drain timeout must be positive.');
+        }
+
+        return DB::transaction(function () use ($claim, $drainTimeoutSeconds): ApplicationBlueGreenDeployment {
             [$state, $deployment] = self::lockExactClaim($claim, BlueGreenDeploymentPhase::SWITCHING);
             if ($state->operation_routing_mutated_at === null
                 || $deployment->blue_green_routing_mutated_at === null
@@ -57,19 +63,24 @@ final class TransitionsBlueGreenDeployment
                 BlueGreenDeploymentColor::BLUE => 'blue_deployment_uuid',
                 BlueGreenDeploymentColor::GREEN => 'green_deployment_uuid',
             };
+            $drainStartedAt = now();
 
             self::updateExactState($state, $claim, BlueGreenDeploymentPhase::SWITCHING, [
                 'active_color' => $claim->pendingColor->value,
                 'pending_color' => null,
                 'pending_deployment_uuid' => null,
-                'phase' => BlueGreenDeploymentPhase::IDLE->value,
+                'phase' => BlueGreenDeploymentPhase::DRAINING->value,
+                'operation_drain_started_at' => $drainStartedAt,
+                'operation_drain_deadline_at' => $drainStartedAt->copy()->addSeconds($drainTimeoutSeconds),
+                'operation_drain_last_observed_connections' => null,
+                'operation_drain_observed_at' => null,
                 $deploymentColumn => $claim->deploymentUuid,
             ]);
             self::updateExactDeployment(
                 $deployment,
                 $claim,
                 BlueGreenDeploymentPhase::SWITCHING,
-                BlueGreenDeploymentPhase::IDLE,
+                BlueGreenDeploymentPhase::DRAINING,
             );
 
             return $state->fresh();
@@ -161,6 +172,9 @@ final class TransitionsBlueGreenDeployment
             ], true)) {
                 self::assertExactClaim($state, $claim, $expectedPhase);
                 $stateQuery = self::exactStateQuery($state, $claim, $expectedPhase);
+            } elseif (self::isExactDrainingClaim($state, $claim)) {
+                $expectedPhase = BlueGreenDeploymentPhase::DRAINING;
+                $stateQuery = self::exactDrainingStateQuery($state, $claim);
             } elseif (self::isExactFinalizedClaim($state, $claim)) {
                 $expectedPhase = BlueGreenDeploymentPhase::IDLE;
                 $stateQuery = self::exactFinalizedStateQuery($state, $claim);
@@ -283,6 +297,35 @@ final class TransitionsBlueGreenDeployment
             && $state->{$deploymentColumn} === $claim->deploymentUuid;
     }
 
+    private static function isExactDrainingClaim(
+        ApplicationBlueGreenDeployment $state,
+        BlueGreenDeploymentClaim $claim,
+    ): bool {
+        $deploymentColumn = match ($claim->pendingColor) {
+            BlueGreenDeploymentColor::BLUE => 'blue_deployment_uuid',
+            BlueGreenDeploymentColor::GREEN => 'green_deployment_uuid',
+        };
+
+        return $state->phase === BlueGreenDeploymentPhase::DRAINING
+            && $state->active_color === $claim->pendingColor
+            && $state->pending_color === null
+            && $state->pending_deployment_uuid === null
+            && $state->routing_revision === $claim->expectedRoutingRevision
+            && $state->operation_deployment_uuid === $claim->deploymentUuid
+            && $state->operation_destination_fence_epoch === $claim->destinationFenceEpoch
+            && $state->operation_server_boot_id === $claim->serverBootId
+            && $state->operation_topology_digest === $claim->topologyDigest
+            && $state->operation_routing_config_digest === $claim->routingConfigDigest
+            && $state->destination_fence_epoch >= $claim->destinationFenceEpoch
+            && $state->destination_fence_operation_id === $claim->deploymentUuid
+            && $state->destination_fence_mutation_sequence > 0
+            && $state->managed_file_sha256 !== null
+            && $state->destination_topology_digest === $claim->topologyDigest
+            && $state->application_routing_config_digest === $claim->routingConfigDigest
+            && $state->legacy_container_name === $claim->legacyContainerName
+            && $state->{$deploymentColumn} === $claim->deploymentUuid;
+    }
+
     /**
      * @param  array<string, int|string|null>  $attributes
      */
@@ -376,6 +419,41 @@ final class TransitionsBlueGreenDeployment
             ->where('destination_fence_mutation_sequence', '>', 0)
             ->whereNotNull('managed_file_sha256')
             ->where('operation_server_boot_id', $claim->serverBootId)
+            ->where('destination_topology_digest', $claim->topologyDigest)
+            ->where('application_routing_config_digest', $claim->routingConfigDigest)
+            ->where($deploymentColumn, $claim->deploymentUuid);
+
+        return $claim->legacyContainerName === null
+            ? $query->whereNull('legacy_container_name')
+            : $query->where('legacy_container_name', $claim->legacyContainerName);
+    }
+
+    private static function exactDrainingStateQuery(
+        ApplicationBlueGreenDeployment $state,
+        BlueGreenDeploymentClaim $claim,
+    ): Builder {
+        $deploymentColumn = match ($claim->pendingColor) {
+            BlueGreenDeploymentColor::BLUE => 'blue_deployment_uuid',
+            BlueGreenDeploymentColor::GREEN => 'green_deployment_uuid',
+        };
+        $query = ApplicationBlueGreenDeployment::query()
+            ->whereKey($state->getKey())
+            ->where('application_id', $claim->applicationId)
+            ->where('standalone_docker_id', $claim->standaloneDockerId)
+            ->where('phase', BlueGreenDeploymentPhase::DRAINING->value)
+            ->where('active_color', $claim->pendingColor->value)
+            ->whereNull('pending_color')
+            ->whereNull('pending_deployment_uuid')
+            ->where('routing_revision', $claim->expectedRoutingRevision)
+            ->where('operation_deployment_uuid', $claim->deploymentUuid)
+            ->where('operation_destination_fence_epoch', $claim->destinationFenceEpoch)
+            ->where('operation_server_boot_id', $claim->serverBootId)
+            ->where('operation_topology_digest', $claim->topologyDigest)
+            ->where('operation_routing_config_digest', $claim->routingConfigDigest)
+            ->where('destination_fence_epoch', '>=', $claim->destinationFenceEpoch)
+            ->where('destination_fence_operation_id', $claim->deploymentUuid)
+            ->where('destination_fence_mutation_sequence', '>', 0)
+            ->whereNotNull('managed_file_sha256')
             ->where('destination_topology_digest', $claim->topologyDigest)
             ->where('application_routing_config_digest', $claim->routingConfigDigest)
             ->where($deploymentColumn, $claim->deploymentUuid);

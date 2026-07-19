@@ -2,7 +2,6 @@
 
 namespace App\Actions\Application\BlueGreen;
 
-use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\ApplicationBlueGreenDeployment;
@@ -47,8 +46,7 @@ final class CompleteBlueGreenDeploymentOperation
                 BlueGreenDeploymentColor::BLUE => 'blue_deployment_uuid',
                 BlueGreenDeploymentColor::GREEN => 'green_deployment_uuid',
             };
-            $isExactFinalizedCycle = $state->phase === BlueGreenDeploymentPhase::IDLE
-                && $state->active_color === $claim->pendingColor
+            $hasExactPromotedRoute = $state->active_color === $claim->pendingColor
                 && $state->pending_color === null
                 && $state->pending_deployment_uuid === null
                 && $state->{$deploymentColumn} === $claim->deploymentUuid
@@ -59,7 +57,6 @@ final class CompleteBlueGreenDeploymentOperation
                 && $state->managed_file_sha256 !== null
                 && $state->destination_topology_digest === $claim->topologyDigest
                 && $state->application_routing_config_digest === $claim->routingConfigDigest
-                && $deployment->blue_green_phase === BlueGreenDeploymentPhase::IDLE
                 && $deployment->blue_green_color === $claim->pendingColor
                 && $deployment->blue_green_routing_revision === $claim->expectedRoutingRevision
                 && $deployment->blue_green_destination_fence_epoch === $claim->destinationFenceEpoch
@@ -69,12 +66,16 @@ final class CompleteBlueGreenDeploymentOperation
                 && $deployment->pull_request_id === 0
                 && (int) $deployment->destination_id === $claim->standaloneDockerId
                 && (int) $deployment->server_id === $destination->server_id;
+            $isExactCompletedCycle = $state->phase === BlueGreenDeploymentPhase::IDLE
+                && $hasExactPromotedRoute
+                && $deployment->blue_green_phase === BlueGreenDeploymentPhase::IDLE;
+            $isExactDrainingCycle = $state->phase === BlueGreenDeploymentPhase::DRAINING
+                && $hasExactPromotedRoute
+                && $deployment->blue_green_phase === BlueGreenDeploymentPhase::DRAINING;
             if ($state->operation_deployment_uuid === null) {
-                if (! $isExactFinalizedCycle
+                if (! $isExactCompletedCycle
                     || $state->legacy_container_name !== null
-                    || ! $this->operationProvenanceIsCleared($state)
-                    || $deployment->status !== ApplicationDeploymentStatus::FINISHED->value
-                    || $deployment->finished_at === null) {
+                    || ! $this->operationProvenanceIsCleared($state)) {
                     throw new BlueGreenDeploymentTransitionException('The completed blue-green operation does not match the exact finalized claim cycle.');
                 }
 
@@ -84,7 +85,7 @@ final class CompleteBlueGreenDeploymentOperation
             $expectedPreviousContainerName = $claim->previousActiveColor === null
                 ? $claim->legacyContainerName
                 : $application->uuid.'-'.$claim->previousActiveColor->value;
-            if (! $isExactFinalizedCycle
+            if (! $isExactDrainingCycle
                 || $state->legacy_container_name !== $claim->legacyContainerName
                 || $state->active_color !== $claim->pendingColor
                 || $state->operation_deployment_uuid !== $claim->deploymentUuid
@@ -109,7 +110,7 @@ final class CompleteBlueGreenDeploymentOperation
 
             $stateUpdated = ApplicationBlueGreenDeployment::query()
                 ->whereKey($state->getKey())
-                ->where('phase', BlueGreenDeploymentPhase::IDLE->value)
+                ->where('phase', BlueGreenDeploymentPhase::DRAINING->value)
                 ->where('active_color', $claim->pendingColor->value)
                 ->where('routing_revision', $claim->expectedRoutingRevision)
                 ->where('operation_deployment_uuid', $claim->deploymentUuid)
@@ -119,12 +120,13 @@ final class CompleteBlueGreenDeploymentOperation
                 ->where('destination_topology_digest', $claim->topologyDigest)
                 ->where('application_routing_config_digest', $claim->routingConfigDigest)
                 ->update([
+                    'phase' => BlueGreenDeploymentPhase::IDLE->value,
                     'legacy_container_name' => null,
                     ...ApplicationBlueGreenDeployment::clearedOperationAttributes(),
                 ]);
             $deploymentUpdated = ApplicationDeploymentQueue::query()
                 ->whereKey($deployment->getKey())
-                ->where('blue_green_phase', BlueGreenDeploymentPhase::IDLE->value)
+                ->where('blue_green_phase', BlueGreenDeploymentPhase::DRAINING->value)
                 ->where('blue_green_color', $claim->pendingColor->value)
                 ->where('blue_green_routing_revision', $claim->expectedRoutingRevision)
                 ->where('blue_green_destination_fence_epoch', $claim->destinationFenceEpoch)
@@ -133,8 +135,7 @@ final class CompleteBlueGreenDeploymentOperation
                 ->where('blue_green_routing_config_digest', $claim->routingConfigDigest)
                 ->where('blue_green_candidate_container_id', $state->operation_candidate_container_id)
                 ->update([
-                    'status' => ApplicationDeploymentStatus::FINISHED->value,
-                    'finished_at' => now(),
+                    'blue_green_phase' => BlueGreenDeploymentPhase::IDLE->value,
                 ]);
             if ($stateUpdated !== 1 || $deploymentUpdated !== 1) {
                 throw new BlueGreenDeploymentTransitionException('The finalized operation changed while durable cleanup was completing.');
@@ -194,7 +195,7 @@ final class CompleteBlueGreenDeploymentOperation
             return true;
         }
 
-        return $operation->recoveredPhase === BlueGreenDeploymentPhase::IDLE
+        return $operation->recoveredPhase === BlueGreenDeploymentPhase::DRAINING
             && $operation->routingMutationRecorded
             && $operation->destination->id === $state->standalone_docker_id
             && $operation->server->id === (int) $deployment->server_id

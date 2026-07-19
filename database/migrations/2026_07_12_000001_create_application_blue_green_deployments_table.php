@@ -103,6 +103,12 @@ return new class extends Migration
                 'operation_routing_config_digest',
                 'operation_previous_managed_file_sha256',
             ],
+            [
+                'operation_drain_started_at',
+                'operation_drain_deadline_at',
+                'operation_drain_last_observed_connections',
+                'operation_drain_observed_at',
+            ],
         ];
         $laterOwnedColumns = array_merge(...$laterOwnedColumnGroups);
         $columnNames = $columns->keys()->values()->all();
@@ -285,7 +291,11 @@ return new class extends Migration
                           'operation_server_boot_id',
                           'operation_topology_digest',
                           'operation_routing_config_digest',
-                          'operation_previous_managed_file_sha256'
+                          'operation_previous_managed_file_sha256',
+                          'operation_drain_started_at',
+                          'operation_drain_deadline_at',
+                          'operation_drain_last_observed_connections',
+                          'operation_drain_observed_at'
                       )
                 )
                 and (select count(*) from actual_all
@@ -305,6 +315,13 @@ return new class extends Migration
                         'operation_routing_config_digest',
                         'operation_previous_managed_file_sha256'
                     )) in (0, 12)
+                and (select count(*) from actual_all
+                    where name in (
+                        'operation_drain_started_at',
+                        'operation_drain_deadline_at',
+                        'operation_drain_last_observed_connections',
+                        'operation_drain_observed_at'
+                    )) in (0, 4)
                 and (select count(*) = 4
                     and count(*) filter (where conname = 'application_blue_green_deployments_pkey'
                         and contype = 'p' and conkey = array[1]::smallint[]

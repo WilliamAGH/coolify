@@ -6,8 +6,10 @@ use App\Actions\Application\BlueGreen\RecordBlueGreenDestinationState;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
+use App\Events\ApplicationConfigurationChanged;
 use App\Exceptions\DeploymentException;
 use App\Jobs\ApplicationDeploymentJob;
+use App\Jobs\ResumeBlueGreenDrainingDeploymentJob;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
@@ -17,11 +19,14 @@ use App\Models\Project;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
 use App\Models\Team;
+use App\Notifications\Application\DeploymentFailed;
 use App\Services\BlueGreenDeploymentLifecycle;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Process\PendingProcess;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Notification;
 use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Storage;
 
 uses(RefreshDatabase::class);
@@ -33,6 +38,7 @@ uses(RefreshDatabase::class);
  *     destination: StandaloneDocker,
  *     job: ApplicationDeploymentJob,
  *     server: Server
+ *     team: Team
  * }
  */
 function makeApplicationDeploymentBlueGreenDestinationFenceFixture(): array
@@ -90,6 +96,7 @@ KEY,
         'destination' => $destination,
         'job' => new ApplicationDeploymentJob($deployment->id),
         'server' => $server,
+        'team' => $team,
     ];
 }
 
@@ -155,6 +162,37 @@ function createNewerApplicationDestinationFence(array $fixture): ApplicationBlue
         'destination_topology_digest' => hash('sha256', 'newer-destination-topology'),
         'application_routing_config_digest' => hash('sha256', 'newer-routing-configuration'),
     ]);
+}
+
+function createCompletedApplicationDeploymentBlueGreenState(array $fixture): ApplicationBlueGreenDeployment
+{
+    $topologyDigest = hash('sha256', 'completed-application-destination-topology');
+    $routingConfigDigest = hash('sha256', 'completed-application-routing-configuration');
+    $state = ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $fixture['application']->id,
+        'standalone_docker_id' => $fixture['destination']->id,
+        'active_color' => BlueGreenDeploymentColor::BLUE,
+        'blue_deployment_uuid' => $fixture['deployment']->deployment_uuid,
+        'phase' => BlueGreenDeploymentPhase::IDLE,
+        'routing_revision' => 1,
+        'destination_fence_epoch' => 1,
+        'destination_fence_operation_id' => $fixture['deployment']->deployment_uuid,
+        'destination_fence_mutation_sequence' => 1,
+        'managed_file_sha256' => hash('sha256', 'completed-managed-route'),
+        'destination_topology_digest' => $topologyDigest,
+        'application_routing_config_digest' => $routingConfigDigest,
+    ]);
+    $fixture['deployment']->update([
+        'blue_green_color' => BlueGreenDeploymentColor::BLUE->value,
+        'blue_green_phase' => BlueGreenDeploymentPhase::IDLE->value,
+        'blue_green_routing_revision' => 1,
+        'blue_green_destination_fence_epoch' => 1,
+        'blue_green_server_boot_id' => '11111111-2222-3333-4444-555555555555',
+        'blue_green_topology_digest' => $topologyDigest,
+        'blue_green_routing_config_digest' => $routingConfigDigest,
+    ]);
+
+    return $state;
 }
 
 beforeEach(function () {
@@ -257,6 +295,94 @@ it('does not complete the job until previous-container retirement owns a destina
 
     expect($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
     Process::assertNothingRan();
+});
+
+it('keeps a drain timeout nonterminal, schedules bounded recovery, and emits success once after completion', function () {
+    $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
+    Queue::fake();
+    Event::fake([ApplicationConfigurationChanged::class]);
+
+    $fixture['job']->deferBlueGreenDrainRecovery();
+
+    expect($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
+    Queue::assertPushed(
+        ResumeBlueGreenDrainingDeploymentJob::class,
+        fn (ResumeBlueGreenDrainingDeploymentJob $job): bool => $job->applicationDeploymentQueueId === $fixture['deployment']->id
+            && $job->recoveryAttempt === 1,
+    );
+
+    $fixture['deployment']->update(['blue_green_phase' => BlueGreenDeploymentPhase::DRAINING]);
+    $resume = new ResumeBlueGreenDrainingDeploymentJob($fixture['deployment']->id);
+    expect($resume->scheduleNextAttempt($fixture['deployment']))->toBeTrue()
+        ->and($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
+    Queue::assertPushed(
+        ResumeBlueGreenDrainingDeploymentJob::class,
+        fn (ResumeBlueGreenDrainingDeploymentJob $job): bool => $job->applicationDeploymentQueueId === $fixture['deployment']->id
+            && $job->recoveryAttempt === 2,
+    );
+    expect((new ResumeBlueGreenDrainingDeploymentJob($fixture['deployment']->id, 10))
+        ->scheduleNextAttempt($fixture['deployment']))->toBeFalse();
+
+    createCompletedApplicationDeploymentBlueGreenState($fixture);
+    $fixture['job']->completeBlueGreenDrainRecovery();
+    $fixture['job']->completeBlueGreenDrainRecovery();
+
+    expect($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::FINISHED->value)
+        ->and($fixture['deployment']->fresh()->finished_at)->not->toBeNull();
+    Event::assertDispatchedTimes(ApplicationConfigurationChanged::class, 1);
+});
+
+it('refuses to mark an arbitrary nonfinal deployment successful through drain recovery', function () {
+    $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
+
+    expect(fn () => $fixture['job']->completeBlueGreenDrainRecovery())
+        ->toThrow(DeploymentException::class, 'exact durable IDLE completion state');
+
+    expect($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
+});
+
+it('completes an exact durable IDLE state when recovery restarts after lifecycle completion', function () {
+    $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
+    Event::fake([ApplicationConfigurationChanged::class]);
+    createCompletedApplicationDeploymentBlueGreenState($fixture);
+
+    (new ResumeBlueGreenDrainingDeploymentJob($fixture['deployment']->id))->handle();
+
+    expect($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::FINISHED->value)
+        ->and($fixture['deployment']->fresh()->finished_at)->not->toBeNull();
+    Event::assertDispatchedTimes(ApplicationConfigurationChanged::class, 1);
+});
+
+it('routes an unexpected drain recovery state through canonical failure exactly once', function () {
+    $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
+    $fixture['team']->emailNotificationSettings()->update([
+        'use_instance_email_settings' => true,
+        'deployment_failure_email_notifications' => true,
+    ]);
+    ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $fixture['application']->id,
+        'standalone_docker_id' => $fixture['destination']->id,
+        'phase' => BlueGreenDeploymentPhase::IDLE,
+        'routing_revision' => 1,
+        'operation_deployment_uuid' => 'another-deployment',
+    ]);
+    $resume = new ResumeBlueGreenDrainingDeploymentJob($fixture['deployment']->id);
+
+    $resume->handle();
+    $resume->handle();
+
+    expect($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value)
+        ->and($fixture['deployment']->fresh()->finished_at)->not->toBeNull()
+        ->and(Notification::sent($fixture['team'], DeploymentFailed::class))->toHaveCount(1);
+});
+
+it('rejects a command health-check contract before public failover compilation', function () {
+    $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
+    $fixture['application']->update(['health_check_type' => 'cmd']);
+    $lifecycle = applicationDeploymentBlueGreenLifecycle($fixture);
+
+    expect(fn () => invokeApplicationDeploymentBlueGreenMethod($lifecycle, 'httpFailoverHealthCheckContract'))
+        ->toThrow(DeploymentException::class, 'requires an HTTP application health-check contract');
 });
 
 it('does not use generic candidate cleanup or overwrite newer destination state after failure', function () {
