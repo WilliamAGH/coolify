@@ -79,6 +79,13 @@ function applicationValidationWorkflowViolations(array $workflow): array
         }
     }
 
+    $workflowAndShell = is_array($jobs) ? ($jobs['workflow-and-shell'] ?? []) : [];
+    $traefikRuntimeScript = collect($workflowAndShell['steps'] ?? [])
+        ->firstWhere('name', 'Run native Traefik runtime integration')['run'] ?? '';
+    if (! str_contains((string) $traefikRuntimeScript, 'tests/Integration/ControlPlaneTraefik/run.sh')) {
+        $violations[] = 'application validation must execute the native Traefik runtime integration';
+    }
+
     foreach (is_array($jobs) ? $jobs : [] as $job) {
         foreach ($job['steps'] ?? [] as $step) {
             $uses = (string) ($step['uses'] ?? '');
@@ -127,4 +134,14 @@ it('rejects omitting the native Traefik control-plane suite', function () {
 
     expect(applicationValidationWorkflowViolations($workflow))
         ->toContain('application validation must execute every native Traefik control-plane test');
+});
+
+it('rejects omitting the native Traefik runtime integration', function () {
+    $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
+    $step = collect($workflow['jobs']['workflow-and-shell']['steps'])
+        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Run native Traefik runtime integration');
+    $workflow['jobs']['workflow-and-shell']['steps'][$step]['run'] = 'true';
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('application validation must execute the native Traefik runtime integration');
 });

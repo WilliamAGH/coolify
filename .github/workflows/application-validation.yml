@@ -283,6 +283,8 @@ jobs:
         run: |
           tests/Integration/PublishLinuxImageScriptTest.sh
           tests/Integration/ReleaseOperationalFixturesTest.sh
+      - name: Run native Traefik runtime integration
+        run: tests/Integration/ControlPlaneTraefik/run.sh
       - name: Require immutable external action and container references
         shell: bash
         run: |
