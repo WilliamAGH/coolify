@@ -3,6 +3,7 @@
 namespace App\Actions\Proxy\ControlPlane;
 
 use App\Models\Server;
+use Closure;
 use InvalidArgumentException;
 use Lorisleiva\Actions\Concerns\AsAction;
 use RuntimeException;
@@ -16,6 +17,9 @@ final class PrepareControlPlaneGenerationPromotion
         private readonly ExtractControlPlaneDynamicFragments $dynamicFragmentExtractor,
         private readonly StoreControlPlaneProxyEnrollmentState $enrollmentStateStore,
         private readonly StoreControlPlaneGenerationPromotionState $promotionStateStore,
+        private readonly ManagedTraefikDocumentWriter $dynamicWriter,
+        private readonly ControlPlaneGenerationWriterAuthority $writerAuthority,
+        private readonly VerifyControlPlaneRestoredRoutes $restoredRoutesVerifier,
     ) {}
 
     /**
@@ -40,16 +44,28 @@ final class PrepareControlPlaneGenerationPromotion
         array $terminalRouterFragments = [],
         array $preservedServices = [],
         array $preservedMiddlewares = [],
+        ?Closure $remoteExecutor = null,
     ): PreparedControlPlaneGenerationPromotion {
         $enrollment = $this->enrolledState($server);
         $currentPromotion = $this->promotionStateStore->read($server);
+        if ($currentPromotion?->legacyWriterAuthorityReconciliationRequired) {
+            if ($currentPromotion->phase !== ControlPlaneGenerationPromotionPhase::RolledBack) {
+                throw new RuntimeException('Legacy control-plane writer authority must be reconciled through generation resume before preparation can continue.');
+            }
+            $currentPromotion = $this->reconcileLegacyTerminalRollback(
+                $server,
+                $currentPromotion,
+                $enrollment,
+                $remoteExecutor,
+            );
+        }
         $isCompletedPredecessor = $currentPromotion?->phase === ControlPlaneGenerationPromotionPhase::Completed;
         $isRolledBackPredecessor = $currentPromotion?->phase === ControlPlaneGenerationPromotionPhase::RolledBack;
         $isChainedReplay = $currentPromotion !== null
             && ! $isCompletedPredecessor
             && ! $isRolledBackPredecessor
             && $currentPromotion->isOwnedBy($operationId, $token)
-            && ! $currentPromotion->matchesEnrolledPredecessor($enrollment);
+            && ! $currentPromotion->matchesEnrolledWriterPredecessor($enrollment);
 
         if ($isCompletedPredecessor) {
             $predecessorDynamicRevision = $currentPromotion->successor['dynamic_revision'];
@@ -209,6 +225,63 @@ final class PrepareControlPlaneGenerationPromotion
         $state = $this->promotionStateStore->reserve($server, $desiredState, $token);
 
         return new PreparedControlPlaneGenerationPromotion($state, $successorConfiguration);
+    }
+
+    /** @param null|Closure(string): ?string $remoteExecutor */
+    private function reconcileLegacyTerminalRollback(
+        Server $server,
+        ControlPlaneGenerationPromotionState $state,
+        ControlPlaneProxyEnrollmentState $enrollment,
+        ?Closure $remoteExecutor,
+    ): ControlPlaneGenerationPromotionState {
+        $execute = $remoteExecutor ?? static fn (string $command): ?string => instant_remote_process(
+            [$command],
+            $server,
+            timeout: 120,
+            disableMultiplexing: true,
+            retry: false,
+        );
+        $proxyPath = rtrim((string) $server->proxyPath(), '/');
+        $mutation = new ManagedTraefikDocumentMutation(
+            dynamicDirectory: $proxyPath.'/dynamic',
+            stateDirectory: $proxyPath.'/.control-plane-managed-traefik',
+            filename: $state->managedFilename,
+            operationId: $state->operationId,
+            revision: $state->successor['dynamic_revision'],
+            expectedSha256: $state->predecessor['dynamic_sha256'],
+            expectedOperationId: $state->predecessor['operation_id'],
+            expectedRevision: $state->predecessor['dynamic_revision'],
+            replacementBytes: '',
+            expectedWriterOperationId: $state->predecessorWriterOperationId,
+        );
+        $output = $execute($this->dynamicWriter->reconcileRolledBackWriterAuthorityCommandFor(
+            mutation: $mutation,
+            predecessorAuthority: $this->writerAuthority->predecessor($state),
+            rolledBackAuthority: $this->writerAuthority->rolledBack($state),
+        ));
+        if (! is_string($output) || ! hash_equals(ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT, $output)) {
+            throw new RuntimeException('The terminal legacy rollback writer authority reconciliation did not return its exact completion proof.');
+        }
+
+        $proof = new ControlPlaneRestoredRoutesProof(
+            canonicalHost: $enrollment->canonicalHost,
+            publicScheme: $enrollment->publicScheme,
+            appPort: $enrollment->appPort,
+            expectedBackendMember: $state->predecessor['member'],
+            expectedBackendRevision: $state->predecessor['release_revision'],
+            expectedDynamicPredecessorSha256: $state->predecessor['dynamic_sha256'],
+        );
+        $transcript = $execute($proof->shellCommand());
+        if (! is_string($transcript)) {
+            throw new RuntimeException('The terminal legacy rollback restored-route proof returned no transcript.');
+        }
+        $this->restoredRoutesVerifier->handle($proof, $transcript);
+
+        return $this->promotionStateStore->reconcileLegacyTerminalRollbackWriterAuthority(
+            $server,
+            $state,
+            now()->toIso8601String(),
+        );
     }
 
     private function enrolledState(Server $server): ControlPlaneProxyEnrollmentState

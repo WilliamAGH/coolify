@@ -283,6 +283,7 @@ function rollbackControlPlaneGenerationMutation(
         expectedOperationId: $state->predecessor['operation_id'],
         expectedRevision: $state->predecessor['dynamic_revision'],
         replacementBytes: $successorYaml,
+        expectedWriterOperationId: $state->predecessorWriterOperationId,
     );
 }
 
@@ -293,6 +294,7 @@ function rollbackControlPlaneGenerationWriterCommand(
     return (new ManagedTraefikDocumentWriter)->rollbackCommandForRequiringPredecessorAuthority(
         mutation: $mutation,
         predecessorAuthority: (new ControlPlaneGenerationWriterAuthority)->predecessor($state),
+        rolledBackAuthority: (new ControlPlaneGenerationWriterAuthority)->rolledBack($state),
         allowInitialOrPreWriteReconciliation: true,
         allowMissingArtifactNoop: true,
     );
@@ -336,8 +338,10 @@ function rollbackControlPlaneGenerationTranscript(ControlPlaneRestoredRoutesProo
     return implode("\n", [...$records, ControlPlaneRestoredRoutesProof::TRANSCRIPT_CONVERGED.' 2']);
 }
 
-it('completes a pre-write rollback without fabricating a dynamic rollback artifact', function (): void {
+it('completes a pre-write rollback with the exact successor document and tombstoned writer authority', function (): void {
     $fixture = rollbackControlPlaneGenerationFixture();
+    $mutation = rollbackControlPlaneGenerationMutation($fixture['server'], $fixture['promotion'], $fixture['successor_yaml']);
+    $writerCommand = rollbackControlPlaneGenerationWriterCommand($fixture['promotion'], $mutation);
     $proof = rollbackControlPlaneGenerationProof($fixture['enrollment'], $fixture['promotion']);
     $commands = [];
     [, $cleanup] = rollbackControlPlaneGenerationIsolatedQueue($fixture['server']);
@@ -347,12 +351,15 @@ it('completes a pre-write rollback without fabricating a dynamic rollback artifa
             $fixture['server'],
             $fixture['promotion']->operationId,
             $fixture['token'],
-            null,
-            function (string $command) use (&$commands, $proof): string {
+            $fixture['successor_yaml'],
+            function (string $command) use (&$commands, $proof, $writerCommand): string {
                 $commands[] = $command;
-                expect($command)->toBe($proof->shellCommand());
 
-                return rollbackControlPlaneGenerationTranscript($proof);
+                return match ($command) {
+                    $writerCommand => ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT,
+                    $proof->shellCommand() => rollbackControlPlaneGenerationTranscript($proof),
+                    default => throw new RuntimeException("Unexpected pre-write generation rollback command: {$command}"),
+                };
             },
         );
 
@@ -360,12 +367,88 @@ it('completes a pre-write rollback without fabricating a dynamic rollback artifa
             ->and($rolledBack->rollbackStartedAt)->not->toBeNull()
             ->and($rolledBack->rollbackAcknowledgedAt)->not->toBeNull()
             ->and($rolledBack->rolledBackAt)->not->toBeNull()
-            ->and($commands)->toBe([$proof->shellCommand()])
+            ->and($commands)->toBe([$writerCommand, $proof->shellCommand()])
+            ->and($writerCommand)->toContain("authority_mode='rollback'")
             ->and($fixture['promotion_store']->read($fixture['server'])?->toArray())
             ->toBe($rolledBack->toArray());
     } finally {
         $cleanup($fixture['promotion']->operationId);
     }
+});
+
+it('reconciles and fences a terminal legacy rollback before returning it', function (): void {
+    $fixture = rollbackControlPlaneGenerationFixture();
+    $rolledBack = $fixture['promotion']
+        ->withPhase(ControlPlaneGenerationPromotionPhase::RollingBack, '2026-07-19T12:01:00Z', [
+            'rollback_started_at' => '2026-07-19T12:01:00Z',
+        ])
+        ->withPhase(ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement, '2026-07-19T12:02:00Z', [
+            'rollback_writer_authority' => [
+                'operation_id' => $fixture['promotion']->operationId,
+                'epoch' => $fixture['promotion']->writerEpoch,
+                'fenced' => true,
+            ],
+        ])
+        ->withPhase(ControlPlaneGenerationPromotionPhase::RollbackUnfreezing, '2026-07-19T12:03:00Z', [
+            'rollback_acknowledged_at' => '2026-07-19T12:03:00Z',
+        ])
+        ->withPhase(ControlPlaneGenerationPromotionPhase::RolledBack, '2026-07-19T12:04:00Z', [
+            'rolled_back_at' => '2026-07-19T12:04:00Z',
+        ]);
+    $legacyPayload = $rolledBack->toArray();
+    $legacyPayload['version'] = 1;
+    unset(
+        $legacyPayload['rollback_writer_authority'],
+        $legacyPayload['legacy_writer_authority_reconciliation_required'],
+        $legacyPayload['writer']['predecessor_operation_id'],
+    );
+    $freshServer = $fixture['server']->fresh();
+    $freshServer->proxy->set(StoreControlPlaneGenerationPromotionState::STATE_KEY, $legacyPayload);
+    $freshServer->save();
+    $legacyState = $fixture['promotion_store']->read($fixture['server']);
+    $mutation = rollbackControlPlaneGenerationMutation($fixture['server'], $legacyState, '');
+    $authority = new ControlPlaneGenerationWriterAuthority;
+    $writerCommand = (new ManagedTraefikDocumentWriter)->reconcileRolledBackWriterAuthorityCommandFor(
+        mutation: $mutation,
+        predecessorAuthority: $authority->predecessor($legacyState),
+        rolledBackAuthority: $authority->rolledBack($legacyState),
+    );
+    $proof = rollbackControlPlaneGenerationProof($fixture['enrollment'], $legacyState);
+    $commands = [];
+
+    $reconciled = rollbackControlPlaneGenerationAction($fixture)->handle(
+        $fixture['server'],
+        $legacyState->operationId,
+        $fixture['token'],
+        $fixture['successor_yaml'],
+        function (string $command) use (&$commands, $proof, $writerCommand): string {
+            $commands[] = $command;
+
+            return match ($command) {
+                $writerCommand => ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT,
+                $proof->shellCommand() => rollbackControlPlaneGenerationTranscript($proof),
+                default => throw new RuntimeException("Unexpected legacy rollback reconciliation command: {$command}"),
+            };
+        },
+    );
+    $replayed = rollbackControlPlaneGenerationAction($fixture)->handle(
+        $fixture['server'],
+        $legacyState->operationId,
+        $fixture['token'],
+        null,
+        static fn (): never => throw new RuntimeException('A reconciled terminal rollback must not repeat remote work.'),
+    );
+
+    expect($legacyState->legacyWriterAuthorityReconciliationRequired)->toBeTrue()
+        ->and($reconciled->phase)->toBe(ControlPlaneGenerationPromotionPhase::RolledBack)
+        ->and($reconciled->legacyWriterAuthorityReconciliationRequired)->toBeFalse()
+        ->and($reconciled->rollbackWriterAuthority)->toBe([
+            'operation_id' => $legacyState->operationId,
+            'epoch' => $legacyState->writerEpoch,
+            'fenced' => true,
+        ])
+        ->and($replayed->toArray())->toBe($reconciled->toArray())
+        ->and($commands)->toBe([$writerCommand, $proof->shellCommand()]);
 });
 
 it('rolls back an exact successor document, releases its own empty freeze, and is terminally replay-safe', function (): void {
@@ -471,6 +554,22 @@ it('persists rolling back before a dynamic rollback crash and retries the exact 
             ->and($fixture['promotion_store']->read($fixture['server'])?->rollbackStartedAt)
             ->not->toBeNull();
 
+        $missingYamlRemoteCalls = 0;
+        expect(fn (): ControlPlaneGenerationPromotionState => rollbackControlPlaneGenerationAction($fixture)->handle(
+            $fixture['server'],
+            $switching->operationId,
+            $fixture['token'],
+            null,
+            function () use (&$missingYamlRemoteCalls): never {
+                $missingYamlRemoteCalls++;
+
+                throw new RuntimeException('A missing successor YAML must prevent a rollback replay command.');
+            },
+        ))->toThrow(RuntimeException::class, 'checksum');
+        expect($missingYamlRemoteCalls)->toBe(0)
+            ->and($fixture['promotion_store']->read($fixture['server'])?->phase)
+            ->toBe(ControlPlaneGenerationPromotionPhase::RollingBack);
+
         $recovered = rollbackControlPlaneGenerationAction($fixture)->handle(
             $fixture['server'],
             $switching->operationId,
@@ -545,6 +644,66 @@ it('keeps an acknowledged document rollback durable when predecessor routes do n
     }
 });
 
+it('completes rollback unfreezing after its live freeze was released and new queue work was admitted', function (): void {
+    $fixture = rollbackControlPlaneGenerationFixture();
+    $switching = rollbackControlPlaneGenerationSwitching($fixture);
+    [$queue, $cleanup] = rollbackControlPlaneGenerationIsolatedQueue($fixture['server']);
+
+    try {
+        ProxyMutationQueue::freeze($switching->operationId, $queue);
+        $rollingBack = $fixture['promotion_store']->transition(
+            $fixture['server'],
+            $switching->operationId,
+            $fixture['token'],
+            ControlPlaneGenerationPromotionPhase::Switching,
+            ControlPlaneGenerationPromotionPhase::RollingBack,
+            '2026-07-19T12:08:00Z',
+            ['rollback_started_at' => '2026-07-19T12:08:00Z'],
+        );
+        $awaitingAcknowledgement = $fixture['promotion_store']->transition(
+            $fixture['server'],
+            $rollingBack->operationId,
+            $fixture['token'],
+            ControlPlaneGenerationPromotionPhase::RollingBack,
+            ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement,
+            '2026-07-19T12:08:01Z',
+            ['rollback_writer_authority' => [
+                'operation_id' => $rollingBack->operationId,
+                'epoch' => $rollingBack->writerEpoch,
+                'fenced' => true,
+            ]],
+        );
+        $fixture['promotion_store']->transition(
+            $fixture['server'],
+            $awaitingAcknowledgement->operationId,
+            $fixture['token'],
+            ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement,
+            ControlPlaneGenerationPromotionPhase::RollbackUnfreezing,
+            '2026-07-19T12:08:02Z',
+            ['rollback_acknowledged_at' => '2026-07-19T12:08:02Z'],
+        );
+        ProxyMutationQueue::unfreeze($switching->operationId, $queue);
+        $queue->getConnection()->rpush($queue->getQueue(ProxyMutationQueue::NAME), 'admitted-after-rollback-unfreeze');
+
+        $rolledBack = rollbackControlPlaneGenerationAction($fixture)->handle(
+            $fixture['server'],
+            $switching->operationId,
+            $fixture['token'],
+            null,
+            static function (): never {
+                throw new RuntimeException('Durably acknowledged rollback unfreezing must not repeat remote work.');
+            },
+        );
+
+        expect($rolledBack->phase)->toBe(ControlPlaneGenerationPromotionPhase::RolledBack)
+            ->and($rolledBack->rolledBackAt)->not->toBeNull()
+            ->and(ProxyMutationQueue::snapshot($queue)->freezeOperationId)->toBeNull()
+            ->and(ProxyMutationQueue::snapshot($queue)->isEmpty())->toBeFalse();
+    } finally {
+        $cleanup($switching->operationId);
+    }
+});
+
 it('completes replay after its own freeze was released following route acknowledgement', function (): void {
     $fixture = rollbackControlPlaneGenerationFixture();
     $switching = rollbackControlPlaneGenerationSwitching($fixture);
@@ -609,7 +768,7 @@ it('fails closed when a recorded pre-write freeze is missing or a foreign operat
             $missingFixture['server'],
             $frozen->operationId,
             $missingFixture['token'],
-            null,
+            $missingFixture['successor_yaml'],
             function () use (&$missingRemoteCalls): never {
                 $missingRemoteCalls++;
 
@@ -626,7 +785,7 @@ it('fails closed when a recorded pre-write freeze is missing or a foreign operat
             $foreignFixture['server'],
             $foreignFixture['promotion']->operationId,
             $foreignFixture['token'],
-            null,
+            $foreignFixture['successor_yaml'],
             function () use (&$foreignRemoteCalls): never {
                 $foreignRemoteCalls++;
 

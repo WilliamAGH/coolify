@@ -16,6 +16,7 @@ final readonly class ManagedTraefikDocumentMutation
         public ?string $expectedOperationId,
         public ?int $expectedRevision,
         public string $replacementBytes,
+        public ?string $expectedWriterOperationId = null,
     ) {
         $this->assertDirectory($dynamicDirectory, 'dynamic directory');
         $this->assertDirectory($stateDirectory, 'state directory');
@@ -44,6 +45,13 @@ final readonly class ManagedTraefikDocumentMutation
                 }
             }
         }
+
+        if ($expectedWriterOperationId !== null) {
+            if ($expectedSha256 === null || $expectedRevision === null) {
+                throw new InvalidArgumentException('A managed Traefik document writer predecessor requires an existing predecessor document.');
+            }
+            $this->assertOperationId($expectedWriterOperationId);
+        }
     }
 
     public function expectedSidecar(): ?string
@@ -62,6 +70,11 @@ final readonly class ManagedTraefikDocumentMutation
     public function replacementSha256(): string
     {
         return hash('sha256', $this->replacementBytes);
+    }
+
+    public function expectedWriterOperationId(): ?string
+    {
+        return $this->expectedWriterOperationId ?? $this->expectedOperationId;
     }
 
     public function replacementSidecar(): string

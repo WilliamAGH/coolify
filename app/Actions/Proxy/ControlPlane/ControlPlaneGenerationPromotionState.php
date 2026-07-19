@@ -8,7 +8,7 @@ use InvalidArgumentException;
 
 final readonly class ControlPlaneGenerationPromotionState
 {
-    public const VERSION = 1;
+    public const VERSION = 2;
 
     /**
      * @param  array{operation_id: string, dynamic_revision: int, dynamic_sha256: string, member: string, release_revision: string, backends: list<string>, configuration_acknowledgement: string}  $predecessor
@@ -35,8 +35,11 @@ final readonly class ControlPlaneGenerationPromotionState
         public ?array $dualRoute,
         public ?array $draining,
         public ControlPlaneGenerationRuntime $runtime,
+        public string $predecessorWriterOperationId,
         public string $writerMember,
         public int $writerEpoch,
+        public ?array $rollbackWriterAuthority,
+        public bool $legacyWriterAuthorityReconciliationRequired,
         public ?string $retiredAt,
         public ?string $fenceReleasedAt,
         public ?string $writerPromotedAt,
@@ -75,6 +78,13 @@ final readonly class ControlPlaneGenerationPromotionState
             throw new InvalidArgumentException('The control-plane generation runtime must match the routed backend sets exactly.');
         }
         self::assertIdentifier($writerMember, 'writer member');
+        self::assertOperationId($predecessorWriterOperationId, 'predecessor writer operation ID');
+        self::assertRollbackWriterAuthority($rollbackWriterAuthority);
+        $this->assertRollbackWriterAuthorityContext();
+        if ($legacyWriterAuthorityReconciliationRequired
+            && ! hash_equals($predecessorWriterOperationId, $predecessor['operation_id'])) {
+            throw new InvalidArgumentException('Legacy control-plane writer authority reconciliation must retain its exact predecessor operation.');
+        }
         if (! hash_equals($writerMember, $successor['member'])) {
             throw new InvalidArgumentException('The control-plane generation writer member must match the successor member.');
         }
@@ -152,6 +162,7 @@ final readonly class ControlPlaneGenerationPromotionState
             successorBackends: $successorBackends,
             successorConfigurationAcknowledgement: $successorConfigurationAcknowledgement,
             runtime: $runtime,
+            predecessorWriterOperationId: $predecessor->operationId,
             writerMember: $writerMember,
             writerEpoch: $writerEpoch,
             timestamp: $timestamp,
@@ -211,6 +222,7 @@ final readonly class ControlPlaneGenerationPromotionState
             successorBackends: $successorBackends,
             successorConfigurationAcknowledgement: $successorConfigurationAcknowledgement,
             runtime: $runtime,
+            predecessorWriterOperationId: $completedPromotion->operationId,
             writerMember: $writerMember,
             writerEpoch: $writerEpoch,
             timestamp: $timestamp,
@@ -239,8 +251,13 @@ final readonly class ControlPlaneGenerationPromotionState
         if ($rolledBackPromotion->phase !== ControlPlaneGenerationPromotionPhase::RolledBack) {
             throw new InvalidArgumentException('A replacement control-plane generation promotion requires a rolled-back predecessor.');
         }
-        if ($writerEpoch !== $rolledBackPromotion->writerEpoch) {
-            throw new InvalidArgumentException('A replacement control-plane generation must reuse the unpromoted writer epoch.');
+        $rollbackWriterAuthority = $rolledBackPromotion->rollbackWriterAuthority
+            ?? throw new InvalidArgumentException('A replacement control-plane generation requires durable rollback writer authority evidence.');
+        if (! $rollbackWriterAuthority['fenced']) {
+            throw new InvalidArgumentException('A legacy rolled-back control-plane generation requires writer authority reconciliation before replacement.');
+        }
+        if ($writerEpoch !== $rollbackWriterAuthority['epoch'] + 1) {
+            throw new InvalidArgumentException('A replacement control-plane generation writer epoch must advance its rolled-back predecessor by one.');
         }
         if ($runtime->predecessorRuntime !== $rolledBackPromotion->runtime->predecessorRuntime) {
             throw new InvalidArgumentException('A replacement control-plane generation runtime must preserve the exact rolled-back predecessor runtime.');
@@ -262,6 +279,7 @@ final readonly class ControlPlaneGenerationPromotionState
             successorBackends: $successorBackends,
             successorConfigurationAcknowledgement: $successorConfigurationAcknowledgement,
             runtime: $runtime,
+            predecessorWriterOperationId: $rollbackWriterAuthority['operation_id'],
             writerMember: $writerMember,
             writerEpoch: $writerEpoch,
             timestamp: $timestamp,
@@ -326,6 +344,29 @@ final readonly class ControlPlaneGenerationPromotionState
         return true;
     }
 
+    public function withReconciledLegacyRollbackWriterAuthority(string $timestamp): self
+    {
+        if (! $this->legacyWriterAuthorityReconciliationRequired
+            || ! in_array($this->phase, [
+                ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement,
+                ControlPlaneGenerationPromotionPhase::RollbackUnfreezing,
+                ControlPlaneGenerationPromotionPhase::RolledBack,
+            ], true)) {
+            throw new InvalidArgumentException('Legacy rollback writer authority reconciliation is not available from this promotion state.');
+        }
+
+        $next = $this->toArray();
+        $next['rollback_writer_authority'] = [
+            'operation_id' => $this->operationId,
+            'epoch' => $this->writerEpoch,
+            'fenced' => true,
+        ];
+        $next['legacy_writer_authority_reconciliation_required'] = false;
+        $next['updated_at'] = $timestamp;
+
+        return self::fromArray($next);
+    }
+
     public function isOwnedBy(string $operationId, string $token): bool
     {
         return hash_equals($this->operationId, $operationId)
@@ -344,6 +385,14 @@ final readonly class ControlPlaneGenerationPromotionState
             && hash_equals($this->predecessor['configuration_acknowledgement'], $enrollment->configurationAcknowledgement);
     }
 
+    public function matchesEnrolledWriterPredecessor(ControlPlaneProxyEnrollmentState $enrollment): bool
+    {
+        return $this->writerEpoch === 2
+            && hash_equals($this->predecessorWriterOperationId, $enrollment->operationId)
+            && ! $this->legacyWriterAuthorityReconciliationRequired
+            && $this->matchesEnrolledPredecessor($enrollment);
+    }
+
     public function matchesCompletedSuccessor(self $completedPromotion): bool
     {
         return $completedPromotion->phase === ControlPlaneGenerationPromotionPhase::Completed
@@ -354,7 +403,9 @@ final readonly class ControlPlaneGenerationPromotionState
             && hash_equals($this->predecessor['member'], $completedPromotion->successor['member'])
             && hash_equals($this->predecessor['release_revision'], $completedPromotion->successor['release_revision'])
             && $this->predecessor['backends'] === $completedPromotion->successor['backends']
-            && hash_equals($this->predecessor['configuration_acknowledgement'], $completedPromotion->successor['configuration_acknowledgement']);
+            && hash_equals($this->predecessor['configuration_acknowledgement'], $completedPromotion->successor['configuration_acknowledgement'])
+            && hash_equals($this->predecessorWriterOperationId, $completedPromotion->operationId)
+            && $this->writerEpoch === $completedPromotion->writerEpoch + 1;
     }
 
     public function matchesRolledBackPredecessor(self $rolledBackPromotion): bool
@@ -362,7 +413,10 @@ final readonly class ControlPlaneGenerationPromotionState
         return $rolledBackPromotion->phase === ControlPlaneGenerationPromotionPhase::RolledBack
             && $this->managedFilename === $rolledBackPromotion->managedFilename
             && $this->predecessor === $rolledBackPromotion->predecessor
-            && $this->writerEpoch === $rolledBackPromotion->writerEpoch;
+            && $rolledBackPromotion->rollbackWriterAuthority !== null
+            && $rolledBackPromotion->rollbackWriterAuthority['fenced']
+            && $this->writerEpoch === $rolledBackPromotion->rollbackWriterAuthority['epoch'] + 1
+            && hash_equals($this->predecessorWriterOperationId, $rolledBackPromotion->rollbackWriterAuthority['operation_id']);
     }
 
     public function sameReservationAs(self $other): bool
@@ -372,8 +426,10 @@ final readonly class ControlPlaneGenerationPromotionState
             && $this->predecessor === $other->predecessor
             && $this->successor === $other->successor
             && $this->runtime->toArray() === $other->runtime->toArray()
+            && hash_equals($this->predecessorWriterOperationId, $other->predecessorWriterOperationId)
             && $this->writerMember === $other->writerMember
-            && $this->writerEpoch === $other->writerEpoch;
+            && $this->writerEpoch === $other->writerEpoch
+            && $this->legacyWriterAuthorityReconciliationRequired === $other->legacyWriterAuthorityReconciliationRequired;
     }
 
     public function predecessorRuntimeSha256(): string
@@ -426,7 +482,13 @@ final readonly class ControlPlaneGenerationPromotionState
             'dual_route' => $this->dualRoute,
             'draining' => $this->draining,
             'runtime' => $this->runtime->toArray(),
-            'writer' => ['member' => $this->writerMember, 'epoch' => $this->writerEpoch],
+            'writer' => [
+                'predecessor_operation_id' => $this->predecessorWriterOperationId,
+                'member' => $this->writerMember,
+                'epoch' => $this->writerEpoch,
+            ],
+            'rollback_writer_authority' => $this->rollbackWriterAuthority,
+            'legacy_writer_authority_reconciliation_required' => $this->legacyWriterAuthorityReconciliationRequired,
             'retired_at' => $this->retiredAt,
             'fence_released_at' => $this->fenceReleasedAt,
             'writer_promoted_at' => $this->writerPromotedAt,
@@ -445,15 +507,37 @@ final readonly class ControlPlaneGenerationPromotionState
     /** @param array<string, mixed> $state */
     public static function fromArray(array $state): self
     {
-        self::assertExactKeys($state, self::SERIALIZED_KEYS);
-        if ($state['version'] !== self::VERSION) {
+        $version = self::requiredInteger($state, 'version');
+        if (! in_array($version, [1, self::VERSION], true)) {
             throw new InvalidArgumentException('The control-plane generation promotion state version is unsupported.');
         }
+        self::assertExactKeys($state, $version === 1 ? self::LEGACY_SERIALIZED_KEYS : self::SERIALIZED_KEYS);
         $predecessor = self::decodePredecessor($state['predecessor']);
         $successor = self::decodeSuccessor($state['successor']);
+        $writer = self::requiredArray($state, 'writer');
+        self::assertExactKeys($writer, $version === 1
+            ? ['member', 'epoch']
+            : ['predecessor_operation_id', 'member', 'epoch']);
+        $phase = ControlPlaneGenerationPromotionPhase::from(self::requiredString($state, 'phase'));
+        $writerEpoch = self::requiredIntegerFrom($writer, 'epoch', 'writer');
+        $writerPromotedAt = self::nullableString($state, 'writer_promoted_at');
+        $predecessorWriterOperationId = $version === 1
+            ? $predecessor['operation_id']
+            : self::requiredStringFrom($writer, 'predecessor_operation_id', 'writer');
+        $rollbackWriterAuthority = $version === 1
+            ? self::legacyRollbackWriterAuthority($phase, $predecessorWriterOperationId, $writerEpoch)
+            : self::decodeRollbackWriterAuthority($state['rollback_writer_authority']);
+        if ($version === 1) {
+            $legacyWriterAuthorityReconciliationRequired = $phase !== ControlPlaneGenerationPromotionPhase::Completed
+                && $writerPromotedAt === null;
+        } elseif (! is_bool($state['legacy_writer_authority_reconciliation_required'])) {
+            throw new InvalidArgumentException('The legacy control-plane writer authority reconciliation flag is invalid.');
+        } else {
+            $legacyWriterAuthorityReconciliationRequired = $state['legacy_writer_authority_reconciliation_required'];
+        }
 
         return new self(
-            phase: ControlPlaneGenerationPromotionPhase::from(self::requiredString($state, 'phase')),
+            phase: $phase,
             operationId: self::requiredString($state, 'operation_id'),
             tokenSha256: self::requiredString($state, 'token_sha256'),
             serverId: self::requiredInteger($state, 'server_id'),
@@ -467,11 +551,14 @@ final readonly class ControlPlaneGenerationPromotionState
             dualRoute: self::decodeSuccessorObservation($state['dual_route'], 'dual-route'),
             draining: self::decodeDraining($state['draining']),
             runtime: ControlPlaneGenerationRuntime::fromArray(self::requiredArray($state, 'runtime')),
-            writerMember: self::requiredStringFrom($state['writer'], 'member', 'writer'),
-            writerEpoch: self::requiredIntegerFrom($state['writer'], 'epoch', 'writer'),
+            predecessorWriterOperationId: $predecessorWriterOperationId,
+            writerMember: self::requiredStringFrom($writer, 'member', 'writer'),
+            writerEpoch: $writerEpoch,
+            rollbackWriterAuthority: $rollbackWriterAuthority,
+            legacyWriterAuthorityReconciliationRequired: $legacyWriterAuthorityReconciliationRequired,
             retiredAt: self::nullableString($state, 'retired_at'),
             fenceReleasedAt: self::nullableString($state, 'fence_released_at'),
-            writerPromotedAt: self::nullableString($state, 'writer_promoted_at'),
+            writerPromotedAt: $writerPromotedAt,
             unfrozenAt: self::nullableString($state, 'unfrozen_at'),
             rollbackStartedAt: self::nullableString($state, 'rollback_started_at'),
             rollbackAcknowledgedAt: self::nullableString($state, 'rollback_acknowledged_at'),
@@ -501,6 +588,7 @@ final readonly class ControlPlaneGenerationPromotionState
         array $successorBackends,
         string $successorConfigurationAcknowledgement,
         ControlPlaneGenerationRuntime $runtime,
+        string $predecessorWriterOperationId,
         string $writerMember,
         int $writerEpoch,
         string $timestamp,
@@ -527,8 +615,11 @@ final readonly class ControlPlaneGenerationPromotionState
             dualRoute: null,
             draining: null,
             runtime: $runtime,
+            predecessorWriterOperationId: $predecessorWriterOperationId,
             writerMember: $writerMember,
             writerEpoch: $writerEpoch,
+            rollbackWriterAuthority: null,
+            legacyWriterAuthorityReconciliationRequired: false,
             retiredAt: null,
             fenceReleasedAt: null,
             writerPromotedAt: null,
@@ -661,6 +752,13 @@ final readonly class ControlPlaneGenerationPromotionState
             ControlPlaneGenerationPromotionPhase::RolledBack,
         ], true) && $this->hasRetirementStarted()) {
             throw new InvalidArgumentException('A control-plane generation cannot roll back after predecessor retirement has started.');
+        }
+        if (in_array($this->phase, [
+            ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement,
+            ControlPlaneGenerationPromotionPhase::RollbackUnfreezing,
+            ControlPlaneGenerationPromotionPhase::RolledBack,
+        ], true) && $this->rollbackWriterAuthority === null) {
+            throw new InvalidArgumentException('The control-plane generation promotion requires durable rollback writer authority evidence.');
         }
         if (in_array($this->phase, [
             ControlPlaneGenerationPromotionPhase::RollbackUnfreezing,
@@ -861,6 +959,80 @@ final readonly class ControlPlaneGenerationPromotionState
             'tcp_connection_count' => self::requiredIntegerFrom($value, 'tcp_connection_count', 'stable zero observation'),
             'predecessor_runtime_sha256' => self::requiredStringFrom($value, 'predecessor_runtime_sha256', 'stable zero observation'),
         ];
+    }
+
+    /** @return array{operation_id: string, epoch: int, fenced: bool}|null */
+    private static function decodeRollbackWriterAuthority(mixed $value): ?array
+    {
+        if ($value === null) {
+            return null;
+        }
+        if (! is_array($value)) {
+            throw new InvalidArgumentException('The control-plane generation rollback writer authority is invalid.');
+        }
+        self::assertExactKeys($value, ['operation_id', 'epoch', 'fenced']);
+        if (! is_bool($value['fenced'])) {
+            throw new InvalidArgumentException('The control-plane generation rollback writer authority fence evidence is invalid.');
+        }
+
+        return [
+            'operation_id' => self::requiredStringFrom($value, 'operation_id', 'rollback writer authority'),
+            'epoch' => self::requiredIntegerFrom($value, 'epoch', 'rollback writer authority'),
+            'fenced' => $value['fenced'],
+        ];
+    }
+
+    /** @return array{operation_id: string, epoch: int, fenced: bool}|null */
+    private static function legacyRollbackWriterAuthority(
+        ControlPlaneGenerationPromotionPhase $phase,
+        string $predecessorWriterOperationId,
+        int $writerEpoch,
+    ): ?array {
+        if (! in_array($phase, [
+            ControlPlaneGenerationPromotionPhase::AwaitingRollbackAcknowledgement,
+            ControlPlaneGenerationPromotionPhase::RollbackUnfreezing,
+            ControlPlaneGenerationPromotionPhase::RolledBack,
+        ], true)) {
+            return null;
+        }
+
+        return [
+            'operation_id' => $predecessorWriterOperationId,
+            'epoch' => $writerEpoch - 1,
+            'fenced' => false,
+        ];
+    }
+
+    /** @param array{operation_id: string, epoch: int, fenced: bool}|null $authority */
+    private static function assertRollbackWriterAuthority(?array $authority): void
+    {
+        if ($authority === null) {
+            return;
+        }
+        self::assertExactKeys($authority, ['operation_id', 'epoch', 'fenced']);
+        self::assertOperationId($authority['operation_id'], 'rollback writer authority operation ID');
+        if ($authority['epoch'] < 1) {
+            throw new InvalidArgumentException('The control-plane generation rollback writer authority epoch is invalid.');
+        }
+        if (! is_bool($authority['fenced'])) {
+            throw new InvalidArgumentException('The control-plane generation rollback writer authority fence evidence is invalid.');
+        }
+    }
+
+    private function assertRollbackWriterAuthorityContext(): void
+    {
+        if ($this->rollbackWriterAuthority === null) {
+            return;
+        }
+        $isLegacyPredecessor = ! $this->rollbackWriterAuthority['fenced']
+            && $this->rollbackWriterAuthority['epoch'] === $this->writerEpoch - 1
+            && hash_equals($this->rollbackWriterAuthority['operation_id'], $this->predecessorWriterOperationId);
+        $isTombstone = $this->rollbackWriterAuthority['fenced']
+            && $this->rollbackWriterAuthority['epoch'] === $this->writerEpoch
+            && hash_equals($this->rollbackWriterAuthority['operation_id'], $this->operationId);
+        if (! $isLegacyPredecessor && ! $isTombstone) {
+            throw new InvalidArgumentException('The control-plane generation rollback writer authority does not match its predecessor or rollback tombstone.');
+        }
     }
 
     /** @param array{operation_id: string, dynamic_revision: int, dynamic_sha256: string, member: string, release_revision: string, backends: list<string>, configuration_acknowledgement: string} $predecessor */
@@ -1159,6 +1331,16 @@ final readonly class ControlPlaneGenerationPromotionState
     private const SERIALIZED_KEYS = [
         'version', 'phase', 'operation_id', 'token_sha256', 'server_id', 'managed_filename',
         'predecessor', 'successor', 'runtime_fence', 'mutation_freeze', 'queue_inventory',
+        'dynamic_written', 'dual_route', 'draining', 'runtime', 'writer', 'rollback_writer_authority',
+        'legacy_writer_authority_reconciliation_required', 'retired_at',
+        'fence_released_at', 'writer_promoted_at', 'unfrozen_at', 'rollback_started_at',
+        'rollback_acknowledged_at', 'rolled_back_at', 'last_error', 'last_error_at',
+        'intervention_required_at', 'created_at', 'updated_at',
+    ];
+
+    private const LEGACY_SERIALIZED_KEYS = [
+        'version', 'phase', 'operation_id', 'token_sha256', 'server_id', 'managed_filename',
+        'predecessor', 'successor', 'runtime_fence', 'mutation_freeze', 'queue_inventory',
         'dynamic_written', 'dual_route', 'draining', 'runtime', 'writer', 'retired_at',
         'fence_released_at', 'writer_promoted_at', 'unfrozen_at', 'rollback_started_at',
         'rollback_acknowledged_at', 'rolled_back_at', 'last_error', 'last_error_at',
@@ -1167,7 +1349,7 @@ final readonly class ControlPlaneGenerationPromotionState
 
     private const MUTABLE_KEYS = [
         'runtime_fence', 'mutation_freeze', 'queue_inventory', 'dynamic_written', 'dual_route',
-        'draining', 'retired_at', 'fence_released_at', 'writer_promoted_at', 'unfrozen_at', 'rollback_started_at',
+        'draining', 'rollback_writer_authority', 'legacy_writer_authority_reconciliation_required', 'retired_at', 'fence_released_at', 'writer_promoted_at', 'unfrozen_at', 'rollback_started_at',
         'rollback_acknowledged_at', 'rolled_back_at', 'last_error', 'last_error_at', 'intervention_required_at',
     ];
 }

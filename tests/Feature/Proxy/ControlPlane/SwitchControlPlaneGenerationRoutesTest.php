@@ -259,6 +259,7 @@ function switchControlPlaneGenerationRoutesMutation(
         expectedOperationId: $state->predecessor['operation_id'],
         expectedRevision: $state->predecessor['dynamic_revision'],
         replacementBytes: $successorYaml,
+        expectedWriterOperationId: $state->predecessorWriterOperationId,
     );
 }
 
@@ -579,6 +580,52 @@ it('uses the permanent enrollment only as the route owner for a verified chained
     expect($draining->phase)->toBe(ControlPlaneGenerationPromotionPhase::Draining)
         ->and($draining->predecessor['operation_id'])->toBe('previous-promotion')
         ->and($draining->successor['dynamic_revision'])->toBe(3);
+});
+
+it('switches a replacement generation after rollback without treating its newer writer authority as a stale route anchor', function (): void {
+    $fixture = switchControlPlaneGenerationRoutesFixture();
+    $replacement = $fixture['quiesced']->toArray();
+    $replacement['writer']['predecessor_operation_id'] = 'rolled-back-switch-routes';
+    $replacement['writer']['epoch'] = 3;
+    $replacement['runtime_fence']['epoch'] = 3;
+    $replacementState = ControlPlaneGenerationPromotionState::fromArray($replacement);
+    $freshServer = $fixture['server']->fresh();
+    $freshServer->proxy->set(StoreControlPlaneGenerationPromotionState::STATE_KEY, $replacementState->toArray());
+    $freshServer->save();
+    $mutation = switchControlPlaneGenerationRoutesMutation(
+        $fixture['server'],
+        $replacementState,
+        $fixture['successorYaml'],
+    );
+    $proof = switchControlPlaneGenerationRoutesProof($fixture['enrollment'], $replacementState);
+    $writerCommand = switchControlPlaneGenerationRoutesWriterCommand($replacementState, $mutation, false);
+    $commands = [];
+
+    $draining = switchControlPlaneGenerationRoutesAction(
+        $fixture['promotionStore'],
+        $fixture['enrollmentStore'],
+    )->handle(
+        $fixture['server'],
+        $replacementState->operationId,
+        'switch-routes-token',
+        $fixture['successorYaml'],
+        function (string $command) use (&$commands, $proof, $writerCommand): string {
+            $commands[] = $command;
+
+            return match ($command) {
+                $writerCommand => ManagedTraefikDocumentWriter::APPLIED_OUTPUT,
+                $proof->shellCommand() => switchControlPlaneGenerationRoutesTranscript($proof),
+                default => throw new RuntimeException("Unexpected replacement generation route-switch command: {$command}"),
+            };
+        },
+    );
+
+    expect($replacementState->matchesEnrolledPredecessor($fixture['enrollment']))->toBeTrue()
+        ->and($replacementState->matchesEnrolledWriterPredecessor($fixture['enrollment']))->toBeFalse()
+        ->and($draining->phase)->toBe(ControlPlaneGenerationPromotionPhase::Draining)
+        ->and($commands)->toBe([$writerCommand, $proof->shellCommand()])
+        ->and($writerCommand)->toContain("authority_mode='require'")
+        ->and($writerCommand)->toContain(base64_encode((new ControlPlaneGenerationWriterAuthority)->predecessor($replacementState)->toJson()));
 });
 
 it('keeps the crash boundary awaiting acknowledgement and resumes an already-applied writer without another mutation', function (): void {

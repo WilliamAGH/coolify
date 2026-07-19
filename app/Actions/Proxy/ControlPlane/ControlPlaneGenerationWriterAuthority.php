@@ -14,7 +14,23 @@ final class ControlPlaneGenerationWriterAuthority
 
         return new ManagedTraefikDocumentWriterAuthority(
             epoch: $state->writerEpoch - 1,
-            operationId: $state->predecessor['operation_id'],
+            operationId: $state->predecessorWriterOperationId,
+            member: $state->predecessor['member'],
+            containerId: $identity['container_id'],
+            containerName: $identity['name'],
+            imageId: $identity['image_id'],
+            dynamicRevision: $state->predecessor['dynamic_revision'],
+            dynamicSha256: $state->predecessor['dynamic_sha256'],
+        );
+    }
+
+    public function rolledBack(ControlPlaneGenerationPromotionState $state): ManagedTraefikDocumentWriterAuthority
+    {
+        $identity = $state->runtime->predecessorWriterIdentity();
+
+        return new ManagedTraefikDocumentWriterAuthority(
+            epoch: $state->writerEpoch,
+            operationId: $state->operationId,
             member: $state->predecessor['member'],
             containerId: $identity['container_id'],
             containerName: $identity['name'],
