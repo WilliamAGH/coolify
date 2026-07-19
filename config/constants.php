@@ -22,8 +22,8 @@ return [
 
     'control_plane_health' => [
         'configuration_acknowledgement' => env('COOLIFY_CONTROL_PLANE_HEALTH_ACK'),
-        'proof_token_sha256' => env('COOLIFY_CONTROL_PLANE_PROOF_TOKEN_SHA256'),
         'health_proof_token_sha256' => env('COOLIFY_CONTROL_PLANE_HEALTH_PROOF_TOKEN_SHA256'),
+        'dynamic_sha256' => env('COOLIFY_CONTROL_PLANE_DYNAMIC_SHA256'),
         'member' => env('COOLIFY_CONTROL_PLANE_MEMBER'),
         'revision' => env('COOLIFY_CONTROL_PLANE_REVISION'),
     ],

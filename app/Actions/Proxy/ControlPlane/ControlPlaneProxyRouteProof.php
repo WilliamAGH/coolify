@@ -10,16 +10,15 @@ final readonly class ControlPlaneProxyRouteProof
 
     public const APP_PORT_ROUTE = 'app-port';
 
-    public const PROOF_HEADER = 'X-Coolify-Control-Plane-Route-Proof';
-
     public const BACKEND_MEMBER_HEADER = 'X-Coolify-Control-Plane-Backend-Member';
 
     public const BACKEND_REVISION_HEADER = 'X-Coolify-Control-Plane-Backend-Revision';
 
+    public const DYNAMIC_SHA256_HEADER = 'X-Coolify-Control-Plane-Dynamic-Sha256';
+
     public function __construct(
         public string $canonicalHost,
         public string $publicScheme,
-        public string $directIpv4,
         public int $appPort,
         public string $expectedColor,
         public string $expectedGeneration,
@@ -27,14 +26,10 @@ final readonly class ControlPlaneProxyRouteProof
         public string $expectedBackendRevision,
         public string $dynamicReplacementSha256,
         public string $configurationAcknowledgement,
-        public string $proofToken,
     ) {
         $this->assertHost($canonicalHost);
         if (! in_array($publicScheme, ['http', 'https'], true)) {
             throw new InvalidArgumentException('The public control-plane route scheme must be http or https.');
-        }
-        if (filter_var($directIpv4, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
-            throw new InvalidArgumentException('The direct control-plane route must use a safe IPv4 address.');
         }
         if ($appPort < 1 || $appPort > 65535) {
             throw new InvalidArgumentException('The control-plane APP_PORT must be between 1 and 65535.');
@@ -53,9 +48,6 @@ final readonly class ControlPlaneProxyRouteProof
         if (preg_match('/^[A-Za-z0-9._~+\/=:-]{16,512}$/D', $configurationAcknowledgement) !== 1) {
             throw new InvalidArgumentException('The control-plane configuration acknowledgement must be opaque and single-line.');
         }
-        if (preg_match('/^[A-Za-z0-9._~+\/=:-]{16,512}$/D', $proofToken) !== 1) {
-            throw new InvalidArgumentException('The control-plane route proof token must be opaque and single-line.');
-        }
     }
 
     public function canonicalPublicUrl(): string
@@ -65,7 +57,7 @@ final readonly class ControlPlaneProxyRouteProof
 
     public function directAppPortUrl(): string
     {
-        return "http://{$this->directIpv4}:{$this->appPort}/api/health";
+        return "http://127.0.0.1:{$this->appPort}/api/health";
     }
 
     public function configurationAcknowledgement(): string
@@ -82,6 +74,7 @@ final readonly class ControlPlaneProxyRouteProof
             ControlPlaneDynamicConfiguration::CONFIGURATION_ACKNOWLEDGEMENT_HEADER => $this->configurationAcknowledgement(),
             self::BACKEND_MEMBER_HEADER => $this->expectedBackendMember,
             self::BACKEND_REVISION_HEADER => $this->expectedBackendRevision,
+            self::DYNAMIC_SHA256_HEADER => $this->dynamicReplacementSha256,
         ];
     }
 
@@ -115,8 +108,6 @@ final readonly class ControlPlaneProxyRouteProof
             '15',
             '--request',
             'GET',
-            '--header',
-            self::PROOF_HEADER.': '.$this->proofToken,
         ];
         if ($route === self::APP_PORT_ROUTE) {
             $arguments[] = '--header';

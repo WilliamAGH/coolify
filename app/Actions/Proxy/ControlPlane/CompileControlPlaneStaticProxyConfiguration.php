@@ -108,17 +108,17 @@ class CompileControlPlaneStaticProxyConfiguration
 
     public function withHealthProofIdentity(
         ControlPlaneStaticProxyConfiguration $configuration,
-        string $proofTokenSha256,
         string $healthProofTokenSha256,
+        string $dynamicSha256,
         string $configurationAcknowledgement,
         string $expectedMember,
         string $expectedRevision,
     ): ControlPlaneStaticProxyConfiguration {
-        if (preg_match('/\A[a-f0-9]{64}\z/D', $proofTokenSha256) !== 1) {
-            throw new InvalidArgumentException('The control-plane proof token hash must be a SHA-256 value.');
-        }
         if (preg_match('/\A[a-f0-9]{64}\z/D', $healthProofTokenSha256) !== 1) {
             throw new InvalidArgumentException('The control-plane health proof token hash must be a SHA-256 value.');
+        }
+        if (preg_match('/\A[a-f0-9]{64}\z/D', $dynamicSha256) !== 1) {
+            throw new InvalidArgumentException('The control-plane dynamic document hash must be a SHA-256 value.');
         }
         if (preg_match('/\A[A-Za-z0-9._~+\/=:-]{16,512}\z/D', $configurationAcknowledgement) !== 1) {
             throw new InvalidArgumentException('The control-plane configuration acknowledgement must be opaque and single-line.');
@@ -132,8 +132,8 @@ class CompileControlPlaneStaticProxyConfiguration
         $override = $this->parseCompose($configuration->sourceOverrideYaml, 'source override');
         $override['services']['coolify']['environment'] = [
             'COOLIFY_CONTROL_PLANE_HEALTH_ACK' => $configurationAcknowledgement,
-            'COOLIFY_CONTROL_PLANE_PROOF_TOKEN_SHA256' => $proofTokenSha256,
             'COOLIFY_CONTROL_PLANE_HEALTH_PROOF_TOKEN_SHA256' => $healthProofTokenSha256,
+            'COOLIFY_CONTROL_PLANE_DYNAMIC_SHA256' => $dynamicSha256,
             'COOLIFY_CONTROL_PLANE_MEMBER' => $expectedMember,
             'COOLIFY_CONTROL_PLANE_REVISION' => $expectedRevision,
         ];

@@ -28,7 +28,7 @@ final class VerifyControlPlaneProxyRoutes
         $expectedHeaders = $proof->expectedResponseHeaders();
         $firstIdentityHeaders = null;
         foreach ($records as $record) {
-            if ($record['status'] !== 204) {
+            if ($record['status'] !== 200) {
                 throw new InvalidArgumentException('Control-plane route proof did not receive the expected successful health response.');
             }
             $identityHeaders = [];

@@ -107,11 +107,11 @@ it('compiles and reserves one public control-plane enrollment without retaining 
         ->and($state->dynamicPredecessorBytes)->toBe("http:\n  routers:\n    legacy: {}\n")
         ->and(data_get(Yaml::parse($state->sourceOverrideBytes, Yaml::PARSE_CUSTOM_TAGS), 'services.coolify.environment'))->toBe([
             'COOLIFY_CONTROL_PLANE_HEALTH_ACK' => 'ack:'.str_repeat('a', 64),
-            'COOLIFY_CONTROL_PLANE_PROOF_TOKEN_SHA256' => hash('sha256', 'raw-token-must-not-persist'),
             'COOLIFY_CONTROL_PLANE_HEALTH_PROOF_TOKEN_SHA256' => hash(
                 'sha256',
                 hash_hmac('sha256', 'coolify-control-plane-health-check-v1', 'raw-token-must-not-persist'),
             ),
+            'COOLIFY_CONTROL_PLANE_DYNAMIC_SHA256' => hash('sha256', $state->dynamicReplacementBytes),
             'COOLIFY_CONTROL_PLANE_MEMBER' => 'blue',
             'COOLIFY_CONTROL_PLANE_REVISION' => 'revision-42',
         ])

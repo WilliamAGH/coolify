@@ -9,7 +9,6 @@ function controlPlaneRouteProof(): ControlPlaneProxyRouteProof
     return new ControlPlaneProxyRouteProof(
         canonicalHost: 'dashboard.example.test',
         publicScheme: 'https',
-        directIpv4: '203.0.113.10',
         appPort: 8000,
         expectedColor: 'blue',
         expectedGeneration: 'generation-42',
@@ -17,7 +16,6 @@ function controlPlaneRouteProof(): ControlPlaneProxyRouteProof
         expectedBackendRevision: 'revision-42',
         dynamicReplacementSha256: hash('sha256', 'coolify.yaml replacement'),
         configurationAcknowledgement: 'ack:'.str_repeat('c', 64),
-        proofToken: 'proof:'.str_repeat('a', 64),
     );
 }
 
@@ -26,7 +24,7 @@ function controlPlaneRouteProofRecord(
     string $route,
     int $attempt,
     array $headers = [],
-    int $status = 204,
+    int $status = 200,
 ): string {
     $responseHeaders = [
         ControlPlaneDynamicConfiguration::COLOR_HEADER => 'blue',
@@ -34,6 +32,7 @@ function controlPlaneRouteProofRecord(
         ControlPlaneDynamicConfiguration::CONFIGURATION_ACKNOWLEDGEMENT_HEADER => $proof->configurationAcknowledgement(),
         ControlPlaneProxyRouteProof::BACKEND_MEMBER_HEADER => 'web-a',
         ControlPlaneProxyRouteProof::BACKEND_REVISION_HEADER => 'revision-42',
+        ControlPlaneProxyRouteProof::DYNAMIC_SHA256_HEADER => $proof->dynamicReplacementSha256,
         ...$headers,
     ];
     $headerLines = "HTTP/2 {$status}\r\n";
@@ -66,7 +65,9 @@ it('accepts two consecutive exact identity proofs through HTTPS and APP_PORT', f
     $proof = controlPlaneRouteProof();
 
     expect(VerifyControlPlaneProxyRoutes::run($proof, successfulControlPlaneRouteProofTranscript($proof)))
-        ->toBe($proof);
+        ->toBe($proof)
+        ->and($proof->shellCommand())->toContain('http://127.0.0.1:8000/api/health')
+        ->and($proof->shellCommand())->not->toContain('Route-Proof');
 });
 
 it('fails closed when one route exposes a different backend identity', function (): void {
@@ -102,6 +103,14 @@ it('fails closed for a stale acknowledgement, a missing identity header, and a p
     expect(fn (): ControlPlaneProxyRouteProof => VerifyControlPlaneProxyRoutes::run($proof, $missingGeneration))
         ->toThrow(InvalidArgumentException::class, ControlPlaneDynamicConfiguration::GENERATION_HEADER);
 
+    $staleDynamicDocument = str_replace(
+        $proof->dynamicReplacementSha256,
+        str_repeat('0', 64),
+        successfulControlPlaneRouteProofTranscript($proof),
+    );
+    expect(fn (): ControlPlaneProxyRouteProof => VerifyControlPlaneProxyRoutes::run($proof, $staleDynamicDocument))
+        ->toThrow(InvalidArgumentException::class, ControlPlaneProxyRouteProof::DYNAMIC_SHA256_HEADER);
+
     $failedAppPort = implode("\n", [
         controlPlaneRouteProofRecord($proof, ControlPlaneProxyRouteProof::PUBLIC_ROUTE, 1),
         controlPlaneRouteProofRecord($proof, ControlPlaneProxyRouteProof::PUBLIC_ROUTE, 2),
@@ -117,15 +126,14 @@ it('rejects malformed curl output before accepting a route proof', function (): 
 
     expect(fn (): ControlPlaneProxyRouteProof => VerifyControlPlaneProxyRoutes::run(
         $proof,
-        "__COOLIFY_ROUTE_PROOF_BEGIN__ public 1\nHTTP/2 204\n",
+        "__COOLIFY_ROUTE_PROOF_BEGIN__ public 1\nHTTP/2 200\n",
     ))->toThrow(InvalidArgumentException::class, 'no valid curl status');
 });
 
-it('rejects unsafe direct route host and proof inputs before command rendering', function (): void {
+it('rejects unsafe public route inputs before command rendering', function (): void {
     expect(fn (): ControlPlaneProxyRouteProof => new ControlPlaneProxyRouteProof(
         canonicalHost: 'dashboard.example.test; curl attacker.test',
         publicScheme: 'https',
-        directIpv4: '203.0.113.10',
         appPort: 8000,
         expectedColor: 'blue',
         expectedGeneration: 'generation-42',
@@ -133,6 +141,5 @@ it('rejects unsafe direct route host and proof inputs before command rendering',
         expectedBackendRevision: 'revision-42',
         dynamicReplacementSha256: hash('sha256', 'coolify.yaml replacement'),
         configurationAcknowledgement: 'ack:'.str_repeat('c', 64),
-        proofToken: 'proof:'.str_repeat('a', 64),
     ))->toThrow(InvalidArgumentException::class, 'canonical control-plane host');
 });

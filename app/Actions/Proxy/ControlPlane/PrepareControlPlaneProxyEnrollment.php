@@ -57,14 +57,6 @@ final class PrepareControlPlaneProxyEnrollment
             exposure: $exposure,
         );
         $healthCheckProof = hash_hmac('sha256', 'coolify-control-plane-health-check-v1', $token);
-        $staticConfiguration = $this->staticConfigurationCompiler->withHealthProofIdentity(
-            configuration: $staticConfiguration,
-            proofTokenSha256: hash('sha256', $token),
-            healthProofTokenSha256: hash('sha256', $healthCheckProof),
-            configurationAcknowledgement: $configurationAcknowledgement,
-            expectedMember: $expectedMember,
-            expectedRevision: $expectedRevision,
-        );
         $dynamicConfiguration = $this->dynamicConfigurationCompiler->handle(
             host: $host,
             appPortEntrypoint: 'coolify',
@@ -78,6 +70,14 @@ final class PrepareControlPlaneProxyEnrollment
             terminalRouterFragments: $terminalRouterFragments,
             preservedServices: $preservedServices,
             preservedMiddlewares: $preservedMiddlewares,
+        );
+        $staticConfiguration = $this->staticConfigurationCompiler->withHealthProofIdentity(
+            configuration: $staticConfiguration,
+            healthProofTokenSha256: hash('sha256', $healthCheckProof),
+            dynamicSha256: $dynamicConfiguration->sha256,
+            configurationAcknowledgement: $configurationAcknowledgement,
+            expectedMember: $expectedMember,
+            expectedRevision: $expectedRevision,
         );
         $desiredState = ControlPlaneProxyEnrollmentState::reserve(
             operationId: $operationId,
