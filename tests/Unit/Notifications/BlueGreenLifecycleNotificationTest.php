@@ -45,6 +45,8 @@ it('builds intervention payloads for every deployment failure channel', function
         ->andReturn(['mail']);
 
     expect($notification->via($notifiable))->toBe(['mail'])
+        ->and($notification->queue)->toBe('high')
+        ->and($notification->afterCommit)->toBeTrue()
         ->and($notification->toMail()->subject)->toContain('Action required')
         ->and($notification->toMail()->view)->toBe('emails.application-blue-green-intervention-required')
         ->and($notification->toDiscord()->title)->toBe('Blue/green intervention required')
@@ -69,6 +71,7 @@ it('builds rollback payloads with deployment evidence', function () {
         ->andReturn(['mail', 'slack']);
 
     expect($notification->via($notifiable))->toBe(['mail', 'slack'])
+        ->and(unserialize(serialize($notification)))->toEqual($notification)
         ->and($notification->toMail()->subject)->toContain('rolled back')
         ->and($notification->toMail()->view)->toBe('emails.application-blue-green-deployment-rolled-back')
         ->and($notification->toDiscord()->description)->toContain('previous healthy version')
@@ -100,9 +103,14 @@ it('uses the configured deployment failure Telegram thread', function () {
         $notifiable,
         new BlueGreenInterventionRequired($this->application),
     );
+    (new TelegramChannel)->send(
+        $notifiable,
+        new BlueGreenDeploymentRolledBack($this->application, 'rolled-back-deployment'),
+    );
 
     Bus::assertDispatched(
         SendMessageToTelegramJob::class,
         fn (SendMessageToTelegramJob $job): bool => $job->threadId === 'failure-thread',
     );
+    Bus::assertDispatchedTimes(SendMessageToTelegramJob::class, 2);
 });

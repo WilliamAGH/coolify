@@ -13,6 +13,8 @@ abstract class BlueGreenLifecycleNotification extends CustomEmailNotification
 {
     public string $applicationName;
 
+    public string $applicationUuid;
+
     public string $projectName;
 
     public string $projectUuid;
@@ -28,12 +30,13 @@ abstract class BlueGreenLifecycleNotification extends CustomEmailNotification
     public ?string $fqdn;
 
     public function __construct(
-        public Application $application,
+        Application $application,
         public ?string $deploymentUuid,
     ) {
         $this->onQueue('high');
         $this->afterCommit();
         $this->applicationName = data_get($application, 'name');
+        $this->applicationUuid = data_get($application, 'uuid');
         $this->projectName = data_get($application, 'environment.project.name');
         $this->projectUuid = data_get($application, 'environment.project.uuid');
         $this->environmentName = data_get($application, 'environment.name');
@@ -126,7 +129,7 @@ abstract class BlueGreenLifecycleNotification extends CustomEmailNotification
             'event' => 'deployment_failed',
             'blue_green_event' => $this->blueGreenEvent(),
             'application_name' => $this->applicationName,
-            'application_uuid' => $this->application->uuid,
+            'application_uuid' => $this->applicationUuid,
             'deployment_uuid' => $this->deploymentUuid,
             'deployment_url' => $this->deploymentUrl,
             'application_url' => $this->applicationUrl,
