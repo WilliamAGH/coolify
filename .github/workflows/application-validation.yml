@@ -158,6 +158,14 @@ jobs:
   workflow-and-shell:
     name: Workflow and shell contracts
     runs-on: ubuntu-24.04
+    env:
+      OWNED_WORKFLOWS: >-
+        .github/workflows/application-validation.yml
+        .github/workflows/coolify-production-build.yml
+        .github/workflows/coolify-staging-build.yml
+        .github/workflows/coolify-testing-host.yml
+        .github/workflows/publish-fork.yml
+        .github/workflows/publish-linux-image.yml
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
@@ -165,13 +173,8 @@ jobs:
           persist-credentials: false
       - name: Validate workflows
         run: |
-          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 \
-            .github/workflows/application-validation.yml \
-            .github/workflows/coolify-production-build.yml \
-            .github/workflows/coolify-staging-build.yml \
-            .github/workflows/coolify-testing-host.yml \
-            .github/workflows/publish-fork.yml \
-            .github/workflows/publish-linux-image.yml
+          read -r -a workflows <<< "$OWNED_WORKFLOWS"
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 "${workflows[@]}"
       - name: Verify pinned source provenance
         run: |
           docker/verify-source-provenance.sh docker/production/Dockerfile
@@ -179,11 +182,12 @@ jobs:
       - name: Require immutable external action and container references
         shell: bash
         run: |
-          if grep -RInP 'uses:\s+(?!\./)[^@\s]+@(?![0-9a-f]{40}(?:\s|$))' .github/workflows; then
+          read -r -a workflows <<< "$OWNED_WORKFLOWS"
+          if grep -nP 'uses:\s+(?!\./)[^@\s]+@(?![0-9a-f]{40}(?:\s|$))' "${workflows[@]}"; then
             echo 'External GitHub Actions must be pinned to a full commit SHA.' >&2
             exit 1
           fi
-          if grep -RInP '^(?: {6}| {8})image:\s+(?![^\s]+@sha256:[0-9a-f]{64}(?:\s|$))' .github/workflows; then
+          if grep -nP '^(?: {6}| {8})image:\s+(?![^\s]+@sha256:[0-9a-f]{64}(?:\s|$))' "${workflows[@]}"; then
             echo 'Workflow job container and service images must be pinned to an immutable SHA-256 digest.' >&2
             exit 1
           fi

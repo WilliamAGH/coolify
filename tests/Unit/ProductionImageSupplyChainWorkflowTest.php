@@ -706,7 +706,7 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
             $violations[] = "workflow validation is missing required step: {$stepName}";
         }
     }
-    $actionlintScript = (string) (releaseWorkflowStep($workflowAndShell, 'Validate workflows')['run'] ?? '');
+    $ownedWorkflows = (string) ($workflowAndShell['env']['OWNED_WORKFLOWS'] ?? '');
     foreach ([
         '.github/workflows/application-validation.yml',
         '.github/workflows/coolify-production-build.yml',
@@ -715,7 +715,7 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
         '.github/workflows/publish-fork.yml',
         '.github/workflows/publish-linux-image.yml',
     ] as $workflowPath) {
-        if (! str_contains($actionlintScript, $workflowPath)) {
+        if (! str_contains($ownedWorkflows, $workflowPath)) {
             $violations[] = "workflow validation must lint owned workflow: {$workflowPath}";
         }
     }
@@ -1296,15 +1296,11 @@ it('rejects omission of an owned workflow from actionlint', function (string $wo
         'testing-host' => Yaml::parseFile($root.'/.github/workflows/coolify-testing-host.yml'),
         'staging' => Yaml::parseFile($root.'/.github/workflows/coolify-staging-build.yml'),
     ];
-    foreach ($applicationValidationWorkflow['jobs']['workflow-and-shell']['steps'] as $index => $step) {
-        if (($step['name'] ?? null) === 'Validate workflows') {
-            $applicationValidationWorkflow['jobs']['workflow-and-shell']['steps'][$index]['run'] = str_replace(
-                $workflowPath,
-                '',
-                (string) ($step['run'] ?? ''),
-            );
-        }
-    }
+    $applicationValidationWorkflow['jobs']['workflow-and-shell']['env']['OWNED_WORKFLOWS'] = str_replace(
+        $workflowPath,
+        '',
+        (string) ($applicationValidationWorkflow['jobs']['workflow-and-shell']['env']['OWNED_WORKFLOWS'] ?? ''),
+    );
 
     expect(releaseFoundationWorkflowViolations($sharedWorkflow, $applicationValidationWorkflow, $callers))
         ->toContain("workflow validation must lint owned workflow: {$workflowPath}");
