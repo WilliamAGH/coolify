@@ -350,6 +350,9 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
                 $this->blueGreenLifecycle->initialize();
                 if ($this->blueGreenLifecycle->isDrainingRecovery()) {
                     $this->blueGreenLifecycle->resumeDrainingOperation();
+                    if ($this->blueGreenLifecycle->wasFinalizedFallbackRecovered()) {
+                        return;
+                    }
                     $this->transitionToStatus(ApplicationDeploymentStatus::FINISHED);
 
                     return;

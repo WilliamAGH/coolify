@@ -2,6 +2,7 @@
 
 namespace App\Actions\Application\BlueGreen;
 
+use App\Actions\Proxy\BlueGreenProxyState;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
@@ -134,6 +135,90 @@ final class TransitionsBlueGreenDeployment
                 ],
                 false,
             );
+
+            return $state->fresh();
+        }, attempts: 5);
+    }
+
+    public static function finishFinalizedFixedColorFallback(
+        BlueGreenDeploymentClaim $claim,
+        BlueGreenContainerExpectation $previousContainer,
+        BlueGreenProxyState $restoredState,
+    ): ApplicationBlueGreenDeployment {
+        if ($claim->previousActiveColor === null
+            || ! $previousContainer->blueGreenManaged
+            || $previousContainer->color !== $claim->previousActiveColor
+            || $previousContainer->deploymentUuid === null
+            || $previousContainer->routingRevision === null) {
+            throw new BlueGreenDeploymentTransitionException('Only an exact fixed-color predecessor can terminalize a finalized draining fallback.');
+        }
+        (new ComputeBlueGreenDeploymentFingerprint)->assertMatchesClaim($claim);
+
+        return DB::transaction(function () use ($claim, $previousContainer, $restoredState): ApplicationBlueGreenDeployment {
+            $locks = BlueGreenLifecycleDatabaseLocks::forDestination(
+                $claim->applicationId,
+                $claim->standaloneDockerId,
+                [$claim->deploymentUuid, $previousContainer->deploymentUuid],
+            );
+            $state = $locks->state;
+            $deployment = $locks->queue($claim->deploymentUuid);
+            $previousDeployment = $locks->queue($previousContainer->deploymentUuid);
+            if ($state === null
+                || $state->id !== $claim->stateId
+                || $deployment === null
+                || $previousDeployment === null
+                || $locks->application->trashed()
+                || $locks->deactivation !== null) {
+                throw new BlueGreenDeploymentTransitionException('The finalized draining fallback no longer has its exact durable owners.');
+            }
+            $locks->assertDeploymentOwner($claim, $deployment);
+            self::assertExactFinalizedFixedColorFallback(
+                $state,
+                $deployment,
+                $previousDeployment,
+                $claim,
+                $previousContainer,
+                $restoredState,
+            );
+
+            $stateUpdated = self::exactFinalizedDrainingFallbackStateQuery(
+                $state,
+                $claim,
+                $previousContainer,
+                $restoredState,
+            )->update([
+                'active_color' => $claim->previousActiveColor->value,
+                'pending_color' => null,
+                'pending_deployment_uuid' => null,
+                'legacy_container_name' => null,
+                'phase' => BlueGreenDeploymentPhase::IDLE->value,
+                'routing_revision' => $previousContainer->routingRevision,
+                ...ApplicationBlueGreenDeployment::clearedOperationAttributes(),
+            ]);
+            if ($stateUpdated !== 1) {
+                throw new BlueGreenDeploymentTransitionException('The finalized draining fallback state changed while predecessor routing was being restored.');
+            }
+
+            $deploymentQuery = ApplicationDeploymentQueue::query()
+                ->whereKey($deployment->getKey())
+                ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
+                ->where('blue_green_candidate_container_id', $state->operation_candidate_container_id)
+                ->where('blue_green_previous_container_id', $previousContainer->dockerId)
+                ->where('blue_green_rollback_managed_filename', $claim->rollbackManagedFilename);
+            $deploymentUpdated = BlueGreenLifecycleDatabaseLocks::constrainDeploymentQueueOwner(
+                $deploymentQuery,
+                $claim,
+                BlueGreenDeploymentPhase::DRAINING,
+                BlueGreenDeploymentPhase::IDLE,
+                false,
+            )->update([
+                'blue_green_phase' => BlueGreenDeploymentPhase::IDLE->value,
+                'status' => ApplicationDeploymentStatus::FAILED->value,
+                'finished_at' => now(),
+            ]);
+            if ($deploymentUpdated !== 1) {
+                throw new BlueGreenDeploymentTransitionException('The finalized draining candidate queue changed while fallback terminalization was being recorded.');
+            }
 
             return $state->fresh();
         }, attempts: 5);
@@ -296,6 +381,117 @@ final class TransitionsBlueGreenDeployment
             || $deployment->blue_green_routing_config_digest !== $claim->routingConfigDigest) {
             throw new BlueGreenDeploymentTransitionException('The deployment queue provenance does not match the pending blue-green transition.');
         }
+    }
+
+    private static function assertExactFinalizedFixedColorFallback(
+        ApplicationBlueGreenDeployment $state,
+        ApplicationDeploymentQueue $deployment,
+        ApplicationDeploymentQueue $previousDeployment,
+        BlueGreenDeploymentClaim $claim,
+        BlueGreenContainerExpectation $previousContainer,
+        BlueGreenProxyState $restoredState,
+    ): void {
+        $candidateColumn = match ($claim->pendingColor) {
+            BlueGreenDeploymentColor::BLUE => 'blue_deployment_uuid',
+            BlueGreenDeploymentColor::GREEN => 'green_deployment_uuid',
+        };
+        $previousColumn = match ($claim->previousActiveColor) {
+            BlueGreenDeploymentColor::BLUE => 'blue_deployment_uuid',
+            BlueGreenDeploymentColor::GREEN => 'green_deployment_uuid',
+        };
+        $persistedPreviousState = self::persistedPreviousProxyState($state, $claim);
+        if ($state->phase !== BlueGreenDeploymentPhase::DRAINING
+            || $state->active_color !== $claim->pendingColor
+            || $state->pending_color !== null
+            || $state->pending_deployment_uuid !== null
+            || $state->{$candidateColumn} !== $claim->deploymentUuid
+            || $state->{$previousColumn} !== $previousContainer->deploymentUuid
+            || $state->routing_revision !== $claim->expectedRoutingRevision
+            || $state->operation_deployment_uuid !== $claim->deploymentUuid
+            || $state->operation_previous_active_color !== $claim->previousActiveColor
+            || $state->operation_previous_deployment_uuid !== $previousContainer->deploymentUuid
+            || $state->operation_previous_routing_revision !== $previousContainer->routingRevision
+            || $state->operation_previous_container_name !== $previousContainer->name
+            || $state->operation_previous_container_id !== $previousContainer->dockerId
+            || $state->operation_candidate_container_name !== $claim->candidateContainerName
+            || $state->operation_candidate_container_id !== $deployment->blue_green_candidate_container_id
+            || $state->operation_rollback_managed_filename !== $claim->rollbackManagedFilename
+            || $state->operation_destination_fence_epoch !== $claim->destinationFenceEpoch
+            || $state->operation_server_boot_id !== $claim->serverBootId
+            || $state->operation_topology_digest !== $claim->topologyDigest
+            || $state->operation_routing_config_digest !== $claim->routingConfigDigest
+            || $state->operation_drain_started_at === null
+            || $state->operation_drain_deadline_at === null
+            || $state->legacy_container_name !== null
+            || $state->deactivation_operation_id !== null
+            || $state->deactivation_started_at !== null
+            || $state->supersession_generation !== $claim->supersessionGeneration
+            || $state->destination_fence_epoch !== $restoredState->destinationFenceEpoch
+            || $state->destination_fence_operation_id !== $restoredState->operationId
+            || $state->destination_fence_mutation_sequence !== $restoredState->mutationSequence
+            || $state->managed_file_sha256 !== $restoredState->managedSha256
+            || $state->destination_topology_digest !== $restoredState->destinationTopologyDigest
+            || $state->application_routing_config_digest !== $restoredState->applicationRoutingConfigDigest
+            || $restoredState->operationId !== $claim->deploymentUuid
+            || $restoredState->destinationFenceEpoch <= $claim->destinationFenceEpoch
+            || $restoredState->activeColor !== $claim->previousActiveColor
+            || $restoredState->activeDeploymentUuid !== $previousContainer->deploymentUuid
+            || $restoredState->activeContainerName !== $previousContainer->name
+            || $restoredState->activeContainerId !== $previousContainer->dockerId
+            || $restoredState->routingRevision !== $previousContainer->routingRevision
+            || $restoredState->managedSha256 === null
+            || $restoredState->applicationRoutingConfigDigest !== $persistedPreviousState->applicationRoutingConfigDigest
+            || $restoredState->destinationTopologyDigest !== $persistedPreviousState->destinationTopologyDigest
+            || $deployment->status !== ApplicationDeploymentStatus::IN_PROGRESS->value
+            || $deployment->blue_green_phase !== BlueGreenDeploymentPhase::DRAINING
+            || $deployment->blue_green_color !== $claim->pendingColor
+            || $deployment->blue_green_routing_revision !== $claim->expectedRoutingRevision
+            || $deployment->blue_green_destination_fence_epoch !== $claim->destinationFenceEpoch
+            || $deployment->blue_green_server_boot_id !== $claim->serverBootId
+            || $deployment->blue_green_topology_digest !== $claim->topologyDigest
+            || $deployment->blue_green_routing_config_digest !== $claim->routingConfigDigest
+            || $deployment->blue_green_supersession_generation !== $claim->supersessionGeneration
+            || $deployment->blue_green_previous_container_id !== $previousContainer->dockerId
+            || $previousDeployment->deployment_uuid !== $previousContainer->deploymentUuid
+            || (int) $previousDeployment->application_id !== $claim->applicationId
+            || (int) $previousDeployment->destination_id !== $claim->standaloneDockerId
+            || (int) $previousDeployment->server_id !== (int) $deployment->server_id
+            || $previousDeployment->pull_request_id !== 0
+            || $previousDeployment->status !== ApplicationDeploymentStatus::FINISHED->value
+            || $previousDeployment->blue_green_color !== $claim->previousActiveColor
+            || $previousDeployment->blue_green_phase !== BlueGreenDeploymentPhase::IDLE
+            || $previousDeployment->blue_green_routing_revision !== $previousContainer->routingRevision
+            || $previousDeployment->blue_green_destination_fence_epoch !== $state->operation_previous_destination_fence_epoch
+            || $previousDeployment->blue_green_topology_digest !== $persistedPreviousState->destinationTopologyDigest
+            || $previousDeployment->blue_green_routing_config_digest !== $persistedPreviousState->applicationRoutingConfigDigest) {
+            throw new BlueGreenDeploymentTransitionException('The finalized draining fallback no longer matches the exact persisted fixed-color predecessor.');
+        }
+    }
+
+    private static function persistedPreviousProxyState(
+        ApplicationBlueGreenDeployment $state,
+        BlueGreenDeploymentClaim $claim,
+    ): BlueGreenProxyState {
+        $serialized = $state->operation_previous_proxy_state;
+        $sha256 = $state->operation_previous_proxy_state_sha256;
+        if (! is_string($serialized)
+            || ! is_string($sha256)
+            || ! hash_equals($sha256, hash('sha256', $serialized))) {
+            throw new BlueGreenDeploymentTransitionException('The finalized draining fallback has no valid persisted predecessor destination state.');
+        }
+        try {
+            $previousState = BlueGreenProxyState::parse($serialized);
+        } catch (\Throwable $exception) {
+            throw new BlueGreenDeploymentTransitionException('The finalized draining fallback predecessor state is malformed.', 0, $exception);
+        }
+        if ($previousState->managedFilename !== $claim->rollbackManagedFilename
+            || $previousState->destinationId !== $claim->standaloneDockerId
+            || $previousState->managedSha256 !== $state->operation_previous_managed_file_sha256
+            || $previousState->destinationFenceEpoch !== $state->operation_previous_destination_fence_epoch) {
+            throw new BlueGreenDeploymentTransitionException('The finalized draining fallback predecessor state changed from its durable provenance.');
+        }
+
+        return $previousState;
     }
 
     private static function isExactFinalizedClaim(
@@ -490,6 +686,55 @@ final class TransitionsBlueGreenDeployment
         return $claim->legacyContainerName === null
             ? $query->whereNull('legacy_container_name')
             : $query->where('legacy_container_name', $claim->legacyContainerName);
+    }
+
+    private static function exactFinalizedDrainingFallbackStateQuery(
+        ApplicationBlueGreenDeployment $state,
+        BlueGreenDeploymentClaim $claim,
+        BlueGreenContainerExpectation $previousContainer,
+        BlueGreenProxyState $restoredState,
+    ): Builder {
+        $candidateColumn = match ($claim->pendingColor) {
+            BlueGreenDeploymentColor::BLUE => 'blue_deployment_uuid',
+            BlueGreenDeploymentColor::GREEN => 'green_deployment_uuid',
+        };
+        $previousColumn = match ($claim->previousActiveColor) {
+            BlueGreenDeploymentColor::BLUE => 'blue_deployment_uuid',
+            BlueGreenDeploymentColor::GREEN => 'green_deployment_uuid',
+        };
+
+        return ApplicationBlueGreenDeployment::query()
+            ->whereKey($state->getKey())
+            ->where('application_id', $claim->applicationId)
+            ->where('standalone_docker_id', $claim->standaloneDockerId)
+            ->where('phase', BlueGreenDeploymentPhase::DRAINING->value)
+            ->where('active_color', $claim->pendingColor->value)
+            ->whereNull('pending_color')
+            ->whereNull('pending_deployment_uuid')
+            ->where($candidateColumn, $claim->deploymentUuid)
+            ->where($previousColumn, $previousContainer->deploymentUuid)
+            ->where('routing_revision', $claim->expectedRoutingRevision)
+            ->where('operation_deployment_uuid', $claim->deploymentUuid)
+            ->where('operation_previous_active_color', $claim->previousActiveColor->value)
+            ->where('operation_previous_deployment_uuid', $previousContainer->deploymentUuid)
+            ->where('operation_previous_routing_revision', $previousContainer->routingRevision)
+            ->where('operation_previous_container_name', $previousContainer->name)
+            ->where('operation_previous_container_id', $previousContainer->dockerId)
+            ->where('operation_candidate_container_name', $claim->candidateContainerName)
+            ->where('operation_destination_fence_epoch', $claim->destinationFenceEpoch)
+            ->where('operation_server_boot_id', $claim->serverBootId)
+            ->where('operation_topology_digest', $claim->topologyDigest)
+            ->where('operation_routing_config_digest', $claim->routingConfigDigest)
+            ->where('destination_fence_epoch', $restoredState->destinationFenceEpoch)
+            ->where('destination_fence_operation_id', $restoredState->operationId)
+            ->where('destination_fence_mutation_sequence', $restoredState->mutationSequence)
+            ->where('managed_file_sha256', $restoredState->managedSha256)
+            ->where('destination_topology_digest', $restoredState->destinationTopologyDigest)
+            ->where('application_routing_config_digest', $restoredState->applicationRoutingConfigDigest)
+            ->whereNull('deactivation_operation_id')
+            ->whereNull('deactivation_started_at')
+            ->where('supersession_generation', $claim->supersessionGeneration)
+            ->whereHas('application');
     }
 
     private static function exactDrainingStateQuery(

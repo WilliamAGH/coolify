@@ -73,6 +73,9 @@ final class ResumeBlueGreenDrainingDeploymentJob implements ShouldQueue
                 throw new DeploymentException('The drain recovery did not find an exact durable DRAINING or completed IDLE operation.');
             }
             $lifecycle->resumeDrainingOperation();
+            if ($lifecycle->wasFinalizedFallbackRecovered()) {
+                return;
+            }
             (new ApplicationDeploymentJob($deployment->id))->completeBlueGreenDrainRecovery();
         } catch (Throwable $exception) {
             if ($lifecycle?->isRetryableDrainTimeout($exception)) {

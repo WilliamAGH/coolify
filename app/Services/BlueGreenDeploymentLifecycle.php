@@ -6,6 +6,7 @@ use App\Actions\Application\BlueGreen\AttestBlueGreenDestinationState;
 use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
+use App\Actions\Application\BlueGreen\BlueGreenDeploymentRecoveryOperation;
 use App\Actions\Application\BlueGreen\BlueGreenDestinationStateRecordingException;
 use App\Actions\Application\BlueGreen\BlueGreenLegacyProviderState;
 use App\Actions\Application\BlueGreen\BlueGreenLegacyRoutingSnapshot;
@@ -20,12 +21,14 @@ use App\Actions\Application\BlueGreen\FindBlueGreenDeactivationFence;
 use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Actions\Application\BlueGreen\PlanBlueGreenPublicRecovery;
 use App\Actions\Application\BlueGreen\ReadBlueGreenServerBootIdentity;
+use App\Actions\Application\BlueGreen\ReconstructBlueGreenDeploymentRecovery;
 use App\Actions\Application\BlueGreen\RecordBlueGreenCandidateIdentity;
 use App\Actions\Application\BlueGreen\RecordBlueGreenDestinationState;
 use App\Actions\Application\BlueGreen\RecordBlueGreenDrainObservation;
 use App\Actions\Application\BlueGreen\RecordBlueGreenLegacyRoutingSnapshot;
 use App\Actions\Application\BlueGreen\RecordBlueGreenRollbackKey;
 use App\Actions\Application\BlueGreen\RecordBlueGreenRoutingMutation;
+use App\Actions\Application\BlueGreen\RecoverBlueGreenFinalizedDrainingOperation;
 use App\Actions\Application\BlueGreen\RemoveBlueGreenInactiveContainer;
 use App\Actions\Application\BlueGreen\RemoveExactBlueGreenCandidate;
 use App\Actions\Application\BlueGreen\TransitionsBlueGreenDeployment;
@@ -96,6 +99,10 @@ final class BlueGreenDeploymentLifecycle
     private bool $drainingRecovery = false;
 
     private bool $completedDrainingRecovery = false;
+
+    private bool $finalizedFallbackRecovered = false;
+
+    private ?BlueGreenDeploymentRecoveryOperation $drainingRecoveryOperation = null;
 
     private bool $promotionCommitted = false;
 
@@ -189,6 +196,11 @@ final class BlueGreenDeploymentLifecycle
     public function isCompletedDrainingRecovery(): bool
     {
         return $this->completedDrainingRecovery;
+    }
+
+    public function wasFinalizedFallbackRecovered(): bool
+    {
+        return $this->finalizedFallbackRecovered;
     }
 
     public function isRetryableDrainTimeout(Throwable $exception): bool
@@ -413,9 +425,24 @@ final class BlueGreenDeploymentLifecycle
             throw new DeploymentException('Blue-green drain recovery was not initialized from an exact durable DRAINING operation.');
         }
 
+        $operation = $this->drainingRecoveryOperation
+            ?? throw new DeploymentException('Blue-green drain recovery has no exact reconstructed durable operation.');
+        $fence = $this->operationFence
+            ?? throw new DeploymentException('Blue-green drain recovery has no owned lifecycle fence.');
+        $result = RecoverBlueGreenFinalizedDrainingOperation::run($operation, $fence);
+        $this->destinationState = $result->destinationState;
+        if ($result->recoveredByFallback) {
+            $this->finalizedFallbackRecovered = true;
+            $this->drainingRecovery = false;
+            $this->deployment->addLogEntry(
+                'Blue-green finalized drain recovery restored the exact healthy fixed-color predecessor and terminalized the abandoned candidate.',
+                'stderr',
+            );
+
+            return;
+        }
+
         $this->assertOperationOwned(BlueGreenDeploymentPhase::DRAINING);
-        $this->assertExactCandidateStillHealthy();
-        $this->assertCandidateReleaseProof();
         $this->retirePreviousContainer();
         $this->complete();
     }
@@ -522,152 +549,28 @@ final class BlueGreenDeploymentLifecycle
             throw new DeploymentException('Blue-green drain recovery requires exactly one configured destination.');
         }
 
-        $this->claim = $this->claimFromDrainingState($state);
-        $this->previousActiveColor = $this->claim->previousActiveColor;
-        $this->legacyContainerName = $this->claim->legacyContainerName;
-        $this->serverBootId = $this->claim->serverBootId;
+        $operation = ReconstructBlueGreenDeploymentRecovery::run($state);
+        if (! $operation->wasFinalized
+            || $operation->recoveredPhase !== BlueGreenDeploymentPhase::DRAINING
+            || $operation->deployment->getKey() !== $this->deployment->getKey()) {
+            throw new DeploymentException('The durable blue-green DRAINING state does not reconstruct to this exact finalized queue owner.');
+        }
+        $this->drainingRecoveryOperation = $operation;
+        $this->claim = $operation->claim;
+        $this->previousActiveColor = $operation->claim->previousActiveColor;
+        $this->legacyContainerName = $operation->claim->legacyContainerName;
+        $this->serverBootId = $operation->claim->serverBootId;
+        $this->destinationState = $operation->currentDestinationState
+            ?? throw new DeploymentException('The durable blue-green DRAINING state has no exact routed destination state.');
+        $this->candidateContainerExpectation = $operation->candidateContainer;
+        $this->previousContainerExpectation = $operation->previousContainer;
         $this->server->privateKey->storeInFileSystem();
-        ReadBlueGreenServerBootIdentity::run($this->server, $this->claim->serverBootId);
-        $this->destinationState = AttestBlueGreenDestinationState::run(
-            $this->server,
-            $this->application,
-            $this->destination,
-            $state,
-        );
-        $this->candidateContainerExpectation = $this->candidateExpectationFromDrainingState($state, $this->claim);
-        $this->previousContainerExpectation = $this->previousExpectationFromDrainingState($state, $this->claim);
+        ReadBlueGreenServerBootIdentity::run($this->server, $operation->claim->serverBootId);
         $this->assertOperationOwned(BlueGreenDeploymentPhase::DRAINING);
-        $this->assertExactCandidateStillHealthy();
-        $this->assertCandidateReleaseProof();
         $this->finalized = true;
         $this->drainingRecovery = true;
         $this->deployment->addLogEntry(
             'Resuming the exact durable blue-green DRAINING operation; no candidate build or routing mutation will run.',
-        );
-    }
-
-    private function claimFromDrainingState(ApplicationBlueGreenDeployment $state): BlueGreenDeploymentClaim
-    {
-        $pendingColor = $state->active_color;
-        $deploymentUuid = $state->operation_deployment_uuid;
-        $destinationFenceEpoch = $state->operation_destination_fence_epoch;
-        $serverBootId = $state->operation_server_boot_id;
-        $topologyDigest = $state->operation_topology_digest;
-        $routingConfigDigest = $state->operation_routing_config_digest;
-        $supersessionGeneration = $state->supersession_generation;
-        $candidateContainerName = $state->operation_candidate_container_name;
-        $rollbackManagedFilename = $state->operation_rollback_managed_filename;
-        if ($state->pending_color !== null
-            || $state->pending_deployment_uuid !== null
-            || $pendingColor === null
-            || ! is_string($deploymentUuid)
-            || $deploymentUuid === ''
-            || ! is_int($destinationFenceEpoch)
-            || ! is_string($serverBootId)
-            || ! is_string($topologyDigest)
-            || ! is_string($routingConfigDigest)
-            || ! is_int($supersessionGeneration)
-            || $supersessionGeneration < 1
-            || ! is_string($candidateContainerName)
-            || ! is_string($rollbackManagedFilename)
-            || $state->operation_drain_started_at === null
-            || $state->operation_drain_deadline_at === null) {
-            throw new DeploymentException('The durable blue-green DRAINING state has incomplete claim or deadline provenance.');
-        }
-
-        return new BlueGreenDeploymentClaim(
-            stateId: $state->id,
-            applicationId: $this->application->id,
-            standaloneDockerId: $this->destination->id,
-            pendingColor: $pendingColor,
-            previousActiveColor: $state->operation_previous_active_color,
-            deploymentUuid: $deploymentUuid,
-            expectedRoutingRevision: $state->routing_revision,
-            destinationFenceEpoch: $destinationFenceEpoch,
-            serverBootId: $serverBootId,
-            topologyDigest: $topologyDigest,
-            routingConfigDigest: $routingConfigDigest,
-            supersessionGeneration: $supersessionGeneration,
-            legacyContainerName: $state->legacy_container_name,
-            candidateContainerName: $candidateContainerName,
-            rollbackManagedFilename: $rollbackManagedFilename,
-        );
-    }
-
-    private function candidateExpectationFromDrainingState(
-        ApplicationBlueGreenDeployment $state,
-        BlueGreenDeploymentClaim $claim,
-    ): BlueGreenContainerExpectation {
-        $candidateContainerId = $state->operation_candidate_container_id;
-        if (! is_string($candidateContainerId) || $candidateContainerId === '') {
-            throw new DeploymentException('The durable blue-green DRAINING state has no exact candidate Docker identity.');
-        }
-
-        return new BlueGreenContainerExpectation(
-            name: $claim->candidateContainerName
-                ?? throw new DeploymentException('The durable blue-green DRAINING claim has no candidate container name.'),
-            dockerId: $candidateContainerId,
-            applicationId: $claim->applicationId,
-            pullRequestId: 0,
-            blueGreenManaged: true,
-            deploymentUuid: $claim->deploymentUuid,
-            color: $claim->pendingColor,
-            routingRevision: $claim->expectedRoutingRevision,
-        );
-    }
-
-    private function previousExpectationFromDrainingState(
-        ApplicationBlueGreenDeployment $state,
-        BlueGreenDeploymentClaim $claim,
-    ): ?BlueGreenContainerExpectation {
-        $name = $state->operation_previous_container_name;
-        $dockerId = $state->operation_previous_container_id;
-        if ($name === null && $dockerId === null) {
-            if ($claim->previousActiveColor !== null || $claim->legacyContainerName !== null) {
-                throw new DeploymentException('The durable blue-green DRAINING state lost its required previous container identity.');
-            }
-
-            return null;
-        }
-        if (! is_string($name) || $name === '' || ! is_string($dockerId) || $dockerId === '') {
-            throw new DeploymentException('The durable blue-green DRAINING state has a partial previous container identity.');
-        }
-
-        if ($claim->previousActiveColor === null) {
-            if ($claim->legacyContainerName === null
-                || $name !== $claim->legacyContainerName
-                || $state->operation_previous_deployment_uuid !== null
-                || $state->operation_previous_routing_revision !== null) {
-                throw new DeploymentException('The durable blue-green DRAINING legacy previous container provenance is invalid.');
-            }
-
-            return new BlueGreenContainerExpectation(
-                name: $name,
-                dockerId: $dockerId,
-                applicationId: $claim->applicationId,
-                pullRequestId: 0,
-                blueGreenManaged: false,
-            );
-        }
-
-        $previousDeploymentUuid = $state->operation_previous_deployment_uuid;
-        $previousRoutingRevision = $state->operation_previous_routing_revision;
-        if ($name !== $this->containerName($claim->previousActiveColor)
-            || ! is_string($previousDeploymentUuid)
-            || $previousDeploymentUuid === ''
-            || ! is_int($previousRoutingRevision)) {
-            throw new DeploymentException('The durable blue-green DRAINING fixed-color previous container provenance is invalid.');
-        }
-
-        return new BlueGreenContainerExpectation(
-            name: $name,
-            dockerId: $dockerId,
-            applicationId: $claim->applicationId,
-            pullRequestId: 0,
-            blueGreenManaged: true,
-            deploymentUuid: $previousDeploymentUuid,
-            color: $claim->previousActiveColor,
-            routingRevision: $previousRoutingRevision,
         );
     }
 
