@@ -1,5 +1,6 @@
 <?php
 
+use App\Actions\Server\UpdateCoolify;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\File;
 
@@ -14,7 +15,7 @@ use Illuminate\Support\Facades\File;
  */
 function get_versions_data(): ?array
 {
-    return Cache::remember('coolify:versions:all', 3600, function () {
+    $readBundledVersions = static function (): ?array {
         $versionsPath = base_path('versions.json');
 
         if (! File::exists($versionsPath)) {
@@ -22,7 +23,13 @@ function get_versions_data(): ?array
         }
 
         return json_decode(File::get($versionsPath), true);
-    });
+    };
+
+    if (UpdateCoolify::isGuardedForkRelease(config('constants.coolify.version'))) {
+        return $readBundledVersions();
+    }
+
+    return Cache::remember('coolify:versions:all', 3600, $readBundledVersions);
 }
 
 /**

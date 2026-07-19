@@ -66,15 +66,18 @@ jobs:
         run: |
           set -Eeuo pipefail
           php artisan test --compact \
+            tests/Unit/CheckHelperImageJobTest.php \
             tests/Unit/CheckForUpdatesJobTest.php \
             tests/Unit/ProductionImageSupplyChainWorkflowTest.php \
             tests/Unit/ReleaseOperationalAcceptanceWorkflowTest.php \
             tests/Unit/ReleasePlatformAcceptanceWorkflowTest.php \
             tests/Unit/ReleasePublicationSerializationTest.php \
             tests/Unit/ReleaseVersionConsumerContractTest.php \
+            tests/Unit/SentinelVersionTest.php \
             tests/Unit/StagingImageReferenceWorkflowTest.php \
             tests/Unit/UpdateCoolifyTest.php \
-            tests/Feature/ForkVersionConsumerTest.php
+            tests/Feature/ForkVersionConsumerTest.php \
+            tests/Feature/UpgradeComponentTest.php
       - name: Run native Traefik control-plane tests
         run: |
           php artisan test --compact \
@@ -338,6 +341,28 @@ jobs:
             shellcheck --severity=error -e SC2015 -- "${legacy_scripts[@]}"
           fi
 
+  testing-host-runtime:
+    name: Testing-host source image runtime
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - name: Build exact testing-host source image without publication
+        env:
+          TESTING_HOST_IMAGE: coolify-testing-host:application-validation-${{ github.sha }}
+        run: |
+          docker buildx build --load --pull \
+            --file docker/testing-host/Dockerfile \
+            --tag "$TESTING_HOST_IMAGE" \
+            .
+      - name: Run exact testing-host runtime contract
+        env:
+          TESTING_HOST_IMAGE: coolify-testing-host:application-validation-${{ github.sha }}
+        run: tests/Integration/TestingHostImageTest.sh
+
   fork-deploy:
     name: Signed fork deployment contract
     runs-on: ubuntu-24.04
@@ -359,6 +384,7 @@ jobs:
       - formatting
       - fork-deploy
       - node
+      - testing-host-runtime
       - workflow-and-shell
     runs-on: ubuntu-24.04
     steps:
@@ -366,10 +392,12 @@ jobs:
         env:
           BLUE_GREEN_LIFECYCLE_RESULT: ${{ needs.blue-green-lifecycle.result }}
           BROWSER_RESULT: ${{ needs.browser.result }}
+          EVENT_NAME: ${{ github.event_name }}
           FORMATTING_RESULT: ${{ needs.formatting.result }}
           FORK_DEPLOY_RESULT: ${{ needs.fork-deploy.result }}
           NODE_RESULT: ${{ needs.node.result }}
           PHP_RESULT: ${{ needs.php.result }}
+          TESTING_HOST_RUNTIME_RESULT: ${{ needs.testing-host-runtime.result }}
           WORKFLOW_RESULT: ${{ needs.workflow-and-shell.result }}
         run: |
           set -Eeuo pipefail
@@ -386,3 +414,14 @@ jobs:
               exit 1
             }
           done
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            [[ "$TESTING_HOST_RUNTIME_RESULT" == success ]] || {
+              echo "Testing-host runtime validation did not succeed for a pull request: $TESTING_HOST_RUNTIME_RESULT" >&2
+              exit 1
+            }
+          else
+            [[ "$TESTING_HOST_RUNTIME_RESULT" == skipped ]] || {
+              echo "Testing-host runtime validation must be skipped for reusable workflow calls: $TESTING_HOST_RUNTIME_RESULT" >&2
+              exit 1
+            }
+          fi

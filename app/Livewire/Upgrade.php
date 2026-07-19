@@ -43,7 +43,7 @@ class Upgrade extends Component
         if (UpdateCoolify::isGuardedForkRelease($this->currentVersion)) {
             $this->latestVersion = $this->currentVersion;
             $settings = $this->instanceSettings();
-            if ($settings?->new_version_available) {
+            if ($settings->new_version_available) {
                 $settings->update(['new_version_available' => false]);
             }
             $this->isUpgradeAvailable = false;
@@ -61,9 +61,9 @@ class Upgrade extends Component
 
         $settings = $this->instanceSettings();
         $hasNewerVersion = version_compare($this->latestVersion, $this->currentVersion, '>');
-        $newVersionAvailable = (bool) data_get($settings, 'new_version_available', false);
+        $newVersionAvailable = (bool) $settings->new_version_available;
 
-        if ($settings && $newVersionAvailable && ! $hasNewerVersion) {
+        if ($newVersionAvailable && ! $hasNewerVersion) {
             $settings->update(['new_version_available' => false]);
             $newVersionAvailable = false;
         }
@@ -71,9 +71,9 @@ class Upgrade extends Component
         $this->isUpgradeAvailable = $hasNewerVersion && $newVersionAvailable;
     }
 
-    protected function instanceSettings(): ?InstanceSettings
+    protected function instanceSettings(): InstanceSettings
     {
-        return InstanceSettings::find(0);
+        return instanceSettings();
     }
 
     public function upgrade()
