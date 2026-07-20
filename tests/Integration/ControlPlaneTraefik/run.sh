@@ -671,6 +671,7 @@ main() {
     for command in docker curl openssl python3 mktemp awk sed tr cp mv wc jq; do
         require_command "$command"
     done
+    "$SCRIPT_DIRECTORY/attestor-test.sh"
     if ! docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
         printf 'SKIP: Docker daemon is unavailable.\n' >&2
         exit 77

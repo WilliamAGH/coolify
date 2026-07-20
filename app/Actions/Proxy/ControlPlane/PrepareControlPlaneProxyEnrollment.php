@@ -107,6 +107,8 @@ final class PrepareControlPlaneProxyEnrollment
             configurationAcknowledgement: $configurationAcknowledgement,
             expectedMember: $expectedMember,
             expectedRevision: $expectedRevision,
+            serverId: (int) $server->getKey(),
+            canonicalHost: $host,
         );
         $desiredState = ControlPlaneProxyEnrollmentState::reserve(
             operationId: $operationId,

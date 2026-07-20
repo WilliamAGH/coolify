@@ -118,6 +118,22 @@ it('compiles and reserves one public control-plane enrollment without retaining 
             'COOLIFY_CONTROL_PLANE_DYNAMIC_SHA256' => hash('sha256', $state->dynamicReplacementBytes),
             'COOLIFY_CONTROL_PLANE_MEMBER' => 'blue',
             'COOLIFY_CONTROL_PLANE_REVISION' => 'revision-42',
+            'COOLIFY_TRAEFIK_ATTESTOR_PROBE_HOST' => 'dashboard.example.test',
+            'COOLIFY_TRAEFIK_ATTESTOR_PROBE_URL' => 'http://host.docker.internal:8000/api/health',
+            'COOLIFY_TRAEFIK_ATTESTOR_SERVER_ID' => (string) $server->getKey(),
+        ])
+        ->and(data_get(Yaml::parse($state->sourceOverrideBytes, Yaml::PARSE_CUSTOM_TAGS), 'services.coolify.volumes'))->toBe([
+            [
+                'type' => 'bind',
+                'source' => '/data/coolify/proxy',
+                'target' => '/var/www/html/storage/app/control-plane-proxy',
+                'read_only' => true,
+            ],
+            [
+                'type' => 'bind',
+                'source' => '/data/coolify/control-plane-attestor',
+                'target' => '/var/www/html/storage/app/control-plane-attestor',
+            ],
         ])
         ->and($state->sourceOverrideBytes)->not->toContain('raw-token-must-not-persist')
         ->and(json_encode($stored, JSON_THROW_ON_ERROR))->not->toContain('raw-token-must-not-persist')
