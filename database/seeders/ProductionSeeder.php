@@ -19,6 +19,9 @@ use App\Models\User;
 use Illuminate\Database\Seeder;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
+use phpseclib3\Crypt\PublicKeyLoader;
+use phpseclib3\Exception\NoKeyLoadedException;
+use RuntimeException;
 
 class ProductionSeeder extends Seeder
 {
@@ -157,6 +160,8 @@ class ProductionSeeder extends Seeder
         }
 
         if (config('constants.coolify.is_windows_docker_desktop')) {
+            $testingHostPrivateKey = $this->windowsTestingHostPrivateKey();
+
             PrivateKey::updateOrCreate(
                 [
                     'id' => 0,
@@ -165,14 +170,7 @@ class ProductionSeeder extends Seeder
                 [
                     'name' => 'Testing-host',
                     'description' => 'This is a a docker container with SSH access',
-                    'private_key' => '-----BEGIN OPENSSH PRIVATE KEY-----
-b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
-QyNTUxOQAAACBbhpqHhqv6aI67Mj9abM3DVbmcfYhZAhC7ca4d9UCevAAAAJi/QySHv0Mk
-hwAAAAtzc2gtZWQyNTUxOQAAACBbhpqHhqv6aI67Mj9abM3DVbmcfYhZAhC7ca4d9UCevA
-AAAECBQw4jg1WRT2IGHMncCiZhURCts2s24HoDS0thHnnRKVuGmoeGq/pojrsyP1pszcNV
-uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
------END OPENSSH PRIVATE KEY-----
-',
+                    'private_key' => $testingHostPrivateKey,
                 ]
             );
             if (Server::find(0) == null) {
@@ -220,5 +218,28 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
         $this->call(SentinelSeeder::class);
         $this->call(RootUserSeeder::class);
         $this->call(CaSslCertSeeder::class);
+    }
+
+    private function windowsTestingHostPrivateKey(): string
+    {
+        $path = config('constants.coolify.windows_testing_host_private_key_path');
+
+        if (! is_string($path) || $path === '' || ! is_file($path) || is_link($path) || ! is_readable($path)) {
+            throw new RuntimeException('Windows Docker Desktop requires a readable testing-host private key fixture.');
+        }
+
+        $privateKey = file_get_contents($path);
+
+        if (! is_string($privateKey) || trim($privateKey) === '') {
+            throw new RuntimeException('Windows Docker Desktop testing-host private key fixture is invalid.');
+        }
+
+        try {
+            PublicKeyLoader::loadPrivateKey($privateKey);
+        } catch (NoKeyLoadedException) {
+            throw new RuntimeException('Windows Docker Desktop testing-host private key fixture is invalid.');
+        }
+
+        return $privateKey;
     }
 }

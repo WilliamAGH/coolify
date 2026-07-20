@@ -71,6 +71,7 @@ jobs:
             tests/Unit/CheckHelperImageJobTest.php \
             tests/Unit/CheckForUpdatesJobTest.php \
             tests/Unit/GenerateChangelogWorkflowTest.php \
+            tests/Unit/ProductionImageRuntimeContentTest.php \
             tests/Unit/ProductionImageSupplyChainWorkflowTest.php \
             tests/Unit/ReleaseOperationalAcceptanceWorkflowTest.php \
             tests/Unit/ReleasePlatformAcceptanceWorkflowTest.php \
@@ -80,6 +81,7 @@ jobs:
             tests/Unit/StagingImageReferenceWorkflowTest.php \
             tests/Unit/UpdateCoolifyTest.php \
             tests/Feature/ForkVersionConsumerTest.php \
+            tests/Feature/ProductionSeederTest.php \
             tests/Feature/UpgradeComponentTest.php
       - name: Run native Traefik control-plane tests
         run: |

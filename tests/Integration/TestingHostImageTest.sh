@@ -5,6 +5,7 @@ set -eu
 repository_root="$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)"
 dockerfile="${TESTING_HOST_DOCKERFILE:-$repository_root/docker/testing-host/Dockerfile}"
 development_authorized_keys="$repository_root/docker/testing-host/development-authorized_keys"
+development_private_key="$repository_root/docker/testing-host/development-private_key"
 image="${TESTING_HOST_IMAGE:?TESTING_HOST_IMAGE is required}"
 project="coolify-testing-host-runtime-$$"
 private_volume="${project}-private"
@@ -54,6 +55,25 @@ assert_compose_authorized_keys_mount()
                 and .read_only == true
             )
         ' >/dev/null || fail "${service} does not mount the development testing-host identity"
+}
+
+assert_compose_private_key_mount()
+{
+    service=$1
+    source=$2
+    shift 2
+    compose_config="$(docker compose "$@" config --no-env-resolution --no-interpolate --format json)" \
+        || fail "${service} Compose configuration did not render"
+    printf '%s\n' "$compose_config" |
+        jq -e --arg service "$service" --arg source "$source" '
+            .services[$service].volumes
+            | any(
+                .type == "bind"
+                and .source == $source
+                and .target == "/run/coolify-testing-host/private/testing-host"
+                and .read_only == true
+            )
+        ' >/dev/null || fail "${service} does not mount the development testing-host private key read-only"
 }
 
 assert_ssh_access()
@@ -126,6 +146,10 @@ trap cleanup EXIT INT TERM
 test -f "$dockerfile" || fail "testing-host Dockerfile is absent: ${dockerfile}"
 test -s "$development_authorized_keys" || fail 'development testing-host public key is absent'
 ssh-keygen -lf "$development_authorized_keys" >/dev/null 2>&1 || fail 'development testing-host public key is invalid'
+test -s "$development_private_key" || fail 'development testing-host private key is absent'
+cp "$development_private_key" "$windows_private_key"
+chmod 600 "$windows_private_key"
+ssh-keygen -y -f "$windows_private_key" >/dev/null 2>&1 || fail 'development testing-host private key is invalid'
 assert_compose_authorized_keys_mount testing-host \
     -f "$repository_root/docker-compose.yml" \
     -f "$repository_root/docker-compose.dev.yml"
@@ -136,11 +160,13 @@ assert_compose_authorized_keys_mount coolify-testing-host \
     -f "$repository_root/docker-compose.windows.yml"
 assert_compose_authorized_keys_mount coolify-testing-host \
     -f "$repository_root/other/nightly/docker-compose.windows.yml"
+assert_compose_private_key_mount coolify "$development_private_key" \
+    -f "$repository_root/docker-compose.windows.yml"
+assert_compose_private_key_mount coolify "$development_private_key" \
+    -f "$repository_root/other/nightly/docker-compose.windows.yml"
 
 extract_testing_host_private_key 'Testing Host Key' \
     "$repository_root/database/seeders/PrivateKeySeeder.php" "$seed_private_key"
-extract_testing_host_private_key 'Testing-host' \
-    "$repository_root/database/seeders/ProductionSeeder.php" "$windows_private_key"
 assert_private_key_matches_authorized_keys 'development' "$seed_private_key"
 assert_private_key_matches_authorized_keys 'Windows' "$windows_private_key"
 
@@ -168,6 +194,8 @@ docker run --detach --pull never --name "$development_server_container" \
 
 assert_ssh_access development-testing-host "$development_server_container" \
     "type=bind,source=${seed_private_key},target=/run/coolify-testing-host/private/testing-host,readonly"
+assert_ssh_access development-testing-host "$development_server_container" \
+    "type=bind,source=${windows_private_key},target=/run/coolify-testing-host/private/testing-host,readonly"
 docker inspect --format '{{.State.Running}}' "$development_server_container" | grep -qx true
 docker rm --force "$development_server_container" >/dev/null
 
