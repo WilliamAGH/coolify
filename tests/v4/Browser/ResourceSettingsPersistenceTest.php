@@ -118,8 +118,13 @@ it('saves application name and enables static site with nginx config', function 
         ->fill('customDockerRunOptions', '--read-only');
 
     submitLivewireForm($page);
-    $page->click('[id^="isStatic"]')
-        ->screenshot();
+    $page->assertValue('name', $updatedName);
+
+    $this->application->refresh();
+    expect($this->application->name)->toBe($updatedName);
+
+    clickAndWaitForSuccessToast($page, '[id^="isStatic"]', 'Settings saved.');
+    $page->screenshot();
 
     $page->assertSee('Custom Nginx Configuration')
         ->assertSee('Is it a SPA (Single Page Application)?')
@@ -171,9 +176,53 @@ it('saves database name and enables ssl with mode selector', function () {
         ->assertSee('SSL Mode');
 });
 
+function clickAndWaitForSuccessToast($page, string $selector, string $description): void
+{
+    $result = $page->script(<<<'JAVASCRIPT'
+        ([selector, description]) => new Promise((resolve, reject) => {
+            const element = document.querySelector(selector);
+            if (!(element instanceof HTMLElement)) {
+                reject(new Error(`Unable to find element: ${selector}`));
+                return;
+            }
+
+            let settled = false;
+            const finish = (callback) => {
+                if (settled) {
+                    return;
+                }
+
+                settled = true;
+                window.clearTimeout(timeout);
+                window.removeEventListener('toast-show', onToast);
+                callback();
+            };
+            const timeout = window.setTimeout(() => {
+                finish(() => reject(new Error(`Timed out waiting for success toast: ${description}`)));
+            }, 10_000);
+            const onToast = (event) => {
+                if (event.detail?.type === 'danger') {
+                    finish(() => reject(new Error(`Livewire action failed: ${event.detail.description ?? event.detail.message}`)));
+                    return;
+                }
+                if (event.detail?.type !== 'success' || event.detail?.description !== description) {
+                    return;
+                }
+
+                finish(() => window.requestAnimationFrame(() => resolve(true)));
+            };
+
+            window.addEventListener('toast-show', onToast);
+            element.click();
+        })
+        JAVASCRIPT, [$selector, $description]);
+
+    expect($result)->toBeTrue();
+}
+
 function submitLivewireForm($page): void
 {
-    $completedComponentId = $page->script(<<<'JAVASCRIPT'
+    $result = $page->script(<<<'JAVASCRIPT'
         () => new Promise((resolve, reject) => {
             const form = document.querySelector('input[name="name"]')?.closest('form[wire\\:submit="submit"]');
             if (!(form instanceof HTMLFormElement)) {
@@ -195,13 +244,25 @@ function submitLivewireForm($page): void
 
                 settled = true;
                 window.clearTimeout(timeout);
+                window.removeEventListener('toast-show', onToast);
                 stopObservingCommits();
                 callback();
             };
             const timeout = window.setTimeout(() => {
-                finish(() => reject(new Error(`Timed out waiting for Livewire submit: ${componentId}`)));
+                finish(() => reject(new Error('Timed out waiting for application settings to save.')));
             }, 10_000);
-            stopObservingCommits = window.Livewire.hook('commit', ({ component, commit, succeed, fail }) => {
+            const onToast = (event) => {
+                if (event.detail?.type === 'danger') {
+                    finish(() => reject(new Error(`Application settings save failed: ${event.detail.description ?? event.detail.message}`)));
+                    return;
+                }
+                if (event.detail?.type !== 'success' || event.detail?.description !== 'Application settings updated!') {
+                    return;
+                }
+
+                finish(() => window.requestAnimationFrame(() => resolve(true)));
+            };
+            stopObservingCommits = window.Livewire.hook('commit', ({ component, commit, fail }) => {
                 if (
                     component.id !== componentId
                     || !commit.calls.some((call) => call.method === 'submit')
@@ -210,16 +271,14 @@ function submitLivewireForm($page): void
                 }
 
                 fail(() => {
-                    finish(() => reject(new Error(`Livewire submit failed: ${componentId}`)));
-                });
-                succeed(() => {
-                    finish(() => window.requestAnimationFrame(() => resolve(componentId)));
+                    finish(() => reject(new Error(`Livewire submit transport failed: ${componentId}`)));
                 });
             });
 
+            window.addEventListener('toast-show', onToast);
             form.requestSubmit();
         })
         JAVASCRIPT);
 
-    expect($completedComponentId)->toBeString()->not->toBeEmpty();
+    expect($result)->toBeTrue();
 }
