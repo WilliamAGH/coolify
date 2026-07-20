@@ -218,11 +218,24 @@ trait ExecuteRemoteCommand
                 }
             }
         });
-        $this->application_deployment_queue->update([
-            'current_process_id' => $process->id(),
-        ]);
+        $processId = (string) $process->id();
+        $ownsProcess = isset($this->dispatch_attempt_uuid)
+            && is_string($this->dispatch_attempt_uuid)
+            && $this->application_deployment_queue->claimCurrentProcessOwnership(
+                $this->dispatch_attempt_uuid,
+                $processId,
+            );
 
         $process_result = $process->wait();
+        if (! $ownsProcess) {
+            throw new DeploymentException('Deployment remote process ownership changed before execution completed.');
+        }
+        if (! $this->application_deployment_queue->releaseCurrentProcessOwnership(
+            $this->dispatch_attempt_uuid,
+            $processId,
+        )) {
+            throw new DeploymentException('Deployment remote process ownership changed before completion was recorded.');
+        }
         if ($process_result->exitCode() !== 0) {
             if (! $ignore_errors) {
                 // Check if deployment was cancelled while command was running

@@ -30,7 +30,7 @@ class Destinations extends Component
 
     private function createNetworkAndAttachToProxy()
     {
-        ConnectProxyToNetworksJob::dispatchSync($this->server);
+        ConnectProxyToNetworksJob::dispatch($this->server);
     }
 
     public function add($name)

@@ -68,23 +68,88 @@ function compileDestinationFencedBlueGreenConfiguration(
     );
 }
 
-function runDestinationFenceCommand(string $command): string
+/** @param array<string, string> $environment */
+function runDestinationFenceCommand(string $command, array $environment = []): string
 {
     $process = Process::fromShellCommandline($command);
     $process->setTimeout(10);
+    if ($environment !== []) {
+        $process->setEnv($environment);
+    }
     $process->mustRun();
 
     return $process->getOutput();
 }
 
-function failedDestinationFenceCommand(string $command): Process
+/** @param array<string, string> $environment */
+function failedDestinationFenceCommand(string $command, array $environment = []): Process
 {
     $process = Process::fromShellCommandline($command);
     $process->setTimeout(10);
+    if ($environment !== []) {
+        $process->setEnv($environment);
+    }
     $process->run();
 
     return $process;
 }
+
+it('retries the rollback-artifact directory barrier after deletion', function (): void {
+    $filesystem = new Filesystem;
+    $proxyPath = sys_get_temp_dir().'/coolify-blue-green-artifact-removal-'.bin2hex(random_bytes(8));
+    $bin = $proxyPath.'/bin';
+    $log = $proxyPath.'/sync.log';
+    $filesystem->mkdir([$proxyPath.'/dynamic', $bin], 0700);
+    file_put_contents($log, '');
+    file_put_contents($bin.'/sync', <<<'SH'
+#!/bin/sh
+set -eu
+[ "$#" -eq 1 ]
+case "$1" in -*) exit 64 ;; esac
+printf '%s\n' "$1" >> "$DURABLE_SYNC_LOG"
+[ "${DURABLE_SYNC_FAIL_PATH:-}" != "$1" ]
+SH
+    );
+    chmod($bin.'/sync', 0700);
+
+    try {
+        $writer = destinationFenceWriter();
+        $configuration = compileDestinationFencedBlueGreenConfiguration(
+            epoch: 1,
+            activeColor: BlueGreenDeploymentColor::BLUE,
+            deploymentUuid: 'deployment-artifact-removal',
+            containerId: '0123456789abcdef',
+            operationId: 'artifact-removal',
+        );
+        $rollbackKey = new BlueGreenProxyRollbackKey('artifact-removal', null, $configuration->state);
+        runDestinationFenceCommand($writer->commandFor(
+            $proxyPath,
+            $configuration,
+            $rollbackKey,
+            destinationFenceBootId(),
+        ));
+        $artifactPath = $writer->rollbackArtifactPath($proxyPath, $rollbackKey);
+        $artifactDirectory = dirname($artifactPath);
+        $commitCommand = $writer->rollbackArtifactCommitCommandFor($proxyPath, $rollbackKey);
+        $environment = [
+            'PATH' => $bin.':'.(getenv('PATH') ?: '/usr/bin:/bin'),
+            'DURABLE_SYNC_LOG' => $log,
+        ];
+
+        $failed = failedDestinationFenceCommand($commitCommand, [
+            ...$environment,
+            'DURABLE_SYNC_FAIL_PATH' => $artifactDirectory,
+        ]);
+        $retried = failedDestinationFenceCommand($commitCommand, $environment);
+
+        expect($failed->isSuccessful())->toBeFalse()
+            ->and($retried->isSuccessful())->toBeTrue($retried->getErrorOutput())
+            ->and(file_exists($artifactPath))->toBeFalse()
+            ->and(file_get_contents($log))->toBe($artifactDirectory."\n".$artifactDirectory."\n");
+    } finally {
+        $filesystem->remove($proxyPath);
+    }
+});
 
 it('derives the exact routing digest and durable fence state from canonical Traefik inputs', function () {
     $configuration = compileDestinationFencedBlueGreenConfiguration(

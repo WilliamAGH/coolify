@@ -41,7 +41,29 @@ class ProxyMutationRedisQueue extends RedisQueue
         }
         ProxyMutationQueue::assertPayloadForInspection('enqueue', $decodedPayload);
 
-        return parent::pushRaw($payload, $queue, $options);
+        ProxyMutationQueue::enqueueReady($this, $payload, $queue);
+
+        return $decodedPayload['id'] ?? null;
+    }
+
+    #[\Override]
+    protected function laterRaw($delay, $payload, $queue = null)
+    {
+        if (! $this->isCanonicalQueue($queue)) {
+            return parent::laterRaw($delay, $payload, $queue);
+        }
+        if (! is_string($payload)) {
+            throw new LogicException('A canonical delayed proxy-mutation payload must be JSON.');
+        }
+
+        $decodedPayload = json_decode($payload, true);
+        if (! is_array($decodedPayload)) {
+            throw new LogicException('The delayed proxy-mutation payload is malformed.');
+        }
+        ProxyMutationQueue::assertPayloadForInspection('delayed enqueue', $decodedPayload);
+        ProxyMutationQueue::enqueueDelayed($this, $payload, $queue, $this->availableAt($delay));
+
+        return $decodedPayload['id'] ?? null;
     }
 
     #[\Override]

@@ -1,0 +1,232 @@
+services:
+  traefik:
+    image: ${TRAEFIK_IMAGE:?}
+    command:
+      - --api.insecure=true
+      - --entrypoints.https.address=:8443
+      - --entrypoints.app-port.address=:8000
+      - --providers.docker=true
+      - --providers.docker.endpoint=unix:///var/run/docker.sock
+      - --providers.docker.exposedbydefault=false
+      - --providers.file.directory=/dynamic
+      - --providers.file.watch=true
+      - --providers.providersThrottleDuration=250ms
+      - --log.level=ERROR
+    ports:
+      - 127.0.0.1:${TRAEFIK_HTTPS_PORT:?}:8443
+      - 127.0.0.1:${TRAEFIK_APP_PORT:?}:8000
+      - 127.0.0.1:${TRAEFIK_API_PORT:?}:8080
+    volumes:
+      - control-plane-dynamic:/dynamic:ro
+      - ${TRAEFIK_CERT_DIR:?}:/certs:ro
+      - ${TRAEFIK_DOCKER_SOCKET:?}:/var/run/docker.sock:ro
+    labels:
+      traefik.enable: "false"
+    networks:
+      - control-plane
+
+  config-writer:
+    image: busybox:1.36.1
+    command:
+      - sh
+      - -c
+      - exec tail -f /dev/null
+    volumes:
+      - control-plane-dynamic:/dynamic
+    networks:
+      - control-plane
+
+  backend-blue:
+    image: node:22-alpine
+    environment:
+      BACKEND_INSTANCE: blue
+      CONTROL_PLANE_HEALTH_PROOF: ${CONTROL_PLANE_HEALTH_PROOF:?}
+      STATE_DIRECTORY: /state
+    volumes:
+      - ${BACKEND_BLUE_STATE_DIR:?}:/state
+    command:
+      - node
+      - -e
+      - |
+        const fs = require('fs');
+        const http = require('http');
+        const stateDirectory = process.env.STATE_DIRECTORY;
+        const privateHeader = 'x-coolify-control-plane-health-proof';
+        const authenticationProofHeader = 'x-coolify-control-plane-authentication-proof';
+        const healthProof = process.env.CONTROL_PLANE_HEALTH_PROOF;
+        const instance = process.env.BACKEND_INSTANCE;
+        const providerHost = 'control-plane.test';
+
+        function append(filename, values) {
+          fs.appendFileSync(stateDirectory + '/' + filename, [String(Date.now()), ...values].join('|') + '\n');
+        }
+
+        function isHealthy() {
+          return fs.existsSync(stateDirectory + '/healthy');
+        }
+
+        function identity() {
+          const [color, generation, dynamicSha] = fs.readFileSync(stateDirectory + '/identity', 'utf8').trim().split('|');
+          return {color, generation, dynamicSha};
+        }
+
+        function responseHeaders() {
+          const current = identity();
+          return {
+            'X-Coolify-Control-Plane-Dynamic-Sha': current.dynamicSha,
+            'X-Integration-Backend': instance,
+            'X-Backend-Color': current.color,
+            'X-Backend-Generation': current.generation,
+          };
+        }
+
+        http.createServer((request, response) => {
+          const requestPath = new URL(request.url, 'http://localhost').pathname;
+          if (requestPath === '/api/health') {
+            const validProof = request.headers[privateHeader] === healthProof;
+            const requestHost = request.headers.host;
+            const providerRequest = requestHost === providerHost || requestHost === providerHost + ':8080';
+            const directRequest = request.headers['x-integration-direct-probe'] === 'true';
+            const healthy = isHealthy();
+
+            if (providerRequest) {
+              append('provider-health.log', [validProof ? '1' : '0', healthy ? '1' : '0']);
+            }
+            if (directRequest) {
+              append('direct-health.log', [validProof ? '1' : '0', healthy ? '1' : '0']);
+            }
+            if (!validProof) {
+              response.writeHead(401);
+              response.end();
+              return;
+            }
+            if (!healthy) {
+              response.writeHead(503);
+              response.end();
+              return;
+            }
+
+            response.writeHead(204, responseHeaders());
+            response.end();
+            return;
+          }
+
+          if (!isHealthy()) {
+            response.writeHead(503);
+            response.end();
+            return;
+          }
+
+          append('route.log', [instance, requestPath]);
+          append('forwarded-identity.log', [request.headers.host || '', request.headers[authenticationProofHeader] || '', request.headers['x-forwarded-for'] || '']);
+          response.writeHead(200, responseHeaders());
+          response.end(instance);
+        }).listen(8080, '0.0.0.0');
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.integration-docker-provider.rule: "Host(`docker-provider.test`)"
+      traefik.http.routers.integration-docker-provider.entrypoints: https
+      traefik.http.routers.integration-docker-provider.tls: "true"
+      traefik.http.routers.integration-docker-provider.service: integration-docker-provider
+      traefik.http.services.integration-docker-provider.loadbalancer.server.port: "8080"
+    networks:
+      - control-plane
+
+  backend-green:
+    image: node:22-alpine
+    environment:
+      BACKEND_INSTANCE: green
+      CONTROL_PLANE_HEALTH_PROOF: ${CONTROL_PLANE_HEALTH_PROOF:?}
+      STATE_DIRECTORY: /state
+    volumes:
+      - ${BACKEND_GREEN_STATE_DIR:?}:/state
+    command:
+      - node
+      - -e
+      - |
+        const fs = require('fs');
+        const http = require('http');
+        const stateDirectory = process.env.STATE_DIRECTORY;
+        const privateHeader = 'x-coolify-control-plane-health-proof';
+        const authenticationProofHeader = 'x-coolify-control-plane-authentication-proof';
+        const healthProof = process.env.CONTROL_PLANE_HEALTH_PROOF;
+        const instance = process.env.BACKEND_INSTANCE;
+        const providerHost = 'control-plane.test';
+
+        function append(filename, values) {
+          fs.appendFileSync(stateDirectory + '/' + filename, [String(Date.now()), ...values].join('|') + '\n');
+        }
+
+        function isHealthy() {
+          return fs.existsSync(stateDirectory + '/healthy');
+        }
+
+        function identity() {
+          const [color, generation, dynamicSha] = fs.readFileSync(stateDirectory + '/identity', 'utf8').trim().split('|');
+          return {color, generation, dynamicSha};
+        }
+
+        function responseHeaders() {
+          const current = identity();
+          return {
+            'X-Coolify-Control-Plane-Dynamic-Sha': current.dynamicSha,
+            'X-Integration-Backend': instance,
+            'X-Backend-Color': current.color,
+            'X-Backend-Generation': current.generation,
+          };
+        }
+
+        http.createServer((request, response) => {
+          const requestPath = new URL(request.url, 'http://localhost').pathname;
+          if (requestPath === '/api/health') {
+            const validProof = request.headers[privateHeader] === healthProof;
+            const requestHost = request.headers.host;
+            const providerRequest = requestHost === providerHost || requestHost === providerHost + ':8080';
+            const directRequest = request.headers['x-integration-direct-probe'] === 'true';
+            const healthy = isHealthy();
+
+            if (providerRequest) {
+              append('provider-health.log', [validProof ? '1' : '0', healthy ? '1' : '0']);
+            }
+            if (directRequest) {
+              append('direct-health.log', [validProof ? '1' : '0', healthy ? '1' : '0']);
+            }
+            if (!validProof) {
+              response.writeHead(401);
+              response.end();
+              return;
+            }
+            if (!healthy) {
+              response.writeHead(503);
+              response.end();
+              return;
+            }
+
+            response.writeHead(204, responseHeaders());
+            response.end();
+            return;
+          }
+
+          if (!isHealthy()) {
+            response.writeHead(503);
+            response.end();
+            return;
+          }
+
+          append('route.log', [instance, requestPath]);
+          append('forwarded-identity.log', [request.headers.host || '', request.headers[authenticationProofHeader] || '', request.headers['x-forwarded-for'] || '']);
+          response.writeHead(200, responseHeaders());
+          response.end(instance);
+        }).listen(8080, '0.0.0.0');
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.integration-backend-green.loadbalancer.server.port: "8080"
+    networks:
+      - control-plane
+
+networks:
+  control-plane:
+    name: ${COMPOSE_PROJECT_NAME:?}_control-plane
+
+volumes:
+  control-plane-dynamic:

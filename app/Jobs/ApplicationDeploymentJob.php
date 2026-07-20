@@ -8,7 +8,7 @@ use App\Actions\Application\WaitForSwarmStackConvergence;
 use App\Actions\Docker\GetContainersStatus;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Contracts\AdoptsLegacyProxyMutationDispatch;
-use App\Contracts\ProxyMutation;
+use App\Enums\ApplicationDeploymentExecutionPhase;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
@@ -29,8 +29,6 @@ use App\Models\SwarmDocker;
 use App\Notifications\Application\DeploymentFailed;
 use App\Notifications\Application\DeploymentSuccess;
 use App\Services\BlueGreenDeploymentLifecycle;
-use App\Support\ProxyMutationQueue;
-use App\Support\UsesProxyMutationQueue;
 use App\Support\ValidationPatterns;
 use App\Traits\EnvironmentVariableAnalyzer;
 use App\Traits\ExecuteRemoteCommand;
@@ -51,12 +49,13 @@ use Spatie\Url\Url;
 use Symfony\Component\Yaml\Yaml;
 use Throwable;
 
-class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, ProxyMutation, ShouldBeEncrypted, ShouldQueue
+class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, ShouldBeEncrypted, ShouldQueue
 {
     use Dispatchable, EnvironmentVariableAnalyzer, ExecuteRemoteCommand, InteractsWithQueue, Queueable, SerializesModels;
-    use UsesProxyMutationQueue;
 
     public const BUILD_TIME_ENV_PATH = '/artifacts/build-time.env';
+
+    public const QUEUE = 'application-deployments';
 
     private const BUILD_SCRIPT_PATH = '/artifacts/build.sh';
 
@@ -215,6 +214,12 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
 
     private bool $skip_build = false;
 
+    private bool $preparationOnly = false;
+
+    private bool $activationOnly = false;
+
+    private bool $handoffScheduled = false;
+
     private Collection|string $build_secrets;
 
     private ?BlueGreenDeploymentLifecycle $blueGreenLifecycle = null;
@@ -232,7 +237,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         ?string $dispatch_attempt_uuid = null,
     ) {
         $this->dispatch_attempt_uuid = $dispatch_attempt_uuid;
-        ProxyMutationQueue::assign($this);
+        $this->assignExecutionQueue();
 
         $this->application_deployment_queue = ApplicationDeploymentQueue::find($this->application_deployment_queue_id);
         $this->nixpacks_plan_json = collect([]);
@@ -315,9 +320,25 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         }
     }
 
+    protected function assignExecutionQueue(): void
+    {
+        $this->onConnection('redis');
+        $this->onQueue(self::QUEUE);
+    }
+
     public function handle(): void
     {
+        $this->handlePreparation();
+    }
+
+    private function executeDeployment(): void
+    {
         $drainRecoveryScheduled = false;
+        $this->application_deployment_queue->refresh();
+        if (($this->activationOnly && $this->application_deployment_queue->execution_phase !== ApplicationDeploymentExecutionPhase::Activate)
+            || ($this->preparationOnly && $this->application_deployment_queue->execution_phase !== ApplicationDeploymentExecutionPhase::Prepare)) {
+            return;
+        }
         if (! $this->acquireDeploymentExecutionOwnership()) {
             return;
         }
@@ -350,7 +371,9 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         try {
             // Make sure the private key is stored in the filesystem
             $this->server->privateKey->storeInFileSystem();
-            if ($this->pull_request_id === 0 && $this->destination instanceof StandaloneDocker) {
+            if (! $this->preparationOnly
+                && $this->pull_request_id === 0
+                && $this->destination instanceof StandaloneDocker) {
                 $this->blueGreenLifecycle = new BlueGreenDeploymentLifecycle(
                     application: $this->application,
                     deployment: $this->application_deployment_queue,
@@ -413,7 +436,9 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
             // Check custom port
             ['repository' => $this->customRepository, 'port' => $this->customPort] = $this->application->customRepository();
 
-            if (data_get($this->application, 'settings.is_build_server_enabled')) {
+            if ($this->activationOnly) {
+                $this->restorePreparedBuildServer();
+            } elseif (data_get($this->application, 'settings.is_build_server_enabled')) {
                 $teamId = data_get($this->application, 'environment.project.team.id');
                 $buildServers = Server::buildServers($teamId)->get();
                 if ($buildServers->count() === 0) {
@@ -421,15 +446,27 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
                     $this->build_server = $this->server;
                 } else {
                     $this->build_server = $buildServers->random();
-                    $this->application_deployment_queue->build_server_id = $this->build_server->id;
+                    if (! is_string($this->dispatch_attempt_uuid)
+                        || ! $this->application_deployment_queue->recordPreparationBuildServer(
+                            $this->dispatch_attempt_uuid,
+                            $this->build_server->id,
+                        )) {
+                        throw new DeploymentException('Deployment preparation lost ownership before recording its build server.');
+                    }
                     $this->application_deployment_queue->addLogEntry("Found a suitable build server ({$this->build_server->name}).");
                     $this->use_build_server = true;
                 }
             } else {
                 $this->build_server = $this->server;
             }
-            $this->detectBuildKitCapabilities();
-            $this->decide_what_to_do();
+            if ($this->activationOnly) {
+                $this->hydratePreparedActivation();
+                $this->activatePreparedDeployment();
+                $this->post_deployment();
+            } else {
+                $this->detectBuildKitCapabilities();
+                $this->decide_what_to_do();
+            }
         } catch (Throwable $e) {
             $failure = $this->blueGreenLifecycle?->rollback($e) ?? $e;
             if ($this->blueGreenLifecycle?->isRetryableDrainTimeout($failure)) {
@@ -446,7 +483,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         } finally {
             // Wrap cleanup operations in try-catch to prevent exceptions from interfering
             // with Laravel's job failure handling and status updates
-            if (! $drainRecoveryScheduled) {
+            if (! $drainRecoveryScheduled && ! $this->handoffScheduled) {
                 try {
                     ApplicationDeploymentQueue::query()
                         ->whereKey($this->application_deployment_queue->getKey())
@@ -464,38 +501,52 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
                 }
             }
 
-            try {
-                if ($this->use_build_server) {
-                    $this->server = $this->build_server;
-                } else {
-                    $this->write_deployment_configurations();
+            if (! $this->handoffScheduled) {
+                try {
+                    if ($this->use_build_server) {
+                        $this->server = $this->build_server;
+                    } else {
+                        $this->write_deployment_configurations();
+                    }
+                } catch (Exception $e) {
+                    // Log but don't fail - configuration writing errors shouldn't prevent status updates
+                    $this->application_deployment_queue->addLogEntry('Warning: Failed to write deployment configurations: '.$e->getMessage(), 'stderr');
                 }
-            } catch (Exception $e) {
-                // Log but don't fail - configuration writing errors shouldn't prevent status updates
-                $this->application_deployment_queue->addLogEntry('Warning: Failed to write deployment configurations: '.$e->getMessage(), 'stderr');
-            }
 
-            try {
-                $this->application_deployment_queue->addLogEntry("Gracefully shutting down build container: {$this->deployment_uuid}");
-                $this->graceful_shutdown_container($this->deployment_uuid, skipRemove: true);
-            } catch (Exception $e) {
-                // Log but don't fail - container cleanup errors are expected when container is already gone
-                Log::warning('Failed to shutdown container '.$this->deployment_uuid.': '.$e->getMessage());
-            }
+                try {
+                    $this->application_deployment_queue->addLogEntry("Gracefully shutting down build container: {$this->deployment_uuid}");
+                    $this->graceful_shutdown_container($this->deployment_uuid, skipRemove: true);
+                } catch (Exception $e) {
+                    // Log but don't fail - container cleanup errors are expected when container is already gone
+                    Log::warning('Failed to shutdown container '.$this->deployment_uuid.': '.$e->getMessage());
+                }
 
-            try {
-                ServiceStatusChanged::dispatch(data_get($this->application, 'environment.project.team.id'));
-            } catch (Exception $e) {
-                // Log but don't fail - event dispatch errors shouldn't prevent status updates
-                Log::warning('Failed to dispatch ServiceStatusChanged for deployment '.$this->deployment_uuid.': '.$e->getMessage());
-            }
+                try {
+                    ServiceStatusChanged::dispatch(data_get($this->application, 'environment.project.team.id'));
+                } catch (Exception $e) {
+                    // Log but don't fail - event dispatch errors shouldn't prevent status updates
+                    Log::warning('Failed to dispatch ServiceStatusChanged for deployment '.$this->deployment_uuid.': '.$e->getMessage());
+                }
 
-            try {
-                $this->blueGreenLifecycle?->release();
-            } catch (Throwable $e) {
-                Log::warning('Failed to release blue-green lifecycle ownership for deployment '.$this->deployment_uuid.': '.$e->getMessage());
+                try {
+                    $this->blueGreenLifecycle?->release();
+                } catch (Throwable $e) {
+                    Log::warning('Failed to release blue-green lifecycle ownership for deployment '.$this->deployment_uuid.': '.$e->getMessage());
+                }
             }
         }
+    }
+
+    public function handlePreparation(): void
+    {
+        $this->preparationOnly = true;
+        $this->executeDeployment();
+    }
+
+    public function handleActivation(): void
+    {
+        $this->activationOnly = true;
+        $this->executeDeployment();
     }
 
     public function acquireDeploymentExecutionOwnership(): bool
@@ -526,11 +577,13 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         }
 
         $this->dispatch_attempt_uuid = $dispatchAttemptUuid;
-        $worker = gethostname();
+        $worker = is_string($queuedJobUuid) && Str::isUuid($queuedJobUuid)
+            ? $queuedJobUuid
+            : (string) Str::uuid();
 
         return $this->application_deployment_queue->acquireDispatchExecution(
             $dispatchAttemptUuid,
-            is_string($worker) && $worker !== '' ? $worker : 'unknown-worker',
+            $worker,
         );
     }
 
@@ -668,7 +721,9 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         } else {
             throw new DeploymentException("Unsupported build pack: {$this->application->build_pack}");
         }
-        $this->post_deployment();
+        if (! $this->handoffScheduled) {
+            $this->post_deployment();
+        }
     }
 
     private function post_deployment()
@@ -730,7 +785,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         $this->save_runtime_environment_variables();
 
         $this->push_to_docker_registry();
-        $this->rolling_update();
+        $this->activate_prepared_runtime();
     }
 
     private function deploy_dockerimage_buildpack()
@@ -750,7 +805,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         // Save runtime environment variables (including empty .env file if no variables defined)
         $this->save_runtime_environment_variables();
 
-        $this->rolling_update();
+        $this->activate_prepared_runtime();
     }
 
     private function resolveDockerImageTag(): string
@@ -941,6 +996,16 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         // This overwrites the build-time .env with ALL variables (build-time + runtime)
         $this->save_runtime_environment_variables();
 
+        if ($this->handoffPreparedDeployment()) {
+            return;
+        }
+
+        $this->activate_docker_compose_runtime();
+    }
+
+    private function activate_docker_compose_runtime(): void
+    {
+        $this->run_pre_deployment_command();
         $this->stop_running_container(force: true);
         $this->application_deployment_queue->addLogEntry('Starting new application.');
         $networkId = $this->application->uuid;
@@ -1078,7 +1143,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         $this->save_runtime_environment_variables();
 
         $this->push_to_docker_registry();
-        $this->rolling_update();
+        $this->activate_prepared_runtime();
     }
 
     private function deploy_nixpacks_buildpack()
@@ -1111,7 +1176,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         // This overwrites the build-time .env with ALL variables (build-time + runtime)
         $this->save_runtime_environment_variables();
         $this->push_to_docker_registry();
-        $this->rolling_update();
+        $this->activate_prepared_runtime();
     }
 
     private function deploy_railpack_buildpack(): void
@@ -1142,7 +1207,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         // Save runtime environment variables AFTER the build
         $this->save_runtime_environment_variables();
         $this->push_to_docker_registry();
-        $this->rolling_update();
+        $this->activate_prepared_runtime();
     }
 
     private function deploy_static_buildpack()
@@ -1174,7 +1239,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         $this->save_runtime_environment_variables();
 
         $this->push_to_docker_registry();
-        $this->rolling_update();
+        $this->activate_prepared_runtime();
     }
 
     private function write_deployment_configurations()
@@ -1416,7 +1481,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
                 $this->save_runtime_environment_variables();
 
                 $this->push_to_docker_registry();
-                $this->rolling_update();
+                $this->activate_prepared_runtime();
 
                 return true;
             }
@@ -1430,7 +1495,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
                 $this->save_runtime_environment_variables();
 
                 $this->push_to_docker_registry();
-                $this->rolling_update();
+                $this->activate_prepared_runtime();
 
                 return true;
             } else {
@@ -2083,7 +2148,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         return [$nixpacks_php_fallback_path, $nixpacks_php_root_dir];
     }
 
-    private function rolling_update()
+    protected function rolling_update()
     {
         try {
             $this->checkForCancellation();
@@ -2160,6 +2225,234 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         } catch (Exception $e) {
             throw new DeploymentException('Rolling update failed ('.get_class($e).'): '.$e->getMessage(), $e->getCode(), $e);
         }
+    }
+
+    protected function activate_prepared_runtime(): void
+    {
+        if ($this->handoffPreparedDeployment()) {
+            return;
+        }
+
+        $this->run_pre_deployment_command();
+        $this->rolling_update();
+    }
+
+    private function handoffPreparedDeployment(): bool
+    {
+        if (! $this->preparationOnly) {
+            return false;
+        }
+
+        $artifact = $this->capturePreparedArtifact();
+        $payload = $this->application_deployment_queue->makePreparedActivationPayload($artifact);
+        $this->application_deployment_queue->refresh();
+        $prepareAttemptUuid = $this->dispatch_attempt_uuid;
+        $prepareWorker = $this->application_deployment_queue->horizon_job_worker;
+        if (! is_string($prepareAttemptUuid)
+            || ! is_string($prepareWorker)
+            || $prepareWorker === '') {
+            throw new DeploymentException('Deployment preparation lost its durable execution ownership before activation handoff.');
+        }
+
+        $activationAttemptUuid = $this->application_deployment_queue->handoffToActivation(
+            $prepareAttemptUuid,
+            $prepareWorker,
+            $payload,
+        );
+        if ($activationAttemptUuid === null) {
+            throw new DeploymentException('Deployment preparation could not transfer ownership to activation.');
+        }
+
+        $this->handoffScheduled = true;
+        $activationDeployment = $this->application_deployment_queue->fresh()
+            ?? throw new DeploymentException('Prepared deployment disappeared before activation dispatch.');
+        dispatch_claimed_application_deployment(
+            $activationDeployment,
+            preserveActivationForRecoveryOnFailure: true,
+        );
+
+        return true;
+    }
+
+    /** @return array<string, mixed> */
+    private function capturePreparedArtifact(): array
+    {
+        $runtimeEnvironmentPath = escapeshellarg("{$this->workdir}/.env");
+        $composePath = escapeshellarg("{$this->workdir}{$this->docker_compose_location}");
+        $this->execute_remote_command([
+            executeInDocker($this->deployment_uuid, "sha256sum {$runtimeEnvironmentPath} | cut -d ' ' -f1"),
+            'hidden' => true,
+            'save' => 'prepared_runtime_environment_sha256',
+            'append' => false,
+        ], [
+            executeInDocker($this->deployment_uuid, "sha256sum {$composePath} | cut -d ' ' -f1"),
+            'hidden' => true,
+            'save' => 'prepared_compose_sha256',
+            'append' => false,
+        ]);
+        $artifactDigest = $this->capturePreparedImageDigest();
+        $runtimeEnvironmentSha256 = trim((string) $this->saved_outputs->get('prepared_runtime_environment_sha256'));
+        $composeSha256 = trim((string) $this->saved_outputs->get('prepared_compose_sha256'));
+        if (preg_match('/\A[a-f0-9]{64}\z/D', $runtimeEnvironmentSha256) !== 1
+            || preg_match('/\A[a-f0-9]{64}\z/D', $composeSha256) !== 1) {
+            throw new DeploymentException('Prepared deployment file digest is invalid.');
+        }
+
+        return [
+            'application_configuration_hash' => $this->application->deploymentConfigurationHash(),
+            'artifact_digest' => $artifactDigest,
+            'build_image_name' => $this->build_image_name ?? null,
+            'build_pack' => $this->application->build_pack,
+            'build_server_id' => $this->use_build_server ? $this->build_server->id : null,
+            'compose_sha256' => $composeSha256,
+            'coolify_variables' => $this->coolify_variables,
+            'deployment_uuid' => $this->deployment_uuid,
+            'docker_compose_custom_start_command' => $this->docker_compose_custom_start_command,
+            'docker_compose_base64' => $this->docker_compose_base64 ?? null,
+            'docker_compose_location' => $this->docker_compose_location,
+            'docker_image' => $this->dockerImage,
+            'docker_image_tag' => $this->dockerImageTag,
+            'production_image_name' => $this->production_image_name ?? null,
+            'runtime_environment_sha256' => $runtimeEnvironmentSha256,
+            'runtime_render_deferred' => $this->application->isBlueGreenDeploymentOptedIn()
+                || $this->application->blueGreenDeployments()
+                    ->where('standalone_docker_id', $this->destination->id)
+                    ->exists(),
+            'use_build_server' => $this->use_build_server,
+        ];
+    }
+
+    private function capturePreparedImageDigest(): string
+    {
+        if ($this->application->build_pack === 'dockercompose') {
+            $safeComposePath = escapeshellarg("{$this->workdir}{$this->docker_compose_location}");
+            $command = "image_ids=\"$(docker compose -f {$safeComposePath} images -q | sort -u)\"; test -n \"\$image_ids\"; printf '%s\\n' \"\$image_ids\" | sha256sum | cut -d ' ' -f1";
+        } else {
+            if (! isset($this->production_image_name) || $this->production_image_name === '') {
+                throw new DeploymentException('Prepared deployment has no production image identity.');
+            }
+            $safeImage = escapeshellarg($this->production_image_name);
+            if ($this->application->build_pack === 'dockerimage' && $this->preparationOnly) {
+                $this->execute_remote_command([
+                    executeInDocker($this->deployment_uuid, "docker pull {$safeImage}"),
+                    'hidden' => true,
+                ]);
+            }
+            $command = "docker image inspect --format='{{.Id}}' {$safeImage}";
+        }
+        $this->execute_remote_command([
+            executeInDocker($this->deployment_uuid, $command),
+            'hidden' => true,
+            'save' => 'prepared_artifact_digest',
+            'append' => false,
+        ]);
+        $artifactDigest = trim((string) $this->saved_outputs->get('prepared_artifact_digest'));
+        if (preg_match('/\A(?:sha256:)?[a-f0-9]{64}\z/D', $artifactDigest) !== 1) {
+            throw new DeploymentException('Prepared deployment artifact digest is invalid.');
+        }
+
+        return $artifactDigest;
+    }
+
+    private function restorePreparedBuildServer(): void
+    {
+        $buildServerId = $this->application_deployment_queue->build_server_id;
+        if ($buildServerId === null) {
+            $this->build_server = $this->mainServer;
+            $this->use_build_server = false;
+
+            return;
+        }
+
+        $this->build_server = Server::find($buildServerId)
+            ?? throw new DeploymentException('Prepared deployment build server no longer exists.');
+        $this->use_build_server = $this->build_server->id !== $this->mainServer->id;
+        $this->server = $this->build_server;
+    }
+
+    private function hydratePreparedActivation(): void
+    {
+        $payload = $this->application_deployment_queue->validatedPreparedActivationPayload();
+        $artifact = $payload['artifact'];
+        if (($artifact['build_pack'] ?? null) !== $this->application->build_pack
+            || ($artifact['deployment_uuid'] ?? null) !== $this->deployment_uuid
+            || (bool) ($artifact['use_build_server'] ?? false) !== $this->use_build_server
+            || ($artifact['build_server_id'] ?? null) !== ($this->use_build_server ? $this->build_server->id : null)) {
+            throw new DeploymentException('Prepared deployment artifact identity no longer matches the activation target.');
+        }
+
+        $this->build_image_name = (string) ($artifact['build_image_name'] ?? '');
+        $this->production_image_name = (string) ($artifact['production_image_name'] ?? '');
+        $this->dockerImage = is_string($artifact['docker_image'] ?? null) ? $artifact['docker_image'] : null;
+        $this->dockerImageTag = is_string($artifact['docker_image_tag'] ?? null) ? $artifact['docker_image_tag'] : null;
+        $this->docker_compose_location = (string) ($artifact['docker_compose_location'] ?? '/docker-compose.yaml');
+        if (is_string($artifact['docker_compose_base64'] ?? null)) {
+            $this->docker_compose_base64 = $artifact['docker_compose_base64'];
+        }
+        $this->docker_compose_custom_start_command = is_string($artifact['docker_compose_custom_start_command'] ?? null)
+            ? $artifact['docker_compose_custom_start_command']
+            : null;
+        $this->coolify_variables = is_string($artifact['coolify_variables'] ?? null)
+            ? $artifact['coolify_variables']
+            : '';
+        if (! hash_equals(
+            (string) ($artifact['application_configuration_hash'] ?? ''),
+            $this->application->deploymentConfigurationHash(),
+        )) {
+            throw new DeploymentException('Application configuration changed after deployment preparation.');
+        }
+        $this->attestPreparedArtifact($artifact);
+        if ((bool) ($artifact['runtime_render_deferred'] ?? false)) {
+            if (! ($this->blueGreenLifecycle?->isEnabled() ?? false)) {
+                throw new DeploymentException('Prepared deployment requires blue-green runtime rendering but activation has no blue-green owner.');
+            }
+            $this->generate_compose_file();
+            $this->save_runtime_environment_variables();
+        }
+    }
+
+    /** @param array<string, mixed> $artifact */
+    private function attestPreparedArtifact(array $artifact): void
+    {
+        $expectedArtifactDigest = $artifact['artifact_digest'] ?? null;
+        $runtimeRenderDeferred = (bool) ($artifact['runtime_render_deferred'] ?? false);
+        $expectedDigests = [$expectedArtifactDigest];
+        if (! $runtimeRenderDeferred) {
+            $expectedDigests[] = $artifact['runtime_environment_sha256'] ?? null;
+            $expectedDigests[] = $artifact['compose_sha256'] ?? null;
+        }
+        foreach ($expectedDigests as $digest) {
+            if (! is_string($digest) || preg_match('/\A(?:sha256:)?[a-f0-9]{64}\z/D', $digest) !== 1) {
+                throw new DeploymentException('Prepared deployment artifact attestation is malformed.');
+            }
+        }
+
+        $capturedArtifact = $runtimeRenderDeferred
+            ? ['artifact_digest' => $this->capturePreparedImageDigest()]
+            : $this->capturePreparedArtifact();
+        $attestedKeys = $runtimeRenderDeferred
+            ? ['artifact_digest']
+            : ['artifact_digest', 'runtime_environment_sha256', 'compose_sha256'];
+        foreach ($attestedKeys as $key) {
+            if (! hash_equals((string) $artifact[$key], (string) $capturedArtifact[$key])) {
+                throw new DeploymentException("Prepared deployment {$key} changed before activation.");
+            }
+        }
+    }
+
+    private function activatePreparedDeployment(): void
+    {
+        if ($this->application->build_pack === 'dockercompose') {
+            if ($this->use_build_server) {
+                $this->write_deployment_configurations();
+                $this->server = $this->mainServer;
+            }
+            $this->activate_docker_compose_runtime();
+
+            return;
+        }
+
+        $this->activate_prepared_runtime();
     }
 
     private function health_check()
@@ -2299,7 +2592,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
         // This overwrites the build-time .env with ALL variables (build-time + runtime)
         $this->save_runtime_environment_variables();
         $this->push_to_docker_registry();
-        $this->rolling_update();
+        $this->activate_prepared_runtime();
     }
 
     private function create_workdir()
@@ -2374,7 +2667,6 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Pro
                 'command' => executeInDocker($this->deployment_uuid, "mkdir -p {$this->basedir}"),
             ],
         );
-        $this->run_pre_deployment_command();
     }
 
     private function restart_builder_container_with_actual_commit()
@@ -4962,7 +5254,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         return null;
     }
 
-    private function run_pre_deployment_command()
+    protected function run_pre_deployment_command()
     {
         if (empty($this->application->pre_deployment_command)) {
             return;
@@ -4990,7 +5282,13 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
 
             return;
         }
-        $containers = getCurrentApplicationContainerStatus($this->server, $this->application->id, $this->pull_request_id);
+        $deploymentServer = $this->server;
+        $this->server = $this->mainServer;
+        try {
+            $containers = getCurrentApplicationContainerStatus($this->server, $this->application->id, $this->pull_request_id);
+        } finally {
+            $this->server = $deploymentServer;
+        }
         if ($containers->count() == 0) {
             $this->application_deployment_queue->addLogEntry('Pre-deployment command: No running containers found. Skipping.');
 
@@ -5019,12 +5317,17 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         $preCommand = str_replace(["\r\n", "\r", "\n"], ' ', $this->application->pre_deployment_command);
         $cmd = "sh -c '".str_replace("'", "'\''", $preCommand)."'";
         $exec = "docker exec {$containerName} {$cmd}";
-        $this->execute_remote_command(
-            [
-                'command' => $exec,
-                'hidden' => true,
-            ],
-        );
+        $this->server = $this->mainServer;
+        try {
+            $this->execute_remote_command(
+                [
+                    'command' => $exec,
+                    'hidden' => true,
+                ],
+            );
+        } finally {
+            $this->server = $deploymentServer;
+        }
     }
 
     private function run_post_deployment_command()

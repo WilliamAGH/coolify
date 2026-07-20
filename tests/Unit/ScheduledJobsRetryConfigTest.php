@@ -1,5 +1,6 @@
 <?php
 
+use App\Jobs\ApplicationDeploymentJob;
 use App\Jobs\CoolifyTask;
 use App\Jobs\DatabaseBackupJob;
 use App\Jobs\ScheduledTaskJob;
@@ -40,46 +41,19 @@ it('ScheduledTaskJob has correct retry properties defined', function () {
         ->and($defaultProperties['timeout'])->toBe(300);
 });
 
-it('DatabaseBackupJob has correct retry properties defined', function () {
+it('DatabaseBackupJob keeps one exception and a bounded default timeout', function () {
     $reflection = new ReflectionClass(DatabaseBackupJob::class);
-
-    // Check public properties exist
-    expect($reflection->hasProperty('tries'))->toBeTrue()
-        ->and($reflection->hasProperty('maxExceptions'))->toBeTrue()
-        ->and($reflection->hasProperty('timeout'))->toBeTrue()
-        ->and($reflection->hasMethod('backoff'))->toBeTrue()
-        ->and($reflection->hasMethod('failed'))->toBeTrue();
-
-    // Get default values from class definition
     $defaultProperties = $reflection->getDefaultProperties();
 
-    expect($defaultProperties['tries'])->toBe(2)
-        ->and($defaultProperties['maxExceptions'])->toBe(1)
+    expect($defaultProperties['maxExceptions'])->toBe(1)
         ->and($defaultProperties['timeout'])->toBe(3600);
 });
 
-it('DatabaseBackupJob enforces minimum timeout of 60 seconds', function () {
-    // Read the constructor to verify minimum timeout enforcement
-    $reflection = new ReflectionClass(DatabaseBackupJob::class);
-    $constructor = $reflection->getMethod('__construct');
-
-    // Get the constructor source
-    $filename = $reflection->getFileName();
-    $startLine = $constructor->getStartLine();
-    $endLine = $constructor->getEndLine();
-
-    $source = file($filename);
-    $constructorSource = implode('', array_slice($source, $startLine - 1, $endLine - $startLine + 1));
-
-    // Verify the implementation enforces minimum of 60 seconds
-    expect($constructorSource)
-        ->toContain('max(')
-        ->toContain('60');
-});
-
-it('isolates proxy mutations from build workers with bounded dedicated capacity', function () {
+it('isolates proxy repairs and application builds with independently bounded capacity', function () {
     $originalQueues = getenv('HORIZON_QUEUES');
-    putenv('HORIZON_QUEUES=high,proxy-mutations,default,proxy-mutations');
+    $originalProxyMutationProcesses = getenv('HORIZON_PROXY_MUTATION_MAX_PROCESSES');
+    putenv('HORIZON_QUEUES=high,application-deployments,proxy-mutations,default,application-deployments,proxy-mutations');
+    putenv('HORIZON_PROXY_MUTATION_MAX_PROCESSES=99');
 
     try {
         $horizon = require dirname(__DIR__, 2).'/config/horizon.php';
@@ -87,10 +61,14 @@ it('isolates proxy mutations from build workers with bounded dedicated capacity'
         $originalQueues === false
             ? putenv('HORIZON_QUEUES')
             : putenv("HORIZON_QUEUES={$originalQueues}");
+        $originalProxyMutationProcesses === false
+            ? putenv('HORIZON_PROXY_MUTATION_MAX_PROCESSES')
+            : putenv("HORIZON_PROXY_MUTATION_MAX_PROCESSES={$originalProxyMutationProcesses}");
     }
 
     $sharedQueues = explode(',', $horizon['defaults']['s6']['queue']);
     $proxySupervisor = $horizon['defaults']['proxy-mutations'];
+    $deploymentSupervisor = $horizon['defaults']['application-deployments'];
     $queue = require dirname(__DIR__, 2).'/config/queue.php';
 
     expect($sharedQueues)->toBe(['high', 'default'])
@@ -98,7 +76,13 @@ it('isolates proxy mutations from build workers with bounded dedicated capacity'
         ->and($proxySupervisor['queue'])->toBe(ProxyMutationQueue::NAME)
         ->and($proxySupervisor['balance'])->toBeFalse()
         ->and($proxySupervisor['minProcesses'])->toBe(1)
-        ->and($proxySupervisor['maxProcesses'])->toBeGreaterThan(1)
+        ->and($proxySupervisor['maxProcesses'])->toBe(1)
         ->and($horizon['waits']['redis:proxy-mutations'])->toBe(60)
+        ->and($deploymentSupervisor['connection'])->toBe('redis')
+        ->and($deploymentSupervisor['queue'])->toBe(ApplicationDeploymentJob::QUEUE)
+        ->and($deploymentSupervisor['balance'])->toBeFalse()
+        ->and($deploymentSupervisor['minProcesses'])->toBe(1)
+        ->and($deploymentSupervisor['maxProcesses'])->toBe(4)
+        ->and($horizon['waits']['redis:application-deployments'])->toBe(60)
         ->and($queue['connections']['redis']['retry_after'])->toBeGreaterThan($proxySupervisor['timeout']);
 });

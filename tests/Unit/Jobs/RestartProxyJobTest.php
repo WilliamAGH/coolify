@@ -2,10 +2,16 @@
 
 namespace Tests\Unit\Jobs;
 
+use App\Contracts\ProxyMutation;
+use App\Events\ProxyStatusChangedUI;
 use App\Jobs\RestartProxyJob;
 use App\Models\Server;
+use App\Support\ProxyMutationQueue;
 use Illuminate\Queue\Middleware\WithoutOverlapping;
+use Illuminate\Support\Facades\Event;
 use Mockery;
+use ReflectionMethod;
+use Spatie\Activitylog\Models\Activity;
 use Tests\TestCase;
 
 /**
@@ -43,8 +49,11 @@ class RestartProxyJobTest extends TestCase
         $job = new RestartProxyJob($server);
 
         $this->assertEquals(1, $job->tries);
-        $this->assertEquals(120, $job->timeout);
+        $this->assertEquals(660, $job->timeout);
         $this->assertNull($job->activity_id);
+        $this->assertInstanceOf(ProxyMutation::class, $job);
+        $this->assertSame(ProxyMutationQueue::CONNECTION, $job->connection);
+        $this->assertSame(ProxyMutationQueue::NAME, $job->queue);
     }
 
     public function test_job_stores_server()
@@ -54,5 +63,32 @@ class RestartProxyJobTest extends TestCase
         $job = new RestartProxyJob($server);
 
         $this->assertSame($server, $job->server);
+    }
+
+    public function test_job_timeout_covers_the_inline_remote_process_budget()
+    {
+        $job = new RestartProxyJob(Mockery::mock(Server::class));
+
+        $this->assertGreaterThan(RestartProxyJob::REMOTE_TIMEOUT_SECONDS, $job->timeout);
+    }
+
+    public function test_job_announces_the_activity_before_inline_execution()
+    {
+        Event::fake([ProxyStatusChangedUI::class]);
+        $server = Mockery::mock(Server::class);
+        $server->shouldReceive('getSchemalessAttributes')->andReturn([]);
+        $server->shouldReceive('getAttribute')->with('team_id')->andReturn(19);
+        $activity = new Activity;
+        $activity->id = 314;
+        $job = new RestartProxyJob($server);
+
+        $announceActivity = new ReflectionMethod($job, 'announceActivity');
+        $announceActivity->invoke($job, $activity);
+
+        $this->assertSame(314, $job->activity_id);
+        Event::assertDispatched(
+            ProxyStatusChangedUI::class,
+            fn (ProxyStatusChangedUI $event): bool => $event->teamId === 19 && $event->activityId === 314,
+        );
     }
 }

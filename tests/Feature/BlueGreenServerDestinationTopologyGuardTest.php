@@ -12,7 +12,7 @@ use App\Models\Server;
 use App\Models\StandaloneDocker;
 use App\Models\Team;
 use Illuminate\Foundation\Testing\RefreshDatabase;
-use Illuminate\Queue\Events\JobProcessing;
+use Illuminate\Queue\Events\JobQueueing;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Process;
@@ -64,6 +64,21 @@ it('rejects proxy changes for a protected blue-green server', function () {
 
     expect($server->fresh()->proxyType())->toBe(ProxyTypes::TRAEFIK->value);
 });
+
+it('allows state-only proxy document writes without treating them as topology transitions', function (bool $quietly): void {
+    ['server' => $server] = makeServerDestinationTopologyFixture();
+    $server->proxy->set('control_plane_test_state', ['phase' => 'prepared']);
+
+    expect(fn (): bool => $quietly ? $server->saveQuietly() : $server->save())
+        ->not->toThrow(RuntimeException::class);
+
+    $persistedServer = $server->fresh();
+    expect($persistedServer->proxyType())->toBe(ProxyTypes::TRAEFIK->value)
+        ->and($persistedServer->proxy->get('control_plane_test_state'))->toBe(['phase' => 'prepared']);
+})->with([
+    'ordinary save' => false,
+    'quiet save' => true,
+]);
 
 it('rejects Docker Swarm transitions for a protected blue-green server', function () {
     ['server' => $server] = makeServerDestinationTopologyFixture();
@@ -223,10 +238,10 @@ it('dispatches proxy network reconciliation only after the destination transacti
         'team_id' => $team->id,
         'private_key_id' => $privateKey->id,
     ]);
-    $processedJobs = 0;
-    Event::listen(JobProcessing::class, function (JobProcessing $event) use (&$processedJobs): void {
-        if ($event->job->resolveName() === ConnectProxyToNetworksJob::class) {
-            $processedJobs++;
+    $queuedJobs = 0;
+    Event::listen(JobQueueing::class, function (JobQueueing $event) use (&$queuedJobs): void {
+        if ($event->job instanceof ConnectProxyToNetworksJob) {
+            $queuedJobs++;
         }
     });
     Process::fake();
@@ -234,16 +249,16 @@ it('dispatches proxy network reconciliation only after the destination transacti
     app()->detectEnvironment(static fn (): string => 'production');
 
     try {
-        DB::transaction(function () use ($server, &$processedJobs): void {
+        DB::transaction(function () use ($server, &$queuedJobs): void {
             StandaloneDocker::factory()->create([
                 'server_id' => $server->id,
                 'network' => 'after-commit-network',
             ]);
 
-            expect($processedJobs)->toBe(0);
+            expect($queuedJobs)->toBe(0);
         });
 
-        expect($processedJobs)->toBe(1);
+        expect($queuedJobs)->toBe(1);
     } finally {
         app()->detectEnvironment(static fn (): string => $environment);
     }

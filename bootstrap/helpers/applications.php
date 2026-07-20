@@ -1,8 +1,10 @@
 <?php
 
 use App\Actions\Application\StopApplication;
+use App\Enums\ApplicationDeploymentExecutionPhase;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Exceptions\DeploymentException;
+use App\Jobs\ActivateApplicationDeploymentJob;
 use App\Jobs\ApplicationDeploymentJob;
 use App\Jobs\VolumeCloneJob;
 use App\Models\Application;
@@ -10,8 +12,11 @@ use App\Models\ApplicationDeploymentQueue;
 use App\Models\EnvironmentVariable;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
+use App\Support\ProxyMutationQueue;
+use App\Support\ProxyMutationQueueFrozenException;
 use Illuminate\Contracts\Bus\Dispatcher;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Laravel\Horizon\Contracts\JobRepository;
 use Spatie\Url\Url;
@@ -170,20 +175,41 @@ function next_after_cancel(ApplicationDeploymentQueue $cancelledDeployment): voi
     queue_next_deployment($cancelledDeployment);
 }
 
-function dispatch_claimed_application_deployment(ApplicationDeploymentQueue $deployment): bool
-{
-    DB::afterCommit(static function () use ($deployment): void {
+function dispatch_claimed_application_deployment(
+    ApplicationDeploymentQueue $deployment,
+    bool $preserveActivationForRecoveryOnFailure = false,
+): bool {
+    DB::afterCommit(static function () use ($deployment, $preserveActivationForRecoveryOnFailure): void {
         $deployment->refresh();
         $dispatchAttemptUuid = $deployment->horizon_job_id;
         if (! is_string($dispatchAttemptUuid) || ! Str::isUuid($dispatchAttemptUuid)) {
             throw new DeploymentException('The claimed deployment has no durable dispatch attempt identity.');
         }
 
-        $job = (new ApplicationDeploymentJob(
-            application_deployment_queue_id: $deployment->id,
-            dispatch_attempt_uuid: $dispatchAttemptUuid,
-        ))->afterCommit();
-        app(Dispatcher::class)->dispatch($job);
+        $job = match ($deployment->execution_phase) {
+            ApplicationDeploymentExecutionPhase::Prepare => new ApplicationDeploymentJob(
+                application_deployment_queue_id: $deployment->id,
+                dispatch_attempt_uuid: $dispatchAttemptUuid,
+            ),
+            ApplicationDeploymentExecutionPhase::Activate => new ActivateApplicationDeploymentJob(
+                application_deployment_queue_id: $deployment->id,
+                dispatch_attempt_uuid: $dispatchAttemptUuid,
+            ),
+        };
+        $job->afterCommit();
+        try {
+            app(Dispatcher::class)->dispatch($job);
+        } catch (ProxyMutationQueueFrozenException) {
+            // The durable dispatch attempt remains recoverable after the owning
+            // control-plane operation explicitly releases admission.
+        } catch (Throwable $exception) {
+            if (! $preserveActivationForRecoveryOnFailure) {
+                throw $exception;
+            }
+            Log::warning(
+                "Activation publication failed for deployment {$deployment->deployment_uuid}; the durable activation remains recoverable: {$exception->getMessage()}",
+            );
+        }
     });
 
     return true;
@@ -193,6 +219,10 @@ function recover_stale_application_deployment_dispatches(
     int $staleAfterSeconds = ApplicationDeploymentQueue::DISPATCH_STALE_AFTER_SECONDS,
     int $limit = ApplicationDeploymentQueue::DISPATCH_RECOVERY_LIMIT_PER_RUN,
 ): int {
+    $recoverablePhase = ProxyMutationQueue::snapshot()->isFrozen()
+        ? ApplicationDeploymentExecutionPhase::Prepare
+        : null;
+
     $jobRepository = app(JobRepository::class);
 
     return ApplicationDeploymentQueue::recoverStaleDispatchAttempts(
@@ -213,6 +243,7 @@ function recover_stale_application_deployment_dispatches(
             dispatch_claimed_application_deployment($recoveredDeployment);
         },
         $limit,
+        $recoverablePhase,
     );
 }
 

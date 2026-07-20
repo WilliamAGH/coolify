@@ -56,13 +56,55 @@ function applicationValidationWorkflowViolations(array $workflow): array
         'tests/Feature/BlueGreenContinuousAvailabilityAcceptanceTest.php',
         'tests/Feature/BlueGreenCrashBoundaryAcceptanceTest.php',
         'tests/Feature/BlueGreenMigrationReplayTest.php',
+        'tests/Feature/DatabaseMigrationReadinessTest.php',
         'tests/Feature/BlueGreenSupersessionGenerationTest.php',
+        'tests/Feature/LegacyProxyMutationPayloadAdoptionTest.php',
+        'tests/Feature/ProxyMutationQueueGateTest.php',
+        'tests/Feature/QueueApplicationDeploymentCommitTest.php',
+        'tests/Unit/ApplicationDeploymentActivationOrderTest.php',
+        'tests/Unit/ProxyMutationQueueTest.php',
+        'tests/Unit/ScheduledJobsRetryConfigTest.php',
     ] as $requiredTest) {
         if (! str_contains((string) $blueGreenScript, $requiredTest)) {
             $violations[] = 'blue-green lifecycle validation must execute every ownership and migration gate';
 
             break;
         }
+    }
+    $activationConfigurationStep = collect($blueGreen['steps'] ?? [])
+        ->firstWhere('name', 'Validate deployment activation configuration fence')['run'] ?? '';
+    if (! str_contains(
+        (string) $activationConfigurationStep,
+        "tests/Unit/DeploymentConfiguration/ApplicationConfigurationSnapshotTest.php --filter='fences deployment command'",
+    )) {
+        $violations[] = 'blue-green lifecycle validation must fail closed when activation-time commands change after preparation';
+    }
+
+    $phpApplication = is_array($jobs) ? ($jobs['php'] ?? []) : [];
+    $controlPlaneScript = collect($phpApplication['steps'] ?? [])
+        ->firstWhere('name', 'Run native Traefik control-plane tests')['run'] ?? '';
+    foreach ([
+        'tests/Feature/InspectProxyMutationQueueTest.php',
+        'tests/Feature/Proxy/ControlPlane',
+        'tests/Unit/Actions/Proxy/ControlPlane',
+    ] as $requiredPath) {
+        if (! str_contains((string) $controlPlaneScript, $requiredPath)) {
+            $violations[] = 'application validation must execute every native Traefik control-plane test';
+
+            break;
+        }
+    }
+
+    $workflowAndShell = is_array($jobs) ? ($jobs['workflow-and-shell'] ?? []) : [];
+    $databaseMigrationScript = collect($workflowAndShell['steps'] ?? [])
+        ->firstWhere('name', 'Verify database migration S6 exit propagation')['run'] ?? '';
+    if (! str_contains((string) $databaseMigrationScript, 'tests/Integration/DatabaseMigrationS6/run.sh')) {
+        $violations[] = 'application validation must execute the database migration S6 exit propagation integration';
+    }
+    $traefikRuntimeScript = collect($workflowAndShell['steps'] ?? [])
+        ->firstWhere('name', 'Run native Traefik runtime integration')['run'] ?? '';
+    if (! str_contains((string) $traefikRuntimeScript, 'tests/Integration/ControlPlaneTraefik/run.sh')) {
+        $violations[] = 'application validation must execute the native Traefik runtime integration';
     }
 
     foreach (is_array($jobs) ? $jobs : [] as $job) {
@@ -103,4 +145,72 @@ it('rejects omitting a blue-green ownership gate from PostgreSQL validation', fu
 
     expect(applicationValidationWorkflowViolations($workflow))
         ->toContain('blue-green lifecycle validation must execute every ownership and migration gate');
+});
+
+it('rejects omitting delayed database-startup coverage from PostgreSQL validation', function () {
+    $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
+    $step = collect($workflow['jobs']['blue-green-lifecycle']['steps'])
+        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Run blue-green lifecycle tests');
+    $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'] = str_replace(
+        'tests/Feature/DatabaseMigrationReadinessTest.php',
+        '',
+        $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'],
+    );
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('blue-green lifecycle validation must execute every ownership and migration gate');
+});
+
+it('rejects omitting the activation configuration fence from PostgreSQL validation', function () {
+    $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
+    $step = collect($workflow['jobs']['blue-green-lifecycle']['steps'])
+        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Validate deployment activation configuration fence');
+    $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'] = 'true';
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('blue-green lifecycle validation must fail closed when activation-time commands change after preparation');
+});
+
+it('rejects omitting the native Traefik control-plane suite', function () {
+    $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
+    $step = collect($workflow['jobs']['php']['steps'])
+        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Run native Traefik control-plane tests');
+    $workflow['jobs']['php']['steps'][$step]['run'] = 'php artisan test --compact tests/Feature/Proxy/ControlPlane';
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('application validation must execute every native Traefik control-plane test');
+});
+
+it('rejects omitting explicit proxy-mutation payload diagnostics', function () {
+    $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
+    $step = collect($workflow['jobs']['php']['steps'])
+        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Run native Traefik control-plane tests');
+    $workflow['jobs']['php']['steps'][$step]['run'] = str_replace(
+        'tests/Feature/InspectProxyMutationQueueTest.php',
+        '',
+        $workflow['jobs']['php']['steps'][$step]['run'],
+    );
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('application validation must execute every native Traefik control-plane test');
+});
+
+it('rejects omitting the native Traefik runtime integration', function () {
+    $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
+    $step = collect($workflow['jobs']['workflow-and-shell']['steps'])
+        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Run native Traefik runtime integration');
+    $workflow['jobs']['workflow-and-shell']['steps'][$step]['run'] = 'true';
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('application validation must execute the native Traefik runtime integration');
+});
+
+it('rejects omitting database migration S6 exit propagation coverage', function () {
+    $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
+    $step = collect($workflow['jobs']['workflow-and-shell']['steps'])
+        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Verify database migration S6 exit propagation');
+    $workflow['jobs']['workflow-and-shell']['steps'][$step]['run'] = 'true';
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('application validation must execute the database migration S6 exit propagation integration');
 });

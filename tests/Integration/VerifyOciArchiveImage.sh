@@ -37,6 +37,11 @@ assert_blob_digest()
 : "${OCI_PLATFORM:?OCI_PLATFORM is required}"
 : "${OCI_IMAGE:?OCI_IMAGE is required}"
 
+case "${OCI_CONTENT_POLICY:-none}" in
+    none|control-plane-main) ;;
+    *) fail "unsupported OCI_CONTENT_POLICY: ${OCI_CONTENT_POLICY}" ;;
+esac
+
 case "$OCI_PLATFORM" in
     linux/amd64) oci_architecture=amd64 ;;
     linux/arm64) oci_architecture=arm64 ;;
@@ -71,9 +76,13 @@ assert_blob_digest "$config_digest"
 # archive without rebuilding or changing the image config/layers.
 runtime_archive_directory="$(mktemp -d "${RUNNER_TEMP:-/tmp}/coolify-oci-runtime.XXXXXX")"
 docker_load_archive="$runtime_archive_directory/docker-load.tar"
+runtime_container_id=
 
 cleanup()
 {
+    if [ -n "$runtime_container_id" ]; then
+        docker rm "$runtime_container_id" >/dev/null 2>&1 || true
+    fi
     rm -rf "$runtime_archive_directory"
 }
 
@@ -134,6 +143,112 @@ loaded_platform="$(docker image inspect "$config_digest" --format '{{.Os}}/{{.Ar
 docker tag "$config_digest" "$OCI_IMAGE"
 [ "$(docker image inspect "$OCI_IMAGE" --format '{{.Id}}')" = "$config_digest" ] ||
     fail 'runtime image tag does not resolve to the loaded OCI config digest'
+
+if [ "${OCI_CONTENT_POLICY:-none}" = control-plane-main ]; then
+    runtime_rootfs_archive="$runtime_archive_directory/runtime-rootfs.tar"
+    runtime_container_id="$(docker create "$OCI_IMAGE")"
+    docker export --output "$runtime_rootfs_archive" "$runtime_container_id"
+    docker rm "$runtime_container_id" >/dev/null
+    runtime_container_id=
+
+    python3 - "$runtime_rootfs_archive" <<'PY'
+import sys
+import tarfile
+
+archive_path = sys.argv[1]
+required_attestor = 'var/www/html/scripts/control-plane-traefik-attestor'
+allowed_service = 'etc/s6-overlay/s6-rc.d/control-plane-traefik-attestor'
+allowed_service_members = {
+    allowed_service,
+    f'{allowed_service}/dependencies.d',
+    f'{allowed_service}/dependencies.d/init-script',
+    f'{allowed_service}/run',
+    f'{allowed_service}/type',
+}
+required_service_members = {
+    allowed_service: 'directory',
+    f'{allowed_service}/dependencies.d/init-script': 'file',
+    f'{allowed_service}/run': 'executable',
+    f'{allowed_service}/type': 'file',
+    'etc/s6-overlay/s6-rc.d/user/contents.d/control-plane-traefik-attestor': 'file',
+}
+forbidden = []
+
+with tarfile.open(archive_path, 'r:*') as archive:
+    members = {
+        member.name.removeprefix('./').rstrip('/'): member
+        for member in archive.getmembers()
+    }
+
+    attestor = members.get(required_attestor)
+    if attestor is None or not attestor.isfile() or attestor.mode & 0o111 == 0:
+        raise SystemExit('bounded control-plane Traefik attestor is absent or not executable')
+
+    for path, expected_type in required_service_members.items():
+        member = members.get(path)
+        if member is None:
+            raise SystemExit(f'bounded attestor service member is absent: {path}')
+        if expected_type == 'directory' and not member.isdir():
+            raise SystemExit(f'bounded attestor service member is not a directory: {path}')
+        if expected_type in ('file', 'executable') and not member.isfile():
+            raise SystemExit(f'bounded attestor service member is not a regular file: {path}')
+        if expected_type == 'executable' and member.mode & 0o111 == 0:
+            raise SystemExit(f'bounded attestor service member is not executable: {path}')
+
+    service_type = archive.extractfile(members[f'{allowed_service}/type']).read().decode().strip()
+    if service_type != 'longrun':
+        raise SystemExit('bounded attestor service type is not longrun')
+
+    for path, member in members.items():
+        lowered = path.lower()
+        parts = lowered.split('/')
+        basename = parts[-1]
+
+        if any('haproxy' in component for component in parts) or basename == 'traefik-ingress.sh':
+            forbidden.append(path)
+            continue
+
+        if (
+            lowered == 'var/www/html/docker/control-plane-blue-green/controllers'
+            or lowered.startswith('var/www/html/docker/control-plane-blue-green/controllers/')
+        ):
+            forbidden.append(path)
+            continue
+
+        if lowered.startswith('var/www/html/scripts/') and lowered != required_attestor:
+            forbidden.append(path)
+            continue
+
+        if lowered.startswith(f'{allowed_service}/') and path not in allowed_service_members:
+            forbidden.append(path)
+            continue
+
+        if lowered.startswith('etc/s6-overlay/s6-rc.d/'):
+            service = '/'.join(path.split('/')[:4])
+            service_name = path.split('/')[3] if len(path.split('/')) > 3 else ''
+            if service != allowed_service and any(
+                marker in service_name.lower()
+                for marker in ('control-plane', 'traefik', 'ingress')
+            ):
+                forbidden.append(path)
+                continue
+
+        if (
+            member.isfile()
+            and member.mode & 0o111
+            and lowered != required_attestor
+            and (
+                lowered.startswith('usr/local/bin/')
+            )
+            and any(marker in basename for marker in ('control-plane', 'traefik', 'ingress'))
+        ):
+            forbidden.append(path)
+
+if forbidden:
+    rendered = '\n'.join(f'  {path}' for path in sorted(set(forbidden)))
+    raise SystemExit(f'forbidden ingress/controller release content found:\n{rendered}')
+PY
+fi
 
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
     printf 'image=%s\n' "$OCI_IMAGE" >> "$GITHUB_OUTPUT"

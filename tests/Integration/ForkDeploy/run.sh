@@ -94,6 +94,10 @@ new_fixture() {
         FORK_DEPLOY_FAIL_COMPOSE_UP FORK_DEPLOY_OPENSSL_VERIFY_FAIL \
         FORK_DEPLOY_USE_REAL_OPENSSL FORK_DEPLOY_ENV_EXTRA \
         FORK_DEPLOY_COMPOSE_VERSION FORK_DEPLOY_LEGACY_VOLUMES \
+        FORK_DEPLOY_APP_HOST_IP FORK_DEPLOY_REALTIME_HOST_IP \
+        FORK_DEPLOY_APP_DUAL_STACK FORK_DEPLOY_COMPOSE_APP_LOOPBACK \
+        FORK_DEPLOY_COMPOSE_OMIT_APP_HOST_IP \
+        FORK_DEPLOY_COMPOSE_SWAP_BINDINGS \
         FORK_DEPLOY_DOCKER_UNAVAILABLE \
         FORK_DEPLOY_FAIL_CANDIDATE_RUNTIME_VERIFY || true
     unset FORK_DEPLOY_FAIL_ACTIVATED_CONFIG FORK_DEPLOY_KILL_ON_ACTIVE_CONFIG \
@@ -123,7 +127,7 @@ write_assets() {
     {
         printf 'services:\n'
         printf '  coolify:\n    image: "%s"\n    ports: !override\n' "docker.iocloudhost.net/williamagh/coolify@$DIGEST_A"
-        printf '%s\n' "      - \"127.0.0.1:\${APP_PORT:-8000}:8080\""
+        printf '%s\n' "      - \"\${APP_PORT:-8000}:8080\""
         printf '    environment:\n      AUTOUPDATE: "false"\n'
         printf '  soketi:\n    image: "%s"\n    ports: !override\n' "docker.iocloudhost.net/williamagh/coolify-realtime@$DIGEST_B"
         printf '%s\n' "      - \"127.0.0.1:\${SOKETI_PORT:-6001}:6001\""
@@ -178,6 +182,24 @@ install_release() {
 
 update_release() {
     "$SUBJECT" update --offline-manifest "$MANIFEST_FILE"
+}
+
+control_plane_listener_override_path() {
+    printf '%s\n' "$ROOT/source/docker-compose.control-plane-listener.yml"
+}
+
+source_compose_mutations_apply_listener_override_last() {
+    local override line suffix invocations=0
+
+    override=$(control_plane_listener_override_path)
+    while IFS= read -r line; do
+        [[ $line == docker\ compose* && $line == *"$ROOT/source/docker-compose.yml"* && $line == *' up '* ]] || continue
+        [[ $line == *"--file $override"* ]] || return 1
+        suffix=${line#*"--file $override"}
+        [[ $suffix != *'--file '* ]] || return 1
+        invocations=$((invocations + 1))
+    done <"$LOG"
+    [[ $invocations -gt 0 ]]
 }
 
 replace_key_value() {
@@ -352,14 +374,29 @@ test_real_compose_config_when_available() {
             --file "$ASSETS/docker-compose.custom.yml" \
             config --format json 2>&1
     ) \
-        && [[ $output == *'"host_ip": "127.0.0.1"'* ]] \
-        && [[ $output == *'"published": "8010"'* ]] \
-        && [[ $output == *'"published": "6011"'* ]] \
-        && [[ $output == *'"published": "6002"'* ]] \
-        && [[ $output != *'0.0.0.0'* && $output != *'9999'* ]]; then
-        pass 'real Compose config honors !override and loopback-only ports'
+        && jq -e '
+            ([.services[]?.ports[]?] | length) == 3
+            and (.services.coolify.ports | length) == 1
+            and (.services.soketi.ports | length) == 2
+            and ([.services.coolify.ports[]
+                | select((.target | tostring) == "8080"
+                    and (.published | tostring) == "8010"
+                    and ((.host_ip // "") == ""
+                        or .host_ip == "0.0.0.0"
+                        or .host_ip == "::"))] | length) == 1
+            and ([.services.soketi.ports[]
+                | select((.target | tostring) == "6001"
+                    and (.published | tostring) == "6011"
+                    and .host_ip == "127.0.0.1")] | length) == 1
+            and ([.services.soketi.ports[]
+                | select((.target | tostring) == "6002"
+                    and (.published | tostring) == "6002"
+                    and .host_ip == "127.0.0.1")] | length) == 1
+        ' <<<"$output" >/dev/null \
+        && [[ $output != *'9999'* ]]; then
+        pass 'real Compose config honors !override, public APP_PORT, and loopback realtime ports'
     else
-        fail 'real Compose config honors !override and loopback-only ports'
+        fail 'real Compose config honors !override, public APP_PORT, and loopback realtime ports'
     fi
     cleanup_fixture
 }
@@ -876,6 +913,145 @@ test_invalid_ports_fail_before_activation() {
     cleanup_fixture
 }
 
+test_effective_compose_rejects_loopback_app_binding() {
+    new_fixture
+    export FORK_DEPLOY_COMPOSE_APP_LOOPBACK=true
+    write_manifest 4.13.0-fork.1
+    local output
+    if output=$(install_release 2>&1); then
+        fail 'effective Compose rejects a loopback APP_PORT binding'
+    elif [[ $output == *'one public APP_PORT and two loopback realtime bindings'* ]] \
+        && [[ ! -e $ROOT/source/docker-compose.yml ]]; then
+        pass 'effective Compose rejects a loopback APP_PORT binding'
+    else
+        fail 'effective Compose rejects a loopback APP_PORT binding'
+    fi
+    cleanup_fixture
+}
+
+test_effective_compose_accepts_default_public_app_binding() {
+    new_fixture
+    export FORK_DEPLOY_COMPOSE_OMIT_APP_HOST_IP=true
+    write_manifest 4.13.0-fork.1
+    if install_release >/dev/null; then
+        pass 'effective Compose accepts the default public APP_PORT binding'
+    else
+        fail 'effective Compose accepts the default public APP_PORT binding'
+    fi
+    cleanup_fixture
+}
+
+test_effective_compose_rejects_swapped_bindings() {
+    new_fixture
+    export FORK_DEPLOY_COMPOSE_SWAP_BINDINGS=true
+    write_manifest 4.13.0-fork.1
+    local output
+    if output=$(install_release 2>&1); then
+        fail 'effective Compose associates host bindings with their service and target'
+    elif [[ $output == *'one public APP_PORT and two loopback realtime bindings'* ]] \
+        && [[ ! -e $ROOT/source/docker-compose.yml ]]; then
+        pass 'effective Compose associates host bindings with their service and target'
+    else
+        fail 'effective Compose associates host bindings with their service and target'
+    fi
+    cleanup_fixture
+}
+
+test_verify_accepts_dual_stack_public_app_binding() {
+    new_fixture
+    write_manifest 4.13.0-fork.1
+    if ! install_release >/dev/null; then
+        fail 'runtime verifier accepts distinct IPv4 and IPv6 APP_PORT bindings'
+        cleanup_fixture
+        return
+    fi
+    export FORK_DEPLOY_APP_DUAL_STACK=true
+    if "$SUBJECT" verify >/dev/null 2>&1; then
+        pass 'runtime verifier accepts distinct IPv4 and IPv6 APP_PORT bindings'
+    else
+        fail 'runtime verifier accepts distinct IPv4 and IPv6 APP_PORT bindings'
+    fi
+    cleanup_fixture
+}
+
+test_update_preserves_control_plane_listener_override() {
+    new_fixture
+    write_manifest 4.13.0-fork.1
+    if ! install_release >/dev/null; then
+        fail 'fork-deploy update preserves enrolled Traefik APP_PORT ownership'
+        cleanup_fixture
+        return
+    fi
+    local override source_hash output
+    override=$(control_plane_listener_override_path)
+    printf 'services:\n  coolify:\n    ports: !reset []\n' >"$override"
+    chmod 600 "$override"
+    source_hash=$(hash_file "$override")
+    write_manifest 4.13.0-fork.2
+    : >"$LOG"
+    if output=$({ update_release && "$SUBJECT" verify; } 2>&1) \
+        && [[ $(hash_file "$override") == "$source_hash" ]] \
+        && source_compose_mutations_apply_listener_override_last; then
+        pass 'fork-deploy update preserves enrolled Traefik APP_PORT ownership'
+    else
+        printf 'control-plane listener persistence diagnostic: %s\n' "$output" >&2
+        fail 'fork-deploy update preserves enrolled Traefik APP_PORT ownership'
+    fi
+    cleanup_fixture
+}
+
+test_update_rejects_symlinked_control_plane_listener_override() {
+    new_fixture
+    write_manifest 4.13.0-fork.1
+    if ! install_release >/dev/null; then
+        fail 'fork-deploy rejects a symlinked control-plane listener override'
+        cleanup_fixture
+        return
+    fi
+    local override output
+    override=$(control_plane_listener_override_path)
+    printf 'services:\n  coolify:\n    ports: !reset []\n' >"$FIXTURE/listener-target.yml"
+    ln -s "$FIXTURE/listener-target.yml" "$override"
+    write_manifest 4.13.0-fork.2
+    : >"$LOG"
+    if output=$(update_release 2>&1); then
+        fail 'fork-deploy rejects a symlinked control-plane listener override'
+    elif [[ $output == *'symbolic link'* && $(<"$ROOT/fork-deploy/current") == 4.13.0-fork.1 ]] \
+        && ! grep -q 'compose .* up' "$LOG"; then
+        pass 'fork-deploy rejects a symlinked control-plane listener override'
+    else
+        printf 'symlinked listener rejection diagnostic: %s\n' "$output" >&2
+        fail 'fork-deploy rejects a symlinked control-plane listener override'
+    fi
+    cleanup_fixture
+}
+
+test_update_rejects_partial_control_plane_listener_override() {
+    new_fixture
+    write_manifest 4.13.0-fork.1
+    if ! install_release >/dev/null; then
+        fail 'fork-deploy rejects a partial control-plane listener override'
+        cleanup_fixture
+        return
+    fi
+    local override output
+    override=$(control_plane_listener_override_path)
+    printf 'services:\n  coolify:\n    environment:\n      COOLIFY_CONTROL_PLANE_MEMBER: blue\n' >"$override"
+    chmod 600 "$override"
+    write_manifest 4.13.0-fork.2
+    : >"$LOG"
+    if output=$(update_release 2>&1); then
+        fail 'fork-deploy rejects a partial control-plane listener override'
+    elif [[ $output == *'must reset Coolify ports'* && $(<"$ROOT/fork-deploy/current") == 4.13.0-fork.1 ]] \
+        && ! grep -q 'compose .* up' "$LOG"; then
+        pass 'fork-deploy rejects a partial control-plane listener override'
+    else
+        printf 'partial listener rejection diagnostic: %s\n' "$output" >&2
+        fail 'fork-deploy rejects a partial control-plane listener override'
+    fi
+    cleanup_fixture
+}
+
 test_verify_rejects_all_unsafe_runtime_bindings() {
     new_fixture
     write_manifest 4.13.0-fork.1
@@ -1141,7 +1317,8 @@ test_update_uses_private_temporary_prestart_undo() {
 test_refuses_complete_unmanaged_state_before_mutation() {
     new_fixture
     mkdir -p "$ROOT/source" "$ROOT/ssh/keys" "$ROOT/ssh/mux" "$ROOT/applications" \
-        "$ROOT/backups" "$ROOT/databases" "$ROOT/proxy/dynamic" "$ROOT/sentinel" "$ROOT/services"
+        "$ROOT/backups" "$ROOT/control-plane-attestor" "$ROOT/databases" "$ROOT/proxy/dynamic" \
+        "$ROOT/sentinel" "$ROOT/services"
     printf 'DB_USERNAME=coolify\nDB_DATABASE=coolify\nREDIS_PASSWORD=legacy-secret\n' >"$ROOT/source/.env"
     chmod 0600 "$ROOT/source/.env"
     : >"$FORK_DEPLOY_DB_MARKER"
@@ -1560,6 +1737,15 @@ test_recover_abort_refuses_after_candidate_start() {
     cleanup_fixture
 }
 
+if [[ ${FORK_DEPLOY_TEST_FILTER:-} == control-plane-listener ]]; then
+    test_update_preserves_control_plane_listener_override
+    test_update_rejects_symlinked_control_plane_listener_override
+    test_update_rejects_partial_control_plane_listener_override
+    printf '%s passing, %s failing\n' "$PASS" "$FAIL"
+    ((FAIL == 0))
+    exit
+fi
+
 test_rejects_untrusted_caller_inputs
 test_install_and_update_are_self_contained
 test_rejects_production_alternate_root
@@ -1587,6 +1773,13 @@ test_forward_recovery_forbids_mismatch_abort_and_rollback
 test_forward_recovery_reconciles_historical_rollback_activation
 test_forward_recovery_requires_recorded_bundle
 test_invalid_ports_fail_before_activation
+test_effective_compose_rejects_loopback_app_binding
+test_effective_compose_accepts_default_public_app_binding
+test_effective_compose_rejects_swapped_bindings
+test_verify_accepts_dual_stack_public_app_binding
+test_update_preserves_control_plane_listener_override
+test_update_rejects_symlinked_control_plane_listener_override
+test_update_rejects_partial_control_plane_listener_override
 test_verify_rejects_all_unsafe_runtime_bindings
 test_rejects_invalid_manifest_signature
 test_rejects_out_of_order_manifest_schema

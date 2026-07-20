@@ -2,6 +2,7 @@
 
 namespace App\Providers;
 
+use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
 use App\Models\User;
 use Illuminate\Support\Facades\Gate;
 use Laravel\Telescope\IncomingEntry;
@@ -46,6 +47,8 @@ class TelescopeServiceProvider extends TelescopeApplicationServiceProvider
             'cookie',
             'x-csrf-token',
             'x-xsrf-token',
+            strtolower(ControlPlaneDynamicConfiguration::HEALTH_PROOF_HEADER),
+            strtolower(ControlPlaneDynamicConfiguration::AUTHENTICATION_PROXY_PROOF_HEADER),
         ]);
     }
 

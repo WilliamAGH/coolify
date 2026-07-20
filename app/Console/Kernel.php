@@ -151,6 +151,7 @@ class Kernel extends ConsoleKernel
     protected function commands(): void
     {
         Actions::registerCommands(app_path('Actions/Application/BlueGreen'));
+        Actions::registerCommands(app_path('Actions/Proxy/ControlPlane'));
         $this->load(__DIR__.'/Commands');
 
         require base_path('routes/console.php');

@@ -682,7 +682,7 @@ class PushServerUpdateJob implements ShouldBeEncrypted, ShouldQueue, Silenced
             if ($this->foundProxy === false) {
                 try {
                     if (CheckProxy::run($this->server)) {
-                        StartProxy::run($this->server, async: false);
+                        StartProxy::dispatch($this->server);
                         $this->server->team?->notify(new ContainerRestarted('coolify-proxy', $this->server));
                     }
                 } catch (\Throwable $e) {

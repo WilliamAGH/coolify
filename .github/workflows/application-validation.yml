@@ -78,6 +78,12 @@ jobs:
             tests/Unit/UpdateCoolifyTest.php \
             tests/Feature/ForkVersionConsumerTest.php \
             tests/Feature/UpgradeComponentTest.php
+      - name: Run native Traefik control-plane tests
+        run: |
+          php artisan test --compact \
+            tests/Feature/InspectProxyMutationQueueTest.php \
+            tests/Feature/Proxy/ControlPlane \
+            tests/Unit/Actions/Proxy/ControlPlane
 
   blue-green-lifecycle:
     name: Blue-green lifecycle (PostgreSQL)
@@ -148,15 +154,24 @@ jobs:
             tests/Feature/BlueGreenFoundationMigrationReplayTest.php \
             tests/Feature/BlueGreenFoundationPersistenceTest.php \
             tests/Feature/BlueGreenMigrationReplayTest.php \
+            tests/Feature/DatabaseMigrationReadinessTest.php \
             tests/Feature/BlueGreenOperationFencingTest.php \
             tests/Feature/BlueGreenSupersessionGenerationTest.php \
             tests/Feature/DeleteResourceJobBlueGreenTest.php \
+            tests/Feature/LegacyProxyMutationPayloadAdoptionTest.php \
+            tests/Feature/ProxyMutationQueueGateTest.php \
+            tests/Feature/QueueApplicationDeploymentCommitTest.php \
             tests/Feature/QueueServerDeletionTest.php \
             tests/Feature/ScheduleOnOneServerTest.php \
             tests/Unit/Actions/Application/BlueGreen/BlueGreenDeploymentLockTest.php \
             tests/Unit/Actions/Application/BlueGreen/BlueGreenOperationFenceTest.php \
             tests/Unit/Actions/Application/BlueGreen/ExecuteBlueGreenDestinationMutationTest.php \
-            tests/Unit/Actions/Application/BlueGreenPublicRecoveryTest.php
+            tests/Unit/Actions/Application/BlueGreenPublicRecoveryTest.php \
+            tests/Unit/ApplicationDeploymentActivationOrderTest.php \
+            tests/Unit/ProxyMutationQueueTest.php \
+            tests/Unit/ScheduledJobsRetryConfigTest.php
+      - name: Validate deployment activation configuration fence
+        run: php artisan test --compact tests/Unit/DeploymentConfiguration/ApplicationConfigurationSnapshotTest.php --filter='fences deployment command'
 
   browser:
     name: Pest browser tests
@@ -282,6 +297,10 @@ jobs:
         run: |
           tests/Integration/PublishLinuxImageScriptTest.sh
           tests/Integration/ReleaseOperationalFixturesTest.sh
+      - name: Verify database migration S6 exit propagation
+        run: tests/Integration/DatabaseMigrationS6/run.sh
+      - name: Run native Traefik runtime integration
+        run: tests/Integration/ControlPlaneTraefik/run.sh
       - name: Require immutable external action and container references
         shell: bash
         run: |

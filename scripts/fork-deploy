@@ -322,7 +322,7 @@ preflight() {
             die 'run as root (or set COOLIFY_ALLOW_NON_ROOT=true only with FORK_DEPLOY_TEST_MODE=true)'
         fi
     fi
-    for command in docker curl sha256sum flock awk grep openssl ssh-keygen mktemp stat find \
+    for command in docker curl sha256sum flock awk grep jq openssl ssh-keygen mktemp stat find \
         sed date sort wc tr; do
         require_command "$command"
     done
@@ -433,7 +433,7 @@ write_overlay() {
         printf '  coolify:\n'
         printf '    image: "%s"\n' "$main_ref"
         printf '    ports: !override\n'
-        printf '%s\n' "      - \"127.0.0.1:\${APP_PORT:-8000}:8080\""
+        printf '%s\n' "      - \"\${APP_PORT:-8000}:8080\""
         printf '    environment:\n'
         printf '      AUTOUPDATE: "false"\n'
         printf '  soketi:\n'
@@ -532,7 +532,7 @@ bootstrap_directories() {
     for directory in \
         "$ROOT" "$SOURCE_DIR" "$ROOT/ssh" "$ROOT/ssh/keys" "$ROOT/ssh/mux" \
         "$ROOT/applications" "$ROOT/databases" "$ROOT/backups" "$ROOT/services" \
-        "$ROOT/proxy" "$ROOT/proxy/dynamic" "$ROOT/sentinel"; do
+        "$ROOT/proxy" "$ROOT/proxy/dynamic" "$ROOT/control-plane-attestor" "$ROOT/sentinel"; do
         require_directory_or_missing "$directory" 'Coolify data directory'
         if [[ ! -e $directory ]]; then
             mkdir "$directory"
@@ -557,7 +557,7 @@ enforce_data_permissions() {
     if "$DRY_RUN"; then note "PLAN: enforce 9999:root ownership and 0700 modes below $ROOT"; return 0; fi
     chown root:root "$ROOT"
     chmod 0711 "$ROOT"
-    for directory in source applications databases backups services proxy sentinel; do
+    for directory in source applications databases backups services proxy control-plane-attestor sentinel; do
         [[ -e $ROOT/$directory ]] || continue
         fd_assert_tree_safe_for_privileged_mutation "$ROOT/$directory" "Coolify $directory tree"
         chown -R 9999:root "$ROOT/$directory"
@@ -1256,21 +1256,44 @@ fd_prepare_staged_environment() {
     set_env_value "$environment" RELEASES_URL "$DISABLED_RELEASES_URL"
 }
 
-fd_compose_in() {
+fd_control_plane_listener_override() {
+    local directory=$1
+    local path=$directory/docker-compose.control-plane-listener.yml
+
+    if [[ -e $path || -L $path ]]; then
+        require_regular_file "$path" 'control-plane listener Compose override'
+        awk '
+            $0 ~ /^  coolify:[[:space:]]*$/ { in_coolify = 1; next }
+            in_coolify && $0 ~ /^  [^[:space:]]/ { exit }
+            in_coolify && $0 ~ /^    ports:[[:space:]]*!reset[[:space:]]*\[\][[:space:]]*$/ {
+                found = 1
+                exit
+            }
+            END { exit !found }
+        ' "$path" || die 'control-plane listener Compose override must reset Coolify ports'
+        printf '%s\n' "$path"
+    fi
+
+    return 0
+}
+
+fd_compose_base_in() {
     local directory=$1
     shift
 
     docker compose --env-file "$directory/.env" --file "$directory/docker-compose.yml" --file "$directory/docker-compose.prod.yml" --file "$directory/docker-compose.custom.yml" "$@"
 }
 
-fd_count() {
-    local value=$1 needle=$2 count=0
+fd_compose_in() {
+    local directory=$1 listener_override
+    shift
 
-    while [[ $value == *"$needle"* ]]; do
-        value=${value#*"$needle"}
-        count=$((count + 1))
-    done
-    printf '%s\n' "$count"
+    listener_override=$(fd_control_plane_listener_override "$directory")
+    if [[ -n $listener_override ]]; then
+        fd_compose_base_in "$directory" --file "$listener_override" "$@"
+    else
+        fd_compose_base_in "$directory" "$@"
+    fi
 }
 
 fd_validate_effective_images() {
@@ -1297,33 +1320,66 @@ fd_validate_effective_images() {
 }
 
 fd_validate_effective_bindings() {
-    local directory=$1 json compact remainder host_ip count=0 target app_port soketi_port
+    local directory=$1 json app_port soketi_port listener_override
 
+    listener_override=$(fd_control_plane_listener_override "$directory")
     app_port=$(env_value "$directory/.env" APP_PORT)
     soketi_port=$(env_value "$directory/.env" SOKETI_PORT)
     validate_port "$app_port" APP_PORT
     validate_port "$soketi_port" SOKETI_PORT
     [[ $app_port != "$soketi_port" && $app_port != 6002 && $soketi_port != 6002 ]] || die 'APP_PORT, SOKETI_PORT, and the fixed Soketi metrics port 6002 must be distinct'
     json=$(fd_compose_in "$directory" config --format json) || die 'could not render effective Compose port bindings'
-    compact=${json//[[:space:]]/}
-    remainder=$compact
-    while [[ $remainder == *'"host_ip":'* ]]; do
-        remainder=${remainder#*'"host_ip":'}
-        [[ $remainder == \"* ]] || die 'effective Compose has an invalid host_ip binding'
-        remainder=${remainder#\"}
-        host_ip=${remainder%%\"*}
-        remainder=${remainder#*\"}
-        [[ $host_ip == 127.0.0.1 ]] || die "effective Compose contains a non-loopback port binding: $host_ip"
-        count=$((count + 1))
-    done
-    [[ $count -eq 3 ]] || die "effective Compose must contain exactly three loopback port bindings, found $count"
-    for target in 8080 6001 6002; do
-        [[ $(fd_count "$compact" "\"target\":$target") -eq 1 ]] || die "effective Compose must contain exactly one loopback target port $target"
-    done
-    [[ $(fd_count "$compact" '"published":') -eq 3 ]] || die 'effective Compose must contain exactly three published ports'
-    for target in "$app_port" "$soketi_port" 6002; do
-        [[ $compact == *"\"published\":\"$target\""* || $compact == *"\"published\":$target"* ]] || die "effective Compose is missing loopback host port $target"
-    done
+    if [[ -n $listener_override ]]; then
+        jq -e --arg soketi_port "$soketi_port" '
+            def ports($service):
+                [.services[$service].ports[]? | {
+                    host_ip: (.host_ip // ""),
+                    published: (.published | tostring),
+                    target: (.target | tostring)
+                }];
+            def exact($ports; $host_ip; $published; $target):
+                ([$ports[] | select(
+                    .host_ip == $host_ip
+                    and .published == $published
+                    and .target == $target
+                )] | length) == 1;
+            ([.services[]?.ports[]?] | length) == 2
+            and (ports("coolify") | length) == 0
+            and (ports("soketi") as $ports
+                | ($ports | length) == 2
+                and exact($ports; "127.0.0.1"; $soketi_port; "6001")
+                and exact($ports; "127.0.0.1"; "6002"; "6002"))
+        ' <<<"$json" >/dev/null \
+            || die 'control-plane listener override must remove Coolify APP_PORT publication'
+    else
+        jq -e --arg app_port "$app_port" --arg soketi_port "$soketi_port" '
+            def ports($service):
+                [.services[$service].ports[]? | {
+                    host_ip: (.host_ip // ""),
+                    published: (.published | tostring),
+                    target: (.target | tostring)
+                }];
+            def exact($ports; $host_ip; $published; $target):
+                ([$ports[] | select(
+                    .host_ip == $host_ip
+                    and .published == $published
+                    and .target == $target
+                )] | length) == 1;
+            ([.services[]?.ports[]?] | length) == 3
+            and (ports("coolify") as $ports
+                | ($ports | length) == 1
+                and ([$ports[] | select(
+                    (.host_ip == "" or .host_ip == "0.0.0.0" or .host_ip == "::")
+                    and .published == $app_port
+                    and .target == "8080"
+                )] | length) == 1)
+            and (ports("soketi") as $ports
+                | ($ports | length) == 2
+                and exact($ports; "127.0.0.1"; $soketi_port; "6001")
+                and exact($ports; "127.0.0.1"; "6002"; "6002"))
+        ' <<<"$json" >/dev/null \
+            || die 'effective Compose must contain one public APP_PORT and two loopback realtime bindings'
+    fi
 }
 
 fd_validate_staging() {
@@ -1854,8 +1910,10 @@ fd_ensure_network() {
 }
 
 fd_validate_runtime_bindings() {
-    local app_port soketi_port container bindings runtime_port host_ip host_port app_seen=0 realtime_seen=0 metrics_seen=0
+    local app_port soketi_port container bindings runtime_port host_ip host_port app_seen=0 realtime_seen=0 metrics_seen=0 listener_override
+    local app_unspecified_seen=0 app_ipv4_seen=0 app_ipv6_seen=0
 
+    listener_override=$(fd_control_plane_listener_override "$SOURCE_DIR")
     app_port=$(env_value "$SOURCE_DIR/.env" APP_PORT)
     soketi_port=$(env_value "$SOURCE_DIR/.env" SOKETI_PORT)
     for container in coolify coolify-realtime coolify-db coolify-redis; do
@@ -1865,14 +1923,37 @@ fd_validate_runtime_bindings() {
         }
         while IFS=$'\t' read -r runtime_port host_ip host_port; do
             [[ -z $runtime_port ]] && continue
-            [[ $host_ip == 127.0.0.1 ]] || {
-                note "ERROR: $container $runtime_port binds to unsafe host IP $host_ip" >&2
-                return 1
-            }
             case "$container:$runtime_port:$host_port" in
-                "coolify:8080/tcp:$app_port") app_seen=$((app_seen + 1)) ;;
-                "coolify-realtime:6001/tcp:$soketi_port") realtime_seen=$((realtime_seen + 1)) ;;
-                'coolify-realtime:6002/tcp:6002') metrics_seen=$((metrics_seen + 1)) ;;
+                "coolify:8080/tcp:$app_port")
+                    case $host_ip in
+                        '') app_unspecified_seen=$((app_unspecified_seen + 1)) ;;
+                        0.0.0.0) app_ipv4_seen=$((app_ipv4_seen + 1)) ;;
+                        ::) app_ipv6_seen=$((app_ipv6_seen + 1)) ;;
+                        *)
+                            note "ERROR: $container $runtime_port does not use the public APP_PORT binding" >&2
+                            return 1
+                            ;;
+                    esac
+                    [[ $app_unspecified_seen -le 1 && $app_ipv4_seen -le 1 && $app_ipv6_seen -le 1 ]] || {
+                        note "ERROR: $container $runtime_port repeats a public APP_PORT binding" >&2
+                        return 1
+                    }
+                    app_seen=$((app_seen + 1))
+                    ;;
+                "coolify-realtime:6001/tcp:$soketi_port")
+                    [[ $host_ip == 127.0.0.1 ]] || {
+                        note "ERROR: $container $runtime_port binds to unsafe host IP $host_ip" >&2
+                        return 1
+                    }
+                    realtime_seen=$((realtime_seen + 1))
+                    ;;
+                'coolify-realtime:6002/tcp:6002')
+                    [[ $host_ip == 127.0.0.1 ]] || {
+                        note "ERROR: $container $runtime_port binds to unsafe host IP $host_ip" >&2
+                        return 1
+                    }
+                    metrics_seen=$((metrics_seen + 1))
+                    ;;
                 *)
                     note "ERROR: unexpected published runtime binding $container $runtime_port -> $host_ip:$host_port" >&2
                     return 1
@@ -1880,10 +1961,17 @@ fd_validate_runtime_bindings() {
             esac
         done <<<"$bindings"
     done
-    [[ $app_seen -eq 1 && $realtime_seen -eq 1 && $metrics_seen -eq 1 ]] || {
-        note 'ERROR: runtime bindings are missing or duplicated' >&2
-        return 1
-    }
+    if [[ -n $listener_override ]]; then
+        [[ $app_seen -eq 0 && $realtime_seen -eq 1 && $metrics_seen -eq 1 ]] || {
+            note 'ERROR: enrolled control-plane source lets Coolify own APP_PORT or has invalid realtime bindings' >&2
+            return 1
+        }
+    else
+        [[ $app_seen -ge 1 && $app_seen -le 2 && $realtime_seen -eq 1 && $metrics_seen -eq 1 ]] || {
+            note 'ERROR: runtime bindings are missing or duplicated' >&2
+            return 1
+        }
+    fi
 }
 
 fd_verify_runtime() {
@@ -2019,7 +2107,7 @@ fd_disarm_recovery() {
 }
 
 fd_rendered_sha() {
-    fd_compose_in "$1" config | sha256sum | awk '{print $1}'
+    fd_compose_base_in "$1" config | sha256sum | awk '{print $1}'
 }
 
 fd_validate_active_assets() {

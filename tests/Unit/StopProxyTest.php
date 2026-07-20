@@ -1,69 +1,25 @@
 <?php
 
-// Test the proxy stop container cleanup logic
-it('ensures stop proxy includes wait loop for container removal', function () {
-    // This test verifies that StopProxy waits for container to be fully removed
-    // to prevent race conditions during restart operations
+use App\Actions\Proxy\StopProxy;
+use App\Models\Server;
+use App\Support\ProxyMutationQueue;
 
-    // Simulate the command sequence from StopProxy
-    $commands = [
-        'docker stop -t 30 coolify-proxy 2>/dev/null || true',
-        'docker rm -f coolify-proxy 2>/dev/null || true',
-        '# Wait for container to be fully removed',
-        'for i in {1..10}; do',
-        '    if ! docker ps -a --format "{{.Names}}" | grep -q "^coolify-proxy$"; then',
-        '        break',
-        '    fi',
-        '    sleep 1',
-        'done',
-    ];
+it('pins queued proxy stops to the canonical mutation lane', function () {
+    $job = StopProxy::makeJob(Mockery::mock(Server::class));
 
-    $commandsString = implode("\n", $commands);
-
-    // Verify the stop sequence includes all required components
-    expect($commandsString)->toContain('docker stop -t 30 coolify-proxy')
-        ->and($commandsString)->toContain('docker rm -f coolify-proxy')
-        ->and($commandsString)->toContain('for i in {1..10}; do')
-        ->and($commandsString)->toContain('if ! docker ps -a --format "{{.Names}}" | grep -q "^coolify-proxy$"')
-        ->and($commandsString)->toContain('break')
-        ->and($commandsString)->toContain('sleep 1');
-
-    // Verify order: stop before remove, and wait loop after remove
-    $stopPosition = strpos($commandsString, 'docker stop');
-    $removePosition = strpos($commandsString, 'docker rm -f');
-    $waitLoopPosition = strpos($commandsString, 'for i in {1..10}');
-
-    expect($stopPosition)->toBeLessThan($removePosition)
-        ->and($removePosition)->toBeLessThan($waitLoopPosition);
+    expect(ProxyMutationQueue::isMarked($job))->toBeTrue()
+        ->and($job->connection)->toBe(ProxyMutationQueue::CONNECTION)
+        ->and($job->queue)->toBe(ProxyMutationQueue::NAME);
 });
 
-it('includes error suppression in stop proxy commands', function () {
-    // Test that stop/remove commands suppress errors gracefully
-
-    $commands = [
-        'docker stop -t 30 coolify-proxy 2>/dev/null || true',
-        'docker rm -f coolify-proxy 2>/dev/null || true',
-    ];
-
-    foreach ($commands as $command) {
-        expect($command)->toContain('2>/dev/null || true');
-    }
+it('exposes the canonical queue contract through the proxy stop action', function () {
+    expect(StopProxy::proxyMutationQueue())->toBe(ProxyMutationQueue::NAME);
 });
 
-it('uses configurable timeout for docker stop', function () {
-    // Verify that stop command includes the timeout parameter
+it('rejects a queued proxy stop retargeted outside canonical Redis', function () {
+    $job = StopProxy::makeJob(Mockery::mock(Server::class));
+    $job->onConnection('sync');
 
-    $timeout = 30;
-    $stopCommand = "docker stop -t $timeout coolify-proxy 2>/dev/null || true";
-
-    expect($stopCommand)->toContain('-t 30');
-});
-
-it('waits for swarm service container removal correctly', function () {
-    // Test that the container name pattern matches swarm naming
-
-    $containerName = 'coolify-proxy_traefik';
-    $checkCommand = "    if ! docker ps -a --format \"{{.Names}}\" | grep -q \"^$containerName$\"; then";
-
-    expect($checkCommand)->toContain('coolify-proxy_traefik');
+    expect(fn () => ProxyMutationQueue::assertUntamperedDispatchTarget($job))
+        ->toThrow(LogicException::class, 'cannot target connection');
 });

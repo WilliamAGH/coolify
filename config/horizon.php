@@ -1,5 +1,6 @@
 <?php
 
+use App\Jobs\ApplicationDeploymentJob;
 use App\Support\ProxyMutationQueue;
 use Illuminate\Support\Str;
 
@@ -86,6 +87,7 @@ return [
 
     'waits' => [
         'redis:default' => 60,
+        'redis:'.ApplicationDeploymentJob::QUEUE => 60,
         'redis:proxy-mutations' => 60,
     ],
 
@@ -187,7 +189,9 @@ return [
             'balance' => env('HORIZON_BALANCE', 'false'),
             'queue' => implode(',', array_filter(
                 array_map('trim', explode(',', (string) env('HORIZON_QUEUES', 'high,default'))),
-                static fn (string $queue): bool => $queue !== '' && $queue !== ProxyMutationQueue::NAME,
+                static fn (string $queue): bool => $queue !== ''
+                    && $queue !== ApplicationDeploymentJob::QUEUE
+                    && $queue !== ProxyMutationQueue::NAME,
             )),
             'maxTime' => env('HORIZON_MAX_TIME', 0),
             'maxJobs' => 400,
@@ -197,12 +201,28 @@ return [
             'sleep' => 3,
             'timeout' => env('HORIZON_TIMEOUT', 36000),
         ],
+        // Production contract: proxy mutations are globally serialized by exactly one worker.
+        // Keep this fixed rather than restoring HORIZON_PROXY_MUTATION_MAX_PROCESSES.
         'proxy-mutations' => [
             'connection' => 'redis',
             'balance' => false,
             'queue' => ProxyMutationQueue::NAME,
             'minProcesses' => 1,
-            'maxProcesses' => env('HORIZON_PROXY_MUTATION_MAX_PROCESSES', 4),
+            'maxProcesses' => 1,
+            'maxTime' => env('HORIZON_MAX_TIME', 0),
+            'maxJobs' => 400,
+            'memory' => 128,
+            'tries' => 1,
+            'nice' => 0,
+            'sleep' => 3,
+            'timeout' => env('HORIZON_TIMEOUT', 36000),
+        ],
+        'application-deployments' => [
+            'connection' => 'redis',
+            'balance' => false,
+            'queue' => ApplicationDeploymentJob::QUEUE,
+            'minProcesses' => 1,
+            'maxProcesses' => env('HORIZON_DEPLOYMENT_MAX_PROCESSES', 4),
             'maxTime' => env('HORIZON_MAX_TIME', 0),
             'maxJobs' => 400,
             'memory' => 128,

@@ -52,3 +52,17 @@ it('falls back when guarded fork bundled metadata cannot be read', function () {
     expect(get_latest_sentinel_version())->toBe('0.0.0');
     Http::assertNothingSent();
 });
+
+it('resolves the exact Traefik image from guarded fork metadata', function () {
+    config(['constants.coolify.version' => '4.13.1-fork']);
+    Cache::put('coolify:versions:all', [
+        'traefik' => ['v3.6' => '3.6.11'],
+    ], 3600);
+
+    expect(get_exact_traefik_image())->toBe('traefik:3.6.23');
+});
+
+it('rejects a Traefik branch without an exact owned release', function () {
+    expect(fn () => get_exact_traefik_image('v9.9'))
+        ->toThrow(RuntimeException::class, 'exact Traefik version');
+});

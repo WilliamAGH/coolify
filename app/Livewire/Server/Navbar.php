@@ -76,6 +76,7 @@ class Navbar extends Component
 
             // Always use background job for all servers
             RestartProxyJob::dispatch($this->server);
+            $this->dispatch('info', 'Proxy restart initiated. Monitor progress in activity logs.');
 
         } catch (\Throwable $e) {
             $this->restartInitiated = false;
@@ -99,8 +100,8 @@ class Navbar extends Component
     {
         try {
             $this->authorize('manageProxy', $this->server);
-            $activity = StartProxy::run($this->server, force: true);
-            $this->dispatch('activityMonitor', $activity->id);
+            StartProxy::dispatch($this->server, force: true);
+            $this->dispatch('info', 'Proxy start initiated. Monitor progress in activity logs.');
         } catch (\Throwable $e) {
             return handleError($e, $this);
         }

@@ -1,9 +1,12 @@
 <?php
 
+use App\Actions\Proxy\ControlPlane\CompileControlPlaneStaticProxyConfiguration;
+use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentPhase;
 use App\Actions\Proxy\SaveProxyConfiguration;
 use App\Enums\ProxyTypes;
 use App\Models\Application;
 use App\Models\Server;
+use App\Support\ValidationPatterns;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
 use Symfony\Component\Yaml\Yaml;
@@ -105,9 +108,15 @@ function collectDockerNetworksByServer(Server $server)
         'allNetworks' => $allNetworks,
     ];
 }
-function connectProxyToNetworks(Server $server)
+function connectProxyToNetworks(Server $server, array $requiredNetworks = [])
 {
     ['networks' => $networks] = collectDockerNetworksByServer($server);
+    foreach ($requiredNetworks as $requiredNetwork) {
+        if (! is_string($requiredNetwork) || ! ValidationPatterns::isValidDockerNetwork($requiredNetwork)) {
+            throw new InvalidArgumentException('Required proxy network name is invalid.');
+        }
+    }
+    $networks = $networks->merge($requiredNetworks)->unique();
     if ($server->isSwarm()) {
         $commands = $networks->map(function ($network) {
             $safe = escapeshellarg($network);
@@ -223,7 +232,7 @@ function extractCustomProxyCommands(Server $server, string $existing_config): ar
 
     return $custom_commands;
 }
-function generateDefaultProxyConfiguration(Server $server, array $custom_commands = [])
+function generateDefaultProxyConfiguration(Server $server, array $custom_commands = [], bool $save = true): ?string
 {
     Log::info('Generating default proxy configuration', [
         'server_id' => $server->id,
@@ -278,7 +287,7 @@ function generateDefaultProxyConfiguration(Server $server, array $custom_command
             'services' => [
                 'traefik' => [
                     'container_name' => 'coolify-proxy',
-                    'image' => 'traefik:v3.6',
+                    'image' => get_exact_traefik_image(),
                     'restart' => RESTART_MODE,
                     'extra_hosts' => [
                         'host.docker.internal:host-gateway',
@@ -396,7 +405,22 @@ function generateDefaultProxyConfiguration(Server $server, array $custom_command
     }
 
     $config = Yaml::dump($config, 12, 2);
-    SaveProxyConfiguration::run($server, $config);
+    $enrollment = $server->controlPlaneProxyEnrollmentState();
+    if ($enrollment !== null) {
+        $config = match ($enrollment->phase) {
+            ControlPlaneProxyEnrollmentPhase::Preparing,
+            ControlPlaneProxyEnrollmentPhase::Prepared => $enrollment->staticPredecessorBytes,
+            ControlPlaneProxyEnrollmentPhase::RollingBack,
+            ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement => $enrollment->staticPredecessorBytes,
+            ControlPlaneProxyEnrollmentPhase::Enrolled => (new CompileControlPlaneStaticProxyConfiguration)
+                ->compileProxyConfiguration($config, $enrollment->exposure),
+            ControlPlaneProxyEnrollmentPhase::RolledBack => $config,
+            default => $enrollment->staticReplacementBytes,
+        };
+    }
+    if ($save) {
+        SaveProxyConfiguration::run($server, $config);
+    }
 
     return $config;
 }

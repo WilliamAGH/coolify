@@ -118,11 +118,10 @@ class WriteBlueGreenProxyConfiguration
             '  repair_checksum=$(sha256sum "$repair_stage")',
             '  test "${repair_checksum%% *}" = '.escapeshellarg($configuration->sha256),
             '  chmod 600 "$repair_stage"',
-            '  sync -f "$repair_stage"',
-            '  mv -f -- "$repair_stage" '.$safeActivePath,
-            '  sync -f '.escapeshellarg($directory),
+            '  durable_remote_replace "$repair_stage" '.$safeActivePath.' '.escapeshellarg($directory),
             '  trap - 0 HUP INT TERM',
             'fi',
+            'durable_remote_reaffirm '.$safeActivePath.' '.escapeshellarg($directory),
             ...$this->assertStateSidecarCommands($state, $statePath),
             ...$this->assertManagedFileCommands($state, $activePath),
             'printf %s "$repair_outcome"',
@@ -322,10 +321,9 @@ class WriteBlueGreenProxyConfiguration
             ...$this->indent([
                 ...$this->validateRollbackArtifactCommands($artifactPath, $rollbackKey),
                 ...$this->discardDecodedRollbackCommands(),
-                'rm -f -- '.$safeArtifactPath,
-                'sync -f '.escapeshellarg(dirname($artifactPath)),
             ]),
             'fi',
+            'durable_remote_remove '.$safeArtifactPath.' '.escapeshellarg(dirname($artifactPath)),
         ]);
     }
 
@@ -492,6 +490,7 @@ class WriteBlueGreenProxyConfiguration
         return [
             'set -eu',
             'umask 077',
+            ...DurableRemoteArtifact::shellFunctions(),
             'mkdir -p -- '.escapeshellarg($this->dynamicDirectory($proxyPath)),
             ...$this->exclusiveManagedFileLockCommands($proxyPath, $managedFilename),
             ...$this->repairPendingMutationJournalCommands($proxyPath, $managedFilename),
@@ -584,6 +583,10 @@ class WriteBlueGreenProxyConfiguration
 
         return [
             'if '.$stateCondition.' && '.$managedCondition.'; then',
+            '  durable_remote_reaffirm '.escapeshellarg($statePath).' '.escapeshellarg(dirname($statePath)),
+            ...$this->indent($state->managedSha256 === null
+                ? ['durable_remote_remove '.escapeshellarg($activePath).' '.escapeshellarg(dirname($activePath))]
+                : ['durable_remote_reaffirm '.escapeshellarg($activePath).' '.escapeshellarg(dirname($activePath))]),
             ...$this->indent($replayCommands),
             'fi',
         ];
@@ -690,9 +693,7 @@ class WriteBlueGreenProxyConfiguration
             '    printf \'\\n\'',
             '  } > "$mutation_journal_stage"',
             '  chmod 600 "$mutation_journal_stage"',
-            '  sync -f "$mutation_journal_stage"',
-            '  mv -f -- "$mutation_journal_stage" '.$safeJournalPath,
-            '  sync -f '.escapeshellarg($directory),
+            '  durable_remote_replace "$mutation_journal_stage" '.$safeJournalPath.' '.escapeshellarg($directory),
             '  trap - 0 HUP INT TERM',
             'fi',
         ];
@@ -767,14 +768,12 @@ class WriteBlueGreenProxyConfiguration
 
         return [
             'if [ "$mutation_journal_replacement_file_state" = missing ]; then',
-            '  rm -f -- '.escapeshellarg($activePath),
+            '  durable_remote_remove '.escapeshellarg($activePath).' '.escapeshellarg($directory),
             'else',
             '  mutation_managed_stage=$(mktemp '.escapeshellarg($directory.'/.blue-green-managed.XXXXXX').')',
             '  cp -- "$mutation_journal_decoded" "$mutation_managed_stage"',
-            '  sync -f "$mutation_managed_stage"',
-            '  mv -f -- "$mutation_managed_stage" '.escapeshellarg($activePath),
+            '  durable_remote_replace "$mutation_managed_stage" '.escapeshellarg($activePath).' '.escapeshellarg($directory),
             'fi',
-            'sync -f '.escapeshellarg($directory),
         ];
     }
 
@@ -787,9 +786,7 @@ class WriteBlueGreenProxyConfiguration
             'mutation_state_stage=$(mktemp '.escapeshellarg($directory.'/.blue-green-state-repair.XXXXXX').')',
             'cp -- "$mutation_journal_replacement_state_decoded" "$mutation_state_stage"',
             'chmod 600 "$mutation_state_stage"',
-            'sync -f "$mutation_state_stage"',
-            'mv -f -- "$mutation_state_stage" '.escapeshellarg($statePath),
-            'sync -f '.escapeshellarg($directory),
+            'durable_remote_replace "$mutation_state_stage" '.escapeshellarg($statePath).' '.escapeshellarg($directory),
         ];
     }
 
@@ -797,8 +794,8 @@ class WriteBlueGreenProxyConfiguration
     private function cleanupMutationJournalCommands(string $journalPath): array
     {
         return [
-            'rm -f -- "${mutation_journal_decoded:-}" "${mutation_journal_expected_state_decoded:-}" "${mutation_journal_replacement_state_decoded:-}" '.escapeshellarg($journalPath),
-            'sync -f '.escapeshellarg(dirname($journalPath)),
+            'rm -f -- "${mutation_journal_decoded:-}" "${mutation_journal_expected_state_decoded:-}" "${mutation_journal_replacement_state_decoded:-}"',
+            'durable_remote_remove '.escapeshellarg($journalPath).' '.escapeshellarg(dirname($journalPath)),
             'trap - 0 HUP INT TERM',
         ];
     }
@@ -842,9 +839,7 @@ class WriteBlueGreenProxyConfiguration
             '  printf \'%s\\n\' '.escapeshellarg(base64_encode($completionScript)),
             '} > "$container_journal_stage"',
             'chmod 600 "$container_journal_stage"',
-            'sync -f "$container_journal_stage"',
-            'mv -f -- "$container_journal_stage" '.$safeJournalPath,
-            'sync -f '.escapeshellarg($directory),
+            'durable_remote_replace "$container_journal_stage" '.$safeJournalPath.' '.escapeshellarg($directory),
             'trap - 0 HUP INT TERM',
         ];
     }
@@ -941,12 +936,10 @@ class WriteBlueGreenProxyConfiguration
             '    container_state_stage=$(mktemp '.escapeshellarg($directory.'/.blue-green-container-state.XXXXXX').')',
             '    cp -- "$container_journal_replacement_state_decoded" "$container_state_stage"',
             '    chmod 600 "$container_state_stage"',
-            '    sync -f "$container_state_stage"',
-            '    mv -f -- "$container_state_stage" '.$safeStatePath,
-            '    sync -f '.escapeshellarg($directory),
+            '    durable_remote_replace "$container_state_stage" '.$safeStatePath.' '.escapeshellarg($directory),
             '  fi',
-            '  rm -f -- "$container_journal_expected_state_decoded" "$container_journal_replacement_state_decoded" "$container_journal_mutation_decoded" "$container_journal_completion_decoded" '.$safeJournalPath,
-            '  sync -f '.escapeshellarg($directory),
+            '  rm -f -- "$container_journal_expected_state_decoded" "$container_journal_replacement_state_decoded" "$container_journal_mutation_decoded" "$container_journal_completion_decoded"',
+            '  durable_remote_remove '.$safeJournalPath.' '.escapeshellarg($directory),
             '  trap - 0 HUP INT TERM',
             'fi',
         ];
@@ -1042,9 +1035,7 @@ class WriteBlueGreenProxyConfiguration
             '    printf \'\\n\'',
             '  } > "$rollback_stage"',
             '  chmod 600 "$rollback_stage"',
-            '  sync -f "$rollback_stage"',
-            '  mv -f -- "$rollback_stage" '.$safeArtifactPath,
-            '  sync -f '.escapeshellarg($directory),
+            '  durable_remote_replace "$rollback_stage" '.$safeArtifactPath.' '.escapeshellarg($directory),
             '  rm -f -- "$rollback_source"',
             '  trap - 0 HUP INT TERM',
             'fi',
@@ -1120,9 +1111,7 @@ class WriteBlueGreenProxyConfiguration
             'state_checksum=$(sha256sum "$state_stage")',
             'test "${state_checksum%% *}" = '.escapeshellarg(hash('sha256', $serialized)),
             'chmod 600 "$state_stage"',
-            'sync -f "$state_stage"',
-            'mv -f -- "$state_stage" '.escapeshellarg($statePath),
-            'sync -f '.escapeshellarg($directory),
+            'durable_remote_replace "$state_stage" '.escapeshellarg($statePath).' '.escapeshellarg($directory),
             'trap - 0 HUP INT TERM',
         ];
     }

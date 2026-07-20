@@ -3,6 +3,7 @@
 namespace App\Models;
 
 use App\Casts\EncryptedArrayCast;
+use App\Enums\ApplicationDeploymentExecutionPhase;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
@@ -102,6 +103,8 @@ class ApplicationDeploymentQueue extends Model
         'blue_green_candidate_container_id',
         'blue_green_rollback_managed_filename',
         'blue_green_routing_mutated_at',
+        'execution_phase',
+        'prepared_activation_payload',
     ];
 
     /**
@@ -116,6 +119,7 @@ class ApplicationDeploymentQueue extends Model
         'logs',
         'configuration_snapshot',
         'configuration_diff',
+        'prepared_activation_payload',
     ];
 
     protected $casts = [
@@ -123,6 +127,8 @@ class ApplicationDeploymentQueue extends Model
         'finished_at' => 'datetime',
         'configuration_snapshot' => EncryptedArrayCast::class,
         'configuration_diff' => EncryptedArrayCast::class,
+        'execution_phase' => ApplicationDeploymentExecutionPhase::class,
+        'prepared_activation_payload' => EncryptedArrayCast::class,
         'blue_green_color' => BlueGreenDeploymentColor::class,
         'blue_green_phase' => BlueGreenDeploymentPhase::class,
         'blue_green_routing_revision' => 'integer',
@@ -259,8 +265,198 @@ class ApplicationDeploymentQueue extends Model
         return true;
     }
 
-    public function deferLiveDispatchRecovery(Carbon $staleBefore, string $dispatchAttemptUuid): bool
+    public function recordPreparationBuildServer(string $dispatchAttemptUuid, int $buildServerId): bool
     {
+        if (! Str::isUuid($dispatchAttemptUuid)) {
+            throw new \InvalidArgumentException('The deployment dispatch attempt must be a valid UUID.');
+        }
+        if ($buildServerId < 1) {
+            throw new \InvalidArgumentException('The deployment build server identity must be positive.');
+        }
+
+        $updated = self::query()
+            ->whereKey($this->getKey())
+            ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
+            ->where('execution_phase', ApplicationDeploymentExecutionPhase::Prepare->value)
+            ->where('horizon_job_id', $dispatchAttemptUuid)
+            ->whereNotNull('horizon_job_worker')
+            ->update(['build_server_id' => $buildServerId]);
+
+        if ($updated !== 1) {
+            return false;
+        }
+
+        $this->setAttribute('build_server_id', $buildServerId);
+        $this->syncOriginalAttribute('build_server_id');
+
+        return true;
+    }
+
+    public function releaseCurrentProcessOwnership(string $dispatchAttemptUuid, string $processId): bool
+    {
+        if (! Str::isUuid($dispatchAttemptUuid)) {
+            throw new \InvalidArgumentException('The deployment dispatch attempt must be a valid UUID.');
+        }
+        if (blank($processId)) {
+            throw new \InvalidArgumentException('The deployment process identity cannot be empty.');
+        }
+
+        $updated = self::query()
+            ->whereKey($this->getKey())
+            ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
+            ->where('horizon_job_id', $dispatchAttemptUuid)
+            ->where('current_process_id', $processId)
+            ->update(['current_process_id' => null]);
+
+        if ($updated !== 1) {
+            return false;
+        }
+
+        $this->setAttribute('current_process_id', null);
+        $this->syncOriginalAttribute('current_process_id');
+
+        return true;
+    }
+
+    public function claimCurrentProcessOwnership(string $dispatchAttemptUuid, string $processId): bool
+    {
+        if (! Str::isUuid($dispatchAttemptUuid)) {
+            throw new \InvalidArgumentException('The deployment dispatch attempt must be a valid UUID.');
+        }
+        if (blank($processId)) {
+            throw new \InvalidArgumentException('The deployment process identity cannot be empty.');
+        }
+
+        $updated = self::query()
+            ->whereKey($this->getKey())
+            ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
+            ->where('horizon_job_id', $dispatchAttemptUuid)
+            ->whereNull('current_process_id')
+            ->update(['current_process_id' => $processId]);
+
+        if ($updated !== 1) {
+            return false;
+        }
+
+        $this->setAttribute('current_process_id', $processId);
+        $this->syncOriginalAttribute('current_process_id');
+
+        return true;
+    }
+
+    /**
+     * @param  array<string, mixed>  $preparedActivationPayload
+     */
+    public function handoffToActivation(
+        string $prepareAttemptUuid,
+        string $prepareWorker,
+        array $preparedActivationPayload,
+    ): ?string {
+        if (! Str::isUuid($prepareAttemptUuid)) {
+            throw new \InvalidArgumentException('The deployment preparation attempt must be a valid UUID.');
+        }
+        if (blank($prepareWorker)) {
+            throw new \InvalidArgumentException('The deployment preparation worker identity cannot be empty.');
+        }
+        $this->assertPreparedActivationPayload($preparedActivationPayload);
+
+        return DB::transaction(function () use ($prepareAttemptUuid, $prepareWorker, $preparedActivationPayload): ?string {
+            $deployment = self::query()
+                ->whereKey($this->getKey())
+                ->lockForUpdate()
+                ->first();
+            if ($deployment === null
+                || $deployment->status !== ApplicationDeploymentStatus::IN_PROGRESS->value
+                || $deployment->execution_phase !== ApplicationDeploymentExecutionPhase::Prepare
+                || $deployment->horizon_job_id !== $prepareAttemptUuid
+                || $deployment->horizon_job_worker !== $prepareWorker
+                || $deployment->current_process_id !== null
+                || $deployment->finished_at !== null) {
+                return null;
+            }
+            $deployment->assertPreparedActivationPayload($preparedActivationPayload);
+
+            $activationAttemptUuid = (string) Str::uuid();
+            $handoffAt = now();
+            $updated = self::query()
+                ->whereKey($deployment->getKey())
+                ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
+                ->where('execution_phase', ApplicationDeploymentExecutionPhase::Prepare->value)
+                ->where('horizon_job_id', $prepareAttemptUuid)
+                ->where('horizon_job_worker', $prepareWorker)
+                ->whereNull('current_process_id')
+                ->whereNull('finished_at')
+                ->update([
+                    'execution_phase' => ApplicationDeploymentExecutionPhase::Activate->value,
+                    'prepared_activation_payload' => (new EncryptedArrayCast)->set(
+                        $deployment,
+                        'prepared_activation_payload',
+                        $preparedActivationPayload,
+                        $deployment->getAttributes(),
+                    ),
+                    'horizon_job_id' => $activationAttemptUuid,
+                    'horizon_job_worker' => null,
+                    'updated_at' => $handoffAt,
+                ]);
+            if ($updated !== 1) {
+                return null;
+            }
+
+            $this->setAttribute('execution_phase', ApplicationDeploymentExecutionPhase::Activate);
+            $this->setAttribute('prepared_activation_payload', $preparedActivationPayload);
+            $this->setAttribute('horizon_job_id', $activationAttemptUuid);
+            $this->setAttribute('horizon_job_worker', null);
+            $this->setAttribute('updated_at', $handoffAt);
+            $this->syncOriginalAttributes([
+                'execution_phase',
+                'prepared_activation_payload',
+                'horizon_job_id',
+                'horizon_job_worker',
+                'updated_at',
+            ]);
+
+            return $activationAttemptUuid;
+        }, attempts: 5);
+    }
+
+    /** @param array<string, mixed> $artifact @return array<string, mixed> */
+    public function makePreparedActivationPayload(array $artifact): array
+    {
+        ksort($artifact);
+        $identity = [
+            'deployment_id' => (int) $this->getKey(),
+            'application_id' => (int) $this->application_id,
+            'server_id' => (int) $this->server_id,
+            'destination_id' => (int) $this->destination_id,
+            'prepared_commit' => $this->commit,
+            'artifact' => $artifact,
+        ];
+        $encodedIdentity = json_encode($identity, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
+
+        return [
+            'schema_version' => 1,
+            ...$identity,
+            'input_fingerprint' => hash('sha256', $encodedIdentity),
+        ];
+    }
+
+    /** @return array<string, mixed> */
+    public function validatedPreparedActivationPayload(): array
+    {
+        $deployment = $this->fresh();
+        if ($deployment === null || ! is_array($deployment->prepared_activation_payload)) {
+            throw new \RuntimeException('The deployment has no prepared activation payload.');
+        }
+        $deployment->assertPreparedActivationPayload($deployment->prepared_activation_payload);
+
+        return $deployment->prepared_activation_payload;
+    }
+
+    public function deferLiveDispatchRecovery(
+        Carbon $staleBefore,
+        string $dispatchAttemptUuid,
+        ?string $worker = null,
+    ): bool {
         if (! Str::isUuid($dispatchAttemptUuid)) {
             throw new \InvalidArgumentException('The live deployment dispatch attempt must be a valid UUID.');
         }
@@ -270,7 +466,11 @@ class ApplicationDeploymentQueue extends Model
             ->whereKey($this->getKey())
             ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
             ->where('horizon_job_id', $dispatchAttemptUuid)
-            ->whereNull('horizon_job_worker')
+            ->when(
+                $worker === null,
+                fn ($query) => $query->whereNull('horizon_job_worker'),
+                fn ($query) => $query->where('horizon_job_worker', $worker),
+            )
             ->whereNull('current_process_id')
             ->whereNull('blue_green_phase')
             ->where('updated_at', '<=', $staleBefore)
@@ -314,9 +514,11 @@ class ApplicationDeploymentQueue extends Model
             ->exists();
     }
 
-    public function reserveStaleDispatchRepublish(?Carbon $staleBefore = null): bool
-    {
-        return DB::transaction(function () use ($staleBefore): bool {
+    public function reserveStaleDispatchRepublish(
+        ?Carbon $staleBefore = null,
+        ?string $expectedWorker = null,
+    ): bool {
+        return DB::transaction(function () use ($staleBefore, $expectedWorker): bool {
             $application = Application::withTrashed()
                 ->whereKey($this->application_id)
                 ->lockForUpdate()
@@ -340,7 +542,7 @@ class ApplicationDeploymentQueue extends Model
                 ->first();
             if ($deployment === null
                 || $deployment->status !== ApplicationDeploymentStatus::IN_PROGRESS->value
-                || $deployment->horizon_job_worker !== null
+                || $deployment->horizon_job_worker !== $expectedWorker
                 || $deployment->current_process_id !== null
                 || $deployment->blue_green_phase !== null
                 || ($staleBefore !== null && ($deployment->updated_at === null || $deployment->updated_at->gt($staleBefore)))) {
@@ -348,14 +550,18 @@ class ApplicationDeploymentQueue extends Model
             }
 
             $dispatchAttemptUuid = $deployment->horizon_job_id;
-            if (! is_string($dispatchAttemptUuid) || ! Str::isUuid($dispatchAttemptUuid)) {
+            if ($expectedWorker !== null || ! is_string($dispatchAttemptUuid) || ! Str::isUuid($dispatchAttemptUuid)) {
                 $dispatchAttemptUuid = (string) Str::uuid();
             }
             $reservedAt = now();
             $reserved = self::query()
                 ->whereKey($deployment->getKey())
                 ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
-                ->whereNull('horizon_job_worker')
+                ->when(
+                    $expectedWorker === null,
+                    fn ($query) => $query->whereNull('horizon_job_worker'),
+                    fn ($query) => $query->where('horizon_job_worker', $expectedWorker),
+                )
                 ->whereNull('current_process_id')
                 ->whereNull('blue_green_phase')
                 ->when(
@@ -364,6 +570,7 @@ class ApplicationDeploymentQueue extends Model
                 )
                 ->update([
                     'horizon_job_id' => $dispatchAttemptUuid,
+                    'horizon_job_worker' => null,
                     'updated_at' => $reservedAt,
                 ]);
             if ($reserved !== 1) {
@@ -371,8 +578,9 @@ class ApplicationDeploymentQueue extends Model
             }
 
             $this->setAttribute('horizon_job_id', $dispatchAttemptUuid);
+            $this->setAttribute('horizon_job_worker', null);
             $this->setAttribute('updated_at', $reservedAt);
-            $this->syncOriginalAttributes(['horizon_job_id', 'updated_at']);
+            $this->syncOriginalAttributes(['horizon_job_id', 'horizon_job_worker', 'updated_at']);
 
             return true;
         }, attempts: 5);
@@ -387,6 +595,7 @@ class ApplicationDeploymentQueue extends Model
         ?Closure $findLiveDispatchAttemptUuids = null,
         ?Closure $onRecovered = null,
         int $limit = self::DISPATCH_RECOVERY_LIMIT_PER_RUN,
+        ?ApplicationDeploymentExecutionPhase $executionPhase = null,
     ): int {
         if ($staleAfterSeconds < 1) {
             throw new \InvalidArgumentException('The deployment dispatch stale window must be positive.');
@@ -398,16 +607,25 @@ class ApplicationDeploymentQueue extends Model
         $staleBefore = now()->subSeconds($staleAfterSeconds);
         $candidates = self::query()
             ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
-            ->whereNull('horizon_job_worker')
+            ->where(static fn ($query) => $query
+                ->whereNull('horizon_job_worker')
+                ->orWhere('horizon_job_worker', 'like', '________-____-____-____-____________'))
             ->whereNull('current_process_id')
             ->whereNull('blue_green_phase')
+            ->when(
+                $executionPhase !== null,
+                fn ($query) => $query->where('execution_phase', $executionPhase->value),
+            )
             ->where('updated_at', '<=', $staleBefore)
             ->orderBy('id')
             ->limit($limit)
-            ->get();
+            ->get()
+            ->filter(static fn (self $deployment): bool => $deployment->horizon_job_worker === null
+                || (is_string($deployment->horizon_job_worker) && Str::isUuid($deployment->horizon_job_worker)))
+            ->values();
 
         $candidateAttemptUuids = $candidates
-            ->pluck('horizon_job_id')
+            ->map(static fn (self $deployment): mixed => $deployment->horizon_job_worker ?? $deployment->horizon_job_id)
             ->filter(static fn (mixed $dispatchAttemptUuid): bool => is_string($dispatchAttemptUuid) && Str::isUuid($dispatchAttemptUuid))
             ->unique()
             ->values()
@@ -418,12 +636,17 @@ class ApplicationDeploymentQueue extends Model
 
         $recovered = 0;
         foreach ($candidates as $deployment) {
-            if (is_string($deployment->horizon_job_id) && isset($liveDispatchAttemptUuids[$deployment->horizon_job_id])) {
-                $deployment->deferLiveDispatchRecovery($staleBefore, $deployment->horizon_job_id);
+            $lookupUuid = $deployment->horizon_job_worker ?? $deployment->horizon_job_id;
+            if (is_string($lookupUuid) && isset($liveDispatchAttemptUuids[$lookupUuid])) {
+                $deployment->deferLiveDispatchRecovery(
+                    $staleBefore,
+                    (string) $deployment->horizon_job_id,
+                    $deployment->horizon_job_worker,
+                );
 
                 continue;
             }
-            if (! $deployment->reserveStaleDispatchRepublish($staleBefore)) {
+            if (! $deployment->reserveStaleDispatchRepublish($staleBefore, $deployment->horizon_job_worker)) {
                 continue;
             }
 
@@ -556,5 +779,33 @@ class ApplicationDeploymentQueue extends Model
             // Save without triggering events to prevent potential race conditions
             $this->saveQuietly();
         });
+    }
+
+    /** @param array<string, mixed> $payload */
+    private function assertPreparedActivationPayload(array $payload): void
+    {
+        $expectedIdentity = [
+            'deployment_id' => (int) $this->getKey(),
+            'application_id' => (int) $this->application_id,
+            'server_id' => (int) $this->server_id,
+            'destination_id' => (int) $this->destination_id,
+        ];
+        foreach ($expectedIdentity as $key => $value) {
+            if (($payload[$key] ?? null) !== $value) {
+                throw new \InvalidArgumentException("The prepared activation payload has an invalid {$key}.");
+            }
+        }
+        if (($payload['schema_version'] ?? null) !== 1
+            || ($payload['prepared_commit'] ?? null) !== $this->commit
+            || ! is_string($payload['input_fingerprint'] ?? null)
+            || preg_match('/\A[a-f0-9]{64}\z/D', $payload['input_fingerprint']) !== 1
+            || ! is_array($payload['artifact'] ?? null)) {
+            throw new \InvalidArgumentException('The prepared activation payload is malformed.');
+        }
+
+        $expectedPayload = $this->makePreparedActivationPayload($payload['artifact']);
+        if (! hash_equals($expectedPayload['input_fingerprint'], $payload['input_fingerprint'])) {
+            throw new \InvalidArgumentException('The prepared activation payload fingerprint is invalid.');
+        }
     }
 }

@@ -135,6 +135,22 @@ it('creates a team-scoped Resend client and sends the rendered message', functio
         ]);
 });
 
+it('throws a controlled error without creating a mail client when its team no longer exists', function () {
+    $missingTeamModel = Mockery::mock(Team::class);
+    $missingTeamModel->shouldReceive('find')->once()->with(1)->andReturnNull();
+
+    $channel = new EmailChannel(
+        static fn (string $_): never => throw new LogicException('The Resend client must not be created for a missing team.'),
+        $missingTeamModel,
+    );
+
+    expect(fn () => $channel->send($this->notifiable, $this->notification))
+        ->toThrow(
+            NonReportableException::class,
+            'Unable to send email notification because the team no longer exists.',
+        );
+});
+
 it('distinguishes a missing Resend API key from a restricted key', function () {
     $resendError = new ErrorException([
         'message' => 'Missing API key.',

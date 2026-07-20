@@ -4,10 +4,13 @@ namespace App\Jobs;
 
 use App\Actions\Proxy\GetProxyConfiguration;
 use App\Actions\Proxy\SaveProxyConfiguration;
+use App\Contracts\ProxyMutation;
 use App\Enums\ProxyTypes;
 use App\Events\ProxyStatusChangedUI;
 use App\Models\Server;
 use App\Services\ProxyDashboardCacheService;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeEncrypted;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -15,23 +18,30 @@ use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\Middleware\WithoutOverlapping;
 use Illuminate\Queue\SerializesModels;
+use Spatie\Activitylog\Models\Activity;
 
-class RestartProxyJob implements ShouldBeEncrypted, ShouldQueue
+class RestartProxyJob implements ProxyMutation, ShouldBeEncrypted, ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    use UsesProxyMutationQueue;
+
+    public const REMOTE_TIMEOUT_SECONDS = 600;
 
     public $tries = 1;
 
-    public $timeout = 120;
+    public $timeout = 660;
 
     public ?int $activity_id = null;
 
     public function middleware(): array
     {
-        return [(new WithoutOverlapping('restart-proxy-'.$this->server->uuid))->expireAfter(120)->dontRelease()];
+        return [(new WithoutOverlapping('restart-proxy-'.$this->server->uuid))->expireAfter(660)->dontRelease()];
     }
 
-    public function __construct(public Server $server) {}
+    public function __construct(public Server $server)
+    {
+        ProxyMutationQueue::assign($this);
+    }
 
     public function handle()
     {
@@ -44,18 +54,15 @@ class RestartProxyJob implements ShouldBeEncrypted, ShouldQueue
             // Build combined stop + start commands for a single activity
             $commands = $this->buildRestartCommands();
 
-            // Create activity and dispatch immediately - returns Activity right away
-            // The remote_process runs asynchronously, so UI gets activity ID instantly
-            $activity = remote_process(
+            remote_process(
                 $commands,
                 $this->server,
                 callEventOnFinish: 'ProxyStatusChanged',
-                callEventData: $this->server->id
+                callEventData: $this->server->id,
+                runSynchronously: true,
+                timeout: self::REMOTE_TIMEOUT_SECONDS,
+                onActivityCreated: $this->announceActivity(...),
             );
-
-            // Store activity ID and notify UI immediately with it
-            $this->activity_id = $activity->id;
-            ProxyStatusChangedUI::dispatch($this->server->team_id, $this->activity_id);
 
         } catch (\Throwable $e) {
             // Set error status
@@ -70,6 +77,12 @@ class RestartProxyJob implements ShouldBeEncrypted, ShouldQueue
 
             return handleError($e);
         }
+    }
+
+    private function announceActivity(Activity $activity): void
+    {
+        $this->activity_id = $activity->id;
+        ProxyStatusChangedUI::dispatch($this->server->team_id, $this->activity_id);
     }
 
     /**

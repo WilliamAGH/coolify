@@ -2,15 +2,25 @@
 
 namespace App\Actions\Proxy;
 
+use App\Contracts\ProxyMutation;
 use App\Events\ProxyStatusChanged;
 use App\Events\ProxyStatusChangedUI;
 use App\Models\Server;
 use App\Services\ProxyDashboardCacheService;
+use App\Support\ProxyMutationQueue;
+use App\Support\UsesProxyMutationQueue;
 use Lorisleiva\Actions\Concerns\AsAction;
+use Lorisleiva\Actions\Decorators\JobDecorator;
 
-class StopProxy
+class StopProxy implements ProxyMutation
 {
     use AsAction;
+    use UsesProxyMutationQueue;
+
+    public function configureJob(JobDecorator $job): void
+    {
+        ProxyMutationQueue::assign($job);
+    }
 
     public function handle(Server $server, bool $forceStop = true, int $timeout = 30, bool $restarting = false)
     {

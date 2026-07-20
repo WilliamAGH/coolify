@@ -1,0 +1,11 @@
+#!/bin/sh
+
+cd /var/www/html || exit 1
+
+if [ ! -d storage/app/control-plane-proxy ] || [ ! -d storage/app/control-plane-attestor ]; then
+    echo "   INFO  Control-plane Traefik attestor is not enrolled, sleeping."
+    exec sleep infinity
+fi
+
+echo "   INFO  Control-plane Traefik attestor is starting."
+exec scripts/control-plane-traefik-attestor watch

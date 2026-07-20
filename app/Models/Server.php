@@ -3,6 +3,9 @@
 namespace App\Models;
 
 use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
+use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentPhase;
+use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentState;
+use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
 use App\Actions\Proxy\StartProxy;
 use App\Actions\Server\InstallDocker;
 use App\Actions\Server\InstallPrerequisites;
@@ -226,7 +229,7 @@ class Server extends BaseModel
 
     protected function performUpdate(Builder $query): bool
     {
-        if (! $this->isDirty('proxy')) {
+        if (! $this->isDirty('proxy') || ! $this->proxyTypeChanged()) {
             return parent::performUpdate($query);
         }
 
@@ -239,6 +242,23 @@ class Server extends BaseModel
 
             return parent::performUpdate($query);
         }, attempts: 5);
+    }
+
+    private function proxyTypeChanged(): bool
+    {
+        $originalProxy = $this->getRawOriginal('proxy');
+        if (is_string($originalProxy)) {
+            try {
+                $originalProxy = json_decode($originalProxy, true, flags: JSON_THROW_ON_ERROR);
+            } catch (\JsonException) {
+                return true;
+            }
+        }
+        if (! is_array($originalProxy)) {
+            return true;
+        }
+
+        return data_get($originalProxy, 'type') !== $this->proxyType();
     }
 
     public function delete(): ?bool
@@ -676,6 +696,11 @@ class Server extends BaseModel
 
     public function setupDynamicProxyConfiguration()
     {
+        $enrollment = $this->controlPlaneProxyEnrollmentState();
+        if ($enrollment !== null && $enrollment->phase !== ControlPlaneProxyEnrollmentPhase::RolledBack) {
+            return;
+        }
+
         $settings = instanceSettings();
         $dynamic_config_path = $this->proxyPath().'/dynamic';
         if ($this->proxyType() === ProxyTypes::TRAEFIK->value) {
@@ -834,6 +859,19 @@ $schema://$host {
                 $this->reloadCaddy();
             }
         }
+    }
+
+    public function controlPlaneProxyEnrollmentState(): ?ControlPlaneProxyEnrollmentState
+    {
+        $state = $this->proxy->get(StoreControlPlaneProxyEnrollmentState::STATE_KEY);
+        if ($state === null) {
+            return null;
+        }
+        if (! is_array($state)) {
+            throw new \RuntimeException('The durable control-plane enrollment state is malformed.');
+        }
+
+        return ControlPlaneProxyEnrollmentState::fromArray($state);
     }
 
     public function reloadCaddy()
@@ -1727,11 +1765,7 @@ $schema://$host {
             $this->proxy->set('last_applied_settings', null);
             $this->save();
             if ($this->proxySet()) {
-                if ($async) {
-                    StartProxy::dispatch($this);
-                } else {
-                    StartProxy::run($this);
-                }
+                StartProxy::dispatch($this);
             }
         } else {
             throw new \Exception('Invalid proxy type.');

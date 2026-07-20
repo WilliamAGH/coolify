@@ -21,10 +21,7 @@ class SaveProxyConfiguration
         $old_hash = $server->proxy->get('last_saved_settings');
         $config_changed = $old_hash && $old_hash !== $new_hash;
 
-        // Update the saved settings hash and store full config as database backup
-        $server->proxy->last_saved_settings = $new_hash;
-        $server->proxy->last_saved_proxy_configuration = $configuration;
-        $server->save();
+        $this->persistDatabaseState($server, $configuration);
 
         $backup_path = "$proxy_path/backups";
 
@@ -45,5 +42,12 @@ class SaveProxyConfiguration
         $commands[] = "echo '$docker_compose_yml_base64' | base64 -d | tee $proxy_path/docker-compose.yml > /dev/null";
 
         instant_remote_process($commands, $server);
+    }
+
+    public function persistDatabaseState(Server $server, string $configuration): void
+    {
+        $server->proxy->last_saved_settings = md5(base64_encode($configuration));
+        $server->proxy->last_saved_proxy_configuration = $configuration;
+        $server->save();
     }
 }

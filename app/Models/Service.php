@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Actions\Proxy\RemoveProxyConnectedNetwork;
 use App\Enums\ProcessStatus;
 use App\Services\ContainerStatusAggregator;
 use App\Traits\ClearsGlobalSearchCache;
@@ -210,8 +211,7 @@ class Service extends BaseModel
     public function deleteConnectedNetworks()
     {
         $server = data_get($this, 'destination.server');
-        instant_remote_process(["docker network disconnect {$this->uuid} coolify-proxy"], $server, false);
-        instant_remote_process(["docker network rm {$this->uuid}"], $server, false);
+        RemoveProxyConnectedNetwork::dispatch($server, $this->uuid);
     }
 
     /**
