@@ -11,6 +11,9 @@ final readonly class BlueGreenRoutingTarget
 
     public const RELEASE_PROOF_HEADER = 'X-Coolify-Deployment';
 
+    /** @var non-empty-list<int> */
+    public array $ports;
+
     public static function managedFilename(string $applicationUuid, int $destinationId): string
     {
         return 'coolify-blue-green-'.self::routingScope($applicationUuid, $destinationId).'.yaml';
@@ -26,12 +29,35 @@ final readonly class BlueGreenRoutingTarget
         return self::routingNamePrefix($applicationUuid, $destinationId).'active';
     }
 
+    public static function activeServiceNameForPort(
+        string $applicationUuid,
+        int $destinationId,
+        int $port,
+        bool $multiplePorts,
+    ): string {
+        self::assertBackendPort($port);
+
+        return self::activeServiceName($applicationUuid, $destinationId).($multiplePorts ? "-{$port}" : '');
+    }
+
     public static function memberServiceName(
         string $applicationUuid,
         int $destinationId,
         BlueGreenDeploymentColor $color,
     ): string {
         return self::routingNamePrefix($applicationUuid, $destinationId).$color->value;
+    }
+
+    public static function memberServiceNameForPort(
+        string $applicationUuid,
+        int $destinationId,
+        BlueGreenDeploymentColor $color,
+        int $port,
+        bool $multiplePorts,
+    ): string {
+        self::assertBackendPort($port);
+
+        return self::memberServiceName($applicationUuid, $destinationId, $color).($multiplePorts ? "-{$port}" : '');
     }
 
     public static function memberServiceReference(
@@ -42,12 +68,44 @@ final readonly class BlueGreenRoutingTarget
         return self::memberServiceName($applicationUuid, $destinationId, $color).'@docker';
     }
 
+    public static function memberServiceReferenceForPort(
+        string $applicationUuid,
+        int $destinationId,
+        BlueGreenDeploymentColor $color,
+        int $port,
+        bool $multiplePorts,
+    ): string {
+        return self::memberServiceNameForPort(
+            $applicationUuid,
+            $destinationId,
+            $color,
+            $port,
+            $multiplePorts,
+        ).'@docker';
+    }
+
     public static function memberDiscoveryRouterName(
         string $applicationUuid,
         int $destinationId,
         BlueGreenDeploymentColor $color,
     ): string {
         return self::memberServiceName($applicationUuid, $destinationId, $color).'-discovery';
+    }
+
+    public static function memberDiscoveryRouterNameForPort(
+        string $applicationUuid,
+        int $destinationId,
+        BlueGreenDeploymentColor $color,
+        int $port,
+        bool $multiplePorts,
+    ): string {
+        return self::memberServiceNameForPort(
+            $applicationUuid,
+            $destinationId,
+            $color,
+            $port,
+            $multiplePorts,
+        ).'-discovery';
     }
 
     public function __construct(
@@ -80,6 +138,7 @@ final readonly class BlueGreenRoutingTarget
         public ?string $activeDeploymentUuid = null,
         public ?string $activeContainerId = null,
         public ?string $destinationTopologyDigest = null,
+        ?array $ports = null,
     ) {
         if ($destinationId < 0) {
             throw new InvalidArgumentException('The destination ID must be a nonnegative integer.');
@@ -87,8 +146,10 @@ final readonly class BlueGreenRoutingTarget
         if ($routingRevision < 0) {
             throw new InvalidArgumentException('The routing revision must be a nonnegative integer.');
         }
-        if ($port < 1 || $port > 65535) {
-            throw new InvalidArgumentException('The blue/green backend port must be between 1 and 65535.');
+        self::assertBackendPort($port);
+        $this->ports = $this->normalizePorts($ports ?? [$port]);
+        if (! in_array($port, $this->ports, true)) {
+            throw new InvalidArgumentException('The blue/green primary backend port must be included in the complete backend port list.');
         }
         if ($blueContainerName === $greenContainerName) {
             throw new InvalidArgumentException('Blue and green container DNS names must differ.');
@@ -183,6 +244,34 @@ final readonly class BlueGreenRoutingTarget
             BlueGreenDeploymentColor::BLUE => BlueGreenDeploymentColor::GREEN,
             BlueGreenDeploymentColor::GREEN => BlueGreenDeploymentColor::BLUE,
         };
+    }
+
+    public function activeServiceNameForBackendPort(string $applicationUuid, int $port): string
+    {
+        $this->assertKnownPort($port);
+
+        return self::activeServiceNameForPort(
+            $applicationUuid,
+            $this->destinationId,
+            $port,
+            count($this->ports) > 1,
+        );
+    }
+
+    public function memberServiceReferenceForBackendPort(
+        string $applicationUuid,
+        BlueGreenDeploymentColor $color,
+        int $port,
+    ): string {
+        $this->assertKnownPort($port);
+
+        return self::memberServiceReferenceForPort(
+            $applicationUuid,
+            $this->destinationId,
+            $color,
+            $port,
+            count($this->ports) > 1,
+        );
     }
 
     public function probeAcknowledgement(): ?string
@@ -355,7 +444,7 @@ final readonly class BlueGreenRoutingTarget
             $routedColor->value,
             $this->blueContainerName,
             $this->greenContainerName,
-            (string) $this->port,
+            implode(',', $this->ports),
         ];
         if ($this->legacyContainerName !== null) {
             $identity[] = $this->legacyContainerName;
@@ -365,5 +454,42 @@ final readonly class BlueGreenRoutingTarget
         }
 
         return hash_hmac('sha256', implode("\0", $identity), $token);
+    }
+
+    /** @return non-empty-list<int> */
+    private function normalizePorts(array $ports): array
+    {
+        if (! array_is_list($ports) || $ports === []) {
+            throw new InvalidArgumentException('Blue-green backend ports must be a non-empty list.');
+        }
+
+        $normalized = [];
+        foreach ($ports as $port) {
+            if (! is_int($port)) {
+                throw new InvalidArgumentException('Blue-green backend ports must be integers.');
+            }
+            self::assertBackendPort($port);
+            if (in_array($port, $normalized, true)) {
+                throw new InvalidArgumentException('Blue-green backend ports must be unique.');
+            }
+            $normalized[] = $port;
+        }
+        sort($normalized, SORT_NUMERIC);
+
+        return $normalized;
+    }
+
+    private function assertKnownPort(int $port): void
+    {
+        if (! in_array($port, $this->ports, true)) {
+            throw new InvalidArgumentException('The requested blue-green backend port is not part of this routing target.');
+        }
+    }
+
+    private static function assertBackendPort(int $port): void
+    {
+        if ($port < 1 || $port > 65535) {
+            throw new InvalidArgumentException('The blue/green backend port must be between 1 and 65535.');
+        }
     }
 }

@@ -75,6 +75,8 @@ final readonly class BlueGreenOperationFence
             || $deployment->blue_green_server_boot_id !== $claim->serverBootId
             || $deployment->blue_green_topology_digest !== $claim->topologyDigest
             || $deployment->blue_green_routing_config_digest !== $claim->routingConfigDigest
+            || $deployment->blue_green_backend_port_inventory !== $claim->backendPortInventory->serialized
+            || $deployment->blue_green_drain_backend_port_inventory !== $claim->drainBackendPortInventory?->serialized
             || $deployment->blue_green_supersession_generation !== $claim->supersessionGeneration
             || ! $this->deploymentProvenanceMatches($state, $deployment, $claim)
             || ! $this->stateShapeMatchesClaim($state, $claim)

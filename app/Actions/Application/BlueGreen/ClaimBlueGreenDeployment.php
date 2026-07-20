@@ -85,17 +85,19 @@ class ClaimBlueGreenDeployment
                 $state->pending_deployment_uuid,
                 $state->operation_deployment_uuid,
                 $state->operation_previous_deployment_uuid,
+                $state->inactive_retirement_owner_deployment_uuid,
+                $state->inactive_retirement_deployment_uuid,
             ])
                 ->filter(static fn (mixed $deploymentUuid): bool => is_string($deploymentUuid) && $deploymentUuid !== '')
                 ->unique()
                 ->values();
-            $lockedDeployment = ApplicationDeploymentQueue::query()
+            $lockedDeployments = ApplicationDeploymentQueue::query()
                 ->where('application_id', $lockedApplication->id)
                 ->whereIn('deployment_uuid', $queueDeploymentUuids)
                 ->orderBy('id')
                 ->lockForUpdate()
-                ->get()
-                ->firstWhere('id', $deployment->getKey());
+                ->get();
+            $lockedDeployment = $lockedDeployments->firstWhere('id', $deployment->getKey());
             if ($lockedDeployment === null) {
                 throw new BlueGreenDeploymentTransitionException('The deployment queue entry no longer exists.');
             }
@@ -122,6 +124,36 @@ class ClaimBlueGreenDeployment
                 throw new BlueGreenDeploymentTransitionException('The blue-green supersession generation is invalid or exhausted.');
             }
             $supersessionGeneration = $previousSupersessionGeneration + 1;
+            $backendPortInventory = BlueGreenBackendPortInventory::fromPorts(
+                $lockedApplication->blueGreenDeploymentBackendPorts($setting)
+                    ?? throw new BlueGreenDeploymentTransitionException('The blue-green application has no exact backend port inventory.'),
+            );
+            $inventoryCompatibility = new BackfillBlueGreenBackendPortInventories;
+            $inventoryCompatibility->backfillPendingInactiveRetirement(
+                $lockedApplication,
+                $setting,
+                $destination,
+                $state,
+                $deactivation,
+                $lockedDeployments,
+            );
+            $drainBackendPortInventory = null;
+            if ($previousContainer !== null) {
+                if ($previousContainer->blueGreenManaged) {
+                    $drainBackendPortInventory = $inventoryCompatibility->historicalFixedColorDrainInventory(
+                        $lockedApplication,
+                        $setting,
+                        $destination,
+                        $state,
+                        $deactivation,
+                        $lockedDeployments,
+                        $previousContainer,
+                        $backendPortInventory,
+                    );
+                } else {
+                    $drainBackendPortInventory = $backendPortInventory;
+                }
+            }
             $fingerprint = ComputeBlueGreenDeploymentFingerprint::run(
                 $lockedApplication,
                 $destination,
@@ -155,6 +187,8 @@ class ClaimBlueGreenDeployment
                 serverBootId: $serverBootId,
                 topologyDigest: $fingerprint->topologyDigest,
                 routingConfigDigest: $fingerprint->routingConfigDigest,
+                backendPortInventory: $backendPortInventory,
+                drainBackendPortInventory: $drainBackendPortInventory,
                 supersessionGeneration: $supersessionGeneration,
                 legacyContainerName: $legacyContainerName,
                 candidateContainerName: $lockedApplication->uuid.'-'.$pendingColor->value,
@@ -217,6 +251,8 @@ class ClaimBlueGreenDeployment
                 ->whereNull('blue_green_server_boot_id')
                 ->whereNull('blue_green_topology_digest')
                 ->whereNull('blue_green_routing_config_digest')
+                ->whereNull('blue_green_backend_port_inventory')
+                ->whereNull('blue_green_drain_backend_port_inventory')
                 ->whereNull('blue_green_supersession_generation')
                 ->whereNull('blue_green_previous_container_id')
                 ->whereNull('blue_green_candidate_container_id')
@@ -244,6 +280,8 @@ class ClaimBlueGreenDeployment
                 'blue_green_server_boot_id' => $serverBootId,
                 'blue_green_topology_digest' => $fingerprint->topologyDigest,
                 'blue_green_routing_config_digest' => $fingerprint->routingConfigDigest,
+                'blue_green_backend_port_inventory' => $backendPortInventory->serialized,
+                'blue_green_drain_backend_port_inventory' => $drainBackendPortInventory?->serialized,
                 'blue_green_supersession_generation' => $supersessionGeneration,
                 'blue_green_previous_container_id' => $previousContainer?->dockerId,
                 'blue_green_candidate_container_id' => null,
@@ -342,6 +380,8 @@ class ClaimBlueGreenDeployment
             || $deployment->blue_green_server_boot_id !== null
             || $deployment->blue_green_topology_digest !== null
             || $deployment->blue_green_routing_config_digest !== null
+            || $deployment->blue_green_backend_port_inventory !== null
+            || $deployment->blue_green_drain_backend_port_inventory !== null
             || $deployment->blue_green_supersession_generation !== null
             || $deployment->blue_green_previous_container_id !== null
             || $deployment->blue_green_candidate_container_id !== null

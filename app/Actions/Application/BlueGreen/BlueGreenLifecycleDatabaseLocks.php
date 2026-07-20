@@ -81,6 +81,8 @@ final readonly class BlueGreenLifecycleDatabaseLocks
             $state?->pending_deployment_uuid,
             $state?->operation_deployment_uuid,
             $state?->operation_previous_deployment_uuid,
+            $state?->inactive_retirement_owner_deployment_uuid,
+            $state?->inactive_retirement_deployment_uuid,
         ])
             ->filter(fn (mixed $deploymentUuid): bool => is_string($deploymentUuid) && $deploymentUuid !== '')
             ->unique()
@@ -121,6 +123,8 @@ final readonly class BlueGreenLifecycleDatabaseLocks
                 $state->phase,
                 $allowCancelledRollbackEntry,
             )
+            || $deployment->blue_green_backend_port_inventory !== $claim->backendPortInventory->serialized
+            || $deployment->blue_green_drain_backend_port_inventory !== $claim->drainBackendPortInventory?->serialized
             || $deployment->blue_green_supersession_generation !== $claim->supersessionGeneration) {
             throw new BlueGreenDeploymentTransitionException('The blue-green deployment was deleted, cancelled, deactivated, or superseded.');
         }
@@ -161,6 +165,11 @@ final readonly class BlueGreenLifecycleDatabaseLocks
             ->where('blue_green_server_boot_id', $claim->serverBootId)
             ->where('blue_green_topology_digest', $claim->topologyDigest)
             ->where('blue_green_routing_config_digest', $claim->routingConfigDigest)
+            ->where('blue_green_backend_port_inventory', $claim->backendPortInventory->serialized);
+        $query = $claim->drainBackendPortInventory === null
+            ? $query->whereNull('blue_green_drain_backend_port_inventory')
+            : $query->where('blue_green_drain_backend_port_inventory', $claim->drainBackendPortInventory->serialized);
+        $query = $query
             ->whereExists(function ($stateQuery) use ($claim, $expectedStatePhase, $stateRetainsOperationIdentity): void {
                 $stateQuery->selectRaw('1')
                     ->from('application_blue_green_deployments as owner_state')

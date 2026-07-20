@@ -349,6 +349,35 @@ it('proves exact tombstone and absence states through canonical direct-origin tr
     Process::assertRanTimes(fn (): bool => true, 12);
 });
 
+it('round-trips every backend port in a durable proxy deactivation snapshot', function () {
+    $sourceYaml = "http:\n  routers: {}\n";
+    $snapshot = new BlueGreenProxyDeactivationSnapshot(
+        managedFilename: BlueGreenRoutingTarget::managedFilename('multi-port-snapshot', 1),
+        sourceYaml: $sourceYaml,
+        sourceSha256: hash('sha256', $sourceYaml),
+        tombstoneYaml: $sourceYaml,
+        tombstoneSha256: hash('sha256', $sourceYaml),
+        tombstoneAcknowledgement: str_repeat('a', 64),
+        routes: [
+            ['router' => 'web-public', 'url' => 'https://web.example.test/health'],
+            ['router' => 'metrics-public', 'url' => 'https://metrics.example.test/health'],
+        ],
+        backendPort: 3000,
+        backendPorts: [8080, 3000],
+        destinationClockObservedAtUnixSeconds: 1_700_000_000,
+        drainDeadlineUnixSeconds: 1_700_000_840,
+        deactivationDeadlineUnixSeconds: 1_700_000_900,
+    );
+    $encoded = $snapshot->encode();
+    $legacyEncoded = $encoded;
+    $legacyEncoded['version'] = 2;
+    unset($legacyEncoded['backendPorts']);
+
+    expect($snapshot->backendPorts)->toBe([3000, 8080])
+        ->and(BlueGreenProxyDeactivationSnapshot::decode($encoded)->backendPorts)->toBe([3000, 8080])
+        ->and(BlueGreenProxyDeactivationSnapshot::decode($legacyEncoded)->backendPorts)->toBe([3000]);
+});
+
 it('rejects a matching eviction response that arrives after the bounded attempt deadline', function () {
     config(['constants.ssh.mux_enabled' => false]);
     $application = new Application;

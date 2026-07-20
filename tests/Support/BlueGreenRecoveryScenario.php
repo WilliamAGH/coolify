@@ -2,6 +2,7 @@
 
 namespace Tests\Support;
 
+use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
 use App\Actions\Application\BlueGreen\BlueGreenLegacyRouter;
 use App\Actions\Application\BlueGreen\BlueGreenLegacyRoutingSnapshot;
 use App\Actions\Application\BlueGreen\BlueGreenLegacyRoutingSnapshotCodec;
@@ -84,6 +85,7 @@ final readonly class BlueGreenRecoveryScenario
         );
         $topologyDigest = $fingerprint->topologyDigest;
         $routingConfigDigest = $fingerprint->routingConfigDigest;
+        $backendPortInventory = BlueGreenBackendPortInventory::fromPorts([3000]);
         $deployment = ApplicationDeploymentQueue::query()->create([
             'application_id' => $application->id,
             'deployment_uuid' => self::OPERATION_UUID,
@@ -98,6 +100,8 @@ final readonly class BlueGreenRecoveryScenario
             'blue_green_server_boot_id' => '11111111-2222-3333-4444-555555555555',
             'blue_green_topology_digest' => $topologyDigest,
             'blue_green_routing_config_digest' => $routingConfigDigest,
+            'blue_green_backend_port_inventory' => $backendPortInventory->serialized,
+            'blue_green_drain_backend_port_inventory' => $backendPortInventory->serialized,
             'blue_green_supersession_generation' => 1,
             'blue_green_previous_container_id' => self::LEGACY_ID,
             'blue_green_candidate_container_id' => self::CANDIDATE_ID,

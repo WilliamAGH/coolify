@@ -47,6 +47,8 @@ function removeBlueGreenExpandSchema(): void
         'blue_green_server_boot_id',
         'blue_green_topology_digest',
         'blue_green_routing_config_digest',
+        'blue_green_backend_port_inventory',
+        'blue_green_drain_backend_port_inventory',
         'blue_green_supersession_generation',
     ];
     $presentQueueColumns = array_values(array_filter(
@@ -159,7 +161,11 @@ it('converges when each authorized schema commit exists without its migration le
         ->and(Schema::hasColumn('application_blue_green_deactivations', 'proxy_snapshot'))->toBeTrue()
         ->and(Schema::hasColumn('application_blue_green_deployments', 'supersession_generation'))->toBeTrue()
         ->and(Schema::hasColumn('application_blue_green_deactivations', 'supersession_generation'))->toBeTrue()
-        ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_supersession_generation'))->toBeTrue();
+        ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_supersession_generation'))->toBeTrue()
+        ->and(Schema::hasColumns('application_deployment_queues', [
+            'blue_green_backend_port_inventory',
+            'blue_green_drain_backend_port_inventory',
+        ]))->toBeTrue();
 });
 
 it('replays every earlier migration against the complete later schema', function () {
@@ -183,7 +189,11 @@ it('replays every earlier migration against the complete later schema', function
         'supersession_generation',
     ]))->toBeTrue()
         ->and(Schema::hasColumn('application_blue_green_deactivations', 'supersession_generation'))->toBeTrue()
-        ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_supersession_generation'))->toBeTrue();
+        ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_supersession_generation'))->toBeTrue()
+        ->and(Schema::hasColumns('application_deployment_queues', [
+            'blue_green_backend_port_inventory',
+            'blue_green_drain_backend_port_inventory',
+        ]))->toBeTrue();
 });
 
 it('attests the complete schema through each migration public contract', function () {
@@ -201,7 +211,11 @@ it('attests the complete schema through each migration public contract', functio
         ->and(Schema::hasColumn('application_blue_green_deactivations', 'proxy_snapshot'))->toBeTrue()
         ->and(Schema::hasColumn('application_blue_green_deployments', 'supersession_generation'))->toBeTrue()
         ->and(Schema::hasColumn('application_blue_green_deactivations', 'supersession_generation'))->toBeTrue()
-        ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_supersession_generation'))->toBeTrue();
+        ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_supersession_generation'))->toBeTrue()
+        ->and(Schema::hasColumns('application_deployment_queues', [
+            'blue_green_backend_port_inventory',
+            'blue_green_drain_backend_port_inventory',
+        ]))->toBeTrue();
 });
 
 it('keeps all expand schema intact because every authorized migration is forward-only', function () {
@@ -236,6 +250,27 @@ it('fails closed on a partial queue provenance schema', function () {
 
     expect(fn () => blueGreenMigration('2026_07_12_000002_add_blue_green_provenance_to_application_deployment_queues')->up())
         ->toThrow(RuntimeException::class, 'partial');
+});
+
+it('fails closed on a partial backend port inventory schema', function () {
+    removeBlueGreenExpandSchema();
+    Schema::table('application_deployment_queues', function (Blueprint $table): void {
+        $table->text('blue_green_backend_port_inventory')->nullable();
+    });
+
+    expect(fn () => blueGreenMigration('2026_07_20_000000_add_blue_green_backend_port_inventories_to_deployment_queues')->up())
+        ->toThrow(RuntimeException::class, 'partial');
+});
+
+it('rejects backend port inventory columns with the wrong exact type', function () {
+    removeBlueGreenExpandSchema();
+    Schema::table('application_deployment_queues', function (Blueprint $table): void {
+        $table->string('blue_green_backend_port_inventory')->nullable();
+        $table->string('blue_green_drain_backend_port_inventory')->nullable();
+    });
+
+    expect(fn () => blueGreenMigration('2026_07_20_000000_add_blue_green_backend_port_inventories_to_deployment_queues')->up())
+        ->toThrow(RuntimeException::class, 'not match the authorized');
 });
 
 it('rejects an inactive retention setting with the wrong exact type', function () {

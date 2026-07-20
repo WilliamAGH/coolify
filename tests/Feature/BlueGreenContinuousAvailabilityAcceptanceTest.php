@@ -1,5 +1,6 @@
 <?php
 
+use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
 use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
@@ -113,6 +114,8 @@ function blueGreenContinuousAvailabilityContext(
         serverBootId: (string) $state->operation_server_boot_id,
         topologyDigest: (string) $state->operation_topology_digest,
         routingConfigDigest: (string) $state->operation_routing_config_digest,
+        backendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
+        drainBackendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
         supersessionGeneration: 1,
         legacyContainerName: $legacyContainerName,
         candidateContainerName: $application->uuid.'-blue',

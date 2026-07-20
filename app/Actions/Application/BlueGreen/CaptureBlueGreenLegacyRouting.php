@@ -71,24 +71,24 @@ class CaptureBlueGreenLegacyRouting
         $this->assertIdentityLabel($labels, 'coolify.applicationId', (string) $expectation->applicationId);
         $this->assertIdentityLabel($labels, 'coolify.pullRequestId', (string) $expectation->pullRequestId);
 
-        $port = $application->blueGreenDeploymentBackendPort();
-        if ($port === null) {
-            throw new RuntimeException('The legacy application no longer has one unambiguous backend port.');
+        $ports = $application->blueGreenDeploymentBackendPorts();
+        if ($ports === null) {
+            throw new RuntimeException('The legacy application no longer has an exact backend port inventory.');
         }
-        $canonicalLabels = $this->canonicalTraefikLabels($application, $destination, $port);
+        $canonicalLabels = $this->canonicalTraefikLabels($application, $destination, $ports);
         $actualLabels = $this->actualTraefikLabels($labels);
         if ($canonicalLabels !== $actualLabels) {
             throw new RuntimeException('The immutable legacy Traefik labels do not exactly match the recognized current canonical routing inventory.');
         }
 
-        [$routers, $services] = $this->routingInventory($actualLabels, $port);
+        [$routers, $services] = $this->routingInventory($actualLabels, $ports);
         $addresses = $this->containerAddresses($networks);
         $encodedLabels = json_encode($actualLabels, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
 
         return new BlueGreenLegacyRoutingSnapshot(
             containerName: $expectation->name,
             dockerId: $dockerId,
-            port: $port,
+            port: $ports[0],
             containerAddresses: $addresses,
             routers: $routers,
             services: $services,
@@ -109,7 +109,7 @@ class CaptureBlueGreenLegacyRouting
     private function canonicalTraefikLabels(
         Application $application,
         StandaloneDocker $destination,
-        int $port,
+        array $ports,
     ): array {
         $applicationForLabels = clone $application;
         $applicationForLabels->setRelation('destination', $destination);
@@ -123,7 +123,8 @@ class CaptureBlueGreenLegacyRouting
                 activeColor: BlueGreenDeploymentColor::BLUE,
                 blueContainerName: "{$applicationUuid}-blue",
                 greenContainerName: "{$applicationUuid}-green",
-                port: $port,
+                port: $ports[0],
+                ports: $ports,
                 routingRevision: 0,
             ),
         );
@@ -181,7 +182,7 @@ class CaptureBlueGreenLegacyRouting
      * @param  array<string, string>  $labels
      * @return array{list<BlueGreenLegacyRouter>, list<BlueGreenLegacyService>}
      */
-    private function routingInventory(array $labels, int $expectedPort): array
+    private function routingInventory(array $labels, array $expectedPorts): array
     {
         if (($labels['traefik.enable'] ?? null) !== 'true') {
             throw new RuntimeException('The immutable legacy routing labels do not enable the Traefik Docker provider.');
@@ -198,8 +199,8 @@ class CaptureBlueGreenLegacyRouting
                 continue;
             }
             if (preg_match('/^traefik\.http\.services\.([A-Za-z0-9_-]+)\.loadbalancer\.server\.port$/D', $key, $matches) === 1) {
-                if (filter_var($value, FILTER_VALIDATE_INT) === false || (int) $value !== $expectedPort) {
-                    throw new RuntimeException('The immutable legacy Traefik service port does not match the canonical backend port.');
+                if (filter_var($value, FILTER_VALIDATE_INT) === false || ! in_array((int) $value, $expectedPorts, true)) {
+                    throw new RuntimeException('The immutable legacy Traefik service port does not match the canonical backend port inventory.');
                 }
                 $servicePorts[$matches[1]] = (int) $value;
 
@@ -209,6 +210,12 @@ class CaptureBlueGreenLegacyRouting
                 continue;
             }
             throw new RuntimeException("The immutable legacy Traefik label {$key} is outside the recognized routing grammar.");
+        }
+
+        $observedPorts = array_values(array_unique(array_values($servicePorts)));
+        sort($observedPorts, SORT_NUMERIC);
+        if ($observedPorts !== $expectedPorts) {
+            throw new RuntimeException('The immutable legacy Traefik services do not cover every canonical backend port.');
         }
 
         $routers = [];

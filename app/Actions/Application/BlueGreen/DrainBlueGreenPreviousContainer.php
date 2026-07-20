@@ -18,11 +18,12 @@ final class DrainBlueGreenPreviousContainer
     public function activeConnections(
         Server $server,
         BlueGreenContainerExpectation $expectation,
-        int $backendPort,
+        int|array $backendPort,
     ): int {
-        if ($expectation->dockerId === null || $backendPort < 1 || $backendPort > 65535) {
-            throw new InvalidArgumentException('An exact Docker ID and valid backend port are required to observe blue-green drain connections.');
+        if ($expectation->dockerId === null) {
+            throw new InvalidArgumentException('An exact Docker ID is required to observe blue-green drain connections.');
         }
+        $this->portHexes($backendPort);
 
         InspectBlueGreenContainer::run($server, $expectation);
         $output = trim((string) instant_remote_process([
@@ -35,21 +36,21 @@ final class DrainBlueGreenPreviousContainer
         return (int) $output;
     }
 
-    public function observationCommandFor(BlueGreenContainerExpectation $expectation, int $backendPort): string
+    public function observationCommandFor(BlueGreenContainerExpectation $expectation, int|array $backendPort): string
     {
-        if ($expectation->dockerId === null || $backendPort < 1 || $backendPort > 65535) {
-            throw new InvalidArgumentException('An exact Docker ID and valid backend port are required to observe blue-green drain connections.');
+        if ($expectation->dockerId === null) {
+            throw new InvalidArgumentException('An exact Docker ID is required to observe blue-green drain connections.');
         }
 
         $containerId = escapeshellarg($expectation->dockerId);
-        $portHex = strtoupper(str_pad(dechex($backendPort), 4, '0', STR_PAD_LEFT));
+        $portFilter = $this->portFilter($backendPort);
 
         return 'drain_pid="$(docker inspect --format='.escapeshellarg('{{.State.Pid}}').' '.$containerId.')"'
             .' && test "$drain_pid" -gt 0'
             .' && test -r "/proc/$drain_pid/net/tcp"'
             .' && test -r "/proc/$drain_pid/net/tcp6"'
-            .' && awk -v target_port='.escapeshellarg($portHex).' '
-            .escapeshellarg('$4 == "01" && substr($2, length($2) - 3, 4) == target_port { active += 1 } END { print active + 0 }')
+            .' && awk '.$portFilter['argument'].' '
+            .escapeshellarg($portFilter['setup'].'$4 == "01" && '.$portFilter['condition'].' { active += 1 } END { print active + 0 }')
             .' "/proc/$drain_pid/net/tcp" "/proc/$drain_pid/net/tcp6"';
     }
 
@@ -58,7 +59,7 @@ final class DrainBlueGreenPreviousContainer
      */
     public function commandsFor(
         BlueGreenContainerExpectation $expectation,
-        int $backendPort,
+        int|array $backendPort,
         int $drainDeadlineEpoch,
         int $stopTimeoutSeconds,
         bool $hasInitialZeroObservation = false,
@@ -66,14 +67,13 @@ final class DrainBlueGreenPreviousContainer
         if ($expectation->dockerId === null) {
             throw new InvalidArgumentException('An exact Docker ID is required before a blue-green container can drain.');
         }
-        if ($backendPort < 1 || $backendPort > 65535
-            || $drainDeadlineEpoch < 1
+        if ($drainDeadlineEpoch < 1
             || $stopTimeoutSeconds < 1) {
             throw new InvalidArgumentException('Blue-green drain ports and timeouts must be positive and valid.');
         }
 
         $containerId = escapeshellarg($expectation->dockerId);
-        $portHex = strtoupper(str_pad(dechex($backendPort), 4, '0', STR_PAD_LEFT));
+        $portFilter = $this->portFilter($backendPort);
         $script = <<<'SH'
 drain_deadline=__DRAIN_DEADLINE_EPOCH__
 drain_zero_observations=__INITIAL_ZERO_OBSERVATIONS__
@@ -82,8 +82,8 @@ while :; do
     test "$drain_pid" -gt 0
     test -r "/proc/$drain_pid/net/tcp"
     test -r "/proc/$drain_pid/net/tcp6"
-    drain_connections="$(awk -v target_port='__PORT_HEX__' '
-        $4 == "01" && substr($2, length($2) - 3, 4) == target_port { active += 1 }
+    drain_connections="$(awk __PORT_AWK_ARGUMENT__ '
+        __PORT_AWK_SETUP__$4 == "01" && __PORT_AWK_CONDITION__ { active += 1 }
         END { print active + 0 }
     ' "/proc/$drain_pid/net/tcp" "/proc/$drain_pid/net/tcp6")"
     case "$drain_connections" in
@@ -114,12 +114,14 @@ SH;
         return [
             ...(new InspectBlueGreenContainer)->exactMutationAssertionsFor($expectation),
             str_replace(
-                ['__DRAIN_DEADLINE_EPOCH__', '__INITIAL_ZERO_OBSERVATIONS__', '__CONTAINER_ID__', '__PORT_HEX__', '__STOP_TIMEOUT__'],
+                ['__DRAIN_DEADLINE_EPOCH__', '__INITIAL_ZERO_OBSERVATIONS__', '__CONTAINER_ID__', '__PORT_AWK_ARGUMENT__', '__PORT_AWK_SETUP__', '__PORT_AWK_CONDITION__', '__STOP_TIMEOUT__'],
                 [
                     (string) $drainDeadlineEpoch,
                     $hasInitialZeroObservation ? '1' : '0',
                     $containerId,
-                    $portHex,
+                    $portFilter['argument'],
+                    $portFilter['setup'],
+                    $portFilter['condition'],
                     (string) $stopTimeoutSeconds,
                 ],
                 $script,
@@ -133,5 +135,50 @@ SH;
     public function completionAssertionsFor(BlueGreenContainerExpectation $expectation): array
     {
         return (new InspectBlueGreenContainer)->stoppedMutationCompletionAssertionsFor($expectation);
+    }
+
+    /** @return non-empty-list<string> */
+    private function portHexes(int|array $backendPorts): array
+    {
+        $backendPorts = is_int($backendPorts) ? [$backendPorts] : $backendPorts;
+        if (! array_is_list($backendPorts) || $backendPorts === []) {
+            throw new InvalidArgumentException('Blue-green drain requires a non-empty backend port list.');
+        }
+
+        $portHexes = [];
+        foreach ($backendPorts as $backendPort) {
+            if (! is_int($backendPort) || $backendPort < 1 || $backendPort > 65535) {
+                throw new InvalidArgumentException('Blue-green drain backend ports must be valid integers.');
+            }
+            $portHex = strtoupper(str_pad(dechex($backendPort), 4, '0', STR_PAD_LEFT));
+            if (in_array($portHex, $portHexes, true)) {
+                throw new InvalidArgumentException('Blue-green drain backend ports must be unique.');
+            }
+            $portHexes[] = $portHex;
+        }
+        sort($portHexes, SORT_STRING);
+
+        return $portHexes;
+    }
+
+    /**
+     * @return array{argument: string, setup: string, condition: string}
+     */
+    private function portFilter(int|array $backendPort): array
+    {
+        $portHexes = $this->portHexes($backendPort);
+        if (count($portHexes) === 1) {
+            return [
+                'argument' => '-v target_port='.escapeshellarg($portHexes[0]),
+                'setup' => '',
+                'condition' => 'substr($2, length($2) - 3, 4) == target_port',
+            ];
+        }
+
+        return [
+            'argument' => '-v target_ports='.escapeshellarg(implode(' ', $portHexes)),
+            'setup' => 'BEGIN { split(target_ports, ports, " "); for (index in ports) expected_ports[ports[index]] = 1 } ',
+            'condition' => '(substr($2, length($2) - 3, 4) in expected_ports)',
+        ];
     }
 }

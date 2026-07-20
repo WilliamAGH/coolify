@@ -18,6 +18,8 @@ final readonly class BlueGreenDeploymentClaim
         public string $serverBootId,
         public string $topologyDigest,
         public string $routingConfigDigest,
+        public BlueGreenBackendPortInventory $backendPortInventory,
+        public ?BlueGreenBackendPortInventory $drainBackendPortInventory,
         public int $supersessionGeneration,
         public ?string $legacyContainerName,
         public ?string $candidateContainerName = null,
@@ -43,6 +45,11 @@ final readonly class BlueGreenDeploymentClaim
 
         if ($this->deploymentUuid === '') {
             throw new \InvalidArgumentException('The deployment UUID must not be empty.');
+        }
+
+        $hasPreviousContainer = $this->previousActiveColor !== null || $this->legacyContainerName !== null;
+        if ($hasPreviousContainer !== ($this->drainBackendPortInventory !== null)) {
+            throw new \InvalidArgumentException('Blue-green claim drain ports must be present exactly when a previous container exists.');
         }
 
         if (($this->candidateContainerName === null) !== ($this->rollbackManagedFilename === null)) {

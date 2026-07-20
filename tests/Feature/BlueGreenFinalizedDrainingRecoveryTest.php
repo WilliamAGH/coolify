@@ -1,11 +1,13 @@
 <?php
 
+use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
 use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
 use App\Actions\Application\BlueGreen\BlueGreenOperationFence;
 use App\Actions\Application\BlueGreen\ComputeBlueGreenDeploymentFingerprint;
+use App\Actions\Application\BlueGreen\DrainBlueGreenPreviousContainer;
 use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Actions\Application\BlueGreen\PlanBlueGreenPublicRecovery;
 use App\Actions\Application\BlueGreen\ReconstructBlueGreenDeploymentRecovery;
@@ -25,6 +27,7 @@ use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\ProxyTypes;
+use App\Exceptions\DeploymentException;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
@@ -114,6 +117,7 @@ KEY;
     ]);
     $application->settings()->update(['is_blue_green_deployment_enabled' => true]);
     $application = $application->fresh(['settings']);
+    $backendPortInventory = BlueGreenBackendPortInventory::fromPorts([3000]);
 
     $previousFingerprint = ComputeBlueGreenDeploymentFingerprint::run(
         $application,
@@ -209,6 +213,8 @@ KEY;
         'blue_green_server_boot_id' => FIXED_COLOR_BOOT_ID,
         'blue_green_topology_digest' => $previousConfiguration->state->destinationTopologyDigest,
         'blue_green_routing_config_digest' => $previousConfiguration->routingConfigDigest,
+        'blue_green_backend_port_inventory' => $backendPortInventory->serialized,
+        'blue_green_drain_backend_port_inventory' => null,
         'blue_green_supersession_generation' => 1,
     ]);
     $routingMutatedAt = $phase === BlueGreenDeploymentPhase::DRAINING ? now()->subMinute() : null;
@@ -226,6 +232,8 @@ KEY;
         'blue_green_server_boot_id' => FIXED_COLOR_BOOT_ID,
         'blue_green_topology_digest' => $candidateConfiguration->state->destinationTopologyDigest,
         'blue_green_routing_config_digest' => $candidateConfiguration->routingConfigDigest,
+        'blue_green_backend_port_inventory' => $backendPortInventory->serialized,
+        'blue_green_drain_backend_port_inventory' => $backendPortInventory->serialized,
         'blue_green_supersession_generation' => 1,
         'blue_green_previous_container_id' => FIXED_COLOR_PREVIOUS_CONTAINER_ID,
         'blue_green_candidate_container_id' => FIXED_COLOR_CANDIDATE_CONTAINER_ID,
@@ -286,6 +294,8 @@ KEY;
         serverBootId: FIXED_COLOR_BOOT_ID,
         topologyDigest: $candidateConfiguration->state->destinationTopologyDigest,
         routingConfigDigest: $candidateConfiguration->routingConfigDigest,
+        backendPortInventory: $backendPortInventory,
+        drainBackendPortInventory: $backendPortInventory,
         supersessionGeneration: 1,
         legacyContainerName: null,
         candidateContainerName: $candidateExpectation->name,
@@ -333,6 +343,108 @@ function invokeFixedColorRecoveryLifecycleMethod(
 ): mixed {
     return (new ReflectionMethod($lifecycle, $method))->invoke($lifecycle, ...$arguments);
 }
+
+it('drains every immutable predecessor port when the live application dropped a port', function (): void {
+    config(['constants.ssh.mux_enabled' => false]);
+    $fixture = fixedColorBlueGreenRecoveryFixture(BlueGreenDeploymentPhase::DRAINING);
+    $predecessorInventory = BlueGreenBackendPortInventory::fromPorts([3000, 8080]);
+    $fixture['previousDeployment']->update([
+        'blue_green_backend_port_inventory' => $predecessorInventory->serialized,
+    ]);
+    $fixture['deployment']->update([
+        'blue_green_drain_backend_port_inventory' => $predecessorInventory->serialized,
+    ]);
+    $operation = ReconstructBlueGreenDeploymentRecovery::run($fixture['state']);
+    $fence = fixedColorRecoveryFence($fixture);
+    $lifecycle = new BlueGreenDeploymentLifecycle(
+        application: $operation->application,
+        deployment: $operation->deployment,
+        destination: $operation->destination,
+        server: $operation->server,
+        timeout: 30,
+        checkForCancellation: static function (): void {},
+    );
+    setFixedColorRecoveryLifecycleProperty($lifecycle, 'enabled', true);
+    setFixedColorRecoveryLifecycleProperty($lifecycle, 'claim', $operation->claim);
+    setFixedColorRecoveryLifecycleProperty($lifecycle, 'previousContainerExpectation', $operation->previousContainer);
+    setFixedColorRecoveryLifecycleProperty($lifecycle, 'destinationState', $operation->currentDestinationState);
+    setFixedColorRecoveryLifecycleProperty($lifecycle, 'operationFence', $fence);
+
+    InspectBlueGreenContainer::shouldRun()
+        ->twice()
+        ->andReturn(new BlueGreenContainerInspection(
+            exists: true,
+            dockerId: FIXED_COLOR_PREVIOUS_CONTAINER_ID,
+            status: 'running',
+            health: 'healthy',
+        ));
+    $observationCommands = [];
+    $mutationCommands = [];
+    Process::fake(function (PendingProcess $process) use (&$mutationCommands, &$observationCommands): FakeProcessResult {
+        $command = is_array($process->command)
+            ? implode(' ', $process->command)
+            : (string) $process->command;
+        if (str_contains($command, "target_ports='0BB8 1F90'")) {
+            $observationCommands[] = $command;
+        }
+        if (str_contains($command, 'container_journal_stage=')) {
+            $mutationCommands[] = $command;
+
+            return Process::result(
+                errorOutput: DrainBlueGreenPreviousContainer::TIMEOUT_MARKER.' with 1 active backend connection(s)',
+                exitCode: 1,
+            );
+        }
+        if (str_contains($command, '/proc/sys/kernel/random/boot_id')) {
+            return Process::result(output: FIXED_COLOR_BOOT_ID);
+        }
+
+        return Process::result(output: '1');
+    });
+
+    try {
+        expect(fn () => $lifecycle->retirePreviousContainer())
+            ->toThrow(DeploymentException::class, 'durable DRAINING state is retained for retry');
+    } finally {
+        $lifecycle->release();
+    }
+
+    $drainDeadline = $fixture['state']->fresh()->operation_drain_deadline_at;
+    expect($drainDeadline)->not->toBeNull();
+    $expectedMutationScript = implode("\n", [
+        'set -eu',
+        ...(new DrainBlueGreenPreviousContainer)->commandsFor(
+            $operation->previousContainer,
+            [3000, 8080],
+            $drainDeadline->getTimestamp(),
+            $operation->application->settings->deploymentStopGracePeriodSeconds(),
+        ),
+    ])."\n";
+    expect($operation->application->blueGreenDeploymentBackendPorts())->toBe([3000])
+        ->and($operation->claim->backendPortInventory->ports())->toBe([3000])
+        ->and($operation->claim->drainBackendPortInventory?->ports())->toBe([3000, 8080])
+        ->and($observationCommands)->toHaveCount(1)
+        ->each->toContain("target_ports='0BB8 1F90'")
+        ->and($mutationCommands)->toHaveCount(1)
+        ->each->toContain(base64_encode($expectedMutationScript))
+        ->and($fixture['state']->fresh()->operation_drain_last_observed_connections)->toBe(1);
+});
+
+it('backfills an unchanged in-flight owner inventory before reconstructing a fixed-color recovery', function (): void {
+    $fixture = fixedColorBlueGreenRecoveryFixture(BlueGreenDeploymentPhase::DRAINING);
+    $inventory = BlueGreenBackendPortInventory::fromPorts([3000]);
+    $fixture['deployment']->update([
+        'blue_green_backend_port_inventory' => null,
+        'blue_green_drain_backend_port_inventory' => null,
+    ]);
+
+    $operation = ReconstructBlueGreenDeploymentRecovery::run($fixture['state']);
+
+    expect($operation->claim->backendPortInventory->serialized)->toBe($inventory->serialized)
+        ->and($operation->claim->drainBackendPortInventory?->serialized)->toBe($inventory->serialized)
+        ->and($fixture['deployment']->fresh()->blue_green_backend_port_inventory)->toBe($inventory->serialized)
+        ->and($fixture['deployment']->fresh()->blue_green_drain_backend_port_inventory)->toBe($inventory->serialized);
+});
 
 it('repairs drifted finalized candidate routing only after exact candidate health and release proof', function (): void {
     config(['constants.ssh.mux_enabled' => false]);

@@ -1,5 +1,6 @@
 <?php
 
+use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
 use App\Actions\Application\BlueGreen\BlueGreenOperationFence;
@@ -38,7 +39,7 @@ uses(RefreshDatabase::class);
  *     server: Server
  * }
  */
-function blueGreenLifecyclePublicRecoveryFixture(): array
+function blueGreenLifecyclePublicRecoveryFixture(array $backendPorts, string $fqdn): array
 {
     InstanceSettings::unguarded(
         fn () => InstanceSettings::query()->firstOrCreate(['id' => 0]),
@@ -76,10 +77,10 @@ KEY;
         'environment_id' => $environment->id,
         'destination_id' => $destination->id,
         'destination_type' => $destination->getMorphClass(),
-        'fqdn' => 'https://lifecycle-proof.example.test',
+        'fqdn' => $fqdn,
         'build_pack' => 'nixpacks',
         'base_directory' => '/',
-        'ports_exposes' => '3000',
+        'ports_exposes' => implode(',', $backendPorts),
     ]);
     $application->settings()->update([
         'is_blue_green_deployment_enabled' => true,
@@ -107,9 +108,13 @@ function setBlueGreenLifecyclePublicRecoveryProperty(
     (new ReflectionProperty($lifecycle, $property))->setValue($lifecycle, $value);
 }
 
-it('uses the canonical direct-origin planner and verifier for deployment and recovery', function () {
+it('uses the canonical direct-origin planner and verifier for every configured backend port', function (
+    array $backendPorts,
+    string $fqdn,
+    array $generatedLabels,
+) {
     config(['constants.ssh.mux_enabled' => false]);
-    $fixture = blueGreenLifecyclePublicRecoveryFixture();
+    $fixture = blueGreenLifecyclePublicRecoveryFixture($backendPorts, $fqdn);
     $application = $fixture['application']->fresh(['settings']);
     $deployment = $fixture['deployment'];
     $destination = $fixture['destination'];
@@ -117,6 +122,7 @@ it('uses the canonical direct-origin planner and verifier for deployment and rec
     $bootId = '11111111-2222-3333-4444-555555555555';
     $candidateId = str_repeat('b', 64);
     $previousId = str_repeat('a', 64);
+    $backendPortInventory = BlueGreenBackendPortInventory::fromPorts($backendPorts);
     $fingerprint = ComputeBlueGreenDeploymentFingerprint::run(
         $application,
         $destination,
@@ -130,7 +136,8 @@ it('uses the canonical direct-origin planner and verifier for deployment and rec
         activeColor: BlueGreenDeploymentColor::BLUE,
         blueContainerName: $application->uuid.'-blue',
         greenContainerName: $application->uuid.'-green',
-        port: 3000,
+        port: $backendPorts[0],
+        ports: $backendPorts,
         routingRevision: 1,
         probeHeaderName: 'X-Coolify-Blue-Green-Probe',
         probeToken: 'probe:'.hash('sha256', $deployment->deployment_uuid),
@@ -145,14 +152,7 @@ it('uses the canonical direct-origin planner and verifier for deployment and rec
     );
     $configuration = (new CompileBlueGreenProxyConfiguration)->compileGeneratedLabels(
         applicationUuid: $application->uuid,
-        generatedLabels: [
-            'traefik.enable=true',
-            'traefik.http.routers.app.rule=Host(`lifecycle-proof.example.test`) && PathPrefix(`/health`)',
-            'traefik.http.routers.app.entryPoints=https',
-            'traefik.http.routers.app.service=app',
-            'traefik.http.routers.app.tls=true',
-            'traefik.http.services.app.loadbalancer.server.port=3000',
-        ],
+        generatedLabels: $generatedLabels,
         target: $target,
     );
     $state = ApplicationBlueGreenDeployment::query()->create([
@@ -194,6 +194,8 @@ it('uses the canonical direct-origin planner and verifier for deployment and rec
         'blue_green_server_boot_id' => $bootId,
         'blue_green_topology_digest' => $fingerprint->topologyDigest,
         'blue_green_routing_config_digest' => $fingerprint->routingConfigDigest,
+        'blue_green_backend_port_inventory' => $backendPortInventory->serialized,
+        'blue_green_drain_backend_port_inventory' => $backendPortInventory->serialized,
         'blue_green_supersession_generation' => 1,
         'blue_green_previous_container_id' => $previousId,
         'blue_green_candidate_container_id' => $candidateId,
@@ -211,6 +213,8 @@ it('uses the canonical direct-origin planner and verifier for deployment and rec
         serverBootId: $bootId,
         topologyDigest: $fingerprint->topologyDigest,
         routingConfigDigest: $fingerprint->routingConfigDigest,
+        backendPortInventory: $backendPortInventory,
+        drainBackendPortInventory: $backendPortInventory,
         supersessionGeneration: 1,
         legacyContainerName: null,
         candidateContainerName: $application->uuid.'-blue',
@@ -290,12 +294,42 @@ it('uses the canonical direct-origin planner and verifier for deployment and rec
         $lifecycle->release();
     }
 
-    expect($forwardRequests)->toHaveCount(2)
+    expect($forwardRequests)->toHaveCount(count($backendPorts) * 2)
         ->each->toContain(VerifyBlueGreenPublicRecovery::DEPLOYMENT_NONCE_PARAMETER)
         ->and(collect($forwardRequests)->filter(
             static fn (string $input): bool => str_contains($input, 'X-Coolify-Blue-Green-Probe'),
-        ))->toHaveCount(1)
-        ->and($recoveryRequests)->toHaveCount(1)
+        ))->toHaveCount(count($backendPorts))
+        ->and($recoveryRequests)->toHaveCount(count($backendPorts))
         ->each->toContain(VerifyBlueGreenPublicRecovery::RECOVERY_NONCE_PARAMETER)
         ->not->toContain('X-Coolify-Blue-Green-Probe');
-});
+})->with([
+    'one exposed backend port' => [
+        [3000],
+        'https://lifecycle-proof.example.test',
+        [
+            'traefik.enable=true',
+            'traefik.http.routers.app.rule=Host(`lifecycle-proof.example.test`) && PathPrefix(`/health`)',
+            'traefik.http.routers.app.entryPoints=https',
+            'traefik.http.routers.app.service=app',
+            'traefik.http.routers.app.tls=true',
+            'traefik.http.services.app.loadbalancer.server.port=3000',
+        ],
+    ],
+    'two exposed backend ports' => [
+        [3000, 8080],
+        'https://lifecycle-web.example.test:3000,https://lifecycle-metrics.example.test:8080',
+        [
+            'traefik.enable=true',
+            'traefik.http.routers.web.rule=Host(`lifecycle-web.example.test`) && PathPrefix(`/health`)',
+            'traefik.http.routers.web.entryPoints=https',
+            'traefik.http.routers.web.service=web',
+            'traefik.http.routers.web.tls=true',
+            'traefik.http.services.web.loadbalancer.server.port=3000',
+            'traefik.http.routers.metrics.rule=Host(`lifecycle-metrics.example.test`) && PathPrefix(`/health`)',
+            'traefik.http.routers.metrics.entryPoints=https',
+            'traefik.http.routers.metrics.service=metrics',
+            'traefik.http.routers.metrics.tls=true',
+            'traefik.http.services.metrics.loadbalancer.server.port=8080',
+        ],
+    ],
+]);

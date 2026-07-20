@@ -385,12 +385,12 @@ final class BlueGreenDeploymentLifecycle
         if ($inspection->dockerId !== $expectation->dockerId) {
             throw new DeploymentException('The previous Docker identity changed before destination-fenced retirement.');
         }
-        $port = $this->application->blueGreenDeploymentBackendPort()
-            ?? throw new DeploymentException('The blue-green backend port became ambiguous before previous-container drain.');
+        $ports = $claim->drainBackendPortInventory?->ports()
+            ?? throw new DeploymentException('The blue-green operation has no immutable previous-container backend port inventory.');
         $stopTimeout = $this->application->settings->deploymentStopGracePeriodSeconds();
         $drainer = new DrainBlueGreenPreviousContainer;
         $drainState = (new RecordBlueGreenDrainObservation)->deadlineFor($claim);
-        $activeConnections = $drainer->activeConnections($this->server, $expectation, $port);
+        $activeConnections = $drainer->activeConnections($this->server, $expectation, $ports);
         $drainState = (new RecordBlueGreenDrainObservation)->record($claim, $activeConnections);
         $drainDeadline = $drainState->operation_drain_deadline_at
             ?? throw new DeploymentException('The blue-green drain has no durable deadline.');
@@ -401,7 +401,7 @@ final class BlueGreenDeploymentLifecycle
             $this->destinationState = $this->executeDestinationMutation(
                 $drainer->commandsFor(
                     $expectation,
-                    $port,
+                    $ports,
                     $drainDeadline->getTimestamp(),
                     $stopTimeout,
                     $activeConnections === 0,
@@ -1051,8 +1051,7 @@ final class BlueGreenDeploymentLifecycle
     ): BlueGreenRoutingTarget {
         $claim = $this->claim
             ?? throw new DeploymentException('Cannot compile blue-green routing without a durable claim.');
-        $port = $this->application->blueGreenDeploymentBackendPort()
-            ?? throw new DeploymentException('The blue-green backend port became ambiguous during promotion.');
+        $ports = $claim->backendPortInventory->ports();
         $activeContainer = $mode === BlueGreenRoutingMode::LegacyRecoveryBridge
             ? $this->previousContainerExpectation
             : ($activeColor === $claim->pendingColor
@@ -1086,7 +1085,8 @@ final class BlueGreenDeploymentLifecycle
             activeColor: $activeColor,
             blueContainerName: $this->containerName(BlueGreenDeploymentColor::BLUE),
             greenContainerName: $this->containerName(BlueGreenDeploymentColor::GREEN),
-            port: $port,
+            port: $ports[0],
+            ports: $ports,
             routingRevision: $claim->expectedRoutingRevision,
             mode: $mode,
             probeHeaderName: $probeHeader,

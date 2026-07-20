@@ -1,5 +1,6 @@
 <?php
 
+use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
 use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\FindBlueGreenDeactivationFence;
@@ -123,6 +124,8 @@ function applicationDeploymentBlueGreenClaim(
         serverBootId: '11111111-2222-3333-4444-555555555555',
         topologyDigest: hash('sha256', 'application-destination-topology'),
         routingConfigDigest: hash('sha256', 'application-routing-configuration'),
+        backendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
+        drainBackendPortInventory: null,
         supersessionGeneration: 1,
         legacyContainerName: null,
         candidateContainerName: $application->uuid.'-blue',

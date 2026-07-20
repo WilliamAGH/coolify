@@ -1,5 +1,6 @@
 <?php
 
+use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\ExecuteBlueGreenDestinationMutation;
 use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
@@ -37,6 +38,8 @@ it('requires reconciliation before a distinct successor mutation can run', funct
             serverBootId: '11111111-2222-3333-4444-555555555555',
             topologyDigest: hash('sha256', 'topology'),
             routingConfigDigest: hash('sha256', 'routing'),
+            backendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
+            drainBackendPortInventory: null,
             supersessionGeneration: 1,
             legacyContainerName: null,
         );
