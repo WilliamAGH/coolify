@@ -7,6 +7,7 @@ All notable changes to this project will be documented in this file.
 ### 🚀 Features
 
 - *(realtime)* Bundle Reverb and terminal in main image (#62)
+- *(blue-green)* Support multiple backend ports
 
 ### 🐛 Bug Fixes
 
@@ -35,6 +36,7 @@ All notable changes to this project will be documented in this file.
 - Update changelog (#59)
 - Update changelog (#60)
 - Update changelog (#65)
+- Update changelog (#67)
 
 ### 🧪 Testing
 
