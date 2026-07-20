@@ -1677,6 +1677,29 @@ jobs:
             printf 'ARCHIVE_SHA256=%s\n' "$(sha256sum "$archive" | awk '{print $1}')"
           } > "fork-image/${ARTIFACT_NAME}-${ARCH}.candidate.env"
 
+      - name: Verify exact fork control-plane OCI runtime and content
+        if: ${{ matrix.product == 'main' }}
+        env:
+          ARCH: ${{ matrix.arch }}
+          ARTIFACT_NAME: ${{ matrix.artifact_name }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -Eeuo pipefail
+          archive="fork-image/${ARTIFACT_NAME}-${ARCH}.oci.tar"
+          candidate="fork-image/${ARTIFACT_NAME}-${ARCH}.candidate.env"
+          image="local/${ARTIFACT_NAME}:${GITHUB_SHA}-${ARCH}-fork-runtime"
+          archive_sha256="$(sed -n 's/^ARCHIVE_SHA256=//p' "$candidate")"
+          child_digest="$(sed -n 's/^CHILD_DIGEST=//p' "$candidate")"
+          printf '%s' "$archive_sha256" | grep -Eq '^[0-9a-f]{64}$'
+          printf '%s' "$child_digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          OCI_ARCHIVE="$archive" \
+            OCI_ARCHIVE_SHA256="$archive_sha256" \
+            OCI_CHILD_DIGEST="$child_digest" \
+            OCI_CONTENT_POLICY=control-plane-main \
+            OCI_IMAGE="$image" \
+            OCI_PLATFORM="$PLATFORM" \
+            tests/Integration/VerifyOciArchiveImage.sh
+
       - name: Generate standalone fork SPDX SBOM
         id: fork-sbom
         continue-on-error: true

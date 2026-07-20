@@ -864,6 +864,18 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
         $violations[] = 'production and staging must verify the exact OCI archive on each native architecture';
     }
 
+    $forkContentGate = releaseWorkflowStep(
+        $jobs['fork-build'] ?? [],
+        'Verify exact fork control-plane OCI runtime and content',
+    );
+    $forkContentGateRun = (string) ($forkContentGate['run'] ?? '');
+    if (($forkContentGate['if'] ?? null) !== "\${{ matrix.product == 'main' }}" ||
+        ($forkContentGate['continue-on-error'] ?? false) !== false ||
+        ! str_contains($forkContentGateRun, 'OCI_CONTENT_POLICY=control-plane-main') ||
+        ! str_contains($forkContentGateRun, 'tests/Integration/VerifyOciArchiveImage.sh')) {
+        $violations[] = 'both native fork control-plane OCI archives must pass the fail-closed runtime content census';
+    }
+
     return array_values(array_unique($violations));
 }
 function mutateReleaseWorkflow(array $sharedWorkflow, array $callers, string $mutation): array
@@ -990,6 +1002,37 @@ function mutateReleaseWorkflow(array $sharedWorkflow, array $callers, string $mu
 
             return [$sharedWorkflow, $callers];
         })(),
+        'remove-fork-control-plane-census' => (function () use ($sharedWorkflow, $callers): array {
+            foreach ($sharedWorkflow['jobs']['fork-build']['steps'] as $index => $step) {
+                if (($step['name'] ?? null) === 'Verify exact fork control-plane OCI runtime and content') {
+                    unset($sharedWorkflow['jobs']['fork-build']['steps'][$index]);
+                }
+            }
+
+            return [$sharedWorkflow, $callers];
+        })(),
+        'misroute-fork-control-plane-census' => (function () use ($sharedWorkflow, $callers): array {
+            foreach ($sharedWorkflow['jobs']['fork-build']['steps'] as &$step) {
+                if (($step['name'] ?? null) === 'Verify exact fork control-plane OCI runtime and content') {
+                    $step['if'] = "\${{ matrix.product == 'realtime' }}";
+                    break;
+                }
+            }
+            unset($step);
+
+            return [$sharedWorkflow, $callers];
+        })(),
+        'allow-fork-control-plane-census-failure' => (function () use ($sharedWorkflow, $callers): array {
+            foreach ($sharedWorkflow['jobs']['fork-build']['steps'] as &$step) {
+                if (($step['name'] ?? null) === 'Verify exact fork control-plane OCI runtime and content') {
+                    $step['continue-on-error'] = true;
+                    break;
+                }
+            }
+            unset($step);
+
+            return [$sharedWorkflow, $callers];
+        })(),
         default => throw new InvalidArgumentException("Unknown release workflow mutation: {$mutation}"),
     };
 }
@@ -1006,6 +1049,28 @@ it('enforces the shared Linux publication graph and caller boundaries', function
 
     expect(releaseFoundationWorkflowViolations($sharedWorkflow, $applicationValidationWorkflow, $callers))->toBe([]);
 });
+
+it('rejects fork publication graphs that bypass the exact control-plane image census', function (string $mutation) {
+    $root = releaseWorkflowRepositoryRoot();
+    $sharedWorkflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $applicationValidationWorkflow = Yaml::parseFile($root.'/.github/workflows/application-validation.yml');
+    $callers = [
+        'production' => Yaml::parseFile($root.'/.github/workflows/coolify-production-build.yml'),
+        'testing-host' => Yaml::parseFile($root.'/.github/workflows/coolify-testing-host.yml'),
+        'staging' => Yaml::parseFile($root.'/.github/workflows/coolify-staging-build.yml'),
+    ];
+    [$mutatedWorkflow, $mutatedCallers] = mutateReleaseWorkflow($sharedWorkflow, $callers, $mutation);
+
+    expect(releaseFoundationWorkflowViolations(
+        $mutatedWorkflow,
+        $applicationValidationWorkflow,
+        $mutatedCallers,
+    ))->toContain('both native fork control-plane OCI archives must pass the fail-closed runtime content census');
+})->with([
+    'missing census' => 'remove-fork-control-plane-census',
+    'census applied to the wrong image' => 'misroute-fork-control-plane-census',
+    'census allowed to fail' => 'allow-fork-control-plane-census-failure',
+]);
 
 it('fails closed across canonical publication and fork validation modes', function () {
     $root = releaseWorkflowRepositoryRoot();
@@ -1828,6 +1893,8 @@ it('defines one referrerless fork release graph for both images and both platfor
     $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
     $caller = Yaml::parseFile($root.'/.github/workflows/publish-fork.yml');
     $jobs = $workflow['jobs'] ?? [];
+
+    expect(is_executable($root.'/tests/Integration/VerifyOciArchiveImage.sh'))->toBeTrue();
 
     $matrix = $jobs['fork-build']['strategy']['matrix']['include'] ?? [];
     $contracts = array_map(
