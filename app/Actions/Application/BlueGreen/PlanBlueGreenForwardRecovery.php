@@ -13,8 +13,15 @@ final class PlanBlueGreenForwardRecovery
 {
     use AsAction;
 
-    public function handle(BlueGreenDeploymentRecoveryOperation $operation): BlueGreenForwardRecoveryPlan
-    {
+    /**
+     * @param  list<BlueGreenReplicaInspection>  $candidateReplicas
+     * @param  list<BlueGreenReplicaInspection>  $previousReplicas
+     */
+    public function handle(
+        BlueGreenDeploymentRecoveryOperation $operation,
+        array $candidateReplicas = [],
+        array $previousReplicas = [],
+    ): BlueGreenForwardRecoveryPlan {
         $state = $operation->currentDestinationState
             ?? throw new RuntimeException('Forward recovery has no exact current destination state.');
         if ($state->activeColor !== $operation->claim->pendingColor
@@ -27,6 +34,21 @@ final class PlanBlueGreenForwardRecovery
             throw new RuntimeException('The application no longer has an exact blue-green backend port inventory.');
         }
         $applicationUuid = (string) $operation->application->uuid;
+        $blueBackends = $this->colorBackends(
+            BlueGreenDeploymentColor::BLUE,
+            $operation->claim,
+            $candidateReplicas,
+            $previousReplicas,
+            $applicationUuid,
+        );
+        $greenBackends = $this->colorBackends(
+            BlueGreenDeploymentColor::GREEN,
+            $operation->claim,
+            $candidateReplicas,
+            $previousReplicas,
+            $applicationUuid,
+        );
+        $usesReplicaBackends = max(count($blueBackends), count($greenBackends)) > 1;
         $target = new BlueGreenRoutingTarget(
             destinationId: $operation->destination->id,
             activeColor: $operation->claim->pendingColor,
@@ -45,6 +67,8 @@ final class PlanBlueGreenForwardRecovery
             activeDeploymentUuid: $state->activeDeploymentUuid,
             activeContainerId: $state->activeContainerId,
             destinationTopologyDigest: $state->destinationTopologyDigest,
+            blueReplicaBackends: $usesReplicaBackends ? $blueBackends : null,
+            greenReplicaBackends: $usesReplicaBackends ? $greenBackends : null,
         );
         $configuration = CompileBlueGreenProxyConfiguration::run(
             $operation->application,
@@ -64,5 +88,28 @@ final class PlanBlueGreenForwardRecovery
             publicAcknowledgement: $target->publicAcknowledgement()
                 ?? throw new RuntimeException('The canonical final route has no durable public acknowledgement.'),
         );
+    }
+
+    /**
+     * @param  list<BlueGreenReplicaInspection>  $candidateReplicas
+     * @param  list<BlueGreenReplicaInspection>  $previousReplicas
+     * @return non-empty-list<string>
+     */
+    private function colorBackends(
+        BlueGreenDeploymentColor $color,
+        BlueGreenDeploymentClaim $claim,
+        array $candidateReplicas,
+        array $previousReplicas,
+        string $applicationUuid,
+    ): array {
+        $replicas = $color === $claim->pendingColor ? $candidateReplicas : $previousReplicas;
+        if ($replicas !== []) {
+            return array_map(
+                static fn (BlueGreenReplicaInspection $inspection): string => $inspection->containerName,
+                $replicas,
+            );
+        }
+
+        return ["{$applicationUuid}-{$color->value}"];
     }
 }

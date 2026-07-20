@@ -12,6 +12,7 @@ use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\ApplicationSetting;
 use App\Models\StandaloneDocker;
+use App\Support\BlueGreenComposeTopology;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Facades\DB;
 use Lorisleiva\Actions\Concerns\AsAction;
@@ -292,6 +293,24 @@ class ClaimBlueGreenDeployment
             if ($deploymentUpdated !== 1) {
                 throw new BlueGreenDeploymentTransitionException('The deployment queue entry changed while blue-green ownership was being claimed.');
             }
+
+            $composeServiceBase = $lockedApplication->build_pack === 'dockercompose'
+                ? BlueGreenComposeTopology::fromApplication($lockedApplication)->candidateServiceName($pendingColor)
+                : $claim->candidateContainerName;
+            if (! is_string($composeServiceBase) || $composeServiceBase === '') {
+                throw new BlueGreenDeploymentTransitionException('The blue-green replica set has no exact Compose service identity.');
+            }
+            (new ReserveBlueGreenReplicaSet)->handle(
+                application: $lockedApplication,
+                state: $state,
+                color: $pendingColor,
+                deploymentUuid: $lockedDeployment->deployment_uuid,
+                routingRevision: $expectedRoutingRevision,
+                composeServiceBase: $composeServiceBase,
+                scalarContainerName: $claim->candidateContainerName
+                    ?? throw new BlueGreenDeploymentTransitionException('The blue-green claim has no scalar candidate identity.'),
+                replicaCount: $setting->blueGreenReplicaCount(),
+            );
 
             return $claim;
         }, attempts: 5);

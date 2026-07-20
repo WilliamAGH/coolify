@@ -14,6 +14,14 @@ final readonly class BlueGreenRoutingTarget
     /** @var non-empty-list<int> */
     public array $ports;
 
+    /** @var non-empty-list<string> */
+    public array $blueReplicaBackends;
+
+    /** @var non-empty-list<string> */
+    public array $greenReplicaBackends;
+
+    public bool $usesExplicitReplicaBackends;
+
     public static function managedFilename(string $applicationUuid, int $destinationId): string
     {
         return 'coolify-blue-green-'.self::routingScope($applicationUuid, $destinationId).'.yaml';
@@ -139,6 +147,8 @@ final readonly class BlueGreenRoutingTarget
         public ?string $activeContainerId = null,
         public ?string $destinationTopologyDigest = null,
         ?array $ports = null,
+        ?array $blueReplicaBackends = null,
+        ?array $greenReplicaBackends = null,
     ) {
         if ($destinationId < 0) {
             throw new InvalidArgumentException('The destination ID must be a nonnegative integer.');
@@ -156,6 +166,20 @@ final readonly class BlueGreenRoutingTarget
         }
         $this->assertContainerName($blueContainerName);
         $this->assertContainerName($greenContainerName);
+        if (($blueReplicaBackends === null) !== ($greenReplicaBackends === null)) {
+            throw new InvalidArgumentException('Blue and green replica backend inventories must be supplied together.');
+        }
+        $this->usesExplicitReplicaBackends = $blueReplicaBackends !== null;
+        $this->blueReplicaBackends = $this->normalizeReplicaBackends(
+            $blueReplicaBackends ?? [$blueContainerName],
+        );
+        $this->greenReplicaBackends = $this->normalizeReplicaBackends(
+            $greenReplicaBackends ?? [$greenContainerName],
+        );
+        if ($this->usesExplicitReplicaBackends
+            && max(count($this->blueReplicaBackends), count($this->greenReplicaBackends)) < 2) {
+            throw new InvalidArgumentException('An explicit blue-green replica backend inventory must contain at least one multi-replica color.');
+        }
 
         $probeSettingCount = count(array_filter(
             [$probeHeaderName, $probeToken, $probeColor],
@@ -265,13 +289,48 @@ final readonly class BlueGreenRoutingTarget
     ): string {
         $this->assertKnownPort($port);
 
-        return self::memberServiceReferenceForPort(
+        $reference = self::memberServiceNameForPort(
             $applicationUuid,
             $this->destinationId,
             $color,
             $port,
             count($this->ports) > 1,
         );
+
+        return $reference.($this->usesExplicitReplicaBackends ? '@file' : '@docker');
+    }
+
+    /** @return non-empty-list<string> */
+    public function replicaBackends(BlueGreenDeploymentColor $color): array
+    {
+        return $color === BlueGreenDeploymentColor::BLUE
+            ? $this->blueReplicaBackends
+            : $this->greenReplicaBackends;
+    }
+
+    /** @return non-empty-list<string> */
+    public function activeReplicaBackends(): array
+    {
+        return $this->replicaBackends($this->activeColor);
+    }
+
+    /** @return non-empty-list<string> */
+    public function inactiveReplicaBackends(): array
+    {
+        return $this->replicaBackends($this->inactiveColor());
+    }
+
+    public function replicaTopologyDigest(): ?string
+    {
+        if (! $this->usesExplicitReplicaBackends) {
+            return null;
+        }
+
+        return hash('sha256', implode("\0", [
+            ...$this->blueReplicaBackends,
+            '--green--',
+            ...$this->greenReplicaBackends,
+        ]));
     }
 
     public function probeAcknowledgement(): ?string
@@ -452,6 +511,9 @@ final readonly class BlueGreenRoutingTarget
         if ($this->fallbackContainerName !== null) {
             $identity[] = $this->fallbackContainerName;
         }
+        if ($this->replicaTopologyDigest() !== null) {
+            $identity[] = $this->replicaTopologyDigest();
+        }
 
         return hash_hmac('sha256', implode("\0", $identity), $token);
     }
@@ -475,6 +537,28 @@ final readonly class BlueGreenRoutingTarget
             $normalized[] = $port;
         }
         sort($normalized, SORT_NUMERIC);
+
+        return $normalized;
+    }
+
+    /** @return non-empty-list<string> */
+    private function normalizeReplicaBackends(array $backends): array
+    {
+        if (! array_is_list($backends) || $backends === []) {
+            throw new InvalidArgumentException('Blue-green replica backends must be a non-empty list.');
+        }
+
+        $normalized = [];
+        foreach ($backends as $backend) {
+            if (! is_string($backend)) {
+                throw new InvalidArgumentException('Blue-green replica backend identities must be strings.');
+            }
+            $this->assertContainerName($backend);
+            if (in_array($backend, $normalized, true)) {
+                throw new InvalidArgumentException('Blue-green replica backend identities must be unique.');
+            }
+            $normalized[] = $backend;
+        }
 
         return $normalized;
     }

@@ -9,9 +9,11 @@ use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
+use App\Models\ApplicationBlueGreenReplica;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Lorisleiva\Actions\Concerns\AsAction;
@@ -78,6 +80,22 @@ final class RetireBlueGreenInactiveContainer
             if ($server === null
                 || ReadBlueGreenServerBootIdentity::run($server) !== $state->inactive_retirement_server_boot_id) {
                 return $this->markIntervention($state, $ownerDeployment, 'The server boot identity changed before inactive-color retirement.');
+            }
+            $replicas = ApplicationBlueGreenReplica::query()
+                ->where('application_blue_green_deployment_id', $state->id)
+                ->where('deployment_uuid', $inactiveDeployment->deployment_uuid)
+                ->where('color', $state->inactive_retirement_color->value)
+                ->orderBy('replica_index')
+                ->get();
+            if ($replicas->count() > DEFAULT_BLUE_GREEN_REPLICA_COUNT) {
+                return $this->retireReplicaSet(
+                    $state,
+                    $application,
+                    $destination,
+                    $ownerDeployment,
+                    $inactiveDeployment,
+                    $replicas,
+                );
             }
             $expectation = new BlueGreenContainerExpectation(
                 name: $application->uuid.'-'.$state->inactive_retirement_color->value,
@@ -176,6 +194,119 @@ final class RetireBlueGreenInactiveContainer
                 $lock->release();
             }
         }
+    }
+
+    /** @param Collection<int, ApplicationBlueGreenReplica> $replicas */
+    private function retireReplicaSet(
+        ApplicationBlueGreenDeployment $state,
+        Application $application,
+        StandaloneDocker $destination,
+        ApplicationDeploymentQueue $ownerDeployment,
+        ApplicationDeploymentQueue $inactiveDeployment,
+        Collection $replicas,
+    ): string {
+        $server = $destination->server
+            ?? throw new BlueGreenDeploymentTransitionException('The inactive replica destination has no server.');
+        $routingRevisions = $replicas->pluck('routing_revision')->unique()->values();
+        if ($routingRevisions->count() !== 1) {
+            throw new BlueGreenDeploymentTransitionException('The retained inactive replica set has conflicting routing revisions.');
+        }
+        $inspections = InspectBlueGreenReplicaSet::run(
+            $server,
+            $state,
+            $inactiveDeployment->deployment_uuid,
+            $state->inactive_retirement_color,
+            (int) $routingRevisions->sole(),
+            $replicas->count(),
+        );
+        if (! hash_equals(
+            $state->inactive_retirement_container_id,
+            BlueGreenReplicaSet::identityDigest($inspections),
+        )) {
+            return $this->markIntervention($state, $ownerDeployment, 'The exact retained inactive replica set changed identity.');
+        }
+        $expectedState = ResolveBlueGreenExpectedProxyState::run($application, $destination, $state->fresh());
+        if ($expectedState === null
+            || $expectedState->activeColor === $state->inactive_retirement_color
+            || $expectedState->activeDeploymentUuid !== $ownerDeployment->deployment_uuid) {
+            return $this->markIntervention($state, $ownerDeployment, 'The managed route no longer proves the retained replica set is inactive.');
+        }
+        $replacementState = $expectedState->withMutationOwner($ownerDeployment->deployment_uuid);
+        if (collect($inspections)->every(
+            static fn (BlueGreenReplicaInspection $inspection): bool => $inspection->status !== 'running',
+        )) {
+            if ($this->attestDestinationState($server, $replacementState)) {
+                $this->markStopped($state, $ownerDeployment, $expectedState, $replacementState);
+
+                return self::COMPLETED;
+            }
+            if (! $this->attestDestinationState($server, $expectedState)) {
+                return $this->markIntervention($state, $ownerDeployment, 'The stopped inactive replica set has no exact expected or completed destination sidecar.');
+            }
+            $this->markStopped($state, $ownerDeployment, null, null);
+
+            return self::COMPLETED;
+        }
+
+        $drainBackendPortInventory = BlueGreenBackendPortInventory::fromSerialized(
+            $ownerDeployment->blue_green_drain_backend_port_inventory,
+        );
+        $inactiveBackendPortInventory = BlueGreenBackendPortInventory::fromSerialized(
+            $inactiveDeployment->blue_green_backend_port_inventory,
+        );
+        if (! hash_equals($drainBackendPortInventory->serialized, $inactiveBackendPortInventory->serialized)) {
+            throw new BlueGreenDeploymentTransitionException('The delayed replica retirement backend port inventory no longer matches the exact inactive deployment.');
+        }
+        $ports = $drainBackendPortInventory->ports();
+        $drainer = new DrainBlueGreenPreviousContainer;
+        $commands = [];
+        $completionAssertions = [];
+        $activeConnections = 0;
+        foreach ($inspections as $inspection) {
+            $expectation = new BlueGreenContainerExpectation(
+                name: $inspection->containerName,
+                dockerId: $inspection->dockerId,
+                applicationId: $application->id,
+                pullRequestId: 0,
+                blueGreenManaged: true,
+                deploymentUuid: $inactiveDeployment->deployment_uuid,
+                color: $state->inactive_retirement_color,
+                routingRevision: (int) $routingRevisions->sole(),
+            );
+            $connections = $drainer->activeConnections($server, $expectation, $ports);
+            $activeConnections += $connections;
+            array_push($commands, ...$drainer->commandsFor(
+                $expectation,
+                $ports,
+                $state->inactive_retirement_drain_deadline_at->getTimestamp(),
+                $state->inactive_retirement_stop_grace_seconds,
+                $connections === 0,
+            ));
+            array_push($completionAssertions, ...$drainer->completionAssertionsFor($expectation));
+        }
+        $this->recordObservation($state, $activeConnections);
+        try {
+            (new ExecuteBlueGreenDestinationMutation)->handle(
+                $server,
+                $expectedState,
+                $replacementState,
+                $commands,
+                $completionAssertions,
+                $state->inactive_retirement_server_boot_id,
+            );
+        } catch (Throwable $exception) {
+            if (! str_contains($exception->getMessage(), DrainBlueGreenPreviousContainer::TIMEOUT_MARKER)) {
+                throw $exception;
+            }
+
+            return $this->recordTimeout($state, $ownerDeployment, $activeConnections);
+        }
+        ApplicationBlueGreenReplica::query()
+            ->whereKey($replicas->modelKeys())
+            ->update(['health_status' => 'stopped', 'last_observed_at' => now()]);
+        $this->markStopped($state, $ownerDeployment, $expectedState, $replacementState);
+
+        return self::COMPLETED;
     }
 
     /** @return array{ApplicationBlueGreenDeployment, Application, StandaloneDocker, ApplicationDeploymentQueue, ApplicationDeploymentQueue}|null */

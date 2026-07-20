@@ -2,6 +2,7 @@
 
 namespace App\Actions\Application\BlueGreen;
 
+use App\Enums\BlueGreenDeploymentColor;
 use App\Support\ValidationPatterns;
 use InvalidArgumentException;
 
@@ -15,6 +16,7 @@ final readonly class BlueGreenContainerRemovalPlan
         public ?int $greenRoutingRevision,
         public ?string $legacyContainerName,
         public int $stopGracePeriodSeconds,
+        public array $replicaContainers = [],
     ) {
         if ($this->applicationId < 1) {
             throw new InvalidArgumentException('The blue-green application identifier must be positive.');
@@ -39,6 +41,19 @@ final readonly class BlueGreenContainerRemovalPlan
             if ($routingRevision !== null && $routingRevision < 1) {
                 throw new InvalidArgumentException('A tracked blue-green container must have a positive routing revision.');
             }
+        }
+        foreach ($this->replicaContainers as $replica) {
+            if (! is_array($replica)
+                || ! is_string($replica['name'] ?? null)
+                || ! is_string($replica['id'] ?? null)
+                || preg_match('/^[a-f0-9]{64}$/D', $replica['id']) !== 1
+                || ! ($replica['color'] ?? null) instanceof BlueGreenDeploymentColor
+                || ! is_int($replica['routingRevision'] ?? null)
+                || ! is_string($replica['deploymentUuid'] ?? null)
+                || ! is_int($replica['index'] ?? null)) {
+                throw new InvalidArgumentException('A blue-green replica removal entry requires complete immutable provenance.');
+            }
+            $this->assertContainerName($replica['name']);
         }
     }
 

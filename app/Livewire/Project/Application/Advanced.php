@@ -69,6 +69,9 @@ class Advanced extends Component
     #[Validate(['integer', 'min:0', 'max:3600'])]
     public int $blueGreenInactiveRetentionSeconds = DEFAULT_BLUE_GREEN_INACTIVE_RETENTION_SECONDS;
 
+    #[Validate(['integer', 'min:1', 'max:32'])]
+    public int $blueGreenReplicaCount = DEFAULT_BLUE_GREEN_REPLICA_COUNT;
+
     #[Validate(['boolean'])]
     public bool $isBuildServerEnabled = false;
 
@@ -162,6 +165,7 @@ class Advanced extends Component
         // Convert null to empty string to prevent dirty detection issues
         $this->stopGracePeriod = $this->application->settings->stop_grace_period ?? '';
         $this->blueGreenInactiveRetentionSeconds = $this->application->settings->blueGreenInactiveRetentionSeconds();
+        $this->blueGreenReplicaCount = $this->application->settings->blueGreenReplicaCount();
     }
 
     private function resetDefaultLabels()
@@ -317,6 +321,33 @@ class Advanced extends Component
                 'blue_green_inactive_retention_seconds' => (int) $validated['retentionSeconds'],
             ]);
             $this->dispatch('success', 'Blue-green inactive retention updated.');
+        } catch (ValidationException $exception) {
+            throw $exception;
+        } catch (\Throwable $exception) {
+            handleError($exception, $this);
+        }
+    }
+
+    public function saveBlueGreenReplicaCount(): void
+    {
+        try {
+            $this->authorize('update', $this->application);
+            $validated = Validator::make(
+                ['replicaCount' => $this->blueGreenReplicaCount],
+                ['replicaCount' => [
+                    'required',
+                    'integer',
+                    'min:'.MIN_BLUE_GREEN_REPLICA_COUNT,
+                    'max:'.MAX_BLUE_GREEN_REPLICA_COUNT,
+                ]],
+                [],
+                ['replicaCount' => 'blue-green replica count'],
+            )->validate();
+            $this->application->settings->update([
+                'blue_green_replica_count' => (int) $validated['replicaCount'],
+            ]);
+            $this->dispatch('success', 'Blue-green replica count updated.');
+            $this->dispatch('configurationChanged');
         } catch (ValidationException $exception) {
             throw $exception;
         } catch (\Throwable $exception) {

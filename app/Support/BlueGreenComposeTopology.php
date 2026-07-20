@@ -2,6 +2,7 @@
 
 namespace App\Support;
 
+use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Models\Application;
 use App\Models\EnvironmentVariable;
@@ -105,6 +106,7 @@ final class BlueGreenComposeTopology
         Application $application,
         BlueGreenDeploymentColor $color,
         array $blueGreenLabels,
+        int $replicaCount = DEFAULT_BLUE_GREEN_REPLICA_COUNT,
     ): array {
         $compose = self::arrayify($compose);
         $services = $compose['services'] ?? null;
@@ -114,6 +116,7 @@ final class BlueGreenComposeTopology
 
         $candidateService = $this->candidateServiceName($color);
         $candidateContainer = $this->candidateContainerName($application, $color);
+        $replicaSet = new BlueGreenReplicaSet($replicaCount);
         $renderedServices = [];
 
         foreach ($services as $serviceName => $service) {
@@ -122,6 +125,31 @@ final class BlueGreenComposeTopology
             }
 
             if ($serviceName === $this->routedService) {
+                if (! $replicaSet->usesScalarCompatibilityPath()) {
+                    foreach ($replicaSet->indexes() as $replicaIndex) {
+                        $replicaService = $replicaSet->serviceName($candidateService, $replicaIndex);
+                        $replica = self::rewriteRoutedServiceReferences($service, $this->routedService, $replicaService);
+                        unset($replica['container_name']);
+                        $replica['networks'] = self::colorizeNetworkAliases(
+                            $replica['networks'] ?? [],
+                            $replicaService,
+                            $color,
+                        );
+                        $replica['labels'] = self::candidateLabels(
+                            $replica['labels'] ?? [],
+                            [...$blueGreenLabels, ...$replicaSet->labels($replicaIndex)],
+                            $replicaService,
+                        );
+                        $replica['environment'] = self::setEnvironmentValue(
+                            $replica['environment'] ?? [],
+                            'COOLIFY_CONTAINER_NAME',
+                            $replicaService,
+                        );
+                        $renderedServices[$replicaService] = $replica;
+                    }
+
+                    continue;
+                }
                 $service = self::rewriteRoutedServiceReferences($service, $this->routedService, $candidateService);
                 $service['container_name'] = $candidateContainer;
                 $service['networks'] = self::colorizeNetworkAliases(

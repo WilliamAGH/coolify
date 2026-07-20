@@ -294,6 +294,42 @@ it('color-swaps only the routed Compose service and preserves every fixed sideca
         ->and($rendered['services'])->not->toHaveKey('web');
 });
 
+it('renders replica services without container name while preserving fixed sidecars', function (): void {
+    $application = blueGreenComposeApplication();
+    $topology = BlueGreenComposeTopology::fromApplication($application);
+    $compose = Yaml::parse($application->docker_compose);
+
+    $rendered = $topology->renderCandidate(
+        compose: $compose,
+        application: $application,
+        color: BlueGreenDeploymentColor::BLUE,
+        blueGreenLabels: [
+            'coolify.blueGreen.managed=true',
+            'coolify.blueGreen.color=blue',
+            'coolify.blueGreen.routingRevision=3',
+            'coolify.blueGreen.deploymentUuid=deployment-blue-replicas',
+        ],
+        replicaCount: 3,
+    );
+
+    expect(array_keys($rendered['services']))->toContain(
+        'web-blue-replica-1',
+        'web-blue-replica-2',
+        'web-blue-replica-3',
+        'db',
+        'worker',
+    )->not->toContain('web', 'web-blue');
+    foreach ([1, 2, 3] as $replicaIndex) {
+        $service = $rendered['services']["web-blue-replica-{$replicaIndex}"];
+        expect($service)->not->toHaveKey('container_name')
+            ->and($service['environment']['COOLIFY_CONTAINER_NAME'])->toBe("web-blue-replica-{$replicaIndex}")
+            ->and($service['labels'])->toContain(
+                "coolify.blueGreen.replicaIndex={$replicaIndex}",
+                'coolify.blueGreen.replicaCount=3',
+            );
+    }
+});
+
 it('compiles the managed route from the parsed routed service labels', function (): void {
     $application = blueGreenComposeApplication();
     $destination = StandaloneDocker::query()->with('server')->findOrFail($application->destination_id);
