@@ -2357,7 +2357,7 @@ jobs:
       contents: write
     runs-on:
       group: coolify-trusted
-      labels: [self-hosted, linux, x64]
+      labels: [self-hosted, Linux, X64, williamacallahan]
     outputs:
       main_digest: ${{ needs.fork-stage.outputs.main_index_digest }}
       main_image: ${{ steps.references.outputs.main_image }}

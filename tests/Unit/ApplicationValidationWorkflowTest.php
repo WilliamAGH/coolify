@@ -348,7 +348,7 @@ function applicationValidationWorkflowViolations(array $workflow): array
     $bundledRuntime = collect($testingHostRuntime['steps'] ?? [])
         ->firstWhere('name', 'Run exact bundled Reverb and terminal runtime contract');
     if (! is_array($bundledRuntime)
-        || ($bundledRuntime['env']['PRODUCTION_IMAGE'] ?? null) !== 'coolify:application-validation-${{ github.sha }}'
+        || ($bundledRuntime['env']['PRODUCTION_IMAGE'] ?? null) !== 'coolify:application-validation-${{ inputs.source_sha || github.sha }}'
         || ($bundledRuntime['run'] ?? null) !== 'tests/Integration/RealtimeImageTest.sh') {
         $violations[] = 'application validation must execute the bundled Reverb and terminal contract against the exact production image';
     }

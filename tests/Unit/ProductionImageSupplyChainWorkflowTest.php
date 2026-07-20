@@ -658,7 +658,7 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
     if (($applicationValidationWorkflow['permissions'] ?? null) !== ['contents' => 'read']) {
         $violations[] = 'application validation must use read-only repository permissions';
     }
-    if (($applicationValidationWorkflow['concurrency']['group'] ?? null) !== 'application-validation-${{ github.event.pull_request.number || github.ref }}' ||
+    if (($applicationValidationWorkflow['concurrency']['group'] ?? null) !== 'application-validation-${{ inputs.source_sha || github.event.pull_request.number || github.ref }}' ||
         ($applicationValidationWorkflow['concurrency']['cancel-in-progress'] ?? null) !== '${{ github.event_name == \'pull_request\' }}') {
         $violations[] = 'application validation must serialize pushes without cancellation while superseding stale pull requests';
     }
@@ -751,8 +751,8 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
         $testingHostRuntimeJob,
         'Run exact bundled Reverb and terminal runtime contract',
     );
-    $testingHostImage = 'coolify-testing-host:application-validation-${{ github.sha }}';
-    $productionImage = 'coolify:application-validation-${{ github.sha }}';
+    $testingHostImage = 'coolify-testing-host:application-validation-${{ inputs.source_sha || github.sha }}';
+    $productionImage = 'coolify:application-validation-${{ inputs.source_sha || github.sha }}';
     if (($testingHostRuntimeJob['timeout-minutes'] ?? null) !== 75 ||
         ($testingHostRuntimeJob['if'] ?? null) !== '${{ github.event_name == \'pull_request\' }}' ||
         ! str_contains($testingHostBuildScript, 'docker buildx build --load --pull') ||
@@ -791,6 +791,7 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
         '.github/workflows/coolify-production-build.yml',
         '.github/workflows/coolify-staging-build.yml',
         '.github/workflows/coolify-testing-host.yml',
+        '.github/workflows/gate-v4x-candidate.yml',
         '.github/workflows/publish-fork.yml',
         '.github/workflows/publish-linux-image.yml',
         '.github/workflows/release-operational-acceptance.yml',
@@ -862,8 +863,8 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
     }
 
     $productionNeeds = releaseWorkflowNeeds($callers['production']['jobs']['resolve-version'] ?? []);
-    if (! in_array('application-validation', $productionNeeds, true)) {
-        $violations[] = 'production publication must wait for application validation';
+    if (! in_array('validation-required', $productionNeeds, true)) {
+        $violations[] = 'production publication must wait for a trusted preflight or hosted validation';
     }
 
     $archiveGate = releaseWorkflowStep(
@@ -1145,7 +1146,7 @@ it('uses the trusted fork promotion runner while keeping pull-request validation
 
     expect($sharedWorkflow['jobs']['fork-release']['runs-on'] ?? null)->toBe([
         'group' => 'coolify-trusted',
-        'labels' => ['self-hosted', 'linux', 'x64'],
+        'labels' => ['self-hosted', 'Linux', 'X64', 'williamacallahan'],
     ]);
 
     foreach ($applicationValidationWorkflow['jobs'] ?? [] as $jobName => $job) {
@@ -1804,6 +1805,7 @@ it('rejects omission of an owned workflow from actionlint', function (string $wo
     'production caller' => '.github/workflows/coolify-production-build.yml',
     'staging caller' => '.github/workflows/coolify-staging-build.yml',
     'testing-host caller' => '.github/workflows/coolify-testing-host.yml',
+    'v4.x candidate gate' => '.github/workflows/gate-v4x-candidate.yml',
     'fork publisher' => '.github/workflows/publish-fork.yml',
     'reusable publisher' => '.github/workflows/publish-linux-image.yml',
     'operational acceptance' => '.github/workflows/release-operational-acceptance.yml',
