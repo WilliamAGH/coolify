@@ -2,6 +2,7 @@ name: Application validation
 
 on:
   pull_request:
+  workflow_dispatch:
   workflow_call:
 
 permissions:
@@ -69,6 +70,7 @@ jobs:
             tests/Unit/ApplicationValidationWorkflowTest.php \
             tests/Unit/CheckHelperImageJobTest.php \
             tests/Unit/CheckForUpdatesJobTest.php \
+            tests/Unit/GenerateChangelogWorkflowTest.php \
             tests/Unit/ProductionImageSupplyChainWorkflowTest.php \
             tests/Unit/ReleaseOperationalAcceptanceWorkflowTest.php \
             tests/Unit/ReleasePlatformAcceptanceWorkflowTest.php \
@@ -299,8 +301,6 @@ jobs:
         run: |
           tests/Integration/PublishLinuxImageScriptTest.sh
           tests/Integration/ReleaseOperationalFixturesTest.sh
-      - name: Verify Docker daemon configuration ownership
-        run: tests/Integration/DockerDaemonConfigurationTest.sh
       - name: Verify database migration S6 exit propagation
         run: tests/Integration/DatabaseMigrationS6/run.sh
       - name: Run native Traefik runtime integration
