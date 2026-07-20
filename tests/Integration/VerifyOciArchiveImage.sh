@@ -158,6 +158,20 @@ import tarfile
 archive_path = sys.argv[1]
 required_attestor = 'var/www/html/scripts/control-plane-traefik-attestor'
 allowed_service = 'etc/s6-overlay/s6-rc.d/control-plane-traefik-attestor'
+allowed_service_members = {
+    allowed_service,
+    f'{allowed_service}/dependencies.d',
+    f'{allowed_service}/dependencies.d/init-script',
+    f'{allowed_service}/run',
+    f'{allowed_service}/type',
+}
+required_service_members = {
+    allowed_service: 'directory',
+    f'{allowed_service}/dependencies.d/init-script': 'file',
+    f'{allowed_service}/run': 'executable',
+    f'{allowed_service}/type': 'file',
+    'etc/s6-overlay/s6-rc.d/user/contents.d/control-plane-traefik-attestor': 'file',
+}
 forbidden = []
 
 with tarfile.open(archive_path, 'r:*') as archive:
@@ -170,16 +184,42 @@ with tarfile.open(archive_path, 'r:*') as archive:
     if attestor is None or not attestor.isfile() or attestor.mode & 0o111 == 0:
         raise SystemExit('bounded control-plane Traefik attestor is absent or not executable')
 
+    for path, expected_type in required_service_members.items():
+        member = members.get(path)
+        if member is None:
+            raise SystemExit(f'bounded attestor service member is absent: {path}')
+        if expected_type == 'directory' and not member.isdir():
+            raise SystemExit(f'bounded attestor service member is not a directory: {path}')
+        if expected_type in ('file', 'executable') and not member.isfile():
+            raise SystemExit(f'bounded attestor service member is not a regular file: {path}')
+        if expected_type == 'executable' and member.mode & 0o111 == 0:
+            raise SystemExit(f'bounded attestor service member is not executable: {path}')
+
+    service_type = archive.extractfile(members[f'{allowed_service}/type']).read().decode().strip()
+    if service_type != 'longrun':
+        raise SystemExit('bounded attestor service type is not longrun')
+
     for path, member in members.items():
         lowered = path.lower()
         parts = lowered.split('/')
         basename = parts[-1]
 
-        if 'haproxy' in parts or basename == 'traefik-ingress.sh':
+        if any('haproxy' in component for component in parts) or basename == 'traefik-ingress.sh':
             forbidden.append(path)
             continue
 
-        if lowered.startswith('var/www/html/docker/control-plane-blue-green/controllers/'):
+        if (
+            lowered == 'var/www/html/docker/control-plane-blue-green/controllers'
+            or lowered.startswith('var/www/html/docker/control-plane-blue-green/controllers/')
+        ):
+            forbidden.append(path)
+            continue
+
+        if lowered.startswith('var/www/html/scripts/') and lowered != required_attestor:
+            forbidden.append(path)
+            continue
+
+        if lowered.startswith(f'{allowed_service}/') and path not in allowed_service_members:
             forbidden.append(path)
             continue
 
@@ -198,8 +238,7 @@ with tarfile.open(archive_path, 'r:*') as archive:
             and member.mode & 0o111
             and lowered != required_attestor
             and (
-                lowered.startswith('var/www/html/scripts/')
-                or lowered.startswith('usr/local/bin/')
+                lowered.startswith('usr/local/bin/')
             )
             and any(marker in basename for marker in ('control-plane', 'traefik', 'ingress'))
         ):
