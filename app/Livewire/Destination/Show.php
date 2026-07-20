@@ -4,6 +4,7 @@ namespace App\Livewire\Destination;
 
 use App\Actions\Proxy\RemoveProxyConnectedNetwork;
 use App\Models\StandaloneDocker;
+use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
 use Livewire\Attributes\Locked;
 use Livewire\Attributes\Validate;
@@ -32,8 +33,12 @@ class Show extends Component
             if (! $destination) {
                 return redirect()->route('destination.index');
             }
+            $this->authorize('view', $destination);
+
             $this->destination = $destination;
             $this->syncData();
+        } catch (AuthorizationException) {
+            abort(403);
         } catch (\Throwable $e) {
             return handleError($e, $this);
         }

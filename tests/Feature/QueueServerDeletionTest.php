@@ -38,6 +38,10 @@ it('chains blue-green resource deletion before the exact server deletion action 
             $server->hetzner_server_id,
             $server->cloud_provider_token_id,
             $server->team_id,
+            false,
+            $server->vultr_instance_id,
+            false,
+            $server->digitalocean_droplet_id,
         ),
     ]);
     Bus::assertNotDispatched(
@@ -84,7 +88,39 @@ it('directly dispatches the decorated server deletion job when the server is emp
                 $server->hetzner_server_id,
                 $server->cloud_provider_token_id,
                 $server->team_id,
+                false,
+                $server->vultr_instance_id,
+                false,
+                $server->digitalocean_droplet_id,
             ],
     );
     Queue::assertNothingPushed();
+});
+
+it('forwards every selected cloud provider deletion through the canonical server deletion action', function () {
+    $team = Team::factory()->create();
+    $server = Server::factory()->create([
+        'team_id' => $team->id,
+        'hetzner_server_id' => 123,
+        'vultr_instance_id' => 'instance-123',
+        'digitalocean_droplet_id' => 456,
+    ]);
+    Bus::fake();
+
+    QueueServerDeletion::run($server, false, true, true, true);
+
+    Bus::assertDispatchedWithoutChain(
+        static fn (JobDecorator $job): bool => $job->decorates(DeleteServer::class)
+            && $job->getParameters() === [
+                $server->id,
+                true,
+                $server->hetzner_server_id,
+                $server->cloud_provider_token_id,
+                $server->team_id,
+                true,
+                $server->vultr_instance_id,
+                true,
+                $server->digitalocean_droplet_id,
+            ],
+    );
 });

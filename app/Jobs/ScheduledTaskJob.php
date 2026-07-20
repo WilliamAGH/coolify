@@ -2,6 +2,7 @@
 
 namespace App\Jobs;
 
+use App\Contracts\SupportsScheduledDispatchOccurrence;
 use App\Events\ScheduledTaskDone;
 use App\Exceptions\NonReportableException;
 use App\Models\Application;
@@ -21,7 +22,7 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
 
-class ScheduledTaskJob implements ShouldBeEncrypted, ShouldQueue
+class ScheduledTaskJob implements ShouldBeEncrypted, ShouldQueue, SupportsScheduledDispatchOccurrence
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
@@ -63,12 +64,33 @@ class ScheduledTaskJob implements ShouldBeEncrypted, ShouldQueue
 
     public string $server_timezone = 'UTC';
 
+    private ?ScheduledDispatchOccurrence $scheduledDispatchOccurrence = null;
+
     public function __construct(ScheduledTask $task)
     {
         $this->onQueue(crons_queue());
 
         $this->task = $task;
         $this->timeout = $this->task->timeout ?? 300;
+    }
+
+    public function middleware(): array
+    {
+        return $this->scheduledDispatchOccurrence === null
+            ? []
+            : [$this->scheduledDispatchOccurrence];
+    }
+
+    public function withScheduledDispatchOccurrence(ScheduledDispatchOccurrence $occurrence): static
+    {
+        $this->scheduledDispatchOccurrence = $occurrence;
+
+        return $this;
+    }
+
+    public function finalizeScheduledDispatchOccurrenceAfterFailure(): bool
+    {
+        return $this->scheduledDispatchOccurrence?->completeAfterTerminalFailure() ?? false;
     }
 
     private function initializeExecutionContext(): void
@@ -217,6 +239,8 @@ class ScheduledTaskJob implements ShouldBeEncrypted, ShouldQueue
      */
     public function failed(?\Throwable $exception): void
     {
+        $this->finalizeScheduledDispatchOccurrenceAfterFailure();
+
         $this->team ??= Team::find($this->task->team_id);
 
         Log::channel('scheduled-errors')->error('ScheduledTask permanently failed', [

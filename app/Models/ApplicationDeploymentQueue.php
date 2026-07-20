@@ -116,6 +116,7 @@ class ApplicationDeploymentQueue extends Model
      * @var array<int, string>
      */
     protected $hidden = [
+        'logs',
         'configuration_snapshot',
         'configuration_diff',
         'prepared_activation_payload',
