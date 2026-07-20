@@ -359,6 +359,32 @@ function applicationValidationWorkflowViolations(array $workflow): array
     if (! str_contains((string) $traefikRuntimeScript, 'tests/Integration/ControlPlaneTraefik/run.sh')) {
         $violations[] = 'application validation must execute the native Traefik runtime integration';
     }
+    $workflowAndShellSteps = collect($workflowAndShell['steps'] ?? []);
+    $phpSetupIndex = $workflowAndShellSteps
+        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Set up PHP');
+    $composerDependenciesIndex = $workflowAndShellSteps
+        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Install Composer dependencies');
+    $traefikRuntimeIndex = $workflowAndShellSteps
+        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Run native Traefik runtime integration');
+    $phpSetup = $phpSetupIndex === false ? null : $workflowAndShellSteps->get($phpSetupIndex);
+    $composerDependencies = $composerDependenciesIndex === false ? null : $workflowAndShellSteps->get($composerDependenciesIndex);
+    if (! is_array($phpSetup)
+        || ($phpSetup['uses'] ?? null) !== 'shivammathur/setup-php@44454db4f0199b8b9685a5d763dc37cbf79108e1'
+        || ($phpSetup['with']['php-version'] ?? null) !== '8.5'
+        || ($phpSetup['with']['coverage'] ?? null) !== 'none'
+        || ($phpSetup['with']['extensions'] ?? null) !== 'mbstring, pdo_sqlite, redis') {
+        $violations[] = 'native Traefik runtime integration must configure pinned PHP 8.5';
+    }
+    if (! is_array($composerDependencies)
+        || ($composerDependencies['run'] ?? null) !== 'composer install --no-interaction --prefer-dist --optimize-autoloader') {
+        $violations[] = 'native Traefik runtime integration must install Composer dependencies';
+    }
+    if ($phpSetupIndex === false
+        || $composerDependenciesIndex === false
+        || $traefikRuntimeIndex === false
+        || ! ($phpSetupIndex < $composerDependenciesIndex && $composerDependenciesIndex < $traefikRuntimeIndex)) {
+        $violations[] = 'native Traefik runtime integration must prepare PHP and Composer before it runs';
+    }
 
     $testingHostRuntime = is_array($jobs) ? ($jobs['testing-host-runtime'] ?? []) : [];
     $bundledRuntime = collect($testingHostRuntime['steps'] ?? [])

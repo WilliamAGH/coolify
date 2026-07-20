@@ -347,6 +347,14 @@ jobs:
         run: tests/Integration/DockerDaemonConfigurationTest.sh
       - name: Verify database migration S6 exit propagation
         run: tests/Integration/DatabaseMigrationS6/run.sh
+      - name: Set up PHP
+        uses: shivammathur/setup-php@44454db4f0199b8b9685a5d763dc37cbf79108e1 # 2.36.0
+        with:
+          php-version: '8.5'
+          coverage: none
+          extensions: mbstring, pdo_sqlite, redis
+      - name: Install Composer dependencies
+        run: composer install --no-interaction --prefer-dist --optimize-autoloader
       - name: Run native Traefik runtime integration
         run: tests/Integration/ControlPlaneTraefik/run.sh
       - name: Require immutable external action and container references

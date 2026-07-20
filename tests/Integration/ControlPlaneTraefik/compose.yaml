@@ -11,6 +11,8 @@ services:
       - --providers.file.directory=/dynamic
       - --providers.file.watch=true
       - --providers.providersThrottleDuration=250ms
+      - --accesslog=true
+      - --accesslog.format=json
       - --log.level=ERROR
     ports:
       - 127.0.0.1:${TRAEFIK_HTTPS_PORT:?}:8443
@@ -33,6 +35,7 @@ services:
       - exec tail -f /dev/null
     volumes:
       - control-plane-dynamic:/dynamic
+      - control-plane-dynamic:/proxy/dynamic
     networks:
       - control-plane
 
@@ -41,12 +44,15 @@ services:
     environment:
       BACKEND_INSTANCE: blue
       CONTROL_PLANE_HEALTH_PROOF: ${CONTROL_PLANE_HEALTH_PROOF:?}
+      APPLICATION_STATE_DIRECTORY: /application-state
       STATE_DIRECTORY: /state
     volumes:
+      - ${APPLICATION_STATE_DIR:?}:/application-state
       - ${BACKEND_BLUE_STATE_DIR:?}:/state
       - ${CONTROL_PLANE_TRAEFIK_SCRIPT_DIRECTORY:?}/backend-server.js:/backend-server.js:ro
       - ${CONTROL_PLANE_TRAEFIK_SCRIPT_DIRECTORY:?}/transport-observer.js:/transport-observer.js:ro
     command: ['node', '/backend-server.js']
+    stop_grace_period: 40s
     labels:
       traefik.enable: "true"
       traefik.http.routers.integration-docker-provider.rule: "Host(`docker-provider.test`)"
@@ -54,6 +60,11 @@ services:
       traefik.http.routers.integration-docker-provider.tls: "true"
       traefik.http.routers.integration-docker-provider.service: integration-docker-provider
       traefik.http.services.integration-docker-provider.loadbalancer.server.port: "8080"
+      traefik.http.routers.runtime-application-docker.rule: "Host(`production-application.test`)"
+      traefik.http.routers.runtime-application-docker.entrypoints: https
+      traefik.http.routers.runtime-application-docker.tls: "true"
+      traefik.http.routers.runtime-application-docker.service: coolify-bg-2996dc1b6153b95b-blue
+      traefik.http.services.coolify-bg-2996dc1b6153b95b-blue.loadbalancer.server.port: "8080"
     networks:
       - control-plane
 
@@ -62,15 +73,19 @@ services:
     environment:
       BACKEND_INSTANCE: green
       CONTROL_PLANE_HEALTH_PROOF: ${CONTROL_PLANE_HEALTH_PROOF:?}
+      APPLICATION_STATE_DIRECTORY: /application-state
       STATE_DIRECTORY: /state
     volumes:
+      - ${APPLICATION_STATE_DIR:?}:/application-state
       - ${BACKEND_GREEN_STATE_DIR:?}:/state
       - ${CONTROL_PLANE_TRAEFIK_SCRIPT_DIRECTORY:?}/backend-server.js:/backend-server.js:ro
       - ${CONTROL_PLANE_TRAEFIK_SCRIPT_DIRECTORY:?}/transport-observer.js:/transport-observer.js:ro
     command: ['node', '/backend-server.js']
+    stop_grace_period: 40s
     labels:
       traefik.enable: "true"
       traefik.http.services.integration-backend-green.loadbalancer.server.port: "8080"
+      traefik.http.services.coolify-bg-2996dc1b6153b95b-green.loadbalancer.server.port: "8080"
     networks:
       - control-plane
 
