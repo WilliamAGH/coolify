@@ -301,6 +301,8 @@ jobs:
         run: |
           tests/Integration/PublishLinuxImageScriptTest.sh
           tests/Integration/ReleaseOperationalFixturesTest.sh
+      - name: Verify Docker daemon configuration ownership
+        run: tests/Integration/DockerDaemonConfigurationTest.sh
       - name: Verify database migration S6 exit propagation
         run: tests/Integration/DatabaseMigrationS6/run.sh
       - name: Run native Traefik runtime integration
