@@ -36,14 +36,14 @@ it('keeps the upgrade UI on the guarded fork release without upstream discovery'
 it('links fork versions to the fork release instead of the upstream tag', function () {
     config([
         'constants.coolify.version' => '4.13.1-fork',
-        'constants.coolify.fork_releases_url' => 'https://github.com/WilliamAGH/coolify/releases',
+        'constants.coolify.fork_releases_url' => 'https://github.com/williamacallahan/coolify/releases',
     ]);
 
     $html = view('components.version', [
         'attributes' => new ComponentAttributeBag,
     ])->render();
 
-    expect($html)->toContain('https://github.com/WilliamAGH/coolify/releases/tag/4.13.1-fork')
+    expect($html)->toContain('https://github.com/williamacallahan/coolify/releases/tag/4.13.1-fork')
         ->not->toContain('coollabsio/coolify/releases/tag');
 });
 

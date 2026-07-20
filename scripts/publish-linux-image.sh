@@ -406,8 +406,8 @@ validate_docker_alias_before_copy_failure_injection() {
 
     [[ "${PUBLISH_LINUX_IMAGE_FAILURE_INJECTION:-}" == 'docker-alias-before-copy' ]] \
         || die 'unsupported release failure injection mode'
-    [[ "${GITHUB_REPOSITORY:-}" == 'WilliamAGH/coolify' ]] \
-        || die 'release failure injection requires the WilliamAGH/coolify repository'
+    [[ "${GITHUB_REPOSITORY:-}" == 'williamacallahan/coolify' ]] \
+        || die 'release failure injection requires the williamacallahan/coolify repository'
     [[ "${GITHUB_EVENT_NAME:-}" == 'repository_dispatch' ]] \
         || die 'release failure injection requires a repository_dispatch event'
     [[ "${GITHUB_REF:-}" == 'refs/heads/v4.x' ]] \

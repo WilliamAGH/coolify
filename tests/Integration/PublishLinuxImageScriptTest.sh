@@ -601,7 +601,7 @@ failure_issue18_ghcr='ghcr.io/williamagh/coolify-remediation-issue18'
 failure_issue18_docker='docker.io/williamagh/coolify-remediation-issue18'
 
 export PUBLISH_LINUX_IMAGE_FAILURE_INJECTION='docker-alias-before-copy'
-export GITHUB_REPOSITORY='WilliamAGH/coolify'
+export GITHUB_REPOSITORY='williamacallahan/coolify'
 export GITHUB_EVENT_NAME='repository_dispatch'
 export GITHUB_REF='refs/heads/v4.x'
 export GITHUB_REF_PROTECTED='true'
