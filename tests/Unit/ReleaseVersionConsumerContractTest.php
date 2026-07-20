@@ -148,6 +148,10 @@ it('serves the workflow-published semantic tag to consumers through versions.jso
     }
 });
 
+it('owns the exact Traefik 3.6 release in versions.json', function () {
+    expect(releaseContractVersionsJson()['traefik']['v3.6'])->toBe('3.6.23');
+});
+
 it('orders the fork prerelease below its corresponding upstream stable release', function () {
     $published = releaseContractPublishedSemanticVersion();
     $stable = explode('-fork', $published, 2)[0];

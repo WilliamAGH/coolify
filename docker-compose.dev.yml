@@ -116,6 +116,10 @@ services:
     container_name: coolify-testing-host
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - type: bind
+        source: ./docker/testing-host/development-authorized_keys
+        target: /run/coolify-testing-host/public/authorized_keys
+        read_only: true
       - dev_coolify_data:/data/coolify
       - dev_coolify_data:/var/lib/docker/volumes/coolify_dev_coolify_data/_data
       - dev_backups_data:/data/coolify/backups
