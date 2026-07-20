@@ -1453,7 +1453,7 @@ jobs:
           regctl tag delete --ignore-missing "$DOCKER_TARGET:quarantine-$RUN_TAG"
 
   fork-registry-policy:
-    name: Require fork registry first-write policy
+    name: Require fork registry fixed ALLOW input
     needs: validate-inputs
     if: ${{ inputs.release_kind == 'fork' }}
     permissions: {}
@@ -1466,10 +1466,14 @@ jobs:
       NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
       SEMANTIC_VERSION: ${{ inputs.semantic_version }}
     steps:
-      - name: Require Nexus hosted repository non-redeploy policy
+      - name: Require Nexus hosted repository fixed ALLOW policy
         run: |
           set -Eeuo pipefail
           umask 077
+
+          # docker-hosted is shared production infrastructure with a fixed ALLOW
+          # input. Repository-owned semantic tag immutability is enforced by the
+          # disposable run tags and digest-bound promotion steps below.
 
           policy_file="$(mktemp "$RUNNER_TEMP/coolify-fork-nexus-policy.XXXXXX")"
           trap 'rm -f "$policy_file"' EXIT
@@ -1485,9 +1489,9 @@ jobs:
           jq -e --arg repository "$NEXUS_REPOSITORY" '
             .name == $repository and
             .online == true and
-            .storage.writePolicy == "ALLOW_ONCE"
+            .storage.writePolicy == "ALLOW"
           ' "$policy_file" >/dev/null || {
-            printf 'Nexus hosted repository must be online with writePolicy=ALLOW_ONCE before fork publication.\n' >&2
+            printf 'Nexus hosted repository must be online with fixed writePolicy=ALLOW; fork publication enforces repository-owned semantic tag immutability.\n' >&2
             exit 1
           }
 
@@ -2373,7 +2377,7 @@ jobs:
       SOURCE_REVISION: ${{ github.sha }}
       SOURCE_URL: https://github.com/${{ github.repository }}
     steps:
-      - name: Re-require Nexus non-redeploy policy before final tagging
+      - name: Re-require Nexus fixed ALLOW policy before final tagging
         env:
           NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
           NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
@@ -2383,6 +2387,10 @@ jobs:
           [[ -n "$BUNDLE_ARTIFACT_ID" ]]
           [[ "$GITHUB_REF" == "refs/tags/$SEMANTIC_VERSION" ]]
           [[ "$GITHUB_SHA" == "$SOURCE_REVISION" ]]
+
+          # Re-read the fixed shared ALLOW input at the semantic write boundary.
+          # Repository-owned semantic tag immutability remains the enforcement
+          # mechanism; this workflow never changes Nexus repository policy.
 
           policy_file="$(mktemp "$RUNNER_TEMP/coolify-fork-final-policy.XXXXXX")"
           trap 'rm -f "$policy_file"' EXIT
@@ -2395,7 +2403,7 @@ jobs:
           jq -e --arg repository "$NEXUS_REPOSITORY" '
             .name == $repository and
             .online == true and
-            .storage.writePolicy == "ALLOW_ONCE"
+            .storage.writePolicy == "ALLOW"
           ' "$policy_file" >/dev/null
 
       - name: Install registry client for final fork promotion
@@ -2709,8 +2717,8 @@ jobs:
           verify_exact_index "$MAIN_TARGET" "$MAIN_INDEX_DIGEST" "$MAIN_AMD64_DIGEST" "$MAIN_ARM64_DIGEST"
 
           # The recovery draft remains unpublished until the single semantic image
-          # tag and its live GitHub source tag have both been revalidated. ALLOW_ONCE
-          # reruns may accept only the same immutable index digest.
+          # tag and its live GitHub source tag have both been revalidated. Shared
+          # ALLOW-policy reruns may accept only the same immutable index digest.
           preflight_semantic_tag() {
             local repository=$1 expected_index_digest=$2 existing
             existing="$(digest_or_absent "$repository:$SEMANTIC_VERSION")"

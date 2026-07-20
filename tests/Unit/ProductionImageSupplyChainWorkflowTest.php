@@ -2288,7 +2288,7 @@ it('defines one referrerless fork release graph for the main image on both platf
 
     $policyRun = (string) (releaseWorkflowStep(
         $jobs['fork-registry-policy'] ?? [],
-        'Require Nexus hosted repository non-redeploy policy',
+        'Require Nexus hosted repository fixed ALLOW policy',
     )['run'] ?? '');
     $stageRun = (string) (releaseWorkflowStep(
         $jobs['fork-stage'] ?? [],
@@ -2303,7 +2303,9 @@ it('defines one referrerless fork release graph for the main image on both platf
         ->values()
         ->all();
     expect($policyRun)
-        ->toContain('.storage.writePolicy == "ALLOW_ONCE"')
+        ->toContain('.storage.writePolicy == "ALLOW"')
+        ->toContain('repository-owned semantic tag immutability')
+        ->not->toContain('ALLOW_ONCE')
         ->toContain('/service/rest/v1/repositories/docker/hosted/$NEXUS_REPOSITORY')
         ->and($forkRegistryPolicyStepNames)
         ->not->toContain('Reject existing fork semantic tags before build')
@@ -2313,6 +2315,8 @@ it('defines one referrerless fork release graph for the main image on both platf
         ->toContain('org.opencontainers.image.revision')
         ->toContain('org.opencontainers.image.version')
         ->toContain('manifests: ((.[0].manifests + .[1].manifests) | unique_by(.digest))')
+        ->toContain('require_absent "$repository:${RUN_TAG}-${arch}"')
+        ->toContain('require_absent "$repository:$RUN_TAG"')
         ->toContain('regctl manifest put')
         ->not->toContain('regctl index create')
         ->and($promotionRun)
@@ -2378,7 +2382,7 @@ it('defines one referrerless fork release graph for the main image on both platf
     $forkRelease = $jobs['fork-release'] ?? [];
     $finalPolicyStep = releaseWorkflowStep(
         $forkRelease,
-        'Re-require Nexus non-redeploy policy before final tagging',
+        'Re-require Nexus fixed ALLOW policy before final tagging',
     );
     $finalLoginStep = releaseWorkflowStep(
         $forkRelease,
@@ -2405,9 +2409,13 @@ it('defines one referrerless fork release graph for the main image on both platf
         ->toBe('${{ secrets.NEXUS_PASSWORD }}')
         ->and($finalLoginStep['with']['username'] ?? null)
         ->toBe('${{ secrets.NEXUS_USERNAME }}')
+        ->and((string) ($finalPolicyStep['run'] ?? ''))
+        ->toContain('.storage.writePolicy == "ALLOW"')
+        ->not->toContain('ALLOW_ONCE')
+        ->toContain('repository-owned semantic tag immutability')
         ->and($forkReleaseNexusSecretSteps)
         ->toBe([
-            'Re-require Nexus non-redeploy policy before final tagging',
+            'Re-require Nexus fixed ALLOW policy before final tagging',
             'Login to Nexus fork registry for final promotion',
         ]);
     expect($forkRelease['permissions']['contents'] ?? null)->toBe('write')
@@ -2488,6 +2496,85 @@ it('defines one referrerless fork release graph for the main image on both platf
         ->not->toContain('FORK_RELEASE_SIGNING_KEY_ID')
         ->and((string) file_get_contents($root.'/.github/workflows/publish-fork.yml'))
         ->not->toContain('FORK_RELEASE_SIGNING_KEY_ID');
+});
+
+it('requires the fixed shared Nexus ALLOW policy at both fork publication gates', function (): void {
+    $root = releaseWorkflowRepositoryRoot();
+    $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $policyRuns = [
+        'preflight' => (string) (releaseWorkflowStep(
+            $workflow['jobs']['fork-registry-policy'] ?? [],
+            'Require Nexus hosted repository fixed ALLOW policy',
+        )['run'] ?? ''),
+        'final promotion' => (string) (releaseWorkflowStep(
+            $workflow['jobs']['fork-release'] ?? [],
+            'Re-require Nexus fixed ALLOW policy before final tagging',
+        )['run'] ?? ''),
+    ];
+    $filesystem = new Filesystem;
+    $fixture = sys_get_temp_dir().'/coolify-fork-nexus-policy-'.bin2hex(random_bytes(8));
+    $bin = $fixture.'/bin';
+    $filesystem->mkdir($bin);
+    file_put_contents($bin.'/curl', <<<'SH'
+#!/bin/sh
+set -eu
+
+output=''
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output) output=$2; shift 2 ;;
+        *) shift ;;
+    esac
+done
+
+[ -n "$output" ]
+printf '%s\n' "${NEXUS_POLICY_JSON:?}" > "$output"
+printf '200'
+SH);
+    chmod($bin.'/curl', 0755);
+
+    $environment = [
+        'BUNDLE_ARTIFACT_ID' => 'fixture-bundle',
+        'GITHUB_REF' => 'refs/tags/4.13.1-fork',
+        'GITHUB_SHA' => str_repeat('a', 40),
+        'NEXUS_API_URL' => 'https://nexus.example.test',
+        'NEXUS_PASSWORD' => 'fixture-password',
+        'NEXUS_POLICY_JSON' => json_encode([
+            'name' => 'docker-hosted',
+            'online' => true,
+            'storage' => ['writePolicy' => 'ALLOW'],
+        ], JSON_THROW_ON_ERROR),
+        'NEXUS_REPOSITORY' => 'docker-hosted',
+        'NEXUS_USERNAME' => 'fixture-user',
+        'PATH' => $bin.PATH_SEPARATOR.(getenv('PATH') ?: ''),
+        'RUNNER_TEMP' => $fixture,
+        'SEMANTIC_VERSION' => '4.13.1-fork',
+        'SOURCE_REVISION' => str_repeat('a', 40),
+    ];
+
+    try {
+        foreach ($policyRuns as $name => $run) {
+            $process = new Process(['bash', '-c', $run], $fixture, $environment);
+            $process->run();
+
+            expect($process->isSuccessful())->toBeTrue($name.': '.$process->getErrorOutput());
+        }
+
+        $environment['NEXUS_POLICY_JSON'] = json_encode([
+            'name' => 'docker-hosted',
+            'online' => true,
+            'storage' => ['writePolicy' => 'ALLOW_ONCE'],
+        ], JSON_THROW_ON_ERROR);
+
+        foreach ($policyRuns as $name => $run) {
+            $process = new Process(['bash', '-c', $run], $fixture, $environment);
+            $process->run();
+
+            expect($process->isSuccessful())->toBeFalse($name);
+        }
+    } finally {
+        $filesystem->remove($fixture);
+    }
 });
 
 it('requires exact fork tag source binding and rejects fork aliases', function () {
