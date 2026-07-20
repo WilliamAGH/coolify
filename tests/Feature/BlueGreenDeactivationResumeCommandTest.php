@@ -85,6 +85,22 @@ it('resumes the explicit bounded limit in deterministic ID order', function (): 
     Process::assertRanTimes(fn (): bool => true, 4);
 });
 
+it('returns a structured bounded failure when stale resumption cannot prove remote completion', function (): void {
+    [$deactivation] = staleBlueGreenDeactivationsForResumeCommand(1);
+    Process::fake(['*' => Process::sequence([
+        BlueGreenDeactivationScenario::BOOT_ID,
+        'not-a-typed-blue-green-remote-outcome',
+    ])]);
+
+    $results = ResumeBlueGreenDeactivations::run(staleAfterSeconds: 1);
+
+    expect($results)->toHaveCount(1)
+        ->and($results[0]->outcome)->toBe('deferred')
+        ->and($results[0]->failure?->publicReason)->toBe('Blue-green deactivation transport returned no valid remote outcome; the durable operation remains resumable.')
+        ->and(strlen((string) $results[0]->message))->toBeLessThanOrEqual(512)
+        ->and($deactivation->fresh()->phase)->toBe(BlueGreenDeactivationPhase::DEACTIVATING);
+});
+
 it('refuses non-positive resume limits from both entrypoints', function (): void {
     Process::fake();
 

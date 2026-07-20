@@ -79,8 +79,11 @@ final class ProveAndFreezeControlPlaneGeneration
             );
         }
         if ($state->phase === ControlPlaneGenerationPromotionPhase::Freezing) {
-            $freeze = ProxyMutationQueue::freeze($state->operationId);
+            $leaseSeconds = ProxyMutationQueue::freezeLeaseSeconds();
+            $freeze = ProxyMutationQueue::freeze($state->operationId, leaseSeconds: $leaseSeconds);
             $this->assertFreezeOwner($freeze, $state);
+            $freezeFence = $freeze->freezeFence
+                ?? throw new RuntimeException('The control-plane generation mutation freeze did not issue a fence.');
             $observedAt = now()->toIso8601String();
             $state = $this->stateStore->transition(
                 $server,
@@ -91,11 +94,18 @@ final class ProveAndFreezeControlPlaneGeneration
                 $observedAt,
                 [
                     'runtime_fence' => ['epoch' => $state->writerEpoch, 'observed_at' => $observedAt],
-                    'mutation_freeze' => ['operation_id' => $state->operationId, 'observed_at' => $observedAt],
+                    'mutation_freeze' => [
+                        'operation_id' => $state->operationId,
+                        'observed_at' => $observedAt,
+                        'fence' => $freezeFence,
+                        'heartbeat_at' => $observedAt,
+                        'lease_seconds' => $leaseSeconds,
+                    ],
                 ],
             );
         }
         if ($state->phase === ControlPlaneGenerationPromotionPhase::Frozen) {
+            $state = $this->heartbeatFreeze($server, $state, $token);
             $state = $this->transition(
                 server: $server,
                 operationId: $operationId,
@@ -108,6 +118,11 @@ final class ProveAndFreezeControlPlaneGeneration
             return $state;
         }
 
+        $state = $this->heartbeatFreeze($server, $state, $token);
+        ProxyMutationQueue::reapExpiredReservations(
+            $state->operationId,
+            $state->mutationFreezeFence(),
+        );
         $snapshot = ProxyMutationQueue::snapshot();
         $this->assertFreezeOwner($snapshot, $state);
         if (! $snapshot->isEmpty()) {
@@ -213,8 +228,42 @@ final class ProveAndFreezeControlPlaneGeneration
         ControlPlaneGenerationPromotionState $state,
     ): void {
         if ($snapshot->freezeOperationId === null
-            || ! hash_equals($state->operationId, $snapshot->freezeOperationId)) {
+            || ! hash_equals($state->operationId, $snapshot->freezeOperationId)
+            || ! $snapshot->hasFencedRenewableFreezeLease()) {
             throw new RuntimeException('The control-plane generation mutation freeze is owned by another operation.');
         }
+        if ($state->mutationFreeze !== null
+            && ! hash_equals($state->mutationFreezeFence(), $snapshot->freezeFence ?? '')) {
+            throw new RuntimeException('The control-plane generation mutation freeze fence changed concurrently.');
+        }
+    }
+
+    private function heartbeatFreeze(
+        Server $server,
+        ControlPlaneGenerationPromotionState $state,
+        string $token,
+    ): ControlPlaneGenerationPromotionState {
+        if ($state->mutationFreeze === null) {
+            throw new RuntimeException('The control-plane generation mutation freeze was never durably recorded.');
+        }
+        $freezeFence = $state->mutationFreezeFence();
+        $leaseSeconds = ProxyMutationQueue::freezeLeaseSeconds();
+        $snapshot = ProxyMutationQueue::renewFreeze(
+            $state->operationId,
+            leaseSeconds: $leaseSeconds,
+            expectedFence: $freezeFence,
+        );
+        $this->assertFreezeOwner($snapshot, $state);
+
+        return $this->stateStore->heartbeatFreeze(
+            $server,
+            $state->operationId,
+            $token,
+            $state->writerEpoch,
+            $leaseSeconds,
+            $freezeFence,
+            $freezeFence,
+            now()->toIso8601String(),
+        );
     }
 }

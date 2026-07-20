@@ -20,15 +20,21 @@ class ExecuteBlueGreenDeactivationRemoteCommand
         if ($result->outcome === BlueGreenDeactivationRemoteOutcome::Deferred) {
             $detail = trim($result->output);
             throw new BlueGreenDeactivationInProgressException(
-                'The bounded blue-green deactivation attempt was deferred and remains resumable'
-                .($detail === '' ? '.' : ": {$detail}"),
+                'The bounded blue-green deactivation attempt was deferred and remains resumable.',
+                failure: new BlueGreenDeactivationFailure(
+                    'The bounded blue-green deactivation attempt was deferred and remains resumable.',
+                    $detail === '' ? null : $detail,
+                ),
             );
         }
         if ($result->outcome === BlueGreenDeactivationRemoteOutcome::InvariantViolation) {
             $detail = trim($result->output);
             throw new BlueGreenDeactivationException(
-                'The destination proved a blue-green deactivation invariant failure with exit status '
-                .$result->exitStatus.($detail === '' ? '.' : ": {$detail}"),
+                'The destination proved a blue-green deactivation invariant failure.',
+                failure: new BlueGreenDeactivationFailure(
+                    'The destination proved a blue-green deactivation invariant failure.',
+                    $detail === '' ? null : $detail,
+                ),
             );
         }
 

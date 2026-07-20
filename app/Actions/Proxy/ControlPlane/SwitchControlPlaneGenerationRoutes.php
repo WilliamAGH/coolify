@@ -191,7 +191,9 @@ final class SwitchControlPlaneGenerationRoutes
         if ($state->mutationFreeze === null
             || ! hash_equals($state->operationId, $state->mutationFreeze['operation_id'])
             || $snapshot->freezeOperationId === null
-            || ! hash_equals($state->operationId, $snapshot->freezeOperationId)) {
+            || ! hash_equals($state->operationId, $snapshot->freezeOperationId)
+            || ! $snapshot->hasFencedRenewableFreezeLease()
+            || ! hash_equals($state->mutationFreezeFence(), $snapshot->freezeFence ?? '')) {
             throw new RuntimeException('The control-plane generation mutation freeze is missing or owned by another operation.');
         }
         if (! $snapshot->isEmpty()) {

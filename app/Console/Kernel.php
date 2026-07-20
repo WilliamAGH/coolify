@@ -54,6 +54,12 @@ class Kernel extends ConsoleKernel
             ->everyMinute()
             ->onOneServer()
             ->withoutOverlapping(6);
+        $this->scheduleInstance->command('control-plane:reap-mutation-freezes --stale-after=1800')
+            ->name('control-plane:reap-mutation-freezes')
+            ->everyMinute()
+            ->onOneServer()
+            ->withoutOverlapping(2)
+            ->runInBackground();
         $this->scheduleInstance->command('blue-green:resume-deactivations --stale-after=300 --limit=1')
             ->name('blue-green:resume-deactivations')
             ->everyMinute()

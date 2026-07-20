@@ -2,6 +2,7 @@
 
 namespace App\Actions\Proxy\ControlPlane;
 
+use App\Support\ProxyMutationQueue;
 use DateTimeImmutable;
 use Exception;
 use InvalidArgumentException;
@@ -14,7 +15,7 @@ final readonly class ControlPlaneGenerationPromotionState
      * @param  array{operation_id: string, dynamic_revision: int, dynamic_sha256: string, member: string, release_revision: string, backends: list<string>, configuration_acknowledgement: string}  $predecessor
      * @param  array{dynamic_revision: int, dynamic_sha256: string, member: string, release_revision: string, backends: list<string>, configuration_acknowledgement: string}  $successor
      * @param  array{epoch: int, observed_at: string}|null  $runtimeFence
-     * @param  array{operation_id: string, observed_at: string}|null  $mutationFreeze
+     * @param  array{operation_id: string, observed_at: string, fence?: string, heartbeat_at?: string, lease_seconds?: int, alerted_at?: string}|null  $mutationFreeze
      * @param  array{pending: int, reserved: int, delayed: int, observed_at: string}|null  $queueInventory
      * @param  array{operation_id: string, dynamic_revision: int, dynamic_sha256: string, configuration_acknowledgement: string, member: string, release_revision: string, observed_at: string}|null  $dynamicWritten
      * @param  array{operation_id: string, dynamic_revision: int, dynamic_sha256: string, configuration_acknowledgement: string, member: string, release_revision: string, observed_at: string}|null  $dualRoute
@@ -325,6 +326,66 @@ final readonly class ControlPlaneGenerationPromotionState
             $next[$key] = $value;
         }
         $next['phase'] = $phase->value;
+        $next['updated_at'] = $timestamp;
+
+        return self::fromArray($next);
+    }
+
+    public function withFreezeHeartbeat(string $timestamp, int $leaseSeconds, string $freezeFence): self
+    {
+        if ($this->mutationFreeze === null
+            || ! hash_equals($this->operationId, $this->mutationFreeze['operation_id'])
+            || in_array($this->phase, [
+                ControlPlaneGenerationPromotionPhase::Completed,
+                ControlPlaneGenerationPromotionPhase::RolledBack,
+            ], true)) {
+            throw new InvalidArgumentException('The control-plane generation promotion has no renewable mutation freeze.');
+        }
+        $leaseSeconds = ProxyMutationQueue::freezeLeaseSeconds($leaseSeconds);
+        self::assertFreezeFence($freezeFence);
+
+        $next = $this->toArray();
+        $next['mutation_freeze'] = [
+            'operation_id' => $this->operationId,
+            'observed_at' => $this->mutationFreeze['observed_at'],
+            'fence' => $freezeFence,
+            'heartbeat_at' => $timestamp,
+            'lease_seconds' => $leaseSeconds,
+        ];
+        $next['updated_at'] = $timestamp;
+
+        return self::fromArray($next);
+    }
+
+    public function mutationFreezeFence(): string
+    {
+        $freezeFence = $this->mutationFreeze['fence'] ?? null;
+        if (! is_string($freezeFence)) {
+            throw new InvalidArgumentException('The control-plane generation promotion mutation freeze fence is missing.');
+        }
+        self::assertFreezeFence($freezeFence);
+
+        return $freezeFence;
+    }
+
+    public function withFreezeAlert(string $timestamp): self
+    {
+        if ($this->mutationFreeze === null
+            || ! hash_equals($this->operationId, $this->mutationFreeze['operation_id'])
+            || array_key_exists('alerted_at', $this->mutationFreeze)
+            || in_array($this->phase, [
+                ControlPlaneGenerationPromotionPhase::Completed,
+                ControlPlaneGenerationPromotionPhase::RolledBack,
+                ControlPlaneGenerationPromotionPhase::InterventionRequired,
+            ], true)) {
+            throw new InvalidArgumentException('The control-plane generation promotion has no unalerted renewable mutation freeze.');
+        }
+
+        $next = $this->toArray();
+        $next['mutation_freeze'] = [
+            ...$this->mutationFreeze,
+            'alerted_at' => $timestamp,
+        ];
         $next['updated_at'] = $timestamp;
 
         return self::fromArray($next);
@@ -869,12 +930,31 @@ final readonly class ControlPlaneGenerationPromotionState
         if (! is_array($value)) {
             throw new InvalidArgumentException('The control-plane generation promotion mutation freeze is invalid.');
         }
-        self::assertExactKeys($value, ['operation_id', 'observed_at']);
-
-        return [
+        $keys = array_keys($value);
+        sort($keys, SORT_STRING);
+        if ($keys !== ['observed_at', 'operation_id']
+            && $keys !== ['heartbeat_at', 'lease_seconds', 'observed_at', 'operation_id']
+            && $keys !== ['alerted_at', 'heartbeat_at', 'lease_seconds', 'observed_at', 'operation_id']
+            && $keys !== ['fence', 'heartbeat_at', 'lease_seconds', 'observed_at', 'operation_id']
+            && $keys !== ['alerted_at', 'fence', 'heartbeat_at', 'lease_seconds', 'observed_at', 'operation_id']) {
+            throw new InvalidArgumentException('The control-plane generation promotion mutation freeze is malformed.');
+        }
+        $freeze = [
             'operation_id' => self::requiredStringFrom($value, 'operation_id', 'mutation freeze'),
             'observed_at' => self::requiredStringFrom($value, 'observed_at', 'mutation freeze'),
         ];
+        if (array_key_exists('heartbeat_at', $value)) {
+            $freeze['heartbeat_at'] = self::requiredStringFrom($value, 'heartbeat_at', 'mutation freeze');
+            $freeze['lease_seconds'] = self::requiredIntegerFrom($value, 'lease_seconds', 'mutation freeze');
+        }
+        if (array_key_exists('fence', $value)) {
+            $freeze['fence'] = self::requiredStringFrom($value, 'fence', 'mutation freeze');
+        }
+        if (array_key_exists('alerted_at', $value)) {
+            $freeze['alerted_at'] = self::requiredStringFrom($value, 'alerted_at', 'mutation freeze');
+        }
+
+        return $freeze;
     }
 
     private static function decodeQueueInventory(mixed $value): ?array
@@ -1086,17 +1166,60 @@ final readonly class ControlPlaneGenerationPromotionState
         self::assertTimestamp($observation['observed_at'], "{$label} timestamp");
     }
 
-    /** @param array{operation_id: string, observed_at: string}|null $observation */
+    /** @param array{operation_id: string, observed_at: string, fence?: string, heartbeat_at?: string, lease_seconds?: int, alerted_at?: string}|null $observation */
     private function assertMutationFreeze(?array $observation): void
     {
         if ($observation === null) {
             return;
         }
-        self::assertExactKeys($observation, ['operation_id', 'observed_at']);
+        $keys = array_keys($observation);
+        sort($keys, SORT_STRING);
+        if ($keys !== ['observed_at', 'operation_id']
+            && $keys !== ['heartbeat_at', 'lease_seconds', 'observed_at', 'operation_id']
+            && $keys !== ['alerted_at', 'heartbeat_at', 'lease_seconds', 'observed_at', 'operation_id']
+            && $keys !== ['fence', 'heartbeat_at', 'lease_seconds', 'observed_at', 'operation_id']
+            && $keys !== ['alerted_at', 'fence', 'heartbeat_at', 'lease_seconds', 'observed_at', 'operation_id']) {
+            throw new InvalidArgumentException('The control-plane generation promotion mutation freeze is malformed.');
+        }
         if (! hash_equals($this->operationId, $observation['operation_id'])) {
             throw new InvalidArgumentException('The control-plane generation promotion mutation freeze owner is stale.');
         }
         self::assertTimestamp($observation['observed_at'], 'mutation freeze timestamp');
+        if (array_key_exists('heartbeat_at', $observation)) {
+            self::assertTimestamp($observation['heartbeat_at'], 'mutation freeze heartbeat');
+            if (new DateTimeImmutable($observation['heartbeat_at']) < new DateTimeImmutable($observation['observed_at'])) {
+                throw new InvalidArgumentException('The control-plane generation promotion mutation freeze heartbeat predates its observation.');
+            }
+            if (! is_int($observation['lease_seconds'])) {
+                throw new InvalidArgumentException('The control-plane generation promotion mutation freeze lease is invalid.');
+            }
+            self::assertRecordedFreezeLeaseSeconds($observation['lease_seconds']);
+        }
+        if (array_key_exists('fence', $observation)) {
+            self::assertFreezeFence($observation['fence']);
+        }
+        if (array_key_exists('alerted_at', $observation)) {
+            self::assertTimestamp($observation['alerted_at'], 'mutation freeze alert');
+            $earliestAlertTime = $observation['heartbeat_at'] ?? $observation['observed_at'];
+            if (new DateTimeImmutable($observation['alerted_at']) < new DateTimeImmutable($earliestAlertTime)) {
+                throw new InvalidArgumentException('The control-plane generation promotion mutation freeze alert predates its latest heartbeat.');
+            }
+        }
+    }
+
+    private static function assertRecordedFreezeLeaseSeconds(int $leaseSeconds): void
+    {
+        if ($leaseSeconds < ProxyMutationQueue::MINIMUM_FREEZE_LEASE_SECONDS
+            || $leaseSeconds > ProxyMutationQueue::MAXIMUM_FREEZE_LEASE_SECONDS) {
+            throw new InvalidArgumentException('The control-plane generation promotion mutation freeze lease is invalid.');
+        }
+    }
+
+    private static function assertFreezeFence(string $freezeFence): void
+    {
+        if (preg_match('/\A[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\z/D', $freezeFence) !== 1) {
+            throw new InvalidArgumentException('The control-plane generation promotion mutation freeze fence is invalid.');
+        }
     }
 
     /** @param array{pending: int, reserved: int, delayed: int, observed_at: string}|null $inventory */

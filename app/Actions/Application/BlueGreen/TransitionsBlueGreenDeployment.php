@@ -280,7 +280,11 @@ final class TransitionsBlueGreenDeployment
 
             self::assertExactDeployment($deployment, $claim, $expectedPhase);
 
-            if ($stateQuery->update(['phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED->value]) !== 1) {
+            if ($stateQuery->update([
+                'phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED->value,
+                'intervention_phase' => $expectedPhase->value,
+                'intervention_reason' => 'Blue-green lifecycle safety checks could not prove a safe continuation.',
+            ]) !== 1) {
                 throw new BlueGreenDeploymentTransitionException('The blue-green deployment state changed while intervention was being recorded.');
             }
             self::updateExactDeployment(

@@ -112,18 +112,21 @@ final class ResumeBlueGreenDeactivations
                 $deactivation->id,
                 BlueGreenDeactivationResumeResult::DEFERRED,
                 $exception->getMessage(),
+                $exception->failure(),
             );
         } catch (BlueGreenDeactivationTransportException $exception) {
             return new BlueGreenDeactivationResumeResult(
                 $deactivation->id,
                 BlueGreenDeactivationResumeResult::DEFERRED,
                 $exception->getMessage(),
+                $exception->failure(),
             );
         } catch (BlueGreenDeactivationException $exception) {
             return new BlueGreenDeactivationResumeResult(
                 $deactivation->id,
                 BlueGreenDeactivationResumeResult::INTERVENTION_REQUIRED,
                 $exception->getMessage(),
+                $exception->failure(),
             );
         }
     }

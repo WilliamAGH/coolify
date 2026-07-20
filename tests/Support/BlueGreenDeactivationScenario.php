@@ -11,6 +11,7 @@ use App\Enums\ProxyTypes;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
+use App\Models\InstanceSettings;
 use App\Models\PrivateKey;
 use App\Models\Project;
 use App\Models\Server;
@@ -26,6 +27,9 @@ final readonly class BlueGreenDeactivationScenario
     public static function context(): array
     {
         config(['constants.ssh.mux_enabled' => false]);
+        InstanceSettings::unguarded(
+            fn () => InstanceSettings::query()->firstOrCreate(['id' => 0]),
+        );
 
         $team = Team::factory()->create();
         $privateKey = PrivateKey::query()->create([

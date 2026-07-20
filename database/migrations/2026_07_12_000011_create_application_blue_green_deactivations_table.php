@@ -60,10 +60,21 @@ return new class extends Migration
         }
         $columns = collect(Schema::getColumns('application_blue_green_deactivations'))->keyBy('name');
 
+        $laterOwnedColumnGroups = [
+            ['supersession_generation'],
+            ['intervention_phase', 'intervention_reason'],
+        ];
+        $laterOwnedColumns = array_merge(...$laterOwnedColumnGroups);
         $columnNames = $columns->keys()->values()->all();
-        $unexpectedColumns = array_diff($columnNames, [...array_keys($expectedColumns), 'supersession_generation']);
+        $unexpectedColumns = array_diff($columnNames, [...array_keys($expectedColumns), ...$laterOwnedColumns]);
+        $hasPartialLaterOwnedGroup = collect($laterOwnedColumnGroups)->contains(function (array $group) use ($columnNames): bool {
+            $presentCount = count(array_intersect($group, $columnNames));
+
+            return ! in_array($presentCount, [0, count($group)], true);
+        });
         if ($unexpectedColumns !== []
-            || array_diff(array_keys($expectedColumns), $columnNames) !== []) {
+            || array_diff(array_keys($expectedColumns), $columnNames) !== []
+            || $hasPartialLaterOwnedGroup) {
             throw new RuntimeException('Existing blue-green deactivation table has an unexpected column set.');
         }
 
@@ -136,7 +147,7 @@ return new class extends Migration
                     ('created_at', 'timestamp(0) without time zone', false, null::text, '', ''),
                     ('updated_at', 'timestamp(0) without time zone', false, null::text, '', '')
             ),
-            actual as (
+            actual_all as (
                 select
                     attribute.attname::text as name,
                     format_type(attribute.atttypid, attribute.atttypmod) as formatted_type,
@@ -155,9 +166,13 @@ return new class extends Migration
                  and attribute_default.adnum = attribute.attnum
                 where namespace.nspname = current_schema()
                   and relation.relname = 'application_blue_green_deactivations'
-                  and attribute.attname <> 'supersession_generation'
                   and attribute.attnum > 0
                   and not attribute.attisdropped
+            ),
+            actual as (
+                select *
+                from actual_all
+                where name not in ('supersession_generation', 'intervention_phase', 'intervention_reason')
             ),
             index_catalog as (
                 select
@@ -202,6 +217,10 @@ return new class extends Migration
                     except all
                     select * from actual
                 )
+                and (select count(*) from actual_all
+                    where name = 'supersession_generation') in (0, 1)
+                and (select count(*) from actual_all
+                    where name in ('intervention_phase', 'intervention_reason')) in (0, 2)
                 and (select count(*) = 4
                     and count(*) filter (where conname = 'application_blue_green_deactivations_pkey'
                         and contype = 'p' and conkey = array[1]::smallint[]

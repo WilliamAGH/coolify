@@ -46,6 +46,21 @@ it('schedules bounded deployment recovery through one non-overlapping owner', fu
         ->and($event->expression)->toBe('* * * * *');
 });
 
+it('schedules control-plane mutation-freeze reaping through one bounded background owner', function (): void {
+    $schedule = app(Schedule::class);
+
+    $event = collect($schedule->events())->first(
+        fn ($event) => (string) $event->description === 'control-plane:reap-mutation-freezes'
+    );
+
+    expect($event)->not->toBeNull()
+        ->and($event->onOneServer)->toBeTrue()
+        ->and($event->withoutOverlapping)->toBeTrue()
+        ->and($event->runInBackground)->toBeTrue()
+        ->and($event->command)->toContain('control-plane:reap-mutation-freezes --stale-after=1800')
+        ->and($event->expression)->toBe('* * * * *');
+});
+
 it('schedules one bounded resumable blue-green deactivation in the background', function () {
     $schedule = app(Schedule::class);
 

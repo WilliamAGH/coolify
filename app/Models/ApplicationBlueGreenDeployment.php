@@ -83,6 +83,8 @@ class ApplicationBlueGreenDeployment extends Model
         'inactive_retirement_stopped_at',
         'inactive_retirement_intervention_required_at',
         'inactive_retirement_dispatch_reserved_until_at',
+        'intervention_phase',
+        'intervention_reason',
         'supersession_generation',
         'phase',
         'routing_revision',

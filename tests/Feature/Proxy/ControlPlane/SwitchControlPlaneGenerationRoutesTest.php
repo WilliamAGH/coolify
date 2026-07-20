@@ -17,6 +17,7 @@ use App\Actions\Proxy\ControlPlane\SwitchControlPlaneGenerationRoutes;
 use App\Actions\Proxy\ControlPlane\VerifyControlPlaneProxyRoutes;
 use App\Models\Server;
 use App\Models\Team;
+use App\Support\ProxyMutationQueue;
 use App\Support\ProxyMutationQueueSnapshot;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 
@@ -141,7 +142,13 @@ function switchControlPlaneGenerationRoutesQuiesced(
         '2026-07-19T12:04:00Z',
         [
             'runtime_fence' => ['epoch' => $state->writerEpoch, 'observed_at' => '2026-07-19T12:04:00Z'],
-            'mutation_freeze' => ['operation_id' => $state->operationId, 'observed_at' => '2026-07-19T12:04:00Z'],
+            'mutation_freeze' => [
+                'operation_id' => $state->operationId,
+                'observed_at' => '2026-07-19T12:04:00Z',
+                'fence' => 'switch-routes-fence',
+                'heartbeat_at' => '2026-07-19T12:04:00Z',
+                'lease_seconds' => ProxyMutationQueue::MINIMUM_FREEZE_LEASE_SECONDS,
+            ],
         ],
     );
     $state = $store->transition(
@@ -238,6 +245,8 @@ function switchControlPlaneGenerationRoutesAction(
             pending: 0,
             reserved: 0,
             delayed: 0,
+            freezeLeaseMilliseconds: ProxyMutationQueue::MINIMUM_FREEZE_LEASE_SECONDS * 1000,
+            freezeFence: $state->mutationFreezeFence(),
         ),
     );
 }
@@ -416,6 +425,8 @@ it('fails closed before route mutation when the live queue freeze is missing or 
             pending: 0,
             reserved: 0,
             delayed: 0,
+            freezeLeaseMilliseconds: $freezeOperationId === null ? null : ProxyMutationQueue::MINIMUM_FREEZE_LEASE_SECONDS * 1000,
+            freezeFence: $freezeOperationId === null ? null : 'foreign-route-switch-fence',
         ),
     );
 
@@ -451,6 +462,8 @@ it('does not acknowledge routes when the live freeze changes during provider pro
                 pending: 0,
                 reserved: 0,
                 delayed: 0,
+                freezeLeaseMilliseconds: ProxyMutationQueue::MINIMUM_FREEZE_LEASE_SECONDS * 1000,
+                freezeFence: $snapshotCalls <= 3 ? $state->mutationFreezeFence() : 'replacement-route-fence',
             );
         },
     );

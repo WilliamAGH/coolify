@@ -322,11 +322,37 @@ function resumeControlPlaneGenerationIsolatedQueue(Server $server): array
         }
     });
 
+    $promotionStore = new StoreControlPlaneGenerationPromotionState;
+    $state = $promotionStore->read($server)
+        ?? throw new RuntimeException('The resume fixture promotion state is missing.');
+    $leaseSeconds = ProxyMutationQueue::freezeLeaseSeconds();
+    $snapshot = ProxyMutationQueue::freeze($state->operationId, $queue, leaseSeconds: $leaseSeconds);
+    $freezeFence = $snapshot->freezeFence
+        ?? throw new RuntimeException('The resume fixture freeze did not issue a fence.');
+    $payload = $state->toArray();
+    $observedAt = $state->mutationFreeze['observed_at'] ?? $state->updatedAt;
+    $payload['mutation_freeze'] = [
+        'operation_id' => $state->operationId,
+        'observed_at' => $observedAt,
+        'fence' => $freezeFence,
+        'heartbeat_at' => $state->updatedAt,
+        'lease_seconds' => $leaseSeconds,
+    ];
+    $payload['updated_at'] = $state->updatedAt;
+    $fixtureServer = $server->fresh()
+        ?? throw new RuntimeException('The resume fixture server disappeared.');
+    $fixtureServer->proxy->set(StoreControlPlaneGenerationPromotionState::STATE_KEY, $payload);
+    $fixtureServer->save();
+
     $cleanup = static function (string $operationId) use ($queue, $queueKey, $freezeKey, $originalQueueManager): void {
         try {
             $snapshot = ProxyMutationQueue::snapshot($queue);
             if ($snapshot->freezeOperationId === $operationId) {
-                ProxyMutationQueue::unfreeze($operationId, $queue);
+                ProxyMutationQueue::unfreeze(
+                    $operationId,
+                    $queue,
+                    $snapshot->freezeFence ?? throw new RuntimeException('The resume fixture freeze did not issue a fence.'),
+                );
             }
         } finally {
             try {
@@ -741,6 +767,142 @@ it('rejects forward work before draining and delegates exact pre-retirement roll
     }
 });
 
+it('rolls back a pre-retirement intervention only after exact manual freeze ownership is supplied', function (): void {
+    $fixture = resumeControlPlaneGenerationFixture(draining: false);
+    [$queue, $cleanup] = resumeControlPlaneGenerationIsolatedQueue($fixture['server']);
+    $commands = [];
+    $timeouts = [];
+    $intervention = $fixture['promotion_store']->transition(
+        $fixture['server'],
+        $fixture['promotion']->operationId,
+        $fixture['token'],
+        ControlPlaneGenerationPromotionPhase::Prepared,
+        ControlPlaneGenerationPromotionPhase::InterventionRequired,
+        '2026-07-20T12:00:00Z',
+        [
+            'last_error' => 'The bounded proxy-mutation freeze lease expired before the control-plane operation completed.',
+            'last_error_at' => '2026-07-20T12:00:00Z',
+            'intervention_required_at' => '2026-07-20T12:00:00Z',
+        ],
+    );
+    $snapshot = ProxyMutationQueue::snapshot($queue);
+    $writerCommand = resumeControlPlaneGenerationRollbackWriterCommand(
+        $fixture['server'],
+        $fixture['enrollment'],
+        $intervention,
+        $fixture['successor_yaml'],
+    );
+    $proof = resumeControlPlaneGenerationRollbackProof($fixture['enrollment'], $intervention);
+
+    try {
+        expect(fn (): ControlPlaneGenerationPromotionState => resumeControlPlaneGenerationAction($fixture)->handle(
+            $fixture['server'],
+            $intervention->operationId,
+            $fixture['token'],
+        ))->toThrow(RuntimeException::class, 'explicit rollback decision');
+
+        expect(fn (): ControlPlaneGenerationPromotionState => resumeControlPlaneGenerationAction($fixture)->handle(
+            $fixture['server'],
+            $intervention->operationId,
+            $fixture['token'],
+            successorYaml: $fixture['successor_yaml'],
+            remoteExecutor: static function (): never {
+                throw new RuntimeException('A stale manual writer epoch must prevent rollback work.');
+            },
+            rollback: true,
+            expectedInterventionWriterEpoch: $intervention->writerEpoch + 1,
+            expectedInterventionFreezeFence: $snapshot->freezeFence,
+        ))->toThrow(RuntimeException::class, 'exact mutation-freeze owner');
+
+        expect(fn (): ControlPlaneGenerationPromotionState => resumeControlPlaneGenerationAction($fixture)->handle(
+            $fixture['server'],
+            $intervention->operationId,
+            $fixture['token'],
+            successorYaml: $fixture['successor_yaml'],
+            remoteExecutor: static function (): never {
+                throw new RuntimeException('A stale manual fence must prevent rollback work.');
+            },
+            rollback: true,
+            expectedInterventionWriterEpoch: $intervention->writerEpoch,
+            expectedInterventionFreezeFence: 'stale-manual-freeze-fence',
+        ))->toThrow(RuntimeException::class, 'exact mutation-freeze owner');
+
+        expect($fixture['promotion_store']->read($fixture['server'])?->phase)
+            ->toBe(ControlPlaneGenerationPromotionPhase::InterventionRequired)
+            ->and(ProxyMutationQueue::snapshot($queue)->freezeFence)
+            ->toBe($snapshot->freezeFence);
+
+        $rolledBack = resumeControlPlaneGenerationAction($fixture)->handle(
+            $fixture['server'],
+            $intervention->operationId,
+            $fixture['token'],
+            successorYaml: $fixture['successor_yaml'],
+            remoteExecutor: resumeControlPlaneGenerationCommandAwareRemote([
+                $writerCommand => ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT,
+                $proof->shellCommand() => resumeControlPlaneGenerationRollbackTranscript($fixture['enrollment'], $intervention),
+            ], $commands, $timeouts),
+            rollback: true,
+            expectedInterventionWriterEpoch: $intervention->writerEpoch,
+            expectedInterventionFreezeFence: $snapshot->freezeFence,
+        );
+
+        expect($rolledBack->phase)->toBe(ControlPlaneGenerationPromotionPhase::RolledBack)
+            ->and($commands)->toBe([$writerCommand, $proof->shellCommand()])
+            ->and($timeouts)->toBe([121, 121])
+            ->and(ProxyMutationQueue::snapshot($queue)->freezeOperationId)->toBeNull();
+    } finally {
+        $cleanup($intervention->operationId);
+    }
+});
+
+it('retains a post-retirement intervention instead of performing a late manual rollback', function (): void {
+    $fixture = resumeControlPlaneGenerationFixture();
+    [$queue, $cleanup] = resumeControlPlaneGenerationIsolatedQueue($fixture['server']);
+    $retiring = resumeControlPlaneGenerationRetiring($fixture);
+    $intervention = $fixture['promotion_store']->transition(
+        $fixture['server'],
+        $retiring->operationId,
+        $fixture['token'],
+        ControlPlaneGenerationPromotionPhase::Retiring,
+        ControlPlaneGenerationPromotionPhase::InterventionRequired,
+        '2026-07-20T12:00:00Z',
+        [
+            'last_error' => 'The retirement outcome requires an explicit operator decision.',
+            'last_error_at' => '2026-07-20T12:00:00Z',
+            'intervention_required_at' => '2026-07-20T12:00:00Z',
+        ],
+    );
+    $snapshot = ProxyMutationQueue::snapshot($queue);
+    $remoteCalls = 0;
+
+    try {
+        expect(fn (): ControlPlaneGenerationPromotionState => resumeControlPlaneGenerationAction($fixture)->handle(
+            $fixture['server'],
+            $intervention->operationId,
+            $fixture['token'],
+            successorYaml: $fixture['successor_yaml'],
+            remoteExecutor: function () use (&$remoteCalls): never {
+                $remoteCalls++;
+
+                throw new RuntimeException('Post-retirement intervention must not mutate routes.');
+            },
+            rollback: true,
+            expectedInterventionWriterEpoch: $intervention->writerEpoch,
+            expectedInterventionFreezeFence: $snapshot->freezeFence,
+        ))->toThrow(RuntimeException::class, 'cannot be rolled back after predecessor retirement');
+
+        expect($remoteCalls)->toBe(0)
+            ->and($fixture['promotion_store']->read($fixture['server'])?->phase)
+            ->toBe(ControlPlaneGenerationPromotionPhase::InterventionRequired)
+            ->and(ProxyMutationQueue::snapshot($queue)->freezeOperationId)
+            ->toBe($intervention->operationId)
+            ->and(ProxyMutationQueue::snapshot($queue)->freezeFence)
+            ->toBe($snapshot->freezeFence);
+    } finally {
+        $cleanup($intervention->operationId);
+    }
+});
+
 it('forces an active legacy v1 promotion through fenced rollback before any forward resume', function (): void {
     $fixture = resumeControlPlaneGenerationFixture(draining: false);
     [, $cleanup] = resumeControlPlaneGenerationIsolatedQueue($fixture['server']);
@@ -751,6 +913,7 @@ it('forces an active legacy v1 promotion through fenced rollback before any forw
         $legacyPayload['legacy_writer_authority_reconciliation_required'],
         $legacyPayload['writer']['predecessor_operation_id'],
     );
+    $legacyPayload['mutation_freeze'] = $fixture['promotion_store']->read($fixture['server'])?->mutationFreeze;
     $freshServer = $fixture['server']->fresh();
     $freshServer->proxy->set(StoreControlPlaneGenerationPromotionState::STATE_KEY, $legacyPayload);
     $freshServer->save();
@@ -842,7 +1005,13 @@ it('fails closed before remote drain proof when the durable freeze is missing or
     [$queue, $cleanup] = resumeControlPlaneGenerationIsolatedQueue($fixture['server']);
 
     try {
-        ProxyMutationQueue::freeze('foreign-generation-owner', $queue);
+        $ownedSnapshot = ProxyMutationQueue::snapshot($queue);
+        ProxyMutationQueue::unfreeze(
+            $fixture['promotion']->operationId,
+            $queue,
+            $ownedSnapshot->freezeFence ?? throw new RuntimeException('The resume fixture freeze did not issue a fence.'),
+        );
+        $foreignSnapshot = ProxyMutationQueue::freeze('foreign-generation-owner', $queue);
 
         expect(fn (): ControlPlaneGenerationPromotionState => resumeControlPlaneGenerationAction($fixture)->handle(
             $fixture['server'],
@@ -851,9 +1020,13 @@ it('fails closed before remote drain proof when the durable freeze is missing or
             remoteExecutor: static function (): never {
                 throw new RuntimeException('Foreign freeze must prevent remote drain proof.');
             },
-        ))->toThrow(RuntimeException::class, 'freeze is missing or owned by another operation');
+        ))->toThrow(RuntimeException::class, 'can only be renewed by its owning operation');
 
-        ProxyMutationQueue::unfreeze('foreign-generation-owner', $queue);
+        ProxyMutationQueue::unfreeze(
+            'foreign-generation-owner',
+            $queue,
+            $foreignSnapshot->freezeFence ?? throw new RuntimeException('The foreign resume freeze did not issue a fence.'),
+        );
 
         expect(fn (): ControlPlaneGenerationPromotionState => resumeControlPlaneGenerationAction($fixture)->handle(
             $fixture['server'],
@@ -862,7 +1035,7 @@ it('fails closed before remote drain proof when the durable freeze is missing or
             remoteExecutor: static function (): never {
                 throw new RuntimeException('Missing freeze must prevent remote drain proof.');
             },
-        ))->toThrow(RuntimeException::class, 'freeze is missing or owned by another operation');
+        ))->toThrow(RuntimeException::class, 'no longer frozen by its owning operation');
     } finally {
         $cleanup($fixture['promotion']->operationId);
     }
@@ -1212,7 +1385,7 @@ it('replays a durable writer marker after a crash before writer-promotion eviden
         ProxyMutationQueue::freeze($fixture['promotion']->operationId, $queue);
         $clock = static function () use (&$clockCalls): DateTimeImmutable {
             $clockCalls++;
-            if ($clockCalls === 6) {
+            if ($clockCalls === 16) {
                 throw new RuntimeException('crash after writer marker');
             }
 
@@ -1279,7 +1452,7 @@ it('replays after an unfreeze crash without requiring the reopened queue to rema
             $fixture,
             clock: static function () use (&$clockCalls): DateTimeImmutable {
                 $clockCalls++;
-                if ($clockCalls === 2) {
+                if ($clockCalls === 3) {
                     throw new RuntimeException('crash after exact fence release');
                 }
 
@@ -1324,23 +1497,28 @@ it('replays after an unfreeze crash without requiring the reopened queue to rema
 
 it('refuses to resume from a predecessor or unrelated local container identity', function (): void {
     $fixture = resumeControlPlaneGenerationFixture();
+    [, $cleanup] = resumeControlPlaneGenerationIsolatedQueue($fixture['server']);
     $remoteCalls = 0;
 
-    expect(fn (): ControlPlaneGenerationPromotionState => resumeControlPlaneGenerationAction(
-        $fixture,
-        localContainerIdentity: static fn (): string => str_repeat('a', 12),
-    )->handle(
-        $fixture['server'],
-        $fixture['promotion']->operationId,
-        $fixture['token'],
-        remoteExecutor: function () use (&$remoteCalls): never {
-            $remoteCalls++;
+    try {
+        expect(fn (): ControlPlaneGenerationPromotionState => resumeControlPlaneGenerationAction(
+            $fixture,
+            localContainerIdentity: static fn (): string => str_repeat('a', 12),
+        )->handle(
+            $fixture['server'],
+            $fixture['promotion']->operationId,
+            $fixture['token'],
+            remoteExecutor: function () use (&$remoteCalls): never {
+                $remoteCalls++;
 
-            throw new RuntimeException('Unexpected remote work.');
-        },
-    ))->toThrow(RuntimeException::class, 'exact successor writer container');
+                throw new RuntimeException('Unexpected remote work.');
+            },
+        ))->toThrow(RuntimeException::class, 'exact successor writer container');
 
-    expect($remoteCalls)->toBe(0)
-        ->and($fixture['promotion_store']->read($fixture['server'])?->phase)
-        ->toBe(ControlPlaneGenerationPromotionPhase::Draining);
+        expect($remoteCalls)->toBe(0)
+            ->and($fixture['promotion_store']->read($fixture['server'])?->phase)
+            ->toBe(ControlPlaneGenerationPromotionPhase::Draining);
+    } finally {
+        $cleanup($fixture['promotion']->operationId);
+    }
 });

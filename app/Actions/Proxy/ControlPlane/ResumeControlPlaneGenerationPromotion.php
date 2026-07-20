@@ -25,6 +25,8 @@ final class ResumeControlPlaneGenerationPromotion
         {server_id : Local Coolify server ID}
         {operation_id : Exact durable generation promotion operation ID}
         {--rollback : Restore the predecessor generation when retirement has not started}
+        {--writer-epoch= : Exact durable writer epoch required for an intervention rollback}
+        {--freeze-fence= : Exact durable mutation-freeze fence required for an intervention rollback}
         {--successor-yaml-path= : Absolute local path to the exact successor YAML for route-switch replay or rollback}';
 
     public string $commandDescription = 'Resume an existing fenced control-plane Traefik generation promotion.';
@@ -76,8 +78,33 @@ final class ResumeControlPlaneGenerationPromotion
         ?string $successorYaml = null,
         ?Closure $remoteExecutor = null,
         bool $rollback = false,
+        ?int $expectedInterventionWriterEpoch = null,
+        ?string $expectedInterventionFreezeFence = null,
     ): ControlPlaneGenerationPromotionState {
         $state = $this->ownedState($server, $operationId, $token);
+        if ($state->phase === ControlPlaneGenerationPromotionPhase::InterventionRequired) {
+            if (! $rollback) {
+                throw new RuntimeException('An intervention-required control-plane generation promotion requires an explicit rollback decision with its exact writer epoch and mutation-freeze fence.');
+            }
+            $this->assertSuccessorExecutor($state);
+
+            return $this->rollback->handle(
+                server: $server,
+                operationId: $operationId,
+                token: $token,
+                successorYaml: $successorYaml,
+                remoteExecutor: $this->rollbackExecutor($remoteExecutor),
+                expectedInterventionWriterEpoch: $expectedInterventionWriterEpoch,
+                expectedInterventionFreezeFence: $expectedInterventionFreezeFence,
+            );
+        }
+        if (! in_array($state->phase, [
+            ControlPlaneGenerationPromotionPhase::Completed,
+            ControlPlaneGenerationPromotionPhase::RolledBack,
+            ControlPlaneGenerationPromotionPhase::Unfreezing,
+        ], true)) {
+            $state = $this->heartbeatFreeze($server, $state, $token);
+        }
         if ($state->legacyWriterAuthorityReconciliationRequired && ! $state->hasRetirementStarted()) {
             return $this->rollback->handle(
                 server: $server,
@@ -170,6 +197,16 @@ final class ResumeControlPlaneGenerationPromotion
         if ($successorYamlPath !== null && ! is_string($successorYamlPath)) {
             throw new InvalidArgumentException('The control-plane successor YAML path is invalid.');
         }
+        $expectedInterventionWriterEpoch = $this->positiveIntegerOption(
+            $command->option('writer-epoch'),
+            'The control-plane intervention writer epoch must be a positive integer.',
+        );
+        $expectedInterventionFreezeFence = $command->option('freeze-fence');
+        if ($expectedInterventionFreezeFence !== null
+            && (! is_string($expectedInterventionFreezeFence)
+                || preg_match('/\\A[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\\z/D', $expectedInterventionFreezeFence) !== 1)) {
+            throw new InvalidArgumentException('The control-plane intervention mutation-freeze fence is invalid.');
+        }
 
         $server = Server::query()->find($serverId)
             ?? throw new RuntimeException('The control-plane generation promotion server does not exist.');
@@ -179,6 +216,8 @@ final class ResumeControlPlaneGenerationPromotion
             token: $token,
             successorYaml: $this->readSuccessorYaml($successorYamlPath),
             rollback: (bool) $command->option('rollback'),
+            expectedInterventionWriterEpoch: $expectedInterventionWriterEpoch,
+            expectedInterventionFreezeFence: $expectedInterventionFreezeFence,
         );
         $command->info("Control-plane generation promotion phase: {$state->phase->value}");
 
@@ -227,9 +266,9 @@ final class ResumeControlPlaneGenerationPromotion
             throw new RuntimeException('The control-plane generation promotion drain evidence is not resumable.');
         }
 
-        $firstObservation = $this->captureDrainProof($state, $enrollment, $execute);
+        $firstObservation = $this->captureDrainProof($server, $state, $token, $enrollment, $execute);
         ($this->sleeper)(1);
-        $secondObservation = $this->captureDrainProof($state, $enrollment, $execute);
+        $secondObservation = $this->captureDrainProof($server, $state, $token, $enrollment, $execute);
 
         return $this->promotionStore->transition(
             server: $server,
@@ -252,11 +291,13 @@ final class ResumeControlPlaneGenerationPromotion
      * @return array{observed_at: string, pending: int, reserved: int, delayed: int, tcp_connection_count: int, predecessor_runtime_sha256: string}
      */
     private function captureDrainProof(
+        Server $server,
         ControlPlaneGenerationPromotionState $state,
+        string $token,
         ControlPlaneProxyEnrollmentState $enrollment,
         Closure $execute,
     ): array {
-        $this->assertOwnedFrozenEmpty($state);
+        $this->assertOwnedFrozenEmpty($server, $state, $token);
         $transcript = $execute(
             $this->drainProof->commandFor($state, $enrollment->appPort, $state->operationId),
             $this->drainRemoteTimeout($state),
@@ -266,7 +307,7 @@ final class ResumeControlPlaneGenerationPromotion
         }
 
         $observation = $this->drainProofVerifier->handle($state, $transcript);
-        $this->assertOwnedFrozenEmpty($state);
+        $this->assertOwnedFrozenEmpty($server, $state, $token);
 
         return $observation;
     }
@@ -279,17 +320,17 @@ final class ResumeControlPlaneGenerationPromotion
         ControlPlaneProxyEnrollmentState $enrollment,
         Closure $execute,
     ): ControlPlaneGenerationPromotionState {
-        $this->assertOwnedFrozenEmpty($state);
+        $this->assertOwnedFrozenEmpty($server, $state, $token);
         $proof = $this->successorRouteProof($enrollment, $state);
         $transcript = $execute($proof->shellCommand(), $this->steadyRemoteTimeout());
         if (! is_string($transcript)) {
             throw new RuntimeException('The control-plane successor route reattestation returned no transcript.');
         }
         $this->routeVerifier->handle($proof, $transcript);
-        $this->assertOwnedFrozenEmpty($state);
+        $this->assertOwnedFrozenEmpty($server, $state, $token);
 
         foreach ($state->runtime->predecessorRuntime as $containerName => $identity) {
-            $this->assertOwnedFrozenEmpty($state);
+            $this->assertOwnedFrozenEmpty($server, $state, $token);
             $timeout = $this->steadyRemoteTimeout();
             $remainingSeconds = $this->remainingDrainSeconds($state);
             $stopTimeout = max(1, min(self::MAXIMUM_STOP_TIMEOUT_SECONDS, $remainingSeconds));
@@ -345,7 +386,7 @@ final class ResumeControlPlaneGenerationPromotion
         string $token,
         Closure $execute,
     ): ControlPlaneGenerationPromotionState {
-        $this->assertOwnedFrozenEmpty($state);
+        $this->assertOwnedFrozenEmpty($server, $state, $token);
         $this->assertWriterPromoted($server, $state, $execute, 'writer handoff');
         $promotedAt = $this->timestamp($this->now());
 
@@ -374,7 +415,9 @@ final class ResumeControlPlaneGenerationPromotion
 
         $snapshot = ProxyMutationQueue::snapshot();
         if ($snapshot->freezeOperationId === null
-            || ! hash_equals($state->operationId, $snapshot->freezeOperationId)) {
+            || ! hash_equals($state->operationId, $snapshot->freezeOperationId)
+            || ! $snapshot->hasFencedRenewableFreezeLease()
+            || ! hash_equals($state->mutationFreezeFence(), $snapshot->freezeFence ?? '')) {
             throw new RuntimeException('The control-plane generation mutation freeze is missing or owned by another operation.');
         }
         if (! $snapshot->isEmpty()) {
@@ -405,13 +448,18 @@ final class ResumeControlPlaneGenerationPromotion
 
         $snapshot = ProxyMutationQueue::snapshot();
         if ($snapshot->freezeOperationId !== null) {
-            if (! hash_equals($state->operationId, $snapshot->freezeOperationId)) {
+            if (! hash_equals($state->operationId, $snapshot->freezeOperationId)
+                || ! $snapshot->hasFencedRenewableFreezeLease()
+                || ! hash_equals($state->mutationFreezeFence(), $snapshot->freezeFence ?? '')) {
                 throw new RuntimeException('The control-plane generation mutation queue was refrozen by another operation.');
             }
             if (! $snapshot->isEmpty()) {
                 throw new RuntimeException('The control-plane generation mutation queue must be empty before exact unfreeze.');
             }
-            $released = ProxyMutationQueue::unfreeze($state->operationId);
+            $released = ProxyMutationQueue::unfreeze(
+                $state->operationId,
+                expectedFence: $state->mutationFreezeFence(),
+            );
             if ($released->freezeOperationId !== null) {
                 throw new RuntimeException('The control-plane generation mutation queue did not release its exact owner.');
             }
@@ -477,13 +525,19 @@ final class ResumeControlPlaneGenerationPromotion
         return $enrollment;
     }
 
-    private function assertOwnedFrozenEmpty(ControlPlaneGenerationPromotionState $state): ProxyMutationQueueSnapshot
-    {
+    private function assertOwnedFrozenEmpty(
+        Server $server,
+        ControlPlaneGenerationPromotionState $state,
+        string $token,
+    ): ProxyMutationQueueSnapshot {
+        $state = $this->heartbeatFreeze($server, $state, $token);
         $snapshot = ProxyMutationQueue::snapshot();
         if ($state->mutationFreeze === null
             || ! hash_equals($state->operationId, $state->mutationFreeze['operation_id'])
             || $snapshot->freezeOperationId === null
-            || ! hash_equals($state->operationId, $snapshot->freezeOperationId)) {
+            || ! hash_equals($state->operationId, $snapshot->freezeOperationId)
+            || ! $snapshot->hasFencedRenewableFreezeLease()
+            || ! hash_equals($state->mutationFreezeFence(), $snapshot->freezeFence ?? '')) {
             throw new RuntimeException('The control-plane generation mutation freeze is missing or owned by another operation.');
         }
         if (! $snapshot->isEmpty()) {
@@ -491,6 +545,40 @@ final class ResumeControlPlaneGenerationPromotion
         }
 
         return $snapshot;
+    }
+
+    private function heartbeatFreeze(
+        Server $server,
+        ControlPlaneGenerationPromotionState $state,
+        string $token,
+    ): ControlPlaneGenerationPromotionState {
+        if ($state->mutationFreeze === null) {
+            return $state;
+        }
+        $freezeFence = $state->mutationFreezeFence();
+        $leaseSeconds = ProxyMutationQueue::freezeLeaseSeconds();
+        $snapshot = ProxyMutationQueue::renewFreeze(
+            $state->operationId,
+            leaseSeconds: $leaseSeconds,
+            expectedFence: $freezeFence,
+        );
+        if ($snapshot->freezeOperationId === null
+            || ! hash_equals($state->operationId, $snapshot->freezeOperationId)
+            || ! $snapshot->hasFencedRenewableFreezeLease()
+            || ! hash_equals($freezeFence, $snapshot->freezeFence ?? '')) {
+            throw new RuntimeException('The control-plane generation mutation freeze is missing or owned by another operation.');
+        }
+
+        return $this->promotionStore->heartbeatFreeze(
+            $server,
+            $state->operationId,
+            $token,
+            $state->writerEpoch,
+            $leaseSeconds,
+            $freezeFence,
+            $freezeFence,
+            $this->timestamp($this->now()),
+        );
     }
 
     private function drainDeadline(ControlPlaneGenerationPromotionState $state): DateTimeImmutable
@@ -631,6 +719,20 @@ final class ResumeControlPlaneGenerationPromotion
         }
 
         return $contents;
+    }
+
+    private function positiveIntegerOption(mixed $value, string $message): ?int
+    {
+        if ($value === null) {
+            return null;
+        }
+
+        $integer = filter_var($value, FILTER_VALIDATE_INT);
+        if ($integer === false || $integer < 1) {
+            throw new InvalidArgumentException($message);
+        }
+
+        return $integer;
     }
 
     private function assertExactOutput(?string $output, string $marker, string $operation): void
