@@ -12,6 +12,7 @@ All notable changes to this project will be documented in this file.
 - *(blue-green)* Support multi-destination fleets
 - *(release)* Gate exact v4.x candidates before publication
 - *(blue-green)* Support multi-destination fleets (#72)
+- *(blue-green)* Support replica sets per destination
 
 ### 🐛 Bug Fixes
 
@@ -39,6 +40,9 @@ All notable changes to this project will be documented in this file.
 - *(control-plane)* Clarify recovery artifact guards
 - *(remediation)* Harden release trust, queue recovery, and Traefik evidence (#69)
 - *(blue-green)* Surface fleet scheduling failures
+- *(blue-green)* Fence fleet failure and removal races
+- *(blue-green)* Renew fleet fences and type recovery predicates
+- *(blue-green)* Preserve terminal recovery timestamp
 
 ### 💼 Other
 
@@ -57,6 +61,11 @@ All notable changes to this project will be documented in this file.
 - Update changelog (#70)
 - Update changelog (#71)
 - Update changelog (#73)
+- Update changelog (#74)
+
+### 🎨 Styling
+
+- *(blue-green)* Format race regression repair
 
 ### 🧪 Testing
 
