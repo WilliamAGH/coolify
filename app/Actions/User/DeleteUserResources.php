@@ -25,7 +25,7 @@ class DeleteUserResources
         $services = collect();
 
         // Get all teams the user belongs to
-        $teams = $this->user->teams()->get();
+        $teams = $this->user->teams()->withCount('members')->get();
 
         foreach ($teams as $team) {
             // Only delete resources from teams that will be FULLY DELETED
@@ -36,7 +36,7 @@ class DeleteUserResources
             // - Team has other members (ownership will be transferred or user just removed)
 
             $userRole = $team->pivot->role;
-            $memberCount = $team->members->count();
+            $memberCount = $team->members_count;
 
             // Skip if user is not owner
             if ($userRole !== 'owner') {
@@ -85,7 +85,7 @@ class DeleteUserResources
     public function assertBlueGreenApplicationsReadyForPermanentDeletion(): void
     {
         foreach ($this->user->teams()->withCount('members')->useWritePdo()->get() as $team) {
-            if ($team->id === 0 || $team->members_count !== 1) {
+            if ($team->pivot->role !== 'owner' || $team->id === 0 || $team->members_count !== 1) {
                 continue;
             }
 

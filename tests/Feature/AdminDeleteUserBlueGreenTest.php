@@ -1,5 +1,6 @@
 <?php
 
+use App\Actions\User\DeleteUserResources;
 use App\Actions\User\DeleteUserServers;
 use App\Actions\User\DeleteUserTeams;
 use App\Console\Commands\AdminDeleteUser;
@@ -62,6 +63,41 @@ it('preserves servers belonging to a shared team for owners and admins', functio
         ->and($action->execute())->toBe(['servers' => 0])
         ->and(Server::query()->whereKey($server->id)->exists())->toBeTrue();
 })->with(['owner', 'admin']);
+
+it('loads membership cardinality once while previewing servers for multiple owned teams', function () {
+    $user = User::factory()->create();
+
+    foreach (range(1, 3) as $index) {
+        $team = Team::factory()->create(['name' => "Preview Team {$index}"]);
+        $team->members()->attach($user->id, ['role' => 'owner']);
+        Server::factory()->create(['team_id' => $team->id]);
+    }
+
+    $membershipCountQueries = [];
+    DB::listen(function ($query) use (&$membershipCountQueries): void {
+        if (str_contains($query->sql, 'count(*)') && str_contains($query->sql, 'team_user')) {
+            $membershipCountQueries[] = $query->sql;
+        }
+    });
+
+    $servers = (new DeleteUserServers($user))->getServersPreview();
+
+    expect($servers)->toHaveCount(3)
+        ->and($membershipCountQueries)->toHaveCount(1);
+});
+
+it('does not run blue green deletion readiness for a sole non-owner team', function (string $role) {
+    $user = User::factory()->create();
+    ['application' => $application, 'destination' => $destination, 'team' => $team] = BlueGreenDeactivationScenario::context();
+    $team->members()->attach($user->id, ['role' => $role]);
+    $application->settings()->update(['is_blue_green_deployment_enabled' => true]);
+    BlueGreenDeactivationScenario::routeLessState($application, $destination);
+
+    (new DeleteUserResources($user))->assertBlueGreenApplicationsReadyForPermanentDeletion();
+
+    expect($team->members()->whereKey($user->id)->first()?->pivot?->role)->toBe($role)
+        ->and($application->fresh())->not->toBeNull();
+})->with(['admin', 'member']);
 
 it('promotes the replacement admin and preserves shared resources when deleting an owner', function () {
     $team = Team::factory()->create();

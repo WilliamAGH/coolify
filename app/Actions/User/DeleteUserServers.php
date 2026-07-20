@@ -23,11 +23,11 @@ class DeleteUserServers
         $servers = collect();
 
         // Get all teams the user belongs to
-        $teams = $this->user->teams()->get();
+        $teams = $this->user->teams()->withCount('members')->get();
 
         foreach ($teams as $team) {
             $userRole = $team->pivot->role;
-            $memberCount = $team->members->count();
+            $memberCount = $team->members_count;
 
             if ($userRole !== 'owner' || $memberCount !== 1) {
                 continue;
