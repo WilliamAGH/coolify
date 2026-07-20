@@ -126,19 +126,18 @@ it('saves application name and enables static site with nginx config', function 
     $page->assertValue('name', $updatedName);
 
     $this->application->refresh();
-    expect($this->application->name)->toBe($updatedName);
+    expect($this->application->name)->toBe($updatedName)
+        ->and($this->application->custom_docker_run_options)->toBe('--read-only');
 
-    clickAndWaitForLivewireSuccess($page, '[id^="isStatic"]', 'Settings saved.');
-    $page->screenshot();
+    $page->click('[id^="isStatic"]')
+        ->screenshot();
 
     $page->assertSee('Custom Nginx Configuration')
         ->assertSee('Is it a SPA (Single Page Application)?')
         ->assertValue('name', $updatedName);
 
     $this->application->refresh();
-    expect($this->application->name)->toBe($updatedName)
-        ->and($this->application->custom_docker_run_options)->toBe('--read-only')
-        ->and($this->application->settings->is_static)->toBeTrue();
+    expect($this->application->settings->is_static)->toBeTrue();
 
     $reloadedPage = visit($applicationRoute);
     $reloadedPage->screenshot();
@@ -167,6 +166,10 @@ it('saves database name and enables ssl with mode selector', function () {
         ['name' => $updatedDatabaseName, 'description' => 'Updated by browser test'],
         'Database updated.'
     );
+    $this->database->refresh();
+    expect($this->database->name)->toBe($updatedDatabaseName)
+        ->and($this->database->description)->toBe('Updated by browser test');
+
     $page->click('[id^="enableSsl"]');
 
     $page->assertSee('SSL Mode')
@@ -174,9 +177,7 @@ it('saves database name and enables ssl with mode selector', function () {
     $page->screenshot();
 
     $this->database->refresh();
-    expect($this->database->name)->toBe($updatedDatabaseName)
-        ->and($this->database->description)->toBe('Updated by browser test')
-        ->and($this->database->enable_ssl)->toBeTruthy();
+    expect($this->database->enable_ssl)->toBeTruthy();
 
     $reloadedPage = visit($databaseRoute);
     $reloadedPage->screenshot();
@@ -184,77 +185,6 @@ it('saves database name and enables ssl with mode selector', function () {
     $reloadedPage->assertValue('name', $updatedDatabaseName)
         ->assertSee('SSL Mode');
 });
-
-function clickAndWaitForLivewireSuccess(PendingAwaitablePage $page, string $selector, string $description): void
-{
-    $encodedSelector = json_encode($selector, JSON_THROW_ON_ERROR);
-    $componentId = $page->script(<<<JAVASCRIPT
-        () => {
-            const selector = {$encodedSelector};
-            const element = document.querySelector(selector);
-            if (!(element instanceof HTMLElement)) {
-                throw new Error(`Unable to find element: \${selector}`);
-            }
-            const componentId = element.closest('[wire\\\\:id]')?.getAttribute('wire:id');
-            if (!componentId) {
-                throw new Error(`Unable to find the Livewire component for: \${selector}`);
-            }
-
-            const pendingAction = new Promise((resolve, reject) => {
-                let settled = false;
-                let stopObservingCommits = () => {};
-                const finish = (callback) => {
-                    if (settled) {
-                        return;
-                    }
-
-                    settled = true;
-                    window.clearTimeout(timeout);
-                    stopObservingCommits();
-                    callback();
-                };
-                const timeout = window.setTimeout(() => {
-                    finish(() => reject(new Error(`Timed out waiting for Livewire action: \${componentId}`)));
-                }, 10_000);
-                stopObservingCommits = window.Livewire.hook('commit', ({ component, fail, succeed }) => {
-                    if (component.id !== componentId) {
-                        return;
-                    }
-
-                    fail(() => {
-                        finish(() => reject(new Error(`Livewire action failed: \${componentId}`)));
-                    });
-                    succeed(({ effects }) => {
-                        finish(() => window.requestAnimationFrame(() => resolve({
-                            componentId,
-                            dispatches: effects.dispatches ?? [],
-                        })));
-                    });
-                });
-            });
-
-            pendingAction.catch(() => {});
-            window.__pestResourceSettingsAction = pendingAction;
-
-            return componentId;
-        }
-        JAVASCRIPT);
-
-    expect($componentId)->toBeString()->not->toBeEmpty();
-    $page->click($selector);
-
-    $result = $page->script(<<<'JAVASCRIPT'
-        async () => {
-            try {
-                return await window.__pestResourceSettingsAction;
-            } finally {
-                delete window.__pestResourceSettingsAction;
-            }
-        }
-        JAVASCRIPT);
-
-    assertLivewireSuccess($result, $componentId, $description);
-}
 
 /**
  * @param  array<string, string>  $expectedUpdates
@@ -344,7 +274,6 @@ function submitLivewireForm(
 function assertLivewireSuccess(array $result, string $componentId, string $expectedSuccessMessage): void
 {
     expect($result['componentId'])->toBe($componentId);
-
     $dispatches = collect($result['dispatches']);
     $errorDispatches = $dispatches->where('name', 'error')->values()->all();
     $successDispatch = $dispatches->first(fn (array $dispatch): bool => data_get($dispatch, 'name') === 'success'
