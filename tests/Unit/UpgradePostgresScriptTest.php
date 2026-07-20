@@ -39,7 +39,6 @@ it('downloads postgres upgrade script during install and upgrade without auto-ru
         ->not->toContain('bash /data/coolify/source/upgrade-postgres.sh');
 })->with([
     'stable install' => 'scripts/install.sh',
-    'nightly install' => 'other/nightly/install.sh',
     'stable upgrade' => 'scripts/upgrade.sh',
     'nightly upgrade' => 'other/nightly/upgrade.sh',
 ]);

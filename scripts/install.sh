@@ -19,6 +19,7 @@ configure_docker_daemon() (
     local address_pool_base="$3"
     local address_pool_size="$4"
     local force_pool="$5"
+    local ensure_pool="${6:-true}"
     local config_directory
     local source_file
     local temp_file=""
@@ -36,8 +37,16 @@ configure_docker_daemon() (
         echo "Invalid Docker address pool override value: $force_pool" >&2
         return 1
     fi
+    if [ "$ensure_pool" != true ] && [ "$ensure_pool" != false ]; then
+        echo "Invalid Docker address pool enforcement value: $ensure_pool" >&2
+        return 1
+    fi
 
-    for source_file in "$config_file" "$sidecar_file"; do
+    for source_file in "$sidecar_file" "$config_file"; do
+        if [ -L "$source_file" ]; then
+            echo "Refusing to replace symlinked Docker daemon configuration: $source_file" >&2
+            return 1
+        fi
         if [ ! -e "$source_file" ]; then
             continue
         fi
@@ -48,15 +57,16 @@ configure_docker_daemon() (
         configuration_sources+=("$source_file")
     done
 
-    config_directory="$(dirname -- "$config_file")"
-    mkdir -p "$config_directory"
+    config_directory="$(dirname -- "$config_file")" || return 1
+    mkdir -p "$config_directory" || return 1
     umask 077
-    temp_file="$(mktemp "$config_directory/.daemon.json.tmp.XXXXXX")"
+    temp_file="$(mktemp "$config_directory/.daemon.json.tmp.XXXXXX")" || return 1
     trap '[ -z "${temp_file:-}" ] || rm -f "$temp_file"' EXIT
 
     jq --sort-keys --slurp \
         --arg address_pool_base "$address_pool_base" \
         --argjson address_pool_size "$address_pool_size" \
+        --argjson ensure_pool "$ensure_pool" \
         --argjson force_pool "$force_pool" '
             reduce .[] as $configuration ({}; . * $configuration)
             | .["log-opts"] = (
@@ -64,39 +74,65 @@ configure_docker_daemon() (
                 * {"max-size": "10m", "max-file": "3"}
             )
             | .["log-driver"] = "json-file"
-            | if $force_pool
+            | if $ensure_pool and (
+                $force_pool
                 or ((.["default-address-pools"] | type) != "array")
                 or ((.["default-address-pools"] | length) == 0)
+              )
               then .["default-address-pools"] = [
                   {"base": $address_pool_base, "size": $address_pool_size}
               ]
               else .
               end
-        ' "${configuration_sources[@]}" > "$temp_file"
-    chmod 600 "$temp_file"
+        ' "${configuration_sources[@]}" > "$temp_file" || return 1
+    if ! dockerd --validate --config-file "$temp_file" >/dev/null 2>&1; then
+        echo "Refusing to publish Docker daemon configuration rejected by dockerd" >&2
+        return 1
+    fi
+    chmod 600 "$temp_file" || return 1
 
     if [ -f "$config_file" ] && jq -e --slurp '.[0] == .[1]' "$config_file" "$temp_file" >/dev/null; then
-        chmod 600 "$config_file"
+        chmod 600 "$config_file" || return 1
         printf 'unchanged\n'
         return 0
     fi
 
-    sync -f "$temp_file"
-    mv -f "$temp_file" "$config_file"
+    sync "$temp_file" || return 1
+    mv -f "$temp_file" "$config_file" || return 1
     temp_file=""
-    sync -f "$config_directory"
+    if ! sync "$config_directory"; then
+        echo "Warning: Docker daemon configuration was replaced, but its directory sync failed" >&2
+    fi
     printf 'changed\n'
 )
 
+coolify_cdn_for_release() {
+    if [ "${1:-}" = next ]; then
+        printf '%s\n' 'https://cdn.coollabs.io/coolify-nightly'
+    else
+        printf '%s\n' 'https://cdn.coollabs.io/coolify'
+    fi
+}
+
 if [ -n "${BASH_SOURCE[0]:-}" ] && [ "${BASH_SOURCE[0]}" != "$0" ]; then
     return 0
+fi
+
+if [ "${1:-}" = --configure-docker-daemon ]; then
+    shift
+    if [ "$#" -lt 5 ] || [ "$#" -gt 6 ]; then
+        echo 'Usage: install.sh --configure-docker-daemon <config> <sidecar> <pool-base> <pool-size> <force-pool> [ensure-pool]' >&2
+        exit 64
+    fi
+    configure_docker_daemon "$@"
+    exit
 fi
 
 set -e # Exit immediately if a command exits with a non-zero status
 ## $1 could be empty, so we need to disable this check
 #set -u # Treat unset variables as an error and exit
 set -o pipefail # Cause a pipeline to return the status of the last command that exited with a non-zero status
-CDN="https://cdn.coollabs.io/coolify"
+CDN="$(coolify_cdn_for_release "${1:-}")"
 DATE=$(date +"%Y%m%d-%H%M%S")
 
 OS_TYPE=$(grep -w "ID" /etc/os-release | cut -d "=" -f 2 | tr -d '"')
