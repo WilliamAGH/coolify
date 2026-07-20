@@ -1,6 +1,7 @@
 <?php
 
 use App\Actions\Proxy\ControlPlane\ControlPlaneCandidateHealthMarker;
+use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
 
 function controlPlaneCandidateHealthMarker(string $operationId = 'operation-42'): ControlPlaneCandidateHealthMarker
 {
@@ -28,17 +29,21 @@ it('serializes only nonsecret candidate health identity material canonically', f
     $derivedHealthProof = hash_hmac('sha256', 'coolify-control-plane-health-check-v1', $rawEnrollmentToken);
     $marker = controlPlaneCandidateHealthMarker();
     $json = $marker->toJson();
+    $authenticationProxyProof = ControlPlaneDynamicConfiguration::deriveAuthenticationProxyProof($derivedHealthProof);
 
     expect($marker->healthProofSha256)->toBe(hash('sha256', $derivedHealthProof))
+        ->and($marker->authenticationProxyProofSha256)->toBe(hash('sha256', $authenticationProxyProof))
         ->and($json)->toBe(json_encode([
             'operation_id' => 'operation-42',
             'expected_member' => 'blue',
             'expected_revision' => 'revision-42',
             'dynamic_sha256' => hash('sha256', 'coolify.yaml replacement'),
             'health_proof_sha256' => hash('sha256', $derivedHealthProof),
+            'authentication_proxy_proof_sha256' => hash('sha256', $authenticationProxyProof),
         ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES))
         ->and($json)->not->toContain($rawEnrollmentToken)
         ->and($json)->not->toContain($derivedHealthProof)
+        ->and($json)->not->toContain($authenticationProxyProof)
         ->and(ControlPlaneCandidateHealthMarker::fromJson($json))
         ->toEqual($marker);
 });

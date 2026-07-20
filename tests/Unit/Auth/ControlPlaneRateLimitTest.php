@@ -33,7 +33,7 @@ function authenticationRequest(string $remoteAddress, string $forwardedAddress, 
 }
 
 it('keeps direct authentication buckets on the canonical remote address', function (): void {
-    config(['constants.control_plane_health.health_proof_token_sha256' => hash('sha256', 'valid-proof')]);
+    config(['constants.control_plane_health.authentication_proxy_proof_sha256' => hash('sha256', str_repeat('e', 64))]);
     $request = authenticationRequest('2001:0db8:0:0:0:0:0:10', '203.0.113.20', 'forged-proof');
 
     $loginLimit = authenticationRateLimit('login', $request);
@@ -47,8 +47,8 @@ it('keeps direct authentication buckets on the canonical remote address', functi
 });
 
 it('uses the forwarded client only with the exact control-plane proof', function (): void {
-    $proof = str_repeat('a', 64);
-    config(['constants.control_plane_health.health_proof_token_sha256' => hash('sha256', $proof)]);
+    $proof = ControlPlaneDynamicConfiguration::deriveAuthenticationProxyProof(str_repeat('a', 64));
+    config(['constants.control_plane_health.authentication_proxy_proof_sha256' => hash('sha256', $proof)]);
 
     $valid = authenticationRateLimit('login', authenticationRequest('172.30.44.1', '2001:0db8:0:0:0:0:0:20', $proof));
     $missing = authenticationRateLimit('login', authenticationRequest('172.30.44.1', '203.0.113.21'));
@@ -84,15 +84,16 @@ it('fails closed without a canonical server-supplied remote address', function (
 })->with(['missing' => null, 'blank' => '', 'malformed' => 'not-an-ip']);
 
 it('prefers the exact candidate marker proof during enrollment', function (): void {
-    $candidateProof = str_repeat('b', 64);
-    $configuredProof = str_repeat('c', 64);
-    config(['constants.control_plane_health.health_proof_token_sha256' => hash('sha256', $configuredProof)]);
+    $candidateHealthProof = str_repeat('b', 64);
+    $candidateProof = ControlPlaneDynamicConfiguration::deriveAuthenticationProxyProof($candidateHealthProof);
+    $configuredProof = ControlPlaneDynamicConfiguration::deriveAuthenticationProxyProof(str_repeat('c', 64));
+    config(['constants.control_plane_health.authentication_proxy_proof_sha256' => hash('sha256', $configuredProof)]);
     $marker = ControlPlaneCandidateHealthMarker::fromDerivedHealthProof(
         operationId: 'candidate-operation',
         expectedMember: 'green',
         expectedRevision: 'revision-43',
         dynamicSha256: str_repeat('d', 64),
-        derivedHealthProof: $candidateProof,
+        derivedHealthProof: $candidateHealthProof,
     );
     $markerPath = tempnam(sys_get_temp_dir(), 'coolify-auth-proof-');
     expect($markerPath)->toBeString();

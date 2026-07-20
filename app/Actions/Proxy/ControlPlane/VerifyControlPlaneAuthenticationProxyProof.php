@@ -27,7 +27,7 @@ final readonly class VerifyControlPlaneAuthenticationProxyProof
     private function candidateProofSha256(): ?string
     {
         try {
-            return ControlPlaneCandidateHealthMarker::readFromPath($this->candidateMarkerPath)->healthProofSha256;
+            return ControlPlaneCandidateHealthMarker::readFromPath($this->candidateMarkerPath)->authenticationProxyProofSha256;
         } catch (InvalidArgumentException) {
             return null;
         }
@@ -35,7 +35,7 @@ final readonly class VerifyControlPlaneAuthenticationProxyProof
 
     private function configuredProofSha256(): ?string
     {
-        $proofSha256 = config('constants.control_plane_health.health_proof_token_sha256');
+        $proofSha256 = config('constants.control_plane_health.authentication_proxy_proof_sha256');
 
         return is_string($proofSha256) && preg_match('/\A[a-f0-9]{64}\z/D', $proofSha256) === 1
             ? $proofSha256

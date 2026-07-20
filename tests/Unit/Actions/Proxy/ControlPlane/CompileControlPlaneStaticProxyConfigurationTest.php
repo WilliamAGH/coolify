@@ -79,6 +79,7 @@ it('adds only hashed proof credentials and immutable backend identity to the sou
     $configuration = $compiler->withHealthProofIdentity(
         configuration: $configuration,
         healthProofTokenSha256: hash('sha256', 'health-proof-token'),
+        authenticationProxyProofSha256: hash('sha256', 'authentication-proxy-proof'),
         dynamicSha256: hash('sha256', 'dynamic-document'),
         configurationAcknowledgement: 'ack:'.str_repeat('a', 64),
         expectedMember: 'blue',
@@ -91,6 +92,7 @@ it('adds only hashed proof credentials and immutable backend identity to the sou
     expect(data_get($override, 'services.coolify.environment'))->toBe([
         'COOLIFY_CONTROL_PLANE_HEALTH_ACK' => 'ack:'.str_repeat('a', 64),
         'COOLIFY_CONTROL_PLANE_HEALTH_PROOF_TOKEN_SHA256' => hash('sha256', 'health-proof-token'),
+        'COOLIFY_CONTROL_PLANE_AUTHENTICATION_PROXY_PROOF_SHA256' => hash('sha256', 'authentication-proxy-proof'),
         'COOLIFY_CONTROL_PLANE_DYNAMIC_SHA256' => hash('sha256', 'dynamic-document'),
         'COOLIFY_CONTROL_PLANE_MEMBER' => 'blue',
         'COOLIFY_CONTROL_PLANE_REVISION' => 'revision-42',

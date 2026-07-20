@@ -15,6 +15,7 @@ final readonly class ControlPlaneCandidateHealthMarker
         'expected_revision',
         'dynamic_sha256',
         'health_proof_sha256',
+        'authentication_proxy_proof_sha256',
     ];
 
     private const FILE_TYPE_MASK = 0170000;
@@ -27,12 +28,14 @@ final readonly class ControlPlaneCandidateHealthMarker
         public string $expectedRevision,
         public string $dynamicSha256,
         public string $healthProofSha256,
+        public string $authenticationProxyProofSha256,
     ) {
         self::assertOperationId($operationId);
         self::assertIdentifier($expectedMember, 'expected member');
         self::assertIdentifier($expectedRevision, 'expected revision');
         self::assertSha256($dynamicSha256, 'dynamic checksum');
         self::assertSha256($healthProofSha256, 'health-proof checksum');
+        self::assertSha256($authenticationProxyProofSha256, 'authentication-proxy proof checksum');
     }
 
     public static function fromDerivedHealthProof(
@@ -50,6 +53,10 @@ final readonly class ControlPlaneCandidateHealthMarker
             expectedRevision: $expectedRevision,
             dynamicSha256: $dynamicSha256,
             healthProofSha256: hash('sha256', $derivedHealthProof),
+            authenticationProxyProofSha256: hash(
+                'sha256',
+                ControlPlaneDynamicConfiguration::deriveAuthenticationProxyProof($derivedHealthProof),
+            ),
         );
     }
 
@@ -76,6 +83,7 @@ final readonly class ControlPlaneCandidateHealthMarker
             expectedRevision: $value['expected_revision'],
             dynamicSha256: $value['dynamic_sha256'],
             healthProofSha256: $value['health_proof_sha256'],
+            authenticationProxyProofSha256: $value['authentication_proxy_proof_sha256'],
         );
 
         if (! hash_equals($marker->toJson(), $json)) {
@@ -127,7 +135,8 @@ final readonly class ControlPlaneCandidateHealthMarker
             || ! hash_equals($expected->expectedMember, $this->expectedMember)
             || ! hash_equals($expected->expectedRevision, $this->expectedRevision)
             || ! hash_equals($expected->dynamicSha256, $this->dynamicSha256)
-            || ! hash_equals($expected->healthProofSha256, $this->healthProofSha256)) {
+            || ! hash_equals($expected->healthProofSha256, $this->healthProofSha256)
+            || ! hash_equals($expected->authenticationProxyProofSha256, $this->authenticationProxyProofSha256)) {
             throw new InvalidArgumentException('The control-plane candidate health marker is stale.');
         }
     }
@@ -140,6 +149,7 @@ final readonly class ControlPlaneCandidateHealthMarker
             'expected_revision' => $this->expectedRevision,
             'dynamic_sha256' => $this->dynamicSha256,
             'health_proof_sha256' => $this->healthProofSha256,
+            'authentication_proxy_proof_sha256' => $this->authenticationProxyProofSha256,
         ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
     }
 

@@ -164,7 +164,7 @@ final class CompileControlPlaneDynamicConfiguration
             ControlPlaneDynamicConfiguration::IDENTITY_MIDDLEWARE => [
                 'headers' => [
                     'customRequestHeaders' => [
-                        ControlPlaneDynamicConfiguration::AUTHENTICATION_PROXY_PROOF_HEADER => $healthCheckProof,
+                        ControlPlaneDynamicConfiguration::AUTHENTICATION_PROXY_PROOF_HEADER => ControlPlaneDynamicConfiguration::deriveAuthenticationProxyProof($healthCheckProof),
                     ],
                     'customResponseHeaders' => [
                         ControlPlaneDynamicConfiguration::COLOR_HEADER => $expectedMember,
