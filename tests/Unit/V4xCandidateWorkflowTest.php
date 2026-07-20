@@ -27,6 +27,7 @@ it('authorizes an immutable v4.x candidate on the William Callahan runner', func
     $authorize = $workflow['jobs']['authorize'] ?? [];
     $script = collect($authorize['steps'] ?? [])->firstWhere('name', 'Authorize immutable candidate')['run'] ?? '';
     $resolver = collect($authorize['steps'] ?? [])->firstWhere('name', 'Resolve immutable candidate ref');
+    $resolverScript = (string) ($resolver['with']['script'] ?? '');
 
     expect(array_keys($inputs))->toBe(['candidate_sha', 'candidate_ref', 'base_sha'])
         ->and($authorize['runs-on'] ?? null)->toBe(williamCallahanTrustedRunner())
@@ -35,9 +36,14 @@ it('authorizes an immutable v4.x candidate on the William Callahan runner', func
         ->toContain('^ship/v4x/$FROZEN_SHA/[0-9a-f]{40}$')
         ->toContain('GITHUB_SHA')
         ->toContain('FROZEN_BASE_SHA')
-        ->and((string) ($resolver['with']['script'] ?? ''))
+        ->and($resolverScript)
         ->toContain('compareCommitsWithBasehead')
-        ->toContain("['ahead', 'identical'].includes(comparison.data.status)");
+        ->toContain("['ahead', 'identical'].includes(comparison.data.status)")
+        ->toContain('protectedPolicyPaths')
+        ->toContain("'.github/workflows/gate-v4x-candidate.yml'")
+        ->toContain("'scripts/dev/ship.sh'")
+        ->toContain('changedFiles.length >= 300')
+        ->toContain('Candidate changes protected release policy');
 
     foreach ($authorize['steps'] ?? [] as $step) {
         expect((string) ($step['uses'] ?? ''))->not->toStartWith('actions/checkout@');
@@ -51,6 +57,9 @@ it('runs hosted reusable validation against the exact authorized candidate sha',
     $applicationValidation = v4xWorkflow('application-validation.yml');
     $baseInput = $applicationValidation['on']['workflow_call']['inputs']['base_sha'] ?? [];
     $workflowCallInput = $applicationValidation['on']['workflow_call']['inputs']['source_sha'] ?? [];
+    $runtime = $applicationValidation['jobs']['testing-host-runtime'] ?? [];
+    $runtimeRequirement = collect($applicationValidation['jobs']['required']['steps'] ?? [])
+        ->firstWhere('name', 'Require every generic validation job');
 
     expect($validation['needs'] ?? null)->toBe('authorize')
         ->and($validation['uses'] ?? null)->toBe('./.github/workflows/application-validation.yml')
@@ -74,7 +83,14 @@ it('runs hosted reusable validation against the exact authorized candidate sha',
         ->and($attestation['permissions'] ?? null)->toBe([
             'checks' => 'write',
             'contents' => 'read',
-        ]);
+        ])
+        ->and($runtime['if'] ?? null)
+        ->toBe('${{ github.event_name == \'pull_request\' || inputs.source_sha != \'\' }}')
+        ->and($runtimeRequirement['env']['VALIDATION_SOURCE_SHA'] ?? null)
+        ->toBe('${{ inputs.source_sha }}')
+        ->and((string) ($runtimeRequirement['run'] ?? ''))
+        ->toContain('[[ "$EVENT_NAME" == pull_request || -n "$VALIDATION_SOURCE_SHA" ]]')
+        ->toContain('Testing-host runtime validation did not succeed for the exact source');
 
     $attestationScript = collect($attestation['steps'] ?? [])
         ->firstWhere('name', 'Attest exact validated candidate')['with']['script'] ?? '';

@@ -405,7 +405,7 @@ jobs:
 
   testing-host-runtime:
     name: Testing-host production identity bridge
-    if: ${{ github.event_name == 'pull_request' }}
+    if: ${{ github.event_name == 'pull_request' || inputs.source_sha != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     steps:
@@ -475,6 +475,7 @@ jobs:
           FORK_DEPLOY_RESULT: ${{ needs.fork-deploy.result }}
           NODE_RESULT: ${{ needs.node.result }}
           PHP_RESULT: ${{ needs.php.result }}
+          VALIDATION_SOURCE_SHA: ${{ inputs.source_sha }}
           TESTING_HOST_RUNTIME_RESULT: ${{ needs.testing-host-runtime.result }}
           WORKFLOW_RESULT: ${{ needs.workflow-and-shell.result }}
         run: |
@@ -492,14 +493,14 @@ jobs:
               exit 1
             }
           done
-          if [[ "$EVENT_NAME" == pull_request ]]; then
+          if [[ "$EVENT_NAME" == pull_request || -n "$VALIDATION_SOURCE_SHA" ]]; then
             [[ "$TESTING_HOST_RUNTIME_RESULT" == success ]] || {
-              echo "Testing-host runtime validation did not succeed for a pull request: $TESTING_HOST_RUNTIME_RESULT" >&2
+              echo "Testing-host runtime validation did not succeed for the exact source: $TESTING_HOST_RUNTIME_RESULT" >&2
               exit 1
             }
           else
             [[ "$TESTING_HOST_RUNTIME_RESULT" == skipped ]] || {
-              echo "Testing-host runtime validation must be skipped for reusable workflow calls: $TESTING_HOST_RUNTIME_RESULT" >&2
+              echo "Testing-host runtime validation must be skipped without an exact source: $TESTING_HOST_RUNTIME_RESULT" >&2
               exit 1
             }
           fi

@@ -69,6 +69,26 @@ jobs:
             if (!['ahead', 'identical'].includes(comparison.data.status)) {
               core.setFailed('Candidate commit is not descended from the frozen v4.x base.');
             }
+            const protectedPolicyPaths = new Set([
+              '.github/workflows/application-validation.yml',
+              '.github/workflows/coolify-production-build.yml',
+              '.github/workflows/gate-v4x-candidate.yml',
+              'make/ship.mk',
+              'scripts/ci/v4x-candidate-contract.sh',
+              'scripts/ci/verify-v4x-candidate-gate.sh',
+              'scripts/dev/ship.sh',
+              'scripts/dev/ship.test.sh',
+            ]);
+            const changedFiles = comparison.data.files ?? [];
+            if (changedFiles.length >= 300) {
+              core.setFailed('Candidate comparison reached the GitHub file limit; use the reviewed pull-request path.');
+            }
+            const changedPolicyPaths = changedFiles
+              .map((file) => file.filename)
+              .filter((filename) => protectedPolicyPaths.has(filename));
+            if (changedPolicyPaths.length > 0) {
+              core.setFailed(`Candidate changes protected release policy: ${changedPolicyPaths.join(', ')}`);
+            }
 
   application-validation:
     name: Validate immutable v4.x candidate

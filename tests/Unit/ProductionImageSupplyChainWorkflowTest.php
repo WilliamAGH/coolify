@@ -718,7 +718,8 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
     );
     if (($requiredStep['env']['TESTING_HOST_RUNTIME_RESULT'] ?? null) !== '${{ needs.testing-host-runtime.result }}' ||
         ($requiredStep['env']['EVENT_NAME'] ?? null) !== '${{ github.event_name }}' ||
-        ! str_contains((string) ($requiredStep['run'] ?? ''), '[[ "$EVENT_NAME" == pull_request ]]') ||
+        ($requiredStep['env']['VALIDATION_SOURCE_SHA'] ?? null) !== '${{ inputs.source_sha }}' ||
+        ! str_contains((string) ($requiredStep['run'] ?? ''), '[[ "$EVENT_NAME" == pull_request || -n "$VALIDATION_SOURCE_SHA" ]]') ||
         ! str_contains((string) ($requiredStep['run'] ?? ''), '[[ "$TESTING_HOST_RUNTIME_RESULT" == success ]]') ||
         ! str_contains((string) ($requiredStep['run'] ?? ''), '[[ "$TESTING_HOST_RUNTIME_RESULT" == skipped ]]')) {
         $violations[] = 'required status must fail when testing-host runtime validation does not succeed';
@@ -755,7 +756,7 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
     $testingHostImage = 'coolify-testing-host:application-validation-${{ inputs.source_sha || github.sha }}';
     $productionImage = 'coolify:application-validation-${{ inputs.source_sha || github.sha }}';
     if (($testingHostRuntimeJob['timeout-minutes'] ?? null) !== 75 ||
-        ($testingHostRuntimeJob['if'] ?? null) !== '${{ github.event_name == \'pull_request\' }}' ||
+        ($testingHostRuntimeJob['if'] ?? null) !== '${{ github.event_name == \'pull_request\' || inputs.source_sha != \'\' }}' ||
         ! str_contains($testingHostBuildScript, 'docker buildx build --load --pull') ||
         ! str_contains($testingHostBuildScript, '--file docker/testing-host/Dockerfile') ||
         ! str_contains($testingHostBuildScript, '--tag "$TESTING_HOST_IMAGE"') ||
