@@ -7,12 +7,15 @@ All notable changes to this project will be documented in this file.
 ### 🚀 Features
 
 - *(realtime)* Bundle Reverb and terminal in main image (#62)
+- *(release)* Gate exact v4.x candidates before publication
 - *(blue-green)* Support multiple backend ports
 - *(blue-green)* Support routed compose services
 
 ### 🐛 Bug Fixes
 
 - *(release)* Scan extracted OCI layouts with Trivy
+- *(blue-green)* Preserve PostgreSQL recovery fencing
+- *(images)* Harden production and realtime supply chains
 - *(install)* Preserve Docker daemon configuration
 - *(recovery)* Expire stale Horizon queue metadata
 - *(install)* Enforce one Docker daemon configuration owner
@@ -24,7 +27,15 @@ All notable changes to this project will be documented in this file.
 - *(ci)* Make changelog auto-merge idempotent (#55)
 - *(image)* Remove production secret and Git LFS blockers (#58)
 - *(image)* Refresh apk indexes before pruning terminal build deps
+- *(release)* Anchor candidate trust to protected base
 - *(control-plane)* Bound intervention and queue recovery
+- *(release)* Bind candidate shipping to exact repository
+- *(release)* Require trusted policy and runtime evidence
+- *(release)* Align fork publication with shared Nexus policy
+- *(control-plane)* Harden durable writer artifacts
+- *(control-plane)* Clarify generated shell guards
+- *(control-plane)* Clarify recovery artifact guards
+- *(remediation)* Harden release trust, queue recovery, and Traefik evidence (#69)
 
 ### 💼 Other
 
@@ -41,12 +52,25 @@ All notable changes to this project will be documented in this file.
 - Update changelog (#67)
 - Update changelog (#68)
 - Update changelog (#70)
+- Update changelog (#71)
 
 ### 🧪 Testing
 
 - *(ci)* Execute required validation result matrix
 - *(control-plane)* Require sustained route availability
 - *(control-plane)* Validate surviving recovery paths in CI (#57)
+- *(release)* Keep ship shellcheck clean
+- *(images)* Pull pinned runtime dependencies
+- *(images)* Guard pinned runtime dependency preparation
+- *(release)* Model exact-source runtime validation
+- *(control-plane)* Prove production route cutovers
+- *(blue-green)* Prove manual-stop intervention rendering
+- *(control-plane)* Prove fenced reservation recovery
+- *(ci)* Run manual-stop intervention contract
+- *(control-plane)* Stabilize native runtime evidence
+- *(control-plane)* Exercise real worker reservation recovery
+- *(proxy)* Dispatch isolated reservation fixtures
+- *(control-plane)* Exclude image pulls from startup budget
 
 ### ⚙️ Miscellaneous Tasks
 
