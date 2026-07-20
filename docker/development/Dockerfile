@@ -1,15 +1,15 @@
 # Versions
-# https://hub.docker.com/r/serversideup/php/tags?name=8.4-fpm-nginx-alpine
-ARG SERVERSIDEUP_PHP_VERSION=8.4-fpm-nginx-alpine
+# https://hub.docker.com/r/serversideup/php/tags?name=8.5-fpm-nginx-alpine
+ARG SERVERSIDEUP_PHP_VERSION=8.5-fpm-nginx-alpine
 # https://github.com/minio/mc/releases
 ARG MINIO_VERSION=RELEASE.2025-05-21T01-59-54Z
 # https://github.com/cloudflare/cloudflared/releases
-ARG CLOUDFLARED_VERSION=2025.7.0
+ARG CLOUDFLARED_VERSION=2026.7.1
 # https://www.postgresql.org/support/versioning/
 # Note: We are using version 18 of the postgres client (while still using postgres 15 for the postgres server) as version 15 has been removed from Alpine 3.23+ https://pkgs.alpinelinux.org/packages?name=postgresql*-client&branch=v3.23&repo=&arch=x86_64&origin=&flagged=&maintainer=
 ARG POSTGRES_VERSION=18
 # https://nginx.org/en/linux_packages.html
-ARG NGINX_VERSION=1.31.0-r1
+ARG NGINX_VERSION=1.31.2-r1
 
 # =================================================================
 # Get MinIO client
@@ -64,8 +64,8 @@ RUN apk add --no-cache \
     lsof \
     vim
 
-# Install PHP extensions
-RUN install-php-extensions sockets
+# Install PHP extensions used by Artisan diagnostics and realtime features.
+RUN install-php-extensions intl sockets
 
 # Configure shell aliases
 RUN echo "alias ll='ls -al'" >> /etc/profile && \
@@ -98,5 +98,8 @@ RUN mkdir -p /etc/nginx/conf.d && \
 COPY --from=minio-client /usr/bin/mc /usr/bin/mc
 RUN chmod +x /usr/bin/mc
 
-# Switch to non-root user
-USER www-data
+# Stay as root for s6 init so bind-mounted workspaces work even when the host
+# tree is root-owned (CI, Jean, rootful Docker). PHP-FPM/nginx still run as
+# www-data via their service configs. Do NOT set USER www-data here — that
+# makes init-setup (composer install) fail with "vendor could not be created".
+USER root

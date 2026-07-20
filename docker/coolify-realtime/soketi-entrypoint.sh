@@ -47,7 +47,7 @@ TERMINAL_PID=$!
 
 log "Terminal server started pid=$TERMINAL_PID logger_pid=$TERMINAL_LOGGER_PID"
 
-node /app/bin/server.js start > "$SOKETI_LOG_FIFO" 2>&1 &
+node-soketi /app/bin/server.js start > "$SOKETI_LOG_FIFO" 2>&1 &
 SOKETI_PID=$!
 
 log "Soketi started pid=$SOKETI_PID logger_pid=$SOKETI_LOGGER_PID"

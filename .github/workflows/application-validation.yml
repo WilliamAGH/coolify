@@ -1,0 +1,100 @@
+name: Application validation
+
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: application-validation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  php:
+    name: PHP 8.5 dependencies
+    runs-on: ubuntu-24.04
+    env:
+      APP_ENV: testing
+      APP_MAINTENANCE_DRIVER: file
+      CACHE_STORE: array
+      DB_CONNECTION: testing
+      QUEUE_CONNECTION: sync
+      SESSION_DRIVER: array
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - name: Set up PHP
+        uses: shivammathur/setup-php@44454db4f0199b8b9685a5d763dc37cbf79108e1 # 2.36.0
+        with:
+          php-version: '8.5'
+          coverage: none
+          extensions: mbstring, pdo_sqlite
+      - name: Install Composer dependencies
+        run: composer install --no-interaction --prefer-dist --optimize-autoloader
+      - name: Validate Composer metadata
+        run: composer validate --strict
+      - name: Audit Composer dependencies
+        run: composer audit --locked --no-interaction
+      - name: Run dependency-owned tests
+        run: |
+          php artisan test --compact \
+            tests/Feature/RealtimeTerminalPackagingTest.php \
+            tests/Unit/ApplicationValidationWorkflowTest.php \
+            tests/Unit/Notifications/Channels/EmailChannelTest.php
+
+  node:
+    name: Node 22 dependencies
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm audit --audit-level=high
+      - run: npm test
+      - run: npm run build
+      - name: Validate realtime dependencies
+        run: |
+          npm --prefix docker/coolify-realtime ci
+          npm --prefix docker/coolify-realtime audit --audit-level=high
+
+  production-image-base:
+    name: Production PHP 8.5 image base
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - name: Build the production dependency stage
+        run: docker buildx build --platform linux/amd64 --target base -f docker/production/Dockerfile .
+
+  required:
+    name: Application validation required
+    if: always()
+    needs:
+      - node
+      - php
+      - production-image-base
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every dependency validation job
+        env:
+          NODE_RESULT: ${{ needs.node.result }}
+          PHP_RESULT: ${{ needs.php.result }}
+          PRODUCTION_IMAGE_RESULT: ${{ needs.production-image-base.result }}
+        run: |
+          set -Eeuo pipefail
+          for result in "$NODE_RESULT" "$PHP_RESULT" "$PRODUCTION_IMAGE_RESULT"; do
+            [[ "$result" == success ]] || {
+              echo "A required dependency validation job did not succeed: $result" >&2
+              exit 1
+            }
+          done
