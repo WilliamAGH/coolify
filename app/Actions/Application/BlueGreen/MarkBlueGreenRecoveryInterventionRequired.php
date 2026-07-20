@@ -260,7 +260,12 @@ final class MarkBlueGreenRecoveryInterventionRequired
             ->where('blue_green_previous_container_id', $state->operation_previous_container_id)
             ->where('blue_green_candidate_container_id', $state->operation_candidate_container_id)
             ->where('blue_green_rollback_managed_filename', $state->operation_rollback_managed_filename)
-            ->whereHas('application')
+            ->whereExists(function ($applicationQuery) use ($state): void {
+                $applicationQuery->selectRaw('1')
+                    ->from('applications as reconciliation_application')
+                    ->where('reconciliation_application.id', $state->application_id)
+                    ->whereNull('reconciliation_application.deleted_at');
+            })
             ->whereExists(function ($stateQuery) use ($state, $operationUuid, $generation): void {
                 $stateQuery->selectRaw('1')
                     ->from('application_blue_green_deployments as reconciliation_owner')
