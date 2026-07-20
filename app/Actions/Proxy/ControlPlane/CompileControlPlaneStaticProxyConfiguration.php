@@ -114,6 +114,8 @@ class CompileControlPlaneStaticProxyConfiguration
         string $configurationAcknowledgement,
         string $expectedMember,
         string $expectedRevision,
+        int $serverId,
+        string $canonicalHost,
     ): ControlPlaneStaticProxyConfiguration {
         if (preg_match('/\A[a-f0-9]{64}\z/D', $healthProofTokenSha256) !== 1) {
             throw new InvalidArgumentException('The control-plane health proof token hash must be a SHA-256 value.');
@@ -129,6 +131,14 @@ class CompileControlPlaneStaticProxyConfiguration
                 throw new InvalidArgumentException("The control-plane {$role} is invalid.");
             }
         }
+        if ($serverId < 0) {
+            throw new InvalidArgumentException('The control-plane attestor server is invalid.');
+        }
+        $isIpv4Address = filter_var($canonicalHost, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false;
+        $isDnsName = preg_match('/\A(?=.{1,253}\z)[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\z/D', $canonicalHost) === 1;
+        if (! $isIpv4Address && ! $isDnsName) {
+            throw new InvalidArgumentException('The control-plane attestor host is invalid.');
+        }
 
         $override = $this->parseCompose($configuration->sourceOverrideYaml, 'source override');
         $override['services']['coolify']['environment'] = [
@@ -137,6 +147,22 @@ class CompileControlPlaneStaticProxyConfiguration
             'COOLIFY_CONTROL_PLANE_DYNAMIC_SHA256' => $dynamicSha256,
             'COOLIFY_CONTROL_PLANE_MEMBER' => $expectedMember,
             'COOLIFY_CONTROL_PLANE_REVISION' => $expectedRevision,
+            'COOLIFY_TRAEFIK_ATTESTOR_PROBE_HOST' => $canonicalHost,
+            'COOLIFY_TRAEFIK_ATTESTOR_PROBE_URL' => 'http://host.docker.internal:'.$configuration->appPort.'/api/health',
+            'COOLIFY_TRAEFIK_ATTESTOR_SERVER_ID' => (string) $serverId,
+        ];
+        $override['services']['coolify']['volumes'] = [
+            [
+                'type' => 'bind',
+                'source' => '/data/coolify/proxy',
+                'target' => '/var/www/html/storage/app/control-plane-proxy',
+                'read_only' => true,
+            ],
+            [
+                'type' => 'bind',
+                'source' => '/data/coolify/control-plane-attestor',
+                'target' => '/var/www/html/storage/app/control-plane-attestor',
+            ],
         ];
 
         return new ControlPlaneStaticProxyConfiguration(

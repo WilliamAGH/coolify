@@ -23,6 +23,7 @@ final class ControlPlaneStaticListenerHandoff
         ?string $sourceCustomComposePath = null,
         ?string $sourcePostgresUpgradeComposePath = null,
         ?string $enrollmentLockPath = null,
+        ?string $attestorStateDirectory = null,
     ) {
         $sourceDirectory = dirname($sourceComposePath);
         $this->sourceCustomComposePath = $sourceCustomComposePath
@@ -52,7 +53,12 @@ final class ControlPlaneStaticListenerHandoff
         $this->enrollmentLockPath = $enrollmentLockPath
             ?? dirname($proxyComposePath).'/.control-plane-static-listener-enrollment.lock';
         $this->assertAbsolutePath($this->enrollmentLockPath, 'enrollment lock path');
+        $this->attestorStateDirectory = $attestorStateDirectory
+            ?? '/data/coolify/control-plane-attestor';
+        $this->assertAbsolutePath($this->attestorStateDirectory, 'attestor state directory');
     }
+
+    private string $attestorStateDirectory;
 
     private string $enrollmentLockPath;
 
@@ -80,6 +86,7 @@ final class ControlPlaneStaticListenerHandoff
             'source_postgres_upgrade_compose_path='.escapeshellarg($this->sourcePostgresUpgradeComposePath),
             'source_directory='.escapeshellarg(dirname($this->sourceComposePath)),
             'enrollment_lock_path='.escapeshellarg($this->enrollmentLockPath),
+            'attestor_state_directory='.escapeshellarg($this->attestorStateDirectory),
             'expected_proxy_binding='.escapeshellarg($expectedProxyBinding),
             'legacy_proxy_binding='.escapeshellarg('0.0.0.0:'.$state->appPort),
             'public_ipv6_binding='.escapeshellarg('[::]:'.$state->appPort),
@@ -102,6 +109,16 @@ final class ControlPlaneStaticListenerHandoff
             '  docker compose "$@" -f "$source_override_path" up -d --force-recreate --no-deps coolify',
             '}',
             ...$this->legacyRecreationFunctions(),
+            'prepare_attestor_state_directory() {',
+            '  if [ -e "$attestor_state_directory" ] || [ -L "$attestor_state_directory" ]; then',
+            '    assert_directory "$attestor_state_directory"',
+            '  else',
+            '    mkdir -p "$attestor_state_directory" || fail',
+            '    assert_directory "$attestor_state_directory"',
+            '  fi',
+            '  chmod 0700 "$attestor_state_directory" || fail',
+            '  if [ "$(id -u)" = 0 ]; then chown 9999:0 "$attestor_state_directory" || fail; fi',
+            '}',
             'verify_port_owner() {',
             '  expected_binding=$1',
             '  expected_owner=$2',
@@ -168,6 +185,7 @@ final class ControlPlaneStaticListenerHandoff
             'assert_regular_or_absent "$source_postgres_upgrade_compose_path"',
             'assert_regular_or_absent "$source_override_path"',
             'assert_regular_or_absent "$enrollment_lock_path"',
+            'prepare_attestor_state_directory',
             'command -v flock >/dev/null 2>&1 || fail',
             'exec 9> "$enrollment_lock_path" || fail',
             'flock -x 9 || fail',

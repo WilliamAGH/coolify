@@ -532,7 +532,7 @@ bootstrap_directories() {
     for directory in \
         "$ROOT" "$SOURCE_DIR" "$ROOT/ssh" "$ROOT/ssh/keys" "$ROOT/ssh/mux" \
         "$ROOT/applications" "$ROOT/databases" "$ROOT/backups" "$ROOT/services" \
-        "$ROOT/proxy" "$ROOT/proxy/dynamic" "$ROOT/sentinel"; do
+        "$ROOT/proxy" "$ROOT/proxy/dynamic" "$ROOT/control-plane-attestor" "$ROOT/sentinel"; do
         require_directory_or_missing "$directory" 'Coolify data directory'
         if [[ ! -e $directory ]]; then
             mkdir "$directory"
@@ -557,7 +557,7 @@ enforce_data_permissions() {
     if "$DRY_RUN"; then note "PLAN: enforce 9999:root ownership and 0700 modes below $ROOT"; return 0; fi
     chown root:root "$ROOT"
     chmod 0711 "$ROOT"
-    for directory in source applications databases backups services proxy sentinel; do
+    for directory in source applications databases backups services proxy control-plane-attestor sentinel; do
         [[ -e $ROOT/$directory ]] || continue
         fd_assert_tree_safe_for_privileged_mutation "$ROOT/$directory" "Coolify $directory tree"
         chown -R 9999:root "$ROOT/$directory"

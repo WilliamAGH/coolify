@@ -35,7 +35,7 @@ function staticListenerHandoffState(
     );
 }
 
-/** @return array{root: string, proxy_compose: string, source_compose: string, source_production_compose: string, source_custom_compose: string, source_postgres_upgrade_compose: string, source_override: string, source_environment: string, lock: string, rollback_journal: string, bin: string, state: string, log: string} */
+/** @return array{root: string, proxy_compose: string, source_compose: string, source_production_compose: string, source_custom_compose: string, source_postgres_upgrade_compose: string, source_override: string, source_environment: string, lock: string, attestor_state: string, rollback_journal: string, bin: string, state: string, log: string} */
 function staticListenerHandoffFixtures(ControlPlaneProxyEnrollmentState $state): array
 {
     $root = sys_get_temp_dir().'/coolify-static-listener-handoff-'.bin2hex(random_bytes(8));
@@ -120,6 +120,7 @@ SH
         'source_override' => $sourceOverride,
         'source_environment' => $sourceEnvironment,
         'lock' => $proxyDirectory.'/.handoff.lock',
+        'attestor_state' => $root.'/control-plane-attestor',
         'rollback_journal' => $proxyDirectory.'/.control-plane-static-listener-rollback.'.$state->operationId.'.journal',
         'bin' => $binDirectory,
         'state' => $stateDirectory,
@@ -127,7 +128,7 @@ SH
     ];
 }
 
-/** @param array{proxy_compose: string, source_compose: string, source_production_compose: string, source_custom_compose: string, source_postgres_upgrade_compose: string, source_override: string, source_environment: string, lock: string} $fixture */
+/** @param array{proxy_compose: string, source_compose: string, source_production_compose: string, source_custom_compose: string, source_postgres_upgrade_compose: string, source_override: string, source_environment: string, lock: string, attestor_state: string} $fixture */
 function staticListenerHandoffWriter(array $fixture): ControlPlaneStaticListenerHandoff
 {
     return new ControlPlaneStaticListenerHandoff(
@@ -139,6 +140,7 @@ function staticListenerHandoffWriter(array $fixture): ControlPlaneStaticListener
         sourceCustomComposePath: $fixture['source_custom_compose'],
         sourcePostgresUpgradeComposePath: $fixture['source_postgres_upgrade_compose'],
         enrollmentLockPath: $fixture['lock'],
+        attestorStateDirectory: $fixture['attestor_state'],
     );
 }
 
@@ -178,6 +180,8 @@ it('hands off the public APP_PORT listener to Traefik exactly once and replays i
             ->and($second->isSuccessful())->toBeTrue()
             ->and(file_get_contents($fixture['proxy_compose']))->toBe($state->staticReplacementBytes)
             ->and(file_get_contents($fixture['source_override']))->toBe($state->sourceOverrideBytes)
+            ->and(is_dir($fixture['attestor_state']))->toBeTrue()
+            ->and(fileperms($fixture['attestor_state']) & 0777)->toBe(0700)
             ->and(file_get_contents($fixture['state'].'/coolify_port'))->toBe('')
             ->and(file_get_contents($fixture['state'].'/coolify-proxy_port'))->toBe("0.0.0.0:8000\n")
             ->and($commands)->toContain(

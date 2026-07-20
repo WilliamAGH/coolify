@@ -1317,7 +1317,8 @@ test_update_uses_private_temporary_prestart_undo() {
 test_refuses_complete_unmanaged_state_before_mutation() {
     new_fixture
     mkdir -p "$ROOT/source" "$ROOT/ssh/keys" "$ROOT/ssh/mux" "$ROOT/applications" \
-        "$ROOT/backups" "$ROOT/databases" "$ROOT/proxy/dynamic" "$ROOT/sentinel" "$ROOT/services"
+        "$ROOT/backups" "$ROOT/control-plane-attestor" "$ROOT/databases" "$ROOT/proxy/dynamic" \
+        "$ROOT/sentinel" "$ROOT/services"
     printf 'DB_USERNAME=coolify\nDB_DATABASE=coolify\nREDIS_PASSWORD=legacy-secret\n' >"$ROOT/source/.env"
     chmod 0600 "$ROOT/source/.env"
     : >"$FORK_DEPLOY_DB_MARKER"

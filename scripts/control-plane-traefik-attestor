@@ -1,0 +1,385 @@
+#!/bin/sh
+
+set -eu
+umask 077
+
+PROXY_ROOT=${COOLIFY_TRAEFIK_ATTESTOR_PROXY_ROOT:-/var/www/html/storage/app/control-plane-proxy}
+STATE_ROOT=${COOLIFY_TRAEFIK_ATTESTOR_STATE_ROOT:-/var/www/html/storage/app/control-plane-attestor}
+SERVER_ID=${COOLIFY_TRAEFIK_ATTESTOR_SERVER_ID:-}
+PROBE_URL=${COOLIFY_TRAEFIK_ATTESTOR_PROBE_URL:-}
+PROBE_HOST=${COOLIFY_TRAEFIK_ATTESTOR_PROBE_HOST:-}
+INTERVAL_SECONDS=${COOLIFY_TRAEFIK_ATTESTOR_INTERVAL_SECONDS:-1}
+HEARTBEAT_WRITE_INTERVAL_SECONDS=${COOLIFY_TRAEFIK_ATTESTOR_HEARTBEAT_WRITE_INTERVAL_SECONDS:-30}
+DOCUMENT=$PROXY_ROOT/dynamic/coolify.yaml
+MANAGED_STATE=$PROXY_ROOT/.control-plane-managed-traefik/.coolify.yaml.state.json
+WRITER_AUTHORITY=$PROXY_ROOT/.control-plane-managed-traefik/.coolify.yaml.writer-authority.json
+HEARTBEAT=$STATE_ROOT/heartbeat.json
+LATCH=$STATE_ROOT/drift-latch.json
+ATTESTATION_RESULT=$STATE_ROOT/attestation-result.json
+LOCK_FILE=$STATE_ROOT/check.lock
+MAXIMUM_ATTESTATION_ATTEMPTS=${COOLIFY_TRAEFIK_ATTESTOR_MAXIMUM_ATTEMPTS:-3}
+ATTESTATION_RETRY_SECONDS=${COOLIFY_TRAEFIK_ATTESTOR_RETRY_SECONDS:-5}
+
+fail() {
+    printf 'control-plane-traefik-attestor: %s\n' "$1" >&2
+    return 1
+}
+
+valid_sha256() {
+    case $1 in
+        *[!0-9a-f]*|'') return 1 ;;
+    esac
+    [ "${#1}" -eq 64 ]
+}
+
+valid_identifier() {
+    printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,127}$'
+}
+
+valid_route_identifier() {
+    printf '%s' "$1" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+}
+
+valid_acknowledgement() {
+    [ "${#1}" -ge 16 ] && [ "${#1}" -le 512 ] \
+        && printf '%s' "$1" | grep -Eq '^[A-Za-z0-9._~+/=:-]+$'
+}
+
+assert_directory() {
+    [ -d "$1" ] && [ ! -L "$1" ]
+}
+
+assert_bounded_regular() {
+    path=$1
+    maximum=$2
+    [ -f "$path" ] && [ ! -L "$path" ] || return 1
+    size=$(wc -c < "$path") || return 1
+    [ "$size" -gt 0 ] && [ "$size" -le "$maximum" ]
+}
+
+sync_path() {
+    sync "$1"
+}
+
+atomic_write() (
+    target=$1
+    source=$2
+    base=${target##*/}
+    temporary=$(mktemp "$STATE_ROOT/.$base.XXXXXX") || return 1
+    trap 'rm -f "$temporary"' EXIT HUP INT TERM
+    cp "$source" "$temporary" || return 1
+    chmod 0600 "$temporary" || return 1
+    sync_path "$temporary" || return 1
+    mv -f "$temporary" "$target" || return 1
+    sync_path "$STATE_ROOT" || return 1
+    trap - EXIT HUP INT TERM
+)
+
+read_identity() {
+    output=$1
+    assert_bounded_regular "$DOCUMENT" 1048576 || return 1
+    assert_bounded_regular "$MANAGED_STATE" 1024 || return 1
+    assert_bounded_regular "$WRITER_AUTHORITY" 1024 || return 1
+
+    document_sha=$(sha256sum "$DOCUMENT" | awk '{print $1}') || return 1
+    sidecar=$(jq -cer '
+        if keys == ["filename","operation_id","revision","sha256","version"]
+            and .version == 1 and .filename == "coolify.yaml"
+            and (.operation_id | type == "string")
+            and (.revision | type == "number" and . >= 1 and floor == .)
+            and (.sha256 | type == "string")
+        then [.operation_id, (.revision | tostring), .sha256] | @tsv
+        else error("invalid managed state") end
+    ' "$MANAGED_STATE") || return 1
+    authority=$(jq -cer '
+        if keys == ["container_id","container_name","dynamic_revision","dynamic_sha256","epoch","image_id","member","operation_id"]
+            and (.epoch | type == "number" and . >= 1 and floor == .)
+            and (.operation_id | type == "string")
+            and (.member | type == "string")
+            and (.container_id | type == "string")
+            and (.container_name | type == "string")
+            and (.image_id | type == "string")
+            and (.dynamic_revision | type == "number" and . >= 1 and floor == .)
+            and (.dynamic_sha256 | type == "string")
+        then [.operation_id, (.epoch | tostring), .member, .container_id, .container_name, .image_id, (.dynamic_revision | tostring), .dynamic_sha256] | @tsv
+        else error("invalid writer authority") end
+    ' "$WRITER_AUTHORITY") || return 1
+    IFS='	' read -r sidecar_operation sidecar_revision sidecar_sha <<EOF
+$sidecar
+EOF
+    IFS='	' read -r authority_operation authority_epoch authority_member authority_container_id authority_container_name authority_image_id authority_revision authority_sha <<EOF
+$authority
+EOF
+    valid_identifier "$sidecar_operation" || return 1
+    valid_sha256 "$sidecar_sha" || return 1
+    valid_identifier "$authority_operation" || return 1
+    case $authority_epoch in ''|*[!0-9]*|0) return 1 ;; esac
+    valid_route_identifier "$authority_member" || return 1
+    valid_sha256 "$authority_container_id" || return 1
+    printf '%s' "$authority_container_name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$' || return 1
+    printf '%s' "$authority_image_id" | grep -Eq '^sha256:[a-f0-9]{64}$' || return 1
+    valid_sha256 "$authority_sha" || return 1
+    [ "$document_sha" = "$sidecar_sha" ] || return 1
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$sidecar_operation" "$sidecar_revision" "$sidecar_sha" \
+        "$authority_operation" "$authority_epoch" "$authority_member" \
+        "$authority_revision" "$authority_sha" > "$output"
+}
+
+header_value() {
+    header_name=$1
+    header_path=$2
+    awk -F: -v expected="$header_name" '
+        tolower($1) == tolower(expected) {
+            value=$0; sub(/^[^:]*:[[:space:]]*/, "", value); sub(/\r$/, "", value); count++; found=value
+        }
+        END { if (count == 1) print found; else exit 1 }
+    ' "$header_path"
+}
+
+probe_provider() {
+    probe_expected_sha=$1
+    probe_headers=$2
+    probe_status=$(curl --silent --show-error --connect-timeout 1 --max-time 1 \
+        --request GET --header "Host: $PROBE_HOST" --dump-header "$probe_headers" \
+        --output /dev/null --write-out '%{http_code}' -- "$PROBE_URL") || return 1
+    [ "$probe_status" = 200 ] || return 1
+    probe_color=$(header_value X-Coolify-Control-Plane-Color "$probe_headers") || return 1
+    probe_generation=$(header_value X-Coolify-Control-Plane-Generation "$probe_headers") || return 1
+    probe_acknowledgement=$(header_value X-Coolify-Control-Plane-Config-Ack "$probe_headers") || return 1
+    probe_backend_member=$(header_value X-Coolify-Control-Plane-Backend-Member "$probe_headers") || return 1
+    probe_backend_revision=$(header_value X-Coolify-Control-Plane-Backend-Revision "$probe_headers") || return 1
+    probe_actual_sha=$(header_value X-Coolify-Control-Plane-Dynamic-Sha256 "$probe_headers") || return 1
+    valid_route_identifier "$probe_color" || return 1
+    valid_route_identifier "$probe_generation" || return 1
+    valid_acknowledgement "$probe_acknowledgement" || return 1
+    valid_route_identifier "$probe_backend_member" || return 1
+    valid_route_identifier "$probe_backend_revision" || return 1
+    valid_sha256 "$probe_actual_sha" || return 1
+    [ "$probe_color" = "$probe_backend_member" ] \
+        && [ "$probe_generation" = "$probe_backend_revision" ] \
+        && [ "$probe_actual_sha" = "$probe_expected_sha" ]
+}
+
+heartbeat_identity() {
+    assert_bounded_regular "$HEARTBEAT" 2048 || return 1
+    jq -cer '
+        if keys == ["dynamic_revision","dynamic_sha256","observed_at","observed_epoch","operation_id","server_id","version","writer_dynamic_revision","writer_dynamic_sha256","writer_epoch","writer_member","writer_operation_id"]
+            and .version == 1 and (.operation_id | type == "string")
+            and (.dynamic_revision | type == "number") and (.dynamic_sha256 | type == "string")
+            and (.observed_epoch | type == "number" and . >= 0 and floor == .)
+            and (.writer_operation_id | type == "string") and (.writer_epoch | type == "number")
+            and (.writer_member | type == "string") and (.writer_dynamic_revision | type == "number")
+            and (.writer_dynamic_sha256 | type == "string")
+        then [.operation_id, (.dynamic_revision | tostring), .dynamic_sha256, .writer_operation_id, (.writer_epoch | tostring), .writer_member, (.writer_dynamic_revision | tostring), .writer_dynamic_sha256] | @tsv
+        else error("invalid heartbeat") end
+    ' "$HEARTBEAT"
+}
+
+dispatch_drift() (
+    reason=$1
+    identity=$2
+    IFS='	' read -r operation_id dynamic_revision dynamic_sha256 writer_operation_id writer_epoch writer_member _writer_dynamic_revision _writer_dynamic_sha256 <<EOF
+$identity
+EOF
+    event_id=$(printf '%s\0%s\0%s\0%s\n' "$reason" "$operation_id" "$dynamic_revision" "$dynamic_sha256" | sha256sum | awk '{print $1}')
+    attempt=1
+    if assert_bounded_regular "$LATCH" 4096; then
+        latched_event_id=$(jq -r '.event_id // empty' "$LATCH" 2>/dev/null || true)
+        if [ "$latched_event_id" != "$event_id" ] \
+            && assert_bounded_regular "$ATTESTATION_RESULT" 2048 \
+            && [ "$(jq -r '.status // empty' "$ATTESTATION_RESULT" 2>/dev/null || true)" = running ]; then
+            running_deadline=$(jq -r '.next_attempt_epoch // 0' "$ATTESTATION_RESULT" 2>/dev/null || printf '0')
+            current_epoch=$(date -u +%s)
+            [ "$current_epoch" -ge "$running_deadline" ] || return 0
+        fi
+        if [ "$latched_event_id" = "$event_id" ] && assert_bounded_regular "$ATTESTATION_RESULT" 2048; then
+            result_record=$(jq -er '
+                if keys == ["attempt","event_id","next_attempt_epoch","status","updated_at","version"]
+                    and .version == 1 and (.event_id | type == "string")
+                    and (.attempt | type == "number" and . >= 1 and floor == .)
+                    and (.status == "running" or .status == "passed" or .status == "failed" or .status == "exhausted")
+                    and (.next_attempt_epoch == null or (.next_attempt_epoch | type == "number" and . >= 0 and floor == .))
+                    and (.updated_at | type == "string")
+                then [.event_id, .status, (.attempt | tostring), ((.next_attempt_epoch // 0) | tostring)] | @tsv
+                else error("invalid attestation result") end
+            ' "$ATTESTATION_RESULT" 2>/dev/null || true)
+            if [ -n "$result_record" ]; then
+                IFS='	' read -r result_event_id result_status result_attempt result_next_attempt_epoch <<EOF
+$result_record
+EOF
+                if [ "$result_event_id" = "$event_id" ]; then
+                    case $result_status in
+                        passed|exhausted) return 0 ;;
+                        running)
+                            observed_epoch=$(date -u +%s)
+                            [ "$observed_epoch" -ge "$result_next_attempt_epoch" ] || return 0
+                            attempt=$((result_attempt + 1))
+                            ;;
+                        failed)
+                            observed_epoch=$(date -u +%s)
+                            [ "$observed_epoch" -ge "$result_next_attempt_epoch" ] || return 0
+                            attempt=$((result_attempt + 1))
+                            ;;
+                    esac
+                fi
+            fi
+        fi
+    fi
+
+    observed_epoch=$(date -u +%s)
+    observed_at=$(date -u -d "@$observed_epoch" +%Y-%m-%dT%H:%M:%SZ)
+    expires_at=$(date -u -d "@$((observed_epoch + 60))" +%Y-%m-%dT%H:%M:%SZ)
+    if [ "$attempt" -gt "$MAXIMUM_ATTESTATION_ATTEMPTS" ]; then
+        exhausted_result=$(mktemp "$STATE_ROOT/.attestation-result.XXXXXX") || return 1
+        jq -nc --arg event_id "$event_id" --arg updated_at "$observed_at" \
+            --argjson attempt "$MAXIMUM_ATTESTATION_ATTEMPTS" \
+            '{version:1,event_id:$event_id,status:"exhausted",attempt:$attempt,next_attempt_epoch:null,updated_at:$updated_at}' \
+            > "$exhausted_result" || return 1
+        atomic_write "$ATTESTATION_RESULT" "$exhausted_result" || return 1
+        rm -f "$exhausted_result"
+        return 0
+    fi
+    event=$(mktemp "$STATE_ROOT/.drift-event.XXXXXX") || return 1
+    trap 'rm -f "$event"' EXIT HUP INT TERM
+    jq -nc \
+        --arg event_id "$event_id" --arg reason "$reason" --arg observed_at "$observed_at" \
+        --arg expires_at "$expires_at" --arg operation_id "$operation_id" \
+        --argjson server_id "$SERVER_ID" --argjson dynamic_revision "$dynamic_revision" \
+        --arg dynamic_sha256 "$dynamic_sha256" \
+        '{version:1,event_id:$event_id,reason:$reason,observed_at:$observed_at,expires_at:$expires_at,server_id:$server_id,operation_id:$operation_id,dynamic_revision:$dynamic_revision,dynamic_sha256:$dynamic_sha256}' \
+        > "$event" || return 1
+    atomic_write "$LATCH" "$event" || return 1
+    running_result=$(mktemp "$STATE_ROOT/.attestation-result.XXXXXX") || return 1
+    jq -nc --arg event_id "$event_id" --arg updated_at "$observed_at" --argjson attempt "$attempt" \
+        --argjson running_deadline "$((observed_epoch + 90))" \
+        '{version:1,event_id:$event_id,status:"running",attempt:$attempt,next_attempt_epoch:$running_deadline,updated_at:$updated_at}' \
+        > "$running_result" || return 1
+    atomic_write "$ATTESTATION_RESULT" "$running_result" || return 1
+    rm -f "$running_result"
+    exec 8< "$LATCH" || return 1
+    (
+        if timeout -s TERM 75 php artisan control-plane:attest-traefik-runtime - <&8 >/dev/null 2>&1; then
+            result_status=passed
+            next_attempt_epoch=null
+        else
+            result_status=failed
+            next_attempt_epoch=$(( $(date -u +%s) + ATTESTATION_RETRY_SECONDS ))
+            if [ "$attempt" -ge "$MAXIMUM_ATTESTATION_ATTEMPTS" ]; then
+                result_status=exhausted
+            fi
+        fi
+        result_updated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        completed_result=$(mktemp "$STATE_ROOT/.attestation-result.XXXXXX") || exit 1
+        jq -nc --arg event_id "$event_id" --arg status "$result_status" \
+            --arg updated_at "$result_updated_at" --argjson attempt "$attempt" \
+            --argjson next_attempt_epoch "$next_attempt_epoch" \
+            '{version:1,event_id:$event_id,status:$status,attempt:$attempt,next_attempt_epoch:$next_attempt_epoch,updated_at:$updated_at}' \
+            > "$completed_result" || exit 1
+        atomic_write "$ATTESTATION_RESULT" "$completed_result"
+        rm -f "$completed_result"
+    ) &
+    exec 8<&-
+    rm -f "$event"
+    trap - EXIT HUP INT TERM
+)
+
+check_once() {
+    assert_directory "$PROXY_ROOT" || fail 'proxy root is missing or unsafe'
+    assert_directory "$STATE_ROOT" || fail 'state root is missing or unsafe'
+    case $SERVER_ID in ''|*[!0-9]*) fail 'server ID is invalid'; return 1 ;; esac
+    printf '%s' "$PROBE_HOST" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$' \
+        || { fail 'probe host is invalid'; return 1; }
+    case $PROBE_URL in http://*|https://*) ;; *) fail 'probe URL is invalid'; return 1 ;; esac
+    case $INTERVAL_SECONDS in ''|*[!0-9]*|0) fail 'interval is invalid'; return 1 ;; esac
+    [ "$INTERVAL_SECONDS" -le 60 ] || { fail 'interval is invalid'; return 1; }
+    case $HEARTBEAT_WRITE_INTERVAL_SECONDS in ''|*[!0-9]*|0) fail 'heartbeat write interval is invalid'; return 1 ;; esac
+    [ "$HEARTBEAT_WRITE_INTERVAL_SECONDS" -le 300 ] || { fail 'heartbeat write interval is invalid'; return 1; }
+    case $MAXIMUM_ATTESTATION_ATTEMPTS in ''|*[!0-9]*|0) fail 'attestation attempt cap is invalid'; return 1 ;; esac
+    [ "$MAXIMUM_ATTESTATION_ATTEMPTS" -le 10 ] || { fail 'attestation attempt cap is invalid'; return 1; }
+    case $ATTESTATION_RETRY_SECONDS in ''|*[!0-9]*) fail 'attestation retry interval is invalid'; return 1 ;; esac
+    [ "$ATTESTATION_RETRY_SECONDS" -le 300 ] || { fail 'attestation retry interval is invalid'; return 1; }
+
+    scratch=$(mktemp -d "$STATE_ROOT/.check.XXXXXX") || return 1
+    trap 'rm -rf "$scratch"' EXIT HUP INT TERM
+    if ! read_identity "$scratch/identity-before"; then
+        identity=$(heartbeat_identity 2>/dev/null || true)
+        [ -n "$identity" ] && dispatch_drift managed-state-invalid "$identity"
+        fail 'managed Traefik state is invalid'
+        return 1
+    fi
+    identity=$(cat "$scratch/identity-before")
+    expected_sha=$(printf '%s' "$identity" | awk -F '\t' '{print $3}')
+    provider_healthy=true
+    probe_provider "$expected_sha" "$scratch/headers" || provider_healthy=false
+    if ! read_identity "$scratch/identity-after" \
+        || ! cmp -s "$scratch/identity-before" "$scratch/identity-after"; then
+        rm -rf "$scratch"
+        trap - EXIT HUP INT TERM
+        return 0
+    fi
+    if [ "$provider_healthy" != true ]; then
+        dispatch_drift provider-health-drift "$identity"
+        fail 'Traefik provider health proof drifted'
+        return 1
+    fi
+
+    observed_epoch=$(date -u +%s)
+    observed_at=$(date -u -d "@$observed_epoch" +%Y-%m-%dT%H:%M:%SZ)
+    IFS='	' read -r operation_id dynamic_revision dynamic_sha256 writer_operation_id writer_epoch writer_member writer_dynamic_revision writer_dynamic_sha256 <<EOF
+$identity
+EOF
+    existing_heartbeat_identity=$(heartbeat_identity 2>/dev/null || true)
+    existing_heartbeat_epoch=$(jq -r '.observed_epoch // 0' "$HEARTBEAT" 2>/dev/null || printf '0')
+    if [ "$existing_heartbeat_identity" != "$identity" ] \
+        || [ "$existing_heartbeat_epoch" -gt "$observed_epoch" ] \
+        || [ "$existing_heartbeat_epoch" -le "$((observed_epoch - HEARTBEAT_WRITE_INTERVAL_SECONDS))" ]; then
+        jq -nc --arg observed_at "$observed_at" --argjson observed_epoch "$observed_epoch" \
+            --arg operation_id "$operation_id" --argjson server_id "$SERVER_ID" \
+            --argjson dynamic_revision "$dynamic_revision" --arg dynamic_sha256 "$dynamic_sha256" \
+            --arg writer_operation_id "$writer_operation_id" --argjson writer_epoch "$writer_epoch" \
+            --arg writer_member "$writer_member" --argjson writer_dynamic_revision "$writer_dynamic_revision" \
+            --arg writer_dynamic_sha256 "$writer_dynamic_sha256" \
+            '{version:1,observed_at:$observed_at,observed_epoch:$observed_epoch,server_id:$server_id,operation_id:$operation_id,dynamic_revision:$dynamic_revision,dynamic_sha256:$dynamic_sha256,writer_operation_id:$writer_operation_id,writer_epoch:$writer_epoch,writer_member:$writer_member,writer_dynamic_revision:$writer_dynamic_revision,writer_dynamic_sha256:$writer_dynamic_sha256}' \
+            > "$scratch/heartbeat"
+        atomic_write "$HEARTBEAT" "$scratch/heartbeat"
+    fi
+    cleanup_requires_sync=false
+    [ ! -e "$LATCH" ] && [ ! -e "$ATTESTATION_RESULT" ] || cleanup_requires_sync=true
+    if assert_bounded_regular "$ATTESTATION_RESULT" 2048 \
+        && [ "$(jq -r '.status // empty' "$ATTESTATION_RESULT" 2>/dev/null || true)" = running ] \
+        && [ "$(date -u +%s)" -lt "$(jq -r '.next_attempt_epoch // 0' "$ATTESTATION_RESULT" 2>/dev/null || printf '0')" ]; then
+        rm -f "$LATCH"
+    else
+        rm -f "$LATCH" "$ATTESTATION_RESULT"
+    fi
+    [ "$cleanup_requires_sync" != true ] || sync_path "$STATE_ROOT"
+    rm -rf "$scratch"
+    trap - EXIT HUP INT TERM
+}
+
+run_check() {
+    if [ -e "$LOCK_FILE" ] || [ -L "$LOCK_FILE" ]; then
+        [ -f "$LOCK_FILE" ] && [ ! -L "$LOCK_FILE" ] || { fail 'attestor lock is unsafe'; return 1; }
+    fi
+    : >> "$LOCK_FILE" || return 1
+    exec 9>> "$LOCK_FILE" || return 1
+    flock -n 9 || return 0
+    check_result=0
+    check_once || check_result=$?
+    return "$check_result"
+}
+
+watch_forever() {
+    trap 'exit 0' HUP INT TERM
+    while :; do
+        run_check || true
+        sleep "$INTERVAL_SECONDS"
+    done
+}
+
+case ${1:-} in
+    check) run_check ;;
+    watch) watch_forever ;;
+    *) printf 'usage: control-plane-traefik-attestor {check|watch}\n' >&2; exit 2 ;;
+esac

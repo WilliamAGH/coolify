@@ -160,6 +160,7 @@ RUN --mount=type=cache,target=/var/cache/apk \
     git-lfs \
     jq \
     lsof \
+    util-linux-misc \
     vim && \
     apk info -e "su-exec=${SU_EXEC_VERSION}" >/dev/null
 
@@ -199,6 +200,7 @@ COPY --chown=www-data:www-data resources/views ./resources/views
 COPY --chown=www-data:www-data artisan artisan
 COPY --chown=www-data:www-data openapi.yaml ./openapi.yaml
 COPY --chown=www-data:www-data changelogs/ ./changelogs/
+COPY --chown=www-data:www-data --chmod=755 scripts/control-plane-traefik-attestor ./scripts/control-plane-traefik-attestor
 
 RUN composer dump-autoload
 
