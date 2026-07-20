@@ -61,13 +61,13 @@ final class PrepareBlueGreenDeactivation
         $locks = BlueGreenLifecycleDatabaseLocks::forDestination(
             $application->id,
             $standaloneDockerId,
-            ensureDeploymentState: $requestedPhase === BlueGreenDeactivationPhase::STOPPING,
+            ensureDeploymentState: $requestedPhase->isManualStop(),
         );
         $application = $locks->application;
-        $isExactManualStopResume = $requestedPhase === BlueGreenDeactivationPhase::STOPPING
+        $isExactManualStopResume = $requestedPhase->isManualStop()
             && $expectedDeactivationId !== null;
         if (($requestedPhase === BlueGreenDeactivationPhase::DEACTIVATING && ! $application->trashed())
-            || ($requestedPhase === BlueGreenDeactivationPhase::STOPPING && $application->trashed() && ! $isExactManualStopResume)) {
+            || ($requestedPhase->isManualStop() && $application->trashed() && ! $isExactManualStopResume)) {
             throw new BlueGreenDeactivationException('The blue-green deactivation mode no longer matches the application lifecycle.');
         }
         $destination = StandaloneDocker::query()
@@ -88,7 +88,7 @@ final class PrepareBlueGreenDeactivation
             $expectedOperationId,
             $expectedSupersessionGeneration,
         );
-        if ($requestedPhase === BlueGreenDeactivationPhase::STOPPING && $state !== null) {
+        if ($requestedPhase->isManualStop() && $state !== null) {
             $this->adoptRouteLessLegacyContainer($application, $state);
         }
         $this->assertNoPromotionOwnership($state);

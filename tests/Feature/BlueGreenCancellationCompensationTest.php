@@ -17,7 +17,7 @@ use Tests\Support\BlueGreenRecoveryScenario;
 
 uses(RefreshDatabase::class);
 
-it('compensates a claimed cancelled blue-green operation exactly once', function (): void {
+it('compensates a claimed cancelled blue-green operation exactly once', function (ApplicationDeploymentStatus $cancellationStatus): void {
     ['application' => $application, 'destination' => $destination, 'server' => $server] = BlueGreenDeactivationScenario::context();
     $application->update([
         'health_check_enabled' => true,
@@ -109,10 +109,10 @@ it('compensates a claimed cancelled blue-green operation exactly once', function
     });
     $cancelledAt = now()->subMinute()->startOfSecond();
     $deployment->update([
-        'status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+        'status' => $cancellationStatus->value,
         'finished_at' => $cancelledAt,
     ]);
-    $cause = new RuntimeException('User cancelled the claimed deployment.');
+    $cause = new RuntimeException('The claimed deployment was cancelled.');
 
     try {
         expect($lifecycle->rollback($cause))->toBe($cause);
@@ -125,7 +125,7 @@ it('compensates a claimed cancelled blue-green operation exactly once', function
             ->and($phaseDuringCandidateCompensation)->toBe(BlueGreenDeploymentPhase::ROLLING_BACK)
             ->and($state->destination_fence_operation_id)->toBe($claim->deploymentUuid)
             ->and($state->destination_fence_mutation_sequence)->toBe(1)
-            ->and($queue->status)->toBe(ApplicationDeploymentStatus::CANCELLED_BY_USER->value)
+            ->and($queue->status)->toBe($cancellationStatus->value)
             ->and($queue->finished_at->equalTo($cancelledAt))->toBeTrue();
         foreach (array_keys(ApplicationBlueGreenDeployment::clearedOperationAttributes()) as $attribute) {
             expect($state->{$attribute})->toBeNull();
@@ -137,13 +137,16 @@ it('compensates a claimed cancelled blue-green operation exactly once', function
     } finally {
         $lifecycle->release();
     }
-});
+})->with([
+    'user cancellation' => ApplicationDeploymentStatus::CANCELLED_BY_USER,
+    'fleet cancellation' => ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET,
+]);
 
-it('completes finalized idle cleanup after cancellation without finishing the queue', function (): void {
+it('completes finalized idle cleanup after cancellation without finishing the queue', function (ApplicationDeploymentStatus $cancellationStatus): void {
     $scenario = BlueGreenRecoveryScenario::create();
     $cancelledAt = now()->subMinute()->startOfSecond();
     $scenario->deployment->update([
-        'status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+        'status' => $cancellationStatus->value,
         'finished_at' => $cancelledAt,
     ]);
 
@@ -153,6 +156,9 @@ it('completes finalized idle cleanup after cancellation without finishing the qu
 
     expect($state->phase)->toBe(BlueGreenDeploymentPhase::IDLE)
         ->and($state->operation_deployment_uuid)->toBeNull()
-        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::CANCELLED_BY_USER->value)
+        ->and($scenario->deployment->fresh()->status)->toBe($cancellationStatus->value)
         ->and($scenario->deployment->fresh()->finished_at->equalTo($cancelledAt))->toBeTrue();
-});
+})->with([
+    'user cancellation' => ApplicationDeploymentStatus::CANCELLED_BY_USER,
+    'fleet cancellation' => ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET,
+]);

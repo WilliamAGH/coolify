@@ -9,6 +9,7 @@ use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationDeploymentQueue;
+use App\Models\Server;
 use App\Models\StandaloneDocker;
 use Illuminate\Cache\Lock;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -40,18 +41,28 @@ it('rolls back the initial tombstone when an intervention-owned promotion blocks
     Process::assertNothingRan();
 });
 
+function deletionOrchestrationDestinationOnNewServer(Server $existingServer, string $network): StandaloneDocker
+{
+    $server = Server::factory()->create(['team_id' => $existingServer->team_id]);
+    $server->settings()->update([
+        'is_reachable' => true,
+        'is_usable' => true,
+        'force_disabled' => false,
+    ]);
+    $server->proxy->set('type', $existingServer->proxyType());
+    $server->save();
+    $destination = $server->standaloneDockers()->firstOrFail();
+    $destination->update(['network' => $network]);
+
+    return $destination;
+}
+
 it('leaves every durable deletion owner untouched when a canonical destination lock is held', function () {
     ['application' => $application, 'destination' => $destination, 'server' => $server] = BlueGreenDeactivationScenario::context();
     Process::fake();
-    $stateDestination = StandaloneDocker::factory()->create([
-        'server_id' => $server->id,
-        'network' => 'state-lock-'.fake()->uuid(),
-    ]);
-    $deactivationDestination = StandaloneDocker::factory()->create([
-        'server_id' => $server->id,
-        'network' => 'deactivation-lock-'.fake()->uuid(),
-    ]);
-    $application->additional_networks()->attach($stateDestination->id, ['server_id' => $server->id]);
+    $stateDestination = deletionOrchestrationDestinationOnNewServer($server, 'state-lock-'.fake()->uuid());
+    $deactivationDestination = deletionOrchestrationDestinationOnNewServer($server, 'deactivation-lock-'.fake()->uuid());
+    $application->additional_networks()->attach($stateDestination->id, ['server_id' => $stateDestination->server_id]);
     $state = BlueGreenDeactivationScenario::routeLessState(
         $application,
         $stateDestination,
@@ -118,24 +129,10 @@ it('leaves every durable deletion owner untouched when a canonical destination l
 });
 
 it('acquires the sorted configured and durable destination union before deletion mutation', function () {
-    ['application' => $application, 'server' => $server] = BlueGreenDeactivationScenario::context();
+    ['application' => $application, 'destination' => $primaryDestination, 'server' => $server] = BlueGreenDeactivationScenario::context();
     Process::fake();
-    $stateDestination = StandaloneDocker::factory()->create([
-        'server_id' => $server->id,
-        'network' => 'state-union-'.fake()->uuid(),
-    ]);
-    $deactivationDestination = StandaloneDocker::factory()->create([
-        'server_id' => $server->id,
-        'network' => 'deactivation-union-'.fake()->uuid(),
-    ]);
-    $primaryDestination = StandaloneDocker::factory()->create([
-        'server_id' => $server->id,
-        'network' => 'primary-union-'.fake()->uuid(),
-    ]);
-    $application->update([
-        'destination_id' => $primaryDestination->id,
-        'destination_type' => $primaryDestination->getMorphClass(),
-    ]);
+    $stateDestination = deletionOrchestrationDestinationOnNewServer($server, 'state-union-'.fake()->uuid());
+    $deactivationDestination = deletionOrchestrationDestinationOnNewServer($server, 'deactivation-union-'.fake()->uuid());
     $state = BlueGreenDeactivationScenario::routeLessState(
         $application,
         $stateDestination,
@@ -189,7 +186,6 @@ it('acquires the sorted configured and durable destination union before deletion
                 $destinationId,
                 $stateDestination,
                 $deactivationDestination,
-                $server,
                 $lastDestinationId,
                 &$lockedDestinationIds,
             ): bool {
@@ -206,8 +202,8 @@ it('acquires the sorted configured and durable destination union before deletion
                         ->all())->toBe($deactivationRows);
 
                 if ((int) $destinationId === $lastDestinationId) {
-                    $application->additional_networks()->attach($stateDestination->id, ['server_id' => $server->id]);
-                    $application->additional_networks()->attach($deactivationDestination->id, ['server_id' => $server->id]);
+                    $application->additional_networks()->attach($stateDestination->id, ['server_id' => $stateDestination->server_id]);
+                    $application->additional_networks()->attach($deactivationDestination->id, ['server_id' => $deactivationDestination->server_id]);
                 }
 
                 return true;

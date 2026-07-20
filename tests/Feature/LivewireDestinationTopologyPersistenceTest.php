@@ -1,5 +1,8 @@
 <?php
 
+use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteOutcome;
+use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteResult;
+use App\Actions\Application\BlueGreen\ExecuteBlueGreenDeactivationRemoteCommand;
 use App\Actions\Application\StopApplicationOneServer;
 use App\Actions\Docker\GetContainersStatus;
 use App\Enums\BlueGreenDeploymentColor;
@@ -11,14 +14,18 @@ use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\Environment;
 use App\Models\InstanceSettings;
+use App\Models\PrivateKey;
 use App\Models\Project;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
 use App\Models\Team;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Facades\Storage;
 use Livewire\Livewire;
 
 uses(RefreshDatabase::class);
@@ -95,6 +102,26 @@ function addDestinationTopologyLifecycleOwner(Application $application, Standalo
             ->where('id', $application->id)
             ->update(['deleted_at' => now()]);
     }
+}
+
+function fakeDestinationRemovalRemoteSuccess(): void
+{
+    Process::fake(function (PendingProcess $process) {
+        if (str_contains($process->command, '/proc/sys/kernel/random/boot_id')) {
+            return Process::result(output: '34480cd3-5fb4-4f9d-a118-794f67aa0649', exitCode: 0);
+        }
+
+        return Process::result(
+            output: (new ExecuteBlueGreenDeactivationRemoteCommand)->encode(
+                new BlueGreenDeactivationRemoteResult(
+                    outcome: BlueGreenDeactivationRemoteOutcome::Success,
+                    exitStatus: 0,
+                    output: '',
+                ),
+            ),
+            exitCode: 0,
+        );
+    });
 }
 
 dataset('destination topology lifecycle owners', [
@@ -180,16 +207,86 @@ it('repeats the main destination fence after reloading stale topology', function
         ->and($application->additional_networks->first()->id)->toBe($this->mainDestination->id);
 });
 
-it('refuses an additional destination while blue-green deployment is opted in', function (): void {
+it('allows an additional destination on a different server while blue-green deployment is opted in', function (): void {
     $this->application->settings()->firstOrFail()->update([
         'is_blue_green_deployment_enabled' => true,
     ]);
 
     Livewire::test(Destination::class, ['resource' => $this->application->fresh()])
         ->call('addServer', $this->additionalDestination->id, $this->additionalServer->id)
-        ->assertDispatched('error');
+        ->assertNotDispatched('error');
 
-    expect($this->application->fresh()->additional_networks)->toHaveCount(0);
+    $additionalDestinations = $this->application->fresh()->additional_networks;
+
+    expect($additionalDestinations)
+        ->toHaveCount(1)
+        ->and($additionalDestinations->first()->id)->toBe($this->additionalDestination->id);
+});
+
+it('proves deactivation before detaching an opted-in destination with no prior durable state', function (): void {
+    $this->application->settings()->firstOrFail()->update([
+        'is_blue_green_deployment_enabled' => true,
+    ]);
+    $this->application->additional_networks()->attach($this->additionalDestination->id, [
+        'server_id' => $this->additionalServer->id,
+    ]);
+    $this->additionalServer->settings()->update([
+        'is_reachable' => true,
+        'is_usable' => true,
+        'force_disabled' => false,
+    ]);
+    $privateKey = PrivateKey::query()->create([
+        'name' => 'Destination removal test key',
+        'private_key' => generateSSHKey('ed25519')['private'],
+        'team_id' => $this->team->id,
+    ]);
+    Storage::fake('ssh-keys');
+    Storage::disk('ssh-keys')->put("ssh_key@{$privateKey->uuid}", $privateKey->private_key);
+    $this->additionalServer->update(['private_key_id' => $privateKey->id]);
+    $this->additionalServer->refresh();
+    fakeDestinationRemovalRemoteSuccess();
+
+    Livewire::test(Destination::class, ['resource' => $this->application->fresh()])
+        ->call('removeServer', $this->additionalDestination->id, $this->additionalServer->id, 'password')
+        ->assertNotDispatched('error');
+
+    expect($this->application->fresh()->additional_networks)->toHaveCount(0)
+        ->and(ApplicationBlueGreenDeployment::query()
+            ->where('application_id', $this->application->id)
+            ->where('standalone_docker_id', $this->additionalDestination->id)
+            ->doesntExist())->toBeTrue()
+        ->and(ApplicationBlueGreenDeactivation::query()
+            ->where('application_id', $this->application->id)
+            ->where('standalone_docker_id', $this->additionalDestination->id)
+            ->doesntExist())->toBeTrue();
+    Process::assertRan(fn (PendingProcess $process): bool => $process->command !== '');
+});
+
+it('shows durable blue-green phase and active color for each configured destination', function (): void {
+    $this->application->additional_networks()->attach($this->additionalDestination->id, [
+        'server_id' => $this->additionalServer->id,
+    ]);
+    ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $this->application->id,
+        'standalone_docker_id' => $this->mainDestination->id,
+        'active_color' => BlueGreenDeploymentColor::BLUE,
+        'blue_deployment_uuid' => 'primary-blue-green-ui-state',
+        'phase' => BlueGreenDeploymentPhase::IDLE,
+        'routing_revision' => 1,
+    ]);
+    ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $this->application->id,
+        'standalone_docker_id' => $this->additionalDestination->id,
+        'active_color' => BlueGreenDeploymentColor::GREEN,
+        'green_deployment_uuid' => 'additional-blue-green-ui-state',
+        'phase' => BlueGreenDeploymentPhase::IDLE,
+        'routing_revision' => 1,
+    ]);
+
+    Livewire::test(Destination::class, ['resource' => $this->application->fresh()])
+        ->assertSee('Blue-green: Idle')
+        ->assertSee('(blue)')
+        ->assertSee('(green)');
 });
 
 it('refuses a stale additional-destination attachment after lifecycle ownership changes', function (bool $withDeactivation, bool $softDeleted): void {

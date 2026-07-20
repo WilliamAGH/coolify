@@ -1413,7 +1413,58 @@ class Application extends BaseModel
         return StandaloneDocker::query()
             ->with('server')
             ->whereIn('id', $destinationIds)
+            ->orderBy('id')
             ->get();
+    }
+
+    public function isBlueGreenStandaloneDockerDestinationConfigured(StandaloneDocker $destination): bool
+    {
+        if (! $this->exists || (int) $destination->id < 1 || (int) $destination->server_id < 1) {
+            return false;
+        }
+
+        if ($this->blueGreenPrimaryStandaloneDockerDestinationId() === (int) $destination->id) {
+            return true;
+        }
+
+        return DB::table('additional_destinations')
+            ->where('application_id', $this->id)
+            ->where('standalone_docker_id', $destination->id)
+            ->where('server_id', $destination->server_id)
+            ->exists();
+    }
+
+    public function assertAdditionalStandaloneDockerDestinationCanBeAttached(StandaloneDocker $destination): void
+    {
+        if (! $this->exists) {
+            throw new RuntimeException('An application must exist before an additional destination can be attached.');
+        }
+        if ((int) $destination->id < 1 || (int) $destination->server_id < 1) {
+            throw new RuntimeException('An additional destination must belong to one exact server.');
+        }
+
+        $primaryDestinationId = $this->blueGreenPrimaryStandaloneDockerDestinationId();
+        if ($primaryDestinationId !== null) {
+            $primaryServerId = StandaloneDocker::query()
+                ->whereKey($primaryDestinationId)
+                ->value('server_id');
+            if ((int) $primaryServerId === (int) $destination->server_id) {
+                throw new RuntimeException('An application can use only one destination per server.');
+            }
+        }
+
+        if (DB::table('additional_destinations')
+            ->where('application_id', $this->id)
+            ->where('standalone_docker_id', $destination->id)
+            ->exists()) {
+            throw new RuntimeException('This standalone Docker destination is already attached to the application.');
+        }
+        if (DB::table('additional_destinations')
+            ->where('application_id', $this->id)
+            ->where('server_id', $destination->server_id)
+            ->exists()) {
+            throw new RuntimeException('An application can use only one destination per server.');
+        }
     }
 
     public function blueGreenPrimaryStandaloneDockerDestinationId(): ?int
@@ -1680,6 +1731,66 @@ class Application extends BaseModel
         }
     }
 
+    public function consumeBlueGreenDestinationRemovalProof(
+        int $standaloneDockerId,
+        int $serverId,
+        int $deactivationId,
+        string $operationId,
+        int $supersessionGeneration,
+    ): void {
+        if ($this->trashed()) {
+            throw new RuntimeException('A deleted blue-green application destination cannot be detached.');
+        }
+
+        $deactivation = $this->blueGreenDeactivations()
+            ->whereKey($deactivationId)
+            ->where('standalone_docker_id', $standaloneDockerId)
+            ->where('operation_id', $operationId)
+            ->where('supersession_generation', $supersessionGeneration)
+            ->lockForUpdate()
+            ->first();
+        if ($deactivation === null
+            || $deactivation->phase !== BlueGreenDeactivationPhase::REMOVED
+            || $deactivation->completed_at === null) {
+            throw new RuntimeException('The exact destination-removal deactivation proof is no longer complete.');
+        }
+        $deactivation->assertValid();
+
+        $state = $this->blueGreenDeployments()
+            ->where('standalone_docker_id', $standaloneDockerId)
+            ->lockForUpdate()
+            ->first();
+        if ($state === null
+            || $state->phase !== BlueGreenDeploymentPhase::STOPPED
+            || (int) $state->supersession_generation !== $supersessionGeneration
+            || $state->active_color !== null
+            || $state->pending_color !== null
+            || $state->blue_deployment_uuid !== null
+            || $state->green_deployment_uuid !== null
+            || $state->pending_deployment_uuid !== null
+            || $state->operation_deployment_uuid !== null
+            || $state->deactivation_operation_id !== null
+            || $state->deactivation_started_at !== null) {
+            throw new RuntimeException('The exact destination-removal state proof is no longer stopped and empty.');
+        }
+
+        if (ApplicationDeploymentQueue::query()
+            ->where('application_id', $this->id)
+            ->where('destination_id', $standaloneDockerId)
+            ->where('server_id', $serverId)
+            ->whereIn('status', [
+                ApplicationDeploymentStatus::QUEUED->value,
+                ApplicationDeploymentStatus::IN_PROGRESS->value,
+            ])
+            ->lockForUpdate()
+            ->exists()) {
+            throw new RuntimeException('A deployment claimed the destination after removal deactivation completed.');
+        }
+
+        $state->delete();
+        $deactivation->delete();
+    }
+
     private function hasBlueGreenDurableState(?int $standaloneDockerId = null): bool
     {
         $deploymentQuery = $this->blueGreenDeployments();
@@ -1817,10 +1928,7 @@ class Application extends BaseModel
         if ($destinations->isEmpty()) {
             return 'Blue-green deployments require at least one standalone Docker destination.';
         }
-        if ($destinations->count() !== 1) {
-            return 'Blue-green deployments support exactly one standalone Docker destination.';
-        }
-
+        $serverIds = [];
         foreach ($destinations as $destination) {
             $server = $destination->server;
             if ($server === null || $server->isSwarm()) {
@@ -1829,6 +1937,10 @@ class Application extends BaseModel
             if ($server->proxyType() !== ProxyTypes::TRAEFIK->value) {
                 return 'Blue-green deployments require Traefik as the proxy on every configured destination.';
             }
+            if (isset($serverIds[$server->id])) {
+                return 'Blue-green deployments require one destination per server.';
+            }
+            $serverIds[$server->id] = true;
         }
 
         return null;

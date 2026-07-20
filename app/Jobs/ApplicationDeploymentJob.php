@@ -5,17 +5,20 @@ namespace App\Jobs;
 use App\Actions\Application\BlueGreen\BlueGreenComposeSidecarDeactivationPlan;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenLifecycleDatabaseLocks;
+use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
 use App\Actions\Application\BlueGreen\FindBlueGreenDeactivationFence;
 use App\Actions\Application\BlueGreen\RemoveBlueGreenComposeSidecars;
 use App\Actions\Application\BlueGreen\StartBlueGreenComposeSidecars;
 use App\Actions\Application\WaitForSwarmStackConvergence;
 use App\Actions\Docker\GetContainersStatus;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
+use App\Actions\Shared\ComplexStatusCheck;
 use App\Contracts\AdoptsLegacyProxyMutationDispatch;
 use App\Enums\ApplicationDeploymentExecutionPhase;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
+use App\Enums\BlueGreenFleetStatus;
 use App\Enums\ProcessStatus;
 use App\Events\ApplicationConfigurationChanged;
 use App\Events\ServiceStatusChanged;
@@ -46,6 +49,7 @@ use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Sleep;
 use Illuminate\Support\Str;
@@ -251,6 +255,10 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
 
     private ?string $blueGreenComposeCandidateService = null;
 
+    private int $pausedBlueGreenFleetDeployments = 0;
+
+    private bool $failedBlueGreenFleetDestinationStatusUpdated = false;
+
     public ?string $dispatch_attempt_uuid = null;
 
     public function tags()
@@ -372,8 +380,8 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
 
         // Check if deployment was cancelled before we even started
         $this->application_deployment_queue->refresh();
-        if ($this->application_deployment_queue->status === ApplicationDeploymentStatus::CANCELLED_BY_USER->value) {
-            $this->application_deployment_queue->addLogEntry('Deployment was cancelled before starting.');
+        if ($this->deploymentWasCancelled()) {
+            $this->application_deployment_queue->addLogEntry($this->deploymentCancellationMessage());
 
             return;
         }
@@ -381,7 +389,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         if ($this->destination instanceof StandaloneDocker
             && FindBlueGreenDeactivationFence::run($this->application_deployment_queue) !== null) {
             $this->application_deployment_queue->refresh();
-            if ($this->application_deployment_queue->status === ApplicationDeploymentStatus::CANCELLED_BY_USER->value) {
+            if ($this->deploymentWasCancelled()) {
                 $this->application_deployment_queue->addLogEntry('Deployment was cancelled because application deactivation owns this destination.');
                 queue_next_deployment($this->application_deployment_queue);
             }
@@ -391,7 +399,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
 
         if ($this->server->isFunctional() === false) {
             $this->application_deployment_queue->addLogEntry('Server is not functional.');
-            $this->fail('Server is not functional.');
+            $this->failQueuedJob('Server is not functional.');
 
             return;
         }
@@ -505,7 +513,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             if ($this->pull_request_id !== 0 && $this->application->is_github_based()) {
                 ApplicationPullRequestUpdateJob::dispatch(application: $this->application, preview: $this->preview, deployment_uuid: $this->deployment_uuid, status: ProcessStatus::ERROR);
             }
-            $this->fail($failure);
+            $this->failQueuedJob($failure);
             throw $failure;
         } finally {
             // Wrap cleanup operations in try-catch to prevent exceptions from interfering
@@ -2825,7 +2833,9 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             return;
         }
         if ($this->blueGreenLifecycle?->isEnabled()) {
-            throw new DeploymentException('Blue-green deployments are single-destination and cannot fan out to additional destinations.');
+            $this->deployBlueGreenFleetToAdditionalDestinations();
+
+            return;
         }
         if ($this->pull_request_id !== 0) {
             return;
@@ -2865,6 +2875,102 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
                 'environment_uuid' => data_get($this->application, 'environment.uuid'),
             ]));
         }
+    }
+
+    private function deployBlueGreenFleetToAdditionalDestinations(): void
+    {
+        DB::transaction(function (): void {
+            BlueGreenTopologyLock::acquire();
+            $application = Application::query()
+                ->with(['destination.server', 'settings'])
+                ->whereKey($this->application->id)
+                ->lockForUpdate()
+                ->first();
+            if ($application === null) {
+                throw new DeploymentException('Blue-green fleet scheduling could not lock the application topology.');
+            }
+            $fleetOwner = ApplicationDeploymentQueue::query()
+                ->whereKey($this->application_deployment_queue->id)
+                ->lockForUpdate()
+                ->first();
+            if ($fleetOwner === null || $fleetOwner->status !== ApplicationDeploymentStatus::FINISHED->value) {
+                throw new DeploymentException('Blue-green fleet scheduling lost its finished deployment owner.');
+            }
+            if ($fleetOwner->blue_green_fleet_deployment_uuid !== null) {
+                if ($fleetOwner->blue_green_fleet_deployment_uuid !== $fleetOwner->deployment_uuid) {
+                    throw new DeploymentException('Blue-green fleet scheduling found an unexpected durable fleet owner.');
+                }
+
+                return;
+            }
+
+            $topology = DB::table('additional_destinations')
+                ->where('application_id', $application->id)
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            if ($topology->isEmpty()) {
+                return;
+            }
+            $destinations = StandaloneDocker::query()
+                ->with('server')
+                ->whereIn('id', $topology->pluck('standalone_docker_id'))
+                ->lockForUpdate()
+                ->get()
+                ->keyBy('id');
+            $fleetOwner->update([
+                'blue_green_fleet_deployment_uuid' => $fleetOwner->deployment_uuid,
+                'blue_green_fleet_status' => BlueGreenFleetStatus::ACTIVE,
+            ]);
+            $this->application_deployment_queue->setAttribute(
+                'blue_green_fleet_deployment_uuid',
+                $fleetOwner->deployment_uuid,
+            );
+
+            foreach ($topology as $topologyEntry) {
+                $destination = $destinations->get((int) $topologyEntry->standalone_docker_id);
+                if (! $destination instanceof StandaloneDocker
+                    || $destination->server === null
+                    || (int) $destination->server_id !== (int) $topologyEntry->server_id) {
+                    throw new DeploymentException('Blue-green fleet scheduling found a stale destination/server topology and refused to dispatch remote work.');
+                }
+                if ((int) $destination->id === (int) $fleetOwner->destination_id) {
+                    continue;
+                }
+                if ((int) $destination->server->team_id !== (int) $application->destination->server->team_id) {
+                    throw new DeploymentException('Blue-green fleet scheduling found a destination outside the application team.');
+                }
+
+                $deploymentUuid = new_public_id();
+                $result = queue_application_deployment(
+                    deployment_uuid: $deploymentUuid,
+                    application: $application,
+                    pull_request_id: (int) $fleetOwner->pull_request_id,
+                    commit: $fleetOwner->commit,
+                    force_rebuild: (bool) $fleetOwner->force_rebuild,
+                    is_webhook: (bool) $fleetOwner->is_webhook,
+                    is_api: (bool) $fleetOwner->is_api,
+                    restart_only: (bool) $fleetOwner->restart_only,
+                    git_type: $fleetOwner->git_type,
+                    server: $destination->server,
+                    destination: $destination,
+                    only_this_server: true,
+                    no_questions_asked: true,
+                    rollback: (bool) $fleetOwner->rollback,
+                    docker_registry_image_tag: $fleetOwner->docker_registry_image_tag,
+                    blue_green_fleet_deployment_uuid: $fleetOwner->deployment_uuid,
+                );
+                if (($result['status'] ?? null) !== 'queued') {
+                    throw new DeploymentException('Blue-green fleet scheduling could not enqueue every destination: '.($result['message'] ?? 'unknown queue failure'));
+                }
+                $fleetOwner->addLogEntry("Blue-green fleet scheduled {$destination->server->name}. Logs: ".route('project.application.deployment.show', [
+                    'project_uuid' => data_get($application, 'environment.project.uuid'),
+                    'application_uuid' => data_get($application, 'uuid'),
+                    'deployment_uuid' => $deploymentUuid,
+                    'environment_uuid' => data_get($application, 'environment.uuid'),
+                ]));
+            }
+        }, attempts: 5);
     }
 
     private function set_coolify_variables()
@@ -5567,9 +5673,9 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
     private function checkForCancellation(): void
     {
         $this->application_deployment_queue->refresh();
-        if ($this->application_deployment_queue->status === ApplicationDeploymentStatus::CANCELLED_BY_USER->value) {
-            $this->application_deployment_queue->addLogEntry('Deployment cancelled by user, stopping execution.');
-            throw new DeploymentException('Deployment cancelled by user', 69420);
+        if ($this->deploymentWasCancelled()) {
+            $this->application_deployment_queue->addLogEntry($this->deploymentCancellationMessage());
+            throw new DeploymentException($this->deploymentCancellationExceptionMessage(), 69420);
         }
     }
 
@@ -5587,7 +5693,10 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
             return;
         }
 
-        if (! $this->updateDeploymentStatus($status)) {
+        $updated = $status === ApplicationDeploymentStatus::FAILED && $this->isBlueGreenFleetDeployment()
+            ? $this->publishBlueGreenFleetFailure()
+            : $this->updateDeploymentStatus($status);
+        if (! $updated) {
             return;
         }
         $this->handleStatusTransition($status);
@@ -5610,9 +5719,9 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
             return true;
         }
 
-        if ($this->application_deployment_queue->status === ApplicationDeploymentStatus::CANCELLED_BY_USER->value) {
-            $this->application_deployment_queue->addLogEntry('Deployment cancelled by user, stopping execution.');
-            throw new DeploymentException('Deployment cancelled by user', 69420);
+        if ($this->deploymentWasCancelled()) {
+            $this->application_deployment_queue->addLogEntry($this->deploymentCancellationMessage());
+            throw new DeploymentException($this->deploymentCancellationExceptionMessage(), 69420);
         }
 
         return false;
@@ -5680,7 +5789,22 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         event(new ApplicationConfigurationChanged($this->application->team()->id));
 
         if (! $this->only_this_server) {
-            $this->deploy_to_additional_destinations();
+            try {
+                $this->deploy_to_additional_destinations();
+            } catch (Throwable $exception) {
+                if (! ($this->blueGreenLifecycle?->isEnabled() ?? false)) {
+                    throw $exception;
+                }
+
+                $this->application_deployment_queue->addLogEntry(
+                    'Blue-green fleet scheduling failed before any additional destination was dispatched: '
+                    .$exception->getMessage(),
+                    'stderr',
+                );
+                Log::warning(
+                    "Blue-green fleet scheduling failed for deployment {$this->deployment_uuid}: {$exception->getMessage()}",
+                );
+            }
         }
 
         $this->sendDeploymentNotification(DeploymentSuccess::class);
@@ -5691,7 +5815,158 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
      */
     private function handleFailedDeployment(): void
     {
+        if ($this->isBlueGreenFleetDeployment()) {
+            $destinationMessage = $this->failedBlueGreenFleetDestinationStatusUpdated
+                ? 'Marked this destination degraded:unknown.'
+                : 'This destination was removed from application topology, so no application status was changed.';
+            $this->application_deployment_queue->addLogEntry(
+                "Blue-green fleet deployment failed. {$destinationMessage} Paused the remaining destination(s) before remote mutation. Recover or roll back this destination, then start a new blue-green fleet deployment to resume the fleet.",
+                'stderr',
+            );
+            if ($this->pausedBlueGreenFleetDeployments === 0) {
+                $this->application_deployment_queue->addLogEntry(
+                    'Blue-green fleet failure found no queued sibling destinations to pause.',
+                    'stderr',
+                );
+            }
+        }
         $this->sendDeploymentNotification(DeploymentFailed::class);
+    }
+
+    private function isBlueGreenFleetDeployment(): bool
+    {
+        $fleetDeploymentUuid = $this->application_deployment_queue->blue_green_fleet_deployment_uuid;
+
+        return is_string($fleetDeploymentUuid)
+            && $fleetDeploymentUuid !== ''
+            && $fleetDeploymentUuid !== $this->application_deployment_queue->deployment_uuid;
+    }
+
+    private function failQueuedJob(Throwable|string $failure): void
+    {
+        if ($this->job === null) {
+            $exception = is_string($failure) ? new DeploymentException($failure) : $failure;
+            $this->failed($exception);
+
+            return;
+        }
+
+        $this->fail($failure);
+    }
+
+    private function publishBlueGreenFleetFailure(): bool
+    {
+        $fleetDeploymentUuid = $this->application_deployment_queue->blue_green_fleet_deployment_uuid;
+        if (! is_string($fleetDeploymentUuid) || $fleetDeploymentUuid === '') {
+            return false;
+        }
+
+        return DB::transaction(function () use ($fleetDeploymentUuid): bool {
+            $application = Application::withTrashed()
+                ->whereKey($this->application->id)
+                ->lockForUpdate()
+                ->first();
+            if ($application === null || $application->trashed()) {
+                return false;
+            }
+            $application->settings()->lockForUpdate()->first();
+
+            $fleetDeployments = ApplicationDeploymentQueue::query()
+                ->where('application_id', $this->application->id)
+                ->where('pull_request_id', 0)
+                ->where(function ($query) use ($fleetDeploymentUuid): void {
+                    $query->where('deployment_uuid', $fleetDeploymentUuid)
+                        ->orWhere('blue_green_fleet_deployment_uuid', $fleetDeploymentUuid);
+                })
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+
+            $fleetOwner = $fleetDeployments->firstWhere('deployment_uuid', $fleetDeploymentUuid);
+            $failedDeployment = $fleetDeployments->firstWhere('id', $this->application_deployment_queue->getKey());
+            if (! $fleetOwner instanceof ApplicationDeploymentQueue
+                || ! $failedDeployment instanceof ApplicationDeploymentQueue
+                || $fleetOwner->blue_green_fleet_status !== BlueGreenFleetStatus::ACTIVE
+                || $failedDeployment->status !== ApplicationDeploymentStatus::IN_PROGRESS->value) {
+                return false;
+            }
+
+            $failureQuery = ApplicationDeploymentQueue::query()
+                ->whereKey($failedDeployment->getKey())
+                ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
+                ->when(
+                    $this->dispatch_attempt_uuid !== null,
+                    fn ($query) => $query->where('horizon_job_id', $this->dispatch_attempt_uuid),
+                );
+            if (BlueGreenLifecycleDatabaseLocks::constrainTerminalQueueOwner(
+                $failureQuery,
+                $this->application_deployment_queue,
+            )->update(['status' => ApplicationDeploymentStatus::FAILED->value]) !== 1) {
+                return false;
+            }
+
+            $paused = 0;
+            foreach ($fleetDeployments->where('status', ApplicationDeploymentStatus::QUEUED->value) as $queuedDeployment) {
+                $updated = ApplicationDeploymentQueue::query()
+                    ->whereKey($queuedDeployment->id)
+                    ->where('status', ApplicationDeploymentStatus::QUEUED->value)
+                    ->update([
+                        'status' => ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value,
+                        'finished_at' => now(),
+                    ]);
+                if ($updated !== 1) {
+                    continue;
+                }
+                $queuedDeployment->refresh();
+                $queuedDeployment->addLogEntry(
+                    'Paused before dispatch because another blue-green destination in this fleet failed. Recover or roll back the failed destination, then start a new fleet deployment.',
+                    'stderr',
+                );
+                $paused++;
+            }
+
+            $ownerPaused = ApplicationDeploymentQueue::query()
+                ->whereKey($fleetOwner->getKey())
+                ->where('blue_green_fleet_status', BlueGreenFleetStatus::ACTIVE->value)
+                ->update(['blue_green_fleet_status' => BlueGreenFleetStatus::PAUSED->value]);
+            if ($ownerPaused !== 1) {
+                throw new DeploymentException('Blue-green fleet failure could not pause its exact durable fleet owner.');
+            }
+
+            $this->failedBlueGreenFleetDestinationStatusUpdated = (new ComplexStatusCheck)->updateApplicationDestinationStatus(
+                $application,
+                (int) $this->destination->id,
+                (int) $this->server->id,
+                'degraded:unknown',
+            );
+            $this->pausedBlueGreenFleetDeployments = $paused;
+            $this->application_deployment_queue->setAttribute('status', ApplicationDeploymentStatus::FAILED->value);
+            $this->application_deployment_queue->syncOriginalAttribute('status');
+
+            return true;
+        }, attempts: 5);
+    }
+
+    private function deploymentWasCancelled(): bool
+    {
+        return in_array($this->application_deployment_queue->status, [
+            ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+            ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value,
+        ], true);
+    }
+
+    private function deploymentCancellationMessage(): string
+    {
+        return $this->application_deployment_queue->status === ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value
+            ? 'Deployment was paused because another blue-green destination in this fleet failed.'
+            : 'Deployment cancelled by user, stopping execution.';
+    }
+
+    private function deploymentCancellationExceptionMessage(): string
+    {
+        return $this->application_deployment_queue->status === ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value
+            ? 'Deployment paused because another blue-green destination in this fleet failed.'
+            : 'Deployment cancelled by user';
     }
 
     /**
@@ -5803,6 +6078,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
             ApplicationDeploymentStatus::FINISHED->value,
             ApplicationDeploymentStatus::FAILED->value,
             ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+            ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value,
         ], true)) {
             return;
         }
@@ -5851,6 +6127,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
                 ApplicationDeploymentStatus::FAILED->value,
                 ApplicationDeploymentStatus::FINISHED->value,
                 ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+                ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value,
             ], true)) {
                 return;
             }

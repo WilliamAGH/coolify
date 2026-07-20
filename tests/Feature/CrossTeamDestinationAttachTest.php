@@ -10,6 +10,7 @@ use App\Models\Server;
 use App\Models\StandaloneDocker;
 use App\Models\Team;
 use App\Models\User;
+use Illuminate\Database\QueryException;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Queue;
@@ -188,45 +189,37 @@ describe('Destination::promote GHSA-j395-3pqh-9r5g', function () {
         expect($additional->first()->pivot->server_id)->toBe($this->serverA->id);
     });
 
-    test('only detaches the promoted network for the selected pivot server', function () {
+    test('database rejects an additional destination paired with the wrong server', function () {
         $this->applicationA->additional_networks()->attach($this->destinationA2->id, ['server_id' => $this->serverA2->id]);
-        $this->applicationA->additional_networks()->attach($this->destinationA2->id, ['server_id' => $this->serverA->id]);
-
-        Livewire::test(Destination::class, ['resource' => $this->applicationA])
-            ->call('promote', $this->destinationA2->id, $this->serverA2->id);
-
-        expect(DB::table('additional_destinations')
-            ->where('application_id', $this->applicationA->id)
-            ->where('standalone_docker_id', $this->destinationA2->id)
-            ->where('server_id', $this->serverA->id)
-            ->exists())->toBeTrue();
+        expect(fn () => DB::table('additional_destinations')->insert([
+            'application_id' => $this->applicationA->id,
+            'standalone_docker_id' => $this->destinationA2->id,
+            'server_id' => $this->serverA->id,
+        ]))->toThrow(QueryException::class);
 
         expect(DB::table('additional_destinations')
             ->where('application_id', $this->applicationA->id)
             ->where('standalone_docker_id', $this->destinationA2->id)
-            ->where('server_id', $this->serverA2->id)
-            ->exists())->toBeFalse();
+            ->count())->toBe(1);
     });
 });
 
 describe('Destination::removeServer', function () {
-    test('only detaches the removed network for the selected pivot server', function () {
-        $this->applicationA->additional_networks()->attach($this->destinationA2->id, ['server_id' => $this->serverA2->id]);
-        $this->applicationA->additional_networks()->attach($this->destinationA2->id, ['server_id' => $this->serverA->id]);
-
-        Livewire::test(Destination::class, ['resource' => $this->applicationA])
-            ->call('removeServer', $this->destinationA2->id, $this->serverA2->id, 'password');
+    test('database rejects an additional destination on the primary server', function () {
+        $primaryServerDestination = StandaloneDocker::factory()->create([
+            'server_id' => $this->serverA->id,
+            'name' => 'dest-a-primary-server-'.fake()->unique()->word(),
+            'network' => 'coolify-a-primary-server-'.fake()->unique()->word(),
+        ]);
+        expect(fn () => DB::table('additional_destinations')->insert([
+            'application_id' => $this->applicationA->id,
+            'standalone_docker_id' => $primaryServerDestination->id,
+            'server_id' => $this->serverA->id,
+        ]))->toThrow(QueryException::class, 'one destination per server');
 
         expect(DB::table('additional_destinations')
             ->where('application_id', $this->applicationA->id)
-            ->where('standalone_docker_id', $this->destinationA2->id)
-            ->where('server_id', $this->serverA->id)
-            ->exists())->toBeTrue();
-
-        expect(DB::table('additional_destinations')
-            ->where('application_id', $this->applicationA->id)
-            ->where('standalone_docker_id', $this->destinationA2->id)
-            ->where('server_id', $this->serverA2->id)
-            ->exists())->toBeFalse();
+            ->where('standalone_docker_id', $primaryServerDestination->id)
+            ->count())->toBe(0);
     });
 });

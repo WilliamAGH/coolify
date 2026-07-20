@@ -258,6 +258,7 @@ final readonly class BlueGreenLifecycleDatabaseLocks
             return $query->whereIn('status', [
                 ApplicationDeploymentStatus::IN_PROGRESS->value,
                 ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+                ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value,
             ]);
         }
 
@@ -270,7 +271,10 @@ final readonly class BlueGreenLifecycleDatabaseLocks
         bool $allowCancelledRollbackEntry = false,
     ): bool {
         return $status === ApplicationDeploymentStatus::IN_PROGRESS->value
-            || ($status === ApplicationDeploymentStatus::CANCELLED_BY_USER->value
+            || (in_array($status, [
+                ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+                ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value,
+            ], true)
                 && (in_array($phase, [BlueGreenDeploymentPhase::ROLLING_BACK, BlueGreenDeploymentPhase::IDLE], true)
                     || $allowCancelledRollbackEntry));
     }

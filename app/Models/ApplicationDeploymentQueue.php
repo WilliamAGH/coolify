@@ -7,6 +7,7 @@ use App\Enums\ApplicationDeploymentExecutionPhase;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
+use App\Enums\BlueGreenFleetStatus;
 use Closure;
 use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Model;
@@ -56,6 +57,8 @@ use OpenApi\Attributes as OA;
         'blue_green_backend_port_inventory' => ['type' => 'string', 'nullable' => true],
         'blue_green_drain_backend_port_inventory' => ['type' => 'string', 'nullable' => true],
         'blue_green_supersession_generation' => ['type' => 'integer', 'nullable' => true],
+        'blue_green_fleet_deployment_uuid' => ['type' => 'string', 'nullable' => true],
+        'blue_green_fleet_status' => ['type' => 'string', 'nullable' => true],
     ],
 )]
 class ApplicationDeploymentQueue extends Model
@@ -103,6 +106,8 @@ class ApplicationDeploymentQueue extends Model
         'blue_green_backend_port_inventory',
         'blue_green_drain_backend_port_inventory',
         'blue_green_supersession_generation',
+        'blue_green_fleet_deployment_uuid',
+        'blue_green_fleet_status',
         'blue_green_previous_container_id',
         'blue_green_candidate_container_id',
         'blue_green_rollback_managed_filename',
@@ -139,6 +144,7 @@ class ApplicationDeploymentQueue extends Model
         'blue_green_destination_fence_epoch' => 'integer',
         'blue_green_routing_mutated_at' => 'datetime',
         'blue_green_supersession_generation' => 'integer',
+        'blue_green_fleet_status' => BlueGreenFleetStatus::class,
     ];
 
     public function claimForDispatch(bool $bypassServerCapacity = false): bool
@@ -162,6 +168,23 @@ class ApplicationDeploymentQueue extends Model
                 return false;
             }
 
+            $deactivation = ApplicationBlueGreenDeactivation::query()
+                ->where('application_id', $application->getKey())
+                ->where('standalone_docker_id', $this->destination_id)
+                ->lockForUpdate()
+                ->first();
+
+            $fleetOwner = null;
+            if (is_string($this->blue_green_fleet_deployment_uuid)
+                && $this->blue_green_fleet_deployment_uuid !== ''
+                && $this->blue_green_fleet_deployment_uuid !== $this->deployment_uuid) {
+                $fleetOwner = self::query()
+                    ->where('application_id', $application->getKey())
+                    ->where('deployment_uuid', $this->blue_green_fleet_deployment_uuid)
+                    ->lockForUpdate()
+                    ->first();
+            }
+
             $deployment = self::query()
                 ->whereKey($this->getKey())
                 ->lockForUpdate()
@@ -171,6 +194,29 @@ class ApplicationDeploymentQueue extends Model
                 || (string) $deployment->server_id !== (string) $server->getKey()
                 || $deployment->status !== ApplicationDeploymentStatus::QUEUED->value) {
                 return false;
+            }
+
+            if ($deactivation?->fences($deployment) === true) {
+                $this->cancelRejectedDeploymentClaim($deployment, ApplicationDeploymentStatus::CANCELLED_BY_USER);
+
+                return false;
+            }
+
+            if (is_string($deployment->blue_green_fleet_deployment_uuid)
+                && $deployment->blue_green_fleet_deployment_uuid !== ''
+                && $deployment->blue_green_fleet_deployment_uuid !== $deployment->deployment_uuid) {
+                if ($fleetOwner === null
+                    || $fleetOwner->deployment_uuid !== $deployment->blue_green_fleet_deployment_uuid
+                    || $fleetOwner->status !== ApplicationDeploymentStatus::FINISHED->value
+                    || $fleetOwner->blue_green_fleet_deployment_uuid !== $fleetOwner->deployment_uuid
+                    || $fleetOwner->blue_green_fleet_status !== BlueGreenFleetStatus::ACTIVE) {
+                    $this->cancelRejectedDeploymentClaim(
+                        $deployment,
+                        ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET,
+                    );
+
+                    return false;
+                }
             }
 
             if ($application->trashed()) {
@@ -241,6 +287,27 @@ class ApplicationDeploymentQueue extends Model
 
             return true;
         }, attempts: 5);
+    }
+
+    private function cancelRejectedDeploymentClaim(
+        self $deployment,
+        ApplicationDeploymentStatus $status,
+    ): void {
+        $cancelledAt = now();
+        $cancelled = self::query()
+            ->whereKey($deployment->getKey())
+            ->where('status', ApplicationDeploymentStatus::QUEUED->value)
+            ->update([
+                'status' => $status->value,
+                'finished_at' => $cancelledAt,
+            ]);
+        if ($cancelled !== 1) {
+            return;
+        }
+
+        $this->setAttribute('status', $status->value);
+        $this->setAttribute('finished_at', $cancelledAt);
+        $this->syncOriginalAttributes(['status', 'finished_at']);
     }
 
     public function acquireDispatchExecution(string $dispatchAttemptUuid, string $worker): bool
