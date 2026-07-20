@@ -6,7 +6,7 @@ use RuntimeException;
 
 final class ControlPlaneMigrationInventory
 {
-    private const FILENAME_PATTERN = '/\A(?:2026_07_12_[0-9]{6}_[a-z0-9_]+|2026_07_19_(?:025448_add_destination_fencing_to_blue_green_operations|025449_add_blue_green_supersession_generation|030000_add_blue_green_drain_provenance|064536_add_blue_green_recovery_predecessor_state|120000_add_blue_green_inactive_retention_setting|120001_add_blue_green_inactive_retirement_provenance)|2026_07_20_(?:000000_add_blue_green_backend_port_inventories_to_deployment_queues|000100_add_blue_green_intervention_reasons|000200_add_blue_green_multi_destination_topology))\.php\z/';
+    private const FILENAME_PATTERN = '/\A(?:2026_07_12_[0-9]{6}_[a-z0-9_]+|2026_07_19_(?:025448_add_destination_fencing_to_blue_green_operations|025449_add_blue_green_supersession_generation|030000_add_blue_green_drain_provenance|064536_add_blue_green_recovery_predecessor_state|120000_add_blue_green_inactive_retention_setting|120001_add_blue_green_inactive_retirement_provenance)|2026_07_20_(?:000000_add_blue_green_backend_port_inventories_to_deployment_queues|000100_add_blue_green_intervention_reasons|000200_add_blue_green_multi_destination_topology|211522_create_application_blue_green_replicas_table))\.php\z/';
 
     private const GLOBS = [
         '2026_07_12_*.php',
@@ -19,6 +19,7 @@ final class ControlPlaneMigrationInventory
         '2026_07_20_000000_add_blue_green_backend_port_inventories_to_deployment_queues.php',
         '2026_07_20_000100_add_blue_green_intervention_reasons.php',
         '2026_07_20_000200_add_blue_green_multi_destination_topology.php',
+        '2026_07_20_211522_create_application_blue_green_replicas_table.php',
     ];
 
     private const FINGERPRINT_PATH = 'database/migrations/control-plane-migration-inventory.fingerprint';

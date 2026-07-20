@@ -1157,6 +1157,11 @@ class Application extends BaseModel
         return $this->hasMany(ApplicationBlueGreenDeactivation::class);
     }
 
+    public function blueGreenReplicas(): HasMany
+    {
+        return $this->hasMany(ApplicationBlueGreenReplica::class);
+    }
+
     public function destination()
     {
         return $this->morphTo();
@@ -1565,6 +1570,7 @@ class Application extends BaseModel
             'is_stripprefix_enabled',
             'stop_grace_period',
             'blue_green_inactive_retention_seconds',
+            'blue_green_replica_count',
         ];
     }
 

@@ -8,6 +8,7 @@ use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
+use App\Models\ApplicationBlueGreenReplica;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
@@ -57,6 +58,61 @@ class RemoveBlueGreenInactiveContainer
             || $inactiveDeploymentUuid === ''
             || $inactiveDeploymentUuid === $claim->deploymentUuid) {
             throw new BlueGreenDeploymentTransitionException('The inactive slot has malformed deployment provenance.');
+        }
+
+        $replicas = ApplicationBlueGreenReplica::query()
+            ->where('application_blue_green_deployment_id', $state->id)
+            ->where('deployment_uuid', $inactiveDeploymentUuid)
+            ->where('color', $claim->pendingColor->value)
+            ->orderBy('replica_index')
+            ->get();
+        if ($replicas->count() > DEFAULT_BLUE_GREEN_REPLICA_COUNT) {
+            $routingRevisions = $replicas->pluck('routing_revision')->unique()->values();
+            if ($routingRevisions->count() !== 1) {
+                throw new BlueGreenDeploymentTransitionException('The inactive replica set has conflicting routing revisions.');
+            }
+            $inspections = InspectBlueGreenReplicaSet::run(
+                $server,
+                $state,
+                $inactiveDeploymentUuid,
+                $claim->pendingColor,
+                (int) $routingRevisions->sole(),
+                $replicas->count(),
+            );
+            $commands = [];
+            $completionAssertions = [];
+            foreach ($inspections as $inspection) {
+                $expectation = new BlueGreenContainerExpectation(
+                    name: $inspection->containerName,
+                    dockerId: $inspection->dockerId,
+                    applicationId: $application->id,
+                    pullRequestId: 0,
+                    blueGreenManaged: true,
+                    deploymentUuid: $inactiveDeploymentUuid,
+                    color: $claim->pendingColor,
+                    routingRevision: (int) $routingRevisions->sole(),
+                );
+                $containerId = escapeshellarg($inspection->dockerId);
+                array_push($commands, ...(new InspectBlueGreenContainer)->exactMutationAssertionsFor($expectation));
+                $commands[] = "docker rm -f {$containerId} >/dev/null; ! docker container inspect {$containerId} >/dev/null 2>&1";
+                array_push($completionAssertions, ...(new InspectBlueGreenContainer)->absentMutationCompletionAssertionsFor($expectation));
+            }
+            $replacement = (new ExecuteBlueGreenDestinationMutation)->executeForClaim(
+                $application,
+                $server,
+                $claim,
+                $expectedState,
+                $commands,
+                $completionAssertions,
+            );
+            ApplicationBlueGreenReplica::query()
+                ->whereKey($replicas->modelKeys())
+                ->update([
+                    'health_status' => 'stopped',
+                    'last_observed_at' => now(),
+                ]);
+
+            return $replacement;
         }
 
         $deployment = ApplicationDeploymentQueue::query()

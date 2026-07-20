@@ -126,6 +126,34 @@ it('saves bounded inactive retention and renders the embedded-worker warning', f
     expect($application->settings()->firstOrFail()->blue_green_inactive_retention_seconds)->toBe(600);
 });
 
+it('saves a bounded all-healthy blue-green replica count', function () {
+    $this->actingAs(User::factory()->create());
+    $application = makeBlueGreenInactiveRetirementApplication();
+
+    Livewire::test(Advanced::class, ['application' => $application])
+        ->assertSee('Promotion requires every configured replica')
+        ->set('blueGreenReplicaCount', 3)
+        ->call('saveBlueGreenReplicaCount')
+        ->assertHasNoErrors()
+        ->assertDispatched('success')
+        ->assertDispatched('configurationChanged');
+
+    expect($application->settings()->firstOrFail()->blue_green_replica_count)->toBe(3);
+});
+
+it('rejects a blue-green replica count outside the bounded interval', function (int $replicas, string $rule) {
+    $this->actingAs(User::factory()->create());
+    $application = makeBlueGreenInactiveRetirementApplication();
+
+    Livewire::test(Advanced::class, ['application' => $application])
+        ->set('blueGreenReplicaCount', $replicas)
+        ->call('saveBlueGreenReplicaCount')
+        ->assertHasErrors(['replicaCount' => [$rule]]);
+})->with([
+    'zero' => [0, 'min'],
+    'above maximum' => [33, 'max'],
+]);
+
 it('rejects retention outside the bounded interval', function (int $seconds, string $rule) {
     $this->actingAs(User::factory()->create());
     $application = makeBlueGreenInactiveRetirementApplication();

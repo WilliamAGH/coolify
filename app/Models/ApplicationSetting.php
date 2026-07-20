@@ -51,6 +51,7 @@ use RuntimeException;
         'docker_images_to_keep' => ['type' => 'integer'],
         'stop_grace_period' => ['type' => 'integer', 'nullable' => true],
         'blue_green_inactive_retention_seconds' => ['type' => 'integer'],
+        'blue_green_replica_count' => ['type' => 'integer'],
         'is_blue_green_deployment_enabled' => ['type' => 'boolean'],
     ]
 )]
@@ -58,6 +59,7 @@ class ApplicationSetting extends Model
 {
     protected $attributes = [
         'blue_green_inactive_retention_seconds' => DEFAULT_BLUE_GREEN_INACTIVE_RETENTION_SECONDS,
+        'blue_green_replica_count' => DEFAULT_BLUE_GREEN_REPLICA_COUNT,
         'is_blue_green_deployment_enabled' => false,
     ];
 
@@ -82,6 +84,7 @@ class ApplicationSetting extends Model
         'docker_images_to_keep' => 'integer',
         'stop_grace_period' => 'integer',
         'blue_green_inactive_retention_seconds' => 'integer',
+        'blue_green_replica_count' => 'integer',
         'is_blue_green_deployment_enabled' => 'boolean',
         'is_log_drain_enabled' => 'boolean',
         'is_gpu_enabled' => 'boolean',
@@ -134,6 +137,7 @@ class ApplicationSetting extends Model
         'docker_images_to_keep',
         'stop_grace_period',
         'blue_green_inactive_retention_seconds',
+        'blue_green_replica_count',
         'is_blue_green_deployment_enabled',
     ];
 
@@ -285,6 +289,16 @@ class ApplicationSetting extends Model
         }
 
         return DEFAULT_BLUE_GREEN_INACTIVE_RETENTION_SECONDS;
+    }
+
+    public function blueGreenReplicaCount(): int
+    {
+        $replicaCount = (int) $this->blue_green_replica_count;
+        if ($replicaCount < MIN_BLUE_GREEN_REPLICA_COUNT || $replicaCount > MAX_BLUE_GREEN_REPLICA_COUNT) {
+            throw new RuntimeException('Blue-green replica count must be between 1 and 32.');
+        }
+
+        return $replicaCount;
     }
 
     public function isStatic(): Attribute

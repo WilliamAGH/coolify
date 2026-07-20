@@ -5,6 +5,7 @@ namespace App\Jobs;
 use App\Actions\Application\BlueGreen\BlueGreenComposeSidecarDeactivationPlan;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenLifecycleDatabaseLocks;
+use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
 use App\Actions\Application\BlueGreen\FindBlueGreenDeactivationFence;
 use App\Actions\Application\BlueGreen\RemoveBlueGreenComposeSidecars;
@@ -1062,6 +1063,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             application: $this->application,
             color: $claim->pendingColor,
             blueGreenLabels: $this->blueGreenComposeCandidateLabels($claim),
+            replicaCount: $this->application->settings->blueGreenReplicaCount(),
         );
     }
 
@@ -4188,9 +4190,50 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
             }
         }
 
+        if ($blueGreenClaim !== null && $this->application->build_pack !== 'dockercompose') {
+            $docker_compose = $this->renderGeneratedBlueGreenReplicaServices($docker_compose, $blueGreenClaim);
+        }
+
         $this->docker_compose = Yaml::dump($docker_compose, 10);
         $this->docker_compose_base64 = base64_encode($this->docker_compose);
         $this->execute_remote_command([executeInDocker($this->deployment_uuid, "echo '{$this->docker_compose_base64}' | base64 -d | tee {$this->workdir}/docker-compose.yaml > /dev/null"), 'hidden' => true]);
+    }
+
+    /** @param array<string, mixed> $compose @return array<string, mixed> */
+    private function renderGeneratedBlueGreenReplicaServices(
+        array $compose,
+        BlueGreenDeploymentClaim $claim,
+    ): array {
+        $replicaSet = new BlueGreenReplicaSet($this->application->settings->blueGreenReplicaCount());
+        if ($replicaSet->usesScalarCompatibilityPath()) {
+            return $compose;
+        }
+        $baseService = $compose['services'][$this->container_name] ?? null;
+        if (! is_array($baseService)) {
+            throw new DeploymentException('Blue-green replica rendering lost the generated candidate service.');
+        }
+
+        unset($compose['services'][$this->container_name]);
+        foreach ($replicaSet->indexes() as $replicaIndex) {
+            $serviceName = $replicaSet->serviceName($this->container_name, $replicaIndex);
+            $service = $baseService;
+            unset($service['container_name']);
+            $service['labels'] = array_values(array_unique([
+                ...(array) ($service['labels'] ?? []),
+                ...$replicaSet->labels($replicaIndex),
+            ]));
+            $service['environment'] = array_replace(
+                is_array($service['environment'] ?? null) ? $service['environment'] : [],
+                ['COOLIFY_CONTAINER_NAME' => $serviceName],
+            );
+            $network = $this->destination->network;
+            if (isset($service['networks'][$network]) && is_array($service['networks'][$network])) {
+                $service['networks'][$network]['aliases'] = [$serviceName];
+            }
+            $compose['services'][$serviceName] = $service;
+        }
+
+        return $compose;
     }
 
     private function generate_local_persistent_volumes()

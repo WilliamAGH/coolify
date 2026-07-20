@@ -6,6 +6,7 @@ use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 
 class ApplicationBlueGreenDeployment extends Model
 {
@@ -157,6 +158,11 @@ class ApplicationBlueGreenDeployment extends Model
     public function operationDeployment(): BelongsTo
     {
         return $this->belongsTo(ApplicationDeploymentQueue::class, 'operation_deployment_uuid', 'deployment_uuid');
+    }
+
+    public function replicas(): HasMany
+    {
+        return $this->hasMany(ApplicationBlueGreenReplica::class);
     }
 
     /** @return array<string, null> */

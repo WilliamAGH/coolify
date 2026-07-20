@@ -102,6 +102,19 @@
                 <x-forms.button canGate="update" :canResource="$application" type="submit">Save</x-forms.button>
             </form>
             @if ($application->settings->is_blue_green_deployment_enabled)
+                <form class="flex items-end gap-2" wire:submit.prevent='saveBlueGreenReplicaCount'>
+                    <x-forms.input
+                        type="number"
+                        id="blueGreenReplicaCount"
+                        label="Blue-Green Replicas per Color"
+                        helper="Number of independently health-checked routed replicas in each color. Promotion requires every configured replica to be running, healthy, and release-proven. One replica preserves the legacy container and routing path. Range: {{ MIN_BLUE_GREEN_REPLICA_COUNT }}-{{ MAX_BLUE_GREEN_REPLICA_COUNT }}."
+                        min="{{ MIN_BLUE_GREEN_REPLICA_COUNT }}"
+                        max="{{ MAX_BLUE_GREEN_REPLICA_COUNT }}"
+                        canGate="update"
+                        :canResource="$application"
+                    />
+                    <x-forms.button canGate="update" :canResource="$application" type="submit">Save</x-forms.button>
+                </form>
                 <form class="flex items-end gap-2" wire:submit.prevent='saveBlueGreenInactiveRetention'>
                     <x-forms.input
                         type="number"
