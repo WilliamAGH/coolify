@@ -243,9 +243,10 @@ final class MarkBlueGreenRecoveryInterventionRequired
         string $operationUuid,
         int $generation,
     ): Builder {
+        $applicationId = (int) $state->application_id;
         $query = ApplicationDeploymentQueue::query()
             ->whereKey($deployment->getKey())
-            ->where('application_id', $state->application_id)
+            ->where('application_id', (string) $applicationId)
             ->where('deployment_uuid', $operationUuid)
             ->where('destination_id', $state->standalone_docker_id)
             ->where('pull_request_id', 0)
@@ -260,12 +261,11 @@ final class MarkBlueGreenRecoveryInterventionRequired
             ->where('blue_green_previous_container_id', $state->operation_previous_container_id)
             ->where('blue_green_candidate_container_id', $state->operation_candidate_container_id)
             ->where('blue_green_rollback_managed_filename', $state->operation_rollback_managed_filename)
-            ->whereHas('application')
-            ->whereExists(function ($stateQuery) use ($state, $operationUuid, $generation): void {
+            ->whereExists(function ($stateQuery) use ($state, $applicationId, $operationUuid, $generation): void {
                 $stateQuery->selectRaw('1')
                     ->from('application_blue_green_deployments as reconciliation_owner')
                     ->where('reconciliation_owner.id', $state->id)
-                    ->whereColumn('reconciliation_owner.application_id', 'application_deployment_queues.application_id')
+                    ->where('reconciliation_owner.application_id', $applicationId)
                     ->where('reconciliation_owner.standalone_docker_id', $state->standalone_docker_id)
                     ->where('reconciliation_owner.phase', $state->phase->value)
                     ->where('reconciliation_owner.supersession_generation', $generation)
@@ -273,6 +273,7 @@ final class MarkBlueGreenRecoveryInterventionRequired
                     ->whereNull('reconciliation_owner.deactivation_operation_id')
                     ->whereNull('reconciliation_owner.deactivation_started_at');
             });
+        $query = BlueGreenLifecycleDatabaseLocks::constrainLiveApplication($query, $applicationId);
 
         return BlueGreenLifecycleDatabaseLocks::constrainQueueStatus($query, $state->phase);
     }

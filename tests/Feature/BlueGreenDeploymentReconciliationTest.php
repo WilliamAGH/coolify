@@ -99,6 +99,23 @@ it('atomically marks an unsafe stale preparation as requiring intervention', fun
     );
 });
 
+it('marks an exact queue owner with PostgreSQL-compatible application predicates', function (): void {
+    Notification::fake();
+    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
+
+    $recorded = MarkBlueGreenRecoveryInterventionRequired::run(
+        $scenario->state->id,
+        BlueGreenRecoveryScenario::OPERATION_UUID,
+        1,
+    );
+
+    expect($recorded)->toBeTrue()
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
+        ->and($scenario->deployment->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
+        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value)
+        ->and($scenario->deployment->fresh()->finished_at)->not->toBeNull();
+});
+
 it('leaves a newer supersession generation untouched', function (): void {
     $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
     $scenario->state->update(['supersession_generation' => 2]);
@@ -113,6 +130,25 @@ it('leaves a newer supersession generation untouched', function (): void {
         ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
         ->and($scenario->deployment->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
         ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
+});
+
+it('does not mark a changed queue owner as failed', function (): void {
+    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
+    $scenario->deployment->update([
+        'blue_green_topology_digest' => hash('sha256', 'changed-queue-owner'),
+    ]);
+
+    $recorded = MarkBlueGreenRecoveryInterventionRequired::run(
+        $scenario->state->id,
+        BlueGreenRecoveryScenario::OPERATION_UUID,
+        1,
+    );
+
+    expect($recorded)->toBeFalse()
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
+        ->and($scenario->deployment->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
+        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+        ->and($scenario->deployment->fresh()->finished_at)->toBeNull();
 });
 
 it('leaves a deactivation-owned state untouched', function (): void {
