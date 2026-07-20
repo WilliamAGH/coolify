@@ -245,7 +245,7 @@ COPY docker/coolify-terminal/package*.json /terminal/
 RUN apk add --no-cache --virtual .terminal-build-deps npm make g++ python3 && \
     npm ci --prefix /terminal && \
     npm rebuild node-pty --prefix /terminal --update-binary && \
-    apk del .terminal-build-deps && \
+    apk del --no-cache .terminal-build-deps && \
     rm -rf /root/.npm
 COPY docker/coolify-terminal/terminal-server.js /terminal/terminal-server.js
 COPY docker/coolify-terminal/terminal-utils.js /terminal/terminal-utils.js
