@@ -1,182 +1,151 @@
 <?php
 
 use App\Actions\User\DeleteUserResources;
+use App\Models\Application;
+use App\Models\Environment;
+use App\Models\PrivateKey;
+use App\Models\Project;
 use App\Models\Server;
+use App\Models\Service;
+use App\Models\StandaloneDocker;
+use App\Models\StandalonePostgresql;
 use App\Models\Team;
 use App\Models\User;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Storage;
+use Tests\TestCase;
 
-beforeEach(function () {
-    // Mock user
-    $this->user = Mockery::mock(User::class);
-    $this->user->shouldReceive('getAttribute')->with('id')->andReturn(1);
-    $this->user->shouldReceive('getAttribute')->with('email')->andReturn('test@example.com');
-});
+uses(TestCase::class, RefreshDatabase::class);
 
-afterEach(function () {
-    Mockery::close();
-});
+function deleteUserResourcesTeam(User $user, string $role, ?User $otherMember = null): Team
+{
+    $team = Team::factory()->create();
+    $team->members()->attach($user, ['role' => $role]);
+
+    if ($otherMember !== null) {
+        $team->members()->attach($otherMember, ['role' => 'member']);
+    }
+
+    return $team;
+}
+
+/** @return array{application: Application, database: StandalonePostgresql, service: Service} */
+function deleteUserResourcesForTeam(Team $team): array
+{
+    Storage::fake('ssh-keys');
+    $privateKey = PrivateKey::create([
+        'name' => 'User deletion resource test key '.fake()->uuid(),
+        'private_key' => generateSSHKey('ed25519')['private'],
+        'team_id' => $team->id,
+    ]);
+    $server = Server::factory()->create([
+        'team_id' => $team->id,
+        'private_key_id' => $privateKey->id,
+    ]);
+    $destination = StandaloneDocker::query()->where('server_id', $server->id)->firstOrFail();
+    $project = Project::factory()->create(['team_id' => $team->id]);
+    $environment = Environment::factory()->create(['project_id' => $project->id]);
+    $application = Application::factory()->create([
+        'environment_id' => $environment->id,
+        'destination_id' => $destination->id,
+        'destination_type' => $destination->getMorphClass(),
+    ]);
+    $service = Service::factory()->create([
+        'server_id' => $server->id,
+        'environment_id' => $environment->id,
+        'destination_id' => $destination->id,
+        'destination_type' => $destination->getMorphClass(),
+    ]);
+    $database = StandalonePostgresql::withoutEvents(fn (): StandalonePostgresql => StandalonePostgresql::create([
+        'uuid' => fake()->uuid(),
+        'name' => 'user-deletion-resource-db-'.fake()->uuid(),
+        'postgres_password' => 'password',
+        'environment_id' => $environment->id,
+        'destination_id' => $destination->id,
+        'destination_type' => $destination->getMorphClass(),
+    ]));
+
+    return compact('application', 'database', 'service');
+}
 
 it('only collects resources from teams where user is the sole member', function () {
-    // Mock owned team where user is the ONLY member (will be deleted)
-    $ownedTeamPivot = (object) ['role' => 'owner'];
-    $ownedTeam = Mockery::mock(Team::class);
-    $ownedTeam->shouldReceive('getAttribute')->with('id')->andReturn(1);
-    $ownedTeam->shouldReceive('getAttribute')->with('pivot')->andReturn($ownedTeamPivot);
-    $ownedTeam->shouldReceive('getAttribute')->with('members')->andReturn(collect([$this->user]));
-    $ownedTeam->shouldReceive('setAttribute')->andReturnSelf();
-    $ownedTeam->pivot = $ownedTeamPivot;
-    $ownedTeam->members = collect([$this->user]);
+    $user = User::factory()->create();
+    $soleTeam = deleteUserResourcesTeam($user, 'owner');
+    $memberTeam = deleteUserResourcesTeam($user, 'member', User::factory()->create());
 
-    // Mock member team (user is NOT owner)
-    $memberTeamPivot = (object) ['role' => 'member'];
-    $memberTeam = Mockery::mock(Team::class);
-    $memberTeam->shouldReceive('getAttribute')->with('id')->andReturn(2);
-    $memberTeam->shouldReceive('getAttribute')->with('pivot')->andReturn($memberTeamPivot);
-    $memberTeam->shouldReceive('getAttribute')->with('members')->andReturn(collect([$this->user]));
-    $memberTeam->shouldReceive('setAttribute')->andReturnSelf();
-    $memberTeam->pivot = $memberTeamPivot;
-    $memberTeam->members = collect([$this->user]);
+    $soleResources = deleteUserResourcesForTeam($soleTeam);
+    deleteUserResourcesForTeam($memberTeam);
 
-    // Mock servers for owned team
-    $ownedServer = Mockery::mock(Server::class);
-    $ownedServer->shouldReceive('applications')->andReturn(collect([
-        (object) ['id' => 1, 'name' => 'app1'],
-    ]));
-    $ownedServer->shouldReceive('databases')->andReturn(collect([
-        (object) ['id' => 1, 'name' => 'db1'],
-    ]));
-    $ownedServer->shouldReceive('services->get')->andReturn(collect([
-        (object) ['id' => 1, 'name' => 'service1'],
-    ]));
+    $preview = (new DeleteUserResources($user, true))->getResourcesPreview();
 
-    // Mock teams relationship
-    $teamsRelation = Mockery::mock();
-    $teamsRelation->shouldReceive('get')->andReturn(collect([$ownedTeam, $memberTeam]));
-    $this->user->shouldReceive('teams')->andReturn($teamsRelation);
-
-    // Mock servers relationship for owned team
-    $ownedServersRelation = Mockery::mock();
-    $ownedServersRelation->shouldReceive('get')->andReturn(collect([$ownedServer]));
-    $ownedTeam->shouldReceive('servers')->andReturn($ownedServersRelation);
-
-    // Execute
-    $action = new DeleteUserResources($this->user, true);
-    $preview = $action->getResourcesPreview();
-
-    // Assert: Should only include resources from owned team where user is sole member
-    expect($preview['applications'])->toHaveCount(1);
-    expect($preview['applications']->first()->id)->toBe(1);
-    expect($preview['applications']->first()->name)->toBe('app1');
-
-    expect($preview['databases'])->toHaveCount(1);
-    expect($preview['databases']->first()->id)->toBe(1);
-
-    expect($preview['services'])->toHaveCount(1);
-    expect($preview['services']->first()->id)->toBe(1);
+    expect($preview['applications'])->toHaveCount(1)
+        ->and($preview['applications']->first()->id)->toBe($soleResources['application']->id)
+        ->and($preview['databases'])->toHaveCount(1)
+        ->and($preview['databases']->first()->id)->toBe($soleResources['database']->id)
+        ->and($preview['services'])->toHaveCount(1)
+        ->and($preview['services']->first()->id)->toBe($soleResources['service']->id);
 });
 
 it('does not collect resources when user is owner but team has other members', function () {
-    // Mock owned team with multiple members (will be transferred, not deleted)
-    $otherUser = Mockery::mock(User::class);
-    $otherUser->shouldReceive('getAttribute')->with('id')->andReturn(2);
+    $user = User::factory()->create();
+    $sharedTeam = deleteUserResourcesTeam($user, 'owner', User::factory()->create());
 
-    $ownedTeamPivot = (object) ['role' => 'owner'];
-    $ownedTeam = Mockery::mock(Team::class);
-    $ownedTeam->shouldReceive('getAttribute')->with('id')->andReturn(1);
-    $ownedTeam->shouldReceive('getAttribute')->with('pivot')->andReturn($ownedTeamPivot);
-    $ownedTeam->shouldReceive('getAttribute')->with('members')->andReturn(collect([$this->user, $otherUser]));
-    $ownedTeam->shouldReceive('setAttribute')->andReturnSelf();
-    $ownedTeam->pivot = $ownedTeamPivot;
-    $ownedTeam->members = collect([$this->user, $otherUser]);
+    deleteUserResourcesForTeam($sharedTeam);
 
-    // Mock teams relationship
-    $teamsRelation = Mockery::mock();
-    $teamsRelation->shouldReceive('get')->andReturn(collect([$ownedTeam]));
-    $this->user->shouldReceive('teams')->andReturn($teamsRelation);
+    $preview = (new DeleteUserResources($user, true))->getResourcesPreview();
 
-    // Execute
-    $action = new DeleteUserResources($this->user, true);
-    $preview = $action->getResourcesPreview();
-
-    // Assert: Should have no resources (team will be transferred, not deleted)
-    expect($preview['applications'])->toBeEmpty();
-    expect($preview['databases'])->toBeEmpty();
-    expect($preview['services'])->toBeEmpty();
+    expect($preview['applications'])->toBeEmpty()
+        ->and($preview['databases'])->toBeEmpty()
+        ->and($preview['services'])->toBeEmpty();
 });
 
 it('does not collect resources when user is only a member of teams', function () {
-    // Mock member team (user is NOT owner)
-    $memberTeamPivot = (object) ['role' => 'member'];
-    $memberTeam = Mockery::mock(Team::class);
-    $memberTeam->shouldReceive('getAttribute')->with('id')->andReturn(1);
-    $memberTeam->shouldReceive('getAttribute')->with('pivot')->andReturn($memberTeamPivot);
-    $memberTeam->shouldReceive('getAttribute')->with('members')->andReturn(collect([$this->user]));
-    $memberTeam->shouldReceive('setAttribute')->andReturnSelf();
-    $memberTeam->pivot = $memberTeamPivot;
-    $memberTeam->members = collect([$this->user]);
+    $user = User::factory()->create();
+    $memberTeam = deleteUserResourcesTeam($user, 'member');
 
-    // Mock teams relationship
-    $teamsRelation = Mockery::mock();
-    $teamsRelation->shouldReceive('get')->andReturn(collect([$memberTeam]));
-    $this->user->shouldReceive('teams')->andReturn($teamsRelation);
+    deleteUserResourcesForTeam($memberTeam);
 
-    // Execute
-    $action = new DeleteUserResources($this->user, true);
-    $preview = $action->getResourcesPreview();
+    $preview = (new DeleteUserResources($user, true))->getResourcesPreview();
 
-    // Assert: Should have no resources
-    expect($preview['applications'])->toBeEmpty();
-    expect($preview['databases'])->toBeEmpty();
-    expect($preview['services'])->toBeEmpty();
+    expect($preview['applications'])->toBeEmpty()
+        ->and($preview['databases'])->toBeEmpty()
+        ->and($preview['services'])->toBeEmpty();
 });
 
-it('collects resources only from teams where user is sole member', function () {
-    // Mock first team: user is sole member (will be deleted)
-    $ownedTeam1Pivot = (object) ['role' => 'owner'];
-    $ownedTeam1 = Mockery::mock(Team::class);
-    $ownedTeam1->shouldReceive('getAttribute')->with('id')->andReturn(1);
-    $ownedTeam1->shouldReceive('getAttribute')->with('pivot')->andReturn($ownedTeam1Pivot);
-    $ownedTeam1->shouldReceive('getAttribute')->with('members')->andReturn(collect([$this->user]));
-    $ownedTeam1->shouldReceive('setAttribute')->andReturnSelf();
-    $ownedTeam1->pivot = $ownedTeam1Pivot;
-    $ownedTeam1->members = collect([$this->user]);
+it('collects resources only from teams where user is sole member across multiple teams', function () {
+    $user = User::factory()->create();
+    $soleTeam = deleteUserResourcesTeam($user, 'owner');
+    $sharedTeam = deleteUserResourcesTeam($user, 'owner', User::factory()->create());
 
-    // Mock second team: user is owner but has other members (will be transferred)
-    $otherUser = Mockery::mock(User::class);
-    $otherUser->shouldReceive('getAttribute')->with('id')->andReturn(2);
+    $soleResources = deleteUserResourcesForTeam($soleTeam);
+    deleteUserResourcesForTeam($sharedTeam);
 
-    $ownedTeam2Pivot = (object) ['role' => 'owner'];
-    $ownedTeam2 = Mockery::mock(Team::class);
-    $ownedTeam2->shouldReceive('getAttribute')->with('id')->andReturn(2);
-    $ownedTeam2->shouldReceive('getAttribute')->with('pivot')->andReturn($ownedTeam2Pivot);
-    $ownedTeam2->shouldReceive('getAttribute')->with('members')->andReturn(collect([$this->user, $otherUser]));
-    $ownedTeam2->shouldReceive('setAttribute')->andReturnSelf();
-    $ownedTeam2->pivot = $ownedTeam2Pivot;
-    $ownedTeam2->members = collect([$this->user, $otherUser]);
+    $preview = (new DeleteUserResources($user, true))->getResourcesPreview();
 
-    // Mock server for team 1 (sole member - will be deleted)
-    $server1 = Mockery::mock(Server::class);
-    $server1->shouldReceive('applications')->andReturn(collect([
-        (object) ['id' => 1, 'name' => 'app1'],
-    ]));
-    $server1->shouldReceive('databases')->andReturn(collect([]));
-    $server1->shouldReceive('services->get')->andReturn(collect([]));
+    expect($preview['applications'])->toHaveCount(1)
+        ->and($preview['applications']->first()->id)->toBe($soleResources['application']->id);
+});
 
-    // Mock teams relationship
-    $teamsRelation = Mockery::mock();
-    $teamsRelation->shouldReceive('get')->andReturn(collect([$ownedTeam1, $ownedTeam2]));
-    $this->user->shouldReceive('teams')->andReturn($teamsRelation);
+it('includes soft-deleted applications from sole-member teams in the preview', function () {
+    $user = User::factory()->create();
+    $soleTeam = deleteUserResourcesTeam($user, 'owner');
+    $resources = deleteUserResourcesForTeam($soleTeam);
+    $resources['application']->delete();
 
-    // Mock servers for team 1
-    $servers1Relation = Mockery::mock();
-    $servers1Relation->shouldReceive('get')->andReturn(collect([$server1]));
-    $ownedTeam1->shouldReceive('servers')->andReturn($servers1Relation);
+    $preview = (new DeleteUserResources($user, true))->getResourcesPreview();
 
-    // Execute
-    $action = new DeleteUserResources($this->user, true);
-    $preview = $action->getResourcesPreview();
+    expect($preview['applications'])->toHaveCount(1)
+        ->and($preview['applications']->first()->id)->toBe($resources['application']->id);
+});
 
-    // Assert: Should only include resources from team 1 (sole member)
-    expect($preview['applications'])->toHaveCount(1);
-    expect($preview['applications']->first()->id)->toBe(1);
+it('reports zero deletions in dry-run execution', function () {
+    $user = User::factory()->create();
+    $soleTeam = deleteUserResourcesTeam($user, 'owner');
+    deleteUserResourcesForTeam($soleTeam);
+
+    expect((new DeleteUserResources($user, true))->execute())->toBe([
+        'applications' => 0,
+        'databases' => 0,
+        'services' => 0,
+    ]);
 });

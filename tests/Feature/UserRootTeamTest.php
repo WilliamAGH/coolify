@@ -101,8 +101,8 @@ it('refuses direct user deletion before any mutation when blue-green permanent d
     $user = User::factory()->create();
     ['application' => $application, 'destination' => $destination, 'team' => $team] = BlueGreenDeactivationScenario::context();
     $team->members()->attach($user->id, ['role' => 'owner']);
-    BlueGreenDeactivationScenario::enableBlueGreen($application);
-    $state = BlueGreenDeactivationScenario::idleState($application, $destination);
+    $application->settings()->update(['is_blue_green_deployment_enabled' => true]);
+    $state = BlueGreenDeactivationScenario::routeLessState($application, $destination);
     Process::fake();
 
     expect(fn () => $user->delete())
@@ -120,8 +120,8 @@ it('refuses direct deletion for a sole non-owner team before preserving its blue
     $user = User::factory()->create();
     ['application' => $application, 'destination' => $destination, 'team' => $team] = BlueGreenDeactivationScenario::context();
     $team->members()->attach($user->id, ['role' => 'admin']);
-    BlueGreenDeactivationScenario::enableBlueGreen($application);
-    $state = BlueGreenDeactivationScenario::idleState($application, $destination);
+    $application->settings()->update(['is_blue_green_deployment_enabled' => true]);
+    $state = BlueGreenDeactivationScenario::routeLessState($application, $destination);
     Process::fake();
 
     expect(fn () => $user->delete())

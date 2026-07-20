@@ -51,14 +51,16 @@ class DeleteUserResources
             // Only delete resources from teams where user is the ONLY member
             // These teams will be fully deleted
 
+            $applications = $applications->merge(
+                Application::withTrashed()
+                    ->whereHas('environment.project', fn (Builder $query): Builder => $query->where('team_id', $team->id))
+                    ->get(),
+            );
+
             // Get all servers for this team
             $servers = $team->servers()->get();
 
             foreach ($servers as $server) {
-                // Get applications (custom method returns Collection)
-                $serverApplications = $server->applications();
-                $applications = $applications->merge($serverApplications);
-
                 // Get databases (custom method returns Collection)
                 $serverDatabases = $server->databases();
                 $databases = $databases->merge($serverDatabases);

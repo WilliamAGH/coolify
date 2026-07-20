@@ -28,8 +28,8 @@ it('refuses unsafe blue-green administrative deletion before any mutation or rem
     ['application' => $application, 'destination' => $destination, 'team' => $team] = BlueGreenDeactivationScenario::context();
     $user = User::factory()->create();
     $team->members()->attach($user->id, ['role' => 'owner']);
-    BlueGreenDeactivationScenario::enableBlueGreen($application);
-    $state = BlueGreenDeactivationScenario::idleState($application, $destination);
+    $application->settings()->update(['is_blue_green_deployment_enabled' => true]);
+    $state = BlueGreenDeactivationScenario::routeLessState($application, $destination);
     Process::fake();
 
     $this->artisan('admin:delete-user', [
@@ -62,6 +62,35 @@ it('preserves servers belonging to a shared team for owners and admins', functio
         ->and($action->execute())->toBe(['servers' => 0])
         ->and(Server::query()->whereKey($server->id)->exists())->toBeTrue();
 })->with(['owner', 'admin']);
+
+it('promotes the replacement admin and preserves shared resources when deleting an owner', function () {
+    $team = Team::factory()->create();
+    $user = User::factory()->create();
+    $replacementOwner = User::factory()->create();
+    $team->members()->attach($user->id, ['role' => 'owner']);
+    $team->members()->attach($replacementOwner->id, ['role' => 'admin']);
+    $server = Server::factory()->create(['team_id' => $team->id]);
+    session(['currentTeam' => $team]);
+    $replacementToken = $replacementOwner->createToken('replacement-admin-token', ['write'])->accessToken;
+    Process::fake();
+
+    $this->artisan('admin:delete-user', [
+        'email' => $user->email,
+        '--skip-resources' => true,
+        '--skip-stripe' => true,
+    ])
+        ->expectsConfirmation('Do you want to continue with the deletion process?', 'yes')
+        ->expectsConfirmation('Are you sure you want to proceed with these team changes?', 'yes')
+        ->expectsQuestion('Confirmation', "DELETE {$user->email}")
+        ->assertExitCode(0);
+
+    expect(User::query()->whereKey($user->id)->doesntExist())->toBeTrue()
+        ->and(Team::query()->whereKey($team->id)->exists())->toBeTrue()
+        ->and(Server::query()->whereKey($server->id)->exists())->toBeTrue()
+        ->and($team->members()->whereKey($replacementOwner->id)->first()?->pivot?->role)->toBe('owner')
+        ->and($replacementToken->fresh())->toBeNull();
+    Process::assertNothingRan();
+});
 
 it('fails closed when a sole team member is not an owner', function (string $role) {
     $team = Team::factory()->create();
@@ -289,6 +318,71 @@ it('does not bypass or release a competing deletion lock after the user email ch
     expect($competingLock->isOwnedByCurrentProcess())->toBeTrue();
     Process::assertNothingRan();
     $competingLock->release();
+});
+
+it('leaves identity roles claims locks and authorization unchanged when final confirmation is declined', function () {
+    $user = User::factory()->create();
+    $replacementOwner = User::factory()->create();
+    $sharedTeam = Team::factory()->create();
+    $sharedTeam->attachMember($user, 'owner');
+    $sharedTeam->attachMember($replacementOwner, 'admin');
+    session(['currentTeam' => $sharedTeam]);
+    $user->load('teams');
+
+    $token = $user->createToken('declined-deletion-proof', ['read'])->accessToken;
+    $userAttributesBefore = $user->fresh()->getAttributes();
+    $membershipsBefore = DB::table('team_user')
+        ->where('user_id', $user->id)
+        ->orderBy('team_id')
+        ->get(['team_id', 'user_id', 'role'])
+        ->map(fn (object $membership): array => (array) $membership)
+        ->all();
+    $authorizationBefore = collect(['view', 'update', 'delete', 'manageMembers'])
+        ->mapWithKeys(fn (string $ability): array => [$ability => $user->can($ability, $sharedTeam)])
+        ->all();
+    Process::fake();
+
+    $this->artisan('admin:delete-user', [
+        'email' => $user->email,
+        '--skip-resources' => true,
+        '--skip-stripe' => true,
+    ])
+        ->expectsConfirmation('Do you want to continue with the deletion process?', 'yes')
+        ->expectsConfirmation('Are you sure you want to proceed with these team changes?', 'yes')
+        ->expectsQuestion('Confirmation', 'DECLINE')
+        ->expectsOutputToContain('User deletion cancelled before the canonical transaction.')
+        ->assertExitCode(0);
+
+    $persistedUser = User::query()->findOrFail($user->id)->load('teams');
+    session(['currentTeam' => $sharedTeam->fresh()]);
+    $membershipsAfter = DB::table('team_user')
+        ->where('user_id', $user->id)
+        ->orderBy('team_id')
+        ->get(['team_id', 'user_id', 'role'])
+        ->map(fn (object $membership): array => (array) $membership)
+        ->all();
+    $authorizationAfter = collect(['view', 'update', 'delete', 'manageMembers'])
+        ->mapWithKeys(fn (string $ability): array => [$ability => $persistedUser->can($ability, $sharedTeam)])
+        ->all();
+    $probeLock = Cache::lock(AdminDeleteUser::deletionLockKey($user->id), 60);
+
+    expect($persistedUser->getAttributes())->toBe($userAttributesBefore)
+        ->and($membershipsAfter)->toBe($membershipsBefore)
+        ->and($authorizationAfter)->toBe($authorizationBefore)
+        ->and($authorizationAfter)->toBe([
+            'view' => true,
+            'update' => true,
+            'delete' => true,
+            'manageMembers' => true,
+        ])
+        ->and(DB::table('team_user')->where('role', 'like', 'user-deletion:%')->count())->toBe(0)
+        ->and($token->fresh())->not->toBeNull()
+        ->and((int) $token->fresh()?->team_id)->toBe($sharedTeam->id)
+        ->and($token->fresh()?->abilities)->toBe(['read'])
+        ->and($probeLock->get())->toBeTrue();
+
+    $probeLock->release();
+    Process::assertNothingRan();
 });
 
 it('keeps canonical deletion atomic when its cache lock expires during the transaction', function () {

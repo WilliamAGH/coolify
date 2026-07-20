@@ -35,9 +35,14 @@ class DeleteUserTeams
             $userRole = $team->pivot->role;
             $memberCount = $team->members->count();
 
-            if ($memberCount === 1) {
-                // User is alone in the team - delete it
+            if ($memberCount === 1 && $userRole === 'owner') {
+                // Only a sole owner may delete the team and its remaining configuration.
                 $teamsToDelete->push($team);
+            } elseif ($memberCount === 1) {
+                $edgeCases->push([
+                    'team' => $team,
+                    'reason' => 'Sole remaining team member is not an owner. Assign an owner before removing this member or delete the team through an authorized owner workflow.',
+                ]);
             } elseif ($userRole === 'owner') {
                 // Check if there are other owners
                 $otherOwners = $team->members

@@ -152,29 +152,32 @@ class User extends Authenticatable implements SendsEmail
                     $userRole = $team->members->where('id', $user->id)->first()?->pivot?->role;
 
                     if ($userRole === 'owner') {
-                        $found_other_owner_or_admin = $team->members->filter(function ($member) use ($user) {
-                            return ($member->pivot->role === 'owner' || $member->pivot->role === 'admin') && $member->id !== $user->id;
-                        })->first();
+                        $otherOwner = $team->members->first(function ($member) use ($user) {
+                            return $member->pivot->role === 'owner' && $member->id !== $user->id;
+                        });
 
-                        if ($found_other_owner_or_admin) {
+                        if ($otherOwner) {
                             $team->detachMember($user);
 
                             continue;
-                        } else {
-                            $found_other_member_who_is_not_owner = $team->members->filter(function ($member) {
-                                return $member->pivot->role === 'member';
-                            })->first();
-
-                            if ($found_other_member_who_is_not_owner) {
-                                $team->updateMemberRole($found_other_member_who_is_not_owner, 'owner');
-                                RevokeUserTeamTokens::forUserTeam($found_other_member_who_is_not_owner, $team->id);
-                                $team->detachMember($user);
-                            } else {
-                                static::finalizeTeamDeletion($user, $team);
-                            }
-
-                            continue;
                         }
+
+                        $replacementOwner = $team->members->first(function ($member) use ($user) {
+                            return $member->pivot->role === 'admin' && $member->id !== $user->id;
+                        });
+                        $replacementOwner ??= $team->members->first(function ($member) use ($user) {
+                            return $member->pivot->role === 'member' && $member->id !== $user->id;
+                        });
+
+                        if ($replacementOwner) {
+                            $team->updateMemberRole($replacementOwner, 'owner');
+                            RevokeUserTeamTokens::forUserTeam($replacementOwner, $team->id);
+                            $team->detachMember($user);
+                        } else {
+                            static::finalizeTeamDeletion($user, $team);
+                        }
+
+                        continue;
                     } else {
                         $team->detachMember($user);
                     }
