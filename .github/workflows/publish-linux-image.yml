@@ -785,7 +785,7 @@ jobs:
         with:
           exit-code: '1'
           format: json
-          input: linux-image/${{ inputs.artifact_name }}-${{ matrix.arch }}.oci.tar
+          input: linux-image/layout-${{ matrix.arch }}
           output: linux-image/${{ inputs.artifact_name }}-${{ matrix.arch }}.secrets.json
           scan-type: image
           scanners: secret

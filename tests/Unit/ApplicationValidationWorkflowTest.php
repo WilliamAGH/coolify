@@ -1,6 +1,115 @@
 <?php
 
+use Symfony\Component\Process\Process;
 use Symfony\Component\Yaml\Yaml;
+
+/**
+ * @return array<string, mixed>
+ */
+function applicationValidationWorkflow(): array
+{
+    return Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
+}
+
+/**
+ * @param  array<string, mixed>  $workflow
+ * @return array<string, mixed>
+ */
+function applicationValidationRequiredAggregateStep(array $workflow): array
+{
+    $step = collect($workflow['jobs']['required']['steps'] ?? [])
+        ->firstWhere('name', 'Require every generic validation job');
+
+    if (! is_array($step)) {
+        throw new RuntimeException('The required application validation aggregate step is missing.');
+    }
+
+    return $step;
+}
+
+/**
+ * @return array<string, string|false>
+ */
+function applicationValidationRequiredEnvironment(string $eventName): array
+{
+    return [
+        'BLUE_GREEN_LIFECYCLE_RESULT' => 'success',
+        'BROWSER_RESULT' => 'success',
+        'EVENT_NAME' => $eventName,
+        'FORMATTING_RESULT' => 'success',
+        'FORK_DEPLOY_RESULT' => 'success',
+        'NODE_RESULT' => 'success',
+        'PHP_RESULT' => 'success',
+        'TESTING_HOST_RUNTIME_RESULT' => $eventName === 'pull_request' ? 'success' : 'skipped',
+        'WORKFLOW_RESULT' => 'success',
+    ];
+}
+
+/**
+ * @param  array<string, string|false>  $environment
+ */
+function runApplicationValidationRequiredAggregate(array $environment): Process
+{
+    $step = applicationValidationRequiredAggregateStep(applicationValidationWorkflow());
+    $process = new Process(
+        ['bash', '-c', (string) ($step['run'] ?? '')],
+        dirname(__DIR__, 2),
+        $environment,
+    );
+    $process->run();
+
+    return $process;
+}
+
+/**
+ * @return array<string, array{string, string}>
+ */
+function applicationValidationGenericResultFailures(): array
+{
+    $cases = [];
+
+    foreach ([
+        'BLUE_GREEN_LIFECYCLE_RESULT',
+        'BROWSER_RESULT',
+        'FORMATTING_RESULT',
+        'FORK_DEPLOY_RESULT',
+        'NODE_RESULT',
+        'PHP_RESULT',
+        'WORKFLOW_RESULT',
+    ] as $variable) {
+        foreach (['failure', 'skipped', 'cancelled'] as $result) {
+            $cases["{$variable} is {$result}"] = [$variable, $result];
+        }
+    }
+
+    return $cases;
+}
+
+/**
+ * @return array<string, array{string, string}>
+ */
+function applicationValidationMissingOrEmptyEnvironmentCases(): array
+{
+    $cases = [];
+
+    foreach ([
+        'BLUE_GREEN_LIFECYCLE_RESULT',
+        'BROWSER_RESULT',
+        'EVENT_NAME',
+        'FORMATTING_RESULT',
+        'FORK_DEPLOY_RESULT',
+        'NODE_RESULT',
+        'PHP_RESULT',
+        'TESTING_HOST_RUNTIME_RESULT',
+        'WORKFLOW_RESULT',
+    ] as $variable) {
+        foreach (['missing', 'empty'] as $state) {
+            $cases["{$variable} is {$state}"] = [$variable, $state];
+        }
+    }
+
+    return $cases;
+}
 
 /**
  * @param  array<string, mixed>  $workflow
@@ -121,10 +230,108 @@ function applicationValidationWorkflowViolations(array $workflow): array
 }
 
 it('defines the required application validation contract', function () {
-    $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
+    $workflow = applicationValidationWorkflow();
 
     expect(applicationValidationWorkflowViolations($workflow))->toBe([]);
 });
+
+it('keeps the aggregate contract structurally connected to every selected result', function () {
+    $workflow = applicationValidationWorkflow();
+    $required = $workflow['jobs']['required'] ?? [];
+    $step = applicationValidationRequiredAggregateStep($workflow);
+    $phpStep = collect($workflow['jobs']['php']['steps'] ?? [])
+        ->firstWhere('name', 'Run release and version-consumer tests');
+
+    expect($required['if'] ?? null)->toBe('always()')
+        ->and($required['runs-on'] ?? null)->toBe('ubuntu-24.04')
+        ->and($required['needs'] ?? null)->toBe([
+            'blue-green-lifecycle',
+            'php',
+            'browser',
+            'formatting',
+            'fork-deploy',
+            'node',
+            'testing-host-runtime',
+            'workflow-and-shell',
+        ])
+        ->and($step['shell'] ?? null)->toBe('bash')
+        ->and($step['env'] ?? null)->toBe([
+            'BLUE_GREEN_LIFECYCLE_RESULT' => '${{ needs.blue-green-lifecycle.result }}',
+            'BROWSER_RESULT' => '${{ needs.browser.result }}',
+            'EVENT_NAME' => '${{ github.event_name }}',
+            'FORMATTING_RESULT' => '${{ needs.formatting.result }}',
+            'FORK_DEPLOY_RESULT' => '${{ needs.fork-deploy.result }}',
+            'NODE_RESULT' => '${{ needs.node.result }}',
+            'PHP_RESULT' => '${{ needs.php.result }}',
+            'TESTING_HOST_RUNTIME_RESULT' => '${{ needs.testing-host-runtime.result }}',
+            'WORKFLOW_RESULT' => '${{ needs.workflow-and-shell.result }}',
+        ])
+        ->and((string) ($phpStep['run'] ?? ''))
+        ->toContain('tests/Unit/ApplicationValidationWorkflowTest.php');
+});
+
+it('executes the actual aggregate script for successful pull requests and reusable calls', function (
+    string $eventName,
+): void {
+    $process = runApplicationValidationRequiredAggregate(
+        applicationValidationRequiredEnvironment($eventName),
+    );
+
+    expect($process->isSuccessful())->toBeTrue($process->getErrorOutput());
+})->with([
+    'pull request' => ['pull_request'],
+    'workflow call' => ['workflow_call'],
+]);
+
+it('fails the actual aggregate script for every non-successful generic result', function (
+    string $variable,
+    string $result,
+): void {
+    $environment = applicationValidationRequiredEnvironment('pull_request');
+    $environment[$variable] = $result;
+
+    $process = runApplicationValidationRequiredAggregate($environment);
+
+    expect($process->isSuccessful())->toBeFalse();
+})->with(applicationValidationGenericResultFailures());
+
+it('requires testing-host success for pull requests', function (string $result): void {
+    $environment = applicationValidationRequiredEnvironment('pull_request');
+    $environment['TESTING_HOST_RUNTIME_RESULT'] = $result;
+
+    $process = runApplicationValidationRequiredAggregate($environment);
+
+    expect($process->isSuccessful())->toBeFalse();
+})->with([
+    'failure' => ['failure'],
+    'skipped' => ['skipped'],
+    'cancelled' => ['cancelled'],
+]);
+
+it('only allows a skipped testing-host result for reusable workflow calls', function (string $result): void {
+    $environment = applicationValidationRequiredEnvironment('workflow_call');
+    $environment['TESTING_HOST_RUNTIME_RESULT'] = $result;
+
+    $process = runApplicationValidationRequiredAggregate($environment);
+
+    expect($process->isSuccessful())->toBeFalse();
+})->with([
+    'success' => ['success'],
+    'failure' => ['failure'],
+    'cancelled' => ['cancelled'],
+]);
+
+it('fails closed when an aggregate environment value is missing or empty', function (
+    string $variable,
+    string $state,
+): void {
+    $environment = applicationValidationRequiredEnvironment('pull_request');
+    $environment[$variable] = $state === 'missing' ? false : '';
+
+    $process = runApplicationValidationRequiredAggregate($environment);
+
+    expect($process->isSuccessful())->toBeFalse();
+})->with(applicationValidationMissingOrEmptyEnvironmentCases());
 
 it('rejects renaming the protected branch validation context', function () {
     $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');

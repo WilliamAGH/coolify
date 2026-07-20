@@ -66,6 +66,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           php artisan test --compact \
+            tests/Unit/ApplicationValidationWorkflowTest.php \
             tests/Unit/CheckHelperImageJobTest.php \
             tests/Unit/CheckForUpdatesJobTest.php \
             tests/Unit/ProductionImageSupplyChainWorkflowTest.php \
@@ -403,6 +404,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Require every generic validation job
+        shell: bash
         env:
           BLUE_GREEN_LIFECYCLE_RESULT: ${{ needs.blue-green-lifecycle.result }}
           BROWSER_RESULT: ${{ needs.browser.result }}
