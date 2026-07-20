@@ -6,20 +6,26 @@ use App\Actions\Stripe\CancelSubscription;
 use App\Actions\User\DeleteUserResources;
 use App\Actions\User\DeleteUserServers;
 use App\Actions\User\DeleteUserTeams;
+use App\Models\Application;
+use App\Models\Service;
 use App\Models\User;
+use Illuminate\Cache\Lock;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
 
 class AdminDeleteUser extends Command
 {
+    private const LOCK_TTL_SECONDS = 86400;
+
     protected $signature = 'admin:delete-user {email}
                             {--dry-run : Preview what will be deleted without actually deleting}
                             {--skip-stripe : Skip Stripe subscription cancellation}
                             {--skip-resources : Skip resource deletion}
                             {--auto-confirm : Skip all confirmation prompts between phases}
-                            {--force : Bypass the lock check and force deletion (use with caution)}';
+                            {--force : Continue past non-lock safety warnings; active deletion locks are never bypassed}';
 
     protected $description = 'Delete a user with comprehensive resource cleanup and phase-by-phase confirmation (works on cloud and self-hosted)';
 
@@ -31,14 +37,20 @@ class AdminDeleteUser extends Command
 
     private User $user;
 
-    private $lock;
+    private ?Lock $lock = null;
+
+    private bool $lockAcquired = false;
+
+    private bool $databaseTransactionStarted = false;
 
     private array $deletionState = [
         'phase_1_overview' => false,
         'phase_2_resources' => false,
         'phase_3_servers' => false,
         'phase_4_teams' => false,
+        'phase_4_committed' => false,
         'phase_5_user_profile' => false,
+        'phase_5_committed' => false,
         'phase_6_stripe' => false,
         'db_committed' => false,
     ];
@@ -48,15 +60,14 @@ class AdminDeleteUser extends Command
         // Register signal handlers for graceful shutdown (Ctrl+C handling)
         $this->registerSignalHandlers();
 
-        $email = $this->argument('email');
+        $email = Str::lower((string) $this->argument('email'));
         $this->isDryRun = $this->option('dry-run');
         $this->skipStripe = $this->option('skip-stripe');
         $this->skipResources = $this->option('skip-resources');
         $force = $this->option('force');
 
         if ($force) {
-            $this->warn('⚠️  FORCE MODE - Lock check will be bypassed');
-            $this->warn('   Use this flag only if you are certain no other deletion is running');
+            $this->warn('⚠️  FORCE MODE - active deletion lock ownership is still required');
             $this->newLine();
         }
 
@@ -95,29 +106,36 @@ class AdminDeleteUser extends Command
             return 1;
         }
 
-        // Implement file lock to prevent concurrent deletions of the same user
-        $lockKey = "user_deletion_{$this->user->id}";
-        $this->lock = Cache::lock($lockKey, 600); // 10 minute lock
+        if (DB::transactionLevel() !== 0) {
+            $this->error('User deletion cannot run inside an existing database transaction.');
+            $this->error('Commit or roll back the caller transaction before retrying.');
 
-        if (! $force) {
-            if (! $this->lock->get()) {
-                $this->error('Another deletion process is already running for this user.');
-                $this->error('Use --force to bypass this lock (use with extreme caution).');
-                $this->logAction("Deletion blocked for user {$email}: Another process is already running");
+            return 1;
+        }
 
-                return 1;
-            }
-        } else {
-            // In force mode, try to get lock but continue even if it fails
-            if (! $this->lock->get()) {
-                $this->warn('⚠️  Lock exists but proceeding due to --force flag');
-                $this->warn('   There may be another deletion process running!');
-                $this->newLine();
-            }
+        $lockKey = self::deletionLockKey((int) $this->user->getKey());
+        $this->lock = Cache::lock($lockKey, self::LOCK_TTL_SECONDS);
+        $this->lockAcquired = (bool) $this->lock->get();
+
+        if (! $this->lockAcquired) {
+            $this->error('Another deletion process is already running for this user.');
+            $this->error('Active lock ownership cannot be bypassed, including with --force.');
+            $this->logAction("Deletion blocked for user {$email}: Another process owns the deletion lock");
+
+            return 1;
         }
 
         try {
             $this->logAction("Starting user deletion process for: {$email}");
+
+            try {
+                (new DeleteUserResources($this->user))->assertBlueGreenApplicationsReadyForPermanentDeletion();
+            } catch (\RuntimeException $exception) {
+                $this->error($exception->getMessage());
+                $this->logAction("User deletion refused for {$email}: {$exception->getMessage()}");
+
+                return 1;
+            }
 
             // Phase 1: Show User Overview (outside transaction)
             if (! $this->showUserOverview()) {
@@ -127,241 +145,115 @@ class AdminDeleteUser extends Command
             }
             $this->deletionState['phase_1_overview'] = true;
 
-            // If not dry run, wrap DB operations in a transaction
-            // NOTE: Stripe cancellations happen AFTER commit to avoid inconsistent state
-            if (! $this->isDryRun) {
-                try {
-                    DB::beginTransaction();
-
-                    // Phase 2: Delete Resources
-                    // WARNING: This triggers Docker container deletion via SSH which CANNOT be rolled back
-                    if (! $this->skipResources) {
-                        if (! $this->deleteResources()) {
-                            DB::rollBack();
-                            $this->displayErrorState('Phase 2: Resource Deletion');
-                            $this->error('❌ User deletion failed at resource deletion phase.');
-                            $this->warn('⚠️  Some Docker containers may have been deleted on remote servers and cannot be restored.');
-                            $this->displayRecoverySteps();
-
-                            return 1;
-                        }
-                    }
-                    $this->deletionState['phase_2_resources'] = true;
-
-                    // Confirmation to continue after Phase 2
-                    if (! $this->skipResources && ! $this->option('auto-confirm')) {
-                        $this->newLine();
-                        if (! $this->confirm('Phase 2 completed. Continue to Phase 3 (Delete Servers)?', true)) {
-                            DB::rollBack();
-                            $this->info('User deletion cancelled by operator after Phase 2.');
-                            $this->info('Database changes have been rolled back.');
-
-                            return 0;
-                        }
-                    }
-
-                    // Phase 3: Delete Servers
-                    // WARNING: This may trigger cleanup operations on remote servers which CANNOT be rolled back
-                    if (! $this->deleteServers()) {
-                        DB::rollBack();
-                        $this->displayErrorState('Phase 3: Server Deletion');
-                        $this->error('❌ User deletion failed at server deletion phase.');
-                        $this->warn('⚠️  Some server cleanup operations may have been performed and cannot be restored.');
-                        $this->displayRecoverySteps();
-
-                        return 1;
-                    }
-                    $this->deletionState['phase_3_servers'] = true;
-
-                    // Confirmation to continue after Phase 3
-                    if (! $this->option('auto-confirm')) {
-                        $this->newLine();
-                        if (! $this->confirm('Phase 3 completed. Continue to Phase 4 (Handle Teams)?', true)) {
-                            DB::rollBack();
-                            $this->info('User deletion cancelled by operator after Phase 3.');
-                            $this->info('Database changes have been rolled back.');
-
-                            return 0;
-                        }
-                    }
-
-                    // Phase 4: Handle Teams
-                    if (! $this->handleTeams()) {
-                        DB::rollBack();
-                        $this->displayErrorState('Phase 4: Team Handling');
-                        $this->error('❌ User deletion failed at team handling phase.');
-                        $this->displayRecoverySteps();
-
-                        return 1;
-                    }
-                    $this->deletionState['phase_4_teams'] = true;
-
-                    // Confirmation to continue after Phase 4
-                    if (! $this->option('auto-confirm')) {
-                        $this->newLine();
-                        if (! $this->confirm('Phase 4 completed. Continue to Phase 5 (Delete User Profile)?', true)) {
-                            DB::rollBack();
-                            $this->info('User deletion cancelled by operator after Phase 4.');
-                            $this->info('Database changes have been rolled back.');
-
-                            return 0;
-                        }
-                    }
-
-                    // Phase 5: Delete User Profile
-                    if (! $this->deleteUserProfile()) {
-                        DB::rollBack();
-                        $this->displayErrorState('Phase 5: User Profile Deletion');
-                        $this->error('❌ User deletion failed at user profile deletion phase.');
-                        $this->displayRecoverySteps();
-
-                        return 1;
-                    }
-                    $this->deletionState['phase_5_user_profile'] = true;
-
-                    // CRITICAL CONFIRMATION: Database commit is next (PERMANENT)
-                    if (! $this->option('auto-confirm')) {
-                        $this->newLine();
-                        $this->warn('⚠️  CRITICAL DECISION POINT');
-                        $this->warn('Next step: COMMIT database changes (PERMANENT and IRREVERSIBLE)');
-                        $this->warn('All resources, servers, teams, and user profile will be permanently deleted');
-                        $this->newLine();
-                        if (! $this->confirm('Phase 5 completed. Commit database changes? (THIS IS PERMANENT)', false)) {
-                            DB::rollBack();
-                            $this->info('User deletion cancelled by operator before commit.');
-                            $this->info('Database changes have been rolled back.');
-                            $this->warn('⚠️  Note: Some Docker containers may have been deleted on remote servers.');
-
-                            return 0;
-                        }
-                    }
-
-                    // Commit the database transaction
-                    DB::commit();
-                    $this->deletionState['db_committed'] = true;
-
-                    $this->newLine();
-                    $this->info('✅ Database operations completed successfully!');
-                    $this->info('✅ Transaction committed - database changes are now PERMANENT.');
-                    $this->logAction("Database deletion completed for: {$email}");
-
-                    // Confirmation to continue to Stripe (after commit)
-                    if (! $this->skipStripe && isCloud() && ! $this->option('auto-confirm')) {
-                        $this->newLine();
-                        $this->warn('⚠️  Database changes are committed (permanent)');
-                        $this->info('Next: Cancel Stripe subscriptions');
-                        if (! $this->confirm('Continue to Phase 6 (Cancel Stripe Subscriptions)?', true)) {
-                            $this->warn('User deletion stopped after database commit.');
-                            $this->error('⚠️  IMPORTANT: User deleted from database but Stripe subscriptions remain active!');
-                            $this->error('You must cancel subscriptions manually in Stripe Dashboard.');
-                            $this->error('Go to: https://dashboard.stripe.com/');
-                            $this->error('Search for: '.$email);
-
-                            return 1;
-                        }
-                    }
-
-                    // Phase 6: Cancel Stripe Subscriptions (AFTER DB commit)
-                    // This is done AFTER commit because Stripe API calls cannot be rolled back
-                    // If this fails, DB changes are already committed but subscriptions remain active
-                    if (! $this->skipStripe && isCloud()) {
-                        if (! $this->cancelStripeSubscriptions()) {
-                            $this->newLine();
-                            $this->error('═══════════════════════════════════════');
-                            $this->error('⚠️  CRITICAL: INCONSISTENT STATE DETECTED');
-                            $this->error('═══════════════════════════════════════');
-                            $this->error('✓ User data DELETED from database (committed)');
-                            $this->error('✗ Stripe subscription cancellation FAILED');
-                            $this->newLine();
-                            $this->displayErrorState('Phase 6: Stripe Cancellation (Post-Commit)');
-                            $this->newLine();
-                            $this->error('MANUAL ACTION REQUIRED:');
-                            $this->error('1. Go to Stripe Dashboard: https://dashboard.stripe.com/');
-                            $this->error('2. Search for customer email: '.$email);
-                            $this->error('3. Cancel all active subscriptions');
-                            $this->error('4. Check storage/logs/user-deletions.log for subscription IDs');
-                            $this->newLine();
-                            $this->logAction("INCONSISTENT STATE: User {$email} deleted but Stripe cancellation failed");
-
-                            return 1;
-                        }
-                    }
-                    $this->deletionState['phase_6_stripe'] = true;
-
-                    $this->newLine();
-                    $this->info('✅ User deletion completed successfully!');
-                    $this->logAction("User deletion completed for: {$email}");
-
-                } catch (\Exception $e) {
-                    DB::rollBack();
-                    $this->newLine();
-                    $this->error('═══════════════════════════════════════');
-                    $this->error('❌ EXCEPTION DURING USER DELETION');
-                    $this->error('═══════════════════════════════════════');
-                    $this->error('Exception: '.get_class($e));
-                    $this->error('Message: '.$e->getMessage());
-                    $this->error('File: '.$e->getFile().':'.$e->getLine());
-                    $this->newLine();
-
-                    if ($this->output->isVerbose()) {
-                        $this->error('Stack Trace:');
-                        $this->error($e->getTraceAsString());
-                        $this->newLine();
-                    } else {
-                        $this->info('Run with -v for full stack trace');
-                        $this->newLine();
-                    }
-
-                    $this->displayErrorState('Exception during execution');
-                    $this->displayRecoverySteps();
-
-                    $this->logAction("User deletion failed for {$email}: {$e->getMessage()} in {$e->getFile()}:{$e->getLine()}");
+            if (! $this->isDryRun && $this->skipResources) {
+                $resources = (new DeleteUserResources($this->user))->getResourcesPreview();
+                if ($resources['applications']->isNotEmpty()
+                    || $resources['databases']->isNotEmpty()
+                    || $resources['services']->isNotEmpty()) {
+                    $this->error('The --skip-resources option cannot be used because teams selected for deletion still contain resources.');
+                    $this->error('Retry without --skip-resources so the resources can be reviewed and deleted safely.');
 
                     return 1;
                 }
-            } else {
-                // Dry run mode - just run through the phases without transaction
-                // Phase 2: Delete Resources
-                if (! $this->skipResources) {
-                    if (! $this->deleteResources()) {
-                        $this->info('User deletion would be cancelled at resource deletion phase.');
+            }
 
-                        return 0;
-                    }
+            try {
+                if (! $this->skipResources && ! $this->deleteResources()) {
+                    $this->info('User deletion cancelled at resource preview.');
+
+                    return 0;
                 }
 
-                // Phase 3: Delete Servers
                 if (! $this->deleteServers()) {
-                    $this->info('User deletion would be cancelled at server deletion phase.');
+                    $this->info('User deletion cancelled at server preview.');
 
                     return 0;
                 }
 
-                // Phase 4: Handle Teams
                 if (! $this->handleTeams()) {
-                    $this->info('User deletion would be cancelled at team handling phase.');
+                    $this->info('User deletion cancelled at team preview.');
 
                     return 0;
                 }
 
-                // Phase 5: Delete User Profile
+                if (! $this->isDryRun && ! $this->renewDeletionLock('Canonical User Deletion')) {
+                    return 1;
+                }
+
                 if (! $this->deleteUserProfile()) {
-                    $this->info('User deletion would be cancelled at user profile deletion phase.');
+                    $this->info('User deletion cancelled before the canonical transaction.');
 
                     return 0;
                 }
 
-                // Phase 6: Cancel Stripe Subscriptions (shown after DB operations in dry run too)
-                if (! $this->skipStripe && isCloud()) {
-                    if (! $this->cancelStripeSubscriptions()) {
-                        $this->info('User deletion would be cancelled at Stripe cancellation phase.');
+                if (! $this->isDryRun) {
+                    $this->deletionState['phase_2_resources'] = true;
+                    $this->deletionState['phase_3_servers'] = true;
+                    $this->deletionState['phase_4_teams'] = true;
+                    $this->deletionState['phase_4_committed'] = true;
+                    $this->deletionState['phase_5_user_profile'] = true;
+                    $this->deletionState['phase_5_committed'] = true;
+                    $this->deletionState['db_committed'] = true;
 
-                        return 0;
+                    $this->newLine();
+                    $this->info('✅ Canonical user deletion transaction committed successfully.');
+                    $this->logAction("Database deletion completed for: {$email}");
+                }
+
+                if (! $this->skipStripe && isCloud()) {
+                    if (! $this->isDryRun && ! $this->renewDeletionLock('Phase 6: Stripe Cancellation')) {
+                        return 1;
+                    }
+
+                    if (! $this->cancelStripeSubscriptions()) {
+                        if ($this->isDryRun) {
+                            $this->info('User deletion would be cancelled at Stripe cancellation phase.');
+
+                            return 0;
+                        }
+
+                        $this->newLine();
+                        $this->error('User data was deleted, but Stripe subscription cancellation failed.');
+                        $this->displayRecoverySteps();
+                        $this->logAction("INCONSISTENT STATE: User {$email} deleted but Stripe cancellation failed");
+
+                        return 1;
                     }
                 }
+                $this->deletionState['phase_6_stripe'] = true;
 
                 $this->newLine();
-                $this->info('✅ DRY RUN completed successfully! No data was deleted.');
+                if ($this->isDryRun) {
+                    $this->info('✅ DRY RUN completed successfully! No data was deleted.');
+                } else {
+                    $this->info('✅ User deletion completed successfully!');
+                    $this->logAction("User deletion completed for: {$email}");
+                }
+            } catch (\Exception $e) {
+                $this->databaseTransactionStarted = false;
+                $this->newLine();
+                $this->error('═══════════════════════════════════════');
+                $this->error('❌ EXCEPTION DURING USER DELETION');
+                $this->error('═══════════════════════════════════════');
+                $this->error('Exception: '.get_class($e));
+                $this->error('Message: '.$e->getMessage());
+                $this->error('File: '.$e->getFile().':'.$e->getLine());
+                $this->newLine();
+
+                if ($this->output->isVerbose()) {
+                    $this->error('Stack Trace:');
+                    $this->error($e->getTraceAsString());
+                    $this->newLine();
+                } else {
+                    $this->info('Run with -v for full stack trace');
+                    $this->newLine();
+                }
+
+                $this->displayErrorState('Exception during canonical deletion');
+                $this->displayRecoverySteps();
+                $this->logAction("User deletion failed for {$email}: {$e->getMessage()} in {$e->getFile()}:{$e->getLine()}");
+
+                return 1;
             }
 
             return 0;
@@ -410,9 +302,9 @@ class AdminDeleteUser extends Command
             foreach ($servers as $server) {
                 $resources = $server->definedResources();
                 foreach ($resources as $resource) {
-                    if ($resource instanceof \App\Models\Application) {
+                    if ($resource instanceof Application) {
                         $allApplications->push($resource);
-                    } elseif ($resource instanceof \App\Models\Service) {
+                    } elseif ($resource instanceof Service) {
                         $allServices->push($resource);
                     } else {
                         $allDatabases->push($resource);
@@ -464,7 +356,7 @@ class AdminDeleteUser extends Command
     {
         $this->newLine();
         $this->info('═══════════════════════════════════════');
-        $this->info('PHASE 2: DELETE RESOURCES');
+        $this->info('PHASE 2: RESOURCE DELETION PREVIEW');
         $this->info('═══════════════════════════════════════');
         $this->newLine();
 
@@ -534,27 +426,6 @@ class AdminDeleteUser extends Command
             return false;
         }
 
-        if (! $this->isDryRun) {
-            $this->info('Deleting resources...');
-            try {
-                $result = $action->execute();
-                $this->info("✓ Deleted: {$result['applications']} applications, {$result['databases']} databases, {$result['services']} services");
-                $this->logAction("Deleted resources for user {$this->user->email}: {$result['applications']} apps, {$result['databases']} databases, {$result['services']} services");
-            } catch (\Exception $e) {
-                $this->error('Failed to delete resources:');
-                $this->error('Exception: '.get_class($e));
-                $this->error('Message: '.$e->getMessage());
-                $this->error('File: '.$e->getFile().':'.$e->getLine());
-
-                if ($this->output->isVerbose()) {
-                    $this->error('Stack Trace:');
-                    $this->error($e->getTraceAsString());
-                }
-
-                throw $e; // Re-throw to trigger rollback
-            }
-        }
-
         return true;
     }
 
@@ -562,7 +433,7 @@ class AdminDeleteUser extends Command
     {
         $this->newLine();
         $this->info('═══════════════════════════════════════');
-        $this->info('PHASE 3: DELETE SERVERS');
+        $this->info('PHASE 3: SERVER DELETION PREVIEW');
         $this->info('═══════════════════════════════════════');
         $this->newLine();
 
@@ -597,27 +468,6 @@ class AdminDeleteUser extends Command
             return false;
         }
 
-        if (! $this->isDryRun) {
-            $this->info('Deleting servers...');
-            try {
-                $result = $action->execute();
-                $this->info("✓ Deleted {$result['servers']} servers");
-                $this->logAction("Deleted {$result['servers']} servers for user {$this->user->email}");
-            } catch (\Exception $e) {
-                $this->error('Failed to delete servers:');
-                $this->error('Exception: '.get_class($e));
-                $this->error('Message: '.$e->getMessage());
-                $this->error('File: '.$e->getFile().':'.$e->getLine());
-
-                if ($this->output->isVerbose()) {
-                    $this->error('Stack Trace:');
-                    $this->error($e->getTraceAsString());
-                }
-
-                throw $e; // Re-throw to trigger rollback
-            }
-        }
-
         return true;
     }
 
@@ -625,7 +475,7 @@ class AdminDeleteUser extends Command
     {
         $this->newLine();
         $this->info('═══════════════════════════════════════');
-        $this->info('PHASE 4: HANDLE TEAMS');
+        $this->info('PHASE 4: TEAM CHANGE PREVIEW');
         $this->info('═══════════════════════════════════════');
         $this->newLine();
 
@@ -794,27 +644,6 @@ class AdminDeleteUser extends Command
             return false;
         }
 
-        if (! $this->isDryRun) {
-            $this->info('Processing team changes...');
-            try {
-                $result = $action->execute();
-                $this->info("✓ Teams deleted: {$result['deleted']}, ownership transferred: {$result['transferred']}, left: {$result['left']}");
-                $this->logAction("Team changes for user {$this->user->email}: deleted {$result['deleted']}, transferred {$result['transferred']}, left {$result['left']}");
-            } catch (\Exception $e) {
-                $this->error('Failed to process team changes:');
-                $this->error('Exception: '.get_class($e));
-                $this->error('Message: '.$e->getMessage());
-                $this->error('File: '.$e->getFile().':'.$e->getLine());
-
-                if ($this->output->isVerbose()) {
-                    $this->error('Stack Trace:');
-                    $this->error($e->getTraceAsString());
-                }
-
-                throw $e; // Re-throw to trigger rollback
-            }
-        }
-
         return true;
     }
 
@@ -917,6 +746,11 @@ class AdminDeleteUser extends Command
         return true;
     }
 
+    public static function deletionLockKey(int $userId): string
+    {
+        return "user_deletion_{$userId}";
+    }
+
     private function deleteUserProfile(): bool
     {
         $this->newLine();
@@ -956,7 +790,14 @@ class AdminDeleteUser extends Command
             $this->info('Deleting user profile...');
 
             try {
-                $this->user->delete();
+                $this->databaseTransactionStarted = true;
+                try {
+                    if ($this->user->delete() !== true) {
+                        throw new \RuntimeException('Canonical user deletion did not delete the user.');
+                    }
+                } finally {
+                    $this->databaseTransactionStarted = false;
+                }
                 $this->info('✓ User profile deleted successfully.');
                 $this->logAction("User profile deleted: {$this->user->email}");
             } catch (\Exception $e) {
@@ -1041,11 +882,10 @@ class AdminDeleteUser extends Command
         $this->table(['Phase', 'Status'], $stateTable);
         $this->newLine();
 
-        // Show what was rolled back vs what remains
-        if ($this->deletionState['db_committed']) {
-            $this->error('⚠️  DATABASE COMMITTED - Changes CANNOT be rolled back!');
+        if ($this->deletionState['phase_4_committed'] || $this->deletionState['phase_5_committed']) {
+            $this->error('⚠️  The canonical database transaction committed and cannot be rolled back.');
         } else {
-            $this->info('✓ Database changes were ROLLED BACK');
+            $this->info('✓ Canonical database changes were rolled back or never started.');
         }
 
         $this->newLine();
@@ -1061,61 +901,66 @@ class AdminDeleteUser extends Command
         $this->error('RECOVERY STEPS');
         $this->error('═══════════════════════════════════════');
 
-        if (! $this->deletionState['db_committed']) {
-            $this->info('✓ Database was rolled back - no recovery needed for database');
-            $this->newLine();
-
-            if ($this->deletionState['phase_2_resources'] || $this->deletionState['phase_3_servers']) {
-                $this->warn('However, some remote operations may have occurred:');
-                $this->newLine();
-
-                if ($this->deletionState['phase_2_resources']) {
-                    $this->warn('Phase 2 (Resources) was attempted:');
-                    $this->warn('- Check remote servers for orphaned Docker containers');
-                    $this->warn('- Use: docker ps -a | grep coolify');
-                    $this->warn('- Manually remove if needed: docker rm -f <container_id>');
-                    $this->newLine();
-                }
-
-                if ($this->deletionState['phase_3_servers']) {
-                    $this->warn('Phase 3 (Servers) was attempted:');
-                    $this->warn('- Check for orphaned server configurations');
-                    $this->warn('- Verify SSH access to servers listed for this user');
-                    $this->newLine();
-                }
-            }
+        if (! $this->deletionState['phase_4_committed'] && ! $this->deletionState['phase_5_committed']) {
+            $this->info('✓ Canonical database changes were rolled back or never started.');
         } else {
-            $this->error('⚠️  DATABASE WAS COMMITTED - Manual recovery required!');
-            $this->newLine();
-            $this->error('The following data has been PERMANENTLY deleted:');
-
-            if ($this->deletionState['phase_5_user_profile']) {
-                $this->error('- User profile (email: '.$this->user->email.')');
-            }
-            if ($this->deletionState['phase_4_teams']) {
+            $this->error('Committed database-only changes:');
+            if ($this->deletionState['phase_4_committed']) {
                 $this->error('- Team memberships and owned teams');
             }
-            if ($this->deletionState['phase_3_servers']) {
-                $this->error('- Server records and configurations');
+            if ($this->deletionState['phase_5_committed']) {
+                $this->error('- User profile (email: '.$this->user->email.')');
             }
-            if ($this->deletionState['phase_2_resources']) {
-                $this->error('- Applications, databases, and services');
-            }
-
             $this->newLine();
+        }
 
-            if (! $this->deletionState['phase_6_stripe']) {
-                $this->error('Stripe subscriptions were NOT cancelled:');
-                $this->error('1. Go to Stripe Dashboard: https://dashboard.stripe.com/');
-                $this->error('2. Search for: '.$this->user->email);
-                $this->error('3. Cancel all active subscriptions manually');
-                $this->newLine();
-            }
+        if (! $this->deletionState['phase_6_stripe'] && isCloud()) {
+            $this->error('Stripe subscriptions were NOT cancelled:');
+            $this->error('1. Go to Stripe Dashboard: https://dashboard.stripe.com/');
+            $this->error('2. Search for: '.$this->user->email);
+            $this->error('3. Cancel all active subscriptions manually');
+            $this->newLine();
         }
 
         $this->error('Log file: storage/logs/user-deletions.log');
         $this->error('Check logs for detailed error information');
         $this->newLine();
+    }
+
+    private function renewDeletionLock(string $phase): bool
+    {
+        if (! $this->lockAcquired || $this->lock === null) {
+            $this->error("Deletion lock ownership is unavailable before {$phase}; refusing destructive work.");
+            $this->displayErrorState("{$phase} (lock ownership unavailable)");
+            $this->displayRecoverySteps();
+
+            return false;
+        }
+
+        try {
+            if ($this->lock->refresh(self::LOCK_TTL_SECONDS)) {
+                return true;
+            }
+        } catch (\Throwable $throwable) {
+            Log::warning('Unable to renew the administrative user deletion lock.', [
+                'user_id' => $this->user->id,
+                'phase' => $phase,
+                'exception' => $throwable,
+            ]);
+            $this->error("Deletion lock ownership could not be validated before {$phase}; refusing destructive work.");
+            $this->displayErrorState("{$phase} (lock ownership validation failed)");
+            $this->displayRecoverySteps();
+
+            return false;
+        }
+
+        $this->lockAcquired = false;
+        $this->error("Deletion lock ownership was lost before {$phase}; refusing destructive work.");
+        $this->error('Another operator may now own this deletion. Inspect committed phase state before retrying.');
+        $this->displayErrorState("{$phase} (lock ownership lost)");
+        $this->displayRecoverySteps();
+
+        return false;
     }
 
     /**
@@ -1134,9 +979,8 @@ class AdminDeleteUser extends Command
             $this->warn('═══════════════════════════════════════');
             $this->warn('⚠️  PROCESS INTERRUPTED (Ctrl+C)');
             $this->warn('═══════════════════════════════════════');
-            $this->info('Cleaning up and releasing lock...');
-            $this->releaseLock();
-            $this->info('Lock released. Exiting gracefully.');
+            $this->info('Rolling back command transaction before releasing lock...');
+            $this->displaySignalCleanupResult($this->cleanUpAfterSignal());
             exit(130); // Standard exit code for SIGINT
         });
 
@@ -1146,9 +990,8 @@ class AdminDeleteUser extends Command
             $this->warn('═══════════════════════════════════════');
             $this->warn('⚠️  PROCESS TERMINATED (SIGTERM)');
             $this->warn('═══════════════════════════════════════');
-            $this->info('Cleaning up and releasing lock...');
-            $this->releaseLock();
-            $this->info('Lock released. Exiting gracefully.');
+            $this->info('Rolling back command transaction before releasing lock...');
+            $this->displaySignalCleanupResult($this->cleanUpAfterSignal());
             exit(143); // Standard exit code for SIGTERM
         });
 
@@ -1157,17 +1000,79 @@ class AdminDeleteUser extends Command
     }
 
     /**
+     * @return array{safe_to_release: bool, transaction_rolled_back: bool, lock_released: bool}
+     */
+    private function cleanUpAfterSignal(): array
+    {
+        $transactionRolledBack = false;
+
+        if ($this->databaseTransactionStarted) {
+            try {
+                if (DB::transactionLevel() > 0) {
+                    DB::rollBack();
+                    $transactionRolledBack = true;
+                }
+                $this->databaseTransactionStarted = false;
+            } catch (\Throwable $throwable) {
+                Log::critical('Unable to roll back the administrative user deletion transaction during signal cleanup.', [
+                    'user_id' => $this->user->id,
+                    'exception' => $throwable,
+                ]);
+
+                return [
+                    'safe_to_release' => false,
+                    'transaction_rolled_back' => false,
+                    'lock_released' => false,
+                ];
+            }
+        }
+
+        return [
+            'safe_to_release' => true,
+            'transaction_rolled_back' => $transactionRolledBack,
+            'lock_released' => $this->releaseLock(),
+        ];
+    }
+
+    /** @param array{safe_to_release: bool, transaction_rolled_back: bool, lock_released: bool} $result */
+    private function displaySignalCleanupResult(array $result): void
+    {
+        if (! $result['safe_to_release']) {
+            $this->error('Transaction rollback failed; deletion lock retained until expiry for safety.');
+
+            return;
+        }
+
+        if ($result['transaction_rolled_back']) {
+            $this->info('Command-owned database transaction rolled back.');
+        }
+
+        $this->info($result['lock_released']
+            ? 'Lock released. Exiting gracefully.'
+            : 'Lock was no longer owned; it was not released.');
+    }
+
+    /**
      * Release the lock if it exists
      */
-    private function releaseLock(): void
+    private function releaseLock(): bool
     {
-        if ($this->lock) {
-            try {
-                $this->lock->release();
-            } catch (\Exception $e) {
-                // Silently ignore lock release errors
-                // Lock will expire after 10 minutes anyway
-            }
+        if (! $this->lockAcquired || $this->lock === null) {
+            return false;
+        }
+
+        try {
+            $released = $this->lock->release();
+            $this->lockAcquired = false;
+
+            return $released;
+        } catch (\Throwable $throwable) {
+            Log::warning('Unable to release the administrative user deletion lock.', [
+                'user_id' => $this->user->id,
+                'exception' => $throwable,
+            ]);
+
+            return false;
         }
     }
 }

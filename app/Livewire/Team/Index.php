@@ -104,11 +104,11 @@ class Index extends Component
         try {
             $currentTeam = currentTeam();
             $this->authorize('delete', $currentTeam);
-            $currentTeam->members->each(function ($user) use ($currentTeam) {
+            $currentTeam->members()->get()->each(function ($user) use ($currentTeam) {
                 if ($user->id === Auth::id()) {
                     return;
                 }
-                $user->teams()->detach($currentTeam);
+                $currentTeam->detachMember($user);
                 $session = DB::table('sessions')->where('user_id', $user->id)->first();
                 if ($session) {
                     DB::table('sessions')->where('id', $session->id)->delete();

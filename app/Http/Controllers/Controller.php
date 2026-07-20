@@ -134,10 +134,9 @@ class Controller extends BaseController
             if (Hash::check($password, $user->password)) {
                 $team = $invitation->team;
                 if (! $user->teams()->where('team_id', $team->id)->exists()) {
-                    $user->teams()->attach($team->id, ['role' => $invitation->role]);
+                    $team->attachMember($user, $invitation->role);
                 }
                 $invitation->delete();
-
                 $user->forceFill([
                     'password' => Hash::make(Str::random(64)),
                 ])->save();
@@ -174,7 +173,6 @@ class Controller extends BaseController
         if (Auth::id() !== $user->id) {
             abort(400, 'You are not allowed to accept this invitation.');
         }
-
         if (! $invitation->isValid()) {
             abort(400, 'Invitation expired.');
         }
@@ -198,7 +196,6 @@ class Controller extends BaseController
         if (Auth::id() !== $user->id) {
             abort(400, 'You are not allowed to accept this invitation.');
         }
-
         if (! $invitation->isValid()) {
             abort(400, 'Invitation expired.');
         }
@@ -208,7 +205,7 @@ class Controller extends BaseController
 
             return redirect()->route('team.index');
         }
-        $user->teams()->attach($invitation->team->id, ['role' => $invitation->role]);
+        $invitation->team->attachMember($user, $invitation->role);
         $invitation->delete();
 
         refreshSession($invitation->team);

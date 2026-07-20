@@ -18,9 +18,19 @@ class StartProxy implements ProxyMutation
     use AsAction;
     use UsesProxyMutationQueue;
 
+    public int $jobTries = 3;
+
+    public int $jobMaxExceptions = 3;
+
     public function configureJob(JobDecorator $job): void
     {
         ProxyMutationQueue::assign($job);
+    }
+
+    /** @return list<int> */
+    public function getJobBackoff(): array
+    {
+        return [30, 90, 180];
     }
 
     public function asJob(Server $server, bool $async = true, bool $force = false, bool $restarting = false): string|Activity

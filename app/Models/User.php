@@ -10,11 +10,13 @@ use App\Notifications\TransactionalEmails\ResetPassword as TransactionalEmailsRe
 use App\Services\ChangelogService;
 use App\Traits\DeletesUserSessions;
 use DateTimeInterface;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Messages\MailMessage;
 use Illuminate\Notifications\Notifiable;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Config;
@@ -106,9 +108,9 @@ class User extends Authenticatable implements SendsEmail
                 $new_team->save();
 
                 if (! $user->teams()->whereKey($new_team->id)->exists()) {
-                    $user->teams()->attach($new_team, ['role' => 'owner']);
+                    $new_team->attachMember($user, 'owner');
                 } else {
-                    $user->teams()->updateExistingPivot($new_team->id, ['role' => 'owner']);
+                    $new_team->updateMemberRole($user, 'owner');
                 }
 
                 return;
@@ -117,14 +119,19 @@ class User extends Authenticatable implements SendsEmail
             $new_team = (new Team)->forceFill($team);
             $new_team->save();
 
-            $user->teams()->attach($new_team, ['role' => 'owner']);
+            $new_team->attachMember($user, 'owner');
         });
 
         static::deleting(function (User $user) {
-            \DB::transaction(function () use ($user) {
-                RevokeUserTeamTokens::forUser($user);
+            static::assertUserIsNotSoleRootTeamMember($user);
+            static::assertSoleTeamMembersAreOwners($user);
+            static::assertBlueGreenApplicationsReadyForPermanentDeletion($user);
+            static::deleteApplicationsForDeletedTeams($user);
 
-                $teams = $user->teams;
+            \DB::transaction(function () use ($user) {
+                $teams = static::loadLockedTeamsForDeletion($user);
+                static::assertLockedSoleTeamMembersAreOwners($user, $teams);
+                RevokeUserTeamTokens::forUser($user);
                 foreach ($teams as $team) {
                     $user_alone_in_team = $team->members->count() === 1;
 
@@ -145,36 +152,181 @@ class User extends Authenticatable implements SendsEmail
                     $userRole = $team->members->where('id', $user->id)->first()?->pivot?->role;
 
                     if ($userRole === 'owner') {
-                        $found_other_owner_or_admin = $team->members->filter(function ($member) use ($user) {
-                            return ($member->pivot->role === 'owner' || $member->pivot->role === 'admin') && $member->id !== $user->id;
-                        })->first();
+                        $otherOwner = $team->members->first(function ($member) use ($user) {
+                            return $member->pivot->role === 'owner' && $member->id !== $user->id;
+                        });
 
-                        if ($found_other_owner_or_admin) {
-                            $team->members()->detach($user->id);
-
-                            continue;
-                        } else {
-                            $found_other_member_who_is_not_owner = $team->members->filter(function ($member) {
-                                return $member->pivot->role === 'member';
-                            })->first();
-
-                            if ($found_other_member_who_is_not_owner) {
-                                $found_other_member_who_is_not_owner->pivot->role = 'owner';
-                                $found_other_member_who_is_not_owner->pivot->save();
-                                RevokeUserTeamTokens::forUserTeam($found_other_member_who_is_not_owner, $team->id);
-                                $team->members()->detach($user->id);
-                            } else {
-                                static::finalizeTeamDeletion($user, $team);
-                            }
+                        if ($otherOwner) {
+                            $team->detachMember($user);
 
                             continue;
                         }
+
+                        $replacementOwner = $team->members->first(function ($member) use ($user) {
+                            return $member->pivot->role === 'admin' && $member->id !== $user->id;
+                        });
+                        $replacementOwner ??= $team->members->first(function ($member) use ($user) {
+                            return $member->pivot->role === 'member' && $member->id !== $user->id;
+                        });
+
+                        if ($replacementOwner) {
+                            $team->updateMemberRole($replacementOwner, 'owner');
+                            RevokeUserTeamTokens::forUserTeam($replacementOwner, $team->id);
+                            $team->detachMember($user);
+                        } else {
+                            static::finalizeTeamDeletion($user, $team);
+                        }
+
+                        continue;
                     } else {
-                        $team->members()->detach($user->id);
+                        $team->detachMember($user);
                     }
                 }
             });
         });
+    }
+
+    public function delete(): ?bool
+    {
+        if (! $this->exists) {
+            return null;
+        }
+
+        $userId = (int) ($this->getRawOriginal($this->getKeyName()) ?? $this->getKey());
+
+        return $this->getConnection()->transaction(function () use ($userId): ?bool {
+            $lockedUser = static::query()
+                ->useWritePdo()
+                ->whereKey($userId)
+                ->lockForUpdate()
+                ->first();
+            if ($lockedUser === null) {
+                $this->exists = false;
+
+                return null;
+            }
+
+            $this->setRawAttributes($lockedUser->getAttributes(), true);
+            $this->unsetRelations();
+
+            return parent::delete();
+        }, attempts: 5);
+    }
+
+    private static function assertUserIsNotSoleRootTeamMember(User $user): void
+    {
+        $user->getConnection()->transaction(function () use ($user): void {
+            $rootTeam = $user->teams()
+                ->getRelated()
+                ->newQuery()
+                ->whereKey(0)
+                ->lockForUpdate()
+                ->first();
+            if ($rootTeam === null) {
+                return;
+            }
+
+            $membersRelation = $rootTeam->members();
+            $pivotMemberKey = $membersRelation->getRelatedPivotKeyName();
+            $membersRelation->newPivotQuery()
+                ->orderBy($pivotMemberKey)
+                ->lockForUpdate()
+                ->get();
+
+            $memberModel = $membersRelation->getRelated();
+            $memberKey = $memberModel->qualifyColumn($memberModel->getKeyName());
+            $memberIds = $membersRelation
+                ->orderBy($memberKey)
+                ->lockForUpdate()
+                ->pluck($memberKey);
+
+            if ($memberIds->count() === 1 && (int) $memberIds->first() === $user->id) {
+                throw new \Exception('User is alone in the root team, cannot delete');
+            }
+        }, attempts: 5);
+    }
+
+    private static function assertSoleTeamMembersAreOwners(User $user): void
+    {
+        $user->getConnection()->transaction(function () use ($user): void {
+            $teams = static::loadLockedTeamsForDeletion($user);
+            static::assertLockedSoleTeamMembersAreOwners($user, $teams);
+        }, attempts: 5);
+    }
+
+    /** @param Collection<int, Team> $teams */
+    private static function assertLockedSoleTeamMembersAreOwners(User $user, Collection $teams): void
+    {
+        foreach ($teams as $team) {
+            if ($team->id === 0 || $team->members->count() !== 1) {
+                continue;
+            }
+
+            $role = $team->members->firstWhere('id', $user->id)?->pivot?->role;
+            if ($role !== 'owner') {
+                throw new \RuntimeException('Sole remaining team member is not an owner. Assign an owner before removing this member or delete the team through an authorized owner workflow.');
+            }
+        }
+    }
+
+    private static function assertBlueGreenApplicationsReadyForPermanentDeletion(User $user): void
+    {
+        foreach (static::applicationsForDeletedTeams($user) as $application) {
+            $application->assertBlueGreenDeletionAuthorized();
+        }
+    }
+
+    /** @return Collection<int, Application> */
+    private static function applicationsForDeletedTeams(User $user): Collection
+    {
+        $applications = collect();
+
+        foreach ($user->teams()->withCount('members')->useWritePdo()->get() as $team) {
+            if ($team->pivot->role !== 'owner' || $team->id === 0 || $team->members_count !== 1) {
+                continue;
+            }
+
+            $applications = $applications->merge(
+                Application::withTrashed()
+                    ->whereHas('environment.project', fn (Builder $query): Builder => $query->where('team_id', $team->id))
+                    ->useWritePdo()
+                    ->get(),
+            );
+        }
+
+        return $applications->unique('id')->values();
+    }
+
+    private static function deleteApplicationsForDeletedTeams(User $user): void
+    {
+        foreach (static::applicationsForDeletedTeams($user) as $application) {
+            $application->forceDelete();
+        }
+    }
+
+    /** @return Collection<int, Team> */
+    private static function loadLockedTeamsForDeletion(User $user): Collection
+    {
+        $teamsRelation = $user->teams();
+        $teamModel = $teamsRelation->getRelated();
+        $teams = $teamsRelation
+            ->orderBy($teamModel->qualifyColumn($teamModel->getKeyName()))
+            ->lockForUpdate()
+            ->get();
+
+        foreach ($teams as $team) {
+            $membersRelation = $team->members();
+            $memberModel = $membersRelation->getRelated();
+            $team->setRelation(
+                'members',
+                $membersRelation
+                    ->orderBy($memberModel->qualifyColumn($memberModel->getKeyName()))
+                    ->lockForUpdate()
+                    ->get(),
+            );
+        }
+
+        return $teams;
     }
 
     /**
@@ -196,7 +348,7 @@ class User extends Authenticatable implements SendsEmail
             $project->forceDelete();
         }
 
-        $team->members()->detach($user->id);
+        $team->detachMember($user);
         $team->delete();
     }
 
@@ -224,7 +376,7 @@ class User extends Authenticatable implements SendsEmail
         }
         $new_team = (new Team)->forceFill($team);
         $new_team->save();
-        $this->teams()->attach($new_team, ['role' => 'owner']);
+        $new_team->attachMember($this, 'owner');
 
         return $new_team;
     }

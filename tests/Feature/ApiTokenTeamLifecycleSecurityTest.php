@@ -126,3 +126,12 @@ test('team deletion revokes team bound personal access tokens', function () {
 
     expect(DB::table('personal_access_tokens')->where('id', $token->id)->exists())->toBeFalse();
 });
+
+test('root teams reject ordinary model deletion', function () {
+    $rootTeam = Team::factory()->create(['id' => 0, 'name' => 'Root Team']);
+
+    expect(fn () => $rootTeam->delete())
+        ->toThrow(RuntimeException::class, 'The root team cannot be deleted.');
+
+    expect($rootTeam->fresh())->not->toBeNull();
+});
