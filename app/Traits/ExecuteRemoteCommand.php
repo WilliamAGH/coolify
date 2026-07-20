@@ -92,8 +92,16 @@ trait ExecuteRemoteCommand
             // Check for cancellation before executing commands
             if (isset($this->application_deployment_queue)) {
                 $this->application_deployment_queue->refresh();
-                if ($this->application_deployment_queue->status === ApplicationDeploymentStatus::CANCELLED_BY_USER->value) {
-                    throw new \RuntimeException('Deployment cancelled by user', 69420);
+                if (in_array($this->application_deployment_queue->status, [
+                    ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+                    ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value,
+                ], true)) {
+                    throw new \RuntimeException(
+                        $this->application_deployment_queue->status === ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value
+                            ? 'Deployment paused because another blue-green destination in this fleet failed.'
+                            : 'Deployment cancelled by user',
+                        69420,
+                    );
                 }
             }
 
@@ -120,8 +128,16 @@ trait ExecuteRemoteCommand
 
                             // Check for cancellation during retry wait
                             $this->application_deployment_queue->refresh();
-                            if ($this->application_deployment_queue->status === ApplicationDeploymentStatus::CANCELLED_BY_USER->value) {
-                                throw new \RuntimeException('Deployment cancelled by user during retry', 69420);
+                            if (in_array($this->application_deployment_queue->status, [
+                                ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+                                ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value,
+                            ], true)) {
+                                throw new \RuntimeException(
+                                    $this->application_deployment_queue->status === ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value
+                                        ? 'Deployment paused because another blue-green destination in this fleet failed during retry.'
+                                        : 'Deployment cancelled by user during retry',
+                                    69420,
+                                );
                             }
                         }
 
@@ -241,8 +257,16 @@ trait ExecuteRemoteCommand
                 // Check if deployment was cancelled while command was running
                 if (isset($this->application_deployment_queue)) {
                     $this->application_deployment_queue->refresh();
-                    if ($this->application_deployment_queue->status === ApplicationDeploymentStatus::CANCELLED_BY_USER->value) {
-                        throw new \RuntimeException('Deployment cancelled by user', 69420);
+                    if (in_array($this->application_deployment_queue->status, [
+                        ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+                        ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value,
+                    ], true)) {
+                        throw new \RuntimeException(
+                            $this->application_deployment_queue->status === ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value
+                                ? 'Deployment paused because another blue-green destination in this fleet failed.'
+                                : 'Deployment cancelled by user',
+                            69420,
+                        );
                     }
                 }
 

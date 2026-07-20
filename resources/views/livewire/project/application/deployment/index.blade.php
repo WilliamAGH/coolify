@@ -41,7 +41,7 @@
                 'border-purple-500/50 border-dashed' =>
                     data_get($deployment, 'status') === 'queued',
                 'border-white border-dashed' =>
-                    data_get($deployment, 'status') === 'cancelled-by-user',
+                    in_array(data_get($deployment, 'status'), ['cancelled-by-user', 'cancelled-by-blue-green-fleet']),
                 'border-error' => data_get($deployment, 'status') === 'failed',
                 'border-success' => data_get($deployment, 'status') === 'finished',
             ])>
@@ -59,13 +59,14 @@
                                 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-200' =>
                                     data_get($deployment, 'status') === 'finished',
                                 'bg-gray-100 text-gray-700 dark:bg-gray-600/30 dark:text-gray-300' =>
-                                    data_get($deployment, 'status') === 'cancelled-by-user',
+                                    in_array(data_get($deployment, 'status'), ['cancelled-by-user', 'cancelled-by-blue-green-fleet']),
                             ])>
                                 @php
                                     $statusText = match (data_get($deployment, 'status')) {
                                         'finished' => 'Success',
                                         'in_progress' => 'In Progress',
                                         'cancelled-by-user' => 'Cancelled',
+                                        'cancelled-by-blue-green-fleet' => 'Paused by Fleet',
                                         'queued' => 'Queued',
                                         default => ucfirst(data_get($deployment, 'status')),
                                     };
@@ -77,7 +78,7 @@
                             <div class="text-gray-600 dark:text-gray-400 text-sm">
                                 Started:
                                 {{ formatDateInServerTimezone(data_get($deployment, 'created_at'), data_get($application, 'destination.server')) }}
-                                @if ($deployment->status !== 'in_progress' && $deployment->status !== 'cancelled-by-user')
+                                @if (! in_array($deployment->status, ['in_progress', 'cancelled-by-user', 'cancelled-by-blue-green-fleet']))
                                     <br>Ended:
                                     {{ formatDateInServerTimezone(data_get($deployment, 'finished_at'), data_get($application, 'destination.server')) }}
                                     <br>Duration:

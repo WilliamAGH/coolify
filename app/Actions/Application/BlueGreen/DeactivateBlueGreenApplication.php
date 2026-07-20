@@ -138,8 +138,14 @@ final class DeactivateBlueGreenApplication
     }
 
     /** @return Collection<int, BlueGreenDeactivationPreparation> */
-    public function stop(Application $application, ?int $standaloneDockerId = null): Collection
-    {
+    public function stop(
+        Application $application,
+        ?int $standaloneDockerId = null,
+        BlueGreenDeactivationPhase $requestedPhase = BlueGreenDeactivationPhase::STOPPING,
+    ): Collection {
+        if (! in_array($requestedPhase, [BlueGreenDeactivationPhase::STOPPING, BlueGreenDeactivationPhase::REMOVING], true)) {
+            throw new \InvalidArgumentException('A manual blue-green stop requires a stopping or removing phase.');
+        }
         $stoppingEveryDestination = $standaloneDockerId === null;
         $destinationIds = $application->blueGreenConfiguredStandaloneDockerDestinationIds();
         if ($standaloneDockerId !== null) {
@@ -153,7 +159,7 @@ final class DeactivateBlueGreenApplication
         $releasedEveryFence = false;
 
         try {
-            $preparations = DB::transaction(function () use ($application, $destinationIds, $destinationFences, $stoppingEveryDestination): Collection {
+            $preparations = DB::transaction(function () use ($application, $destinationIds, $destinationFences, $stoppingEveryDestination, $requestedPhase): Collection {
                 $liveApplication = Application::withTrashed()
                     ->whereKey($application->id)
                     ->lockForUpdate()
@@ -168,13 +174,13 @@ final class DeactivateBlueGreenApplication
                     : $destinationIds;
                 $this->assertEveryDestinationIsLocked($currentDestinationIds, $destinationFences);
 
-                $preparations = $currentDestinationIds->map(function (int $destinationId) use ($liveApplication, $destinationFences): BlueGreenDeactivationPreparation {
+                $preparations = $currentDestinationIds->map(function (int $destinationId) use ($liveApplication, $destinationFences, $requestedPhase): BlueGreenDeactivationPreparation {
                     $this->refreshDestinationFences($destinationFences);
 
                     return PrepareBlueGreenDeactivation::run(
                         $liveApplication,
                         $destinationId,
-                        requestedPhase: BlueGreenDeactivationPhase::STOPPING,
+                        requestedPhase: $requestedPhase,
                     );
                 });
 

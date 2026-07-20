@@ -126,10 +126,16 @@ final class TransitionsBlueGreenDeployment
                 BlueGreenDeploymentPhase::ROLLING_BACK,
                 BlueGreenDeploymentPhase::IDLE,
                 [
-                    'status' => $deployment->status === ApplicationDeploymentStatus::CANCELLED_BY_USER->value
-                        ? ApplicationDeploymentStatus::CANCELLED_BY_USER->value
+                    'status' => in_array($deployment->status, [
+                        ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+                        ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value,
+                    ], true)
+                        ? $deployment->status
                         : ApplicationDeploymentStatus::FAILED->value,
-                    'finished_at' => $deployment->status === ApplicationDeploymentStatus::CANCELLED_BY_USER->value
+                    'finished_at' => in_array($deployment->status, [
+                        ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+                        ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value,
+                    ], true)
                         ? ($deployment->finished_at ?? now())
                         : now(),
                 ],

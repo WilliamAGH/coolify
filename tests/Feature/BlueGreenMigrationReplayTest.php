@@ -27,6 +27,7 @@ function blueGreenMigrationMismatchMessage(string $sqliteMessage, string $postgr
 
 function removeBlueGreenExpandSchema(): void
 {
+    Schema::dropIfExists('application_destination_reservations');
     Schema::dropIfExists('application_blue_green_deactivations');
     Schema::dropIfExists('application_blue_green_deployments');
 
@@ -50,6 +51,8 @@ function removeBlueGreenExpandSchema(): void
         'blue_green_backend_port_inventory',
         'blue_green_drain_backend_port_inventory',
         'blue_green_supersession_generation',
+        'blue_green_fleet_deployment_uuid',
+        'blue_green_fleet_status',
     ];
     $presentQueueColumns = array_values(array_filter(
         $queueColumns,
@@ -129,11 +132,27 @@ function createDeactivationTableWithShortOperationId(): void
 beforeEach(function (): void {
     Schema::dropAllTables();
 
-    Schema::create('applications', fn (Blueprint $table) => $table->id());
-    Schema::create('standalone_dockers', fn (Blueprint $table) => $table->id());
+    Schema::create('applications', function (Blueprint $table): void {
+        $table->id();
+        $table->unsignedBigInteger('destination_id')->nullable();
+        $table->string('destination_type')->nullable();
+    });
+    Schema::create('servers', fn (Blueprint $table) => $table->id());
+    Schema::create('standalone_dockers', function (Blueprint $table): void {
+        $table->id();
+        $table->unsignedBigInteger('server_id');
+    });
+    Schema::create('additional_destinations', function (Blueprint $table): void {
+        $table->id();
+        $table->unsignedBigInteger('application_id');
+        $table->unsignedBigInteger('server_id');
+        $table->unsignedBigInteger('standalone_docker_id');
+    });
     Schema::create('application_settings', fn (Blueprint $table) => $table->id());
     Schema::create('application_deployment_queues', function (Blueprint $table) {
         $table->id();
+        $table->string('application_id');
+        $table->integer('pull_request_id')->default(0);
         $table->string('status');
     });
 });
@@ -167,7 +186,10 @@ it('converges when each authorized schema commit exists without its migration le
         ->and(Schema::hasColumns('application_deployment_queues', [
             'blue_green_backend_port_inventory',
             'blue_green_drain_backend_port_inventory',
-        ]))->toBeTrue();
+        ]))->toBeTrue()
+        ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_fleet_deployment_uuid'))->toBeTrue()
+        ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_fleet_status'))->toBeTrue()
+        ->and(Schema::hasTable('application_destination_reservations'))->toBeTrue();
 });
 
 it('replays every earlier migration against the complete later schema', function () {
@@ -201,7 +223,10 @@ it('replays every earlier migration against the complete later schema', function
         ->and(Schema::hasColumns('application_deployment_queues', [
             'blue_green_backend_port_inventory',
             'blue_green_drain_backend_port_inventory',
-        ]))->toBeTrue();
+        ]))->toBeTrue()
+        ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_fleet_deployment_uuid'))->toBeTrue()
+        ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_fleet_status'))->toBeTrue()
+        ->and(Schema::hasTable('application_destination_reservations'))->toBeTrue();
 });
 
 it('attests the complete schema through each migration public contract', function () {
@@ -225,7 +250,10 @@ it('attests the complete schema through each migration public contract', functio
         ->and(Schema::hasColumns('application_deployment_queues', [
             'blue_green_backend_port_inventory',
             'blue_green_drain_backend_port_inventory',
-        ]))->toBeTrue();
+        ]))->toBeTrue()
+        ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_fleet_deployment_uuid'))->toBeTrue()
+        ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_fleet_status'))->toBeTrue()
+        ->and(Schema::hasTable('application_destination_reservations'))->toBeTrue();
 });
 
 it('keeps all expand schema intact because every authorized migration is forward-only', function () {

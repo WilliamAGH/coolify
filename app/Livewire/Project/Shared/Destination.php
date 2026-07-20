@@ -3,10 +3,13 @@
 namespace App\Livewire\Project\Shared;
 
 use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
+use App\Actions\Application\BlueGreen\DeactivateBlueGreenApplication;
 use App\Actions\Application\StopApplicationOneServer;
 use App\Actions\Docker\GetContainersStatus;
+use App\Enums\BlueGreenDeactivationPhase;
 use App\Events\ApplicationStatusChanged;
 use App\Models\Application;
+use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
 use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
@@ -20,6 +23,9 @@ class Destination extends Component
     public $resource;
 
     public Collection $networks;
+
+    /** @var array<string, array{phase: string|null, activeColor: string|null}> */
+    public array $blueGreenDestinationStates = [];
 
     public function getListeners()
     {
@@ -40,6 +46,17 @@ class Destination extends Component
 
     public function loadData()
     {
+        $this->blueGreenDestinationStates = $this->resource instanceof Application
+            ? $this->resource->blueGreenDeployments()
+                ->get(['standalone_docker_id', 'phase', 'active_color'])
+                ->mapWithKeys(static fn (ApplicationBlueGreenDeployment $deployment): array => [
+                    (string) $deployment->standalone_docker_id => [
+                        'phase' => $deployment->phase?->value,
+                        'activeColor' => $deployment->active_color?->value,
+                    ],
+                ])
+                ->all()
+            : [];
         $all_networks = collect([]);
         $all_networks = $all_networks->push($this->resource->destination);
         $all_networks = $all_networks->merge($this->resource->additional_networks);
@@ -142,16 +159,17 @@ class Destination extends Component
                 if ($this->resource instanceof Application) {
                     $this->resource->prepareBlueGreenAdditionalDestinationAddition($network);
                 }
-                $this->resource->additional_networks()->attach($mainDestination->id, [
-                    'server_id' => $mainDestination->server->id,
-                ]);
+                $this->resource->additional_networks()
+                    ->wherePivot('server_id', $server->id)
+                    ->detach($network->id);
                 $this->resource->update([
                     'destination_id' => $network->id,
                     'destination_type' => StandaloneDocker::class,
                 ]);
                 $this->resource->additional_networks()
-                    ->wherePivot('server_id', $server->id)
-                    ->detach($network->id);
+                    ->attach($mainDestination->id, [
+                        'server_id' => $mainDestination->server->id,
+                    ]);
             });
             $this->resource->refresh();
             $this->refreshServers();
@@ -182,6 +200,7 @@ class Destination extends Component
                     ->where('server_id', $server->id)
                     ->findOrFail($network_id);
                 if ($this->resource instanceof Application) {
+                    $this->resource->assertAdditionalStandaloneDockerDestinationCanBeAttached($network);
                     $this->resource->prepareBlueGreenAdditionalDestinationAddition($network);
                 }
                 $this->resource->additional_networks()->attach($network->id, ['server_id' => $server->id]);
@@ -207,7 +226,21 @@ class Destination extends Component
             }
             $server = Server::ownedByCurrentTeam()->findOrFail($server_id);
             StandaloneDocker::ownedByCurrentTeam()->where('server_id', $server->id)->findOrFail($network_id);
-            [$shouldStopServer, $server] = $this->resource->getConnection()->transaction(function () use ($network_id, $server_id): array {
+            $removalProof = null;
+            if ($this->resource instanceof Application && $this->resource->requiresBlueGreenDeactivation()) {
+                $preparations = DeactivateBlueGreenApplication::make()->stop(
+                    $this->resource,
+                    $network_id,
+                    BlueGreenDeactivationPhase::REMOVING,
+                );
+                $deactivation = $preparations->sole()->deactivation->fresh();
+                $removalProof = [
+                    'id' => (int) $deactivation->id,
+                    'operation_id' => (string) $deactivation->operation_id,
+                    'supersession_generation' => (int) $deactivation->supersession_generation,
+                ];
+            }
+            [$shouldStopServer, $server] = $this->resource->getConnection()->transaction(function () use ($network_id, $server_id, $removalProof): array {
                 BlueGreenTopologyLock::acquire($this->resource->getConnection());
                 $this->reloadResourceTopology();
                 $server = Server::ownedByCurrentTeam()->findOrFail($server_id);
@@ -218,13 +251,23 @@ class Destination extends Component
                     return [null, $server];
                 }
                 if ($this->resource instanceof Application) {
-                    $this->resource->assertBlueGreenDestinationCanBeRemoved($network_id);
+                    if ($removalProof !== null) {
+                        $this->resource->consumeBlueGreenDestinationRemovalProof(
+                            $network_id,
+                            $server_id,
+                            $removalProof['id'],
+                            $removalProof['operation_id'],
+                            $removalProof['supersession_generation'],
+                        );
+                    } else {
+                        $this->resource->assertBlueGreenDestinationCanBeRemoved($network_id);
+                    }
                 }
                 $detachedDestinations = $this->resource->additional_networks()
                     ->wherePivot('server_id', $server_id)
                     ->detach($network_id);
 
-                return [$detachedDestinations > 0, $server];
+                return [$detachedDestinations > 0 && $removalProof === null, $server];
             });
             if ($shouldStopServer === null) {
                 $this->dispatch('error', 'You are trying to remove the main server.');

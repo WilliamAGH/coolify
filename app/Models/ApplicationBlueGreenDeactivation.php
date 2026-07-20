@@ -65,6 +65,9 @@ final class ApplicationBlueGreenDeactivation extends Model
         if ($this->application()->whereNotNull('deleted_at')->exists()) {
             return true;
         }
+        if ($this->phase === BlueGreenDeactivationPhase::REMOVED) {
+            return true;
+        }
         if ($deployment->pull_request_id !== 0) {
             return false;
         }
@@ -77,7 +80,9 @@ final class ApplicationBlueGreenDeactivation extends Model
     {
         return match ($this->phase) {
             BlueGreenDeactivationPhase::STOPPING => true,
+            BlueGreenDeactivationPhase::REMOVING => true,
             BlueGreenDeactivationPhase::STOPPED => ! $application->trashed(),
+            BlueGreenDeactivationPhase::REMOVED => ! $application->trashed(),
             default => $application->trashed(),
         };
     }
@@ -89,7 +94,7 @@ final class ApplicationBlueGreenDeactivation extends Model
             || $this->started_at === null
             || $this->queue_cutoff_id < 0
             || $this->supersession_generation < 1
-            || (in_array($this->phase, [BlueGreenDeactivationPhase::COMPLETED, BlueGreenDeactivationPhase::STOPPED], true)) !== ($this->completed_at !== null)) {
+            || (in_array($this->phase, [BlueGreenDeactivationPhase::COMPLETED, BlueGreenDeactivationPhase::STOPPED, BlueGreenDeactivationPhase::REMOVED], true)) !== ($this->completed_at !== null)) {
             throw new \LogicException('The blue-green deactivation fence is malformed.');
         }
         if ($this->proxy_snapshot !== null) {

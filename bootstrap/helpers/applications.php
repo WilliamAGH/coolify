@@ -21,8 +21,11 @@ use Illuminate\Support\Str;
 use Laravel\Horizon\Contracts\JobRepository;
 use Spatie\Url\Url;
 
-function queue_application_deployment(Application $application, string $deployment_uuid, ?int $pull_request_id = 0, ?string $commit = null, bool $force_rebuild = false, bool $is_webhook = false, bool $is_api = false, bool $restart_only = false, ?string $git_type = null, bool $no_questions_asked = false, ?Server $server = null, ?StandaloneDocker $destination = null, bool $only_this_server = false, bool $rollback = false, ?string $docker_registry_image_tag = null)
+function queue_application_deployment(Application $application, string $deployment_uuid, ?int $pull_request_id = 0, ?string $commit = null, bool $force_rebuild = false, bool $is_webhook = false, bool $is_api = false, bool $restart_only = false, ?string $git_type = null, bool $no_questions_asked = false, ?Server $server = null, ?StandaloneDocker $destination = null, bool $only_this_server = false, bool $rollback = false, ?string $docker_registry_image_tag = null, ?string $blue_green_fleet_deployment_uuid = null)
 {
+    if ($blue_green_fleet_deployment_uuid !== null && trim($blue_green_fleet_deployment_uuid) === '') {
+        throw new InvalidArgumentException('A blue-green fleet deployment UUID cannot be empty.');
+    }
     $commit = $commit ?: ($application->git_commit_sha ?: 'HEAD');
     $application_id = $application->id;
     $deployment_link = Url::fromString($application->link()."/deployment/{$deployment_uuid}");
@@ -92,6 +95,7 @@ function queue_application_deployment(Application $application, string $deployme
         'rollback' => $rollback,
         'git_type' => $git_type,
         'only_this_server' => $only_this_server,
+        'blue_green_fleet_deployment_uuid' => $blue_green_fleet_deployment_uuid,
     ]);
 
     if ($deployment->claimForDispatch(bypassServerCapacity: $no_questions_asked)) {

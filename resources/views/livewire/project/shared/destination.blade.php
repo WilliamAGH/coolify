@@ -19,6 +19,17 @@
                 <div class="box-description">
                     Network: {{ data_get($resource, 'destination.network') }}
                 </div>
+                <div class="box-description">
+                    Status: {{ $resource->realStatus() }}
+                </div>
+                @if ($primaryBlueGreenState = data_get($blueGreenDestinationStates, data_get($resource, 'destination.id')))
+                    <div class="box-description">
+                        Blue-green: {{ str(data_get($primaryBlueGreenState, 'phase'))->replace('_', ' ')->headline() }}
+                        @if (data_get($primaryBlueGreenState, 'activeColor'))
+                            ({{ data_get($primaryBlueGreenState, 'activeColor') }})
+                        @endif
+                    </div>
+                @endif
             </div>
             @if ($resource?->additional_networks?->count() > 0)
                 <div class="flex gap-2">
@@ -51,6 +62,17 @@
                             <div class="box-description">
                                 Network: {{ data_get($destination, 'network') }}
                             </div>
+                            <div class="box-description">
+                                Status: {{ data_get($destination, 'pivot.status') }}
+                            </div>
+                            @if ($blueGreenState = data_get($blueGreenDestinationStates, $destination->id))
+                                <div class="box-description">
+                                    Blue-green: {{ str(data_get($blueGreenState, 'phase'))->replace('_', ' ')->headline() }}
+                                    @if (data_get($blueGreenState, 'activeColor'))
+                                        ({{ data_get($blueGreenState, 'activeColor') }})
+                                    @endif
+                                </div>
+                            @endif
                         </div>
                     </div>
                     <div class="flex gap-2">

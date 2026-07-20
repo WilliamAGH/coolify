@@ -4,9 +4,12 @@ namespace App\Actions\Shared;
 
 use App\Actions\Application\BlueGreen\ActiveApplicationContainerResolution;
 use App\Models\Application;
+use App\Models\StandaloneDocker;
 use App\Services\ContainerStatusAggregator;
 use App\Traits\CalculatesExcludedStatus;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\DB;
+use InvalidArgumentException;
 use Lorisleiva\Actions\Concerns\AsAction;
 
 class ComplexStatusCheck
@@ -32,24 +35,14 @@ class ComplexStatusCheck
                 continue;
             }
             if ($resolution instanceof ActiveApplicationContainerResolution && ! $resolution->observable) {
-                if ($is_main_server) {
-                    $application->update(['status' => 'exited']);
-                } else {
-                    $application->additional_servers()->updateExistingPivot($server->id, ['status' => 'exited']);
-                }
+                $this->updateApplicationDestinationStatus($application, $destinationId, $server->id, 'exited');
 
                 continue;
             }
             if (! $server->isFunctional()) {
-                if ($is_main_server) {
-                    $application->update(['status' => 'exited']);
+                $this->updateApplicationDestinationStatus($application, $destinationId, $server->id, 'exited');
 
-                    continue;
-                } else {
-                    $application->additional_servers()->updateExistingPivot($server->id, ['status' => 'exited']);
-
-                    continue;
-                }
+                continue;
             }
             $containers = instant_remote_process(["docker container inspect $(docker container ls -q --filter 'label=coolify.applicationId={$application->id}' --filter 'label=coolify.pullRequestId=0') --format '{{json .}}'"], $server, false);
             $containers = format_docker_command_output_to_json($containers);
@@ -66,31 +59,56 @@ class ComplexStatusCheck
 
             if ($containers->count() > 0) {
                 $statusToSet = $this->aggregateContainerStatuses($application, $containers);
-
-                if ($is_main_server) {
-                    $statusFromDb = $application->status;
-                    if ($statusFromDb !== $statusToSet) {
-                        $application->update(['status' => $statusToSet]);
-                    }
-                } else {
-                    $additional_server = $application->additional_servers()->wherePivot('server_id', $server->id);
-                    $statusFromDb = $additional_server->first()->pivot->status;
-                    if ($statusFromDb !== $statusToSet) {
-                        $additional_server->updateExistingPivot($server->id, ['status' => $statusToSet]);
-                    }
-                }
+                $this->updateApplicationDestinationStatus($application, $destinationId, $server->id, $statusToSet);
             } else {
-                if ($is_main_server) {
-                    $application->update(['status' => 'exited']);
-
-                    continue;
-                } else {
-                    $application->additional_servers()->updateExistingPivot($server->id, ['status' => 'exited']);
-
-                    continue;
-                }
+                $this->updateApplicationDestinationStatus($application, $destinationId, $server->id, 'exited');
             }
         }
+    }
+
+    public function updateApplicationDestinationStatus(
+        Application $application,
+        int $standaloneDockerId,
+        int $serverId,
+        string $status,
+    ): bool {
+        if ($standaloneDockerId < 1 || $serverId < 1 || blank($status)) {
+            throw new InvalidArgumentException('Application destination status updates require an exact destination, server, and status.');
+        }
+
+        $isPrimaryDestination = (int) $application->destination_id === $standaloneDockerId
+            && in_array($application->destination_type, [
+                StandaloneDocker::class,
+                (new StandaloneDocker)->getMorphClass(),
+            ], true)
+            && (int) StandaloneDocker::query()
+                ->whereKey($standaloneDockerId)
+                ->value('server_id') === $serverId;
+        if ($isPrimaryDestination) {
+            if ($application->status !== $status) {
+                $application->update(['status' => $status]);
+            }
+
+            return true;
+        }
+
+        $destinationStatus = DB::table('additional_destinations')
+            ->where('application_id', $application->id)
+            ->where('standalone_docker_id', $standaloneDockerId)
+            ->where('server_id', $serverId)
+            ->value('status');
+        if ($destinationStatus === null) {
+            return false;
+        }
+        if ($destinationStatus !== $status) {
+            DB::table('additional_destinations')
+                ->where('application_id', $application->id)
+                ->where('standalone_docker_id', $standaloneDockerId)
+                ->where('server_id', $serverId)
+                ->update(['status' => $status]);
+        }
+
+        return true;
     }
 
     private function aggregateContainerStatuses($application, $containers)

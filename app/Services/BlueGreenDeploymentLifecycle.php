@@ -47,6 +47,7 @@ use App\Actions\Proxy\BlueGreenRoutingMode;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
 use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
+use App\Actions\Shared\ComplexStatusCheck;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
@@ -328,15 +329,21 @@ final class BlueGreenDeploymentLifecycle
     {
         $claim = $this->claim
             ?? throw new DeploymentException('Blue-green deployment completion has no durable operation claim.');
-        if ($this->application->blueGreenConfiguredStandaloneDockerDestinationIds()->count() !== 1
-            || $this->application->additional_networks()->exists()) {
-            throw new DeploymentException('Blue-green deployment completion requires exactly one configured destination.');
-        }
         $this->assertOperationOwned(BlueGreenDeploymentPhase::DRAINING);
         $this->retireStoppedLegacyContainer();
         $this->assertOperationOwned(BlueGreenDeploymentPhase::DRAINING);
         $state = CompleteBlueGreenDeploymentOperation::run($claim, $this->inactiveRetentionSeconds);
-        $this->application->update(['status' => 'running:healthy']);
+        if (! (new ComplexStatusCheck)->updateApplicationDestinationStatus(
+            $this->application,
+            (int) $this->destination->id,
+            (int) $this->server->id,
+            'running:healthy',
+        )) {
+            $this->deployment->addLogEntry(
+                'Blue-green completion found that this destination was removed from application topology; no primary application status was changed.',
+                'stderr',
+            );
+        }
         $this->promotionCommitted = true;
         $this->deployment->refresh();
         $this->dispatchInactiveRetirement($state, $claim);
@@ -553,6 +560,9 @@ final class BlueGreenDeploymentLifecycle
             || (int) $this->deployment->server_id !== $this->destination->server_id) {
             throw new DeploymentException('The queued blue-green destination does not match the resolved standalone Docker destination and server.');
         }
+        if (! $this->application->isBlueGreenStandaloneDockerDestinationConfigured($this->destination)) {
+            throw new DeploymentException('The queued blue-green destination is no longer configured for this application. No remote mutation will run.');
+        }
 
         $applicationForEligibility = clone $this->application;
         $applicationForEligibility->setRelation('destination', $this->destination);
@@ -601,11 +611,6 @@ final class BlueGreenDeploymentLifecycle
             || $this->deployment->pull_request_id !== 0) {
             throw new DeploymentException('The queued drain recovery does not match the durable standalone Docker destination.');
         }
-        if ($this->application->blueGreenConfiguredStandaloneDockerDestinationIds()->count() !== 1
-            || $this->application->additional_networks()->exists()) {
-            throw new DeploymentException('Blue-green drain recovery requires exactly one configured destination.');
-        }
-
         $operation = ReconstructBlueGreenDeploymentRecovery::run($state);
         if (! $operation->wasFinalized
             || $operation->recoveredPhase !== BlueGreenDeploymentPhase::DRAINING
@@ -1532,7 +1537,10 @@ final class BlueGreenDeploymentLifecycle
         try {
             $this->assertLifecycleLockOwned();
             $this->deployment->refresh();
-            if ($this->deployment->status !== ApplicationDeploymentStatus::CANCELLED_BY_USER->value) {
+            if (! in_array($this->deployment->status, [
+                ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+                ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value,
+            ], true)) {
                 $this->assertOperationOwned(
                     BlueGreenDeploymentPhase::PREPARING,
                     BlueGreenDeploymentPhase::SWITCHING,
