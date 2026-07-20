@@ -875,9 +875,10 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
         'Verify exact fork control-plane OCI runtime and content',
     );
     $forkContentGateRun = (string) ($forkContentGate['run'] ?? '');
-    if (($forkContentGate['if'] ?? null) !== "\${{ matrix.product == 'main' }}" ||
+    if (isset($forkContentGate['if']) ||
         ($forkContentGate['continue-on-error'] ?? false) !== false ||
-        ! str_contains($forkContentGateRun, 'OCI_CONTENT_POLICY=control-plane-main') ||
+        ($forkContentGate['env']['CONTENT_POLICY'] ?? null) !== "\${{ matrix.product == 'main' && 'control-plane-main' || 'none' }}" ||
+        ! str_contains($forkContentGateRun, 'OCI_CONTENT_POLICY="$CONTENT_POLICY"') ||
         ! str_contains($forkContentGateRun, 'tests/Integration/VerifyOciArchiveImage.sh')) {
         $violations[] = 'both native fork control-plane OCI archives must pass the fail-closed runtime content census';
     }
@@ -1969,6 +1970,127 @@ it('executes immutable-tag, compensation, and platform-verification behavior aga
         ->and($process->getOutput())->toContain('PUBLISH_LINUX_IMAGE_HELPER_PASS');
 });
 
+it('loads a native child from a nested attested OCI archive', function () {
+    $filesystem = new Filesystem;
+    $fixture = sys_get_temp_dir().'/coolify-nested-oci-'.bin2hex(random_bytes(8));
+    $layout = $fixture.'/layout';
+    $blobDirectory = $layout.'/blobs/sha256';
+    $bin = $fixture.'/bin';
+    $filesystem->mkdir([$blobDirectory, $bin]);
+
+    $writeBlob = static function (array $document) use ($blobDirectory): array {
+        $contents = json_encode($document, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
+        $digest = hash('sha256', $contents);
+        file_put_contents($blobDirectory.'/'.$digest, $contents);
+
+        return ['digest' => 'sha256:'.$digest, 'size' => strlen($contents)];
+    };
+
+    try {
+        $config = $writeBlob([
+            'architecture' => 'amd64',
+            'config' => ['Labels' => []],
+            'os' => 'linux',
+            'rootfs' => ['diff_ids' => [], 'type' => 'layers'],
+        ]);
+        $manifest = $writeBlob([
+            'config' => [
+                'digest' => $config['digest'],
+                'mediaType' => 'application/vnd.oci.image.config.v1+json',
+                'size' => $config['size'],
+            ],
+            'layers' => [],
+            'mediaType' => 'application/vnd.oci.image.manifest.v1+json',
+            'schemaVersion' => 2,
+        ]);
+        $attestation = $writeBlob([
+            'config' => [
+                'digest' => $config['digest'],
+                'mediaType' => 'application/vnd.oci.image.config.v1+json',
+                'size' => $config['size'],
+            ],
+            'layers' => [],
+            'mediaType' => 'application/vnd.oci.image.manifest.v1+json',
+            'schemaVersion' => 2,
+        ]);
+        $innerIndex = $writeBlob([
+            'manifests' => [
+                [
+                    'digest' => $manifest['digest'],
+                    'mediaType' => 'application/vnd.oci.image.manifest.v1+json',
+                    'platform' => ['architecture' => 'amd64', 'os' => 'linux'],
+                    'size' => $manifest['size'],
+                ],
+                [
+                    'annotations' => [
+                        'vnd.docker.reference.digest' => $manifest['digest'],
+                        'vnd.docker.reference.type' => 'attestation-manifest',
+                    ],
+                    'digest' => $attestation['digest'],
+                    'mediaType' => 'application/vnd.oci.image.manifest.v1+json',
+                    'platform' => ['architecture' => 'unknown', 'os' => 'unknown'],
+                    'size' => $attestation['size'],
+                ],
+            ],
+            'mediaType' => 'application/vnd.oci.image.index.v1+json',
+            'schemaVersion' => 2,
+        ]);
+        file_put_contents($layout.'/oci-layout', json_encode(['imageLayoutVersion' => '1.0.0'], JSON_THROW_ON_ERROR));
+        file_put_contents($layout.'/index.json', json_encode([
+            'manifests' => [[
+                'digest' => $innerIndex['digest'],
+                'mediaType' => 'application/vnd.oci.image.index.v1+json',
+                'size' => $innerIndex['size'],
+            ]],
+            'mediaType' => 'application/vnd.oci.image.index.v1+json',
+            'schemaVersion' => 2,
+        ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES));
+
+        $archive = $fixture.'/nested.oci.tar';
+        (new Process(['tar', '-C', $layout, '-cf', $archive, 'oci-layout', 'index.json', 'blobs']))->mustRun();
+        file_put_contents($bin.'/docker', <<<'SH'
+#!/bin/sh
+set -eu
+case "$1:$2" in
+    image:inspect)
+        case " $* " in
+            *' --format {{.Id}} '*) printf '%s\n' "${CONFIG_DIGEST:?}" ;;
+            *' --format {{.Os}}/{{.Architecture}} '*) printf '%s\n' 'linux/amd64' ;;
+            *) exit 1 ;;
+        esac
+        ;;
+    load:*) exit 0 ;;
+    tag:*) exit 0 ;;
+    *) printf 'unexpected docker invocation: %s\n' "$*" >&2; exit 64 ;;
+esac
+SH);
+        chmod($bin.'/docker', 0755);
+
+        $process = new Process(
+            ['sh', releaseWorkflowRepositoryRoot().'/tests/Integration/VerifyOciArchiveImage.sh'],
+            releaseWorkflowRepositoryRoot(),
+            [
+                'CONFIG_DIGEST' => $config['digest'],
+                'OCI_ARCHIVE' => $archive,
+                'OCI_ARCHIVE_SHA256' => hash_file('sha256', $archive),
+                'OCI_CHILD_DIGEST' => $manifest['digest'],
+                'OCI_CONTENT_POLICY' => 'none',
+                'OCI_IMAGE' => 'local/coolify:test-nested',
+                'OCI_PLATFORM' => 'linux/amd64',
+                'PATH' => $bin.PATH_SEPARATOR.(getenv('PATH') ?: ''),
+                'RUNNER_TEMP' => $fixture,
+            ],
+        );
+        $process->mustRun();
+
+        expect($process->getOutput())
+            ->toContain('OCI_ARCHIVE_RUNTIME_VERIFIED')
+            ->toContain('child_digest='.$manifest['digest']);
+    } finally {
+        $filesystem->remove($fixture);
+    }
+});
+
 it('defines one referrerless fork release graph for both images and both platforms', function () {
     $root = releaseWorkflowRepositoryRoot();
     $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
@@ -2004,6 +2126,32 @@ it('defines one referrerless fork release graph for both images and both platfor
         ->toContain('org.opencontainers.image.source=https://github.com/${{ github.repository }}')
         ->toContain('org.opencontainers.image.revision=${{ github.sha }}')
         ->toContain('org.opencontainers.image.version=${{ inputs.semantic_version }}');
+
+    $archiveVerificationRun = (string) (releaseWorkflowStep(
+        $jobs['fork-build'] ?? [],
+        'Verify fork OCI labels and inline attestations',
+    )['run'] ?? '');
+    expect($archiveVerificationRun)
+        ->toContain('expected one nested image index')
+        ->toContain('nested_index_blob="$layout/blobs/sha256/${nested_index_digest#sha256:}"');
+
+    $runtimeVerifier = (string) file_get_contents($root.'/tests/Integration/VerifyOciArchiveImage.sh');
+    expect($runtimeVerifier)
+        ->toContain('expected one nested image index')
+        ->toContain('indexes = [index]')
+        ->toContain("indexes.append(json.load(source.extractfile(f'blobs/sha256/{nested_digest}')))");
+
+    foreach ([
+        'Generate standalone fork SPDX SBOM',
+        'Scan fork OCI for high and critical vulnerabilities',
+        'Scan fork OCI for secrets',
+    ] as $scanStepName) {
+        $scanStep = releaseWorkflowStep($jobs['fork-build'] ?? [], $scanStepName);
+        expect(json_encode($scanStep, JSON_THROW_ON_ERROR))->toContain('-fork-runtime');
+    }
+    $secretScan = releaseWorkflowStep($jobs['fork-build'] ?? [], 'Scan fork OCI for secrets');
+    expect($secretScan['with']['image-ref'] ?? null)
+        ->toBe('local/${{ matrix.artifact_name }}:${{ github.sha }}-${{ matrix.arch }}-fork-runtime');
 
     $policyRun = (string) (releaseWorkflowStep(
         $jobs['fork-registry-policy'] ?? [],
@@ -2310,14 +2458,14 @@ it('requires both fork application version sources to exactly match the immutabl
         $cases = [
             'matching version sources' => [$constants, $versions, true, ''],
             'constants version mismatch' => [
-                str_replace("'4.13.1-fork'", "'4.13.2-fork'", $constants),
+                str_replace("'4.13.2-fork'", "'4.13.3-fork'", $constants),
                 $versions,
                 false,
                 'config/constants.php Coolify version must equal the fork tag',
             ],
             'versions json mismatch' => [
                 $constants,
-                str_replace('"4.13.1-fork"', '"4.13.2-fork"', $versions),
+                str_replace('"4.13.2-fork"', '"4.13.3-fork"', $versions),
                 false,
                 'versions.json Coolify v4 version must equal the fork tag',
             ],
@@ -2328,7 +2476,7 @@ it('requires both fork application version sources to exactly match the immutabl
             file_put_contents($fixture.'/versions.json', $fixtureVersions);
             $process = new Process(['bash', '-c', $script], $root, [
                 'GITHUB_WORKSPACE' => $fixture,
-                'SEMANTIC_VERSION' => '4.13.1-fork',
+                'SEMANTIC_VERSION' => '4.13.2-fork',
             ]);
             $process->run();
 
