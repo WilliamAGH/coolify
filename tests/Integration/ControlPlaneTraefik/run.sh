@@ -18,6 +18,8 @@ readonly MIN_PROVIDER_CADENCE_MS=500
 readonly MAX_PROVIDER_CADENCE_MS=5000
 readonly MAX_PROVIDER_START_DELAY_MS=15000
 readonly MAX_RELOAD_DELAY_MS=12000
+readonly MIN_TRANSITION_OBSERVATION_MS=5000
+readonly MAX_TRANSITION_OBSERVATION_MS=17000
 readonly TRANSITION_ATTEMPTS=24
 readonly TRANSITION_SAMPLE_DELAY_SECONDS=0.05
 
@@ -39,6 +41,10 @@ fail() {
 
 now_ms() {
     python3 -c 'import time; print(int(time.time() * 1000))'
+}
+
+monotonic_ms() {
+    python3 -c 'import time; print(int(time.monotonic() * 1000))'
 }
 
 compose() {
@@ -67,6 +73,12 @@ cleanup() {
 }
 
 trap cleanup EXIT
+
+initialize_temp_directory() {
+    TEMP_BASE=${TMPDIR:-/tmp}
+    TEMP_BASE=${TEMP_BASE%/}
+    TEMP_DIRECTORY=$(mktemp -d "$TEMP_BASE/coolify-control-plane-traefik.XXXXXX")
+}
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || fail "Required command is unavailable: $1"
@@ -589,12 +601,37 @@ wait_for_docker_provider_route() {
 start_transition_observer() {
     local log_file=$1
     local attempt=1
+    local first_https_observed_at_ms=0
+    local first_app_port_observed_at_ms=0
+    local https_observed_at_ms=0
+    local app_port_observed_at_ms=0
+    local observer_started_at_ms
+    local record
 
     : > "$log_file"
     (
-        while [ "$attempt" -le "$TRANSITION_ATTEMPTS" ]; do
-            printf 'https|%s\n' "$(fetch_route https)" >> "$log_file"
-            printf 'app-port|%s\n' "$(fetch_route app-port)" >> "$log_file"
+        observer_started_at_ms=$(monotonic_ms)
+        while :; do
+            record=$(fetch_route https)
+            https_observed_at_ms=$(now_ms)
+            printf '%s|https|%s\n' "$https_observed_at_ms" "$record" >> "$log_file"
+
+            record=$(fetch_route app-port)
+            app_port_observed_at_ms=$(now_ms)
+            printf '%s|app-port|%s\n' "$app_port_observed_at_ms" "$record" >> "$log_file"
+
+            if [ "$attempt" -eq 1 ]; then
+                first_https_observed_at_ms=$https_observed_at_ms
+                first_app_port_observed_at_ms=$app_port_observed_at_ms
+            fi
+            if [ "$attempt" -ge "$TRANSITION_ATTEMPTS" ] \
+                && [ "$((https_observed_at_ms - first_https_observed_at_ms))" -ge "$MIN_TRANSITION_OBSERVATION_MS" ] \
+                && [ "$((app_port_observed_at_ms - first_app_port_observed_at_ms))" -ge "$MIN_TRANSITION_OBSERVATION_MS" ]; then
+                break
+            fi
+            if [ "$(( $(monotonic_ms) - observer_started_at_ms ))" -ge "$MAX_TRANSITION_OBSERVATION_MS" ]; then
+                fail 'Transition observer could not collect a five-second timestamp span within the bounded observation window'
+            fi
             sleep "$TRANSITION_SAMPLE_DELAY_SECONDS"
             attempt=$((attempt + 1))
         done
@@ -626,15 +663,28 @@ assert_transition_log() {
     local new_acknowledgement=$8
     local new_dynamic_sha=$9
     local new_backend=${10}
-    local route status color generation acknowledgement dynamic_sha backend
+    local observed_at_ms route status color generation acknowledgement dynamic_sha backend
     local https_samples=0
     local app_port_samples=0
     local old_https=0
     local old_app_port=0
     local new_https=0
     local new_app_port=0
+    local first_https_observed_at_ms=0
+    local first_app_port_observed_at_ms=0
+    local last_observed_at_ms=0
+    local last_https_observed_at_ms=0
+    local last_app_port_observed_at_ms=0
+    local https_observation_ms
+    local app_port_observation_ms
 
-    while IFS='|' read -r route status color generation acknowledgement dynamic_sha backend; do
+    awk -F'|' 'NF != 8 { exit 1 }' "$log_file" || fail 'Transition observer recorded a malformed sample'
+    while IFS='|' read -r observed_at_ms route status color generation acknowledgement dynamic_sha backend; do
+        [[ $observed_at_ms =~ ^[0-9]{13,16}$ ]] || fail 'Transition observer recorded a malformed epoch-millisecond timestamp'
+        if [ "$last_observed_at_ms" -gt 0 ] && [ "$observed_at_ms" -lt "$last_observed_at_ms" ]; then
+            fail 'Transition observer recorded nonmonotonic sample timestamps'
+        fi
+        last_observed_at_ms=$observed_at_ms
         [ "$status" = 200 ] || fail "Transition observer saw $route status $status"
         if [ "$color" = "$old_color" ] && [ "$generation" = "$old_generation" ] && [ "$acknowledgement" = "$old_acknowledgement" ] && [ "$dynamic_sha" = "$old_dynamic_sha" ]; then
             if [ "$route" = https ]; then
@@ -653,8 +703,22 @@ assert_transition_log() {
         fi
 
         if [ "$route" = https ]; then
+            if [ "$last_https_observed_at_ms" -gt 0 ] && [ "$observed_at_ms" -lt "$last_https_observed_at_ms" ]; then
+                fail 'Transition observer recorded nonmonotonic HTTPS timestamps'
+            fi
+            if [ "$first_https_observed_at_ms" -eq 0 ]; then
+                first_https_observed_at_ms=$observed_at_ms
+            fi
+            last_https_observed_at_ms=$observed_at_ms
             https_samples=$((https_samples + 1))
         elif [ "$route" = app-port ]; then
+            if [ "$last_app_port_observed_at_ms" -gt 0 ] && [ "$observed_at_ms" -lt "$last_app_port_observed_at_ms" ]; then
+                fail 'Transition observer recorded nonmonotonic APP_PORT timestamps'
+            fi
+            if [ "$first_app_port_observed_at_ms" -eq 0 ]; then
+                first_app_port_observed_at_ms=$observed_at_ms
+            fi
+            last_app_port_observed_at_ms=$observed_at_ms
             app_port_samples=$((app_port_samples + 1))
         else
             fail "Transition observer recorded an unknown route: $route"
@@ -665,6 +729,76 @@ assert_transition_log() {
     [ "$app_port_samples" -ge "$TRANSITION_ATTEMPTS" ] || fail 'Transition observer did not sample APP_PORT enough times'
     [ "$old_https" -gt 0 ] && [ "$old_app_port" -gt 0 ] || fail 'Transition observer never saw the predecessor identity on both routes'
     [ "$new_https" -gt 0 ] && [ "$new_app_port" -gt 0 ] || fail 'Transition observer never saw the replacement identity on both routes'
+    https_observation_ms=$((last_https_observed_at_ms - first_https_observed_at_ms))
+    app_port_observation_ms=$((last_app_port_observed_at_ms - first_app_port_observed_at_ms))
+    [ "$https_observation_ms" -ge "$MIN_TRANSITION_OBSERVATION_MS" ] \
+        || fail "Transition observer sampled HTTPS for only ${https_observation_ms}ms"
+    [ "$app_port_observation_ms" -ge "$MIN_TRANSITION_OBSERVATION_MS" ] \
+        || fail "Transition observer sampled APP_PORT for only ${app_port_observation_ms}ms"
+}
+
+write_transition_log_fixture() {
+    local log_file=$1
+    local fixture_kind=$2
+    local attempt
+    local observed_at_ms
+    local interval_ms=220
+    local color='blue'
+    local generation='generation-blue'
+    local acknowledgement='ack-blue'
+    local dynamic_sha='sha-blue'
+    local backend='blue'
+    local malformed_suffix
+
+    if [ "$fixture_kind" = too-short ]; then
+        interval_ms=100
+    fi
+    : > "$log_file"
+    for ((attempt = 1; attempt <= TRANSITION_ATTEMPTS; attempt++)); do
+        observed_at_ms=$((1700000000000 + (attempt - 1) * interval_ms))
+        malformed_suffix=''
+        if [ "$attempt" -gt 12 ]; then
+            color='green'
+            generation='generation-green'
+            acknowledgement='ack-green'
+            dynamic_sha='sha-green'
+            backend='green'
+        fi
+        if [ "$fixture_kind" = nonmonotonic ] && [ "$attempt" -eq 13 ]; then
+            observed_at_ms=1699999999999
+        fi
+        if [ "$fixture_kind" = malformed ] && [ "$attempt" -eq 7 ]; then
+            malformed_suffix='|unexpected'
+        fi
+        printf '%s|https|200|%s|%s|%s|%s|%s%s\n' \
+            "$observed_at_ms" "$color" "$generation" "$acknowledgement" "$dynamic_sha" "$backend" "$malformed_suffix" >> "$log_file"
+        printf '%s|app-port|200|%s|%s|%s|%s|%s\n' \
+            "$observed_at_ms" "$color" "$generation" "$acknowledgement" "$dynamic_sha" "$backend" >> "$log_file"
+    done
+}
+
+expect_transition_log_failure() {
+    local log_file=$1
+    local expected_failure=$2
+
+    if (assert_transition_log "$log_file" blue generation-blue ack-blue sha-blue green generation-green ack-green sha-green green) >/dev/null 2>&1; then
+        fail "Transition-log validator accepted a ${expected_failure} fixture"
+    fi
+}
+
+assert_transition_log_validation() {
+    local fixture_kind
+    local log_file
+
+    for fixture_kind in valid malformed nonmonotonic too-short; do
+        log_file="$TEMP_DIRECTORY/transition-${fixture_kind}.log"
+        write_transition_log_fixture "$log_file" "$fixture_kind"
+        if [ "$fixture_kind" = valid ]; then
+            assert_transition_log "$log_file" blue generation-blue ack-blue sha-blue green generation-green ack-green sha-green green
+        else
+            expect_transition_log_failure "$log_file" "$fixture_kind"
+        fi
+    done
 }
 
 traefik_container_id() {
@@ -726,6 +860,19 @@ main() {
     local restart_started_at
     local total_route_requests
 
+    if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$1" != --self-test ]; }; then
+        fail 'Usage: run.sh [--self-test]'
+    fi
+    if [ "${1:-}" = --self-test ]; then
+        for command in python3 mktemp awk; do
+            require_command "$command"
+        done
+        initialize_temp_directory
+        assert_transition_log_validation
+        printf 'PASS: transition-log duration validation self-tests completed.\n'
+        return
+    fi
+
     for command in docker curl openssl python3 mktemp awk sed tr cp mv wc jq; do
         require_command "$command"
     done
@@ -748,9 +895,8 @@ main() {
     esac
     [ -S "$TRAEFIK_DOCKER_SOCKET" ] || fail "Docker socket is not a local socket: $TRAEFIK_DOCKER_SOCKET"
 
-    TEMP_BASE=${TMPDIR:-/tmp}
-    TEMP_BASE=${TEMP_BASE%/}
-    TEMP_DIRECTORY=$(mktemp -d "$TEMP_BASE/coolify-control-plane-traefik.XXXXXX")
+    initialize_temp_directory
+    assert_transition_log_validation
     PROJECT_NAME="coolify-control-plane-traefik-$$"
     TRAEFIK_CERT_DIR="$TEMP_DIRECTORY/certs"
     BACKEND_BLUE_STATE_DIR="$TEMP_DIRECTORY/backend-blue"
