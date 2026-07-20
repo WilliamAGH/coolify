@@ -74,7 +74,7 @@ Thank you so much!
 * [Macarne](https://macarne.com) - Best IP Transit & Carrier Ethernet Solutions for Simplified Network Connectivity
 * [Hetzner](http://htznr.li/CoolifyXHetzner) - Server, cloud, hosting, and data center solutions
 * [Logto](https://logto.io) - The better identity infrastructure for developers
-* [Supadata](https://supadata.ai/) - Scrape YouTube, web, and files. Get AI-ready, clean data for your next project. 
+* [Supadata](https://supadata.ai/) - Scrape YouTube, web, and files. Get AI-ready, clean data for your next project.
 * [Tolgee](https://tolgee.io) - The open source localization platform
 * [Best Consultant](https://bc.direct) - Your trusted technology consulting partner
 * [ArcJet](https://arcjet.com) - Advanced web security and performance solutions

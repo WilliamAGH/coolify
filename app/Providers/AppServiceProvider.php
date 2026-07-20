@@ -3,7 +3,13 @@
 namespace App\Providers;
 
 use App\Models\PersonalAccessToken;
+use App\Support\ProxyMutationExecutionPipe;
+use App\Support\ProxyMutationQueue;
+use App\Support\ProxyMutationRedisConnector;
+use App\Support\ProxyMutationRedisQueue;
+use Illuminate\Bus\Dispatcher;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Queue\QueueManager;
 use Illuminate\Support\Facades\App;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
@@ -26,12 +32,49 @@ class AppServiceProvider extends ServiceProvider
 
     public function boot(): void
     {
+        $this->configureProxyMutationQueue();
+        $this->configureProxyMutationExecutionPipe();
         $this->configureCommands();
         $this->configureModels();
         $this->configurePasswords();
         $this->configureSanctumModel();
         $this->configureGitHubHttp();
 
+    }
+
+    private function configureProxyMutationQueue(): void
+    {
+        ProxyMutationQueue::redisConnectionName();
+
+        $queueManager = $this->app->make(QueueManager::class);
+        foreach (config('queue.connections', []) as $connectionName => $connection) {
+            if (! is_array($connection)
+                || ($connection['driver'] ?? null) !== 'redis'
+                || ! $queueManager->connected($connectionName)) {
+                continue;
+            }
+
+            if (! $queueManager->connection($connectionName) instanceof ProxyMutationRedisQueue) {
+                throw new \LogicException("The Redis queue connection [{$connectionName}] resolved before the proxy-mutation gate.");
+            }
+        }
+
+        $queueManager->addConnector('redis', fn (): ProxyMutationRedisConnector => new ProxyMutationRedisConnector(
+            $this->app['redis'],
+        ));
+
+        if (! $queueManager->connection(ProxyMutationQueue::CONNECTION) instanceof ProxyMutationRedisQueue) {
+            throw new \LogicException('The canonical proxy-mutation queue connection must resolve through the mutation gate.');
+        }
+
+        ProxyMutationQueue::registerPayloadTargetGate();
+    }
+
+    private function configureProxyMutationExecutionPipe(): void
+    {
+        $this->app->make(Dispatcher::class)->pipeThrough([
+            ProxyMutationExecutionPipe::class,
+        ]);
     }
 
     private function configureCommands(): void

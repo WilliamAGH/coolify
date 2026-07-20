@@ -164,6 +164,19 @@
         JS;
     @endphp
     <x-resources.breadcrumbs :resource="$application" :parameters="$parameters" :title="$lastDeploymentInfo" :lastDeploymentLink="$lastDeploymentLink" />
+    @if ($blueGreenInactiveRetirement !== null)
+        <div class="pb-2 text-xs text-neutral-500 dark:text-neutral-400">
+            @if ($blueGreenInactiveRetirement['status'] === 'stopped')
+                Inactive {{ $blueGreenInactiveRetirement['color'] }} container is stopped and retained for fast rollback.
+            @elseif ($blueGreenInactiveRetirement['status'] === 'intervention_required')
+                Inactive {{ $blueGreenInactiveRetirement['color'] }} container retirement requires operator intervention.
+            @elseif ($blueGreenInactiveRetirement['status'] === 'draining')
+                Inactive {{ $blueGreenInactiveRetirement['color'] }} container is draining {{ $blueGreenInactiveRetirement['activeConnections'] }} active connection(s) before retirement.
+            @else
+                Inactive {{ $blueGreenInactiveRetirement['color'] }} container remains running until {{ $blueGreenInactiveRetirement['notBeforeAt'] }}; embedded workers remain active.
+            @endif
+        </div>
+    @endif
     <div class="navbar-main">
         <div class="w-full md:hidden">
             @if (!($application->build_pack === 'dockercompose' && is_null($application->docker_compose_raw)))

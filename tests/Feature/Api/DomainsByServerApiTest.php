@@ -2,6 +2,7 @@
 
 use App\Models\Application;
 use App\Models\Environment;
+use App\Models\InstanceSettings;
 use App\Models\Project;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
@@ -12,6 +13,10 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
+    InstanceSettings::unguarded(fn (): InstanceSettings => InstanceSettings::query()->updateOrCreate(
+        ['id' => 0],
+        ['is_api_enabled' => true],
+    ));
     $this->team = Team::factory()->create();
     $this->user = User::factory()->create();
     $this->team->members()->attach($this->user->id, ['role' => 'owner']);
@@ -35,7 +40,7 @@ function domainApiAuthHeaders(): array
 
 test('returns domains for own team application via uuid query param', function () {
     $application = Application::factory()->create([
-        'fqdn' => 'https://my-app.example.com',
+        'fqdn' => 'https://my-app.example.com:8443/path',
         'environment_id' => $this->environment->id,
         'destination_id' => $this->destination->id,
         'destination_type' => $this->destination->getMorphClass(),
@@ -46,6 +51,24 @@ test('returns domains for own team application via uuid query param', function (
 
     $response->assertOk();
     $response->assertJsonFragment(['my-app.example.com']);
+    expect($response->json())->not->toContain('my-app.example.com:8443')
+        ->not->toContain('path');
+});
+
+test('keeps the route server identity separate from the application query uuid', function () {
+    $otherServer = Server::factory()->create(['team_id' => $this->team->id]);
+    $application = Application::factory()->create([
+        'fqdn' => 'https://route-identity.example.com',
+        'environment_id' => $this->environment->id,
+        'destination_id' => $this->destination->id,
+        'destination_type' => $this->destination->getMorphClass(),
+    ]);
+
+    $response = $this->withHeaders(domainApiAuthHeaders())
+        ->getJson("/api/v1/servers/{$otherServer->uuid}/domains?uuid={$application->uuid}");
+
+    $response->assertOk()
+        ->assertJsonFragment(['route-identity.example.com']);
 });
 
 test('returns 404 when application uuid belongs to another team', function () {
@@ -87,7 +110,7 @@ test('returns 404 when server uuid belongs to another team', function () {
 
     $otherServer = Server::factory()->create(['team_id' => $otherTeam->id]);
 
-    $response = $this->withHeaders(authHeaders())
+    $response = $this->withHeaders(domainApiAuthHeaders())
         ->getJson("/api/v1/servers/{$otherServer->uuid}/domains");
 
     $response->assertNotFound();
@@ -112,7 +135,7 @@ test('only returns domains for applications on the specified server', function (
         'destination_type' => $otherDestination->getMorphClass(),
     ]);
 
-    $response = $this->withHeaders(authHeaders())
+    $response = $this->withHeaders(domainApiAuthHeaders())
         ->getJson("/api/v1/servers/{$this->server->uuid}/domains");
 
     $response->assertOk();

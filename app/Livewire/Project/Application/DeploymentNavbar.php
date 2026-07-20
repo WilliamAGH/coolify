@@ -2,7 +2,7 @@
 
 namespace App\Livewire\Project\Application;
 
-use App\Enums\ApplicationDeploymentStatus;
+use App\Actions\Application\CancelApplicationDeployment;
 use App\Models\Application;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\Server;
@@ -55,7 +55,11 @@ class DeploymentNavbar extends Component
     {
         try {
             $this->authorize('deploy', $this->application);
-            force_start_deployment($this->application_deployment_queue);
+            if (! force_start_deployment($this->application_deployment_queue)) {
+                $this->application_deployment_queue->refresh();
+                $this->dispatch('refreshQueue');
+                $this->dispatch('warning', 'This deployment could not be force-started because its queue state or application deployment slot changed. The queue has been refreshed.');
+            }
         } catch (\Throwable $e) {
             return handleError($e, $this);
         }
@@ -100,10 +104,9 @@ class DeploymentNavbar extends Component
         $build_server_id = $this->application_deployment_queue->build_server_id ?? $this->application->destination->server_id;
         $server_id = $this->application_deployment_queue->server_id ?? $this->application->destination->server_id;
 
-        // First, mark the deployment as cancelled to prevent further processing
-        $this->application_deployment_queue->update([
-            'status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
-        ]);
+        if (! CancelApplicationDeployment::run($this->application_deployment_queue)) {
+            return;
+        }
 
         try {
             if ($this->application->settings->is_build_server_enabled) {
@@ -159,7 +162,7 @@ class DeploymentNavbar extends Component
             $this->application_deployment_queue->update([
                 'current_process_id' => null,
             ]);
-            next_after_cancel($server);
+            next_after_cancel($this->application_deployment_queue);
         }
     }
 }

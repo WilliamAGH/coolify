@@ -675,7 +675,7 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
         $violations[] = 'application validation must serialize pushes without cancellation while superseding stale pull requests';
     }
 
-    $genericJobs = ['php', 'browser', 'formatting', 'node', 'workflow-and-shell'];
+    $genericJobs = ['php', 'blue-green-lifecycle', 'browser', 'formatting', 'node', 'workflow-and-shell'];
     foreach ($genericJobs as $jobName) {
         if (! isset($applicationJobs[$jobName])) {
             $violations[] = "missing generic application validation job: {$jobName}";
@@ -706,6 +706,12 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
             fn (array $step): bool => str_contains((string) ($step['run'] ?? ''), 'touch database/browser-testing.sqlite'),
         )) {
         $violations[] = 'browser validation must use a file-backed SQLite database';
+    }
+    $blueGreenLifecycleJob = $applicationJobs['blue-green-lifecycle'] ?? [];
+    if (($blueGreenLifecycleJob['env']['COOLIFY_EXTERNAL_TEST_SERVICES'] ?? null) !== true ||
+        ($blueGreenLifecycleJob['env']['DB_HOST'] ?? null) !== '127.0.0.1' ||
+        ! str_ends_with((string) ($blueGreenLifecycleJob['env']['DB_DATABASE'] ?? ''), '_testing')) {
+        $violations[] = 'PostgreSQL lifecycle validation must explicitly confirm isolated loopback test services';
     }
     $requiredJobs = [...$genericJobs, 'fork-deploy', 'testing-host-runtime'];
     $requiredNeeds = releaseWorkflowNeeds($applicationJobs['required'] ?? []);

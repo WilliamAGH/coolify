@@ -2,9 +2,11 @@
 
 namespace App\Livewire\Project\Shared;
 
+use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
 use App\Actions\Application\StopApplicationOneServer;
 use App\Actions\Docker\GetContainersStatus;
 use App\Events\ApplicationStatusChanged;
+use App\Models\Application;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
 use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
@@ -116,10 +118,33 @@ class Destination extends Component
     {
         try {
             $server = Server::ownedByCurrentTeam()->findOrFail($server_id);
-            $network = StandaloneDocker::ownedByCurrentTeam()->where('server_id', $server->id)->findOrFail($network_id);
+            StandaloneDocker::ownedByCurrentTeam()->where('server_id', $server->id)->findOrFail($network_id);
             $this->authorize('update', $this->resource);
-            $this->resource->getConnection()->transaction(function () use ($network, $server) {
+
+            $this->resource->getConnection()->transaction(function () use ($network_id, $server_id): void {
+                BlueGreenTopologyLock::acquire($this->resource->getConnection());
+                $this->reloadResourceTopology();
+                $server = Server::ownedByCurrentTeam()->findOrFail($server_id);
+                $network = StandaloneDocker::ownedByCurrentTeam()
+                    ->where('server_id', $server->id)
+                    ->findOrFail($network_id);
+                if ($this->isMainDestination($network_id, $server_id)) {
+                    return;
+                }
+                if (! $this->resource->additional_networks()
+                    ->whereKey($network_id)
+                    ->wherePivot('server_id', $server_id)
+                    ->exists()) {
+                    throw new \RuntimeException('The destination is no longer attached to this resource and cannot be promoted.');
+                }
+
                 $mainDestination = $this->resource->destination;
+                if ($this->resource instanceof Application) {
+                    $this->resource->prepareBlueGreenAdditionalDestinationAddition($network);
+                }
+                $this->resource->additional_networks()->attach($mainDestination->id, [
+                    'server_id' => $mainDestination->server->id,
+                ]);
                 $this->resource->update([
                     'destination_id' => $network->id,
                     'destination_type' => StandaloneDocker::class,
@@ -127,7 +152,6 @@ class Destination extends Component
                 $this->resource->additional_networks()
                     ->wherePivot('server_id', $server->id)
                     ->detach($network->id);
-                $this->resource->additional_networks()->attach($mainDestination->id, ['server_id' => $mainDestination->server->id]);
             });
             $this->resource->refresh();
             $this->refreshServers();
@@ -147,10 +171,21 @@ class Destination extends Component
     {
         try {
             $server = Server::ownedByCurrentTeam()->findOrFail($server_id);
-            $network = StandaloneDocker::ownedByCurrentTeam()->where('server_id', $server->id)->findOrFail($network_id);
+            StandaloneDocker::ownedByCurrentTeam()->where('server_id', $server->id)->findOrFail($network_id);
             $this->authorize('update', $this->resource);
 
-            $this->resource->additional_networks()->attach($network->id, ['server_id' => $server->id]);
+            $this->resource->getConnection()->transaction(function () use ($network_id, $server_id): void {
+                BlueGreenTopologyLock::acquire($this->resource->getConnection());
+                $this->reloadResourceTopology();
+                $server = Server::ownedByCurrentTeam()->findOrFail($server_id);
+                $network = StandaloneDocker::ownedByCurrentTeam()
+                    ->where('server_id', $server->id)
+                    ->findOrFail($network_id);
+                if ($this->resource instanceof Application) {
+                    $this->resource->prepareBlueGreenAdditionalDestinationAddition($network);
+                }
+                $this->resource->additional_networks()->attach($network->id, ['server_id' => $server->id]);
+            });
             $this->dispatch('refresh');
         } catch (\Throwable $e) {
             return handleError($e, $this);
@@ -165,16 +200,40 @@ class Destination extends Component
                 return 'The provided password is incorrect.';
             }
 
-            if ($this->resource->destination->server->id == $server_id && $this->resource->destination->id == $network_id) {
+            if ($this->isMainDestination($network_id, $server_id)) {
                 $this->dispatch('error', 'You are trying to remove the main server.');
 
                 return;
             }
             $server = Server::ownedByCurrentTeam()->findOrFail($server_id);
-            StopApplicationOneServer::run($this->resource, $server);
-            $this->resource->additional_networks()
-                ->wherePivot('server_id', $server_id)
-                ->detach($network_id);
+            StandaloneDocker::ownedByCurrentTeam()->where('server_id', $server->id)->findOrFail($network_id);
+            [$shouldStopServer, $server] = $this->resource->getConnection()->transaction(function () use ($network_id, $server_id): array {
+                BlueGreenTopologyLock::acquire($this->resource->getConnection());
+                $this->reloadResourceTopology();
+                $server = Server::ownedByCurrentTeam()->findOrFail($server_id);
+                StandaloneDocker::ownedByCurrentTeam()
+                    ->where('server_id', $server->id)
+                    ->findOrFail($network_id);
+                if ($this->isMainDestination($network_id, $server_id)) {
+                    return [null, $server];
+                }
+                if ($this->resource instanceof Application) {
+                    $this->resource->assertBlueGreenDestinationCanBeRemoved($network_id);
+                }
+                $detachedDestinations = $this->resource->additional_networks()
+                    ->wherePivot('server_id', $server_id)
+                    ->detach($network_id);
+
+                return [$detachedDestinations > 0, $server];
+            });
+            if ($shouldStopServer === null) {
+                $this->dispatch('error', 'You are trying to remove the main server.');
+
+                return;
+            }
+            if ($shouldStopServer) {
+                StopApplicationOneServer::run($this->resource, $server);
+            }
             $this->loadData();
             $this->dispatch('refresh');
             ApplicationStatusChanged::dispatch(data_get($this->resource, 'environment.project.team.id'));
@@ -183,5 +242,17 @@ class Destination extends Component
         } catch (\Exception $e) {
             return handleError($e, $this);
         }
+    }
+
+    private function reloadResourceTopology(): void
+    {
+        $this->resource->refresh();
+        $this->resource->load('destination.server');
+    }
+
+    private function isMainDestination(int $networkId, int $serverId): bool
+    {
+        return (int) $this->resource->destination->id === $networkId
+            && (int) $this->resource->destination->server->id === $serverId;
     }
 }

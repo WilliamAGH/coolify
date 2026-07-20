@@ -93,11 +93,14 @@ class CleanupPreviewDeployment
 
         $cancelled = 0;
         foreach ($activeDeployments as $deployment) {
+            $deploymentCancelled = false;
+
             try {
                 // Mark deployment as cancelled
                 $deployment->update([
                     'status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
                 ]);
+                $deploymentCancelled = true;
 
                 // Add cancellation log entry
                 $deployment->addLogEntry('Deployment cancelled: Pull request closed.', 'stderr');
@@ -107,6 +110,10 @@ class CleanupPreviewDeployment
                 $cancelled++;
             } catch (\Throwable $e) {
                 \Log::warning("Failed to cancel deployment {$deployment->id}: {$e->getMessage()}");
+            } finally {
+                if ($deploymentCancelled) {
+                    next_after_cancel($deployment);
+                }
             }
         }
 

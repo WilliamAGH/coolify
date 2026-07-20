@@ -15,7 +15,7 @@ body:
       description: Provide a detailed description of the error or exception you encountered, along with any relevant log output.
     validations:
       required: true
-      
+
   - type: textarea
     attributes:
       label: Expected Behavior
@@ -67,7 +67,7 @@ body:
       label: Operating System and Version (self-hosted)
       description: Run `cat /etc/os-release` or `lsb_release -a` in your terminal and provide the operating system and version.
       placeholder: "Ubuntu 22.04"
-      
+
   - type: textarea
     attributes:
       label: Screenshots / Visuals

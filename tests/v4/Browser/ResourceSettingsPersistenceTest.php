@@ -123,6 +123,7 @@ it('saves application name and enables static site with nginx config', function 
         ['name' => $updatedName, 'customDockerRunOptions' => '--read-only'],
         'Application settings updated!'
     );
+    $page->assertValue('name', $updatedName);
 
     $this->application->refresh();
     expect($this->application->name)->toBe($updatedName)
@@ -165,7 +166,6 @@ it('saves database name and enables ssl with mode selector', function () {
         ['name' => $updatedDatabaseName, 'description' => 'Updated by browser test'],
         'Database updated.'
     );
-
     $this->database->refresh();
     expect($this->database->name)->toBe($updatedDatabaseName)
         ->and($this->database->description)->toBe('Updated by browser test');
@@ -250,7 +250,6 @@ function submitLivewireForm(
         JAVASCRIPT);
 
     expect($componentId)->toBeString()->not->toBeEmpty();
-
     $page->click('form[wire\\:submit="submit"] > div:first-child > button[type="submit"]');
 
     $result = $page->script(<<<'JAVASCRIPT'
@@ -263,12 +262,18 @@ function submitLivewireForm(
         }
         JAVASCRIPT);
 
-    expect($result['componentId'])->toBe($componentId);
-
+    expect($result['updates'])->toBeArray();
     foreach ($expectedUpdates as $property => $expectedValue) {
         expect($result['updates'])->toHaveKey($property, $expectedValue);
     }
 
+    assertLivewireSuccess($result, $componentId, $expectedSuccessMessage);
+}
+
+/** @param  array{componentId: string, dispatches: array<int, array<string, mixed>>}  $result */
+function assertLivewireSuccess(array $result, string $componentId, string $expectedSuccessMessage): void
+{
+    expect($result['componentId'])->toBe($componentId);
     $dispatches = collect($result['dispatches']);
     $errorDispatches = $dispatches->where('name', 'error')->values()->all();
     $successDispatch = $dispatches->first(fn (array $dispatch): bool => data_get($dispatch, 'name') === 'success'

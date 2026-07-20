@@ -18,6 +18,7 @@ use App\Jobs\UpdateCoolifyJob;
 use App\Models\InstanceSettings;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Foundation\Console\Kernel as ConsoleKernel;
+use Lorisleiva\Actions\Facades\Actions;
 
 class Kernel extends ConsoleKernel
 {
@@ -48,6 +49,35 @@ class Kernel extends ConsoleKernel
         $this->scheduleInstance->command('cleanup:redis --clear-locks')->daily();
         $this->scheduleInstance->command('sanctum:prune-expired --hours=1')->hourly()->onOneServer();
         $this->scheduleInstance->job(new ApiTokenExpirationWarningJob)->hourly()->onOneServer();
+        $this->scheduleInstance->call(fn (): int => recover_stale_application_deployment_dispatches())
+            ->name('deployments:recover-unpublished-dispatches')
+            ->everyMinute()
+            ->onOneServer()
+            ->withoutOverlapping(6);
+        $this->scheduleInstance->command('blue-green:resume-deactivations --stale-after=300 --limit=1')
+            ->name('blue-green:resume-deactivations')
+            ->everyMinute()
+            ->onOneServer()
+            ->withoutOverlapping(16)
+            ->runInBackground();
+        $this->scheduleInstance->command('blue-green:reconcile --stale-after=300 --limit=1')
+            ->name('blue-green:reconcile')
+            ->everyMinute()
+            ->onOneServer()
+            ->withoutOverlapping(16)
+            ->runInBackground();
+        $this->scheduleInstance->command('blue-green:retire-inactive --limit=10')
+            ->name('blue-green:retire-inactive')
+            ->everyMinute()
+            ->onOneServer()
+            ->withoutOverlapping(16)
+            ->runInBackground();
+        $this->scheduleInstance->command('blue-green:repair-steady --limit=1')
+            ->name('blue-green:repair-steady')
+            ->everyFiveMinutes()
+            ->onOneServer()
+            ->withoutOverlapping(16)
+            ->runInBackground();
 
         if (isDev()) {
             // Instance Jobs
@@ -120,6 +150,7 @@ class Kernel extends ConsoleKernel
 
     protected function commands(): void
     {
+        Actions::registerCommands(app_path('Actions/Application/BlueGreen'));
         $this->load(__DIR__.'/Commands');
 
         require base_path('routes/console.php');

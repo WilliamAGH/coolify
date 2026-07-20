@@ -136,43 +136,20 @@ class SshMultiplexingHelper
 
     public static function generateSshCommand(Server $server, string $command, bool $disableMultiplexing = false, ?int $commandTimeout = null): string
     {
-        if ($server->settings->force_disabled) {
-            throw new \RuntimeException('Server is disabled.');
-        }
-
-        $sshConfig = self::serverSshConfiguration($server);
-        $sshKeyLocation = $sshConfig['sshKeyLocation'];
-
-        self::validateSshKey($server->privateKey);
-
-        $commandTimeout = $commandTimeout ?? (int) config('constants.ssh.command_timeout');
-        $sshCommand = $commandTimeout > 0 ? "timeout {$commandTimeout} ssh " : 'ssh ';
-
-        if (! $disableMultiplexing && self::isMultiplexingEnabled()) {
-            try {
-                if (self::ensureMultiplexedConnection($server)) {
-                    $sshCommand .= self::multiplexingOptions($server);
-                }
-            } catch (\Throwable $e) {
-                Log::warning('SSH multiplexing failed, falling back to non-multiplexed connection', [
-                    'server' => $server->name ?? $server->ip,
-                    'error' => $e->getMessage(),
-                ]);
-            }
-        }
-
-        if (data_get($server, 'settings.is_cloudflare_tunnel')) {
-            $sshCommand .= "-o ProxyCommand='cloudflared access ssh --hostname %h' ";
-        }
-
-        $sshCommand .= self::getCommonSshOptions($server, $sshKeyLocation, self::getConnectionTimeout($server), config('constants.ssh.server_interval'));
+        $sshCommand = self::sshCommandPrefix($server, $disableMultiplexing, $commandTimeout);
 
         $delimiter = base64_encode(Hash::make($command));
         $command = str_replace($delimiter, '', $command);
 
-        return $sshCommand.self::escapedUserAtHost($server)." 'bash -se' << \\$delimiter".PHP_EOL
+        return $sshCommand." 'bash -se' << \\$delimiter".PHP_EOL
             .$command.PHP_EOL
             .$delimiter;
+    }
+
+    public static function generateSshCommandWithInput(Server $server, string $command, bool $disableMultiplexing = false, ?int $commandTimeout = null): string
+    {
+        return self::sshCommandPrefix($server, $disableMultiplexing, $commandTimeout)
+            .' '.escapeshellarg($command);
     }
 
     public static function getConnectionTimeout(Server $server): int
@@ -288,6 +265,45 @@ class SshMultiplexingHelper
     private static function isMultiplexingEnabled(): bool
     {
         return config('constants.ssh.mux_enabled') && ! config('constants.coolify.is_windows_docker_desktop');
+    }
+
+    private static function sshCommandPrefix(Server $server, bool $disableMultiplexing, ?int $commandTimeout): string
+    {
+        if ($server->settings->force_disabled) {
+            throw new \RuntimeException('Server is disabled.');
+        }
+
+        $sshConfig = self::serverSshConfiguration($server);
+        self::validateSshKey($server->privateKey);
+
+        $commandTimeout ??= (int) config('constants.ssh.command_timeout');
+        $sshCommand = $commandTimeout > 0 ? "timeout {$commandTimeout} ssh " : 'ssh ';
+
+        if (! $disableMultiplexing && self::isMultiplexingEnabled()) {
+            try {
+                if (self::ensureMultiplexedConnection($server)) {
+                    $sshCommand .= self::multiplexingOptions($server);
+                }
+            } catch (\Throwable $e) {
+                Log::warning('SSH multiplexing failed, falling back to non-multiplexed connection', [
+                    'server' => $server->name ?? $server->ip,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        if (data_get($server, 'settings.is_cloudflare_tunnel')) {
+            $sshCommand .= "-o ProxyCommand='cloudflared access ssh --hostname %h' ";
+        }
+
+        $sshCommand .= self::getCommonSshOptions(
+            $server,
+            $sshConfig['sshKeyLocation'],
+            self::getConnectionTimeout($server),
+            config('constants.ssh.server_interval'),
+        );
+
+        return $sshCommand.self::escapedUserAtHost($server);
     }
 
     private static function validateSshKey(PrivateKey $privateKey): void

@@ -66,6 +66,9 @@ class Advanced extends Component
     #[Validate(['string', 'nullable'])]
     public ?string $stopGracePeriod = null;
 
+    #[Validate(['integer', 'min:0', 'max:3600'])]
+    public int $blueGreenInactiveRetentionSeconds = DEFAULT_BLUE_GREEN_INACTIVE_RETENTION_SECONDS;
+
     #[Validate(['boolean'])]
     public bool $isBuildServerEnabled = false;
 
@@ -158,6 +161,7 @@ class Advanced extends Component
         // Load stop_grace_period separately since it has its own save handler
         // Convert null to empty string to prevent dirty detection issues
         $this->stopGracePeriod = $this->application->settings->stop_grace_period ?? '';
+        $this->blueGreenInactiveRetentionSeconds = $this->application->settings->blueGreenInactiveRetentionSeconds();
     }
 
     private function resetDefaultLabels()
@@ -291,6 +295,32 @@ class Advanced extends Component
             throw $e;
         } catch (\Throwable $e) {
             return handleError($e, $this);
+        }
+    }
+
+    public function saveBlueGreenInactiveRetention(): void
+    {
+        try {
+            $this->authorize('update', $this->application);
+            $validated = Validator::make(
+                ['retentionSeconds' => $this->blueGreenInactiveRetentionSeconds],
+                ['retentionSeconds' => [
+                    'required',
+                    'integer',
+                    'min:'.MIN_BLUE_GREEN_INACTIVE_RETENTION_SECONDS,
+                    'max:'.MAX_BLUE_GREEN_INACTIVE_RETENTION_SECONDS,
+                ]],
+                [],
+                ['retentionSeconds' => 'blue-green inactive retention'],
+            )->validate();
+            $this->application->settings->update([
+                'blue_green_inactive_retention_seconds' => (int) $validated['retentionSeconds'],
+            ]);
+            $this->dispatch('success', 'Blue-green inactive retention updated.');
+        } catch (ValidationException $exception) {
+            throw $exception;
+        } catch (\Throwable $exception) {
+            handleError($exception, $this);
         }
     }
 

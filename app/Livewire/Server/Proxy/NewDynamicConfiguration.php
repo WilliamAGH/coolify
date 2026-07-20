@@ -2,6 +2,7 @@
 
 namespace App\Livewire\Server\Proxy;
 
+use App\Actions\Proxy\BlueGreenProxyConfiguration;
 use App\Enums\ProxyTypes;
 use App\Models\Server;
 use App\Rules\ValidProxyConfigFilename;
@@ -66,6 +67,11 @@ class NewDynamicConfiguration extends Component
                 if (! str($this->fileName)->endsWith('.caddy')) {
                     $this->fileName = "{$this->fileName}.caddy";
                 }
+            }
+            if (BlueGreenProxyConfiguration::isManagedFilename($this->fileName)) {
+                $this->dispatch('error', 'Coolify-managed blue-green routes cannot be overwritten from the dynamic configuration editor.');
+
+                return;
             }
             $proxy_path = $this->server->proxyPath();
             $file = "{$proxy_path}/dynamic/{$this->fileName}";

@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Actions\Application\CancelApplicationDeployment;
 use App\Actions\Database\StartDatabase;
 use App\Actions\Service\StartService;
 use App\Enums\ApplicationDeploymentStatus;
@@ -12,6 +13,7 @@ use App\Models\ApplicationPreview;
 use App\Models\Server;
 use App\Models\Service;
 use App\Models\Tag;
+use App\Support\ValidationPatterns;
 use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Http\Request;
 use OpenApi\Attributes as OA;
@@ -245,15 +247,19 @@ class DeployController extends Controller
         }
 
         // Perform the cancellation
+        $deploymentCancelled = false;
+
         try {
             $deployment_uuid = $deployment->deployment_uuid;
             $kill_command = "docker rm -f {$deployment_uuid}";
             $build_server_id = $deployment->build_server_id ?? $deployment->server_id;
 
-            // Mark deployment as cancelled
-            $deployment->update([
-                'status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
-            ]);
+            $deploymentCancelled = CancelApplicationDeployment::run($deployment);
+            if (! $deploymentCancelled) {
+                return response()->json([
+                    'message' => "Deployment cannot be cancelled. Current status: {$deployment->status}",
+                ], 400);
+            }
 
             // Get the server
             $server = Server::whereTeamId($teamId)->find($build_server_id);
@@ -301,6 +307,10 @@ class DeployController extends Controller
             return response()->json([
                 'message' => 'Failed to cancel deployment: '.$e->getMessage(),
             ], 500);
+        } finally {
+            if ($deploymentCancelled) {
+                next_after_cancel($deployment);
+            }
         }
     }
 
@@ -367,6 +377,10 @@ class DeployController extends Controller
             return invalidTokenResponse();
         }
 
+        $request->validate([
+            'docker_tag' => ValidationPatterns::dockerImageTagRules(),
+        ]);
+
         $uuids = $request->input('uuid');
         $tags = $request->input('tag');
         $force = $request->boolean('force');
@@ -408,6 +422,11 @@ class DeployController extends Controller
         foreach ($uuids as $uuid) {
             $resource = getResourceByUuid($uuid, $teamId);
             if ($resource) {
+                if ($dockerTag !== null && ! ($resource instanceof Application && $resource->build_pack === 'dockerimage')) {
+                    $deployments->push(['message' => 'docker_tag can only be used with Docker Image applications.', 'resource_uuid' => $uuid]);
+
+                    continue;
+                }
                 $dockerTagForResource = $dockerTag;
                 if ($pr !== 0) {
                     $preview = null;

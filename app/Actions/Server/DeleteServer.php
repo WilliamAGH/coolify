@@ -51,6 +51,10 @@ class DeleteServer
             return; // Server already force deleted from Coolify
         }
 
+        if (! $server->trashed()) {
+            $server->delete();
+        }
+
         try {
             $server->forceDelete();
         } catch (\Throwable $e) {

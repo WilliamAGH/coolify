@@ -2,6 +2,7 @@
 
 namespace App\Livewire\Server\Proxy;
 
+use App\Actions\Proxy\BlueGreenProxyConfiguration;
 use App\Models\Server;
 use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
 use Livewire\Component;
@@ -34,6 +35,12 @@ class DynamicConfigurationNavbar extends Component
             $file = str_replace('|', '.', $fileName);
 
             validateFilenameSafe($file, 'proxy configuration filename');
+
+            if (BlueGreenProxyConfiguration::isManagedFilename($file)) {
+                $this->dispatch('error', 'Coolify-managed blue-green routes cannot be deleted from the dynamic configuration editor.');
+
+                return;
+            }
 
             if ($proxy_type === 'CADDY' && $file === 'Caddyfile') {
                 $this->dispatch('error', 'Cannot delete Caddyfile.');

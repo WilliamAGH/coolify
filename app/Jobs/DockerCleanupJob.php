@@ -3,6 +3,7 @@
 namespace App\Jobs;
 
 use App\Actions\Server\CleanupDocker;
+use App\Contracts\SupportsScheduledDispatchOccurrence;
 use App\Events\DockerCleanupDone;
 use App\Models\DockerCleanupExecution;
 use App\Models\Server;
@@ -16,8 +17,10 @@ use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\Middleware\WithoutOverlapping;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Log;
+use Throwable;
 
-class DockerCleanupJob implements ShouldBeEncrypted, ShouldQueue
+class DockerCleanupJob implements ShouldBeEncrypted, ShouldQueue, SupportsScheduledDispatchOccurrence
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
@@ -29,9 +32,29 @@ class DockerCleanupJob implements ShouldBeEncrypted, ShouldQueue
 
     public ?DockerCleanupExecution $execution_log = null;
 
+    private ?ScheduledDispatchOccurrence $scheduledDispatchOccurrence = null;
+
     public function middleware(): array
     {
-        return [(new WithoutOverlapping('docker-cleanup-'.$this->server->uuid))->expireAfter(600)->dontRelease()];
+        $middleware = [(new WithoutOverlapping('docker-cleanup-'.$this->server->uuid))->expireAfter(600)->dontRelease()];
+
+        if ($this->scheduledDispatchOccurrence !== null) {
+            array_unshift($middleware, $this->scheduledDispatchOccurrence);
+        }
+
+        return $middleware;
+    }
+
+    public function withScheduledDispatchOccurrence(ScheduledDispatchOccurrence $occurrence): static
+    {
+        $this->scheduledDispatchOccurrence = $occurrence;
+
+        return $this;
+    }
+
+    public function finalizeScheduledDispatchOccurrenceAfterFailure(): bool
+    {
+        return $this->scheduledDispatchOccurrence?->completeAfterTerminalFailure() ?? false;
     }
 
     public function __construct(
@@ -137,7 +160,7 @@ class DockerCleanupJob implements ShouldBeEncrypted, ShouldQueue
                 $this->server->team?->notify(new DockerCleanupSuccess($this->server, $message));
                 event(new DockerCleanupDone($this->execution_log));
             }
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             if ($this->execution_log) {
                 $this->execution_log->update([
                     'status' => 'failed',
@@ -154,5 +177,19 @@ class DockerCleanupJob implements ShouldBeEncrypted, ShouldQueue
                 ]);
             }
         }
+    }
+
+    public function failed(?Throwable $exception): void
+    {
+        $this->finalizeScheduledDispatchOccurrenceAfterFailure();
+
+        Log::channel('scheduled-errors')->error('DockerCleanup permanently failed', [
+            'job' => 'DockerCleanupJob',
+            'server_id' => $this->server->id,
+            'server' => $this->server->name,
+            'total_attempts' => $this->attempts(),
+            'error' => $exception?->getMessage(),
+            'trace' => $exception?->getTraceAsString(),
+        ]);
     }
 }

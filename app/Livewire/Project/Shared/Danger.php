@@ -2,7 +2,9 @@
 
 namespace App\Livewire\Project\Shared;
 
+use App\Actions\Application\BlueGreen\DeactivateBlueGreenApplication;
 use App\Jobs\DeleteResourceJob;
+use App\Models\Application;
 use App\Models\Service;
 use App\Models\ServiceApplication;
 use App\Models\ServiceDatabase;
@@ -106,7 +108,12 @@ class Danger extends Component
 
         try {
             $this->authorize('delete', $this->resource);
-            $this->resource->delete();
+            if ($this->resource instanceof Application
+                && $this->resource->requiresBlueGreenDeactivation()) {
+                (new DeactivateBlueGreenApplication)->beginDeletion($this->resource);
+            } else {
+                $this->resource->delete();
+            }
             DeleteResourceJob::dispatch(
                 $this->resource,
                 $this->delete_volumes,

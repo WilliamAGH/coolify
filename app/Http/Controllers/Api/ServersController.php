@@ -2,12 +2,11 @@
 
 namespace App\Http\Controllers\Api;
 
-use App\Actions\Server\DeleteServer;
+use App\Actions\Server\QueueServerDeletion;
 use App\Actions\Server\ValidateServer;
 use App\Enums\ProxyStatus;
 use App\Enums\ProxyTypes;
 use App\Http\Controllers\Controller;
-use App\Jobs\DeleteResourceJob;
 use App\Jobs\ValidateAndInstallServerJob;
 use App\Models\Application;
 use App\Models\PrivateKey;
@@ -302,7 +301,7 @@ class ServersController extends Controller
         if (is_null($teamId)) {
             return invalidTokenResponse();
         }
-        $server = ModelsServer::whereTeamId($teamId)->whereUuid($request->uuid)->first();
+        $server = ModelsServer::whereTeamId($teamId)->whereUuid($request->route('uuid'))->first();
         if (is_null($server)) {
             return response()->json(['message' => 'Server not found.'], 404);
         }
@@ -313,7 +312,13 @@ class ServersController extends Controller
                 return response()->json(['message' => 'Application not found.'], 404);
             }
 
-            return response()->json(serializeApiResponse($application->fqdns));
+            $domains = collect($application->fqdns)->map(function (string $fqdn) {
+                $host = str($fqdn)->replace('http://', '')->replace('https://', '')->explode('/')->first();
+
+                return str($host)->explode(':')->first();
+            })->filter()->values();
+
+            return response()->json(serializeApiResponse($domains));
         }
         $projects = Project::where('team_id', $teamId)->get();
         $domains = collect();
@@ -855,27 +860,10 @@ class ServersController extends Controller
             return response()->json(['message' => 'Local server cannot be deleted.'], 400);
         }
 
-        if ($force) {
-            foreach ($server->definedResources() as $resource) {
-                DeleteResourceJob::dispatch($resource);
-            }
-        }
-
         $deletedUuid = $server->uuid;
         $deletedName = $server->name;
         $deletedIp = $server->ip;
-        $server->delete();
-        DeleteServer::dispatch(
-            $server->id,
-            false, // Don't delete from Hetzner via API
-            $server->hetzner_server_id,
-            $server->cloud_provider_token_id,
-            $server->team_id,
-            false, // Don't delete from Vultr via API
-            $server->vultr_instance_id,
-            false, // Don't delete from DigitalOcean via API
-            $server->digitalocean_droplet_id
-        );
+        QueueServerDeletion::run($server, $force);
 
         auditLog('api.server.deleted', [
             'team_id' => $teamId,
