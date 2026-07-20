@@ -24,6 +24,9 @@ readonly MIN_DIRECT_HEALTH_REQUESTS=2
 readonly MIN_PROVIDER_HEALTH_REQUESTS=2
 readonly MIN_ROUTE_REQUESTS=100
 readonly MIN_APPLICATION_REQUESTS=30
+readonly MIN_APPLICATION_PHASE_REQUESTS=4
+readonly MAX_APPLICATION_REQUEST_LATENCY_MS=2000
+readonly MAX_APPLICATION_SAMPLE_GAP_MS=2500
 readonly MIN_PROVIDER_CADENCE_MS=500
 readonly MAX_PROVIDER_CADENCE_MS=5000
 readonly MAX_PROVIDER_START_DELAY_MS=15000
@@ -627,8 +630,9 @@ atomic_replace_snapshot() {
     local staged_filename
 
     staged_filename=".coolify.yaml.${RANDOM}.$$"
-    compose cp "$source_snapshot" "config-writer:/dynamic/${staged_filename}"
-    compose exec -T config-writer sh -c "mv -f /dynamic/${staged_filename} /dynamic/coolify.yaml"
+    compose exec -T config-writer mkdir -p /proxy/dynamic
+    compose cp "$source_snapshot" "config-writer:/proxy/dynamic/${staged_filename}"
+    compose exec -T config-writer sh -c "mv -f /proxy/dynamic/${staged_filename} /proxy/dynamic/coolify.yaml"
 }
 
 assert_exact_dynamic_snapshot() {
@@ -637,7 +641,7 @@ assert_exact_dynamic_snapshot() {
     local actual_dynamic_sha
 
     expected_dynamic_sha=$(sha256_file "$snapshot")
-    actual_dynamic_sha=$(compose exec -T config-writer sh -c 'sha256sum /dynamic/coolify.yaml' | awk '{print $1}')
+    actual_dynamic_sha=$(compose exec -T config-writer sh -c 'sha256sum /proxy/dynamic/coolify.yaml' | awk '{print $1}')
     [ "$actual_dynamic_sha" = "$expected_dynamic_sha" ] || fail 'The managed dynamic document does not contain the exact expected bytes'
 }
 
@@ -755,21 +759,27 @@ decode_base64() {
 
 fetch_application_route() {
     local headers_file
+    local curl_result
+    local duration_ms
     local status
+    local total_seconds
 
     headers_file=$(mktemp "$TEMP_DIRECTORY/application-route-headers.XXXXXX")
-    if ! status=$(curl --silent --show-error --insecure --noproxy '*' --connect-timeout 2 --max-time 4 \
+    if ! curl_result=$(curl --silent --show-error --insecure --noproxy '*' --connect-timeout 2 --max-time 4 \
         --header "Host: ${APPLICATION_HOST}" \
         --dump-header "$headers_file" \
         --output /dev/null \
-        --write-out '%{http_code}' \
+        --write-out '%{http_code}|%{time_total}' \
         "https://127.0.0.1:${TRAEFIK_HTTPS_PORT}/runtime-application"); then
-        status=000
+        curl_result='000|4.000000'
     fi
-    printf '%s|%s|%s\n' \
+    IFS='|' read -r status total_seconds <<<"$curl_result"
+    duration_ms=$(awk -v seconds="$total_seconds" 'BEGIN { printf "%d", (seconds * 1000) + 0.5 }')
+    printf '%s|%s|%s|%s\n' \
         "$status" \
         "$(header_value 'X-Integration-Backend' "$headers_file")" \
-        "$(header_value 'X-Coolify-Probe-Ack' "$headers_file")"
+        "$(header_value 'X-Coolify-Probe-Ack' "$headers_file")" \
+        "$duration_ms"
     rm -f -- "$headers_file"
 }
 
@@ -777,10 +787,10 @@ application_route_matches() {
     local expected_backend=$1
     local expected_acknowledgement=$2
     local record
-    local status backend acknowledgement
+    local status backend acknowledgement _duration_ms
 
     record=$(fetch_application_route)
-    IFS='|' read -r status backend acknowledgement <<<"$record"
+    IFS='|' read -r status backend acknowledgement _duration_ms <<<"$record"
     [ "$status" = 200 ] \
         && [ "$backend" = "$expected_backend" ] \
         && [ "$acknowledgement" = "$expected_acknowledgement" ]
@@ -803,6 +813,7 @@ wait_for_application_route() {
 assert_application_provider_inventory() {
     local expected_file=$1
     local expected_docker=$2
+    local expected_public_backend=$3
     local rawdata_file
 
     rawdata_file=$(mktemp "$TEMP_DIRECTORY/application-rawdata.XXXXXX")
@@ -811,12 +822,12 @@ assert_application_provider_inventory() {
         rm -f -- "$rawdata_file"
         return 1
     fi
-    if ! python3 - "$rawdata_file" "$expected_file" "$expected_docker" \
+    if ! python3 - "$rawdata_file" "$expected_file" "$expected_docker" "$expected_public_backend" \
         "$APPLICATION_FILE_ROUTER" "$APPLICATION_DOCKER_ROUTER" "$APPLICATION_HOST" "$APPLICATION_ROUTING_PREFIX" <<'PY'
 import json
 import sys
 
-rawdata_path, expected_file, expected_docker, file_name, docker_name, host, prefix = sys.argv[1:]
+rawdata_path, expected_file, expected_docker, expected_public_backend, file_name, docker_name, host, prefix = sys.argv[1:]
 with open(rawdata_path, encoding='utf-8') as rawdata_handle:
     rawdata = json.load(rawdata_handle)
 routers = rawdata.get('routers') or {}
@@ -832,6 +843,11 @@ if (docker_router is not None) != (expected_docker == 'present'):
 if docker_router is not None:
     if docker_router.get('status') != 'enabled' or docker_router.get('rule') != rule:
         raise SystemExit(1)
+    if docker_router.get('service') != f'{prefix}blue':
+        raise SystemExit(1)
+    blue_service = services.get(f'{prefix}blue@docker')
+    if blue_service is None or blue_service.get('status') != 'enabled':
+        raise SystemExit(1)
 if file_router is not None:
     if file_router.get('status') != 'enabled' or file_router.get('rule') != rule:
         raise SystemExit(1)
@@ -841,10 +857,18 @@ if file_router is not None:
         raise SystemExit(1)
     if docker_router is not None and int(file_router.get('priority', 0)) <= int(docker_router.get('priority', 0)):
         raise SystemExit(1)
-    for service_name in (f'{prefix}active@file', f'{prefix}green@docker'):
-        service = services.get(service_name)
-        if service is None or service.get('status') != 'enabled':
-            raise SystemExit(1)
+    active_service = services.get(f'{prefix}active@file')
+    expected_member_name = f'{prefix}{expected_public_backend}@docker'
+    expected_children = [{'name': expected_member_name, 'weight': 1}]
+    if active_service is None or active_service.get('status') != 'enabled':
+        raise SystemExit(1)
+    if (active_service.get('weighted') or {}).get('services') != expected_children:
+        raise SystemExit(1)
+    member_service = services.get(expected_member_name)
+    if member_service is None or member_service.get('status') != 'enabled':
+        raise SystemExit(1)
+elif expected_public_backend != 'blue':
+    raise SystemExit(1)
 relevant_errors = [
     error for error in (rawdata.get('errors') or [])
     if host in json.dumps(error, sort_keys=True) or prefix in json.dumps(error, sort_keys=True)
@@ -862,10 +886,11 @@ PY
 wait_for_application_provider_inventory() {
     local expected_file=$1
     local expected_docker=$2
+    local expected_public_backend=$3
     local deadline=$(( $(now_ms) + MAX_RELOAD_DELAY_MS ))
 
     while [ "$(now_ms)" -lt "$deadline" ]; do
-        if assert_application_provider_inventory "$expected_file" "$expected_docker"; then
+        if assert_application_provider_inventory "$expected_file" "$expected_docker" "$expected_public_backend"; then
             return
         fi
         sleep 0.1
@@ -879,7 +904,7 @@ wait_for_application_provider_inventory() {
                 services: (.services // {} | with_entries(select(.key | contains($prefix))))
             }
         ' >&2 || true
-    fail "Timed out waiting for application provider inventory file=$expected_file docker=$expected_docker"
+    fail "Timed out waiting for application provider inventory file=$expected_file docker=$expected_docker backend=$expected_public_backend"
 }
 
 compile_application_lifecycle_plan() {
@@ -1058,18 +1083,41 @@ assert_rolled_back_application_artifacts() {
     [ "$actual_state" = "$expected_state" ] || fail 'Canonical rollback did not persist the exact monotonic rollback state'
 }
 
+publish_application_phase() {
+    local phase_file=$1
+    local phase=$2
+    local staged_phase
+
+    staged_phase=$(mktemp "${phase_file}.XXXXXX")
+    jq -n --arg phase "$phase" --argjson published_at "$(now_ms)" \
+        '{phase: $phase, publishedAt: $published_at}' > "$staged_phase"
+    mv -f -- "$staged_phase" "$phase_file"
+}
+
 start_application_observer() {
     local log_file=$1
     local stop_file=$2
+    local phase_file=$3
+    local completed_at_ms
+    local phase_after
+    local phase_before
     local record
+    local started_at_ms
 
     : > "$log_file"
     rm -f -- "$stop_file"
     (
         trap - EXIT
         while [ ! -e "$stop_file" ]; do
+            phase_before=$(jq -er '.phase' "$phase_file")
+            started_at_ms=$(now_ms)
             record=$(fetch_application_route)
-            printf '%s|%s\n' "$(now_ms)" "$record" >> "$log_file"
+            completed_at_ms=$(now_ms)
+            phase_after=$(jq -er '.phase' "$phase_file")
+            if [ "$phase_before" = "$phase_after" ]; then
+                printf '%s|%s|%s|%s\n' \
+                    "$started_at_ms" "$completed_at_ms" "$phase_before" "$record" >> "$log_file"
+            fi
             sleep 0.05
         done
     ) &
@@ -1077,41 +1125,109 @@ start_application_observer() {
     register_background_pid "$APPLICATION_OBSERVER_PID"
 }
 
-wait_for_application_observer_samples() {
+wait_for_application_phase_backend() {
     local log_file=$1
+    local phase=$2
+    local expected_backend=$3
+    local expected_acknowledgement=$4
     local deadline=$(( $(now_ms) + MAX_RELOAD_DELAY_MS ))
+    local observed_count
 
     while [ "$(now_ms)" -lt "$deadline" ]; do
-        if [ "$(wc -l < "$log_file")" -ge 8 ]; then
+        background_pid_is_running "$APPLICATION_OBSERVER_PID" \
+            || fail "Application availability observer terminated during phase $phase"
+        observed_count=$(awk -F'|' \
+            -v acknowledgement="$expected_acknowledgement" \
+            -v backend="$expected_backend" \
+            -v phase="$phase" '
+                $3 == phase && $4 == "200" && $5 == backend && $6 == acknowledgement { count += 1 }
+                END { print count + 0 }
+            ' "$log_file")
+        if [ "$observed_count" -ge "$MIN_APPLICATION_PHASE_REQUESTS" ]; then
             return
         fi
         sleep 0.05
     done
-    fail 'Application availability observer did not collect baseline traffic'
+    fail "Application availability phase $phase did not record $MIN_APPLICATION_PHASE_REQUESTS requests from $expected_backend"
 }
 
 assert_application_observer() {
     local log_file=$1
-    local request_count
-    local first_backend
-    local last_backend
+    local public_acknowledgement=$2
 
-    request_count=$(wc -l < "$log_file")
-    [ "$request_count" -ge "$MIN_APPLICATION_REQUESTS" ] \
-        || fail "Application availability observer collected only $request_count requests"
-    if ! awk -F'|' 'NF != 4 || $2 != "200" { exit 1 }' "$log_file"; then
-        printf 'Application availability failures:\n' >&2
-        awk -F'|' 'NF != 4 || $2 != "200"' "$log_file" >&2
+    if ! python3 - "$log_file" "$public_acknowledgement" \
+        "$MIN_APPLICATION_REQUESTS" "$MIN_APPLICATION_PHASE_REQUESTS" \
+        "$MAX_APPLICATION_REQUEST_LATENCY_MS" "$MAX_APPLICATION_SAMPLE_GAP_MS" <<'PY'
+import sys
+
+(
+    log_path,
+    public_acknowledgement,
+    minimum_requests,
+    minimum_phase_requests,
+    maximum_latency_ms,
+    maximum_gap_ms,
+) = sys.argv[1:]
+minimum_requests = int(minimum_requests)
+minimum_phase_requests = int(minimum_phase_requests)
+maximum_latency_ms = int(maximum_latency_ms)
+maximum_gap_ms = int(maximum_gap_ms)
+phase_pairs = {
+    'docker-prior': {('blue', '')},
+    'forward-transition': {('blue', ''), ('green', public_acknowledgement)},
+    'file-candidate': {('green', public_acknowledgement)},
+    'predecessor-draining': {('green', public_acknowledgement)},
+    'file-only': {('green', public_acknowledgement)},
+    'docker-restored-shadowed': {('green', public_acknowledgement)},
+    'rollback-transition': {('green', public_acknowledgement), ('blue', '')},
+    'docker-restored': {('blue', '')},
+}
+phase_order = {phase: index for index, phase in enumerate(phase_pairs)}
+phase_counts = {phase: {} for phase in phase_pairs}
+records = []
+
+with open(log_path, encoding='utf-8') as log_handle:
+    for line_number, line in enumerate(log_handle, start=1):
+        fields = line.rstrip('\n').split('|')
+        if len(fields) != 7:
+            raise ValueError(f'line {line_number} has {len(fields)} fields')
+        started_at, completed_at, phase, status, backend, acknowledgement, duration = fields
+        started_at = int(started_at)
+        completed_at = int(completed_at)
+        duration = int(duration)
+        if phase not in phase_pairs:
+            raise ValueError(f'line {line_number} has unknown phase {phase}')
+        pair = (backend, acknowledgement)
+        if status != '200' or pair not in phase_pairs[phase]:
+            raise ValueError(f'line {line_number} violates phase {phase}: status={status} pair={pair}')
+        if started_at > completed_at:
+            raise ValueError(f'line {line_number} completes before it starts')
+        if duration > maximum_latency_ms or completed_at - started_at > maximum_latency_ms:
+            raise ValueError(f'line {line_number} exceeds latency bound: curl={duration} wall={completed_at - started_at}')
+        phase_counts[phase][pair] = phase_counts[phase].get(pair, 0) + 1
+        records.append((started_at, completed_at, phase))
+
+if len(records) < minimum_requests:
+    raise ValueError(f'only {len(records)} application requests were recorded')
+if [phase_order[phase] for _, _, phase in records] != sorted(phase_order[phase] for _, _, phase in records):
+    raise ValueError('application phases regressed')
+for previous, current in zip(records, records[1:]):
+    gap_ms = current[0] - previous[1]
+    if gap_ms > maximum_gap_ms:
+        raise ValueError(f'application availability gap {gap_ms}ms exceeds {maximum_gap_ms}ms')
+for phase, expected_pairs in phase_pairs.items():
+    for pair in expected_pairs:
+        observed = phase_counts[phase].get(pair, 0)
+        if observed < minimum_phase_requests:
+            raise ValueError(f'phase {phase} pair {pair} has only {observed} requests')
+PY
+    then
+        printf 'Application availability phase evidence:\n' >&2
+        cat "$log_file" >&2
         printf 'Recent Traefik routing logs:\n' >&2
         compose logs --no-color --no-log-prefix --tail 200 traefik >&2 || true
-        fail 'Application availability observer saw a connection failure, 404, or gateway response'
+        fail 'Application availability violated a phase, backend, latency, or gap contract'
     fi
-    first_backend=$(awk -F'|' 'NR == 1 { print $3 }' "$log_file")
-    last_backend=$(awk -F'|' 'END { print $3 }' "$log_file")
-    [ "$first_backend" = blue ] || fail 'Application availability did not begin on the prior Docker-provider route'
-    [ "$last_backend" = blue ] || fail 'Application availability did not finish on the restored Docker-provider route'
-    awk -F'|' '$3 == "green" { green = 1 } END { exit green ? 0 : 1 }' "$log_file" \
-        || fail 'Application availability observer never reached the fenced File-provider candidate'
 }
 
 start_held_application_transaction() {
@@ -1817,8 +1933,11 @@ assert_production_application_lifecycle() {
     local green_container_id
     local public_acknowledgement
     local availability_log="$TEMP_DIRECTORY/application-availability.log"
+    local availability_phase="$TEMP_DIRECTORY/application-availability-phase.json"
     local availability_stop="$TEMP_DIRECTORY/application-availability.stop"
     local availability_pid
+    local config_writer_after_recreate
+    local config_writer_before_recreate
     local application_forward_transport_log application_forward_transport_pid application_forward_transport_ready application_forward_transport_release application_forward_transport_report
     local application_recovery_transport_log application_recovery_transport_pid application_recovery_transport_ready application_recovery_transport_release application_recovery_transport_report
     local held_headers="$TEMP_DIRECTORY/held-transaction-headers"
@@ -1840,15 +1959,16 @@ assert_production_application_lifecycle() {
     local application_rollback_applied_at_ms
 
     wait_for_application_route blue ''
-    wait_for_application_provider_inventory absent present
+    wait_for_application_provider_inventory absent present blue
     boot_id=$(compose exec -T config-writer cat /proc/sys/kernel/random/boot_id | tr -d '\r\n')
     green_container_id=$(docker inspect --format '{{.Id}}' "$(compose ps -q backend-green)")
     compile_application_lifecycle_plan "$plan" "$boot_id" "$green_container_id"
     public_acknowledgement=$(jq -er '.publicAcknowledgement' "$plan")
 
-    start_application_observer "$availability_log" "$availability_stop"
+    publish_application_phase "$availability_phase" docker-prior
+    start_application_observer "$availability_log" "$availability_stop" "$availability_phase"
     availability_pid=$APPLICATION_OBSERVER_PID
-    wait_for_application_observer_samples "$availability_log"
+    wait_for_application_phase_backend "$availability_log" docker-prior blue ''
 
     start_transport_observer application-forward backend-green "$BACKEND_GREEN_STATE_DIR" "$APPLICATION_HOST"
     application_forward_transport_log=$TRANSPORT_OBSERVER_LOG
@@ -1867,11 +1987,14 @@ assert_production_application_lifecycle() {
     background_pid_is_running "$HELD_TRANSACTION_PID" \
         || fail 'The predecessor transaction response was not held before route publication'
 
+    publish_application_phase "$availability_phase" forward-transition
+    wait_for_application_phase_backend "$availability_log" forward-transition blue ''
     application_forward_switch_started_at_ms=$(now_ms)
     run_application_writer_command "$plan" interruptedCommandBase64 86
     wait_for_application_route green "$public_acknowledgement"
-    wait_for_application_provider_inventory present present
+    wait_for_application_provider_inventory present present green
     application_forward_applied_at_ms=$(now_ms)
+    wait_for_application_phase_backend "$availability_log" forward-transition green "$public_acknowledgement"
     assert_interrupted_application_artifacts "$plan"
     background_pid_is_running "$HELD_TRANSACTION_PID" \
         || fail 'The held predecessor response ended during interrupted candidate publication'
@@ -1879,16 +2002,30 @@ assert_production_application_lifecycle() {
     post_application_transaction "$replay_headers" "$replay_body" "$replay_status"
     assert_application_transaction_response \
         "$replay_headers" "$replay_body" "$replay_status" 200 green false "$public_acknowledgement" "$transaction_id"
+    publish_application_phase "$availability_phase" file-candidate
+    wait_for_application_phase_backend "$availability_log" file-candidate green "$public_acknowledgement"
+    config_writer_before_recreate=$(compose ps -q config-writer)
+    compose up -d --force-recreate config-writer
+    config_writer_after_recreate=$(compose ps -q config-writer)
+    [ -n "$config_writer_before_recreate" ] && [ -n "$config_writer_after_recreate" ] \
+        && [ "$config_writer_before_recreate" != "$config_writer_after_recreate" ] \
+        || fail 'Config writer was not recreated between interrupted publication and recovery'
+    assert_interrupted_application_artifacts "$plan"
+    wait_for_application_route green "$public_acknowledgement"
+    wait_for_application_provider_inventory present present green
+    assert_traefik_unchanged "$expected_traefik_id" "$expected_traefik_started_at"
     run_application_writer_command "$plan" recoveryCommandBase64 0
     assert_recovered_application_artifacts "$plan"
 
+    publish_application_phase "$availability_phase" predecessor-draining
+    wait_for_application_phase_backend "$availability_log" predecessor-draining green "$public_acknowledgement"
     compose stop --timeout 40 backend-blue > "$stop_log" 2>&1 &
     stop_pid=$!
     register_background_pid "$stop_pid"
     wait_for_host_file "$BACKEND_BLUE_STATE_DIR/shutdown.log" 'the predecessor graceful-shutdown marker'
     background_pid_is_running "$stop_pid" || fail 'The predecessor exited before held connections drained'
     background_pid_is_running "$HELD_TRANSACTION_PID" || fail 'The held predecessor response did not survive SIGTERM'
-    wait_for_application_provider_inventory present present
+    wait_for_application_provider_inventory present present green
     wait_for_application_route green "$public_acknowledgement"
 
     touch "$APPLICATION_STATE_DIR/releases/forward-publication"
@@ -1908,13 +2045,17 @@ assert_production_application_lifecycle() {
         cat "$stop_log" >&2 || true
         fail 'The predecessor did not stop cleanly after held transports drained'
     fi
-    wait_for_application_provider_inventory present absent
+    wait_for_application_provider_inventory present absent green
     wait_for_application_route green "$public_acknowledgement"
+    publish_application_phase "$availability_phase" file-only
+    wait_for_application_phase_backend "$availability_log" file-only green "$public_acknowledgement"
 
     compose up -d backend-blue
     wait_for_docker_provider_route
-    wait_for_application_provider_inventory present present
+    wait_for_application_provider_inventory present present green
     wait_for_application_route green "$public_acknowledgement"
+    publish_application_phase "$availability_phase" docker-restored-shadowed
+    wait_for_application_phase_backend "$availability_log" docker-restored-shadowed green "$public_acknowledgement"
 
     start_transport_observer application-recovery backend-blue "$BACKEND_BLUE_STATE_DIR" "$APPLICATION_HOST"
     application_recovery_transport_log=$TRANSPORT_OBSERVER_LOG
@@ -1923,11 +2064,16 @@ assert_production_application_lifecycle() {
     application_recovery_transport_release=$TRANSPORT_OBSERVER_RELEASE
     application_recovery_transport_report=$TRANSPORT_OBSERVER_REPORT
     wait_for_transport_observer_ready application-recovery "$application_recovery_transport_ready" "$application_recovery_transport_log"
+    publish_application_phase "$availability_phase" rollback-transition
+    wait_for_application_phase_backend "$availability_log" rollback-transition green "$public_acknowledgement"
     application_rollback_switch_started_at_ms=$(now_ms)
     run_application_writer_command "$plan" rollbackCommandBase64 0
     wait_for_application_route blue ''
-    wait_for_application_provider_inventory absent present
+    wait_for_application_provider_inventory absent present blue
     application_rollback_applied_at_ms=$(now_ms)
+    wait_for_application_phase_backend "$availability_log" rollback-transition blue ''
+    publish_application_phase "$availability_phase" docker-restored
+    wait_for_application_phase_backend "$availability_log" docker-restored blue ''
     publish_transport_release application-recovery "$application_rollback_applied_at_ms" "$application_recovery_transport_release"
     wait_for_transport_observer application-recovery \
         "$application_recovery_transport_pid" "$application_recovery_transport_log" "$application_recovery_transport_report"
@@ -1938,20 +2084,11 @@ assert_production_application_lifecycle() {
     assert_rolled_back_application_artifacts "$plan"
     assert_traefik_unchanged "$expected_traefik_id" "$expected_traefik_started_at"
 
-    local availability_deadline=$(( $(now_ms) + MAX_RELOAD_DELAY_MS ))
-
-    while [ "$(wc -l < "$availability_log")" -lt "$MIN_APPLICATION_REQUESTS" ]; do
-        background_pid_is_running "$availability_pid" \
-            || fail 'Application availability observer terminated before collecting the required traffic'
-        [ "$(now_ms)" -lt "$availability_deadline" ] \
-            || fail 'Application availability observer did not collect the required traffic before the reload deadline'
-        sleep 0.05
-    done
     sleep 0.25
     touch "$availability_stop"
     wait_for_registered_background_pid "$availability_pid" \
         || fail 'Application availability observer terminated unexpectedly'
-    assert_application_observer "$availability_log"
+    assert_application_observer "$availability_log" "$public_acknowledgement"
     assert_durable_transaction_evidence "$transaction_file" "$held_body" "$replay_body" "$idempotency_hash"
     assert_application_access_log
 }
@@ -2058,6 +2195,8 @@ main() {
 
     mkdir -p "$TRAEFIK_CERT_DIR" "$BACKEND_BLUE_STATE_DIR" "$BACKEND_GREEN_STATE_DIR" "$APPLICATION_STATE_DIR"
     chmod 777 "$BACKEND_BLUE_STATE_DIR" "$BACKEND_GREEN_STATE_DIR" "$APPLICATION_STATE_DIR"
+    touch "$BACKEND_BLUE_STATE_DIR/forwarded-identity.log" "$BACKEND_GREEN_STATE_DIR/forwarded-identity.log"
+    chmod 666 "$BACKEND_BLUE_STATE_DIR/forwarded-identity.log" "$BACKEND_GREEN_STATE_DIR/forwarded-identity.log"
     openssl req -x509 -nodes -newkey rsa:2048 -days 1 -subj "/CN=${CONTROL_PLANE_HOST}" \
         -keyout "$TRAEFIK_CERT_DIR/key.pem" -out "$TRAEFIK_CERT_DIR/cert.pem" >/dev/null 2>&1
 

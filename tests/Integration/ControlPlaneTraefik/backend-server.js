@@ -22,9 +22,11 @@ const activeHeldConnections = new Set();
 let serverClosed = false;
 let shuttingDown = false;
 
-fs.mkdirSync(`${applicationStateDirectory}/locks`, {recursive: true});
-fs.mkdirSync(`${applicationStateDirectory}/releases`, {recursive: true});
-fs.mkdirSync(`${applicationStateDirectory}/transactions`, {recursive: true});
+for (const directory of ['locks', 'releases', 'transactions']) {
+    const path = `${applicationStateDirectory}/${directory}`;
+    fs.mkdirSync(path, {recursive: true});
+    fs.chmodSync(path, 0o777);
+}
 
 function append(filename, values) {
     fs.appendFileSync(`${stateDirectory}/${filename}`, [String(Date.now()), ...values].join('|') + '\n');
@@ -41,7 +43,7 @@ function fsyncDirectory(directory) {
 }
 
 function durableAppend(filename, value) {
-    const descriptor = fs.openSync(`${applicationStateDirectory}/${filename}`, 'a', 0o600);
+    const descriptor = fs.openSync(`${applicationStateDirectory}/${filename}`, 'a', 0o644);
 
     try {
         fs.writeSync(descriptor, `${value}\n`);
@@ -55,7 +57,7 @@ function durableReplace(filename, value) {
     const directory = `${applicationStateDirectory}/transactions`;
     const stagedPath = `${directory}/.transaction-${process.pid}-${crypto.randomUUID()}`;
 
-    fs.writeFileSync(stagedPath, `${JSON.stringify(value)}\n`, {flag: 'wx', mode: 0o600});
+    fs.writeFileSync(stagedPath, `${JSON.stringify(value)}\n`, {flag: 'wx', mode: 0o644});
     const descriptor = fs.openSync(stagedPath, 'r');
     try {
         fs.fsyncSync(descriptor);
