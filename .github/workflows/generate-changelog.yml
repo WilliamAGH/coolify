@@ -87,4 +87,10 @@ jobs:
             -f context='Application validation required' \
             -f description='Required workflow_dispatch validation passed' \
             -f target_url="${validation_url}"
-          gh pr merge --auto --squash --delete-branch "${pr_url}"
+
+          pr_merge_state="$(gh pr view "${pr_url}" \
+            --json state,autoMergeRequest \
+            --jq 'if .state != "OPEN" then "closed" elif .autoMergeRequest != null then "armed" else "unarmed" end')"
+          if [ "${pr_merge_state}" = 'unarmed' ]; then
+            gh pr merge --auto --squash --delete-branch "${pr_url}"
+          fi

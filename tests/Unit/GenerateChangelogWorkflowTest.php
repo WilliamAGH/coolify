@@ -32,6 +32,8 @@ it('updates the protected changelog through a validated pull request', function 
         ->toContain('gh run watch "${validation_run_id}" --exit-status')
         ->toContain('statuses/${head_sha}')
         ->toContain("context='Application validation required'")
+        ->toContain('--json state,autoMergeRequest')
+        ->toContain('if [ "${pr_merge_state}" = \'unarmed\' ]')
         ->toContain('gh pr merge --auto --squash --delete-branch')
         ->not->toContain('HEAD:refs/heads/v4.x')
         ->not->toContain('git push https://');
