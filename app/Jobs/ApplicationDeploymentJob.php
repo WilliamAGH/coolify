@@ -41,10 +41,12 @@ use App\Support\ValidationPatterns;
 use App\Traits\EnvironmentVariableAnalyzer;
 use App\Traits\ExecuteRemoteCommand;
 use Carbon\Carbon;
+use Closure;
 use Exception;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeEncrypted;
 use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
@@ -5682,8 +5684,13 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
     /**
      * Transition deployment to a new status with proper validation and side effects.
      * This is the single source of truth for status transitions.
+     *
+     * @param  null|Closure(Builder): void  $statusConstraint
      */
-    private function transitionToStatus(ApplicationDeploymentStatus $status): void
+    private function transitionToStatus(
+        ApplicationDeploymentStatus $status,
+        ?Closure $statusConstraint = null,
+    ): void
     {
         if ($this->isInTerminalState()) {
             return;
@@ -5694,8 +5701,8 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         }
 
         $updated = $status === ApplicationDeploymentStatus::FAILED && $this->isBlueGreenFleetDeployment()
-            ? $this->publishBlueGreenFleetFailure()
-            : $this->updateDeploymentStatus($status);
+            ? $this->publishBlueGreenFleetFailure($statusConstraint)
+            : $this->updateDeploymentStatus($status, $statusConstraint);
         if (! $updated) {
             return;
         }
@@ -5729,8 +5736,13 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
 
     /**
      * Update the deployment status in the database.
+     *
+     * @param  null|Closure(Builder): void  $statusConstraint
      */
-    private function updateDeploymentStatus(ApplicationDeploymentStatus $status): bool
+    private function updateDeploymentStatus(
+        ApplicationDeploymentStatus $status,
+        ?Closure $statusConstraint = null,
+    ): bool
     {
         $query = ApplicationDeploymentQueue::query()
             ->whereKey($this->application_deployment_queue->getKey())
@@ -5739,6 +5751,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
                 $this->dispatch_attempt_uuid !== null,
                 fn ($query) => $query->where('horizon_job_id', $this->dispatch_attempt_uuid),
             );
+        $statusConstraint?->__invoke($query);
         $updated = BlueGreenLifecycleDatabaseLocks::constrainTerminalQueueOwner(
             $query,
             $this->application_deployment_queue,
@@ -5858,14 +5871,17 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         $this->fail($failure);
     }
 
-    private function publishBlueGreenFleetFailure(): bool
+    /**
+     * @param  null|Closure(Builder): void  $failureConstraint
+     */
+    private function publishBlueGreenFleetFailure(?Closure $failureConstraint = null): bool
     {
         $fleetDeploymentUuid = $this->application_deployment_queue->blue_green_fleet_deployment_uuid;
         if (! is_string($fleetDeploymentUuid) || $fleetDeploymentUuid === '') {
             return false;
         }
 
-        return DB::transaction(function () use ($fleetDeploymentUuid): bool {
+        return DB::transaction(function () use ($fleetDeploymentUuid, $failureConstraint): bool {
             $application = Application::withTrashed()
                 ->whereKey($this->application->id)
                 ->lockForUpdate()
@@ -5902,6 +5918,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
                     $this->dispatch_attempt_uuid !== null,
                     fn ($query) => $query->where('horizon_job_id', $this->dispatch_attempt_uuid),
                 );
+            $failureConstraint?->__invoke($failureQuery);
             if (BlueGreenLifecycleDatabaseLocks::constrainTerminalQueueOwner(
                 $failureQuery,
                 $this->application_deployment_queue,
@@ -6159,7 +6176,31 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
             .$exception->getMessage(),
             'stderr',
         );
-        $failed = ApplicationDeploymentQueue::query()
+        $this->transitionToStatus(
+            ApplicationDeploymentStatus::FAILED,
+            function ($query) use ($supersessionGeneration): void {
+                $this->constrainBlueGreenDrainRecoveryFailure($query, $supersessionGeneration);
+            },
+        );
+        $this->application_deployment_queue->refresh();
+        if (in_array($this->application_deployment_queue->status, [
+            ApplicationDeploymentStatus::FAILED->value,
+            ApplicationDeploymentStatus::FINISHED->value,
+            ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+            ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value,
+        ], true)) {
+            return;
+        }
+
+        throw new DeploymentException('Blue-green drain recovery lost queue ownership before publishing failure.');
+    }
+
+    private function constrainBlueGreenDrainRecoveryFailure(
+        Builder $query,
+        int $supersessionGeneration,
+    ): void
+    {
+        $query
             ->whereKey($this->application_deployment_queue->getKey())
             ->where('application_id', $this->application_deployment_queue->application_id)
             ->where('destination_id', $this->application_deployment_queue->destination_id)
@@ -6178,28 +6219,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
                     ->where('drain_failure_state.supersession_generation', $supersessionGeneration)
                     ->whereNull('drain_failure_state.deactivation_operation_id')
                     ->whereNull('drain_failure_state.deactivation_started_at');
-            })
-            ->update([
-                'status' => ApplicationDeploymentStatus::FAILED->value,
-                'finished_at' => Carbon::now()->toImmutable(),
-            ]);
-        if ($failed !== 1) {
-            $this->application_deployment_queue->refresh();
-            if (in_array($this->application_deployment_queue->status, [
-                ApplicationDeploymentStatus::FAILED->value,
-                ApplicationDeploymentStatus::FINISHED->value,
-                ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
-                ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value,
-            ], true)) {
-                return;
-            }
-
-            throw new DeploymentException('Blue-green drain recovery lost queue ownership before publishing failure.');
-        }
-
-        $this->application_deployment_queue->refresh();
-        $this->handleStatusTransition(ApplicationDeploymentStatus::FAILED);
-        queue_next_deployment($this->application_deployment_queue);
+            });
     }
 
     public function failed(Throwable $exception): void

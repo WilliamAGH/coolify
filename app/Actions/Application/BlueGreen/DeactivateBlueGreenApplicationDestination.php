@@ -13,6 +13,7 @@ use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
 use App\Notifications\Application\BlueGreenInterventionRequired;
+use Closure;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Lorisleiva\Actions\Concerns\AsAction;
@@ -30,6 +31,7 @@ final class DeactivateBlueGreenApplicationDestination
         ?int $expectedSupersessionGeneration = null,
         BlueGreenDeactivationPhase $requestedPhase = BlueGreenDeactivationPhase::DEACTIVATING,
         ?BlueGreenOperationFence $operationFence = null,
+        ?Closure $beforeRemoteMutation = null,
     ): bool {
         $releaseOperationFence = false;
         if ($operationFence === null) {
@@ -59,6 +61,8 @@ final class DeactivateBlueGreenApplicationDestination
             if ($preparation->invariantViolation !== null) {
                 throw $preparation->invariantViolation;
             }
+            $operationFence->assertDeactivationOwnership($preparation);
+            $beforeRemoteMutation?->__invoke();
             $operationFence->assertDeactivationOwnership($preparation);
             $server = $preparation->destination->server;
             $expectedServerBootId = ReadBlueGreenServerBootIdentity::run($server);

@@ -207,6 +207,39 @@ it('repeats the main destination fence after reloading stale topology', function
         ->and($application->additional_networks->first()->id)->toBe($this->mainDestination->id);
 });
 
+it('never remotely deactivates a blue-green destination that became primary after stale selection', function (): void {
+    $this->application->settings()->firstOrFail()->update([
+        'is_blue_green_deployment_enabled' => true,
+    ]);
+    $this->application->additional_networks()->attach($this->additionalDestination->id, [
+        'server_id' => $this->additionalServer->id,
+    ]);
+    $staleComponent = Livewire::test(Destination::class, ['resource' => $this->application->fresh()]);
+    GetContainersStatus::shouldRun()->once()->andReturnNull();
+    Process::fake();
+
+    Livewire::test(Destination::class, ['resource' => $this->application->fresh()])
+        ->call('promote', $this->additionalDestination->id, $this->additionalServer->id)
+        ->assertNotDispatched('error');
+    $result = $staleComponent->instance()->removeServer(
+        $this->additionalDestination->id,
+        $this->additionalServer->id,
+        'password',
+    );
+
+    $application = $this->application->fresh();
+
+    expect($result)->not->toBeNull()
+        ->and($application->destination_id)->toBe($this->additionalDestination->id)
+        ->and($application->additional_networks)->toHaveCount(1)
+        ->and($application->additional_networks->first()->id)->toBe($this->mainDestination->id)
+        ->and(ApplicationBlueGreenDeactivation::query()
+            ->where('application_id', $application->id)
+            ->where('standalone_docker_id', $this->additionalDestination->id)
+            ->doesntExist())->toBeTrue();
+    Process::assertNothingRan();
+});
+
 it('allows an additional destination on a different server while blue-green deployment is opted in', function (): void {
     $this->application->settings()->firstOrFail()->update([
         'is_blue_green_deployment_enabled' => true,
