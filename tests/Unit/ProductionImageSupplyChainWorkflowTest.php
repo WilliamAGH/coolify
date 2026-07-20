@@ -150,7 +150,7 @@ SH);
         'environment' => [
             'CURL_LOG' => $curlLog,
             'GITHUB_REF' => 'refs/tags/4.13.1-fork',
-            'GITHUB_REPOSITORY' => 'WilliamAGH/coolify',
+            'GITHUB_REPOSITORY' => 'williamacallahan/coolify',
             'GITHUB_SHA' => str_repeat('a', 40),
             'MAIN_AMD64_DIGEST' => releaseWorkflowTestDigest('1'),
             'MAIN_ARM64_DIGEST' => releaseWorkflowTestDigest('2'),
@@ -166,7 +166,7 @@ SH);
             'RUNNER_TEMP' => $fixture,
             'SEMANTIC_VERSION' => '4.13.1-fork',
             'SOURCE_REVISION' => str_repeat('a', 40),
-            'SOURCE_URL' => 'https://github.com/WilliamAGH/coolify',
+            'SOURCE_URL' => 'https://github.com/williamacallahan/coolify',
         ],
         'log' => $log,
         'state' => $state,
@@ -263,7 +263,7 @@ SH);
             'GH_LOG' => $ghLog,
             'GH_TOKEN' => 'fixture-token',
             'GITHUB_REF' => 'refs/tags/4.13.1-fork',
-            'GITHUB_REPOSITORY' => 'WilliamAGH/coolify',
+            'GITHUB_REPOSITORY' => 'williamacallahan/coolify',
             'GITHUB_SHA' => str_repeat('a', 40),
             'RUNNER_TEMP' => $fixture,
             'SEMANTIC_VERSION' => '4.13.1-fork',
@@ -381,7 +381,7 @@ SH);
             'GH_LOG' => $ghLog,
             'GH_TOKEN' => 'fixture-token',
             'GITHUB_REF' => 'refs/tags/4.13.1-fork',
-            'GITHUB_REPOSITORY' => 'WilliamAGH/coolify',
+            'GITHUB_REPOSITORY' => 'williamacallahan/coolify',
             'GITHUB_SHA' => str_repeat('a', 40),
             'PATH' => $bin.PATH_SEPARATOR.(getenv('PATH') ?: ''),
             'RELEASE_ASSETS_JSON' => json_encode(
@@ -1103,6 +1103,29 @@ it('enforces the shared Linux publication graph and caller boundaries', function
     ];
 
     expect(releaseFoundationWorkflowViolations($sharedWorkflow, $applicationValidationWorkflow, $callers))->toBe([]);
+});
+
+it('uses the trusted fork promotion runner while keeping pull-request validation GitHub-hosted', function (): void {
+    $root = releaseWorkflowRepositoryRoot();
+    $sharedWorkflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $applicationValidationWorkflow = Yaml::parseFile($root.'/.github/workflows/application-validation.yml');
+    $pullRequestQualityWorkflow = Yaml::parseFile($root.'/.github/workflows/pr-quality.yaml');
+
+    expect($sharedWorkflow['jobs']['fork-release']['runs-on'] ?? null)->toBe([
+        'group' => 'coolify-trusted',
+        'labels' => ['self-hosted', 'linux', 'x64'],
+    ]);
+
+    foreach ($applicationValidationWorkflow['jobs'] ?? [] as $jobName => $job) {
+        expect($job)->toBeArray()
+            ->and($job['runs-on'] ?? null)->toBe(
+                'ubuntu-24.04',
+                "pull-request validation job {$jobName} must stay GitHub-hosted",
+            );
+    }
+
+    expect($pullRequestQualityWorkflow['jobs']['pr-quality']['runs-on'] ?? null)
+        ->toBe('ubuntu-latest', 'pull-request quality job must stay GitHub-hosted');
 });
 
 it('rejects fork publication graphs that bypass the exact control-plane image census', function (string $mutation) {
@@ -2402,7 +2425,7 @@ it('requires exact fork tag source binding and rejects fork aliases', function (
                 'NEXUS_USERNAME' => 'fixture-user',
                 'PUBLISH_LATEST' => $publishLatest,
                 'RELEASE_KIND' => 'fork',
-                'REPOSITORY' => 'WilliamAGH/coolify',
+                'REPOSITORY' => 'williamacallahan/coolify',
                 'SEMANTIC_VERSION' => $version,
                 'SEMANTIC_VERSION_PATTERN' => $semanticPattern,
                 'TARGET_REPOSITORY' => 'williamagh/coolify',
@@ -2580,7 +2603,7 @@ it('accepts an exact published fork release during pre-promotion retry', functio
         expect($process->isSuccessful())->toBeTrue($process->getErrorOutput())
             ->and($process->getOutput())->toContain('accepting idempotent retry')
             ->and((string) file_get_contents($release['gh_log']))
-            ->toContain('api repos/WilliamAGH/coolify/commits/4.13.1-fork --jq .sha')
+            ->toContain('api repos/williamacallahan/coolify/commits/4.13.1-fork --jq .sha')
             ->not->toContain('release create');
     } finally {
         $filesystem->remove($fixture);
@@ -2665,7 +2688,7 @@ it('reconciles ambiguous fork release publication and accepts exact published re
                 ->and(trim((string) file_get_contents($release['state'])))->toBe('false')
                 ->and(substr_count($ghLog, 'release edit 4.13.1-fork'))->toBe($expectedEdits)
                 ->and($ghLog)->not->toContain('release upload')
-                ->toContain('api repos/WilliamAGH/coolify/commits/4.13.1-fork --jq .sha');
+                ->toContain('api repos/williamacallahan/coolify/commits/4.13.1-fork --jq .sha');
         } finally {
             $filesystem->remove($fixture);
         }

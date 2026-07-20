@@ -154,7 +154,7 @@ jobs:
 
           if [ "$OPERATIONAL_ACCEPTANCE" = true ]; then
             require_dockerhub_credentials
-            [ "$REPOSITORY" = 'WilliamAGH/coolify' ]
+            [ "$REPOSITORY" = 'williamacallahan/coolify' ]
             [ "$GITHUB_EVENT_NAME" = 'repository_dispatch' ]
             [ "$GITHUB_REF" = 'refs/heads/v4.x' ]
             [ "$GITHUB_REF_PROTECTED" = true ]
@@ -276,7 +276,7 @@ jobs:
               [ "$DOCKERFILE" = 'docker/production/Dockerfile' ]
               [ "$TARGET_REPOSITORY" = 'williamagh/coolify' ]
               [ "$CANDIDATE_REPOSITORY" = 'williamagh/coolify-fork-candidates' ]
-              [ "$REPOSITORY" = 'WilliamAGH/coolify' ]
+              [ "$REPOSITORY" = 'williamacallahan/coolify' ]
               printf '%s' "$SEMANTIC_VERSION" | grep -Eq "$FORK_SEMANTIC_VERSION_PATTERN"
               [ "$GITHUB_REF_TYPE" = tag ]
               [ "$GITHUB_REF" = "refs/tags/$SEMANTIC_VERSION" ]
@@ -881,7 +881,7 @@ jobs:
           REF_PROTECTED: ${{ github.ref_protected }}
         run: |
           set -eu
-          [ "$GITHUB_REPOSITORY" = 'WilliamAGH/coolify' ]
+          [ "$GITHUB_REPOSITORY" = 'williamacallahan/coolify' ]
           [ "$GITHUB_EVENT_NAME" = 'repository_dispatch' ]
           [ "$GITHUB_REF" = 'refs/heads/v4.x' ]
           [ "$REF_PROTECTED" = true ]
@@ -2468,7 +2468,9 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: write
-    runs-on: ubuntu-24.04
+    runs-on:
+      group: coolify-trusted
+      labels: [self-hosted, linux, x64]
     outputs:
       main_digest: ${{ needs.fork-stage.outputs.main_index_digest }}
       main_image: ${{ steps.references.outputs.main_image }}

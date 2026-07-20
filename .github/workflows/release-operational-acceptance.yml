@@ -40,7 +40,7 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          [[ "$GITHUB_REPOSITORY" == 'WilliamAGH/coolify' ]]
+          [[ "$GITHUB_REPOSITORY" == 'williamacallahan/coolify' ]]
           [[ "$GITHUB_EVENT_NAME" == 'repository_dispatch' ]]
           [[ "$EVENT_ACTION" == 'release-operational-acceptance' ]]
           [[ "$GITHUB_REF" == 'refs/heads/v4.x' ]]
