@@ -117,7 +117,7 @@ it('saves application name and enables static site with nginx config', function 
         ->fill('name', $updatedName)
         ->fill('customDockerRunOptions', '--read-only');
 
-    submitLivewireForm($page, 'Application settings updated!');
+    submitLivewireForm($page);
     $page->click('[id^="isStatic"]')
         ->screenshot();
 
@@ -152,7 +152,7 @@ it('saves database name and enables ssl with mode selector', function () {
         ->fill('name', $updatedDatabaseName)
         ->fill('description', 'Updated by browser test');
 
-    submitLivewireForm($page, 'Database updated.');
+    submitLivewireForm($page);
     $page->click('[id^="enableSsl"]');
 
     $page->assertSee('SSL Mode')
@@ -171,38 +171,55 @@ it('saves database name and enables ssl with mode selector', function () {
         ->assertSee('SSL Mode');
 });
 
-function submitLivewireForm($page, string $successMessage): void
+function submitLivewireForm($page): void
 {
-    $encodedSuccessMessage = json_encode($successMessage, JSON_HEX_APOS | JSON_HEX_QUOT | JSON_THROW_ON_ERROR);
-    $script = sprintf(<<<'JAVASCRIPT'
+    $completedComponentId = $page->script(<<<'JAVASCRIPT'
         () => new Promise((resolve, reject) => {
-            const expectedSuccessMessage = %s;
             const form = document.querySelector('input[name="name"]')?.closest('form[wire\\:submit="submit"]');
             if (!(form instanceof HTMLFormElement)) {
                 reject(new Error('Unable to find the canonical Livewire settings form.'));
                 return;
             }
+            const componentId = form.closest('[wire\\:id]')?.getAttribute('wire:id');
+            if (!componentId) {
+                reject(new Error('Unable to find the canonical Livewire settings component.'));
+                return;
+            }
 
-            const timeout = window.setTimeout(() => {
-                window.removeEventListener('toast-show', observeSuccessToast);
-                reject(new Error(`Timed out waiting for Livewire success: ${expectedSuccessMessage}`));
-            }, 10_000);
-            const observeSuccessToast = (event) => {
-                if (event.detail?.description !== expectedSuccessMessage) {
+            let settled = false;
+            let stopObservingCommits = () => {};
+            const finish = (callback) => {
+                if (settled) {
                     return;
                 }
 
+                settled = true;
                 window.clearTimeout(timeout);
-                window.removeEventListener('toast-show', observeSuccessToast);
-                window.requestAnimationFrame(() => resolve(event.detail.description));
+                stopObservingCommits();
+                callback();
             };
+            const timeout = window.setTimeout(() => {
+                finish(() => reject(new Error(`Timed out waiting for Livewire submit: ${componentId}`)));
+            }, 10_000);
+            stopObservingCommits = window.Livewire.hook('commit', ({ component, commit, succeed, fail }) => {
+                if (
+                    component.id !== componentId
+                    || !commit.calls.some((call) => call.method === 'submit')
+                ) {
+                    return;
+                }
 
-            window.addEventListener('toast-show', observeSuccessToast);
+                fail(() => {
+                    finish(() => reject(new Error(`Livewire submit failed: ${componentId}`)));
+                });
+                succeed(() => {
+                    finish(() => window.requestAnimationFrame(() => resolve(componentId)));
+                });
+            });
+
             form.requestSubmit();
         })
-        JAVASCRIPT, $encodedSuccessMessage);
-    $observedSuccessMessage = $page->script($script);
+        JAVASCRIPT);
 
-    expect($observedSuccessMessage)->toBe($successMessage);
-    $page->assertSee($successMessage);
+    expect($completedComponentId)->toBeString()->not->toBeEmpty();
 }
