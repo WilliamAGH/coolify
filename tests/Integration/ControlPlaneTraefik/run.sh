@@ -10,6 +10,7 @@ readonly REPOSITORY_ROOT
 readonly CONTROL_PLANE_HOST='control-plane.test'
 readonly DOCKER_PROVIDER_HOST='docker-provider.test'
 readonly PRIVATE_HEALTH_HEADER='X-Coolify-Control-Plane-Health-Proof'
+readonly AUTHENTICATION_PROOF_HEADER='X-Coolify-Control-Plane-Authentication-Proof'
 readonly MIN_DIRECT_HEALTH_REQUESTS=2
 readonly MIN_PROVIDER_HEALTH_REQUESTS=2
 readonly MIN_ROUTE_REQUESTS=100
@@ -137,6 +138,61 @@ fetch_route() {
         "$(header_value 'X-Coolify-Control-Plane-Dynamic-Sha' "$headers_file")" \
         "$(header_value 'X-Integration-Backend' "$headers_file")"
     rm -f -- "$headers_file"
+}
+
+probe_forwarded_identity() {
+    local route=$1
+    local host_header=$2
+    local supplied_proof=$3
+    local supplied_forwarded_for=$4
+    local url
+
+    if [ "$route" = https ]; then
+        url="https://127.0.0.1:${TRAEFIK_HTTPS_PORT}/forwarded-identity-probe"
+    elif [ "$route" = app-port ]; then
+        url="http://127.0.0.1:${TRAEFIK_APP_PORT}/forwarded-identity-probe"
+    else
+        fail "Unknown forwarded-identity route: $route"
+    fi
+
+    curl --fail --silent --show-error --insecure --noproxy '*' --connect-timeout 2 --max-time 4 \
+        --header "Host: ${host_header}" \
+        --header "${AUTHENTICATION_PROOF_HEADER}: ${supplied_proof}" \
+        --header "X-Forwarded-For: ${supplied_forwarded_for}" \
+        --output /dev/null "$url"
+}
+
+latest_forwarded_identity_record() {
+    touch "$BACKEND_BLUE_STATE_DIR/forwarded-identity.log" "$BACKEND_GREEN_STATE_DIR/forwarded-identity.log"
+    sort -n -t '|' -k 1,1 "$BACKEND_BLUE_STATE_DIR/forwarded-identity.log" "$BACKEND_GREEN_STATE_DIR/forwarded-identity.log" | tail -n 1
+}
+
+assert_forwarded_identity_boundary() {
+    local forged_proof
+    local forged_forwarded_for
+    local record
+    local _timestamp observed_host observed_proof observed_forwarded_for
+
+    forged_proof=$(openssl rand -hex 32)
+    forged_forwarded_for='203.0.113.199'
+
+    for route in https app-port; do
+        probe_forwarded_identity "$route" "$CONTROL_PLANE_HOST" "$forged_proof" "$forged_forwarded_for"
+        record=$(latest_forwarded_identity_record)
+        IFS='|' read -r _timestamp observed_host observed_proof observed_forwarded_for <<<"$record"
+        [ "$observed_host" = "$CONTROL_PLANE_HOST" ] || fail "$route did not preserve the managed control-plane host"
+        [ "$observed_proof" = "$CONTROL_PLANE_AUTHENTICATION_PROOF" ] || fail "$route did not overwrite a forged authentication proof"
+        [ -n "$observed_forwarded_for" ] || fail "$route omitted the genuine forwarded client identity"
+        case "$observed_forwarded_for" in
+            *"$forged_forwarded_for"*) fail "$route trusted a caller-supplied forwarded identity" ;;
+        esac
+    done
+
+    probe_forwarded_identity https "$DOCKER_PROVIDER_HOST" "$forged_proof" "$forged_forwarded_for"
+    record=$(latest_forwarded_identity_record)
+    IFS='|' read -r _timestamp observed_host observed_proof observed_forwarded_for <<<"$record"
+    [ "$observed_host" = "$DOCKER_PROVIDER_HOST" ] || fail 'Docker-provider identity probe reached the wrong host'
+    [ "$observed_proof" = "$forged_proof" ] || fail 'File-provider identity middleware leaked onto the Docker-provider route'
 }
 
 assert_route_identity() {
@@ -375,6 +431,8 @@ write_dynamic_snapshot() {
         printf '%s\n' '  middlewares:'
         printf '%s\n' '    coolify-control-plane-identity:'
         printf '%s\n' '      headers:'
+        printf '%s\n' '        customRequestHeaders:'
+        printf '          %s: %s\n' "$AUTHENTICATION_PROOF_HEADER" "$CONTROL_PLANE_AUTHENTICATION_PROOF"
         printf '%s\n' '        customResponseHeaders:'
         printf '          X-Coolify-Control-Plane-Color: %s\n' "$color"
         printf '          X-Coolify-Control-Plane-Generation: %s\n' "$generation"
@@ -698,13 +756,14 @@ main() {
     BACKEND_BLUE_STATE_DIR="$TEMP_DIRECTORY/backend-blue"
     BACKEND_GREEN_STATE_DIR="$TEMP_DIRECTORY/backend-green"
     CONTROL_PLANE_HEALTH_PROOF="proof-$(openssl rand -hex 32)"
+    CONTROL_PLANE_AUTHENTICATION_PROOF=$(openssl rand -hex 32)
     TRAEFIK_HTTPS_PORT=$(next_port)
     TRAEFIK_APP_PORT=$(next_port)
     TRAEFIK_API_PORT=$(next_port)
     TRAEFIK_IMAGE="traefik:$(jq -er '.traefik["v3.6"] | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' "$REPOSITORY_ROOT/versions.json")" \
         || fail 'versions.json does not own an exact Traefik 3.6 release'
     export PROJECT_NAME TRAEFIK_CERT_DIR TRAEFIK_DOCKER_SOCKET BACKEND_BLUE_STATE_DIR BACKEND_GREEN_STATE_DIR
-    export CONTROL_PLANE_HEALTH_PROOF TRAEFIK_HTTPS_PORT TRAEFIK_APP_PORT TRAEFIK_API_PORT TRAEFIK_IMAGE
+    export CONTROL_PLANE_HEALTH_PROOF CONTROL_PLANE_AUTHENTICATION_PROOF TRAEFIK_HTTPS_PORT TRAEFIK_APP_PORT TRAEFIK_API_PORT TRAEFIK_IMAGE
     export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
 
     mkdir -p "$TRAEFIK_CERT_DIR" "$BACKEND_BLUE_STATE_DIR" "$BACKEND_GREEN_STATE_DIR"
@@ -730,6 +789,7 @@ main() {
     wait_for_docker_provider_route
     wait_for_provider_health "$BACKEND_BLUE_STATE_DIR" backend-blue
     wait_for_provider_health "$BACKEND_GREEN_STATE_DIR" backend-green
+    assert_forwarded_identity_boundary
     assert_provider_delay_bounds "$BACKEND_BLUE_STATE_DIR" backend-blue
     assert_provider_delay_bounds "$BACKEND_GREEN_STATE_DIR" backend-green
     assert_directly_healthy_twice backend-blue "$BACKEND_BLUE_STATE_DIR" "$initial_dynamic_sha"

@@ -30,7 +30,18 @@ final readonly class ControlPlaneDynamicConfiguration
 
     public const AUTHENTICATION_PROXY_PROOF_HEADER = 'X-Coolify-Control-Plane-Authentication-Proof';
 
+    public const AUTHENTICATION_PROXY_PROOF_DERIVATION_CONTEXT = 'coolify-control-plane-authentication-proxy-v1';
+
     public const HEALTH_PROOF_DERIVATION_CONTEXT = 'coolify-control-plane-health-check-v1';
+
+    public static function deriveAuthenticationProxyProof(string $healthCheckProof): string
+    {
+        if (preg_match('/\A[a-f0-9]{64}\z/D', $healthCheckProof) !== 1) {
+            throw new InvalidArgumentException('The control-plane health-check proof must be a SHA-256 value.');
+        }
+
+        return hash_hmac('sha256', self::AUTHENTICATION_PROXY_PROOF_DERIVATION_CONTEXT, $healthCheckProof);
+    }
 
     public function __construct(
         public string $managedFilename,

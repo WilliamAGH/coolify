@@ -52,6 +52,7 @@ services:
         const http = require('http');
         const stateDirectory = process.env.STATE_DIRECTORY;
         const privateHeader = 'x-coolify-control-plane-health-proof';
+        const authenticationProofHeader = 'x-coolify-control-plane-authentication-proof';
         const healthProof = process.env.CONTROL_PLANE_HEALTH_PROOF;
         const instance = process.env.BACKEND_INSTANCE;
         const providerHost = 'control-plane.test';
@@ -117,6 +118,7 @@ services:
           }
 
           append('route.log', [instance, requestPath]);
+          append('forwarded-identity.log', [request.headers.host || '', request.headers[authenticationProofHeader] || '', request.headers['x-forwarded-for'] || '']);
           response.writeHead(200, responseHeaders());
           response.end(instance);
         }).listen(8080, '0.0.0.0');
@@ -146,6 +148,7 @@ services:
         const http = require('http');
         const stateDirectory = process.env.STATE_DIRECTORY;
         const privateHeader = 'x-coolify-control-plane-health-proof';
+        const authenticationProofHeader = 'x-coolify-control-plane-authentication-proof';
         const healthProof = process.env.CONTROL_PLANE_HEALTH_PROOF;
         const instance = process.env.BACKEND_INSTANCE;
         const providerHost = 'control-plane.test';
@@ -211,6 +214,7 @@ services:
           }
 
           append('route.log', [instance, requestPath]);
+          append('forwarded-identity.log', [request.headers.host || '', request.headers[authenticationProofHeader] || '', request.headers['x-forwarded-for'] || '']);
           response.writeHead(200, responseHeaders());
           response.end(instance);
         }).listen(8080, '0.0.0.0');

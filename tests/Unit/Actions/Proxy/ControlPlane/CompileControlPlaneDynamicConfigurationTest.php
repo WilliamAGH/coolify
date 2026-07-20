@@ -90,7 +90,7 @@ it('compiles one deterministic File-provider snapshot with shared HTTPS and APP_
         ControlPlaneDynamicConfiguration::GENERATION_HEADER => 'generation-42',
         ControlPlaneDynamicConfiguration::CONFIGURATION_ACKNOWLEDGEMENT_HEADER => 'ack:'.str_repeat('a', 64),
     ])->and($identityRequestHeaders)->toBe([
-        ControlPlaneDynamicConfiguration::AUTHENTICATION_PROXY_PROOF_HEADER => str_repeat('b', 64),
+        ControlPlaneDynamicConfiguration::AUTHENTICATION_PROXY_PROOF_HEADER => ControlPlaneDynamicConfiguration::deriveAuthenticationProxyProof(str_repeat('b', 64)),
     ])->and($service)->toMatchArray([
         'servers' => [
             ['url' => 'http://coolify-web-a:8080'],

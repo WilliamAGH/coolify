@@ -2,6 +2,7 @@
 
 use App\Actions\Proxy\ControlPlane\CompileControlPlaneDynamicConfiguration;
 use App\Actions\Proxy\ControlPlane\CompileControlPlaneStaticProxyConfiguration;
+use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentPhase;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentState;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyExposure;
@@ -114,6 +115,12 @@ it('compiles and reserves one public control-plane enrollment without retaining 
             'COOLIFY_CONTROL_PLANE_HEALTH_PROOF_TOKEN_SHA256' => hash(
                 'sha256',
                 hash_hmac('sha256', 'coolify-control-plane-health-check-v1', 'raw-token-must-not-persist'),
+            ),
+            'COOLIFY_CONTROL_PLANE_AUTHENTICATION_PROXY_PROOF_SHA256' => hash(
+                'sha256',
+                ControlPlaneDynamicConfiguration::deriveAuthenticationProxyProof(
+                    hash_hmac('sha256', 'coolify-control-plane-health-check-v1', 'raw-token-must-not-persist'),
+                ),
             ),
             'COOLIFY_CONTROL_PLANE_DYNAMIC_SHA256' => hash('sha256', $state->dynamicReplacementBytes),
             'COOLIFY_CONTROL_PLANE_MEMBER' => 'blue',

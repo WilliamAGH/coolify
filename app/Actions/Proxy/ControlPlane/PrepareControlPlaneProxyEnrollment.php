@@ -103,6 +103,10 @@ final class PrepareControlPlaneProxyEnrollment
         $staticConfiguration = $this->staticConfigurationCompiler->withHealthProofIdentity(
             configuration: $staticConfiguration,
             healthProofTokenSha256: hash('sha256', $healthCheckProof),
+            authenticationProxyProofSha256: hash(
+                'sha256',
+                ControlPlaneDynamicConfiguration::deriveAuthenticationProxyProof($healthCheckProof),
+            ),
             dynamicSha256: $dynamicConfiguration->sha256,
             configurationAcknowledgement: $configurationAcknowledgement,
             expectedMember: $expectedMember,
