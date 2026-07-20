@@ -104,7 +104,7 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
 });
 
 it('saves application name and enables static site with nginx config', function () {
-    loginAndSkipBoarding();
+    loginAndSkipBoarding($this->user->email);
 
     $updatedName = 'App Saved '.(string) new Cuid2;
     $applicationRoute = "/project/{$this->project->uuid}/environment/{$this->environment->uuid}/application/{$this->application->uuid}";
@@ -139,7 +139,7 @@ it('saves application name and enables static site with nginx config', function 
 });
 
 it('saves database name and enables ssl with mode selector', function () {
-    loginAndSkipBoarding();
+    loginAndSkipBoarding($this->user->email);
 
     $updatedDatabaseName = 'Database Saved '.(string) new Cuid2;
     $databaseRoute = "/project/{$this->project->uuid}/environment/{$this->environment->uuid}/database/{$this->database->uuid}";
@@ -177,7 +177,7 @@ function submitLivewireForm($page, string $successMessage): void
     $script = sprintf(<<<'JAVASCRIPT'
         () => new Promise((resolve, reject) => {
             const expectedSuccessMessage = %s;
-            const form = document.querySelector('form[wire\\\\:submit="submit"]');
+            const form = document.querySelector('form[wire\\:submit="submit"]');
             if (!(form instanceof HTMLFormElement)) {
                 reject(new Error('Unable to find the canonical Livewire settings form.'));
                 return;

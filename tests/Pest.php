@@ -35,7 +35,7 @@ beforeEach(function () {
 
 function loginAndSkipBoarding(?string $email = null, string $password = 'password'): mixed
 {
-    $email ??= property_exists(test(), 'user') ? test()->user->email : 'test@example.com';
+    $email ??= 'test@example.com';
 
     return visit('/login')
         ->fill('email', $email)
