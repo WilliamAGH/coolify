@@ -205,6 +205,16 @@ function applicationValidationWorkflowViolations(array $workflow): array
             break;
         }
     }
+    $backupQuiesceOwner = 'tests/Feature/Proxy/ControlPlane/ProveAndFreezeControlPlaneGenerationTest.php';
+    $backupQuiesceScript = collect($phpApplication['steps'] ?? [])
+        ->firstWhere('name', 'Run control-plane backup-quiesce owner')['run'] ?? '';
+    $phpScripts = collect($phpApplication['steps'] ?? [])
+        ->map(fn (array $step): string => (string) ($step['run'] ?? ''))
+        ->implode("\n");
+    if ((string) $backupQuiesceScript !== "php artisan test --compact {$backupQuiesceOwner}"
+        || substr_count($phpScripts, $backupQuiesceOwner) !== 1) {
+        $violations[] = 'application validation must execute the canonical control-plane backup-quiesce owner';
+    }
 
     $workflowAndShell = is_array($jobs) ? ($jobs['workflow-and-shell'] ?? []) : [];
     $dockerDaemonConfigurationScript = collect($workflowAndShell['steps'] ?? [])
@@ -433,6 +443,31 @@ it('rejects omitting explicit proxy-mutation payload diagnostics', function () {
 
     expect(applicationValidationWorkflowViolations($workflow))
         ->toContain('application validation must execute every native Traefik control-plane test');
+});
+
+it('rejects omitting the canonical control-plane backup-quiesce owner', function () {
+    $workflow = applicationValidationWorkflow();
+    $step = collect($workflow['jobs']['php']['steps'] ?? [])
+        ->search(fn (array $candidate): bool => ($candidate['name'] ?? null) === 'Run control-plane backup-quiesce owner');
+    expect($step)->not->toBeFalse();
+
+    unset($workflow['jobs']['php']['steps'][$step]);
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('application validation must execute the canonical control-plane backup-quiesce owner');
+});
+
+it('rejects executing the control-plane backup-quiesce owner twice', function () {
+    $workflow = applicationValidationWorkflow();
+    $step = collect($workflow['jobs']['php']['steps'] ?? [])
+        ->search(fn (array $candidate): bool => ($candidate['name'] ?? null) === 'Run native Traefik control-plane tests');
+    expect($step)->not->toBeFalse();
+
+    $workflow['jobs']['php']['steps'][$step]['run'] .= "\n"
+        .'php artisan test --compact tests/Feature/Proxy/ControlPlane/ProveAndFreezeControlPlaneGenerationTest.php';
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('application validation must execute the canonical control-plane backup-quiesce owner');
 });
 
 it('rejects omitting the native Traefik runtime integration', function () {
