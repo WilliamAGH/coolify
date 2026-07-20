@@ -39,6 +39,16 @@ it('requires native OCI runtime acceptance before a production or staging index 
         ->and($jobs['release']['needs'] ?? null)->toBe(['stage-candidates', 'attest-and-verify']);
 });
 
+it('feeds Trivy the extracted OCI layout instead of an unsupported OCI archive tar', function () {
+    $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/publish-linux-image.yml');
+    $secretScan = collect($workflow['jobs']['build-and-scan']['steps'] ?? [])
+        ->firstWhere('name', 'Scan local OCI for secrets');
+
+    expect($secretScan)->toBeArray()
+        ->and($secretScan['with']['input'] ?? null)->toBe('linux-image/layout-${{ matrix.arch }}')
+        ->and($secretScan['with'] ?? [])->not->toHaveKey('scan-ref');
+});
+
 it('accepts a safe staging-only alias and publishes it through the serialized release owner', function () {
     $root = dirname(__DIR__, 2);
     $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
