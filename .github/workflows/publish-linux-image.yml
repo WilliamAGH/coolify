@@ -1712,6 +1712,15 @@ jobs:
           upload-artifact: false
           upload-release-assets: false
 
+      - name: Enforce fork control-plane SBOM content census
+        if: ${{ matrix.product == 'main' && steps.fork-sbom.outcome == 'success' }}
+        run: |
+          set -Eeuo pipefail
+          jq -e '
+            [.packages[]? | select((.name // "" | ascii_downcase | contains("haproxy")))]
+            | length == 0
+          ' "fork-image/${{ matrix.artifact_name }}-${{ matrix.arch }}.sbom.spdx.json" >/dev/null
+
       - name: Scan fork OCI for high and critical vulnerabilities
         id: fork-vulnerability
         if: always()
