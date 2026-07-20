@@ -15,6 +15,7 @@ permissions:
   actions: write
   contents: write
   pull-requests: write
+  statuses: write
 
 concurrency:
   group: generate-changelog
@@ -76,5 +77,14 @@ jobs:
               --body 'Automated changelog update generated from the protected v4.x release history.')"
           fi
 
-          gh workflow run application-validation.yml --ref "${bot_branch}"
+          validation_url="$(gh workflow run application-validation.yml --ref "${bot_branch}")"
+          validation_run_id="${validation_url##*/}"
+          gh run watch "${validation_run_id}" --exit-status
+
+          head_sha="$(git rev-parse HEAD)"
+          gh api --method POST "repos/${GH_REPO}/statuses/${head_sha}" \
+            -f state=success \
+            -f context='Application validation required' \
+            -f description='Required workflow_dispatch validation passed' \
+            -f target_url="${validation_url}"
           gh pr merge --auto --squash --delete-branch "${pr_url}"
