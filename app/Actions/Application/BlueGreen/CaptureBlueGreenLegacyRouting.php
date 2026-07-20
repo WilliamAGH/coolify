@@ -113,7 +113,9 @@ class CaptureBlueGreenLegacyRouting
     ): array {
         $applicationForLabels = clone $application;
         $applicationForLabels->setRelation('destination', $destination);
-        $labels = generateLabelsApplication($applicationForLabels);
+        $labels = $application->build_pack === 'dockercompose'
+            ? $application->blueGreenRoutingLabels()
+            : generateLabelsApplication($applicationForLabels);
         $applicationUuid = (string) $application->uuid;
         CompileBlueGreenProxyConfiguration::run(
             $application,

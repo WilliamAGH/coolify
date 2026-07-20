@@ -28,9 +28,13 @@ class CompileBlueGreenProxyConfiguration
         $applicationForLabels = clone $application;
         $applicationForLabels->setRelation('destination', $destination);
 
+        $generatedLabels = $application->build_pack === 'dockercompose'
+            ? $application->blueGreenRoutingLabels()
+            : generateLabelsApplication($applicationForLabels);
+
         return $this->compileGeneratedLabels(
             applicationUuid: $applicationUuid,
-            generatedLabels: generateLabelsApplication($applicationForLabels),
+            generatedLabels: $generatedLabels,
             target: $target,
         );
     }

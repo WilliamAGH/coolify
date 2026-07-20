@@ -15,6 +15,7 @@ final readonly class BlueGreenDeactivationPreparation
         public BlueGreenContainerRemovalPlan $containerRemovalPlan,
         public ApplicationBlueGreenDeactivation $deactivation,
         public ?BlueGreenDeactivationException $invariantViolation = null,
+        public ?BlueGreenComposeSidecarDeactivationPlan $composeSidecarRemovalPlan = null,
     ) {}
 
     public function routingRevision(): int

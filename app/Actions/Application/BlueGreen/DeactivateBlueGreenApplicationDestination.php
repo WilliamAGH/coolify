@@ -125,6 +125,8 @@ final class DeactivateBlueGreenApplicationDestination
     ): void {
         $server = $preparation->destination->server;
         $operationFence->assertDeactivationOwnership($preparation);
+        $containerRemover = new RemoveBlueGreenApplicationContainers;
+        $sidecarRemover = new RemoveBlueGreenComposeSidecars;
         if ($preparation->state !== null) {
             $replacementState = $this->routeLessReplacementState(
                 $application,
@@ -140,8 +142,14 @@ final class DeactivateBlueGreenApplicationDestination
                     $expectedProxyState,
                     $replacementState,
                     $expectedServerBootId,
-                    [(new RemoveBlueGreenApplicationContainers)->commandFor($preparation->containerRemovalPlan)],
-                    [(new RemoveBlueGreenApplicationContainers)->assertAbsentCommandFor($preparation->containerRemovalPlan)],
+                    [
+                        $containerRemover->commandFor($preparation->containerRemovalPlan),
+                        $sidecarRemover->commandFor($preparation->composeSidecarRemovalPlan),
+                    ],
+                    [
+                        $containerRemover->assertAbsentCommandFor($preparation->containerRemovalPlan),
+                        $sidecarRemover->assertAbsentCommandFor($preparation->composeSidecarRemovalPlan),
+                    ],
                 ),
             );
             $this->recordRouteLessDestinationState($preparation, $expectedProxyState, $replacementState);
@@ -154,9 +162,10 @@ final class DeactivateBlueGreenApplicationDestination
             $server,
             implode("\n", [
                 $bootAssertion,
-                (new RemoveBlueGreenApplicationContainers)->commandFor(
-                    $preparation->containerRemovalPlan,
-                ),
+                $containerRemover->commandFor($preparation->containerRemovalPlan),
+                $sidecarRemover->commandFor($preparation->composeSidecarRemovalPlan),
+                $containerRemover->assertAbsentCommandFor($preparation->containerRemovalPlan),
+                $sidecarRemover->assertAbsentCommandFor($preparation->composeSidecarRemovalPlan),
                 $bootAssertion,
             ]),
         );
@@ -281,6 +290,7 @@ final class DeactivateBlueGreenApplicationDestination
         string $expectedServerBootId,
     ): void {
         $server = $preparation->destination->server;
+        $sidecarRemover = new RemoveBlueGreenComposeSidecars;
         $expectedProxyState ??= throw new BlueGreenDeactivationException('A snapshotted route has no exact durable proxy state.');
         $operationFence->assertDeactivationOwnership($preparation);
         $installation = InstallBlueGreenProxyEvictionTombstone::run(
@@ -302,6 +312,7 @@ final class DeactivateBlueGreenApplicationDestination
                     (new RemoveBlueGreenApplicationContainers)->assertAbsentCommandFor(
                         $preparation->containerRemovalPlan,
                     ),
+                    $sidecarRemover->assertAbsentCommandFor($preparation->composeSidecarRemovalPlan),
                     $bootAssertion,
                 ]),
             );
@@ -332,6 +343,20 @@ final class DeactivateBlueGreenApplicationDestination
             $preparation->containerRemovalPlan,
             $expectedServerBootId,
         );
+        $operationFence->assertDeactivationOwnership($preparation);
+        $sidecarRemovalPlan = $preparation->composeSidecarRemovalPlan;
+        if ($sidecarRemovalPlan !== null && ! $sidecarRemovalPlan->isEmpty()) {
+            $bootAssertion = (new ReadBlueGreenServerBootIdentity)->assertionCommandFor($expectedServerBootId).' || exit 75';
+            ExecuteBlueGreenDeactivationRemoteCommand::run(
+                $server,
+                implode("\n", [
+                    $bootAssertion,
+                    $sidecarRemover->commandFor($sidecarRemovalPlan),
+                    $sidecarRemover->assertAbsentCommandFor($sidecarRemovalPlan),
+                    $bootAssertion,
+                ]),
+            );
+        }
         $operationFence->assertDeactivationOwnership($preparation);
         RemoveBlueGreenProxyEvictionTombstone::run(
             $server,
