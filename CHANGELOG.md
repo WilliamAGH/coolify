@@ -15,6 +15,7 @@ All notable changes to this project will be documented in this file.
 - *(ci)* Update changelog through protected pull request
 - *(ci)* Preserve Docker daemon validation in changelog patch
 - *(ci)* Attest dispatched changelog validation
+- *(ci)* Make changelog auto-merge idempotent (#55)
 
 ### 💼 Other
 
@@ -23,6 +24,7 @@ All notable changes to this project will be documented in this file.
 ### 📚 Documentation
 
 - Update changelog (#52)
+- Update changelog (#54)
 
 ### 🧪 Testing
 
