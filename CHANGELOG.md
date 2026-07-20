@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🚀 Features
+
+- *(realtime)* Bundle Reverb and terminal in main image (#62)
+
 ### 🐛 Bug Fixes
 
 - *(release)* Scan extracted OCI layouts with Trivy
@@ -28,6 +32,7 @@ All notable changes to this project will be documented in this file.
 - Update changelog (#54)
 - Update changelog (#56)
 - Update changelog (#59)
+- Update changelog (#60)
 
 ### 🧪 Testing
 
