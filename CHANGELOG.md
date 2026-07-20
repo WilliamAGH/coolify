@@ -8,6 +8,7 @@ All notable changes to this project will be documented in this file.
 
 - *(realtime)* Bundle Reverb and terminal in main image (#62)
 - *(blue-green)* Support multiple backend ports
+- *(blue-green)* Support routed compose services
 
 ### 🐛 Bug Fixes
 
@@ -39,6 +40,7 @@ All notable changes to this project will be documented in this file.
 - Update changelog (#65)
 - Update changelog (#67)
 - Update changelog (#68)
+- Update changelog (#70)
 
 ### 🧪 Testing
 
