@@ -9,11 +9,24 @@ REPOSITORY_ROOT="$(cd -- "$SCRIPT_DIRECTORY/../../.." && pwd)"
 readonly REPOSITORY_ROOT
 readonly CONTROL_PLANE_HOST='control-plane.test'
 readonly DOCKER_PROVIDER_HOST='docker-provider.test'
+readonly APPLICATION_HOST='production-application.test'
+readonly APPLICATION_UUID='runtime-app'
+readonly APPLICATION_DESTINATION_ID=42
+readonly APPLICATION_ROUTING_PREFIX='coolify-bg-2996dc1b6153b95b-'
+readonly APPLICATION_MANAGED_FILENAME='coolify-blue-green-2996dc1b6153b95b.yaml'
+readonly APPLICATION_DOCKER_ROUTER='runtime-application-docker@docker'
+readonly APPLICATION_FILE_ROUTER="${APPLICATION_ROUTING_PREFIX}runtime-application-public@file"
+readonly APPLICATION_TRANSACTION_KEY='runtime-forward-retry-0001'
+readonly APPLICATION_TRANSACTION_PAYLOAD='{"operation":"runtime-write"}'
 readonly PRIVATE_HEALTH_HEADER='X-Coolify-Control-Plane-Health-Proof'
 readonly AUTHENTICATION_PROOF_HEADER='X-Coolify-Control-Plane-Authentication-Proof'
 readonly MIN_DIRECT_HEALTH_REQUESTS=2
 readonly MIN_PROVIDER_HEALTH_REQUESTS=2
 readonly MIN_ROUTE_REQUESTS=100
+readonly MIN_APPLICATION_REQUESTS=30
+readonly MIN_APPLICATION_PHASE_REQUESTS=4
+readonly MAX_APPLICATION_REQUEST_LATENCY_MS=2000
+readonly MAX_APPLICATION_SAMPLE_GAP_MS=2500
 readonly MIN_PROVIDER_CADENCE_MS=500
 readonly MAX_PROVIDER_CADENCE_MS=5000
 readonly MAX_PROVIDER_START_DELAY_MS=15000
@@ -47,6 +60,8 @@ TRANSPORT_OBSERVER_LOG=''
 TRANSPORT_OBSERVER_REPORT=''
 TRANSPORT_OBSERVER_READY=''
 TRANSPORT_OBSERVER_RELEASE=''
+APPLICATION_OBSERVER_PID=''
+HELD_TRANSACTION_PID=''
 BACKGROUND_PIDS=()
 
 fail() {
@@ -615,8 +630,9 @@ atomic_replace_snapshot() {
     local staged_filename
 
     staged_filename=".coolify.yaml.${RANDOM}.$$"
-    compose cp "$source_snapshot" "config-writer:/dynamic/${staged_filename}"
-    compose exec -T config-writer sh -c "mv -f /dynamic/${staged_filename} /dynamic/coolify.yaml"
+    compose exec -T config-writer mkdir -p /proxy/dynamic
+    compose cp "$source_snapshot" "config-writer:/proxy/dynamic/${staged_filename}"
+    compose exec -T config-writer sh -c "mv -f /proxy/dynamic/${staged_filename} /proxy/dynamic/coolify.yaml"
 }
 
 assert_exact_dynamic_snapshot() {
@@ -625,7 +641,7 @@ assert_exact_dynamic_snapshot() {
     local actual_dynamic_sha
 
     expected_dynamic_sha=$(sha256_file "$snapshot")
-    actual_dynamic_sha=$(compose exec -T config-writer sh -c 'sha256sum /dynamic/coolify.yaml' | awk '{print $1}')
+    actual_dynamic_sha=$(compose exec -T config-writer sh -c 'sha256sum /proxy/dynamic/coolify.yaml' | awk '{print $1}')
     [ "$actual_dynamic_sha" = "$expected_dynamic_sha" ] || fail 'The managed dynamic document does not contain the exact expected bytes'
 }
 
@@ -737,10 +753,641 @@ wait_for_docker_provider_route() {
     fail 'Docker-provider route did not become reachable'
 }
 
+decode_base64() {
+    python3 -c 'import base64, sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.buffer.read()))'
+}
+
+fetch_application_route() {
+    local headers_file
+    local curl_result
+    local duration_ms
+    local status
+    local total_seconds
+
+    headers_file=$(mktemp "$TEMP_DIRECTORY/application-route-headers.XXXXXX")
+    if ! curl_result=$(curl --silent --show-error --insecure --noproxy '*' --connect-timeout 2 --max-time 4 \
+        --header "Host: ${APPLICATION_HOST}" \
+        --dump-header "$headers_file" \
+        --output /dev/null \
+        --write-out '%{http_code}|%{time_total}' \
+        "https://127.0.0.1:${TRAEFIK_HTTPS_PORT}/runtime-application"); then
+        curl_result='000|4.000000'
+    fi
+    IFS='|' read -r status total_seconds <<<"$curl_result"
+    duration_ms=$(awk -v seconds="$total_seconds" 'BEGIN { printf "%d", (seconds * 1000) + 0.5 }')
+    printf '%s|%s|%s|%s\n' \
+        "$status" \
+        "$(header_value 'X-Integration-Backend' "$headers_file")" \
+        "$(header_value 'X-Coolify-Probe-Ack' "$headers_file")" \
+        "$duration_ms"
+    rm -f -- "$headers_file"
+}
+
+application_route_matches() {
+    local expected_backend=$1
+    local expected_acknowledgement=$2
+    local record
+    local status backend acknowledgement _duration_ms
+
+    record=$(fetch_application_route)
+    IFS='|' read -r status backend acknowledgement _duration_ms <<<"$record"
+    [ "$status" = 200 ] \
+        && [ "$backend" = "$expected_backend" ] \
+        && [ "$acknowledgement" = "$expected_acknowledgement" ]
+}
+
+wait_for_application_route() {
+    local expected_backend=$1
+    local expected_acknowledgement=$2
+    local deadline=$(( $(now_ms) + MAX_RELOAD_DELAY_MS ))
+
+    while [ "$(now_ms)" -lt "$deadline" ]; do
+        if application_route_matches "$expected_backend" "$expected_acknowledgement"; then
+            return
+        fi
+        sleep 0.1
+    done
+    fail "Timed out waiting for the application route to reach $expected_backend with its exact provider acknowledgement"
+}
+
+assert_application_provider_inventory() {
+    local expected_file=$1
+    local expected_docker=$2
+    local expected_public_backend=$3
+    local rawdata_file
+
+    rawdata_file=$(mktemp "$TEMP_DIRECTORY/application-rawdata.XXXXXX")
+    if ! curl --fail --silent --show-error --noproxy '*' --connect-timeout 2 --max-time 4 \
+        --output "$rawdata_file" "http://127.0.0.1:${TRAEFIK_API_PORT}/api/rawdata"; then
+        rm -f -- "$rawdata_file"
+        return 1
+    fi
+    if ! python3 - "$rawdata_file" "$expected_file" "$expected_docker" "$expected_public_backend" \
+        "$APPLICATION_FILE_ROUTER" "$APPLICATION_DOCKER_ROUTER" "$APPLICATION_HOST" "$APPLICATION_ROUTING_PREFIX" <<'PY'
+import json
+import sys
+
+rawdata_path, expected_file, expected_docker, expected_public_backend, file_name, docker_name, host, prefix = sys.argv[1:]
+with open(rawdata_path, encoding='utf-8') as rawdata_handle:
+    rawdata = json.load(rawdata_handle)
+routers = rawdata.get('routers') or {}
+services = rawdata.get('services') or {}
+rule = f'Host(`{host}`)'
+file_router = routers.get(file_name)
+docker_router = routers.get(docker_name)
+
+if (file_router is not None) != (expected_file == 'present'):
+    raise SystemExit(1)
+if (docker_router is not None) != (expected_docker == 'present'):
+    raise SystemExit(1)
+if docker_router is not None:
+    if docker_router.get('status') != 'enabled' or docker_router.get('rule') != rule:
+        raise SystemExit(1)
+    if docker_router.get('service') != f'{prefix}blue':
+        raise SystemExit(1)
+    blue_service = services.get(f'{prefix}blue@docker')
+    if blue_service is None or blue_service.get('status') != 'enabled':
+        raise SystemExit(1)
+if file_router is not None:
+    if file_router.get('status') != 'enabled' or file_router.get('rule') != rule:
+        raise SystemExit(1)
+    if file_router.get('service') != f'{prefix}active':
+        raise SystemExit(1)
+    if int(file_router.get('priority', 0)) != len(rule) + 1:
+        raise SystemExit(1)
+    if docker_router is not None and int(file_router.get('priority', 0)) <= int(docker_router.get('priority', 0)):
+        raise SystemExit(1)
+    active_service = services.get(f'{prefix}active@file')
+    expected_member_name = f'{prefix}{expected_public_backend}@docker'
+    expected_children = [{'name': expected_member_name, 'weight': 1}]
+    if active_service is None or active_service.get('status') != 'enabled':
+        raise SystemExit(1)
+    if (active_service.get('weighted') or {}).get('services') != expected_children:
+        raise SystemExit(1)
+    member_service = services.get(expected_member_name)
+    if member_service is None or member_service.get('status') != 'enabled':
+        raise SystemExit(1)
+elif expected_public_backend != 'blue':
+    raise SystemExit(1)
+relevant_errors = [
+    error for error in (rawdata.get('errors') or [])
+    if host in json.dumps(error, sort_keys=True) or prefix in json.dumps(error, sort_keys=True)
+]
+if relevant_errors:
+    raise SystemExit(1)
+PY
+    then
+        rm -f -- "$rawdata_file"
+        return 1
+    fi
+    rm -f -- "$rawdata_file"
+}
+
+wait_for_application_provider_inventory() {
+    local expected_file=$1
+    local expected_docker=$2
+    local expected_public_backend=$3
+    local deadline=$(( $(now_ms) + MAX_RELOAD_DELAY_MS ))
+
+    while [ "$(now_ms)" -lt "$deadline" ]; do
+        if assert_application_provider_inventory "$expected_file" "$expected_docker" "$expected_public_backend"; then
+            return
+        fi
+        sleep 0.1
+    done
+    curl --silent --show-error --noproxy '*' --connect-timeout 2 --max-time 4 \
+        "http://127.0.0.1:${TRAEFIK_API_PORT}/api/rawdata" \
+        | jq --arg host "$APPLICATION_HOST" --arg prefix "$APPLICATION_ROUTING_PREFIX" '
+            {
+                errors,
+                routers: (.routers // {} | with_entries(select((.key | contains($prefix)) or (.value.rule // "" | contains($host))))),
+                services: (.services // {} | with_entries(select(.key | contains($prefix))))
+            }
+        ' >&2 || true
+    fail "Timed out waiting for application provider inventory file=$expected_file docker=$expected_docker backend=$expected_public_backend"
+}
+
+compile_application_lifecycle_plan() {
+    local destination=$1
+    local expected_boot_id=$2
+    local green_container_id=$3
+
+    php -- "$REPOSITORY_ROOT" "$expected_boot_id" "$green_container_id" "$APPLICATION_UUID" "$APPLICATION_DESTINATION_ID" > "$destination" <<'PHP'
+<?php
+
+use App\Actions\Proxy\BlueGreenProxyRollbackKey;
+use App\Actions\Proxy\BlueGreenRoutingMode;
+use App\Actions\Proxy\BlueGreenRoutingTarget;
+use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
+use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
+use App\Enums\BlueGreenDeploymentColor;
+
+require $argv[1].'/vendor/autoload.php';
+
+$expectedBootId = $argv[2];
+$greenContainerId = $argv[3];
+$operationId = 'runtime-interrupted-forward';
+$applicationUuid = $argv[4];
+$destinationId = (int) $argv[5];
+$target = new BlueGreenRoutingTarget(
+    destinationId: $destinationId,
+    activeColor: BlueGreenDeploymentColor::GREEN,
+    blueContainerName: 'backend-blue',
+    greenContainerName: 'backend-green',
+    port: 8080,
+    routingRevision: 1,
+    mode: BlueGreenRoutingMode::LegacyAdoption,
+    publicProofToken: BlueGreenRoutingTarget::durablePublicProofToken($operationId),
+    destinationFenceEpoch: 1,
+    operationId: $operationId,
+    mutationSequence: 1,
+    activeDeploymentUuid: 'runtime-green-deployment',
+    activeContainerId: $greenContainerId,
+    destinationTopologyDigest: hash('sha256', 'runtime-destination-42'),
+);
+$configuration = (new CompileBlueGreenProxyConfiguration)->compileGeneratedLabels(
+    applicationUuid: $applicationUuid,
+    generatedLabels: [
+        'traefik.enable=true',
+        'traefik.http.routers.runtime-application.rule=Host(`production-application.test`)',
+        'traefik.http.routers.runtime-application.entryPoints=https',
+        'traefik.http.routers.runtime-application.tls=true',
+        'traefik.http.routers.runtime-application.service=runtime-application',
+        'traefik.http.services.runtime-application.loadbalancer.server.port=8080',
+    ],
+    target: $target,
+);
+$rollbackKey = new BlueGreenProxyRollbackKey($operationId, null, $configuration->state);
+$writer = new WriteBlueGreenProxyConfiguration;
+$interruptedWriter = new class extends WriteBlueGreenProxyConfiguration
+{
+    protected function afterManagedMutationCommands(): array
+    {
+        return ['exit 86'];
+    }
+};
+$proxyPath = '/proxy';
+
+echo json_encode([
+    'activeServiceName' => BlueGreenRoutingTarget::activeServiceName($applicationUuid, $destinationId).'@file',
+    'dockerRouterName' => 'runtime-application-docker@docker',
+    'fileRouterName' => BlueGreenRoutingTarget::routingNamePrefix($applicationUuid, $destinationId).'runtime-application-public@file',
+    'forwardStateBase64' => base64_encode($configuration->state->serialize()),
+    'interruptedCommandBase64' => base64_encode($interruptedWriter->commandFor($proxyPath, $configuration, $rollbackKey, $expectedBootId)),
+    'journalPath' => $writer->mutationJournalPath($proxyPath, $configuration->managedFilename),
+    'managedFilename' => $configuration->managedFilename,
+    'managedPath' => $writer->managedPath($proxyPath, $configuration->managedFilename),
+    'managedSha256' => $configuration->sha256,
+    'publicAcknowledgement' => $target->publicAcknowledgement(),
+    'recoveryCommandBase64' => base64_encode($writer->commandFor($proxyPath, $configuration, $rollbackKey, $expectedBootId)),
+    'rollbackArtifactPath' => $writer->rollbackArtifactPath($proxyPath, $rollbackKey),
+    'rollbackCommandBase64' => base64_encode($writer->rollbackArtifactRestoreCommandFor($proxyPath, $rollbackKey, $expectedBootId)),
+    'rollbackStateBase64' => base64_encode($rollbackKey->rollbackState()->serialize()),
+    'statePath' => $writer->statePath($proxyPath, $configuration->managedFilename),
+    'yamlBase64' => base64_encode($configuration->yaml),
+], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
+PHP
+
+    jq -e \
+        --arg active_service "${APPLICATION_ROUTING_PREFIX}active@file" \
+        --arg docker_router "$APPLICATION_DOCKER_ROUTER" \
+        --arg file_router "$APPLICATION_FILE_ROUTER" \
+        --arg filename "$APPLICATION_MANAGED_FILENAME" '
+            .activeServiceName == $active_service
+            and .dockerRouterName == $docker_router
+            and .fileRouterName == $file_router
+            and .managedFilename == $filename
+            and (.managedSha256 | test("^[a-f0-9]{64}$"))
+            and (.publicAcknowledgement | type == "string" and length >= 16)
+        ' "$destination" >/dev/null || fail 'The production compiler returned an invalid application lifecycle plan'
+}
+
+run_application_writer_command() {
+    local plan=$1
+    local command_field=$2
+    local expected_status=$3
+    local command
+    local output_file="$TEMP_DIRECTORY/${command_field}.log"
+    local status=0
+
+    command=$(jq -er ".${command_field}" "$plan" | decode_base64)
+    compose exec -T config-writer sh -c "$command" > "$output_file" 2>&1 || status=$?
+    if [ "$status" -ne "$expected_status" ]; then
+        cat "$output_file" >&2 || true
+        fail "$command_field exited $status instead of $expected_status"
+    fi
+}
+
+wait_for_host_file() {
+    local path=$1
+    local description=$2
+    local deadline=$(( $(now_ms) + MAX_RELOAD_DELAY_MS ))
+
+    while [ "$(now_ms)" -lt "$deadline" ]; do
+        if [ -s "$path" ]; then
+            return
+        fi
+        sleep 0.05
+    done
+    fail "Timed out waiting for $description"
+}
+
+assert_interrupted_application_artifacts() {
+    local plan=$1
+    local managed_path state_path journal_path artifact_path expected_sha actual_sha
+
+    managed_path=$(jq -er '.managedPath' "$plan")
+    state_path=$(jq -er '.statePath' "$plan")
+    journal_path=$(jq -er '.journalPath' "$plan")
+    artifact_path=$(jq -er '.rollbackArtifactPath' "$plan")
+    expected_sha=$(jq -er '.managedSha256' "$plan")
+    compose exec -T config-writer sh -c \
+        "test -f \"\$1\" && test ! -e \"\$2\" && test ! -L \"\$2\" && test -f \"\$3\" && test -f \"\$4\"" \
+        sh "$managed_path" "$state_path" "$journal_path" "$artifact_path" \
+        || fail 'Interrupted publication did not retain its exact managed file, journal, and rollback artifact'
+    actual_sha=$(compose exec -T config-writer sh -c "sha256sum \"\$1\"" sh "$managed_path" | awk '{print $1}')
+    [ "$actual_sha" = "$expected_sha" ] || fail 'Interrupted publication exposed bytes other than the production compiler output'
+}
+
+assert_recovered_application_artifacts() {
+    local plan=$1
+    local managed_path state_path journal_path artifact_path expected_state actual_state
+
+    managed_path=$(jq -er '.managedPath' "$plan")
+    state_path=$(jq -er '.statePath' "$plan")
+    journal_path=$(jq -er '.journalPath' "$plan")
+    artifact_path=$(jq -er '.rollbackArtifactPath' "$plan")
+    expected_state=$(jq -er '.forwardStateBase64' "$plan" | decode_base64)
+    compose exec -T config-writer sh -c \
+        "test -f \"\$1\" && test -f \"\$2\" && test ! -e \"\$3\" && test ! -L \"\$3\" && test -f \"\$4\"" \
+        sh "$managed_path" "$state_path" "$journal_path" "$artifact_path" \
+        || fail 'Canonical recovery did not finish the interrupted publication journal'
+    actual_state=$(compose exec -T config-writer cat "$state_path")
+    [ "$actual_state" = "$expected_state" ] || fail 'Canonical recovery did not persist the exact forward destination-fence state'
+}
+
+assert_rolled_back_application_artifacts() {
+    local plan=$1
+    local managed_path state_path journal_path artifact_path expected_state actual_state
+
+    managed_path=$(jq -er '.managedPath' "$plan")
+    state_path=$(jq -er '.statePath' "$plan")
+    journal_path=$(jq -er '.journalPath' "$plan")
+    artifact_path=$(jq -er '.rollbackArtifactPath' "$plan")
+    expected_state=$(jq -er '.rollbackStateBase64' "$plan" | decode_base64)
+    compose exec -T config-writer sh -c \
+        "test ! -e \"\$1\" && test ! -L \"\$1\" && test -f \"\$2\" && test ! -e \"\$3\" && test ! -L \"\$3\" && test -f \"\$4\"" \
+        sh "$managed_path" "$state_path" "$journal_path" "$artifact_path" \
+        || fail 'Canonical rollback did not restore the exact absent File-provider route state'
+    actual_state=$(compose exec -T config-writer cat "$state_path")
+    [ "$actual_state" = "$expected_state" ] || fail 'Canonical rollback did not persist the exact monotonic rollback state'
+}
+
+publish_application_phase() {
+    local phase_file=$1
+    local phase=$2
+    local staged_phase
+
+    staged_phase=$(mktemp "${phase_file}.XXXXXX")
+    jq -n --arg phase "$phase" --argjson published_at "$(now_ms)" \
+        '{phase: $phase, publishedAt: $published_at}' > "$staged_phase"
+    mv -f -- "$staged_phase" "$phase_file"
+}
+
+start_application_observer() {
+    local log_file=$1
+    local stop_file=$2
+    local phase_file=$3
+    local completed_at_ms
+    local phase_after
+    local phase_before
+    local record
+    local started_at_ms
+
+    : > "$log_file"
+    rm -f -- "$stop_file"
+    (
+        trap - EXIT
+        while [ ! -e "$stop_file" ]; do
+            phase_before=$(jq -er '.phase' "$phase_file")
+            started_at_ms=$(now_ms)
+            record=$(fetch_application_route)
+            completed_at_ms=$(now_ms)
+            phase_after=$(jq -er '.phase' "$phase_file")
+            if [ "$phase_before" = "$phase_after" ]; then
+                printf '%s|%s|%s|%s\n' \
+                    "$started_at_ms" "$completed_at_ms" "$phase_before" "$record" >> "$log_file"
+            fi
+            sleep 0.05
+        done
+    ) &
+    APPLICATION_OBSERVER_PID=$!
+    register_background_pid "$APPLICATION_OBSERVER_PID"
+}
+
+wait_for_application_phase_backend() {
+    local log_file=$1
+    local phase=$2
+    local expected_backend=$3
+    local expected_acknowledgement=$4
+    local deadline=$(( $(now_ms) + MAX_RELOAD_DELAY_MS ))
+    local observed_count
+
+    while [ "$(now_ms)" -lt "$deadline" ]; do
+        background_pid_is_running "$APPLICATION_OBSERVER_PID" \
+            || fail "Application availability observer terminated during phase $phase"
+        observed_count=$(awk -F'|' \
+            -v acknowledgement="$expected_acknowledgement" \
+            -v backend="$expected_backend" \
+            -v phase="$phase" '
+                $3 == phase && $4 == "200" && $5 == backend && $6 == acknowledgement { count += 1 }
+                END { print count + 0 }
+            ' "$log_file")
+        if [ "$observed_count" -ge "$MIN_APPLICATION_PHASE_REQUESTS" ]; then
+            return
+        fi
+        sleep 0.05
+    done
+    fail "Application availability phase $phase did not record $MIN_APPLICATION_PHASE_REQUESTS requests from $expected_backend"
+}
+
+assert_application_observer() {
+    local log_file=$1
+    local public_acknowledgement=$2
+
+    if ! python3 - "$log_file" "$public_acknowledgement" \
+        "$MIN_APPLICATION_REQUESTS" "$MIN_APPLICATION_PHASE_REQUESTS" \
+        "$MAX_APPLICATION_REQUEST_LATENCY_MS" "$MAX_APPLICATION_SAMPLE_GAP_MS" <<'PY'
+import sys
+
+(
+    log_path,
+    public_acknowledgement,
+    minimum_requests,
+    minimum_phase_requests,
+    maximum_latency_ms,
+    maximum_gap_ms,
+) = sys.argv[1:]
+minimum_requests = int(minimum_requests)
+minimum_phase_requests = int(minimum_phase_requests)
+maximum_latency_ms = int(maximum_latency_ms)
+maximum_gap_ms = int(maximum_gap_ms)
+phase_pairs = {
+    'docker-prior': {('blue', '')},
+    'forward-transition': {('blue', ''), ('green', public_acknowledgement)},
+    'file-candidate': {('green', public_acknowledgement)},
+    'predecessor-draining': {('green', public_acknowledgement)},
+    'file-only': {('green', public_acknowledgement)},
+    'docker-restored-shadowed': {('green', public_acknowledgement)},
+    'rollback-transition': {('green', public_acknowledgement), ('blue', '')},
+    'docker-restored': {('blue', '')},
+}
+phase_order = {phase: index for index, phase in enumerate(phase_pairs)}
+phase_counts = {phase: {} for phase in phase_pairs}
+records = []
+
+with open(log_path, encoding='utf-8') as log_handle:
+    for line_number, line in enumerate(log_handle, start=1):
+        fields = line.rstrip('\n').split('|')
+        if len(fields) != 7:
+            raise ValueError(f'line {line_number} has {len(fields)} fields')
+        started_at, completed_at, phase, status, backend, acknowledgement, duration = fields
+        started_at = int(started_at)
+        completed_at = int(completed_at)
+        duration = int(duration)
+        if phase not in phase_pairs:
+            raise ValueError(f'line {line_number} has unknown phase {phase}')
+        pair = (backend, acknowledgement)
+        if status != '200' or pair not in phase_pairs[phase]:
+            raise ValueError(f'line {line_number} violates phase {phase}: status={status} pair={pair}')
+        if started_at > completed_at:
+            raise ValueError(f'line {line_number} completes before it starts')
+        if duration > maximum_latency_ms or completed_at - started_at > maximum_latency_ms:
+            raise ValueError(f'line {line_number} exceeds latency bound: curl={duration} wall={completed_at - started_at}')
+        phase_counts[phase][pair] = phase_counts[phase].get(pair, 0) + 1
+        records.append((started_at, completed_at, phase))
+
+if len(records) < minimum_requests:
+    raise ValueError(f'only {len(records)} application requests were recorded')
+if [phase_order[phase] for _, _, phase in records] != sorted(phase_order[phase] for _, _, phase in records):
+    raise ValueError('application phases regressed')
+for previous, current in zip(records, records[1:]):
+    gap_ms = current[0] - previous[1]
+    if gap_ms > maximum_gap_ms:
+        raise ValueError(f'application availability gap {gap_ms}ms exceeds {maximum_gap_ms}ms')
+for phase, expected_pairs in phase_pairs.items():
+    for pair in expected_pairs:
+        observed = phase_counts[phase].get(pair, 0)
+        if observed < minimum_phase_requests:
+            raise ValueError(f'phase {phase} pair {pair} has only {observed} requests')
+PY
+    then
+        printf 'Application availability phase evidence:\n' >&2
+        cat "$log_file" >&2
+        printf 'Recent Traefik routing logs:\n' >&2
+        compose logs --no-color --no-log-prefix --tail 200 traefik >&2 || true
+        fail 'Application availability violated a phase, backend, latency, or gap contract'
+    fi
+}
+
+start_held_application_transaction() {
+    local headers_file=$1
+    local body_file=$2
+    local status_file=$3
+    local error_file=$4
+
+    curl --silent --show-error --insecure --noproxy '*' --connect-timeout 2 --max-time 65 \
+        --request POST \
+        --header "Host: ${APPLICATION_HOST}" \
+        --header "Idempotency-Key: ${APPLICATION_TRANSACTION_KEY}" \
+        --header 'Content-Type: application/json' \
+        --data "$APPLICATION_TRANSACTION_PAYLOAD" \
+        --dump-header "$headers_file" \
+        --output "$body_file" \
+        --write-out '%{http_code}' \
+        "https://127.0.0.1:${TRAEFIK_HTTPS_PORT}/transactions?hold=forward-publication" \
+        > "$status_file" 2> "$error_file" &
+    HELD_TRANSACTION_PID=$!
+    register_background_pid "$HELD_TRANSACTION_PID"
+}
+
+post_application_transaction() {
+    local headers_file=$1
+    local body_file=$2
+    local status_file=$3
+
+    curl --silent --show-error --insecure --noproxy '*' --connect-timeout 2 --max-time 5 \
+        --request POST \
+        --header "Host: ${APPLICATION_HOST}" \
+        --header "Idempotency-Key: ${APPLICATION_TRANSACTION_KEY}" \
+        --header 'Content-Type: application/json' \
+        --data "$APPLICATION_TRANSACTION_PAYLOAD" \
+        --dump-header "$headers_file" \
+        --output "$body_file" \
+        --write-out '%{http_code}' \
+        "https://127.0.0.1:${TRAEFIK_HTTPS_PORT}/transactions" > "$status_file"
+}
+
+assert_application_transaction_response() {
+    local headers_file=$1
+    local body_file=$2
+    local status_file=$3
+    local expected_status=$4
+    local expected_backend=$5
+    local expected_created=$6
+    local expected_acknowledgement=$7
+    local expected_transaction_id=$8
+
+    [ "$(cat "$status_file")" = "$expected_status" ] \
+        || fail "Application transaction returned status $(cat "$status_file") instead of $expected_status"
+    [ "$(header_value 'X-Integration-Backend' "$headers_file")" = "$expected_backend" ] \
+        || fail 'Application transaction reached the wrong backend'
+    [ "$(header_value 'X-Coolify-Probe-Ack' "$headers_file")" = "$expected_acknowledgement" ] \
+        || fail 'Application transaction returned the wrong provider acknowledgement'
+    jq -e \
+        --arg backend "$expected_backend" \
+        --arg transaction_id "$expected_transaction_id" \
+        --argjson created "$expected_created" '
+            .backend == $backend
+            and .created == $created
+            and .transactionId == $transaction_id
+            and .writeCount == 1
+            and (if $created then .replayedByBackend == null else .replayedByBackend == $backend end)
+        ' "$body_file" >/dev/null || fail 'Application transaction response violated the idempotent write contract'
+}
+
+assert_durable_transaction_evidence() {
+    local transaction_file=$1
+    local first_body=$2
+    local replay_body=$3
+    local idempotency_hash=$4
+    local payload_file="$TEMP_DIRECTORY/application-payload"
+    local payload_sha
+    local transaction_id
+
+    printf '%s' "$APPLICATION_TRANSACTION_PAYLOAD" > "$payload_file"
+    payload_sha=$(sha256_file "$payload_file")
+    transaction_id=$(jq -er '.transactionId' "$transaction_file")
+    jq -e \
+        --arg idempotency_hash "$idempotency_hash" \
+        --arg payload_sha "$payload_sha" \
+        --arg transaction_id "$transaction_id" '
+            .createdByBackend == "blue"
+            and .idempotencyHash == $idempotency_hash
+            and .payloadSha256 == $payload_sha
+            and .transactionId == $transaction_id
+            and .writeCount == 1
+            and (.committedAt | type == "number")
+        ' "$transaction_file" >/dev/null || fail 'Durable transaction record does not prove one exact committed write'
+    [ "$(jq -er '.transactionId' "$first_body")" = "$transaction_id" ] \
+        || fail 'Held predecessor response did not identify the durable transaction'
+    [ "$(jq -er '.transactionId' "$replay_body")" = "$transaction_id" ] \
+        || fail 'Candidate retry did not adopt the durable transaction'
+    [ "$(wc -l < "$APPLICATION_STATE_DIR/durable-writes.log")" -eq 1 ] \
+        || fail 'Durable write evidence was emitted more or less than exactly once'
+    [ "$(wc -l < "$APPLICATION_STATE_DIR/transaction-attempts.log")" -eq 2 ] \
+        || fail 'Application transaction retry evidence did not contain exactly two attempts'
+    awk -F'|' -v transaction_id="$transaction_id" '
+        NR == 1 && $2 == transaction_id && $3 == "created" && $4 == "blue" { created = 1 }
+        NR == 2 && $2 == transaction_id && $3 == "replayed" && $4 == "green" { replayed = 1 }
+        END { exit created && replayed ? 0 : 1 }
+    ' "$APPLICATION_STATE_DIR/transaction-attempts.log" \
+        || fail 'Application transaction attempts were not one blue creation followed by one green replay'
+}
+
+assert_application_access_log() {
+    local access_log="$TEMP_DIRECTORY/application-access.log"
+
+    compose logs --no-color --no-log-prefix traefik > "$access_log"
+    python3 - "$access_log" "$APPLICATION_HOST" "$MIN_APPLICATION_REQUESTS" <<'PY' \
+        || fail 'Traefik access logs did not prove enough application requests without 404 or gateway responses'
+import json
+import sys
+
+log_path, expected_host, minimum_requests = sys.argv[1], sys.argv[2], int(sys.argv[3])
+records = []
+with open(log_path, encoding='utf-8') as log_handle:
+    for line in log_handle:
+        start = line.find('{')
+        if start < 0:
+            continue
+        try:
+            record = json.loads(line[start:])
+        except json.JSONDecodeError:
+            continue
+        if record.get('RequestHost') == expected_host:
+            request_path = (record.get('RequestPath') or '').split('?', 1)[0]
+            records.append((request_path, int(record.get('DownstreamStatus', 0))))
+if len(records) < minimum_requests:
+    print(f'application access-log requests={len(records)} required={minimum_requests}', file=sys.stderr)
+    raise SystemExit(1)
+invalid = [
+    (path, status) for path, status in records
+    if status == 404
+    or status >= 500
+    or (path == '/transport/ws' and status not in (0, 101))
+    or (path != '/transport/ws' and not 200 <= status < 300)
+]
+websocket_statuses = [status for path, status in records if path == '/transport/ws']
+sse_statuses = [status for path, status in records if path == '/transport/sse']
+transaction_statuses = [status for path, status in records if path == '/transactions']
+if invalid or len(websocket_statuses) < 2 or any(status not in (0, 101) for status in websocket_statuses):
+    print(f'application access-log invalid={invalid} websocket={websocket_statuses}', file=sys.stderr)
+    raise SystemExit(1)
+if len(sse_statuses) < 2 or any(status != 200 for status in sse_statuses):
+    print(f'application access-log sse={sse_statuses}', file=sys.stderr)
+    raise SystemExit(1)
+if sorted(transaction_statuses) != [200, 201]:
+    print(f'application access-log transactions={transaction_statuses}', file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
 start_transport_observer() {
     local transition=$1
     local backend=$2
     local state_directory=$3
+    local host=${4:-$CONTROL_PLANE_HOST}
     local log_name="transport-${transition}.log"
     local ready_name="transport-${transition}-ready.json"
     local release_name="transport-${transition}-release.json"
@@ -756,7 +1403,7 @@ start_transport_observer() {
         "/state/$report_name" \
         "/state/$ready_name" \
         "/state/$release_name" \
-        "$CONTROL_PLANE_HOST" \
+        "$host" \
         "$TRANSPORT_MIN_EVENT_COUNT" \
         "$TRANSPORT_OBSERVER_TIMEOUT_MS" > "$TRANSPORT_OBSERVER_LOG" 2>&1 &
     TRANSPORT_OBSERVER_PID=$!
@@ -1272,6 +1919,180 @@ route_request_count() {
     printf '%s\n' "$count"
 }
 
+assert_production_application_lifecycle() {
+    local blue_color=$1
+    local blue_generation=$2
+    local blue_dynamic_sha=$3
+    local green_color=$4
+    local green_generation=$5
+    local green_dynamic_sha=$6
+    local expected_traefik_id=$7
+    local expected_traefik_started_at=$8
+    local plan="$TEMP_DIRECTORY/application-lifecycle-plan.json"
+    local boot_id
+    local green_container_id
+    local public_acknowledgement
+    local availability_log="$TEMP_DIRECTORY/application-availability.log"
+    local availability_phase="$TEMP_DIRECTORY/application-availability-phase.json"
+    local availability_stop="$TEMP_DIRECTORY/application-availability.stop"
+    local availability_pid
+    local config_writer_after_recreate
+    local config_writer_before_recreate
+    local application_forward_transport_log application_forward_transport_pid application_forward_transport_ready application_forward_transport_release application_forward_transport_report
+    local application_recovery_transport_log application_recovery_transport_pid application_recovery_transport_ready application_recovery_transport_release application_recovery_transport_report
+    local held_headers="$TEMP_DIRECTORY/held-transaction-headers"
+    local held_body="$TEMP_DIRECTORY/held-transaction-body.json"
+    local held_status="$TEMP_DIRECTORY/held-transaction-status"
+    local held_error="$TEMP_DIRECTORY/held-transaction-error.log"
+    local replay_headers="$TEMP_DIRECTORY/replay-transaction-headers"
+    local replay_body="$TEMP_DIRECTORY/replay-transaction-body.json"
+    local replay_status="$TEMP_DIRECTORY/replay-transaction-status"
+    local transaction_key_file="$TEMP_DIRECTORY/application-transaction-key"
+    local idempotency_hash
+    local transaction_file
+    local transaction_id
+    local application_forward_switch_started_at_ms
+    local application_forward_applied_at_ms
+    local stop_pid
+    local stop_log="$TEMP_DIRECTORY/backend-blue-stop.log"
+    local application_rollback_switch_started_at_ms
+    local application_rollback_applied_at_ms
+
+    wait_for_application_route blue ''
+    wait_for_application_provider_inventory absent present blue
+    boot_id=$(compose exec -T config-writer cat /proc/sys/kernel/random/boot_id | tr -d '\r\n')
+    green_container_id=$(docker inspect --format '{{.Id}}' "$(compose ps -q backend-green)")
+    compile_application_lifecycle_plan "$plan" "$boot_id" "$green_container_id"
+    public_acknowledgement=$(jq -er '.publicAcknowledgement' "$plan")
+
+    publish_application_phase "$availability_phase" docker-prior
+    start_application_observer "$availability_log" "$availability_stop" "$availability_phase"
+    availability_pid=$APPLICATION_OBSERVER_PID
+    wait_for_application_phase_backend "$availability_log" docker-prior blue ''
+
+    start_transport_observer application-forward backend-green "$BACKEND_GREEN_STATE_DIR" "$APPLICATION_HOST"
+    application_forward_transport_log=$TRANSPORT_OBSERVER_LOG
+    application_forward_transport_pid=$TRANSPORT_OBSERVER_PID
+    application_forward_transport_ready=$TRANSPORT_OBSERVER_READY
+    application_forward_transport_release=$TRANSPORT_OBSERVER_RELEASE
+    application_forward_transport_report=$TRANSPORT_OBSERVER_REPORT
+    wait_for_transport_observer_ready application-forward "$application_forward_transport_ready" "$application_forward_transport_log"
+
+    start_held_application_transaction "$held_headers" "$held_body" "$held_status" "$held_error"
+    printf '%s' "$APPLICATION_TRANSACTION_KEY" > "$transaction_key_file"
+    idempotency_hash=$(sha256_file "$transaction_key_file")
+    transaction_file="$APPLICATION_STATE_DIR/transactions/${idempotency_hash}.json"
+    wait_for_host_file "$transaction_file" 'the held predecessor transaction to become durable'
+    transaction_id=$(jq -er '.transactionId' "$transaction_file")
+    background_pid_is_running "$HELD_TRANSACTION_PID" \
+        || fail 'The predecessor transaction response was not held before route publication'
+
+    publish_application_phase "$availability_phase" forward-transition
+    wait_for_application_phase_backend "$availability_log" forward-transition blue ''
+    application_forward_switch_started_at_ms=$(now_ms)
+    run_application_writer_command "$plan" interruptedCommandBase64 86
+    wait_for_application_route green "$public_acknowledgement"
+    wait_for_application_provider_inventory present present green
+    application_forward_applied_at_ms=$(now_ms)
+    wait_for_application_phase_backend "$availability_log" forward-transition green "$public_acknowledgement"
+    assert_interrupted_application_artifacts "$plan"
+    background_pid_is_running "$HELD_TRANSACTION_PID" \
+        || fail 'The held predecessor response ended during interrupted candidate publication'
+
+    post_application_transaction "$replay_headers" "$replay_body" "$replay_status"
+    assert_application_transaction_response \
+        "$replay_headers" "$replay_body" "$replay_status" 200 green false "$public_acknowledgement" "$transaction_id"
+    publish_application_phase "$availability_phase" file-candidate
+    wait_for_application_phase_backend "$availability_log" file-candidate green "$public_acknowledgement"
+    config_writer_before_recreate=$(compose ps -q config-writer)
+    compose up -d --force-recreate config-writer
+    config_writer_after_recreate=$(compose ps -q config-writer)
+    [ -n "$config_writer_before_recreate" ] && [ -n "$config_writer_after_recreate" ] \
+        && [ "$config_writer_before_recreate" != "$config_writer_after_recreate" ] \
+        || fail 'Config writer was not recreated between interrupted publication and recovery'
+    assert_interrupted_application_artifacts "$plan"
+    wait_for_application_route green "$public_acknowledgement"
+    wait_for_application_provider_inventory present present green
+    assert_traefik_unchanged "$expected_traefik_id" "$expected_traefik_started_at"
+    run_application_writer_command "$plan" recoveryCommandBase64 0
+    assert_recovered_application_artifacts "$plan"
+
+    publish_application_phase "$availability_phase" predecessor-draining
+    wait_for_application_phase_backend "$availability_log" predecessor-draining green "$public_acknowledgement"
+    compose stop --timeout 40 backend-blue > "$stop_log" 2>&1 &
+    stop_pid=$!
+    register_background_pid "$stop_pid"
+    wait_for_host_file "$BACKEND_BLUE_STATE_DIR/shutdown.log" 'the predecessor graceful-shutdown marker'
+    background_pid_is_running "$stop_pid" || fail 'The predecessor exited before held connections drained'
+    background_pid_is_running "$HELD_TRANSACTION_PID" || fail 'The held predecessor response did not survive SIGTERM'
+    wait_for_application_provider_inventory present present green
+    wait_for_application_route green "$public_acknowledgement"
+
+    touch "$APPLICATION_STATE_DIR/releases/forward-publication"
+    if ! wait_for_registered_background_pid "$HELD_TRANSACTION_PID"; then
+        cat "$held_error" >&2 || true
+        fail 'The held predecessor transaction did not complete after its drain barrier'
+    fi
+    assert_application_transaction_response \
+        "$held_headers" "$held_body" "$held_status" 201 blue true '' "$transaction_id"
+    publish_transport_release application-forward "$application_forward_applied_at_ms" "$application_forward_transport_release"
+    wait_for_transport_observer application-forward \
+        "$application_forward_transport_pid" "$application_forward_transport_log" "$application_forward_transport_report"
+    assert_transport_continuity "$application_forward_transport_report" application-forward 0 \
+        "$application_forward_switch_started_at_ms" "$application_forward_applied_at_ms" \
+        blue "$blue_color" "$blue_generation" "$blue_dynamic_sha"
+    if ! wait_for_registered_background_pid "$stop_pid"; then
+        cat "$stop_log" >&2 || true
+        fail 'The predecessor did not stop cleanly after held transports drained'
+    fi
+    wait_for_application_provider_inventory present absent green
+    wait_for_application_route green "$public_acknowledgement"
+    publish_application_phase "$availability_phase" file-only
+    wait_for_application_phase_backend "$availability_log" file-only green "$public_acknowledgement"
+
+    compose up -d backend-blue
+    wait_for_docker_provider_route
+    wait_for_application_provider_inventory present present green
+    wait_for_application_route green "$public_acknowledgement"
+    publish_application_phase "$availability_phase" docker-restored-shadowed
+    wait_for_application_phase_backend "$availability_log" docker-restored-shadowed green "$public_acknowledgement"
+
+    start_transport_observer application-recovery backend-blue "$BACKEND_BLUE_STATE_DIR" "$APPLICATION_HOST"
+    application_recovery_transport_log=$TRANSPORT_OBSERVER_LOG
+    application_recovery_transport_pid=$TRANSPORT_OBSERVER_PID
+    application_recovery_transport_ready=$TRANSPORT_OBSERVER_READY
+    application_recovery_transport_release=$TRANSPORT_OBSERVER_RELEASE
+    application_recovery_transport_report=$TRANSPORT_OBSERVER_REPORT
+    wait_for_transport_observer_ready application-recovery "$application_recovery_transport_ready" "$application_recovery_transport_log"
+    publish_application_phase "$availability_phase" rollback-transition
+    wait_for_application_phase_backend "$availability_log" rollback-transition green "$public_acknowledgement"
+    application_rollback_switch_started_at_ms=$(now_ms)
+    run_application_writer_command "$plan" rollbackCommandBase64 0
+    wait_for_application_route blue ''
+    wait_for_application_provider_inventory absent present blue
+    application_rollback_applied_at_ms=$(now_ms)
+    wait_for_application_phase_backend "$availability_log" rollback-transition blue ''
+    publish_application_phase "$availability_phase" docker-restored
+    wait_for_application_phase_backend "$availability_log" docker-restored blue ''
+    publish_transport_release application-recovery "$application_rollback_applied_at_ms" "$application_recovery_transport_release"
+    wait_for_transport_observer application-recovery \
+        "$application_recovery_transport_pid" "$application_recovery_transport_log" "$application_recovery_transport_report"
+    assert_transport_continuity "$application_recovery_transport_report" application-recovery "$application_forward_applied_at_ms" \
+        "$application_rollback_switch_started_at_ms" "$application_rollback_applied_at_ms" \
+        green "$green_color" "$green_generation" "$green_dynamic_sha"
+    run_application_writer_command "$plan" rollbackCommandBase64 0
+    assert_rolled_back_application_artifacts "$plan"
+    assert_traefik_unchanged "$expected_traefik_id" "$expected_traefik_started_at"
+
+    sleep 0.25
+    touch "$availability_stop"
+    wait_for_registered_background_pid "$availability_pid" \
+        || fail 'Application availability observer terminated unexpectedly'
+    assert_application_observer "$availability_log" "$public_acknowledgement"
+    assert_durable_transaction_evidence "$transaction_file" "$held_body" "$replay_body" "$idempotency_hash"
+    assert_application_access_log
+}
+
 main() {
     local docker_context
     local docker_endpoint
@@ -1328,9 +2149,11 @@ main() {
         return
     fi
 
-    for command in docker curl openssl python3 mktemp awk sed tr cp mv wc jq; do
+    for command in docker curl openssl php python3 mktemp awk sed tr cp mv wc jq; do
         require_command "$command"
     done
+    [ -f "$REPOSITORY_ROOT/vendor/autoload.php" ] \
+        || fail 'Composer dependencies are required for the production application lifecycle proof'
     "$SCRIPT_DIRECTORY/attestor-test.sh"
     if ! docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
         printf 'SKIP: Docker daemon is unavailable.\n' >&2
@@ -1357,6 +2180,7 @@ main() {
     TRAEFIK_CERT_DIR="$TEMP_DIRECTORY/certs"
     BACKEND_BLUE_STATE_DIR="$TEMP_DIRECTORY/backend-blue"
     BACKEND_GREEN_STATE_DIR="$TEMP_DIRECTORY/backend-green"
+    APPLICATION_STATE_DIR="$TEMP_DIRECTORY/application-state"
     CONTROL_PLANE_HEALTH_PROOF="proof-$(openssl rand -hex 32)"
     CONTROL_PLANE_AUTHENTICATION_PROOF=$(openssl rand -hex 32)
     TRAEFIK_HTTPS_PORT=$(next_port)
@@ -1365,12 +2189,14 @@ main() {
     CONTROL_PLANE_TRAEFIK_SCRIPT_DIRECTORY="$SCRIPT_DIRECTORY"
     TRAEFIK_IMAGE="traefik:$(jq -er '.traefik["v3.6"] | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' "$REPOSITORY_ROOT/versions.json")" \
         || fail 'versions.json does not own an exact Traefik 3.6 release'
-    export PROJECT_NAME TRAEFIK_CERT_DIR TRAEFIK_DOCKER_SOCKET BACKEND_BLUE_STATE_DIR BACKEND_GREEN_STATE_DIR CONTROL_PLANE_TRAEFIK_SCRIPT_DIRECTORY
+    export PROJECT_NAME TRAEFIK_CERT_DIR TRAEFIK_DOCKER_SOCKET BACKEND_BLUE_STATE_DIR BACKEND_GREEN_STATE_DIR APPLICATION_STATE_DIR CONTROL_PLANE_TRAEFIK_SCRIPT_DIRECTORY
     export CONTROL_PLANE_HEALTH_PROOF CONTROL_PLANE_AUTHENTICATION_PROOF TRAEFIK_HTTPS_PORT TRAEFIK_APP_PORT TRAEFIK_API_PORT TRAEFIK_IMAGE
     export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
 
-    mkdir -p "$TRAEFIK_CERT_DIR" "$BACKEND_BLUE_STATE_DIR" "$BACKEND_GREEN_STATE_DIR"
-    chmod 777 "$BACKEND_BLUE_STATE_DIR" "$BACKEND_GREEN_STATE_DIR"
+    mkdir -p "$TRAEFIK_CERT_DIR" "$BACKEND_BLUE_STATE_DIR" "$BACKEND_GREEN_STATE_DIR" "$APPLICATION_STATE_DIR"
+    chmod 777 "$BACKEND_BLUE_STATE_DIR" "$BACKEND_GREEN_STATE_DIR" "$APPLICATION_STATE_DIR"
+    touch "$BACKEND_BLUE_STATE_DIR/forwarded-identity.log" "$BACKEND_GREEN_STATE_DIR/forwarded-identity.log"
+    chmod 666 "$BACKEND_BLUE_STATE_DIR/forwarded-identity.log" "$BACKEND_GREEN_STATE_DIR/forwarded-identity.log"
     openssl req -x509 -nodes -newkey rsa:2048 -days 1 -subj "/CN=${CONTROL_PLANE_HOST}" \
         -keyout "$TRAEFIK_CERT_DIR/key.pem" -out "$TRAEFIK_CERT_DIR/cert.pem" >/dev/null 2>&1
 
@@ -1381,9 +2207,10 @@ main() {
     write_identity "$BACKEND_GREEN_STATE_DIR" "$blue_initial_color" "$blue_initial_generation" "$initial_dynamic_sha"
     touch "$BACKEND_BLUE_STATE_DIR/healthy" "$BACKEND_GREEN_STATE_DIR/healthy"
     compose config -q
+    compose pull
     COMPOSE_STARTED=1
     COMPOSE_STARTED_AT_MS=$(now_ms)
-    compose up -d --remove-orphans
+    compose up -d --remove-orphans --pull never
     [ "$(docker inspect --format '{{.Config.Image}}' "$(traefik_container_id)")" = "$TRAEFIK_IMAGE" ] \
         || fail 'Traefik did not start from the exact versions.json image'
     atomic_replace_snapshot "$initial_snapshot"
@@ -1496,6 +2323,11 @@ main() {
     assert_full_cycle_transport_continuity "$forward_transport_report" \
         "$forward_switch_started_at_ms" "$forward_applied_at_ms" "$rollback_switch_started_at_ms" "$rollback_applied_at_ms" \
         blue "$blue_final_color" "$blue_final_generation" "$blue_final_dynamic_sha"
+
+    assert_production_application_lifecycle \
+        "$blue_final_color" "$blue_final_generation" "$blue_final_dynamic_sha" \
+        "$green_color" "$green_generation" "$green_dynamic_sha" \
+        "$traefik_id" "$traefik_before_switch_started_at"
 
     restart_started_at=$(traefik_started_at "$traefik_id")
     compose restart traefik

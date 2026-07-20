@@ -48,7 +48,7 @@ it('runs Reverb and the terminal websocket as supervised services in the Coolify
     $serviceRoot = dirname($dockerfile).'/etc/s6-overlay/s6-rc.d';
 
     expect($dockerfileContents)
-        ->toContain('COPY docker/coolify-terminal/package*.json /terminal/')
+        ->toMatch('/COPY docker\/coolify-terminal\/package\*\.json (?:\/terminal\/|\.\/)/')
         ->toMatch('/COPY(?: --chown=[^ ]+)? docker\/coolify-terminal\/terminal-server\.js \/terminal\/terminal-server\.js/')
         ->toMatch('/COPY(?: --chown=[^ ]+)? docker\/coolify-terminal\/terminal-utils\.js \/terminal\/terminal-utils\.js/')
         ->and(file_get_contents(base_path($serviceRoot.'/reverb/run')))
@@ -65,15 +65,27 @@ it('runs Reverb and the terminal websocket as supervised services in the Coolify
     'development image' => ['docker/development/Dockerfile', 'init-setup'],
 ]);
 
-it('removes native terminal build dependencies from the production image', function () {
+it('keeps native terminal build dependencies out of the production image', function () {
     $dockerfile = file_get_contents(base_path('docker/production/Dockerfile'));
-    $buildDependencyInstall = strpos($dockerfile, 'apk add --no-cache --virtual .terminal-build-deps npm make g++ python3');
-    $terminalDependencyInstall = strpos($dockerfile, 'npm ci --prefix /terminal');
-    $buildDependencyRemoval = strpos($dockerfile, 'apk del --no-cache .terminal-build-deps');
+    $terminalBuilder = strpos($dockerfile, 'AS terminal-assets');
+    $terminalDependencyInstall = strpos($dockerfile, 'npm ci', $terminalBuilder);
+    $productionStage = strrpos($dockerfile, 'FROM serversideup/php:');
+    $terminalRuntimeCopy = strpos(
+        $dockerfile,
+        'COPY --from=terminal-assets /terminal/node_modules /terminal/node_modules',
+    );
+    $productionInstructions = substr($dockerfile, $productionStage);
 
-    expect($buildDependencyInstall)->not->toBeFalse()
-        ->and($terminalDependencyInstall)->not->toBeFalse()->toBeGreaterThan($buildDependencyInstall)
-        ->and($buildDependencyRemoval)->not->toBeFalse()->toBeGreaterThan($terminalDependencyInstall);
+    expect($terminalBuilder)->not->toBeFalse()
+        ->and($terminalDependencyInstall)->not->toBeFalse()->toBeGreaterThan($terminalBuilder)
+        ->and($productionStage)->not->toBeFalse()->toBeGreaterThan($terminalDependencyInstall)
+        ->and($terminalRuntimeCopy)->not->toBeFalse()->toBeGreaterThan($productionStage)
+        ->and($productionInstructions)
+        ->toContain('STOPSIGNAL SIGTERM')
+        ->not->toContain('apk add --no-cache make g++ python3')
+        ->not->toContain('npm ci')
+        ->not->toContain('apk del')
+        ->not->toContain('--update-binary');
 });
 
 it('bundles ports 6001 and 6002 into the Coolify service without a Soketi service', function (string $composeFile) {
@@ -150,7 +162,9 @@ it('removes obsolete realtime image ownership but retains an exact legacy-contai
         ->not->toContain('realtime_image')
         ->and($versions)->not->toContain('"realtime"')
         ->and($nightlyVersions)->not->toContain('"realtime"')
-        ->and(base_path('docker/coolify-realtime'))->not->toBeDirectory()
+        ->and(base_path('docker/coolify-realtime/Dockerfile'))->not->toBeFile()
+        ->and(base_path('docker/coolify-realtime/package.json'))->not->toBeFile()
+        ->and(base_path('docker/coolify-realtime/soketi-entrypoint.sh'))->not->toBeFile()
         ->and(base_path('.github/workflows/coolify-realtime.yml'))->not->toBeFile()
         ->and(base_path('.github/workflows/coolify-realtime-next.yml'))->not->toBeFile()
         ->and($upgrade)->toContain('stop_legacy_realtime_container')

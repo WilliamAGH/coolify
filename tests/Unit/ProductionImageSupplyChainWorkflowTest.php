@@ -658,7 +658,7 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
     if (($applicationValidationWorkflow['permissions'] ?? null) !== ['contents' => 'read']) {
         $violations[] = 'application validation must use read-only repository permissions';
     }
-    if (($applicationValidationWorkflow['concurrency']['group'] ?? null) !== 'application-validation-${{ github.event.pull_request.number || github.ref }}' ||
+    if (($applicationValidationWorkflow['concurrency']['group'] ?? null) !== 'application-validation-${{ inputs.source_sha || github.event.pull_request.number || github.ref }}' ||
         ($applicationValidationWorkflow['concurrency']['cancel-in-progress'] ?? null) !== '${{ github.event_name == \'pull_request\' }}') {
         $violations[] = 'application validation must serialize pushes without cancellation while superseding stale pull requests';
     }
@@ -676,6 +676,7 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
     foreach ([
         'tests/Unit/CheckHelperImageJobTest.php',
         'tests/Unit/SentinelVersionTest.php',
+        'tests/Unit/V4xCandidateWorkflowTest.php',
         'tests/Feature/UpgradeComponentTest.php',
     ] as $requiredPhpTest) {
         if (! str_contains($phpTestScript, $requiredPhpTest)) {
@@ -717,7 +718,8 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
     );
     if (($requiredStep['env']['TESTING_HOST_RUNTIME_RESULT'] ?? null) !== '${{ needs.testing-host-runtime.result }}' ||
         ($requiredStep['env']['EVENT_NAME'] ?? null) !== '${{ github.event_name }}' ||
-        ! str_contains((string) ($requiredStep['run'] ?? ''), '[[ "$EVENT_NAME" == pull_request ]]') ||
+        ($requiredStep['env']['VALIDATION_SOURCE_SHA'] ?? null) !== '${{ inputs.source_sha }}' ||
+        ! str_contains((string) ($requiredStep['run'] ?? ''), '[[ "$EVENT_NAME" == pull_request || -n "$VALIDATION_SOURCE_SHA" ]]') ||
         ! str_contains((string) ($requiredStep['run'] ?? ''), '[[ "$TESTING_HOST_RUNTIME_RESULT" == success ]]') ||
         ! str_contains((string) ($requiredStep['run'] ?? ''), '[[ "$TESTING_HOST_RUNTIME_RESULT" == skipped ]]')) {
         $violations[] = 'required status must fail when testing-host runtime validation does not succeed';
@@ -737,21 +739,38 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
         'Build exact testing-host source image without publication',
     );
     $testingHostBuildScript = (string) ($testingHostBuildStep['run'] ?? '');
+    $productionBuildStep = releaseWorkflowStep(
+        $testingHostRuntimeJob,
+        'Build exact production source image without publication',
+    );
+    $productionBuildScript = (string) ($productionBuildStep['run'] ?? '');
     $testingHostRuntimeStep = releaseWorkflowStep(
         $testingHostRuntimeJob,
         'Run exact testing-host runtime contract',
     );
     $testingHostRuntimeScript = (string) ($testingHostRuntimeStep['run'] ?? '');
-    $testingHostImage = 'coolify-testing-host:application-validation-${{ github.sha }}';
-    if (($testingHostRuntimeJob['timeout-minutes'] ?? null) !== 45 ||
-        ($testingHostRuntimeJob['if'] ?? null) !== '${{ github.event_name == \'pull_request\' }}' ||
+    $bundledRuntimeStep = releaseWorkflowStep(
+        $testingHostRuntimeJob,
+        'Run exact bundled Reverb and terminal runtime contract',
+    );
+    $testingHostImage = 'coolify-testing-host:application-validation-${{ inputs.source_sha || github.sha }}';
+    $productionImage = 'coolify:application-validation-${{ inputs.source_sha || github.sha }}';
+    if (($testingHostRuntimeJob['timeout-minutes'] ?? null) !== 75 ||
+        ($testingHostRuntimeJob['if'] ?? null) !== '${{ github.event_name == \'pull_request\' || inputs.source_sha != \'\' }}' ||
         ! str_contains($testingHostBuildScript, 'docker buildx build --load --pull') ||
         ! str_contains($testingHostBuildScript, '--file docker/testing-host/Dockerfile') ||
         ! str_contains($testingHostBuildScript, '--tag "$TESTING_HOST_IMAGE"') ||
+        ! str_contains($productionBuildScript, 'docker buildx build --load --pull') ||
+        ! str_contains($productionBuildScript, '--file docker/production/Dockerfile') ||
+        ! str_contains($productionBuildScript, '--tag "$PRODUCTION_IMAGE"') ||
         ($testingHostBuildStep['env']['TESTING_HOST_IMAGE'] ?? null) !== $testingHostImage ||
+        ($productionBuildStep['env']['PRODUCTION_IMAGE'] ?? null) !== $productionImage ||
         ($testingHostRuntimeStep['env']['TESTING_HOST_IMAGE'] ?? null) !== $testingHostImage ||
-        $testingHostRuntimeScript !== 'tests/Integration/TestingHostImageTest.sh') {
-        $violations[] = 'testing-host validation must build the exact source image and execute its runtime contract on pull requests';
+        ($testingHostRuntimeStep['env']['PRODUCTION_IMAGE'] ?? null) !== $productionImage ||
+        $testingHostRuntimeScript !== 'tests/Integration/TestingHostImageTest.sh' ||
+        ($bundledRuntimeStep['env']['PRODUCTION_IMAGE'] ?? null) !== $productionImage ||
+        ($bundledRuntimeStep['run'] ?? null) !== 'tests/Integration/RealtimeImageTest.sh') {
+        $violations[] = 'production runtime validation must bridge the testing host and execute bundled Reverb and terminal acceptance on pull requests';
     }
     $testingHostJobDefinition = json_encode($testingHostRuntimeJob, JSON_THROW_ON_ERROR);
     foreach (['secrets.', 'docker login', 'docker push', '--push', 'publish-linux-image'] as $publicationContract) {
@@ -774,6 +793,7 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
         '.github/workflows/coolify-production-build.yml',
         '.github/workflows/coolify-staging-build.yml',
         '.github/workflows/coolify-testing-host.yml',
+        '.github/workflows/gate-v4x-candidate.yml',
         '.github/workflows/publish-fork.yml',
         '.github/workflows/publish-linux-image.yml',
         '.github/workflows/release-operational-acceptance.yml',
@@ -845,8 +865,8 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
     }
 
     $productionNeeds = releaseWorkflowNeeds($callers['production']['jobs']['resolve-version'] ?? []);
-    if (! in_array('application-validation', $productionNeeds, true)) {
-        $violations[] = 'production publication must wait for application validation';
+    if (! in_array('validation-required', $productionNeeds, true)) {
+        $violations[] = 'production publication must wait for a trusted preflight or hosted validation';
     }
 
     $archiveGate = releaseWorkflowStep(
@@ -869,6 +889,17 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
         ! str_contains($forkContentGateRun, 'OCI_CONTENT_POLICY="$CONTENT_POLICY"') ||
         ! str_contains($forkContentGateRun, 'tests/Integration/VerifyOciArchiveImage.sh')) {
         $violations[] = 'both native fork control-plane OCI archives must pass the fail-closed runtime content census';
+    }
+
+    $forkBundledRuntimeGate = releaseWorkflowStep(
+        $jobs['fork-build'] ?? [],
+        'Verify exact fork bundled Reverb and terminal runtime',
+    );
+    if (isset($forkBundledRuntimeGate['if']) ||
+        ($forkBundledRuntimeGate['continue-on-error'] ?? false) !== false ||
+        ($forkBundledRuntimeGate['env']['PRODUCTION_IMAGE'] ?? null) !== 'local/${{ matrix.artifact_name }}:${{ github.sha }}-${{ matrix.arch }}-fork-runtime' ||
+        ($forkBundledRuntimeGate['run'] ?? null) !== 'tests/Integration/RealtimeImageTest.sh') {
+        $violations[] = 'both native fork production images must execute bundled Reverb and terminal acceptance before publication';
     }
 
     $forkMainPlatforms = collect($jobs['fork-build']['strategy']['matrix']['include'] ?? [])
@@ -1076,6 +1107,15 @@ function mutateReleaseWorkflow(array $sharedWorkflow, array $callers, string $mu
 
             return [$sharedWorkflow, $callers];
         })(),
+        'remove-fork-bundled-runtime' => (function () use ($sharedWorkflow, $callers): array {
+            foreach ($sharedWorkflow['jobs']['fork-build']['steps'] as $index => $step) {
+                if (($step['name'] ?? null) === 'Verify exact fork bundled Reverb and terminal runtime') {
+                    unset($sharedWorkflow['jobs']['fork-build']['steps'][$index]);
+                }
+            }
+
+            return [$sharedWorkflow, $callers];
+        })(),
         default => throw new InvalidArgumentException("Unknown release workflow mutation: {$mutation}"),
     };
 }
@@ -1093,6 +1133,13 @@ it('enforces the shared Linux publication graph and caller boundaries', function
     expect(releaseFoundationWorkflowViolations($sharedWorkflow, $applicationValidationWorkflow, $callers))->toBe([]);
 });
 
+it('keeps the hardened publisher as the sole realtime release owner', function () {
+    $root = releaseWorkflowRepositoryRoot();
+
+    expect(file_exists($root.'/.github/workflows/coolify-realtime.yml'))->toBeFalse()
+        ->and(file_exists($root.'/.github/workflows/coolify-realtime-next.yml'))->toBeFalse();
+});
+
 it('uses the trusted fork promotion runner while keeping pull-request validation GitHub-hosted', function (): void {
     $root = releaseWorkflowRepositoryRoot();
     $sharedWorkflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
@@ -1101,7 +1148,7 @@ it('uses the trusted fork promotion runner while keeping pull-request validation
 
     expect($sharedWorkflow['jobs']['fork-release']['runs-on'] ?? null)->toBe([
         'group' => 'coolify-trusted',
-        'labels' => ['self-hosted', 'linux', 'x64'],
+        'labels' => ['self-hosted', 'Linux', 'X64', 'williamacallahan'],
     ]);
 
     foreach ($applicationValidationWorkflow['jobs'] ?? [] as $jobName => $job) {
@@ -1162,6 +1209,10 @@ it('rejects fork publication graphs that drop native architecture or SBOM residu
     'missing signed SBOM census' => [
         'remove-fork-control-plane-sbom-census',
         'both native fork control-plane SBOMs must reject HAProxy package residue',
+    ],
+    'missing native bundled runtime' => [
+        'remove-fork-bundled-runtime',
+        'both native fork production images must execute bundled Reverb and terminal acceptance before publication',
     ],
 ]);
 
@@ -1547,6 +1598,7 @@ it('keeps helper Sentinel and upgrade regressions in the required PHP lane', fun
     foreach ([
         'tests/Unit/CheckHelperImageJobTest.php',
         'tests/Unit/SentinelVersionTest.php',
+        'tests/Unit/V4xCandidateWorkflowTest.php',
         'tests/Feature/UpgradeComponentTest.php',
     ] as $requiredPhpTest) {
         $mutatedWorkflow = $applicationValidationWorkflow;
@@ -1561,7 +1613,7 @@ it('keeps helper Sentinel and upgrade regressions in the required PHP lane', fun
     }
 });
 
-it('requires fork-runnable testing-host source image validation without publication', function () {
+it('requires fork-runnable production runtime validation without publication', function () {
     $root = releaseWorkflowRepositoryRoot();
     $sharedWorkflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
     $applicationValidationWorkflow = Yaml::parseFile($root.'/.github/workflows/application-validation.yml');
@@ -1574,12 +1626,12 @@ it('requires fork-runnable testing-host source image validation without publicat
     $withoutRuntimeJob = $applicationValidationWorkflow;
     unset($withoutRuntimeJob['jobs']['testing-host-runtime']);
     expect(releaseFoundationWorkflowViolations($sharedWorkflow, $withoutRuntimeJob, $callers))
-        ->toContain('testing-host validation must build the exact source image and execute its runtime contract on pull requests');
+        ->toContain('production runtime validation must bridge the testing host and execute bundled Reverb and terminal acceptance on pull requests');
 
     $canonicalOnlyRuntimeJob = $applicationValidationWorkflow;
     $canonicalOnlyRuntimeJob['jobs']['testing-host-runtime']['if'] = "\${{ github.repository == 'coollabsio/coolify' }}";
     expect(releaseFoundationWorkflowViolations($sharedWorkflow, $canonicalOnlyRuntimeJob, $callers))
-        ->toContain('testing-host validation must build the exact source image and execute its runtime contract on pull requests');
+        ->toContain('production runtime validation must bridge the testing host and execute bundled Reverb and terminal acceptance on pull requests');
 
     $publishingRuntimeJob = $applicationValidationWorkflow;
     foreach ($publishingRuntimeJob['jobs']['testing-host-runtime']['steps'] as &$step) {
@@ -1600,6 +1652,33 @@ it('requires fork-runnable testing-host source image validation without publicat
     unset($step);
     expect(releaseFoundationWorkflowViolations($sharedWorkflow, $withoutRequiredResult, $callers))
         ->toContain('required status must fail when testing-host runtime validation does not succeed');
+
+    $withoutBundledRuntime = $applicationValidationWorkflow;
+    foreach ($withoutBundledRuntime['jobs']['testing-host-runtime']['steps'] as $index => $step) {
+        if (($step['name'] ?? null) === 'Run exact bundled Reverb and terminal runtime contract') {
+            unset($withoutBundledRuntime['jobs']['testing-host-runtime']['steps'][$index]);
+        }
+    }
+    expect(releaseFoundationWorkflowViolations($sharedWorkflow, $withoutBundledRuntime, $callers))
+        ->toContain('production runtime validation must bridge the testing host and execute bundled Reverb and terminal acceptance on pull requests');
+});
+
+it('preloads pinned testing-host service images before pull-never runtime use', function () {
+    $script = file_get_contents(
+        releaseWorkflowRepositoryRoot().'/tests/Integration/TestingHostImageTest.sh',
+    );
+
+    expect($script)->toBeString();
+
+    foreach (['database', 'redis'] as $service) {
+        $pull = 'docker pull "$'.$service.'_image"';
+        $run = '"$'.$service.'_image" >/dev/null';
+
+        expect($script)
+            ->toContain($pull)
+            ->toContain($run)
+            ->and(strpos($script, $pull))->toBeLessThan(strpos($script, $run));
+    }
 });
 
 it('rejects removing the browser Redis runtime dependency', function () {
@@ -1681,6 +1760,50 @@ it('rejects omission of either image source-provenance gate', function (string $
     'testing-host image' => 'docker/testing-host/Dockerfile',
 ]);
 
+it('pins the production Git LFS binary to verified fixed Go source provenance', function (): void {
+    $dockerfile = (string) file_get_contents(releaseWorkflowRepositoryRoot().'/docker/production/Dockerfile');
+    $databaseSeederCopy = <<<'DOCKERFILE'
+COPY --chown=www-data:www-data \
+    database/seeders/CaSslCertSeeder.php \
+    database/seeders/DatabaseSeeder.php \
+    database/seeders/OauthSettingSeeder.php \
+    database/seeders/PopulateSshKeysDirectorySeeder.php \
+    database/seeders/ProductionSeeder.php \
+    database/seeders/RootUserSeeder.php \
+    database/seeders/SentinelSeeder.php \
+    ./database/seeders/
+DOCKERFILE;
+
+    expect($dockerfile)
+        ->toContain('ARG GO_BUILD_IMAGE=golang:1.26.5-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2')
+        ->toContain('ARG GIT_LFS_VERSION=3.7.1')
+        ->toContain('ARG GIT_LFS_TAG=v3.7.1')
+        ->toContain('ARG GIT_LFS_COMMIT=b84b33847fe6458f36ef521534dc0eac953cb379')
+        ->toContain('ARG GIT_LFS_SOURCE_SHA256=e1ef5ba4828fa632337be6a2c421a685432faec0405bf187f46a1459e82a9a62')
+        ->toContain('ARG GIT_LFS_X_NET_VERSION=v0.56.0')
+        ->toContain('ARG GIT_LFS_GO_MOD_SHA256=9b34961df646f48ca832d5201d9a4a78059a06269f50237d682630cf28485460')
+        ->toContain('ARG GIT_LFS_GO_SUM_SHA256=f2e6c6da7a7d84ef4ffcad42902798eaa2aa14b795c3639a857d36504f2c6396')
+        ->toContain('FROM go-source-builder AS git-lfs-builder')
+        ->toContain('go get "golang.org/x/net@${GIT_LFS_X_NET_VERSION}"')
+        ->toContain('go mod verify')
+        ->toContain('go version -m /out/git-lfs')
+        ->toContain('COPY --from=git-lfs-builder --chmod=755 /out/git-lfs /usr/local/bin/git-lfs')
+        ->toContain('git lfs version')
+        ->toContain("COPY app ./app\nCOPY config ./config\nCOPY lang ./lang\nCOPY resources ./resources\nCOPY routes ./routes\nCOPY templates ./templates\nRUN npm run build")
+        ->toContain('COPY --chown=www-data:www-data database/migrations ./database/migrations')
+        ->toContain($databaseSeederCopy)
+        ->not->toContain('database/seeders/GithubAppSeeder.php')
+        ->not->toContain('database/seeders/PersonalAccessTokenSeeder.php')
+        ->not->toContain('database/seeders/S3StorageSeeder.php')
+        ->not->toContain('database/seeders/StandalonePostgresqlSeeder.php')
+        ->not->toContain('database/seeders/StandaloneRedisSeeder.php')
+        ->not->toContain('database/schema')
+        ->not->toContain('COPY --exclude=database . .')
+        ->not->toContain('database ./database')
+        ->not->toMatch('/^COPY \\. \\.\s*$/m')
+        ->not->toMatch('/^\\s+git-lfs\\s+\\\\$/m');
+});
+
 it('rejects omission of an owned workflow from actionlint', function (string $workflowPath): void {
     $root = releaseWorkflowRepositoryRoot();
     $sharedWorkflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
@@ -1703,6 +1826,7 @@ it('rejects omission of an owned workflow from actionlint', function (string $wo
     'production caller' => '.github/workflows/coolify-production-build.yml',
     'staging caller' => '.github/workflows/coolify-staging-build.yml',
     'testing-host caller' => '.github/workflows/coolify-testing-host.yml',
+    'v4.x candidate gate' => '.github/workflows/gate-v4x-candidate.yml',
     'fork publisher' => '.github/workflows/publish-fork.yml',
     'reusable publisher' => '.github/workflows/publish-linux-image.yml',
     'operational acceptance' => '.github/workflows/release-operational-acceptance.yml',

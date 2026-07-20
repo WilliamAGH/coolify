@@ -315,7 +315,9 @@ it('attests the exact successor writer, writes its authority marker atomically, 
 
     try {
         $first = runWriterHandoffCommand($command, $fixture);
+        $markerInode = fileinode($fixture['marker']);
         $second = runWriterHandoffCommand($command, $fixture);
+        clearstatcache(true, $fixture['marker']);
         $log = file_get_contents($fixture['log']);
 
         expect($first->isSuccessful())->toBeTrue()
@@ -324,6 +326,7 @@ it('attests the exact successor writer, writes its authority marker atomically, 
             ->and($second->getOutput())->toBe(ControlPlaneGenerationWriterHandoff::COMPLETION_MARKER."\n")
             ->and(file_get_contents($fixture['marker']))->toBe(expectedWriterHandoffMarker($state))
             ->and(fileperms($fixture['marker']) & 0777)->toBe(0600)
+            ->and(fileinode($fixture['marker']))->toBe($markerInode)
             ->and($log)->toContain('inspect '.$fixture['docker_id'])
             ->and($log)->toContain('exec '.$fixture['docker_id'])
             ->and($log)->toContain('sync '.$fixture['marker'])
@@ -331,6 +334,42 @@ it('attests the exact successor writer, writes its authority marker atomically, 
             ->and($log)->not->toContain('sync -f')
             ->and($log)->not->toContain('exec '.$fixture['container_name'])
             ->and($command)->not->toContain('writer-handoff-secret-token');
+    } finally {
+        $filesystem->remove($fixture['root']);
+    }
+});
+
+it('rejects hard-linked or foreign-owned writer authority and recovers without replacing its inode', function (): void {
+    $filesystem = new Filesystem;
+    $fixture = writerHandoffFixture();
+    $state = writerHandoffState();
+    $command = ControlPlaneGenerationWriterHandoff::run($state);
+    $hardLink = $fixture['root'].'/writer-authority-hardlink';
+
+    try {
+        $first = runWriterHandoffCommand($command, $fixture);
+        $markerInode = fileinode($fixture['marker']);
+        link($fixture['marker'], $hardLink);
+        $hardLinked = runWriterHandoffCommand($command, $fixture);
+        unlink($hardLink);
+        $recovered = runWriterHandoffCommand($command, $fixture);
+
+        file_put_contents($fixture['bin'].'/id', <<<'SH'
+#!/bin/sh
+[ "${1:-}" = -u ] || exit 64
+printf '%s\n' 4294967294
+SH
+        );
+        chmod($fixture['bin'].'/id', 0700);
+        $foreignOwner = runWriterHandoffCommand($command, $fixture);
+        clearstatcache(true, $fixture['marker']);
+
+        expect($first->isSuccessful())->toBeTrue()
+            ->and($hardLinked->isSuccessful())->toBeFalse()
+            ->and($recovered->isSuccessful())->toBeTrue()
+            ->and($foreignOwner->isSuccessful())->toBeFalse()
+            ->and(fileinode($fixture['marker']))->toBe($markerInode)
+            ->and(file_get_contents($fixture['marker']))->toBe(expectedWriterHandoffMarker($state));
     } finally {
         $filesystem->remove($fixture['root']);
     }

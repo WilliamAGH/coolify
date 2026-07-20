@@ -25,7 +25,6 @@ yarn-error.log
 docker/coolify-terminal/node_modules
 
 /storage/*.key
-/docker/testing-host/development-private_key
 /storage/app/backups
 /storage/app/ssh/keys
 /storage/app/ssh/mux

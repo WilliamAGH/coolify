@@ -68,6 +68,18 @@ assert_runtime_contract_source()
         "$source_path" "$source_sha256"
 }
 
+assert_source_file_sha256()
+{
+    argument=$1
+    source_path=$2
+    expected_sha256=$(argument_value "$argument")
+
+    test -f "$source_path" || fail "source file is absent: $source_path"
+    actual_sha256=$(sha256sum "$source_path" | awk '{print $1}')
+    [ "$actual_sha256" = "$expected_sha256" ] ||
+        fail "$source_path resolves to $actual_sha256, not $expected_sha256"
+}
+
 case "$dockerfile" in
     docker/testing-host/Dockerfile)
         docker_version=$(argument_value DOCKER_VERSION)
@@ -101,10 +113,18 @@ case "$dockerfile" in
             "$docker_version" "$compose_version" "$buildx_version"
         ;;
     docker/production/Dockerfile)
+        git_lfs_version=$(argument_value GIT_LFS_VERSION)
+        git_lfs_tag=$(argument_value GIT_LFS_TAG)
+        git_lfs_commit=$(argument_value GIT_LFS_COMMIT)
         cloudflared_version=$(argument_value CLOUDFLARED_VERSION)
         cloudflared_tag=$(argument_value CLOUDFLARED_TAG)
         cloudflared_commit=$(argument_value CLOUDFLARED_COMMIT)
 
+        assert_version_tag "$git_lfs_version" "$git_lfs_tag" v
+        assert_official_tag_commit \
+            'https://github.com/git-lfs/git-lfs.git' \
+            "$git_lfs_tag" \
+            "$git_lfs_commit"
         assert_version_tag "$cloudflared_version" "$cloudflared_tag" ''
         assert_official_tag_commit \
             'https://github.com/cloudflare/cloudflared.git' \
@@ -118,7 +138,8 @@ case "$dockerfile" in
             assert_runtime_contract_source "$source_path"
         done
 
-        printf 'IMAGE_SOURCE_PROVENANCE verified cloudflared=%s\n' "$cloudflared_version"
+        printf 'IMAGE_SOURCE_PROVENANCE verified git_lfs=%s cloudflared=%s\n' \
+            "$git_lfs_version" "$cloudflared_version"
         ;;
     *)
         fail "unsupported Dockerfile: $dockerfile"

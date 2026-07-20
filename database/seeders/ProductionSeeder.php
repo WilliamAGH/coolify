@@ -112,7 +112,7 @@ class ProductionSeeder extends Seeder
             }
         }
 
-        if (! isCloud()) {
+        if (! isCloud() && config('constants.coolify.is_windows_docker_desktop') == false) {
             if (Server::find(0) == null) {
                 $server_details = [
                     'id' => 0,
@@ -160,7 +160,7 @@ class ProductionSeeder extends Seeder
         }
 
         if (config('constants.coolify.is_windows_docker_desktop')) {
-            $testingHostPrivateKey = $this->windowsTestingHostPrivateKey();
+            $testingHostPrivateKey = $this->testingHostPrivateKey();
 
             PrivateKey::updateOrCreate(
                 [
@@ -220,24 +220,24 @@ class ProductionSeeder extends Seeder
         $this->call(CaSslCertSeeder::class);
     }
 
-    private function windowsTestingHostPrivateKey(): string
+    private function testingHostPrivateKey(): string
     {
-        $path = config('constants.coolify.windows_testing_host_private_key_path');
+        $privateKeyPath = config('constants.coolify.testing_host_private_key_path');
 
-        if (! is_string($path) || $path === '' || ! is_file($path) || is_link($path) || ! is_readable($path)) {
-            throw new RuntimeException('Windows Docker Desktop requires a readable testing-host private key fixture.');
+        if (! is_string($privateKeyPath) || $privateKeyPath === '' || ! is_file($privateKeyPath) || is_link($privateKeyPath) || ! is_readable($privateKeyPath)) {
+            throw new RuntimeException('The runtime testing-host private key is unavailable.');
         }
 
-        $privateKey = file_get_contents($path);
+        $privateKey = file_get_contents($privateKeyPath);
 
         if (! is_string($privateKey) || trim($privateKey) === '') {
-            throw new RuntimeException('Windows Docker Desktop testing-host private key fixture is invalid.');
+            throw new RuntimeException('The runtime testing-host private key is invalid.');
         }
 
         try {
             PublicKeyLoader::loadPrivateKey($privateKey);
         } catch (NoKeyLoadedException) {
-            throw new RuntimeException('Windows Docker Desktop testing-host private key fixture is invalid.');
+            throw new RuntimeException('The runtime testing-host private key is invalid.');
         }
 
         return $privateKey;
