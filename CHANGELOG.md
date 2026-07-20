@@ -14,10 +14,15 @@ All notable changes to this project will be documented in this file.
 - *(recovery)* Keep application ownership check type-safe
 - *(ci)* Update changelog through protected pull request
 - *(ci)* Preserve Docker daemon validation in changelog patch
+- *(ci)* Attest dispatched changelog validation
 
 ### 💼 Other
 
 - *(stack)* Advance daemon ownership into lock recovery
+
+### 📚 Documentation
+
+- Update changelog (#52)
 
 ### 🧪 Testing
 
