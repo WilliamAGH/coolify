@@ -200,6 +200,8 @@ compose_version="$(argument_value DOCKER_COMPOSE_VERSION)"
 buildx_version="$(argument_value DOCKER_BUILDX_VERSION)"
 docker image inspect "$image" >/dev/null
 docker image inspect "$production_image" >/dev/null
+docker pull "$database_image" >/dev/null
+docker pull "$redis_image" >/dev/null
 
 docker run --rm --pull never --entrypoint /usr/local/bin/docker "$image" --version |
     grep -Eq "^Docker version ${docker_version}, build "
@@ -223,7 +225,7 @@ docker run --detach --pull never --name "$database_container" \
 database_attempt=0
 until docker exec "$database_container" pg_isready --dbname coolify --username coolify >/dev/null 2>&1; do
     database_attempt=$((database_attempt + 1))
-    if [ "$database_attempt" -ge 30 ]; then
+    if [ "$database_attempt" -ge 60 ]; then
         docker logs "$database_container" >&2 || true
         fail 'the disposable PostgreSQL bridge database did not become ready'
     fi
