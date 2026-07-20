@@ -68,6 +68,7 @@ test_canonical_contract() {
   base='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
   generation='cccccccccccccccccccccccccccccccccccccccc'
   # shellcheck source=scripts/ci/v4x-candidate-contract.sh
+  # shellcheck disable=SC1091
   source "$ROOT/scripts/ci/v4x-candidate-contract.sh"
   [ "$V4X_CANDIDATE_BASE_BRANCH" = v4.x ] || fail 'base branch must be canonical'
   [ "$V4X_CANDIDATE_WORKFLOW" = gate-v4x-candidate.yml ] || fail 'workflow must be canonical'
