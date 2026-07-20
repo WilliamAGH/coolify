@@ -21,6 +21,7 @@ All notable changes to this project will be documented in this file.
 - *(ci)* Attest dispatched changelog validation
 - *(ci)* Make changelog auto-merge idempotent (#55)
 - *(image)* Remove production secret and Git LFS blockers (#58)
+- *(image)* Refresh apk indexes before pruning terminal build deps
 
 ### 💼 Other
 
@@ -33,6 +34,7 @@ All notable changes to this project will be documented in this file.
 - Update changelog (#56)
 - Update changelog (#59)
 - Update changelog (#60)
+- Update changelog (#65)
 
 ### 🧪 Testing
 
