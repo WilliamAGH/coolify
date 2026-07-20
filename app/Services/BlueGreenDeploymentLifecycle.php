@@ -320,12 +320,13 @@ final class BlueGreenDeploymentLifecycle
             }
             $candidateExpectation = $this->candidateContainerExpectation
                 ?? throw new DeploymentException('Blue-green candidate start has no durable container expectation.');
-            $replicaCount = $this->application->settings->blueGreenReplicaCount();
-            $completionAssertions = $replicaCount === DEFAULT_BLUE_GREEN_REPLICA_COUNT
+            $replicaRows = $this->candidateReplicaRows($claim);
+            $replicaSet = BlueGreenReplicaSet::fromReplicas($replicaRows);
+            $completionAssertions = $replicaSet->usesScalarCompatibilityPath()
                 ? (new InspectBlueGreenContainer)->runningMutationCompletionAssertionsFor($candidateExpectation)
                 : (new InspectBlueGreenReplicaSet)->runningMutationCompletionAssertionsFor(
-                    $this->candidateReplicaRows($claim),
-                    $replicaCount,
+                    $replicaRows,
+                    $replicaSet->count,
                 );
             if ($claim->previousActiveColor === null && $this->application->build_pack === 'dockercompose') {
                 $sidecarPlan = (new RemoveBlueGreenComposeSidecars)->planFor($this->application);
@@ -1159,8 +1160,9 @@ final class BlueGreenDeploymentLifecycle
             ?? throw new DeploymentException('The blue-green candidate has no durable label expectation.');
         $claim = $this->claim
             ?? throw new DeploymentException('The blue-green candidate has no durable deployment claim.');
-        if ($this->application->settings->blueGreenReplicaCount() > DEFAULT_BLUE_GREEN_REPLICA_COUNT) {
-            $this->waitForExactCandidateReplicaHealth($claim);
+        $replicaSet = BlueGreenReplicaSet::fromReplicas($this->candidateReplicaRows($claim));
+        if (! $replicaSet->usesScalarCompatibilityPath()) {
+            $this->waitForExactCandidateReplicaHealth($claim, $replicaSet);
 
             return;
         }
@@ -1204,9 +1206,11 @@ final class BlueGreenDeploymentLifecycle
         throw new DeploymentException('The exact blue-green candidate did not become healthy before the health gate expired.');
     }
 
-    private function waitForExactCandidateReplicaHealth(BlueGreenDeploymentClaim $claim): void
-    {
-        $replicaCount = $this->application->settings->blueGreenReplicaCount();
+    private function waitForExactCandidateReplicaHealth(
+        BlueGreenDeploymentClaim $claim,
+        BlueGreenReplicaSet $replicaSet,
+    ): void {
+        $replicaCount = $replicaSet->count;
         $startPeriod = max(0, (int) $this->application->health_check_start_period);
         for ($elapsed = 0; $elapsed < $startPeriod; $elapsed++) {
             ($this->checkForCancellation)();
@@ -1233,21 +1237,21 @@ final class BlueGreenDeploymentLifecycle
             $this->deployment->addLogEntry(
                 "Blue-green replica health attempt {$attempt} of {$attempts}: {$healthy} of {$replicaCount} running and healthy."
             );
+            $this->assertOperationOwned(BlueGreenDeploymentPhase::PREPARING);
+            (new BindBlueGreenReplicaSet)->handle($claim, $inspections);
+            $this->candidateReplicaInspections = $inspections;
+            $digest = BlueGreenReplicaSet::identityDigest($inspections);
+            $expectation = $this->candidateContainerExpectation
+                ?? throw new DeploymentException('The replica set has no durable candidate expectation.');
+            $this->candidateContainerExpectation = $expectation->withDockerId($digest);
+            RecordBlueGreenCandidateIdentity::run($claim, new BlueGreenContainerInspection(
+                exists: true,
+                dockerId: $digest,
+                status: 'running',
+                health: $healthy === $replicaCount ? 'healthy' : 'unhealthy',
+            ));
             if ($healthy === $replicaCount) {
-                (new BlueGreenReplicaSet($replicaCount))->assertPromotionThreshold($inspections);
-                $this->assertOperationOwned(BlueGreenDeploymentPhase::PREPARING);
-                (new BindBlueGreenReplicaSet)->handle($claim, $inspections);
-                $this->candidateReplicaInspections = $inspections;
-                $digest = BlueGreenReplicaSet::identityDigest($inspections);
-                $expectation = $this->candidateContainerExpectation
-                    ?? throw new DeploymentException('The replica set has no durable candidate expectation.');
-                $this->candidateContainerExpectation = $expectation->withDockerId($digest);
-                RecordBlueGreenCandidateIdentity::run($claim, new BlueGreenContainerInspection(
-                    exists: true,
-                    dockerId: $digest,
-                    status: 'running',
-                    health: 'healthy',
-                ));
+                $replicaSet->assertPromotionThreshold($inspections);
                 $this->assertCandidateReleaseProof();
 
                 return;
@@ -1267,8 +1271,10 @@ final class BlueGreenDeploymentLifecycle
     }
 
     /** @return Collection<int, ApplicationBlueGreenReplica> */
-    private function candidateReplicaRows(BlueGreenDeploymentClaim $claim): Collection
-    {
+    public function candidateReplicaRows(
+        BlueGreenDeploymentClaim $claim,
+        bool $allowLegacyScalarFallback = false,
+    ): Collection {
         $rows = ApplicationBlueGreenReplica::query()
             ->where('application_blue_green_deployment_id', $claim->stateId)
             ->where('application_id', $claim->applicationId)
@@ -1278,9 +1284,10 @@ final class BlueGreenDeploymentLifecycle
             ->where('routing_revision', $claim->expectedRoutingRevision)
             ->orderBy('replica_index')
             ->get();
-        if ($rows->count() !== $this->application->settings->blueGreenReplicaCount()) {
-            throw new DeploymentException('The candidate replica ledger changed before destination-fenced startup.');
+        if ($rows->isEmpty() && $allowLegacyScalarFallback) {
+            return $rows;
         }
+        BlueGreenReplicaSet::fromReplicas($rows);
 
         return $rows;
     }
@@ -2033,8 +2040,9 @@ final class BlueGreenDeploymentLifecycle
     {
         $claim = $this->claim
             ?? throw new DeploymentException('Cannot remove a blue-green candidate without its durable claim.');
-        if ($this->application->settings->blueGreenReplicaCount() > DEFAULT_BLUE_GREEN_REPLICA_COUNT) {
-            $replicas = $this->candidateReplicaRows($claim);
+        $replicas = $this->candidateReplicaRows($claim, allowLegacyScalarFallback: true);
+        if ($replicas->isNotEmpty()
+            && ! BlueGreenReplicaSet::fromReplicas($replicas)->usesScalarCompatibilityPath()) {
             try {
                 $this->destinationState = (new RemoveBlueGreenReplicaSet)->handle(
                     $this->server,
