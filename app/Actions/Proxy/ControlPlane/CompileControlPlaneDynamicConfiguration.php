@@ -163,6 +163,9 @@ final class CompileControlPlaneDynamicConfiguration
             ...$preservedMiddlewares,
             ControlPlaneDynamicConfiguration::IDENTITY_MIDDLEWARE => [
                 'headers' => [
+                    'customRequestHeaders' => [
+                        ControlPlaneDynamicConfiguration::AUTHENTICATION_PROXY_PROOF_HEADER => $healthCheckProof,
+                    ],
                     'customResponseHeaders' => [
                         ControlPlaneDynamicConfiguration::COLOR_HEADER => $expectedMember,
                         ControlPlaneDynamicConfiguration::GENERATION_HEADER => $expectedRevision,

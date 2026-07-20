@@ -28,6 +28,8 @@ final readonly class ControlPlaneDynamicConfiguration
 
     public const HEALTH_PROOF_HEADER = 'X-Coolify-Control-Plane-Health-Proof';
 
+    public const AUTHENTICATION_PROXY_PROOF_HEADER = 'X-Coolify-Control-Plane-Authentication-Proof';
+
     public const HEALTH_PROOF_DERIVATION_CONTEXT = 'coolify-control-plane-health-check-v1';
 
     public function __construct(

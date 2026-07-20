@@ -69,6 +69,10 @@ it('compiles one deterministic File-provider snapshot with shared HTTPS and APP_
         $parsed,
         'http.middlewares.'.ControlPlaneDynamicConfiguration::IDENTITY_MIDDLEWARE.'.headers.customResponseHeaders',
     );
+    $identityRequestHeaders = data_get(
+        $parsed,
+        'http.middlewares.'.ControlPlaneDynamicConfiguration::IDENTITY_MIDDLEWARE.'.headers.customRequestHeaders',
+    );
     $service = data_get($parsed, 'http.services.'.ControlPlaneDynamicConfiguration::SERVICE.'.loadBalancer');
 
     expect($httpsRouter)->toMatchArray([
@@ -85,6 +89,8 @@ it('compiles one deterministic File-provider snapshot with shared HTTPS and APP_
         ControlPlaneDynamicConfiguration::COLOR_HEADER => 'blue',
         ControlPlaneDynamicConfiguration::GENERATION_HEADER => 'generation-42',
         ControlPlaneDynamicConfiguration::CONFIGURATION_ACKNOWLEDGEMENT_HEADER => 'ack:'.str_repeat('a', 64),
+    ])->and($identityRequestHeaders)->toBe([
+        ControlPlaneDynamicConfiguration::AUTHENTICATION_PROXY_PROOF_HEADER => str_repeat('b', 64),
     ])->and($service)->toMatchArray([
         'servers' => [
             ['url' => 'http://coolify-web-a:8080'],
