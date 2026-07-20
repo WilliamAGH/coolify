@@ -408,6 +408,7 @@ it('publishes exact drain recovery fleet failure with typed postgres ownership b
     $job->failBlueGreenDrainRecovery(new RuntimeException('PostgreSQL drain recovery requires intervention.'));
 
     expect($failedDeployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value)
+        ->and($failedDeployment->fresh()->finished_at)->not->toBeNull()
         ->and($pendingDeployment->fresh()->status)->toBe(ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value)
         ->and($owner->fresh()->blue_green_fleet_status)->toBe(BlueGreenFleetStatus::PAUSED)
         ->and($fixture['application']->fresh()->additional_networks()

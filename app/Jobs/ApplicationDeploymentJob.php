@@ -5960,10 +5960,14 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
                     fn ($query) => $query->where('horizon_job_id', $this->dispatch_attempt_uuid),
                 );
             $failureConstraint?->__invoke($failureQuery);
+            $finishedAt = Carbon::now()->toImmutable();
             if (BlueGreenLifecycleDatabaseLocks::constrainTerminalQueueOwner(
                 $failureQuery,
                 $this->application_deployment_queue,
-            )->update(['status' => ApplicationDeploymentStatus::FAILED->value]) !== 1) {
+            )->update([
+                'status' => ApplicationDeploymentStatus::FAILED->value,
+                'finished_at' => $finishedAt,
+            ]) !== 1) {
                 return false;
             }
 
@@ -6004,6 +6008,8 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
             $this->pausedBlueGreenFleetDeployments = $paused;
             $this->application_deployment_queue->setAttribute('status', ApplicationDeploymentStatus::FAILED->value);
             $this->application_deployment_queue->syncOriginalAttribute('status');
+            $this->application_deployment_queue->setAttribute('finished_at', $finishedAt);
+            $this->application_deployment_queue->syncOriginalAttribute('finished_at');
 
             return true;
         }, attempts: 5);

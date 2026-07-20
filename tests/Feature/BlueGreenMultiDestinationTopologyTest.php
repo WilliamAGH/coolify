@@ -1,5 +1,7 @@
 <?php
 
+use App\Actions\Application\BlueGreen\BlueGreenInterventionRecoveryResult;
+use App\Actions\Application\BlueGreen\RecoverBlueGreenIntervention;
 use App\Actions\Shared\ComplexStatusCheck;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentPhase;
@@ -7,6 +9,7 @@ use App\Enums\BlueGreenFleetStatus;
 use App\Enums\ProxyTypes;
 use App\Exceptions\DeploymentException;
 use App\Jobs\ApplicationDeploymentJob;
+use App\Jobs\ResumeBlueGreenDrainingDeploymentJob;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
@@ -27,6 +30,7 @@ use Illuminate\Support\Facades\Notification;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Str;
+use Tests\Support\BlueGreenRecoveryScenario;
 
 uses(RefreshDatabase::class);
 
@@ -506,6 +510,76 @@ it('publishes an exact drain-recovery fleet failure through the fleet failure ow
             ->whereKey($failed['destination']->id)
             ->firstOrFail()->pivot->status)->toBe('degraded:unknown')
         ->and($pendingDeployment->claimForDispatch(bypassServerCapacity: true))->toBeFalse();
+});
+
+it('publishes a recoverable drain-recovery fleet failure timestamp under the exact owner and fence', function (): void {
+    Notification::fake();
+    Queue::fake();
+    $scenario = BlueGreenRecoveryScenario::create(finalized: true, routingMutationRecorded: true);
+    $pending = blueGreenMultiDestinationAdditional($scenario->application->team(), 'recoverable-drain-pending');
+    $scenario->application->additional_networks()->attach($pending['destination']->id, [
+        'server_id' => $pending['server']->id,
+    ]);
+    $rootDeployment = blueGreenMultiDestinationQueue(
+        $scenario->application,
+        $scenario->destination,
+        $scenario->server,
+        'recoverable-drain-fleet-root',
+        ApplicationDeploymentStatus::FINISHED->value,
+    );
+    $rootDeployment->update([
+        'blue_green_fleet_deployment_uuid' => $rootDeployment->deployment_uuid,
+        'blue_green_fleet_status' => BlueGreenFleetStatus::ACTIVE,
+    ]);
+    $scenario->deployment->update([
+        'blue_green_fleet_deployment_uuid' => $rootDeployment->deployment_uuid,
+        'blue_green_phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+        'blue_green_supersession_generation' => 1,
+    ]);
+    $pendingDeployment = blueGreenMultiDestinationQueue(
+        $scenario->application,
+        $pending['destination'],
+        $pending['server'],
+        'recoverable-drain-fleet-pending',
+        ApplicationDeploymentStatus::QUEUED->value,
+    );
+    $pendingDeployment->update(['blue_green_fleet_deployment_uuid' => $rootDeployment->deployment_uuid]);
+    $scenario->state->update([
+        'phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+        'intervention_phase' => BlueGreenDeploymentPhase::DRAINING,
+        'intervention_reason' => 'Drain recovery requires exact operator retry.',
+        'operation_drain_started_at' => now()->subMinutes(2),
+        'operation_drain_deadline_at' => now()->subMinute(),
+    ]);
+    $job = blueGreenMultiDestinationJob(
+        $scenario->application,
+        $scenario->deployment->fresh(),
+        $scenario->destination,
+        $scenario->server,
+    );
+
+    $job->failBlueGreenDrainRecovery(new RuntimeException('Drain recovery requires intervention.'));
+
+    expect($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value)
+        ->and($scenario->deployment->fresh()->finished_at)->not->toBeNull()
+        ->and($pendingDeployment->fresh()->status)->toBe(ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value)
+        ->and($rootDeployment->fresh()->blue_green_fleet_status)->toBe(BlueGreenFleetStatus::PAUSED);
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        apply: true,
+        reason: 'Retry the exact finalized drain owner under its lifecycle fence.',
+    );
+
+    expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::FINALIZED_UNCONFIRMED)
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::RECOVERED)
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::DRAINING)
+        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+        ->and($scenario->deployment->fresh()->finished_at)->toBeNull();
+    Queue::assertPushed(
+        ResumeBlueGreenDrainingDeploymentJob::class,
+        fn (ResumeBlueGreenDrainingDeploymentJob $job): bool => $job->applicationDeploymentQueueId === $scenario->deployment->id,
+    );
 });
 
 it('atomically pauses a fleet when a child finds its server non-functional before lifecycle initialization', function (): void {
