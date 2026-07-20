@@ -141,6 +141,8 @@ function loginAsRoot(): mixed
 - Main branch: `v4.x`
 - Development branch: `next`
 - PRs should target `v4.x`
+- Treat shared production infrastructure as read-only during repository work. A failing CI or release check does not authorize changes to Nexus repository policies, registry routing or authentication, Coolify service configuration, DNS, GitHub rulesets, or Actions runner groups.
+- Resolve infrastructure-policy mismatches in repository-owned workflow, code, or configuration, or report the exact blocker. Generic directives such as “get it done,” “ship,” or “fix CI” are not authorization for an exact shared-infrastructure mutation. Follow `docs/operations/shared-production-change-control.md` for the required boundary and recovery procedure.
 
 <laravel-boost-guidelines>
 === foundation rules ===

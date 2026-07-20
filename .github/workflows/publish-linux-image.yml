@@ -1453,43 +1453,26 @@ jobs:
           regctl tag delete --ignore-missing "$DOCKER_TARGET:quarantine-$RUN_TAG"
 
   fork-registry-policy:
-    name: Require fork registry first-write policy
+    name: Validate shared Nexus docker-hosted contract
     needs: validate-inputs
     if: ${{ inputs.release_kind == 'fork' }}
-    permissions: {}
+    permissions:
+      contents: read
     runs-on: ubuntu-24.04
     env:
       MAIN_TARGET: docker.iocloudhost.net/williamagh/coolify
-      NEXUS_API_URL: https://sonatype.popos-sf6.com
+      NEXUS_BASE_URL: https://sonatype.popos-sf6.com
       NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
-      NEXUS_REPOSITORY: docker-hosted
+      NEXUS_DOCKER_REPOSITORY: docker-hosted
       NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
-      SEMANTIC_VERSION: ${{ inputs.semantic_version }}
     steps:
-      - name: Require Nexus hosted repository non-redeploy policy
-        run: |
-          set -Eeuo pipefail
-          umask 077
-
-          policy_file="$(mktemp "$RUNNER_TEMP/coolify-fork-nexus-policy.XXXXXX")"
-          trap 'rm -f "$policy_file"' EXIT
-          status="$(curl --silent --show-error --location \
-            --connect-timeout 10 --max-time 30 --retry 3 --retry-all-errors --retry-delay 1 \
-            --user "$NEXUS_USERNAME:$NEXUS_PASSWORD" \
-            --output "$policy_file" --write-out '%{http_code}' \
-            "$NEXUS_API_URL/service/rest/v1/repositories/docker/hosted/$NEXUS_REPOSITORY")"
-          [[ "$status" == 200 ]] || {
-            printf 'Nexus repository policy query returned HTTP %s.\n' "$status" >&2
-            exit 1
-          }
-          jq -e --arg repository "$NEXUS_REPOSITORY" '
-            .name == $repository and
-            .online == true and
-            .storage.writePolicy == "ALLOW_ONCE"
-          ' "$policy_file" >/dev/null || {
-            printf 'Nexus hosted repository must be online with writePolicy=ALLOW_ONCE before fork publication.\n' >&2
-            exit 1
-          }
+      - name: Check out immutable fork policy source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Validate shared Nexus docker-hosted contract
+        run: scripts/ci/verify-nexus-docker-write-policy.sh
 
   fork-build:
     name: Build and scan fork ${{ matrix.product }} OCI (${{ matrix.arch }})
@@ -2367,36 +2350,27 @@ jobs:
       MAIN_ARM64_DIGEST: ${{ needs.fork-stage.outputs.main_arm64_digest }}
       MAIN_INDEX_DIGEST: ${{ needs.fork-stage.outputs.main_index_digest }}
       MAIN_TARGET: docker.iocloudhost.net/williamagh/coolify
-      NEXUS_API_URL: https://sonatype.popos-sf6.com
-      NEXUS_REPOSITORY: docker-hosted
+      NEXUS_BASE_URL: https://sonatype.popos-sf6.com
+      NEXUS_DOCKER_REPOSITORY: docker-hosted
+      RELEASE_TAG_BRANCH: fork
       SEMANTIC_VERSION: ${{ inputs.semantic_version }}
       SOURCE_REVISION: ${{ github.sha }}
       SOURCE_URL: https://github.com/${{ github.repository }}
     steps:
-      - name: Re-require Nexus non-redeploy policy before final tagging
+      - name: Check out immutable fork release source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Set up Node.js for canonical fork tag derivation
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Revalidate shared Nexus docker-hosted contract before final tagging
         env:
           NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
           NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
-        run: |
-          set -Eeuo pipefail
-          umask 077
-          [[ -n "$BUNDLE_ARTIFACT_ID" ]]
-          [[ "$GITHUB_REF" == "refs/tags/$SEMANTIC_VERSION" ]]
-          [[ "$GITHUB_SHA" == "$SOURCE_REVISION" ]]
-
-          policy_file="$(mktemp "$RUNNER_TEMP/coolify-fork-final-policy.XXXXXX")"
-          trap 'rm -f "$policy_file"' EXIT
-          status="$(curl --silent --show-error --location \
-            --connect-timeout 10 --max-time 30 --retry 3 --retry-all-errors --retry-delay 1 \
-            --user "$NEXUS_USERNAME:$NEXUS_PASSWORD" \
-            --output "$policy_file" --write-out '%{http_code}' \
-            "$NEXUS_API_URL/service/rest/v1/repositories/docker/hosted/$NEXUS_REPOSITORY")"
-          [[ "$status" == 200 ]]
-          jq -e --arg repository "$NEXUS_REPOSITORY" '
-            .name == $repository and
-            .online == true and
-            .storage.writePolicy == "ALLOW_ONCE"
-          ' "$policy_file" >/dev/null
+        run: scripts/ci/verify-nexus-docker-write-policy.sh
 
       - name: Install registry client for final fork promotion
         uses: regclient/actions/regctl-installer@1b705e32d40851370799ea5814e83d0a5f6a70dc # v0.1.0
@@ -2709,8 +2683,10 @@ jobs:
           verify_exact_index "$MAIN_TARGET" "$MAIN_INDEX_DIGEST" "$MAIN_AMD64_DIGEST" "$MAIN_ARM64_DIGEST"
 
           # The recovery draft remains unpublished until the single semantic image
-          # tag and its live GitHub source tag have both been revalidated. ALLOW_ONCE
-          # reruns may accept only the same immutable index digest.
+          # tag and its live GitHub source tag have both been revalidated. The shared
+          # ALLOW policy is fixed infrastructure; signed release assets and deployments
+          # use the immutable digest, while this convenience tag is checked before and
+          # after promotion and may accept only the same digest on observed reruns.
           preflight_semantic_tag() {
             local repository=$1 expected_index_digest=$2 existing
             existing="$(digest_or_absent "$repository:$SEMANTIC_VERSION")"
@@ -2748,12 +2724,49 @@ jobs:
             [[ "$(regctl image digest "$repository:$SEMANTIC_VERSION")" == "$expected_index_digest" ]]
           }
 
+          promote_and_verify_canonical_tags() {
+            local repository=$1 expected_index_digest=$2 tag existing
+            local -a tags existing_digests
+            mapfile -t tags < <(node scripts/ci/deriveImageTags.mjs \
+              --branch "$RELEASE_TAG_BRANCH" \
+              --version "$SEMANTIC_VERSION" \
+              --sha "$SOURCE_REVISION" \
+              --image-base "$repository" \
+              --format tags)
+            [[ "${#tags[@]}" == 3 ]]
+            existing_digests=(
+              "$(digest_or_absent "${tags[1]}")"
+              "$(digest_or_absent "${tags[2]}")"
+            )
+            for existing in "${existing_digests[@]}"; do
+              [[ -z "$existing" || "$existing" == "$expected_index_digest" ]] || {
+                printf 'Canonical fork release tag already points at a different digest; refusing release-identity overwrite.\n' >&2
+                return 1
+              }
+            done
+            for tag in "${tags[1]}" "${tags[2]}"; do
+              [[ "$tag" == "$repository:"* ]]
+              existing="$(digest_or_absent "$tag")"
+              if [[ -z "$existing" ]]; then
+                regctl image copy "$repository@$expected_index_digest" "$tag"
+              fi
+              [[ "$(regctl image digest "$tag")" == "$expected_index_digest" ]]
+            done
+            tag="${tags[0]}"
+            [[ "$tag" == "$repository:"* ]]
+            if [[ "$(digest_or_absent "$tag")" != "$expected_index_digest" ]]; then
+              regctl image copy "$repository@$expected_index_digest" "$tag"
+            fi
+            [[ "$(regctl image digest "$tag")" == "$expected_index_digest" ]]
+          }
+
           preflight_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"
 
           assert_live_fork_tag_binding
           assert_active_fork_tag_protection
 
           promote_or_verify_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"
+          promote_and_verify_canonical_tags "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"
           verify_exact_index "$MAIN_TARGET" "$MAIN_INDEX_DIGEST" "$MAIN_AMD64_DIGEST" "$MAIN_ARM64_DIGEST"
           assert_live_fork_tag_binding
           assert_active_fork_tag_protection
