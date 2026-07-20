@@ -1662,6 +1662,24 @@ it('requires fork-runnable production runtime validation without publication', f
         ->toContain('production runtime validation must bridge the testing host and execute bundled Reverb and terminal acceptance on pull requests');
 });
 
+it('preloads pinned testing-host service images before pull-never runtime use', function () {
+    $script = file_get_contents(
+        releaseWorkflowRepositoryRoot().'/tests/Integration/TestingHostImageTest.sh',
+    );
+
+    expect($script)->toBeString();
+
+    foreach (['database', 'redis'] as $service) {
+        $pull = 'docker pull "$'.$service.'_image"';
+        $run = '"$'.$service.'_image" >/dev/null';
+
+        expect($script)
+            ->toContain($pull)
+            ->toContain($run)
+            ->and(strpos($script, $pull))->toBeLessThan(strpos($script, $run));
+    }
+});
+
 it('rejects removing the browser Redis runtime dependency', function () {
     $root = releaseWorkflowRepositoryRoot();
     $sharedWorkflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
