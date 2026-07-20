@@ -47,6 +47,7 @@ it('authorizes an immutable v4.x candidate on the William Callahan runner', func
 it('runs hosted reusable validation against the exact authorized candidate sha', function () {
     $candidate = v4xWorkflow('gate-v4x-candidate.yml');
     $validation = $candidate['jobs']['application-validation'] ?? [];
+    $attestation = $candidate['jobs']['attest-candidate'] ?? [];
     $applicationValidation = v4xWorkflow('application-validation.yml');
     $baseInput = $applicationValidation['on']['workflow_call']['inputs']['base_sha'] ?? [];
     $workflowCallInput = $applicationValidation['on']['workflow_call']['inputs']['source_sha'] ?? [];
@@ -67,7 +68,21 @@ it('runs hosted reusable validation against the exact authorized candidate sha',
             'required' => false,
             'type' => 'string',
             'default' => '',
+        ])
+        ->and($attestation['needs'] ?? null)->toBe('application-validation')
+        ->and($attestation['runs-on'] ?? null)->toBe('ubuntu-24.04')
+        ->and($attestation['permissions'] ?? null)->toBe([
+            'checks' => 'write',
+            'contents' => 'read',
         ]);
+
+    $attestationScript = collect($attestation['steps'] ?? [])
+        ->firstWhere('name', 'Attest exact validated candidate')['with']['script'] ?? '';
+
+    expect((string) $attestationScript)
+        ->toContain('github.rest.checks.create')
+        ->toContain("name: 'Application validation required'")
+        ->toContain('head_sha: process.env.FROZEN_SHA');
 
     foreach ($applicationValidation['jobs'] ?? [] as $jobName => $job) {
         foreach ($job['steps'] ?? [] as $step) {
@@ -90,7 +105,7 @@ it('runs hosted reusable validation against the exact authorized candidate sha',
         ->not->toContain('application-validation-${{ github.sha }}');
 });
 
-it('reuses a green self-hosted candidate gate before production validation', function () {
+it('reuses a green candidate gate without coupling fallback to self-hosted availability', function () {
     $workflow = v4xWorkflow('coolify-production-build.yml');
     $jobs = $workflow['jobs'] ?? [];
     $preflight = $jobs['candidate-preflight'] ?? [];
@@ -100,16 +115,21 @@ it('reuses a green self-hosted candidate gate before production validation', fun
     $checkout = collect($preflight['steps'] ?? [])->firstWhere('name', 'Check out protected base verifier');
     $verify = collect($preflight['steps'] ?? [])->firstWhere('id', 'verify');
 
-    expect($preflight['runs-on'] ?? null)->toBe(williamCallahanTrustedRunner())
+    expect($preflight['runs-on'] ?? null)->toBe('ubuntu-24.04')
         ->and($preflight['permissions'] ?? null)->toBe([
             'actions' => 'read',
             'contents' => 'read',
         ])
         ->and($preflight['outputs']['verified'] ?? null)->toBe('${{ steps.verify.outputs.verified }}')
+        ->and($checkout['id'] ?? null)->toBe('trusted_base')
+        ->and($checkout['continue-on-error'] ?? null)->toBeTrue()
         ->and($checkout['with']['ref'] ?? null)->toBe('${{ github.event.before }}')
         ->and($checkout['with']['path'] ?? null)->toBe('trusted-v4x')
         ->and($verify)->toBeArray()
+        ->and($verify['if'] ?? null)->toBe('always()')
+        ->and($verify['env']['CHECKOUT_OUTCOME'] ?? null)->toBe('${{ steps.trusted_base.outcome }}')
         ->and((string) ($verify['run'] ?? ''))
+        ->toContain('[[ "$CHECKOUT_OUTCOME" == success ]]')
         ->toContain('trusted-v4x/scripts/ci/verify-v4x-candidate-gate.sh')
         ->not->toContain('if scripts/ci/verify-v4x-candidate-gate.sh')
         ->and($validation['needs'] ?? null)->toBe('candidate-preflight')

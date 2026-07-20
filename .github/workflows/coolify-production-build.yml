@@ -20,13 +20,13 @@ jobs:
     permissions:
       actions: read
       contents: read
-    runs-on:
-      group: coolify-trusted
-      labels: [self-hosted, Linux, X64, williamacallahan]
+    runs-on: ubuntu-24.04
     outputs:
       verified: ${{ steps.verify.outputs.verified }}
     steps:
-      - name: Check out protected base verifier
+      - id: trusted_base
+        name: Check out protected base verifier
+        continue-on-error: true
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           persist-credentials: false
@@ -35,15 +35,18 @@ jobs:
 
       - id: verify
         name: Verify exact candidate preflight
+        if: always()
         shell: bash
         env:
           BASE_SHA: ${{ github.event.before }}
           CANDIDATE_SHA: ${{ github.sha }}
+          CHECKOUT_OUTCOME: ${{ steps.trusted_base.outcome }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -Eeuo pipefail
           verified=false
-          if [[ -x trusted-v4x/scripts/ci/verify-v4x-candidate-gate.sh ]] &&
+          if [[ "$CHECKOUT_OUTCOME" == success ]] &&
+            [[ -x trusted-v4x/scripts/ci/verify-v4x-candidate-gate.sh ]] &&
             trusted-v4x/scripts/ci/verify-v4x-candidate-gate.sh "$CANDIDATE_SHA" "$BASE_SHA"; then
             verified=true
           else

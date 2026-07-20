@@ -32,6 +32,7 @@ case "${1:-} ${2:-}" in
   'rev-parse --show-toplevel') printf '%s\n' "$MOCK_ROOT" ;;
   'rev-parse HEAD^{commit}') printf '%s\n' "$MOCK_SHA" ;;
   'rev-parse refs/remotes/origin/v4.x^{commit}') printf '%s\n' "$MOCK_BASE" ;;
+  'remote get-url') printf '%s\n' 'https://github.com/WilliamAGH/coolify.git' ;;
   'hash-object --stdin') cat >/dev/null; printf '%s\n' "$MOCK_GENERATION" ;;
   *) printf 'unexpected git arguments: %s\n' "$*" >&2; exit 2 ;;
 esac
@@ -48,11 +49,13 @@ FAKE_GH
     || fail 'make ship SHIP_DRY_RUN=1 exited non-zero'
   printf '%s\n' "$out" | grep -Fq "[dry-run] git push origin $sha:refs/heads/$candidate_ref" \
     || fail 'dry-run must plan the exact candidate push'
-  printf '%s\n' "$out" | grep -Fq "[dry-run] gh workflow run gate-v4x-candidate.yml --ref v4.x -f candidate_sha=$sha -f candidate_ref=$candidate_ref -f base_sha=$base" \
+  printf '%s\n' "$out" | grep -Fq "[dry-run] gh workflow run gate-v4x-candidate.yml --ref v4.x --repo williamacallahan/coolify -f candidate_sha=$sha -f candidate_ref=$candidate_ref -f base_sha=$base" \
     || fail 'dry-run must plan the exact trusted dispatch'
+  printf '%s\n' "$out" | grep -Fq -- "--repo williamacallahan/coolify" \
+    || fail 'dry-run must target the repository derived from the selected remote'
   printf '%s\n' "$out" | grep -Fq "Gate v4.x $sha $candidate_ref from $base" \
     || fail 'dry-run must expose the fully bound run title'
-  if grep -Eq 'fetch|push' "$calls"; then
+  if grep -Eq '^(fetch|push)( |$)' "$calls"; then
     fail 'dry-run must not fetch or push'
   fi
   rm -rf "$work"
@@ -90,6 +93,8 @@ test_ship_guards_and_dispatch_wiring() {
     || fail 'ship must require the remote base to be an ancestor'
   grep -Fq "gh workflow run \"\$V4X_CANDIDATE_WORKFLOW\" --ref \"\$V4X_CANDIDATE_BASE_BRANCH\"" "$ship" \
     || fail 'ship must dispatch the canonical workflow from v4.x'
+  grep -Fq -- "--repo \"\$GH_REPO\"" "$ship" \
+    || fail 'every gh operation must explicitly target the pushed repository'
   grep -Fq -- "-f \"candidate_sha=\$candidate_sha\" -f \"candidate_ref=\$candidate_ref\" -f \"base_sha=\$base_sha\"" "$ship" \
     || fail 'ship must bind all workflow_dispatch inputs'
   grep -Fq 'print_reattach' "$ship" || fail 'ship must provide reattach guidance'
@@ -123,13 +128,14 @@ test_status_and_verifier_exact_binding() {
   wrong_ref="ship/v4x/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee/dddddddddddddddddddddddddddddddddddddddd"
   title="Gate v4.x $sha $candidate_ref from $base"
   runs="[{\"workflow_runs\":[{\"id\":4111,\"display_title\":\"Gate v4.x $sha $wrong_ref from $base\",\"event\":\"workflow_dispatch\",\"status\":\"completed\",\"conclusion\":\"success\",\"created_at\":\"2026-07-20T00:00:00Z\"},{\"id\":4242,\"display_title\":\"$title\",\"event\":\"workflow_dispatch\",\"status\":\"completed\",\"conclusion\":\"success\",\"created_at\":\"2026-07-20T00:01:00Z\"}]}]"
-  run_json="{\"workflow_id\":77,\"path\":\".github/workflows/gate-v4x-candidate.yml@refs/heads/v4.x\",\"event\":\"workflow_dispatch\",\"head_branch\":\"v4.x\",\"status\":\"completed\",\"conclusion\":\"success\",\"display_title\":\"$title\"}"
+  run_json="{\"workflow_id\":77,\"path\":\".github/workflows/gate-v4x-candidate.yml@refs/heads/v4.x\",\"event\":\"workflow_dispatch\",\"head_branch\":\"v4.x\",\"head_sha\":\"$base\",\"status\":\"completed\",\"conclusion\":\"success\",\"display_title\":\"$title\"}"
 
   cat >"$work/bin/git" <<'FAKE_GIT'
 #!/usr/bin/env bash
 set -euo pipefail
 case "${1:-} ${2:-}" in
   'rev-parse --show-toplevel') printf '%s\n' "$MOCK_ROOT" ;;
+  'remote get-url') printf '%s\n' 'https://github.com/WilliamAGH/coolify.git' ;;
   *) printf 'unexpected git arguments: %s\n' "$*" >&2; exit 2 ;;
 esac
 FAKE_GIT
@@ -137,8 +143,14 @@ FAKE_GIT
 #!/usr/bin/env bash
 set -euo pipefail
 case "${1:-} ${2:-}" in
-  'run list') printf '%s\n' "$MOCK_RUN_LIST" ;;
-  'run watch') printf 'gh %s\n' "$*" >>"$MOCK_GH_CALLS" ;;
+  'run list')
+    [[ "$*" == *"--repo williamacallahan/coolify"* ]] || exit 3
+    printf '%s\n' "$MOCK_RUN_LIST"
+    ;;
+  'run watch')
+    [[ "$*" == *"--repo williamacallahan/coolify"* ]] || exit 3
+    printf 'gh %s\n' "$*" >>"$MOCK_GH_CALLS"
+    ;;
   'api repos/'*)
     case "$2" in
       *'/actions/workflows/gate-v4x-candidate.yml') printf '77\n' ;;
@@ -172,8 +184,117 @@ FAKE_GH
     MOCK_RUN_JSON="$run_json" scripts/ci/verify-v4x-candidate-gate.sh "$sha" "$base") >/dev/null 2>&1; then
     fail 'verifier must reject a title whose candidate ref binds a different SHA'
   fi
+  if (cd "$ROOT" && BASH_ENV=/dev/null PATH="$work/bin:$PATH" GH_TOKEN='test-token' GITHUB_REPOSITORY='williamacallahan/coolify' \
+    MOCK_API_RUNS="$runs" MOCK_RUN_JSON="$(printf '%s' "$run_json" | jq --arg head_sha 'dddddddddddddddddddddddddddddddddddddddd' '.head_sha = $head_sha')" \
+    scripts/ci/verify-v4x-candidate-gate.sh "$sha" "$base") >/dev/null 2>&1; then
+    fail 'verifier must reject a run whose head SHA does not equal the bound base SHA'
+  fi
   rm -rf "$work"
   pass 'status_and_verifier_exact_binding'
+}
+
+test_remote_resolution_and_dispatch_cleanup() {
+  local work sha base generation candidate_ref out
+  work="$(mktemp -d)"
+  mkdir -p "$work/bin"
+  sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  base='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+  generation='cccccccccccccccccccccccccccccccccccccccc'
+  candidate_ref="ship/v4x/$sha/$generation"
+
+  cat >"$work/bin/git" <<'FAKE_GIT'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$MOCK_GIT_CALLS"
+case "${1:-} ${2:-}" in
+  'rev-parse --show-toplevel') printf '%s\n' "$MOCK_ROOT" ;;
+  'rev-parse HEAD^{commit}') printf '%s\n' "$MOCK_SHA" ;;
+  'rev-parse refs/remotes/origin/v4.x^{commit}') printf '%s\n' "$MOCK_BASE" ;;
+  'remote get-url') printf '%s\n' "$MOCK_REMOTE_URL" ;;
+  'hash-object --stdin') cat >/dev/null; printf '%s\n' "$MOCK_GENERATION" ;;
+  'fetch --quiet') ;;
+  'merge-base --is-ancestor') ;;
+  'push origin')
+    if [[ "$*" == *"--force-with-lease="* ]] && [ "${MOCK_CLEANUP_FAIL:-0}" = 1 ]; then
+      exit 23
+    fi
+    ;;
+  *) printf 'unexpected git arguments: %s\n' "$*" >&2; exit 2 ;;
+esac
+FAKE_GIT
+  cat >"$work/bin/gh" <<'FAKE_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$MOCK_GH_CALLS"
+case "${1:-} ${2:-}" in
+  'run list') printf '[]\n' ;;
+  'workflow run') exit 17 ;;
+  *) printf 'unexpected gh arguments: %s\n' "$*" >&2; exit 2 ;;
+esac
+FAKE_GH
+  chmod +x "$work/bin/git" "$work/bin/gh"
+
+  if out="$(cd "$ROOT" && BASH_ENV=/dev/null PATH="$work/bin:$PATH" MOCK_ROOT="$ROOT" MOCK_SHA="$sha" MOCK_BASE="$base" \
+    MOCK_GENERATION="$generation" MOCK_REMOTE_URL='https://github.com/WilliamAGH/coolify.git' \
+    MOCK_CANDIDATE_REF="$candidate_ref" MOCK_GIT_CALLS="$work/git.calls" MOCK_GH_CALLS="$work/gh.calls" \
+    scripts/dev/ship.sh --revision HEAD 2>&1)"; then
+    fail 'ship must fail when workflow dispatch fails'
+  fi
+  grep -Fq "workflow run gate-v4x-candidate.yml --ref v4.x --repo williamacallahan/coolify" "$work/gh.calls" \
+    || fail 'dispatch must target the canonical repository derived from the selected remote'
+  grep -Fq "push origin --force-with-lease=refs/heads/$candidate_ref:$sha :refs/heads/$candidate_ref" "$work/git.calls" \
+    || fail 'failed dispatch must delete only the exact pushed candidate ref with force-with-lease'
+  printf '%s\n' "$out" | grep -Fq 'dispatch failed; deleted the exact candidate ref' \
+    || fail 'successful cleanup must be reported with the dispatch failure'
+
+  : >"$work/git.calls"
+  : >"$work/gh.calls"
+  if out="$(cd "$ROOT" && BASH_ENV=/dev/null PATH="$work/bin:$PATH" MOCK_ROOT="$ROOT" MOCK_SHA="$sha" MOCK_BASE="$base" \
+    MOCK_GENERATION="$generation" MOCK_REMOTE_URL='https://github.com/WilliamAGH/coolify.git' \
+    MOCK_CANDIDATE_REF="$candidate_ref" MOCK_CLEANUP_FAIL=1 MOCK_GIT_CALLS="$work/git.calls" MOCK_GH_CALLS="$work/gh.calls" \
+    scripts/dev/ship.sh --revision HEAD 2>&1)"; then
+    fail 'ship must fail hard when dispatch and candidate-ref cleanup both fail'
+  fi
+  printf '%s\n' "$out" | grep -Fq 'dispatch failed and cleanup failed' \
+    || fail 'cleanup failure must be an explicit hard failure'
+
+  if (cd "$ROOT" && BASH_ENV=/dev/null PATH="$work/bin:$PATH" MOCK_ROOT="$ROOT" MOCK_SHA="$sha" MOCK_BASE="$base" \
+    MOCK_GENERATION="$generation" MOCK_REMOTE_URL='https://github.com/coollabsio/coolify.git' \
+    MOCK_CANDIDATE_REF="$candidate_ref" MOCK_GIT_CALLS="$work/git.calls" MOCK_GH_CALLS="$work/gh.calls" \
+    scripts/dev/ship.sh --dry-run) >/dev/null 2>&1; then
+    fail 'ship must fail closed for a selected remote outside williamacallahan/coolify'
+  fi
+  rm -rf "$work"
+  pass 'remote_resolution_and_dispatch_cleanup'
+}
+
+test_history_limit() {
+  local work out
+  work="$(mktemp -d)"
+  mkdir -p "$work/bin"
+  cat >"$work/bin/git" <<'FAKE_GIT'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-} ${2:-}" in
+  'rev-parse --show-toplevel') printf '%s\n' "$MOCK_ROOT" ;;
+  'remote get-url') printf '%s\n' 'https://github.com/WilliamAGH/coolify.git' ;;
+  *) printf 'unexpected git arguments: %s\n' "$*" >&2; exit 2 ;;
+esac
+FAKE_GIT
+  cat >"$work/bin/gh" <<'FAKE_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$MOCK_GH_CALLS"
+printf '%s\n' '[{"databaseId":1,"displayTitle":"Gate v4.x aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ship/v4x/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/cccccccccccccccccccccccccccccccccccccccc from bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","status":"completed","conclusion":"success"}]'
+FAKE_GH
+  chmod +x "$work/bin/git" "$work/bin/gh"
+  out="$(cd "$ROOT" && BASH_ENV=/dev/null PATH="$work/bin:$PATH" MOCK_ROOT="$ROOT" MOCK_GH_CALLS="$work/gh.calls" \
+    HISTORY=1 HISTORY_N=7 scripts/dev/ship.sh status)" || fail 'history mode must succeed'
+  [ -n "$out" ] || fail 'history mode must print matching runs'
+  grep -Fq 'run list --workflow gate-v4x-candidate.yml --branch v4.x --event workflow_dispatch --limit 7 --repo williamacallahan/coolify' "$work/gh.calls" \
+    || fail 'HISTORY_N must limit the GitHub history query'
+  rm -rf "$work"
+  pass 'history_limit'
 }
 
 test_dry_run_plan
@@ -181,4 +302,6 @@ test_canonical_contract
 test_ship_guards_and_dispatch_wiring
 test_verifier_wiring
 test_status_and_verifier_exact_binding
+test_remote_resolution_and_dispatch_cleanup
+test_history_limit
 printf 'ALL V4.X SHIP TESTS PASSED\n'

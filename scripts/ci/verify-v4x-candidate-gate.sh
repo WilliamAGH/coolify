@@ -53,11 +53,13 @@ jq -e \
   --arg workflow_id "$workflow_id" \
   --arg workflow_path ".github/workflows/$V4X_CANDIDATE_WORKFLOW" \
   --arg branch "$V4X_CANDIDATE_BASE_BRANCH" \
+  --arg base_sha "$base_sha" \
   --arg title "$expected_title" '
     (.workflow_id | tostring) == $workflow_id
     and ((.path // "") == $workflow_path or ((.path // "") | startswith($workflow_path + "@")))
     and .event == "workflow_dispatch"
     and .head_branch == $branch
+    and .head_sha == $base_sha
     and .status == "completed"
     and .conclusion == "success"
     and .display_title == $title

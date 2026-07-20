@@ -82,3 +82,32 @@ jobs:
     with:
       base_sha: ${{ inputs.base_sha }}
       source_sha: ${{ inputs.candidate_sha }}
+
+  attest-candidate:
+    name: Attach required validation to candidate SHA
+    needs: application-validation
+    permissions:
+      checks: write
+      contents: read
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Attest exact validated candidate
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v8.0.0
+        env:
+          FROZEN_BASE_SHA: ${{ inputs.base_sha }}
+          FROZEN_SHA: ${{ inputs.candidate_sha }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'Application validation required',
+              head_sha: process.env.FROZEN_SHA,
+              status: 'completed',
+              conclusion: 'success',
+              output: {
+                title: 'Exact v4.x candidate validation passed',
+                summary: `Validated ${process.env.FROZEN_SHA} from protected base ${process.env.FROZEN_BASE_SHA}.`,
+              },
+            });

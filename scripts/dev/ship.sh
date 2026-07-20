@@ -24,6 +24,31 @@ fail() {
   exit 1
 }
 
+github_repo_for_remote() {
+  local remote_url remote_path owner repository owner_lower repository_lower
+  remote_url="$(git remote get-url --push "$SHIP_REMOTE" 2>/dev/null)" || \
+    fail "cannot resolve push URL for remote $SHIP_REMOTE"
+  case "$remote_url" in
+    git@github.com:*) remote_path="${remote_url#git@github.com:}" ;;
+    ssh://git@github.com/*) remote_path="${remote_url#ssh://git@github.com/}" ;;
+    https://github.com/*) remote_path="${remote_url#https://github.com/}" ;;
+    *) fail "remote $SHIP_REMOTE is not a supported github.com push URL" ;;
+  esac
+  remote_path="${remote_path%.git}"
+  remote_path="${remote_path%/}"
+  [[ "$remote_path" =~ ^([^/]+)/([^/]+)$ ]] || \
+    fail "remote $SHIP_REMOTE does not identify one GitHub owner/repository"
+  owner="${BASH_REMATCH[1]}"
+  repository="${BASH_REMATCH[2]}"
+  owner_lower="$(printf '%s' "$owner" | tr '[:upper:]' '[:lower:]')"
+  repository_lower="$(printf '%s' "$repository" | tr '[:upper:]' '[:lower:]')"
+  [ "$repository_lower" = coolify ] || fail "remote $SHIP_REMOTE does not push coolify"
+  case "$owner_lower" in
+    williamagh|williamacallahan) printf '%s\n' 'williamacallahan/coolify' ;;
+    *) fail "remote $SHIP_REMOTE is not owned by williamacallahan" ;;
+  esac
+}
+
 usage() {
   cat <<'USAGE'
 usage:
@@ -53,6 +78,9 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
+GH_REPO="$(github_repo_for_remote)"
+export GH_REPO
+
 candidate_commit() {
   git rev-parse "${1}^{commit}"
 }
@@ -62,8 +90,9 @@ remote_base_commit() {
 }
 
 gate_runs_json() {
+  local limit="${1:-$SHIP_STATUS_LIMIT}"
   gh run list --workflow "$V4X_CANDIDATE_WORKFLOW" --branch "$V4X_CANDIDATE_BASE_BRANCH" \
-    --event workflow_dispatch --limit "$SHIP_STATUS_LIMIT" \
+    --event workflow_dispatch --limit "$limit" --repo "$GH_REPO" \
     --json databaseId,displayTitle,status,conclusion
 }
 
@@ -119,7 +148,7 @@ stream_gate() {
   local run_id="$1" candidate_sha="$2" candidate_ref="$3" base_sha="$4"
   printf 'Streaming v4.x candidate gate run %s.\n' "$run_id"
   print_reattach "$candidate_sha" "$candidate_ref" "$base_sha"
-  if gh run watch "$run_id" --exit-status; then
+  if gh run watch "$run_id" --exit-status --repo "$GH_REPO"; then
     printf 'Candidate gate is green for %s.\n' "$candidate_sha"
   else
     printf 'ship: gate did not finish successfully. ' >&2
@@ -149,8 +178,8 @@ cmd_ship() {
   if [ "$dry_run" -eq 1 ]; then
     base_sha="$(remote_base_commit 2>/dev/null || printf '<%s/%s-sha>' "$SHIP_REMOTE" "$V4X_CANDIDATE_BASE_BRANCH")"
     printf '[dry-run] git push %s %s:refs/heads/%s\n' "$SHIP_REMOTE" "$candidate_sha" "$candidate_ref"
-    printf '[dry-run] gh workflow run %s --ref %s -f candidate_sha=%s -f candidate_ref=%s -f base_sha=%s\n' \
-      "$V4X_CANDIDATE_WORKFLOW" "$V4X_CANDIDATE_BASE_BRANCH" "$candidate_sha" "$candidate_ref" "$base_sha"
+    printf '[dry-run] gh workflow run %s --ref %s --repo %s -f candidate_sha=%s -f candidate_ref=%s -f base_sha=%s\n' \
+      "$V4X_CANDIDATE_WORKFLOW" "$V4X_CANDIDATE_BASE_BRANCH" "$GH_REPO" "$candidate_sha" "$candidate_ref" "$base_sha"
     printf '[dry-run] expected run title: Gate v4.x %s %s from %s\n' "$candidate_sha" "$candidate_ref" "$base_sha"
     return
   fi
@@ -176,8 +205,14 @@ cmd_ship() {
   fi
 
   git push "$SHIP_REMOTE" "$candidate_sha:refs/heads/$candidate_ref"
-  gh workflow run "$V4X_CANDIDATE_WORKFLOW" --ref "$V4X_CANDIDATE_BASE_BRANCH" \
-    -f "candidate_sha=$candidate_sha" -f "candidate_ref=$candidate_ref" -f "base_sha=$base_sha"
+  if ! gh workflow run "$V4X_CANDIDATE_WORKFLOW" --ref "$V4X_CANDIDATE_BASE_BRANCH" --repo "$GH_REPO" \
+    -f "candidate_sha=$candidate_sha" -f "candidate_ref=$candidate_ref" -f "base_sha=$base_sha"; then
+    if git push "$SHIP_REMOTE" --force-with-lease="refs/heads/$candidate_ref:$candidate_sha" \
+      ":refs/heads/$candidate_ref"; then
+      fail "workflow dispatch failed; deleted the exact candidate ref $candidate_ref"
+    fi
+    fail "workflow dispatch failed and cleanup failed for exact candidate ref $candidate_ref"
+  fi
   printf 'Submitted exact candidate gate for %s.\n' "$candidate_sha"
   print_reattach "$candidate_sha" "$candidate_ref" "$base_sha"
   binding="$(wait_for_exact_gate "$candidate_sha" "$candidate_ref" "$base_sha")"
@@ -186,9 +221,11 @@ cmd_ship() {
 }
 
 cmd_status() {
-  local candidate_sha="${FOLLOW:-}" candidate_ref="${CANDIDATE_REF:-}" base_sha="${BASE_SHA:-}" binding run_id
+  local candidate_sha="${FOLLOW:-}" candidate_ref="${CANDIDATE_REF:-}" base_sha="${BASE_SHA:-}" binding run_id history_limit
   if [ -n "${HISTORY:-}" ]; then
-    gate_runs_json | jq -r --arg title_pattern "$V4X_CANDIDATE_RUN_TITLE_REGEX" '
+    history_limit="${HISTORY_N:-$SHIP_STATUS_LIMIT}"
+    [[ "$history_limit" =~ ^[1-9][0-9]*$ ]] || fail 'HISTORY_N must be a positive integer'
+    gate_runs_json "$history_limit" | jq -r --arg title_pattern "$V4X_CANDIDATE_RUN_TITLE_REGEX" '
       .[] | select((.displayTitle // "") | test($title_pattern))
       | [.databaseId, .status, (.conclusion // "pending"), .displayTitle] | @tsv'
     return
