@@ -25,11 +25,13 @@ All notable changes to this project will be documented in this file.
 
 - Update changelog (#52)
 - Update changelog (#54)
+- Update changelog (#56)
 
 ### 🧪 Testing
 
 - *(ci)* Execute required validation result matrix
 - *(control-plane)* Require sustained route availability
+- *(control-plane)* Validate surviving recovery paths in CI (#57)
 
 ### ⚙️ Miscellaneous Tasks
 
