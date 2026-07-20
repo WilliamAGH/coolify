@@ -24,6 +24,10 @@ services:
         source: .env
         target: /var/www/html/.env
         read_only: true
+      - type: bind
+        source: ../../docker/testing-host/development-private_key
+        target: /run/coolify-testing-host/private/testing-host
+        read_only: true
       - ./ssh:/var/www/html/storage/app/ssh
       - ./applications:/var/www/html/storage/app/applications
       - ./databases:/var/www/html/storage/app/databases

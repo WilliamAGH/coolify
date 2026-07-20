@@ -18,6 +18,10 @@ ARG CLOUDFLARED_RELEASE_DATE=2026-07-09-12:06
 # Note: We are using version 18 of the postgres client (while still using postgres 15 for the postgres server) as version 15 has been removed from Alpine 3.23+ https://pkgs.alpinelinux.org/packages?name=postgresql*-client&branch=v3.23&repo=&arch=x86_64&origin=&flagged=&maintainer=
 ARG POSTGRES_VERSION=18
 ARG SU_EXEC_VERSION=0.3-r0
+# https://pkgs.alpinelinux.org/package/edge/community/x86_64/git-lfs
+ARG GIT_LFS_VERSION=3.7.1-r1
+ARG GIT_LFS_AMD64_SHA256=a43b0a41e8009d422d43806fe732c2b978e3ceec568394309251c1f611e098e6
+ARG GIT_LFS_ARM64_SHA256=2bb47c493735a7681cf385303835c60ada86a811e107029e9bb3042d279ffa19
 # https://nginx.org/en/linux_packages.html
 ARG NGINX_VERSION=1.31.2-r1
 ARG NGINX_APK_SIGNER_FILE_SHA256=ff7cf138acc09f2a5029300ab713fe6a1440605fca72e2bab76a4da9206fec87
@@ -121,6 +125,10 @@ ARG USER_ID
 ARG GROUP_ID
 ARG POSTGRES_VERSION
 ARG SU_EXEC_VERSION
+ARG TARGETARCH
+ARG GIT_LFS_VERSION
+ARG GIT_LFS_AMD64_SHA256
+ARG GIT_LFS_ARM64_SHA256
 ARG NGINX_VERSION
 ARG NGINX_APK_SIGNER_FILE_SHA256
 ARG NGINX_APK_SIGNER_FINGERPRINT_SHA256
@@ -157,12 +165,31 @@ RUN --mount=type=cache,target=/var/cache/apk \
     "su-exec=${SU_EXEC_VERSION}" \
     openssh-client \
     git \
-    git-lfs \
     jq \
     lsof \
     util-linux-misc \
     vim && \
     apk info -e "su-exec=${SU_EXEC_VERSION}" >/dev/null
+
+# Install only the exact patched Git LFS APK from Alpine edge without enabling its repository.
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+        amd64) GIT_LFS_APK_ARCH=x86_64; GIT_LFS_APK_SHA256="${GIT_LFS_AMD64_SHA256}" ;; \
+        arm64) GIT_LFS_APK_ARCH=aarch64; GIT_LFS_APK_SHA256="${GIT_LFS_ARM64_SHA256}" ;; \
+        *) echo "Unsupported TARGETARCH for Git LFS: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    GIT_LFS_APK="/tmp/git-lfs-${GIT_LFS_VERSION}.apk"; \
+    curl -fSsL "https://dl-cdn.alpinelinux.org/alpine/edge/community/${GIT_LFS_APK_ARCH}/git-lfs-${GIT_LFS_VERSION}.apk" -o "${GIT_LFS_APK}"; \
+    echo "${GIT_LFS_APK_SHA256}  ${GIT_LFS_APK}" | sha256sum -c -; \
+    apk verify "${GIT_LFS_APK}"; \
+    apk add --no-cache "${GIT_LFS_APK}"; \
+    rm -f "${GIT_LFS_APK}"; \
+    apk info -e "git-lfs=${GIT_LFS_VERSION}" >/dev/null; \
+    GIT_LFS_RUNTIME_VERSION="$(git lfs version)"; \
+    case "${GIT_LFS_RUNTIME_VERSION}" in \
+        "git-lfs/${GIT_LFS_VERSION%-r*} "*) ;; \
+        *) echo "Unexpected Git LFS runtime version: ${GIT_LFS_RUNTIME_VERSION}" >&2; exit 1 ;; \
+    esac
 
 # Install PHP extensions used by Artisan diagnostics and realtime features.
 RUN install-php-extensions intl sockets
@@ -190,7 +217,15 @@ COPY --chown=www-data:www-data composer.json composer.lock ./
 COPY --chown=www-data:www-data app ./app
 COPY --chown=www-data:www-data bootstrap ./bootstrap
 COPY --chown=www-data:www-data config ./config
-COPY --chown=www-data:www-data database ./database
+COPY --chown=www-data:www-data database/migrations ./database/migrations
+COPY --chown=www-data:www-data \
+    database/seeders/CaSslCertSeeder.php \
+    database/seeders/OauthSettingSeeder.php \
+    database/seeders/PopulateSshKeysDirectorySeeder.php \
+    database/seeders/ProductionSeeder.php \
+    database/seeders/RootUserSeeder.php \
+    database/seeders/SentinelSeeder.php \
+    ./database/seeders/
 COPY --chown=www-data:www-data lang ./lang
 COPY --chown=www-data:www-data public ./public
 COPY --chown=www-data:www-data routes ./routes
