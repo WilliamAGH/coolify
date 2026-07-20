@@ -15,7 +15,7 @@ import {
 async function postToCoolify(path, headers) {
     return new Promise((resolve, reject) => {
         const request = http.request({
-            hostname: 'coolify',
+            hostname: process.env.TERMINAL_AUTH_HOST || process.env.COOLIFY_INTERNAL_HOST || '127.0.0.1',
             port: 8080,
             path,
             method: 'POST',
@@ -505,8 +505,44 @@ function generateUserId() {
     return Math.random().toString(36).substring(2, 11);
 }
 
-server.listen(6002, () => {
+const terminalPort = Number.parseInt(process.env.TERMINAL_BACKEND_PORT || '6002', 10);
+
+server.listen(terminalPort, () => {
     logTerminal('log', 'Terminal debug logging is enabled.', {
         terminalDebugEnabled,
     });
 });
+
+let shuttingDown = false;
+
+async function shutdown(signal) {
+    if (shuttingDown) {
+        return;
+    }
+
+    shuttingDown = true;
+    clearInterval(heartbeat);
+
+    logTerminal('log', 'Shutting down terminal websocket server.', { signal });
+
+    const forcedShutdown = setTimeout(() => {
+        process.exit(1);
+    }, 10000);
+    forcedShutdown.unref();
+
+    wss.clients.forEach((ws) => {
+        ws.close(1001, 'Server shutting down');
+    });
+
+    await Promise.all([...userSessions.keys()].map(killPtyProcess));
+
+    wss.close(() => {
+        server.close(() => {
+            clearTimeout(forcedShutdown);
+            process.exit(0);
+        });
+    });
+}
+
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));

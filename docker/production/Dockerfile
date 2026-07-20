@@ -162,6 +162,7 @@ RUN --mount=type=cache,target=/var/cache/apk \
     apk upgrade && \
     apk add --no-cache \
     postgresql${POSTGRES_VERSION}-client \
+    nodejs \
     "su-exec=${SU_EXEC_VERSION}" \
     openssh-client \
     git \
@@ -238,6 +239,17 @@ COPY --chown=www-data:www-data changelogs/ ./changelogs/
 COPY --chown=www-data:www-data --chmod=755 scripts/control-plane-traefik-attestor ./scripts/control-plane-traefik-attestor
 
 RUN composer dump-autoload
+
+# Install terminal WebSocket server dependencies.
+COPY docker/coolify-terminal/package*.json /terminal/
+RUN apk add --no-cache --virtual .terminal-build-deps npm make g++ python3 && \
+    npm ci --prefix /terminal && \
+    npm rebuild node-pty --prefix /terminal --update-binary && \
+    apk del .terminal-build-deps && \
+    rm -rf /root/.npm
+COPY docker/coolify-terminal/terminal-server.js /terminal/terminal-server.js
+COPY docker/coolify-terminal/terminal-utils.js /terminal/terminal-utils.js
+RUN chown -R www-data:www-data /terminal
 
 # Configure Nginx and S6 overlay
 COPY docker/production/etc/nginx/conf.d/custom.conf /etc/nginx/conf.d/custom.conf

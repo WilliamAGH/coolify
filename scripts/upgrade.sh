@@ -183,6 +183,13 @@ update_env_var() {
     fi
 }
 
+normalize_pusher_port() {
+    if grep -q "^PUSHER_PORT=8080$" "$ENV_FILE"; then
+        sed -i "s|^PUSHER_PORT=8080$|PUSHER_PORT=6001|" "$ENV_FILE"
+        log "Updated PUSHER_PORT from app HTTP port 8080 to Reverb port 6001"
+    fi
+}
+
 set_env_var() {
     local key="$1"
     local value="$2"
@@ -201,6 +208,11 @@ set_env_var "REGISTRY_URL" "$REGISTRY_URL"
 update_env_var "PUSHER_APP_ID" "$(openssl rand -hex 32)"
 update_env_var "PUSHER_APP_KEY" "$(openssl rand -hex 32)"
 update_env_var "PUSHER_APP_SECRET" "$(openssl rand -hex 32)"
+update_env_var "PUSHER_PORT" "6001"
+normalize_pusher_port
+update_env_var "PUSHER_BACKEND_HOST" "127.0.0.1"
+update_env_var "PUSHER_BACKEND_PORT" "6001"
+update_env_var "TERMINAL_BACKEND_PORT" "6002"
 log "Environment variables check complete"
 echo "     Done."
 
@@ -305,8 +317,61 @@ nohup bash -c "
         echo \"\$1|\$2|\$(date -Iseconds)\" > \"\$STATUS_FILE\"
     }
 
-    # Stop and remove containers
-    for container in coolify coolify-db coolify-redis coolify-realtime; do
+    LEGACY_REALTIME_PRESENT=false
+
+    stop_legacy_realtime_container() {
+        local container=coolify-realtime
+        if docker container inspect \"\$container\" >/dev/null 2>&1; then
+            log \"Stopping legacy realtime container: \${container}\"
+            if ! docker container stop \"\$container\" >>\"\$LOGFILE\" 2>&1; then
+                log \"ERROR: Failed to stop legacy realtime container \${container}\"
+                write_status 'error' 'Failed to stop legacy realtime container'
+                exit 1
+            fi
+            LEGACY_REALTIME_PRESENT=true
+            log \"Legacy realtime container \${container} stopped and retained pending bundled route proof\"
+        else
+            log \"Legacy realtime container \${container} not found (skipping)\"
+        fi
+    }
+
+    remove_proven_legacy_realtime_container() {
+        local container=coolify-realtime
+        [[ \$LEGACY_REALTIME_PRESENT == true ]] || return 0
+        if ! docker container inspect \"\$container\" >/dev/null 2>&1; then
+            log \"ERROR: Legacy realtime container \${container} disappeared before verified removal\"
+            write_status 'error' 'Legacy realtime container disappeared before verified removal'
+            exit 1
+        fi
+        log \"Removing legacy realtime container after bundled route proof: \${container}\"
+        if ! docker container rm --force \"\$container\" >>\"\$LOGFILE\" 2>&1; then
+            log \"ERROR: Failed to remove legacy realtime container \${container}\"
+            write_status 'error' 'Failed to remove legacy realtime container'
+            exit 1
+        fi
+        if docker container inspect \"\$container\" >/dev/null 2>&1; then
+            log \"ERROR: Legacy realtime container \${container} remains after removal\"
+            write_status 'error' 'Legacy realtime container remains after removal'
+            exit 1
+        fi
+        LEGACY_REALTIME_PRESENT=false
+    }
+
+    wait_for_bundled_realtime_routes() {
+        local attempt
+        for ((attempt = 1; attempt <= 30; attempt++)); do
+            if docker exec coolify curl --fail --silent --show-error http://127.0.0.1:6001/up --connect-timeout 5 --max-time 10 >>\"\$LOGFILE\" 2>&1 \
+                && docker exec coolify curl --fail --silent --show-error http://127.0.0.1:6002/ready --connect-timeout 5 --max-time 10 >>\"\$LOGFILE\" 2>&1; then
+                log 'Bundled Laravel Reverb and terminal routes are ready'
+                return 0
+            fi
+            sleep 2
+        done
+        return 1
+    }
+
+    # Stop and remove core containers before recreating the bundled services.
+    for container in coolify coolify-db coolify-redis; do
         if docker ps -a --format '{{.Names}}' | grep -q \"^\${container}\$\"; then
             log \"Stopping container: \${container}\"
             docker stop \"\$container\" >>\"\$LOGFILE\" 2>&1 || true
@@ -317,6 +382,7 @@ nohup bash -c "
             log \"Container \${container} not found (skipping)\"
         fi
     done
+    stop_legacy_realtime_container
     log \"Container cleanup complete\"
 
     # Start new containers
@@ -345,8 +411,34 @@ nohup bash -c "
         log 'Using control-plane listener Compose override'
     fi
 
+    ORPHAN_CLEANUP='--remove-orphans'
+    if [[ \$LEGACY_REALTIME_PRESENT == true ]]; then
+        ORPHAN_CLEANUP=''
+    fi
     log 'Running docker compose up...'
-    docker run -v /data/coolify/source:/data/coolify/source -v /var/run/docker.sock:/var/run/docker.sock \${DOCKER_CONFIG_MOUNT} --rm \${REGISTRY_URL:-docker.io}/coollabsio/coolify-helper:\${LATEST_HELPER_VERSION} bash -c \"LATEST_IMAGE=\${LATEST_IMAGE} docker compose --env-file /data/coolify/source/.env \${COMPOSE_FILES} up -d --remove-orphans --wait --wait-timeout 60\" >>\"\$LOGFILE\" 2>&1
+    if ! docker run -v /data/coolify/source:/data/coolify/source -v /var/run/docker.sock:/var/run/docker.sock \${DOCKER_CONFIG_MOUNT} --rm \${REGISTRY_URL:-docker.io}/coollabsio/coolify-helper:\${LATEST_HELPER_VERSION} bash -c \"LATEST_IMAGE=\${LATEST_IMAGE} docker compose --env-file /data/coolify/source/.env \${COMPOSE_FILES} up -d \${ORPHAN_CLEANUP} --wait --wait-timeout 60\" >>\"\$LOGFILE\" 2>&1; then
+        log 'ERROR: Docker compose failed to start the bundled Coolify runtime'
+        write_status 'error' 'Failed to start bundled Coolify runtime'
+        exit 1
+    fi
+    if ! wait_for_bundled_realtime_routes; then
+        log 'ERROR: Bundled Laravel Reverb or terminal route did not become ready'
+        write_status 'error' 'Bundled realtime route proof failed'
+        exit 1
+    fi
+    if [[ \$LEGACY_REALTIME_PRESENT == true ]]; then
+        remove_proven_legacy_realtime_container
+        if ! docker run -v /data/coolify/source:/data/coolify/source -v /var/run/docker.sock:/var/run/docker.sock \${DOCKER_CONFIG_MOUNT} --rm \${REGISTRY_URL:-docker.io}/coollabsio/coolify-helper:\${LATEST_HELPER_VERSION} bash -c \"LATEST_IMAGE=\${LATEST_IMAGE} docker compose --env-file /data/coolify/source/.env \${COMPOSE_FILES} up -d --remove-orphans --wait --wait-timeout 60\" >>\"\$LOGFILE\" 2>&1; then
+            log 'ERROR: Docker compose orphan cleanup failed after legacy realtime removal'
+            write_status 'error' 'Failed to finalize legacy realtime removal'
+            exit 1
+        fi
+        if ! wait_for_bundled_realtime_routes; then
+            log 'ERROR: Bundled realtime routes failed after legacy orphan cleanup'
+            write_status 'error' 'Bundled realtime route recheck failed'
+            exit 1
+        fi
+    fi
     log 'Docker compose up completed'
 
     # Final log entry

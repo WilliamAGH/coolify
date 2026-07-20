@@ -89,17 +89,23 @@ new_fixture() {
     export FORK_DEPLOY_CANDIDATE_STARTED_MARKER=$FIXTURE/candidate-started
     export FORK_DEPLOY_DB_MARKER=$FIXTURE/database-active
     export FORK_DEPLOY_REDIS_MARKER=$FIXTURE/redis-active
+    export FORK_DEPLOY_LEGACY_REALTIME_MARKER=$FIXTURE/legacy-realtime
+    export FORK_DEPLOY_LEGACY_REALTIME_STOPPED_MARKER=$FIXTURE/legacy-realtime-stopped
     export FORK_DEPLOY_ACTIVE_SOURCE=$ROOT/source
     unset FORK_DEPLOY_MIGRATION_FINGERPRINT FORK_DEPLOY_HOST_IP FORK_DEPLOY_EXTRA_BINDING \
         FORK_DEPLOY_FAIL_COMPOSE_UP FORK_DEPLOY_OPENSSL_VERIFY_FAIL \
         FORK_DEPLOY_USE_REAL_OPENSSL FORK_DEPLOY_ENV_EXTRA \
         FORK_DEPLOY_COMPOSE_VERSION FORK_DEPLOY_LEGACY_VOLUMES \
-        FORK_DEPLOY_APP_HOST_IP FORK_DEPLOY_REALTIME_HOST_IP \
+        FORK_DEPLOY_APP_HOST_IP FORK_DEPLOY_PUSHER_HOST_IP FORK_DEPLOY_TERMINAL_HOST_IP \
         FORK_DEPLOY_APP_DUAL_STACK FORK_DEPLOY_COMPOSE_APP_LOOPBACK \
         FORK_DEPLOY_COMPOSE_OMIT_APP_HOST_IP \
         FORK_DEPLOY_COMPOSE_SWAP_BINDINGS \
         FORK_DEPLOY_DOCKER_UNAVAILABLE \
-        FORK_DEPLOY_FAIL_CANDIDATE_RUNTIME_VERIFY || true
+        FORK_DEPLOY_FAIL_CANDIDATE_RUNTIME_VERIFY \
+        FORK_DEPLOY_FAIL_LEGACY_RUNTIME_VERIFY \
+        FORK_DEPLOY_FAIL_BUNDLED_ROUTE_PROOF \
+        FORK_DEPLOY_FAIL_LEGACY_REALTIME_REMOVE \
+        FORK_DEPLOY_LEGACY_CURRENT || true
     unset FORK_DEPLOY_FAIL_ACTIVATED_CONFIG FORK_DEPLOY_KILL_ON_ACTIVE_CONFIG \
         FORK_DEPLOY_TEST_KILL_AFTER_RESTORE_PREVIOUS_CURRENT \
         FORK_DEPLOY_TEST_KILL_AFTER_PENDING_WRITE \
@@ -128,19 +134,43 @@ write_assets() {
         printf 'services:\n'
         printf '  coolify:\n    image: "%s"\n    ports: !override\n' "docker.iocloudhost.net/williamagh/coolify@$DIGEST_A"
         printf '%s\n' "      - \"\${APP_PORT:-8000}:8080\""
+        printf '%s\n' "      - \"127.0.0.1:\${PUSHER_PORT:-\${SOKETI_PORT:-6001}}:6001\""
+        printf '%s\n' "      - \"127.0.0.1:\${TERMINAL_PORT:-6002}:6002\""
         printf '    environment:\n      AUTOUPDATE: "false"\n'
-        printf '  soketi:\n    image: "%s"\n    ports: !override\n' "docker.iocloudhost.net/williamagh/coolify-realtime@$DIGEST_B"
-        printf '%s\n' "      - \"127.0.0.1:\${SOKETI_PORT:-6001}:6001\""
-        printf '      - "127.0.0.1:6002:6002"\n'
         printf '  postgres:\n    image: "%s"\n' "docker.io/library/postgres@$DIGEST_C"
         printf '  redis:\n    image: "%s"\n' "docker.io/library/redis@$DIGEST_D"
     } >"$ASSETS/docker-compose.custom.yml"
 }
 
-write_manifest() {
+sign_manifest() {
+    "$FORK_DEPLOY_REAL_OPENSSL" pkeyutl \
+        -sign \
+        -rawin \
+        -inkey "$FIXTURE/trust/private.pem" \
+        -in "$MANIFEST_FILE" \
+        -out "$MANIFEST_FILE.sig"
+}
+
+write_v1_assets() {
+    printf 'services: {}\n' >"$ASSETS/docker-compose.yml"
+    printf 'services: {}\n' >"$ASSETS/docker-compose.prod.yml"
+    printf 'DB_USERNAME=coolify\nDB_DATABASE=coolify\n' >"$ASSETS/.env.production"
+    {
+        printf 'services:\n'
+        printf '  coolify:\n    image: "%s"\n    ports: !override\n' "docker.iocloudhost.net/williamagh/coolify@$DIGEST_A"
+        printf '%s\n' "      - \"\${APP_PORT:-8000}:8080\""
+        printf '  soketi:\n    image: "%s"\n    container_name: coolify-realtime\n    ports:\n' "docker.iocloudhost.net/williamagh/coolify-realtime@$DIGEST_B"
+        printf '%s\n' "      - \"127.0.0.1:\${SOKETI_PORT:-6001}:6001\""
+        printf '%s\n' '      - "127.0.0.1:6002:6002"'
+        printf '  postgres:\n    image: "%s"\n' "docker.io/library/postgres@$DIGEST_C"
+        printf '  redis:\n    image: "%s"\n' "docker.io/library/redis@$DIGEST_D"
+    } >"$ASSETS/docker-compose.custom.yml"
+}
+
+write_v1_manifest() {
     local version=$1
 
-    write_assets
+    write_v1_assets
     {
         printf 'SCHEMA=coolify-fork-release/v1\n'
         printf 'KEY_ID=%s\n' "$(manifest_key_id)"
@@ -173,7 +203,90 @@ write_manifest() {
         printf 'COMPOSE_OVERLAY_SHA256=%s\n' "$(hash_file "$ASSETS/docker-compose.custom.yml")"
         printf 'ENV_PRODUCTION_SHA256=%s\n' "$(hash_file "$ASSETS/.env.production")"
     } >"$MANIFEST_FILE"
-    : >"$MANIFEST_FILE.sig"
+    sign_manifest
+}
+
+seed_v1_current() {
+    local version=$1 release activation rendered
+
+    export FORK_DEPLOY_USE_REAL_OPENSSL=true
+    export FORK_DEPLOY_LEGACY_CURRENT=true
+    write_v1_manifest "$version"
+    release=$ROOT/fork-deploy/releases/$version
+    activation=$ROOT/fork-deploy/activations/$version
+    mkdir -p "$release" "$ROOT/fork-deploy/activations" "$ROOT/fork-deploy/prestart" "$ROOT/source"
+    chmod 0700 "$ROOT/fork-deploy" "$ROOT/fork-deploy/releases" "$release" \
+        "$ROOT/fork-deploy/activations" "$ROOT/fork-deploy/prestart" "$ROOT/source"
+    cp -p "$ASSETS/docker-compose.yml" "$ASSETS/docker-compose.prod.yml" \
+        "$ASSETS/docker-compose.custom.yml" "$ASSETS/.env.production" "$release/"
+    cp -p "$MANIFEST_FILE" "$release/release.manifest"
+    cp -p "$MANIFEST_FILE.sig" "$release/release.manifest.sig"
+    printf 'VERSION=%s\n' "$version" >"$release/verified"
+    cp -p "$ASSETS/docker-compose.yml" "$ASSETS/docker-compose.prod.yml" \
+        "$ASSETS/docker-compose.custom.yml" "$ASSETS/.env.production" "$ROOT/source/"
+    {
+        printf 'DB_USERNAME=coolify\n'
+        printf 'DB_DATABASE=coolify\n'
+        printf 'APP_PORT=8000\n'
+        printf 'SOKETI_PORT=6001\n'
+        printf 'AUTOUPDATE=false\n'
+        printf 'VERSIONS_URL=http://127.0.0.1:9/fork-deploy-disabled/versions.json\n'
+        printf 'UPGRADE_SCRIPT_URL=http://127.0.0.1:9/fork-deploy-disabled/upgrade.sh\n'
+        printf 'RELEASES_URL=http://127.0.0.1:9/fork-deploy-disabled/releases\n'
+        printf 'COOLIFY_FORK_VERSION=%s\n' "$version"
+    } >"$ROOT/source/.env"
+    rendered=$(hash_file "$ROOT/source/.env")
+    {
+        printf 'VERSION=%s\n' "$version"
+        printf 'ACTIVATED_AT=2026-07-20T00:00:00Z\n'
+        printf 'MIGRATION_FINGERPRINT_BEFORE=uninitialized\n'
+        printf 'MIGRATION_FINGERPRINT_AFTER=uninitialized\n'
+        printf 'RENDERED_COMPOSE_SHA256=%s\n' "$rendered"
+    } >"$activation"
+    printf '%s\n' "$version" >"$ROOT/fork-deploy/current"
+    chmod 0600 "$release"/* "$release/.env.production" "$activation" \
+        "$ROOT/fork-deploy/current" "$ROOT/source"/* "$ROOT/source/.env" "$ROOT/source/.env.production"
+    : >"$FORK_DEPLOY_RUNTIME_MARKER"
+    : >"$FORK_DEPLOY_DB_MARKER"
+    : >"$FORK_DEPLOY_REDIS_MARKER"
+    : >"$FORK_DEPLOY_LEGACY_REALTIME_MARKER"
+    rm -f "$FORK_DEPLOY_CANDIDATE_STARTED_MARKER" "$FORK_DEPLOY_LEGACY_REALTIME_STOPPED_MARKER"
+}
+
+write_manifest() {
+    local version=$1
+
+    write_assets
+    {
+        printf 'SCHEMA=coolify-fork-release/v2\n'
+        printf 'KEY_ID=%s\n' "$(manifest_key_id)"
+        printf 'VERSION=%s\n' "$version"
+        printf 'SOURCE_REVISION=%s\n' "$REVISION"
+        printf 'SOURCE_TAG=%s\n' "$version"
+        printf 'PLATFORM=linux/amd64\n'
+        printf 'MAIN_IMAGE=docker.iocloudhost.net/williamagh/coolify\n'
+        printf 'MAIN_INDEX_DIGEST=%s\n' "$DIGEST_A"
+        printf 'MAIN_PLATFORM_DIGEST=%s\n' "$DIGEST_A"
+        printf 'POSTGRES_IMAGE=docker.io/library/postgres\n'
+        printf 'POSTGRES_DIGEST=%s\n' "$DIGEST_C"
+        printf 'POSTGRES_MAJOR=16\n'
+        printf 'REDIS_IMAGE=docker.io/library/redis\n'
+        printf 'REDIS_DIGEST=%s\n' "$DIGEST_D"
+        printf 'REDIS_MAJOR=7\n'
+        printf 'MAIN_OCI_LABELS_SHA256=%064d\n' 1
+        printf 'MAIN_SBOM_SHA256=%064d\n' 3
+        printf 'MAIN_PROVENANCE_SHA256=%064d\n' 5
+        printf 'DOCKERFILE_MAIN_SHA256=%064d\n' 7
+        printf 'COMPOSE_SHA256=%s\n' "$(hash_file "$ASSETS/docker-compose.yml")"
+        printf 'COMPOSE_PROD_SHA256=%s\n' "$(hash_file "$ASSETS/docker-compose.prod.yml")"
+        printf 'COMPOSE_OVERLAY_SHA256=%s\n' "$(hash_file "$ASSETS/docker-compose.custom.yml")"
+        printf 'ENV_PRODUCTION_SHA256=%s\n' "$(hash_file "$ASSETS/.env.production")"
+    } >"$MANIFEST_FILE"
+    if [[ ${FORK_DEPLOY_USE_REAL_OPENSSL:-false} == true ]]; then
+        sign_manifest
+    else
+        : >"$MANIFEST_FILE.sig"
+    fi
 }
 
 install_release() {
@@ -357,7 +470,7 @@ test_real_compose_config_when_available() {
 
     new_fixture
     write_assets
-    printf 'APP_PORT=8010\nSOKETI_PORT=6011\n' >"$FIXTURE/real-compose.env"
+    printf 'APP_PORT=8010\nPUSHER_PORT=6011\nTERMINAL_PORT=6012\n' >"$FIXTURE/real-compose.env"
     {
         printf 'services:\n'
         printf '  coolify:\n'
@@ -376,27 +489,26 @@ test_real_compose_config_when_available() {
     ) \
         && jq -e '
             ([.services[]?.ports[]?] | length) == 3
-            and (.services.coolify.ports | length) == 1
-            and (.services.soketi.ports | length) == 2
+            and (.services.coolify.ports | length) == 3
             and ([.services.coolify.ports[]
                 | select((.target | tostring) == "8080"
                     and (.published | tostring) == "8010"
                     and ((.host_ip // "") == ""
                         or .host_ip == "0.0.0.0"
                         or .host_ip == "::"))] | length) == 1
-            and ([.services.soketi.ports[]
+            and ([.services.coolify.ports[]
                 | select((.target | tostring) == "6001"
                     and (.published | tostring) == "6011"
                     and .host_ip == "127.0.0.1")] | length) == 1
-            and ([.services.soketi.ports[]
+            and ([.services.coolify.ports[]
                 | select((.target | tostring) == "6002"
-                    and (.published | tostring) == "6002"
+                    and (.published | tostring) == "6012"
                     and .host_ip == "127.0.0.1")] | length) == 1
         ' <<<"$output" >/dev/null \
         && [[ $output != *'9999'* ]]; then
-        pass 'real Compose config honors !override, public APP_PORT, and loopback realtime ports'
+        pass 'real Compose config honors !override, public APP_PORT, and loopback Reverb and terminal ports'
     else
-        fail 'real Compose config honors !override, public APP_PORT, and loopback realtime ports'
+        fail 'real Compose config honors !override, public APP_PORT, and loopback Reverb and terminal ports'
     fi
     cleanup_fixture
 }
@@ -587,6 +699,237 @@ test_update_requires_healthy_current_runtime() {
         pass 'update requires a healthy current runtime'
     else
         fail 'update requires a healthy current runtime'
+    fi
+    cleanup_fixture
+}
+
+test_update_removes_exact_legacy_realtime_container() {
+    new_fixture
+    write_manifest 4.13.0-fork.1
+    if ! install_release >/dev/null; then
+        fail 'update removes the exact legacy realtime container'
+        cleanup_fixture
+        return
+    fi
+    : >"$FORK_DEPLOY_LEGACY_REALTIME_MARKER"
+    write_manifest 4.13.0-fork.2
+    : >"$LOG"
+    if update_release >/dev/null \
+        && [[ ! -e $FORK_DEPLOY_LEGACY_REALTIME_MARKER ]] \
+        && grep -Fxq 'docker container inspect coolify-realtime' "$LOG" \
+        && grep -Fxq 'docker container rm --force coolify-realtime' "$LOG"; then
+        pass 'update removes the exact legacy realtime container'
+    else
+        fail 'update removes the exact legacy realtime container'
+    fi
+    cleanup_fixture
+}
+
+test_signed_v1_current_updates_one_way_to_v2() {
+    new_fixture
+    seed_v1_current 4.13.0-fork.1
+    write_manifest 4.13.0-fork.2
+    : >"$LOG"
+    local stop_line reverb_line terminal_line remove_line first_up
+    if update_release >/dev/null; then
+        stop_line=$(grep -nFx 'docker container stop coolify-realtime' "$LOG" | head -1 | cut -d: -f1)
+        reverb_line=$(grep -nF 'docker exec coolify curl --fail --silent --show-error http://127.0.0.1:6001/up' "$LOG" | head -1 | cut -d: -f1)
+        terminal_line=$(grep -nF 'docker exec coolify curl --fail --silent --show-error http://127.0.0.1:6002/ready' "$LOG" | head -1 | cut -d: -f1)
+        remove_line=$(grep -nFx 'docker container rm --force coolify-realtime' "$LOG" | head -1 | cut -d: -f1)
+        first_up=$(grep -n 'docker compose .* up ' "$LOG" | head -1)
+    fi
+    if [[ ${stop_line:-0} -gt 0 \
+        && ${reverb_line:-0} -gt $stop_line \
+        && ${terminal_line:-0} -gt $stop_line \
+        && ${remove_line:-0} -gt $reverb_line \
+        && ${remove_line:-0} -gt $terminal_line \
+        && ${first_up:-} != *--remove-orphans* \
+        && $(<"$ROOT/fork-deploy/current") == 4.13.0-fork.2 \
+        && ! -e $FORK_DEPLOY_LEGACY_REALTIME_MARKER \
+        && -f $ROOT/fork-deploy/releases/4.13.0-fork.1/release.manifest ]]; then
+        pass 'signed v1 current updates one-way to a proven v2 bundled runtime'
+    else
+        fail 'signed v1 current updates one-way to a proven v2 bundled runtime'
+    fi
+    cleanup_fixture
+}
+
+test_unsigned_v1_current_is_rejected() {
+    new_fixture
+    seed_v1_current 4.13.0-fork.1
+    : >"$ROOT/fork-deploy/releases/4.13.0-fork.1/release.manifest.sig"
+    : >"$LOG"
+    local output
+    if output=$("$SUBJECT" verify 2>&1); then
+        fail 'unsigned v1 current is rejected before runtime mutation'
+    elif [[ $output == *'signature verification failed'* \
+        && $output != *'healthy and matches'* ]] \
+        && ! grep -q 'compose .* up' "$LOG"; then
+        pass 'unsigned v1 current is rejected before runtime mutation'
+    else
+        printf 'unsigned-v1 output: %s\n' "$output" >&2
+        fail 'unsigned v1 current is rejected before runtime mutation'
+    fi
+    cleanup_fixture
+}
+
+test_tampered_v1_current_is_rejected() {
+    new_fixture
+    seed_v1_current 4.13.0-fork.1
+    printf 'TAMPERED=true\n' >>"$ROOT/fork-deploy/releases/4.13.0-fork.1/release.manifest"
+    : >"$LOG"
+    local output
+    if output=$("$SUBJECT" verify 2>&1); then
+        fail 'tampered v1 current is rejected before runtime mutation'
+    elif [[ $output == *'signature verification failed'* ]] \
+        && ! grep -q 'compose .* up' "$LOG"; then
+        pass 'tampered v1 current is rejected before runtime mutation'
+    else
+        printf 'tampered-v1 output: %s\n' "$output" >&2
+        fail 'tampered v1 current is rejected before runtime mutation'
+    fi
+    cleanup_fixture
+}
+
+test_v1_asset_digest_mismatch_is_rejected() {
+    new_fixture
+    seed_v1_current 4.13.0-fork.1
+    printf 'tampered\n' >>"$ROOT/fork-deploy/releases/4.13.0-fork.1/docker-compose.custom.yml"
+    write_manifest 4.13.0-fork.2
+    : >"$LOG"
+    local output
+    if output=$(update_release 2>&1); then
+        fail 'v1 current asset digests are verified before migration'
+    elif [[ $output == *'recorded release asset hash mismatch: docker-compose.custom.yml'* \
+        && $(<"$ROOT/fork-deploy/current") == 4.13.0-fork.1 ]] \
+        && ! grep -q 'compose .* up' "$LOG"; then
+        pass 'v1 current asset digests are verified before migration'
+    else
+        fail 'v1 current asset digests are verified before migration'
+    fi
+    cleanup_fixture
+}
+
+test_v1_runtime_digest_mismatch_is_rejected() {
+    new_fixture
+    seed_v1_current 4.13.0-fork.1
+    write_manifest 4.13.0-fork.2
+    export FORK_DEPLOY_FAIL_LEGACY_RUNTIME_VERIFY=true
+    : >"$LOG"
+    local output
+    if output=$(update_release 2>&1); then
+        unset FORK_DEPLOY_FAIL_LEGACY_RUNTIME_VERIFY
+        fail 'v1 current runtime digests are verified before migration'
+        cleanup_fixture
+        return
+    fi
+    unset FORK_DEPLOY_FAIL_LEGACY_RUNTIME_VERIFY
+    if [[ $output == *'legacy coolify-realtime runs'* \
+        && $(<"$ROOT/fork-deploy/current") == 4.13.0-fork.1 ]] \
+        && ! grep -q 'compose .* up' "$LOG"; then
+        pass 'v1 current runtime digests are verified before migration'
+    else
+        fail 'v1 current runtime digests are verified before migration'
+    fi
+    cleanup_fixture
+}
+
+test_v1_candidate_is_rejected() {
+    new_fixture
+    export FORK_DEPLOY_USE_REAL_OPENSSL=true
+    write_v1_manifest 4.13.0-fork.1
+    local output
+    if output=$(install_release 2>&1); then
+        fail 'v1 candidate manifests are rejected for new installs'
+    elif [[ $output == *'v1 manifests are accepted only for the active predecessor of a v2 update'* \
+        && ! -e $ROOT/fork-deploy/current ]]; then
+        pass 'v1 candidate manifests are rejected for new installs'
+    else
+        fail 'v1 candidate manifests are rejected for new installs'
+    fi
+    cleanup_fixture
+}
+
+test_v1_rollback_is_rejected_after_migration() {
+    new_fixture
+    seed_v1_current 4.13.0-fork.1
+    write_manifest 4.13.0-fork.2
+    if ! update_release >/dev/null; then
+        fail 'v1 recorded releases cannot be rollback targets after migration'
+        cleanup_fixture
+        return
+    fi
+    : >"$LOG"
+    local output
+    if output=$("$SUBJECT" rollback --version 4.13.0-fork.1 2>&1); then
+        fail 'v1 recorded releases cannot be rollback targets after migration'
+    elif [[ $output == *'v1 manifests are accepted only for the active predecessor of a v2 update'* \
+        && $(<"$ROOT/fork-deploy/current") == 4.13.0-fork.2 ]] \
+        && ! grep -q 'compose .* up' "$LOG"; then
+        pass 'v1 recorded releases cannot be rollback targets after migration'
+    else
+        printf 'v1-rollback output: %s\n' "$output" >&2
+        fail 'v1 recorded releases cannot be rollback targets after migration'
+    fi
+    cleanup_fixture
+}
+
+test_legacy_removal_waits_for_bundled_route_proof() {
+    new_fixture
+    seed_v1_current 4.13.0-fork.1
+    write_manifest 4.13.0-fork.2
+    export FORK_DEPLOY_FAIL_BUNDLED_ROUTE_PROOF=true
+    : >"$LOG"
+    if update_release >/dev/null 2>&1; then
+        unset FORK_DEPLOY_FAIL_BUNDLED_ROUTE_PROOF
+        fail 'legacy realtime removal waits for bundled route proof'
+        cleanup_fixture
+        return
+    fi
+    unset FORK_DEPLOY_FAIL_BUNDLED_ROUTE_PROOF
+    if [[ -e $FORK_DEPLOY_LEGACY_REALTIME_MARKER \
+        && -e $ROOT/fork-deploy/forward-recovery ]] \
+        && ! grep -Fxq 'docker container rm --force coolify-realtime' "$LOG"; then
+        pass 'legacy realtime removal waits for bundled route proof'
+    else
+        fail 'legacy realtime removal waits for bundled route proof'
+    fi
+    cleanup_fixture
+}
+
+test_partial_legacy_removal_recovers_forward() {
+    new_fixture
+    seed_v1_current 4.13.0-fork.1
+    write_manifest 4.13.0-fork.2
+    export FORK_DEPLOY_FAIL_LEGACY_REALTIME_REMOVE=true
+    : >"$LOG"
+    if update_release >/dev/null 2>&1; then
+        unset FORK_DEPLOY_FAIL_LEGACY_REALTIME_REMOVE
+        fail 'partial legacy realtime removal remains forward-recoverable'
+        cleanup_fixture
+        return
+    fi
+    unset FORK_DEPLOY_FAIL_LEGACY_REALTIME_REMOVE
+    local remove_line reverb_line recovered=false partial_state=false
+    remove_line=$(grep -nFx 'docker container rm --force coolify-realtime' "$LOG" | head -1 | cut -d: -f1)
+    reverb_line=$(grep -nF 'docker exec coolify curl --fail --silent --show-error http://127.0.0.1:6001/up' "$LOG" | head -1 | cut -d: -f1)
+    if [[ -e $FORK_DEPLOY_LEGACY_REALTIME_MARKER \
+        && -e $FORK_DEPLOY_LEGACY_REALTIME_STOPPED_MARKER \
+        && -e $ROOT/fork-deploy/forward-recovery ]]; then
+        partial_state=true
+    fi
+    if "$SUBJECT" recover-forward >/dev/null; then
+        recovered=true
+    fi
+    if [[ ${remove_line:-0} -gt ${reverb_line:-0} \
+        && $partial_state == true \
+        && $recovered == true \
+        && $(<"$ROOT/fork-deploy/current") == 4.13.0-fork.2 \
+        && ! -e $FORK_DEPLOY_LEGACY_REALTIME_MARKER \
+        && ! -e $ROOT/fork-deploy/forward-recovery ]]; then
+        pass 'partial legacy realtime removal remains forward-recoverable'
+    else
+        fail 'partial legacy realtime removal remains forward-recoverable'
     fi
     cleanup_fixture
 }
@@ -913,6 +1256,20 @@ test_invalid_ports_fail_before_activation() {
     cleanup_fixture
 }
 
+test_normalizes_legacy_pusher_app_port() {
+    new_fixture
+    export FORK_DEPLOY_ENV_EXTRA=$'PUSHER_PORT=8080\n'
+    write_manifest 4.13.0-fork.1
+    if install_release >/dev/null \
+        && grep -Fxq 'PUSHER_PORT=6001' "$ROOT/source/.env" \
+        && ! grep -Fxq 'PUSHER_PORT=8080' "$ROOT/source/.env"; then
+        pass 'legacy PUSHER_PORT 8080 is normalized to the Reverb port'
+    else
+        fail 'legacy PUSHER_PORT 8080 is normalized to the Reverb port'
+    fi
+    cleanup_fixture
+}
+
 test_effective_compose_rejects_loopback_app_binding() {
     new_fixture
     export FORK_DEPLOY_COMPOSE_APP_LOOPBACK=true
@@ -920,7 +1277,7 @@ test_effective_compose_rejects_loopback_app_binding() {
     local output
     if output=$(install_release 2>&1); then
         fail 'effective Compose rejects a loopback APP_PORT binding'
-    elif [[ $output == *'one public APP_PORT and two loopback realtime bindings'* ]] \
+    elif [[ $output == *'publish APP_PORT publicly and Reverb/terminal ports on loopback'* ]] \
         && [[ ! -e $ROOT/source/docker-compose.yml ]]; then
         pass 'effective Compose rejects a loopback APP_PORT binding'
     else
@@ -948,7 +1305,7 @@ test_effective_compose_rejects_swapped_bindings() {
     local output
     if output=$(install_release 2>&1); then
         fail 'effective Compose associates host bindings with their service and target'
-    elif [[ $output == *'one public APP_PORT and two loopback realtime bindings'* ]] \
+    elif [[ $output == *'publish APP_PORT publicly and Reverb/terminal ports on loopback'* ]] \
         && [[ ! -e $ROOT/source/docker-compose.yml ]]; then
         pass 'effective Compose associates host bindings with their service and target'
     else
@@ -1116,7 +1473,8 @@ test_rejects_out_of_order_manifest_schema() {
     local output
     if output=$(install_release 2>&1); then
         fail 'manifest schema fields must be canonical and ordered'
-    elif [[ $output == *'unexpected, duplicate, or out-of-order field'* ]]; then
+    elif [[ $output == *'release manifest must begin with SCHEMA'* \
+        || $output == *'unexpected, duplicate, or out-of-order field'* ]]; then
         pass 'manifest schema fields must be canonical and ordered'
     else
         fail 'manifest schema fields must be canonical and ordered'
@@ -1745,6 +2103,28 @@ test_uses_migrated_github_raw_base() {
     fi
 }
 
+if [[ ${FORK_DEPLOY_TEST_FILTER:-} == port-normalization ]]; then
+    test_normalizes_legacy_pusher_app_port
+    printf '%s passing, %s failing\n' "$PASS" "$FAIL"
+    ((FAIL == 0))
+    exit
+fi
+
+if [[ ${FORK_DEPLOY_TEST_FILTER:-} == legacy-v1-bridge ]]; then
+    test_signed_v1_current_updates_one_way_to_v2
+    test_unsigned_v1_current_is_rejected
+    test_tampered_v1_current_is_rejected
+    test_v1_asset_digest_mismatch_is_rejected
+    test_v1_runtime_digest_mismatch_is_rejected
+    test_v1_candidate_is_rejected
+    test_v1_rollback_is_rejected_after_migration
+    test_legacy_removal_waits_for_bundled_route_proof
+    test_partial_legacy_removal_recovers_forward
+    printf '%s passing, %s failing\n' "$PASS" "$FAIL"
+    ((FAIL == 0))
+    exit
+fi
+
 if [[ ${FORK_DEPLOY_TEST_FILTER:-} == control-plane-listener ]]; then
     test_update_preserves_control_plane_listener_override
     test_update_rejects_symlinked_control_plane_listener_override
@@ -1772,6 +2152,16 @@ test_install_rejects_zero_historical_suffix
 test_accepts_real_ed25519_raw_signature
 test_update_requires_verified_current_release
 test_update_requires_healthy_current_runtime
+test_update_removes_exact_legacy_realtime_container
+test_signed_v1_current_updates_one_way_to_v2
+test_unsigned_v1_current_is_rejected
+test_tampered_v1_current_is_rejected
+test_v1_asset_digest_mismatch_is_rejected
+test_v1_runtime_digest_mismatch_is_rejected
+test_v1_candidate_is_rejected
+test_v1_rollback_is_rejected_after_migration
+test_legacy_removal_waits_for_bundled_route_proof
+test_partial_legacy_removal_recovers_forward
 test_repair_never_rewrites_verified_bundle
 test_repair_rejects_corrupted_recorded_asset
 test_help_and_parser_describe_forward_recovery
@@ -1782,6 +2172,7 @@ test_forward_recovery_forbids_mismatch_abort_and_rollback
 test_forward_recovery_reconciles_historical_rollback_activation
 test_forward_recovery_requires_recorded_bundle
 test_invalid_ports_fail_before_activation
+test_normalizes_legacy_pusher_app_port
 test_effective_compose_rejects_loopback_app_binding
 test_effective_compose_accepts_default_public_app_binding
 test_effective_compose_rejects_swapped_bindings

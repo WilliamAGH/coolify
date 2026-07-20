@@ -90,8 +90,8 @@ function prepareControlPlaneEnrollment(
             ],
         ] : [],
         preservedServices: $supplyExplicitFragments ? [
-            'coolify-realtime' => ['loadBalancer' => ['servers' => [['url' => 'http://coolify-realtime:6001']]]],
-            'coolify-terminal' => ['loadBalancer' => ['servers' => [['url' => 'http://coolify-realtime:6002']]]],
+            'coolify-realtime' => ['loadBalancer' => ['servers' => [['url' => 'http://coolify:6001']]]],
+            'coolify-terminal' => ['loadBalancer' => ['servers' => [['url' => 'http://coolify:6002']]]],
         ] : [],
         preservedMiddlewares: $supplyExplicitFragments ? ['gzip' => ['compress' => true]] : [],
         hasProvenAlternateRoute: $hasProvenAlternateRoute,

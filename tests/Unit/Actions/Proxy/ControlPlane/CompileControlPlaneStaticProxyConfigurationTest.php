@@ -26,7 +26,11 @@ function controlPlaneSourceCompose(): string
         'services' => [
             'coolify' => [
                 'image' => 'coolify:test',
-                'ports' => ['${APP_PORT:-8000}:8080'],
+                'ports' => [
+                    '${APP_PORT:-8000}:8080',
+                    '${PUSHER_PORT:-${SOKETI_PORT:-6001}}:6001',
+                    '${TERMINAL_PORT:-6002}:6002',
+                ],
                 'environment' => ['APP_ENV=production'],
             ],
             'postgres' => ['image' => 'postgres:15-alpine'],

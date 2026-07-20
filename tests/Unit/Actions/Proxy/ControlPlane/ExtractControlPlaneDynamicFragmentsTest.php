@@ -40,13 +40,13 @@ it('extracts deterministic realtime and terminal fragments with their local depe
                 ],
                 'terminal-backend' => [
                     'loadBalancer' => [
-                        'servers' => [['url' => 'http://coolify-realtime:6002']],
+                        'servers' => [['url' => 'http://coolify:6002']],
                     ],
                 ],
                 'realtime-route' => [
                     'middlewares' => ['service-header'],
                     'loadBalancer' => [
-                        'servers' => [['url' => 'http://coolify-realtime:6001']],
+                        'servers' => [['url' => 'http://coolify:6001']],
                     ],
                 ],
                 'error-pages' => [
@@ -160,6 +160,70 @@ it('returns empty maps when the optional websocket routes are absent', function 
     ]);
 });
 
+it('migrates exact legacy realtime container backends while preserving enrolled route names', function (): void {
+    $fragments = ExtractControlPlaneDynamicFragments::run(controlPlaneDynamicSnapshot([
+        'http' => [
+            'routers' => [
+                'coolify-realtime-wss' => [
+                    'rule' => 'Host(`dashboard.example.test`) && PathPrefix(`/app`)',
+                    'entryPoints' => ['https'],
+                    'service' => 'coolify-realtime',
+                ],
+                'coolify-reverb-api-https' => [
+                    'rule' => 'Host(`dashboard.example.test`) && PathPrefix(`/apps`)',
+                    'entryPoints' => ['https'],
+                    'service' => 'coolify-realtime',
+                ],
+                'coolify-terminal-wss' => [
+                    'rule' => 'Host(`dashboard.example.test`) && PathPrefix(`/terminal/ws`)',
+                    'entryPoints' => ['https'],
+                    'service' => 'coolify-terminal',
+                ],
+            ],
+            'services' => [
+                'coolify-realtime' => [
+                    'loadBalancer' => [
+                        'servers' => [['url' => 'http://coolify-realtime:6001']],
+                    ],
+                ],
+                'coolify-terminal' => [
+                    'loadBalancer' => [
+                        'servers' => [['url' => 'http://coolify-realtime:6002']],
+                    ],
+                ],
+            ],
+        ],
+    ]));
+    $compiled = CompileControlPlaneDynamicConfiguration::run(
+        host: 'dashboard.example.test',
+        appPortEntrypoint: 'coolify',
+        activeBackendDnsNames: ['coolify-web-a'],
+        expectedRevision: 'generation-42',
+        expectedMember: 'blue',
+        configurationAcknowledgement: 'ack:'.str_repeat('a', 64),
+        healthCheckProof: str_repeat('b', 64),
+        realtimeRouterFragments: $fragments['realtimeRouterFragments'],
+        terminalRouterFragments: $fragments['terminalRouterFragments'],
+        preservedServices: $fragments['preservedServices'],
+        preservedMiddlewares: $fragments['preservedMiddlewares'],
+    );
+    $compiledDocument = Yaml::parse($compiled->yaml);
+
+    expect($fragments['realtimeRouterFragments'])->toHaveKey('coolify-realtime-wss')
+        ->toHaveKey('coolify-reverb-api-https')
+        ->and($fragments['terminalRouterFragments'])->toHaveKey('coolify-terminal-wss')
+        ->and($fragments['preservedServices']['coolify-realtime']['loadBalancer']['servers'])
+        ->toBe([['url' => 'http://coolify:6001']])
+        ->and($fragments['preservedServices']['coolify-terminal']['loadBalancer']['servers'])
+        ->toBe([['url' => 'http://coolify:6002']])
+        ->and($compiledDocument['http']['routers']['coolify-realtime-wss'])
+        ->toBe($fragments['realtimeRouterFragments']['coolify-realtime-wss'])
+        ->and($compiledDocument['http']['routers']['coolify-reverb-api-https'])
+        ->toBe($fragments['realtimeRouterFragments']['coolify-reverb-api-https'])
+        ->and($compiledDocument['http']['routers']['coolify-terminal-wss'])
+        ->toBe($fragments['terminalRouterFragments']['coolify-terminal-wss']);
+});
+
 it('rejects malformed, duplicate, and incomplete source configuration', function (): void {
     expect(fn (): array => ExtractControlPlaneDynamicFragments::run("http:\n  routers: [\n"))
         ->toThrow(InvalidArgumentException::class, 'invalid');
@@ -216,7 +280,7 @@ it('rejects missing and unsafe File-provider dependencies while retaining explic
             ],
             'services' => [
                 'realtime@docker' => [
-                    'loadBalancer' => ['servers' => [['url' => 'http://coolify-realtime:6001']]],
+                    'loadBalancer' => ['servers' => [['url' => 'http://coolify:6001']]],
                 ],
             ],
         ],
@@ -252,7 +316,7 @@ it('rejects ambiguous route matches and managed-name collisions', function (): v
                 ],
             ],
             'services' => [
-                'realtime' => ['loadBalancer' => ['servers' => [['url' => 'http://coolify-realtime:6001']]]],
+                'realtime' => ['loadBalancer' => ['servers' => [['url' => 'http://coolify:6001']]]],
             ],
         ],
     ])))->toThrow(InvalidArgumentException::class, 'ambiguously');
@@ -267,7 +331,7 @@ it('rejects ambiguous route matches and managed-name collisions', function (): v
                 ],
             ],
             'services' => [
-                'realtime' => ['loadBalancer' => ['servers' => [['url' => 'http://coolify-realtime:6001']]]],
+                'realtime' => ['loadBalancer' => ['servers' => [['url' => 'http://coolify:6001']]]],
             ],
         ],
     ])))->toThrow(InvalidArgumentException::class, 'managed');
@@ -298,7 +362,7 @@ it('rejects ambiguous route matches and managed-name collisions', function (): v
                 ],
             ],
             'services' => [
-                'realtime' => ['loadBalancer' => ['servers' => [['url' => 'http://coolify-realtime:6001']]]],
+                'realtime' => ['loadBalancer' => ['servers' => [['url' => 'http://coolify:6001']]]],
             ],
             'middlewares' => [
                 'coolify-control-plane-identity' => ['headers' => []],

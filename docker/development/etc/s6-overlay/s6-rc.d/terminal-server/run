@@ -1,0 +1,11 @@
+#!/bin/sh
+
+cd /var/www/html || exit 1
+
+if grep -qE '^TERMINAL_ENABLED=false' .env 2>/dev/null; then
+    echo "   INFO  Terminal websocket server is disabled, sleeping."
+    exec sleep infinity
+fi
+
+echo "   INFO  Terminal websocket server is enabled, starting..."
+exec node /terminal/terminal-server.js

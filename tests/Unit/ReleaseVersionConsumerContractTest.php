@@ -330,14 +330,11 @@ it('keeps the signed fork deployment path separate from the rejected generic upd
         ->not->toContain('bash scripts/upgrade.sh');
 });
 
-it('keeps helper and realtime versions consistent across versions.json, constants, and production compose', function () {
+it('keeps the helper version consistent across versions.json and constants', function () {
     $versions = releaseContractVersionsJson();
     $constants = releaseContractConstants();
 
     expect($versions['coolify']['helper']['version'])->toBe($constants['coolify']['helper_version'])
-        ->and($versions['coolify']['realtime']['version'])->toBe($constants['coolify']['realtime_version']);
-
-    $compose = Yaml::parseFile(releaseContractRepositoryRoot().'/docker-compose.prod.yml');
-    $realtimeImage = $compose['services']['soketi']['image'];
-    expect($realtimeImage)->toEndWith(':'.$constants['coolify']['realtime_version']);
+        ->and($versions['coolify'])->not->toHaveKey('realtime')
+        ->and($constants['coolify'])->not->toHaveKeys(['realtime_version', 'realtime_image']);
 });

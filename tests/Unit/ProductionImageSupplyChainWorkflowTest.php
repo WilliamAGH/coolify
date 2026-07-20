@@ -20,7 +20,6 @@ function releaseWorkflowTestDigest(string $character): string
 function releaseWorkflowPrepareForkPromotionRegistryDouble(
     string $fixture,
     ?string $mainSemanticDigest,
-    ?string $realtimeSemanticDigest,
 ): array {
     $filesystem = new Filesystem;
     $bin = $fixture.'/bin';
@@ -31,13 +30,11 @@ function releaseWorkflowPrepareForkPromotionRegistryDouble(
     file_put_contents($curlLog, '');
     file_put_contents($log, '');
     file_put_contents($state.'/main', ($mainSemanticDigest ?? 'absent')."\n");
-    file_put_contents($state.'/realtime', ($realtimeSemanticDigest ?? 'absent')."\n");
     file_put_contents($bin.'/regctl', <<<'SH'
 #!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "${REGCTL_LOG:?}"
 main=${MAIN_TARGET:?}
-realtime=${REALTIME_TARGET:?}
 semantic=${SEMANTIC_VERSION:?}
 state=${REGCTL_STATE:?}
 
@@ -57,23 +54,19 @@ case "$1:$2" in
             *' --platform linux/amd64 '*)
                 case "$reference" in
                     "$main"@*) printf '%s\n' "$MAIN_AMD64_DIGEST" ;;
-                    "$realtime"@*) printf '%s\n' "$REALTIME_AMD64_DIGEST" ;;
                     *) exit 64 ;;
                 esac
                 ;;
             *' --platform linux/arm64 '*)
                 case "$reference" in
                     "$main"@*) printf '%s\n' "$MAIN_ARM64_DIGEST" ;;
-                    "$realtime"@*) printf '%s\n' "$REALTIME_ARM64_DIGEST" ;;
                     *) exit 64 ;;
                 esac
                 ;;
             *)
                 case "$reference" in
                     "$main:$semantic") semantic_digest "$state/main" ;;
-                    "$realtime:$semantic") semantic_digest "$state/realtime" ;;
                     "$main"@*) printf '%s\n' "$MAIN_INDEX_DIGEST" ;;
-                    "$realtime"@*) printf '%s\n' "$REALTIME_INDEX_DIGEST" ;;
                     *) exit 64 ;;
                 esac
                 ;;
@@ -90,7 +83,6 @@ case "$1:$2" in
         destination=$4
         case "$destination" in
             "$main:$semantic") printf '%s\n' "$MAIN_INDEX_DIGEST" > "$state/main" ;;
-            "$realtime:$semantic") printf '%s\n' "$REALTIME_INDEX_DIGEST" > "$state/realtime" ;;
             *) exit 64 ;;
         esac
         ;;
@@ -157,10 +149,6 @@ SH);
             'MAIN_INDEX_DIGEST' => releaseWorkflowTestDigest('3'),
             'MAIN_TARGET' => 'docker.iocloudhost.net/williamagh/coolify',
             'PATH' => $bin.PATH_SEPARATOR.(getenv('PATH') ?: ''),
-            'REALTIME_AMD64_DIGEST' => releaseWorkflowTestDigest('4'),
-            'REALTIME_ARM64_DIGEST' => releaseWorkflowTestDigest('5'),
-            'REALTIME_INDEX_DIGEST' => releaseWorkflowTestDigest('6'),
-            'REALTIME_TARGET' => 'docker.iocloudhost.net/williamagh/coolify-realtime',
             'REGCTL_LOG' => $log,
             'REGCTL_STATE' => $state,
             'RUNNER_TEMP' => $fixture,
@@ -1049,7 +1037,7 @@ function mutateReleaseWorkflow(array $sharedWorkflow, array $callers, string $mu
         'misroute-fork-control-plane-census' => (function () use ($sharedWorkflow, $callers): array {
             foreach ($sharedWorkflow['jobs']['fork-build']['steps'] as &$step) {
                 if (($step['name'] ?? null) === 'Verify exact fork control-plane OCI runtime and content') {
-                    $step['if'] = "\${{ matrix.product == 'realtime' }}";
+                    $step['if'] = "\${{ matrix.product == 'non-main' }}";
                     break;
                 }
             }
@@ -2114,7 +2102,7 @@ SH);
     }
 });
 
-it('defines one referrerless fork release graph for both images and both platforms', function () {
+it('defines one referrerless fork release graph for the main image on both platforms', function () {
     $root = releaseWorkflowRepositoryRoot();
     $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
     $caller = Yaml::parseFile($root.'/.github/workflows/publish-fork.yml');
@@ -2135,8 +2123,6 @@ it('defines one referrerless fork release graph for both images and both platfor
     expect($contracts)->toBe([
         ['main', 'docker/production/Dockerfile', 'linux/amd64', 'ubuntu-24.04'],
         ['main', 'docker/production/Dockerfile', 'linux/arm64', 'ubuntu-24.04-arm'],
-        ['realtime', 'docker/coolify-realtime/Dockerfile', 'linux/amd64', 'ubuntu-24.04'],
-        ['realtime', 'docker/coolify-realtime/Dockerfile', 'linux/arm64', 'ubuntu-24.04-arm'],
     ]);
 
     $buildStep = releaseWorkflowStep(
@@ -2182,11 +2168,11 @@ it('defines one referrerless fork release graph for both images and both platfor
     )['run'] ?? '');
     $stageRun = (string) (releaseWorkflowStep(
         $jobs['fork-stage'] ?? [],
-        'Stage both fork products with inline build attestations',
+        'Stage the fork image with inline build attestations',
     )['run'] ?? '');
     $promotionRun = (string) (releaseWorkflowStep(
         $jobs['fork-release'] ?? [],
-        'Promote realtime first and main last as the fork release commit marker',
+        'Promote and verify the main fork image',
     )['run'] ?? '');
     $forkRegistryPolicyStepNames = collect(releaseWorkflowSteps($jobs['fork-registry-policy'] ?? []))
         ->pluck('name')
@@ -2199,7 +2185,6 @@ it('defines one referrerless fork release graph for both images and both platfor
         ->not->toContain('Reject existing fork semantic tags before build')
         ->and($stageRun)
         ->toContain('stage_product main coolify "$MAIN_TARGET"')
-        ->toContain('stage_product realtime coolify-realtime "$REALTIME_TARGET"')
         ->toContain('org.opencontainers.image.source')
         ->toContain('org.opencontainers.image.revision')
         ->toContain('org.opencontainers.image.version')
@@ -2211,8 +2196,6 @@ it('defines one referrerless fork release graph for both images and both platfor
         ->toContain('promote_or_verify_semantic_tag')
         ->toContain('does not match its expected immutable index digest')
         ->toContain('accepting recovery state')
-        ->toContain('Physical registry atomicity is impossible')
-        ->toContain('main tag as the final commit marker')
         ->toContain('assert_live_fork_tag_binding')
         ->toContain('assert_active_fork_tag_protection')
         ->toContain('Protect Coolify fork release tags')
@@ -2222,30 +2205,26 @@ it('defines one referrerless fork release graph for both images and both platfor
         ->toContain('index("deletion")')
         ->toContain('human authority remains a residual risk')
         ->toContain('preflight_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"')
-        ->toContain('preflight_semantic_tag "$REALTIME_TARGET" "$REALTIME_INDEX_DIGEST"')
-        ->toContain('promote_or_verify_semantic_tag "$REALTIME_TARGET" "$REALTIME_INDEX_DIGEST"')
         ->toContain('promote_or_verify_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"')
+        ->not->toContain('REALTIME_TARGET')
         ->not->toContain(':latest');
 
-    $preflightRealtimePosition = strpos($promotionRun, 'preflight_semantic_tag "$REALTIME_TARGET" "$REALTIME_INDEX_DIGEST"');
-    $preWriteTagVerificationPosition = strpos($promotionRun, 'assert_live_fork_tag_binding', $preflightRealtimePosition ?: 0);
-    $realtimePromotionPosition = strpos($promotionRun, 'promote_or_verify_semantic_tag "$REALTIME_TARGET" "$REALTIME_INDEX_DIGEST"');
+    $preflightMainPosition = strpos($promotionRun, 'preflight_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"');
+    $preWriteTagVerificationPosition = strpos($promotionRun, 'assert_live_fork_tag_binding', $preflightMainPosition ?: 0);
     $mainPromotionPosition = strpos($promotionRun, 'promote_or_verify_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"');
     $postWriteTagVerificationPosition = strpos($promotionRun, 'assert_live_fork_tag_binding', ($mainPromotionPosition ?: 0) + 1);
-    expect($preflightRealtimePosition)->not->toBeFalse()
+    expect($preflightMainPosition)->not->toBeFalse()
         ->and($preWriteTagVerificationPosition)->not->toBeFalse()
-        ->and($realtimePromotionPosition)->not->toBeFalse()
         ->and($mainPromotionPosition)->not->toBeFalse()
         ->and($postWriteTagVerificationPosition)->not->toBeFalse()
-        ->and($preWriteTagVerificationPosition)->toBeGreaterThan($preflightRealtimePosition)
-        ->and($realtimePromotionPosition)->toBeGreaterThan($preWriteTagVerificationPosition)
-        ->and($mainPromotionPosition)->toBeGreaterThan($realtimePromotionPosition)
+        ->and($preWriteTagVerificationPosition)->toBeGreaterThan($preflightMainPosition)
+        ->and($mainPromotionPosition)->toBeGreaterThan($preWriteTagVerificationPosition)
         ->and($postWriteTagVerificationPosition)->toBeGreaterThan($mainPromotionPosition);
 
     $attestationJob = $jobs['fork-attest'] ?? [];
     $forkAttestations = collect(releaseWorkflowSteps($attestationJob))
         ->filter(fn (array $step): bool => str_starts_with((string) ($step['uses'] ?? ''), 'actions/attest@'));
-    expect($forkAttestations)->toHaveCount(10);
+    expect($forkAttestations)->toHaveCount(6);
     foreach ($forkAttestations as $attestation) {
         expect($attestation['with']['push-to-registry'] ?? null)->toBeFalse()
             ->and($attestation['with']['create-storage-record'] ?? null)->toBeFalse();
@@ -2341,7 +2320,7 @@ it('defines one referrerless fork release graph for both images and both platfor
         releaseWorkflowSteps($forkRelease),
     );
     $draftRecoveryStepPosition = array_search('Create or validate empty draft recovery release before semantic promotion', $forkReleaseStepNames, true);
-    $promotionStepPosition = array_search('Promote realtime first and main last as the fork release commit marker', $forkReleaseStepNames, true);
+    $promotionStepPosition = array_search('Promote and verify the main fork image', $forkReleaseStepNames, true);
     $publicationStepPosition = array_search('Publish immutable signed fork bundles to the tag release', $forkReleaseStepNames, true);
     expect($draftRecoveryStepPosition)->not->toBeFalse()
         ->and($promotionStepPosition)->not->toBeFalse()
@@ -2481,14 +2460,14 @@ it('requires both fork application version sources to exactly match the immutabl
         $cases = [
             'matching version sources' => [$constants, $versions, true, ''],
             'constants version mismatch' => [
-                str_replace("'4.13.2-fork'", "'4.13.3-fork'", $constants),
+                str_replace("'4.13.3-fork'", "'4.13.4-fork'", $constants),
                 $versions,
                 false,
                 'config/constants.php Coolify version must equal the fork tag',
             ],
             'versions json mismatch' => [
                 $constants,
-                str_replace('"4.13.2-fork"', '"4.13.3-fork"', $versions),
+                str_replace('"4.13.3-fork"', '"4.13.4-fork"', $versions),
                 false,
                 'versions.json Coolify v4 version must equal the fork tag',
             ],
@@ -2499,7 +2478,7 @@ it('requires both fork application version sources to exactly match the immutabl
             file_put_contents($fixture.'/versions.json', $fixtureVersions);
             $process = new Process(['bash', '-c', $script], $root, [
                 'GITHUB_WORKSPACE' => $fixture,
-                'SEMANTIC_VERSION' => '4.13.2-fork',
+                'SEMANTIC_VERSION' => '4.13.3-fork',
             ]);
             $process->run();
 
@@ -2723,9 +2702,6 @@ it('emits the strict signed fork deploy manifest schema', function () {
         'MAIN_IMAGE',
         'MAIN_INDEX_DIGEST',
         'MAIN_PLATFORM_DIGEST',
-        'REALTIME_IMAGE',
-        'REALTIME_INDEX_DIGEST',
-        'REALTIME_PLATFORM_DIGEST',
         'POSTGRES_IMAGE',
         'POSTGRES_DIGEST',
         'POSTGRES_MAJOR',
@@ -2733,13 +2709,9 @@ it('emits the strict signed fork deploy manifest schema', function () {
         'REDIS_DIGEST',
         'REDIS_MAJOR',
         'MAIN_OCI_LABELS_SHA256',
-        'REALTIME_OCI_LABELS_SHA256',
         'MAIN_SBOM_SHA256',
-        'REALTIME_SBOM_SHA256',
         'MAIN_PROVENANCE_SHA256',
-        'REALTIME_PROVENANCE_SHA256',
         'DOCKERFILE_MAIN_SHA256',
-        'DOCKERFILE_REALTIME_SHA256',
         'COMPOSE_SHA256',
         'COMPOSE_PROD_SHA256',
         'COMPOSE_OVERLAY_SHA256',
@@ -2754,6 +2726,8 @@ it('emits the strict signed fork deploy manifest schema', function () {
     }
 
     expect($manifestRun)
+        ->toContain("printf 'SCHEMA=coolify-fork-release/v2\\n'")
+        ->not->toContain('REALTIME_')
         ->toContain('openssl pkeyutl -sign -rawin')
         ->toContain('openssl pkeyutl -verify -rawin -pubin')
         ->toContain('committed_public_key=docker/fork-release-signing-ed25519.pub')
@@ -2770,19 +2744,18 @@ it('emits the strict signed fork deploy manifest schema', function () {
         ->not->toContain('RELEASE_ASSET_MANIFEST_SHA256');
 });
 
-it('recovers a split fork semantic promotion without overwriting its matching peer', function () {
+it('accepts an idempotent fork semantic promotion without overwriting its matching image', function () {
     $root = releaseWorkflowRepositoryRoot();
     $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
     $promotionRun = (string) (releaseWorkflowStep(
         $workflow['jobs']['fork-release'] ?? [],
-        'Promote realtime first and main last as the fork release commit marker',
+        'Promote and verify the main fork image',
     )['run'] ?? '');
     $filesystem = new Filesystem;
     $fixture = sys_get_temp_dir().'/coolify-fork-split-recovery-'.bin2hex(random_bytes(8));
     $registry = releaseWorkflowPrepareForkPromotionRegistryDouble(
         $fixture,
         releaseWorkflowTestDigest('3'),
-        null,
     );
 
     try {
@@ -2794,9 +2767,7 @@ it('recovers a split fork semantic promotion without overwriting its matching pe
             ->and($process->getOutput())->toContain('accepting recovery state')
             ->and($registryLog)
             ->not->toContain('image copy docker.iocloudhost.net/williamagh/coolify@'.releaseWorkflowTestDigest('3').' docker.iocloudhost.net/williamagh/coolify:4.13.1-fork')
-            ->toContain('image copy docker.iocloudhost.net/williamagh/coolify-realtime@'.releaseWorkflowTestDigest('6').' docker.iocloudhost.net/williamagh/coolify-realtime:4.13.1-fork')
             ->and(trim((string) file_get_contents($registry['state'].'/main')))->toBe(releaseWorkflowTestDigest('3'))
-            ->and(trim((string) file_get_contents($registry['state'].'/realtime')))->toBe(releaseWorkflowTestDigest('6'))
             ->and(substr_count((string) file_get_contents($registry['curl_log']), '/git/ref/tags/4.13.1-fork'))->toBe(2)
             ->and(substr_count((string) file_get_contents($registry['curl_log']), 'rulesets?targets=tag&includes_parents=true&per_page=100'))->toBe(2);
     } finally {
@@ -2809,11 +2780,11 @@ it('fails closed on missing fork tag protection before any semantic registry wri
     $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
     $promotionRun = (string) (releaseWorkflowStep(
         $workflow['jobs']['fork-release'] ?? [],
-        'Promote realtime first and main last as the fork release commit marker',
+        'Promote and verify the main fork image',
     )['run'] ?? '');
     $filesystem = new Filesystem;
     $fixture = sys_get_temp_dir().'/coolify-fork-ruleset-rejection-'.bin2hex(random_bytes(8));
-    $registry = releaseWorkflowPrepareForkPromotionRegistryDouble($fixture, null, null);
+    $registry = releaseWorkflowPrepareForkPromotionRegistryDouble($fixture, null);
     $registry['environment']['FORK_RULESET_STATE'] = 'missing-deletion';
 
     try {
@@ -2823,8 +2794,7 @@ it('fails closed on missing fork tag protection before any semantic registry wri
         expect($process->isSuccessful())->toBeFalse()
             ->and($process->getErrorOutput())->toContain('creation, update, and deletion controls')
             ->and((string) file_get_contents($registry['log']))->not->toContain('image copy')
-            ->and(trim((string) file_get_contents($registry['state'].'/main')))->toBe('absent')
-            ->and(trim((string) file_get_contents($registry['state'].'/realtime')))->toBe('absent');
+            ->and(trim((string) file_get_contents($registry['state'].'/main')))->toBe('absent');
     } finally {
         $filesystem->remove($fixture);
     }
@@ -2835,11 +2805,11 @@ it('fails closed when the live fork tag no longer resolves to the workflow sourc
     $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
     $promotionRun = (string) (releaseWorkflowStep(
         $workflow['jobs']['fork-release'] ?? [],
-        'Promote realtime first and main last as the fork release commit marker',
+        'Promote and verify the main fork image',
     )['run'] ?? '');
     $filesystem = new Filesystem;
     $fixture = sys_get_temp_dir().'/coolify-fork-live-tag-rejection-'.bin2hex(random_bytes(8));
-    $registry = releaseWorkflowPrepareForkPromotionRegistryDouble($fixture, null, null);
+    $registry = releaseWorkflowPrepareForkPromotionRegistryDouble($fixture, null);
     $registry['environment']['FORK_LIVE_TAG_STATE'] = 'mismatch';
 
     try {
@@ -2849,26 +2819,24 @@ it('fails closed when the live fork tag no longer resolves to the workflow sourc
         expect($process->isSuccessful())->toBeFalse()
             ->and($process->getErrorOutput())->toContain('no longer resolves to the immutable workflow source revision')
             ->and((string) file_get_contents($registry['log']))->not->toContain('image copy')
-            ->and(trim((string) file_get_contents($registry['state'].'/main')))->toBe('absent')
-            ->and(trim((string) file_get_contents($registry['state'].'/realtime')))->toBe('absent');
+            ->and(trim((string) file_get_contents($registry['state'].'/main')))->toBe('absent');
     } finally {
         $filesystem->remove($fixture);
     }
 });
 
-it('rejects a mismatched fork semantic tag before it promotes a missing peer', function () {
+it('rejects a mismatched fork semantic tag before any registry write', function () {
     $root = releaseWorkflowRepositoryRoot();
     $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
     $promotionRun = (string) (releaseWorkflowStep(
         $workflow['jobs']['fork-release'] ?? [],
-        'Promote realtime first and main last as the fork release commit marker',
+        'Promote and verify the main fork image',
     )['run'] ?? '');
     $filesystem = new Filesystem;
     $fixture = sys_get_temp_dir().'/coolify-fork-mismatch-rejection-'.bin2hex(random_bytes(8));
     $registry = releaseWorkflowPrepareForkPromotionRegistryDouble(
         $fixture,
         releaseWorkflowTestDigest('f'),
-        null,
     );
 
     try {
@@ -2878,7 +2846,7 @@ it('rejects a mismatched fork semantic tag before it promotes a missing peer', f
         expect($process->isSuccessful())->toBeFalse()
             ->and($process->getErrorOutput())->toContain('does not match its expected immutable index digest')
             ->and((string) file_get_contents($registry['log']))->not->toContain('image copy')
-            ->and(trim((string) file_get_contents($registry['state'].'/realtime')))->toBe('absent');
+            ->and(trim((string) file_get_contents($registry['state'].'/main')))->toBe(releaseWorkflowTestDigest('f'));
     } finally {
         $filesystem->remove($fixture);
     }

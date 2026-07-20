@@ -1,15 +1,20 @@
 <?php
 
-it('copies the realtime terminal utilities into the container image', function () {
-    $dockerfile = file_get_contents(base_path('docker/coolify-realtime/Dockerfile'));
+it('copies the terminal utilities into each Coolify container image', function (string $dockerfilePath) {
+    $dockerfile = file_get_contents(base_path($dockerfilePath));
 
-    expect($dockerfile)->toContain('COPY docker/coolify-realtime/terminal-utils.js /terminal/terminal-utils.js');
-});
+    expect($dockerfile)->toMatch('/COPY(?: --chown=[^ ]+)? docker\/coolify-terminal\/terminal-utils\.js \/terminal\/terminal-utils\.js/');
+})->with([
+    'production image' => 'docker/production/Dockerfile',
+    'development image' => 'docker/development/Dockerfile',
+]);
 
-it('mounts the realtime terminal utilities in local development compose files', function (string $composeFile) {
+it('does not depend on terminal source bind mounts in local development compose files', function (string $composeFile) {
     $composeContents = file_get_contents(base_path($composeFile));
 
-    expect($composeContents)->toContain('./docker/coolify-realtime/terminal-utils.js:/terminal/terminal-utils.js');
+    expect($composeContents)
+        ->not->toContain('docker/coolify-terminal')
+        ->not->toContain('coolify-realtime');
 })->with([
     'default dev compose' => 'docker-compose.dev.yml',
     'maxio dev compose' => 'docker-compose-maxio.dev.yml',
@@ -38,18 +43,19 @@ it('registers the terminal Alpine provider before Livewire initializes navigated
         ->toContain('terminalComponentRegistered = true;');
 });
 
-it('keeps realtime terminal server logging behind the explicit debug flag', function () {
-    $terminalServer = file_get_contents(base_path('docker/coolify-realtime/terminal-server.js'));
+it('keeps terminal server logging behind the explicit debug flag', function () {
+    $terminalServer = file_get_contents(base_path('docker/coolify-terminal/terminal-server.js'));
 
     expect($terminalServer)
         ->toContain('const debugOverride = String(process.env.TERMINAL_DEBUG')
         ->toContain("['1', 'true', 'yes', 'on'].includes(debugOverride)")
+        ->toContain("process.env.TERMINAL_AUTH_HOST || process.env.COOLIFY_INTERNAL_HOST || '127.0.0.1'")
         ->toContain('if (!terminalDebugEnabled) {')
         ->not->toContain("console.log('Coolify realtime terminal server listening on port 6002. Let the hacking begin!');");
 });
 
 it('configures a server-initiated WebSocket heartbeat to survive proxy idle timeouts', function () {
-    $terminalServer = file_get_contents(base_path('docker/coolify-realtime/terminal-server.js'));
+    $terminalServer = file_get_contents(base_path('docker/coolify-terminal/terminal-server.js'));
 
     expect($terminalServer)
         ->toContain('ws.isAlive = true;')
@@ -74,7 +80,7 @@ it('uses a fast probe timeout when the tab regains visibility', function () {
 });
 
 it('does not hard close terminal sessions after 30 minutes on the server', function () {
-    $terminalServer = file_get_contents(base_path('docker/coolify-realtime/terminal-server.js'));
+    $terminalServer = file_get_contents(base_path('docker/coolify-terminal/terminal-server.js'));
 
     expect($terminalServer)
         ->not->toContain('IDLE_TIMEOUT_MS = 30 * 60 * 1000')
@@ -123,8 +129,8 @@ it('replays the last command on reconnect so the PTY respawns automatically', fu
         ->toContain('this.lastSentCommand = null;');
 });
 
-it('buffers messages received before the realtime server finishes auth so the replay is not lost', function () {
-    $terminalServer = file_get_contents(base_path('docker/coolify-realtime/terminal-server.js'));
+it('buffers messages received before the terminal server finishes auth so the replay is not lost', function () {
+    $terminalServer = file_get_contents(base_path('docker/coolify-terminal/terminal-server.js'));
 
     expect($terminalServer)
         ->toContain('authReady: false')
