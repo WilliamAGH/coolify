@@ -2,6 +2,7 @@
 
 namespace App\Actions\Proxy;
 
+use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\ProxyTypes;
 use App\Models\Application;
 use App\Models\StandaloneDocker;
@@ -138,6 +139,21 @@ class CompileBlueGreenProxyConfiguration
         $services = [];
         foreach ($target->ports as $backendPort) {
             $activeServiceName = $target->activeServiceNameForBackendPort($applicationUuid, $backendPort);
+            if ($target->usesExplicitReplicaBackends) {
+                foreach (BlueGreenDeploymentColor::cases() as $color) {
+                    $services[BlueGreenRoutingTarget::memberServiceNameForPort(
+                        $applicationUuid,
+                        $target->destinationId,
+                        $color,
+                        $backendPort,
+                        count($target->ports) > 1,
+                    )] = $this->serviceForBackends(
+                        $target->replicaBackends($color),
+                        $backendPort,
+                        $target->failoverHealthCheck(),
+                    );
+                }
+            }
             if ($target->mode !== BlueGreenRoutingMode::ProbeOnly) {
                 $services[$activeServiceName] = [
                     'weighted' => [
@@ -155,17 +171,21 @@ class CompileBlueGreenProxyConfiguration
             if ($target->mode !== BlueGreenRoutingMode::ProbeOnly && $target->fallbackContainerName !== null) {
                 $candidateServiceName = $this->failoverServiceName($namePrefix, 'candidate-main', $target, $backendPort);
                 $fallbackServiceName = $this->failoverServiceName($namePrefix, 'previous-fallback', $target, $backendPort);
-                $services[$candidateServiceName] = $this->service(
-                    $target->containerName($target->activeColor),
-                    $backendPort,
-                    $target->failoverHealthCheck(),
-                );
-                $services[$fallbackServiceName] = $this->service(
-                    $target->fallbackContainerName
-                        ?? throw new InvalidArgumentException('A failover route has no exact previous backend identity.'),
-                    $backendPort,
-                    $target->failoverHealthCheck(),
-                );
+                $services[$candidateServiceName] = $target->usesExplicitReplicaBackends
+                    ? $this->serviceForBackends($target->activeReplicaBackends(), $backendPort, $target->failoverHealthCheck())
+                    : $this->service(
+                        $target->containerName($target->activeColor),
+                        $backendPort,
+                        $target->failoverHealthCheck(),
+                    );
+                $services[$fallbackServiceName] = $target->usesExplicitReplicaBackends
+                    ? $this->serviceForBackends($target->inactiveReplicaBackends(), $backendPort, $target->failoverHealthCheck())
+                    : $this->service(
+                        $target->fallbackContainerName
+                            ?? throw new InvalidArgumentException('A failover route has no exact previous backend identity.'),
+                        $backendPort,
+                        $target->failoverHealthCheck(),
+                    );
                 $services[$activeServiceName] = [
                     'failover' => [
                         'service' => $candidateServiceName,
@@ -507,6 +527,24 @@ class CompileBlueGreenProxyConfiguration
         return $service;
     }
 
+    /**
+     * @param  non-empty-list<string>  $backends
+     * @param  array{path: string, interval: string, timeout: string, scheme: string, hostname: string, method: string, status: int, port?: int}  $healthCheck
+     * @return array{loadBalancer: array{servers: non-empty-list<array{url: string}>, healthCheck: array<string, int|string>}}
+     */
+    private function serviceForBackends(array $backends, int $port, array $healthCheck): array
+    {
+        return [
+            'loadBalancer' => [
+                'servers' => array_map(
+                    static fn (string $backend): array => ['url' => "http://{$backend}:{$port}"],
+                    $backends,
+                ),
+                'healthCheck' => $healthCheck,
+            ],
+        ];
+    }
+
     private function metadataHeader(
         string $applicationUuid,
         BlueGreenRoutingTarget $target,
@@ -527,6 +565,9 @@ class CompileBlueGreenProxyConfiguration
             'coolify.routing-config-digest' => $routingConfigDigest,
             'coolify.destination-topology-digest' => $target->destinationTopologyDigest,
         ];
+        if ($target->replicaTopologyDigest() !== null) {
+            $metadata['coolify.replica-topology-digest'] = $target->replicaTopologyDigest();
+        }
         $header = "# This file is generated and managed by Coolify.\n";
         foreach ($metadata as $key => $value) {
             $encoded = json_encode($value, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);

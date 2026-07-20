@@ -6,6 +6,7 @@ use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
+use App\Models\ApplicationBlueGreenReplica;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
@@ -98,6 +99,7 @@ final class RemoveBlueGreenApplicationContainers
             greenRoutingRevision: $greenRoutingRevision,
             legacyContainerName: $this->legacyContainerName($state),
             stopGracePeriodSeconds: $application->settings->stopGracePeriodSeconds(),
+            replicaContainers: $this->replicaContainers($state),
         );
     }
 
@@ -120,6 +122,9 @@ final class RemoveBlueGreenApplicationContainers
                 $plan->greenRoutingRevision,
             ),
         ];
+        foreach ($plan->replicaContainers as $replica) {
+            array_push($commands, ...$this->commandsForReplica($plan, $replica));
+        }
         if ($plan->legacyContainerName !== null) {
             array_push($commands, ...$this->commandsForLegacyContainer($plan));
         }
@@ -130,6 +135,7 @@ final class RemoveBlueGreenApplicationContainers
     public function assertAbsentCommandFor(BlueGreenContainerRemovalPlan $plan): string
     {
         $containerNames = [$plan->blueContainerName, $plan->greenContainerName];
+        array_push($containerNames, ...array_column($plan->replicaContainers, 'name'));
         if ($plan->legacyContainerName !== null) {
             $containerNames[] = $plan->legacyContainerName;
         }
@@ -141,6 +147,54 @@ final class RemoveBlueGreenApplicationContainers
                 $containerNames,
             ),
         ]);
+    }
+
+    /** @param array{name: string, id: string, color: BlueGreenDeploymentColor, routingRevision: int, deploymentUuid: string, index: int} $replica */
+    private function commandsForReplica(BlueGreenContainerRemovalPlan $plan, array $replica): array
+    {
+        return $this->commandsForExactContainer(
+            containerName: $replica['name'],
+            format: '{{.Id}} {{.Name}} {{index .Config.Labels "coolify.applicationId"}} {{index .Config.Labels "coolify.blueGreen.managed"}} {{index .Config.Labels "coolify.blueGreen.deploymentUuid"}} {{index .Config.Labels "coolify.blueGreen.color"}} {{index .Config.Labels "coolify.blueGreen.routingRevision"}} {{index .Config.Labels "coolify.blueGreen.replicaIndex"}}',
+            expectedMetadata: "/{$replica['name']} {$plan->applicationId} true {$replica['deploymentUuid']} {$replica['color']->value} {$replica['routingRevision']} {$replica['index']}",
+            stopGracePeriodSeconds: $plan->stopGracePeriodSeconds,
+            expectedContainerId: $replica['id'],
+        );
+    }
+
+    /** @return list<array{name: string, id: string, color: BlueGreenDeploymentColor, routingRevision: int, deploymentUuid: string, index: int}> */
+    private function replicaContainers(ApplicationBlueGreenDeployment $state): array
+    {
+        $deploymentUuids = array_values(array_filter([
+            $state->blue_deployment_uuid,
+            $state->green_deployment_uuid,
+        ], static fn (mixed $deploymentUuid): bool => is_string($deploymentUuid) && $deploymentUuid !== ''));
+        if ($deploymentUuids === []) {
+            return [];
+        }
+        $rows = ApplicationBlueGreenReplica::query()
+            ->where('application_blue_green_deployment_id', $state->id)
+            ->whereIn('deployment_uuid', $deploymentUuids)
+            ->orderBy('color')
+            ->orderBy('replica_index')
+            ->get();
+        if ($rows->isEmpty()) {
+            return [];
+        }
+
+        return $rows->map(function (ApplicationBlueGreenReplica $replica): array {
+            if ($replica->container_name === null || $replica->container_id === null) {
+                throw new BlueGreenDeactivationException('A durable blue-green replica has no exact bound container identity.');
+            }
+
+            return [
+                'name' => $replica->container_name,
+                'id' => $replica->container_id,
+                'color' => $replica->color,
+                'routingRevision' => $replica->routing_revision,
+                'deploymentUuid' => $replica->deployment_uuid,
+                'index' => $replica->replica_index,
+            ];
+        })->all();
     }
 
     /** @return list<string> */
@@ -186,19 +240,27 @@ final class RemoveBlueGreenApplicationContainers
         string $format,
         string $expectedMetadata,
         int $stopGracePeriodSeconds,
+        ?string $expectedContainerId = null,
     ): array {
         $safeContainerName = escapeshellarg($containerName);
         $safeFormat = escapeshellarg($format);
         $safeExpectedMetadata = escapeshellarg($expectedMetadata);
+
+        $identityAssertions = [
+            '  test "$container_id" != "$inspection"',
+            '  test "${#container_id}" -eq 64',
+            '  case "$container_id" in *[!0-9a-f]*|\'\') exit 1 ;; esac',
+        ];
+        if ($expectedContainerId !== null) {
+            $identityAssertions[] = '  test "$container_id" = '.escapeshellarg($expectedContainerId);
+        }
 
         return [
             "if docker container inspect {$safeContainerName} >/dev/null 2>&1; then",
             "  inspection=\$(docker inspect --format={$safeFormat} {$safeContainerName})",
             '  container_id=${inspection%% *}',
             '  metadata=${inspection#* }',
-            '  test "$container_id" != "$inspection"',
-            '  test "${#container_id}" -eq 64',
-            '  case "$container_id" in *[!0-9a-f]*|\'\') exit 1 ;; esac',
+            ...$identityAssertions,
             "  test \"\$metadata\" = {$safeExpectedMetadata}",
             '  remaining_attempt=$((attempt_deadline - $(date +%s)))',
             '  if [ "$remaining_attempt" -le 0 ]; then printf \'%s\n\' \'This bounded removal attempt ended before container stop; resume the same operation.\' >&2; exit 75; fi',

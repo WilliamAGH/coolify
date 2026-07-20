@@ -11,6 +11,8 @@ function blueGreenMultiPortTarget(
     BlueGreenRoutingMode $mode = BlueGreenRoutingMode::Steady,
     ?string $probeToken = null,
     ?string $fallbackContainerName = null,
+    ?array $blueReplicaBackends = null,
+    ?array $greenReplicaBackends = null,
 ): BlueGreenRoutingTarget {
     return new BlueGreenRoutingTarget(
         destinationId: 42,
@@ -41,6 +43,8 @@ function blueGreenMultiPortTarget(
         activeDeploymentUuid: 'deployment-7',
         activeContainerId: str_repeat('a', 64),
         destinationTopologyDigest: hash('sha256', 'destination:42'),
+        blueReplicaBackends: $blueReplicaBackends,
+        greenReplicaBackends: $greenReplicaBackends,
     );
 }
 
@@ -112,6 +116,35 @@ it('publishes one Docker-provider discovery service per color and exposed backen
         "traefik.http.routers.{$prefix}blue-3000-discovery.service=noop@internal",
         "traefik.http.routers.{$prefix}blue-8080-discovery.service=noop@internal",
     );
+});
+
+it('compiles one health-checked file-provider backend per proven replica and port', function (): void {
+    [, $parsed] = compileBlueGreenMultiPortConfiguration(blueGreenMultiPortTarget(
+        blueReplicaBackends: ['app-blue-1', 'app-blue-2', 'app-blue-3'],
+        greenReplicaBackends: ['app-green-1', 'app-green-2', 'app-green-3'],
+    ));
+    $prefix = BlueGreenRoutingTarget::routingNamePrefix('app-multi-port', 42);
+
+    foreach ([3000, 8080] as $port) {
+        expect(data_get($parsed, "http.services.{$prefix}blue-{$port}.loadBalancer.servers"))
+            ->toBe([
+                ['url' => "http://app-blue-1:{$port}"],
+                ['url' => "http://app-blue-2:{$port}"],
+                ['url' => "http://app-blue-3:{$port}"],
+            ])
+            ->and(data_get($parsed, "http.services.{$prefix}green-{$port}.loadBalancer.servers"))
+            ->toBe([
+                ['url' => "http://app-green-1:{$port}"],
+                ['url' => "http://app-green-2:{$port}"],
+                ['url' => "http://app-green-3:{$port}"],
+            ])
+            ->and(data_get($parsed, "http.services.{$prefix}blue-{$port}.loadBalancer.healthCheck.path"))
+            ->toBe('/healthz')
+            ->and(data_get($parsed, "http.services.{$prefix}active-{$port}.weighted.services.0.name"))
+            ->toBe($prefix."blue-{$port}@file");
+    }
+
+    expect($parsed)->not->toBeNull();
 });
 
 it('applies the failover health-check contract independently to every backend port', function (): void {
