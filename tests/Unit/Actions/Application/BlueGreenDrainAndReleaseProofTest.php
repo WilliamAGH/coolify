@@ -47,6 +47,31 @@ it('requires two observed zero-connection samples before exact previous-containe
         );
 });
 
+it('counts established connections across every exposed backend port before retirement', function () {
+    $drain = new DrainBlueGreenPreviousContainer;
+    $commands = $drain->commandsFor(
+        blueGreenDrainExpectation(),
+        backendPort: [8080, 3000],
+        drainDeadlineEpoch: 1_700_000_030,
+        stopTimeoutSeconds: 15,
+    );
+    $script = $commands[array_key_last($commands)];
+    $observation = $drain->observationCommandFor(
+        blueGreenDrainExpectation(),
+        backendPort: [8080, 3000],
+    );
+
+    expect($script)->toContain(
+        "target_ports='0BB8 1F90'",
+        'expected_ports[ports[index]] = 1',
+        'in expected_ports',
+    )->and($observation)->toContain(
+        "target_ports='0BB8 1F90'",
+        'expected_ports[ports[index]] = 1',
+        'in expected_ports',
+    );
+});
+
 it('binds the release proof to the exact managed candidate label and runtime environment', function () {
     $expectation = blueGreenDrainExpectation();
     $token = BlueGreenRoutingTarget::durableReleaseProofToken('deployment-drain');

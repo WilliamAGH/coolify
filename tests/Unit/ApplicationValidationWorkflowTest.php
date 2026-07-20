@@ -276,7 +276,12 @@ function applicationValidationWorkflowViolations(array $workflow): array
         'tests/Feature/BlueGreenContinuousAvailabilityAcceptanceTest.php',
         'tests/Feature/BlueGreenCrashBoundaryAcceptanceTest.php',
         'tests/Feature/BlueGreenDeploymentReconciliationTest.php',
+        'tests/Feature/BlueGreenFinalizedDrainingRecoveryTest.php',
+        'tests/Feature/BlueGreenInactiveRetirementTest.php',
+        'tests/Feature/BlueGreenLifecyclePublicRecoveryTest.php',
         'tests/Feature/BlueGreenMigrationReplayTest.php',
+        'tests/Feature/BlueGreenMultiPortPromotionAcceptanceTest.php',
+        'tests/Feature/BlueGreenStoppedLegacyContainerCleanupTest.php',
         'tests/Feature/DatabaseMigrationReadinessTest.php',
         'tests/Feature/BlueGreenSupersessionGenerationTest.php',
         'tests/Feature/LegacyProxyMutationPayloadAdoptionTest.php',
@@ -487,6 +492,20 @@ it('rejects omitting a blue-green ownership gate from PostgreSQL validation', fu
     $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'] = str_replace(
         'tests/Feature/BlueGreenCancellationCompensationTest.php',
         'tests/Feature/BlueGreenApplicationDeactivationTest.php',
+        $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'],
+    );
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('blue-green lifecycle validation must execute every ownership and migration gate');
+});
+
+it('rejects omitting nullable backend inventory compatibility coverage from PostgreSQL validation', function (): void {
+    $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
+    $step = collect($workflow['jobs']['blue-green-lifecycle']['steps'])
+        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Run blue-green lifecycle tests');
+    $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'] = str_replace(
+        'tests/Feature/BlueGreenMultiPortPromotionAcceptanceTest.php',
+        'tests/Feature/BlueGreenLifecyclePublicRecoveryTest.php',
         $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'],
     );
 

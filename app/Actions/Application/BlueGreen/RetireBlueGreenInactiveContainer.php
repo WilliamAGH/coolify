@@ -114,12 +114,18 @@ final class RetireBlueGreenInactiveContainer
                 return self::COMPLETED;
             }
 
-            $port = $application->blueGreenDeploymentBackendPort();
-            if ($port === null) {
-                return $this->markIntervention($state, $ownerDeployment, 'The inactive-color backend port became ambiguous before retirement.');
+            $drainBackendPortInventory = BlueGreenBackendPortInventory::fromSerialized(
+                $ownerDeployment->blue_green_drain_backend_port_inventory,
+            );
+            $inactiveBackendPortInventory = BlueGreenBackendPortInventory::fromSerialized(
+                $inactiveDeployment->blue_green_backend_port_inventory,
+            );
+            if (! hash_equals($drainBackendPortInventory->serialized, $inactiveBackendPortInventory->serialized)) {
+                throw new BlueGreenDeploymentTransitionException('The delayed inactive retirement backend port inventory no longer matches the exact inactive deployment.');
             }
+            $ports = $drainBackendPortInventory->ports();
             $drainer = new DrainBlueGreenPreviousContainer;
-            $activeConnections = $drainer->activeConnections($server, $expectation, $port);
+            $activeConnections = $drainer->activeConnections($server, $expectation, $ports);
             $this->recordObservation($state, $activeConnections);
             try {
                 (new ExecuteBlueGreenDestinationMutation)->handle(
@@ -128,7 +134,7 @@ final class RetireBlueGreenInactiveContainer
                     $replacementState,
                     $drainer->commandsFor(
                         $expectation,
-                        $port,
+                        $ports,
                         $state->inactive_retirement_drain_deadline_at->getTimestamp(),
                         $state->inactive_retirement_stop_grace_seconds,
                         $activeConnections === 0,
@@ -176,24 +182,28 @@ final class RetireBlueGreenInactiveContainer
     private function lockedRetirement(int $stateId, string $ownerDeploymentUuid, int $generation): ?array
     {
         return DB::transaction(function () use ($stateId, $ownerDeploymentUuid, $generation): ?array {
-            $state = ApplicationBlueGreenDeployment::query()->lockForUpdate()->find($stateId);
+            $snapshot = ApplicationBlueGreenDeployment::query()->find($stateId);
+            if ($snapshot === null) {
+                return null;
+            }
+            $locks = BlueGreenLifecycleDatabaseLocks::forDestination(
+                (int) $snapshot->application_id,
+                (int) $snapshot->standalone_docker_id,
+                [$ownerDeploymentUuid, $snapshot->inactive_retirement_deployment_uuid],
+            );
+            $state = $locks->state;
             if ($state === null
+                || $state->id !== $snapshot->id
                 || $state->inactive_retirement_owner_deployment_uuid !== $ownerDeploymentUuid
                 || $state->inactive_retirement_supersession_generation !== $generation) {
                 return null;
             }
-            $application = Application::query()->find($state->application_id);
+            $application = $locks->application;
             $destination = StandaloneDocker::query()->with('server')->find($state->standalone_docker_id);
-            $owner = ApplicationDeploymentQueue::query()
-                ->where('application_id', $state->application_id)
-                ->where('deployment_uuid', $ownerDeploymentUuid)
-                ->lockForUpdate()
-                ->first();
-            $inactive = ApplicationDeploymentQueue::query()
-                ->where('application_id', $state->application_id)
-                ->where('deployment_uuid', $state->inactive_retirement_deployment_uuid)
-                ->lockForUpdate()
-                ->first();
+            $owner = $locks->queue($ownerDeploymentUuid);
+            $inactive = is_string($state->inactive_retirement_deployment_uuid)
+                ? $locks->queue($state->inactive_retirement_deployment_uuid)
+                : null;
             $activeDeploymentUuid = match ($state->active_color) {
                 BlueGreenDeploymentColor::BLUE => $state->blue_deployment_uuid,
                 BlueGreenDeploymentColor::GREEN => $state->green_deployment_uuid,
@@ -213,6 +223,7 @@ final class RetireBlueGreenInactiveContainer
                 || $state->operation_deployment_uuid !== null
                 || $state->deactivation_operation_id !== null
                 || $state->supersession_generation !== $generation
+                || $locks->deactivation !== null
                 || $state->routing_revision !== $state->inactive_retirement_owner_routing_revision
                 || $state->destination_fence_epoch !== $state->inactive_retirement_destination_fence_epoch
                 || $state->destination_topology_digest !== $state->inactive_retirement_topology_digest
@@ -229,6 +240,19 @@ final class RetireBlueGreenInactiveContainer
                 || $inactive->blue_green_candidate_container_id !== $state->inactive_retirement_container_id
                 || $inactive->blue_green_routing_revision !== $state->inactive_retirement_container_routing_revision) {
                 throw new BlueGreenDeploymentTransitionException('The delayed inactive retirement owner is no longer exact.');
+            }
+
+            (new BackfillBlueGreenBackendPortInventories)->backfillPendingInactiveRetirement(
+                $application,
+                $locks->setting,
+                $destination,
+                $state,
+                $locks->deactivation,
+                $locks->queues,
+            );
+            if ($owner->blue_green_drain_backend_port_inventory === null
+                || $inactive->blue_green_backend_port_inventory === null) {
+                throw new BlueGreenDeploymentTransitionException('The delayed inactive retirement inventory could not be safely backfilled.');
             }
 
             return [$state, $application, $destination, $owner, $inactive];
@@ -273,7 +297,7 @@ final class RetireBlueGreenInactiveContainer
 
     private function markIntervention(
         ApplicationBlueGreenDeployment $state,
-        ApplicationDeploymentQueue $owner,
+        ?ApplicationDeploymentQueue $owner,
         string $message,
     ): string {
         ApplicationBlueGreenDeployment::query()

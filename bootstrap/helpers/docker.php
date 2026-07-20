@@ -833,43 +833,75 @@ function generateBlueGreenApplicationContainerLabels(
     int $destinationId,
     BlueGreenDeploymentColor $color,
     int $routingRevision,
-    int $backendPort,
+    int|array $backendPorts,
 ): array {
     if ($routingRevision < 0) {
         throw new InvalidArgumentException('The routing revision must be a nonnegative integer.');
     }
-    if ($backendPort < 1 || $backendPort > 65535) {
-        throw new InvalidArgumentException('The blue/green backend port must be between 1 and 65535.');
+    $backendPorts = is_int($backendPorts) ? [$backendPorts] : $backendPorts;
+    if (! array_is_list($backendPorts) || $backendPorts === []) {
+        throw new InvalidArgumentException('Blue-green backend ports must be a non-empty list.');
     }
+    foreach ($backendPorts as $backendPort) {
+        if (! is_int($backendPort) || $backendPort < 1 || $backendPort > 65535) {
+            throw new InvalidArgumentException('Blue-green backend ports must be integers between 1 and 65535.');
+        }
+    }
+    if (count(array_unique($backendPorts)) !== count($backendPorts)) {
+        throw new InvalidArgumentException('Blue-green backend ports must be unique.');
+    }
+    sort($backendPorts, SORT_NUMERIC);
 
     $applicationUuid = (string) $application->uuid;
-    $serviceName = BlueGreenRoutingTarget::memberServiceName($applicationUuid, $destinationId, $color);
-    $discoveryRouterName = BlueGreenRoutingTarget::memberDiscoveryRouterName(
-        $applicationUuid,
-        $destinationId,
-        $color,
-    );
     $labels = [
         'traefik.enable=true',
-        "traefik.http.routers.{$discoveryRouterName}.rule=Host(`{$discoveryRouterName}.invalid`)",
-        "traefik.http.routers.{$discoveryRouterName}.service=noop@internal",
-        "traefik.http.services.{$serviceName}.loadbalancer.server.port={$backendPort}",
+    ];
+    foreach ($backendPorts as $backendPort) {
+        $serviceName = BlueGreenRoutingTarget::memberServiceNameForPort(
+            $applicationUuid,
+            $destinationId,
+            $color,
+            $backendPort,
+            count($backendPorts) > 1,
+        );
+        $discoveryRouterName = BlueGreenRoutingTarget::memberDiscoveryRouterNameForPort(
+            $applicationUuid,
+            $destinationId,
+            $color,
+            $backendPort,
+            count($backendPorts) > 1,
+        );
+        $labels[] = "traefik.http.routers.{$discoveryRouterName}.rule=Host(`{$discoveryRouterName}.invalid`)";
+        $labels[] = "traefik.http.routers.{$discoveryRouterName}.service=noop@internal";
+        $labels[] = "traefik.http.services.{$serviceName}.loadbalancer.server.port={$backendPort}";
+    }
+    $labels = [
+        ...$labels,
         'coolify.blueGreen.managed=true',
         "coolify.blueGreen.color={$color->value}",
         "coolify.blueGreen.routingRevision={$routingRevision}",
     ];
 
     if ((bool) $application->health_check_enabled && $application->health_check_type === 'http') {
-        $healthCheckPrefix = "traefik.http.services.{$serviceName}.loadbalancer.healthcheck";
-        $labels[] = "{$healthCheckPrefix}.path={$application->health_check_path}";
-        $labels[] = "{$healthCheckPrefix}.hostname={$application->health_check_host}";
-        $labels[] = "{$healthCheckPrefix}.method={$application->health_check_method}";
-        $labels[] = "{$healthCheckPrefix}.status={$application->health_check_return_code}";
-        $labels[] = "{$healthCheckPrefix}.scheme={$application->health_check_scheme}";
-        $labels[] = "{$healthCheckPrefix}.interval={$application->health_check_interval}s";
-        $labels[] = "{$healthCheckPrefix}.timeout={$application->health_check_timeout}s";
-        if ($application->health_check_port !== null) {
-            $labels[] = "{$healthCheckPrefix}.port={$application->health_check_port}";
+        foreach ($backendPorts as $backendPort) {
+            $serviceName = BlueGreenRoutingTarget::memberServiceNameForPort(
+                $applicationUuid,
+                $destinationId,
+                $color,
+                $backendPort,
+                count($backendPorts) > 1,
+            );
+            $healthCheckPrefix = "traefik.http.services.{$serviceName}.loadbalancer.healthcheck";
+            $labels[] = "{$healthCheckPrefix}.path={$application->health_check_path}";
+            $labels[] = "{$healthCheckPrefix}.hostname={$application->health_check_host}";
+            $labels[] = "{$healthCheckPrefix}.method={$application->health_check_method}";
+            $labels[] = "{$healthCheckPrefix}.status={$application->health_check_return_code}";
+            $labels[] = "{$healthCheckPrefix}.scheme={$application->health_check_scheme}";
+            $labels[] = "{$healthCheckPrefix}.interval={$application->health_check_interval}s";
+            $labels[] = "{$healthCheckPrefix}.timeout={$application->health_check_timeout}s";
+            if ($application->health_check_port !== null) {
+                $labels[] = "{$healthCheckPrefix}.port={$application->health_check_port}";
+            }
         }
     }
 

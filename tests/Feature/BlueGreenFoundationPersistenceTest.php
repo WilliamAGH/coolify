@@ -1,6 +1,8 @@
 <?php
 
+use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
+use App\Actions\Application\BlueGreen\BlueGreenDeploymentTransitionException;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\ProxyTypes;
@@ -13,6 +15,18 @@ use App\Models\Team;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 
 uses(RefreshDatabase::class);
+
+it('canonically serializes immutable backend port inventories and rejects byte drift', function () {
+    $inventory = BlueGreenBackendPortInventory::fromPorts([8080, 3000]);
+
+    expect($inventory->ports())->toBe([3000, 8080])
+        ->and($inventory->serialized)->toBe('{"version":1,"ports":[3000,8080]}')
+        ->and(BlueGreenBackendPortInventory::fromSerialized($inventory->serialized)->ports())
+        ->toBe([3000, 8080]);
+
+    expect(fn () => BlueGreenBackendPortInventory::fromSerialized('{"ports":[3000,8080],"version":1}'))
+        ->toThrow(BlueGreenDeploymentTransitionException::class, 'non-canonical');
+});
 
 it('persists the typed blue-green foundation and queue provenance', function () {
     $team = Team::factory()->create();
@@ -55,6 +69,8 @@ it('persists the typed blue-green foundation and queue provenance', function () 
         'blue_green_server_boot_id' => '11111111-2222-3333-4444-555555555555',
         'blue_green_topology_digest' => str_repeat('c', 64),
         'blue_green_routing_config_digest' => str_repeat('d', 64),
+        'blue_green_backend_port_inventory' => BlueGreenBackendPortInventory::fromPorts([3000])->serialized,
+        'blue_green_drain_backend_port_inventory' => BlueGreenBackendPortInventory::fromPorts([3000])->serialized,
         'blue_green_previous_container_id' => str_repeat('a', 64),
         'blue_green_candidate_container_id' => str_repeat('b', 64),
         'blue_green_rollback_managed_filename' => 'coolify-managed.yaml.rollback',
@@ -90,6 +106,8 @@ it('persists the typed blue-green foundation and queue provenance', function () 
         ->and($queue->blue_green_server_boot_id)->toBe('11111111-2222-3333-4444-555555555555')
         ->and($queue->blue_green_topology_digest)->toBe(str_repeat('c', 64))
         ->and($queue->blue_green_routing_config_digest)->toBe(str_repeat('d', 64))
+        ->and($queue->blue_green_backend_port_inventory)->toBe(BlueGreenBackendPortInventory::fromPorts([3000])->serialized)
+        ->and($queue->blue_green_drain_backend_port_inventory)->toBe(BlueGreenBackendPortInventory::fromPorts([3000])->serialized)
         ->and($queue->blue_green_routing_mutated_at)->not->toBeNull()
         ->and($state->active_color)->toBe(BlueGreenDeploymentColor::BLUE)
         ->and($state->pending_color)->toBe(BlueGreenDeploymentColor::GREEN)
@@ -117,6 +135,8 @@ it('rejects invalid blue-green deployment claims before remote work starts', fun
         serverBootId: '11111111-2222-3333-4444-555555555555',
         topologyDigest: str_repeat('a', 64),
         routingConfigDigest: str_repeat('b', 64),
+        backendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
+        drainBackendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
         supersessionGeneration: 1,
         legacyContainerName: null,
     ))->toThrow(InvalidArgumentException::class, 'routing revision must be positive');
@@ -133,6 +153,8 @@ it('rejects invalid blue-green deployment claims before remote work starts', fun
         serverBootId: '11111111-2222-3333-4444-555555555555',
         topologyDigest: str_repeat('a', 64),
         routingConfigDigest: str_repeat('b', 64),
+        backendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
+        drainBackendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
         supersessionGeneration: 1,
         legacyContainerName: null,
         candidateContainerName: 'candidate',
@@ -150,6 +172,8 @@ it('rejects invalid blue-green deployment claims before remote work starts', fun
         serverBootId: '11111111-2222-3333-4444-555555555555',
         topologyDigest: str_repeat('a', 64),
         routingConfigDigest: str_repeat('b', 64),
+        backendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
+        drainBackendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
         supersessionGeneration: 1,
         legacyContainerName: null,
     ))->toThrow(InvalidArgumentException::class, 'fence epoch must be positive');
@@ -166,6 +190,8 @@ it('rejects invalid blue-green deployment claims before remote work starts', fun
         serverBootId: '11111111-2222-3333-4444-555555555555',
         topologyDigest: 'not-a-digest',
         routingConfigDigest: str_repeat('b', 64),
+        backendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
+        drainBackendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
         supersessionGeneration: 1,
         legacyContainerName: null,
     ))->toThrow(InvalidArgumentException::class, 'lowercase SHA-256');
@@ -182,6 +208,8 @@ it('rejects invalid blue-green deployment claims before remote work starts', fun
         serverBootId: 'NOT-A-BOOT-ID',
         topologyDigest: str_repeat('a', 64),
         routingConfigDigest: str_repeat('b', 64),
+        backendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
+        drainBackendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
         supersessionGeneration: 1,
         legacyContainerName: null,
     ))->toThrow(InvalidArgumentException::class, 'canonical lowercase UUID');

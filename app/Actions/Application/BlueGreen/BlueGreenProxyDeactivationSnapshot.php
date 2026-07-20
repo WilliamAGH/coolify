@@ -15,7 +15,12 @@ final readonly class BlueGreenProxyDeactivationSnapshot
 
     public const DRAIN_ATTEMPT_SECONDS = 240;
 
-    private const VERSION = 2;
+    private const VERSION = 3;
+
+    private const LEGACY_VERSION = 2;
+
+    /** @var non-empty-list<int> */
+    public array $backendPorts;
 
     /**
      * @param  list<array{router: string, url: string}>  $routes
@@ -32,6 +37,7 @@ final readonly class BlueGreenProxyDeactivationSnapshot
         public int $destinationClockObservedAtUnixSeconds,
         public int $drainDeadlineUnixSeconds,
         public int $deactivationDeadlineUnixSeconds,
+        ?array $backendPorts = null,
     ) {
         BlueGreenProxyConfiguration::assertManagedFilename($managedFilename);
         if (! hash_equals(hash('sha256', $sourceYaml), $sourceSha256)
@@ -41,13 +47,17 @@ final readonly class BlueGreenProxyDeactivationSnapshot
         if (preg_match('/^[a-f0-9]{64}$/D', $tombstoneAcknowledgement) !== 1) {
             throw new InvalidArgumentException('Blue-green proxy deactivation requires one opaque tombstone acknowledgement.');
         }
+        $this->backendPorts = $this->normalizeBackendPorts($backendPorts ?? [$backendPort]);
+        if (! in_array($backendPort, $this->backendPorts, true)) {
+            throw new InvalidArgumentException('Blue-green proxy deactivation requires its primary backend port in the complete backend port list.');
+        }
         if ($routes === [] || $backendPort < 1 || $backendPort > 65535
             || $destinationClockObservedAtUnixSeconds < 1
             || $drainDeadlineUnixSeconds !== $destinationClockObservedAtUnixSeconds
                 + self::DEACTIVATION_WINDOW_SECONDS - self::FINALIZATION_RESERVE_SECONDS
             || $deactivationDeadlineUnixSeconds !== $destinationClockObservedAtUnixSeconds
                 + self::DEACTIVATION_WINDOW_SECONDS) {
-            throw new InvalidArgumentException('Blue-green proxy deactivation requires routes, a backend port, and destination-clock-bound deadlines.');
+            throw new InvalidArgumentException('Blue-green proxy deactivation requires routes, backend ports, and destination-clock-bound deadlines.');
         }
         $routeIdentities = [];
         foreach ($routes as $route) {
@@ -79,6 +89,7 @@ final readonly class BlueGreenProxyDeactivationSnapshot
             'tombstoneAcknowledgement' => $this->tombstoneAcknowledgement,
             'routes' => $this->routes,
             'backendPort' => $this->backendPort,
+            'backendPorts' => $this->backendPorts,
             'destinationClockObservedAtUnixSeconds' => $this->destinationClockObservedAtUnixSeconds,
             'drainDeadlineUnixSeconds' => $this->drainDeadlineUnixSeconds,
             'deactivationDeadlineUnixSeconds' => $this->deactivationDeadlineUnixSeconds,
@@ -88,7 +99,8 @@ final readonly class BlueGreenProxyDeactivationSnapshot
     /** @param array<mixed> $encoded */
     public static function decode(array $encoded): self
     {
-        if (($encoded['version'] ?? null) !== self::VERSION
+        $version = $encoded['version'] ?? null;
+        if (($version !== self::VERSION && $version !== self::LEGACY_VERSION)
             || ! is_string($encoded['managedFilename'] ?? null)
             || ! is_string($encoded['sourceYaml'] ?? null)
             || ! is_string($encoded['sourceSha256'] ?? null)
@@ -101,6 +113,9 @@ final readonly class BlueGreenProxyDeactivationSnapshot
             || ! is_int($encoded['drainDeadlineUnixSeconds'] ?? null)
             || ! is_int($encoded['deactivationDeadlineUnixSeconds'] ?? null)) {
             throw new InvalidArgumentException('Durable blue-green proxy deactivation snapshot is malformed.');
+        }
+        if ($version === self::VERSION && ! is_array($encoded['backendPorts'] ?? null)) {
+            throw new InvalidArgumentException('Durable blue-green proxy deactivation snapshot has no complete backend port list.');
         }
 
         return new self(
@@ -115,6 +130,29 @@ final readonly class BlueGreenProxyDeactivationSnapshot
             destinationClockObservedAtUnixSeconds: $encoded['destinationClockObservedAtUnixSeconds'],
             drainDeadlineUnixSeconds: $encoded['drainDeadlineUnixSeconds'],
             deactivationDeadlineUnixSeconds: $encoded['deactivationDeadlineUnixSeconds'],
+            backendPorts: $version === self::VERSION ? $encoded['backendPorts'] : [$encoded['backendPort']],
         );
+    }
+
+    /** @return non-empty-list<int> */
+    private function normalizeBackendPorts(array $backendPorts): array
+    {
+        if (! array_is_list($backendPorts) || $backendPorts === []) {
+            throw new InvalidArgumentException('Blue-green proxy deactivation requires a non-empty backend port list.');
+        }
+
+        $normalized = [];
+        foreach ($backendPorts as $backendPort) {
+            if (! is_int($backendPort) || $backendPort < 1 || $backendPort > 65535) {
+                throw new InvalidArgumentException('Blue-green proxy deactivation backend ports must be valid integers.');
+            }
+            if (in_array($backendPort, $normalized, true)) {
+                throw new InvalidArgumentException('Blue-green proxy deactivation backend ports must be unique.');
+            }
+            $normalized[] = $backendPort;
+        }
+        sort($normalized, SORT_NUMERIC);
+
+        return $normalized;
     }
 }

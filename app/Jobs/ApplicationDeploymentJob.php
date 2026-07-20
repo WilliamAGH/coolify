@@ -2,6 +2,7 @@
 
 namespace App\Jobs;
 
+use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenLifecycleDatabaseLocks;
 use App\Actions\Application\BlueGreen\FindBlueGreenDeactivationFence;
 use App\Actions\Application\WaitForSwarmStackConvergence;
@@ -85,6 +86,26 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
     public $timeout = 3600;
 
     public static int $batch_counter = 0;
+
+    /** @return non-empty-list<string> */
+    public static function blueGreenCandidateContainerLabels(
+        Application $application,
+        int $destinationId,
+        BlueGreenDeploymentClaim $claim,
+    ): array {
+        return [
+            ...generateBlueGreenApplicationContainerLabels(
+                $application,
+                $destinationId,
+                $claim->pendingColor,
+                $claim->expectedRoutingRevision,
+                $claim->backendPortInventory->ports(),
+            ),
+            "coolify.blueGreen.deploymentUuid={$claim->deploymentUuid}",
+            'coolify.blueGreen.releaseProof='.
+                BlueGreenRoutingTarget::durableReleaseProofToken($claim->deploymentUuid),
+        ];
+    }
 
     private bool $newVersionIsHealthy = false;
 
@@ -3705,20 +3726,11 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         $persistent_file_volumes = $this->application->fileStorages()->get();
         $volume_names = $this->generate_local_persistent_volumes_only_volume_names();
         if ($blueGreenClaim !== null) {
-            $blueGreenBackendPort = $this->application->blueGreenDeploymentBackendPort()
-                ?? throw new DeploymentException('The blue-green backend port became ambiguous before member discovery labels were generated.');
-            $labels = collect(generateBlueGreenApplicationContainerLabels(
+            $labels = collect(self::blueGreenCandidateContainerLabels(
                 $this->application,
                 (int) $this->destination->id,
-                $blueGreenClaim->pendingColor,
-                $blueGreenClaim->expectedRoutingRevision,
-                $blueGreenBackendPort,
+                $blueGreenClaim,
             ));
-            $labels->push("coolify.blueGreen.deploymentUuid={$blueGreenClaim->deploymentUuid}");
-            $labels->push(
-                'coolify.blueGreen.releaseProof='
-                .BlueGreenRoutingTarget::durableReleaseProofToken($blueGreenClaim->deploymentUuid),
-            );
         } elseif (data_get($this->application, 'custom_labels')) {
             $this->application->parseContainerLabels();
             $labels = collect(preg_split("/\r\n|\n|\r/", base64_decode($this->application->custom_labels)));

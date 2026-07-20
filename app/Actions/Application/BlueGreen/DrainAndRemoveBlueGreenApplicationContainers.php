@@ -38,6 +38,10 @@ final class DrainAndRemoveBlueGreenApplicationContainers
             $proxyPath,
             $snapshot->managedFilename,
         );
+        $backendPortHexes = implode(' ', array_map(
+            static fn (int $backendPort): string => sprintf('%04X', $backendPort),
+            $snapshot->backendPorts,
+        ));
         $commands = [
             'set -eu',
             'mkdir -p -- '.escapeshellarg(dirname($managedPath)),
@@ -45,7 +49,7 @@ final class DrainAndRemoveBlueGreenApplicationContainers
             'attempt_deadline=$(($(date +%s) + '.(string) BlueGreenProxyDeactivationSnapshot::DRAIN_ATTEMPT_SECONDS.'))',
             'stable_zero_observations=0',
             'stable_zero_started_at=0',
-            'backend_port=$(printf \'%04X\' '.(string) $snapshot->backendPort.')',
+            'backend_ports='.escapeshellarg($backendPortHexes),
             'while :; do',
             ...$this->deadlineAssertion($snapshot),
             ...$this->tombstoneAssertion($managedPath, $snapshot),
@@ -173,7 +177,9 @@ final class DrainAndRemoveBlueGreenApplicationContainers
             '      case "$pid" in *[!0-9]*|0|\'\') exit 1 ;; esac',
             '      test -r "/proc/$pid/net/tcp"',
             '      test -r "/proc/$pid/net/tcp6"',
-            '      if awk -v port="$backend_port" \'NR > 1 { split($2, endpoint, ":"); if (toupper(endpoint[2]) == port && $4 == "01") found = 1 } END { exit found ? 0 : 1 }\' "/proc/$pid/net/tcp" "/proc/$pid/net/tcp6"; then',
+            '      if awk -v target_ports="$backend_ports" '
+                .escapeshellarg('BEGIN { split(target_ports, ports, " "); for (index in ports) expected_ports[ports[index]] = 1 } NR > 1 { split($2, endpoint, ":"); if (toupper(endpoint[2]) in expected_ports && $4 == "01") found = 1 } END { exit found ? 0 : 1 }')
+                .' "/proc/$pid/net/tcp" "/proc/$pid/net/tcp6"; then',
             '        active_connections=1',
             '      fi',
             '    fi',

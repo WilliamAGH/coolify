@@ -22,9 +22,9 @@ final class PlanBlueGreenForwardRecovery
             || $state->activeContainerId !== $operation->candidateContainer->dockerId) {
             throw new RuntimeException('The current destination route does not target the exact claimed candidate.');
         }
-        $port = $operation->application->blueGreenDeploymentBackendPort();
-        if ($port === null) {
-            throw new RuntimeException('The application no longer has one unambiguous blue-green backend port.');
+        $ports = $operation->application->blueGreenDeploymentBackendPorts();
+        if ($ports === null) {
+            throw new RuntimeException('The application no longer has an exact blue-green backend port inventory.');
         }
         $applicationUuid = (string) $operation->application->uuid;
         $target = new BlueGreenRoutingTarget(
@@ -32,7 +32,8 @@ final class PlanBlueGreenForwardRecovery
             activeColor: $operation->claim->pendingColor,
             blueContainerName: "{$applicationUuid}-".BlueGreenDeploymentColor::BLUE->value,
             greenContainerName: "{$applicationUuid}-".BlueGreenDeploymentColor::GREEN->value,
-            port: $port,
+            port: $ports[0],
+            ports: $ports,
             routingRevision: $operation->claim->expectedRoutingRevision,
             mode: $operation->claim->previousActiveColor === null
                 ? BlueGreenRoutingMode::LegacyAdoption

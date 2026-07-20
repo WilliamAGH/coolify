@@ -141,9 +141,9 @@ class PlanBlueGreenPublicRecovery
             || $expectedState->activeContainerId === null) {
             throw new RuntimeException('The durable predecessor has no managed route inventory to reconstruct.');
         }
-        $port = $operation->application->blueGreenDeploymentBackendPort();
-        if ($port === null) {
-            throw new RuntimeException('The application no longer has one unambiguous blue-green backend port.');
+        $ports = $operation->application->blueGreenDeploymentBackendPorts();
+        if ($ports === null) {
+            throw new RuntimeException('The application no longer has an exact blue-green backend port inventory.');
         }
         $applicationUuid = (string) $operation->application->uuid;
         $target = new BlueGreenRoutingTarget(
@@ -151,7 +151,8 @@ class PlanBlueGreenPublicRecovery
             activeColor: $expectedState->activeColor,
             blueContainerName: "{$applicationUuid}-".BlueGreenDeploymentColor::BLUE->value,
             greenContainerName: "{$applicationUuid}-".BlueGreenDeploymentColor::GREEN->value,
-            port: $port,
+            port: $ports[0],
+            ports: $ports,
             routingRevision: $expectedState->routingRevision,
             publicProofToken: BlueGreenRoutingTarget::durablePublicProofToken($expectedState->operationId),
             destinationFenceEpoch: $expectedState->destinationFenceEpoch,
