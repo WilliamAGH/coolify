@@ -23,7 +23,14 @@ readonly MAX_TRANSITION_OBSERVATION_MS=35000
 readonly TRANSITION_ATTEMPTS=24
 readonly TRANSITION_SAMPLE_DELAY_SECONDS=0.05
 readonly TRANSPORT_MIN_EVENT_COUNT=5
-readonly TRANSPORT_OBSERVER_TIMEOUT_MS=40000
+readonly TRANSPORT_OBSERVER_RELOAD_PHASES=6
+readonly TRANSPORT_OBSERVER_TIMEOUT_MARGIN_MS=15000
+readonly TRANSPORT_OBSERVER_TIMEOUT_MS=$((
+    (2 * MAX_TRANSITION_OBSERVATION_MS)
+    + (TRANSPORT_OBSERVER_RELOAD_PHASES * MAX_RELOAD_DELAY_MS)
+    + TRANSPORT_OBSERVER_TIMEOUT_MARGIN_MS
+))
+readonly BACKGROUND_PID_EXIT_TIMEOUT_MS=5000
 
 TEMP_BASE=''
 TEMP_DIRECTORY=''
@@ -110,6 +117,30 @@ terminate_registered_background_pids() {
             kill "$pid" 2>/dev/null || true
         fi
     done
+}
+
+reap_registered_background_pids() {
+    local deadline=$(( $(now_ms) + BACKGROUND_PID_EXIT_TIMEOUT_MS ))
+    local pid
+    local running=0
+
+    while [ "$(now_ms)" -lt "$deadline" ]; do
+        running=0
+        for pid in "${BACKGROUND_PIDS[@]}"; do
+            if background_pid_is_running "$pid"; then
+                running=1
+                break
+            fi
+        done
+        [ "$running" -eq 0 ] && break
+        sleep 0.05
+    done
+
+    for pid in "${BACKGROUND_PIDS[@]}"; do
+        if background_pid_is_running "$pid"; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    done
     for pid in "${BACKGROUND_PIDS[@]}"; do
         wait "$pid" 2>/dev/null || true
     done
@@ -125,6 +156,7 @@ cleanup() {
     if [ "$COMPOSE_STARTED" -eq 1 ]; then
         compose down --volumes --remove-orphans >/dev/null 2>&1
     fi
+    reap_registered_background_pids
     if [ -n "$TEMP_DIRECTORY" ]; then
         case "$TEMP_DIRECTORY" in
             "$TEMP_BASE"/coolify-control-plane-traefik.*)
@@ -860,6 +892,118 @@ assert_full_cycle_transport_continuity() {
         || fail 'Original SSE or WebSocket connection did not remain active throughout the green-applied interval'
 }
 
+write_transport_report_fixture() {
+    local destination=$1
+    local fixture_kind=$2
+    local staged_fixture
+
+    jq -n '
+        def events($transport; $connection_id):
+            [
+                {sequence: 1, receivedAt: 1500},
+                {sequence: 2, receivedAt: 2500},
+                {sequence: 3, receivedAt: 3500},
+                {sequence: 4, receivedAt: 4500},
+                {sequence: 5, receivedAt: 5500},
+                {sequence: 6, receivedAt: 6500}
+            ]
+            | map(. + {
+                backend: "blue",
+                color: "blue",
+                connectionId: $connection_id,
+                dynamicSha: "sha-blue",
+                generation: "generation-blue",
+                transport: $transport
+            });
+        {
+            minimumEventCount: 5,
+            release: {transition: "full-cycle", appliedAt: 6000},
+            sse: {
+                completedAt: 6500,
+                events: events("sse"; "sse-connection"),
+                release: {transition: "full-cycle", appliedAt: 6000},
+                startedAt: 1000,
+                status: 200
+            },
+            websocket: {
+                completedAt: 6500,
+                events: events("websocket"; "websocket-connection"),
+                release: {transition: "full-cycle", appliedAt: 6000},
+                startedAt: 1000,
+                status: 101
+            }
+        }
+    ' > "$destination"
+
+    [ "$fixture_kind" = valid ] && return
+    staged_fixture=$(mktemp "${destination}.XXXXXX")
+    case "$fixture_kind" in
+        wrong-backend)
+            jq '.sse.events[2].backend = "green"' "$destination" > "$staged_fixture"
+            ;;
+        wrong-color)
+            jq '.websocket.events[2].color = "green"' "$destination" > "$staged_fixture"
+            ;;
+        wrong-generation)
+            jq '.sse.events[2].generation = "generation-green"' "$destination" > "$staged_fixture"
+            ;;
+        wrong-dynamic-sha)
+            jq '.websocket.events[2].dynamicSha = "sha-green"' "$destination" > "$staged_fixture"
+            ;;
+        changed-connection-id)
+            jq '.sse.events[3].connectionId = "sse-successor"' "$destination" > "$staged_fixture"
+            ;;
+        missing-green-interval)
+            jq '
+                .sse.events |= map(if .receivedAt >= 3000 and .receivedAt < 5000 then .receivedAt = 2500 else . end)
+                | .websocket.events |= map(if .receivedAt >= 3000 and .receivedAt < 5000 then .receivedAt = 2500 else . end)
+            ' "$destination" > "$staged_fixture"
+            ;;
+        missing-post-rollback)
+            jq '
+                .sse.events |= map(if .receivedAt >= 6000 then .receivedAt = 5500 else . end)
+                | .websocket.events |= map(if .receivedAt >= 6000 then .receivedAt = 5500 else . end)
+                | .sse.completedAt = 5500
+                | .websocket.completedAt = 5500
+            ' "$destination" > "$staged_fixture"
+            ;;
+        *)
+            rm -f -- "$staged_fixture"
+            fail "Unknown transport report fixture: $fixture_kind"
+            ;;
+    esac
+    mv -f -- "$staged_fixture" "$destination"
+}
+
+expect_transport_report_failure() {
+    local report_file=$1
+    local fixture_kind=$2
+
+    if (
+        trap - EXIT
+        assert_full_cycle_transport_continuity "$report_file" 2000 3000 5000 6000 \
+            blue blue generation-blue sha-blue
+    ) >/dev/null 2>&1; then
+        fail "Transport report fixture unexpectedly passed: $fixture_kind"
+    fi
+}
+
+assert_transport_report_validation() {
+    local fixture_kind
+    local report_file
+
+    for fixture_kind in valid wrong-backend wrong-color wrong-generation wrong-dynamic-sha changed-connection-id missing-green-interval missing-post-rollback; do
+        report_file="$TEMP_DIRECTORY/transport-report-${fixture_kind}.json"
+        write_transport_report_fixture "$report_file" "$fixture_kind"
+        if [ "$fixture_kind" = valid ]; then
+            assert_full_cycle_transport_continuity "$report_file" 2000 3000 5000 6000 \
+                blue blue generation-blue sha-blue
+        else
+            expect_transport_report_failure "$report_file" "$fixture_kind"
+        fi
+    done
+}
+
 start_transition_observer() {
     local log_file=$1
     local applied_barrier_file=$2
@@ -1174,12 +1318,13 @@ main() {
         fail 'Usage: run.sh [--self-test]'
     fi
     if [ "${1:-}" = --self-test ]; then
-        for command in python3 mktemp awk; do
+        for command in python3 mktemp awk jq; do
             require_command "$command"
         done
         initialize_temp_directory
         assert_transition_log_validation
-        printf 'PASS: transition-log duration validation self-tests completed.\n'
+        assert_transport_report_validation
+        printf 'PASS: transition-log and transport-report validation self-tests completed.\n'
         return
     fi
 
@@ -1207,6 +1352,7 @@ main() {
 
     initialize_temp_directory
     assert_transition_log_validation
+    assert_transport_report_validation
     PROJECT_NAME="coolify-control-plane-traefik-$$"
     TRAEFIK_CERT_DIR="$TEMP_DIRECTORY/certs"
     BACKEND_BLUE_STATE_DIR="$TEMP_DIRECTORY/backend-blue"

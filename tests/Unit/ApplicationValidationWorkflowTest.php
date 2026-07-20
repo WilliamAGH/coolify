@@ -67,6 +67,62 @@ function controlPlaneTraefikTransportLifecycleViolations(string $script): array
 }
 
 /**
+ * @return list<string>
+ */
+function controlPlaneTraefikTransportSafetyViolations(string $script): array
+{
+    $violations = [];
+
+    foreach ([
+        'readonly TRANSPORT_OBSERVER_RELOAD_PHASES=6',
+        'readonly TRANSPORT_OBSERVER_TIMEOUT_MARGIN_MS=15000',
+        '(2 * MAX_TRANSITION_OBSERVATION_MS)',
+        '(TRANSPORT_OBSERVER_RELOAD_PHASES * MAX_RELOAD_DELAY_MS)',
+        '+ TRANSPORT_OBSERVER_TIMEOUT_MARGIN_MS',
+    ] as $timeoutContract) {
+        if (! str_contains($script, $timeoutContract)) {
+            $violations[] = 'native Traefik transport timeout must cover both bounded transitions and reload phases';
+            break;
+        }
+    }
+
+    $cleanupStart = strpos($script, "cleanup() {\n");
+    $cleanupEnd = $cleanupStart === false ? false : strpos($script, "\n}\n\ntrap cleanup EXIT", $cleanupStart);
+    $cleanup = $cleanupStart === false || $cleanupEnd === false
+        ? ''
+        : substr($script, $cleanupStart, $cleanupEnd - $cleanupStart);
+    $terminatePosition = strpos($cleanup, 'terminate_registered_background_pids');
+    $composeDownPosition = strpos($cleanup, 'compose down --volumes --remove-orphans');
+    $reapPosition = strpos($cleanup, 'reap_registered_background_pids');
+    if ($terminatePosition === false
+        || $composeDownPosition === false
+        || $reapPosition === false
+        || ! ($terminatePosition < $composeDownPosition && $composeDownPosition < $reapPosition)
+        || ! str_contains($script, 'readonly BACKGROUND_PID_EXIT_TIMEOUT_MS=5000')
+        || ! str_contains($script, 'kill -KILL "$pid" 2>/dev/null || true')) {
+        $violations[] = 'native Traefik cleanup must tear Compose down before bounded child reaping';
+    }
+
+    foreach ([
+        'wrong-backend',
+        'wrong-color',
+        'wrong-generation',
+        'wrong-dynamic-sha',
+        'changed-connection-id',
+        'missing-green-interval',
+        'missing-post-rollback',
+        'assert_transport_report_validation',
+    ] as $reportContract) {
+        if (! str_contains($script, $reportContract)) {
+            $violations[] = 'native Traefik self-tests must reject malformed full-cycle transport reports';
+            break;
+        }
+    }
+
+    return array_values(array_unique($violations));
+}
+
+/**
  * @param  array<string, mixed>  $workflow
  * @return array<string, mixed>
  */
@@ -547,6 +603,47 @@ it('rejects releasing the original transport streams before rollback proof', fun
 
     expect(controlPlaneTraefikTransportLifecycleViolations($mutated))
         ->toContain('native Traefik runtime must retain its original transport streams through proved rollback');
+});
+
+it('keeps full-cycle transport deadlines and cleanup ordering internally bounded', function () {
+    expect(controlPlaneTraefikTransportSafetyViolations(controlPlaneTraefikRuntimeScript()))->toBe([]);
+});
+
+it('rejects shortening the full-cycle observer below its derived phase bounds', function () {
+    $mutated = str_replace(
+        '+ TRANSPORT_OBSERVER_TIMEOUT_MARGIN_MS',
+        '+ 0',
+        controlPlaneTraefikRuntimeScript(),
+    );
+
+    expect(controlPlaneTraefikTransportSafetyViolations($mutated))
+        ->toContain('native Traefik transport timeout must cover both bounded transitions and reload phases');
+});
+
+it('rejects waiting on observer children before exact-project Compose teardown', function () {
+    $script = controlPlaneTraefikRuntimeScript();
+    $mutated = str_replace(
+        "    if [ \"\$COMPOSE_STARTED\" -eq 1 ]; then\n        compose down --volumes --remove-orphans >/dev/null 2>&1\n    fi\n    reap_registered_background_pids",
+        "    reap_registered_background_pids\n    if [ \"\$COMPOSE_STARTED\" -eq 1 ]; then\n        compose down --volumes --remove-orphans >/dev/null 2>&1\n    fi",
+        $script,
+    );
+
+    expect($mutated)->not->toBe($script)
+        ->and(controlPlaneTraefikTransportSafetyViolations($mutated))
+        ->toContain('native Traefik cleanup must tear Compose down before bounded child reaping');
+});
+
+it('executes negative full-cycle transport report fixtures', function () {
+    $process = new Process([
+        'bash',
+        dirname(__DIR__).'/Integration/ControlPlaneTraefik/run.sh',
+        '--self-test',
+    ], dirname(__DIR__, 2));
+    $process->setTimeout(30);
+    $process->mustRun();
+
+    expect($process->getOutput())
+        ->toContain('PASS: transition-log and transport-report validation self-tests completed.');
 });
 
 it('rejects omitting database migration S6 exit propagation coverage', function () {
