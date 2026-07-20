@@ -152,6 +152,7 @@ jobs:
             tests/Feature/BlueGreenApplicationDeletionOrchestrationTest.php \
             tests/Feature/BlueGreenCancellationCompensationTest.php \
             tests/Feature/BlueGreenDeactivationResumeCommandTest.php \
+            tests/Feature/BlueGreenDeploymentReconciliationTest.php \
             tests/Feature/BlueGreenDeploymentRecoveryFailureTest.php \
             tests/Feature/BlueGreenDeploymentRecoveryTest.php \
             tests/Feature/BlueGreenFoundationMigrationReplayTest.php \

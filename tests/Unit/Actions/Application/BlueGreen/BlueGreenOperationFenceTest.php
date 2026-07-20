@@ -17,6 +17,8 @@ use App\Models\Server;
 use App\Models\Team;
 use Illuminate\Cache\Lock;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Str;
 use Tests\TestCase;
 
 uses(TestCase::class, RefreshDatabase::class);
@@ -126,6 +128,16 @@ it('rejects a deployment owner when its durable ownership changes', function (Cl
             'blue_green_supersession_generation' => $fixture['claim']->supersessionGeneration + 1,
         ]);
     }],
+    'state operation change' => [static function (array $fixture): void {
+        $fixture['state']->update([
+            'operation_deployment_uuid' => 'replacement-operation-fence-deployment',
+        ]);
+    }],
+    'queue operation change' => [static function (array $fixture): void {
+        $fixture['deployment']->update([
+            'deployment_uuid' => 'replacement-operation-fence-deployment',
+        ]);
+    }],
 ]);
 
 it('refreshes the lifecycle heartbeat before every explicit ownership assertion', function () {
@@ -135,4 +147,27 @@ it('refreshes the lifecycle heartbeat before every explicit ownership assertion'
 
     $fence->assertLockOwnership();
     $fence->assertLockOwnership();
+});
+
+it('cannot refresh or release a newer Redis lifecycle owner after its lease expires', function (): void {
+    config()->set('cache.default', 'redis');
+    $lockKey = 'blue-green-operation-fence-test-'.Str::uuid();
+    $expiredOwner = Cache::lock($lockKey, 1);
+    expect($expiredOwner->get())->toBeTrue();
+
+    usleep(1_100_000);
+
+    $newerOwner = Cache::lock($lockKey, 10);
+    expect($newerOwner->get())->toBeTrue();
+
+    try {
+        $expiredFence = blueGreenOperationFence($expiredOwner);
+
+        expect(fn () => $expiredFence->assertLockOwnership())
+            ->toThrow(BlueGreenOperationFenceLostException::class);
+        expect($expiredFence->releaseIfOwned())->toBeFalse()
+            ->and($newerOwner->isOwnedByCurrentProcess())->toBeTrue();
+    } finally {
+        $newerOwner->release();
+    }
 });
