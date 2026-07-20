@@ -61,6 +61,14 @@ jobs:
             if (candidate.data.object.type !== 'commit' || candidate.data.object.sha !== process.env.FROZEN_SHA) {
               core.setFailed('Candidate ref does not resolve to the requested commit SHA.');
             }
+            const comparison = await github.rest.repos.compareCommitsWithBasehead({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              basehead: `${process.env.FROZEN_BASE_SHA}...${process.env.FROZEN_SHA}`,
+            });
+            if (!['ahead', 'identical'].includes(comparison.data.status)) {
+              core.setFailed('Candidate commit is not descended from the frozen v4.x base.');
+            }
 
   application-validation:
     name: Validate immutable v4.x candidate

@@ -26,6 +26,7 @@ it('authorizes an immutable v4.x candidate on the William Callahan runner', func
     $inputs = $workflow['on']['workflow_dispatch']['inputs'] ?? [];
     $authorize = $workflow['jobs']['authorize'] ?? [];
     $script = collect($authorize['steps'] ?? [])->firstWhere('name', 'Authorize immutable candidate')['run'] ?? '';
+    $resolver = collect($authorize['steps'] ?? [])->firstWhere('name', 'Resolve immutable candidate ref');
 
     expect(array_keys($inputs))->toBe(['candidate_sha', 'candidate_ref', 'base_sha'])
         ->and($authorize['runs-on'] ?? null)->toBe(williamCallahanTrustedRunner())
@@ -33,7 +34,10 @@ it('authorizes an immutable v4.x candidate on the William Callahan runner', func
         ->and((string) $script)
         ->toContain('^ship/v4x/$FROZEN_SHA/[0-9a-f]{40}$')
         ->toContain('GITHUB_SHA')
-        ->toContain('FROZEN_BASE_SHA');
+        ->toContain('FROZEN_BASE_SHA')
+        ->and((string) ($resolver['with']['script'] ?? ''))
+        ->toContain('compareCommitsWithBasehead')
+        ->toContain("['ahead', 'identical'].includes(comparison.data.status)");
 
     foreach ($authorize['steps'] ?? [] as $step) {
         expect((string) ($step['uses'] ?? ''))->not->toStartWith('actions/checkout@');
@@ -93,6 +97,7 @@ it('reuses a green self-hosted candidate gate before production validation', fun
     $validation = $jobs['application-validation'] ?? [];
     $required = $jobs['validation-required'] ?? [];
     $resolveVersion = $jobs['resolve-version'] ?? [];
+    $checkout = collect($preflight['steps'] ?? [])->firstWhere('name', 'Check out protected base verifier');
     $verify = collect($preflight['steps'] ?? [])->firstWhere('id', 'verify');
 
     expect($preflight['runs-on'] ?? null)->toBe(williamCallahanTrustedRunner())
@@ -101,8 +106,12 @@ it('reuses a green self-hosted candidate gate before production validation', fun
             'contents' => 'read',
         ])
         ->and($preflight['outputs']['verified'] ?? null)->toBe('${{ steps.verify.outputs.verified }}')
+        ->and($checkout['with']['ref'] ?? null)->toBe('${{ github.event.before }}')
+        ->and($checkout['with']['path'] ?? null)->toBe('trusted-v4x')
         ->and($verify)->toBeArray()
-        ->and((string) ($verify['run'] ?? ''))->toContain('verify-v4x-candidate-gate.sh')
+        ->and((string) ($verify['run'] ?? ''))
+        ->toContain('trusted-v4x/scripts/ci/verify-v4x-candidate-gate.sh')
+        ->not->toContain('if scripts/ci/verify-v4x-candidate-gate.sh')
         ->and($validation['needs'] ?? null)->toBe('candidate-preflight')
         ->and($validation['if'] ?? null)->toBe('${{ always() && needs.candidate-preflight.outputs.verified != \'true\' }}')
         ->and($validation['with']['base_sha'] ?? null)->toBe('${{ github.event.before }}')
@@ -111,6 +120,18 @@ it('reuses a green self-hosted candidate gate before production validation', fun
         ->and($required['if'] ?? null)->toBe('always()')
         ->and($required['runs-on'] ?? null)->toBe('ubuntu-24.04')
         ->and($resolveVersion['needs'] ?? null)->toBe('validation-required');
+});
+
+it('runs the v4.x candidate regression owners in application validation', function () {
+    $workflow = v4xWorkflow('application-validation.yml');
+    $php = collect($workflow['jobs']['php']['steps'] ?? [])
+        ->firstWhere('name', 'Run release and version-consumer tests');
+    $shell = collect($workflow['jobs']['workflow-and-shell']['steps'] ?? [])
+        ->firstWhere('name', 'Run v4.x candidate ship contract');
+
+    expect((string) ($php['run'] ?? ''))
+        ->toContain('tests/Unit/V4xCandidateWorkflowTest.php')
+        ->and($shell['run'] ?? null)->toBe('scripts/dev/ship.test.sh');
 });
 
 it('uses the organization label for the privileged fork promotion', function () {

@@ -26,11 +26,12 @@ jobs:
     outputs:
       verified: ${{ steps.verify.outputs.verified }}
     steps:
-      - name: Check out trusted v4.x revision
+      - name: Check out protected base verifier
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           persist-credentials: false
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.before }}
+          path: trusted-v4x
 
       - id: verify
         name: Verify exact candidate preflight
@@ -42,7 +43,8 @@ jobs:
         run: |
           set -Eeuo pipefail
           verified=false
-          if scripts/ci/verify-v4x-candidate-gate.sh "$CANDIDATE_SHA" "$BASE_SHA"; then
+          if [[ -x trusted-v4x/scripts/ci/verify-v4x-candidate-gate.sh ]] &&
+            trusted-v4x/scripts/ci/verify-v4x-candidate-gate.sh "$CANDIDATE_SHA" "$BASE_SHA"; then
             verified=true
           else
             echo '::notice::No trusted candidate preflight matched this v4.x push; hosted validation will run.'

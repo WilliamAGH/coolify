@@ -308,6 +308,11 @@ function applicationValidationWorkflowViolations(array $workflow): array
     }
 
     $phpApplication = is_array($jobs) ? ($jobs['php'] ?? []) : [];
+    $releaseTestsScript = collect($phpApplication['steps'] ?? [])
+        ->firstWhere('name', 'Run release and version-consumer tests')['run'] ?? '';
+    if (! str_contains((string) $releaseTestsScript, 'tests/Unit/V4xCandidateWorkflowTest.php')) {
+        $violations[] = 'application validation must execute the v4.x candidate workflow regression owner';
+    }
     $controlPlaneScript = collect($phpApplication['steps'] ?? [])
         ->firstWhere('name', 'Run native Traefik control-plane tests')['run'] ?? '';
     foreach ([
@@ -333,6 +338,11 @@ function applicationValidationWorkflowViolations(array $workflow): array
     }
 
     $workflowAndShell = is_array($jobs) ? ($jobs['workflow-and-shell'] ?? []) : [];
+    $candidateShipScript = collect($workflowAndShell['steps'] ?? [])
+        ->firstWhere('name', 'Run v4.x candidate ship contract')['run'] ?? '';
+    if ((string) $candidateShipScript !== 'scripts/dev/ship.test.sh') {
+        $violations[] = 'application validation must execute the v4.x candidate ship contract';
+    }
     $dockerDaemonConfigurationScript = collect($workflowAndShell['steps'] ?? [])
         ->firstWhere('name', 'Verify Docker daemon configuration ownership')['run'] ?? '';
     if (! str_contains((string) $dockerDaemonConfigurationScript, 'tests/Integration/DockerDaemonConfigurationTest.sh')) {
