@@ -44,84 +44,9 @@ services:
       STATE_DIRECTORY: /state
     volumes:
       - ${BACKEND_BLUE_STATE_DIR:?}:/state
-    command:
-      - node
-      - -e
-      - |
-        const fs = require('fs');
-        const http = require('http');
-        const stateDirectory = process.env.STATE_DIRECTORY;
-        const privateHeader = 'x-coolify-control-plane-health-proof';
-        const authenticationProofHeader = 'x-coolify-control-plane-authentication-proof';
-        const healthProof = process.env.CONTROL_PLANE_HEALTH_PROOF;
-        const instance = process.env.BACKEND_INSTANCE;
-        const providerHost = 'control-plane.test';
-
-        function append(filename, values) {
-          fs.appendFileSync(stateDirectory + '/' + filename, [String(Date.now()), ...values].join('|') + '\n');
-        }
-
-        function isHealthy() {
-          return fs.existsSync(stateDirectory + '/healthy');
-        }
-
-        function identity() {
-          const [color, generation, dynamicSha] = fs.readFileSync(stateDirectory + '/identity', 'utf8').trim().split('|');
-          return {color, generation, dynamicSha};
-        }
-
-        function responseHeaders() {
-          const current = identity();
-          return {
-            'X-Coolify-Control-Plane-Dynamic-Sha': current.dynamicSha,
-            'X-Integration-Backend': instance,
-            'X-Backend-Color': current.color,
-            'X-Backend-Generation': current.generation,
-          };
-        }
-
-        http.createServer((request, response) => {
-          const requestPath = new URL(request.url, 'http://localhost').pathname;
-          if (requestPath === '/api/health') {
-            const validProof = request.headers[privateHeader] === healthProof;
-            const requestHost = request.headers.host;
-            const providerRequest = requestHost === providerHost || requestHost === providerHost + ':8080';
-            const directRequest = request.headers['x-integration-direct-probe'] === 'true';
-            const healthy = isHealthy();
-
-            if (providerRequest) {
-              append('provider-health.log', [validProof ? '1' : '0', healthy ? '1' : '0']);
-            }
-            if (directRequest) {
-              append('direct-health.log', [validProof ? '1' : '0', healthy ? '1' : '0']);
-            }
-            if (!validProof) {
-              response.writeHead(401);
-              response.end();
-              return;
-            }
-            if (!healthy) {
-              response.writeHead(503);
-              response.end();
-              return;
-            }
-
-            response.writeHead(204, responseHeaders());
-            response.end();
-            return;
-          }
-
-          if (!isHealthy()) {
-            response.writeHead(503);
-            response.end();
-            return;
-          }
-
-          append('route.log', [instance, requestPath]);
-          append('forwarded-identity.log', [request.headers.host || '', request.headers[authenticationProofHeader] || '', request.headers['x-forwarded-for'] || '']);
-          response.writeHead(200, responseHeaders());
-          response.end(instance);
-        }).listen(8080, '0.0.0.0');
+      - ${CONTROL_PLANE_TRAEFIK_SCRIPT_DIRECTORY:?}/backend-server.js:/backend-server.js:ro
+      - ${CONTROL_PLANE_TRAEFIK_SCRIPT_DIRECTORY:?}/transport-observer.js:/transport-observer.js:ro
+    command: ['node', '/backend-server.js']
     labels:
       traefik.enable: "true"
       traefik.http.routers.integration-docker-provider.rule: "Host(`docker-provider.test`)"
@@ -140,84 +65,9 @@ services:
       STATE_DIRECTORY: /state
     volumes:
       - ${BACKEND_GREEN_STATE_DIR:?}:/state
-    command:
-      - node
-      - -e
-      - |
-        const fs = require('fs');
-        const http = require('http');
-        const stateDirectory = process.env.STATE_DIRECTORY;
-        const privateHeader = 'x-coolify-control-plane-health-proof';
-        const authenticationProofHeader = 'x-coolify-control-plane-authentication-proof';
-        const healthProof = process.env.CONTROL_PLANE_HEALTH_PROOF;
-        const instance = process.env.BACKEND_INSTANCE;
-        const providerHost = 'control-plane.test';
-
-        function append(filename, values) {
-          fs.appendFileSync(stateDirectory + '/' + filename, [String(Date.now()), ...values].join('|') + '\n');
-        }
-
-        function isHealthy() {
-          return fs.existsSync(stateDirectory + '/healthy');
-        }
-
-        function identity() {
-          const [color, generation, dynamicSha] = fs.readFileSync(stateDirectory + '/identity', 'utf8').trim().split('|');
-          return {color, generation, dynamicSha};
-        }
-
-        function responseHeaders() {
-          const current = identity();
-          return {
-            'X-Coolify-Control-Plane-Dynamic-Sha': current.dynamicSha,
-            'X-Integration-Backend': instance,
-            'X-Backend-Color': current.color,
-            'X-Backend-Generation': current.generation,
-          };
-        }
-
-        http.createServer((request, response) => {
-          const requestPath = new URL(request.url, 'http://localhost').pathname;
-          if (requestPath === '/api/health') {
-            const validProof = request.headers[privateHeader] === healthProof;
-            const requestHost = request.headers.host;
-            const providerRequest = requestHost === providerHost || requestHost === providerHost + ':8080';
-            const directRequest = request.headers['x-integration-direct-probe'] === 'true';
-            const healthy = isHealthy();
-
-            if (providerRequest) {
-              append('provider-health.log', [validProof ? '1' : '0', healthy ? '1' : '0']);
-            }
-            if (directRequest) {
-              append('direct-health.log', [validProof ? '1' : '0', healthy ? '1' : '0']);
-            }
-            if (!validProof) {
-              response.writeHead(401);
-              response.end();
-              return;
-            }
-            if (!healthy) {
-              response.writeHead(503);
-              response.end();
-              return;
-            }
-
-            response.writeHead(204, responseHeaders());
-            response.end();
-            return;
-          }
-
-          if (!isHealthy()) {
-            response.writeHead(503);
-            response.end();
-            return;
-          }
-
-          append('route.log', [instance, requestPath]);
-          append('forwarded-identity.log', [request.headers.host || '', request.headers[authenticationProofHeader] || '', request.headers['x-forwarded-for'] || '']);
-          response.writeHead(200, responseHeaders());
-          response.end(instance);
-        }).listen(8080, '0.0.0.0');
+      - ${CONTROL_PLANE_TRAEFIK_SCRIPT_DIRECTORY:?}/backend-server.js:/backend-server.js:ro
+      - ${CONTROL_PLANE_TRAEFIK_SCRIPT_DIRECTORY:?}/transport-observer.js:/transport-observer.js:ro
+    command: ['node', '/backend-server.js']
     labels:
       traefik.enable: "true"
       traefik.http.services.integration-backend-green.loadbalancer.server.port: "8080"

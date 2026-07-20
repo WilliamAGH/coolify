@@ -85,10 +85,18 @@ jobs:
             tests/Feature/UpgradeComponentTest.php
       - name: Run native Traefik control-plane tests
         run: |
+          set -Eeuo pipefail
+          mapfile -t control_plane_feature_tests < <(
+            find tests/Feature/Proxy/ControlPlane -maxdepth 1 -type f -name '*Test.php' \
+              ! -name 'ProveAndFreezeControlPlaneGenerationTest.php' -print | sort
+          )
+          (( ${#control_plane_feature_tests[@]} > 0 ))
           php artisan test --compact \
             tests/Feature/InspectProxyMutationQueueTest.php \
-            tests/Feature/Proxy/ControlPlane \
+            "${control_plane_feature_tests[@]}" \
             tests/Unit/Actions/Proxy/ControlPlane
+      - name: Run control-plane backup-quiesce owner
+        run: php artisan test --compact tests/Feature/Proxy/ControlPlane/ProveAndFreezeControlPlaneGenerationTest.php
 
   blue-green-lifecycle:
     name: Blue-green lifecycle (PostgreSQL)
