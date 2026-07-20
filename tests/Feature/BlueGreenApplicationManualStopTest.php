@@ -26,8 +26,10 @@ use App\Models\ApplicationDeploymentQueue;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
 use App\Models\User;
+use Illuminate\Cache\ArrayStore;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Process\PendingProcess;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
@@ -460,6 +462,93 @@ it('stops every configured blue-green destination through the application stop b
         ->toBeTrue()
         ->and($state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::STOPPED)
         ->and($additionalState->fresh()->phase)->toBe(BlueGreenDeploymentPhase::STOPPED);
+});
+
+it('renews every pending fence throughout a slow all-destination stop', function (): void {
+    $context = BlueGreenDeactivationScenario::context();
+    $application = $context['application'];
+    $destination = $context['destination'];
+    $second = manualBlueGreenAdditionalDestination($context);
+    $third = manualBlueGreenAdditionalDestination($context);
+
+    $application->additional_networks()->attach($second['destination']->id, [
+        'server_id' => $second['server']->id,
+    ]);
+    $application->additional_networks()->attach($third['destination']->id, [
+        'server_id' => $third['server']->id,
+    ]);
+    $states = [
+        $destination->id => BlueGreenDeactivationScenario::routeLessState($application, $destination),
+        $second['destination']->id => BlueGreenDeactivationScenario::routeLessState($application, $second['destination']),
+        $third['destination']->id => BlueGreenDeactivationScenario::routeLessState($application, $third['destination']),
+    ];
+    $destinationIds = $application->fresh()
+        ->blueGreenConfiguredStandaloneDockerDestinationIds()
+        ->map(fn (mixed $destinationId): int => (int) $destinationId)
+        ->values()
+        ->all();
+    $leaseSeconds = BlueGreenDeploymentLock::deactivationLeaseSeconds();
+    $simulatedRemoteLatencySeconds = 160;
+    $mutationIndex = 0;
+    $renewalSnapshots = [];
+    Carbon::setTestNow(now()->startOfSecond());
+    fakeManualBlueGreenStopRemoteSuccess(function (
+        PendingProcess $process,
+        BlueGreenProxyState $replacementState,
+    ) use (
+        $application,
+        $destinationIds,
+        $simulatedRemoteLatencySeconds,
+        &$mutationIndex,
+        &$renewalSnapshots,
+    ): void {
+        $cacheStore = Cache::getStore();
+        if (! $cacheStore instanceof ArrayStore) {
+            throw new RuntimeException('The slow-fleet fence regression requires the test array cache store.');
+        }
+
+        $pendingDestinationIds = array_slice($destinationIds, $mutationIndex);
+        $remainingLeaseSeconds = [];
+        foreach ($pendingDestinationIds as $pendingDestinationId) {
+            $expiresAt = $cacheStore->locks[BlueGreenDeploymentLock::key(
+                $application->id,
+                $pendingDestinationId,
+            )]['expiresAt'] ?? null;
+            $remainingLeaseSeconds[$pendingDestinationId] = $expiresAt instanceof Carbon
+                ? $expiresAt->getTimestamp() - Carbon::now()->getTimestamp()
+                : null;
+        }
+        $renewalSnapshots[] = [
+            'destination_id' => $replacementState->destinationId,
+            'remaining_lease_seconds' => $remainingLeaseSeconds,
+        ];
+        $mutationIndex++;
+        Carbon::setTestNow(Carbon::now()->addSeconds($simulatedRemoteLatencySeconds));
+    });
+    Event::fake([ServiceStatusChanged::class]);
+
+    try {
+        $result = StopApplication::run($application, dockerCleanup: false);
+    } finally {
+        Carbon::setTestNow();
+    }
+
+    expect($result)->toBeNull()
+        ->and($mutationIndex)->toBe(3)
+        ->and($mutationIndex * $simulatedRemoteLatencySeconds)->toBeGreaterThan($leaseSeconds)
+        ->and($renewalSnapshots)->toHaveCount(3)
+        ->and(ApplicationBlueGreenDeactivation::query()
+            ->where('application_id', $application->id)
+            ->where('phase', BlueGreenDeactivationPhase::STOPPED->value)
+            ->count())->toBe(3)
+        ->and(collect($states)->every(
+            fn (ApplicationBlueGreenDeployment $state): bool => $state->fresh()->phase === BlueGreenDeploymentPhase::STOPPED,
+        ))->toBeTrue();
+    foreach ($renewalSnapshots as $index => $renewalSnapshot) {
+        expect($renewalSnapshot['destination_id'])->toBe($destinationIds[$index])
+            ->and(array_keys($renewalSnapshot['remaining_lease_seconds']))->toBe(array_slice($destinationIds, $index));
+        expect($renewalSnapshot['remaining_lease_seconds'])->each->toBe($leaseSeconds);
+    }
 });
 
 it('stops exactly the destination owned by the selected server', function () {

@@ -13,6 +13,7 @@ use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
 use App\Notifications\Application\BlueGreenInterventionRequired;
+use Closure;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Lorisleiva\Actions\Concerns\AsAction;
@@ -30,6 +31,7 @@ final class DeactivateBlueGreenApplicationDestination
         ?int $expectedSupersessionGeneration = null,
         BlueGreenDeactivationPhase $requestedPhase = BlueGreenDeactivationPhase::DEACTIVATING,
         ?BlueGreenOperationFence $operationFence = null,
+        ?Closure $beforeFencedMutation = null,
     ): bool {
         $releaseOperationFence = false;
         if ($operationFence === null) {
@@ -59,7 +61,7 @@ final class DeactivateBlueGreenApplicationDestination
             if ($preparation->invariantViolation !== null) {
                 throw $preparation->invariantViolation;
             }
-            $operationFence->assertDeactivationOwnership($preparation);
+            $this->assertDeactivationOwnership($operationFence, $preparation, $beforeFencedMutation);
             $server = $preparation->destination->server;
             $expectedServerBootId = ReadBlueGreenServerBootIdentity::run($server);
             $expectedProxyState = $this->expectedProxyState($application, $preparation);
@@ -76,6 +78,7 @@ final class DeactivateBlueGreenApplicationDestination
                     $operationFence,
                     $expectedServerBootId,
                     $expectedProxyState,
+                    $beforeFencedMutation,
                 )
                 : $this->deactivateActiveRoute(
                     $application,
@@ -84,8 +87,9 @@ final class DeactivateBlueGreenApplicationDestination
                     $expectedProxyState,
                     $operationFence,
                     $expectedServerBootId,
+                    $beforeFencedMutation,
                 );
-            $operationFence->assertDeactivationOwnership($preparation);
+            $this->assertDeactivationOwnership($operationFence, $preparation, $beforeFencedMutation);
             $this->completePreparedDeactivation($preparation);
 
             return true;
@@ -116,15 +120,25 @@ final class DeactivateBlueGreenApplicationDestination
         }
     }
 
+    private function assertDeactivationOwnership(
+        BlueGreenOperationFence $operationFence,
+        BlueGreenDeactivationPreparation $preparation,
+        ?Closure $beforeFencedMutation,
+    ): void {
+        $beforeFencedMutation?->__invoke();
+        $operationFence->assertDeactivationOwnership($preparation);
+    }
+
     private function deactivateWithoutActiveRoute(
         Application $application,
         BlueGreenDeactivationPreparation $preparation,
         BlueGreenOperationFence $operationFence,
         string $expectedServerBootId,
         ?BlueGreenProxyState $expectedProxyState,
+        ?Closure $beforeFencedMutation,
     ): void {
         $server = $preparation->destination->server;
-        $operationFence->assertDeactivationOwnership($preparation);
+        $this->assertDeactivationOwnership($operationFence, $preparation, $beforeFencedMutation);
         $containerRemover = new RemoveBlueGreenApplicationContainers;
         $sidecarRemover = new RemoveBlueGreenComposeSidecars;
         if ($preparation->state !== null) {
@@ -288,11 +302,12 @@ final class DeactivateBlueGreenApplicationDestination
         ?BlueGreenProxyState $expectedProxyState,
         BlueGreenOperationFence $operationFence,
         string $expectedServerBootId,
+        ?Closure $beforeFencedMutation,
     ): void {
         $server = $preparation->destination->server;
         $sidecarRemover = new RemoveBlueGreenComposeSidecars;
         $expectedProxyState ??= throw new BlueGreenDeactivationException('A snapshotted route has no exact durable proxy state.');
-        $operationFence->assertDeactivationOwnership($preparation);
+        $this->assertDeactivationOwnership($operationFence, $preparation, $beforeFencedMutation);
         $installation = InstallBlueGreenProxyEvictionTombstone::run(
             $server,
             $preparation,
@@ -303,7 +318,7 @@ final class DeactivateBlueGreenApplicationDestination
         $currentProxyState = $this->expectedProxyState($application, $preparation)
             ?? throw new BlueGreenDeactivationException('The snapshotted proxy state disappeared during deactivation.');
         if ($installation === BlueGreenProxyTombstoneInstallation::AlreadyAbsent) {
-            $operationFence->assertDeactivationOwnership($preparation);
+            $this->assertDeactivationOwnership($operationFence, $preparation, $beforeFencedMutation);
             $bootAssertion = (new ReadBlueGreenServerBootIdentity)->assertionCommandFor($expectedServerBootId).' || exit 75';
             ExecuteBlueGreenDeactivationRemoteCommand::run(
                 $server,
@@ -316,7 +331,7 @@ final class DeactivateBlueGreenApplicationDestination
                     $bootAssertion,
                 ]),
             );
-            $operationFence->assertDeactivationOwnership($preparation);
+            $this->assertDeactivationOwnership($operationFence, $preparation, $beforeFencedMutation);
             WaitForBlueGreenProxyEviction::run(
                 $server,
                 $application,
@@ -328,7 +343,7 @@ final class DeactivateBlueGreenApplicationDestination
             return;
         }
 
-        $operationFence->assertDeactivationOwnership($preparation);
+        $this->assertDeactivationOwnership($operationFence, $preparation, $beforeFencedMutation);
         WaitForBlueGreenProxyEviction::run(
             $server,
             $application,
@@ -336,14 +351,14 @@ final class DeactivateBlueGreenApplicationDestination
             BlueGreenProxyEvictionState::Tombstone,
             $expectedServerBootId,
         );
-        $operationFence->assertDeactivationOwnership($preparation);
+        $this->assertDeactivationOwnership($operationFence, $preparation, $beforeFencedMutation);
         DrainAndRemoveBlueGreenApplicationContainers::run(
             $server,
             $snapshot,
             $preparation->containerRemovalPlan,
             $expectedServerBootId,
         );
-        $operationFence->assertDeactivationOwnership($preparation);
+        $this->assertDeactivationOwnership($operationFence, $preparation, $beforeFencedMutation);
         $sidecarRemovalPlan = $preparation->composeSidecarRemovalPlan;
         if ($sidecarRemovalPlan !== null && ! $sidecarRemovalPlan->isEmpty()) {
             $bootAssertion = (new ReadBlueGreenServerBootIdentity)->assertionCommandFor($expectedServerBootId).' || exit 75';
@@ -357,7 +372,7 @@ final class DeactivateBlueGreenApplicationDestination
                 ]),
             );
         }
-        $operationFence->assertDeactivationOwnership($preparation);
+        $this->assertDeactivationOwnership($operationFence, $preparation, $beforeFencedMutation);
         RemoveBlueGreenProxyEvictionTombstone::run(
             $server,
             $preparation,
@@ -365,7 +380,7 @@ final class DeactivateBlueGreenApplicationDestination
             $currentProxyState,
             $expectedServerBootId,
         );
-        $operationFence->assertDeactivationOwnership($preparation);
+        $this->assertDeactivationOwnership($operationFence, $preparation, $beforeFencedMutation);
         WaitForBlueGreenProxyEviction::run(
             $server,
             $application,

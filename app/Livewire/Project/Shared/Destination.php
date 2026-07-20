@@ -6,7 +6,6 @@ use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
 use App\Actions\Application\BlueGreen\DeactivateBlueGreenApplication;
 use App\Actions\Application\StopApplicationOneServer;
 use App\Actions\Docker\GetContainersStatus;
-use App\Enums\BlueGreenDeactivationPhase;
 use App\Events\ApplicationStatusChanged;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
@@ -228,10 +227,10 @@ class Destination extends Component
             StandaloneDocker::ownedByCurrentTeam()->where('server_id', $server->id)->findOrFail($network_id);
             $removalProof = null;
             if ($this->resource instanceof Application && $this->resource->requiresBlueGreenDeactivation()) {
-                $preparations = DeactivateBlueGreenApplication::make()->stop(
+                $preparations = DeactivateBlueGreenApplication::make()->removeDestination(
                     $this->resource,
                     $network_id,
-                    BlueGreenDeactivationPhase::REMOVING,
+                    $server_id,
                 );
                 $deactivation = $preparations->sole()->deactivation->fresh();
                 $removalProof = [

@@ -2,11 +2,13 @@
 
 use App\Actions\Shared\ComplexStatusCheck;
 use App\Enums\ApplicationDeploymentStatus;
+use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\BlueGreenFleetStatus;
 use App\Enums\ProxyTypes;
 use App\Exceptions\DeploymentException;
 use App\Jobs\ApplicationDeploymentJob;
 use App\Models\Application;
+use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\InstanceSettings;
 use App\Models\PrivateKey;
@@ -441,6 +443,69 @@ it('marks only the failed blue-green destination degraded and pauses the remaini
         ->and($pendingDeployment->fresh()->status)->toBe('cancelled-by-blue-green-fleet')
         ->and($rootDeployment->fresh()->blue_green_fleet_status)->toBe(BlueGreenFleetStatus::PAUSED)
         ->and((string) $failedDeployment->fresh()->logs)->toContain('Paused the remaining destination(s)');
+});
+
+it('publishes an exact drain-recovery fleet failure through the fleet failure owner', function (): void {
+    Notification::fake();
+    $fixture = blueGreenMultiDestinationFixture();
+    $failed = blueGreenMultiDestinationAdditional($fixture['team'], 'drain-recovery-failed');
+    $pending = blueGreenMultiDestinationAdditional($fixture['team'], 'drain-recovery-pending');
+    $fixture['application']->additional_networks()->attach($failed['destination']->id, ['server_id' => $failed['server']->id]);
+    $fixture['application']->additional_networks()->attach($pending['destination']->id, ['server_id' => $pending['server']->id]);
+    $rootDeployment = blueGreenMultiDestinationQueue(
+        $fixture['application'],
+        $fixture['destination'],
+        $fixture['server'],
+        'blue-green-drain-recovery-fleet-root',
+        ApplicationDeploymentStatus::FINISHED->value,
+    );
+    $rootDeployment->update([
+        'blue_green_fleet_deployment_uuid' => $rootDeployment->deployment_uuid,
+        'blue_green_fleet_status' => BlueGreenFleetStatus::ACTIVE,
+    ]);
+    $failedDeployment = blueGreenMultiDestinationQueue(
+        $fixture['application'],
+        $failed['destination'],
+        $failed['server'],
+        'blue-green-drain-recovery-failed-child',
+    );
+    $pendingDeployment = blueGreenMultiDestinationQueue(
+        $fixture['application'],
+        $pending['destination'],
+        $pending['server'],
+        'blue-green-drain-recovery-pending-child',
+        ApplicationDeploymentStatus::QUEUED->value,
+    );
+    $failedDeployment->update([
+        'blue_green_fleet_deployment_uuid' => $rootDeployment->deployment_uuid,
+        'blue_green_phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+        'blue_green_supersession_generation' => 1,
+    ]);
+    $pendingDeployment->update(['blue_green_fleet_deployment_uuid' => $rootDeployment->deployment_uuid]);
+    ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $fixture['application']->id,
+        'standalone_docker_id' => $failed['destination']->id,
+        'operation_deployment_uuid' => $failedDeployment->deployment_uuid,
+        'phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+        'routing_revision' => 1,
+        'supersession_generation' => 1,
+    ]);
+    $job = blueGreenMultiDestinationJob(
+        $fixture['application'],
+        $failedDeployment->fresh(),
+        $failed['destination'],
+        $failed['server'],
+    );
+
+    $job->failBlueGreenDrainRecovery(new RuntimeException('The drain recovery requires intervention.'));
+
+    expect($failedDeployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value)
+        ->and($pendingDeployment->fresh()->status)->toBe(ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value)
+        ->and($rootDeployment->fresh()->blue_green_fleet_status)->toBe(BlueGreenFleetStatus::PAUSED)
+        ->and($fixture['application']->fresh()->additional_networks()
+            ->whereKey($failed['destination']->id)
+            ->firstOrFail()->pivot->status)->toBe('degraded:unknown')
+        ->and($pendingDeployment->claimForDispatch(bypassServerCapacity: true))->toBeFalse();
 });
 
 it('atomically pauses a fleet when a child finds its server non-functional before lifecycle initialization', function (): void {

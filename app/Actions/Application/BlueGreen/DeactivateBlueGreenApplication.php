@@ -8,6 +8,7 @@ use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\ApplicationSetting;
+use Closure;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -142,9 +143,14 @@ final class DeactivateBlueGreenApplication
         Application $application,
         ?int $standaloneDockerId = null,
         BlueGreenDeactivationPhase $requestedPhase = BlueGreenDeactivationPhase::STOPPING,
+        ?int $expectedAdditionalServerId = null,
     ): Collection {
         if (! in_array($requestedPhase, [BlueGreenDeactivationPhase::STOPPING, BlueGreenDeactivationPhase::REMOVING], true)) {
             throw new \InvalidArgumentException('A manual blue-green stop requires a stopping or removing phase.');
+        }
+        if ($expectedAdditionalServerId !== null
+            && ($requestedPhase !== BlueGreenDeactivationPhase::REMOVING || $standaloneDockerId === null)) {
+            throw new \InvalidArgumentException('A blue-green destination-removal reservation requires one exact removing destination and server.');
         }
         $stoppingEveryDestination = $standaloneDockerId === null;
         $destinationIds = $application->blueGreenConfiguredStandaloneDockerDestinationIds();
@@ -157,15 +163,28 @@ final class DeactivateBlueGreenApplication
 
         $destinationFences = $this->acquireDestinationFences($application->id, $destinationIds);
         $releasedEveryFence = false;
+        $preparations = null;
+        $result = null;
 
         try {
-            $preparations = DB::transaction(function () use ($application, $destinationIds, $destinationFences, $stoppingEveryDestination, $requestedPhase): Collection {
+            $preparations = DB::transaction(function () use ($application, $destinationIds, $destinationFences, $stoppingEveryDestination, $requestedPhase, $standaloneDockerId, $expectedAdditionalServerId): Collection {
+                if ($expectedAdditionalServerId !== null && $standaloneDockerId !== null) {
+                    BlueGreenTopologyLock::acquire($application->getConnection());
+                }
                 $liveApplication = Application::withTrashed()
                     ->whereKey($application->id)
                     ->lockForUpdate()
                     ->firstOrFail();
                 if ($liveApplication->trashed()) {
                     throw new BlueGreenDeactivationException('A deleted blue-green application cannot be manually stopped.');
+                }
+
+                if ($expectedAdditionalServerId !== null && $standaloneDockerId !== null) {
+                    $this->assertExpectedAdditionalDestination(
+                        $liveApplication,
+                        $standaloneDockerId,
+                        $expectedAdditionalServerId,
+                    );
                 }
 
                 $this->refreshDestinationFences($destinationFences);
@@ -194,26 +213,64 @@ final class DeactivateBlueGreenApplication
 
                 return $preparations;
             }, attempts: 5);
+
+            $beforeRemoteMutation = $expectedAdditionalServerId === null || $standaloneDockerId === null
+                ? null
+                : function () use ($application, $standaloneDockerId, $expectedAdditionalServerId): void {
+                    $this->assertExpectedAdditionalDestinationBeforeRemoteMutation(
+                        $application,
+                        $standaloneDockerId,
+                        $expectedAdditionalServerId,
+                    );
+                };
+            $result = $this->deactivatePreparedDestinations(
+                Application::withTrashed()->findOrFail($application->id),
+                $preparations,
+                $destinationFences,
+                $beforeRemoteMutation,
+            );
         } finally {
             $releasedEveryFence = $this->releaseDestinationFences($destinationFences);
         }
 
         if (! $releasedEveryFence) {
-            throw new BlueGreenDeactivationInProgressException('Blue-green application stop prepared its durable owners, but one or more destination lifecycle locks could not be released safely.');
+            throw new BlueGreenDeactivationInProgressException('Blue-green application stop could not release one or more destination lifecycle locks safely.');
         }
 
-        return $this->deactivatePreparedDestinations(
-            Application::withTrashed()->findOrFail($application->id),
-            $preparations,
+        return $result ?? throw new \LogicException('Blue-green application stop finished without deactivation preparations.');
+    }
+
+    /** @return Collection<int, BlueGreenDeactivationPreparation> */
+    public function removeDestination(
+        Application $application,
+        int $standaloneDockerId,
+        int $serverId,
+    ): Collection {
+        return $this->stop(
+            application: $application,
+            standaloneDockerId: $standaloneDockerId,
+            requestedPhase: BlueGreenDeactivationPhase::REMOVING,
+            expectedAdditionalServerId: $serverId,
         );
     }
 
     /**
      * @param  Collection<int, BlueGreenDeactivationPreparation>  $preparations
+     * @param  array<int, BlueGreenOperationFence>  $destinationFences
      * @return Collection<int, BlueGreenDeactivationPreparation>
      */
-    private function deactivatePreparedDestinations(Application $application, Collection $preparations): Collection
-    {
+    private function deactivatePreparedDestinations(
+        Application $application,
+        Collection $preparations,
+        array $destinationFences = [],
+        ?Closure $beforeRemoteMutation = null,
+    ): Collection {
+        $beforeFencedMutation = $destinationFences === [] && $beforeRemoteMutation === null
+            ? null
+            : function () use ($destinationFences, $beforeRemoteMutation): void {
+                $this->refreshDestinationFences($destinationFences);
+                $beforeRemoteMutation?->__invoke();
+            };
         foreach ($preparations as $preparation) {
             $deactivation = $preparation->deactivation;
             $operationId = $deactivation->operation_id;
@@ -229,6 +286,8 @@ final class DeactivateBlueGreenApplication
                 $operationId,
                 $supersessionGeneration,
                 $deactivation->phase,
+                $destinationFences[(int) $deactivation->standalone_docker_id] ?? null,
+                $beforeFencedMutation,
             )) {
                 throw new BlueGreenDeactivationException('Blue-green destination deactivation did not prove completion.');
             }
@@ -236,6 +295,45 @@ final class DeactivateBlueGreenApplication
         }
 
         return $preparations;
+    }
+
+    private function assertExpectedAdditionalDestination(
+        Application $application,
+        int $standaloneDockerId,
+        int $serverId,
+    ): void {
+        if ($application->blueGreenPrimaryStandaloneDockerDestinationId() === $standaloneDockerId) {
+            throw new BlueGreenDeactivationException('The requested destination became the application primary and cannot be remotely deactivated for removal.');
+        }
+
+        if (! $application->getConnection()->table('additional_destinations')
+            ->where('application_id', $application->id)
+            ->where('standalone_docker_id', $standaloneDockerId)
+            ->where('server_id', $serverId)
+            ->lockForUpdate()
+            ->exists()) {
+            throw new BlueGreenDeactivationException('The requested destination is no longer an attached additional destination and cannot be remotely deactivated for removal.');
+        }
+    }
+
+    private function assertExpectedAdditionalDestinationBeforeRemoteMutation(
+        Application $application,
+        int $standaloneDockerId,
+        int $serverId,
+    ): void {
+        $connection = $application->getConnection();
+        $connection->transaction(function () use ($application, $standaloneDockerId, $serverId, $connection): void {
+            BlueGreenTopologyLock::acquire($connection);
+            $liveApplication = Application::withTrashed()
+                ->whereKey($application->id)
+                ->lockForUpdate()
+                ->firstOrFail();
+            if ($liveApplication->trashed()) {
+                throw new BlueGreenDeactivationException('A deleted blue-green application destination cannot be remotely deactivated for removal.');
+            }
+
+            $this->assertExpectedAdditionalDestination($liveApplication, $standaloneDockerId, $serverId);
+        }, attempts: 5);
     }
 
     /**
