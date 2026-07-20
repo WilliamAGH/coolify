@@ -291,7 +291,7 @@ it('bounds canonical proxy-mutation reservations to the job timeout plus recover
         $before = time();
         $job = proxyMutationGateJob();
         ProxyMutationQueue::assign($job);
-        $queue->getConnection()->rpush($queueKey, $queue->payloadFor($job));
+        $queue->dispatchProxyMutationForTest($job);
         $reserved = $queue->pop(ProxyMutationQueue::NAME);
         $after = time();
         $reservedPayload = $reserved?->getReservedJob();
@@ -307,7 +307,7 @@ it('bounds canonical proxy-mutation reservations to the job timeout plus recover
         $fallbackBefore = time();
         $fallbackJob = proxyMutationGateFallbackJob();
         ProxyMutationQueue::assign($fallbackJob);
-        $queue->getConnection()->rpush($queueKey, $queue->payloadFor($fallbackJob));
+        $queue->dispatchProxyMutationForTest($fallbackJob);
         $fallbackReserved = $queue->pop(ProxyMutationQueue::NAME);
         $fallbackAfter = time();
         $fallbackReservedPayload = $fallbackReserved?->getReservedJob();
