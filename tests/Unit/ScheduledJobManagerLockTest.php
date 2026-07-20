@@ -22,13 +22,14 @@ it('uses WithoutOverlapping middleware with expireAfter to prevent stale locks',
     // Use reflection to check private properties
     $reflection = new ReflectionClass($overlappingMiddleware);
 
-    // Check expireAfter is set (should be 60 seconds - matches job frequency)
+    // The lock must outlive the bounded manager timeout so a large schedule census cannot overlap.
     $expiresAfterProperty = $reflection->getProperty('expiresAfter');
     $expiresAfterProperty->setAccessible(true);
     $expiresAfter = $expiresAfterProperty->getValue($overlappingMiddleware);
 
-    expect($expiresAfter)->toBe(90)
-        ->and($expiresAfter)->toBeGreaterThan(0, 'expireAfter must be set to prevent stale locks');
+    expect($expiresAfter)->toBe(ScheduledJobManager::OVERLAP_LEASE_SECONDS)
+        ->and($expiresAfter)->toBeGreaterThan($job->timeout)
+        ->and($job->timeout)->toBe(ScheduledJobManager::MANAGER_TIMEOUT_SECONDS);
 
     // Check releaseAfter is NOT set (we use dontRelease)
     $releaseAfterProperty = $reflection->getProperty('releaseAfter');

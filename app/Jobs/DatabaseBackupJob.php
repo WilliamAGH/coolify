@@ -2,6 +2,7 @@
 
 namespace App\Jobs;
 
+use App\Contracts\SupportsScheduledDispatchOccurrence;
 use App\Events\BackupCreated;
 use App\Models\S3Storage;
 use App\Models\ScheduledDatabaseBackup;
@@ -31,7 +32,7 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Throwable;
 
-class DatabaseBackupJob implements ShouldBeEncrypted, ShouldQueue
+class DatabaseBackupJob implements ShouldBeEncrypted, ShouldQueue, SupportsScheduledDispatchOccurrence
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
@@ -77,6 +78,8 @@ class DatabaseBackupJob implements ShouldBeEncrypted, ShouldQueue
 
     public ?string $backup_log_uuid = null;
 
+    private ?ScheduledDispatchOccurrence $scheduledDispatchOccurrence = null;
+
     public function __construct(public ScheduledDatabaseBackup $backup)
     {
         $this->onQueue(crons_queue());
@@ -87,7 +90,25 @@ class DatabaseBackupJob implements ShouldBeEncrypted, ShouldQueue
     {
         $expireAfter = ($this->backup->timeout ?? 3600) + 300;
 
-        return [(new WithoutOverlapping('database-backup-'.$this->backup->id))->expireAfter($expireAfter)->dontRelease()];
+        $middleware = [(new WithoutOverlapping('database-backup-'.$this->backup->id))->expireAfter($expireAfter)->dontRelease()];
+
+        if ($this->scheduledDispatchOccurrence !== null) {
+            array_unshift($middleware, $this->scheduledDispatchOccurrence);
+        }
+
+        return $middleware;
+    }
+
+    public function withScheduledDispatchOccurrence(ScheduledDispatchOccurrence $occurrence): static
+    {
+        $this->scheduledDispatchOccurrence = $occurrence;
+
+        return $this;
+    }
+
+    public function finalizeScheduledDispatchOccurrenceAfterFailure(): bool
+    {
+        return $this->scheduledDispatchOccurrence?->completeAfterTerminalFailure() ?? false;
     }
 
     public function handle(): void
@@ -820,6 +841,8 @@ class DatabaseBackupJob implements ShouldBeEncrypted, ShouldQueue
 
     public function failed(?Throwable $exception): void
     {
+        $this->finalizeScheduledDispatchOccurrenceAfterFailure();
+
         Log::channel('scheduled-errors')->error('DatabaseBackup permanently failed', [
             'job' => 'DatabaseBackupJob',
             'backup_id' => $this->backup->uuid,

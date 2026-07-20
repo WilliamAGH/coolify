@@ -2,12 +2,15 @@
 
 namespace App\Jobs;
 
+use App\Contracts\SupportsScheduledDispatchOccurrence;
 use App\Models\ScheduledDatabaseBackup;
 use App\Models\ScheduledTask;
 use App\Models\Server;
 use App\Models\Team;
+use Closure;
 use Cron\CronExpression;
 use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Bus\Dispatcher;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -18,12 +21,20 @@ use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Redis;
+use RuntimeException;
+use Throwable;
 
 class ScheduledJobManager implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     private const CHUNK_SIZE = 100;
+
+    public const MANAGER_TIMEOUT_SECONDS = 3600;
+
+    public const OVERLAP_LEASE_SECONDS = 3660;
+
+    public int $timeout = self::MANAGER_TIMEOUT_SECONDS;
 
     /**
      * The time when this job execution started.
@@ -55,7 +66,7 @@ class ScheduledJobManager implements ShouldQueue
 
         return [
             (new WithoutOverlapping('scheduled-job-manager'))
-                ->expireAfter(90)   // Lock expires after 90s to handle high-load environments with many tasks
+                ->expireAfter(self::OVERLAP_LEASE_SECONDS)
                 ->dontRelease(),    // Don't re-queue on lock conflict
         ];
     }
@@ -80,7 +91,7 @@ class ScheduledJobManager implements ShouldQueue
                     'lock_key' => $lockKey,
                 ]);
             }
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             // Never let lock cleanup failure prevent the job from running
             Log::channel('scheduled-errors')->error('Failed to check/clear stale lock', [
                 'error' => $e->getMessage(),
@@ -129,14 +140,14 @@ class ScheduledJobManager implements ShouldQueue
         // Write heartbeat so the UI can detect when the scheduler has stopped
         try {
             Cache::put('scheduled-job-manager:heartbeat', now()->toIso8601String(), 300);
-        } catch (\Throwable) {
+        } catch (Throwable) {
             // Non-critical; don't let heartbeat failure affect the job
         }
     }
 
     private function processScheduledBackupsAndTasks(): void
     {
-        $lastBackupId = 0;
+        $lastBackupId = null;
         $lastTaskId = 0;
 
         do {
@@ -177,11 +188,16 @@ class ScheduledJobManager implements ShouldQueue
         }
     }
 
-    private function scheduledBackupQuery(int $lastBackupId): Builder
+    private function scheduledBackupQuery(?int $lastBackupId): Builder
     {
-        return ScheduledDatabaseBackup::with(['database', 'team.subscription'])
-            ->where('enabled', true)
-            ->where('id', '>', $lastBackupId)
+        $query = ScheduledDatabaseBackup::with(['database', 'team.subscription'])
+            ->where('enabled', true);
+
+        if ($lastBackupId !== null) {
+            $query->where('id', '>', $lastBackupId);
+        }
+
+        return $query
             ->orderBy('id')
             ->limit(self::CHUNK_SIZE);
     }
@@ -282,8 +298,12 @@ class ScheduledJobManager implements ShouldQueue
                 return;
             }
 
-            if ($this->shouldDispatch($backup->frequency, $server, "scheduled-backup:{$backup->id}")) {
-                DatabaseBackupJob::dispatch($backup);
+            if ($this->dispatchReserved(
+                $backup->frequency,
+                $server,
+                "scheduled-backup:{$backup->id}",
+                fn (): DatabaseBackupJob => new DatabaseBackupJob($backup),
+            )) {
                 $this->dispatchedCount++;
                 Log::channel('scheduled')->info('Backup dispatched', [
                     'backup_id' => $backup->id,
@@ -313,10 +333,6 @@ class ScheduledJobManager implements ShouldQueue
                 return;
             }
 
-            if (! $this->shouldDispatch($task->frequency, $server, "scheduled-task:{$task->id}")) {
-                return;
-            }
-
             $runtimeSkip = $this->getTaskRuntimeSkipReason($task);
             if ($runtimeSkip !== null) {
                 $this->skippedCount++;
@@ -325,7 +341,14 @@ class ScheduledJobManager implements ShouldQueue
                 return;
             }
 
-            ScheduledTaskJob::dispatch($task);
+            if (! $this->dispatchReserved(
+                $task->frequency,
+                $server,
+                "scheduled-task:{$task->id}",
+                fn (): ScheduledTaskJob => new ScheduledTaskJob($task),
+            )) {
+                return;
+            }
             $this->dispatchedCount++;
             Log::channel('scheduled')->info('Task dispatched', [
                 'task_id' => $task->id,
@@ -431,13 +454,17 @@ class ScheduledJobManager implements ShouldQueue
 
             $frequency = data_get($server->settings, 'docker_cleanup_frequency', '0 * * * *');
 
-            if ($this->shouldDispatch($frequency, $server, "docker-cleanup:{$server->id}")) {
-                DockerCleanupJob::dispatch(
+            if ($this->dispatchReserved(
+                $frequency,
+                $server,
+                "docker-cleanup:{$server->id}",
+                fn (): DockerCleanupJob => new DockerCleanupJob(
                     $server,
                     false,
                     $server->settings->delete_unused_volumes,
-                    $server->settings->delete_unused_networks
-                );
+                    $server->settings->delete_unused_networks,
+                ),
+            )) {
                 $this->dispatchedCount++;
                 Log::channel('scheduled')->info('Docker cleanup dispatched', [
                     'server_id' => $server->id,
@@ -499,40 +526,89 @@ class ScheduledJobManager implements ShouldQueue
         ], $context));
     }
 
-    private function shouldDispatch(string $frequency, Server $server, string $dedupKey): bool
-    {
-        return shouldRunCronNow(
+    /** @param Closure(): object $makeJob */
+    private function dispatchReserved(
+        string $frequency,
+        Server $server,
+        string $dedupKey,
+        Closure $makeJob,
+    ): bool {
+        $reservation = reserveCronDispatch(
             $this->normalizeFrequency($frequency),
             $this->serverTimezone($server),
             $dedupKey,
             $this->executionTime,
         );
+        if ($reservation === null) {
+            return false;
+        }
+
+        try {
+            $job = $makeJob();
+            if (! $job instanceof SupportsScheduledDispatchOccurrence) {
+                throw new RuntimeException("Scheduled dispatch {$dedupKey} cannot carry its durable occurrence guard.");
+            }
+            $jobTimeout = is_numeric($job->timeout ?? null) ? (int) $job->timeout : 3600;
+            $job->withScheduledDispatchOccurrence(new ScheduledDispatchOccurrence(
+                $reservation,
+                max($jobTimeout + 300, 600),
+            ));
+        } catch (Throwable $exception) {
+            rollbackCronDispatchReservation($reservation);
+
+            throw $exception;
+        }
+
+        app(Dispatcher::class)->dispatch($job);
+
+        if (! commitCronDispatchReservation($reservation)) {
+            throw new RuntimeException("Scheduled dispatch {$dedupKey} was published but its deduplication reservation could not be committed.");
+        }
+
+        return true;
     }
 
     private function isDueCandidateBeforeExpensiveChecks(string $frequency, Server $server, string $dedupKey): bool
     {
         $cron = new CronExpression($this->normalizeFrequency($frequency));
         $executionTime = ($this->executionTime ?? Carbon::now())->copy()->setTimezone($this->serverTimezone($server));
-        $lastDispatched = Cache::get($dedupKey);
-        $previousDue = Carbon::instance($cron->getPreviousRunDate($executionTime, allowCurrentDate: true));
+        $lockKey = 'cron-dispatch-lock:'.hash('sha256', $dedupKey);
+        $reservationPointerKey = 'cron-dispatch-reservation:'.hash('sha256', $dedupKey);
 
-        if ($lastDispatched === null) {
-            $isDue = $cron->isDue($executionTime);
-
-            if (! $isDue) {
-                Cache::put($dedupKey, $previousDue->toIso8601String(), 2592000);
+        return Cache::lock($lockKey, 10)->block(5, function () use ($cron, $executionTime, $dedupKey, $reservationPointerKey): bool {
+            $reservationPointer = Cache::get($reservationPointerKey);
+            $reservationKey = is_array($reservationPointer)
+                ? ($reservationPointer['reservation_key'] ?? null)
+                : $reservationPointer;
+            $reservation = is_array($reservationPointer)
+                ? $reservationPointer
+                : (is_string($reservationKey) ? Cache::get($reservationKey) : null);
+            if (is_array($reservation) && ($reservation['state'] ?? null) === 'publishing') {
+                $reservedAt = Carbon::parse((string) ($reservation['reserved_at'] ?? $executionTime));
+                if ($reservedAt->lte($executionTime->copy()->subSeconds(30))) {
+                    return true;
+                }
             }
 
-            return $isDue;
-        }
+            $lastDispatched = Cache::get($dedupKey);
+            $previousDue = Carbon::instance($cron->getPreviousRunDate($executionTime, allowCurrentDate: true));
 
-        $shouldFire = $previousDue->gt(Carbon::parse($lastDispatched));
+            if ($lastDispatched === null) {
+                $isDue = $cron->isDue($executionTime);
+                if (! $isDue) {
+                    Cache::put($dedupKey, $previousDue->toIso8601String(), 2592000);
+                }
 
-        if (! $shouldFire) {
-            Cache::put($dedupKey, $previousDue->toIso8601String(), 2592000);
-        }
+                return $isDue;
+            }
 
-        return $shouldFire;
+            $shouldFire = $previousDue->gt(Carbon::parse($lastDispatched));
+            if (! $shouldFire) {
+                Cache::put($dedupKey, $lastDispatched, 2592000);
+            }
+
+            return $shouldFire;
+        });
     }
 
     private function normalizeFrequency(string $frequency): string
