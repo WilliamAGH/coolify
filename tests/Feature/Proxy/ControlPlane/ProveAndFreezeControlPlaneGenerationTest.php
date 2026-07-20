@@ -407,7 +407,7 @@ it('returns after one nonempty cardinality snapshot and finishes only after a ze
     }
 });
 
-it('requeues an expired crashed reservation only while its exact control-plane freeze owns quiescing', function (): void {
+it('keeps a live canonical reservation until deterministic worker-death expiry requeues its exact member', function (): void {
     [$server, $state, , $action, $token] = proveAndFreezePromotionFixture();
     [$queue, $queueKey, $cleanup] = proveAndFreezeIsolatedQueue();
     $payload = json_encode([
@@ -429,14 +429,16 @@ it('requeues an expired crashed reservation only while its exact control-plane f
     try {
         $queue->getConnection()->rpush($queueKey, $payload);
         $reserved = $queue->pop(ProxyMutationQueue::NAME);
-        expect($reserved)->not->toBeNull();
-        $queue->getConnection()->zadd(
+        $reservedPayload = $reserved?->getReservedJob();
+        if (! is_string($reservedPayload)) {
+            throw new RuntimeException('The test proxy-mutation worker did not create a reservation.');
+        }
+        $reservationExpiresAt = (int) $queue->getConnection()->zscore(
             $queueKey.':reserved',
-            time() - 1,
-            $reserved?->getReservedJob(),
+            $reservedPayload,
         );
 
-        $quiescing = $action->handle(
+        $liveQuiescing = $action->handle(
             $server,
             $state->operationId,
             $token,
@@ -444,13 +446,31 @@ it('requeues an expired crashed reservation only while its exact control-plane f
                 ? ''
                 : proveAndFreezeCandidateTranscript($state),
         );
-        $snapshot = ProxyMutationQueue::snapshot($queue);
+        $liveSnapshot = ProxyMutationQueue::snapshot($queue);
 
-        expect($quiescing->phase)->toBe(ControlPlaneGenerationPromotionPhase::Quiescing)
-            ->and($snapshot->freezeOperationId)->toBe($state->operationId)
-            ->and($snapshot->pending)->toBe(1)
-            ->and($snapshot->reserved)->toBe(0)
-            ->and($snapshot->delayed)->toBe(0);
+        expect($reservationExpiresAt)->toBeGreaterThan(time())
+            ->and($liveQuiescing->phase)->toBe(ControlPlaneGenerationPromotionPhase::Quiescing)
+            ->and($liveSnapshot->freezeOperationId)->toBe($state->operationId)
+            ->and($liveSnapshot->pending)->toBe(0)
+            ->and($liveSnapshot->reserved)->toBe(1)
+            ->and($liveSnapshot->delayed)->toBe(0)
+            ->and($queue->getConnection()->zscore($queueKey.':reserved', $reservedPayload))->not->toBeFalse();
+
+        $queue->getConnection()->zadd($queueKey.':reserved', time() - 1, $reservedPayload);
+        $recoveredQuiescing = $action->handle(
+            $server,
+            $state->operationId,
+            $token,
+            static fn (): never => throw new RuntimeException('A quiescing replay must not execute remotely.'),
+        );
+        $recoveredSnapshot = ProxyMutationQueue::snapshot($queue);
+
+        expect($recoveredQuiescing->phase)->toBe(ControlPlaneGenerationPromotionPhase::Quiescing)
+            ->and($recoveredSnapshot->freezeOperationId)->toBe($state->operationId)
+            ->and($recoveredSnapshot->pending)->toBe(1)
+            ->and($recoveredSnapshot->reserved)->toBe(0)
+            ->and($recoveredSnapshot->delayed)->toBe(0)
+            ->and($queue->getConnection()->lindex($queueKey, 0))->toBe($reservedPayload);
     } finally {
         $cleanup($state->operationId);
     }

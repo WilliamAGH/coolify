@@ -225,7 +225,7 @@ it('bounds canonical proxy-mutation reservations to the job timeout plus recover
     }
 });
 
-it('reaps only expired reservations owned by its exact live freeze fence', function (): void {
+it('rejects a stale reservation reaper fence after release and reacquisition, then recovers the exact member', function (): void {
     $queueKey = 'queues:proxy-mutation-reservation-reaper-'.Str::uuid();
     $queue = new class(app('redis'), ProxyMutationQueue::NAME, 'default', 86400, null, true, $queueKey) extends ProxyMutationRedisQueue
     {
@@ -250,8 +250,8 @@ it('reaps only expired reservations owned by its exact live freeze fence', funct
     $queue->setConnectionName(ProxyMutationQueue::CONNECTION);
     $queue->setContainer(app());
     $operationId = 'test-reservation-reaper-'.Str::uuid();
-    $freeze = ProxyMutationQueue::freeze($operationId, $queue);
-    $fence = $freeze->freezeFence ?? throw new RuntimeException('The test freeze did not issue a fence.');
+    $firstFreeze = ProxyMutationQueue::freeze($operationId, $queue);
+    $firstFence = $firstFreeze->freezeFence ?? throw new RuntimeException('The test freeze did not issue a fence.');
 
     try {
         $queue->getConnection()->rpush($queueKey, proxyMutationGatePayload(60));
@@ -261,21 +261,44 @@ it('reaps only expired reservations owned by its exact live freeze fence', funct
             throw new RuntimeException('The test proxy-mutation reservation was not created.');
         }
         $queue->getConnection()->zadd($queueKey.':reserved', time() - 1, $reservedPayload);
+        $beforeRelease = ProxyMutationQueue::snapshot($queue);
+
+        ProxyMutationQueue::unfreeze($operationId, $queue, $firstFence);
+        $successorFreeze = ProxyMutationQueue::freeze($operationId, $queue);
+        $successorFence = $successorFreeze->freezeFence
+            ?? throw new RuntimeException('The successor test freeze did not issue a fence.');
 
         expect(fn (): int => ProxyMutationQueue::reapExpiredReservations(
-            'foreign-reservation-reaper-'.Str::uuid(),
-            $fence,
+            $operationId,
+            $firstFence,
             $queue,
         ))->toThrow(RuntimeException::class, 'exact fenced control-plane owner');
-        expect(ProxyMutationQueue::snapshot($queue)->pending)->toBe(0)
-            ->and(ProxyMutationQueue::snapshot($queue)->reserved)->toBe(1)
-            ->and(ProxyMutationQueue::reapExpiredReservations($operationId, $fence, $queue))->toBe(1)
-            ->and(ProxyMutationQueue::snapshot($queue)->pending)->toBe(1)
-            ->and(ProxyMutationQueue::snapshot($queue)->reserved)->toBe(0);
+        $afterStaleFence = ProxyMutationQueue::snapshot($queue);
+
+        expect($beforeRelease->pending)->toBe(0)
+            ->and($beforeRelease->reserved)->toBe(1)
+            ->and($successorFence)->not->toBe($firstFence)
+            ->and($afterStaleFence->freezeOperationId)->toBe($operationId)
+            ->and($afterStaleFence->freezeFence)->toBe($successorFence)
+            ->and($afterStaleFence->pending)->toBe(0)
+            ->and($afterStaleFence->reserved)->toBe(1);
+
+        expect(ProxyMutationQueue::reapExpiredReservations($operationId, $successorFence, $queue))->toBe(1);
+        $recovered = ProxyMutationQueue::snapshot($queue);
+
+        expect($recovered->freezeOperationId)->toBe($operationId)
+            ->and($recovered->freezeFence)->toBe($successorFence)
+            ->and($recovered->pending)->toBe(1)
+            ->and($recovered->reserved)->toBe(0)
+            ->and($queue->getConnection()->lindex($queueKey, 0))->toBe($reservedPayload);
     } finally {
         $snapshot = ProxyMutationQueue::snapshot($queue);
         if ($snapshot->freezeOperationId === $operationId) {
-            ProxyMutationQueue::unfreeze($operationId, $queue, $fence);
+            ProxyMutationQueue::unfreeze(
+                $operationId,
+                $queue,
+                $snapshot->freezeFence ?? throw new RuntimeException('The test freeze did not issue a fence.'),
+            );
         }
         $queue->getConnection()->del(
             $queueKey,
