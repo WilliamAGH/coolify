@@ -18,6 +18,7 @@ final readonly class BlueGreenDeactivationResumeResult
         public int $stateId,
         public string $outcome,
         public string $message,
+        public ?BlueGreenDeactivationFailure $failure = null,
     ) {
         if (! in_array($this->outcome, [
             self::DEFERRED,

@@ -159,6 +159,8 @@ it('converges when each authorized schema commit exists without its migration le
         ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_routing_mutated_at'))->toBeTrue()
         ->and(Schema::hasColumn('application_blue_green_deployments', 'deactivation_started_at'))->toBeTrue()
         ->and(Schema::hasColumn('application_blue_green_deactivations', 'proxy_snapshot'))->toBeTrue()
+        ->and(Schema::hasColumns('application_blue_green_deployments', ['intervention_phase', 'intervention_reason']))->toBeTrue()
+        ->and(Schema::hasColumns('application_blue_green_deactivations', ['intervention_phase', 'intervention_reason']))->toBeTrue()
         ->and(Schema::hasColumn('application_blue_green_deployments', 'supersession_generation'))->toBeTrue()
         ->and(Schema::hasColumn('application_blue_green_deactivations', 'supersession_generation'))->toBeTrue()
         ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_supersession_generation'))->toBeTrue()
@@ -187,8 +189,14 @@ it('replays every earlier migration against the complete later schema', function
         'operation_drain_last_observed_connections',
         'operation_drain_observed_at',
         'supersession_generation',
+        'intervention_phase',
+        'intervention_reason',
     ]))->toBeTrue()
-        ->and(Schema::hasColumn('application_blue_green_deactivations', 'supersession_generation'))->toBeTrue()
+        ->and(Schema::hasColumns('application_blue_green_deactivations', [
+            'supersession_generation',
+            'intervention_phase',
+            'intervention_reason',
+        ]))->toBeTrue()
         ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_supersession_generation'))->toBeTrue()
         ->and(Schema::hasColumns('application_deployment_queues', [
             'blue_green_backend_port_inventory',
@@ -209,6 +217,8 @@ it('attests the complete schema through each migration public contract', functio
 
     expect(Schema::hasTable('application_blue_green_deactivations'))->toBeTrue()
         ->and(Schema::hasColumn('application_blue_green_deactivations', 'proxy_snapshot'))->toBeTrue()
+        ->and(Schema::hasColumns('application_blue_green_deployments', ['intervention_phase', 'intervention_reason']))->toBeTrue()
+        ->and(Schema::hasColumns('application_blue_green_deactivations', ['intervention_phase', 'intervention_reason']))->toBeTrue()
         ->and(Schema::hasColumn('application_blue_green_deployments', 'supersession_generation'))->toBeTrue()
         ->and(Schema::hasColumn('application_blue_green_deactivations', 'supersession_generation'))->toBeTrue()
         ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_supersession_generation'))->toBeTrue()
@@ -271,6 +281,32 @@ it('rejects backend port inventory columns with the wrong exact type', function 
 
     expect(fn () => blueGreenMigration('2026_07_20_000000_add_blue_green_backend_port_inventories_to_deployment_queues')->up())
         ->toThrow(RuntimeException::class, 'not match the authorized');
+});
+
+it('rejects partial later-owned intervention reason groups during foundation replay', function (): void {
+    removeBlueGreenExpandSchema();
+    $deploymentMigration = blueGreenMigration('2026_07_12_000001_create_application_blue_green_deployments_table');
+    $deactivationMigration = blueGreenMigration('2026_07_12_000011_create_application_blue_green_deactivations_table');
+    $deploymentMigration->up();
+    $deactivationMigration->up();
+
+    Schema::table('application_blue_green_deployments', function (Blueprint $table): void {
+        $table->string('intervention_phase', 32)->nullable();
+    });
+    Schema::table('application_blue_green_deactivations', function (Blueprint $table): void {
+        $table->string('intervention_reason', 2048)->nullable();
+    });
+
+    expect(fn () => $deploymentMigration->up())
+        ->toThrow(RuntimeException::class, blueGreenMigrationMismatchMessage(
+            'Existing blue-green deployment table has an unexpected column set.',
+            'Existing blue-green deployment PostgreSQL catalog does not match the authorized schema.',
+        ));
+    expect(fn () => $deactivationMigration->up())
+        ->toThrow(RuntimeException::class, blueGreenMigrationMismatchMessage(
+            'Existing blue-green deactivation table has an unexpected column set.',
+            'Existing blue-green deactivation PostgreSQL catalog does not match the authorized schema.',
+        ));
 });
 
 it('rejects an inactive retention setting with the wrong exact type', function () {

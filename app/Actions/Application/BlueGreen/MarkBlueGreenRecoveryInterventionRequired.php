@@ -24,13 +24,16 @@ final class MarkBlueGreenRecoveryInterventionRequired
         int $stateId,
         ?string $expectedOperationUuid,
         ?int $expectedSupersessionGeneration = null,
+        ?string $reason = null,
     ): bool {
+        $reason = $this->normalizeReason($reason);
         $notificationApplicationId = null;
         $notificationOperationUuid = null;
         $recorded = DB::transaction(function () use (
             $stateId,
             $expectedOperationUuid,
             $expectedSupersessionGeneration,
+            $reason,
             &$notificationApplicationId,
             &$notificationOperationUuid,
         ): bool {
@@ -77,7 +80,7 @@ final class MarkBlueGreenRecoveryInterventionRequired
             }
             if ($state->operation_deployment_uuid === null
                 && ($operationUuid === null || $locks->queue($operationUuid) === null)) {
-                $recorded = $this->terminalizeStateWithoutQueue($state, $generation, $operationUuid);
+                $recorded = $this->terminalizeStateWithoutQueue($state, $generation, $operationUuid, $reason);
                 if ($recorded) {
                     $notificationApplicationId = $locks->application->id;
                     $notificationOperationUuid = $operationUuid;
@@ -86,7 +89,7 @@ final class MarkBlueGreenRecoveryInterventionRequired
                 return $recorded;
             }
             if ($operationUuid === null) {
-                $recorded = $this->terminalizeStateWithoutQueue($state, $generation, null);
+                $recorded = $this->terminalizeStateWithoutQueue($state, $generation, null, $reason);
                 if ($recorded) {
                     $notificationApplicationId = $locks->application->id;
                 }
@@ -126,7 +129,11 @@ final class MarkBlueGreenRecoveryInterventionRequired
                         ->where('status', ApplicationDeploymentStatus::FAILED->value)
                         ->whereNotNull('finished_at');
                 })
-                ->update(['phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED->value]);
+                ->update([
+                    'phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED->value,
+                    'intervention_phase' => $state->phase->value,
+                    'intervention_reason' => $reason,
+                ]);
             if ($stateUpdated !== 1) {
                 throw new BlueGreenDeploymentTransitionException('The blue-green operation changed while reconciliation intervention was recorded.');
             }
@@ -156,6 +163,7 @@ final class MarkBlueGreenRecoveryInterventionRequired
         ApplicationBlueGreenDeployment $state,
         int $generation,
         ?string $expectedPendingDeploymentUuid,
+        string $reason,
     ): bool {
         $query = ApplicationBlueGreenDeployment::query()
             ->whereKey($state->getKey())
@@ -169,7 +177,18 @@ final class MarkBlueGreenRecoveryInterventionRequired
             ? $query->whereNull('pending_deployment_uuid')
             : $query->where('pending_deployment_uuid', $expectedPendingDeploymentUuid);
 
-        return $query->update(['phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED->value]) === 1;
+        return $query->update([
+            'phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED->value,
+            'intervention_phase' => $state->phase->value,
+            'intervention_reason' => $reason,
+        ]) === 1;
+    }
+
+    private function normalizeReason(?string $reason): string
+    {
+        return BlueGreenDeactivationFailure::publicReason(
+            $reason ?? 'Blue-green recovery could not prove a safe continuation.',
+        );
     }
 
     private function alreadyTerminalized(

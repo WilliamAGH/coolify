@@ -164,6 +164,11 @@
         JS;
     @endphp
     <x-resources.breadcrumbs :resource="$application" :parameters="$parameters" :title="$lastDeploymentInfo" :lastDeploymentLink="$lastDeploymentLink" />
+    @if ($blueGreenIntervention !== null)
+        <div role="alert" class="pb-2 text-xs text-warning dark:text-warning">
+            Blue-green {{ $blueGreenIntervention['phase'] }} ({{ $blueGreenIntervention['sourcePhase'] }}) for destination {{ $blueGreenIntervention['destinationId'] }} requires operator intervention. Reason: {{ $blueGreenIntervention['reason'] }}
+        </div>
+    @endif
     @if ($blueGreenInactiveRetirement !== null)
         <div class="pb-2 text-xs text-neutral-500 dark:text-neutral-400">
             @if ($blueGreenInactiveRetirement['status'] === 'stopped')

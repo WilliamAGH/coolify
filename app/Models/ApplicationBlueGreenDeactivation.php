@@ -24,6 +24,8 @@ final class ApplicationBlueGreenDeactivation extends Model
         'supersession_generation',
         'phase',
         'completed_at',
+        'intervention_phase',
+        'intervention_reason',
     ];
 
     protected $hidden = [

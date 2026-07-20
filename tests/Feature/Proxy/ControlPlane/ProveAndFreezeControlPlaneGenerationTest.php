@@ -12,6 +12,7 @@ use App\Actions\Proxy\ControlPlane\ControlPlaneProxyExposure;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyRouteProof;
 use App\Actions\Proxy\ControlPlane\InstallControlPlaneCandidateHealthMarkers;
 use App\Actions\Proxy\ControlPlane\ProveAndFreezeControlPlaneGeneration;
+use App\Actions\Proxy\ControlPlane\RecoverStaleControlPlaneMutationFreeze;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneGenerationPromotionState;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
 use App\Actions\Proxy\ControlPlane\VerifyControlPlaneCandidateMembers;
@@ -153,7 +154,11 @@ function proveAndFreezeIsolatedQueue(?Closure $onConnection = null): array
         try {
             $snapshot = ProxyMutationQueue::snapshot($queue);
             if ($snapshot->freezeOperationId === $operationId) {
-                ProxyMutationQueue::unfreeze($operationId, $queue);
+                ProxyMutationQueue::unfreeze(
+                    $operationId,
+                    $queue,
+                    $snapshot->freezeFence ?? throw new RuntimeException('The test freeze did not issue a fence.'),
+                );
             }
         } finally {
             try {
@@ -254,7 +259,7 @@ it('proves exact successor members before atomically freezing and quiescing', fu
             ->and($commands[1])->toContain("'docker' 'exec' '".str_repeat('e', 64)."'")
             ->and($commands[1])->toContain('docker inspect --type container')
             ->and(array_map(static fn (?ControlPlaneGenerationPromotionPhase $phase): ?string => $phase?->value, $connectionPhases))
-            ->toBe(['freezing', 'quiescing'])
+            ->toBe(['freezing', 'frozen', 'quiescing', 'quiescing', 'quiescing'])
             ->and(ProxyMutationQueue::snapshot($queue)->freezeOperationId)->toBe($state->operationId);
 
         $replayed = $action->handle(
@@ -327,6 +332,47 @@ it('replays an already-owned atomic freeze after a crash before frozen evidence 
     }
 });
 
+it('reacquires a fenced lease before recording break-glass intervention', function (): void {
+    [$server, $state, $store, $action, $token] = proveAndFreezePromotionFixture();
+    [$queue, , $cleanup] = proveAndFreezeIsolatedQueue();
+
+    try {
+        $quiesced = $action->handle(
+            $server,
+            $state->operationId,
+            $token,
+            fn (string $command): string => str_contains($command, ControlPlaneCandidateHealthMarker::CONTAINER_MARKER_PATH)
+                ? ''
+                : proveAndFreezeCandidateTranscript($state),
+        );
+        $expiredFence = $quiesced->mutationFreezeFence();
+        ProxyMutationQueue::unfreeze($quiesced->operationId, $queue, $expiredFence);
+
+        $recorded = (new RecoverStaleControlPlaneMutationFreeze($store))->handle(
+            $server,
+            $quiesced->operationId,
+            $token,
+            $quiesced->writerEpoch,
+            'The expired bounded lease was recovered through the audited break-glass path.',
+        );
+
+        $recovered = $store->read($server);
+        $snapshot = ProxyMutationQueue::snapshot($queue);
+        expect($recorded)->toBeTrue()
+            ->and($recovered?->phase)->toBe(ControlPlaneGenerationPromotionPhase::InterventionRequired)
+            ->and($recovered?->mutationFreezeFence())->not->toBe($expiredFence)
+            ->and($snapshot->freezeOperationId)->toBe($quiesced->operationId)
+            ->and($snapshot->freezeFence)->toBe($recovered?->mutationFreezeFence())
+            ->and(fn (): mixed => ProxyMutationQueue::renewFreeze(
+                $quiesced->operationId,
+                $queue,
+                expectedFence: $expiredFence,
+            ))->toThrow(RuntimeException::class, 'owning operation');
+    } finally {
+        $cleanup($state->operationId);
+    }
+});
+
 it('returns after one nonempty cardinality snapshot and finishes only after a zero replay', function (): void {
     [$server, $state, , $action, $token] = proveAndFreezePromotionFixture();
     [$queue, $queueKey, $cleanup] = proveAndFreezeIsolatedQueue();
@@ -356,6 +402,55 @@ it('returns after one nonempty cardinality snapshot and finishes only after a ze
 
         expect($quiesced->phase)->toBe(ControlPlaneGenerationPromotionPhase::Quiesced)
             ->and($quiesced->queueInventory)->toMatchArray(['pending' => 0, 'reserved' => 0, 'delayed' => 0]);
+    } finally {
+        $cleanup($state->operationId);
+    }
+});
+
+it('requeues an expired crashed reservation only while its exact control-plane freeze owns quiescing', function (): void {
+    [$server, $state, , $action, $token] = proveAndFreezePromotionFixture();
+    [$queue, $queueKey, $cleanup] = proveAndFreezeIsolatedQueue();
+    $payload = json_encode([
+        'uuid' => (string) Str::uuid(),
+        'id' => (string) Str::uuid(),
+        'displayName' => 'ProxyMutationWorkerCrashFixture',
+        'job' => 'Illuminate\\Queue\\CallQueuedHandler@call',
+        'maxTries' => 1,
+        'maxExceptions' => null,
+        'failOnTimeout' => false,
+        'backoff' => null,
+        'timeout' => 60,
+        'retryUntil' => null,
+        'data' => [],
+        'attempts' => 0,
+        ProxyMutationQueue::PAYLOAD_MARKER => true,
+    ], JSON_THROW_ON_ERROR);
+
+    try {
+        $queue->getConnection()->rpush($queueKey, $payload);
+        $reserved = $queue->pop(ProxyMutationQueue::NAME);
+        expect($reserved)->not->toBeNull();
+        $queue->getConnection()->zadd(
+            $queueKey.':reserved',
+            time() - 1,
+            $reserved?->getReservedJob(),
+        );
+
+        $quiescing = $action->handle(
+            $server,
+            $state->operationId,
+            $token,
+            fn (string $command): string => str_contains($command, ControlPlaneCandidateHealthMarker::CONTAINER_MARKER_PATH)
+                ? ''
+                : proveAndFreezeCandidateTranscript($state),
+        );
+        $snapshot = ProxyMutationQueue::snapshot($queue);
+
+        expect($quiescing->phase)->toBe(ControlPlaneGenerationPromotionPhase::Quiescing)
+            ->and($snapshot->freezeOperationId)->toBe($state->operationId)
+            ->and($snapshot->pending)->toBe(1)
+            ->and($snapshot->reserved)->toBe(0)
+            ->and($snapshot->delayed)->toBe(0);
     } finally {
         $cleanup($state->operationId);
     }
@@ -399,7 +494,13 @@ it('rejects foreign durable and mutation-freeze owners without remote work', fun
             '2026-07-19T12:04:00Z',
             [
                 'runtime_fence' => ['epoch' => $freezing->writerEpoch, 'observed_at' => '2026-07-19T12:04:00Z'],
-                'mutation_freeze' => ['operation_id' => $state->operationId, 'observed_at' => '2026-07-19T12:04:00Z'],
+                'mutation_freeze' => [
+                    'operation_id' => $state->operationId,
+                    'observed_at' => '2026-07-19T12:04:00Z',
+                    'fence' => 'foreign-owner-test-fence',
+                    'heartbeat_at' => '2026-07-19T12:04:00Z',
+                    'lease_seconds' => ProxyMutationQueue::MINIMUM_FREEZE_LEASE_SECONDS,
+                ],
             ],
         );
         expect(fn (): ControlPlaneGenerationPromotionState => $action->handle(
@@ -407,13 +508,17 @@ it('rejects foreign durable and mutation-freeze owners without remote work', fun
             $state->operationId,
             $token,
             static fn (): never => throw new RuntimeException('A quiescing owner check must not execute remotely.'),
-        ))->toThrow(RuntimeException::class, 'mutation freeze is owned by another operation');
-        expect($store->read($server)?->phase)->toBe(ControlPlaneGenerationPromotionPhase::Quiescing)
+        ))->toThrow(RuntimeException::class, 'can only be renewed by its owning operation');
+        expect($store->read($server)?->phase)->toBe(ControlPlaneGenerationPromotionPhase::Frozen)
             ->and($frozen->phase)->toBe(ControlPlaneGenerationPromotionPhase::Frozen);
     } finally {
         $snapshot = ProxyMutationQueue::snapshot($queue);
         if ($snapshot->freezeOperationId === $foreignOperationId) {
-            ProxyMutationQueue::unfreeze($foreignOperationId, $queue);
+            ProxyMutationQueue::unfreeze(
+                $foreignOperationId,
+                $queue,
+                $snapshot->freezeFence ?? throw new RuntimeException('The foreign test freeze did not issue a fence.'),
+            );
         }
         $cleanup($state->operationId);
     }

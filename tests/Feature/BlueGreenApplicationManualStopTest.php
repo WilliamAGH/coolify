@@ -226,7 +226,7 @@ it('resumes an immutable route-less replacement after its durable record fails a
     });
 
     expect(fn () => StopApplication::run($application, dockerCleanup: false))
-        ->toThrow(BlueGreenDeactivationTransportException::class, 'manual-stop route-less durable record failure');
+        ->toThrow(BlueGreenDeactivationTransportException::class, 'Blue-green deactivation transport did not prove completion.');
 
     $failedState = $state->fresh();
     $failedDeactivation = ApplicationBlueGreenDeactivation::query()->sole();
@@ -435,7 +435,7 @@ it('does not run Docker work when a manual stop loses a destination fence', func
 
     try {
         expect(fn () => StopApplication::run($application, dockerCleanup: false))
-            ->toThrow(BlueGreenDeactivationInProgressException::class);
+            ->toThrow(BlueGreenDeactivationInProgressException::class, 'Another blue-green lifecycle operation owns one of the application destinations required for deletion.');
     } finally {
         $released = $lock->release();
     }

@@ -21,11 +21,32 @@ class ProxyMutationQueueGateJob implements ProxyMutation
 {
     use Queueable;
     use UsesProxyMutationQueue;
+
+    public int $timeout = 60;
 }
 
 function proxyMutationGateJob(): object
 {
     return new ProxyMutationQueueGateJob;
+}
+
+function proxyMutationGatePayload(?int $timeout): string
+{
+    return json_encode([
+        'uuid' => (string) Str::uuid(),
+        'id' => (string) Str::uuid(),
+        'displayName' => ProxyMutationQueueGateJob::class,
+        'job' => 'Illuminate\\Queue\\CallQueuedHandler@call',
+        'maxTries' => 1,
+        'maxExceptions' => null,
+        'failOnTimeout' => false,
+        'backoff' => null,
+        'timeout' => $timeout,
+        'retryUntil' => null,
+        'data' => [],
+        'attempts' => 0,
+        ProxyMutationQueue::PAYLOAD_MARKER => true,
+    ], JSON_THROW_ON_ERROR);
 }
 
 function proxyMutationGateQueue(Container $container): ProxyMutationRedisQueue
@@ -118,7 +139,7 @@ it('atomically freezes ready and delayed admission using cardinality-only snapsh
             ->toThrow(ProxyMutationQueueFrozenException::class)
             ->and(ProxyMutationQueue::snapshot($queue)->isEmpty())->toBeTrue();
 
-        ProxyMutationQueue::unfreeze($operationId, $queue);
+        ProxyMutationQueue::unfreeze($operationId, $queue, $frozen->freezeFence);
         expect($queue->pushRaw($payload, ProxyMutationQueue::NAME))->not->toBeNull()
             ->and($queue->delayedRawForTest(60, $payload))->not->toBeNull();
         $admitted = ProxyMutationQueue::snapshot($queue);
@@ -129,7 +150,132 @@ it('atomically freezes ready and delayed admission using cardinality-only snapsh
     } finally {
         $snapshot = ProxyMutationQueue::snapshot($queue);
         if ($snapshot->freezeOperationId === $operationId) {
-            ProxyMutationQueue::unfreeze($operationId, $queue);
+            ProxyMutationQueue::unfreeze($operationId, $queue, $snapshot->freezeFence);
+        }
+        $queue->getConnection()->del(
+            $queueKey,
+            $queueKey.':reserved',
+            $queueKey.':delayed',
+            $queueKey.':notify',
+        );
+    }
+});
+
+it('bounds canonical proxy-mutation reservations to the job timeout plus recovery grace', function (): void {
+    $queueKey = 'queues:proxy-mutation-reservation-timeout-'.Str::uuid();
+    $queue = new class(app('redis'), ProxyMutationQueue::NAME, 'default', 86400, null, true, $queueKey) extends ProxyMutationRedisQueue
+    {
+        public function __construct(
+            mixed $redis,
+            string $default,
+            string $connection,
+            int $retryAfter,
+            mixed $blockFor,
+            bool $dispatchAfterCommit,
+            private readonly string $testQueueKey,
+        ) {
+            parent::__construct($redis, $default, $connection, $retryAfter, $blockFor, $dispatchAfterCommit);
+        }
+
+        #[Override]
+        public function getQueue($queue): string
+        {
+            return $this->testQueueKey;
+        }
+    };
+    $queue->setConnectionName(ProxyMutationQueue::CONNECTION);
+    $queue->setContainer(app());
+    $payload = proxyMutationGatePayload(60);
+
+    try {
+        $before = time();
+        $queue->getConnection()->rpush($queueKey, $payload);
+        $reserved = $queue->pop(ProxyMutationQueue::NAME);
+        $after = time();
+        $reservedPayload = $reserved?->getReservedJob();
+        $reservedUntil = is_string($reservedPayload)
+            ? (int) $queue->getConnection()->zscore($queueKey.':reserved', $reservedPayload)
+            : 0;
+        $retryAfter = ProxyMutationQueue::reservationRetryAfterSeconds(60);
+
+        expect($reserved)->not->toBeNull()
+            ->and($reservedUntil)->toBeGreaterThanOrEqual($before + $retryAfter)
+            ->and($reservedUntil)->toBeLessThanOrEqual($after + $retryAfter);
+
+        $fallbackBefore = time();
+        $queue->getConnection()->rpush($queueKey, proxyMutationGatePayload(null));
+        $fallbackReserved = $queue->pop(ProxyMutationQueue::NAME);
+        $fallbackAfter = time();
+        $fallbackReservedPayload = $fallbackReserved?->getReservedJob();
+        $fallbackReservedUntil = is_string($fallbackReservedPayload)
+            ? (int) $queue->getConnection()->zscore($queueKey.':reserved', $fallbackReservedPayload)
+            : 0;
+        $fallbackRetryAfter = ProxyMutationQueue::reservationRetryAfterSeconds(null);
+
+        expect($fallbackReserved)->not->toBeNull()
+            ->and($fallbackReservedUntil)->toBeGreaterThanOrEqual($fallbackBefore + $fallbackRetryAfter)
+            ->and($fallbackReservedUntil)->toBeLessThanOrEqual($fallbackAfter + $fallbackRetryAfter);
+    } finally {
+        $queue->getConnection()->del(
+            $queueKey,
+            $queueKey.':reserved',
+            $queueKey.':delayed',
+            $queueKey.':notify',
+        );
+    }
+});
+
+it('reaps only expired reservations owned by its exact live freeze fence', function (): void {
+    $queueKey = 'queues:proxy-mutation-reservation-reaper-'.Str::uuid();
+    $queue = new class(app('redis'), ProxyMutationQueue::NAME, 'default', 86400, null, true, $queueKey) extends ProxyMutationRedisQueue
+    {
+        public function __construct(
+            mixed $redis,
+            string $default,
+            string $connection,
+            int $retryAfter,
+            mixed $blockFor,
+            bool $dispatchAfterCommit,
+            private readonly string $testQueueKey,
+        ) {
+            parent::__construct($redis, $default, $connection, $retryAfter, $blockFor, $dispatchAfterCommit);
+        }
+
+        #[Override]
+        public function getQueue($queue): string
+        {
+            return $this->testQueueKey;
+        }
+    };
+    $queue->setConnectionName(ProxyMutationQueue::CONNECTION);
+    $queue->setContainer(app());
+    $operationId = 'test-reservation-reaper-'.Str::uuid();
+    $freeze = ProxyMutationQueue::freeze($operationId, $queue);
+    $fence = $freeze->freezeFence ?? throw new RuntimeException('The test freeze did not issue a fence.');
+
+    try {
+        $queue->getConnection()->rpush($queueKey, proxyMutationGatePayload(60));
+        $reserved = $queue->pop(ProxyMutationQueue::NAME);
+        $reservedPayload = $reserved?->getReservedJob();
+        if (! is_string($reservedPayload)) {
+            throw new RuntimeException('The test proxy-mutation reservation was not created.');
+        }
+        $queue->getConnection()->zadd($queueKey.':reserved', time() - 1, $reservedPayload);
+
+        expect(fn (): int => ProxyMutationQueue::reapExpiredReservations(
+            'foreign-reservation-reaper-'.Str::uuid(),
+            $fence,
+            $queue,
+        ))->toThrow(RuntimeException::class, 'exact fenced control-plane owner');
+        expect(ProxyMutationQueue::snapshot($queue)->pending)->toBe(0)
+            ->and(ProxyMutationQueue::snapshot($queue)->reserved)->toBe(1)
+            ->and(ProxyMutationQueue::reapExpiredReservations($operationId, $fence, $queue))->toBe(1)
+            ->and(ProxyMutationQueue::snapshot($queue)->pending)->toBe(1)
+            ->and(ProxyMutationQueue::snapshot($queue)->reserved)->toBe(0);
+    } finally {
+        $snapshot = ProxyMutationQueue::snapshot($queue);
+        if ($snapshot->freezeOperationId === $operationId) {
+            ProxyMutationQueue::unfreeze($operationId, $queue, $fence);
         }
         $queue->getConnection()->del(
             $queueKey,
@@ -145,18 +291,88 @@ it('keeps freeze ownership fail closed across replay and foreign release attempt
     $operationId = 'test-owner-'.Str::uuid();
 
     try {
-        expect(ProxyMutationQueue::freeze($operationId, $queue)->freezeOperationId)->toBe($operationId)
-            ->and(ProxyMutationQueue::freeze($operationId, $queue)->freezeOperationId)->toBe($operationId)
+        $frozen = ProxyMutationQueue::freeze($operationId, $queue);
+        expect($frozen->freezeOperationId)->toBe($operationId)
+            ->and($frozen->freezeFence)->not->toBeNull()
+            ->and(ProxyMutationQueue::freeze($operationId, $queue)->freezeFence)->toBe($frozen->freezeFence)
             ->and(fn (): mixed => ProxyMutationQueue::freeze('foreign-'.Str::uuid(), $queue))
             ->toThrow(RuntimeException::class, 'another control-plane operation')
-            ->and(fn (): mixed => ProxyMutationQueue::unfreeze('foreign-'.Str::uuid(), $queue))
+            ->and(fn (): mixed => ProxyMutationQueue::unfreeze(
+                'foreign-'.Str::uuid(),
+                $queue,
+                $frozen->freezeFence ?? throw new RuntimeException('The test freeze did not issue a fence.'),
+            ))
             ->toThrow(RuntimeException::class, 'owning operation');
     } finally {
         $snapshot = ProxyMutationQueue::snapshot($queue);
         if ($snapshot->freezeOperationId === $operationId) {
-            ProxyMutationQueue::unfreeze($operationId, $queue);
+            ProxyMutationQueue::unfreeze(
+                $operationId,
+                $queue,
+                $snapshot->freezeFence ?? throw new RuntimeException('The test freeze did not issue a fence.'),
+            );
         }
     }
+});
+
+it('uses a fenced lease that rejects a stale owner after the same operation is reacquired', function () {
+    $queue = proxyMutationGateQueue(app());
+    $operationId = 'test-lease-'.Str::uuid();
+    $leaseSeconds = ProxyMutationQueue::MINIMUM_FREEZE_LEASE_SECONDS;
+
+    try {
+        $frozen = ProxyMutationQueue::freeze($operationId, $queue, leaseSeconds: $leaseSeconds);
+        $fence = $frozen->freezeFence;
+
+        expect($frozen->hasRenewableFreezeLease())->toBeTrue()
+            ->and($frozen->hasFencedRenewableFreezeLease())->toBeTrue()
+            ->and($fence)->not->toBeNull()
+            ->and($frozen->freezeLeaseMilliseconds)->toBeGreaterThan(0)
+            ->and(fn (): mixed => ProxyMutationQueue::renewFreeze(
+                $operationId,
+                $queue,
+                leaseSeconds: $leaseSeconds,
+            ))->toThrow(LogicException::class, 'exact fence')
+            ->and(fn (): mixed => ProxyMutationQueue::unfreeze($operationId, $queue))
+            ->toThrow(LogicException::class, 'exact fence')
+            ->and(fn (): mixed => ProxyMutationQueue::renewFreeze(
+                'foreign-'.Str::uuid(),
+                $queue,
+                leaseSeconds: $leaseSeconds,
+                expectedFence: $fence ?? throw new RuntimeException('The test freeze did not issue a fence.'),
+            ))->toThrow(RuntimeException::class, 'owning operation')
+            ->and(ProxyMutationQueue::renewFreeze(
+                $operationId,
+                $queue,
+                leaseSeconds: $leaseSeconds,
+                expectedFence: $fence,
+            )->hasRenewableFreezeLease())->toBeTrue();
+
+        ProxyMutationQueue::unfreeze($operationId, $queue, $fence);
+        $reacquired = ProxyMutationQueue::freeze($operationId, $queue, leaseSeconds: $leaseSeconds);
+
+        expect($reacquired->freezeFence)->not->toBe($fence)
+            ->and(fn (): mixed => ProxyMutationQueue::renewFreeze(
+                $operationId,
+                $queue,
+                leaseSeconds: $leaseSeconds,
+                expectedFence: $fence,
+            ))->toThrow(RuntimeException::class, 'owning operation');
+    } finally {
+        $snapshot = ProxyMutationQueue::snapshot($queue);
+        if ($snapshot->freezeOperationId === $operationId) {
+            ProxyMutationQueue::unfreeze(
+                $operationId,
+                $queue,
+                $snapshot->freezeFence ?? throw new RuntimeException('The test freeze did not issue a fence.'),
+            );
+        }
+    }
+});
+
+it('rejects a lease shorter than the bounded control-plane drain window', function (): void {
+    expect(fn (): int => ProxyMutationQueue::freezeLeaseSeconds(ProxyMutationQueue::MINIMUM_FREEZE_LEASE_SECONDS - 1))
+        ->toThrow(LogicException::class, 'bounded recovery window');
 });
 
 it('serializes typed mutations only on the canonical Redis queue', function () {

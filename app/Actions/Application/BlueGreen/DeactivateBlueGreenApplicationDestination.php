@@ -29,19 +29,25 @@ final class DeactivateBlueGreenApplicationDestination
         ?string $expectedOperationId = null,
         ?int $expectedSupersessionGeneration = null,
         BlueGreenDeactivationPhase $requestedPhase = BlueGreenDeactivationPhase::DEACTIVATING,
+        ?BlueGreenOperationFence $operationFence = null,
     ): bool {
-        $leaseSeconds = BlueGreenDeploymentLock::deactivationLeaseSeconds();
-        $lifecycleLock = Cache::lock(
-            BlueGreenDeploymentLock::key($application->id, $standaloneDockerId),
-            $leaseSeconds,
-        );
-        if (! $lifecycleLock->get()) {
-            throw new BlueGreenDeactivationInProgressException('Another blue-green lifecycle operation is already in progress for this application destination.');
+        $releaseOperationFence = false;
+        if ($operationFence === null) {
+            $leaseSeconds = BlueGreenDeploymentLock::deactivationLeaseSeconds();
+            $lifecycleLock = Cache::lock(
+                BlueGreenDeploymentLock::key($application->id, $standaloneDockerId),
+                $leaseSeconds,
+            );
+            if (! $lifecycleLock->get()) {
+                throw new BlueGreenDeactivationInProgressException('Another blue-green lifecycle operation is already in progress for this application destination.');
+            }
+            $operationFence = new BlueGreenOperationFence($lifecycleLock, $leaseSeconds);
+            $releaseOperationFence = true;
         }
-        $operationFence = new BlueGreenOperationFence($lifecycleLock, $leaseSeconds);
 
         $preparation = null;
         try {
+            $operationFence->assertLockOwnership();
             $preparation = PrepareBlueGreenDeactivation::run(
                 $application,
                 $standaloneDockerId,
@@ -92,37 +98,20 @@ final class DeactivateBlueGreenApplicationDestination
         } catch (BlueGreenDeactivationInProgressException $exception) {
             throw $exception;
         } catch (BlueGreenDeactivationTransportException $exception) {
-            throw new BlueGreenDeactivationTransportException(
-                'Blue-green deactivation transport did not prove completion; the durable operation remains resumable: '.$exception->getMessage(),
-                (int) $exception->getCode(),
-                $exception,
-            );
+            throw $exception;
         } catch (BlueGreenDeactivationException $exception) {
-            if ($preparation !== null) {
-                try {
-                    $operationFence->assertDeactivationOwnership($preparation);
-                } catch (BlueGreenOperationFenceLostException $fenceException) {
-                    throw new BlueGreenDeactivationInProgressException(
-                        'The durable deactivation owner changed while intervention was being recorded; the newer owner was left untouched.',
-                        (int) $fenceException->getCode(),
-                        $fenceException,
-                    );
-                }
-                $this->requireIntervention($preparation, $exception);
-            }
+            $this->recordInterventionForPreparedFailure($preparation, $operationFence, $exception);
 
             throw $exception;
         } catch (Throwable $exception) {
-            throw new BlueGreenDeactivationTransportException(
-                'Blue-green deactivation transport did not prove completion; the durable operation remains resumable: '.$exception->getMessage(),
-                (int) $exception->getCode(),
-                $exception,
-            );
+            throw BlueGreenDeactivationTransportException::fromThrowable($exception);
         } finally {
-            try {
-                $operationFence->releaseIfOwned();
-            } catch (Throwable $releaseException) {
-                report($releaseException);
+            if ($releaseOperationFence) {
+                try {
+                    $operationFence->releaseIfOwned();
+                } catch (Throwable $releaseException) {
+                    report($releaseException);
+                }
             }
         }
     }
@@ -377,19 +366,45 @@ final class DeactivateBlueGreenApplicationDestination
             );
         } catch (BlueGreenDeploymentTransitionException|\InvalidArgumentException $exception) {
             throw new BlueGreenDeactivationException(
-                'The durable destination proxy state is malformed and requires intervention: '.$exception->getMessage(),
+                'The durable destination proxy state is malformed and requires intervention.',
                 (int) $exception->getCode(),
                 $exception,
+                BlueGreenDeactivationFailure::fromThrowable(
+                    $exception,
+                    'The durable destination proxy state is malformed and requires intervention.',
+                ),
             );
         }
+    }
+
+    private function recordInterventionForPreparedFailure(
+        ?BlueGreenDeactivationPreparation $preparation,
+        BlueGreenOperationFence $operationFence,
+        BlueGreenDeactivationException $exception,
+    ): void {
+        if ($preparation === null) {
+            return;
+        }
+
+        try {
+            $operationFence->assertDeactivationOwnership($preparation);
+        } catch (BlueGreenOperationFenceLostException $fenceException) {
+            throw new BlueGreenDeactivationInProgressException(
+                'The durable deactivation owner changed while intervention was being recorded; the newer owner was left untouched.',
+                (int) $fenceException->getCode(),
+                $fenceException,
+            );
+        }
+        $this->requireIntervention($preparation, $exception);
     }
 
     private function requireIntervention(
         BlueGreenDeactivationPreparation $preparation,
         BlueGreenDeactivationException $exception,
     ): void {
+        $reason = $this->interventionReason($exception);
         try {
-            $applicationId = DB::transaction(function () use ($preparation): int {
+            $applicationId = DB::transaction(function () use ($preparation, $reason): int {
                 $locks = BlueGreenLifecycleDatabaseLocks::forDestination(
                     $preparation->deactivation->application_id,
                     $preparation->deactivation->standalone_docker_id,
@@ -419,6 +434,8 @@ final class DeactivateBlueGreenApplicationDestination
                     ->update([
                         'phase' => BlueGreenDeactivationPhase::INTERVENTION_REQUIRED->value,
                         'completed_at' => null,
+                        'intervention_phase' => $deactivation->phase->value,
+                        'intervention_reason' => $reason,
                     ]) !== 1) {
                     throw new BlueGreenDeactivationException('The durable deactivation owner changed while intervention was being recorded.');
                 }
@@ -454,6 +471,8 @@ final class DeactivateBlueGreenApplicationDestination
                     'deactivation_operation_id' => $operationId,
                     'deactivation_started_at' => $startedAt,
                     'supersession_generation' => $deactivation->supersession_generation,
+                    'intervention_phase' => $state->phase->value,
+                    'intervention_reason' => $reason,
                 ]) !== 1) {
                     throw new BlueGreenDeactivationException('The durable deployment provenance changed while intervention was being recorded.');
                 }
@@ -462,12 +481,23 @@ final class DeactivateBlueGreenApplicationDestination
             }, attempts: 5);
             $this->notifyIntervention($applicationId);
         } catch (Throwable $markingException) {
+            report($exception);
+            report($markingException);
             throw new BlueGreenDeactivationException(
-                $exception->getMessage().' The durable state could not be marked for intervention: '.$markingException->getMessage(),
+                'The durable blue-green intervention could not be recorded. Operator recovery is required.',
                 (int) $markingException->getCode(),
                 $markingException,
+                new BlueGreenDeactivationFailure(
+                    'The durable blue-green intervention could not be recorded. Operator recovery is required.',
+                    $exception->failure()->internalEvidence,
+                ),
             );
         }
+    }
+
+    private function interventionReason(BlueGreenDeactivationException $exception): string
+    {
+        return $exception->failure()->publicReason;
     }
 
     private function notifyIntervention(int $applicationId): void
@@ -547,6 +577,8 @@ final class DeactivateBlueGreenApplicationDestination
                 ->update([
                     'phase' => $completedPhase->value,
                     'completed_at' => now(),
+                    'intervention_phase' => null,
+                    'intervention_reason' => null,
                 ]) !== 1) {
                 throw new BlueGreenDeactivationException('The durable blue-green deletion authorization could not be recorded.');
             }
@@ -578,6 +610,8 @@ final class DeactivateBlueGreenApplicationDestination
             'legacy_container_name' => null,
             'deactivation_operation_id' => null,
             'deactivation_started_at' => null,
+            'intervention_phase' => null,
+            'intervention_reason' => null,
             ...ApplicationBlueGreenDeployment::clearedOperationAttributes(),
         ]) !== 1) {
             throw new BlueGreenDeactivationException('The durable blue-green state changed during manual stop and was retained for intervention.');

@@ -3,6 +3,7 @@
 use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
 use App\Actions\Application\BlueGreen\BlueGreenContainerRemovalPlan;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationException;
+use App\Actions\Application\BlueGreen\BlueGreenDeactivationFailure;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationInProgressException;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationPreparation;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteOutcome;
@@ -53,6 +54,20 @@ function fakeBlueGreenRemoteProcessSequence(string ...$outputs): void
 {
     Process::fake(['*' => Process::sequence($outputs)]);
 }
+
+it('truncates public and internal intervention evidence on UTF-8 character boundaries', function (): void {
+    $failure = new BlueGreenDeactivationFailure(
+        str_repeat('é', 513),
+        str_repeat('🧪', 4097),
+    );
+
+    expect($failure->publicReason)->toEndWith('...')
+        ->and(mb_check_encoding($failure->publicReason, 'UTF-8'))->toBeTrue()
+        ->and(mb_strlen($failure->publicReason))->toBe(BlueGreenDeactivationFailure::MAXIMUM_PUBLIC_REASON_LENGTH)
+        ->and($failure->internalEvidence)->not->toBeNull()
+        ->and(mb_check_encoding($failure->internalEvidence, 'UTF-8'))->toBeTrue()
+        ->and(mb_strlen($failure->internalEvidence))->toBe(4096);
+});
 
 it('allocates one exact supersession generation for state, deactivation, and cancelled queue provenance', function () {
     ['application' => $application, 'destination' => $destination] = BlueGreenDeactivationScenario::context();
@@ -533,7 +548,7 @@ it('retries the exact stale deactivation owner to completion', function () {
     Process::assertRanTimes(fn () => true, 2);
 });
 
-it('keeps transport-ambiguous remote failures resumable under the exact generation', function () {
+it('keeps transport-ambiguous remote failures resumable with a bounded public failure', function () {
     ['application' => $application, 'destination' => $destination] = BlueGreenDeactivationScenario::context();
     $state = BlueGreenDeactivationScenario::routeLessState($application, $destination);
     $application->delete();
@@ -542,11 +557,18 @@ it('keeps transport-ambiguous remote failures resumable under the exact generati
         'not-a-typed-blue-green-remote-outcome',
     );
 
-    expect(fn () => DeactivateBlueGreenApplicationDestination::run($application, $destination->id))
-        ->toThrow(BlueGreenDeactivationTransportException::class);
+    $exception = null;
+    try {
+        DeactivateBlueGreenApplicationDestination::run($application, $destination->id);
+    } catch (BlueGreenDeactivationTransportException $caught) {
+        $exception = $caught;
+    }
 
     $deactivation = ApplicationBlueGreenDeactivation::query()->sole();
-    expect($deactivation->phase)->toBe(BlueGreenDeactivationPhase::DEACTIVATING)
+    expect($exception)->toBeInstanceOf(BlueGreenDeactivationTransportException::class)
+        ->and($exception?->getMessage())->toBe('Blue-green deactivation transport returned no valid remote outcome; the durable operation remains resumable.')
+        ->and(strlen((string) $exception?->getMessage()))->toBeLessThanOrEqual(512)
+        ->and($deactivation->phase)->toBe(BlueGreenDeactivationPhase::DEACTIVATING)
         ->and($state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::DEACTIVATING)
         ->and($state->fresh()->supersession_generation)->toBe($deactivation->supersession_generation);
     Process::assertRanTimes(fn () => true, 2);
@@ -587,6 +609,37 @@ it('marks a proven remote invariant failure for intervention instead of continui
         1,
     );
     Process::assertRanTimes(fn () => true, 2);
+});
+
+it('keeps remote failure detail out of bounded public intervention reasons', function (): void {
+    ['application' => $application, 'destination' => $destination] = BlueGreenDeactivationScenario::context();
+    $state = BlueGreenDeactivationScenario::routeLessState($application, $destination);
+    $application->delete();
+    $rawDetail = str_repeat('credential=not-for-public-display ', 200);
+    fakeBlueGreenRemoteProcessSequence(
+        BlueGreenDeactivationScenario::BOOT_ID,
+        blueGreenDeactivationRemoteOutput(
+            BlueGreenDeactivationRemoteOutcome::InvariantViolation,
+            19,
+            $rawDetail,
+        ),
+    );
+
+    $exception = null;
+    try {
+        DeactivateBlueGreenApplicationDestination::run($application, $destination->id);
+    } catch (BlueGreenDeactivationException $caught) {
+        $exception = $caught;
+    }
+
+    $deactivation = ApplicationBlueGreenDeactivation::query()->sole();
+    expect($exception)->toBeInstanceOf(BlueGreenDeactivationException::class)
+        ->and($exception?->getMessage())->toBe('The destination proved a blue-green deactivation invariant failure.')
+        ->and(strlen((string) $exception?->getMessage()))->toBeLessThanOrEqual(512)
+        ->and($exception?->failure()->internalEvidence)->toContain('credential=not-for-public-display')
+        ->and($deactivation->intervention_reason)->toBe('The destination proved a blue-green deactivation invariant failure.')
+        ->and($deactivation->intervention_reason)->not->toContain('credential=not-for-public-display')
+        ->and($state->fresh()->intervention_reason)->toBe($deactivation->intervention_reason);
 });
 
 it('supersedes a completed live manual stop with a strict soft-delete deactivation', function () {

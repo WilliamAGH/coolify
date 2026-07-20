@@ -2,9 +2,11 @@
 
 namespace App\Livewire\Project\Application;
 
+use App\Actions\Application\BlueGreen\BlueGreenDeactivationFailure;
 use App\Actions\Application\StopApplication;
 use App\Actions\Docker\GetContainersStatus;
 use App\Models\Application;
+use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationBlueGreenDeployment;
 use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
 use Livewire\Component;
@@ -21,6 +23,9 @@ class Heading extends Component
 
     /** @var array<string, int|string|null>|null */
     public ?array $blueGreenInactiveRetirement = null;
+
+    /** @var array{phase: string, sourcePhase: string, reason: string, destinationId: int}|null */
+    public ?array $blueGreenIntervention = null;
 
     public array $parameters;
 
@@ -42,6 +47,8 @@ class Heading extends Component
 
     public function mount()
     {
+        $this->authorize('view', $this->application);
+
         $this->parameters = [
             'project_uuid' => $this->application->project()->uuid,
             'environment_uuid' => $this->application->environment->uuid,
@@ -50,17 +57,56 @@ class Heading extends Component
         $lastDeployment = $this->application->get_last_successful_deployment();
         $this->lastDeploymentInfo = data_get_str($lastDeployment, 'commit')->limit(7).' '.data_get($lastDeployment, 'commit_message');
         $this->lastDeploymentLink = $this->application->gitCommitLink(data_get($lastDeployment, 'commit'));
+        $this->refreshBlueGreenIntervention();
         $this->refreshBlueGreenInactiveRetirement();
     }
 
     public function checkStatus()
     {
+        $this->refreshBlueGreenIntervention();
         $this->refreshBlueGreenInactiveRetirement();
         if ($this->application->destination->server->isFunctional()) {
             GetContainersStatus::dispatch($this->application->destination->server);
         } else {
             $this->dispatch('error', 'Server is not functional.');
         }
+    }
+
+    private function refreshBlueGreenIntervention(): void
+    {
+        $deactivation = ApplicationBlueGreenDeactivation::query()
+            ->where('application_id', $this->application->id)
+            ->where('phase', 'intervention_required')
+            ->orderByDesc('updated_at')
+            ->orderByDesc('id')
+            ->first();
+        $deployment = ApplicationBlueGreenDeployment::query()
+            ->where('application_id', $this->application->id)
+            ->where('phase', 'intervention_required')
+            ->orderByDesc('updated_at')
+            ->orderByDesc('id')
+            ->first();
+        $owner = $deactivation;
+        $ownerPhase = 'deactivation';
+        if ($deployment !== null && ($deactivation === null || $deployment->updated_at->gt($deactivation->updated_at))) {
+            $owner = $deployment;
+            $ownerPhase = 'deployment';
+        }
+        if ($owner === null) {
+            $this->blueGreenIntervention = null;
+
+            return;
+        }
+
+        $this->blueGreenIntervention = [
+            'phase' => $ownerPhase,
+            'sourcePhase' => $owner->intervention_phase ?? 'unknown',
+            'reason' => BlueGreenDeactivationFailure::publicReason(
+                $owner->intervention_reason
+                    ?? 'A blue-green safety check requires an operator recovery decision.',
+            ),
+            'destinationId' => (int) $owner->standalone_docker_id,
+        ];
     }
 
     private function refreshBlueGreenInactiveRetirement(): void
