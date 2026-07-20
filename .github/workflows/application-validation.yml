@@ -87,12 +87,12 @@ jobs:
       postgres:
         image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
         env:
-          POSTGRES_DB: coolify_tests
+          POSTGRES_DB: coolify_testing
           POSTGRES_PASSWORD: coolify-tests
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U postgres -d coolify_tests"
+          --health-cmd "pg_isready -U postgres -d coolify_testing"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
@@ -109,10 +109,11 @@ jobs:
       APP_ENV: testing
       APP_MAINTENANCE_DRIVER: file
       CACHE_STORE: array
+      COOLIFY_EXTERNAL_TEST_SERVICES: true
       DB_CONNECTION: pgsql
       DB_HOST: 127.0.0.1
       DB_PORT: 5432
-      DB_DATABASE: coolify_tests
+      DB_DATABASE: coolify_testing
       DB_USERNAME: postgres
       DB_PASSWORD: coolify-tests
       QUEUE_CONNECTION: sync

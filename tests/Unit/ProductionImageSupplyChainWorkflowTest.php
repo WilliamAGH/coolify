@@ -707,6 +707,12 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
         )) {
         $violations[] = 'browser validation must use a file-backed SQLite database';
     }
+    $blueGreenLifecycleJob = $applicationJobs['blue-green-lifecycle'] ?? [];
+    if (($blueGreenLifecycleJob['env']['COOLIFY_EXTERNAL_TEST_SERVICES'] ?? null) !== true ||
+        ($blueGreenLifecycleJob['env']['DB_HOST'] ?? null) !== '127.0.0.1' ||
+        ! str_ends_with((string) ($blueGreenLifecycleJob['env']['DB_DATABASE'] ?? ''), '_testing')) {
+        $violations[] = 'PostgreSQL lifecycle validation must explicitly confirm isolated loopback test services';
+    }
     $requiredJobs = [...$genericJobs, 'fork-deploy', 'testing-host-runtime'];
     $requiredNeeds = releaseWorkflowNeeds($applicationJobs['required'] ?? []);
     sort($requiredJobs);
