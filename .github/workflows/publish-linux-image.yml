@@ -313,15 +313,30 @@ jobs:
           if [ -n "${STAGING_ALIAS:-}" ]; then
             validate_tag_length "$STAGING_ALIAS"
           fi
+          fork_latest_tag=''
+          fork_version_tag=''
+          fork_version_sha_tag=''
           if [ "$RELEASE_KIND" = fork ]; then
-            node scripts/ci/deriveImageTags.mjs \
+            mapfile -t fork_tags < <(node scripts/ci/deriveImageTags.mjs \
               --branch fork \
               --version "$SEMANTIC_VERSION" \
               --sha "$GITHUB_SHA" \
-              --image-base "docker.iocloudhost.net/$TARGET_REPOSITORY"
+              --image-base "docker.iocloudhost.net/$TARGET_REPOSITORY" \
+              --format tags)
+            [ "${#fork_tags[@]}" -eq 3 ]
+            fork_latest_tag="${fork_tags[0]}"
+            fork_version_tag="${fork_tags[1]}"
+            fork_version_sha_tag="${fork_tags[2]}"
           fi
 
-          printf 'run_tag=%s\n' "$run_tag" >> "$GITHUB_OUTPUT"
+          {
+            printf 'run_tag=%s\n' "$run_tag"
+            if [ "$RELEASE_KIND" = fork ]; then
+              printf 'latest_tag=%s\n' "$fork_latest_tag"
+              printf 'version_tag=%s\n' "$fork_version_tag"
+              printf 'version_sha_tag=%s\n' "$fork_version_sha_tag"
+            fi
+          } >> "$GITHUB_OUTPUT"
 
       - name: Require fork application versions match the immutable tag
         if: ${{ inputs.release_kind == 'fork' }}
@@ -2345,7 +2360,7 @@ jobs:
     needs: [validate-inputs, fork-registry-policy, fork-stage, fork-attest]
     if: ${{ inputs.release_kind == 'fork' && needs.fork-attest.result == 'success' }}
     concurrency:
-      group: fork-semantic-promotion-${{ inputs.semantic_version }}
+      group: linux-image-alias-mutation-${{ inputs.target_repository }}
       cancel-in-progress: false
     permissions:
       contents: write
@@ -2374,7 +2389,28 @@ jobs:
         env:
           NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
           NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
-        run: scripts/ci/verify-nexus-docker-write-policy.sh
+        run: |
+          set -Eeuo pipefail
+          set +x
+          umask 077
+
+          repository_json="$(mktemp "$RUNNER_TEMP/coolify-fork-final-nexus-policy.XXXXXX")"
+          trap 'rm -f "$repository_json"' EXIT
+          curl --fail --silent --show-error \
+            --connect-timeout 10 --max-time 30 \
+            --retry 3 --retry-all-errors --retry-delay 1 \
+            --user "$NEXUS_USERNAME:$NEXUS_PASSWORD" \
+            --header 'Accept: application/json' \
+            --output "$repository_json" \
+            "${NEXUS_BASE_URL%/}/service/rest/v1/repositories/docker/hosted/$NEXUS_DOCKER_REPOSITORY"
+          jq -e --arg repository "$NEXUS_DOCKER_REPOSITORY" '
+            type == "object" and
+            .name == $repository and
+            .format == "docker" and
+            .type == "hosted" and
+            .online == true and
+            (.storage | if type == "object" then .writePolicy == "ALLOW" else false end)
+          ' "$repository_json" >/dev/null
 
       - name: Install registry client for final fork promotion
         uses: regclient/actions/regctl-installer@1b705e32d40851370799ea5814e83d0a5f6a70dc # v0.1.0
@@ -2730,12 +2766,10 @@ jobs:
 
           derive_canonical_tags() {
             local repository=$1
-            node scripts/ci/deriveImageTags.mjs \
-              --branch "$RELEASE_TAG_BRANCH" \
-              --version "$SEMANTIC_VERSION" \
-              --sha "$SOURCE_REVISION" \
-              --image-base "$repository" \
-              --format tags
+            [[ "$FORK_LATEST_TAG" == "$repository:fork-latest" ]]
+            [[ "$FORK_VERSION_TAG" == "$repository:fork-$SEMANTIC_VERSION" ]]
+            [[ "$FORK_VERSION_SHA_TAG" == "$repository:fork-$SEMANTIC_VERSION-${SOURCE_REVISION:0:7}" ]]
+            printf '%s\n' "$FORK_LATEST_TAG" "$FORK_VERSION_TAG" "$FORK_VERSION_SHA_TAG"
           }
 
           preflight_canonical_tags() {

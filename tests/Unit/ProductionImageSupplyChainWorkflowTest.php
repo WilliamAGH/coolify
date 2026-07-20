@@ -154,10 +154,12 @@ SH);
             'MAIN_ARM64_DIGEST' => releaseWorkflowTestDigest('2'),
             'MAIN_INDEX_DIGEST' => releaseWorkflowTestDigest('3'),
             'MAIN_TARGET' => 'docker.iocloudhost.net/williamagh/coolify',
+            'FORK_LATEST_TAG' => 'docker.iocloudhost.net/williamagh/coolify:fork-latest',
+            'FORK_VERSION_TAG' => 'docker.iocloudhost.net/williamagh/coolify:fork-4.13.1-fork',
+            'FORK_VERSION_SHA_TAG' => 'docker.iocloudhost.net/williamagh/coolify:fork-4.13.1-fork-aaaaaaa',
             'PATH' => $bin.PATH_SEPARATOR.(getenv('PATH') ?: ''),
             'REGCTL_LOG' => $log,
             'REGCTL_STATE' => $state,
-            'RELEASE_TAG_BRANCH' => 'fork',
             'RUNNER_TEMP' => $fixture,
             'SEMANTIC_VERSION' => '4.13.1-fork',
             'SOURCE_REVISION' => str_repeat('a', 40),
@@ -2345,10 +2347,11 @@ it('defines one referrerless fork release graph for the main image on both platf
 
     $forkRegistryPolicy = $jobs['fork-registry-policy'] ?? [];
     $policyCheckout = releaseWorkflowStep($forkRegistryPolicy, 'Check out immutable fork policy source');
-    $policyRun = (string) (releaseWorkflowStep(
+    $policyStep = releaseWorkflowStep(
         $forkRegistryPolicy,
         'Validate shared Nexus docker-hosted contract',
-    )['run'] ?? '');
+    );
+    $policyRun = (string) ($policyStep['run'] ?? '');
     $stageRun = (string) (releaseWorkflowStep(
         $jobs['fork-stage'] ?? [],
         'Stage the fork image with inline build attestations',
@@ -2363,6 +2366,13 @@ it('defines one referrerless fork release graph for the main image on both platf
         ->all();
     expect($forkRegistryPolicy['name'] ?? null)->toBe('Validate shared Nexus docker-hosted contract');
     expect($forkRegistryPolicy['permissions'] ?? null)->toBe(['contents' => 'read'])
+        ->and($forkRegistryPolicy['env'] ?? [])
+        ->not->toHaveKey('NEXUS_PASSWORD')
+        ->not->toHaveKey('NEXUS_USERNAME')
+        ->and($policyStep['env'] ?? null)->toBe([
+            'NEXUS_PASSWORD' => '${{ secrets.NEXUS_PASSWORD }}',
+            'NEXUS_USERNAME' => '${{ secrets.NEXUS_USERNAME }}',
+        ])
         ->and($policyCheckout['uses'] ?? null)
         ->toBe('actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd')
         ->and($policyCheckout['with']['persist-credentials'] ?? null)->toBeFalse()
@@ -2383,10 +2393,10 @@ it('defines one referrerless fork release graph for the main image on both platf
         ->toContain('preflight_semantic_tag')
         ->toContain('promote_or_verify_semantic_tag')
         ->toContain('promote_and_verify_canonical_tags')
-        ->toContain('scripts/ci/deriveImageTags.mjs')
-        ->toContain('--branch "$RELEASE_TAG_BRANCH"')
-        ->toContain('--version "$SEMANTIC_VERSION"')
-        ->toContain('--sha "$SOURCE_REVISION"')
+        ->toContain('FORK_LATEST_TAG')
+        ->toContain('FORK_VERSION_TAG')
+        ->toContain('FORK_VERSION_SHA_TAG')
+        ->not->toContain('scripts/ci/deriveImageTags.mjs')
         ->toContain('does not match its expected immutable index digest')
         ->toContain('accepting recovery state')
         ->toContain('assert_live_fork_tag_binding')
@@ -2446,8 +2456,8 @@ it('defines one referrerless fork release graph for the main image on both platf
         'Create or validate empty draft recovery release before semantic promotion',
     )['run'] ?? '');
     $forkRelease = $jobs['fork-release'] ?? [];
-    $releaseCheckout = releaseWorkflowStep($forkRelease, 'Check out immutable fork release source');
-    $releaseNode = releaseWorkflowStep($forkRelease, 'Set up Node.js for canonical fork tag derivation');
+    $releaseCheckoutSteps = collect(releaseWorkflowSteps($forkRelease))
+        ->filter(static fn (array $step): bool => str_starts_with((string) ($step['uses'] ?? ''), 'actions/checkout@'));
     $finalPolicyStep = releaseWorkflowStep(
         $forkRelease,
         'Revalidate shared Nexus docker-hosted contract before final tagging',
@@ -2483,14 +2493,13 @@ it('defines one referrerless fork release graph for the main image on both platf
             'Revalidate shared Nexus docker-hosted contract before final tagging',
             'Login to Nexus fork registry for final promotion',
         ]);
-    expect($releaseCheckout['uses'] ?? null)
-        ->toBe('actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd')
-        ->and($releaseCheckout['with']['persist-credentials'] ?? null)->toBeFalse()
-        ->and($releaseCheckout['with']['ref'] ?? null)->toBe('${{ github.sha }}');
-    expect($releaseNode['uses'] ?? null)
-        ->toBe('actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020')
-        ->and($releaseNode['with']['node-version'] ?? null)->toBe('22');
-    expect($finalPolicyRun)->toBe('scripts/ci/verify-nexus-docker-write-policy.sh');
+    expect($releaseCheckoutSteps)->toBeEmpty();
+    expect($finalPolicyRun)
+        ->toContain('.writePolicy == "ALLOW"')
+        ->toContain('.format == "docker"')
+        ->toContain('.type == "hosted"')
+        ->not->toContain('ALLOW_ONCE')
+        ->not->toContain('--request');
     expect($forkRelease['permissions']['contents'] ?? null)->toBe('write')
         ->and($releaseBundleDownload['with']['artifact-ids'] ?? null)
         ->toBe('${{ needs.fork-attest.outputs.bundle_artifact_id }}')
