@@ -11,6 +11,117 @@ function applicationValidationWorkflow(): array
     return Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
 }
 
+function controlPlaneTraefikRuntimeScript(): string
+{
+    return file_get_contents(dirname(__DIR__).'/Integration/ControlPlaneTraefik/run.sh');
+}
+
+/**
+ * @return list<string>
+ */
+function controlPlaneTraefikTransportLifecycleViolations(string $script): array
+{
+    preg_match_all(
+        '/^\s*publish_transport_release [^\n]+ "\$forward_transport_release"$/m',
+        $script,
+        $forwardTransportReleases,
+    );
+    if (count($forwardTransportReleases[0]) !== 1) {
+        return ['native Traefik runtime must retain its original transport streams through proved rollback'];
+    }
+
+    $milestones = [
+        '    start_transport_observer forward backend-blue "$BACKEND_BLUE_STATE_DIR"',
+        '    forward_applied_at_ms=$(now_ms)',
+        '    start_transport_observer rollback backend-green "$BACKEND_GREEN_STATE_DIR"',
+        '    rollback_applied_at_ms=$(now_ms)',
+        '    publish_transport_release rollback "$rollback_applied_at_ms" "$rollback_transport_release"',
+        '    assert_transport_continuity "$rollback_transport_report" rollback',
+        '    assert_transition_log "$rollback_observer_log"',
+        '    assert_exact_dynamic_snapshot "$blue_final_snapshot"',
+        '    publish_transport_release full-cycle "$rollback_applied_at_ms" "$forward_transport_release"',
+        '    wait_for_transport_observer full-cycle "$forward_transport_pid" "$forward_transport_log" "$forward_transport_report"',
+        '    assert_full_cycle_transport_continuity "$forward_transport_report"',
+    ];
+    $previousPosition = -1;
+
+    foreach ($milestones as $milestone) {
+        $position = strpos($script, $milestone);
+        if ($position === false || $position <= $previousPosition) {
+            return ['native Traefik runtime must retain its original transport streams through proved rollback'];
+        }
+
+        $previousPosition = $position;
+    }
+
+    foreach ([
+        'any(.sse.events[]; .receivedAt >= $forward_applied_at and .receivedAt < $rollback_started_at)',
+        'any(.websocket.events[]; .receivedAt >= $forward_applied_at and .receivedAt < $rollback_started_at)',
+    ] as $requiredAssertion) {
+        if (! str_contains($script, $requiredAssertion)) {
+            return ['native Traefik runtime must retain its original transport streams through proved rollback'];
+        }
+    }
+
+    return [];
+}
+
+/**
+ * @return list<string>
+ */
+function controlPlaneTraefikTransportSafetyViolations(string $script): array
+{
+    $violations = [];
+
+    foreach ([
+        'readonly TRANSPORT_OBSERVER_RELOAD_PHASES=6',
+        'readonly TRANSPORT_OBSERVER_TIMEOUT_MARGIN_MS=15000',
+        '(2 * MAX_TRANSITION_OBSERVATION_MS)',
+        '(TRANSPORT_OBSERVER_RELOAD_PHASES * MAX_RELOAD_DELAY_MS)',
+        '+ TRANSPORT_OBSERVER_TIMEOUT_MARGIN_MS',
+    ] as $timeoutContract) {
+        if (! str_contains($script, $timeoutContract)) {
+            $violations[] = 'native Traefik transport timeout must cover both bounded transitions and reload phases';
+            break;
+        }
+    }
+
+    $cleanupStart = strpos($script, "cleanup() {\n");
+    $cleanupEnd = $cleanupStart === false ? false : strpos($script, "\n}\n\ntrap cleanup EXIT", $cleanupStart);
+    $cleanup = $cleanupStart === false || $cleanupEnd === false
+        ? ''
+        : substr($script, $cleanupStart, $cleanupEnd - $cleanupStart);
+    $terminatePosition = strpos($cleanup, 'terminate_registered_background_pids');
+    $composeDownPosition = strpos($cleanup, 'compose down --volumes --remove-orphans');
+    $reapPosition = strpos($cleanup, 'reap_registered_background_pids');
+    if ($terminatePosition === false
+        || $composeDownPosition === false
+        || $reapPosition === false
+        || ! ($terminatePosition < $composeDownPosition && $composeDownPosition < $reapPosition)
+        || ! str_contains($script, 'readonly BACKGROUND_PID_EXIT_TIMEOUT_MS=5000')
+        || ! str_contains($script, 'kill -KILL "$pid" 2>/dev/null || true')) {
+        $violations[] = 'native Traefik cleanup must tear Compose down before bounded child reaping';
+    }
+
+    foreach ([
+        'wrong-backend',
+        'wrong-color',
+        'wrong-generation',
+        'wrong-dynamic-sha',
+        'changed-connection-id',
+        'missing-green-interval',
+        'missing-post-rollback',
+        'assert_transport_report_validation',
+    ] as $reportContract) {
+        if (! str_contains($script, $reportContract)) {
+            $violations[] = 'native Traefik self-tests must reject malformed full-cycle transport reports';
+            break;
+        }
+    }
+
+    return array_values(array_unique($violations));
+}
+
 /**
  * @param  array<string, mixed>  $workflow
  * @return array<string, mixed>
@@ -204,6 +315,16 @@ function applicationValidationWorkflowViolations(array $workflow): array
 
             break;
         }
+    }
+    $backupQuiesceOwner = 'tests/Feature/Proxy/ControlPlane/ProveAndFreezeControlPlaneGenerationTest.php';
+    $backupQuiesceScript = collect($phpApplication['steps'] ?? [])
+        ->firstWhere('name', 'Run control-plane backup-quiesce owner')['run'] ?? '';
+    $phpScripts = collect($phpApplication['steps'] ?? [])
+        ->map(fn (array $step): string => (string) ($step['run'] ?? ''))
+        ->implode("\n");
+    if ((string) $backupQuiesceScript !== "php artisan test --compact {$backupQuiesceOwner}"
+        || substr_count($phpScripts, $backupQuiesceOwner) !== 1) {
+        $violations[] = 'application validation must execute the canonical control-plane backup-quiesce owner';
     }
 
     $workflowAndShell = is_array($jobs) ? ($jobs['workflow-and-shell'] ?? []) : [];
@@ -435,6 +556,31 @@ it('rejects omitting explicit proxy-mutation payload diagnostics', function () {
         ->toContain('application validation must execute every native Traefik control-plane test');
 });
 
+it('rejects omitting the canonical control-plane backup-quiesce owner', function () {
+    $workflow = applicationValidationWorkflow();
+    $step = collect($workflow['jobs']['php']['steps'] ?? [])
+        ->search(fn (array $candidate): bool => ($candidate['name'] ?? null) === 'Run control-plane backup-quiesce owner');
+    expect($step)->not->toBeFalse();
+
+    unset($workflow['jobs']['php']['steps'][$step]);
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('application validation must execute the canonical control-plane backup-quiesce owner');
+});
+
+it('rejects executing the control-plane backup-quiesce owner twice', function () {
+    $workflow = applicationValidationWorkflow();
+    $step = collect($workflow['jobs']['php']['steps'] ?? [])
+        ->search(fn (array $candidate): bool => ($candidate['name'] ?? null) === 'Run native Traefik control-plane tests');
+    expect($step)->not->toBeFalse();
+
+    $workflow['jobs']['php']['steps'][$step]['run'] .= "\n"
+        .'php artisan test --compact tests/Feature/Proxy/ControlPlane/ProveAndFreezeControlPlaneGenerationTest.php';
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('application validation must execute the canonical control-plane backup-quiesce owner');
+});
+
 it('rejects omitting the native Traefik runtime integration', function () {
     $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
     $step = collect($workflow['jobs']['workflow-and-shell']['steps'])
@@ -443,6 +589,61 @@ it('rejects omitting the native Traefik runtime integration', function () {
 
     expect(applicationValidationWorkflowViolations($workflow))
         ->toContain('application validation must execute the native Traefik runtime integration');
+});
+
+it('retains the original transport streams through forward promotion and proved rollback', function () {
+    expect(controlPlaneTraefikTransportLifecycleViolations(controlPlaneTraefikRuntimeScript()))->toBe([]);
+});
+
+it('rejects releasing the original transport streams before rollback proof', function () {
+    $script = controlPlaneTraefikRuntimeScript();
+    $rollbackStart = '    start_transport_observer rollback backend-green "$BACKEND_GREEN_STATE_DIR"';
+    $prematureRelease = '    publish_transport_release forward "$forward_applied_at_ms" "$forward_transport_release"';
+    $mutated = str_replace($rollbackStart, $prematureRelease."\n".$rollbackStart, $script);
+
+    expect(controlPlaneTraefikTransportLifecycleViolations($mutated))
+        ->toContain('native Traefik runtime must retain its original transport streams through proved rollback');
+});
+
+it('keeps full-cycle transport deadlines and cleanup ordering internally bounded', function () {
+    expect(controlPlaneTraefikTransportSafetyViolations(controlPlaneTraefikRuntimeScript()))->toBe([]);
+});
+
+it('rejects shortening the full-cycle observer below its derived phase bounds', function () {
+    $mutated = str_replace(
+        '+ TRANSPORT_OBSERVER_TIMEOUT_MARGIN_MS',
+        '+ 0',
+        controlPlaneTraefikRuntimeScript(),
+    );
+
+    expect(controlPlaneTraefikTransportSafetyViolations($mutated))
+        ->toContain('native Traefik transport timeout must cover both bounded transitions and reload phases');
+});
+
+it('rejects waiting on observer children before exact-project Compose teardown', function () {
+    $script = controlPlaneTraefikRuntimeScript();
+    $mutated = str_replace(
+        "    if [ \"\$COMPOSE_STARTED\" -eq 1 ]; then\n        compose down --volumes --remove-orphans >/dev/null 2>&1\n    fi\n    reap_registered_background_pids",
+        "    reap_registered_background_pids\n    if [ \"\$COMPOSE_STARTED\" -eq 1 ]; then\n        compose down --volumes --remove-orphans >/dev/null 2>&1\n    fi",
+        $script,
+    );
+
+    expect($mutated)->not->toBe($script)
+        ->and(controlPlaneTraefikTransportSafetyViolations($mutated))
+        ->toContain('native Traefik cleanup must tear Compose down before bounded child reaping');
+});
+
+it('executes negative full-cycle transport report fixtures', function () {
+    $process = new Process([
+        'bash',
+        dirname(__DIR__).'/Integration/ControlPlaneTraefik/run.sh',
+        '--self-test',
+    ], dirname(__DIR__, 2));
+    $process->setTimeout(30);
+    $process->mustRun();
+
+    expect($process->getOutput())
+        ->toContain('PASS: transition-log and transport-report validation self-tests completed.');
 });
 
 it('rejects omitting database migration S6 exit propagation coverage', function () {
