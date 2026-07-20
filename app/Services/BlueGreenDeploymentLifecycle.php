@@ -29,8 +29,10 @@ use App\Actions\Application\BlueGreen\RecordBlueGreenLegacyRoutingSnapshot;
 use App\Actions\Application\BlueGreen\RecordBlueGreenRollbackKey;
 use App\Actions\Application\BlueGreen\RecordBlueGreenRoutingMutation;
 use App\Actions\Application\BlueGreen\RecoverBlueGreenFinalizedDrainingOperation;
+use App\Actions\Application\BlueGreen\RemoveBlueGreenComposeSidecars;
 use App\Actions\Application\BlueGreen\RemoveBlueGreenInactiveContainer;
 use App\Actions\Application\BlueGreen\RemoveExactBlueGreenCandidate;
+use App\Actions\Application\BlueGreen\StartBlueGreenComposeSidecars;
 use App\Actions\Application\BlueGreen\TransitionsBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\VerifyBlueGreenCandidateReleaseProof;
 use App\Actions\Application\BlueGreen\VerifyBlueGreenPublicRecovery;
@@ -302,9 +304,17 @@ final class BlueGreenDeploymentLifecycle
             }
             $candidateExpectation = $this->candidateContainerExpectation
                 ?? throw new DeploymentException('Blue-green candidate start has no durable container expectation.');
+            $completionAssertions = (new InspectBlueGreenContainer)->runningMutationCompletionAssertionsFor($candidateExpectation);
+            if ($claim->previousActiveColor === null && $this->application->build_pack === 'dockercompose') {
+                $sidecarPlan = (new RemoveBlueGreenComposeSidecars)->planFor($this->application);
+                array_push(
+                    $completionAssertions,
+                    ...(new StartBlueGreenComposeSidecars)->runningMutationCompletionAssertionsFor($sidecarPlan),
+                );
+            }
             $this->destinationState = $this->executeDestinationMutation(
                 $candidateStartCommands,
-                (new InspectBlueGreenContainer)->runningMutationCompletionAssertionsFor($candidateExpectation),
+                $completionAssertions,
             );
             $this->waitForExactCandidateHealth();
             $this->promoteCandidate($claim);
@@ -626,6 +636,7 @@ final class BlueGreenDeploymentLifecycle
         ?ApplicationBlueGreenDeployment $durableState,
         Collection $containers,
     ): ?string {
+        $containers = $this->routedApplicationContainers($containers);
         $blueName = $this->containerName(BlueGreenDeploymentColor::BLUE);
         $greenName = $this->containerName(BlueGreenDeploymentColor::GREEN);
         $fixedNames = [$blueName, $greenName];
@@ -754,11 +765,11 @@ final class BlueGreenDeploymentLifecycle
             $this->containerName(BlueGreenDeploymentColor::BLUE),
             $this->containerName(BlueGreenDeploymentColor::GREEN),
         ];
-        $legacyContainers = getCurrentApplicationContainerStatus(
+        $legacyContainers = $this->routedApplicationContainers(getCurrentApplicationContainerStatus(
             $this->server,
             $this->application->id,
             pullRequestId: 0,
-        )
+        ))
             ->filter(
                 static fn (mixed $container): bool => is_array($container)
                     && ! in_array(data_get($container, 'Names'), $fixedNames, true),
@@ -849,7 +860,30 @@ final class BlueGreenDeploymentLifecycle
 
     private function legacyBaseContainerName(): string
     {
-        return $this->validateContainerName((string) $this->application->uuid);
+        return $this->validateContainerName(
+            $this->application->blueGreenLegacyRoutedContainerName() ?? (string) $this->application->uuid,
+        );
+    }
+
+    /** @param Collection<int, array<string, mixed>> $containers @return Collection<int, array<string, mixed>> */
+    private function routedApplicationContainers(Collection $containers): Collection
+    {
+        $legacyRoutedContainerName = $this->application->blueGreenLegacyRoutedContainerName();
+        if ($legacyRoutedContainerName === null) {
+            return $containers;
+        }
+        $fixedNames = [
+            $this->containerName(BlueGreenDeploymentColor::BLUE),
+            $this->containerName(BlueGreenDeploymentColor::GREEN),
+        ];
+
+        return $containers->filter(
+            static fn (array $container): bool => in_array(
+                data_get($container, 'Names'),
+                [...$fixedNames, $legacyRoutedContainerName],
+                true,
+            ),
+        )->values();
     }
 
     private function assertExactPreviousContainerHealthy(): void

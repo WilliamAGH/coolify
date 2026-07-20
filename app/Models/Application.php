@@ -12,6 +12,7 @@ use App\Services\ConfigurationGenerator;
 use App\Services\DeploymentConfiguration\ApplicationConfigurationSnapshot;
 use App\Services\DeploymentConfiguration\ConfigurationDiff;
 use App\Services\DeploymentConfiguration\ConfigurationDiffer;
+use App\Support\BlueGreenComposeTopology;
 use App\Traits\ClearsGlobalSearchCache;
 use App\Traits\HasConfiguration;
 use App\Traits\HasMetrics;
@@ -1284,6 +1285,11 @@ class Application extends BaseModel
         $setting ??= $this->relationLoaded('settings')
             ? $this->getRelation('settings')
             : $this->settings()->first();
+        if ($this->build_pack === 'dockercompose') {
+            $backendPort = BlueGreenComposeTopology::tryFromApplication($this)?->backendPort;
+
+            return $backendPort === null ? null : [$backendPort];
+        }
         if ((bool) ($setting?->is_static ?? false)) {
             $backendPorts = [80];
         } else {
@@ -1339,6 +1345,36 @@ class Application extends BaseModel
         }
 
         return $backendPorts[0];
+    }
+
+    public function blueGreenComposeTopology(): ?BlueGreenComposeTopology
+    {
+        if ($this->build_pack !== 'dockercompose') {
+            return null;
+        }
+
+        return BlueGreenComposeTopology::tryFromApplication($this);
+    }
+
+    /** @return list<string> */
+    public function blueGreenRoutingLabels(): array
+    {
+        if ($this->build_pack === 'dockercompose') {
+            return $this->blueGreenComposeTopology()?->routingLabels() ?? [];
+        }
+
+        return generateLabelsApplication($this);
+    }
+
+    public function blueGreenLegacyRoutedContainerName(): ?string
+    {
+        return $this->blueGreenComposeTopology()?->legacyRoutedContainerName;
+    }
+
+    /** @return array<string, mixed>|null */
+    public function blueGreenTopologyFingerprintPayload(): ?array
+    {
+        return $this->blueGreenComposeTopology()?->fingerprintPayload();
     }
 
     /** @return Collection<int, int> */
@@ -1494,6 +1530,12 @@ class Application extends BaseModel
             'ports_mappings',
             'custom_network_aliases',
             'custom_docker_run_options',
+            'compose_parsing_version',
+            'docker_compose',
+            'docker_compose_domains',
+            'docker_compose_raw',
+            'docker_compose_custom_build_command',
+            'docker_compose_custom_start_command',
         ]);
     }
 
@@ -1509,6 +1551,12 @@ class Application extends BaseModel
             'ports_mappings',
             'custom_network_aliases',
             'custom_docker_run_options',
+            'compose_parsing_version',
+            'docker_compose',
+            'docker_compose_domains',
+            'docker_compose_raw',
+            'docker_compose_custom_build_command',
+            'docker_compose_custom_start_command',
             'redirect',
             'is_http_basic_auth_enabled',
             'http_basic_auth_username',
@@ -1541,6 +1589,9 @@ class Application extends BaseModel
         if (! $this->isBlueGreenDeploymentOptedIn($setting) && ! $hasDurableState) {
             return;
         }
+        if ($hasDurableState) {
+            $this->assertBlueGreenComposeSidecarIdentitiesUnchanged();
+        }
         if ($hasDurableState && ($topologyReason = $this->blueGreenDurableStateTopologyIneligibilityReason()) !== null) {
             throw new RuntimeException($topologyReason);
         }
@@ -1551,6 +1602,29 @@ class Application extends BaseModel
             $setting,
             $allowPendingSettingOptOut,
         );
+    }
+
+    private function assertBlueGreenComposeSidecarIdentitiesUnchanged(): void
+    {
+        if (! $this->isDirty([
+            'build_pack',
+            'compose_parsing_version',
+            'docker_compose',
+            'docker_compose_domains',
+            'docker_compose_custom_build_command',
+            'docker_compose_custom_start_command',
+        ])) {
+            return;
+        }
+
+        $persistedApplication = clone $this;
+        $persistedApplication->setRawAttributes($this->getRawOriginal(), sync: true);
+        $persistedSidecars = BlueGreenComposeTopology::tryFromApplication($persistedApplication)?->fixedSidecars();
+        $proposedSidecars = BlueGreenComposeTopology::tryFromApplication($this)?->fixedSidecars();
+
+        if ($persistedSidecars !== $proposedSidecars) {
+            throw new RuntimeException('Blue-green Docker Compose fixed sidecar identities cannot change while durable state exists. Stop the application and finish blue-green cleanup first.');
+        }
     }
 
     public function prepareBlueGreenStorageAddition(): void
@@ -1687,13 +1761,21 @@ class Application extends BaseModel
         if (! (bool) ($setting?->is_container_label_readonly_enabled ?? false)) {
             return 'Blue-green deployments require generated, read-only container labels.';
         }
-        if ($this->build_pack === 'dockercompose' || (bool) ($setting?->is_raw_compose_deployment_enabled ?? false)) {
-            return 'Blue-green deployments do not support Docker Compose applications.';
+        if ((bool) ($setting?->is_raw_compose_deployment_enabled ?? false)) {
+            return 'Blue-green deployments do not support raw Docker Compose applications because raw Compose cannot be safely rewritten.';
         }
-        if (! (bool) $this->health_check_enabled && ! (bool) $this->custom_healthcheck_found) {
+        $isParsedCompose = $this->build_pack === 'dockercompose';
+        if ($isParsedCompose && ($composeReason = BlueGreenComposeTopology::ineligibilityReason($this)) !== null) {
+            return $composeReason;
+        }
+        if ($isParsedCompose) {
+            if (! (bool) $this->health_check_enabled || $this->health_check_type !== 'http') {
+                return 'Blue-green Docker Compose applications require an enabled HTTP Coolify healthcheck for routed failover.';
+            }
+        } elseif (! (bool) $this->health_check_enabled && ! (bool) $this->custom_healthcheck_found) {
             return 'Blue-green deployments require either an enabled Coolify healthcheck or a detected image healthcheck.';
         }
-        if (str($this->fqdn)->trim()->isEmpty()) {
+        if (! $isParsedCompose && str($this->fqdn)->trim()->isEmpty()) {
             return 'Blue-green deployments require at least one FQDN.';
         }
         if ($this->blueGreenDeploymentBackendPorts($setting) === null) {
@@ -1714,7 +1796,7 @@ class Application extends BaseModel
         if (str($this->custom_docker_run_options)->trim()->isNotEmpty()) {
             return 'Blue-green deployments do not support custom Docker run options.';
         }
-        if ($this->persistentStorages()->exists() || $this->fileStorages()->exists()) {
+        if (! $isParsedCompose && ($this->persistentStorages()->exists() || $this->fileStorages()->exists())) {
             return 'Blue-green deployments require stateless applications without writable storage.';
         }
 
