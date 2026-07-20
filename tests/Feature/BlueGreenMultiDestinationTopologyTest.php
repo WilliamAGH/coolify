@@ -14,6 +14,8 @@ use App\Models\Project;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
 use App\Models\Team;
+use App\Notifications\Application\DeploymentFailed;
+use App\Notifications\Application\DeploymentSuccess;
 use App\Services\BlueGreenDeploymentLifecycle;
 use Illuminate\Database\QueryException;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -343,9 +345,14 @@ it('keeps rollback fleet children pinned to the root rollback artifact identity'
         ->and($child->git_type)->toBe('gitlab');
 });
 
-it('keeps the completed primary explicit when fleet scheduling rejects the locked topology', function (): void {
+it('surfaces a degraded fleet when scheduling rejects the locked topology', function (): void {
     Notification::fake();
     $fixture = blueGreenMultiDestinationFixture();
+    $fixture['team']->emailNotificationSettings()->update([
+        'use_instance_email_settings' => true,
+        'deployment_failure_email_notifications' => true,
+        'deployment_success_email_notifications' => true,
+    ]);
     $foreignTeam = Team::factory()->create();
     $foreignDestination = blueGreenMultiDestinationAdditional($foreignTeam, 'foreign');
     Event::fake();
@@ -369,13 +376,18 @@ it('keeps the completed primary explicit when fleet scheduling rejects the locke
     blueGreenMultiDestinationInvoke($job, 'handleSuccessfulDeployment');
 
     expect($rootDeployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FINISHED->value)
-        ->and($rootDeployment->fresh()->blue_green_fleet_deployment_uuid)->toBeNull()
+        ->and($rootDeployment->fresh()->blue_green_fleet_deployment_uuid)->toBe($rootDeployment->deployment_uuid)
+        ->and($rootDeployment->fresh()->blue_green_fleet_status)->toBe(BlueGreenFleetStatus::PAUSED)
         ->and((string) $rootDeployment->fresh()->logs)
         ->toContain('Blue-green fleet scheduling failed before any additional destination was dispatched')
+        ->and($fixture['application']->fresh()->additional_networks()->firstOrFail()->pivot->status)
+        ->toBe('degraded:unknown')
         ->and(ApplicationDeploymentQueue::query()
             ->where('application_id', $fixture['application']->id)
             ->where('id', '!=', $rootDeployment->id)
-            ->count())->toBe(0);
+            ->count())->toBe(0)
+        ->and(Notification::sent($fixture['team'], DeploymentFailed::class))->toHaveCount(1)
+        ->and(Notification::sent($fixture['team'], DeploymentSuccess::class))->toHaveCount(0);
 });
 
 it('marks only the failed blue-green destination degraded and pauses the remaining fleet', function (): void {

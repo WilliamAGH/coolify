@@ -5804,6 +5804,10 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
                 Log::warning(
                     "Blue-green fleet scheduling failed for deployment {$this->deployment_uuid}: {$exception->getMessage()}",
                 );
+                $this->publishBlueGreenFleetSchedulingFailure();
+                $this->sendDeploymentNotification(DeploymentFailed::class);
+
+                return;
             }
         }
 
@@ -5944,6 +5948,64 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
             $this->application_deployment_queue->syncOriginalAttribute('status');
 
             return true;
+        }, attempts: 5);
+    }
+
+    private function publishBlueGreenFleetSchedulingFailure(): void
+    {
+        DB::transaction(function (): void {
+            BlueGreenTopologyLock::acquire();
+            $application = Application::query()
+                ->whereKey($this->application->id)
+                ->lockForUpdate()
+                ->first();
+            $fleetOwner = ApplicationDeploymentQueue::query()
+                ->whereKey($this->application_deployment_queue->id)
+                ->where('deployment_uuid', $this->deployment_uuid)
+                ->where('status', ApplicationDeploymentStatus::FINISHED->value)
+                ->whereNull('blue_green_fleet_deployment_uuid')
+                ->lockForUpdate()
+                ->first();
+            if ($application === null || $fleetOwner === null) {
+                throw new DeploymentException('Blue-green fleet scheduling failure lost its exact completed deployment owner.');
+            }
+
+            $topology = DB::table('additional_destinations')
+                ->where('application_id', $application->id)
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            if ($topology->isEmpty()) {
+                throw new DeploymentException('Blue-green fleet scheduling failure found no remaining fleet topology to mark degraded.');
+            }
+
+            $fleetOwner->update([
+                'blue_green_fleet_deployment_uuid' => $fleetOwner->deployment_uuid,
+                'blue_green_fleet_status' => BlueGreenFleetStatus::PAUSED,
+            ]);
+            foreach ($topology as $topologyEntry) {
+                if (! (new ComplexStatusCheck)->updateApplicationDestinationStatus(
+                    $application,
+                    (int) $topologyEntry->standalone_docker_id,
+                    (int) $topologyEntry->server_id,
+                    'degraded:unknown',
+                )) {
+                    throw new DeploymentException('Blue-green fleet scheduling failure could not mark an exact destination degraded.');
+                }
+            }
+
+            $this->application_deployment_queue->setAttribute(
+                'blue_green_fleet_deployment_uuid',
+                $fleetOwner->deployment_uuid,
+            );
+            $this->application_deployment_queue->setAttribute(
+                'blue_green_fleet_status',
+                BlueGreenFleetStatus::PAUSED,
+            );
+            $this->application_deployment_queue->syncOriginalAttributes([
+                'blue_green_fleet_deployment_uuid',
+                'blue_green_fleet_status',
+            ]);
         }, attempts: 5);
     }
 
