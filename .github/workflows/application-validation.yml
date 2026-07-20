@@ -297,6 +297,7 @@ jobs:
           docker/verify-source-provenance.sh docker/testing-host/Dockerfile
       - name: Run release publication shell integrations
         run: |
+          tests/Integration/DockerDaemonConfigurationTest.sh
           tests/Integration/PublishLinuxImageScriptTest.sh
           tests/Integration/ReleaseOperationalFixturesTest.sh
       - name: Verify database migration S6 exit propagation

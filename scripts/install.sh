@@ -11,6 +11,87 @@
 ## AUTOUPDATE - Set to "false" to disable auto-updates
 ## REGISTRY_URL - Custom registry URL for Docker images (default: docker.io)
 
+configure_docker_daemon() (
+    set -e
+
+    local config_file="$1"
+    local sidecar_file="$2"
+    local address_pool_base="$3"
+    local address_pool_size="$4"
+    local force_pool="$5"
+    local config_directory
+    local source_file
+    local temp_file=""
+    local -a configuration_sources=(/dev/null)
+
+    if ! [[ $address_pool_base =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+        echo "Invalid Docker address pool base: $address_pool_base" >&2
+        return 1
+    fi
+    if ! [[ $address_pool_size =~ ^[0-9]+$ ]] || [ "$address_pool_size" -lt 16 ] || [ "$address_pool_size" -gt 28 ]; then
+        echo "Invalid Docker address pool size: $address_pool_size" >&2
+        return 1
+    fi
+    if [ "$force_pool" != true ] && [ "$force_pool" != false ]; then
+        echo "Invalid Docker address pool override value: $force_pool" >&2
+        return 1
+    fi
+
+    for source_file in "$config_file" "$sidecar_file"; do
+        if [ ! -e "$source_file" ]; then
+            continue
+        fi
+        if [ ! -f "$source_file" ] || ! jq -e --slurp 'length == 1 and (.[0] | type == "object")' "$source_file" >/dev/null 2>&1; then
+            echo "Refusing to replace invalid Docker daemon configuration: $source_file" >&2
+            return 1
+        fi
+        configuration_sources+=("$source_file")
+    done
+
+    config_directory="$(dirname -- "$config_file")"
+    mkdir -p "$config_directory"
+    umask 077
+    temp_file="$(mktemp "$config_directory/.daemon.json.tmp.XXXXXX")"
+    trap '[ -z "${temp_file:-}" ] || rm -f "$temp_file"' EXIT
+
+    jq --sort-keys --slurp \
+        --arg address_pool_base "$address_pool_base" \
+        --argjson address_pool_size "$address_pool_size" \
+        --argjson force_pool "$force_pool" '
+            reduce .[] as $configuration ({}; . * $configuration)
+            | .["log-opts"] = (
+                (if (.["log-opts"] | type) == "object" then .["log-opts"] else {} end)
+                * {"max-size": "10m", "max-file": "3"}
+            )
+            | .["log-driver"] = "json-file"
+            | if $force_pool
+                or ((.["default-address-pools"] | type) != "array")
+                or ((.["default-address-pools"] | length) == 0)
+              then .["default-address-pools"] = [
+                  {"base": $address_pool_base, "size": $address_pool_size}
+              ]
+              else .
+              end
+        ' "${configuration_sources[@]}" > "$temp_file"
+    chmod 600 "$temp_file"
+
+    if [ -f "$config_file" ] && jq -e --slurp '.[0] == .[1]' "$config_file" "$temp_file" >/dev/null; then
+        chmod 600 "$config_file"
+        printf 'unchanged\n'
+        return 0
+    fi
+
+    sync -f "$temp_file"
+    mv -f "$temp_file" "$config_file"
+    temp_file=""
+    sync -f "$config_directory"
+    printf 'changed\n'
+)
+
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ "${BASH_SOURCE[0]}" != "$0" ]; then
+    return 0
+fi
+
 set -e # Exit immediately if a command exits with a non-zero status
 ## $1 could be empty, so we need to disable this check
 #set -u # Treat unset variables as an error and exit
@@ -651,128 +732,18 @@ echo "4/9 Checking Docker configuration..."
 echo " - Network pool configuration: ${DOCKER_ADDRESS_POOL_BASE}/${DOCKER_ADDRESS_POOL_SIZE}"
 echo " - To override existing configuration: DOCKER_POOL_FORCE_OVERRIDE=true"
 
-mkdir -p /etc/docker
+DAEMON_CONFIG_RESULT=$(configure_docker_daemon \
+    /etc/docker/daemon.json \
+    /etc/docker/daemon.json.coolify \
+    "$DOCKER_ADDRESS_POOL_BASE" \
+    "$DOCKER_ADDRESS_POOL_SIZE" \
+    "$DOCKER_POOL_FORCE_OVERRIDE")
 
-# Backup original daemon.json if it exists
-if [ -f /etc/docker/daemon.json ]; then
-    cp /etc/docker/daemon.json /etc/docker/daemon.json.original-"$DATE"
-fi
-
-# Create coolify configuration with or without address pools based on whether they were explicitly provided
-if [ "$DOCKER_POOL_FORCE_OVERRIDE" = true ] || [ "$EXISTING_POOL_CONFIGURED" = false ]; then
-    # First check if the configuration would actually change anything
-    if [ -f /etc/docker/daemon.json ]; then
-        CURRENT_POOL_BASE=$(jq -r '.["default-address-pools"][0].base' /etc/docker/daemon.json 2>/dev/null)
-        CURRENT_POOL_SIZE=$(jq -r '.["default-address-pools"][0].size' /etc/docker/daemon.json 2>/dev/null)
-
-        if [ "$CURRENT_POOL_BASE" = "$DOCKER_ADDRESS_POOL_BASE" ] && [ "$CURRENT_POOL_SIZE" = "$DOCKER_ADDRESS_POOL_SIZE" ]; then
-            echo " - Network pool configuration unchanged, skipping update"
-            NEED_MERGE=false
-        else
-            # If force override is enabled or no existing configuration exists,
-            # create a new configuration with the specified address pools
-            echo " - Creating new Docker configuration with network pool: ${DOCKER_ADDRESS_POOL_BASE}/${DOCKER_ADDRESS_POOL_SIZE}"
-            cat >/etc/docker/daemon.json <<EOL
-{
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "10m",
-    "max-file": "3"
-  },
-  "default-address-pools": [
-    {"base":"${DOCKER_ADDRESS_POOL_BASE}","size":${DOCKER_ADDRESS_POOL_SIZE}}
-  ]
-}
-EOL
-            NEED_MERGE=true
-        fi
-    else
-        # No existing configuration, create new one
-        echo " - Creating new Docker configuration with network pool: ${DOCKER_ADDRESS_POOL_BASE}/${DOCKER_ADDRESS_POOL_SIZE}"
-        cat >/etc/docker/daemon.json <<EOL
-{
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "10m",
-    "max-file": "3"
-  },
-  "default-address-pools": [
-    {"base":"${DOCKER_ADDRESS_POOL_BASE}","size":${DOCKER_ADDRESS_POOL_SIZE}}
-  ]
-}
-EOL
-        NEED_MERGE=true
-    fi
+if [ "$DAEMON_CONFIG_RESULT" = changed ]; then
+    echo " - Configuration updated - restarting Docker daemon..."
+    restart_docker_service
 else
-    # Check if we need to update log settings
-    if [ -f /etc/docker/daemon.json ] && jq -e '.["log-driver"] == "json-file" and .["log-opts"]["max-size"] == "10m" and .["log-opts"]["max-file"] == "3"' /etc/docker/daemon.json >/dev/null 2>&1; then
-        echo " - Log configuration is up to date"
-        NEED_MERGE=false
-    else
-        # Create a configuration without address pools to preserve existing ones
-        cat >/etc/docker/daemon.json.coolify <<EOL
-{
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "10m",
-    "max-file": "3"
-  }
-}
-EOL
-        NEED_MERGE=true
-    fi
-fi
-
-# Remove the duplicate daemon.json creation since we handle it above
-if ! [ -f /etc/docker/daemon.json ]; then
-    # If no daemon.json exists, create it with default settings
-    cat >/etc/docker/daemon.json <<EOL
-{
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "10m",
-    "max-file": "3"
-  },
-  "default-address-pools": [
-    {"base":"${DOCKER_ADDRESS_POOL_BASE}","size":${DOCKER_ADDRESS_POOL_SIZE}}
-  ]
-}
-EOL
-    NEED_MERGE=false
-fi
-
-if [ -s /etc/docker/daemon.json.original-"$DATE" ]; then
-    DIFF=$(diff <(jq --sort-keys . /etc/docker/daemon.json) <(jq --sort-keys . /etc/docker/daemon.json.original-"$DATE") || true)
-    if [ "$DIFF" != "" ]; then
-        echo " - Checking configuration changes..."
-
-        # Check if address pools were changed
-        if echo "$DIFF" | grep -q "default-address-pools"; then
-            if [ "$DOCKER_POOL_BASE_PROVIDED" = true ] || [ "$DOCKER_POOL_SIZE_PROVIDED" = true ]; then
-                echo " - Network pool updated per user request"
-            else
-                echo " - Warning: Network pool modified without explicit request"
-            fi
-        fi
-
-        # Remove this redundant restart since we already restarted when writing the config
-        echo " - Configuration changes confirmed"
-        if [ "$NEED_MERGE" = true ]; then
-            echo " - Configuration updated - restarting Docker daemon..."
-            restart_docker_service
-        else
-            echo " - Configuration is up to date"
-        fi
-    else
-        echo " - Configuration is up to date"
-    fi
-else
-    if [ "$NEED_MERGE" = true ]; then
-        echo " - Configuration updated - restarting Docker daemon..."
-        restart_docker_service
-    else
-        echo " - Configuration is up to date"
-    fi
+    echo " - Configuration is up to date"
 fi
 
 log_section "Step 5/9: Downloading required files from CDN"

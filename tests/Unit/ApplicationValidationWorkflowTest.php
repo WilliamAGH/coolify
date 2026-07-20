@@ -206,6 +206,11 @@ function applicationValidationWorkflowViolations(array $workflow): array
     }
 
     $workflowAndShell = is_array($jobs) ? ($jobs['workflow-and-shell'] ?? []) : [];
+    $releasePublicationScript = collect($workflowAndShell['steps'] ?? [])
+        ->firstWhere('name', 'Run release publication shell integrations')['run'] ?? '';
+    if (! str_contains((string) $releasePublicationScript, 'tests/Integration/DockerDaemonConfigurationTest.sh')) {
+        $violations[] = 'application validation must execute the Docker daemon configuration integration';
+    }
     $databaseMigrationScript = collect($workflowAndShell['steps'] ?? [])
         ->firstWhere('name', 'Verify database migration S6 exit propagation')['run'] ?? '';
     if (! str_contains((string) $databaseMigrationScript, 'tests/Integration/DatabaseMigrationS6/run.sh')) {
