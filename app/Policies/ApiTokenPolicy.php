@@ -99,11 +99,7 @@ class ApiTokenPolicy
      */
     public function useWritePermissions(User $user): bool
     {
-        // Authorization temporarily disabled
-        /*
         // Only admins and owners can use write permissions
         return $user->isAdmin() || $user->isOwner();
-        */
-        return true;
     }
 }
