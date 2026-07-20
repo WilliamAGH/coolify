@@ -6197,6 +6197,9 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         Builder $query,
         int $supersessionGeneration,
     ): void {
+        $applicationId = (int) $this->application_deployment_queue->application_id;
+        $destinationId = (int) $this->application_deployment_queue->destination_id;
+        $deploymentUuid = (string) $this->application_deployment_queue->deployment_uuid;
         $query
             ->whereKey($this->application_deployment_queue->getKey())
             ->where('application_id', $this->application_deployment_queue->application_id)
@@ -6206,12 +6209,12 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
             ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
             ->where('blue_green_phase', BlueGreenDeploymentPhase::INTERVENTION_REQUIRED->value)
             ->where('blue_green_supersession_generation', $supersessionGeneration)
-            ->whereExists(function ($stateQuery) use ($supersessionGeneration): void {
+            ->whereExists(function ($stateQuery) use ($applicationId, $deploymentUuid, $destinationId, $supersessionGeneration): void {
                 $stateQuery->selectRaw('1')
                     ->from('application_blue_green_deployments as drain_failure_state')
-                    ->whereColumn('drain_failure_state.application_id', 'application_deployment_queues.application_id')
-                    ->whereColumn('drain_failure_state.standalone_docker_id', 'application_deployment_queues.destination_id')
-                    ->whereColumn('drain_failure_state.operation_deployment_uuid', 'application_deployment_queues.deployment_uuid')
+                    ->where('drain_failure_state.application_id', $applicationId)
+                    ->where('drain_failure_state.standalone_docker_id', $destinationId)
+                    ->where('drain_failure_state.operation_deployment_uuid', $deploymentUuid)
                     ->where('drain_failure_state.phase', BlueGreenDeploymentPhase::INTERVENTION_REQUIRED->value)
                     ->where('drain_failure_state.supersession_generation', $supersessionGeneration)
                     ->whereNull('drain_failure_state.deactivation_operation_id')

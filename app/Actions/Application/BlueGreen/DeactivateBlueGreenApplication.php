@@ -265,6 +265,12 @@ final class DeactivateBlueGreenApplication
         array $destinationFences = [],
         ?Closure $beforeRemoteMutation = null,
     ): Collection {
+        $beforeFencedMutation = $destinationFences === [] && $beforeRemoteMutation === null
+            ? null
+            : function () use ($destinationFences, $beforeRemoteMutation): void {
+                $this->refreshDestinationFences($destinationFences);
+                $beforeRemoteMutation?->__invoke();
+            };
         foreach ($preparations as $preparation) {
             $deactivation = $preparation->deactivation;
             $operationId = $deactivation->operation_id;
@@ -281,7 +287,7 @@ final class DeactivateBlueGreenApplication
                 $supersessionGeneration,
                 $deactivation->phase,
                 $destinationFences[(int) $deactivation->standalone_docker_id] ?? null,
-                $beforeRemoteMutation,
+                $beforeFencedMutation,
             )) {
                 throw new BlueGreenDeactivationException('Blue-green destination deactivation did not prove completion.');
             }

@@ -3,10 +3,12 @@
 use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
 use App\Actions\Application\BlueGreen\DeactivateBlueGreenApplication;
 use App\Enums\ApplicationDeploymentStatus;
+use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\BlueGreenFleetStatus;
 use App\Enums\ProxyTypes;
 use App\Jobs\ApplicationDeploymentJob;
 use App\Models\Application;
+use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\InstanceSettings;
 use App\Models\Project;
@@ -15,14 +17,12 @@ use App\Models\StandaloneDocker;
 use App\Models\Team;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Notification;
 use Illuminate\Support\Facades\Process;
 
 beforeEach(function (): void {
     if (DB::getDriverName() !== 'pgsql') {
-        $this->markTestSkipped('PostgreSQL row locking is required for this concurrency test.');
-    }
-    if (! function_exists('pcntl_fork')) {
-        $this->markTestSkipped('The pcntl extension is required for this concurrency test.');
+        $this->markTestSkipped('PostgreSQL is required for this feature file.');
     }
 
     Artisan::call('migrate:fresh', ['--no-interaction' => true]);
@@ -113,6 +113,9 @@ function postgresBlueGreenWaitForLock(string $applicationName): bool
 }
 
 it('serializes direct cross-table topology writes through the destination reservation relation', function (): void {
+    if (! function_exists('pcntl_fork')) {
+        $this->markTestSkipped('The pcntl extension is required for this concurrency test.');
+    }
     $fixture = postgresBlueGreenMultiDestinationFixture();
     $additional = postgresBlueGreenMultiDestinationAdditional($fixture['team'], 'reservation');
     $competingPrimary = StandaloneDocker::factory()->create([
@@ -215,6 +218,9 @@ it('serializes direct cross-table topology writes through the destination reserv
 });
 
 it('never remotely deactivates a removal target promoted by a concurrent topology transaction', function (): void {
+    if (! function_exists('pcntl_fork')) {
+        $this->markTestSkipped('The pcntl extension is required for this concurrency test.');
+    }
     $fixture = postgresBlueGreenMultiDestinationFixture();
     $additional = postgresBlueGreenMultiDestinationAdditional($fixture['team'], 'removal-promotion');
     $fixture['application']->additional_networks()->attach($additional['destination']->id, [
@@ -300,7 +306,7 @@ it('never remotely deactivates a removal target promoted by a concurrent topolog
             ->where('server_id', $additional['server']->id)
             ->delete();
         DB::table('applications')
-            ->whereKey($fixture['application']->id)
+            ->where('id', $fixture['application']->id)
             ->update([
                 'destination_id' => $additional['destination']->id,
                 'destination_type' => $additional['destination']->getMorphClass(),
@@ -343,7 +349,77 @@ it('never remotely deactivates a removal target promoted by a concurrent topolog
     }
 });
 
+it('publishes exact drain recovery fleet failure with typed postgres ownership bindings', function (): void {
+    Notification::fake();
+    $fixture = postgresBlueGreenMultiDestinationFixture();
+    $failed = postgresBlueGreenMultiDestinationAdditional($fixture['team'], 'drain-failure');
+    $pending = postgresBlueGreenMultiDestinationAdditional($fixture['team'], 'drain-pending');
+    $fixture['application']->additional_networks()->attach($failed['destination']->id, ['server_id' => $failed['server']->id]);
+    $fixture['application']->additional_networks()->attach($pending['destination']->id, ['server_id' => $pending['server']->id]);
+    $owner = postgresBlueGreenMultiDestinationQueue(
+        $fixture['application'],
+        $fixture['destination'],
+        $fixture['server'],
+        'postgres-drain-fleet-owner',
+        ApplicationDeploymentStatus::FINISHED->value,
+    );
+    $owner->update([
+        'blue_green_fleet_deployment_uuid' => $owner->deployment_uuid,
+        'blue_green_fleet_status' => BlueGreenFleetStatus::ACTIVE,
+    ]);
+    $failedDeployment = postgresBlueGreenMultiDestinationQueue(
+        $fixture['application'],
+        $failed['destination'],
+        $failed['server'],
+        'postgres-drain-fleet-failed',
+        ApplicationDeploymentStatus::IN_PROGRESS->value,
+    );
+    $pendingDeployment = postgresBlueGreenMultiDestinationQueue(
+        $fixture['application'],
+        $pending['destination'],
+        $pending['server'],
+        'postgres-drain-fleet-pending',
+        ApplicationDeploymentStatus::QUEUED->value,
+    );
+    $failedDeployment->update([
+        'blue_green_fleet_deployment_uuid' => $owner->deployment_uuid,
+        'blue_green_phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+        'blue_green_supersession_generation' => 1,
+    ]);
+    $pendingDeployment->update(['blue_green_fleet_deployment_uuid' => $owner->deployment_uuid]);
+    ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $fixture['application']->id,
+        'standalone_docker_id' => $failed['destination']->id,
+        'operation_deployment_uuid' => $failedDeployment->deployment_uuid,
+        'phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+        'routing_revision' => 1,
+        'supersession_generation' => 1,
+    ]);
+    $job = new ApplicationDeploymentJob($failedDeployment->id);
+    foreach ([
+        'application' => $fixture['application']->fresh(['destination.server', 'settings']),
+        'application_deployment_queue' => $failedDeployment->fresh(),
+        'destination' => $failed['destination'],
+        'server' => $failed['server'],
+    ] as $property => $value) {
+        (new ReflectionProperty($job, $property))->setValue($job, $value);
+    }
+
+    $job->failBlueGreenDrainRecovery(new RuntimeException('PostgreSQL drain recovery requires intervention.'));
+
+    expect($failedDeployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value)
+        ->and($pendingDeployment->fresh()->status)->toBe(ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value)
+        ->and($owner->fresh()->blue_green_fleet_status)->toBe(BlueGreenFleetStatus::PAUSED)
+        ->and($fixture['application']->fresh()->additional_networks()
+            ->whereKey($failed['destination']->id)
+            ->firstOrFail()->pivot->status)->toBe('degraded:unknown')
+        ->and($pendingDeployment->claimForDispatch(bypassServerCapacity: true))->toBeFalse();
+});
+
 it('serializes a fleet failure publication before a sibling dispatch claim', function (): void {
+    if (! function_exists('pcntl_fork')) {
+        $this->markTestSkipped('The pcntl extension is required for this concurrency test.');
+    }
     $fixture = postgresBlueGreenMultiDestinationFixture();
     $failed = postgresBlueGreenMultiDestinationAdditional($fixture['team'], 'failure');
     $pending = postgresBlueGreenMultiDestinationAdditional($fixture['team'], 'pending');
