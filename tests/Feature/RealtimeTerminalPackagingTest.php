@@ -24,6 +24,20 @@ it('keeps terminal browser logging restricted to Vite development mode', functio
         ->not->toContain("console.log('[Terminal] WebSocket connection established. Cool cool cool cool cool cool.');");
 });
 
+it('registers the terminal Alpine provider before Livewire initializes navigated terminal markup', function () {
+    $appJs = file_get_contents(resource_path('js/app.js'));
+    $terminalClient = file_get_contents(resource_path('js/terminal.js'));
+
+    expect($appJs)
+        ->toContain("document.addEventListener('alpine:init', registerTerminalComponent, { once: true });")
+        ->toContain('registerTerminalComponent();')
+        ->not->toContain("document.getElementById('terminal-container')")
+        ->and($terminalClient)
+        ->toContain('let terminalComponentRegistered = false;')
+        ->toContain("window.Alpine.data('terminalData', terminalData);")
+        ->toContain('terminalComponentRegistered = true;');
+});
+
 it('keeps realtime terminal server logging behind the explicit debug flag', function () {
     $terminalServer = file_get_contents(base_path('docker/coolify-realtime/terminal-server.js'));
 
