@@ -180,11 +180,16 @@ jobs:
             tests/Feature/BlueGreenDeploymentReconciliationTest.php \
             tests/Feature/BlueGreenDeploymentRecoveryFailureTest.php \
             tests/Feature/BlueGreenDeploymentRecoveryTest.php \
+            tests/Feature/BlueGreenFinalizedDrainingRecoveryTest.php \
             tests/Feature/BlueGreenFoundationMigrationReplayTest.php \
             tests/Feature/BlueGreenFoundationPersistenceTest.php \
+            tests/Feature/BlueGreenInactiveRetirementTest.php \
+            tests/Feature/BlueGreenLifecyclePublicRecoveryTest.php \
             tests/Feature/BlueGreenMigrationReplayTest.php \
+            tests/Feature/BlueGreenMultiPortPromotionAcceptanceTest.php \
             tests/Feature/DatabaseMigrationReadinessTest.php \
             tests/Feature/BlueGreenOperationFencingTest.php \
+            tests/Feature/BlueGreenStoppedLegacyContainerCleanupTest.php \
             tests/Feature/BlueGreenSupersessionGenerationTest.php \
             tests/Feature/DeleteResourceJobBlueGreenTest.php \
             tests/Feature/LegacyProxyMutationPayloadAdoptionTest.php \
@@ -195,8 +200,10 @@ jobs:
             tests/Feature/ScheduleOnOneServerTest.php \
             tests/Unit/Actions/Application/BlueGreen/BlueGreenDeploymentLockTest.php \
             tests/Unit/Actions/Application/BlueGreen/BlueGreenOperationFenceTest.php \
+            tests/Unit/Actions/Application/BlueGreenDrainAndReleaseProofTest.php \
             tests/Unit/Actions/Application/BlueGreen/ExecuteBlueGreenDestinationMutationTest.php \
             tests/Unit/Actions/Application/BlueGreenPublicRecoveryTest.php \
+            tests/Unit/Actions/Proxy/BlueGreenMultiPortConfigurationTest.php \
             tests/Unit/ApplicationDeploymentActivationOrderTest.php \
             tests/Unit/ProxyMutationQueueTest.php \
             tests/Unit/ScheduledJobsRetryConfigTest.php

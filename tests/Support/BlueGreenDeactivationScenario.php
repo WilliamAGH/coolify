@@ -2,6 +2,7 @@
 
 namespace Tests\Support;
 
+use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
 use App\Actions\Application\BlueGreen\BlueGreenProxyDeactivationSnapshot;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Enums\ApplicationDeploymentStatus;
@@ -94,10 +95,12 @@ final readonly class BlueGreenDeactivationScenario
     public static function proxySnapshot(
         Application $application,
         StandaloneDocker $destination,
+        array $backendPorts = [3000],
     ): BlueGreenProxyDeactivationSnapshot {
         $sourceYaml = "http:\n  routers: {}\n";
         $tombstoneYaml = "http:\n  routers: {}\n";
         $destinationClockObservedAt = 1_700_000_000;
+        $canonicalBackendPorts = BlueGreenBackendPortInventory::fromPorts($backendPorts)->ports();
 
         return new BlueGreenProxyDeactivationSnapshot(
             managedFilename: BlueGreenRoutingTarget::managedFilename((string) $application->uuid, (int) $destination->id),
@@ -110,7 +113,8 @@ final readonly class BlueGreenDeactivationScenario
                 'router' => 'blue-green-deactivation-public',
                 'url' => 'https://blue-green-deactivation.example.test/',
             ]],
-            backendPort: 3000,
+            backendPort: $canonicalBackendPorts[0],
+            backendPorts: $canonicalBackendPorts,
             destinationClockObservedAtUnixSeconds: $destinationClockObservedAt,
             drainDeadlineUnixSeconds: $destinationClockObservedAt + 840,
             deactivationDeadlineUnixSeconds: $destinationClockObservedAt + 900,

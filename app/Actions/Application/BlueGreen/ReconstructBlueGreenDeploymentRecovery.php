@@ -11,6 +11,7 @@ use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\StandaloneDocker;
+use Illuminate\Support\Facades\DB;
 use Lorisleiva\Actions\Concerns\AsAction;
 
 final class ReconstructBlueGreenDeploymentRecovery
@@ -19,69 +20,99 @@ final class ReconstructBlueGreenDeploymentRecovery
 
     public function handle(ApplicationBlueGreenDeployment $state): BlueGreenDeploymentRecoveryOperation
     {
-        $state->refresh();
-        $operationUuid = $this->operationUuid($state);
-        $application = Application::withTrashed()->find($state->application_id);
-        $destination = StandaloneDocker::query()->with('server')->find($state->standalone_docker_id);
-        $deployment = ApplicationDeploymentQueue::query()
-            ->where('application_id', $state->application_id)
-            ->where('deployment_uuid', $operationUuid)
-            ->first();
+        return DB::transaction(function () use ($state): BlueGreenDeploymentRecoveryOperation {
+            $stateId = (int) $state->getKey();
+            $snapshot = ApplicationBlueGreenDeployment::query()->find($stateId);
+            if ($snapshot === null) {
+                throw new BlueGreenDeploymentTransitionException('The interrupted deployment state no longer exists.');
+            }
+            $operationUuid = $this->operationUuid($snapshot);
+            $locks = BlueGreenLifecycleDatabaseLocks::forDestination(
+                (int) $snapshot->application_id,
+                (int) $snapshot->standalone_docker_id,
+                [$operationUuid],
+            );
+            $state = $locks->state;
+            $application = $locks->application;
+            $destination = StandaloneDocker::query()
+                ->with('server')
+                ->find($snapshot->standalone_docker_id);
+            $deployment = $locks->queue($operationUuid);
 
-        if ($application === null || $destination === null || $destination->server === null || $deployment === null) {
-            throw new BlueGreenDeploymentTransitionException('The interrupted operation no longer has an exact application, destination, server, and queue owner.');
-        }
+            if ($state === null
+                || $state->id !== $snapshot->id
+                || $destination === null
+                || $destination->server === null
+                || $deployment === null) {
+                throw new BlueGreenDeploymentTransitionException('The interrupted operation no longer has an exact application, destination, server, and queue owner.');
+            }
 
-        $this->assertApplicationOwnership($application, $state);
-        $this->assertDeploymentScope($application, $destination, $deployment);
-        $claim = $this->claim($state, $application, $destination, $deployment, $operationUuid);
-        $this->assertQueueProvenance($state, $deployment, $claim);
+            $this->assertApplicationOwnership($application, $state);
+            $this->assertDeploymentScope($application, $destination, $deployment);
+            $hasPreviousContainer = $state->operation_previous_active_color !== null
+                || $state->legacy_container_name !== null;
+            if ($deployment->blue_green_backend_port_inventory === null
+                || ($hasPreviousContainer && $deployment->blue_green_drain_backend_port_inventory === null)
+                || (! $hasPreviousContainer && $deployment->blue_green_drain_backend_port_inventory !== null)) {
+                (new BackfillBlueGreenBackendPortInventories)->backfillInFlightOwner(
+                    $application,
+                    $locks->setting,
+                    $destination,
+                    $state,
+                    $locks->deactivation,
+                    $locks->queues,
+                    $deployment,
+                );
+            }
+            $claim = $this->claim($state, $application, $destination, $deployment, $operationUuid);
+            $this->assertQueueProvenance($state, $deployment, $claim);
 
-        [$isPending, $wasFinalized] = $this->operationShape($state, $claim);
-        $this->assertOperationPhase($state, $isPending, $wasFinalized);
+            [$isPending, $wasFinalized] = $this->operationShape($state, $claim);
+            $this->assertOperationPhase($state, $isPending, $wasFinalized);
 
-        $routingMutationRecorded = $this->routingMutationRecorded($state, $deployment);
-        if ($wasFinalized && ! $routingMutationRecorded) {
-            throw new BlueGreenDeploymentTransitionException('A finalized operation has no durable routing-mutation provenance.');
-        }
+            $routingMutationRecorded = $this->routingMutationRecorded($state, $deployment);
+            if ($wasFinalized && ! $routingMutationRecorded) {
+                throw new BlueGreenDeploymentTransitionException('A finalized operation has no durable routing-mutation provenance.');
+            }
 
-        $previousContainer = $this->previousContainer($state, $claim, $deployment);
-        $legacyRoutingSnapshot = $this->legacyRoutingSnapshot(
-            $state,
-            $claim,
-            $previousContainer,
-            $routingMutationRecorded,
-        );
-        $candidateContainer = $this->candidateContainer($state, $claim);
+            $previousContainer = $this->previousContainer($state, $claim, $deployment);
+            $legacyRoutingSnapshot = $this->legacyRoutingSnapshot(
+                $state,
+                $claim,
+                $previousContainer,
+                $routingMutationRecorded,
+            );
+            $candidateContainer = $this->candidateContainer($state, $claim);
 
-        $rollbackKey = $this->rollbackKey(
-            $state,
-            $application,
-            $claim,
-            $routingMutationRecorded,
-        );
-
-        return new BlueGreenDeploymentRecoveryOperation(
-            claim: $claim,
-            application: $application,
-            destination: $destination,
-            server: $destination->server,
-            deployment: $deployment,
-            previousContainer: $previousContainer,
-            legacyRoutingSnapshot: $legacyRoutingSnapshot,
-            candidateContainer: $candidateContainer,
-            rollbackKey: $rollbackKey,
-            currentDestinationState: $this->currentDestinationState(
+            $rollbackKey = $this->rollbackKey(
                 $state,
                 $application,
                 $claim,
-                $rollbackKey,
                 $routingMutationRecorded,
-            ),
-            recoveredPhase: $state->phase,
-            routingMutationRecorded: $routingMutationRecorded,
-            wasFinalized: $wasFinalized,
-        );
+            );
+
+            return new BlueGreenDeploymentRecoveryOperation(
+                claim: $claim,
+                application: $application,
+                destination: $destination,
+                server: $destination->server,
+                deployment: $deployment,
+                previousContainer: $previousContainer,
+                legacyRoutingSnapshot: $legacyRoutingSnapshot,
+                candidateContainer: $candidateContainer,
+                rollbackKey: $rollbackKey,
+                currentDestinationState: $this->currentDestinationState(
+                    $state,
+                    $application,
+                    $claim,
+                    $rollbackKey,
+                    $routingMutationRecorded,
+                ),
+                recoveredPhase: $state->phase,
+                routingMutationRecorded: $routingMutationRecorded,
+                wasFinalized: $wasFinalized,
+            );
+        }, attempts: 5);
     }
 
     private function operationUuid(ApplicationBlueGreenDeployment $state): string
@@ -146,6 +177,12 @@ final class ReconstructBlueGreenDeploymentRecovery
         $serverBootId = $state->operation_server_boot_id;
         $topologyDigest = $state->operation_topology_digest;
         $routingConfigDigest = $state->operation_routing_config_digest;
+        $backendPortInventory = BlueGreenBackendPortInventory::fromSerialized(
+            $deployment->blue_green_backend_port_inventory,
+        );
+        $drainBackendPortInventory = $deployment->blue_green_drain_backend_port_inventory === null
+            ? null
+            : BlueGreenBackendPortInventory::fromSerialized($deployment->blue_green_drain_backend_port_inventory);
         $supersessionGeneration = $state->supersession_generation;
         $candidateContainerName = $state->operation_candidate_container_name;
         $rollbackManagedFilename = $state->operation_rollback_managed_filename;
@@ -179,6 +216,8 @@ final class ReconstructBlueGreenDeploymentRecovery
             serverBootId: $serverBootId,
             topologyDigest: $topologyDigest,
             routingConfigDigest: $routingConfigDigest,
+            backendPortInventory: $backendPortInventory,
+            drainBackendPortInventory: $drainBackendPortInventory,
             supersessionGeneration: $supersessionGeneration,
             legacyContainerName: $state->operation_previous_active_color === null
                 ? $state->legacy_container_name
@@ -213,6 +252,8 @@ final class ReconstructBlueGreenDeploymentRecovery
             || $deployment->blue_green_server_boot_id !== $claim->serverBootId
             || $deployment->blue_green_topology_digest !== $claim->topologyDigest
             || $deployment->blue_green_routing_config_digest !== $claim->routingConfigDigest
+            || $deployment->blue_green_backend_port_inventory !== $claim->backendPortInventory->serialized
+            || $deployment->blue_green_drain_backend_port_inventory !== $claim->drainBackendPortInventory?->serialized
             || $deployment->blue_green_supersession_generation !== $claim->supersessionGeneration
             || $deployment->blue_green_previous_container_id !== $state->operation_previous_container_id
             || $deployment->blue_green_candidate_container_id !== $state->operation_candidate_container_id

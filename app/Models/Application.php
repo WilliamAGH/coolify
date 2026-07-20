@@ -1278,41 +1278,67 @@ class Application extends BaseModel
         return false;
     }
 
-    public function blueGreenDeploymentBackendPort(?ApplicationSetting $setting = null): ?int
+    /** @return non-empty-list<int>|null */
+    public function blueGreenDeploymentBackendPorts(?ApplicationSetting $setting = null): ?array
     {
         $setting ??= $this->relationLoaded('settings')
             ? $this->getRelation('settings')
             : $this->settings()->first();
         if ((bool) ($setting?->is_static ?? false)) {
-            $backendPort = 80;
+            $backendPorts = [80];
         } else {
-            $ports = $this->ports_exposes_array;
-            if (count($ports) !== 1) {
-                return null;
-            }
+            $backendPorts = [];
+            foreach ($this->ports_exposes_array as $configuredPort) {
+                $configuredPort = trim((string) $configuredPort);
+                if (preg_match('/^[1-9][0-9]{0,4}$/D', $configuredPort) !== 1) {
+                    return null;
+                }
 
-            $configuredPort = trim((string) $ports[0]);
-            if (preg_match('/^[1-9][0-9]{0,4}$/D', $configuredPort) !== 1) {
-                return null;
+                $backendPort = (int) $configuredPort;
+                if ($backendPort > 65535 || in_array($backendPort, $backendPorts, true)) {
+                    return null;
+                }
+                $backendPorts[] = $backendPort;
             }
-            $backendPort = (int) $configuredPort;
-            if ($backendPort > 65535) {
+            if ($backendPorts === []) {
                 return null;
             }
         }
+        sort($backendPorts, SORT_NUMERIC);
 
+        $routedBackendPorts = [];
         foreach (explode(',', (string) $this->fqdn) as $domain) {
             try {
                 $domainPort = Url::fromString(trim($domain))->getPort();
             } catch (\Throwable) {
                 return null;
             }
-            if ($domainPort !== null && $domainPort !== $backendPort) {
+            if ($domainPort === null) {
+                if (count($backendPorts) !== 1) {
+                    return null;
+                }
+                $domainPort = $backendPorts[0];
+            }
+            if (! in_array($domainPort, $backendPorts, true)) {
                 return null;
             }
+            $routedBackendPorts[$domainPort] = true;
+        }
+        if (count($routedBackendPorts) !== count($backendPorts)) {
+            return null;
         }
 
-        return $backendPort;
+        return $backendPorts;
+    }
+
+    public function blueGreenDeploymentBackendPort(?ApplicationSetting $setting = null): ?int
+    {
+        $backendPorts = $this->blueGreenDeploymentBackendPorts($setting);
+        if ($backendPorts === null || count($backendPorts) !== 1) {
+            return null;
+        }
+
+        return $backendPorts[0];
     }
 
     /** @return Collection<int, int> */
@@ -1670,8 +1696,8 @@ class Application extends BaseModel
         if (str($this->fqdn)->trim()->isEmpty()) {
             return 'Blue-green deployments require at least one FQDN.';
         }
-        if ($this->blueGreenDeploymentBackendPort($setting) === null) {
-            return 'Blue-green deployments require exactly one valid exposed backend port; static applications use port 80 and every explicit FQDN port must match it.';
+        if ($this->blueGreenDeploymentBackendPorts($setting) === null) {
+            return 'Blue-green deployments require unique valid exposed backend ports. Multiple ports require every FQDN to declare one exposed :port, and every exposed port must have a matching FQDN; static applications use port 80.';
         }
         if (count($this->ports_mappings_array) > 0) {
             return 'Blue-green deployments do not support ports mapped to the host.';

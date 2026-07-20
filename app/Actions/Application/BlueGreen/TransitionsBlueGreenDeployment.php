@@ -378,7 +378,9 @@ final class TransitionsBlueGreenDeployment
             || $deployment->blue_green_destination_fence_epoch !== $claim->destinationFenceEpoch
             || $deployment->blue_green_server_boot_id !== $claim->serverBootId
             || $deployment->blue_green_topology_digest !== $claim->topologyDigest
-            || $deployment->blue_green_routing_config_digest !== $claim->routingConfigDigest) {
+            || $deployment->blue_green_routing_config_digest !== $claim->routingConfigDigest
+            || $deployment->blue_green_backend_port_inventory !== $claim->backendPortInventory->serialized
+            || $deployment->blue_green_drain_backend_port_inventory !== $claim->drainBackendPortInventory?->serialized) {
             throw new BlueGreenDeploymentTransitionException('The deployment queue provenance does not match the pending blue-green transition.');
         }
     }

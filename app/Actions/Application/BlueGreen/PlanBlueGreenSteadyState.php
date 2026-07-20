@@ -39,15 +39,16 @@ final class PlanBlueGreenSteadyState
             ->where('application_id', $application->id)
             ->where('deployment_uuid', $activeDeploymentUuid)
             ->firstOrFail();
-        $port = $application->blueGreenDeploymentBackendPort()
-            ?? throw new BlueGreenDeploymentTransitionException('The IDLE destination no longer has one unambiguous backend port.');
+        $ports = $application->blueGreenDeploymentBackendPorts()
+            ?? throw new BlueGreenDeploymentTransitionException('The IDLE destination no longer has an exact backend port inventory.');
         $applicationUuid = (string) $application->uuid;
         $target = new BlueGreenRoutingTarget(
             destinationId: $destination->id,
             activeColor: $state->active_color,
             blueContainerName: "{$applicationUuid}-".BlueGreenDeploymentColor::BLUE->value,
             greenContainerName: "{$applicationUuid}-".BlueGreenDeploymentColor::GREEN->value,
-            port: $port,
+            port: $ports[0],
+            ports: $ports,
             routingRevision: $state->routing_revision,
             mode: BlueGreenRoutingMode::Steady,
             publicProofToken: BlueGreenRoutingTarget::durablePublicProofToken($activeDeploymentUuid),

@@ -54,10 +54,7 @@ class CompileBlueGreenProxyConfiguration
         }
 
         $namePrefix = BlueGreenRoutingTarget::routingNamePrefix($applicationUuid, $target->destinationId);
-        $activeServiceName = BlueGreenRoutingTarget::activeServiceName($applicationUuid, $target->destinationId);
-        $publicServiceName = $target->mode === BlueGreenRoutingMode::LegacyRecoveryBridge
-            ? $namePrefix.'legacy-recovery-bridge'
-            : $activeServiceName;
+        $routerPorts = $this->routerPorts($parsed, $target);
         $shouldEmitPublicRoutes = $target->mode !== BlueGreenRoutingMode::ProbeOnly;
         $middlewareNames = [];
         $middlewares = [];
@@ -80,12 +77,15 @@ class CompileBlueGreenProxyConfiguration
 
         $routers = [];
         foreach ($parsed['routers'] as $routerName => $properties) {
+            $backendPort = $routerPorts[$routerName];
             $compiledName = $namePrefix.$routerName;
             $publicRouterName = $compiledName.'-public';
             $router = $this->compileRouter(
                 routerName: $routerName,
                 properties: $properties,
-                serviceName: $publicServiceName,
+                serviceName: $target->mode === BlueGreenRoutingMode::LegacyRecoveryBridge
+                    ? $this->legacyRecoveryServiceName($namePrefix, $target, $backendPort)
+                    : $target->activeServiceNameForBackendPort($applicationUuid, $backendPort),
                 middlewareNames: $middlewareNames,
                 mode: $target->mode,
             );
@@ -95,10 +95,10 @@ class CompileBlueGreenProxyConfiguration
                 $probeRule = '('.$router['rule'].') && Header(`'.$target->probeHeaderName.'`, `'.$target->probeToken.'`)';
                 $probeRouter = $router;
                 $probeRouter['rule'] = $probeRule;
-                $probeRouter['service'] = BlueGreenRoutingTarget::memberServiceReference(
+                $probeRouter['service'] = $target->memberServiceReferenceForBackendPort(
                     $applicationUuid,
-                    $target->destinationId,
                     $target->probeColor,
+                    $backendPort,
                 );
                 unset($probeRouter['priority']);
                 $probeRouter['middlewares'] = array_values(array_merge(
@@ -129,74 +129,54 @@ class CompileBlueGreenProxyConfiguration
             }
         }
 
-        $referencedServices = [];
-        foreach ($parsed['routers'] as $routerName => $properties) {
-            $generatedService = $properties['service'] ?? null;
-            if ($generatedService === null || ! isset($parsed['servicePorts'][$generatedService])) {
-                throw new InvalidArgumentException(
-                    "Generated Traefik router {$routerName} must reference a service with an explicit port."
-                );
-            }
-            $referencedServices[$generatedService] = true;
-        }
-        ksort($referencedServices);
-        if (array_keys($referencedServices) !== array_keys($parsed['servicePorts'])) {
-            throw new InvalidArgumentException('Canonical application labels contain an unreferenced Traefik service port.');
-        }
-
-        foreach ($parsed['servicePorts'] as $serviceName => $port) {
-            if ($port !== $target->port) {
-                throw new InvalidArgumentException(
-                    "Generated Traefik service {$serviceName} uses port {$port}, not the blue/green target port {$target->port}."
-                );
-            }
-        }
-
         ksort($routers);
         ksort($middlewares);
         $services = [];
-        if ($target->mode !== BlueGreenRoutingMode::ProbeOnly) {
-            $services[$activeServiceName] = [
-                'weighted' => [
-                    'services' => [[
-                        'name' => BlueGreenRoutingTarget::memberServiceReference(
-                            $applicationUuid,
-                            $target->destinationId,
-                            $target->activeColor,
-                        ),
-                        'weight' => 1,
-                    ]],
-                ],
-            ];
-        }
-        if ($target->mode !== BlueGreenRoutingMode::ProbeOnly && $target->fallbackContainerName !== null) {
-            $candidateServiceName = $namePrefix.'candidate-main';
-            $fallbackServiceName = $namePrefix.'previous-fallback';
-            $services[$candidateServiceName] = $this->service(
-                $target->containerName($target->activeColor),
-                $target->port,
-                $target->failoverHealthCheck(),
-            );
-            $services[$fallbackServiceName] = $this->service(
-                $target->fallbackContainerName
-                    ?? throw new InvalidArgumentException('A failover route has no exact previous backend identity.'),
-                $target->port,
-                $target->failoverHealthCheck(),
-            );
-            $services[$activeServiceName] = [
-                'failover' => [
-                    'service' => $candidateServiceName,
-                    'fallback' => $fallbackServiceName,
-                    'healthCheck' => [],
-                ],
-            ];
-        }
-        if ($target->mode === BlueGreenRoutingMode::LegacyRecoveryBridge) {
-            $services[$publicServiceName] = $this->service(
-                $target->legacyContainerName
-                    ?? throw new InvalidArgumentException('A legacy recovery bridge has no legacy backend identity.'),
-                $target->port,
-            );
+        foreach ($target->ports as $backendPort) {
+            $activeServiceName = $target->activeServiceNameForBackendPort($applicationUuid, $backendPort);
+            if ($target->mode !== BlueGreenRoutingMode::ProbeOnly) {
+                $services[$activeServiceName] = [
+                    'weighted' => [
+                        'services' => [[
+                            'name' => $target->memberServiceReferenceForBackendPort(
+                                $applicationUuid,
+                                $target->activeColor,
+                                $backendPort,
+                            ),
+                            'weight' => 1,
+                        ]],
+                    ],
+                ];
+            }
+            if ($target->mode !== BlueGreenRoutingMode::ProbeOnly && $target->fallbackContainerName !== null) {
+                $candidateServiceName = $this->failoverServiceName($namePrefix, 'candidate-main', $target, $backendPort);
+                $fallbackServiceName = $this->failoverServiceName($namePrefix, 'previous-fallback', $target, $backendPort);
+                $services[$candidateServiceName] = $this->service(
+                    $target->containerName($target->activeColor),
+                    $backendPort,
+                    $target->failoverHealthCheck(),
+                );
+                $services[$fallbackServiceName] = $this->service(
+                    $target->fallbackContainerName
+                        ?? throw new InvalidArgumentException('A failover route has no exact previous backend identity.'),
+                    $backendPort,
+                    $target->failoverHealthCheck(),
+                );
+                $services[$activeServiceName] = [
+                    'failover' => [
+                        'service' => $candidateServiceName,
+                        'fallback' => $fallbackServiceName,
+                        'healthCheck' => [],
+                    ],
+                ];
+            }
+            if ($target->mode === BlueGreenRoutingMode::LegacyRecoveryBridge) {
+                $services[$this->legacyRecoveryServiceName($namePrefix, $target, $backendPort)] = $this->service(
+                    $target->legacyContainerName
+                        ?? throw new InvalidArgumentException('A legacy recovery bridge has no legacy backend identity.'),
+                    $backendPort,
+                );
+            }
         }
         ksort($services);
         $configuration = [
@@ -227,6 +207,62 @@ class CompileBlueGreenProxyConfiguration
             sha256: $sha256,
             state: $target->fencedState($applicationUuid, $managedFilename, $sha256, $routingConfigDigest),
         );
+    }
+
+    /**
+     * @param  array{routers: array<string, array<string, string>>, servicePorts: array<string, int>}  $parsed
+     * @return array<string, int>
+     */
+    private function routerPorts(array $parsed, BlueGreenRoutingTarget $target): array
+    {
+        $referencedServices = [];
+        $routerPorts = [];
+        $routePorts = [];
+        foreach ($parsed['routers'] as $routerName => $properties) {
+            $generatedService = $properties['service'] ?? null;
+            if ($generatedService === null || ! isset($parsed['servicePorts'][$generatedService])) {
+                throw new InvalidArgumentException(
+                    "Generated Traefik router {$routerName} must reference a service with an explicit port."
+                );
+            }
+            $referencedServices[$generatedService] = true;
+            $backendPort = $parsed['servicePorts'][$generatedService];
+            $routeIdentity = ($properties['rule'] ?? '')."\0".($properties['entryPoints'] ?? '');
+            if (isset($routePorts[$routeIdentity]) && $routePorts[$routeIdentity] !== $backendPort) {
+                throw new InvalidArgumentException('Canonical application labels cannot map one public route to multiple blue-green backend ports.');
+            }
+            $routePorts[$routeIdentity] = $backendPort;
+            $routerPorts[$routerName] = $backendPort;
+        }
+        ksort($referencedServices);
+        if (array_keys($referencedServices) !== array_keys($parsed['servicePorts'])) {
+            throw new InvalidArgumentException('Canonical application labels contain an unreferenced Traefik service port.');
+        }
+
+        $generatedPorts = array_values(array_unique(array_values($parsed['servicePorts'])));
+        sort($generatedPorts, SORT_NUMERIC);
+        if ($generatedPorts !== $target->ports) {
+            throw new InvalidArgumentException('Canonical application labels must route every configured blue-green backend port exactly.');
+        }
+
+        return $routerPorts;
+    }
+
+    private function failoverServiceName(
+        string $namePrefix,
+        string $role,
+        BlueGreenRoutingTarget $target,
+        int $port,
+    ): string {
+        return $namePrefix.$role.(count($target->ports) > 1 ? "-{$port}" : '');
+    }
+
+    private function legacyRecoveryServiceName(
+        string $namePrefix,
+        BlueGreenRoutingTarget $target,
+        int $port,
+    ): string {
+        return $namePrefix.'legacy-recovery-bridge'.(count($target->ports) > 1 ? "-{$port}" : '');
     }
 
     /**

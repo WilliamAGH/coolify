@@ -233,9 +233,9 @@ final class RecoverBlueGreenFinalizedDrainingOperation
             ?? throw new BlueGreenDeploymentTransitionException('The finalized fallback has no previous routing revision.');
         $persistedPreviousState = $operation->rollbackKey->expectedState
             ?? throw new BlueGreenDeploymentTransitionException('The finalized fallback has no persisted predecessor destination state.');
-        $port = $operation->application->blueGreenDeploymentBackendPort();
-        if ($port === null) {
-            throw new BlueGreenDeploymentTransitionException('The finalized fallback has no unambiguous blue-green backend port.');
+        $ports = $operation->application->blueGreenDeploymentBackendPorts();
+        if ($ports === null) {
+            throw new BlueGreenDeploymentTransitionException('The finalized fallback has no exact blue-green backend port inventory.');
         }
         $applicationUuid = (string) $operation->application->uuid;
         $configuration = CompileBlueGreenProxyConfiguration::run(
@@ -246,7 +246,8 @@ final class RecoverBlueGreenFinalizedDrainingOperation
                 activeColor: $previousColor,
                 blueContainerName: "{$applicationUuid}-".BlueGreenDeploymentColor::BLUE->value,
                 greenContainerName: "{$applicationUuid}-".BlueGreenDeploymentColor::GREEN->value,
-                port: $port,
+                port: $ports[0],
+                ports: $ports,
                 routingRevision: $previousRoutingRevision,
                 mode: BlueGreenRoutingMode::Steady,
                 publicProofToken: BlueGreenRoutingTarget::durablePublicProofToken($previousDeploymentUuid),

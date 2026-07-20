@@ -1,5 +1,6 @@
 <?php
 
+use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
 use App\Actions\Application\BlueGreen\BlueGreenContainerRemovalPlan;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationException;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationInProgressException;
@@ -13,15 +14,20 @@ use App\Actions\Application\BlueGreen\DrainAndRemoveBlueGreenApplicationContaine
 use App\Actions\Application\BlueGreen\ExecuteBlueGreenDeactivationRemoteCommand;
 use App\Actions\Application\BlueGreen\PrepareBlueGreenDeactivation;
 use App\Actions\Application\BlueGreen\PrepareBlueGreenProxyDeactivation;
+use App\Actions\Application\BlueGreen\ResolveBlueGreenExpectedProxyState;
 use App\Actions\Application\BlueGreen\ResumeBlueGreenDeactivations;
+use App\Actions\Proxy\BlueGreenProxyRollbackArtifact;
+use App\Actions\Proxy\BlueGreenProxyRollbackKey;
 use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
+use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationBlueGreenDeployment;
+use App\Models\ApplicationDeploymentQueue;
 use App\Models\InstanceSettings;
 use App\Notifications\Application\BlueGreenInterventionRequired;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -111,6 +117,248 @@ it('defers a typed 240-second drain attempt without marking intervention', funct
         ->and($state->fresh()->supersession_generation)->toBe($deactivation->supersession_generation)
         ->and($state->fresh()->deactivation_operation_id)->toBe($deactivation->operation_id);
     Process::assertRanTimes(fn () => true, 1);
+});
+
+it('drains every persisted backend port before deactivation removes application containers', function () {
+    ['application' => $application, 'destination' => $destination, 'server' => $server] = BlueGreenDeactivationScenario::context();
+    $snapshot = BlueGreenDeactivationScenario::proxySnapshot($application, $destination, [8080, 3000]);
+    $plan = new BlueGreenContainerRemovalPlan(
+        applicationId: $application->id,
+        blueContainerName: $application->uuid.'-blue',
+        blueRoutingRevision: 1,
+        greenContainerName: $application->uuid.'-green',
+        greenRoutingRevision: 2,
+        legacyContainerName: null,
+        stopGracePeriodSeconds: 1,
+    );
+
+    $command = (new DrainAndRemoveBlueGreenApplicationContainers)->commandFor(
+        $server->proxyPath(),
+        $snapshot,
+        $plan,
+    );
+
+    expect($command)->toContain(
+        "backend_ports='0BB8 1F90'",
+        'expected_ports[ports[index]] = 1',
+        'toupper(endpoint[2]) in expected_ports',
+    );
+});
+
+it('uses the first canonical persisted backend port as the deactivation primary', function () {
+    ['application' => $application, 'destination' => $destination] = BlueGreenDeactivationScenario::context();
+
+    $snapshot = BlueGreenDeactivationScenario::proxySnapshot($application, $destination, [8080]);
+
+    expect($snapshot->backendPort)->toBe(8080)
+        ->and($snapshot->backendPorts)->toBe([8080]);
+});
+
+it('prepares and resumes a multi-port deactivation from its active deployment inventory after application ports change', function () {
+    ['application' => $application, 'destination' => $destination] = BlueGreenDeactivationScenario::context();
+    $application->update([
+        'fqdn' => 'https://blue-green-web.example.test:3000,https://blue-green-metrics.example.test:8080',
+        'health_check_enabled' => true,
+        'health_check_path' => '/health',
+        'ports_exposes' => '3000,8080',
+    ]);
+    $application->settings()->update(['is_blue_green_deployment_enabled' => true]);
+    $application = $application->fresh(['settings']);
+    $activeDeploymentUuid = 'persisted-multi-port-blue';
+    $activeContainerId = str_repeat('c', 64);
+    $target = new BlueGreenRoutingTarget(
+        destinationId: $destination->id,
+        activeColor: BlueGreenDeploymentColor::BLUE,
+        blueContainerName: $application->uuid.'-blue',
+        greenContainerName: $application->uuid.'-green',
+        port: 3000,
+        ports: [3000, 8080],
+        routingRevision: 1,
+        publicProofToken: BlueGreenRoutingTarget::durablePublicProofToken($activeDeploymentUuid),
+        destinationFenceEpoch: 1,
+        operationId: $activeDeploymentUuid,
+        mutationSequence: 1,
+        activeDeploymentUuid: $activeDeploymentUuid,
+        activeContainerId: $activeContainerId,
+        destinationTopologyDigest: hash('sha256', 'persisted-multi-port-destination'),
+    );
+    $configuration = CompileBlueGreenProxyConfiguration::run($application, $destination, $target);
+    $inventory = BlueGreenBackendPortInventory::fromPorts([3000, 8080]);
+    ApplicationDeploymentQueue::query()->create([
+        'application_id' => $application->id,
+        'application_name' => $application->name,
+        'server_id' => $destination->server_id,
+        'server_name' => $destination->server->name,
+        'destination_id' => $destination->id,
+        'deployment_uuid' => $activeDeploymentUuid,
+        'pull_request_id' => 0,
+        'commit' => 'persisted-multi-port-commit',
+        'status' => ApplicationDeploymentStatus::FINISHED->value,
+        'finished_at' => now()->subMinute(),
+        'blue_green_color' => BlueGreenDeploymentColor::BLUE,
+        'blue_green_phase' => BlueGreenDeploymentPhase::IDLE,
+        'blue_green_routing_revision' => 1,
+        'blue_green_destination_fence_epoch' => 1,
+        'blue_green_server_boot_id' => BlueGreenDeactivationScenario::BOOT_ID,
+        'blue_green_topology_digest' => $configuration->state->destinationTopologyDigest,
+        'blue_green_routing_config_digest' => $configuration->state->applicationRoutingConfigDigest,
+        'blue_green_backend_port_inventory' => $inventory->serialized,
+        'blue_green_drain_backend_port_inventory' => null,
+        'blue_green_supersession_generation' => 1,
+        'blue_green_candidate_container_id' => $activeContainerId,
+        'blue_green_rollback_managed_filename' => $configuration->managedFilename,
+    ]);
+    $state = ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $application->id,
+        'standalone_docker_id' => $destination->id,
+        'active_color' => BlueGreenDeploymentColor::BLUE,
+        'blue_deployment_uuid' => $activeDeploymentUuid,
+        'phase' => BlueGreenDeploymentPhase::IDLE,
+        'routing_revision' => 1,
+        'destination_fence_epoch' => $configuration->state->destinationFenceEpoch,
+        'destination_fence_operation_id' => $configuration->state->operationId,
+        'destination_fence_mutation_sequence' => $configuration->state->mutationSequence,
+        'managed_file_sha256' => $configuration->state->managedSha256,
+        'destination_topology_digest' => $configuration->state->destinationTopologyDigest,
+        'application_routing_config_digest' => $configuration->state->applicationRoutingConfigDigest,
+        'supersession_generation' => 1,
+    ]);
+
+    $application->update([
+        'fqdn' => 'https://blue-green-web.example.test:3000',
+        'ports_exposes' => '3000',
+    ]);
+    $application->delete();
+    $application->newQuery()
+        ->withTrashed()
+        ->whereKey($application->id)
+        ->update(['deleted_at' => now()->subMinutes(20)->startOfSecond()]);
+    $preparation = PrepareBlueGreenDeactivation::run($application, $destination->id);
+    $expectedState = ResolveBlueGreenExpectedProxyState::run(
+        $application,
+        $destination,
+        $preparation->state,
+    );
+    $sourceYaml = $configuration->yaml;
+    $sourceSha256 = hash('sha256', $sourceYaml);
+    fakeBlueGreenRemoteProcessSequence(blueGreenDeactivationRemoteOutput(
+        BlueGreenDeactivationRemoteOutcome::Success,
+        0,
+        implode("\n", [
+            '1700000000',
+            $sourceSha256,
+            base64_encode($sourceYaml),
+        ]),
+    ));
+
+    $snapshot = PrepareBlueGreenProxyDeactivation::run(
+        $application,
+        $preparation,
+        $expectedState,
+        BlueGreenDeactivationScenario::BOOT_ID,
+    );
+    $staleStartedAt = now()->subMinutes(10)->startOfSecond();
+    ApplicationBlueGreenDeactivation::query()
+        ->whereKey($preparation->deactivation->id)
+        ->update(['started_at' => $staleStartedAt]);
+    $tombstoneState = new BlueGreenProxyState(
+        managedFilename: $expectedState->managedFilename,
+        applicationUuid: $expectedState->applicationUuid,
+        destinationId: $expectedState->destinationId,
+        operationId: $preparation->deactivation->operation_id,
+        mutationSequence: 1,
+        destinationFenceEpoch: $expectedState->destinationFenceEpoch + 1,
+        routingRevision: $expectedState->routingRevision,
+        managedSha256: $snapshot->tombstoneSha256,
+        activeColor: $expectedState->activeColor,
+        activeDeploymentUuid: $expectedState->activeDeploymentUuid,
+        activeContainerName: $expectedState->activeContainerName,
+        activeContainerId: $expectedState->activeContainerId,
+        applicationRoutingConfigDigest: $expectedState->applicationRoutingConfigDigest,
+        destinationTopologyDigest: $expectedState->destinationTopologyDigest,
+    );
+    ApplicationBlueGreenDeployment::query()
+        ->whereKey($state->id)
+        ->update([
+            'deactivation_started_at' => $staleStartedAt,
+            'destination_fence_epoch' => $tombstoneState->destinationFenceEpoch,
+            'destination_fence_operation_id' => $tombstoneState->operationId,
+            'destination_fence_mutation_sequence' => $tombstoneState->mutationSequence,
+            'managed_file_sha256' => $tombstoneState->managedSha256,
+        ]);
+    $absentState = $tombstoneState->withoutManagedRoute(
+        $tombstoneState->destinationFenceEpoch + 1,
+        $preparation->deactivation->operation_id,
+        $tombstoneState->mutationSequence + 1,
+    );
+    $rollbackArtifact = new BlueGreenProxyRollbackArtifact(
+        new BlueGreenProxyRollbackKey(
+            $preparation->deactivation->operation_id,
+            $tombstoneState,
+            $absentState,
+        ),
+        true,
+        $snapshot->tombstoneYaml,
+    );
+    $tombstoneResponse = "HTTP/1.1 418 I'm a teapot\r\n"
+        .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$snapshot->tombstoneAcknowledgement}\r\n\r\n";
+    $remoteSuccess = blueGreenDeactivationRemoteOutput(BlueGreenDeactivationRemoteOutcome::Success, 0);
+    $remoteTimestamp = blueGreenDeactivationRemoteOutput(
+        BlueGreenDeactivationRemoteOutcome::Success,
+        0,
+        '1700000000',
+    );
+    $remoteOutputs = [
+        blueGreenDeactivationRemoteOutput(BlueGreenDeactivationRemoteOutcome::Success, 0, 'tombstone'),
+        $remoteSuccess,
+        $remoteTimestamp,
+    ];
+    foreach ($snapshot->routes as $route) {
+        $remoteOutputs[] = $remoteTimestamp;
+        $remoteOutputs[] = $remoteTimestamp;
+    }
+    $remoteOutputs[] = $remoteSuccess;
+    $remoteOutputs[] = $remoteSuccess;
+    $remoteOutputs[] = blueGreenDeactivationRemoteOutput(
+        BlueGreenDeactivationRemoteOutcome::Success,
+        0,
+        BlueGreenProxyRollbackArtifact::OUTPUT_PREFIX.base64_encode($rollbackArtifact->serialize()),
+    );
+    $remoteOutputs[] = $remoteSuccess;
+    $remoteOutputs[] = $remoteSuccess;
+    $remoteOutputs[] = $remoteTimestamp;
+    foreach ($snapshot->routes as $route) {
+        $remoteOutputs[] = $remoteTimestamp;
+        $remoteOutputs[] = $remoteTimestamp;
+    }
+    $remoteOutputs[] = $remoteSuccess;
+    $publicResponses = [
+        ...array_fill(0, count($snapshot->routes), $tombstoneResponse),
+        ...array_fill(0, count($snapshot->routes), "HTTP/1.1 404 Not Found\r\n\r\n"),
+    ];
+    Process::fake(function (PendingProcess $process) use (&$publicResponses, &$remoteOutputs) {
+        if (str_ends_with($process->command, " 'curl --config -'")) {
+            return Process::result(output: array_shift($publicResponses));
+        }
+        if (str_contains($process->command, 'coolify-blue-green-deactivation-remote-v1')) {
+            return Process::result(output: array_shift($remoteOutputs));
+        }
+        if (str_contains($process->command, '/proc/sys/kernel/random/boot_id')) {
+            return Process::result(output: BlueGreenDeactivationScenario::BOOT_ID);
+        }
+
+        throw new RuntimeException('Unexpected remote process during blue-green deactivation resume.');
+    });
+
+    $results = ResumeBlueGreenDeactivations::run(staleAfterSeconds: 300);
+
+    Process::assertRanTimes(fn (): bool => true, 36);
+    expect($snapshot->backendPorts)->toBe([3000, 8080])
+        ->and($results)->toHaveCount(1)
+        ->and($results[0]->outcome)->toBe('resumed')
+        ->and(ApplicationBlueGreenDeactivation::query()->findOrFail($preparation->deactivation->id)->phase)
+        ->toBe(BlueGreenDeactivationPhase::COMPLETED)
+        ->and(ApplicationBlueGreenDeployment::query()->whereKey($state->id)->doesntExist())->toBeTrue();
 });
 
 it('fails closed before tombstone persistence when any public router has no entry point', function () {

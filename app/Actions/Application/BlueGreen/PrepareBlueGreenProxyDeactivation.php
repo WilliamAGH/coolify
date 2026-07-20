@@ -6,8 +6,10 @@ use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
 use App\Enums\BlueGreenDeploymentColor;
+use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeactivation;
+use App\Models\ApplicationDeploymentQueue;
 use App\Models\Server;
 use Illuminate\Support\Facades\DB;
 use Lorisleiva\Actions\Concerns\AsAction;
@@ -247,11 +249,16 @@ class PrepareBlueGreenProxyDeactivation
             $router['middlewares'] = [$middlewareName];
             $tombstoneRouters[$routerName] = $router;
         }
-        $backendPort = $this->backendPort(
+        $backendPorts = $this->backendPorts(
             services: $services,
             application: $application,
             destinationId: $preparation->destination->id,
             activeColor: $activeColor,
+            activeBackendPortInventory: $this->activeBackendPortInventory(
+                $application,
+                $preparation,
+                $activeColor,
+            ),
         );
         $tombstone = [
             'http' => [
@@ -282,7 +289,8 @@ class PrepareBlueGreenProxyDeactivation
             tombstoneSha256: hash('sha256', $tombstoneYaml),
             tombstoneAcknowledgement: $acknowledgement,
             routes: $routes,
-            backendPort: $backendPort,
+            backendPort: $backendPorts[0],
+            backendPorts: $backendPorts,
             destinationClockObservedAtUnixSeconds: $destinationClockObservedAtUnixSeconds,
             drainDeadlineUnixSeconds: $destinationClockObservedAtUnixSeconds
                 + BlueGreenProxyDeactivationSnapshot::DEACTIVATION_WINDOW_SECONDS
@@ -292,53 +300,163 @@ class PrepareBlueGreenProxyDeactivation
         );
     }
 
-    /** @param array<string, mixed> $services */
-    private function backendPort(
+    /**
+     * @param  array<string, mixed>  $services
+     * @return non-empty-list<int>
+     */
+    private function backendPorts(
         array $services,
         Application $application,
         int $destinationId,
         BlueGreenDeploymentColor $activeColor,
-    ): int {
-        $activeServiceName = BlueGreenRoutingTarget::activeServiceName(
-            $application->uuid,
-            $destinationId,
-        );
-        $expectedServices = [
-            $activeServiceName => [
+        ?BlueGreenBackendPortInventory $activeBackendPortInventory,
+    ): array {
+        if ($activeBackendPortInventory === null) {
+            return $this->legacyBackendPorts($services, $application);
+        }
+
+        $backendPorts = $activeBackendPortInventory->ports();
+        $expectedServices = [];
+        foreach ($backendPorts as $backendPort) {
+            $activeServiceName = BlueGreenRoutingTarget::activeServiceNameForPort(
+                $application->uuid,
+                $destinationId,
+                $backendPort,
+                count($backendPorts) > 1,
+            );
+            $expectedServices[$activeServiceName] = [
                 'weighted' => [
                     'services' => [[
-                        'name' => BlueGreenRoutingTarget::memberServiceReference(
+                        'name' => BlueGreenRoutingTarget::memberServiceReferenceForPort(
                             $application->uuid,
                             $destinationId,
                             $activeColor,
+                            $backendPort,
+                            count($backendPorts) > 1,
                         ),
                         'weight' => 1,
                     ]],
                 ],
-            ],
-        ];
-        $backendPort = $application->blueGreenDeploymentBackendPort();
-        if ($backendPort === null) {
-            throw new BlueGreenDeactivationException('The application has no exact blue/green backend port.');
+            ];
         }
+        ksort($expectedServices);
         if ($services === $expectedServices) {
-            return $backendPort;
+            return $backendPorts;
         }
 
+        throw new BlueGreenDeactivationException('Managed proxy services do not match the locked active deployment backend port inventory.');
+    }
+
+    /**
+     * A missing queue inventory predates the durable inventory migration. It may only
+     * use the current application configuration after the managed source itself proves
+     * that it is a legacy direct load-balancer layout, never a weighted modern layout.
+     *
+     * @param  array<string, mixed>  $services
+     * @return non-empty-list<int>
+     */
+    private function legacyBackendPorts(array $services, Application $application): array
+    {
+        $backendPorts = $application->blueGreenDeploymentBackendPorts();
+        if ($backendPorts === null) {
+            throw new BlueGreenDeactivationException('The legacy application has no exact blue/green backend port inventory.');
+        }
+
+        $observedPorts = [];
         foreach ($services as $service) {
             $servers = is_array($service) ? data_get($service, 'loadBalancer.servers') : null;
             if (! is_array($servers) || $servers === []) {
-                throw new BlueGreenDeactivationException('Managed proxy services do not match the exact active weighted member or a legacy backend inventory.');
+                throw new BlueGreenDeactivationException('A deployment without durable backend ports must prove a legacy direct load-balancer layout.');
             }
             foreach ($servers as $server) {
                 $url = is_array($server) ? ($server['url'] ?? null) : null;
                 $port = is_string($url) ? parse_url($url, PHP_URL_PORT) : false;
-                if ($port !== $backendPort) {
-                    throw new BlueGreenDeactivationException('Managed legacy proxy service does not match the application backend port.');
+                if (! is_int($port) || ! in_array($port, $backendPorts, true)) {
+                    throw new BlueGreenDeactivationException('Managed legacy proxy service does not match the application backend port inventory.');
                 }
+                $observedPorts[$port] = true;
             }
         }
+        $observedBackendPorts = array_keys($observedPorts);
+        sort($observedBackendPorts, SORT_NUMERIC);
+        if ($observedBackendPorts !== $backendPorts) {
+            throw new BlueGreenDeactivationException('Managed legacy proxy services do not cover every application backend port.');
+        }
 
-        return $backendPort;
+        return $backendPorts;
+    }
+
+    /**
+     * A null inventory is treated as legacy only after the caller proves a direct
+     * load-balancer source layout. The lifecycle state and linked queue are locked in
+     * the canonical order before their inventory is trusted.
+     */
+    private function activeBackendPortInventory(
+        Application $application,
+        BlueGreenDeactivationPreparation $preparation,
+        BlueGreenDeploymentColor $activeColor,
+    ): ?BlueGreenBackendPortInventory {
+        return DB::transaction(function () use ($application, $preparation, $activeColor): ?BlueGreenBackendPortInventory {
+            $locks = BlueGreenLifecycleDatabaseLocks::forDestination(
+                $preparation->deactivation->application_id,
+                $preparation->deactivation->standalone_docker_id,
+            );
+            $deactivation = $locks->deactivation;
+            $state = $locks->state;
+            if ($locks->application->id !== $application->id
+                || $deactivation === null
+                || ! $deactivation->ownsApplicationLifecycle($locks->application)
+                || $state === null
+                || $preparation->state === null
+                || $deactivation->id !== $preparation->deactivation->id
+                || $deactivation->operation_id !== $preparation->deactivation->operation_id
+                || $deactivation->started_at === null
+                || $preparation->deactivation->started_at === null
+                || ! $deactivation->started_at->equalTo($preparation->deactivation->started_at)
+                || (int) $deactivation->supersession_generation !== (int) $preparation->deactivation->supersession_generation
+                || ! $deactivation->phase->isInProgress()
+                || $state->id !== $preparation->state->id
+                || $state->phase !== BlueGreenDeploymentPhase::DEACTIVATING
+                || $state->active_color !== $activeColor
+                || $state->deactivation_operation_id !== $deactivation->operation_id
+                || $state->deactivation_started_at === null
+                || ! $state->deactivation_started_at->equalTo($deactivation->started_at)
+                || (int) $state->supersession_generation !== (int) $deactivation->supersession_generation) {
+                throw new BlueGreenDeactivationException('The exact durable deactivation owner changed before active backend port inventory lookup.');
+            }
+
+            $activeDeploymentUuid = match ($activeColor) {
+                BlueGreenDeploymentColor::BLUE => $state->blue_deployment_uuid,
+                BlueGreenDeploymentColor::GREEN => $state->green_deployment_uuid,
+            };
+            if (! is_string($activeDeploymentUuid) || $activeDeploymentUuid === '') {
+                throw new BlueGreenDeactivationException('The active blue-green route has no linked durable deployment queue.');
+            }
+            $deployment = $locks->queue($activeDeploymentUuid);
+            if (! $deployment instanceof ApplicationDeploymentQueue
+                || (int) $deployment->application_id !== $locks->application->id
+                || (int) $deployment->destination_id !== $preparation->destination->id
+                || (int) $deployment->pull_request_id !== 0) {
+                throw new BlueGreenDeactivationException('The active blue-green route is not linked to its exact durable deployment queue.');
+            }
+
+            $serializedInventory = $deployment->blue_green_backend_port_inventory;
+            if ($serializedInventory === null) {
+                return null;
+            }
+            if ($deployment->blue_green_color !== $activeColor) {
+                throw new BlueGreenDeactivationException('The active deployment queue color does not match the durable active route.');
+            }
+
+            try {
+                return BlueGreenBackendPortInventory::fromSerialized($serializedInventory);
+            } catch (BlueGreenDeploymentTransitionException $exception) {
+                throw new BlueGreenDeactivationException(
+                    'The active deployment queue has a malformed durable backend port inventory.',
+                    (int) $exception->getCode(),
+                    $exception,
+                );
+            }
+        }, attempts: 5);
     }
 }

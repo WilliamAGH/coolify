@@ -53,6 +53,8 @@ use OpenApi\Attributes as OA;
         'blue_green_server_boot_id' => ['type' => 'string', 'nullable' => true],
         'blue_green_topology_digest' => ['type' => 'string', 'nullable' => true],
         'blue_green_routing_config_digest' => ['type' => 'string', 'nullable' => true],
+        'blue_green_backend_port_inventory' => ['type' => 'string', 'nullable' => true],
+        'blue_green_drain_backend_port_inventory' => ['type' => 'string', 'nullable' => true],
         'blue_green_supersession_generation' => ['type' => 'integer', 'nullable' => true],
     ],
 )]
@@ -98,6 +100,8 @@ class ApplicationDeploymentQueue extends Model
         'blue_green_server_boot_id',
         'blue_green_topology_digest',
         'blue_green_routing_config_digest',
+        'blue_green_backend_port_inventory',
+        'blue_green_drain_backend_port_inventory',
         'blue_green_supersession_generation',
         'blue_green_previous_container_id',
         'blue_green_candidate_container_id',

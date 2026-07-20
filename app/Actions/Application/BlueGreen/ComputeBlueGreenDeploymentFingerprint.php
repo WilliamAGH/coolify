@@ -26,8 +26,8 @@ final class ComputeBlueGreenDeploymentFingerprint
     ): BlueGreenDeploymentFingerprint {
         $topologyDigest = $this->topologyDigest($application, $destination);
         $application->loadMissing('settings');
-        $port = $application->blueGreenDeploymentBackendPort($application->settings)
-            ?? throw new BlueGreenDeploymentTransitionException('The blue-green application has no exact backend port.');
+        $ports = $application->blueGreenDeploymentBackendPorts($application->settings)
+            ?? throw new BlueGreenDeploymentTransitionException('The blue-green application has no exact backend port inventory.');
         $configuration = CompileBlueGreenProxyConfiguration::run(
             $application,
             $destination,
@@ -36,7 +36,8 @@ final class ComputeBlueGreenDeploymentFingerprint
                 activeColor: $pendingColor,
                 blueContainerName: $application->uuid.'-'.BlueGreenDeploymentColor::BLUE->value,
                 greenContainerName: $application->uuid.'-'.BlueGreenDeploymentColor::GREEN->value,
-                port: $port,
+                port: $ports[0],
+                ports: $ports,
                 routingRevision: $routingRevision,
                 mode: $legacyAdoption ? BlueGreenRoutingMode::LegacyAdoption : BlueGreenRoutingMode::Steady,
                 publicProofToken: BlueGreenRoutingTarget::durablePublicProofToken($operationId),
@@ -75,7 +76,12 @@ final class ComputeBlueGreenDeploymentFingerprint
             $claim->deploymentUuid,
             $claim->legacyContainerName !== null,
         );
-        if (! hash_equals($claim->topologyDigest, $fingerprint->topologyDigest)
+        $backendPortInventory = BlueGreenBackendPortInventory::fromPorts(
+            $application->blueGreenDeploymentBackendPorts($application->settings)
+                ?? throw new BlueGreenOperationFenceLostException('The blue-green backend port inventory disappeared after the operation was claimed.'),
+        );
+        if (! hash_equals($claim->backendPortInventory->serialized, $backendPortInventory->serialized)
+            || ! hash_equals($claim->topologyDigest, $fingerprint->topologyDigest)
             || ! hash_equals($claim->routingConfigDigest, $fingerprint->routingConfigDigest)) {
             throw new BlueGreenOperationFenceLostException('The blue-green destination topology or routing configuration changed after the operation was claimed.');
         }

@@ -1,5 +1,6 @@
 <?php
 
+use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
 use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
@@ -87,6 +88,8 @@ it('removes only an exact stopped base-name legacy container before fixed-color 
         serverBootId: $bootId,
         topologyDigest: $fingerprint->topologyDigest,
         routingConfigDigest: $fingerprint->routingConfigDigest,
+        backendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
+        drainBackendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
         supersessionGeneration: 1,
         legacyContainerName: null,
         candidateContainerName: $application->uuid.'-green',
@@ -226,6 +229,8 @@ it('removes only an exact stopped base-name legacy container before fixed-color 
             'blue_green_server_boot_id' => $bootId,
             'blue_green_topology_digest' => $fingerprint->topologyDigest,
             'blue_green_routing_config_digest' => $fingerprint->routingConfigDigest,
+            'blue_green_backend_port_inventory' => $claim->backendPortInventory->serialized,
+            'blue_green_drain_backend_port_inventory' => $claim->drainBackendPortInventory?->serialized,
             'blue_green_supersession_generation' => 1,
             'blue_green_previous_container_id' => $previousContainerId,
             'blue_green_candidate_container_id' => $candidateContainerId,
