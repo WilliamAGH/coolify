@@ -112,7 +112,7 @@ it('redirects unauthenticated users to login', function () {
 });
 
 it('shows dashboard after successful login and onboarding skip', function () {
-    $page = loginAndSkipBoarding();
+    $page = loginAndSkipBoarding($this->user->email);
 
     $page->assertSee('Dashboard')
         ->assertSee('Your self-hosted infrastructure')
@@ -120,7 +120,7 @@ it('shows dashboard after successful login and onboarding skip', function () {
 });
 
 it('displays all projects on dashboard', function () {
-    $page = loginAndSkipBoarding();
+    $page = loginAndSkipBoarding($this->user->email);
 
     $page->assertSee('Projects')
         ->assertSee('My first project')
@@ -131,7 +131,7 @@ it('displays all projects on dashboard', function () {
 });
 
 it('displays all servers on dashboard', function () {
-    $page = loginAndSkipBoarding();
+    $page = loginAndSkipBoarding($this->user->email);
 
     $page->assertSee('Servers')
         ->assertSee('localhost')
@@ -142,7 +142,7 @@ it('displays all servers on dashboard', function () {
 });
 
 it('allows authenticated users to access team settings', function () {
-    loginAndSkipBoarding();
+    loginAndSkipBoarding($this->user->email);
 
     $page = visit('/team');
 
@@ -152,7 +152,7 @@ it('allows authenticated users to access team settings', function () {
 });
 
 it('shows danger zone to team owner', function () {
-    loginAndSkipBoarding();
+    loginAndSkipBoarding($this->user->email);
 
     $page = visit('/team');
 
@@ -185,7 +185,7 @@ it('prevents unauthenticated access to project show page', function () {
 });
 
 it('authenticated user can navigate to server details', function () {
-    loginAndSkipBoarding();
+    loginAndSkipBoarding($this->user->email);
 
     // Navigate to server show page using UUID
     $server = Server::first();
@@ -197,7 +197,7 @@ it('authenticated user can navigate to server details', function () {
 });
 
 it('authenticated user can navigate to project details', function () {
-    loginAndSkipBoarding();
+    loginAndSkipBoarding($this->user->email);
 
     // Navigate to project show page using UUID
     $project = Project::first();
@@ -216,7 +216,7 @@ it('prevents unauthenticated access to team members page', function () {
 });
 
 it('authenticated user can access team members page', function () {
-    loginAndSkipBoarding();
+    loginAndSkipBoarding($this->user->email);
 
     $page = visit('/team/members');
 
@@ -291,7 +291,7 @@ it('member does not see proxy controls on server page', function () {
 });
 
 it('owner sees terminal and security links on server page', function () {
-    loginAndSkipBoarding();
+    loginAndSkipBoarding($this->user->email);
 
     $server = Server::first();
     $page = visit("/server/{$server->uuid}");
@@ -332,7 +332,7 @@ it('member does not see environment settings link on project page', function () 
 });
 
 it('owner sees add environment and settings on project page', function () {
-    loginAndSkipBoarding();
+    loginAndSkipBoarding($this->user->email);
 
     $project = Project::where('uuid', 'project-1')->first();
     $page = visit("/project/{$project->uuid}");
@@ -355,7 +355,7 @@ it('member does not see add resource link on dashboard project cards', function 
 });
 
 it('owner sees add resource link on dashboard project cards', function () {
-    loginAndSkipBoarding();
+    loginAndSkipBoarding($this->user->email);
 
     $page = visit('/dashboard');
 
@@ -388,7 +388,7 @@ it('member does not see invite form on team members page', function () {
 });
 
 it('owner sees invite form on team members page', function () {
-    loginAndSkipBoarding();
+    loginAndSkipBoarding($this->user->email);
 
     $page = visit('/team/members');
 
@@ -423,7 +423,7 @@ it('member does not see save button on server show page', function () {
 });
 
 it('owner sees save button on server show page', function () {
-    loginAndSkipBoarding();
+    loginAndSkipBoarding($this->user->email);
 
     $server = Server::first();
     $page = visit("/server/{$server->uuid}");
