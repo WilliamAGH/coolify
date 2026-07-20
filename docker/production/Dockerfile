@@ -6,7 +6,16 @@ ARG SERVERSIDEUP_PHP_VERSION=8.5-fpm-nginx-alpine@sha256:1854d81da23fc5c174a26bf
 # https://hub.docker.com/_/node
 ARG NODE_VERSION=24-alpine@sha256:a0b9bf06e4e6193cf7a0f58816cc935ff8c2a908f81e6f1a95432d679c54fbfd
 # https://hub.docker.com/_/golang
-ARG CLOUDFLARED_GO_IMAGE=golang:1.26.5-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2
+ARG GO_BUILD_IMAGE=golang:1.26.5-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2
+# https://github.com/git-lfs/git-lfs/releases/tag/v3.7.1
+ARG GIT_LFS_VERSION=3.7.1
+ARG GIT_LFS_TAG=v3.7.1
+ARG GIT_LFS_COMMIT=b84b33847fe6458f36ef521534dc0eac953cb379
+ARG GIT_LFS_SOURCE_SHA256=e1ef5ba4828fa632337be6a2c421a685432faec0405bf187f46a1459e82a9a62
+# https://pkg.go.dev/vuln/GO-2026-5026
+ARG GIT_LFS_X_NET_VERSION=v0.56.0
+ARG GIT_LFS_GO_MOD_SHA256=9b34961df646f48ca832d5201d9a4a78059a06269f50237d682630cf28485460
+ARG GIT_LFS_GO_SUM_SHA256=f2e6c6da7a7d84ef4ffcad42902798eaa2aa14b795c3639a857d36504f2c6396
 # https://github.com/cloudflare/cloudflared/releases/tag/2026.7.1
 ARG CLOUDFLARED_VERSION=2026.7.1
 ARG CLOUDFLARED_TAG=2026.7.1
@@ -75,23 +84,33 @@ WORKDIR /app
 COPY package*.json vite.config.js postcss.config.cjs ./
 RUN --mount=type=cache,target=/root/.npm \
     npm ci
-COPY . .
+COPY app ./app
+COPY config ./config
+COPY lang ./lang
+COPY resources ./resources
+COPY routes ./routes
+COPY templates ./templates
 RUN npm run build
 
 # =================================================================
-# Stage 3: Cloudflared from verified vendored source
+# Stage 3: Pinned Go source-build base
 # =================================================================
-FROM --platform=$BUILDPLATFORM ${CLOUDFLARED_GO_IMAGE} AS cloudflared-builder
+FROM --platform=$BUILDPLATFORM ${GO_BUILD_IMAGE} AS go-source-builder
+
+WORKDIR /src
+
+RUN apk add --no-cache ca-certificates curl tar
+
+# =================================================================
+# Stage 4: Cloudflared from verified vendored source
+# =================================================================
+FROM go-source-builder AS cloudflared-builder
 
 ARG TARGETARCH
 ARG CLOUDFLARED_VERSION
 ARG CLOUDFLARED_COMMIT
 ARG CLOUDFLARED_SOURCE_SHA256
 ARG CLOUDFLARED_RELEASE_DATE
-
-WORKDIR /src
-
-RUN apk add --no-cache ca-certificates curl tar
 
 RUN curl -fSsL "https://github.com/cloudflare/cloudflared/archive/${CLOUDFLARED_COMMIT}.tar.gz" -o /tmp/cloudflared.tar.gz && \
     echo "${CLOUDFLARED_SOURCE_SHA256}  /tmp/cloudflared.tar.gz" | sha256sum -c - && \
@@ -113,14 +132,64 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
         github.com/cloudflare/cloudflared/cmd/cloudflared
 
 # =================================================================
+# Stage 5: Git LFS from checksum-verified source and Go modules
+# =================================================================
+FROM go-source-builder AS git-lfs-builder
+
+ARG TARGETARCH
+ARG GIT_LFS_VERSION
+ARG GIT_LFS_COMMIT
+ARG GIT_LFS_SOURCE_SHA256
+ARG GIT_LFS_X_NET_VERSION
+ARG GIT_LFS_GO_MOD_SHA256
+ARG GIT_LFS_GO_SUM_SHA256
+
+ENV GOTOOLCHAIN=local \
+    GOPROXY=https://proxy.golang.org \
+    GOSUMDB=sum.golang.org
+
+RUN curl -fSsL "https://github.com/git-lfs/git-lfs/archive/${GIT_LFS_COMMIT}.tar.gz" -o /tmp/git-lfs.tar.gz && \
+    echo "${GIT_LFS_SOURCE_SHA256}  /tmp/git-lfs.tar.gz" | sha256sum -c - && \
+    tar -xzf /tmp/git-lfs.tar.gz --strip-components=1 && \
+    test -f go.mod && \
+    test -f go.sum
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go get "golang.org/x/net@${GIT_LFS_X_NET_VERSION}" && \
+    go mod tidy && \
+    echo "${GIT_LFS_GO_MOD_SHA256}  go.mod" | sha256sum -c - && \
+    echo "${GIT_LFS_GO_SUM_SHA256}  go.sum" | sha256sum -c - && \
+    go mod download && \
+    go mod verify && \
+    test "$(go env GOVERSION)" = 'go1.26.5' && \
+    test "$(awk '$1 == "golang.org/x/net" { print $2 }' go.mod)" = "${GIT_LFS_X_NET_VERSION}" && \
+    GOOS=linux \
+    GOARCH="${TARGETARCH}" \
+    CGO_ENABLED=0 \
+    go build \
+        -mod=readonly \
+        -trimpath \
+        -buildvcs=false \
+        -ldflags="-s -w -X github.com/git-lfs/git-lfs/v3/config.GitCommit=${GIT_LFS_COMMIT}" \
+        -o /out/git-lfs \
+        ./git-lfs.go
+
+RUN /out/git-lfs version | grep -E "^git-lfs/${GIT_LFS_VERSION} \\(GitHub; linux ${TARGETARCH}; go 1\\.26\\.5; git ${GIT_LFS_COMMIT}\\)$" && \
+    go version -m /out/git-lfs | awk -v expected="${GIT_LFS_X_NET_VERSION}" '$1 == "dep" && $2 == "golang.org/x/net" && $3 == expected { found = 1 } END { exit found ? 0 : 1 }'
+
+# =================================================================
 # Final Stage: Production image
 # =================================================================
 FROM serversideup/php:${SERVERSIDEUP_PHP_VERSION}
 
+ARG TARGETARCH
 ARG USER_ID
 ARG GROUP_ID
 ARG POSTGRES_VERSION
 ARG SU_EXEC_VERSION
+ARG GIT_LFS_VERSION
+ARG GIT_LFS_COMMIT
 ARG NGINX_VERSION
 ARG NGINX_APK_SIGNER_FILE_SHA256
 ARG NGINX_APK_SIGNER_FINGERPRINT_SHA256
@@ -157,7 +226,6 @@ RUN --mount=type=cache,target=/var/cache/apk \
     "su-exec=${SU_EXEC_VERSION}" \
     openssh-client \
     git \
-    git-lfs \
     jq \
     lsof \
     util-linux-misc \
@@ -172,7 +240,12 @@ RUN echo "alias ll='ls -al'" >> /etc/profile && \
     echo "alias a='php artisan'" >> /etc/profile && \
     echo "alias logs='tail -f storage/logs/laravel.log'" >> /etc/profile
 
+COPY --from=git-lfs-builder --chmod=755 /out/git-lfs /usr/local/bin/git-lfs
 COPY --from=cloudflared-builder --chmod=755 /out/cloudflared /usr/local/bin/cloudflared
+
+RUN test "$(command -v git-lfs)" = /usr/local/bin/git-lfs && \
+    ! apk info -e git-lfs >/dev/null 2>&1 && \
+    git lfs version | grep -E "^git-lfs/${GIT_LFS_VERSION} \\(GitHub; linux ${TARGETARCH}; go 1\\.26\\.5; git ${GIT_LFS_COMMIT}\\)$"
 
 # Configure PHP
 COPY docker/production/etc/php/conf.d/zzz-custom-php.ini /usr/local/etc/php/conf.d/zzz-custom-php.ini
@@ -190,7 +263,16 @@ COPY --chown=www-data:www-data composer.json composer.lock ./
 COPY --chown=www-data:www-data app ./app
 COPY --chown=www-data:www-data bootstrap ./bootstrap
 COPY --chown=www-data:www-data config ./config
-COPY --chown=www-data:www-data database ./database
+COPY --chown=www-data:www-data database/migrations ./database/migrations
+COPY --chown=www-data:www-data \
+    database/seeders/CaSslCertSeeder.php \
+    database/seeders/DatabaseSeeder.php \
+    database/seeders/OauthSettingSeeder.php \
+    database/seeders/PopulateSshKeysDirectorySeeder.php \
+    database/seeders/ProductionSeeder.php \
+    database/seeders/RootUserSeeder.php \
+    database/seeders/SentinelSeeder.php \
+    ./database/seeders/
 COPY --chown=www-data:www-data lang ./lang
 COPY --chown=www-data:www-data public ./public
 COPY --chown=www-data:www-data routes ./routes

@@ -25,6 +25,7 @@ cleanup() {
 
 TERMINAL_LOG_FIFO="/tmp/coolify-terminal-log.$$"
 SOKETI_LOG_FIFO="/tmp/coolify-soketi-log.$$"
+SHUTTING_DOWN=false
 
 rm -f "$TERMINAL_LOG_FIFO" "$SOKETI_LOG_FIFO"
 mkfifo "$TERMINAL_LOG_FIFO" "$SOKETI_LOG_FIFO"
@@ -47,12 +48,13 @@ TERMINAL_PID=$!
 
 log "Terminal server started pid=$TERMINAL_PID logger_pid=$TERMINAL_LOGGER_PID"
 
-node-soketi /app/bin/server.js start > "$SOKETI_LOG_FIFO" 2>&1 &
+node /app/bin/server.js start > "$SOKETI_LOG_FIFO" 2>&1 &
 SOKETI_PID=$!
 
 log "Soketi started pid=$SOKETI_PID logger_pid=$SOKETI_LOGGER_PID"
 
 forward_signal() {
+    SHUTTING_DOWN=true
     log "Forwarding signal $1 to terminal=$TERMINAL_PID soketi=$SOKETI_PID"
 
     kill -"$1" "$TERMINAL_PID" 2>/dev/null || true
@@ -72,6 +74,10 @@ while true; do
         kill "$SOKETI_PID" 2>/dev/null || true
         wait "$SOKETI_PID" 2>/dev/null || true
 
+        if [ "$SHUTTING_DOWN" = true ]; then
+            exit 0
+        fi
+
         exit "$EXIT_CODE"
     fi
 
@@ -83,6 +89,10 @@ while true; do
 
         kill "$TERMINAL_PID" 2>/dev/null || true
         wait "$TERMINAL_PID" 2>/dev/null || true
+
+        if [ "$SHUTTING_DOWN" = true ]; then
+            exit 0
+        fi
 
         exit "$EXIT_CODE"
     fi

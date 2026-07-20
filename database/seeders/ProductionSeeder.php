@@ -19,6 +19,8 @@ use App\Models\User;
 use Illuminate\Database\Seeder;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
+use phpseclib3\Crypt\PublicKeyLoader;
+use phpseclib3\Exception\NoKeyLoadedException;
 
 class ProductionSeeder extends Seeder
 {
@@ -109,7 +111,7 @@ class ProductionSeeder extends Seeder
             }
         }
 
-        if (! isCloud()) {
+        if (! isCloud() && config('constants.coolify.is_windows_docker_desktop') == false) {
             if (Server::find(0) == null) {
                 $server_details = [
                     'id' => 0,
@@ -165,14 +167,7 @@ class ProductionSeeder extends Seeder
                 [
                     'name' => 'Testing-host',
                     'description' => 'This is a a docker container with SSH access',
-                    'private_key' => '-----BEGIN OPENSSH PRIVATE KEY-----
-b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
-QyNTUxOQAAACBbhpqHhqv6aI67Mj9abM3DVbmcfYhZAhC7ca4d9UCevAAAAJi/QySHv0Mk
-hwAAAAtzc2gtZWQyNTUxOQAAACBbhpqHhqv6aI67Mj9abM3DVbmcfYhZAhC7ca4d9UCevA
-AAAECBQw4jg1WRT2IGHMncCiZhURCts2s24HoDS0thHnnRKVuGmoeGq/pojrsyP1pszcNV
-uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
------END OPENSSH PRIVATE KEY-----
-',
+                    'private_key' => $this->testingHostPrivateKey(),
                 ]
             );
             if (Server::find(0) == null) {
@@ -220,5 +215,28 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
         $this->call(SentinelSeeder::class);
         $this->call(RootUserSeeder::class);
         $this->call(CaSslCertSeeder::class);
+    }
+
+    private function testingHostPrivateKey(): string
+    {
+        $privateKeyPath = config('constants.coolify.testing_host_private_key_path');
+
+        if (! is_string($privateKeyPath) || $privateKeyPath === '' || ! is_file($privateKeyPath) || is_link($privateKeyPath) || ! is_readable($privateKeyPath)) {
+            throw new \RuntimeException('The runtime testing-host private key is unavailable.');
+        }
+
+        $privateKey = file_get_contents($privateKeyPath);
+
+        if (! is_string($privateKey)) {
+            throw new \RuntimeException('The runtime testing-host private key is invalid.');
+        }
+
+        try {
+            PublicKeyLoader::loadPrivateKey($privateKey);
+        } catch (NoKeyLoadedException) {
+            throw new \RuntimeException('The runtime testing-host private key is invalid.');
+        }
+
+        return $privateKey;
     }
 }

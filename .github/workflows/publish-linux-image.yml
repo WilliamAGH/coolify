@@ -1569,19 +1569,16 @@ jobs:
           PRODUCT: ${{ matrix.product }}
         run: |
           set -Eeuo pipefail
+          docker/verify-source-provenance.sh "$DOCKERFILE"
           if [[ "$PRODUCT" == main ]]; then
-            docker/verify-source-provenance.sh "$DOCKERFILE"
             exit 0
           fi
 
-          expected_frontend='# syntax=docker/dockerfile:1@sha256:87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89'
-          [[ "$(sed -n '1p' "$DOCKERFILE")" == "$expected_frontend" ]]
           for argument in CLOUDFLARED_VERSION CLOUDFLARED_TAG CLOUDFLARED_COMMIT CLOUDFLARED_SOURCE_SHA256 CLOUDFLARED_RELEASE_DATE; do
             realtime_value="$(sed -n "s/^ARG ${argument}=//p" "$DOCKERFILE" | sed -n '1p')"
             production_value="$(sed -n "s/^ARG ${argument}=//p" docker/production/Dockerfile | sed -n '1p')"
             [[ -n "$realtime_value" && "$realtime_value" == "$production_value" ]]
           done
-          docker/verify-source-provenance.sh docker/production/Dockerfile
 
       - name: Prepare fork OCI evidence directory
         run: install -d -m 0700 fork-image
@@ -1721,6 +1718,12 @@ jobs:
             OCI_IMAGE="$image" \
             OCI_PLATFORM="$PLATFORM" \
             tests/Integration/VerifyOciArchiveImage.sh
+
+      - name: Verify exact fork realtime runtime
+        if: ${{ matrix.product == 'realtime' }}
+        env:
+          REALTIME_IMAGE: local/${{ matrix.artifact_name }}:${{ github.sha }}-${{ matrix.arch }}-fork-runtime
+        run: tests/Integration/RealtimeImageTest.sh
 
       - name: Generate standalone fork SPDX SBOM
         id: fork-sbom

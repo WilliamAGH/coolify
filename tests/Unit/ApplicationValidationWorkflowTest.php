@@ -40,6 +40,7 @@ function applicationValidationRequiredEnvironment(string $eventName): array
         'FORK_DEPLOY_RESULT' => 'success',
         'NODE_RESULT' => 'success',
         'PHP_RESULT' => 'success',
+        'REALTIME_RUNTIME_RESULT' => $eventName === 'pull_request' ? 'success' : 'skipped',
         'TESTING_HOST_RUNTIME_RESULT' => $eventName === 'pull_request' ? 'success' : 'skipped',
         'WORKFLOW_RESULT' => 'success',
     ];
@@ -100,6 +101,7 @@ function applicationValidationMissingOrEmptyEnvironmentCases(): array
         'FORK_DEPLOY_RESULT',
         'NODE_RESULT',
         'PHP_RESULT',
+        'REALTIME_RUNTIME_RESULT',
         'TESTING_HOST_RUNTIME_RESULT',
         'WORKFLOW_RESULT',
     ] as $variable) {
@@ -251,6 +253,7 @@ it('keeps the aggregate contract structurally connected to every selected result
             'formatting',
             'fork-deploy',
             'node',
+            'realtime-runtime',
             'testing-host-runtime',
             'workflow-and-shell',
         ])
@@ -263,6 +266,7 @@ it('keeps the aggregate contract structurally connected to every selected result
             'FORK_DEPLOY_RESULT' => '${{ needs.fork-deploy.result }}',
             'NODE_RESULT' => '${{ needs.node.result }}',
             'PHP_RESULT' => '${{ needs.php.result }}',
+            'REALTIME_RUNTIME_RESULT' => '${{ needs.realtime-runtime.result }}',
             'TESTING_HOST_RUNTIME_RESULT' => '${{ needs.testing-host-runtime.result }}',
             'WORKFLOW_RESULT' => '${{ needs.workflow-and-shell.result }}',
         ])
@@ -308,9 +312,35 @@ it('requires testing-host success for pull requests', function (string $result):
     'cancelled' => ['cancelled'],
 ]);
 
+it('requires realtime runtime success for pull requests', function (string $result): void {
+    $environment = applicationValidationRequiredEnvironment('pull_request');
+    $environment['REALTIME_RUNTIME_RESULT'] = $result;
+
+    $process = runApplicationValidationRequiredAggregate($environment);
+
+    expect($process->isSuccessful())->toBeFalse();
+})->with([
+    'failure' => ['failure'],
+    'skipped' => ['skipped'],
+    'cancelled' => ['cancelled'],
+]);
+
 it('only allows a skipped testing-host result for reusable workflow calls', function (string $result): void {
     $environment = applicationValidationRequiredEnvironment('workflow_call');
     $environment['TESTING_HOST_RUNTIME_RESULT'] = $result;
+
+    $process = runApplicationValidationRequiredAggregate($environment);
+
+    expect($process->isSuccessful())->toBeFalse();
+})->with([
+    'success' => ['success'],
+    'failure' => ['failure'],
+    'cancelled' => ['cancelled'],
+]);
+
+it('only allows a skipped realtime runtime result for reusable workflow calls', function (string $result): void {
+    $environment = applicationValidationRequiredEnvironment('workflow_call');
+    $environment['REALTIME_RUNTIME_RESULT'] = $result;
 
     $process = runApplicationValidationRequiredAggregate($environment);
 

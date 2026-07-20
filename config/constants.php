@@ -13,6 +13,7 @@ return [
         'helper_image' => env('HELPER_IMAGE', env('REGISTRY_URL', 'docker.io').'/coollabsio/coolify-helper'),
         'realtime_image' => env('REALTIME_IMAGE', env('REGISTRY_URL', 'docker.io').'/coollabsio/coolify-realtime'),
         'is_windows_docker_desktop' => env('IS_WINDOWS_DOCKER_DESKTOP', false),
+        'testing_host_private_key_path' => env('COOLIFY_TESTING_HOST_PRIVATE_KEY_PATH', '/run/coolify-testing-host/private/testing-host'),
         'cdn_url' => env('CDN_URL', 'https://cdn.coollabs.io'),
         'versions_url' => env('VERSIONS_URL', env('CDN_URL', 'https://cdn.coollabs.io').'/coolify/versions.json'),
         'upgrade_script_url' => env('UPGRADE_SCRIPT_URL', env('CDN_URL', 'https://cdn.coollabs.io').'/coolify/upgrade.sh'),

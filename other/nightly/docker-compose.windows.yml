@@ -4,13 +4,24 @@ services:
     image: "docker.io/coollabsio/coolify-testing-host:latest"
     pull_policy: always
     container_name: coolify-testing-host
+    restart: always
+    environment:
+      COOLIFY_TESTING_KEY_UID: "9999"
+      COOLIFY_TESTING_KEY_GID: "9999"
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - /usr/local/bin/coolify-testing-host-keygen && exec /usr/local/bin/coolify-testing-host-entrypoint
     volumes:
       - //var/run/docker.sock://var/run/docker.sock
-      - type: bind
-        source: ../../docker/testing-host/development-authorized_keys
-        target: /run/coolify-testing-host/public/authorized_keys
-        read_only: true
+      - coolify-testing-host-private:/run/coolify-testing-host/private
+      - coolify-testing-host-public:/run/coolify-testing-host/public
       - ./:/data/coolify
+    healthcheck:
+      test: [ "CMD-SHELL", "test -s /run/coolify-testing-host/private/testing-host && test -s /run/coolify-testing-host/public/authorized_keys && /usr/sbin/sshd -T >/dev/null" ]
+      interval: 2s
+      retries: 30
+      timeout: 2s
   coolify:
     image: "docker.io/coollabsio/coolify:latest"
     pull_policy: always
@@ -29,6 +40,7 @@ services:
       - ./databases:/var/www/html/storage/app/databases
       - ./services:/var/www/html/storage/app/services
       - ./backups:/var/www/html/storage/app/backups
+      - coolify-testing-host-private:/run/coolify-testing-host/private:ro
     env_file:
       - .env
     environment:
@@ -50,6 +62,7 @@ services:
       - SELF_HOSTED=true
       - SSH_MUX_ENABLED=false
       - IS_WINDOWS_DOCKER_DESKTOP=true
+      - COOLIFY_TESTING_HOST_PRIVATE_KEY_PATH=/run/coolify-testing-host/private/testing-host
     ports:
       - "${APP_PORT:-8000}:8080"
     expose:
@@ -60,6 +73,8 @@ services:
       retries: 10
       timeout: 2s
     depends_on:
+      coolify-testing-host:
+        condition: service_healthy
       postgres:
         condition: service_healthy
       redis:
@@ -129,3 +144,7 @@ volumes:
     name: coolify-db
   coolify-redis:
     name: coolify-redis
+  coolify-testing-host-private:
+    name: coolify-testing-host-private
+  coolify-testing-host-public:
+    name: coolify-testing-host-public

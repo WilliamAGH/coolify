@@ -8,6 +8,12 @@ class DatabaseSeeder extends Seeder
 {
     public function run(): void
     {
+        if (! in_array(config('app.env'), ['local', 'development', 'dev', 'testing'], true)) {
+            $this->call(ProductionSeeder::class);
+
+            return;
+        }
+
         $this->call([
             InstanceSettingsSeeder::class,
             UserSeeder::class,
