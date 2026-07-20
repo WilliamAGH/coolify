@@ -177,7 +177,7 @@ function submitLivewireForm($page, string $successMessage): void
     $script = sprintf(<<<'JAVASCRIPT'
         () => new Promise((resolve, reject) => {
             const expectedSuccessMessage = %s;
-            const form = document.querySelector('input#name')?.closest('form[wire\\:submit="submit"]');
+            const form = document.querySelector('input[name="name"]')?.closest('form[wire\\:submit="submit"]');
             if (!(form instanceof HTMLFormElement)) {
                 reject(new Error('Unable to find the canonical Livewire settings form.'));
                 return;
