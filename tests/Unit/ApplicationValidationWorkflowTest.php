@@ -141,7 +141,7 @@ function applicationValidationRequiredAggregateStep(array $workflow): array
 /**
  * @return array<string, string|false>
  */
-function applicationValidationRequiredEnvironment(string $eventName): array
+function applicationValidationRequiredEnvironment(string $eventName, string $sourceSha = ''): array
 {
     return [
         'BLUE_GREEN_LIFECYCLE_RESULT' => 'success',
@@ -151,7 +151,8 @@ function applicationValidationRequiredEnvironment(string $eventName): array
         'FORK_DEPLOY_RESULT' => 'success',
         'NODE_RESULT' => 'success',
         'PHP_RESULT' => 'success',
-        'TESTING_HOST_RUNTIME_RESULT' => $eventName === 'pull_request' ? 'success' : 'skipped',
+        'VALIDATION_SOURCE_SHA' => $sourceSha,
+        'TESTING_HOST_RUNTIME_RESULT' => $eventName === 'pull_request' || $sourceSha !== '' ? 'success' : 'skipped',
         'WORKFLOW_RESULT' => 'success',
     ];
 }
@@ -426,6 +427,7 @@ it('keeps the aggregate contract structurally connected to every selected result
             'FORK_DEPLOY_RESULT' => '${{ needs.fork-deploy.result }}',
             'NODE_RESULT' => '${{ needs.node.result }}',
             'PHP_RESULT' => '${{ needs.php.result }}',
+            'VALIDATION_SOURCE_SHA' => '${{ inputs.source_sha }}',
             'TESTING_HOST_RUNTIME_RESULT' => '${{ needs.testing-host-runtime.result }}',
             'WORKFLOW_RESULT' => '${{ needs.workflow-and-shell.result }}',
         ])
@@ -435,15 +437,16 @@ it('keeps the aggregate contract structurally connected to every selected result
 
 it('executes the actual aggregate script for successful pull requests and reusable calls', function (
     string $eventName,
+    string $sourceSha,
 ): void {
     $process = runApplicationValidationRequiredAggregate(
-        applicationValidationRequiredEnvironment($eventName),
+        applicationValidationRequiredEnvironment($eventName, $sourceSha),
     );
 
     expect($process->isSuccessful())->toBeTrue($process->getErrorOutput());
 })->with([
-    'pull request' => ['pull_request'],
-    'workflow call' => ['workflow_call'],
+    'pull request' => ['pull_request', ''],
+    'exact-source workflow call' => ['workflow_call', str_repeat('a', 40)],
 ]);
 
 it('fails the actual aggregate script for every non-successful generic result', function (
@@ -471,7 +474,7 @@ it('requires testing-host success for pull requests', function (string $result):
     'cancelled' => ['cancelled'],
 ]);
 
-it('only allows a skipped testing-host result for reusable workflow calls', function (string $result): void {
+it('only allows a skipped testing-host result without an exact source', function (string $result): void {
     $environment = applicationValidationRequiredEnvironment('workflow_call');
     $environment['TESTING_HOST_RUNTIME_RESULT'] = $result;
 
