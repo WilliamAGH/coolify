@@ -2286,10 +2286,9 @@ it('defines one referrerless fork release graph for the main image on both platf
     expect($secretScan['with']['image-ref'] ?? null)
         ->toBe('local/${{ matrix.artifact_name }}:${{ github.sha }}-${{ matrix.arch }}-fork-runtime');
 
-    $forkRegistryPolicy = $jobs['fork-registry-policy'] ?? [];
     $policyRun = (string) (releaseWorkflowStep(
-        $forkRegistryPolicy,
-        'Require shared Nexus docker-hosted ALLOW policy',
+        $jobs['fork-registry-policy'] ?? [],
+        'Require Nexus hosted repository non-redeploy policy',
     )['run'] ?? '');
     $stageRun = (string) (releaseWorkflowStep(
         $jobs['fork-stage'] ?? [],
@@ -2299,15 +2298,12 @@ it('defines one referrerless fork release graph for the main image on both platf
         $jobs['fork-release'] ?? [],
         'Promote and verify the main fork image',
     )['run'] ?? '');
-    $forkRegistryPolicyStepNames = collect(releaseWorkflowSteps($forkRegistryPolicy))
+    $forkRegistryPolicyStepNames = collect(releaseWorkflowSteps($jobs['fork-registry-policy'] ?? []))
         ->pluck('name')
         ->values()
         ->all();
-    expect($forkRegistryPolicy['name'] ?? null)->toBe('Require shared Nexus docker-hosted ALLOW policy');
     expect($policyRun)
-        ->toContain('.storage.writePolicy == "ALLOW"')
-        ->toContain('writePolicy=ALLOW')
-        ->toContain('mutable *-latest aliases')
+        ->toContain('.storage.writePolicy == "ALLOW_ONCE"')
         ->toContain('/service/rest/v1/repositories/docker/hosted/$NEXUS_REPOSITORY')
         ->and($forkRegistryPolicyStepNames)
         ->not->toContain('Reject existing fork semantic tags before build')
@@ -2382,9 +2378,8 @@ it('defines one referrerless fork release graph for the main image on both platf
     $forkRelease = $jobs['fork-release'] ?? [];
     $finalPolicyStep = releaseWorkflowStep(
         $forkRelease,
-        'Re-require shared Nexus docker-hosted ALLOW policy before final tagging',
+        'Re-require Nexus non-redeploy policy before final tagging',
     );
-    $finalPolicyRun = (string) ($finalPolicyStep['run'] ?? '');
     $finalLoginStep = releaseWorkflowStep(
         $forkRelease,
         'Login to Nexus fork registry for final promotion',
@@ -2412,13 +2407,9 @@ it('defines one referrerless fork release graph for the main image on both platf
         ->toBe('${{ secrets.NEXUS_USERNAME }}')
         ->and($forkReleaseNexusSecretSteps)
         ->toBe([
-            'Re-require shared Nexus docker-hosted ALLOW policy before final tagging',
+            'Re-require Nexus non-redeploy policy before final tagging',
             'Login to Nexus fork registry for final promotion',
         ]);
-    expect($finalPolicyRun)
-        ->toContain('.storage.writePolicy == "ALLOW"')
-        ->toContain('writePolicy=ALLOW')
-        ->toContain('mutable *-latest aliases');
     expect($forkRelease['permissions']['contents'] ?? null)->toBe('write')
         ->and($releaseBundleDownload['with']['artifact-ids'] ?? null)
         ->toBe('${{ needs.fork-attest.outputs.bundle_artifact_id }}')

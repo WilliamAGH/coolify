@@ -1453,7 +1453,7 @@ jobs:
           regctl tag delete --ignore-missing "$DOCKER_TARGET:quarantine-$RUN_TAG"
 
   fork-registry-policy:
-    name: Require shared Nexus docker-hosted ALLOW policy
+    name: Require fork registry first-write policy
     needs: validate-inputs
     if: ${{ inputs.release_kind == 'fork' }}
     permissions: {}
@@ -1466,7 +1466,7 @@ jobs:
       NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
       SEMANTIC_VERSION: ${{ inputs.semantic_version }}
     steps:
-      - name: Require shared Nexus docker-hosted ALLOW policy
+      - name: Require Nexus hosted repository non-redeploy policy
         run: |
           set -Eeuo pipefail
           umask 077
@@ -1485,9 +1485,9 @@ jobs:
           jq -e --arg repository "$NEXUS_REPOSITORY" '
             .name == $repository and
             .online == true and
-            .storage.writePolicy == "ALLOW"
+            .storage.writePolicy == "ALLOW_ONCE"
           ' "$policy_file" >/dev/null || {
-            printf 'Shared Nexus docker-hosted repository must be online with writePolicy=ALLOW; release trains require mutable *-latest aliases before fork publication.\n' >&2
+            printf 'Nexus hosted repository must be online with writePolicy=ALLOW_ONCE before fork publication.\n' >&2
             exit 1
           }
 
@@ -2373,7 +2373,7 @@ jobs:
       SOURCE_REVISION: ${{ github.sha }}
       SOURCE_URL: https://github.com/${{ github.repository }}
     steps:
-      - name: Re-require shared Nexus docker-hosted ALLOW policy before final tagging
+      - name: Re-require Nexus non-redeploy policy before final tagging
         env:
           NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
           NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
@@ -2395,11 +2395,8 @@ jobs:
           jq -e --arg repository "$NEXUS_REPOSITORY" '
             .name == $repository and
             .online == true and
-            .storage.writePolicy == "ALLOW"
-          ' "$policy_file" >/dev/null || {
-            printf 'Shared Nexus docker-hosted repository must be online with writePolicy=ALLOW; release trains require mutable *-latest aliases before final fork tagging.\n' >&2
-            exit 1
-          }
+            .storage.writePolicy == "ALLOW_ONCE"
+          ' "$policy_file" >/dev/null
 
       - name: Install registry client for final fork promotion
         uses: regclient/actions/regctl-installer@1b705e32d40851370799ea5814e83d0a5f6a70dc # v0.1.0
@@ -2712,9 +2709,8 @@ jobs:
           verify_exact_index "$MAIN_TARGET" "$MAIN_INDEX_DIGEST" "$MAIN_AMD64_DIGEST" "$MAIN_ARM64_DIGEST"
 
           # The recovery draft remains unpublished until the single semantic image
-          # tag and its live GitHub source tag have both been revalidated. The shared
-          # Nexus ALLOW policy permits mutable *-latest aliases; reruns may accept only
-          # the same immutable index digest.
+          # tag and its live GitHub source tag have both been revalidated. ALLOW_ONCE
+          # reruns may accept only the same immutable index digest.
           preflight_semantic_tag() {
             local repository=$1 expected_index_digest=$2 existing
             existing="$(digest_or_absent "$repository:$SEMANTIC_VERSION")"
