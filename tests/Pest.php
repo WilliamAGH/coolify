@@ -1,5 +1,6 @@
 <?php
 
+use App\Models\InstanceSettings;
 use App\Models\Server;
 use Illuminate\Support\Once;
 use Tests\TestCase;
@@ -39,6 +40,14 @@ function loginAndSkipBoarding(string $email = 'test@example.com', string $passwo
         ->fill('password', $password)
         ->click('Login')
         ->click('Skip Setup');
+}
+
+function seedBrowserInstanceSettings(): InstanceSettings
+{
+    return InstanceSettings::unguarded(fn (): InstanceSettings => InstanceSettings::query()->create([
+        'id' => 0,
+        'is_sponsorship_popup_enabled' => false,
+    ]));
 }
 
 /*
