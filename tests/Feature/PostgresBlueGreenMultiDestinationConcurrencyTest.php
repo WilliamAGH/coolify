@@ -1,10 +1,10 @@
 <?php
 
+use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
+use App\Actions\Application\BlueGreen\DeactivateBlueGreenApplication;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenFleetStatus;
 use App\Enums\ProxyTypes;
-use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
-use App\Actions\Application\BlueGreen\DeactivateBlueGreenApplication;
 use App\Jobs\ApplicationDeploymentJob;
 use App\Models\Application;
 use App\Models\ApplicationDeploymentQueue;

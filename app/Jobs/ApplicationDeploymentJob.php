@@ -5690,8 +5690,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
     private function transitionToStatus(
         ApplicationDeploymentStatus $status,
         ?Closure $statusConstraint = null,
-    ): void
-    {
+    ): void {
         if ($this->isInTerminalState()) {
             return;
         }
@@ -5742,8 +5741,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
     private function updateDeploymentStatus(
         ApplicationDeploymentStatus $status,
         ?Closure $statusConstraint = null,
-    ): bool
-    {
+    ): bool {
         $query = ApplicationDeploymentQueue::query()
             ->whereKey($this->application_deployment_queue->getKey())
             ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
@@ -6198,8 +6196,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
     private function constrainBlueGreenDrainRecoveryFailure(
         Builder $query,
         int $supersessionGeneration,
-    ): void
-    {
+    ): void {
         $query
             ->whereKey($this->application_deployment_queue->getKey())
             ->where('application_id', $this->application_deployment_queue->application_id)
