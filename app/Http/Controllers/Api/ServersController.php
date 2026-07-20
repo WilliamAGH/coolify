@@ -301,7 +301,7 @@ class ServersController extends Controller
         if (is_null($teamId)) {
             return invalidTokenResponse();
         }
-        $server = ModelsServer::whereTeamId($teamId)->whereUuid($request->uuid)->first();
+        $server = ModelsServer::whereTeamId($teamId)->whereUuid($request->route('uuid'))->first();
         if (is_null($server)) {
             return response()->json(['message' => 'Server not found.'], 404);
         }
@@ -312,7 +312,13 @@ class ServersController extends Controller
                 return response()->json(['message' => 'Application not found.'], 404);
             }
 
-            return response()->json(serializeApiResponse($application->fqdns));
+            $domains = collect($application->fqdns)->map(function (string $fqdn) {
+                $host = str($fqdn)->replace('http://', '')->replace('https://', '')->explode('/')->first();
+
+                return str($host)->explode(':')->first();
+            })->filter()->values();
+
+            return response()->json(serializeApiResponse($domains));
         }
         $projects = Project::where('team_id', $teamId)->get();
         $domains = collect();
