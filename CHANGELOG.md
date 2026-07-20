@@ -7,15 +7,15 @@ All notable changes to this project will be documented in this file.
 ### 🚀 Features
 
 - *(realtime)* Bundle Reverb and terminal in main image (#62)
-- *(release)* Gate exact v4.x candidates before publication
 - *(blue-green)* Support multiple backend ports
 - *(blue-green)* Support routed compose services
+- *(blue-green)* Support multi-destination fleets
+- *(release)* Gate exact v4.x candidates before publication
+- *(blue-green)* Support multi-destination fleets (#72)
 
 ### 🐛 Bug Fixes
 
 - *(release)* Scan extracted OCI layouts with Trivy
-- *(blue-green)* Preserve PostgreSQL recovery fencing
-- *(images)* Harden production and realtime supply chains
 - *(install)* Preserve Docker daemon configuration
 - *(recovery)* Expire stale Horizon queue metadata
 - *(install)* Enforce one Docker daemon configuration owner
@@ -27,8 +27,10 @@ All notable changes to this project will be documented in this file.
 - *(ci)* Make changelog auto-merge idempotent (#55)
 - *(image)* Remove production secret and Git LFS blockers (#58)
 - *(image)* Refresh apk indexes before pruning terminal build deps
-- *(release)* Anchor candidate trust to protected base
 - *(control-plane)* Bound intervention and queue recovery
+- *(blue-green)* Preserve PostgreSQL recovery fencing
+- *(images)* Harden production and realtime supply chains
+- *(release)* Anchor candidate trust to protected base
 - *(release)* Bind candidate shipping to exact repository
 - *(release)* Require trusted policy and runtime evidence
 - *(release)* Align fork publication with shared Nexus policy
@@ -36,6 +38,7 @@ All notable changes to this project will be documented in this file.
 - *(control-plane)* Clarify generated shell guards
 - *(control-plane)* Clarify recovery artifact guards
 - *(remediation)* Harden release trust, queue recovery, and Traefik evidence (#69)
+- *(blue-green)* Surface fleet scheduling failures
 
 ### 💼 Other
 
@@ -53,6 +56,7 @@ All notable changes to this project will be documented in this file.
 - Update changelog (#68)
 - Update changelog (#70)
 - Update changelog (#71)
+- Update changelog (#73)
 
 ### 🧪 Testing
 
