@@ -1737,6 +1737,14 @@ test_recover_abort_refuses_after_candidate_start() {
     cleanup_fixture
 }
 
+test_uses_migrated_github_raw_base() {
+    if grep -Fxq 'GITHUB_RAW_BASE=https://raw.githubusercontent.com/williamacallahan/coolify' "$SUBJECT"; then
+        pass 'fork deployment downloads release assets from the migrated GitHub repository'
+    else
+        fail 'fork deployment does not use the migrated GitHub raw base'
+    fi
+}
+
 if [[ ${FORK_DEPLOY_TEST_FILTER:-} == control-plane-listener ]]; then
     test_update_preserves_control_plane_listener_override
     test_update_rejects_symlinked_control_plane_listener_override
@@ -1747,6 +1755,7 @@ if [[ ${FORK_DEPLOY_TEST_FILTER:-} == control-plane-listener ]]; then
 fi
 
 test_rejects_untrusted_caller_inputs
+test_uses_migrated_github_raw_base
 test_install_and_update_are_self_contained
 test_rejects_production_alternate_root
 test_rejects_symlinked_root_and_authorized_key_ancestors

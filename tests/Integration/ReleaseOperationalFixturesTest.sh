@@ -405,7 +405,7 @@ export REGCTL_LOG="$log"
 export REGCTL_STATE="$state"
 export GITHUB_ACTIONS=true
 export GITHUB_EVENT_NAME=repository_dispatch
-export GITHUB_REPOSITORY=WilliamAGH/coolify
+export GITHUB_REPOSITORY=williamacallahan/coolify
 export GITHUB_REF_TYPE=branch
 export GITHUB_REF_PROTECTED=true
 export GITHUB_REF=refs/heads/v4.x
@@ -418,7 +418,7 @@ cat > "$event_path" <<'JSON'
 {
   "action": "release-operational-acceptance",
   "repository": {
-    "full_name": "WilliamAGH/coolify",
+    "full_name": "williamacallahan/coolify",
     "default_branch": "v4.x"
   }
 }
