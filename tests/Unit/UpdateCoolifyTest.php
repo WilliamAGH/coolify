@@ -47,6 +47,42 @@ it('has UpdateCoolify action class', function () {
     expect(class_exists(UpdateCoolify::class))->toBeTrue();
 });
 
+it('recognizes only guarded fork release versions', function () {
+    expect(UpdateCoolify::isGuardedForkRelease('4.13.1-fork'))->toBeTrue()
+        ->and(UpdateCoolify::isGuardedForkRelease('4.13.1-fork.2'))->toBeTrue()
+        ->and(UpdateCoolify::isGuardedForkRelease('4.13.1'))->toBeFalse()
+        ->and(UpdateCoolify::isGuardedForkRelease('4.13.1-fork.0'))->toBeFalse();
+});
+
+it('does not contact upstream or run the generic updater for a fork release', function () {
+    updateCoolifyTestCreateRootServerAndSettings(['new_version_available' => true]);
+    config(['constants.coolify.version' => '4.13.1-fork']);
+    Http::preventStrayRequests();
+    Log::shouldReceive('warning')
+        ->once()
+        ->with('Upstream updater disabled for fork release', Mockery::type('array'));
+
+    (new UpdateCoolify)->handle();
+
+    Http::assertNothingSent();
+    expect(InstanceSettings::findOrFail(0)->new_version_available)->toBeFalse();
+});
+
+it('directs manual fork updates to the guarded deployment workflow', function () {
+    updateCoolifyTestCreateRootServerAndSettings(['new_version_available' => true]);
+    config(['constants.coolify.version' => '4.13.1-fork']);
+    Http::preventStrayRequests();
+    Log::shouldReceive('warning')
+        ->once()
+        ->with('Upstream updater disabled for fork release', Mockery::type('array'));
+
+    expect(fn () => (new UpdateCoolify)->handle(manual_update: true))
+        ->toThrow(RuntimeException::class, 'guarded fork deployment workflow');
+
+    Http::assertNothingSent();
+    expect(InstanceSettings::findOrFail(0)->new_version_available)->toBeFalse();
+});
+
 it('validates cache against running version before fallback', function () {
     updateCoolifyTestCreateRootServerAndSettings();
 

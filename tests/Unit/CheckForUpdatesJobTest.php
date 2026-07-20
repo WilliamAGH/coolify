@@ -2,16 +2,32 @@
 
 use App\Jobs\CheckForUpdatesJob;
 use App\Models\InstanceSettings;
+use Illuminate\Contracts\Queue\ShouldBeEncrypted;
+use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Tests\TestCase;
+
+uses(TestCase::class);
+
+function checkForUpdatesJobForTest(InstanceSettings $settings): CheckForUpdatesJob
+{
+    $job = Mockery::mock(CheckForUpdatesJob::class)
+        ->makePartial()
+        ->shouldAllowMockingProtectedMethods();
+    $job->shouldReceive('instanceSettings')->andReturn($settings);
+
+    return $job;
+}
 
 beforeEach(function () {
     Cache::flush();
 
     // Mock InstanceSettings
     $this->settings = Mockery::mock(InstanceSettings::class);
-    $this->settings->shouldReceive('update')->andReturn(true);
+    $this->settings->shouldReceive('update')->byDefault()->andReturn(true);
 });
 
 afterEach(function () {
@@ -22,8 +38,28 @@ it('has correct job configuration', function () {
     $job = new CheckForUpdatesJob;
 
     $interfaces = class_implements($job);
-    expect($interfaces)->toContain(\Illuminate\Contracts\Queue\ShouldQueue::class);
-    expect($interfaces)->toContain(\Illuminate\Contracts\Queue\ShouldBeEncrypted::class);
+    expect($interfaces)->toContain(ShouldQueue::class);
+    expect($interfaces)->toContain(ShouldBeEncrypted::class);
+});
+
+it('does not contact or mutate upstream update metadata for a fork release', function () {
+    config(['constants.coolify.version' => '4.13.1-fork']);
+    Http::preventStrayRequests();
+    File::shouldReceive('exists')->never();
+    File::shouldReceive('get')->never();
+    File::shouldReceive('put')->never();
+    Cache::shouldReceive('forget')->never();
+    $this->settings->shouldReceive('update')
+        ->once()
+        ->with(['new_version_available' => false]);
+    Log::shouldReceive('warning')
+        ->once()
+        ->with('Upstream update discovery disabled for fork release', Mockery::type('array'));
+    $job = checkForUpdatesJobForTest($this->settings);
+
+    $job->handle();
+
+    Http::assertNothingSent();
 });
 
 it('uses max of CDN and cache versions', function () {
@@ -57,12 +93,7 @@ it('uses max of CDN and cache versions', function () {
 
     config(['constants.coolify.version' => '4.0.5']);
 
-    // Mock instanceSettings function
-    $this->app->instance('App\Models\InstanceSettings', function () {
-        return $this->settings;
-    });
-
-    $job = new CheckForUpdatesJob;
+    $job = checkForUpdatesJobForTest($this->settings);
     $job->handle();
 });
 
@@ -98,15 +129,14 @@ it('never downgrades from current running version', function () {
     // Running version is newest
     config(['constants.coolify.version' => '4.0.10']);
 
-    \Illuminate\Support\Facades\Log::shouldReceive('warning')
+    Log::shouldReceive('warning')
         ->once()
         ->with('Version downgrade prevented in CheckForUpdatesJob', Mockery::type('array'));
+    Log::shouldReceive('warning')
+        ->once()
+        ->with('CDN served older Coolify version than cache', Mockery::type('array'));
 
-    $this->app->instance('App\Models\InstanceSettings', function () {
-        return $this->settings;
-    });
-
-    $job = new CheckForUpdatesJob;
+    $job = checkForUpdatesJobForTest($this->settings);
     $job->handle();
 });
 
@@ -123,11 +153,7 @@ it('uses data_set for safe version mutation', function () {
 
     config(['constants.coolify.version' => '4.0.5']);
 
-    $this->app->instance('App\Models\InstanceSettings', function () {
-        return $this->settings;
-    });
-
-    $job = new CheckForUpdatesJob;
+    $job = checkForUpdatesJobForTest($this->settings);
 
     // Should not throw even if structure is unexpected
     // data_set() handles nested path creation
@@ -169,18 +195,14 @@ it('preserves other component versions when preventing Coolify downgrade', funct
 
     config(['constants.coolify.version' => '4.0.10']);
 
-    \Illuminate\Support\Facades\Log::shouldReceive('warning')
+    Log::shouldReceive('warning')
         ->once()
         ->with('CDN served older Coolify version than cache', Mockery::type('array'));
 
-    \Illuminate\Support\Facades\Log::shouldReceive('warning')
+    Log::shouldReceive('warning')
         ->once()
         ->with('Version downgrade prevented in CheckForUpdatesJob', Mockery::type('array'));
 
-    $this->app->instance('App\Models\InstanceSettings', function () {
-        return $this->settings;
-    });
-
-    $job = new CheckForUpdatesJob;
+    $job = checkForUpdatesJobForTest($this->settings);
     $job->handle();
 });

@@ -2,6 +2,7 @@
 
 namespace App\Actions\Server;
 
+use App\Models\InstanceSettings;
 use App\Models\Server;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
@@ -11,6 +12,8 @@ use Lorisleiva\Actions\Concerns\AsAction;
 class UpdateCoolify
 {
     use AsAction;
+
+    private const string FORK_VERSION_PATTERN = '/\A(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-fork(?:\.[1-9]\d*)?\z/D';
 
     public ?Server $server = null;
 
@@ -25,9 +28,26 @@ class UpdateCoolify
 
             return;
         }
-        $settings = instanceSettings();
-        $this->server = Server::find(0);
+        $settings = $this->instanceSettings();
+        $this->server ??= Server::find(0);
         if (! $this->server) {
+            return;
+        }
+
+        $this->currentVersion = config('constants.coolify.version');
+        if (self::isGuardedForkRelease($this->currentVersion)) {
+            Log::warning('Upstream updater disabled for fork release', [
+                'current_version' => $this->currentVersion,
+                'manual_update' => $manual_update,
+            ]);
+            $settings->update(['new_version_available' => false]);
+
+            if ($manual_update) {
+                throw new \RuntimeException(
+                    'Fork releases must be updated through the guarded fork deployment workflow.'
+                );
+            }
+
             return;
         }
 
@@ -83,7 +103,6 @@ class UpdateCoolify
             ]);
         }
 
-        $this->currentVersion = config('constants.coolify.version');
         if (! $manual_update) {
             if (! $settings->is_auto_update_enabled) {
                 return;
@@ -110,11 +129,20 @@ class UpdateCoolify
         }
 
         $this->update();
-        $settings->new_version_available = false;
-        $settings->save();
+        $settings->update(['new_version_available' => false]);
     }
 
-    private function update()
+    public static function isGuardedForkRelease(mixed $version): bool
+    {
+        return is_string($version) && preg_match(self::FORK_VERSION_PATTERN, $version) === 1;
+    }
+
+    protected function instanceSettings(): InstanceSettings
+    {
+        return instanceSettings();
+    }
+
+    protected function update(): void
     {
         $latestHelperImageVersion = getHelperVersion();
         $upgradeScriptUrl = config('constants.coolify.upgrade_script_url');

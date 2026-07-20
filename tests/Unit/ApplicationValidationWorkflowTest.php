@@ -6,7 +6,7 @@ use Symfony\Component\Yaml\Yaml;
  * @param  array<string, mixed>  $workflow
  * @return list<string>
  */
-function dependencyApplicationValidationViolations(array $workflow): array
+function applicationValidationWorkflowViolations(array $workflow): array
 {
     $violations = [];
     $jobs = $workflow['jobs'] ?? [];
@@ -25,9 +25,14 @@ function dependencyApplicationValidationViolations(array $workflow): array
     }
 
     $requiredNeeds = $required['needs'] ?? [];
+    $validationJobs = array_values(array_filter(
+        array_keys(is_array($jobs) ? $jobs : []),
+        fn (string $job): bool => $job !== 'required',
+    ));
     sort($requiredNeeds);
-    if ($requiredNeeds !== ['node', 'php', 'production-image-base'] || ($required['if'] ?? null) !== 'always()') {
-        $violations[] = 'application validation must aggregate every dependency validation job';
+    sort($validationJobs);
+    if ($requiredNeeds !== $validationJobs || ($required['if'] ?? null) !== 'always()') {
+        $violations[] = 'application validation must aggregate every validation job';
     }
 
     foreach (is_array($jobs) ? $jobs : [] as $job) {
@@ -42,16 +47,16 @@ function dependencyApplicationValidationViolations(array $workflow): array
     return array_values(array_unique($violations));
 }
 
-it('defines the required dependency application validation contract', function () {
+it('defines the required application validation contract', function () {
     $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
 
-    expect(dependencyApplicationValidationViolations($workflow))->toBe([]);
+    expect(applicationValidationWorkflowViolations($workflow))->toBe([]);
 });
 
 it('rejects renaming the protected branch validation context', function () {
     $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
     $workflow['jobs']['required']['name'] = 'Renamed application validation';
 
-    expect(dependencyApplicationValidationViolations($workflow))
+    expect(applicationValidationWorkflowViolations($workflow))
         ->toContain('application validation must preserve the protected branch status context');
 });

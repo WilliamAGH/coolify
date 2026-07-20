@@ -4,9 +4,32 @@ use App\Livewire\Upgrade;
 use App\Models\InstanceSettings;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Once;
 use Livewire\Livewire;
 
 uses(RefreshDatabase::class);
+
+beforeEach(function () {
+    Once::flush();
+});
+
+it('uses the canonical cached instance settings accessor', function () {
+    InstanceSettings::forceCreate([
+        'id' => 0,
+        'new_version_available' => false,
+    ]);
+
+    $canonicalSettings = instanceSettings();
+    $component = new class extends Upgrade
+    {
+        public function exposedInstanceSettings(): InstanceSettings
+        {
+            return $this->instanceSettings();
+        }
+    };
+
+    expect($component->exposedInstanceSettings())->toBe($canonicalSettings);
+});
 
 it('initializes latest version during mount from cached versions data', function () {
     config(['constants.coolify.version' => '4.0.0-beta.998']);
@@ -49,6 +72,7 @@ it('uses sidebar state css instead of nested alpine state for upgrade labels', f
 });
 
 it('falls back to 0.0.0 during mount when cached versions data is unavailable', function () {
+    config(['constants.coolify.version' => '4.0.0']);
     InstanceSettings::forceCreate([
         'id' => 0,
         'new_version_available' => false,

@@ -38,8 +38,20 @@ class Upgrade extends Component
     protected function refreshUpgradeState(): void
     {
         $this->currentVersion = config('constants.coolify.version');
-        $this->latestVersion = get_latest_version_of_coolify();
         $this->devMode = isDev();
+
+        if (UpdateCoolify::isGuardedForkRelease($this->currentVersion)) {
+            $this->latestVersion = $this->currentVersion;
+            $settings = $this->instanceSettings();
+            if ($settings->new_version_available) {
+                $settings->update(['new_version_available' => false]);
+            }
+            $this->isUpgradeAvailable = false;
+
+            return;
+        }
+
+        $this->latestVersion = get_latest_version_of_coolify();
 
         if ($this->devMode) {
             $this->isUpgradeAvailable = true;
@@ -47,16 +59,21 @@ class Upgrade extends Component
             return;
         }
 
-        $settings = InstanceSettings::find(0);
+        $settings = $this->instanceSettings();
         $hasNewerVersion = version_compare($this->latestVersion, $this->currentVersion, '>');
-        $newVersionAvailable = (bool) data_get($settings, 'new_version_available', false);
+        $newVersionAvailable = (bool) $settings->new_version_available;
 
-        if ($settings && $newVersionAvailable && ! $hasNewerVersion) {
+        if ($newVersionAvailable && ! $hasNewerVersion) {
             $settings->update(['new_version_available' => false]);
             $newVersionAvailable = false;
         }
 
         $this->isUpgradeAvailable = $hasNewerVersion && $newVersionAvailable;
+    }
+
+    protected function instanceSettings(): InstanceSettings
+    {
+        return instanceSettings();
     }
 
     public function upgrade()

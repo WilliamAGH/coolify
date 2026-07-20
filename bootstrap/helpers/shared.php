@@ -1,5 +1,6 @@
 <?php
 
+use App\Actions\Server\UpdateCoolify;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\ProxyTypes;
 use App\Jobs\ServerFilesFromServerJob;
@@ -635,6 +636,10 @@ function get_route_parameters(): array
 function get_latest_sentinel_version(): string
 {
     try {
+        if (UpdateCoolify::isGuardedForkRelease(config('constants.coolify.version'))) {
+            return data_get(get_versions_data(), 'coolify.sentinel.version', '0.0.0');
+        }
+
         $response = Http::get(config('constants.coolify.versions_url'));
         $versions = $response->json();
 
@@ -3803,8 +3808,12 @@ function loggy($message = null, array $context = [])
 
     return app('log')->debug($message, $context);
 }
-function sslipDomainWarning(string $domains)
+function sslipDomainWarning(?string $domains): bool
 {
+    if (blank($domains)) {
+        return false;
+    }
+
     $domains = str($domains)->trim()->explode(',');
     $showSslipHttpsWarning = false;
     $domains->each(function ($domain) use (&$showSslipHttpsWarning) {

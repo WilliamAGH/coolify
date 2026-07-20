@@ -79,6 +79,7 @@ class InstanceSettings extends Model
         'is_auto_update_enabled' => 'boolean',
         'auto_update_frequency' => 'string',
         'update_check_frequency' => 'string',
+        'new_version_available' => 'boolean',
         'sentinel_token' => 'encrypted',
         'is_wire_navigate_enabled' => 'boolean',
         'is_mcp_server_enabled' => 'boolean',

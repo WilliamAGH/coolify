@@ -1,0 +1,372 @@
+name: Release operational acceptance
+
+on:
+  repository_dispatch:
+    types: [release-operational-acceptance]
+
+permissions: {}
+
+concurrency:
+  group: release-operational-acceptance
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    name: Authorize fixed disposable release scenario
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      artifact_name: ${{ steps.authorize.outputs.artifact_name }}
+      candidate_repository: ${{ steps.authorize.outputs.candidate_repository }}
+      expected_publish_result: ${{ steps.authorize.outputs.expected_publish_result }}
+      failure_mode: ${{ steps.authorize.outputs.failure_mode }}
+      publish_latest: ${{ steps.authorize.outputs.publish_latest }}
+      release_kind: ${{ steps.authorize.outputs.release_kind }}
+      scenario: ${{ steps.authorize.outputs.scenario }}
+      semantic_version: ${{ steps.authorize.outputs.semantic_version }}
+      source_sha: ${{ steps.authorize.outputs.source_sha }}
+      staging_alias: ${{ steps.authorize.outputs.staging_alias }}
+      target_repository: ${{ steps.authorize.outputs.target_repository }}
+    steps:
+      - id: authorize
+        name: Bind request to the protected default-branch source and fixed targets
+        env:
+          CLIENT_PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+          EVENT_ACTION: ${{ github.event.action }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          REQUESTED_SCENARIO: ${{ github.event.client_payload.scenario }}
+          REQUESTED_SOURCE_SHA: ${{ github.event.client_payload.source_sha }}
+        run: |
+          set -Eeuo pipefail
+
+          [[ "$GITHUB_REPOSITORY" == 'WilliamAGH/coolify' ]]
+          [[ "$GITHUB_EVENT_NAME" == 'repository_dispatch' ]]
+          [[ "$EVENT_ACTION" == 'release-operational-acceptance' ]]
+          [[ "$GITHUB_REF" == 'refs/heads/v4.x' ]]
+          [[ "$REF_PROTECTED" == true ]]
+          [[ "$REQUESTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$REQUESTED_SOURCE_SHA" == "$GITHUB_SHA" ]]
+          jq -e 'type == "object" and keys == ["scenario", "source_sha"]' <<< "$CLIENT_PAYLOAD" >/dev/null
+
+          artifact_name=''
+          candidate_repository=''
+          expected_publish_result=success
+          failure_mode=none
+          publish_latest=false
+          release_kind=''
+          semantic_version=''
+          staging_alias=''
+          target_repository=''
+
+          case "$REQUESTED_SCENARIO" in
+            issue7-staging-success)
+              artifact_name=coolify-operational-issue7
+              candidate_repository=williamagh/coolify-remediation-issue7-candidates
+              release_kind=staging
+              staging_alias=v4.x
+              target_repository=williamagh/coolify-remediation-issue7
+              ;;
+            issue7-staging-failed-build)
+              artifact_name=coolify-operational-issue7
+              candidate_repository=williamagh/coolify-remediation-issue7-candidates
+              expected_publish_result=failure
+              failure_mode=build-after-gates
+              release_kind=staging
+              staging_alias=v4.x
+              target_repository=williamagh/coolify-remediation-issue7
+              ;;
+            issue9-latest-bootstrap|issue9-latest-forward-repair)
+              artifact_name=coolify-operational-issue9
+              candidate_repository=williamagh/coolify-remediation-issue9-candidates
+              publish_latest=true
+              release_kind=production
+              semantic_version="0.0.0-operational.$GITHUB_RUN_ID"
+              target_repository=williamagh/coolify-remediation-issue9
+              ;;
+            issue9-latest-mixed|issue9-latest-malformed|issue9-latest-split)
+              artifact_name=coolify-operational-issue9
+              candidate_repository=williamagh/coolify-remediation-issue9-candidates
+              expected_publish_result=failure
+              publish_latest=true
+              release_kind=production
+              semantic_version="0.0.0-operational.$GITHUB_RUN_ID"
+              target_repository=williamagh/coolify-remediation-issue9
+              ;;
+            issue9-latest-compensation)
+              artifact_name=coolify-operational-issue9
+              candidate_repository=williamagh/coolify-remediation-issue9-candidates
+              expected_publish_result=failure
+              failure_mode=docker-alias-before-copy
+              publish_latest=true
+              release_kind=production
+              semantic_version="0.0.0-operational.$GITHUB_RUN_ID"
+              target_repository=williamagh/coolify-remediation-issue9
+              ;;
+            issue18-serialization)
+              artifact_name=coolify-operational-issue18
+              candidate_repository=williamagh/coolify-remediation-issue18-candidates
+              release_kind=staging
+              staging_alias=v4.x
+              target_repository=williamagh/coolify-remediation-issue18
+              ;;
+            *)
+              echo "Unknown operational acceptance scenario: $REQUESTED_SCENARIO" >&2
+              exit 1
+              ;;
+          esac
+
+          {
+            printf 'artifact_name=%s\n' "$artifact_name"
+            printf 'candidate_repository=%s\n' "$candidate_repository"
+            printf 'expected_publish_result=%s\n' "$expected_publish_result"
+            printf 'failure_mode=%s\n' "$failure_mode"
+            printf 'publish_latest=%s\n' "$publish_latest"
+            printf 'release_kind=%s\n' "$release_kind"
+            printf 'scenario=%s\n' "$REQUESTED_SCENARIO"
+            printf 'semantic_version=%s\n' "$semantic_version"
+            printf 'source_sha=%s\n' "$REQUESTED_SOURCE_SHA"
+            printf 'staging_alias=%s\n' "$staging_alias"
+            printf 'target_repository=%s\n' "$target_repository"
+          } >> "$GITHUB_OUTPUT"
+
+  fixture:
+    name: Prepare disposable registry state
+    needs: authorize
+    environment: release-operational-acceptance
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - name: Install registry client
+        uses: regclient/actions/regctl-installer@1b705e32d40851370799ea5814e83d0a5f6a70dc # v0.1.0
+        with:
+          release: v0.11.5
+      - name: Verify registry client bytes
+        run: |
+          set -eu
+          printf '%s  %s\n' c93aa7638749f5aaac1a8e01787321889c78f0101809bb2880343478d0ba0467 "$(command -v regctl)" | sha256sum --check --strict -
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          password: ${{ github.token }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+      - name: Login to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+      - name: Set up Buildx for disposable fixture sources
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      - name: Prepare and seed only the requested disposable acceptance fixture
+        env:
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+          SCENARIO: ${{ needs.authorize.outputs.scenario }}
+        run: |
+          set -Eeuo pipefail
+          case "$SCENARIO" in
+            issue7-staging-success|issue7-staging-failed-build)
+              issue=issue7
+              preset=staging-predecessor
+              ;;
+            issue9-latest-bootstrap)
+              issue=issue9
+              preset=latest-bootstrap
+              ;;
+            issue9-latest-mixed)
+              issue=issue9
+              preset=latest-mixed
+              ;;
+            issue9-latest-malformed)
+              issue=issue9
+              preset=latest-malformed
+              ;;
+            issue9-latest-split)
+              issue=issue9
+              preset=latest-split
+              ;;
+            issue9-latest-compensation)
+              issue=issue9
+              preset=latest-predecessor
+              ;;
+            issue9-latest-forward-repair)
+              issue=issue9
+              preset=forward-repair
+              ;;
+            issue18-serialization)
+              issue=issue18
+              preset=staging-predecessor
+              ;;
+            *)
+              echo "Unknown operational fixture scenario: $SCENARIO" >&2
+              exit 1
+              ;;
+          esac
+          scripts/release-operational-fixtures.sh prepare-sources "$issue" "$preset"
+          scripts/release-operational-fixtures.sh seed "$issue" "$preset"
+          scripts/release-operational-fixtures.sh verify-seed "$issue" "$preset"
+
+  publish:
+    name: Publish through the canonical reusable workflow
+    needs: [authorize, fixture]
+    concurrency:
+      group: release-operational-${{ needs.authorize.outputs.target_repository }}
+      cancel-in-progress: false
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    uses: ./.github/workflows/publish-linux-image.yml
+    with:
+      artifact_name: ${{ needs.authorize.outputs.artifact_name }}
+      candidate_repository: ${{ needs.authorize.outputs.candidate_repository }}
+      dockerfile: docker/production/Dockerfile
+      operational_acceptance: true
+      operational_failure_mode: ${{ needs.authorize.outputs.failure_mode }}
+      operational_scenario: ${{ needs.authorize.outputs.scenario }}
+      publish_latest: ${{ needs.authorize.outputs.publish_latest == 'true' }}
+      release_kind: ${{ needs.authorize.outputs.release_kind }}
+      semantic_version: ${{ needs.authorize.outputs.semantic_version }}
+      staging_alias: ${{ needs.authorize.outputs.staging_alias }}
+      target_repository: ${{ needs.authorize.outputs.target_repository }}
+      validate_only: false
+    secrets:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+
+  verify:
+    name: Verify operational acceptance evidence
+    if: ${{ always() && needs.authorize.result == 'success' && needs.fixture.result == 'success' }}
+    needs: [authorize, fixture, publish]
+    environment: release-operational-acceptance
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - name: Install registry client
+        uses: regclient/actions/regctl-installer@1b705e32d40851370799ea5814e83d0a5f6a70dc # v0.1.0
+        with:
+          release: v0.11.5
+      - name: Verify registry client bytes
+        run: |
+          set -eu
+          printf '%s  %s\n' c93aa7638749f5aaac1a8e01787321889c78f0101809bb2880343478d0ba0467 "$(command -v regctl)" | sha256sum --check --strict -
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          password: ${{ github.token }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+      - name: Login to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+      - name: Verify expected result and immutable registry evidence
+        env:
+          EXPECTED_PUBLISH_RESULT: ${{ needs.authorize.outputs.expected_publish_result }}
+          INDEX_DIGEST: ${{ needs.publish.outputs.digest }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          SCENARIO: ${{ needs.authorize.outputs.scenario }}
+          STAGING_DIGEST: ${{ needs.publish.outputs.staging_digest }}
+          STAGING_IMAGE: ${{ needs.publish.outputs.staging_image }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$PUBLISH_RESULT" == "$EXPECTED_PUBLISH_RESULT" ]]
+          case "$SCENARIO" in
+            issue7-staging-success)
+              [[ "$INDEX_DIGEST" == "$STAGING_DIGEST" ]]
+              [[ "$STAGING_IMAGE" == 'docker.io/williamagh/coolify-remediation-issue7:v4.x' ]]
+              scripts/release-operational-fixtures.sh verify-published issue7 staging-predecessor "$INDEX_DIGEST"
+              ;;
+            issue7-staging-failed-build)
+              scripts/release-operational-fixtures.sh verify-seed issue7 staging-predecessor
+              ;;
+            issue9-latest-bootstrap)
+              scripts/release-operational-fixtures.sh verify-published issue9 latest-bootstrap "$INDEX_DIGEST"
+              ;;
+            issue9-latest-mixed)
+              scripts/release-operational-fixtures.sh verify-seed issue9 latest-mixed
+              ;;
+            issue9-latest-malformed)
+              scripts/release-operational-fixtures.sh verify-seed issue9 latest-malformed
+              ;;
+            issue9-latest-split)
+              scripts/release-operational-fixtures.sh verify-seed issue9 latest-split
+              ;;
+            issue9-latest-compensation)
+              scripts/release-operational-fixtures.sh verify-seed issue9 latest-predecessor
+              ;;
+            issue9-latest-forward-repair)
+              scripts/release-operational-fixtures.sh verify-result issue9 forward-repair
+              ;;
+            issue18-serialization)
+              [[ "$INDEX_DIGEST" == "$STAGING_DIGEST" ]]
+              [[ "$STAGING_IMAGE" == 'docker.io/williamagh/coolify-remediation-issue18:v4.x' ]]
+              scripts/release-operational-fixtures.sh verify-published issue18 staging-predecessor "$INDEX_DIGEST"
+              ;;
+            *)
+              echo "Unknown operational verification scenario: $SCENARIO" >&2
+              exit 1
+              ;;
+          esac
+
+  cleanup:
+    name: Remove disposable fixture aliases
+    if: ${{ always() && needs.authorize.result == 'success' }}
+    needs: [authorize, fixture, publish, verify]
+    environment: release-operational-acceptance
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - name: Install registry client
+        uses: regclient/actions/regctl-installer@1b705e32d40851370799ea5814e83d0a5f6a70dc # v0.1.0
+        with:
+          release: v0.11.5
+      - name: Verify registry client bytes
+        run: |
+          set -eu
+          printf '%s  %s\n' c93aa7638749f5aaac1a8e01787321889c78f0101809bb2880343478d0ba0467 "$(command -v regctl)" | sha256sum --check --strict -
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          password: ${{ github.token }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+      - name: Login to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+      - name: Remove only scenario-owned disposable aliases
+        env:
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+          SCENARIO: ${{ needs.authorize.outputs.scenario }}
+        run: |
+          set -Eeuo pipefail
+          case "$SCENARIO" in
+            issue7-*) issue=issue7 ;;
+            issue9-*) issue=issue9 ;;
+            issue18-*) issue=issue18 ;;
+            *) echo "Unknown operational cleanup scenario: $SCENARIO" >&2; exit 1 ;;
+          esac
+          scripts/release-operational-fixtures.sh cleanup "$issue"

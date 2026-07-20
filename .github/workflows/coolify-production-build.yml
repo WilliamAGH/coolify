@@ -3,88 +3,100 @@ name: Production Build (v4)
 on:
   push:
     branches: ["v4.x"]
+    paths-ignore:
+      - .github/workflows/coolify-helper.yml
+      - .github/workflows/coolify-helper-next.yml
+      - .github/workflows/coolify-realtime.yml
+      - .github/workflows/coolify-realtime-next.yml
+      - .github/workflows/pr-quality.yaml
+      - docker/coolify-helper/**
+      - docker/coolify-realtime/**
+      - docker/testing-host/**
+      - CHANGELOG.md
 
-permissions:
-  contents: read
-  packages: write
-
-env:
-  GITHUB_REGISTRY: ghcr.io
-  DOCKER_REGISTRY: docker.io
-  IMAGE_NAME: "coollabsio/coolify"
+permissions: {}
 
 jobs:
-  build-push:
-    strategy:
-      matrix:
-        include:
-          - arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-24.04
-          - arch: aarch64
-            platform: linux/aarch64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+  application-validation:
+    name: Validate application before image publication
+    uses: ./.github/workflows/application-validation.yml
+    permissions:
+      contents: read
+
+  resolve-version:
+    name: Resolve production version
+    needs: application-validation
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    outputs:
+      should_publish: ${{ steps.version.outputs.should_publish }}
+      version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Login to ${{ env.GITHUB_REGISTRY }}
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.GITHUB_REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN  }}
-
-      - name: Login to ${{ env.DOCKER_REGISTRY }}
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.DOCKER_REGISTRY }}
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Build and Push Image (${{ matrix.arch }})
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/production/Dockerfile
-          platforms: ${{ matrix.platform }}
-          push: true
-          tags: |
-            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}-${{ matrix.arch }}
-            ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}-${{ matrix.arch }}
-
-  merge-manifest:
-    runs-on: ubuntu-24.04
-    needs: build-push
-    steps:
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Login to ${{ env.GITHUB_REGISTRY }}
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.GITHUB_REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN  }}
-
-      - name: Login to ${{ env.DOCKER_REGISTRY }}
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.DOCKER_REGISTRY }}
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Create & publish manifest on ${{ env.GITHUB_REGISTRY }}
+      - id: version
+        name: Read semantic version from bootstrap
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          SEMANTIC_VERSION_PATTERN: '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*))(\.((0|[1-9][0-9]*)|([0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?$'
         run: |
-          docker buildx imagetools create \
-          ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}-amd64 \
-          ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}-aarch64 \
-          --tag ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          set -eu
+          version="$(php bootstrap/getVersion.php)"
+          printf '%s' "$version" | grep -Eq "$SEMANTIC_VERSION_PATTERN"
+          [ "$(jq -er '.coolify.v4.version' versions.json)" = "$version" ]
 
-      - name: Create & publish manifest on ${{ env.DOCKER_REGISTRY }}
-        run: |
-          docker buildx imagetools create \
-          ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}-amd64 \
-          ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}-aarch64 \
-          --tag ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          should_publish=false
+          if printf '%s' "$BEFORE_SHA" | grep -Eq '^[0-9a-f]{40}$' &&
+            [ "$BEFORE_SHA" != '0000000000000000000000000000000000000000' ]; then
+            git cat-file -e "${BEFORE_SHA}^{commit}"
+            previous_constants="$RUNNER_TEMP/coolify-previous-constants.php"
+            git show "${BEFORE_SHA}:config/constants.php" > "$previous_constants"
+            # PHP receives its own positional arguments.
+            # shellcheck disable=SC2016
+            previous_version="$(php -r 'function env() { return null; } $constants = include $argv[1]; echo $constants["coolify"]["version"] ?? "";' "$previous_constants")"
+            printf '%s' "$previous_version" | grep -Eq "$SEMANTIC_VERSION_PATTERN"
+
+            # The serialized publisher decides whether this version is already
+            # present. Equal versions must reach it because GitHub may replace
+            # an intermediate pending bump run with a later unchanged push.
+            # shellcheck disable=SC2016
+            php -r 'exit(version_compare($argv[1], $argv[2], ">=") ? 0 : 1);' "$version" "$previous_version" || {
+              printf 'Production version must not decrease: %s -> %s\n' "$previous_version" "$version" >&2
+              exit 1
+            }
+            should_publish=true
+          fi
+
+          printf 'should_publish=%s\n' "$should_publish" >> "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Build and publish production Linux image
+    if: ${{ needs.resolve-version.outputs.should_publish == 'true' }}
+    needs: resolve-version
+    concurrency:
+      group: linux-image-release-coollabsio/coolify
+      cancel-in-progress: false
+    uses: ./.github/workflows/publish-linux-image.yml
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: write
+      id-token: write
+      packages: write
+    with:
+      artifact_name: coolify
+      candidate_repository: coollabsio/coolify-production-staging
+      dockerfile: docker/production/Dockerfile
+      publish_latest: true
+      release_kind: production
+      semantic_version: ${{ needs.resolve-version.outputs.version }}
+      target_repository: coollabsio/coolify
+      validate_only: ${{ github.repository != 'coollabsio/coolify' }}
+    secrets:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
