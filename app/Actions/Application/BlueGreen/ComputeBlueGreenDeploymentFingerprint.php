@@ -99,7 +99,7 @@ final class ComputeBlueGreenDeploymentFingerprint
             ->all();
 
         try {
-            $serialized = json_encode([
+            $topology = [
                 'version' => 1,
                 'application_id' => (int) $application->id,
                 'application_uuid' => (string) $application->uuid,
@@ -115,7 +115,12 @@ final class ComputeBlueGreenDeploymentFingerprint
                 'server_private_key_id' => (int) $server->private_key_id,
                 'server_proxy_type' => (string) $server->proxyType(),
                 'server_proxy_path' => $server->proxyPath(),
-            ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
+            ];
+            if ($application->build_pack === 'dockercompose') {
+                $topology['version'] = 2;
+                $topology['compose_routed_topology'] = $application->blueGreenTopologyFingerprintPayload();
+            }
+            $serialized = json_encode($topology, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
         } catch (JsonException $exception) {
             throw new BlueGreenDeploymentTransitionException(
                 'The blue-green destination topology could not be serialized.',

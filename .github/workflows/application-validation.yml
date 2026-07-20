@@ -159,6 +159,7 @@ jobs:
             tests/Feature/BlueGreenApplicationDeactivationTest.php \
             tests/Feature/BlueGreenContinuousAvailabilityAcceptanceTest.php \
             tests/Feature/BlueGreenCrashBoundaryAcceptanceTest.php \
+            tests/Feature/BlueGreenDockerComposeTopologyTest.php \
             tests/Feature/BlueGreenApplicationDeletionFenceTest.php \
             tests/Feature/BlueGreenApplicationDeletionOrchestrationTest.php \
             tests/Feature/BlueGreenCancellationCompensationTest.php \

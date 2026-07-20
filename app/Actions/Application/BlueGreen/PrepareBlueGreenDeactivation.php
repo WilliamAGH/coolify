@@ -130,6 +130,7 @@ final class PrepareBlueGreenDeactivation
             if ($destination->server->proxyType() !== ProxyTypes::TRAEFIK->value) {
                 throw new BlueGreenDeactivationException('The blue-green destination no longer uses Traefik; its state and containers were retained for intervention.');
             }
+            $composeSidecarRemovalPlan = (new RemoveBlueGreenComposeSidecars)->planFor($application);
 
             if ($state === null) {
                 return new BlueGreenDeactivationPreparation(
@@ -137,6 +138,7 @@ final class PrepareBlueGreenDeactivation
                     destination: $destination,
                     containerRemovalPlan: $this->fallbackRemovalPlan($application),
                     deactivation: $deactivation,
+                    composeSidecarRemovalPlan: $composeSidecarRemovalPlan,
                 );
             }
 
@@ -151,6 +153,7 @@ final class PrepareBlueGreenDeactivation
                 destination: $destination,
                 containerRemovalPlan: $containerRemovalPlan,
                 deactivation: $deactivation,
+                composeSidecarRemovalPlan: $composeSidecarRemovalPlan,
             );
         } catch (BlueGreenDeactivationException $exception) {
             return new BlueGreenDeactivationPreparation(
@@ -171,7 +174,7 @@ final class PrepareBlueGreenDeactivation
             blueRoutingRevision: null,
             greenContainerName: $application->uuid.'-green',
             greenRoutingRevision: null,
-            legacyContainerName: (string) $application->uuid,
+            legacyContainerName: $application->blueGreenLegacyRoutedContainerName() ?? (string) $application->uuid,
             stopGracePeriodSeconds: $application->settings->stopGracePeriodSeconds(),
         );
     }
@@ -199,10 +202,10 @@ final class PrepareBlueGreenDeactivation
             ->whereNull('green_deployment_uuid')
             ->whereNull('legacy_container_name')
             ->where('routing_revision', 0)
-            ->update(['legacy_container_name' => (string) $application->uuid]) !== 1) {
+            ->update(['legacy_container_name' => $application->blueGreenLegacyRoutedContainerName() ?? (string) $application->uuid]) !== 1) {
             throw new BlueGreenDeactivationInProgressException('The route-less blue-green state changed while its legacy container identity was adopted.');
         }
-        $state->legacy_container_name = (string) $application->uuid;
+        $state->legacy_container_name = $application->blueGreenLegacyRoutedContainerName() ?? (string) $application->uuid;
     }
 
     private function claimDeactivationFence(
