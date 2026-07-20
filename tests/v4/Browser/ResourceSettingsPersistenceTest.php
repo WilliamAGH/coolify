@@ -12,6 +12,7 @@ use App\Models\StandalonePostgresql;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Hash;
+use Pest\Browser\Api\PendingAwaitablePage;
 use Visus\Cuid2\Cuid2;
 
 uses(RefreshDatabase::class);
@@ -117,7 +118,11 @@ it('saves application name and enables static site with nginx config', function 
         ->fill('name', $updatedName)
         ->fill('customDockerRunOptions', '--read-only');
 
-    submitLivewireForm($page, 'Application settings updated!');
+    submitLivewireForm(
+        $page,
+        ['name' => $updatedName, 'customDockerRunOptions' => '--read-only'],
+        'Application settings updated!'
+    );
     $page->assertValue('name', $updatedName);
 
     $this->application->refresh();
@@ -157,7 +162,11 @@ it('saves database name and enables ssl with mode selector', function () {
         ->fill('name', $updatedDatabaseName)
         ->fill('description', 'Updated by browser test');
 
-    submitLivewireForm($page, 'Database updated.');
+    submitLivewireForm(
+        $page,
+        ['name' => $updatedDatabaseName, 'description' => 'Updated by browser test'],
+        'Database updated.'
+    );
     $page->click('[id^="enableSsl"]');
 
     $page->assertSee('SSL Mode')
@@ -176,125 +185,172 @@ it('saves database name and enables ssl with mode selector', function () {
         ->assertSee('SSL Mode');
 });
 
-function clickAndWaitForLivewireSuccess($page, string $selector, string $description): void
+function clickAndWaitForLivewireSuccess(PendingAwaitablePage $page, string $selector, string $description): void
 {
-    $result = $page->script(<<<'JAVASCRIPT'
-        ([selector, description]) => new Promise((resolve, reject) => {
+    $encodedSelector = json_encode($selector, JSON_THROW_ON_ERROR);
+    $componentId = $page->script(<<<JAVASCRIPT
+        () => {
+            const selector = {$encodedSelector};
             const element = document.querySelector(selector);
             if (!(element instanceof HTMLElement)) {
-                reject(new Error(`Unable to find element: ${selector}`));
-                return;
+                throw new Error(`Unable to find element: \${selector}`);
             }
-            const componentId = element.closest('[wire\\:id]')?.getAttribute('wire:id');
+            const componentId = element.closest('[wire\\\\:id]')?.getAttribute('wire:id');
             if (!componentId) {
-                reject(new Error(`Unable to find the Livewire component for: ${selector}`));
-                return;
+                throw new Error(`Unable to find the Livewire component for: \${selector}`);
             }
 
-            let settled = false;
-            let stopObservingCommits = () => {};
-            const finish = (callback) => {
-                if (settled) {
-                    return;
-                }
-
-                settled = true;
-                window.clearTimeout(timeout);
-                stopObservingCommits();
-                callback();
-            };
-            const timeout = window.setTimeout(() => {
-                finish(() => reject(new Error(`Timed out waiting for Livewire success: ${description}`)));
-            }, 10_000);
-            stopObservingCommits = window.Livewire.hook('commit', ({ component, fail, succeed }) => {
-                if (component.id !== componentId) {
-                    return;
-                }
-
-                fail(() => {
-                    finish(() => reject(new Error(`Livewire action transport failed: ${componentId}`)));
-                });
-                succeed(({ effects }) => {
-                    const dispatches = effects?.dispatches ?? [];
-                    const error = dispatches.find(({ name }) => name === 'error');
-                    if (error) {
-                        finish(() => reject(new Error(`Livewire action failed: ${error.params?.[0] ?? 'Unknown error'}`)));
-                        return;
-                    }
-                    if (!dispatches.some(({ name, params }) => name === 'success' && params?.[0] === description)) {
+            const pendingAction = new Promise((resolve, reject) => {
+                let settled = false;
+                let stopObservingCommits = () => {};
+                const finish = (callback) => {
+                    if (settled) {
                         return;
                     }
 
-                    finish(() => window.requestAnimationFrame(() => resolve(true)));
+                    settled = true;
+                    window.clearTimeout(timeout);
+                    stopObservingCommits();
+                    callback();
+                };
+                const timeout = window.setTimeout(() => {
+                    finish(() => reject(new Error(`Timed out waiting for Livewire action: \${componentId}`)));
+                }, 10_000);
+                stopObservingCommits = window.Livewire.hook('commit', ({ component, fail, succeed }) => {
+                    if (component.id !== componentId) {
+                        return;
+                    }
+
+                    fail(() => {
+                        finish(() => reject(new Error(`Livewire action failed: \${componentId}`)));
+                    });
+                    succeed(({ effects }) => {
+                        finish(() => window.requestAnimationFrame(() => resolve({
+                            componentId,
+                            dispatches: effects.dispatches ?? [],
+                        })));
+                    });
                 });
             });
-            element.click();
-        })
-        JAVASCRIPT, [$selector, $description]);
 
-    expect($result)->toBeTrue();
+            pendingAction.catch(() => {});
+            window.__pestResourceSettingsAction = pendingAction;
+
+            return componentId;
+        }
+        JAVASCRIPT);
+
+    expect($componentId)->toBeString()->not->toBeEmpty();
+    $page->click($selector);
+
+    $result = $page->script(<<<'JAVASCRIPT'
+        async () => {
+            try {
+                return await window.__pestResourceSettingsAction;
+            } finally {
+                delete window.__pestResourceSettingsAction;
+            }
+        }
+        JAVASCRIPT);
+
+    assertLivewireSuccess($result, $componentId, $description);
 }
 
-function submitLivewireForm($page, string $successDescription): void
-{
-    $result = $page->script(<<<'JAVASCRIPT'
-        ([successDescription]) => new Promise((resolve, reject) => {
+/**
+ * @param  array<string, string>  $expectedUpdates
+ */
+function submitLivewireForm(
+    PendingAwaitablePage $page,
+    array $expectedUpdates,
+    string $expectedSuccessMessage
+): void {
+    $componentId = $page->script(<<<'JAVASCRIPT'
+        () => {
             const form = document.querySelector('input[name="name"]')?.closest('form[wire\\:submit="submit"]');
             if (!(form instanceof HTMLFormElement)) {
-                reject(new Error('Unable to find the canonical Livewire settings form.'));
-                return;
+                throw new Error('Unable to find the canonical Livewire settings form.');
             }
             const componentId = form.closest('[wire\\:id]')?.getAttribute('wire:id');
             if (!componentId) {
-                reject(new Error('Unable to find the canonical Livewire settings component.'));
-                return;
+                throw new Error('Unable to find the canonical Livewire settings component.');
             }
 
-            let settled = false;
-            let stopObservingCommits = () => {};
-            const finish = (callback) => {
-                if (settled) {
-                    return;
-                }
-
-                settled = true;
-                window.clearTimeout(timeout);
-                stopObservingCommits();
-                callback();
-            };
-            const timeout = window.setTimeout(() => {
-                finish(() => reject(new Error(`Timed out waiting for settings to save: ${successDescription}`)));
-            }, 10_000);
-            stopObservingCommits = window.Livewire.hook('commit', ({ component, commit, fail, succeed }) => {
-                if (
-                    component.id !== componentId
-                    || !commit.calls.some((call) => call.method === 'submit')
-                ) {
-                    return;
-                }
-
-                fail(() => {
-                    finish(() => reject(new Error(`Livewire submit transport failed: ${componentId}`)));
-                });
-                succeed(({ effects }) => {
-                    const dispatches = effects?.dispatches ?? [];
-                    const error = dispatches.find(({ name }) => name === 'error');
-                    if (error) {
-                        finish(() => reject(new Error(`Settings save failed: ${error.params?.[0] ?? 'Unknown error'}`)));
-                        return;
-                    }
-                    if (!dispatches.some(({ name, params }) => name === 'success' && params?.[0] === successDescription)) {
-                        finish(() => reject(new Error(`Settings save completed without expected success: ${successDescription}`)));
+            const pendingSubmit = new Promise((resolve, reject) => {
+                let settled = false;
+                let stopObservingCommits = () => {};
+                const finish = (callback) => {
+                    if (settled) {
                         return;
                     }
 
-                    finish(() => window.requestAnimationFrame(() => resolve(true)));
+                    settled = true;
+                    window.clearTimeout(timeout);
+                    stopObservingCommits();
+                    callback();
+                };
+                const timeout = window.setTimeout(() => {
+                    finish(() => reject(new Error(`Timed out waiting for Livewire submit: ${componentId}`)));
+                }, 10_000);
+                stopObservingCommits = window.Livewire.hook('commit', ({ component, commit, succeed, fail }) => {
+                    if (
+                        component.id !== componentId
+                        || !commit.calls.some((call) => call.method === 'submit')
+                    ) {
+                        return;
+                    }
+
+                    fail(() => {
+                        finish(() => reject(new Error(`Livewire submit failed: ${componentId}`)));
+                    });
+                    succeed(({ effects }) => {
+                        finish(() => window.requestAnimationFrame(() => resolve({
+                            componentId,
+                            updates: commit.updates,
+                            dispatches: effects.dispatches ?? [],
+                        })));
+                    });
                 });
             });
 
-            form.requestSubmit();
-        })
-        JAVASCRIPT, [$successDescription]);
+            pendingSubmit.catch(() => {});
+            window.__pestResourceSettingsSubmit = pendingSubmit;
 
-    expect($result)->toBeTrue();
+            return componentId;
+        }
+        JAVASCRIPT);
+
+    expect($componentId)->toBeString()->not->toBeEmpty();
+    $page->click('form[wire\\:submit="submit"] > div:first-child > button[type="submit"]');
+
+    $result = $page->script(<<<'JAVASCRIPT'
+        async () => {
+            try {
+                return await window.__pestResourceSettingsSubmit;
+            } finally {
+                delete window.__pestResourceSettingsSubmit;
+            }
+        }
+        JAVASCRIPT);
+
+    expect($result['updates'])->toBeArray();
+    foreach ($expectedUpdates as $property => $expectedValue) {
+        expect($result['updates'])->toHaveKey($property, $expectedValue);
+    }
+
+    assertLivewireSuccess($result, $componentId, $expectedSuccessMessage);
+}
+
+/** @param  array{componentId: string, dispatches: array<int, array<string, mixed>>}  $result */
+function assertLivewireSuccess(array $result, string $componentId, string $expectedSuccessMessage): void
+{
+    expect($result['componentId'])->toBe($componentId);
+
+    $dispatches = collect($result['dispatches']);
+    $errorDispatches = $dispatches->where('name', 'error')->values()->all();
+    $successDispatch = $dispatches->first(fn (array $dispatch): bool => data_get($dispatch, 'name') === 'success'
+        && data_get($dispatch, 'params.0') === $expectedSuccessMessage);
+
+    expect($errorDispatches)->toBeEmpty(
+        'Unexpected Livewire error dispatches: '.json_encode($errorDispatches, JSON_THROW_ON_ERROR)
+    )->and($successDispatch)->not->toBeNull();
 }
