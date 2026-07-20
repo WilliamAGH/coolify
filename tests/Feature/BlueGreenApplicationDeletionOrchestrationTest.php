@@ -18,6 +18,28 @@ use Tests\Support\BlueGreenDeactivationScenario;
 
 uses(RefreshDatabase::class);
 
+it('rolls back the initial tombstone when an intervention-owned promotion blocks deletion', function (): void {
+    ['application' => $application, 'destination' => $destination] = BlueGreenDeactivationScenario::context();
+    $state = BlueGreenDeactivationScenario::routeLessState($application, $destination);
+    $state->update([
+        'phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+        'intervention_phase' => BlueGreenDeploymentPhase::PREPARING->value,
+        'intervention_reason' => 'The exact promotion owner requires operator recovery.',
+    ]);
+    $deletedAt = Application::withTrashed()->findOrFail($application->id)->getRawOriginal('deleted_at');
+    $stateAttributes = $state->fresh()->getAttributes();
+    Process::fake();
+
+    expect(fn () => (new DeactivateBlueGreenApplication)->beginDeletion($application))
+        ->toThrow(BlueGreenDeactivationInProgressException::class, 'must recover or finish');
+
+    expect(Application::withTrashed()->findOrFail($application->id)->getRawOriginal('deleted_at'))
+        ->toBe($deletedAt)
+        ->and($state->fresh()->getAttributes())->toBe($stateAttributes)
+        ->and(ApplicationBlueGreenDeactivation::query()->doesntExist())->toBeTrue();
+    Process::assertNothingRan();
+});
+
 it('leaves every durable deletion owner untouched when a canonical destination lock is held', function () {
     ['application' => $application, 'destination' => $destination, 'server' => $server] = BlueGreenDeactivationScenario::context();
     Process::fake();

@@ -329,3 +329,37 @@ it('requires unversioned active owners to drain before generation expansion', fu
     expect(fn () => $migration->up())
         ->toThrow(RuntimeException::class, 'must drain before supersession-generation expansion');
 });
+
+it('replays bounded public intervention reasons for both durable blue-green owners', function (): void {
+    Schema::create('application_blue_green_deployments', function (Blueprint $table): void {
+        $table->id();
+    });
+    Schema::create('application_blue_green_deactivations', function (Blueprint $table): void {
+        $table->id();
+    });
+
+    $migration = require database_path('migrations/2026_07_20_000100_add_blue_green_intervention_reasons.php');
+    $migration->up();
+    $migration->up();
+
+    expect(Schema::hasColumns('application_blue_green_deployments', ['intervention_phase', 'intervention_reason']))->toBeTrue()
+        ->and(Schema::hasColumns('application_blue_green_deactivations', ['intervention_phase', 'intervention_reason']))->toBeTrue()
+        ->and(fn () => $migration->down())
+        ->toThrow(RuntimeException::class, 'Control-plane expand migration is forward-only: 2026_07_20_000100_add_blue_green_intervention_reasons.');
+});
+
+it('rejects malformed intervention-reason columns instead of accepting an unsafe public surface', function (): void {
+    Schema::create('application_blue_green_deployments', function (Blueprint $table): void {
+        $table->id();
+        $table->string('intervention_phase', 32)->nullable();
+        $table->integer('intervention_reason')->nullable();
+    });
+    Schema::create('application_blue_green_deactivations', function (Blueprint $table): void {
+        $table->id();
+    });
+
+    $migration = require database_path('migrations/2026_07_20_000100_add_blue_green_intervention_reasons.php');
+
+    expect(fn () => $migration->up())
+        ->toThrow(RuntimeException::class, 'authorized SQLite schema');
+});

@@ -99,6 +99,152 @@ final class StoreControlPlaneGenerationPromotionState
         }, 3);
     }
 
+    public function heartbeatFreeze(
+        Server $server,
+        string $operationId,
+        string $token,
+        int $expectedWriterEpoch,
+        int $leaseSeconds,
+        ?string $expectedFreezeFence,
+        string $nextFreezeFence,
+        string $timestamp,
+    ): ControlPlaneGenerationPromotionState {
+        return DB::transaction(function () use ($server, $operationId, $token, $expectedWriterEpoch, $leaseSeconds, $expectedFreezeFence, $nextFreezeFence, $timestamp): ControlPlaneGenerationPromotionState {
+            $lockedServer = $this->lockServer($server);
+            $current = $this->readFrom($lockedServer)
+                ?? throw new RuntimeException('The durable control-plane generation promotion state is missing.');
+            if (! $current->isOwnedBy($operationId, $token)
+                || $current->writerEpoch !== $expectedWriterEpoch
+                || $current->mutationFreeze === null
+                || ! hash_equals($operationId, $current->mutationFreeze['operation_id'])
+                || ($current->mutationFreeze['fence'] ?? null) !== $expectedFreezeFence) {
+                throw new RuntimeException('The durable control-plane generation mutation freeze owner changed before its heartbeat was recorded.');
+            }
+
+            $next = $current->withFreezeHeartbeat($timestamp, $leaseSeconds, $nextFreezeFence);
+            $this->writeTo($lockedServer, $next);
+
+            return $next;
+        }, 3);
+    }
+
+    public function markFreezeAlertedForExpectedState(
+        Server $server,
+        ControlPlaneGenerationPromotionState $expectedState,
+        string $timestamp,
+    ): bool {
+        return DB::transaction(function () use ($server, $expectedState, $timestamp): bool {
+            $lockedServer = $this->lockServer($server);
+            $current = $this->readFrom($lockedServer);
+            if ($current === null
+                || $current->operationId !== $expectedState->operationId
+                || ! hash_equals($current->tokenSha256, $expectedState->tokenSha256)
+                || $current->writerEpoch !== $expectedState->writerEpoch
+                || $current->phase !== $expectedState->phase
+                || $current->mutationFreeze !== $expectedState->mutationFreeze
+                || $current->mutationFreeze === null
+                || array_key_exists('alerted_at', $current->mutationFreeze)
+                || in_array($current->phase, [
+                    ControlPlaneGenerationPromotionPhase::Completed,
+                    ControlPlaneGenerationPromotionPhase::RolledBack,
+                    ControlPlaneGenerationPromotionPhase::InterventionRequired,
+                ], true)) {
+                return false;
+            }
+
+            $this->writeTo($lockedServer, $current->withFreezeAlert($timestamp));
+
+            return true;
+        }, 3);
+    }
+
+    public function requireIntervention(
+        Server $server,
+        string $operationId,
+        string $token,
+        int $expectedWriterEpoch,
+        string $reason,
+        string $timestamp,
+    ): bool {
+        if (preg_match('/\A[^\r\n]{1,2048}\z/D', $reason) !== 1) {
+            throw new RuntimeException('The control-plane generation intervention reason is invalid.');
+        }
+
+        return DB::transaction(function () use ($server, $operationId, $token, $expectedWriterEpoch, $reason, $timestamp): bool {
+            $lockedServer = $this->lockServer($server);
+            $current = $this->readFrom($lockedServer)
+                ?? throw new RuntimeException('The durable control-plane generation promotion state is missing.');
+            if (! $current->isOwnedBy($operationId, $token)
+                || $current->writerEpoch !== $expectedWriterEpoch) {
+                throw new RuntimeException('The durable control-plane generation promotion owner changed before intervention could be recorded.');
+            }
+            if (in_array($current->phase, [
+                ControlPlaneGenerationPromotionPhase::Completed,
+                ControlPlaneGenerationPromotionPhase::RolledBack,
+                ControlPlaneGenerationPromotionPhase::InterventionRequired,
+            ], true)) {
+                return false;
+            }
+
+            $next = $current->withPhase(
+                ControlPlaneGenerationPromotionPhase::InterventionRequired,
+                $timestamp,
+                [
+                    'last_error' => $reason,
+                    'last_error_at' => $timestamp,
+                    'intervention_required_at' => $timestamp,
+                ],
+            );
+            $this->writeTo($lockedServer, $next);
+
+            return true;
+        }, 3);
+    }
+
+    public function requireInterventionForExpectedState(
+        Server $server,
+        ControlPlaneGenerationPromotionState $expectedState,
+        string $reason,
+        string $timestamp,
+    ): bool {
+        if (preg_match('/\A[^\r\n]{1,2048}\z/D', $reason) !== 1) {
+            throw new RuntimeException('The control-plane generation intervention reason is invalid.');
+        }
+
+        return DB::transaction(function () use ($server, $expectedState, $reason, $timestamp): bool {
+            $lockedServer = $this->lockServer($server);
+            $current = $this->readFrom($lockedServer);
+            if ($current === null
+                || $current->operationId !== $expectedState->operationId
+                || ! hash_equals($current->tokenSha256, $expectedState->tokenSha256)
+                || $current->writerEpoch !== $expectedState->writerEpoch
+                || $current->phase !== $expectedState->phase
+                || $current->mutationFreeze !== $expectedState->mutationFreeze) {
+                return false;
+            }
+            if (in_array($current->phase, [
+                ControlPlaneGenerationPromotionPhase::Completed,
+                ControlPlaneGenerationPromotionPhase::RolledBack,
+                ControlPlaneGenerationPromotionPhase::InterventionRequired,
+            ], true)) {
+                return false;
+            }
+
+            $next = $current->withPhase(
+                ControlPlaneGenerationPromotionPhase::InterventionRequired,
+                $timestamp,
+                [
+                    'last_error' => $reason,
+                    'last_error_at' => $timestamp,
+                    'intervention_required_at' => $timestamp,
+                ],
+            );
+            $this->writeTo($lockedServer, $next);
+
+            return true;
+        }, 3);
+    }
+
     public function reconcileLegacyRollbackWriterAuthority(
         Server $server,
         string $operationId,

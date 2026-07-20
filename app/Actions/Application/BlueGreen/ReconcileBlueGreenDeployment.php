@@ -26,6 +26,8 @@ final class ReconcileBlueGreenDeployment
     public function handle(
         ApplicationBlueGreenDeployment $state,
         int $staleAfterSeconds = 300,
+        bool $ignoreQueueActivity = false,
+        ?BlueGreenOperationFence $operationFence = null,
     ): BlueGreenReconciliationResult {
         if ($staleAfterSeconds < 1) {
             throw new \InvalidArgumentException('The reconciliation stale window must be positive.');
@@ -70,20 +72,25 @@ final class ReconcileBlueGreenDeployment
         $expectedOperationUuid = $state->operation_deployment_uuid ?? $state->pending_deployment_uuid;
         $expectedGeneration = $state->supersession_generation;
         $expectedPhase = $state->phase;
-        $lock = Cache::lock(
-            BlueGreenDeploymentLock::key($state->application_id, $state->standalone_docker_id),
-            BlueGreenDeploymentLock::RENEWABLE_LEASE_SECONDS,
-        );
-        if (! $lock->get()) {
-            return new BlueGreenReconciliationResult(
-                $stateId,
-                BlueGreenReconciliationResult::DEFERRED,
-                'Another lifecycle owner holds the blue-green reconciliation lock.',
+        $releaseOperationFence = false;
+        if ($operationFence === null) {
+            $lock = Cache::lock(
+                BlueGreenDeploymentLock::key($state->application_id, $state->standalone_docker_id),
+                BlueGreenDeploymentLock::RENEWABLE_LEASE_SECONDS,
             );
+            if (! $lock->get()) {
+                return new BlueGreenReconciliationResult(
+                    $stateId,
+                    BlueGreenReconciliationResult::DEFERRED,
+                    'Another lifecycle owner holds the blue-green reconciliation lock.',
+                );
+            }
+            $operationFence = new BlueGreenOperationFence($lock, BlueGreenDeploymentLock::RENEWABLE_LEASE_SECONDS);
+            $releaseOperationFence = true;
         }
-        $operationFence = new BlueGreenOperationFence($lock, BlueGreenDeploymentLock::RENEWABLE_LEASE_SECONDS);
 
         try {
+            $operationFence->assertLockOwnership();
             $state = ApplicationBlueGreenDeployment::query()->find($stateId);
             if ($state === null) {
                 return new BlueGreenReconciliationResult(
@@ -132,7 +139,9 @@ final class ReconcileBlueGreenDeployment
                 ->where('application_id', $state->application_id)
                 ->where('deployment_uuid', $expectedOperationUuid)
                 ->first();
-            if ($deployment !== null && BlueGreenDeploymentQueueActivity::run($deployment, $staleAfterSeconds)) {
+            if ($deployment !== null
+                && ! $ignoreQueueActivity
+                && BlueGreenDeploymentQueueActivity::run($deployment, $staleAfterSeconds)) {
                 return new BlueGreenReconciliationResult(
                     $stateId,
                     BlueGreenReconciliationResult::DEFERRED,
@@ -229,10 +238,12 @@ final class ReconcileBlueGreenDeployment
                 );
             }
         } finally {
-            try {
-                $operationFence->releaseIfOwned();
-            } catch (Throwable $exception) {
-                report($exception);
+            if ($releaseOperationFence) {
+                try {
+                    $operationFence->releaseIfOwned();
+                } catch (Throwable $exception) {
+                    report($exception);
+                }
             }
         }
     }
@@ -519,6 +530,7 @@ final class ReconcileBlueGreenDeployment
             $stateId,
             $expectedOperationUuid,
             $expectedGeneration,
+            $message,
         )) {
             return new BlueGreenReconciliationResult(
                 $stateId,

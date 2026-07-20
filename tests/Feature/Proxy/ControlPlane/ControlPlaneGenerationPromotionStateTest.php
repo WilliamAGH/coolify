@@ -8,10 +8,12 @@ use App\Actions\Proxy\ControlPlane\ControlPlaneGenerationWriterAuthority;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentPhase;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentState;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyExposure;
+use App\Actions\Proxy\ControlPlane\ReapStaleControlPlaneMutationFreezes;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneGenerationPromotionState;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
 use App\Models\Server;
 use App\Models\Team;
+use App\Support\ProxyMutationQueue;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 
 uses(RefreshDatabase::class);
@@ -218,6 +220,89 @@ it('serializes a strict canonical promotion state without retaining the raw toke
             ...$serialized,
             'writer' => [...$serialized['writer'], 'epoch' => 1],
         ]))->toThrow(InvalidArgumentException::class, 'writer epoch');
+});
+
+it('records a stale freeze alert once and clears it after a new heartbeat', function (): void {
+    $server = Server::factory()->create(['team_id' => Team::factory()->create()->id]);
+    $leaseSeconds = ProxyMutationQueue::MINIMUM_FREEZE_LEASE_SECONDS;
+    $freezeFence = 'fence-state-alert';
+    $state = switchingGenerationPromotionState(generationPromotionState($server))
+        ->withFreezeHeartbeat('2026-07-19T12:08:00Z', $leaseSeconds, $freezeFence)
+        ->withFreezeAlert('2026-07-19T12:09:00Z');
+
+    expect($state->mutationFreeze)->toMatchArray([
+        'operation_id' => $state->operationId,
+        'heartbeat_at' => '2026-07-19T12:08:00Z',
+        'lease_seconds' => $leaseSeconds,
+        'fence' => $freezeFence,
+        'alerted_at' => '2026-07-19T12:09:00Z',
+    ])
+        ->and(ControlPlaneGenerationPromotionState::fromArray($state->toArray())->mutationFreeze)
+        ->toBe($state->mutationFreeze)
+        ->and($state->withFreezeHeartbeat('2026-07-19T12:10:00Z', $leaseSeconds, $freezeFence)->mutationFreeze)
+        ->not->toHaveKey('alerted_at');
+});
+
+it('rejects persisted bounded mutation-freeze evidence shorter than the canonical lease', function (): void {
+    $server = Server::factory()->create(['team_id' => Team::factory()->create()->id]);
+    $state = switchingGenerationPromotionState(generationPromotionState($server))
+        ->withFreezeHeartbeat(
+            '2026-07-19T12:08:00Z',
+            ProxyMutationQueue::MINIMUM_FREEZE_LEASE_SECONDS,
+            'fence-too-short-persisted-lease',
+        );
+    $serialized = $state->toArray();
+    $serialized['mutation_freeze']['lease_seconds'] = ProxyMutationQueue::MINIMUM_FREEZE_LEASE_SECONDS - 1;
+
+    expect(fn () => ControlPlaneGenerationPromotionState::fromArray($serialized))
+        ->toThrow(InvalidArgumentException::class, 'mutation freeze lease is invalid');
+});
+
+it('fails closed into intervention when a stale durable mutation-freeze owner has disappeared', function (): void {
+    $server = Server::factory()->create(['team_id' => Team::factory()->create()->id]);
+    $state = switchingGenerationPromotionState(generationPromotionState(
+        $server,
+        operationId: 'stale-freeze-reaper-owner',
+    ))->withFreezeHeartbeat(
+        '2026-07-19T12:08:00Z',
+        ProxyMutationQueue::MINIMUM_FREEZE_LEASE_SECONDS,
+        'stale-freeze-reaper-fence',
+    );
+    $server->proxy->set(StoreControlPlaneGenerationPromotionState::STATE_KEY, $state->toArray());
+    $server->save();
+
+    $findings = (new ReapStaleControlPlaneMutationFreezes(new StoreControlPlaneGenerationPromotionState))
+        ->handle(ProxyMutationQueue::MINIMUM_FREEZE_LEASE_SECONDS);
+    $persisted = (new StoreControlPlaneGenerationPromotionState)->read($server);
+
+    expect($findings)->toBe(1)
+        ->and($persisted?->phase)->toBe(ControlPlaneGenerationPromotionPhase::InterventionRequired)
+        ->and($persisted?->lastError)->toBe(
+            'The bounded proxy-mutation freeze lease expired before the control-plane operation completed.',
+        );
+});
+
+it('does not mark a renewed mutation-freeze owner as stale from an older observation', function (): void {
+    $server = Server::factory()->create(['team_id' => Team::factory()->create()->id]);
+    $leaseSeconds = ProxyMutationQueue::MINIMUM_FREEZE_LEASE_SECONDS;
+    $freezeFence = 'fence-state-renewal';
+    $observed = switchingGenerationPromotionState(generationPromotionState($server))
+        ->withFreezeHeartbeat('2026-07-19T12:08:00Z', $leaseSeconds, $freezeFence);
+    $renewed = $observed->withFreezeHeartbeat('2026-07-19T12:09:00Z', $leaseSeconds, $freezeFence);
+    $server->proxy->set(StoreControlPlaneGenerationPromotionState::STATE_KEY, $renewed->toArray());
+    $server->save();
+
+    $recorded = (new StoreControlPlaneGenerationPromotionState)
+        ->requireInterventionForExpectedState(
+            $server,
+            $observed,
+            'The original stale observation must not override a renewed owner.',
+            '2026-07-19T12:10:00Z',
+        );
+
+    expect($recorded)->toBeFalse()
+        ->and((new StoreControlPlaneGenerationPromotionState)->read($server)?->phase)
+        ->toBe(ControlPlaneGenerationPromotionPhase::Switching);
 });
 
 it('enforces safe phase transitions and durable rollback timestamps', function () {

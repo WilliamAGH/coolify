@@ -150,11 +150,17 @@ function rollbackControlPlaneGenerationIsolatedQueue(Server $server): array
         }
     });
 
+    rollbackControlPlaneGenerationPersistFixtureFreeze($server, $queue);
+
     $cleanup = static function (string $operationId) use ($queue, $queueKey, $originalQueueManager): void {
         try {
             $snapshot = ProxyMutationQueue::snapshot($queue);
             if ($snapshot->freezeOperationId === $operationId) {
-                ProxyMutationQueue::unfreeze($operationId, $queue);
+                ProxyMutationQueue::unfreeze(
+                    $operationId,
+                    $queue,
+                    $snapshot->freezeFence ?? throw new RuntimeException('The rollback fixture freeze did not issue a fence.'),
+                );
             }
         } finally {
             try {
@@ -171,6 +177,31 @@ function rollbackControlPlaneGenerationIsolatedQueue(Server $server): array
     };
 
     return [$queue, $cleanup];
+}
+
+function rollbackControlPlaneGenerationPersistFixtureFreeze(Server $server, ProxyMutationRedisQueue $queue): void
+{
+    $promotionStore = new StoreControlPlaneGenerationPromotionState;
+    $state = $promotionStore->read($server)
+        ?? throw new RuntimeException('The rollback fixture promotion state is missing.');
+    $leaseSeconds = ProxyMutationQueue::freezeLeaseSeconds();
+    $snapshot = ProxyMutationQueue::freeze($state->operationId, $queue, leaseSeconds: $leaseSeconds);
+    $freezeFence = $snapshot->freezeFence
+        ?? throw new RuntimeException('The rollback fixture freeze did not issue a fence.');
+    $payload = $state->toArray();
+    $observedAt = $state->mutationFreeze['observed_at'] ?? $state->updatedAt;
+    $payload['mutation_freeze'] = [
+        'operation_id' => $state->operationId,
+        'observed_at' => $observedAt,
+        'fence' => $freezeFence,
+        'heartbeat_at' => $state->updatedAt,
+        'lease_seconds' => $leaseSeconds,
+    ];
+    $payload['updated_at'] = $state->updatedAt;
+    $fixtureServer = $server->fresh()
+        ?? throw new RuntimeException('The rollback fixture server disappeared.');
+    $fixtureServer->proxy->set(StoreControlPlaneGenerationPromotionState::STATE_KEY, $payload);
+    $fixtureServer->save();
 }
 
 /** @param array{promotion_store: StoreControlPlaneGenerationPromotionState, server: Server, promotion: ControlPlaneGenerationPromotionState, token: string} $fixture */
@@ -682,7 +713,12 @@ it('completes rollback unfreezing after its live freeze was released and new que
             '2026-07-19T12:08:02Z',
             ['rollback_acknowledged_at' => '2026-07-19T12:08:02Z'],
         );
-        ProxyMutationQueue::unfreeze($switching->operationId, $queue);
+        $releasedSnapshot = ProxyMutationQueue::snapshot($queue);
+        ProxyMutationQueue::unfreeze(
+            $switching->operationId,
+            $queue,
+            $releasedSnapshot->freezeFence ?? throw new RuntimeException('The rollback fixture freeze did not issue a fence.'),
+        );
         $queue->getConnection()->rpush($queue->getQueue(ProxyMutationQueue::NAME), 'admitted-after-rollback-unfreeze');
 
         $rolledBack = rollbackControlPlaneGenerationAction($fixture)->handle(
@@ -739,7 +775,11 @@ it('completes replay after its own freeze was released following route acknowled
             '2026-07-19T12:08:00Z',
             ['rollback_acknowledged_at' => '2026-07-19T12:08:00Z'],
         );
-        ProxyMutationQueue::unfreeze($switching->operationId);
+        $releasedSnapshot = ProxyMutationQueue::snapshot();
+        ProxyMutationQueue::unfreeze(
+            $switching->operationId,
+            expectedFence: $releasedSnapshot->freezeFence ?? throw new RuntimeException('The rollback fixture freeze did not issue a fence.'),
+        );
         $recovered = rollbackControlPlaneGenerationAction($fixture)->handle(
             $fixture['server'],
             $switching->operationId,
@@ -761,9 +801,14 @@ it('fails closed when a recorded pre-write freeze is missing or a foreign operat
     $missingRemoteCalls = 0;
     $foreignOperationId = 'foreign-generation-freeze';
     $foreignRemoteCalls = 0;
-    [, $cleanup] = rollbackControlPlaneGenerationIsolatedQueue($missingFixture['server']);
+    [$queue, $cleanup] = rollbackControlPlaneGenerationIsolatedQueue($missingFixture['server']);
 
     try {
+        $missingSnapshot = ProxyMutationQueue::snapshot();
+        ProxyMutationQueue::unfreeze(
+            $frozen->operationId,
+            expectedFence: $missingSnapshot->freezeFence ?? throw new RuntimeException('The rollback fixture freeze did not issue a fence.'),
+        );
         expect(fn (): ControlPlaneGenerationPromotionState => rollbackControlPlaneGenerationAction($missingFixture)->handle(
             $missingFixture['server'],
             $frozen->operationId,
@@ -774,13 +819,20 @@ it('fails closed when a recorded pre-write freeze is missing or a foreign operat
 
                 throw new RuntimeException('Unexpected route proof.');
             },
-        ))->toThrow(RuntimeException::class, 'freeze is missing');
+        ))->toThrow(RuntimeException::class, 'no longer frozen by its owning operation');
         expect($missingRemoteCalls)->toBe(0)
             ->and($missingFixture['promotion_store']->read($missingFixture['server'])?->phase)
-            ->toBe(ControlPlaneGenerationPromotionPhase::RollingBack);
+            ->toBe(ControlPlaneGenerationPromotionPhase::Frozen);
 
         $foreignFixture = rollbackControlPlaneGenerationFixture();
-        ProxyMutationQueue::freeze($foreignOperationId);
+        rollbackControlPlaneGenerationPersistFixtureFreeze($foreignFixture['server'], $queue);
+        $ownedForeignSnapshot = ProxyMutationQueue::snapshot($queue);
+        ProxyMutationQueue::unfreeze(
+            $foreignFixture['promotion']->operationId,
+            $queue,
+            $ownedForeignSnapshot->freezeFence ?? throw new RuntimeException('The foreign rollback fixture freeze did not issue a fence.'),
+        );
+        ProxyMutationQueue::freeze($foreignOperationId, $queue);
         expect(fn (): ControlPlaneGenerationPromotionState => rollbackControlPlaneGenerationAction($foreignFixture)->handle(
             $foreignFixture['server'],
             $foreignFixture['promotion']->operationId,
@@ -791,10 +843,10 @@ it('fails closed when a recorded pre-write freeze is missing or a foreign operat
 
                 throw new RuntimeException('Unexpected foreign-freeze route proof.');
             },
-        ))->toThrow(RuntimeException::class, 'owned by another operation');
+        ))->toThrow(RuntimeException::class, 'can only be renewed by its owning operation');
         expect($foreignRemoteCalls)->toBe(0)
             ->and($foreignFixture['promotion_store']->read($foreignFixture['server'])?->phase)
-            ->toBe(ControlPlaneGenerationPromotionPhase::RollingBack);
+            ->toBe(ControlPlaneGenerationPromotionPhase::Prepared);
     } finally {
         $cleanup($foreignOperationId);
     }

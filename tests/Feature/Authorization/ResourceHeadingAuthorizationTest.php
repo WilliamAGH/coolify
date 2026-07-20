@@ -1,8 +1,12 @@
 <?php
 
+use App\Enums\BlueGreenDeactivationPhase;
+use App\Enums\BlueGreenDeploymentPhase;
 use App\Livewire\Project\Application\Heading as ApplicationHeading;
 use App\Livewire\Project\Service\Heading as ServiceHeading;
 use App\Models\Application;
+use App\Models\ApplicationBlueGreenDeactivation;
+use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\InstanceSettings;
 use App\Models\Project;
 use App\Models\Server;
@@ -13,13 +17,20 @@ use App\Models\Team;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Once;
 use Illuminate\Support\Str;
 use Livewire\Livewire;
 
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
-    InstanceSettings::updateOrCreate(['id' => 0]);
+    $this->withoutVite();
+    Once::flush();
+
+    InstanceSettings::unguarded(
+        fn () => InstanceSettings::query()->firstOrCreate(['id' => 0]),
+    );
 
     $this->team = Team::factory()->create();
 
@@ -136,10 +147,13 @@ test('member cannot call restart on application', function () {
 test('member cannot call stop on application', function () {
     $this->actingAs($this->member);
     session(['currentTeam' => $this->team]);
+    Queue::fake();
 
     Livewire::test(ApplicationHeading::class, ['application' => $this->application])
         ->call('stop')
         ->assertDispatched('error');
+
+    Queue::assertNothingPushed();
 });
 
 test('member does not see terminal link for application', function () {
@@ -156,6 +170,56 @@ test('admin sees terminal link for application', function () {
 
     Livewire::test(ApplicationHeading::class, ['application' => $this->application])
         ->assertSee('Terminal');
+});
+
+test('application heading shows the newest blue-green intervention across deployment and deactivation owners', function (): void {
+    $older = now()->subMinute();
+    $newer = now();
+    $deactivation = ApplicationBlueGreenDeactivation::query()->create([
+        'application_id' => $this->application->id,
+        'standalone_docker_id' => $this->destination->id,
+        'operation_id' => str_repeat('a', 64),
+        'started_at' => $older,
+        'queue_cutoff_id' => 0,
+        'supersession_generation' => 1,
+        'phase' => BlueGreenDeactivationPhase::INTERVENTION_REQUIRED,
+        'intervention_phase' => BlueGreenDeactivationPhase::DEACTIVATING->value,
+        'intervention_reason' => 'Older deactivation intervention.',
+    ]);
+    $deployment = ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $this->application->id,
+        'standalone_docker_id' => $this->destination->id,
+        'phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+        'intervention_phase' => BlueGreenDeploymentPhase::PREPARING->value,
+        'intervention_reason' => 'Newer deployment intervention.',
+    ]);
+    ApplicationBlueGreenDeactivation::query()
+        ->whereKey($deactivation->id)
+        ->update(['created_at' => $older, 'updated_at' => $older]);
+    ApplicationBlueGreenDeployment::query()
+        ->whereKey($deployment->id)
+        ->update(['created_at' => $newer, 'updated_at' => $newer]);
+
+    $this->actingAs($this->admin);
+    session(['currentTeam' => $this->team]);
+
+    Livewire::test(ApplicationHeading::class, ['application' => $this->application])
+        ->assertSet('blueGreenIntervention.phase', 'deployment')
+        ->assertSee('Blue-green deployment (preparing)')
+        ->assertSee('Newer deployment intervention.')
+        ->assertDontSee('Older deactivation intervention.');
+});
+
+test('application heading rejects a foreign team before it can render intervention evidence', function (): void {
+    $foreignTeam = Team::factory()->create();
+    $foreignUser = User::factory()->create();
+    $foreignUser->teams()->attach($foreignTeam, ['role' => 'member']);
+
+    $this->actingAs($foreignUser);
+    session(['currentTeam' => $foreignTeam]);
+
+    Livewire::test(ApplicationHeading::class, ['application' => $this->application])
+        ->assertForbidden();
 });
 
 // --- Database Heading (via page route for rendering, policy checks for actions) ---

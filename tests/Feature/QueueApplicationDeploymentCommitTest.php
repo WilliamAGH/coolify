@@ -242,7 +242,10 @@ describe('proxy mutation freeze recovery', function () {
         } finally {
             $snapshot = ProxyMutationQueue::snapshot();
             if ($snapshot->freezeOperationId === $operationId) {
-                ProxyMutationQueue::unfreeze($operationId);
+                ProxyMutationQueue::unfreeze(
+                    $operationId,
+                    expectedFence: $snapshot->freezeFence ?? throw new RuntimeException('The test freeze did not issue a fence.'),
+                );
             }
         }
 

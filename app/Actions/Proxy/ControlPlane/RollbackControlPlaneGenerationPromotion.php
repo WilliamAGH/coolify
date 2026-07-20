@@ -4,7 +4,6 @@ namespace App\Actions\Proxy\ControlPlane;
 
 use App\Models\Server;
 use App\Support\ProxyMutationQueue;
-use App\Support\ProxyMutationQueueSnapshot;
 use Closure;
 use Lorisleiva\Actions\Concerns\AsAction;
 use RuntimeException;
@@ -28,8 +27,24 @@ final class RollbackControlPlaneGenerationPromotion
         string $token,
         ?string $successorYaml = null,
         ?Closure $remoteExecutor = null,
+        ?int $expectedInterventionWriterEpoch = null,
+        ?string $expectedInterventionFreezeFence = null,
     ): ControlPlaneGenerationPromotionState {
         $state = $this->ownedState($server, $operationId, $token);
+        if ($state->phase === ControlPlaneGenerationPromotionPhase::InterventionRequired) {
+            $this->assertManualInterventionRollback(
+                $state,
+                $expectedInterventionWriterEpoch,
+                $expectedInterventionFreezeFence,
+            );
+        }
+        if (! in_array($state->phase, [
+            ControlPlaneGenerationPromotionPhase::Completed,
+            ControlPlaneGenerationPromotionPhase::RolledBack,
+            ControlPlaneGenerationPromotionPhase::RollbackUnfreezing,
+        ], true)) {
+            $state = $this->heartbeatFreeze($server, $state, $token);
+        }
         $execute = $remoteExecutor ?? static fn (string $command): ?string => instant_remote_process(
             [$command],
             $server,
@@ -100,7 +115,7 @@ final class RollbackControlPlaneGenerationPromotion
 
         if ($state->phase === ControlPlaneGenerationPromotionPhase::RollingBack) {
             if ($mustRestoreDynamicDocument) {
-                $this->assertRecordedFreeze($state, ProxyMutationQueue::snapshot());
+                $state = $this->assertRecordedFreeze($server, $state, $token);
                 if ($state->legacyWriterAuthorityReconciliationRequired) {
                     $mutation = $this->legacyReconciliationMutation($server, $state);
                     $command = $this->dynamicWriter->reconcileRolledBackWriterAuthorityCommandFor(
@@ -126,7 +141,7 @@ final class RollbackControlPlaneGenerationPromotion
                 );
             }
 
-            $this->assertRecordedFreeze($state, ProxyMutationQueue::snapshot());
+            $state = $this->assertRecordedFreeze($server, $state, $token);
 
             $state = $this->promotionStore->transition(
                 $server,
@@ -162,9 +177,9 @@ final class RollbackControlPlaneGenerationPromotion
             throw new RuntimeException("Control-plane generation rollback cannot acknowledge from {$state->phase->value}.");
         }
 
-        $this->assertRecordedFreeze($state, ProxyMutationQueue::snapshot());
+        $state = $this->assertRecordedFreeze($server, $state, $token);
         $this->proveRestoredRoutes($server, $state, $execute);
-        $this->assertRecordedFreeze($state, ProxyMutationQueue::snapshot());
+        $state = $this->assertRecordedFreeze($server, $state, $token);
 
         $acknowledgedAt = now()->toIso8601String();
 
@@ -312,31 +327,46 @@ final class RollbackControlPlaneGenerationPromotion
     }
 
     private function assertRecordedFreeze(
+        Server $server,
         ControlPlaneGenerationPromotionState $state,
-        ProxyMutationQueueSnapshot $snapshot,
-    ): void {
-        if ($snapshot->freezeOperationId !== null
-            && ! hash_equals($state->operationId, $snapshot->freezeOperationId)) {
-            throw new RuntimeException('The control-plane generation mutation freeze is owned by another operation.');
+        string $token,
+    ): ControlPlaneGenerationPromotionState {
+        if ($state->mutationFreeze !== null) {
+            $state = $this->heartbeatFreeze($server, $state, $token);
+        }
+        $snapshot = ProxyMutationQueue::snapshot();
+        if ($snapshot->freezeOperationId !== null) {
+            if ($state->mutationFreeze === null
+                || ! hash_equals($state->operationId, $snapshot->freezeOperationId)
+                || ! $snapshot->hasFencedRenewableFreezeLease()
+                || ! hash_equals($state->mutationFreezeFence(), $snapshot->freezeFence ?? '')) {
+                throw new RuntimeException('The control-plane generation mutation freeze is owned by another operation.');
+            }
         }
         if ($state->mutationFreeze === null) {
             if ($snapshot->freezeOperationId !== null) {
                 throw new RuntimeException('The control-plane generation mutation freeze was never durably recorded.');
             }
 
-            return;
+            return $state;
         }
         if ($snapshot->freezeOperationId === null) {
             throw new RuntimeException('The recorded control-plane generation mutation freeze is missing.');
         }
+
+        return $state;
     }
 
     private function releaseMutationFreeze(ControlPlaneGenerationPromotionState $state): void
     {
         $snapshot = ProxyMutationQueue::snapshot();
-        if ($snapshot->freezeOperationId !== null
-            && ! hash_equals($state->operationId, $snapshot->freezeOperationId)) {
-            throw new RuntimeException('The control-plane generation mutation freeze is owned by another operation.');
+        if ($snapshot->freezeOperationId !== null) {
+            if ($state->mutationFreeze === null
+                || ! hash_equals($state->operationId, $snapshot->freezeOperationId)
+                || ! $snapshot->hasFencedRenewableFreezeLease()
+                || ! hash_equals($state->mutationFreezeFence(), $snapshot->freezeFence ?? '')) {
+                throw new RuntimeException('The control-plane generation mutation freeze is owned by another operation.');
+            }
         }
         if ($snapshot->freezeOperationId === null) {
             return;
@@ -348,10 +378,47 @@ final class RollbackControlPlaneGenerationPromotion
             throw new RuntimeException('The control-plane generation mutation queue must be empty before rollback completion.');
         }
 
-        $released = ProxyMutationQueue::unfreeze($state->operationId);
+        $released = ProxyMutationQueue::unfreeze(
+            $state->operationId,
+            expectedFence: $state->mutationFreezeFence(),
+        );
         if ($released->freezeOperationId !== null || ! $released->isEmpty()) {
             throw new RuntimeException('The control-plane generation mutation queue did not release cleanly.');
         }
+    }
+
+    private function heartbeatFreeze(
+        Server $server,
+        ControlPlaneGenerationPromotionState $state,
+        string $token,
+    ): ControlPlaneGenerationPromotionState {
+        if ($state->mutationFreeze === null) {
+            return $state;
+        }
+        $freezeFence = $state->mutationFreezeFence();
+        $leaseSeconds = ProxyMutationQueue::freezeLeaseSeconds();
+        $snapshot = ProxyMutationQueue::renewFreeze(
+            $state->operationId,
+            leaseSeconds: $leaseSeconds,
+            expectedFence: $freezeFence,
+        );
+        if ($snapshot->freezeOperationId === null
+            || ! hash_equals($state->operationId, $snapshot->freezeOperationId)
+            || ! $snapshot->hasFencedRenewableFreezeLease()
+            || ! hash_equals($freezeFence, $snapshot->freezeFence ?? '')) {
+            throw new RuntimeException('The control-plane generation mutation freeze is missing or owned by another operation.');
+        }
+
+        return $this->promotionStore->heartbeatFreeze(
+            $server,
+            $state->operationId,
+            $token,
+            $state->writerEpoch,
+            $leaseSeconds,
+            $freezeFence,
+            $freezeFence,
+            now()->toIso8601String(),
+        );
     }
 
     private function ownedState(
@@ -366,6 +433,26 @@ final class RollbackControlPlaneGenerationPromotion
         }
 
         return $state;
+    }
+
+    private function assertManualInterventionRollback(
+        ControlPlaneGenerationPromotionState $state,
+        ?int $expectedWriterEpoch,
+        ?string $expectedFreezeFence,
+    ): void {
+        if ($expectedWriterEpoch === null
+            || $expectedWriterEpoch < 1
+            || $expectedFreezeFence === null
+            || $expectedFreezeFence === ''
+            || $state->writerEpoch !== $expectedWriterEpoch
+            || $state->mutationFreeze === null
+            || ! hash_equals($state->operationId, $state->mutationFreeze['operation_id'])
+            || ! hash_equals($state->mutationFreezeFence(), $expectedFreezeFence)) {
+            throw new RuntimeException('The exact mutation-freeze owner or writer epoch does not match.');
+        }
+        if ($state->hasRetirementStarted()) {
+            throw new RuntimeException('A control-plane generation cannot be rolled back after predecessor retirement has started.');
+        }
     }
 
     private function assertExactOutput(?string $output, string $expected, string $operation): void
