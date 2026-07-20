@@ -1538,6 +1538,52 @@ it('rejects OCI tags longer than 128 characters in input validation', function (
     }
 });
 
+it('rejects fork versions whose derived canonical tag exceeds the OCI limit', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $sharedWorkflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $targetStep = releaseWorkflowStepById($sharedWorkflow['jobs']['validate-inputs'] ?? [], 'target');
+    $script = (string) ($targetStep['run'] ?? '');
+    $forkSemanticVersionPattern = (string) ($targetStep['env']['FORK_SEMANTIC_VERSION_PATTERN'] ?? '');
+    $cases = [
+        '115-character fork version is accepted' => ['1.0.1'.str_repeat('0', 105).'-fork', true],
+        '116-character fork version is rejected' => ['1.0.1'.str_repeat('0', 106).'-fork', false],
+    ];
+
+    foreach ($cases as $description => [$semanticVersion, $shouldSucceed]) {
+        $githubOutput = tempnam(sys_get_temp_dir(), 'coolify-fork-tag-limit-');
+        expect($githubOutput)->not->toBeFalse();
+
+        try {
+            $process = new Process(['bash', '-c', $script], $root, [
+                'ARTIFACT_NAME' => 'coolify-fork',
+                'CANDIDATE_REPOSITORY' => 'williamagh/coolify-fork-candidates',
+                'DOCKERFILE' => 'docker/production/Dockerfile',
+                'FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY' => 'fixture-key',
+                'FORK_SEMANTIC_VERSION_PATTERN' => $forkSemanticVersionPattern,
+                'GITHUB_OUTPUT' => $githubOutput,
+                'GITHUB_REF' => "refs/tags/{$semanticVersion}",
+                'GITHUB_REF_TYPE' => 'tag',
+                'GITHUB_RUN_ATTEMPT' => '1',
+                'GITHUB_RUN_ID' => '1',
+                'GITHUB_SHA' => str_repeat('a', 40),
+                'NEXUS_PASSWORD' => 'fixture-password',
+                'NEXUS_USERNAME' => 'fixture-user',
+                'PUBLISH_LATEST' => 'false',
+                'RELEASE_KIND' => 'fork',
+                'REPOSITORY' => 'williamacallahan/coolify',
+                'SEMANTIC_VERSION' => $semanticVersion,
+                'TARGET_REPOSITORY' => 'williamagh/coolify',
+                'VALIDATE_ONLY' => 'false',
+            ]);
+            $process->run();
+
+            expect($process->isSuccessful())->toBe($shouldSucceed, $description);
+        } finally {
+            unlink($githubOutput);
+        }
+    }
+});
+
 it('uses isolated database and cache stores in release validation', function () {
     $applicationValidationWorkflow = Yaml::parseFile(releaseWorkflowRepositoryRoot().'/.github/workflows/application-validation.yml');
     $environment = $applicationValidationWorkflow['jobs']['php']['env'] ?? [];
@@ -3023,10 +3069,7 @@ it('rejects a mismatched canonical fork identity tag before updating fork latest
     )['run'] ?? '');
     $filesystem = new Filesystem;
     $fixture = sys_get_temp_dir().'/coolify-fork-canonical-mismatch-'.bin2hex(random_bytes(8));
-    $registry = releaseWorkflowPrepareForkPromotionRegistryDouble(
-        $fixture,
-        releaseWorkflowTestDigest('3'),
-    );
+    $registry = releaseWorkflowPrepareForkPromotionRegistryDouble($fixture, null);
     file_put_contents($registry['state'].'/fork-4.13.1-fork', releaseWorkflowTestDigest('f')."\n");
 
     try {
@@ -3037,6 +3080,7 @@ it('rejects a mismatched canonical fork identity tag before updating fork latest
             ->and($process->getErrorOutput())->toContain('refusing release-identity overwrite')
             ->and((string) file_get_contents($registry['log']))->not->toContain('image copy')
             ->and(file_exists($registry['state'].'/fork-latest'))->toBeFalse()
+            ->and(trim((string) file_get_contents($registry['state'].'/main')))->toBe('absent')
             ->and(trim((string) file_get_contents($registry['state'].'/fork-4.13.1-fork')))
             ->toBe(releaseWorkflowTestDigest('f'));
     } finally {

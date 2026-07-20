@@ -37,10 +37,22 @@ if (version) {
     tags.push(`${imageBase}:${branch}-${shortSha}`);
 }
 
+for (const tag of tags) {
+    const tagName = tag.slice(tag.lastIndexOf(":") + 1);
+    if (tagName.length > 128) {
+        throw new Error(`OCI tag exceeds the 128-character limit: ${tagName}`);
+    }
+}
+
 if (process.env.GITHUB_OUTPUT && !formatWasExplicit) {
     appendFileSync(process.env.GITHUB_OUTPUT, `branch=${branch}\n`);
     appendFileSync(process.env.GITHUB_OUTPUT, `short_sha=${shortSha}\n`);
     appendFileSync(process.env.GITHUB_OUTPUT, `image_base=${imageBase}\n`);
+    appendFileSync(process.env.GITHUB_OUTPUT, `latest_tag=${tags[0]}\n`);
+    if (version) {
+        appendFileSync(process.env.GITHUB_OUTPUT, `version_tag=${tags[1]}\n`);
+        appendFileSync(process.env.GITHUB_OUTPUT, `version_sha_tag=${tags[2]}\n`);
+    }
     appendFileSync(
         process.env.GITHUB_OUTPUT,
         `tags<<EOF\n${tags.join("\n")}\nEOF\n`,

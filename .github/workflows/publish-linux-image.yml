@@ -99,6 +99,9 @@ jobs:
       publish_required: ${{ steps.publication.outputs.publish_required }}
       repair_required: ${{ steps.publication.outputs.repair_required }}
       run_tag: ${{ steps.target.outputs.run_tag }}
+      fork_latest_tag: ${{ steps.target.outputs.latest_tag }}
+      fork_version_tag: ${{ steps.target.outputs.version_tag }}
+      fork_version_sha_tag: ${{ steps.target.outputs.version_sha_tag }}
     steps:
       - name: Check out exact fork source for version binding
         if: ${{ inputs.release_kind == 'fork' }}
@@ -309,6 +312,13 @@ jobs:
           fi
           if [ -n "${STAGING_ALIAS:-}" ]; then
             validate_tag_length "$STAGING_ALIAS"
+          fi
+          if [ "$RELEASE_KIND" = fork ]; then
+            node scripts/ci/deriveImageTags.mjs \
+              --branch fork \
+              --version "$SEMANTIC_VERSION" \
+              --sha "$GITHUB_SHA" \
+              --image-base "docker.iocloudhost.net/$TARGET_REPOSITORY"
           fi
 
           printf 'run_tag=%s\n' "$run_tag" >> "$GITHUB_OUTPUT"
@@ -1462,9 +1472,7 @@ jobs:
     env:
       MAIN_TARGET: docker.iocloudhost.net/williamagh/coolify
       NEXUS_BASE_URL: https://sonatype.popos-sf6.com
-      NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
       NEXUS_DOCKER_REPOSITORY: docker-hosted
-      NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
     steps:
       - name: Check out immutable fork policy source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -1472,6 +1480,9 @@ jobs:
           persist-credentials: false
           ref: ${{ github.sha }}
       - name: Validate shared Nexus docker-hosted contract
+        env:
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
         run: scripts/ci/verify-nexus-docker-write-policy.sh
 
   fork-build:
@@ -2350,22 +2361,15 @@ jobs:
       MAIN_ARM64_DIGEST: ${{ needs.fork-stage.outputs.main_arm64_digest }}
       MAIN_INDEX_DIGEST: ${{ needs.fork-stage.outputs.main_index_digest }}
       MAIN_TARGET: docker.iocloudhost.net/williamagh/coolify
+      FORK_LATEST_TAG: ${{ needs.validate-inputs.outputs.fork_latest_tag }}
+      FORK_VERSION_TAG: ${{ needs.validate-inputs.outputs.fork_version_tag }}
+      FORK_VERSION_SHA_TAG: ${{ needs.validate-inputs.outputs.fork_version_sha_tag }}
       NEXUS_BASE_URL: https://sonatype.popos-sf6.com
       NEXUS_DOCKER_REPOSITORY: docker-hosted
-      RELEASE_TAG_BRANCH: fork
       SEMANTIC_VERSION: ${{ inputs.semantic_version }}
       SOURCE_REVISION: ${{ github.sha }}
       SOURCE_URL: https://github.com/${{ github.repository }}
     steps:
-      - name: Check out immutable fork release source
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-        with:
-          persist-credentials: false
-          ref: ${{ github.sha }}
-      - name: Set up Node.js for canonical fork tag derivation
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: '22'
       - name: Revalidate shared Nexus docker-hosted contract before final tagging
         env:
           NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
@@ -2724,15 +2728,20 @@ jobs:
             [[ "$(regctl image digest "$repository:$SEMANTIC_VERSION")" == "$expected_index_digest" ]]
           }
 
-          promote_and_verify_canonical_tags() {
-            local repository=$1 expected_index_digest=$2 tag existing
-            local -a tags existing_digests
-            mapfile -t tags < <(node scripts/ci/deriveImageTags.mjs \
+          derive_canonical_tags() {
+            local repository=$1
+            node scripts/ci/deriveImageTags.mjs \
               --branch "$RELEASE_TAG_BRANCH" \
               --version "$SEMANTIC_VERSION" \
               --sha "$SOURCE_REVISION" \
               --image-base "$repository" \
-              --format tags)
+              --format tags
+          }
+
+          preflight_canonical_tags() {
+            local repository=$1 expected_index_digest=$2 tag existing
+            local -a tags existing_digests
+            mapfile -t tags < <(derive_canonical_tags "$repository")
             [[ "${#tags[@]}" == 3 ]]
             existing_digests=(
               "$(digest_or_absent "${tags[1]}")"
@@ -2744,6 +2753,14 @@ jobs:
                 return 1
               }
             done
+          }
+
+          promote_and_verify_canonical_tags() {
+            local repository=$1 expected_index_digest=$2 tag existing
+            local -a tags
+            mapfile -t tags < <(derive_canonical_tags "$repository")
+            [[ "${#tags[@]}" == 3 ]]
+            preflight_canonical_tags "$repository" "$expected_index_digest"
             for tag in "${tags[1]}" "${tags[2]}"; do
               [[ "$tag" == "$repository:"* ]]
               existing="$(digest_or_absent "$tag")"
@@ -2761,6 +2778,7 @@ jobs:
           }
 
           preflight_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"
+          preflight_canonical_tags "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"
 
           assert_live_fork_tag_binding
           assert_active_fork_tag_protection

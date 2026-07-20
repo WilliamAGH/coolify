@@ -38,7 +38,17 @@ actual=$(GITHUB_OUTPUT="$github_output" node "$derive_image_tags" \
 assert_equals '' "$actual" 'implicit format must write action output only'
 grep -Fqx 'branch=fork' "$github_output" || fail 'branch output missing'
 grep -Fqx 'short_sha=dfaa830' "$github_output" || fail 'short SHA output missing'
+grep -Fqx 'latest_tag=docker.iocloudhost.net/williamagh/coolify:fork-latest' "$github_output" || fail 'latest tag scalar output missing'
+grep -Fqx 'version_tag=docker.iocloudhost.net/williamagh/coolify:fork-4.13.3-fork' "$github_output" || fail 'version tag scalar output missing'
+grep -Fqx 'version_sha_tag=docker.iocloudhost.net/williamagh/coolify:fork-4.13.3-fork-dfaa830' "$github_output" || fail 'version SHA tag scalar output missing'
 grep -Fqx 'docker.iocloudhost.net/williamagh/coolify:fork-latest' "$github_output" || fail 'latest tag output missing'
 grep -Fqx 'docker.iocloudhost.net/williamagh/coolify:fork-4.13.3-fork-dfaa830' "$github_output" || fail 'hash tag output missing'
+
+oversized_version="1.0.1$(printf '0%.0s' {1..106})-fork"
+if node "$derive_image_tags" \
+    --branch fork --version "$oversized_version" --sha dfaa8302d43845dcb586802216db0b886c072233 \
+    --image-base docker.iocloudhost.net/williamagh/coolify --format tags >/dev/null 2>&1; then
+    fail 'derived OCI tags longer than 128 characters must be rejected'
+fi
 
 printf 'ok: deriveImageTags action output modes\n'
