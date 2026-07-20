@@ -6,6 +6,7 @@ use App\Actions\Fortify\CreateNewUser;
 use App\Actions\Fortify\ResetUserPassword;
 use App\Actions\Fortify\UpdateUserPassword;
 use App\Actions\Fortify\UpdateUserProfileInformation;
+use App\Actions\Proxy\ControlPlane\VerifyControlPlaneAuthenticationProxyProof;
 use App\Models\OauthSetting;
 use App\Models\TeamInvitation;
 use App\Models\User;
@@ -14,11 +15,18 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\ServiceProvider;
+use Illuminate\Support\Str;
 use Laravel\Fortify\Contracts\RegisterResponse;
 use Laravel\Fortify\Fortify;
+use LogicException;
 
 class FortifyServiceProvider extends ServiceProvider
 {
+    private const array LOOPBACK_PROXY_ADDRESSES = [
+        '127.0.0.1',
+        '::1',
+    ];
+
     /**
      * Register any application services.
      */
@@ -128,8 +136,7 @@ class FortifyServiceProvider extends ServiceProvider
         });
 
         RateLimiter::for('forgot-password', function (Request $request) {
-            // Use real client IP (not spoofable forwarded headers)
-            $realIp = $request->server('REMOTE_ADDR') ?? $request->ip();
+            $realIp = self::rateLimitClientAddress($request);
 
             $limits = [
                 Limit::perMinutes(10, 3)->by('forgot-password:ip:'.sha1($realIp)),
@@ -144,10 +151,8 @@ class FortifyServiceProvider extends ServiceProvider
         });
 
         RateLimiter::for('login', function (Request $request) {
-            $email = (string) $request->email;
-            // Use email + real client IP (not spoofable forwarded headers)
-            // server('REMOTE_ADDR') gives the actual connecting IP before proxy headers
-            $realIp = $request->server('REMOTE_ADDR') ?? $request->ip();
+            $email = Str::transliterate(Str::lower((string) $request->input(Fortify::username())));
+            $realIp = self::rateLimitClientAddress($request);
 
             return Limit::perMinute(5)->by($email.'|'.$realIp);
         });
@@ -155,5 +160,37 @@ class FortifyServiceProvider extends ServiceProvider
         RateLimiter::for('two-factor', function (Request $request) {
             return Limit::perMinute(5)->by($request->session()->get('login.id'));
         });
+    }
+
+    private static function rateLimitClientAddress(Request $request): string
+    {
+        $remoteAddress = self::normalizeIpAddress($request->server('REMOTE_ADDR'));
+        if ($remoteAddress === null) {
+            throw new LogicException('Authentication rate limits require a canonical server-supplied REMOTE_ADDR.');
+        }
+
+        $isLoopbackProxy = in_array($remoteAddress, self::LOOPBACK_PROXY_ADDRESSES, true);
+        $hasControlPlaneProof = (new VerifyControlPlaneAuthenticationProxyProof)->handle($request);
+        if ($isLoopbackProxy || $hasControlPlaneProof) {
+            return self::normalizeIpAddress($request->ip()) ?? $remoteAddress;
+        }
+
+        return $remoteAddress;
+    }
+
+    private static function normalizeIpAddress(mixed $address): ?string
+    {
+        if (! is_string($address) || trim($address) !== $address || $address === '') {
+            return null;
+        }
+
+        $packedAddress = @inet_pton($address);
+        if ($packedAddress === false) {
+            return null;
+        }
+
+        $normalizedAddress = inet_ntop($packedAddress);
+
+        return $normalizedAddress === false ? null : $normalizedAddress;
     }
 }
