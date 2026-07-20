@@ -56,7 +56,26 @@ test "$(sha256sum "$OCI_ARCHIVE" | awk '{print $1}')" = "$OCI_ARCHIVE_SHA256" ||
     fail 'OCI archive SHA-256 differs from the recorded candidate metadata'
 tar -tf "$OCI_ARCHIVE" >/dev/null
 
-archive_child_digest="$(tar -xOf "$OCI_ARCHIVE" index.json | jq -er --arg architecture "$oci_architecture" '
+archive_index="$(tar -xOf "$OCI_ARCHIVE" index.json)"
+direct_native_count="$(printf '%s' "$archive_index" | jq -r --arg architecture "$oci_architecture" '
+    [.manifests[] | select(.platform.os == "linux" and .platform.architecture == $architecture)] | length
+')"
+if [ "$direct_native_count" = 0 ]; then
+    nested_index_digest="$(printf '%s' "$archive_index" | jq -er '
+        [.manifests[] |
+            select(.mediaType == "application/vnd.oci.image.index.v1+json") |
+            select(.annotations["vnd.docker.reference.type"] != "attestation-manifest")] |
+        if length == 1 then .[0].digest else error("expected one nested image index") end
+    ')"
+    require_sha256_digest "$nested_index_digest" 'nested OCI index digest'
+    assert_blob_digest "$nested_index_digest"
+    nested_index_path="blobs/sha256/${nested_index_digest#sha256:}"
+    archive_index="$(tar -xOf "$OCI_ARCHIVE" "$nested_index_path")"
+elif [ "$direct_native_count" != 1 ]; then
+    fail "expected one native manifest, found ${direct_native_count}"
+fi
+
+archive_child_digest="$(printf '%s' "$archive_index" | jq -er --arg architecture "$oci_architecture" '
     [.manifests[] | select(.platform.os == "linux" and .platform.architecture == $architecture)]
     | if length == 1 then .[0].digest else error("expected one native manifest") end
 ')"
@@ -102,10 +121,18 @@ source_path, destination_path, image_name, expected_child_digest = sys.argv[1:]
 
 with tarfile.open(source_path, 'r:*') as source:
     index = json.load(source.extractfile('index.json'))
-    child_descriptor = next(
-        (descriptor for descriptor in index['manifests'] if descriptor['digest'] == expected_child_digest),
-        None,
-    )
+    indexes = [index]
+    for descriptor in index['manifests']:
+        if descriptor.get('mediaType') != 'application/vnd.oci.image.index.v1+json':
+            continue
+        nested_digest = descriptor['digest'].split(':', 1)[1]
+        indexes.append(json.load(source.extractfile(f'blobs/sha256/{nested_digest}')))
+    child_descriptor = next((
+        descriptor
+        for candidate_index in indexes
+        for descriptor in candidate_index['manifests']
+        if descriptor['digest'] == expected_child_digest
+    ), None)
     if child_descriptor is None:
         raise SystemExit('verified OCI child manifest is absent from the archive index')
 

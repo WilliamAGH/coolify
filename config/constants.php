@@ -2,7 +2,7 @@
 
 return [
     'coolify' => [
-        'version' => '4.13.1-fork',
+        'version' => '4.13.2-fork',
         'helper_version' => '1.0.14',
         'realtime_version' => '1.0.16',
         'railpack_version' => '0.23.0',

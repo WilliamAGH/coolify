@@ -1623,10 +1623,32 @@ jobs:
           install -d -m 0700 "$layout"
           tar -xf "$archive" -C "$layout"
 
+          index_file="$layout/index.json"
+          direct_native_count="$(jq -r --arg arch "$OCI_ARCH" '[
+            .manifests[] |
+            select(.platform.os == "linux" and .platform.architecture == $arch)
+          ] | length' "$index_file")"
+          if [[ "$direct_native_count" == 0 ]]; then
+            nested_index_digest="$(jq -er '[
+              .manifests[] |
+              select(.mediaType == "application/vnd.oci.image.index.v1+json") |
+              select(.annotations["vnd.docker.reference.type"] != "attestation-manifest")
+            ] | if length == 1 then .[0].digest else error("expected one nested image index") end' "$index_file")"
+            printf '%s' "$nested_index_digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
+            nested_index_blob="$layout/blobs/sha256/${nested_index_digest#sha256:}"
+            [[ -f "$nested_index_blob" ]]
+            printf '%s  %s\n' "${nested_index_digest#sha256:}" "$nested_index_blob" | sha256sum --check --strict -
+            jq -e '.mediaType == "application/vnd.oci.image.index.v1+json"' "$nested_index_blob" >/dev/null
+            index_file="$nested_index_blob"
+          elif [[ "$direct_native_count" != 1 ]]; then
+            printf 'Expected exactly one native image manifest, found %s.\n' "$direct_native_count" >&2
+            exit 1
+          fi
+
           child_digest="$(jq -er --arg arch "$OCI_ARCH" '
             [.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch)] |
             if length == 1 then .[0].digest else error("expected one native image manifest") end
-          ' "$layout/index.json")"
+          ' "$index_file")"
           printf '%s' "$child_digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
           child_blob="$layout/blobs/sha256/${child_digest#sha256:}"
           [[ -f "$child_blob" ]]
@@ -1652,7 +1674,7 @@ jobs:
               .annotations["org.opencontainers.image.source"] == $source and
               .annotations["org.opencontainers.image.revision"] == $revision and
               .annotations["org.opencontainers.image.version"] == $version
-            ' "$layout/index.json" >/dev/null
+            ' "$index_file" >/dev/null
 
           predicate_types="$layout/predicate-types.txt"
           : > "$predicate_types"
@@ -1668,7 +1690,7 @@ jobs:
             select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") |
             select(.annotations["vnd.docker.reference.digest"] == $child) |
             .digest
-          ' "$layout/index.json")
+          ' "$index_file")
           grep -Eq '^https://slsa\.dev/provenance/' "$predicate_types"
           grep -Eq '^https://spdx\.dev/Document' "$predicate_types"
 
@@ -1678,10 +1700,10 @@ jobs:
           } > "fork-image/${ARTIFACT_NAME}-${ARCH}.candidate.env"
 
       - name: Verify exact fork control-plane OCI runtime and content
-        if: ${{ matrix.product == 'main' }}
         env:
           ARCH: ${{ matrix.arch }}
           ARTIFACT_NAME: ${{ matrix.artifact_name }}
+          CONTENT_POLICY: ${{ matrix.product == 'main' && 'control-plane-main' || 'none' }}
           PLATFORM: ${{ matrix.platform }}
         run: |
           set -Eeuo pipefail
@@ -1695,7 +1717,7 @@ jobs:
           OCI_ARCHIVE="$archive" \
             OCI_ARCHIVE_SHA256="$archive_sha256" \
             OCI_CHILD_DIGEST="$child_digest" \
-            OCI_CONTENT_POLICY=control-plane-main \
+            OCI_CONTENT_POLICY="$CONTENT_POLICY" \
             OCI_IMAGE="$image" \
             OCI_PLATFORM="$PLATFORM" \
             tests/Integration/VerifyOciArchiveImage.sh
@@ -1707,7 +1729,7 @@ jobs:
         with:
           artifact-name: fork-${{ matrix.artifact_name }}-${{ matrix.arch }}-${{ github.sha }}.spdx.json
           format: spdx-json
-          image: oci-archive:fork-image/${{ matrix.artifact_name }}-${{ matrix.arch }}.oci.tar
+          image: local/${{ matrix.artifact_name }}:${{ github.sha }}-${{ matrix.arch }}-fork-runtime
           output-file: fork-image/${{ matrix.artifact_name }}-${{ matrix.arch }}.sbom.spdx.json
           upload-artifact: false
           upload-release-assets: false
@@ -1728,7 +1750,7 @@ jobs:
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:
           fail-build: true
-          image: oci-archive:fork-image/${{ matrix.artifact_name }}-${{ matrix.arch }}.oci.tar
+          image: local/${{ matrix.artifact_name }}:${{ github.sha }}-${{ matrix.arch }}-fork-runtime
           only-fixed: false
           output-file: fork-image/${{ matrix.artifact_name }}-${{ matrix.arch }}.vulnerabilities.json
           output-format: json
@@ -1742,7 +1764,7 @@ jobs:
         with:
           exit-code: '1'
           format: json
-          input: fork-image/${{ matrix.artifact_name }}-${{ matrix.arch }}.oci.tar
+          image-ref: local/${{ matrix.artifact_name }}:${{ github.sha }}-${{ matrix.arch }}-fork-runtime
           output: fork-image/${{ matrix.artifact_name }}-${{ matrix.arch }}.secrets.json
           scan-type: image
           scanners: secret
