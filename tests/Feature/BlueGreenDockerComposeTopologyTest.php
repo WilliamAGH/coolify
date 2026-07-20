@@ -20,7 +20,6 @@ use App\Enums\ProxyTypes;
 use App\Jobs\ApplicationDeploymentJob;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
-use App\Models\ApplicationBlueGreenReplica;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\LocalPersistentVolume;
 use App\Models\Project;
@@ -364,46 +363,42 @@ it('renders replica services without container name while preserving fixed sidec
 it('renders and targets the durable replica ledger when live settings drift after claim', function (): void {
     $application = blueGreenComposeApplication();
     $destination = StandaloneDocker::query()->with('server')->findOrFail($application->destination_id);
-    $application->settings()->firstOrFail()->update(['blue_green_replica_count' => 3]);
-    $state = ApplicationBlueGreenDeployment::query()->create([
-        'application_id' => $application->id,
-        'standalone_docker_id' => $destination->id,
-        'phase' => BlueGreenDeploymentPhase::PREPARING,
-        'pending_color' => BlueGreenDeploymentColor::GREEN,
-        'pending_deployment_uuid' => 'compose-deployment',
-        'operation_deployment_uuid' => 'compose-deployment',
-        'routing_revision' => 1,
+    $application->settings()->firstOrFail()->update([
+        'is_blue_green_deployment_enabled' => true,
+        'blue_green_replica_count' => 3,
     ]);
-    foreach (range(1, 3) as $replicaIndex) {
-        ApplicationBlueGreenReplica::query()->create([
-            'application_blue_green_deployment_id' => $state->id,
-            'application_id' => $application->id,
-            'standalone_docker_id' => $destination->id,
-            'color' => BlueGreenDeploymentColor::GREEN,
-            'replica_index' => $replicaIndex,
-            'deployment_uuid' => 'compose-deployment',
-            'routing_revision' => 1,
-            'compose_project' => $application->uuid,
-            'compose_service' => "web-green-replica-{$replicaIndex}",
-        ]);
-    }
+    $deployment = ApplicationDeploymentQueue::query()->create([
+        'application_id' => $application->id,
+        'application_name' => $application->name,
+        'server_id' => $destination->server->id,
+        'server_name' => $destination->server->name,
+        'destination_id' => $destination->id,
+        'deployment_uuid' => 'compose-replica-drift',
+        'pull_request_id' => 0,
+        'commit' => 'compose-replica-drift',
+        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+        'only_this_server' => true,
+    ]);
+    $claim = ClaimBlueGreenDeployment::run(
+        $application,
+        $destination,
+        $deployment,
+        '11111111-1111-1111-1111-111111111111',
+    );
     DB::table('application_settings')
         ->where('application_id', $application->id)
         ->update(['blue_green_replica_count' => 1]);
     $application->refresh()->load('settings');
     $lifecycle = new BlueGreenDeploymentLifecycle(
         application: $application,
-        deployment: new ApplicationDeploymentQueue,
+        deployment: $deployment->fresh(),
         destination: $destination,
         server: $destination->server,
         timeout: 30,
         checkForCancellation: static function (): void {},
     );
     (new ReflectionProperty(BlueGreenDeploymentLifecycle::class, 'enabled'))->setValue($lifecycle, true);
-    (new ReflectionProperty(BlueGreenDeploymentLifecycle::class, 'claim'))->setValue(
-        $lifecycle,
-        blueGreenComposeClaim($application, $destination, null, $state->id),
-    );
+    (new ReflectionProperty(BlueGreenDeploymentLifecycle::class, 'claim'))->setValue($lifecycle, $claim);
     $job = (new ReflectionClass(ApplicationDeploymentJob::class))->newInstanceWithoutConstructor();
     setBlueGreenComposeJobProperty($job, 'application', $application);
     setBlueGreenComposeJobProperty($job, 'destination', $destination);
@@ -414,14 +409,16 @@ it('renders and targets the durable replica ledger when live settings drift afte
     $targets = (new ReflectionProperty(ApplicationDeploymentJob::class, 'blueGreenComposeCandidateServices'))
         ->getValue($job);
 
+    $serviceBase = 'web-'.$claim->pendingColor->value;
+    $expectedTargets = [
+        $serviceBase.'-replica-1',
+        $serviceBase.'-replica-2',
+        $serviceBase.'-replica-3',
+    ];
     expect($application->settings->blueGreenReplicaCount())->toBe(1)
-        ->and($targets)->toBe([
-            'web-green-replica-1',
-            'web-green-replica-2',
-            'web-green-replica-3',
-        ])
+        ->and($targets)->toBe($expectedTargets)
         ->and(array_keys($rendered['services']))->toContain(...$targets)
-        ->and($rendered['services'])->not->toHaveKey('web-green');
+        ->and($rendered['services'])->not->toHaveKey($serviceBase);
 });
 
 it('keeps the claimed scalar Compose topology when live settings drift from one replica to three', function (): void {
