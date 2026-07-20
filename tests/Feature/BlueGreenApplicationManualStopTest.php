@@ -239,7 +239,9 @@ it('resumes an immutable route-less replacement after its durable record fails a
     ApplicationBlueGreenDeactivation::query()
         ->whereKey($failedDeactivation->id)
         ->update(['started_at' => $staleStartedAt]);
-    $application->update(['fqdn' => $driftedFqdn]);
+    DB::table('applications')
+        ->where('id', $application->id)
+        ->update(['fqdn' => $driftedFqdn]);
 
     $resumption = ResumeBlueGreenDeactivations::run(
         $application->id,

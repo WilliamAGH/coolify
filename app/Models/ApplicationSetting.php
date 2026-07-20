@@ -2,9 +2,14 @@
 
 namespace App\Models;
 
+use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
+use App\Enums\BlueGreenDeploymentPhase;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\DB;
 use OpenApi\Attributes as OA;
+use RuntimeException;
 
 #[OA\Schema(
     description: 'Application settings.',
@@ -131,6 +136,123 @@ class ApplicationSetting extends Model
         'blue_green_inactive_retention_seconds',
         'is_blue_green_deployment_enabled',
     ];
+
+    protected function performInsert(Builder $query)
+    {
+        return DB::transaction(function () use ($query): bool {
+            BlueGreenTopologyLock::acquire();
+            $this->prepareBlueGreenMutation();
+
+            return parent::performInsert($query);
+        }, attempts: 5);
+    }
+
+    protected function performUpdate(Builder $query)
+    {
+        if ($this->isDirty('application_id')) {
+            throw new RuntimeException('Application settings cannot be reassigned to another application.');
+        }
+
+        if (! $this->isDirty(Application::blueGreenLifecycleAffectingSettingAttributes())) {
+            return parent::performUpdate($query);
+        }
+
+        return DB::transaction(function () use ($query): bool {
+            BlueGreenTopologyLock::acquire();
+            $proposedDirtyAttributes = $this->getDirty();
+            $application = Application::withTrashed()
+                ->whereKey($this->application_id)
+                ->lockForUpdate()
+                ->first();
+            if ($application === null) {
+                throw new RuntimeException('Blue-green application settings cannot be updated after the application is gone.');
+            }
+            $lockedSetting = self::query()
+                ->whereKey($this->getKey())
+                ->lockForUpdate()
+                ->first();
+            if ($lockedSetting === null || (int) $lockedSetting->application_id !== $application->id) {
+                throw new RuntimeException('Blue-green application settings changed while their persistence transaction was being acquired.');
+            }
+            $lockedAttributes = $lockedSetting->getAttributes();
+            $this->setRawAttributes($lockedAttributes, sync: true);
+            $this->setRawAttributes(array_replace($lockedAttributes, $proposedDirtyAttributes));
+
+            $states = ApplicationBlueGreenDeployment::query()
+                ->where('application_id', $application->id)
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            ApplicationBlueGreenDeactivation::query()
+                ->where('application_id', $application->id)
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            $queueDeploymentUuids = $states
+                ->flatMap(static fn (ApplicationBlueGreenDeployment $state): array => [
+                    $state->blue_deployment_uuid,
+                    $state->green_deployment_uuid,
+                    $state->pending_deployment_uuid,
+                    $state->operation_deployment_uuid,
+                    $state->operation_previous_deployment_uuid,
+                    $state->inactive_retirement_owner_deployment_uuid,
+                    $state->inactive_retirement_deployment_uuid,
+                ])
+                ->filter(static fn (mixed $deploymentUuid): bool => is_string($deploymentUuid) && $deploymentUuid !== '')
+                ->unique()
+                ->values();
+            if ($queueDeploymentUuids->isNotEmpty()) {
+                ApplicationDeploymentQueue::query()
+                    ->where('application_id', $application->id)
+                    ->whereIn('deployment_uuid', $queueDeploymentUuids)
+                    ->orderBy('id')
+                    ->lockForUpdate()
+                    ->get();
+            }
+
+            if ($states->contains(
+                static fn (ApplicationBlueGreenDeployment $state): bool => $state->phase !== BlueGreenDeploymentPhase::IDLE,
+            )) {
+                throw new RuntimeException('Blue-green routing and lifecycle settings cannot change while a deployment operation is in progress. Wait for promotion or recovery to finish.');
+            }
+
+            $application->setRelation('settings', $this);
+            $this->setRelation('application', $application);
+            $application->assertBlueGreenTopologyMutationAllowed();
+            $this->prepareBlueGreenMutation();
+
+            return parent::performUpdate($query);
+        }, attempts: 5);
+    }
+
+    private function prepareBlueGreenMutation(): void
+    {
+        if (! $this->isDirty(Application::blueGreenEligibilityAffectingSettingAttributes())) {
+            return;
+        }
+
+        $application = $this->application;
+        if ($application === null) {
+            if ($this->is_blue_green_deployment_enabled) {
+                throw new RuntimeException('Blue-green deployments require an application before they can be enabled.');
+            }
+
+            return;
+        }
+        if ($this->isDirty('is_blue_green_deployment_enabled')
+            && ! $this->is_blue_green_deployment_enabled
+            && ($blockedReason = $application->blueGreenDeploymentOptOutBlockedReason()) !== null) {
+            throw new RuntimeException($blockedReason);
+        }
+
+        $isEnablingBlueGreenDeployment = $this->isDirty('is_blue_green_deployment_enabled')
+            && $this->is_blue_green_deployment_enabled;
+
+        $application->prepareBlueGreenConfigurationMutation(
+            setting: $this,
+            allowPendingSettingOptOut: ! $isEnablingBlueGreenDeployment,
+        );
+    }
 
     public function stopGracePeriodSeconds(): int
     {
