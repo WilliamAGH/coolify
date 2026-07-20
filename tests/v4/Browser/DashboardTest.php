@@ -2,7 +2,6 @@
 
 use App\Enums\ProxyStatus;
 use App\Enums\ProxyTypes;
-use App\Models\InstanceSettings;
 use App\Models\PrivateKey;
 use App\Models\Project;
 use App\Models\Server;
@@ -13,7 +12,7 @@ use Illuminate\Support\Facades\Hash;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
-    InstanceSettings::unguarded(fn () => InstanceSettings::query()->create(['id' => 0]));
+    seedBrowserInstanceSettings();
 
     $this->user = User::factory()->create([
         'id' => 0,
@@ -99,15 +98,6 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
     ]);
 });
 
-function loginAndSkipOnboarding(): mixed
-{
-    return visit('/login')
-        ->fill('email', 'test@example.com')
-        ->fill('password', 'password')
-        ->click('Login')
-        ->click('Skip Setup');
-}
-
 it('redirects to login when not authenticated', function () {
     $page = visit('/');
 
@@ -128,7 +118,7 @@ it('shows onboarding after first login', function () {
 });
 
 it('shows dashboard after skipping onboarding', function () {
-    $page = loginAndSkipOnboarding();
+    $page = loginAndSkipBoarding();
 
     $page->assertSee('Dashboard')
         ->assertSee('Your self-hosted infrastructure.')
@@ -136,7 +126,7 @@ it('shows dashboard after skipping onboarding', function () {
 });
 
 it('shows all projects on dashboard', function () {
-    $page = loginAndSkipOnboarding();
+    $page = loginAndSkipBoarding();
 
     $page->assertSee('Projects')
         ->assertSee('My first project')
@@ -149,7 +139,7 @@ it('shows all projects on dashboard', function () {
 });
 
 it('shows servers on dashboard', function () {
-    $page = loginAndSkipOnboarding();
+    $page = loginAndSkipBoarding();
 
     $page->assertSee('Servers')
         ->assertSee('localhost')

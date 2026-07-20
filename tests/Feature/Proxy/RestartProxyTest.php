@@ -1,7 +1,6 @@
 <?php
 
-namespace Tests\Feature\Proxy;
-
+use App\Enums\ProxyTypes;
 use App\Jobs\RestartProxyJob;
 use App\Models\InstanceSettings;
 use App\Models\Server;
@@ -11,135 +10,158 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Queue\Middleware\WithoutOverlapping;
 use Illuminate\Support\Facades\Queue;
 use Livewire\Livewire;
-use Tests\TestCase;
 
-class RestartProxyTest extends TestCase
+uses(RefreshDatabase::class);
+
+beforeEach(function () {
+    (new InstanceSettings)->forceFill(['id' => 0])->save();
+});
+
+function setupRestartProxyUser(string $role): array
 {
-    use RefreshDatabase;
+    $team = Team::factory()->create();
+    $user = User::factory()->create();
+    $user->teams()->attach($team, ['role' => $role]);
 
-    protected User $user;
+    $server = Server::factory()->create([
+        'team_id' => $team->id,
+        'name' => 'Test Server',
+        'ip' => '192.168.1.100',
+    ]);
 
-    protected Team $team;
-
-    protected Server $server;
-
-    protected function setUp(): void
-    {
-        parent::setUp();
-        (new InstanceSettings)->forceFill(['id' => 0])->save();
-
-        // Create test user and team
-        $this->user = User::factory()->create();
-        $this->team = Team::factory()->create(['name' => 'Test Team']);
-        $this->user->teams()->attach($this->team);
-
-        // Create test server
-        $this->server = Server::factory()->create([
-            'team_id' => $this->team->id,
-            'name' => 'Test Server',
-            'ip' => '192.168.1.100',
-        ]);
-
-        // Authenticate user
-        $this->actingAs($this->user);
-        session(['currentTeam' => $this->team]);
-    }
-
-    public function test_restart_dispatches_job_for_all_servers()
-    {
-        Queue::fake();
-
-        Livewire::test('server.navbar', ['server' => $this->server])
-            ->call('restart');
-
-        // Assert job was dispatched
-        Queue::assertPushed(RestartProxyJob::class, function ($job) {
-            return $job->server->id === $this->server->id;
-        });
-    }
-
-    public function test_restart_dispatches_job_for_localhost_server()
-    {
-        Queue::fake();
-
-        // Create localhost server (id = 0)
-        $localhostServer = Server::factory()->create([
-            'id' => 0,
-            'team_id' => $this->team->id,
-            'name' => 'Localhost',
-            'ip' => 'host.docker.internal',
-        ]);
-
-        Livewire::test('server.navbar', ['server' => $localhostServer])
-            ->call('restart');
-
-        // Assert job was dispatched
-        Queue::assertPushed(RestartProxyJob::class, function ($job) use ($localhostServer) {
-            return $job->server->id === $localhostServer->id;
-        });
-    }
-
-    public function test_restart_shows_info_message()
-    {
-        Queue::fake();
-
-        Livewire::test('server.navbar', ['server' => $this->server])
-            ->call('restart')
-            ->assertDispatched('info', 'Proxy restart initiated. Monitor progress in activity logs.');
-    }
-
-    public function test_unauthorized_user_cannot_restart_proxy()
-    {
-        Queue::fake();
-
-        // Create another user without access
-        auth()->logout();
-        $unauthorizedUser = User::factory()->create();
-        $this->actingAs($unauthorizedUser);
-        session(['currentTeam' => $unauthorizedUser->teams()->first()]);
-
-        Livewire::test('server.navbar', ['server' => $this->server])
-            ->call('restart')
-            ->assertDispatched('error');
-
-        // Assert job was NOT dispatched
-        Queue::assertNotPushed(RestartProxyJob::class);
-    }
-
-    public function test_restart_prevents_concurrent_jobs_via_without_overlapping()
-    {
-        Queue::fake();
-
-        // Dispatch job twice
-        Livewire::test('server.navbar', ['server' => $this->server])
-            ->call('restart');
-
-        Livewire::test('server.navbar', ['server' => $this->server])
-            ->call('restart');
-
-        // Assert job was pushed twice (WithoutOverlapping middleware will handle deduplication)
-        Queue::assertPushed(RestartProxyJob::class, 2);
-
-        // Get the jobs
-        $jobs = Queue::pushed(RestartProxyJob::class);
-
-        // Verify both jobs have WithoutOverlapping middleware
-        foreach ($jobs as $job) {
-            $middleware = $job->middleware();
-            $this->assertCount(1, $middleware);
-            $this->assertInstanceOf(WithoutOverlapping::class, $middleware[0]);
-        }
-    }
-
-    public function test_restart_uses_server_team_id()
-    {
-        Queue::fake();
-
-        Livewire::test('server.navbar', ['server' => $this->server])
-            ->call('restart');
-
-        Queue::assertPushed(RestartProxyJob::class, function ($job) {
-            return $job->server->team_id === $this->team->id;
-        });
-    }
+    return [$user, $team, $server];
 }
+
+function makeRestartProxyServerRunning(Server $server): void
+{
+    $server->settings()->update([
+        'is_reachable' => true,
+        'is_usable' => true,
+    ]);
+    $server->proxy->status = 'running';
+    $server->proxy->type = ProxyTypes::TRAEFIK->value;
+    $server->save();
+    $server->refresh();
+}
+
+function authenticateRestartProxyUser(User $user, Team $team): void
+{
+    test()->actingAs($user);
+    session(['currentTeam' => $team]);
+}
+
+test('admin restart dispatches a serialized proxy mutation for the selected server', function () {
+    Queue::fake();
+    [$user, $team, $server] = setupRestartProxyUser('admin');
+    authenticateRestartProxyUser($user, $team);
+
+    Livewire::test('server.navbar', ['server' => $server])
+        ->call('restart')
+        ->assertDispatched('info', 'Proxy restart initiated. Monitor progress in activity logs.');
+
+    Queue::assertPushed(RestartProxyJob::class, function (RestartProxyJob $job) use ($server, $team): bool {
+        return $job->server->is($server)
+            && $job->server->team_id === $team->id
+            && collect($job->middleware())->contains(fn (object $middleware): bool => $middleware instanceof WithoutOverlapping);
+    });
+});
+
+test('admin can restart the localhost proxy', function () {
+    Queue::fake();
+    [$user, $team] = setupRestartProxyUser('admin');
+    $localhostServer = Server::factory()->create([
+        'id' => 0,
+        'team_id' => $team->id,
+        'name' => 'Localhost',
+        'ip' => 'host.docker.internal',
+    ]);
+    authenticateRestartProxyUser($user, $team);
+
+    Livewire::test('server.navbar', ['server' => $localhostServer])
+        ->call('restart');
+
+    Queue::assertPushed(RestartProxyJob::class, fn (RestartProxyJob $job): bool => $job->server->is($localhostServer));
+});
+
+test('two restart requests retain per-server overlap protection', function () {
+    Queue::fake();
+    [$user, $team, $server] = setupRestartProxyUser('admin');
+    authenticateRestartProxyUser($user, $team);
+
+    Livewire::test('server.navbar', ['server' => $server])->call('restart');
+    Livewire::test('server.navbar', ['server' => $server])->call('restart');
+
+    Queue::assertPushed(RestartProxyJob::class, 2);
+    foreach (Queue::pushed(RestartProxyJob::class) as $job) {
+        expect($job->middleware())
+            ->toHaveCount(1)
+            ->and($job->middleware()[0])->toBeInstanceOf(WithoutOverlapping::class);
+    }
+});
+
+test('user outside the server team cannot restart its proxy', function () {
+    Queue::fake();
+    [, , $server] = setupRestartProxyUser('admin');
+    [$otherUser, $otherTeam] = setupRestartProxyUser('admin');
+    authenticateRestartProxyUser($otherUser, $otherTeam);
+
+    Livewire::test('server.navbar', ['server' => $server])
+        ->call('restart')
+        ->assertDispatched('error');
+
+    Queue::assertNotPushed(RestartProxyJob::class);
+});
+
+test('member cannot restart a proxy', function () {
+    Queue::fake();
+    [$user, $team, $server] = setupRestartProxyUser('member');
+    authenticateRestartProxyUser($user, $team);
+
+    Livewire::test('server.navbar', ['server' => $server])
+        ->call('restart')
+        ->assertDispatched('error');
+
+    Queue::assertNotPushed(RestartProxyJob::class);
+});
+
+test('member cannot see proxy restart and stop buttons', function () {
+    [$user, $team, $server] = setupRestartProxyUser('member');
+    makeRestartProxyServerRunning($server);
+
+    $mock = Mockery::mock($server)->makePartial();
+    $mock->shouldReceive('proxySet')->andReturn(true);
+    authenticateRestartProxyUser($user, $team);
+
+    Livewire::test('server.navbar', ['server' => $mock])
+        ->assertDontSee('Restart Proxy')
+        ->assertDontSee('Stop Proxy');
+});
+
+test('admin can see proxy restart and stop buttons', function () {
+    [$user, $team, $server] = setupRestartProxyUser('admin');
+    makeRestartProxyServerRunning($server);
+
+    $mock = Mockery::mock($server)->makePartial();
+    $mock->shouldReceive('proxySet')->andReturn(true);
+    authenticateRestartProxyUser($user, $team);
+
+    Livewire::test('server.navbar', ['server' => $mock])
+        ->assertSee('Restart Proxy')
+        ->assertSee('Stop Proxy');
+});
+
+test('member cannot see start proxy button', function () {
+    [$user, $team, $server] = setupRestartProxyUser('member');
+
+    $server->proxy->status = 'exited';
+    $server->proxy->type = ProxyTypes::TRAEFIK->value;
+    $server->save();
+    $server->refresh();
+
+    $mock = Mockery::mock($server)->makePartial();
+    $mock->shouldReceive('proxySet')->andReturn(true);
+    authenticateRestartProxyUser($user, $team);
+
+    Livewire::test('server.navbar', ['server' => $mock])
+        ->assertDontSee('Start Proxy');
+});

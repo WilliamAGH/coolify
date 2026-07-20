@@ -1,7 +1,9 @@
 <?php
 
+use App\Models\InstanceSettings;
 use App\Models\Server;
 use Illuminate\Support\Once;
+use Tests\TestCase;
 
 /*
 |--------------------------------------------------------------------------
@@ -13,7 +15,7 @@ use Illuminate\Support\Once;
 | need to change it using the "uses()" function to bind a different classes or traits.
 |
 */
-uses(Tests\TestCase::class)->in('Feature', 'v4/Feature', 'v4/Browser');
+uses(TestCase::class)->in('Feature', 'v4/Feature', 'v4/Browser');
 
 /*
 |--------------------------------------------------------------------------
@@ -30,6 +32,23 @@ beforeEach(function () {
     // Flush the Server identity map cache to ensure tests get fresh data
     Server::flushIdentityMap();
 });
+
+function loginAndSkipBoarding(string $email = 'test@example.com', string $password = 'password'): mixed
+{
+    return visit('/login')
+        ->fill('email', $email)
+        ->fill('password', $password)
+        ->click('Login')
+        ->click('Skip Setup');
+}
+
+function seedBrowserInstanceSettings(): InstanceSettings
+{
+    return InstanceSettings::unguarded(fn (): InstanceSettings => InstanceSettings::query()->create([
+        'id' => 0,
+        'is_sponsorship_popup_enabled' => false,
+    ]));
+}
 
 /*
 |--------------------------------------------------------------------------

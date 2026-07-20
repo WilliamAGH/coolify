@@ -7,6 +7,7 @@ use App\Actions\Server\ValidateServer;
 use App\Enums\ProxyStatus;
 use App\Enums\ProxyTypes;
 use App\Http\Controllers\Controller;
+use App\Jobs\ValidateAndInstallServerJob;
 use App\Models\Application;
 use App\Models\PrivateKey;
 use App\Models\Project;
@@ -22,9 +23,14 @@ class ServersController extends Controller
 {
     private function removeSensitiveDataFromSettings($settings)
     {
-        if (request()->attributes->get('can_read_sensitive', false) === false) {
-            $settings = $settings->makeHidden([
+        if (request()->attributes->get('can_read_sensitive', false) === true) {
+            $settings = $settings->makeVisible([
                 'sentinel_token',
+                'sentinel_custom_url',
+                'logdrain_newrelic_license_key',
+                'logdrain_axiom_api_key',
+                'logdrain_custom_config',
+                'logdrain_custom_config_parser',
             ]);
         }
 
@@ -36,8 +42,11 @@ class ServersController extends Controller
         $server->makeHidden([
             'id',
         ]);
-        if (request()->attributes->get('can_read_sensitive', false) === false) {
-            // Do nothing
+        if (request()->attributes->get('can_read_sensitive', false) === true) {
+            $server->makeVisible([
+                'logdrain_axiom_api_key',
+                'logdrain_newrelic_license_key',
+            ]);
         }
 
         return serializeApiResponse($server);
@@ -147,6 +156,7 @@ class ServersController extends Controller
         if (is_null($server)) {
             return response()->json(['message' => 'Server not found.'], 404);
         }
+        $this->authorize('view', $server);
         if ($with_resources) {
             $server['resources'] = $server->definedResources()->map(function ($resource) {
                 $payload = [
@@ -476,6 +486,7 @@ class ServersController extends Controller
         if (is_null($teamId)) {
             return invalidTokenResponse();
         }
+        $this->authorize('create', [ModelsServer::class]);
 
         $return = validateIncomingRequest($request);
         if ($return instanceof JsonResponse) {
@@ -700,6 +711,7 @@ class ServersController extends Controller
         if (! $server) {
             return response()->json(['message' => 'Server not found.'], 404);
         }
+        $this->authorize('update', $server);
         if ($request->proxy_type) {
             $validProxyTypes = collect(ProxyTypes::cases())->map(function ($proxyType) {
                 return str($proxyType->value)->lower();
@@ -721,6 +733,13 @@ class ServersController extends Controller
             return response()->json([
                 'message' => 'Validation failed.',
                 'errors' => ['server_disk_usage_check_frequency' => ['Invalid Cron / Human expression for Disk Usage Check Frequency.']],
+            ], 422);
+        }
+
+        if ($request->boolean('is_build_server') && ! $server->isBuildServer() && ! $server->isEmpty()) {
+            return response()->json([
+                'message' => 'Validation failed.',
+                'errors' => ['is_build_server' => ['A server with existing resources cannot be configured as a build server.']],
             ], 422);
         }
 
@@ -824,6 +843,7 @@ class ServersController extends Controller
         if (! $server) {
             return response()->json(['message' => 'Server not found.'], 404);
         }
+        $this->authorize('delete', $server);
 
         $force = filter_var($request->query('force', false), FILTER_VALIDATE_BOOLEAN);
 
@@ -850,7 +870,7 @@ class ServersController extends Controller
         return response()->json(['message' => 'Server deleted.']);
     }
 
-    #[OA\Get(
+    #[OA\Post(
         summary: 'Validate',
         description: 'Validate server by UUID.',
         path: '/servers/{uuid}/validate',
@@ -862,6 +882,19 @@ class ServersController extends Controller
         parameters: [
             new OA\Parameter(name: 'uuid', in: 'path', required: true, description: 'Server UUID', schema: new OA\Schema(type: 'string')),
         ],
+        requestBody: new OA\RequestBody(
+            required: false,
+            content: new OA\JsonContent(
+                properties: [
+                    new OA\Property(
+                        property: 'install',
+                        description: 'Install missing prerequisites and Docker. This can restart the Docker daemon.',
+                        type: 'boolean',
+                        default: false,
+                    ),
+                ],
+            ),
+        ),
         responses: [
             new OA\Response(
                 response: 201,
@@ -910,14 +943,34 @@ class ServersController extends Controller
         if (! $server) {
             return response()->json(['message' => 'Server not found.'], 404);
         }
-        ValidateServer::dispatch($server);
+        $this->authorize('update', $server);
+
+        $validator = customApiValidator($request->all(), [
+            'install' => 'boolean',
+        ]);
+        if ($validator->fails()) {
+            return response()->json([
+                'message' => 'Validation failed.',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        $install = $request->boolean('install', false);
+        if ($install) {
+            ValidateAndInstallServerJob::dispatch($server);
+        } else {
+            ValidateServer::dispatch($server);
+        }
 
         auditLog('api.server.validated', [
             'team_id' => $teamId,
             'server_uuid' => $server->uuid,
             'server_name' => $server->name,
+            'install' => $install,
         ]);
 
-        return response()->json(['message' => 'Validation started.'], 201);
+        $message = $install ? 'Validation and installation started.' : 'Validation started.';
+
+        return response()->json(['message' => $message], 201);
     }
 }
