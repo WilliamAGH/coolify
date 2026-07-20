@@ -110,6 +110,27 @@ SH);
         && $request['url'] === 'https://cdn.coollabs.io/coolify/upgrade-postgres.sh');
 });
 
+it('publishes the canonical installer bytes to the nightly CDN channel', function () {
+    Http::fake([
+        'https://cdn.coollabs.io/coolify-nightly/*' => Http::response('', 404),
+        'https://storage.bunnycdn.com/*' => Http::response([], 201),
+        'https://api.bunny.net/purge*' => Http::response([], 200),
+    ]);
+
+    $this->artisan('sync:bunny --bunny')
+        ->expectsChoice('Which environment would you like to sync?', 'nightly', [
+            'production' => 'Production',
+            'nightly' => 'Nightly',
+        ])
+        ->expectsConfirmation('Are you sure you want to sync?', 'yes')
+        ->assertExitCode(0);
+
+    $canonicalInstaller = file_get_contents(base_path('scripts/install.sh'));
+    Http::assertSent(fn ($request): bool => $request->method() === 'PUT'
+        && $request->url() === 'https://storage.bunnycdn.com/coolcdn/coolify-nightly/install.sh'
+        && $request->body() === $canonicalInstaller);
+});
+
 it('selects the environment and release files to sync to GitHub', function (string $targetDirectory, string $environment, array $selectedBasenames) {
     Http::fake([
         'api.github.com/repos/coollabsio/coolify/releases*' => Http::response([], 200),

@@ -206,6 +206,11 @@ function applicationValidationWorkflowViolations(array $workflow): array
     }
 
     $workflowAndShell = is_array($jobs) ? ($jobs['workflow-and-shell'] ?? []) : [];
+    $dockerDaemonConfigurationScript = collect($workflowAndShell['steps'] ?? [])
+        ->firstWhere('name', 'Verify Docker daemon configuration ownership')['run'] ?? '';
+    if (! str_contains((string) $dockerDaemonConfigurationScript, 'tests/Integration/DockerDaemonConfigurationTest.sh')) {
+        $violations[] = 'application validation must execute the Docker daemon configuration integration';
+    }
     $databaseMigrationScript = collect($workflowAndShell['steps'] ?? [])
         ->firstWhere('name', 'Verify database migration S6 exit propagation')['run'] ?? '';
     if (! str_contains((string) $databaseMigrationScript, 'tests/Integration/DatabaseMigrationS6/run.sh')) {
@@ -233,6 +238,18 @@ it('defines the required application validation contract', function () {
     $workflow = applicationValidationWorkflow();
 
     expect(applicationValidationWorkflowViolations($workflow))->toBe([]);
+});
+
+it('fails when Docker daemon configuration ownership is removed from required validation', function () {
+    $workflow = applicationValidationWorkflow();
+    $step = collect($workflow['jobs']['workflow-and-shell']['steps'] ?? [])
+        ->search(fn (array $candidate): bool => ($candidate['name'] ?? null) === 'Verify Docker daemon configuration ownership');
+    expect($step)->not->toBeFalse();
+
+    unset($workflow['jobs']['workflow-and-shell']['steps'][$step]);
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('application validation must execute the Docker daemon configuration integration');
 });
 
 it('keeps the aggregate contract structurally connected to every selected result', function () {
