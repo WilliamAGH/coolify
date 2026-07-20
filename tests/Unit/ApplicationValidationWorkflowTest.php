@@ -59,6 +59,7 @@ function applicationValidationWorkflowViolations(array $workflow): array
         'tests/Feature/DatabaseMigrationReadinessTest.php',
         'tests/Feature/BlueGreenSupersessionGenerationTest.php',
         'tests/Feature/LegacyProxyMutationPayloadAdoptionTest.php',
+        'tests/Feature/PostgresUserDeletionConcurrencyTest.php',
         'tests/Feature/ProxyMutationQueueGateTest.php',
         'tests/Feature/QueueApplicationDeploymentCommitTest.php',
         'tests/Unit/ApplicationDeploymentActivationOrderTest.php',
@@ -153,6 +154,20 @@ it('rejects omitting delayed database-startup coverage from PostgreSQL validatio
         ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Run blue-green lifecycle tests');
     $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'] = str_replace(
         'tests/Feature/DatabaseMigrationReadinessTest.php',
+        '',
+        $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'],
+    );
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('blue-green lifecycle validation must execute every ownership and migration gate');
+});
+
+it('rejects omitting PostgreSQL user-deletion concurrency coverage', function () {
+    $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
+    $step = collect($workflow['jobs']['blue-green-lifecycle']['steps'])
+        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Run blue-green lifecycle tests');
+    $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'] = str_replace(
+        'tests/Feature/PostgresUserDeletionConcurrencyTest.php',
         '',
         $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'],
     );

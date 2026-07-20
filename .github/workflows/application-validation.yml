@@ -159,6 +159,7 @@ jobs:
             tests/Feature/DeleteResourceJobBlueGreenTest.php \
             tests/Feature/LegacyProxyMutationPayloadAdoptionTest.php \
             tests/Feature/ProxyMutationQueueGateTest.php \
+            tests/Feature/PostgresUserDeletionConcurrencyTest.php \
             tests/Feature/QueueApplicationDeploymentCommitTest.php \
             tests/Feature/QueueServerDeletionTest.php \
             tests/Feature/ScheduleOnOneServerTest.php \
