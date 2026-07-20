@@ -93,7 +93,19 @@ COPY templates ./templates
 RUN npm run build
 
 # =================================================================
-# Stage 3: Pinned Go source-build base
+# Stage 3: Terminal runtime dependencies
+# =================================================================
+FROM node:${NODE_VERSION} AS terminal-assets
+
+WORKDIR /terminal
+COPY docker/coolify-terminal/package*.json ./
+RUN apk add --no-cache make g++ python3 && \
+    npm ci && \
+    npm rebuild node-pty && \
+    rm -rf /root/.npm
+
+# =================================================================
+# Stage 4: Pinned Go source-build base
 # =================================================================
 FROM --platform=$BUILDPLATFORM ${GO_BUILD_IMAGE} AS go-source-builder
 
@@ -102,7 +114,7 @@ WORKDIR /src
 RUN apk add --no-cache ca-certificates curl tar
 
 # =================================================================
-# Stage 4: Cloudflared from verified vendored source
+# Stage 5: Cloudflared from verified vendored source
 # =================================================================
 FROM go-source-builder AS cloudflared-builder
 
@@ -132,7 +144,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
         github.com/cloudflare/cloudflared/cmd/cloudflared
 
 # =================================================================
-# Stage 5: Git LFS from checksum-verified source and Go modules
+# Stage 6: Git LFS from checksum-verified source and Go modules
 # =================================================================
 FROM go-source-builder AS git-lfs-builder
 
@@ -195,6 +207,8 @@ ARG NGINX_APK_SIGNER_FILE_SHA256
 ARG NGINX_APK_SIGNER_FINGERPRINT_SHA256
 ARG CI=true
 
+STOPSIGNAL SIGTERM
+
 WORKDIR /var/www/html
 
 USER root
@@ -223,6 +237,7 @@ RUN --mount=type=cache,target=/var/cache/apk \
     apk upgrade && \
     apk add --no-cache \
     postgresql${POSTGRES_VERSION}-client \
+    nodejs \
     "su-exec=${SU_EXEC_VERSION}" \
     openssh-client \
     git \
@@ -285,6 +300,13 @@ COPY --chown=www-data:www-data changelogs/ ./changelogs/
 COPY --chown=www-data:www-data --chmod=755 scripts/control-plane-traefik-attestor ./scripts/control-plane-traefik-attestor
 
 RUN composer dump-autoload
+
+# Install terminal WebSocket server dependencies.
+COPY --from=terminal-assets /terminal/node_modules /terminal/node_modules
+COPY --from=terminal-assets /terminal/package*.json /terminal/
+COPY docker/coolify-terminal/terminal-server.js /terminal/terminal-server.js
+COPY docker/coolify-terminal/terminal-utils.js /terminal/terminal-utils.js
+RUN chown -R www-data:www-data /terminal
 
 # Configure Nginx and S6 overlay
 COPY docker/production/etc/nginx/conf.d/custom.conf /etc/nginx/conf.d/custom.conf

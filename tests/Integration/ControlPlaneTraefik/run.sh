@@ -19,9 +19,18 @@ readonly MAX_PROVIDER_CADENCE_MS=5000
 readonly MAX_PROVIDER_START_DELAY_MS=15000
 readonly MAX_RELOAD_DELAY_MS=12000
 readonly MIN_TRANSITION_OBSERVATION_MS=5000
-readonly MAX_TRANSITION_OBSERVATION_MS=17000
+readonly MAX_TRANSITION_OBSERVATION_MS=35000
 readonly TRANSITION_ATTEMPTS=24
 readonly TRANSITION_SAMPLE_DELAY_SECONDS=0.05
+readonly TRANSPORT_MIN_EVENT_COUNT=5
+readonly TRANSPORT_OBSERVER_RELOAD_PHASES=6
+readonly TRANSPORT_OBSERVER_TIMEOUT_MARGIN_MS=15000
+readonly TRANSPORT_OBSERVER_TIMEOUT_MS=$((
+    (2 * MAX_TRANSITION_OBSERVATION_MS)
+    + (TRANSPORT_OBSERVER_RELOAD_PHASES * MAX_RELOAD_DELAY_MS)
+    + TRANSPORT_OBSERVER_TIMEOUT_MARGIN_MS
+))
+readonly BACKGROUND_PID_EXIT_TIMEOUT_MS=5000
 
 TEMP_BASE=''
 TEMP_DIRECTORY=''
@@ -33,6 +42,12 @@ TRAEFIK_API_PORT=''
 TRAEFIK_IMAGE=''
 COMPOSE_STARTED_AT_MS=0
 TRANSITION_OBSERVER_PID=''
+TRANSPORT_OBSERVER_PID=''
+TRANSPORT_OBSERVER_LOG=''
+TRANSPORT_OBSERVER_REPORT=''
+TRANSPORT_OBSERVER_READY=''
+TRANSPORT_OBSERVER_RELEASE=''
+BACKGROUND_PIDS=()
 
 fail() {
     printf 'FAIL: %s\n' "$*" >&2
@@ -51,14 +66,97 @@ compose() {
     docker compose --project-name "$PROJECT_NAME" --file "$COMPOSE_FILE" "$@"
 }
 
+register_background_pid() {
+    local pid=$1
+
+    [[ $pid =~ ^[0-9]+$ ]] || fail "Refusing to register an invalid background PID: $pid"
+    BACKGROUND_PIDS+=("$pid")
+}
+
+unregister_background_pid() {
+    local pid=$1
+    local registered_pid
+    local -a remaining_pids=()
+
+    for registered_pid in "${BACKGROUND_PIDS[@]}"; do
+        if [ "$registered_pid" != "$pid" ]; then
+            remaining_pids+=("$registered_pid")
+        fi
+    done
+    BACKGROUND_PIDS=("${remaining_pids[@]}")
+}
+
+wait_for_registered_background_pid() {
+    local pid=$1
+    local status=0
+
+    wait "$pid" || status=$?
+    unregister_background_pid "$pid"
+
+    return "$status"
+}
+
+background_pid_is_running() {
+    local expected_pid=$1
+    local running_pid
+
+    while IFS= read -r running_pid; do
+        if [ "$running_pid" = "$expected_pid" ]; then
+            return 0
+        fi
+    done < <(jobs -pr)
+
+    return 1
+}
+
+terminate_registered_background_pids() {
+    local pid
+
+    for pid in "${BACKGROUND_PIDS[@]}"; do
+        if background_pid_is_running "$pid"; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+}
+
+reap_registered_background_pids() {
+    local deadline=$(( $(now_ms) + BACKGROUND_PID_EXIT_TIMEOUT_MS ))
+    local pid
+    local running=0
+
+    while [ "$(now_ms)" -lt "$deadline" ]; do
+        running=0
+        for pid in "${BACKGROUND_PIDS[@]}"; do
+            if background_pid_is_running "$pid"; then
+                running=1
+                break
+            fi
+        done
+        [ "$running" -eq 0 ] && break
+        sleep 0.05
+    done
+
+    for pid in "${BACKGROUND_PIDS[@]}"; do
+        if background_pid_is_running "$pid"; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    done
+    for pid in "${BACKGROUND_PIDS[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    BACKGROUND_PIDS=()
+}
+
 cleanup() {
     local exit_code=$?
 
     trap - EXIT
     set +e
+    terminate_registered_background_pids
     if [ "$COMPOSE_STARTED" -eq 1 ]; then
         compose down --volumes --remove-orphans >/dev/null 2>&1
     fi
+    reap_registered_background_pids
     if [ -n "$TEMP_DIRECTORY" ]; then
         case "$TEMP_DIRECTORY" in
             "$TEMP_BASE"/coolify-control-plane-traefik.*)
@@ -150,6 +248,47 @@ fetch_route() {
         "$(header_value 'X-Coolify-Control-Plane-Dynamic-Sha' "$headers_file")" \
         "$(header_value 'X-Integration-Backend' "$headers_file")"
     rm -f -- "$headers_file"
+}
+
+assert_transport_http() {
+    local route=$1
+    local expected_backend=$2
+    local expected_color=$3
+    local expected_generation=$4
+    local expected_dynamic_sha=$5
+    local headers_file
+    local body_file
+    local status
+    local url
+
+    headers_file=$(mktemp "$TEMP_DIRECTORY/transport-headers.XXXXXX")
+    body_file=$(mktemp "$TEMP_DIRECTORY/transport-body.XXXXXX")
+    if [ "$route" = https ]; then
+        url="https://127.0.0.1:${TRAEFIK_HTTPS_PORT}/transport/http"
+    elif [ "$route" = app-port ]; then
+        url="http://127.0.0.1:${TRAEFIK_APP_PORT}/transport/http"
+    else
+        rm -f -- "$headers_file" "$body_file"
+        fail "Unknown transport route: $route"
+    fi
+
+    if ! status=$(curl --silent --show-error --insecure --noproxy '*' --connect-timeout 2 --max-time 4 \
+        --header "Host: ${CONTROL_PLANE_HOST}" --dump-header "$headers_file" --output "$body_file" --write-out '%{http_code}' "$url"); then
+        status=000
+    fi
+    [ "$status" = 200 ] || fail "$route transport HTTP request returned status $status"
+    [ "$(header_value 'X-Integration-Backend' "$headers_file")" = "$expected_backend" ] \
+        || fail "$route transport HTTP request reached the wrong backend"
+    [ "$(header_value 'X-Coolify-Control-Plane-Dynamic-Sha' "$headers_file")" = "$expected_dynamic_sha" ] \
+        || fail "$route transport HTTP request returned a stale dynamic SHA"
+    jq -e \
+        --arg backend "$expected_backend" \
+        --arg color "$expected_color" \
+        --arg dynamic_sha "$expected_dynamic_sha" \
+        --arg generation "$expected_generation" \
+        '.transport == "http" and .sequence == 1 and .backend == $backend and .color == $color and .dynamicSha == $dynamic_sha and .generation == $generation' \
+        "$body_file" >/dev/null || fail "$route transport HTTP request returned an inconsistent payload"
+    rm -f -- "$headers_file" "$body_file"
 }
 
 probe_forwarded_identity() {
@@ -598,8 +737,276 @@ wait_for_docker_provider_route() {
     fail 'Docker-provider route did not become reachable'
 }
 
+start_transport_observer() {
+    local transition=$1
+    local backend=$2
+    local state_directory=$3
+    local log_name="transport-${transition}.log"
+    local ready_name="transport-${transition}-ready.json"
+    local release_name="transport-${transition}-release.json"
+    local report_name="transport-${transition}-report.json"
+
+    TRANSPORT_OBSERVER_LOG="$TEMP_DIRECTORY/$log_name"
+    TRANSPORT_OBSERVER_READY="$state_directory/$ready_name"
+    TRANSPORT_OBSERVER_RELEASE="$state_directory/$release_name"
+    TRANSPORT_OBSERVER_REPORT="$state_directory/$report_name"
+    rm -f -- "$TRANSPORT_OBSERVER_LOG" "$TRANSPORT_OBSERVER_READY" "$TRANSPORT_OBSERVER_RELEASE" "$TRANSPORT_OBSERVER_REPORT"
+
+    compose exec -T "$backend" node /transport-observer.js \
+        "/state/$report_name" \
+        "/state/$ready_name" \
+        "/state/$release_name" \
+        "$CONTROL_PLANE_HOST" \
+        "$TRANSPORT_MIN_EVENT_COUNT" \
+        "$TRANSPORT_OBSERVER_TIMEOUT_MS" > "$TRANSPORT_OBSERVER_LOG" 2>&1 &
+    TRANSPORT_OBSERVER_PID=$!
+    register_background_pid "$TRANSPORT_OBSERVER_PID"
+}
+
+wait_for_transport_observer_ready() {
+    local transition=$1
+    local ready_path=$2
+    local observer_log=$3
+    local deadline=$(( $(now_ms) + MAX_RELOAD_DELAY_MS ))
+
+    while [ "$(now_ms)" -lt "$deadline" ]; do
+        if [ -s "$ready_path" ] && jq -e '
+            (.sse.startedAt | type == "number")
+            and (.sse.firstEventAt | type == "number")
+            and (.websocket.startedAt | type == "number")
+            and (.websocket.firstEventAt | type == "number")
+        ' "$ready_path" >/dev/null; then
+            return
+        fi
+        sleep 0.05
+    done
+    cat "$observer_log" >&2 || true
+    fail "$transition transport observer did not receive initial SSE and WebSocket events"
+}
+
+publish_transport_release() {
+    local transition=$1
+    local applied_at_ms=$2
+    local release_path=$3
+    local staged_release
+
+    [[ $applied_at_ms =~ ^[0-9]{13,16}$ ]] || fail "Refusing to publish a malformed $transition transport barrier"
+    staged_release=$(mktemp "${release_path}.XXXXXX")
+    jq -n \
+        --arg transition "$transition" \
+        --argjson applied_at "$applied_at_ms" \
+        '{transition: $transition, appliedAt: $applied_at}' > "$staged_release"
+    mv -f -- "$staged_release" "$release_path"
+}
+
+wait_for_transport_observer() {
+    local transition=$1
+    local observer_pid=$2
+    local observer_log=$3
+    local observer_report=$4
+
+    if ! wait_for_registered_background_pid "$observer_pid"; then
+        cat "$observer_log" >&2 || true
+        fail "$transition transport observer terminated before crossing its applied-config barrier"
+    fi
+    [ -s "$observer_report" ] || fail "$transition transport observer did not publish a continuity report"
+}
+
+assert_transport_continuity() {
+    local report_file=$1
+    local transition=$2
+    local observer_not_before_ms=$3
+    local switch_started_at_ms=$4
+    local transition_applied_at_ms=$5
+    local expected_backend=$6
+    local expected_color=$7
+    local expected_generation=$8
+    local expected_dynamic_sha=$9
+
+    jq -e \
+        --arg backend "$expected_backend" \
+        --arg color "$expected_color" \
+        --arg dynamic_sha "$expected_dynamic_sha" \
+        --arg generation "$expected_generation" \
+        --arg transition "$transition" \
+        --argjson applied_at "$transition_applied_at_ms" \
+        --argjson minimum_count "$TRANSPORT_MIN_EVENT_COUNT" \
+        --argjson observer_not_before "$observer_not_before_ms" \
+        --argjson switch_started_at "$switch_started_at_ms" '
+            .minimumEventCount == $minimum_count
+            and .release == {transition: $transition, appliedAt: $applied_at}
+            and .sse.release == .release
+            and .websocket.release == .release
+            and .sse.status == 200
+            and .websocket.status == 101
+            and .sse.startedAt >= $observer_not_before
+            and .websocket.startedAt >= $observer_not_before
+            and .sse.startedAt < $switch_started_at
+            and .websocket.startedAt < $switch_started_at
+            and .sse.events[0].receivedAt < $switch_started_at
+            and .websocket.events[0].receivedAt < $switch_started_at
+            and .sse.events[-1].receivedAt >= $applied_at
+            and .websocket.events[-1].receivedAt >= $applied_at
+            and .sse.completedAt >= $applied_at
+            and .websocket.completedAt >= $applied_at
+            and (.sse.events | length >= $minimum_count)
+            and (.websocket.events | length >= $minimum_count)
+            and ([.sse.events[].sequence] == [range(1; (.sse.events | length) + 1)])
+            and ([.websocket.events[].sequence] == [range(1; (.websocket.events | length) + 1)])
+            and ([.sse.events[].receivedAt] == ([.sse.events[].receivedAt] | sort))
+            and ([.websocket.events[].receivedAt] == ([.websocket.events[].receivedAt] | sort))
+            and (([.sse.events[].backend] | unique) == [$backend])
+            and (([.websocket.events[].backend] | unique) == [$backend])
+            and (([.sse.events[].color] | unique) == [$color])
+            and (([.websocket.events[].color] | unique) == [$color])
+            and (([.sse.events[].generation] | unique) == [$generation])
+            and (([.websocket.events[].generation] | unique) == [$generation])
+            and (([.sse.events[].dynamicSha] | unique) == [$dynamic_sha])
+            and (([.websocket.events[].dynamicSha] | unique) == [$dynamic_sha])
+            and (([.sse.events[].transport] | unique) == ["sse"])
+            and (([.websocket.events[].transport] | unique) == ["websocket"])
+            and ([.sse.events[].connectionId] | unique | length == 1)
+            and ([.websocket.events[].connectionId] | unique | length == 1)
+        ' "$report_file" >/dev/null || fail "$transition SSE or WebSocket connection did not cross the applied-config barrier"
+}
+
+assert_full_cycle_transport_continuity() {
+    local report_file=$1
+    local forward_switch_started_at_ms=$2
+    local forward_applied_at_ms=$3
+    local rollback_switch_started_at_ms=$4
+    local rollback_applied_at_ms=$5
+    local expected_backend=$6
+    local expected_color=$7
+    local expected_generation=$8
+    local expected_dynamic_sha=$9
+
+    assert_transport_continuity "$report_file" full-cycle 0 "$forward_switch_started_at_ms" "$rollback_applied_at_ms" \
+        "$expected_backend" "$expected_color" "$expected_generation" "$expected_dynamic_sha"
+    jq -e \
+        --argjson forward_applied_at "$forward_applied_at_ms" \
+        --argjson rollback_started_at "$rollback_switch_started_at_ms" '
+            any(.sse.events[]; .receivedAt >= $forward_applied_at and .receivedAt < $rollback_started_at)
+            and any(.websocket.events[]; .receivedAt >= $forward_applied_at and .receivedAt < $rollback_started_at)
+        ' "$report_file" >/dev/null \
+        || fail 'Original SSE or WebSocket connection did not remain active throughout the green-applied interval'
+}
+
+write_transport_report_fixture() {
+    local destination=$1
+    local fixture_kind=$2
+    local staged_fixture
+
+    jq -n '
+        def events($transport; $connection_id):
+            [
+                {sequence: 1, receivedAt: 1500},
+                {sequence: 2, receivedAt: 2500},
+                {sequence: 3, receivedAt: 3500},
+                {sequence: 4, receivedAt: 4500},
+                {sequence: 5, receivedAt: 5500},
+                {sequence: 6, receivedAt: 6500}
+            ]
+            | map(. + {
+                backend: "blue",
+                color: "blue",
+                connectionId: $connection_id,
+                dynamicSha: "sha-blue",
+                generation: "generation-blue",
+                transport: $transport
+            });
+        {
+            minimumEventCount: 5,
+            release: {transition: "full-cycle", appliedAt: 6000},
+            sse: {
+                completedAt: 6500,
+                events: events("sse"; "sse-connection"),
+                release: {transition: "full-cycle", appliedAt: 6000},
+                startedAt: 1000,
+                status: 200
+            },
+            websocket: {
+                completedAt: 6500,
+                events: events("websocket"; "websocket-connection"),
+                release: {transition: "full-cycle", appliedAt: 6000},
+                startedAt: 1000,
+                status: 101
+            }
+        }
+    ' > "$destination"
+
+    [ "$fixture_kind" = valid ] && return
+    staged_fixture=$(mktemp "${destination}.XXXXXX")
+    case "$fixture_kind" in
+        wrong-backend)
+            jq '.sse.events[2].backend = "green"' "$destination" > "$staged_fixture"
+            ;;
+        wrong-color)
+            jq '.websocket.events[2].color = "green"' "$destination" > "$staged_fixture"
+            ;;
+        wrong-generation)
+            jq '.sse.events[2].generation = "generation-green"' "$destination" > "$staged_fixture"
+            ;;
+        wrong-dynamic-sha)
+            jq '.websocket.events[2].dynamicSha = "sha-green"' "$destination" > "$staged_fixture"
+            ;;
+        changed-connection-id)
+            jq '.sse.events[3].connectionId = "sse-successor"' "$destination" > "$staged_fixture"
+            ;;
+        missing-green-interval)
+            jq '
+                .sse.events |= map(if .receivedAt >= 3000 and .receivedAt < 5000 then .receivedAt = 2500 else . end)
+                | .websocket.events |= map(if .receivedAt >= 3000 and .receivedAt < 5000 then .receivedAt = 2500 else . end)
+            ' "$destination" > "$staged_fixture"
+            ;;
+        missing-post-rollback)
+            jq '
+                .sse.events |= map(if .receivedAt >= 6000 then .receivedAt = 5500 else . end)
+                | .websocket.events |= map(if .receivedAt >= 6000 then .receivedAt = 5500 else . end)
+                | .sse.completedAt = 5500
+                | .websocket.completedAt = 5500
+            ' "$destination" > "$staged_fixture"
+            ;;
+        *)
+            rm -f -- "$staged_fixture"
+            fail "Unknown transport report fixture: $fixture_kind"
+            ;;
+    esac
+    mv -f -- "$staged_fixture" "$destination"
+}
+
+expect_transport_report_failure() {
+    local report_file=$1
+    local fixture_kind=$2
+
+    if (
+        trap - EXIT
+        assert_full_cycle_transport_continuity "$report_file" 2000 3000 5000 6000 \
+            blue blue generation-blue sha-blue
+    ) >/dev/null 2>&1; then
+        fail "Transport report fixture unexpectedly passed: $fixture_kind"
+    fi
+}
+
+assert_transport_report_validation() {
+    local fixture_kind
+    local report_file
+
+    for fixture_kind in valid wrong-backend wrong-color wrong-generation wrong-dynamic-sha changed-connection-id missing-green-interval missing-post-rollback; do
+        report_file="$TEMP_DIRECTORY/transport-report-${fixture_kind}.json"
+        write_transport_report_fixture "$report_file" "$fixture_kind"
+        if [ "$fixture_kind" = valid ]; then
+            assert_full_cycle_transport_continuity "$report_file" 2000 3000 5000 6000 \
+                blue blue generation-blue sha-blue
+        else
+            expect_transport_report_failure "$report_file" "$fixture_kind"
+        fi
+    done
+}
+
 start_transition_observer() {
     local log_file=$1
+    local applied_barrier_file=$2
     local attempt=1
     local first_https_observed_at_ms=0
     local first_app_port_observed_at_ms=0
@@ -607,9 +1014,11 @@ start_transition_observer() {
     local app_port_observed_at_ms=0
     local observer_started_at_ms
     local record
+    local transition_applied_at_ms=0
 
     : > "$log_file"
     (
+        trap - EXIT
         observer_started_at_ms=$(monotonic_ms)
         while :; do
             record=$(fetch_route https)
@@ -624,19 +1033,27 @@ start_transition_observer() {
                 first_https_observed_at_ms=$https_observed_at_ms
                 first_app_port_observed_at_ms=$app_port_observed_at_ms
             fi
+            if [ -s "$applied_barrier_file" ]; then
+                transition_applied_at_ms=$(jq -er '.appliedAt | select(type == "number")' "$applied_barrier_file")
+            fi
             if [ "$attempt" -ge "$TRANSITION_ATTEMPTS" ] \
                 && [ "$((https_observed_at_ms - first_https_observed_at_ms))" -ge "$MIN_TRANSITION_OBSERVATION_MS" ] \
-                && [ "$((app_port_observed_at_ms - first_app_port_observed_at_ms))" -ge "$MIN_TRANSITION_OBSERVATION_MS" ]; then
+                && [ "$((app_port_observed_at_ms - first_app_port_observed_at_ms))" -ge "$MIN_TRANSITION_OBSERVATION_MS" ] \
+                && [ "$transition_applied_at_ms" -gt 0 ] \
+                && [ "$https_observed_at_ms" -ge "$transition_applied_at_ms" ] \
+                && [ "$app_port_observed_at_ms" -ge "$transition_applied_at_ms" ]; then
                 break
             fi
             if [ "$(( $(monotonic_ms) - observer_started_at_ms ))" -ge "$MAX_TRANSITION_OBSERVATION_MS" ]; then
-                fail 'Transition observer could not collect a five-second timestamp span within the bounded observation window'
+                printf '%s\n' 'Transition observer did not cross the applied-config barrier within the bounded observation window' >&2
+                exit 1
             fi
             sleep "$TRANSITION_SAMPLE_DELAY_SECONDS"
             attempt=$((attempt + 1))
         done
     ) &
     TRANSITION_OBSERVER_PID=$!
+    register_background_pid "$TRANSITION_OBSERVER_PID"
 }
 
 wait_for_observer_samples() {
@@ -663,6 +1080,8 @@ assert_transition_log() {
     local new_acknowledgement=$8
     local new_dynamic_sha=$9
     local new_backend=${10}
+    local old_backend=${11}
+    local transition_applied_at_ms=${12}
     local observed_at_ms route status color generation acknowledgement dynamic_sha backend
     local https_samples=0
     local app_port_samples=0
@@ -670,6 +1089,8 @@ assert_transition_log() {
     local old_app_port=0
     local new_https=0
     local new_app_port=0
+    local new_https_after_applied=0
+    local new_app_port_after_applied=0
     local first_https_observed_at_ms=0
     local first_app_port_observed_at_ms=0
     local last_observed_at_ms=0
@@ -678,6 +1099,7 @@ assert_transition_log() {
     local https_observation_ms
     local app_port_observation_ms
 
+    [[ $transition_applied_at_ms =~ ^[0-9]{13,16}$ ]] || fail 'Transition validator received a malformed applied-config timestamp'
     awk -F'|' 'NF != 8 { exit 1 }' "$log_file" || fail 'Transition observer recorded a malformed sample'
     while IFS='|' read -r observed_at_ms route status color generation acknowledgement dynamic_sha backend; do
         [[ $observed_at_ms =~ ^[0-9]{13,16}$ ]] || fail 'Transition observer recorded a malformed epoch-millisecond timestamp'
@@ -686,7 +1108,7 @@ assert_transition_log() {
         fi
         last_observed_at_ms=$observed_at_ms
         [ "$status" = 200 ] || fail "Transition observer saw $route status $status"
-        if [ "$color" = "$old_color" ] && [ "$generation" = "$old_generation" ] && [ "$acknowledgement" = "$old_acknowledgement" ] && [ "$dynamic_sha" = "$old_dynamic_sha" ]; then
+        if [ "$color" = "$old_color" ] && [ "$generation" = "$old_generation" ] && [ "$acknowledgement" = "$old_acknowledgement" ] && [ "$dynamic_sha" = "$old_dynamic_sha" ] && [ "$backend" = "$old_backend" ]; then
             if [ "$route" = https ]; then
                 old_https=$((old_https + 1))
             else
@@ -695,8 +1117,14 @@ assert_transition_log() {
         elif [ "$color" = "$new_color" ] && [ "$generation" = "$new_generation" ] && [ "$acknowledgement" = "$new_acknowledgement" ] && [ "$dynamic_sha" = "$new_dynamic_sha" ] && [ "$backend" = "$new_backend" ]; then
             if [ "$route" = https ]; then
                 new_https=$((new_https + 1))
+                if [ "$observed_at_ms" -ge "$transition_applied_at_ms" ]; then
+                    new_https_after_applied=$((new_https_after_applied + 1))
+                fi
             else
                 new_app_port=$((new_app_port + 1))
+                if [ "$observed_at_ms" -ge "$transition_applied_at_ms" ]; then
+                    new_app_port_after_applied=$((new_app_port_after_applied + 1))
+                fi
             fi
         else
             fail "Transition observer saw a mixed or partial route identity on $route"
@@ -729,6 +1157,8 @@ assert_transition_log() {
     [ "$app_port_samples" -ge "$TRANSITION_ATTEMPTS" ] || fail 'Transition observer did not sample APP_PORT enough times'
     [ "$old_https" -gt 0 ] && [ "$old_app_port" -gt 0 ] || fail 'Transition observer never saw the predecessor identity on both routes'
     [ "$new_https" -gt 0 ] && [ "$new_app_port" -gt 0 ] || fail 'Transition observer never saw the replacement identity on both routes'
+    [ "$new_https_after_applied" -gt 0 ] && [ "$new_app_port_after_applied" -gt 0 ] \
+        || fail 'Transition observer did not sample both replacement routes after their applied-config barrier'
     https_observation_ms=$((last_https_observed_at_ms - first_https_observed_at_ms))
     app_port_observation_ms=$((last_app_port_observed_at_ms - first_app_port_observed_at_ms))
     [ "$https_observation_ms" -ge "$MIN_TRANSITION_OBSERVATION_MS" ] \
@@ -764,6 +1194,9 @@ write_transition_log_fixture() {
             dynamic_sha='sha-green'
             backend='green'
         fi
+        if [ "$fixture_kind" = wrong-predecessor-backend ] && [ "$attempt" -le 12 ]; then
+            backend='green'
+        fi
         if [ "$fixture_kind" = nonmonotonic ] && [ "$attempt" -eq 13 ]; then
             observed_at_ms=1699999999999
         fi
@@ -780,8 +1213,9 @@ write_transition_log_fixture() {
 expect_transition_log_failure() {
     local log_file=$1
     local expected_failure=$2
+    local transition_applied_at_ms=$3
 
-    if (assert_transition_log "$log_file" blue generation-blue ack-blue sha-blue green generation-green ack-green sha-green green) >/dev/null 2>&1; then
+    if (assert_transition_log "$log_file" blue generation-blue ack-blue sha-blue green generation-green ack-green sha-green green blue "$transition_applied_at_ms") >/dev/null 2>&1; then
         fail "Transition-log validator accepted a ${expected_failure} fixture"
     fi
 }
@@ -789,14 +1223,19 @@ expect_transition_log_failure() {
 assert_transition_log_validation() {
     local fixture_kind
     local log_file
+    local transition_applied_at_ms
 
-    for fixture_kind in valid malformed nonmonotonic too-short; do
+    for fixture_kind in valid malformed nonmonotonic too-short wrong-predecessor-backend missing-post-barrier; do
         log_file="$TEMP_DIRECTORY/transition-${fixture_kind}.log"
         write_transition_log_fixture "$log_file" "$fixture_kind"
+        transition_applied_at_ms=1700000003000
+        if [ "$fixture_kind" = missing-post-barrier ]; then
+            transition_applied_at_ms=1700000006000
+        fi
         if [ "$fixture_kind" = valid ]; then
-            assert_transition_log "$log_file" blue generation-blue ack-blue sha-blue green generation-green ack-green sha-green green
+            assert_transition_log "$log_file" blue generation-blue ack-blue sha-blue green generation-green ack-green sha-green green blue "$transition_applied_at_ms"
         else
-            expect_transition_log_failure "$log_file" "$fixture_kind"
+            expect_transition_log_failure "$log_file" "$fixture_kind" "$transition_applied_at_ms"
         fi
     done
 }
@@ -857,6 +1296,21 @@ main() {
     local switch_observer_pid
     local rollback_observer_log
     local rollback_observer_pid
+    local forward_transport_log
+    local forward_transport_pid
+    local forward_transport_ready
+    local forward_transport_release
+    local forward_transport_report
+    local forward_transition_barrier
+    local rollback_transport_log
+    local rollback_transport_pid
+    local rollback_transport_ready
+    local rollback_transport_release
+    local rollback_transport_report
+    local forward_switch_started_at_ms
+    local forward_applied_at_ms
+    local rollback_switch_started_at_ms
+    local rollback_applied_at_ms
     local restart_started_at
     local total_route_requests
 
@@ -864,12 +1318,13 @@ main() {
         fail 'Usage: run.sh [--self-test]'
     fi
     if [ "${1:-}" = --self-test ]; then
-        for command in python3 mktemp awk; do
+        for command in python3 mktemp awk jq; do
             require_command "$command"
         done
         initialize_temp_directory
         assert_transition_log_validation
-        printf 'PASS: transition-log duration validation self-tests completed.\n'
+        assert_transport_report_validation
+        printf 'PASS: transition-log and transport-report validation self-tests completed.\n'
         return
     fi
 
@@ -897,6 +1352,7 @@ main() {
 
     initialize_temp_directory
     assert_transition_log_validation
+    assert_transport_report_validation
     PROJECT_NAME="coolify-control-plane-traefik-$$"
     TRAEFIK_CERT_DIR="$TEMP_DIRECTORY/certs"
     BACKEND_BLUE_STATE_DIR="$TEMP_DIRECTORY/backend-blue"
@@ -906,9 +1362,10 @@ main() {
     TRAEFIK_HTTPS_PORT=$(next_port)
     TRAEFIK_APP_PORT=$(next_port)
     TRAEFIK_API_PORT=$(next_port)
+    CONTROL_PLANE_TRAEFIK_SCRIPT_DIRECTORY="$SCRIPT_DIRECTORY"
     TRAEFIK_IMAGE="traefik:$(jq -er '.traefik["v3.6"] | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' "$REPOSITORY_ROOT/versions.json")" \
         || fail 'versions.json does not own an exact Traefik 3.6 release'
-    export PROJECT_NAME TRAEFIK_CERT_DIR TRAEFIK_DOCKER_SOCKET BACKEND_BLUE_STATE_DIR BACKEND_GREEN_STATE_DIR
+    export PROJECT_NAME TRAEFIK_CERT_DIR TRAEFIK_DOCKER_SOCKET BACKEND_BLUE_STATE_DIR BACKEND_GREEN_STATE_DIR CONTROL_PLANE_TRAEFIK_SCRIPT_DIRECTORY
     export CONTROL_PLANE_HEALTH_PROOF CONTROL_PLANE_AUTHENTICATION_PROOF TRAEFIK_HTTPS_PORT TRAEFIK_APP_PORT TRAEFIK_API_PORT TRAEFIK_IMAGE
     export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
 
@@ -965,6 +1422,8 @@ main() {
     set_backend_identity backend-blue "$blue_final_color" "$blue_final_generation" "$blue_final_dynamic_sha"
     wait_for_route_identity https "$blue_final_color" "$blue_final_generation" "$blue_final_acknowledgement" "$blue_final_dynamic_sha" blue
     wait_for_route_identity app-port "$blue_final_color" "$blue_final_generation" "$blue_final_acknowledgement" "$blue_final_dynamic_sha" blue
+    assert_transport_http https blue "$blue_final_color" "$blue_final_generation" "$blue_final_dynamic_sha"
+    assert_transport_http app-port blue "$blue_final_color" "$blue_final_generation" "$blue_final_dynamic_sha"
 
     green_snapshot="$TEMP_DIRECTORY/green.yaml"
     write_dynamic_snapshot "$green_snapshot" "$green_color" "$green_generation" "$green_acknowledgement" backend-green
@@ -973,32 +1432,70 @@ main() {
     traefik_id=$(traefik_container_id)
     traefik_before_switch_started_at=$(traefik_started_at "$traefik_id")
 
+    start_transport_observer forward backend-blue "$BACKEND_BLUE_STATE_DIR"
+    forward_transport_log=$TRANSPORT_OBSERVER_LOG
+    forward_transport_pid=$TRANSPORT_OBSERVER_PID
+    forward_transport_ready=$TRANSPORT_OBSERVER_READY
+    forward_transport_release=$TRANSPORT_OBSERVER_RELEASE
+    forward_transport_report=$TRANSPORT_OBSERVER_REPORT
+    forward_transition_barrier="$TEMP_DIRECTORY/forward-transition-barrier.json"
+    rm -f -- "$forward_transition_barrier"
+    wait_for_transport_observer_ready forward "$forward_transport_ready" "$forward_transport_log"
     switch_observer_log="$TEMP_DIRECTORY/switch-traffic.log"
-    start_transition_observer "$switch_observer_log"
+    start_transition_observer "$switch_observer_log" "$forward_transition_barrier"
     switch_observer_pid=$TRANSITION_OBSERVER_PID
     wait_for_observer_samples "$switch_observer_log"
+    forward_switch_started_at_ms=$(now_ms)
     atomic_replace_snapshot "$green_snapshot"
     wait_for_route_identity https "$green_color" "$green_generation" "$green_acknowledgement" "$green_dynamic_sha" green
     wait_for_route_identity app-port "$green_color" "$green_generation" "$green_acknowledgement" "$green_dynamic_sha" green
-    wait "$switch_observer_pid"
+    assert_transport_http https green "$green_color" "$green_generation" "$green_dynamic_sha"
+    assert_transport_http app-port green "$green_color" "$green_generation" "$green_dynamic_sha"
+    forward_applied_at_ms=$(now_ms)
+    publish_transport_release forward "$forward_applied_at_ms" "$forward_transition_barrier"
+    if ! wait_for_registered_background_pid "$switch_observer_pid"; then
+        fail 'Forward transition observer terminated before crossing the applied-config barrier'
+    fi
     assert_transition_log "$switch_observer_log" \
         "$blue_final_color" "$blue_final_generation" "$blue_final_acknowledgement" "$blue_final_dynamic_sha" \
-        "$green_color" "$green_generation" "$green_acknowledgement" "$green_dynamic_sha" green
+        "$green_color" "$green_generation" "$green_acknowledgement" "$green_dynamic_sha" green blue "$forward_applied_at_ms"
     assert_traefik_unchanged "$traefik_id" "$traefik_before_switch_started_at"
 
+    start_transport_observer rollback backend-green "$BACKEND_GREEN_STATE_DIR"
+    rollback_transport_log=$TRANSPORT_OBSERVER_LOG
+    rollback_transport_pid=$TRANSPORT_OBSERVER_PID
+    rollback_transport_ready=$TRANSPORT_OBSERVER_READY
+    rollback_transport_release=$TRANSPORT_OBSERVER_RELEASE
+    rollback_transport_report=$TRANSPORT_OBSERVER_REPORT
+    wait_for_transport_observer_ready rollback "$rollback_transport_ready" "$rollback_transport_log"
     rollback_observer_log="$TEMP_DIRECTORY/rollback-traffic.log"
-    start_transition_observer "$rollback_observer_log"
+    start_transition_observer "$rollback_observer_log" "$rollback_transport_release"
     rollback_observer_pid=$TRANSITION_OBSERVER_PID
     wait_for_observer_samples "$rollback_observer_log"
+    rollback_switch_started_at_ms=$(now_ms)
     atomic_replace_snapshot "$blue_final_snapshot"
     wait_for_route_identity https "$blue_final_color" "$blue_final_generation" "$blue_final_acknowledgement" "$blue_final_dynamic_sha" blue
     wait_for_route_identity app-port "$blue_final_color" "$blue_final_generation" "$blue_final_acknowledgement" "$blue_final_dynamic_sha" blue
-    wait "$rollback_observer_pid"
+    assert_transport_http https blue "$blue_final_color" "$blue_final_generation" "$blue_final_dynamic_sha"
+    assert_transport_http app-port blue "$blue_final_color" "$blue_final_generation" "$blue_final_dynamic_sha"
+    rollback_applied_at_ms=$(now_ms)
+    publish_transport_release rollback "$rollback_applied_at_ms" "$rollback_transport_release"
+    wait_for_transport_observer rollback "$rollback_transport_pid" "$rollback_transport_log" "$rollback_transport_report"
+    assert_transport_continuity "$rollback_transport_report" rollback "$forward_applied_at_ms" "$rollback_switch_started_at_ms" "$rollback_applied_at_ms" \
+        green "$green_color" "$green_generation" "$green_dynamic_sha"
+    if ! wait_for_registered_background_pid "$rollback_observer_pid"; then
+        fail 'Rollback transition observer terminated before crossing the applied-config barrier'
+    fi
     assert_transition_log "$rollback_observer_log" \
         "$green_color" "$green_generation" "$green_acknowledgement" "$green_dynamic_sha" \
-        "$blue_final_color" "$blue_final_generation" "$blue_final_acknowledgement" "$blue_final_dynamic_sha" blue
+        "$blue_final_color" "$blue_final_generation" "$blue_final_acknowledgement" "$blue_final_dynamic_sha" blue green "$rollback_applied_at_ms"
     assert_traefik_unchanged "$traefik_id" "$traefik_before_switch_started_at"
     assert_exact_dynamic_snapshot "$blue_final_snapshot"
+    publish_transport_release full-cycle "$rollback_applied_at_ms" "$forward_transport_release"
+    wait_for_transport_observer full-cycle "$forward_transport_pid" "$forward_transport_log" "$forward_transport_report"
+    assert_full_cycle_transport_continuity "$forward_transport_report" \
+        "$forward_switch_started_at_ms" "$forward_applied_at_ms" "$rollback_switch_started_at_ms" "$rollback_applied_at_ms" \
+        blue "$blue_final_color" "$blue_final_generation" "$blue_final_dynamic_sha"
 
     restart_started_at=$(traefik_started_at "$traefik_id")
     compose restart traefik

@@ -48,7 +48,13 @@ class CompileControlPlaneStaticProxyConfiguration
         }
 
         $sourcePorts = data_get($source, 'services.coolify.ports');
-        if ($sourcePorts !== ['${APP_PORT:-8000}:8080']) {
+        $legacySourcePorts = ['${APP_PORT:-8000}:8080'];
+        $bundledSourcePorts = [
+            '${APP_PORT:-8000}:8080',
+            '${PUSHER_PORT:-${SOKETI_PORT:-6001}}:6001',
+            '${TERMINAL_PORT:-6002}:6002',
+        ];
+        if ($sourcePorts !== $legacySourcePorts && $sourcePorts !== $bundledSourcePorts) {
             throw new InvalidArgumentException('Enrollment requires exactly one canonical Coolify APP_PORT publication.');
         }
 

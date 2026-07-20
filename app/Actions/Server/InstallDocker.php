@@ -47,6 +47,11 @@ class InstallDocker
               "max-file": "3"
             }
           }');
+        $installer = file_get_contents(base_path('scripts/install.sh'));
+        if ($installer === false) {
+            throw new \RuntimeException('The canonical Docker daemon configuration owner is unavailable.');
+        }
+        $encodedInstaller = base64_encode($installer);
         $found = StandaloneDocker::where('server_id', $server->id);
         if ($found->count() == 0 && $server->id) {
             StandaloneDocker::create([
@@ -85,16 +90,8 @@ class InstallDocker
 
             $command = $command->merge([
                 "echo 'Configuring Docker Engine (merging existing configuration with the required)...'",
-                'test -s /etc/docker/daemon.json && cp /etc/docker/daemon.json "/etc/docker/daemon.json.original-$(date +"%Y%m%d-%H%M%S")"',
-                "test ! -s /etc/docker/daemon.json && echo '{$config}' | base64 -d | tee /etc/docker/daemon.json > /dev/null",
-                "echo '{$config}' | base64 -d | tee /etc/docker/daemon.json.coolify > /dev/null",
-                'jq . /etc/docker/daemon.json.coolify | tee /etc/docker/daemon.json.coolify.pretty > /dev/null',
-                'mv /etc/docker/daemon.json.coolify.pretty /etc/docker/daemon.json.coolify',
-                "jq -s '.[0] * .[1]' /etc/docker/daemon.json.coolify /etc/docker/daemon.json | tee /etc/docker/daemon.json.appended > /dev/null",
-                'mv /etc/docker/daemon.json.appended /etc/docker/daemon.json',
-                "echo 'Restarting Docker Engine...'",
                 'systemctl enable docker >/dev/null 2>&1 || true',
-                'systemctl restart docker',
+                "DAEMON_CONFIG_INPUT=\$(mktemp /tmp/coolify-daemon-config.XXXXXX) && DAEMON_CONFIG_RUNNER='' && trap 'rm -f \"\$DAEMON_CONFIG_INPUT\" \"\$DAEMON_CONFIG_RUNNER\"' EXIT && DAEMON_CONFIG_RUNNER=\$(mktemp /tmp/coolify-install.XXXXXX) && echo '{$config}' | base64 -d > \"\$DAEMON_CONFIG_INPUT\" && echo '{$encodedInstaller}' | base64 -d > \"\$DAEMON_CONFIG_RUNNER\" && DAEMON_CONFIG_RESULT=\$(bash \"\$DAEMON_CONFIG_RUNNER\" --configure-docker-daemon /etc/docker/daemon.json \"\$DAEMON_CONFIG_INPUT\" 10.0.0.0/8 24 false false) && rm -f \"\$DAEMON_CONFIG_INPUT\" \"\$DAEMON_CONFIG_RUNNER\" && trap - EXIT && if [ \"\$DAEMON_CONFIG_RESULT\" = changed ]; then echo 'Restarting Docker Engine...'; systemctl restart docker; else echo 'Docker Engine configuration is up to date'; fi",
             ]);
             if ($server->isSwarm()) {
                 $command = $command->merge([

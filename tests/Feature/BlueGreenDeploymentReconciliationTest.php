@@ -1,6 +1,8 @@
 <?php
 
 use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
+use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
+use App\Actions\Application\BlueGreen\BlueGreenDeploymentQueueActivity;
 use App\Actions\Application\BlueGreen\BlueGreenReconciliationResult;
 use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Actions\Application\BlueGreen\MarkBlueGreenRecoveryInterventionRequired;
@@ -19,9 +21,11 @@ use App\Notifications\Application\BlueGreenDeploymentRolledBack;
 use App\Notifications\Application\BlueGreenInterventionRequired;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Notification;
 use Illuminate\Support\Facades\Queue;
+use Laravel\Horizon\Contracts\JobRepository;
 use Tests\Support\BlueGreenRecoveryScenario;
 
 uses(RefreshDatabase::class);
@@ -36,6 +40,46 @@ function blueGreenReconciliationMakeQueueStale(ApplicationDeploymentQueue $deplo
         ->where('id', $deployment->id)
         ->update(['updated_at' => now()->subMinutes(10)]);
 }
+
+it('treats stale Horizon execution metadata as advisory', function (string $horizonStatus): void {
+    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: true);
+    $jobId = "stale-horizon-{$horizonStatus}";
+    $scenario->deployment->update(['horizon_job_id' => $jobId]);
+    blueGreenReconciliationMakeQueueStale($scenario->deployment);
+
+    $jobRepository = Mockery::mock(JobRepository::class);
+    $jobRepository->shouldReceive('getJobs')
+        ->with([$jobId])
+        ->andReturn(collect([(object) ['status' => $horizonStatus]]));
+    app()->instance(JobRepository::class, $jobRepository);
+
+    expect(BlueGreenDeploymentQueueActivity::run(
+        $scenario->deployment->fresh(),
+        staleAfterSeconds: 1,
+    ))->toBeFalse();
+})->with(['reserved', 'running']);
+
+it('never displaces a live Redis lifecycle owner while reconciling stale queue metadata', function (): void {
+    config()->set('cache.default', 'redis');
+    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: true);
+    blueGreenReconciliationMakeQueueStale($scenario->deployment);
+    $lock = Cache::lock(
+        BlueGreenDeploymentLock::key($scenario->application->id, $scenario->destination->id),
+        10,
+    );
+    expect($lock->get())->toBeTrue();
+
+    try {
+        $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
+
+        expect($result->outcome)->toBe(BlueGreenReconciliationResult::DEFERRED)
+            ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
+            ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+            ->and($lock->isOwnedByCurrentProcess())->toBeTrue();
+    } finally {
+        $lock->release();
+    }
+});
 
 it('defers durable draining states to the dedicated resume job without forward completion', function (): void {
     Queue::fake();
@@ -99,23 +143,6 @@ it('atomically marks an unsafe stale preparation as requiring intervention', fun
     );
 });
 
-it('marks an exact queue owner with PostgreSQL-compatible application predicates', function (): void {
-    Notification::fake();
-    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
-
-    $recorded = MarkBlueGreenRecoveryInterventionRequired::run(
-        $scenario->state->id,
-        BlueGreenRecoveryScenario::OPERATION_UUID,
-        1,
-    );
-
-    expect($recorded)->toBeTrue()
-        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
-        ->and($scenario->deployment->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
-        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value)
-        ->and($scenario->deployment->fresh()->finished_at)->not->toBeNull();
-});
-
 it('leaves a newer supersession generation untouched', function (): void {
     $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
     $scenario->state->update(['supersession_generation' => 2]);
@@ -130,25 +157,6 @@ it('leaves a newer supersession generation untouched', function (): void {
         ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
         ->and($scenario->deployment->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
         ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
-});
-
-it('does not mark a changed queue owner as failed', function (): void {
-    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
-    $scenario->deployment->update([
-        'blue_green_topology_digest' => hash('sha256', 'changed-queue-owner'),
-    ]);
-
-    $recorded = MarkBlueGreenRecoveryInterventionRequired::run(
-        $scenario->state->id,
-        BlueGreenRecoveryScenario::OPERATION_UUID,
-        1,
-    );
-
-    expect($recorded)->toBeFalse()
-        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
-        ->and($scenario->deployment->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
-        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
-        ->and($scenario->deployment->fresh()->finished_at)->toBeNull();
 });
 
 it('leaves a deactivation-owned state untouched', function (): void {

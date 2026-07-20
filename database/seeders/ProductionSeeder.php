@@ -21,6 +21,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
 use phpseclib3\Crypt\PublicKeyLoader;
 use phpseclib3\Exception\NoKeyLoadedException;
+use RuntimeException;
 
 class ProductionSeeder extends Seeder
 {
@@ -159,6 +160,8 @@ class ProductionSeeder extends Seeder
         }
 
         if (config('constants.coolify.is_windows_docker_desktop')) {
+            $testingHostPrivateKey = $this->testingHostPrivateKey();
+
             PrivateKey::updateOrCreate(
                 [
                     'id' => 0,
@@ -167,7 +170,7 @@ class ProductionSeeder extends Seeder
                 [
                     'name' => 'Testing-host',
                     'description' => 'This is a a docker container with SSH access',
-                    'private_key' => $this->testingHostPrivateKey(),
+                    'private_key' => $testingHostPrivateKey,
                 ]
             );
             if (Server::find(0) == null) {
@@ -222,19 +225,19 @@ class ProductionSeeder extends Seeder
         $privateKeyPath = config('constants.coolify.testing_host_private_key_path');
 
         if (! is_string($privateKeyPath) || $privateKeyPath === '' || ! is_file($privateKeyPath) || is_link($privateKeyPath) || ! is_readable($privateKeyPath)) {
-            throw new \RuntimeException('The runtime testing-host private key is unavailable.');
+            throw new RuntimeException('The runtime testing-host private key is unavailable.');
         }
 
         $privateKey = file_get_contents($privateKeyPath);
 
-        if (! is_string($privateKey)) {
-            throw new \RuntimeException('The runtime testing-host private key is invalid.');
+        if (! is_string($privateKey) || trim($privateKey) === '') {
+            throw new RuntimeException('The runtime testing-host private key is invalid.');
         }
 
         try {
             PublicKeyLoader::loadPrivateKey($privateKey);
         } catch (NoKeyLoadedException) {
-            throw new \RuntimeException('The runtime testing-host private key is invalid.');
+            throw new RuntimeException('The runtime testing-host private key is invalid.');
         }
 
         return $privateKey;

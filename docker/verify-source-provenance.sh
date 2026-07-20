@@ -141,48 +141,6 @@ case "$dockerfile" in
         printf 'IMAGE_SOURCE_PROVENANCE verified git_lfs=%s cloudflared=%s\n' \
             "$git_lfs_version" "$cloudflared_version"
         ;;
-    docker/coolify-realtime/Dockerfile)
-        soketi_version=$(argument_value SOKETI_VERSION)
-        soketi_tag=$(argument_value SOKETI_TAG)
-        soketi_commit=$(argument_value SOKETI_COMMIT)
-        uwebsockets_version=$(argument_value UWEBSOCKETS_VERSION)
-        uwebsockets_tag=$(argument_value UWEBSOCKETS_TAG)
-        uwebsockets_package_commit=$(argument_value UWEBSOCKETS_PACKAGE_COMMIT)
-        cloudflared_version=$(argument_value CLOUDFLARED_VERSION)
-        cloudflared_tag=$(argument_value CLOUDFLARED_TAG)
-        cloudflared_commit=$(argument_value CLOUDFLARED_COMMIT)
-
-        assert_version_tag "$soketi_version" "$soketi_tag" ''
-        assert_version_tag "$uwebsockets_version" "$uwebsockets_tag" v
-        assert_version_tag "$cloudflared_version" "$cloudflared_tag" ''
-        assert_official_tag_commit \
-            'https://github.com/soketi/soketi.git' \
-            "$soketi_tag" \
-            "$soketi_commit"
-        assert_official_tag_commit \
-            'https://github.com/uNetworking/uWebSockets.js.git' \
-            "$uwebsockets_tag" \
-            "$uwebsockets_package_commit"
-        assert_official_tag_commit \
-            'https://github.com/cloudflare/cloudflared.git' \
-            "$cloudflared_tag" \
-            "$cloudflared_commit"
-        assert_source_file_sha256 \
-            UWEBSOCKETS_NO_HTTP3_PATCH_SHA256 \
-            docker/coolify-realtime/uwebsockets-no-http3.patch
-
-        for source_path in \
-            docker/verify-source-provenance.sh \
-            docker/coolify-realtime/soketi-entrypoint.sh \
-            docker/coolify-realtime/uwebsockets-no-http3.patch \
-            tests/Integration/RealtimeImageTest.sh
-        do
-            assert_runtime_contract_source "$source_path"
-        done
-
-        printf 'IMAGE_SOURCE_PROVENANCE verified soketi=%s uwebsockets=%s cloudflared=%s\n' \
-            "$soketi_version" "$uwebsockets_version" "$cloudflared_version"
-        ;;
     *)
         fail "unsupported Dockerfile: $dockerfile"
         ;;

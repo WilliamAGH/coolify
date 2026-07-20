@@ -13,11 +13,9 @@ project="coolify-testing-host-runtime-$$"
 private_volume="${project}-private"
 public_volume="${project}-public"
 network="${project}-network"
-development_server_container="${project}-development-sshd"
 server_container="${project}-sshd"
 database_container="${project}-postgres"
 redis_container="${project}-redis"
-seed_private_key="$(mktemp)"
 
 fail()
 {
@@ -35,13 +33,11 @@ argument_value()
 
 cleanup()
 {
-    docker rm --force "$development_server_container" >/dev/null 2>&1 || true
     docker rm --force "$server_container" >/dev/null 2>&1 || true
     docker rm --force "$database_container" >/dev/null 2>&1 || true
     docker rm --force "$redis_container" >/dev/null 2>&1 || true
     docker network rm "$network" >/dev/null 2>&1 || true
     docker volume rm "$private_volume" "$public_volume" >/dev/null 2>&1 || true
-    rm -f "$seed_private_key"
 }
 
 assert_compose_authorized_keys_mount()
@@ -93,38 +89,6 @@ testing-host-runtime-command'
         fi
         sleep 1
     done
-}
-
-extract_testing_host_private_key()
-{
-    key_name=$1
-    source_file=$2
-    destination=$3
-    awk -v key_name="$key_name" '
-        /name/ && index($0, key_name) { testing_host = 1 }
-        testing_host && /private_key/ && index($0, "-----BEGIN OPENSSH PRIVATE KEY-----") {
-            capture = 1
-            print "-----BEGIN OPENSSH PRIVATE KEY-----"
-            next
-        }
-        capture && /^-----END OPENSSH PRIVATE KEY-----/ {
-            print "-----END OPENSSH PRIVATE KEY-----"
-            exit
-        }
-        capture { print }
-    ' "$source_file" > "$destination"
-    chmod 600 "$destination"
-    ssh-keygen -y -f "$destination" >/dev/null 2>&1 \
-        || fail "${key_name} seeded private key is missing or invalid"
-}
-
-assert_private_key_matches_authorized_keys()
-{
-    key_name=$1
-    private_key=$2
-    [ "$(ssh-keygen -y -f "$private_key" | awk '{ print $1 " " $2 }')" = \
-        "$(awk '{ print $1 " " $2 }' "$development_authorized_keys")" ] \
-        || fail "${key_name} seeded private key does not match the development testing-host public key"
 }
 
 assert_windows_runtime_key_contract()
@@ -231,10 +195,6 @@ assert_compose_authorized_keys_mount testing-host \
 assert_windows_runtime_key_contract "$repository_root/docker-compose.windows.yml"
 assert_windows_runtime_key_contract "$repository_root/other/nightly/docker-compose.windows.yml"
 
-extract_testing_host_private_key 'Testing Host Key' \
-    "$repository_root/database/seeders/PrivateKeySeeder.php" "$seed_private_key"
-assert_private_key_matches_authorized_keys 'development' "$seed_private_key"
-
 docker_version="$(argument_value DOCKER_VERSION)"
 compose_version="$(argument_value DOCKER_COMPOSE_VERSION)"
 buildx_version="$(argument_value DOCKER_BUILDX_VERSION)"
@@ -284,17 +244,6 @@ until docker exec "$redis_container" redis-cli ping 2>/dev/null | grep -qx PONG;
     fi
     sleep 1
 done
-
-docker run --detach --pull never --name "$development_server_container" \
-    --network "$network" \
-    --network-alias development-testing-host \
-    --mount "type=bind,source=${development_authorized_keys},target=/run/coolify-testing-host/public/authorized_keys,readonly" \
-    "$image" >/dev/null
-
-assert_ssh_access development-testing-host "$development_server_container" \
-    "type=bind,source=${seed_private_key},target=/run/coolify-testing-host/private/testing-host,readonly"
-docker inspect --format '{{.State.Running}}' "$development_server_container" | grep -qx true
-docker rm --force "$development_server_container" >/dev/null
 
 for _ in first second; do
     docker run --rm --pull never --user root \

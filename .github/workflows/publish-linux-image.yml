@@ -79,12 +79,6 @@ on:
       fork_main_image:
         description: Immutable fork main-image reference.
         value: ${{ jobs.fork-release.outputs.main_image }}
-      fork_realtime_digest:
-        description: Published fork realtime-image index digest.
-        value: ${{ jobs.fork-release.outputs.realtime_digest }}
-      fork_realtime_image:
-        description: Immutable fork realtime-image reference.
-        value: ${{ jobs.fork-release.outputs.realtime_image }}
 
 permissions: {}
 
@@ -1470,7 +1464,6 @@ jobs:
       NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
       NEXUS_REPOSITORY: docker-hosted
       NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
-      REALTIME_TARGET: docker.iocloudhost.net/williamagh/coolify-realtime
       SEMANTIC_VERSION: ${{ inputs.semantic_version }}
     steps:
       - name: Require Nexus hosted repository non-redeploy policy
@@ -1522,20 +1515,6 @@ jobs:
             oci_arch: arm64
             platform: linux/arm64
             runner: ubuntu-24.04-arm
-          - product: realtime
-            artifact_name: coolify-realtime
-            dockerfile: docker/coolify-realtime/Dockerfile
-            arch: amd64
-            oci_arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-24.04
-          - product: realtime
-            artifact_name: coolify-realtime
-            dockerfile: docker/coolify-realtime/Dockerfile
-            arch: arm64
-            oci_arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -1566,19 +1545,9 @@ jobs:
       - name: Verify reviewed fork Dockerfile sources
         env:
           DOCKERFILE: ${{ matrix.dockerfile }}
-          PRODUCT: ${{ matrix.product }}
         run: |
           set -Eeuo pipefail
           docker/verify-source-provenance.sh "$DOCKERFILE"
-          if [[ "$PRODUCT" == main ]]; then
-            exit 0
-          fi
-
-          for argument in CLOUDFLARED_VERSION CLOUDFLARED_TAG CLOUDFLARED_COMMIT CLOUDFLARED_SOURCE_SHA256 CLOUDFLARED_RELEASE_DATE; do
-            realtime_value="$(sed -n "s/^ARG ${argument}=//p" "$DOCKERFILE" | sed -n '1p')"
-            production_value="$(sed -n "s/^ARG ${argument}=//p" docker/production/Dockerfile | sed -n '1p')"
-            [[ -n "$realtime_value" && "$realtime_value" == "$production_value" ]]
-          done
 
       - name: Prepare fork OCI evidence directory
         run: install -d -m 0700 fork-image
@@ -1719,10 +1688,9 @@ jobs:
             OCI_PLATFORM="$PLATFORM" \
             tests/Integration/VerifyOciArchiveImage.sh
 
-      - name: Verify exact fork realtime runtime
-        if: ${{ matrix.product == 'realtime' }}
+      - name: Verify exact fork bundled Reverb and terminal runtime
         env:
-          REALTIME_IMAGE: local/${{ matrix.artifact_name }}:${{ github.sha }}-${{ matrix.arch }}-fork-runtime
+          PRODUCTION_IMAGE: local/${{ matrix.artifact_name }}:${{ github.sha }}-${{ matrix.arch }}-fork-runtime
         run: tests/Integration/RealtimeImageTest.sh
 
       - name: Generate standalone fork SPDX SBOM
@@ -1800,7 +1768,7 @@ jobs:
           retention-days: 7
 
   fork-stage:
-    name: Stage both verified fork indexes
+    name: Stage the verified fork index
     needs: [validate-inputs, fork-registry-policy, fork-build]
     if: ${{ inputs.release_kind == 'fork' && needs.fork-build.result == 'success' }}
     permissions:
@@ -1810,9 +1778,6 @@ jobs:
       main_amd64_digest: ${{ steps.stage.outputs.main_amd64_digest }}
       main_arm64_digest: ${{ steps.stage.outputs.main_arm64_digest }}
       main_index_digest: ${{ steps.stage.outputs.main_index_digest }}
-      realtime_amd64_digest: ${{ steps.stage.outputs.realtime_amd64_digest }}
-      realtime_arm64_digest: ${{ steps.stage.outputs.realtime_arm64_digest }}
-      realtime_index_digest: ${{ steps.stage.outputs.realtime_index_digest }}
       run_tag: ${{ needs.validate-inputs.outputs.run_tag }}
     steps:
       - name: Download all verified fork OCI evidence
@@ -1839,11 +1804,10 @@ jobs:
           registry: docker.iocloudhost.net
           username: ${{ secrets.NEXUS_USERNAME }}
 
-      - name: Stage both fork products with inline build attestations
+      - name: Stage the fork image with inline build attestations
         id: stage
         env:
           MAIN_TARGET: docker.iocloudhost.net/williamagh/coolify
-          REALTIME_TARGET: docker.iocloudhost.net/williamagh/coolify-realtime
           RUN_TAG: ${{ needs.validate-inputs.outputs.run_tag }}
           SEMANTIC_VERSION: ${{ inputs.semantic_version }}
           SOURCE_REVISION: ${{ github.sha }}
@@ -1998,7 +1962,6 @@ jobs:
           }
 
           stage_product main coolify "$MAIN_TARGET"
-          stage_product realtime coolify-realtime "$REALTIME_TARGET"
 
           install -d -m 0700 fork-binding
           jq -n \
@@ -2006,10 +1969,6 @@ jobs:
             --arg mainArm64 "$(sed -n 's/^CHILD_DIGEST=//p' fork-candidate-input/coolify-arm64.candidate.env)" \
             --arg mainIndex "$(regctl image digest "$MAIN_TARGET:$RUN_TAG")" \
             --arg mainRepository "$MAIN_TARGET" \
-            --arg realtimeAmd64 "$(sed -n 's/^CHILD_DIGEST=//p' fork-candidate-input/coolify-realtime-amd64.candidate.env)" \
-            --arg realtimeArm64 "$(sed -n 's/^CHILD_DIGEST=//p' fork-candidate-input/coolify-realtime-arm64.candidate.env)" \
-            --arg realtimeIndex "$(regctl image digest "$REALTIME_TARGET:$RUN_TAG")" \
-            --arg realtimeRepository "$REALTIME_TARGET" \
             --arg runTag "$RUN_TAG" \
             --arg sourceRef "$GITHUB_REF" \
             --arg sourceRepository "$GITHUB_REPOSITORY" \
@@ -2023,8 +1982,7 @@ jobs:
                 source: {repository: $sourceRepository, url: $sourceUrl, ref: $sourceRef, revision: $sourceRevision},
                 expectedLabels: {source: $sourceUrl, revision: $sourceRevision, version: $version},
                 images: {
-                  main: {repository: $mainRepository, indexDigest: $mainIndex, childDigests: {amd64: $mainAmd64, arm64: $mainArm64}},
-                  realtime: {repository: $realtimeRepository, indexDigest: $realtimeIndex, childDigests: {amd64: $realtimeAmd64, arm64: $realtimeArm64}}
+                  main: {repository: $mainRepository, indexDigest: $mainIndex, childDigests: {amd64: $mainAmd64, arm64: $mainArm64}}
                 }
               }
             ' > fork-binding/release-binding.json
@@ -2055,7 +2013,6 @@ jobs:
       POSTGRES_ARM64_DIGEST: sha256:b462a1ee492ec44a74cef7a6ca37084c48d0dee6e4b53099acd1fc53ec997357
       POSTGRES_IMAGE: docker.io/library/postgres
       POSTGRES_INDEX_DIGEST: sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f
-      REALTIME_TARGET: docker.iocloudhost.net/williamagh/coolify-realtime
       REDIS_AMD64_DIGEST: sha256:b1addbe72465a718643cff9e60a58e6df1841e29d6d7d60c9a85d8d72f08d1a7
       REDIS_ARM64_DIGEST: sha256:084f4bcb3fedf990ba43d26774f58ed4697a2c044156544ac4717934ad1d57c8
       REDIS_IMAGE: docker.io/library/redis
@@ -2105,26 +2062,6 @@ jobs:
           subject-digest: ${{ needs.fork-stage.outputs.main_arm64_digest }}
           subject-name: ${{ env.MAIN_TARGET }}
 
-      - name: Sign realtime amd64 SBOM bundle off-registry
-        id: realtime-amd64-sbom
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
-        with:
-          create-storage-record: false
-          push-to-registry: false
-          sbom-path: fork-attestation-input/coolify-realtime-amd64.sbom.spdx.json
-          subject-digest: ${{ needs.fork-stage.outputs.realtime_amd64_digest }}
-          subject-name: ${{ env.REALTIME_TARGET }}
-
-      - name: Sign realtime arm64 SBOM bundle off-registry
-        id: realtime-arm64-sbom
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
-        with:
-          create-storage-record: false
-          push-to-registry: false
-          sbom-path: fork-attestation-input/coolify-realtime-arm64.sbom.spdx.json
-          subject-digest: ${{ needs.fork-stage.outputs.realtime_arm64_digest }}
-          subject-name: ${{ env.REALTIME_TARGET }}
-
       - name: Sign main provenance bundle off-registry
         id: main-provenance
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
@@ -2133,15 +2070,6 @@ jobs:
           push-to-registry: false
           subject-digest: ${{ needs.fork-stage.outputs.main_index_digest }}
           subject-name: ${{ env.MAIN_TARGET }}
-
-      - name: Sign realtime provenance bundle off-registry
-        id: realtime-provenance
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
-        with:
-          create-storage-record: false
-          push-to-registry: false
-          subject-digest: ${{ needs.fork-stage.outputs.realtime_index_digest }}
-          subject-name: ${{ env.REALTIME_TARGET }}
 
       - name: Sign main release-binding bundle off-registry
         id: main-binding
@@ -2154,27 +2082,12 @@ jobs:
           subject-digest: ${{ needs.fork-stage.outputs.main_index_digest }}
           subject-name: ${{ env.MAIN_TARGET }}
 
-      - name: Sign realtime release-binding bundle off-registry
-        id: realtime-binding
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
-        with:
-          create-storage-record: false
-          predicate-path: fork-attestation-input/release-binding.json
-          predicate-type: https://coolify.io/attestations/fork-release-binding/v1
-          push-to-registry: false
-          subject-digest: ${{ needs.fork-stage.outputs.realtime_index_digest }}
-          subject-name: ${{ env.REALTIME_TARGET }}
-
       - name: Collect signed fork bundles
         env:
           MAIN_AMD64_SBOM_BUNDLE: ${{ steps.main-amd64-sbom.outputs.bundle-path }}
           MAIN_ARM64_SBOM_BUNDLE: ${{ steps.main-arm64-sbom.outputs.bundle-path }}
           MAIN_BINDING_BUNDLE: ${{ steps.main-binding.outputs.bundle-path }}
           MAIN_PROVENANCE_BUNDLE: ${{ steps.main-provenance.outputs.bundle-path }}
-          REALTIME_AMD64_SBOM_BUNDLE: ${{ steps.realtime-amd64-sbom.outputs.bundle-path }}
-          REALTIME_ARM64_SBOM_BUNDLE: ${{ steps.realtime-arm64-sbom.outputs.bundle-path }}
-          REALTIME_BINDING_BUNDLE: ${{ steps.realtime-binding.outputs.bundle-path }}
-          REALTIME_PROVENANCE_BUNDLE: ${{ steps.realtime-provenance.outputs.bundle-path }}
         run: |
           set -Eeuo pipefail
           umask 077
@@ -2183,14 +2096,8 @@ jobs:
           install -m 0600 "$MAIN_ARM64_SBOM_BUNDLE" fork-signed-bundles/main-arm64.sbom.sigstore.json
           install -m 0600 "$MAIN_PROVENANCE_BUNDLE" fork-signed-bundles/main.provenance.sigstore.json
           install -m 0600 "$MAIN_BINDING_BUNDLE" fork-signed-bundles/main.binding.sigstore.json
-          install -m 0600 "$REALTIME_AMD64_SBOM_BUNDLE" fork-signed-bundles/realtime-amd64.sbom.sigstore.json
-          install -m 0600 "$REALTIME_ARM64_SBOM_BUNDLE" fork-signed-bundles/realtime-arm64.sbom.sigstore.json
-          install -m 0600 "$REALTIME_PROVENANCE_BUNDLE" fork-signed-bundles/realtime.provenance.sigstore.json
-          install -m 0600 "$REALTIME_BINDING_BUNDLE" fork-signed-bundles/realtime.binding.sigstore.json
           install -m 0600 fork-attestation-input/coolify-amd64.sbom.spdx.json fork-signed-bundles/main-amd64.sbom.spdx.json
           install -m 0600 fork-attestation-input/coolify-arm64.sbom.spdx.json fork-signed-bundles/main-arm64.sbom.spdx.json
-          install -m 0600 fork-attestation-input/coolify-realtime-amd64.sbom.spdx.json fork-signed-bundles/realtime-amd64.sbom.spdx.json
-          install -m 0600 fork-attestation-input/coolify-realtime-arm64.sbom.spdx.json fork-signed-bundles/realtime-arm64.sbom.spdx.json
           install -m 0600 fork-attestation-input/release-binding.json fork-signed-bundles/release-binding.json
 
       - name: Verify pinned Postgres and Redis dependency indexes
@@ -2227,9 +2134,6 @@ jobs:
           MAIN_AMD64_DIGEST: ${{ needs.fork-stage.outputs.main_amd64_digest }}
           MAIN_ARM64_DIGEST: ${{ needs.fork-stage.outputs.main_arm64_digest }}
           MAIN_INDEX_DIGEST: ${{ needs.fork-stage.outputs.main_index_digest }}
-          REALTIME_AMD64_DIGEST: ${{ needs.fork-stage.outputs.realtime_amd64_digest }}
-          REALTIME_ARM64_DIGEST: ${{ needs.fork-stage.outputs.realtime_arm64_digest }}
-          REALTIME_INDEX_DIGEST: ${{ needs.fork-stage.outputs.realtime_index_digest }}
           SEMANTIC_VERSION: ${{ inputs.semantic_version }}
           SOURCE_REVISION: ${{ github.sha }}
           SOURCE_TAG: ${{ github.ref_name }}
@@ -2270,10 +2174,9 @@ jobs:
             } > "$output"
           }
           write_labels fork-signed-bundles/main.oci-labels.env
-          write_labels fork-signed-bundles/realtime.oci-labels.env
 
           write_overlay() {
-            local output=$1 main_digest=$2 realtime_digest=$3 postgres_digest=$4 redis_digest=$5
+            local output=$1 main_digest=$2 postgres_digest=$3 redis_digest=$4
             {
               printf 'services:\n'
               printf '  coolify:\n'
@@ -2281,14 +2184,12 @@ jobs:
               printf '    ports: !override\n'
               # shellcheck disable=SC2016
               printf '%s\n' '      - "${APP_PORT:-8000}:8080"'
+              # shellcheck disable=SC2016
+              printf '%s\n' '      - "127.0.0.1:${PUSHER_PORT:-${SOKETI_PORT:-6001}}:6001"'
+              # shellcheck disable=SC2016
+              printf '%s\n' '      - "127.0.0.1:${TERMINAL_PORT:-6002}:6002"'
               printf '    environment:\n'
               printf '      AUTOUPDATE: "false"\n'
-              printf '  soketi:\n'
-              printf '    image: "%s@%s"\n' "$REALTIME_TARGET" "$realtime_digest"
-              printf '    ports: !override\n'
-              # shellcheck disable=SC2016
-              printf '%s\n' '      - "127.0.0.1:${SOKETI_PORT:-6001}:6001"'
-              printf '      - "127.0.0.1:6002:6002"\n'
               printf '  postgres:\n'
               printf '    image: "%s@%s"\n' "$POSTGRES_IMAGE" "$postgres_digest"
               printf '  redis:\n'
@@ -2296,30 +2197,27 @@ jobs:
             } > "$output"
           }
           write_overlay fork-signed-bundles/docker-compose.linux-amd64.custom.yml \
-            "$MAIN_AMD64_DIGEST" "$REALTIME_AMD64_DIGEST" "$POSTGRES_AMD64_DIGEST" "$REDIS_AMD64_DIGEST"
+            "$MAIN_AMD64_DIGEST" "$POSTGRES_AMD64_DIGEST" "$REDIS_AMD64_DIGEST"
           write_overlay fork-signed-bundles/docker-compose.linux-arm64.custom.yml \
-            "$MAIN_ARM64_DIGEST" "$REALTIME_ARM64_DIGEST" "$POSTGRES_ARM64_DIGEST" "$REDIS_ARM64_DIGEST"
+            "$MAIN_ARM64_DIGEST" "$POSTGRES_ARM64_DIGEST" "$REDIS_ARM64_DIGEST"
 
           sha256_of() {
             sha256sum "$1" | awk '{print $1}'
           }
 
           main_labels_sha256="$(sha256_of fork-signed-bundles/main.oci-labels.env)"
-          realtime_labels_sha256="$(sha256_of fork-signed-bundles/realtime.oci-labels.env)"
           main_provenance_sha256="$(sha256_of fork-signed-bundles/main.provenance.sigstore.json)"
-          realtime_provenance_sha256="$(sha256_of fork-signed-bundles/realtime.provenance.sigstore.json)"
           dockerfile_main_sha256="$(sha256_of docker/production/Dockerfile)"
-          dockerfile_realtime_sha256="$(sha256_of docker/coolify-realtime/Dockerfile)"
           compose_sha256="$(sha256_of docker-compose.yml)"
           compose_prod_sha256="$(sha256_of docker-compose.prod.yml)"
           env_production_sha256="$(sha256_of .env.production)"
 
           write_manifest() {
-            local platform=$1 main_platform_digest=$2 realtime_platform_digest=$3
-            local postgres_digest=$4 redis_digest=$5 sbom_suffix=$6 overlay=$7 manifest
+            local platform=$1 main_platform_digest=$2 postgres_digest=$3
+            local redis_digest=$4 sbom_suffix=$5 overlay=$6 manifest
             manifest="fork-signed-bundles/release-${platform//\//-}.env"
             {
-              printf 'SCHEMA=coolify-fork-release/v1\n'
+              printf 'SCHEMA=coolify-fork-release/v2\n'
               printf 'KEY_ID=%s\n' "$key_id"
               printf 'VERSION=%s\n' "$SEMANTIC_VERSION"
               printf 'SOURCE_REVISION=%s\n' "$SOURCE_REVISION"
@@ -2328,9 +2226,6 @@ jobs:
               printf 'MAIN_IMAGE=%s\n' "$MAIN_TARGET"
               printf 'MAIN_INDEX_DIGEST=%s\n' "$MAIN_INDEX_DIGEST"
               printf 'MAIN_PLATFORM_DIGEST=%s\n' "$main_platform_digest"
-              printf 'REALTIME_IMAGE=%s\n' "$REALTIME_TARGET"
-              printf 'REALTIME_INDEX_DIGEST=%s\n' "$REALTIME_INDEX_DIGEST"
-              printf 'REALTIME_PLATFORM_DIGEST=%s\n' "$realtime_platform_digest"
               printf 'POSTGRES_IMAGE=%s\n' "$POSTGRES_IMAGE"
               printf 'POSTGRES_DIGEST=%s\n' "$postgres_digest"
               printf 'POSTGRES_MAJOR=15\n'
@@ -2338,13 +2233,9 @@ jobs:
               printf 'REDIS_DIGEST=%s\n' "$redis_digest"
               printf 'REDIS_MAJOR=7\n'
               printf 'MAIN_OCI_LABELS_SHA256=%s\n' "$main_labels_sha256"
-              printf 'REALTIME_OCI_LABELS_SHA256=%s\n' "$realtime_labels_sha256"
               printf 'MAIN_SBOM_SHA256=%s\n' "$(sha256_of "fork-signed-bundles/main-${sbom_suffix}.sbom.sigstore.json")"
-              printf 'REALTIME_SBOM_SHA256=%s\n' "$(sha256_of "fork-signed-bundles/realtime-${sbom_suffix}.sbom.sigstore.json")"
               printf 'MAIN_PROVENANCE_SHA256=%s\n' "$main_provenance_sha256"
-              printf 'REALTIME_PROVENANCE_SHA256=%s\n' "$realtime_provenance_sha256"
               printf 'DOCKERFILE_MAIN_SHA256=%s\n' "$dockerfile_main_sha256"
-              printf 'DOCKERFILE_REALTIME_SHA256=%s\n' "$dockerfile_realtime_sha256"
               printf 'COMPOSE_SHA256=%s\n' "$compose_sha256"
               printf 'COMPOSE_PROD_SHA256=%s\n' "$compose_prod_sha256"
               printf 'COMPOSE_OVERLAY_SHA256=%s\n' "$(sha256_of "$overlay")"
@@ -2354,10 +2245,10 @@ jobs:
             openssl pkeyutl -verify -rawin -pubin -inkey "$public_key" -in "$manifest" -sigfile "$manifest.sig"
           }
 
-          write_manifest linux/amd64 "$MAIN_AMD64_DIGEST" "$REALTIME_AMD64_DIGEST" \
+          write_manifest linux/amd64 "$MAIN_AMD64_DIGEST" \
             "$POSTGRES_AMD64_DIGEST" "$REDIS_AMD64_DIGEST" amd64 \
             fork-signed-bundles/docker-compose.linux-amd64.custom.yml
-          write_manifest linux/arm64 "$MAIN_ARM64_DIGEST" "$REALTIME_ARM64_DIGEST" \
+          write_manifest linux/arm64 "$MAIN_ARM64_DIGEST" \
             "$POSTGRES_ARM64_DIGEST" "$REDIS_ARM64_DIGEST" arm64 \
             fork-signed-bundles/docker-compose.linux-arm64.custom.yml
           rm -f "$private_key" "$derived_public_der" "$committed_public_der"
@@ -2407,9 +2298,6 @@ jobs:
           MAIN_AMD64_DIGEST: ${{ needs.fork-stage.outputs.main_amd64_digest }}
           MAIN_ARM64_DIGEST: ${{ needs.fork-stage.outputs.main_arm64_digest }}
           MAIN_INDEX_DIGEST: ${{ needs.fork-stage.outputs.main_index_digest }}
-          REALTIME_AMD64_DIGEST: ${{ needs.fork-stage.outputs.realtime_amd64_digest }}
-          REALTIME_ARM64_DIGEST: ${{ needs.fork-stage.outputs.realtime_arm64_digest }}
-          REALTIME_INDEX_DIGEST: ${{ needs.fork-stage.outputs.realtime_index_digest }}
         run: |
           set -Eeuo pipefail
 
@@ -2426,12 +2314,8 @@ jobs:
 
           verify_bundle "oci://${MAIN_TARGET}@${MAIN_AMD64_DIGEST}" fork-signed-bundles/main-amd64.sbom.sigstore.json https://spdx.dev/Document/v2.3
           verify_bundle "oci://${MAIN_TARGET}@${MAIN_ARM64_DIGEST}" fork-signed-bundles/main-arm64.sbom.sigstore.json https://spdx.dev/Document/v2.3
-          verify_bundle "oci://${REALTIME_TARGET}@${REALTIME_AMD64_DIGEST}" fork-signed-bundles/realtime-amd64.sbom.sigstore.json https://spdx.dev/Document/v2.3
-          verify_bundle "oci://${REALTIME_TARGET}@${REALTIME_ARM64_DIGEST}" fork-signed-bundles/realtime-arm64.sbom.sigstore.json https://spdx.dev/Document/v2.3
           verify_bundle "oci://${MAIN_TARGET}@${MAIN_INDEX_DIGEST}" fork-signed-bundles/main.provenance.sigstore.json https://slsa.dev/provenance/v1
-          verify_bundle "oci://${REALTIME_TARGET}@${REALTIME_INDEX_DIGEST}" fork-signed-bundles/realtime.provenance.sigstore.json https://slsa.dev/provenance/v1
           verify_bundle "oci://${MAIN_TARGET}@${MAIN_INDEX_DIGEST}" fork-signed-bundles/main.binding.sigstore.json https://coolify.io/attestations/fork-release-binding/v1
-          verify_bundle "oci://${REALTIME_TARGET}@${REALTIME_INDEX_DIGEST}" fork-signed-bundles/realtime.binding.sigstore.json https://coolify.io/attestations/fork-release-binding/v1
           "$GH_CLI" attestation verify fork-signed-bundles/release-linux-amd64.env \
             --bundle fork-signed-bundles/release-linux-amd64.attestation.sigstore.json \
             --predicate-type https://slsa.dev/provenance/v1 \
@@ -2463,7 +2347,7 @@ jobs:
           retention-days: 90
 
   fork-release:
-    name: Coordinate both fork semantic promotions
+    name: Coordinate the fork semantic promotion
     needs: [validate-inputs, fork-registry-policy, fork-stage, fork-attest]
     if: ${{ inputs.release_kind == 'fork' && needs.fork-attest.result == 'success' }}
     concurrency:
@@ -2477,8 +2361,6 @@ jobs:
     outputs:
       main_digest: ${{ needs.fork-stage.outputs.main_index_digest }}
       main_image: ${{ steps.references.outputs.main_image }}
-      realtime_digest: ${{ needs.fork-stage.outputs.realtime_index_digest }}
-      realtime_image: ${{ steps.references.outputs.realtime_image }}
     env:
       BUNDLE_ARTIFACT_ID: ${{ needs.fork-attest.outputs.bundle_artifact_id }}
       MAIN_AMD64_DIGEST: ${{ needs.fork-stage.outputs.main_amd64_digest }}
@@ -2487,10 +2369,6 @@ jobs:
       MAIN_TARGET: docker.iocloudhost.net/williamagh/coolify
       NEXUS_API_URL: https://sonatype.popos-sf6.com
       NEXUS_REPOSITORY: docker-hosted
-      REALTIME_AMD64_DIGEST: ${{ needs.fork-stage.outputs.realtime_amd64_digest }}
-      REALTIME_ARM64_DIGEST: ${{ needs.fork-stage.outputs.realtime_arm64_digest }}
-      REALTIME_INDEX_DIGEST: ${{ needs.fork-stage.outputs.realtime_index_digest }}
-      REALTIME_TARGET: docker.iocloudhost.net/williamagh/coolify-realtime
       SEMANTIC_VERSION: ${{ inputs.semantic_version }}
       SOURCE_REVISION: ${{ github.sha }}
       SOURCE_URL: https://github.com/${{ github.repository }}
@@ -2697,7 +2575,7 @@ jobs:
             printf 'Published fork release exactly matches the immutable release contract; accepting idempotent retry.\n'
           fi
 
-      - name: Promote realtime first and main last as the fork release commit marker
+      - name: Promote and verify the main fork image
         run: |
           set -Eeuo pipefail
           umask 077
@@ -2829,14 +2707,10 @@ jobs:
           }
 
           verify_exact_index "$MAIN_TARGET" "$MAIN_INDEX_DIGEST" "$MAIN_AMD64_DIGEST" "$MAIN_ARM64_DIGEST"
-          verify_exact_index "$REALTIME_TARGET" "$REALTIME_INDEX_DIGEST" "$REALTIME_AMD64_DIGEST" "$REALTIME_ARM64_DIGEST"
 
-          # Physical registry atomicity is impossible: Nexus has no cross-repository
-          # atomic tag operation. The consumable-release contract is therefore
-          # an unpublished recovery draft plus verified realtime first, then the
-          # main tag as the final commit marker. Signed bundles are published only
-          # after both tags and the live GitHub source tag are revalidated. ALLOW_ONCE
-          # reruns may repair only an absent peer whose eventual digest matches.
+          # The recovery draft remains unpublished until the single semantic image
+          # tag and its live GitHub source tag have both been revalidated. ALLOW_ONCE
+          # reruns may accept only the same immutable index digest.
           preflight_semantic_tag() {
             local repository=$1 expected_index_digest=$2 existing
             existing="$(digest_or_absent "$repository:$SEMANTIC_VERSION")"
@@ -2875,16 +2749,11 @@ jobs:
           }
 
           preflight_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"
-          preflight_semantic_tag "$REALTIME_TARGET" "$REALTIME_INDEX_DIGEST"
 
           assert_live_fork_tag_binding
           assert_active_fork_tag_protection
 
-          promote_or_verify_semantic_tag "$REALTIME_TARGET" "$REALTIME_INDEX_DIGEST"
-          verify_exact_index "$REALTIME_TARGET" "$REALTIME_INDEX_DIGEST" "$REALTIME_AMD64_DIGEST" "$REALTIME_ARM64_DIGEST"
-
           promote_or_verify_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"
-          verify_exact_index "$REALTIME_TARGET" "$REALTIME_INDEX_DIGEST" "$REALTIME_AMD64_DIGEST" "$REALTIME_ARM64_DIGEST"
           verify_exact_index "$MAIN_TARGET" "$MAIN_INDEX_DIGEST" "$MAIN_AMD64_DIGEST" "$MAIN_ARM64_DIGEST"
           assert_live_fork_tag_binding
           assert_active_fork_tag_protection
@@ -3070,5 +2939,4 @@ jobs:
           set -eu
           {
             printf 'main_image=%s@%s\n' "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"
-            printf 'realtime_image=%s@%s\n' "$REALTIME_TARGET" "$REALTIME_INDEX_DIGEST"
           } >> "$GITHUB_OUTPUT"

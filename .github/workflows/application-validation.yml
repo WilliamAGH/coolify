@@ -2,6 +2,7 @@ name: Application validation
 
 on:
   pull_request:
+  workflow_dispatch:
   workflow_call:
 
 permissions:
@@ -70,6 +71,8 @@ jobs:
             tests/Unit/ApplicationValidationWorkflowTest.php \
             tests/Unit/CheckHelperImageJobTest.php \
             tests/Unit/CheckForUpdatesJobTest.php \
+            tests/Unit/GenerateChangelogWorkflowTest.php \
+            tests/Unit/ProductionImageRuntimeContentTest.php \
             tests/Unit/ProductionImageSupplyChainWorkflowTest.php \
             tests/Unit/ReleaseOperationalAcceptanceWorkflowTest.php \
             tests/Unit/ReleasePlatformAcceptanceWorkflowTest.php \
@@ -79,13 +82,23 @@ jobs:
             tests/Unit/StagingImageReferenceWorkflowTest.php \
             tests/Unit/UpdateCoolifyTest.php \
             tests/Feature/ForkVersionConsumerTest.php \
+            tests/Feature/ProductionSeederTest.php \
+            tests/Feature/ReverbAndTerminalPackagingTest.php \
             tests/Feature/UpgradeComponentTest.php
       - name: Run native Traefik control-plane tests
         run: |
+          set -Eeuo pipefail
+          mapfile -t control_plane_feature_tests < <(
+            find tests/Feature/Proxy/ControlPlane -maxdepth 1 -type f -name '*Test.php' \
+              ! -name 'ProveAndFreezeControlPlaneGenerationTest.php' -print | sort
+          )
+          (( ${#control_plane_feature_tests[@]} > 0 ))
           php artisan test --compact \
             tests/Feature/InspectProxyMutationQueueTest.php \
-            tests/Feature/Proxy/ControlPlane \
+            "${control_plane_feature_tests[@]}" \
             tests/Unit/Actions/Proxy/ControlPlane
+      - name: Run control-plane backup-quiesce owner
+        run: php artisan test --compact tests/Feature/Proxy/ControlPlane/ProveAndFreezeControlPlaneGenerationTest.php
 
   blue-green-lifecycle:
     name: Blue-green lifecycle (PostgreSQL)
@@ -151,6 +164,7 @@ jobs:
             tests/Feature/BlueGreenApplicationDeletionOrchestrationTest.php \
             tests/Feature/BlueGreenCancellationCompensationTest.php \
             tests/Feature/BlueGreenDeactivationResumeCommandTest.php \
+            tests/Feature/BlueGreenDeploymentReconciliationTest.php \
             tests/Feature/BlueGreenDeploymentRecoveryFailureTest.php \
             tests/Feature/BlueGreenDeploymentRecoveryTest.php \
             tests/Feature/BlueGreenFoundationMigrationReplayTest.php \
@@ -295,12 +309,13 @@ jobs:
       - name: Verify pinned source provenance
         run: |
           docker/verify-source-provenance.sh docker/production/Dockerfile
-          docker/verify-source-provenance.sh docker/coolify-realtime/Dockerfile
           docker/verify-source-provenance.sh docker/testing-host/Dockerfile
       - name: Run release publication shell integrations
         run: |
           tests/Integration/PublishLinuxImageScriptTest.sh
           tests/Integration/ReleaseOperationalFixturesTest.sh
+      - name: Verify Docker daemon configuration ownership
+        run: tests/Integration/DockerDaemonConfigurationTest.sh
       - name: Verify database migration S6 exit propagation
         run: tests/Integration/DatabaseMigrationS6/run.sh
       - name: Run native Traefik runtime integration
@@ -388,27 +403,9 @@ jobs:
           PRODUCTION_IMAGE: coolify:application-validation-${{ github.sha }}
           TESTING_HOST_IMAGE: coolify-testing-host:application-validation-${{ github.sha }}
         run: tests/Integration/TestingHostImageTest.sh
-
-  realtime-runtime:
-    name: Realtime source image runtime
-    if: ${{ github.event_name == 'pull_request' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-        with:
-          persist-credentials: false
-      - name: Build exact realtime source image without publication
+      - name: Run exact bundled Reverb and terminal runtime contract
         env:
-          REALTIME_IMAGE: coolify-realtime:application-validation-${{ github.sha }}
-        run: |
-          docker buildx build --load --pull \
-            --file docker/coolify-realtime/Dockerfile \
-            --tag "$REALTIME_IMAGE" \
-            .
-      - name: Run exact realtime runtime contract
-        env:
-          REALTIME_IMAGE: coolify-realtime:application-validation-${{ github.sha }}
+          PRODUCTION_IMAGE: coolify:application-validation-${{ github.sha }}
         run: tests/Integration/RealtimeImageTest.sh
 
   fork-deploy:
@@ -432,7 +429,6 @@ jobs:
       - formatting
       - fork-deploy
       - node
-      - realtime-runtime
       - testing-host-runtime
       - workflow-and-shell
     runs-on: ubuntu-24.04
@@ -447,7 +443,6 @@ jobs:
           FORK_DEPLOY_RESULT: ${{ needs.fork-deploy.result }}
           NODE_RESULT: ${{ needs.node.result }}
           PHP_RESULT: ${{ needs.php.result }}
-          REALTIME_RUNTIME_RESULT: ${{ needs.realtime-runtime.result }}
           TESTING_HOST_RUNTIME_RESULT: ${{ needs.testing-host-runtime.result }}
           WORKFLOW_RESULT: ${{ needs.workflow-and-shell.result }}
         run: |
@@ -466,19 +461,11 @@ jobs:
             }
           done
           if [[ "$EVENT_NAME" == pull_request ]]; then
-            [[ "$REALTIME_RUNTIME_RESULT" == success ]] || {
-              echo "Realtime runtime validation did not succeed for a pull request: $REALTIME_RUNTIME_RESULT" >&2
-              exit 1
-            }
             [[ "$TESTING_HOST_RUNTIME_RESULT" == success ]] || {
               echo "Testing-host runtime validation did not succeed for a pull request: $TESTING_HOST_RUNTIME_RESULT" >&2
               exit 1
             }
           else
-            [[ "$REALTIME_RUNTIME_RESULT" == skipped ]] || {
-              echo "Realtime runtime validation must be skipped outside pull requests: $REALTIME_RUNTIME_RESULT" >&2
-              exit 1
-            }
             [[ "$TESTING_HOST_RUNTIME_RESULT" == skipped ]] || {
               echo "Testing-host runtime validation must be skipped for reusable workflow calls: $TESTING_HOST_RUNTIME_RESULT" >&2
               exit 1

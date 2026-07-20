@@ -1,50 +1,20 @@
 <?php
 
-it('copies the realtime terminal utilities into the container image', function () {
-    $dockerfile = file_get_contents(base_path('docker/coolify-realtime/Dockerfile'));
+it('copies the terminal utilities into each Coolify container image', function (string $dockerfilePath) {
+    $dockerfile = file_get_contents(base_path($dockerfilePath));
 
-    expect($dockerfile)->toContain('COPY docker/coolify-realtime/terminal-utils.js /terminal/terminal-utils.js');
-});
+    expect($dockerfile)->toMatch('/COPY(?: --chown=[^ ]+)? docker\/coolify-terminal\/terminal-utils\.js \/terminal\/terminal-utils\.js/');
+})->with([
+    'production image' => 'docker/production/Dockerfile',
+    'development image' => 'docker/development/Dockerfile',
+]);
 
-it('builds Soketi from pinned source on the supported Node runtime', function () {
-    $dockerfile = file_get_contents(base_path('docker/coolify-realtime/Dockerfile'));
-    $entrypoint = file_get_contents(base_path('docker/coolify-realtime/soketi-entrypoint.sh'));
-
-    expect($dockerfile)
-        ->toContain('ARG SOKETI_VERSION=1.6.1')
-        ->toContain('ARG SOKETI_TAG=1.6.1')
-        ->toContain('ARG SOKETI_COMMIT=5d188786beaf683aca2115a6247dcdc15c29ac77')
-        ->toContain('ARG NODE_VERSION=24.18.0-alpine3.24@sha256:a0b9bf06e4e6193cf7a0f58816cc935ff8c2a908f81e6f1a95432d679c54fbfd')
-        ->toContain('ARG UWEBSOCKETS_VERSION=20.69.0')
-        ->toContain('ARG UWEBSOCKETS_TAG=v20.69.0')
-        ->toContain('ARG NODE_V8_FAST_API_HEADER_SHA256=c6c8b22ebf8014ef5b1cb04bec2af7549754cede52b745474aae1762e060b842')
-        ->toContain('ARG SOKETI_RUNTIME_PM2_AGENT_VERSION=2.1.1')
-        ->toContain('ARG SOKETI_RUNTIME_PM2_AGENT_WS_VERSION=7.5.13')
-        ->toContain('ARG SOKETI_RUNTIME_LOCK_SHA256=92397a4262e3fa2f2cc9e554ba724981a4a8b97ebfd7f422b38616b68981e89c')
-        ->toContain('npm run build')
-        ->toContain('npm ci --omit=dev --ignore-scripts --no-audit --no-fund;')
-        ->toContain('git -C uWebSockets submodule update --init --depth=1 uSockets;')
-        ->toContain('ARG UWEBSOCKETS_NO_HTTP3_PATCH_SHA256=418c90db5f48f0893d53a41c84c549138c47307c331ffed5146e17cefa3da2ad')
-        ->toContain('COPY docker/coolify-realtime/uwebsockets-no-http3.patch /tmp/uwebsockets-no-http3.patch')
-        ->toContain('git apply --check --unidiff-zero /tmp/uwebsockets-no-http3.patch;')
-        ->toContain('-lssl -lcrypto -luv -lz')
-        ->toContain('rm -rf node_modules/resolve/test;')
-        ->toContain('COPY --from=soketi-builder /out /app')
-        ->toContain('/usr/local/lib/node_modules/npm;')
-        ->not->toContain('quay.io/soketi/soketi')
-        ->not->toContain('/usr/local/bin/node-soketi')
-        ->not->toContain('LD_LIBRARY_PATH=/usr/local/lib/node24')
-        ->and($entrypoint)
-        ->toContain('node /app/bin/server.js start')
-        ->toContain('SHUTTING_DOWN=true')
-        ->toContain('if [ "$SHUTTING_DOWN" = true ]; then')
-        ->not->toContain('node-soketi');
-});
-
-it('mounts the realtime terminal utilities in local development compose files', function (string $composeFile) {
+it('does not depend on terminal source bind mounts in local development compose files', function (string $composeFile) {
     $composeContents = file_get_contents(base_path($composeFile));
 
-    expect($composeContents)->toContain('./docker/coolify-realtime/terminal-utils.js:/terminal/terminal-utils.js');
+    expect($composeContents)
+        ->not->toContain('docker/coolify-terminal')
+        ->not->toContain('coolify-realtime');
 })->with([
     'default dev compose' => 'docker-compose.dev.yml',
     'maxio dev compose' => 'docker-compose-maxio.dev.yml',
@@ -73,18 +43,19 @@ it('registers the terminal Alpine provider before Livewire initializes navigated
         ->toContain('terminalComponentRegistered = true;');
 });
 
-it('keeps realtime terminal server logging behind the explicit debug flag', function () {
-    $terminalServer = file_get_contents(base_path('docker/coolify-realtime/terminal-server.js'));
+it('keeps terminal server logging behind the explicit debug flag', function () {
+    $terminalServer = file_get_contents(base_path('docker/coolify-terminal/terminal-server.js'));
 
     expect($terminalServer)
         ->toContain('const debugOverride = String(process.env.TERMINAL_DEBUG')
         ->toContain("['1', 'true', 'yes', 'on'].includes(debugOverride)")
+        ->toContain("process.env.TERMINAL_AUTH_HOST || process.env.COOLIFY_INTERNAL_HOST || '127.0.0.1'")
         ->toContain('if (!terminalDebugEnabled) {')
         ->not->toContain("console.log('Coolify realtime terminal server listening on port 6002. Let the hacking begin!');");
 });
 
 it('configures a server-initiated WebSocket heartbeat to survive proxy idle timeouts', function () {
-    $terminalServer = file_get_contents(base_path('docker/coolify-realtime/terminal-server.js'));
+    $terminalServer = file_get_contents(base_path('docker/coolify-terminal/terminal-server.js'));
 
     expect($terminalServer)
         ->toContain('ws.isAlive = true;')
@@ -109,7 +80,7 @@ it('uses a fast probe timeout when the tab regains visibility', function () {
 });
 
 it('does not hard close terminal sessions after 30 minutes on the server', function () {
-    $terminalServer = file_get_contents(base_path('docker/coolify-realtime/terminal-server.js'));
+    $terminalServer = file_get_contents(base_path('docker/coolify-terminal/terminal-server.js'));
 
     expect($terminalServer)
         ->not->toContain('IDLE_TIMEOUT_MS = 30 * 60 * 1000')
@@ -158,8 +129,8 @@ it('replays the last command on reconnect so the PTY respawns automatically', fu
         ->toContain('this.lastSentCommand = null;');
 });
 
-it('buffers messages received before the realtime server finishes auth so the replay is not lost', function () {
-    $terminalServer = file_get_contents(base_path('docker/coolify-realtime/terminal-server.js'));
+it('buffers messages received before the terminal server finishes auth so the replay is not lost', function () {
+    $terminalServer = file_get_contents(base_path('docker/coolify-terminal/terminal-server.js'));
 
     expect($terminalServer)
         ->toContain('authReady: false')

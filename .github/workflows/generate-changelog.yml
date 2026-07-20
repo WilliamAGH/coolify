@@ -6,13 +6,18 @@ on:
     paths-ignore:
       - .github/workflows/coolify-helper.yml
       - .github/workflows/coolify-helper-next.yml
-      - .github/workflows/coolify-realtime.yml
-      - .github/workflows/coolify-realtime-next.yml
       - .github/workflows/pr-quality.yaml
   workflow_dispatch:
 
 permissions:
+  actions: write
   contents: write
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  group: generate-changelog
+  cancel-in-progress: true
 
 jobs:
   changelog:
@@ -20,12 +25,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           fetch-depth: 0
 
       - name: Generate changelog
-        uses: orhun/git-cliff-action@v4
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # v4.8.0
         with:
           config: cliff.toml
           args: --verbose
@@ -33,10 +38,57 @@ jobs:
           OUTPUT: CHANGELOG.md
           GITHUB_REPO: ${{ github.repository }}
 
-      - name: Commit
+      - name: Publish protected changelog pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
+          set -Eeuo pipefail
+
+          if git diff --quiet -- CHANGELOG.md; then
+            echo 'CHANGELOG.md is current.'
+            exit 0
+          fi
+
+          bot_branch='automation/changelog'
+          bot_ref="refs/heads/${bot_branch}"
+          expected_head="$(git ls-remote --heads origin "${bot_ref}" | awk '{print $1}')"
+
+          git switch -C "${bot_branch}"
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
           git add CHANGELOG.md
           git commit -m "docs: update changelog"
-          git push https://${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git v4.x
+
+          if [ -n "${expected_head}" ]; then
+            git push --force-with-lease="${bot_ref}:${expected_head}" origin "HEAD:${bot_ref}"
+          else
+            git push origin "HEAD:${bot_ref}"
+          fi
+
+          pr_url="$(gh pr list --head "${bot_branch}" --base v4.x --state open --json url --jq '.[0].url // empty')"
+          if [ -z "${pr_url}" ]; then
+            pr_url="$(gh pr create \
+              --base v4.x \
+              --head "${bot_branch}" \
+              --title 'docs: update changelog' \
+              --body 'Automated changelog update generated from the protected v4.x release history.')"
+          fi
+
+          validation_url="$(gh workflow run application-validation.yml --ref "${bot_branch}")"
+          validation_run_id="${validation_url##*/}"
+          gh run watch "${validation_run_id}" --exit-status
+
+          head_sha="$(git rev-parse HEAD)"
+          gh api --method POST "repos/${GH_REPO}/statuses/${head_sha}" \
+            -f state=success \
+            -f context='Application validation required' \
+            -f description='Required workflow_dispatch validation passed' \
+            -f target_url="${validation_url}"
+
+          pr_merge_state="$(gh pr view "${pr_url}" \
+            --json state,autoMergeRequest \
+            --jq 'if .state != "OPEN" then "closed" elif .autoMergeRequest != null then "armed" else "unarmed" end')"
+          if [ "${pr_merge_state}" = 'unarmed' ]; then
+            gh pr merge --auto --squash --delete-branch "${pr_url}"
+          fi

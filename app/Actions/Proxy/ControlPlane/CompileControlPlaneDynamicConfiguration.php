@@ -49,12 +49,12 @@ final class CompileControlPlaneDynamicConfiguration
 
         $realtimeRouterFragments = $this->normalizeRouterFragments(
             $realtimeRouterFragments,
-            '/app',
+            ['/app', '/apps'],
             'realtime',
         );
         $terminalRouterFragments = $this->normalizeRouterFragments(
             $terminalRouterFragments,
-            '/terminal/ws',
+            ['/terminal/ws'],
             'terminal',
         );
         $fragmentRouterNames = [...array_keys($realtimeRouterFragments), ...array_keys($terminalRouterFragments)];
@@ -264,9 +264,10 @@ final class CompileControlPlaneDynamicConfiguration
 
     /**
      * @param  array<string, array<string, mixed>>  $fragments
+     * @param  list<string>  $requiredPaths
      * @return array<string, array<string, mixed>>
      */
-    private function normalizeRouterFragments(array $fragments, string $requiredPath, string $kind): array
+    private function normalizeRouterFragments(array $fragments, array $requiredPaths, string $kind): array
     {
         foreach ($fragments as $routerName => $router) {
             if (! is_string($routerName)
@@ -283,9 +284,14 @@ final class CompileControlPlaneDynamicConfiguration
             if (array_diff(array_keys($router), ['rule', 'entryPoints', 'service', 'middlewares', 'tls', 'priority']) !== []) {
                 throw new InvalidArgumentException("The {$kind} router fragment contains an unsupported router property.");
             }
-            if (preg_match('/^[\x20-\x7E]+$/D', $router['rule']) !== 1
-                || ! str_contains($router['rule'], "PathPrefix(`{$requiredPath}`)")) {
-                throw new InvalidArgumentException("The {$kind} router fragment must preserve {$requiredPath}.");
+            $preservesRequiredPath = array_any(
+                $requiredPaths,
+                fn (string $requiredPath): bool => str_contains($router['rule'], "PathPrefix(`{$requiredPath}`)"),
+            );
+            if (preg_match('/^[\x20-\x7E]+$/D', $router['rule']) !== 1 || ! $preservesRequiredPath) {
+                throw new InvalidArgumentException(
+                    "The {$kind} router fragment must preserve ".implode(' or ', $requiredPaths).'.',
+                );
             }
             $this->assertProviderReference($router['service'], "{$kind} router service");
             if (! array_is_list($router['entryPoints']) || $router['entryPoints'] === []) {

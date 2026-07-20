@@ -228,7 +228,8 @@ final class ExtractControlPlaneDynamicFragments
 
     private function routeKind(string $rule): ?string
     {
-        $matchesRealtime = str_contains($rule, 'PathPrefix(`/app`)');
+        $matchesRealtime = str_contains($rule, 'PathPrefix(`/app`)')
+            || str_contains($rule, 'PathPrefix(`/apps`)');
         $matchesTerminal = str_contains($rule, 'PathPrefix(`/terminal/ws`)');
         if ($matchesRealtime && $matchesTerminal) {
             throw new InvalidArgumentException('A control-plane router cannot ambiguously match both realtime and terminal paths.');
@@ -270,7 +271,9 @@ final class ExtractControlPlaneDynamicFragments
             throw new InvalidArgumentException("The {$serviceName} service has circular references.");
         }
 
-        $service = $this->referencedDefinition($serviceName, $services, 'service');
+        $service = $this->migrateLegacyRealtimeBackend(
+            $this->referencedDefinition($serviceName, $services, 'service'),
+        );
         $serviceResolutionStack[$serviceName] = true;
         try {
             $this->preserveServiceDependencies(
@@ -287,6 +290,33 @@ final class ExtractControlPlaneDynamicFragments
         }
 
         $preservedServices[$serviceName] = $service;
+    }
+
+    /**
+     * @param  array<string, mixed>  $service
+     * @return array<string, mixed>
+     */
+    private function migrateLegacyRealtimeBackend(array $service): array
+    {
+        $servers = $service['loadBalancer']['servers'] ?? null;
+        if (! is_array($servers)) {
+            return $service;
+        }
+
+        $legacyBackends = [
+            'http://coolify-realtime:6001' => 'http://coolify:6001',
+            'http://coolify-realtime:6002' => 'http://coolify:6002',
+        ];
+        foreach ($servers as $index => $server) {
+            if (! is_array($server) || ! isset($server['url']) || ! is_string($server['url'])) {
+                continue;
+            }
+            if (isset($legacyBackends[$server['url']])) {
+                $service['loadBalancer']['servers'][$index]['url'] = $legacyBackends[$server['url']];
+            }
+        }
+
+        return $service;
     }
 
     /**
