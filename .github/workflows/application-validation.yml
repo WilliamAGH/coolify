@@ -82,6 +82,7 @@ jobs:
             tests/Unit/UpdateCoolifyTest.php \
             tests/Feature/ForkVersionConsumerTest.php \
             tests/Feature/ProductionSeederTest.php \
+            tests/Feature/ReverbAndTerminalPackagingTest.php \
             tests/Feature/UpgradeComponentTest.php
       - name: Run native Traefik control-plane tests
         run: |

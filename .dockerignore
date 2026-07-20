@@ -22,7 +22,7 @@ yarn-error.log
 .rnd
 /.ssh
 .ignition.json
-docker/coolify-realtime/node_modules
+docker/coolify-terminal/node_modules
 
 /storage/*.key
 /docker/testing-host/development-private_key

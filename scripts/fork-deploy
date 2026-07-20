@@ -19,7 +19,7 @@ PENDING_FILE=
 FORWARD_RECOVERY_FILE=
 REGISTRY=docker.iocloudhost.net
 MAIN_REPOSITORY=$REGISTRY/williamagh/coolify
-REALTIME_REPOSITORY=$REGISTRY/williamagh/coolify-realtime
+LEGACY_REALTIME_REPOSITORY=$REGISTRY/williamagh/coolify-realtime
 POSTGRES_REPOSITORY=docker.io/library/postgres
 REDIS_REPOSITORY=docker.io/library/redis
 GITHUB_RAW_BASE=https://raw.githubusercontent.com/williamacallahan/coolify
@@ -32,7 +32,6 @@ DRY_RUN=false
 ACTION=
 VERSION=
 MAIN_DIGEST=
-REALTIME_DIGEST=
 POSTGRES_DIGEST=
 REDIS_DIGEST=
 SOURCE_REVISION=
@@ -45,14 +44,16 @@ MANIFEST_PUBLIC_KEY=
 MANIFEST_SIGNATURE=
 MANIFEST_KEY_ID=
 MANIFEST_TRUST_KEY_ID=
+MANIFEST_SCHEMA=
 TRUST_PUBLIC_KEY=
 SOURCE_TAG=
 MAIN_INDEX_DIGEST=
-REALTIME_INDEX_DIGEST=
+LEGACY_REALTIME_INDEX_DIGEST=
+LEGACY_REALTIME_DIGEST=
 POSTGRES_MAJOR=
 REDIS_MAJOR=
 MAIN_IMAGE=
-REALTIME_IMAGE=
+LEGACY_REALTIME_IMAGE=
 POSTGRES_IMAGE=
 REDIS_IMAGE=
 RECOVERY_ARMED=false
@@ -64,6 +65,7 @@ DEPLOYMENT_PRESTART_UNDO_SHA256=
 PREVIOUS_CURRENT_VERSION=
 UPDATE_FROM_VERSION=
 DEPLOYMENT_STAGING=
+LEGACY_REALTIME_TRANSITION=false
 
 test_mode() {
     [[ $TEST_MODE == true ]]
@@ -400,7 +402,7 @@ acquire_lock() {
 }
 
 image_ref_main() { printf '%s@%s\n' "$MAIN_REPOSITORY" "$MAIN_DIGEST"; }
-image_ref_realtime() { printf '%s@%s\n' "$REALTIME_REPOSITORY" "$REALTIME_DIGEST"; }
+image_ref_legacy_realtime() { printf '%s@%s\n' "$LEGACY_REALTIME_REPOSITORY" "$LEGACY_REALTIME_DIGEST"; }
 image_ref_postgres() { printf '%s@%s\n' "$POSTGRES_REPOSITORY" "$POSTGRES_DIGEST"; }
 image_ref_redis() { printf '%s@%s\n' "$REDIS_REPOSITORY" "$REDIS_DIGEST"; }
 
@@ -421,9 +423,8 @@ download_asset() {
 }
 
 write_overlay() {
-    local path=$1 main_ref realtime_ref
+    local path=$1 main_ref
     main_ref=$(image_ref_main)
-    realtime_ref=$(image_ref_realtime)
     if "$DRY_RUN"; then
         note "PLAN: write immutable image overlay $path"
         return 0
@@ -434,13 +435,10 @@ write_overlay() {
         printf '    image: "%s"\n' "$main_ref"
         printf '    ports: !override\n'
         printf '%s\n' "      - \"\${APP_PORT:-8000}:8080\""
+        printf '%s\n' "      - \"127.0.0.1:\${PUSHER_PORT:-\${SOKETI_PORT:-6001}}:6001\""
+        printf '%s\n' "      - \"127.0.0.1:\${TERMINAL_PORT:-6002}:6002\""
         printf '    environment:\n'
         printf '      AUTOUPDATE: "false"\n'
-        printf '  soketi:\n'
-        printf '    image: "%s"\n' "$realtime_ref"
-        printf '    ports: !override\n'
-        printf '%s\n' "      - \"127.0.0.1:\${SOKETI_PORT:-6001}:6001\""
-        printf '      - "127.0.0.1:6002:6002"\n'
         printf '  postgres:\n'
         printf '    image: "%s"\n' "$(image_ref_postgres)"
         printf '  redis:\n'
@@ -661,14 +659,29 @@ adopt_localhost_ssh_key() {
 wait_for_health() {
     local attempt container status
     for ((attempt = 1; attempt <= HEALTH_ATTEMPTS; attempt++)); do
-        for container in coolify coolify-db coolify-redis coolify-realtime; do
+        for container in coolify coolify-db coolify-redis; do
             status=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container" 2>/dev/null || true)
             [[ $status == healthy || $status == running ]] || break
         done
-        if [[ $container == coolify-realtime && ( $status == healthy || $status == running ) ]]; then return 0; fi
+        if [[ $container == coolify-redis && ( $status == healthy || $status == running ) ]]; then return 0; fi
         sleep 2
     done
     note "ERROR: containers did not become healthy after $HEALTH_ATTEMPTS checks" >&2
+    return 1
+}
+
+wait_for_legacy_health() {
+    local attempt container status
+
+    for ((attempt = 1; attempt <= HEALTH_ATTEMPTS; attempt++)); do
+        for container in coolify coolify-realtime coolify-db coolify-redis; do
+            status=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container" 2>/dev/null || true)
+            [[ $status == healthy || $status == running ]] || break
+        done
+        if [[ $container == coolify-redis && ( $status == healthy || $status == running ) ]]; then return 0; fi
+        sleep 2
+    done
+    note "ERROR: legacy containers did not become healthy after $HEALTH_ATTEMPTS checks" >&2
     return 1
 }
 
@@ -892,11 +905,43 @@ fd_download_manifest() {
     MANIFEST_SIGNATURE=$destination.sig
 }
 
+fd_reset_manifest_fields() {
+    MANIFEST_SCHEMA=
+    MANIFEST_KEY_ID=
+    VERSION=
+    SOURCE_REVISION=
+    SOURCE_TAG=
+    MAIN_IMAGE=
+    MAIN_INDEX_DIGEST=
+    MAIN_DIGEST=
+    LEGACY_REALTIME_IMAGE=
+    LEGACY_REALTIME_INDEX_DIGEST=
+    LEGACY_REALTIME_DIGEST=
+    POSTGRES_IMAGE=
+    POSTGRES_DIGEST=
+    POSTGRES_MAJOR=
+    REDIS_IMAGE=
+    REDIS_DIGEST=
+    REDIS_MAJOR=
+    MAIN_OCI_LABELS_SHA256=
+    REALTIME_OCI_LABELS_SHA256=
+    MAIN_SBOM_SHA256=
+    REALTIME_SBOM_SHA256=
+    MAIN_PROVENANCE_SHA256=
+    REALTIME_PROVENANCE_SHA256=
+    DOCKERFILE_MAIN_SHA256=
+    DOCKERFILE_REALTIME_SHA256=
+    COMPOSE_SHA256=
+    COMPOSE_PROD_SHA256=
+    COMPOSE_OVERLAY_SHA256=
+    ENV_PRODUCTION_SHA256=
+}
+
 fd_assign_manifest_field() {
     local key=$1 value=$2
 
     case $key in
-        SCHEMA) [[ $value == coolify-fork-release/v1 ]] || die 'unsupported release manifest schema' ;;
+        SCHEMA) MANIFEST_SCHEMA=$value ;;
         KEY_ID)
             MANIFEST_KEY_ID=$value
             [[ $MANIFEST_KEY_ID =~ ^sha256:[0-9a-f]{64}$ ]] || die 'invalid release manifest KEY_ID'
@@ -909,9 +954,9 @@ fd_assign_manifest_field() {
         MAIN_IMAGE) MAIN_IMAGE=$value; [[ $MAIN_IMAGE == "$MAIN_REPOSITORY" ]] || die 'release manifest MAIN_IMAGE is not the approved Coolify repository' ;;
         MAIN_INDEX_DIGEST) MAIN_INDEX_DIGEST=$value; validate_digest "$MAIN_INDEX_DIGEST" ;;
         MAIN_PLATFORM_DIGEST) MAIN_DIGEST=$value; validate_digest "$MAIN_DIGEST" ;;
-        REALTIME_IMAGE) REALTIME_IMAGE=$value; [[ $REALTIME_IMAGE == "$REALTIME_REPOSITORY" ]] || die 'release manifest REALTIME_IMAGE is not the approved realtime repository' ;;
-        REALTIME_INDEX_DIGEST) REALTIME_INDEX_DIGEST=$value; validate_digest "$REALTIME_INDEX_DIGEST" ;;
-        REALTIME_PLATFORM_DIGEST) REALTIME_DIGEST=$value; validate_digest "$REALTIME_DIGEST" ;;
+        REALTIME_IMAGE) LEGACY_REALTIME_IMAGE=$value; [[ $LEGACY_REALTIME_IMAGE == "$LEGACY_REALTIME_REPOSITORY" ]] || die 'release manifest REALTIME_IMAGE is not the approved legacy realtime repository' ;;
+        REALTIME_INDEX_DIGEST) LEGACY_REALTIME_INDEX_DIGEST=$value; validate_digest "$LEGACY_REALTIME_INDEX_DIGEST" ;;
+        REALTIME_PLATFORM_DIGEST) LEGACY_REALTIME_DIGEST=$value; validate_digest "$LEGACY_REALTIME_DIGEST" ;;
         POSTGRES_IMAGE) POSTGRES_IMAGE=$value; [[ $POSTGRES_IMAGE == "$POSTGRES_REPOSITORY" ]] || die 'release manifest POSTGRES_IMAGE is not the approved PostgreSQL repository' ;;
         POSTGRES_DIGEST) POSTGRES_DIGEST=$value; validate_digest "$POSTGRES_DIGEST" ;;
         POSTGRES_MAJOR) POSTGRES_MAJOR=$value; [[ $POSTGRES_MAJOR =~ ^[1-9][0-9]*$ ]] || die 'invalid release manifest POSTGRES_MAJOR' ;;
@@ -924,24 +969,54 @@ fd_assign_manifest_field() {
 }
 
 fd_load_manifest() {
-    local index=0 line key value
-    local -a expected=(
-        SCHEMA KEY_ID VERSION SOURCE_REVISION SOURCE_TAG PLATFORM
-        MAIN_IMAGE MAIN_INDEX_DIGEST MAIN_PLATFORM_DIGEST
-        REALTIME_IMAGE REALTIME_INDEX_DIGEST REALTIME_PLATFORM_DIGEST
-        POSTGRES_IMAGE POSTGRES_DIGEST POSTGRES_MAJOR
-        REDIS_IMAGE REDIS_DIGEST REDIS_MAJOR
-        MAIN_OCI_LABELS_SHA256 REALTIME_OCI_LABELS_SHA256
-        MAIN_SBOM_SHA256 REALTIME_SBOM_SHA256
-        MAIN_PROVENANCE_SHA256 REALTIME_PROVENANCE_SHA256
-        DOCKERFILE_MAIN_SHA256 DOCKERFILE_REALTIME_SHA256
-        COMPOSE_SHA256 COMPOSE_PROD_SHA256 COMPOSE_OVERLAY_SHA256
-        ENV_PRODUCTION_SHA256
-    )
+    local acceptance=${1:-v2-only} index=0 line key value first_line schema
+    local -a expected
 
+    case $acceptance in
+        v2-only|active-v1-predecessor) ;;
+        *) die 'internal release manifest acceptance mode is invalid' ;;
+    esac
     require_regular_file "$MANIFEST_PATH" 'release manifest'
     require_regular_file "$MANIFEST_SIGNATURE" 'release manifest signature'
     openssl pkeyutl -verify -pubin -inkey "$MANIFEST_PUBLIC_KEY" -rawin -in "$MANIFEST_PATH" -sigfile "$MANIFEST_SIGNATURE" >/dev/null 2>&1 || die 'release manifest signature verification failed'
+    IFS= read -r first_line <"$MANIFEST_PATH" || die 'release manifest is empty'
+    [[ $first_line == SCHEMA=* && $first_line != *$'\r'* ]] || die 'release manifest must begin with SCHEMA'
+    schema=${first_line#SCHEMA=}
+    case $schema in
+        coolify-fork-release/v2)
+            expected=(
+                SCHEMA KEY_ID VERSION SOURCE_REVISION SOURCE_TAG PLATFORM
+                MAIN_IMAGE MAIN_INDEX_DIGEST MAIN_PLATFORM_DIGEST
+                POSTGRES_IMAGE POSTGRES_DIGEST POSTGRES_MAJOR
+                REDIS_IMAGE REDIS_DIGEST REDIS_MAJOR
+                MAIN_OCI_LABELS_SHA256
+                MAIN_SBOM_SHA256
+                MAIN_PROVENANCE_SHA256
+                DOCKERFILE_MAIN_SHA256
+                COMPOSE_SHA256 COMPOSE_PROD_SHA256 COMPOSE_OVERLAY_SHA256
+                ENV_PRODUCTION_SHA256
+            )
+            ;;
+        coolify-fork-release/v1)
+            [[ $acceptance == active-v1-predecessor ]] \
+                || die 'v1 manifests are accepted only for the active predecessor of a v2 update'
+            expected=(
+                SCHEMA KEY_ID VERSION SOURCE_REVISION SOURCE_TAG PLATFORM
+                MAIN_IMAGE MAIN_INDEX_DIGEST MAIN_PLATFORM_DIGEST
+                REALTIME_IMAGE REALTIME_INDEX_DIGEST REALTIME_PLATFORM_DIGEST
+                POSTGRES_IMAGE POSTGRES_DIGEST POSTGRES_MAJOR
+                REDIS_IMAGE REDIS_DIGEST REDIS_MAJOR
+                MAIN_OCI_LABELS_SHA256 REALTIME_OCI_LABELS_SHA256
+                MAIN_SBOM_SHA256 REALTIME_SBOM_SHA256
+                MAIN_PROVENANCE_SHA256 REALTIME_PROVENANCE_SHA256
+                DOCKERFILE_MAIN_SHA256 DOCKERFILE_REALTIME_SHA256
+                COMPOSE_SHA256 COMPOSE_PROD_SHA256 COMPOSE_OVERLAY_SHA256
+                ENV_PRODUCTION_SHA256
+            )
+            ;;
+        *) die 'unsupported release manifest schema' ;;
+    esac
+    fd_reset_manifest_fields
     while IFS= read -r line || [[ -n $line ]]; do
         [[ $line == *=* && $line != =* && $line != *$'\r'* ]] || die 'release manifest contains an invalid line'
         key=${line%%=*}
@@ -951,6 +1026,7 @@ fd_load_manifest() {
         index=$((index + 1))
     done <"$MANIFEST_PATH"
     [[ $index -eq ${#expected[@]} ]] || die 'release manifest is incomplete'
+    [[ $MANIFEST_SCHEMA == "$schema" ]] || die 'release manifest schema changed while parsing'
     [[ $SOURCE_TAG == "$VERSION" ]] || die 'release manifest SOURCE_TAG must exactly match VERSION'
 }
 
@@ -1011,14 +1087,13 @@ fd_activation_file() {
 }
 
 fd_verify_recorded_bundle() {
-    local dir=$1 asset expected actual
+    local dir=$1 acceptance=${2:-v2-only} asset expected actual
 
     require_regular_file "$dir/release.manifest" 'recorded release manifest'
     require_regular_file "$dir/release.manifest.sig" 'recorded release manifest signature'
-    openssl pkeyutl -verify -pubin -inkey "$MANIFEST_PUBLIC_KEY" -rawin -in "$dir/release.manifest" -sigfile "$dir/release.manifest.sig" >/dev/null 2>&1 || die 'recorded release manifest signature verification failed'
     MANIFEST_PATH=$dir/release.manifest
     MANIFEST_SIGNATURE=$dir/release.manifest.sig
-    fd_load_manifest
+    fd_load_manifest "$acceptance"
     for asset in docker-compose.yml docker-compose.prod.yml docker-compose.custom.yml .env.production; do
         case $asset in
             docker-compose.yml) expected=$COMPOSE_SHA256 ;;
@@ -1032,13 +1107,31 @@ fd_verify_recorded_bundle() {
     done
 }
 
+fd_assert_active_v1_predecessor() {
+    local requested=$1 current
+
+    if [[ -e $CURRENT_FILE || -L $CURRENT_FILE ]]; then
+        current=$(fd_current_version)
+        [[ $current == "$requested" ]] \
+            || die 'v1 manifest does not belong to the active predecessor'
+        return 0
+    fi
+    [[ ( $ACTION == update || $ACTION == recover-abort ) \
+        && -n $PREVIOUS_CURRENT_VERSION \
+        && $requested == "$PREVIOUS_CURRENT_VERSION" ]] \
+        || die 'v1 manifests are accepted only for the active predecessor of a v2 update'
+}
+
 fd_load_recorded_release() {
-    local requested=$1 dir
+    local requested=$1 acceptance=${2:-v2-only} dir
 
     dir=$(fd_release_dir "$requested")
     require_regular_file "$dir/verified" "release $requested verified marker"
-    fd_verify_recorded_bundle "$dir"
+    fd_verify_recorded_bundle "$dir" "$acceptance"
     [[ $VERSION == "$requested" ]] || die 'recorded release manifest version does not match its directory'
+    if [[ $MANIFEST_SCHEMA == coolify-fork-release/v1 ]]; then
+        fd_assert_active_v1_predecessor "$requested"
+    fi
 }
 
 fd_load_activation() {
@@ -1070,7 +1163,7 @@ fd_write_activation() {
     now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     fd_atomic_write "$(fd_activation_file "$VERSION")" "activation state for $VERSION" "VERSION=$VERSION" "ACTIVATED_AT=$now" "MIGRATION_FINGERPRINT_BEFORE=$before" "MIGRATION_FINGERPRINT_AFTER=$after" "RENDERED_COMPOSE_SHA256=$rendered"
     fd_atomic_write "$CURRENT_FILE" 'active release state' "$VERSION"
-    fd_append_history "$now"$'\t'"$ACTION"$'\t'"$VERSION"$'\t'"$MAIN_DIGEST"$'\t'"$REALTIME_DIGEST"$'\t'"$before"$'\t'"$after"
+    fd_append_history "$now"$'\t'"$ACTION"$'\t'"$VERSION"$'\t'"$MAIN_DIGEST"$'\t'"$before"$'\t'"$after"
 }
 
 fd_activation_history_exists() {
@@ -1082,12 +1175,11 @@ fd_activation_history_exists() {
         -v activated_at="$activated_at" \
         -v version="$VERSION" \
         -v main_digest="$MAIN_DIGEST" \
-        -v realtime_digest="$REALTIME_DIGEST" \
         -v before="$before" \
         -v after="$after" '
             $1 == activated_at && $2 == "recover-forward" \
                 && $3 == version && $4 == main_digest \
-                && $5 == realtime_digest && $6 == before && $7 == after { found = 1 }
+                && $5 == before && $6 == after { found = 1 }
             END { exit !found }
         ' "$HISTORY_FILE"
 }
@@ -1119,7 +1211,7 @@ fd_reconcile_forward_activation() {
         fd_atomic_write "$CURRENT_FILE" 'active release state' "$VERSION"
     fi
     if ! fd_activation_history_exists "$activated_at" "$before" "$after"; then
-        fd_append_history "$activated_at"$'\t'recover-forward$'\t'"$VERSION"$'\t'"$MAIN_DIGEST"$'\t'"$REALTIME_DIGEST"$'\t'"$before"$'\t'"$after"
+        fd_append_history "$activated_at"$'\t'recover-forward$'\t'"$VERSION"$'\t'"$MAIN_DIGEST"$'\t'"$before"$'\t'"$after"
     fi
 }
 
@@ -1197,27 +1289,41 @@ fd_ensure_no_unresolved() {
 }
 
 fd_validate_ports() {
-    local environment=$1 app_port soketi_port
+    local environment=$1 app_port pusher_port terminal_port legacy_soketi_port
 
     app_port=$(optional_env_value "$environment" APP_PORT)
-    soketi_port=$(optional_env_value "$environment" SOKETI_PORT)
+    pusher_port=$(optional_env_value "$environment" PUSHER_PORT)
+    terminal_port=$(optional_env_value "$environment" TERMINAL_PORT)
+    legacy_soketi_port=$(optional_env_value "$environment" SOKETI_PORT)
     app_port=${app_port:-8000}
-    soketi_port=${soketi_port:-6001}
+    pusher_port=${pusher_port:-${legacy_soketi_port:-6001}}
+    [[ $pusher_port == 8080 ]] && pusher_port=6001
+    terminal_port=${terminal_port:-6002}
     validate_port "$app_port" APP_PORT
-    validate_port "$soketi_port" SOKETI_PORT
-    [[ $app_port != "$soketi_port" && $app_port != 6002 && $soketi_port != 6002 ]] || die 'APP_PORT, SOKETI_PORT, and the fixed Soketi metrics port 6002 must be distinct'
+    validate_port "$pusher_port" PUSHER_PORT
+    validate_port "$terminal_port" TERMINAL_PORT
+    [[ $app_port != "$pusher_port" && $app_port != "$terminal_port" && $pusher_port != "$terminal_port" ]] \
+        || die 'APP_PORT, PUSHER_PORT, and TERMINAL_PORT must be distinct'
 }
 
 fd_normalize_staged_ports() {
-    local environment=$1 app_port soketi_port
+    local environment=$1 app_port pusher_port terminal_port legacy_soketi_port
 
     app_port=$(optional_env_value "$environment" APP_PORT)
-    soketi_port=$(optional_env_value "$environment" SOKETI_PORT)
+    pusher_port=$(optional_env_value "$environment" PUSHER_PORT)
+    terminal_port=$(optional_env_value "$environment" TERMINAL_PORT)
+    legacy_soketi_port=$(optional_env_value "$environment" SOKETI_PORT)
     app_port=${app_port:-8000}
-    soketi_port=${soketi_port:-6001}
+    pusher_port=${pusher_port:-${legacy_soketi_port:-6001}}
+    [[ $pusher_port == 8080 ]] && pusher_port=6001
+    terminal_port=${terminal_port:-6002}
     fd_validate_ports "$environment"
     set_env_value "$environment" APP_PORT "$app_port"
-    set_env_value "$environment" SOKETI_PORT "$soketi_port"
+    set_env_value "$environment" PUSHER_PORT "$pusher_port"
+    set_env_value "$environment" PUSHER_BACKEND_HOST 127.0.0.1
+    set_env_value "$environment" PUSHER_BACKEND_PORT 6001
+    set_env_value "$environment" TERMINAL_PORT "$terminal_port"
+    set_env_value "$environment" TERMINAL_BACKEND_PORT 6002
 }
 
 fd_prepare_staged_environment() {
@@ -1300,7 +1406,7 @@ fd_validate_effective_images() {
     local directory=$1 images reference expected found count=0
 
     images=$(fd_compose_in "$directory" config --images) || die 'could not render effective Compose images'
-    for reference in "$(image_ref_main)" "$(image_ref_realtime)" "$(image_ref_postgres)" "$(image_ref_redis)"; do
+    for reference in "$(image_ref_main)" "$(image_ref_postgres)" "$(image_ref_redis)"; do
         found=false
         while IFS= read -r expected; do
             if [[ $expected == "$reference" ]]; then
@@ -1316,43 +1422,27 @@ fd_validate_effective_images() {
             count=$((count + 1))
         }
     done <<<"$images"
-    [[ $count -eq 4 ]] || die "effective Compose must contain exactly four immutable service images, found $count"
+    [[ $count -eq 3 ]] || die "effective Compose must contain exactly three immutable service images, found $count"
 }
 
 fd_validate_effective_bindings() {
-    local directory=$1 json app_port soketi_port listener_override
+    local directory=$1 json app_port pusher_port terminal_port listener_override
 
     listener_override=$(fd_control_plane_listener_override "$directory")
     app_port=$(env_value "$directory/.env" APP_PORT)
-    soketi_port=$(env_value "$directory/.env" SOKETI_PORT)
+    pusher_port=$(env_value "$directory/.env" PUSHER_PORT)
+    terminal_port=$(env_value "$directory/.env" TERMINAL_PORT)
     validate_port "$app_port" APP_PORT
-    validate_port "$soketi_port" SOKETI_PORT
-    [[ $app_port != "$soketi_port" && $app_port != 6002 && $soketi_port != 6002 ]] || die 'APP_PORT, SOKETI_PORT, and the fixed Soketi metrics port 6002 must be distinct'
+    validate_port "$pusher_port" PUSHER_PORT
+    validate_port "$terminal_port" TERMINAL_PORT
+    [[ $app_port != "$pusher_port" && $app_port != "$terminal_port" && $pusher_port != "$terminal_port" ]] \
+        || die 'APP_PORT, PUSHER_PORT, and TERMINAL_PORT must be distinct'
     json=$(fd_compose_in "$directory" config --format json) || die 'could not render effective Compose port bindings'
     if [[ -n $listener_override ]]; then
-        jq -e --arg soketi_port "$soketi_port" '
-            def ports($service):
-                [.services[$service].ports[]? | {
-                    host_ip: (.host_ip // ""),
-                    published: (.published | tostring),
-                    target: (.target | tostring)
-                }];
-            def exact($ports; $host_ip; $published; $target):
-                ([$ports[] | select(
-                    .host_ip == $host_ip
-                    and .published == $published
-                    and .target == $target
-                )] | length) == 1;
-            ([.services[]?.ports[]?] | length) == 2
-            and (ports("coolify") | length) == 0
-            and (ports("soketi") as $ports
-                | ($ports | length) == 2
-                and exact($ports; "127.0.0.1"; $soketi_port; "6001")
-                and exact($ports; "127.0.0.1"; "6002"; "6002"))
-        ' <<<"$json" >/dev/null \
-            || die 'control-plane listener override must remove Coolify APP_PORT publication'
+        jq -e '([.services[]?.ports[]?] | length) == 0 and ([.services.coolify.ports[]?] | length) == 0' <<<"$json" >/dev/null \
+            || die 'control-plane listener override must remove all Coolify host-port publications'
     else
-        jq -e --arg app_port "$app_port" --arg soketi_port "$soketi_port" '
+        jq -e --arg app_port "$app_port" --arg pusher_port "$pusher_port" --arg terminal_port "$terminal_port" '
             def ports($service):
                 [.services[$service].ports[]? | {
                     host_ip: (.host_ip // ""),
@@ -1367,18 +1457,108 @@ fd_validate_effective_bindings() {
                 )] | length) == 1;
             ([.services[]?.ports[]?] | length) == 3
             and (ports("coolify") as $ports
-                | ($ports | length) == 1
+                | ($ports | length) == 3
                 and ([$ports[] | select(
                     (.host_ip == "" or .host_ip == "0.0.0.0" or .host_ip == "::")
                     and .published == $app_port
                     and .target == "8080"
-                )] | length) == 1)
+                )] | length) == 1
+                and exact($ports; "127.0.0.1"; $pusher_port; "6001")
+                and exact($ports; "127.0.0.1"; $terminal_port; "6002"))
+        ' <<<"$json" >/dev/null \
+            || die 'effective Compose must publish APP_PORT publicly and Reverb/terminal ports on loopback from the Coolify container'
+    fi
+}
+
+fd_validate_effective_images_legacy() {
+    local directory=$1 images reference expected found count=0
+
+    images=$(fd_compose_in "$directory" config --images) || die 'could not render effective legacy Compose images'
+    for reference in "$(image_ref_main)" "$(image_ref_legacy_realtime)" "$(image_ref_postgres)" "$(image_ref_redis)"; do
+        found=false
+        while IFS= read -r expected; do
+            if [[ $expected == "$reference" ]]; then
+                found=true
+                break
+            fi
+        done <<<"$images"
+        "$found" || die "effective legacy Compose is missing immutable image $reference"
+    done
+    while IFS= read -r reference; do
+        [[ -z $reference ]] || {
+            [[ $reference =~ @sha256:[0-9a-f]{64}$ ]] || die "effective legacy Compose contains mutable image reference: $reference"
+            count=$((count + 1))
+        }
+    done <<<"$images"
+    [[ $count -eq 4 ]] || die "effective legacy Compose must contain exactly four immutable service images, found $count"
+}
+
+fd_validate_effective_bindings_legacy() {
+    local directory=$1 json app_port pusher_port terminal_port listener_override
+
+    listener_override=$(fd_control_plane_listener_override "$directory")
+    app_port=$(optional_env_value "$directory/.env" APP_PORT)
+    pusher_port=$(optional_env_value "$directory/.env" SOKETI_PORT)
+    terminal_port=$(optional_env_value "$directory/.env" TERMINAL_PORT)
+    app_port=${app_port:-8000}
+    pusher_port=${pusher_port:-6001}
+    terminal_port=${terminal_port:-6002}
+    validate_port "$app_port" APP_PORT
+    validate_port "$pusher_port" SOKETI_PORT
+    validate_port "$terminal_port" TERMINAL_PORT
+    [[ $app_port != "$pusher_port" && $app_port != "$terminal_port" && $pusher_port != "$terminal_port" ]] \
+        || die 'legacy APP_PORT, SOKETI_PORT, and TERMINAL_PORT must be distinct'
+    json=$(fd_compose_in "$directory" config --format json) || die 'could not render effective legacy Compose port bindings'
+    if [[ -n $listener_override ]]; then
+        jq -e --arg pusher_port "$pusher_port" --arg terminal_port "$terminal_port" '
+            def ports($service):
+                [.services[$service].ports[]? | {
+                    host_ip: (.host_ip // ""),
+                    published: (.published | tostring),
+                    target: (.target | tostring)
+                }];
+            def exact($ports; $published; $target):
+                ([$ports[] | select(
+                    .host_ip == "127.0.0.1"
+                    and .published == $published
+                    and .target == $target
+                )] | length) == 1;
+            ([.services[]?.ports[]?] | length) == 2
+            and ([.services.coolify.ports[]?] | length) == 0
             and (ports("soketi") as $ports
                 | ($ports | length) == 2
-                and exact($ports; "127.0.0.1"; $soketi_port; "6001")
-                and exact($ports; "127.0.0.1"; "6002"; "6002"))
+                and exact($ports; $pusher_port; "6001")
+                and exact($ports; $terminal_port; "6002"))
         ' <<<"$json" >/dev/null \
-            || die 'effective Compose must contain one public APP_PORT and two loopback realtime bindings'
+            || die 'legacy control-plane Compose must publish only the realtime loopback ports'
+    else
+        jq -e --arg app_port "$app_port" --arg pusher_port "$pusher_port" --arg terminal_port "$terminal_port" '
+            def ports($service):
+                [.services[$service].ports[]? | {
+                    host_ip: (.host_ip // ""),
+                    published: (.published | tostring),
+                    target: (.target | tostring)
+                }];
+            def exact($ports; $host_ip; $published; $target):
+                ([$ports[] | select(
+                    .host_ip == $host_ip
+                    and .published == $published
+                    and .target == $target
+                )] | length) == 1;
+            ([.services[]?.ports[]?] | length) == 3
+            and (ports("coolify") as $app_ports
+                | ($app_ports | length) == 1
+                and ([$app_ports[] | select(
+                    (.host_ip == "" or .host_ip == "0.0.0.0" or .host_ip == "::")
+                    and .published == $app_port
+                    and .target == "8080"
+                )] | length) == 1)
+            and (ports("soketi") as $realtime_ports
+                | ($realtime_ports | length) == 2
+                and exact($realtime_ports; "127.0.0.1"; $pusher_port; "6001")
+                and exact($realtime_ports; "127.0.0.1"; $terminal_port; "6002"))
+        ' <<<"$json" >/dev/null \
+            || die 'legacy Compose must publish APP_PORT publicly and realtime ports on loopback from the exact legacy service'
     fi
 }
 
@@ -1909,14 +2089,112 @@ fd_ensure_network() {
     fi
 }
 
+fd_stop_legacy_realtime_container() {
+    local container=coolify-realtime
+
+    LEGACY_REALTIME_TRANSITION=false
+    if docker container inspect "$container" >/dev/null 2>&1; then
+        LEGACY_REALTIME_TRANSITION=true
+        note "Stopping legacy realtime container before bundled realtime startup: $container"
+        docker container stop "$container" >/dev/null \
+            || die "could not stop legacy realtime container $container"
+    fi
+}
+
+fd_remove_proven_legacy_realtime_container() {
+    local container=coolify-realtime
+
+    [[ $LEGACY_REALTIME_TRANSITION == true ]] || return 0
+    docker container inspect "$container" >/dev/null 2>&1 \
+        || die "legacy realtime container disappeared before its verified transition completed: $container"
+    note "Removing legacy realtime container after bundled route proof: $container"
+    docker container rm --force "$container" >/dev/null \
+        || die "could not remove legacy realtime container $container"
+    if docker container inspect "$container" >/dev/null 2>&1; then
+        die "legacy realtime container remains after verified removal: $container"
+    fi
+    LEGACY_REALTIME_TRANSITION=false
+}
+
+fd_validate_runtime_bindings_legacy() {
+    local app_port pusher_port terminal_port container bindings runtime_port host_ip host_port
+    local app_seen=0 pusher_seen=0 terminal_seen=0 listener_override
+    local app_unspecified_seen=0 app_ipv4_seen=0 app_ipv6_seen=0
+
+    listener_override=$(fd_control_plane_listener_override "$SOURCE_DIR")
+    app_port=$(optional_env_value "$SOURCE_DIR/.env" APP_PORT)
+    pusher_port=$(optional_env_value "$SOURCE_DIR/.env" SOKETI_PORT)
+    terminal_port=$(optional_env_value "$SOURCE_DIR/.env" TERMINAL_PORT)
+    app_port=${app_port:-8000}
+    pusher_port=${pusher_port:-6001}
+    terminal_port=${terminal_port:-6002}
+    for container in coolify coolify-realtime coolify-db coolify-redis; do
+        bindings=$(docker inspect --format '{{range $port, $bindings := .NetworkSettings.Ports}}{{range $binding := $bindings}}{{printf "%s\t%s\t%s\n" $port $binding.HostIp $binding.HostPort}}{{end}}{{end}}' "$container") || {
+            note "ERROR: legacy runtime container $container is missing" >&2
+            return 1
+        }
+        while IFS=$'\t' read -r runtime_port host_ip host_port; do
+            [[ -z $runtime_port ]] && continue
+            case "$container:$runtime_port:$host_port" in
+                "coolify:8080/tcp:$app_port")
+                    case $host_ip in
+                        '') app_unspecified_seen=$((app_unspecified_seen + 1)) ;;
+                        0.0.0.0) app_ipv4_seen=$((app_ipv4_seen + 1)) ;;
+                        ::) app_ipv6_seen=$((app_ipv6_seen + 1)) ;;
+                        *)
+                            note "ERROR: legacy $container $runtime_port does not use the public APP_PORT binding" >&2
+                            return 1
+                            ;;
+                    esac
+                    [[ $app_unspecified_seen -le 1 && $app_ipv4_seen -le 1 && $app_ipv6_seen -le 1 ]] || {
+                        note "ERROR: legacy $container $runtime_port repeats a public APP_PORT binding" >&2
+                        return 1
+                    }
+                    app_seen=$((app_seen + 1))
+                    ;;
+                "coolify-realtime:6001/tcp:$pusher_port")
+                    [[ $host_ip == 127.0.0.1 ]] || {
+                        note "ERROR: legacy $container $runtime_port binds to unsafe host IP $host_ip" >&2
+                        return 1
+                    }
+                    pusher_seen=$((pusher_seen + 1))
+                    ;;
+                "coolify-realtime:6002/tcp:$terminal_port")
+                    [[ $host_ip == 127.0.0.1 ]] || {
+                        note "ERROR: legacy $container $runtime_port binds to unsafe host IP $host_ip" >&2
+                        return 1
+                    }
+                    terminal_seen=$((terminal_seen + 1))
+                    ;;
+                *)
+                    note "ERROR: unexpected published legacy runtime binding $container $runtime_port -> $host_ip:$host_port" >&2
+                    return 1
+                    ;;
+            esac
+        done <<<"$bindings"
+    done
+    if [[ -n $listener_override ]]; then
+        [[ $app_seen -eq 0 && $pusher_seen -eq 1 && $terminal_seen -eq 1 ]] || {
+            note 'ERROR: legacy control-plane runtime bindings are missing or duplicated' >&2
+            return 1
+        }
+    else
+        [[ $app_seen -ge 1 && $app_seen -le 2 && $pusher_seen -eq 1 && $terminal_seen -eq 1 ]] || {
+            note 'ERROR: legacy runtime bindings are missing or duplicated' >&2
+            return 1
+        }
+    fi
+}
+
 fd_validate_runtime_bindings() {
-    local app_port soketi_port container bindings runtime_port host_ip host_port app_seen=0 realtime_seen=0 metrics_seen=0 listener_override
+    local app_port pusher_port terminal_port container bindings runtime_port host_ip host_port app_seen=0 pusher_seen=0 terminal_seen=0 listener_override
     local app_unspecified_seen=0 app_ipv4_seen=0 app_ipv6_seen=0
 
     listener_override=$(fd_control_plane_listener_override "$SOURCE_DIR")
     app_port=$(env_value "$SOURCE_DIR/.env" APP_PORT)
-    soketi_port=$(env_value "$SOURCE_DIR/.env" SOKETI_PORT)
-    for container in coolify coolify-realtime coolify-db coolify-redis; do
+    pusher_port=$(env_value "$SOURCE_DIR/.env" PUSHER_PORT)
+    terminal_port=$(env_value "$SOURCE_DIR/.env" TERMINAL_PORT)
+    for container in coolify coolify-db coolify-redis; do
         bindings=$(docker inspect --format '{{range $port, $bindings := .NetworkSettings.Ports}}{{range $binding := $bindings}}{{printf "%s\t%s\t%s\n" $port $binding.HostIp $binding.HostPort}}{{end}}{{end}}' "$container") || {
             note "ERROR: $container is missing" >&2
             return 1
@@ -1940,19 +2218,19 @@ fd_validate_runtime_bindings() {
                     }
                     app_seen=$((app_seen + 1))
                     ;;
-                "coolify-realtime:6001/tcp:$soketi_port")
+                "coolify:6001/tcp:$pusher_port")
                     [[ $host_ip == 127.0.0.1 ]] || {
                         note "ERROR: $container $runtime_port binds to unsafe host IP $host_ip" >&2
                         return 1
                     }
-                    realtime_seen=$((realtime_seen + 1))
+                    pusher_seen=$((pusher_seen + 1))
                     ;;
-                'coolify-realtime:6002/tcp:6002')
+                "coolify:6002/tcp:$terminal_port")
                     [[ $host_ip == 127.0.0.1 ]] || {
                         note "ERROR: $container $runtime_port binds to unsafe host IP $host_ip" >&2
                         return 1
                     }
-                    metrics_seen=$((metrics_seen + 1))
+                    terminal_seen=$((terminal_seen + 1))
                     ;;
                 *)
                     note "ERROR: unexpected published runtime binding $container $runtime_port -> $host_ip:$host_port" >&2
@@ -1962,12 +2240,12 @@ fd_validate_runtime_bindings() {
         done <<<"$bindings"
     done
     if [[ -n $listener_override ]]; then
-        [[ $app_seen -eq 0 && $realtime_seen -eq 1 && $metrics_seen -eq 1 ]] || {
-            note 'ERROR: enrolled control-plane source lets Coolify own APP_PORT or has invalid realtime bindings' >&2
+        [[ $app_seen -eq 0 && $pusher_seen -eq 0 && $terminal_seen -eq 0 ]] || {
+            note 'ERROR: enrolled control-plane source unexpectedly publishes Coolify host ports' >&2
             return 1
         }
     else
-        [[ $app_seen -ge 1 && $app_seen -le 2 && $realtime_seen -eq 1 && $metrics_seen -eq 1 ]] || {
+        [[ $app_seen -ge 1 && $app_seen -le 2 && $pusher_seen -eq 1 && $terminal_seen -eq 1 ]] || {
             note 'ERROR: runtime bindings are missing or duplicated' >&2
             return 1
         }
@@ -1978,10 +2256,9 @@ fd_verify_runtime() {
     local expected actual container platform
 
     platform=$(host_platform)
-    for container in coolify coolify-realtime coolify-db coolify-redis; do
+    for container in coolify coolify-db coolify-redis; do
         case $container in
             coolify) expected=$(image_ref_main) ;;
-            coolify-realtime) expected=$(image_ref_realtime) ;;
             coolify-db) expected=$(image_ref_postgres) ;;
             coolify-redis) expected=$(image_ref_redis) ;;
         esac
@@ -1993,7 +2270,51 @@ fd_verify_runtime() {
         validate_image_for_host "$expected" "$platform"
     done
     fd_validate_runtime_bindings
-    wait_for_health
+    wait_for_health || return 1
+    docker exec coolify curl --fail --silent --show-error http://127.0.0.1:6001/up --connect-timeout 5 --max-time 10 >/dev/null || {
+        note 'ERROR: bundled Laravel Reverb readiness route failed' >&2
+        return 1
+    }
+    docker exec coolify curl --fail --silent --show-error http://127.0.0.1:6002/ready --connect-timeout 5 --max-time 10 >/dev/null || {
+        note 'ERROR: bundled terminal readiness route failed' >&2
+        return 1
+    }
+}
+
+fd_verify_runtime_legacy() {
+    local expected actual container platform
+
+    platform=$(host_platform)
+    for container in coolify coolify-realtime coolify-db coolify-redis; do
+        case $container in
+            coolify) expected=$(image_ref_main) ;;
+            coolify-realtime) expected=$(image_ref_legacy_realtime) ;;
+            coolify-db) expected=$(image_ref_postgres) ;;
+            coolify-redis) expected=$(image_ref_redis) ;;
+        esac
+        actual=$(docker inspect --format '{{.Config.Image}}' "$container") || return 1
+        [[ $actual == "$expected" ]] || {
+            note "ERROR: legacy $container runs $actual, expected $expected" >&2
+            return 1
+        }
+        validate_image_for_host "$expected" "$platform"
+    done
+    fd_validate_runtime_bindings_legacy
+    wait_for_legacy_health
+}
+
+fd_start_and_verify_candidate_runtime() {
+    fd_stop_legacy_realtime_container
+    if [[ $LEGACY_REALTIME_TRANSITION == true ]]; then
+        fd_compose_in "$SOURCE_DIR" up --detach
+        fd_verify_runtime
+        fd_remove_proven_legacy_realtime_container
+        fd_compose_in "$SOURCE_DIR" up --detach --remove-orphans
+        fd_verify_runtime
+    else
+        fd_compose_in "$SOURCE_DIR" up --detach --remove-orphans
+        fd_verify_runtime
+    fi
 }
 
 fd_commit_bundle() {
@@ -2031,7 +2352,7 @@ fd_restore_previous_current() {
     local previous=$1
 
     [[ -z $previous ]] && return 0
-    fd_load_recorded_release "$previous"
+    fd_load_recorded_release "$previous" active-v1-predecessor
     fd_load_activation "$previous"
     fd_atomic_write "$CURRENT_FILE" 'active release state' "$previous"
     if test_mode && [[ ${FORK_DEPLOY_TEST_KILL_AFTER_RESTORE_PREVIOUS_CURRENT:-false} == true ]]; then
@@ -2230,6 +2551,7 @@ fd_recover_abort() {
     fd_validate_undo_path "$journal"
     prestart_sha=$(read_field "$PENDING_FILE" PRESTART_UNDO_SHA256 'pending deployment state')
     VERSION=$candidate
+    PREVIOUS_CURRENT_VERSION=$previous
     DEPLOYMENT_UNDO=$journal
     DEPLOYMENT_PRESTART_UNDO_SHA256=$prestart_sha
     case $state in
@@ -2352,8 +2674,7 @@ fd_recover_forward() {
     fd_release_ssh_runtime_ownership
 
     fd_ensure_network
-    fd_compose_in "$SOURCE_DIR" up --detach --remove-orphans
-    fd_verify_runtime
+    fd_start_and_verify_candidate_runtime
     migration_after=$(fd_migration_fingerprint "$SOURCE_DIR/.env")
     rendered=$(fd_rendered_sha "$SOURCE_DIR")
     fd_reconcile_forward_activation "$migration" "$migration_after" "$rendered"
@@ -2388,8 +2709,7 @@ fd_start_candidate() {
     fd_mark_candidate_started
     fd_finalize_prestart_undo "$DEPLOYMENT_UNDO"
     fd_release_ssh_runtime_ownership
-    fd_compose_in "$SOURCE_DIR" up --detach --remove-orphans
-    fd_verify_runtime
+    fd_start_and_verify_candidate_runtime
     migration_after=$(fd_migration_fingerprint "$SOURCE_DIR/.env")
     rendered=$(fd_rendered_sha "$SOURCE_DIR")
     fd_write_activation "$migration_before" "$migration_after" "$rendered"
@@ -2406,7 +2726,6 @@ fd_deploy_new() {
 
     platform=$(host_platform)
     validate_image_for_host "$(image_ref_main)" "$platform"
-    validate_image_for_host "$(image_ref_realtime)" "$platform"
     validate_image_for_host "$(image_ref_postgres)" "$platform"
     validate_image_for_host "$(image_ref_redis)" "$platform"
     if "$DRY_RUN"; then
@@ -2470,12 +2789,11 @@ fd_status() {
         return 1
     fi
     current=$(fd_current_version)
-    fd_load_recorded_release "$current"
+    fd_load_recorded_release "$current" active-v1-predecessor
     manifest=$(fd_release_dir "$current")/release.manifest
     note "Fork deploy version: $current"
     note "Source revision: $(read_field "$manifest" SOURCE_REVISION 'recorded release manifest')"
     note "Main digest: $MAIN_DIGEST"
-    note "Realtime digest: $REALTIME_DIGEST"
     docker ps --filter name='^/coolify' --format '{{.Names}} {{.Status}}' || true
 }
 
@@ -2483,18 +2801,27 @@ fd_verify_current() {
     local current dir rendered migrations
 
     current=$(fd_current_version)
-    fd_load_recorded_release "$current"
+    fd_load_recorded_release "$current" active-v1-predecessor
     fd_load_activation "$current"
     dir=$(fd_release_dir "$current")
     fd_validate_active_assets "$dir"
     fd_validate_active_environment
     rendered=$(fd_rendered_sha "$SOURCE_DIR")
     [[ $rendered == "$(fd_activation_field "$current" RENDERED_COMPOSE_SHA256)" ]] || die 'effective rendered Compose differs from the active verified state; run repair'
-    fd_validate_effective_images "$SOURCE_DIR"
-    fd_validate_effective_bindings "$SOURCE_DIR"
+    if [[ $MANIFEST_SCHEMA == coolify-fork-release/v1 ]]; then
+        fd_validate_effective_images_legacy "$SOURCE_DIR"
+        fd_validate_effective_bindings_legacy "$SOURCE_DIR"
+    else
+        fd_validate_effective_images "$SOURCE_DIR"
+        fd_validate_effective_bindings "$SOURCE_DIR"
+    fi
     migrations=$(fd_migration_fingerprint "$SOURCE_DIR/.env")
     [[ $migrations == "$(fd_activation_field "$current" MIGRATION_FINGERPRINT_AFTER)" ]] || die 'database migration fingerprint differs from the active verified state; investigate before update or rollback'
-    fd_verify_runtime
+    if [[ $MANIFEST_SCHEMA == coolify-fork-release/v1 ]]; then
+        fd_verify_runtime_legacy
+    else
+        fd_verify_runtime
+    fi
     note "Release $current is healthy and matches its immutable verified bundle and active state."
 }
 

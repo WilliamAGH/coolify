@@ -2,16 +2,14 @@
 
 return [
     'coolify' => [
-        'version' => '4.13.2-fork',
+        'version' => '4.13.3-fork',
         'helper_version' => '1.0.14',
-        'realtime_version' => '1.0.16',
         'railpack_version' => '0.23.0',
         'self_hosted' => env('SELF_HOSTED', true),
         'autoupdate' => env('AUTOUPDATE'),
         'base_config_path' => env('BASE_CONFIG_PATH', '/data/coolify'),
         'registry_url' => env('REGISTRY_URL', 'docker.io'),
         'helper_image' => env('HELPER_IMAGE', env('REGISTRY_URL', 'docker.io').'/coollabsio/coolify-helper'),
-        'realtime_image' => env('REALTIME_IMAGE', env('REGISTRY_URL', 'docker.io').'/coollabsio/coolify-realtime'),
         'is_windows_docker_desktop' => env('IS_WINDOWS_DOCKER_DESKTOP', false),
         'windows_testing_host_private_key_path' => '/run/coolify-testing-host/private/testing-host',
         'cdn_url' => env('CDN_URL', 'https://cdn.coollabs.io'),
@@ -49,7 +47,7 @@ return [
 
     'pusher' => [
         'host' => env('PUSHER_HOST'),
-        'port' => env('PUSHER_PORT'),
+        'port' => env('PUSHER_PORT', env('SOKETI_PORT')),
         'app_key' => env('PUSHER_APP_KEY'),
     ],
 

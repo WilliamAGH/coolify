@@ -33,12 +33,12 @@ function compileControlPlaneDynamicConfiguration(): ControlPlaneDynamicConfigura
         preservedServices: [
             'coolify-realtime' => [
                 'loadBalancer' => [
-                    'servers' => [['url' => 'http://coolify-realtime:6001']],
+                    'servers' => [['url' => 'http://coolify:6001']],
                 ],
             ],
             'coolify-terminal' => [
                 'loadBalancer' => [
-                    'servers' => [['url' => 'http://coolify-realtime:6002']],
+                    'servers' => [['url' => 'http://coolify:6002']],
                 ],
             ],
         ],
@@ -127,9 +127,9 @@ it('compiles one deterministic File-provider snapshot with shared HTTPS and APP_
             'tls' => ['certResolver' => 'letsencrypt'],
         ])
         ->and(data_get($parsed, 'http.services.coolify-realtime.loadBalancer.servers'))
-        ->toBe([['url' => 'http://coolify-realtime:6001']])
+        ->toBe([['url' => 'http://coolify:6001']])
         ->and(data_get($parsed, 'http.services.coolify-terminal.loadBalancer.servers'))
-        ->toBe([['url' => 'http://coolify-realtime:6002']])
+        ->toBe([['url' => 'http://coolify:6002']])
         ->and(data_get($parsed, 'http.middlewares.gzip'))->toBe(['compress' => true]);
 });
 
