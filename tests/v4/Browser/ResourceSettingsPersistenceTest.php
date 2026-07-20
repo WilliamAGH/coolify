@@ -117,12 +117,11 @@ it('saves application name and enables static site with nginx config', function 
         ->fill('name', $updatedName)
         ->fill('customDockerRunOptions', '--read-only');
 
-    submitLivewireForm($page);
+    submitLivewireForm($page, 'Application settings updated!');
     $page->click('[id^="isStatic"]')
-        ->wait(2)
         ->screenshot();
 
-    $page->assertSourceHas('Custom Nginx Configuration')
+    $page->assertSee('Custom Nginx Configuration')
         ->assertSee('Is it a SPA (Single Page Application)?')
         ->assertValue('name', $updatedName);
 
@@ -135,8 +134,8 @@ it('saves application name and enables static site with nginx config', function 
     $reloadedPage->screenshot();
 
     $reloadedPage->assertValue('name', $updatedName)
-        ->assertSourceHas('Custom Nginx Configuration')
-        ->assertSourceHas('Is it a SPA (Single Page Application)?');
+        ->assertSee('Custom Nginx Configuration')
+        ->assertSee('Is it a SPA (Single Page Application)?');
 });
 
 it('saves database name and enables ssl with mode selector', function () {
@@ -153,7 +152,7 @@ it('saves database name and enables ssl with mode selector', function () {
         ->fill('name', $updatedDatabaseName)
         ->fill('description', 'Updated by browser test');
 
-    submitLivewireForm($page);
+    submitLivewireForm($page, 'Database updated.');
     $page->click('[id^="enableSsl"]');
 
     $page->assertSee('SSL Mode')
@@ -172,8 +171,8 @@ it('saves database name and enables ssl with mode selector', function () {
         ->assertSee('SSL Mode');
 });
 
-function submitLivewireForm($page): void
+function submitLivewireForm($page, string $successMessage): void
 {
     $page->script("document.querySelector('form[wire\\\\:submit=\"submit\"]')?.requestSubmit()");
-    $page->wait(1);
+    $page->assertSee($successMessage);
 }
