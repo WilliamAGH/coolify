@@ -16,6 +16,7 @@ All notable changes to this project will be documented in this file.
 - *(ci)* Preserve Docker daemon validation in changelog patch
 - *(ci)* Attest dispatched changelog validation
 - *(ci)* Make changelog auto-merge idempotent (#55)
+- *(image)* Remove production secret and Git LFS blockers (#58)
 
 ### 💼 Other
 
@@ -26,6 +27,7 @@ All notable changes to this project will be documented in this file.
 - Update changelog (#52)
 - Update changelog (#54)
 - Update changelog (#56)
+- Update changelog (#59)
 
 ### 🧪 Testing
 
