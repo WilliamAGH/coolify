@@ -2,9 +2,11 @@
 
 namespace App\Actions\Shared;
 
+use App\Actions\Application\BlueGreen\ActiveApplicationContainerResolution;
 use App\Models\Application;
 use App\Services\ContainerStatusAggregator;
 use App\Traits\CalculatesExcludedStatus;
+use Illuminate\Support\Collection;
 use Lorisleiva\Actions\Concerns\AsAction;
 
 class ComplexStatusCheck
@@ -12,12 +14,32 @@ class ComplexStatusCheck
     use AsAction;
     use CalculatesExcludedStatus;
 
-    public function handle(Application $application)
+    /** @param  Collection<string, ActiveApplicationContainerResolution>|null  $activeContainerResolutions */
+    public function handle(Application $application, ?Collection $activeContainerResolutions = null): void
     {
+        $activeContainerResolutions ??= collect();
         $servers = $application->additional_servers;
         $servers->push($application->destination->server);
         foreach ($servers as $server) {
             $is_main_server = $application->destination->server->id === $server->id;
+            $destinationId = $is_main_server
+                ? (int) $application->destination_id
+                : (int) $server->pivot->standalone_docker_id;
+            $resolution = $activeContainerResolutions->get(
+                ActiveApplicationContainerResolution::key((int) $application->id, $destinationId),
+            );
+            if ($resolution instanceof ActiveApplicationContainerResolution && $resolution->preserveStatus) {
+                continue;
+            }
+            if ($resolution instanceof ActiveApplicationContainerResolution && ! $resolution->observable) {
+                if ($is_main_server) {
+                    $application->update(['status' => 'exited']);
+                } else {
+                    $application->additional_servers()->updateExistingPivot($server->id, ['status' => 'exited']);
+                }
+
+                continue;
+            }
             if (! $server->isFunctional()) {
                 if ($is_main_server) {
                     $application->update(['status' => 'exited']);
@@ -31,6 +53,16 @@ class ComplexStatusCheck
             }
             $containers = instant_remote_process(["docker container inspect $(docker container ls -q --filter 'label=coolify.applicationId={$application->id}' --filter 'label=coolify.pullRequestId=0') --format '{{json .}}'"], $server, false);
             $containers = format_docker_command_output_to_json($containers);
+            if ($resolution instanceof ActiveApplicationContainerResolution) {
+                $containers = $containers->filter(function (mixed $container) use ($resolution): bool {
+                    $labels = data_get($container, 'Config.Labels', []);
+
+                    return $resolution->matches(
+                        data_get($container, 'Id'),
+                        is_array($labels) ? ($labels['coolify.blueGreen.deploymentUuid'] ?? null) : null,
+                    );
+                });
+            }
 
             if ($containers->count() > 0) {
                 $statusToSet = $this->aggregateContainerStatuses($application, $containers);

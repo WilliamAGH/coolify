@@ -104,6 +104,12 @@ it('reconstructs an exact rolled-back route after the destination epoch advances
         ->and($expectedState->operationId)->toBe('failed-green-deployment')
         ->and($expectedState->activeDeploymentUuid)->toBe('active-blue-deployment')
         ->and($expectedState->activeContainerId)->toBe($containerId);
+
+    $state->update(['phase' => BlueGreenDeploymentPhase::DEACTIVATING]);
+    $deactivatingExpectedState = ResolveBlueGreenExpectedProxyState::run($application, $destination, $state->fresh());
+
+    expect($deactivatingExpectedState)->not->toBeNull()
+        ->and($deactivatingExpectedState->activeContainerId)->toBe($containerId);
 });
 
 it('persists a fresh idle claim server boot identity without changing durable route topology ownership', function () {

@@ -2,6 +2,8 @@
 
 namespace App\Jobs;
 
+use App\Actions\Application\BlueGreen\ActiveApplicationContainerResolution;
+use App\Actions\Application\BlueGreen\ResolveActiveApplicationContainer;
 use App\Actions\Database\StartDatabaseProxy;
 use App\Actions\Database\StopDatabaseProxy;
 use App\Actions\Proxy\CheckProxy;
@@ -97,6 +99,9 @@ class PushServerUpdateJob implements ShouldBeEncrypted, ShouldQueue, Silenced
 
     public Collection $serviceContainerStatuses;
 
+    /** @var Collection<string, ActiveApplicationContainerResolution> */
+    public Collection $activeContainerResolutions;
+
     public bool $foundProxy = false;
 
     public bool $foundLogDrainContainer = false;
@@ -123,6 +128,7 @@ class PushServerUpdateJob implements ShouldBeEncrypted, ShouldQueue, Silenced
         $this->foundServiceDatabaseIds = collect();
         $this->applicationContainerStatuses = collect();
         $this->serviceContainerStatuses = collect();
+        $this->activeContainerResolutions = collect();
         $this->allApplicationIds = collect();
         $this->allDatabaseUuids = collect();
         $this->allTcpProxyUuids = collect();
@@ -140,6 +146,7 @@ class PushServerUpdateJob implements ShouldBeEncrypted, ShouldQueue, Silenced
     {
         // Defensive initialization for Collection properties to handle queue deserialization edge cases
         $this->serviceContainerStatuses ??= collect();
+        $this->activeContainerResolutions ??= collect();
         $this->applicationContainerStatuses ??= collect();
         $this->foundApplicationIds ??= collect();
         $this->foundDatabaseUuids ??= collect();
@@ -193,6 +200,7 @@ class PushServerUpdateJob implements ShouldBeEncrypted, ShouldQueue, Silenced
         }
 
         $this->applications = $this->loadApplications();
+        $this->activeContainerResolutions = ResolveActiveApplicationContainer::run($this->applications);
         $this->databases = $this->loadDatabases();
         $this->previews = $this->loadPreviews();
         $this->services = $this->loadServices();
@@ -203,9 +211,10 @@ class PushServerUpdateJob implements ShouldBeEncrypted, ShouldQueue, Silenced
         $this->serviceApplicationsById = $this->services->flatMap(fn ($service) => $service->applications)->keyBy(fn ($application) => (string) $application->id);
         $this->serviceDatabasesById = $this->services->flatMap(fn ($service) => $service->databases)->keyBy(fn ($database) => (string) $database->id);
 
-        $this->allApplicationIds = $this->applications->filter(function ($application) {
-            return $application->additional_servers_count === 0;
-        })->pluck('id');
+        $this->allApplicationIds = $this->applications
+            ->filter(fn ($application): bool => $application->additional_servers_count === 0)
+            ->reject(fn ($application): bool => $this->activeContainerResolution($application)?->preserveStatus === true)
+            ->pluck('id');
         $this->allApplicationsWithAdditionalServers = $this->applications->filter(function ($application) {
             return $application->additional_servers_count > 0;
         });
@@ -241,6 +250,18 @@ class PushServerUpdateJob implements ShouldBeEncrypted, ShouldQueue, Silenced
                 $pullRequestId = $labels->get('coolify.pullRequestId', '0');
                 try {
                     if ($pullRequestId === '0') {
+                        $application = $this->applicationsById->get((string) $applicationId);
+                        if ($application?->additional_servers_count > 0) {
+                            continue;
+                        }
+                        $resolution = $application === null ? null : $this->activeContainerResolution($application);
+                        if ($resolution instanceof ActiveApplicationContainerResolution
+                            && ! $resolution->matches(
+                                data_get($container, 'id') ?? data_get($container, 'container_id'),
+                                $labels->get('coolify.blueGreen.deploymentUuid'),
+                            )) {
+                            continue;
+                        }
                         if ($this->allApplicationIds->contains($applicationId)) {
                             $this->foundApplicationIds->push($applicationId);
                         }
@@ -784,9 +805,16 @@ class PushServerUpdateJob implements ShouldBeEncrypted, ShouldQueue, Silenced
 
     private function updateAdditionalServersStatus()
     {
-        $this->allApplicationsWithAdditionalServers->each(function ($application) {
-            ComplexStatusCheck::run($application);
+        $this->allApplicationsWithAdditionalServers->each(function ($application): void {
+            ComplexStatusCheck::run($application, $this->activeContainerResolutions);
         });
+    }
+
+    private function activeContainerResolution(mixed $application): ?ActiveApplicationContainerResolution
+    {
+        return $this->activeContainerResolutions->get(
+            ActiveApplicationContainerResolution::key((int) $application->id, (int) $application->destination_id),
+        );
     }
 
     private function isRunning(string $containerStatus)
