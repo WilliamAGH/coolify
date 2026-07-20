@@ -69,7 +69,7 @@ it('removes native terminal build dependencies from the production image', funct
     $dockerfile = file_get_contents(base_path('docker/production/Dockerfile'));
     $buildDependencyInstall = strpos($dockerfile, 'apk add --no-cache --virtual .terminal-build-deps npm make g++ python3');
     $terminalDependencyInstall = strpos($dockerfile, 'npm ci --prefix /terminal');
-    $buildDependencyRemoval = strpos($dockerfile, 'apk del .terminal-build-deps');
+    $buildDependencyRemoval = strpos($dockerfile, 'apk del --no-cache .terminal-build-deps');
 
     expect($buildDependencyInstall)->not->toBeFalse()
         ->and($terminalDependencyInstall)->not->toBeFalse()->toBeGreaterThan($buildDependencyInstall)
