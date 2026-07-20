@@ -172,6 +172,7 @@ jobs:
           php -d memory_limit=1G vendor/bin/pest --compact --do-not-cache-result \
             tests/Feature/ApplicationDeploymentBlueGreenDestinationFenceTest.php \
             tests/Feature/BlueGreenApplicationDeactivationTest.php \
+            tests/Feature/BlueGreenApplicationManualStopTest.php \
             tests/Feature/BlueGreenContinuousAvailabilityAcceptanceTest.php \
             tests/Feature/BlueGreenCrashBoundaryAcceptanceTest.php \
             tests/Feature/BlueGreenApplicationDeletionFenceTest.php \

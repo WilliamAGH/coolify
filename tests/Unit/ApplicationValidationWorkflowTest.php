@@ -273,6 +273,7 @@ function applicationValidationWorkflowViolations(array $workflow): array
     foreach ([
         'tests/Feature/ApplicationDeploymentBlueGreenDestinationFenceTest.php',
         'tests/Feature/BlueGreenApplicationDeactivationTest.php',
+        'tests/Feature/BlueGreenApplicationManualStopTest.php',
         'tests/Feature/BlueGreenCancellationCompensationTest.php',
         'tests/Feature/BlueGreenContinuousAvailabilityAcceptanceTest.php',
         'tests/Feature/BlueGreenCrashBoundaryAcceptanceTest.php',
