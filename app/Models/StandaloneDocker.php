@@ -2,11 +2,14 @@
 
 namespace App\Models;
 
+use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
 use App\Jobs\ConnectProxyToNetworksJob;
 use App\Support\ValidationPatterns;
 use App\Traits\HasSafeStringAttribute;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Support\Facades\DB;
 use OpenApi\Attributes as OA;
 
 #[OA\Schema(
@@ -47,8 +50,32 @@ class StandaloneDocker extends BaseModel
             instant_remote_process([
                 "docker network inspect {$safeNetwork} >/dev/null 2>&1 || docker network create --driver overlay --attachable {$safeNetwork} >/dev/null",
             ], $server, false);
-            ConnectProxyToNetworksJob::dispatch($server);
+            ConnectProxyToNetworksJob::dispatch($server)->afterCommit();
         });
+    }
+
+    protected function performUpdate(Builder $query): bool
+    {
+        if (! $this->isDirty(['server_id', 'network'])) {
+            return parent::performUpdate($query);
+        }
+
+        return DB::transaction(function () use ($query): bool {
+            BlueGreenTopologyLock::acquire();
+            $this->assertBlueGreenTopologyCanChange();
+
+            return parent::performUpdate($query);
+        }, attempts: 5);
+    }
+
+    public function delete(): ?bool
+    {
+        return DB::transaction(function (): ?bool {
+            BlueGreenTopologyLock::acquire();
+            $this->assertBlueGreenTopologyCanChange();
+
+            return parent::delete();
+        }, attempts: 5);
     }
 
     public function setNetworkAttribute(string $value): void
@@ -164,5 +191,14 @@ class StandaloneDocker extends BaseModel
     public function attachedTo()
     {
         return $this->applications()->exists() || $this->databases()->count() > 0 || $this->services()->exists();
+    }
+
+    private function assertBlueGreenTopologyCanChange(): void
+    {
+        if (! Application::hasBlueGreenTopologyProtectionForStandaloneDockerIds([$this->id])) {
+            return;
+        }
+
+        throw new \RuntimeException('A Docker destination with an opted-in or durable blue-green application cannot change topology or be removed. Disable blue-green deployment and complete its cleanup lifecycle first.');
     }
 }

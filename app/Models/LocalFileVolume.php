@@ -2,10 +2,13 @@
 
 namespace App\Models;
 
+use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
 use App\Events\FileStorageChanged;
 use App\Jobs\ServerStorageSaveJob;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Support\Facades\DB;
 use Symfony\Component\Yaml\Yaml;
 
 class LocalFileVolume extends BaseModel
@@ -55,8 +58,34 @@ class LocalFileVolume extends BaseModel
             }
 
             $fileVolume->load(['service']);
-            dispatch(new ServerStorageSaveJob($fileVolume));
+            ServerStorageSaveJob::dispatch($fileVolume)->afterCommit();
         });
+    }
+
+    protected function performInsert(Builder $query)
+    {
+        return DB::transaction(function () use ($query): bool {
+            BlueGreenTopologyLock::acquire();
+            Application::findBlueGreenStorageApplication($this->resource_type, $this->resource_id)
+                ?->prepareBlueGreenStorageAddition();
+
+            return parent::performInsert($query);
+        }, attempts: 5);
+    }
+
+    protected function performUpdate(Builder $query)
+    {
+        if (! $this->isDirty(['resource_type', 'resource_id'])) {
+            return parent::performUpdate($query);
+        }
+
+        return DB::transaction(function () use ($query): bool {
+            BlueGreenTopologyLock::acquire();
+            Application::findBlueGreenStorageApplication($this->resource_type, $this->resource_id)
+                ?->prepareBlueGreenStorageAddition();
+
+            return parent::performUpdate($query);
+        }, attempts: 5);
     }
 
     protected function isBinary(): Attribute
