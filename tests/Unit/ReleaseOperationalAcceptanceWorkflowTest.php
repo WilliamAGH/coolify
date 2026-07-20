@@ -613,7 +613,7 @@ function runReleaseOperationalAcceptanceAuthorization(array $payload, array $con
             'GITHUB_OUTPUT' => $githubOutput,
             'GITHUB_REF' => 'refs/heads/v4.x',
             'GITHUB_REF_PROTECTED' => 'true',
-            'GITHUB_REPOSITORY' => 'WilliamAGH/coolify',
+            'GITHUB_REPOSITORY' => 'williamacallahan/coolify',
             'GITHUB_RUN_ID' => '101',
             'GITHUB_SHA' => $sourceSha,
         ], $context);

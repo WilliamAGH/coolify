@@ -5,7 +5,7 @@ set -Eeuo pipefail
 readonly AMD64_PLATFORM='linux/amd64'
 readonly ARM64_PLATFORM='linux/arm64'
 readonly FIXTURE_EVENT_TYPE='release-operational-acceptance'
-readonly FIXTURE_OWNER='WilliamAGH/coolify'
+readonly FIXTURE_OWNER='williamacallahan/coolify'
 
 SCENARIO=''
 GHCR_TARGET=''
