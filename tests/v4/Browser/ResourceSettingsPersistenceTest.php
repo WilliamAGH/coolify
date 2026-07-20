@@ -173,6 +173,36 @@ it('saves database name and enables ssl with mode selector', function () {
 
 function submitLivewireForm($page, string $successMessage): void
 {
-    $page->script("document.querySelector('form[wire\\\\:submit=\"submit\"]')?.requestSubmit()");
+    $encodedSuccessMessage = json_encode($successMessage, JSON_HEX_APOS | JSON_HEX_QUOT | JSON_THROW_ON_ERROR);
+    $script = sprintf(<<<'JAVASCRIPT'
+        () => new Promise((resolve, reject) => {
+            const expectedSuccessMessage = %s;
+            const form = document.querySelector('form[wire\\\\:submit="submit"]');
+            if (!(form instanceof HTMLFormElement)) {
+                reject(new Error('Unable to find the canonical Livewire settings form.'));
+                return;
+            }
+
+            const timeout = window.setTimeout(() => {
+                window.removeEventListener('toast-show', observeSuccessToast);
+                reject(new Error(`Timed out waiting for Livewire success: ${expectedSuccessMessage}`));
+            }, 10_000);
+            const observeSuccessToast = (event) => {
+                if (event.detail?.description !== expectedSuccessMessage) {
+                    return;
+                }
+
+                window.clearTimeout(timeout);
+                window.removeEventListener('toast-show', observeSuccessToast);
+                window.requestAnimationFrame(() => resolve(event.detail.description));
+            };
+
+            window.addEventListener('toast-show', observeSuccessToast);
+            form.requestSubmit();
+        })
+        JAVASCRIPT, $encodedSuccessMessage);
+    $observedSuccessMessage = $page->script($script);
+
+    expect($observedSuccessMessage)->toBe($successMessage);
     $page->assertSee($successMessage);
 }

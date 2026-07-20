@@ -8,6 +8,7 @@ use App\Models\Server;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Hash;
+use Visus\Cuid2\Cuid2;
 
 uses(RefreshDatabase::class);
 
@@ -18,7 +19,7 @@ beforeEach(function () {
     $this->user = User::factory()->create([
         'id' => 0,
         'name' => 'Root User',
-        'email' => 'test@example.com',
+        'email' => 'owner+'.(string) new Cuid2.'@example.com',
         'password' => Hash::make('password'),
     ]);
 
@@ -84,7 +85,7 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
     // Create a member user attached to root team only
     $this->member = User::factory()->create([
         'name' => 'Member User',
-        'email' => 'member@example.com',
+        'email' => 'member+'.(string) new Cuid2.'@example.com',
         'password' => Hash::make('password'),
     ]);
     // Remove auto-created personal team so member only belongs to root team
@@ -98,7 +99,7 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
 function loginAsMember(): mixed
 {
     return visit('/login')
-        ->fill('email', 'member@example.com')
+        ->fill('email', test()->member->email)
         ->fill('password', 'password')
         ->click('Login');
 }
