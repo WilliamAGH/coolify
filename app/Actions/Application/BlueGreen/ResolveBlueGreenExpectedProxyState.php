@@ -59,20 +59,20 @@ final class ResolveBlueGreenExpectedProxyState
             if ($activeColor === null || ! is_string($activeDeploymentUuid) || $activeDeploymentUuid === '') {
                 throw new BlueGreenDeploymentTransitionException('The managed route has no durable active deployment identity.');
             }
-            $activeDeployment = ApplicationDeploymentQueue::query()
-                ->where('application_id', $application->id)
+            $activeDeployments = ApplicationDeploymentQueue::query()
                 ->where('deployment_uuid', $activeDeploymentUuid)
-                ->first();
-            if ($activeDeployment === null
-                || ! is_string($activeDeployment->blue_green_candidate_container_id)
-                || $activeDeployment->blue_green_candidate_container_id === ''
-                || $activeDeployment->blue_green_routing_revision !== $state->routing_revision
-                || $activeDeployment->blue_green_topology_digest !== $state->destination_topology_digest
-                || $activeDeployment->blue_green_routing_config_digest !== $state->application_routing_config_digest) {
+                ->get()
+                ->keyBy('deployment_uuid');
+            $resolution = (new ResolveActiveApplicationContainer)->resolveRoutedState(
+                $application,
+                $state,
+                $activeDeployments,
+            );
+            if ($resolution === null || ! $resolution->observable || $resolution->deploymentUuid !== $activeDeploymentUuid) {
                 throw new BlueGreenDeploymentTransitionException('The active deployment provenance does not match durable destination routing state.');
             }
             $activeContainerName = $application->uuid.'-'.$activeColor->value;
-            $activeContainerId = $activeDeployment->blue_green_candidate_container_id;
+            $activeContainerId = $resolution->containerId;
         } elseif ($activeColor !== null || $activeDeploymentUuid !== null) {
             throw new BlueGreenDeploymentTransitionException('Durable DB state names an active route while the managed file is absent.');
         }

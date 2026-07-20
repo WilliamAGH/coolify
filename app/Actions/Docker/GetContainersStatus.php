@@ -2,6 +2,8 @@
 
 namespace App\Actions\Docker;
 
+use App\Actions\Application\BlueGreen\ActiveApplicationContainerResolution;
+use App\Actions\Application\BlueGreen\ResolveActiveApplicationContainer;
 use App\Actions\Application\StopApplication;
 use App\Actions\Database\StartDatabaseProxy;
 use App\Actions\Database\StopDatabaseProxy;
@@ -39,6 +41,9 @@ class GetContainersStatus
 
     protected ?Collection $serviceContainerStatuses;
 
+    /** @var Collection<string, ActiveApplicationContainerResolution> */
+    protected Collection $activeContainerResolutions;
+
     public function handle(Server $server, ?Collection $containers = null, ?Collection $containerReplicates = null)
     {
         $this->containers = $containers;
@@ -48,11 +53,12 @@ class GetContainersStatus
             return 'Server is not functional.';
         }
         $this->applications = $this->server->applications();
+        $this->activeContainerResolutions = ResolveActiveApplicationContainer::run($this->applications);
         $skip_these_applications = collect([]);
         foreach ($this->applications as $application) {
             if ($application->additional_servers->count() > 0) {
                 $skip_these_applications->push($application);
-                ComplexStatusCheck::run($application);
+                ComplexStatusCheck::run($application, $this->activeContainerResolutions);
                 $this->applications = $this->applications->filter(function ($value, $key) use ($application) {
                     return $value->id !== $application->id;
                 });
@@ -139,6 +145,14 @@ class GetContainersStatus
                 } else {
                     $application = $this->applications->where('id', $applicationId)->first();
                     if ($application) {
+                        $resolution = $this->activeContainerResolution($application);
+                        if ($resolution instanceof ActiveApplicationContainerResolution
+                            && ! $resolution->matches(
+                                data_get($container, 'Id'),
+                                data_get($labels, 'coolify.blueGreen.deploymentUuid'),
+                            )) {
+                            continue;
+                        }
                         $foundApplications[] = $application->id;
                         // Store container status for aggregation
                         if (! isset($this->applicationContainerStatuses)) {
@@ -363,7 +377,10 @@ class GetContainersStatus
             $exitedService->update(['status' => 'exited']);
         }
 
-        $notRunningApplications = $this->applications->pluck('id')->diff($foundApplications);
+        $notRunningApplications = $this->applications
+            ->reject(fn ($application): bool => $this->activeContainerResolution($application)?->preserveStatus === true)
+            ->pluck('id')
+            ->diff($foundApplications);
         foreach ($notRunningApplications as $applicationId) {
             $application = $this->applications->where('id', $applicationId)->first();
             if (str($application->status)->startsWith('exited')) {
@@ -533,6 +550,13 @@ class GetContainersStatus
         $aggregator = new ContainerStatusAggregator;
 
         return $aggregator->aggregateFromStrings($relevantStatuses, $maxRestartCount, preserveRestarting: true);
+    }
+
+    private function activeContainerResolution(mixed $application): ?ActiveApplicationContainerResolution
+    {
+        return $this->activeContainerResolutions->get(
+            ActiveApplicationContainerResolution::key((int) $application->id, (int) $application->destination_id),
+        );
     }
 
     private function aggregateServiceContainerStatuses($services)
