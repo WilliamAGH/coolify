@@ -38,9 +38,11 @@ final readonly class BlueGreenRecoveryScenario
         public ApplicationDeploymentQueue $deployment,
     ) {}
 
+    /** @param  array<string, mixed>  $applicationAttributes */
     public static function create(
         bool $finalized = true,
         bool $routingMutationRecorded = true,
+        array $applicationAttributes = [],
     ): self {
         $team = Team::factory()->create();
         $privateKey = PrivateKey::query()->create([
@@ -59,7 +61,7 @@ final readonly class BlueGreenRecoveryScenario
         $destination = $server->standaloneDockers()->firstOrFail();
         $project = Project::factory()->create(['team_id' => $team->id]);
         $environment = $project->environments()->where('name', 'production')->firstOrFail();
-        $application = Application::factory()->create([
+        $application = Application::factory()->create(array_replace([
             'environment_id' => $environment->id,
             'destination_id' => $destination->id,
             'destination_type' => $destination->getMorphClass(),
@@ -67,7 +69,7 @@ final readonly class BlueGreenRecoveryScenario
             'ports_exposes' => '3000',
             'redirect' => 'both',
             'is_http_basic_auth_enabled' => false,
-        ]);
+        ], $applicationAttributes));
         $managedFilename = BlueGreenRoutingTarget::managedFilename((string) $application->uuid, (int) $destination->id);
         $legacyName = $application->uuid.'-legacy';
         $mutatedAt = $routingMutationRecorded ? now()->subMinute() : null;

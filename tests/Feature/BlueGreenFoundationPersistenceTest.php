@@ -3,6 +3,7 @@
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
+use App\Enums\ProxyTypes;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
@@ -16,6 +17,8 @@ uses(RefreshDatabase::class);
 it('persists the typed blue-green foundation and queue provenance', function () {
     $team = Team::factory()->create();
     $server = Server::factory()->create(['team_id' => $team->id]);
+    $server->proxy->set('type', ProxyTypes::TRAEFIK->value);
+    $server->save();
     $project = Project::factory()->create(['team_id' => $team->id]);
     $environment = $project->environments()->where('name', 'production')->firstOrFail();
     $destination = $server->standaloneDockers()->firstOrFail();
@@ -23,11 +26,22 @@ it('persists the typed blue-green foundation and queue provenance', function () 
         'environment_id' => $environment->id,
         'destination_id' => $destination->id,
         'destination_type' => $destination->getMorphClass(),
+        'fqdn' => 'https://foundation.example.test',
+        'health_check_enabled' => true,
+        'build_pack' => 'nixpacks',
+        'ports_exposes' => '3000',
+        'ports_mappings' => null,
+        'custom_docker_run_options' => null,
     ]);
 
     $setting = $application->settings()->firstOrFail();
     expect($setting->is_blue_green_deployment_enabled)->toBeFalse();
 
+    $setting->update([
+        'is_container_label_readonly_enabled' => true,
+        'is_consistent_container_name_enabled' => false,
+        'custom_internal_name' => null,
+    ]);
     $setting->update(['is_blue_green_deployment_enabled' => true]);
     expect($setting->fresh()->is_blue_green_deployment_enabled)->toBeTrue();
 

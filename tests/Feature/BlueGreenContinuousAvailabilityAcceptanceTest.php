@@ -45,18 +45,19 @@ function blueGreenContinuousAvailabilityContext(
     BlueGreenRoutingMode $mode,
     bool $probeOnly = false,
 ): array {
-    $scenario = BlueGreenRecoveryScenario::create(finalized: false);
+    $scenario = BlueGreenRecoveryScenario::create(
+        finalized: false,
+        applicationAttributes: [
+            'health_check_interval' => 1,
+            'health_check_retries' => 1,
+            'health_check_timeout' => 1,
+        ],
+    );
     $application = $scenario->application->fresh(['settings']);
     $destination = $scenario->destination;
     $server = $scenario->server;
     $state = $scenario->state->fresh();
     $deployment = $scenario->deployment->fresh();
-    $application->update([
-        'health_check_interval' => 1,
-        'health_check_retries' => 1,
-        'health_check_timeout' => 1,
-    ]);
-    $application = $application->fresh(['settings']);
     $operationId = $deployment->deployment_uuid;
     $legacyContainerName = (string) $state->legacy_container_name;
     $target = new BlueGreenRoutingTarget(
