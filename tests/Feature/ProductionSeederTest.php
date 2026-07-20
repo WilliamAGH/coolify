@@ -6,6 +6,7 @@ use App\Models\Server;
 use App\Models\SharedEnvironmentVariable;
 use App\Models\SslCertificate;
 use App\Models\Team;
+use Database\Seeders\DatabaseSeeder;
 use Database\Seeders\ProductionSeeder;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Queue;
@@ -13,10 +14,16 @@ use Illuminate\Support\Facades\Queue;
 uses(RefreshDatabase::class);
 
 it('creates the root team before seeding the localhost server and predefined shared variables', function () {
+    $runtimeKeyPair = generateSSHKey('ed25519');
+    $testingHostPrivateKeyPath = tempnam(sys_get_temp_dir(), 'coolify-testing-host-key-');
+    expect($testingHostPrivateKeyPath)->not->toBeFalse()
+        ->and(file_put_contents($testingHostPrivateKeyPath, $runtimeKeyPair['private']))->not->toBeFalse();
+    $this->beforeApplicationDestroyed(fn () => @unlink($testingHostPrivateKeyPath));
+
     config([
         'broadcasting.default' => 'log',
         'constants.coolify.is_windows_docker_desktop' => true,
-        'constants.coolify.windows_testing_host_private_key_path' => base_path('docker/testing-host/development-private_key'),
+        'constants.coolify.testing_host_private_key_path' => $testingHostPrivateKeyPath,
     ]);
     Queue::fake();
 
@@ -41,18 +48,18 @@ it('creates the root team before seeding the localhost server and predefined sha
 
     $rootTeam = Team::find(0);
     $localhostServer = Server::find(0);
+    $testingHostPrivateKey = PrivateKey::find(0);
 
     expect($rootTeam)->not->toBeNull()
         ->and($localhostServer)->not->toBeNull()
-        ->and($localhostServer->team_id)->toBe(0);
+        ->and($localhostServer->team_id)->toBe(0)
+        ->and($testingHostPrivateKey)->not->toBeNull()
+        ->and($testingHostPrivateKey->private_key)->toBe($runtimeKeyPair['private']);
 
-    $testingHostPrivateKey = PrivateKey::find(0);
-    $authorizedKey = trim((string) file_get_contents(base_path('docker/testing-host/development-authorized_keys')));
-    $expectedPublicKey = implode(' ', array_slice(explode(' ', $authorizedKey), 0, 2));
-    $actualPublicKey = implode(' ', array_slice(explode(' ', $testingHostPrivateKey?->public_key ?? ''), 0, 2));
+    $expectedPublicKey = collect(explode(' ', trim($runtimeKeyPair['public'])))->take(2)->implode(' ');
+    $actualPublicKey = collect(explode(' ', trim((string) PrivateKey::extractPublicKeyFromPrivate($testingHostPrivateKey->private_key))))->take(2)->implode(' ');
 
-    expect($testingHostPrivateKey)->not->toBeNull()
-        ->and($actualPublicKey)->toBe($expectedPublicKey);
+    expect($actualPublicKey)->toBe($expectedPublicKey);
 
     expect(SharedEnvironmentVariable::query()
         ->where('type', 'server')
@@ -75,70 +82,137 @@ it('creates the root team before seeding the localhost server and predefined sha
         ->and($rootUser->teams()->where('team_id', 0)->exists())->toBeTrue();
 });
 
-it('fails closed when the Windows testing-host private-key fixture is unavailable', function () {
+it('fails closed when the Windows testing-host runtime key is unavailable', function () {
     config([
         'broadcasting.default' => 'log',
         'constants.coolify.is_windows_docker_desktop' => true,
-        'constants.coolify.windows_testing_host_private_key_path' => sys_get_temp_dir().'/coolify-missing-testing-host-key-'.uniqid(),
+        'constants.coolify.testing_host_private_key_path' => sys_get_temp_dir().'/coolify-missing-testing-host-key-'.uniqid(),
     ]);
     Queue::fake();
 
     expect(fn () => $this->seed(ProductionSeeder::class))
-        ->toThrow(RuntimeException::class, 'Windows Docker Desktop requires a readable testing-host private key fixture.');
+        ->toThrow(RuntimeException::class, 'The runtime testing-host private key is unavailable.');
 });
 
-it('fails closed when the Windows testing-host private-key fixture is invalid', function () {
-    $fixture = tmpfile();
-    expect($fixture)->not->toBeFalse();
-    fwrite($fixture, 'not a private key');
-    $fixtureMetadata = stream_get_meta_data($fixture);
+it('fails closed when the Windows testing-host runtime key is unreadable', function () {
+    $testingHostPrivateKeyPath = tempnam(sys_get_temp_dir(), 'coolify-testing-host-key-');
+    expect($testingHostPrivateKeyPath)->not->toBeFalse()
+        ->and(file_put_contents($testingHostPrivateKeyPath, generateSSHKey('ed25519')['private']))->not->toBeFalse()
+        ->and(chmod($testingHostPrivateKeyPath, 0000))->toBeTrue();
+    clearstatcache(true, $testingHostPrivateKeyPath);
 
     config([
         'broadcasting.default' => 'log',
         'constants.coolify.is_windows_docker_desktop' => true,
-        'constants.coolify.windows_testing_host_private_key_path' => $fixtureMetadata['uri'],
+        'constants.coolify.testing_host_private_key_path' => $testingHostPrivateKeyPath,
     ]);
     Queue::fake();
 
     try {
         expect(fn () => $this->seed(ProductionSeeder::class))
-            ->toThrow(RuntimeException::class, 'Windows Docker Desktop testing-host private key fixture is invalid.');
+            ->toThrow(RuntimeException::class, 'The runtime testing-host private key is unavailable.');
     } finally {
-        fclose($fixture);
+        chmod($testingHostPrivateKeyPath, 0600);
+        unlink($testingHostPrivateKeyPath);
     }
 });
 
-it('fails closed when the Windows testing-host private-key fixture contains only a public key', function () {
+it('fails closed when the Windows testing-host runtime key is invalid', function () {
+    $testingHostPrivateKeyPath = tempnam(sys_get_temp_dir(), 'coolify-testing-host-key-');
+    expect($testingHostPrivateKeyPath)->not->toBeFalse()
+        ->and(file_put_contents($testingHostPrivateKeyPath, 'not-an-ssh-private-key'))->not->toBeFalse();
+    $this->beforeApplicationDestroyed(fn () => @unlink($testingHostPrivateKeyPath));
+
     config([
         'broadcasting.default' => 'log',
         'constants.coolify.is_windows_docker_desktop' => true,
-        'constants.coolify.windows_testing_host_private_key_path' => base_path('docker/testing-host/development-authorized_keys'),
+        'constants.coolify.testing_host_private_key_path' => $testingHostPrivateKeyPath,
     ]);
     Queue::fake();
 
     expect(fn () => $this->seed(ProductionSeeder::class))
-        ->toThrow(RuntimeException::class, 'Windows Docker Desktop testing-host private key fixture is invalid.');
+        ->toThrow(RuntimeException::class, 'The runtime testing-host private key is invalid.');
 });
 
-it('fails closed when the Windows testing-host private-key fixture is a symlink', function () {
-    $target = tempnam(sys_get_temp_dir(), 'coolify-testing-host-key-target-');
-    $link = $target.'-link';
-    expect($target)->not->toBeFalse()
-        ->and(file_put_contents($target, file_get_contents(base_path('docker/testing-host/development-private_key'))))->toBeInt()
-        ->and(symlink($target, $link))->toBeTrue();
+it('fails closed when the Windows testing-host runtime key contains only a public key', function () {
+    $testingHostPrivateKeyPath = tempnam(sys_get_temp_dir(), 'coolify-testing-host-key-');
+    expect($testingHostPrivateKeyPath)->not->toBeFalse()
+        ->and(file_put_contents($testingHostPrivateKeyPath, generateSSHKey('ed25519')['public']))->not->toBeFalse();
+    $this->beforeApplicationDestroyed(fn () => @unlink($testingHostPrivateKeyPath));
 
     config([
         'broadcasting.default' => 'log',
         'constants.coolify.is_windows_docker_desktop' => true,
-        'constants.coolify.windows_testing_host_private_key_path' => $link,
+        'constants.coolify.testing_host_private_key_path' => $testingHostPrivateKeyPath,
+    ]);
+    Queue::fake();
+
+    expect(fn () => $this->seed(ProductionSeeder::class))
+        ->toThrow(RuntimeException::class, 'The runtime testing-host private key is invalid.');
+});
+
+it('fails closed when the Windows testing-host runtime key is a symlink', function () {
+    $targetPath = tempnam(sys_get_temp_dir(), 'coolify-testing-host-key-target-');
+    expect($targetPath)->not->toBeFalse()
+        ->and(file_put_contents($targetPath, generateSSHKey('ed25519')['private']))->not->toBeFalse();
+    $symlinkPath = $targetPath.'-link';
+    expect(symlink($targetPath, $symlinkPath))->toBeTrue();
+
+    config([
+        'broadcasting.default' => 'log',
+        'constants.coolify.is_windows_docker_desktop' => true,
+        'constants.coolify.testing_host_private_key_path' => $symlinkPath,
     ]);
     Queue::fake();
 
     try {
         expect(fn () => $this->seed(ProductionSeeder::class))
-            ->toThrow(RuntimeException::class, 'Windows Docker Desktop requires a readable testing-host private key fixture.');
+            ->toThrow(RuntimeException::class, 'The runtime testing-host private key is unavailable.');
     } finally {
-        unlink($link);
-        unlink($target);
+        unlink($symlinkPath);
+        unlink($targetPath);
     }
+});
+
+it('routes the default production seed graph through ProductionSeeder', function () {
+    $testingHostPrivateKeyPath = tempnam(sys_get_temp_dir(), 'coolify-testing-host-key-');
+    expect($testingHostPrivateKeyPath)->not->toBeFalse()
+        ->and(file_put_contents($testingHostPrivateKeyPath, generateSSHKey('ed25519')['private']))->not->toBeFalse();
+    $this->beforeApplicationDestroyed(fn () => @unlink($testingHostPrivateKeyPath));
+
+    config([
+        'app.env' => 'production',
+        'broadcasting.default' => 'log',
+        'constants.coolify.is_windows_docker_desktop' => true,
+        'constants.coolify.testing_host_private_key_path' => $testingHostPrivateKeyPath,
+    ]);
+    Queue::fake();
+
+    $this->seed(DatabaseSeeder::class);
+
+    expect(Server::query()->whereKey(0)->value('uuid'))->toBe('coolify-testing-host')
+        ->and(Team::whereKey(0)->exists())->toBeTrue();
+});
+
+it('replaces a stale Windows testing-host key with the generated runtime identity', function () {
+    $runtimeKeyPair = generateSSHKey('ed25519');
+    $testingHostPrivateKeyPath = tempnam(sys_get_temp_dir(), 'coolify-testing-host-key-');
+    expect($testingHostPrivateKeyPath)->not->toBeFalse()
+        ->and(file_put_contents($testingHostPrivateKeyPath, $runtimeKeyPair['private']))->not->toBeFalse();
+    $this->beforeApplicationDestroyed(fn () => @unlink($testingHostPrivateKeyPath));
+
+    config([
+        'broadcasting.default' => 'log',
+        'constants.coolify.is_windows_docker_desktop' => true,
+        'constants.coolify.testing_host_private_key_path' => $testingHostPrivateKeyPath,
+    ]);
+    Queue::fake();
+
+    $this->seed(ProductionSeeder::class);
+    $stalePrivateKey = PrivateKey::findOrFail(0);
+    $stalePrivateKey->private_key = generateSSHKey('ed25519')['private'];
+    $stalePrivateKey->save();
+    $this->seed(ProductionSeeder::class);
+
+    expect(PrivateKey::findOrFail(0)->private_key)->toBe($runtimeKeyPair['private']);
 });

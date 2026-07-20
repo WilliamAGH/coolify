@@ -103,8 +103,7 @@ expected_marker=$2
 allow_marker_create=$3
 marker_directory=${marker_path%/*}
 [ -n "$marker_directory" ] || exit 64
-[ -d "$marker_directory" ] || exit 65
-[ ! -L "$marker_directory" ] || exit 65
+durable_remote_assert_owned_directory "$marker_directory" || exit 65
 case "$allow_marker_create" in true|false) ;; *) exit 64 ;; esac
 if [ -L "$marker_path" ]; then exit 65; fi
 
@@ -119,45 +118,40 @@ umask 077
 temporary_path=$(mktemp "$marker_directory/.coolify-control-plane-writer-authority.XXXXXX") || exit 65
 printf '%s' "$expected_marker" > "$temporary_path"
 chmod 0600 "$temporary_path" || exit 65
-[ -f "$temporary_path" ] || exit 65
-[ ! -L "$temporary_path" ] || exit 65
+durable_remote_assert_owned_regular "$temporary_path" || exit 65
 
 if [ -e "$marker_path" ]; then
-    [ -f "$marker_path" ] || exit 65
-    [ ! -L "$marker_path" ] || exit 65
+    durable_remote_assert_owned_regular "$marker_path" || exit 65
     cmp -s "$temporary_path" "$marker_path" || exit 65
     durable_remote_reaffirm "$marker_path" "$marker_directory" || exit 65
     exit 0
 fi
 [ "$allow_marker_create" = true ] || exit 65
-[ -d "$marker_directory" ] || exit 65
-[ ! -L "$marker_directory" ] || exit 65
+durable_remote_assert_owned_directory "$marker_directory" || exit 65
 if [ -e "$marker_path" ]; then
-    [ -f "$marker_path" ] || exit 65
-    [ ! -L "$marker_path" ] || exit 65
+    durable_remote_assert_owned_regular "$marker_path" || exit 65
     cmp -s "$temporary_path" "$marker_path" || exit 65
     durable_remote_reaffirm "$marker_path" "$marker_directory" || exit 65
     exit 0
 fi
 durable_remote_replace "$temporary_path" "$marker_path" "$marker_directory" || exit 65
 temporary_path=''
-[ -f "$marker_path" ] || exit 65
-[ ! -L "$marker_path" ] || exit 65
+durable_remote_assert_owned_regular "$marker_path" || exit 65
 SH,
         ]);
     }
 
     private function readMarkerScript(): string
     {
-        return <<<'SH'
+        return implode("\n", [
+            ...DurableRemoteArtifact::shellFunctions(),
+            <<<'SH'
 marker_path=$1
 expected_marker=$2
 marker_directory=${marker_path%/*}
 [ -n "$marker_directory" ] || exit 64
-[ -d "$marker_directory" ] || exit 65
-[ ! -L "$marker_directory" ] || exit 65
-[ -f "$marker_path" ] || exit 65
-[ ! -L "$marker_path" ] || exit 65
+durable_remote_assert_owned_directory "$marker_directory" || exit 65
+durable_remote_assert_owned_regular "$marker_path" || exit 65
 
 readback_path=''
 cleanup() {
@@ -170,13 +164,12 @@ umask 077
 readback_path=$(mktemp "$marker_directory/.coolify-control-plane-writer-authority-readback.XXXXXX") || exit 65
 printf '%s' "$expected_marker" > "$readback_path"
 chmod 0600 "$readback_path" || exit 65
-[ -f "$readback_path" ] || exit 65
-[ ! -L "$readback_path" ] || exit 65
+durable_remote_assert_owned_regular "$readback_path" || exit 65
 cmp -s "$readback_path" "$marker_path" || exit 65
 cat "$marker_path"
-[ -f "$marker_path" ] || exit 65
-[ ! -L "$marker_path" ] || exit 65
+durable_remote_assert_owned_regular "$marker_path" || exit 65
 cmp -s "$readback_path" "$marker_path" || exit 65
-SH;
+SH,
+        ]);
     }
 }

@@ -1688,6 +1688,11 @@ jobs:
             OCI_PLATFORM="$PLATFORM" \
             tests/Integration/VerifyOciArchiveImage.sh
 
+      - name: Verify exact fork bundled Reverb and terminal runtime
+        env:
+          PRODUCTION_IMAGE: local/${{ matrix.artifact_name }}:${{ github.sha }}-${{ matrix.arch }}-fork-runtime
+        run: tests/Integration/RealtimeImageTest.sh
+
       - name: Generate standalone fork SPDX SBOM
         id: fork-sbom
         continue-on-error: true
@@ -2352,7 +2357,7 @@ jobs:
       contents: write
     runs-on:
       group: coolify-trusted
-      labels: [self-hosted, linux, x64]
+      labels: [self-hosted, Linux, X64, williamacallahan]
     outputs:
       main_digest: ${{ needs.fork-stage.outputs.main_index_digest }}
       main_image: ${{ steps.references.outputs.main_image }}

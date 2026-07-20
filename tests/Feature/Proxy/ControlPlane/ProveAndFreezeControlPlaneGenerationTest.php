@@ -16,6 +16,7 @@ use App\Actions\Proxy\ControlPlane\RecoverStaleControlPlaneMutationFreeze;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneGenerationPromotionState;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
 use App\Actions\Proxy\ControlPlane\VerifyControlPlaneCandidateMembers;
+use App\Jobs\RestartProxyJob;
 use App\Models\Server;
 use App\Models\Team;
 use App\Support\ProxyMutationQueue;
@@ -23,6 +24,7 @@ use App\Support\ProxyMutationRedisQueue;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Queue\QueueManager;
 use Illuminate\Support\Str;
+use Symfony\Component\Process\Process;
 
 uses(RefreshDatabase::class);
 
@@ -120,10 +122,35 @@ function proveAndFreezeIsolatedQueue(?Closure $onConnection = null): array
             parent::__construct($redis, $default, $connection, $retryAfter, $blockFor, $dispatchAfterCommit);
         }
 
+        private bool $buildingCanonicalPayload = false;
+
         #[Override]
         public function getQueue($queue): string
         {
-            return $this->testQueueKey;
+            return $this->buildingCanonicalPayload
+                ? 'queues:'.ProxyMutationQueue::NAME
+                : $this->testQueueKey;
+        }
+
+        public function dispatchProxyMutationForTest(object $job): mixed
+        {
+            $this->buildingCanonicalPayload = true;
+
+            try {
+                return $this->enqueueUsing(
+                    $job,
+                    $this->createPayload($job, ProxyMutationQueue::NAME),
+                    ProxyMutationQueue::NAME,
+                    null,
+                    function (string $payload, string $queue, mixed $delay): mixed {
+                        $this->buildingCanonicalPayload = false;
+
+                        return $this->pushRaw($payload, $queue);
+                    },
+                );
+            } finally {
+                $this->buildingCanonicalPayload = false;
+            }
         }
     };
     $queue->setConnectionName(ProxyMutationQueue::CONNECTION);
@@ -175,6 +202,84 @@ function proveAndFreezeIsolatedQueue(?Closure $onConnection = null): array
     };
 
     return [$queue, $queueKey, $cleanup];
+}
+
+/** @return array{payload: string, exit_code: int, terminated: bool} */
+function proveAndFreezeReserveDispatchedProxyMutationInChild(string $queueKey): array
+{
+    $worker = new Process(
+        [
+            PHP_BINARY,
+            '-r',
+            <<<'PHP'
+$queueKey = $argv[1] ?? null;
+if (! is_string($queueKey) || $queueKey === '') {
+    fwrite(STDERR, "A test queue key is required.\n");
+    exit(2);
+}
+
+require getcwd().'/vendor/autoload.php';
+$app = require getcwd().'/bootstrap/app.php';
+$app->make(\Illuminate\Contracts\Console\Kernel::class)->bootstrap();
+
+$queue = new class(
+    app('redis'),
+    \App\Support\ProxyMutationQueue::NAME,
+    'default',
+    86400,
+    null,
+    true,
+    $queueKey,
+) extends \App\Support\ProxyMutationRedisQueue {
+    public function __construct(
+        mixed $redis,
+        string $default,
+        string $connection,
+        int $retryAfter,
+        mixed $blockFor,
+        bool $dispatchAfterCommit,
+        private readonly string $testQueueKey,
+    ) {
+        parent::__construct($redis, $default, $connection, $retryAfter, $blockFor, $dispatchAfterCommit);
+    }
+
+    #[\Override]
+    public function getQueue($queue): string
+    {
+        return $this->testQueueKey;
+    }
+};
+$queue->setConnectionName(\App\Support\ProxyMutationQueue::CONNECTION);
+$queue->setContainer($app);
+$job = $queue->pop(\App\Support\ProxyMutationQueue::NAME);
+$reservedPayload = $job?->getReservedJob();
+if (! is_string($reservedPayload) || $reservedPayload === '') {
+    fwrite(STDERR, "The test worker did not reserve a proxy-mutation job.\n");
+    exit(3);
+}
+
+fwrite(STDOUT, base64_encode($reservedPayload));
+PHP,
+            $queueKey,
+        ],
+        base_path(),
+        ['APP_ENV' => 'testing'],
+    );
+    $worker->setTimeout(10);
+    $worker->run();
+
+    $payload = base64_decode(trim($worker->getOutput()), true);
+    $exitCode = $worker->getExitCode();
+    $terminated = $worker->isTerminated();
+    if ($exitCode !== 0 || ! $terminated || ! is_string($payload) || $payload === '') {
+        throw new RuntimeException('The test-owned proxy-mutation worker did not exit after reserving its job: '.$worker->getErrorOutput());
+    }
+
+    return [
+        'payload' => $payload,
+        'exit_code' => $exitCode,
+        'terminated' => $terminated,
+    ];
 }
 
 function proveAndFreezeCandidateTranscript(ControlPlaneGenerationPromotionState $state): string
@@ -407,36 +512,56 @@ it('returns after one nonempty cardinality snapshot and finishes only after a ze
     }
 });
 
-it('requeues an expired crashed reservation only while its exact control-plane freeze owns quiescing', function (): void {
+it('reaps an unacknowledged child-worker reservation only after its successor ProveAndFreeze fence takes ownership', function (): void {
     [$server, $state, , $action, $token] = proveAndFreezePromotionFixture();
     [$queue, $queueKey, $cleanup] = proveAndFreezeIsolatedQueue();
-    $payload = json_encode([
-        'uuid' => (string) Str::uuid(),
-        'id' => (string) Str::uuid(),
-        'displayName' => 'ProxyMutationWorkerCrashFixture',
-        'job' => 'Illuminate\\Queue\\CallQueuedHandler@call',
-        'maxTries' => 1,
-        'maxExceptions' => null,
-        'failOnTimeout' => false,
-        'backoff' => null,
-        'timeout' => 60,
-        'retryUntil' => null,
-        'data' => [],
-        'attempts' => 0,
-        ProxyMutationQueue::PAYLOAD_MARKER => true,
-    ], JSON_THROW_ON_ERROR);
 
     try {
-        $queue->getConnection()->rpush($queueKey, $payload);
-        $reserved = $queue->pop(ProxyMutationQueue::NAME);
-        expect($reserved)->not->toBeNull();
-        $queue->getConnection()->zadd(
+        $queue->dispatchProxyMutationForTest(new RestartProxyJob($server));
+        $workerReservation = proveAndFreezeReserveDispatchedProxyMutationInChild($queueKey);
+        $reservedPayload = $workerReservation['payload'];
+        $reservationExpiresAt = (int) $queue->getConnection()->zscore(
             $queueKey.':reserved',
-            time() - 1,
-            $reserved?->getReservedJob(),
+            $reservedPayload,
         );
+        $firstFreeze = ProxyMutationQueue::freeze($state->operationId, $queue);
+        $firstFence = $firstFreeze->freezeFence
+            ?? throw new RuntimeException('The test freeze did not issue a fence.');
+        $liveRecovered = ProxyMutationQueue::reapExpiredReservations($state->operationId, $firstFence, $queue);
+        $liveSnapshot = ProxyMutationQueue::snapshot($queue);
 
-        $quiescing = $action->handle(
+        expect($workerReservation['exit_code'])->toBe(0)
+            ->and($workerReservation['terminated'])->toBeTrue()
+            ->and($reservationExpiresAt)->toBeGreaterThan(time())
+            ->and($liveRecovered)->toBe(0)
+            ->and($liveSnapshot->freezeOperationId)->toBe($state->operationId)
+            ->and($liveSnapshot->freezeFence)->toBe($firstFence)
+            ->and($liveSnapshot->pending)->toBe(0)
+            ->and($liveSnapshot->reserved)->toBe(1)
+            ->and($liveSnapshot->delayed)->toBe(0)
+            ->and($queue->getConnection()->zrange($queueKey.':reserved', 0, -1))->toBe([$reservedPayload]);
+
+        $queue->getConnection()->zadd($queueKey.':reserved', time() - 1, $reservedPayload);
+        ProxyMutationQueue::unfreeze($state->operationId, $queue, $firstFence);
+        $successorFreeze = ProxyMutationQueue::freeze($state->operationId, $queue);
+        $successorFence = $successorFreeze->freezeFence
+            ?? throw new RuntimeException('The successor test freeze did not issue a fence.');
+
+        expect(fn (): int => ProxyMutationQueue::reapExpiredReservations(
+            $state->operationId,
+            $firstFence,
+            $queue,
+        ))->toThrow(RuntimeException::class, 'exact fenced control-plane owner');
+        $afterStaleFence = ProxyMutationQueue::snapshot($queue);
+
+        expect($successorFence)->not->toBe($firstFence)
+            ->and($afterStaleFence->freezeOperationId)->toBe($state->operationId)
+            ->and($afterStaleFence->freezeFence)->toBe($successorFence)
+            ->and($afterStaleFence->pending)->toBe(0)
+            ->and($afterStaleFence->reserved)->toBe(1)
+            ->and($queue->getConnection()->zrange($queueKey.':reserved', 0, -1))->toBe([$reservedPayload]);
+
+        $recoveredQuiescing = $action->handle(
             $server,
             $state->operationId,
             $token,
@@ -444,13 +569,15 @@ it('requeues an expired crashed reservation only while its exact control-plane f
                 ? ''
                 : proveAndFreezeCandidateTranscript($state),
         );
-        $snapshot = ProxyMutationQueue::snapshot($queue);
+        $recoveredSnapshot = ProxyMutationQueue::snapshot($queue);
 
-        expect($quiescing->phase)->toBe(ControlPlaneGenerationPromotionPhase::Quiescing)
-            ->and($snapshot->freezeOperationId)->toBe($state->operationId)
-            ->and($snapshot->pending)->toBe(1)
-            ->and($snapshot->reserved)->toBe(0)
-            ->and($snapshot->delayed)->toBe(0);
+        expect($recoveredQuiescing->phase)->toBe(ControlPlaneGenerationPromotionPhase::Quiescing)
+            ->and($recoveredSnapshot->freezeOperationId)->toBe($state->operationId)
+            ->and($recoveredSnapshot->freezeFence)->toBe($successorFence)
+            ->and($recoveredSnapshot->pending)->toBe(1)
+            ->and($recoveredSnapshot->reserved)->toBe(0)
+            ->and($recoveredSnapshot->delayed)->toBe(0)
+            ->and($queue->getConnection()->lindex($queueKey, 0))->toBe($reservedPayload);
     } finally {
         $cleanup($state->operationId);
     }

@@ -141,7 +141,7 @@ function applicationValidationRequiredAggregateStep(array $workflow): array
 /**
  * @return array<string, string|false>
  */
-function applicationValidationRequiredEnvironment(string $eventName): array
+function applicationValidationRequiredEnvironment(string $eventName, string $sourceSha = ''): array
 {
     return [
         'BLUE_GREEN_LIFECYCLE_RESULT' => 'success',
@@ -151,7 +151,8 @@ function applicationValidationRequiredEnvironment(string $eventName): array
         'FORK_DEPLOY_RESULT' => 'success',
         'NODE_RESULT' => 'success',
         'PHP_RESULT' => 'success',
-        'TESTING_HOST_RUNTIME_RESULT' => $eventName === 'pull_request' ? 'success' : 'skipped',
+        'VALIDATION_SOURCE_SHA' => $sourceSha,
+        'TESTING_HOST_RUNTIME_RESULT' => $eventName === 'pull_request' || $sourceSha !== '' ? 'success' : 'skipped',
         'WORKFLOW_RESULT' => 'success',
     ];
 }
@@ -272,6 +273,7 @@ function applicationValidationWorkflowViolations(array $workflow): array
     foreach ([
         'tests/Feature/ApplicationDeploymentBlueGreenDestinationFenceTest.php',
         'tests/Feature/BlueGreenApplicationDeactivationTest.php',
+        'tests/Feature/BlueGreenApplicationManualStopTest.php',
         'tests/Feature/BlueGreenCancellationCompensationTest.php',
         'tests/Feature/BlueGreenContinuousAvailabilityAcceptanceTest.php',
         'tests/Feature/BlueGreenCrashBoundaryAcceptanceTest.php',
@@ -308,6 +310,11 @@ function applicationValidationWorkflowViolations(array $workflow): array
     }
 
     $phpApplication = is_array($jobs) ? ($jobs['php'] ?? []) : [];
+    $releaseTestsScript = collect($phpApplication['steps'] ?? [])
+        ->firstWhere('name', 'Run release and version-consumer tests')['run'] ?? '';
+    if (! str_contains((string) $releaseTestsScript, 'tests/Unit/V4xCandidateWorkflowTest.php')) {
+        $violations[] = 'application validation must execute the v4.x candidate workflow regression owner';
+    }
     $controlPlaneScript = collect($phpApplication['steps'] ?? [])
         ->firstWhere('name', 'Run native Traefik control-plane tests')['run'] ?? '';
     foreach ([
@@ -333,6 +340,11 @@ function applicationValidationWorkflowViolations(array $workflow): array
     }
 
     $workflowAndShell = is_array($jobs) ? ($jobs['workflow-and-shell'] ?? []) : [];
+    $candidateShipScript = collect($workflowAndShell['steps'] ?? [])
+        ->firstWhere('name', 'Run v4.x candidate ship contract')['run'] ?? '';
+    if ((string) $candidateShipScript !== 'scripts/dev/ship.test.sh') {
+        $violations[] = 'application validation must execute the v4.x candidate ship contract';
+    }
     $dockerDaemonConfigurationScript = collect($workflowAndShell['steps'] ?? [])
         ->firstWhere('name', 'Verify Docker daemon configuration ownership')['run'] ?? '';
     if (! str_contains((string) $dockerDaemonConfigurationScript, 'tests/Integration/DockerDaemonConfigurationTest.sh')) {
@@ -347,6 +359,41 @@ function applicationValidationWorkflowViolations(array $workflow): array
         ->firstWhere('name', 'Run native Traefik runtime integration')['run'] ?? '';
     if (! str_contains((string) $traefikRuntimeScript, 'tests/Integration/ControlPlaneTraefik/run.sh')) {
         $violations[] = 'application validation must execute the native Traefik runtime integration';
+    }
+    $workflowAndShellSteps = collect($workflowAndShell['steps'] ?? []);
+    $phpSetupIndex = $workflowAndShellSteps
+        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Set up PHP');
+    $composerDependenciesIndex = $workflowAndShellSteps
+        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Install Composer dependencies');
+    $traefikRuntimeIndex = $workflowAndShellSteps
+        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Run native Traefik runtime integration');
+    $phpSetup = $phpSetupIndex === false ? null : $workflowAndShellSteps->get($phpSetupIndex);
+    $composerDependencies = $composerDependenciesIndex === false ? null : $workflowAndShellSteps->get($composerDependenciesIndex);
+    if (! is_array($phpSetup)
+        || ($phpSetup['uses'] ?? null) !== 'shivammathur/setup-php@44454db4f0199b8b9685a5d763dc37cbf79108e1'
+        || ($phpSetup['with']['php-version'] ?? null) !== '8.5'
+        || ($phpSetup['with']['coverage'] ?? null) !== 'none'
+        || ($phpSetup['with']['extensions'] ?? null) !== 'mbstring, pdo_sqlite, redis') {
+        $violations[] = 'native Traefik runtime integration must configure pinned PHP 8.5';
+    }
+    if (! is_array($composerDependencies)
+        || ($composerDependencies['run'] ?? null) !== 'composer install --no-interaction --prefer-dist --optimize-autoloader') {
+        $violations[] = 'native Traefik runtime integration must install Composer dependencies';
+    }
+    if ($phpSetupIndex === false
+        || $composerDependenciesIndex === false
+        || $traefikRuntimeIndex === false
+        || ! ($phpSetupIndex < $composerDependenciesIndex && $composerDependenciesIndex < $traefikRuntimeIndex)) {
+        $violations[] = 'native Traefik runtime integration must prepare PHP and Composer before it runs';
+    }
+
+    $testingHostRuntime = is_array($jobs) ? ($jobs['testing-host-runtime'] ?? []) : [];
+    $bundledRuntime = collect($testingHostRuntime['steps'] ?? [])
+        ->firstWhere('name', 'Run exact bundled Reverb and terminal runtime contract');
+    if (! is_array($bundledRuntime)
+        || ($bundledRuntime['env']['PRODUCTION_IMAGE'] ?? null) !== 'coolify:application-validation-${{ inputs.source_sha || github.sha }}'
+        || ($bundledRuntime['run'] ?? null) !== 'tests/Integration/RealtimeImageTest.sh') {
+        $violations[] = 'application validation must execute the bundled Reverb and terminal contract against the exact production image';
     }
 
     foreach (is_array($jobs) ? $jobs : [] as $job) {
@@ -407,6 +454,7 @@ it('keeps the aggregate contract structurally connected to every selected result
             'FORK_DEPLOY_RESULT' => '${{ needs.fork-deploy.result }}',
             'NODE_RESULT' => '${{ needs.node.result }}',
             'PHP_RESULT' => '${{ needs.php.result }}',
+            'VALIDATION_SOURCE_SHA' => '${{ inputs.source_sha }}',
             'TESTING_HOST_RUNTIME_RESULT' => '${{ needs.testing-host-runtime.result }}',
             'WORKFLOW_RESULT' => '${{ needs.workflow-and-shell.result }}',
         ])
@@ -416,15 +464,16 @@ it('keeps the aggregate contract structurally connected to every selected result
 
 it('executes the actual aggregate script for successful pull requests and reusable calls', function (
     string $eventName,
+    string $sourceSha,
 ): void {
     $process = runApplicationValidationRequiredAggregate(
-        applicationValidationRequiredEnvironment($eventName),
+        applicationValidationRequiredEnvironment($eventName, $sourceSha),
     );
 
     expect($process->isSuccessful())->toBeTrue($process->getErrorOutput());
 })->with([
-    'pull request' => ['pull_request'],
-    'workflow call' => ['workflow_call'],
+    'pull request' => ['pull_request', ''],
+    'exact-source workflow call' => ['workflow_call', str_repeat('a', 40)],
 ]);
 
 it('fails the actual aggregate script for every non-successful generic result', function (
@@ -452,7 +501,7 @@ it('requires testing-host success for pull requests', function (string $result):
     'cancelled' => ['cancelled'],
 ]);
 
-it('only allows a skipped testing-host result for reusable workflow calls', function (string $result): void {
+it('only allows a skipped testing-host result without an exact source', function (string $result): void {
     $environment = applicationValidationRequiredEnvironment('workflow_call');
     $environment['TESTING_HOST_RUNTIME_RESULT'] = $result;
 
@@ -608,6 +657,18 @@ it('rejects omitting the native Traefik runtime integration', function () {
 
     expect(applicationValidationWorkflowViolations($workflow))
         ->toContain('application validation must execute the native Traefik runtime integration');
+});
+
+it('rejects omitting bundled Reverb and terminal runtime acceptance', function () {
+    $workflow = applicationValidationWorkflow();
+    $step = collect($workflow['jobs']['testing-host-runtime']['steps'] ?? [])
+        ->search(fn (array $candidate): bool => ($candidate['name'] ?? null) === 'Run exact bundled Reverb and terminal runtime contract');
+    expect($step)->not->toBeFalse();
+
+    unset($workflow['jobs']['testing-host-runtime']['steps'][$step]);
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('application validation must execute the bundled Reverb and terminal contract against the exact production image');
 });
 
 it('retains the original transport streams through forward promotion and proved rollback', function () {

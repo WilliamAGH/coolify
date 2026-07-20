@@ -1,6 +1,7 @@
 <?php
 
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationException;
+use App\Actions\Application\BlueGreen\BlueGreenDeactivationFailure;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationInProgressException;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteOutcome;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteResult;
@@ -18,17 +19,20 @@ use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\ProxyTypes;
 use App\Events\ServiceStatusChanged;
+use App\Livewire\Project\Application\Heading as ApplicationHeading;
 use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
+use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Process;
+use Livewire\Livewire;
 use Tests\Support\BlueGreenDeactivationScenario;
 
 uses(RefreshDatabase::class);
@@ -192,6 +196,69 @@ it('adopts and removes the exact legacy container through a fenced first manual 
         ->and($stoppedState->destination_fence_operation_id)->toBe($replacementState->operationId)
         ->and($stoppedState->destination_fence_mutation_sequence)->toBe($replacementState->mutationSequence)
         ->and($deactivation->phase)->toBe(BlueGreenDeactivationPhase::STOPPED);
+});
+
+it('records a typed remote invariant failure through manual stop and renders its durable intervention', function (): void {
+    $context = BlueGreenDeactivationScenario::context();
+    $application = $context['application'];
+    $destination = $context['destination'];
+    $state = BlueGreenDeactivationScenario::routeLessState($application, $destination);
+    $rawRemoteDetail = str_repeat('credential=not-for-public-display ', 40);
+    $publicReason = 'The destination proved a blue-green deactivation invariant failure.';
+
+    Process::fake(function (PendingProcess $process) use ($rawRemoteDetail) {
+        if (str_contains($process->command, '/proc/sys/kernel/random/boot_id')) {
+            return Process::result(output: BlueGreenDeactivationScenario::BOOT_ID, exitCode: 0);
+        }
+
+        return Process::result(
+            output: (new ExecuteBlueGreenDeactivationRemoteCommand)->encode(
+                new BlueGreenDeactivationRemoteResult(
+                    outcome: BlueGreenDeactivationRemoteOutcome::InvariantViolation,
+                    exitStatus: 19,
+                    output: $rawRemoteDetail,
+                ),
+            ),
+            exitCode: 0,
+        );
+    });
+
+    $exception = null;
+    try {
+        StopApplication::run($application, dockerCleanup: false);
+    } catch (BlueGreenDeactivationException $caught) {
+        $exception = $caught;
+    }
+
+    $deactivation = ApplicationBlueGreenDeactivation::query()->sole();
+    $interventionState = $state->fresh();
+
+    expect($exception)->toBeInstanceOf(BlueGreenDeactivationException::class)
+        ->and($exception?->getMessage())->toBe($publicReason)
+        ->and(mb_strlen($publicReason))->toBeLessThanOrEqual(BlueGreenDeactivationFailure::MAXIMUM_PUBLIC_REASON_LENGTH)
+        ->and($deactivation->phase)->toBe(BlueGreenDeactivationPhase::INTERVENTION_REQUIRED)
+        ->and($deactivation->intervention_phase)->toBe(BlueGreenDeactivationPhase::STOPPING->value)
+        ->and($deactivation->intervention_reason)->toBe($publicReason)
+        ->and($deactivation->intervention_reason)->not->toContain('credential=not-for-public-display')
+        ->and($interventionState?->phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
+        ->and($interventionState?->intervention_phase)->toBe(BlueGreenDeploymentPhase::DEACTIVATING->value)
+        ->and($interventionState?->intervention_reason)->toBe($publicReason);
+
+    $this->withoutVite();
+    $admin = User::factory()->create();
+    $admin->teams()->attach($context['team'], ['role' => 'admin']);
+    $this->actingAs($admin);
+    session(['currentTeam' => $context['team']]);
+
+    Livewire::test(ApplicationHeading::class, ['application' => $application->fresh()])
+        ->assertSet('blueGreenIntervention.phase', 'deactivation')
+        ->assertSet('blueGreenIntervention.sourcePhase', BlueGreenDeactivationPhase::STOPPING->value)
+        ->assertSet('blueGreenIntervention.destinationId', $destination->id)
+        ->assertSet('blueGreenIntervention.reason', $publicReason)
+        ->assertSee('Blue-green deactivation (stopping)')
+        ->assertSee('destination '.$destination->id)
+        ->assertSee($publicReason)
+        ->assertDontSee($rawRemoteDetail);
 });
 
 it('resumes an immutable route-less replacement after its durable record fails and application configuration drifts', function () {

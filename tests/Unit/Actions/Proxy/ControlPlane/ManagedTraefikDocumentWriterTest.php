@@ -12,11 +12,12 @@ function managedTraefikDocumentMutation(
     int $revision,
     string $replacementBytes,
     ?ManagedTraefikDocumentMutation $predecessor = null,
+    string $filename = 'coolify-control-plane.yaml',
 ): ManagedTraefikDocumentMutation {
     return new ManagedTraefikDocumentMutation(
         dynamicDirectory: $root.'/dynamic',
         stateDirectory: $root.'/state',
-        filename: 'coolify-control-plane.yaml',
+        filename: $filename,
         operationId: $operationId,
         revision: $revision,
         expectedSha256: $predecessor?->replacementSha256(),
@@ -106,6 +107,162 @@ it('atomically writes one managed file-provider document and replays its owner i
                 $mutation->replacementSha256(),
             )
             ->and(file_exists($mutation->journalPath()))->toBeFalse();
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('does not reap owned temporary files for a different managed filename', function (): void {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $filesystem->mkdir([$root.'/dynamic', $root.'/state'], 0700);
+        $writer = new ManagedTraefikDocumentWriter;
+        $mutation = managedTraefikDocumentMutation(
+            root: $root,
+            operationId: 'control-plane-scoped-cleanup',
+            revision: 1,
+            replacementBytes: "http:\n  routers: {}\n",
+        );
+        $otherFilename = 'secondary-control-plane.yaml';
+        $otherTemporaryFiles = [
+            $root.'/dynamic/.managed-traefik-document.'.$otherFilename.'.active',
+            $root.'/state/.managed-traefik-journal.'.$otherFilename.'.active',
+            $root.'/state/.managed-traefik-artifact.'.$otherFilename.'.active',
+        ];
+        foreach ($otherTemporaryFiles as $temporaryFile) {
+            file_put_contents($temporaryFile, 'active-other-writer');
+            chmod($temporaryFile, 0600);
+        }
+
+        $result = runManagedTraefikDocumentCommand($writer->writeCommandFor($mutation));
+
+        expect($result->isSuccessful())->toBeTrue($result->getErrorOutput());
+        foreach ($otherTemporaryFiles as $temporaryFile) {
+            expect(file_get_contents($temporaryFile))->toBe('active-other-writer');
+        }
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('rejects hard-linked managed state and preserves the stable mutation lock inode', function () {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $first = managedTraefikDocumentMutation(
+            root: $root,
+            operationId: 'control-plane-hard-link-first',
+            revision: 1,
+            replacementBytes: "http:\n  routers:\n    first: {}\n",
+        );
+        $second = managedTraefikDocumentMutation(
+            root: $root,
+            operationId: 'control-plane-hard-link-second',
+            revision: 2,
+            replacementBytes: "http:\n  routers:\n    second: {}\n",
+            predecessor: $first,
+        );
+
+        $firstWrite = runManagedTraefikDocumentCommand($writer->writeCommandFor($first));
+        $lockInode = fileinode($first->lockPath());
+        $hardLink = $root.'/state/sidecar-hardlink';
+        link($first->sidecarPath(), $hardLink);
+        $rejected = runManagedTraefikDocumentCommand($writer->writeCommandFor($second));
+        $documentAfterRejection = file_get_contents($first->documentPath());
+        $sidecarAfterRejection = file_get_contents($first->sidecarPath());
+        unlink($hardLink);
+        $recovered = runManagedTraefikDocumentCommand($writer->writeCommandFor($second));
+        clearstatcache(true, $first->lockPath());
+
+        expect($firstWrite->isSuccessful())->toBeTrue()
+            ->and($rejected->isSuccessful())->toBeFalse()
+            ->and($documentAfterRejection)->toBe($first->replacementBytes)
+            ->and($sidecarAfterRejection)->toBe($first->replacementSidecar())
+            ->and($recovered->isSuccessful())->toBeTrue()
+            ->and(file_get_contents($first->documentPath()))->toBe($second->replacementBytes)
+            ->and(fileinode($first->lockPath()))->toBe($lockInode)
+            ->and(fileperms($first->lockPath()) & 0777)->toBe(0600);
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('recovers an owned candidate fsync crash without publishing partial state or retaining its temp file', function () {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $mutation = managedTraefikDocumentMutation(
+            root: $root,
+            operationId: 'control-plane-candidate-fsync-crash',
+            revision: 1,
+            replacementBytes: "http:\n  routers:\n    candidate: {}\n",
+        );
+        $command = $writer->writeCommandFor($mutation);
+
+        $crashed = runManagedTraefikDocumentCommand(
+            $command,
+            ['COOLIFY_DURABLE_REMOTE_ARTIFACT_CRASH_AFTER_CANDIDATE_FSYNC' => '1'],
+        );
+        $crashTemps = glob($mutation->stateDirectory.'/.managed-traefik-artifact.*') ?: [];
+        $documentExistsAfterCrash = file_exists($mutation->documentPath());
+        $replayed = runManagedTraefikDocumentCommand($command);
+        $recoveredTemps = glob($mutation->stateDirectory.'/.managed-traefik-artifact.*') ?: [];
+
+        expect($crashed->isSuccessful())->toBeFalse()
+            ->and($crashed->getExitCode())->toBe(75)
+            ->and($documentExistsAfterCrash)->toBeFalse()
+            ->and($crashTemps)->toHaveCount(1)
+            ->and($replayed->isSuccessful())->toBeTrue()
+            ->and($recoveredTemps)->toBe([])
+            ->and(file_get_contents($mutation->documentPath()))->toBe($mutation->replacementBytes)
+            ->and(file_get_contents($mutation->sidecarPath()))->toBe($mutation->replacementSidecar());
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('replays after a journal unlink crash with the exact routed document already durable', function () {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $first = managedTraefikDocumentMutation(
+            root: $root,
+            operationId: 'control-plane-unlink-first',
+            revision: 1,
+            replacementBytes: "http:\n  routers:\n    first: {}\n",
+        );
+        $second = managedTraefikDocumentMutation(
+            root: $root,
+            operationId: 'control-plane-unlink-second',
+            revision: 2,
+            replacementBytes: "http:\n  routers:\n    second: {}\n",
+            predecessor: $first,
+        );
+
+        $firstWrite = runManagedTraefikDocumentCommand($writer->writeCommandFor($first));
+        $command = $writer->writeCommandFor($second);
+        $crashed = runManagedTraefikDocumentCommand(
+            $command,
+            ['COOLIFY_DURABLE_REMOTE_ARTIFACT_CRASH_AFTER_UNLINK' => '1'],
+        );
+        $replayed = runManagedTraefikDocumentCommand($command);
+
+        expect($firstWrite->isSuccessful())->toBeTrue()
+            ->and($crashed->isSuccessful())->toBeFalse()
+            ->and($crashed->getExitCode())->toBe(75)
+            ->and(file_exists($second->journalPath()))->toBeFalse()
+            ->and(file_get_contents($second->documentPath()))->toBe($second->replacementBytes)
+            ->and(file_get_contents($second->sidecarPath()))->toBe($second->replacementSidecar())
+            ->and($replayed->isSuccessful())->toBeTrue()
+            ->and(trim($replayed->getOutput()))->toBe(ManagedTraefikDocumentWriter::APPLIED_OUTPUT);
     } finally {
         $filesystem->remove($root);
     }
@@ -942,6 +1099,56 @@ it('allows a third generation to require the rollback tombstone instead of the o
             ->and(file_get_contents($third->documentPath()))->toBe($third->replacementBytes)
             ->and(file_get_contents($third->sidecarPath()))->toBe($third->replacementSidecar())
             ->and(file_get_contents($third->writerAuthorityPath()))->toBe($rolledBackAuthority->toJson());
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('renders valid dash and bash commands without shellcheck findings', function (): void {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+    $commandsRoot = $root.'/commands';
+
+    try {
+        $filesystem->mkdir($commandsRoot, 0700);
+        $writer = new ManagedTraefikDocumentWriter;
+        $first = managedTraefikDocumentMutation(
+            root: $root,
+            operationId: 'control-plane-shell-first',
+            revision: 1,
+            replacementBytes: "http:\n  routers:\n    first: {}\n",
+        );
+        $firstAuthority = managedTraefikDocumentWriterAuthority($first, epoch: 1, identity: 'a');
+        $second = managedTraefikDocumentMutation(
+            root: $root,
+            operationId: 'control-plane-shell-second',
+            revision: 2,
+            replacementBytes: "http:\n  routers:\n    second: {}\n",
+            predecessor: $first,
+        );
+        $secondAuthority = managedTraefikDocumentWriterAuthority($second, epoch: 2, identity: 'b');
+        $rolledBackAuthority = managedTraefikDocumentRollbackAuthority($first, $second, $firstAuthority);
+        $commands = [
+            $writer->writeCommandFor($first),
+            $writer->promoteWriterAuthorityCommandFor(
+                $second->stateDirectory,
+                $second->filename,
+                $firstAuthority,
+                $secondAuthority,
+            ),
+            $writer->reconcileRolledBackWriterAuthorityCommandFor($second, $firstAuthority, $rolledBackAuthority),
+        ];
+
+        foreach ($commands as $index => $command) {
+            $commandPath = $commandsRoot.'/managed-traefik-'.$index.'.sh';
+            file_put_contents($commandPath, $command);
+            foreach ([['dash', '-n', $commandPath], ['bash', '-n', $commandPath], ['shellcheck', '-s', 'sh', $commandPath]] as $arguments) {
+                $process = new Process($arguments);
+                $process->run();
+
+                expect($process->isSuccessful())->toBeTrue($process->getOutput().$process->getErrorOutput());
+            }
+        }
     } finally {
         $filesystem->remove($root);
     }
