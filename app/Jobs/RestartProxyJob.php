@@ -27,15 +27,23 @@ class RestartProxyJob implements ProxyMutation, ShouldBeEncrypted, ShouldQueue
 
     public const REMOTE_TIMEOUT_SECONDS = 600;
 
-    public $tries = 1;
+    public int $tries = 3;
 
-    public $timeout = 660;
+    public int $maxExceptions = 3;
+
+    public int $timeout = 660;
 
     public ?int $activity_id = null;
 
     public function middleware(): array
     {
         return [(new WithoutOverlapping('restart-proxy-'.$this->server->uuid))->expireAfter(660)->dontRelease()];
+    }
+
+    /** @return list<int> */
+    public function backoff(): array
+    {
+        return [30, 90, 180];
     }
 
     public function __construct(public Server $server)

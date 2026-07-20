@@ -2,6 +2,7 @@
 
 use App\Actions\Proxy\StartProxy;
 use App\Contracts\ProxyMutation;
+use App\Jobs\RestartProxyJob;
 use App\Models\Server;
 use App\Support\ProxyMutationExecutionPipe;
 use App\Support\ProxyMutationQueue;
@@ -182,6 +183,21 @@ it('marks Laravel Action decorators with their canonical action identity', funct
         ->and($payload['displayName'])->toBe(StartProxy::class)
         ->and($job->connection)->toBe(ProxyMutationQueue::CONNECTION)
         ->and($job->queue)->toBe(ProxyMutationQueue::NAME);
+});
+
+it('serializes retry policy on concrete proxy mutation transports', function () {
+    $queue = proxyMutationGateQueue(app());
+
+    foreach ([StartProxy::makeJob(new Server), new RestartProxyJob(new Server)] as $job) {
+        $payload = $queue->payloadFor($job);
+
+        expect($job->connection)->toBe(ProxyMutationQueue::CONNECTION)
+            ->and($job->queue)->toBe(ProxyMutationQueue::NAME)
+            ->and($payload[ProxyMutationQueue::PAYLOAD_MARKER])->toBeTrue()
+            ->and($payload['maxTries'])->toBe(3)
+            ->and($payload['maxExceptions'])->toBe(3)
+            ->and($payload['backoff'])->toBe('30,90,180');
+    }
 });
 
 it('rejects unmarked canonical payloads before physical enqueue', function () {

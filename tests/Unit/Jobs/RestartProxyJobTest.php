@@ -48,7 +48,9 @@ class RestartProxyJobTest extends TestCase
 
         $job = new RestartProxyJob($server);
 
-        $this->assertEquals(1, $job->tries);
+        $this->assertEquals(3, $job->tries);
+        $this->assertEquals(3, $job->maxExceptions);
+        $this->assertSame([30, 90, 180], $job->backoff());
         $this->assertEquals(660, $job->timeout);
         $this->assertNull($job->activity_id);
         $this->assertInstanceOf(ProxyMutation::class, $job);
