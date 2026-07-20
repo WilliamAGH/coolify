@@ -11,6 +11,61 @@ function applicationValidationWorkflow(): array
     return Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
 }
 
+function controlPlaneTraefikRuntimeScript(): string
+{
+    return file_get_contents(dirname(__DIR__).'/Integration/ControlPlaneTraefik/run.sh');
+}
+
+/**
+ * @return list<string>
+ */
+function controlPlaneTraefikTransportLifecycleViolations(string $script): array
+{
+    preg_match_all(
+        '/^\s*publish_transport_release [^\n]+ "\$forward_transport_release"$/m',
+        $script,
+        $forwardTransportReleases,
+    );
+    if (count($forwardTransportReleases[0]) !== 1) {
+        return ['native Traefik runtime must retain its original transport streams through proved rollback'];
+    }
+
+    $milestones = [
+        '    start_transport_observer forward backend-blue "$BACKEND_BLUE_STATE_DIR"',
+        '    forward_applied_at_ms=$(now_ms)',
+        '    start_transport_observer rollback backend-green "$BACKEND_GREEN_STATE_DIR"',
+        '    rollback_applied_at_ms=$(now_ms)',
+        '    publish_transport_release rollback "$rollback_applied_at_ms" "$rollback_transport_release"',
+        '    assert_transport_continuity "$rollback_transport_report" rollback',
+        '    assert_transition_log "$rollback_observer_log"',
+        '    assert_exact_dynamic_snapshot "$blue_final_snapshot"',
+        '    publish_transport_release full-cycle "$rollback_applied_at_ms" "$forward_transport_release"',
+        '    wait_for_transport_observer full-cycle "$forward_transport_pid" "$forward_transport_log" "$forward_transport_report"',
+        '    assert_full_cycle_transport_continuity "$forward_transport_report"',
+    ];
+    $previousPosition = -1;
+
+    foreach ($milestones as $milestone) {
+        $position = strpos($script, $milestone);
+        if ($position === false || $position <= $previousPosition) {
+            return ['native Traefik runtime must retain its original transport streams through proved rollback'];
+        }
+
+        $previousPosition = $position;
+    }
+
+    foreach ([
+        'any(.sse.events[]; .receivedAt >= $forward_applied_at and .receivedAt < $rollback_started_at)',
+        'any(.websocket.events[]; .receivedAt >= $forward_applied_at and .receivedAt < $rollback_started_at)',
+    ] as $requiredAssertion) {
+        if (! str_contains($script, $requiredAssertion)) {
+            return ['native Traefik runtime must retain its original transport streams through proved rollback'];
+        }
+    }
+
+    return [];
+}
+
 /**
  * @param  array<string, mixed>  $workflow
  * @return array<string, mixed>
@@ -478,6 +533,20 @@ it('rejects omitting the native Traefik runtime integration', function () {
 
     expect(applicationValidationWorkflowViolations($workflow))
         ->toContain('application validation must execute the native Traefik runtime integration');
+});
+
+it('retains the original transport streams through forward promotion and proved rollback', function () {
+    expect(controlPlaneTraefikTransportLifecycleViolations(controlPlaneTraefikRuntimeScript()))->toBe([]);
+});
+
+it('rejects releasing the original transport streams before rollback proof', function () {
+    $script = controlPlaneTraefikRuntimeScript();
+    $rollbackStart = '    start_transport_observer rollback backend-green "$BACKEND_GREEN_STATE_DIR"';
+    $prematureRelease = '    publish_transport_release forward "$forward_applied_at_ms" "$forward_transport_release"';
+    $mutated = str_replace($rollbackStart, $prematureRelease."\n".$rollbackStart, $script);
+
+    expect(controlPlaneTraefikTransportLifecycleViolations($mutated))
+        ->toContain('native Traefik runtime must retain its original transport streams through proved rollback');
 });
 
 it('rejects omitting database migration S6 exit propagation coverage', function () {

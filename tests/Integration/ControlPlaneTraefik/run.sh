@@ -733,47 +733,51 @@ start_transport_observer() {
 
 wait_for_transport_observer_ready() {
     local transition=$1
+    local ready_path=$2
+    local observer_log=$3
     local deadline=$(( $(now_ms) + MAX_RELOAD_DELAY_MS ))
 
     while [ "$(now_ms)" -lt "$deadline" ]; do
-        if [ -s "$TRANSPORT_OBSERVER_READY" ] && jq -e '
+        if [ -s "$ready_path" ] && jq -e '
             (.sse.startedAt | type == "number")
             and (.sse.firstEventAt | type == "number")
             and (.websocket.startedAt | type == "number")
             and (.websocket.firstEventAt | type == "number")
-        ' "$TRANSPORT_OBSERVER_READY" >/dev/null; then
+        ' "$ready_path" >/dev/null; then
             return
         fi
         sleep 0.05
     done
-    cat "$TRANSPORT_OBSERVER_LOG" >&2 || true
+    cat "$observer_log" >&2 || true
     fail "$transition transport observer did not receive initial SSE and WebSocket events"
 }
 
 publish_transport_release() {
     local transition=$1
     local applied_at_ms=$2
+    local release_path=$3
     local staged_release
 
     [[ $applied_at_ms =~ ^[0-9]{13,16}$ ]] || fail "Refusing to publish a malformed $transition transport barrier"
-    staged_release=$(mktemp "${TRANSPORT_OBSERVER_RELEASE}.XXXXXX")
+    staged_release=$(mktemp "${release_path}.XXXXXX")
     jq -n \
         --arg transition "$transition" \
         --argjson applied_at "$applied_at_ms" \
         '{transition: $transition, appliedAt: $applied_at}' > "$staged_release"
-    mv -f -- "$staged_release" "$TRANSPORT_OBSERVER_RELEASE"
+    mv -f -- "$staged_release" "$release_path"
 }
 
 wait_for_transport_observer() {
     local transition=$1
-    local observer_pid=$TRANSPORT_OBSERVER_PID
+    local observer_pid=$2
+    local observer_log=$3
+    local observer_report=$4
 
     if ! wait_for_registered_background_pid "$observer_pid"; then
-        cat "$TRANSPORT_OBSERVER_LOG" >&2 || true
+        cat "$observer_log" >&2 || true
         fail "$transition transport observer terminated before crossing its applied-config barrier"
     fi
-    TRANSPORT_OBSERVER_PID=''
-    [ -s "$TRANSPORT_OBSERVER_REPORT" ] || fail "$transition transport observer did not publish a continuity report"
+    [ -s "$observer_report" ] || fail "$transition transport observer did not publish a continuity report"
 }
 
 assert_transport_continuity() {
@@ -832,6 +836,28 @@ assert_transport_continuity() {
             and ([.sse.events[].connectionId] | unique | length == 1)
             and ([.websocket.events[].connectionId] | unique | length == 1)
         ' "$report_file" >/dev/null || fail "$transition SSE or WebSocket connection did not cross the applied-config barrier"
+}
+
+assert_full_cycle_transport_continuity() {
+    local report_file=$1
+    local forward_switch_started_at_ms=$2
+    local forward_applied_at_ms=$3
+    local rollback_switch_started_at_ms=$4
+    local rollback_applied_at_ms=$5
+    local expected_backend=$6
+    local expected_color=$7
+    local expected_generation=$8
+    local expected_dynamic_sha=$9
+
+    assert_transport_continuity "$report_file" full-cycle 0 "$forward_switch_started_at_ms" "$rollback_applied_at_ms" \
+        "$expected_backend" "$expected_color" "$expected_generation" "$expected_dynamic_sha"
+    jq -e \
+        --argjson forward_applied_at "$forward_applied_at_ms" \
+        --argjson rollback_started_at "$rollback_switch_started_at_ms" '
+            any(.sse.events[]; .receivedAt >= $forward_applied_at and .receivedAt < $rollback_started_at)
+            and any(.websocket.events[]; .receivedAt >= $forward_applied_at and .receivedAt < $rollback_started_at)
+        ' "$report_file" >/dev/null \
+        || fail 'Original SSE or WebSocket connection did not remain active throughout the green-applied interval'
 }
 
 start_transition_observer() {
@@ -1126,6 +1152,17 @@ main() {
     local switch_observer_pid
     local rollback_observer_log
     local rollback_observer_pid
+    local forward_transport_log
+    local forward_transport_pid
+    local forward_transport_ready
+    local forward_transport_release
+    local forward_transport_report
+    local forward_transition_barrier
+    local rollback_transport_log
+    local rollback_transport_pid
+    local rollback_transport_ready
+    local rollback_transport_release
+    local rollback_transport_report
     local forward_switch_started_at_ms
     local forward_applied_at_ms
     local rollback_switch_started_at_ms
@@ -1250,9 +1287,16 @@ main() {
     traefik_before_switch_started_at=$(traefik_started_at "$traefik_id")
 
     start_transport_observer forward backend-blue "$BACKEND_BLUE_STATE_DIR"
-    wait_for_transport_observer_ready forward
+    forward_transport_log=$TRANSPORT_OBSERVER_LOG
+    forward_transport_pid=$TRANSPORT_OBSERVER_PID
+    forward_transport_ready=$TRANSPORT_OBSERVER_READY
+    forward_transport_release=$TRANSPORT_OBSERVER_RELEASE
+    forward_transport_report=$TRANSPORT_OBSERVER_REPORT
+    forward_transition_barrier="$TEMP_DIRECTORY/forward-transition-barrier.json"
+    rm -f -- "$forward_transition_barrier"
+    wait_for_transport_observer_ready forward "$forward_transport_ready" "$forward_transport_log"
     switch_observer_log="$TEMP_DIRECTORY/switch-traffic.log"
-    start_transition_observer "$switch_observer_log" "$TRANSPORT_OBSERVER_RELEASE"
+    start_transition_observer "$switch_observer_log" "$forward_transition_barrier"
     switch_observer_pid=$TRANSITION_OBSERVER_PID
     wait_for_observer_samples "$switch_observer_log"
     forward_switch_started_at_ms=$(now_ms)
@@ -1262,10 +1306,7 @@ main() {
     assert_transport_http https green "$green_color" "$green_generation" "$green_dynamic_sha"
     assert_transport_http app-port green "$green_color" "$green_generation" "$green_dynamic_sha"
     forward_applied_at_ms=$(now_ms)
-    publish_transport_release forward "$forward_applied_at_ms"
-    wait_for_transport_observer forward
-    assert_transport_continuity "$TRANSPORT_OBSERVER_REPORT" forward 0 "$forward_switch_started_at_ms" "$forward_applied_at_ms" \
-        blue "$blue_final_color" "$blue_final_generation" "$blue_final_dynamic_sha"
+    publish_transport_release forward "$forward_applied_at_ms" "$forward_transition_barrier"
     if ! wait_for_registered_background_pid "$switch_observer_pid"; then
         fail 'Forward transition observer terminated before crossing the applied-config barrier'
     fi
@@ -1275,9 +1316,14 @@ main() {
     assert_traefik_unchanged "$traefik_id" "$traefik_before_switch_started_at"
 
     start_transport_observer rollback backend-green "$BACKEND_GREEN_STATE_DIR"
-    wait_for_transport_observer_ready rollback
+    rollback_transport_log=$TRANSPORT_OBSERVER_LOG
+    rollback_transport_pid=$TRANSPORT_OBSERVER_PID
+    rollback_transport_ready=$TRANSPORT_OBSERVER_READY
+    rollback_transport_release=$TRANSPORT_OBSERVER_RELEASE
+    rollback_transport_report=$TRANSPORT_OBSERVER_REPORT
+    wait_for_transport_observer_ready rollback "$rollback_transport_ready" "$rollback_transport_log"
     rollback_observer_log="$TEMP_DIRECTORY/rollback-traffic.log"
-    start_transition_observer "$rollback_observer_log" "$TRANSPORT_OBSERVER_RELEASE"
+    start_transition_observer "$rollback_observer_log" "$rollback_transport_release"
     rollback_observer_pid=$TRANSITION_OBSERVER_PID
     wait_for_observer_samples "$rollback_observer_log"
     rollback_switch_started_at_ms=$(now_ms)
@@ -1287,9 +1333,9 @@ main() {
     assert_transport_http https blue "$blue_final_color" "$blue_final_generation" "$blue_final_dynamic_sha"
     assert_transport_http app-port blue "$blue_final_color" "$blue_final_generation" "$blue_final_dynamic_sha"
     rollback_applied_at_ms=$(now_ms)
-    publish_transport_release rollback "$rollback_applied_at_ms"
-    wait_for_transport_observer rollback
-    assert_transport_continuity "$TRANSPORT_OBSERVER_REPORT" rollback "$forward_applied_at_ms" "$rollback_switch_started_at_ms" "$rollback_applied_at_ms" \
+    publish_transport_release rollback "$rollback_applied_at_ms" "$rollback_transport_release"
+    wait_for_transport_observer rollback "$rollback_transport_pid" "$rollback_transport_log" "$rollback_transport_report"
+    assert_transport_continuity "$rollback_transport_report" rollback "$forward_applied_at_ms" "$rollback_switch_started_at_ms" "$rollback_applied_at_ms" \
         green "$green_color" "$green_generation" "$green_dynamic_sha"
     if ! wait_for_registered_background_pid "$rollback_observer_pid"; then
         fail 'Rollback transition observer terminated before crossing the applied-config barrier'
@@ -1299,6 +1345,11 @@ main() {
         "$blue_final_color" "$blue_final_generation" "$blue_final_acknowledgement" "$blue_final_dynamic_sha" blue green "$rollback_applied_at_ms"
     assert_traefik_unchanged "$traefik_id" "$traefik_before_switch_started_at"
     assert_exact_dynamic_snapshot "$blue_final_snapshot"
+    publish_transport_release full-cycle "$rollback_applied_at_ms" "$forward_transport_release"
+    wait_for_transport_observer full-cycle "$forward_transport_pid" "$forward_transport_log" "$forward_transport_report"
+    assert_full_cycle_transport_continuity "$forward_transport_report" \
+        "$forward_switch_started_at_ms" "$forward_applied_at_ms" "$rollback_switch_started_at_ms" "$rollback_applied_at_ms" \
+        blue "$blue_final_color" "$blue_final_generation" "$blue_final_dynamic_sha"
 
     restart_started_at=$(traefik_started_at "$traefik_id")
     compose restart traefik
