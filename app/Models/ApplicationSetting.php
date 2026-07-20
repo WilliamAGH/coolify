@@ -147,9 +147,8 @@ class ApplicationSetting extends Model
         return Attribute::make(
             set: function ($value) {
                 if ($value) {
-                    $this->application->ports_exposes = 80;
+                    $this->application()->update(['ports_exposes' => 80]);
                 }
-                $this->application->save();
 
                 return $value;
             }
