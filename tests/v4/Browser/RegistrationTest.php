@@ -1,16 +1,12 @@
 <?php
 
-use App\Models\InstanceSettings;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
-    InstanceSettings::unguarded(fn () => InstanceSettings::query()->create([
-        'id' => 0,
-        'is_sponsorship_popup_enabled' => false,
-    ]));
+    seedBrowserInstanceSettings();
 });
 
 it('shows registration page when no users exist', function () {

@@ -2,7 +2,6 @@
 
 use App\Enums\ProxyStatus;
 use App\Enums\ProxyTypes;
-use App\Models\InstanceSettings;
 use App\Models\PrivateKey;
 use App\Models\Project;
 use App\Models\Server;
@@ -13,7 +12,7 @@ use Illuminate\Support\Facades\Hash;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
-    InstanceSettings::create(['id' => 0, 'is_sponsorship_popup_enabled' => false]);
+    seedBrowserInstanceSettings();
 
     // Create root/owner user
     $this->user = User::factory()->create([
