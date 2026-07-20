@@ -2,9 +2,12 @@
 
 namespace App\Models;
 
+use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
 use Illuminate\Contracts\Encryption\DecryptException;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use OpenApi\Attributes as OA;
 
@@ -108,6 +111,8 @@ class ServerSetting extends Model
         'docker_cleanup_threshold' => 'integer',
         'sentinel_token' => 'encrypted',
         'is_reachable' => 'boolean',
+        'is_swarm_manager' => 'boolean',
+        'is_swarm_worker' => 'boolean',
         'is_usable' => 'boolean',
         'is_build_server' => 'boolean',
         'is_terminal_enabled' => 'boolean',
@@ -154,6 +159,32 @@ class ServerSetting extends Model
                 $settings->server->restartSentinel();
             }
         });
+    }
+
+    protected function performUpdate(Builder $query): bool
+    {
+        if (! $this->isDirty(['server_id', 'is_swarm_manager', 'is_swarm_worker'])) {
+            return parent::performUpdate($query);
+        }
+
+        return DB::transaction(function () use ($query): bool {
+            BlueGreenTopologyLock::acquire();
+            if ($this->isDirty('server_id')) {
+                throw new \RuntimeException('Server settings cannot be reassigned to another server after creation.');
+            }
+
+            $wasSwarm = (bool) $this->getOriginal('is_swarm_manager')
+                || (bool) $this->getOriginal('is_swarm_worker');
+            $willBeSwarm = (bool) $this->is_swarm_manager || (bool) $this->is_swarm_worker;
+            if (! $wasSwarm && $willBeSwarm) {
+                $this->server->assertBlueGreenTopologyCanChange(
+                    willBeSwarm: true,
+                    proxyType: $this->server->proxyType(),
+                );
+            }
+
+            return parent::performUpdate($query);
+        }, attempts: 5);
     }
 
     /**
