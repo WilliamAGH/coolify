@@ -2207,9 +2207,10 @@ main() {
     write_identity "$BACKEND_GREEN_STATE_DIR" "$blue_initial_color" "$blue_initial_generation" "$initial_dynamic_sha"
     touch "$BACKEND_BLUE_STATE_DIR/healthy" "$BACKEND_GREEN_STATE_DIR/healthy"
     compose config -q
+    compose pull
     COMPOSE_STARTED=1
     COMPOSE_STARTED_AT_MS=$(now_ms)
-    compose up -d --remove-orphans
+    compose up -d --remove-orphans --pull never
     [ "$(docker inspect --format '{{.Config.Image}}' "$(traefik_container_id)")" = "$TRAEFIK_IMAGE" ] \
         || fail 'Traefik did not start from the exact versions.json image'
     atomic_replace_snapshot "$initial_snapshot"
