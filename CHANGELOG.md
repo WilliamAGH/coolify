@@ -75,6 +75,7 @@ All notable changes to this project will be documented in this file.
 - *(release)* Restore dedicated ruleset audit authority
 - *(blue-green)* Preserve continuous fixed-color promotion
 - *(release)* Remove undeployed ruleset secret dependency
+- *(blue-green)* Recover prepared activations safely
 
 ### 💼 Other
 
@@ -110,6 +111,7 @@ All notable changes to this project will be documented in this file.
 - Update changelog (#96)
 - Update changelog (#99)
 - Clarify Docker SSOT clean preserves non-lab resources
+- Update changelog (#100)
 
 ### 🎨 Styling
 
