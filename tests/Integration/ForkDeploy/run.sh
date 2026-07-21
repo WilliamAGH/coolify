@@ -543,6 +543,25 @@ test_real_compose_config_when_available() {
     else
         fail 'real production Compose selects the staged environment'
     fi
+
+    if output=$(
+        unset COOLIFY_ENV_FILE
+        "$REAL_DOCKER" compose \
+            --env-file "$staged_environment" \
+            --file "$REPO_ROOT/docker-compose.yml" \
+            --file "$REPO_ROOT/docker-compose.prod.yml" \
+            config --no-env-resolution --format json 2>&1
+    ) \
+        && jq -e '
+            ([.services.coolify.volumes[]
+                | select(.target == "/var/www/html/.env"
+                    and .source == "/data/coolify/source/.env")] | length) == 1
+            and .services.coolify.env_file == [{"path": "/data/coolify/source/.env"}]
+        ' <<<"$output" >/dev/null; then
+        pass 'real production Compose preserves the generic environment default'
+    else
+        fail 'real production Compose preserves the generic environment default'
+    fi
     cleanup_fixture
 }
 
