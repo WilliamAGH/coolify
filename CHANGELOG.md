@@ -87,6 +87,7 @@ All notable changes to this project will be documented in this file.
 - *(blue-green)* Separate claim and runtime route digests
 - *(blue-green)* Complete probe and release proof contracts
 - *(blue-green)* Recover prepared activations safely
+- *(ci)* Keep fallback validation annotation-free
 
 ### 💼 Other
 
@@ -124,6 +125,7 @@ All notable changes to this project will be documented in this file.
 - Clarify Docker SSOT clean preserves non-lab resources
 - Update changelog (#100)
 - Update changelog (#102)
+- Update changelog (#103)
 
 ### 🎨 Styling
 
