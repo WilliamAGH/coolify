@@ -375,7 +375,7 @@ function remove_iip($text)
  */
 function sanitize_utf8_text(?string $text): string
 {
-    if (empty($text)) {
+    if ($text === null || $text === '') {
         return '';
     }
 
