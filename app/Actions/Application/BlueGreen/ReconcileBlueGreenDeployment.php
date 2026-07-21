@@ -182,13 +182,14 @@ final class ReconcileBlueGreenDeployment
                         || $replacementState->applicationRoutingConfigDigest !== $operation->claim->routingConfigDigest) {
                         throw new BlueGreenDeploymentTransitionException('The discovered routing mutation does not target the exact claimed candidate.');
                     }
-                    $attestation = trim((string) instant_remote_process([
+                    $attestation = trim((string) instant_privileged_remote_script(
                         (new WriteBlueGreenProxyConfiguration)->attestStateCommandFor(
                             $operation->server->proxyPath(),
                             $replacementState->managedFilename,
                             $replacementState,
                         ),
-                    ], $operation->server));
+                        $operation->server,
+                    ));
                     if ($attestation !== 'coolify-blue-green-destination-state-attested') {
                         throw new BlueGreenDeploymentTransitionException('The discovered remote routing mutation did not attest its exact state.');
                     }

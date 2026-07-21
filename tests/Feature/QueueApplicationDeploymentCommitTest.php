@@ -795,3 +795,63 @@ describe('ApplicationDeploymentQueue stale dispatch recovery', function () {
             ->and($thirdDeployment->fresh()->updated_at->lt(now()->subMinutes(5)))->toBeTrue();
     });
 });
+
+describe('activation job queue restore', function () {
+    test('rehydrates parent private deployment context after SerializesModels restore', function () {
+        $application = makeApplication($this->environment->id, $this->destination->id, null);
+        $deployment = makeQueueAdmissionDeployment($application, $this->server, 'activate-queue-restore');
+        $deployment->update([
+            'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+            'execution_phase' => ApplicationDeploymentExecutionPhase::Activate,
+            'horizon_job_id' => $attempt = (string) Str::uuid(),
+        ]);
+
+        $job = new ActivateApplicationDeploymentJob($deployment->id, $attempt);
+        $payload = $job->__serialize();
+
+        // SerializesModels only reflects the concrete class, so parent private state is absent.
+        expect(array_key_exists("\0".ActivateApplicationDeploymentJob::class."\0application_deployment_queue", $payload))->toBeFalse()
+            ->and(array_key_exists("\0".ApplicationDeploymentJob::class."\0application_deployment_queue", $payload))->toBeFalse();
+
+        $restored = (new ReflectionClass(ActivateApplicationDeploymentJob::class))->newInstanceWithoutConstructor();
+        $restored->__unserialize($payload);
+
+        $queueProperty = new ReflectionProperty(ApplicationDeploymentJob::class, 'application_deployment_queue');
+        expect($queueProperty->isInitialized($restored))->toBeFalse();
+
+        $hydrate = new ReflectionMethod(ApplicationDeploymentJob::class, 'hydrateDeploymentContext');
+        $hydrate->invoke($restored);
+
+        expect($queueProperty->isInitialized($restored))->toBeTrue()
+            ->and($queueProperty->getValue($restored)->id)->toBe($deployment->id)
+            ->and($restored->application_deployment_queue_id)->toBe($deployment->id);
+    });
+
+    test('failed rehydrates before preserving a newer dispatch owner', function () {
+        $application = makeApplication($this->environment->id, $this->destination->id, null);
+        $deployment = makeQueueAdmissionDeployment($application, $this->server, 'activate-failed-rehydrate');
+        $deployment->update([
+            'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+            'execution_phase' => ApplicationDeploymentExecutionPhase::Activate,
+            'horizon_job_id' => $attempt = (string) Str::uuid(),
+        ]);
+
+        $job = new ActivateApplicationDeploymentJob($deployment->id, $attempt);
+        $payload = $job->__serialize();
+        $restored = (new ReflectionClass(ActivateApplicationDeploymentJob::class))->newInstanceWithoutConstructor();
+        $restored->__unserialize($payload);
+        $newerAttempt = (string) Str::uuid();
+        $deployment->update(['horizon_job_id' => $newerAttempt]);
+
+        $queueProperty = new ReflectionProperty(ApplicationDeploymentJob::class, 'application_deployment_queue');
+        expect($queueProperty->isInitialized($restored))->toBeFalse();
+
+        $restored->failed(new RuntimeException('stale activation failure must not win'));
+
+        expect($queueProperty->isInitialized($restored))->toBeTrue()
+            ->and($queueProperty->getValue($restored)->id)->toBe($deployment->id)
+            ->and($deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+            ->and($deployment->fresh()->execution_phase)->toBe(ApplicationDeploymentExecutionPhase::Activate)
+            ->and($deployment->fresh()->horizon_job_id)->toBe($newerAttempt);
+    });
+});

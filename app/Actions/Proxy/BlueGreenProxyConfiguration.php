@@ -8,11 +8,15 @@ final readonly class BlueGreenProxyConfiguration
 {
     public string $routingConfigDigest;
 
+    /**
+     * @param  array{routers: array<string, string>, services: array<string, array<string, mixed>>}|null  $probeOnlyContract
+     */
     public function __construct(
         public string $managedFilename,
         public string $yaml,
         public string $sha256,
         public BlueGreenProxyState $state,
+        public ?array $probeOnlyContract = null,
     ) {
         self::assertManagedFilename($managedFilename);
         if ($state->managedFilename !== $managedFilename

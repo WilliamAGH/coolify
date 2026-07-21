@@ -11,6 +11,7 @@ class ServerFactory extends Factory
         return [
             'name' => fake()->unique()->name(),
             'ip' => fake()->unique()->ipv4(),
+            'user' => 'root',
             'private_key_id' => 1,
         ];
     }

@@ -14,9 +14,12 @@ class ExecuteBlueGreenDeactivationRemoteCommand
 
     public function handle(Server $server, string $command): string
     {
-        $result = $this->decode((string) instant_remote_process([
+        $result = $this->decode((string) instant_privileged_remote_script(
             $this->commandFor($command),
-        ], $server, timeout: BlueGreenDeploymentLock::deactivationRemoteTimeoutSeconds(), retry: false));
+            $server,
+            timeout: BlueGreenDeploymentLock::deactivationRemoteTimeoutSeconds(),
+            retry: false,
+        ));
         if ($result->outcome === BlueGreenDeactivationRemoteOutcome::Deferred) {
             $detail = trim($result->output);
             throw new BlueGreenDeactivationInProgressException(

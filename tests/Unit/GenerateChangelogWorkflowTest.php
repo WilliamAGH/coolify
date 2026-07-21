@@ -29,6 +29,7 @@ it('updates the protected changelog through a validated pull request', function 
         ->toContain('git push --force-with-lease=')
         ->toContain('gh pr create')
         ->toContain('gh workflow run application-validation.yml')
+        ->toContain('-f source_sha="${head_sha}"')
         ->toContain('gh run watch "${validation_run_id}" --exit-status')
         ->toContain('statuses/${head_sha}')
         ->toContain("context='Application validation required'")
@@ -42,5 +43,12 @@ it('updates the protected changelog through a validated pull request', function 
 it('allows changelog pull requests to dispatch required validation', function () {
     $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
 
-    expect($workflow['on'])->toHaveKey('workflow_dispatch');
+    expect($workflow['on'])->toHaveKey('workflow_dispatch')
+        ->and($workflow['on']['workflow_dispatch']['inputs']['source_sha'] ?? null)
+        ->toMatchArray([
+            'description' => 'Exact commit SHA to validate',
+            'required' => false,
+            'type' => 'string',
+            'default' => '',
+        ]);
 });

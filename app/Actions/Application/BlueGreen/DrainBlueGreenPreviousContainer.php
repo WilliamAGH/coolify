@@ -26,9 +26,10 @@ final class DrainBlueGreenPreviousContainer
         $this->portHexes($backendPort);
 
         InspectBlueGreenContainer::run($server, $expectation);
-        $output = trim((string) instant_remote_process([
+        $output = trim((string) instant_privileged_remote_script(
             $this->observationCommandFor($expectation, $backendPort),
-        ], $server));
+            $server,
+        ));
         if (preg_match('/^\d+$/D', $output) !== 1) {
             throw new RuntimeException('Blue-green drain observation returned a malformed active-connection count.');
         }

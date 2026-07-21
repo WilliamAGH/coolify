@@ -61,6 +61,8 @@ jobs:
     uses: ./.github/workflows/application-validation.yml
     permissions:
       contents: read
+    with:
+      source_sha: ${{ github.sha }}
 
   publish:
     name: Build and publish staging Linux image

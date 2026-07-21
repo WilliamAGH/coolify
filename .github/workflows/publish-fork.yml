@@ -4,7 +4,6 @@ on:
   push:
     tags:
       - '*.*.*-fork'
-  workflow_dispatch:
 
 permissions: {}
 
@@ -13,64 +12,42 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  application-validation:
-    uses: ./.github/workflows/application-validation.yml
-    permissions:
-      contents: read
-
   resolve-tag:
-    name: Resolve protected fork publication source
-    needs: application-validation
+    name: Bind fork version tag to source commit
     permissions:
       contents: read
     runs-on: ubuntu-24.04
     outputs:
+      source_revision: ${{ steps.version.outputs.source_revision }}
       version: ${{ steps.version.outputs.version }}
-      source_is_tag: ${{ steps.version.outputs.source_is_tag }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.sha }}
 
       - id: version
-        name: Resolve a protected fork source and application version
+        name: Require an exact fork tag and commit binding
         env:
-          EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
           REF_NAME: ${{ github.ref_name }}
-          REF_PROTECTED: ${{ github.ref_protected }}
           REF_TYPE: ${{ github.ref_type }}
           SOURCE_REVISION: ${{ github.sha }}
           VERSION_PATTERN: '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-fork$'
         run: |
           set -Eeuo pipefail
+          [[ "$REF_TYPE" == tag ]]
+          [[ "$REF" == "refs/tags/$REF_NAME" ]]
+          printf '%s' "$REF_NAME" | grep -Eq "$VERSION_PATTERN"
           printf '%s' "$SOURCE_REVISION" | grep -Eq '^[0-9a-f]{40}$'
+          scripts/ci/verify-fork-release-tag.sh \
+            "$REF_NAME" "$SOURCE_REVISION" \
+            "https://github.com/$GITHUB_REPOSITORY.git" \
+            docker/fork-release-tag-allowed-signers
           [[ "$(git cat-file -t "$SOURCE_REVISION")" == commit ]]
           git fetch --no-tags origin '+refs/heads/v4.x:refs/remotes/origin/v4.x'
           trusted_default_branch="$(git rev-parse --verify 'refs/remotes/origin/v4.x^{commit}')"
-
-          case "$EVENT_NAME:$REF_TYPE" in
-            push:tag)
-              [[ "$REF" == "refs/tags/$REF_NAME" ]]
-              printf '%s' "$REF_NAME" | grep -Eq "$VERSION_PATTERN"
-              [[ "$(git rev-parse --verify "${REF}^{commit}")" == "$SOURCE_REVISION" ]]
-              git merge-base --is-ancestor "$SOURCE_REVISION" "$trusted_default_branch"
-              source_is_tag=true
-              ;;
-            workflow_dispatch:branch)
-              [[ "$REF" == 'refs/heads/v4.x' ]]
-              [[ "$REF_NAME" == v4.x ]]
-              [[ "$REF_PROTECTED" == true ]]
-              [[ "$SOURCE_REVISION" == "$trusted_default_branch" ]]
-              source_is_tag=false
-              ;;
-            *)
-              printf 'Fork publication requires a push tag or a protected v4.x workflow_dispatch source.\n' >&2
-              exit 1
-              ;;
-          esac
+          git merge-base --is-ancestor "$SOURCE_REVISION" "$trusted_default_branch"
 
           command -v php >/dev/null
           command -v jq >/dev/null
@@ -85,28 +62,30 @@ jobs:
             echo $version;
           ' config/constants.php)"
           versions_json_version="$(jq -er '.coolify.v4.version | strings' versions.json)"
-          [[ "$constants_version" == "$versions_json_version" ]] || {
-            printf 'config/constants.php and versions.json must declare the same fork version: found %s and %s.\n' \
-              "$constants_version" "$versions_json_version" >&2
+          [[ "$constants_version" == "$REF_NAME" ]] || {
+            printf 'config/constants.php Coolify version must equal the fork tag: expected %s, found %s.\n' \
+              "$REF_NAME" "$constants_version" >&2
             exit 1
           }
-          printf '%s' "$constants_version" | grep -Eq "$VERSION_PATTERN"
-          if [[ "$source_is_tag" == true ]]; then
-            [[ "$constants_version" == "$REF_NAME" ]] || {
-              printf 'config/constants.php Coolify version must equal the fork tag: expected %s, found %s.\n' \
-                "$REF_NAME" "$constants_version" >&2
-              exit 1
-            }
-          fi
+          [[ "$versions_json_version" == "$REF_NAME" ]] || {
+            printf 'versions.json Coolify v4 version must equal the fork tag: expected %s, found %s.\n' \
+              "$REF_NAME" "$versions_json_version" >&2
+            exit 1
+          }
+          printf 'source_revision=%s\n' "$SOURCE_REVISION" >> "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "$REF_NAME" >> "$GITHUB_OUTPUT"
 
-          {
-            printf 'version=%s\n' "$constants_version"
-            printf 'source_is_tag=%s\n' "$source_is_tag"
-          } >> "$GITHUB_OUTPUT"
+  application-validation:
+    needs: resolve-tag
+    uses: ./.github/workflows/application-validation.yml
+    permissions:
+      contents: read
+    with:
+      source_sha: ${{ needs.resolve-tag.outputs.source_revision }}
 
   publish:
     name: Build, attest, and coordinate fork publication
-    needs: resolve-tag
+    needs: [resolve-tag, application-validation]
     concurrency:
       group: linux-image-release-williamagh/coolify
       cancel-in-progress: false
@@ -124,10 +103,10 @@ jobs:
       publish_latest: false
       release_kind: fork
       semantic_version: ${{ needs.resolve-tag.outputs.version }}
-      source_is_tag: ${{ needs.resolve-tag.outputs.source_is_tag == 'true' }}
       target_repository: williamagh/coolify
       validate_only: false
     secrets:
+      FORK_RELEASE_RULESET_TOKEN: ${{ secrets.FORK_RELEASE_RULESET_TOKEN }}
       FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY: ${{ secrets.FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY }}
       NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
       NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}

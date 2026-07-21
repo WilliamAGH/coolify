@@ -27,7 +27,7 @@ final class ExecuteBlueGreenDestinationMutation
         array $completionCommands,
         string $expectedServerBootId,
     ): void {
-        instant_remote_process([
+        instant_privileged_remote_script(
             $this->commandFor(
                 $server->proxyPath(),
                 $expectedState,
@@ -36,7 +36,8 @@ final class ExecuteBlueGreenDestinationMutation
                 $completionCommands,
                 $expectedServerBootId,
             ),
-        ], $server);
+            $server,
+        );
     }
 
     public function replacementStateFor(

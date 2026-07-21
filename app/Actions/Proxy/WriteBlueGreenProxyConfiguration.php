@@ -5,6 +5,7 @@ namespace App\Actions\Proxy;
 use App\Enums\ProxyTypes;
 use App\Models\Server;
 use InvalidArgumentException;
+use JsonException;
 use Lorisleiva\Actions\Concerns\AsAction;
 use RuntimeException;
 use Symfony\Component\Yaml\Yaml;
@@ -25,6 +26,8 @@ class WriteBlueGreenProxyConfiguration
 
     private const PROBE_HEADER = 'X-Coolify-Blue-Green-Probe';
 
+    private const PROBE_ONLY_CONTRACT_METADATA = 'coolify.probe-only-contract';
+
     public function handle(
         Server $server,
         BlueGreenProxyConfiguration $configuration,
@@ -32,9 +35,10 @@ class WriteBlueGreenProxyConfiguration
         string $expectedBootId,
     ): BlueGreenProxyRollbackArtifact {
         $this->assertTraefik($server);
-        $output = instant_remote_process([
+        $output = instant_privileged_remote_script(
             $this->commandFor($server->proxyPath(), $configuration, $rollbackKey, $expectedBootId),
-        ], $server);
+            $server,
+        );
 
         return BlueGreenProxyRollbackArtifact::fromRemoteOutput($rollbackKey, $output ?? '');
     }
@@ -71,9 +75,10 @@ class WriteBlueGreenProxyConfiguration
         string $expectedBootId,
     ): string {
         $this->assertTraefik($server);
-        $output = trim((string) instant_remote_process([
+        $output = trim((string) instant_privileged_remote_script(
             $this->repairCommandFor($server->proxyPath(), $configuration, $expectedBootId),
-        ], $server));
+            $server,
+        ));
         if (! in_array($output, [
             self::REPAIR_HEALTHY_OUTPUT,
             self::REPAIR_MISSING_OUTPUT,
@@ -420,54 +425,118 @@ class WriteBlueGreenProxyConfiguration
         }
         $routers = $parsed['http']['routers'];
         $services = $parsed['http']['services'];
-        $routerName = count($routers) === 1 ? array_key_first($routers) : null;
-        $isSingletonProbeDocument = is_string($routerName) && str_ends_with($routerName, '-probe');
-        if (($services === [] && ! $this->isGuardedSingletonProbeOnlyDocument($configuration, $parsed['http']))
-            || ($services !== [] && $isSingletonProbeDocument)) {
+        $metadataProbeOnlyContract = $this->probeOnlyContract($configuration->yaml);
+        $trustedProbeOnlyContract = $configuration->probeOnlyContract;
+        if ($metadataProbeOnlyContract !== null || $trustedProbeOnlyContract !== null) {
+            if (is_array($metadataProbeOnlyContract)
+                && is_array($trustedProbeOnlyContract)
+                && $metadataProbeOnlyContract === $trustedProbeOnlyContract
+                && $this->isGuardedProbeOnlyDocument($configuration, $parsed['http'], $trustedProbeOnlyContract)) {
+                return;
+            }
+
+            throw new InvalidArgumentException('Blue/green proxy configuration must contain HTTP routers and services.');
+        }
+        if ($this->isLegacyGuardedSingletonProbeOnlyDocument($configuration, $parsed['http'])) {
+            return;
+        }
+        if ($services === [] || $this->isProbeShapedDocument($configuration, $parsed['http'])) {
             throw new InvalidArgumentException('Blue/green proxy configuration must contain HTTP routers and services.');
         }
     }
 
     /** @param array<string, mixed> $http */
-    private function isGuardedSingletonProbeOnlyDocument(
+    private function isGuardedProbeOnlyDocument(
         BlueGreenProxyConfiguration $configuration,
         array $http,
+        array $contract,
     ): bool {
         $routers = $http['routers'];
         $middlewares = $http['middlewares'] ?? null;
-        if (count($routers) !== 1 || ! is_array($middlewares) || count($middlewares) !== 1) {
+        $services = $http['services'] ?? null;
+        if ($routers === []
+            || ! is_array($middlewares)
+            || $middlewares === []
+            || ! is_array($services)
+            || array_diff(array_keys($contract), ['routers', 'services']) !== []
+            || ! is_array($contract['routers'] ?? null)
+            || $contract['routers'] === []
+            || ! is_array($contract['services'] ?? null)) {
             return false;
         }
 
-        $routerName = array_key_first($routers);
-        $router = $routers[$routerName] ?? null;
         $state = $configuration->state;
-        if (! is_string($routerName) || ! is_array($router) || $state->activeColor === null) {
+        if ($state->activeColor === null || $state->operationId === null) {
             return false;
         }
 
         $namePrefix = BlueGreenRoutingTarget::routingNamePrefix($state->applicationUuid, $state->destinationId);
         $probeMiddlewareName = $namePrefix.'probe-header-strip';
-        $expectedService = BlueGreenRoutingTarget::memberServiceReference(
+        $memberBase = BlueGreenRoutingTarget::memberServiceName(
             $state->applicationUuid,
             $state->destinationId,
             $state->activeColor,
         );
         $expectedGuard = 'Header(`'.self::PROBE_HEADER.'`, `'.BlueGreenRoutingTarget::durableProbeToken($state->operationId).'`)';
-        $rule = $router['rule'] ?? null;
-        $entryPoints = $router['entryPoints'] ?? null;
-        if (preg_match('/^'.preg_quote($namePrefix, '/').'[A-Za-z0-9_-]+-probe$/D', $routerName) !== 1
-            || ($router['service'] ?? null) !== $expectedService
-            || ! is_string($rule)
-            || preg_match('/^\(.+\) && '.preg_quote($expectedGuard, '/').'$/D', $rule) !== 1
-            || ! is_array($entryPoints)
-            || ! array_is_list($entryPoints)
-            || $entryPoints === []
-            || array_filter($entryPoints, static fn (mixed $entryPoint): bool => ! is_string($entryPoint) || $entryPoint === '') !== []
-            || ($router['middlewares'] ?? null) !== [$probeMiddlewareName]
-            || array_diff(array_keys($router), ['rule', 'entryPoints', 'service', 'middlewares', 'tls']) !== []
-            || array_keys($middlewares) !== [$probeMiddlewareName]) {
+        $expectedRouterServices = $contract['routers'];
+        $expectedServices = $contract['services'];
+        $actualRouterNames = array_keys($routers);
+        $expectedRouterNames = array_keys($expectedRouterServices);
+        sort($actualRouterNames);
+        sort($expectedRouterNames);
+        if ($actualRouterNames !== $expectedRouterNames
+            || ! array_key_exists($probeMiddlewareName, $middlewares)) {
             return false;
+        }
+
+        $referencedServices = [];
+        foreach ($expectedRouterServices as $routerName => $serviceName) {
+            if (! is_string($routerName)
+                || ! is_string($serviceName)
+                || ! isset($routers[$routerName])
+                || ! $this->isCanonicalProbeRouter(
+                    router: $routers[$routerName],
+                    routerName: $routerName,
+                    serviceName: $serviceName,
+                    namePrefix: $namePrefix,
+                    expectedGuard: $expectedGuard,
+                    probeMiddlewareName: $probeMiddlewareName,
+                    middlewares: $middlewares,
+                )) {
+                return false;
+            }
+            $fileServiceName = $this->fileServiceNameForProbeReference($serviceName);
+            if ($fileServiceName === null) {
+                return false;
+            }
+            $referencedServices[$fileServiceName] = true;
+        }
+
+        $expectedServiceNames = array_keys($expectedServices);
+        $referencedServiceNames = array_keys($referencedServices);
+        sort($expectedServiceNames);
+        sort($referencedServiceNames);
+        if ($expectedServiceNames !== $referencedServiceNames) {
+            return false;
+        }
+        $actualServices = $services;
+        $contractServices = $expectedServices;
+        ksort($actualServices);
+        ksort($contractServices);
+        if ($actualServices !== $contractServices) {
+            return false;
+        }
+        foreach ($contractServices as $serviceName => $service) {
+            if (! is_string($serviceName)
+                || ! is_array($service)
+                || ! $this->isCanonicalProbeFileService(
+                    serviceName: $serviceName,
+                    service: $service,
+                    memberBase: $memberBase,
+                    requiresPortSpecificName: count($contractServices) > 1,
+                )) {
+                return false;
+            }
         }
 
         $acknowledgement = $middlewares[$probeMiddlewareName]['headers']['customResponseHeaders'][BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER] ?? null;
@@ -482,6 +551,220 @@ class WriteBlueGreenProxyConfiguration
                     ],
                 ],
             ];
+    }
+
+    /** @param array<string, mixed> $http */
+    private function isLegacyGuardedSingletonProbeOnlyDocument(
+        BlueGreenProxyConfiguration $configuration,
+        array $http,
+    ): bool {
+        $routers = $http['routers'];
+        $middlewares = $http['middlewares'] ?? null;
+        $services = $http['services'] ?? null;
+        $state = $configuration->state;
+        if (count($routers) !== 1
+            || ! is_array($middlewares)
+            || $middlewares === []
+            || $services !== []
+            || $state->activeColor === null
+            || $state->operationId === null) {
+            return false;
+        }
+
+        $namePrefix = BlueGreenRoutingTarget::routingNamePrefix($state->applicationUuid, $state->destinationId);
+        $probeMiddlewareName = $namePrefix.'probe-header-strip';
+        $routerName = array_key_first($routers);
+        $router = is_string($routerName) ? ($routers[$routerName] ?? null) : null;
+        if (! is_string($routerName)
+            || ! is_array($router)
+            || ! array_key_exists($probeMiddlewareName, $middlewares)
+            || ! $this->isCanonicalProbeRouter(
+                router: $router,
+                routerName: $routerName,
+                serviceName: BlueGreenRoutingTarget::memberServiceReference(
+                    $state->applicationUuid,
+                    $state->destinationId,
+                    $state->activeColor,
+                ),
+                namePrefix: $namePrefix,
+                expectedGuard: 'Header(`'.self::PROBE_HEADER.'`, `'.BlueGreenRoutingTarget::durableProbeToken($state->operationId).'`)',
+                probeMiddlewareName: $probeMiddlewareName,
+                middlewares: $middlewares,
+            )) {
+            return false;
+        }
+
+        return $this->hasProbeAcknowledgement($middlewares, $probeMiddlewareName);
+    }
+
+    /** @param array<string, mixed> $http */
+    private function isProbeShapedDocument(BlueGreenProxyConfiguration $configuration, array $http): bool
+    {
+        $routers = $http['routers'];
+        $middlewares = $http['middlewares'] ?? null;
+        $services = $http['services'] ?? null;
+        $state = $configuration->state;
+        $namePrefix = BlueGreenRoutingTarget::routingNamePrefix($state->applicationUuid, $state->destinationId);
+        if (is_array($middlewares) && array_key_exists($namePrefix.'probe-header-strip', $middlewares)) {
+            return true;
+        }
+        foreach ($routers as $routerName => $router) {
+            if ((is_string($routerName) && str_ends_with($routerName, '-probe'))
+                || (is_array($router)
+                    && is_string($router['rule'] ?? null)
+                    && str_contains($router['rule'], 'Header(`'.self::PROBE_HEADER.'`'))) {
+                return true;
+            }
+        }
+        if (count($routers) < 2 || ! is_array($services) || $services === [] || $state->activeColor === null) {
+            return false;
+        }
+
+        $memberBase = BlueGreenRoutingTarget::memberServiceName(
+            $state->applicationUuid,
+            $state->destinationId,
+            $state->activeColor,
+        );
+        foreach (array_keys($services) as $serviceName) {
+            if (! is_string($serviceName)
+                || preg_match('/^'.preg_quote($memberBase, '/').'(?:-[1-9][0-9]{0,4})?$/D', $serviceName) !== 1) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /** @param array<string, mixed> $router @param array<string, mixed> $middlewares */
+    private function isCanonicalProbeRouter(
+        array $router,
+        string $routerName,
+        string $serviceName,
+        string $namePrefix,
+        string $expectedGuard,
+        string $probeMiddlewareName,
+        array $middlewares,
+    ): bool {
+        $rule = $router['rule'] ?? null;
+        $entryPoints = $router['entryPoints'] ?? null;
+        $routerMiddlewares = $router['middlewares'] ?? null;
+        if (preg_match('/^'.preg_quote($namePrefix, '/').'[A-Za-z0-9_-]+-probe$/D', $routerName) !== 1
+            || ($router['service'] ?? null) !== $serviceName
+            || ! is_string($rule)
+            || preg_match('/^\(.+\) && '.preg_quote($expectedGuard, '/').'$/D', $rule) !== 1
+            || ! is_array($entryPoints)
+            || ! array_is_list($entryPoints)
+            || $entryPoints === []
+            || array_filter($entryPoints, static fn (mixed $entryPoint): bool => ! is_string($entryPoint) || $entryPoint === '') !== []
+            || ! is_array($routerMiddlewares)
+            || ! array_is_list($routerMiddlewares)
+            || $routerMiddlewares === []
+            || ($routerMiddlewares[0] ?? null) !== $probeMiddlewareName
+            || array_diff(array_keys($router), ['rule', 'entryPoints', 'service', 'middlewares', 'tls']) !== []) {
+            return false;
+        }
+        foreach ($routerMiddlewares as $middlewareName) {
+            if (! is_string($middlewareName)
+                || $middlewareName === ''
+                || ! array_key_exists($middlewareName, $middlewares)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private function fileServiceNameForProbeReference(string $serviceReference): ?string
+    {
+        if (str_ends_with($serviceReference, '@file')) {
+            return substr($serviceReference, 0, -strlen('@file'));
+        }
+
+        return str_contains($serviceReference, '@') ? null : $serviceReference;
+    }
+
+    /** @param array<string, mixed> $service */
+    private function isCanonicalProbeFileService(
+        string $serviceName,
+        array $service,
+        string $memberBase,
+        bool $requiresPortSpecificName,
+    ): bool {
+        $expectedPort = null;
+        if ($serviceName === $memberBase) {
+            if ($requiresPortSpecificName) {
+                return false;
+            }
+        } elseif (preg_match('/^'.preg_quote($memberBase, '/').'-([1-9][0-9]{0,4})$/D', $serviceName, $matches) === 1
+            && (int) $matches[1] <= 65535) {
+            $expectedPort = (int) $matches[1];
+        } else {
+            return false;
+        }
+        $loadBalancer = $service['loadBalancer'] ?? null;
+        if (array_diff(array_keys($service), ['loadBalancer']) !== []
+            || ! is_array($loadBalancer)
+            || array_diff(array_keys($loadBalancer), ['servers', 'healthCheck']) !== []
+            || ! is_array($loadBalancer['servers'] ?? null)
+            || ! array_is_list($loadBalancer['servers'])
+            || $loadBalancer['servers'] === []
+            || (isset($loadBalancer['healthCheck']) && ! is_array($loadBalancer['healthCheck']))) {
+            return false;
+        }
+        foreach ($loadBalancer['servers'] as $server) {
+            if (! is_array($server)
+                || array_keys($server) !== ['url']
+                || ! is_string($server['url'] ?? null)
+                || preg_match('#^http://[A-Za-z0-9][A-Za-z0-9_.-]*:([1-9][0-9]{0,4})$#D', $server['url'], $matches) !== 1
+                || (int) $matches[1] > 65535
+                || ($expectedPort !== null && (int) $matches[1] !== $expectedPort)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /** @param array<string, mixed> $middlewares */
+    private function hasProbeAcknowledgement(array $middlewares, string $probeMiddlewareName): bool
+    {
+        $acknowledgement = $middlewares[$probeMiddlewareName]['headers']['customResponseHeaders'][BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER] ?? null;
+
+        return is_string($acknowledgement)
+            && preg_match('/^[a-f0-9]{64}$/D', $acknowledgement) === 1
+            && $middlewares[$probeMiddlewareName] === [
+                'headers' => [
+                    'customRequestHeaders' => [self::PROBE_HEADER => ''],
+                    'customResponseHeaders' => [
+                        BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER => $acknowledgement,
+                    ],
+                ],
+            ];
+    }
+
+    /** @return array<string, mixed>|false|null */
+    private function probeOnlyContract(string $yaml): array|false|null
+    {
+        $prefix = '# '.self::PROBE_ONLY_CONTRACT_METADATA.': ';
+        $contractLines = [];
+        foreach (explode("\n", $yaml) as $line) {
+            if (str_starts_with($line, $prefix)) {
+                $contractLines[] = substr($line, strlen($prefix));
+            }
+        }
+        if ($contractLines === []) {
+            return null;
+        }
+        if (count($contractLines) !== 1) {
+            return false;
+        }
+        try {
+            $contract = json_decode($contractLines[0], true, flags: JSON_THROW_ON_ERROR);
+        } catch (JsonException) {
+            return false;
+        }
+
+        return is_array($contract) ? $contract : false;
     }
 
     private function assertStateScope(string $managedFilename, ?BlueGreenProxyState $state): void

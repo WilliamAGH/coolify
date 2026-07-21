@@ -19,12 +19,12 @@ final class RemoveBlueGreenApplicationContainers
 
     public function handle(Server $server, BlueGreenContainerRemovalPlan $plan): void
     {
-        instant_remote_process([$this->commandFor($plan)], $server);
+        instant_privileged_remote_script($this->commandFor($plan), $server);
     }
 
     public function assertAbsent(Server $server, BlueGreenContainerRemovalPlan $plan): void
     {
-        instant_remote_process([$this->assertAbsentCommandFor($plan)], $server);
+        instant_privileged_remote_script($this->assertAbsentCommandFor($plan), $server);
     }
 
     public function planFor(

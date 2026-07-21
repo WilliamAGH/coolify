@@ -19,9 +19,10 @@ class BlueGreenProxyRollbackArtifactRestorer
         if ($server->proxyType() !== ProxyTypes::TRAEFIK->value) {
             throw new InvalidArgumentException('Blue/green proxy rollback requires a Traefik server.');
         }
-        instant_remote_process([
+        instant_privileged_remote_script(
             $this->commandFor($server->proxyPath(), $rollbackKey, $expectedBootId),
-        ], $server);
+            $server,
+        );
     }
 
     public function commandFor(
@@ -46,7 +47,7 @@ class BlueGreenProxyRollbackArtifactRestorer
         if ($server->proxyType() !== ProxyTypes::TRAEFIK->value) {
             throw new InvalidArgumentException('Blue/green proxy rollback requires a Traefik server.');
         }
-        instant_remote_process([
+        instant_privileged_remote_script(
             (new WriteBlueGreenProxyConfiguration)->rollbackArtifactRestoreFromStateCommandFor(
                 $server->proxyPath(),
                 $rollbackKey,
@@ -54,6 +55,7 @@ class BlueGreenProxyRollbackArtifactRestorer
                 $restoredState,
                 $expectedBootId,
             ),
-        ], $server);
+            $server,
+        );
     }
 }

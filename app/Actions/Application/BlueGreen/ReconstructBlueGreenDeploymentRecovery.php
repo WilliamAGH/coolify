@@ -526,7 +526,6 @@ final class ReconstructBlueGreenDeploymentRecovery
                 replacementState: $previousState->withDestinationFenceEpoch(
                     $previousState->destinationFenceEpoch + 1,
                     $claim->deploymentUuid,
-                    $previousState->mutationSequence + 1,
                 ),
             );
         }

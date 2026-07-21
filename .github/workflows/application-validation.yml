@@ -3,6 +3,17 @@ name: Application validation
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      base_sha:
+        description: Exact base commit SHA for changed-file validation
+        required: false
+        type: string
+        default: ''
+      source_sha:
+        description: Exact commit SHA to validate
+        required: false
+        type: string
+        default: ''
   workflow_call:
     inputs:
       base_sha:
@@ -24,8 +35,32 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  source-identity:
+    name: Exact validation source identity
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Bind requested source to check-run revision
+        shell: bash
+        env:
+          CHECK_RUN_SHA: ${{ github.sha }}
+          VALIDATION_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -Eeuo pipefail
+          if [[ -z "$VALIDATION_SOURCE_SHA" ]]; then
+            exit 0
+          fi
+          [[ "$VALIDATION_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "The requested validation source is not a full lowercase commit SHA." >&2
+            exit 1
+          }
+          [[ "$VALIDATION_SOURCE_SHA" == "$CHECK_RUN_SHA" ]] || {
+            echo "The requested validation source does not match the check-run revision." >&2
+            exit 1
+          }
+
   php:
     name: PHP 8.5 application
+    needs: source-identity
     runs-on: ubuntu-24.04
     services:
       redis:
@@ -115,6 +150,7 @@ jobs:
 
   blue-green-lifecycle:
     name: Blue-green lifecycle (PostgreSQL)
+    needs: source-identity
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     services:
@@ -194,6 +230,7 @@ jobs:
             tests/Feature/DatabaseMigrationReadinessTest.php \
             tests/Feature/LivewireDestinationTopologyPersistenceTest.php \
             tests/Feature/BlueGreenOperationFencingTest.php \
+            tests/Feature/BlueGreenReplicaLifecycleTest.php \
             tests/Feature/BlueGreenStoppedLegacyContainerCleanupTest.php \
             tests/Feature/BlueGreenSupersessionGenerationTest.php \
             tests/Feature/DeleteResourceJobBlueGreenTest.php \
@@ -207,9 +244,11 @@ jobs:
             tests/Unit/Actions/Application/BlueGreen/BlueGreenDeploymentLockTest.php \
             tests/Unit/Actions/Application/BlueGreen/BlueGreenOperationFenceTest.php \
             tests/Unit/Actions/Application/BlueGreenDrainAndReleaseProofTest.php \
+            tests/Unit/Actions/Application/BlueGreen/BlueGreenNonRootRemoteExecutionTest.php \
             tests/Unit/Actions/Application/BlueGreen/ExecuteBlueGreenDestinationMutationTest.php \
             tests/Unit/Actions/Application/BlueGreenPublicRecoveryTest.php \
             tests/Unit/Actions/Proxy/BlueGreenMultiPortConfigurationTest.php \
+            tests/Unit/Actions/Proxy/BlueGreenNonRootRemoteExecutionTest.php \
             tests/Unit/ApplicationDeploymentActivationOrderTest.php \
             tests/Unit/ProxyMutationQueueTest.php \
             tests/Unit/ScheduledJobsRetryConfigTest.php
@@ -218,6 +257,7 @@ jobs:
 
   browser:
     name: Pest browser tests
+    needs: source-identity
     runs-on: ubuntu-24.04
     services:
       redis:
@@ -268,6 +308,7 @@ jobs:
 
   formatting:
     name: PHP formatting
+    needs: source-identity
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -299,6 +340,7 @@ jobs:
 
   node:
     name: Node 22 application
+    needs: source-identity
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -317,6 +359,7 @@ jobs:
 
   workflow-and-shell:
     name: Workflow and shell contracts
+    needs: source-identity
     runs-on: ubuntu-24.04
     env:
       OWNED_WORKFLOWS: >-
@@ -324,6 +367,7 @@ jobs:
         .github/workflows/coolify-production-build.yml
         .github/workflows/coolify-staging-build.yml
         .github/workflows/coolify-testing-host.yml
+        .github/workflows/generate-changelog.yml
         .github/workflows/gate-v4x-candidate.yml
         .github/workflows/publish-fork.yml
         .github/workflows/publish-linux-image.yml
@@ -348,6 +392,10 @@ jobs:
           tests/Integration/PublishLinuxImageScriptTest.sh
           tests/Integration/ReleaseOperationalFixturesTest.sh
           tests/Integration/VerifyNexusDockerWritePolicyTest.sh
+          tests/Integration/VerifyForkReleaseTagTest.sh
+          tests/Integration/VerifyForkReleaseTrustTest.sh
+          tests/Integration/DockerSsotCleanTest.sh
+          tests/Integration/ProductionApplicationBlueGreen/SanitizeEvidenceTest.sh
       - name: Run v4.x candidate ship contract
         run: scripts/dev/ship.test.sh
       - name: Verify Docker daemon configuration ownership
@@ -420,6 +468,7 @@ jobs:
 
   testing-host-runtime:
     name: Testing-host production identity bridge
+    needs: source-identity
     if: ${{ github.event_name == 'pull_request' || inputs.source_sha != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 75
@@ -453,9 +502,37 @@ jobs:
         env:
           PRODUCTION_IMAGE: coolify:application-validation-${{ inputs.source_sha || github.sha }}
         run: tests/Integration/RealtimeImageTest.sh
+      - name: Run production application blue-green deployment contract
+        env:
+          EVIDENCE_PARENT: ${{ runner.temp }}/production-application-blue-green-evidence
+          PRODUCTION_APPLICATION_BLUE_GREEN_EVIDENCE_DIRECTORY: ${{ runner.temp }}/production-application-blue-green-evidence
+          PRODUCTION_IMAGE: coolify:application-validation-${{ inputs.source_sha || github.sha }}
+          TESTING_HOST_IMAGE: coolify-testing-host:application-validation-${{ inputs.source_sha || github.sha }}
+        run: |
+          install -d -m 0700 "$EVIDENCE_PARENT"
+          tests/Integration/ProductionApplicationBlueGreen/run.sh
+      - name: Sanitize production application blue-green evidence
+        if: always()
+        shell: bash
+        env:
+          RAW_EVIDENCE_PARENT: ${{ runner.temp }}/production-application-blue-green-evidence
+          SANITIZED_EVIDENCE_PARENT: ${{ runner.temp }}/production-application-blue-green-sanitized
+        run: |
+          set -Eeuo pipefail
+          python3 tests/Integration/ProductionApplicationBlueGreen/sanitize-evidence.py \
+            "$RAW_EVIDENCE_PARENT" "$SANITIZED_EVIDENCE_PARENT"
+      - name: Retain sanitized production application blue-green evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          if-no-files-found: ignore
+          name: production-application-blue-green-${{ inputs.source_sha || github.sha }}
+          path: ${{ runner.temp }}/production-application-blue-green-sanitized/**
+          retention-days: 7
 
   fork-deploy:
     name: Signed fork deployment contract
+    needs: source-identity
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -476,6 +553,7 @@ jobs:
       - formatting
       - fork-deploy
       - node
+      - source-identity
       - testing-host-runtime
       - workflow-and-shell
     runs-on: ubuntu-24.04
@@ -490,6 +568,7 @@ jobs:
           FORK_DEPLOY_RESULT: ${{ needs.fork-deploy.result }}
           NODE_RESULT: ${{ needs.node.result }}
           PHP_RESULT: ${{ needs.php.result }}
+          SOURCE_IDENTITY_RESULT: ${{ needs.source-identity.result }}
           VALIDATION_SOURCE_SHA: ${{ inputs.source_sha }}
           TESTING_HOST_RUNTIME_RESULT: ${{ needs.testing-host-runtime.result }}
           WORKFLOW_RESULT: ${{ needs.workflow-and-shell.result }}
@@ -502,6 +581,7 @@ jobs:
             "$FORMATTING_RESULT" \
             "$FORK_DEPLOY_RESULT" \
             "$NODE_RESULT" \
+            "$SOURCE_IDENTITY_RESULT" \
             "$WORKFLOW_RESULT"; do
             [[ "$result" == success ]] || {
               echo "A required generic application validation job did not succeed: $result" >&2

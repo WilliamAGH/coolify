@@ -344,6 +344,27 @@ function invokeFixedColorRecoveryLifecycleMethod(
     return (new ReflectionMethod($lifecycle, $method))->invoke($lifecycle, ...$arguments);
 }
 
+it('starts a reconstructed fixed-color routing operation at mutation sequence one', function (): void {
+    $fixture = fixedColorBlueGreenRecoveryFixture(BlueGreenDeploymentPhase::PREPARING);
+    $previousBytes = $fixture['previousConfiguration']->state->serialize();
+    $fixture['state']->update([
+        'operation_previous_proxy_state' => $previousBytes,
+        'operation_previous_proxy_state_sha256' => hash('sha256', $previousBytes),
+    ]);
+
+    $operation = ReconstructBlueGreenDeploymentRecovery::run($fixture['state']);
+
+    expect($operation->routingMutationRecorded)->toBeFalse()
+        ->and($operation->rollbackKey->expectedState?->operationId)->toBe(FIXED_COLOR_PREVIOUS_DEPLOYMENT)
+        ->and($operation->rollbackKey->replacementState->operationId)->toBe(FIXED_COLOR_CANDIDATE_DEPLOYMENT)
+        ->and($operation->rollbackKey->replacementState->mutationSequence)->toBe(1)
+        ->and($operation->rollbackKey->replacementState->destinationFenceEpoch)->toBe(2)
+        ->and($operation->rollbackKey->replacementState->isMutationSuccessorOf(
+            $operation->rollbackKey->expectedState,
+            FIXED_COLOR_CANDIDATE_DEPLOYMENT,
+        ))->toBeTrue();
+});
+
 it('drains every immutable predecessor port when the live application dropped a port', function (): void {
     config(['constants.ssh.mux_enabled' => false]);
     $fixture = fixedColorBlueGreenRecoveryFixture(BlueGreenDeploymentPhase::DRAINING);

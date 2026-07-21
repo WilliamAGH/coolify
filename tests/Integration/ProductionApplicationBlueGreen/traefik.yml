@@ -1,0 +1,20 @@
+api:
+  dashboard: false
+  insecure: false
+entryPoints:
+  http:
+    address: ":80"
+log:
+  level: INFO
+accessLog:
+  format: json
+ping:
+  entryPoint: http
+providers:
+  providersThrottleDuration: 250ms
+  file:
+    directory: /dynamic
+    watch: true
+  docker:
+    exposedByDefault: false
+    network: coolify

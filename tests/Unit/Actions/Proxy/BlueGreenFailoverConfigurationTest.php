@@ -119,9 +119,13 @@ it('compiles a probe-only legacy adoption stage without shadowing the legacy pub
     ));
     $routers = data_get($parsed, 'http.routers');
 
+    $memberService = blueGreenFailoverPrefix().'blue';
     expect(array_keys($routers))->toHaveCount(1)
         ->and(array_key_first($routers))->toEndWith('-probe')
-        ->and(data_get($parsed, 'http.services'))->toBe([])
+        ->and(data_get($routers, array_key_first($routers).'.service'))->toBe($memberService)
+        ->and(data_get($parsed, 'http.services'))->toHaveKey($memberService)
+        ->and(data_get($parsed, 'http.services.'.$memberService.'.loadBalancer.servers.0.url'))
+        ->toBe('http://app-failover-blue:8080')
         ->and(data_get($parsed, 'http.middlewares.'.blueGreenFailoverPrefix().'probe-header-strip.headers.customRequestHeaders'))
         ->not->toHaveKey(BlueGreenRoutingTarget::RELEASE_PROOF_HEADER)
         ->and(data_get($parsed, 'http.middlewares'))->not->toHaveKey(
@@ -137,13 +141,14 @@ it('keeps a fixed-color probe-only stage strictly private even when it carries t
     ));
 
     $routers = data_get($parsed, 'http.routers');
+    $memberService = blueGreenFailoverPrefix().'blue';
 
     expect(array_keys($routers))->toHaveCount(1)
         ->and(array_key_first($routers))->toEndWith('-probe')
         ->and(collect($routers)->keys()->filter(
             static fn (string $name): bool => str_ends_with($name, '-public'),
         ))->toHaveCount(0)
-        ->and(data_get($parsed, 'http.services'))->toBe([])
+        ->and(data_get($parsed, 'http.services'))->toHaveKey($memberService)
         ->and(data_get($parsed, 'http.middlewares.'.blueGreenFailoverPrefix().'probe-header-strip.headers.customRequestHeaders'))
         ->not->toHaveKey(BlueGreenRoutingTarget::RELEASE_PROOF_HEADER);
 });

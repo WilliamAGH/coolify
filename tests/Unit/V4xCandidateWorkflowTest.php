@@ -178,7 +178,16 @@ it('uses the organization label for the privileged fork promotion', function () 
         ->toBe(williamCallahanTrustedRunner())
         ->and($forkRelease['permissions'] ?? null)->toBe(['contents' => 'write']);
 
-    foreach ($forkRelease['steps'] ?? [] as $step) {
-        expect((string) ($step['uses'] ?? ''))->not->toStartWith('actions/checkout@');
-    }
+    $checkoutSteps = collect($forkRelease['steps'] ?? [])
+        ->filter(static fn (array $step): bool => str_starts_with((string) ($step['uses'] ?? ''), 'actions/checkout@'))
+        ->values()
+        ->all();
+    expect($checkoutSteps)->toBe([[
+        'uses' => 'actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd',
+        'with' => [
+            'fetch-depth' => 0,
+            'persist-credentials' => false,
+            'ref' => '${{ github.sha }}',
+        ],
+    ]]);
 });

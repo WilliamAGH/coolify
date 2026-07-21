@@ -199,6 +199,37 @@ function instant_remote_process(Collection|array $command, Server $server, bool 
     );
 }
 
+function instant_privileged_remote_script(
+    string $script,
+    Server $server,
+    bool $throwError = true,
+    ?int $timeout = null,
+    bool $disableMultiplexing = false,
+    bool $retry = true,
+): ?string {
+    if (! $server->isNonRoot()) {
+        return instant_remote_process(
+            [$script],
+            $server,
+            $throwError,
+            timeout: $timeout,
+            disableMultiplexing: $disableMultiplexing,
+            retry: $retry,
+        );
+    }
+
+    return instant_remote_process(
+        ['sudo bash -se'],
+        $server,
+        $throwError,
+        no_sudo: true,
+        timeout: $timeout,
+        disableMultiplexing: $disableMultiplexing,
+        input: $script,
+        retry: $retry,
+    );
+}
+
 function excludeCertainErrors(string $errorOutput, ?int $exitCode = null)
 {
     $ignoredErrors = collect([

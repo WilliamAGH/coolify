@@ -139,6 +139,22 @@ function applicationValidationRequiredAggregateStep(array $workflow): array
 }
 
 /**
+ * @param  array<string, mixed>  $workflow
+ * @return array<string, mixed>
+ */
+function applicationValidationSourceIdentityStep(array $workflow): array
+{
+    $step = collect($workflow['jobs']['source-identity']['steps'] ?? [])
+        ->firstWhere('name', 'Bind requested source to check-run revision');
+
+    if (! is_array($step)) {
+        throw new RuntimeException('The exact validation source identity step is missing.');
+    }
+
+    return $step;
+}
+
+/**
  * @return array<string, string|false>
  */
 function applicationValidationRequiredEnvironment(string $eventName, string $sourceSha = ''): array
@@ -151,6 +167,7 @@ function applicationValidationRequiredEnvironment(string $eventName, string $sou
         'FORK_DEPLOY_RESULT' => 'success',
         'NODE_RESULT' => 'success',
         'PHP_RESULT' => 'success',
+        'SOURCE_IDENTITY_RESULT' => 'success',
         'VALIDATION_SOURCE_SHA' => $sourceSha,
         'TESTING_HOST_RUNTIME_RESULT' => $eventName === 'pull_request' || $sourceSha !== '' ? 'success' : 'skipped',
         'WORKFLOW_RESULT' => 'success',
@@ -173,6 +190,22 @@ function runApplicationValidationRequiredAggregate(array $environment): Process
     return $process;
 }
 
+function runApplicationValidationSourceIdentity(string $sourceSha, string $checkRunSha): Process
+{
+    $step = applicationValidationSourceIdentityStep(applicationValidationWorkflow());
+    $process = new Process(
+        ['bash', '-c', (string) ($step['run'] ?? '')],
+        dirname(__DIR__, 2),
+        [
+            'CHECK_RUN_SHA' => $checkRunSha,
+            'VALIDATION_SOURCE_SHA' => $sourceSha,
+        ],
+    );
+    $process->run();
+
+    return $process;
+}
+
 /**
  * @return array<string, array{string, string}>
  */
@@ -187,6 +220,7 @@ function applicationValidationGenericResultFailures(): array
         'FORK_DEPLOY_RESULT',
         'NODE_RESULT',
         'PHP_RESULT',
+        'SOURCE_IDENTITY_RESULT',
         'WORKFLOW_RESULT',
     ] as $variable) {
         foreach (['failure', 'skipped', 'cancelled'] as $result) {
@@ -212,6 +246,7 @@ function applicationValidationMissingOrEmptyEnvironmentCases(): array
         'FORK_DEPLOY_RESULT',
         'NODE_RESULT',
         'PHP_RESULT',
+        'SOURCE_IDENTITY_RESULT',
         'TESTING_HOST_RUNTIME_RESULT',
         'WORKFLOW_RESULT',
     ] as $variable) {
@@ -243,6 +278,30 @@ function applicationValidationWorkflowViolations(array $workflow): array
     $required = is_array($jobs) ? ($jobs['required'] ?? []) : [];
     if (($required['name'] ?? null) !== 'Application validation required') {
         $violations[] = 'application validation must preserve the protected branch status context';
+    }
+
+    $sourceIdentity = is_array($jobs) ? ($jobs['source-identity'] ?? []) : [];
+    $sourceIdentityStep = collect($sourceIdentity['steps'] ?? [])
+        ->firstWhere('name', 'Bind requested source to check-run revision');
+    if (($sourceIdentity['name'] ?? null) !== 'Exact validation source identity'
+        || ! is_array($sourceIdentityStep)
+        || ($sourceIdentityStep['shell'] ?? null) !== 'bash'
+        || ($sourceIdentityStep['env'] ?? null) !== [
+            'CHECK_RUN_SHA' => '${{ github.sha }}',
+            'VALIDATION_SOURCE_SHA' => '${{ inputs.source_sha }}',
+        ]
+        || ! str_contains((string) ($sourceIdentityStep['run'] ?? ''), '[[ "$VALIDATION_SOURCE_SHA" == "$CHECK_RUN_SHA" ]]')) {
+        $violations[] = 'application validation must bind an exact requested source to the check-run revision';
+    }
+    foreach (is_array($jobs) ? $jobs : [] as $jobName => $job) {
+        if (in_array($jobName, ['required', 'source-identity'], true)) {
+            continue;
+        }
+        if (($job['needs'] ?? null) !== 'source-identity') {
+            $violations[] = 'every validation job must wait for exact source identity';
+
+            break;
+        }
     }
 
     $requiredNeeds = $required['needs'] ?? [];
@@ -283,6 +342,7 @@ function applicationValidationWorkflowViolations(array $workflow): array
         'tests/Feature/BlueGreenLifecyclePublicRecoveryTest.php',
         'tests/Feature/BlueGreenMigrationReplayTest.php',
         'tests/Feature/BlueGreenMultiPortPromotionAcceptanceTest.php',
+        'tests/Feature/BlueGreenReplicaLifecycleTest.php',
         'tests/Feature/BlueGreenStoppedLegacyContainerCleanupTest.php',
         'tests/Feature/DatabaseMigrationReadinessTest.php',
         'tests/Feature/BlueGreenSupersessionGenerationTest.php',
@@ -291,6 +351,8 @@ function applicationValidationWorkflowViolations(array $workflow): array
         'tests/Feature/ProxyMutationQueueGateTest.php',
         'tests/Feature/QueueApplicationDeploymentCommitTest.php',
         'tests/Unit/ApplicationDeploymentActivationOrderTest.php',
+        'tests/Unit/Actions/Application/BlueGreen/BlueGreenNonRootRemoteExecutionTest.php',
+        'tests/Unit/Actions/Proxy/BlueGreenNonRootRemoteExecutionTest.php',
         'tests/Unit/ProxyMutationQueueTest.php',
         'tests/Unit/ScheduledJobsRetryConfigTest.php',
     ] as $requiredTest) {
@@ -395,6 +457,46 @@ function applicationValidationWorkflowViolations(array $workflow): array
         || ($bundledRuntime['run'] ?? null) !== 'tests/Integration/RealtimeImageTest.sh') {
         $violations[] = 'application validation must execute the bundled Reverb and terminal contract against the exact production image';
     }
+    $productionBlueGreen = collect($testingHostRuntime['steps'] ?? [])
+        ->firstWhere('name', 'Run production application blue-green deployment contract');
+    if (! is_array($productionBlueGreen)
+        || ($productionBlueGreen['env'] ?? null) !== [
+            'EVIDENCE_PARENT' => '${{ runner.temp }}/production-application-blue-green-evidence',
+            'PRODUCTION_APPLICATION_BLUE_GREEN_EVIDENCE_DIRECTORY' => '${{ runner.temp }}/production-application-blue-green-evidence',
+            'PRODUCTION_IMAGE' => 'coolify:application-validation-${{ inputs.source_sha || github.sha }}',
+            'TESTING_HOST_IMAGE' => 'coolify-testing-host:application-validation-${{ inputs.source_sha || github.sha }}',
+        ]
+        || ! str_contains((string) ($productionBlueGreen['run'] ?? ''), 'install -d -m 0700 "$EVIDENCE_PARENT"')
+        || ! str_contains((string) ($productionBlueGreen['run'] ?? ''), 'tests/Integration/ProductionApplicationBlueGreen/run.sh')) {
+        $violations[] = 'application validation must execute the production application blue-green contract against both exact source images';
+    }
+    $productionBlueGreenEvidenceSanitizer = collect($testingHostRuntime['steps'] ?? [])
+        ->firstWhere('name', 'Sanitize production application blue-green evidence');
+    $sanitizerScript = (string) ($productionBlueGreenEvidenceSanitizer['run'] ?? '');
+    $expectedSanitizerScript = <<<'SH'
+set -Eeuo pipefail
+python3 tests/Integration/ProductionApplicationBlueGreen/sanitize-evidence.py \
+  "$RAW_EVIDENCE_PARENT" "$SANITIZED_EVIDENCE_PARENT"
+SH;
+    if (! is_array($productionBlueGreenEvidenceSanitizer)
+        || ($productionBlueGreenEvidenceSanitizer['if'] ?? null) !== 'always()'
+        || ($productionBlueGreenEvidenceSanitizer['shell'] ?? null) !== 'bash'
+        || ($productionBlueGreenEvidenceSanitizer['env'] ?? null) !== [
+            'RAW_EVIDENCE_PARENT' => '${{ runner.temp }}/production-application-blue-green-evidence',
+            'SANITIZED_EVIDENCE_PARENT' => '${{ runner.temp }}/production-application-blue-green-sanitized',
+        ]
+        || trim($sanitizerScript) !== $expectedSanitizerScript) {
+        $violations[] = 'application validation must sanitize every retained production application blue-green text artifact';
+    }
+    $productionBlueGreenArtifact = collect($testingHostRuntime['steps'] ?? [])
+        ->firstWhere('name', 'Retain sanitized production application blue-green evidence');
+    if (! is_array($productionBlueGreenArtifact)
+        || ($productionBlueGreenArtifact['if'] ?? null) !== 'always()'
+        || ($productionBlueGreenArtifact['uses'] ?? null) !== 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a'
+        || ($productionBlueGreenArtifact['with']['if-no-files-found'] ?? null) !== 'ignore'
+        || ($productionBlueGreenArtifact['with']['path'] ?? null) !== '${{ runner.temp }}/production-application-blue-green-sanitized/**') {
+        $violations[] = 'application validation must retain sanitized production application blue-green evidence';
+    }
 
     foreach (is_array($jobs) ? $jobs : [] as $job) {
         foreach ($job['steps'] ?? [] as $step) {
@@ -414,6 +516,44 @@ it('defines the required application validation contract', function () {
     expect(applicationValidationWorkflowViolations($workflow))->toBe([]);
 });
 
+it('accepts only an empty source or the exact check-run revision', function (string $sourceSha, string $checkRunSha): void {
+    $process = runApplicationValidationSourceIdentity($sourceSha, $checkRunSha);
+
+    expect($process->isSuccessful())->toBeTrue($process->getErrorOutput());
+})->with([
+    'implicit check-run source' => ['', str_repeat('a', 40)],
+    'matching exact source' => [str_repeat('b', 40), str_repeat('b', 40)],
+]);
+
+it('rejects malformed or mismatched exact validation sources', function (string $sourceSha, string $checkRunSha): void {
+    $process = runApplicationValidationSourceIdentity($sourceSha, $checkRunSha);
+
+    expect($process->isSuccessful())->toBeFalse();
+})->with([
+    'short source' => [str_repeat('a', 39), str_repeat('a', 40)],
+    'uppercase source' => [str_repeat('A', 40), str_repeat('a', 40)],
+    'different revision' => [str_repeat('a', 40), str_repeat('b', 40)],
+]);
+
+it('rejects removing the exact validation source binding', function (): void {
+    $workflow = applicationValidationWorkflow();
+    $step = collect($workflow['jobs']['source-identity']['steps'] ?? [])
+        ->search(fn (array $candidate): bool => ($candidate['name'] ?? null) === 'Bind requested source to check-run revision');
+    expect($step)->not->toBeFalse();
+    $workflow['jobs']['source-identity']['steps'][$step]['run'] = 'true';
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('application validation must bind an exact requested source to the check-run revision');
+});
+
+it('rejects running a validation job before exact source identity succeeds', function (): void {
+    $workflow = applicationValidationWorkflow();
+    unset($workflow['jobs']['php']['needs']);
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('every validation job must wait for exact source identity');
+});
+
 it('fails when Docker daemon configuration ownership is removed from required validation', function () {
     $workflow = applicationValidationWorkflow();
     $step = collect($workflow['jobs']['workflow-and-shell']['steps'] ?? [])
@@ -424,6 +564,59 @@ it('fails when Docker daemon configuration ownership is removed from required va
 
     expect(applicationValidationWorkflowViolations($workflow))
         ->toContain('application validation must execute the Docker daemon configuration integration');
+});
+
+it('fails when the production application blue-green runtime owner is removed', function (): void {
+    $workflow = applicationValidationWorkflow();
+    $step = collect($workflow['jobs']['testing-host-runtime']['steps'] ?? [])
+        ->search(fn (array $candidate): bool => ($candidate['name'] ?? null) === 'Run production application blue-green deployment contract');
+    expect($step)->not->toBeFalse();
+    unset($workflow['jobs']['testing-host-runtime']['steps'][$step]);
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('application validation must execute the production application blue-green contract against both exact source images');
+});
+
+it('fails when an exact blue-green regression owner is removed from required validation', function (string $requiredTest): void {
+    $workflow = applicationValidationWorkflow();
+    $step = collect($workflow['jobs']['blue-green-lifecycle']['steps'] ?? [])
+        ->search(fn (array $candidate): bool => ($candidate['name'] ?? null) === 'Run blue-green lifecycle tests');
+    expect($step)->not->toBeFalse();
+    $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'] = str_replace(
+        $requiredTest,
+        'tests/Feature/RemovedRequiredRegressionOwnerTest.php',
+        (string) $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'],
+    );
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('blue-green lifecycle validation must execute every ownership and migration gate');
+})->with([
+    'replica identity' => 'tests/Feature/BlueGreenReplicaLifecycleTest.php',
+    'application privileged transport' => 'tests/Unit/Actions/Application/BlueGreen/BlueGreenNonRootRemoteExecutionTest.php',
+    'proxy privileged transport' => 'tests/Unit/Actions/Proxy/BlueGreenNonRootRemoteExecutionTest.php',
+]);
+
+it('fails when production application blue-green evidence bypasses the sanitized export tree', function (): void {
+    $workflow = applicationValidationWorkflow();
+    $step = collect($workflow['jobs']['testing-host-runtime']['steps'] ?? [])
+        ->search(fn (array $candidate): bool => ($candidate['name'] ?? null) === 'Retain sanitized production application blue-green evidence');
+    expect($step)->not->toBeFalse();
+    $workflow['jobs']['testing-host-runtime']['steps'][$step]['with']['path'] =
+        '${{ runner.temp }}/production-application-blue-green-evidence/**';
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('application validation must retain sanitized production application blue-green evidence');
+});
+
+it('fails when production application blue-green evidence is uploaded without sanitizing every text artifact', function (): void {
+    $workflow = applicationValidationWorkflow();
+    $step = collect($workflow['jobs']['testing-host-runtime']['steps'] ?? [])
+        ->search(fn (array $candidate): bool => ($candidate['name'] ?? null) === 'Sanitize production application blue-green evidence');
+    expect($step)->not->toBeFalse();
+    unset($workflow['jobs']['testing-host-runtime']['steps'][$step]);
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('application validation must sanitize every retained production application blue-green text artifact');
 });
 
 it('keeps the aggregate contract structurally connected to every selected result', function () {
@@ -442,6 +635,7 @@ it('keeps the aggregate contract structurally connected to every selected result
             'formatting',
             'fork-deploy',
             'node',
+            'source-identity',
             'testing-host-runtime',
             'workflow-and-shell',
         ])
@@ -454,6 +648,7 @@ it('keeps the aggregate contract structurally connected to every selected result
             'FORK_DEPLOY_RESULT' => '${{ needs.fork-deploy.result }}',
             'NODE_RESULT' => '${{ needs.node.result }}',
             'PHP_RESULT' => '${{ needs.php.result }}',
+            'SOURCE_IDENTITY_RESULT' => '${{ needs.source-identity.result }}',
             'VALIDATION_SOURCE_SHA' => '${{ inputs.source_sha }}',
             'TESTING_HOST_RUNTIME_RESULT' => '${{ needs.testing-host-runtime.result }}',
             'WORKFLOW_RESULT' => '${{ needs.workflow-and-shell.result }}',
@@ -745,7 +940,6 @@ it('pins Node 24 action implementations throughout release validation and public
         'docker/build-push-action' => '53b7df96c91f9c12dcc8a07bcb9ccacbed38856a',
         'docker/login-action' => 'af1e73f918a031802d376d3c8bbc3fe56130a9b0',
         'docker/setup-buildx-action' => 'bb05f3f5519dd87d3ba754cc423b652a5edd6d2c',
-        'docker/setup-qemu-action' => '96fe6ef7f33517b61c61be40b68a1882f3264fb8',
         'shivammathur/setup-php' => 'f3e473d116dcccaddc5834248c87452386958240',
     ];
     $observedActions = array_fill_keys(array_keys($expectedPins), 0);

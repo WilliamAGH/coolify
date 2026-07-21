@@ -220,6 +220,14 @@ EOF
         esac
         ;;
     ps)
+        no_trunc=false
+        for argument in "$@"; do
+            if test "$argument" = --no-trunc; then
+                no_trunc=true
+                break
+            fi
+        done
+        test "$no_trunc" = true
         shift
         while IFS='|' read -r container_id container_name application_id deployment_uuid color routing_revision replica_index replica_count compose_project compose_service; do
             test -n "$container_id" || continue
@@ -287,6 +295,22 @@ it('defines an all-healthy promotion threshold and exact replica services', func
     expect(fn () => new BlueGreenReplicaSet(0))->toThrow(InvalidArgumentException::class)
         ->and(fn () => new BlueGreenReplicaSet(33))->toThrow(InvalidArgumentException::class);
 });
+
+it('rejects incomplete or duplicate durable replica ledger indexes', function (array $indexes): void {
+    $replicas = collect($indexes)->map(static function (int $index): ApplicationBlueGreenReplica {
+        $replica = new ApplicationBlueGreenReplica;
+        $replica->forceFill(['replica_index' => $index]);
+
+        return $replica;
+    });
+
+    expect(fn () => BlueGreenReplicaSet::fromReplicas($replicas))
+        ->toThrow(InvalidArgumentException::class, 'every contiguous replica index exactly once');
+})->with([
+    'missing initial index' => [[2, 3, 4]],
+    'duplicate index' => [[1, 1, 3]],
+    'non-contiguous index' => [[1, 2, 4]],
+]);
 
 it('refuses promotion unless every configured replica is running and healthy', function (): void {
     $replicas = new BlueGreenReplicaSet(3);
@@ -451,9 +475,11 @@ it('binds the durable N=3 identities before refusing partial health after a rest
         ->where('application_blue_green_deployment_id', $claim->stateId)
         ->orderBy('replica_index')
         ->get();
-    $rollbackPlans = $boundRows->map(
-        static fn (ApplicationBlueGreenReplica $replica): array => (new RemoveBlueGreenReplicaSet)->commandsForReplica($replica),
+    [$rollbackCommands, $rollbackCompletionAssertions] = (new RemoveBlueGreenReplicaSet)->commandsFor(
+        $claim,
+        $boundRows,
     );
+    $rollbackPlan = implode("\n", [...$rollbackCommands, ...$rollbackCompletionAssertions]);
 
     expect($application->settings->blueGreenReplicaCount())->toBe(1)
         ->and($boundRows)->toHaveCount(3)
@@ -463,9 +489,13 @@ it('binds the durable N=3 identities before refusing partial health after a rest
             str_repeat('3', 64),
         ])
         ->and($boundRows->pluck('health_status')->all())->toBe(['healthy', 'unhealthy', 'healthy'])
-        ->and($rollbackPlans)->toHaveCount(3)
-        ->and($deployment->fresh()->blue_green_candidate_container_id)
-        ->toBe(BlueGreenReplicaSet::identityDigest($inspections));
+        ->and($rollbackPlan)->toContain(
+            'docker ps -aq --no-trunc',
+            'label=coolify.blueGreen.replicaIndex=1',
+            'label=coolify.blueGreen.replicaIndex=2',
+            'label=coolify.blueGreen.replicaIndex=3',
+        )
+        ->and($deployment->fresh()->blue_green_candidate_container_id)->toBeNull();
 });
 
 it('keeps the claimed scalar health and rollback identity when settings drift from one replica to three', function (): void {
@@ -835,7 +865,9 @@ it('preserves color slot history while enforcing one durable row per release ind
         'deployment_uuid' => 'another-release',
     ]);
 
-    expect(fn () => ApplicationBlueGreenReplica::query()->create($attributes))
+    expect(fn () => DB::transaction(
+        static fn (): ApplicationBlueGreenReplica => ApplicationBlueGreenReplica::query()->create($attributes),
+    ))
         ->toThrow(QueryException::class)
         ->and(ApplicationBlueGreenReplica::query()->count())->toBe(2);
 });
@@ -954,7 +986,9 @@ it('reconstructs the reserved replica quorum after the setting changes', functio
     int $changedReplicaCount,
 ): void {
     $fixture = exactBlueGreenReplicaBindingFixture($reservedReplicaCount);
-    $fixture['application']->settings->update(['blue_green_replica_count' => $changedReplicaCount]);
+    DB::table('application_settings')
+        ->where('application_id', $fixture['application']->id)
+        ->update(['blue_green_replica_count' => $changedReplicaCount]);
 
     $replicaCount = (new ReflectionMethod(
         ReconstructBlueGreenDeploymentRecovery::class,

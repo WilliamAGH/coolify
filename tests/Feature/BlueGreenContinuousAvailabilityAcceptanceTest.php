@@ -339,7 +339,9 @@ it('proves a first legacy-adoption candidate through a private probe before any 
         ->and($routers)->toBeArray()
         ->and(array_keys($routers))->toHaveCount(1)
         ->each->toEndWith('-probe')
-        ->and(data_get($parsed, 'http.services'))->toBe([]);
+        ->and(data_get($parsed, 'http.services'))->not->toBe([])
+        ->and(collect(data_get($parsed, 'http.services', []))->keys()->all())
+        ->each->toStartWith('coolify-bg-');
     Sleep::assertSleptTimes(9);
     Process::assertRanTimes(
         fn (PendingProcess $process): bool => str_contains(

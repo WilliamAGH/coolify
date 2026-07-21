@@ -14,13 +14,14 @@ final class VerifyBlueGreenManagedConfiguration
 
     public function handle(Server $server, BlueGreenProxyConfiguration $configuration): void
     {
-        $output = trim((string) instant_remote_process([
+        $output = trim((string) instant_privileged_remote_script(
             (new WriteBlueGreenProxyConfiguration)->attestStateCommandFor(
                 $server->proxyPath(),
                 $configuration->managedFilename,
                 $configuration->state,
             ),
-        ], $server));
+            $server,
+        ));
         if ($output !== 'coolify-blue-green-destination-state-attested') {
             throw new RuntimeException('The managed route did not return its exact destination-state attestation.');
         }

@@ -1,0 +1,143 @@
+services:
+  postgres:
+    image: postgres:15.18-alpine3.24@sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f
+    pull_policy: never
+    environment:
+      POSTGRES_DB: coolify
+      POSTGRES_PASSWORD: password
+      POSTGRES_USER: coolify
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coolify -d coolify"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+    networks: [control]
+
+  redis:
+    image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    pull_policy: never
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+    networks: [control]
+
+  dind:
+    image: docker:28.4.0-dind@sha256:2ceb471176ad51e37145d43ce7cbf0fa5d644a2b185bd537f0ef695fb3a37497
+    pull_policy: never
+    privileged: true
+    command: ["--host=unix:///var/run/docker.sock", "--insecure-registry=127.0.0.1:5000"]
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+    volumes:
+      - coolify-data:/data/coolify
+      - docker-data:/var/lib/docker
+      - docker-run:/var/run
+      - ${EVIDENCE_DIRECTORY:?}:/runtime-evidence
+    networks: [control]
+
+  keygen:
+    image: ${TESTING_HOST_IMAGE:?}
+    pull_policy: never
+    user: root
+    entrypoint: ["/bin/sh", "/usr/local/bin/coolify-testing-host-keygen"]
+    environment:
+      COOLIFY_TESTING_KEY_GID: "9999"
+      COOLIFY_TESTING_KEY_UID: "9999"
+    volumes:
+      - testing-host-private-key:/run/coolify-testing-host/private
+      - testing-host-public-key:/run/coolify-testing-host/public
+    networks: [control]
+
+  testing-host:
+    image: ${TESTING_HOST_IMAGE:?}
+    pull_policy: never
+    init: true
+    network_mode: service:dind
+    pid: service:dind
+    depends_on:
+      dind:
+        condition: service_healthy
+      keygen:
+        condition: service_completed_successfully
+    environment:
+      FIXTURE_IMAGE: ${FIXTURE_IMAGE:?}
+      FIXTURE_IMAGE_ID: ${FIXTURE_IMAGE_ID:?}
+      HELPER_IMAGE_ID: ${HELPER_IMAGE_ID:?}
+      HELPER_RUNTIME_IMAGE: ${HELPER_RUNTIME_IMAGE:?}
+      REGISTRY_IMAGE_ID: ${REGISTRY_IMAGE_ID:?}
+      REGISTRY_RUNTIME_IMAGE: ${REGISTRY_RUNTIME_IMAGE:?}
+      TRAEFIK_IMAGE_ID: ${TRAEFIK_IMAGE_ID:?}
+      TRAEFIK_RUNTIME_IMAGE: ${TRAEFIK_RUNTIME_IMAGE:?}
+    volumes:
+      - coolify-data:/data/coolify
+      - docker-run:/var/run
+      - testing-host-public-key:/run/coolify-testing-host/public:ro
+      - ${EVIDENCE_DIRECTORY:?}:/runtime-evidence
+      - ./remote-init.sh:/lab/remote-init.sh:ro
+      - ./traefik.yml:/lab/traefik.yml:ro
+
+  control-plane:
+    image: ${PRODUCTION_IMAGE:?}
+    pull_policy: never
+    user: "9999:9999"
+    entrypoint: ["/bin/sh", "/lab/control-plane-entrypoint.sh"]
+    environment:
+      APP_DEBUG: "false"
+      APP_ENV: production
+      APP_KEY: base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      APP_URL: http://control-plane.test
+      AUTORUN_ENABLED: "false"
+      BROADCAST_CONNECTION: log
+      CACHE_STORE: redis
+      CONTROL_PLANE_MODE: active
+      DB_CONNECTION: pgsql
+      DB_DATABASE: coolify
+      DB_HOST: postgres
+      DB_PASSWORD: password
+      DB_PORT: "5432"
+      DB_USERNAME: coolify
+      FILESYSTEM_DISK: local
+      FIXTURE_IMAGE: ${FIXTURE_IMAGE:?}
+      FIXTURE_IMAGE_ID: ${FIXTURE_IMAGE_ID:?}
+      HELPER_IMAGE: ghcr.io/coollabsio/coolify-helper
+      HORIZON_ENABLED: "false"
+      LOG_CHANNEL: stderr
+      MAIL_MAILER: log
+      QUEUE_CONNECTION: redis
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      SESSION_DRIVER: array
+      SSH_MUX_ENABLED: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      testing-host:
+        condition: service_started
+    volumes:
+      - ./control-plane-entrypoint.sh:/lab/control-plane-entrypoint.sh:ro
+      - ./deploy.php:/lab/deploy.php:ro
+      - ${EVIDENCE_DIRECTORY:?}:/runtime-evidence
+      - testing-host-private-key:/var/www/html/storage/app/ssh
+    networks: [control]
+
+networks:
+  control:
+    name: ${CONTROL_NETWORK_NAME:?}
+    external: true
+
+volumes:
+  coolify-data:
+  docker-data:
+  docker-run:
+  testing-host-private-key:
+  testing-host-public-key:
