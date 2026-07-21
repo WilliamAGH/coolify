@@ -82,6 +82,7 @@ All notable changes to this project will be documented in this file.
 - Update changelog (#91)
 - Update changelog (#92)
 - Update changelog (#94)
+- Update changelog (#96)
 
 ### 🎨 Styling
 
@@ -109,6 +110,7 @@ All notable changes to this project will be documented in this file.
 ### ⚙️ Miscellaneous Tasks
 
 - *(github)* Prepare organization runner migration
+- Migrate release actions to Node 24
 
 ## [4.13.2-fork] - 2026-07-20
 
