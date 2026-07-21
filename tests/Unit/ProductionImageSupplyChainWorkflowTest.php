@@ -151,7 +151,9 @@ SH);
         'curl_log' => $curlLog,
         'environment' => [
             'CURL_LOG' => $curlLog,
+            'GITHUB_EVENT_NAME' => 'push',
             'GITHUB_REF' => 'refs/tags/4.13.1-fork',
+            'GITHUB_REF_TYPE' => 'tag',
             'GITHUB_REPOSITORY' => 'williamacallahan/coolify',
             'GITHUB_SHA' => str_repeat('a', 40),
             'MAIN_AMD64_DIGEST' => releaseWorkflowTestDigest('1'),
@@ -167,6 +169,7 @@ SH);
             'RUNNER_TEMP' => $fixture,
             'SEMANTIC_VERSION' => '4.13.1-fork',
             'SOURCE_REVISION' => str_repeat('a', 40),
+            'SOURCE_IS_TAG' => 'true',
             'SOURCE_URL' => 'https://github.com/williamacallahan/coolify',
         ],
         'log' => $log,
@@ -920,15 +923,31 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
         ->map(fn (array $entry): array => [
             $entry['arch'] ?? null,
             $entry['platform'] ?? null,
-            $entry['runner'] ?? null,
         ])
         ->values()
         ->all();
+    $trustedForkRunner = [
+        'group' => 'coolify-trusted',
+        'labels' => ['self-hosted', 'Linux', 'X64', 'williamacallahan'],
+    ];
+    $forkQemuSetup = releaseWorkflowStep(
+        $jobs['fork-build'] ?? [],
+        'Set up QEMU for fork cross-platform builds',
+    );
+    $forkBuildxVerification = (string) (releaseWorkflowStep(
+        $jobs['fork-build'] ?? [],
+        'Verify fork Buildx platform support',
+    )['run'] ?? '');
     if ($forkMainPlatforms !== [
-        ['amd64', 'linux/amd64', 'ubuntu-24.04'],
-        ['arm64', 'linux/arm64', 'ubuntu-24.04-arm'],
-    ]) {
-        $violations[] = 'fork control-plane publication must retain native amd64 and arm64 archive acceptance';
+        ['amd64', 'linux/amd64'],
+        ['arm64', 'linux/arm64'],
+    ] ||
+        ($jobs['fork-build']['runs-on'] ?? null) !== $trustedForkRunner ||
+        ($jobs['fork-stage']['runs-on'] ?? null) !== $trustedForkRunner ||
+        ($forkQemuSetup['uses'] ?? null) !== 'docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130' ||
+        ($forkQemuSetup['with']['platforms'] ?? null) !== 'arm64' ||
+        ! str_contains($forkBuildxVerification, 'docker buildx inspect --bootstrap | grep -F "$PLATFORM"')) {
+        $violations[] = 'fork control-plane publication must retain self-hosted amd64 and arm64 archive acceptance';
     }
 
     $forkSbomCensus = releaseWorkflowStep(
@@ -1217,7 +1236,7 @@ it('rejects fork publication graphs that drop native architecture or SBOM residu
 })->with([
     'missing native arm64 acceptance' => [
         'remove-fork-main-arm64-acceptance',
-        'fork control-plane publication must retain native amd64 and arm64 archive acceptance',
+        'fork control-plane publication must retain self-hosted amd64 and arm64 archive acceptance',
     ],
     'missing signed SBOM census' => [
         'remove-fork-control-plane-sbom-census',
@@ -1566,8 +1585,11 @@ it('rejects fork versions whose derived canonical tag exceeds the OCI limit', fu
                 'DOCKERFILE' => 'docker/production/Dockerfile',
                 'FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY' => 'fixture-key',
                 'FORK_SEMANTIC_VERSION_PATTERN' => $forkSemanticVersionPattern,
+                'FORK_SOURCE_IS_TAG' => 'true',
                 'GITHUB_OUTPUT' => $githubOutput,
+                'GITHUB_EVENT_NAME' => 'push',
                 'GITHUB_REF' => "refs/tags/{$semanticVersion}",
+                'GITHUB_REF_PROTECTED' => 'false',
                 'GITHUB_REF_TYPE' => 'tag',
                 'GITHUB_RUN_ATTEMPT' => '1',
                 'GITHUB_RUN_ID' => '1',
@@ -2158,6 +2180,7 @@ it('executes immutable-tag, compensation, and platform-verification behavior aga
         'bash',
         releaseWorkflowRepositoryRoot().'/tests/Integration/PublishLinuxImageScriptTest.sh',
     ]);
+    $process->setTimeout(180);
     $process->run();
 
     expect($process->isSuccessful())->toBeTrue($process->getErrorOutput())
@@ -2303,14 +2326,31 @@ it('defines one referrerless fork release graph for the main image on both platf
             $entry['product'] ?? null,
             $entry['dockerfile'] ?? null,
             $entry['platform'] ?? null,
-            $entry['runner'] ?? null,
         ],
         $matrix,
     );
     expect($contracts)->toBe([
-        ['main', 'docker/production/Dockerfile', 'linux/amd64', 'ubuntu-24.04'],
-        ['main', 'docker/production/Dockerfile', 'linux/arm64', 'ubuntu-24.04-arm'],
+        ['main', 'docker/production/Dockerfile', 'linux/amd64'],
+        ['main', 'docker/production/Dockerfile', 'linux/arm64'],
     ]);
+
+    $trustedForkRunner = [
+        'group' => 'coolify-trusted',
+        'labels' => ['self-hosted', 'Linux', 'X64', 'williamacallahan'],
+    ];
+    expect($jobs['fork-build']['runs-on'] ?? null)->toBe($trustedForkRunner)
+        ->and($jobs['fork-stage']['runs-on'] ?? null)->toBe($trustedForkRunner)
+        ->and($jobs['fork-release']['runs-on'] ?? null)->toBe($trustedForkRunner);
+
+    $qemuSetup = releaseWorkflowStep($jobs['fork-build'] ?? [], 'Set up QEMU for fork cross-platform builds');
+    $buildxPlatformVerification = (string) (releaseWorkflowStep(
+        $jobs['fork-build'] ?? [],
+        'Verify fork Buildx platform support',
+    )['run'] ?? '');
+    expect($qemuSetup['uses'] ?? null)
+        ->toBe('docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130')
+        ->and($qemuSetup['with']['platforms'] ?? null)->toBe('arm64')
+        ->and($buildxPlatformVerification)->toContain('docker buildx inspect --bootstrap | grep -F "$PLATFORM"');
 
     $buildStep = releaseWorkflowStep(
         $jobs['fork-build'] ?? [],
@@ -2408,6 +2448,9 @@ it('defines one referrerless fork release graph for the main image on both platf
         ->toContain('accepting recovery state')
         ->toContain('assert_live_fork_tag_binding')
         ->toContain('assert_active_fork_tag_protection')
+        ->toContain('assert_dispatch_source_binding')
+        ->toContain('assert_release_source_binding')
+        ->toContain('[[ "$GITHUB_REF" == refs/heads/v4.x ]]')
         ->toContain('Protect Coolify fork release tags')
         ->toContain('refs/tags/*.*.*-fork*')
         ->toContain('index("creation")')
@@ -2421,9 +2464,9 @@ it('defines one referrerless fork release graph for the main image on both platf
         ->not->toContain('DOCKER_TARGET');
 
     $preflightMainPosition = strpos($promotionRun, 'preflight_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"');
-    $preWriteTagVerificationPosition = strpos($promotionRun, 'assert_live_fork_tag_binding', $preflightMainPosition ?: 0);
+    $preWriteTagVerificationPosition = strpos($promotionRun, 'assert_release_source_binding', $preflightMainPosition ?: 0);
     $mainPromotionPosition = strpos($promotionRun, 'promote_or_verify_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"');
-    $postWriteTagVerificationPosition = strpos($promotionRun, 'assert_live_fork_tag_binding', ($mainPromotionPosition ?: 0) + 1);
+    $postWriteTagVerificationPosition = strpos($promotionRun, 'assert_release_source_binding', ($mainPromotionPosition ?: 0) + 1);
     expect($preflightMainPosition)->not->toBeFalse()
         ->and($preWriteTagVerificationPosition)->not->toBeFalse()
         ->and($mainPromotionPosition)->not->toBeFalse()
@@ -2433,6 +2476,8 @@ it('defines one referrerless fork release graph for the main image on both platf
         ->and($postWriteTagVerificationPosition)->toBeGreaterThan($mainPromotionPosition);
 
     $attestationJob = $jobs['fork-attest'] ?? [];
+    expect($attestationJob['if'] ?? null)
+        ->toBe('${{ inputs.release_kind == \'fork\' && needs.fork-stage.result == \'success\' }}');
     $forkAttestations = collect(releaseWorkflowSteps($attestationJob))
         ->filter(fn (array $step): bool => str_starts_with((string) ($step['uses'] ?? ''), 'actions/attest@'));
     expect($forkAttestations)->toHaveCount(6);
@@ -2448,7 +2493,23 @@ it('defines one referrerless fork release graph for the main image on both platf
         ->toContain('--bundle "$bundle"')
         ->toContain('--source-digest "$GITHUB_SHA"')
         ->toContain('--source-ref "$GITHUB_REF"')
+        ->toContain('case "$SOURCE_IS_TAG" in')
+        ->toContain('false)')
         ->not->toContain('--bundle-from-oci');
+    foreach ([
+        'Generate and Ed25519-sign strict fork deploy manifests',
+        'Sign amd64 deploy manifest off-registry',
+        'Sign arm64 deploy manifest off-registry',
+        'Collect deploy-manifest attestation bundles and checksums',
+    ] as $tagOnlyStepName) {
+        expect(releaseWorkflowStep($attestationJob, $tagOnlyStepName)['if'] ?? null)
+            ->toBe('${{ inputs.source_is_tag }}');
+    }
+    $bundleChecksums = releaseWorkflowStep($attestationJob, 'Collect fork bundle checksums');
+    expect($bundleChecksums)->not->toHaveKey('if')
+        ->and((string) ($bundleChecksums['run'] ?? ''))
+        ->toContain('find . -maxdepth 1 -type f -print0')
+        ->toContain('install -m 0600 "$checksum_file" fork-signed-bundles/SHA256SUMS');
 
     $releaseBundleDownload = releaseWorkflowStep(
         $jobs['fork-release'] ?? [],
@@ -2463,6 +2524,10 @@ it('defines one referrerless fork release graph for the main image on both platf
         'Create or validate empty draft recovery release before semantic promotion',
     )['run'] ?? '');
     $forkRelease = $jobs['fork-release'] ?? [];
+    $releaseEvidence = (string) (releaseWorkflowStep(
+        $forkRelease,
+        'Record verified direct fork registry evidence',
+    )['run'] ?? '');
     $releaseCheckoutSteps = collect(releaseWorkflowSteps($forkRelease))
         ->filter(static fn (array $step): bool => str_starts_with((string) ($step['uses'] ?? ''), 'actions/checkout@'));
     $finalPolicyStep = releaseWorkflowStep(
@@ -2510,6 +2575,13 @@ it('defines one referrerless fork release graph for the main image on both platf
     expect($forkRelease['permissions']['contents'] ?? null)->toBe('write')
         ->and($releaseBundleDownload['with']['artifact-ids'] ?? null)
         ->toBe('${{ needs.fork-attest.outputs.bundle_artifact_id }}')
+        ->and($releaseBundleDownload['if'] ?? null)->toBe('${{ inputs.source_is_tag }}')
+        ->and(releaseWorkflowStep($forkRelease, 'Install pinned GitHub CLI for fork release publication')['if'] ?? null)
+        ->toBe('${{ inputs.source_is_tag }}')
+        ->and(releaseWorkflowStep($forkRelease, 'Create or validate empty draft recovery release before semantic promotion')['if'] ?? null)
+        ->toBe('${{ inputs.source_is_tag }}')
+        ->and(releaseWorkflowStep($forkRelease, 'Publish immutable signed fork bundles to the tag release')['if'] ?? null)
+        ->toBe('${{ inputs.source_is_tag }}')
         ->and($draftRecovery)
         ->toContain('"$GH_CLI" release create')
         ->toContain('--verify-tag')
@@ -2534,7 +2606,14 @@ it('defines one referrerless fork release graph for the main image on both platf
         ->toContain('sha256sum --check --strict SHA256SUMS')
         ->toContain('Fork tag release asset does not match the signed release bundle')
         ->toContain('Published fork tag release assets are incomplete; refusing to modify a published release.')
-        ->not->toContain('--clobber');
+        ->not->toContain('--clobber')
+        ->and($releaseEvidence)
+        ->toContain('### Verified fork registry publication')
+        ->toContain('"$FORK_LATEST_TAG"')
+        ->toContain('"$FORK_VERSION_TAG"')
+        ->toContain('"$FORK_VERSION_SHA_TAG"')
+        ->toContain('linux/amd64')
+        ->toContain('linux/arm64');
 
     $forkReleaseStepNames = array_map(
         static fn (array $step): string => (string) ($step['name'] ?? ''),
@@ -2568,6 +2647,7 @@ it('defines one referrerless fork release graph for the main image on both platf
         'publish_latest' => false,
         'release_kind' => 'fork',
         'semantic_version' => '${{ needs.resolve-tag.outputs.version }}',
+        'source_is_tag' => '${{ needs.resolve-tag.outputs.source_is_tag == \'true\' }}',
         'target_repository' => 'williamagh/coolify',
         'validate_only' => false,
     ])->and(array_keys($publish['secrets'] ?? []))->toBe([
@@ -2587,7 +2667,7 @@ it('defines one referrerless fork release graph for the main image on both platf
         ->not->toContain('FORK_RELEASE_SIGNING_KEY_ID');
 });
 
-it('requires exact fork tag source binding and rejects fork aliases', function () {
+it('permits only exact fork tags or protected v4.x direct fork publication sources', function () {
     $root = releaseWorkflowRepositoryRoot();
     $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
     $targetStep = releaseWorkflowStepById($workflow['jobs']['validate-inputs'] ?? [], 'target');
@@ -2595,17 +2675,20 @@ it('requires exact fork tag source binding and rejects fork aliases', function (
     $semanticPattern = (string) ($targetStep['env']['SEMANTIC_VERSION_PATTERN'] ?? '');
     $forkPattern = (string) ($targetStep['env']['FORK_SEMANTIC_VERSION_PATTERN'] ?? '');
     $cases = [
-        'exact current fork tag' => ['4.13.1-fork', 'refs/tags/4.13.1-fork', 'tag', 'false', 'false', true],
-        'future fork release' => ['4.14.0-fork', 'refs/tags/4.14.0-fork', 'tag', 'false', 'false', true],
-        'legacy numbered fork release' => ['4.13.1-fork.1', 'refs/tags/4.13.1-fork.1', 'tag', 'false', 'false', false],
-        'zero fork release' => ['4.13.1-fork.0', 'refs/tags/4.13.1-fork.0', 'tag', 'false', 'false', false],
-        'v-prefixed alias' => ['4.13.1-fork', 'refs/tags/v4.13.1-fork', 'tag', 'false', 'false', false],
-        'branch ref' => ['4.13.1-fork', 'refs/heads/main', 'branch', 'false', 'false', false],
-        'latest publication' => ['4.13.1-fork', 'refs/tags/4.13.1-fork', 'tag', 'true', 'false', false],
-        'validate-only publication' => ['4.13.1-fork', 'refs/tags/4.13.1-fork', 'tag', 'false', 'true', false],
+        'exact current fork tag' => ['4.13.1-fork', 'refs/tags/4.13.1-fork', 'tag', 'push', 'false', 'true', 'false', 'false', true],
+        'future fork release' => ['4.14.0-fork', 'refs/tags/4.14.0-fork', 'tag', 'push', 'false', 'true', 'false', 'false', true],
+        'protected v4x direct dispatch' => ['4.13.1-fork', 'refs/heads/v4.x', 'branch', 'workflow_dispatch', 'true', 'false', 'false', 'false', true],
+        'legacy numbered fork release' => ['4.13.1-fork.1', 'refs/tags/4.13.1-fork.1', 'tag', 'push', 'false', 'true', 'false', 'false', false],
+        'zero fork release' => ['4.13.1-fork.0', 'refs/tags/4.13.1-fork.0', 'tag', 'push', 'false', 'true', 'false', 'false', false],
+        'v-prefixed alias' => ['4.13.1-fork', 'refs/tags/v4.13.1-fork', 'tag', 'push', 'false', 'true', 'false', 'false', false],
+        'unprotected v4x direct dispatch' => ['4.13.1-fork', 'refs/heads/v4.x', 'branch', 'workflow_dispatch', 'false', 'false', 'false', 'false', false],
+        'wrong direct branch' => ['4.13.1-fork', 'refs/heads/main', 'branch', 'workflow_dispatch', 'true', 'false', 'false', 'false', false],
+        'tag mode with dispatch event' => ['4.13.1-fork', 'refs/tags/4.13.1-fork', 'tag', 'workflow_dispatch', 'false', 'true', 'false', 'false', false],
+        'latest publication' => ['4.13.1-fork', 'refs/tags/4.13.1-fork', 'tag', 'push', 'false', 'true', 'true', 'false', false],
+        'validate-only publication' => ['4.13.1-fork', 'refs/tags/4.13.1-fork', 'tag', 'push', 'false', 'true', 'false', 'true', false],
     ];
 
-    foreach ($cases as $description => [$version, $ref, $refType, $publishLatest, $validateOnly, $successful]) {
+    foreach ($cases as $description => [$version, $ref, $refType, $eventName, $refProtected, $sourceIsTag, $publishLatest, $validateOnly, $successful]) {
         $output = tempnam(sys_get_temp_dir(), 'coolify-fork-target-');
         expect($output)->not->toBeFalse();
         try {
@@ -2613,10 +2696,13 @@ it('requires exact fork tag source binding and rejects fork aliases', function (
                 'ARTIFACT_NAME' => 'coolify-fork',
                 'CANDIDATE_REPOSITORY' => 'williamagh/coolify-fork-candidates',
                 'DOCKERFILE' => 'docker/production/Dockerfile',
-                'FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY' => 'fixture-private-key',
+                'FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY' => $sourceIsTag === 'true' ? 'fixture-private-key' : '',
                 'FORK_SEMANTIC_VERSION_PATTERN' => $forkPattern,
+                'FORK_SOURCE_IS_TAG' => $sourceIsTag,
                 'GITHUB_OUTPUT' => $output,
+                'GITHUB_EVENT_NAME' => $eventName,
                 'GITHUB_REF' => $ref,
+                'GITHUB_REF_PROTECTED' => $refProtected,
                 'GITHUB_REF_TYPE' => $refType,
                 'GITHUB_RUN_ATTEMPT' => '1',
                 'GITHUB_RUN_ID' => '1',
@@ -2640,7 +2726,7 @@ it('requires exact fork tag source binding and rejects fork aliases', function (
     }
 });
 
-it('requires both fork application version sources to exactly match the immutable tag before builds', function () {
+it('requires both fork application version sources to exactly match the immutable source before builds', function () {
     $root = releaseWorkflowRepositoryRoot();
     $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
     $validateInputs = $workflow['jobs']['validate-inputs'] ?? [];
@@ -2650,7 +2736,7 @@ it('requires both fork application version sources to exactly match the immutabl
     );
     $versionStep = releaseWorkflowStep(
         $validateInputs,
-        'Require fork application versions match the immutable tag',
+        'Require fork application versions match the immutable source',
     );
     $script = (string) ($versionStep['run'] ?? '');
     $validateInputStepNames = array_map(
@@ -2658,7 +2744,7 @@ it('requires both fork application version sources to exactly match the immutabl
         releaseWorkflowSteps($validateInputs),
     );
     $checkoutPosition = array_search('Check out exact fork source for version binding', $validateInputStepNames, true);
-    $versionPosition = array_search('Require fork application versions match the immutable tag', $validateInputStepNames, true);
+    $versionPosition = array_search('Require fork application versions match the immutable source', $validateInputStepNames, true);
     expect($checkoutStep['uses'] ?? null)
         ->toBe('actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd')
         ->and($validateInputs['permissions'] ?? null)->toBe(['contents' => 'read'])
@@ -2684,13 +2770,13 @@ it('requires both fork application version sources to exactly match the immutabl
                 str_replace("'4.13.3-fork'", "'4.13.4-fork'", $constants),
                 $versions,
                 false,
-                'config/constants.php Coolify version must equal the fork tag',
+                'config/constants.php Coolify version must equal the fork publication version',
             ],
             'versions json mismatch' => [
                 $constants,
                 str_replace('"4.13.3-fork"', '"4.13.4-fork"', $versions),
                 false,
-                'versions.json Coolify v4 version must equal the fork tag',
+                'versions.json Coolify v4 version must equal the fork publication version',
             ],
         ];
 
@@ -2895,16 +2981,25 @@ it('reconciles ambiguous fork release publication and accepts exact published re
     }
 });
 
-it('requires the fork tag commit to be reachable from the trusted v4.x branch before publication', function () {
+it('binds tag compatibility and direct dispatch publication to an exact trusted source', function () {
     $caller = Yaml::parseFile(releaseWorkflowRepositoryRoot().'/.github/workflows/publish-fork.yml');
     $resolveTag = $caller['jobs']['resolve-tag'] ?? [];
     $resolveTagRun = (string) (releaseWorkflowStepById($resolveTag, 'version')['run'] ?? '');
 
     expect($resolveTag['needs'] ?? null)->toBe('application-validation')
+        ->and($resolveTag['outputs']['version'] ?? null)->toBe('${{ steps.version.outputs.version }}')
+        ->and($resolveTag['outputs']['source_is_tag'] ?? null)->toBe('${{ steps.version.outputs.source_is_tag }}')
         ->and($resolveTagRun)
         ->toContain("git fetch --no-tags origin '+refs/heads/v4.x:refs/remotes/origin/v4.x'")
         ->toContain("git rev-parse --verify 'refs/remotes/origin/v4.x^{commit}'")
-        ->toContain('git merge-base --is-ancestor "$SOURCE_REVISION" "$trusted_default_branch"');
+        ->toContain('push:tag)')
+        ->toContain('workflow_dispatch:branch)')
+        ->toContain("[[ \"\$REF\" == 'refs/heads/v4.x' ]]")
+        ->toContain('[[ "$REF_PROTECTED" == true ]]')
+        ->toContain('[[ "$SOURCE_REVISION" == "$trusted_default_branch" ]]')
+        ->toContain('git merge-base --is-ancestor "$SOURCE_REVISION" "$trusted_default_branch"')
+        ->toContain('[[ "$constants_version" == "$versions_json_version" ]]')
+        ->toContain('source_is_tag=%s');
 });
 
 it('emits the strict signed fork deploy manifest schema', function () {
@@ -2994,6 +3089,37 @@ it('accepts an idempotent fork semantic promotion without overwriting its matchi
             ->and(trim((string) file_get_contents($registry['state'].'/fork-4.13.1-fork-aaaaaaa')))->toBe(releaseWorkflowTestDigest('3'))
             ->and(substr_count((string) file_get_contents($registry['curl_log']), '/git/ref/tags/4.13.1-fork'))->toBe(2)
             ->and(substr_count((string) file_get_contents($registry['curl_log']), 'rulesets?targets=tag&includes_parents=true&per_page=100'))->toBe(2);
+    } finally {
+        $filesystem->remove($fixture);
+    }
+});
+
+it('publishes and verifies every direct protected-v4x fork registry alias without a GitHub tag', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $promotionRun = (string) (releaseWorkflowStep(
+        $workflow['jobs']['fork-release'] ?? [],
+        'Promote and verify the main fork image',
+    )['run'] ?? '');
+    $filesystem = new Filesystem;
+    $fixture = sys_get_temp_dir().'/coolify-fork-direct-registry-publication-'.bin2hex(random_bytes(8));
+    $registry = releaseWorkflowPrepareForkPromotionRegistryDouble($fixture, null);
+    $registry['environment']['GITHUB_EVENT_NAME'] = 'workflow_dispatch';
+    $registry['environment']['GITHUB_REF'] = 'refs/heads/v4.x';
+    $registry['environment']['GITHUB_REF_PROTECTED'] = 'true';
+    $registry['environment']['GITHUB_REF_TYPE'] = 'branch';
+    $registry['environment']['SOURCE_IS_TAG'] = 'false';
+
+    try {
+        $process = new Process(['bash', '-c', $promotionRun], $root, $registry['environment']);
+        $process->run();
+
+        expect($process->isSuccessful())->toBeTrue($process->getErrorOutput())
+            ->and((string) file_get_contents($registry['curl_log']))->toBe('')
+            ->and(trim((string) file_get_contents($registry['state'].'/main')))->toBe(releaseWorkflowTestDigest('3'))
+            ->and(trim((string) file_get_contents($registry['state'].'/fork-latest')))->toBe(releaseWorkflowTestDigest('3'))
+            ->and(trim((string) file_get_contents($registry['state'].'/fork-4.13.1-fork')))->toBe(releaseWorkflowTestDigest('3'))
+            ->and(trim((string) file_get_contents($registry['state'].'/fork-4.13.1-fork-aaaaaaa')))->toBe(releaseWorkflowTestDigest('3'));
     } finally {
         $filesystem->remove($fixture);
     }

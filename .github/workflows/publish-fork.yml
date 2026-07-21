@@ -19,38 +19,58 @@ jobs:
       contents: read
 
   resolve-tag:
-    name: Bind fork version tag to source commit
+    name: Resolve protected fork publication source
     needs: application-validation
     permissions:
       contents: read
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
+      source_is_tag: ${{ steps.version.outputs.source_is_tag }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ github.sha }}
 
       - id: version
-        name: Require an exact fork tag and commit binding
+        name: Resolve a protected fork source and application version
         env:
+          EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
           REF_NAME: ${{ github.ref_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
           REF_TYPE: ${{ github.ref_type }}
           SOURCE_REVISION: ${{ github.sha }}
           VERSION_PATTERN: '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-fork$'
         run: |
           set -Eeuo pipefail
-          [[ "$REF_TYPE" == tag ]]
-          [[ "$REF" == "refs/tags/$REF_NAME" ]]
-          printf '%s' "$REF_NAME" | grep -Eq "$VERSION_PATTERN"
           printf '%s' "$SOURCE_REVISION" | grep -Eq '^[0-9a-f]{40}$'
-          [[ "$(git rev-parse --verify "${REF}^{commit}")" == "$SOURCE_REVISION" ]]
           [[ "$(git cat-file -t "$SOURCE_REVISION")" == commit ]]
           git fetch --no-tags origin '+refs/heads/v4.x:refs/remotes/origin/v4.x'
           trusted_default_branch="$(git rev-parse --verify 'refs/remotes/origin/v4.x^{commit}')"
-          git merge-base --is-ancestor "$SOURCE_REVISION" "$trusted_default_branch"
+
+          case "$EVENT_NAME:$REF_TYPE" in
+            push:tag)
+              [[ "$REF" == "refs/tags/$REF_NAME" ]]
+              printf '%s' "$REF_NAME" | grep -Eq "$VERSION_PATTERN"
+              [[ "$(git rev-parse --verify "${REF}^{commit}")" == "$SOURCE_REVISION" ]]
+              git merge-base --is-ancestor "$SOURCE_REVISION" "$trusted_default_branch"
+              source_is_tag=true
+              ;;
+            workflow_dispatch:branch)
+              [[ "$REF" == 'refs/heads/v4.x' ]]
+              [[ "$REF_NAME" == v4.x ]]
+              [[ "$REF_PROTECTED" == true ]]
+              [[ "$SOURCE_REVISION" == "$trusted_default_branch" ]]
+              source_is_tag=false
+              ;;
+            *)
+              printf 'Fork publication requires a push tag or a protected v4.x workflow_dispatch source.\n' >&2
+              exit 1
+              ;;
+          esac
 
           command -v php >/dev/null
           command -v jq >/dev/null
@@ -65,17 +85,24 @@ jobs:
             echo $version;
           ' config/constants.php)"
           versions_json_version="$(jq -er '.coolify.v4.version | strings' versions.json)"
-          [[ "$constants_version" == "$REF_NAME" ]] || {
-            printf 'config/constants.php Coolify version must equal the fork tag: expected %s, found %s.\n' \
-              "$REF_NAME" "$constants_version" >&2
+          [[ "$constants_version" == "$versions_json_version" ]] || {
+            printf 'config/constants.php and versions.json must declare the same fork version: found %s and %s.\n' \
+              "$constants_version" "$versions_json_version" >&2
             exit 1
           }
-          [[ "$versions_json_version" == "$REF_NAME" ]] || {
-            printf 'versions.json Coolify v4 version must equal the fork tag: expected %s, found %s.\n' \
-              "$REF_NAME" "$versions_json_version" >&2
-            exit 1
-          }
-          printf 'version=%s\n' "$REF_NAME" >> "$GITHUB_OUTPUT"
+          printf '%s' "$constants_version" | grep -Eq "$VERSION_PATTERN"
+          if [[ "$source_is_tag" == true ]]; then
+            [[ "$constants_version" == "$REF_NAME" ]] || {
+              printf 'config/constants.php Coolify version must equal the fork tag: expected %s, found %s.\n' \
+                "$REF_NAME" "$constants_version" >&2
+              exit 1
+            }
+          fi
+
+          {
+            printf 'version=%s\n' "$constants_version"
+            printf 'source_is_tag=%s\n' "$source_is_tag"
+          } >> "$GITHUB_OUTPUT"
 
   publish:
     name: Build, attest, and coordinate fork publication
@@ -97,6 +124,7 @@ jobs:
       publish_latest: false
       release_kind: fork
       semantic_version: ${{ needs.resolve-tag.outputs.version }}
+      source_is_tag: ${{ needs.resolve-tag.outputs.source_is_tag == 'true' }}
       target_repository: williamagh/coolify
       validate_only: false
     secrets:
