@@ -57,6 +57,8 @@ on:
         required: false
       FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY:
         required: false
+      FORK_RELEASE_RULESET_TOKEN:
+        required: false
     outputs:
       digest:
         description: Published multi-platform index digest.
@@ -2470,7 +2472,7 @@ jobs:
 
       - name: Create or validate empty draft recovery release before semantic promotion
         env:
-          FORK_RELEASE_RULESET_TOKEN: ${{ github.token }}
+          FORK_RELEASE_RULESET_TOKEN: ${{ secrets.FORK_RELEASE_RULESET_TOKEN }}
           GH_CLI: ${{ steps.fork-release-gh-cli.outputs.path }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -2627,7 +2629,7 @@ jobs:
 
       - name: Promote and verify the main fork image
         env:
-          FORK_RELEASE_RULESET_TOKEN: ${{ github.token }}
+          FORK_RELEASE_RULESET_TOKEN: ${{ secrets.FORK_RELEASE_RULESET_TOKEN }}
           GH_CLI: ${{ steps.fork-release-gh-cli.outputs.path }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -2839,7 +2841,7 @@ jobs:
 
       - name: Publish immutable signed fork bundles to the tag release
         env:
-          FORK_RELEASE_RULESET_TOKEN: ${{ github.token }}
+          FORK_RELEASE_RULESET_TOKEN: ${{ secrets.FORK_RELEASE_RULESET_TOKEN }}
           GH_CLI: ${{ steps.fork-release-gh-cli.outputs.path }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -3033,7 +3035,7 @@ jobs:
 
       - name: Reverify every fork alias after release publication
         env:
-          FORK_RELEASE_RULESET_TOKEN: ${{ github.token }}
+          FORK_RELEASE_RULESET_TOKEN: ${{ secrets.FORK_RELEASE_RULESET_TOKEN }}
           GH_CLI: ${{ steps.fork-release-gh-cli.outputs.path }}
           GH_TOKEN: ${{ github.token }}
         run: |
