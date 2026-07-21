@@ -589,12 +589,14 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
                     // Log but don't fail - event dispatch errors shouldn't prevent status updates
                     Log::warning('Failed to dispatch ServiceStatusChanged for deployment '.$this->deployment_uuid.': '.$e->getMessage());
                 }
+            }
 
-                try {
-                    $this->blueGreenLifecycle?->release();
-                } catch (Throwable $e) {
-                    Log::warning('Failed to release blue-green lifecycle ownership for deployment '.$this->deployment_uuid.': '.$e->getMessage());
-                }
+            // Always drop the cache lock, including preparation→activation handoff.
+            // Activation is a separate worker process and cannot inherit the owner token.
+            try {
+                $this->blueGreenLifecycle?->release();
+            } catch (Throwable $e) {
+                Log::warning('Failed to release blue-green lifecycle ownership for deployment '.$this->deployment_uuid.': '.$e->getMessage());
             }
         }
     }
