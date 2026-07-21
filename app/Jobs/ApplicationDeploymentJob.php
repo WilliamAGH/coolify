@@ -252,6 +252,8 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
 
     private bool $handoffScheduled = false;
 
+    private bool $preserveBlueGreenRecovery = false;
+
     private Collection|string $build_secrets;
 
     private ?BlueGreenDeploymentLifecycle $blueGreenLifecycle = null;
@@ -443,7 +445,22 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
                         $this->checkForCancellation();
                     },
                 );
-                $this->blueGreenLifecycle->initialize();
+                if ($this->activationOnly) {
+                    $this->blueGreenLifecycle->initializePreparedActivation();
+                } else {
+                    $this->blueGreenLifecycle->initialize();
+                }
+                if ($this->blueGreenLifecycle->wasPreparedActivationHandled()) {
+                    $this->preserveBlueGreenRecovery = true;
+
+                    return;
+                }
+                if ($this->activationOnly && $this->blueGreenLifecycle->isCompletedDrainingRecovery()) {
+                    $this->preserveBlueGreenRecovery = true;
+                    $this->completeBlueGreenDrainRecovery();
+
+                    return;
+                }
                 if ($this->blueGreenLifecycle->isDrainingRecovery()) {
                     $this->blueGreenLifecycle->resumeDrainingOperation();
                     if ($this->blueGreenLifecycle->wasFinalizedFallbackRecovered()) {
@@ -545,7 +562,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         } finally {
             // Wrap cleanup operations in try-catch to prevent exceptions from interfering
             // with Laravel's job failure handling and status updates
-            if (! $drainRecoveryScheduled && ! $this->handoffScheduled) {
+            if (! $drainRecoveryScheduled && ! $this->handoffScheduled && ! $this->preserveBlueGreenRecovery) {
                 try {
                     ApplicationDeploymentQueue::query()
                         ->whereKey($this->application_deployment_queue->getKey())
@@ -563,7 +580,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
                 }
             }
 
-            if (! $this->handoffScheduled) {
+            if (! $this->handoffScheduled && ! $this->preserveBlueGreenRecovery) {
                 try {
                     if ($this->use_build_server) {
                         $this->server = $this->build_server;
