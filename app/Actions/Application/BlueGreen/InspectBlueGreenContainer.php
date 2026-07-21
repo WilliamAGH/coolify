@@ -17,14 +17,16 @@ class InspectBlueGreenContainer
     public function handle(Server $server, BlueGreenContainerExpectation $expectation): BlueGreenContainerInspection
     {
         $identifier = $expectation->dockerId ?? $expectation->name;
-        $output = trim((string) instant_remote_process([
+        $output = trim((string) instant_privileged_remote_script(
             $this->commandFor($identifier),
-        ], $server));
+            $server,
+        ));
 
         if ($output === self::MISSING && $expectation->dockerId !== null) {
-            $namedOutput = trim((string) instant_remote_process([
+            $namedOutput = trim((string) instant_privileged_remote_script(
                 $this->commandFor($expectation->name),
-            ], $server));
+                $server,
+            ));
             if ($namedOutput !== self::MISSING) {
                 throw new RuntimeException("The persisted container name {$expectation->name} was reused by another Docker identity.");
             }

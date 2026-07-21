@@ -32,9 +32,10 @@ class WriteBlueGreenProxyConfiguration
         string $expectedBootId,
     ): BlueGreenProxyRollbackArtifact {
         $this->assertTraefik($server);
-        $output = instant_remote_process([
+        $output = instant_privileged_remote_script(
             $this->commandFor($server->proxyPath(), $configuration, $rollbackKey, $expectedBootId),
-        ], $server);
+            $server,
+        );
 
         return BlueGreenProxyRollbackArtifact::fromRemoteOutput($rollbackKey, $output ?? '');
     }
@@ -71,9 +72,10 @@ class WriteBlueGreenProxyConfiguration
         string $expectedBootId,
     ): string {
         $this->assertTraefik($server);
-        $output = trim((string) instant_remote_process([
+        $output = trim((string) instant_privileged_remote_script(
             $this->repairCommandFor($server->proxyPath(), $configuration, $expectedBootId),
-        ], $server));
+            $server,
+        ));
         if (! in_array($output, [
             self::REPAIR_HEALTHY_OUTPUT,
             self::REPAIR_MISSING_OUTPUT,

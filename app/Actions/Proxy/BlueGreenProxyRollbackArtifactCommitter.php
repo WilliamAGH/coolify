@@ -16,9 +16,10 @@ class BlueGreenProxyRollbackArtifactCommitter
         if ($server->proxyType() !== ProxyTypes::TRAEFIK->value) {
             throw new InvalidArgumentException('Blue/green proxy rollback requires a Traefik server.');
         }
-        instant_remote_process([
+        instant_privileged_remote_script(
             $this->commandFor($server->proxyPath(), $rollbackKey),
-        ], $server);
+            $server,
+        );
     }
 
     public function commandFor(string $proxyPath, BlueGreenProxyRollbackKey $rollbackKey): string

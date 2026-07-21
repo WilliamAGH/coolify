@@ -20,9 +20,10 @@ final class RemoveBlueGreenProxyConfiguration
             throw new InvalidArgumentException('Blue/green proxy configuration removal requires a Traefik server.');
         }
         $writer = new WriteBlueGreenProxyConfiguration;
-        $output = instant_remote_process([
+        $output = instant_privileged_remote_script(
             $writer->removeCommandFor($server->proxyPath(), $rollbackKey, $expectedBootId),
-        ], $server);
+            $server,
+        );
 
         return BlueGreenProxyRollbackArtifact::fromRemoteOutput($rollbackKey, $output ?? '');
     }

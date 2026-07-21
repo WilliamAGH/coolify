@@ -36,9 +36,10 @@ final class ReadBlueGreenManagedRouteMetadata
             (string) $application->uuid,
             (int) $destination->getKey(),
         );
-        $output = trim((string) instant_remote_process([
+        $output = trim((string) instant_privileged_remote_script(
             $this->commandFor($server->proxyPath(), $managedFilename),
-        ], $server));
+            $server,
+        ));
         if ($output === self::ABSENT_OUTPUT) {
             return null;
         }

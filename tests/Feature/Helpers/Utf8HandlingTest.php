@@ -15,6 +15,9 @@ class Utf8HandlingTest extends TestCase
         // Test with empty string
         $this->assertEquals('', sanitize_utf8_text(''));
 
+        // Numeric command output must not be erased by PHP empty-value semantics.
+        $this->assertSame('0', sanitize_utf8_text('0'));
+
         // Test with malformed UTF-8 (binary data)
         $malformedUtf8 = "Hello\x80\x81\x82World";
         $sanitized = sanitize_utf8_text($malformedUtf8);

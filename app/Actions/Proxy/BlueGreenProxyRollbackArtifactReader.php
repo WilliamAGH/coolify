@@ -18,9 +18,10 @@ class BlueGreenProxyRollbackArtifactReader
         if ($server->proxyType() !== ProxyTypes::TRAEFIK->value) {
             throw new InvalidArgumentException('Blue/green proxy rollback requires a Traefik server.');
         }
-        $output = instant_remote_process([
+        $output = instant_privileged_remote_script(
             $this->commandFor($server->proxyPath(), $rollbackKey),
-        ], $server);
+            $server,
+        );
         if (trim((string) $output) === self::ABSENT_OUTPUT) {
             return null;
         }

@@ -37,9 +37,10 @@ final class InspectBlueGreenReplicaSet
             throw new RuntimeException('The durable blue-green replica ledger does not match the configured promotion threshold.');
         }
 
-        $output = trim((string) instant_remote_process([
+        $output = trim((string) instant_privileged_remote_script(
             $this->commandFor($replicas, $expectedCount),
-        ], $server));
+            $server,
+        ));
 
         return $this->parse(
             output: $output,

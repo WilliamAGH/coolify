@@ -478,13 +478,14 @@ final class RetireBlueGreenInactiveContainer
     private function attestDestinationState(Server $server, BlueGreenProxyState $state): bool
     {
         try {
-            $result = trim((string) instant_remote_process([
+            $result = trim((string) instant_privileged_remote_script(
                 (new WriteBlueGreenProxyConfiguration)->attestStateCommandFor(
                     $server->proxyPath(),
                     $state->managedFilename,
                     $state,
                 ),
-            ], $server));
+                $server,
+            ));
 
             return $result === 'coolify-blue-green-destination-state-attested';
         } catch (Throwable) {

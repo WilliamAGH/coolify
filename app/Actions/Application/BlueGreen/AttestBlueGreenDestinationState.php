@@ -28,13 +28,14 @@ final class AttestBlueGreenDestinationState
             (string) $application->uuid,
             (int) $destination->id,
         );
-        $result = trim((string) instant_remote_process([
+        $result = trim((string) instant_privileged_remote_script(
             (new WriteBlueGreenProxyConfiguration)->attestStateCommandFor(
                 $server->proxyPath(),
                 $managedFilename,
                 $expectedState,
             ),
-        ], $server));
+            $server,
+        ));
         if ($result !== 'coolify-blue-green-destination-state-attested') {
             throw new BlueGreenDeploymentTransitionException('The remote destination state did not return its exact attestation.');
         }

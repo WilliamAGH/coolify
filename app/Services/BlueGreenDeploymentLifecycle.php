@@ -1850,13 +1850,14 @@ final class BlueGreenDeploymentLifecycle
             throw new DeploymentException('Managed route verification does not match the last destination mutation.');
         }
         $this->assertOperationOwned($expectedPhase);
-        $output = trim((string) instant_remote_process([
+        $output = trim((string) instant_privileged_remote_script(
             (new WriteBlueGreenProxyConfiguration)->attestStateCommandFor(
                 $this->server->proxyPath(),
                 $configuration->managedFilename,
                 $destinationState,
             ),
-        ], $this->server));
+            $this->server,
+        ));
         if ($output !== 'coolify-blue-green-destination-state-attested') {
             throw new DeploymentException('The active blue-green Traefik state did not return its exact attestation.');
         }
@@ -2209,13 +2210,14 @@ final class BlueGreenDeploymentLifecycle
     private function remoteDestinationStateMatches(BlueGreenProxyState $expectedState): bool
     {
         try {
-            $output = trim((string) instant_remote_process([
+            $output = trim((string) instant_privileged_remote_script(
                 (new WriteBlueGreenProxyConfiguration)->attestStateCommandFor(
                     $this->server->proxyPath(),
                     $expectedState->managedFilename,
                     $expectedState,
                 ),
-            ], $this->server));
+                $this->server,
+            ));
 
             return $output === 'coolify-blue-green-destination-state-attested';
         } catch (Throwable) {

@@ -17,7 +17,7 @@ final class RemoveBlueGreenComposeSidecars
             return;
         }
 
-        instant_remote_process([$this->commandFor($plan)], $server);
+        instant_privileged_remote_script($this->commandFor($plan), $server);
     }
 
     public function assertAbsent(Server $server, ?BlueGreenComposeSidecarDeactivationPlan $plan): void
@@ -26,7 +26,7 @@ final class RemoveBlueGreenComposeSidecars
             return;
         }
 
-        instant_remote_process([$this->assertAbsentCommandFor($plan)], $server);
+        instant_privileged_remote_script($this->assertAbsentCommandFor($plan), $server);
     }
 
     public function planFor(Application $application): ?BlueGreenComposeSidecarDeactivationPlan
