@@ -105,6 +105,8 @@ new_fixture() {
         FORK_DEPLOY_FAIL_CANDIDATE_RUNTIME_VERIFY \
         FORK_DEPLOY_FAIL_LEGACY_RUNTIME_VERIFY \
         FORK_DEPLOY_FAIL_BUNDLED_ROUTE_PROOF \
+        FORK_DEPLOY_BUNDLED_ROUTE_FAILURES \
+        FORK_DEPLOY_BUNDLED_ROUTE_ATTEMPTS_FILE \
         FORK_DEPLOY_FAIL_LEGACY_REALTIME_REMOVE \
         FORK_DEPLOY_LEGACY_CURRENT || true
     unset FORK_DEPLOY_FAIL_ACTIVATED_CONFIG FORK_DEPLOY_KILL_ON_ACTIVE_CONFIG \
@@ -940,6 +942,22 @@ test_legacy_removal_waits_for_bundled_route_proof() {
         pass 'legacy realtime removal waits for bundled route proof'
     else
         fail 'legacy realtime removal waits for bundled route proof'
+    fi
+    cleanup_fixture
+}
+
+test_bundled_route_readiness_retries_during_startup() {
+    new_fixture
+    export COOLIFY_HEALTH_ATTEMPTS=3
+    export FORK_DEPLOY_BUNDLED_ROUTE_FAILURES=2
+    export FORK_DEPLOY_BUNDLED_ROUTE_ATTEMPTS_FILE=$FIXTURE/bundled-route-attempts
+    write_manifest 4.13.0-fork.1
+    if install_release >/dev/null \
+        && [[ $(<"$FORK_DEPLOY_BUNDLED_ROUTE_ATTEMPTS_FILE") == 4 ]] \
+        && [[ ! -e $ROOT/fork-deploy/forward-recovery ]]; then
+        pass 'bundled route readiness retries during startup'
+    else
+        fail 'bundled route readiness retries during startup'
     fi
     cleanup_fixture
 }
@@ -2216,6 +2234,7 @@ test_v1_runtime_digest_mismatch_is_rejected
 test_v1_candidate_is_rejected
 test_v1_rollback_is_rejected_after_migration
 test_legacy_removal_waits_for_bundled_route_proof
+test_bundled_route_readiness_retries_during_startup
 test_partial_legacy_removal_recovers_forward
 test_repair_never_rewrites_verified_bundle
 test_repair_rejects_corrupted_recorded_asset

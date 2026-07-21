@@ -670,6 +670,24 @@ wait_for_health() {
     return 1
 }
 
+fd_wait_for_bundled_route() {
+    local label=$1 url=$2 attempt running
+
+    for ((attempt = 1; attempt <= HEALTH_ATTEMPTS; attempt++)); do
+        if docker exec coolify curl --fail --silent --show-error "$url" --connect-timeout 5 --max-time 10 >/dev/null 2>&1; then
+            return 0
+        fi
+        running=$(docker inspect --format '{{.State.Running}}' coolify 2>/dev/null || true)
+        [[ $running == true ]] || {
+            note "ERROR: $label readiness route failed after the Coolify container stopped" >&2
+            return 1
+        }
+        sleep 2
+    done
+    note "ERROR: $label readiness route did not become healthy after $HEALTH_ATTEMPTS checks" >&2
+    return 1
+}
+
 wait_for_legacy_health() {
     local attempt container status
 
@@ -2271,14 +2289,8 @@ fd_verify_runtime() {
     done
     fd_validate_runtime_bindings
     wait_for_health || return 1
-    docker exec coolify curl --fail --silent --show-error http://127.0.0.1:6001/up --connect-timeout 5 --max-time 10 >/dev/null || {
-        note 'ERROR: bundled Laravel Reverb readiness route failed' >&2
-        return 1
-    }
-    docker exec coolify curl --fail --silent --show-error http://127.0.0.1:6002/ready --connect-timeout 5 --max-time 10 >/dev/null || {
-        note 'ERROR: bundled terminal readiness route failed' >&2
-        return 1
-    }
+    fd_wait_for_bundled_route 'bundled Laravel Reverb' http://127.0.0.1:6001/up || return 1
+    fd_wait_for_bundled_route 'bundled terminal' http://127.0.0.1:6002/ready || return 1
 }
 
 fd_verify_runtime_legacy() {

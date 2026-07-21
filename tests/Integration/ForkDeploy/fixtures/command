@@ -291,6 +291,15 @@ case $name in
             exec)
                 if [[ $* == *'curl '* ]]; then
                     [[ ${FORK_DEPLOY_FAIL_BUNDLED_ROUTE_PROOF:-false} != true ]] || exit 1
+                    if [[ -n ${FORK_DEPLOY_BUNDLED_ROUTE_FAILURES:-} ]]; then
+                        attempts=0
+                        if [[ -f ${FORK_DEPLOY_BUNDLED_ROUTE_ATTEMPTS_FILE:-/nonexistent} ]]; then
+                            attempts=$(<"$FORK_DEPLOY_BUNDLED_ROUTE_ATTEMPTS_FILE")
+                        fi
+                        attempts=$((attempts + 1))
+                        printf '%s\n' "$attempts" >"$FORK_DEPLOY_BUNDLED_ROUTE_ATTEMPTS_FILE"
+                        ((attempts > FORK_DEPLOY_BUNDLED_ROUTE_FAILURES)) || exit 1
+                    fi
                     [[ $* == *'http://127.0.0.1:6001/up'* \
                         || $* == *'http://127.0.0.1:6002/ready'* ]] || exit 64
                 elif [[ $* == *to_regclass* ]]; then
