@@ -25,7 +25,9 @@ assert_logged() {
 assert_not_logged() {
     local unexpected="$1"
 
-    grep -Fx "$unexpected" "$command_log" >/dev/null && fail "unexpected Docker operation: $unexpected"
+    if grep -Fx "$unexpected" "$command_log" >/dev/null; then
+        fail "unexpected Docker operation: $unexpected"
+    fi
 }
 
 assert_removed() {
