@@ -5,6 +5,7 @@ use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingMode;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
+use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
 use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
 use App\Enums\BlueGreenDeploymentColor;
 use Symfony\Component\Yaml\Yaml;
@@ -213,6 +214,18 @@ it('allows ProbeOnly documents that keep application label middlewares after the
             destinationTopologyDigest: hash('sha256', 'probe-only-destination:42'),
         ),
     );
+
+    (new WriteBlueGreenProxyConfiguration)->validate($configuration);
+})->throwsNoExceptions();
+
+it('allows ProbeOnly documents that retain an unreferenced canonical redirect-to-https middleware', function (): void {
+    $configuration = mutateProbeOnlyWriterConfiguration(static function (array $document): array {
+        $document['http']['middlewares'][ControlPlaneDynamicConfiguration::HTTPS_REDIRECT_MIDDLEWARE] = [
+            'redirectScheme' => ['scheme' => 'https'],
+        ];
+
+        return $document;
+    });
 
     (new WriteBlueGreenProxyConfiguration)->validate($configuration);
 })->throwsNoExceptions();

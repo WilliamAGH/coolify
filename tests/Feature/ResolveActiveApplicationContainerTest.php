@@ -140,14 +140,14 @@ it('uses the routed candidate while draining', function () {
         5,
         BlueGreenDeploymentPhase::DRAINING,
     );
-    ApplicationBlueGreenDeployment::query()->create([
+    $state = ApplicationBlueGreenDeployment::query()->create([
         'application_id' => $fixture['application']->id,
         'standalone_docker_id' => $fixture['destination']->id,
         'active_color' => BlueGreenDeploymentColor::BLUE,
         'blue_deployment_uuid' => 'resolver-candidate-blue',
         'operation_deployment_uuid' => 'resolver-candidate-blue',
-        'operation_routing_config_digest' => $fixture['routing'],
         'operation_candidate_container_id' => $candidateId,
+        'operation_routing_config_digest' => $fixture['routing'],
         'phase' => BlueGreenDeploymentPhase::DRAINING,
         'routing_revision' => 5,
         'destination_topology_digest' => $fixture['topology'],
@@ -161,35 +161,43 @@ it('uses the routed candidate while draining', function () {
         ->and($resolution->deploymentUuid)->toBe('resolver-candidate-blue');
 });
 
-it('fails closed when a draining queue no longer owns the operation routing claim', function () {
+it('fails closed when a draining queue no longer owns the operation routing claim', function (): void {
     $fixture = activeContainerResolverFixture('resolver-draining-claim-mismatch');
-    $candidateId = str_repeat('d', 64);
-    activeContainerQueue(
+    $candidateId = str_repeat('7', 64);
+    $queue = activeContainerQueue(
         $fixture,
-        'resolver-claim-mismatch-blue',
+        'resolver-mismatched-candidate-blue',
         $candidateId,
         BlueGreenDeploymentColor::BLUE,
         6,
         BlueGreenDeploymentPhase::DRAINING,
     );
-    ApplicationBlueGreenDeployment::query()->create([
+    $state = ApplicationBlueGreenDeployment::query()->create([
         'application_id' => $fixture['application']->id,
         'standalone_docker_id' => $fixture['destination']->id,
         'active_color' => BlueGreenDeploymentColor::BLUE,
-        'blue_deployment_uuid' => 'resolver-claim-mismatch-blue',
-        'operation_deployment_uuid' => 'resolver-claim-mismatch-blue',
-        'operation_routing_config_digest' => hash('sha256', 'different-routing-claim'),
+        'blue_deployment_uuid' => 'resolver-mismatched-candidate-blue',
+        'operation_deployment_uuid' => 'resolver-mismatched-candidate-blue',
         'operation_candidate_container_id' => $candidateId,
+        'operation_routing_config_digest' => hash('sha256', 'another-operation-claim'),
         'phase' => BlueGreenDeploymentPhase::DRAINING,
         'routing_revision' => 6,
         'destination_topology_digest' => $fixture['topology'],
-        'application_routing_config_digest' => hash('sha256', 'resolver-claim-mismatch-actual-routing'),
+        'application_routing_config_digest' => hash('sha256', 'resolver-mismatched-runtime-route'),
     ]);
 
     $resolution = ResolveActiveApplicationContainer::run(collect([$fixture['application']]))->first();
+    $state->phase = BlueGreenDeploymentPhase::SWITCHING;
+    $routedResolution = (new ResolveActiveApplicationContainer)->resolveRoutedState(
+        $fixture['application'],
+        $state,
+        collect([$queue->deployment_uuid => $queue]),
+    );
 
     expect($resolution->observable)->toBeFalse()
-        ->and($resolution->containerId)->toBeNull();
+        ->and($resolution->preserveStatus)->toBeTrue()
+        ->and($resolution->containerId)->toBeNull()
+        ->and($routedResolution)->toBeNull();
 });
 
 it('fails closed for non-observable and inconsistent durable states', function (BlueGreenDeploymentPhase $phase) {

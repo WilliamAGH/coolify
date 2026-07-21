@@ -49,6 +49,75 @@ it('derives application status only from the durable active generation', functio
     expect($fixture['application']->fresh()->status)->toBe('running:healthy');
 });
 
+it('resolves the active generation when the final route digest differs from its immutable claim digest', function () {
+    $fixture = blueGreenStatusFixture('status-final-route');
+    $activeId = str_repeat('9', 64);
+    blueGreenStatusQueue($fixture, 'status-final-route-blue', $activeId, 3);
+    ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $fixture['application']->id,
+        'standalone_docker_id' => $fixture['destination']->id,
+        'active_color' => BlueGreenDeploymentColor::BLUE,
+        'blue_deployment_uuid' => 'status-final-route-blue',
+        'phase' => BlueGreenDeploymentPhase::IDLE,
+        'routing_revision' => 3,
+        'destination_topology_digest' => $fixture['topology'],
+        'application_routing_config_digest' => hash('sha256', 'status-final-runtime-route'),
+    ]);
+    $fixture['application']->update(['status' => 'exited']);
+
+    (new PushServerUpdateJob($fixture['server'], [
+        'containers' => [
+            blueGreenStatusContainer(
+                $fixture['application']->id,
+                $activeId,
+                'status-final-route-blue',
+                'running',
+                'healthy',
+            ),
+        ],
+    ]))->handle();
+
+    expect($fixture['application']->fresh()->status)->toBe('running:healthy');
+});
+
+it('does not resolve an active generation with a malformed claim or runtime route digest', function (string $owner): void {
+    $fixture = blueGreenStatusFixture('status-malformed-'.$owner);
+    $activeId = str_repeat('8', 64);
+    blueGreenStatusQueue($fixture, 'status-malformed-blue', $activeId, 4);
+    $state = ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $fixture['application']->id,
+        'standalone_docker_id' => $fixture['destination']->id,
+        'active_color' => BlueGreenDeploymentColor::BLUE,
+        'blue_deployment_uuid' => 'status-malformed-blue',
+        'phase' => BlueGreenDeploymentPhase::IDLE,
+        'routing_revision' => 4,
+        'destination_topology_digest' => $fixture['topology'],
+        'application_routing_config_digest' => hash('sha256', 'status-valid-runtime-route'),
+    ]);
+    if ($owner === 'claim') {
+        ApplicationDeploymentQueue::query()
+            ->where('deployment_uuid', 'status-malformed-blue')
+            ->update(['blue_green_routing_config_digest' => 'malformed']);
+    } else {
+        $state->update(['application_routing_config_digest' => 'malformed']);
+    }
+    $fixture['application']->update(['status' => 'exited']);
+
+    (new PushServerUpdateJob($fixture['server'], [
+        'containers' => [
+            blueGreenStatusContainer(
+                $fixture['application']->id,
+                $activeId,
+                'status-malformed-blue',
+                'running',
+                'healthy',
+            ),
+        ],
+    ]))->handle();
+
+    expect($fixture['application']->fresh()->status)->not->toBe('running:healthy');
+})->with(['claim', 'runtime']);
+
 it('preserves status while durable state cannot safely name an observable container', function (BlueGreenDeploymentPhase $phase) {
     $fixture = blueGreenStatusFixture('status-closed-'.$phase->value);
     ApplicationBlueGreenDeployment::query()->create([

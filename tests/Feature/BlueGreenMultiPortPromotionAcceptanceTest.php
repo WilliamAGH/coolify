@@ -70,6 +70,7 @@ function multiPortPromotionAcceptanceFixture(
     array $backendPorts = [3000, 8080],
     bool $historicalPreviousInventory = false,
     bool $claimOperation = true,
+    bool $stageSpecificPreviousRoute = false,
 ): array {
     InstanceSettings::unguarded(
         fn () => InstanceSettings::query()->firstOrCreate(['id' => 0]),
@@ -138,6 +139,16 @@ function multiPortPromotionAcceptanceFixture(
         activeDeploymentUuid: MULTI_PORT_PREVIOUS_DEPLOYMENT,
         activeContainerId: MULTI_PORT_PREVIOUS_CONTAINER_ID,
         destinationTopologyDigest: $previousFingerprint->topologyDigest,
+        blueReplicaBackends: $stageSpecificPreviousRoute
+            ? [$application->uuid.'-blue']
+            : null,
+        greenReplicaBackends: $stageSpecificPreviousRoute
+            ? [
+                $application->uuid.'-green-replica-1',
+                $application->uuid.'-green-replica-2',
+                $application->uuid.'-green-replica-3',
+            ]
+            : null,
     );
     $previousConfiguration = CompileBlueGreenProxyConfiguration::run(
         $application,
@@ -161,7 +172,7 @@ function multiPortPromotionAcceptanceFixture(
         'blue_green_destination_fence_epoch' => 1,
         'blue_green_server_boot_id' => MULTI_PORT_BOOT_ID,
         'blue_green_topology_digest' => $previousFingerprint->topologyDigest,
-        'blue_green_routing_config_digest' => $previousConfiguration->routingConfigDigest,
+        'blue_green_routing_config_digest' => $previousFingerprint->routingConfigDigest,
         'blue_green_backend_port_inventory' => $historicalPreviousInventory ? null : $inventory->serialized,
         'blue_green_drain_backend_port_inventory' => null,
         'blue_green_supersession_generation' => 1,
@@ -232,10 +243,13 @@ it('adopts an unchanged historical fixed-color backend inventory before claiming
     $context = multiPortPromotionAcceptanceFixture(
         backendPorts: $backendPorts,
         historicalPreviousInventory: true,
+        stageSpecificPreviousRoute: true,
     );
     $inventory = BlueGreenBackendPortInventory::fromPorts($backendPorts);
 
-    expect($context['claim'])->toBeInstanceOf(BlueGreenDeploymentClaim::class)
+    expect($context['previous']->blue_green_routing_config_digest)
+        ->not->toBe($context['previousConfiguration']->state->applicationRoutingConfigDigest)
+        ->and($context['claim'])->toBeInstanceOf(BlueGreenDeploymentClaim::class)
         ->and($context['claim']->backendPortInventory->ports())->toBe($backendPorts)
         ->and($context['claim']->drainBackendPortInventory?->ports())->toBe($backendPorts)
         ->and($context['previous']->fresh()->blue_green_backend_port_inventory)->toBe($inventory->serialized)

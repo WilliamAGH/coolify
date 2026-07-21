@@ -2,6 +2,7 @@
 
 namespace App\Actions\Proxy;
 
+use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
 use App\Enums\ProxyTypes;
 use App\Models\Server;
 use InvalidArgumentException;
@@ -486,7 +487,7 @@ class WriteBlueGreenProxyConfiguration
         sort($expectedRouterNames);
         if ($actualRouterNames !== $expectedRouterNames
             || ! array_key_exists($probeMiddlewareName, $middlewares)
-            || ! $this->hasCanonicalProbeMiddlewares($middlewares, $namePrefix, $probeMiddlewareName)) {
+            || ! $this->areCanonicalProbeMiddlewares($middlewares, $namePrefix, $probeMiddlewareName)) {
             return false;
         }
 
@@ -579,7 +580,7 @@ class WriteBlueGreenProxyConfiguration
         if (! is_string($routerName)
             || ! is_array($router)
             || ! array_key_exists($probeMiddlewareName, $middlewares)
-            || ! $this->hasCanonicalProbeMiddlewares($middlewares, $namePrefix, $probeMiddlewareName)
+            || ! $this->areCanonicalProbeMiddlewares($middlewares, $namePrefix, $probeMiddlewareName)
             || ! $this->isCanonicalProbeRouter(
                 router: $router,
                 routerName: $routerName,
@@ -667,6 +668,7 @@ class WriteBlueGreenProxyConfiguration
         }
         foreach ($routerMiddlewares as $middlewareName) {
             if (! is_string($middlewareName)
+                || $middlewareName === ''
                 || preg_match('/^'.preg_quote($namePrefix, '/').'[A-Za-z0-9_-]+$/D', $middlewareName) !== 1
                 || ! array_key_exists($middlewareName, $middlewares)) {
                 return false;
@@ -677,15 +679,19 @@ class WriteBlueGreenProxyConfiguration
     }
 
     /** @param array<string, mixed> $middlewares */
-    private function hasCanonicalProbeMiddlewares(
+    private function areCanonicalProbeMiddlewares(
         array $middlewares,
         string $namePrefix,
         string $probeMiddlewareName,
     ): bool {
         foreach ($middlewares as $middlewareName => $middleware) {
-            if (! is_string($middlewareName)
-                || preg_match('/^'.preg_quote($namePrefix, '/').'[A-Za-z0-9_-]+$/D', $middlewareName) !== 1
-                || ! is_array($middleware)
+            if (! is_string($middlewareName) || ! is_array($middleware)) {
+                return false;
+            }
+            $hasScopedName = preg_match('/^'.preg_quote($namePrefix, '/').'[A-Za-z0-9_-]+$/D', $middlewareName) === 1;
+            $isSharedHttpsRedirect = $middlewareName === ControlPlaneDynamicConfiguration::HTTPS_REDIRECT_MIDDLEWARE
+                && $middleware === ['redirectScheme' => ['scheme' => 'https']];
+            if ((! $hasScopedName && ! $isSharedHttpsRedirect)
                 || ($middlewareName !== $probeMiddlewareName && ! $this->isCanonicalApplicationMiddleware($middleware))) {
                 return false;
             }

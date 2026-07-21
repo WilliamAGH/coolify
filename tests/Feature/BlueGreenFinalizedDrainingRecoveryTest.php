@@ -12,6 +12,7 @@ use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Actions\Application\BlueGreen\PlanBlueGreenPublicRecovery;
 use App\Actions\Application\BlueGreen\ReconstructBlueGreenDeploymentRecovery;
 use App\Actions\Application\BlueGreen\RecoverBlueGreenFinalizedDrainingOperation;
+use App\Actions\Application\BlueGreen\TransitionsBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\VerifyBlueGreenCandidateReleaseProof;
 use App\Actions\Application\BlueGreen\VerifyBlueGreenPublicRecovery;
 use App\Actions\Proxy\BlueGreenProxyConfiguration;
@@ -75,8 +76,10 @@ const FIXED_COLOR_CANDIDATE_CONTAINER_ID = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
  *     state: ApplicationBlueGreenDeployment
  * }
  */
-function fixedColorBlueGreenRecoveryFixture(BlueGreenDeploymentPhase $phase): array
-{
+function fixedColorBlueGreenRecoveryFixture(
+    BlueGreenDeploymentPhase $phase,
+    bool $stageSpecificPreviousRoute = false,
+): array {
     InstanceSettings::unguarded(
         fn () => InstanceSettings::query()->firstOrCreate(['id' => 0]),
     );
@@ -154,6 +157,16 @@ KEY;
         activeDeploymentUuid: FIXED_COLOR_PREVIOUS_DEPLOYMENT,
         activeContainerId: FIXED_COLOR_PREVIOUS_CONTAINER_ID,
         destinationTopologyDigest: $previousFingerprint->topologyDigest,
+        blueReplicaBackends: $stageSpecificPreviousRoute
+            ? ["{$applicationUuid}-blue"]
+            : null,
+        greenReplicaBackends: $stageSpecificPreviousRoute
+            ? [
+                "{$applicationUuid}-green-replica-1",
+                "{$applicationUuid}-green-replica-2",
+                "{$applicationUuid}-green-replica-3",
+            ]
+            : null,
     );
     $previousConfiguration = CompileBlueGreenProxyConfiguration::run(
         $application,
@@ -214,11 +227,12 @@ KEY;
         'blue_green_routing_revision' => 1,
         'blue_green_destination_fence_epoch' => 1,
         'blue_green_server_boot_id' => FIXED_COLOR_BOOT_ID,
-        'blue_green_topology_digest' => $previousConfiguration->state->destinationTopologyDigest,
-        'blue_green_routing_config_digest' => $previousConfiguration->routingConfigDigest,
+        'blue_green_topology_digest' => $previousFingerprint->topologyDigest,
+        'blue_green_routing_config_digest' => $previousFingerprint->routingConfigDigest,
         'blue_green_backend_port_inventory' => $backendPortInventory->serialized,
         'blue_green_drain_backend_port_inventory' => null,
         'blue_green_supersession_generation' => 1,
+        'blue_green_candidate_container_id' => FIXED_COLOR_PREVIOUS_CONTAINER_ID,
     ]);
     $routingMutatedAt = $phase === BlueGreenDeploymentPhase::DRAINING ? now()->subMinute() : null;
     $deployment = ApplicationDeploymentQueue::query()->create([
@@ -346,6 +360,40 @@ function invokeFixedColorRecoveryLifecycleMethod(
 ): mixed {
     return (new ReflectionMethod($lifecycle, $method))->invoke($lifecycle, ...$arguments);
 }
+
+it('terminalizes a finalized fallback when the predecessor runtime route digest differs from its claim digest', function (): void {
+    $fixture = fixedColorBlueGreenRecoveryFixture(
+        BlueGreenDeploymentPhase::DRAINING,
+        stageSpecificPreviousRoute: true,
+    );
+    $currentState = $fixture['candidateConfiguration']->state;
+    $restoredState = $fixture['previousConfiguration']->state->withDestinationFenceEpoch(
+        $currentState->destinationFenceEpoch + 1,
+        FIXED_COLOR_CANDIDATE_DEPLOYMENT,
+        $currentState->mutationSequence + 1,
+    );
+    $fixture['state']->update([
+        'destination_fence_epoch' => $restoredState->destinationFenceEpoch,
+        'destination_fence_operation_id' => $restoredState->operationId,
+        'destination_fence_mutation_sequence' => $restoredState->mutationSequence,
+        'managed_file_sha256' => $restoredState->managedSha256,
+        'destination_topology_digest' => $restoredState->destinationTopologyDigest,
+        'application_routing_config_digest' => $restoredState->applicationRoutingConfigDigest,
+    ]);
+
+    expect($fixture['previousDeployment']->blue_green_routing_config_digest)
+        ->not->toBe($restoredState->applicationRoutingConfigDigest);
+
+    $completedState = TransitionsBlueGreenDeployment::finishFinalizedFixedColorFallback(
+        $fixture['claim'],
+        $fixture['previousExpectation'],
+        $restoredState,
+    );
+
+    expect($completedState->phase)->toBe(BlueGreenDeploymentPhase::IDLE)
+        ->and($completedState->active_color)->toBe(BlueGreenDeploymentColor::GREEN)
+        ->and($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value);
+});
 
 it('starts a reconstructed fixed-color routing operation at mutation sequence one', function (): void {
     $fixture = fixedColorBlueGreenRecoveryFixture(BlueGreenDeploymentPhase::PREPARING);
@@ -548,19 +596,29 @@ it('drains every immutable predecessor port when the live application dropped a 
 });
 
 it('backfills an unchanged in-flight owner inventory before reconstructing a fixed-color recovery', function (): void {
-    $fixture = fixedColorBlueGreenRecoveryFixture(BlueGreenDeploymentPhase::DRAINING);
+    $fixture = fixedColorBlueGreenRecoveryFixture(
+        BlueGreenDeploymentPhase::DRAINING,
+        stageSpecificPreviousRoute: true,
+    );
     $inventory = BlueGreenBackendPortInventory::fromPorts([3000]);
     $fixture['deployment']->update([
         'blue_green_backend_port_inventory' => null,
         'blue_green_drain_backend_port_inventory' => null,
     ]);
+    $fixture['previousDeployment']->update([
+        'blue_green_backend_port_inventory' => null,
+    ]);
+
+    expect($fixture['previousDeployment']->blue_green_routing_config_digest)
+        ->not->toBe($fixture['previousConfiguration']->state->applicationRoutingConfigDigest);
 
     $operation = ReconstructBlueGreenDeploymentRecovery::run($fixture['state']);
 
     expect($operation->claim->backendPortInventory->serialized)->toBe($inventory->serialized)
         ->and($operation->claim->drainBackendPortInventory?->serialized)->toBe($inventory->serialized)
         ->and($fixture['deployment']->fresh()->blue_green_backend_port_inventory)->toBe($inventory->serialized)
-        ->and($fixture['deployment']->fresh()->blue_green_drain_backend_port_inventory)->toBe($inventory->serialized);
+        ->and($fixture['deployment']->fresh()->blue_green_drain_backend_port_inventory)->toBe($inventory->serialized)
+        ->and($fixture['previousDeployment']->fresh()->blue_green_backend_port_inventory)->toBe($inventory->serialized);
 });
 
 it('repairs drifted finalized candidate routing only after exact candidate health and release proof', function (): void {

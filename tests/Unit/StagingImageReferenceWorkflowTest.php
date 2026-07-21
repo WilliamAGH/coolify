@@ -8,6 +8,16 @@ function stagingImageReferenceAlias(string $branchName): string
     return substr(str_replace('/', '-', $branchName), 0, 63).'-'.hash('sha256', $branchName);
 }
 
+it('limits automatic staging publication to the next branch', function () {
+    $root = dirname(__DIR__, 2);
+    $workflow = Yaml::parseFile($root.'/.github/workflows/coolify-staging-build.yml');
+    $push = $workflow['on']['push'] ?? [];
+
+    expect($push['branches'] ?? null)->toBe(['next'])
+        ->and($push)->not->toHaveKeys(['branches-ignore', 'tags'])
+        ->and($workflow['on'] ?? [])->not->toHaveKey('workflow_dispatch');
+});
+
 it('publishes a validated branch alias only after staging validation succeeds', function () {
     $root = dirname(__DIR__, 2);
     $publisher = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');

@@ -1,6 +1,7 @@
 <?php
 
 use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
+use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
 use App\Actions\Application\BlueGreen\BlueGreenOperationFence;
@@ -260,6 +261,89 @@ function blueGreenInitialProbeRecoveryContext(): array
     return compact('claim', 'configuration', 'lifecycle', 'target');
 }
 
+it('uses a private probe only for first or legacy-adoption promotions', function (): void {
+    $fixture = blueGreenLifecyclePublicRecoveryFixture([3000], 'https://lifecycle-proof.example.test');
+    $application = $fixture['application']->fresh(['settings']);
+    $deployment = $fixture['deployment'];
+    $destination = $fixture['destination'];
+    $server = $fixture['server'];
+    $inventory = BlueGreenBackendPortInventory::fromPorts([3000]);
+    $previous = new BlueGreenContainerExpectation(
+        name: $application->uuid.'-green',
+        dockerId: str_repeat('a', 64),
+        applicationId: $application->id,
+        pullRequestId: 0,
+        blueGreenManaged: true,
+        deploymentUuid: 'previous-fixed-color',
+        color: BlueGreenDeploymentColor::GREEN,
+        routingRevision: 1,
+    );
+    $claim = new BlueGreenDeploymentClaim(
+        stateId: 1,
+        applicationId: $application->id,
+        standaloneDockerId: $destination->id,
+        pendingColor: BlueGreenDeploymentColor::BLUE,
+        previousActiveColor: BlueGreenDeploymentColor::GREEN,
+        deploymentUuid: $deployment->deployment_uuid,
+        expectedRoutingRevision: 2,
+        destinationFenceEpoch: 2,
+        serverBootId: '11111111-2222-3333-4444-555555555555',
+        topologyDigest: str_repeat('b', 64),
+        routingConfigDigest: str_repeat('c', 64),
+        backendPortInventory: $inventory,
+        drainBackendPortInventory: $inventory,
+        supersessionGeneration: 2,
+        legacyContainerName: null,
+        candidateContainerName: $application->uuid.'-blue',
+        rollbackManagedFilename: BlueGreenRoutingTarget::managedFilename($application->uuid, $destination->id),
+    );
+    $legacyClaim = new BlueGreenDeploymentClaim(
+        stateId: 2,
+        applicationId: $application->id,
+        standaloneDockerId: $destination->id,
+        pendingColor: BlueGreenDeploymentColor::BLUE,
+        previousActiveColor: BlueGreenDeploymentColor::GREEN,
+        deploymentUuid: 'legacy-adoption-promotion',
+        expectedRoutingRevision: 2,
+        destinationFenceEpoch: 2,
+        serverBootId: '11111111-2222-3333-4444-555555555555',
+        topologyDigest: str_repeat('b', 64),
+        routingConfigDigest: str_repeat('c', 64),
+        backendPortInventory: $inventory,
+        drainBackendPortInventory: $inventory,
+        supersessionGeneration: 2,
+        legacyContainerName: 'legacy-predecessor',
+        candidateContainerName: $application->uuid.'-blue',
+        rollbackManagedFilename: BlueGreenRoutingTarget::managedFilename($application->uuid, $destination->id),
+    );
+    $lifecycle = new BlueGreenDeploymentLifecycle(
+        application: $application,
+        deployment: $deployment,
+        destination: $destination,
+        server: $server,
+        timeout: 30,
+        checkForCancellation: static function (): void {},
+    );
+
+    expect(invokesBlueGreenLifecyclePublicRecoveryMethod(
+        $lifecycle,
+        'requiresPrivateProbeStage',
+        $claim,
+        $previous,
+    ))->toBeFalse()
+        ->and(invokesBlueGreenLifecyclePublicRecoveryMethod(
+            $lifecycle,
+            'requiresPrivateProbeStage',
+            $claim,
+            null,
+        ))->toBeTrue()
+        ->and(invokesBlueGreenLifecyclePublicRecoveryMethod(
+            $lifecycle,
+            'requiresPrivateProbeStage',
+            $legacyClaim,
+            $previous,
+        ))->toBeTrue();
+});
 it('retries only an initial unacknowledged 404 candidate probe route', function (
     string $outcome,
     int $expectedProbeRequests,

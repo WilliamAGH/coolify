@@ -1534,7 +1534,7 @@ final class BlueGreenDeploymentLifecycle
         }
 
         $previousContainer = $this->previousContainerExpectation;
-        if ($claim->previousActiveColor === null) {
+        if ($this->requiresPrivateProbeStage($claim, $previousContainer)) {
             $this->deployment->addLogEntry(
                 'Blue-green first adoption is proving the exact candidate release through its private probe before public handoff.',
             );
@@ -1606,6 +1606,13 @@ final class BlueGreenDeploymentLifecycle
             $this->interventionRequired = true;
             throw new DeploymentException('Blue-green routing is live, but durable finalization cleanup failed and requires intervention: '.$exception->getMessage(), $exception->getCode(), $exception);
         }
+    }
+
+    private function requiresPrivateProbeStage(
+        BlueGreenDeploymentClaim $claim,
+        ?BlueGreenContainerExpectation $previousContainer,
+    ): bool {
+        return $previousContainer === null || $claim->legacyContainerName !== null;
     }
 
     private function routingTarget(

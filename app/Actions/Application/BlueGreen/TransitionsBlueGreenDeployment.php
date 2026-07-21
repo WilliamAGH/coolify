@@ -476,7 +476,8 @@ final class TransitionsBlueGreenDeployment
             || $previousDeployment->blue_green_routing_revision !== $previousContainer->routingRevision
             || $previousDeployment->blue_green_destination_fence_epoch !== $state->operation_previous_destination_fence_epoch
             || $previousDeployment->blue_green_topology_digest !== $persistedPreviousState->destinationTopologyDigest
-            || $previousDeployment->blue_green_routing_config_digest !== $persistedPreviousState->applicationRoutingConfigDigest) {
+            || ! is_string($previousDeployment->blue_green_routing_config_digest)
+            || preg_match('/^[a-f0-9]{64}$/D', $previousDeployment->blue_green_routing_config_digest) !== 1) {
             throw new BlueGreenDeploymentTransitionException('The finalized draining fallback no longer matches the exact persisted fixed-color predecessor.');
         }
     }
