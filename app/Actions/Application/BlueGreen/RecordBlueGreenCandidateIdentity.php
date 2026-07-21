@@ -4,6 +4,7 @@ namespace App\Actions\Application\BlueGreen;
 
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\ApplicationBlueGreenDeployment;
+use App\Models\ApplicationBlueGreenReplica;
 use App\Models\ApplicationDeploymentQueue;
 use Illuminate\Support\Facades\DB;
 use Lorisleiva\Actions\Concerns\AsAction;
@@ -60,6 +61,8 @@ final class RecordBlueGreenCandidateIdentity
                     throw new BlueGreenDeploymentTransitionException('The candidate Docker identity changed after it was persisted.');
                 }
 
+                $this->bindScalarReplicaIdentity($claim, $state, $inspection);
+
                 return $state;
             }
 
@@ -111,7 +114,69 @@ final class RecordBlueGreenCandidateIdentity
                 throw new BlueGreenDeploymentTransitionException('The candidate Docker identity changed while it was being persisted.');
             }
 
+            $this->bindScalarReplicaIdentity($claim, $state, $inspection);
+
             return $state->fresh();
         }, attempts: 5);
+    }
+
+    private function bindScalarReplicaIdentity(
+        BlueGreenDeploymentClaim $claim,
+        ApplicationBlueGreenDeployment $state,
+        BlueGreenContainerInspection $inspection,
+    ): void {
+        if ($claim->replicaCount !== DEFAULT_BLUE_GREEN_REPLICA_COUNT) {
+            return;
+        }
+
+        $replicas = ApplicationBlueGreenReplica::query()
+            ->where('application_blue_green_deployment_id', $state->id)
+            ->where('application_id', $claim->applicationId)
+            ->where('standalone_docker_id', $claim->standaloneDockerId)
+            ->where('deployment_uuid', $claim->deploymentUuid)
+            ->where('color', $claim->pendingColor->value)
+            ->where('routing_revision', $claim->expectedRoutingRevision)
+            ->orderBy('replica_index')
+            ->lockForUpdate()
+            ->get();
+        try {
+            $replicaSet = BlueGreenReplicaSet::fromReplicas($replicas);
+        } catch (\InvalidArgumentException $exception) {
+            throw new BlueGreenDeploymentTransitionException('The scalar blue-green replica ledger no longer has a contiguous exact candidate slot.', 0, $exception);
+        }
+        $replica = $replicas->first();
+        $expectedName = $claim->candidateContainerName;
+        if ($replicaSet->count !== $claim->replicaCount
+            || ! $replicaSet->usesScalarCompatibilityPath()
+            || ! $replica instanceof ApplicationBlueGreenReplica
+            || $expectedName === null
+            || $replica->replica_index !== 1
+            || $replica->container_name !== $expectedName
+            || ($replica->container_id !== null && $replica->container_id !== $inspection->dockerId)) {
+            throw new BlueGreenDeploymentTransitionException('The scalar blue-green replica ledger no longer matches the exact candidate identity.');
+        }
+        if ($replica->container_id !== null) {
+            return;
+        }
+
+        $updated = ApplicationBlueGreenReplica::query()
+            ->whereKey($replica->getKey())
+            ->where('application_blue_green_deployment_id', $state->id)
+            ->where('application_id', $claim->applicationId)
+            ->where('standalone_docker_id', $claim->standaloneDockerId)
+            ->where('deployment_uuid', $claim->deploymentUuid)
+            ->where('color', $claim->pendingColor->value)
+            ->where('routing_revision', $claim->expectedRoutingRevision)
+            ->where('replica_index', 1)
+            ->where('container_name', $expectedName)
+            ->whereNull('container_id')
+            ->update([
+                'container_id' => $inspection->dockerId,
+                'health_status' => $inspection->health === 'healthy' ? 'healthy' : 'unhealthy',
+                'last_observed_at' => now(),
+            ]);
+        if ($updated !== 1) {
+            throw new BlueGreenDeploymentTransitionException('The scalar blue-green replica changed before its exact Docker identity could be bound.');
+        }
     }
 }
