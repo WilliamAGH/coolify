@@ -526,6 +526,12 @@ $firstActivation = consumeQueuedActivationDeployment($firstHandoff['deployment']
 $first = $firstActivation['deployment'];
 
 $trafficContainer = 'production-application-continuity';
+$fixtureImage = getenv('FIXTURE_IMAGE');
+assertLab(
+    is_string($fixtureImage)
+        && preg_match('/\Aproduction-application-fixture:production-application-blue-green-[a-z0-9-]+\z/D', $fixtureImage) === 1,
+    'Continuity observer has no exact owned fixture image alias.',
+);
 instant_remote_process([
     'rm -f /runtime-evidence/continuity.json /runtime-evidence/continuity-ready /runtime-evidence/replay-complete',
     'docker rm --force '.escapeshellarg($trafficContainer).' >/dev/null 2>&1 || true',
@@ -534,7 +540,7 @@ instant_remote_process([
         .' --env EXPECTED_FIRST_ACK='.escapeshellarg($firstAcknowledgement)
         .' --env EXPECTED_SECOND_ACK='.escapeshellarg($secondAcknowledgement)
         .' --volume /runtime-evidence:/evidence'
-        .' production-application-fixture:manifest node /app/traffic.mjs',
+        .' '.escapeshellarg($fixtureImage).' node /app/traffic.mjs',
 ], $server);
 waitForEvidence('/runtime-evidence/continuity-ready', 300, 'Continuity observer did not establish the blue route.');
 

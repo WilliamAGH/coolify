@@ -105,6 +105,7 @@ services:
       DB_PORT: "5432"
       DB_USERNAME: coolify
       FILESYSTEM_DISK: local
+      FIXTURE_IMAGE: ${FIXTURE_IMAGE:?}
       FIXTURE_IMAGE_ID: ${FIXTURE_IMAGE_ID:?}
       HELPER_IMAGE: ghcr.io/coollabsio/coolify-helper
       HORIZON_ENABLED: "false"
