@@ -718,13 +718,19 @@ final class BlueGreenDeploymentLifecycle
         $this->previousActiveColor = $operation->claim->previousActiveColor;
         $this->legacyContainerName = $operation->claim->legacyContainerName;
         $this->serverBootId = $operation->claim->serverBootId;
-        $this->destinationState = $operation->currentDestinationState
-            ?? throw new DeploymentException('The durable blue-green PREPARING state has no exact routed destination state.');
         $this->candidateContainerExpectation = $operation->candidateContainer
             ?? throw new DeploymentException('The durable blue-green PREPARING state has no candidate container identity.');
         $this->previousContainerExpectation = $operation->previousContainer;
         $this->server->privateKey->storeInFileSystem();
         ReadBlueGreenServerBootIdentity::run($this->server, $operation->claim->serverBootId);
+        // First-adoption PREPARING has no routed mutation yet; re-attest live destination state.
+        $this->destinationState = $operation->currentDestinationState
+            ?? AttestBlueGreenDestinationState::run(
+                $this->server,
+                $this->application,
+                $this->destination,
+                $state,
+            );
         $this->assertOperationOwned(BlueGreenDeploymentPhase::PREPARING);
         $this->deployment->addLogEntry(
             'Resuming the exact durable blue-green PREPARING claim for activation; preparation ownership is preserved.',
