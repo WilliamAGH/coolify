@@ -53,6 +53,7 @@ All notable changes to this project will be documented in this file.
 - *(release)* Publish fork images from protected v4.x
 - *(test)* Inject runtime env through Docker API
 - *(deps)* Update Guzzle for security advisories
+- *(release)* Accept Nexus manifest-head absence
 - *(test)* Scope realtime image cleanup to owned container
 
 ### 💼 Other
@@ -78,6 +79,8 @@ All notable changes to this project will be documented in this file.
 - Update changelog (#83)
 - Update changelog (#85)
 - Update changelog (#87)
+- Update changelog (#91)
+- Update changelog (#92)
 
 ### 🎨 Styling
 
