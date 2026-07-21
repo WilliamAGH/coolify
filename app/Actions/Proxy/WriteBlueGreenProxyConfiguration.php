@@ -437,7 +437,15 @@ class WriteBlueGreenProxyConfiguration
     ): bool {
         $routers = $http['routers'];
         $middlewares = $http['middlewares'] ?? null;
-        if (count($routers) !== 1 || ! is_array($middlewares) || count($middlewares) !== 1) {
+        $services = $http['services'] ?? null;
+        // Probe-only file documents keep services empty and point at the Docker
+        // provider. Application label middlewares (gzip, auth, redirects) may
+        // still be present alongside the probe header strip middleware.
+        if (count($routers) !== 1
+            || ! is_array($middlewares)
+            || $middlewares === []
+            || ! is_array($services)
+            || $services !== []) {
             return false;
         }
 
@@ -458,6 +466,7 @@ class WriteBlueGreenProxyConfiguration
         $expectedGuard = 'Header(`'.self::PROBE_HEADER.'`, `'.BlueGreenRoutingTarget::durableProbeToken($state->operationId).'`)';
         $rule = $router['rule'] ?? null;
         $entryPoints = $router['entryPoints'] ?? null;
+        $routerMiddlewares = $router['middlewares'] ?? null;
         if (preg_match('/^'.preg_quote($namePrefix, '/').'[A-Za-z0-9_-]+-probe$/D', $routerName) !== 1
             || ($router['service'] ?? null) !== $expectedService
             || ! is_string($rule)
@@ -466,10 +475,21 @@ class WriteBlueGreenProxyConfiguration
             || ! array_is_list($entryPoints)
             || $entryPoints === []
             || array_filter($entryPoints, static fn (mixed $entryPoint): bool => ! is_string($entryPoint) || $entryPoint === '') !== []
-            || ($router['middlewares'] ?? null) !== [$probeMiddlewareName]
+            || ! is_array($routerMiddlewares)
+            || ! array_is_list($routerMiddlewares)
+            || $routerMiddlewares === []
+            || ($routerMiddlewares[0] ?? null) !== $probeMiddlewareName
             || array_diff(array_keys($router), ['rule', 'entryPoints', 'service', 'middlewares', 'tls']) !== []
-            || array_keys($middlewares) !== [$probeMiddlewareName]) {
+            || ! array_key_exists($probeMiddlewareName, $middlewares)) {
             return false;
+        }
+
+        foreach ($routerMiddlewares as $middlewareName) {
+            if (! is_string($middlewareName)
+                || $middlewareName === ''
+                || ! array_key_exists($middlewareName, $middlewares)) {
+                return false;
+            }
         }
 
         $acknowledgement = $middlewares[$probeMiddlewareName]['headers']['customResponseHeaders'][BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER] ?? null;

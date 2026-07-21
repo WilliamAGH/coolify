@@ -87,6 +87,42 @@ it('allows the guarded singleton ProbeOnly document to reference its canonical D
     (new WriteBlueGreenProxyConfiguration)->validate(probeOnlyWriterConfiguration());
 })->throwsNoExceptions();
 
+it('allows ProbeOnly documents that keep application label middlewares after the probe strip', function (): void {
+    $configuration = (new CompileBlueGreenProxyConfiguration)->compileGeneratedLabels(
+        applicationUuid: 'probe-only-writer-app',
+        generatedLabels: [
+            'traefik.enable=true',
+            'traefik.http.middlewares.gzip.compress=true',
+            'traefik.http.routers.web.rule=Host(`probe-only.example.test`)',
+            'traefik.http.routers.web.entryPoints=https',
+            'traefik.http.routers.web.service=web',
+            'traefik.http.routers.web.middlewares=gzip',
+            'traefik.http.routers.web.tls=true',
+            'traefik.http.services.web.loadbalancer.server.port=8080',
+        ],
+        target: new BlueGreenRoutingTarget(
+            destinationId: 42,
+            activeColor: BlueGreenDeploymentColor::BLUE,
+            blueContainerName: 'probe-only-writer-blue',
+            greenContainerName: 'probe-only-writer-green',
+            port: 8080,
+            routingRevision: 7,
+            mode: BlueGreenRoutingMode::ProbeOnly,
+            probeHeaderName: 'X-Coolify-Blue-Green-Probe',
+            probeToken: BlueGreenRoutingTarget::durableProbeToken('probe-only-operation'),
+            probeColor: BlueGreenDeploymentColor::BLUE,
+            destinationFenceEpoch: 3,
+            operationId: 'probe-only-operation',
+            mutationSequence: 2,
+            activeDeploymentUuid: 'probe-only-deployment',
+            activeContainerId: str_repeat('a', 64),
+            destinationTopologyDigest: hash('sha256', 'probe-only-destination:42'),
+        ),
+    );
+
+    (new WriteBlueGreenProxyConfiguration)->validate($configuration);
+})->throwsNoExceptions();
+
 it('continues allowing ordinary managed documents with inline services', function (): void {
     (new WriteBlueGreenProxyConfiguration)->validate(
         probeOnlyWriterConfiguration(BlueGreenRoutingMode::Steady),
@@ -174,6 +210,15 @@ it('rejects unsafe ProbeOnly-shaped documents', function (callable $mutate): voi
     },
     'foreign router middleware' => static function (array $document, string $routerName): array {
         $document['http']['routers'][$routerName]['middlewares'] = ['foreign@file'];
+
+        return $document;
+    },
+    'probe strip not first' => static function (array $document, string $routerName, string $middlewareName): array {
+        $document['http']['middlewares']['coolify-bg-extra-gzip'] = ['compress' => true];
+        $document['http']['routers'][$routerName]['middlewares'] = [
+            'coolify-bg-extra-gzip',
+            $middlewareName,
+        ];
 
         return $document;
     },
