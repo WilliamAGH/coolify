@@ -370,7 +370,7 @@ function applicationValidationWorkflowViolations(array $workflow): array
     $phpSetup = $phpSetupIndex === false ? null : $workflowAndShellSteps->get($phpSetupIndex);
     $composerDependencies = $composerDependenciesIndex === false ? null : $workflowAndShellSteps->get($composerDependenciesIndex);
     if (! is_array($phpSetup)
-        || ($phpSetup['uses'] ?? null) !== 'shivammathur/setup-php@44454db4f0199b8b9685a5d763dc37cbf79108e1'
+        || ($phpSetup['uses'] ?? null) !== 'shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240'
         || ($phpSetup['with']['php-version'] ?? null) !== '8.5'
         || ($phpSetup['with']['coverage'] ?? null) !== 'none'
         || ($phpSetup['with']['extensions'] ?? null) !== 'mbstring, pdo_sqlite, redis') {
@@ -734,4 +734,61 @@ it('rejects omitting database migration S6 exit propagation coverage', function 
 
     expect(applicationValidationWorkflowViolations($workflow))
         ->toContain('application validation must execute the database migration S6 exit propagation integration');
+});
+
+it('pins Node 24 action implementations throughout release validation and publication', function () {
+    $expectedPins = [
+        'actions/download-artifact' => '3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c',
+        'actions/setup-node' => '820762786026740c76f36085b0efc47a31fe5020',
+        'actions/upload-artifact' => '043fb46d1a93c77aae656e7c1c64a875d1fc6a0a',
+        'aquasecurity/trivy-action' => 'ed142fd0673e97e23eac54620cfb913e5ce36c25',
+        'docker/build-push-action' => '53b7df96c91f9c12dcc8a07bcb9ccacbed38856a',
+        'docker/login-action' => 'af1e73f918a031802d376d3c8bbc3fe56130a9b0',
+        'docker/setup-buildx-action' => 'bb05f3f5519dd87d3ba754cc423b652a5edd6d2c',
+        'docker/setup-qemu-action' => '96fe6ef7f33517b61c61be40b68a1882f3264fb8',
+        'shivammathur/setup-php' => 'f3e473d116dcccaddc5834248c87452386958240',
+    ];
+    $observedActions = array_fill_keys(array_keys($expectedPins), 0);
+    $workflowSources = '';
+
+    foreach ([
+        'application-validation.yml',
+        'publish-linux-image.yml',
+        'release-operational-acceptance.yml',
+    ] as $workflowFile) {
+        $workflowPath = dirname(__DIR__, 2).'/.github/workflows/'.$workflowFile;
+        $workflowSources .= file_get_contents($workflowPath);
+        $workflow = Yaml::parseFile($workflowPath);
+
+        foreach ($workflow['jobs'] ?? [] as $job) {
+            foreach ($job['steps'] ?? [] as $step) {
+                $uses = (string) ($step['uses'] ?? '');
+
+                foreach ($expectedPins as $action => $sha) {
+                    if (! str_starts_with($uses, $action.'@')) {
+                        continue;
+                    }
+
+                    expect($uses)->toBe($action.'@'.$sha);
+                    $observedActions[$action]++;
+                }
+            }
+        }
+    }
+
+    expect($observedActions)->each->toBeGreaterThan(0);
+
+    foreach ([
+        '10e90e3645eae34f1e60eeb005ba3a3d33f178e8',
+        '44454db4f0199b8b9685a5d763dc37cbf79108e1',
+        '49933ea5288caeca8642d1e84afbd3f7d6820020',
+        '57a97c7e7821a5776cebc9bb87c984fa69cba8f1',
+        '634f93cb2916e3fdff6788551b99b062d0335ce0',
+        'c7c53464625b32c7a7e944ae62b3e17d2b600130',
+        'c94ce9fb468520275223c153574b00df6fe4bcc9',
+        'e468171a9de216ec08956ac3ada2f0791b6bd435',
+        'ea165f8d65b6e75b540449e92b4886f43607fa02',
+    ] as $deprecatedPin) {
+        expect($workflowSources)->not->toContain($deprecatedPin);
+    }
 });

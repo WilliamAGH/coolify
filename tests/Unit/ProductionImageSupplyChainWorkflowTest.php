@@ -944,7 +944,7 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
     ] ||
         ($jobs['fork-build']['runs-on'] ?? null) !== $trustedForkRunner ||
         ($jobs['fork-stage']['runs-on'] ?? null) !== $trustedForkRunner ||
-        ($forkQemuSetup['uses'] ?? null) !== 'docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130' ||
+        ($forkQemuSetup['uses'] ?? null) !== 'docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8' ||
         ($forkQemuSetup['with']['platforms'] ?? null) !== 'arm64' ||
         ! str_contains($forkBuildxVerification, 'docker buildx inspect --bootstrap | grep -F "$PLATFORM"')) {
         $violations[] = 'fork control-plane publication must retain self-hosted amd64 and arm64 archive acceptance';
@@ -2411,7 +2411,7 @@ it('defines one referrerless fork release graph for the main image on both platf
         'Verify fork Buildx platform support',
     )['run'] ?? '');
     expect($qemuSetup['uses'] ?? null)
-        ->toBe('docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130')
+        ->toBe('docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8')
         ->and($qemuSetup['with']['platforms'] ?? null)->toBe('arm64')
         ->and($buildxPlatformVerification)->toContain('docker buildx inspect --bootstrap | grep -F "$PLATFORM"');
 
@@ -2830,14 +2830,14 @@ it('requires both fork application version sources to exactly match the immutabl
         $cases = [
             'matching version sources' => [$constants, $versions, true, ''],
             'constants version mismatch' => [
-                str_replace("'4.13.3-fork'", "'4.13.4-fork'", $constants),
+                str_replace("'4.13.4-fork'", "'4.13.5-fork'", $constants),
                 $versions,
                 false,
                 'config/constants.php Coolify version must equal the fork publication version',
             ],
             'versions json mismatch' => [
                 $constants,
-                str_replace('"4.13.3-fork"', '"4.13.4-fork"', $versions),
+                str_replace('"4.13.4-fork"', '"4.13.5-fork"', $versions),
                 false,
                 'versions.json Coolify v4 version must equal the fork publication version',
             ],
@@ -2848,7 +2848,7 @@ it('requires both fork application version sources to exactly match the immutabl
             file_put_contents($fixture.'/versions.json', $fixtureVersions);
             $process = new Process(['bash', '-c', $script], $root, [
                 'GITHUB_WORKSPACE' => $fixture,
-                'SEMANTIC_VERSION' => '4.13.3-fork',
+                'SEMANTIC_VERSION' => '4.13.4-fork',
             ]);
             $process->run();
 
