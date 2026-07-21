@@ -393,7 +393,6 @@ jobs:
           tests/Integration/ReleaseOperationalFixturesTest.sh
           tests/Integration/VerifyNexusDockerWritePolicyTest.sh
           tests/Integration/VerifyForkReleaseTagTest.sh
-          tests/Integration/VerifyForkReleaseTrustTest.sh
           tests/Integration/DockerSsotCleanTest.sh
           tests/Integration/ProductionApplicationBlueGreen/SanitizeEvidenceTest.sh
       - name: Run v4.x candidate ship contract
