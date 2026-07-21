@@ -2,8 +2,12 @@
 
 declare(strict_types=1);
 
+use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
+use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
+use App\Actions\Application\BlueGreen\ReadBlueGreenManagedRouteMetadata;
 use App\Enums\ApplicationDeploymentExecutionPhase;
 use App\Enums\ApplicationDeploymentStatus;
+use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\ProxyStatus;
 use App\Enums\ProxyTypes;
 use App\Jobs\ActivateApplicationDeploymentJob;
@@ -16,8 +20,14 @@ use App\Models\Project;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
 use App\Models\Team;
+use App\Support\ProxyMutationQueue;
 use Illuminate\Contracts\Console\Kernel;
+use Illuminate\Queue\Events\JobProcessed;
+use Illuminate\Queue\Events\JobProcessing;
+use Illuminate\Queue\Worker;
+use Illuminate\Queue\WorkerOptions;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Redis;
 use Illuminate\Support\Str;
 
@@ -143,6 +153,9 @@ function redisSnapshot(): array
         sort($keys);
         foreach ($keys as $key) {
             $type = $client->type($key);
+            if ($type === \Redis::REDIS_NOT_FOUND) {
+                continue;
+            }
             $value = match ($type) {
                 \Redis::REDIS_STRING => $client->get($key),
                 \Redis::REDIS_SET => tap($client->sMembers($key), static fn (array &$members) => sort($members)),
@@ -238,16 +251,132 @@ function prepareDeployment(ApplicationDeploymentQueue $deployment): array
     ];
 }
 
-function activateDeployment(
+/** @return array{pending: int, reserved: int, delayed: int} */
+function proxyMutationQueueCardinality(): array
+{
+    $snapshot = ProxyMutationQueue::snapshot();
+    assertLab(! $snapshot->isFrozen(), 'The isolated proxy-mutation queue is unexpectedly frozen.');
+
+    return [
+        'pending' => $snapshot->pending,
+        'reserved' => $snapshot->reserved,
+        'delayed' => $snapshot->delayed,
+    ];
+}
+
+/**
+ * @return array{
+ *     deployment: ApplicationDeploymentQueue,
+ *     queue: array{
+ *         before: array{pending: int, reserved: int, delayed: int},
+ *         during: array{pending: int, reserved: int, delayed: int},
+ *         after: array{pending: int, reserved: int, delayed: int},
+ *         transportUuid: string,
+ *         attempts: int
+ *     }
+ * }
+ */
+function consumeQueuedActivationDeployment(
     ApplicationDeploymentQueue $deployment,
     Server $server,
     string $activationAttempt,
-): ApplicationDeploymentQueue {
-    (new ActivateApplicationDeploymentJob($deployment->id, $activationAttempt))->handleActivation();
+): array {
+    $deployment->refresh();
+    assertLab($deployment->status === ApplicationDeploymentStatus::IN_PROGRESS->value, 'Activation was not left in progress for its queued child.');
+    assertLab($deployment->execution_phase === ApplicationDeploymentExecutionPhase::Activate, 'Queued child did not own the Activate phase.');
+    assertLab($deployment->horizon_job_id === $activationAttempt, 'Queued child lost its durable activation identity.');
+    assertLab($deployment->horizon_job_worker === null, 'Queued child was bypassed by an existing worker owner.');
+
+    $queueBefore = proxyMutationQueueCardinality();
+    assertLab(
+        $queueBefore === ['pending' => 1, 'reserved' => 0, 'delayed' => 0],
+        'Activation handoff did not publish exactly one ready proxy-mutation child.',
+    );
+
+    $reservation = null;
+    $completion = null;
+    $inspectionOpen = true;
+    Queue::before(static function (JobProcessing $event) use (&$completion, &$inspectionOpen, &$reservation, $activationAttempt, $deployment): void {
+        if (! $inspectionOpen
+            || $event->connectionName !== ProxyMutationQueue::CONNECTION
+            || $event->job->getQueue() !== ProxyMutationQueue::NAME) {
+            return;
+        }
+
+        assertLab($reservation === null, 'The bounded activation consumer reserved more than one proxy-mutation child.');
+        $payload = $event->job->payload();
+        assertLab(is_array($payload), 'Queued activation child has no inspectable payload.');
+        assertLab(($payload[ProxyMutationQueue::PAYLOAD_MARKER] ?? null) === true, 'Queued activation child is missing its proxy-mutation marker.');
+        assertLab(($payload['displayName'] ?? null) === ActivateApplicationDeploymentJob::class, 'Queued child is not the activation transport.');
+        assertLab(($payload['attempts'] ?? null) === 0, 'Queued activation child was already attempted before the bounded consumer.');
+        $transportUuid = $event->job->uuid();
+        assertLab(is_string($transportUuid) && Str::isUuid($transportUuid), 'Queued activation child has no transport UUID.');
+        assertLab($event->job->attempts() === 1, 'Queued activation child did not reserve its first attempt.');
+
+        $current = ApplicationDeploymentQueue::query()->findOrFail($deployment->id);
+        assertLab($current->horizon_job_id === $activationAttempt, 'Queued child no longer owns the expected activation attempt.');
+        assertLab($current->horizon_job_worker === null, 'Queued child acquired worker ownership before reservation inspection.');
+        $queueDuring = proxyMutationQueueCardinality();
+        assertLab(
+            $queueDuring === ['pending' => 0, 'reserved' => 1, 'delayed' => 0],
+            'Queued activation child was not atomically moved into the reserved set.',
+        );
+        $reservation = [
+            'during' => $queueDuring,
+            'transportUuid' => $transportUuid,
+            'attempts' => $event->job->attempts(),
+        ];
+    });
+    Queue::after(static function (JobProcessed $event) use (&$completion, &$inspectionOpen, &$reservation): void {
+        if (! $inspectionOpen
+            || $event->connectionName !== ProxyMutationQueue::CONNECTION
+            || $event->job->getQueue() !== ProxyMutationQueue::NAME) {
+            return;
+        }
+
+        assertLab(is_array($reservation), 'Queued activation completed without a reservation observation.');
+        assertLab($completion === null, 'The bounded activation consumer completed more than one proxy-mutation child.');
+        assertLab($event->job->uuid() === $reservation['transportUuid'], 'Queued activation completion changed transport ownership.');
+        assertLab($event->job->attempts() === $reservation['attempts'], 'Queued activation completion changed attempt ownership.');
+        $completion = [
+            'after' => proxyMutationQueueCardinality(),
+            'transportUuid' => $event->job->uuid(),
+            'attempts' => $event->job->attempts(),
+        ];
+    });
+
+    try {
+        app(Worker::class)->runNextJob(
+            ProxyMutationQueue::CONNECTION,
+            ProxyMutationQueue::NAME,
+            new WorkerOptions(
+                name: 'production-application-blue-green',
+                timeout: 120,
+                sleep: 0,
+                maxTries: 1,
+                force: true,
+                maxJobs: 1,
+                maxTime: 120,
+            ),
+        );
+    } finally {
+        $inspectionOpen = false;
+    }
+
+    assertLab(is_array($reservation), 'The bounded activation consumer did not reserve the queued child.');
+    assertLab(is_array($completion), 'The bounded activation consumer did not complete the queued child.');
+    $queueAfter = proxyMutationQueueCardinality();
+    assertLab(
+        $completion['after'] === ['pending' => 0, 'reserved' => 0, 'delayed' => 0]
+            && $queueAfter === ['pending' => 0, 'reserved' => 0, 'delayed' => 0],
+        'Queued activation child was not removed from the canonical queue after completion.',
+    );
+
     $deployment->refresh();
     assertLab($deployment->status === ApplicationDeploymentStatus::FINISHED->value, 'Activation did not reach terminal success.');
     assertLab($deployment->execution_phase === ApplicationDeploymentExecutionPhase::Activate, 'Terminal deployment lost its Activate phase.');
     assertLab($deployment->finished_at !== null, 'Terminal deployment has no completion timestamp.');
+    assertLab($deployment->horizon_job_worker === $reservation['transportUuid'], 'Activation did not persist the reserved queue transport as its worker owner.');
     assertLab(
         is_string($deployment->blue_green_candidate_container_id)
             && preg_match('/\A[a-f0-9]{64}\z/D', $deployment->blue_green_candidate_container_id) === 1,
@@ -261,7 +390,16 @@ function activateDeployment(
         fn () => (new ActivateApplicationDeploymentJob($deployment->id, $activationAttempt))->handleActivation(),
     );
 
-    return $deployment;
+    return [
+        'deployment' => $deployment,
+        'queue' => [
+            'before' => $queueBefore,
+            'during' => $reservation['during'],
+            'after' => $queueAfter,
+            'transportUuid' => $reservation['transportUuid'],
+            'attempts' => $reservation['attempts'],
+        ],
+    ];
 }
 
 function waitForEvidence(string $path, int $attemptLimit, string $message): void
@@ -365,7 +503,8 @@ $firstHandoff = prepareDeployment(newDeployment(
     'production-application-blue',
     $firstCommit,
 ));
-$first = activateDeployment($firstHandoff['deployment'], $server, $firstHandoff['activationAttempt']);
+$firstActivation = consumeQueuedActivationDeployment($firstHandoff['deployment'], $server, $firstHandoff['activationAttempt']);
+$first = $firstActivation['deployment'];
 
 $trafficContainer = 'production-application-continuity';
 instant_remote_process([
@@ -388,7 +527,8 @@ $secondHandoff = prepareDeployment(newDeployment(
     'production-application-green',
     $secondCommit,
 ));
-$second = activateDeployment($secondHandoff['deployment'], $server, $secondHandoff['activationAttempt']);
+$secondActivation = consumeQueuedActivationDeployment($secondHandoff['deployment'], $server, $secondHandoff['activationAttempt']);
+$second = $secondActivation['deployment'];
 $activationElapsedMilliseconds = (hrtime(true) - $activationStartedAt) / 1_000_000;
 file_put_contents('/runtime-evidence/replay-complete', hrtime(true)."\n");
 
@@ -416,20 +556,30 @@ $samples = $continuity['samples'] ?? null;
 assertLab(is_array($samples) && count($samples) === $continuity['requestCount'], 'Continuity raw samples do not cover every successful request.');
 $recomputedMaxGap = 0;
 $previousSampleAt = null;
+$postReplaySamples = 0;
 foreach ($samples as $sample) {
     assertLab(
         is_array($sample)
             && ($sample['status'] ?? null) === 200
             && is_int($sample['endedAt'] ?? null)
+            && is_bool($sample['afterTerminalReplay'] ?? null)
             && in_array($sample['acknowledgement'] ?? null, [$firstAcknowledgement, $secondAcknowledgement], true),
         'Continuity raw sample is malformed.',
     );
+    if ($sample['afterTerminalReplay']) {
+        $postReplaySamples++;
+        assertLab($sample['acknowledgement'] === $secondAcknowledgement, 'Terminal activation replay left the blue acknowledgement routable.');
+    }
     if ($previousSampleAt !== null) {
         $recomputedMaxGap = max($recomputedMaxGap, $sample['endedAt'] - $previousSampleAt);
     }
     $previousSampleAt = $sample['endedAt'];
 }
 assertLab($recomputedMaxGap === $continuity['maxGapMilliseconds'], 'Continuity max-gap summary does not match its raw samples.');
+assertLab($postReplaySamples === $continuity['postReplayCount'], 'Continuity post-replay summary does not match its raw samples.');
+$finalSample = end($samples);
+assertLab(is_array($finalSample) && $finalSample['acknowledgement'] === $secondAcknowledgement, 'Continuity ended on a non-promoted acknowledgement.');
+assertLab(($continuity['finalAcknowledgement'] ?? null) === $secondAcknowledgement, 'Continuity final acknowledgement summary is not green.');
 
 $managedInventory = trim((string) instant_remote_process([
     'docker ps --all --quiet --no-trunc --filter '.escapeshellarg('label=coolify.applicationId='.$application->id)
@@ -459,6 +609,27 @@ $first = ApplicationDeploymentQueue::query()->findOrFail($first->id);
 $second = ApplicationDeploymentQueue::query()->findOrFail($second->id);
 assertLab($managedContainers['blue'] === $first->blue_green_candidate_container_id, 'Actual blue container ID does not match first persisted candidate ID.');
 assertLab($managedContainers['green'] === $second->blue_green_candidate_container_id, 'Actual green container ID does not match second persisted candidate ID.');
+assertLab(is_int($second->blue_green_routing_revision) && $second->blue_green_routing_revision > 0, 'Green deployment has no positive routing revision.');
+$greenInspection = InspectBlueGreenContainer::run(
+    $server,
+    new BlueGreenContainerExpectation(
+        name: $application->uuid.'-green',
+        dockerId: $managedContainers['green'],
+        applicationId: $application->id,
+        pullRequestId: 0,
+        blueGreenManaged: true,
+        deploymentUuid: $second->deployment_uuid,
+        color: BlueGreenDeploymentColor::GREEN,
+        routingRevision: $second->blue_green_routing_revision,
+    ),
+);
+assertLab($greenInspection->exists && $greenInspection->status === 'running' && $greenInspection->health === 'healthy', 'Promoted green container is not running and healthy.');
+$activeRoute = ReadBlueGreenManagedRouteMetadata::run($server, $application, $destination);
+assertLab($activeRoute !== null, 'The promoted green route has no managed destination state.');
+assertLab($activeRoute->activeColor === BlueGreenDeploymentColor::GREEN, 'Managed route state is not promoted to green.');
+assertLab($activeRoute->routingRevision === $second->blue_green_routing_revision, 'Managed route revision does not match promoted green provenance.');
+assertLab($activeRoute->activeDeploymentUuid === $second->deployment_uuid, 'Managed route deployment identity does not match green provenance.');
+assertLab($activeRoute->activeContainerId === $managedContainers['green'], 'Managed route container identity does not match healthy green runtime.');
 
 $report = [
     'applicationId' => $application->id,
@@ -470,6 +641,8 @@ $report = [
         'prepareAttempt' => $firstHandoff['prepareAttempt'],
         'activationAttempt' => $firstHandoff['activationAttempt'],
         'candidateContainerId' => $first->blue_green_candidate_container_id,
+        'queue' => $firstActivation['queue'],
+        'routingRevision' => $first->blue_green_routing_revision,
         'status' => $first->status,
     ],
     'second' => [
@@ -477,10 +650,27 @@ $report = [
         'prepareAttempt' => $secondHandoff['prepareAttempt'],
         'activationAttempt' => $secondHandoff['activationAttempt'],
         'candidateContainerId' => $second->blue_green_candidate_container_id,
+        'queue' => $secondActivation['queue'],
+        'routingRevision' => $second->blue_green_routing_revision,
         'status' => $second->status,
     ],
     'activationElapsedMilliseconds' => $activationElapsedMilliseconds,
     'continuity' => $continuity,
+    'expectedAcknowledgements' => [
+        'first' => $firstAcknowledgement,
+        'second' => $secondAcknowledgement,
+    ],
+    'activeRoute' => [
+        'activeColor' => $activeRoute->activeColor?->value,
+        'activeContainerId' => $activeRoute->activeContainerId,
+        'activeDeploymentUuid' => $activeRoute->activeDeploymentUuid,
+        'routingRevision' => $activeRoute->routingRevision,
+    ],
+    'greenInspection' => [
+        'dockerId' => $greenInspection->dockerId,
+        'health' => $greenInspection->health,
+        'status' => $greenInspection->status,
+    ],
     'managedContainers' => $managedContainers,
     'trafficContainerId' => $trafficContainerId,
 ];

@@ -16,15 +16,17 @@ const summary = {
   secondCount: 0,
   postReplayCount: 0,
   replayCompletedAt: null,
+  finalAcknowledgement: null,
   maxGapMilliseconds: 0,
   errors: [],
   samples: [],
 };
 let lastSuccessAt = null;
 
-function recordSuccessfulSample(response) {
+function recordSuccessfulSample(response, afterTerminalReplay) {
   summary.samples.push({
     acknowledgement: response.acknowledgement,
+    afterTerminalReplay,
     endedAt: response.endedAt,
     status: response.status,
   });
@@ -35,6 +37,7 @@ function recordSuccessfulSample(response) {
     summary.secondCount += 1;
     summary.transitionAt ??= response.endedAt;
   }
+  summary.finalAcknowledgement = response.acknowledgement;
   if (lastSuccessAt !== null) {
     summary.maxGapMilliseconds = Math.max(summary.maxGapMilliseconds, response.endedAt - lastSuccessAt);
   }
@@ -88,7 +91,7 @@ try {
   }
 
   summary.startedAt = initial.endedAt;
-  recordSuccessfulSample(initial);
+  recordSuccessfulSample(initial, false);
   await writeFile(readyPath, `${summary.startedAt}\n`);
 
   while (Date.now() < deadline) {
@@ -106,8 +109,11 @@ try {
     if (response.acknowledgement !== firstAcknowledgement && response.acknowledgement !== secondAcknowledgement) {
       throw new Error(`route returned unknown acknowledgement ${response.acknowledgement}`);
     }
+    if (replayComplete && response.acknowledgement !== secondAcknowledgement) {
+      throw new Error('terminal activation replay left the blue acknowledgement routable');
+    }
 
-    recordSuccessfulSample(response);
+    recordSuccessfulSample(response, replayComplete);
     if (replayComplete) {
       summary.replayCompletedAt ??= response.endedAt;
       summary.postReplayCount += 1;

@@ -134,6 +134,42 @@ capture_with_deadline_at()
     return "$capture_status"
 }
 
+persist_sanitized_capture_output()
+{
+    test -n "${evidence_directory:-}" || return 0
+    test -f "$capture_output_file" || return 0
+    command_output_artifact="$evidence_directory/command-output.log"
+    temporary_command_output_artifact=$(mktemp "$evidence_directory/.command-output.XXXXXX") || return 1
+    chmod 0600 "$temporary_command_output_artifact"
+    if python3 - "$capture_output_file" "$temporary_command_output_artifact" <<'PY'
+import re
+import sys
+
+source, destination = sys.argv[1:]
+sensitive_line = re.compile(
+    r'(?:password|passwd|secret|token|private[ _-]?key|authorization|cookie|credential|app[ _-]?key|bearer)',
+    re.IGNORECASE,
+)
+credential_url = re.compile(r'([a-z][a-z0-9+.-]*://[^\s/:@]+:)[^\s@]+@', re.IGNORECASE)
+
+with open(source, 'r', encoding='utf-8', errors='replace') as input_file, open(destination, 'w', encoding='utf-8') as output_file:
+    for line in input_file:
+        line = credential_url.sub(r'\1[REDACTED]@', line)
+        if sensitive_line.search(line):
+            output_file.write('[REDACTED sensitive command output]\n')
+        else:
+            output_file.write(line)
+PY
+    then
+        mv -f "$temporary_command_output_artifact" "$command_output_artifact"
+        chmod 0600 "$command_output_artifact"
+        return 0
+    fi
+    rm -f "$temporary_command_output_artifact"
+
+    return 1
+}
+
 if test -n "${DOCKER_HOST:-}"; then
     outer_docker_host=$DOCKER_HOST
 else
@@ -208,6 +244,7 @@ compose()
 
 fail()
 {
+    persist_sanitized_capture_output || printf 'PRODUCTION_APPLICATION_BLUE_GREEN_WARN could not persist sanitized command output\n' >&2
     printf 'PRODUCTION_APPLICATION_BLUE_GREEN_FAIL %s evidence=%s\n' "$1" "$evidence_directory" >&2
     exit 1
 }
@@ -293,6 +330,7 @@ cleanup_on_exit()
 {
     original_status=$?
     trap - EXIT INT TERM HUP
+    persist_sanitized_capture_output || printf 'PRODUCTION_APPLICATION_BLUE_GREEN_WARN could not persist sanitized command output\n' >&2
     if test "$resources_cleaned" -eq 0; then
         cleanup_resources || true
     fi
@@ -454,8 +492,18 @@ jq -e '
     and .second.status == "finished"
     and (.first.prepareAttempt != .first.activationAttempt)
     and (.second.prepareAttempt != .second.activationAttempt)
+    and ([.first, .second] | all(
+        .queue.before == {pending: 1, reserved: 0, delayed: 0}
+        and .queue.during == {pending: 0, reserved: 1, delayed: 0}
+        and .queue.after == {pending: 0, reserved: 0, delayed: 0}
+        and (.queue.transportUuid | test("^[A-Za-z0-9-]{36}$"))
+        and .queue.attempts == 1
+    ))
     and (.first.candidateContainerId | test("^[a-f0-9]{64}$"))
     and (.second.candidateContainerId | test("^[a-f0-9]{64}$"))
+    and (.first.routingRevision | type == "number" and . > 0)
+    and ((.first.routingRevision) as $firstRoutingRevision
+        | (.second.routingRevision | type == "number" and . > $firstRoutingRevision))
     and (.managedContainers | length == 2)
     and (.managedContainers.blue == .first.candidateContainerId)
     and (.managedContainers.green == .second.candidateContainerId)
@@ -474,9 +522,20 @@ jq -e '
     and .continuity.secondCount >= 3
     and .continuity.postReplayCount >= 5
     and (.continuity.replayCompletedAt | type == "number")
+    and .continuity.finalAcknowledgement == .expectedAcknowledgements.second
+    and (([.continuity.samples[] | select(.afterTerminalReplay)] | length) == .continuity.postReplayCount)
+    and ((.expectedAcknowledgements.second) as $secondAcknowledgement
+        | ([.continuity.samples[] | select(.afterTerminalReplay) | .acknowledgement == $secondAcknowledgement] | all))
     and .continuity.errors == []
     and (.continuity.samples | length == .continuity.requestCount)
     and .continuity.maxGapMilliseconds < 1500
+    and .activeRoute.activeColor == "green"
+    and .activeRoute.activeDeploymentUuid == .second.deploymentUuid
+    and .activeRoute.activeContainerId == .managedContainers.green
+    and .activeRoute.routingRevision == .second.routingRevision
+    and .greenInspection.dockerId == .managedContainers.green
+    and .greenInspection.status == "running"
+    and .greenInspection.health == "healthy"
     and (.trafficContainerId | test("^[a-f0-9]{64}$"))
 ' "$evidence_directory/report.json" >/dev/null || fail 'deployment report contract failed'
 
