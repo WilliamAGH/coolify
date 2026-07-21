@@ -111,9 +111,9 @@ case $name in
             if [[ $1 == --output ]]; then output=$2; shift 2; else shift; fi
         done
         case $output in
-            */docker-compose.yml) printf 'services: {}\n' >"$output" ;;
-            */docker-compose.prod.yml) printf 'services: {}\n' >"$output" ;;
-            */.env.production) printf 'DB_USERNAME=coolify\nDB_DATABASE=coolify\n%s' "${FORK_DEPLOY_ENV_EXTRA:-}" >"$output" ;;
+            */docker-compose.yml|*/docker-compose.prod.yml|*/.env.production)
+                cp "$FORK_DEPLOY_TEST_ASSETS/${output##*/}" "$output"
+                ;;
             *) exit 2 ;;
         esac
         ;;

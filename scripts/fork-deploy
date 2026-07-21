@@ -1345,7 +1345,7 @@ fd_normalize_staged_ports() {
 }
 
 fd_prepare_staged_environment() {
-    local staging=$1 environment source entry key generator value
+    local staging=$1 environment source entry key generator value database
 
     environment=$staging/.env
     source=$SOURCE_DIR/.env
@@ -1372,6 +1372,8 @@ fd_prepare_staged_environment() {
             set_env_value "$environment" "$key" "$value"
         fi
     done
+    database=$(optional_env_value "$environment" DB_DATABASE)
+    set_env_value "$environment" DB_DATABASE "${database:-coolify}"
     fd_normalize_staged_ports "$environment"
     set_env_value "$environment" AUTOUPDATE false
     set_env_value "$environment" COOLIFY_FORK_VERSION "$VERSION"
@@ -1725,7 +1727,8 @@ fd_migration_fingerprint() {
         return 0
     fi
     username=$(env_value "$environment" DB_USERNAME)
-    database=$(env_value "$environment" DB_DATABASE)
+    database=$(optional_env_value "$environment" DB_DATABASE)
+    database=${database:-coolify}
     table_exists=$(docker exec coolify-db psql -U "$username" -d "$database" -Atc "SELECT COALESCE(to_regclass('public.migrations')::text, '');") || die 'could not inspect the Coolify migration table'
     if [[ $table_exists != migrations && $table_exists != public.migrations ]]; then
         printf 'uninitialized\n'
@@ -1748,13 +1751,13 @@ fd_unmanaged_state_present() {
     done
     require_directory_or_missing "$SOURCE_DIR" 'unmanaged Coolify source directory'
     if [[ -d $SOURCE_DIR ]]; then
-        discovered=$(find "$SOURCE_DIR" -mindepth 1 -print -quit)
+        discovered=$(find "$SOURCE_DIR" -mindepth 1 ! -type d -print -quit)
         [[ -z $discovered ]] || return 0
     fi
     for directory in applications backups databases proxy sentinel services ssh; do
         require_directory_or_missing "$ROOT/$directory" "unmanaged Coolify $directory directory"
         [[ -d $ROOT/$directory ]] || continue
-        discovered=$(find "$ROOT/$directory" -mindepth 1 -print -quit)
+        discovered=$(find "$ROOT/$directory" -mindepth 1 ! -type d -print -quit)
         [[ -z $discovered ]] || return 0
     done
     volumes=$(docker volume ls --format '{{.Name}}') \
