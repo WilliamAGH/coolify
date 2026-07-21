@@ -179,6 +179,7 @@ SH);
             'FORK_VERSION_SHA_TAG' => 'docker.iocloudhost.net/williamagh/coolify:fork-4.13.1-fork-aaaaaaa',
             'FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE' => '/dev/null',
             'FORK_RELEASE_TAG_VERIFIER' => '/usr/bin/true',
+            'FORK_RELEASE_RULESET_TOKEN' => 'fixture-ruleset-token',
             'FORK_RELEASE_TRUST_VERIFIER' => '/usr/bin/true',
             'PATH' => $bin.PATH_SEPARATOR.(getenv('PATH') ?: ''),
             'REGCTL_LOG' => $log,
@@ -287,6 +288,7 @@ SH);
             'GITHUB_SHA' => str_repeat('a', 40),
             'FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE' => '/dev/null',
             'FORK_RELEASE_TAG_VERIFIER' => '/usr/bin/true',
+            'FORK_RELEASE_RULESET_TOKEN' => 'fixture-ruleset-token',
             'FORK_RELEASE_TRUST_VERIFIER' => '/usr/bin/true',
             'RUNNER_TEMP' => $fixture,
             'SEMANTIC_VERSION' => '4.13.1-fork',
@@ -409,6 +411,7 @@ SH);
             'GITHUB_SHA' => str_repeat('a', 40),
             'FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE' => '/dev/null',
             'FORK_RELEASE_TAG_VERIFIER' => '/usr/bin/true',
+            'FORK_RELEASE_RULESET_TOKEN' => 'fixture-ruleset-token',
             'FORK_RELEASE_TRUST_VERIFIER' => '/usr/bin/true',
             'PATH' => $bin.PATH_SEPARATOR.(getenv('PATH') ?: ''),
             'RELEASE_ASSETS_JSON' => json_encode(
@@ -1255,7 +1258,7 @@ SH;
         'Reverify every fork alias after release publication',
     )['run'] ?? '');
     $canonicalTrustVerifierInvocation = <<<'SH'
-"$FORK_RELEASE_TRUST_VERIFIER" \
+FORK_RELEASE_RULESET_TOKEN="$ruleset_token" "$FORK_RELEASE_TRUST_VERIFIER" \
     "$SEMANTIC_VERSION" "$SOURCE_REVISION" \
     "$SOURCE_URL.git" "$FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE" \
     "$GITHUB_REPOSITORY"
@@ -1267,6 +1270,25 @@ SH;
     }
     if (($forkRelease['env']['FORK_RELEASE_TRUST_VERIFIER'] ?? null) !== 'scripts/ci/verify-fork-release-trust.sh') {
         $violations[] = 'fork release lost the canonical trust verifier owner';
+    }
+    foreach ([
+        'Create or validate empty draft recovery release before semantic promotion',
+        'Promote and verify the main fork image',
+        'Publish immutable signed fork bundles to the tag release',
+        'Reverify every fork alias after release publication',
+    ] as $trustStepName) {
+        $trustStep = releaseWorkflowStep($forkRelease, $trustStepName);
+        if (($trustStep['env']['FORK_RELEASE_RULESET_TOKEN'] ?? null) !== '${{ secrets.FORK_RELEASE_RULESET_TOKEN }}'
+            || ($trustStep['env']['GH_TOKEN'] ?? null) !== '${{ github.token }}') {
+            $violations[] = 'fork release trust checks must isolate the ruleset audit token from release mutation credentials';
+        }
+        $trustRun = (string) ($trustStep['run'] ?? '');
+        if (! str_contains($trustRun, 'ruleset_token=${FORK_RELEASE_RULESET_TOKEN:?}'.PHP_EOL.'unset FORK_RELEASE_RULESET_TOKEN')) {
+            $violations[] = 'fork release trust steps must unexport ruleset authority before running any external command';
+        }
+    }
+    if (($caller['jobs']['publish']['secrets']['FORK_RELEASE_RULESET_TOKEN'] ?? null) !== '${{ secrets.FORK_RELEASE_RULESET_TOKEN }}') {
+        $violations[] = 'fork caller must explicitly pass the ruleset audit token';
     }
 
     $semanticMutationBoundaries = [
@@ -1401,6 +1423,23 @@ it('rejects unsafe fork source, signer, and runner topology mutations', function
             '      regctl image copy "$repository@$expected_index_digest" "$tag"',
         ),
         'missing-tag-ruleset-bypass-guard' => $sharedWorkflow['jobs']['fork-release']['env']['FORK_RELEASE_TRUST_VERIFIER'] = '/usr/bin/true',
+        'missing-ruleset-token-binding' => (function () use (&$sharedWorkflow): void {
+            foreach ($sharedWorkflow['jobs']['fork-release']['steps'] as &$step) {
+                if (($step['name'] ?? null) === 'Promote and verify the main fork image') {
+                    unset($step['env']['FORK_RELEASE_RULESET_TOKEN']);
+                }
+            }
+            unset($step);
+        })(),
+        'missing-ruleset-token-unset' => $replaceForkReleaseRun(
+            $sharedWorkflow,
+            'Promote and verify the main fork image',
+            'ruleset_token=${FORK_RELEASE_RULESET_TOKEN:?}'.PHP_EOL.'unset FORK_RELEASE_RULESET_TOKEN',
+            'ruleset_token=${FORK_RELEASE_RULESET_TOKEN:?}'.PHP_EOL.':',
+        ),
+        'missing-caller-ruleset-token' => (function () use (&$caller): void {
+            unset($caller['jobs']['publish']['secrets']['FORK_RELEASE_RULESET_TOKEN']);
+        })(),
         'missing-release-upload-signer' => $replaceForkReleaseRun(
             $sharedWorkflow,
             'Publish immutable signed fork bundles to the tag release',
@@ -1463,6 +1502,9 @@ it('rejects unsafe fork source, signer, and runner topology mutations', function
     'missing-registry-write-signer',
     'missing-post-copy-signer',
     'missing-tag-ruleset-bypass-guard',
+    'missing-ruleset-token-binding',
+    'missing-ruleset-token-unset',
+    'missing-caller-ruleset-token',
     'missing-release-upload-signer',
     'missing-post-release-upload-trust',
     'missing-release-publication-signer',
@@ -3055,6 +3097,7 @@ it('defines one referrerless fork release graph for the main image on both platf
         'target_repository' => 'williamagh/coolify',
         'validate_only' => false,
     ])->and(array_keys($publish['secrets'] ?? []))->toBe([
+        'FORK_RELEASE_RULESET_TOKEN',
         'FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY',
         'NEXUS_PASSWORD',
         'NEXUS_USERNAME',

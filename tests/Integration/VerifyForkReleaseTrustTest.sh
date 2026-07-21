@@ -14,11 +14,14 @@ printf '%s\n' matching > "$ruleset_state"
 cat > "$bin/tag-verifier" <<'SH'
 #!/bin/sh
 set -eu
+[ -z "${FORK_RELEASE_RULESET_TOKEN:-}" ]
+[ -z "${GH_TOKEN:-}" ]
 printf '%s\n' "$*" >> "${VERIFICATION_LOG:?}"
 SH
 cat > "$bin/gh" <<'SH'
 #!/bin/sh
 set -eu
+[ "${GH_TOKEN:-}" = fixture-ruleset-token ]
 endpoint=''
 for argument in "$@"; do
   case "$argument" in
@@ -65,7 +68,9 @@ chmod +x "$bin/tag-verifier" "$bin/gh"
 
 run_verifier()
 {
+  ruleset_token=${1-fixture-ruleset-token}
   FORK_RELEASE_TAG_VERIFIER="$bin/tag-verifier" \
+  FORK_RELEASE_RULESET_TOKEN="$ruleset_token" \
   GH_CLI="$bin/gh" \
   RULESET_STATE="$ruleset_state" \
   RUNNER_TEMP="$fixture" \
@@ -79,6 +84,10 @@ run_verifier()
 
 run_verifier
 grep -Fx "4.13.4-fork $(printf 'a%.0s' {1..40}) https://github.com/williamacallahan/coolify.git docker/fork-release-tag-allowed-signers" "$verification_log" >/dev/null
+if run_verifier '' >/dev/null 2>&1; then
+  printf '%s\n' 'missing ruleset audit token was accepted' >&2
+  exit 1
+fi
 
 for rejected_state in bypass missing-bypass missing-deletion duplicate; do
   printf '%s\n' "$rejected_state" > "$ruleset_state"

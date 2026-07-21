@@ -10,8 +10,11 @@ repository=${5:-}
 repository_pattern='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
 fork_ruleset_name='Protect Coolify fork release tags'
 fork_tag_pattern='refs/tags/*.*.*-fork*'
+ruleset_token=${FORK_RELEASE_RULESET_TOKEN:-}
+unset FORK_RELEASE_RULESET_TOKEN GH_TOKEN
 
 [[ "$repository" =~ $repository_pattern ]]
+[[ -n "$ruleset_token" ]]
 
 script_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 tag_verifier=${FORK_RELEASE_TAG_VERIFIER:-$script_directory/verify-fork-release-tag.sh}
@@ -31,7 +34,7 @@ rulesets_file=$(mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/coolify-fork-rulesets.XX
 ruleset_file=$(mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/coolify-fork-ruleset.XXXXXX")
 trap 'rm -f "$rulesets_file" "$ruleset_file"' EXIT
 
-"$gh_cli" api --method GET \
+GH_TOKEN="$ruleset_token" "$gh_cli" api --method GET \
   --header 'Accept: application/vnd.github+json' \
   --header 'X-GitHub-Api-Version: 2022-11-28' \
   "repos/$repository/rulesets?targets=tag&includes_parents=true&per_page=100" > "$rulesets_file"
@@ -41,7 +44,7 @@ ruleset_id=$(jq -er --arg name "$fork_ruleset_name" '
 ' "$rulesets_file")
 printf '%s' "$ruleset_id" | grep -Eq '^[1-9][0-9]*$'
 
-"$gh_cli" api --method GET \
+GH_TOKEN="$ruleset_token" "$gh_cli" api --method GET \
   --header 'Accept: application/vnd.github+json' \
   --header 'X-GitHub-Api-Version: 2022-11-28' \
   "repos/$repository/rulesets/$ruleset_id" > "$ruleset_file"

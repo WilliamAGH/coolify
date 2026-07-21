@@ -57,6 +57,8 @@ on:
         required: false
       FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY:
         required: false
+      FORK_RELEASE_RULESET_TOKEN:
+        required: false
     outputs:
       digest:
         description: Published multi-platform index digest.
@@ -2470,14 +2472,17 @@ jobs:
 
       - name: Create or validate empty draft recovery release before semantic promotion
         env:
+          FORK_RELEASE_RULESET_TOKEN: ${{ secrets.FORK_RELEASE_RULESET_TOKEN }}
           GH_CLI: ${{ steps.fork-release-gh-cli.outputs.path }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
           umask 077
+          ruleset_token=${FORK_RELEASE_RULESET_TOKEN:?}
+          unset FORK_RELEASE_RULESET_TOKEN
 
           verify_live_fork_release_trust() {
-            "$FORK_RELEASE_TRUST_VERIFIER" \
+            FORK_RELEASE_RULESET_TOKEN="$ruleset_token" "$FORK_RELEASE_TRUST_VERIFIER" \
               "$SEMANTIC_VERSION" "$SOURCE_REVISION" \
               "$SOURCE_URL.git" "$FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE" \
               "$GITHUB_REPOSITORY"
@@ -2624,14 +2629,17 @@ jobs:
 
       - name: Promote and verify the main fork image
         env:
+          FORK_RELEASE_RULESET_TOKEN: ${{ secrets.FORK_RELEASE_RULESET_TOKEN }}
           GH_CLI: ${{ steps.fork-release-gh-cli.outputs.path }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
           umask 077
+          ruleset_token=${FORK_RELEASE_RULESET_TOKEN:?}
+          unset FORK_RELEASE_RULESET_TOKEN
 
           verify_live_fork_release_trust() {
-            "$FORK_RELEASE_TRUST_VERIFIER" \
+            FORK_RELEASE_RULESET_TOKEN="$ruleset_token" "$FORK_RELEASE_TRUST_VERIFIER" \
               "$SEMANTIC_VERSION" "$SOURCE_REVISION" \
               "$SOURCE_URL.git" "$FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE" \
               "$GITHUB_REPOSITORY"
@@ -2833,14 +2841,17 @@ jobs:
 
       - name: Publish immutable signed fork bundles to the tag release
         env:
+          FORK_RELEASE_RULESET_TOKEN: ${{ secrets.FORK_RELEASE_RULESET_TOKEN }}
           GH_CLI: ${{ steps.fork-release-gh-cli.outputs.path }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
           umask 077
+          ruleset_token=${FORK_RELEASE_RULESET_TOKEN:?}
+          unset FORK_RELEASE_RULESET_TOKEN
 
           verify_live_fork_release_trust() {
-            "$FORK_RELEASE_TRUST_VERIFIER" \
+            FORK_RELEASE_RULESET_TOKEN="$ruleset_token" "$FORK_RELEASE_TRUST_VERIFIER" \
               "$SEMANTIC_VERSION" "$SOURCE_REVISION" \
               "$SOURCE_URL.git" "$FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE" \
               "$GITHUB_REPOSITORY"
@@ -3024,14 +3035,17 @@ jobs:
 
       - name: Reverify every fork alias after release publication
         env:
+          FORK_RELEASE_RULESET_TOKEN: ${{ secrets.FORK_RELEASE_RULESET_TOKEN }}
           GH_CLI: ${{ steps.fork-release-gh-cli.outputs.path }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
           umask 077
+          ruleset_token=${FORK_RELEASE_RULESET_TOKEN:?}
+          unset FORK_RELEASE_RULESET_TOKEN
 
           verify_live_fork_release_trust() {
-            "$FORK_RELEASE_TRUST_VERIFIER" \
+            FORK_RELEASE_RULESET_TOKEN="$ruleset_token" "$FORK_RELEASE_TRUST_VERIFIER" \
               "$SEMANTIC_VERSION" "$SOURCE_REVISION" \
               "$SOURCE_URL.git" "$FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE" \
               "$GITHUB_REPOSITORY"
