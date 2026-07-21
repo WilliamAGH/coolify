@@ -346,7 +346,9 @@ function consumeQueuedActivationDeployment(
     });
 
     try {
-        app(Worker::class)->runNextJob(
+        $worker = app('queue.worker');
+        assertLab($worker instanceof Worker, 'Laravel did not register the canonical queue worker.');
+        $worker->runNextJob(
             ProxyMutationQueue::CONNECTION,
             ProxyMutationQueue::NAME,
             new WorkerOptions(
