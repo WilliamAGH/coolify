@@ -1,17 +1,23 @@
 <?php
 
+use App\Actions\Application\BlueGreen\BindBlueGreenReplicaSet;
+use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
 use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenContainerRemovalPlan;
+use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
 use App\Actions\Application\BlueGreen\BlueGreenOperationFence;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaInspection;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\InspectBlueGreenReplicaSet;
+use App\Actions\Application\BlueGreen\ReconstructBlueGreenDeploymentRecovery;
 use App\Actions\Application\BlueGreen\RemoveBlueGreenApplicationContainers;
 use App\Actions\Application\BlueGreen\RemoveBlueGreenReplicaSet;
+use App\Actions\Application\BlueGreen\ReserveBlueGreenReplicaSet;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
+use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\ProxyTypes;
 use App\Exceptions\DeploymentException;
 use App\Models\Application;
@@ -30,13 +36,120 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Schema;
+use Symfony\Component\Filesystem\Filesystem;
 use Symfony\Component\Process\Process as SymfonyProcess;
+use Tests\Support\BlueGreenDeactivationScenario;
 
 uses(RefreshDatabase::class);
 
 beforeEach(function (): void {
     InstanceSettings::unguarded(fn () => InstanceSettings::query()->create(['id' => 0]));
 });
+
+/**
+ * @return array{
+ *     application: Application,
+ *     claim: BlueGreenDeploymentClaim,
+ *     state: ApplicationBlueGreenDeployment
+ * }
+ */
+function exactBlueGreenReplicaBindingFixture(int $replicaCount = 3): array
+{
+    $team = Team::factory()->create();
+    $server = Server::factory()->create(['team_id' => $team->id]);
+    $destination = $server->standaloneDockers()->firstOrFail();
+    $project = Project::factory()->create(['team_id' => $team->id]);
+    $application = Application::factory()->create([
+        'environment_id' => $project->environments()->firstOrFail()->id,
+        'destination_id' => $destination->id,
+        'destination_type' => $destination->getMorphClass(),
+    ]);
+    $deploymentUuid = 'replica-binding-release';
+    $state = ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $application->id,
+        'standalone_docker_id' => $destination->id,
+        'pending_color' => BlueGreenDeploymentColor::BLUE,
+        'pending_deployment_uuid' => $deploymentUuid,
+        'operation_deployment_uuid' => $deploymentUuid,
+        'operation_candidate_container_name' => $application->uuid.'-blue',
+        'operation_rollback_managed_filename' => 'replica-binding-rollback.yaml',
+        'operation_destination_fence_epoch' => 1,
+        'operation_server_boot_id' => '11111111-1111-1111-1111-111111111111',
+        'operation_topology_digest' => hash('sha256', 'replica-binding-topology'),
+        'operation_routing_config_digest' => hash('sha256', 'replica-binding-routing'),
+        'supersession_generation' => 1,
+        'phase' => BlueGreenDeploymentPhase::PREPARING,
+        'routing_revision' => 1,
+    ]);
+    $claim = new BlueGreenDeploymentClaim(
+        stateId: $state->id,
+        applicationId: $application->id,
+        standaloneDockerId: $destination->id,
+        pendingColor: BlueGreenDeploymentColor::BLUE,
+        previousActiveColor: null,
+        deploymentUuid: $deploymentUuid,
+        expectedRoutingRevision: 1,
+        destinationFenceEpoch: 1,
+        serverBootId: '11111111-1111-1111-1111-111111111111',
+        topologyDigest: hash('sha256', 'replica-binding-topology'),
+        routingConfigDigest: hash('sha256', 'replica-binding-routing'),
+        backendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
+        drainBackendPortInventory: null,
+        supersessionGeneration: 1,
+        legacyContainerName: null,
+        replicaCount: $replicaCount,
+        candidateContainerName: $application->uuid.'-blue',
+        rollbackManagedFilename: 'replica-binding-rollback.yaml',
+    );
+    ApplicationDeploymentQueue::query()->create([
+        'application_id' => $application->id,
+        'destination_id' => $destination->id,
+        'server_id' => $server->id,
+        'deployment_uuid' => $claim->deploymentUuid,
+        'pull_request_id' => 0,
+        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+        'blue_green_color' => $claim->pendingColor,
+        'blue_green_phase' => BlueGreenDeploymentPhase::PREPARING,
+        'blue_green_routing_revision' => $claim->expectedRoutingRevision,
+        'blue_green_destination_fence_epoch' => $claim->destinationFenceEpoch,
+        'blue_green_server_boot_id' => $claim->serverBootId,
+        'blue_green_topology_digest' => $claim->topologyDigest,
+        'blue_green_routing_config_digest' => $claim->routingConfigDigest,
+        'blue_green_backend_port_inventory' => $claim->backendPortInventory->serialized,
+        'blue_green_drain_backend_port_inventory' => null,
+        'blue_green_supersession_generation' => $claim->supersessionGeneration,
+    ]);
+    (new ReserveBlueGreenReplicaSet)->handle(
+        application: $application,
+        state: $state,
+        color: $claim->pendingColor,
+        deploymentUuid: $claim->deploymentUuid,
+        routingRevision: $claim->expectedRoutingRevision,
+        composeServiceBase: $application->uuid.'-blue',
+        scalarContainerName: $claim->candidateContainerName,
+        replicaCount: $claim->replicaCount,
+    );
+
+    return compact('application', 'claim', 'state');
+}
+
+/** @return list<BlueGreenReplicaInspection> */
+function exactBlueGreenReplicaInspections(
+    Application $application,
+    int $replicaCount,
+): array {
+    return array_map(
+        static fn (int $index): BlueGreenReplicaInspection => BlueGreenReplicaInspection::fromRuntime(
+            replicaIndex: $index,
+            composeService: $application->uuid."-blue-replica-{$index}",
+            containerName: $application->uuid."-blue-replica-{$index}-1",
+            dockerId: str_repeat((string) $index, 64),
+            status: 'running',
+            health: 'healthy',
+        ),
+        range(1, $replicaCount),
+    );
+}
 
 /** @param array{commands: non-empty-list<string>, completionAssertions: non-empty-list<string>} $plan */
 function runReplicaRemovalPlanAgainstFakeDocker(
@@ -66,48 +179,78 @@ function writeReplicaRemovalFakeDocker(string $binaryDirectory): void
 #!/bin/sh
 set -eu
 state=''
-if test -s "$COOLIFY_FAKE_DOCKER_STATE"; then
-    state=$(cat "$COOLIFY_FAKE_DOCKER_STATE")
-fi
-container_id=${state%%|*}
-container_name=${state#*|}
-exists=false
-if test -n "$state"; then
-    exists=true
-fi
-identifier_exists() {
-    test "$exists" = true && { test "$1" = "$container_id" || test "$1" = "$container_name"; }
+find_container() {
+    identifier=$1
+    while IFS='|' read -r container_id container_name application_id deployment_uuid color routing_revision replica_index replica_count compose_project compose_service; do
+        test -n "$container_id" || continue
+        if test "$identifier" = "$container_id" || test "$identifier" = "$container_name"; then
+            printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$container_id" "$container_name" "$application_id" "$deployment_uuid" "$color" "$routing_revision" "$replica_index" "$replica_count" "$compose_project" "$compose_service"
+            return 0
+        fi
+    done < "$COOLIFY_FAKE_DOCKER_STATE"
+
+    return 1
 }
 case "$1" in
     container)
         test "$2" = inspect
-        identifier_exists "$3"
+        find_container "$3" >/dev/null
         ;;
     inspect)
         format=${2#--format=}
         identifier=$3
-        identifier_exists "$identifier"
+        state=$(find_container "$identifier")
+        IFS='|' read -r container_id container_name application_id deployment_uuid color routing_revision replica_index replica_count compose_project compose_service <<EOF
+$state
+EOF
         case "$format" in
             '{{.Id}}') printf '%s\n' "$container_id" ;;
             '{{.Name}}') printf '/%s\n' "$container_name" ;;
-            *coolify.applicationId*) printf '41\n' ;;
+            *coolify.applicationId*) printf '%s\n' "$application_id" ;;
             *coolify.pullRequestId*) printf '0\n' ;;
             *coolify.blueGreen.managed*) printf 'true\n' ;;
-            *coolify.blueGreen.deploymentUuid*) printf 'replica-removal-release\n' ;;
-            *coolify.blueGreen.color*) printf 'blue\n' ;;
-            *coolify.blueGreen.routingRevision*) printf '12\n' ;;
+            *coolify.blueGreen.deploymentUuid*) printf '%s\n' "$deployment_uuid" ;;
+            *coolify.blueGreen.color*) printf '%s\n' "$color" ;;
+            *coolify.blueGreen.routingRevision*) printf '%s\n' "$routing_revision" ;;
+            *coolify.blueGreen.replicaIndex*) printf '%s\n' "$replica_index" ;;
+            *coolify.blueGreen.replicaCount*) printf '%s\n' "$replica_count" ;;
+            *com.docker.compose.project*) printf '%s\n' "$compose_project" ;;
+            *com.docker.compose.service*) printf '%s\n' "$compose_service" ;;
             *) exit 94 ;;
         esac
         ;;
     ps)
-        if test "$exists" = true; then
-            printf '%s\n' "$container_id"
-        fi
+        shift
+        while IFS='|' read -r container_id container_name application_id deployment_uuid color routing_revision replica_index replica_count compose_project compose_service; do
+            test -n "$container_id" || continue
+            matches=true
+            for argument in "$@"; do
+                case "$argument" in
+                    label=coolify.applicationId=*) test "$argument" = "label=coolify.applicationId=$application_id" || matches=false ;;
+                    label=coolify.pullRequestId=*) test "$argument" = 'label=coolify.pullRequestId=0' || matches=false ;;
+                    label=coolify.blueGreen.managed=*) test "$argument" = 'label=coolify.blueGreen.managed=true' || matches=false ;;
+                    label=coolify.blueGreen.deploymentUuid=*) test "$argument" = "label=coolify.blueGreen.deploymentUuid=$deployment_uuid" || matches=false ;;
+                    label=coolify.blueGreen.color=*) test "$argument" = "label=coolify.blueGreen.color=$color" || matches=false ;;
+                    label=coolify.blueGreen.routingRevision=*) test "$argument" = "label=coolify.blueGreen.routingRevision=$routing_revision" || matches=false ;;
+                    label=coolify.blueGreen.replicaIndex=*) test "$argument" = "label=coolify.blueGreen.replicaIndex=$replica_index" || matches=false ;;
+                    label=coolify.blueGreen.replicaCount=*) test "$argument" = "label=coolify.blueGreen.replicaCount=$replica_count" || matches=false ;;
+                    label=com.docker.compose.project=*) test "$argument" = "label=com.docker.compose.project=$compose_project" || matches=false ;;
+                    label=com.docker.compose.service=*) test "$argument" = "label=com.docker.compose.service=$compose_service" || matches=false ;;
+                esac
+            done
+            test "$matches" = true && printf '%s\n' "$container_id"
+        done < "$COOLIFY_FAKE_DOCKER_STATE"
         ;;
     rm)
         test "$2" = -f
-        test "$3" = "$container_id"
-        : > "$COOLIFY_FAKE_DOCKER_STATE"
+        removal_id=$3
+        find_container "$removal_id" >/dev/null
+        temporary_state="$COOLIFY_FAKE_DOCKER_STATE.tmp.$$"
+        : > "$temporary_state"
+        while IFS= read -r container; do
+            test "${container%%|*}" = "$removal_id" || printf '%s\n' "$container" >> "$temporary_state"
+        done < "$COOLIFY_FAKE_DOCKER_STATE"
+        mv "$temporary_state" "$COOLIFY_FAKE_DOCKER_STATE"
         ;;
     *) exit 95 ;;
 esac
@@ -267,7 +410,7 @@ it('binds the durable N=3 identities before refusing partial health after a rest
         ),
     )->all();
     $inspectionOutput = $claimedRows->map(static function (ApplicationBlueGreenReplica $replica): string {
-        return json_encode([
+        $inspection = json_encode([
             'Id' => str_repeat((string) $replica->replica_index, 64),
             'Name' => '/'.$replica->compose_service.'-1',
             'State' => [
@@ -287,6 +430,8 @@ it('binds the durable N=3 identities before refusing partial health after a rest
                 'com.docker.compose.service' => $replica->compose_service,
             ]],
         ], JSON_THROW_ON_ERROR);
+
+        return $replica->replica_index."\t".$inspection;
     })->implode("\n");
     Process::fake(function ($process) use ($bootId, $inspectionOutput) {
         $command = is_array($process->command) ? implode(' ', $process->command) : (string) $process->command;
@@ -437,50 +582,82 @@ it('keeps the claimed scalar health and rollback identity when settings drift fr
 });
 
 it('executes replica rollback only for the immutable bound identity and preserves replacements', function (): void {
-    $replica = new ApplicationBlueGreenReplica;
-    $persistedContainerId = str_repeat('a', 64);
-    $replacementContainerId = str_repeat('b', 64);
-    $replica->forceFill([
-        'application_id' => 41,
-        'standalone_docker_id' => 9,
-        'color' => BlueGreenDeploymentColor::BLUE,
-        'replica_index' => 1,
-        'deployment_uuid' => 'replica-removal-release',
-        'routing_revision' => 12,
-        'compose_project' => 'application-project',
-        'compose_service' => 'application-blue-replica-1',
-        'container_name' => 'application-blue-replica-1-1',
-        'container_id' => $persistedContainerId,
-    ]);
-    $remover = new RemoveBlueGreenReplicaSet;
-    $plan = $remover->commandsForReplica($replica);
-    $temporaryDirectory = sys_get_temp_dir().'/coolify-replica-removal-'.bin2hex(random_bytes(8));
-    $binaryDirectory = $temporaryDirectory.'/bin';
-    $stateFile = $temporaryDirectory.'/state';
+    $fixture = exactBlueGreenReplicaBindingFixture();
+    $bound = (new BindBlueGreenReplicaSet)->handle(
+        $fixture['claim'],
+        exactBlueGreenReplicaInspections($fixture['application'], $fixture['claim']->replicaCount),
+    );
+    [$commands, $completionAssertions] = (new RemoveBlueGreenReplicaSet)->commandsFor(
+        $fixture['claim'],
+        collect($bound),
+    );
+    $firstReplicaId = $bound[0]->container_id;
+    $command = implode("\n", $commands);
+    $identityGuard = 'test "$(docker ps -aq --no-trunc';
+    $removal = 'docker rm -f '.escapeshellarg($firstReplicaId);
+
+    expect($firstReplicaId)->toMatch('/^[a-f0-9]{64}$/')
+        ->and($command)->toContain(
+            $identityGuard,
+            '= '.escapeshellarg($firstReplicaId),
+            'label=coolify.blueGreen.replicaIndex=1',
+            'label=coolify.blueGreen.replicaCount=3',
+            'label=com.docker.compose.project='.$bound[0]->compose_project,
+            'label=com.docker.compose.service='.$bound[0]->compose_service,
+            $removal,
+        )
+        ->and(strpos($command, $identityGuard))->toBeInt()->toBeLessThan(strpos($command, $removal))
+        ->and(implode("\n", $completionAssertions))->toContain('docker ps -aq --no-trunc');
+
+    $filesystem = new Filesystem;
+    $fixtureDirectory = sys_get_temp_dir().'/coolify-replica-removal-'.bin2hex(random_bytes(8));
+    $binaryDirectory = $fixtureDirectory.'/bin';
+    $stateFile = $fixtureDirectory.'/state';
+    $filesystem->mkdir($fixtureDirectory, 0700);
     writeReplicaRemovalFakeDocker($binaryDirectory);
+    $stateLines = array_map(
+        static fn (ApplicationBlueGreenReplica $replica): string => implode('|', [
+            $replica->container_id,
+            $replica->container_name,
+            $replica->application_id,
+            $replica->deployment_uuid,
+            $replica->color->value,
+            $replica->routing_revision,
+            $replica->replica_index,
+            3,
+            $replica->compose_project,
+            $replica->compose_service,
+        ]),
+        $bound,
+    );
+    $plan = compact('commands', 'completionAssertions');
 
-    file_put_contents($stateFile, $persistedContainerId.'|application-blue-replica-1-1');
-    $exactRemoval = runReplicaRemovalPlanAgainstFakeDocker($plan, $stateFile, $binaryDirectory);
-    $idempotentReplay = runReplicaRemovalPlanAgainstFakeDocker($plan, $stateFile, $binaryDirectory);
+    try {
+        file_put_contents($stateFile, implode("\n", $stateLines)."\n");
+        $exactRemoval = runReplicaRemovalPlanAgainstFakeDocker($plan, $stateFile, $binaryDirectory);
 
-    file_put_contents($stateFile, $replacementContainerId.'|application-blue-replica-1-1');
-    $sameNameReplacement = runReplicaRemovalPlanAgainstFakeDocker($plan, $stateFile, $binaryDirectory);
-    $sameNameState = file_get_contents($stateFile);
+        expect($exactRemoval->isSuccessful())->toBeTrue($exactRemoval->getErrorOutput())
+            ->and(trim((string) file_get_contents($stateFile)))->toBe('');
 
-    file_put_contents($stateFile, $replacementContainerId.'|replacement-blue-replica-1-1');
-    $sameLabelReplacement = runReplicaRemovalPlanAgainstFakeDocker($plan, $stateFile, $binaryDirectory);
-    $sameLabelState = file_get_contents($stateFile);
+        $replacementId = str_repeat('f', 64);
+        $replacementState = preg_replace('/^[^|]+/', $replacementId, $stateLines[0], 1);
+        expect($replacementState)->toBeString();
+        $replacementStateLines = [$replacementState, ...array_slice($stateLines, 1)];
+        file_put_contents($stateFile, implode("\n", $replacementStateLines)."\n");
+        $replacementFence = runReplicaRemovalPlanAgainstFakeDocker($plan, $stateFile, $binaryDirectory);
 
-    expect($exactRemoval->isSuccessful())->toBeTrue()
-        ->and($idempotentReplay->isSuccessful())->toBeTrue()
-        ->and($sameNameReplacement->isSuccessful())->toBeFalse()
-        ->and($sameLabelReplacement->isSuccessful())->toBeFalse()
-        ->and($sameNameState)->toBe($replacementContainerId.'|application-blue-replica-1-1')
-        ->and($sameLabelState)->toBe($replacementContainerId.'|replacement-blue-replica-1-1');
+        expect($replacementFence->isSuccessful())->toBeFalse()
+            ->and(file($stateFile, FILE_IGNORE_NEW_LINES))->toBe($replacementStateLines);
+    } finally {
+        $filesystem->remove($fixtureDirectory);
+    }
 
-    $replica->container_id = null;
-    expect(fn () => $remover->commandsForReplica($replica))
-        ->toThrow(RuntimeException::class, 'immutable bound container identity');
+    $truncated = clone $bound[0];
+    $truncated->forceFill(['container_id' => str_repeat('a', 12)]);
+    expect(fn (): array => (new RemoveBlueGreenReplicaSet)->commandsFor(
+        $fixture['claim'],
+        collect([$truncated, ...array_slice($bound, 1)]),
+    ))->toThrow(RuntimeException::class, 'exact pending release');
 });
 
 it('parses exactly one provenance-matched Docker identity per replica slot', function (): void {
@@ -529,9 +706,11 @@ it('parses exactly one provenance-matched Docker identity per replica slot', fun
             'application-blue-replica-3-1',
         ])
         ->and($inspector->commandFor($replicas, 3))->toContain(
+            'docker ps -aq --no-trunc',
             'label=coolify.blueGreen.replicaIndex=1',
             'label=com.docker.compose.service=application-blue-replica-3',
-        );
+        )
+        ->and($inspector->availableCommandFor($replicas, 3))->toContain('docker ps -aq --no-trunc');
 
     expect(fn () => $inspector->parse(str_replace(
         '"coolify.blueGreen.replicaCount":"3"',
@@ -660,3 +839,139 @@ it('preserves color slot history while enforcing one durable row per release ind
         ->toThrow(QueryException::class)
         ->and(ApplicationBlueGreenReplica::query()->count())->toBe(2);
 });
+
+it('fails closed when a durable replica ledger omits a contiguous slot', function (): void {
+    $replicas = collect([1, 3])->map(function (int $index): ApplicationBlueGreenReplica {
+        $replica = new ApplicationBlueGreenReplica;
+        $replica->forceFill(['replica_index' => $index]);
+
+        return $replica;
+    });
+
+    expect(fn (): BlueGreenReplicaSet => BlueGreenReplicaSet::fromReplicas($replicas))
+        ->toThrow(InvalidArgumentException::class, 'contiguous replica index exactly once')
+        ->and(fn (): string => (new InspectBlueGreenReplicaSet)->availableCommandFor($replicas, 2))
+        ->toThrow(RuntimeException::class, 'contiguous claimed quorum');
+});
+
+it('requires every claimed replica to be running before a multi-replica start mutation completes', function (): void {
+    $fixture = exactBlueGreenReplicaBindingFixture();
+    $fixture['application']->update(['build_pack' => 'nixpacks']);
+    $lifecycle = new BlueGreenDeploymentLifecycle(
+        application: $fixture['application']->fresh(),
+        deployment: ApplicationDeploymentQueue::query()
+            ->where('deployment_uuid', $fixture['claim']->deploymentUuid)
+            ->sole(),
+        destination: $fixture['application']->destination,
+        server: $fixture['application']->destination->server,
+        timeout: 30,
+        checkForCancellation: static function (): void {},
+    );
+    $expectation = new BlueGreenContainerExpectation(
+        name: $fixture['claim']->candidateContainerName ?? throw new RuntimeException('The test claim has no candidate name.'),
+        dockerId: null,
+        applicationId: $fixture['application']->id,
+        pullRequestId: 0,
+        blueGreenManaged: true,
+        deploymentUuid: $fixture['claim']->deploymentUuid,
+        color: $fixture['claim']->pendingColor,
+        routingRevision: $fixture['claim']->expectedRoutingRevision,
+    );
+
+    $assertions = (new ReflectionMethod(
+        BlueGreenDeploymentLifecycle::class,
+        'candidateStartCompletionAssertionsFor',
+    ))->invoke($lifecycle, $fixture['claim'], $expectation);
+
+    expect($assertions)->not->toBeEmpty()
+        ->and(implode("\n", $assertions))->toContain(
+            'docker ps -aq --no-trunc',
+            'coolify.blueGreen.replicaIndex=1',
+            'coolify.blueGreen.replicaIndex=2',
+            'coolify.blueGreen.replicaIndex=3',
+        );
+});
+
+it('freezes the configured replica count into durable claim provenance before settings change', function (): void {
+    ['application' => $application, 'destination' => $destination, 'server' => $server] = BlueGreenDeactivationScenario::context();
+    $application->update([
+        'health_check_enabled' => true,
+        'ports_mappings' => null,
+    ]);
+    $application->settings()->update([
+        'is_blue_green_deployment_enabled' => true,
+        'is_container_label_readonly_enabled' => true,
+        'blue_green_replica_count' => 3,
+    ]);
+    $deployment = ApplicationDeploymentQueue::query()->create([
+        'application_id' => $application->id,
+        'application_name' => $application->name,
+        'server_id' => $server->id,
+        'server_name' => $server->name,
+        'destination_id' => $destination->id,
+        'deployment_uuid' => 'claim-replica-count-provenance',
+        'pull_request_id' => 0,
+        'commit' => 'claim-replica-count-provenance',
+        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+        'only_this_server' => true,
+    ]);
+    Process::fake(['*' => Process::sequence([
+        BlueGreenDeactivationScenario::BOOT_ID,
+        'coolify-blue-green-destination-state-attested',
+        '',
+        BlueGreenDeactivationScenario::BOOT_ID,
+    ])]);
+    $lifecycle = new BlueGreenDeploymentLifecycle(
+        application: $application,
+        deployment: $deployment,
+        destination: $destination,
+        server: $server,
+        timeout: 30,
+        checkForCancellation: static function (): void {},
+    );
+
+    try {
+        $lifecycle->initialize();
+        $claim = $lifecycle->claim();
+        DB::table('application_settings')
+            ->where('application_id', $application->id)
+            ->update(['blue_green_replica_count' => 1]);
+        $replicas = ApplicationBlueGreenReplica::query()
+            ->where('application_blue_green_deployment_id', $claim->stateId)
+            ->orderBy('replica_index')
+            ->get();
+
+        expect($claim->replicaCount)->toBe(3)
+            ->and(BlueGreenReplicaSet::fromReplicas($replicas)->count)->toBe(3)
+            ->and($replicas->pluck('replica_index')->all())->toBe([1, 2, 3]);
+    } finally {
+        $lifecycle->release();
+    }
+});
+
+it('reconstructs the reserved replica quorum after the setting changes', function (
+    int $reservedReplicaCount,
+    int $changedReplicaCount,
+): void {
+    $fixture = exactBlueGreenReplicaBindingFixture($reservedReplicaCount);
+    $fixture['application']->settings->update(['blue_green_replica_count' => $changedReplicaCount]);
+
+    $replicaCount = (new ReflectionMethod(
+        ReconstructBlueGreenDeploymentRecovery::class,
+        'replicaCount',
+    ))->invoke(
+        new ReconstructBlueGreenDeploymentRecovery,
+        $fixture['state'],
+        $fixture['claim']->deploymentUuid,
+        $fixture['claim']->pendingColor,
+        $fixture['claim']->expectedRoutingRevision,
+    );
+
+    expect($replicaCount)->toBe($reservedReplicaCount)
+        ->and(ApplicationBlueGreenReplica::query()
+            ->where('deployment_uuid', $fixture['claim']->deploymentUuid)
+            ->count())->toBe($reservedReplicaCount);
+})->with([
+    'three to one' => [3, 1],
+    'one to three' => [1, 3],
+]);

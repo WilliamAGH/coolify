@@ -256,8 +256,13 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
 
     private ?BlueGreenDeploymentLifecycle $blueGreenLifecycle = null;
 
+    private ?string $blueGreenComposeCandidateService = null;
+
     /** @var list<string> */
     private array $blueGreenComposeCandidateServices = [];
+
+    /** @var list<array{service: string, image: string, image_id: string, delivery_image?: string, source_image?: string}> */
+    private array $preparedBlueGreenComposeImages = [];
 
     private int $pausedBlueGreenFleetDeployments = 0;
 
@@ -410,8 +415,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         try {
             // Make sure the private key is stored in the filesystem
             $this->server->privateKey->storeInFileSystem();
-            if (! $this->preparationOnly
-                && $this->pull_request_id === 0
+            if ($this->pull_request_id === 0
                 && $this->destination instanceof StandaloneDocker) {
                 $this->blueGreenLifecycle = new BlueGreenDeploymentLifecycle(
                     application: $this->application,
@@ -432,6 +436,9 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
                     $this->transitionToStatus(ApplicationDeploymentStatus::FINISHED);
 
                     return;
+                }
+                if ($this->preparationOnly && $this->blueGreenLifecycle->isEnabled()) {
+                    $this->blueGreenLifecycle->claim();
                 }
             }
             // Generate custom host<->ip mapping
@@ -970,6 +977,8 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         // Save build-time .env file BEFORE the build
         $this->save_buildtime_environment_variables();
 
+        $this->pullBlueGreenComposeImagesForPreparation();
+
         if ($this->docker_compose_custom_build_command) {
             // Auto-inject -f (compose file) and --env-file flags using helper function
             $build_command = injectDockerComposeFlags(
@@ -1009,8 +1018,15 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
                 throw $e;
             }
         } else {
+            $buildArguments = '';
+            if (! $this->application->settings->use_build_secrets && $this->build_args instanceof Collection && $this->build_args->isNotEmpty()) {
+                $buildArguments = $this->build_args->implode(' ');
+                $this->application_deployment_queue->addLogEntry('Adding build arguments to Docker Compose build command.');
+            }
+            $command = $this->blueGreenComposeDefaultBuildCommand($buildArguments);
+
             $this->execute_remote_command(
-                [executeInDocker($this->deployment_uuid, $this->defaultDockerComposeBuildCommand()), 'hidden' => true],
+                [executeInDocker($this->deployment_uuid, $command), 'hidden' => true],
             );
         }
 
@@ -1025,6 +1041,28 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         $this->activate_docker_compose_runtime();
     }
 
+    private function blueGreenComposeDefaultBuildCommand(string $buildArguments = ''): string
+    {
+        $command = "{$this->coolify_variables} docker compose";
+        if ($this->dockerBuildkitSupported) {
+            $command = "DOCKER_BUILDKIT=1 {$command}";
+        }
+        $command .= ' --env-file '.self::BUILD_TIME_ENV_PATH;
+        if ($this->force_rebuild) {
+            $command .= " --project-name {$this->application->uuid} --project-directory {$this->workdir} -f {$this->workdir}{$this->docker_compose_location} build --pull --no-cache";
+        } else {
+            $command .= " --project-name {$this->application->uuid} --project-directory {$this->workdir} -f {$this->workdir}{$this->docker_compose_location} build --pull";
+        }
+        if ($buildArguments !== '') {
+            $command .= " {$buildArguments}";
+        }
+        foreach ($this->blueGreenComposeBuildServices() as $buildService) {
+            $command .= ' '.escapeshellarg($buildService);
+        }
+
+        return $command;
+    }
+
     /** @param array<array-key, mixed>|Collection<int, mixed> $composeFile */
     private function renderBlueGreenComposeCandidate(array|Collection $composeFile): array|Collection
     {
@@ -1037,6 +1075,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         $this->container_name = $topology->candidateContainerName($this->application, $claim->pendingColor);
         $replicaRows = $this->blueGreenLifecycle->candidateReplicaRows($claim);
         $replicaSet = BlueGreenReplicaSet::fromReplicas($replicaRows);
+        $this->blueGreenComposeCandidateService = $topology->candidateServiceName($claim->pendingColor);
         $this->blueGreenComposeCandidateServices = $replicaRows
             ->pluck('compose_service')
             ->values()
@@ -1049,6 +1088,21 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             blueGreenLabels: $this->blueGreenComposeCandidateLabels($claim),
             replicaCount: $replicaSet->count,
         );
+    }
+
+    private function hydrateBlueGreenComposeCandidateServices(?BlueGreenDeploymentClaim $claim = null): void
+    {
+        $claim ??= $this->blueGreenLifecycle?->claim()
+            ?? throw new DeploymentException('Blue-green Compose service resolution has no durable claim.');
+        $replicaRows = $this->blueGreenLifecycle?->candidateReplicaRows($claim)
+            ?? throw new DeploymentException('Blue-green Compose service resolution has no durable lifecycle owner.');
+        BlueGreenReplicaSet::fromReplicas($replicaRows);
+        $this->blueGreenComposeCandidateService = BlueGreenComposeTopology::fromApplication($this->application)
+            ->candidateServiceName($claim->pendingColor);
+        $this->blueGreenComposeCandidateServices = $replicaRows
+            ->pluck('compose_service')
+            ->values()
+            ->all();
     }
 
     /** @return list<string> */
@@ -1070,48 +1124,62 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         return $labels;
     }
 
-    private function blueGreenComposeBuildServiceArguments(): string
+    /** @return list<string> */
+    private function blueGreenComposeBuildServices(): array
+    {
+        return $this->blueGreenComposePreparedServiceNames();
+    }
+
+    /** @return list<string> */
+    private function blueGreenComposeCandidateServices(): array
     {
         if ($this->application->build_pack !== 'dockercompose') {
-            return '';
+            return [];
         }
         if ($this->blueGreenComposeCandidateServices !== []) {
-            return $this->blueGreenComposeCandidateServiceArguments();
+            return $this->blueGreenComposeCandidateServices;
+        }
+        if ($this->blueGreenComposeCandidateService !== null) {
+            return [$this->blueGreenComposeCandidateService];
         }
         if (! ($this->blueGreenLifecycle?->isEnabled() ?? false)
             && (! $this->preparationOnly || ! $this->application->isBlueGreenDeploymentOptedIn())) {
-            return '';
+            return [];
         }
 
-        return ' '.escapeshellarg(BlueGreenComposeTopology::fromApplication($this->application)->routedService);
+        return [BlueGreenComposeTopology::fromApplication($this->application)->routedService];
     }
 
-    private function defaultDockerComposeBuildCommand(): string
+    /** @return list<string> */
+    private function blueGreenComposePreparedServiceNames(): array
     {
-        $command = "{$this->coolify_variables} docker compose";
-        if ($this->dockerBuildkitSupported) {
-            $command = "DOCKER_BUILDKIT=1 {$command}";
-        }
-        $command .= ' --env-file '.self::BUILD_TIME_ENV_PATH;
-        if ($this->force_rebuild) {
-            $command .= " --project-name {$this->application->uuid} --project-directory {$this->workdir} -f {$this->workdir}{$this->docker_compose_location} build --pull --no-cache";
-        } else {
-            $command .= " --project-name {$this->application->uuid} --project-directory {$this->workdir} -f {$this->workdir}{$this->docker_compose_location} build --pull";
-        }
-        if (! $this->application->settings->use_build_secrets && $this->build_args instanceof Collection && $this->build_args->isNotEmpty()) {
-            $command .= ' '.$this->build_args->implode(' ');
-            $this->application_deployment_queue->addLogEntry('Adding build arguments to Docker Compose build command.');
+        $services = $this->blueGreenComposeCandidateServices();
+        $sidecarPlan = $this->firstAdoptionComposeSidecarPlan();
+        if ($sidecarPlan !== null) {
+            foreach ($sidecarPlan->sidecars as $sidecar) {
+                $services[] = $sidecar->serviceName;
+            }
         }
 
-        return $command.$this->blueGreenComposeBuildServiceArguments();
+        return array_values(array_unique($services));
     }
 
-    private function blueGreenComposeCandidateServiceArguments(): string
+    private function pullBlueGreenComposeImagesForPreparation(): void
     {
-        return implode('', array_map(
-            static fn (string $service): string => ' '.escapeshellarg($service),
-            $this->blueGreenComposeCandidateServices,
-        ));
+        if (! ($this->blueGreenLifecycle?->isEnabled() ?? false)) {
+            return;
+        }
+        $services = $this->blueGreenComposePreparedServiceNames();
+        if ($services === []) {
+            return;
+        }
+        $serviceArguments = implode(' ', array_map(escapeshellarg(...), $services));
+        $command = "{$this->coolify_variables} docker compose --env-file ".self::BUILD_TIME_ENV_PATH
+            ." --project-name {$this->application->uuid} --project-directory {$this->workdir} -f {$this->workdir}{$this->docker_compose_location} pull --ignore-buildable {$serviceArguments}";
+        $this->execute_remote_command([
+            executeInDocker($this->deployment_uuid, $command),
+            'hidden' => true,
+        ]);
     }
 
     private function renderDeferredBlueGreenComposeCandidate(): void
@@ -1134,7 +1202,21 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         if (! is_array($compose)) {
             throw new DeploymentException('Prepared blue-green Compose activation has a non-object Compose artifact.');
         }
-        $rendered = $this->renderBlueGreenComposeCandidate($compose);
+        $topology = BlueGreenComposeTopology::fromApplication($this->application);
+        $services = $compose['services'] ?? null;
+        if (! is_array($services)) {
+            throw new DeploymentException('Prepared blue-green Compose activation has no service map.');
+        }
+        if (isset($services[$topology->routedService])) {
+            $rendered = $this->renderBlueGreenComposeCandidate($compose);
+        } else {
+            foreach ($this->blueGreenComposeCandidateServices() as $candidateService) {
+                if (! is_array($services[$candidateService] ?? null)) {
+                    throw new DeploymentException("Prepared blue-green Compose activation lost candidate service {$candidateService}.");
+                }
+            }
+            $rendered = $compose;
+        }
         $this->docker_compose_base64 = base64_encode(Yaml::dump(convertToArray($rendered), 10));
         $this->execute_remote_command([
             executeInDocker(
@@ -2433,6 +2515,13 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
     /** @return array<string, mixed> */
     private function capturePreparedArtifact(): array
     {
+        $blueGreenClaim = $this->blueGreenLifecycle?->claim();
+        if (($this->blueGreenLifecycle?->isEnabled() ?? false) && $blueGreenClaim === null) {
+            throw new DeploymentException('Blue-green preparation reached artifact attestation without an exact durable claim.');
+        }
+        if ($blueGreenClaim !== null && $this->application->build_pack === 'dockercompose') {
+            $this->preparedBlueGreenComposeImages = $this->prepareBlueGreenComposeImagesForActivation($blueGreenClaim);
+        }
         $runtimeEnvironmentPath = escapeshellarg("{$this->workdir}/.env");
         $composePath = escapeshellarg("{$this->workdir}{$this->docker_compose_location}");
         $this->execute_remote_command([
@@ -2457,6 +2546,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         return [
             'application_configuration_hash' => $this->application->deploymentConfigurationHash(),
             'artifact_digest' => $artifactDigest,
+            'blue_green_claim' => $this->preparedBlueGreenClaimArtifact($blueGreenClaim),
             'build_image_name' => $this->build_image_name ?? null,
             'build_pack' => $this->application->build_pack,
             'build_server_id' => $this->use_build_server ? $this->build_server->id : null,
@@ -2469,19 +2559,226 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             'docker_image' => $this->dockerImage,
             'docker_image_tag' => $this->dockerImageTag,
             'production_image_name' => $this->production_image_name ?? null,
+            'prepared_compose_images' => $this->preparedBlueGreenComposeImages,
             'runtime_environment_sha256' => $runtimeEnvironmentSha256,
-            'runtime_render_deferred' => $this->application->isBlueGreenDeploymentOptedIn()
-                || $this->application->blueGreenDeployments()
-                    ->where('standalone_docker_id', $this->destination->id)
-                    ->exists(),
+            'runtime_render_deferred' => $blueGreenClaim !== null,
             'use_build_server' => $this->use_build_server,
         ];
     }
 
+    /**
+     * @return array<string, int|string>|null
+     */
+    private function preparedBlueGreenClaimArtifact(?BlueGreenDeploymentClaim $claim): ?array
+    {
+        if ($claim === null) {
+            return null;
+        }
+
+        return [
+            'application_id' => $claim->applicationId,
+            'candidate_container_name' => $claim->candidateContainerName
+                ?? throw new DeploymentException('Blue-green preparation has no candidate container identity.'),
+            'destination_fence_epoch' => $claim->destinationFenceEpoch,
+            'deployment_uuid' => $claim->deploymentUuid,
+            'pending_color' => $claim->pendingColor->value,
+            'replica_count' => $claim->replicaCount,
+            'routing_config_digest' => $claim->routingConfigDigest,
+            'routing_revision' => $claim->expectedRoutingRevision,
+            'state_id' => $claim->stateId,
+            'standalone_docker_id' => $claim->standaloneDockerId,
+            'supersession_generation' => $claim->supersessionGeneration,
+            'topology_digest' => $claim->topologyDigest,
+        ];
+    }
+
+    /** @param array<string, mixed> $preparedClaim */
+    private function assertPreparedBlueGreenClaimArtifact(
+        array $preparedClaim,
+        BlueGreenDeploymentClaim $claim,
+    ): void {
+        if ($preparedClaim !== $this->preparedBlueGreenClaimArtifact($claim)) {
+            throw new DeploymentException('Prepared deployment blue-green ownership does not match the durable activation claim.');
+        }
+    }
+
+    /**
+     * @return list<array{service: string, image: string, image_id: string, delivery_image?: string, source_image?: string}>
+     */
+    private function prepareBlueGreenComposeImagesForActivation(BlueGreenDeploymentClaim $claim): array
+    {
+        if ($claim->deploymentUuid !== $this->deployment_uuid) {
+            throw new DeploymentException('Blue-green Compose image preparation lost its exact deployment ownership.');
+        }
+        $services = $this->blueGreenComposePreparedServiceNames();
+        if ($services === []) {
+            throw new DeploymentException('Blue-green Compose preparation has no candidate or first-adoption sidecar images to attest.');
+        }
+
+        $images = [];
+        foreach ($services as $service) {
+            $image = $this->resolveBlueGreenComposeImageReference($service);
+            $images[] = [
+                'service' => $service,
+                'image' => $image,
+                'image_id' => $this->inspectBlueGreenComposeImageId($image, $service),
+            ];
+        }
+        if ($this->use_build_server) {
+            $images = $this->transferPreparedBlueGreenComposeImagesToMainServer($images);
+            $this->renderBlueGreenComposeDeliveryImages($images);
+        }
+
+        return $images;
+    }
+
+    private function resolveBlueGreenComposeImageReference(string $service): string
+    {
+        $saveName = 'prepared_compose_image_reference_'.substr(hash('sha256', $service), 0, 16);
+        $this->execute_remote_command([
+            executeInDocker($this->deployment_uuid, $this->blueGreenComposePreparedImageReferenceCommand($service)),
+            'hidden' => true,
+            'save' => $saveName,
+            'append' => false,
+        ]);
+        $references = array_values(array_filter(
+            preg_split('/\R/', trim((string) $this->saved_outputs->get($saveName))) ?: [],
+            static fn (string $reference): bool => $reference !== '',
+        ));
+        if (count($references) !== 1
+            || preg_match('/[\x00-\x1f\x7f]/', $references[0]) === 1) {
+            throw new DeploymentException("Blue-green Compose service {$service} did not resolve to exactly one immutable image reference.");
+        }
+
+        return $references[0];
+    }
+
+    private function blueGreenComposePreparedImageReferenceCommand(string $service): string
+    {
+        $safeComposePath = escapeshellarg("{$this->workdir}{$this->docker_compose_location}");
+
+        return "{$this->coolify_variables} docker compose --env-file ".self::BUILD_TIME_ENV_PATH
+            ." --project-name {$this->application->uuid} --project-directory {$this->workdir} -f {$safeComposePath} config --images ".escapeshellarg($service);
+    }
+
+    private function inspectBlueGreenComposeImageId(string $image, string $service): string
+    {
+        $saveName = 'prepared_compose_image_id_'.substr(hash('sha256', $service."\0".$image), 0, 16);
+        $this->execute_remote_command([
+            executeInDocker(
+                $this->deployment_uuid,
+                'docker image inspect --format='.escapeshellarg('{{.Id}}').' '.escapeshellarg($image),
+            ),
+            'hidden' => true,
+            'save' => $saveName,
+            'append' => false,
+        ]);
+        $imageId = trim((string) $this->saved_outputs->get($saveName));
+        if (preg_match('/\Asha256:[a-f0-9]{64}\z/D', $imageId) !== 1) {
+            throw new DeploymentException("Blue-green Compose service {$service} has no immutable local image identity after preparation.");
+        }
+
+        return $imageId;
+    }
+
+    /**
+     * @param  list<array{service: string, image: string, image_id: string}>  $images
+     * @return list<array{service: string, image: string, image_id: string, delivery_image: string, source_image: string}>
+     */
+    private function transferPreparedBlueGreenComposeImagesToMainServer(array $images): array
+    {
+        $registryImage = trim((string) $this->application->docker_registry_image_name);
+        if (! ValidationPatterns::isValidDockerImageName($registryImage)) {
+            throw new DeploymentException('Blue-green Compose build-server preparation requires a valid Docker registry image name for immutable artifact delivery.');
+        }
+
+        $sourceServer = $this->server;
+        try {
+            foreach ($images as $index => $image) {
+                $deliveryImage = $this->preparedBlueGreenComposeDeliveryImage($registryImage, $image['service']);
+                $this->execute_remote_command([
+                    executeInDocker(
+                        $this->deployment_uuid,
+                        'docker tag '.escapeshellarg($image['image']).' '.escapeshellarg($deliveryImage)
+                        .' && docker push '.escapeshellarg($deliveryImage),
+                    ),
+                    'hidden' => true,
+                ]);
+
+                $this->server = $this->mainServer;
+                $targetImage = [
+                    ...$image,
+                    'image' => $deliveryImage,
+                ];
+                $this->execute_remote_command([
+                    'docker pull '.escapeshellarg($deliveryImage)
+                    .' && '.$this->blueGreenComposeImageDigestForManifest([$targetImage]),
+                    'hidden' => true,
+                ]);
+                $images[$index]['delivery_image'] = $deliveryImage;
+                $images[$index]['source_image'] = $image['image'];
+                $images[$index]['image'] = $deliveryImage;
+                $this->server = $sourceServer;
+            }
+        } finally {
+            $this->server = $sourceServer;
+        }
+
+        return $images;
+    }
+
+    private function preparedBlueGreenComposeDeliveryImage(string $registryImage, string $service): string
+    {
+        $suffix = substr(hash('sha256', $this->deployment_uuid."\0".$service), 0, 32);
+
+        return "{$registryImage}:coolify-prepared-{$suffix}";
+    }
+
+    /**
+     * @param  list<array{service: string, image: string, image_id: string, delivery_image: string, source_image: string}>  $images
+     */
+    private function renderBlueGreenComposeDeliveryImages(array $images): void
+    {
+        if (! is_string($this->docker_compose_base64)) {
+            throw new DeploymentException('Prepared build-server Compose delivery has no rendered Compose artifact to freeze.');
+        }
+        $yaml = base64_decode($this->docker_compose_base64, true);
+        if (! is_string($yaml)) {
+            throw new DeploymentException('Prepared build-server Compose delivery has malformed Compose data.');
+        }
+        try {
+            $compose = Yaml::parse(
+                $yaml,
+                Yaml::PARSE_EXCEPTION_ON_ALIAS | Yaml::PARSE_EXCEPTION_ON_INVALID_TYPE,
+            );
+        } catch (Throwable $exception) {
+            throw new DeploymentException('Prepared build-server Compose delivery could not parse its rendered Compose artifact.', previous: $exception);
+        }
+        if (! is_array($compose) || ! is_array($compose['services'] ?? null)) {
+            throw new DeploymentException('Prepared build-server Compose delivery has no service map to freeze.');
+        }
+        foreach ($images as $image) {
+            $service = $compose['services'][$image['service']] ?? null;
+            if (! is_array($service)) {
+                throw new DeploymentException("Prepared build-server Compose delivery has no exact service {$image['service']} to freeze.");
+            }
+            $service['image'] = $image['image'];
+            unset($service['build']);
+            $compose['services'][$image['service']] = $service;
+        }
+        $this->docker_compose_base64 = base64_encode(Yaml::dump(convertToArray($compose), 10));
+    }
+
     private function capturePreparedImageDigest(): string
     {
+        $attestOnActivationTarget = $this->activationOnly
+            && $this->use_build_server
+            && $this->application->build_pack === 'dockercompose';
         if ($this->application->build_pack === 'dockercompose') {
-            $command = $this->preparedComposeImageDigestCommand();
+            if ($attestOnActivationTarget && $this->preparedBlueGreenComposeImages === []) {
+                throw new DeploymentException('Prepared build-server Compose activation has no immutable image manifest for target-side attestation.');
+            }
+            $command = $this->blueGreenComposeImageDigestCommand();
         } else {
             if (! isset($this->production_image_name) || $this->production_image_name === '') {
                 throw new DeploymentException('Prepared deployment has no production image identity.');
@@ -2495,12 +2792,17 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             }
             $command = "docker image inspect --format='{{.Id}}' {$safeImage}";
         }
-        $this->execute_remote_command([
-            executeInDocker($this->deployment_uuid, $command),
+        $commandDefinition = [
             'hidden' => true,
             'save' => 'prepared_artifact_digest',
             'append' => false,
-        ]);
+        ];
+        if ($attestOnActivationTarget) {
+            $commandDefinition['command'] = $command;
+        } else {
+            $commandDefinition[] = executeInDocker($this->deployment_uuid, $command);
+        }
+        $this->execute_remote_command($commandDefinition);
         $artifactDigest = trim((string) $this->saved_outputs->get('prepared_artifact_digest'));
         if (preg_match('/\A(?:sha256:)?[a-f0-9]{64}\z/D', $artifactDigest) !== 1) {
             throw new DeploymentException('Prepared deployment artifact digest is invalid.');
@@ -2509,12 +2811,93 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         return $artifactDigest;
     }
 
-    private function preparedComposeImageDigestCommand(): string
+    private function blueGreenComposeImageDigestCommand(): string
     {
-        $safeComposePath = escapeshellarg("{$this->workdir}{$this->docker_compose_location}");
-        $serviceArguments = $this->blueGreenComposeBuildServiceArguments();
+        if ($this->preparedBlueGreenComposeImages !== []) {
+            return $this->blueGreenComposeImageDigestForManifest($this->preparedBlueGreenComposeImages);
+        }
 
-        return "image_ids=\"$(docker compose -f {$safeComposePath} images -q{$serviceArguments} | sort -u)\"; test -n \"\$image_ids\"; printf '%s\\n' \"\$image_ids\" | sha256sum | cut -d ' ' -f1";
+        $safeComposePath = escapeshellarg("{$this->workdir}{$this->docker_compose_location}");
+        $services = $this->blueGreenComposePreparedServiceNames();
+        if ($services === []) {
+            throw new DeploymentException('Blue-green Compose image attestation has no prepared services.');
+        }
+        $serviceArgument = ' '.implode(' ', array_map(escapeshellarg(...), $services));
+
+        return "image_ids=\"$(docker compose -f {$safeComposePath} config --images{$serviceArgument} | while IFS= read -r image; do test -n \"\$image\"; docker image inspect --format='{{.Id}}' \"\$image\"; done | sort -u)\"; test -n \"\$image_ids\"; printf '%s\\n' \"\$image_ids\" | sha256sum | cut -d ' ' -f1";
+    }
+
+    /**
+     * @param  list<array{service: string, image: string, image_id: string, delivery_image?: string, source_image?: string}>  $images
+     */
+    private function blueGreenComposeImageDigestForManifest(array $images): string
+    {
+        if ($images === []) {
+            throw new DeploymentException('Blue-green Compose image attestation has an empty immutable image manifest.');
+        }
+        $inspectionCommands = [];
+        foreach ($images as $image) {
+            $inspectionCommands[] = 'image_id=$(docker image inspect --format='
+                .escapeshellarg('{{.Id}}').' '.escapeshellarg($image['image']).')';
+            $inspectionCommands[] = 'test "$image_id" = '.escapeshellarg($image['image_id']);
+            $inspectionCommands[] = 'printf '.escapeshellarg('%s\\n').' "$image_id"';
+        }
+
+        return 'image_ids="$( { '.implode('; ', $inspectionCommands).'; } | sort -u)"; test -n "$image_ids"; printf '.escapeshellarg('%s\\n').' "$image_ids" | sha256sum | cut -d '.escapeshellarg(' ').' -f1';
+    }
+
+    /**
+     * @return list<array{service: string, image: string, image_id: string, delivery_image?: string, source_image?: string}>
+     */
+    private function hydratePreparedBlueGreenComposeImageManifest(mixed $manifest): array
+    {
+        if (! is_array($manifest) || $manifest === []) {
+            throw new DeploymentException('Prepared blue-green Compose activation has no immutable image manifest.');
+        }
+
+        $images = [];
+        foreach ($manifest as $entry) {
+            if (! is_array($entry)
+                || ! is_string($entry['service'] ?? null)
+                || ! is_string($entry['image'] ?? null)
+                || ! is_string($entry['image_id'] ?? null)
+                || $entry['service'] === ''
+                || $entry['image'] === ''
+                || preg_match('/[\x00-\x1f\x7f]/', $entry['service']) === 1
+                || preg_match('/[\x00-\x1f\x7f]/', $entry['image']) === 1
+                || preg_match('/\Asha256:[a-f0-9]{64}\z/D', $entry['image_id']) !== 1
+                || isset($images[$entry['service']])) {
+                throw new DeploymentException('Prepared blue-green Compose image manifest is malformed.');
+            }
+            $image = [
+                'service' => $entry['service'],
+                'image' => $entry['image'],
+                'image_id' => $entry['image_id'],
+            ];
+            if (array_key_exists('delivery_image', $entry)) {
+                if (! is_string($entry['delivery_image'])
+                    || $entry['delivery_image'] === ''
+                    || preg_match('/[\x00-\x1f\x7f]/', $entry['delivery_image']) === 1) {
+                    throw new DeploymentException('Prepared blue-green Compose image delivery provenance is malformed.');
+                }
+                $image['delivery_image'] = $entry['delivery_image'];
+            }
+            $images[$entry['service']] = $image;
+        }
+
+        $expectedServices = $this->blueGreenComposePreparedServiceNames();
+        sort($expectedServices);
+        ksort($images);
+        if (array_keys($images) !== $expectedServices) {
+            throw new DeploymentException('Prepared blue-green Compose image manifest no longer matches the durable candidate and first-adoption sidecar set.');
+        }
+        if ($this->use_build_server && collect($images)->contains(
+            static fn (array $image): bool => ! isset($image['delivery_image']),
+        )) {
+            throw new DeploymentException('Prepared build-server Compose activation lacks immutable delivery provenance.');
+        }
+
+        return array_values($images);
     }
 
     private function restorePreparedBuildServer(): void
@@ -2564,17 +2947,46 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         )) {
             throw new DeploymentException('Application configuration changed after deployment preparation.');
         }
+        $runtimeRenderDeferred = (bool) ($artifact['runtime_render_deferred'] ?? false);
+        $preparedBlueGreenClaim = $artifact['blue_green_claim'] ?? null;
+        if ($preparedBlueGreenClaim !== null && ! is_array($preparedBlueGreenClaim)) {
+            throw new DeploymentException('Prepared deployment blue-green ownership is malformed.');
+        }
+        if ($preparedBlueGreenClaim !== null && ! $runtimeRenderDeferred) {
+            throw new DeploymentException('Prepared deployment blue-green ownership is inconsistent with its runtime artifact.');
+        }
+        if ($preparedBlueGreenClaim !== null) {
+            $claim = $this->blueGreenLifecycle?->claim()
+                ?? throw new DeploymentException('Prepared deployment has no durable blue-green activation claim.');
+            $this->assertPreparedBlueGreenClaimArtifact($preparedBlueGreenClaim, $claim);
+        }
+        if ($runtimeRenderDeferred
+            && $this->application->build_pack === 'dockercompose') {
+            $this->hydrateBlueGreenComposeCandidateServices();
+        }
+        if ($preparedBlueGreenClaim !== null
+            && $runtimeRenderDeferred
+            && $this->application->build_pack === 'dockercompose') {
+            $this->preparedBlueGreenComposeImages = $this->hydratePreparedBlueGreenComposeImageManifest(
+                $artifact['prepared_compose_images'] ?? null,
+            );
+            if ($this->use_build_server) {
+                $this->server = $this->mainServer;
+            }
+        }
         $this->attestPreparedArtifact($artifact);
-        if ((bool) ($artifact['runtime_render_deferred'] ?? false)) {
+        if ($runtimeRenderDeferred) {
             if (! ($this->blueGreenLifecycle?->isEnabled() ?? false)) {
                 throw new DeploymentException('Prepared deployment requires blue-green runtime rendering but activation has no blue-green owner.');
             }
-            if ($this->application->build_pack === 'dockercompose') {
-                $this->renderDeferredBlueGreenComposeCandidate();
-            } else {
-                $this->generate_compose_file();
+            if ($preparedBlueGreenClaim === null) {
+                if ($this->application->build_pack === 'dockercompose') {
+                    $this->renderDeferredBlueGreenComposeCandidate();
+                } else {
+                    $this->generate_compose_file();
+                }
+                $this->save_runtime_environment_variables();
             }
-            $this->save_runtime_environment_variables();
         }
     }
 
@@ -4843,19 +5255,20 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         $commands = ["touch {$this->configuration_dir}/.env"];
         $sidecarPlan = $this->firstAdoptionComposeSidecarPlan();
         $sidecarStarter = new StartBlueGreenComposeSidecars;
-        $blueGreenCandidateServices = $this->blueGreenComposeCandidateServices === []
-            ? ''
-            : ' --no-deps'.$this->blueGreenComposeCandidateServiceArguments();
+        $blueGreenCandidateService = $this->blueGreenComposeCandidateServiceArguments();
 
         if ($this->application->build_pack === 'dockerimage') {
-            $this->application_deployment_queue->addLogEntry('Pulling latest images from the registry.');
+            if (! $this->activationOnly) {
+                $this->application_deployment_queue->addLogEntry('Pulling latest images from the registry.');
+                $commands[] = executeInDocker(
+                    $this->deployment_uuid,
+                    "docker compose --project-name {$this->application->uuid} --project-directory {$this->workdir} pull",
+                );
+            }
             $commands[] = executeInDocker(
                 $this->deployment_uuid,
-                "docker compose --project-name {$this->application->uuid} --project-directory {$this->workdir} pull",
-            );
-            $commands[] = executeInDocker(
-                $this->deployment_uuid,
-                "{$this->coolify_variables} docker compose --project-name {$this->application->uuid} --project-directory {$this->workdir} up --build -d",
+                "{$this->coolify_variables} docker compose --project-name {$this->application->uuid} --project-directory {$this->workdir} up"
+                    .($this->activationOnly ? ' -d --no-build --pull never' : ' --build -d'),
             );
 
             return $commands;
@@ -4863,18 +5276,32 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
 
         if ($this->use_build_server) {
             $composeCommandPrefix = "{$this->coolify_variables} docker compose --project-name {$this->application->uuid} --project-directory {$this->configuration_dir} -f {$this->configuration_dir}{$this->docker_compose_location}";
-            $sidecarCommand = $sidecarStarter->composeUpCommand($composeCommandPrefix, $sidecarPlan, ' --pull always');
+            $sidecarCommand = $sidecarStarter->composeUpCommand(
+                $composeCommandPrefix,
+                $sidecarPlan,
+                $this->activationOnly ? ' --no-build --pull never' : ' --pull always',
+                build: ! $this->activationOnly,
+                detachedBeforeOptions: $this->activationOnly,
+            );
             if ($sidecarCommand !== null) {
                 $commands[] = $sidecarCommand;
                 array_push($commands, ...$sidecarStarter->runningMutationCompletionAssertionsFor($sidecarPlan));
             }
-            $commands[] = "{$composeCommandPrefix} up --pull always --build -d{$blueGreenCandidateServices}";
+            $commands[] = "{$composeCommandPrefix} up"
+                .($this->activationOnly ? ' -d --no-build --pull never' : ' --pull always --build -d')
+                .$blueGreenCandidateService;
 
             return $commands;
         }
 
         $composeCommandPrefix = "{$this->coolify_variables} docker compose --project-name {$this->application->uuid} --project-directory {$this->workdir} -f {$this->workdir}{$this->docker_compose_location}";
-        $sidecarCommand = $sidecarStarter->composeUpCommand($composeCommandPrefix, $sidecarPlan);
+        $sidecarCommand = $sidecarStarter->composeUpCommand(
+            $composeCommandPrefix,
+            $sidecarPlan,
+            $this->activationOnly ? ' --no-build --pull never' : '',
+            build: ! $this->activationOnly,
+            detachedBeforeOptions: $this->activationOnly,
+        );
         if ($sidecarCommand !== null) {
             $commands[] = executeInDocker($this->deployment_uuid, $sidecarCommand);
             array_push($commands, ...$sidecarStarter->runningMutationCompletionAssertionsFor($sidecarPlan));
@@ -4882,17 +5309,38 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
 
         $commands[] = executeInDocker(
             $this->deployment_uuid,
-            "{$composeCommandPrefix} up --build -d{$blueGreenCandidateServices}",
+            "{$composeCommandPrefix} up"
+                .($this->activationOnly ? ' -d --no-build --pull never' : ' --build -d')
+                .$blueGreenCandidateService,
         );
 
         return $commands;
+    }
+
+    private function blueGreenComposeCandidateServiceArguments(): string
+    {
+        if ($this->blueGreenComposeCandidateService === null) {
+            return '';
+        }
+
+        return ' --no-deps '.$this->blueGreenComposeServiceArguments();
+    }
+
+    private function blueGreenComposeServiceArguments(): string
+    {
+        $services = $this->blueGreenComposeCandidateServices();
+        if ($services === []) {
+            return '';
+        }
+
+        return ' '.implode(' ', array_map(escapeshellarg(...), $services));
     }
 
     private function firstAdoptionComposeSidecarPlan(): ?BlueGreenComposeSidecarDeactivationPlan
     {
         $claim = $this->blueGreenLifecycle?->claim();
         if ($this->application->build_pack !== 'dockercompose'
-            || $this->blueGreenComposeCandidateServices === []
+            || $this->blueGreenComposeCandidateService === null
             || $claim === null
             || $claim->previousActiveColor !== null) {
             return null;

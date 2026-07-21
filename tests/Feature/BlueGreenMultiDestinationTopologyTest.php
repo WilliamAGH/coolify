@@ -441,6 +441,7 @@ it('marks only the failed blue-green destination degraded and pauses the remaini
     blueGreenMultiDestinationInvoke($job, 'transitionToStatus', ApplicationDeploymentStatus::FAILED);
 
     expect($fixture['application']->fresh()->realStatus())->toBe($primaryRawStatus)
+        ->and($failedDeployment->fresh()->finished_at)->not->toBeNull()
         ->and($fixture['application']->fresh()->additional_networks()
             ->whereKey($failed['destination']->id)
             ->firstOrFail()->pivot->status)->toBe('degraded:unknown')

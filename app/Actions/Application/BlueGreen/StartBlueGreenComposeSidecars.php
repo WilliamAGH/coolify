@@ -8,6 +8,8 @@ final class StartBlueGreenComposeSidecars
         string $composeCommandPrefix,
         ?BlueGreenComposeSidecarDeactivationPlan $plan,
         string $upOptions = '',
+        bool $build = true,
+        bool $detachedBeforeOptions = false,
     ): ?string {
         if ($plan === null || $plan->isEmpty()) {
             return null;
@@ -18,7 +20,10 @@ final class StartBlueGreenComposeSidecars
             $plan->sidecars,
         ));
 
-        return "{$composeCommandPrefix} up{$upOptions} --build --no-recreate -d {$services}";
+        $detachedPrefix = $detachedBeforeOptions ? ' -d' : '';
+        $detachedSuffix = $detachedBeforeOptions ? '' : ' -d';
+
+        return "{$composeCommandPrefix} up{$detachedPrefix}{$upOptions}".($build ? ' --build' : '')." --no-recreate{$detachedSuffix} {$services}";
     }
 
     /** @return list<string> */

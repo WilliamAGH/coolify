@@ -5,15 +5,14 @@ use App\Actions\Application\BlueGreen\BlueGreenDeactivationException;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteOutcome;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteResult;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
-use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\ComputeBlueGreenDeploymentFingerprint;
 use App\Actions\Application\BlueGreen\DeactivateBlueGreenApplicationDestination;
 use App\Actions\Application\BlueGreen\ExecuteBlueGreenDeactivationRemoteCommand;
 use App\Actions\Application\BlueGreen\PrepareBlueGreenDeactivation;
 use App\Actions\Application\BlueGreen\RemoveBlueGreenComposeSidecars;
+use App\Actions\Application\BlueGreen\ReserveBlueGreenReplicaSet;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
-use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\ProxyTypes;
@@ -30,13 +29,29 @@ use App\Services\BlueGreenDeploymentLifecycle;
 use App\Support\BlueGreenComposeTopology;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Process\PendingProcess;
-use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Process;
-use Symfony\Component\Process\Process as SymfonyProcess;
 use Symfony\Component\Yaml\Yaml;
 use Tests\Support\BlueGreenDeactivationScenario;
 
 uses(RefreshDatabase::class);
+
+final class RecordingBlueGreenComposeDeploymentJob extends ApplicationDeploymentJob
+{
+    /** @var list<array<int|string, mixed>> */
+    public array $recordedRemoteCommands = [];
+
+    /** @var list<int> */
+    public array $recordedRemoteServerIds = [];
+
+    public function __construct() {}
+
+    public function execute_remote_command(...$commands)
+    {
+        $this->recordedRemoteCommands[] = $commands;
+        $server = (new ReflectionProperty(ApplicationDeploymentJob::class, 'server'))->getValue($this);
+        $this->recordedRemoteServerIds[] = $server->id;
+    }
+}
 
 /** @return array<string, mixed> */
 function blueGreenComposeFixtureDocument(array $overrides = []): array
@@ -190,9 +205,9 @@ function blueGreenComposeApplication(array $documentOverrides = []): Application
     return $application->fresh(['settings']);
 }
 
-function invokeBlueGreenComposeJobMethod(object $job, string $method): mixed
+function invokeBlueGreenComposeJobMethod(object $job, string $method, mixed ...$arguments): mixed
 {
-    return (new ReflectionMethod(ApplicationDeploymentJob::class, $method))->invoke($job);
+    return (new ReflectionMethod(ApplicationDeploymentJob::class, $method))->invoke($job, ...$arguments);
 }
 
 function setBlueGreenComposeJobProperty(object $job, string $property, mixed $value): void
@@ -200,36 +215,30 @@ function setBlueGreenComposeJobProperty(object $job, string $property, mixed $va
     (new ReflectionProperty(ApplicationDeploymentJob::class, $property))->setValue($job, $value);
 }
 
-function unwrapBlueGreenComposeDockerExec(string $command): string
-{
-    if (preg_match("/^docker exec [^ ]+ bash -c '(.*)'$/s", $command, $matches) !== 1) {
-        return $command;
-    }
-
-    return str_replace("'\\''", "'", $matches[1]);
-}
-
-/** @param array<string, string> $environment */
-function runBlueGreenComposeCommand(string $command, array $environment): SymfonyProcess
-{
-    $process = SymfonyProcess::fromShellCommandline(
-        unwrapBlueGreenComposeDockerExec($command),
-        null,
-        $environment,
-    );
-    $process->run();
-
-    return $process;
-}
-
 function blueGreenComposeClaim(
     Application $application,
     StandaloneDocker $destination,
     ?BlueGreenDeploymentColor $previousActiveColor,
-    int $stateId = 1,
+    int $replicaCount = 1,
 ): BlueGreenDeploymentClaim {
-    return new BlueGreenDeploymentClaim(
-        stateId: $stateId,
+    $state = ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $application->id,
+        'standalone_docker_id' => $destination->id,
+        'pending_color' => BlueGreenDeploymentColor::GREEN,
+        'pending_deployment_uuid' => 'compose-deployment',
+        'operation_deployment_uuid' => 'compose-deployment',
+        'operation_candidate_container_name' => $application->uuid.'-green',
+        'operation_rollback_managed_filename' => 'compose-rollback.yaml',
+        'operation_destination_fence_epoch' => 1,
+        'operation_server_boot_id' => '11111111-1111-1111-1111-111111111111',
+        'operation_topology_digest' => hash('sha256', 'compose-topology'),
+        'operation_routing_config_digest' => hash('sha256', 'compose-routing'),
+        'supersession_generation' => 1,
+        'phase' => BlueGreenDeploymentPhase::IDLE,
+        'routing_revision' => 1,
+    ]);
+    $claim = new BlueGreenDeploymentClaim(
+        stateId: $state->id,
         applicationId: $application->id,
         standaloneDockerId: $destination->id,
         pendingColor: BlueGreenDeploymentColor::GREEN,
@@ -244,9 +253,56 @@ function blueGreenComposeClaim(
         drainBackendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
         supersessionGeneration: 1,
         legacyContainerName: 'web-compose-application',
+        replicaCount: $replicaCount,
         candidateContainerName: $application->uuid.'-green',
         rollbackManagedFilename: 'compose-rollback.yaml',
     );
+    $candidateService = BlueGreenComposeTopology::fromApplication($application)
+        ->candidateServiceName($claim->pendingColor);
+    (new ReserveBlueGreenReplicaSet)->handle(
+        application: $application,
+        state: $state,
+        color: $claim->pendingColor,
+        deploymentUuid: $claim->deploymentUuid,
+        routingRevision: $claim->expectedRoutingRevision,
+        composeServiceBase: $candidateService,
+        scalarContainerName: $claim->candidateContainerName,
+        replicaCount: $claim->replicaCount,
+    );
+
+    return $claim;
+}
+
+function blueGreenComposeJobForClaim(
+    Application $application,
+    StandaloneDocker $destination,
+    BlueGreenDeploymentClaim $claim,
+): ApplicationDeploymentJob {
+    $lifecycle = new BlueGreenDeploymentLifecycle(
+        application: $application,
+        deployment: new ApplicationDeploymentQueue,
+        destination: $destination,
+        server: $destination->server,
+        timeout: 30,
+        checkForCancellation: static function (): void {},
+    );
+    (new ReflectionProperty(BlueGreenDeploymentLifecycle::class, 'enabled'))->setValue($lifecycle, true);
+    (new ReflectionProperty(BlueGreenDeploymentLifecycle::class, 'claim'))->setValue($lifecycle, $claim);
+
+    $job = (new ReflectionClass(ApplicationDeploymentJob::class))->newInstanceWithoutConstructor();
+    setBlueGreenComposeJobProperty($job, 'application', $application);
+    setBlueGreenComposeJobProperty($job, 'destination', $destination);
+    setBlueGreenComposeJobProperty($job, 'configuration_dir', '/tmp/compose-config');
+    setBlueGreenComposeJobProperty($job, 'workdir', '/tmp/compose-workdir');
+    setBlueGreenComposeJobProperty($job, 'deployment_uuid', 'compose-deployment');
+    setBlueGreenComposeJobProperty($job, 'docker_compose_location', '/docker-compose.yaml');
+    setBlueGreenComposeJobProperty($job, 'coolify_variables', '');
+    setBlueGreenComposeJobProperty($job, 'use_build_server', false);
+    setBlueGreenComposeJobProperty($job, 'force_rebuild', false);
+    setBlueGreenComposeJobProperty($job, 'dockerBuildkitSupported', false);
+    setBlueGreenComposeJobProperty($job, 'blueGreenLifecycle', $lifecycle);
+
+    return $job;
 }
 
 /** @return list<string> */
@@ -363,35 +419,175 @@ it('renders replica services without container name while preserving fixed sidec
 it('renders and targets the durable replica ledger when live settings drift after claim', function (): void {
     $application = blueGreenComposeApplication();
     $destination = StandaloneDocker::query()->with('server')->findOrFail($application->destination_id);
-    $application->settings()->firstOrFail()->update([
-        'is_blue_green_deployment_enabled' => true,
-        'blue_green_replica_count' => 3,
-    ]);
-    $deployment = ApplicationDeploymentQueue::query()->create([
-        'application_id' => $application->id,
-        'application_name' => $application->name,
-        'server_id' => $destination->server->id,
-        'server_name' => $destination->server->name,
-        'destination_id' => $destination->id,
-        'deployment_uuid' => 'compose-replica-drift',
-        'pull_request_id' => 0,
-        'commit' => 'compose-replica-drift',
-        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
-        'only_this_server' => true,
-    ]);
-    $claim = ClaimBlueGreenDeployment::run(
-        $application,
-        $destination,
-        $deployment,
-        '11111111-1111-1111-1111-111111111111',
+    $claim = blueGreenComposeClaim($application, $destination, null, 3);
+    $application->settings->update(['blue_green_replica_count' => 1]);
+    $job = blueGreenComposeJobForClaim($application, $destination, $claim);
+
+    $rendered = invokeBlueGreenComposeJobMethod(
+        $job,
+        'renderBlueGreenComposeCandidate',
+        Yaml::parse($application->docker_compose),
     );
-    DB::table('application_settings')
-        ->where('application_id', $application->id)
-        ->update(['blue_green_replica_count' => 1]);
-    $application->refresh()->load('settings');
+    $buildCommand = invokeBlueGreenComposeJobMethod($job, 'blueGreenComposeDefaultBuildCommand', '');
+    $attestationCommand = invokeBlueGreenComposeJobMethod($job, 'blueGreenComposeImageDigestCommand');
+    $startCommands = invokeBlueGreenComposeJobMethod($job, 'startByComposeFileCommands');
+    setBlueGreenComposeJobProperty($job, 'blueGreenComposeCandidateService', null);
+    setBlueGreenComposeJobProperty($job, 'blueGreenComposeCandidateServices', []);
+    invokeBlueGreenComposeJobMethod($job, 'hydrateBlueGreenComposeCandidateServices');
+    $activationAttestationCommand = invokeBlueGreenComposeJobMethod($job, 'blueGreenComposeImageDigestCommand');
+
+    $expectedTargets = [
+        'web-green-replica-1',
+        'web-green-replica-2',
+        'web-green-replica-3',
+    ];
+    expect($application->settings->blueGreenReplicaCount())->toBe(1)
+        ->and(array_keys($rendered['services']))->toContain(...$expectedTargets)
+        ->not->toContain('web', 'web-green')
+        ->and($buildCommand)->toContain('build --pull')
+        ->and($buildCommand)->not->toContain("'web-green'")
+        ->and($attestationCommand)->toContain('config --images', 'docker image inspect')
+        ->and($attestationCommand)->not->toContain("'web-green'")
+        ->and($activationAttestationCommand)->toContain('config --images', 'docker image inspect')
+        ->and($activationAttestationCommand)->not->toContain("'web-green'")
+        ->and($startCommands[array_key_last($startCommands)])->toContain('up --build -d --no-deps')
+        ->and($startCommands[array_key_last($startCommands)])->not->toContain("'web-green'");
+
+    foreach ($expectedTargets as $service) {
+        expect($buildCommand)->toContain("'{$service}'")
+            ->and($attestationCommand)->toContain("'{$service}'")
+            ->and($activationAttestationCommand)->toContain("'{$service}'")
+            ->and($startCommands[array_key_last($startCommands)])->toContain("'{$service}'");
+    }
+    foreach (['db', 'worker'] as $sidecar) {
+        expect($buildCommand)->toContain("'{$sidecar}'")
+            ->and($attestationCommand)->toContain("'{$sidecar}'")
+            ->and($activationAttestationCommand)->toContain("'{$sidecar}'")
+            ->and($startCommands[array_key_last($startCommands)])->not->toContain("'{$sidecar}'");
+    }
+});
+
+it('activates the prepared replica quorum without rebuilding after the setting changes', function (): void {
+    $application = blueGreenComposeApplication();
+    $destination = StandaloneDocker::query()->with('server')->findOrFail($application->destination_id);
+    $claim = blueGreenComposeClaim($application, $destination, null, 3);
+    $job = blueGreenComposeJobForClaim($application, $destination, $claim);
+    $application->settings->update(['blue_green_replica_count' => 1]);
+    setBlueGreenComposeJobProperty($job, 'activationOnly', true);
+
+    $rendered = invokeBlueGreenComposeJobMethod(
+        $job,
+        'renderBlueGreenComposeCandidate',
+        Yaml::parse($application->docker_compose),
+    );
+    $commands = invokeBlueGreenComposeJobMethod($job, 'startByComposeFileCommands');
+    $allCommands = implode("\n", $commands);
+
+    expect(array_keys($rendered['services']))->toContain(
+        'web-green-replica-1',
+        'web-green-replica-2',
+        'web-green-replica-3',
+    )->not->toContain('web', 'web-green')
+        ->and($allCommands)->toContain(
+            'up -d --no-build --pull never',
+            '--no-deps',
+            'web-green-replica-1',
+            'web-green-replica-2',
+            'web-green-replica-3',
+        )
+        ->not->toContain('--build', '--pull always');
+});
+
+it('delivers and target-attests each prepared Compose image without tagging digest-pinned source references', function (): void {
+    $application = blueGreenComposeApplication();
+    $application->update(['docker_registry_image_name' => 'registry.example.test/coolify/compose']);
+    $destination = StandaloneDocker::query()->with('server')->findOrFail($application->destination_id);
+    $buildServer = Server::factory()->create(['team_id' => $destination->server->team_id]);
+    $job = new RecordingBlueGreenComposeDeploymentJob;
+    setBlueGreenComposeJobProperty($job, 'application', $application);
+    setBlueGreenComposeJobProperty($job, 'deployment_uuid', 'compose-deployment');
+    setBlueGreenComposeJobProperty($job, 'server', $buildServer);
+    setBlueGreenComposeJobProperty($job, 'mainServer', $destination->server);
+    setBlueGreenComposeJobProperty($job, 'use_build_server', true);
+    $sourceImage = 'registry.example.test/coolify/web@sha256:'.str_repeat('c', 64);
+    $imageId = 'sha256:'.str_repeat('a', 64);
+
+    $delivered = invokeBlueGreenComposeJobMethod($job, 'transferPreparedBlueGreenComposeImagesToMainServer', [[
+        'service' => 'web-green',
+        'image' => $sourceImage,
+        'image_id' => $imageId,
+    ], [
+        'service' => 'db',
+        'image' => 'postgres:17',
+        'image_id' => 'sha256:'.str_repeat('b', 64),
+    ]]);
+    $sourceCommands = implode("\n", $job->recordedRemoteCommands[0][0]);
+    $targetCommands = implode("\n", $job->recordedRemoteCommands[1][0]);
+
+    expect($job->recordedRemoteServerIds)->toBe([
+        $buildServer->id,
+        $destination->server->id,
+        $buildServer->id,
+        $destination->server->id,
+    ])->and($delivered)->toHaveCount(2)
+        ->and($delivered[0]['source_image'])->toBe($sourceImage)
+        ->and($delivered[0]['image'])->toStartWith('registry.example.test/coolify/compose:coolify-prepared-')
+        ->and($sourceCommands)->toContain('docker tag', 'docker push', $sourceImage)
+        ->and($targetCommands)->toContain('docker pull', 'docker image inspect', $imageId)
+        ->and($targetCommands)->not->toContain($sourceImage, 'docker tag');
+});
+
+it('freezes build-server delivery image references into the rendered Compose artifact', function (): void {
+    $application = blueGreenComposeApplication([
+        'services' => ['web' => ['build' => './web']],
+    ]);
+    $destination = StandaloneDocker::query()->with('server')->findOrFail($application->destination_id);
+    $claim = blueGreenComposeClaim($application, $destination, null);
+    $job = blueGreenComposeJobForClaim($application, $destination, $claim);
+    $rendered = invokeBlueGreenComposeJobMethod(
+        $job,
+        'renderBlueGreenComposeCandidate',
+        Yaml::parse($application->docker_compose),
+    );
+    setBlueGreenComposeJobProperty($job, 'docker_compose_base64', base64_encode(Yaml::dump($rendered, 10)));
+
+    invokeBlueGreenComposeJobMethod($job, 'renderBlueGreenComposeDeliveryImages', [[
+        'service' => 'web-green',
+        'image' => 'registry.example.test/coolify/compose:coolify-prepared-web',
+        'image_id' => 'sha256:'.str_repeat('a', 64),
+        'delivery_image' => 'registry.example.test/coolify/compose:coolify-prepared-web',
+        'source_image' => 'registry.example.test/coolify/web@sha256:'.str_repeat('c', 64),
+    ], [
+        'service' => 'db',
+        'image' => 'registry.example.test/coolify/compose:coolify-prepared-db',
+        'image_id' => 'sha256:'.str_repeat('b', 64),
+        'delivery_image' => 'registry.example.test/coolify/compose:coolify-prepared-db',
+        'source_image' => 'postgres:17',
+    ], [
+        'service' => 'worker',
+        'image' => 'registry.example.test/coolify/compose:coolify-prepared-worker',
+        'image_id' => 'sha256:'.str_repeat('d', 64),
+        'delivery_image' => 'registry.example.test/coolify/compose:coolify-prepared-worker',
+        'source_image' => 'example/worker:latest',
+    ]]);
+    $frozen = Yaml::parse((string) base64_decode(
+        (new ReflectionProperty(ApplicationDeploymentJob::class, 'docker_compose_base64'))->getValue($job),
+        true,
+    ));
+
+    expect($frozen['services']['web-green']['image'])->toBe('registry.example.test/coolify/compose:coolify-prepared-web')
+        ->and($frozen['services']['web-green'])->not->toHaveKey('build')
+        ->and($frozen['services']['db']['image'])->toBe('registry.example.test/coolify/compose:coolify-prepared-db')
+        ->and($frozen['services']['worker']['image'])->toBe('registry.example.test/coolify/compose:coolify-prepared-worker');
+});
+
+it('preserves the rendered delivery artifact when activation writes the prepared candidate', function (): void {
+    $application = blueGreenComposeApplication();
+    $destination = StandaloneDocker::query()->with('server')->findOrFail($application->destination_id);
+    $claim = blueGreenComposeClaim($application, $destination, null);
     $lifecycle = new BlueGreenDeploymentLifecycle(
         application: $application,
-        deployment: $deployment->fresh(),
+        deployment: new ApplicationDeploymentQueue,
         destination: $destination,
         server: $destination->server,
         timeout: 30,
@@ -399,102 +595,57 @@ it('renders and targets the durable replica ledger when live settings drift afte
     );
     (new ReflectionProperty(BlueGreenDeploymentLifecycle::class, 'enabled'))->setValue($lifecycle, true);
     (new ReflectionProperty(BlueGreenDeploymentLifecycle::class, 'claim'))->setValue($lifecycle, $claim);
-    $job = (new ReflectionClass(ApplicationDeploymentJob::class))->newInstanceWithoutConstructor();
+    $job = new RecordingBlueGreenComposeDeploymentJob;
     setBlueGreenComposeJobProperty($job, 'application', $application);
     setBlueGreenComposeJobProperty($job, 'destination', $destination);
+    setBlueGreenComposeJobProperty($job, 'server', $destination->server);
+    setBlueGreenComposeJobProperty($job, 'workdir', '/tmp/compose-workdir');
+    setBlueGreenComposeJobProperty($job, 'deployment_uuid', $claim->deploymentUuid);
+    setBlueGreenComposeJobProperty($job, 'docker_compose_location', '/docker-compose.yaml');
+    setBlueGreenComposeJobProperty($job, 'coolify_variables', '');
     setBlueGreenComposeJobProperty($job, 'blueGreenLifecycle', $lifecycle);
+    $rendered = invokeBlueGreenComposeJobMethod(
+        $job,
+        'renderBlueGreenComposeCandidate',
+        Yaml::parse($application->docker_compose),
+    );
+    $rendered['services']['web-green']['image'] = 'registry.example.test/coolify/compose:coolify-prepared-web';
+    setBlueGreenComposeJobProperty($job, 'docker_compose_base64', base64_encode(Yaml::dump($rendered, 10)));
 
-    $rendered = (new ReflectionMethod(ApplicationDeploymentJob::class, 'renderBlueGreenComposeCandidate'))
-        ->invoke($job, Yaml::parse($application->docker_compose));
-    $targets = (new ReflectionProperty(ApplicationDeploymentJob::class, 'blueGreenComposeCandidateServices'))
-        ->getValue($job);
+    invokeBlueGreenComposeJobMethod($job, 'renderDeferredBlueGreenComposeCandidate');
+    $written = Yaml::parse((string) base64_decode(
+        (new ReflectionProperty(ApplicationDeploymentJob::class, 'docker_compose_base64'))->getValue($job),
+        true,
+    ));
 
-    $serviceBase = 'web-'.$claim->pendingColor->value;
-    $expectedTargets = [
-        $serviceBase.'-replica-1',
-        $serviceBase.'-replica-2',
-        $serviceBase.'-replica-3',
-    ];
-    expect($application->settings->blueGreenReplicaCount())->toBe(1)
-        ->and($targets)->toBe($expectedTargets)
-        ->and(array_keys($rendered['services']))->toContain(...$targets)
-        ->and($rendered['services'])->not->toHaveKey($serviceBase);
+    expect($written['services'])->toHaveKey('web-green')
+        ->not->toHaveKey('web')
+        ->and($written['services']['web-green']['image'])->toBe('registry.example.test/coolify/compose:coolify-prepared-web')
+        ->and($job->recordedRemoteCommands)->toHaveCount(1);
 });
 
 it('keeps the claimed scalar Compose topology when live settings drift from one replica to three', function (): void {
     $application = blueGreenComposeApplication();
     $destination = StandaloneDocker::query()->with('server')->findOrFail($application->destination_id);
-    $application->settings()->firstOrFail()->update([
-        'is_blue_green_deployment_enabled' => true,
-        'blue_green_replica_count' => 1,
-    ]);
-    $deployment = ApplicationDeploymentQueue::query()->create([
-        'application_id' => $application->id,
-        'application_name' => $application->name,
-        'server_id' => $destination->server->id,
-        'server_name' => $destination->server->name,
-        'destination_id' => $destination->id,
-        'deployment_uuid' => 'compose-scalar-drift',
-        'pull_request_id' => 0,
-        'commit' => 'compose-scalar-drift',
-        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
-        'only_this_server' => true,
-    ]);
-    $claim = ClaimBlueGreenDeployment::run(
-        $application,
-        $destination,
-        $deployment,
-        '11111111-1111-1111-1111-111111111111',
-    );
-    DB::table('application_settings')
-        ->where('application_id', $application->id)
-        ->update(['blue_green_replica_count' => 3]);
-    $application = $application->fresh(['settings']);
-    $lifecycle = new BlueGreenDeploymentLifecycle(
-        application: $application,
-        deployment: $deployment->fresh(),
-        destination: $destination,
-        server: $destination->server,
-        timeout: 30,
-        checkForCancellation: static function (): void {},
-    );
-    (new ReflectionProperty($lifecycle, 'enabled'))->setValue($lifecycle, true);
-    (new ReflectionProperty($lifecycle, 'claim'))->setValue($lifecycle, $claim);
-    $job = (new ReflectionClass(ApplicationDeploymentJob::class))->newInstanceWithoutConstructor();
-    setBlueGreenComposeJobProperty($job, 'application', $application);
-    setBlueGreenComposeJobProperty($job, 'destination', $destination);
-    setBlueGreenComposeJobProperty($job, 'blueGreenLifecycle', $lifecycle);
-    setBlueGreenComposeJobProperty($job, 'configuration_dir', '/tmp/compose-config');
-    setBlueGreenComposeJobProperty($job, 'workdir', '/tmp/compose-workdir');
-    setBlueGreenComposeJobProperty($job, 'deployment_uuid', 'compose-scalar-drift');
-    setBlueGreenComposeJobProperty($job, 'coolify_variables', '');
-    setBlueGreenComposeJobProperty($job, 'docker_compose_location', '/docker-compose.yml');
-    setBlueGreenComposeJobProperty($job, 'dockerBuildkitSupported', false);
-    setBlueGreenComposeJobProperty($job, 'force_rebuild', false);
-    setBlueGreenComposeJobProperty($job, 'build_args', collect());
-    setBlueGreenComposeJobProperty($job, 'use_build_server', false);
+    $claim = blueGreenComposeClaim($application, $destination, null, 1);
+    $application->settings->update(['blue_green_replica_count' => 3]);
+    $job = blueGreenComposeJobForClaim($application, $destination, $claim);
 
-    $rendered = (new ReflectionMethod(ApplicationDeploymentJob::class, 'renderBlueGreenComposeCandidate'))
-        ->invoke($job, Yaml::parse($application->docker_compose));
-    $targets = (new ReflectionProperty(ApplicationDeploymentJob::class, 'blueGreenComposeCandidateServices'))
-        ->getValue($job);
-    $buildCommand = invokeBlueGreenComposeJobMethod($job, 'defaultDockerComposeBuildCommand');
-    $imageCommand = invokeBlueGreenComposeJobMethod($job, 'preparedComposeImageDigestCommand');
+    $rendered = invokeBlueGreenComposeJobMethod(
+        $job,
+        'renderBlueGreenComposeCandidate',
+        Yaml::parse($application->docker_compose),
+    );
+    $buildCommand = invokeBlueGreenComposeJobMethod($job, 'blueGreenComposeDefaultBuildCommand', '');
     $startCommands = invokeBlueGreenComposeJobMethod($job, 'startByComposeFileCommands');
-    $expectedService = 'web-'.$claim->pendingColor->value;
 
     expect($application->settings->blueGreenReplicaCount())->toBe(3)
-        ->and($targets)->toBe([$expectedService])
-        ->and($rendered['services'])->toHaveKey($expectedService)
-        ->and(array_keys($rendered['services']))->not->toContain(
-            $expectedService.'-replica-1',
-            $expectedService.'-replica-2',
-            $expectedService.'-replica-3',
-        )
-        ->and($buildCommand)->toContain("build --pull '{$expectedService}'")
-        ->and($imageCommand)->toContain("images -q '{$expectedService}'")
-        ->and(unwrapBlueGreenComposeDockerExec($startCommands[array_key_last($startCommands)]))
-        ->toContain("--no-deps '{$expectedService}'");
+        ->and($rendered['services'])->toHaveKey('web-green')
+        ->and(array_keys($rendered['services']))->not->toContain('web-green-replica-1')
+        ->and($buildCommand)->toContain("'web-green'")
+        ->and($buildCommand)->not->toContain('replica-')
+        ->and($startCommands[array_key_last($startCommands)])->toContain("'web-green'")
+        ->and($startCommands[array_key_last($startCommands)])->not->toContain('replica-');
 });
 
 it('compiles the managed route from the parsed routed service labels', function (): void {
@@ -570,10 +721,10 @@ it('uses PHP reflection without setAccessible to start only the colored routed s
     setBlueGreenComposeJobProperty($job, 'deployment_uuid', 'compose-deployment');
     setBlueGreenComposeJobProperty($job, 'coolify_variables', '');
     setBlueGreenComposeJobProperty($job, 'use_build_server', false);
-    $candidateProperty = new ReflectionProperty(ApplicationDeploymentJob::class, 'blueGreenComposeCandidateServices');
+    $candidateProperty = new ReflectionProperty(ApplicationDeploymentJob::class, 'blueGreenComposeCandidateService');
     expect($candidateProperty->isPrivate())->toBeTrue();
-    $candidateProperty->setValue($job, ['web-green']);
-    expect($candidateProperty->getValue($job))->toBe(['web-green']);
+    $candidateProperty->setValue($job, 'web-green');
+    expect($candidateProperty->getValue($job))->toBe('web-green');
 
     $method = new ReflectionMethod(ApplicationDeploymentJob::class, 'startByComposeFileCommands');
     expect($method->isPrivate())->toBeTrue();
@@ -611,7 +762,7 @@ it('starts and attests missing fixed sidecars exactly once before the routed can
     setBlueGreenComposeJobProperty($job, 'coolify_variables', '');
     setBlueGreenComposeJobProperty($job, 'use_build_server', false);
     setBlueGreenComposeJobProperty($job, 'blueGreenLifecycle', $lifecycle);
-    setBlueGreenComposeJobProperty($job, 'blueGreenComposeCandidateServices', ['web-green']);
+    setBlueGreenComposeJobProperty($job, 'blueGreenComposeCandidateService', 'web-green');
 
     $commands = invokeBlueGreenComposeJobMethod($job, 'startByComposeFileCommands');
     $sidecarStarts = array_values(array_filter(
@@ -657,7 +808,7 @@ it('does not restart fixed sidecars after first Compose adoption', function (): 
     setBlueGreenComposeJobProperty($job, 'coolify_variables', '');
     setBlueGreenComposeJobProperty($job, 'use_build_server', false);
     setBlueGreenComposeJobProperty($job, 'blueGreenLifecycle', $lifecycle);
-    setBlueGreenComposeJobProperty($job, 'blueGreenComposeCandidateServices', ['web-green']);
+    setBlueGreenComposeJobProperty($job, 'blueGreenComposeCandidateService', 'web-green');
 
     $commands = invokeBlueGreenComposeJobMethod($job, 'startByComposeFileCommands');
 
@@ -666,86 +817,43 @@ it('does not restart fixed sidecars after first Compose adoption', function (): 
         ->and($commands[1])->toContain('up --build -d --no-deps', 'web-green');
 });
 
-it('executes Compose build start and image attestation against every rendered replica service', function (): void {
+it('prefetches every candidate and first-adoption sidecar before Compose image attestation', function (): void {
     $application = blueGreenComposeApplication();
-    $job = (new ReflectionClass(ApplicationDeploymentJob::class))->newInstanceWithoutConstructor();
+    $destination = StandaloneDocker::query()->with('server')->findOrFail($application->destination_id);
+    $claim = blueGreenComposeClaim($application, $destination, null, 3);
+    $job = new RecordingBlueGreenComposeDeploymentJob;
     setBlueGreenComposeJobProperty($job, 'application', $application);
-    $temporaryDirectory = sys_get_temp_dir().'/coolify-compose-replica-'.bin2hex(random_bytes(8));
-    $binaryDirectory = $temporaryDirectory.'/bin';
-    mkdir($binaryDirectory, 0700, true);
-    $composePath = $temporaryDirectory.'/docker-compose.yml';
-    file_put_contents($composePath, "services: {}\n");
-    $dockerPath = $binaryDirectory.'/docker';
-    file_put_contents($dockerPath, <<<'SH'
-#!/bin/sh
-set -eu
-printf '%s\n' "$*" >> "$COOLIFY_COMPOSE_COMMAND_LOG"
-test "$1" = compose
-shift
-case " $* " in
-    *" web-green "*) exit 91 ;;
-esac
-for service in web-green-replica-1 web-green-replica-2 web-green-replica-3; do
-    case " $* " in
-        *" $service "*) ;;
-        *) exit 92 ;;
-    esac
-done
-case " $* " in
-    *" images -q "*)
-        printf '%064d\n' 1
-        printf '%064d\n' 2
-        printf '%064d\n' 3
-        ;;
-esac
-SH);
-    chmod($dockerPath, 0700);
-    $commandLog = $temporaryDirectory.'/compose-commands.log';
-
-    setBlueGreenComposeJobProperty($job, 'configuration_dir', $temporaryDirectory);
-    setBlueGreenComposeJobProperty($job, 'workdir', $temporaryDirectory);
-    setBlueGreenComposeJobProperty($job, 'deployment_uuid', 'compose-deployment');
+    setBlueGreenComposeJobProperty($job, 'destination', $destination);
+    setBlueGreenComposeJobProperty($job, 'server', $destination->server);
+    setBlueGreenComposeJobProperty($job, 'workdir', '/tmp/compose-workdir');
+    setBlueGreenComposeJobProperty($job, 'deployment_uuid', $claim->deploymentUuid);
+    setBlueGreenComposeJobProperty($job, 'docker_compose_location', '/docker-compose.yaml');
     setBlueGreenComposeJobProperty($job, 'coolify_variables', '');
-    setBlueGreenComposeJobProperty($job, 'docker_compose_location', '/docker-compose.yml');
-    setBlueGreenComposeJobProperty($job, 'dockerBuildkitSupported', false);
-    setBlueGreenComposeJobProperty($job, 'force_rebuild', false);
-    setBlueGreenComposeJobProperty($job, 'build_args', collect());
-    setBlueGreenComposeJobProperty($job, 'use_build_server', false);
-    setBlueGreenComposeJobProperty($job, 'blueGreenComposeCandidateServices', [
-        'web-green-replica-1',
-        'web-green-replica-2',
-        'web-green-replica-3',
-    ]);
+    setBlueGreenComposeJobProperty($job, 'blueGreenLifecycle', (function () use ($application, $destination, $claim): BlueGreenDeploymentLifecycle {
+        $lifecycle = new BlueGreenDeploymentLifecycle(
+            application: $application,
+            deployment: new ApplicationDeploymentQueue,
+            destination: $destination,
+            server: $destination->server,
+            timeout: 30,
+            checkForCancellation: static function (): void {},
+        );
+        (new ReflectionProperty(BlueGreenDeploymentLifecycle::class, 'enabled'))->setValue($lifecycle, true);
+        (new ReflectionProperty(BlueGreenDeploymentLifecycle::class, 'claim'))->setValue($lifecycle, $claim);
 
-    $buildCommand = invokeBlueGreenComposeJobMethod($job, 'defaultDockerComposeBuildCommand');
-    $imageCommand = invokeBlueGreenComposeJobMethod($job, 'preparedComposeImageDigestCommand');
-    $localStartCommands = invokeBlueGreenComposeJobMethod($job, 'startByComposeFileCommands');
-    setBlueGreenComposeJobProperty($job, 'use_build_server', true);
-    $buildServerCommands = invokeBlueGreenComposeJobMethod($job, 'startByComposeFileCommands');
-    $environment = [
-        'COOLIFY_COMPOSE_COMMAND_LOG' => $commandLog,
-        'PATH' => $binaryDirectory.':'.getenv('PATH'),
-    ];
-    $executions = [
-        runBlueGreenComposeCommand($buildCommand, $environment),
-        runBlueGreenComposeCommand($imageCommand, $environment),
-        runBlueGreenComposeCommand($localStartCommands[array_key_last($localStartCommands)], $environment),
-        runBlueGreenComposeCommand($buildServerCommands[array_key_last($buildServerCommands)], $environment),
-    ];
-    $recordedCommands = file($commandLog, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        return $lifecycle;
+    })());
+    invokeBlueGreenComposeJobMethod($job, 'hydrateBlueGreenComposeCandidateServices');
+    invokeBlueGreenComposeJobMethod($job, 'pullBlueGreenComposeImagesForPreparation');
+    $prefetch = implode("\n", $job->recordedRemoteCommands[0][0]);
 
-    expect(array_map(static fn (SymfonyProcess $process): bool => $process->isSuccessful(), $executions))
-        ->toBe([true, true, true, true])
-        ->and($recordedCommands)->toHaveCount(4)
-        ->and($recordedCommands[0])->toContain('build --pull')
-        ->and($recordedCommands[1])->toContain('images -q')
-        ->and($recordedCommands[2])->toContain('up --build -d --no-deps')
-        ->and($recordedCommands[3])->toContain('up --pull always --build -d --no-deps')
-        ->and(implode("\n", $recordedCommands))->not->toMatch('/(?:^| )web-green(?: |$)/')
-        ->and(implode("\n", $recordedCommands))->toContain(
-            'web-green-replica-1',
-            'web-green-replica-2',
-            'web-green-replica-3',
+    expect($prefetch)->toContain('pull --ignore-buildable')
+        ->and($prefetch)->toContain(
+            "'web-green-replica-1'",
+            "'web-green-replica-2'",
+            "'web-green-replica-3'",
+            "'db'",
+            "'worker'",
         );
 });
 

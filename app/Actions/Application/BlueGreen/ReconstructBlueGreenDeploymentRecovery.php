@@ -9,6 +9,7 @@ use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
+use App\Models\ApplicationBlueGreenReplica;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\StandaloneDocker;
 use Illuminate\Support\Facades\DB;
@@ -203,6 +204,12 @@ final class ReconstructBlueGreenDeploymentRecovery
             )) {
             throw new BlueGreenDeploymentTransitionException('The interrupted state has incomplete or non-canonical claim provenance.');
         }
+        $replicaCount = $this->replicaCount(
+            $state,
+            $operationUuid,
+            $pendingColor,
+            $routingRevision,
+        );
 
         return new BlueGreenDeploymentClaim(
             stateId: $state->id,
@@ -222,9 +229,42 @@ final class ReconstructBlueGreenDeploymentRecovery
             legacyContainerName: $state->operation_previous_active_color === null
                 ? $state->legacy_container_name
                 : null,
+            replicaCount: $replicaCount,
             candidateContainerName: $candidateContainerName,
             rollbackManagedFilename: $rollbackManagedFilename,
         );
+    }
+
+    private function replicaCount(
+        ApplicationBlueGreenDeployment $state,
+        string $deploymentUuid,
+        BlueGreenDeploymentColor $color,
+        int $routingRevision,
+    ): int {
+        $replicas = ApplicationBlueGreenReplica::query()
+            ->where('application_blue_green_deployment_id', $state->id)
+            ->where('application_id', $state->application_id)
+            ->where('standalone_docker_id', $state->standalone_docker_id)
+            ->where('deployment_uuid', $deploymentUuid)
+            ->where('color', $color->value)
+            ->where('routing_revision', $routingRevision)
+            ->orderBy('replica_index')
+            ->get(['replica_index']);
+        if ($replicas->isEmpty()) {
+            return DEFAULT_BLUE_GREEN_REPLICA_COUNT;
+        }
+
+        try {
+            $replicaSet = BlueGreenReplicaSet::fromReplicas($replicas);
+        } catch (\InvalidArgumentException $exception) {
+            throw new BlueGreenDeploymentTransitionException(
+                'The interrupted operation has an invalid durable replica quorum.',
+                0,
+                $exception,
+            );
+        }
+
+        return $replicaSet->count;
     }
 
     private function assertQueueProvenance(
