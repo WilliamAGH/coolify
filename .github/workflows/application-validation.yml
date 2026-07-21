@@ -392,6 +392,7 @@ jobs:
           tests/Integration/PublishLinuxImageScriptTest.sh
           tests/Integration/ReleaseOperationalFixturesTest.sh
           tests/Integration/VerifyNexusDockerWritePolicyTest.sh
+          tests/Integration/ProductionApplicationBlueGreen/SanitizeEvidenceTest.sh
       - name: Run v4.x candidate ship contract
         run: scripts/dev/ship.test.sh
       - name: Verify Docker daemon configuration ownership

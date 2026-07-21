@@ -141,25 +141,8 @@ persist_sanitized_capture_output()
     command_output_artifact="$evidence_directory/command-output.log"
     temporary_command_output_artifact=$(mktemp "$evidence_directory/.command-output.XXXXXX") || return 1
     chmod 0600 "$temporary_command_output_artifact"
-    if python3 - "$capture_output_file" "$temporary_command_output_artifact" <<'PY'
-import re
-import sys
-
-source, destination = sys.argv[1:]
-sensitive_line = re.compile(
-    r'(?:password|passwd|secret|token|private[ _-]?key|authorization|cookie|credential|app[ _-]?key|bearer)',
-    re.IGNORECASE,
-)
-credential_url = re.compile(r'([a-z][a-z0-9+.-]*://[^\s/:@]+:)[^\s@]+@', re.IGNORECASE)
-
-with open(source, 'r', encoding='utf-8', errors='replace') as input_file, open(destination, 'w', encoding='utf-8') as output_file:
-    for line in input_file:
-        line = credential_url.sub(r'\1[REDACTED]@', line)
-        if sensitive_line.search(line):
-            output_file.write('[REDACTED sensitive command output]\n')
-        else:
-            output_file.write(line)
-PY
+    if python3 "$lab_directory/sanitize-evidence.py" \
+        "$capture_output_file" "$temporary_command_output_artifact"
     then
         mv -f "$temporary_command_output_artifact" "$command_output_artifact"
         chmod 0600 "$command_output_artifact"
