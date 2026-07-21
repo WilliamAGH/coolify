@@ -46,22 +46,46 @@ class InspectBlueGreenContainer
     /** @return non-empty-list<string> */
     public function exactMutationAssertionsFor(BlueGreenContainerExpectation $expectation): array
     {
-        if ($expectation->dockerId === null) {
-            throw new InvalidArgumentException('A destination-fenced container mutation requires the exact Docker ID.');
+        $assertions = $this->exactIdentityAssertionsFor($expectation);
+        $containerId = escapeshellarg($expectation->dockerId);
+        if ($expectation->blueGreenManaged) {
+            $assertions[] = 'test "$(docker ps -aq --no-trunc '.$this->blueGreenProvenanceFilters($expectation).')" = '.$containerId;
+        }
+
+        return $assertions;
+    }
+
+    /** @return non-empty-list<string> */
+    public function exactReplicaMutationAssertionsFor(
+        BlueGreenContainerExpectation $expectation,
+        int $replicaIndex,
+        int $replicaCount,
+        string $composeProject,
+        string $composeService,
+    ): array {
+        $replicaSet = new BlueGreenReplicaSet($replicaCount);
+        if (! $expectation->blueGreenManaged
+            || ! in_array($replicaIndex, $replicaSet->indexes(), true)
+            || trim($composeProject) === ''
+            || trim($composeService) === '') {
+            throw new InvalidArgumentException('A replica mutation requires complete replica and Compose provenance.');
         }
         $containerId = escapeshellarg($expectation->dockerId);
         $assertions = [
-            'test "$(docker inspect --format='.escapeshellarg('{{.Id}}').' '.$containerId.')" = '.escapeshellarg($expectation->dockerId),
-            'test "$(docker inspect --format='.escapeshellarg('{{.Name}}').' '.$containerId.')" = '.escapeshellarg('/'.$expectation->name),
-            $this->labelAssertion($containerId, 'coolify.applicationId', (string) $expectation->applicationId),
-            $this->labelAssertion($containerId, 'coolify.pullRequestId', (string) $expectation->pullRequestId),
+            ...$this->exactIdentityAssertionsFor($expectation),
+            $this->labelAssertion($containerId, 'coolify.blueGreen.replicaIndex', (string) $replicaIndex),
+            $this->labelAssertion($containerId, 'coolify.blueGreen.replicaCount', (string) $replicaSet->count),
+            $this->labelAssertion($containerId, 'com.docker.compose.project', $composeProject),
+            $this->labelAssertion($containerId, 'com.docker.compose.service', $composeService),
         ];
-        if ($expectation->blueGreenManaged) {
-            $assertions[] = $this->labelAssertion($containerId, 'coolify.blueGreen.managed', 'true');
-            $assertions[] = $this->labelAssertion($containerId, 'coolify.blueGreen.deploymentUuid', (string) $expectation->deploymentUuid);
-            $assertions[] = $this->labelAssertion($containerId, 'coolify.blueGreen.color', (string) $expectation->color?->value);
-            $assertions[] = $this->labelAssertion($containerId, 'coolify.blueGreen.routingRevision', (string) $expectation->routingRevision);
-        }
+        $replicaFilters = implode(' ', [
+            $this->blueGreenProvenanceFilters($expectation),
+            '--filter '.escapeshellarg('label=coolify.blueGreen.replicaIndex='.$replicaIndex),
+            '--filter '.escapeshellarg('label=coolify.blueGreen.replicaCount='.$replicaSet->count),
+            '--filter '.escapeshellarg('label=com.docker.compose.project='.$composeProject),
+            '--filter '.escapeshellarg('label=com.docker.compose.service='.$composeService),
+        ]);
+        $assertions[] = 'test "$(docker ps -aq --no-trunc '.$replicaFilters.')" = '.$containerId;
 
         return $assertions;
     }
@@ -186,6 +210,29 @@ class InspectBlueGreenContainer
     }
 
     /** @return non-empty-list<string> */
+    private function exactIdentityAssertionsFor(BlueGreenContainerExpectation $expectation): array
+    {
+        if ($expectation->dockerId === null) {
+            throw new InvalidArgumentException('A destination-fenced container mutation requires the exact Docker ID.');
+        }
+        $containerId = escapeshellarg($expectation->dockerId);
+        $assertions = [
+            'test "$(docker inspect --format='.escapeshellarg('{{.Id}}').' '.$containerId.')" = '.escapeshellarg($expectation->dockerId),
+            'test "$(docker inspect --format='.escapeshellarg('{{.Name}}').' '.$containerId.')" = '.escapeshellarg('/'.$expectation->name),
+            $this->labelAssertion($containerId, 'coolify.applicationId', (string) $expectation->applicationId),
+            $this->labelAssertion($containerId, 'coolify.pullRequestId', (string) $expectation->pullRequestId),
+        ];
+        if ($expectation->blueGreenManaged) {
+            $assertions[] = $this->labelAssertion($containerId, 'coolify.blueGreen.managed', 'true');
+            $assertions[] = $this->labelAssertion($containerId, 'coolify.blueGreen.deploymentUuid', (string) $expectation->deploymentUuid);
+            $assertions[] = $this->labelAssertion($containerId, 'coolify.blueGreen.color', (string) $expectation->color?->value);
+            $assertions[] = $this->labelAssertion($containerId, 'coolify.blueGreen.routingRevision', (string) $expectation->routingRevision);
+        }
+
+        return $assertions;
+    }
+
+    /** @return non-empty-list<string> */
     private function namedMutationAssertionsFor(BlueGreenContainerExpectation $expectation, string $identifier): array
     {
         $assertions = [
@@ -199,16 +246,20 @@ class InspectBlueGreenContainer
             $assertions[] = $this->labelAssertion($identifier, 'coolify.blueGreen.deploymentUuid', (string) $expectation->deploymentUuid);
             $assertions[] = $this->labelAssertion($identifier, 'coolify.blueGreen.color', (string) $expectation->color?->value);
             $assertions[] = $this->labelAssertion($identifier, 'coolify.blueGreen.routingRevision', (string) $expectation->routingRevision);
-            $filters = implode(' ', [
-                '--filter '.escapeshellarg('label=coolify.applicationId='.$expectation->applicationId),
-                '--filter '.escapeshellarg('label=coolify.blueGreen.managed=true'),
-                '--filter '.escapeshellarg('label=coolify.blueGreen.deploymentUuid='.$expectation->deploymentUuid),
-                '--filter '.escapeshellarg('label=coolify.blueGreen.color='.$expectation->color?->value),
-                '--filter '.escapeshellarg('label=coolify.blueGreen.routingRevision='.$expectation->routingRevision),
-            ]);
-            $assertions[] = 'test "$(docker ps -aq --no-trunc '.$filters.')" = "$(docker inspect --format='.escapeshellarg('{{.Id}}').' '.$identifier.')"';
+            $assertions[] = 'test "$(docker ps -aq --no-trunc '.$this->blueGreenProvenanceFilters($expectation).')" = "$(docker inspect --format='.escapeshellarg('{{.Id}}').' '.$identifier.')"';
         }
 
         return $assertions;
+    }
+
+    private function blueGreenProvenanceFilters(BlueGreenContainerExpectation $expectation): string
+    {
+        return implode(' ', [
+            '--filter '.escapeshellarg('label=coolify.applicationId='.$expectation->applicationId),
+            '--filter '.escapeshellarg('label=coolify.blueGreen.managed=true'),
+            '--filter '.escapeshellarg('label=coolify.blueGreen.deploymentUuid='.$expectation->deploymentUuid),
+            '--filter '.escapeshellarg('label=coolify.blueGreen.color='.$expectation->color?->value),
+            '--filter '.escapeshellarg('label=coolify.blueGreen.routingRevision='.$expectation->routingRevision),
+        ]);
     }
 }

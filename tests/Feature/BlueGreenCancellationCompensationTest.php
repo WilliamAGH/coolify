@@ -7,6 +7,7 @@ use App\Actions\Application\BlueGreen\RecordBlueGreenCandidateIdentity;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\ApplicationBlueGreenDeployment;
+use App\Models\ApplicationBlueGreenReplica;
 use App\Models\ApplicationDeploymentQueue;
 use App\Services\BlueGreenDeploymentLifecycle;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -141,6 +142,130 @@ it('compensates a claimed cancelled blue-green operation exactly once', function
     'user cancellation' => ApplicationDeploymentStatus::CANCELLED_BY_USER,
     'fleet cancellation' => ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET,
 ]);
+
+it('compensates only the exact partial multi-replica start that exists before health verification', function (): void {
+    ['application' => $application, 'destination' => $destination, 'server' => $server] = BlueGreenDeactivationScenario::context();
+    $application->update([
+        'health_check_enabled' => true,
+        'ports_mappings' => null,
+    ]);
+    $application->settings()->update([
+        'is_blue_green_deployment_enabled' => true,
+        'is_container_label_readonly_enabled' => true,
+        'blue_green_replica_count' => 3,
+    ]);
+    $deployment = ApplicationDeploymentQueue::query()->create([
+        'application_id' => $application->id,
+        'application_name' => $application->name,
+        'server_id' => $server->id,
+        'server_name' => $server->name,
+        'destination_id' => $destination->id,
+        'deployment_uuid' => 'partial-replica-start-compensation',
+        'pull_request_id' => 0,
+        'commit' => 'partial-replica-start-compensation-commit',
+        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+        'only_this_server' => true,
+    ]);
+    $bootId = BlueGreenDeactivationScenario::BOOT_ID;
+    Process::fake(['*' => Process::sequence([
+        $bootId,
+        'coolify-blue-green-destination-state-attested',
+        '',
+        $bootId,
+    ])]);
+    $lifecycle = new BlueGreenDeploymentLifecycle(
+        application: $application,
+        deployment: $deployment,
+        destination: $destination,
+        server: $server,
+        timeout: 30,
+        checkForCancellation: static function (): void {},
+    );
+    $lifecycle->initialize();
+    $claim = $lifecycle->claim();
+    $reservedReplicas = ApplicationBlueGreenReplica::query()
+        ->where('application_blue_green_deployment_id', $claim->stateId)
+        ->orderBy('replica_index')
+        ->get();
+    $availableReplicaOutput = $reservedReplicas->take(2)->map(function (ApplicationBlueGreenReplica $replica): string {
+        return $replica->replica_index."\t".json_encode([
+            'Id' => str_repeat((string) $replica->replica_index, 64),
+            'Name' => '/'.$replica->compose_service.'-1',
+            'State' => [
+                'Status' => 'running',
+                'Health' => ['Status' => 'healthy'],
+            ],
+            'Config' => [
+                'Labels' => [
+                    'coolify.applicationId' => (string) $replica->application_id,
+                    'coolify.pullRequestId' => '0',
+                    'coolify.blueGreen.managed' => 'true',
+                    'coolify.blueGreen.deploymentUuid' => $replica->deployment_uuid,
+                    'coolify.blueGreen.color' => $replica->color->value,
+                    'coolify.blueGreen.routingRevision' => (string) $replica->routing_revision,
+                    'coolify.blueGreen.replicaIndex' => (string) $replica->replica_index,
+                    'coolify.blueGreen.replicaCount' => '3',
+                    'com.docker.compose.project' => $replica->compose_project,
+                    'com.docker.compose.service' => $replica->compose_service,
+                ],
+            ],
+        ], JSON_THROW_ON_ERROR);
+    })->implode("\n");
+    $phaseDuringAvailableReplicaDiscovery = null;
+    $compensationCommands = [];
+    Process::fake(function (PendingProcess $process) use (
+        $bootId,
+        $availableReplicaOutput,
+        $claim,
+        &$phaseDuringAvailableReplicaDiscovery,
+        &$compensationCommands,
+    ) {
+        $compensationCommands[] = $process->command;
+        if (str_contains($process->command, '/proc/sys/kernel/random/boot_id')) {
+            return Process::result(output: $bootId, exitCode: 0);
+        }
+        if (str_contains($process->command, 'coolify_available_replica_')) {
+            $phaseDuringAvailableReplicaDiscovery ??= ApplicationBlueGreenDeployment::query()
+                ->findOrFail($claim->stateId)
+                ->phase;
+
+            return Process::result(output: $availableReplicaOutput, exitCode: 0);
+        }
+
+        return Process::result(output: '', exitCode: 0);
+    });
+    $deployment->update([
+        'status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+        'finished_at' => now()->subMinute()->startOfSecond(),
+    ]);
+    $cause = new RuntimeException('The candidate Compose start failed before health verification.');
+
+    try {
+        expect($lifecycle->rollback($cause))->toBe($cause);
+
+        $state = ApplicationBlueGreenDeployment::query()->findOrFail($claim->stateId);
+        $replicas = ApplicationBlueGreenReplica::query()
+            ->where('application_blue_green_deployment_id', $claim->stateId)
+            ->orderBy('replica_index')
+            ->get();
+
+        expect($phaseDuringAvailableReplicaDiscovery)->toBe(BlueGreenDeploymentPhase::ROLLING_BACK)
+            ->and($state->phase)->toBe(BlueGreenDeploymentPhase::IDLE)
+            ->and($replicas->pluck('container_id')->all())->toBe([
+                str_repeat('1', 64),
+                str_repeat('2', 64),
+                null,
+            ])
+            ->and($replicas->pluck('health_status')->all())->toBe(['stopped', 'stopped', 'pending'])
+            ->and(implode("\n", $compensationCommands))->toContain(
+                'coolify_available_replica_1',
+                'coolify_available_replica_2',
+                'coolify_available_replica_3',
+            );
+    } finally {
+        $lifecycle->release();
+    }
+});
 
 it('completes finalized idle cleanup after cancellation without finishing the queue', function (ApplicationDeploymentStatus $cancellationStatus): void {
     $scenario = BlueGreenRecoveryScenario::create();

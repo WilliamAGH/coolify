@@ -13,6 +13,7 @@ use App\Actions\Application\BlueGreen\RecordBlueGreenCandidateIdentity;
 use App\Actions\Application\BlueGreen\RecordBlueGreenDestinationState;
 use App\Actions\Application\BlueGreen\RecordBlueGreenDrainObservation;
 use App\Actions\Application\BlueGreen\RecordBlueGreenRoutingMutation;
+use App\Actions\Application\BlueGreen\RemoveBlueGreenApplicationContainers;
 use App\Actions\Application\BlueGreen\TransitionsBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\VerifyBlueGreenPublicRecovery;
 use App\Actions\Proxy\BlueGreenProxyConfiguration;
@@ -26,6 +27,7 @@ use App\Enums\ProxyTypes;
 use App\Jobs\ApplicationDeploymentJob;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
+use App\Models\ApplicationBlueGreenReplica;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\InstanceSettings;
 use App\Models\PrivateKey;
@@ -418,6 +420,10 @@ it('promotes two public routes across two backend ports through production label
             health: 'healthy',
         ),
     );
+    $scalarReplica = ApplicationBlueGreenReplica::query()
+        ->where('application_blue_green_deployment_id', $claim->stateId)
+        ->where('deployment_uuid', $claim->deploymentUuid)
+        ->sole();
     $releaseProof = BlueGreenRoutingTarget::durableReleaseProofToken($claim->deploymentUuid);
     $probeToken = BlueGreenRoutingTarget::durableProbeToken($claim->deploymentUuid);
     $probeTarget = new BlueGreenRoutingTarget(
@@ -558,6 +564,11 @@ it('promotes two public routes across two backend ports through production label
     (new RecordBlueGreenDrainObservation)->record($claim, 0);
     $finalState = CompleteBlueGreenDeploymentOperation::run($claim, 0);
     $finalQueue = $context['candidate']->fresh();
+    $deactivationPlan = (new RemoveBlueGreenApplicationContainers)->planFor(
+        $application,
+        $finalState,
+        $destination,
+    );
 
     expect($probeRoutes)->toHaveCount(4)
         ->and($handoffRoutes)->toHaveCount(4)
@@ -578,6 +589,17 @@ it('promotes two public routes across two backend ports through production label
             'https://multi-port-web.example.test/',
         ])
         ->and($steadyConfiguration->routingConfigDigest)->toBe($claim->routingConfigDigest)
+        ->and($scalarReplica->container_name)->toBe($claim->candidateContainerName)
+        ->and($scalarReplica->container_id)->toBe(MULTI_PORT_CANDIDATE_CONTAINER_ID)
+        ->and($scalarReplica->health_status)->toBe('healthy')
+        ->and($deactivationPlan->replicaContainers)->toBe([[
+            'name' => $claim->candidateContainerName,
+            'id' => MULTI_PORT_CANDIDATE_CONTAINER_ID,
+            'color' => BlueGreenDeploymentColor::BLUE,
+            'routingRevision' => $claim->expectedRoutingRevision,
+            'deploymentUuid' => $claim->deploymentUuid,
+            'index' => 1,
+        ]])
         ->and($finalState->phase)->toBe(BlueGreenDeploymentPhase::IDLE)
         ->and($finalState->active_color)->toBe(BlueGreenDeploymentColor::BLUE)
         ->and($finalState->routing_revision)->toBe(2)

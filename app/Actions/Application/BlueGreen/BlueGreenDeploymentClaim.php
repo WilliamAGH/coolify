@@ -22,6 +22,7 @@ final readonly class BlueGreenDeploymentClaim
         public ?BlueGreenBackendPortInventory $drainBackendPortInventory,
         public int $supersessionGeneration,
         public ?string $legacyContainerName,
+        public int $replicaCount = DEFAULT_BLUE_GREEN_REPLICA_COUNT,
         public ?string $candidateContainerName = null,
         public ?string $rollbackManagedFilename = null,
     ) {
@@ -34,6 +35,7 @@ final readonly class BlueGreenDeploymentClaim
         if ($this->supersessionGeneration < 1) {
             throw new \InvalidArgumentException('The supersession generation must be positive.');
         }
+        new BlueGreenReplicaSet($this->replicaCount);
         if (preg_match('/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/D', $this->serverBootId) !== 1) {
             throw new \InvalidArgumentException('The server boot identity must be a canonical lowercase UUID.');
         }

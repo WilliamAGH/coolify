@@ -125,6 +125,7 @@ class ClaimBlueGreenDeployment
                 throw new BlueGreenDeploymentTransitionException('The blue-green supersession generation is invalid or exhausted.');
             }
             $supersessionGeneration = $previousSupersessionGeneration + 1;
+            $replicaCount = $setting->blueGreenReplicaCount();
             $backendPortInventory = BlueGreenBackendPortInventory::fromPorts(
                 $lockedApplication->blueGreenDeploymentBackendPorts($setting)
                     ?? throw new BlueGreenDeploymentTransitionException('The blue-green application has no exact backend port inventory.'),
@@ -191,6 +192,7 @@ class ClaimBlueGreenDeployment
                 backendPortInventory: $backendPortInventory,
                 drainBackendPortInventory: $drainBackendPortInventory,
                 supersessionGeneration: $supersessionGeneration,
+                replicaCount: $replicaCount,
                 legacyContainerName: $legacyContainerName,
                 candidateContainerName: $lockedApplication->uuid.'-'.$pendingColor->value,
                 rollbackManagedFilename: $this->rollbackManagedFilename(
@@ -309,7 +311,7 @@ class ClaimBlueGreenDeployment
                 composeServiceBase: $composeServiceBase,
                 scalarContainerName: $claim->candidateContainerName
                     ?? throw new BlueGreenDeploymentTransitionException('The blue-green claim has no scalar candidate identity.'),
-                replicaCount: $setting->blueGreenReplicaCount(),
+                replicaCount: $claim->replicaCount,
             );
 
             return $claim;
