@@ -1271,6 +1271,45 @@ SH;
     if (($forkRelease['env']['FORK_RELEASE_TRUST_VERIFIER'] ?? null) !== 'scripts/ci/verify-fork-release-trust.sh') {
         $violations[] = 'fork release lost the canonical trust verifier owner';
     }
+    if (($forkRelease['env']['FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE'] ?? null) !== 'docker/fork-release-tag-allowed-signers') {
+        $violations[] = 'fork release signer authorization must use the committed canonical inventory path';
+    }
+    $forkStage = $sharedWorkflow['jobs']['fork-stage'] ?? [];
+    $forkStageCheckouts = collect(releaseWorkflowSteps($forkStage))
+        ->filter(static fn (array $step): bool => str_starts_with((string) ($step['uses'] ?? ''), 'actions/checkout@'))
+        ->values();
+    $forkStageCheckout = $forkStageCheckouts->first();
+    if ($forkStageCheckouts->count() !== 1
+        || ($forkStageCheckout['uses'] ?? null) !== 'actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd'
+        || ($forkStageCheckout['with'] ?? null) !== [
+            'fetch-depth' => 0,
+            'persist-credentials' => false,
+            'ref' => '${{ github.sha }}',
+        ]) {
+        $violations[] = 'fork staging must use one immutable credential-free checkout for live tag verification';
+    }
+    $forkStageRun = (string) (releaseWorkflowStep(
+        $forkStage,
+        'Stage the fork image with inline build attestations',
+    )['run'] ?? '');
+    foreach ([
+        <<<'SH'
+verify_live_fork_tag
+    regctl image import "$repository:${RUN_TAG}-${arch}" "$archive"
+    verify_live_fork_tag
+SH,
+        <<<'SH'
+verify_live_fork_tag
+  regctl manifest put \
+    --content-type application/vnd.oci.image.index.v1+json \
+    "$repository:$RUN_TAG" < "$merged_index"
+  verify_live_fork_tag
+SH,
+    ] as $requiredStageWriteFence) {
+        if (! str_contains($forkStageRun, $requiredStageWriteFence)) {
+            $violations[] = 'every disposable fork staging registry write must be fenced by live tag verification';
+        }
+    }
     foreach ([
         'Create or validate empty draft recovery release before semantic promotion',
         'Promote and verify the main fork image',
@@ -1423,6 +1462,19 @@ it('rejects unsafe fork source, signer, and runner topology mutations', function
             '      regctl image copy "$repository@$expected_index_digest" "$tag"',
         ),
         'missing-tag-ruleset-bypass-guard' => $sharedWorkflow['jobs']['fork-release']['env']['FORK_RELEASE_TRUST_VERIFIER'] = '/usr/bin/true',
+        'external-allowed-signers-inventory' => $sharedWorkflow['jobs']['fork-release']['env']['FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE'] = '/tmp/allowed-signers',
+        'missing-stage-tag-write-fence' => (function () use (&$sharedWorkflow): void {
+            foreach ($sharedWorkflow['jobs']['fork-stage']['steps'] as &$step) {
+                if (($step['name'] ?? null) === 'Stage the fork image with inline build attestations') {
+                    $step['run'] = str_replace(
+                        'verify_live_fork_tag'.PHP_EOL.'    regctl image import',
+                        ':'.PHP_EOL.'    regctl image import',
+                        (string) ($step['run'] ?? ''),
+                    );
+                }
+            }
+            unset($step);
+        })(),
         'missing-ruleset-token-binding' => (function () use (&$sharedWorkflow): void {
             foreach ($sharedWorkflow['jobs']['fork-release']['steps'] as &$step) {
                 if (($step['name'] ?? null) === 'Promote and verify the main fork image') {
@@ -1502,6 +1554,8 @@ it('rejects unsafe fork source, signer, and runner topology mutations', function
     'missing-registry-write-signer',
     'missing-post-copy-signer',
     'missing-tag-ruleset-bypass-guard',
+    'external-allowed-signers-inventory',
+    'missing-stage-tag-write-fence',
     'missing-ruleset-token-binding',
     'missing-ruleset-token-unset',
     'missing-caller-ruleset-token',

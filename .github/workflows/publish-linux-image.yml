@@ -1792,6 +1792,12 @@ jobs:
       main_index_digest: ${{ steps.stage.outputs.main_index_digest }}
       run_tag: ${{ needs.validate-inputs.outputs.run_tag }}
     steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
       - name: Download all verified fork OCI evidence
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -1819,6 +1825,8 @@ jobs:
       - name: Stage the fork image with inline build attestations
         id: stage
         env:
+          FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE: docker/fork-release-tag-allowed-signers
+          FORK_RELEASE_TAG_VERIFIER: scripts/ci/verify-fork-release-tag.sh
           MAIN_TARGET: docker.iocloudhost.net/williamagh/coolify
           RUN_TAG: ${{ needs.validate-inputs.outputs.run_tag }}
           SEMANTIC_VERSION: ${{ inputs.semantic_version }}
@@ -1827,6 +1835,12 @@ jobs:
         run: |
           set -Eeuo pipefail
           umask 077
+
+          verify_live_fork_tag() {
+            "$FORK_RELEASE_TAG_VERIFIER" \
+              "$SEMANTIC_VERSION" "$SOURCE_REVISION" \
+              "$SOURCE_URL.git" "$FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE"
+          }
 
           digest_or_absent() {
             local reference=$1 error_file digest
@@ -1928,7 +1942,9 @@ jobs:
             for arch in amd64 arm64; do
               archive="fork-candidate-input/${artifact}-${arch}.oci.tar"
               require_absent "$repository:${RUN_TAG}-${arch}"
+              verify_live_fork_tag
               regctl image import "$repository:${RUN_TAG}-${arch}" "$archive"
+              verify_live_fork_tag
               if [[ "$arch" == amd64 ]]; then
                 [[ "$(regctl image digest "$repository:${RUN_TAG}-${arch}" --platform linux/amd64)" == "$amd64_digest" ]]
               else
@@ -1959,9 +1975,11 @@ jobs:
                   }
                 }
               ' "$amd64_index" "$arm64_index" > "$merged_index"
+            verify_live_fork_tag
             regctl manifest put \
               --content-type application/vnd.oci.image.index.v1+json \
               "$repository:$RUN_TAG" < "$merged_index"
+            verify_live_fork_tag
             rm -f "$amd64_index" "$arm64_index" "$merged_index"
             index_digest="$(regctl image digest "$repository:$RUN_TAG")"
             printf '%s' "$index_digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
