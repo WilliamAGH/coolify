@@ -106,6 +106,7 @@ jobs:
       target_repository: williamagh/coolify
       validate_only: false
     secrets:
+      FORK_RELEASE_RULESET_TOKEN: ${{ secrets.FORK_RELEASE_RULESET_TOKEN }}
       FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY: ${{ secrets.FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY }}
       NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
       NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}

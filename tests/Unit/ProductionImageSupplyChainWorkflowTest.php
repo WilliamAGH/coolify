@@ -1278,17 +1278,17 @@ SH;
         'Reverify every fork alias after release publication',
     ] as $trustStepName) {
         $trustStep = releaseWorkflowStep($forkRelease, $trustStepName);
-        if (($trustStep['env']['FORK_RELEASE_RULESET_TOKEN'] ?? null) !== '${{ github.token }}'
+        if (($trustStep['env']['FORK_RELEASE_RULESET_TOKEN'] ?? null) !== '${{ secrets.FORK_RELEASE_RULESET_TOKEN }}'
             || ($trustStep['env']['GH_TOKEN'] ?? null) !== '${{ github.token }}') {
-            $violations[] = 'fork release trust checks must bind and unexport the ephemeral workflow token';
+            $violations[] = 'fork release trust checks must isolate the ruleset audit token from release mutation credentials';
         }
         $trustRun = (string) ($trustStep['run'] ?? '');
         if (! str_contains($trustRun, 'ruleset_token=${FORK_RELEASE_RULESET_TOKEN:?}'.PHP_EOL.'unset FORK_RELEASE_RULESET_TOKEN')) {
             $violations[] = 'fork release trust steps must unexport ruleset authority before running any external command';
         }
     }
-    if (array_key_exists('FORK_RELEASE_RULESET_TOKEN', $caller['jobs']['publish']['secrets'] ?? [])) {
-        $violations[] = 'fork caller must not depend on a separately provisioned ruleset token';
+    if (($caller['jobs']['publish']['secrets']['FORK_RELEASE_RULESET_TOKEN'] ?? null) !== '${{ secrets.FORK_RELEASE_RULESET_TOKEN }}') {
+        $violations[] = 'fork caller must explicitly pass the ruleset audit token';
     }
 
     $semanticMutationBoundaries = [
@@ -1437,8 +1437,8 @@ it('rejects unsafe fork source, signer, and runner topology mutations', function
             'ruleset_token=${FORK_RELEASE_RULESET_TOKEN:?}'.PHP_EOL.'unset FORK_RELEASE_RULESET_TOKEN',
             'ruleset_token=${FORK_RELEASE_RULESET_TOKEN:?}'.PHP_EOL.':',
         ),
-        'caller-requires-ruleset-token-secret' => (function () use (&$caller): void {
-            $caller['jobs']['publish']['secrets']['FORK_RELEASE_RULESET_TOKEN'] = '${{ secrets.FORK_RELEASE_RULESET_TOKEN }}';
+        'missing-caller-ruleset-token' => (function () use (&$caller): void {
+            unset($caller['jobs']['publish']['secrets']['FORK_RELEASE_RULESET_TOKEN']);
         })(),
         'missing-release-upload-signer' => $replaceForkReleaseRun(
             $sharedWorkflow,
@@ -1504,7 +1504,7 @@ it('rejects unsafe fork source, signer, and runner topology mutations', function
     'missing-tag-ruleset-bypass-guard',
     'missing-ruleset-token-binding',
     'missing-ruleset-token-unset',
-    'caller-requires-ruleset-token-secret',
+    'missing-caller-ruleset-token',
     'missing-release-upload-signer',
     'missing-post-release-upload-trust',
     'missing-release-publication-signer',
@@ -3097,6 +3097,7 @@ it('defines one referrerless fork release graph for the main image on both platf
         'target_repository' => 'williamagh/coolify',
         'validate_only' => false,
     ])->and(array_keys($publish['secrets'] ?? []))->toBe([
+        'FORK_RELEASE_RULESET_TOKEN',
         'FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY',
         'NEXUS_PASSWORD',
         'NEXUS_USERNAME',
