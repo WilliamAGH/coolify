@@ -19,14 +19,14 @@ Docker Compose-based dev setup with services: coolify (app), postgres, redis, so
 spin up                          # or: docker compose -f docker-compose.dev.yml up -d
 spin down                        # stop services
 
-# SSOT local Docker hygiene (OrbStack): keep coolify + coolify-proxy only;
-# tear down cpbg-*/lab stacks, extra buildx builders, orphan volumes.
+# SSOT local Docker hygiene (OrbStack): preserve persistent resources and
+# tear down only explicitly identified cpbg-*/lab resources.
 make docker-ssot-status
 make docker-ssot-clean
 make docker-ssot-ensure-builder  # aventure-runtime-multiarch-proxy for multiarch push
 ```
 
-After any integration lab (blue/green, production-application, gate0), run `make docker-ssot-clean` so residue cannot accumulate. Prefer `docker compose -p <lab> down --remove-orphans -v` at the end of each lab run.
+After any integration lab (blue/green, production-application, gate0), run `make docker-ssot-clean` so named lab residue cannot accumulate. The command deliberately does not prune global builders or volumes. Prefer `docker compose -p <lab> down --remove-orphans -v` at the end of each lab run.
 
 The app runs at `localhost:8000` by default. Vite dev server on port 5173.
 
