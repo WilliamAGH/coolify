@@ -1,17 +1,17 @@
 # Local OrbStack Docker SSOT hygiene for Coolify dev.
-# Keep-set: compose projects coolify + coolify-proxy, one multiarch builder.
-# Lab residue (cpbg-*, production-application-*, extra buildx builders) is removed by clean.
+# Clean only explicit lab resources: cpbg-*, production-application-blue-green-*,
+# or coolify.integration.ephemeral=true. It never prunes global Docker state.
 
 .PHONY: docker-ssot-status docker-ssot-clean docker-ssot-ensure-builder
 
 DOCKER_PUSH_BUILDER ?= aventure-runtime-multiarch-proxy
 export DOCKER_PUSH_BUILDER
 
-docker-ssot-status: ## Print SSOT keep-set vs live Docker inventory
+docker-ssot-status: ## Print explicit cleanup targets and live Docker inventory
 	@scripts/dev/docker-ssot-clean.sh status
 
 docker-ssot-ensure-builder: ## Ensure multiarch push builder (aventure-runtime-multiarch-proxy)
 	@scripts/dev/docker-ssot-clean.sh ensure-builder
 
-docker-ssot-clean: ## Tear down lab stacks; keep Coolify control plane containers/volumes
+docker-ssot-clean: ## Remove only explicitly identified Coolify lab resources
 	@scripts/dev/docker-ssot-clean.sh clean

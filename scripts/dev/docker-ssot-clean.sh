@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # SSOT local Docker hygiene for Coolify dev on OrbStack.
-# Preserves the Coolify compose control plane; removes lab residue
-# (cpbg-*, production-application-*, uuid blue/green deploys, extra buildx builders).
+# Clean targets only known Coolify lab projects or an explicit ephemeral label.
 #
 # Usage:
 #   scripts/dev/docker-ssot-clean.sh status
@@ -11,10 +10,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 MULTIARCH_BUILDER="${DOCKER_PUSH_BUILDER:-aventure-runtime-multiarch-proxy}"
-# Coolify compose project is "coolify" (docker-compose.dev.yml / spin).
-# coolify-proxy is a separate long-lived Traefik project on this host.
-KEEP_COMPOSE_PROJECTS="coolify coolify-proxy"
-KEEP_BUILDERS="orbstack default ${MULTIARCH_BUILDER}"
+LAB_CLEAN_LABEL="coolify.integration.ephemeral=true"
 
 log() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -24,38 +20,20 @@ require_docker() {
   docker info >/dev/null 2>&1 || die "docker engine not reachable"
 }
 
-is_keep_builder() {
-  local name="$1" k
-  for k in ${KEEP_BUILDERS}; do
-    [ "$name" = "$k" ] && return 0
-  done
-  return 1
-}
+is_lab_compose_project() {
+  local project="$1"
 
-is_keep_compose_project() {
-  local project="$1" k
-  [ -z "$project" ] && return 1
-  for k in ${KEEP_COMPOSE_PROJECTS}; do
-    [ "$project" = "$k" ] && return 0
-  done
-  return 1
-}
-
-is_keep_container() {
-  local name="$1" project="$2"
-  is_keep_compose_project "$project" && return 0
-  case "$name" in
-    coolify|coolify-*|"buildx_buildkit_${MULTIARCH_BUILDER}0") return 0 ;;
-  esac
-  return 1
+  [[ "$project" =~ ^cpbg(-[a-z0-9][a-z0-9_-]*)?$ ]] \
+    || [[ "$project" =~ ^production-application-blue-green(-[a-z0-9][a-z0-9_-]*)?$ ]]
 }
 
 cmd_status() {
   require_docker
-  log "=== Coolify SSOT keep-set ==="
+  log "=== Coolify SSOT cleanup targets ==="
   log "repo: ${ROOT}"
-  log "compose projects: ${KEEP_COMPOSE_PROJECTS}"
-  log "builders: ${KEEP_BUILDERS}"
+  log "lab compose project prefixes: cpbg-*, production-application-blue-green-*"
+  log "lab resource label: ${LAB_CLEAN_LABEL}"
+  log "builder: ${MULTIARCH_BUILDER}"
   log ""
   log "=== running containers ==="
   docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
@@ -91,71 +69,83 @@ cmd_ensure_builder() {
   log "builder created: ${MULTIARCH_BUILDER}"
 }
 
-cmd_clean() {
-  require_docker
-  cmd_ensure_builder
+remove_containers_with_filter() {
+  local filter="$1" description="$2" id ids
 
-  local proj
-  while IFS= read -r proj; do
-    [ -z "$proj" ] && continue
-    if is_keep_compose_project "$proj"; then
-      log "KEEP compose project: ${proj}"
-      continue
-    fi
-    log "compose down -v: ${proj}"
-    docker compose -p "${proj}" down --remove-orphans -v >/dev/null 2>&1 || true
-  done < <(docker ps -a --format '{{.Label "com.docker.compose.project"}}' | sort -u)
+  ids="$(docker ps -aq --filter "$filter")" \
+    || die "could not enumerate containers for ${description}"
 
-  local id name project
   while IFS= read -r id; do
     [ -z "$id" ] && continue
-    name="$(docker inspect -f '{{.Name}}' "$id" | sed 's#^/##')"
-    project="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$id" 2>/dev/null || true)"
-    if is_keep_container "$name" "$project"; then
-      log "KEEP container: ${name}"
-      continue
-    fi
-    log "rm container: ${name}"
-    docker rm -f "$id" >/dev/null 2>&1 || true
-  done < <(docker ps -aq)
+    log "rm container (${description}): ${id}"
+    docker rm -f "$id" >/dev/null 2>&1 \
+      || die "could not remove container ${id} for ${description}"
+  done <<< "$ids"
+}
 
-  local builder
-  while IFS= read -r builder; do
-    [ -z "$builder" ] && continue
-    if is_keep_builder "$builder"; then
-      log "KEEP builder: ${builder}"
-      continue
-    fi
-    if docker buildx inspect "$builder" >/dev/null 2>&1; then
-      log "buildx rm: ${builder}"
-      docker buildx rm -f "$builder" >/dev/null 2>&1 || true
-    fi
-  done < <(docker buildx ls --format '{{.Name}}' 2>/dev/null | sort -u)
+remove_volumes_with_filter() {
+  local filter="$1" description="$2" volume volumes
 
-  local keep_vols v
-  keep_vols="$(
-    docker ps -q | while IFS= read -r cid; do
-      docker inspect -f '{{range .Mounts}}{{if eq .Type "volume"}}{{println .Name}}{{end}}{{end}}' "$cid"
-    done | sort -u
-  )"
-  while IFS= read -r v; do
-    [ -z "$v" ] && continue
-    if printf '%s\n' "$keep_vols" | grep -qx "$v"; then
-      log "KEEP volume: ${v}"
-      continue
+  volumes="$(docker volume ls -q --filter "$filter")" \
+    || die "could not enumerate volumes for ${description}"
+
+  while IFS= read -r volume; do
+    [ -z "$volume" ] && continue
+    log "rm volume (${description}): ${volume}"
+    docker volume rm -f "$volume" >/dev/null 2>&1 \
+      || die "could not remove volume ${volume} for ${description}"
+  done <<< "$volumes"
+}
+
+remove_networks_with_filter() {
+  local filter="$1" description="$2" network networks
+
+  networks="$(docker network ls -q --filter "$filter")" \
+    || die "could not enumerate networks for ${description}"
+
+  while IFS= read -r network; do
+    [ -z "$network" ] && continue
+    log "rm network (${description}): ${network}"
+    docker network rm "$network" >/dev/null 2>&1 \
+      || die "could not remove network ${network} for ${description}"
+  done <<< "$networks"
+}
+
+remove_resources_with_filter() {
+  local filter="$1" description="$2"
+
+  remove_containers_with_filter "$filter" "$description"
+  remove_volumes_with_filter "$filter" "$description"
+  remove_networks_with_filter "$filter" "$description"
+}
+
+lab_compose_projects() {
+  local container_projects volume_projects network_projects
+
+  container_projects="$(docker ps -a --format '{{.Label "com.docker.compose.project"}}')" \
+    || die 'could not enumerate container Compose project labels'
+  volume_projects="$(docker volume ls --format '{{.Label "com.docker.compose.project"}}')" \
+    || die 'could not enumerate volume Compose project labels'
+  network_projects="$(docker network ls --format '{{.Label "com.docker.compose.project"}}')" \
+    || die 'could not enumerate network Compose project labels'
+  printf '%s\n%s\n%s\n' "$container_projects" "$volume_projects" "$network_projects" | sort -u
+}
+
+cmd_clean() {
+  require_docker
+
+  local proj projects
+  projects="$(lab_compose_projects)" || die 'could not enumerate Compose project labels'
+
+  while IFS= read -r proj; do
+    [ -z "$proj" ] && continue
+    if is_lab_compose_project "$proj"; then
+      log "CLEAN compose project: ${proj}"
+      remove_resources_with_filter "label=com.docker.compose.project=${proj}" "compose project ${proj}"
     fi
-    log "rm volume: ${v}"
-    docker volume rm -f "$v" >/dev/null 2>&1 || true
-  done < <(docker volume ls -q)
+  done <<< "$projects"
 
-  docker container prune -f >/dev/null
-  docker image prune -af >/dev/null
-  docker builder prune -af >/dev/null
-  docker volume prune -f >/dev/null
-
-  if docker buildx inspect orbstack >/dev/null 2>&1; then
-    docker buildx use orbstack >/dev/null 2>&1 || true
-  fi
+  remove_resources_with_filter "label=${LAB_CLEAN_LABEL}" "explicit lab label"
 
   log ""
   log "=== after clean ==="
@@ -166,9 +156,9 @@ usage() {
   cat <<'EOF'
 Usage: scripts/dev/docker-ssot-clean.sh <status|clean|ensure-builder>
 
-  status          Print keep-set and live inventory
+  status          Print cleanup targets and live inventory
   ensure-builder  Ensure aventure-runtime-multiarch-proxy (Nexus multiarch)
-  clean           Tear down lab stacks/builders/volumes; keep Coolify control plane
+  clean           Remove only cpbg/production blue-green labs or coolify.integration.ephemeral=true
 EOF
 }
 
