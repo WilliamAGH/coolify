@@ -22,10 +22,6 @@ on:
         default: ''
         required: false
         type: string
-      source_is_tag:
-        default: false
-        required: false
-        type: boolean
       staging_alias:
         default: ''
         required: false
@@ -123,7 +119,6 @@ jobs:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           FORK_SEMANTIC_VERSION_PATTERN: '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-fork$'
           FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY: ${{ secrets.FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY }}
-          FORK_SOURCE_IS_TAG: ${{ inputs.source_is_tag }}
           GITHUB_REF_TYPE: ${{ github.ref_type }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
           GITHUB_REF: ${{ github.ref }}
@@ -146,7 +141,6 @@ jobs:
           GITHUB_EVENT_NAME="${GITHUB_EVENT_NAME:-}"
           GITHUB_REF="${GITHUB_REF:-}"
           GITHUB_REF_PROTECTED="${GITHUB_REF_PROTECTED:-false}"
-          GITHUB_REF_TYPE="${GITHUB_REF_TYPE:-}"
           OPERATIONAL_ACCEPTANCE="${OPERATIONAL_ACCEPTANCE:-false}"
           OPERATIONAL_FAILURE_MODE="${OPERATIONAL_FAILURE_MODE:-none}"
           OPERATIONAL_SCENARIO="${OPERATIONAL_SCENARIO:-}"
@@ -281,30 +275,16 @@ jobs:
               [ "$CANDIDATE_REPOSITORY" = 'williamagh/coolify-fork-candidates' ]
               [ "$REPOSITORY" = 'williamacallahan/coolify' ]
               printf '%s' "$SEMANTIC_VERSION" | grep -Eq "$FORK_SEMANTIC_VERSION_PATTERN"
+              [ "$GITHUB_EVENT_NAME" = push ]
+              [ "$GITHUB_REF_TYPE" = tag ]
+              [ "$GITHUB_REF" = "refs/tags/$SEMANTIC_VERSION" ]
               printf '%s' "$GITHUB_SHA" | grep -Eq '^[0-9a-f]{40}$'
               [ "$PUBLISH_LATEST" = false ]
               [ -z "${STAGING_ALIAS:-}" ]
               [ "$VALIDATE_ONLY" = false ]
               [ -n "$NEXUS_USERNAME" ]
               [ -n "$NEXUS_PASSWORD" ]
-              case "$FORK_SOURCE_IS_TAG" in
-                true)
-                  [ "$GITHUB_EVENT_NAME" = push ]
-                  [ "$GITHUB_REF_TYPE" = tag ]
-                  [ "$GITHUB_REF" = "refs/tags/$SEMANTIC_VERSION" ]
-                  [ -n "$FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY" ]
-                  ;;
-                false)
-                  [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]
-                  [ "$GITHUB_REF_TYPE" = branch ]
-                  [ "$GITHUB_REF" = 'refs/heads/v4.x' ]
-                  [ "$GITHUB_REF_PROTECTED" = true ]
-                  ;;
-                *)
-                  printf 'Fork publication source_is_tag must be a boolean.\n' >&2
-                  exit 1
-                  ;;
-              esac
+              [ -n "$FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY" ]
               ;;
             *)
               echo "Unknown release kind: $RELEASE_KIND" >&2
@@ -359,7 +339,7 @@ jobs:
             fi
           } >> "$GITHUB_OUTPUT"
 
-      - name: Require fork application versions match the immutable source
+      - name: Require fork application versions match the immutable tag
         if: ${{ inputs.release_kind == 'fork' }}
         env:
           SEMANTIC_VERSION: ${{ inputs.semantic_version }}
@@ -385,12 +365,12 @@ jobs:
           versions_json_version="$(jq -er '.coolify.v4.version | strings' "$versions_file")"
 
           [[ "$constants_version" == "$SEMANTIC_VERSION" ]] || {
-            printf 'config/constants.php Coolify version must equal the fork publication version: expected %s, found %s.\n' \
+            printf 'config/constants.php Coolify version must equal the fork tag: expected %s, found %s.\n' \
               "$SEMANTIC_VERSION" "$constants_version" >&2
             exit 1
           }
           [[ "$versions_json_version" == "$SEMANTIC_VERSION" ]] || {
-            printf 'versions.json Coolify v4 version must equal the fork publication version: expected %s, found %s.\n' \
+            printf 'versions.json Coolify v4 version must equal the fork tag: expected %s, found %s.\n' \
               "$SEMANTIC_VERSION" "$versions_json_version" >&2
             exit 1
           }
@@ -1537,21 +1517,21 @@ jobs:
             arch: amd64
             oci_arch: amd64
             platform: linux/amd64
+            runner: ubuntu-24.04
           - product: main
             artifact_name: coolify
             dockerfile: docker/production/Dockerfile
             arch: arm64
             oci_arch: arm64
             platform: linux/arm64
-    runs-on:
-      group: coolify-trusted
-      labels: [self-hosted, Linux, X64, williamacallahan]
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           persist-credentials: false
 
-      - name: Preflight trusted fork build host
+      - name: Preflight native fork build host
         env:
           PLATFORM: ${{ matrix.platform }}
         run: |
@@ -1561,23 +1541,16 @@ jobs:
           [[ $(docker context inspect default --format '{{.Endpoints.docker.Host}}') == unix:///var/run/docker.sock ]]
           [[ -S /var/run/docker.sock ]]
           [[ $(uname -s) == Linux ]]
-          [[ $(docker version --format '{{.Server.Os}}/{{.Server.Arch}}') == linux/amd64 ]]
-          [[ "$PLATFORM" == linux/amd64 || "$PLATFORM" == linux/arm64 ]]
-
-      - name: Set up QEMU for fork cross-platform builds
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
-        with:
-          platforms: arm64
+          case "$(uname -m)" in
+            x86_64|amd64) native_platform=linux/amd64 ;;
+            aarch64|arm64) native_platform=linux/arm64 ;;
+            *) printf 'Unsupported native fork build architecture: %s\n' "$(uname -m)" >&2; exit 1 ;;
+          esac
+          [[ "$native_platform" == "$PLATFORM" ]]
+          [[ $(docker version --format '{{.Server.Os}}/{{.Server.Arch}}') == "$PLATFORM" ]]
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
-
-      - name: Verify fork Buildx platform support
-        env:
-          PLATFORM: ${{ matrix.platform }}
-        run: |
-          set -Eeuo pipefail
-          docker buildx inspect --bootstrap | grep -F "$PLATFORM"
 
       - name: Verify reviewed fork Dockerfile sources
         env:
@@ -1810,9 +1783,7 @@ jobs:
     if: ${{ inputs.release_kind == 'fork' && needs.fork-build.result == 'success' }}
     permissions:
       contents: read
-    runs-on:
-      group: coolify-trusted
-      labels: [self-hosted, Linux, X64, williamacallahan]
+    runs-on: ubuntu-24.04
     outputs:
       main_amd64_digest: ${{ steps.stage.outputs.main_amd64_digest }}
       main_arm64_digest: ${{ steps.stage.outputs.main_arm64_digest }}
@@ -2168,7 +2139,6 @@ jobs:
           verify_dependency_index "$REDIS_IMAGE" "$REDIS_INDEX_DIGEST" "$REDIS_AMD64_DIGEST" "$REDIS_ARM64_DIGEST" 7
 
       - name: Generate and Ed25519-sign strict fork deploy manifests
-        if: ${{ inputs.source_is_tag }}
         env:
           FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY: ${{ secrets.FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY }}
           MAIN_AMD64_DIGEST: ${{ needs.fork-stage.outputs.main_amd64_digest }}
@@ -2294,7 +2264,6 @@ jobs:
           rm -f "$private_key" "$derived_public_der" "$committed_public_der"
 
       - name: Sign amd64 deploy manifest off-registry
-        if: ${{ inputs.source_is_tag }}
         id: amd64-deploy-manifest
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
         with:
@@ -2303,7 +2272,6 @@ jobs:
           subject-path: fork-signed-bundles/release-linux-amd64.env
 
       - name: Sign arm64 deploy manifest off-registry
-        if: ${{ inputs.source_is_tag }}
         id: arm64-deploy-manifest
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
         with:
@@ -2311,8 +2279,7 @@ jobs:
           push-to-registry: false
           subject-path: fork-signed-bundles/release-linux-arm64.env
 
-      - name: Collect deploy-manifest attestation bundles and checksums
-        if: ${{ inputs.source_is_tag }}
+      - name: Collect deploy-manifest attestation bundles
         env:
           AMD64_DEPLOY_MANIFEST_BUNDLE: ${{ steps.amd64-deploy-manifest.outputs.bundle-path }}
           ARM64_DEPLOY_MANIFEST_BUNDLE: ${{ steps.arm64-deploy-manifest.outputs.bundle-path }}
@@ -2353,7 +2320,6 @@ jobs:
           MAIN_AMD64_DIGEST: ${{ needs.fork-stage.outputs.main_amd64_digest }}
           MAIN_ARM64_DIGEST: ${{ needs.fork-stage.outputs.main_arm64_digest }}
           MAIN_INDEX_DIGEST: ${{ needs.fork-stage.outputs.main_index_digest }}
-          SOURCE_IS_TAG: ${{ inputs.source_is_tag }}
         run: |
           set -Eeuo pipefail
 
@@ -2372,35 +2338,25 @@ jobs:
           verify_bundle "oci://${MAIN_TARGET}@${MAIN_ARM64_DIGEST}" fork-signed-bundles/main-arm64.sbom.sigstore.json https://spdx.dev/Document/v2.3
           verify_bundle "oci://${MAIN_TARGET}@${MAIN_INDEX_DIGEST}" fork-signed-bundles/main.provenance.sigstore.json https://slsa.dev/provenance/v1
           verify_bundle "oci://${MAIN_TARGET}@${MAIN_INDEX_DIGEST}" fork-signed-bundles/main.binding.sigstore.json https://coolify.io/attestations/fork-release-binding/v1
-          case "$SOURCE_IS_TAG" in
-            true)
-              "$GH_CLI" attestation verify fork-signed-bundles/release-linux-amd64.env \
-                --bundle fork-signed-bundles/release-linux-amd64.attestation.sigstore.json \
-                --predicate-type https://slsa.dev/provenance/v1 \
-                --repo "$GITHUB_REPOSITORY" \
-                --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/publish-linux-image.yml" \
-                --source-digest "$GITHUB_SHA" \
-                --source-ref "$GITHUB_REF"
-              "$GH_CLI" attestation verify fork-signed-bundles/release-linux-arm64.env \
-                --bundle fork-signed-bundles/release-linux-arm64.attestation.sigstore.json \
-                --predicate-type https://slsa.dev/provenance/v1 \
-                --repo "$GITHUB_REPOSITORY" \
-                --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/publish-linux-image.yml" \
-                --source-digest "$GITHUB_SHA" \
-                --source-ref "$GITHUB_REF"
-              for manifest in fork-signed-bundles/release-linux-amd64.env fork-signed-bundles/release-linux-arm64.env; do
-                openssl pkeyutl -verify -rawin -pubin \
-                  -inkey fork-signed-bundles/release-signing-ed25519.pub \
-                  -in "$manifest" -sigfile "$manifest.sig"
-              done
-              ;;
-            false)
-              ;;
-            *)
-              printf 'Fork publication source_is_tag must be a boolean.\n' >&2
-              exit 1
-              ;;
-          esac
+          "$GH_CLI" attestation verify fork-signed-bundles/release-linux-amd64.env \
+            --bundle fork-signed-bundles/release-linux-amd64.attestation.sigstore.json \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/publish-linux-image.yml" \
+            --source-digest "$GITHUB_SHA" \
+            --source-ref "$GITHUB_REF"
+          "$GH_CLI" attestation verify fork-signed-bundles/release-linux-arm64.env \
+            --bundle fork-signed-bundles/release-linux-arm64.attestation.sigstore.json \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/publish-linux-image.yml" \
+            --source-digest "$GITHUB_SHA" \
+            --source-ref "$GITHUB_REF"
+          for manifest in fork-signed-bundles/release-linux-amd64.env fork-signed-bundles/release-linux-arm64.env; do
+            openssl pkeyutl -verify -rawin -pubin \
+              -inkey fork-signed-bundles/release-signing-ed25519.pub \
+              -in "$manifest" -sigfile "$manifest.sig"
+          done
           (cd fork-signed-bundles && sha256sum --check --strict SHA256SUMS)
 
       - name: Upload verified downloadable fork bundles
@@ -2439,7 +2395,6 @@ jobs:
       NEXUS_BASE_URL: https://sonatype.popos-sf6.com
       NEXUS_DOCKER_REPOSITORY: docker-hosted
       SEMANTIC_VERSION: ${{ inputs.semantic_version }}
-      SOURCE_IS_TAG: ${{ inputs.source_is_tag }}
       SOURCE_REVISION: ${{ github.sha }}
       SOURCE_URL: https://github.com/${{ github.repository }}
     steps:
@@ -2488,14 +2443,12 @@ jobs:
           username: ${{ secrets.NEXUS_USERNAME }}
 
       - name: Download verified fork release bundles
-        if: ${{ inputs.source_is_tag }}
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           artifact-ids: ${{ needs.fork-attest.outputs.bundle_artifact_id }}
           path: fork-release-bundles
 
       - name: Install pinned GitHub CLI for fork release publication
-        if: ${{ inputs.source_is_tag }}
         id: fork-release-gh-cli
         run: |
           set -eu
@@ -2507,7 +2460,6 @@ jobs:
           printf 'path=%s\n' "$RUNNER_TEMP/pinned-fork-release-gh/bin/gh" >> "$GITHUB_OUTPUT"
 
       - name: Create or validate empty draft recovery release before semantic promotion
-        if: ${{ inputs.source_is_tag }}
         env:
           GH_CLI: ${{ steps.fork-release-gh-cli.outputs.path }}
           GH_TOKEN: ${{ github.token }}
@@ -2733,30 +2685,6 @@ jobs:
             # the observed policy protects the release tag at each semantic-write boundary.
           }
 
-          assert_dispatch_source_binding() {
-            [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
-            [[ "$GITHUB_REF_TYPE" == branch ]]
-            [[ "$GITHUB_REF" == refs/heads/v4.x ]]
-            [[ "$GITHUB_REF_PROTECTED" == true ]]
-            [[ "$GITHUB_SHA" == "$SOURCE_REVISION" ]]
-          }
-
-          assert_release_source_binding() {
-            case "$SOURCE_IS_TAG" in
-              true)
-                assert_live_fork_tag_binding
-                assert_active_fork_tag_protection
-                ;;
-              false)
-                assert_dispatch_source_binding
-                ;;
-              *)
-                printf 'Fork publication source_is_tag must be a boolean.\n' >&2
-                return 1
-                ;;
-            esac
-          }
-
           digest_or_absent() {
             local reference=$1 error_file digest
             error_file="$(mktemp "$RUNNER_TEMP/coolify-fork-final-read.XXXXXX")"
@@ -2807,10 +2735,11 @@ jobs:
 
           verify_exact_index "$MAIN_TARGET" "$MAIN_INDEX_DIGEST" "$MAIN_AMD64_DIGEST" "$MAIN_ARM64_DIGEST"
 
-          # The GitHub tag path additionally revalidates the live tag and its
-          # protection rules. Protected-v4.x workflow_dispatch is a direct registry
-          # publication path and binds its exact SHA in the caller before this job.
-          # In both cases, every public alias is pinned to this immutable digest.
+          # The recovery draft remains unpublished until the single semantic image
+          # tag and its live GitHub source tag have both been revalidated. The shared
+          # ALLOW policy is fixed infrastructure; signed release assets and deployments
+          # use the immutable digest, while this convenience tag is checked before and
+          # after promotion and may accept only the same digest on observed reruns.
           preflight_semantic_tag() {
             local repository=$1 expected_index_digest=$2 existing
             existing="$(digest_or_absent "$repository:$SEMANTIC_VERSION")"
@@ -2935,15 +2864,16 @@ jobs:
           preflight_canonical_tags "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"
           preflight_latest_tag "$MAIN_INDEX_DIGEST"
 
-          assert_release_source_binding
+          assert_live_fork_tag_binding
+          assert_active_fork_tag_protection
 
           promote_or_verify_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"
           promote_and_verify_canonical_tags "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"
           verify_exact_index "$MAIN_TARGET" "$MAIN_INDEX_DIGEST" "$MAIN_AMD64_DIGEST" "$MAIN_ARM64_DIGEST"
-          assert_release_source_binding
+          assert_live_fork_tag_binding
+          assert_active_fork_tag_protection
 
       - name: Publish immutable signed fork bundles to the tag release
-        if: ${{ inputs.source_is_tag }}
         env:
           GH_CLI: ${{ steps.fork-release-gh-cli.outputs.path }}
           GH_TOKEN: ${{ github.token }}
@@ -3119,38 +3049,9 @@ jobs:
           assert_release_tag_targets_source_revision
 
       - id: references
-        name: Record verified direct fork registry evidence
+        name: Record immutable fork image references
         run: |
-          set -Eeuo pipefail
-          for tag in \
-            "$MAIN_TARGET:$SEMANTIC_VERSION" \
-            "$FORK_LATEST_TAG" \
-            "$FORK_VERSION_TAG" \
-            "$FORK_VERSION_SHA_TAG"; do
-            [[ "$(regctl image digest "$tag")" == "$MAIN_INDEX_DIGEST" ]]
-            [[ "$(regctl image digest "$tag" --platform linux/amd64)" == "$MAIN_AMD64_DIGEST" ]]
-            [[ "$(regctl image digest "$tag" --platform linux/arm64)" == "$MAIN_ARM64_DIGEST" ]]
-          done
-          {
-            printf '### Verified fork registry publication\n\n'
-            printf '| Reference | Digest |\n'
-            printf '| --- | --- |\n'
-            for tag in \
-              "$MAIN_TARGET:$SEMANTIC_VERSION" \
-              "$FORK_LATEST_TAG" \
-              "$FORK_VERSION_TAG" \
-              "$FORK_VERSION_SHA_TAG"; do
-              # shellcheck disable=SC2016 # Backticks intentionally format Markdown.
-              printf '| `%s` | `%s` |\n' "$tag" "$MAIN_INDEX_DIGEST"
-            done
-            # shellcheck disable=SC2016 # Backticks intentionally format Markdown.
-            printf '\nSource: `%s` at `%s` (tag source: `%s`).\n' \
-              "$GITHUB_REF" "$SOURCE_REVISION" "$SOURCE_IS_TAG"
-          } >> "$GITHUB_STEP_SUMMARY"
+          set -eu
           {
             printf 'main_image=%s@%s\n' "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"
-            printf 'main_digest=%s\n' "$MAIN_INDEX_DIGEST"
-            printf 'fork_latest_tag=%s\n' "$FORK_LATEST_TAG"
-            printf 'fork_version_tag=%s\n' "$FORK_VERSION_TAG"
-            printf 'fork_version_sha_tag=%s\n' "$FORK_VERSION_SHA_TAG"
           } >> "$GITHUB_OUTPUT"
