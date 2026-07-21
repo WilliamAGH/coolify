@@ -31,12 +31,11 @@ printf '%s\n' \
     'SCHEDULER_ENABLED=false' \
     'TERMINAL_ENABLED=true' \
     > "$runtime_env"
-chmod 0644 "$runtime_env"
+chmod 0444 "$runtime_env"
 
 docker image inspect "$image" >/dev/null || fail 'the exact production image is absent'
 
-docker run --detach --pull never --name "$container" \
-    --mount "type=bind,source=${runtime_env},target=/var/www/html/.env,readonly" \
+docker create --pull never --name "$container" \
     --env APP_DEBUG=false \
     --env APP_ENV=staging \
     --env APP_KEY=base64:8VEfVNVkXQ9mH2L33WBWNMF4eQ0BWD5CTzB8mIxcl+k= \
@@ -67,6 +66,10 @@ docker run --detach --pull never --name "$container" \
     --env TERMINAL_BACKEND_PORT=6002 \
     --env TERMINAL_ENABLED=true \
     "$image" >/dev/null
+docker cp "$runtime_env" "${container}:/var/www/html/.env" \
+    || fail 'the runtime environment could not be copied through the Docker API'
+docker start "$container" >/dev/null \
+    || fail 'the production image could not be started after runtime environment injection'
 
 attempt=0
 until docker exec "$container" curl --fail --silent --show-error http://127.0.0.1:6001/up >/dev/null \
