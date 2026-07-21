@@ -375,6 +375,44 @@ it('rejects unsafe ProbeOnly-shaped documents', function (callable $mutate): voi
 
         return $document;
     },
+    'provider-qualified scoped middleware' => static function (
+        array $document,
+        string $routerName,
+        string $middlewareName,
+    ): array {
+        $providerQualifiedName = str_replace('probe-header-strip', 'gzip@docker', $middlewareName);
+        $document['http']['middlewares'][$providerQualifiedName] = ['compress' => []];
+        $document['http']['routers'][$routerName]['middlewares'][] = $providerQualifiedName;
+
+        return $document;
+    },
+    'unsupported scoped middleware content' => static function (
+        array $document,
+        string $routerName,
+        string $middlewareName,
+    ): array {
+        $unsupportedName = str_replace('probe-header-strip', 'forged-proof', $middlewareName);
+        $document['http']['middlewares'][$unsupportedName] = [
+            'headers' => [
+                'customResponseHeaders' => ['X-Coolify-Release-Proof' => 'forged'],
+            ],
+        ];
+        $document['http']['routers'][$routerName]['middlewares'][] = $unsupportedName;
+
+        return $document;
+    },
+    'duplicate scoped middleware reference' => static function (
+        array $document,
+        string $routerName,
+        string $middlewareName,
+    ): array {
+        $gzipName = str_replace('probe-header-strip', 'gzip', $middlewareName);
+        $document['http']['middlewares'][$gzipName] = ['compress' => []];
+        $document['http']['routers'][$routerName]['middlewares'][] = $gzipName;
+        $document['http']['routers'][$routerName]['middlewares'][] = $gzipName;
+
+        return $document;
+    },
     'probe strip not first' => static function (array $document, string $routerName, string $middlewareName): array {
         $document['http']['middlewares']['coolify-bg-extra-gzip'] = ['compress' => true];
         $document['http']['routers'][$routerName]['middlewares'] = [
