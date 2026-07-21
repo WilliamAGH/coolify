@@ -663,7 +663,6 @@ class WriteBlueGreenProxyConfiguration
             || ! array_is_list($routerMiddlewares)
             || $routerMiddlewares === []
             || ($routerMiddlewares[0] ?? null) !== $probeMiddlewareName
-            || count($routerMiddlewares) !== count(array_unique($routerMiddlewares, SORT_STRING))
             || array_diff(array_keys($router), ['rule', 'entryPoints', 'service', 'middlewares', 'tls']) !== []) {
             return false;
         }

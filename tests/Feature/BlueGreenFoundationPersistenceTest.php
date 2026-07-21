@@ -17,7 +17,7 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 
 uses(RefreshDatabase::class);
 
-it('keeps blue-green member discovery labels free of persistent Traefik health checks', function (): void {
+it('keeps blue-green member discovery labels free of persistent Traefik health checks', function (BlueGreenDeploymentColor $color): void {
     $application = new Application([
         'uuid' => 'blue-green-member-labels',
         'health_check_enabled' => true,
@@ -33,7 +33,6 @@ it('keeps blue-green member discovery labels free of persistent Traefik health c
     ]);
 
     $destinationId = 1;
-    $color = BlueGreenDeploymentColor::BLUE;
     $labels = generateBlueGreenApplicationContainerLabels(
         $application,
         destinationId: $destinationId,
@@ -55,15 +54,34 @@ it('keeps blue-green member discovery labels free of persistent Traefik health c
         8080,
         true,
     );
+    $webDiscoveryRouter = BlueGreenRoutingTarget::memberDiscoveryRouterNameForPort(
+        (string) $application->uuid,
+        $destinationId,
+        $color,
+        3000,
+        true,
+    );
+    $metricsDiscoveryRouter = BlueGreenRoutingTarget::memberDiscoveryRouterNameForPort(
+        (string) $application->uuid,
+        $destinationId,
+        $color,
+        8080,
+        true,
+    );
 
     expect($labels)
         ->toContain('traefik.enable=true')
         ->toContain("traefik.http.services.{$webService}.loadbalancer.server.port=3000")
         ->toContain("traefik.http.services.{$metricsService}.loadbalancer.server.port=8080")
+        ->toContain("traefik.http.routers.{$webDiscoveryRouter}.service=noop@internal")
+        ->toContain("traefik.http.routers.{$metricsDiscoveryRouter}.service=noop@internal")
         ->and(collect($labels)->filter(
             static fn (string $label): bool => str_contains($label, '.loadbalancer.healthcheck.'),
         ))->toBeEmpty();
-});
+})->with([
+    'blue member' => BlueGreenDeploymentColor::BLUE,
+    'green member' => BlueGreenDeploymentColor::GREEN,
+]);
 
 it('canonically serializes immutable backend port inventories and rejects byte drift', function () {
     $inventory = BlueGreenBackendPortInventory::fromPorts([8080, 3000]);
@@ -76,72 +94,6 @@ it('canonically serializes immutable backend port inventories and rejects byte d
     expect(fn () => BlueGreenBackendPortInventory::fromSerialized('{"ports":[3000,8080],"version":1}'))
         ->toThrow(BlueGreenDeploymentTransitionException::class, 'non-canonical');
 });
-
-it('keeps health checks out of blue-green Docker-provider labels', function (BlueGreenDeploymentColor $color) {
-    $application = new Application;
-    $application->uuid = 'blue-green-health-check-labels';
-    $application->health_check_enabled = true;
-    $application->health_check_type = 'http';
-    $application->health_check_path = '/healthz';
-    $application->health_check_host = 'health.example.test';
-    $application->health_check_method = 'HEAD';
-    $application->health_check_return_code = 204;
-    $application->health_check_scheme = 'https';
-    $application->health_check_interval = 7;
-    $application->health_check_timeout = 3;
-    $application->health_check_port = 9443;
-
-    $labels = generateBlueGreenApplicationContainerLabels(
-        application: $application,
-        destinationId: 42,
-        color: $color,
-        routingRevision: 7,
-        backendPorts: [3000, 8080],
-    );
-    $webService = BlueGreenRoutingTarget::memberServiceNameForPort(
-        (string) $application->uuid,
-        42,
-        $color,
-        3000,
-        true,
-    );
-    $metricsService = BlueGreenRoutingTarget::memberServiceNameForPort(
-        (string) $application->uuid,
-        42,
-        $color,
-        8080,
-        true,
-    );
-    $webDiscoveryRouter = BlueGreenRoutingTarget::memberDiscoveryRouterNameForPort(
-        (string) $application->uuid,
-        42,
-        $color,
-        3000,
-        true,
-    );
-    $metricsDiscoveryRouter = BlueGreenRoutingTarget::memberDiscoveryRouterNameForPort(
-        (string) $application->uuid,
-        42,
-        $color,
-        8080,
-        true,
-    );
-
-    expect($labels)->toContain(
-        "traefik.http.services.{$webService}.loadbalancer.server.port=3000",
-        "traefik.http.services.{$metricsService}.loadbalancer.server.port=8080",
-        "traefik.http.routers.{$webDiscoveryRouter}.service=noop@internal",
-        "traefik.http.routers.{$metricsDiscoveryRouter}.service=noop@internal",
-    );
-
-    expect(array_filter(
-        $labels,
-        static fn (string $label): bool => str_contains($label, '.loadbalancer.healthcheck.'),
-    ))->toBe([]);
-})->with([
-    'blue member' => BlueGreenDeploymentColor::BLUE,
-    'green member' => BlueGreenDeploymentColor::GREEN,
-]);
 
 it('persists the typed blue-green foundation and queue provenance', function () {
     $team = Team::factory()->create();
