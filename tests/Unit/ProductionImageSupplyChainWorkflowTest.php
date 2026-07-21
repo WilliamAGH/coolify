@@ -736,7 +736,7 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
         ! str_ends_with((string) ($blueGreenLifecycleJob['env']['DB_DATABASE'] ?? ''), '_testing')) {
         $violations[] = 'PostgreSQL lifecycle validation must explicitly confirm isolated loopback test services';
     }
-    $requiredJobs = [...$genericJobs, 'fork-deploy', 'testing-host-runtime'];
+    $requiredJobs = [...$genericJobs, 'fork-deploy', 'source-identity', 'testing-host-runtime'];
     $requiredNeeds = releaseWorkflowNeeds($applicationJobs['required'] ?? []);
     sort($requiredJobs);
     sort($requiredNeeds);
@@ -750,9 +750,11 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
         $applicationJobs['required'] ?? [],
         'Require every generic validation job',
     );
-    if (($requiredStep['env']['TESTING_HOST_RUNTIME_RESULT'] ?? null) !== '${{ needs.testing-host-runtime.result }}' ||
+    if (($requiredStep['env']['SOURCE_IDENTITY_RESULT'] ?? null) !== '${{ needs.source-identity.result }}' ||
+        ($requiredStep['env']['TESTING_HOST_RUNTIME_RESULT'] ?? null) !== '${{ needs.testing-host-runtime.result }}' ||
         ($requiredStep['env']['EVENT_NAME'] ?? null) !== '${{ github.event_name }}' ||
         ($requiredStep['env']['VALIDATION_SOURCE_SHA'] ?? null) !== '${{ inputs.source_sha }}' ||
+        ! str_contains((string) ($requiredStep['run'] ?? ''), '"$SOURCE_IDENTITY_RESULT"') ||
         ! str_contains((string) ($requiredStep['run'] ?? ''), '[[ "$EVENT_NAME" == pull_request || -n "$VALIDATION_SOURCE_SHA" ]]') ||
         ! str_contains((string) ($requiredStep['run'] ?? ''), '[[ "$TESTING_HOST_RUNTIME_RESULT" == success ]]') ||
         ! str_contains((string) ($requiredStep['run'] ?? ''), '[[ "$TESTING_HOST_RUNTIME_RESULT" == skipped ]]')) {
@@ -1799,6 +1801,24 @@ it('rejects renaming the protected branch application validation status context'
 
     expect(releaseFoundationWorkflowViolations($sharedWorkflow, $applicationValidationWorkflow, $callers))
         ->toContain('application validation must preserve the protected branch status context');
+});
+
+it('rejects an application validation aggregate that omits exact source identity', function (): void {
+    $root = releaseWorkflowRepositoryRoot();
+    $sharedWorkflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $applicationValidationWorkflow = Yaml::parseFile($root.'/.github/workflows/application-validation.yml');
+    $callers = [
+        'production' => Yaml::parseFile($root.'/.github/workflows/coolify-production-build.yml'),
+        'testing-host' => Yaml::parseFile($root.'/.github/workflows/coolify-testing-host.yml'),
+        'staging' => Yaml::parseFile($root.'/.github/workflows/coolify-staging-build.yml'),
+    ];
+    $applicationValidationWorkflow['jobs']['required']['needs'] = array_values(array_filter(
+        $applicationValidationWorkflow['jobs']['required']['needs'],
+        fn (string $job): bool => $job !== 'source-identity',
+    ));
+
+    expect(releaseFoundationWorkflowViolations($sharedWorkflow, $applicationValidationWorkflow, $callers))
+        ->toContain('release foundation validation must require every owned job');
 });
 
 it('rejects a testing-host authorization job without a canonical source gate', function () {
