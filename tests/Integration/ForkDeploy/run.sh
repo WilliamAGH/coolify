@@ -556,7 +556,10 @@ test_real_compose_config_when_available() {
             ([.services.coolify.volumes[]
                 | select(.target == "/var/www/html/.env"
                     and .source == "/data/coolify/source/.env")] | length) == 1
-            and .services.coolify.env_file == [{"path": "/data/coolify/source/.env"}]
+            and (.services.coolify.env_file | length) == 1
+            and ((.services.coolify.env_file[0]
+                | if type == "object" then .path else . end)
+                == "/data/coolify/source/.env")
         ' <<<"$output" >/dev/null; then
         pass 'real production Compose preserves the generic environment default'
     else
