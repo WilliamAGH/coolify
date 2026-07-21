@@ -4,9 +4,9 @@ namespace App\Actions\Application\BlueGreen;
 
 use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
-use App\Enums\BlueGreenDeploymentColor;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
+use App\Models\ApplicationBlueGreenReplica;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\StandaloneDocker;
 use Lorisleiva\Actions\Concerns\AsAction;
@@ -47,33 +47,43 @@ final class ResolveBlueGreenExpectedProxyState
             throw new BlueGreenDeploymentTransitionException('The durable destination fence state is partial.');
         }
 
-        $activeColor = $state->active_color;
-        $activeDeploymentUuid = match ($activeColor) {
-            BlueGreenDeploymentColor::BLUE => $state->blue_deployment_uuid,
-            BlueGreenDeploymentColor::GREEN => $state->green_deployment_uuid,
-            null => null,
-        };
+        $activeColor = null;
+        $activeDeploymentUuid = null;
         $activeContainerName = null;
         $activeContainerId = null;
         if ($state->managed_file_sha256 !== null) {
-            if ($activeColor === null || ! is_string($activeDeploymentUuid) || $activeDeploymentUuid === '') {
-                throw new BlueGreenDeploymentTransitionException('The managed route has no durable active deployment identity.');
-            }
+            $deploymentUuids = collect([
+                $state->blue_deployment_uuid,
+                $state->green_deployment_uuid,
+                $state->operation_previous_deployment_uuid,
+                $state->operation_deployment_uuid,
+            ])->filter(fn (mixed $uuid): bool => is_string($uuid) && $uuid !== '')->unique()->values();
             $activeDeployments = ApplicationDeploymentQueue::query()
-                ->where('deployment_uuid', $activeDeploymentUuid)
+                ->whereIn('deployment_uuid', $deploymentUuids)
                 ->get()
                 ->keyBy('deployment_uuid');
+            $replicas = ApplicationBlueGreenReplica::query()
+                ->whereIn('deployment_uuid', $deploymentUuids)
+                ->orderBy('replica_index')
+                ->get()
+                ->groupBy('deployment_uuid');
             $resolution = (new ResolveActiveApplicationContainer)->resolveRoutedState(
                 $application,
                 $state,
                 $activeDeployments,
+                $replicas,
             );
-            if ($resolution === null || ! $resolution->observable || $resolution->deploymentUuid !== $activeDeploymentUuid) {
+            if ($resolution === null
+                || ! $resolution->observable
+                || $resolution->color === null
+                || ! is_string($resolution->deploymentUuid)) {
                 throw new BlueGreenDeploymentTransitionException('The active deployment provenance does not match durable destination routing state.');
             }
+            $activeColor = $resolution->color;
+            $activeDeploymentUuid = $resolution->deploymentUuid;
             $activeContainerName = $application->uuid.'-'.$activeColor->value;
             $activeContainerId = $resolution->containerId;
-        } elseif ($activeColor !== null || $activeDeploymentUuid !== null) {
+        } elseif ($state->active_color !== null) {
             throw new BlueGreenDeploymentTransitionException('Durable DB state names an active route while the managed file is absent.');
         }
 

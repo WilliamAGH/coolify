@@ -3077,6 +3077,127 @@
                 ]
             }
         },
+        "\/applications\/{uuid}\/active-container": {
+            "get": {
+                "tags": [
+                    "Applications"
+                ],
+                "summary": "Get active application container",
+                "description": "Get the exact image and status of the routed application container.",
+                "operationId": "get-active-application-container",
+                "parameters": [
+                    {
+                        "name": "uuid",
+                        "in": "path",
+                        "description": "UUID of the application.",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "The exact routed application container state.",
+                        "content": {
+                            "application\/json": {
+                                "schema": {
+                                    "required": [
+                                        "image",
+                                        "source",
+                                        "status",
+                                        "provenance"
+                                    ],
+                                    "properties": {
+                                        "image": {
+                                            "type": "string"
+                                        },
+                                        "source": {
+                                            "type": "string"
+                                        },
+                                        "status": {
+                                            "type": "string"
+                                        },
+                                        "provenance": {
+                                            "required": [
+                                                "kind",
+                                                "destination"
+                                            ],
+                                            "properties": {
+                                                "kind": {
+                                                    "type": "string",
+                                                    "example": "live-container-inspection"
+                                                },
+                                                "destination": {
+                                                    "type": "array",
+                                                    "items": {
+                                                        "required": [
+                                                            "destination_id",
+                                                            "deployment_uuid",
+                                                            "color",
+                                                            "routing_revision",
+                                                            "container_ids"
+                                                        ],
+                                                        "properties": {
+                                                            "destination_id": {
+                                                                "type": "integer"
+                                                            },
+                                                            "deployment_uuid": {
+                                                                "type": "string"
+                                                            },
+                                                            "color": {
+                                                                "type": [
+                                                                    "string",
+                                                                    "null"
+                                                                ],
+                                                                "enum": [
+                                                                    "blue",
+                                                                    "green",
+                                                                    null
+                                                                ]
+                                                            },
+                                                            "routing_revision": {
+                                                                "type": [
+                                                                    "integer",
+                                                                    "null"
+                                                                ]
+                                                            },
+                                                            "container_ids": {
+                                                                "type": "array",
+                                                                "items": {
+                                                                    "type": "string"
+                                                                }
+                                                            }
+                                                        },
+                                                        "type": "object"
+                                                    }
+                                                }
+                                            },
+                                            "type": "object"
+                                        }
+                                    },
+                                    "type": "object"
+                                }
+                            }
+                        }
+                    },
+                    "401": {
+                        "$ref": "#\/components\/responses\/401"
+                    },
+                    "404": {
+                        "$ref": "#\/components\/responses\/404"
+                    },
+                    "409": {
+                        "description": "No exact active application container image is observable."
+                    }
+                },
+                "security": [
+                    {
+                        "bearerAuth": []
+                    }
+                ]
+            }
+        },
         "\/applications\/{uuid}\/logs": {
             "get": {
                 "tags": [
@@ -16159,6 +16280,54 @@
                     },
                     "commit_message": {
                         "type": "string"
+                    },
+                    "blue_green_color": {
+                        "type": "string",
+                        "nullable": true
+                    },
+                    "blue_green_phase": {
+                        "type": "string",
+                        "nullable": true
+                    },
+                    "blue_green_routing_revision": {
+                        "type": "integer",
+                        "nullable": true
+                    },
+                    "blue_green_destination_fence_epoch": {
+                        "type": "integer",
+                        "nullable": true
+                    },
+                    "blue_green_server_boot_id": {
+                        "type": "string",
+                        "nullable": true
+                    },
+                    "blue_green_topology_digest": {
+                        "type": "string",
+                        "nullable": true
+                    },
+                    "blue_green_routing_config_digest": {
+                        "type": "string",
+                        "nullable": true
+                    },
+                    "blue_green_backend_port_inventory": {
+                        "type": "string",
+                        "nullable": true
+                    },
+                    "blue_green_drain_backend_port_inventory": {
+                        "type": "string",
+                        "nullable": true
+                    },
+                    "blue_green_supersession_generation": {
+                        "type": "integer",
+                        "nullable": true
+                    },
+                    "blue_green_fleet_deployment_uuid": {
+                        "type": "string",
+                        "nullable": true
+                    },
+                    "blue_green_fleet_status": {
+                        "type": "string",
+                        "nullable": true
                     }
                 },
                 "type": "object"
@@ -16276,6 +16445,15 @@
                     "stop_grace_period": {
                         "type": "integer",
                         "nullable": true
+                    },
+                    "blue_green_inactive_retention_seconds": {
+                        "type": "integer"
+                    },
+                    "blue_green_replica_count": {
+                        "type": "integer"
+                    },
+                    "is_blue_green_deployment_enabled": {
+                        "type": "boolean"
                     }
                 },
                 "type": "object"

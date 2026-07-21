@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Actions\Application\BlueGreen\ResolveActiveApplicationContainerState;
 use App\Actions\Application\CleanupPreviewDeployment;
 use App\Actions\Application\LoadComposeFile;
 use App\Actions\Application\StopApplication;
@@ -2282,6 +2283,117 @@ class ApplicationsController extends Controller
         $this->authorize('view', $application);
 
         return response()->json($this->removeSensitiveData($application));
+    }
+
+    #[OA\Get(
+        summary: 'Get active application container',
+        description: 'Get the exact image and status of the routed application container.',
+        path: '/applications/{uuid}/active-container',
+        operationId: 'get-active-application-container',
+        security: [
+            ['bearerAuth' => []],
+        ],
+        tags: ['Applications'],
+        parameters: [
+            new OA\Parameter(
+                name: 'uuid',
+                in: 'path',
+                description: 'UUID of the application.',
+                required: true,
+                schema: new OA\Schema(type: 'string'),
+            ),
+        ],
+        responses: [
+            new OA\Response(
+                response: 200,
+                description: 'The exact routed application container state.',
+                content: new OA\JsonContent(
+                    required: ['image', 'source', 'status', 'provenance'],
+                    properties: [
+                        new OA\Property(property: 'image', type: 'string'),
+                        new OA\Property(property: 'source', type: 'string'),
+                        new OA\Property(property: 'status', type: 'string'),
+                        new OA\Property(
+                            property: 'provenance',
+                            required: ['kind', 'destination'],
+                            properties: [
+                                new OA\Property(property: 'kind', type: 'string', example: 'live-container-inspection'),
+                                new OA\Property(
+                                    property: 'destination',
+                                    type: 'array',
+                                    items: new OA\Items(
+                                        required: [
+                                            'destination_id',
+                                            'deployment_uuid',
+                                            'color',
+                                            'routing_revision',
+                                            'container_ids',
+                                        ],
+                                        properties: [
+                                            new OA\Property(property: 'destination_id', type: 'integer'),
+                                            new OA\Property(property: 'deployment_uuid', type: 'string'),
+                                            new OA\Property(
+                                                property: 'color',
+                                                type: 'string',
+                                                enum: ['blue', 'green', null],
+                                                nullable: true,
+                                            ),
+                                            new OA\Property(property: 'routing_revision', type: 'integer', nullable: true),
+                                            new OA\Property(
+                                                property: 'container_ids',
+                                                type: 'array',
+                                                items: new OA\Items(type: 'string'),
+                                            ),
+                                        ],
+                                        type: 'object',
+                                    ),
+                                ),
+                            ],
+                            type: 'object',
+                        ),
+                    ],
+                    type: 'object',
+                ),
+            ),
+            new OA\Response(response: 401, ref: '#/components/responses/401'),
+            new OA\Response(response: 404, ref: '#/components/responses/404'),
+            new OA\Response(
+                response: 409,
+                description: 'No exact active application container image is observable.',
+            ),
+        ],
+    )]
+    public function active_container(
+        Request $request,
+        ResolveActiveApplicationContainerState $stateResolver,
+    ): JsonResponse {
+        $teamId = getTeamIdFromToken();
+        if (is_null($teamId)) {
+            return invalidTokenResponse();
+        }
+        $application = Application::ownedByCurrentTeamAPI($teamId)
+            ->where('uuid', $request->route('uuid'))
+            ->first();
+        if (! $application) {
+            return response()->json(['message' => 'Application not found.'], 404);
+        }
+        $this->authorize('view', $application);
+        $activeContainer = $stateResolver->handle($application);
+        if ($activeContainer === null) {
+            return response()->json([
+                'message' => 'Active application container state is not observable.',
+            ], 409);
+        }
+
+        return response()->json([
+            'image' => $activeContainer->image,
+            'source' => $application->build_pack,
+            'status' => $activeContainer->status,
+            'provenance' => [
+                'kind' => 'live-container-inspection',
+                'destination' => $activeContainer->destination,
+            ],
+        ]);
     }
 
     #[OA\Get(
