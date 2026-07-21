@@ -100,6 +100,7 @@ new_fixture() {
         FORK_DEPLOY_APP_DUAL_STACK FORK_DEPLOY_COMPOSE_APP_LOOPBACK \
         FORK_DEPLOY_COMPOSE_OMIT_APP_HOST_IP \
         FORK_DEPLOY_COMPOSE_SWAP_BINDINGS \
+        FORK_DEPLOY_REQUIRE_COMPOSE_ENV_PATH \
         FORK_DEPLOY_DOCKER_UNAVAILABLE \
         FORK_DEPLOY_FAIL_CANDIDATE_RUNTIME_VERIFY \
         FORK_DEPLOY_FAIL_LEGACY_RUNTIME_VERIFY \
@@ -615,6 +616,18 @@ test_install_records_signed_immutable_bundle() {
         pass 'install records a signed immutable release bundle'
     else
         fail 'install records a signed immutable release bundle'
+    fi
+    cleanup_fixture
+}
+
+test_fresh_install_selects_staged_compose_environment() {
+    new_fixture
+    write_manifest 4.13.0-fork.1
+    export FORK_DEPLOY_REQUIRE_COMPOSE_ENV_PATH=true
+    if install_release >/dev/null; then
+        pass 'fresh install selects the staged Compose environment before activation'
+    else
+        fail 'fresh install selects the staged Compose environment before activation'
     fi
     cleanup_fixture
 }
@@ -2134,6 +2147,13 @@ if [[ ${FORK_DEPLOY_TEST_FILTER:-} == control-plane-listener ]]; then
     exit
 fi
 
+if [[ ${FORK_DEPLOY_TEST_FILTER:-} == fresh-staging-env ]]; then
+    test_fresh_install_selects_staged_compose_environment
+    printf '%s passing, %s failing\n' "$PASS" "$FAIL"
+    ((FAIL == 0))
+    exit
+fi
+
 test_rejects_untrusted_caller_inputs
 test_uses_migrated_github_raw_base
 test_install_and_update_are_self_contained
@@ -2147,6 +2167,7 @@ test_dry_run_is_non_mutating
 test_status_does_not_mutate_authorized_keys
 test_trust_is_production_only_without_deployment_preflight
 test_install_records_signed_immutable_bundle
+test_fresh_install_selects_staged_compose_environment
 test_install_accepts_bare_fork_version_convention
 test_install_rejects_zero_historical_suffix
 test_accepts_real_ed25519_raw_signature

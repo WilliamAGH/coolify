@@ -3,7 +3,7 @@ services:
     image: "${REGISTRY_URL:-ghcr.io}/coollabsio/coolify:${LATEST_IMAGE:-latest}"
     volumes:
       - type: bind
-        source: /data/coolify/source/.env
+        source: "${COOLIFY_ENV_FILE:-/data/coolify/source/.env}"
         target: /var/www/html/.env
         read_only: true
       - /data/coolify/ssh:/var/www/html/storage/app/ssh
@@ -23,7 +23,7 @@ services:
       - PUSHER_BACKEND_PORT=${PUSHER_BACKEND_PORT:-6001}
       - TERMINAL_BACKEND_PORT=${TERMINAL_BACKEND_PORT:-6002}
     env_file:
-      - /data/coolify/source/.env
+      - "${COOLIFY_ENV_FILE:-/data/coolify/source/.env}"
     ports:
       - "${APP_PORT:-8000}:8080"
       - "${PUSHER_PORT:-${SOKETI_PORT:-6001}}:6001"

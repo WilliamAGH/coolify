@@ -56,6 +56,19 @@ compose_uses_legacy_current() {
     [[ $environment == "${FORK_DEPLOY_ACTIVE_SOURCE:-/nonexistent}/.env" ]]
 }
 
+compose_uses_selected_environment() {
+    local argument previous='' environment=''
+
+    for argument in "$@"; do
+        if [[ $previous == --env-file ]]; then
+            environment=$argument
+            break
+        fi
+        [[ $argument == --env-file ]] && previous=--env-file
+    done
+    [[ -n $environment && ${COOLIFY_ENV_FILE:-} == "$environment" ]]
+}
+
 legacy_runtime_is_active() {
     [[ ${FORK_DEPLOY_LEGACY_CURRENT:-false} == true \
         && ! -e ${FORK_DEPLOY_CANDIDATE_STARTED_MARKER:-/nonexistent} ]]
@@ -113,6 +126,10 @@ case $name in
                 if [[ ${2:-} == version ]]; then
                     if [[ ${3:-} == --short ]]; then printf '%s\n' "${FORK_DEPLOY_COMPOSE_VERSION:-v2.24.4}"; fi
                     exit 0
+                fi
+                if [[ ${FORK_DEPLOY_REQUIRE_COMPOSE_ENV_PATH:-false} == true ]] \
+                    && ! compose_uses_selected_environment "$@"; then
+                    exit 1
                 fi
                 listener_override_active=false
                 if compose_uses_control_plane_listener_override "$@"; then
