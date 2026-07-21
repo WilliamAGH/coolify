@@ -9,10 +9,12 @@ use App\Actions\Application\BlueGreen\MarkBlueGreenRecoveryInterventionRequired;
 use App\Actions\Application\BlueGreen\ReconcileBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\ReconcileBlueGreenDeployments;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifactReader;
+use App\Enums\ApplicationDeploymentExecutionPhase;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
+use App\Jobs\ActivateApplicationDeploymentJob;
 use App\Jobs\ResumeBlueGreenDrainingDeploymentJob;
 use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationDeploymentQueue;
@@ -21,10 +23,12 @@ use App\Notifications\Application\BlueGreenDeploymentRolledBack;
 use App\Notifications\Application\BlueGreenInterventionRequired;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Notification;
 use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Str;
 use Laravel\Horizon\Contracts\JobRepository;
 use Tests\Support\BlueGreenRecoveryScenario;
 
@@ -39,6 +43,43 @@ function blueGreenReconciliationMakeQueueStale(ApplicationDeploymentQueue $deplo
     DB::table('application_deployment_queues')
         ->where('id', $deployment->id)
         ->update(['updated_at' => now()->subMinutes(10)]);
+}
+
+/**
+ * @return array{deployment: ApplicationDeploymentQueue, activationAttemptUuid: string, payload: array<string, mixed>}
+ */
+function blueGreenReconciliationPrepareActivation(BlueGreenRecoveryScenario $scenario): array
+{
+    $deployment = $scenario->deployment->fresh()
+        ?? throw new RuntimeException('The blue-green recovery deployment disappeared before activation handoff.');
+    $preparationAttemptUuid = (string) Str::uuid();
+    $preparationWorker = 'blue-green-reconciliation-preparation-worker';
+    $deployment->update([
+        'execution_phase' => ApplicationDeploymentExecutionPhase::Prepare,
+        'horizon_job_id' => $preparationAttemptUuid,
+        'horizon_job_worker' => null,
+        'current_process_id' => null,
+    ]);
+    $deployment->refresh();
+
+    expect($deployment->acquireDispatchExecution($preparationAttemptUuid, $preparationWorker))->toBeTrue();
+
+    $payload = $deployment->makePreparedActivationPayload([]);
+    $activationAttemptUuid = $deployment->handoffToActivation(
+        $preparationAttemptUuid,
+        $preparationWorker,
+        $payload,
+    );
+
+    expect($activationAttemptUuid)->toBeString()
+        ->and(Str::isUuid($activationAttemptUuid))->toBeTrue();
+
+    return [
+        'deployment' => $deployment->fresh()
+            ?? throw new RuntimeException('The blue-green recovery deployment disappeared after activation handoff.'),
+        'activationAttemptUuid' => $activationAttemptUuid,
+        'payload' => $payload,
+    ];
 }
 
 it('treats stale Horizon execution metadata as advisory', function (string $horizonStatus): void {
@@ -59,10 +100,13 @@ it('treats stale Horizon execution metadata as advisory', function (string $hori
     ))->toBeFalse();
 })->with(['reserved', 'running']);
 
-it('never displaces a live Redis lifecycle owner while reconciling stale queue metadata', function (): void {
+it('defers a stale prepared activation while another lifecycle owner holds the lock', function (): void {
     config()->set('cache.default', 'redis');
-    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: true);
-    blueGreenReconciliationMakeQueueStale($scenario->deployment);
+    Bus::fake();
+    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
+    $preparedActivation = blueGreenReconciliationPrepareActivation($scenario);
+    $deployment = $preparedActivation['deployment'];
+    blueGreenReconciliationMakeQueueStale($deployment);
     $lock = Cache::lock(
         BlueGreenDeploymentLock::key($scenario->application->id, $scenario->destination->id),
         10,
@@ -74,11 +118,101 @@ it('never displaces a live Redis lifecycle owner while reconciling stale queue m
 
         expect($result->outcome)->toBe(BlueGreenReconciliationResult::DEFERRED)
             ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
-            ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+            ->and($deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+            ->and($deployment->fresh()->execution_phase)->toBe(ApplicationDeploymentExecutionPhase::Activate)
+            ->and($deployment->fresh()->horizon_job_id)->toBe($preparedActivation['activationAttemptUuid'])
+            ->and($deployment->fresh()->horizon_job_worker)->toBeNull()
+            ->and($deployment->fresh()->prepared_activation_payload)->toBe($preparedActivation['payload'])
             ->and($lock->isOwnedByCurrentProcess())->toBeTrue();
+        Bus::assertNotDispatched(ActivateApplicationDeploymentJob::class);
     } finally {
         $lock->release();
     }
+});
+
+it('republishes an exact stale prepared activation without rolling back its unmutated owner', function (): void {
+    Bus::fake();
+    BlueGreenProxyRollbackArtifactReader::shouldRun()->once()->andReturnNull();
+    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
+    $preparedActivation = blueGreenReconciliationPrepareActivation($scenario);
+    $deployment = $preparedActivation['deployment'];
+    blueGreenReconciliationMakeQueueStale($deployment);
+
+    $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
+
+    expect($result->outcome)->toBe(BlueGreenReconciliationResult::DEFERRED)
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
+        ->and($scenario->state->fresh()->pending_color)->toBe(BlueGreenDeploymentColor::BLUE)
+        ->and($scenario->state->fresh()->pending_deployment_uuid)->toBe(BlueGreenRecoveryScenario::OPERATION_UUID)
+        ->and($deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+        ->and($deployment->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
+        ->and($deployment->fresh()->execution_phase)->toBe(ApplicationDeploymentExecutionPhase::Activate)
+        ->and($deployment->fresh()->horizon_job_id)->toBe($preparedActivation['activationAttemptUuid'])
+        ->and($deployment->fresh()->horizon_job_worker)->toBeNull()
+        ->and($deployment->fresh()->current_process_id)->toBeNull()
+        ->and($deployment->fresh()->prepared_activation_payload)->toBe($preparedActivation['payload'])
+        ->and($deployment->fresh()->finished_at)->toBeNull();
+    Bus::assertDispatched(
+        ActivateApplicationDeploymentJob::class,
+        fn (ActivateApplicationDeploymentJob $job): bool => $job->application_deployment_queue_id === $deployment->id
+            && $job->dispatch_attempt_uuid === $preparedActivation['activationAttemptUuid'],
+    );
+});
+
+it('rotates a stale prepared activation worker identity before republishing the exact owner', function (): void {
+    Bus::fake();
+    BlueGreenProxyRollbackArtifactReader::shouldRun()->once()->andReturnNull();
+    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
+    $preparedActivation = blueGreenReconciliationPrepareActivation($scenario);
+    $deployment = $preparedActivation['deployment'];
+    $originalActivationAttemptUuid = $preparedActivation['activationAttemptUuid'];
+    $staleWorkerUuid = (string) Str::uuid();
+    $deployment->update(['horizon_job_worker' => $staleWorkerUuid]);
+    blueGreenReconciliationMakeQueueStale($deployment);
+
+    $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
+    $persistedDeployment = $deployment->fresh()
+        ?? throw new RuntimeException('The blue-green recovery deployment disappeared after stale-worker republish.');
+
+    expect($result->outcome)->toBe(BlueGreenReconciliationResult::DEFERRED)
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
+        ->and($persistedDeployment->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+        ->and($persistedDeployment->blue_green_phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
+        ->and($persistedDeployment->execution_phase)->toBe(ApplicationDeploymentExecutionPhase::Activate)
+        ->and($persistedDeployment->horizon_job_id)->toBeString()
+        ->and(Str::isUuid($persistedDeployment->horizon_job_id))->toBeTrue()
+        ->and($persistedDeployment->horizon_job_id)->not->toBe($originalActivationAttemptUuid)
+        ->and($persistedDeployment->horizon_job_worker)->toBeNull()
+        ->and($persistedDeployment->prepared_activation_payload)->toBe($preparedActivation['payload'])
+        ->and($persistedDeployment->finished_at)->toBeNull();
+    Bus::assertDispatched(
+        ActivateApplicationDeploymentJob::class,
+        fn (ActivateApplicationDeploymentJob $job): bool => $job->application_deployment_queue_id === $deployment->id
+            && $job->dispatch_attempt_uuid === $persistedDeployment->horizon_job_id
+            && $job->dispatch_attempt_uuid !== $originalActivationAttemptUuid,
+    );
+});
+
+it('defers a prepared activation whose publication reservation loses its exact owner', function (): void {
+    Bus::fake();
+    BlueGreenProxyRollbackArtifactReader::shouldRun()->once()->andReturnNull();
+    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
+    $preparedActivation = blueGreenReconciliationPrepareActivation($scenario);
+    $deployment = $preparedActivation['deployment'];
+    $deployment->update(['current_process_id' => 'prepared-activation-cas-race']);
+    blueGreenReconciliationMakeQueueStale($deployment);
+
+    $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
+
+    expect($result->outcome)->toBe(BlueGreenReconciliationResult::DEFERRED)
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
+        ->and($deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+        ->and($deployment->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
+        ->and($deployment->fresh()->execution_phase)->toBe(ApplicationDeploymentExecutionPhase::Activate)
+        ->and($deployment->fresh()->horizon_job_id)->toBe($preparedActivation['activationAttemptUuid'])
+        ->and($deployment->fresh()->current_process_id)->toBe('prepared-activation-cas-race')
+        ->and($deployment->fresh()->finished_at)->toBeNull();
+    Bus::assertNotDispatched(ActivateApplicationDeploymentJob::class);
 });
 
 it('defers durable draining states to the dedicated resume job without forward completion', function (): void {
@@ -115,27 +249,31 @@ it('defers durable draining states to the dedicated resume job without forward c
     );
 });
 
-it('atomically marks an unsafe stale preparation as requiring intervention', function (): void {
+it('keeps a routed stale prepared activation on the intervention recovery path', function (): void {
+    Bus::fake();
     Notification::fake();
     $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: true);
+    $preparedActivation = blueGreenReconciliationPrepareActivation($scenario);
+    $deployment = $preparedActivation['deployment'];
     $scenario->application->team()->emailNotificationSettings()->update([
         'use_instance_email_settings' => true,
         'deployment_failure_email_notifications' => true,
     ]);
-    blueGreenReconciliationMakeQueueStale($scenario->deployment);
+    blueGreenReconciliationMakeQueueStale($deployment);
 
     $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
 
     expect($result->outcome)->toBe(BlueGreenReconciliationResult::INTERVENTION_REQUIRED)
         ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
-        ->and($scenario->deployment->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
-        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value)
-        ->and($scenario->deployment->fresh()->finished_at)->not->toBeNull();
+        ->and($deployment->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
+        ->and($deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value)
+        ->and($deployment->fresh()->finished_at)->not->toBeNull();
+    Bus::assertNotDispatched(ActivateApplicationDeploymentJob::class);
 
     $repeat = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
 
     expect($repeat->outcome)->toBe(BlueGreenReconciliationResult::INTERVENTION_REQUIRED)
-        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value);
+        ->and($deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value);
     Notification::assertSentToTimes(
         $scenario->application->team(),
         BlueGreenInterventionRequired::class,

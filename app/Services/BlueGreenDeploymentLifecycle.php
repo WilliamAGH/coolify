@@ -14,6 +14,7 @@ use App\Actions\Application\BlueGreen\BlueGreenLegacyProviderState;
 use App\Actions\Application\BlueGreen\BlueGreenLegacyRoutingSnapshot;
 use App\Actions\Application\BlueGreen\BlueGreenOperationFence;
 use App\Actions\Application\BlueGreen\BlueGreenOperationFenceLostException;
+use App\Actions\Application\BlueGreen\BlueGreenPublicRouteAcknowledgementMismatch;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaInspection;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\CaptureBlueGreenLegacyRouting;
@@ -621,6 +622,22 @@ final class BlueGreenDeploymentLifecycle
         $this->operationFence?->releaseIfOwned();
         $this->operationFence = null;
         $this->lifecycleLock = null;
+    }
+
+    public function releaseForPreparedActivationHandoff(): bool
+    {
+        $operationFence = $this->operationFence;
+        if (! $this->enabled) {
+            return $operationFence === null && $this->lifecycleLock === null;
+        }
+        if ($operationFence === null || ! $operationFence->releaseIfOwned()) {
+            return false;
+        }
+
+        $this->operationFence = null;
+        $this->lifecycleLock = null;
+
+        return true;
     }
 
     private function acquireLifecycleLock(): void
@@ -1858,6 +1875,9 @@ final class BlueGreenDeploymentLifecycle
                     );
                     throw new DeploymentException('Blue-green public verification failed after switch without retry: '.$lastFailure, previous: $exception);
                 }
+                if (! $this->isExpectedInitialProbeRouteAppearance($exception, $expectedPhase)) {
+                    throw new DeploymentException('Blue-green candidate probe verification failed without retry: '.$lastFailure, previous: $exception);
+                }
             }
             if ($attempt < $attempts) {
                 Sleep::for(1)->seconds();
@@ -1865,6 +1885,53 @@ final class BlueGreenDeploymentLifecycle
         }
 
         throw new DeploymentException("Traefik did not acknowledge every canonical blue-green router: {$lastFailure}");
+    }
+
+    private function isExpectedInitialProbeRouteAppearance(
+        Throwable $exception,
+        BlueGreenDeploymentPhase $expectedPhase,
+    ): bool {
+        if (! $exception instanceof BlueGreenPublicRouteAcknowledgementMismatch
+            || $exception->status !== 404
+            || $exception->acknowledgements !== []
+            || $expectedPhase !== BlueGreenDeploymentPhase::PREPARING
+            || $this->previousActiveColor !== null
+            || $this->legacyContainerName !== null
+            || $this->previousContainerExpectation !== null
+            || $this->legacyRoutingSnapshot !== null) {
+            return false;
+        }
+        $claim = $this->claim;
+        if ($claim === null
+            || $claim->previousActiveColor !== null
+            || $claim->legacyContainerName !== null) {
+            return false;
+        }
+
+        return ApplicationBlueGreenDeployment::query()
+            ->whereKey($claim->stateId)
+            ->where('application_id', $claim->applicationId)
+            ->where('standalone_docker_id', $claim->standaloneDockerId)
+            ->where('phase', BlueGreenDeploymentPhase::PREPARING->value)
+            ->where('pending_color', $claim->pendingColor->value)
+            ->where('pending_deployment_uuid', $claim->deploymentUuid)
+            ->where('operation_deployment_uuid', $claim->deploymentUuid)
+            ->where('operation_candidate_container_name', $claim->candidateContainerName)
+            ->where('operation_rollback_managed_filename', $claim->rollbackManagedFilename)
+            ->where('operation_destination_fence_epoch', $claim->destinationFenceEpoch)
+            ->where('operation_server_boot_id', $claim->serverBootId)
+            ->where('operation_topology_digest', $claim->topologyDigest)
+            ->where('operation_routing_config_digest', $claim->routingConfigDigest)
+            ->where('routing_revision', $claim->expectedRoutingRevision)
+            ->where('supersession_generation', $claim->supersessionGeneration)
+            ->whereNull('active_color')
+            ->whereNull('legacy_container_name')
+            ->whereNull('operation_previous_active_color')
+            ->whereNull('operation_previous_deployment_uuid')
+            ->whereNull('operation_previous_routing_revision')
+            ->whereNull('operation_previous_container_name')
+            ->whereNull('operation_previous_container_id')
+            ->exists();
     }
 
     private function monitorPublicHandoff(
@@ -2036,11 +2103,19 @@ final class BlueGreenDeploymentLifecycle
                 }
                 $this->assertOperationOwned(BlueGreenDeploymentPhase::ROLLING_BACK);
                 $this->assertServerBootIdentity();
-                BlueGreenProxyRollbackArtifactRestorer::run($this->server, $rollbackKey, $claim->serverBootId);
-                $rollbackState = $rollbackKey->rollbackState();
+                $currentState = $this->destinationState
+                    ?? throw new DeploymentException('Blue-green rollback has no exact current destination state.');
+                $rollbackState = $this->rollbackStateFromCurrentDestination($rollbackKey, $currentState);
+                (new BlueGreenProxyRollbackArtifactRestorer)->restoreFromCurrentState(
+                    $this->server,
+                    $rollbackKey,
+                    $currentState,
+                    $rollbackState,
+                    $claim->serverBootId,
+                );
                 RecordBlueGreenDestinationState::run(
                     $claim,
-                    $this->destinationState,
+                    $currentState,
                     $rollbackState,
                 );
                 $this->destinationState = $rollbackState;
@@ -2118,6 +2193,24 @@ final class BlueGreenDeploymentLifecycle
                 $cause,
             );
         }
+    }
+
+    private function rollbackStateFromCurrentDestination(
+        BlueGreenProxyRollbackKey $rollbackKey,
+        BlueGreenProxyState $currentState,
+    ): BlueGreenProxyState {
+        $destinationFenceEpoch = $currentState->destinationFenceEpoch + 1;
+        $mutationSequence = $currentState->mutationSequence + 1;
+
+        return $rollbackKey->expectedState?->withDestinationFenceEpoch(
+            $destinationFenceEpoch,
+            $rollbackKey->operationId,
+            $mutationSequence,
+        ) ?? $currentState->withoutManagedRoute(
+            $destinationFenceEpoch,
+            $rollbackKey->operationId,
+            $mutationSequence,
+        );
     }
 
     private function removeCandidateContainer(): void

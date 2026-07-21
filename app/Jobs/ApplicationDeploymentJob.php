@@ -2522,6 +2522,23 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         }
 
         $this->handoffScheduled = true;
+        try {
+            $released = $this->blueGreenLifecycle?->releaseForPreparedActivationHandoff() ?? true;
+        } catch (Throwable $exception) {
+            Log::warning(
+                'Deferred prepared activation publication because the preparation lifecycle lock release could not be confirmed: '
+                .$exception->getMessage(),
+            );
+
+            return true;
+        }
+        if (! $released) {
+            Log::warning(
+                'Deferred prepared activation publication because the preparation lifecycle lock release was not confirmed.',
+            );
+
+            return true;
+        }
         $activationDeployment = $this->application_deployment_queue->fresh()
             ?? throw new DeploymentException('Prepared deployment disappeared before activation dispatch.');
         dispatch_claimed_application_deployment(

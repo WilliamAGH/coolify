@@ -356,7 +356,8 @@ final class ReconstructBlueGreenDeploymentRecovery
             && $state->destination_fence_mutation_sequence > 0
             && is_string($state->managed_file_sha256)
             && $state->destination_topology_digest === $state->operation_topology_digest
-            && $state->application_routing_config_digest === $state->operation_routing_config_digest;
+            && is_string($state->application_routing_config_digest)
+            && preg_match('/^[a-f0-9]{64}$/D', $state->application_routing_config_digest) === 1;
         if ($stateTimestamp === null && $queueTimestamp === null) {
             return $durableDestinationMutation;
         }
@@ -564,7 +565,6 @@ final class ReconstructBlueGreenDeploymentRecovery
             || $replacementState->destinationId !== $claim->standaloneDockerId
             || $replacementState->destinationFenceEpoch !== $claim->destinationFenceEpoch
             || $replacementState->destinationTopologyDigest !== $claim->topologyDigest
-            || $replacementState->applicationRoutingConfigDigest !== $claim->routingConfigDigest
             || $previousState?->managedSha256 !== $state->operation_previous_managed_file_sha256
             || ($previousState?->destinationFenceEpoch ?? 0) !== $state->operation_previous_destination_fence_epoch) {
             throw new BlueGreenDeploymentTransitionException('The persisted rollback key does not match the exact interrupted claim.');
@@ -648,7 +648,7 @@ final class ReconstructBlueGreenDeploymentRecovery
             || $state->destination_fence_mutation_sequence < 1
             || ! is_string($state->managed_file_sha256)
             || $state->destination_topology_digest !== $claim->topologyDigest
-            || $state->application_routing_config_digest !== $claim->routingConfigDigest
+            || ! is_string($state->application_routing_config_digest)
             || ! is_string($state->operation_candidate_container_id)) {
             throw new BlueGreenDeploymentTransitionException('The recorded destination state does not match the exact claimed routing mutation.');
         }
@@ -667,7 +667,7 @@ final class ReconstructBlueGreenDeploymentRecovery
             activeDeploymentUuid: $claim->deploymentUuid,
             activeContainerName: $claim->candidateContainerName,
             activeContainerId: $state->operation_candidate_container_id,
-            applicationRoutingConfigDigest: $claim->routingConfigDigest,
+            applicationRoutingConfigDigest: $state->application_routing_config_digest,
             destinationTopologyDigest: $claim->topologyDigest,
         );
     }
