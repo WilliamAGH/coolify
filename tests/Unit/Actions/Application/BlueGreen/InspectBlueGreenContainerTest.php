@@ -63,3 +63,37 @@ SH);
         $filesystem->remove($fakeDockerDirectory);
     }
 });
+
+it('scopes running replica assertions to one exact compose slot', function (): void {
+    $dockerId = str_repeat('b', 64);
+    $expectation = new BlueGreenContainerExpectation(
+        name: 'coolify-app-blue-replica-2-1',
+        dockerId: $dockerId,
+        applicationId: 42,
+        pullRequestId: 0,
+        blueGreenManaged: true,
+        deploymentUuid: 'deployment-uuid',
+        color: BlueGreenDeploymentColor::BLUE,
+        routingRevision: 7,
+    );
+
+    $assertions = (new InspectBlueGreenContainer)->runningReplicaMutationCompletionAssertionsFor(
+        $expectation,
+        replicaIndex: 2,
+        replicaCount: 3,
+        composeProject: 'coolify-app',
+        composeService: 'coolify-app-blue-replica-2',
+    );
+    $uniquenessAssertion = collect($assertions)
+        ->first(fn (string $assertion): bool => str_contains($assertion, 'docker ps -aq'));
+
+    expect($uniquenessAssertion)
+        ->toContain('label=coolify.blueGreen.replicaIndex=2')
+        ->toContain('label=coolify.blueGreen.replicaCount=3')
+        ->toContain('label=com.docker.compose.project=coolify-app')
+        ->toContain('label=com.docker.compose.service=coolify-app-blue-replica-2')
+        ->toContain($dockerId)
+        ->and($assertions)->toContain(
+            'test "$(docker inspect --format=\'{{.State.Status}}\' \'b'.str_repeat('b', 63).'\')" = running',
+        );
+});

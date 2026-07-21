@@ -103,6 +103,29 @@ class InspectBlueGreenContainer
     }
 
     /** @return non-empty-list<string> */
+    public function runningReplicaMutationCompletionAssertionsFor(
+        BlueGreenContainerExpectation $expectation,
+        int $replicaIndex,
+        int $replicaCount,
+        string $composeProject,
+        string $composeService,
+    ): array {
+        if ($expectation->dockerId === null) {
+            throw new InvalidArgumentException('A running replica postcondition requires the exact Docker ID.');
+        }
+        $assertions = $this->exactReplicaMutationAssertionsFor(
+            $expectation,
+            $replicaIndex,
+            $replicaCount,
+            $composeProject,
+            $composeService,
+        );
+        $assertions[] = 'test "$(docker inspect --format='.escapeshellarg('{{.State.Status}}').' '.escapeshellarg($expectation->dockerId).')" = running';
+
+        return $assertions;
+    }
+
+    /** @return non-empty-list<string> */
     public function stoppedMutationCompletionAssertionsFor(BlueGreenContainerExpectation $expectation): array
     {
         if ($expectation->dockerId === null) {
