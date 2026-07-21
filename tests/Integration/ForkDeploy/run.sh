@@ -76,6 +76,7 @@ new_fixture() {
         ln -s "$TEST_DIR/fixtures/command" "$BIN/$command"
     done
     export FORK_DEPLOY_TEST_LOG=$LOG
+    export FORK_DEPLOY_TEST_ASSETS=$ASSETS
     export FORK_DEPLOY_REAL_OPENSSL
     FORK_DEPLOY_REAL_OPENSSL=$(command -v openssl)
     "$FORK_DEPLOY_REAL_OPENSSL" genpkey -algorithm ED25519 -out "$FIXTURE/trust/private.pem"
@@ -105,6 +106,8 @@ new_fixture() {
         FORK_DEPLOY_FAIL_CANDIDATE_RUNTIME_VERIFY \
         FORK_DEPLOY_FAIL_LEGACY_RUNTIME_VERIFY \
         FORK_DEPLOY_FAIL_BUNDLED_ROUTE_PROOF \
+        FORK_DEPLOY_BUNDLED_ROUTE_FAILURES \
+        FORK_DEPLOY_BUNDLED_ROUTE_ATTEMPTS_FILE \
         FORK_DEPLOY_FAIL_LEGACY_REALTIME_REMOVE \
         FORK_DEPLOY_LEGACY_CURRENT || true
     unset FORK_DEPLOY_FAIL_ACTIVATED_CONFIG FORK_DEPLOY_KILL_ON_ACTIVE_CONFIG \
@@ -128,9 +131,18 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 write_assets() {
+    local entry key
+
     printf 'services: {}\n' >"$ASSETS/docker-compose.yml"
     printf 'services: {}\n' >"$ASSETS/docker-compose.prod.yml"
-    printf 'DB_USERNAME=coolify\nDB_DATABASE=coolify\n%s' "${FORK_DEPLOY_ENV_EXTRA:-}" >"$ASSETS/.env.production"
+    cp "$REPO_ROOT/.env.production" "$ASSETS/.env.production"
+    while IFS= read -r entry; do
+        [[ -n $entry ]] || continue
+        key=${entry%%=*}
+        awk -F= -v key="$key" '$1 != key' "$ASSETS/.env.production" >"$ASSETS/.env.production.updated"
+        printf '%s\n' "$entry" >>"$ASSETS/.env.production.updated"
+        mv "$ASSETS/.env.production.updated" "$ASSETS/.env.production"
+    done <<<"${FORK_DEPLOY_ENV_EXTRA:-}"
     {
         printf 'services:\n'
         printf '  coolify:\n    image: "%s"\n    ports: !override\n' "docker.iocloudhost.net/williamagh/coolify@$DIGEST_A"
@@ -643,12 +655,67 @@ test_install_records_signed_immutable_bundle() {
         && [[ $(<"$ROOT/fork-deploy/current") == 4.13.0-fork.1 ]] \
         && [[ -f $ROOT/fork-deploy/releases/4.13.0-fork.1/release.manifest ]] \
         && [[ -f $ROOT/fork-deploy/releases/4.13.0-fork.1/.env.production ]] \
+        && grep -Fxq 'DB_DATABASE=coolify' "$ROOT/source/.env" \
         && grep -Fxq 'AUTOUPDATE=false' "$ROOT/source/.env" \
         && grep -Fxq "chown root:root $ROOT" "$LOG" \
         && ! grep -Fxq "chown 9999:root $ROOT" "$LOG"; then
         pass 'install records a signed immutable release bundle'
     else
         fail 'install records a signed immutable release bundle'
+    fi
+    cleanup_fixture
+}
+
+test_verify_rejects_missing_database_name() {
+    new_fixture
+    write_manifest 4.13.0-fork.1
+    if ! install_release >/dev/null; then
+        fail 'verify rejects a missing managed database name'
+        cleanup_fixture
+        return
+    fi
+    awk '$0 !~ /^DB_DATABASE=/' "$ROOT/source/.env" >"$ROOT/source/.env.without-database"
+    mv "$ROOT/source/.env.without-database" "$ROOT/source/.env"
+    local output
+    if output=$("$SUBJECT" verify 2>&1); then
+        fail 'verify rejects a missing managed database name'
+    elif [[ $output == *'effective rendered Compose differs from the active verified state'* \
+        || $output == *'managed database name'* ]]; then
+        pass 'verify rejects a missing managed database name'
+    else
+        fail 'verify rejects a missing managed database name'
+    fi
+    cleanup_fixture
+}
+
+test_update_normalizes_legacy_missing_database_name() {
+    new_fixture
+    write_manifest 4.13.0-fork.1
+    if ! install_release >/dev/null; then
+        fail 'update normalizes a legacy missing database name'
+        cleanup_fixture
+        return
+    fi
+    awk '$0 !~ /^DB_DATABASE=/' "$ROOT/source/.env" >"$ROOT/source/.env.without-database"
+    mv "$ROOT/source/.env.without-database" "$ROOT/source/.env"
+    local activation=$ROOT/fork-deploy/activations/4.13.0-fork.1 rendered
+    rendered=$(hash_file "$ROOT/source/.env")
+    awk -F= -v rendered="$rendered" '
+        $1 == "RENDERED_COMPOSE_SHA256" { print "RENDERED_COMPOSE_SHA256=" rendered; next }
+        { print }
+    ' "$activation" >"$activation.updated"
+    mv "$activation.updated" "$activation"
+    if ! "$SUBJECT" verify >/dev/null; then
+        fail 'update normalizes a legacy missing database name'
+        cleanup_fixture
+        return
+    fi
+    write_manifest 4.13.0-fork.2
+    if update_release >/dev/null \
+        && grep -Fxq 'DB_DATABASE=coolify' "$ROOT/source/.env"; then
+        pass 'update normalizes a legacy missing database name'
+    else
+        fail 'update normalizes a legacy missing database name'
     fi
     cleanup_fixture
 }
@@ -940,6 +1007,22 @@ test_legacy_removal_waits_for_bundled_route_proof() {
         pass 'legacy realtime removal waits for bundled route proof'
     else
         fail 'legacy realtime removal waits for bundled route proof'
+    fi
+    cleanup_fixture
+}
+
+test_bundled_route_readiness_retries_during_startup() {
+    new_fixture
+    export COOLIFY_HEALTH_ATTEMPTS=3
+    export FORK_DEPLOY_BUNDLED_ROUTE_FAILURES=2
+    export FORK_DEPLOY_BUNDLED_ROUTE_ATTEMPTS_FILE=$FIXTURE/bundled-route-attempts
+    write_manifest 4.13.0-fork.1
+    if install_release >/dev/null \
+        && [[ $(<"$FORK_DEPLOY_BUNDLED_ROUTE_ATTEMPTS_FILE") == 4 ]] \
+        && [[ ! -e $ROOT/fork-deploy/forward-recovery ]]; then
+        pass 'bundled route readiness retries during startup'
+    else
+        fail 'bundled route readiness retries during startup'
     fi
     cleanup_fixture
 }
@@ -1718,6 +1801,21 @@ test_update_uses_private_temporary_prestart_undo() {
     cleanup_fixture
 }
 
+test_install_retries_after_empty_managed_scaffold() {
+    new_fixture
+    mkdir -p "$ROOT/source" "$ROOT/ssh/keys" "$ROOT/ssh/mux" "$ROOT/applications" \
+        "$ROOT/backups" "$ROOT/control-plane-attestor" "$ROOT/databases" "$ROOT/proxy/dynamic" \
+        "$ROOT/sentinel" "$ROOT/services"
+    write_manifest 4.13.0-fork.1
+    if install_release >/dev/null \
+        && [[ $(<"$ROOT/fork-deploy/current") == 4.13.0-fork.1 ]]; then
+        pass 'install retries after an earlier attempt left empty managed scaffolding'
+    else
+        fail 'install retries after an earlier attempt left empty managed scaffolding'
+    fi
+    cleanup_fixture
+}
+
 
 test_refuses_complete_unmanaged_state_before_mutation() {
     new_fixture
@@ -2188,6 +2286,29 @@ if [[ ${FORK_DEPLOY_TEST_FILTER:-} == fresh-staging-env ]]; then
     exit
 fi
 
+if [[ ${FORK_DEPLOY_TEST_FILTER:-} == empty-scaffold-retry ]]; then
+    test_install_retries_after_empty_managed_scaffold
+    printf '%s passing, %s failing\n' "$PASS" "$FAIL"
+    ((FAIL == 0))
+    exit
+fi
+
+if [[ ${FORK_DEPLOY_TEST_FILTER:-} == bundled-readiness-retry ]]; then
+    test_bundled_route_readiness_retries_during_startup
+    printf '%s passing, %s failing\n' "$PASS" "$FAIL"
+    ((FAIL == 0))
+    exit
+fi
+
+if [[ ${FORK_DEPLOY_TEST_FILTER:-} == database-default ]]; then
+    test_install_records_signed_immutable_bundle
+    test_verify_rejects_missing_database_name
+    test_update_normalizes_legacy_missing_database_name
+    printf '%s passing, %s failing\n' "$PASS" "$FAIL"
+    ((FAIL == 0))
+    exit
+fi
+
 test_rejects_untrusted_caller_inputs
 test_uses_migrated_github_raw_base
 test_install_and_update_are_self_contained
@@ -2201,6 +2322,8 @@ test_dry_run_is_non_mutating
 test_status_does_not_mutate_authorized_keys
 test_trust_is_production_only_without_deployment_preflight
 test_install_records_signed_immutable_bundle
+test_verify_rejects_missing_database_name
+test_update_normalizes_legacy_missing_database_name
 test_fresh_install_selects_staged_compose_environment
 test_install_accepts_bare_fork_version_convention
 test_install_rejects_zero_historical_suffix
@@ -2216,6 +2339,7 @@ test_v1_runtime_digest_mismatch_is_rejected
 test_v1_candidate_is_rejected
 test_v1_rollback_is_rejected_after_migration
 test_legacy_removal_waits_for_bundled_route_proof
+test_bundled_route_readiness_retries_during_startup
 test_partial_legacy_removal_recovers_forward
 test_repair_never_rewrites_verified_bundle
 test_repair_rejects_corrupted_recorded_asset
@@ -2246,6 +2370,7 @@ test_compatible_rollback_succeeds
 test_incompatible_rollback_refuses_before_compose
 test_update_rejects_previously_activated_target
 test_update_uses_private_temporary_prestart_undo
+test_install_retries_after_empty_managed_scaffold
 test_refuses_complete_unmanaged_state_before_mutation
 test_refuses_orphan_legacy_volume_without_complete_adoption
 test_refuses_unmanaged_source_asset_without_complete_adoption

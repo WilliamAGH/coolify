@@ -670,6 +670,24 @@ wait_for_health() {
     return 1
 }
 
+fd_wait_for_bundled_route() {
+    local label=$1 url=$2 attempt running
+
+    for ((attempt = 1; attempt <= HEALTH_ATTEMPTS; attempt++)); do
+        if docker exec coolify curl --fail --silent --show-error "$url" --connect-timeout 5 --max-time 10 >/dev/null 2>&1; then
+            return 0
+        fi
+        running=$(docker inspect --format '{{.State.Running}}' coolify 2>/dev/null || true)
+        [[ $running == true ]] || {
+            note "ERROR: $label readiness route failed after the Coolify container stopped" >&2
+            return 1
+        }
+        sleep 2
+    done
+    note "ERROR: $label readiness route did not become healthy after $HEALTH_ATTEMPTS checks" >&2
+    return 1
+}
+
 wait_for_legacy_health() {
     local attempt container status
 
@@ -1327,7 +1345,7 @@ fd_normalize_staged_ports() {
 }
 
 fd_prepare_staged_environment() {
-    local staging=$1 environment source entry key generator value
+    local staging=$1 environment source entry key generator value database
 
     environment=$staging/.env
     source=$SOURCE_DIR/.env
@@ -1354,6 +1372,8 @@ fd_prepare_staged_environment() {
             set_env_value "$environment" "$key" "$value"
         fi
     done
+    database=$(optional_env_value "$environment" DB_DATABASE)
+    set_env_value "$environment" DB_DATABASE "${database:-coolify}"
     fd_normalize_staged_ports "$environment"
     set_env_value "$environment" AUTOUPDATE false
     set_env_value "$environment" COOLIFY_FORK_VERSION "$VERSION"
@@ -1707,7 +1727,8 @@ fd_migration_fingerprint() {
         return 0
     fi
     username=$(env_value "$environment" DB_USERNAME)
-    database=$(env_value "$environment" DB_DATABASE)
+    database=$(optional_env_value "$environment" DB_DATABASE)
+    database=${database:-coolify}
     table_exists=$(docker exec coolify-db psql -U "$username" -d "$database" -Atc "SELECT COALESCE(to_regclass('public.migrations')::text, '');") || die 'could not inspect the Coolify migration table'
     if [[ $table_exists != migrations && $table_exists != public.migrations ]]; then
         printf 'uninitialized\n'
@@ -1730,13 +1751,13 @@ fd_unmanaged_state_present() {
     done
     require_directory_or_missing "$SOURCE_DIR" 'unmanaged Coolify source directory'
     if [[ -d $SOURCE_DIR ]]; then
-        discovered=$(find "$SOURCE_DIR" -mindepth 1 -print -quit)
+        discovered=$(find "$SOURCE_DIR" -mindepth 1 ! -type d -print -quit)
         [[ -z $discovered ]] || return 0
     fi
     for directory in applications backups databases proxy sentinel services ssh; do
         require_directory_or_missing "$ROOT/$directory" "unmanaged Coolify $directory directory"
         [[ -d $ROOT/$directory ]] || continue
-        discovered=$(find "$ROOT/$directory" -mindepth 1 -print -quit)
+        discovered=$(find "$ROOT/$directory" -mindepth 1 ! -type d -print -quit)
         [[ -z $discovered ]] || return 0
     done
     volumes=$(docker volume ls --format '{{.Name}}') \
@@ -2271,14 +2292,8 @@ fd_verify_runtime() {
     done
     fd_validate_runtime_bindings
     wait_for_health || return 1
-    docker exec coolify curl --fail --silent --show-error http://127.0.0.1:6001/up --connect-timeout 5 --max-time 10 >/dev/null || {
-        note 'ERROR: bundled Laravel Reverb readiness route failed' >&2
-        return 1
-    }
-    docker exec coolify curl --fail --silent --show-error http://127.0.0.1:6002/ready --connect-timeout 5 --max-time 10 >/dev/null || {
-        note 'ERROR: bundled terminal readiness route failed' >&2
-        return 1
-    }
+    fd_wait_for_bundled_route 'bundled Laravel Reverb' http://127.0.0.1:6001/up || return 1
+    fd_wait_for_bundled_route 'bundled terminal' http://127.0.0.1:6002/ready || return 1
 }
 
 fd_verify_runtime_legacy() {

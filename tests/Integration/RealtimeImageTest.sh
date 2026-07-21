@@ -87,6 +87,11 @@ docker cp "$runtime_env" "${container_id}:/var/www/html/.env" \
 docker start "$container_id" >/dev/null \
     || fail 'the production image could not be started after runtime environment injection'
 
+docker exec "$container_id" test -s /var/www/html/versions.json \
+    || fail 'the production image does not contain the runtime version catalog'
+docker exec "$container_id" jq -er '.coolify.v4.version | strings | select(length > 0)' /var/www/html/versions.json >/dev/null \
+    || fail 'the production image runtime version catalog is invalid'
+
 attempt=0
 until docker exec "$container_id" curl --fail --silent --show-error http://127.0.0.1:6001/up >/dev/null \
     && docker exec "$container_id" curl --fail --silent --show-error http://127.0.0.1:6002/ready >/dev/null
