@@ -2789,6 +2789,41 @@ jobs:
             done
           }
 
+          fork_version_is_newer() {
+            local candidate=$1 current=$2
+            local candidate_major candidate_minor candidate_patch
+            local current_major current_minor current_patch
+            [[ "$candidate" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-fork$ ]]
+            candidate_major=${BASH_REMATCH[1]}
+            candidate_minor=${BASH_REMATCH[2]}
+            candidate_patch=${BASH_REMATCH[3]}
+            [[ "$current" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-fork$ ]]
+            current_major=${BASH_REMATCH[1]}
+            current_minor=${BASH_REMATCH[2]}
+            current_patch=${BASH_REMATCH[3]}
+            ((candidate_major > current_major)) && return 0
+            ((candidate_major < current_major)) && return 1
+            ((candidate_minor > current_minor)) && return 0
+            ((candidate_minor < current_minor)) && return 1
+            ((candidate_patch > current_patch))
+          }
+
+          preflight_latest_tag() {
+            local expected_index_digest=$1 existing current_version
+            existing="$(digest_or_absent "$FORK_LATEST_TAG")"
+            [[ -z "$existing" || "$existing" == "$expected_index_digest" ]] && return 0
+            current_version="$(regctl manifest get "$FORK_LATEST_TAG" --format raw-body | jq -er '
+              .annotations["org.opencontainers.image.version"] |
+              strings |
+              select(test("^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)-fork$"))
+            ')"
+            fork_version_is_newer "$SEMANTIC_VERSION" "$current_version" || {
+              printf 'Refusing to move fork-latest backward or sideways from %s to %s.\n' \
+                "$current_version" "$SEMANTIC_VERSION" >&2
+              return 1
+            }
+          }
+
           promote_and_verify_canonical_tags() {
             local repository=$1 expected_index_digest=$2 tag existing
             local -a tags
@@ -2803,6 +2838,7 @@ jobs:
               fi
               [[ "$(regctl image digest "$tag")" == "$expected_index_digest" ]]
             done
+            preflight_latest_tag "$expected_index_digest"
             tag="${tags[0]}"
             [[ "$tag" == "$repository:"* ]]
             if [[ "$(digest_or_absent "$tag")" != "$expected_index_digest" ]]; then
@@ -2813,6 +2849,7 @@ jobs:
 
           preflight_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"
           preflight_canonical_tags "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"
+          preflight_latest_tag "$MAIN_INDEX_DIGEST"
 
           assert_live_fork_tag_binding
           assert_active_fork_tag_protection

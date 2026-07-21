@@ -81,7 +81,11 @@ case "$1:$2" in
         printf '{"config":{"Labels":{"org.opencontainers.image.source":"%s","org.opencontainers.image.revision":"%s","org.opencontainers.image.version":"%s"}}}\n' "$SOURCE_URL" "$SOURCE_REVISION" "$SEMANTIC_VERSION"
         ;;
     manifest:get)
-        printf '{"mediaType":"application/vnd.oci.image.index.v1+json","annotations":{"org.opencontainers.image.source":"%s","org.opencontainers.image.revision":"%s","org.opencontainers.image.version":"%s"}}\n' "$SOURCE_URL" "$SOURCE_REVISION" "$SEMANTIC_VERSION"
+        version=$SEMANTIC_VERSION
+        if [ "$3" = "$main:fork-latest" ] && [ -n "${FORK_LATEST_VERSION:-}" ]; then
+            version=$FORK_LATEST_VERSION
+        fi
+        printf '{"mediaType":"application/vnd.oci.image.index.v1+json","annotations":{"org.opencontainers.image.source":"%s","org.opencontainers.image.revision":"%s","org.opencontainers.image.version":"%s"}}\n' "$SOURCE_URL" "$SOURCE_REVISION" "$version"
         ;;
     image:copy)
         source=$3
@@ -2393,6 +2397,9 @@ it('defines one referrerless fork release graph for the main image on both platf
         ->toContain('preflight_semantic_tag')
         ->toContain('promote_or_verify_semantic_tag')
         ->toContain('promote_and_verify_canonical_tags')
+        ->toContain('fork_version_is_newer')
+        ->toContain('preflight_latest_tag')
+        ->toContain('Refusing to move fork-latest backward or sideways')
         ->toContain('FORK_LATEST_TAG')
         ->toContain('FORK_VERSION_TAG')
         ->toContain('FORK_VERSION_SHA_TAG')
@@ -3092,6 +3099,58 @@ it('rejects a mismatched canonical fork identity tag before updating fork latest
             ->and(trim((string) file_get_contents($registry['state'].'/main')))->toBe('absent')
             ->and(trim((string) file_get_contents($registry['state'].'/fork-4.13.1-fork')))
             ->toBe(releaseWorkflowTestDigest('f'));
+    } finally {
+        $filesystem->remove($fixture);
+    }
+});
+
+it('refuses to move fork latest backward after a newer release has won serialization', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $promotionRun = (string) (releaseWorkflowStep(
+        $workflow['jobs']['fork-release'] ?? [],
+        'Promote and verify the main fork image',
+    )['run'] ?? '');
+    $filesystem = new Filesystem;
+    $fixture = sys_get_temp_dir().'/coolify-fork-latest-rollback-refusal-'.bin2hex(random_bytes(8));
+    $registry = releaseWorkflowPrepareForkPromotionRegistryDouble($fixture, null);
+    file_put_contents($registry['state'].'/fork-latest', releaseWorkflowTestDigest('f')."\n");
+    $registry['environment']['FORK_LATEST_VERSION'] = '4.13.2-fork';
+
+    try {
+        $process = new Process(['bash', '-c', $promotionRun], $root, $registry['environment']);
+        $process->run();
+
+        expect($process->isSuccessful())->toBeFalse()
+            ->and($process->getErrorOutput())->toContain('Refusing to move fork-latest backward or sideways from 4.13.2-fork to 4.13.1-fork')
+            ->and((string) file_get_contents($registry['log']))->not->toContain('image copy')
+            ->and(trim((string) file_get_contents($registry['state'].'/fork-latest')))->toBe(releaseWorkflowTestDigest('f'))
+            ->and(trim((string) file_get_contents($registry['state'].'/main')))->toBe('absent');
+    } finally {
+        $filesystem->remove($fixture);
+    }
+});
+
+it('moves fork latest forward after an older release has won serialization', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $promotionRun = (string) (releaseWorkflowStep(
+        $workflow['jobs']['fork-release'] ?? [],
+        'Promote and verify the main fork image',
+    )['run'] ?? '');
+    $filesystem = new Filesystem;
+    $fixture = sys_get_temp_dir().'/coolify-fork-latest-forward-'.bin2hex(random_bytes(8));
+    $registry = releaseWorkflowPrepareForkPromotionRegistryDouble($fixture, null);
+    file_put_contents($registry['state'].'/fork-latest', releaseWorkflowTestDigest('f')."\n");
+    $registry['environment']['FORK_LATEST_VERSION'] = '4.13.0-fork';
+
+    try {
+        $process = new Process(['bash', '-c', $promotionRun], $root, $registry['environment']);
+        $process->run();
+
+        expect($process->isSuccessful())->toBeTrue($process->getErrorOutput())
+            ->and(trim((string) file_get_contents($registry['state'].'/fork-latest')))->toBe(releaseWorkflowTestDigest('3'))
+            ->and(trim((string) file_get_contents($registry['state'].'/main')))->toBe(releaseWorkflowTestDigest('3'));
     } finally {
         $filesystem->remove($fixture);
     }
