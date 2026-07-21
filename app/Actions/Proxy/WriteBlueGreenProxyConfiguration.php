@@ -2,6 +2,7 @@
 
 namespace App\Actions\Proxy;
 
+use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
 use App\Enums\ProxyTypes;
 use App\Models\Server;
 use InvalidArgumentException;
@@ -685,9 +686,13 @@ class WriteBlueGreenProxyConfiguration
         string $probeMiddlewareName,
     ): bool {
         foreach ($middlewares as $middlewareName => $middleware) {
-            if (! is_string($middlewareName)
-                || preg_match('/^'.preg_quote($namePrefix, '/').'[A-Za-z0-9_-]+$/D', $middlewareName) !== 1
-                || ! is_array($middleware)
+            if (! is_string($middlewareName) || ! is_array($middleware)) {
+                return false;
+            }
+            $hasScopedName = preg_match('/^'.preg_quote($namePrefix, '/').'[A-Za-z0-9_-]+$/D', $middlewareName) === 1;
+            $isSharedHttpsRedirect = $middlewareName === ControlPlaneDynamicConfiguration::HTTPS_REDIRECT_MIDDLEWARE
+                && $middleware === ['redirectScheme' => ['scheme' => 'https']];
+            if ((! $hasScopedName && ! $isSharedHttpsRedirect)
                 || ($middlewareName !== $probeMiddlewareName && ! $this->isCanonicalApplicationMiddleware($middleware))) {
                 return false;
             }

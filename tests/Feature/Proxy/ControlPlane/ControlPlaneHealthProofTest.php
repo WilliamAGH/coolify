@@ -1,5 +1,6 @@
 <?php
 
+use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\ControlPlane\ControlPlaneCandidateHealthMarker;
 use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyRouteProof;
@@ -9,6 +10,7 @@ use Illuminate\Http\Request;
 beforeEach(function (): void {
     config([
         'constants.control_plane_health.configuration_acknowledgement' => 'ack:'.str_repeat('a', 64),
+        'constants.control_plane_health.deployment_release_proof' => null,
         'constants.control_plane_health.health_proof_token_sha256' => hash('sha256', 'health-proof-token'),
         'constants.control_plane_health.dynamic_sha256' => str_repeat('d', 64),
         'constants.control_plane_health.member' => 'blue',
@@ -24,6 +26,29 @@ it('preserves the public health body and exposes only non-secret backend identit
         ->assertHeader(ControlPlaneProxyRouteProof::BACKEND_REVISION_HEADER, 'revision-42')
         ->assertHeader(ControlPlaneProxyRouteProof::DYNAMIC_SHA256_HEADER, str_repeat('d', 64));
 });
+
+it('publishes an exact deployment-bound release proof on ordinary health when configured', function (): void {
+    $releaseProof = BlueGreenRoutingTarget::durableReleaseProofToken('deployment-health-proof');
+    config(['constants.control_plane_health.deployment_release_proof' => $releaseProof]);
+
+    $this->get('/api/health')
+        ->assertOk()
+        ->assertSeeText('OK')
+        ->assertHeader(BlueGreenRoutingTarget::RELEASE_PROOF_HEADER, $releaseProof);
+});
+
+it('omits missing or malformed deployment release proofs from ordinary health', function (?string $releaseProof): void {
+    config(['constants.control_plane_health.deployment_release_proof' => $releaseProof]);
+
+    $this->get('/api/health')
+        ->assertOk()
+        ->assertHeaderMissing(BlueGreenRoutingTarget::RELEASE_PROOF_HEADER);
+})->with([
+    'missing' => [null],
+    'wrong prefix' => ['proof:'.str_repeat('a', 64)],
+    'uppercase digest' => ['release:'.str_repeat('A', 64)],
+    'newline injection' => ['release:'.str_repeat('a', 64)."\nX-Injected: value"],
+]);
 
 it('preserves health and proof behavior through the versioned API alias', function (): void {
     $this->get('/api/v1/health')

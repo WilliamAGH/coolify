@@ -882,29 +882,6 @@ function generateBlueGreenApplicationContainerLabels(
         "coolify.blueGreen.routingRevision={$routingRevision}",
     ];
 
-    if ((bool) $application->health_check_enabled && $application->health_check_type === 'http') {
-        foreach ($backendPorts as $backendPort) {
-            $serviceName = BlueGreenRoutingTarget::memberServiceNameForPort(
-                $applicationUuid,
-                $destinationId,
-                $color,
-                $backendPort,
-                count($backendPorts) > 1,
-            );
-            $healthCheckPrefix = "traefik.http.services.{$serviceName}.loadbalancer.healthcheck";
-            $labels[] = "{$healthCheckPrefix}.path={$application->health_check_path}";
-            $labels[] = "{$healthCheckPrefix}.hostname={$application->health_check_host}";
-            $labels[] = "{$healthCheckPrefix}.method={$application->health_check_method}";
-            $labels[] = "{$healthCheckPrefix}.status={$application->health_check_return_code}";
-            $labels[] = "{$healthCheckPrefix}.scheme={$application->health_check_scheme}";
-            $labels[] = "{$healthCheckPrefix}.interval={$application->health_check_interval}s";
-            $labels[] = "{$healthCheckPrefix}.timeout={$application->health_check_timeout}s";
-            if ($application->health_check_port !== null) {
-                $labels[] = "{$healthCheckPrefix}.port={$application->health_check_port}";
-            }
-        }
-    }
-
     return $labels;
 }
 
