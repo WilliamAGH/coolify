@@ -423,9 +423,23 @@ class WriteBlueGreenProxyConfiguration
         $routers = $parsed['http']['routers'];
         $services = $parsed['http']['services'];
         $routerName = count($routers) === 1 ? array_key_first($routers) : null;
-        $isSingletonProbeDocument = is_string($routerName) && str_ends_with($routerName, '-probe');
-        if (($services === [] && ! $this->isGuardedSingletonProbeOnlyDocument($configuration, $parsed['http']))
-            || ($services !== [] && $isSingletonProbeDocument)) {
+        $singletonRouter = is_string($routerName) ? ($routers[$routerName] ?? null) : null;
+        $hasProbeRouter = array_filter(
+            array_keys($routers),
+            static fn (mixed $name): bool => is_string($name) && str_ends_with($name, '-probe'),
+        ) !== [];
+        $singletonLooksLikeProbe = is_array($singletonRouter)
+            && is_string($singletonRouter['rule'] ?? null)
+            && str_contains((string) $singletonRouter['rule'], 'Header(`'.self::PROBE_HEADER.'`');
+        $isGuardedProbe = $this->isGuardedSingletonProbeOnlyDocument($configuration, $parsed['http']);
+        // Empty file services are only legal for the legacy Docker-member probe
+        // shape. Any unguarded probe-shaped document (probe router name, probe
+        // Header rule, or empty services) is rejected even when it owns a
+        // file-provider backend.
+        if ($isGuardedProbe) {
+            return;
+        }
+        if ($services === [] || $hasProbeRouter || $singletonLooksLikeProbe) {
             throw new InvalidArgumentException('Blue/green proxy configuration must contain HTTP routers and services.');
         }
     }
@@ -438,57 +452,101 @@ class WriteBlueGreenProxyConfiguration
         $routers = $http['routers'];
         $middlewares = $http['middlewares'] ?? null;
         $services = $http['services'] ?? null;
-        // Probe-only file documents keep services empty and point at the Docker
-        // provider. Application label middlewares (gzip, auth, redirects) may
-        // still be present alongside the probe header strip middleware.
-        if (count($routers) !== 1
+        // Probe-only documents contain only Header-guarded routers. They may
+        // either reference Docker member services with empty file services
+        // (legacy singleton) or own exact file-provider member backends for the
+        // candidate color so private proof does not depend on Docker discovery.
+        // Application label middlewares (gzip, auth, redirects) may still be
+        // present after the probe header strip middleware.
+        if ($routers === []
             || ! is_array($middlewares)
             || $middlewares === []
-            || ! is_array($services)
-            || $services !== []) {
+            || ! is_array($services)) {
             return false;
         }
 
-        $routerName = array_key_first($routers);
-        $router = $routers[$routerName] ?? null;
         $state = $configuration->state;
-        if (! is_string($routerName) || ! is_array($router) || $state->activeColor === null) {
+        if ($state->activeColor === null || $state->operationId === null) {
             return false;
         }
 
         $namePrefix = BlueGreenRoutingTarget::routingNamePrefix($state->applicationUuid, $state->destinationId);
         $probeMiddlewareName = $namePrefix.'probe-header-strip';
-        $expectedService = BlueGreenRoutingTarget::memberServiceReference(
+        $memberBase = BlueGreenRoutingTarget::memberServiceName(
             $state->applicationUuid,
             $state->destinationId,
             $state->activeColor,
         );
+        $dockerMemberService = $memberBase.'@docker';
         $expectedGuard = 'Header(`'.self::PROBE_HEADER.'`, `'.BlueGreenRoutingTarget::durableProbeToken($state->operationId).'`)';
-        $rule = $router['rule'] ?? null;
-        $entryPoints = $router['entryPoints'] ?? null;
-        $routerMiddlewares = $router['middlewares'] ?? null;
-        if (preg_match('/^'.preg_quote($namePrefix, '/').'[A-Za-z0-9_-]+-probe$/D', $routerName) !== 1
-            || ($router['service'] ?? null) !== $expectedService
-            || ! is_string($rule)
-            || preg_match('/^\(.+\) && '.preg_quote($expectedGuard, '/').'$/D', $rule) !== 1
-            || ! is_array($entryPoints)
-            || ! array_is_list($entryPoints)
-            || $entryPoints === []
-            || array_filter($entryPoints, static fn (mixed $entryPoint): bool => ! is_string($entryPoint) || $entryPoint === '') !== []
-            || ! is_array($routerMiddlewares)
-            || ! array_is_list($routerMiddlewares)
-            || $routerMiddlewares === []
-            || ($routerMiddlewares[0] ?? null) !== $probeMiddlewareName
-            || array_diff(array_keys($router), ['rule', 'entryPoints', 'service', 'middlewares', 'tls']) !== []
-            || ! array_key_exists($probeMiddlewareName, $middlewares)) {
+        $referencedServices = [];
+
+        foreach ($routers as $routerName => $router) {
+            if (! is_string($routerName) || ! is_array($router)) {
+                return false;
+            }
+            $rule = $router['rule'] ?? null;
+            $entryPoints = $router['entryPoints'] ?? null;
+            $routerMiddlewares = $router['middlewares'] ?? null;
+            $routerService = $router['service'] ?? null;
+            if (preg_match('/^'.preg_quote($namePrefix, '/').'[A-Za-z0-9_-]+-probe$/D', $routerName) !== 1
+                || ! is_string($routerService)
+                || ! is_string($rule)
+                || preg_match('/^\(.+\) && '.preg_quote($expectedGuard, '/').'$/D', $rule) !== 1
+                || ! is_array($entryPoints)
+                || ! array_is_list($entryPoints)
+                || $entryPoints === []
+                || array_filter($entryPoints, static fn (mixed $entryPoint): bool => ! is_string($entryPoint) || $entryPoint === '') !== []
+                || ! is_array($routerMiddlewares)
+                || ! array_is_list($routerMiddlewares)
+                || $routerMiddlewares === []
+                || ($routerMiddlewares[0] ?? null) !== $probeMiddlewareName
+                || array_diff(array_keys($router), ['rule', 'entryPoints', 'service', 'middlewares', 'tls']) !== []) {
+                return false;
+            }
+            foreach ($routerMiddlewares as $middlewareName) {
+                if (! is_string($middlewareName)
+                    || $middlewareName === ''
+                    || ! array_key_exists($middlewareName, $middlewares)) {
+                    return false;
+                }
+            }
+            $referencedServices[$routerService] = true;
+        }
+
+        if (! array_key_exists($probeMiddlewareName, $middlewares)) {
             return false;
         }
 
-        foreach ($routerMiddlewares as $middlewareName) {
-            if (! is_string($middlewareName)
-                || $middlewareName === ''
-                || ! array_key_exists($middlewareName, $middlewares)) {
+        if ($services === []) {
+            // Legacy Docker-member shape only admits a singleton probe router.
+            if (count($routers) !== 1 || array_keys($referencedServices) !== [$dockerMemberService]) {
                 return false;
+            }
+        } else {
+            $expectedFileServices = array_keys($referencedServices);
+            sort($expectedFileServices);
+            $actualFileServices = array_keys($services);
+            sort($actualFileServices);
+            if ($expectedFileServices !== $actualFileServices) {
+                return false;
+            }
+            foreach ($referencedServices as $serviceName => $_) {
+                if (! is_string($serviceName)
+                    || ! str_starts_with($serviceName, $memberBase)
+                    || str_contains($serviceName, '@')
+                    || ! is_array($services[$serviceName]['loadBalancer']['servers'] ?? null)
+                    || $services[$serviceName]['loadBalancer']['servers'] === []
+                    || array_diff(array_keys($services[$serviceName]), ['loadBalancer']) !== []) {
+                    return false;
+                }
+                foreach ($services[$serviceName]['loadBalancer']['servers'] as $server) {
+                    if (! is_array($server)
+                        || ! is_string($server['url'] ?? null)
+                        || preg_match('#^http://[A-Za-z0-9][A-Za-z0-9_.-]*:[1-9][0-9]{0,4}$#D', $server['url']) !== 1) {
+                        return false;
+                    }
+                }
             }
         }
 

@@ -82,8 +82,12 @@ it('compiles deterministic port-specific blue-green services and probes for ever
     expect($routers)->toHaveKeys([
         $prefix.'metrics-probe',
         $prefix.'web-probe',
-    ])->and(data_get($routers, $prefix.'web-probe.service'))->toBe($prefix.'blue-3000@docker')
-        ->and(data_get($routers, $prefix.'metrics-probe.service'))->toBe($prefix.'blue-8080@docker');
+    ])->and(data_get($routers, $prefix.'web-probe.service'))->toBe($prefix.'blue-3000')
+        ->and(data_get($routers, $prefix.'metrics-probe.service'))->toBe($prefix.'blue-8080')
+        ->and(data_get($parsed, 'http.services'))->toHaveKeys([
+            $prefix.'blue-3000',
+            $prefix.'blue-8080',
+        ]);
 
     [, $publicParsed] = compileBlueGreenMultiPortConfiguration(blueGreenMultiPortTarget());
     $services = data_get($publicParsed, 'http.services');

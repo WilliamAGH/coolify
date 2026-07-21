@@ -100,11 +100,24 @@ class CompileBlueGreenProxyConfiguration
                 $probeRule = '('.$router['rule'].') && Header(`'.$target->probeHeaderName.'`, `'.$target->probeToken.'`)';
                 $probeRouter = $router;
                 $probeRouter['rule'] = $probeRule;
-                $probeRouter['service'] = $target->memberServiceReferenceForBackendPort(
-                    $applicationUuid,
-                    $target->probeColor,
-                    $backendPort,
-                );
+                // Probe-only stages keep a file-provider backend so Traefik can
+                // acknowledge the candidate without waiting for Docker service
+                // discovery of the member label set. Replica inventories already
+                // own file-provider member services and keep that reference.
+                $probeRouter['service'] = $target->mode === BlueGreenRoutingMode::ProbeOnly
+                    && ! $target->usesExplicitReplicaBackends
+                    ? BlueGreenRoutingTarget::memberServiceNameForPort(
+                        $applicationUuid,
+                        $target->destinationId,
+                        $target->probeColor,
+                        $backendPort,
+                        count($target->ports) > 1,
+                    )
+                    : $target->memberServiceReferenceForBackendPort(
+                        $applicationUuid,
+                        $target->probeColor,
+                        $backendPort,
+                    );
                 unset($probeRouter['priority']);
                 $probeRouter['middlewares'] = array_values(array_merge(
                     [$probeMiddlewareName],
@@ -153,6 +166,17 @@ class CompileBlueGreenProxyConfiguration
                         $target->failoverHealthCheck(),
                     );
                 }
+            } elseif ($target->mode === BlueGreenRoutingMode::ProbeOnly && $target->probeColor !== null) {
+                $services[BlueGreenRoutingTarget::memberServiceNameForPort(
+                    $applicationUuid,
+                    $target->destinationId,
+                    $target->probeColor,
+                    $backendPort,
+                    count($target->ports) > 1,
+                )] = $this->service(
+                    $target->containerName($target->probeColor),
+                    $backendPort,
+                );
             }
             if ($target->mode !== BlueGreenRoutingMode::ProbeOnly) {
                 $services[$activeServiceName] = [

@@ -12,6 +12,8 @@ use Symfony\Component\Yaml\Yaml;
 function probeOnlyWriterConfiguration(
     BlueGreenRoutingMode $mode = BlueGreenRoutingMode::ProbeOnly,
 ): BlueGreenProxyConfiguration {
+    $isProbeOnly = $mode === BlueGreenRoutingMode::ProbeOnly;
+
     return (new CompileBlueGreenProxyConfiguration)->compileGeneratedLabels(
         applicationUuid: 'probe-only-writer-app',
         generatedLabels: [
@@ -30,9 +32,10 @@ function probeOnlyWriterConfiguration(
             port: 8080,
             routingRevision: 7,
             mode: $mode,
-            probeHeaderName: 'X-Coolify-Blue-Green-Probe',
-            probeToken: BlueGreenRoutingTarget::durableProbeToken('probe-only-operation'),
-            probeColor: BlueGreenDeploymentColor::BLUE,
+            probeHeaderName: $isProbeOnly ? 'X-Coolify-Blue-Green-Probe' : null,
+            probeToken: $isProbeOnly ? BlueGreenRoutingTarget::durableProbeToken('probe-only-operation') : null,
+            probeColor: $isProbeOnly ? BlueGreenDeploymentColor::BLUE : null,
+            publicProofToken: $isProbeOnly ? null : BlueGreenRoutingTarget::durablePublicProofToken('probe-only-operation'),
             destinationFenceEpoch: 3,
             operationId: 'probe-only-operation',
             mutationSequence: 2,
@@ -178,28 +181,25 @@ it('rejects unsafe ProbeOnly-shaped documents', function (callable $mutate): voi
     },
     'wrong canonical color' => static function (array $document, string $routerName): array {
         $document['http']['routers'][$routerName]['service'] = str_replace(
-            '-blue@docker',
-            '-green@docker',
+            '-blue',
+            '-green',
             $document['http']['routers'][$routerName]['service'],
         );
 
         return $document;
     },
     'file-provider service' => static function (array $document, string $routerName): array {
-        $document['http']['routers'][$routerName]['service'] = str_replace(
-            '@docker',
-            '@file',
-            $document['http']['routers'][$routerName]['service'],
-        );
+        $document['http']['routers'][$routerName]['service'] = $document['http']['routers'][$routerName]['service'].'@file';
 
         return $document;
     },
     'port-specific service' => static function (array $document, string $routerName): array {
-        $document['http']['routers'][$routerName]['service'] = str_replace(
-            '@docker',
-            '-8080@docker',
-            $document['http']['routers'][$routerName]['service'],
-        );
+        $document['http']['routers'][$routerName]['service'] = $document['http']['routers'][$routerName]['service'].'-8080';
+
+        return $document;
+    },
+    'docker-provider service' => static function (array $document, string $routerName): array {
+        $document['http']['routers'][$routerName]['service'] = $document['http']['routers'][$routerName]['service'].'@docker';
 
         return $document;
     },
