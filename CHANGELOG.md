@@ -4,15 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🐛 Bug Fixes
+
+- *(deploy)* Validate the staged Coolify environment
+
 ### 📚 Documentation
 
-- Update changelog (#107)
+- Update changelog (#109)
+
+### 🧪 Testing
+
+- *(deploy)* Prove staged Compose rendering
+- *(browser)* Wait for member login navigation
+- *(deploy)* Cover generic Compose environment
+- *(deploy)* Accept Compose env file JSON shapes
+- *(deploy)* Cover defaults without newer Compose flags
 
 ### ⚙️ Miscellaneous Tasks
 
-- *(release)* Reserve fork version 4.13.5
+- *(release)* Reserve fork version 4.13.6
 
-## [4.13.4-fork] - 2026-07-21
+## [4.13.5-fork] - 2026-07-21
 
 ### 🚀 Features
 
@@ -138,6 +150,7 @@ All notable changes to this project will be documented in this file.
 - Update changelog (#102)
 - Update changelog (#103)
 - Update changelog (#105)
+- Update changelog (#107)
 
 ### 🎨 Styling
 
@@ -189,6 +202,7 @@ All notable changes to this project will be documented in this file.
 - *(release)* Verify fork tags through the shared allowlist script
 - Migrate release actions to Node 24
 - *(release)* Extract shared fork release trust verifier
+- *(release)* Reserve fork version 4.13.5
 
 ## [4.13.2-fork] - 2026-07-20
 
