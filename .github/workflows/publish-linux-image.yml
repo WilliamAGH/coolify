@@ -561,14 +561,14 @@ jobs:
           printf '%s  %s\n' c93aa7638749f5aaac1a8e01787321889c78f0101809bb2880343478d0ba0467 "$(command -v regctl)" | sha256sum --check --strict -
 
       - name: Login to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           password: ${{ github.token }}
           registry: ghcr.io
           username: ${{ github.actor }}
 
       - name: Login to Docker Hub
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           registry: docker.io
@@ -616,14 +616,14 @@ jobs:
           printf '%s  %s\n' c93aa7638749f5aaac1a8e01787321889c78f0101809bb2880343478d0ba0467 "$(command -v regctl)" | sha256sum --check --strict -
 
       - name: Login to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           password: ${{ github.token }}
           registry: ghcr.io
           username: ${{ github.actor }}
 
       - name: Login to Docker Hub
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           registry: docker.io
@@ -745,7 +745,7 @@ jobs:
             || { echo 'Runner evidence is not a regular file.' >&2; exit 1; }
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Verify source provenance
         env:
@@ -756,7 +756,7 @@ jobs:
         run: mkdir -p linux-image
 
       - name: Build local OCI archive
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: ${{ inputs.dockerfile }}
@@ -821,7 +821,7 @@ jobs:
         id: secret
         if: always()
         continue-on-error: true
-        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           exit-code: '1'
           format: json
@@ -900,7 +900,7 @@ jobs:
 
       - name: Retain gated OCI evidence
         if: success()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           compression-level: 0
           if-no-files-found: error
@@ -948,7 +948,7 @@ jobs:
           persist-credentials: false
 
       - name: Download gated OCI evidence
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           merge-multiple: true
           path: candidate-input
@@ -965,14 +965,14 @@ jobs:
           printf '%s  %s\n' c93aa7638749f5aaac1a8e01787321889c78f0101809bb2880343478d0ba0467 "$(command -v regctl)" | sha256sum --check --strict -
 
       - name: Login to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           password: ${{ github.token }}
           registry: ghcr.io
           username: ${{ github.actor }}
 
       - name: Login to Docker Hub
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           registry: docker.io
@@ -1059,7 +1059,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Retain candidate digest binding
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           if-no-files-found: error
           name: linux-image-binding-${{ inputs.artifact_name }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -1082,27 +1082,27 @@ jobs:
       GHCR_TARGET: ghcr.io/${{ inputs.target_repository }}
     steps:
       - name: Download child SBOMs
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           merge-multiple: true
           path: attestation-input
           pattern: linux-image-${{ inputs.artifact_name }}-${{ github.run_id }}-${{ github.run_attempt }}-*
 
       - name: Download index digest binding
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: linux-image-binding-${{ inputs.artifact_name }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: attestation-input
 
       - name: Login to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           password: ${{ github.token }}
           registry: ghcr.io
           username: ${{ github.actor }}
 
       - name: Login to Docker Hub
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           registry: docker.io
@@ -1240,14 +1240,14 @@ jobs:
           printf '%s  %s\n' c93aa7638749f5aaac1a8e01787321889c78f0101809bb2880343478d0ba0467 "$(command -v regctl)" | sha256sum --check --strict -
 
       - name: Login to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           password: ${{ github.token }}
           registry: ghcr.io
           username: ${{ github.actor }}
 
       - name: Login to Docker Hub
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           registry: docker.io
@@ -1477,14 +1477,14 @@ jobs:
           printf '%s  %s\n' c93aa7638749f5aaac1a8e01787321889c78f0101809bb2880343478d0ba0467 "$(command -v regctl)" | sha256sum --check --strict -
 
       - name: Login to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           password: ${{ github.token }}
           registry: ghcr.io
           username: ${{ github.actor }}
 
       - name: Login to Docker Hub
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           registry: docker.io
@@ -1565,12 +1565,12 @@ jobs:
           [[ "$PLATFORM" == linux/amd64 || "$PLATFORM" == linux/arm64 ]]
 
       - name: Set up QEMU for fork cross-platform builds
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
         with:
           platforms: arm64
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Verify fork Buildx platform support
         env:
@@ -1590,7 +1590,7 @@ jobs:
         run: install -d -m 0700 fork-image
 
       - name: Build fork OCI archive with inline provenance and SBOM
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           annotations: |
             index:org.opencontainers.image.source=https://github.com/${{ github.repository }}
@@ -1768,7 +1768,7 @@ jobs:
         id: fork-secret
         if: always()
         continue-on-error: true
-        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           exit-code: '1'
           format: json
@@ -1791,7 +1791,7 @@ jobs:
 
       - name: Retain verified fork OCI evidence
         if: success()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           compression-level: 0
           if-no-files-found: error
@@ -1820,7 +1820,7 @@ jobs:
       run_tag: ${{ needs.validate-inputs.outputs.run_tag }}
     steps:
       - name: Download all verified fork OCI evidence
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           merge-multiple: true
           path: fork-candidate-input
@@ -1837,7 +1837,7 @@ jobs:
           printf '%s  %s\n' c93aa7638749f5aaac1a8e01787321889c78f0101809bb2880343478d0ba0467 "$(command -v regctl)" | sha256sum --check --strict -
 
       - name: Login to Nexus fork registry for staging
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           password: ${{ secrets.NEXUS_PASSWORD }}
           registry: docker.iocloudhost.net
@@ -2027,7 +2027,7 @@ jobs:
             ' > fork-binding/release-binding.json
 
       - name: Retain unsigned fork release binding
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           if-no-files-found: error
           name: fork-binding-${{ inputs.semantic_version }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -2062,20 +2062,20 @@ jobs:
           persist-credentials: false
 
       - name: Download fork SBOM evidence
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           merge-multiple: true
           path: fork-attestation-input
           pattern: fork-image-*-${{ github.run_id }}-${{ github.run_attempt }}-*
 
       - name: Download fork release binding
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: fork-binding-${{ inputs.semantic_version }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: fork-attestation-input
 
       - name: Login to Nexus fork registry for bundle verification
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           password: ${{ secrets.NEXUS_PASSWORD }}
           registry: docker.iocloudhost.net
@@ -2405,7 +2405,7 @@ jobs:
 
       - name: Upload verified downloadable fork bundles
         id: upload-fork-bundles
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           if-no-files-found: error
           name: fork-supply-chain-${{ inputs.semantic_version }}-${{ github.sha }}
@@ -2481,7 +2481,7 @@ jobs:
           printf '%s  %s\n' c93aa7638749f5aaac1a8e01787321889c78f0101809bb2880343478d0ba0467 "$(command -v regctl)" | sha256sum --check --strict -
 
       - name: Login to Nexus fork registry for final promotion
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           password: ${{ secrets.NEXUS_PASSWORD }}
           registry: docker.iocloudhost.net
@@ -2489,7 +2489,7 @@ jobs:
 
       - name: Download verified fork release bundles
         if: ${{ inputs.source_is_tag }}
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.fork-attest.outputs.bundle_artifact_id }}
           path: fork-release-bundles
