@@ -901,7 +901,7 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
         ($forkContentGate['env']['CONTENT_POLICY'] ?? null) !== "\${{ matrix.product == 'main' && 'control-plane-main' || 'none' }}" ||
         ! str_contains($forkContentGateRun, 'OCI_CONTENT_POLICY="$CONTENT_POLICY"') ||
         ! str_contains($forkContentGateRun, 'tests/Integration/VerifyOciArchiveImage.sh')) {
-        $violations[] = 'both native fork control-plane OCI archives must pass the fail-closed runtime content census';
+        $violations[] = 'both self-hosted fork control-plane OCI archives must pass the fail-closed runtime content census';
     }
 
     $forkBundledRuntimeGate = releaseWorkflowStep(
@@ -912,7 +912,7 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
         ($forkBundledRuntimeGate['continue-on-error'] ?? false) !== false ||
         ($forkBundledRuntimeGate['env']['PRODUCTION_IMAGE'] ?? null) !== 'local/${{ matrix.artifact_name }}:${{ github.sha }}-${{ matrix.arch }}-fork-runtime' ||
         ($forkBundledRuntimeGate['run'] ?? null) !== 'tests/Integration/RealtimeImageTest.sh') {
-        $violations[] = 'both native fork production images must execute bundled Reverb and terminal acceptance before publication';
+        $violations[] = 'both self-hosted fork production images must execute bundled Reverb and terminal acceptance before publication';
     }
 
     $forkMainPlatforms = collect($jobs['fork-build']['strategy']['matrix']['include'] ?? [])
@@ -940,7 +940,7 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
         ($forkSbomCensus['continue-on-error'] ?? false) !== false ||
         ! str_contains($forkSbomCensusRun, 'contains("haproxy")') ||
         ! str_contains($forkSbomCensusRun, '.sbom.spdx.json')) {
-        $violations[] = 'both native fork control-plane SBOMs must reject HAProxy package residue';
+        $violations[] = 'both self-hosted fork control-plane SBOMs must reject HAProxy package residue';
     }
 
     return array_values(array_unique($violations));
@@ -1317,7 +1317,7 @@ it('rejects fork publication graphs that bypass the exact control-plane image ce
         $mutatedWorkflow,
         $applicationValidationWorkflow,
         $mutatedCallers,
-    ))->toContain('both native fork control-plane OCI archives must pass the fail-closed runtime content census');
+    ))->toContain('both self-hosted fork control-plane OCI archives must pass the fail-closed runtime content census');
 })->with([
     'missing census' => 'remove-fork-control-plane-census',
     'census applied to the wrong image' => 'misroute-fork-control-plane-census',
@@ -1341,17 +1341,17 @@ it('rejects fork publication graphs that drop native architecture or SBOM residu
         $mutatedCallers,
     ))->toContain($expectedViolation);
 })->with([
-    'missing native arm64 acceptance' => [
+    'missing self-hosted arm64 acceptance' => [
         'remove-fork-main-arm64-acceptance',
         'fork control-plane publication must retain native amd64 and arm64 archive acceptance',
     ],
     'missing signed SBOM census' => [
         'remove-fork-control-plane-sbom-census',
-        'both native fork control-plane SBOMs must reject HAProxy package residue',
+        'both self-hosted fork control-plane SBOMs must reject HAProxy package residue',
     ],
     'missing native bundled runtime' => [
         'remove-fork-bundled-runtime',
-        'both native fork production images must execute bundled Reverb and terminal acceptance before publication',
+        'both self-hosted fork production images must execute bundled Reverb and terminal acceptance before publication',
     ],
 ]);
 
@@ -2290,6 +2290,18 @@ it('executes immutable-tag, compensation, and platform-verification behavior aga
 
     expect($process->isSuccessful())->toBeTrue($process->getErrorOutput())
         ->and($process->getOutput())->toContain('PUBLISH_LINUX_IMAGE_HELPER_PASS');
+});
+
+it('injects the realtime runtime environment through the Docker API', function () {
+    $script = (string) file_get_contents(
+        releaseWorkflowRepositoryRoot().'/tests/Integration/RealtimeImageTest.sh',
+    );
+
+    expect($script)
+        ->toContain('docker create --pull never --name "$container"')
+        ->toContain('docker cp "$runtime_env" "${container}:/var/www/html/.env"')
+        ->toContain('docker start "$container"')
+        ->not->toContain('type=bind');
 });
 
 it('loads a native child from a nested attested OCI archive', function () {
