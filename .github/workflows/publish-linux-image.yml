@@ -2563,8 +2563,9 @@ jobs:
           verify_recovery_release_asset_hash() {
             local asset_name=$1 download_directory
             download_directory="$(mktemp -d "$RUNNER_TEMP/coolify-fork-recovery-download.XXXXXX")"
-            "$GH_CLI" release download "$SEMANTIC_VERSION" --repo "$GITHUB_REPOSITORY" \
-              --pattern "$asset_name" --dir "$download_directory"
+            "$GITHUB_WORKSPACE/scripts/ci/download-github-release-asset.sh" \
+              "$GH_CLI" "$GITHUB_REPOSITORY" "$SEMANTIC_VERSION" "$asset_name" \
+              "$download_directory" 5 2
             [[ -f "$download_directory/$asset_name" && ! -L "$download_directory/$asset_name" ]]
             [[ "$(sha256_of "$bundle_directory/$asset_name")" == "$(sha256_of "$download_directory/$asset_name")" ]] || {
               printf 'Fork recovery draft asset does not match the signed release bundle: %s\n' "$asset_name" >&2
@@ -2939,8 +2940,9 @@ jobs:
           verify_release_asset_hash() {
             local asset_name=$1 download_directory
             download_directory="$(mktemp -d "$RUNNER_TEMP/coolify-fork-release-download.XXXXXX")"
-            "$GH_CLI" release download "$SEMANTIC_VERSION" --repo "$GITHUB_REPOSITORY" \
-              --pattern "$asset_name" --dir "$download_directory"
+            "$GITHUB_WORKSPACE/scripts/ci/download-github-release-asset.sh" \
+              "$GH_CLI" "$GITHUB_REPOSITORY" "$SEMANTIC_VERSION" "$asset_name" \
+              "$download_directory" 5 2
             [[ -f "$download_directory/$asset_name" && ! -L "$download_directory/$asset_name" ]]
             [[ "$(sha256_of "$bundle_directory/$asset_name")" == "$(sha256_of "$download_directory/$asset_name")" ]] || {
               printf 'Fork tag release asset does not match the signed release bundle: %s\n' "$asset_name" >&2
