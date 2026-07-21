@@ -88,6 +88,7 @@ All notable changes to this project will be documented in this file.
 - *(blue-green)* Complete probe and release proof contracts
 - *(blue-green)* Recover prepared activations safely
 - *(ci)* Keep fallback validation annotation-free
+- *(release)* Remove redundant ruleset audit credential
 
 ### 💼 Other
 
@@ -126,6 +127,7 @@ All notable changes to this project will be documented in this file.
 - Update changelog (#100)
 - Update changelog (#102)
 - Update changelog (#103)
+- Update changelog (#105)
 
 ### 🎨 Styling
 
