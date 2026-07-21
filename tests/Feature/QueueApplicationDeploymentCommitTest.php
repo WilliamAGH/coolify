@@ -817,11 +817,6 @@ describe('activation job queue restore', function () {
         $restored->__unserialize($payload);
 
         $queueProperty = new ReflectionProperty(ApplicationDeploymentJob::class, 'application_deployment_queue');
-        expect($queueProperty->isInitialized($restored))->toBeFalse();
-
-        $hydrate = new ReflectionMethod(ApplicationDeploymentJob::class, 'hydrateDeploymentContext');
-        $hydrate->invoke($restored);
-
         expect($queueProperty->isInitialized($restored))->toBeTrue()
             ->and($queueProperty->getValue($restored)->id)->toBe($deployment->id)
             ->and($restored->application_deployment_queue_id)->toBe($deployment->id);
@@ -844,7 +839,7 @@ describe('activation job queue restore', function () {
         $deployment->update(['horizon_job_id' => $newerAttempt]);
 
         $queueProperty = new ReflectionProperty(ApplicationDeploymentJob::class, 'application_deployment_queue');
-        expect($queueProperty->isInitialized($restored))->toBeFalse();
+        expect($queueProperty->isInitialized($restored))->toBeTrue();
 
         $restored->failed(new RuntimeException('stale activation failure must not win'));
 

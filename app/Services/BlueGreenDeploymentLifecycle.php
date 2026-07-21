@@ -14,6 +14,8 @@ use App\Actions\Application\BlueGreen\BlueGreenLegacyProviderState;
 use App\Actions\Application\BlueGreen\BlueGreenLegacyRoutingSnapshot;
 use App\Actions\Application\BlueGreen\BlueGreenOperationFence;
 use App\Actions\Application\BlueGreen\BlueGreenOperationFenceLostException;
+use App\Actions\Application\BlueGreen\BlueGreenPublicRouteAcknowledgementMismatch;
+use App\Actions\Application\BlueGreen\BlueGreenReconciliationResult;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaInspection;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\CaptureBlueGreenLegacyRouting;
@@ -26,6 +28,7 @@ use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Actions\Application\BlueGreen\InspectBlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\PlanBlueGreenPublicRecovery;
 use App\Actions\Application\BlueGreen\ReadBlueGreenServerBootIdentity;
+use App\Actions\Application\BlueGreen\ReconcileBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\ReconstructBlueGreenDeploymentRecovery;
 use App\Actions\Application\BlueGreen\RecordBlueGreenCandidateIdentity;
 use App\Actions\Application\BlueGreen\RecordBlueGreenDestinationState;
@@ -133,6 +136,8 @@ final class BlueGreenDeploymentLifecycle
 
     private bool $rollbackCompleted = false;
 
+    private bool $preparedActivationHandled = false;
+
     private readonly int $inactiveRetentionSeconds;
 
     /** @param Closure(): void $checkForCancellation */
@@ -175,16 +180,6 @@ final class BlueGreenDeploymentLifecycle
 
             return;
         }
-        // Activation resumes the exact PREPARING claim created by preparation-only ownership.
-        if ($durableState?->phase === BlueGreenDeploymentPhase::PREPARING
-            && $durableState->operation_deployment_uuid === $this->deployment->deployment_uuid
-            && $this->deployment->execution_phase === ApplicationDeploymentExecutionPhase::Activate) {
-            $this->acquireLifecycleLock();
-            $this->assertNotFencedByDeactivation();
-            $this->initializePreparingActivation($durableState);
-
-            return;
-        }
         if ($durableState !== null
             && ($durableState->phase !== BlueGreenDeploymentPhase::IDLE
                 || $durableState->operation_deployment_uuid !== null)) {
@@ -217,6 +212,167 @@ final class BlueGreenDeploymentLifecycle
         );
     }
 
+    public function initializePreparedActivation(): void
+    {
+        if ($this->deployment->execution_phase !== ApplicationDeploymentExecutionPhase::Activate) {
+            throw new DeploymentException('A prepared blue-green activation requires exact activation-phase queue ownership.');
+        }
+
+        $state = ApplicationBlueGreenDeployment::query()
+            ->where('application_id', $this->application->id)
+            ->where('standalone_docker_id', $this->destination->id)
+            ->first();
+        if ($state?->phase === BlueGreenDeploymentPhase::DRAINING
+            && $state->operation_deployment_uuid === $this->deployment->deployment_uuid) {
+            $this->initialize();
+
+            return;
+        }
+        if ($state?->phase === BlueGreenDeploymentPhase::IDLE
+            && $this->isExactCompletedDrainingRecovery($state)) {
+            $this->enabled = true;
+            $this->completedDrainingRecovery = true;
+
+            return;
+        }
+        if ($state === null
+            || $state->operation_deployment_uuid !== $this->deployment->deployment_uuid
+            || ! in_array($state->phase, [
+                BlueGreenDeploymentPhase::PREPARING,
+                BlueGreenDeploymentPhase::SWITCHING,
+                BlueGreenDeploymentPhase::ROLLING_BACK,
+            ], true)) {
+            $this->preparedActivationHandled = true;
+            $this->deployment->addLogEntry(
+                'Deferred a stale prepared activation because its exact durable blue-green operation is no longer resumable by this queue owner.',
+                'stderr',
+            );
+
+            return;
+        }
+
+        try {
+            $acquiredLifecycleLock = $this->tryAcquireLifecycleLock();
+        } catch (Throwable $exception) {
+            report($exception);
+            $this->preparedActivationHandled = true;
+            $this->deployment->addLogEntry(
+                'Deferred prepared blue-green activation because lifecycle lock acquisition could not be confirmed.',
+                'stderr',
+            );
+
+            return;
+        }
+        if (! $acquiredLifecycleLock) {
+            $this->preparedActivationHandled = true;
+            $this->deployment->addLogEntry(
+                'Deferred prepared blue-green activation because another lifecycle owner still holds the destination lock.',
+                'stderr',
+            );
+
+            return;
+        }
+        if (FindBlueGreenDeactivationFence::run($this->deployment) !== null) {
+            $this->preparedActivationHandled = true;
+            $this->deployment->addLogEntry(
+                'Deferred prepared blue-green activation because application deactivation owns this destination.',
+                'stderr',
+            );
+
+            return;
+        }
+        $state = ApplicationBlueGreenDeployment::query()->find($state->getKey());
+        if ($state?->phase === BlueGreenDeploymentPhase::IDLE
+            && $this->isExactCompletedDrainingRecovery($state)) {
+            $this->enabled = true;
+            $this->completedDrainingRecovery = true;
+
+            return;
+        }
+        if ($state === null || $state->operation_deployment_uuid !== $this->deployment->deployment_uuid) {
+            $this->preparedActivationHandled = true;
+
+            return;
+        }
+        if ($state->phase === BlueGreenDeploymentPhase::DRAINING) {
+            $this->enabled = true;
+            $this->initializeDrainingRecovery($state);
+
+            return;
+        }
+        if (! in_array($state->phase, [
+            BlueGreenDeploymentPhase::PREPARING,
+            BlueGreenDeploymentPhase::SWITCHING,
+            BlueGreenDeploymentPhase::ROLLING_BACK,
+        ], true)) {
+            $this->preparedActivationHandled = true;
+
+            return;
+        }
+        try {
+            $operation = ReconstructBlueGreenDeploymentRecovery::run($state);
+        } catch (Throwable) {
+            $result = ReconcileBlueGreenDeployment::run(
+                $state,
+                staleAfterSeconds: 1,
+                ignoreQueueActivity: true,
+                operationFence: $this->operationFence,
+            );
+            $this->preparedActivationHandled = true;
+            $this->deployment->addLogEntry(
+                "Prepared blue-green activation reconstruction recovery outcome={$result->outcome}: {$result->message}",
+                'stderr',
+            );
+
+            return;
+        }
+        if ($operation->deployment->getKey() !== $this->deployment->getKey()) {
+            throw new DeploymentException('The prepared blue-green activation did not reconstruct to its exact pending queue owner.');
+        }
+        if ($operation->wasFinalized
+            || $operation->recoveredPhase !== BlueGreenDeploymentPhase::PREPARING
+            || $operation->routingMutationRecorded) {
+            $result = ReconcileBlueGreenDeployment::run(
+                $state,
+                staleAfterSeconds: 1,
+                ignoreQueueActivity: true,
+                operationFence: $this->operationFence,
+            );
+            $this->preparedActivationHandled = true;
+            $this->deployment->addLogEntry(
+                "Prepared blue-green activation recovery outcome={$result->outcome}: {$result->message}",
+                $result->outcome === BlueGreenReconciliationResult::RECONCILED ? 'stdout' : 'stderr',
+            );
+
+            return;
+        }
+
+        $this->enabled = true;
+        $this->claim = $operation->claim;
+        $this->previousActiveColor = $operation->claim->previousActiveColor;
+        $this->legacyContainerName = $operation->claim->legacyContainerName;
+        $this->legacyRoutingSnapshot = $operation->legacyRoutingSnapshot;
+        $this->serverBootId = $operation->claim->serverBootId;
+        $this->candidateContainerExpectation = $operation->candidateContainer;
+        $this->previousContainerExpectation = $operation->previousContainer;
+        $this->server->privateKey->storeInFileSystem();
+        ReadBlueGreenServerBootIdentity::run($this->server, $operation->claim->serverBootId);
+        $this->destinationState = $operation->currentDestinationState
+            ?? AttestBlueGreenDestinationState::run(
+                $this->server,
+                $this->application,
+                $this->destination,
+                null,
+            );
+        $this->loadPreviousRecoveryReplicaInspections($state);
+        $this->assertEligibility();
+        $this->assertOperationOwned(BlueGreenDeploymentPhase::PREPARING);
+        $this->captureStoppedLegacyContainerForRetirement();
+        $this->deployment->addLogEntry(
+            'Resumed the exact prepared blue-green activation claim after queue handoff.',
+        );
+    }
+
     public function isEnabled(): bool
     {
         return $this->enabled;
@@ -235,6 +391,11 @@ final class BlueGreenDeploymentLifecycle
     public function isCompletedDrainingRecovery(): bool
     {
         return $this->completedDrainingRecovery;
+    }
+
+    public function wasPreparedActivationHandled(): bool
+    {
+        return $this->preparedActivationHandled;
     }
 
     public function wasFinalizedFallbackRecovered(): bool
@@ -623,7 +784,32 @@ final class BlueGreenDeploymentLifecycle
         $this->lifecycleLock = null;
     }
 
+    public function releaseForPreparedActivationHandoff(): bool
+    {
+        $operationFence = $this->operationFence;
+        if (! $this->enabled) {
+            return $operationFence === null && $this->lifecycleLock === null;
+        }
+        if ($operationFence === null || ! $operationFence->releaseIfOwned()) {
+            return false;
+        }
+
+        $this->operationFence = null;
+        $this->lifecycleLock = null;
+
+        return true;
+    }
+
     private function acquireLifecycleLock(): void
+    {
+        if ($this->tryAcquireLifecycleLock()) {
+            return;
+        }
+
+        throw new DeploymentException('Another deployment or reconciler owns this application destination blue-green lifecycle.');
+    }
+
+    private function tryAcquireLifecycleLock(): bool
     {
         $leaseSeconds = BlueGreenDeploymentLock::deploymentLeaseSeconds(
             max($this->timeout, (int) config('constants.ssh.command_timeout')),
@@ -635,9 +821,12 @@ final class BlueGreenDeploymentLifecycle
         );
         if (! $this->lifecycleLock->get()) {
             $this->lifecycleLock = null;
-            throw new DeploymentException('Another deployment or reconciler owns this application destination blue-green lifecycle.');
+
+            return false;
         }
         $this->operationFence = new BlueGreenOperationFence($this->lifecycleLock, $leaseSeconds);
+
+        return true;
     }
 
     private function assertNotFencedByDeactivation(): void
@@ -683,7 +872,10 @@ final class BlueGreenDeploymentLifecycle
             || $this->deployment->blue_green_routing_revision !== $state->routing_revision
             || $this->deployment->blue_green_destination_fence_epoch !== $state->destination_fence_epoch
             || $this->deployment->blue_green_topology_digest !== $state->destination_topology_digest
-            || $this->deployment->blue_green_routing_config_digest !== $state->application_routing_config_digest) {
+            || ! is_string($this->deployment->blue_green_routing_config_digest)
+            || preg_match('/^[a-f0-9]{64}$/D', $this->deployment->blue_green_routing_config_digest) !== 1
+            || ! is_string($state->application_routing_config_digest)
+            || preg_match('/^[a-f0-9]{64}$/D', $state->application_routing_config_digest) !== 1) {
             return false;
         }
         foreach (ApplicationBlueGreenDeployment::clearedOperationAttributes() as $attribute => $_) {
@@ -693,52 +885,6 @@ final class BlueGreenDeploymentLifecycle
         }
 
         return true;
-    }
-
-    private function initializePreparingActivation(ApplicationBlueGreenDeployment $state): void
-    {
-        if ($state->operation_deployment_uuid !== $this->deployment->deployment_uuid) {
-            throw new DeploymentException('An unfinished blue-green preparation belongs to a different deployment and cannot be resumed by this queue entry.');
-        }
-        if ((int) $this->deployment->destination_id !== $this->destination->id
-            || (int) $this->deployment->server_id !== $this->server->id
-            || $this->deployment->pull_request_id !== 0
-            || $this->deployment->execution_phase !== ApplicationDeploymentExecutionPhase::Activate) {
-            throw new DeploymentException('The queued activation does not match the durable prepared blue-green destination ownership.');
-        }
-
-        $operation = ReconstructBlueGreenDeploymentRecovery::run($state);
-        if ($operation->wasFinalized
-            || $operation->recoveredPhase !== BlueGreenDeploymentPhase::PREPARING
-            || $operation->deployment->getKey() !== $this->deployment->getKey()) {
-            throw new DeploymentException('The durable blue-green PREPARING state does not reconstruct to this exact activation owner.');
-        }
-
-        $this->claim = $operation->claim;
-        $this->previousActiveColor = $operation->claim->previousActiveColor;
-        $this->legacyContainerName = $operation->claim->legacyContainerName;
-        $this->serverBootId = $operation->claim->serverBootId;
-        $this->candidateContainerExpectation = $operation->candidateContainer
-            ?? throw new DeploymentException('The durable blue-green PREPARING state has no candidate container identity.');
-        $this->previousContainerExpectation = $operation->previousContainer;
-        $this->server->privateKey->storeInFileSystem();
-        ReadBlueGreenServerBootIdentity::run($this->server, $operation->claim->serverBootId);
-        // A null reconstructed state is provably first adoption: no routing mutation
-        // exists yet, so there is no pre-operation destination state to resolve. Attest
-        // the absent-managed-file baseline exactly as the initial claim did (durable state
-        // null), never the PREPARING claim row, whose pending routing revision would read
-        // as an unenrolled routed destination.
-        $this->destinationState = $operation->currentDestinationState
-            ?? AttestBlueGreenDestinationState::run(
-                $this->server,
-                $this->application,
-                $this->destination,
-                null,
-            );
-        $this->assertOperationOwned(BlueGreenDeploymentPhase::PREPARING);
-        $this->deployment->addLogEntry(
-            'Resuming the exact durable blue-green PREPARING claim for activation; preparation ownership is preserved.',
-        );
     }
 
     private function initializeDrainingRecovery(ApplicationBlueGreenDeployment $state): void
@@ -802,6 +948,12 @@ final class BlueGreenDeploymentLifecycle
             }
         }
 
+        $this->loadPreviousRecoveryReplicaInspections($state);
+    }
+
+    private function loadPreviousRecoveryReplicaInspections(
+        ApplicationBlueGreenDeployment $state,
+    ): void {
         $previous = $this->previousContainerExpectation;
         if ($previous?->deploymentUuid === null || $previous->color === null || $previous->routingRevision === null) {
             return;
@@ -1858,6 +2010,9 @@ final class BlueGreenDeploymentLifecycle
                     );
                     throw new DeploymentException('Blue-green public verification failed after switch without retry: '.$lastFailure, previous: $exception);
                 }
+                if (! $this->isExpectedInitialProbeRouteAppearance($exception, $expectedPhase)) {
+                    throw new DeploymentException('Blue-green candidate probe verification failed without retry: '.$lastFailure, previous: $exception);
+                }
             }
             if ($attempt < $attempts) {
                 Sleep::for(1)->seconds();
@@ -1865,6 +2020,53 @@ final class BlueGreenDeploymentLifecycle
         }
 
         throw new DeploymentException("Traefik did not acknowledge every canonical blue-green router: {$lastFailure}");
+    }
+
+    private function isExpectedInitialProbeRouteAppearance(
+        Throwable $exception,
+        BlueGreenDeploymentPhase $expectedPhase,
+    ): bool {
+        if (! $exception instanceof BlueGreenPublicRouteAcknowledgementMismatch
+            || $exception->status !== 404
+            || $exception->acknowledgements !== []
+            || $expectedPhase !== BlueGreenDeploymentPhase::PREPARING
+            || $this->previousActiveColor !== null
+            || $this->legacyContainerName !== null
+            || $this->previousContainerExpectation !== null
+            || $this->legacyRoutingSnapshot !== null) {
+            return false;
+        }
+        $claim = $this->claim;
+        if ($claim === null
+            || $claim->previousActiveColor !== null
+            || $claim->legacyContainerName !== null) {
+            return false;
+        }
+
+        return ApplicationBlueGreenDeployment::query()
+            ->whereKey($claim->stateId)
+            ->where('application_id', $claim->applicationId)
+            ->where('standalone_docker_id', $claim->standaloneDockerId)
+            ->where('phase', BlueGreenDeploymentPhase::PREPARING->value)
+            ->where('pending_color', $claim->pendingColor->value)
+            ->where('pending_deployment_uuid', $claim->deploymentUuid)
+            ->where('operation_deployment_uuid', $claim->deploymentUuid)
+            ->where('operation_candidate_container_name', $claim->candidateContainerName)
+            ->where('operation_rollback_managed_filename', $claim->rollbackManagedFilename)
+            ->where('operation_destination_fence_epoch', $claim->destinationFenceEpoch)
+            ->where('operation_server_boot_id', $claim->serverBootId)
+            ->where('operation_topology_digest', $claim->topologyDigest)
+            ->where('operation_routing_config_digest', $claim->routingConfigDigest)
+            ->where('routing_revision', $claim->expectedRoutingRevision)
+            ->where('supersession_generation', $claim->supersessionGeneration)
+            ->whereNull('active_color')
+            ->whereNull('legacy_container_name')
+            ->whereNull('operation_previous_active_color')
+            ->whereNull('operation_previous_deployment_uuid')
+            ->whereNull('operation_previous_routing_revision')
+            ->whereNull('operation_previous_container_name')
+            ->whereNull('operation_previous_container_id')
+            ->exists();
     }
 
     private function monitorPublicHandoff(
@@ -2036,11 +2238,19 @@ final class BlueGreenDeploymentLifecycle
                 }
                 $this->assertOperationOwned(BlueGreenDeploymentPhase::ROLLING_BACK);
                 $this->assertServerBootIdentity();
-                BlueGreenProxyRollbackArtifactRestorer::run($this->server, $rollbackKey, $claim->serverBootId);
-                $rollbackState = $rollbackKey->rollbackState();
+                $currentState = $this->destinationState
+                    ?? throw new DeploymentException('Blue-green rollback has no exact current destination state.');
+                $rollbackState = $this->rollbackStateFromCurrentDestination($rollbackKey, $currentState);
+                BlueGreenProxyRollbackArtifactRestorer::run(
+                    $this->server,
+                    $rollbackKey,
+                    $claim->serverBootId,
+                    $currentState,
+                    $rollbackState,
+                );
                 RecordBlueGreenDestinationState::run(
                     $claim,
-                    $this->destinationState,
+                    $currentState,
                     $rollbackState,
                 );
                 $this->destinationState = $rollbackState;
@@ -2118,6 +2328,24 @@ final class BlueGreenDeploymentLifecycle
                 $cause,
             );
         }
+    }
+
+    private function rollbackStateFromCurrentDestination(
+        BlueGreenProxyRollbackKey $rollbackKey,
+        BlueGreenProxyState $currentState,
+    ): BlueGreenProxyState {
+        $destinationFenceEpoch = $currentState->destinationFenceEpoch + 1;
+        $mutationSequence = $currentState->mutationSequence + 1;
+
+        return $rollbackKey->expectedState?->withDestinationFenceEpoch(
+            $destinationFenceEpoch,
+            $rollbackKey->operationId,
+            $mutationSequence,
+        ) ?? $currentState->withoutManagedRoute(
+            $destinationFenceEpoch,
+            $rollbackKey->operationId,
+            $mutationSequence,
+        );
     }
 
     private function removeCandidateContainer(): void

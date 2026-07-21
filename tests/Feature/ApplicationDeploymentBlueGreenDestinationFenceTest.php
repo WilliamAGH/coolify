@@ -177,7 +177,8 @@ function createNewerApplicationDestinationFence(array $fixture): ApplicationBlue
 function createCompletedApplicationDeploymentBlueGreenState(array $fixture): ApplicationBlueGreenDeployment
 {
     $topologyDigest = hash('sha256', 'completed-application-destination-topology');
-    $routingConfigDigest = hash('sha256', 'completed-application-routing-configuration');
+    $claimRoutingConfigDigest = hash('sha256', 'completed-application-routing-claim');
+    $actualRoutingConfigDigest = hash('sha256', 'completed-application-routing-configuration');
     $state = ApplicationBlueGreenDeployment::query()->create([
         'application_id' => $fixture['application']->id,
         'standalone_docker_id' => $fixture['destination']->id,
@@ -191,7 +192,7 @@ function createCompletedApplicationDeploymentBlueGreenState(array $fixture): App
         'destination_fence_mutation_sequence' => 1,
         'managed_file_sha256' => hash('sha256', 'completed-managed-route'),
         'destination_topology_digest' => $topologyDigest,
-        'application_routing_config_digest' => $routingConfigDigest,
+        'application_routing_config_digest' => $actualRoutingConfigDigest,
     ]);
     $fixture['deployment']->update([
         'blue_green_color' => BlueGreenDeploymentColor::BLUE->value,
@@ -201,7 +202,7 @@ function createCompletedApplicationDeploymentBlueGreenState(array $fixture): App
         'blue_green_destination_fence_epoch' => 1,
         'blue_green_server_boot_id' => '11111111-2222-3333-4444-555555555555',
         'blue_green_topology_digest' => $topologyDigest,
-        'blue_green_routing_config_digest' => $routingConfigDigest,
+        'blue_green_routing_config_digest' => $claimRoutingConfigDigest,
     ]);
 
     return $state;

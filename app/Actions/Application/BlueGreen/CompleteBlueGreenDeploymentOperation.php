@@ -58,7 +58,8 @@ final class CompleteBlueGreenDeploymentOperation
                 && $state->destination_fence_mutation_sequence > 0
                 && $state->managed_file_sha256 !== null
                 && $state->destination_topology_digest === $claim->topologyDigest
-                && $state->application_routing_config_digest === $claim->routingConfigDigest
+                && is_string($state->application_routing_config_digest)
+                && preg_match('/^[a-f0-9]{64}$/D', $state->application_routing_config_digest) === 1
                 && $deployment->blue_green_color === $claim->pendingColor
                 && $deployment->blue_green_routing_revision === $claim->expectedRoutingRevision
                 && $deployment->blue_green_destination_fence_epoch === $claim->destinationFenceEpoch
@@ -158,7 +159,7 @@ final class CompleteBlueGreenDeploymentOperation
                     'inactive_retirement_destination_fence_epoch' => $state->destination_fence_epoch,
                     'inactive_retirement_server_boot_id' => $claim->serverBootId,
                     'inactive_retirement_topology_digest' => $claim->topologyDigest,
-                    'inactive_retirement_routing_config_digest' => $claim->routingConfigDigest,
+                    'inactive_retirement_routing_config_digest' => $state->application_routing_config_digest,
                     'inactive_retirement_not_before_at' => $notBeforeAt,
                     'inactive_retirement_drain_deadline_at' => $notBeforeAt->copy()->addSeconds(
                         $stopGraceSeconds,
@@ -183,7 +184,7 @@ final class CompleteBlueGreenDeploymentOperation
                 ->where('destination_fence_operation_id', $claim->deploymentUuid)
                 ->where('operation_server_boot_id', $claim->serverBootId)
                 ->where('destination_topology_digest', $claim->topologyDigest)
-                ->where('application_routing_config_digest', $claim->routingConfigDigest)
+                ->whereNotNull('application_routing_config_digest')
                 ->whereNull('deactivation_operation_id')
                 ->whereNull('deactivation_started_at')
                 ->where('supersession_generation', $claim->supersessionGeneration)

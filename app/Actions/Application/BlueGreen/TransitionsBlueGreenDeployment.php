@@ -57,7 +57,8 @@ final class TransitionsBlueGreenDeployment
                 || $state->destination_fence_mutation_sequence < 1
                 || $state->managed_file_sha256 === null
                 || $state->destination_topology_digest !== $claim->topologyDigest
-                || $state->application_routing_config_digest !== $claim->routingConfigDigest) {
+                || ! is_string($state->application_routing_config_digest)
+                || preg_match('/^[a-f0-9]{64}$/D', $state->application_routing_config_digest) !== 1) {
                 throw new BlueGreenDeploymentTransitionException('The final managed route was not durably attested for the exact claimed candidate.');
             }
             $deploymentColumn = match ($claim->pendingColor) {
@@ -526,7 +527,8 @@ final class TransitionsBlueGreenDeployment
             && $state->managed_file_sha256 !== null
             && $state->operation_server_boot_id === $claim->serverBootId
             && $state->destination_topology_digest === $claim->topologyDigest
-            && $state->application_routing_config_digest === $claim->routingConfigDigest
+            && is_string($state->application_routing_config_digest)
+            && preg_match('/^[a-f0-9]{64}$/D', $state->application_routing_config_digest) === 1
             && $state->legacy_container_name === $claim->legacyContainerName
             && $state->{$deploymentColumn} === $claim->deploymentUuid;
     }
@@ -555,7 +557,8 @@ final class TransitionsBlueGreenDeployment
             && $state->destination_fence_mutation_sequence > 0
             && $state->managed_file_sha256 !== null
             && $state->destination_topology_digest === $claim->topologyDigest
-            && $state->application_routing_config_digest === $claim->routingConfigDigest
+            && is_string($state->application_routing_config_digest)
+            && preg_match('/^[a-f0-9]{64}$/D', $state->application_routing_config_digest) === 1
             && $state->legacy_container_name === $claim->legacyContainerName
             && $state->{$deploymentColumn} === $claim->deploymentUuid;
     }
@@ -685,7 +688,7 @@ final class TransitionsBlueGreenDeployment
             ->whereNotNull('managed_file_sha256')
             ->where('operation_server_boot_id', $claim->serverBootId)
             ->where('destination_topology_digest', $claim->topologyDigest)
-            ->where('application_routing_config_digest', $claim->routingConfigDigest)
+            ->whereNotNull('application_routing_config_digest')
             ->where($deploymentColumn, $claim->deploymentUuid)
             ->whereNull('deactivation_operation_id')
             ->whereNull('deactivation_started_at')
@@ -776,7 +779,7 @@ final class TransitionsBlueGreenDeployment
             ->where('destination_fence_mutation_sequence', '>', 0)
             ->whereNotNull('managed_file_sha256')
             ->where('destination_topology_digest', $claim->topologyDigest)
-            ->where('application_routing_config_digest', $claim->routingConfigDigest)
+            ->whereNotNull('application_routing_config_digest')
             ->where($deploymentColumn, $claim->deploymentUuid)
             ->whereNull('deactivation_operation_id')
             ->whereNull('deactivation_started_at')

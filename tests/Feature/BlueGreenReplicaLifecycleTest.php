@@ -10,11 +10,14 @@ use App\Actions\Application\BlueGreen\BlueGreenOperationFence;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaInspection;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
+use App\Actions\Application\BlueGreen\ComputeBlueGreenDeploymentFingerprint;
 use App\Actions\Application\BlueGreen\InspectBlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\ReconstructBlueGreenDeploymentRecovery;
 use App\Actions\Application\BlueGreen\RemoveBlueGreenApplicationContainers;
 use App\Actions\Application\BlueGreen\RemoveBlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\ReserveBlueGreenReplicaSet;
+use App\Actions\Proxy\BlueGreenRoutingTarget;
+use App\Enums\ApplicationDeploymentExecutionPhase;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
@@ -32,6 +35,7 @@ use App\Models\Team;
 use App\Services\BlueGreenDeploymentLifecycle;
 use Illuminate\Database\QueryException;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Process;
@@ -495,6 +499,9 @@ it('binds the durable N=3 identities before refusing partial health after a rest
             'label=coolify.blueGreen.replicaIndex=2',
             'label=coolify.blueGreen.replicaIndex=3',
         )
+        ->and(collect($rollbackCommands)->filter(
+            static fn (string $command): bool => str_starts_with($command, 'docker rm -f '),
+        ))->toHaveCount(3)
         ->and($deployment->fresh()->blue_green_candidate_container_id)->toBeNull();
 });
 
@@ -978,6 +985,290 @@ it('freezes the configured replica count into durable claim provenance before se
             ->and($replicas->pluck('replica_index')->all())->toBe([1, 2, 3]);
     } finally {
         $lifecycle->release();
+    }
+});
+
+it('reconstructs the exact prepared claim after the activation queue handoff', function (): void {
+    ['application' => $application, 'destination' => $destination, 'server' => $server] = BlueGreenDeactivationScenario::context();
+    $application->update([
+        'health_check_enabled' => true,
+        'ports_mappings' => null,
+    ]);
+    $application->settings()->update([
+        'is_blue_green_deployment_enabled' => true,
+        'is_container_label_readonly_enabled' => true,
+    ]);
+    $deployment = ApplicationDeploymentQueue::query()->create([
+        'application_id' => $application->id,
+        'application_name' => $application->name,
+        'server_id' => $server->id,
+        'server_name' => $server->name,
+        'destination_id' => $destination->id,
+        'deployment_uuid' => 'prepared-activation-claim',
+        'pull_request_id' => 0,
+        'commit' => 'prepared-activation-claim',
+        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+        'execution_phase' => ApplicationDeploymentExecutionPhase::Prepare,
+        'only_this_server' => true,
+    ]);
+    Process::fake(function (PendingProcess $process) {
+        $command = is_array($process->command)
+            ? implode(' ', $process->command)
+            : (string) $process->command;
+
+        if (str_contains($command, 'coolify-blue-green-destination-state-attested')) {
+            return Process::result(output: 'coolify-blue-green-destination-state-attested');
+        }
+
+        if (str_contains($command, '/proc/sys/kernel/random/boot_id')) {
+            return Process::result(output: BlueGreenDeactivationScenario::BOOT_ID);
+        }
+
+        return Process::result(output: '');
+    });
+    $preparation = new BlueGreenDeploymentLifecycle(
+        application: $application,
+        deployment: $deployment,
+        destination: $destination,
+        server: $server,
+        timeout: 30,
+        checkForCancellation: static function (): void {},
+    );
+    $preparation->initialize();
+    $preparedClaim = $preparation->claim();
+    $preparation->release();
+    $deployment->update(['execution_phase' => ApplicationDeploymentExecutionPhase::Activate]);
+    $activation = new BlueGreenDeploymentLifecycle(
+        application: $application,
+        deployment: $deployment->fresh(),
+        destination: $destination,
+        server: $server,
+        timeout: 30,
+        checkForCancellation: static function (): void {},
+    );
+
+    try {
+        $activation->initializePreparedActivation();
+        $activationClaim = $activation->claim();
+
+        expect($activationClaim)->not->toBeNull()
+            ->and($activationClaim->stateId)->toBe($preparedClaim->stateId)
+            ->and($activationClaim->deploymentUuid)->toBe($preparedClaim->deploymentUuid)
+            ->and($activationClaim->candidateContainerName)->toBe($preparedClaim->candidateContainerName)
+            ->and($activationClaim->destinationFenceEpoch)->toBe($preparedClaim->destinationFenceEpoch)
+            ->and($activationClaim->topologyDigest)->toBe($preparedClaim->topologyDigest)
+            ->and($activationClaim->routingConfigDigest)->toBe($preparedClaim->routingConfigDigest);
+    } finally {
+        $activation->release();
+    }
+
+    Process::assertRanTimes(function (PendingProcess $process): bool {
+        $command = is_array($process->command)
+            ? implode(' ', $process->command)
+            : (string) $process->command;
+
+        return str_contains($command, 'coolify-blue-green-destination-state-attested');
+    }, 2);
+});
+
+it('reconstructs the exact active three-replica predecessor after the activation queue handoff', function (): void {
+    ['application' => $application, 'destination' => $destination, 'server' => $server] = BlueGreenDeactivationScenario::context();
+    $application->update([
+        'health_check_enabled' => true,
+        'ports_mappings' => null,
+    ]);
+    $application->settings()->update([
+        'is_blue_green_deployment_enabled' => true,
+        'is_container_label_readonly_enabled' => true,
+        'blue_green_replica_count' => 3,
+    ]);
+    $application = $application->fresh(['settings']);
+    $previousDeploymentUuid = 'prepared-activation-previous-green';
+    $candidateDeploymentUuid = 'prepared-activation-candidate-blue';
+    $backendPortInventory = BlueGreenBackendPortInventory::fromPorts([3000]);
+    $previousFingerprint = ComputeBlueGreenDeploymentFingerprint::run(
+        $application,
+        $destination,
+        BlueGreenDeploymentColor::GREEN,
+        1,
+        1,
+        $previousDeploymentUuid,
+    );
+    $managedFilename = BlueGreenRoutingTarget::managedFilename((string) $application->uuid, (int) $destination->id);
+    $state = ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $application->id,
+        'standalone_docker_id' => $destination->id,
+        'active_color' => BlueGreenDeploymentColor::GREEN,
+        'green_deployment_uuid' => $previousDeploymentUuid,
+        'phase' => BlueGreenDeploymentPhase::IDLE,
+        'routing_revision' => 1,
+        'destination_fence_epoch' => 1,
+        'destination_fence_operation_id' => $previousDeploymentUuid,
+        'destination_fence_mutation_sequence' => 1,
+        'managed_file_sha256' => str_repeat('d', 64),
+        'destination_topology_digest' => $previousFingerprint->topologyDigest,
+        'application_routing_config_digest' => $previousFingerprint->routingConfigDigest,
+        'supersession_generation' => 1,
+    ]);
+    $previousReplicaRows = collect(range(1, 3))->map(function (int $index) use (
+        $application,
+        $destination,
+        $previousDeploymentUuid,
+        $state,
+    ): ApplicationBlueGreenReplica {
+        $composeService = $application->uuid."-green-replica-{$index}";
+
+        return ApplicationBlueGreenReplica::query()->create([
+            'application_blue_green_deployment_id' => $state->id,
+            'application_id' => $application->id,
+            'standalone_docker_id' => $destination->id,
+            'color' => BlueGreenDeploymentColor::GREEN,
+            'replica_index' => $index,
+            'deployment_uuid' => $previousDeploymentUuid,
+            'routing_revision' => 1,
+            'compose_project' => $application->uuid,
+            'compose_service' => $composeService,
+            'container_name' => $composeService.'-1',
+            'container_id' => str_repeat((string) $index, 64),
+            'health_status' => 'healthy',
+        ]);
+    });
+    $previousInspections = $previousReplicaRows->map(
+        static fn (ApplicationBlueGreenReplica $replica): BlueGreenReplicaInspection => BlueGreenReplicaInspection::fromRuntime(
+            replicaIndex: $replica->replica_index,
+            composeService: $replica->compose_service,
+            containerName: $replica->container_name,
+            dockerId: $replica->container_id,
+            status: 'running',
+            health: 'healthy',
+        ),
+    )->all();
+    $previousReplicaDigest = BlueGreenReplicaSet::identityDigest($previousInspections);
+    $previousDeployment = ApplicationDeploymentQueue::query()->create([
+        'application_id' => $application->id,
+        'application_name' => $application->name,
+        'server_id' => $server->id,
+        'server_name' => $server->name,
+        'destination_id' => $destination->id,
+        'deployment_uuid' => $previousDeploymentUuid,
+        'pull_request_id' => 0,
+        'commit' => 'prepared-activation-previous-green-commit',
+        'status' => ApplicationDeploymentStatus::FINISHED->value,
+        'finished_at' => now()->subMinute(),
+        'blue_green_color' => BlueGreenDeploymentColor::GREEN,
+        'blue_green_phase' => BlueGreenDeploymentPhase::IDLE,
+        'blue_green_routing_revision' => 1,
+        'blue_green_destination_fence_epoch' => 1,
+        'blue_green_server_boot_id' => BlueGreenDeactivationScenario::BOOT_ID,
+        'blue_green_topology_digest' => $previousFingerprint->topologyDigest,
+        'blue_green_routing_config_digest' => $previousFingerprint->routingConfigDigest,
+        'blue_green_backend_port_inventory' => $backendPortInventory->serialized,
+        'blue_green_drain_backend_port_inventory' => null,
+        'blue_green_supersession_generation' => 1,
+        'blue_green_candidate_container_id' => $previousReplicaDigest,
+        'blue_green_rollback_managed_filename' => $managedFilename,
+    ]);
+    $candidateDeployment = ApplicationDeploymentQueue::query()->create([
+        'application_id' => $application->id,
+        'application_name' => $application->name,
+        'server_id' => $server->id,
+        'server_name' => $server->name,
+        'destination_id' => $destination->id,
+        'deployment_uuid' => $candidateDeploymentUuid,
+        'pull_request_id' => 0,
+        'commit' => 'prepared-activation-candidate-blue-commit',
+        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+        'execution_phase' => ApplicationDeploymentExecutionPhase::Prepare,
+        'only_this_server' => true,
+    ]);
+    $preparedClaim = ClaimBlueGreenDeployment::run(
+        application: $application,
+        standaloneDocker: $destination,
+        deployment: $candidateDeployment,
+        serverBootId: BlueGreenDeactivationScenario::BOOT_ID,
+        previousContainer: new BlueGreenContainerExpectation(
+            name: $application->uuid.'-green',
+            dockerId: $previousReplicaDigest,
+            applicationId: $application->id,
+            pullRequestId: 0,
+            blueGreenManaged: true,
+            deploymentUuid: $previousDeployment->deployment_uuid,
+            color: BlueGreenDeploymentColor::GREEN,
+            routingRevision: 1,
+        ),
+    );
+    $candidateDeployment->update(['execution_phase' => ApplicationDeploymentExecutionPhase::Activate]);
+    $previousReplicaOutput = $previousReplicaRows->map(static function (ApplicationBlueGreenReplica $replica): string {
+        return json_encode([
+            'Id' => $replica->container_id,
+            'Name' => '/'.$replica->container_name,
+            'State' => ['Status' => 'running', 'Health' => ['Status' => 'healthy']],
+            'Config' => ['Labels' => [
+                'coolify.applicationId' => (string) $replica->application_id,
+                'coolify.pullRequestId' => '0',
+                'coolify.blueGreen.managed' => 'true',
+                'coolify.blueGreen.deploymentUuid' => $replica->deployment_uuid,
+                'coolify.blueGreen.color' => $replica->color->value,
+                'coolify.blueGreen.routingRevision' => (string) $replica->routing_revision,
+                'coolify.blueGreen.replicaIndex' => (string) $replica->replica_index,
+                'coolify.blueGreen.replicaCount' => '3',
+                'com.docker.compose.project' => $replica->compose_project,
+                'com.docker.compose.service' => $replica->compose_service,
+            ]],
+        ], JSON_THROW_ON_ERROR);
+    })->implode("\n");
+    Process::fake(function ($process) use ($previousReplicaOutput) {
+        $command = is_array($process->command) ? implode(' ', $process->command) : (string) $process->command;
+
+        if (str_contains($command, '/proc/sys/kernel/random/boot_id')) {
+            return Process::result(output: BlueGreenDeactivationScenario::BOOT_ID);
+        }
+        if (str_contains($command, 'coolify_replica_')) {
+            return Process::result(output: $previousReplicaOutput);
+        }
+
+        return Process::result(output: '[]');
+    });
+    $activation = new BlueGreenDeploymentLifecycle(
+        application: $application,
+        deployment: $candidateDeployment->fresh(),
+        destination: $destination,
+        server: $server,
+        timeout: 30,
+        checkForCancellation: static function (): void {},
+    );
+
+    try {
+        $activation->initializePreparedActivation();
+        expect($activation->wasPreparedActivationHandled())->toBeFalse(
+            (string) $candidateDeployment->fresh()?->logs,
+        );
+        $reconstructedPreviousReplicas = (new ReflectionProperty($activation, 'previousReplicaInspections'))->getValue($activation);
+        $reconstructedPreviousExpectation = (new ReflectionProperty($activation, 'previousContainerExpectation'))->getValue($activation);
+        $reconstructedPreviousBackends = (new ReflectionMethod(
+            $activation,
+            'replicaBackendsForColor',
+        ))->invoke($activation, BlueGreenDeploymentColor::GREEN);
+
+        expect($activation->claim()?->stateId)->toBe($preparedClaim->stateId)
+            ->and($reconstructedPreviousReplicas)->toHaveCount(3)
+            ->and(array_map(
+                static fn (BlueGreenReplicaInspection $inspection): int => $inspection->replicaIndex,
+                $reconstructedPreviousReplicas,
+            ))->toBe([1, 2, 3])
+            ->and(array_map(
+                static fn (BlueGreenReplicaInspection $inspection): string => $inspection->dockerId,
+                $reconstructedPreviousReplicas,
+            ))->toBe($previousReplicaRows->pluck('container_id')->all())
+            ->and(array_map(
+                static fn (BlueGreenReplicaInspection $inspection): string => $inspection->status.'/'.$inspection->health,
+                $reconstructedPreviousReplicas,
+            ))->toBe(['running/healthy', 'running/healthy', 'running/healthy'])
+            ->and($reconstructedPreviousBackends)->toBe($previousReplicaRows->pluck('container_name')->all())
+            ->and(BlueGreenReplicaSet::identityDigest($reconstructedPreviousReplicas))->toBe($previousReplicaDigest)
+            ->and($reconstructedPreviousExpectation->dockerId)->toBe($previousReplicaDigest);
+    } finally {
+        $activation->release();
     }
 });
 

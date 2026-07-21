@@ -304,7 +304,7 @@ it('fails a public handoff after one post-switch gateway error instead of maskin
     );
 })->with([502, 503]);
 
-it('proves a first legacy-adoption candidate through a private probe before any public router can shadow legacy traffic', function (): void {
+it('fails a legacy-adoption candidate probe without retry before a public router can shadow legacy traffic', function (): void {
     config(['constants.ssh.mux_enabled' => false]);
     Sleep::fake();
     $context = blueGreenContinuousAvailabilityContext(BlueGreenRoutingMode::ProbeOnly, probeOnly: true);
@@ -314,14 +314,12 @@ it('proves a first legacy-adoption candidate through a private probe before any 
     $claim = $context['claim'];
     $parsed = Yaml::parse($configuration->yaml, Yaml::PARSE_EXCEPTION_ON_ALIAS | Yaml::PARSE_EXCEPTION_ON_INVALID_TYPE);
     $routers = data_get($parsed, 'http.routers');
-    $probeAttempts = [];
-    for ($attempt = 1; $attempt <= 10; $attempt++) {
-        $probeAttempts[] = Process::result(output: $claim->serverBootId);
-        $probeAttempts[] = Process::result(output: 'coolify-blue-green-destination-state-attested');
-        $probeAttempts[] = Process::result(output: $claim->serverBootId);
-        $probeAttempts[] = Process::result(output: "HTTP/1.1 503 Service Unavailable\r\n\r\n");
-    }
-    Process::fake(['*' => Process::sequence($probeAttempts)]);
+    Process::fake(['*' => Process::sequence([
+        Process::result(output: $claim->serverBootId),
+        Process::result(output: 'coolify-blue-green-destination-state-attested'),
+        Process::result(output: $claim->serverBootId),
+        Process::result(output: "HTTP/1.1 503 Service Unavailable\r\n\r\n"),
+    ])]);
 
     try {
         expect(fn () => invokeBlueGreenContinuousAvailabilityLifecycle(
@@ -330,7 +328,7 @@ it('proves a first legacy-adoption candidate through a private probe before any 
             $configuration,
             $target,
             BlueGreenDeploymentPhase::PREPARING,
-        ))->toThrow(DeploymentException::class, 'Traefik did not acknowledge every canonical blue-green router');
+        ))->toThrow(DeploymentException::class, 'candidate probe verification failed without retry');
     } finally {
         $lifecycle->release();
     }
@@ -342,13 +340,13 @@ it('proves a first legacy-adoption candidate through a private probe before any 
         ->and(data_get($parsed, 'http.services'))->not->toBe([])
         ->and(collect(data_get($parsed, 'http.services', []))->keys()->all())
         ->each->toStartWith('coolify-bg-');
-    Sleep::assertSleptTimes(9);
+    Sleep::assertNeverSlept();
     Process::assertRanTimes(
         fn (PendingProcess $process): bool => str_contains(
             (string) $process->input,
             'X-Coolify-Blue-Green-Probe',
         ),
-        10,
+        1,
     );
     Process::assertRanTimes(
         fn (PendingProcess $process): bool => str_contains((string) $process->input, 'url = ')

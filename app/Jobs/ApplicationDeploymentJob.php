@@ -252,6 +252,8 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
 
     private bool $handoffScheduled = false;
 
+    private bool $preserveBlueGreenRecovery = false;
+
     private Collection|string $build_secrets;
 
     private ?BlueGreenDeploymentLifecycle $blueGreenLifecycle = null;
@@ -443,7 +445,22 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
                         $this->checkForCancellation();
                     },
                 );
-                $this->blueGreenLifecycle->initialize();
+                if ($this->activationOnly) {
+                    $this->blueGreenLifecycle->initializePreparedActivation();
+                } else {
+                    $this->blueGreenLifecycle->initialize();
+                }
+                if ($this->blueGreenLifecycle->wasPreparedActivationHandled()) {
+                    $this->preserveBlueGreenRecovery = true;
+
+                    return;
+                }
+                if ($this->activationOnly && $this->blueGreenLifecycle->isCompletedDrainingRecovery()) {
+                    $this->preserveBlueGreenRecovery = true;
+                    $this->completeBlueGreenDrainRecovery();
+
+                    return;
+                }
                 if ($this->blueGreenLifecycle->isDrainingRecovery()) {
                     $this->blueGreenLifecycle->resumeDrainingOperation();
                     if ($this->blueGreenLifecycle->wasFinalizedFallbackRecovered()) {
@@ -545,7 +562,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         } finally {
             // Wrap cleanup operations in try-catch to prevent exceptions from interfering
             // with Laravel's job failure handling and status updates
-            if (! $drainRecoveryScheduled && ! $this->handoffScheduled) {
+            if (! $drainRecoveryScheduled && ! $this->handoffScheduled && ! $this->preserveBlueGreenRecovery) {
                 try {
                     ApplicationDeploymentQueue::query()
                         ->whereKey($this->application_deployment_queue->getKey())
@@ -563,7 +580,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
                 }
             }
 
-            if (! $this->handoffScheduled) {
+            if (! $this->handoffScheduled && ! $this->preserveBlueGreenRecovery) {
                 try {
                     if ($this->use_build_server) {
                         $this->server = $this->build_server;
@@ -591,12 +608,12 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
                 }
             }
 
-            // Always drop the cache lock, including preparation→activation handoff.
-            // Activation is a separate worker process and cannot inherit the owner token.
-            try {
-                $this->blueGreenLifecycle?->release();
-            } catch (Throwable $e) {
-                Log::warning('Failed to release blue-green lifecycle ownership for deployment '.$this->deployment_uuid.': '.$e->getMessage());
+            if (! $this->handoffScheduled) {
+                try {
+                    $this->blueGreenLifecycle?->release();
+                } catch (Throwable $e) {
+                    Log::warning('Failed to release blue-green lifecycle ownership for deployment '.$this->deployment_uuid.': '.$e->getMessage());
+                }
             }
         }
     }
@@ -2522,6 +2539,23 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         }
 
         $this->handoffScheduled = true;
+        try {
+            $released = $this->blueGreenLifecycle?->releaseForPreparedActivationHandoff() ?? true;
+        } catch (Throwable $exception) {
+            Log::warning(
+                'Deferred prepared activation publication because the preparation lifecycle lock release could not be confirmed: '
+                .$exception->getMessage(),
+            );
+
+            return true;
+        }
+        if (! $released) {
+            Log::warning(
+                'Deferred prepared activation publication because the preparation lifecycle lock release was not confirmed.',
+            );
+
+            return true;
+        }
         $activationDeployment = $this->application_deployment_queue->fresh()
             ?? throw new DeploymentException('Prepared deployment disappeared before activation dispatch.');
         dispatch_claimed_application_deployment(
@@ -6646,7 +6680,10 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
             || $this->application_deployment_queue->blue_green_routing_revision !== $state->routing_revision
             || $this->application_deployment_queue->blue_green_destination_fence_epoch !== $state->destination_fence_epoch
             || $this->application_deployment_queue->blue_green_topology_digest !== $state->destination_topology_digest
-            || $this->application_deployment_queue->blue_green_routing_config_digest !== $state->application_routing_config_digest) {
+            || ! is_string($this->application_deployment_queue->blue_green_routing_config_digest)
+            || preg_match('/^[a-f0-9]{64}$/D', $this->application_deployment_queue->blue_green_routing_config_digest) !== 1
+            || ! is_string($state->application_routing_config_digest)
+            || preg_match('/^[a-f0-9]{64}$/D', $state->application_routing_config_digest) !== 1) {
             throw new DeploymentException('Blue-green drain recovery cannot mark deployment success before its exact durable IDLE completion state is present.');
         }
         foreach (ApplicationBlueGreenDeployment::clearedOperationAttributes() as $attribute => $_) {
