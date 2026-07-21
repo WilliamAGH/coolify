@@ -172,17 +172,29 @@ class VerifyBlueGreenPublicRecovery
     ): void {
         ['status' => $status, 'acknowledgements' => $acknowledgements] = $this->responseFor($headers);
         if ($status < 200 || $status >= 400) {
-            throw new RuntimeException("The restored router {$route['router']} returned an ineligible public status {$status}.");
+            throw new BlueGreenPublicRouteAcknowledgementMismatch(
+                status: $status,
+                acknowledgements: $acknowledgements,
+                message: "The restored router {$route['router']} returned an ineligible public status {$status}.",
+            );
         }
         if ($expectedAcknowledgement === null) {
             if ($acknowledgements !== []) {
-                throw new RuntimeException("The restored router {$route['router']} leaked the reserved probe acknowledgement.");
+                throw new BlueGreenPublicRouteAcknowledgementMismatch(
+                    status: $status,
+                    acknowledgements: $acknowledgements,
+                    message: "The restored router {$route['router']} leaked the reserved probe acknowledgement.",
+                );
             }
 
             return;
         }
         if ($acknowledgements !== [$expectedAcknowledgement]) {
-            throw new RuntimeException("The restored router {$route['router']} did not return its exact opaque acknowledgement.");
+            throw new BlueGreenPublicRouteAcknowledgementMismatch(
+                status: $status,
+                acknowledgements: $acknowledgements,
+                message: "The restored router {$route['router']} did not return its exact opaque acknowledgement.",
+            );
         }
         if ($expectedReleaseProof === null) {
             return;
