@@ -7,7 +7,6 @@ use App\Jobs\ApplicationDeploymentJob;
 use App\Models\Application;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\Environment;
-use App\Models\InstanceSettings;
 use App\Models\Project;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
@@ -828,8 +827,7 @@ describe('activation job queue restore', function () {
             ->and($restored->application_deployment_queue_id)->toBe($deployment->id);
     });
 
-    test('failed rehydrates before reading private parent ownership state', function () {
-        InstanceSettings::unguarded(fn () => InstanceSettings::query()->firstOrCreate(['id' => 0]));
+    test('failed rehydrates before preserving a newer dispatch owner', function () {
         $application = makeApplication($this->environment->id, $this->destination->id, null);
         $deployment = makeQueueAdmissionDeployment($application, $this->server, 'activate-failed-rehydrate');
         $deployment->update([
@@ -842,20 +840,18 @@ describe('activation job queue restore', function () {
         $payload = $job->__serialize();
         $restored = (new ReflectionClass(ActivateApplicationDeploymentJob::class))->newInstanceWithoutConstructor();
         $restored->__unserialize($payload);
+        $newerAttempt = (string) Str::uuid();
+        $deployment->update(['horizon_job_id' => $newerAttempt]);
 
         $queueProperty = new ReflectionProperty(ApplicationDeploymentJob::class, 'application_deployment_queue');
         expect($queueProperty->isInitialized($restored))->toBeFalse();
 
-        try {
-            $restored->failed(new RuntimeException('activation failed path rehydrate probe'));
-        } catch (Error $error) {
-            expect($error->getMessage())->not->toContain('must not be accessed before initialization');
-            throw $error;
-        } catch (Throwable) {
-            // failDeployment may need broader fixtures; rehydration itself must have succeeded.
-        }
+        $restored->failed(new RuntimeException('stale activation failure must not win'));
 
         expect($queueProperty->isInitialized($restored))->toBeTrue()
-            ->and($queueProperty->getValue($restored)->id)->toBe($deployment->id);
+            ->and($queueProperty->getValue($restored)->id)->toBe($deployment->id)
+            ->and($deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+            ->and($deployment->fresh()->execution_phase)->toBe(ApplicationDeploymentExecutionPhase::Activate)
+            ->and($deployment->fresh()->horizon_job_id)->toBe($newerAttempt);
     });
 });
