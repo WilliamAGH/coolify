@@ -15,7 +15,7 @@ function releaseWorkflowTestDigest(string $character): string
 }
 
 /**
- * @return array{curl_log: string, environment: array<string, string>, log: string, state: string}
+ * @return array{environment: array<string, string>, log: string, state: string}
  */
 function releaseWorkflowPrepareForkPromotionRegistryDouble(
     string $fixture,
@@ -23,11 +23,9 @@ function releaseWorkflowPrepareForkPromotionRegistryDouble(
 ): array {
     $filesystem = new Filesystem;
     $bin = $fixture.'/bin';
-    $curlLog = $fixture.'/curl.log';
     $log = $fixture.'/regctl.log';
     $state = $fixture.'/state';
     $filesystem->mkdir([$bin, $state]);
-    file_put_contents($curlLog, '');
     file_put_contents($log, '');
     file_put_contents($state.'/main', ($mainSemanticDigest ?? 'absent')."\n");
     file_put_contents($bin.'/regctl', <<<'SH'
@@ -100,73 +98,9 @@ case "$1:$2" in
 esac
 SH);
     chmod($bin.'/regctl', 0755);
-    file_put_contents($bin.'/curl', <<<'SH'
-#!/bin/sh
-set -eu
-printf '%s\n' "$*" >> "${CURL_LOG:?}"
-api="https://api.github.com/repos/${GITHUB_REPOSITORY:?}"
-semantic=${SEMANTIC_VERSION:?}
-source_revision=${GITHUB_SHA:?}
-tag_one=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-url=''
-for argument in "$@"; do
-    case "$argument" in
-        https://api.github.com/*) url=$argument ;;
-    esac
-done
-
-case "$url" in
-    "$api/git/ref/tags/$semantic")
-        printf '{"ref":"refs/tags/%s","object":{"type":"tag","sha":"%s"}}\n' "$semantic" "$tag_one"
-        ;;
-    "$api/git/tags/$tag_one")
-        if [ "${FORK_LIVE_TAG_STATE:-matching}" = mismatch ]; then
-            source_revision=dddddddddddddddddddddddddddddddddddddddd
-        fi
-        verified=true
-        reason=valid
-        tagger_name='William Callahan'
-        tagger_email='william@aventure.vc'
-        signature='-----BEGIN SSH SIGNATURE----- fixture'
-        if [ "${FORK_LIVE_TAG_STATE:-matching}" = unsigned ]; then
-            verified=false
-            reason=unsigned
-            signature=''
-        elif [ "${FORK_LIVE_TAG_STATE:-matching}" = wrong-tagger ]; then
-            tagger_email='other@example.com'
-        fi
-        jq -n \
-            --arg tag "$semantic" \
-            --arg tagger_name "$tagger_name" \
-            --arg tagger_email "$tagger_email" \
-            --arg source_revision "$source_revision" \
-            --arg signature "$signature" \
-            --arg reason "$reason" \
-            --argjson verified "$verified" \
-            '{tag:$tag,tagger:{name:$tagger_name,email:$tagger_email},object:{type:"commit",sha:$source_revision},verification:{verified:$verified,reason:$reason,signature:$signature}}'
-        ;;
-    "$api/rulesets?targets=tag&includes_parents=true&per_page=100")
-        printf '[{"id":42,"name":"Protect Coolify fork release tags","enforcement":"active"}]\n'
-        ;;
-    "$api/rulesets/42")
-        if [ "${FORK_RULESET_STATE:-matching}" = missing-deletion ]; then
-            printf '{"id":42,"name":"Protect Coolify fork release tags","target":"tag","enforcement":"active","conditions":{"ref_name":{"include":["refs/tags/*.*.*-fork*"],"exclude":[]}},"rules":[{"type":"creation"},{"type":"update"}]}\n'
-        else
-            printf '{"id":42,"name":"Protect Coolify fork release tags","target":"tag","enforcement":"active","conditions":{"ref_name":{"include":["refs/tags/*.*.*-fork*"],"exclude":[]}},"rules":[{"type":"creation"},{"type":"update"},{"type":"deletion"}]}\n'
-        fi
-        ;;
-    *)
-        printf 'unexpected curl URL: %s\n' "$url" >&2
-        exit 64
-        ;;
-esac
-SH);
-    chmod($bin.'/curl', 0755);
 
     return [
-        'curl_log' => $curlLog,
         'environment' => [
-            'CURL_LOG' => $curlLog,
             'GITHUB_REF' => 'refs/tags/4.13.1-fork',
             'GITHUB_REPOSITORY' => 'williamacallahan/coolify',
             'GITHUB_SHA' => str_repeat('a', 40),
@@ -179,8 +113,6 @@ SH);
             'FORK_VERSION_SHA_TAG' => 'docker.iocloudhost.net/williamagh/coolify:fork-4.13.1-fork-aaaaaaa',
             'FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE' => '/dev/null',
             'FORK_RELEASE_TAG_VERIFIER' => '/usr/bin/true',
-            'FORK_RELEASE_RULESET_TOKEN' => 'fixture-ruleset-token',
-            'FORK_RELEASE_TRUST_VERIFIER' => '/usr/bin/true',
             'PATH' => $bin.PATH_SEPARATOR.(getenv('PATH') ?: ''),
             'REGCTL_LOG' => $log,
             'REGCTL_STATE' => $state,
@@ -288,8 +220,6 @@ SH);
             'GITHUB_SHA' => str_repeat('a', 40),
             'FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE' => '/dev/null',
             'FORK_RELEASE_TAG_VERIFIER' => '/usr/bin/true',
-            'FORK_RELEASE_RULESET_TOKEN' => 'fixture-ruleset-token',
-            'FORK_RELEASE_TRUST_VERIFIER' => '/usr/bin/true',
             'RUNNER_TEMP' => $fixture,
             'SEMANTIC_VERSION' => '4.13.1-fork',
             'SOURCE_REVISION' => str_repeat('a', 40),
@@ -411,8 +341,6 @@ SH);
             'GITHUB_SHA' => str_repeat('a', 40),
             'FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE' => '/dev/null',
             'FORK_RELEASE_TAG_VERIFIER' => '/usr/bin/true',
-            'FORK_RELEASE_RULESET_TOKEN' => 'fixture-ruleset-token',
-            'FORK_RELEASE_TRUST_VERIFIER' => '/usr/bin/true',
             'PATH' => $bin.PATH_SEPARATOR.(getenv('PATH') ?: ''),
             'RELEASE_ASSETS_JSON' => json_encode(
                 array_map(static fn (string $assetName): array => ['name' => $assetName], $assetNames),
@@ -862,13 +790,6 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
             $violations[] = "workflow validation must verify pinned source provenance for {$dockerfile}";
         }
     }
-    $releaseShellIntegrations = (string) (releaseWorkflowStep(
-        $workflowAndShell,
-        'Run release publication shell integrations',
-    )['run'] ?? '');
-    if (! str_contains($releaseShellIntegrations, 'tests/Integration/VerifyForkReleaseTrustTest.sh')) {
-        $violations[] = 'workflow validation must execute the canonical fork release trust integration';
-    }
     $shellcheckScript = (string) (releaseWorkflowStep($workflowAndShell, 'ShellCheck changed shell scripts')['run'] ?? '');
     foreach (['strict_scripts', 'legacy_scripts', '--diff-filter=A', '--severity=error'] as $requiredShellcheckContract) {
         if (! str_contains($shellcheckScript, $requiredShellcheckContract)) {
@@ -1257,19 +1178,18 @@ SH;
         $forkRelease,
         'Reverify every fork alias after release publication',
     )['run'] ?? '');
-    $canonicalTrustVerifierInvocation = <<<'SH'
-FORK_RELEASE_RULESET_TOKEN="$ruleset_token" "$FORK_RELEASE_TRUST_VERIFIER" \
+    $canonicalTagVerifierInvocation = <<<'SH'
+"$FORK_RELEASE_TAG_VERIFIER" \
     "$SEMANTIC_VERSION" "$SOURCE_REVISION" \
-    "$SOURCE_URL.git" "$FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE" \
-    "$GITHUB_REPOSITORY"
+    "$SOURCE_URL.git" "$FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE"
 SH;
     foreach ([$draftRecoveryRun, $promotionRun, $releasePublicationRun, $postPublicationVerificationRun] as $releaseRun) {
-        if (! str_contains($releaseRun, $canonicalTrustVerifierInvocation)) {
-            $violations[] = 'fork release lost the canonical signer and empty-bypass ruleset trust verifier';
+        if (! str_contains($releaseRun, $canonicalTagVerifierInvocation)) {
+            $violations[] = 'fork release lost the canonical signed-tag verifier';
         }
     }
-    if (($forkRelease['env']['FORK_RELEASE_TRUST_VERIFIER'] ?? null) !== 'scripts/ci/verify-fork-release-trust.sh') {
-        $violations[] = 'fork release lost the canonical trust verifier owner';
+    if (($forkRelease['env']['FORK_RELEASE_TAG_VERIFIER'] ?? null) !== 'scripts/ci/verify-fork-release-tag.sh') {
+        $violations[] = 'fork release lost the canonical signed-tag verifier owner';
     }
     if (($forkRelease['env']['FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE'] ?? null) !== 'docker/fork-release-tag-allowed-signers') {
         $violations[] = 'fork release signer authorization must use the committed canonical inventory path';
@@ -1310,56 +1230,36 @@ SH,
             $violations[] = 'every disposable fork staging registry write must be fenced by live tag verification';
         }
     }
-    foreach ([
-        'Create or validate empty draft recovery release before semantic promotion',
-        'Promote and verify the main fork image',
-        'Publish immutable signed fork bundles to the tag release',
-        'Reverify every fork alias after release publication',
-    ] as $trustStepName) {
-        $trustStep = releaseWorkflowStep($forkRelease, $trustStepName);
-        if (($trustStep['env']['FORK_RELEASE_RULESET_TOKEN'] ?? null) !== '${{ secrets.FORK_RELEASE_RULESET_TOKEN }}'
-            || ($trustStep['env']['GH_TOKEN'] ?? null) !== '${{ github.token }}') {
-            $violations[] = 'fork release trust checks must isolate the ruleset audit token from release mutation credentials';
-        }
-        $trustRun = (string) ($trustStep['run'] ?? '');
-        if (! str_contains($trustRun, 'ruleset_token=${FORK_RELEASE_RULESET_TOKEN:?}'.PHP_EOL.'unset FORK_RELEASE_RULESET_TOKEN')) {
-            $violations[] = 'fork release trust steps must unexport ruleset authority before running any external command';
-        }
-    }
-    if (($caller['jobs']['publish']['secrets']['FORK_RELEASE_RULESET_TOKEN'] ?? null) !== '${{ secrets.FORK_RELEASE_RULESET_TOKEN }}') {
-        $violations[] = 'fork caller must explicitly pass the ruleset audit token';
-    }
-
     $semanticMutationBoundaries = [
-        [$draftRecoveryRun, '~if ! refresh_release_metadata; then\\s+verify_live_fork_release_trust\\s+if ! "\\$GH_CLI" release create "\\$SEMANTIC_VERSION"~'],
-        [$draftRecoveryRun, '~release create "\\$SEMANTIC_VERSION".*?; then\\n {4}verify_live_fork_release_trust\\n {4}refresh_release_metadata~s'],
-        [$draftRecoveryRun, '~\\n {2}else\\n {4}verify_live_fork_release_trust\\n {4}refresh_release_metadata\\n {2}fi~'],
-        [$promotionRun, '~if \\[\\[ -z "\\$existing" \\]\\]; then\\s+verify_live_fork_release_trust\\s+if regctl image copy "\\$repository@\\$expected_index_digest" "\\$repository:\\$SEMANTIC_VERSION"~'],
-        [$promotionRun, '~if regctl image copy "\\$repository@\\$expected_index_digest" "\\$repository:\\$SEMANTIC_VERSION"; then\\n {6}verify_live_fork_release_trust\\n {4}else\\n {6}verify_live_fork_release_trust\\n {6}existing=~'],
-        [$promotionRun, '~if \\[\\[ -z "\\$existing" \\]\\]; then\\s+verify_live_fork_release_trust\\s+regctl image copy "\\$repository@\\$expected_index_digest" "\\$tag"~'],
-        [$promotionRun, '~if \\[\\[ "\\$\\(digest_or_absent "\\$tag"\\)" != "\\$expected_index_digest" \\]\\]; then\\s+verify_live_fork_release_trust\\s+regctl image copy "\\$repository@\\$expected_index_digest" "\\$tag"~'],
-        [$releasePublicationRun, '~0\\)\\s+verify_live_fork_release_trust\\s+if "\\$GH_CLI" release upload "\\$SEMANTIC_VERSION"~'],
-        [$releasePublicationRun, '~release upload "\\$SEMANTIC_VERSION".*?; then\\n {10}verify_live_fork_release_trust\\n {8}else\\n {10}verify_live_fork_release_trust\\n {10}refresh_release_metadata~s'],
-        [$releasePublicationRun, '~assert_release_assets_are_exact\\s+assert_release_tag_targets_source_revision\\s+verify_live_fork_release_trust\\s+if "\\$GH_CLI" release edit "\\$SEMANTIC_VERSION"~'],
-        [$releasePublicationRun, '~release edit "\\$SEMANTIC_VERSION".*?; then\\n {4}verify_live_fork_release_trust\\n {2}else\\n {4}verify_live_fork_release_trust\\n {4}printf~s'],
-        [trim($releasePublicationRun), '~assert_release_assets_are_exact\\s+assert_release_tag_targets_source_revision\\s+verify_live_fork_release_trust\\s*\\z~'],
-        [trim($postPublicationVerificationRun), '~verify_live_fork_release_trust\\s*\\z~'],
+        [$draftRecoveryRun, '~if ! refresh_release_metadata; then\\s+verify_live_fork_tag\\s+if ! "\\$GH_CLI" release create "\\$SEMANTIC_VERSION"~'],
+        [$draftRecoveryRun, '~release create "\\$SEMANTIC_VERSION".*?; then\\n {4}verify_live_fork_tag\\n {4}refresh_release_metadata~s'],
+        [$draftRecoveryRun, '~\\n {2}else\\n {4}verify_live_fork_tag\\n {4}refresh_release_metadata\\n {2}fi~'],
+        [$promotionRun, '~if \\[\\[ -z "\\$existing" \\]\\]; then\\s+verify_live_fork_tag\\s+if regctl image copy "\\$repository@\\$expected_index_digest" "\\$repository:\\$SEMANTIC_VERSION"~'],
+        [$promotionRun, '~if regctl image copy "\\$repository@\\$expected_index_digest" "\\$repository:\\$SEMANTIC_VERSION"; then\\n {6}verify_live_fork_tag\\n {4}else\\n {6}verify_live_fork_tag\\n {6}existing=~'],
+        [$promotionRun, '~if \\[\\[ -z "\\$existing" \\]\\]; then\\s+verify_live_fork_tag\\s+regctl image copy "\\$repository@\\$expected_index_digest" "\\$tag"~'],
+        [$promotionRun, '~if \\[\\[ "\\$\\(digest_or_absent "\\$tag"\\)" != "\\$expected_index_digest" \\]\\]; then\\s+verify_live_fork_tag\\s+regctl image copy "\\$repository@\\$expected_index_digest" "\\$tag"~'],
+        [$releasePublicationRun, '~0\\)\\s+verify_live_fork_tag\\s+if "\\$GH_CLI" release upload "\\$SEMANTIC_VERSION"~'],
+        [$releasePublicationRun, '~release upload "\\$SEMANTIC_VERSION".*?; then\\n {10}verify_live_fork_tag\\n {8}else\\n {10}verify_live_fork_tag\\n {10}refresh_release_metadata~s'],
+        [$releasePublicationRun, '~assert_release_assets_are_exact\\s+assert_release_tag_targets_source_revision\\s+verify_live_fork_tag\\s+if "\\$GH_CLI" release edit "\\$SEMANTIC_VERSION"~'],
+        [$releasePublicationRun, '~release edit "\\$SEMANTIC_VERSION".*?; then\\n {4}verify_live_fork_tag\\n {2}else\\n {4}verify_live_fork_tag\\n {4}printf~s'],
+        [trim($releasePublicationRun), '~assert_release_assets_are_exact\\s+assert_release_tag_targets_source_revision\\s+verify_live_fork_tag\\s*\\z~'],
+        [trim($postPublicationVerificationRun), '~verify_live_fork_tag\\s*\\z~'],
     ];
     foreach ($semanticMutationBoundaries as $boundaryIndex => [$releaseRun, $boundaryVerifierPattern]) {
         if (preg_match($boundaryVerifierPattern, $releaseRun) !== 1) {
-            $violations[] = "fork release lost signer and empty-bypass ruleset verification at semantic mutation boundary {$boundaryIndex}";
+            $violations[] = "fork release lost signed-tag verification at semantic mutation boundary {$boundaryIndex}";
         }
     }
     $postCopyVerifierPatterns = [
-        // Both success and ambiguous-failure paths re-check trust before observing registry state.
-        [$promotionRun, '~regctl image copy "\\$repository@\\$expected_index_digest" "\\$repository:\\$SEMANTIC_VERSION"; then\\s+verify_live_fork_release_trust\\s+else\\s+verify_live_fork_release_trust~', 1],
-        // Alias tag copies must re-check release trust on the next line so a later
+        // Both success and ambiguous-failure paths re-check the tag before observing registry state.
+        [$promotionRun, '~regctl image copy "\\$repository@\\$expected_index_digest" "\\$repository:\\$SEMANTIC_VERSION"; then\\s+verify_live_fork_tag\\s+else\\s+verify_live_fork_tag~', 1],
+        // Alias tag copies must re-check the tag on the next line so a later
         // final assert cannot mask a missing post-copy verifier.
-        [$promotionRun, '~regctl image copy "\\$repository@\\$expected_index_digest" "\\$tag"\\s+verify_live_fork_release_trust~', 2],
+        [$promotionRun, '~regctl image copy "\\$repository@\\$expected_index_digest" "\\$tag"\\s+verify_live_fork_tag~', 2],
     ];
     foreach ($postCopyVerifierPatterns as [$releaseRun, $postCopyVerifierPattern, $expectedCount]) {
         if (preg_match_all($postCopyVerifierPattern, $releaseRun) !== $expectedCount) {
-            $violations[] = 'fork release must reverify signer and empty-bypass ruleset trust after every semantic registry copy';
+            $violations[] = 'fork release must reverify the signed tag after every semantic registry copy';
         }
     }
 
@@ -1440,28 +1340,27 @@ it('rejects unsafe fork source, signer, and runner topology mutations', function
         'missing-draft-release-signer' => $replaceForkReleaseRun(
             $sharedWorkflow,
             'Create or validate empty draft recovery release before semantic promotion',
-            '  verify_live_fork_release_trust'.PHP_EOL.'  if ! "$GH_CLI" release create',
+            '  verify_live_fork_tag'.PHP_EOL.'  if ! "$GH_CLI" release create',
             '  :'.PHP_EOL.'  if ! "$GH_CLI" release create',
         ),
-        'missing-post-draft-release-trust' => $replaceForkReleaseRunPattern(
+        'missing-post-draft-release-signer' => $replaceForkReleaseRunPattern(
             $sharedWorkflow,
             'Create or validate empty draft recovery release before semantic promotion',
-            '~(release create .*?; then\n)\s*verify_live_fork_release_trust~s',
+            '~(release create .*?; then\n)\s*verify_live_fork_tag~s',
             '$1  :',
         ),
         'missing-registry-write-signer' => $replaceForkReleaseRun(
             $sharedWorkflow,
             'Promote and verify the main fork image',
-            '    verify_live_fork_release_trust'.PHP_EOL.'    if regctl image copy',
+            '    verify_live_fork_tag'.PHP_EOL.'    if regctl image copy',
             '    :'.PHP_EOL.'    if regctl image copy',
         ),
         'missing-post-copy-signer' => $replaceForkReleaseRun(
             $sharedWorkflow,
             'Promote and verify the main fork image',
-            '      regctl image copy "$repository@$expected_index_digest" "$tag"'.PHP_EOL.'      verify_live_fork_release_trust',
+            '      regctl image copy "$repository@$expected_index_digest" "$tag"'.PHP_EOL.'      verify_live_fork_tag',
             '      regctl image copy "$repository@$expected_index_digest" "$tag"',
         ),
-        'missing-tag-ruleset-bypass-guard' => $sharedWorkflow['jobs']['fork-release']['env']['FORK_RELEASE_TRUST_VERIFIER'] = '/usr/bin/true',
         'external-allowed-signers-inventory' => $sharedWorkflow['jobs']['fork-release']['env']['FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE'] = '/tmp/allowed-signers',
         'missing-stage-tag-write-fence' => (function () use (&$sharedWorkflow): void {
             foreach ($sharedWorkflow['jobs']['fork-stage']['steps'] as &$step) {
@@ -1475,51 +1374,34 @@ it('rejects unsafe fork source, signer, and runner topology mutations', function
             }
             unset($step);
         })(),
-        'missing-ruleset-token-binding' => (function () use (&$sharedWorkflow): void {
-            foreach ($sharedWorkflow['jobs']['fork-release']['steps'] as &$step) {
-                if (($step['name'] ?? null) === 'Promote and verify the main fork image') {
-                    unset($step['env']['FORK_RELEASE_RULESET_TOKEN']);
-                }
-            }
-            unset($step);
-        })(),
-        'missing-ruleset-token-unset' => $replaceForkReleaseRun(
-            $sharedWorkflow,
-            'Promote and verify the main fork image',
-            'ruleset_token=${FORK_RELEASE_RULESET_TOKEN:?}'.PHP_EOL.'unset FORK_RELEASE_RULESET_TOKEN',
-            'ruleset_token=${FORK_RELEASE_RULESET_TOKEN:?}'.PHP_EOL.':',
-        ),
-        'missing-caller-ruleset-token' => (function () use (&$caller): void {
-            unset($caller['jobs']['publish']['secrets']['FORK_RELEASE_RULESET_TOKEN']);
-        })(),
         'missing-release-upload-signer' => $replaceForkReleaseRun(
             $sharedWorkflow,
             'Publish immutable signed fork bundles to the tag release',
-            '        verify_live_fork_release_trust'.PHP_EOL.'        if "$GH_CLI" release upload',
+            '        verify_live_fork_tag'.PHP_EOL.'        if "$GH_CLI" release upload',
             '        :'.PHP_EOL.'        if "$GH_CLI" release upload',
         ),
-        'missing-post-release-upload-trust' => $replaceForkReleaseRunPattern(
+        'missing-post-release-upload-signer' => $replaceForkReleaseRunPattern(
             $sharedWorkflow,
             'Publish immutable signed fork bundles to the tag release',
-            '~(release upload .*?; then\n)\s*verify_live_fork_release_trust~s',
+            '~(release upload .*?; then\n)\s*verify_live_fork_tag~s',
             '$1        :',
         ),
         'missing-release-publication-signer' => $replaceForkReleaseRun(
             $sharedWorkflow,
             'Publish immutable signed fork bundles to the tag release',
-            '  verify_live_fork_release_trust'.PHP_EOL.'  if "$GH_CLI" release edit',
+            '  verify_live_fork_tag'.PHP_EOL.'  if "$GH_CLI" release edit',
             '  :'.PHP_EOL.'  if "$GH_CLI" release edit',
         ),
-        'missing-post-release-publication-trust' => $replaceForkReleaseRun(
+        'missing-post-release-publication-signer' => $replaceForkReleaseRun(
             $sharedWorkflow,
             'Publish immutable signed fork bundles to the tag release',
-            '  if "$GH_CLI" release edit "$SEMANTIC_VERSION" --repo "$GITHUB_REPOSITORY" --draft=false; then'.PHP_EOL.'    verify_live_fork_release_trust',
+            '  if "$GH_CLI" release edit "$SEMANTIC_VERSION" --repo "$GITHUB_REPOSITORY" --draft=false; then'.PHP_EOL.'    verify_live_fork_tag',
             '  if "$GH_CLI" release edit "$SEMANTIC_VERSION" --repo "$GITHUB_REPOSITORY" --draft=false; then'.PHP_EOL.'    :',
         ),
         'missing-post-publication-signer' => $replaceForkReleaseRun(
             $sharedWorkflow,
             'Reverify every fork alias after release publication',
-            'verify_live_fork_release_trust',
+            'verify_live_fork_tag',
             ':',
         ),
         'missing-exact-runtime-source' => (function () use (&$caller): void {
@@ -1550,19 +1432,15 @@ it('rejects unsafe fork source, signer, and runner topology mutations', function
     'missing-push-event-check',
     'unsigned-annotated-tag',
     'missing-draft-release-signer',
-    'missing-post-draft-release-trust',
+    'missing-post-draft-release-signer',
     'missing-registry-write-signer',
     'missing-post-copy-signer',
-    'missing-tag-ruleset-bypass-guard',
     'external-allowed-signers-inventory',
     'missing-stage-tag-write-fence',
-    'missing-ruleset-token-binding',
-    'missing-ruleset-token-unset',
-    'missing-caller-ruleset-token',
     'missing-release-upload-signer',
-    'missing-post-release-upload-trust',
+    'missing-post-release-upload-signer',
     'missing-release-publication-signer',
-    'missing-post-release-publication-trust',
+    'missing-post-release-publication-signer',
     'missing-post-publication-signer',
     'missing-exact-runtime-source',
     'release-before-application-validation',
@@ -2834,7 +2712,7 @@ it('defines one referrerless fork release graph for the main image on both platf
     expect(is_executable($root.'/scripts/ci/deriveImageTags.mjs'))->toBeTrue()
         ->and(is_executable($root.'/scripts/ci/deriveImageTags.test.sh'))->toBeTrue()
         ->and(is_executable($root.'/scripts/ci/verify-nexus-docker-write-policy.sh'))->toBeTrue()
-        ->and(is_executable($root.'/scripts/ci/verify-fork-release-trust.sh'))->toBeTrue()
+        ->and(is_executable($root.'/scripts/ci/verify-fork-release-tag.sh'))->toBeTrue()
         ->and(is_executable($root.'/tests/Integration/VerifyNexusDockerWritePolicyTest.sh'))->toBeTrue();
 
     $matrix = $jobs['fork-build']['strategy']['matrix']['include'] ?? [];
@@ -2946,8 +2824,8 @@ it('defines one referrerless fork release graph for the main image on both platf
         ->not->toContain('scripts/ci/deriveImageTags.mjs')
         ->toContain('does not match its expected immutable index digest')
         ->toContain('accepting recovery state')
-        ->toContain('verify_live_fork_release_trust')
-        ->toContain('"$FORK_RELEASE_TRUST_VERIFIER"')
+        ->toContain('verify_live_fork_tag')
+        ->toContain('"$FORK_RELEASE_TAG_VERIFIER"')
         ->toContain('preflight_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"')
         ->toContain('promote_or_verify_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"')
         ->toContain('promote_and_verify_canonical_tags "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"')
@@ -2955,9 +2833,9 @@ it('defines one referrerless fork release graph for the main image on both platf
         ->not->toContain('DOCKER_TARGET');
 
     $preflightMainPosition = strpos($promotionRun, 'preflight_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"');
-    $preWriteTagVerificationPosition = strpos($promotionRun, 'verify_live_fork_release_trust', $preflightMainPosition ?: 0);
+    $preWriteTagVerificationPosition = strpos($promotionRun, 'verify_live_fork_tag', $preflightMainPosition ?: 0);
     $mainPromotionPosition = strpos($promotionRun, 'promote_or_verify_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"');
-    $postWriteTagVerificationPosition = strpos($promotionRun, 'verify_live_fork_release_trust', ($mainPromotionPosition ?: 0) + 1);
+    $postWriteTagVerificationPosition = strpos($promotionRun, 'verify_live_fork_tag', ($mainPromotionPosition ?: 0) + 1);
     expect($preflightMainPosition)->not->toBeFalse()
         ->and($preWriteTagVerificationPosition)->not->toBeFalse()
         ->and($mainPromotionPosition)->not->toBeFalse()
@@ -3040,9 +2918,7 @@ it('defines one referrerless fork release graph for the main image on both platf
     expect($forkRelease['env']['FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE'] ?? null)
         ->toBe('docker/fork-release-tag-allowed-signers')
         ->and($forkRelease['env']['FORK_RELEASE_TAG_VERIFIER'] ?? null)
-        ->toBe('scripts/ci/verify-fork-release-tag.sh')
-        ->and($forkRelease['env']['FORK_RELEASE_TRUST_VERIFIER'] ?? null)
-        ->toBe('scripts/ci/verify-fork-release-trust.sh');
+        ->toBe('scripts/ci/verify-fork-release-tag.sh');
     expect($forkRelease['env'] ?? [])
         ->not->toHaveKey('NEXUS_PASSWORD')
         ->not->toHaveKey('NEXUS_USERNAME')
@@ -3110,8 +2986,8 @@ it('defines one referrerless fork release graph for the main image on both platf
         ->toContain('Fork alias moved during release publication')
         ->toContain('regctl image digest "$MAIN_TARGET@$MAIN_INDEX_DIGEST" --platform linux/amd64')
         ->toContain('regctl image digest "$MAIN_TARGET@$MAIN_INDEX_DIGEST" --platform linux/arm64')
-        ->toContain('verify_live_fork_release_trust')
-        ->toContain('"$FORK_RELEASE_TRUST_VERIFIER"');
+        ->toContain('verify_live_fork_tag')
+        ->toContain('"$FORK_RELEASE_TAG_VERIFIER"');
 
     $forkReleaseStepNames = array_map(
         static fn (array $step): string => (string) ($step['name'] ?? ''),
@@ -3151,7 +3027,6 @@ it('defines one referrerless fork release graph for the main image on both platf
         'target_repository' => 'williamagh/coolify',
         'validate_only' => false,
     ])->and(array_keys($publish['secrets'] ?? []))->toBe([
-        'FORK_RELEASE_RULESET_TOKEN',
         'FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY',
         'NEXUS_PASSWORD',
         'NEXUS_USERNAME',
@@ -3641,9 +3516,7 @@ it('accepts an idempotent fork semantic promotion without overwriting its matchi
             ->and(trim((string) file_get_contents($registry['state'].'/main')))->toBe(releaseWorkflowTestDigest('3'))
             ->and(trim((string) file_get_contents($registry['state'].'/fork-latest')))->toBe(releaseWorkflowTestDigest('3'))
             ->and(trim((string) file_get_contents($registry['state'].'/fork-4.13.1-fork')))->toBe(releaseWorkflowTestDigest('3'))
-            ->and(trim((string) file_get_contents($registry['state'].'/fork-4.13.1-fork-aaaaaaa')))->toBe(releaseWorkflowTestDigest('3'))
-            ->and(substr_count((string) file_get_contents($registry['curl_log']), '/git/ref/tags/4.13.1-fork'))->toBe(0)
-            ->and(substr_count((string) file_get_contents($registry['curl_log']), 'rulesets?targets=tag&includes_parents=true&per_page=100'))->toBe(0);
+            ->and(trim((string) file_get_contents($registry['state'].'/fork-4.13.1-fork-aaaaaaa')))->toBe(releaseWorkflowTestDigest('3'));
     } finally {
         $filesystem->remove($fixture);
     }
@@ -3657,31 +3530,7 @@ it('treats the pinned regctl Nexus 404 response as an absent image', function ()
 
     expect(substr_count($workflow, $expectedMatcher))->toBe(4);
 });
-it('fails closed when release trust rejects tag protection before any semantic registry write', function () {
-    $root = releaseWorkflowRepositoryRoot();
-    $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
-    $promotionRun = (string) (releaseWorkflowStep(
-        $workflow['jobs']['fork-release'] ?? [],
-        'Promote and verify the main fork image',
-    )['run'] ?? '');
-    $filesystem = new Filesystem;
-    $fixture = sys_get_temp_dir().'/coolify-fork-ruleset-rejection-'.bin2hex(random_bytes(8));
-    $registry = releaseWorkflowPrepareForkPromotionRegistryDouble($fixture, null);
-    $registry['environment']['FORK_RELEASE_TRUST_VERIFIER'] = '/usr/bin/false';
-
-    try {
-        $process = new Process(['bash', '-c', $promotionRun], $root, $registry['environment']);
-        $process->run();
-
-        expect($process->isSuccessful())->toBeFalse()
-            ->and((string) file_get_contents($registry['log']))->not->toContain('image copy')
-            ->and(trim((string) file_get_contents($registry['state'].'/main')))->toBe('absent');
-    } finally {
-        $filesystem->remove($fixture);
-    }
-});
-
-it('fails closed when the canonical fork release trust verifier rejects semantic registry promotion', function () {
+it('fails closed when the canonical signed-tag verifier rejects semantic registry promotion', function () {
     $root = releaseWorkflowRepositoryRoot();
     $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
     $promotionRun = (string) (releaseWorkflowStep(
@@ -3691,7 +3540,7 @@ it('fails closed when the canonical fork release trust verifier rejects semantic
     $filesystem = new Filesystem;
     $fixture = sys_get_temp_dir().'/coolify-fork-live-tag-rejection-'.bin2hex(random_bytes(8));
     $registry = releaseWorkflowPrepareForkPromotionRegistryDouble($fixture, null);
-    $registry['environment']['FORK_RELEASE_TRUST_VERIFIER'] = '/usr/bin/false';
+    $registry['environment']['FORK_RELEASE_TAG_VERIFIER'] = '/usr/bin/false';
 
     try {
         $process = new Process(['bash', '-c', $promotionRun], $root, $registry['environment']);
@@ -3705,7 +3554,7 @@ it('fails closed when the canonical fork release trust verifier rejects semantic
     }
 });
 
-it('fails closed when the canonical fork release trust verifier rejects release publication', function () {
+it('fails closed when the canonical signed-tag verifier rejects release publication', function () {
     $root = releaseWorkflowRepositoryRoot();
     $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
     $publicationRun = (string) (releaseWorkflowStep(
@@ -3715,7 +3564,7 @@ it('fails closed when the canonical fork release trust verifier rejects release 
     $filesystem = new Filesystem;
     $fixture = sys_get_temp_dir().'/coolify-fork-unsigned-live-tag-rejection-'.bin2hex(random_bytes(8));
     $release = releaseWorkflowPrepareForkPublicationDouble($fixture, true);
-    $release['environment']['FORK_RELEASE_TRUST_VERIFIER'] = '/usr/bin/false';
+    $release['environment']['FORK_RELEASE_TAG_VERIFIER'] = '/usr/bin/false';
 
     try {
         $process = new Process(['bash', '-c', $publicationRun], $fixture, $release['environment']);

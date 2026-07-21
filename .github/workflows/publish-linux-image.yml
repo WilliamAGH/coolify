@@ -57,8 +57,6 @@ on:
         required: false
       FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY:
         required: false
-      FORK_RELEASE_RULESET_TOKEN:
-        required: false
     outputs:
       digest:
         description: Published multi-platform index digest.
@@ -2419,7 +2417,6 @@ jobs:
       SOURCE_URL: https://github.com/${{ github.repository }}
       FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE: docker/fork-release-tag-allowed-signers
       FORK_RELEASE_TAG_VERIFIER: scripts/ci/verify-fork-release-tag.sh
-      FORK_RELEASE_TRUST_VERIFIER: scripts/ci/verify-fork-release-trust.sh
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
@@ -2490,20 +2487,16 @@ jobs:
 
       - name: Create or validate empty draft recovery release before semantic promotion
         env:
-          FORK_RELEASE_RULESET_TOKEN: ${{ secrets.FORK_RELEASE_RULESET_TOKEN }}
           GH_CLI: ${{ steps.fork-release-gh-cli.outputs.path }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
           umask 077
-          ruleset_token=${FORK_RELEASE_RULESET_TOKEN:?}
-          unset FORK_RELEASE_RULESET_TOKEN
 
-          verify_live_fork_release_trust() {
-            FORK_RELEASE_RULESET_TOKEN="$ruleset_token" "$FORK_RELEASE_TRUST_VERIFIER" \
+          verify_live_fork_tag() {
+            "$FORK_RELEASE_TAG_VERIFIER" \
               "$SEMANTIC_VERSION" "$SOURCE_REVISION" \
-              "$SOURCE_URL.git" "$FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE" \
-              "$GITHUB_REPOSITORY"
+              "$SOURCE_URL.git" "$FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE"
           }
 
           expected_release_name="Coolify fork $SEMANTIC_VERSION"
@@ -2612,7 +2605,7 @@ jobs:
           }
 
           if ! refresh_release_metadata; then
-            verify_live_fork_release_trust
+            verify_live_fork_tag
             if ! "$GH_CLI" release create "$SEMANTIC_VERSION" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
@@ -2621,13 +2614,13 @@ jobs:
               --latest=false \
               --title "$expected_release_name" \
               --notes "Recovery record for immutable signed fork release bundles at source revision $SOURCE_REVISION."; then
-              verify_live_fork_release_trust
+              verify_live_fork_tag
               refresh_release_metadata || {
                 printf 'Fork recovery draft creation failed and no recoverable release is available.\n' >&2
                 exit 1
               }
             else
-              verify_live_fork_release_trust
+              verify_live_fork_tag
               refresh_release_metadata
             fi
           fi
@@ -2643,24 +2636,20 @@ jobs:
             assert_release_tag_targets_source_revision
             printf 'Published fork release exactly matches the immutable release contract; accepting idempotent retry.\n'
           fi
-          verify_live_fork_release_trust
+          verify_live_fork_tag
 
       - name: Promote and verify the main fork image
         env:
-          FORK_RELEASE_RULESET_TOKEN: ${{ secrets.FORK_RELEASE_RULESET_TOKEN }}
           GH_CLI: ${{ steps.fork-release-gh-cli.outputs.path }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
           umask 077
-          ruleset_token=${FORK_RELEASE_RULESET_TOKEN:?}
-          unset FORK_RELEASE_RULESET_TOKEN
 
-          verify_live_fork_release_trust() {
-            FORK_RELEASE_RULESET_TOKEN="$ruleset_token" "$FORK_RELEASE_TRUST_VERIFIER" \
+          verify_live_fork_tag() {
+            "$FORK_RELEASE_TAG_VERIFIER" \
               "$SEMANTIC_VERSION" "$SOURCE_REVISION" \
-              "$SOURCE_URL.git" "$FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE" \
-              "$GITHUB_REPOSITORY"
+              "$SOURCE_URL.git" "$FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE"
           }
 
           digest_or_absent() {
@@ -2737,11 +2726,11 @@ jobs:
             local repository=$1 expected_index_digest=$2 existing
             existing="$(digest_or_absent "$repository:$SEMANTIC_VERSION")"
             if [[ -z "$existing" ]]; then
-              verify_live_fork_release_trust
+              verify_live_fork_tag
               if regctl image copy "$repository@$expected_index_digest" "$repository:$SEMANTIC_VERSION"; then
-                verify_live_fork_release_trust
+                verify_live_fork_tag
               else
-                verify_live_fork_release_trust
+                verify_live_fork_tag
                 existing="$(digest_or_absent "$repository:$SEMANTIC_VERSION")"
                 [[ "$existing" == "$expected_index_digest" ]] || {
                   printf 'Fork semantic tag promotion did not produce its expected immutable index digest: %s:%s\n' \
@@ -2829,9 +2818,9 @@ jobs:
               [[ "$tag" == "$repository:"* ]]
               existing="$(digest_or_absent "$tag")"
               if [[ -z "$existing" ]]; then
-                verify_live_fork_release_trust
+                verify_live_fork_tag
                 regctl image copy "$repository@$expected_index_digest" "$tag"
-                verify_live_fork_release_trust
+                verify_live_fork_tag
               fi
               [[ "$(regctl image digest "$tag")" == "$expected_index_digest" ]]
             done
@@ -2839,9 +2828,9 @@ jobs:
             tag="${tags[0]}"
             [[ "$tag" == "$repository:"* ]]
             if [[ "$(digest_or_absent "$tag")" != "$expected_index_digest" ]]; then
-              verify_live_fork_release_trust
+              verify_live_fork_tag
               regctl image copy "$repository@$expected_index_digest" "$tag"
-              verify_live_fork_release_trust
+              verify_live_fork_tag
             fi
             [[ "$(regctl image digest "$tag")" == "$expected_index_digest" ]]
           }
@@ -2850,29 +2839,25 @@ jobs:
           preflight_canonical_tags "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"
           preflight_latest_tag "$MAIN_INDEX_DIGEST"
 
-          verify_live_fork_release_trust
+          verify_live_fork_tag
 
           promote_or_verify_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"
           promote_and_verify_canonical_tags "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"
           verify_exact_index "$MAIN_TARGET" "$MAIN_INDEX_DIGEST" "$MAIN_AMD64_DIGEST" "$MAIN_ARM64_DIGEST"
-          verify_live_fork_release_trust
+          verify_live_fork_tag
 
       - name: Publish immutable signed fork bundles to the tag release
         env:
-          FORK_RELEASE_RULESET_TOKEN: ${{ secrets.FORK_RELEASE_RULESET_TOKEN }}
           GH_CLI: ${{ steps.fork-release-gh-cli.outputs.path }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
           umask 077
-          ruleset_token=${FORK_RELEASE_RULESET_TOKEN:?}
-          unset FORK_RELEASE_RULESET_TOKEN
 
-          verify_live_fork_release_trust() {
-            FORK_RELEASE_RULESET_TOKEN="$ruleset_token" "$FORK_RELEASE_TRUST_VERIFIER" \
+          verify_live_fork_tag() {
+            "$FORK_RELEASE_TAG_VERIFIER" \
               "$SEMANTIC_VERSION" "$SOURCE_REVISION" \
-              "$SOURCE_URL.git" "$FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE" \
-              "$GITHUB_REPOSITORY"
+              "$SOURCE_URL.git" "$FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE"
           }
 
           bundle_directory=fork-release-bundles
@@ -3003,12 +2988,12 @@ jobs:
               asset_count="$(current_release_asset_count "$asset_name")"
               case "$asset_count" in
                 0)
-                  verify_live_fork_release_trust
+                  verify_live_fork_tag
                   if "$GH_CLI" release upload "$SEMANTIC_VERSION" --repo "$GITHUB_REPOSITORY" \
                     "$bundle_directory/$asset_name"; then
-                    verify_live_fork_release_trust
+                    verify_live_fork_tag
                   else
-                    verify_live_fork_release_trust
+                    verify_live_fork_tag
                     refresh_release_metadata
                   fi
                   ;;
@@ -3029,11 +3014,11 @@ jobs:
             validate_release_identity
             assert_release_assets_are_exact
             assert_release_tag_targets_source_revision
-            verify_live_fork_release_trust
+            verify_live_fork_tag
             if "$GH_CLI" release edit "$SEMANTIC_VERSION" --repo "$GITHUB_REPOSITORY" --draft=false; then
-              verify_live_fork_release_trust
+              verify_live_fork_tag
             else
-              verify_live_fork_release_trust
+              verify_live_fork_tag
               printf 'Fork release publication returned an ambiguous failure; reconciling the observed release state.\n' >&2
             fi
             refresh_release_metadata || {
@@ -3049,24 +3034,20 @@ jobs:
           }
           assert_release_assets_are_exact
           assert_release_tag_targets_source_revision
-          verify_live_fork_release_trust
+          verify_live_fork_tag
 
       - name: Reverify every fork alias after release publication
         env:
-          FORK_RELEASE_RULESET_TOKEN: ${{ secrets.FORK_RELEASE_RULESET_TOKEN }}
           GH_CLI: ${{ steps.fork-release-gh-cli.outputs.path }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
           umask 077
-          ruleset_token=${FORK_RELEASE_RULESET_TOKEN:?}
-          unset FORK_RELEASE_RULESET_TOKEN
 
-          verify_live_fork_release_trust() {
-            FORK_RELEASE_RULESET_TOKEN="$ruleset_token" "$FORK_RELEASE_TRUST_VERIFIER" \
+          verify_live_fork_tag() {
+            "$FORK_RELEASE_TAG_VERIFIER" \
               "$SEMANTIC_VERSION" "$SOURCE_REVISION" \
-              "$SOURCE_URL.git" "$FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE" \
-              "$GITHUB_REPOSITORY"
+              "$SOURCE_URL.git" "$FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE"
           }
 
           references=(
@@ -3089,7 +3070,7 @@ jobs:
 
           [[ "$(regctl image digest "$MAIN_TARGET@$MAIN_INDEX_DIGEST" --platform linux/amd64)" == "$MAIN_AMD64_DIGEST" ]]
           [[ "$(regctl image digest "$MAIN_TARGET@$MAIN_INDEX_DIGEST" --platform linux/arm64)" == "$MAIN_ARM64_DIGEST" ]]
-          verify_live_fork_release_trust
+          verify_live_fork_tag
 
       - id: references
         name: Record immutable fork image references
