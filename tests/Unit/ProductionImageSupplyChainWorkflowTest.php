@@ -108,7 +108,6 @@ api="https://api.github.com/repos/${GITHUB_REPOSITORY:?}"
 semantic=${SEMANTIC_VERSION:?}
 source_revision=${GITHUB_SHA:?}
 tag_one=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-tag_two=cccccccccccccccccccccccccccccccccccccccc
 url=''
 for argument in "$@"; do
     case "$argument" in
@@ -121,13 +120,30 @@ case "$url" in
         printf '{"ref":"refs/tags/%s","object":{"type":"tag","sha":"%s"}}\n' "$semantic" "$tag_one"
         ;;
     "$api/git/tags/$tag_one")
-        printf '{"object":{"type":"tag","sha":"%s"}}\n' "$tag_two"
-        ;;
-    "$api/git/tags/$tag_two")
         if [ "${FORK_LIVE_TAG_STATE:-matching}" = mismatch ]; then
             source_revision=dddddddddddddddddddddddddddddddddddddddd
         fi
-        printf '{"object":{"type":"commit","sha":"%s"}}\n' "$source_revision"
+        verified=true
+        reason=valid
+        tagger_name='William Callahan'
+        tagger_email='william@aventure.vc'
+        signature='-----BEGIN SSH SIGNATURE----- fixture'
+        if [ "${FORK_LIVE_TAG_STATE:-matching}" = unsigned ]; then
+            verified=false
+            reason=unsigned
+            signature=''
+        elif [ "${FORK_LIVE_TAG_STATE:-matching}" = wrong-tagger ]; then
+            tagger_email='other@example.com'
+        fi
+        jq -n \
+            --arg tag "$semantic" \
+            --arg tagger_name "$tagger_name" \
+            --arg tagger_email "$tagger_email" \
+            --arg source_revision "$source_revision" \
+            --arg signature "$signature" \
+            --arg reason "$reason" \
+            --argjson verified "$verified" \
+            '{tag:$tag,tagger:{name:$tagger_name,email:$tagger_email},object:{type:"commit",sha:$source_revision},verification:{verified:$verified,reason:$reason,signature:$signature}}'
         ;;
     "$api/rulesets?targets=tag&includes_parents=true&per_page=100")
         printf '[{"id":42,"name":"Protect Coolify fork release tags","enforcement":"active"}]\n'
@@ -671,6 +687,11 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
     if (($applicationValidationWorkflow['permissions'] ?? null) !== ['contents' => 'read']) {
         $violations[] = 'application validation must use read-only repository permissions';
     }
+    foreach ($callers as $callerName => $caller) {
+        if (($caller['jobs']['application-validation']['with']['source_sha'] ?? null) !== '${{ github.sha }}') {
+            $violations[] = "{$callerName} publication must validate its exact source SHA before publishing";
+        }
+    }
     if (($applicationValidationWorkflow['concurrency']['group'] ?? null) !== 'application-validation-${{ inputs.source_sha || github.event.pull_request.number || github.ref }}' ||
         ($applicationValidationWorkflow['concurrency']['cancel-in-progress'] ?? null) !== '${{ github.event_name == \'pull_request\' }}') {
         $violations[] = 'application validation must serialize pushes without cancellation while superseding stale pull requests';
@@ -806,6 +827,7 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
         '.github/workflows/coolify-production-build.yml',
         '.github/workflows/coolify-staging-build.yml',
         '.github/workflows/coolify-testing-host.yml',
+        '.github/workflows/generate-changelog.yml',
         '.github/workflows/gate-v4x-candidate.yml',
         '.github/workflows/publish-fork.yml',
         '.github/workflows/publish-linux-image.yml',
@@ -1156,11 +1178,23 @@ function forkReleaseSourceViolations(array $sharedWorkflow, array $caller): arra
         '[[ "$REF_TYPE" == tag ]]',
         '[[ "$REF" == "refs/tags/$REF_NAME" ]]',
         '[[ "$(git cat-file -t "$REF")" == tag ]]',
+        'git -c gpg.ssh.allowedSignersFile=docker/fork-release-tag-allowed-signers verify-tag "$REF"',
         '[[ "$(git rev-parse --verify "${REF}^{commit}")" == "$SOURCE_REVISION" ]]',
+        'printf \'source_revision=%s\\n\' "$SOURCE_REVISION" >> "$GITHUB_OUTPUT"',
     ] as $requiredSourceCheck) {
         if (! str_contains($resolveRun, $requiredSourceCheck)) {
             $violations[] = 'fork caller lost an exact annotated-tag source check';
         }
+    }
+
+    $resolveTag = $caller['jobs']['resolve-tag'] ?? [];
+    $applicationValidation = $caller['jobs']['application-validation'] ?? [];
+    $publish = $caller['jobs']['publish'] ?? [];
+    if (($resolveTag['outputs']['source_revision'] ?? null) !== '${{ steps.version.outputs.source_revision }}'
+        || ($applicationValidation['needs'] ?? null) !== 'resolve-tag'
+        || ($applicationValidation['with']['source_sha'] ?? null) !== '${{ needs.resolve-tag.outputs.source_revision }}'
+        || ($publish['needs'] ?? null) !== ['resolve-tag', 'application-validation']) {
+        $violations[] = 'fork publication must validate the authorized tag commit through the exact-image application gate before exposing release secrets';
     }
 
     $validationRun = (string) (releaseWorkflowStepById(
@@ -1229,6 +1263,15 @@ it('rejects unsafe fork source and runner topology mutations', function (string 
             ':',
             (string) $sharedWorkflow['jobs']['validate-inputs']['steps'][1]['run'],
         ),
+        'unsigned-annotated-tag' => $caller['jobs']['resolve-tag']['steps'][1]['run'] = str_replace(
+            'git -c gpg.ssh.allowedSignersFile=docker/fork-release-tag-allowed-signers verify-tag "$REF"',
+            ':',
+            (string) $caller['jobs']['resolve-tag']['steps'][1]['run'],
+        ),
+        'missing-exact-runtime-source' => (function () use (&$caller): void {
+            unset($caller['jobs']['application-validation']['with']['source_sha']);
+        })(),
+        'release-before-application-validation' => $caller['jobs']['publish']['needs'] = 'resolve-tag',
         'trusted-cross-build' => $sharedWorkflow['jobs']['fork-build']['runs-on'] = [
             'group' => 'coolify-trusted',
             'labels' => ['self-hosted', 'Linux', 'X64', 'williamacallahan'],
@@ -1251,6 +1294,9 @@ it('rejects unsafe fork source and runner topology mutations', function (string 
     'branch-dispatch',
     'source-switch-input',
     'missing-push-event-check',
+    'unsigned-annotated-tag',
+    'missing-exact-runtime-source',
+    'release-before-application-validation',
     'trusted-cross-build',
     'qemu-cross-build',
     'trusted-stage',
@@ -1270,6 +1316,21 @@ it('enforces the shared Linux publication graph and caller boundaries', function
     ];
 
     expect(releaseFoundationWorkflowViolations($sharedWorkflow, $applicationValidationWorkflow, $callers))->toBe([]);
+});
+
+it('rejects a publishing caller that can skip exact-image application validation', function (): void {
+    $root = releaseWorkflowRepositoryRoot();
+    $sharedWorkflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $applicationValidationWorkflow = Yaml::parseFile($root.'/.github/workflows/application-validation.yml');
+    $callers = [
+        'production' => Yaml::parseFile($root.'/.github/workflows/coolify-production-build.yml'),
+        'testing-host' => Yaml::parseFile($root.'/.github/workflows/coolify-testing-host.yml'),
+        'staging' => Yaml::parseFile($root.'/.github/workflows/coolify-staging-build.yml'),
+    ];
+    unset($callers['staging']['jobs']['application-validation']['with']['source_sha']);
+
+    expect(releaseFoundationWorkflowViolations($sharedWorkflow, $applicationValidationWorkflow, $callers))
+        ->toContain('staging publication must validate its exact source SHA before publishing');
 });
 
 it('keeps the hardened publisher as the sole realtime release owner', function () {
@@ -2612,6 +2673,10 @@ it('defines one referrerless fork release graph for the main image on both platf
         $jobs['fork-release'] ?? [],
         'Publish immutable signed fork bundles to the tag release',
     )['run'] ?? '');
+    $postPublicationVerification = (string) (releaseWorkflowStep(
+        $jobs['fork-release'] ?? [],
+        'Reverify every fork alias after release publication',
+    )['run'] ?? '');
     $draftRecovery = (string) (releaseWorkflowStep(
         $jobs['fork-release'] ?? [],
         'Create or validate empty draft recovery release before semantic promotion',
@@ -2688,7 +2753,18 @@ it('defines one referrerless fork release graph for the main image on both platf
         ->toContain('sha256sum --check --strict SHA256SUMS')
         ->toContain('Fork tag release asset does not match the signed release bundle')
         ->toContain('Published fork tag release assets are incomplete; refusing to modify a published release.')
-        ->not->toContain('--clobber');
+        ->not->toContain('--clobber')
+        ->and($postPublicationVerification)
+        ->toContain('"$MAIN_TARGET:$SEMANTIC_VERSION"')
+        ->toContain('"$FORK_LATEST_TAG"')
+        ->toContain('"$FORK_VERSION_TAG"')
+        ->toContain('"$FORK_VERSION_SHA_TAG"')
+        ->toContain('Fork alias moved during release publication')
+        ->toContain('regctl image digest "$MAIN_TARGET@$MAIN_INDEX_DIGEST" --platform linux/amd64')
+        ->toContain('regctl image digest "$MAIN_TARGET@$MAIN_INDEX_DIGEST" --platform linux/arm64')
+        ->toContain('assert_live_signed_fork_tag')
+        ->toContain('.verification.verified == true')
+        ->toContain('assert_active_fork_tag_protection');
 
     $forkReleaseStepNames = array_map(
         static fn (array $step): string => (string) ($step['name'] ?? ''),
@@ -2697,11 +2773,14 @@ it('defines one referrerless fork release graph for the main image on both platf
     $draftRecoveryStepPosition = array_search('Create or validate empty draft recovery release before semantic promotion', $forkReleaseStepNames, true);
     $promotionStepPosition = array_search('Promote and verify the main fork image', $forkReleaseStepNames, true);
     $publicationStepPosition = array_search('Publish immutable signed fork bundles to the tag release', $forkReleaseStepNames, true);
+    $postPublicationVerificationStepPosition = array_search('Reverify every fork alias after release publication', $forkReleaseStepNames, true);
     expect($draftRecoveryStepPosition)->not->toBeFalse()
         ->and($promotionStepPosition)->not->toBeFalse()
         ->and($publicationStepPosition)->not->toBeFalse()
+        ->and($postPublicationVerificationStepPosition)->not->toBeFalse()
         ->and($draftRecoveryStepPosition)->toBeLessThan($promotionStepPosition)
-        ->and($promotionStepPosition)->toBeLessThan($publicationStepPosition);
+        ->and($promotionStepPosition)->toBeLessThan($publicationStepPosition)
+        ->and($publicationStepPosition)->toBeLessThan($postPublicationVerificationStepPosition);
 
     $draftRecoveryPosition = strpos($releasePublication, 'if [[ "$(jq -r \'.isDraft\' "$release_metadata_file")" == true ]]; then');
     $draftInventoryCheckPosition = strpos($releasePublication, 'assert_release_assets_are_exact', $draftRecoveryPosition ?: 0);
@@ -3050,12 +3129,76 @@ it('reconciles ambiguous fork release publication and accepts exact published re
     }
 });
 
+it('reverifies every fork alias and platform digest after release publication', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $verificationRun = (string) (releaseWorkflowStep(
+        $workflow['jobs']['fork-release'] ?? [],
+        'Reverify every fork alias after release publication',
+    )['run'] ?? '');
+    $filesystem = new Filesystem;
+    $fixture = sys_get_temp_dir().'/coolify-fork-post-publication-verification-'.bin2hex(random_bytes(8));
+    $expectedDigest = releaseWorkflowTestDigest('3');
+    $registry = releaseWorkflowPrepareForkPromotionRegistryDouble($fixture, $expectedDigest);
+    foreach (['fork-latest', 'fork-4.13.1-fork', 'fork-4.13.1-fork-aaaaaaa'] as $tag) {
+        file_put_contents($registry['state'].'/'.$tag, $expectedDigest."\n");
+    }
+
+    try {
+        $process = new Process(['bash', '-c', $verificationRun], $root, $registry['environment']);
+        $process->run();
+
+        $registryLog = (string) file_get_contents($registry['log']);
+        expect($process->isSuccessful())->toBeTrue($process->getErrorOutput())
+            ->and($registryLog)
+            ->toContain('image digest docker.iocloudhost.net/williamagh/coolify:4.13.1-fork')
+            ->toContain('image digest docker.iocloudhost.net/williamagh/coolify:fork-latest')
+            ->toContain('image digest docker.iocloudhost.net/williamagh/coolify:fork-4.13.1-fork')
+            ->toContain('image digest docker.iocloudhost.net/williamagh/coolify:fork-4.13.1-fork-aaaaaaa')
+            ->toContain('image digest docker.iocloudhost.net/williamagh/coolify@'.$expectedDigest.' --platform linux/amd64')
+            ->toContain('image digest docker.iocloudhost.net/williamagh/coolify@'.$expectedDigest.' --platform linux/arm64');
+    } finally {
+        $filesystem->remove($fixture);
+    }
+});
+
+it('fails when a fork alias moves during signed release publication', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $verificationRun = (string) (releaseWorkflowStep(
+        $workflow['jobs']['fork-release'] ?? [],
+        'Reverify every fork alias after release publication',
+    )['run'] ?? '');
+    $filesystem = new Filesystem;
+    $fixture = sys_get_temp_dir().'/coolify-fork-post-publication-alias-race-'.bin2hex(random_bytes(8));
+    $expectedDigest = releaseWorkflowTestDigest('3');
+    $registry = releaseWorkflowPrepareForkPromotionRegistryDouble($fixture, $expectedDigest);
+    file_put_contents($registry['state'].'/fork-latest', releaseWorkflowTestDigest('f')."\n");
+    file_put_contents($registry['state'].'/fork-4.13.1-fork', $expectedDigest."\n");
+    file_put_contents($registry['state'].'/fork-4.13.1-fork-aaaaaaa', $expectedDigest."\n");
+
+    try {
+        $process = new Process(['bash', '-c', $verificationRun], $root, $registry['environment']);
+        $process->run();
+
+        expect($process->isSuccessful())->toBeFalse()
+            ->and($process->getErrorOutput())
+            ->toContain('Fork alias moved during release publication')
+            ->toContain('docker.iocloudhost.net/williamagh/coolify:fork-latest')
+            ->toContain('expected '.$expectedDigest)
+            ->toContain('found '.releaseWorkflowTestDigest('f'));
+    } finally {
+        $filesystem->remove($fixture);
+    }
+});
+
 it('requires the fork tag commit to be reachable from the trusted v4.x branch before publication', function () {
     $caller = Yaml::parseFile(releaseWorkflowRepositoryRoot().'/.github/workflows/publish-fork.yml');
     $resolveTag = $caller['jobs']['resolve-tag'] ?? [];
     $resolveTagRun = (string) (releaseWorkflowStepById($resolveTag, 'version')['run'] ?? '');
 
-    expect($resolveTag['needs'] ?? null)->toBe('application-validation')
+    expect($resolveTag)->not->toHaveKey('needs')
+        ->and($caller['jobs']['application-validation']['needs'] ?? null)->toBe('resolve-tag')
         ->and($resolveTagRun)
         ->toContain("git fetch --no-tags origin '+refs/heads/v4.x:refs/remotes/origin/v4.x'")
         ->toContain("git rev-parse --verify 'refs/remotes/origin/v4.x^{commit}'")
@@ -3197,6 +3340,31 @@ it('fails closed when the live fork tag no longer resolves to the workflow sourc
 
         expect($process->isSuccessful())->toBeFalse()
             ->and($process->getErrorOutput())->toContain('no longer resolves to the immutable workflow source revision')
+            ->and((string) file_get_contents($registry['log']))->not->toContain('image copy')
+            ->and(trim((string) file_get_contents($registry['state'].'/main')))->toBe('absent');
+    } finally {
+        $filesystem->remove($fixture);
+    }
+});
+
+it('fails closed when the live fork tag is not cryptographically verified', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $promotionRun = (string) (releaseWorkflowStep(
+        $workflow['jobs']['fork-release'] ?? [],
+        'Promote and verify the main fork image',
+    )['run'] ?? '');
+    $filesystem = new Filesystem;
+    $fixture = sys_get_temp_dir().'/coolify-fork-unsigned-live-tag-rejection-'.bin2hex(random_bytes(8));
+    $registry = releaseWorkflowPrepareForkPromotionRegistryDouble($fixture, null);
+    $registry['environment']['FORK_LIVE_TAG_STATE'] = 'unsigned';
+
+    try {
+        $process = new Process(['bash', '-c', $promotionRun], $root, $registry['environment']);
+        $process->run();
+
+        expect($process->isSuccessful())->toBeFalse()
+            ->and($process->getErrorOutput())->toContain('not a directly bound, verified signature from the allowed tagger')
             ->and((string) file_get_contents($registry['log']))->not->toContain('image copy')
             ->and(trim((string) file_get_contents($registry['state'].'/main')))->toBe('absent');
     } finally {

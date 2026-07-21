@@ -75,11 +75,13 @@ jobs:
               --body 'Automated changelog update generated from the protected v4.x release history.')"
           fi
 
-          validation_url="$(gh workflow run application-validation.yml --ref "${bot_branch}")"
+          head_sha="$(git rev-parse HEAD)"
+          validation_url="$(gh workflow run application-validation.yml \
+            --ref "${bot_branch}" \
+            -f source_sha="${head_sha}")"
           validation_run_id="${validation_url##*/}"
           gh run watch "${validation_run_id}" --exit-status
 
-          head_sha="$(git rev-parse HEAD)"
           gh api --method POST "repos/${GH_REPO}/statuses/${head_sha}" \
             -f state=success \
             -f context='Application validation required' \

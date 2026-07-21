@@ -283,6 +283,7 @@ function applicationValidationWorkflowViolations(array $workflow): array
         'tests/Feature/BlueGreenLifecyclePublicRecoveryTest.php',
         'tests/Feature/BlueGreenMigrationReplayTest.php',
         'tests/Feature/BlueGreenMultiPortPromotionAcceptanceTest.php',
+        'tests/Feature/BlueGreenReplicaLifecycleTest.php',
         'tests/Feature/BlueGreenStoppedLegacyContainerCleanupTest.php',
         'tests/Feature/DatabaseMigrationReadinessTest.php',
         'tests/Feature/BlueGreenSupersessionGenerationTest.php',
@@ -291,6 +292,8 @@ function applicationValidationWorkflowViolations(array $workflow): array
         'tests/Feature/ProxyMutationQueueGateTest.php',
         'tests/Feature/QueueApplicationDeploymentCommitTest.php',
         'tests/Unit/ApplicationDeploymentActivationOrderTest.php',
+        'tests/Unit/Actions/Application/BlueGreen/BlueGreenNonRootRemoteExecutionTest.php',
+        'tests/Unit/Actions/Proxy/BlueGreenNonRootRemoteExecutionTest.php',
         'tests/Unit/ProxyMutationQueueTest.php',
         'tests/Unit/ScheduledJobsRetryConfigTest.php',
     ] as $requiredTest) {
@@ -459,6 +462,25 @@ it('fails when the production application blue-green runtime owner is removed', 
     expect(applicationValidationWorkflowViolations($workflow))
         ->toContain('application validation must execute the production application blue-green contract against both exact source images');
 });
+
+it('fails when an exact blue-green regression owner is removed from required validation', function (string $requiredTest): void {
+    $workflow = applicationValidationWorkflow();
+    $step = collect($workflow['jobs']['blue-green-lifecycle']['steps'] ?? [])
+        ->search(fn (array $candidate): bool => ($candidate['name'] ?? null) === 'Run blue-green lifecycle tests');
+    expect($step)->not->toBeFalse();
+    $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'] = str_replace(
+        $requiredTest,
+        'tests/Feature/RemovedRequiredRegressionOwnerTest.php',
+        (string) $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'],
+    );
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('blue-green lifecycle validation must execute every ownership and migration gate');
+})->with([
+    'replica identity' => 'tests/Feature/BlueGreenReplicaLifecycleTest.php',
+    'application privileged transport' => 'tests/Unit/Actions/Application/BlueGreen/BlueGreenNonRootRemoteExecutionTest.php',
+    'proxy privileged transport' => 'tests/Unit/Actions/Proxy/BlueGreenNonRootRemoteExecutionTest.php',
+]);
 
 it('fails when production application blue-green evidence includes the nested image archive', function (): void {
     $workflow = applicationValidationWorkflow();

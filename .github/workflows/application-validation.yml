@@ -3,6 +3,17 @@ name: Application validation
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      base_sha:
+        description: Exact base commit SHA for changed-file validation
+        required: false
+        type: string
+        default: ''
+      source_sha:
+        description: Exact commit SHA to validate
+        required: false
+        type: string
+        default: ''
   workflow_call:
     inputs:
       base_sha:
@@ -194,6 +205,7 @@ jobs:
             tests/Feature/DatabaseMigrationReadinessTest.php \
             tests/Feature/LivewireDestinationTopologyPersistenceTest.php \
             tests/Feature/BlueGreenOperationFencingTest.php \
+            tests/Feature/BlueGreenReplicaLifecycleTest.php \
             tests/Feature/BlueGreenStoppedLegacyContainerCleanupTest.php \
             tests/Feature/BlueGreenSupersessionGenerationTest.php \
             tests/Feature/DeleteResourceJobBlueGreenTest.php \
@@ -207,9 +219,11 @@ jobs:
             tests/Unit/Actions/Application/BlueGreen/BlueGreenDeploymentLockTest.php \
             tests/Unit/Actions/Application/BlueGreen/BlueGreenOperationFenceTest.php \
             tests/Unit/Actions/Application/BlueGreenDrainAndReleaseProofTest.php \
+            tests/Unit/Actions/Application/BlueGreen/BlueGreenNonRootRemoteExecutionTest.php \
             tests/Unit/Actions/Application/BlueGreen/ExecuteBlueGreenDestinationMutationTest.php \
             tests/Unit/Actions/Application/BlueGreenPublicRecoveryTest.php \
             tests/Unit/Actions/Proxy/BlueGreenMultiPortConfigurationTest.php \
+            tests/Unit/Actions/Proxy/BlueGreenNonRootRemoteExecutionTest.php \
             tests/Unit/ApplicationDeploymentActivationOrderTest.php \
             tests/Unit/ProxyMutationQueueTest.php \
             tests/Unit/ScheduledJobsRetryConfigTest.php
@@ -324,6 +338,7 @@ jobs:
         .github/workflows/coolify-production-build.yml
         .github/workflows/coolify-staging-build.yml
         .github/workflows/coolify-testing-host.yml
+        .github/workflows/generate-changelog.yml
         .github/workflows/gate-v4x-candidate.yml
         .github/workflows/publish-fork.yml
         .github/workflows/publish-linux-image.yml
