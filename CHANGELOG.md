@@ -81,6 +81,7 @@ All notable changes to this project will be documented in this file.
 - Update changelog (#87)
 - Update changelog (#91)
 - Update changelog (#92)
+- Update changelog (#94)
 
 ### 🎨 Styling
 
