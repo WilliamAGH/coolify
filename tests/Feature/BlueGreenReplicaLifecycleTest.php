@@ -495,8 +495,7 @@ it('binds the durable N=3 identities before refusing partial health after a rest
             'label=coolify.blueGreen.replicaIndex=2',
             'label=coolify.blueGreen.replicaIndex=3',
         )
-        ->and($deployment->fresh()->blue_green_candidate_container_id)
-        ->toBe(BlueGreenReplicaSet::identityDigest($inspections));
+        ->and($deployment->fresh()->blue_green_candidate_container_id)->toBeNull();
 });
 
 it('keeps the claimed scalar health and rollback identity when settings drift from one replica to three', function (): void {
