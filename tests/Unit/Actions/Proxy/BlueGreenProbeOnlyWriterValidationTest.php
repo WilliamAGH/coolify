@@ -1,0 +1,210 @@
+<?php
+
+use App\Actions\Proxy\BlueGreenProxyConfiguration;
+use App\Actions\Proxy\BlueGreenProxyState;
+use App\Actions\Proxy\BlueGreenRoutingMode;
+use App\Actions\Proxy\BlueGreenRoutingTarget;
+use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
+use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
+use App\Enums\BlueGreenDeploymentColor;
+use Symfony\Component\Yaml\Yaml;
+
+function probeOnlyWriterConfiguration(
+    BlueGreenRoutingMode $mode = BlueGreenRoutingMode::ProbeOnly,
+): BlueGreenProxyConfiguration {
+    return (new CompileBlueGreenProxyConfiguration)->compileGeneratedLabels(
+        applicationUuid: 'probe-only-writer-app',
+        generatedLabels: [
+            'traefik.enable=true',
+            'traefik.http.routers.web.rule=Host(`probe-only.example.test`)',
+            'traefik.http.routers.web.entryPoints=https',
+            'traefik.http.routers.web.service=web',
+            'traefik.http.routers.web.tls=true',
+            'traefik.http.services.web.loadbalancer.server.port=8080',
+        ],
+        target: new BlueGreenRoutingTarget(
+            destinationId: 42,
+            activeColor: BlueGreenDeploymentColor::BLUE,
+            blueContainerName: 'probe-only-writer-blue',
+            greenContainerName: 'probe-only-writer-green',
+            port: 8080,
+            routingRevision: 7,
+            mode: $mode,
+            probeHeaderName: 'X-Coolify-Blue-Green-Probe',
+            probeToken: BlueGreenRoutingTarget::durableProbeToken('probe-only-operation'),
+            probeColor: BlueGreenDeploymentColor::BLUE,
+            destinationFenceEpoch: 3,
+            operationId: 'probe-only-operation',
+            mutationSequence: 2,
+            activeDeploymentUuid: 'probe-only-deployment',
+            activeContainerId: str_repeat('a', 64),
+            destinationTopologyDigest: hash('sha256', 'probe-only-destination:42'),
+        ),
+    );
+}
+
+/**
+ * @param  callable(array<string, mixed>, string, string): array<string, mixed>  $mutate
+ */
+function mutateProbeOnlyWriterConfiguration(callable $mutate): BlueGreenProxyConfiguration
+{
+    $configuration = probeOnlyWriterConfiguration();
+    $document = Yaml::parse($configuration->yaml);
+    $routerName = array_key_first($document['http']['routers']);
+    $middlewareName = BlueGreenRoutingTarget::routingNamePrefix(
+        $configuration->state->applicationUuid,
+        $configuration->state->destinationId,
+    ).'probe-header-strip';
+    $document = $mutate($document, $routerName, $middlewareName);
+    $yaml = Yaml::dump($document, 20, 2, Yaml::DUMP_EXCEPTION_ON_INVALID_TYPE);
+    $sha256 = hash('sha256', $yaml);
+    $state = $configuration->state;
+
+    return new BlueGreenProxyConfiguration(
+        managedFilename: $configuration->managedFilename,
+        yaml: $yaml,
+        sha256: $sha256,
+        state: new BlueGreenProxyState(
+            managedFilename: $state->managedFilename,
+            applicationUuid: $state->applicationUuid,
+            destinationId: $state->destinationId,
+            operationId: $state->operationId,
+            mutationSequence: $state->mutationSequence,
+            destinationFenceEpoch: $state->destinationFenceEpoch,
+            routingRevision: $state->routingRevision,
+            managedSha256: $sha256,
+            activeColor: $state->activeColor,
+            activeDeploymentUuid: $state->activeDeploymentUuid,
+            activeContainerName: $state->activeContainerName,
+            activeContainerId: $state->activeContainerId,
+            applicationRoutingConfigDigest: hash('sha256', $yaml),
+            destinationTopologyDigest: $state->destinationTopologyDigest,
+        ),
+    );
+}
+
+it('allows the guarded singleton ProbeOnly document to reference its canonical Docker service directly', function (): void {
+    (new WriteBlueGreenProxyConfiguration)->validate(probeOnlyWriterConfiguration());
+})->throwsNoExceptions();
+
+it('continues allowing ordinary managed documents with inline services', function (): void {
+    (new WriteBlueGreenProxyConfiguration)->validate(
+        probeOnlyWriterConfiguration(BlueGreenRoutingMode::Steady),
+    );
+})->throwsNoExceptions();
+
+it('rejects unsafe ProbeOnly-shaped documents', function (callable $mutate): void {
+    $configuration = mutateProbeOnlyWriterConfiguration($mutate);
+
+    expect(fn () => (new WriteBlueGreenProxyConfiguration)->validate($configuration))
+        ->toThrow(InvalidArgumentException::class, 'must contain HTTP routers and services');
+})->with([
+    'zero routers' => static function (array $document): array {
+        $document['http']['routers'] = [];
+
+        return $document;
+    },
+    'multiple routers' => static function (array $document, string $routerName): array {
+        $document['http']['routers'][$routerName.'-second'] = $document['http']['routers'][$routerName];
+
+        return $document;
+    },
+    'public router name' => static function (array $document, string $routerName): array {
+        $document['http']['routers'][$routerName.'-public'] = $document['http']['routers'][$routerName];
+        unset($document['http']['routers'][$routerName]);
+
+        return $document;
+    },
+    'foreign scope' => static function (array $document, string $routerName): array {
+        $document['http']['routers']['coolify-bg-0000000000000000-web-probe'] = $document['http']['routers'][$routerName];
+        unset($document['http']['routers'][$routerName]);
+
+        return $document;
+    },
+    'unguarded public rule' => static function (array $document, string $routerName): array {
+        $document['http']['routers'][$routerName]['rule'] = 'Host(`probe-only.example.test`)';
+
+        return $document;
+    },
+    'non-reserved probe header' => static function (array $document, string $routerName): array {
+        $document['http']['routers'][$routerName]['rule'] = str_replace(
+            'X-Coolify-Blue-Green-Probe',
+            'X-Coolify-Arbitrary-Probe',
+            $document['http']['routers'][$routerName]['rule'],
+        );
+
+        return $document;
+    },
+    'arbitrary Docker service' => static function (array $document, string $routerName): array {
+        $document['http']['routers'][$routerName]['service'] = 'foreign-blue@docker';
+
+        return $document;
+    },
+    'wrong canonical color' => static function (array $document, string $routerName): array {
+        $document['http']['routers'][$routerName]['service'] = str_replace(
+            '-blue@docker',
+            '-green@docker',
+            $document['http']['routers'][$routerName]['service'],
+        );
+
+        return $document;
+    },
+    'file-provider service' => static function (array $document, string $routerName): array {
+        $document['http']['routers'][$routerName]['service'] = str_replace(
+            '@docker',
+            '@file',
+            $document['http']['routers'][$routerName]['service'],
+        );
+
+        return $document;
+    },
+    'port-specific service' => static function (array $document, string $routerName): array {
+        $document['http']['routers'][$routerName]['service'] = str_replace(
+            '@docker',
+            '-8080@docker',
+            $document['http']['routers'][$routerName]['service'],
+        );
+
+        return $document;
+    },
+    'missing router middleware' => static function (array $document, string $routerName): array {
+        unset($document['http']['routers'][$routerName]['middlewares']);
+
+        return $document;
+    },
+    'foreign router middleware' => static function (array $document, string $routerName): array {
+        $document['http']['routers'][$routerName]['middlewares'] = ['foreign@file'];
+
+        return $document;
+    },
+    'missing strip and acknowledgement middleware' => static function (array $document): array {
+        $document['http']['middlewares'] = [];
+
+        return $document;
+    },
+    'missing acknowledgement header' => static function (
+        array $document,
+        string $routerName,
+        string $middlewareName,
+    ): array {
+        unset($document['http']['middlewares'][$middlewareName]['headers']['customResponseHeaders']);
+
+        return $document;
+    },
+    'invalid acknowledgement value' => static function (
+        array $document,
+        string $routerName,
+        string $middlewareName,
+    ): array {
+        $document['http']['middlewares'][$middlewareName]['headers']['customResponseHeaders'][BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER] = 'unattested';
+
+        return $document;
+    },
+    'inline service' => static function (array $document): array {
+        $document['http']['services']['inline'] = [
+            'loadBalancer' => ['servers' => [['url' => 'http://foreign:8080']]],
+        ];
+
+        return $document;
+    },
+]);

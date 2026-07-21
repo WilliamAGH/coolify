@@ -344,8 +344,10 @@ jobs:
           docker/verify-source-provenance.sh docker/testing-host/Dockerfile
       - name: Run release publication shell integrations
         run: |
+          scripts/ci/deriveImageTags.test.sh
           tests/Integration/PublishLinuxImageScriptTest.sh
           tests/Integration/ReleaseOperationalFixturesTest.sh
+          tests/Integration/VerifyNexusDockerWritePolicyTest.sh
       - name: Run v4.x candidate ship contract
         run: scripts/dev/ship.test.sh
       - name: Verify Docker daemon configuration ownership

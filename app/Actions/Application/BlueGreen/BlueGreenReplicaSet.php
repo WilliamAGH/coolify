@@ -2,6 +2,8 @@
 
 namespace App\Actions\Application\BlueGreen;
 
+use App\Models\ApplicationBlueGreenReplica;
+use Illuminate\Support\Collection;
 use InvalidArgumentException;
 
 final readonly class BlueGreenReplicaSet
@@ -16,6 +18,22 @@ final readonly class BlueGreenReplicaSet
     public function promotionThreshold(): int
     {
         return $this->count;
+    }
+
+    /** @param Collection<int, ApplicationBlueGreenReplica> $replicas */
+    public static function fromReplicas(Collection $replicas): self
+    {
+        $replicas = $replicas->sortBy('replica_index')->values();
+        $replicaSet = new self($replicas->count());
+        foreach ($replicaSet->indexes() as $offset => $expectedIndex) {
+            $replica = $replicas->get($offset);
+            if (! $replica instanceof ApplicationBlueGreenReplica
+                || $replica->replica_index !== $expectedIndex) {
+                throw new InvalidArgumentException('The durable blue-green replica ledger must contain every contiguous replica index exactly once.');
+            }
+        }
+
+        return $replicaSet;
     }
 
     /** @param non-empty-list<BlueGreenReplicaInspection> $inspections */

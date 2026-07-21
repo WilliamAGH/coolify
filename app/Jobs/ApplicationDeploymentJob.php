@@ -256,7 +256,8 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
 
     private ?BlueGreenDeploymentLifecycle $blueGreenLifecycle = null;
 
-    private ?string $blueGreenComposeCandidateService = null;
+    /** @var list<string> */
+    private array $blueGreenComposeCandidateServices = [];
 
     private int $pausedBlueGreenFleetDeployments = 0;
 
@@ -1008,30 +1009,8 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
                 throw $e;
             }
         } else {
-            $command = "{$this->coolify_variables} docker compose";
-            // Prepend DOCKER_BUILDKIT=1 if BuildKit is supported
-            if ($this->dockerBuildkitSupported) {
-                $command = "DOCKER_BUILDKIT=1 {$command}";
-            }
-            // Use build-time .env file from /artifacts (outside Docker context to prevent it from being in the image)
-            $command .= ' --env-file '.self::BUILD_TIME_ENV_PATH;
-            if ($this->force_rebuild) {
-                $command .= " --project-name {$this->application->uuid} --project-directory {$this->workdir} -f {$this->workdir}{$this->docker_compose_location} build --pull --no-cache";
-            } else {
-                $command .= " --project-name {$this->application->uuid} --project-directory {$this->workdir} -f {$this->workdir}{$this->docker_compose_location} build --pull";
-            }
-
-            if (! $this->application->settings->use_build_secrets && $this->build_args instanceof Collection && $this->build_args->isNotEmpty()) {
-                $build_args_string = $this->build_args->implode(' ');
-                $command .= " {$build_args_string}";
-                $this->application_deployment_queue->addLogEntry('Adding build arguments to Docker Compose build command.');
-            }
-            if (($buildService = $this->blueGreenComposeBuildService()) !== null) {
-                $command .= ' '.escapeshellarg($buildService);
-            }
-
             $this->execute_remote_command(
-                [executeInDocker($this->deployment_uuid, $command), 'hidden' => true],
+                [executeInDocker($this->deployment_uuid, $this->defaultDockerComposeBuildCommand()), 'hidden' => true],
             );
         }
 
@@ -1056,14 +1035,19 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             ?? throw new DeploymentException('Blue-green Compose candidate rendering has no durable claim.');
         $topology = BlueGreenComposeTopology::fromApplication($this->application);
         $this->container_name = $topology->candidateContainerName($this->application, $claim->pendingColor);
-        $this->blueGreenComposeCandidateService = $topology->candidateServiceName($claim->pendingColor);
+        $replicaRows = $this->blueGreenLifecycle->candidateReplicaRows($claim);
+        $replicaSet = BlueGreenReplicaSet::fromReplicas($replicaRows);
+        $this->blueGreenComposeCandidateServices = $replicaRows
+            ->pluck('compose_service')
+            ->values()
+            ->all();
 
         return $topology->renderCandidate(
             compose: convertToArray($composeFile),
             application: $this->application,
             color: $claim->pendingColor,
             blueGreenLabels: $this->blueGreenComposeCandidateLabels($claim),
-            replicaCount: $this->application->settings->blueGreenReplicaCount(),
+            replicaCount: $replicaSet->count,
         );
     }
 
@@ -1086,20 +1070,48 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         return $labels;
     }
 
-    private function blueGreenComposeBuildService(): ?string
+    private function blueGreenComposeBuildServiceArguments(): string
     {
         if ($this->application->build_pack !== 'dockercompose') {
-            return null;
+            return '';
         }
-        if ($this->blueGreenComposeCandidateService !== null) {
-            return $this->blueGreenComposeCandidateService;
+        if ($this->blueGreenComposeCandidateServices !== []) {
+            return $this->blueGreenComposeCandidateServiceArguments();
         }
         if (! ($this->blueGreenLifecycle?->isEnabled() ?? false)
             && (! $this->preparationOnly || ! $this->application->isBlueGreenDeploymentOptedIn())) {
-            return null;
+            return '';
         }
 
-        return BlueGreenComposeTopology::fromApplication($this->application)->routedService;
+        return ' '.escapeshellarg(BlueGreenComposeTopology::fromApplication($this->application)->routedService);
+    }
+
+    private function defaultDockerComposeBuildCommand(): string
+    {
+        $command = "{$this->coolify_variables} docker compose";
+        if ($this->dockerBuildkitSupported) {
+            $command = "DOCKER_BUILDKIT=1 {$command}";
+        }
+        $command .= ' --env-file '.self::BUILD_TIME_ENV_PATH;
+        if ($this->force_rebuild) {
+            $command .= " --project-name {$this->application->uuid} --project-directory {$this->workdir} -f {$this->workdir}{$this->docker_compose_location} build --pull --no-cache";
+        } else {
+            $command .= " --project-name {$this->application->uuid} --project-directory {$this->workdir} -f {$this->workdir}{$this->docker_compose_location} build --pull";
+        }
+        if (! $this->application->settings->use_build_secrets && $this->build_args instanceof Collection && $this->build_args->isNotEmpty()) {
+            $command .= ' '.$this->build_args->implode(' ');
+            $this->application_deployment_queue->addLogEntry('Adding build arguments to Docker Compose build command.');
+        }
+
+        return $command.$this->blueGreenComposeBuildServiceArguments();
+    }
+
+    private function blueGreenComposeCandidateServiceArguments(): string
+    {
+        return implode('', array_map(
+            static fn (string $service): string => ' '.escapeshellarg($service),
+            $this->blueGreenComposeCandidateServices,
+        ));
     }
 
     private function renderDeferredBlueGreenComposeCandidate(): void
@@ -2469,10 +2481,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
     private function capturePreparedImageDigest(): string
     {
         if ($this->application->build_pack === 'dockercompose') {
-            $safeComposePath = escapeshellarg("{$this->workdir}{$this->docker_compose_location}");
-            $blueGreenService = $this->blueGreenComposeBuildService();
-            $serviceArgument = $blueGreenService === null ? '' : ' '.escapeshellarg($blueGreenService);
-            $command = "image_ids=\"$(docker compose -f {$safeComposePath} images -q{$serviceArgument} | sort -u)\"; test -n \"\$image_ids\"; printf '%s\\n' \"\$image_ids\" | sha256sum | cut -d ' ' -f1";
+            $command = $this->preparedComposeImageDigestCommand();
         } else {
             if (! isset($this->production_image_name) || $this->production_image_name === '') {
                 throw new DeploymentException('Prepared deployment has no production image identity.');
@@ -2498,6 +2507,14 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         }
 
         return $artifactDigest;
+    }
+
+    private function preparedComposeImageDigestCommand(): string
+    {
+        $safeComposePath = escapeshellarg("{$this->workdir}{$this->docker_compose_location}");
+        $serviceArguments = $this->blueGreenComposeBuildServiceArguments();
+
+        return "image_ids=\"$(docker compose -f {$safeComposePath} images -q{$serviceArguments} | sort -u)\"; test -n \"\$image_ids\"; printf '%s\\n' \"\$image_ids\" | sha256sum | cut -d ' ' -f1";
     }
 
     private function restorePreparedBuildServer(): void
@@ -4204,7 +4221,9 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         array $compose,
         BlueGreenDeploymentClaim $claim,
     ): array {
-        $replicaSet = new BlueGreenReplicaSet($this->application->settings->blueGreenReplicaCount());
+        $claimRows = $this->blueGreenLifecycle?->candidateReplicaRows($claim)
+            ?? throw new DeploymentException('Blue-green replica rendering has no durable lifecycle owner.');
+        $replicaSet = BlueGreenReplicaSet::fromReplicas($claimRows);
         if ($replicaSet->usesScalarCompatibilityPath()) {
             return $compose;
         }
@@ -4824,9 +4843,9 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         $commands = ["touch {$this->configuration_dir}/.env"];
         $sidecarPlan = $this->firstAdoptionComposeSidecarPlan();
         $sidecarStarter = new StartBlueGreenComposeSidecars;
-        $blueGreenCandidateService = $this->blueGreenComposeCandidateService === null
+        $blueGreenCandidateServices = $this->blueGreenComposeCandidateServices === []
             ? ''
-            : ' --no-deps '.escapeshellarg($this->blueGreenComposeCandidateService);
+            : ' --no-deps'.$this->blueGreenComposeCandidateServiceArguments();
 
         if ($this->application->build_pack === 'dockerimage') {
             $this->application_deployment_queue->addLogEntry('Pulling latest images from the registry.');
@@ -4849,7 +4868,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
                 $commands[] = $sidecarCommand;
                 array_push($commands, ...$sidecarStarter->runningMutationCompletionAssertionsFor($sidecarPlan));
             }
-            $commands[] = "{$composeCommandPrefix} up --pull always --build -d{$blueGreenCandidateService}";
+            $commands[] = "{$composeCommandPrefix} up --pull always --build -d{$blueGreenCandidateServices}";
 
             return $commands;
         }
@@ -4863,7 +4882,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
 
         $commands[] = executeInDocker(
             $this->deployment_uuid,
-            "{$composeCommandPrefix} up --build -d{$blueGreenCandidateService}",
+            "{$composeCommandPrefix} up --build -d{$blueGreenCandidateServices}",
         );
 
         return $commands;
@@ -4873,7 +4892,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
     {
         $claim = $this->blueGreenLifecycle?->claim();
         if ($this->application->build_pack !== 'dockercompose'
-            || $this->blueGreenComposeCandidateService === null
+            || $this->blueGreenComposeCandidateServices === []
             || $claim === null
             || $claim->previousActiveColor !== null) {
             return null;

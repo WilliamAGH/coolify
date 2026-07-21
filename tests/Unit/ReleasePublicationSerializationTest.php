@@ -14,4 +14,5 @@ it('serializes caller release publication and permits shared release writes by t
     'production' => ['.github/workflows/coolify-production-build.yml', 'coollabsio/coolify'],
     'staging' => ['.github/workflows/coolify-staging-build.yml', 'coollabsio/coolify-staging'],
     'testing host' => ['.github/workflows/coolify-testing-host.yml', 'coollabsio/coolify-testing-host'],
+    'fork' => ['.github/workflows/publish-fork.yml', 'williamagh/coolify'],
 ]);

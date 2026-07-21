@@ -204,7 +204,7 @@ class InspectBlueGreenContainer
                 '--filter '.escapeshellarg('label=coolify.blueGreen.color='.$expectation->color?->value),
                 '--filter '.escapeshellarg('label=coolify.blueGreen.routingRevision='.$expectation->routingRevision),
             ]);
-            $assertions[] = 'test "$(docker ps -aq '.$filters.')" = "$(docker inspect --format='.escapeshellarg('{{.Id}}').' '.$identifier.')"';
+            $assertions[] = 'test "$(docker ps -aq --no-trunc '.$filters.')" = "$(docker inspect --format='.escapeshellarg('{{.Id}}').' '.$identifier.')"';
         }
 
         return $assertions;

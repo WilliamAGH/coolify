@@ -80,6 +80,9 @@ jobs:
   publish:
     name: Build, attest, and coordinate fork publication
     needs: resolve-tag
+    concurrency:
+      group: linux-image-release-williamagh/coolify
+      cancel-in-progress: false
     uses: ./.github/workflows/publish-linux-image.yml
     permissions:
       artifact-metadata: write

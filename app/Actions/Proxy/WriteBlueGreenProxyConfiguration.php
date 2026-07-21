@@ -23,6 +23,8 @@ class WriteBlueGreenProxyConfiguration
 
     private const CONTAINER_MUTATION_JOURNAL_MAGIC = 'coolify-blue-green-container-mutation-v1';
 
+    private const PROBE_HEADER = 'X-Coolify-Blue-Green-Probe';
+
     public function handle(
         Server $server,
         BlueGreenProxyConfiguration $configuration,
@@ -413,10 +415,73 @@ class WriteBlueGreenProxyConfiguration
             || ! is_array($parsed['http']['routers'] ?? null)
             || $parsed['http']['routers'] === []
             || (isset($parsed['http']['middlewares']) && ! is_array($parsed['http']['middlewares']))
-            || ! is_array($parsed['http']['services'] ?? null)
-            || $parsed['http']['services'] === []) {
+            || ! is_array($parsed['http']['services'] ?? null)) {
             throw new InvalidArgumentException('Blue/green proxy configuration must contain HTTP routers and services.');
         }
+        $routers = $parsed['http']['routers'];
+        $services = $parsed['http']['services'];
+        $routerName = count($routers) === 1 ? array_key_first($routers) : null;
+        $isSingletonProbeDocument = is_string($routerName) && str_ends_with($routerName, '-probe');
+        if (($services === [] && ! $this->isGuardedSingletonProbeOnlyDocument($configuration, $parsed['http']))
+            || ($services !== [] && $isSingletonProbeDocument)) {
+            throw new InvalidArgumentException('Blue/green proxy configuration must contain HTTP routers and services.');
+        }
+    }
+
+    /** @param array<string, mixed> $http */
+    private function isGuardedSingletonProbeOnlyDocument(
+        BlueGreenProxyConfiguration $configuration,
+        array $http,
+    ): bool {
+        $routers = $http['routers'];
+        $middlewares = $http['middlewares'] ?? null;
+        if (count($routers) !== 1 || ! is_array($middlewares) || count($middlewares) !== 1) {
+            return false;
+        }
+
+        $routerName = array_key_first($routers);
+        $router = $routers[$routerName] ?? null;
+        $state = $configuration->state;
+        if (! is_string($routerName) || ! is_array($router) || $state->activeColor === null) {
+            return false;
+        }
+
+        $namePrefix = BlueGreenRoutingTarget::routingNamePrefix($state->applicationUuid, $state->destinationId);
+        $probeMiddlewareName = $namePrefix.'probe-header-strip';
+        $expectedService = BlueGreenRoutingTarget::memberServiceReference(
+            $state->applicationUuid,
+            $state->destinationId,
+            $state->activeColor,
+        );
+        $expectedGuard = 'Header(`'.self::PROBE_HEADER.'`, `'.BlueGreenRoutingTarget::durableProbeToken($state->operationId).'`)';
+        $rule = $router['rule'] ?? null;
+        $entryPoints = $router['entryPoints'] ?? null;
+        if (preg_match('/^'.preg_quote($namePrefix, '/').'[A-Za-z0-9_-]+-probe$/D', $routerName) !== 1
+            || ($router['service'] ?? null) !== $expectedService
+            || ! is_string($rule)
+            || preg_match('/^\(.+\) && '.preg_quote($expectedGuard, '/').'$/D', $rule) !== 1
+            || ! is_array($entryPoints)
+            || ! array_is_list($entryPoints)
+            || $entryPoints === []
+            || array_filter($entryPoints, static fn (mixed $entryPoint): bool => ! is_string($entryPoint) || $entryPoint === '') !== []
+            || ($router['middlewares'] ?? null) !== [$probeMiddlewareName]
+            || array_diff(array_keys($router), ['rule', 'entryPoints', 'service', 'middlewares', 'tls']) !== []
+            || array_keys($middlewares) !== [$probeMiddlewareName]) {
+            return false;
+        }
+
+        $acknowledgement = $middlewares[$probeMiddlewareName]['headers']['customResponseHeaders'][BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER] ?? null;
+
+        return is_string($acknowledgement)
+            && preg_match('/^[a-f0-9]{64}$/D', $acknowledgement) === 1
+            && $middlewares[$probeMiddlewareName] === [
+                'headers' => [
+                    'customRequestHeaders' => [self::PROBE_HEADER => ''],
+                    'customResponseHeaders' => [
+                        BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER => $acknowledgement,
+                    ],
+                ],
+            ];
     }
 
     private function assertStateScope(string $managedFilename, ?BlueGreenProxyState $state): void
