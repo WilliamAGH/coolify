@@ -282,6 +282,21 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
     ) {
         $this->dispatch_attempt_uuid = $dispatch_attempt_uuid;
         $this->assignExecutionQueue();
+        $this->hydrateDeploymentContext();
+    }
+
+    /**
+     * Rebuild private parent state lost when a subclass is queue-serialized.
+     *
+     * Laravel's SerializesModels only reflects properties declared on the concrete
+     * job class, so ActivateApplicationDeploymentJob drops ApplicationDeploymentJob
+     * private fields on restore. Public application_deployment_queue_id survives.
+     */
+    protected function hydrateDeploymentContext(): void
+    {
+        if (isset($this->application_deployment_queue)) {
+            return;
+        }
 
         $this->application_deployment_queue = ApplicationDeploymentQueue::find($this->application_deployment_queue_id);
         $this->nixpacks_plan_json = collect([]);
@@ -377,6 +392,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
 
     private function executeDeployment(): void
     {
+        $this->hydrateDeploymentContext();
         $drainRecoveryScheduled = false;
         $this->application_deployment_queue->refresh();
         if (($this->activationOnly && $this->application_deployment_queue->execution_phase !== ApplicationDeploymentExecutionPhase::Activate)
@@ -597,6 +613,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
 
     public function acquireDeploymentExecutionOwnership(): bool
     {
+        $this->hydrateDeploymentContext();
         $this->application_deployment_queue->refresh();
 
         if ($this->application_deployment_queue->status === ApplicationDeploymentStatus::QUEUED->value
@@ -635,6 +652,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
 
     public function adoptLegacyProxyMutationDispatch(): bool
     {
+        $this->hydrateDeploymentContext();
         $deployment = $this->application_deployment_queue->fresh();
         if ($deployment === null) {
             return false;
@@ -6601,6 +6619,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
 
     public function completeBlueGreenDrainRecovery(): void
     {
+        $this->hydrateDeploymentContext();
         $this->application_deployment_queue->refresh();
         if ($this->application_deployment_queue->status === ApplicationDeploymentStatus::FINISHED->value) {
             return;
@@ -6656,6 +6675,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
 
     public function deferBlueGreenDrainRecovery(): void
     {
+        $this->hydrateDeploymentContext();
         ResumeBlueGreenDrainingDeploymentJob::dispatch($this->application_deployment_queue->id)
             ->delay(now()->addSecond());
         $this->application_deployment_queue->addLogEntry(
@@ -6666,6 +6686,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
 
     public function failBlueGreenDrainRecovery(Throwable $exception): void
     {
+        $this->hydrateDeploymentContext();
         $this->application_deployment_queue->refresh();
         if (in_array($this->application_deployment_queue->status, [
             ApplicationDeploymentStatus::FINISHED->value,
@@ -6740,6 +6761,8 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
 
     public function failed(Throwable $exception): void
     {
+        $this->hydrateDeploymentContext();
+
         if ($this->deploymentOwnedByAnotherDispatchAttempt()) {
             return;
         }
