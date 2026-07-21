@@ -24,6 +24,14 @@ Authorization: AWS4-HMAC-SHA256 Credential=actual-aws-secret,SignedHeaders=host,
 Cookie: session=actual-cookie-secret; Path=/
 password=hunter2 command=restore
 "token": "actual-json-token"
+DB_PASSWORD=actual-db-password-secret
+POSTGRES_PASSWORD: actual-postgres-password-secret
+X_API_TOKEN=actual-x-api-token-secret
+AUTHORIZATION=Bearer actual-shell-authorization-secret
+COOKIE=session=actual-shell-cookie-secret; Path=/
+{"Authorization": "Bearer actual-json-authorization-secret", "Cookie": "session=actual-json-cookie-secret", "DB_PASSWORD": "actual-json-db-password-secret"}
+diagnostic token/password parser completed correlation=run-42
+{"message": "token/password parser completed", "correlation": "run-42"}
 https://operator:actual-url-password@example.invalid/v2/
 docker login --password actual-option-secret registry.invalid
 -----BEGIN OPENSSH PRIVATE KEY-----
@@ -52,6 +60,14 @@ for secret in \
     actual-cookie-secret \
     hunter2 \
     actual-json-token \
+    actual-db-password-secret \
+    actual-postgres-password-secret \
+    actual-x-api-token-secret \
+    actual-shell-authorization-secret \
+    actual-shell-cookie-secret \
+    actual-json-authorization-secret \
+    actual-json-cookie-secret \
+    actual-json-db-password-secret \
     actual-url-password \
     actual-option-secret \
     actual-private-key-material; do
@@ -66,11 +82,19 @@ for marker in \
     '[REDACTED cookie-value]' \
     '[REDACTED sensitive-value:password]' \
     '[REDACTED sensitive-value:token]' \
+    '[REDACTED sensitive-value:db-password]' \
+    '[REDACTED sensitive-value:postgres-password]' \
+    '[REDACTED sensitive-value:x-api-token]' \
+    '[REDACTED sensitive-value:authorization]' \
+    '[REDACTED sensitive-value:cookie]' \
     '[REDACTED credential-url-password]' \
     '[REDACTED command-option-value]' \
     '[REDACTED private-key-material]'; do
     grep -Fq "$marker" "$destination_file"
 done
+
+grep -Fqx 'diagnostic token/password parser completed correlation=run-42' "$destination_file"
+grep -Fqx '{"message": "token/password parser completed", "correlation": "run-42"}' "$destination_file"
 
 mkdir -p "$source_tree/nested/headers"
 cat >"$source_tree/nested/headers/request.log" <<'EOF'

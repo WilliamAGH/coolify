@@ -9,16 +9,23 @@ import tempfile
 from pathlib import Path
 
 
-SENSITIVE_KEY = r'(?:password|passwd|secret|token|credential|app[ _-]?key|private[ _-]?key)'
+SENSITIVE_KEY_COMPONENT = r'(?:password|passwd|secret|token|credential|app[ _-]?key|private[ _-]?key)'
+SENSITIVE_KEY = rf'(?:[a-z0-9]+[._-])*{SENSITIVE_KEY_COMPONENT}(?:[._-][a-z0-9]+)*'
+ASSIGNMENT_SENSITIVE_KEY = rf'(?:{SENSITIVE_KEY}|authorization|cookie)'
 CREDENTIAL_URL = re.compile(r'([a-z][a-z0-9+.-]*://[^\s/:@]+:)[^\s@]+@', re.IGNORECASE)
 AUTHORIZATION_HEADER = re.compile(
     r'^([ \t>]*authorization\s*:\s*)[^\r\n]+$',
     re.IGNORECASE,
 )
-COOKIE_HEADER = re.compile(r'(\b(?:set-)?cookie\s*:\s*)[^\r\n]+', re.IGNORECASE)
+COOKIE_HEADER = re.compile(r'^([ \t>]*(?:set-)?cookie\s*:\s*)[^\r\n]+$', re.IGNORECASE)
 QUOTED_ASSIGNMENT = re.compile(
-    rf'(?P<prefix>["\']?\b(?P<key>{SENSITIVE_KEY})\b["\']?\s*[:=]\s*)'
+    rf'(?P<prefix>["\']?\b(?P<key>{ASSIGNMENT_SENSITIVE_KEY})\b["\']?\s*[:=]\s*)'
     rf'(?P<quote>["\'])(?P<value>.*?)(?P=quote)',
+    re.IGNORECASE,
+)
+HEADER_ASSIGNMENT = re.compile(
+    r'(?P<prefix>["\']?\b(?P<key>authorization|cookie)\b["\']?\s*=\s*)'
+    r'(?P<value>(?!["\'])[^\r\n]+)',
     re.IGNORECASE,
 )
 UNQUOTED_ASSIGNMENT = re.compile(
@@ -52,6 +59,7 @@ def redact_line(line: str) -> str:
     line = AUTHORIZATION_HEADER.sub(r'\1[REDACTED authorization-header]', line)
     line = COOKIE_HEADER.sub(r'\1[REDACTED cookie-value]', line)
     line = QUOTED_ASSIGNMENT.sub(redact_assignment, line)
+    line = HEADER_ASSIGNMENT.sub(redact_assignment, line)
     line = UNQUOTED_ASSIGNMENT.sub(redact_assignment, line)
     line = SENSITIVE_OPTION.sub(r'\g<prefix>[REDACTED command-option-value]', line)
 
