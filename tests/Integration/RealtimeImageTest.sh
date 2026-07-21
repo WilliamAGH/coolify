@@ -4,24 +4,33 @@ set -eu
 
 image="${PRODUCTION_IMAGE:?PRODUCTION_IMAGE is required}"
 container="coolify-main-realtime-runtime-$$"
-runtime_env="$(mktemp)"
+container_id=''
+runtime_env=''
 
 fail()
 {
     printf 'MAIN_IMAGE_REALTIME_RUNTIME_FAILURE %s\n' "$1" >&2
-    if docker container inspect "$container" >/dev/null 2>&1; then
-        docker logs "$container" >&2 2>/dev/null || true
+    if [ -n "$container_id" ] && docker container inspect "$container_id" >/dev/null 2>&1; then
+        docker logs "$container_id" >&2 2>/dev/null || true
     fi
     exit 1
 }
 
 cleanup()
 {
-    docker rm --force "$container" >/dev/null 2>&1 || true
-    rm -f "$runtime_env"
+    if [ -n "$container_id" ]; then
+        docker rm --force "$container_id" >/dev/null 2>&1 || true
+    fi
+    if [ -n "$runtime_env" ]; then
+        rm -f "$runtime_env"
+    fi
 }
 
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+runtime_env="$(mktemp)"
 
 printf '%s\n' \
     'APP_ENV=staging' \
@@ -35,7 +44,9 @@ chmod 0444 "$runtime_env"
 
 docker image inspect "$image" >/dev/null || fail 'the exact production image is absent'
 
-docker create --pull never --name "$container" \
+created_container_id=''
+if ! created_container_id="$(
+    docker create --pull never --name "$container" \
     --env APP_DEBUG=false \
     --env APP_ENV=staging \
     --env APP_KEY=base64:8VEfVNVkXQ9mH2L33WBWNMF4eQ0BWD5CTzB8mIxcl+k= \
@@ -65,17 +76,22 @@ docker create --pull never --name "$container" \
     --env SESSION_DRIVER=array \
     --env TERMINAL_BACKEND_PORT=6002 \
     --env TERMINAL_ENABLED=true \
-    "$image" >/dev/null
-docker cp "$runtime_env" "${container}:/var/www/html/.env" \
+    "$image"
+)"; then
+    fail 'the exact production image could not be created'
+fi
+container_id="$created_container_id"
+
+docker cp "$runtime_env" "${container_id}:/var/www/html/.env" \
     || fail 'the runtime environment could not be copied through the Docker API'
-docker start "$container" >/dev/null \
+docker start "$container_id" >/dev/null \
     || fail 'the production image could not be started after runtime environment injection'
 
 attempt=0
-until docker exec "$container" curl --fail --silent --show-error http://127.0.0.1:6001/up >/dev/null \
-    && docker exec "$container" curl --fail --silent --show-error http://127.0.0.1:6002/ready >/dev/null
+until docker exec "$container_id" curl --fail --silent --show-error http://127.0.0.1:6001/up >/dev/null \
+    && docker exec "$container_id" curl --fail --silent --show-error http://127.0.0.1:6002/ready >/dev/null
 do
-    if [ "$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null || true)" != true ]; then
+    if [ "$(docker inspect --format '{{.State.Running}}' "$container_id" 2>/dev/null || true)" != true ]; then
         fail 'the production image exited before Reverb and terminal became ready'
     fi
 
@@ -86,7 +102,7 @@ do
     sleep 1
 done
 
-docker exec --workdir /terminal "$container" node --input-type=module -e '
+docker exec --workdir /terminal "$container_id" node --input-type=module -e '
     import WebSocket from "ws";
 
     const websocket = new WebSocket("ws://127.0.0.1:6001/app/coolify-key?protocol=7&client=js&version=8.4.0&flash=false");
@@ -104,7 +120,7 @@ docker exec --workdir /terminal "$container" node --input-type=module -e '
     websocket.on("error", () => process.exit(4));
 ' || fail 'the bundled Reverb server did not complete a real Pusher WebSocket handshake'
 
-docker exec --workdir /terminal "$container" node --input-type=module -e '
+docker exec --workdir /terminal "$container_id" node --input-type=module -e '
     import pty from "node-pty";
 
     const expected = "coolify-main-image-node-pty-pass";
@@ -130,9 +146,9 @@ docker exec --workdir /terminal "$container" node --input-type=module -e '
     });
 ' || fail 'the bundled node-pty addon could not spawn, echo, and exit cleanly'
 
-docker stop --time 20 "$container" >/dev/null \
+docker stop --time 20 "$container_id" >/dev/null \
     || fail 'the production image did not stop within the s6 shutdown deadline'
-[ "$(docker inspect --format '{{.State.ExitCode}}' "$container")" -eq 0 ] \
+[ "$(docker inspect --format '{{.State.ExitCode}}' "$container_id")" -eq 0 ] \
     || fail 'the production image did not complete a clean s6 shutdown'
 
 printf 'MAIN_IMAGE_REALTIME_RUNTIME_PASS image=%s reverb=%s terminal=%s\n' \
