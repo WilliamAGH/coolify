@@ -39,6 +39,10 @@ semantic=${SEMANTIC_VERSION:?}
 state=${REGCTL_STATE:?}
 
 semantic_digest() {
+    if [ ! -f "$1" ]; then
+        printf '%s\n' 'manifest unknown' >&2
+        exit 1
+    fi
     value="$(cat "$1")"
     if [ "$value" = absent ]; then
         printf '%s\n' 'manifest unknown' >&2
@@ -66,6 +70,7 @@ case "$1:$2" in
             *)
                 case "$reference" in
                     "$main:$semantic") semantic_digest "$state/main" ;;
+                    "$main:"*) semantic_digest "$state/${reference#"$main:"}" ;;
                     "$main"@*) printf '%s\n' "$MAIN_INDEX_DIGEST" ;;
                     *) exit 64 ;;
                 esac
@@ -76,13 +81,18 @@ case "$1:$2" in
         printf '{"config":{"Labels":{"org.opencontainers.image.source":"%s","org.opencontainers.image.revision":"%s","org.opencontainers.image.version":"%s"}}}\n' "$SOURCE_URL" "$SOURCE_REVISION" "$SEMANTIC_VERSION"
         ;;
     manifest:get)
-        printf '{"mediaType":"application/vnd.oci.image.index.v1+json","annotations":{"org.opencontainers.image.source":"%s","org.opencontainers.image.revision":"%s","org.opencontainers.image.version":"%s"}}\n' "$SOURCE_URL" "$SOURCE_REVISION" "$SEMANTIC_VERSION"
+        version=$SEMANTIC_VERSION
+        if [ "$3" = "$main:fork-latest" ] && [ -n "${FORK_LATEST_VERSION:-}" ]; then
+            version=$FORK_LATEST_VERSION
+        fi
+        printf '{"mediaType":"application/vnd.oci.image.index.v1+json","annotations":{"org.opencontainers.image.source":"%s","org.opencontainers.image.revision":"%s","org.opencontainers.image.version":"%s"}}\n' "$SOURCE_URL" "$SOURCE_REVISION" "$version"
         ;;
     image:copy)
         source=$3
         destination=$4
         case "$destination" in
             "$main:$semantic") printf '%s\n' "$MAIN_INDEX_DIGEST" > "$state/main" ;;
+            "$main:"*) printf '%s\n' "$MAIN_INDEX_DIGEST" > "$state/${destination#"$main:"}" ;;
             *) exit 64 ;;
         esac
         ;;
@@ -148,6 +158,9 @@ SH);
             'MAIN_ARM64_DIGEST' => releaseWorkflowTestDigest('2'),
             'MAIN_INDEX_DIGEST' => releaseWorkflowTestDigest('3'),
             'MAIN_TARGET' => 'docker.iocloudhost.net/williamagh/coolify',
+            'FORK_LATEST_TAG' => 'docker.iocloudhost.net/williamagh/coolify:fork-latest',
+            'FORK_VERSION_TAG' => 'docker.iocloudhost.net/williamagh/coolify:fork-4.13.1-fork',
+            'FORK_VERSION_SHA_TAG' => 'docker.iocloudhost.net/williamagh/coolify:fork-4.13.1-fork-aaaaaaa',
             'PATH' => $bin.PATH_SEPARATOR.(getenv('PATH') ?: ''),
             'REGCTL_LOG' => $log,
             'REGCTL_STATE' => $state,
@@ -1531,6 +1544,52 @@ it('rejects OCI tags longer than 128 characters in input validation', function (
     }
 });
 
+it('rejects fork versions whose derived canonical tag exceeds the OCI limit', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $sharedWorkflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $targetStep = releaseWorkflowStepById($sharedWorkflow['jobs']['validate-inputs'] ?? [], 'target');
+    $script = (string) ($targetStep['run'] ?? '');
+    $forkSemanticVersionPattern = (string) ($targetStep['env']['FORK_SEMANTIC_VERSION_PATTERN'] ?? '');
+    $cases = [
+        '115-character fork version is accepted' => ['1.0.1'.str_repeat('0', 105).'-fork', true],
+        '116-character fork version is rejected' => ['1.0.1'.str_repeat('0', 106).'-fork', false],
+    ];
+
+    foreach ($cases as $description => [$semanticVersion, $shouldSucceed]) {
+        $githubOutput = tempnam(sys_get_temp_dir(), 'coolify-fork-tag-limit-');
+        expect($githubOutput)->not->toBeFalse();
+
+        try {
+            $process = new Process(['bash', '-c', $script], $root, [
+                'ARTIFACT_NAME' => 'coolify-fork',
+                'CANDIDATE_REPOSITORY' => 'williamagh/coolify-fork-candidates',
+                'DOCKERFILE' => 'docker/production/Dockerfile',
+                'FORK_RELEASE_SIGNING_ED25519_PRIVATE_KEY' => 'fixture-key',
+                'FORK_SEMANTIC_VERSION_PATTERN' => $forkSemanticVersionPattern,
+                'GITHUB_OUTPUT' => $githubOutput,
+                'GITHUB_REF' => "refs/tags/{$semanticVersion}",
+                'GITHUB_REF_TYPE' => 'tag',
+                'GITHUB_RUN_ATTEMPT' => '1',
+                'GITHUB_RUN_ID' => '1',
+                'GITHUB_SHA' => str_repeat('a', 40),
+                'NEXUS_PASSWORD' => 'fixture-password',
+                'NEXUS_USERNAME' => 'fixture-user',
+                'PUBLISH_LATEST' => 'false',
+                'RELEASE_KIND' => 'fork',
+                'REPOSITORY' => 'williamacallahan/coolify',
+                'SEMANTIC_VERSION' => $semanticVersion,
+                'TARGET_REPOSITORY' => 'williamagh/coolify',
+                'VALIDATE_ONLY' => 'false',
+            ]);
+            $process->run();
+
+            expect($process->isSuccessful())->toBe($shouldSucceed, $description);
+        } finally {
+            unlink($githubOutput);
+        }
+    }
+});
+
 it('uses isolated database and cache stores in release validation', function () {
     $applicationValidationWorkflow = Yaml::parseFile(releaseWorkflowRepositoryRoot().'/.github/workflows/application-validation.yml');
     $environment = $applicationValidationWorkflow['jobs']['php']['env'] ?? [];
@@ -2233,6 +2292,10 @@ it('defines one referrerless fork release graph for the main image on both platf
     $jobs = $workflow['jobs'] ?? [];
 
     expect(is_executable($root.'/tests/Integration/VerifyOciArchiveImage.sh'))->toBeTrue();
+    expect(is_executable($root.'/scripts/ci/deriveImageTags.mjs'))->toBeTrue()
+        ->and(is_executable($root.'/scripts/ci/deriveImageTags.test.sh'))->toBeTrue()
+        ->and(is_executable($root.'/scripts/ci/verify-nexus-docker-write-policy.sh'))->toBeTrue()
+        ->and(is_executable($root.'/tests/Integration/VerifyNexusDockerWritePolicyTest.sh'))->toBeTrue();
 
     $matrix = $jobs['fork-build']['strategy']['matrix']['include'] ?? [];
     $contracts = array_map(
@@ -2286,10 +2349,13 @@ it('defines one referrerless fork release graph for the main image on both platf
     expect($secretScan['with']['image-ref'] ?? null)
         ->toBe('local/${{ matrix.artifact_name }}:${{ github.sha }}-${{ matrix.arch }}-fork-runtime');
 
-    $policyRun = (string) (releaseWorkflowStep(
-        $jobs['fork-registry-policy'] ?? [],
-        'Require Nexus hosted repository non-redeploy policy',
-    )['run'] ?? '');
+    $forkRegistryPolicy = $jobs['fork-registry-policy'] ?? [];
+    $policyCheckout = releaseWorkflowStep($forkRegistryPolicy, 'Check out immutable fork policy source');
+    $policyStep = releaseWorkflowStep(
+        $forkRegistryPolicy,
+        'Validate shared Nexus docker-hosted contract',
+    );
+    $policyRun = (string) ($policyStep['run'] ?? '');
     $stageRun = (string) (releaseWorkflowStep(
         $jobs['fork-stage'] ?? [],
         'Stage the fork image with inline build attestations',
@@ -2298,13 +2364,25 @@ it('defines one referrerless fork release graph for the main image on both platf
         $jobs['fork-release'] ?? [],
         'Promote and verify the main fork image',
     )['run'] ?? '');
-    $forkRegistryPolicyStepNames = collect(releaseWorkflowSteps($jobs['fork-registry-policy'] ?? []))
+    $forkRegistryPolicyStepNames = collect(releaseWorkflowSteps($forkRegistryPolicy))
         ->pluck('name')
         ->values()
         ->all();
+    expect($forkRegistryPolicy['name'] ?? null)->toBe('Validate shared Nexus docker-hosted contract');
+    expect($forkRegistryPolicy['permissions'] ?? null)->toBe(['contents' => 'read'])
+        ->and($forkRegistryPolicy['env'] ?? [])
+        ->not->toHaveKey('NEXUS_PASSWORD')
+        ->not->toHaveKey('NEXUS_USERNAME')
+        ->and($policyStep['env'] ?? null)->toBe([
+            'NEXUS_PASSWORD' => '${{ secrets.NEXUS_PASSWORD }}',
+            'NEXUS_USERNAME' => '${{ secrets.NEXUS_USERNAME }}',
+        ])
+        ->and($policyCheckout['uses'] ?? null)
+        ->toBe('actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd')
+        ->and($policyCheckout['with']['persist-credentials'] ?? null)->toBeFalse()
+        ->and($policyCheckout['with']['ref'] ?? null)->toBe('${{ github.sha }}');
     expect($policyRun)
-        ->toContain('.storage.writePolicy == "ALLOW_ONCE"')
-        ->toContain('/service/rest/v1/repositories/docker/hosted/$NEXUS_REPOSITORY')
+        ->toBe('scripts/ci/verify-nexus-docker-write-policy.sh')
         ->and($forkRegistryPolicyStepNames)
         ->not->toContain('Reject existing fork semantic tags before build')
         ->and($stageRun)
@@ -2318,6 +2396,14 @@ it('defines one referrerless fork release graph for the main image on both platf
         ->and($promotionRun)
         ->toContain('preflight_semantic_tag')
         ->toContain('promote_or_verify_semantic_tag')
+        ->toContain('promote_and_verify_canonical_tags')
+        ->toContain('fork_version_is_newer')
+        ->toContain('preflight_latest_tag')
+        ->toContain('Refusing to move fork-latest backward or sideways')
+        ->toContain('FORK_LATEST_TAG')
+        ->toContain('FORK_VERSION_TAG')
+        ->toContain('FORK_VERSION_SHA_TAG')
+        ->not->toContain('scripts/ci/deriveImageTags.mjs')
         ->toContain('does not match its expected immutable index digest')
         ->toContain('accepting recovery state')
         ->toContain('assert_live_fork_tag_binding')
@@ -2330,8 +2416,9 @@ it('defines one referrerless fork release graph for the main image on both platf
         ->toContain('human authority remains a residual risk')
         ->toContain('preflight_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"')
         ->toContain('promote_or_verify_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"')
+        ->toContain('promote_and_verify_canonical_tags "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"')
         ->not->toContain('REALTIME_TARGET')
-        ->not->toContain(':latest');
+        ->not->toContain('DOCKER_TARGET');
 
     $preflightMainPosition = strpos($promotionRun, 'preflight_semantic_tag "$MAIN_TARGET" "$MAIN_INDEX_DIGEST"');
     $preWriteTagVerificationPosition = strpos($promotionRun, 'assert_live_fork_tag_binding', $preflightMainPosition ?: 0);
@@ -2376,10 +2463,13 @@ it('defines one referrerless fork release graph for the main image on both platf
         'Create or validate empty draft recovery release before semantic promotion',
     )['run'] ?? '');
     $forkRelease = $jobs['fork-release'] ?? [];
+    $releaseCheckoutSteps = collect(releaseWorkflowSteps($forkRelease))
+        ->filter(static fn (array $step): bool => str_starts_with((string) ($step['uses'] ?? ''), 'actions/checkout@'));
     $finalPolicyStep = releaseWorkflowStep(
         $forkRelease,
-        'Re-require Nexus non-redeploy policy before final tagging',
+        'Revalidate shared Nexus docker-hosted contract before final tagging',
     );
+    $finalPolicyRun = (string) ($finalPolicyStep['run'] ?? '');
     $finalLoginStep = releaseWorkflowStep(
         $forkRelease,
         'Login to Nexus fork registry for final promotion',
@@ -2407,9 +2497,16 @@ it('defines one referrerless fork release graph for the main image on both platf
         ->toBe('${{ secrets.NEXUS_USERNAME }}')
         ->and($forkReleaseNexusSecretSteps)
         ->toBe([
-            'Re-require Nexus non-redeploy policy before final tagging',
+            'Revalidate shared Nexus docker-hosted contract before final tagging',
             'Login to Nexus fork registry for final promotion',
         ]);
+    expect($releaseCheckoutSteps)->toBeEmpty();
+    expect($finalPolicyRun)
+        ->toContain('.writePolicy == "ALLOW"')
+        ->toContain('.format == "docker"')
+        ->toContain('.type == "hosted"')
+        ->not->toContain('ALLOW_ONCE')
+        ->not->toContain('--request');
     expect($forkRelease['permissions']['contents'] ?? null)->toBe('write')
         ->and($releaseBundleDownload['with']['artifact-ids'] ?? null)
         ->toBe('${{ needs.fork-attest.outputs.bundle_artifact_id }}')
@@ -2892,6 +2989,9 @@ it('accepts an idempotent fork semantic promotion without overwriting its matchi
             ->and($registryLog)
             ->not->toContain('image copy docker.iocloudhost.net/williamagh/coolify@'.releaseWorkflowTestDigest('3').' docker.iocloudhost.net/williamagh/coolify:4.13.1-fork')
             ->and(trim((string) file_get_contents($registry['state'].'/main')))->toBe(releaseWorkflowTestDigest('3'))
+            ->and(trim((string) file_get_contents($registry['state'].'/fork-latest')))->toBe(releaseWorkflowTestDigest('3'))
+            ->and(trim((string) file_get_contents($registry['state'].'/fork-4.13.1-fork')))->toBe(releaseWorkflowTestDigest('3'))
+            ->and(trim((string) file_get_contents($registry['state'].'/fork-4.13.1-fork-aaaaaaa')))->toBe(releaseWorkflowTestDigest('3'))
             ->and(substr_count((string) file_get_contents($registry['curl_log']), '/git/ref/tags/4.13.1-fork'))->toBe(2)
             ->and(substr_count((string) file_get_contents($registry['curl_log']), 'rulesets?targets=tag&includes_parents=true&per_page=100'))->toBe(2);
     } finally {
@@ -2971,6 +3071,86 @@ it('rejects a mismatched fork semantic tag before any registry write', function 
             ->and($process->getErrorOutput())->toContain('does not match its expected immutable index digest')
             ->and((string) file_get_contents($registry['log']))->not->toContain('image copy')
             ->and(trim((string) file_get_contents($registry['state'].'/main')))->toBe(releaseWorkflowTestDigest('f'));
+    } finally {
+        $filesystem->remove($fixture);
+    }
+});
+
+it('rejects a mismatched canonical fork identity tag before updating fork latest', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $promotionRun = (string) (releaseWorkflowStep(
+        $workflow['jobs']['fork-release'] ?? [],
+        'Promote and verify the main fork image',
+    )['run'] ?? '');
+    $filesystem = new Filesystem;
+    $fixture = sys_get_temp_dir().'/coolify-fork-canonical-mismatch-'.bin2hex(random_bytes(8));
+    $registry = releaseWorkflowPrepareForkPromotionRegistryDouble($fixture, null);
+    file_put_contents($registry['state'].'/fork-4.13.1-fork', releaseWorkflowTestDigest('f')."\n");
+
+    try {
+        $process = new Process(['bash', '-c', $promotionRun], $root, $registry['environment']);
+        $process->run();
+
+        expect($process->isSuccessful())->toBeFalse()
+            ->and($process->getErrorOutput())->toContain('refusing release-identity overwrite')
+            ->and((string) file_get_contents($registry['log']))->not->toContain('image copy')
+            ->and(file_exists($registry['state'].'/fork-latest'))->toBeFalse()
+            ->and(trim((string) file_get_contents($registry['state'].'/main')))->toBe('absent')
+            ->and(trim((string) file_get_contents($registry['state'].'/fork-4.13.1-fork')))
+            ->toBe(releaseWorkflowTestDigest('f'));
+    } finally {
+        $filesystem->remove($fixture);
+    }
+});
+
+it('refuses to move fork latest backward after a newer release has won serialization', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $promotionRun = (string) (releaseWorkflowStep(
+        $workflow['jobs']['fork-release'] ?? [],
+        'Promote and verify the main fork image',
+    )['run'] ?? '');
+    $filesystem = new Filesystem;
+    $fixture = sys_get_temp_dir().'/coolify-fork-latest-rollback-refusal-'.bin2hex(random_bytes(8));
+    $registry = releaseWorkflowPrepareForkPromotionRegistryDouble($fixture, null);
+    file_put_contents($registry['state'].'/fork-latest', releaseWorkflowTestDigest('f')."\n");
+    $registry['environment']['FORK_LATEST_VERSION'] = '4.13.2-fork';
+
+    try {
+        $process = new Process(['bash', '-c', $promotionRun], $root, $registry['environment']);
+        $process->run();
+
+        expect($process->isSuccessful())->toBeFalse()
+            ->and($process->getErrorOutput())->toContain('Refusing to move fork-latest backward or sideways from 4.13.2-fork to 4.13.1-fork')
+            ->and((string) file_get_contents($registry['log']))->not->toContain('image copy')
+            ->and(trim((string) file_get_contents($registry['state'].'/fork-latest')))->toBe(releaseWorkflowTestDigest('f'))
+            ->and(trim((string) file_get_contents($registry['state'].'/main')))->toBe('absent');
+    } finally {
+        $filesystem->remove($fixture);
+    }
+});
+
+it('moves fork latest forward after an older release has won serialization', function () {
+    $root = releaseWorkflowRepositoryRoot();
+    $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
+    $promotionRun = (string) (releaseWorkflowStep(
+        $workflow['jobs']['fork-release'] ?? [],
+        'Promote and verify the main fork image',
+    )['run'] ?? '');
+    $filesystem = new Filesystem;
+    $fixture = sys_get_temp_dir().'/coolify-fork-latest-forward-'.bin2hex(random_bytes(8));
+    $registry = releaseWorkflowPrepareForkPromotionRegistryDouble($fixture, null);
+    file_put_contents($registry['state'].'/fork-latest', releaseWorkflowTestDigest('f')."\n");
+    $registry['environment']['FORK_LATEST_VERSION'] = '4.13.0-fork';
+
+    try {
+        $process = new Process(['bash', '-c', $promotionRun], $root, $registry['environment']);
+        $process->run();
+
+        expect($process->isSuccessful())->toBeTrue($process->getErrorOutput())
+            ->and(trim((string) file_get_contents($registry['state'].'/fork-latest')))->toBe(releaseWorkflowTestDigest('3'))
+            ->and(trim((string) file_get_contents($registry['state'].'/main')))->toBe(releaseWorkflowTestDigest('3'));
     } finally {
         $filesystem->remove($fixture);
     }
