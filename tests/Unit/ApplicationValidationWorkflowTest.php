@@ -139,6 +139,22 @@ function applicationValidationRequiredAggregateStep(array $workflow): array
 }
 
 /**
+ * @param  array<string, mixed>  $workflow
+ * @return array<string, mixed>
+ */
+function applicationValidationSourceIdentityStep(array $workflow): array
+{
+    $step = collect($workflow['jobs']['source-identity']['steps'] ?? [])
+        ->firstWhere('name', 'Bind requested source to check-run revision');
+
+    if (! is_array($step)) {
+        throw new RuntimeException('The exact validation source identity step is missing.');
+    }
+
+    return $step;
+}
+
+/**
  * @return array<string, string|false>
  */
 function applicationValidationRequiredEnvironment(string $eventName, string $sourceSha = ''): array
@@ -151,6 +167,7 @@ function applicationValidationRequiredEnvironment(string $eventName, string $sou
         'FORK_DEPLOY_RESULT' => 'success',
         'NODE_RESULT' => 'success',
         'PHP_RESULT' => 'success',
+        'SOURCE_IDENTITY_RESULT' => 'success',
         'VALIDATION_SOURCE_SHA' => $sourceSha,
         'TESTING_HOST_RUNTIME_RESULT' => $eventName === 'pull_request' || $sourceSha !== '' ? 'success' : 'skipped',
         'WORKFLOW_RESULT' => 'success',
@@ -173,6 +190,22 @@ function runApplicationValidationRequiredAggregate(array $environment): Process
     return $process;
 }
 
+function runApplicationValidationSourceIdentity(string $sourceSha, string $checkRunSha): Process
+{
+    $step = applicationValidationSourceIdentityStep(applicationValidationWorkflow());
+    $process = new Process(
+        ['bash', '-c', (string) ($step['run'] ?? '')],
+        dirname(__DIR__, 2),
+        [
+            'CHECK_RUN_SHA' => $checkRunSha,
+            'VALIDATION_SOURCE_SHA' => $sourceSha,
+        ],
+    );
+    $process->run();
+
+    return $process;
+}
+
 /**
  * @return array<string, array{string, string}>
  */
@@ -187,6 +220,7 @@ function applicationValidationGenericResultFailures(): array
         'FORK_DEPLOY_RESULT',
         'NODE_RESULT',
         'PHP_RESULT',
+        'SOURCE_IDENTITY_RESULT',
         'WORKFLOW_RESULT',
     ] as $variable) {
         foreach (['failure', 'skipped', 'cancelled'] as $result) {
@@ -212,6 +246,7 @@ function applicationValidationMissingOrEmptyEnvironmentCases(): array
         'FORK_DEPLOY_RESULT',
         'NODE_RESULT',
         'PHP_RESULT',
+        'SOURCE_IDENTITY_RESULT',
         'TESTING_HOST_RUNTIME_RESULT',
         'WORKFLOW_RESULT',
     ] as $variable) {
@@ -243,6 +278,30 @@ function applicationValidationWorkflowViolations(array $workflow): array
     $required = is_array($jobs) ? ($jobs['required'] ?? []) : [];
     if (($required['name'] ?? null) !== 'Application validation required') {
         $violations[] = 'application validation must preserve the protected branch status context';
+    }
+
+    $sourceIdentity = is_array($jobs) ? ($jobs['source-identity'] ?? []) : [];
+    $sourceIdentityStep = collect($sourceIdentity['steps'] ?? [])
+        ->firstWhere('name', 'Bind requested source to check-run revision');
+    if (($sourceIdentity['name'] ?? null) !== 'Exact validation source identity'
+        || ! is_array($sourceIdentityStep)
+        || ($sourceIdentityStep['shell'] ?? null) !== 'bash'
+        || ($sourceIdentityStep['env'] ?? null) !== [
+            'CHECK_RUN_SHA' => '${{ github.sha }}',
+            'VALIDATION_SOURCE_SHA' => '${{ inputs.source_sha }}',
+        ]
+        || ! str_contains((string) ($sourceIdentityStep['run'] ?? ''), '[[ "$VALIDATION_SOURCE_SHA" == "$CHECK_RUN_SHA" ]]')) {
+        $violations[] = 'application validation must bind an exact requested source to the check-run revision';
+    }
+    foreach (is_array($jobs) ? $jobs : [] as $jobName => $job) {
+        if (in_array($jobName, ['required', 'source-identity'], true)) {
+            continue;
+        }
+        if (($job['needs'] ?? null) !== 'source-identity') {
+            $violations[] = 'every validation job must wait for exact source identity';
+
+            break;
+        }
     }
 
     $requiredNeeds = $required['needs'] ?? [];
@@ -440,6 +499,44 @@ it('defines the required application validation contract', function () {
     expect(applicationValidationWorkflowViolations($workflow))->toBe([]);
 });
 
+it('accepts only an empty source or the exact check-run revision', function (string $sourceSha, string $checkRunSha): void {
+    $process = runApplicationValidationSourceIdentity($sourceSha, $checkRunSha);
+
+    expect($process->isSuccessful())->toBeTrue($process->getErrorOutput());
+})->with([
+    'implicit check-run source' => ['', str_repeat('a', 40)],
+    'matching exact source' => [str_repeat('b', 40), str_repeat('b', 40)],
+]);
+
+it('rejects malformed or mismatched exact validation sources', function (string $sourceSha, string $checkRunSha): void {
+    $process = runApplicationValidationSourceIdentity($sourceSha, $checkRunSha);
+
+    expect($process->isSuccessful())->toBeFalse();
+})->with([
+    'short source' => [str_repeat('a', 39), str_repeat('a', 40)],
+    'uppercase source' => [str_repeat('A', 40), str_repeat('a', 40)],
+    'different revision' => [str_repeat('a', 40), str_repeat('b', 40)],
+]);
+
+it('rejects removing the exact validation source binding', function (): void {
+    $workflow = applicationValidationWorkflow();
+    $step = collect($workflow['jobs']['source-identity']['steps'] ?? [])
+        ->search(fn (array $candidate): bool => ($candidate['name'] ?? null) === 'Bind requested source to check-run revision');
+    expect($step)->not->toBeFalse();
+    $workflow['jobs']['source-identity']['steps'][$step]['run'] = 'true';
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('application validation must bind an exact requested source to the check-run revision');
+});
+
+it('rejects running a validation job before exact source identity succeeds', function (): void {
+    $workflow = applicationValidationWorkflow();
+    unset($workflow['jobs']['php']['needs']);
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('every validation job must wait for exact source identity');
+});
+
 it('fails when Docker daemon configuration ownership is removed from required validation', function () {
     $workflow = applicationValidationWorkflow();
     $step = collect($workflow['jobs']['workflow-and-shell']['steps'] ?? [])
@@ -510,6 +607,7 @@ it('keeps the aggregate contract structurally connected to every selected result
             'formatting',
             'fork-deploy',
             'node',
+            'source-identity',
             'testing-host-runtime',
             'workflow-and-shell',
         ])
@@ -522,6 +620,7 @@ it('keeps the aggregate contract structurally connected to every selected result
             'FORK_DEPLOY_RESULT' => '${{ needs.fork-deploy.result }}',
             'NODE_RESULT' => '${{ needs.node.result }}',
             'PHP_RESULT' => '${{ needs.php.result }}',
+            'SOURCE_IDENTITY_RESULT' => '${{ needs.source-identity.result }}',
             'VALIDATION_SOURCE_SHA' => '${{ inputs.source_sha }}',
             'TESTING_HOST_RUNTIME_RESULT' => '${{ needs.testing-host-runtime.result }}',
             'WORKFLOW_RESULT' => '${{ needs.workflow-and-shell.result }}',

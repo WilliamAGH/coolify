@@ -35,8 +35,32 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  source-identity:
+    name: Exact validation source identity
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Bind requested source to check-run revision
+        shell: bash
+        env:
+          CHECK_RUN_SHA: ${{ github.sha }}
+          VALIDATION_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -Eeuo pipefail
+          if [[ -z "$VALIDATION_SOURCE_SHA" ]]; then
+            exit 0
+          fi
+          [[ "$VALIDATION_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "The requested validation source is not a full lowercase commit SHA." >&2
+            exit 1
+          }
+          [[ "$VALIDATION_SOURCE_SHA" == "$CHECK_RUN_SHA" ]] || {
+            echo "The requested validation source does not match the check-run revision." >&2
+            exit 1
+          }
+
   php:
     name: PHP 8.5 application
+    needs: source-identity
     runs-on: ubuntu-24.04
     services:
       redis:
@@ -126,6 +150,7 @@ jobs:
 
   blue-green-lifecycle:
     name: Blue-green lifecycle (PostgreSQL)
+    needs: source-identity
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     services:
@@ -232,6 +257,7 @@ jobs:
 
   browser:
     name: Pest browser tests
+    needs: source-identity
     runs-on: ubuntu-24.04
     services:
       redis:
@@ -282,6 +308,7 @@ jobs:
 
   formatting:
     name: PHP formatting
+    needs: source-identity
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -313,6 +340,7 @@ jobs:
 
   node:
     name: Node 22 application
+    needs: source-identity
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -331,6 +359,7 @@ jobs:
 
   workflow-and-shell:
     name: Workflow and shell contracts
+    needs: source-identity
     runs-on: ubuntu-24.04
     env:
       OWNED_WORKFLOWS: >-
@@ -435,6 +464,7 @@ jobs:
 
   testing-host-runtime:
     name: Testing-host production identity bridge
+    needs: source-identity
     if: ${{ github.event_name == 'pull_request' || inputs.source_sha != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 75
@@ -490,6 +520,7 @@ jobs:
 
   fork-deploy:
     name: Signed fork deployment contract
+    needs: source-identity
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -510,6 +541,7 @@ jobs:
       - formatting
       - fork-deploy
       - node
+      - source-identity
       - testing-host-runtime
       - workflow-and-shell
     runs-on: ubuntu-24.04
@@ -524,6 +556,7 @@ jobs:
           FORK_DEPLOY_RESULT: ${{ needs.fork-deploy.result }}
           NODE_RESULT: ${{ needs.node.result }}
           PHP_RESULT: ${{ needs.php.result }}
+          SOURCE_IDENTITY_RESULT: ${{ needs.source-identity.result }}
           VALIDATION_SOURCE_SHA: ${{ inputs.source_sha }}
           TESTING_HOST_RUNTIME_RESULT: ${{ needs.testing-host-runtime.result }}
           WORKFLOW_RESULT: ${{ needs.workflow-and-shell.result }}
@@ -536,6 +569,7 @@ jobs:
             "$FORMATTING_RESULT" \
             "$FORK_DEPLOY_RESULT" \
             "$NODE_RESULT" \
+            "$SOURCE_IDENTITY_RESULT" \
             "$WORKFLOW_RESULT"; do
             [[ "$result" == success ]] || {
               echo "A required generic application validation job did not succeed: $result" >&2
