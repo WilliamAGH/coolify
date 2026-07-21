@@ -43,6 +43,14 @@ All notable changes to this project will be documented in this file.
 - *(blue-green)* Fence fleet failure and removal races
 - *(blue-green)* Renew fleet fences and type recovery predicates
 - *(blue-green)* Preserve terminal recovery timestamp
+- *(deps)* Update Guzzle for security advisories
+- *(blue-green)* Fence replica recovery
+- *(release)* Align fork image tag train
+- *(release)* Preflight immutable fork aliases
+- *(release)* Complete DRY fork promotion wiring
+- *(blue-green)* Preserve full container identity
+- *(release)* Keep fork latest monotonic
+- *(traefik)* Admit guarded probe-only routes
 
 ### 💼 Other
 
@@ -62,6 +70,8 @@ All notable changes to this project will be documented in this file.
 - Update changelog (#71)
 - Update changelog (#73)
 - Update changelog (#74)
+- Update changelog (#77)
+- Update changelog (#82)
 
 ### 🎨 Styling
 
@@ -84,6 +94,7 @@ All notable changes to this project will be documented in this file.
 - *(control-plane)* Exercise real worker reservation recovery
 - *(proxy)* Dispatch isolated reservation fixtures
 - *(control-plane)* Exclude image pulls from startup budget
+- *(blue-green)* Claim drift fixtures durably
 
 ### ⚙️ Miscellaneous Tasks
 
