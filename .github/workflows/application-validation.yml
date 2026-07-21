@@ -392,6 +392,8 @@ jobs:
           tests/Integration/PublishLinuxImageScriptTest.sh
           tests/Integration/ReleaseOperationalFixturesTest.sh
           tests/Integration/VerifyNexusDockerWritePolicyTest.sh
+          tests/Integration/VerifyForkReleaseTagTest.sh
+          tests/Integration/DockerSsotCleanTest.sh
           tests/Integration/ProductionApplicationBlueGreen/SanitizeEvidenceTest.sh
       - name: Run v4.x candidate ship contract
         run: scripts/dev/ship.test.sh
@@ -508,15 +510,23 @@ jobs:
         run: |
           install -d -m 0700 "$EVIDENCE_PARENT"
           tests/Integration/ProductionApplicationBlueGreen/run.sh
+      - name: Sanitize production application blue-green evidence
+        if: always()
+        shell: bash
+        env:
+          RAW_EVIDENCE_PARENT: ${{ runner.temp }}/production-application-blue-green-evidence
+          SANITIZED_EVIDENCE_PARENT: ${{ runner.temp }}/production-application-blue-green-sanitized
+        run: |
+          set -Eeuo pipefail
+          python3 tests/Integration/ProductionApplicationBlueGreen/sanitize-evidence.py \
+            "$RAW_EVIDENCE_PARENT" "$SANITIZED_EVIDENCE_PARENT"
       - name: Retain sanitized production application blue-green evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           if-no-files-found: ignore
           name: production-application-blue-green-${{ inputs.source_sha || github.sha }}
-          path: |
-            ${{ runner.temp }}/production-application-blue-green-evidence/production-application-blue-green.*/shared/**
-            !${{ runner.temp }}/production-application-blue-green-evidence/**/images.tar
+          path: ${{ runner.temp }}/production-application-blue-green-sanitized/**
           retention-days: 7
 
   fork-deploy:

@@ -470,14 +470,31 @@ function applicationValidationWorkflowViolations(array $workflow): array
         || ! str_contains((string) ($productionBlueGreen['run'] ?? ''), 'tests/Integration/ProductionApplicationBlueGreen/run.sh')) {
         $violations[] = 'application validation must execute the production application blue-green contract against both exact source images';
     }
+    $productionBlueGreenEvidenceSanitizer = collect($testingHostRuntime['steps'] ?? [])
+        ->firstWhere('name', 'Sanitize production application blue-green evidence');
+    $sanitizerScript = (string) ($productionBlueGreenEvidenceSanitizer['run'] ?? '');
+    $expectedSanitizerScript = <<<'SH'
+set -Eeuo pipefail
+python3 tests/Integration/ProductionApplicationBlueGreen/sanitize-evidence.py \
+  "$RAW_EVIDENCE_PARENT" "$SANITIZED_EVIDENCE_PARENT"
+SH;
+    if (! is_array($productionBlueGreenEvidenceSanitizer)
+        || ($productionBlueGreenEvidenceSanitizer['if'] ?? null) !== 'always()'
+        || ($productionBlueGreenEvidenceSanitizer['shell'] ?? null) !== 'bash'
+        || ($productionBlueGreenEvidenceSanitizer['env'] ?? null) !== [
+            'RAW_EVIDENCE_PARENT' => '${{ runner.temp }}/production-application-blue-green-evidence',
+            'SANITIZED_EVIDENCE_PARENT' => '${{ runner.temp }}/production-application-blue-green-sanitized',
+        ]
+        || trim($sanitizerScript) !== $expectedSanitizerScript) {
+        $violations[] = 'application validation must sanitize every retained production application blue-green text artifact';
+    }
     $productionBlueGreenArtifact = collect($testingHostRuntime['steps'] ?? [])
         ->firstWhere('name', 'Retain sanitized production application blue-green evidence');
     if (! is_array($productionBlueGreenArtifact)
         || ($productionBlueGreenArtifact['if'] ?? null) !== 'always()'
         || ($productionBlueGreenArtifact['uses'] ?? null) !== 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02'
         || ($productionBlueGreenArtifact['with']['if-no-files-found'] ?? null) !== 'ignore'
-        || ! str_contains((string) ($productionBlueGreenArtifact['with']['path'] ?? ''), 'production-application-blue-green.*/shared/**')
-        || ! str_contains((string) ($productionBlueGreenArtifact['with']['path'] ?? ''), '!${{ runner.temp }}/production-application-blue-green-evidence/**/images.tar')) {
+        || ($productionBlueGreenArtifact['with']['path'] ?? null) !== '${{ runner.temp }}/production-application-blue-green-sanitized/**') {
         $violations[] = 'application validation must retain sanitized production application blue-green evidence';
     }
 
@@ -579,7 +596,7 @@ it('fails when an exact blue-green regression owner is removed from required val
     'proxy privileged transport' => 'tests/Unit/Actions/Proxy/BlueGreenNonRootRemoteExecutionTest.php',
 ]);
 
-it('fails when production application blue-green evidence includes the nested image archive', function (): void {
+it('fails when production application blue-green evidence bypasses the sanitized export tree', function (): void {
     $workflow = applicationValidationWorkflow();
     $step = collect($workflow['jobs']['testing-host-runtime']['steps'] ?? [])
         ->search(fn (array $candidate): bool => ($candidate['name'] ?? null) === 'Retain sanitized production application blue-green evidence');
@@ -589,6 +606,17 @@ it('fails when production application blue-green evidence includes the nested im
 
     expect(applicationValidationWorkflowViolations($workflow))
         ->toContain('application validation must retain sanitized production application blue-green evidence');
+});
+
+it('fails when production application blue-green evidence is uploaded without sanitizing every text artifact', function (): void {
+    $workflow = applicationValidationWorkflow();
+    $step = collect($workflow['jobs']['testing-host-runtime']['steps'] ?? [])
+        ->search(fn (array $candidate): bool => ($candidate['name'] ?? null) === 'Sanitize production application blue-green evidence');
+    expect($step)->not->toBeFalse();
+    unset($workflow['jobs']['testing-host-runtime']['steps'][$step]);
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('application validation must sanitize every retained production application blue-green text artifact');
 });
 
 it('keeps the aggregate contract structurally connected to every selected result', function () {
