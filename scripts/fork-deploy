@@ -620,6 +620,18 @@ fd_release_ssh_runtime_ownership() {
     fd_assert_tree_safe_for_privileged_mutation "$ssh_directory" 'Coolify ssh tree'
 }
 
+fd_restore_fresh_install_ssh_scaffold() {
+    local ssh_directory=$ROOT/ssh
+
+    require_directory_or_missing "$ssh_directory" 'localhost SSH directory'
+    [[ -d $ssh_directory ]] || die "localhost SSH directory is missing: $ssh_directory"
+    fd_assert_tree_safe_for_privileged_mutation "$ssh_directory" 'Coolify ssh tree'
+    find "$ssh_directory" -xdev -mindepth 1 -depth -exec chown root:root {} +
+    find "$ssh_directory" -xdev -type d -exec chmod 0700 {} +
+    chown root:root "$ssh_directory"
+    chmod 0700 "$ssh_directory"
+}
+
 adopt_localhost_ssh_key() {
     local private_key=$ROOT/ssh/keys/id.root@host.docker.internal public_key authorized_directory
     authorized_directory=${AUTHORIZED_KEYS%/*}
@@ -1743,23 +1755,56 @@ fd_container_exists() {
     docker inspect "$1" >/dev/null 2>&1
 }
 
+fd_empty_install_scaffold_directory() {
+    local path=$1 label=$2 discovered
+
+    require_directory_or_missing "$path" "$label"
+    [[ -d $path ]] || return 0
+    [[ $(file_mode "$path") == 700 ]] || return 1
+    if ! test_mode; then
+        [[ $(file_owner "$path") == 0:0 ]] || return 1
+    fi
+    discovered=$(find "$path" -mindepth 1 -print -quit)
+    [[ -z $discovered ]]
+}
+
 fd_unmanaged_state_present() {
-    local container directory discovered volumes volume
+    local container directory discovered parent volumes volume
 
     for container in coolify coolify-realtime coolify-db coolify-redis; do
         fd_container_exists "$container" && return 0
     done
-    require_directory_or_missing "$SOURCE_DIR" 'unmanaged Coolify source directory'
-    if [[ -d $SOURCE_DIR ]]; then
-        discovered=$(find "$SOURCE_DIR" -mindepth 1 ! -type d -print -quit)
-        [[ -z $discovered ]] || return 0
-    fi
-    for directory in applications backups databases proxy sentinel services ssh; do
-        require_directory_or_missing "$ROOT/$directory" "unmanaged Coolify $directory directory"
-        [[ -d $ROOT/$directory ]] || continue
-        discovered=$(find "$ROOT/$directory" -mindepth 1 ! -type d -print -quit)
+    fd_empty_install_scaffold_directory "$SOURCE_DIR" 'unmanaged Coolify source directory' \
+        || return 0
+    for directory in applications backups control-plane-attestor databases sentinel services; do
+        fd_empty_install_scaffold_directory "$ROOT/$directory" \
+            "unmanaged Coolify $directory directory" || return 0
+    done
+    for parent in proxy ssh; do
+        require_directory_or_missing "$ROOT/$parent" "unmanaged Coolify $parent directory"
+        [[ -d $ROOT/$parent ]] || continue
+        [[ $(file_mode "$ROOT/$parent") == 700 ]] || return 0
+        if ! test_mode; then
+            [[ $(file_owner "$ROOT/$parent") == 0:0 ]] || return 0
+        fi
+        case $parent in
+            proxy)
+                discovered=$(find "$ROOT/proxy" -mindepth 1 -maxdepth 1 \
+                    ! -path "$ROOT/proxy/dynamic" -print -quit)
+                ;;
+            ssh)
+                discovered=$(find "$ROOT/ssh" -mindepth 1 -maxdepth 1 \
+                    ! -path "$ROOT/ssh/keys" ! -path "$ROOT/ssh/mux" -print -quit)
+                ;;
+        esac
         [[ -z $discovered ]] || return 0
     done
+    fd_empty_install_scaffold_directory "$ROOT/proxy/dynamic" \
+        'unmanaged Coolify proxy dynamic directory' || return 0
+    fd_empty_install_scaffold_directory "$ROOT/ssh/keys" \
+        'unmanaged Coolify SSH key directory' || return 0
+    fd_empty_install_scaffold_directory "$ROOT/ssh/mux" \
+        'unmanaged Coolify SSH multiplexing directory' || return 0
     volumes=$(docker volume ls --format '{{.Name}}') \
         || die 'could not list Docker volumes while checking unmanaged Coolify state'
     while IFS= read -r volume; do
@@ -1995,8 +2040,10 @@ fd_restore_ssh_undo() {
             chmod "$mode" "$authorized_directory"
             ;;
         absent)
-            rmdir "$authorized_directory" 2>/dev/null \
-                || die 'could not remove the authorized_keys directory created by the aborted deployment'
+            if [[ -e $authorized_directory ]]; then
+                rmdir "$authorized_directory" 2>/dev/null \
+                    || die 'could not remove the authorized_keys directory created by the aborted deployment'
+            fi
             ;;
         *) die 'pre-start authorized_keys directory state is invalid' ;;
     esac
@@ -2409,7 +2456,11 @@ fd_deployment_failure() {
                 "$PREVIOUS_CURRENT_VERSION" "$DEPLOYMENT_MIGRATION_FINGERPRINT" \
                 "$DEPLOYMENT_UNDO" "$DEPLOYMENT_PRESTART_UNDO_SHA256"
             fd_finish_prestart_undo_finalization "$DEPLOYMENT_UNDO"
-            fd_release_ssh_runtime_ownership
+            if [[ -n $PREVIOUS_CURRENT_VERSION ]]; then
+                fd_release_ssh_runtime_ownership
+            else
+                fd_restore_fresh_install_ssh_scaffold
+            fi
         ); then
             fd_remove_file "$PENDING_FILE" 'pending deployment state' || true
             note 'Deployment failed before candidate startup; the exact prior configuration and SSH state were restored without starting containers.'
@@ -2600,7 +2651,11 @@ fd_recover_abort() {
         fd_assert_recover_abort_current "$previous" restored
         fd_finish_prestart_undo_finalization "$journal"
     fi
-    fd_release_ssh_runtime_ownership
+    if [[ -n $previous ]]; then
+        fd_release_ssh_runtime_ownership
+    else
+        fd_restore_fresh_install_ssh_scaffold
+    fi
     fd_remove_file "$PENDING_FILE" 'pending deployment state'
     note 'Recovered the exact pre-start configuration and SSH state without starting containers.'
 }

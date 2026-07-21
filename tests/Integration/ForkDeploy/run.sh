@@ -1806,12 +1806,112 @@ test_install_retries_after_empty_managed_scaffold() {
     mkdir -p "$ROOT/source" "$ROOT/ssh/keys" "$ROOT/ssh/mux" "$ROOT/applications" \
         "$ROOT/backups" "$ROOT/control-plane-attestor" "$ROOT/databases" "$ROOT/proxy/dynamic" \
         "$ROOT/sentinel" "$ROOT/services"
+    find "$ROOT" -type d -exec chmod 0700 {} +
     write_manifest 4.13.0-fork.1
     if install_release >/dev/null \
         && [[ $(<"$ROOT/fork-deploy/current") == 4.13.0-fork.1 ]]; then
         pass 'install retries after an earlier attempt left empty managed scaffolding'
     else
         fail 'install retries after an earlier attempt left empty managed scaffolding'
+    fi
+    cleanup_fixture
+}
+
+test_fresh_install_retries_after_prestart_recovery() {
+    new_fixture
+    write_manifest 4.13.0-fork.1
+    export FORK_DEPLOY_FAIL_ACTIVATED_CONFIG=true
+    if install_release >/dev/null 2>&1; then
+        fail 'fresh install retries after pre-start recovery'
+        cleanup_fixture
+        return
+    fi
+    unset FORK_DEPLOY_FAIL_ACTIVATED_CONFIG
+    local last_ssh_owner scaffold_restored=false
+    last_ssh_owner=$(awk -v path="$ROOT/ssh" '
+        $0 == "chown root:root " path || $0 == "chown 9999:root " path { last = $0 }
+        END { print last }
+    ' "$LOG")
+    if [[ $last_ssh_owner == "chown root:root $ROOT/ssh" ]]; then
+        scaffold_restored=true
+    fi
+    if [[ $scaffold_restored == true ]] \
+        && install_release >/dev/null \
+        && [[ $(<"$ROOT/fork-deploy/current") == 4.13.0-fork.1 ]]; then
+        pass 'fresh install retries after pre-start recovery'
+    else
+        fail 'fresh install retries after pre-start recovery'
+    fi
+    cleanup_fixture
+}
+
+test_fresh_install_retries_after_manual_recover_abort() {
+    new_fixture
+    write_manifest 4.13.0-fork.1
+    export FORK_DEPLOY_TEST_KILL_AFTER_PENDING_WRITE=true
+    if install_release >/dev/null 2>&1; then
+        fail 'fresh install retries after manual recover-abort'
+        cleanup_fixture
+        return
+    fi
+    unset FORK_DEPLOY_TEST_KILL_AFTER_PENDING_WRITE
+    local previous
+    previous=$(awk -F= '$1 == "PREVIOUS_VERSION" { print substr($0, length($1) + 2) }' \
+        "$ROOT/fork-deploy/pending-candidate")
+    : >"$LOG"
+    local scaffold_restored=false
+    if "$SUBJECT" recover-abort >/dev/null \
+        && [[ -z $previous ]] \
+        && [[ ! -e $ROOT/fork-deploy/current ]] \
+        && [[ ! -e $ROOT/fork-deploy/pending-candidate ]] \
+        && [[ $(file_mode "$ROOT/ssh") == 700 ]] \
+        && [[ $(file_mode "$ROOT/ssh/keys") == 700 ]] \
+        && [[ $(file_mode "$ROOT/ssh/mux") == 700 ]] \
+        && [[ -z $(find "$ROOT/ssh/keys" -mindepth 1 -print -quit) ]] \
+        && [[ -z $(find "$ROOT/ssh/mux" -mindepth 1 -print -quit) ]] \
+        && grep -Fq "chown root:root $ROOT/ssh" "$LOG" \
+        && ! grep -Fq "chown 9999:root $ROOT/ssh" "$LOG"; then
+        scaffold_restored=true
+    fi
+    if [[ $scaffold_restored == true ]] \
+        && install_release >/dev/null \
+        && [[ $(<"$ROOT/fork-deploy/current") == 4.13.0-fork.1 ]]; then
+        pass 'fresh install retries after manual recover-abort'
+    else
+        fail 'fresh install retries after manual recover-abort'
+    fi
+    cleanup_fixture
+}
+
+test_install_refuses_unrecognized_empty_scaffold() {
+    new_fixture
+    mkdir -p "$ROOT/proxy/unmanaged"
+    write_manifest 4.13.0-fork.1
+    local output
+    if output=$(install_release 2>&1); then
+        fail 'install refuses an unrecognized empty scaffold'
+    elif [[ $output == *'control-plane migration and enrollment path'* \
+        && ! -e $ROOT/fork-deploy/current ]]; then
+        pass 'install refuses an unrecognized empty scaffold'
+    else
+        fail 'install refuses an unrecognized empty scaffold'
+    fi
+    cleanup_fixture
+}
+
+test_install_refuses_writable_empty_scaffold() {
+    new_fixture
+    mkdir -p "$ROOT/source"
+    chmod 0777 "$ROOT/source"
+    write_manifest 4.13.0-fork.1
+    local output
+    if output=$(install_release 2>&1); then
+        fail 'install refuses a writable empty scaffold'
+    elif [[ $output == *'control-plane migration and enrollment path'* \
+        && ! -e $ROOT/fork-deploy/current ]]; then
+        pass 'install refuses a writable empty scaffold'
+    else
+        fail 'install refuses a writable empty scaffold'
     fi
     cleanup_fixture
 }
@@ -2288,6 +2388,10 @@ fi
 
 if [[ ${FORK_DEPLOY_TEST_FILTER:-} == empty-scaffold-retry ]]; then
     test_install_retries_after_empty_managed_scaffold
+    test_fresh_install_retries_after_prestart_recovery
+    test_fresh_install_retries_after_manual_recover_abort
+    test_install_refuses_unrecognized_empty_scaffold
+    test_install_refuses_writable_empty_scaffold
     printf '%s passing, %s failing\n' "$PASS" "$FAIL"
     ((FAIL == 0))
     exit
@@ -2371,6 +2475,10 @@ test_incompatible_rollback_refuses_before_compose
 test_update_rejects_previously_activated_target
 test_update_uses_private_temporary_prestart_undo
 test_install_retries_after_empty_managed_scaffold
+test_fresh_install_retries_after_prestart_recovery
+test_fresh_install_retries_after_manual_recover_abort
+test_install_refuses_unrecognized_empty_scaffold
+test_install_refuses_writable_empty_scaffold
 test_refuses_complete_unmanaged_state_before_mutation
 test_refuses_orphan_legacy_volume_without_complete_adoption
 test_refuses_unmanaged_source_asset_without_complete_adoption
