@@ -147,6 +147,8 @@ it('reuses a green candidate gate without coupling fallback to self-hosted avail
         ->and((string) ($verify['run'] ?? ''))
         ->toContain('[[ "$CHECKOUT_OUTCOME" == success ]]')
         ->toContain('trusted-v4x/scripts/ci/verify-v4x-candidate-gate.sh')
+        ->toContain('No trusted candidate preflight matched this v4.x push; hosted validation will run.')
+        ->not->toContain('::notice::')
         ->not->toContain('if scripts/ci/verify-v4x-candidate-gate.sh')
         ->and($validation['needs'] ?? null)->toBe('candidate-preflight')
         ->and($validation['if'] ?? null)->toBe('${{ always() && needs.candidate-preflight.outputs.verified != \'true\' }}')

@@ -50,7 +50,7 @@ jobs:
             trusted-v4x/scripts/ci/verify-v4x-candidate-gate.sh "$CANDIDATE_SHA" "$BASE_SHA"; then
             verified=true
           else
-            echo '::notice::No trusted candidate preflight matched this v4.x push; hosted validation will run.'
+            echo 'No trusted candidate preflight matched this v4.x push; hosted validation will run.'
           fi
           printf 'verified=%s\n' "$verified" >> "$GITHUB_OUTPUT"
 
