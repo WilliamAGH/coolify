@@ -6,7 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### 🐛 Bug Fixes
 
+- *(deploy)* Wait for bundled runtime readiness
+- *(deploy)* Harden fresh install recovery
+
+### 📚 Documentation
+
+- Update changelog (#111)
+
+## [4.13.6-fork] - 2026-07-21
+
+### 🐛 Bug Fixes
+
 - *(deploy)* Validate the staged Coolify environment
+- *(release)* Package runtime version catalog
 
 ### 📚 Documentation
 
@@ -19,6 +31,7 @@ All notable changes to this project will be documented in this file.
 - *(deploy)* Cover generic Compose environment
 - *(deploy)* Accept Compose env file JSON shapes
 - *(deploy)* Cover defaults without newer Compose flags
+- *(release)* Verify runtime version catalog
 
 ### ⚙️ Miscellaneous Tasks
 
