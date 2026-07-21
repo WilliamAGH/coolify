@@ -984,7 +984,7 @@ jobs:
               printf '%s\n' "$digest"
               return 0
             fi
-            if grep -Eiq '^(manifest unknown|name unknown)(: .*)?$|^failed to (get|resolve) manifest [^[:space:]]+: (manifest unknown|not found)$' "$error_file"; then
+            if grep -Eiq '^(manifest unknown|name unknown)(: .*)?$|^failed to (get|resolve) manifest [^[:space:]]+: (manifest unknown|not found)$|^failed to request manifest head .+: request failed: not found \[http 404\](: .*)?$' "$error_file"; then
               rm -f "$error_file"
               printf '\n'
               return 0
@@ -1265,7 +1265,7 @@ jobs:
               status=$?
             fi
 
-            if grep -Eiq '^(manifest unknown|name unknown)(: .*)?$|^failed to (get|resolve) manifest [^[:space:]]+: (manifest unknown|not found)$' "$error_file"; then
+            if grep -Eiq '^(manifest unknown|name unknown)(: .*)?$|^failed to (get|resolve) manifest [^[:space:]]+: (manifest unknown|not found)$|^failed to request manifest head .+: request failed: not found \[http 404\](: .*)?$' "$error_file"; then
               rm -f "$error_file"
               printf '\n'
               return 0
@@ -1835,7 +1835,7 @@ jobs:
               printf '%s\n' "$digest"
               return 0
             fi
-            if grep -Eiq '^(manifest unknown|name unknown)(: .*)?$|^failed to (get|resolve) manifest [^[:space:]]+: (manifest unknown|not found)$' "$error_file"; then
+            if grep -Eiq '^(manifest unknown|name unknown)(: .*)?$|^failed to (get|resolve) manifest [^[:space:]]+: (manifest unknown|not found)$|^failed to request manifest head .+: request failed: not found \[http 404\](: .*)?$' "$error_file"; then
               rm -f "$error_file"
               printf '\n'
               return 0
@@ -2696,7 +2696,7 @@ jobs:
               printf '%s\n' "$digest"
               return 0
             fi
-            if grep -Eiq '^(manifest unknown|name unknown)(: .*)?$|^failed to (get|resolve) manifest [^[:space:]]+: (manifest unknown|not found)$' "$error_file"; then
+            if grep -Eiq '^(manifest unknown|name unknown)(: .*)?$|^failed to (get|resolve) manifest [^[:space:]]+: (manifest unknown|not found)$|^failed to request manifest head .+: request failed: not found \[http 404\](: .*)?$' "$error_file"; then
               rm -f "$error_file"
               printf '\n'
               return 0

@@ -2360,9 +2360,60 @@ it('injects the realtime runtime environment through the Docker API', function (
 
     expect($script)
         ->toContain('docker create --pull never --name "$container"')
-        ->toContain('docker cp "$runtime_env" "${container}:/var/www/html/.env"')
-        ->toContain('docker start "$container"')
-        ->not->toContain('type=bind');
+        ->toContain('docker cp "$runtime_env" "${container_id}:/var/www/html/.env"')
+        ->toContain('docker start "$container_id"')
+        ->toContain("container_id=''")
+        ->toContain('if [ -n "$container_id" ]; then')
+        ->toContain('docker rm --force "$container_id" >/dev/null 2>&1 || true')
+        ->toContain('trap cleanup EXIT')
+        ->not->toContain('type=bind')
+        ->not->toContain('docker rm --force "$container"');
+});
+
+it('does not delete an unowned realtime container when creation fails', function (): void {
+    $filesystem = new Filesystem;
+    $fixture = sys_get_temp_dir().'/coolify-realtime-image-create-failure-'.bin2hex(random_bytes(8));
+    $bin = $fixture.'/bin';
+    $dockerLog = $fixture.'/docker.log';
+
+    $filesystem->mkdir($bin);
+    file_put_contents($dockerLog, '');
+    file_put_contents($bin.'/docker', <<<'SH'
+#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${DOCKER_LOG:?}"
+
+case "${1:-}:${2:-}" in
+    image:inspect) exit 0 ;;
+    create:*) exit 70 ;;
+    *) exit 64 ;;
+esac
+SH);
+    chmod($bin.'/docker', 0755);
+
+    try {
+        $process = new Process(
+            ['sh', releaseWorkflowRepositoryRoot().'/tests/Integration/RealtimeImageTest.sh'],
+            releaseWorkflowRepositoryRoot(),
+            [
+                'DOCKER_LOG' => $dockerLog,
+                'PATH' => $bin.PATH_SEPARATOR.(getenv('PATH') ?: ''),
+                'PRODUCTION_IMAGE' => 'local/realtime-create-failure:exact',
+            ],
+        );
+        $process->run();
+
+        $dockerLogContents = (string) file_get_contents($dockerLog);
+
+        expect($process->isSuccessful())->toBeFalse()
+            ->and($process->getErrorOutput())->toContain('the exact production image could not be created')
+            ->and($dockerLogContents)->toContain('image inspect local/realtime-create-failure:exact')
+            ->toContain('create --pull never --name coolify-main-realtime-runtime-')
+            ->not->toContain('container inspect')
+            ->not->toContain('rm --force');
+    } finally {
+        $filesystem->remove($fixture);
+    }
 });
 
 it('loads a native child from a nested attested OCI archive', function () {
@@ -3297,6 +3348,14 @@ it('accepts an idempotent fork semantic promotion without overwriting its matchi
     }
 });
 
+it('treats the pinned regctl Nexus 404 response as an absent image', function () {
+    $workflow = (string) file_get_contents(
+        releaseWorkflowRepositoryRoot().'/.github/workflows/publish-linux-image.yml',
+    );
+    $expectedMatcher = 'failed to request manifest head .+: request failed: not found \\[http 404\\]';
+
+    expect(substr_count($workflow, $expectedMatcher))->toBe(4);
+});
 it('fails closed on missing fork tag protection before any semantic registry write', function () {
     $root = releaseWorkflowRepositoryRoot();
     $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
