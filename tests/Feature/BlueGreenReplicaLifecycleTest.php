@@ -865,7 +865,9 @@ it('preserves color slot history while enforcing one durable row per release ind
         'deployment_uuid' => 'another-release',
     ]);
 
-    expect(fn () => ApplicationBlueGreenReplica::query()->create($attributes))
+    expect(fn () => DB::transaction(
+        static fn (): ApplicationBlueGreenReplica => ApplicationBlueGreenReplica::query()->create($attributes),
+    ))
         ->toThrow(QueryException::class)
         ->and(ApplicationBlueGreenReplica::query()->count())->toBe(2);
 });
