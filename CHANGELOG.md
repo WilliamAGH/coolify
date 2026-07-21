@@ -43,6 +43,7 @@ All notable changes to this project will be documented in this file.
 - *(blue-green)* Fence fleet failure and removal races
 - *(blue-green)* Renew fleet fences and type recovery predicates
 - *(blue-green)* Preserve terminal recovery timestamp
+- *(deps)* Update Guzzle for security advisories
 - *(blue-green)* Fence replica recovery
 - *(release)* Align fork image tag train
 - *(release)* Preflight immutable fork aliases
@@ -70,6 +71,7 @@ All notable changes to this project will be documented in this file.
 - Update changelog (#73)
 - Update changelog (#74)
 - Update changelog (#77)
+- Update changelog (#82)
 
 ### 🎨 Styling
 
