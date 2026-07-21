@@ -35,7 +35,7 @@ final class StampApplicationDeploymentProvenance
 
             $labelsAreList = array_is_list($labels);
             foreach ($labels as $key => $label) {
-                if (is_int($key) && is_string($label) && str_starts_with($label, 'coolify.deploymentId=')) {
+                if (is_int($key) && is_string($label) && ($label === 'coolify.deploymentId' || str_starts_with($label, 'coolify.deploymentId='))) {
                     unset($labels[$key]);
                 }
             }

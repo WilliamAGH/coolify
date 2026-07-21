@@ -9,6 +9,7 @@ it('replaces list-form caller provenance for every service while preserving unre
         'services' => [
             'web' => [
                 'labels' => [
+                    'coolify.deploymentId',
                     'traefik.enable=true',
                     'coolify.deploymentId=caller-web',
                     'example.owner=web',
