@@ -100,6 +100,14 @@ case "$1" in
         esac
         ;;
     ps)
+        no_trunc=false
+        for argument in "$@"; do
+            if test "$argument" = --no-trunc; then
+                no_trunc=true
+                break
+            fi
+        done
+        test "$no_trunc" = true
         if test "$exists" = true; then
             printf '%s\n' "$container_id"
         fi
@@ -144,6 +152,22 @@ it('defines an all-healthy promotion threshold and exact replica services', func
     expect(fn () => new BlueGreenReplicaSet(0))->toThrow(InvalidArgumentException::class)
         ->and(fn () => new BlueGreenReplicaSet(33))->toThrow(InvalidArgumentException::class);
 });
+
+it('rejects incomplete or duplicate durable replica ledger indexes', function (array $indexes): void {
+    $replicas = collect($indexes)->map(static function (int $index): ApplicationBlueGreenReplica {
+        $replica = new ApplicationBlueGreenReplica;
+        $replica->forceFill(['replica_index' => $index]);
+
+        return $replica;
+    });
+
+    expect(fn () => BlueGreenReplicaSet::fromReplicas($replicas))
+        ->toThrow(InvalidArgumentException::class, 'every contiguous replica index exactly once');
+})->with([
+    'missing initial index' => [[2, 3, 4]],
+    'duplicate index' => [[1, 1, 3]],
+    'non-contiguous index' => [[1, 2, 4]],
+]);
 
 it('refuses promotion unless every configured replica is running and healthy', function (): void {
     $replicas = new BlueGreenReplicaSet(3);
@@ -436,7 +460,7 @@ it('keeps the claimed scalar health and rollback identity when settings drift fr
         ->and($deployment->fresh()->blue_green_candidate_container_id)->toBe($containerId);
 });
 
-it('executes replica rollback only for the immutable bound identity and preserves replacements', function (): void {
+it('executes replica rollback with full immutable Docker IDs and preserves replacements', function (): void {
     $replica = new ApplicationBlueGreenReplica;
     $persistedContainerId = str_repeat('a', 64);
     $replacementContainerId = str_repeat('b', 64);
