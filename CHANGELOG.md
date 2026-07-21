@@ -75,6 +75,17 @@ All notable changes to this project will be documented in this file.
 - *(release)* Restore dedicated ruleset audit authority
 - *(blue-green)* Preserve continuous fixed-color promotion
 - *(release)* Remove undeployed ruleset secret dependency
+- *(blue-green)* Type public-route acknowledgement mismatches
+- *(blue-green)* Restart previous multi-replica containers with compose provenance
+- *(blue-green)* Accept live managed routing digests when finalizing
+- *(blue-green)* Harden prepared activation handoff and multi-replica recovery
+- *(blue-green)* Restore rollback artifacts from the current destination state
+- *(blue-green)* Resume prepared activation without failing stale owners
+- *(blue-green)* Reject forged probe-only middleware documents
+- *(ci)* Fence fork stage writes with tag-target signer inventory
+- *(ci)* Suppress non-staging branch publication checks
+- *(blue-green)* Separate claim and runtime route digests
+- *(blue-green)* Complete probe and release proof contracts
 - *(blue-green)* Recover prepared activations safely
 
 ### 💼 Other
@@ -112,6 +123,7 @@ All notable changes to this project will be documented in this file.
 - Update changelog (#99)
 - Clarify Docker SSOT clean preserves non-lab resources
 - Update changelog (#100)
+- Update changelog (#102)
 
 ### 🎨 Styling
 
@@ -149,6 +161,8 @@ All notable changes to this project will be documented in this file.
 - *(ci)* Allow the exact fork-release checkout for tag verification
 - *(ci)* Tighten Docker SSOT clean contract coverage
 - *(ci)* Expand evidence sanitizer authorization and tree coverage
+- *(blue-green)* Expect fail-closed candidate probe without retry
+- *(blue-green)* Consolidate canonical ingress invariants
 
 ### ⚙️ Miscellaneous Tasks
 
