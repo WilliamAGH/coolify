@@ -723,13 +723,17 @@ final class BlueGreenDeploymentLifecycle
         $this->previousContainerExpectation = $operation->previousContainer;
         $this->server->privateKey->storeInFileSystem();
         ReadBlueGreenServerBootIdentity::run($this->server, $operation->claim->serverBootId);
-        // First-adoption PREPARING has no routed mutation yet; re-attest live destination state.
+        // A null reconstructed state is provably first adoption: no routing mutation
+        // exists yet, so there is no pre-operation destination state to resolve. Attest
+        // the absent-managed-file baseline exactly as the initial claim did (durable state
+        // null), never the PREPARING claim row, whose pending routing revision would read
+        // as an unenrolled routed destination.
         $this->destinationState = $operation->currentDestinationState
             ?? AttestBlueGreenDestinationState::run(
                 $this->server,
                 $this->application,
                 $this->destination,
-                $state,
+                null,
             );
         $this->assertOperationOwned(BlueGreenDeploymentPhase::PREPARING);
         $this->deployment->addLogEntry(
