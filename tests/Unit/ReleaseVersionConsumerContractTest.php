@@ -320,21 +320,6 @@ it('keeps generic compose resolution for upstream image tags without changing it
     expect($resolved)->toBe('ghcr.io/coollabsio/coolify:4.2.10');
 });
 
-it('validates fork staging with its rendered environment before source activation', function () {
-    $root = releaseContractRepositoryRoot();
-    $compose = Yaml::parseFile($root.'/docker-compose.prod.yml');
-    $coolify = $compose['services']['coolify'];
-    $environmentPath = '${COOLIFY_ENV_FILE:-/data/coolify/source/.env}';
-    $environmentBind = collect($coolify['volumes'])
-        ->first(fn (mixed $volume): bool => is_array($volume) && ($volume['target'] ?? null) === '/var/www/html/.env');
-    $forkDeploy = (string) file_get_contents($root.'/scripts/fork-deploy');
-
-    expect($environmentBind['source'] ?? null)->toBe($environmentPath)
-        ->and($coolify['env_file'] ?? [])->toBe([$environmentPath])
-        ->and($forkDeploy)
-        ->toContain('COOLIFY_ENV_FILE="$directory/.env" docker compose --env-file "$directory/.env"');
-});
-
 it('keeps the signed fork deployment path separate from the rejected generic updater', function () {
     $forkDeploy = (string) file_get_contents(releaseContractRepositoryRoot().'/scripts/fork-deploy');
 

@@ -62,7 +62,7 @@ manifest_key_id() {
 new_fixture() {
     local base
 
-    unset BASH_ENV
+    unset BASH_ENV COOLIFY_ENV_FILE
     base=$(cd -P "${TMPDIR:-/tmp}" && pwd -P)
     FIXTURE=$(mktemp -d "$base/fork-deploy.XXXXXX")
     ROOT=$FIXTURE/data/coolify
@@ -462,7 +462,7 @@ test_requires_compose_override_support() {
 }
 
 test_real_compose_config_when_available() {
-    local output
+    local output staged_environment
 
     if [[ -z $REAL_DOCKER ]] || ! "$REAL_DOCKER" info >/dev/null 2>&1; then
         pass 'real Compose configuration test skipped because Docker is unavailable'
@@ -510,6 +510,38 @@ test_real_compose_config_when_available() {
         pass 'real Compose config honors !override, public APP_PORT, and loopback Reverb and terminal ports'
     else
         fail 'real Compose config honors !override, public APP_PORT, and loopback Reverb and terminal ports'
+    fi
+
+    staged_environment="$FIXTURE/staged-compose.env"
+    {
+        printf 'APP_PORT=8010\n'
+        printf 'PUSHER_PORT=6011\n'
+        printf 'TERMINAL_PORT=6012\n'
+        printf 'DB_USERNAME=coolify\n'
+        printf 'DB_PASSWORD=staged-password\n'
+        printf 'DB_DATABASE=coolify\n'
+        printf 'REDIS_PASSWORD=staged-redis-password\n'
+        printf 'STAGING_ENV_PROOF=selected\n'
+    } >"$staged_environment"
+
+    if output=$(
+        COOLIFY_ENV_FILE="$staged_environment" \
+            "$REAL_DOCKER" compose \
+            --env-file "$staged_environment" \
+            --file "$REPO_ROOT/docker-compose.yml" \
+            --file "$REPO_ROOT/docker-compose.prod.yml" \
+            --file "$ASSETS/docker-compose.custom.yml" \
+            config --format json 2>&1
+    ) \
+        && jq -e --arg staged_environment "$staged_environment" '
+            ([.services.coolify.volumes[]
+                | select(.target == "/var/www/html/.env"
+                    and .source == $staged_environment)] | length) == 1
+            and .services.coolify.environment.STAGING_ENV_PROOF == "selected"
+        ' <<<"$output" >/dev/null; then
+        pass 'real production Compose selects the staged environment'
+    else
+        fail 'real production Compose selects the staged environment'
     fi
     cleanup_fixture
 }
@@ -624,10 +656,11 @@ test_fresh_install_selects_staged_compose_environment() {
     new_fixture
     write_manifest 4.13.0-fork.1
     export FORK_DEPLOY_REQUIRE_COMPOSE_ENV_PATH=true
+    export COOLIFY_ENV_FILE="$FIXTURE/hostile-inherited.env"
     if install_release >/dev/null; then
-        pass 'fresh install selects the staged Compose environment before activation'
+        pass 'fresh install overrides inherited Compose environment with staging before activation'
     else
-        fail 'fresh install selects the staged Compose environment before activation'
+        fail 'fresh install overrides inherited Compose environment with staging before activation'
     fi
     cleanup_fixture
 }
