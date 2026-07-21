@@ -485,7 +485,8 @@ class WriteBlueGreenProxyConfiguration
         sort($actualRouterNames);
         sort($expectedRouterNames);
         if ($actualRouterNames !== $expectedRouterNames
-            || ! array_key_exists($probeMiddlewareName, $middlewares)) {
+            || ! array_key_exists($probeMiddlewareName, $middlewares)
+            || ! $this->hasCanonicalProbeMiddlewares($middlewares, $namePrefix, $probeMiddlewareName)) {
             return false;
         }
 
@@ -578,6 +579,7 @@ class WriteBlueGreenProxyConfiguration
         if (! is_string($routerName)
             || ! is_array($router)
             || ! array_key_exists($probeMiddlewareName, $middlewares)
+            || ! $this->hasCanonicalProbeMiddlewares($middlewares, $namePrefix, $probeMiddlewareName)
             || ! $this->isCanonicalProbeRouter(
                 router: $router,
                 routerName: $routerName,
@@ -665,13 +667,83 @@ class WriteBlueGreenProxyConfiguration
         }
         foreach ($routerMiddlewares as $middlewareName) {
             if (! is_string($middlewareName)
-                || $middlewareName === ''
+                || preg_match('/^'.preg_quote($namePrefix, '/').'[A-Za-z0-9_-]+$/D', $middlewareName) !== 1
                 || ! array_key_exists($middlewareName, $middlewares)) {
                 return false;
             }
         }
 
+        return count($routerMiddlewares) === count(array_unique($routerMiddlewares, SORT_STRING));
+    }
+
+    /** @param array<string, mixed> $middlewares */
+    private function hasCanonicalProbeMiddlewares(
+        array $middlewares,
+        string $namePrefix,
+        string $probeMiddlewareName,
+    ): bool {
+        foreach ($middlewares as $middlewareName => $middleware) {
+            if (! is_string($middlewareName)
+                || preg_match('/^'.preg_quote($namePrefix, '/').'[A-Za-z0-9_-]+$/D', $middlewareName) !== 1
+                || ! is_array($middleware)
+                || ($middlewareName !== $probeMiddlewareName && ! $this->isCanonicalApplicationMiddleware($middleware))) {
+                return false;
+            }
+        }
+
         return true;
+    }
+
+    /** @param array<string, mixed> $middleware */
+    private function isCanonicalApplicationMiddleware(array $middleware): bool
+    {
+        if ($middleware === ['compress' => []]
+            || $middleware === ['redirectScheme' => ['scheme' => 'https']]) {
+            return true;
+        }
+        if (array_keys($middleware) === ['basicAuth']) {
+            if (! is_array($middleware['basicAuth'])) {
+                return false;
+            }
+            $users = $middleware['basicAuth']['users'] ?? null;
+
+            return array_keys($middleware['basicAuth']) === ['users']
+                && is_array($users)
+                && array_is_list($users)
+                && count($users) === 1
+                && is_string($users[0])
+                && $users[0] !== '';
+        }
+        if (array_keys($middleware) === ['stripPrefix']) {
+            if (! is_array($middleware['stripPrefix'])) {
+                return false;
+            }
+            $prefixes = $middleware['stripPrefix']['prefixes'] ?? null;
+
+            return array_keys($middleware['stripPrefix']) === ['prefixes']
+                && is_array($prefixes)
+                && array_is_list($prefixes)
+                && count($prefixes) === 1
+                && is_string($prefixes[0])
+                && str_starts_with($prefixes[0], '/');
+        }
+        if (array_keys($middleware) !== ['redirectRegex']) {
+            return false;
+        }
+        $redirectRegex = $middleware['redirectRegex'];
+        if (! is_array($redirectRegex)
+            || array_diff(array_keys($redirectRegex), ['regex', 'replacement', 'permanent']) !== []
+            || ! array_key_exists('regex', $redirectRegex)
+            || ! array_key_exists('replacement', $redirectRegex)
+            || ! is_string($redirectRegex['regex'])
+            || $redirectRegex['regex'] === ''
+            || ! is_string($redirectRegex['replacement'])
+            || $redirectRegex['replacement'] === '') {
+            return false;
+        }
+
+        return ! array_key_exists('permanent', $redirectRegex)
+            || is_bool($redirectRegex['permanent']);
     }
 
     private function fileServiceNameForProbeReference(string $serviceReference): ?string

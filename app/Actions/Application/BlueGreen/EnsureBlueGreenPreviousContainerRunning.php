@@ -20,7 +20,19 @@ class EnsureBlueGreenPreviousContainerRunning
         ?BlueGreenProxyState $expectedState,
         BlueGreenContainerExpectation $expectation,
         BlueGreenContainerInspection $inspection,
+        ?int $replicaIndex = null,
+        ?int $replicaCount = null,
+        ?string $composeProject = null,
+        ?string $composeService = null,
     ): ?BlueGreenProxyState {
+        $replicaProvenance = [$replicaIndex, $replicaCount, $composeProject, $composeService];
+        $replicaProvenanceCount = count(array_filter(
+            $replicaProvenance,
+            static fn (mixed $value): bool => $value !== null,
+        ));
+        if (! in_array($replicaProvenanceCount, [0, count($replicaProvenance)], true)) {
+            throw new RuntimeException('Previous replica restart requires complete replica and Compose provenance.');
+        }
         if (! $inspection->exists || $inspection->dockerId === null || $expectation->dockerId === null) {
             throw new RuntimeException('The exact previous Docker container is missing.');
         }
@@ -35,16 +47,35 @@ class EnsureBlueGreenPreviousContainerRunning
         if (! $proof->exists || $proof->dockerId !== $expectation->dockerId) {
             throw new RuntimeException('The previous Docker identity changed before it could be restarted.');
         }
+        $inspector = new InspectBlueGreenContainer;
+        $mutationAssertions = $replicaProvenanceCount === 0
+            ? $inspector->exactMutationAssertionsFor($expectation)
+            : $inspector->exactReplicaMutationAssertionsFor(
+                $expectation,
+                $replicaIndex,
+                $replicaCount,
+                $composeProject,
+                $composeService,
+            );
+        $completionAssertions = $replicaProvenanceCount === 0
+            ? $inspector->runningMutationCompletionAssertionsFor($expectation)
+            : $inspector->runningReplicaMutationCompletionAssertionsFor(
+                $expectation,
+                $replicaIndex,
+                $replicaCount,
+                $composeProject,
+                $composeService,
+            );
         $replacementState = (new ExecuteBlueGreenDestinationMutation)->executeForClaim(
             $application,
             $server,
             $claim,
             $expectedState,
             [
-                ...(new InspectBlueGreenContainer)->exactMutationAssertionsFor($expectation),
+                ...$mutationAssertions,
                 'docker start '.escapeshellarg($expectation->dockerId),
             ],
-            (new InspectBlueGreenContainer)->runningMutationCompletionAssertionsFor($expectation),
+            $completionAssertions,
         );
 
         $attempts = max(10, (int) $application->health_check_retries);

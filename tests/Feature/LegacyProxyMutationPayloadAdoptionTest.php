@@ -301,4 +301,43 @@ describe('legacy proxy-mutation payload adoption', function () {
             ->and($deployment->horizon_job_id)->toBe($canonicalAttempt)
             ->and($deployment->horizon_job_worker)->toBeNull();
     });
+
+    test('rehydrates a serialized activation worker before terminalizing only its exact attempt', function () {
+        $deployment = legacyAdoptionDeployment($this->environment, $this->destination, $this->server, 'serialized-activation-failure');
+        expect($deployment->claimForDispatch())->toBeTrue();
+        $preparationAttempt = $deployment->horizon_job_id;
+        expect($deployment->acquireDispatchExecution($preparationAttempt, 'preparation-worker'))->toBeTrue();
+
+        $activationAttempt = $deployment->handoffToActivation(
+            $preparationAttempt,
+            'preparation-worker',
+            $deployment->makePreparedActivationPayload([]),
+        );
+        expect($activationAttempt)->toBeString()
+            ->and(Str::isUuid($activationAttempt))->toBeTrue();
+        $deployment->application()->update(['build_pack' => 'dockercompose']);
+
+        $foreignActivation = unserialize(serialize(new ActivateApplicationDeploymentJob($deployment->id, (string) Str::uuid())));
+        expect($foreignActivation)->toBeInstanceOf(ActivateApplicationDeploymentJob::class);
+        $foreignActivation->failed(new RuntimeException('A stale activation worker failed.'));
+        expect($deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+            ->and($deployment->fresh()->horizon_job_id)->toBe($activationAttempt);
+
+        $activation = unserialize(serialize(new ActivateApplicationDeploymentJob($deployment->id, $activationAttempt)));
+        expect($activation)->toBeInstanceOf(ActivateApplicationDeploymentJob::class)
+            ->and($activation->application_deployment_queue_id)->toBe($deployment->id)
+            ->and($activation->dispatch_attempt_uuid)->toBe($activationAttempt)
+            ->and($activation->connection)->toBe(ProxyMutationQueue::CONNECTION)
+            ->and($activation->queue)->toBe(ProxyMutationQueue::NAME);
+
+        $queueProperty = new ReflectionProperty(ApplicationDeploymentJob::class, 'application_deployment_queue');
+        expect($queueProperty->isInitialized($activation))->toBeTrue()
+            ->and($queueProperty->getValue($activation))->toBeInstanceOf(ApplicationDeploymentQueue::class)
+            ->and($queueProperty->getValue($activation)->id)->toBe($deployment->id);
+
+        $activation->failed(new RuntimeException('The owned activation worker failed.'));
+
+        expect($deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value)
+            ->and($deployment->fresh()->horizon_job_id)->toBe($activationAttempt);
+    });
 });

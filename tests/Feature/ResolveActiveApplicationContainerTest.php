@@ -70,6 +70,7 @@ function activeContainerQueue(
 it('uses the exact active fixed-color provenance while idle', function () {
     $fixture = activeContainerResolverFixture('resolver-idle');
     $containerId = str_repeat('a', 64);
+    $actualRoutingDigest = hash('sha256', 'resolver-idle-actual-routing');
     activeContainerQueue($fixture, 'resolver-idle-blue', $containerId, BlueGreenDeploymentColor::BLUE, 3);
     ApplicationBlueGreenDeployment::query()->create([
         'application_id' => $fixture['application']->id,
@@ -79,7 +80,7 @@ it('uses the exact active fixed-color provenance while idle', function () {
         'phase' => BlueGreenDeploymentPhase::IDLE,
         'routing_revision' => 3,
         'destination_topology_digest' => $fixture['topology'],
-        'application_routing_config_digest' => $fixture['routing'],
+        'application_routing_config_digest' => $actualRoutingDigest,
     ]);
 
     $resolution = ResolveActiveApplicationContainer::run(collect([$fixture['application']]))->first();
@@ -130,6 +131,7 @@ it('keeps the predecessor observable until the candidate is routed', function (B
 it('uses the routed candidate while draining', function () {
     $fixture = activeContainerResolverFixture('resolver-draining');
     $candidateId = str_repeat('c', 64);
+    $actualRoutingDigest = hash('sha256', 'resolver-draining-actual-routing');
     activeContainerQueue(
         $fixture,
         'resolver-candidate-blue',
@@ -144,11 +146,12 @@ it('uses the routed candidate while draining', function () {
         'active_color' => BlueGreenDeploymentColor::BLUE,
         'blue_deployment_uuid' => 'resolver-candidate-blue',
         'operation_deployment_uuid' => 'resolver-candidate-blue',
+        'operation_routing_config_digest' => $fixture['routing'],
         'operation_candidate_container_id' => $candidateId,
         'phase' => BlueGreenDeploymentPhase::DRAINING,
         'routing_revision' => 5,
         'destination_topology_digest' => $fixture['topology'],
-        'application_routing_config_digest' => $fixture['routing'],
+        'application_routing_config_digest' => $actualRoutingDigest,
     ]);
 
     $resolution = ResolveActiveApplicationContainer::run(collect([$fixture['application']]))->first();
@@ -156,6 +159,37 @@ it('uses the routed candidate while draining', function () {
     expect($resolution->observable)->toBeTrue()
         ->and($resolution->containerId)->toBe($candidateId)
         ->and($resolution->deploymentUuid)->toBe('resolver-candidate-blue');
+});
+
+it('fails closed when a draining queue no longer owns the operation routing claim', function () {
+    $fixture = activeContainerResolverFixture('resolver-draining-claim-mismatch');
+    $candidateId = str_repeat('d', 64);
+    activeContainerQueue(
+        $fixture,
+        'resolver-claim-mismatch-blue',
+        $candidateId,
+        BlueGreenDeploymentColor::BLUE,
+        6,
+        BlueGreenDeploymentPhase::DRAINING,
+    );
+    ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $fixture['application']->id,
+        'standalone_docker_id' => $fixture['destination']->id,
+        'active_color' => BlueGreenDeploymentColor::BLUE,
+        'blue_deployment_uuid' => 'resolver-claim-mismatch-blue',
+        'operation_deployment_uuid' => 'resolver-claim-mismatch-blue',
+        'operation_routing_config_digest' => hash('sha256', 'different-routing-claim'),
+        'operation_candidate_container_id' => $candidateId,
+        'phase' => BlueGreenDeploymentPhase::DRAINING,
+        'routing_revision' => 6,
+        'destination_topology_digest' => $fixture['topology'],
+        'application_routing_config_digest' => hash('sha256', 'resolver-claim-mismatch-actual-routing'),
+    ]);
+
+    $resolution = ResolveActiveApplicationContainer::run(collect([$fixture['application']]))->first();
+
+    expect($resolution->observable)->toBeFalse()
+        ->and($resolution->containerId)->toBeNull();
 });
 
 it('fails closed for non-observable and inconsistent durable states', function (BlueGreenDeploymentPhase $phase) {

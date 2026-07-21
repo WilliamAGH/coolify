@@ -2,6 +2,7 @@
 
 namespace App\Actions\Proxy\ControlPlane;
 
+use App\Actions\Proxy\BlueGreenRoutingTarget;
 use Illuminate\Http\Request;
 use InvalidArgumentException;
 use Lorisleiva\Actions\Concerns\AsAction;
@@ -22,6 +23,7 @@ final class RespondToControlPlaneHealthCheck
         $dynamicSha256 = config('constants.control_plane_health.dynamic_sha256');
         $member = config('constants.control_plane_health.member');
         $revision = config('constants.control_plane_health.revision');
+        $deploymentReleaseProof = config('constants.control_plane_health.deployment_release_proof');
         $suppliedAcknowledgement = $request->header(ControlPlaneDynamicConfiguration::CONFIGURATION_ACKNOWLEDGEMENT_HEADER);
         $suppliedHealthProof = $request->header(ControlPlaneDynamicConfiguration::HEALTH_PROOF_HEADER);
 
@@ -35,6 +37,9 @@ final class RespondToControlPlaneHealthCheck
 
         if ($suppliedAcknowledgement === null && $suppliedHealthProof === null) {
             $response = response('OK');
+            if ($this->validDeploymentReleaseProof($deploymentReleaseProof)) {
+                $response->header(BlueGreenRoutingTarget::RELEASE_PROOF_HEADER, $deploymentReleaseProof);
+            }
             if ($identity !== null) {
                 $response->withHeaders($this->backendIdentityHeaders(
                     $identity['member'],
@@ -63,6 +68,12 @@ final class RespondToControlPlaneHealthCheck
                 $identity['revision'],
                 $identity['dynamicSha256'],
             ));
+    }
+
+    private function validDeploymentReleaseProof(mixed $releaseProof): bool
+    {
+        return is_string($releaseProof)
+            && preg_match('/\Arelease:[a-f0-9]{64}\z/D', $releaseProof) === 1;
     }
 
     /** @return null|array{healthProofSha256: string, member: string, revision: string, dynamicSha256: string} */

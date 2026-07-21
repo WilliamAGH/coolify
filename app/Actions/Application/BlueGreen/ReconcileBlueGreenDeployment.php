@@ -8,11 +8,13 @@ use App\Actions\Proxy\BlueGreenProxyRollbackArtifactRestorer;
 use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
+use App\Enums\ApplicationDeploymentExecutionPhase;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Jobs\ResumeBlueGreenDrainingDeploymentJob;
 use App\Models\ApplicationBlueGreenDeployment;
+use App\Models\ApplicationBlueGreenReplica;
 use App\Models\ApplicationDeploymentQueue;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -178,8 +180,7 @@ final class ReconcileBlueGreenDeployment
                         || $replacementState->activeDeploymentUuid !== $operation->claim->deploymentUuid
                         || $replacementState->activeContainerId !== $operation->candidateContainer->dockerId
                         || $replacementState->routingRevision !== $operation->claim->expectedRoutingRevision
-                        || $replacementState->destinationTopologyDigest !== $operation->claim->topologyDigest
-                        || $replacementState->applicationRoutingConfigDigest !== $operation->claim->routingConfigDigest) {
+                        || $replacementState->destinationTopologyDigest !== $operation->claim->topologyDigest) {
                         throw new BlueGreenDeploymentTransitionException('The discovered routing mutation does not target the exact claimed candidate.');
                     }
                     $attestation = trim((string) instant_privileged_remote_script(
@@ -201,6 +202,51 @@ final class ReconcileBlueGreenDeployment
                     RecordBlueGreenRoutingMutation::run($operation->claim, $replacementState);
                     $operation = $operation->withDiscoveredRoutingMutation($operation->rollbackKey);
                 }
+            }
+            if ($this->isPreparedActivationPublicationPending($operation)) {
+                if (! $releaseOperationFence) {
+                    return new BlueGreenReconciliationResult(
+                        $stateId,
+                        BlueGreenReconciliationResult::DEFERRED,
+                        'Prepared activation publication is deferred to the scheduler-owned lifecycle fence.',
+                    );
+                }
+                $activationDeployment = ReserveBlueGreenPreparedActivationPublication::run($operation);
+                if ($activationDeployment === null) {
+                    return new BlueGreenReconciliationResult(
+                        $stateId,
+                        BlueGreenReconciliationResult::DEFERRED,
+                        'The exact prepared activation publication owner changed before it could be reserved.',
+                    );
+                }
+                try {
+                    if (! $operationFence->releaseIfOwned()) {
+                        return new BlueGreenReconciliationResult(
+                            $stateId,
+                            BlueGreenReconciliationResult::DEFERRED,
+                            'Prepared activation publication remains durable because lifecycle lock release was not confirmed.',
+                        );
+                    }
+                    $releaseOperationFence = false;
+                } catch (Throwable $exception) {
+                    report($exception);
+
+                    return new BlueGreenReconciliationResult(
+                        $stateId,
+                        BlueGreenReconciliationResult::DEFERRED,
+                        'Prepared activation publication remains durable because lifecycle lock release failed.',
+                    );
+                }
+                dispatch_claimed_application_deployment(
+                    $activationDeployment,
+                    preserveActivationForRecoveryOnFailure: true,
+                );
+
+                return new BlueGreenReconciliationResult(
+                    $stateId,
+                    BlueGreenReconciliationResult::DEFERRED,
+                    'The exact stale prepared activation was republished after confirmed lifecycle lock release.',
+                );
             }
             if ($operation->recoveredPhase === BlueGreenDeploymentPhase::SWITCHING
                 && $operation->routingMutationRecorded
@@ -249,13 +295,32 @@ final class ReconcileBlueGreenDeployment
         }
     }
 
+    private function isPreparedActivationPublicationPending(
+        BlueGreenDeploymentRecoveryOperation $operation,
+    ): bool {
+        $deployment = $operation->deployment;
+
+        return ! $operation->wasFinalized
+            && ! $operation->routingMutationRecorded
+            && $operation->recoveredPhase === BlueGreenDeploymentPhase::PREPARING
+            && $deployment->status === ApplicationDeploymentStatus::IN_PROGRESS->value
+            && $deployment->execution_phase === ApplicationDeploymentExecutionPhase::Activate;
+    }
+
     private function completeSwitchingForward(
         BlueGreenDeploymentRecoveryOperation $operation,
         BlueGreenOperationFence $operationFence,
     ): BlueGreenReconciliationResult {
         $claim = $operation->claim;
-        $plan = PlanBlueGreenForwardRecovery::run($operation);
-        $candidate = InspectBlueGreenContainer::run($operation->server, $operation->candidateContainer);
+        $candidateReplicas = $this->candidateReplicaInspections($operation);
+        if ($candidateReplicas !== []) {
+            (new BlueGreenReplicaSet($claim->replicaCount))->assertPromotionThreshold($candidateReplicas);
+        }
+        $previousReplicas = $this->previousReplicaInspections($operation);
+        $plan = PlanBlueGreenForwardRecovery::run($operation, $candidateReplicas, $previousReplicas);
+        $candidate = $candidateReplicas === []
+            ? InspectBlueGreenContainer::run($operation->server, $operation->candidateContainer)
+            : $this->aggregateReplicaInspection($candidateReplicas);
         if (! $candidate->exists
             || $candidate->dockerId !== $operation->candidateContainer->dockerId
             || $candidate->status !== 'running'
@@ -263,11 +328,7 @@ final class ReconcileBlueGreenDeployment
             throw new BlueGreenDeploymentTransitionException('Forward recovery could not prove the exact candidate healthy.');
         }
         $operationFence->assertDeploymentOwnership($claim, [BlueGreenDeploymentPhase::SWITCHING]);
-        VerifyBlueGreenCandidateReleaseProof::run(
-            $operation->server,
-            $operation->candidateContainer,
-            BlueGreenRoutingTarget::durableReleaseProofToken($claim->deploymentUuid),
-        );
+        $this->verifyReleaseProof($operation, $operation->candidateContainer, $candidateReplicas);
         $operationFence->assertDeploymentOwnership($claim, [BlueGreenDeploymentPhase::SWITCHING]);
         VerifyBlueGreenManagedConfiguration::run($operation->server, $plan->configuration);
         $verifier = new VerifyBlueGreenPublicRecovery;
@@ -307,14 +368,21 @@ final class ReconcileBlueGreenDeployment
     ): BlueGreenReconciliationResult {
         $claim = $operation->claim;
         $phase = $operation->recoveredPhase;
-        $candidateInspection = InspectBlueGreenContainer::run($operation->server, $operation->candidateContainer);
-        if ($candidateInspection->exists && $operation->candidateContainer->dockerId === null) {
+        $replicaCandidate = ! (new BlueGreenReplicaSet($claim->replicaCount))->usesScalarCompatibilityPath();
+        $candidateReplicas = $replicaCandidate
+            ? $this->availableCandidateReplicaInspections($operation)
+            : [];
+        $candidateInspection = $replicaCandidate
+            ? null
+            : InspectBlueGreenContainer::run($operation->server, $operation->candidateContainer);
+        if ($candidateInspection?->exists && $operation->candidateContainer->dockerId === null) {
             throw new BlueGreenDeploymentTransitionException('The interrupted candidate exists without an immutable Docker identity.');
         }
 
         $artifact = null;
         $currentState = $operation->currentDestinationState;
         $previousInspection = null;
+        $previousReplicas = [];
         $legacySnapshot = $operation->legacyRoutingSnapshot;
         if ($operation->routingMutationRecorded) {
             $artifact = BlueGreenProxyRollbackArtifactReader::run($operation->server, $operation->rollbackKey);
@@ -324,7 +392,10 @@ final class ReconcileBlueGreenDeployment
             if ($operation->previousContainer === null) {
                 throw new BlueGreenDeploymentTransitionException('The recorded routing mutation has no exact predecessor container.');
             }
-            $previousInspection = InspectBlueGreenContainer::run($operation->server, $operation->previousContainer);
+            $previousReplicas = $this->previousReplicaInspections($operation);
+            $previousInspection = $previousReplicas === []
+                ? InspectBlueGreenContainer::run($operation->server, $operation->previousContainer)
+                : $this->aggregateReplicaInspection($previousReplicas);
             if (! $previousInspection->exists) {
                 throw new BlueGreenDeploymentTransitionException('The exact predecessor container is missing.');
             }
@@ -340,20 +411,42 @@ final class ReconcileBlueGreenDeployment
         );
         BeginBlueGreenDeploymentRecovery::run($operation);
         $phase = BlueGreenDeploymentPhase::ROLLING_BACK;
+        $boundCandidateReplicas = [];
+        if ($candidateReplicas !== []) {
+            $boundCandidateReplicas = (new BindBlueGreenReplicaSet)->handle($claim, $candidateReplicas);
+        }
 
         if ($artifact !== null) {
             if ($previousInspection === null || $operation->previousContainer === null || $currentState === null) {
                 throw new BlueGreenDeploymentTransitionException('Routed rollback lost its exact predecessor or destination state.');
             }
             $operationFence->assertDeploymentOwnership($claim, [$phase]);
-            $currentState = EnsureBlueGreenPreviousContainerRunning::run(
-                $operation->server,
-                $operation->application,
-                $claim,
-                $currentState,
-                $operation->previousContainer,
-                $previousInspection,
-            );
+            if ($previousReplicas === []) {
+                $currentState = EnsureBlueGreenPreviousContainerRunning::run(
+                    $operation->server,
+                    $operation->application,
+                    $claim,
+                    $currentState,
+                    $operation->previousContainer,
+                    $previousInspection,
+                );
+            } else {
+                foreach ($previousReplicas as $previousReplica) {
+                    $operationFence->assertDeploymentOwnership($claim, [$phase]);
+                    $currentState = EnsureBlueGreenPreviousContainerRunning::run(
+                        $operation->server,
+                        $operation->application,
+                        $claim,
+                        $currentState,
+                        $this->replicaExpectation($operation->previousContainer, $previousReplica),
+                        $this->containerInspection($previousReplica),
+                        $previousReplica->replicaIndex,
+                        count($previousReplicas),
+                        (string) $operation->application->uuid,
+                        $previousReplica->composeService,
+                    );
+                }
+            }
             $restoredState = $this->restoredStateFrom($operation, $currentState);
             $operationFence->assertDeploymentOwnership($claim, [$phase]);
             (new BlueGreenProxyRollbackArtifactRestorer)->restoreFromCurrentState(
@@ -394,7 +487,16 @@ final class ReconcileBlueGreenDeployment
             }
         }
 
-        if ($candidateInspection->exists) {
+        if ($boundCandidateReplicas !== []) {
+            $operationFence->assertDeploymentOwnership($claim, [$phase]);
+            $currentState = (new RemoveBlueGreenReplicaSet)->handle(
+                $operation->server,
+                $operation->application,
+                $claim,
+                $currentState,
+                collect($boundCandidateReplicas),
+            );
+        } elseif ($candidateInspection?->exists) {
             $operationFence->assertDeploymentOwnership($claim, [$phase]);
             $currentState = RemoveExactBlueGreenCandidate::run(
                 $operation->server,
@@ -421,6 +523,149 @@ final class ReconcileBlueGreenDeployment
             BlueGreenReconciliationResult::RECONCILED,
             'The exact predecessor route was restored and the interrupted candidate was retired.',
         );
+    }
+
+    /** @return list<BlueGreenReplicaInspection> */
+    private function candidateReplicaInspections(BlueGreenDeploymentRecoveryOperation $operation): array
+    {
+        if ((new BlueGreenReplicaSet($operation->claim->replicaCount))->usesScalarCompatibilityPath()) {
+            return [];
+        }
+
+        $state = $this->replicaState($operation);
+
+        return InspectBlueGreenReplicaSet::run(
+            $operation->server,
+            $state,
+            $operation->claim->deploymentUuid,
+            $operation->claim->pendingColor,
+            $operation->claim->expectedRoutingRevision,
+            $operation->claim->replicaCount,
+        );
+    }
+
+    /** @return list<BlueGreenReplicaInspection> */
+    private function availableCandidateReplicaInspections(BlueGreenDeploymentRecoveryOperation $operation): array
+    {
+        $state = $this->replicaState($operation);
+
+        return (new InspectBlueGreenReplicaSet)->available(
+            $operation->server,
+            $state,
+            $operation->claim->deploymentUuid,
+            $operation->claim->pendingColor,
+            $operation->claim->expectedRoutingRevision,
+            $operation->claim->replicaCount,
+        );
+    }
+
+    /** @return list<BlueGreenReplicaInspection> */
+    private function previousReplicaInspections(BlueGreenDeploymentRecoveryOperation $operation): array
+    {
+        $previous = $operation->previousContainer;
+        if ($previous?->deploymentUuid === null
+            || $previous->color === null
+            || $previous->routingRevision === null) {
+            return [];
+        }
+
+        $state = $this->replicaState($operation);
+        $count = ApplicationBlueGreenReplica::query()
+            ->where('application_blue_green_deployment_id', $state->id)
+            ->where('application_id', $state->application_id)
+            ->where('standalone_docker_id', $state->standalone_docker_id)
+            ->where('deployment_uuid', $previous->deploymentUuid)
+            ->where('color', $previous->color->value)
+            ->where('routing_revision', $previous->routingRevision)
+            ->count();
+        if ($count <= DEFAULT_BLUE_GREEN_REPLICA_COUNT) {
+            return [];
+        }
+
+        $replicas = InspectBlueGreenReplicaSet::run(
+            $operation->server,
+            $state,
+            $previous->deploymentUuid,
+            $previous->color,
+            $previous->routingRevision,
+            $count,
+        );
+        if (BlueGreenReplicaSet::identityDigest($replicas) !== $previous->dockerId) {
+            throw new BlueGreenDeploymentTransitionException('The predecessor replica set no longer matches its exact durable aggregate identity.');
+        }
+
+        return $replicas;
+    }
+
+    private function replicaState(BlueGreenDeploymentRecoveryOperation $operation): ApplicationBlueGreenDeployment
+    {
+        return ApplicationBlueGreenDeployment::query()->find($operation->claim->stateId)
+            ?? throw new BlueGreenDeploymentTransitionException('The recovery replica ledger has no durable deployment state.');
+    }
+
+    /** @param non-empty-list<BlueGreenReplicaInspection> $replicas */
+    private function aggregateReplicaInspection(array $replicas): BlueGreenContainerInspection
+    {
+        return new BlueGreenContainerInspection(
+            exists: true,
+            dockerId: BlueGreenReplicaSet::identityDigest($replicas),
+            status: collect($replicas)->every(
+                static fn (BlueGreenReplicaInspection $inspection): bool => $inspection->status === 'running',
+            ) ? 'running' : 'stopped',
+            health: collect($replicas)->every(
+                static fn (BlueGreenReplicaInspection $inspection): bool => $inspection->health === 'healthy',
+            ) ? 'healthy' : 'unhealthy',
+        );
+    }
+
+    private function replicaExpectation(
+        BlueGreenContainerExpectation $setExpectation,
+        BlueGreenReplicaInspection $replica,
+    ): BlueGreenContainerExpectation {
+        return new BlueGreenContainerExpectation(
+            name: $replica->containerName,
+            dockerId: $replica->dockerId,
+            applicationId: $setExpectation->applicationId,
+            pullRequestId: 0,
+            blueGreenManaged: true,
+            deploymentUuid: $setExpectation->deploymentUuid,
+            color: $setExpectation->color,
+            routingRevision: $setExpectation->routingRevision,
+        );
+    }
+
+    private function containerInspection(BlueGreenReplicaInspection $replica): BlueGreenContainerInspection
+    {
+        return new BlueGreenContainerInspection(
+            exists: true,
+            dockerId: $replica->dockerId,
+            status: $replica->status,
+            health: $replica->health,
+        );
+    }
+
+    /** @param list<BlueGreenReplicaInspection> $replicas */
+    private function verifyReleaseProof(
+        BlueGreenDeploymentRecoveryOperation $operation,
+        BlueGreenContainerExpectation $setExpectation,
+        array $replicas,
+    ): void {
+        if ($replicas === []) {
+            VerifyBlueGreenCandidateReleaseProof::run(
+                $operation->server,
+                $setExpectation,
+                BlueGreenRoutingTarget::durableReleaseProofToken((string) $setExpectation->deploymentUuid),
+            );
+
+            return;
+        }
+        foreach ($replicas as $replica) {
+            VerifyBlueGreenCandidateReleaseProof::run(
+                $operation->server,
+                $this->replicaExpectation($setExpectation, $replica),
+                BlueGreenRoutingTarget::durableReleaseProofToken((string) $setExpectation->deploymentUuid),
+            );
+        }
     }
 
     private function restoredStateFrom(

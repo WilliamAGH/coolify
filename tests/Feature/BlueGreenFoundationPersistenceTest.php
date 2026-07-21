@@ -3,6 +3,7 @@
 use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentTransitionException;
+use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\ProxyTypes;
@@ -15,6 +16,54 @@ use App\Models\Team;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 
 uses(RefreshDatabase::class);
+
+it('keeps blue-green member discovery labels free of persistent Traefik health checks', function (): void {
+    $application = new Application([
+        'uuid' => 'blue-green-member-labels',
+        'health_check_enabled' => true,
+        'health_check_type' => 'http',
+        'health_check_path' => '/ready',
+        'health_check_host' => 'localhost',
+        'health_check_method' => 'GET',
+        'health_check_return_code' => 200,
+        'health_check_scheme' => 'http',
+        'health_check_interval' => 5,
+        'health_check_timeout' => 5,
+        'health_check_port' => 3000,
+    ]);
+
+    $destinationId = 1;
+    $color = BlueGreenDeploymentColor::BLUE;
+    $labels = generateBlueGreenApplicationContainerLabels(
+        $application,
+        destinationId: $destinationId,
+        color: $color,
+        routingRevision: 1,
+        backendPorts: [3000, 8080],
+    );
+    $webService = BlueGreenRoutingTarget::memberServiceNameForPort(
+        (string) $application->uuid,
+        $destinationId,
+        $color,
+        3000,
+        true,
+    );
+    $metricsService = BlueGreenRoutingTarget::memberServiceNameForPort(
+        (string) $application->uuid,
+        $destinationId,
+        $color,
+        8080,
+        true,
+    );
+
+    expect($labels)
+        ->toContain('traefik.enable=true')
+        ->toContain("traefik.http.services.{$webService}.loadbalancer.server.port=3000")
+        ->toContain("traefik.http.services.{$metricsService}.loadbalancer.server.port=8080")
+        ->and(collect($labels)->filter(
+            static fn (string $label): bool => str_contains($label, '.loadbalancer.healthcheck.'),
+        ))->toBeEmpty();
+});
 
 it('canonically serializes immutable backend port inventories and rejects byte drift', function () {
     $inventory = BlueGreenBackendPortInventory::fromPorts([8080, 3000]);
