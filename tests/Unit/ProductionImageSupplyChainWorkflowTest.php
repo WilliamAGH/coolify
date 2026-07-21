@@ -3127,17 +3127,21 @@ it('requires both fork application version sources to exactly match the immutabl
 
     $filesystem->mkdir($fixture.'/config');
     try {
+        $currentVersion = (string) data_get(json_decode($versions, true), 'coolify.v4.version');
+        expect($currentVersion)->toMatch('/^\d+\.\d+\.\d+-fork$/');
+        $driftVersion = '0.0.0-fork';
+
         $cases = [
             'matching version sources' => [$constants, $versions, true, ''],
             'constants version mismatch' => [
-                str_replace("'4.13.3-fork'", "'4.13.4-fork'", $constants),
+                str_replace("'{$currentVersion}'", "'{$driftVersion}'", $constants),
                 $versions,
                 false,
                 'config/constants.php Coolify version must equal the fork tag',
             ],
             'versions json mismatch' => [
                 $constants,
-                str_replace('"4.13.3-fork"', '"4.13.4-fork"', $versions),
+                str_replace("\"{$currentVersion}\"", "\"{$driftVersion}\"", $versions),
                 false,
                 'versions.json Coolify v4 version must equal the fork tag',
             ],
@@ -3148,7 +3152,7 @@ it('requires both fork application version sources to exactly match the immutabl
             file_put_contents($fixture.'/versions.json', $fixtureVersions);
             $process = new Process(['bash', '-c', $script], $root, [
                 'GITHUB_WORKSPACE' => $fixture,
-                'SEMANTIC_VERSION' => '4.13.3-fork',
+                'SEMANTIC_VERSION' => $currentVersion,
             ]);
             $process->run();
 
