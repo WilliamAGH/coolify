@@ -67,9 +67,10 @@ final class InspectBlueGreenReplicaSet
             ->get();
         $this->replicaSetFor($replicas, $expectedCount);
 
-        $output = trim((string) instant_remote_process([
+        $output = trim((string) instant_privileged_remote_script(
             $this->availableCommandFor($replicas, $expectedCount),
-        ], $server));
+            $server,
+        ));
 
         return $this->parseAvailable(
             output: $output,

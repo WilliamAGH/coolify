@@ -458,7 +458,7 @@ it('routes every blue-green application script executor through the privileged s
     assertBlueGreenApplicationNonRootProcessPayloads($processes, $expectedScripts);
 });
 
-it('runs lifecycle attestation and replica inspection paths through the privileged stdin transport', function (): void {
+it('runs lifecycle attestation and replica inspection availability paths through the privileged stdin transport', function (): void {
     config(['constants.ssh.mux_enabled' => false]);
     Storage::fake('ssh-keys');
     $fixture = blueGreenApplicationRemoteLifecycleFixture(blueGreenApplicationRemoteServer('ubuntu'));
@@ -512,11 +512,16 @@ it('runs lifecycle attestation and replica inspection paths through the privileg
     $containerId = $replica->container_id ?? str_repeat('b', 64);
     $replicaSet = new InspectBlueGreenReplicaSet;
     $replicaScript = $replicaSet->commandFor(collect([$replica]), 1);
+    $availableReplicaScript = $replicaSet->availableCommandFor(collect([$replica]), 1);
+    $replicaOutput = blueGreenApplicationRemoteReplicaInspectionOutput($replica, $containerName, $containerId);
     $replicaProcesses = [];
-    Process::fake(function (PendingProcess $process) use (&$replicaProcesses, $replicaScript, $replica, $containerName, $containerId) {
+    Process::fake(function (PendingProcess $process) use (&$replicaProcesses, $replicaScript, $availableReplicaScript, $replica, $replicaOutput) {
         $replicaProcesses[] = $process;
         if ($process->input === $replicaScript) {
-            return Process::result(output: blueGreenApplicationRemoteReplicaInspectionOutput($replica, $containerName, $containerId));
+            return Process::result(output: $replicaOutput);
+        }
+        if ($process->input === $availableReplicaScript) {
+            return Process::result(output: $replica->replica_index."\t".$replicaOutput);
         }
 
         throw new RuntimeException('Unexpected replica inspection remote command.');
@@ -530,11 +535,22 @@ it('runs lifecycle attestation and replica inspection paths through the privileg
         $fixture['claim']->expectedRoutingRevision,
         1,
     );
+    $availableInspections = $replicaSet->available(
+        $fixture['server'],
+        $fixture['state'],
+        $fixture['claim']->deploymentUuid,
+        BlueGreenDeploymentColor::BLUE,
+        $fixture['claim']->expectedRoutingRevision,
+        1,
+    );
 
     expect($inspections)->toHaveCount(1)
         ->and($inspections[0]->containerName)->toBe($containerName)
-        ->and($inspections[0]->dockerId)->toBe($containerId);
-    assertBlueGreenApplicationNonRootProcessPayloads($replicaProcesses, [$replicaScript]);
+        ->and($inspections[0]->dockerId)->toBe($containerId)
+        ->and($availableInspections)->toHaveCount(1)
+        ->and($availableInspections[0]->containerName)->toBe($containerName)
+        ->and($availableInspections[0]->dockerId)->toBe($containerId);
+    assertBlueGreenApplicationNonRootProcessPayloads($replicaProcesses, [$replicaScript, $availableReplicaScript]);
     expect($fixture['operationFence']->releaseIfOwned())->toBeTrue();
 });
 
