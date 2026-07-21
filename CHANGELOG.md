@@ -51,14 +51,38 @@ All notable changes to this project will be documented in this file.
 - *(release)* Keep fork latest monotonic
 - *(traefik)* Admit guarded probe-only routes
 - *(release)* Publish fork images from protected v4.x
-- *(test)* Inject runtime env through Docker API
 - *(deps)* Update Guzzle for security advisories
+- *(blue-green)* Preserve privileged remote scripts
+- *(release)* Restore signed native fork publication
+- *(test)* Inject runtime env through Docker API
+- *(release)* Bind publication to signed validated source
 - *(release)* Accept Nexus manifest-head absence
 - *(test)* Scope realtime image cleanup to owned container
+- *(blue-green)* Bind exact multi-replica identity through compensation
+- *(deploy)* Rehydrate activation job after queue restore
+- *(ci)* Surface activation failures and quiet docker SSOT shellcheck
+- *(blue-green)* Resume prepared claim during activation ownership
+- *(blue-green)* Release lifecycle lock on preparation handoff
+- *(blue-green)* Re-attest destination state for prepared activation
+- *(blue-green)* Inspect available replicas through privileged scripts
+- *(blue-green)* Attest first-adoption baseline without PREPARING row
+- *(ci)* Isolate fork tag verifier fixtures from Actions remote binding
+- *(traefik)* Admit probe-only routes that keep application middlewares
+- *(release)* Isolate ruleset audit authority
+- *(release)* Reuse ephemeral ruleset authority
+- *(blue-green)* Give probe-only routes file-provider backends
+- *(ci)* Run continuity observer on the owned lab fixture image
+- *(release)* Restore dedicated ruleset audit authority
+- *(blue-green)* Preserve continuous fixed-color promotion
+- *(release)* Remove undeployed ruleset secret dependency
 
 ### 💼 Other
 
 - *(stack)* Advance daemon ownership into lock recovery
+- Refresh remediation validation base
+- Refresh final remediation base
+- Refresh final remediation base after changelog update
+- Accept Node 24 action runtime base
 
 ### 📚 Documentation
 
@@ -82,7 +106,10 @@ All notable changes to this project will be documented in this file.
 - Update changelog (#91)
 - Update changelog (#92)
 - Update changelog (#94)
+- Record Nexus absence and changelog PR notes
 - Update changelog (#96)
+- Update changelog (#99)
+- Clarify Docker SSOT clean preserves non-lab resources
 
 ### 🎨 Styling
 
@@ -106,11 +133,32 @@ All notable changes to this project will be documented in this file.
 - *(proxy)* Dispatch isolated reservation fixtures
 - *(control-plane)* Exclude image pulls from startup budget
 - *(blue-green)* Claim drift fixtures durably
+- *(blue-green)* Lock replica identity invariants
+- *(blue-green)* Exercise production lifecycle end to end
+- *(blue-green)* Consume the real activation queue
+- *(blue-green)* Expect unset candidate id before full healthy quorum
+- *(blue-green)* Recover pgsql transaction after unique replica probe
+- *(blue-green)* Consume activation through queue.worker binding
+- *(ci)* Require exact source identity in release gate
+- *(ci)* Extract blue-green evidence sanitizer with secrets coverage
+- *(deploy)* Keep failed activation from stealing a newer dispatch
+- *(ci)* Harden blue-green evidence tree sanitization
+- *(release)* Bind version-source cases to the current fork tag
+- *(ci)* Allow the exact fork-release checkout for tag verification
+- *(ci)* Tighten Docker SSOT clean contract coverage
+- *(ci)* Expand evidence sanitizer authorization and tree coverage
 
 ### ⚙️ Miscellaneous Tasks
 
 - *(github)* Prepare organization runner migration
+- *(blue-green)* Require production lifecycle evidence
+- Bind exact validation source to check-run revision
+- *(docker)* Add SSOT local clean for Coolify dev
+- *(docker)* Limit SSOT clean to explicit Coolify lab resources
+- Sanitize blue-green evidence before artifact retention
+- *(release)* Verify fork tags through the shared allowlist script
 - Migrate release actions to Node 24
+- *(release)* Extract shared fork release trust verifier
 
 ## [4.13.2-fork] - 2026-07-20
 
