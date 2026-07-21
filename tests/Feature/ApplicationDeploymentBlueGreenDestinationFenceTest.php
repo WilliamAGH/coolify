@@ -177,7 +177,8 @@ function createNewerApplicationDestinationFence(array $fixture): ApplicationBlue
 function createCompletedApplicationDeploymentBlueGreenState(array $fixture): ApplicationBlueGreenDeployment
 {
     $topologyDigest = hash('sha256', 'completed-application-destination-topology');
-    $routingConfigDigest = hash('sha256', 'completed-application-routing-configuration');
+    $claimRoutingConfigDigest = hash('sha256', 'completed-application-claim-routing-configuration');
+    $runtimeRoutingConfigDigest = hash('sha256', 'completed-application-runtime-routing-configuration');
     $state = ApplicationBlueGreenDeployment::query()->create([
         'application_id' => $fixture['application']->id,
         'standalone_docker_id' => $fixture['destination']->id,
@@ -191,7 +192,7 @@ function createCompletedApplicationDeploymentBlueGreenState(array $fixture): App
         'destination_fence_mutation_sequence' => 1,
         'managed_file_sha256' => hash('sha256', 'completed-managed-route'),
         'destination_topology_digest' => $topologyDigest,
-        'application_routing_config_digest' => $routingConfigDigest,
+        'application_routing_config_digest' => $runtimeRoutingConfigDigest,
     ]);
     $fixture['deployment']->update([
         'blue_green_color' => BlueGreenDeploymentColor::BLUE->value,
@@ -201,8 +202,10 @@ function createCompletedApplicationDeploymentBlueGreenState(array $fixture): App
         'blue_green_destination_fence_epoch' => 1,
         'blue_green_server_boot_id' => '11111111-2222-3333-4444-555555555555',
         'blue_green_topology_digest' => $topologyDigest,
-        'blue_green_routing_config_digest' => $routingConfigDigest,
+        'blue_green_routing_config_digest' => $claimRoutingConfigDigest,
     ]);
+
+    expect($claimRoutingConfigDigest)->not->toBe($runtimeRoutingConfigDigest);
 
     return $state;
 }
@@ -355,6 +358,21 @@ it('refuses to mark an arbitrary nonfinal deployment successful through drain re
 
     expect($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
 });
+
+it('refuses completed drain recovery with a malformed claim or runtime route digest', function (string $owner): void {
+    $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
+    $state = createCompletedApplicationDeploymentBlueGreenState($fixture);
+    if ($owner === 'claim') {
+        $fixture['deployment']->update(['blue_green_routing_config_digest' => 'malformed']);
+    } else {
+        $state->update(['application_routing_config_digest' => 'malformed']);
+    }
+
+    expect(fn () => $fixture['job']->completeBlueGreenDrainRecovery())
+        ->toThrow(DeploymentException::class, 'exact durable IDLE completion state');
+
+    expect($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
+})->with(['claim', 'runtime']);
 
 it('completes an exact durable IDLE state when recovery restarts after lifecycle completion', function () {
     $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();

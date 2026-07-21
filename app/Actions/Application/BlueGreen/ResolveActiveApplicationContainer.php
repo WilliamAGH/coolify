@@ -238,7 +238,14 @@ final class ResolveActiveApplicationContainer
             || ($deploymentPhase !== null && $deployment->blue_green_phase !== $deploymentPhase)
             || $deployment->blue_green_routing_revision !== $routingRevision
             || $deployment->blue_green_topology_digest !== $state->destination_topology_digest
-            || $deployment->blue_green_routing_config_digest !== $state->application_routing_config_digest
+            || ! is_string($deployment->blue_green_routing_config_digest)
+            || preg_match('/^[a-f0-9]{64}$/D', $deployment->blue_green_routing_config_digest) !== 1
+            || ($state->phase === BlueGreenDeploymentPhase::DRAINING
+                && $state->operation_deployment_uuid === $deploymentUuid
+                && (! is_string($state->operation_routing_config_digest)
+                    || $deployment->blue_green_routing_config_digest !== $state->operation_routing_config_digest))
+            || ! is_string($state->application_routing_config_digest)
+            || preg_match('/^[a-f0-9]{64}$/D', $state->application_routing_config_digest) !== 1
             || ! is_string($deployment->blue_green_candidate_container_id)
             || ! $this->validDockerId($deployment->blue_green_candidate_container_id)) {
             return null;

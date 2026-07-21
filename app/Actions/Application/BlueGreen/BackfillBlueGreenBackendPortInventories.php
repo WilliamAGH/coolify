@@ -205,6 +205,7 @@ final class BackfillBlueGreenBackendPortInventories
             || ! is_int($state->inactive_retirement_destination_fence_epoch)
             || ! is_string($state->inactive_retirement_topology_digest)
             || ! is_string($state->inactive_retirement_routing_config_digest)
+            || preg_match('/^[a-f0-9]{64}$/D', $state->inactive_retirement_routing_config_digest) !== 1
             || $state->inactive_retirement_not_before_at === null
             || $state->inactive_retirement_drain_deadline_at === null
             || $state->inactive_retirement_lease_seconds === null) {
@@ -270,7 +271,6 @@ final class BackfillBlueGreenBackendPortInventories
             $activeColor,
             false,
             $state->inactive_retirement_topology_digest,
-            $state->inactive_retirement_routing_config_digest,
         );
         $this->assertQueueFingerprint(
             $application,
@@ -324,6 +324,7 @@ final class BackfillBlueGreenBackendPortInventories
             || $state->managed_file_sha256 === null
             || ! is_string($state->destination_topology_digest)
             || ! is_string($state->application_routing_config_digest)
+            || preg_match('/^[a-f0-9]{64}$/D', $state->application_routing_config_digest) !== 1
             || $previousContainer->applicationId !== $application->id
             || $previousContainer->pullRequestId !== 0
             || $previousContainer->color !== $activeColor) {
@@ -337,7 +338,6 @@ final class BackfillBlueGreenBackendPortInventories
             $activeColor,
             false,
             $state->destination_topology_digest,
-            $state->application_routing_config_digest,
         );
     }
 
@@ -389,7 +389,6 @@ final class BackfillBlueGreenBackendPortInventories
             $previousColor,
             false,
             $previousState->destinationTopologyDigest,
-            $previousState->applicationRoutingConfigDigest,
         );
         $inventory = $this->currentInventory($application, $setting);
         $this->persistInventory($previousDeployment, [
@@ -406,7 +405,6 @@ final class BackfillBlueGreenBackendPortInventories
         BlueGreenDeploymentColor $activeColor,
         bool $legacyAdoption,
         ?string $expectedTopologyDigest = null,
-        ?string $expectedRoutingConfigDigest = null,
     ): void {
         if (! is_int($deployment->blue_green_routing_revision)
             || $deployment->blue_green_routing_revision < 1
@@ -428,9 +426,7 @@ final class BackfillBlueGreenBackendPortInventories
         if (! hash_equals($fingerprint->topologyDigest, $deployment->blue_green_topology_digest)
             || ! hash_equals($fingerprint->routingConfigDigest, $deployment->blue_green_routing_config_digest)
             || ($expectedTopologyDigest !== null
-                && ! hash_equals($fingerprint->topologyDigest, $expectedTopologyDigest))
-            || ($expectedRoutingConfigDigest !== null
-                && ! hash_equals($fingerprint->routingConfigDigest, $expectedRoutingConfigDigest))) {
+                && ! hash_equals($fingerprint->topologyDigest, $expectedTopologyDigest))) {
             throw new BlueGreenDeploymentTransitionException('The persisted blue-green routing or topology fingerprint drifted; backend port inventory cannot be adopted.');
         }
     }

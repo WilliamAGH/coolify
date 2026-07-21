@@ -6680,7 +6680,10 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
             || $this->application_deployment_queue->blue_green_routing_revision !== $state->routing_revision
             || $this->application_deployment_queue->blue_green_destination_fence_epoch !== $state->destination_fence_epoch
             || $this->application_deployment_queue->blue_green_topology_digest !== $state->destination_topology_digest
-            || $this->application_deployment_queue->blue_green_routing_config_digest !== $state->application_routing_config_digest) {
+            || ! is_string($this->application_deployment_queue->blue_green_routing_config_digest)
+            || preg_match('/^[a-f0-9]{64}$/D', $this->application_deployment_queue->blue_green_routing_config_digest) !== 1
+            || ! is_string($state->application_routing_config_digest)
+            || preg_match('/^[a-f0-9]{64}$/D', $state->application_routing_config_digest) !== 1) {
             throw new DeploymentException('Blue-green drain recovery cannot mark deployment success before its exact durable IDLE completion state is present.');
         }
         foreach (ApplicationBlueGreenDeployment::clearedOperationAttributes() as $attribute => $_) {
