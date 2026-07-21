@@ -3188,6 +3188,15 @@ it('publishes and verifies every direct protected-v4x fork registry alias withou
     }
 });
 
+it('treats the pinned regctl Nexus 404 response as an absent image', function () {
+    $workflow = (string) file_get_contents(
+        releaseWorkflowRepositoryRoot().'/.github/workflows/publish-linux-image.yml',
+    );
+    $expectedMatcher = 'failed to request manifest head .+: request failed: not found \\[http 404\\]';
+
+    expect(substr_count($workflow, $expectedMatcher))->toBe(4);
+});
+
 it('fails closed on missing fork tag protection before any semantic registry write', function () {
     $root = releaseWorkflowRepositoryRoot();
     $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
