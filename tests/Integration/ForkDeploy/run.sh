@@ -62,7 +62,7 @@ manifest_key_id() {
 new_fixture() {
     local base
 
-    unset BASH_ENV
+    unset BASH_ENV COOLIFY_ENV_FILE
     base=$(cd -P "${TMPDIR:-/tmp}" && pwd -P)
     FIXTURE=$(mktemp -d "$base/fork-deploy.XXXXXX")
     ROOT=$FIXTURE/data/coolify
@@ -100,6 +100,7 @@ new_fixture() {
         FORK_DEPLOY_APP_DUAL_STACK FORK_DEPLOY_COMPOSE_APP_LOOPBACK \
         FORK_DEPLOY_COMPOSE_OMIT_APP_HOST_IP \
         FORK_DEPLOY_COMPOSE_SWAP_BINDINGS \
+        FORK_DEPLOY_REQUIRE_COMPOSE_ENV_PATH \
         FORK_DEPLOY_DOCKER_UNAVAILABLE \
         FORK_DEPLOY_FAIL_CANDIDATE_RUNTIME_VERIFY \
         FORK_DEPLOY_FAIL_LEGACY_RUNTIME_VERIFY \
@@ -461,7 +462,7 @@ test_requires_compose_override_support() {
 }
 
 test_real_compose_config_when_available() {
-    local output
+    local output staged_environment
 
     if [[ -z $REAL_DOCKER ]] || ! "$REAL_DOCKER" info >/dev/null 2>&1; then
         pass 'real Compose configuration test skipped because Docker is unavailable'
@@ -510,6 +511,39 @@ test_real_compose_config_when_available() {
     else
         fail 'real Compose config honors !override, public APP_PORT, and loopback Reverb and terminal ports'
     fi
+
+    staged_environment="$FIXTURE/staged-compose.env"
+    {
+        printf 'APP_PORT=8010\n'
+        printf 'PUSHER_PORT=6011\n'
+        printf 'TERMINAL_PORT=6012\n'
+        printf 'DB_USERNAME=coolify\n'
+        printf 'DB_PASSWORD=staged-password\n'
+        printf 'DB_DATABASE=coolify\n'
+        printf 'REDIS_PASSWORD=staged-redis-password\n'
+        printf 'STAGING_ENV_PROOF=selected\n'
+    } >"$staged_environment"
+
+    if output=$(
+        COOLIFY_ENV_FILE="$staged_environment" \
+            "$REAL_DOCKER" compose \
+            --env-file "$staged_environment" \
+            --file "$REPO_ROOT/docker-compose.yml" \
+            --file "$REPO_ROOT/docker-compose.prod.yml" \
+            --file "$ASSETS/docker-compose.custom.yml" \
+            config --format json 2>&1
+    ) \
+        && jq -e --arg staged_environment "$staged_environment" '
+            ([.services.coolify.volumes[]
+                | select(.target == "/var/www/html/.env"
+                    and .source == $staged_environment)] | length) == 1
+            and .services.coolify.environment.STAGING_ENV_PROOF == "selected"
+        ' <<<"$output" >/dev/null; then
+        pass 'real production Compose selects the staged environment'
+    else
+        fail 'real production Compose selects the staged environment'
+    fi
+
     cleanup_fixture
 }
 
@@ -615,6 +649,19 @@ test_install_records_signed_immutable_bundle() {
         pass 'install records a signed immutable release bundle'
     else
         fail 'install records a signed immutable release bundle'
+    fi
+    cleanup_fixture
+}
+
+test_fresh_install_selects_staged_compose_environment() {
+    new_fixture
+    write_manifest 4.13.0-fork.1
+    export FORK_DEPLOY_REQUIRE_COMPOSE_ENV_PATH=true
+    export COOLIFY_ENV_FILE="$FIXTURE/hostile-inherited.env"
+    if install_release >/dev/null; then
+        pass 'fresh install overrides inherited Compose environment with staging before activation'
+    else
+        fail 'fresh install overrides inherited Compose environment with staging before activation'
     fi
     cleanup_fixture
 }
@@ -2134,6 +2181,13 @@ if [[ ${FORK_DEPLOY_TEST_FILTER:-} == control-plane-listener ]]; then
     exit
 fi
 
+if [[ ${FORK_DEPLOY_TEST_FILTER:-} == fresh-staging-env ]]; then
+    test_fresh_install_selects_staged_compose_environment
+    printf '%s passing, %s failing\n' "$PASS" "$FAIL"
+    ((FAIL == 0))
+    exit
+fi
+
 test_rejects_untrusted_caller_inputs
 test_uses_migrated_github_raw_base
 test_install_and_update_are_self_contained
@@ -2147,6 +2201,7 @@ test_dry_run_is_non_mutating
 test_status_does_not_mutate_authorized_keys
 test_trust_is_production_only_without_deployment_preflight
 test_install_records_signed_immutable_bundle
+test_fresh_install_selects_staged_compose_environment
 test_install_accepts_bare_fork_version_convention
 test_install_rejects_zero_historical_suffix
 test_accepts_real_ed25519_raw_signature

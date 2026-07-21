@@ -1387,7 +1387,7 @@ fd_compose_base_in() {
     local directory=$1
     shift
 
-    docker compose --env-file "$directory/.env" --file "$directory/docker-compose.yml" --file "$directory/docker-compose.prod.yml" --file "$directory/docker-compose.custom.yml" "$@"
+    COOLIFY_ENV_FILE="$directory/.env" docker compose --env-file "$directory/.env" --file "$directory/docker-compose.yml" --file "$directory/docker-compose.prod.yml" --file "$directory/docker-compose.custom.yml" "$@"
 }
 
 fd_compose_in() {

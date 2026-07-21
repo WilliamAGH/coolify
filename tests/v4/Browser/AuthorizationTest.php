@@ -101,7 +101,8 @@ function loginAsMember(): mixed
     return visit('/login')
         ->fill('email', test()->member->email)
         ->fill('password', 'password')
-        ->click('Login');
+        ->click('Login')
+        ->assertSee('Dashboard');
 }
 
 it('redirects unauthenticated users to login', function () {
