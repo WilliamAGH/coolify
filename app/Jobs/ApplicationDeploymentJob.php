@@ -980,6 +980,10 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             $services = collect(data_get($composeFile, 'services', []));
             $services = $services->map(function ($service, $name) {
                 $service['env_file'] = ['.env'];
+                $labels = collect(data_get($service, 'labels', []))
+                    ->reject(fn (mixed $label): bool => is_string($label) && str_starts_with($label, 'coolify.deploymentId='))
+                    ->push("coolify.deploymentId={$this->deployment_uuid}");
+                $service['labels'] = $labels;
 
                 return $service;
             });
@@ -4462,7 +4466,10 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
                 return escapeDollarSign($value);
             });
         }
-        $labels = $labels->merge(defaultLabels($this->application->id, $this->application->uuid, $this->application->project()->name, $this->application->name, $this->application->environment->name, $this->pull_request_id))->toArray();
+        $labels = $labels
+            ->merge(defaultLabels($this->application->id, $this->application->uuid, $this->application->project()->name, $this->application->name, $this->application->environment->name, $this->pull_request_id))
+            ->push("coolify.deploymentId={$this->deployment_uuid}")
+            ->toArray();
 
         // Check for custom HEALTHCHECK
         if ($this->application->build_pack === 'dockerfile' || $this->application->dockerfile) {

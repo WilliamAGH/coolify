@@ -1,12 +1,15 @@
 <?php
 
 use App\Actions\Application\BlueGreen\ActiveApplicationContainerResolution;
+use App\Actions\Application\BlueGreen\BlueGreenReplicaInspection;
+use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\ResolveActiveApplicationContainer;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
+use App\Models\ApplicationBlueGreenReplica;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\Project;
 use App\Models\Server;
@@ -127,6 +130,204 @@ it('keeps the predecessor observable until the candidate is routed', function (B
     BlueGreenDeploymentPhase::SWITCHING,
     BlueGreenDeploymentPhase::ROLLING_BACK,
 ]);
+
+it('uses managed-route mutation ordering instead of lifecycle phase for cutover and rollback', function () {
+    $fixture = activeContainerResolverFixture('resolver-route-ordering');
+    $previousId = str_repeat('4', 64);
+    $candidateId = str_repeat('5', 64);
+    $previousManagedSha = hash('sha256', 'previous-managed-route');
+    $candidateManagedSha = hash('sha256', 'candidate-managed-route');
+    $previous = activeContainerQueue(
+        $fixture,
+        'resolver-route-ordering-green',
+        $previousId,
+        BlueGreenDeploymentColor::GREEN,
+        6,
+    );
+    $candidate = activeContainerQueue(
+        $fixture,
+        'resolver-route-ordering-blue',
+        $candidateId,
+        BlueGreenDeploymentColor::BLUE,
+        7,
+        BlueGreenDeploymentPhase::ROLLING_BACK,
+    );
+    $state = ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $fixture['application']->id,
+        'standalone_docker_id' => $fixture['destination']->id,
+        'active_color' => BlueGreenDeploymentColor::GREEN,
+        'pending_color' => BlueGreenDeploymentColor::BLUE,
+        'green_deployment_uuid' => $previous->deployment_uuid,
+        'operation_previous_active_color' => BlueGreenDeploymentColor::GREEN,
+        'operation_previous_deployment_uuid' => $previous->deployment_uuid,
+        'operation_previous_routing_revision' => 6,
+        'operation_previous_container_id' => $previousId,
+        'operation_previous_managed_file_sha256' => $previousManagedSha,
+        'operation_deployment_uuid' => $candidate->deployment_uuid,
+        'operation_candidate_container_id' => $candidateId,
+        'operation_routing_config_digest' => $fixture['routing'],
+        'phase' => BlueGreenDeploymentPhase::ROLLING_BACK,
+        'routing_revision' => 7,
+        'managed_file_sha256' => $candidateManagedSha,
+        'operation_routing_mutated_at' => now(),
+        'destination_topology_digest' => $fixture['topology'],
+        'application_routing_config_digest' => $fixture['routing'],
+    ]);
+    $deployments = collect([
+        $previous->deployment_uuid => $previous,
+        $candidate->deployment_uuid => $candidate,
+    ]);
+    $resolver = new ResolveActiveApplicationContainer;
+
+    $beforeProxyRestoration = $resolver->resolveRoutedState($fixture['application'], $state, $deployments);
+    $state->managed_file_sha256 = $previousManagedSha;
+    $afterProxyRestoration = $resolver->resolveRoutedState($fixture['application'], $state, $deployments);
+
+    expect($beforeProxyRestoration?->containerId)->toBe($candidateId)
+        ->and($beforeProxyRestoration?->deploymentUuid)->toBe($candidate->deployment_uuid)
+        ->and($afterProxyRestoration?->containerId)->toBe($previousId)
+        ->and($afterProxyRestoration?->deploymentUuid)->toBe($previous->deployment_uuid);
+});
+
+it('observes the candidate immediately after proxy cutover while phase is still preparing', function () {
+    $fixture = activeContainerResolverFixture('resolver-preparing-cutover');
+    $previousId = str_repeat('8', 64);
+    $candidateId = str_repeat('9', 64);
+    $previous = activeContainerQueue(
+        $fixture,
+        'resolver-preparing-green',
+        $previousId,
+        BlueGreenDeploymentColor::GREEN,
+        10,
+    );
+    $candidate = activeContainerQueue(
+        $fixture,
+        'resolver-preparing-blue',
+        $candidateId,
+        BlueGreenDeploymentColor::BLUE,
+        11,
+        BlueGreenDeploymentPhase::PREPARING,
+    );
+    $state = ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $fixture['application']->id,
+        'standalone_docker_id' => $fixture['destination']->id,
+        'active_color' => BlueGreenDeploymentColor::GREEN,
+        'pending_color' => BlueGreenDeploymentColor::BLUE,
+        'green_deployment_uuid' => $previous->deployment_uuid,
+        'operation_previous_active_color' => BlueGreenDeploymentColor::GREEN,
+        'operation_previous_deployment_uuid' => $previous->deployment_uuid,
+        'operation_previous_routing_revision' => 10,
+        'operation_previous_container_id' => $previousId,
+        'operation_previous_managed_file_sha256' => hash('sha256', 'preparing-previous-route'),
+        'operation_deployment_uuid' => $candidate->deployment_uuid,
+        'operation_candidate_container_id' => $candidateId,
+        'operation_routing_config_digest' => $fixture['routing'],
+        'phase' => BlueGreenDeploymentPhase::PREPARING,
+        'routing_revision' => 11,
+        'managed_file_sha256' => hash('sha256', 'preparing-candidate-route'),
+        'operation_routing_mutated_at' => now(),
+        'destination_topology_digest' => $fixture['topology'],
+        'application_routing_config_digest' => $fixture['routing'],
+    ]);
+
+    $resolution = (new ResolveActiveApplicationContainer)->resolveRoutedState(
+        $fixture['application'],
+        $state,
+        collect([
+            $previous->deployment_uuid => $previous,
+            $candidate->deployment_uuid => $candidate,
+        ]),
+    );
+
+    expect($resolution?->containerId)->toBe($candidateId)
+        ->and($resolution?->deploymentUuid)->toBe($candidate->deployment_uuid);
+});
+
+it('fails closed while a preparing route mutation lacks durable public-cutover attestation', function () {
+    $fixture = activeContainerResolverFixture('resolver-probe-only');
+    $candidateId = str_repeat('a', 64);
+    $candidate = activeContainerQueue(
+        $fixture,
+        'resolver-probe-only-blue',
+        $candidateId,
+        BlueGreenDeploymentColor::BLUE,
+        12,
+        BlueGreenDeploymentPhase::PREPARING,
+    );
+    $state = ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $fixture['application']->id,
+        'standalone_docker_id' => $fixture['destination']->id,
+        'pending_color' => BlueGreenDeploymentColor::BLUE,
+        'operation_deployment_uuid' => $candidate->deployment_uuid,
+        'operation_candidate_container_id' => $candidateId,
+        'operation_routing_config_digest' => $fixture['routing'],
+        'phase' => BlueGreenDeploymentPhase::PREPARING,
+        'routing_revision' => 12,
+        'managed_file_sha256' => hash('sha256', 'private-probe-route'),
+        'destination_topology_digest' => $fixture['topology'],
+        'application_routing_config_digest' => $fixture['routing'],
+    ]);
+
+    $resolution = (new ResolveActiveApplicationContainer)->resolveRoutedState(
+        $fixture['application'],
+        $state,
+        collect([$candidate->deployment_uuid => $candidate]),
+    );
+
+    expect($resolution)->toBeNull();
+});
+
+it('resolves a replica identity digest to every durable routed container', function () {
+    $fixture = activeContainerResolverFixture('resolver-replica-set');
+    $firstId = str_repeat('6', 64);
+    $secondId = str_repeat('7', 64);
+    $inspections = [
+        BlueGreenReplicaInspection::fromRuntime(1, 'app-blue-replica-1', 'app-blue-replica-1', $firstId, 'running', 'healthy'),
+        BlueGreenReplicaInspection::fromRuntime(2, 'app-blue-replica-2', 'app-blue-replica-2', $secondId, 'running', 'healthy'),
+    ];
+    $identityDigest = BlueGreenReplicaSet::identityDigest($inspections);
+    activeContainerQueue(
+        $fixture,
+        'resolver-replica-blue',
+        $identityDigest,
+        BlueGreenDeploymentColor::BLUE,
+        8,
+    );
+    $state = ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $fixture['application']->id,
+        'standalone_docker_id' => $fixture['destination']->id,
+        'active_color' => BlueGreenDeploymentColor::BLUE,
+        'blue_deployment_uuid' => 'resolver-replica-blue',
+        'phase' => BlueGreenDeploymentPhase::IDLE,
+        'routing_revision' => 8,
+        'destination_topology_digest' => $fixture['topology'],
+        'application_routing_config_digest' => $fixture['routing'],
+    ]);
+    foreach ($inspections as $inspection) {
+        ApplicationBlueGreenReplica::query()->create([
+            'application_blue_green_deployment_id' => $state->id,
+            'application_id' => $fixture['application']->id,
+            'standalone_docker_id' => $fixture['destination']->id,
+            'color' => BlueGreenDeploymentColor::BLUE,
+            'replica_index' => $inspection->replicaIndex,
+            'deployment_uuid' => 'resolver-replica-blue',
+            'routing_revision' => 8,
+            'compose_project' => 'resolver-replica',
+            'compose_service' => $inspection->composeService,
+            'container_name' => $inspection->containerName,
+            'container_id' => $inspection->dockerId,
+            'health_status' => 'healthy',
+        ]);
+    }
+
+    $resolution = ResolveActiveApplicationContainer::run(collect([$fixture['application']]))->first();
+
+    expect($resolution->containerId)->toBe($identityDigest)
+        ->and($resolution->containerIds)->toBe([$firstId, $secondId])
+        ->and($resolution->matches($firstId, 'resolver-replica-blue'))->toBeTrue()
+        ->and($resolution->matches($secondId, 'resolver-replica-blue'))->toBeTrue()
+        ->and($resolution->matches($identityDigest, 'resolver-replica-blue'))->toBeFalse();
+});
 
 it('uses the routed candidate while draining', function () {
     $fixture = activeContainerResolverFixture('resolver-draining');

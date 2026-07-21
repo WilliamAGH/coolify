@@ -2,6 +2,7 @@
 
 namespace App\Actions\Application\BlueGreen;
 
+use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 
 final readonly class ActiveApplicationContainerResolution
@@ -14,6 +15,10 @@ final readonly class ActiveApplicationContainerResolution
         public bool $preserveStatus,
         public ?string $containerId,
         public ?string $deploymentUuid,
+        public ?BlueGreenDeploymentColor $color = null,
+        public ?int $routingRevision = null,
+        /** @var list<string> */
+        public array $containerIds = [],
     ) {}
 
     public static function key(int $applicationId, int $destinationId): string
@@ -32,7 +37,27 @@ final readonly class ActiveApplicationContainerResolution
             return false;
         }
 
-        return $this->containerId !== null && $this->dockerIdsMatch($this->containerId, $containerId);
+        $expectedContainerIds = $this->containerIds !== []
+            ? $this->containerIds
+            : array_filter([$this->containerId]);
+
+        return collect($expectedContainerIds)->contains(
+            fn (string $expected): bool => $this->dockerIdsMatch($expected, $containerId),
+        );
+    }
+
+    public function hasSameObservationFence(self $other): bool
+    {
+        return $this->applicationId === $other->applicationId
+            && $this->destinationId === $other->destinationId
+            && $this->phase === $other->phase
+            && $this->observable === $other->observable
+            && $this->preserveStatus === $other->preserveStatus
+            && $this->containerId === $other->containerId
+            && $this->deploymentUuid === $other->deploymentUuid
+            && $this->color === $other->color
+            && $this->routingRevision === $other->routingRevision
+            && $this->containerIds === $other->containerIds;
     }
 
     private function dockerIdsMatch(string $expected, ?string $actual): bool
