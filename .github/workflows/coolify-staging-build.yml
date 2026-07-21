@@ -2,10 +2,8 @@ name: Staging Build
 
 on:
   push:
-    branches-ignore:
-      - v4.x
-      - v3.x
-      - '**v5.x**'
+    branches:
+      - next
     paths-ignore:
       - .github/workflows/coolify-helper.yml
       - .github/workflows/coolify-helper-next.yml
