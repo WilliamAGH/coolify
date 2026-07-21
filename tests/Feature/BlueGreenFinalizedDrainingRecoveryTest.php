@@ -13,12 +13,14 @@ use App\Actions\Application\BlueGreen\PlanBlueGreenPublicRecovery;
 use App\Actions\Application\BlueGreen\ReconstructBlueGreenDeploymentRecovery;
 use App\Actions\Application\BlueGreen\RecoverBlueGreenFinalizedDrainingOperation;
 use App\Actions\Application\BlueGreen\VerifyBlueGreenCandidateReleaseProof;
+use App\Actions\Application\BlueGreen\VerifyBlueGreenPublicRecovery;
 use App\Actions\Proxy\BlueGreenProxyConfiguration;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifact;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifactCommitter;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifactReader;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifactRestorer;
 use App\Actions\Proxy\BlueGreenProxyRollbackKey;
+use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingMode;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
@@ -783,4 +785,137 @@ it('leaves proxyChanged false and does not restore an artifact when the first ro
         ->and((new ReflectionProperty($lifecycle, 'proxyChanged'))->getValue($lifecycle))->toBeFalse()
         ->and($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value)
         ->and($fixture['state']->fresh()->phase)->toBe(BlueGreenDeploymentPhase::IDLE);
+});
+
+it('restores a pre-finalization rollback from the latest routed destination state', function (): void {
+    config(['constants.ssh.mux_enabled' => false]);
+    $fixture = fixedColorBlueGreenRecoveryFixture(BlueGreenDeploymentPhase::PREPARING);
+    $fence = fixedColorRecoveryFence($fixture);
+    $rollbackKey = new BlueGreenProxyRollbackKey(
+        FIXED_COLOR_CANDIDATE_DEPLOYMENT,
+        $fixture['previousConfiguration']->state,
+        $fixture['candidateConfiguration']->state,
+    );
+    $currentState = $fixture['candidateConfiguration']->state->withDestinationFenceEpoch(
+        $fixture['candidateConfiguration']->state->destinationFenceEpoch + 1,
+        FIXED_COLOR_CANDIDATE_DEPLOYMENT,
+        $fixture['candidateConfiguration']->state->mutationSequence + 1,
+    );
+    $restoredState = $fixture['previousConfiguration']->state->withDestinationFenceEpoch(
+        $currentState->destinationFenceEpoch + 1,
+        FIXED_COLOR_CANDIDATE_DEPLOYMENT,
+        $currentState->mutationSequence + 1,
+    );
+    $fixture['state']->update([
+        'destination_fence_epoch' => $currentState->destinationFenceEpoch,
+        'destination_fence_operation_id' => $currentState->operationId,
+        'destination_fence_mutation_sequence' => $currentState->mutationSequence,
+        'managed_file_sha256' => $currentState->managedSha256,
+        'destination_topology_digest' => $currentState->destinationTopologyDigest,
+        'application_routing_config_digest' => $currentState->applicationRoutingConfigDigest,
+    ]);
+    $lifecycle = new BlueGreenDeploymentLifecycle(
+        application: $fixture['application'],
+        deployment: $fixture['deployment'],
+        destination: $fixture['destination'],
+        server: $fixture['server'],
+        timeout: 30,
+        checkForCancellation: static function (): void {},
+    );
+    setFixedColorRecoveryLifecycleProperty($lifecycle, 'enabled', true);
+    setFixedColorRecoveryLifecycleProperty($lifecycle, 'claim', $fixture['claim']);
+    setFixedColorRecoveryLifecycleProperty($lifecycle, 'destinationState', $currentState);
+    setFixedColorRecoveryLifecycleProperty($lifecycle, 'candidateContainerExpectation', $fixture['candidateExpectation']);
+    setFixedColorRecoveryLifecycleProperty($lifecycle, 'previousContainerExpectation', $fixture['previousExpectation']);
+    setFixedColorRecoveryLifecycleProperty($lifecycle, 'operationFence', $fence);
+    setFixedColorRecoveryLifecycleProperty($lifecycle, 'proxyChanged', true);
+    setFixedColorRecoveryLifecycleProperty($lifecycle, 'rollbackKey', $rollbackKey);
+    setFixedColorRecoveryLifecycleProperty(
+        $lifecycle,
+        'latestRoutingMutationKey',
+        new BlueGreenProxyRollbackKey(
+            FIXED_COLOR_CANDIDATE_DEPLOYMENT,
+            $fixture['candidateConfiguration']->state,
+            $currentState,
+        ),
+    );
+
+    InspectBlueGreenContainer::shouldRun()
+        ->twice()
+        ->andReturn(
+            new BlueGreenContainerInspection(
+                exists: true,
+                dockerId: FIXED_COLOR_PREVIOUS_CONTAINER_ID,
+                status: 'running',
+                health: 'healthy',
+            ),
+            BlueGreenContainerInspection::missing(),
+        );
+    BlueGreenProxyRollbackArtifactReader::shouldRun()
+        ->once()
+        ->with($fixture['server'], $rollbackKey)
+        ->andReturn(new BlueGreenProxyRollbackArtifact(
+            $rollbackKey,
+            true,
+            $fixture['previousConfiguration']->yaml,
+        ));
+    BlueGreenProxyRollbackArtifactRestorer::shouldRun()
+        ->once()
+        ->withArgs(static function (
+            Server $server,
+            BlueGreenProxyRollbackKey $key,
+            string $bootId,
+            BlueGreenProxyState $actualCurrentState,
+            BlueGreenProxyState $actualRestoredState,
+        ) use ($fixture, $rollbackKey, $currentState, $restoredState): bool {
+            return $server->is($fixture['server'])
+                && $key === $rollbackKey
+                && $bootId === FIXED_COLOR_BOOT_ID
+                && $actualCurrentState->serialize() === $currentState->serialize()
+                && $actualRestoredState->serialize() === $restoredState->serialize();
+        })
+        ->andReturnNull();
+    VerifyBlueGreenPublicRecovery::shouldRun()->once()->andReturnNull();
+    BlueGreenProxyRollbackArtifactCommitter::shouldRun()->once()->andReturnNull();
+    Process::fake(static fn (): FakeProcessResult => Process::result(output: FIXED_COLOR_BOOT_ID));
+
+    $cause = new RuntimeException('post-route promotion failed before finalization');
+    try {
+        $rollbackResult = $lifecycle->rollback($cause);
+    } finally {
+        $fence->releaseIfOwned();
+    }
+
+    $state = $fixture['state']->fresh();
+    expect($rollbackResult)->toBe($cause)
+        ->and($state->phase)->toBe(BlueGreenDeploymentPhase::IDLE)
+        ->and($state->destination_fence_epoch)->toBe($restoredState->destinationFenceEpoch)
+        ->and($state->destination_fence_operation_id)->toBe(FIXED_COLOR_CANDIDATE_DEPLOYMENT)
+        ->and($state->destination_fence_mutation_sequence)->toBe($restoredState->mutationSequence)
+        ->and($state->managed_file_sha256)->toBe($fixture['previousConfiguration']->state->managedSha256)
+        ->and($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value);
+});
+
+it('rejects a one-sided rollback destination-state restoration request', function (): void {
+    $fixture = fixedColorBlueGreenRecoveryFixture(BlueGreenDeploymentPhase::PREPARING);
+    $rollbackKey = new BlueGreenProxyRollbackKey(
+        FIXED_COLOR_CANDIDATE_DEPLOYMENT,
+        $fixture['previousConfiguration']->state,
+        $fixture['candidateConfiguration']->state,
+    );
+    $restorer = new BlueGreenProxyRollbackArtifactRestorer;
+
+    expect(fn () => $restorer->handle(
+        $fixture['server'],
+        $rollbackKey,
+        FIXED_COLOR_BOOT_ID,
+        $fixture['candidateConfiguration']->state,
+    ))->toThrow(InvalidArgumentException::class, 'requires both current and restored destination states')
+        ->and(fn () => $restorer->handle(
+            $fixture['server'],
+            $rollbackKey,
+            FIXED_COLOR_BOOT_ID,
+            null,
+            $fixture['previousConfiguration']->state,
+        ))->toThrow(InvalidArgumentException::class, 'requires both current and restored destination states');
 });

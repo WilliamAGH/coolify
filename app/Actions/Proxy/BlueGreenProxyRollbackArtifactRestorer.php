@@ -15,7 +15,23 @@ class BlueGreenProxyRollbackArtifactRestorer
         Server $server,
         BlueGreenProxyRollbackKey $rollbackKey,
         string $expectedBootId,
+        ?BlueGreenProxyState $currentState = null,
+        ?BlueGreenProxyState $restoredState = null,
     ): void {
+        if (($currentState === null) !== ($restoredState === null)) {
+            throw new InvalidArgumentException('Blue/green rollback restoration requires both current and restored destination states.');
+        }
+        if ($currentState !== null && $restoredState !== null) {
+            $this->restoreFromCurrentState(
+                $server,
+                $rollbackKey,
+                $currentState,
+                $restoredState,
+                $expectedBootId,
+            );
+
+            return;
+        }
         if ($server->proxyType() !== ProxyTypes::TRAEFIK->value) {
             throw new InvalidArgumentException('Blue/green proxy rollback requires a Traefik server.');
         }
