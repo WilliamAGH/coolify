@@ -22,6 +22,7 @@ use App\Models\StandaloneDocker;
 use App\Models\Team;
 use App\Support\ProxyMutationQueue;
 use Illuminate\Contracts\Console\Kernel;
+use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
 use Illuminate\Queue\Worker;
@@ -295,7 +296,17 @@ function consumeQueuedActivationDeployment(
 
     $reservation = null;
     $completion = null;
+    $failure = null;
     $inspectionOpen = true;
+    Queue::failing(static function (JobFailed $event) use (&$failure, &$inspectionOpen): void {
+        if (! $inspectionOpen
+            || $event->connectionName !== ProxyMutationQueue::CONNECTION
+            || $event->job->getQueue() !== ProxyMutationQueue::NAME) {
+            return;
+        }
+
+        $failure = $event->exception;
+    });
     Queue::before(static function (JobProcessing $event) use (&$completion, &$inspectionOpen, &$reservation, $activationAttempt, $deployment): void {
         if (! $inspectionOpen
             || $event->connectionName !== ProxyMutationQueue::CONNECTION
@@ -366,7 +377,13 @@ function consumeQueuedActivationDeployment(
     }
 
     assertLab(is_array($reservation), 'The bounded activation consumer did not reserve the queued child.');
-    assertLab(is_array($completion), 'The bounded activation consumer did not complete the queued child.');
+    $failureDetail = $failure instanceof Throwable
+        ? ' Failure: '.$failure::class.': '.$failure->getMessage()
+        : '';
+    assertLab(
+        is_array($completion),
+        'The bounded activation consumer did not complete the queued child.'.$failureDetail,
+    );
     $queueAfter = proxyMutationQueueCardinality();
     assertLab(
         $completion['after'] === ['pending' => 0, 'reserved' => 0, 'delayed' => 0]

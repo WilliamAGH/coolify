@@ -45,7 +45,7 @@ is_keep_container() {
   local name="$1" project="$2"
   is_keep_compose_project "$project" && return 0
   case "$name" in
-    coolify|coolify-*|buildx_buildkit_${MULTIARCH_BUILDER}0) return 0 ;;
+    coolify|coolify-*|"buildx_buildkit_${MULTIARCH_BUILDER}0") return 0 ;;
   esac
   return 1
 }
