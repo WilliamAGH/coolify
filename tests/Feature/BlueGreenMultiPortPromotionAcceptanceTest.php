@@ -425,58 +425,7 @@ it('promotes two public routes across two backend ports through production label
         ->where('deployment_uuid', $claim->deploymentUuid)
         ->sole();
     $releaseProof = BlueGreenRoutingTarget::durableReleaseProofToken($claim->deploymentUuid);
-    $probeToken = BlueGreenRoutingTarget::durableProbeToken($claim->deploymentUuid);
-    $probeTarget = new BlueGreenRoutingTarget(
-        destinationId: $destination->id,
-        activeColor: $claim->pendingColor,
-        blueContainerName: $application->uuid.'-blue',
-        greenContainerName: $application->uuid.'-green',
-        port: 3000,
-        ports: [3000, 8080],
-        routingRevision: $claim->expectedRoutingRevision,
-        mode: BlueGreenRoutingMode::ProbeOnly,
-        probeHeaderName: 'X-Coolify-Blue-Green-Probe',
-        probeToken: $probeToken,
-        probeColor: $claim->pendingColor,
-        releaseProofToken: $releaseProof,
-        fallbackContainerName: $context['previousExpectation']->name,
-        destinationFenceEpoch: $claim->destinationFenceEpoch,
-        operationId: $claim->deploymentUuid,
-        mutationSequence: 1,
-        activeDeploymentUuid: $claim->deploymentUuid,
-        activeContainerId: MULTI_PORT_CANDIDATE_CONTAINER_ID,
-        destinationTopologyDigest: $claim->topologyDigest,
-    );
-    $probeConfiguration = CompileBlueGreenProxyConfiguration::run(
-        $application,
-        $destination,
-        $probeTarget,
-    );
-    RecordBlueGreenDestinationState::run(
-        $claim,
-        $context['previousConfiguration']->state,
-        $probeConfiguration->state,
-    );
     $planner = new PlanBlueGreenPublicRecovery;
-    $probeRoutes = $planner->routesForYaml(
-        $probeConfiguration->yaml,
-        probe: true,
-        requireEntryPoints: true,
-    );
-    $probeResponse = "HTTP/1.1 200 OK\r\n".
-        BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$probeTarget->probeAcknowledgement()}\r\n".
-        BlueGreenRoutingTarget::RELEASE_PROOF_HEADER.": {$releaseProof}\r\n\r\n";
-    $probeRequests = verifyMultiPortRoutes(
-        $probeRoutes,
-        array_map(static fn (): FakeProcessResult => Process::result(output: $probeResponse), $probeRoutes),
-        $context['server'],
-        $application,
-        $probeTarget->probeAcknowledgement(),
-        $releaseProof,
-        'X-Coolify-Blue-Green-Probe',
-        $probeToken,
-    );
-
     $handoffTarget = new BlueGreenRoutingTarget(
         destinationId: $destination->id,
         activeColor: $claim->pendingColor,
@@ -489,9 +438,9 @@ it('promotes two public routes across two backend ports through production label
         releaseProofToken: $releaseProof,
         publicProofToken: BlueGreenRoutingTarget::durablePublicProofToken($claim->deploymentUuid),
         fallbackContainerName: $context['previousExpectation']->name,
-        destinationFenceEpoch: $claim->destinationFenceEpoch + 1,
+        destinationFenceEpoch: $claim->destinationFenceEpoch,
         operationId: $claim->deploymentUuid,
-        mutationSequence: 2,
+        mutationSequence: 1,
         activeDeploymentUuid: $claim->deploymentUuid,
         activeContainerId: MULTI_PORT_CANDIDATE_CONTAINER_ID,
         destinationTopologyDigest: $claim->topologyDigest,
@@ -503,7 +452,7 @@ it('promotes two public routes across two backend ports through production label
     );
     RecordBlueGreenDestinationState::run(
         $claim,
-        $probeConfiguration->state,
+        $context['previousConfiguration']->state,
         $handoffConfiguration->state,
     );
     RecordBlueGreenRoutingMutation::run($claim, $handoffConfiguration->state);
@@ -529,9 +478,9 @@ it('promotes two public routes across two backend ports through production label
         ports: [3000, 8080],
         routingRevision: $claim->expectedRoutingRevision,
         publicProofToken: BlueGreenRoutingTarget::durablePublicProofToken($claim->deploymentUuid),
-        destinationFenceEpoch: $claim->destinationFenceEpoch + 2,
+        destinationFenceEpoch: $claim->destinationFenceEpoch + 1,
         operationId: $claim->deploymentUuid,
-        mutationSequence: 3,
+        mutationSequence: 2,
         activeDeploymentUuid: $claim->deploymentUuid,
         activeContainerId: MULTI_PORT_CANDIDATE_CONTAINER_ID,
         destinationTopologyDigest: $claim->topologyDigest,
@@ -570,18 +519,16 @@ it('promotes two public routes across two backend ports through production label
         $destination,
     );
 
-    expect($probeRoutes)->toHaveCount(4)
+    expect($claim->previousActiveColor)->toBe(BlueGreenDeploymentColor::GREEN)
         ->and($handoffRoutes)->toHaveCount(4)
         ->and($steadyRoutes)->toHaveCount(4)
-        ->and($probeRequests)->toHaveCount(4)
-        ->each->toContain('X-Coolify-Blue-Green-Probe: '.$probeToken)
         ->and($handoffRequests)->toHaveCount(4)
         ->each->not->toContain('X-Coolify-Blue-Green-Probe')
         ->and($steadyRequests)->toHaveCount(4)
         ->each->not->toContain('X-Coolify-Blue-Green-Probe')
-        ->and(collect([...$probeRequests, ...$handoffRequests, ...$steadyRequests]))
+        ->and(collect([...$handoffRequests, ...$steadyRequests]))
         ->each->toContain(VerifyBlueGreenPublicRecovery::DEPLOYMENT_NONCE_PARAMETER)
-        ->and(collect([...$probeRoutes, ...$handoffRoutes, ...$steadyRoutes])->pluck('url')->unique()->sort()->values()->all())
+        ->and(collect([...$handoffRoutes, ...$steadyRoutes])->pluck('url')->unique()->sort()->values()->all())
         ->toBe([
             'http://multi-port-metrics.example.test/',
             'http://multi-port-web.example.test/',

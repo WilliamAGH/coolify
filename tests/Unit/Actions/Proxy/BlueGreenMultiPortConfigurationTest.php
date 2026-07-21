@@ -3,6 +3,7 @@
 use App\Actions\Proxy\BlueGreenRoutingMode;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
+use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Models\Application;
 use Symfony\Component\Yaml\Yaml;
@@ -99,6 +100,23 @@ it('compiles deterministic port-specific blue-green services and probes for ever
         ->and(data_get($publicParsed, 'http.routers.'.$prefix.'metrics-public.service'))->toBe($prefix.'active-8080')
         ->and(data_get($services, $prefix.'active-3000.weighted.services.0.name'))->toBe($prefix.'blue-3000@docker')
         ->and(data_get($services, $prefix.'active-8080.weighted.services.0.name'))->toBe($prefix.'blue-8080@docker');
+});
+
+it('keeps explicit-replica ProbeOnly services limited to the probed color and referenced ports', function (): void {
+    [$configuration, $parsed] = compileBlueGreenMultiPortConfiguration(blueGreenMultiPortTarget(
+        mode: BlueGreenRoutingMode::ProbeOnly,
+        probeToken: BlueGreenRoutingTarget::durableProbeToken('deployment-7'),
+        blueReplicaBackends: ['app-blue-1', 'app-blue-2'],
+        greenReplicaBackends: ['app-green-1', 'app-green-2'],
+    ));
+    $prefix = BlueGreenRoutingTarget::routingNamePrefix('app-multi-port', 42);
+
+    expect(array_keys(data_get($parsed, 'http.services')))->toBe([
+        $prefix.'blue-3000',
+        $prefix.'blue-8080',
+    ]);
+
+    (new WriteBlueGreenProxyConfiguration)->validate($configuration);
 });
 
 it('publishes one Docker-provider discovery service per color and exposed backend port', function (): void {

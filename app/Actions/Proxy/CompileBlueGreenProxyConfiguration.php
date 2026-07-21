@@ -153,7 +153,10 @@ class CompileBlueGreenProxyConfiguration
         foreach ($target->ports as $backendPort) {
             $activeServiceName = $target->activeServiceNameForBackendPort($applicationUuid, $backendPort);
             if ($target->usesExplicitReplicaBackends) {
-                foreach (BlueGreenDeploymentColor::cases() as $color) {
+                $serviceColors = $target->mode === BlueGreenRoutingMode::ProbeOnly && $target->probeColor !== null
+                    ? [$target->probeColor]
+                    : BlueGreenDeploymentColor::cases();
+                foreach ($serviceColors as $color) {
                     $services[BlueGreenRoutingTarget::memberServiceNameForPort(
                         $applicationUuid,
                         $target->destinationId,
@@ -237,7 +240,13 @@ class CompileBlueGreenProxyConfiguration
 
         $yamlBody = Yaml::dump($configuration, 20, 2, Yaml::DUMP_EXCEPTION_ON_INVALID_TYPE);
         $routingConfigDigest = hash('sha256', $yamlBody);
-        $yaml = $this->metadataHeader($applicationUuid, $target, $routingConfigDigest).$yamlBody;
+        $probeOnlyContract = $this->probeOnlyContract($routers, $services, $target);
+        $yaml = $this->metadataHeader(
+            applicationUuid: $applicationUuid,
+            target: $target,
+            routingConfigDigest: $routingConfigDigest,
+            probeOnlyContract: $probeOnlyContract,
+        ).$yamlBody;
         $validated = Yaml::parse(
             $yaml,
             Yaml::PARSE_EXCEPTION_ON_ALIAS | Yaml::PARSE_EXCEPTION_ON_INVALID_TYPE,
@@ -254,6 +263,7 @@ class CompileBlueGreenProxyConfiguration
             yaml: $yaml,
             sha256: $sha256,
             state: $target->fencedState($applicationUuid, $managedFilename, $sha256, $routingConfigDigest),
+            probeOnlyContract: $probeOnlyContract,
         );
     }
 
@@ -573,6 +583,7 @@ class CompileBlueGreenProxyConfiguration
         string $applicationUuid,
         BlueGreenRoutingTarget $target,
         string $routingConfigDigest,
+        ?array $probeOnlyContract = null,
     ): string {
         $metadata = [
             'coolify.blue-green.managed' => 'true',
@@ -592,6 +603,9 @@ class CompileBlueGreenProxyConfiguration
         if ($target->replicaTopologyDigest() !== null) {
             $metadata['coolify.replica-topology-digest'] = $target->replicaTopologyDigest();
         }
+        if ($probeOnlyContract !== null) {
+            $metadata['coolify.probe-only-contract'] = $probeOnlyContract;
+        }
         $header = "# This file is generated and managed by Coolify.\n";
         foreach ($metadata as $key => $value) {
             $encoded = json_encode($value, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
@@ -599,5 +613,47 @@ class CompileBlueGreenProxyConfiguration
         }
 
         return $header."\n";
+    }
+
+    /**
+     * @param  array<string, array<string, mixed>>  $routers
+     * @param  array<string, array<string, mixed>>  $services
+     * @return array{routers: array<string, string>, services: array<string, array<string, mixed>>}|null
+     */
+    private function probeOnlyContract(
+        array $routers,
+        array $services,
+        BlueGreenRoutingTarget $target,
+    ): ?array {
+        if ($target->mode !== BlueGreenRoutingMode::ProbeOnly || $routers === []) {
+            return null;
+        }
+
+        $probeRouters = [];
+        foreach ($routers as $routerName => $router) {
+            $serviceName = $router['service'] ?? null;
+            if (! is_string($serviceName) || $serviceName === '') {
+                throw new InvalidArgumentException('Probe-only routers must have an exact file-provider service binding.');
+            }
+            $probeRouters[$routerName] = $serviceName;
+        }
+        ksort($probeRouters);
+
+        $probeServices = [];
+        foreach (array_values(array_unique($probeRouters)) as $serviceName) {
+            $fileServiceName = str_ends_with($serviceName, '@file')
+                ? substr($serviceName, 0, -strlen('@file'))
+                : $serviceName;
+            if (str_contains($fileServiceName, '@') || ! isset($services[$fileServiceName])) {
+                throw new InvalidArgumentException('Probe-only routers must reference a managed file-provider service.');
+            }
+            $probeServices[$fileServiceName] = $services[$fileServiceName];
+        }
+        ksort($probeServices);
+
+        return [
+            'routers' => $probeRouters,
+            'services' => $probeServices,
+        ];
     }
 }

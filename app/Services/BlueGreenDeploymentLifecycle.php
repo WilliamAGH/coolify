@@ -1382,18 +1382,23 @@ final class BlueGreenDeploymentLifecycle
         }
 
         $previousContainer = $this->previousContainerExpectation;
-        $this->deployment->addLogEntry(
-            'Blue-green promotion is proving the exact candidate release through its private probe before public handoff.',
-        );
-        $this->writeAndVerifyRouting($this->routingTarget(
-            activeColor: $candidateColor,
-            probeHeader: 'X-Coolify-Blue-Green-Probe',
-            probeToken: BlueGreenRoutingTarget::durableProbeToken($claim->deploymentUuid),
-            probeColor: $candidateColor,
-            releaseProofToken: $releaseProofToken,
-            mode: BlueGreenRoutingMode::ProbeOnly,
-            fallbackContainerName: $claim->legacyContainerName === null ? $previousContainer?->name : null,
-        ), recordRoutingMutation: false, expectedPhase: BlueGreenDeploymentPhase::PREPARING);
+        if ($claim->previousActiveColor === null) {
+            $this->deployment->addLogEntry(
+                'Blue-green first adoption is proving the exact candidate release through its private probe before public handoff.',
+            );
+            $this->writeAndVerifyRouting($this->routingTarget(
+                activeColor: $candidateColor,
+                probeHeader: 'X-Coolify-Blue-Green-Probe',
+                probeToken: BlueGreenRoutingTarget::durableProbeToken($claim->deploymentUuid),
+                probeColor: $candidateColor,
+                releaseProofToken: $releaseProofToken,
+                mode: BlueGreenRoutingMode::ProbeOnly,
+            ), recordRoutingMutation: false, expectedPhase: BlueGreenDeploymentPhase::PREPARING);
+        } else {
+            $this->deployment->addLogEntry(
+                'Blue-green candidate release proof passed without replacing the live fixed-color route before public handoff.',
+            );
+        }
 
         if ($previousContainer !== null) {
             $handoffMode = $claim->legacyContainerName === null

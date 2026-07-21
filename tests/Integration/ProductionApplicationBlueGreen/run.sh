@@ -506,11 +506,12 @@ jq -e '
     and .continuity.postReplayCount >= 5
     and (.continuity.replayCompletedAt | type == "number")
     and .continuity.finalAcknowledgement == .expectedAcknowledgements.second
-    and (([.continuity.samples[] | select(.afterTerminalReplay)] | length) == .continuity.postReplayCount)
+    and (.continuity as $continuity
+        | ([$continuity.samples[] | select(.afterTerminalReplay)] | length) == $continuity.postReplayCount)
     and ((.expectedAcknowledgements.second) as $secondAcknowledgement
         | ([.continuity.samples[] | select(.afterTerminalReplay) | .acknowledgement == $secondAcknowledgement] | all))
     and .continuity.errors == []
-    and (.continuity.samples | length == .continuity.requestCount)
+    and (.continuity as $continuity | ($continuity.samples | length) == $continuity.requestCount)
     and .continuity.maxGapMilliseconds < 1500
     and .activeRoute.activeColor == "green"
     and .activeRoute.activeDeploymentUuid == .second.deploymentUuid
