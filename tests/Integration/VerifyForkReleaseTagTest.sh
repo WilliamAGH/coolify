@@ -49,7 +49,10 @@ run_verifier()
   revision=$2
   (
     cd "$verification_repository"
-    GITHUB_REF="refs/tags/$version" GITHUB_SHA="$revision" \
+    # Local bare remotes are intentional fixtures; production CI sets
+    # GITHUB_ACTIONS=true and would reject any non-repository remote.
+    env -u GITHUB_ACTIONS -u GITHUB_REPOSITORY \
+      GITHUB_REF="refs/tags/$version" GITHUB_SHA="$revision" \
       "$repository_root/scripts/ci/verify-fork-release-tag.sh" \
       "$version" "$revision" "$remote" "$allowlist"
   )
