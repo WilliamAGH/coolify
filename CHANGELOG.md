@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 📚 Documentation
+
+- Update changelog (#107)
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Reserve fork version 4.13.5
+
+## [4.13.4-fork] - 2026-07-21
+
 ### 🚀 Features
 
 - *(realtime)* Bundle Reverb and terminal in main image (#62)
