@@ -2397,7 +2397,15 @@ jobs:
       SEMANTIC_VERSION: ${{ inputs.semantic_version }}
       SOURCE_REVISION: ${{ github.sha }}
       SOURCE_URL: https://github.com/${{ github.repository }}
+      FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE: docker/fork-release-tag-allowed-signers
+      FORK_RELEASE_TAG_VERIFIER: scripts/ci/verify-fork-release-tag.sh
     steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
       - name: Revalidate shared Nexus docker-hosted contract before final tagging
         env:
           NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
@@ -2466,6 +2474,12 @@ jobs:
         run: |
           set -Eeuo pipefail
           umask 077
+
+          verify_live_fork_tag() {
+            "$FORK_RELEASE_TAG_VERIFIER" \
+              "$SEMANTIC_VERSION" "$SOURCE_REVISION" \
+              "$SOURCE_URL.git" "$FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE"
+          }
 
           expected_release_name="Coolify fork $SEMANTIC_VERSION"
           bundle_directory=fork-release-bundles
@@ -2573,6 +2587,7 @@ jobs:
           }
 
           if ! refresh_release_metadata; then
+            verify_live_fork_tag
             if ! "$GH_CLI" release create "$SEMANTIC_VERSION" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
@@ -2601,6 +2616,7 @@ jobs:
             assert_release_tag_targets_source_revision
             printf 'Published fork release exactly matches the immutable release contract; accepting idempotent retry.\n'
           fi
+          verify_live_fork_tag
 
       - name: Promote and verify the main fork image
         run: |
@@ -2617,37 +2633,9 @@ jobs:
           }
 
           assert_live_fork_tag_binding() {
-            local reference_file tag_object_file tag_object_sha object_sha
-            reference_file="$(mktemp "$RUNNER_TEMP/coolify-fork-live-tag-reference.XXXXXX")"
-            tag_object_file="$(mktemp "$RUNNER_TEMP/coolify-fork-live-tag-object.XXXXXX")"
-            github_api_get "git/ref/tags/$SEMANTIC_VERSION" "$reference_file"
-            jq -e --arg ref "refs/tags/$SEMANTIC_VERSION" '
-              .ref == $ref and .object.type == "tag"
-            ' "$reference_file" >/dev/null
-            tag_object_sha="$(jq -er '.object.sha' "$reference_file")"
-            printf '%s' "$tag_object_sha" | grep -Eq '^[0-9a-f]{40}$'
-            github_api_get "git/tags/$tag_object_sha" "$tag_object_file"
-            jq -e \
-              --arg tag "$SEMANTIC_VERSION" \
-              --arg tagger_email 'william@aventure.vc' \
-              --arg tagger_name 'William Callahan' '
-                .tag == $tag and
-                .tagger.name == $tagger_name and
-                .tagger.email == $tagger_email and
-                .object.type == "commit" and
-                .verification.verified == true and
-                .verification.reason == "valid" and
-                (.verification.signature | strings | startswith("-----BEGIN SSH SIGNATURE-----"))
-              ' "$tag_object_file" >/dev/null || {
-              printf 'Fork release tag is not a directly bound, verified signature from the allowed tagger.\n' >&2
-              return 1
-            }
-            object_sha="$(jq -er '.object.sha' "$tag_object_file")"
-            printf '%s' "$object_sha" | grep -Eq '^[0-9a-f]{40}$'
-            [[ "$object_sha" == "$GITHUB_SHA" && "$object_sha" == "$SOURCE_REVISION" ]] || {
-              printf 'Fork release tag no longer resolves to the immutable workflow source revision.\n' >&2
-              return 1
-            }
+            "$FORK_RELEASE_TAG_VERIFIER" \
+              "$SEMANTIC_VERSION" "$SOURCE_REVISION" \
+              "$SOURCE_URL.git" "$FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE"
           }
 
           assert_active_fork_tag_protection() {
@@ -2668,6 +2656,7 @@ jobs:
                 .name == $name and
                 .target == "tag" and
                 .enforcement == "active" and
+                ((.bypass_actors // []) == []) and
                 .conditions.ref_name.include == [$pattern] and
                 ((.conditions.ref_name.exclude // []) == [])
               ) and
@@ -2682,9 +2671,6 @@ jobs:
               return 1
             }
 
-            # A named ruleset can intentionally grant bypass actors. That explicit
-            # human authority remains a residual risk; this gate fail-closes unless
-            # the observed policy protects the release tag at each semantic-write boundary.
           }
 
           digest_or_absent() {
@@ -2761,6 +2747,7 @@ jobs:
             local repository=$1 expected_index_digest=$2 existing
             existing="$(digest_or_absent "$repository:$SEMANTIC_VERSION")"
             if [[ -z "$existing" ]]; then
+              assert_live_fork_tag_binding
               if ! regctl image copy "$repository@$expected_index_digest" "$repository:$SEMANTIC_VERSION"; then
                 existing="$(digest_or_absent "$repository:$SEMANTIC_VERSION")"
                 [[ "$existing" == "$expected_index_digest" ]] || {
@@ -2769,6 +2756,7 @@ jobs:
                   return 1
                 }
               fi
+              assert_live_fork_tag_binding
             else
               [[ "$existing" == "$expected_index_digest" ]] || {
                 printf 'Fork semantic tag does not match its expected immutable index digest: %s:%s expected %s, found %s\n' \
@@ -2849,7 +2837,9 @@ jobs:
               [[ "$tag" == "$repository:"* ]]
               existing="$(digest_or_absent "$tag")"
               if [[ -z "$existing" ]]; then
+                assert_live_fork_tag_binding
                 regctl image copy "$repository@$expected_index_digest" "$tag"
+                assert_live_fork_tag_binding
               fi
               [[ "$(regctl image digest "$tag")" == "$expected_index_digest" ]]
             done
@@ -2857,7 +2847,9 @@ jobs:
             tag="${tags[0]}"
             [[ "$tag" == "$repository:"* ]]
             if [[ "$(digest_or_absent "$tag")" != "$expected_index_digest" ]]; then
+              assert_live_fork_tag_binding
               regctl image copy "$repository@$expected_index_digest" "$tag"
+              assert_live_fork_tag_binding
             fi
             [[ "$(regctl image digest "$tag")" == "$expected_index_digest" ]]
           }
@@ -2882,6 +2874,12 @@ jobs:
         run: |
           set -Eeuo pipefail
           umask 077
+
+          verify_live_fork_tag() {
+            "$FORK_RELEASE_TAG_VERIFIER" \
+              "$SEMANTIC_VERSION" "$SOURCE_REVISION" \
+              "$SOURCE_URL.git" "$FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE"
+          }
 
           bundle_directory=fork-release-bundles
           expected_release_name="Coolify fork $SEMANTIC_VERSION"
@@ -3011,6 +3009,7 @@ jobs:
               asset_count="$(current_release_asset_count "$asset_name")"
               case "$asset_count" in
                 0)
+                  verify_live_fork_tag
                   if ! "$GH_CLI" release upload "$SEMANTIC_VERSION" --repo "$GITHUB_REPOSITORY" \
                     "$bundle_directory/$asset_name"; then
                     refresh_release_metadata
@@ -3033,6 +3032,7 @@ jobs:
             validate_release_identity
             assert_release_assets_are_exact
             assert_release_tag_targets_source_revision
+            verify_live_fork_tag
             if ! "$GH_CLI" release edit "$SEMANTIC_VERSION" --repo "$GITHUB_REPOSITORY" --draft=false; then
               printf 'Fork release publication returned an ambiguous failure; reconciling the observed release state.\n' >&2
             fi
@@ -3049,6 +3049,7 @@ jobs:
           }
           assert_release_assets_are_exact
           assert_release_tag_targets_source_revision
+          verify_live_fork_tag
 
       - name: Reverify every fork alias after release publication
         run: |
@@ -3065,33 +3066,9 @@ jobs:
           }
 
           assert_live_signed_fork_tag() {
-            local reference_file tag_object_file tag_object_sha
-            reference_file="$(mktemp "$RUNNER_TEMP/coolify-fork-final-tag-reference.XXXXXX")"
-            tag_object_file="$(mktemp "$RUNNER_TEMP/coolify-fork-final-tag-object.XXXXXX")"
-            github_api_get "git/ref/tags/$SEMANTIC_VERSION" "$reference_file"
-            jq -e --arg ref "refs/tags/$SEMANTIC_VERSION" '
-              .ref == $ref and .object.type == "tag"
-            ' "$reference_file" >/dev/null
-            tag_object_sha="$(jq -er '.object.sha' "$reference_file")"
-            printf '%s' "$tag_object_sha" | grep -Eq '^[0-9a-f]{40}$'
-            github_api_get "git/tags/$tag_object_sha" "$tag_object_file"
-            jq -e \
-              --arg revision "$SOURCE_REVISION" \
-              --arg tag "$SEMANTIC_VERSION" \
-              --arg tagger_email 'william@aventure.vc' \
-              --arg tagger_name 'William Callahan' '
-                .tag == $tag and
-                .tagger.name == $tagger_name and
-                .tagger.email == $tagger_email and
-                .object.type == "commit" and
-                .object.sha == $revision and
-                .verification.verified == true and
-                .verification.reason == "valid" and
-                (.verification.signature | strings | startswith("-----BEGIN SSH SIGNATURE-----"))
-              ' "$tag_object_file" >/dev/null || {
-              printf 'Fork release tag signature changed during release publication.\n' >&2
-              return 1
-            }
+            "$FORK_RELEASE_TAG_VERIFIER" \
+              "$SEMANTIC_VERSION" "$SOURCE_REVISION" \
+              "$SOURCE_URL.git" "$FORK_RELEASE_TAG_ALLOWED_SIGNERS_FILE"
           }
 
           assert_active_fork_tag_protection() {
@@ -3110,6 +3087,7 @@ jobs:
               .name == $name and
               .target == "tag" and
               .enforcement == "active" and
+              ((.bypass_actors // []) == []) and
               .conditions.ref_name.include == [$pattern] and
               ((.conditions.ref_name.exclude // []) == []) and
               (([.rules[].type] | unique) as $rule_types |
