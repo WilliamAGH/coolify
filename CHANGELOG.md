@@ -51,6 +51,7 @@ All notable changes to this project will be documented in this file.
 - *(release)* Keep fork latest monotonic
 - *(traefik)* Admit guarded probe-only routes
 - *(release)* Publish fork images from protected v4.x
+- *(test)* Inject runtime env through Docker API
 - *(deps)* Update Guzzle for security advisories
 
 ### 💼 Other
@@ -74,6 +75,7 @@ All notable changes to this project will be documented in this file.
 - Update changelog (#77)
 - Update changelog (#82)
 - Update changelog (#83)
+- Update changelog (#85)
 
 ### 🎨 Styling
 
