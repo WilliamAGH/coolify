@@ -296,6 +296,7 @@ COPY --chown=www-data:www-data templates ./templates
 COPY --chown=www-data:www-data resources/views ./resources/views
 COPY --chown=www-data:www-data artisan artisan
 COPY --chown=www-data:www-data openapi.yaml ./openapi.yaml
+COPY --chown=www-data:www-data versions.json ./versions.json
 COPY --chown=www-data:www-data changelogs/ ./changelogs/
 COPY --chown=www-data:www-data --chmod=755 scripts/control-plane-traefik-attestor ./scripts/control-plane-traefik-attestor
 

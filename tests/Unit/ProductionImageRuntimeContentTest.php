@@ -7,6 +7,14 @@ function productionImageRuntimeContentRoot(): string
     return dirname(__DIR__, 2);
 }
 
+it('packages the runtime version catalog used by proxy startup', function (): void {
+    $root = productionImageRuntimeContentRoot();
+    $dockerfile = (string) file_get_contents($root.'/docker/production/Dockerfile');
+
+    expect($dockerfile)
+        ->toContain('COPY --chown=www-data:www-data versions.json ./versions.json');
+});
+
 it('keeps the production database payload to migrations and the runtime seeder allowlist', function (): void {
     $root = productionImageRuntimeContentRoot();
     $dockerfile = (string) file_get_contents($root.'/docker/production/Dockerfile');
