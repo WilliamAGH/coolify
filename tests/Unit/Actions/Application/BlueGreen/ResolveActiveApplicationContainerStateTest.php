@@ -57,17 +57,24 @@ function activeLiveRoute(
 function activeImageContainer(
     string $containerId,
     string $deploymentUuid,
-    string $image,
+    string $configuredImage,
     string $health = 'healthy',
+    ?string $imageId = null,
 ): array {
     return [
         'Id' => $containerId,
+        'Image' => $imageId ?? activeImageId($configuredImage),
         'Config' => [
-            'Image' => $image,
+            'Image' => $configuredImage,
             'Labels' => ['coolify.blueGreen.deploymentUuid' => $deploymentUuid],
         ],
         'State' => ['Status' => 'running', 'Health' => ['Status' => $health]],
     ];
+}
+
+function activeImageId(string $image): string
+{
+    return 'sha256:'.hash('sha256', $image);
 }
 
 it('returns the routed predecessor image while a candidate rollback is active', function () {
@@ -91,7 +98,7 @@ it('returns the routed predecessor image while a candidate rollback is active', 
     );
 
     expect($state)->toBeInstanceOf(ActiveApplicationContainerState::class)
-        ->and($state->image)->toBe('registry.example/app:ccb9a3b')
+        ->and($state->image)->toBe(activeImageId('registry.example/app:ccb9a3b'))
         ->and($state->status)->toBe('running:healthy')
         ->and($state->destination[0]['deployment_uuid'])->toBe('deployment-ccb9a3b');
 });
@@ -114,11 +121,11 @@ it('returns the routed candidate image while it is draining', function () {
         ]),
     );
 
-    expect($state?->image)->toBe('registry.example/app:candidate')
+    expect($state?->image)->toBe(activeImageId('registry.example/app:candidate'))
         ->and($state?->status)->toBe('running:healthy');
 });
 
-it('fails closed for mismatched provenance and divergent destination images', function () {
+it('fails closed for mismatched provenance and one mutable tag resolving to distinct immutable image IDs', function () {
     $firstId = str_repeat('d', 64);
     $secondId = str_repeat('e', 64);
     $action = new ResolveActiveApplicationContainerState;
@@ -137,8 +144,18 @@ it('fails closed for mismatched provenance and divergent destination images', fu
     $divergent = $action->resolveFromContainers(
         $resolutions,
         collect([
-            13 => collect([activeImageContainer($firstId, 'deployment-first', 'registry.example/app:first')]),
-            14 => collect([activeImageContainer($secondId, 'deployment-second', 'registry.example/app:second')]),
+            13 => collect([activeImageContainer(
+                $firstId,
+                'deployment-first',
+                'registry.example/app:stable',
+                imageId: activeImageId('registry.example/app@sha256:first'),
+            )]),
+            14 => collect([activeImageContainer(
+                $secondId,
+                'deployment-second',
+                'registry.example/app:stable',
+                imageId: activeImageId('registry.example/app@sha256:second'),
+            )]),
         ]),
     );
 
@@ -167,7 +184,7 @@ it('observes every routed replica and derives image and status from that same se
         ]),
     );
 
-    expect($state?->image)->toBe('registry.example/app:replicas')
+    expect($state?->image)->toBe(activeImageId('registry.example/app:replicas'))
         ->and($state?->status)->toBe('running:unhealthy')
         ->and($state?->destination[0]['container_ids'])->toBe([$firstId, $secondId]);
 });

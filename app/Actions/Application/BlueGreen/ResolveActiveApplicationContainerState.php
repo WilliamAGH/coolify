@@ -222,9 +222,11 @@ class ResolveActiveApplicationContainerState
     private function buildState(Collection $selectedContainers, array $destination): ?ActiveApplicationContainerState
     {
         $images = $selectedContainers->map(function (array $container): ?string {
-            $image = data_get($container, 'Config.Image');
+            $image = data_get($container, 'Image');
 
-            return is_string($image) && $image !== '' ? $image : null;
+            return is_string($image) && preg_match('/\Asha256:[a-f0-9]{64}\z/D', $image) === 1
+                ? $image
+                : null;
         });
         if ($images->contains(null) || $images->unique()->count() !== 1) {
             return null;
