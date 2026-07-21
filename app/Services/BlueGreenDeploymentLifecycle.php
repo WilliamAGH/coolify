@@ -54,6 +54,7 @@ use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
 use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
 use App\Actions\Shared\ComplexStatusCheck;
+use App\Enums\ApplicationDeploymentExecutionPhase;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
@@ -171,6 +172,16 @@ final class BlueGreenDeploymentLifecycle
         if ($durableState?->phase === BlueGreenDeploymentPhase::IDLE
             && $this->isExactCompletedDrainingRecovery($durableState)) {
             $this->completedDrainingRecovery = true;
+
+            return;
+        }
+        // Activation resumes the exact PREPARING claim created by preparation-only ownership.
+        if ($durableState?->phase === BlueGreenDeploymentPhase::PREPARING
+            && $durableState->operation_deployment_uuid === $this->deployment->deployment_uuid
+            && $this->deployment->execution_phase === ApplicationDeploymentExecutionPhase::Activate) {
+            $this->acquireLifecycleLock();
+            $this->assertNotFencedByDeactivation();
+            $this->initializePreparingActivation($durableState);
 
             return;
         }
@@ -682,6 +693,42 @@ final class BlueGreenDeploymentLifecycle
         }
 
         return true;
+    }
+
+    private function initializePreparingActivation(ApplicationBlueGreenDeployment $state): void
+    {
+        if ($state->operation_deployment_uuid !== $this->deployment->deployment_uuid) {
+            throw new DeploymentException('An unfinished blue-green preparation belongs to a different deployment and cannot be resumed by this queue entry.');
+        }
+        if ((int) $this->deployment->destination_id !== $this->destination->id
+            || (int) $this->deployment->server_id !== $this->server->id
+            || $this->deployment->pull_request_id !== 0
+            || $this->deployment->execution_phase !== ApplicationDeploymentExecutionPhase::Activate) {
+            throw new DeploymentException('The queued activation does not match the durable prepared blue-green destination ownership.');
+        }
+
+        $operation = ReconstructBlueGreenDeploymentRecovery::run($state);
+        if ($operation->wasFinalized
+            || $operation->recoveredPhase !== BlueGreenDeploymentPhase::PREPARING
+            || $operation->deployment->getKey() !== $this->deployment->getKey()) {
+            throw new DeploymentException('The durable blue-green PREPARING state does not reconstruct to this exact activation owner.');
+        }
+
+        $this->claim = $operation->claim;
+        $this->previousActiveColor = $operation->claim->previousActiveColor;
+        $this->legacyContainerName = $operation->claim->legacyContainerName;
+        $this->serverBootId = $operation->claim->serverBootId;
+        $this->destinationState = $operation->currentDestinationState
+            ?? throw new DeploymentException('The durable blue-green PREPARING state has no exact routed destination state.');
+        $this->candidateContainerExpectation = $operation->candidateContainer
+            ?? throw new DeploymentException('The durable blue-green PREPARING state has no candidate container identity.');
+        $this->previousContainerExpectation = $operation->previousContainer;
+        $this->server->privateKey->storeInFileSystem();
+        ReadBlueGreenServerBootIdentity::run($this->server, $operation->claim->serverBootId);
+        $this->assertOperationOwned(BlueGreenDeploymentPhase::PREPARING);
+        $this->deployment->addLogEntry(
+            'Resuming the exact durable blue-green PREPARING claim for activation; preparation ownership is preserved.',
+        );
     }
 
     private function initializeDrainingRecovery(ApplicationBlueGreenDeployment $state): void
