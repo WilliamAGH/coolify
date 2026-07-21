@@ -453,6 +453,25 @@ jobs:
         env:
           PRODUCTION_IMAGE: coolify:application-validation-${{ inputs.source_sha || github.sha }}
         run: tests/Integration/RealtimeImageTest.sh
+      - name: Run production application blue-green deployment contract
+        env:
+          EVIDENCE_PARENT: ${{ runner.temp }}/production-application-blue-green-evidence
+          PRODUCTION_APPLICATION_BLUE_GREEN_EVIDENCE_DIRECTORY: ${{ runner.temp }}/production-application-blue-green-evidence
+          PRODUCTION_IMAGE: coolify:application-validation-${{ inputs.source_sha || github.sha }}
+          TESTING_HOST_IMAGE: coolify-testing-host:application-validation-${{ inputs.source_sha || github.sha }}
+        run: |
+          install -d -m 0700 "$EVIDENCE_PARENT"
+          tests/Integration/ProductionApplicationBlueGreen/run.sh
+      - name: Retain sanitized production application blue-green evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          if-no-files-found: ignore
+          name: production-application-blue-green-${{ inputs.source_sha || github.sha }}
+          path: |
+            ${{ runner.temp }}/production-application-blue-green-evidence/production-application-blue-green.*/shared/**
+            !${{ runner.temp }}/production-application-blue-green-evidence/**/images.tar
+          retention-days: 7
 
   fork-deploy:
     name: Signed fork deployment contract

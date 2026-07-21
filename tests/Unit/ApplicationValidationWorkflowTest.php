@@ -395,6 +395,29 @@ function applicationValidationWorkflowViolations(array $workflow): array
         || ($bundledRuntime['run'] ?? null) !== 'tests/Integration/RealtimeImageTest.sh') {
         $violations[] = 'application validation must execute the bundled Reverb and terminal contract against the exact production image';
     }
+    $productionBlueGreen = collect($testingHostRuntime['steps'] ?? [])
+        ->firstWhere('name', 'Run production application blue-green deployment contract');
+    if (! is_array($productionBlueGreen)
+        || ($productionBlueGreen['env'] ?? null) !== [
+            'EVIDENCE_PARENT' => '${{ runner.temp }}/production-application-blue-green-evidence',
+            'PRODUCTION_APPLICATION_BLUE_GREEN_EVIDENCE_DIRECTORY' => '${{ runner.temp }}/production-application-blue-green-evidence',
+            'PRODUCTION_IMAGE' => 'coolify:application-validation-${{ inputs.source_sha || github.sha }}',
+            'TESTING_HOST_IMAGE' => 'coolify-testing-host:application-validation-${{ inputs.source_sha || github.sha }}',
+        ]
+        || ! str_contains((string) ($productionBlueGreen['run'] ?? ''), 'install -d -m 0700 "$EVIDENCE_PARENT"')
+        || ! str_contains((string) ($productionBlueGreen['run'] ?? ''), 'tests/Integration/ProductionApplicationBlueGreen/run.sh')) {
+        $violations[] = 'application validation must execute the production application blue-green contract against both exact source images';
+    }
+    $productionBlueGreenArtifact = collect($testingHostRuntime['steps'] ?? [])
+        ->firstWhere('name', 'Retain sanitized production application blue-green evidence');
+    if (! is_array($productionBlueGreenArtifact)
+        || ($productionBlueGreenArtifact['if'] ?? null) !== 'always()'
+        || ($productionBlueGreenArtifact['uses'] ?? null) !== 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02'
+        || ($productionBlueGreenArtifact['with']['if-no-files-found'] ?? null) !== 'ignore'
+        || ! str_contains((string) ($productionBlueGreenArtifact['with']['path'] ?? ''), 'production-application-blue-green.*/shared/**')
+        || ! str_contains((string) ($productionBlueGreenArtifact['with']['path'] ?? ''), '!${{ runner.temp }}/production-application-blue-green-evidence/**/images.tar')) {
+        $violations[] = 'application validation must retain sanitized production application blue-green evidence';
+    }
 
     foreach (is_array($jobs) ? $jobs : [] as $job) {
         foreach ($job['steps'] ?? [] as $step) {
@@ -424,6 +447,29 @@ it('fails when Docker daemon configuration ownership is removed from required va
 
     expect(applicationValidationWorkflowViolations($workflow))
         ->toContain('application validation must execute the Docker daemon configuration integration');
+});
+
+it('fails when the production application blue-green runtime owner is removed', function (): void {
+    $workflow = applicationValidationWorkflow();
+    $step = collect($workflow['jobs']['testing-host-runtime']['steps'] ?? [])
+        ->search(fn (array $candidate): bool => ($candidate['name'] ?? null) === 'Run production application blue-green deployment contract');
+    expect($step)->not->toBeFalse();
+    unset($workflow['jobs']['testing-host-runtime']['steps'][$step]);
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('application validation must execute the production application blue-green contract against both exact source images');
+});
+
+it('fails when production application blue-green evidence includes the nested image archive', function (): void {
+    $workflow = applicationValidationWorkflow();
+    $step = collect($workflow['jobs']['testing-host-runtime']['steps'] ?? [])
+        ->search(fn (array $candidate): bool => ($candidate['name'] ?? null) === 'Retain sanitized production application blue-green evidence');
+    expect($step)->not->toBeFalse();
+    $workflow['jobs']['testing-host-runtime']['steps'][$step]['with']['path'] =
+        '${{ runner.temp }}/production-application-blue-green-evidence/**';
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('application validation must retain sanitized production application blue-green evidence');
 });
 
 it('keeps the aggregate contract structurally connected to every selected result', function () {
