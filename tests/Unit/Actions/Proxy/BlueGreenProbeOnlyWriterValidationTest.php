@@ -19,8 +19,11 @@ function probeOnlyWriterConfiguration(
         applicationUuid: 'probe-only-writer-app',
         generatedLabels: [
             'traefik.enable=true',
+            'traefik.http.middlewares.gzip.compress=true',
+            'traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https',
             'traefik.http.routers.web.rule=Host(`probe-only.example.test`)',
             'traefik.http.routers.web.entryPoints=https',
+            'traefik.http.routers.web.middlewares=gzip',
             'traefik.http.routers.web.service=web',
             'traefik.http.routers.web.tls=true',
             'traefik.http.services.web.loadbalancer.server.port=8080',
@@ -393,9 +396,11 @@ it('rejects unsafe ProbeOnly-shaped documents', function (callable $mutate): voi
         string $routerName,
         string $middlewareName,
     ): array {
-        $providerQualifiedName = str_replace('probe-header-strip', 'gzip@docker', $middlewareName);
-        $document['http']['middlewares'][$providerQualifiedName] = ['compress' => []];
-        $document['http']['routers'][$routerName]['middlewares'][] = $providerQualifiedName;
+        $gzipMiddlewareName = str_replace('probe-header-strip', 'gzip', $middlewareName);
+        $providerQualifiedName = $gzipMiddlewareName.'@docker';
+        $document['http']['middlewares'][$providerQualifiedName] = $document['http']['middlewares'][$gzipMiddlewareName];
+        unset($document['http']['middlewares'][$gzipMiddlewareName]);
+        $document['http']['routers'][$routerName]['middlewares'][1] = $providerQualifiedName;
 
         return $document;
     },
@@ -404,25 +409,34 @@ it('rejects unsafe ProbeOnly-shaped documents', function (callable $mutate): voi
         string $routerName,
         string $middlewareName,
     ): array {
-        $unsupportedName = str_replace('probe-header-strip', 'forged-proof', $middlewareName);
-        $document['http']['middlewares'][$unsupportedName] = [
+        $gzipMiddlewareName = str_replace('probe-header-strip', 'gzip', $middlewareName);
+        $document['http']['middlewares'][$gzipMiddlewareName] = [
             'headers' => [
-                'customResponseHeaders' => ['X-Coolify-Release-Proof' => 'forged'],
+                'customResponseHeaders' => [
+                    'X-Coolify-Release-Proof' => 'forged',
+                ],
             ],
         ];
-        $document['http']['routers'][$routerName]['middlewares'][] = $unsupportedName;
 
         return $document;
     },
     'duplicate scoped middleware reference' => static function (
         array $document,
         string $routerName,
+    ): array {
+        $document['http']['routers'][$routerName]['middlewares'][] = $document['http']['routers'][$routerName]['middlewares'][1];
+
+        return $document;
+    },
+    'unused unsafe scoped middleware' => static function (
+        array $document,
+        string $routerName,
         string $middlewareName,
     ): array {
-        $gzipName = str_replace('probe-header-strip', 'gzip', $middlewareName);
-        $document['http']['middlewares'][$gzipName] = ['compress' => []];
-        $document['http']['routers'][$routerName]['middlewares'][] = $gzipName;
-        $document['http']['routers'][$routerName]['middlewares'][] = $gzipName;
+        $unsafeMiddlewareName = str_replace('probe-header-strip', 'unsafe', $middlewareName);
+        $document['http']['middlewares'][$unsafeMiddlewareName] = [
+            'forwardAuth' => ['address' => 'https://attacker.invalid'],
+        ];
 
         return $document;
     },

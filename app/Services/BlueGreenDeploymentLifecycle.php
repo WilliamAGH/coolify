@@ -180,16 +180,6 @@ final class BlueGreenDeploymentLifecycle
 
             return;
         }
-        // Activation resumes the exact PREPARING claim created by preparation-only ownership.
-        if ($durableState?->phase === BlueGreenDeploymentPhase::PREPARING
-            && $durableState->operation_deployment_uuid === $this->deployment->deployment_uuid
-            && $this->deployment->execution_phase === ApplicationDeploymentExecutionPhase::Activate) {
-            $this->acquireLifecycleLock();
-            $this->assertNotFencedByDeactivation();
-            $this->initializePreparingActivation($durableState);
-
-            return;
-        }
         if ($durableState !== null
             && ($durableState->phase !== BlueGreenDeploymentPhase::IDLE
                 || $durableState->operation_deployment_uuid !== null)) {
@@ -363,11 +353,17 @@ final class BlueGreenDeploymentLifecycle
         $this->legacyContainerName = $operation->claim->legacyContainerName;
         $this->legacyRoutingSnapshot = $operation->legacyRoutingSnapshot;
         $this->serverBootId = $operation->claim->serverBootId;
-        $this->destinationState = $operation->currentDestinationState;
         $this->candidateContainerExpectation = $operation->candidateContainer;
         $this->previousContainerExpectation = $operation->previousContainer;
         $this->server->privateKey->storeInFileSystem();
         ReadBlueGreenServerBootIdentity::run($this->server, $operation->claim->serverBootId);
+        $this->destinationState = $operation->currentDestinationState
+            ?? AttestBlueGreenDestinationState::run(
+                $this->server,
+                $this->application,
+                $this->destination,
+                null,
+            );
         $this->loadPreviousRecoveryReplicaInspections($state);
         $this->assertEligibility();
         $this->assertOperationOwned(BlueGreenDeploymentPhase::PREPARING);
@@ -891,52 +887,6 @@ final class BlueGreenDeploymentLifecycle
         return true;
     }
 
-    private function initializePreparingActivation(ApplicationBlueGreenDeployment $state): void
-    {
-        if ($state->operation_deployment_uuid !== $this->deployment->deployment_uuid) {
-            throw new DeploymentException('An unfinished blue-green preparation belongs to a different deployment and cannot be resumed by this queue entry.');
-        }
-        if ((int) $this->deployment->destination_id !== $this->destination->id
-            || (int) $this->deployment->server_id !== $this->server->id
-            || $this->deployment->pull_request_id !== 0
-            || $this->deployment->execution_phase !== ApplicationDeploymentExecutionPhase::Activate) {
-            throw new DeploymentException('The queued activation does not match the durable prepared blue-green destination ownership.');
-        }
-
-        $operation = ReconstructBlueGreenDeploymentRecovery::run($state);
-        if ($operation->wasFinalized
-            || $operation->recoveredPhase !== BlueGreenDeploymentPhase::PREPARING
-            || $operation->deployment->getKey() !== $this->deployment->getKey()) {
-            throw new DeploymentException('The durable blue-green PREPARING state does not reconstruct to this exact activation owner.');
-        }
-
-        $this->claim = $operation->claim;
-        $this->previousActiveColor = $operation->claim->previousActiveColor;
-        $this->legacyContainerName = $operation->claim->legacyContainerName;
-        $this->serverBootId = $operation->claim->serverBootId;
-        $this->candidateContainerExpectation = $operation->candidateContainer
-            ?? throw new DeploymentException('The durable blue-green PREPARING state has no candidate container identity.');
-        $this->previousContainerExpectation = $operation->previousContainer;
-        $this->server->privateKey->storeInFileSystem();
-        ReadBlueGreenServerBootIdentity::run($this->server, $operation->claim->serverBootId);
-        // A null reconstructed state is provably first adoption: no routing mutation
-        // exists yet, so there is no pre-operation destination state to resolve. Attest
-        // the absent-managed-file baseline exactly as the initial claim did (durable state
-        // null), never the PREPARING claim row, whose pending routing revision would read
-        // as an unenrolled routed destination.
-        $this->destinationState = $operation->currentDestinationState
-            ?? AttestBlueGreenDestinationState::run(
-                $this->server,
-                $this->application,
-                $this->destination,
-                null,
-            );
-        $this->assertOperationOwned(BlueGreenDeploymentPhase::PREPARING);
-        $this->deployment->addLogEntry(
-            'Resuming the exact durable blue-green PREPARING claim for activation; preparation ownership is preserved.',
-        );
-    }
-
     private function initializeDrainingRecovery(ApplicationBlueGreenDeployment $state): void
     {
         if ($state->operation_deployment_uuid !== $this->deployment->deployment_uuid) {
@@ -1004,7 +954,6 @@ final class BlueGreenDeploymentLifecycle
     private function loadPreviousRecoveryReplicaInspections(
         ApplicationBlueGreenDeployment $state,
     ): void {
-
         $previous = $this->previousContainerExpectation;
         if ($previous?->deploymentUuid === null || $previous->color === null || $previous->routingRevision === null) {
             return;

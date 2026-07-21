@@ -47,6 +47,7 @@ use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Storage;
+use Symfony\Component\Yaml\Yaml;
 
 uses(RefreshDatabase::class);
 
@@ -413,6 +414,99 @@ it('starts a reconstructed fixed-color routing operation at mutation sequence on
             $operation->rollbackKey->expectedState,
             FIXED_COLOR_CANDIDATE_DEPLOYMENT,
         ))->toBeTrue();
+});
+
+it('hands a fixed-color promotion directly to public failover without publishing a probe-only route', function (): void {
+    config(['constants.ssh.mux_enabled' => false]);
+    $fixture = fixedColorBlueGreenRecoveryFixture(BlueGreenDeploymentPhase::PREPARING);
+    $fence = fixedColorRecoveryFence($fixture);
+    $lifecycle = new BlueGreenDeploymentLifecycle(
+        application: $fixture['application'],
+        deployment: $fixture['deployment'],
+        destination: $fixture['destination'],
+        server: $fixture['server'],
+        timeout: 30,
+        checkForCancellation: static function (): void {},
+    );
+    foreach ([
+        'enabled' => true,
+        'claim' => $fixture['claim'],
+        'destinationState' => $fixture['previousConfiguration']->state,
+        'candidateContainerExpectation' => $fixture['candidateExpectation'],
+        'previousContainerExpectation' => $fixture['previousExpectation'],
+        'operationFence' => $fence,
+    ] as $property => $value) {
+        setFixedColorRecoveryLifecycleProperty($lifecycle, $property, $value);
+    }
+
+    $writtenConfigurations = [];
+    $previousReleaseProof = BlueGreenRoutingTarget::durableReleaseProofToken(FIXED_COLOR_PREVIOUS_DEPLOYMENT);
+    InspectBlueGreenContainer::shouldRun()
+        ->twice()
+        ->andReturn(
+            new BlueGreenContainerInspection(
+                exists: true,
+                dockerId: FIXED_COLOR_PREVIOUS_CONTAINER_ID,
+                status: 'running',
+                health: 'healthy',
+            ),
+            new BlueGreenContainerInspection(
+                exists: true,
+                dockerId: FIXED_COLOR_PREVIOUS_CONTAINER_ID,
+                status: 'running',
+                health: 'healthy',
+            ),
+        );
+    WriteBlueGreenProxyConfiguration::shouldRun()
+        ->once()
+        ->andReturnUsing(function ($server, BlueGreenProxyConfiguration $configuration) use (&$writtenConfigurations): never {
+            $writtenConfigurations[] = $configuration;
+
+            throw new RuntimeException('stop after observing the fixed-color handoff writer');
+        });
+    Process::fake(static function (PendingProcess $process) use ($previousReleaseProof) {
+        $command = (string) $process->command;
+        if (str_contains($command, '/proc/sys/kernel/random/boot_id')) {
+            return Process::result(output: FIXED_COLOR_BOOT_ID);
+        }
+        if (str_contains($command, '{{json .Config}}')) {
+            return Process::result(output: json_encode([
+                'Labels' => [
+                    VerifyBlueGreenCandidateReleaseProof::LABEL => $previousReleaseProof,
+                ],
+                'Env' => [],
+            ], JSON_THROW_ON_ERROR));
+        }
+
+        return Process::result(output: 'destination state was not attested');
+    });
+
+    try {
+        expect(fn () => invokeFixedColorRecoveryLifecycleMethod(
+            $lifecycle,
+            'promoteCandidate',
+            $fixture['claim'],
+        ))->toThrow(RuntimeException::class, 'stop after observing the fixed-color handoff writer');
+    } finally {
+        $fence->releaseIfOwned();
+    }
+
+    expect($writtenConfigurations)->toHaveCount(1);
+    $compiled = Yaml::parse(
+        $writtenConfigurations[0]->yaml,
+        Yaml::PARSE_EXCEPTION_ON_ALIAS | Yaml::PARSE_EXCEPTION_ON_INVALID_TYPE,
+    );
+    $routers = data_get($compiled, 'http.routers');
+    $services = data_get($compiled, 'http.services');
+    $activeService = BlueGreenRoutingTarget::activeServiceName(
+        (string) $fixture['application']->uuid,
+        (int) $fixture['destination']->id,
+    );
+
+    expect($routers)->toBeArray()
+        ->and(array_keys($routers))->each->toEndWith('-public')
+        ->and($services)->toHaveKey($activeService)
+        ->and($services[$activeService])->toHaveKey('failover');
 });
 
 it('drains every immutable predecessor port when the live application dropped a port', function (): void {

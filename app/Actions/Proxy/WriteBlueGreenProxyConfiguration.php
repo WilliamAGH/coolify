@@ -676,7 +676,7 @@ class WriteBlueGreenProxyConfiguration
             }
         }
 
-        return true;
+        return count($routerMiddlewares) === count(array_unique($routerMiddlewares, SORT_STRING));
     }
 
     /** @param array<string, mixed> $middlewares */

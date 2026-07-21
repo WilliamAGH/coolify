@@ -344,7 +344,6 @@ it('uses a private probe only for first or legacy-adoption promotions', function
             $previous,
         ))->toBeTrue();
 });
-
 it('retries only an initial unacknowledged 404 candidate probe route', function (
     string $outcome,
     int $expectedProbeRequests,

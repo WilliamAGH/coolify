@@ -35,6 +35,7 @@ use App\Models\Team;
 use App\Services\BlueGreenDeploymentLifecycle;
 use Illuminate\Database\QueryException;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Process;
@@ -498,6 +499,9 @@ it('binds the durable N=3 identities before refusing partial health after a rest
             'label=coolify.blueGreen.replicaIndex=2',
             'label=coolify.blueGreen.replicaIndex=3',
         )
+        ->and(collect($rollbackCommands)->filter(
+            static fn (string $command): bool => str_starts_with($command, 'docker rm -f '),
+        ))->toHaveCount(3)
         ->and($deployment->fresh()->blue_green_candidate_container_id)->toBeNull();
 });
 
@@ -1007,14 +1011,21 @@ it('reconstructs the exact prepared claim after the activation queue handoff', f
         'execution_phase' => ApplicationDeploymentExecutionPhase::Prepare,
         'only_this_server' => true,
     ]);
-    Process::fake(['*' => Process::sequence([
-        BlueGreenDeactivationScenario::BOOT_ID,
-        'coolify-blue-green-destination-state-attested',
-        '',
-        BlueGreenDeactivationScenario::BOOT_ID,
-        BlueGreenDeactivationScenario::BOOT_ID,
-        BlueGreenDeactivationScenario::BOOT_ID,
-    ])]);
+    Process::fake(function (PendingProcess $process) {
+        $command = is_array($process->command)
+            ? implode(' ', $process->command)
+            : (string) $process->command;
+
+        if (str_contains($command, 'coolify-blue-green-destination-state-attested')) {
+            return Process::result(output: 'coolify-blue-green-destination-state-attested');
+        }
+
+        if (str_contains($command, '/proc/sys/kernel/random/boot_id')) {
+            return Process::result(output: BlueGreenDeactivationScenario::BOOT_ID);
+        }
+
+        return Process::result(output: '');
+    });
     $preparation = new BlueGreenDeploymentLifecycle(
         application: $application,
         deployment: $deployment,
@@ -1050,6 +1061,14 @@ it('reconstructs the exact prepared claim after the activation queue handoff', f
     } finally {
         $activation->release();
     }
+
+    Process::assertRanTimes(function (PendingProcess $process): bool {
+        $command = is_array($process->command)
+            ? implode(' ', $process->command)
+            : (string) $process->command;
+
+        return str_contains($command, 'coolify-blue-green-destination-state-attested');
+    }, 2);
 });
 
 it('reconstructs the exact active three-replica predecessor after the activation queue handoff', function (): void {

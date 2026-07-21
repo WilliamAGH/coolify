@@ -70,6 +70,7 @@ function activeContainerQueue(
 it('uses the exact active fixed-color provenance while idle', function () {
     $fixture = activeContainerResolverFixture('resolver-idle');
     $containerId = str_repeat('a', 64);
+    $actualRoutingDigest = hash('sha256', 'resolver-idle-actual-routing');
     activeContainerQueue($fixture, 'resolver-idle-blue', $containerId, BlueGreenDeploymentColor::BLUE, 3);
     ApplicationBlueGreenDeployment::query()->create([
         'application_id' => $fixture['application']->id,
@@ -79,7 +80,7 @@ it('uses the exact active fixed-color provenance while idle', function () {
         'phase' => BlueGreenDeploymentPhase::IDLE,
         'routing_revision' => 3,
         'destination_topology_digest' => $fixture['topology'],
-        'application_routing_config_digest' => hash('sha256', 'resolver-idle-runtime-route'),
+        'application_routing_config_digest' => $actualRoutingDigest,
     ]);
 
     $resolution = ResolveActiveApplicationContainer::run(collect([$fixture['application']]))->first();
@@ -130,7 +131,8 @@ it('keeps the predecessor observable until the candidate is routed', function (B
 it('uses the routed candidate while draining', function () {
     $fixture = activeContainerResolverFixture('resolver-draining');
     $candidateId = str_repeat('c', 64);
-    $queue = activeContainerQueue(
+    $actualRoutingDigest = hash('sha256', 'resolver-draining-actual-routing');
+    activeContainerQueue(
         $fixture,
         'resolver-candidate-blue',
         $candidateId,
@@ -149,7 +151,7 @@ it('uses the routed candidate while draining', function () {
         'phase' => BlueGreenDeploymentPhase::DRAINING,
         'routing_revision' => 5,
         'destination_topology_digest' => $fixture['topology'],
-        'application_routing_config_digest' => hash('sha256', 'resolver-draining-runtime-route'),
+        'application_routing_config_digest' => $actualRoutingDigest,
     ]);
 
     $resolution = ResolveActiveApplicationContainer::run(collect([$fixture['application']]))->first();
@@ -185,6 +187,7 @@ it('fails closed when a draining queue no longer owns the operation routing clai
     ]);
 
     $resolution = ResolveActiveApplicationContainer::run(collect([$fixture['application']]))->first();
+    $state->phase = BlueGreenDeploymentPhase::SWITCHING;
     $routedResolution = (new ResolveActiveApplicationContainer)->resolveRoutedState(
         $fixture['application'],
         $state,
