@@ -4,9 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🐛 Bug Fixes
+
+- *(control-plane)* Preserve curl route proof markers
+
 ### 📚 Documentation
 
 - Update changelog (#139)
+- Update changelog (#140)
 
 ## [4.13.18-fork] - 2026-07-22
 
