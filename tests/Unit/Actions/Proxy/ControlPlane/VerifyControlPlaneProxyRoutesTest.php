@@ -2,7 +2,11 @@
 
 use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyRouteProof;
+use App\Actions\Proxy\ControlPlane\ControlPlaneRestoredRoutesProof;
 use App\Actions\Proxy\ControlPlane\VerifyControlPlaneProxyRoutes;
+use App\Actions\Proxy\ControlPlane\VerifyControlPlaneRestoredRoutes;
+use Illuminate\Filesystem\Filesystem;
+use Symfony\Component\Process\Process;
 
 function controlPlaneRouteProof(int $maximumAttempts = 5): ControlPlaneProxyRouteProof
 {
@@ -76,6 +80,54 @@ function successfulControlPlaneRouteProofTranscript(ControlPlaneProxyRouteProof 
     return controlPlaneRouteProofTranscript($records, '__COOLIFY_ROUTE_PROOF_CONVERGED__ 2');
 }
 
+/** @param array<string, string> $headers */
+function executeRenderedControlPlaneRouteProof(string $command, array $headers): string
+{
+    $filesystem = new Filesystem;
+    $directory = sys_get_temp_dir().'/coolify-route-proof-'.bin2hex(random_bytes(8));
+    $filesystem->makeDirectory($directory, 0700);
+    $curl = $directory.'/curl';
+    file_put_contents($curl, <<<'SH'
+#!/bin/sh
+set -eu
+write_out=
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = --write-out ]; then
+        shift
+        write_out=$1
+    fi
+    shift
+done
+printf 'HTTP/1.1 200 OK\r\n'
+printf 'X-Coolify-Control-Plane-Color: %s\r\n' "$FAKE_COLOR"
+printf 'X-Coolify-Control-Plane-Generation: %s\r\n' "$FAKE_GENERATION"
+printf 'X-Coolify-Control-Plane-Config-Ack: %s\r\n' "$FAKE_ACK"
+printf 'X-Coolify-Control-Plane-Backend-Member: %s\r\n' "$FAKE_MEMBER"
+printf 'X-Coolify-Control-Plane-Backend-Revision: %s\r\n' "$FAKE_REVISION"
+printf 'X-Coolify-Control-Plane-Dynamic-Sha256: %s\r\n\r\n' "$FAKE_DYNAMIC_SHA"
+formatted=$(printf %s "$write_out" | sed 's/%{http_code}/200/g')
+printf '%b' "$formatted"
+SH);
+    chmod($curl, 0700);
+
+    try {
+        $process = Process::fromShellCommandline($command, null, [
+            'PATH' => $directory.':'.getenv('PATH'),
+            'FAKE_COLOR' => $headers[ControlPlaneDynamicConfiguration::COLOR_HEADER] ?? 'unused',
+            'FAKE_GENERATION' => $headers[ControlPlaneDynamicConfiguration::GENERATION_HEADER] ?? 'unused',
+            'FAKE_ACK' => $headers[ControlPlaneDynamicConfiguration::CONFIGURATION_ACKNOWLEDGEMENT_HEADER] ?? 'unused',
+            'FAKE_MEMBER' => $headers[ControlPlaneProxyRouteProof::BACKEND_MEMBER_HEADER],
+            'FAKE_REVISION' => $headers[ControlPlaneProxyRouteProof::BACKEND_REVISION_HEADER],
+            'FAKE_DYNAMIC_SHA' => $headers[ControlPlaneProxyRouteProof::DYNAMIC_SHA256_HEADER],
+        ]);
+        $process->mustRun();
+
+        return $process->getOutput();
+    } finally {
+        $filesystem->deleteDirectory($directory);
+    }
+}
+
 it('polls both routes without bearer credentials and accepts two exact consecutive rounds', function (): void {
     $proof = controlPlaneRouteProof(maximumAttempts: 4);
     $command = $proof->shellCommand();
@@ -89,6 +141,28 @@ it('polls both routes without bearer credentials and accepts two exact consecuti
         ->and($command)->not->toContain('Authorization')
         ->and($command)->not->toContain('Bearer')
         ->and($command)->not->toContain($proof->configurationAcknowledgement());
+});
+
+it('executes indented active and restored route proofs with unindented curl status records', function (): void {
+    $active = controlPlaneRouteProof(maximumAttempts: 2);
+    $activeTranscript = executeRenderedControlPlaneRouteProof($active->shellCommand(), $active->expectedResponseHeaders());
+
+    $restored = new ControlPlaneRestoredRoutesProof(
+        canonicalHost: 'dashboard.example.test',
+        publicScheme: 'https',
+        appPort: 8000,
+        expectedBackendMember: 'web-a',
+        expectedBackendRevision: 'revision-42',
+        expectedDynamicPredecessorSha256: $active->dynamicReplacementSha256,
+        maximumAttempts: 2,
+        pollIntervalSeconds: 0,
+        connectTimeoutSeconds: 1,
+        requestTimeoutSeconds: 1,
+    );
+    $restoredTranscript = executeRenderedControlPlaneRouteProof($restored->shellCommand(), $restored->expectedResponseHeaders());
+
+    expect(VerifyControlPlaneProxyRoutes::run($active, $activeTranscript))->toBe($active)
+        ->and(VerifyControlPlaneRestoredRoutes::run($restored, $restoredTranscript))->toBe($restored);
 });
 
 it('tolerates a delayed file-provider update before dual-route convergence', function (): void {

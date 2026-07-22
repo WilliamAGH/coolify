@@ -157,7 +157,7 @@ final readonly class ControlPlaneProxyRouteProof
             '--output',
             '/dev/null',
             '--write-out',
-            "\n__COOLIFY_ROUTE_PROOF_STATUS__ %{http_code}\n",
+            '\n__COOLIFY_ROUTE_PROOF_STATUS__ %{http_code}\n',
             '--',
             $url,
         ];
