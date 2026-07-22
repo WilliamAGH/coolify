@@ -103,6 +103,7 @@ docker() {
   case "$subcommand" in
     inspect) printf true ;;
     ps)
+      if [ "$scenario" = ps-failure ]; then return 1; fi
       printf x >> "$counter_file"
       census_round=$(wc -c < "$counter_file")
       printf '%s\n' coolify coolify-proxy
@@ -349,7 +350,7 @@ it('rejects an activating abort on duplicate IPv6 ownership or Docker inspection
         $remoteExecutor,
     ))->toThrow(RuntimeException::class, 'exact legacy runtime ownership')
         ->and($fixture['store']->read($fixture['server'])?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Activating);
-})->with(['duplicate-ipv6', 'second-round-duplicate-ipv6', 'port-failure']);
+})->with(['duplicate-ipv6', 'second-round-duplicate-ipv6', 'port-failure', 'ps-failure']);
 
 it('refuses an abort when any activation artifact exists', function (ControlPlaneProxyEnrollmentPhase $phase, string $artifact): void {
     $fixture = preparedEnrollmentAbortFixture($phase);

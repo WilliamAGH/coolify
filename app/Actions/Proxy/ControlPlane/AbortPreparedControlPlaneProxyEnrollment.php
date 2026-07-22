@@ -169,7 +169,8 @@ final class AbortPreparedControlPlaneProxyEnrollment
             '  [ -z "$proxy_bindings" ]',
             '  owner_count=0',
             '  owner=',
-            '  for candidate in $(docker ps --format '.escapeshellarg('{{.Names}}').'); do',
+            '  candidates=$(docker ps --format '.escapeshellarg('{{.Names}}').')',
+            '  for candidate in $candidates; do',
             '    candidate_ports=$(docker port "$candidate" 2>/dev/null)',
             '    candidate_bindings=$(printf "%s\n" "$candidate_ports" | sed -n '.escapeshellarg('s/^[^ ]* -> //p').')',
             '    if printf "%s\n" "$candidate_bindings" | grep -Fx '.escapeshellarg($expectedBinding).' >/dev/null '
