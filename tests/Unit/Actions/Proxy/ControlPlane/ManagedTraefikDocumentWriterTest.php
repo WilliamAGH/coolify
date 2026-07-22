@@ -436,6 +436,38 @@ it('fails closed for a missing rollback artifact unless pre-write reconciliation
     }
 });
 
+it('validates missing-artifact rollback bytes before installing writer authority', function (): void {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $filesystem->mkdir([$root.'/dynamic', $root.'/state'], 0700);
+        $writer = new ManagedTraefikDocumentWriter;
+        $enrollment = managedTraefikDocumentMutation(
+            $root,
+            'control-plane-enrollment-precondition',
+            1,
+            "http:\n  routers:\n    enrollment: {}\n",
+        );
+        $replacementAuthority = managedTraefikDocumentWriterAuthority($enrollment, epoch: 1);
+        $rolledBackAuthority = managedTraefikDocumentEnrollmentRollbackAuthority($enrollment, $replacementAuthority);
+        $foreignDocument = "http:\n  routers:\n    foreign: {}\n";
+        file_put_contents($enrollment->documentPath(), $foreignDocument);
+
+        $result = runManagedTraefikDocumentCommand($writer->rollbackEnrollmentCommandFor(
+            $enrollment,
+            $replacementAuthority,
+            $rolledBackAuthority,
+        ));
+
+        expect($result->isSuccessful())->toBeFalse()
+            ->and(file_get_contents($enrollment->documentPath()))->toBe($foreignDocument)
+            ->and(file_exists($enrollment->writerAuthorityPath()))->toBeFalse();
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
 it('fails closed when a managed document path is a symlink', function () {
     $filesystem = new Filesystem;
     $root = managedTraefikDocumentRoot();

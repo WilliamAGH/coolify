@@ -32,6 +32,7 @@ use App\Models\Team;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Process\FakeProcessResult;
 use Illuminate\Process\PendingProcess;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Storage;
 
@@ -278,4 +279,71 @@ YAML;
     );
 
     expect($timeouts)->toBe([120, 30, 30]);
+});
+
+it('holds the enrollment operation fence through reconciliation and replacement reservation', function (): void {
+    if (DB::getDriverName() !== 'pgsql') {
+        $this->markTestSkipped('PostgreSQL is required for the enrollment serialization assertion.');
+    }
+    $server = Server::factory()->create([
+        'id' => 0,
+        'team_id' => Team::factory()->create()->id,
+        'ip' => 'host.docker.internal',
+    ]);
+    $server->proxy->set('type', ProxyTypes::TRAEFIK->value);
+    $server->proxy->set('last_saved_proxy_configuration', generateDefaultProxyConfiguration($server, save: false));
+    $server->proxy->set(
+        StoreControlPlaneProxyEnrollmentState::STATE_KEY,
+        hostRolledBackEnrollmentState($server)->toArray(),
+    );
+    $server->save();
+    $store = new StoreControlPlaneProxyEnrollmentState;
+    $connectionName = 'host_enrollment_lock_competitor';
+    config()->set("database.connections.{$connectionName}", config('database.connections.'.DB::getDefaultConnection()));
+    $competitor = DB::connection($connectionName);
+    $lockName = StoreControlPlaneProxyEnrollmentState::operationLockName($server->getKey());
+    $sourceCompose = "services:\n  coolify:\n    image: coolify:test\n";
+    $competingLockResult = null;
+
+    try {
+        hostPreparedEnrollmentAction($store)->handle(
+            server: $server,
+            operationId: 'serialized-replacement-enrollment',
+            token: 'serialized-replacement-token',
+            appPort: 8000,
+            exposure: ControlPlaneProxyExposure::Public,
+            activeBackendDnsNames: ['coolify-new'],
+            host: 'new.example.test',
+            expectedRevision: 'new-revision',
+            expectedMember: 'blue',
+            remoteExecutor: function (string $command) use ($competitor, $lockName, $sourceCompose, &$competingLockResult): string {
+                if ($competingLockResult === null) {
+                    $competingLockResult = $competitor->selectOne(
+                        'select case when pg_try_advisory_lock(hashtextextended(?, 0)) then 1 else 0 end as acquired',
+                        [$lockName],
+                        false,
+                    );
+                }
+
+                return match (true) {
+                    str_contains($command, ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_PENDING_OUTPUT) => ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT,
+                    str_starts_with($command, 'cat -- ') => $sourceCompose,
+                    str_contains($command, '__COOLIFY_CONTROL_PLANE_ARTIFACT_') => "__COOLIFY_CONTROL_PLANE_ARTIFACT_ABSENT__\n",
+                    default => throw new RuntimeException("Unexpected remote command: {$command}"),
+                };
+            },
+        );
+
+        expect((int) $competingLockResult?->acquired)->toBe(0);
+        $released = $competitor->selectOne(
+            'select case when pg_try_advisory_lock(hashtextextended(?, 0)) then 1 else 0 end as acquired',
+            [$lockName],
+            false,
+        );
+        expect((int) $released->acquired)->toBe(1);
+        $competitor->selectOne('select pg_advisory_unlock(hashtextextended(?, 0))', [$lockName], false);
+    } finally {
+        DB::purge($connectionName);
+        config()->set("database.connections.{$connectionName}", null);
+    }
 });
