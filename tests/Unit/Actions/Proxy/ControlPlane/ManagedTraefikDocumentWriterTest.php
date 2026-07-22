@@ -510,7 +510,9 @@ it('bootstraps the exact enrollment predecessor during the initial generation sw
         );
         $authority = managedTraefikDocumentWriterAuthority($enrollment, epoch: 1);
 
-        expect(runManagedTraefikDocumentCommand($writer->writeCommandFor($enrollment))->isSuccessful())->toBeTrue();
+        expect(runManagedTraefikDocumentCommand($writer->writeCommandFor($enrollment))->isSuccessful())->toBeTrue()
+            ->and(file_get_contents($enrollment->rollbackArtifactPath()))
+            ->toBe($writer->rollbackArtifactFor($enrollment, null));
 
         $written = runManagedTraefikDocumentCommand(
             $writer->writeCommandForRequiringAuthority($mutation, $authority, allowBootstrap: true),
@@ -765,7 +767,9 @@ it('finalizes an exact initial enrollment rollback by restoring the pre-enrollme
         $replacementAuthority = managedTraefikDocumentWriterAuthority($enrollment, epoch: 1);
         $rolledBackAuthority = managedTraefikDocumentEnrollmentRollbackAuthority($enrollment, $replacementAuthority);
 
-        expect(runManagedTraefikDocumentCommand($writer->writeCommandFor($enrollment))->isSuccessful())->toBeTrue();
+        expect(runManagedTraefikDocumentCommand($writer->writeCommandFor($enrollment))->isSuccessful())->toBeTrue()
+            ->and(file_get_contents($enrollment->rollbackArtifactPath()))
+            ->toBe($writer->rollbackArtifactFor($enrollment, null));
         file_put_contents($enrollment->writerAuthorityPath(), $replacementAuthority->toJson());
         expect(runManagedTraefikDocumentCommand($writer->rollbackEnrollmentCommandFor(
             $enrollment,
@@ -784,6 +788,51 @@ it('finalizes an exact initial enrollment rollback by restoring the pre-enrollme
             ->and(file_exists($enrollment->writerAuthorityPath()))->toBeFalse()
             ->and(file_exists($enrollment->rollbackArtifactPath()))->toBeFalse()
             ->and(file_exists($enrollment->lockPath()))->toBeFalse()
+            ->and(file_exists($enrollment->stateDirectory))->toBeFalse();
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('recovers an interrupted initial enrollment with a visible sidecar and rollback artifact', function (): void {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $enrollment = managedTraefikDocumentMutation(
+            $root,
+            'interrupted-control-plane-enrollment',
+            1,
+            "http:\n  routers:\n    enrollment: {}\n",
+        );
+        $replacementAuthority = managedTraefikDocumentWriterAuthority($enrollment, epoch: 1);
+        $rolledBackAuthority = managedTraefikDocumentEnrollmentRollbackAuthority($enrollment, $replacementAuthority);
+
+        expect(runManagedTraefikDocumentCommand($writer->writeCommandFor($enrollment))->isSuccessful())->toBeTrue()
+            ->and(file_get_contents($enrollment->rollbackArtifactPath()))
+            ->toBe($writer->rollbackArtifactFor($enrollment, null));
+        unlink($enrollment->documentPath());
+        $scratch = $enrollment->stateDirectory.'/.managed-traefik-document.interrupted';
+        $filesystem->mkdir($scratch, 0700);
+        file_put_contents($scratch.'/expected-sidecar', '');
+
+        $rolledBack = runManagedTraefikDocumentCommand($writer->rollbackEnrollmentCommandFor(
+            $enrollment,
+            $replacementAuthority,
+            $rolledBackAuthority,
+        ));
+        $finalized = runManagedTraefikDocumentCommand(
+            $writer->finalizeEnrollmentRollbackCommandFor($enrollment, $rolledBackAuthority),
+        );
+
+        expect($rolledBack->isSuccessful())->toBeTrue($rolledBack->getErrorOutput())
+            ->and(trim($rolledBack->getOutput()))->toBe(ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT)
+            ->and($finalized->isSuccessful())->toBeTrue($finalized->getErrorOutput())
+            ->and(trim($finalized->getOutput()))->toBe(ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT)
+            ->and(file_exists($enrollment->documentPath()))->toBeFalse()
+            ->and(file_exists($enrollment->sidecarPath()))->toBeFalse()
+            ->and(file_exists($enrollment->rollbackArtifactPath()))->toBeFalse()
             ->and(file_exists($enrollment->stateDirectory))->toBeFalse();
     } finally {
         $filesystem->remove($root);

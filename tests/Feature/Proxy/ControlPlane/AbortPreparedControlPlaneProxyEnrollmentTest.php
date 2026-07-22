@@ -5,6 +5,8 @@ use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentPhase;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentState;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyExposure;
+use App\Actions\Proxy\ControlPlane\ManagedTraefikDocumentMutation;
+use App\Actions\Proxy\ControlPlane\ManagedTraefikDocumentWriter;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
 use App\Models\Server;
 use App\Models\Team;
@@ -302,8 +304,23 @@ it('aborts an activating enrollment after its host artifacts rolled back exactly
     $fixture = preparedEnrollmentAbortFixture(ControlPlaneProxyEnrollmentPhase::Activating);
     $this->preparedAbortRoot = $fixture['root'];
     (new Filesystem)->makeDirectory($fixture['proxy'].'/.control-plane-managed-traefik', 0700);
-    file_put_contents($fixture['proxy'].'/.control-plane-managed-traefik/.coolify.yaml.lock', '');
-    file_put_contents($fixture['proxy'].'/.control-plane-managed-traefik/.coolify.yaml.state.json', "{}\n");
+    $mutation = new ManagedTraefikDocumentMutation(
+        dynamicDirectory: $fixture['proxy'].'/dynamic',
+        stateDirectory: $fixture['proxy'].'/.control-plane-managed-traefik',
+        filename: $fixture['state']->managedFilename,
+        operationId: $fixture['state']->operationId,
+        revision: $fixture['state']->dynamicRevision,
+        expectedSha256: null,
+        expectedOperationId: null,
+        expectedRevision: null,
+        replacementBytes: $fixture['state']->dynamicReplacementBytes,
+    );
+    file_put_contents($mutation->lockPath(), '');
+    file_put_contents($mutation->sidecarPath(), $mutation->replacementSidecar());
+    file_put_contents(
+        $mutation->rollbackArtifactPath(),
+        (new ManagedTraefikDocumentWriter)->rollbackArtifactFor($mutation, null),
+    );
     $artifactExecutor = $fixture['remote'];
     $commands = [];
     $fixture['server']->proxy->set('last_saved_settings', md5(base64_encode($fixture['state']->staticReplacementBytes)));
@@ -319,9 +336,28 @@ it('aborts an activating enrollment after its host artifacts rolled back exactly
         $remoteExecutor,
     )->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack)
         ->and($fixture['store']->read($fixture['server'])?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack)
-        ->and($commands)->toHaveCount(5)
+        ->and($commands)->toHaveCount(7)
         ->and($fixture['server']->fresh()?->proxy->get('last_saved_proxy_configuration'))->toBe($fixture['state']->staticPredecessorBytes)
         ->and($fixture['server']->fresh()?->proxy->get('last_saved_settings'))->toBe(md5(base64_encode($fixture['state']->staticPredecessorBytes)));
+});
+
+it('keeps an activating owner when a visible sidecar has no matching rollback artifact', function (): void {
+    $fixture = preparedEnrollmentAbortFixture(ControlPlaneProxyEnrollmentPhase::Activating);
+    $this->preparedAbortRoot = $fixture['root'];
+    (new Filesystem)->makeDirectory($fixture['proxy'].'/.control-plane-managed-traefik', 0700);
+    file_put_contents($fixture['proxy'].'/.control-plane-managed-traefik/.coolify.yaml.lock', '');
+    file_put_contents($fixture['proxy'].'/.control-plane-managed-traefik/.coolify.yaml.state.json', "{}\n");
+    $commands = [];
+    $remoteExecutor = preparedEnrollmentRuntimeExecutor($fixture['remote'], 'valid', $commands);
+
+    expect(fn () => $fixture['action']->handle(
+        $fixture['server'],
+        'stale-prepared-enrollment',
+        'wrong.example.test',
+        'old-revision',
+        $remoteExecutor,
+    ))->toThrow(RuntimeException::class, 'absent or regular directory')
+        ->and($fixture['store']->read($fixture['server'])?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Activating);
 });
 
 it('keeps an activating owner unless exact legacy runtime ownership is proved', function (?string $evidence): void {

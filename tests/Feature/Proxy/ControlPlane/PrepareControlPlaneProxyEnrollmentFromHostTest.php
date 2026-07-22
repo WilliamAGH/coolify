@@ -303,10 +303,10 @@ it('holds the enrollment operation fence through reconciliation and replacement 
     $competitor = DB::connection($connectionName);
     $lockName = StoreControlPlaneProxyEnrollmentState::operationLockName($server->getKey());
     $sourceCompose = "services:\n  coolify:\n    image: coolify:test\n";
-    $competingLockResult = null;
+    $competingLockResults = [];
 
     try {
-        hostPreparedEnrollmentAction($store)->handle(
+        expect(fn () => hostPreparedEnrollmentAction($store)->handle(
             server: $server,
             operationId: 'serialized-replacement-enrollment',
             token: 'serialized-replacement-token',
@@ -316,25 +316,27 @@ it('holds the enrollment operation fence through reconciliation and replacement 
             host: 'new.example.test',
             expectedRevision: 'new-revision',
             expectedMember: 'blue',
-            remoteExecutor: function (string $command) use ($competitor, $lockName, $sourceCompose, &$competingLockResult): string {
-                if ($competingLockResult === null) {
-                    $competingLockResult = $competitor->selectOne(
-                        'select case when pg_try_advisory_lock(hashtextextended(?, 0)) then 1 else 0 end as acquired',
-                        [$lockName],
-                        false,
-                    );
-                }
+            submitActivation: true,
+            remoteExecutor: function (string $command) use ($competitor, $lockName, $sourceCompose, &$competingLockResults): string {
+                $result = $competitor->selectOne(
+                    'select case when pg_try_advisory_lock(hashtextextended(?, 0)) then 1 else 0 end as acquired',
+                    [$lockName],
+                    false,
+                );
+                $competingLockResults[] = (int) $result->acquired;
 
                 return match (true) {
                     str_contains($command, ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_PENDING_OUTPUT) => ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT,
                     str_starts_with($command, 'cat -- ') => $sourceCompose,
                     str_contains($command, '__COOLIFY_CONTROL_PLANE_ARTIFACT_') => "__COOLIFY_CONTROL_PLANE_ARTIFACT_ABSENT__\n",
+                    str_contains($command, NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT) => throw new RuntimeException('nested activation reached'),
                     default => throw new RuntimeException("Unexpected remote command: {$command}"),
                 };
             },
-        );
+        ))->toThrow(RuntimeException::class, 'nested activation reached');
 
-        expect((int) $competingLockResult?->acquired)->toBe(0);
+        expect($competingLockResults)->not->toBeEmpty()
+            ->each->toBe(0);
         $released = $competitor->selectOne(
             'select case when pg_try_advisory_lock(hashtextextended(?, 0)) then 1 else 0 end as acquired',
             [$lockName],

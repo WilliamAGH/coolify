@@ -132,7 +132,7 @@ it('reconciles an absent prepared-style writer state through the missing-artifac
     expect($commands)->toHaveCount(6)
         ->and($normalizationIndex)->toBeInt()
         ->and($authorityInspectionIndex)->toBeInt()
-        ->and($normalizationIndex)->toBeLessThan($authorityInspectionIndex)
+        ->and($authorityInspectionIndex)->toBeLessThan($normalizationIndex)
         ->and($writerInspectionCommand)->toContain("expected_container_name='coolify-web-first'")
         ->and($rollbackCommand)->toContain("allow_missing_artifact_noop='true'")
         ->and($rollbackCommand)->toContain("allow_authority_absence='true'")
@@ -198,7 +198,6 @@ it('rejects a foreign writer authority before it mutates the rollback tombstone'
 
                 return match (true) {
                     str_contains($command, ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_PENDING_OUTPUT) => ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_PENDING_OUTPUT,
-                    str_contains($command, NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT) => NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT,
                     str_contains($command, InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_BEGIN) => reconciledRolledBackAuthorityTranscript($foreignAuthority),
                     default => throw new RuntimeException("Foreign authority was mutated: {$command}"),
                 };
@@ -206,7 +205,7 @@ it('rejects a foreign writer authority before it mutates the rollback tombstone'
         );
     })->toThrow(RuntimeException::class, 'not owned by this exact rollback');
 
-    expect($remoteCalls)->toBe(3)
+    expect($remoteCalls)->toBe(2)
         ->and($store->read($server)?->toArray())->toBe($state->toArray());
 });
 

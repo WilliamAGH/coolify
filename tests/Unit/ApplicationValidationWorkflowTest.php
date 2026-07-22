@@ -348,6 +348,7 @@ function applicationValidationWorkflowViolations(array $workflow): array
         'tests/Feature/BlueGreenSupersessionGenerationTest.php',
         'tests/Feature/LegacyProxyMutationPayloadAdoptionTest.php',
         'tests/Feature/PostgresUserDeletionConcurrencyTest.php',
+        'tests/Feature/Proxy/ControlPlane/PrepareControlPlaneProxyEnrollmentFromHostTest.php',
         'tests/Feature/ProxyMutationQueueGateTest.php',
         'tests/Feature/QueueApplicationDeploymentCommitTest.php',
         'tests/Unit/ApplicationDeploymentActivationOrderTest.php',
@@ -594,6 +595,7 @@ it('fails when an exact blue-green regression owner is removed from required val
     'replica identity' => 'tests/Feature/BlueGreenReplicaLifecycleTest.php',
     'application privileged transport' => 'tests/Unit/Actions/Application/BlueGreen/BlueGreenNonRootRemoteExecutionTest.php',
     'proxy privileged transport' => 'tests/Unit/Actions/Proxy/BlueGreenNonRootRemoteExecutionTest.php',
+    'control-plane enrollment serialization' => 'tests/Feature/Proxy/ControlPlane/PrepareControlPlaneProxyEnrollmentFromHostTest.php',
 ]);
 
 it('fails when production application blue-green evidence bypasses the sanitized export tree', function (): void {

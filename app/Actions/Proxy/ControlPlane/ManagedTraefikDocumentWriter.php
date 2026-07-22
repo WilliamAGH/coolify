@@ -26,6 +26,29 @@ final class ManagedTraefikDocumentWriter
 
     private const JOURNAL_MAGIC = 'coolify-managed-traefik-document-journal-v1';
 
+    public function rollbackArtifactFor(
+        ManagedTraefikDocumentMutation $mutation,
+        ?string $predecessorBytes,
+    ): string {
+        if (($predecessorBytes === null) !== ($mutation->expectedSha256 === null)
+            || ($predecessorBytes !== null
+                && ! hash_equals($mutation->expectedSha256 ?? '', hash('sha256', $predecessorBytes)))) {
+            throw new InvalidArgumentException('The managed Traefik rollback artifact predecessor does not match its mutation.');
+        }
+
+        return implode("\n", [
+            self::ARTIFACT_MAGIC,
+            $mutation->filename,
+            $mutation->operationId,
+            (string) $mutation->revision,
+            $mutation->expectedSha256 ?? 'absent',
+            $mutation->replacementSha256(),
+            $mutation->expectedSidecar() === null ? 'absent' : base64_encode($mutation->expectedSidecar()),
+            $predecessorBytes === null ? 'absent' : base64_encode($predecessorBytes),
+            '',
+        ]);
+    }
+
     public function writeCommandFor(ManagedTraefikDocumentMutation $mutation): string
     {
         return $this->commandFor($mutation, false);
@@ -557,15 +580,15 @@ final class ManagedTraefikDocumentWriter
             '  test "${document_checksum%% *}" = "$expected_checksum"',
             '}',
             'sidecar_matches() {',
-            '  sidecar_candidate=$1',
-            '  expected_sidecar_base64=$2',
-            '  expected_sidecar_file=$3',
-            '  if [ "$expected_sidecar_base64" = absent ]; then',
-            '    test ! -e "$sidecar_candidate" && test ! -L "$sidecar_candidate"',
+            '  sidecar_candidate_path=$1',
+            '  sidecar_expected_base64=$2',
+            '  sidecar_expected_file=$3',
+            '  if [ "$sidecar_expected_base64" = absent ]; then',
+            '    test ! -e "$sidecar_candidate_path" && test ! -L "$sidecar_candidate_path"',
             '    return',
             '  fi',
-            '  if [ ! -e "$sidecar_candidate" ] || [ -L "$sidecar_candidate" ] || [ ! -f "$sidecar_candidate" ]; then return 1; fi',
-            '  cmp -s "$sidecar_candidate" "$expected_sidecar_file"',
+            '  if [ ! -e "$sidecar_candidate_path" ] || [ -L "$sidecar_candidate_path" ] || [ ! -f "$sidecar_candidate_path" ]; then return 1; fi',
+            '  cmp -s "$sidecar_candidate_path" "$sidecar_expected_file"',
             '}',
             'authority_matches() {',
             '  authority_candidate=$1',
@@ -878,6 +901,13 @@ final class ManagedTraefikDocumentWriter
             '  if [ "$mode" = write ]; then validate_artifact; fi',
             '  authorize_writer',
             '  crash_after_authority_if_requested',
+            'elif [ "$mode" = rollback ] && document_matches "$document_path" "$replacement_document_sha" && sidecar_matches "$sidecar_path" "$expected_sidecar_base64" "$expected_sidecar_file"; then',
+            '  validate_artifact',
+            '  authorize_writer',
+            '  crash_after_authority_if_requested',
+            '  write_journal',
+            '  crash_after_journal_if_requested',
+            '  apply_journal',
             'elif document_matches "$document_path" "$expected_document_sha" && sidecar_matches "$sidecar_path" "$expected_sidecar_base64" "$expected_sidecar_file"; then',
             '  if [ "$mode" = write ] && { [ -e "$artifact_path" ] || [ -L "$artifact_path" ]; }; then validate_artifact; fi',
             '  authorize_writer',

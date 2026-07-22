@@ -59,12 +59,6 @@ final class ReconcileRolledBackControlPlaneProxyEnrollment
             'dynamic Traefik document rollback finalization inspection',
         );
 
-        $this->assertExactOutput(
-            $execute($this->filesystemNormalizer->commandFor($proxyPath)),
-            NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT,
-            'control-plane enrollment filesystem normalization',
-        );
-
         $authorityTranscript = $execute($this->writerAuthorityInspector->commandFor($mutation));
         if (! is_string($authorityTranscript)) {
             throw new RuntimeException('The control-plane enrollment writer authority inspection returned no transcript.');
@@ -86,6 +80,12 @@ final class ReconcileRolledBackControlPlaneProxyEnrollment
             && ! hash_equals($existingAuthority->toJson(), $rolledBackAuthority->toJson())) {
             throw new RuntimeException('The control-plane enrollment writer authority is not owned by this exact rollback.');
         }
+
+        $this->assertExactOutput(
+            $execute($this->filesystemNormalizer->commandFor($proxyPath)),
+            NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT,
+            'control-plane enrollment filesystem normalization',
+        );
 
         if ($requiresRollback) {
             $this->assertExactOutput(

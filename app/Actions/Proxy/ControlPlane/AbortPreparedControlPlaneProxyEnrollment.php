@@ -133,7 +133,14 @@ final class AbortPreparedControlPlaneProxyEnrollment
         $this->assertExactRegularFile($execute, $proxyPath.'/docker-compose.yml', $state->staticPredecessorBytes);
         $this->assertAbsent($execute, $sourceDirectory.'/docker-compose.control-plane-listener.yml');
         if ($state->phase === ControlPlaneProxyEnrollmentPhase::Activating) {
-            $this->assertAbsentOrRegularDirectory($execute, $proxyPath.'/.control-plane-managed-traefik');
+            $hasManagedState = $this->assertAbsentOrRecoverableDirectory(
+                $execute,
+                $proxyPath.'/.control-plane-managed-traefik',
+                $state,
+            );
+            if ($hasManagedState) {
+                $this->assertRecoverableManagedState($execute, $proxyPath, $state);
+            }
         } else {
             $this->assertAbsentOrEmptyDirectory($execute, $proxyPath.'/.control-plane-managed-traefik');
         }
@@ -232,9 +239,16 @@ final class AbortPreparedControlPlaneProxyEnrollment
         }
     }
 
-    private function assertAbsentOrRegularDirectory(Closure $execute, string $path): void
-    {
+    private function assertAbsentOrRecoverableDirectory(
+        Closure $execute,
+        string $path,
+        ControlPlaneProxyEnrollmentState $state,
+    ): bool {
         $pathArgument = escapeshellarg($path);
+        $sidecarPath = escapeshellarg($path.'/.'.$state->managedFilename.'.state.json');
+        $artifactPath = escapeshellarg(
+            $path.'/.'.$state->managedFilename.'.'.$state->operationId.'.r'.$state->dynamicRevision.'.rollback',
+        );
         $output = $execute(
             'if [ ! -e '.$pathArgument.' ] && [ ! -L '.$pathArgument.' ]; then '
             .'printf '.escapeshellarg(self::ABSENT_ARTIFACT."\n").'; '
@@ -247,6 +261,13 @@ final class AbortPreparedControlPlaneProxyEnrollment
             .'other_permissions=${permissions#"${permissions%?}"}; owner_group_permissions=${permissions%?}; '
             .'group_permissions=${owner_group_permissions#"${owner_group_permissions%?}"}; '
             .'case "${group_permissions}${other_permissions}" in *[2367]*) exit 1 ;; esac; '
+            .'if [ -e '.$sidecarPath.' ] || [ -L '.$sidecarPath.' ]; then '
+            .'[ -f '.$sidecarPath.' ] && [ ! -L '.$sidecarPath.' ] || exit 1; '
+            .'[ -f '.$artifactPath.' ] && [ ! -L '.$artifactPath.' ] || exit 1; '
+            .'sidecar_links=$(if stat -c "%h" '.$sidecarPath.' >/dev/null 2>&1; then stat -c "%h" '.$sidecarPath.'; else stat -f "%l" '.$sidecarPath.'; fi) || exit 1; '
+            .'artifact_links=$(if stat -c "%h" '.$artifactPath.' >/dev/null 2>&1; then stat -c "%h" '.$artifactPath.'; else stat -f "%l" '.$artifactPath.'; fi) || exit 1; '
+            .'[ "$sidecar_links" = 1 ] && [ "$artifact_links" = 1 ] || exit 1; '
+            .'fi; '
             .'printf '.escapeshellarg(self::REGULAR_ARTIFACT_DIRECTORY."\n").'; '
             .'else exit 1; fi',
         );
@@ -257,6 +278,41 @@ final class AbortPreparedControlPlaneProxyEnrollment
             self::REGULAR_ARTIFACT_DIRECTORY."\n",
         ], true)) {
             throw new RuntimeException("Prepared control-plane enrollment artifact is not an absent or regular directory: {$path}");
+        }
+
+        return in_array($output, [
+            self::REGULAR_ARTIFACT_DIRECTORY,
+            self::REGULAR_ARTIFACT_DIRECTORY."\n",
+        ], true);
+    }
+
+    private function assertRecoverableManagedState(
+        Closure $execute,
+        string $proxyPath,
+        ControlPlaneProxyEnrollmentState $state,
+    ): void {
+        $mutation = new ManagedTraefikDocumentMutation(
+            dynamicDirectory: $proxyPath.'/dynamic',
+            stateDirectory: $proxyPath.'/.control-plane-managed-traefik',
+            filename: $state->managedFilename,
+            operationId: $state->operationId,
+            revision: $state->dynamicRevision,
+            expectedSha256: $state->dynamicPredecessorBytes === null
+                ? null
+                : hash('sha256', $state->dynamicPredecessorBytes),
+            expectedOperationId: null,
+            expectedRevision: null,
+            replacementBytes: $state->dynamicReplacementBytes,
+        );
+        $sidecar = $this->readArtifact($execute, $mutation->sidecarPath());
+        $artifact = $this->readArtifact($execute, $mutation->rollbackArtifactPath());
+        if (($sidecar !== null && ! hash_equals($mutation->replacementSidecar(), $sidecar))
+            || ($sidecar !== null && $artifact === null)
+            || ($artifact !== null && ! hash_equals(
+                (new ManagedTraefikDocumentWriter)->rollbackArtifactFor($mutation, $state->dynamicPredecessorBytes),
+                $artifact,
+            ))) {
+            throw new RuntimeException('The activating control-plane enrollment has no exact recoverable dynamic state.');
         }
     }
 
