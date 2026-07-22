@@ -344,6 +344,24 @@ it('keeps an activating owner unless exact legacy runtime ownership is proved', 
         ->and($fixture['store']->read($fixture['server'])?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Activating);
 })->with(['malformed', null]);
 
+it('rejects an activating abort when the managed state directory is writable by another principal', function (): void {
+    $fixture = preparedEnrollmentAbortFixture(ControlPlaneProxyEnrollmentPhase::Activating);
+    $this->preparedAbortRoot = $fixture['root'];
+    (new Filesystem)->makeDirectory($fixture['proxy'].'/.control-plane-managed-traefik', 0777);
+    chmod($fixture['proxy'].'/.control-plane-managed-traefik', 0777);
+    $commands = [];
+    $remoteExecutor = preparedEnrollmentRuntimeExecutor($fixture['remote'], 'valid', $commands);
+
+    expect(fn () => $fixture['action']->handle(
+        $fixture['server'],
+        'stale-prepared-enrollment',
+        'wrong.example.test',
+        'old-revision',
+        $remoteExecutor,
+    ))->toThrow(RuntimeException::class, 'absent or regular directory')
+        ->and($fixture['store']->read($fixture['server'])?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Activating);
+});
+
 it('rejects an activating abort on duplicate IPv6 ownership or Docker inspection failure', function (string $scenario): void {
     $fixture = preparedEnrollmentAbortFixture(ControlPlaneProxyEnrollmentPhase::Activating);
     $this->preparedAbortRoot = $fixture['root'];

@@ -239,6 +239,14 @@ final class AbortPreparedControlPlaneProxyEnrollment
             'if [ ! -e '.$pathArgument.' ] && [ ! -L '.$pathArgument.' ]; then '
             .'printf '.escapeshellarg(self::ABSENT_ARTIFACT."\n").'; '
             .'elif [ -d '.$pathArgument.' ] && [ ! -L '.$pathArgument.' ]; then '
+            .'owner_uid=$(if stat -c "%u" '.$pathArgument.' >/dev/null 2>&1; then stat -c "%u" '.$pathArgument.'; else stat -f "%u" '.$pathArgument.'; fi) || exit 1; '
+            .'[ "$owner_uid" = 0 ] || [ "$owner_uid" = 9999 ] || [ "$owner_uid" = "$(id -u)" ] || exit 1; '
+            .'permissions=$(if stat -c "%a" '.$pathArgument.' >/dev/null 2>&1; then stat -c "%a" '.$pathArgument.'; else stat -f "%Lp" '.$pathArgument.'; fi) || exit 1; '
+            .'case "$permissions" in ???|????) ;; *) exit 1 ;; esac; '
+            .'case "$permissions" in *[!0-7]*) exit 1 ;; esac; '
+            .'other_permissions=${permissions#"${permissions%?}"}; owner_group_permissions=${permissions%?}; '
+            .'group_permissions=${owner_group_permissions#"${owner_group_permissions%?}"}; '
+            .'case "${group_permissions}${other_permissions}" in *[2367]*) exit 1 ;; esac; '
             .'printf '.escapeshellarg(self::REGULAR_ARTIFACT_DIRECTORY."\n").'; '
             .'else exit 1; fi',
         );
