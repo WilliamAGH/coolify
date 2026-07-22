@@ -2810,17 +2810,36 @@ it('defines one referrerless fork release graph for the main image on both platf
         ->toContain('indexes = [index]')
         ->toContain("indexes.append(json.load(source.extractfile(f'blobs/sha256/{nested_digest}')))");
 
-    foreach ([
-        'Generate standalone fork SPDX SBOM',
-        'Scan fork OCI for high and critical vulnerabilities',
-        'Scan fork OCI for secrets',
-    ] as $scanStepName) {
-        $scanStep = releaseWorkflowStep($jobs['fork-build'] ?? [], $scanStepName);
-        expect(json_encode($scanStep, JSON_THROW_ON_ERROR))->toContain('-fork-runtime');
-    }
+    $forkSbomScan = releaseWorkflowStep($jobs['fork-build'] ?? [], 'Generate standalone fork SPDX SBOM');
+    expect($forkSbomScan['with']['image'] ?? null)
+        ->toBe('docker:local/${{ matrix.artifact_name }}:${{ github.sha }}-${{ matrix.arch }}-fork-runtime');
+
+    $forkVulnerabilityScan = releaseWorkflowStep($jobs['fork-build'] ?? [], 'Scan fork OCI for high and critical vulnerabilities');
+    expect($forkVulnerabilityScan['with']['image'] ?? null)
+        ->toBe('docker:local/${{ matrix.artifact_name }}:${{ github.sha }}-${{ matrix.arch }}-fork-runtime');
+
     $secretScan = releaseWorkflowStep($jobs['fork-build'] ?? [], 'Scan fork OCI for secrets');
     expect($secretScan['with']['image-ref'] ?? null)
-        ->toBe('local/${{ matrix.artifact_name }}:${{ github.sha }}-${{ matrix.arch }}-fork-runtime');
+        ->toBe('local/${{ matrix.artifact_name }}:${{ github.sha }}-${{ matrix.arch }}-fork-runtime')
+        ->and($secretScan['env']['TRIVY_IMAGE_SRC'] ?? null)->toBe('docker');
+
+    foreach ([
+        'build-and-scan' => [
+            'Scan local OCI for high and critical vulnerabilities',
+            'Scan local OCI for secrets',
+            'Enforce local supply-chain gates',
+        ],
+        'fork-build' => [
+            'Scan fork OCI for high and critical vulnerabilities',
+            'Scan fork OCI for secrets',
+            'Enforce fork supply-chain scans',
+        ],
+    ] as $jobName => $cancelAwareStepNames) {
+        foreach ($cancelAwareStepNames as $cancelAwareStepName) {
+            $cancelAwareStep = releaseWorkflowStep($jobs[$jobName] ?? [], $cancelAwareStepName);
+            expect($cancelAwareStep['if'] ?? null)->toBe('${{ !cancelled() }}');
+        }
+    }
 
     $forkRegistryPolicy = $jobs['fork-registry-policy'] ?? [];
     $policyCheckout = releaseWorkflowStep($forkRegistryPolicy, 'Check out immutable fork policy source');
