@@ -871,6 +871,48 @@ it('replays an exact abandoned initial enrollment rollback after each durable mu
     'after restoring the predecessor document' => 'COOLIFY_MANAGED_TRAEFIK_DOCUMENT_CRASH_AFTER_DOCUMENT',
 ]);
 
+it('recovers an exact no-journal predecessor document with the replacement sidecar', function (): void {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $enrollment = managedTraefikDocumentMutation(
+            $root,
+            'control-plane-abandoned-no-journal',
+            1,
+            "http:\n  routers:\n    enrollment: {}\n",
+        );
+        $replacementAuthority = managedTraefikDocumentWriterAuthority($enrollment, epoch: 1);
+        $rolledBackAuthority = managedTraefikDocumentEnrollmentRollbackAuthority($enrollment, $replacementAuthority);
+        expect(runManagedTraefikDocumentCommand($writer->writeCommandFor($enrollment))->isSuccessful())->toBeTrue();
+        $rollbackCommand = $writer->rollbackAbandonedInitialEnrollmentCommandFor(
+            $enrollment,
+            $replacementAuthority,
+            $rolledBackAuthority,
+        );
+        $afterAuthority = runManagedTraefikDocumentCommand(
+            $rollbackCommand,
+            ['COOLIFY_MANAGED_TRAEFIK_DOCUMENT_CRASH_AFTER_AUTHORITY' => '1'],
+        );
+        unlink($enrollment->documentPath());
+
+        expect($afterAuthority->isSuccessful())->toBeFalse()
+            ->and(file_exists($enrollment->journalPath()))->toBeFalse()
+            ->and(file_get_contents($enrollment->sidecarPath()))->toBe($enrollment->replacementSidecar());
+
+        $replayed = runManagedTraefikDocumentCommand($rollbackCommand);
+        expect($replayed->isSuccessful())->toBeTrue($replayed->getErrorOutput())
+            ->and(trim($replayed->getOutput()))->toBe(ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT)
+            ->and(file_exists($enrollment->documentPath()))->toBeFalse()
+            ->and(file_exists($enrollment->sidecarPath()))->toBeFalse()
+            ->and(file_exists($enrollment->journalPath()))->toBeFalse()
+            ->and(file_get_contents($enrollment->writerAuthorityPath()))->toBe($rolledBackAuthority->toJson());
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
 it('replays an exact abandoned rollback after restoring a present predecessor document and sidecar', function (): void {
     $filesystem = new Filesystem;
     $root = managedTraefikDocumentRoot();

@@ -883,6 +883,7 @@ final class ManagedTraefikDocumentWriter
             '      else fail; fi',
             '    else',
             '      if document_matches "$document_path" "$original_replacement_document_sha" && sidecar_matches "$sidecar_path" "$original_replacement_sidecar_base64" "$expected_sidecar_file"; then :',
+            '      elif document_matches "$document_path" "$original_expected_document_sha" && sidecar_matches "$sidecar_path" "$original_replacement_sidecar_base64" "$expected_sidecar_file"; then :',
             '      elif document_matches "$document_path" "$original_expected_document_sha" && sidecar_matches "$sidecar_path" "$original_expected_sidecar_base64" "$replacement_sidecar_file"; then :',
             '      else fail; fi',
             '    fi',
