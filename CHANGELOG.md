@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 📚 Documentation
+
+- Update changelog (#129)
+
+### 🧪 Testing
+
+- *(traefik)* Honor provider startup budget
+
+## [4.13.14-fork] - 2026-07-22
+
 ### 🐛 Bug Fixes
 
 - *(control-plane)* Recover abandoned activation safely
