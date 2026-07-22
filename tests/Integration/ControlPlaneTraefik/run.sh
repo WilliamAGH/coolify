@@ -742,7 +742,8 @@ assert_docker_provider_route() {
 }
 
 wait_for_docker_provider_route() {
-    local deadline=$(( $(now_ms) + MAX_RELOAD_DELAY_MS ))
+    local timeout_ms=${1:-$MAX_RELOAD_DELAY_MS}
+    local deadline=$(( $(now_ms) + timeout_ms ))
 
     while [ "$(now_ms)" -lt "$deadline" ]; do
         if assert_docker_provider_route; then
@@ -2216,7 +2217,7 @@ main() {
     atomic_replace_snapshot "$initial_snapshot"
 
     wait_for_runtime_shared_service
-    wait_for_docker_provider_route
+    wait_for_docker_provider_route "$MAX_PROVIDER_START_DELAY_MS"
     wait_for_provider_health "$BACKEND_BLUE_STATE_DIR" backend-blue
     wait_for_provider_health "$BACKEND_GREEN_STATE_DIR" backend-green
     assert_forwarded_identity_boundary
