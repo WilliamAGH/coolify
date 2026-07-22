@@ -129,7 +129,7 @@ it('reconciles an absent prepared-style writer state through the missing-artifac
         fn (string $command): bool => str_contains($command, InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_BEGIN),
     );
 
-    expect($commands)->toHaveCount(6)
+    expect($commands)->toHaveCount(7)
         ->and($normalizationIndex)->toBeInt()
         ->and($authorityInspectionIndex)->toBeInt()
         ->and($authorityInspectionIndex)->toBeLessThan($normalizationIndex)
@@ -170,7 +170,7 @@ it('finalizes an exact epoch-two rollback tombstone without another rollback mut
             && ! str_contains($command, ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_PENDING_OUTPUT),
     );
 
-    expect($commands)->toHaveCount(4)
+    expect($commands)->toHaveCount(5)
         ->and($finalizationCommand)->toContain("expected_document_sha='".hash('sha256', $state->dynamicPredecessorBytes ?? '')."'")
         ->and($store->read($server)?->toArray())->toBe($state->toArray());
 });
@@ -206,6 +206,51 @@ it('rejects a foreign writer authority before it mutates the rollback tombstone'
     })->toThrow(RuntimeException::class, 'not owned by this exact rollback');
 
     expect($remoteCalls)->toBe(2)
+        ->and($store->read($server)?->toArray())->toBe($state->toArray());
+});
+
+it('rejects writer authority drift after normalization before rollback mutation', function (): void {
+    [$server, $store, $state, $action] = reconciledRolledBackControlPlaneEnrollment();
+    $identity = new ControlPlaneEnrollmentWriterIdentity(
+        containerId: str_repeat('a', 64),
+        containerName: 'coolify-web-first',
+        imageId: 'sha256:'.str_repeat('b', 64),
+    );
+    $bootstrap = new BootstrapControlPlaneEnrollmentWriterAuthority;
+    $replacementAuthority = $bootstrap->authorityFor($state, $identity);
+    $foreignAuthority = new ManagedTraefikDocumentWriterAuthority(
+        epoch: 1,
+        operationId: 'foreign-enrollment',
+        member: 'blue',
+        containerId: $identity->containerId,
+        containerName: $identity->containerName,
+        imageId: $identity->imageId,
+        dynamicRevision: 1,
+        dynamicSha256: hash('sha256', $state->dynamicReplacementBytes),
+    );
+    $authorityInspections = 0;
+    $remoteCalls = 0;
+
+    expect(function () use ($action, $server, $state, &$authorityInspections, &$remoteCalls, $replacementAuthority, $foreignAuthority): void {
+        $action->handle(
+            $server,
+            $state,
+            function (string $command) use (&$authorityInspections, &$remoteCalls, $replacementAuthority, $foreignAuthority): string {
+                $remoteCalls++;
+
+                return match (true) {
+                    str_contains($command, ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_PENDING_OUTPUT) => ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_PENDING_OUTPUT,
+                    str_contains($command, NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT) => NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT,
+                    str_contains($command, InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_BEGIN) => reconciledRolledBackAuthorityTranscript(
+                        ++$authorityInspections === 1 ? $replacementAuthority : $foreignAuthority,
+                    ),
+                    default => throw new RuntimeException("Authority drift reached a rollback mutation: {$command}"),
+                };
+            },
+        );
+    })->toThrow(RuntimeException::class, 'changed during rollback normalization');
+
+    expect($remoteCalls)->toBe(4)
         ->and($store->read($server)?->toArray())->toBe($state->toArray());
 });
 

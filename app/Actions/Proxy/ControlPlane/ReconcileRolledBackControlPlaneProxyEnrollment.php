@@ -86,6 +86,16 @@ final class ReconcileRolledBackControlPlaneProxyEnrollment
             NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT,
             'control-plane enrollment filesystem normalization',
         );
+        $normalizedAuthorityTranscript = $execute($this->writerAuthorityInspector->commandFor($mutation));
+        if (! is_string($normalizedAuthorityTranscript)) {
+            throw new RuntimeException('The normalized control-plane enrollment writer authority inspection returned no transcript.');
+        }
+        $normalizedAuthority = $this->writerAuthorityInspector->handle($normalizedAuthorityTranscript);
+        if (($existingAuthority === null) !== ($normalizedAuthority === null)
+            || ($existingAuthority !== null && $normalizedAuthority !== null
+                && ! hash_equals($existingAuthority->toJson(), $normalizedAuthority->toJson()))) {
+            throw new RuntimeException('The control-plane enrollment writer authority changed during rollback normalization.');
+        }
 
         if ($requiresRollback) {
             $this->assertExactOutput(
