@@ -4,10 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 📚 Documentation
+
+- Update changelog (#113)
+
+## [4.13.7-fork] - 2026-07-21
+
 ### 🐛 Bug Fixes
 
 - *(deploy)* Wait for bundled runtime readiness
 - *(deploy)* Harden fresh install recovery
+- *(api)* Report exact active application image
+- *(deploy)* Preserve fresh install retry after recovery
+- *(release)* Retry draft asset verification
 
 ### 📚 Documentation
 
