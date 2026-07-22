@@ -2057,6 +2057,14 @@ paths:
           $ref: '#/components/responses/404'
         '409':
           description: 'No exact active application container image is observable.'
+          content:
+            application/json:
+              schema:
+                required:
+                  - message
+                properties:
+                  message: { type: string }
+                type: object
       security:
         -
           bearerAuth: []

@@ -51,3 +51,24 @@ it('documents active container destination provenance fields', function () {
         'container_ids',
     ])->and($items['properties']['container_ids']['items']['type'])->toBe('string');
 });
+
+it('documents the active container conflict response body', function () {
+    $openApi = json_decode(
+        file_get_contents(__DIR__.'/../../openapi.json'),
+        true,
+        flags: JSON_THROW_ON_ERROR,
+    );
+    $schema = data_get(
+        $openApi,
+        'paths./applications/{uuid}/active-container.get.responses.409.content.application/json.schema',
+    );
+
+    expect($schema)
+        ->toMatchArray([
+            'type' => 'object',
+            'required' => ['message'],
+            'properties' => [
+                'message' => ['type' => 'string'],
+            ],
+        ]);
+});
