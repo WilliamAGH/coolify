@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🐛 Bug Fixes
+
+- *(control-plane)* Recover abandoned activation safely
+
+### 📚 Documentation
+
+- Update changelog (#127)
+
+### 🧪 Testing
+
+- *(control-plane)* Fail closed on census errors
+
+## [4.13.13-fork] - 2026-07-22
+
 ### 🚀 Features
 
 - *(api)* Expose active container image reference
