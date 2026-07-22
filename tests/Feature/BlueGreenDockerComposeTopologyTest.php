@@ -11,6 +11,7 @@ use App\Actions\Application\BlueGreen\ExecuteBlueGreenDeactivationRemoteCommand;
 use App\Actions\Application\BlueGreen\PrepareBlueGreenDeactivation;
 use App\Actions\Application\BlueGreen\RemoveBlueGreenComposeSidecars;
 use App\Actions\Application\BlueGreen\ReserveBlueGreenReplicaSet;
+use App\Actions\Application\StampApplicationDeploymentProvenance;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
 use App\Enums\BlueGreenDeploymentColor;
@@ -1482,6 +1483,38 @@ it('rejects multiple routed services and raw Compose with precise eligibility re
 
     expect(fn (): bool => $setting->update(['is_blue_green_deployment_enabled' => true]))
         ->toThrow(RuntimeException::class, 'Blue-green deployments do not support raw Docker Compose applications because raw Compose cannot be safely rewritten.');
+});
+
+it('preserves mapping labels through raw Compose ownership and provenance stamping', function (): void {
+    Process::fake(['*' => Process::result()]);
+    $application = blueGreenComposeApplication();
+    $application->docker_compose_raw = Yaml::dump([
+        'services' => [
+            'web' => [
+                'image' => 'example/web:latest',
+                'labels' => [
+                    'example.owner' => 'web',
+                    'coolify.managed' => 'false',
+                    'coolify.deploymentId' => 'caller-controlled',
+                ],
+            ],
+        ],
+    ], 10);
+
+    $application->oldRawParser();
+    $compose = StampApplicationDeploymentProvenance::run(
+        Yaml::parse($application->docker_compose_raw),
+        'deployment-authoritative',
+    );
+    $labels = data_get($compose, 'services.web.labels');
+
+    expect($labels)->toBe([
+        'example.owner' => 'web',
+        'coolify.managed' => 'true',
+        'coolify.deploymentId' => 'deployment-authoritative',
+        'coolify.applicationId' => (string) $application->id,
+        'coolify.type' => 'application',
+    ])->and(array_filter(array_keys($labels), 'is_int'))->toBe([]);
 });
 
 it('fails closed when an opted-in Compose application mutates its routed topology', function (): void {
