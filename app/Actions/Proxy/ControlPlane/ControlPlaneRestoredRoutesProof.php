@@ -29,6 +29,7 @@ final readonly class ControlPlaneRestoredRoutesProof
         public int $pollIntervalSeconds = 3,
         public int $connectTimeoutSeconds = 2,
         public int $requestTimeoutSeconds = 3,
+        public bool $publicRouteExpected = true,
     ) {
         $this->assertHost($canonicalHost);
         if (! in_array($publicScheme, ['http', 'https'], true)) {
@@ -144,6 +145,10 @@ final readonly class ControlPlaneRestoredRoutesProof
             $url,
         ];
 
+        $successfulCases = $route === ControlPlaneProxyRouteProof::PUBLIC_ROUTE && ! $this->publicRouteExpected
+            ? ["  {$route}:22:404|{$route}:22:503)"]
+            : ["  {$route}:0:200)"];
+
         return implode("\n", [
             "printf '%s %s\\n' ".escapeshellarg(self::TRANSCRIPT_BEGIN." {$route}").' "$round"',
             'curl_exit=0',
@@ -157,7 +162,7 @@ final readonly class ControlPlaneRestoredRoutesProof
             "printf '%s\\n' '".self::TRANSCRIPT_END."'",
             "status=\$(printf '%s\\n' \"\$output\" | sed -n 's/^".self::TRANSCRIPT_STATUS." \\([0-9][0-9][0-9]\\)$/\\1/p')",
             'case "'.$route.':$curl_exit:$status" in',
-            "  {$route}:0:200)",
+            ...$successfulCases,
             '    :',
             '    ;;',
             "  {$route}:*)",

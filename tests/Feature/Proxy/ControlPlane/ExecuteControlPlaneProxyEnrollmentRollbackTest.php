@@ -27,6 +27,7 @@ uses(RefreshDatabase::class);
 
 function executableControlPlaneRollback(
     ControlPlaneProxyEnrollmentPhase $phase = ControlPlaneProxyEnrollmentPhase::Active,
+    ?string $dynamicPredecessorBytes = "http:\n  routers:\n    legacy: {}\n",
 ): array {
     $server = Server::factory()->create(['team_id' => Team::factory()->create()->id]);
     $state = new ControlPlaneProxyEnrollmentState(
@@ -47,7 +48,7 @@ function executableControlPlaneRollback(
         staticPredecessorBytes: "services:\n  traefik:\n    ports: ['80:80']\n",
         staticReplacementBytes: "services:\n  traefik:\n    ports: ['80:80', '8000:8000']\n",
         sourceOverrideBytes: "services:\n  coolify:\n    ports: !reset []\n",
-        dynamicPredecessorBytes: "http:\n  routers:\n    legacy: {}\n",
+        dynamicPredecessorBytes: $dynamicPredecessorBytes,
         dynamicReplacementBytes: "http:\n  routers:\n    coolify-app-port: {}\n",
         createdAt: '2026-07-19T12:00:00Z',
         updatedAt: '2026-07-19T12:00:00Z',
@@ -73,16 +74,28 @@ function executableControlPlaneRollback(
     ];
 }
 
-function executableControlPlaneRestoredTranscript(): string
+function executableControlPlaneRestoredTranscript(?string $dynamicPredecessorBytes = "http:\n  routers:\n    legacy: {}\n"): string
 {
     $headers = [
         ControlPlaneProxyRouteProof::BACKEND_MEMBER_HEADER.': coolify',
         ControlPlaneProxyRouteProof::BACKEND_REVISION_HEADER.': rollback-1',
-        ControlPlaneProxyRouteProof::DYNAMIC_SHA256_HEADER.': '.hash('sha256', "http:\n  routers:\n    legacy: {}\n"),
+        ControlPlaneProxyRouteProof::DYNAMIC_SHA256_HEADER.': '.hash('sha256', $dynamicPredecessorBytes ?? ''),
     ];
     $records = [];
     foreach ([1, 2] as $attempt) {
         foreach ([ControlPlaneProxyRouteProof::PUBLIC_ROUTE, ControlPlaneProxyRouteProof::APP_PORT_ROUTE] as $route) {
+            if ($route === ControlPlaneProxyRouteProof::PUBLIC_ROUTE && $dynamicPredecessorBytes === null) {
+                $records[] = implode("\n", [
+                    ControlPlaneRestoredRoutesProof::TRANSCRIPT_BEGIN." {$route} {$attempt}",
+                    'HTTP/2 503',
+                    '',
+                    ControlPlaneRestoredRoutesProof::TRANSCRIPT_STATUS.' 503',
+                    ControlPlaneRestoredRoutesProof::TRANSCRIPT_CURL_EXIT.' 22',
+                    ControlPlaneRestoredRoutesProof::TRANSCRIPT_END,
+                ]);
+
+                continue;
+            }
             $records[] = implode("\n", [
                 ControlPlaneRestoredRoutesProof::TRANSCRIPT_BEGIN." {$route} {$attempt}",
                 'HTTP/2 200',
@@ -160,6 +173,30 @@ it('persists rollback before self-replacement and requires a fresh replay to fin
         ->and($calls)->toBe(15)
         ->and($staticHandoffCommand)->toContain("sed -n 's/^[^ ]* -> //p'")
         ->and($server->fresh()?->proxy->get('last_saved_proxy_configuration'))->toBe($rolledBack->staticPredecessorBytes)
+        ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack);
+});
+
+it('finishes rollback when the durable predecessor intentionally had no public route', function (): void {
+    [$server, $store, $action] = executableControlPlaneRollback(dynamicPredecessorBytes: null);
+    $executor = static function (string $command): string {
+        return match (true) {
+            str_contains($command, ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_PENDING_OUTPUT) => ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_PENDING_OUTPUT,
+            str_contains($command, NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT) => NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT,
+            str_contains($command, InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_BEGIN) => executableControlPlaneAuthorityAbsentTranscript(),
+            str_contains($command, InspectControlPlaneEnrollmentWriter::TRANSCRIPT_BEGIN) => executableControlPlaneWriterInspectionTranscript(),
+            str_contains($command, ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT) => ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT,
+            str_contains($command, ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT) => ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT,
+            str_contains($command, ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT) => ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT,
+            str_contains($command, ControlPlaneRestoredRoutesProof::TRANSCRIPT_BEGIN) => executableControlPlaneRestoredTranscript(null),
+            default => '',
+        };
+    };
+
+    $action->handle($server, 'execute-control-plane-rollback', 'rollback-token', $executor);
+    $action->handle($server, 'execute-control-plane-rollback', 'rollback-token', $executor);
+    $rolledBack = $action->handle($server, 'execute-control-plane-rollback', 'rollback-token', $executor);
+
+    expect($rolledBack->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack)
         ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack);
 });
 

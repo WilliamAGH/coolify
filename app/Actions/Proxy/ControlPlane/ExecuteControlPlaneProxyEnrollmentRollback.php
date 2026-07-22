@@ -153,6 +153,7 @@ final class ExecuteControlPlaneProxyEnrollmentRollback
             expectedBackendMember: $expectedMember,
             expectedBackendRevision: $expectedRevision,
             expectedDynamicPredecessorSha256: $expectedDynamicSha256,
+            publicRouteExpected: $state->dynamicPredecessorBytes !== null,
         );
         $transcript = $execute($proof->shellCommand());
         if (! is_string($transcript)) {

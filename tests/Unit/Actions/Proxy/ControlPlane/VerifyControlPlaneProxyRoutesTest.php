@@ -81,7 +81,7 @@ function successfulControlPlaneRouteProofTranscript(ControlPlaneProxyRouteProof 
 }
 
 /** @param array<string, string> $headers */
-function executeRenderedControlPlaneRouteProof(string $command, array $headers): string
+function executeRenderedControlPlaneRouteProof(string $command, array $headers, bool $publicRouteAbsent = false): string
 {
     $filesystem = new Filesystem;
     $directory = sys_get_temp_dir().'/coolify-route-proof-'.bin2hex(random_bytes(8));
@@ -91,13 +91,21 @@ function executeRenderedControlPlaneRouteProof(string $command, array $headers):
 #!/bin/sh
 set -eu
 write_out=
+public_route=false
 while [ "$#" -gt 0 ]; do
     if [ "$1" = --write-out ]; then
         shift
         write_out=$1
     fi
+    case "$1" in https://dashboard.example.test/*) public_route=true ;; esac
     shift
 done
+if [ "$FAKE_PUBLIC_ROUTE_ABSENT" = 1 ] && [ "$public_route" = true ]; then
+    printf 'HTTP/1.1 503 Service Unavailable\r\n\r\n'
+    formatted=$(printf %s "$write_out" | sed 's/%{http_code}/503/g')
+    printf '%b' "$formatted"
+    exit 22
+fi
 printf 'HTTP/1.1 200 OK\r\n'
 printf 'X-Coolify-Control-Plane-Color: %s\r\n' "$FAKE_COLOR"
 printf 'X-Coolify-Control-Plane-Generation: %s\r\n' "$FAKE_GENERATION"
@@ -119,6 +127,7 @@ SH);
             'FAKE_MEMBER' => $headers[ControlPlaneProxyRouteProof::BACKEND_MEMBER_HEADER],
             'FAKE_REVISION' => $headers[ControlPlaneProxyRouteProof::BACKEND_REVISION_HEADER],
             'FAKE_DYNAMIC_SHA' => $headers[ControlPlaneProxyRouteProof::DYNAMIC_SHA256_HEADER],
+            'FAKE_PUBLIC_ROUTE_ABSENT' => $publicRouteAbsent ? '1' : '0',
         ]);
         $process->mustRun();
 
@@ -141,6 +150,29 @@ it('polls both routes without bearer credentials and accepts two exact consecuti
         ->and($command)->not->toContain('Authorization')
         ->and($command)->not->toContain('Bearer')
         ->and($command)->not->toContain($proof->configurationAcknowledgement());
+});
+
+it('executes a restored proof with an intentionally absent public predecessor', function (): void {
+    $proof = new ControlPlaneRestoredRoutesProof(
+        canonicalHost: 'dashboard.example.test',
+        publicScheme: 'https',
+        appPort: 8000,
+        expectedBackendMember: 'coolify',
+        expectedBackendRevision: 'rollback-1',
+        expectedDynamicPredecessorSha256: hash('sha256', ''),
+        maximumAttempts: 2,
+        pollIntervalSeconds: 0,
+        connectTimeoutSeconds: 1,
+        requestTimeoutSeconds: 1,
+        publicRouteExpected: false,
+    );
+    $transcript = executeRenderedControlPlaneRouteProof(
+        $proof->shellCommand(),
+        $proof->expectedResponseHeaders(),
+        publicRouteAbsent: true,
+    );
+
+    expect(VerifyControlPlaneRestoredRoutes::run($proof, $transcript))->toBe($proof);
 });
 
 it('executes indented active and restored route proofs with unindented curl status records', function (): void {

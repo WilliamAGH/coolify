@@ -39,6 +39,12 @@ final class VerifyControlPlaneRestoredRoutes
         }
 
         $expectedHeaders = $proof->expectedResponseHeaders();
+        $managedIdentityHeaders = array_fill_keys(array_map('strtolower', [
+            ...array_keys($expectedHeaders),
+            ControlPlaneDynamicConfiguration::COLOR_HEADER,
+            ControlPlaneDynamicConfiguration::GENERATION_HEADER,
+            ControlPlaneDynamicConfiguration::CONFIGURATION_ACKNOWLEDGEMENT_HEADER,
+        ]), true);
         $consecutiveExactRounds = 0;
         $firstConvergedAttempt = null;
         $recordIndex = 0;
@@ -47,6 +53,20 @@ final class VerifyControlPlaneRestoredRoutes
             $identityHeadersByRoute = [];
             foreach ([ControlPlaneProxyRouteProof::PUBLIC_ROUTE, ControlPlaneProxyRouteProof::APP_PORT_ROUTE] as $route) {
                 $record = $records[$recordIndex++];
+                if ($route === ControlPlaneProxyRouteProof::PUBLIC_ROUTE && ! $proof->publicRouteExpected) {
+                    $unexpectedIdentityHeader = array_key_first(array_intersect_key(
+                        $record['headers'],
+                        $managedIdentityHeaders,
+                    ));
+                    if ($unexpectedIdentityHeader !== null) {
+                        throw new InvalidArgumentException('Restored control-plane public route unexpectedly exposes a managed backend identity.');
+                    }
+                    if ($record['curlExit'] !== 22 || ! in_array($record['status'], [404, 503], true)) {
+                        $isExactRound = false;
+                    }
+
+                    continue;
+                }
                 if ($record['status'] !== 200) {
                     $isExactRound = false;
 
@@ -68,7 +88,8 @@ final class VerifyControlPlaneRestoredRoutes
                 $identityHeadersByRoute[$route] = $identityHeaders;
             }
             if ($isExactRound) {
-                if (($identityHeadersByRoute[ControlPlaneProxyRouteProof::PUBLIC_ROUTE] ?? null)
+                if ($proof->publicRouteExpected
+                    && ($identityHeadersByRoute[ControlPlaneProxyRouteProof::PUBLIC_ROUTE] ?? null)
                     !== ($identityHeadersByRoute[ControlPlaneProxyRouteProof::APP_PORT_ROUTE] ?? null)) {
                     throw new InvalidArgumentException('Restored control-plane public and APP_PORT routes do not expose the same restored marker.');
                 }
