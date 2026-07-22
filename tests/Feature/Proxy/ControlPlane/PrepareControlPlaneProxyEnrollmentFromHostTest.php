@@ -26,11 +26,43 @@ use App\Actions\Proxy\ControlPlane\VerifyControlPlaneCandidateMembers;
 use App\Actions\Proxy\ControlPlane\VerifyControlPlaneProxyRoutes;
 use App\Actions\Proxy\ControlPlane\VerifyControlPlaneRestoredRoutes;
 use App\Enums\ProxyTypes;
+use App\Models\PrivateKey;
 use App\Models\Server;
 use App\Models\Team;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Process\FakeProcessResult;
+use Illuminate\Process\PendingProcess;
+use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Facades\Storage;
 
 uses(RefreshDatabase::class);
+
+function hostRolledBackEnrollmentState(Server $server): ControlPlaneProxyEnrollmentState
+{
+    return new ControlPlaneProxyEnrollmentState(
+        phase: ControlPlaneProxyEnrollmentPhase::RolledBack,
+        operationId: 'old-rolled-back-enrollment',
+        tokenSha256: hash('sha256', 'lost-old-token'),
+        serverId: (int) $server->getKey(),
+        appPort: 8000,
+        exposure: ControlPlaneProxyExposure::Public,
+        managedFilename: ControlPlaneDynamicConfiguration::MANAGED_FILENAME,
+        dynamicRevision: 1,
+        canonicalHost: 'old.example.test',
+        publicScheme: 'https',
+        expectedMember: 'green',
+        expectedRevision: 'old-revision',
+        configurationAcknowledgement: 'ack:'.str_repeat('a', 64),
+        activeBackendDnsNames: ['coolify-old'],
+        staticPredecessorBytes: "services:\n  traefik:\n    ports: ['80:80']\n",
+        staticReplacementBytes: "services:\n  traefik:\n    ports: ['80:80', '8000:8000']\n",
+        sourceOverrideBytes: "services:\n  coolify:\n    ports: !reset []\n",
+        dynamicPredecessorBytes: null,
+        dynamicReplacementBytes: "http:\n  routers:\n    old-control-plane: {}\n",
+        createdAt: '2026-07-22T00:00:00Z',
+        updatedAt: '2026-07-22T00:00:00Z',
+    );
+}
 
 function hostPreparedEnrollmentAction(StoreControlPlaneProxyEnrollmentState $store): PrepareControlPlaneProxyEnrollmentFromHost
 {
@@ -142,29 +174,7 @@ it('reconciles an exact rolled-back owner before reserving a replacement from ho
     ]);
     $server->proxy->set('type', ProxyTypes::TRAEFIK->value);
     $server->proxy->set('last_saved_proxy_configuration', generateDefaultProxyConfiguration($server, save: false));
-    $rolledBack = new ControlPlaneProxyEnrollmentState(
-        phase: ControlPlaneProxyEnrollmentPhase::RolledBack,
-        operationId: 'old-rolled-back-enrollment',
-        tokenSha256: hash('sha256', 'lost-old-token'),
-        serverId: (int) $server->getKey(),
-        appPort: 8000,
-        exposure: ControlPlaneProxyExposure::Public,
-        managedFilename: ControlPlaneDynamicConfiguration::MANAGED_FILENAME,
-        dynamicRevision: 1,
-        canonicalHost: 'old.example.test',
-        publicScheme: 'https',
-        expectedMember: 'green',
-        expectedRevision: 'old-revision',
-        configurationAcknowledgement: 'ack:'.str_repeat('a', 64),
-        activeBackendDnsNames: ['coolify-old'],
-        staticPredecessorBytes: "services:\n  traefik:\n    ports: ['80:80']\n",
-        staticReplacementBytes: "services:\n  traefik:\n    ports: ['80:80', '8000:8000']\n",
-        sourceOverrideBytes: "services:\n  coolify:\n    ports: !reset []\n",
-        dynamicPredecessorBytes: null,
-        dynamicReplacementBytes: "http:\n  routers:\n    old-control-plane: {}\n",
-        createdAt: '2026-07-22T00:00:00Z',
-        updatedAt: '2026-07-22T00:00:00Z',
-    );
+    $rolledBack = hostRolledBackEnrollmentState($server);
     $server->proxy->set(StoreControlPlaneProxyEnrollmentState::STATE_KEY, $rolledBack->toArray());
     $server->save();
     $store = new StoreControlPlaneProxyEnrollmentState;
@@ -213,4 +223,59 @@ YAML;
         ->and($state->operationId)->toBe('replacement-enrollment')
         ->and($state->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Preparing)
         ->and($store->read($server)?->operationId)->toBe('replacement-enrollment');
+});
+
+it('preserves the reconciliation transport budget before using the host artifact budget', function (): void {
+    Storage::fake('ssh-keys');
+    $team = Team::factory()->create();
+    $privateKey = PrivateKey::factory()->create(['team_id' => $team->id]);
+    $server = Server::factory()->create([
+        'id' => 0,
+        'team_id' => $team->id,
+        'private_key_id' => $privateKey->id,
+        'ip' => 'host.docker.internal',
+    ]);
+    $server->proxy->set('type', ProxyTypes::TRAEFIK->value);
+    $server->proxy->set('last_saved_proxy_configuration', generateDefaultProxyConfiguration($server, save: false));
+    $server->proxy->set(
+        StoreControlPlaneProxyEnrollmentState::STATE_KEY,
+        hostRolledBackEnrollmentState($server)->toArray(),
+    );
+    $server->save();
+    $sourceCompose = <<<'YAML'
+services:
+  coolify:
+    image: coolify:test
+    ports:
+      - "${APP_PORT:-8000}:8080"
+YAML;
+    $timeouts = [];
+    Process::fake(function (PendingProcess $process) use (&$timeouts, $sourceCompose): FakeProcessResult {
+        $timeouts[] = $process->timeout;
+
+        return match (true) {
+            str_contains($process->command, ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_PENDING_OUTPUT) => Process::result(
+                output: ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT,
+            ),
+            str_contains($process->command, '__COOLIFY_CONTROL_PLANE_ARTIFACT_') => Process::result(
+                output: "__COOLIFY_CONTROL_PLANE_ARTIFACT_ABSENT__\n",
+            ),
+            str_contains($process->command, 'cat -- ') => Process::result(output: $sourceCompose),
+            default => throw new RuntimeException("Unexpected remote command: {$process->command}"),
+        };
+    });
+
+    hostPreparedEnrollmentAction(new StoreControlPlaneProxyEnrollmentState)->handle(
+        server: $server,
+        operationId: 'replacement-enrollment',
+        token: 'replacement-token',
+        appPort: 8000,
+        exposure: ControlPlaneProxyExposure::Public,
+        activeBackendDnsNames: ['coolify-new'],
+        host: 'new.example.test',
+        expectedRevision: 'new-revision',
+        expectedMember: 'blue',
+    );
+
+    expect($timeouts)->toBe([120, 30, 30]);
 });
