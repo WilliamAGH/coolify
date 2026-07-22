@@ -359,6 +359,9 @@ it('keeps an activating owner unless its managed state is exactly recoverable', 
     $mutation = preparedEnrollmentAbortMutation($fixture);
     if ($scenario !== 'missing lock') {
         file_put_contents($mutation->lockPath(), '');
+        if ($scenario === 'writable lock') {
+            chmod($mutation->lockPath(), 0666);
+        }
     }
     file_put_contents(
         $mutation->sidecarPath(),
@@ -388,7 +391,7 @@ it('keeps an activating owner unless its managed state is exactly recoverable', 
         $remoteExecutor,
     ))->toThrow(RuntimeException::class)
         ->and($fixture['store']->read($fixture['server'])?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Activating);
-})->with(['missing lock', 'missing artifact', 'malformed sidecar', 'malformed artifact', 'unknown journal', 'foreign authority']);
+})->with(['missing lock', 'writable lock', 'missing artifact', 'malformed sidecar', 'malformed artifact', 'unknown journal', 'foreign authority']);
 
 it('keeps an activating owner unless exact legacy runtime ownership is proved', function (?string $evidence): void {
     $fixture = preparedEnrollmentAbortFixture(ControlPlaneProxyEnrollmentPhase::Activating);
