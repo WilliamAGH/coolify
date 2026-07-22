@@ -2022,7 +2022,7 @@ paths:
       tags:
         - Applications
       summary: 'Get active application container'
-      description: 'Get the exact image and status of the routed application container.'
+      description: 'Get the runtime image ID, configured image reference, and status of the routed application container.'
       operationId: get-active-application-container
       parameters:
         -
@@ -2040,11 +2040,13 @@ paths:
               schema:
                 required:
                   - image
+                  - image_reference
                   - source
                   - status
                   - provenance
                 properties:
-                  image: { type: string }
+                  image: { description: 'Runtime Docker image ID.', type: string }
+                  image_reference: { description: 'Exact Docker image reference configured on the routed container.', type: string }
                   source: { type: string }
                   status: { type: string }
                   provenance: { required: [kind, destination], properties: { kind: { type: string, example: live-container-inspection }, destination: { type: array, items: { required: [destination_id, deployment_uuid, color, routing_revision, container_ids], properties: { destination_id: { type: integer }, deployment_uuid: { type: string }, color: { type: [string, 'null'], enum: [blue, green, null] }, routing_revision: { type: [integer, 'null'] }, container_ids: { type: array, items: { type: string } } }, type: object } } }, type: object }
