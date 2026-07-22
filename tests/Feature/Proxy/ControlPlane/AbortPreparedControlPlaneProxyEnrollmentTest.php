@@ -134,7 +134,9 @@ it('inspects prepared artifacts on the managed host', function (): void {
             return "__COOLIFY_CONTROL_PLANE_ARTIFACT_PRESENT__\n".base64_encode($fixture['state']->staticPredecessorBytes);
         }
 
-        return "__COOLIFY_CONTROL_PLANE_ARTIFACT_ABSENT__\n";
+        return str_contains($command, '.control-plane-managed-traefik')
+            ? "__COOLIFY_CONTROL_PLANE_ARTIFACT_DIRECTORY_EMPTY__\n"
+            : "__COOLIFY_CONTROL_PLANE_ARTIFACT_ABSENT__\n";
     };
     $action = new AbortPreparedControlPlaneProxyEnrollment($fixture['store']);
 
@@ -150,6 +152,20 @@ it('inspects prepared artifacts on the managed host', function (): void {
         ->and($commands[1])->toContain('/data/coolify/source/docker-compose.control-plane-listener.yml')
         ->and($commands[2])->toContain($proxyPath.'/.control-plane-managed-traefik')
         ->and($commands[3])->toContain($proxyPath.'/dynamic/'.ControlPlaneDynamicConfiguration::MANAGED_FILENAME);
+});
+
+it('allows a pre-existing empty managed state directory', function (): void {
+    $fixture = preparedEnrollmentAbortFixture();
+    $this->preparedAbortRoot = $fixture['root'];
+    (new Filesystem)->makeDirectory($fixture['proxy'].'/.control-plane-managed-traefik', 0700);
+
+    expect($fixture['action']->handle(
+        $fixture['server'],
+        'stale-prepared-enrollment',
+        'wrong.example.test',
+        'old-revision',
+        $fixture['remote'],
+    )->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack);
 });
 
 it('keeps the prepared owner when host artifact evidence is unavailable', function (?string $evidence): void {
@@ -203,6 +219,11 @@ it('refuses a prepared abort when any activation artifact exists', function (str
         file_put_contents($fixture['source'].'/docker-compose.control-plane-listener.yml', "services: {}\n");
     } elseif ($artifact === 'state') {
         (new Filesystem)->makeDirectory($fixture['proxy'].'/.control-plane-managed-traefik', 0700);
+        file_put_contents($fixture['proxy'].'/.control-plane-managed-traefik/authority.json', "{}\n");
+    } elseif ($artifact === 'state symlink') {
+        symlink($fixture['proxy'].'/dynamic', $fixture['proxy'].'/.control-plane-managed-traefik');
+    } elseif ($artifact === 'state file') {
+        file_put_contents($fixture['proxy'].'/.control-plane-managed-traefik', "{}\n");
     } else {
         file_put_contents($fixture['proxy'].'/dynamic/'.ControlPlaneDynamicConfiguration::MANAGED_FILENAME, "http: {}\n");
     }
@@ -215,7 +236,7 @@ it('refuses a prepared abort when any activation artifact exists', function (str
         $fixture['remote'],
     ))->toThrow(RuntimeException::class)
         ->and($fixture['store']->read($fixture['server'])?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Prepared);
-})->with(['override', 'state', 'dynamic']);
+})->with(['override', 'state', 'state symlink', 'state file', 'dynamic']);
 
 it('refuses mismatched predecessor bytes and non-local servers', function (): void {
     $fixture = preparedEnrollmentAbortFixture();
