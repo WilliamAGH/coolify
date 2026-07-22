@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🐛 Bug Fixes
+
+- *(control-plane)* Reconcile rolled-back enrollment
+- *(control-plane)* Preserve rollback reconciliation timeout
+
+### 📚 Documentation
+
+- Update changelog (#132)
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Reserve 4.13.16-fork
+
+## [4.13.15-fork] - 2026-07-22
+
 ### 📚 Documentation
 
 - Update changelog (#129)
