@@ -1,12 +1,17 @@
 <?php
 
 use App\Actions\Proxy\ControlPlane\AbortPreparedControlPlaneProxyEnrollment;
+use App\Actions\Proxy\ControlPlane\BootstrapControlPlaneEnrollmentWriterAuthority;
 use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentPhase;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentState;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyExposure;
+use App\Actions\Proxy\ControlPlane\InspectControlPlaneEnrollmentWriter;
+use App\Actions\Proxy\ControlPlane\InspectControlPlaneEnrollmentWriterAuthority;
 use App\Actions\Proxy\ControlPlane\ManagedTraefikDocumentMutation;
 use App\Actions\Proxy\ControlPlane\ManagedTraefikDocumentWriter;
+use App\Actions\Proxy\ControlPlane\NormalizeControlPlaneEnrollmentFilesystem;
+use App\Actions\Proxy\ControlPlane\StoreControlPlaneGenerationPromotionState;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
 use App\Models\Server;
 use App\Models\Team;
@@ -68,6 +73,11 @@ function preparedEnrollmentAbortFixture(
     $server->proxy->set(StoreControlPlaneProxyEnrollmentState::STATE_KEY, $state->toArray());
     $server->save();
     $store = new StoreControlPlaneProxyEnrollmentState;
+    $dynamicWriter = new ManagedTraefikDocumentWriter;
+    $writerAuthorityInspector = new InspectControlPlaneEnrollmentWriterAuthority;
+    $writerInspector = new InspectControlPlaneEnrollmentWriter;
+    $writerAuthorityBootstrap = new BootstrapControlPlaneEnrollmentWriterAuthority;
+    $filesystemNormalizer = new NormalizeControlPlaneEnrollmentFilesystem;
     $remoteExecutor = static fn (string $command): string => trim((string) shell_exec($command));
 
     return [
@@ -77,15 +87,56 @@ function preparedEnrollmentAbortFixture(
         'server' => $server,
         'state' => $state,
         'store' => $store,
+        'writer' => $dynamicWriter,
+        'writerAuthorityInspector' => $writerAuthorityInspector,
+        'writerInspector' => $writerInspector,
+        'writerAuthorityBootstrap' => $writerAuthorityBootstrap,
+        'filesystemNormalizer' => $filesystemNormalizer,
         'remote' => $remoteExecutor,
-        'action' => new AbortPreparedControlPlaneProxyEnrollment($store, $proxyPath, $sourcePath),
+        'action' => new AbortPreparedControlPlaneProxyEnrollment(
+            $store,
+            $dynamicWriter,
+            $writerAuthorityInspector,
+            $writerInspector,
+            $writerAuthorityBootstrap,
+            $filesystemNormalizer,
+            $proxyPath,
+            $sourcePath,
+        ),
     ];
+}
+
+function preparedEnrollmentMutation(array $fixture): ManagedTraefikDocumentMutation
+{
+    return new ManagedTraefikDocumentMutation(
+        dynamicDirectory: $fixture['proxy'].'/dynamic',
+        stateDirectory: $fixture['proxy'].'/.control-plane-managed-traefik',
+        filename: $fixture['state']->managedFilename,
+        operationId: $fixture['state']->operationId,
+        revision: $fixture['state']->dynamicRevision,
+        expectedSha256: $fixture['state']->dynamicPredecessorBytes === null
+            ? null
+            : hash('sha256', $fixture['state']->dynamicPredecessorBytes),
+        expectedOperationId: null,
+        expectedRevision: null,
+        replacementBytes: $fixture['state']->dynamicReplacementBytes,
+    );
 }
 
 function preparedEnrollmentRuntimeExecutor(Closure $artifactExecutor, string $scenario, array &$commands): Closure
 {
     return static function (string $command) use ($artifactExecutor, $scenario, &$commands): ?string {
         $commands[] = $command;
+        if (str_contains($command, InspectControlPlaneEnrollmentWriter::TRANSCRIPT_BEGIN)) {
+            return implode("\n", [
+                InspectControlPlaneEnrollmentWriter::TRANSCRIPT_BEGIN,
+                InspectControlPlaneEnrollmentWriter::TRANSCRIPT_RECORD.' '.str_repeat('a', 64).' /coolify sha256:'.str_repeat('b', 64).' true',
+                InspectControlPlaneEnrollmentWriter::TRANSCRIPT_END,
+            ]);
+        }
+        if (str_contains($command, NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT)) {
+            return NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT;
+        }
         if (! str_contains($command, '__COOLIFY_CONTROL_PLANE_LEGACY_RUNTIME__')) {
             return $artifactExecutor($command);
         }
@@ -126,7 +177,6 @@ docker() {
     *) return 1 ;;
   esac
 }
-
 sleep() { :; }
 SH;
         $output = [];
@@ -139,23 +189,6 @@ SH;
 
         return $exitCode === 0 ? implode("\n", $output) : null;
     };
-}
-
-function preparedEnrollmentAbortMutation(array $fixture): ManagedTraefikDocumentMutation
-{
-    return new ManagedTraefikDocumentMutation(
-        dynamicDirectory: $fixture['proxy'].'/dynamic',
-        stateDirectory: $fixture['proxy'].'/.control-plane-managed-traefik',
-        filename: $fixture['state']->managedFilename,
-        operationId: $fixture['state']->operationId,
-        revision: $fixture['state']->dynamicRevision,
-        expectedSha256: $fixture['state']->dynamicPredecessorBytes === null
-            ? null
-            : hash('sha256', $fixture['state']->dynamicPredecessorBytes),
-        expectedOperationId: null,
-        expectedRevision: null,
-        replacementBytes: $fixture['state']->dynamicReplacementBytes,
-    );
 }
 
 it('serializes enrollment mutations on a dedicated postgres session lock', function (): void {
@@ -257,7 +290,14 @@ it('inspects prepared artifacts on the managed host', function (): void {
             ? "__COOLIFY_CONTROL_PLANE_ARTIFACT_DIRECTORY_EMPTY__\n"
             : "__COOLIFY_CONTROL_PLANE_ARTIFACT_ABSENT__\n";
     };
-    $action = new AbortPreparedControlPlaneProxyEnrollment($fixture['store']);
+    $action = new AbortPreparedControlPlaneProxyEnrollment(
+        $fixture['store'],
+        $fixture['writer'],
+        $fixture['writerAuthorityInspector'],
+        $fixture['writerInspector'],
+        $fixture['writerAuthorityBootstrap'],
+        $fixture['filesystemNormalizer'],
+    );
 
     expect($action->handle(
         $fixture['server'],
@@ -318,23 +358,9 @@ it('refuses a prepared abort when an identity fence differs', function (string $
     'revision' => ['stale-prepared-enrollment', 'wrong.example.test', 'another-revision'],
 ]);
 
-it('aborts an activating enrollment with an exactly recoverable managed document', function (bool $replacementIsVisible): void {
+it('aborts an activating enrollment after its host artifacts rolled back exactly', function (): void {
     $fixture = preparedEnrollmentAbortFixture(ControlPlaneProxyEnrollmentPhase::Activating);
     $this->preparedAbortRoot = $fixture['root'];
-    (new Filesystem)->makeDirectory($fixture['proxy'].'/.control-plane-managed-traefik', 0700);
-    $mutation = preparedEnrollmentAbortMutation($fixture);
-    file_put_contents($mutation->lockPath(), '');
-    file_put_contents($mutation->sidecarPath(), $mutation->replacementSidecar());
-    file_put_contents(
-        $mutation->rollbackArtifactPath(),
-        (new ManagedTraefikDocumentWriter)->rollbackArtifactFor($mutation, null),
-    );
-    if ($replacementIsVisible) {
-        file_put_contents($mutation->documentPath(), $fixture['state']->dynamicReplacementBytes);
-    }
-    $scratch = $mutation->stateDirectory.'/.managed-traefik-document.interrupted';
-    (new Filesystem)->makeDirectory($scratch, 0700);
-    file_put_contents($scratch.'/expected-sidecar', '');
     $artifactExecutor = $fixture['remote'];
     $commands = [];
     $fixture['server']->proxy->set('last_saved_settings', md5(base64_encode($fixture['state']->staticReplacementBytes)));
@@ -350,60 +376,104 @@ it('aborts an activating enrollment with an exactly recoverable managed document
         $remoteExecutor,
     )->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack)
         ->and($fixture['store']->read($fixture['server'])?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack)
-        ->and($commands)->toHaveCount(7)
+        ->and($commands)->toHaveCount(5)
         ->and($fixture['server']->fresh()?->proxy->get('last_saved_proxy_configuration'))->toBe($fixture['state']->staticPredecessorBytes)
         ->and($fixture['server']->fresh()?->proxy->get('last_saved_settings'))->toBe(md5(base64_encode($fixture['state']->staticPredecessorBytes)));
-})->with([
-    'replacement document visible' => true,
-    'predecessor document visible' => false,
-]);
+});
 
-it('keeps an activating owner unless its managed state is exactly recoverable', function (string $scenario): void {
+it('recovers the exact authority-less initial dynamic activation and preserves the epoch-two tombstone', function (): void {
     $fixture = preparedEnrollmentAbortFixture(ControlPlaneProxyEnrollmentPhase::Activating);
     $this->preparedAbortRoot = $fixture['root'];
-    (new Filesystem)->makeDirectory($fixture['proxy'].'/.control-plane-managed-traefik', 0700);
-    $mutation = preparedEnrollmentAbortMutation($fixture);
-    if ($scenario !== 'missing lock') {
-        file_put_contents($mutation->lockPath(), '');
-        if ($scenario === 'writable lock') {
-            chmod($mutation->lockPath(), 0666);
-        }
-    }
-    if ($scenario !== 'missing sidecar') {
-        file_put_contents(
-            $mutation->sidecarPath(),
-            $scenario === 'malformed sidecar' ? "{}\n" : $mutation->replacementSidecar(),
-        );
-    }
-    if ($scenario !== 'missing artifact') {
-        file_put_contents(
-            $mutation->rollbackArtifactPath(),
-            $scenario === 'malformed artifact'
-                ? "rollback\n"
-                : (new ManagedTraefikDocumentWriter)->rollbackArtifactFor($mutation, null),
-        );
-    }
-    if ($scenario === 'unknown journal') {
-        file_put_contents($mutation->journalPath(), "journal\n");
-    } elseif ($scenario === 'foreign authority') {
-        file_put_contents($mutation->stateDirectory.'/.'.$mutation->filename.'.writer-authority.json', "{}\n");
-    } elseif ($scenario === 'foreign document') {
-        file_put_contents($mutation->documentPath(), "http:\n  routers:\n    foreign: {}\n");
-    } elseif ($scenario === 'missing sidecar') {
-        file_put_contents($mutation->documentPath(), $fixture['state']->dynamicReplacementBytes);
-    }
+    $mutation = preparedEnrollmentMutation($fixture);
+    expect(shell_exec($fixture['writer']->writeCommandFor($mutation)))->toContain(ManagedTraefikDocumentWriter::APPLIED_OUTPUT);
     $commands = [];
     $remoteExecutor = preparedEnrollmentRuntimeExecutor($fixture['remote'], 'valid', $commands);
+
+    $rolledBack = $fixture['action']->handle(
+        $fixture['server'],
+        'stale-prepared-enrollment',
+        'wrong.example.test',
+        'old-revision',
+        $remoteExecutor,
+    );
+    $authority = json_decode((string) file_get_contents($mutation->writerAuthorityPath()), true, flags: JSON_THROW_ON_ERROR);
+
+    expect($rolledBack->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack)
+        ->and($authority['epoch'])->toBe(2)
+        ->and($authority['operation_id'])->toBe($fixture['state']->operationId)
+        ->and(file_exists($mutation->documentPath()))->toBeFalse()
+        ->and(file_exists($mutation->sidecarPath()))->toBeFalse()
+        ->and(file_exists($mutation->rollbackArtifactPath()))->toBeTrue()
+        ->and(file_exists($mutation->lockPath()))->toBeTrue()
+        ->and($commands)->toContain($fixture['writerInspector']->commandFor('coolify'));
+});
+
+it('replays recovery after the predecessor was restored but before the durable abort was recorded', function (): void {
+    $fixture = preparedEnrollmentAbortFixture(ControlPlaneProxyEnrollmentPhase::Activating);
+    $this->preparedAbortRoot = $fixture['root'];
+    $mutation = preparedEnrollmentMutation($fixture);
+    expect(shell_exec($fixture['writer']->writeCommandFor($mutation)))->toContain(ManagedTraefikDocumentWriter::APPLIED_OUTPUT);
+    $commands = [];
+    $baseExecutor = preparedEnrollmentRuntimeExecutor($fixture['remote'], 'valid', $commands);
+    $identityInspections = 0;
+    $failAfterRollback = static function (string $command) use ($baseExecutor, &$identityInspections): ?string {
+        if (str_contains($command, InspectControlPlaneEnrollmentWriter::TRANSCRIPT_BEGIN)
+            && ++$identityInspections === 2) {
+            return null;
+        }
+
+        return $baseExecutor($command);
+    };
 
     expect(fn () => $fixture['action']->handle(
         $fixture['server'],
         'stale-prepared-enrollment',
         'wrong.example.test',
         'old-revision',
-        $remoteExecutor,
-    ))->toThrow(RuntimeException::class)
+        $failAfterRollback,
+    ))->toThrow(RuntimeException::class, 'writer inspection returned no transcript')
+        ->and($fixture['store']->read($fixture['server'])?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Activating)
+        ->and(file_exists($mutation->documentPath()))->toBeFalse()
+        ->and(file_exists($mutation->writerAuthorityPath()))->toBeTrue();
+
+    $retryWithoutLiveWriter = static function (string $command) use ($baseExecutor): ?string {
+        if (str_contains($command, InspectControlPlaneEnrollmentWriter::TRANSCRIPT_BEGIN)) {
+            throw new RuntimeException('The retired writer is unavailable after the rollback tombstone became durable.');
+        }
+
+        return $baseExecutor($command);
+    };
+
+    expect($fixture['action']->handle(
+        $fixture['server'],
+        'stale-prepared-enrollment',
+        'wrong.example.test',
+        'old-revision',
+        $retryWithoutLiveWriter,
+    )->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack);
+});
+
+it('rejects generation promotion before inspecting or mutating an activating host', function (): void {
+    $fixture = preparedEnrollmentAbortFixture(ControlPlaneProxyEnrollmentPhase::Activating);
+    $this->preparedAbortRoot = $fixture['root'];
+    $fixture['server']->proxy->set(StoreControlPlaneGenerationPromotionState::STATE_KEY, ['present' => true]);
+    $fixture['server']->save();
+    $remoteCalls = 0;
+
+    expect(fn () => $fixture['action']->handle(
+        $fixture['server'],
+        'stale-prepared-enrollment',
+        'wrong.example.test',
+        'old-revision',
+        static function (string $command) use (&$remoteCalls): string {
+            $remoteCalls++;
+
+            return '';
+        },
+    ))->toThrow(RuntimeException::class, 'generation promotion state exists')
+        ->and($remoteCalls)->toBe(0)
         ->and($fixture['store']->read($fixture['server'])?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Activating);
-})->with(['missing lock', 'writable lock', 'missing sidecar', 'missing artifact', 'malformed sidecar', 'malformed artifact', 'unknown journal', 'foreign authority', 'foreign document']);
+});
 
 it('keeps an activating owner unless exact legacy runtime ownership is proved', function (?string $evidence): void {
     $fixture = preparedEnrollmentAbortFixture(ControlPlaneProxyEnrollmentPhase::Activating);
@@ -424,24 +494,6 @@ it('keeps an activating owner unless exact legacy runtime ownership is proved', 
     ))->toThrow(RuntimeException::class, 'exact legacy runtime ownership')
         ->and($fixture['store']->read($fixture['server'])?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Activating);
 })->with(['malformed', null]);
-
-it('rejects an activating abort when the managed state directory is writable by another principal', function (): void {
-    $fixture = preparedEnrollmentAbortFixture(ControlPlaneProxyEnrollmentPhase::Activating);
-    $this->preparedAbortRoot = $fixture['root'];
-    (new Filesystem)->makeDirectory($fixture['proxy'].'/.control-plane-managed-traefik', 0777);
-    chmod($fixture['proxy'].'/.control-plane-managed-traefik', 0777);
-    $commands = [];
-    $remoteExecutor = preparedEnrollmentRuntimeExecutor($fixture['remote'], 'valid', $commands);
-
-    expect(fn () => $fixture['action']->handle(
-        $fixture['server'],
-        'stale-prepared-enrollment',
-        'wrong.example.test',
-        'old-revision',
-        $remoteExecutor,
-    ))->toThrow(RuntimeException::class, 'absent or regular directory')
-        ->and($fixture['store']->read($fixture['server'])?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Activating);
-});
 
 it('rejects an activating abort on duplicate IPv6 ownership or Docker inspection failure', function (string $scenario): void {
     $fixture = preparedEnrollmentAbortFixture(ControlPlaneProxyEnrollmentPhase::Activating);
@@ -490,8 +542,7 @@ it('refuses an abort when any activation artifact exists', function (ControlPlan
     'prepared state file' => [ControlPlaneProxyEnrollmentPhase::Prepared, 'state file'],
     'prepared dynamic' => [ControlPlaneProxyEnrollmentPhase::Prepared, 'dynamic'],
     'activating override' => [ControlPlaneProxyEnrollmentPhase::Activating, 'override'],
-    'activating state symlink' => [ControlPlaneProxyEnrollmentPhase::Activating, 'state symlink'],
-    'activating state file' => [ControlPlaneProxyEnrollmentPhase::Activating, 'state file'],
+    'activating state' => [ControlPlaneProxyEnrollmentPhase::Activating, 'state'],
     'activating dynamic' => [ControlPlaneProxyEnrollmentPhase::Activating, 'dynamic'],
 ]);
 
