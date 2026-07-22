@@ -147,7 +147,7 @@ it('serializes enrollment mutations on a dedicated postgres session lock', funct
     $connectionName = 'control_plane_enrollment_lock_competitor';
     config()->set("database.connections.{$connectionName}", config('database.connections.'.DB::getDefaultConnection()));
     $competitor = DB::connection($connectionName);
-    $lockName = 'coolify:control-plane-proxy-enrollment:'.$fixture['server']->getKey();
+    $lockName = StoreControlPlaneProxyEnrollmentState::operationLockName($fixture['server']->getKey());
 
     try {
         $fixture['store']->serializeOperation($fixture['server'], function () use ($competitor, $lockName): void {
@@ -173,7 +173,7 @@ it('serializes enrollment mutations on a dedicated postgres session lock', funct
     }
 });
 
-it('aborts only an unchanged prepared local enrollment and admits a new owner', function (): void {
+it('aborts only an unchanged prepared local enrollment and keeps the tombstone until exact reconciliation', function (): void {
     $fixture = preparedEnrollmentAbortFixture();
     $this->preparedAbortRoot = $fixture['root'];
 
@@ -211,6 +211,11 @@ it('aborts only an unchanged prepared local enrollment and admits a new owner', 
         createdAt: '2026-07-22T01:00:00Z',
         updatedAt: '2026-07-22T01:00:00Z',
     );
+
+    expect(fn () => $fixture['store']->reserve($fixture['server'], $replacement, 'new-token'))
+        ->toThrow(RuntimeException::class, 'already owns this server');
+
+    $fixture['store']->clearRolledBackIfUnchanged($fixture['server'], $rolledBack);
 
     expect($fixture['store']->reserve($fixture['server'], $replacement, 'new-token')->operationId)
         ->toBe('corrected-enrollment');

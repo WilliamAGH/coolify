@@ -797,6 +797,80 @@ it('replays enrollment rollback finalization after its state directory has alrea
     }
 });
 
+it('inspects exact rollback finalization without recreating writer state', function (): void {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $filesystem->mkdir($root.'/dynamic', 0700);
+        $enrollment = managedTraefikDocumentMutation(
+            $root,
+            'control-plane-enrollment-finalization-inspection',
+            1,
+            "http:\n  routers:\n    enrollment: {}\n",
+        );
+        $writer = new ManagedTraefikDocumentWriter;
+        $command = $writer->inspectEnrollmentRollbackFinalizationCommandFor($enrollment);
+
+        $finalized = runManagedTraefikDocumentCommand($command);
+        $filesystem->mkdir($enrollment->stateDirectory, 0700);
+        $emptyCleanup = runManagedTraefikDocumentCommand($command);
+        file_put_contents($enrollment->lockPath(), '');
+        $lockedCleanup = runManagedTraefikDocumentCommand($command);
+        $cleaned = runManagedTraefikDocumentCommand(
+            $writer->finalizePartialEnrollmentRollbackCommandFor($enrollment),
+        );
+
+        expect($finalized->isSuccessful())->toBeTrue($finalized->getErrorOutput())
+            ->and(trim($finalized->getOutput()))->toBe(ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT)
+            ->and($emptyCleanup->isSuccessful())->toBeTrue($emptyCleanup->getErrorOutput())
+            ->and(trim($emptyCleanup->getOutput()))->toBe(ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_CLEANUP_PENDING_OUTPUT)
+            ->and($lockedCleanup->isSuccessful())->toBeTrue($lockedCleanup->getErrorOutput())
+            ->and(trim($lockedCleanup->getOutput()))->toBe(ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_CLEANUP_PENDING_OUTPUT)
+            ->and($cleaned->isSuccessful())->toBeTrue($cleaned->getErrorOutput())
+            ->and(trim($cleaned->getOutput()))->toBe(ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT)
+            ->and(file_exists($enrollment->stateDirectory))->toBeFalse();
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('finalizes a replayed enrollment rollback whose forward artifact is already absent', function (): void {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $filesystem->mkdir([$root.'/dynamic', $root.'/state'], 0700);
+        $writer = new ManagedTraefikDocumentWriter;
+        $enrollment = managedTraefikDocumentMutation(
+            $root,
+            'control-plane-enrollment-finalize-without-artifact',
+            1,
+            "http:\n  routers:\n    enrollment: {}\n",
+        );
+        $replacementAuthority = managedTraefikDocumentWriterAuthority($enrollment, epoch: 1);
+        $rolledBackAuthority = managedTraefikDocumentEnrollmentRollbackAuthority($enrollment, $replacementAuthority);
+
+        $rolledBack = runManagedTraefikDocumentCommand($writer->rollbackEnrollmentCommandFor(
+            $enrollment,
+            $replacementAuthority,
+            $rolledBackAuthority,
+        ));
+        $finalized = runManagedTraefikDocumentCommand(
+            $writer->finalizeEnrollmentRollbackCommandFor($enrollment, $rolledBackAuthority),
+        );
+
+        expect($rolledBack->isSuccessful())->toBeTrue($rolledBack->getErrorOutput())
+            ->and(trim($rolledBack->getOutput()))->toBe(ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT)
+            ->and(file_exists($enrollment->rollbackArtifactPath()))->toBeFalse()
+            ->and($finalized->isSuccessful())->toBeTrue($finalized->getErrorOutput())
+            ->and(trim($finalized->getOutput()))->toBe(ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT)
+            ->and(file_exists($enrollment->stateDirectory))->toBeFalse();
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
 it('rejects foreign enrollment rollback authority and unknown state files without cleanup', function (): void {
     $filesystem = new Filesystem;
     $root = managedTraefikDocumentRoot();

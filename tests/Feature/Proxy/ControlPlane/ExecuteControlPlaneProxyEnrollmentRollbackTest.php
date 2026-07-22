@@ -1,6 +1,7 @@
 <?php
 
 use App\Actions\Proxy\ControlPlane\BootstrapControlPlaneEnrollmentWriterAuthority;
+use App\Actions\Proxy\ControlPlane\ControlPlaneCandidateHealthMarker;
 use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentPhase;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentState;
@@ -13,7 +14,9 @@ use App\Actions\Proxy\ControlPlane\InspectControlPlaneEnrollmentWriter;
 use App\Actions\Proxy\ControlPlane\InspectControlPlaneEnrollmentWriterAuthority;
 use App\Actions\Proxy\ControlPlane\InstallControlPlaneCandidateHealthMarkers;
 use App\Actions\Proxy\ControlPlane\ManagedTraefikDocumentWriter;
+use App\Actions\Proxy\ControlPlane\ManagedTraefikDocumentWriterAuthority;
 use App\Actions\Proxy\ControlPlane\NormalizeControlPlaneEnrollmentFilesystem;
+use App\Actions\Proxy\ControlPlane\StoreControlPlaneGenerationPromotionState;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
 use App\Actions\Proxy\ControlPlane\VerifyControlPlaneRestoredRoutes;
 use App\Models\Server;
@@ -22,11 +25,12 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 
 uses(RefreshDatabase::class);
 
-function executableControlPlaneRollback(): array
-{
+function executableControlPlaneRollback(
+    ControlPlaneProxyEnrollmentPhase $phase = ControlPlaneProxyEnrollmentPhase::Active,
+): array {
     $server = Server::factory()->create(['team_id' => Team::factory()->create()->id]);
     $state = new ControlPlaneProxyEnrollmentState(
-        phase: ControlPlaneProxyEnrollmentPhase::Active,
+        phase: $phase,
         operationId: 'execute-control-plane-rollback',
         tokenSha256: hash('sha256', 'rollback-token'),
         serverId: (int) $server->getKey(),
@@ -103,6 +107,15 @@ function executableControlPlaneAuthorityAbsentTranscript(): string
     ]);
 }
 
+function executableControlPlaneAuthorityTranscript(ManagedTraefikDocumentWriterAuthority $authority): string
+{
+    return implode("\n", [
+        InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_BEGIN,
+        InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_RECORD.' '.base64_encode($authority->toJson()),
+        InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_END,
+    ]);
+}
+
 function executableControlPlaneWriterInspectionTranscript(): string
 {
     return implode("\n", [
@@ -123,6 +136,7 @@ it('persists rollback before self-replacement and requires a fresh replay to fin
         }
 
         return match (true) {
+            str_contains($command, ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_PENDING_OUTPUT) => ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_PENDING_OUTPUT,
             str_contains($command, NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT) => NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT,
             str_contains($command, InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_BEGIN) => executableControlPlaneAuthorityAbsentTranscript(),
             str_contains($command, InspectControlPlaneEnrollmentWriter::TRANSCRIPT_BEGIN) => executableControlPlaneWriterInspectionTranscript(),
@@ -143,7 +157,7 @@ it('persists rollback before self-replacement and requires a fresh replay to fin
         ->and($awaitingAcknowledgement->phase)->toBe(ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement)
         ->and($rolledBack->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack)
         ->and($replayed->toArray())->toBe($rolledBack->toArray())
-        ->and($calls)->toBe(14)
+        ->and($calls)->toBe(15)
         ->and($staticHandoffCommand)->toContain("sed -n 's/^[^ ]* -> //p'")
         ->and($server->fresh()?->proxy->get('last_saved_proxy_configuration'))->toBe($rolledBack->staticPredecessorBytes)
         ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack);
@@ -205,4 +219,110 @@ it('keeps ambiguous static rollback durably resumable and rejects foreign owners
         },
     ))->toThrow(RuntimeException::class, 'another operation');
     expect($remoteCalls)->toBe(0);
+});
+
+it('rejects a promoted writer authority before claiming terminal enrollment rollback', function (): void {
+    [$server, $store, $action] = executableControlPlaneRollback(ControlPlaneProxyEnrollmentPhase::Enrolled);
+    $promotedAuthority = new ManagedTraefikDocumentWriterAuthority(
+        epoch: 3,
+        operationId: 'newer-generation-promotion',
+        member: 'green',
+        containerId: str_repeat('c', 64),
+        containerName: 'coolify-web-c',
+        imageId: 'sha256:'.str_repeat('d', 64),
+        dynamicRevision: 3,
+        dynamicSha256: str_repeat('e', 64),
+    );
+    $remoteCounter = (object) ['calls' => 0];
+
+    expect(fn () => $action->handle(
+        $server,
+        'execute-control-plane-rollback',
+        'rollback-token',
+        static function (string $command) use ($remoteCounter, $promotedAuthority): string {
+            $remoteCounter->calls++;
+
+            return match (true) {
+                str_contains($command, InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_BEGIN) => executableControlPlaneAuthorityTranscript($promotedAuthority),
+                default => throw new RuntimeException("Rollback mutated remote state before rejecting promoted authority: {$command}"),
+            };
+        },
+    ))->toThrow(RuntimeException::class, 'not owned by this exact rollback');
+    expect($remoteCounter->calls)->toBe(1)
+        ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Enrolled);
+});
+
+it('rejects rollback before remote execution while generation promotion state exists', function (): void {
+    [$server, $store, $action] = executableControlPlaneRollback();
+    $server->proxy->set(StoreControlPlaneGenerationPromotionState::STATE_KEY, ['present' => true]);
+    $server->save();
+    $remoteCalls = 0;
+
+    expect(fn () => $action->handle(
+        $server,
+        'execute-control-plane-rollback',
+        'rollback-token',
+        static function (string $command) use (&$remoteCalls): string {
+            $remoteCalls++;
+
+            return '';
+        },
+    ))->toThrow(RuntimeException::class, 'generation promotion state exists')
+        ->and($remoteCalls)->toBe(0)
+        ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Active);
+});
+
+it('replays a crash after remote rollback finalization without the retired backend', function (): void {
+    [$server, $store, $action] = executableControlPlaneRollback(
+        ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement,
+    );
+    $remoteCalls = 0;
+
+    $rolledBack = $action->handle(
+        $server,
+        'execute-control-plane-rollback',
+        'rollback-token',
+        static function (string $command) use (&$remoteCalls): string {
+            $remoteCalls++;
+
+            return match (true) {
+                str_contains($command, ControlPlaneCandidateHealthMarker::CONTAINER_MARKER_PATH) => '',
+                str_contains($command, ControlPlaneRestoredRoutesProof::TRANSCRIPT_BEGIN) => executableControlPlaneRestoredTranscript(),
+                str_contains($command, ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_PENDING_OUTPUT) => ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT,
+                default => throw new RuntimeException("Finalized rollback replay attempted remote mutation: {$command}"),
+            };
+        },
+    );
+
+    expect($rolledBack->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack)
+        ->and($remoteCalls)->toBe(3)
+        ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack);
+});
+
+it('finishes authority-less partial rollback cleanup without the retired backend', function (): void {
+    [$server, $store, $action] = executableControlPlaneRollback(
+        ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement,
+    );
+    $remoteCalls = 0;
+
+    $rolledBack = $action->handle(
+        $server,
+        'execute-control-plane-rollback',
+        'rollback-token',
+        static function (string $command) use (&$remoteCalls): string {
+            $remoteCalls++;
+
+            return match (true) {
+                str_contains($command, ControlPlaneCandidateHealthMarker::CONTAINER_MARKER_PATH) => '',
+                str_contains($command, ControlPlaneRestoredRoutesProof::TRANSCRIPT_BEGIN) => executableControlPlaneRestoredTranscript(),
+                str_contains($command, ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_CLEANUP_PENDING_OUTPUT) => ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_CLEANUP_PENDING_OUTPUT,
+                str_contains($command, 'assert_cleanup_only_state') => ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT,
+                default => throw new RuntimeException("Partial rollback cleanup inspected the retired backend: {$command}"),
+            };
+        },
+    );
+
+    expect($rolledBack->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack)
+        ->and($remoteCalls)->toBe(4)
+        ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack);
 });

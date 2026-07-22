@@ -19,6 +19,7 @@ final class StoreControlPlaneGenerationPromotionState
         string $token,
     ): ControlPlaneGenerationPromotionState {
         return DB::transaction(function () use ($server, $state, $token): ControlPlaneGenerationPromotionState {
+            $this->lockEnrollmentOwnership($server);
             $lockedServer = $this->lockServer($server);
             if ($state->serverId !== (int) $lockedServer->getKey() || ! $state->isOwnedBy($state->operationId, $token)) {
                 throw new RuntimeException('The control-plane generation promotion reservation does not match its server or token.');
@@ -307,6 +308,23 @@ final class StoreControlPlaneGenerationPromotionState
     {
         return Server::query()->whereKey($server->getKey())->lockForUpdate()->first()
             ?? throw new RuntimeException('The control-plane generation promotion server no longer exists.');
+    }
+
+    private function lockEnrollmentOwnership(Server $server): void
+    {
+        $connection = DB::connection();
+        if ($connection->getDriverName() === 'sqlite') {
+            return;
+        }
+        if ($connection->getDriverName() !== 'pgsql') {
+            throw new RuntimeException('Control-plane ownership serialization requires PostgreSQL.');
+        }
+
+        $connection->selectOne(
+            'select pg_advisory_xact_lock(hashtextextended(?, 0))',
+            [StoreControlPlaneProxyEnrollmentState::operationLockName($server->getKey())],
+            false,
+        );
     }
 
     private function enrolledState(Server $server): ControlPlaneProxyEnrollmentState

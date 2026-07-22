@@ -198,7 +198,7 @@ it('resumes a fenced enrollment across self-replacement without exposing its tok
         ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Enrolled);
 });
 
-it('repairs missing writer authority for a terminal legacy enrollment', function (): void {
+it('keeps a terminal enrollment replay remote-side-effect free when legacy authority is absent', function (): void {
     [$server, $store, , $action] = resumableControlPlaneEnrollment();
     $timestamp = '2026-07-19T12:01:00Z';
     foreach ([
@@ -219,18 +219,12 @@ it('repairs missing writer authority for a terminal legacy enrollment', function
         function (string $command) use (&$remoteCalls): string {
             $remoteCalls++;
 
-            return match (true) {
-                str_contains($command, NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT) => NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT,
-                str_contains($command, InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_BEGIN) => resumedControlPlaneWriterAuthorityAbsentTranscript(),
-                str_contains($command, InspectControlPlaneEnrollmentWriter::TRANSCRIPT_BEGIN) => resumedControlPlaneWriterInspectionTranscript(),
-                str_contains($command, BootstrapControlPlaneEnrollmentWriterAuthority::APPLIED_OUTPUT) => BootstrapControlPlaneEnrollmentWriterAuthority::APPLIED_OUTPUT,
-                default => throw new RuntimeException("Unexpected remote call {$remoteCalls}: {$command}"),
-            };
+            throw new RuntimeException("Unexpected remote call {$remoteCalls}: {$command}");
         },
     );
 
     expect($enrolled->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Enrolled)
-        ->and($remoteCalls)->toBe(4)
+        ->and($remoteCalls)->toBe(0)
         ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Enrolled);
 });
 
@@ -265,15 +259,11 @@ it('preserves a valid newer writer authority for a terminal enrollment', functio
         function (string $command) use (&$remoteCalls, $newerAuthority): string {
             $remoteCalls++;
 
-            return match (true) {
-                str_contains($command, NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT) => NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT,
-                str_contains($command, InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_BEGIN) => resumedControlPlaneWriterAuthorityTranscript($newerAuthority),
-                default => throw new RuntimeException("Unexpected remote call {$remoteCalls}: {$command}"),
-            };
+            throw new RuntimeException("Unexpected remote call {$remoteCalls}: {$command} {$newerAuthority->operationId}");
         },
     );
 
     expect($enrolled->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Enrolled)
-        ->and($remoteCalls)->toBe(2)
+        ->and($remoteCalls)->toBe(0)
         ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Enrolled);
 });

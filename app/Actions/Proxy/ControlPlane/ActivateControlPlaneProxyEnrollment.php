@@ -50,6 +50,9 @@ final class ActivateControlPlaneProxyEnrollment
         ?Closure $remoteExecutor,
     ): ControlPlaneProxyEnrollmentState {
         $state = $this->ownedState($server, $operationId, $token);
+        if ($state->phase === ControlPlaneProxyEnrollmentPhase::Enrolled) {
+            return $state;
+        }
         $execute = $remoteExecutor ?? static fn (string $command): ?string => instant_remote_process(
             [$command],
             $server,
@@ -60,7 +63,6 @@ final class ActivateControlPlaneProxyEnrollment
         if (in_array($state->phase, [
             ControlPlaneProxyEnrollmentPhase::Active,
             ControlPlaneProxyEnrollmentPhase::Finalizing,
-            ControlPlaneProxyEnrollmentPhase::Enrolled,
         ], true)) {
             $this->repairActivatedEnrollment($server, $state, $execute);
 
@@ -193,9 +195,6 @@ final class ActivateControlPlaneProxyEnrollment
                 $execute,
             );
 
-            return;
-        }
-        if ($state->phase === ControlPlaneProxyEnrollmentPhase::Enrolled) {
             return;
         }
         $expectedAuthority = $this->writerAuthorityBootstrap->authorityFor(

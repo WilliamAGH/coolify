@@ -16,6 +16,10 @@ final class ManagedTraefikDocumentWriter
 
     public const ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT = 'coolify-managed-traefik-document:enrollment-rollback-finalized';
 
+    public const ENROLLMENT_ROLLBACK_PENDING_OUTPUT = 'coolify-managed-traefik-document:enrollment-rollback-pending';
+
+    public const ENROLLMENT_ROLLBACK_CLEANUP_PENDING_OUTPUT = 'coolify-managed-traefik-document:enrollment-rollback-cleanup-pending';
+
     public const WRITER_AUTHORITY_PROMOTED_OUTPUT = 'coolify-managed-traefik-writer-authority:promoted';
 
     private const ARTIFACT_MAGIC = 'coolify-managed-traefik-document-rollback-v1';
@@ -111,6 +115,7 @@ final class ManagedTraefikDocumentWriter
             rollback: true,
             requiredAuthority: $replacementAuthority,
             nextAuthority: $rolledBackAuthority,
+            allowMissingArtifactNoop: true,
             allowAuthorityAbsence: true,
         );
     }
@@ -213,7 +218,11 @@ final class ManagedTraefikDocumentWriter
             '    durable_remote_assert_owned_regular "$state_path" || return 1',
             '    state_file_count=$((state_file_count + 1))',
             '  done',
-            '  test "$state_file_count" = 3',
+            '  if [ -e "$artifact_path" ] || [ -L "$artifact_path" ]; then',
+            '    test "$state_file_count" = 3',
+            '  else',
+            '    test "$state_file_count" = 2',
+            '  fi',
             '}',
             'cleanup_owned_writer_scratch() {',
             '  for scratch_path in "$state_directory"/.managed-traefik-document.*; do',
@@ -268,16 +277,163 @@ final class ManagedTraefikDocumentWriter
             'cleanup_owned_writer_scratch || fail',
             'state_contains_only_enrollment_rollback_files || fail',
             'authority_matches_rollback || fail',
-            'artifact_matches_mutation || fail',
+            'if [ -e "$artifact_path" ] || [ -L "$artifact_path" ]; then artifact_matches_mutation || fail; fi',
             'if [ "$expected_document_sha" = absent ]; then',
             '  durable_remote_remove "$document_path" "$dynamic_directory" || fail',
             'else',
             '  durable_remote_reaffirm "$document_path" "$dynamic_directory" || fail',
             'fi',
-            'durable_remote_remove "$authority_path" "$state_directory" || fail',
             'durable_remote_remove "$artifact_path" "$state_directory" || fail',
             'durable_remote_remove "$sidecar_path" "$state_directory" || fail',
+            'durable_remote_remove "$authority_path" "$state_directory" || fail',
             'durable_remote_remove "$lock_path" "$state_directory" || fail',
+            'rmdir "$state_directory" || fail',
+            'sync "$state_parent_directory" || fail',
+            'printf %s "$finalized_output"',
+        ]);
+    }
+
+    public function inspectEnrollmentRollbackFinalizationCommandFor(
+        ManagedTraefikDocumentMutation $mutation,
+    ): string {
+        if ($mutation->expectedSidecar() !== null) {
+            throw new InvalidArgumentException('Enrollment rollback finalization inspection requires an unmanaged predecessor state.');
+        }
+
+        return implode("\n", [
+            'set -eu',
+            'umask 077',
+            'dynamic_directory='.escapeshellarg($mutation->dynamicDirectory),
+            'state_directory='.escapeshellarg($mutation->stateDirectory),
+            'state_parent_directory='.escapeshellarg(dirname(rtrim($mutation->stateDirectory, '/'))),
+            'document_path='.escapeshellarg($mutation->documentPath()),
+            'sidecar_path='.escapeshellarg($mutation->sidecarPath()),
+            'lock_path='.escapeshellarg($mutation->lockPath()),
+            'expected_document_sha='.escapeshellarg($mutation->expectedSha256 ?? 'absent'),
+            'pending_output='.escapeshellarg(self::ENROLLMENT_ROLLBACK_PENDING_OUTPUT),
+            'cleanup_pending_output='.escapeshellarg(self::ENROLLMENT_ROLLBACK_CLEANUP_PENDING_OUTPUT),
+            'finalized_output='.escapeshellarg(self::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT),
+            '',
+            'fail() { exit 1; }',
+            'pending() { printf %s "$pending_output"; exit 0; }',
+            ...DurableRemoteArtifact::shellFunctions(),
+            'assert_trusted_legacy_directory() {',
+            '  [ -d "$1" ] && [ ! -L "$1" ] || return 1',
+            '  trusted_owner_uid=$(durable_remote_owner_uid "$1") || return 1',
+            '  if [ "$trusted_owner_uid" != 0 ] && [ "$trusted_owner_uid" != 9999 ] && [ "$trusted_owner_uid" != "$(id -u)" ]; then return 1; fi',
+            '  trusted_permissions=$(durable_remote_permissions "$1") || return 1',
+            '  case "$trusted_permissions" in ???|????) ;; *) return 1 ;; esac',
+            '  case "$trusted_permissions" in *[!0-7]*) return 1 ;; esac',
+            '  trusted_other_permissions=${trusted_permissions#"${trusted_permissions%?}"}',
+            '  trusted_owner_group_permissions=${trusted_permissions%?}',
+            '  trusted_group_permissions=${trusted_owner_group_permissions#"${trusted_owner_group_permissions%?}"}',
+            '  case "${trusted_group_permissions}${trusted_other_permissions}" in *[2367]*) return 1 ;; esac',
+            '}',
+            'assert_trusted_legacy_regular() {',
+            '  [ -f "$1" ] && [ ! -L "$1" ] || return 1',
+            '  trusted_owner_uid=$(durable_remote_owner_uid "$1") || return 1',
+            '  if [ "$trusted_owner_uid" != 0 ] && [ "$trusted_owner_uid" != 9999 ] && [ "$trusted_owner_uid" != "$(id -u)" ]; then return 1; fi',
+            '  [ "$(durable_remote_link_count "$1")" = 1 ]',
+            '}',
+            'assert_trusted_legacy_directory "$state_parent_directory" || fail',
+            'assert_trusted_legacy_directory "$dynamic_directory" || fail',
+            'if [ -e "$sidecar_path" ] || [ -L "$sidecar_path" ]; then pending; fi',
+            'if [ "$expected_document_sha" = absent ]; then',
+            '  if [ -e "$document_path" ] || [ -L "$document_path" ]; then pending; fi',
+            'else',
+            '  if [ ! -e "$document_path" ] || [ -L "$document_path" ] || [ ! -f "$document_path" ]; then pending; fi',
+            '  assert_trusted_legacy_regular "$document_path" || fail',
+            '  document_checksum=$(sha256sum "$document_path") || fail',
+            '  if [ "${document_checksum%% *}" != "$expected_document_sha" ]; then pending; fi',
+            'fi',
+            'if [ ! -e "$state_directory" ] && [ ! -L "$state_directory" ]; then',
+            '  printf %s "$finalized_output"',
+            '  exit 0',
+            'fi',
+            'assert_trusted_legacy_directory "$state_directory" || pending',
+            'cleanup_only=true',
+            'for state_path in "$state_directory"/* "$state_directory"/.*; do',
+            '  [ -e "$state_path" ] || [ -L "$state_path" ] || continue',
+            '  case "${state_path##*/}" in .|..) continue ;; esac',
+            '  if [ "$state_path" != "$lock_path" ] || ! assert_trusted_legacy_regular "$state_path"; then cleanup_only=false; fi',
+            'done',
+            'if [ "$cleanup_only" = true ]; then printf %s "$cleanup_pending_output"; exit 0; fi',
+            'pending',
+        ]);
+    }
+
+    public function finalizePartialEnrollmentRollbackCommandFor(
+        ManagedTraefikDocumentMutation $mutation,
+    ): string {
+        if ($mutation->expectedSidecar() !== null) {
+            throw new InvalidArgumentException('Partial enrollment rollback finalization requires an unmanaged predecessor state.');
+        }
+
+        return implode("\n", [
+            'set -eu',
+            'umask 077',
+            'dynamic_directory='.escapeshellarg($mutation->dynamicDirectory),
+            'state_directory='.escapeshellarg($mutation->stateDirectory),
+            'state_parent_directory='.escapeshellarg(dirname(rtrim($mutation->stateDirectory, '/'))),
+            'document_path='.escapeshellarg($mutation->documentPath()),
+            'sidecar_path='.escapeshellarg($mutation->sidecarPath()),
+            'lock_path='.escapeshellarg($mutation->lockPath()),
+            'expected_document_sha='.escapeshellarg($mutation->expectedSha256 ?? 'absent'),
+            'finalized_output='.escapeshellarg(self::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT),
+            '',
+            'fail() { exit 1; }',
+            ...DurableRemoteArtifact::shellFunctions(),
+            'assert_trusted_legacy_directory() {',
+            '  [ -d "$1" ] && [ ! -L "$1" ] || return 1',
+            '  trusted_owner_uid=$(durable_remote_owner_uid "$1") || return 1',
+            '  if [ "$trusted_owner_uid" != 0 ] && [ "$trusted_owner_uid" != 9999 ] && [ "$trusted_owner_uid" != "$(id -u)" ]; then return 1; fi',
+            '  trusted_permissions=$(durable_remote_permissions "$1") || return 1',
+            '  case "$trusted_permissions" in ???|????) ;; *) return 1 ;; esac',
+            '  case "$trusted_permissions" in *[!0-7]*) return 1 ;; esac',
+            '  trusted_other_permissions=${trusted_permissions#"${trusted_permissions%?}"}',
+            '  trusted_owner_group_permissions=${trusted_permissions%?}',
+            '  trusted_group_permissions=${trusted_owner_group_permissions#"${trusted_owner_group_permissions%?}"}',
+            '  case "${trusted_group_permissions}${trusted_other_permissions}" in *[2367]*) return 1 ;; esac',
+            '}',
+            'assert_trusted_legacy_regular() {',
+            '  [ -f "$1" ] && [ ! -L "$1" ] || return 1',
+            '  trusted_owner_uid=$(durable_remote_owner_uid "$1") || return 1',
+            '  if [ "$trusted_owner_uid" != 0 ] && [ "$trusted_owner_uid" != 9999 ] && [ "$trusted_owner_uid" != "$(id -u)" ]; then return 1; fi',
+            '  [ "$(durable_remote_link_count "$1")" = 1 ]',
+            '}',
+            'assert_document_predecessor() {',
+            '  if [ "$expected_document_sha" = absent ]; then',
+            '    [ ! -e "$document_path" ] && [ ! -L "$document_path" ]',
+            '    return',
+            '  fi',
+            '  assert_trusted_legacy_regular "$document_path" || return 1',
+            '  document_checksum=$(sha256sum "$document_path") || return 1',
+            '  [ "${document_checksum%% *}" = "$expected_document_sha" ]',
+            '}',
+            'assert_cleanup_only_state() {',
+            '  for state_path in "$state_directory"/* "$state_directory"/.*; do',
+            '    [ -e "$state_path" ] || [ -L "$state_path" ] || continue',
+            '    case "${state_path##*/}" in .|..) continue ;; esac',
+            '    [ "$state_path" = "$lock_path" ] || return 1',
+            '    assert_trusted_legacy_regular "$state_path" || return 1',
+            '  done',
+            '}',
+            'assert_trusted_legacy_directory "$state_parent_directory" || fail',
+            'assert_trusted_legacy_directory "$dynamic_directory" || fail',
+            'assert_trusted_legacy_directory "$state_directory" || fail',
+            '[ ! -e "$sidecar_path" ] && [ ! -L "$sidecar_path" ] || fail',
+            'assert_document_predecessor || fail',
+            'assert_cleanup_only_state || fail',
+            'if [ -e "$lock_path" ] || [ -L "$lock_path" ]; then',
+            '  assert_trusted_legacy_regular "$lock_path" || fail',
+            '  command -v flock >/dev/null 2>&1 || fail',
+            '  exec 9< "$lock_path" || fail',
+            '  flock -x 9 || fail',
+            'fi',
+            'assert_cleanup_only_state || fail',
+            '[ ! -e "$sidecar_path" ] && [ ! -L "$sidecar_path" ] || fail',
+            'assert_document_predecessor || fail',
+            'if [ -e "$lock_path" ] || [ -L "$lock_path" ]; then rm -f -- "$lock_path" || fail; fi',
             'rmdir "$state_directory" || fail',
             'sync "$state_parent_directory" || fail',
             'printf %s "$finalized_output"',
@@ -1166,7 +1322,7 @@ final class ManagedTraefikDocumentWriter
         ManagedTraefikDocumentWriterAuthority $rolledBackAuthority,
     ): void {
         if ($mutation->expectedSidecar() !== null
-            || $rolledBackAuthority->epoch < 2
+            || $rolledBackAuthority->epoch !== 2
             || ! hash_equals($rolledBackAuthority->operationId, $mutation->operationId)
             || $rolledBackAuthority->dynamicRevision !== $mutation->revision
             || ! hash_equals(
