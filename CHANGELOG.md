@@ -4,9 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🚀 Features
+
+- *(api)* Expose active container image reference
+
+### 🐛 Bug Fixes
+
+- *(proxy)* Allow empty prepared state directory
+
 ### 📚 Documentation
 
 - Update changelog (#123)
+- Update changelog (#125)
 
 ## [4.13.12-fork] - 2026-07-22
 
@@ -19,10 +28,6 @@ All notable changes to this project will be documented in this file.
 - Update changelog (#121)
 
 ## [4.13.11-fork] - 2026-07-22
-
-### 🚀 Features
-
-- *(api)* Expose active container image reference
 
 ### 🐛 Bug Fixes
 
