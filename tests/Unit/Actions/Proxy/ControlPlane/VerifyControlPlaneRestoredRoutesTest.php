@@ -1,5 +1,6 @@
 <?php
 
+use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyRouteProof;
 use App\Actions\Proxy\ControlPlane\ControlPlaneRestoredRoutesProof;
 use App\Actions\Proxy\ControlPlane\VerifyControlPlaneRestoredRoutes;
@@ -20,6 +21,23 @@ function controlPlaneRestoredRoutesProof(int $maximumAttempts = 5): ControlPlane
     );
 }
 
+function controlPlaneRestoredRoutesProofWithoutPublicPredecessor(int $maximumAttempts = 5): ControlPlaneRestoredRoutesProof
+{
+    return new ControlPlaneRestoredRoutesProof(
+        canonicalHost: 'dashboard.example.test',
+        publicScheme: 'https',
+        appPort: 8000,
+        expectedBackendMember: 'coolify',
+        expectedBackendRevision: 'rollback-1',
+        expectedDynamicPredecessorSha256: hash('sha256', ''),
+        maximumAttempts: $maximumAttempts,
+        pollIntervalSeconds: 0,
+        connectTimeoutSeconds: 1,
+        requestTimeoutSeconds: 1,
+        publicRouteExpected: false,
+    );
+}
+
 /** @param array<string, string> $headers */
 function controlPlaneRestoredRoutesProofRecord(
     ControlPlaneRestoredRoutesProof $proof,
@@ -29,11 +47,12 @@ function controlPlaneRestoredRoutesProofRecord(
     int $status = 200,
     int $curlExit = 0,
     bool $includeHeaders = true,
+    bool $includeExpectedHeaders = true,
 ): string {
     $statusCode = str_pad((string) $status, 3, '0', STR_PAD_LEFT);
     $lines = [ControlPlaneRestoredRoutesProof::TRANSCRIPT_BEGIN." {$route} {$attempt}"];
     if ($includeHeaders) {
-        $responseHeaders = [...$proof->expectedResponseHeaders(), ...$headers];
+        $responseHeaders = [...($includeExpectedHeaders ? $proof->expectedResponseHeaders() : []), ...$headers];
         $lines[] = "HTTP/2 {$statusCode}";
         foreach ($responseHeaders as $name => $value) {
             $lines[] = "{$name}: {$value}";
@@ -99,6 +118,89 @@ it('allows a delayed restored provider update before dual-route convergence', fu
         $proof,
         controlPlaneRestoredRoutesProofTranscript($records, ControlPlaneRestoredRoutesProof::TRANSCRIPT_CONVERGED.' 3'),
     ))->toBe($proof);
+});
+
+it('proves an absent public predecessor while requiring the exact restored APP_PORT route', function (): void {
+    $proof = controlPlaneRestoredRoutesProofWithoutPublicPredecessor();
+    $records = [];
+    foreach ([1, 2] as $attempt) {
+        $records[] = controlPlaneRestoredRoutesProofRecord(
+            $proof,
+            ControlPlaneProxyRouteProof::PUBLIC_ROUTE,
+            $attempt,
+            status: 503,
+            curlExit: 22,
+            includeHeaders: true,
+            includeExpectedHeaders: false,
+        );
+        $records[] = controlPlaneRestoredRoutesProofRecord(
+            $proof,
+            ControlPlaneProxyRouteProof::APP_PORT_ROUTE,
+            $attempt,
+        );
+    }
+
+    $transcript = controlPlaneRestoredRoutesProofTranscript(
+        $records,
+        ControlPlaneRestoredRoutesProof::TRANSCRIPT_CONVERGED.' 2',
+    );
+
+    expect(VerifyControlPlaneRestoredRoutes::run($proof, $transcript))->toBe($proof)
+        ->and($proof->shellCommand())->toContain('public:22:404|public:22:503)');
+});
+
+it('rejects a stale public route when the restored predecessor was absent', function (): void {
+    $proof = controlPlaneRestoredRoutesProofWithoutPublicPredecessor();
+    $records = [];
+    foreach ([1, 2] as $attempt) {
+        $records[] = controlPlaneRestoredRoutesProofRecord(
+            $proof,
+            ControlPlaneProxyRouteProof::PUBLIC_ROUTE,
+            $attempt,
+        );
+        $records[] = controlPlaneRestoredRoutesProofRecord(
+            $proof,
+            ControlPlaneProxyRouteProof::APP_PORT_ROUTE,
+            $attempt,
+        );
+    }
+
+    expect(fn (): ControlPlaneRestoredRoutesProof => VerifyControlPlaneRestoredRoutes::run(
+        $proof,
+        controlPlaneRestoredRoutesProofTranscript(
+            $records,
+            ControlPlaneRestoredRoutesProof::TRANSCRIPT_CONVERGED.' 2',
+        ),
+    ))->toThrow(InvalidArgumentException::class, 'unexpectedly exposes a managed backend identity');
+});
+
+it('rejects a failed public response carrying stale routing middleware identity', function (): void {
+    $proof = controlPlaneRestoredRoutesProofWithoutPublicPredecessor();
+    $records = [];
+    foreach ([1, 2] as $attempt) {
+        $records[] = controlPlaneRestoredRoutesProofRecord(
+            $proof,
+            ControlPlaneProxyRouteProof::PUBLIC_ROUTE,
+            $attempt,
+            headers: [ControlPlaneDynamicConfiguration::COLOR_HEADER => 'blue'],
+            status: 503,
+            curlExit: 22,
+            includeExpectedHeaders: false,
+        );
+        $records[] = controlPlaneRestoredRoutesProofRecord(
+            $proof,
+            ControlPlaneProxyRouteProof::APP_PORT_ROUTE,
+            $attempt,
+        );
+    }
+
+    expect(fn (): ControlPlaneRestoredRoutesProof => VerifyControlPlaneRestoredRoutes::run(
+        $proof,
+        controlPlaneRestoredRoutesProofTranscript(
+            $records,
+            ControlPlaneRestoredRoutesProof::TRANSCRIPT_CONVERGED.' 2',
+        ),
+    ))->toThrow(InvalidArgumentException::class, 'unexpectedly exposes a managed backend identity');
 });
 
 it('rejects stale and mixed restored markers', function (): void {
