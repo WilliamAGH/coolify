@@ -63,6 +63,7 @@ function enrollmentWriterAuthorityFixture(): array
     (new Filesystem)->mkdir([$bin, $dynamicDirectory, $stateDirectory], 0700);
     file_put_contents($mutation->documentPath(), $mutation->replacementBytes);
     file_put_contents($mutation->sidecarPath(), $mutation->replacementSidecar());
+    file_put_contents($mutation->lockPath(), '');
     file_put_contents($root.'/docker-state', implode("\n", [
         'docker_id='.str_repeat('a', 64),
         'container_name=coolify',
@@ -111,9 +112,9 @@ case "$1" in
   *) exit 64 ;;
 esac
 case "$format" in
-  %u) printf '%s\n' 0 ;;
+  %u) printf '%s\n' "${FAKE_STAT_OWNER_UID:-0}" ;;
   %h|%l) printf '%s\n' "${FAKE_STAT_LINK_COUNT:-1}" ;;
-  %a|%Lp) printf '%s\n' 640 ;;
+  %a|%Lp) printf '%s\n' "${FAKE_STAT_MODE:-640}" ;;
   %u:%g:%a|%u:%g:%Lp) printf '%s\n' "${FAKE_AUTHORITY_METADATA:-0:9999:640}" ;;
   *) exit 64 ;;
 esac
@@ -227,17 +228,46 @@ it('inspects absent and exact canonical authority while deriving one fenced enro
         $absent = runEnrollmentWriterAuthorityCommand($inspector->commandFor($fixture['mutation']), $fixture);
         file_put_contents($fixture['mutation']->writerAuthorityPath(), $authority->toJson());
         $present = runEnrollmentWriterAuthorityCommand($inspector->commandFor($fixture['mutation']), $fixture);
+        $trustedLegacy = runEnrollmentWriterAuthorityCommand($inspector->commandFor($fixture['mutation']), $fixture, [
+            'FAKE_STAT_OWNER_UID' => 9999,
+        ]);
 
         expect($absent->isSuccessful())->toBeTrue($absent->getErrorOutput())
             ->and($inspector->handle($absent->getOutput()))->toBeNull()
             ->and($present->isSuccessful())->toBeTrue($present->getErrorOutput())
             ->and($inspector->handle($present->getOutput())?->toJson())->toBe($authority->toJson())
+            ->and($trustedLegacy->isSuccessful())->toBeTrue($trustedLegacy->getErrorOutput())
+            ->and($inspector->handle($trustedLegacy->getOutput())?->toJson())->toBe($authority->toJson())
             ->and($rolledBackAuthority->epoch)->toBe(2)
             ->and($rolledBackAuthority->dynamicSha256)->toBe(hash('sha256', ''))
             ->and($rolledBackAuthority->hasSameWriterIdentityAs($authority))->toBeTrue()
             ->and(fn (): ?ManagedTraefikDocumentWriterAuthority => $inspector->handle(
                 InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_BEGIN."\nforeign\n".InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_END,
             ))->toThrow(InvalidArgumentException::class, 'record is invalid');
+    } finally {
+        $filesystem->remove($fixture['root']);
+    }
+});
+
+it('rejects writable or untrusted authority metadata without mutating it', function (): void {
+    $filesystem = new Filesystem;
+    $fixture = enrollmentWriterAuthorityFixture();
+    $inspector = new InspectControlPlaneEnrollmentWriterAuthority;
+    $authorityPath = $fixture['mutation']->writerAuthorityPath();
+    $authority = "foreign authority\n";
+
+    try {
+        file_put_contents($authorityPath, $authority);
+        $writable = runEnrollmentWriterAuthorityCommand($inspector->commandFor($fixture['mutation']), $fixture, [
+            'FAKE_STAT_MODE' => 662,
+        ]);
+        $untrusted = runEnrollmentWriterAuthorityCommand($inspector->commandFor($fixture['mutation']), $fixture, [
+            'FAKE_STAT_OWNER_UID' => 1234,
+        ]);
+
+        expect($writable->isSuccessful())->toBeFalse()
+            ->and($untrusted->isSuccessful())->toBeFalse()
+            ->and(file_get_contents($authorityPath))->toBe($authority);
     } finally {
         $filesystem->remove($fixture['root']);
     }

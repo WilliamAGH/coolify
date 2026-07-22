@@ -26,6 +26,29 @@ final class ManagedTraefikDocumentWriter
 
     private const JOURNAL_MAGIC = 'coolify-managed-traefik-document-journal-v1';
 
+    public function rollbackArtifactFor(
+        ManagedTraefikDocumentMutation $mutation,
+        ?string $predecessorBytes,
+    ): string {
+        if (($predecessorBytes === null) !== ($mutation->expectedSha256 === null)
+            || ($predecessorBytes !== null
+                && ! hash_equals($mutation->expectedSha256 ?? '', hash('sha256', $predecessorBytes)))) {
+            throw new InvalidArgumentException('The managed Traefik rollback artifact predecessor does not match its mutation.');
+        }
+
+        return implode("\n", [
+            self::ARTIFACT_MAGIC,
+            $mutation->filename,
+            $mutation->operationId,
+            (string) $mutation->revision,
+            $mutation->expectedSha256 ?? 'absent',
+            $mutation->replacementSha256(),
+            $mutation->expectedSidecar() === null ? 'absent' : base64_encode($mutation->expectedSidecar()),
+            $predecessorBytes === null ? 'absent' : base64_encode($predecessorBytes),
+            '',
+        ]);
+    }
+
     public function writeCommandFor(ManagedTraefikDocumentMutation $mutation): string
     {
         return $this->commandFor($mutation, false);
@@ -860,6 +883,7 @@ final class ManagedTraefikDocumentWriter
             '      else fail; fi',
             '    else',
             '      if document_matches "$document_path" "$original_replacement_document_sha" && sidecar_matches "$sidecar_path" "$original_replacement_sidecar_base64" "$expected_sidecar_file"; then :',
+            '      elif document_matches "$document_path" "$original_expected_document_sha" && sidecar_matches "$sidecar_path" "$original_replacement_sidecar_base64" "$expected_sidecar_file"; then :',
             '      elif document_matches "$document_path" "$original_expected_document_sha" && sidecar_matches "$sidecar_path" "$original_expected_sidecar_base64" "$replacement_sidecar_file"; then :',
             '      else fail; fi',
             '    fi',
@@ -959,10 +983,10 @@ final class ManagedTraefikDocumentWriter
             '  if ! { test "$mode" = rollback && test "$authority_mode" = rollback && test "$allow_missing_artifact_noop" = false && test "$allow_authority_bootstrap" = false && test "$allow_authority_absence" = false; }; then fail; fi',
             'fi',
             'if [ "$rollback_without_artifact" = true ]; then',
-            '  authorize_writer',
             '  if [ -e "$journal_path" ] || [ -L "$journal_path" ]; then fail; fi',
             '  document_matches "$document_path" "$original_expected_document_sha" || fail',
             '  sidecar_matches "$sidecar_path" "$original_expected_sidecar_base64" "$expected_sidecar_file" || fail',
+            '  authorize_writer',
             '  if [ "$original_expected_document_sha" = absent ]; then durable_remote_remove "$document_path" "$dynamic_directory" || fail; else durable_remote_reaffirm "$document_path" "$dynamic_directory" || fail; fi',
             '  if [ "$original_expected_sidecar_base64" = absent ]; then durable_remote_remove "$sidecar_path" "$state_directory" || fail; else durable_remote_reaffirm "$sidecar_path" "$state_directory" || fail; fi',
             '  durable_remote_remove "$journal_path" "$state_directory" || fail',
@@ -1000,6 +1024,13 @@ final class ManagedTraefikDocumentWriter
             '  if [ "$mode" = write ]; then validate_artifact; fi',
             '  authorize_writer',
             '  crash_after_authority_if_requested',
+            'elif [ "$mode" = rollback ] && document_matches "$document_path" "$replacement_document_sha" && sidecar_matches "$sidecar_path" "$expected_sidecar_base64" "$expected_sidecar_file"; then',
+            '  validate_artifact',
+            '  authorize_writer',
+            '  crash_after_authority_if_requested',
+            '  write_journal',
+            '  crash_after_journal_if_requested',
+            '  apply_journal',
             'elif document_matches "$document_path" "$expected_document_sha" && sidecar_matches "$sidecar_path" "$expected_sidecar_base64" "$expected_sidecar_file"; then',
             '  if [ "$mode" = write ] && { [ -e "$artifact_path" ] || [ -L "$artifact_path" ]; }; then validate_artifact; fi',
             '  authorize_writer',

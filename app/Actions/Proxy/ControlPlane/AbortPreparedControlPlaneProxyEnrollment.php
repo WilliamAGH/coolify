@@ -35,6 +35,7 @@ final class AbortPreparedControlPlaneProxyEnrollment
         private readonly InspectControlPlaneEnrollmentWriterAuthority $writerAuthorityInspector,
         private readonly InspectControlPlaneEnrollmentWriter $writerInspector,
         private readonly BootstrapControlPlaneEnrollmentWriterAuthority $writerAuthorityBootstrap,
+        private readonly NormalizeControlPlaneEnrollmentFilesystem $filesystemNormalizer,
         private readonly ?string $proxyPath = null,
         private readonly string $sourceDirectory = '/data/coolify/source',
     ) {}
@@ -148,6 +149,19 @@ final class AbortPreparedControlPlaneProxyEnrollment
                     containerName: $existingAuthority->containerName,
                     imageId: $existingAuthority->imageId,
                 );
+            }
+            $this->assertExactOutput(
+                $execute($this->filesystemNormalizer->commandFor($proxyPath, $sourceDirectory)),
+                NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT,
+                'filesystem normalization',
+            );
+            $normalizedAuthority = $this->inspectWriterAuthority($execute, $mutation);
+            if (($existingAuthority === null) !== ($normalizedAuthority === null)
+                || ($existingAuthority !== null && ! hash_equals(
+                    $existingAuthority->toJson(),
+                    $normalizedAuthority?->toJson() ?? '',
+                ))) {
+                throw new RuntimeException('The activating control-plane enrollment writer authority changed during filesystem normalization.');
             }
             $replacementAuthority = $this->writerAuthorityBootstrap->authorityFor($state, $beforeIdentity);
             $rolledBackAuthority = $this->writerAuthorityBootstrap->rolledBackAuthorityFor($state, $beforeIdentity);
@@ -328,7 +342,14 @@ final class AbortPreparedControlPlaneProxyEnrollment
             throw new RuntimeException('The control-plane enrollment writer authority inspection returned no transcript.');
         }
 
-        return $this->writerAuthorityInspector->handle($transcript);
+        try {
+            return $this->writerAuthorityInspector->handle($transcript);
+        } catch (InvalidArgumentException $exception) {
+            throw new RuntimeException(
+                'The control-plane enrollment writer authority inspection returned an invalid transcript.',
+                previous: $exception,
+            );
+        }
     }
 
     private function assertExactOutput(?string $output, string $expected, string $operation): void

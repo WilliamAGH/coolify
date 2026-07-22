@@ -10,6 +10,7 @@ use App\Actions\Proxy\ControlPlane\InspectControlPlaneEnrollmentWriter;
 use App\Actions\Proxy\ControlPlane\InspectControlPlaneEnrollmentWriterAuthority;
 use App\Actions\Proxy\ControlPlane\ManagedTraefikDocumentMutation;
 use App\Actions\Proxy\ControlPlane\ManagedTraefikDocumentWriter;
+use App\Actions\Proxy\ControlPlane\NormalizeControlPlaneEnrollmentFilesystem;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneGenerationPromotionState;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
 use App\Models\Server;
@@ -76,6 +77,7 @@ function preparedEnrollmentAbortFixture(
     $writerAuthorityInspector = new InspectControlPlaneEnrollmentWriterAuthority;
     $writerInspector = new InspectControlPlaneEnrollmentWriter;
     $writerAuthorityBootstrap = new BootstrapControlPlaneEnrollmentWriterAuthority;
+    $filesystemNormalizer = new NormalizeControlPlaneEnrollmentFilesystem;
     $remoteExecutor = static fn (string $command): string => trim((string) shell_exec($command));
 
     return [
@@ -89,6 +91,7 @@ function preparedEnrollmentAbortFixture(
         'writerAuthorityInspector' => $writerAuthorityInspector,
         'writerInspector' => $writerInspector,
         'writerAuthorityBootstrap' => $writerAuthorityBootstrap,
+        'filesystemNormalizer' => $filesystemNormalizer,
         'remote' => $remoteExecutor,
         'action' => new AbortPreparedControlPlaneProxyEnrollment(
             $store,
@@ -96,6 +99,7 @@ function preparedEnrollmentAbortFixture(
             $writerAuthorityInspector,
             $writerInspector,
             $writerAuthorityBootstrap,
+            $filesystemNormalizer,
             $proxyPath,
             $sourcePath,
         ),
@@ -129,6 +133,9 @@ function preparedEnrollmentRuntimeExecutor(Closure $artifactExecutor, string $sc
                 InspectControlPlaneEnrollmentWriter::TRANSCRIPT_RECORD.' '.str_repeat('a', 64).' /coolify sha256:'.str_repeat('b', 64).' true',
                 InspectControlPlaneEnrollmentWriter::TRANSCRIPT_END,
             ]);
+        }
+        if (str_contains($command, NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT)) {
+            return NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT;
         }
         if (! str_contains($command, '__COOLIFY_CONTROL_PLANE_LEGACY_RUNTIME__')) {
             return $artifactExecutor($command);
@@ -289,6 +296,7 @@ it('inspects prepared artifacts on the managed host', function (): void {
         $fixture['writerAuthorityInspector'],
         $fixture['writerInspector'],
         $fixture['writerAuthorityBootstrap'],
+        $fixture['filesystemNormalizer'],
     );
 
     expect($action->handle(
