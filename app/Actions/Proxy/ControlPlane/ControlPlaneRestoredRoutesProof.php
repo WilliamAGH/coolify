@@ -25,6 +25,7 @@ final readonly class ControlPlaneRestoredRoutesProof
         public string $expectedBackendMember,
         public string $expectedBackendRevision,
         public string $expectedDynamicPredecessorSha256,
+        public bool $expectedDynamicPredecessorAbsent = false,
         public int $maximumAttempts = 5,
         public int $pollIntervalSeconds = 3,
         public int $connectTimeoutSeconds = 2,
@@ -41,6 +42,10 @@ final readonly class ControlPlaneRestoredRoutesProof
         $this->assertIdentifier($expectedBackendRevision, 'expected backend revision');
         if (preg_match('/^[a-f0-9]{64}$/D', $expectedDynamicPredecessorSha256) !== 1) {
             throw new InvalidArgumentException('The expected restored dynamic predecessor checksum must be a SHA-256 value.');
+        }
+        if ($expectedDynamicPredecessorAbsent
+            && ! hash_equals(hash('sha256', ''), $expectedDynamicPredecessorSha256)) {
+            throw new InvalidArgumentException('An absent restored dynamic predecessor must use the empty SHA-256 value.');
         }
         if ($maximumAttempts < 2 || $maximumAttempts > 10) {
             throw new InvalidArgumentException('The restored control-plane route proof must allow between two and ten polling attempts.');
@@ -66,6 +71,19 @@ final readonly class ControlPlaneRestoredRoutesProof
         return "http://127.0.0.1:{$this->appPort}/api/health";
     }
 
+    /** @return list<string> */
+    public function routes(): array
+    {
+        if ($this->expectedDynamicPredecessorAbsent) {
+            return [ControlPlaneProxyRouteProof::APP_PORT_ROUTE];
+        }
+
+        return [
+            ControlPlaneProxyRouteProof::PUBLIC_ROUTE,
+            ControlPlaneProxyRouteProof::APP_PORT_ROUTE,
+        ];
+    }
+
     /** @return array<string, string> */
     public function expectedResponseHeaders(): array
     {
@@ -85,7 +103,7 @@ final readonly class ControlPlaneRestoredRoutesProof
             "while [ \"\$round\" -le {$this->maximumAttempts} ]; do",
             '  round_successful=1',
         ];
-        foreach ([ControlPlaneProxyRouteProof::PUBLIC_ROUTE, ControlPlaneProxyRouteProof::APP_PORT_ROUTE] as $route) {
+        foreach ($this->routes() as $route) {
             $commands[] = '  '.str_replace("\n", "\n  ", $this->attemptCommand($route));
         }
         $commands = [

@@ -24,13 +24,14 @@ final class VerifyControlPlaneRestoredRoutes
             throw new InvalidArgumentException('Restored control-plane route proof output has an invalid convergence boundary.');
         }
 
-        $expectedRecordCount = $terminal['attempt'] * 2;
+        $routes = $proof->routes();
+        $expectedRecordCount = $terminal['attempt'] * count($routes);
         if (count($records) !== $expectedRecordCount) {
             throw new InvalidArgumentException('Restored control-plane route proof output is partial, duplicated, or contains an unexpected route attempt.');
         }
         $recordIndex = 0;
         foreach (range(1, $terminal['attempt']) as $attempt) {
-            foreach ([ControlPlaneProxyRouteProof::PUBLIC_ROUTE, ControlPlaneProxyRouteProof::APP_PORT_ROUTE] as $route) {
+            foreach ($routes as $route) {
                 $record = $records[$recordIndex++] ?? null;
                 if ($record === null || $record['route'] !== $route || $record['attempt'] !== $attempt) {
                     throw new InvalidArgumentException('Restored control-plane route proof output is partial, duplicated, or contains an unexpected route attempt.');
@@ -45,7 +46,7 @@ final class VerifyControlPlaneRestoredRoutes
         foreach (range(1, $terminal['attempt']) as $attempt) {
             $isExactRound = true;
             $identityHeadersByRoute = [];
-            foreach ([ControlPlaneProxyRouteProof::PUBLIC_ROUTE, ControlPlaneProxyRouteProof::APP_PORT_ROUTE] as $route) {
+            foreach ($routes as $route) {
                 $record = $records[$recordIndex++];
                 if ($record['status'] !== 200) {
                     $isExactRound = false;
@@ -68,7 +69,8 @@ final class VerifyControlPlaneRestoredRoutes
                 $identityHeadersByRoute[$route] = $identityHeaders;
             }
             if ($isExactRound) {
-                if (($identityHeadersByRoute[ControlPlaneProxyRouteProof::PUBLIC_ROUTE] ?? null)
+                if (in_array(ControlPlaneProxyRouteProof::PUBLIC_ROUTE, $routes, true)
+                    && ($identityHeadersByRoute[ControlPlaneProxyRouteProof::PUBLIC_ROUTE] ?? null)
                     !== ($identityHeadersByRoute[ControlPlaneProxyRouteProof::APP_PORT_ROUTE] ?? null)) {
                     throw new InvalidArgumentException('Restored control-plane public and APP_PORT routes do not expose the same restored marker.');
                 }
@@ -86,10 +88,10 @@ final class VerifyControlPlaneRestoredRoutes
                 throw new InvalidArgumentException('Restored control-plane route proof timed out after it had already claimed convergence.');
             }
 
-            throw new InvalidArgumentException('Restored control-plane route proof timed out before both routes had two consecutive exact successes.');
+            throw new InvalidArgumentException('Restored control-plane route proof timed out before the required route set had two consecutive exact successes.');
         }
         if ($firstConvergedAttempt !== $terminal['attempt']) {
-            throw new InvalidArgumentException('Restored control-plane route proof claimed convergence without two consecutive exact route successes.');
+            throw new InvalidArgumentException('Restored control-plane route proof claimed convergence without two consecutive exact required-route successes.');
         }
 
         return $proof;

@@ -27,6 +27,7 @@ uses(RefreshDatabase::class);
 
 function executableControlPlaneRollback(
     ControlPlaneProxyEnrollmentPhase $phase = ControlPlaneProxyEnrollmentPhase::Active,
+    ?string $dynamicPredecessorBytes = "http:\n  routers:\n    legacy: {}\n",
 ): array {
     $server = Server::factory()->create(['team_id' => Team::factory()->create()->id]);
     $state = new ControlPlaneProxyEnrollmentState(
@@ -47,7 +48,7 @@ function executableControlPlaneRollback(
         staticPredecessorBytes: "services:\n  traefik:\n    ports: ['80:80']\n",
         staticReplacementBytes: "services:\n  traefik:\n    ports: ['80:80', '8000:8000']\n",
         sourceOverrideBytes: "services:\n  coolify:\n    ports: !reset []\n",
-        dynamicPredecessorBytes: "http:\n  routers:\n    legacy: {}\n",
+        dynamicPredecessorBytes: $dynamicPredecessorBytes,
         dynamicReplacementBytes: "http:\n  routers:\n    coolify-app-port: {}\n",
         createdAt: '2026-07-19T12:00:00Z',
         updatedAt: '2026-07-19T12:00:00Z',
@@ -73,16 +74,20 @@ function executableControlPlaneRollback(
     ];
 }
 
-function executableControlPlaneRestoredTranscript(): string
-{
+function executableControlPlaneRestoredTranscript(
+    ?string $dynamicPredecessorBytes = "http:\n  routers:\n    legacy: {}\n",
+): string {
     $headers = [
         ControlPlaneProxyRouteProof::BACKEND_MEMBER_HEADER.': coolify',
         ControlPlaneProxyRouteProof::BACKEND_REVISION_HEADER.': rollback-1',
-        ControlPlaneProxyRouteProof::DYNAMIC_SHA256_HEADER.': '.hash('sha256', "http:\n  routers:\n    legacy: {}\n"),
+        ControlPlaneProxyRouteProof::DYNAMIC_SHA256_HEADER.': '.hash('sha256', $dynamicPredecessorBytes ?? ''),
     ];
     $records = [];
+    $routes = $dynamicPredecessorBytes === null
+        ? [ControlPlaneProxyRouteProof::APP_PORT_ROUTE]
+        : [ControlPlaneProxyRouteProof::PUBLIC_ROUTE, ControlPlaneProxyRouteProof::APP_PORT_ROUTE];
     foreach ([1, 2] as $attempt) {
-        foreach ([ControlPlaneProxyRouteProof::PUBLIC_ROUTE, ControlPlaneProxyRouteProof::APP_PORT_ROUTE] as $route) {
+        foreach ($routes as $route) {
             $records[] = implode("\n", [
                 ControlPlaneRestoredRoutesProof::TRANSCRIPT_BEGIN." {$route} {$attempt}",
                 'HTTP/2 200',
@@ -297,6 +302,45 @@ it('replays a crash after remote rollback finalization without the retired backe
     expect($rolledBack->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack)
         ->and($remoteCalls)->toBe(3)
         ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack);
+});
+
+it('acknowledges an absent dynamic predecessor from two exact APP_PORT proofs', function (): void {
+    [$server, $store, $action] = executableControlPlaneRollback(
+        ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement,
+        dynamicPredecessorBytes: null,
+    );
+    $remoteCalls = 0;
+    $proofCommand = null;
+    $transcript = executableControlPlaneRestoredTranscript(null);
+
+    $rolledBack = $action->handle(
+        $server,
+        'execute-control-plane-rollback',
+        'rollback-token',
+        function (string $command) use (&$remoteCalls, &$proofCommand, $transcript): string {
+            $remoteCalls++;
+
+            if (str_contains($command, ControlPlaneRestoredRoutesProof::TRANSCRIPT_BEGIN)) {
+                $proofCommand = $command;
+
+                return $transcript;
+            }
+
+            return match (true) {
+                str_contains($command, ControlPlaneCandidateHealthMarker::CONTAINER_MARKER_PATH) => '',
+                str_contains($command, ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_PENDING_OUTPUT) => ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT,
+                default => throw new RuntimeException("Unexpected absent-predecessor rollback command: {$command}"),
+            };
+        },
+    );
+
+    expect($rolledBack->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack)
+        ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack)
+        ->and($remoteCalls)->toBe(3)
+        ->and($proofCommand)->toContain('http://127.0.0.1:8000/api/health')
+        ->not->toContain('https://dashboard.example.test/api/health')
+        ->and(substr_count($transcript, ControlPlaneRestoredRoutesProof::TRANSCRIPT_BEGIN.' app-port '))->toBe(2)
+        ->and($transcript)->not->toContain(ControlPlaneRestoredRoutesProof::TRANSCRIPT_BEGIN.' public ');
 });
 
 it('finishes authority-less partial rollback cleanup without the retired backend', function (): void {

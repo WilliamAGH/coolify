@@ -83,6 +83,62 @@ it('renders bounded tokenless probes and accepts two exact restored rounds', fun
         ->and($command)->not->toContain($proof->expectedDynamicPredecessorSha256);
 });
 
+it('proves only the exact APP_PORT route when the restored dynamic predecessor is absent', function (): void {
+    $proof = new ControlPlaneRestoredRoutesProof(
+        canonicalHost: 'dashboard.example.test',
+        publicScheme: 'https',
+        appPort: 8000,
+        expectedBackendMember: 'coolify-web-a',
+        expectedBackendRevision: 'rollback-42',
+        expectedDynamicPredecessorSha256: hash('sha256', ''),
+        expectedDynamicPredecessorAbsent: true,
+        pollIntervalSeconds: 0,
+        connectTimeoutSeconds: 1,
+        requestTimeoutSeconds: 1,
+    );
+    $existingEmptyPredecessor = new ControlPlaneRestoredRoutesProof(
+        canonicalHost: 'dashboard.example.test',
+        publicScheme: 'https',
+        appPort: 8000,
+        expectedBackendMember: 'coolify-web-a',
+        expectedBackendRevision: 'rollback-42',
+        expectedDynamicPredecessorSha256: hash('sha256', ''),
+        pollIntervalSeconds: 0,
+        connectTimeoutSeconds: 1,
+        requestTimeoutSeconds: 1,
+    );
+    $records = [];
+    foreach ([1, 2] as $attempt) {
+        $records[] = controlPlaneRestoredRoutesProofRecord(
+            $proof,
+            ControlPlaneProxyRouteProof::APP_PORT_ROUTE,
+            $attempt,
+        );
+    }
+    $transcript = controlPlaneRestoredRoutesProofTranscript(
+        $records,
+        ControlPlaneRestoredRoutesProof::TRANSCRIPT_CONVERGED.' 2',
+    );
+    $unexpectedPublicRecord = controlPlaneRestoredRoutesProofTranscript([
+        controlPlaneRestoredRoutesProofRecord($proof, ControlPlaneProxyRouteProof::PUBLIC_ROUTE, 1),
+        ...$records,
+    ], ControlPlaneRestoredRoutesProof::TRANSCRIPT_CONVERGED.' 2');
+    $command = $proof->shellCommand();
+
+    expect(VerifyControlPlaneRestoredRoutes::run($proof, $transcript))->toBe($proof)
+        ->and($proof->routes())->toBe([ControlPlaneProxyRouteProof::APP_PORT_ROUTE])
+        ->and($command)->toContain('http://127.0.0.1:8000/api/health')
+        ->and($command)->toContain('Host: dashboard.example.test')
+        ->and($command)->not->toContain('https://dashboard.example.test/api/health')
+        ->and($existingEmptyPredecessor->routes())->toBe([
+            ControlPlaneProxyRouteProof::PUBLIC_ROUTE,
+            ControlPlaneProxyRouteProof::APP_PORT_ROUTE,
+        ])
+        ->and($existingEmptyPredecessor->shellCommand())->toContain('https://dashboard.example.test/api/health');
+    expect(fn (): ControlPlaneRestoredRoutesProof => VerifyControlPlaneRestoredRoutes::run($proof, $unexpectedPublicRecord))
+        ->toThrow(InvalidArgumentException::class, 'partial, duplicated, or contains an unexpected route attempt');
+});
+
 it('allows a delayed restored provider update before dual-route convergence', function (): void {
     $proof = controlPlaneRestoredRoutesProof(maximumAttempts: 3);
     $records = [];
@@ -161,7 +217,7 @@ it('rejects partial, duplicate, malformed, extra, timeout, and forged convergenc
     expect(fn (): ControlPlaneRestoredRoutesProof => VerifyControlPlaneRestoredRoutes::run(
         $proof,
         controlPlaneRestoredRoutesProofTranscript($timedOutRecords, ControlPlaneRestoredRoutesProof::TRANSCRIPT_TIMEOUT.' 3'),
-    ))->toThrow(InvalidArgumentException::class, 'timed out before both routes had two consecutive exact successes');
+    ))->toThrow(InvalidArgumentException::class, 'timed out before the required route set had two consecutive exact successes');
 
     $forged = controlPlaneRestoredRoutesProofTranscript([
         controlPlaneRestoredRoutesProofRecord($proof, ControlPlaneProxyRouteProof::PUBLIC_ROUTE, 1, status: 503, curlExit: 22),
@@ -170,7 +226,7 @@ it('rejects partial, duplicate, malformed, extra, timeout, and forged convergenc
         controlPlaneRestoredRoutesProofRecord($proof, ControlPlaneProxyRouteProof::APP_PORT_ROUTE, 2),
     ], ControlPlaneRestoredRoutesProof::TRANSCRIPT_CONVERGED.' 2');
     expect(fn (): ControlPlaneRestoredRoutesProof => VerifyControlPlaneRestoredRoutes::run($proof, $forged))
-        ->toThrow(InvalidArgumentException::class, 'claimed convergence without two consecutive exact route successes');
+        ->toThrow(InvalidArgumentException::class, 'claimed convergence without two consecutive exact required-route successes');
 });
 
 it('rejects invalid restored route proof settings', function (): void {
@@ -183,4 +239,14 @@ it('rejects invalid restored route proof settings', function (): void {
         expectedDynamicPredecessorSha256: hash('sha256', 'coolify.yaml predecessor'),
         maximumAttempts: 1,
     ))->toThrow(InvalidArgumentException::class, 'between two and ten polling attempts');
+
+    expect(fn (): ControlPlaneRestoredRoutesProof => new ControlPlaneRestoredRoutesProof(
+        canonicalHost: 'dashboard.example.test',
+        publicScheme: 'https',
+        appPort: 8000,
+        expectedBackendMember: 'coolify-web-a',
+        expectedBackendRevision: 'revision-42',
+        expectedDynamicPredecessorSha256: hash('sha256', 'present predecessor'),
+        expectedDynamicPredecessorAbsent: true,
+    ))->toThrow(InvalidArgumentException::class, 'must use the empty SHA-256 value');
 });
