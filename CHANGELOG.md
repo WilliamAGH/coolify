@@ -2,7 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
-## [unreleased]
+## [4.13.21-fork] - 2026-07-22
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.21-fork
+
+## [4.13.20-fork] - 2026-07-22
+
+### 🐛 Bug Fixes
+
+- *(control-plane)* Reclaim legacy rollback journal
+- *(control-plane)* Emit canonical listener reset
+- *(release)* Adopt released listener override
+
+### 📚 Documentation
+
+- Update changelog (#142)
+
+## [4.13.19-fork] - 2026-07-22
 
 ### 🐛 Bug Fixes
 
