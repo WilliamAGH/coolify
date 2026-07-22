@@ -6,6 +6,16 @@ All notable changes to this project will be documented in this file.
 
 ### 🐛 Bug Fixes
 
+- *(proxy)* Inspect prepared abort state on host
+
+### 📚 Documentation
+
+- Update changelog (#121)
+
+## [4.13.11-fork] - 2026-07-22
+
+### 🐛 Bug Fixes
+
 - *(release)* Patch bundled cloudflared grpc
 
 ### 📚 Documentation
