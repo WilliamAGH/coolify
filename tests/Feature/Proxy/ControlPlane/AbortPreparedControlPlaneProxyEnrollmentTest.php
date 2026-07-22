@@ -369,10 +369,12 @@ it('keeps an activating owner unless its managed state is exactly recoverable', 
             chmod($mutation->lockPath(), 0666);
         }
     }
-    file_put_contents(
-        $mutation->sidecarPath(),
-        $scenario === 'malformed sidecar' ? "{}\n" : $mutation->replacementSidecar(),
-    );
+    if ($scenario !== 'missing sidecar') {
+        file_put_contents(
+            $mutation->sidecarPath(),
+            $scenario === 'malformed sidecar' ? "{}\n" : $mutation->replacementSidecar(),
+        );
+    }
     if ($scenario !== 'missing artifact') {
         file_put_contents(
             $mutation->rollbackArtifactPath(),
@@ -387,6 +389,8 @@ it('keeps an activating owner unless its managed state is exactly recoverable', 
         file_put_contents($mutation->stateDirectory.'/.'.$mutation->filename.'.writer-authority.json', "{}\n");
     } elseif ($scenario === 'foreign document') {
         file_put_contents($mutation->documentPath(), "http:\n  routers:\n    foreign: {}\n");
+    } elseif ($scenario === 'missing sidecar') {
+        file_put_contents($mutation->documentPath(), $fixture['state']->dynamicReplacementBytes);
     }
     $commands = [];
     $remoteExecutor = preparedEnrollmentRuntimeExecutor($fixture['remote'], 'valid', $commands);
@@ -399,7 +403,7 @@ it('keeps an activating owner unless its managed state is exactly recoverable', 
         $remoteExecutor,
     ))->toThrow(RuntimeException::class)
         ->and($fixture['store']->read($fixture['server'])?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Activating);
-})->with(['missing lock', 'writable lock', 'missing artifact', 'malformed sidecar', 'malformed artifact', 'unknown journal', 'foreign authority', 'foreign document']);
+})->with(['missing lock', 'writable lock', 'missing sidecar', 'missing artifact', 'malformed sidecar', 'malformed artifact', 'unknown journal', 'foreign authority', 'foreign document']);
 
 it('keeps an activating owner unless exact legacy runtime ownership is proved', function (?string $evidence): void {
     $fixture = preparedEnrollmentAbortFixture(ControlPlaneProxyEnrollmentPhase::Activating);

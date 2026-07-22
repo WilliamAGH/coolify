@@ -132,7 +132,7 @@ final class AbortPreparedControlPlaneProxyEnrollment
         $sourceDirectory = rtrim($this->sourceDirectory, '/');
         $this->assertExactRegularFile($execute, $proxyPath.'/docker-compose.yml', $state->staticPredecessorBytes);
         $this->assertAbsent($execute, $sourceDirectory.'/docker-compose.control-plane-listener.yml');
-        $hasRecoverableManagedState = false;
+        $hasRecoverableReplacementProof = false;
         if ($state->phase === ControlPlaneProxyEnrollmentPhase::Activating) {
             $hasManagedState = $this->assertAbsentOrRecoverableDirectory(
                 $execute,
@@ -140,15 +140,14 @@ final class AbortPreparedControlPlaneProxyEnrollment
                 $state,
             );
             if ($hasManagedState) {
-                $this->assertRecoverableManagedState($execute, $proxyPath, $state);
-                $hasRecoverableManagedState = true;
+                $hasRecoverableReplacementProof = $this->assertRecoverableManagedState($execute, $proxyPath, $state);
             }
         } else {
             $this->assertAbsentOrEmptyDirectory($execute, $proxyPath.'/.control-plane-managed-traefik');
         }
 
         $managedDocument = $proxyPath.'/dynamic/'.$state->managedFilename;
-        if ($hasRecoverableManagedState) {
+        if ($hasRecoverableReplacementProof) {
             $managedDocumentBytes = $this->readArtifact($execute, $managedDocument);
             if (! in_array($managedDocumentBytes, [
                 $state->dynamicPredecessorBytes,
@@ -320,7 +319,7 @@ final class AbortPreparedControlPlaneProxyEnrollment
         Closure $execute,
         string $proxyPath,
         ControlPlaneProxyEnrollmentState $state,
-    ): void {
+    ): bool {
         $mutation = new ManagedTraefikDocumentMutation(
             dynamicDirectory: $proxyPath.'/dynamic',
             stateDirectory: $proxyPath.'/.control-plane-managed-traefik',
@@ -337,13 +336,15 @@ final class AbortPreparedControlPlaneProxyEnrollment
         $sidecar = $this->readArtifact($execute, $mutation->sidecarPath());
         $artifact = $this->readArtifact($execute, $mutation->rollbackArtifactPath());
         if (($sidecar !== null && ! hash_equals($mutation->replacementSidecar(), $sidecar))
-            || ($sidecar !== null && $artifact === null)
+            || (($sidecar === null) !== ($artifact === null))
             || ($artifact !== null && ! hash_equals(
                 (new ManagedTraefikDocumentWriter)->rollbackArtifactFor($mutation, $state->dynamicPredecessorBytes),
                 $artifact,
             ))) {
             throw new RuntimeException('The activating control-plane enrollment has no exact recoverable dynamic state.');
         }
+
+        return $sidecar !== null && $artifact !== null;
     }
 
     private function readArtifact(Closure $execute, string $path): ?string
