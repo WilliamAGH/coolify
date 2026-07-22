@@ -202,9 +202,9 @@ class CompileControlPlaneStaticProxyConfiguration
     /** @param array<string, mixed> $compose */
     private function dumpCompose(array $compose): string
     {
-        $yaml = Yaml::dump($compose, 12, 2, Yaml::DUMP_OBJECT_AS_MAP | Yaml::DUMP_EXCEPTION_ON_INVALID_TYPE | Yaml::DUMP_EMPTY_ARRAY_AS_SEQUENCE);
+        $yaml = Yaml::dump($compose, 12, 2, Yaml::DUMP_OBJECT_AS_MAP | Yaml::DUMP_EXCEPTION_ON_INVALID_TYPE);
 
-        return str_replace("    ports: !reset\n      []", '    ports: !reset []', $yaml);
+        return str_replace("    ports: !reset\n      {  }", '    ports: !reset []', $yaml);
     }
 
     private function publishesContainerPort(mixed $publication, int $containerPort): bool

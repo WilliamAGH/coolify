@@ -1556,6 +1556,12 @@ fd_control_plane_listener_override() {
                 found = 1
                 exit
             }
+            in_coolify && $0 ~ /^    ports:[[:space:]]*!reset[[:space:]]*$/ {
+                if (getline > 0 && $0 ~ /^      \{[[:space:]]*\}[[:space:]]*$/) {
+                    found = 1
+                }
+                exit
+            }
             END { exit !found }
         ' "$path" || die 'control-plane listener Compose override must reset Coolify ports'
         printf '%s\n' "$path"
