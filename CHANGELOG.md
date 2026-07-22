@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🐛 Bug Fixes
+
+- *(proxy)* Finalize control-plane enrollment ownership
+- *(proxy)* Render unambiguous rollback guards
+
+### 💼 Other
+
+- Advance control-plane ownership to current v4.x
+
+### 📚 Documentation
+
+- Update changelog (#117)
+
+## [4.13.9-fork] - 2026-07-22
+
 ### 📚 Documentation
 
 - Update changelog (#115)
