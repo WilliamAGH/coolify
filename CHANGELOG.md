@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file.
 
 ### 🐛 Bug Fixes
 
+- *(control-plane)* Recover partial enrollment activation
+
+### 📚 Documentation
+
+- Update changelog (#134)
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Reserve 4.13.17-fork
+
+## [4.13.16-fork] - 2026-07-22
+
+### 🐛 Bug Fixes
+
 - *(control-plane)* Reconcile rolled-back enrollment
 - *(control-plane)* Preserve rollback reconciliation timeout
 
