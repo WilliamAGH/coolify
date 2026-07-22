@@ -139,7 +139,7 @@ final readonly class ControlPlaneRestoredRoutesProof
             '--output',
             '/dev/null',
             '--write-out',
-            "\n".self::TRANSCRIPT_STATUS." %{http_code}\n",
+            '\n'.self::TRANSCRIPT_STATUS.' %{http_code}\n',
             '--',
             $url,
         ];
