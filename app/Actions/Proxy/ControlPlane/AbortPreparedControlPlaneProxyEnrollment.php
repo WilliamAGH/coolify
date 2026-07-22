@@ -132,6 +132,7 @@ final class AbortPreparedControlPlaneProxyEnrollment
         $sourceDirectory = rtrim($this->sourceDirectory, '/');
         $this->assertExactRegularFile($execute, $proxyPath.'/docker-compose.yml', $state->staticPredecessorBytes);
         $this->assertAbsent($execute, $sourceDirectory.'/docker-compose.control-plane-listener.yml');
+        $hasRecoverableManagedState = false;
         if ($state->phase === ControlPlaneProxyEnrollmentPhase::Activating) {
             $hasManagedState = $this->assertAbsentOrRecoverableDirectory(
                 $execute,
@@ -140,13 +141,22 @@ final class AbortPreparedControlPlaneProxyEnrollment
             );
             if ($hasManagedState) {
                 $this->assertRecoverableManagedState($execute, $proxyPath, $state);
+                $hasRecoverableManagedState = true;
             }
         } else {
             $this->assertAbsentOrEmptyDirectory($execute, $proxyPath.'/.control-plane-managed-traefik');
         }
 
         $managedDocument = $proxyPath.'/dynamic/'.$state->managedFilename;
-        if ($state->dynamicPredecessorBytes === null) {
+        if ($hasRecoverableManagedState) {
+            $managedDocumentBytes = $this->readArtifact($execute, $managedDocument);
+            if (! in_array($managedDocumentBytes, [
+                $state->dynamicPredecessorBytes,
+                $state->dynamicReplacementBytes,
+            ], true)) {
+                throw new RuntimeException("Prepared control-plane enrollment artifact changed: {$managedDocument}");
+            }
+        } elseif ($state->dynamicPredecessorBytes === null) {
             $this->assertAbsent($execute, $managedDocument);
         } else {
             $this->assertExactRegularFile($execute, $managedDocument, $state->dynamicPredecessorBytes);

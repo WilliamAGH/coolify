@@ -318,7 +318,7 @@ it('refuses a prepared abort when an identity fence differs', function (string $
     'revision' => ['stale-prepared-enrollment', 'wrong.example.test', 'another-revision'],
 ]);
 
-it('aborts an activating enrollment after its host artifacts rolled back exactly', function (): void {
+it('aborts an activating enrollment with an exactly recoverable managed document', function (bool $replacementIsVisible): void {
     $fixture = preparedEnrollmentAbortFixture(ControlPlaneProxyEnrollmentPhase::Activating);
     $this->preparedAbortRoot = $fixture['root'];
     (new Filesystem)->makeDirectory($fixture['proxy'].'/.control-plane-managed-traefik', 0700);
@@ -329,6 +329,9 @@ it('aborts an activating enrollment after its host artifacts rolled back exactly
         $mutation->rollbackArtifactPath(),
         (new ManagedTraefikDocumentWriter)->rollbackArtifactFor($mutation, null),
     );
+    if ($replacementIsVisible) {
+        file_put_contents($mutation->documentPath(), $fixture['state']->dynamicReplacementBytes);
+    }
     $scratch = $mutation->stateDirectory.'/.managed-traefik-document.interrupted';
     (new Filesystem)->makeDirectory($scratch, 0700);
     file_put_contents($scratch.'/expected-sidecar', '');
@@ -350,7 +353,10 @@ it('aborts an activating enrollment after its host artifacts rolled back exactly
         ->and($commands)->toHaveCount(7)
         ->and($fixture['server']->fresh()?->proxy->get('last_saved_proxy_configuration'))->toBe($fixture['state']->staticPredecessorBytes)
         ->and($fixture['server']->fresh()?->proxy->get('last_saved_settings'))->toBe(md5(base64_encode($fixture['state']->staticPredecessorBytes)));
-});
+})->with([
+    'replacement document visible' => true,
+    'predecessor document visible' => false,
+]);
 
 it('keeps an activating owner unless its managed state is exactly recoverable', function (string $scenario): void {
     $fixture = preparedEnrollmentAbortFixture(ControlPlaneProxyEnrollmentPhase::Activating);
@@ -379,6 +385,8 @@ it('keeps an activating owner unless its managed state is exactly recoverable', 
         file_put_contents($mutation->journalPath(), "journal\n");
     } elseif ($scenario === 'foreign authority') {
         file_put_contents($mutation->stateDirectory.'/.'.$mutation->filename.'.writer-authority.json', "{}\n");
+    } elseif ($scenario === 'foreign document') {
+        file_put_contents($mutation->documentPath(), "http:\n  routers:\n    foreign: {}\n");
     }
     $commands = [];
     $remoteExecutor = preparedEnrollmentRuntimeExecutor($fixture['remote'], 'valid', $commands);
@@ -391,7 +399,7 @@ it('keeps an activating owner unless its managed state is exactly recoverable', 
         $remoteExecutor,
     ))->toThrow(RuntimeException::class)
         ->and($fixture['store']->read($fixture['server'])?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Activating);
-})->with(['missing lock', 'writable lock', 'missing artifact', 'malformed sidecar', 'malformed artifact', 'unknown journal', 'foreign authority']);
+})->with(['missing lock', 'writable lock', 'missing artifact', 'malformed sidecar', 'malformed artifact', 'unknown journal', 'foreign authority', 'foreign document']);
 
 it('keeps an activating owner unless exact legacy runtime ownership is proved', function (?string $evidence): void {
     $fixture = preparedEnrollmentAbortFixture(ControlPlaneProxyEnrollmentPhase::Activating);
