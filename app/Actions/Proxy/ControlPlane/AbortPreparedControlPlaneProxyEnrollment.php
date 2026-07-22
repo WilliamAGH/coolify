@@ -3,6 +3,7 @@
 namespace App\Actions\Proxy\ControlPlane;
 
 use App\Models\Server;
+use Closure;
 use Illuminate\Console\Command;
 use InvalidArgumentException;
 use Lorisleiva\Actions\Concerns\AsAction;
@@ -11,6 +12,10 @@ use RuntimeException;
 final class AbortPreparedControlPlaneProxyEnrollment
 {
     use AsAction;
+
+    private const ABSENT_ARTIFACT = '__COOLIFY_CONTROL_PLANE_ARTIFACT_ABSENT__';
+
+    private const PRESENT_ARTIFACT = '__COOLIFY_CONTROL_PLANE_ARTIFACT_PRESENT__';
 
     public string $commandSignature = 'control-plane:proxy-enrollment:abort-prepared
         {server_id : Local Coolify server ID}
@@ -22,7 +27,7 @@ final class AbortPreparedControlPlaneProxyEnrollment
 
     public function __construct(
         private readonly StoreControlPlaneProxyEnrollmentState $stateStore,
-        private readonly string $proxyPath = '/data/coolify/proxy',
+        private readonly ?string $proxyPath = null,
         private readonly string $sourceDirectory = '/data/coolify/source',
     ) {}
 
@@ -31,6 +36,7 @@ final class AbortPreparedControlPlaneProxyEnrollment
         string $operationId,
         string $canonicalHost,
         string $expectedRevision,
+        ?Closure $remoteExecutor = null,
     ): ControlPlaneProxyEnrollmentState {
         if (! $server->isLocalhost()) {
             throw new InvalidArgumentException('A prepared control-plane enrollment can only be aborted on the local Coolify server.');
@@ -45,7 +51,7 @@ final class AbortPreparedControlPlaneProxyEnrollment
             throw new RuntimeException('The prepared control-plane enrollment abort fence does not match the durable state.');
         }
 
-        $this->assertUnchangedPreparedFilesystem($state);
+        $this->assertUnchangedPreparedFilesystem($server, $state, $remoteExecutor);
 
         return $this->stateStore->abortPrepared(
             $server,
@@ -78,33 +84,69 @@ final class AbortPreparedControlPlaneProxyEnrollment
         return Command::SUCCESS;
     }
 
-    private function assertUnchangedPreparedFilesystem(ControlPlaneProxyEnrollmentState $state): void
-    {
-        $proxyPath = rtrim($this->proxyPath, '/');
+    private function assertUnchangedPreparedFilesystem(
+        Server $server,
+        ControlPlaneProxyEnrollmentState $state,
+        ?Closure $remoteExecutor,
+    ): void {
+        $execute = $remoteExecutor ?? static fn (string $command): ?string => instant_remote_process(
+            [$command],
+            $server,
+            timeout: 30,
+            disableMultiplexing: true,
+            retry: false,
+        );
+        $proxyPath = rtrim($this->proxyPath ?? (string) $server->proxyPath(), '/');
         $sourceDirectory = rtrim($this->sourceDirectory, '/');
-        $this->assertExactRegularFile($proxyPath.'/docker-compose.yml', $state->staticPredecessorBytes);
-        $this->assertAbsent($sourceDirectory.'/docker-compose.control-plane-listener.yml');
-        $this->assertAbsent($proxyPath.'/.control-plane-managed-traefik');
+        $this->assertExactRegularFile($execute, $proxyPath.'/docker-compose.yml', $state->staticPredecessorBytes);
+        $this->assertAbsent($execute, $sourceDirectory.'/docker-compose.control-plane-listener.yml');
+        $this->assertAbsent($execute, $proxyPath.'/.control-plane-managed-traefik');
 
         $managedDocument = $proxyPath.'/dynamic/'.$state->managedFilename;
         if ($state->dynamicPredecessorBytes === null) {
-            $this->assertAbsent($managedDocument);
+            $this->assertAbsent($execute, $managedDocument);
         } else {
-            $this->assertExactRegularFile($managedDocument, $state->dynamicPredecessorBytes);
+            $this->assertExactRegularFile($execute, $managedDocument, $state->dynamicPredecessorBytes);
         }
     }
 
-    private function assertExactRegularFile(string $path, string $expectedBytes): void
+    private function assertExactRegularFile(Closure $execute, string $path, string $expectedBytes): void
     {
-        if (! is_file($path) || is_link($path) || file_get_contents($path) !== $expectedBytes) {
+        if ($this->readArtifact($execute, $path) !== $expectedBytes) {
             throw new RuntimeException("Prepared control-plane enrollment artifact changed: {$path}");
         }
     }
 
-    private function assertAbsent(string $path): void
+    private function assertAbsent(Closure $execute, string $path): void
     {
-        if (file_exists($path) || is_link($path)) {
+        if ($this->readArtifact($execute, $path) !== null) {
             throw new RuntimeException("Prepared control-plane enrollment artifact is no longer absent: {$path}");
         }
+    }
+
+    private function readArtifact(Closure $execute, string $path): ?string
+    {
+        $pathArgument = escapeshellarg($path);
+        $output = $execute(
+            'if [ ! -e '.$pathArgument.' ] && [ ! -L '.$pathArgument.' ]; then '
+            .'printf '.escapeshellarg(self::ABSENT_ARTIFACT."\n").'; '
+            .'elif [ -f '.$pathArgument.' ] && [ ! -L '.$pathArgument.' ]; then '
+            .'printf '.escapeshellarg(self::PRESENT_ARTIFACT."\n").'; base64 < '.$pathArgument.'; '
+            .'else exit 1; fi',
+        );
+        if ($output === self::ABSENT_ARTIFACT."\n" || $output === self::ABSENT_ARTIFACT) {
+            return null;
+        }
+        $prefix = self::PRESENT_ARTIFACT."\n";
+        if (! is_string($output) || ! str_starts_with($output, $prefix)) {
+            throw new RuntimeException("Prepared control-plane enrollment artifact could not be inspected: {$path}");
+        }
+
+        $bytes = base64_decode(trim(substr($output, strlen($prefix))), true);
+        if ($bytes === false) {
+            throw new RuntimeException("Prepared control-plane enrollment artifact could not be inspected: {$path}");
+        }
+
+        return $bytes;
     }
 }

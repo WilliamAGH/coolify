@@ -23,7 +23,7 @@ function preparedEnrollmentAbortFixture(
     ControlPlaneProxyEnrollmentPhase $phase = ControlPlaneProxyEnrollmentPhase::Prepared,
     ?string $dynamicPredecessorBytes = null,
 ): array {
-    $root = sys_get_temp_dir().'/coolify-prepared-enrollment-abort-'.bin2hex(random_bytes(8));
+    $root = sys_get_temp_dir()."/coolify-prepared-enrollment-abort-'quoted;path-".bin2hex(random_bytes(8));
     $proxyPath = $root.'/proxy';
     $sourcePath = $root.'/source';
     (new Filesystem)->makeDirectory($proxyPath.'/dynamic', 0700, true);
@@ -65,6 +65,7 @@ function preparedEnrollmentAbortFixture(
     $server->proxy->set(StoreControlPlaneProxyEnrollmentState::STATE_KEY, $state->toArray());
     $server->save();
     $store = new StoreControlPlaneProxyEnrollmentState;
+    $remoteExecutor = static fn (string $command): string => trim((string) shell_exec($command));
 
     return [
         'root' => $root,
@@ -73,6 +74,7 @@ function preparedEnrollmentAbortFixture(
         'server' => $server,
         'state' => $state,
         'store' => $store,
+        'remote' => $remoteExecutor,
         'action' => new AbortPreparedControlPlaneProxyEnrollment($store, $proxyPath, $sourcePath),
     ];
 }
@@ -86,6 +88,7 @@ it('aborts only an unchanged prepared local enrollment and admits a new owner', 
         'stale-prepared-enrollment',
         'wrong.example.test',
         'old-revision',
+        $fixture['remote'],
     );
 
     expect($rolledBack->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack)
@@ -119,11 +122,59 @@ it('aborts only an unchanged prepared local enrollment and admits a new owner', 
         ->toBe('corrected-enrollment');
 });
 
+it('inspects prepared artifacts on the managed host', function (): void {
+    $fixture = preparedEnrollmentAbortFixture();
+    $this->preparedAbortRoot = $fixture['root'];
+    $commands = [];
+    $proxyPath = rtrim((string) $fixture['server']->proxyPath(), '/');
+    $remoteExecutor = function (string $command) use (&$commands, $fixture, $proxyPath): ?string {
+        $commands[] = $command;
+
+        if (str_contains($command, $proxyPath.'/docker-compose.yml')) {
+            return "__COOLIFY_CONTROL_PLANE_ARTIFACT_PRESENT__\n".base64_encode($fixture['state']->staticPredecessorBytes);
+        }
+
+        return "__COOLIFY_CONTROL_PLANE_ARTIFACT_ABSENT__\n";
+    };
+    $action = new AbortPreparedControlPlaneProxyEnrollment($fixture['store']);
+
+    expect($action->handle(
+        $fixture['server'],
+        'stale-prepared-enrollment',
+        'wrong.example.test',
+        'old-revision',
+        $remoteExecutor,
+    )->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack)
+        ->and($commands)->toHaveCount(4)
+        ->and($commands[0])->toContain($proxyPath.'/docker-compose.yml')
+        ->and($commands[1])->toContain('/data/coolify/source/docker-compose.control-plane-listener.yml')
+        ->and($commands[2])->toContain($proxyPath.'/.control-plane-managed-traefik')
+        ->and($commands[3])->toContain($proxyPath.'/dynamic/'.ControlPlaneDynamicConfiguration::MANAGED_FILENAME);
+});
+
+it('keeps the prepared owner when host artifact evidence is unavailable', function (?string $evidence): void {
+    $fixture = preparedEnrollmentAbortFixture();
+    $this->preparedAbortRoot = $fixture['root'];
+
+    expect(fn () => $fixture['action']->handle(
+        $fixture['server'],
+        'stale-prepared-enrollment',
+        'wrong.example.test',
+        'old-revision',
+        static fn (string $command): ?string => $evidence,
+    ))->toThrow(RuntimeException::class, 'could not be inspected')
+        ->and($fixture['store']->read($fixture['server'])?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Prepared);
+})->with([
+    'malformed' => 'malformed',
+    'invalid base64' => "__COOLIFY_CONTROL_PLANE_ARTIFACT_PRESENT__\n***",
+    'missing' => null,
+]);
+
 it('refuses a prepared abort when an identity fence differs', function (string $operationId, string $host, string $revision): void {
     $fixture = preparedEnrollmentAbortFixture();
     $this->preparedAbortRoot = $fixture['root'];
 
-    expect(fn () => $fixture['action']->handle($fixture['server'], $operationId, $host, $revision))
+    expect(fn () => $fixture['action']->handle($fixture['server'], $operationId, $host, $revision, $fixture['remote']))
         ->toThrow(RuntimeException::class, 'abort fence does not match')
         ->and($fixture['store']->read($fixture['server'])?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Prepared);
 })->with([
@@ -141,6 +192,7 @@ it('refuses a prepared abort after activation owns the operation', function (): 
         'stale-prepared-enrollment',
         'wrong.example.test',
         'old-revision',
+        $fixture['remote'],
     ))->toThrow(RuntimeException::class, 'abort fence does not match');
 });
 
@@ -160,6 +212,7 @@ it('refuses a prepared abort when any activation artifact exists', function (str
         'stale-prepared-enrollment',
         'wrong.example.test',
         'old-revision',
+        $fixture['remote'],
     ))->toThrow(RuntimeException::class)
         ->and($fixture['store']->read($fixture['server'])?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Prepared);
 })->with(['override', 'state', 'dynamic']);
@@ -174,6 +227,7 @@ it('refuses mismatched predecessor bytes and non-local servers', function (): vo
         'stale-prepared-enrollment',
         'wrong.example.test',
         'old-revision',
+        $fixture['remote'],
     ))->toThrow(RuntimeException::class, 'artifact changed');
 
     file_put_contents($fixture['proxy'].'/docker-compose.yml', $fixture['state']->staticPredecessorBytes);
@@ -184,6 +238,7 @@ it('refuses mismatched predecessor bytes and non-local servers', function (): vo
         'stale-prepared-enrollment',
         'wrong.example.test',
         'old-revision',
+        $fixture['remote'],
     ))->toThrow(InvalidArgumentException::class, 'local Coolify server');
 });
 
