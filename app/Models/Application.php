@@ -2778,17 +2778,27 @@ class Application extends BaseModel
                     }
                 }
             }
-            $labels = collect(data_get($service, 'labels', []));
-            if (! $labels->contains('coolify.managed')) {
-                $labels->push('coolify.managed=true');
+            $labels = data_get($service, 'labels', []);
+            if (! is_array($labels)) {
+                throw new RuntimeException('Docker Compose service labels must be a list or map.');
             }
-            if (! $labels->contains('coolify.applicationId')) {
-                $labels->push('coolify.applicationId='.$this->id);
+            $managedLabels = [
+                'coolify.managed' => 'true',
+                'coolify.applicationId' => (string) $this->id,
+                'coolify.type' => 'application',
+            ];
+            if (array_is_list($labels)) {
+                $labels = array_values(array_filter(
+                    $labels,
+                    fn (mixed $label): bool => ! is_string($label) || ! array_key_exists(str($label)->before('=')->value(), $managedLabels),
+                ));
+                foreach ($managedLabels as $name => $value) {
+                    $labels[] = "{$name}={$value}";
+                }
+            } else {
+                $labels = [...$labels, ...$managedLabels];
             }
-            if (! $labels->contains('coolify.type')) {
-                $labels->push('coolify.type=application');
-            }
-            data_set($service, 'labels', $labels->toArray());
+            data_set($service, 'labels', $labels);
 
             return $service;
         });

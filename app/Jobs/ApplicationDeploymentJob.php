@@ -10,6 +10,7 @@ use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
 use App\Actions\Application\BlueGreen\FindBlueGreenDeactivationFence;
 use App\Actions\Application\BlueGreen\RemoveBlueGreenComposeSidecars;
 use App\Actions\Application\BlueGreen\StartBlueGreenComposeSidecars;
+use App\Actions\Application\StampApplicationDeploymentProvenance;
 use App\Actions\Application\WaitForSwarmStackConvergence;
 use App\Actions\Docker\GetContainersStatus;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
@@ -967,7 +968,14 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         $this->application->loadComposeFile(isInit: false);
         if ($this->application->settings->is_raw_compose_deployment_enabled) {
             $this->application->oldRawParser();
-            $yaml = $composeFile = $this->application->docker_compose_raw;
+            $composeFile = Yaml::parse($this->application->docker_compose_raw);
+            if (! is_array($composeFile)) {
+                $this->fail('Failed to parse docker-compose file.');
+
+                return;
+            }
+            $composeFile = StampApplicationDeploymentProvenance::run($composeFile, $this->deployment_uuid);
+            $yaml = Yaml::dump($composeFile, 10);
 
             // For raw compose, we cannot automatically add secrets configuration
             // User must define it manually in their docker-compose file
@@ -976,18 +984,16 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             }
         } else {
             $composeFile = $this->application->parse(pull_request_id: $this->pull_request_id, preview_id: data_get($this->preview, 'id'), commit: $this->commit);
+            $composeFile = convertToArray($composeFile);
             // Always add .env file to services
             $services = collect(data_get($composeFile, 'services', []));
             $services = $services->map(function ($service, $name) {
                 $service['env_file'] = ['.env'];
-                $labels = collect(data_get($service, 'labels', []))
-                    ->reject(fn (mixed $label): bool => is_string($label) && str_starts_with($label, 'coolify.deploymentId='))
-                    ->push("coolify.deploymentId={$this->deployment_uuid}");
-                $service['labels'] = $labels;
 
                 return $service;
             });
             $composeFile['services'] = $services->toArray();
+            $composeFile = StampApplicationDeploymentProvenance::run($composeFile, $this->deployment_uuid);
             if (empty($composeFile)) {
                 $this->application_deployment_queue->addLogEntry('Failed to parse docker-compose file.');
                 $this->fail('Failed to parse docker-compose file.');

@@ -23,9 +23,11 @@ function ordinaryApplicationContainer(
     string $deploymentUuid,
     string $image,
     string $health = 'healthy',
+    ?string $imageId = null,
 ): array {
     return [
         'Id' => $containerId,
+        'Image' => $imageId ?? 'sha256:'.hash('sha256', $image),
         'Config' => [
             'Image' => $image,
             'Labels' => [
@@ -92,6 +94,7 @@ it('returns the exact active container image instead of configured application i
 
 it('resolves an ordinary image application directly from its live container without blue-green state', function () {
     $containerId = str_repeat('b', 64);
+    $image = 'registry.example/app:ordinary-live';
     $state = (new ResolveActiveApplicationContainerState)->resolveOrdinaryFromContainers(
         (int) $this->application->id,
         collect([(int) $this->application->destination_id => 'deployment-ordinary']),
@@ -100,13 +103,13 @@ it('resolves an ordinary image application directly from its live container with
                 (int) $this->application->id,
                 $containerId,
                 'deployment-ordinary',
-                'registry.example/app:ordinary-live',
+                $image,
             )]),
         ]),
     );
 
     expect($this->application->blueGreenDeployments()->exists())->toBeFalse()
-        ->and($state?->image)->toBe('registry.example/app:ordinary-live')
+        ->and($state?->image)->toBe('sha256:'.hash('sha256', $image))
         ->and($state?->status)->toBe('running:healthy')
         ->and($state?->destination[0]['deployment_uuid'])->toBe('deployment-ordinary')
         ->and($state?->destination[0]['container_ids'])->toBe([$containerId]);
@@ -133,7 +136,7 @@ it('ignores a stale ordinary container with a different image', function () {
         ])]),
     );
 
-    expect($state?->image)->toBe('registry.example/app:current')
+    expect($state?->image)->toBe('sha256:'.hash('sha256', 'registry.example/app:current'))
         ->and($state?->destination[0]['container_ids'])->toBe([str_repeat('d', 64)]);
 });
 
@@ -159,7 +162,7 @@ it('derives ordinary status only from the exact current deployment', function ()
         ])]),
     );
 
-    expect($state?->image)->toBe('registry.example/app:same')
+    expect($state?->image)->toBe('sha256:'.hash('sha256', 'registry.example/app:same'))
         ->and($state?->status)->toBe('running:healthy')
         ->and($state?->destination[0]['container_ids'])->toBe([str_repeat('f', 64)]);
 });
