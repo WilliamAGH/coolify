@@ -3083,7 +3083,7 @@
                     "Applications"
                 ],
                 "summary": "Get active application container",
-                "description": "Get the exact image and status of the routed application container.",
+                "description": "Get the runtime image ID, configured image reference, and status of the routed application container.",
                 "operationId": "get-active-application-container",
                 "parameters": [
                     {
@@ -3104,12 +3104,18 @@
                                 "schema": {
                                     "required": [
                                         "image",
+                                        "image_reference",
                                         "source",
                                         "status",
                                         "provenance"
                                     ],
                                     "properties": {
                                         "image": {
+                                            "description": "Runtime Docker image ID.",
+                                            "type": "string"
+                                        },
+                                        "image_reference": {
+                                            "description": "Exact Docker image reference configured on the routed container.",
                                             "type": "string"
                                         },
                                         "source": {

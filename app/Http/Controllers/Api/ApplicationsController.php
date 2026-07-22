@@ -2287,7 +2287,7 @@ class ApplicationsController extends Controller
 
     #[OA\Get(
         summary: 'Get active application container',
-        description: 'Get the exact image and status of the routed application container.',
+        description: 'Get the runtime image ID, configured image reference, and status of the routed application container.',
         path: '/applications/{uuid}/active-container',
         operationId: 'get-active-application-container',
         security: [
@@ -2308,9 +2308,10 @@ class ApplicationsController extends Controller
                 response: 200,
                 description: 'The exact routed application container state.',
                 content: new OA\JsonContent(
-                    required: ['image', 'source', 'status', 'provenance'],
+                    required: ['image', 'image_reference', 'source', 'status', 'provenance'],
                     properties: [
-                        new OA\Property(property: 'image', type: 'string'),
+                        new OA\Property(property: 'image', type: 'string', description: 'Runtime Docker image ID.'),
+                        new OA\Property(property: 'image_reference', type: 'string', description: 'Exact Docker image reference configured on the routed container.'),
                         new OA\Property(property: 'source', type: 'string'),
                         new OA\Property(property: 'status', type: 'string'),
                         new OA\Property(
@@ -2387,6 +2388,7 @@ class ApplicationsController extends Controller
 
         return response()->json([
             'image' => $activeContainer->image,
+            'image_reference' => $activeContainer->imageReference,
             'source' => $application->build_pack,
             'status' => $activeContainer->status,
             'provenance' => [

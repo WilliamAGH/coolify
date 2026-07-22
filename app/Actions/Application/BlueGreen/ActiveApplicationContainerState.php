@@ -15,6 +15,7 @@ final readonly class ActiveApplicationContainerState
      */
     public function __construct(
         public string $image,
+        public string $imageReference,
         public string $status,
         public array $destination,
     ) {}

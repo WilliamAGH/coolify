@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 📚 Documentation
+
+- Update changelog (#123)
+
+## [4.13.12-fork] - 2026-07-22
+
+### 🐛 Bug Fixes
+
+- *(proxy)* Inspect prepared abort state on host
+
+### 📚 Documentation
+
+- Update changelog (#121)
+
+## [4.13.11-fork] - 2026-07-22
+
+### 🚀 Features
+
+- *(api)* Expose active container image reference
+
 ### 🐛 Bug Fixes
 
 - *(release)* Patch bundled cloudflared grpc

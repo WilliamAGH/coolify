@@ -99,6 +99,7 @@ it('returns the routed predecessor image while a candidate rollback is active', 
 
     expect($state)->toBeInstanceOf(ActiveApplicationContainerState::class)
         ->and($state->image)->toBe(activeImageId('registry.example/app:ccb9a3b'))
+        ->and($state->imageReference)->toBe('registry.example/app:ccb9a3b')
         ->and($state->status)->toBe('running:healthy')
         ->and($state->destination[0]['deployment_uuid'])->toBe('deployment-ccb9a3b');
 });
@@ -122,6 +123,7 @@ it('returns the routed candidate image while it is draining', function () {
     );
 
     expect($state?->image)->toBe(activeImageId('registry.example/app:candidate'))
+        ->and($state?->imageReference)->toBe('registry.example/app:candidate')
         ->and($state?->status)->toBe('running:healthy');
 });
 
@@ -163,6 +165,79 @@ it('fails closed for mismatched provenance and one mutable tag resolving to dist
         ->and($divergent)->toBeNull();
 });
 
+it('fails closed when a selected routed container lacks its configured image reference', function () {
+    $containerId = str_repeat('f', 64);
+    $container = activeImageContainer(
+        $containerId,
+        'deployment-missing-reference',
+        'registry.example/app:missing-reference',
+    );
+    unset($container['Config']['Image']);
+
+    $state = (new ResolveActiveApplicationContainerState)->resolveFromContainers(
+        collect([activeImageResolution(
+            15,
+            $containerId,
+            'deployment-missing-reference',
+            BlueGreenDeploymentPhase::IDLE,
+        )]),
+        collect([15 => collect([$container])]),
+    );
+
+    expect($state)->toBeNull();
+});
+
+it('fails closed when a selected routed container has a blank configured image reference', function () {
+    $containerId = str_repeat('0', 64);
+    $container = activeImageContainer(
+        $containerId,
+        'deployment-blank-reference',
+        'registry.example/app:blank-reference',
+    );
+    $container['Config']['Image'] = ' ';
+
+    $state = (new ResolveActiveApplicationContainerState)->resolveFromContainers(
+        collect([activeImageResolution(
+            15,
+            $containerId,
+            'deployment-blank-reference',
+            BlueGreenDeploymentPhase::IDLE,
+        )]),
+        collect([15 => collect([$container])]),
+    );
+
+    expect($state)->toBeNull();
+});
+
+it('fails closed when selected routed containers disagree on their configured image reference', function () {
+    $firstId = str_repeat('a', 64);
+    $secondId = str_repeat('b', 64);
+    $imageId = activeImageId('registry.example/app@sha256:immutable');
+
+    $state = (new ResolveActiveApplicationContainerState)->resolveFromContainers(
+        collect([
+            activeImageResolution(16, $firstId, 'deployment-first', BlueGreenDeploymentPhase::IDLE),
+            activeImageResolution(17, $secondId, 'deployment-second', BlueGreenDeploymentPhase::IDLE),
+        ]),
+        collect([
+            16 => collect([activeImageContainer(
+                $firstId,
+                'deployment-first',
+                'registry.example/app:stable',
+                imageId: $imageId,
+            )]),
+            17 => collect([activeImageContainer(
+                $secondId,
+                'deployment-second',
+                'registry.example/app:next',
+                imageId: $imageId,
+            )]),
+        ]),
+    );
+
+    expect($state)->toBeNull();
+});
+
 it('observes every routed replica and derives image and status from that same set', function () {
     $firstId = str_repeat('1', 64);
     $secondId = str_repeat('2', 64);
@@ -185,6 +260,7 @@ it('observes every routed replica and derives image and status from that same se
     );
 
     expect($state?->image)->toBe(activeImageId('registry.example/app:replicas'))
+        ->and($state?->imageReference)->toBe('registry.example/app:replicas')
         ->and($state?->status)->toBe('running:unhealthy')
         ->and($state?->destination[0]['container_ids'])->toBe([$firstId, $secondId]);
 });
