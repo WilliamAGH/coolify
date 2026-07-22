@@ -4,18 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
-### 🐛 Bug Fixes
-
-- *(control-plane)* Admit exact no-journal rollback state
-
 ### 📚 Documentation
 
-- Update changelog (#137)
+- Update changelog (#139)
 
-## [4.13.17-fork] - 2026-07-22
+## [4.13.18-fork] - 2026-07-22
 
 ### 🐛 Bug Fixes
 
+- *(ci)* Keep release scans local and cancellation-safe
+- *(control-plane)* Recover interrupted enrollment aborts
+- *(control-plane)* Serialize enrollment replacement
 - *(control-plane)* Fence abort residue permissions
 - *(control-plane)* Normalize rollback residue first
 - *(control-plane)* Recover interrupted enrollment residue
@@ -24,11 +23,11 @@ All notable changes to this project will be documented in this file.
 - *(control-plane)* Match abort recovery metadata
 - *(control-plane)* Accept visible enrollment replacement
 - *(control-plane)* Require complete replacement proof
-- *(control-plane)* Recover partial enrollment activation
+- *(control-plane)* Admit exact no-journal rollback state
 
 ### 📚 Documentation
 
-- Update changelog (#134)
+- Update changelog (#137)
 
 ### 🧪 Testing
 
@@ -36,7 +35,21 @@ All notable changes to this project will be documented in this file.
 
 ### ⚙️ Miscellaneous Tasks
 
+- *(release)* Reserve 4.13.18-fork
 - *(release)* Reserve 4.13.17-fork
+
+## [4.13.17-fork] - 2026-07-22
+
+### 🐛 Bug Fixes
+
+- *(control-plane)* Recover partial enrollment activation
+
+### 📚 Documentation
+
+- Update changelog (#134)
+
+### ⚙️ Miscellaneous Tasks
+
 - *(release)* Reserve 4.13.17-fork
 
 ## [4.13.16-fork] - 2026-07-22
@@ -44,9 +57,7 @@ All notable changes to this project will be documented in this file.
 ### 🐛 Bug Fixes
 
 - *(control-plane)* Reconcile rolled-back enrollment
-- *(control-plane)* Recover interrupted enrollment aborts
 - *(control-plane)* Preserve rollback reconciliation timeout
-- *(control-plane)* Serialize enrollment replacement
 
 ### 📚 Documentation
 
