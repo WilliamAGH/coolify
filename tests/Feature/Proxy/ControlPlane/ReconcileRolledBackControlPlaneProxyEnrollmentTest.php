@@ -122,8 +122,17 @@ it('reconciles an absent prepared-style writer state through the missing-artifac
     $rollbackCommand = collect($commands)->first(
         fn (string $command): bool => str_contains($command, ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT),
     );
+    $normalizationIndex = collect($commands)->search(
+        fn (string $command): bool => str_contains($command, NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT),
+    );
+    $authorityInspectionIndex = collect($commands)->search(
+        fn (string $command): bool => str_contains($command, InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_BEGIN),
+    );
 
     expect($commands)->toHaveCount(6)
+        ->and($normalizationIndex)->toBeInt()
+        ->and($authorityInspectionIndex)->toBeInt()
+        ->and($normalizationIndex)->toBeLessThan($authorityInspectionIndex)
         ->and($writerInspectionCommand)->toContain("expected_container_name='coolify-web-first'")
         ->and($rollbackCommand)->toContain("allow_missing_artifact_noop='true'")
         ->and($rollbackCommand)->toContain("allow_authority_absence='true'")
@@ -197,7 +206,7 @@ it('rejects a foreign writer authority before it mutates the rollback tombstone'
         );
     })->toThrow(RuntimeException::class, 'not owned by this exact rollback');
 
-    expect($remoteCalls)->toBe(2)
+    expect($remoteCalls)->toBe(3)
         ->and($store->read($server)?->toArray())->toBe($state->toArray());
 });
 
