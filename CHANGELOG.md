@@ -6,14 +6,37 @@ All notable changes to this project will be documented in this file.
 
 ### 🐛 Bug Fixes
 
+- *(control-plane)* Admit exact no-journal rollback state
+
+### 📚 Documentation
+
+- Update changelog (#137)
+
+## [4.13.17-fork] - 2026-07-22
+
+### 🐛 Bug Fixes
+
+- *(control-plane)* Fence abort residue permissions
+- *(control-plane)* Normalize rollback residue first
+- *(control-plane)* Recover interrupted enrollment residue
+- *(control-plane)* Recheck rollback authority
+- *(control-plane)* Require recoverable abort state
+- *(control-plane)* Match abort recovery metadata
+- *(control-plane)* Accept visible enrollment replacement
+- *(control-plane)* Require complete replacement proof
 - *(control-plane)* Recover partial enrollment activation
 
 ### 📚 Documentation
 
 - Update changelog (#134)
 
+### 🧪 Testing
+
+- *(control-plane)* Retain lock probe evidence
+
 ### ⚙️ Miscellaneous Tasks
 
+- *(release)* Reserve 4.13.17-fork
 - *(release)* Reserve 4.13.17-fork
 
 ## [4.13.16-fork] - 2026-07-22
@@ -21,7 +44,9 @@ All notable changes to this project will be documented in this file.
 ### 🐛 Bug Fixes
 
 - *(control-plane)* Reconcile rolled-back enrollment
+- *(control-plane)* Recover interrupted enrollment aborts
 - *(control-plane)* Preserve rollback reconciliation timeout
+- *(control-plane)* Serialize enrollment replacement
 
 ### 📚 Documentation
 
