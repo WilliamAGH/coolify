@@ -65,12 +65,13 @@ beforeEach(function () {
     ]);
 });
 
-it('returns the exact active container image instead of configured application image', function () {
+it('returns the active container runtime image ID and configured image reference', function () {
     $resolver = Mockery::mock(new ResolveActiveApplicationContainerState)->makePartial();
     $resolver->shouldReceive('handle')
         ->once()
         ->andReturn(new ActiveApplicationContainerState(
-            image: 'registry.example/app:ccb9a3b',
+            image: 'sha256:'.hash('sha256', 'registry.example/app:ccb9a3b'),
+            imageReference: 'registry.example/app:ccb9a3b',
             status: 'running:unhealthy',
             destination: [[
                 'destination_id' => (int) $this->application->destination_id,
@@ -85,7 +86,8 @@ it('returns the exact active container image instead of configured application i
     $this->withToken($this->token)
         ->getJson("/api/v1/applications/{$this->application->uuid}/active-container")
         ->assertSuccessful()
-        ->assertJsonPath('image', 'registry.example/app:ccb9a3b')
+        ->assertJsonPath('image', 'sha256:'.hash('sha256', 'registry.example/app:ccb9a3b'))
+        ->assertJsonPath('image_reference', 'registry.example/app:ccb9a3b')
         ->assertJsonPath('source', 'dockerimage')
         ->assertJsonPath('status', 'running:unhealthy')
         ->assertJsonPath('provenance.kind', 'live-container-inspection')
@@ -110,6 +112,7 @@ it('resolves an ordinary image application directly from its live container with
 
     expect($this->application->blueGreenDeployments()->exists())->toBeFalse()
         ->and($state?->image)->toBe('sha256:'.hash('sha256', $image))
+        ->and($state?->imageReference)->toBe($image)
         ->and($state?->status)->toBe('running:healthy')
         ->and($state?->destination[0]['deployment_uuid'])->toBe('deployment-ordinary')
         ->and($state?->destination[0]['container_ids'])->toBe([$containerId]);

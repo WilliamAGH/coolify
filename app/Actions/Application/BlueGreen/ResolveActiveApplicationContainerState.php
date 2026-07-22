@@ -228,7 +228,17 @@ class ResolveActiveApplicationContainerState
                 ? $image
                 : null;
         });
-        if ($images->contains(null) || $images->unique()->count() !== 1) {
+        $imageReferences = $selectedContainers->map(function (array $container): ?string {
+            $imageReference = data_get($container, 'Config.Image');
+
+            return is_string($imageReference) && trim($imageReference) !== ''
+                ? $imageReference
+                : null;
+        });
+        if ($images->contains(null)
+            || $images->unique()->count() !== 1
+            || $imageReferences->contains(null)
+            || $imageReferences->uniqueStrict()->count() !== 1) {
             return null;
         }
         if ($selectedContainers->contains(
@@ -239,6 +249,7 @@ class ResolveActiveApplicationContainerState
 
         return new ActiveApplicationContainerState(
             image: $images->first(),
+            imageReference: $imageReferences->first(),
             status: (new ContainerStatusAggregator)->aggregateFromContainers($selectedContainers),
             destination: $destination,
         );
