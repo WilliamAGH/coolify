@@ -31,6 +31,24 @@ final class ActivateControlPlaneProxyEnrollment
         string $token,
         ?Closure $remoteExecutor = null,
     ): ControlPlaneProxyEnrollmentState {
+        return $this->stateStore->serializeOperation(
+            $server,
+            fn (Server $lockedServer): ControlPlaneProxyEnrollmentState => $this->handleLocked(
+                $lockedServer,
+                $operationId,
+                $token,
+                $remoteExecutor,
+            ),
+        );
+    }
+
+    /** @param null|Closure(string): ?string $remoteExecutor */
+    private function handleLocked(
+        Server $server,
+        string $operationId,
+        string $token,
+        ?Closure $remoteExecutor,
+    ): ControlPlaneProxyEnrollmentState {
         $state = $this->ownedState($server, $operationId, $token);
         $execute = $remoteExecutor ?? static fn (string $command): ?string => instant_remote_process(
             [$command],
