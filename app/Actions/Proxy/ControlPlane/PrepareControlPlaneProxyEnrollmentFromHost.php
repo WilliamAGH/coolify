@@ -68,7 +68,7 @@ final class PrepareControlPlaneProxyEnrollmentFromHost
         );
         $existingState = $this->stateStore->read($server);
         if ($existingState?->phase === ControlPlaneProxyEnrollmentPhase::RolledBack) {
-            $this->rolledBackReconciler->handle($server, $existingState, $execute);
+            $this->rolledBackReconciler->handle($server, $existingState, $remoteExecutor);
             $this->stateStore->clearRolledBackIfUnchanged($server, $existingState);
         }
         $sourceComposeYaml = $execute('cat -- '.escapeshellarg($this->sourceProductionComposePath));
