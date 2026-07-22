@@ -31,6 +31,10 @@ final class AbortPreparedControlPlaneProxyEnrollment
 
     public function __construct(
         private readonly StoreControlPlaneProxyEnrollmentState $stateStore,
+        private readonly ManagedTraefikDocumentWriter $dynamicWriter,
+        private readonly InspectControlPlaneEnrollmentWriterAuthority $writerAuthorityInspector,
+        private readonly InspectControlPlaneEnrollmentWriter $writerInspector,
+        private readonly BootstrapControlPlaneEnrollmentWriterAuthority $writerAuthorityBootstrap,
         private readonly ?string $proxyPath = null,
         private readonly string $sourceDirectory = '/data/coolify/source',
     ) {}
@@ -77,11 +81,9 @@ final class AbortPreparedControlPlaneProxyEnrollment
             || ! hash_equals($state->expectedRevision, $expectedRevision)) {
             throw new RuntimeException('The unchanged control-plane enrollment abort fence does not match the durable state.');
         }
+        $this->stateStore->assertRollbackAvailable($server);
 
-        $this->assertUnchangedPreparedFilesystem($server, $state, $remoteExecutor);
-        if ($state->phase === ControlPlaneProxyEnrollmentPhase::Activating) {
-            $this->assertLegacyRuntimeOwnership($server, $state->appPort, $remoteExecutor);
-        }
+        $this->assertUnchangedOrRecoverInitialActivation($server, $state, $remoteExecutor);
 
         return $this->stateStore->abortUnchanged(
             $server,
@@ -114,7 +116,7 @@ final class AbortPreparedControlPlaneProxyEnrollment
         return Command::SUCCESS;
     }
 
-    private function assertUnchangedPreparedFilesystem(
+    private function assertUnchangedOrRecoverInitialActivation(
         Server $server,
         ControlPlaneProxyEnrollmentState $state,
         ?Closure $remoteExecutor,
@@ -128,10 +130,78 @@ final class AbortPreparedControlPlaneProxyEnrollment
         );
         $proxyPath = rtrim($this->proxyPath ?? (string) $server->proxyPath(), '/');
         $sourceDirectory = rtrim($this->sourceDirectory, '/');
+        $stateDirectory = $proxyPath.'/.control-plane-managed-traefik';
+        $this->assertUnchangedStaticFilesystem($execute, $proxyPath, $sourceDirectory, $state);
+        $managedStatePresent = $this->managedStateDirectoryPresent($execute, $stateDirectory);
+
+        if ($state->phase === ControlPlaneProxyEnrollmentPhase::Activating && $managedStatePresent) {
+            $writerContainerName = $state->activeBackendDnsNames[0]
+                ?? throw new RuntimeException('The activating control-plane enrollment has no writer container identity.');
+            $mutation = $this->rollbackMutation($proxyPath, $state);
+            $existingAuthority = $this->inspectWriterAuthority($execute, $mutation);
+            if ($existingAuthority === null) {
+                $this->assertLegacyRuntimeOwnership($server, $state->appPort, $execute);
+                $beforeIdentity = $this->inspectWriterIdentity($execute, $writerContainerName);
+            } else {
+                $beforeIdentity = new ControlPlaneEnrollmentWriterIdentity(
+                    containerId: $existingAuthority->containerId,
+                    containerName: $existingAuthority->containerName,
+                    imageId: $existingAuthority->imageId,
+                );
+            }
+            $replacementAuthority = $this->writerAuthorityBootstrap->authorityFor($state, $beforeIdentity);
+            $rolledBackAuthority = $this->writerAuthorityBootstrap->rolledBackAuthorityFor($state, $beforeIdentity);
+            if ($existingAuthority !== null && ! hash_equals($existingAuthority->toJson(), $rolledBackAuthority->toJson())) {
+                throw new RuntimeException('The activating control-plane enrollment writer authority is not its exact epoch-two rollback tombstone.');
+            }
+            $this->assertExactOutput(
+                $execute($this->dynamicWriter->rollbackAbandonedInitialEnrollmentCommandFor(
+                    $mutation,
+                    $replacementAuthority,
+                    $rolledBackAuthority,
+                )),
+                ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT,
+                'abandoned initial dynamic rollback',
+            );
+            if ($existingAuthority === null) {
+                $afterIdentity = $this->inspectWriterIdentity($execute, $writerContainerName);
+                if (! hash_equals($beforeIdentity->containerId, $afterIdentity->containerId)
+                    || ! hash_equals($beforeIdentity->containerName, $afterIdentity->containerName)
+                    || ! hash_equals($beforeIdentity->imageId, $afterIdentity->imageId)) {
+                    throw new RuntimeException('The activating control-plane enrollment writer identity changed during rollback.');
+                }
+            }
+            $this->assertUnchangedStaticFilesystem($execute, $proxyPath, $sourceDirectory, $state);
+            $this->assertDynamicPredecessor($execute, $proxyPath, $state);
+            $this->assertLegacyRuntimeOwnership($server, $state->appPort, $execute);
+
+            return;
+        }
+
+        if ($managedStatePresent) {
+            throw new RuntimeException("Prepared control-plane enrollment artifact is not absent or empty: {$stateDirectory}");
+        }
+        $this->assertDynamicPredecessor($execute, $proxyPath, $state);
+        if ($state->phase === ControlPlaneProxyEnrollmentPhase::Activating) {
+            $this->assertLegacyRuntimeOwnership($server, $state->appPort, $execute);
+        }
+    }
+
+    private function assertUnchangedStaticFilesystem(
+        Closure $execute,
+        string $proxyPath,
+        string $sourceDirectory,
+        ControlPlaneProxyEnrollmentState $state,
+    ): void {
         $this->assertExactRegularFile($execute, $proxyPath.'/docker-compose.yml', $state->staticPredecessorBytes);
         $this->assertAbsent($execute, $sourceDirectory.'/docker-compose.control-plane-listener.yml');
-        $this->assertAbsentOrEmptyDirectory($execute, $proxyPath.'/.control-plane-managed-traefik');
+    }
 
+    private function assertDynamicPredecessor(
+        Closure $execute,
+        string $proxyPath,
+        ControlPlaneProxyEnrollmentState $state,
+    ): void {
         $managedDocument = $proxyPath.'/dynamic/'.$state->managedFilename;
         if ($state->dynamicPredecessorBytes === null) {
             $this->assertAbsent($execute, $managedDocument);
@@ -143,15 +213,8 @@ final class AbortPreparedControlPlaneProxyEnrollment
     private function assertLegacyRuntimeOwnership(
         Server $server,
         int $appPort,
-        ?Closure $remoteExecutor,
+        Closure $execute,
     ): void {
-        $execute = $remoteExecutor ?? static fn (string $command): ?string => instant_remote_process(
-            [$command],
-            $server,
-            timeout: 30,
-            disableMultiplexing: true,
-            retry: false,
-        );
         $expectedBinding = '0.0.0.0:'.$appPort;
         $publicIpv6Binding = '[::]:'.$appPort;
         $output = $execute(implode("\n", [
@@ -204,7 +267,7 @@ final class AbortPreparedControlPlaneProxyEnrollment
         }
     }
 
-    private function assertAbsentOrEmptyDirectory(Closure $execute, string $path): void
+    private function managedStateDirectoryPresent(Closure $execute, string $path): bool
     {
         $pathArgument = escapeshellarg($path);
         $output = $execute(
@@ -212,8 +275,8 @@ final class AbortPreparedControlPlaneProxyEnrollment
             .'printf '.escapeshellarg(self::ABSENT_ARTIFACT."\n").'; '
             .'elif [ -d '.$pathArgument.' ] && [ ! -L '.$pathArgument.' ]; then '
             .'entries=$(find '.$pathArgument.' -mindepth 1 -maxdepth 1 -print -quit) || exit 1; '
-            .'[ -z "$entries" ] || exit 1; '
-            .'printf '.escapeshellarg(self::EMPTY_ARTIFACT_DIRECTORY."\n").'; '
+            .'if [ -z "$entries" ]; then printf '.escapeshellarg(self::EMPTY_ARTIFACT_DIRECTORY."\n").'; '
+            .'else printf '.escapeshellarg(self::PRESENT_ARTIFACT."\n").'; fi; '
             .'else exit 1; fi',
         );
         if (! in_array($output, [
@@ -222,7 +285,56 @@ final class AbortPreparedControlPlaneProxyEnrollment
             self::EMPTY_ARTIFACT_DIRECTORY,
             self::EMPTY_ARTIFACT_DIRECTORY."\n",
         ], true)) {
-            throw new RuntimeException("Prepared control-plane enrollment artifact is not absent or empty: {$path}");
+            if (in_array($output, [self::PRESENT_ARTIFACT, self::PRESENT_ARTIFACT."\n"], true)) {
+                return true;
+            }
+            throw new RuntimeException("Prepared control-plane enrollment artifact could not be inspected: {$path}");
+        }
+
+        return false;
+    }
+
+    private function rollbackMutation(string $proxyPath, ControlPlaneProxyEnrollmentState $state): ManagedTraefikDocumentMutation
+    {
+        return new ManagedTraefikDocumentMutation(
+            dynamicDirectory: $proxyPath.'/dynamic',
+            stateDirectory: $proxyPath.'/.control-plane-managed-traefik',
+            filename: $state->managedFilename,
+            operationId: $state->operationId,
+            revision: $state->dynamicRevision,
+            expectedSha256: $state->dynamicPredecessorBytes === null ? null : hash('sha256', $state->dynamicPredecessorBytes),
+            expectedOperationId: null,
+            expectedRevision: null,
+            replacementBytes: $state->dynamicReplacementBytes,
+        );
+    }
+
+    private function inspectWriterIdentity(Closure $execute, string $containerName): ControlPlaneEnrollmentWriterIdentity
+    {
+        $transcript = $execute($this->writerInspector->commandFor($containerName));
+        if (! is_string($transcript)) {
+            throw new RuntimeException('The control-plane enrollment writer inspection returned no transcript.');
+        }
+
+        return $this->writerInspector->handle($transcript, $containerName);
+    }
+
+    private function inspectWriterAuthority(
+        Closure $execute,
+        ManagedTraefikDocumentMutation $mutation,
+    ): ?ManagedTraefikDocumentWriterAuthority {
+        $transcript = $execute($this->writerAuthorityInspector->commandFor($mutation));
+        if (! is_string($transcript)) {
+            throw new RuntimeException('The control-plane enrollment writer authority inspection returned no transcript.');
+        }
+
+        return $this->writerAuthorityInspector->handle($transcript);
+    }
+
+    private function assertExactOutput(?string $output, string $expected, string $operation): void
+    {
+        if (! is_string($output) || ! hash_equals($expected, trim($output))) {
+            throw new RuntimeException("The control-plane {$operation} did not return its exact completion proof.");
         }
     }
 

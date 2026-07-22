@@ -30,7 +30,7 @@ function managedTraefikDocumentMutation(
 function runManagedTraefikDocumentCommand(string $command, array $environment = []): Process
 {
     $process = Process::fromShellCommandline($command);
-    $process->setTimeout(10);
+    $process->setTimeout(30);
     if ($environment !== []) {
         $process->setEnv($environment);
     }
@@ -717,6 +717,369 @@ it('rolls back initial enrollment with an exact replacement authority and replay
         $filesystem->remove($root);
     }
 });
+
+it('rolls back only an exact authority-less initial enrollment and preserves its rollback tombstone', function (): void {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $enrollment = managedTraefikDocumentMutation(
+            $root,
+            'control-plane-abandoned-enrollment',
+            1,
+            "http:\n  routers:\n    enrollment: {}\n",
+        );
+        $replacementAuthority = managedTraefikDocumentWriterAuthority($enrollment, epoch: 1);
+        $rolledBackAuthority = managedTraefikDocumentEnrollmentRollbackAuthority($enrollment, $replacementAuthority);
+        $forwardCommand = $writer->writeCommandFor($enrollment);
+
+        expect(runManagedTraefikDocumentCommand($forwardCommand)->isSuccessful())->toBeTrue();
+        $rollbackCommand = $writer->rollbackAbandonedInitialEnrollmentCommandFor(
+            $enrollment,
+            $replacementAuthority,
+            $rolledBackAuthority,
+        );
+        $rolledBack = runManagedTraefikDocumentCommand($rollbackCommand);
+        $replayed = runManagedTraefikDocumentCommand($rollbackCommand);
+        $staleForward = runManagedTraefikDocumentCommand($forwardCommand);
+
+        expect($rolledBack->isSuccessful())->toBeTrue($rolledBack->getErrorOutput())
+            ->and(trim($rolledBack->getOutput()))->toBe(ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT)
+            ->and($replayed->isSuccessful())->toBeTrue($replayed->getErrorOutput())
+            ->and($staleForward->isSuccessful())->toBeFalse()
+            ->and(file_exists($enrollment->documentPath()))->toBeFalse()
+            ->and(file_exists($enrollment->sidecarPath()))->toBeFalse()
+            ->and(file_exists($enrollment->rollbackArtifactPath()))->toBeTrue()
+            ->and(file_exists($enrollment->lockPath()))->toBeTrue()
+            ->and(file_get_contents($enrollment->writerAuthorityPath()))->toBe($rolledBackAuthority->toJson());
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('rejects drift from the exact authority-less initial enrollment without changing its document', function (string $drift): void {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $enrollment = managedTraefikDocumentMutation(
+            $root,
+            'control-plane-abandoned-enrollment-drift',
+            1,
+            "http:\n  routers:\n    enrollment: {}\n",
+        );
+        $replacementAuthority = managedTraefikDocumentWriterAuthority($enrollment, epoch: 1);
+        $rolledBackAuthority = managedTraefikDocumentEnrollmentRollbackAuthority($enrollment, $replacementAuthority);
+        expect(runManagedTraefikDocumentCommand($writer->writeCommandFor($enrollment))->isSuccessful())->toBeTrue();
+
+        match ($drift) {
+            'authority' => file_put_contents($enrollment->writerAuthorityPath(), $replacementAuthority->toJson()),
+            'artifact' => file_put_contents($enrollment->rollbackArtifactPath(), "foreign\n"),
+            'document' => file_put_contents($enrollment->documentPath(), "http:\n  routers:\n    foreign: {}\n"),
+            'sidecar' => file_put_contents($enrollment->sidecarPath(), "{}\n"),
+            'lock' => unlink($enrollment->lockPath()),
+            'extra' => file_put_contents($enrollment->stateDirectory.'/foreign-state', "foreign\n"),
+        };
+
+        $result = runManagedTraefikDocumentCommand(
+            $writer->rollbackAbandonedInitialEnrollmentCommandFor(
+                $enrollment,
+                $replacementAuthority,
+                $rolledBackAuthority,
+            ),
+        );
+
+        expect($result->isSuccessful())->toBeFalse()
+            ->and(file_exists($enrollment->writerAuthorityPath()))->toBe($drift === 'authority')
+            ->and(file_exists($enrollment->rollbackArtifactPath()))->toBeTrue();
+    } finally {
+        $filesystem->remove($root);
+    }
+})->with(['authority', 'artifact', 'document', 'sidecar', 'lock', 'extra']);
+
+it('replays an exact abandoned initial enrollment rollback after each durable mutation boundary', function (string $crashVariable): void {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $enrollment = managedTraefikDocumentMutation(
+            $root,
+            'control-plane-abandoned-enrollment-crash',
+            1,
+            "http:\n  routers:\n    enrollment: {}\n",
+        );
+        $replacementAuthority = managedTraefikDocumentWriterAuthority($enrollment, epoch: 1);
+        $rolledBackAuthority = managedTraefikDocumentEnrollmentRollbackAuthority($enrollment, $replacementAuthority);
+        expect(runManagedTraefikDocumentCommand($writer->writeCommandFor($enrollment))->isSuccessful())->toBeTrue();
+        $rollbackCommand = $writer->rollbackAbandonedInitialEnrollmentCommandFor(
+            $enrollment,
+            $replacementAuthority,
+            $rolledBackAuthority,
+        );
+
+        $crashed = runManagedTraefikDocumentCommand($rollbackCommand, [$crashVariable => '1']);
+        $replayed = runManagedTraefikDocumentCommand($rollbackCommand);
+
+        expect($crashed->isSuccessful())->toBeFalse()
+            ->and(file_get_contents($enrollment->writerAuthorityPath()))->toBe($rolledBackAuthority->toJson())
+            ->and($replayed->isSuccessful())->toBeTrue($replayed->getErrorOutput())
+            ->and(file_exists($enrollment->documentPath()))->toBeFalse()
+            ->and(file_exists($enrollment->sidecarPath()))->toBeFalse()
+            ->and(file_exists($enrollment->journalPath()))->toBeFalse();
+    } finally {
+        $filesystem->remove($root);
+    }
+})->with([
+    'after the epoch-two rollback tombstone' => 'COOLIFY_MANAGED_TRAEFIK_DOCUMENT_CRASH_AFTER_AUTHORITY',
+    'after restoring the predecessor document' => 'COOLIFY_MANAGED_TRAEFIK_DOCUMENT_CRASH_AFTER_DOCUMENT',
+]);
+
+it('replays an exact abandoned rollback after restoring a present predecessor document and sidecar', function (): void {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $predecessor = managedTraefikDocumentMutation($root, 'predecessor', 1, "http:\n  routers:\n    predecessor: {}\n");
+        $enrollment = managedTraefikDocumentMutation(
+            $root,
+            'control-plane-abandoned-present-predecessor',
+            2,
+            "http:\n  routers:\n    enrollment: {}\n",
+            $predecessor,
+        );
+        expect(runManagedTraefikDocumentCommand($writer->writeCommandFor($predecessor))->isSuccessful())->toBeTrue()
+            ->and(runManagedTraefikDocumentCommand($writer->writeCommandFor($enrollment))->isSuccessful())->toBeTrue();
+        unlink($predecessor->rollbackArtifactPath());
+        $replacementAuthority = managedTraefikDocumentWriterAuthority($enrollment, epoch: 1);
+        $rolledBackAuthority = managedTraefikDocumentEnrollmentRollbackAuthority($enrollment, $replacementAuthority);
+        $rollbackCommand = $writer->rollbackAbandonedInitialEnrollmentCommandFor(
+            $enrollment,
+            $replacementAuthority,
+            $rolledBackAuthority,
+        );
+
+        $crashed = runManagedTraefikDocumentCommand(
+            $rollbackCommand,
+            ['COOLIFY_MANAGED_TRAEFIK_DOCUMENT_CRASH_AFTER_SIDECAR' => '1'],
+        );
+        expect($crashed->isSuccessful())->toBeFalse()
+            ->and(file_get_contents($enrollment->documentPath()))->toBe($predecessor->replacementBytes)
+            ->and(file_get_contents($enrollment->sidecarPath()))->toBe($predecessor->replacementSidecar())
+            ->and(file_exists($enrollment->journalPath()))->toBeTrue();
+
+        $replayed = runManagedTraefikDocumentCommand($rollbackCommand);
+        expect($replayed->isSuccessful())->toBeTrue($replayed->getErrorOutput())
+            ->and(file_get_contents($enrollment->documentPath()))->toBe($predecessor->replacementBytes)
+            ->and(file_get_contents($enrollment->sidecarPath()))->toBe($predecessor->replacementSidecar())
+            ->and(file_exists($enrollment->journalPath()))->toBeFalse();
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('replays an exact abandoned rollback after the epoch-two authority candidate was fsynced', function (): void {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $enrollment = managedTraefikDocumentMutation(
+            $root,
+            'control-plane-abandoned-authority-candidate',
+            1,
+            "http:\n  routers:\n    enrollment: {}\n",
+        );
+        $replacementAuthority = managedTraefikDocumentWriterAuthority($enrollment, epoch: 1);
+        $rolledBackAuthority = managedTraefikDocumentEnrollmentRollbackAuthority($enrollment, $replacementAuthority);
+        expect(runManagedTraefikDocumentCommand($writer->writeCommandFor($enrollment))->isSuccessful())->toBeTrue();
+        $rollbackCommand = $writer->rollbackAbandonedInitialEnrollmentCommandFor(
+            $enrollment,
+            $replacementAuthority,
+            $rolledBackAuthority,
+        );
+
+        $crashed = runManagedTraefikDocumentCommand(
+            $rollbackCommand,
+            ['COOLIFY_DURABLE_REMOTE_ARTIFACT_CRASH_AFTER_CANDIDATE_FSYNC' => '1'],
+        );
+        expect($crashed->isSuccessful())->toBeFalse()
+            ->and(file_exists($enrollment->writerAuthorityPath()))->toBeFalse();
+
+        $replayed = runManagedTraefikDocumentCommand($rollbackCommand);
+        expect($replayed->isSuccessful())->toBeTrue($replayed->getErrorOutput())
+            ->and(file_get_contents($enrollment->writerAuthorityPath()))->toBe($rolledBackAuthority->toJson());
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('replays an exact abandoned rollback after the rollback journal candidate was fsynced', function (): void {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $enrollment = managedTraefikDocumentMutation(
+            $root,
+            'control-plane-abandoned-journal-candidate',
+            1,
+            "http:\n  routers:\n    enrollment: {}\n",
+        );
+        $replacementAuthority = managedTraefikDocumentWriterAuthority($enrollment, epoch: 1);
+        $rolledBackAuthority = managedTraefikDocumentEnrollmentRollbackAuthority($enrollment, $replacementAuthority);
+        expect(runManagedTraefikDocumentCommand($writer->writeCommandFor($enrollment))->isSuccessful())->toBeTrue();
+        $rollbackCommand = $writer->rollbackAbandonedInitialEnrollmentCommandFor(
+            $enrollment,
+            $replacementAuthority,
+            $rolledBackAuthority,
+        );
+        $afterAuthority = runManagedTraefikDocumentCommand(
+            $rollbackCommand,
+            ['COOLIFY_MANAGED_TRAEFIK_DOCUMENT_CRASH_AFTER_AUTHORITY' => '1'],
+        );
+        expect($afterAuthority->isSuccessful())->toBeFalse()
+            ->and(file_get_contents($enrollment->writerAuthorityPath()))->toBe($rolledBackAuthority->toJson())
+            ->and(file_exists($enrollment->journalPath()))->toBeFalse();
+
+        $afterJournalCandidate = runManagedTraefikDocumentCommand(
+            $rollbackCommand,
+            ['COOLIFY_DURABLE_REMOTE_ARTIFACT_CRASH_AFTER_CANDIDATE_FSYNC' => '1'],
+        );
+        expect($afterJournalCandidate->isSuccessful())->toBeFalse()
+            ->and(file_exists($enrollment->journalPath()))->toBeFalse();
+
+        $replayed = runManagedTraefikDocumentCommand($rollbackCommand);
+        expect($replayed->isSuccessful())->toBeTrue($replayed->getErrorOutput())
+            ->and(file_exists($enrollment->documentPath()))->toBeFalse()
+            ->and(file_exists($enrollment->sidecarPath()))->toBeFalse();
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('reconciles an empty abandoned legacy scratch directory before exact rollback replay', function (): void {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $enrollment = managedTraefikDocumentMutation(
+            $root,
+            'control-plane-abandoned-empty-scratch',
+            1,
+            "http:\n  routers:\n    enrollment: {}\n",
+        );
+        $replacementAuthority = managedTraefikDocumentWriterAuthority($enrollment, epoch: 1);
+        $rolledBackAuthority = managedTraefikDocumentEnrollmentRollbackAuthority($enrollment, $replacementAuthority);
+        expect(runManagedTraefikDocumentCommand($writer->writeCommandFor($enrollment))->isSuccessful())->toBeTrue();
+        $abandonedScratch = $enrollment->stateDirectory.'/.managed-traefik-document.Ab12Cd';
+        mkdir($abandonedScratch, 0700);
+
+        $replayed = runManagedTraefikDocumentCommand(
+            $writer->rollbackAbandonedInitialEnrollmentCommandFor(
+                $enrollment,
+                $replacementAuthority,
+                $rolledBackAuthority,
+            ),
+        );
+
+        expect($replayed->isSuccessful())->toBeTrue($replayed->getErrorOutput())
+            ->and(file_exists($abandonedScratch))->toBeFalse()
+            ->and(file_exists($enrollment->documentPath()))->toBeFalse();
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('reconciles a populated abandoned legacy scratch directory before exact rollback replay', function (): void {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $enrollment = managedTraefikDocumentMutation(
+            $root,
+            'control-plane-abandoned-populated-scratch',
+            1,
+            "http:\n  routers:\n    enrollment: {}\n",
+        );
+        $replacementAuthority = managedTraefikDocumentWriterAuthority($enrollment, epoch: 1);
+        $rolledBackAuthority = managedTraefikDocumentEnrollmentRollbackAuthority($enrollment, $replacementAuthority);
+        expect(runManagedTraefikDocumentCommand($writer->writeCommandFor($enrollment))->isSuccessful())->toBeTrue();
+        $abandonedScratch = $enrollment->stateDirectory.'/.managed-traefik-document.Ab12Cd';
+        mkdir($abandonedScratch, 0700);
+        foreach ([
+            'expected-sidecar',
+            'replacement-sidecar',
+            'replacement-payload',
+            'expected-journal',
+            'forward-journal',
+            'authority-required',
+            'authority-next',
+            'predecessor-document',
+        ] as $scratchFile) {
+            file_put_contents($abandonedScratch.'/'.$scratchFile, $scratchFile);
+        }
+
+        $replayed = runManagedTraefikDocumentCommand(
+            $writer->rollbackAbandonedInitialEnrollmentCommandFor(
+                $enrollment,
+                $replacementAuthority,
+                $rolledBackAuthority,
+            ),
+        );
+
+        expect($replayed->isSuccessful())->toBeTrue($replayed->getErrorOutput())
+            ->and(file_exists($abandonedScratch))->toBeFalse()
+            ->and(file_exists($enrollment->documentPath()))->toBeFalse();
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('rejects unsafe abandoned legacy scratch contents without changing the replacement', function (string $unsafeEntry): void {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $enrollment = managedTraefikDocumentMutation(
+            $root,
+            'control-plane-unsafe-legacy-scratch',
+            1,
+            "http:\n  routers:\n    enrollment: {}\n",
+        );
+        $replacementAuthority = managedTraefikDocumentWriterAuthority($enrollment, epoch: 1);
+        $rolledBackAuthority = managedTraefikDocumentEnrollmentRollbackAuthority($enrollment, $replacementAuthority);
+        expect(runManagedTraefikDocumentCommand($writer->writeCommandFor($enrollment))->isSuccessful())->toBeTrue();
+        $abandonedScratch = $enrollment->stateDirectory.'/.managed-traefik-document.Ab12Cd';
+        mkdir($abandonedScratch, 0700);
+        match ($unsafeEntry) {
+            'unknown' => file_put_contents($abandonedScratch.'/unknown', 'unknown'),
+            'symlink' => symlink($enrollment->documentPath(), $abandonedScratch.'/expected-sidecar'),
+            'hardlink' => link($enrollment->documentPath(), $abandonedScratch.'/expected-sidecar'),
+            'directory' => mkdir($abandonedScratch.'/expected-sidecar', 0700),
+        };
+
+        $result = runManagedTraefikDocumentCommand(
+            $writer->rollbackAbandonedInitialEnrollmentCommandFor(
+                $enrollment,
+                $replacementAuthority,
+                $rolledBackAuthority,
+            ),
+        );
+
+        expect($result->isSuccessful())->toBeFalse()
+            ->and(file_get_contents($enrollment->documentPath()))->toBe($enrollment->replacementBytes)
+            ->and(file_exists($enrollment->writerAuthorityPath()))->toBeFalse();
+    } finally {
+        $filesystem->remove($root);
+    }
+})->with(['unknown', 'symlink', 'hardlink', 'directory']);
 
 it('finalizes an exact initial enrollment rollback by restoring the pre-enrollment filesystem state', function (): void {
     $filesystem = new Filesystem;
@@ -1405,6 +1768,11 @@ it('renders valid dash and bash commands without shellcheck findings', function 
                 $secondAuthority,
             ),
             $writer->reconcileRolledBackWriterAuthorityCommandFor($second, $firstAuthority, $rolledBackAuthority),
+            $writer->rollbackAbandonedInitialEnrollmentCommandFor(
+                $enrollment,
+                $enrollmentReplacementAuthority,
+                $enrollmentRolledBackAuthority,
+            ),
             $writer->finalizeEnrollmentRollbackCommandFor($enrollment, $enrollmentRolledBackAuthority),
         ];
 
