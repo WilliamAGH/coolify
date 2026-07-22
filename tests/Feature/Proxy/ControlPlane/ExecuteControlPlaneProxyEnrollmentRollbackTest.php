@@ -1,5 +1,6 @@
 <?php
 
+use App\Actions\Proxy\ControlPlane\BootstrapControlPlaneEnrollmentWriterAuthority;
 use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentPhase;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentState;
@@ -8,8 +9,11 @@ use App\Actions\Proxy\ControlPlane\ControlPlaneProxyRouteProof;
 use App\Actions\Proxy\ControlPlane\ControlPlaneRestoredRoutesProof;
 use App\Actions\Proxy\ControlPlane\ControlPlaneStaticListenerHandoff;
 use App\Actions\Proxy\ControlPlane\ExecuteControlPlaneProxyEnrollmentRollback;
+use App\Actions\Proxy\ControlPlane\InspectControlPlaneEnrollmentWriter;
+use App\Actions\Proxy\ControlPlane\InspectControlPlaneEnrollmentWriterAuthority;
 use App\Actions\Proxy\ControlPlane\InstallControlPlaneCandidateHealthMarkers;
 use App\Actions\Proxy\ControlPlane\ManagedTraefikDocumentWriter;
+use App\Actions\Proxy\ControlPlane\NormalizeControlPlaneEnrollmentFilesystem;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
 use App\Actions\Proxy\ControlPlane\VerifyControlPlaneRestoredRoutes;
 use App\Models\Server;
@@ -53,8 +57,12 @@ function executableControlPlaneRollback(): array
         $store,
         new ExecuteControlPlaneProxyEnrollmentRollback(
             $store,
+            new NormalizeControlPlaneEnrollmentFilesystem,
             new ControlPlaneStaticListenerHandoff,
             new ManagedTraefikDocumentWriter,
+            new InspectControlPlaneEnrollmentWriterAuthority,
+            new InspectControlPlaneEnrollmentWriter,
+            new BootstrapControlPlaneEnrollmentWriterAuthority,
             new InstallControlPlaneCandidateHealthMarkers,
             new VerifyControlPlaneRestoredRoutes,
         ),
@@ -86,18 +94,39 @@ function executableControlPlaneRestoredTranscript(): string
     return implode("\n", [...$records, ControlPlaneRestoredRoutesProof::TRANSCRIPT_CONVERGED.' 2']);
 }
 
+function executableControlPlaneAuthorityAbsentTranscript(): string
+{
+    return implode("\n", [
+        InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_BEGIN,
+        InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_ABSENT,
+        InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_END,
+    ]);
+}
+
+function executableControlPlaneWriterInspectionTranscript(): string
+{
+    return implode("\n", [
+        InspectControlPlaneEnrollmentWriter::TRANSCRIPT_BEGIN,
+        InspectControlPlaneEnrollmentWriter::TRANSCRIPT_RECORD.' '.str_repeat('a', 64).' /coolify-web-a sha256:'.str_repeat('b', 64).' true',
+        InspectControlPlaneEnrollmentWriter::TRANSCRIPT_END,
+    ]);
+}
+
 it('persists rollback before self-replacement and requires a fresh replay to finish', function (): void {
     [$server, $store, $action] = executableControlPlaneRollback();
     $calls = 0;
     $executor = function (string $command) use (&$calls): string {
         $calls++;
 
-        return match ($calls) {
-            1, 2 => ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT,
-            3 => ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT,
-            4 => '',
-            5 => executableControlPlaneRestoredTranscript(),
-            default => throw new RuntimeException("Unexpected rollback command: {$command}"),
+        return match (true) {
+            str_contains($command, NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT) => NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT,
+            str_contains($command, InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_BEGIN) => executableControlPlaneAuthorityAbsentTranscript(),
+            str_contains($command, InspectControlPlaneEnrollmentWriter::TRANSCRIPT_BEGIN) => executableControlPlaneWriterInspectionTranscript(),
+            str_contains($command, ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT) => ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT,
+            str_contains($command, ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT) => ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT,
+            str_contains($command, ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT) => ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT,
+            str_contains($command, ControlPlaneRestoredRoutesProof::TRANSCRIPT_BEGIN) => executableControlPlaneRestoredTranscript(),
+            default => '',
         };
     };
 
@@ -110,7 +139,7 @@ it('persists rollback before self-replacement and requires a fresh replay to fin
         ->and($awaitingAcknowledgement->phase)->toBe(ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement)
         ->and($rolledBack->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack)
         ->and($replayed->toArray())->toBe($rolledBack->toArray())
-        ->and($calls)->toBe(5)
+        ->and($calls)->toBe(14)
         ->and($server->fresh()?->proxy->get('last_saved_proxy_configuration'))->toBe($rolledBack->staticPredecessorBytes)
         ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack);
 });
@@ -118,15 +147,17 @@ it('persists rollback before self-replacement and requires a fresh replay to fin
 it('keeps rollback nonterminal when restored public traffic is not acknowledged', function (): void {
     [$server, $store, $action] = executableControlPlaneRollback();
     $calls = 0;
-    $executor = function () use (&$calls): string {
+    $executor = function (string $command) use (&$calls): string {
         $calls++;
 
-        return match ($calls) {
-            1, 2 => ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT,
-            3 => ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT,
-            4 => '',
-            5 => ControlPlaneRestoredRoutesProof::TRANSCRIPT_TIMEOUT.' 5',
-            default => throw new RuntimeException('Unexpected restored rollback command.'),
+        return match (true) {
+            str_contains($command, NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT) => NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT,
+            str_contains($command, InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_BEGIN) => executableControlPlaneAuthorityAbsentTranscript(),
+            str_contains($command, InspectControlPlaneEnrollmentWriter::TRANSCRIPT_BEGIN) => executableControlPlaneWriterInspectionTranscript(),
+            str_contains($command, ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT) => ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT,
+            str_contains($command, ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT) => ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT,
+            str_contains($command, ControlPlaneRestoredRoutesProof::TRANSCRIPT_BEGIN) => ControlPlaneRestoredRoutesProof::TRANSCRIPT_TIMEOUT.' 5',
+            default => '',
         };
     };
 
@@ -145,8 +176,14 @@ it('keeps ambiguous static rollback durably resumable and rejects foreign owners
         $server,
         'execute-control-plane-rollback',
         'rollback-token',
-        static function (string $command): never {
-            throw new RuntimeException("Ambiguous self-replacement: {$command}");
+        static function (string $command): string {
+            return match (true) {
+                str_contains($command, NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT) => NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT,
+                str_contains($command, InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_BEGIN) => executableControlPlaneAuthorityAbsentTranscript(),
+                str_contains($command, InspectControlPlaneEnrollmentWriter::TRANSCRIPT_BEGIN) => executableControlPlaneWriterInspectionTranscript(),
+                str_contains($command, ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT) => ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT,
+                default => throw new RuntimeException("Ambiguous self-replacement: {$command}"),
+            };
         },
     ))->toThrow(RuntimeException::class, 'Ambiguous self-replacement');
     expect($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RollingBack);

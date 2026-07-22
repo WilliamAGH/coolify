@@ -14,8 +14,12 @@ final class ExecuteControlPlaneProxyEnrollmentRollback
 
     public function __construct(
         private readonly StoreControlPlaneProxyEnrollmentState $stateStore,
+        private readonly NormalizeControlPlaneEnrollmentFilesystem $filesystemNormalizer,
         private readonly ControlPlaneStaticListenerHandoff $staticHandoff,
         private readonly ManagedTraefikDocumentWriter $dynamicWriter,
+        private readonly InspectControlPlaneEnrollmentWriterAuthority $writerAuthorityInspector,
+        private readonly InspectControlPlaneEnrollmentWriter $writerInspector,
+        private readonly BootstrapControlPlaneEnrollmentWriterAuthority $writerAuthorityBootstrap,
         private readonly InstallControlPlaneCandidateHealthMarkers $candidateMarkerInstaller,
         private readonly VerifyControlPlaneRestoredRoutes $restoredRoutesVerifier,
     ) {}
@@ -56,13 +60,16 @@ final class ExecuteControlPlaneProxyEnrollmentRollback
         }
 
         $proxyPath = rtrim((string) $server->proxyPath(), '/');
-        $plan = RollBackControlPlaneProxyEnrollment::plan(
-            state: $state,
-            operationId: $operationId,
-            token: $token,
-            timestamp: now()->toIso8601String(),
-            dynamicDirectory: $proxyPath.'/dynamic',
-            stateDirectory: $proxyPath.'/.control-plane-managed-traefik',
+        $this->assertExactOutput(
+            $execute($this->filesystemNormalizer->commandFor($proxyPath)),
+            NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT,
+            'control-plane enrollment filesystem normalization',
+        );
+        $dynamicMutation = $this->rollbackMutation($server, $state);
+        [$replacementAuthority, $rolledBackAuthority] = $this->rollbackAuthorities(
+            $state,
+            $dynamicMutation,
+            $execute,
         );
         $this->assertExactOutput(
             $execute($this->staticHandoff->rollbackCommandFor($state, $operationId, $token)),
@@ -76,10 +83,12 @@ final class ExecuteControlPlaneProxyEnrollmentRollback
             return $state;
         }
 
-        $dynamicRollbackCommand = $plan->dynamicRollbackCommand($this->dynamicWriter)
-            ?? throw new RuntimeException('The control-plane dynamic rollback command is missing.');
         $this->assertExactOutput(
-            $execute($dynamicRollbackCommand),
+            $execute($this->dynamicWriter->rollbackEnrollmentCommandFor(
+                $dynamicMutation,
+                $replacementAuthority,
+                $rolledBackAuthority,
+            )),
             ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT,
             'dynamic Traefik document rollback',
         );
@@ -133,6 +142,17 @@ final class ExecuteControlPlaneProxyEnrollmentRollback
         }
         $this->restoredRoutesVerifier->handle($proof, $transcript);
 
+        $dynamicMutation = $this->rollbackMutation($server, $state);
+        [, $rolledBackAuthority] = $this->rollbackAuthorities($state, $dynamicMutation, $execute);
+        $this->assertExactOutput(
+            $execute($this->dynamicWriter->finalizeEnrollmentRollbackCommandFor(
+                $dynamicMutation,
+                $rolledBackAuthority,
+            )),
+            ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT,
+            'dynamic Traefik document rollback finalization',
+        );
+
         return $this->stateStore->transition(
             $server,
             $operationId,
@@ -140,6 +160,66 @@ final class ExecuteControlPlaneProxyEnrollmentRollback
             ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement,
             ControlPlaneProxyEnrollmentPhase::RolledBack,
             now()->toIso8601String(),
+        );
+    }
+
+    /**
+     * @param  Closure(string): ?string  $execute
+     * @return array{ManagedTraefikDocumentWriterAuthority, ManagedTraefikDocumentWriterAuthority}
+     */
+    private function rollbackAuthorities(
+        ControlPlaneProxyEnrollmentState $state,
+        ManagedTraefikDocumentMutation $mutation,
+        Closure $execute,
+    ): array {
+        $authorityTranscript = $execute($this->writerAuthorityInspector->commandFor($mutation));
+        if (! is_string($authorityTranscript)) {
+            throw new RuntimeException('The control-plane enrollment writer authority inspection returned no transcript.');
+        }
+        $existingAuthority = $this->writerAuthorityInspector->handle($authorityTranscript);
+        if ($existingAuthority === null) {
+            $writerContainerName = $state->activeBackendDnsNames[0];
+            $identityTranscript = $execute($this->writerInspector->commandFor($writerContainerName));
+            if (! is_string($identityTranscript)) {
+                throw new RuntimeException('The control-plane enrollment writer inspection returned no transcript.');
+            }
+            $writerIdentity = $this->writerInspector->handle($identityTranscript, $writerContainerName);
+        } else {
+            $writerIdentity = new ControlPlaneEnrollmentWriterIdentity(
+                containerId: $existingAuthority->containerId,
+                containerName: $existingAuthority->containerName,
+                imageId: $existingAuthority->imageId,
+            );
+        }
+        $replacementAuthority = $this->writerAuthorityBootstrap->authorityFor($state, $writerIdentity);
+        $rolledBackAuthority = $this->writerAuthorityBootstrap->rolledBackAuthorityFor($state, $writerIdentity);
+        if ($existingAuthority !== null
+            && ! hash_equals($existingAuthority->toJson(), $replacementAuthority->toJson())
+            && ! hash_equals($existingAuthority->toJson(), $rolledBackAuthority->toJson())) {
+            throw new RuntimeException('The control-plane enrollment writer authority is not owned by this exact rollback.');
+        }
+
+        return [$replacementAuthority, $rolledBackAuthority];
+    }
+
+    private function rollbackMutation(
+        Server $server,
+        ControlPlaneProxyEnrollmentState $state,
+    ): ManagedTraefikDocumentMutation {
+        $proxyPath = rtrim((string) $server->proxyPath(), '/');
+
+        return new ManagedTraefikDocumentMutation(
+            dynamicDirectory: $proxyPath.'/dynamic',
+            stateDirectory: $proxyPath.'/.control-plane-managed-traefik',
+            filename: $state->managedFilename,
+            operationId: $state->operationId,
+            revision: $state->dynamicRevision,
+            expectedSha256: $state->dynamicPredecessorBytes === null
+                ? null
+                : hash('sha256', $state->dynamicPredecessorBytes),
+            expectedOperationId: null,
+            expectedRevision: null,
+            replacementBytes: $state->dynamicReplacementBytes,
         );
     }
 

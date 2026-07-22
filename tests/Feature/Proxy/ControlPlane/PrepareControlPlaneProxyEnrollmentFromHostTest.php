@@ -1,6 +1,7 @@
 <?php
 
 use App\Actions\Proxy\ControlPlane\ActivateControlPlaneProxyEnrollment;
+use App\Actions\Proxy\ControlPlane\BootstrapControlPlaneEnrollmentWriterAuthority;
 use App\Actions\Proxy\ControlPlane\CompileControlPlaneDynamicConfiguration;
 use App\Actions\Proxy\ControlPlane\CompileControlPlaneStaticProxyConfiguration;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentPhase;
@@ -9,8 +10,11 @@ use App\Actions\Proxy\ControlPlane\ControlPlaneStaticListenerHandoff;
 use App\Actions\Proxy\ControlPlane\ExecuteControlPlaneProxyEnrollmentRollback;
 use App\Actions\Proxy\ControlPlane\ExtractControlPlaneDynamicFragments;
 use App\Actions\Proxy\ControlPlane\FinalizeControlPlaneProxyEnrollment;
+use App\Actions\Proxy\ControlPlane\InspectControlPlaneEnrollmentWriter;
+use App\Actions\Proxy\ControlPlane\InspectControlPlaneEnrollmentWriterAuthority;
 use App\Actions\Proxy\ControlPlane\InstallControlPlaneCandidateHealthMarkers;
 use App\Actions\Proxy\ControlPlane\ManagedTraefikDocumentWriter;
+use App\Actions\Proxy\ControlPlane\NormalizeControlPlaneEnrollmentFilesystem;
 use App\Actions\Proxy\ControlPlane\PrepareControlPlaneProxyEnrollment;
 use App\Actions\Proxy\ControlPlane\PrepareControlPlaneProxyEnrollmentFromHost;
 use App\Actions\Proxy\ControlPlane\ResumeControlPlaneProxyEnrollment;
@@ -31,16 +35,24 @@ function hostPreparedEnrollmentAction(StoreControlPlaneProxyEnrollmentState $sto
     $dynamicWriter = new ManagedTraefikDocumentWriter;
     $activator = new ActivateControlPlaneProxyEnrollment(
         $store,
+        new NormalizeControlPlaneEnrollmentFilesystem,
         new InstallControlPlaneCandidateHealthMarkers,
         new VerifyControlPlaneCandidateMembers,
         $dynamicWriter,
         $staticHandoff,
+        new InspectControlPlaneEnrollmentWriter,
+        new InspectControlPlaneEnrollmentWriterAuthority,
+        new BootstrapControlPlaneEnrollmentWriterAuthority,
     );
     $finalizer = new FinalizeControlPlaneProxyEnrollment($store, new VerifyControlPlaneProxyRoutes);
     $rollback = new ExecuteControlPlaneProxyEnrollmentRollback(
         $store,
+        new NormalizeControlPlaneEnrollmentFilesystem,
         $staticHandoff,
         $dynamicWriter,
+        new InspectControlPlaneEnrollmentWriterAuthority,
+        new InspectControlPlaneEnrollmentWriter,
+        new BootstrapControlPlaneEnrollmentWriterAuthority,
         new InstallControlPlaneCandidateHealthMarkers,
         new VerifyControlPlaneRestoredRoutes,
     );
