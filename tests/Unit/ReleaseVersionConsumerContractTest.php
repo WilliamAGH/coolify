@@ -341,6 +341,30 @@ it('keeps the signed fork deployment path separate from the rejected generic upd
         ->not->toContain('bash scripts/upgrade.sh');
 });
 
+it('preserves the enrolled control-plane filesystem contract across install and fork deploy', function (): void {
+    $root = releaseContractRepositoryRoot();
+    $install = (string) file_get_contents($root.'/scripts/install.sh');
+    $forkDeploy = (string) file_get_contents($root.'/scripts/fork-deploy');
+
+    expect($install)
+        ->toContain('coolify_control_plane_enrollment_filesystem_present')
+        ->not->toContain('|| [ -e /data/coolify/proxy/dynamic/coolify.yaml ]')
+        ->not->toContain('|| [ -L /data/coolify/proxy/dynamic/coolify.yaml ]')
+        ->toContain('coolify_enforce_data_permissions')
+        ->toContain('chown root:9999 /data/coolify/proxy /data/coolify/proxy/dynamic')
+        ->toContain('chown 9999:root /data/coolify/source/.env')
+        ->not->toContain("chown -R 9999:root /data/coolify\nchmod -R 700 /data/coolify")
+        ->and(substr_count($install, "coolify_enforce_data_permissions\n"))->toBe(2);
+
+    expect($forkDeploy)
+        ->toContain('fd_control_plane_enrollment_filesystem_present')
+        ->not->toContain('|| -e $ROOT/proxy/dynamic/coolify.yaml')
+        ->not->toContain('|| -L $ROOT/proxy/dynamic/coolify.yaml')
+        ->toContain('fd_enforce_control_plane_enrollment_permissions')
+        ->toContain('chown root:9999 "$ROOT/proxy" "$dynamic_directory" "$state_directory"')
+        ->toContain('chown 9999:root "$SOURCE_DIR/.env"');
+});
+
 it('keeps the helper version consistent across versions.json and constants', function () {
     $versions = releaseContractVersionsJson();
     $constants = releaseContractConstants();

@@ -55,6 +55,12 @@ final class ResumeControlPlaneProxyEnrollment
             if ($state->phase === ControlPlaneProxyEnrollmentPhase::Activating) {
                 return $state;
             }
+        } elseif (in_array($state->phase, [
+            ControlPlaneProxyEnrollmentPhase::Active,
+            ControlPlaneProxyEnrollmentPhase::Finalizing,
+            ControlPlaneProxyEnrollmentPhase::Enrolled,
+        ], true)) {
+            $state = $this->activator->handle($server, $operationId, $token, $remoteExecutor);
         }
         if (in_array($state->phase, [
             ControlPlaneProxyEnrollmentPhase::Active,

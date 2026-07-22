@@ -1,6 +1,8 @@
 <?php
 
 use App\Actions\Proxy\ControlPlane\ActivateControlPlaneProxyEnrollment;
+use App\Actions\Proxy\ControlPlane\BootstrapControlPlaneEnrollmentWriterAuthority;
+use App\Actions\Proxy\ControlPlane\ControlPlaneCandidateHealthMarker;
 use App\Actions\Proxy\ControlPlane\ControlPlaneCandidateMembersProof;
 use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentPhase;
@@ -11,8 +13,12 @@ use App\Actions\Proxy\ControlPlane\ControlPlaneStaticListenerHandoff;
 use App\Actions\Proxy\ControlPlane\ControlPlaneStaticProxyConfiguration;
 use App\Actions\Proxy\ControlPlane\ExecuteControlPlaneProxyEnrollmentRollback;
 use App\Actions\Proxy\ControlPlane\FinalizeControlPlaneProxyEnrollment;
+use App\Actions\Proxy\ControlPlane\InspectControlPlaneEnrollmentWriter;
+use App\Actions\Proxy\ControlPlane\InspectControlPlaneEnrollmentWriterAuthority;
 use App\Actions\Proxy\ControlPlane\InstallControlPlaneCandidateHealthMarkers;
 use App\Actions\Proxy\ControlPlane\ManagedTraefikDocumentWriter;
+use App\Actions\Proxy\ControlPlane\ManagedTraefikDocumentWriterAuthority;
+use App\Actions\Proxy\ControlPlane\NormalizeControlPlaneEnrollmentFilesystem;
 use App\Actions\Proxy\ControlPlane\ResumeControlPlaneProxyEnrollment;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
 use App\Actions\Proxy\ControlPlane\VerifyControlPlaneCandidateMembers;
@@ -62,16 +68,24 @@ function resumableControlPlaneEnrollment(): array
         $store,
         new ActivateControlPlaneProxyEnrollment(
             $store,
+            new NormalizeControlPlaneEnrollmentFilesystem,
             new InstallControlPlaneCandidateHealthMarkers,
             new VerifyControlPlaneCandidateMembers,
             new ManagedTraefikDocumentWriter,
             new ControlPlaneStaticListenerHandoff,
+            new InspectControlPlaneEnrollmentWriter,
+            new InspectControlPlaneEnrollmentWriterAuthority,
+            new BootstrapControlPlaneEnrollmentWriterAuthority,
         ),
         new FinalizeControlPlaneProxyEnrollment($store, new VerifyControlPlaneProxyRoutes),
         new ExecuteControlPlaneProxyEnrollmentRollback(
             $store,
+            new NormalizeControlPlaneEnrollmentFilesystem,
             new ControlPlaneStaticListenerHandoff,
             new ManagedTraefikDocumentWriter,
+            new InspectControlPlaneEnrollmentWriterAuthority,
+            new InspectControlPlaneEnrollmentWriter,
+            new BootstrapControlPlaneEnrollmentWriterAuthority,
             new InstallControlPlaneCandidateHealthMarkers,
             new VerifyControlPlaneRestoredRoutes,
         ),
@@ -99,6 +113,33 @@ function resumedControlPlaneCandidateTranscript(ControlPlaneProxyEnrollmentState
     }
 
     return implode("\n", $records);
+}
+
+function resumedControlPlaneWriterInspectionTranscript(): string
+{
+    return implode("\n", [
+        InspectControlPlaneEnrollmentWriter::TRANSCRIPT_BEGIN,
+        InspectControlPlaneEnrollmentWriter::TRANSCRIPT_RECORD.' '.str_repeat('a', 64).' /coolify-web-a sha256:'.str_repeat('b', 64).' true',
+        InspectControlPlaneEnrollmentWriter::TRANSCRIPT_END,
+    ]);
+}
+
+function resumedControlPlaneWriterAuthorityAbsentTranscript(): string
+{
+    return implode("\n", [
+        InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_BEGIN,
+        InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_ABSENT,
+        InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_END,
+    ]);
+}
+
+function resumedControlPlaneWriterAuthorityTranscript(ManagedTraefikDocumentWriterAuthority $authority): string
+{
+    return implode("\n", [
+        InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_BEGIN,
+        InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_RECORD.' '.base64_encode($authority->toJson()),
+        InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_END,
+    ]);
 }
 
 function resumedControlPlaneTranscript(ControlPlaneProxyEnrollmentState $state): string
@@ -132,12 +173,16 @@ it('resumes a fenced enrollment across self-replacement without exposing its tok
     $executor = function (string $command) use (&$remoteCalls, $state): string {
         $remoteCalls++;
 
-        return match ($remoteCalls) {
-            1, 5 => '',
-            2, 6 => resumedControlPlaneCandidateTranscript($state),
-            3, 7 => ManagedTraefikDocumentWriter::APPLIED_OUTPUT,
-            4, 8 => ControlPlaneStaticListenerHandoff::APPLIED_OUTPUT,
-            9 => resumedControlPlaneTranscript($state),
+        return match (true) {
+            str_contains($command, NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT) => NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT,
+            str_contains($command, ControlPlaneCandidateHealthMarker::CONTAINER_MARKER_PATH) => '',
+            str_contains($command, ControlPlaneCandidateMembersProof::TRANSCRIPT_BEGIN) => resumedControlPlaneCandidateTranscript($state),
+            str_contains($command, InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_BEGIN) => resumedControlPlaneWriterAuthorityAbsentTranscript(),
+            str_contains($command, InspectControlPlaneEnrollmentWriter::TRANSCRIPT_BEGIN) => resumedControlPlaneWriterInspectionTranscript(),
+            str_contains($command, 'docker-compose.control-plane-listener.yml') => ControlPlaneStaticListenerHandoff::APPLIED_OUTPUT,
+            str_contains($command, BootstrapControlPlaneEnrollmentWriterAuthority::APPLIED_OUTPUT) => BootstrapControlPlaneEnrollmentWriterAuthority::APPLIED_OUTPUT,
+            str_contains($command, '__COOLIFY_ROUTE_PROOF_BEGIN__') => resumedControlPlaneTranscript($state),
+            str_contains($command, 'coolify.yaml') => ManagedTraefikDocumentWriter::APPLIED_OUTPUT,
             default => throw new RuntimeException("Unexpected remote call {$remoteCalls}: {$command}"),
         };
     };
@@ -147,8 +192,88 @@ it('resumes a fenced enrollment across self-replacement without exposing its tok
 
     expect($submitted->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Activating)
         ->and($enrolled->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Enrolled)
-        ->and($remoteCalls)->toBe(9)
+        ->and($remoteCalls)->toBe(16)
         ->and($action->commandSignature)->not->toContain('token')
         ->and($action->commandSignature)->toContain('--rollback')
+        ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Enrolled);
+});
+
+it('repairs missing writer authority for a terminal legacy enrollment', function (): void {
+    [$server, $store, , $action] = resumableControlPlaneEnrollment();
+    $timestamp = '2026-07-19T12:01:00Z';
+    foreach ([
+        [ControlPlaneProxyEnrollmentPhase::Preparing, ControlPlaneProxyEnrollmentPhase::Prepared],
+        [ControlPlaneProxyEnrollmentPhase::Prepared, ControlPlaneProxyEnrollmentPhase::Activating],
+        [ControlPlaneProxyEnrollmentPhase::Activating, ControlPlaneProxyEnrollmentPhase::Active],
+        [ControlPlaneProxyEnrollmentPhase::Active, ControlPlaneProxyEnrollmentPhase::Finalizing],
+        [ControlPlaneProxyEnrollmentPhase::Finalizing, ControlPlaneProxyEnrollmentPhase::Enrolled],
+    ] as [$expected, $next]) {
+        $store->transition($server, 'resume-control-plane', 'resume-token', $expected, $next, $timestamp);
+    }
+
+    $remoteCalls = 0;
+    $enrolled = $action->handle(
+        $server,
+        'resume-control-plane',
+        'resume-token',
+        function (string $command) use (&$remoteCalls): string {
+            $remoteCalls++;
+
+            return match (true) {
+                str_contains($command, NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT) => NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT,
+                str_contains($command, InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_BEGIN) => resumedControlPlaneWriterAuthorityAbsentTranscript(),
+                str_contains($command, InspectControlPlaneEnrollmentWriter::TRANSCRIPT_BEGIN) => resumedControlPlaneWriterInspectionTranscript(),
+                str_contains($command, BootstrapControlPlaneEnrollmentWriterAuthority::APPLIED_OUTPUT) => BootstrapControlPlaneEnrollmentWriterAuthority::APPLIED_OUTPUT,
+                default => throw new RuntimeException("Unexpected remote call {$remoteCalls}: {$command}"),
+            };
+        },
+    );
+
+    expect($enrolled->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Enrolled)
+        ->and($remoteCalls)->toBe(4)
+        ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Enrolled);
+});
+
+it('preserves a valid newer writer authority for a terminal enrollment', function (): void {
+    [$server, $store, , $action] = resumableControlPlaneEnrollment();
+    $timestamp = '2026-07-19T12:01:00Z';
+    foreach ([
+        [ControlPlaneProxyEnrollmentPhase::Preparing, ControlPlaneProxyEnrollmentPhase::Prepared],
+        [ControlPlaneProxyEnrollmentPhase::Prepared, ControlPlaneProxyEnrollmentPhase::Activating],
+        [ControlPlaneProxyEnrollmentPhase::Activating, ControlPlaneProxyEnrollmentPhase::Active],
+        [ControlPlaneProxyEnrollmentPhase::Active, ControlPlaneProxyEnrollmentPhase::Finalizing],
+        [ControlPlaneProxyEnrollmentPhase::Finalizing, ControlPlaneProxyEnrollmentPhase::Enrolled],
+    ] as [$expected, $next]) {
+        $store->transition($server, 'resume-control-plane', 'resume-token', $expected, $next, $timestamp);
+    }
+    $newerAuthority = new ManagedTraefikDocumentWriterAuthority(
+        epoch: 3,
+        operationId: 'newer-generation',
+        member: 'green',
+        containerId: str_repeat('c', 64),
+        containerName: 'coolify-web-green',
+        imageId: 'sha256:'.str_repeat('d', 64),
+        dynamicRevision: 3,
+        dynamicSha256: str_repeat('e', 64),
+    );
+    $remoteCalls = 0;
+
+    $enrolled = $action->handle(
+        $server,
+        'resume-control-plane',
+        'resume-token',
+        function (string $command) use (&$remoteCalls, $newerAuthority): string {
+            $remoteCalls++;
+
+            return match (true) {
+                str_contains($command, NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT) => NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT,
+                str_contains($command, InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_BEGIN) => resumedControlPlaneWriterAuthorityTranscript($newerAuthority),
+                default => throw new RuntimeException("Unexpected remote call {$remoteCalls}: {$command}"),
+            };
+        },
+    );
+
+    expect($enrolled->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Enrolled)
+        ->and($remoteCalls)->toBe(2)
         ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Enrolled);
 });

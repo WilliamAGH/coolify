@@ -1469,20 +1469,71 @@ test_update_preserves_control_plane_listener_override() {
         cleanup_fixture
         return
     fi
-    local override source_hash output
+    local override source_hash output state_directory managed_document sidecar authority private_state crash_directory crash_stage
     override=$(control_plane_listener_override_path)
     printf 'services:\n  coolify:\n    ports: !reset []\n' >"$override"
     chmod 600 "$override"
+    state_directory=$ROOT/proxy/.control-plane-managed-traefik
+    managed_document=$ROOT/proxy/dynamic/coolify.yaml
+    sidecar=$state_directory/.coolify.yaml.state.json
+    authority=$state_directory/.coolify.yaml.writer-authority.json
+    private_state=$state_directory/.coolify.yaml.lock
+    crash_directory=$state_directory/.control-plane-enrollment-writer-authority-scratch.ABCDEF
+    crash_stage=$state_directory/.control-plane-enrollment-writer-authority.ABCDEF
+    mkdir -p "$state_directory"
+    mkdir "$crash_directory"
+    printf 'services: {}\n' >"$ROOT/proxy/docker-compose.yml"
+    printf 'http: {}\n' >"$managed_document"
+    printf '{}\n' >"$sidecar"
+    printf '{}\n' >"$authority"
+    : >"$private_state"
+    printf 'scratch\n' >"$crash_directory/file"
+    printf 'stage\n' >"$crash_stage"
+    chmod 700 "$ROOT/proxy" "$ROOT/proxy/dynamic" "$state_directory"
+    chmod 600 "$ROOT/proxy/docker-compose.yml" "$managed_document" "$sidecar" "$authority" "$private_state"
     source_hash=$(hash_file "$override")
     write_manifest 4.13.0-fork.2
     : >"$LOG"
     if output=$({ update_release && "$SUBJECT" verify; } 2>&1) \
         && [[ $(hash_file "$override") == "$source_hash" ]] \
-        && source_compose_mutations_apply_listener_override_last; then
+        && source_compose_mutations_apply_listener_override_last \
+        && [[ $(file_mode "$ROOT/proxy") == 710 \
+            && $(file_mode "$ROOT/proxy/dynamic") == 710 \
+            && $(file_mode "$state_directory") == 710 \
+            && $(file_mode "$ROOT/source") == 710 \
+            && $(file_mode "$managed_document") == 640 \
+            && $(file_mode "$sidecar") == 640 \
+            && $(file_mode "$authority") == 640 \
+            && $(file_mode "$private_state") == 600 ]] \
+        && [[ ! -e $crash_directory && ! -e $crash_stage ]] \
+        && grep -Fq "chown root:9999 $ROOT/proxy $ROOT/proxy/dynamic $state_directory" "$LOG" \
+        && grep -Fq "chown root:root $ROOT/source $ROOT/proxy/docker-compose.yml" "$LOG"; then
         pass 'fork-deploy update preserves enrolled Traefik APP_PORT ownership'
     else
         printf 'control-plane listener persistence diagnostic: %s\n' "$output" >&2
         fail 'fork-deploy update preserves enrolled Traefik APP_PORT ownership'
+    fi
+    cleanup_fixture
+}
+
+test_update_keeps_ordinary_dynamic_proxy_non_enrolled() {
+    new_fixture
+    write_manifest 4.13.0-fork.1
+    if ! install_release >/dev/null; then
+        fail 'fork-deploy keeps an ordinary dynamic proxy outside enrollment ownership'
+        cleanup_fixture
+        return
+    fi
+    printf 'http: {}\n' >"$ROOT/proxy/dynamic/coolify.yaml"
+    write_manifest 4.13.0-fork.2
+    : >"$LOG"
+    if update_release >/dev/null \
+        && [[ $(<"$ROOT/fork-deploy/current") == 4.13.0-fork.2 ]] \
+        && [[ ! -e $ROOT/proxy/.control-plane-managed-traefik ]] \
+        && [[ ! -e $ROOT/source/docker-compose.control-plane-listener.yml ]]; then
+        pass 'fork-deploy keeps an ordinary dynamic proxy outside enrollment ownership'
+    else
+        fail 'fork-deploy keeps an ordinary dynamic proxy outside enrollment ownership'
     fi
     cleanup_fixture
 }
@@ -2413,6 +2464,14 @@ if [[ ${FORK_DEPLOY_TEST_FILTER:-} == database-default ]]; then
     exit
 fi
 
+if [[ ${FORK_DEPLOY_TEST_FILTER:-} == control-plane-ownership ]]; then
+    test_update_preserves_control_plane_listener_override
+    test_update_keeps_ordinary_dynamic_proxy_non_enrolled
+    printf '%s passing, %s failing\n' "$PASS" "$FAIL"
+    ((FAIL == 0))
+    exit
+fi
+
 test_rejects_untrusted_caller_inputs
 test_uses_migrated_github_raw_base
 test_install_and_update_are_self_contained
@@ -2461,6 +2520,7 @@ test_effective_compose_accepts_default_public_app_binding
 test_effective_compose_rejects_swapped_bindings
 test_verify_accepts_dual_stack_public_app_binding
 test_update_preserves_control_plane_listener_override
+test_update_keeps_ordinary_dynamic_proxy_non_enrolled
 test_update_rejects_symlinked_control_plane_listener_override
 test_update_rejects_partial_control_plane_listener_override
 test_verify_rejects_all_unsafe_runtime_bindings

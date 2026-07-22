@@ -80,6 +80,34 @@ final class StoreControlPlaneProxyEnrollmentState
         return $this->readFrom($fresh);
     }
 
+    public function abortPrepared(
+        Server $server,
+        string $operationId,
+        string $canonicalHost,
+        string $expectedRevision,
+        string $timestamp,
+    ): ControlPlaneProxyEnrollmentState {
+        return DB::transaction(function () use ($server, $operationId, $canonicalHost, $expectedRevision, $timestamp): ControlPlaneProxyEnrollmentState {
+            $lockedServer = $this->lockServer($server);
+            $current = $this->readFrom($lockedServer)
+                ?? throw new RuntimeException('The durable control-plane enrollment state is missing.');
+            if ($current->phase !== ControlPlaneProxyEnrollmentPhase::Prepared
+                || ! hash_equals($current->operationId, $operationId)
+                || ! hash_equals($current->canonicalHost, $canonicalHost)
+                || ! hash_equals($current->expectedRevision, $expectedRevision)) {
+                throw new RuntimeException('The prepared control-plane enrollment abort fence does not match the durable state.');
+            }
+
+            $rolledBack = $current
+                ->withPhase(ControlPlaneProxyEnrollmentPhase::RollingBack, $timestamp)
+                ->withPhase(ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement, $timestamp)
+                ->withPhase(ControlPlaneProxyEnrollmentPhase::RolledBack, $timestamp);
+            $this->writeTo($lockedServer, $rolledBack);
+
+            return $rolledBack;
+        }, 3);
+    }
+
     private function lockServer(Server $server): Server
     {
         return Server::query()->whereKey($server->getKey())->lockForUpdate()->first()

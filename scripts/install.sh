@@ -146,6 +146,156 @@ if [ $EUID != 0 ]; then
     exit
 fi
 
+coolify_control_plane_enrollment_filesystem_present() {
+    [ -e /data/coolify/source/docker-compose.control-plane-listener.yml ] \
+        || [ -L /data/coolify/source/docker-compose.control-plane-listener.yml ] \
+        || [ -e /data/coolify/proxy/.control-plane-managed-traefik ] \
+        || [ -L /data/coolify/proxy/.control-plane-managed-traefik ]
+}
+
+coolify_assert_safe_privileged_tree() {
+    local path=$1 unsafe
+    [ -d "$path" ] && [ ! -L "$path" ] || return 1
+    unsafe=$(find "$path" -xdev -type l -print -quit)
+    [ -z "$unsafe" ] || return 1
+    unsafe=$(find "$path" -xdev -type f -links +1 -print -quit)
+    [ -z "$unsafe" ] || return 1
+}
+
+coolify_require_regular_or_absent() {
+    if [ -e "$1" ] || [ -L "$1" ]; then
+        [ -f "$1" ] && [ ! -L "$1" ] && [ "$(stat -c '%h' "$1")" = 1 ]
+    fi
+}
+
+coolify_cleanup_control_plane_writer_crash_debris() {
+    local state_directory=$1 lock_path=$1/.coolify.yaml.lock path child basename owner
+
+    coolify_require_regular_or_absent "$lock_path" || return 1
+    command -v flock >/dev/null 2>&1 || return 1
+    exec 8>"$lock_path"
+    chown root:root "$lock_path"
+    chmod 0600 "$lock_path"
+    flock -x 8 || return 1
+
+    for path in "$state_directory"/.control-plane-enrollment-writer-authority-scratch.* \
+        "$state_directory"/.managed-traefik-document.* \
+        "$state_directory"/.managed-traefik-authority.* \
+        "$state_directory"/.managed-traefik-reconcile.*; do
+        [ -e "$path" ] || [ -L "$path" ] || continue
+        [ -d "$path" ] && [ ! -L "$path" ] || continue
+        owner=$(stat -c '%u' "$path") || return 1
+        [ "$owner" = 0 ] || return 1
+        coolify_assert_safe_privileged_tree "$path" || return 1
+        for child in "$path"/* "$path"/.*; do
+            [ -e "$child" ] || [ -L "$child" ] || continue
+            basename=${child##*/}
+            [ "$basename" != . ] && [ "$basename" != .. ] || continue
+            coolify_require_regular_or_absent "$child" || return 1
+            owner=$(stat -c '%u' "$child") || return 1
+            [ "$owner" = 0 ] || return 1
+        done
+        rm -f -- "$path"/* "$path"/.* 2>/dev/null || true
+        rmdir "$path" || return 1
+    done
+    for path in "$state_directory"/.control-plane-enrollment-writer-authority.*; do
+        [ -e "$path" ] || [ -L "$path" ] || continue
+        case ${path##*/} in .control-plane-enrollment-writer-authority-scratch.*) continue ;; esac
+        coolify_require_regular_or_absent "$path" || return 1
+        owner=$(stat -c '%u' "$path") || return 1
+        [ "$owner" = 0 ] || return 1
+        rm -f -- "$path" || return 1
+    done
+}
+
+coolify_enforce_data_permissions() {
+    local directory path basename visibility
+
+    chown root:root /data/coolify
+    chmod 0711 /data/coolify
+    for directory in applications databases backups services control-plane-attestor sentinel; do
+        [ -e "/data/coolify/$directory" ] || continue
+        coolify_assert_safe_privileged_tree "/data/coolify/$directory" || return 1
+        chown -R 9999:root "/data/coolify/$directory"
+        chmod -R 0700 "/data/coolify/$directory"
+    done
+
+    if ! coolify_control_plane_enrollment_filesystem_present; then
+        for directory in source proxy; do
+            [ -e "/data/coolify/$directory" ] || continue
+            coolify_assert_safe_privileged_tree "/data/coolify/$directory" || return 1
+            chown -R 9999:root "/data/coolify/$directory"
+            chmod -R 0700 "/data/coolify/$directory"
+        done
+        return 0
+    fi
+
+    coolify_assert_safe_privileged_tree /data/coolify/source || return 1
+    coolify_assert_safe_privileged_tree /data/coolify/proxy || return 1
+    [ -d /data/coolify/proxy/dynamic ] || return 1
+    [ -d /data/coolify/proxy/.control-plane-managed-traefik ] || return 1
+    coolify_require_regular_or_absent /data/coolify/proxy/docker-compose.yml || return 1
+    [ -e /data/coolify/proxy/docker-compose.yml ] || return 1
+    coolify_require_regular_or_absent /data/coolify/source/.env || return 1
+    [ -e /data/coolify/source/.env ] || return 1
+    coolify_require_regular_or_absent /data/coolify/source/docker-compose.control-plane-listener.yml || return 1
+
+    chown root:9999 /data/coolify/proxy /data/coolify/proxy/dynamic \
+        /data/coolify/proxy/.control-plane-managed-traefik
+    chmod 0710 /data/coolify/proxy /data/coolify/proxy/dynamic \
+        /data/coolify/proxy/.control-plane-managed-traefik
+    chown root:root /data/coolify/source /data/coolify/proxy/docker-compose.yml
+    chmod 0710 /data/coolify/source
+    chmod 0600 /data/coolify/proxy/docker-compose.yml
+    chown 9999:root /data/coolify/source/.env
+    chmod 0600 /data/coolify/source/.env
+    if [ -e /data/coolify/source/docker-compose.control-plane-listener.yml ]; then
+        chown root:root /data/coolify/source/docker-compose.control-plane-listener.yml
+        chmod 0600 /data/coolify/source/docker-compose.control-plane-listener.yml
+    fi
+
+    coolify_cleanup_control_plane_writer_crash_debris \
+        /data/coolify/proxy/.control-plane-managed-traefik
+
+    for path in /data/coolify/proxy/dynamic/* /data/coolify/proxy/dynamic/.*; do
+        [ -e "$path" ] || [ -L "$path" ] || continue
+        basename=${path##*/}
+        [ "$basename" != . ] && [ "$basename" != .. ] || continue
+        coolify_require_regular_or_absent "$path" || return 1
+        if [ "$basename" = coolify.yaml ]; then
+            chown root:9999 "$path"
+            chmod 0640 "$path"
+        else
+            chown root:root "$path"
+            chmod 0600 "$path"
+        fi
+    done
+    for path in /data/coolify/proxy/.control-plane-managed-traefik/* \
+        /data/coolify/proxy/.control-plane-managed-traefik/.*; do
+        [ -e "$path" ] || [ -L "$path" ] || continue
+        basename=${path##*/}
+        [ "$basename" != . ] && [ "$basename" != .. ] || continue
+        coolify_require_regular_or_absent "$path" || return 1
+        case "$basename" in
+            .coolify.yaml.state.json | .coolify.yaml.writer-authority.json) visibility=public ;;
+            .coolify.yaml.lock | .coolify.yaml.pending-mutation \
+                | .coolify.yaml.*.r*.rollback | .coolify.yaml.*.r*.rollback-reconciled \
+                | .managed-traefik-document.* | .managed-traefik-journal.* \
+                | .managed-traefik-artifact.* | .managed-traefik-authority.* \
+                | .managed-traefik-reconcile.*) visibility=private ;;
+            *) return 1 ;;
+        esac
+        if [ "$visibility" = public ]; then
+            chown root:9999 "$path"
+            chmod 0640 "$path"
+        else
+            chown root:root "$path"
+            chmod 0600 "$path"
+        fi
+    done
+    exec 8>&-
+}
+
 echo ""
 echo "=========================================="
 echo "   Coolify Installation - ${DATE}"
@@ -349,8 +499,7 @@ mkdir -p /data/coolify/{source,ssh,applications,databases,backups,services,proxy
 mkdir -p /data/coolify/ssh/{keys,mux}
 mkdir -p /data/coolify/proxy/dynamic
 
-chown -R 9999:root /data/coolify
-chmod -R 700 /data/coolify
+coolify_enforce_data_permissions
 
 INSTALLATION_LOG_WITH_DATE="/data/coolify/source/installation-${DATE}.log"
 
@@ -928,8 +1077,7 @@ if [ "$IS_COOLIFY_VOLUME_EXISTS" -eq 0 ]; then
     rm -f /data/coolify/ssh/keys/id.$CURRENT_USER@host.docker.internal.pub
 fi
 
-chown -R 9999:root /data/coolify
-chmod -R 700 /data/coolify
+coolify_enforce_data_permissions
 log "SSH key check completed"
 echo "     Done."
 

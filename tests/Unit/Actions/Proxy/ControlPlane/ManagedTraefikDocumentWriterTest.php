@@ -79,6 +79,22 @@ function managedTraefikDocumentRollbackAuthority(
     );
 }
 
+function managedTraefikDocumentEnrollmentRollbackAuthority(
+    ManagedTraefikDocumentMutation $mutation,
+    ManagedTraefikDocumentWriterAuthority $replacementAuthority,
+): ManagedTraefikDocumentWriterAuthority {
+    return new ManagedTraefikDocumentWriterAuthority(
+        epoch: $replacementAuthority->epoch + 1,
+        operationId: $mutation->operationId,
+        member: $replacementAuthority->member,
+        containerId: $replacementAuthority->containerId,
+        containerName: $replacementAuthority->containerName,
+        imageId: $replacementAuthority->imageId,
+        dynamicRevision: $mutation->revision,
+        dynamicSha256: $mutation->expectedSha256 ?? hash('sha256', ''),
+    );
+}
+
 it('atomically writes one managed file-provider document and replays its owner idempotently', function () {
     $filesystem = new Filesystem;
     $root = managedTraefikDocumentRoot();
@@ -657,6 +673,173 @@ it('tombstones a rolled-back generation so a captured stale forward shell comman
     }
 });
 
+it('rolls back initial enrollment with an exact replacement authority and replays its tombstone', function (): void {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $enrollment = managedTraefikDocumentMutation(
+            $root,
+            'control-plane-enrollment-authority-rollback',
+            1,
+            "http:\n  routers:\n    enrollment: {}\n",
+        );
+        $replacementAuthority = managedTraefikDocumentWriterAuthority($enrollment, epoch: 1);
+        $rolledBackAuthority = new ManagedTraefikDocumentWriterAuthority(
+            epoch: 2,
+            operationId: $enrollment->operationId,
+            member: $replacementAuthority->member,
+            containerId: $replacementAuthority->containerId,
+            containerName: $replacementAuthority->containerName,
+            imageId: $replacementAuthority->imageId,
+            dynamicRevision: $enrollment->revision,
+            dynamicSha256: hash('sha256', ''),
+        );
+
+        expect(runManagedTraefikDocumentCommand($writer->writeCommandFor($enrollment))->isSuccessful())->toBeTrue();
+        file_put_contents($enrollment->writerAuthorityPath(), $replacementAuthority->toJson());
+        $command = $writer->rollbackEnrollmentCommandFor(
+            $enrollment,
+            $replacementAuthority,
+            $rolledBackAuthority,
+        );
+        $rolledBack = runManagedTraefikDocumentCommand($command);
+        $replayed = runManagedTraefikDocumentCommand($command);
+
+        expect($rolledBack->isSuccessful())->toBeTrue($rolledBack->getErrorOutput())
+            ->and(trim($rolledBack->getOutput()))->toBe(ManagedTraefikDocumentWriter::ROLLED_BACK_OUTPUT)
+            ->and($replayed->isSuccessful())->toBeTrue($replayed->getErrorOutput())
+            ->and(file_exists($enrollment->documentPath()))->toBeFalse()
+            ->and(file_exists($enrollment->sidecarPath()))->toBeFalse()
+            ->and(file_get_contents($enrollment->writerAuthorityPath()))->toBe($rolledBackAuthority->toJson());
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('finalizes an exact initial enrollment rollback by restoring the pre-enrollment filesystem state', function (): void {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $enrollment = managedTraefikDocumentMutation(
+            $root,
+            'control-plane-enrollment-finalize',
+            1,
+            "http:\n  routers:\n    enrollment: {}\n",
+        );
+        $replacementAuthority = managedTraefikDocumentWriterAuthority($enrollment, epoch: 1);
+        $rolledBackAuthority = managedTraefikDocumentEnrollmentRollbackAuthority($enrollment, $replacementAuthority);
+
+        expect(runManagedTraefikDocumentCommand($writer->writeCommandFor($enrollment))->isSuccessful())->toBeTrue();
+        file_put_contents($enrollment->writerAuthorityPath(), $replacementAuthority->toJson());
+        expect(runManagedTraefikDocumentCommand($writer->rollbackEnrollmentCommandFor(
+            $enrollment,
+            $replacementAuthority,
+            $rolledBackAuthority,
+        ))->isSuccessful())->toBeTrue();
+
+        $finalized = runManagedTraefikDocumentCommand(
+            $writer->finalizeEnrollmentRollbackCommandFor($enrollment, $rolledBackAuthority),
+        );
+
+        expect($finalized->isSuccessful())->toBeTrue($finalized->getErrorOutput())
+            ->and(trim($finalized->getOutput()))->toBe(ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT)
+            ->and(file_exists($enrollment->documentPath()))->toBeFalse()
+            ->and(file_exists($enrollment->sidecarPath()))->toBeFalse()
+            ->and(file_exists($enrollment->writerAuthorityPath()))->toBeFalse()
+            ->and(file_exists($enrollment->rollbackArtifactPath()))->toBeFalse()
+            ->and(file_exists($enrollment->lockPath()))->toBeFalse()
+            ->and(file_exists($enrollment->stateDirectory))->toBeFalse();
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('replays enrollment rollback finalization after its state directory has already been removed', function (): void {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $filesystem->mkdir($root.'/dynamic', 0700);
+        $predecessorBytes = "http:\n  routers:\n    predecessor: {}\n";
+        $enrollment = new ManagedTraefikDocumentMutation(
+            dynamicDirectory: $root.'/dynamic',
+            stateDirectory: $root.'/state',
+            filename: 'coolify-control-plane.yaml',
+            operationId: 'control-plane-enrollment-finalize-replay',
+            revision: 1,
+            expectedSha256: hash('sha256', $predecessorBytes),
+            expectedOperationId: null,
+            expectedRevision: null,
+            replacementBytes: "http:\n  routers:\n    enrollment: {}\n",
+        );
+        file_put_contents($enrollment->documentPath(), $predecessorBytes);
+        $replacementAuthority = managedTraefikDocumentWriterAuthority($enrollment, epoch: 1);
+        $rolledBackAuthority = managedTraefikDocumentEnrollmentRollbackAuthority($enrollment, $replacementAuthority);
+        $command = (new ManagedTraefikDocumentWriter)->finalizeEnrollmentRollbackCommandFor(
+            $enrollment,
+            $rolledBackAuthority,
+        );
+        $first = runManagedTraefikDocumentCommand($command);
+        $replayed = runManagedTraefikDocumentCommand($command);
+
+        expect($first->isSuccessful())->toBeTrue($first->getErrorOutput())
+            ->and(trim($first->getOutput()))->toBe(ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT)
+            ->and($replayed->isSuccessful())->toBeTrue($replayed->getErrorOutput())
+            ->and(trim($replayed->getOutput()))->toBe(ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT)
+            ->and(file_get_contents($enrollment->documentPath()))->toBe($predecessorBytes)
+            ->and(file_exists($enrollment->stateDirectory))->toBeFalse();
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('rejects foreign enrollment rollback authority and unknown state files without cleanup', function (): void {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $writer = new ManagedTraefikDocumentWriter;
+        $enrollment = managedTraefikDocumentMutation(
+            $root,
+            'control-plane-enrollment-finalize-reject',
+            1,
+            "http:\n  routers:\n    enrollment: {}\n",
+        );
+        $replacementAuthority = managedTraefikDocumentWriterAuthority($enrollment, epoch: 1, identity: 'a');
+        $rolledBackAuthority = managedTraefikDocumentEnrollmentRollbackAuthority($enrollment, $replacementAuthority);
+
+        expect(runManagedTraefikDocumentCommand($writer->writeCommandFor($enrollment))->isSuccessful())->toBeTrue();
+        file_put_contents($enrollment->writerAuthorityPath(), $replacementAuthority->toJson());
+        expect(runManagedTraefikDocumentCommand($writer->rollbackEnrollmentCommandFor(
+            $enrollment,
+            $replacementAuthority,
+            $rolledBackAuthority,
+        ))->isSuccessful())->toBeTrue();
+
+        $command = $writer->finalizeEnrollmentRollbackCommandFor($enrollment, $rolledBackAuthority);
+        $foreignAuthority = managedTraefikDocumentWriterAuthority($enrollment, epoch: 3, identity: 'b');
+        file_put_contents($enrollment->writerAuthorityPath(), $foreignAuthority->toJson());
+        $rejectedAuthority = runManagedTraefikDocumentCommand($command);
+        file_put_contents($enrollment->writerAuthorityPath(), $rolledBackAuthority->toJson());
+        $foreignStatePath = $enrollment->stateDirectory.'/foreign-state';
+        file_put_contents($foreignStatePath, 'foreign');
+        $rejectedState = runManagedTraefikDocumentCommand($command);
+
+        expect($rejectedAuthority->isSuccessful())->toBeFalse()
+            ->and($rejectedState->isSuccessful())->toBeFalse()
+            ->and(file_exists($enrollment->stateDirectory))->toBeTrue()
+            ->and(file_exists($enrollment->rollbackArtifactPath()))->toBeTrue()
+            ->and(file_get_contents($enrollment->writerAuthorityPath()))->toBe($rolledBackAuthority->toJson())
+            ->and(file_get_contents($foreignStatePath))->toBe('foreign');
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
 it('fences and reconciles an exact forward journal left before document apply', function (): void {
     $filesystem = new Filesystem;
     $root = managedTraefikDocumentRoot();
@@ -1128,6 +1311,17 @@ it('renders valid dash and bash commands without shellcheck findings', function 
         );
         $secondAuthority = managedTraefikDocumentWriterAuthority($second, epoch: 2, identity: 'b');
         $rolledBackAuthority = managedTraefikDocumentRollbackAuthority($first, $second, $firstAuthority);
+        $enrollment = managedTraefikDocumentMutation(
+            root: $root,
+            operationId: 'control-plane-shell-enrollment',
+            revision: 3,
+            replacementBytes: "http:\n  routers:\n    enrollment: {}\n",
+        );
+        $enrollmentReplacementAuthority = managedTraefikDocumentWriterAuthority($enrollment, epoch: 1, identity: 'c');
+        $enrollmentRolledBackAuthority = managedTraefikDocumentEnrollmentRollbackAuthority(
+            $enrollment,
+            $enrollmentReplacementAuthority,
+        );
         $commands = [
             $writer->writeCommandFor($first),
             $writer->promoteWriterAuthorityCommandFor(
@@ -1137,6 +1331,7 @@ it('renders valid dash and bash commands without shellcheck findings', function 
                 $secondAuthority,
             ),
             $writer->reconcileRolledBackWriterAuthorityCommandFor($second, $firstAuthority, $rolledBackAuthority),
+            $writer->finalizeEnrollmentRollbackCommandFor($enrollment, $enrollmentRolledBackAuthority),
         ];
 
         foreach ($commands as $index => $command) {

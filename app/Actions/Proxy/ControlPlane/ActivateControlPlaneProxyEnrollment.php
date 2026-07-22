@@ -14,10 +14,14 @@ final class ActivateControlPlaneProxyEnrollment
 
     public function __construct(
         private readonly StoreControlPlaneProxyEnrollmentState $stateStore,
+        private readonly NormalizeControlPlaneEnrollmentFilesystem $filesystemNormalizer,
         private readonly InstallControlPlaneCandidateHealthMarkers $candidateMarkerInstaller,
         private readonly VerifyControlPlaneCandidateMembers $candidateVerifier,
         private readonly ManagedTraefikDocumentWriter $dynamicWriter,
         private readonly ControlPlaneStaticListenerHandoff $staticHandoff,
+        private readonly InspectControlPlaneEnrollmentWriter $writerInspector,
+        private readonly InspectControlPlaneEnrollmentWriterAuthority $writerAuthorityInspector,
+        private readonly BootstrapControlPlaneEnrollmentWriterAuthority $writerAuthorityBootstrap,
     ) {}
 
     /** @param null|Closure(string): ?string $remoteExecutor */
@@ -28,7 +32,20 @@ final class ActivateControlPlaneProxyEnrollment
         ?Closure $remoteExecutor = null,
     ): ControlPlaneProxyEnrollmentState {
         $state = $this->ownedState($server, $operationId, $token);
-        if ($state->phase === ControlPlaneProxyEnrollmentPhase::Active) {
+        $execute = $remoteExecutor ?? static fn (string $command): ?string => instant_remote_process(
+            [$command],
+            $server,
+            timeout: 120,
+            disableMultiplexing: true,
+            retry: false,
+        );
+        if (in_array($state->phase, [
+            ControlPlaneProxyEnrollmentPhase::Active,
+            ControlPlaneProxyEnrollmentPhase::Finalizing,
+            ControlPlaneProxyEnrollmentPhase::Enrolled,
+        ], true)) {
+            $this->repairActivatedEnrollment($server, $state, $execute);
+
             return $state;
         }
         if ($state->phase === ControlPlaneProxyEnrollmentPhase::Preparing) {
@@ -49,12 +66,21 @@ final class ActivateControlPlaneProxyEnrollment
         }
 
         $wasAlreadyActivating = $state->phase === ControlPlaneProxyEnrollmentPhase::Activating;
-        $execute = $remoteExecutor ?? static fn (string $command): ?string => instant_remote_process(
-            [$command],
-            $server,
-            timeout: 120,
-            disableMultiplexing: true,
-            retry: false,
+        if (! $wasAlreadyActivating) {
+            $state = $this->stateStore->transition(
+                $server,
+                $operationId,
+                $token,
+                ControlPlaneProxyEnrollmentPhase::Prepared,
+                ControlPlaneProxyEnrollmentPhase::Activating,
+                now()->toIso8601String(),
+            );
+        }
+        $proxyPath = rtrim((string) $server->proxyPath(), '/');
+        $this->assertExactOutput(
+            $execute($this->filesystemNormalizer->commandFor($proxyPath)),
+            NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT,
+            'control-plane enrollment filesystem normalization',
         );
         $derivedHealthProof = hash_hmac(
             'sha256',
@@ -83,21 +109,21 @@ final class ActivateControlPlaneProxyEnrollment
         }
         $this->candidateVerifier->handle($candidateProof, $candidateTranscript);
 
-        $this->assertExactOutput(
-            $execute($this->dynamicWriter->writeCommandFor($this->dynamicMutation($server, $state))),
-            ManagedTraefikDocumentWriter::APPLIED_OUTPUT,
-            'dynamic Traefik document',
-        );
-
-        if (! $wasAlreadyActivating) {
-            $state = $this->stateStore->transition(
-                $server,
-                $operationId,
-                $token,
-                ControlPlaneProxyEnrollmentPhase::Prepared,
-                ControlPlaneProxyEnrollmentPhase::Activating,
-                now()->toIso8601String(),
+        $mutation = $this->dynamicMutation($server, $state);
+        $writerAuthority = $this->writerAuthority($state, $execute);
+        $authorityTranscript = $execute($this->writerAuthorityInspector->commandFor($mutation));
+        if (! is_string($authorityTranscript)) {
+            throw new RuntimeException('The control-plane enrollment writer authority inspection returned no transcript.');
+        }
+        $existingAuthority = $this->writerAuthorityInspector->handle($authorityTranscript);
+        if ($existingAuthority === null) {
+            $this->assertExactOutput(
+                $execute($this->dynamicWriter->writeCommandFor($mutation)),
+                ManagedTraefikDocumentWriter::APPLIED_OUTPUT,
+                'dynamic Traefik document',
             );
+        } elseif (! hash_equals($existingAuthority->toJson(), $writerAuthority->toJson())) {
+            throw new RuntimeException('The control-plane enrollment writer authority is not owned by this exact enrollment.');
         }
 
         $this->assertExactOutput(
@@ -112,6 +138,8 @@ final class ActivateControlPlaneProxyEnrollment
             return $state;
         }
 
+        $this->bootstrapActivatedWriterAuthority($mutation, $writerAuthority, $execute);
+
         return $this->stateStore->transition(
             $server,
             $operationId,
@@ -120,6 +148,77 @@ final class ActivateControlPlaneProxyEnrollment
             ControlPlaneProxyEnrollmentPhase::Active,
             now()->toIso8601String(),
         );
+    }
+
+    /** @param Closure(string): ?string $execute */
+    private function repairActivatedEnrollment(
+        Server $server,
+        ControlPlaneProxyEnrollmentState $state,
+        Closure $execute,
+    ): void {
+        $proxyPath = rtrim((string) $server->proxyPath(), '/');
+        $this->assertExactOutput(
+            $execute($this->filesystemNormalizer->commandFor($proxyPath)),
+            NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT,
+            'control-plane enrollment filesystem normalization',
+        );
+        $mutation = $this->dynamicMutation($server, $state);
+        $authorityTranscript = $execute($this->writerAuthorityInspector->commandFor($mutation));
+        if (! is_string($authorityTranscript)) {
+            throw new RuntimeException('The control-plane enrollment writer authority inspection returned no transcript.');
+        }
+        $existingAuthority = $this->writerAuthorityInspector->handle($authorityTranscript);
+        if ($existingAuthority === null) {
+            $this->bootstrapActivatedWriterAuthority(
+                $mutation,
+                $this->writerAuthority($state, $execute),
+                $execute,
+            );
+
+            return;
+        }
+        if ($state->phase === ControlPlaneProxyEnrollmentPhase::Enrolled) {
+            return;
+        }
+        $expectedAuthority = $this->writerAuthorityBootstrap->authorityFor(
+            $state,
+            new ControlPlaneEnrollmentWriterIdentity(
+                containerId: $existingAuthority->containerId,
+                containerName: $existingAuthority->containerName,
+                imageId: $existingAuthority->imageId,
+            ),
+        );
+        if (! hash_equals($existingAuthority->toJson(), $expectedAuthority->toJson())) {
+            throw new RuntimeException('The control-plane enrollment writer authority is not owned by this exact enrollment.');
+        }
+    }
+
+    /** @param Closure(string): ?string $execute */
+    private function bootstrapActivatedWriterAuthority(
+        ManagedTraefikDocumentMutation $mutation,
+        ManagedTraefikDocumentWriterAuthority $writerAuthority,
+        Closure $execute,
+    ): void {
+        $this->assertExactOutput(
+            $execute($this->writerAuthorityBootstrap->commandFor($mutation, $writerAuthority)),
+            BootstrapControlPlaneEnrollmentWriterAuthority::APPLIED_OUTPUT,
+            'control-plane enrollment writer authority bootstrap',
+        );
+    }
+
+    /** @param Closure(string): ?string $execute */
+    private function writerAuthority(
+        ControlPlaneProxyEnrollmentState $state,
+        Closure $execute,
+    ): ManagedTraefikDocumentWriterAuthority {
+        $writerContainerName = $state->activeBackendDnsNames[0];
+        $inspectionTranscript = $execute($this->writerInspector->commandFor($writerContainerName));
+        if (! is_string($inspectionTranscript)) {
+            throw new RuntimeException('The control-plane enrollment writer inspection returned no transcript.');
+        }
+        $writerIdentity = $this->writerInspector->handle($inspectionTranscript, $writerContainerName);
+
+        return $this->writerAuthorityBootstrap->authorityFor($state, $writerIdentity);
     }
 
     private function ownedState(Server $server, string $operationId, string $token): ControlPlaneProxyEnrollmentState
