@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [unreleased]
+
+### 🐛 Bug Fixes
+
+- *(control-plane)* Attest absent rollback routes
+
+### 📚 Documentation
+
+- Update changelog (#145)
+
 ## [4.13.21-fork] - 2026-07-22
 
 ### ⚙️ Miscellaneous Tasks
