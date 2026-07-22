@@ -35,6 +35,8 @@ final class PrepareControlPlaneProxyEnrollmentFromHost
     public function __construct(
         private readonly PrepareControlPlaneProxyEnrollment $preparer,
         private readonly ResumeControlPlaneProxyEnrollment $resumer,
+        private readonly StoreControlPlaneProxyEnrollmentState $stateStore,
+        private readonly ReconcileRolledBackControlPlaneProxyEnrollment $rolledBackReconciler,
         private readonly string $sourceProductionComposePath = '/data/coolify/source/docker-compose.prod.yml',
     ) {}
 
@@ -64,6 +66,11 @@ final class PrepareControlPlaneProxyEnrollmentFromHost
             disableMultiplexing: true,
             retry: false,
         );
+        $existingState = $this->stateStore->read($server);
+        if ($existingState?->phase === ControlPlaneProxyEnrollmentPhase::RolledBack) {
+            $this->rolledBackReconciler->handle($server, $existingState, $execute);
+            $this->stateStore->clearRolledBackIfUnchanged($server, $existingState);
+        }
         $sourceComposeYaml = $execute('cat -- '.escapeshellarg($this->sourceProductionComposePath));
         if (! is_string($sourceComposeYaml) || $sourceComposeYaml === '') {
             throw new RuntimeException('The canonical Coolify production Compose could not be read.');

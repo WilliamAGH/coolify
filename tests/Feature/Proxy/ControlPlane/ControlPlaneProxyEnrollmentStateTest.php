@@ -5,6 +5,7 @@ use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentPhase;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentState;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyExposure;
 use App\Actions\Proxy\ControlPlane\ControlPlaneStaticProxyConfiguration;
+use App\Actions\Proxy\ControlPlane\StoreControlPlaneGenerationPromotionState;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
 use App\Models\Server;
 use App\Models\Team;
@@ -187,7 +188,7 @@ it('rejects foreign owners, stale phases, invalid transitions, and corrupted art
         ->toThrow(InvalidArgumentException::class, 'checksum');
 });
 
-it('allows a new owner only after the previous enrollment has durably rolled back', function () {
+it('allows a new owner only after the exact rolled-back state is reconciled and cleared', function () {
     $team = Team::factory()->create();
     $server = Server::factory()->create(['team_id' => $team->id]);
     $repository = new StoreControlPlaneProxyEnrollmentState;
@@ -219,9 +220,54 @@ it('allows a new owner only after the previous enrollment has durably rolled bac
     );
 
     $second = controlPlaneEnrollmentState($server, 'second-op', 'second-token');
+    expect(fn () => $repository->reserve($server, $second, 'second-token'))
+        ->toThrow(RuntimeException::class, 'already owns');
+    $rolledBack = $repository->read($server);
+    expect($rolledBack)->not->toBeNull();
+    $concurrentlyChangedServer = $server->fresh();
+    $concurrentlyChangedServer->proxy->set(StoreControlPlaneProxyEnrollmentState::STATE_KEY, $second->toArray());
+    $concurrentlyChangedServer->save();
+    expect(fn () => $repository->clearRolledBackIfUnchanged($server, $rolledBack))
+        ->toThrow(RuntimeException::class, 'changed before reconciliation completed')
+        ->and($repository->read($server)?->operationId)->toBe('second-op');
+    $concurrentlyChangedServer->refresh();
+    $concurrentlyChangedServer->proxy->set(StoreControlPlaneProxyEnrollmentState::STATE_KEY, $rolledBack->toArray());
+    $concurrentlyChangedServer->save();
+    $repository->clearRolledBackIfUnchanged($server, $rolledBack);
     $reserved = $repository->reserve($server, $second, 'second-token');
 
     expect($reserved->operationId)->toBe('second-op')
         ->and($reserved->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Preparing)
         ->and($repository->read($server)?->operationId)->toBe('second-op');
+});
+
+it('blocks enrollment reservation and rollback while generation promotion state exists', function (): void {
+    $server = Server::factory()->create(['team_id' => Team::factory()->create()->id]);
+    $repository = new StoreControlPlaneProxyEnrollmentState;
+    $server->proxy->set(StoreControlPlaneGenerationPromotionState::STATE_KEY, ['present' => true]);
+    $server->save();
+
+    expect(fn () => $repository->reserve(
+        $server,
+        controlPlaneEnrollmentState($server),
+        'secret-token',
+    ))->toThrow(RuntimeException::class, 'generation promotion state exists');
+
+    $server->proxy->set(StoreControlPlaneGenerationPromotionState::STATE_KEY, null);
+    $server->save();
+    $state = controlPlaneEnrollmentState($server);
+    $repository->reserve($server, $state, 'secret-token');
+    $server->refresh();
+    $server->proxy->set(StoreControlPlaneGenerationPromotionState::STATE_KEY, ['present' => true]);
+    $server->save();
+
+    expect(fn () => $repository->transition(
+        $server,
+        'enrollment-op',
+        'secret-token',
+        ControlPlaneProxyEnrollmentPhase::Preparing,
+        ControlPlaneProxyEnrollmentPhase::RollingBack,
+        '2026-07-18T12:01:00Z',
+    ))->toThrow(RuntimeException::class, 'generation promotion state exists')
+        ->and($repository->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Preparing);
 });

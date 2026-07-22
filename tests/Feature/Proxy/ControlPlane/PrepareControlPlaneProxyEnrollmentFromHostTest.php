@@ -4,7 +4,9 @@ use App\Actions\Proxy\ControlPlane\ActivateControlPlaneProxyEnrollment;
 use App\Actions\Proxy\ControlPlane\BootstrapControlPlaneEnrollmentWriterAuthority;
 use App\Actions\Proxy\ControlPlane\CompileControlPlaneDynamicConfiguration;
 use App\Actions\Proxy\ControlPlane\CompileControlPlaneStaticProxyConfiguration;
+use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentPhase;
+use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentState;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyExposure;
 use App\Actions\Proxy\ControlPlane\ControlPlaneStaticListenerHandoff;
 use App\Actions\Proxy\ControlPlane\ExecuteControlPlaneProxyEnrollmentRollback;
@@ -17,6 +19,7 @@ use App\Actions\Proxy\ControlPlane\ManagedTraefikDocumentWriter;
 use App\Actions\Proxy\ControlPlane\NormalizeControlPlaneEnrollmentFilesystem;
 use App\Actions\Proxy\ControlPlane\PrepareControlPlaneProxyEnrollment;
 use App\Actions\Proxy\ControlPlane\PrepareControlPlaneProxyEnrollmentFromHost;
+use App\Actions\Proxy\ControlPlane\ReconcileRolledBackControlPlaneProxyEnrollment;
 use App\Actions\Proxy\ControlPlane\ResumeControlPlaneProxyEnrollment;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
 use App\Actions\Proxy\ControlPlane\VerifyControlPlaneCandidateMembers;
@@ -33,26 +36,30 @@ function hostPreparedEnrollmentAction(StoreControlPlaneProxyEnrollmentState $sto
 {
     $staticHandoff = new ControlPlaneStaticListenerHandoff;
     $dynamicWriter = new ManagedTraefikDocumentWriter;
+    $filesystemNormalizer = new NormalizeControlPlaneEnrollmentFilesystem;
+    $writerInspector = new InspectControlPlaneEnrollmentWriter;
+    $writerAuthorityInspector = new InspectControlPlaneEnrollmentWriterAuthority;
+    $writerAuthorityBootstrap = new BootstrapControlPlaneEnrollmentWriterAuthority;
     $activator = new ActivateControlPlaneProxyEnrollment(
         $store,
-        new NormalizeControlPlaneEnrollmentFilesystem,
+        $filesystemNormalizer,
         new InstallControlPlaneCandidateHealthMarkers,
         new VerifyControlPlaneCandidateMembers,
         $dynamicWriter,
         $staticHandoff,
-        new InspectControlPlaneEnrollmentWriter,
-        new InspectControlPlaneEnrollmentWriterAuthority,
-        new BootstrapControlPlaneEnrollmentWriterAuthority,
+        $writerInspector,
+        $writerAuthorityInspector,
+        $writerAuthorityBootstrap,
     );
     $finalizer = new FinalizeControlPlaneProxyEnrollment($store, new VerifyControlPlaneProxyRoutes);
     $rollback = new ExecuteControlPlaneProxyEnrollmentRollback(
         $store,
-        new NormalizeControlPlaneEnrollmentFilesystem,
+        $filesystemNormalizer,
         $staticHandoff,
         $dynamicWriter,
-        new InspectControlPlaneEnrollmentWriterAuthority,
-        new InspectControlPlaneEnrollmentWriter,
-        new BootstrapControlPlaneEnrollmentWriterAuthority,
+        $writerAuthorityInspector,
+        $writerInspector,
+        $writerAuthorityBootstrap,
         new InstallControlPlaneCandidateHealthMarkers,
         new VerifyControlPlaneRestoredRoutes,
     );
@@ -66,11 +73,21 @@ function hostPreparedEnrollmentAction(StoreControlPlaneProxyEnrollmentState $sto
             $store,
         ),
         $resumer,
+        $store,
+        new ReconcileRolledBackControlPlaneProxyEnrollment(
+            $store,
+            $filesystemNormalizer,
+            $dynamicWriter,
+            $writerAuthorityInspector,
+            $writerInspector,
+            $writerAuthorityBootstrap,
+        ),
     );
 }
 
 it('prepares exact host artifacts through the thin operator boundary without exposing its token', function (): void {
     $server = Server::factory()->create([
+        'id' => 0,
         'team_id' => Team::factory()->create()->id,
         'ip' => 'host.docker.internal',
     ]);
@@ -115,4 +132,85 @@ YAML;
         ->and($commands)->toHaveCount(2)
         ->and(implode("\n", $commands))->not->toContain('host-enrollment-token')
         ->and(json_encode($store->read($server)?->toArray(), JSON_THROW_ON_ERROR))->not->toContain('host-enrollment-token');
+});
+
+it('reconciles an exact rolled-back owner before reserving a replacement from host artifacts', function (): void {
+    $server = Server::factory()->create([
+        'id' => 0,
+        'team_id' => Team::factory()->create()->id,
+        'ip' => 'host.docker.internal',
+    ]);
+    $server->proxy->set('type', ProxyTypes::TRAEFIK->value);
+    $server->proxy->set('last_saved_proxy_configuration', generateDefaultProxyConfiguration($server, save: false));
+    $rolledBack = new ControlPlaneProxyEnrollmentState(
+        phase: ControlPlaneProxyEnrollmentPhase::RolledBack,
+        operationId: 'old-rolled-back-enrollment',
+        tokenSha256: hash('sha256', 'lost-old-token'),
+        serverId: (int) $server->getKey(),
+        appPort: 8000,
+        exposure: ControlPlaneProxyExposure::Public,
+        managedFilename: ControlPlaneDynamicConfiguration::MANAGED_FILENAME,
+        dynamicRevision: 1,
+        canonicalHost: 'old.example.test',
+        publicScheme: 'https',
+        expectedMember: 'green',
+        expectedRevision: 'old-revision',
+        configurationAcknowledgement: 'ack:'.str_repeat('a', 64),
+        activeBackendDnsNames: ['coolify-old'],
+        staticPredecessorBytes: "services:\n  traefik:\n    ports: ['80:80']\n",
+        staticReplacementBytes: "services:\n  traefik:\n    ports: ['80:80', '8000:8000']\n",
+        sourceOverrideBytes: "services:\n  coolify:\n    ports: !reset []\n",
+        dynamicPredecessorBytes: null,
+        dynamicReplacementBytes: "http:\n  routers:\n    old-control-plane: {}\n",
+        createdAt: '2026-07-22T00:00:00Z',
+        updatedAt: '2026-07-22T00:00:00Z',
+    );
+    $server->proxy->set(StoreControlPlaneProxyEnrollmentState::STATE_KEY, $rolledBack->toArray());
+    $server->save();
+    $store = new StoreControlPlaneProxyEnrollmentState;
+    $action = hostPreparedEnrollmentAction($store);
+    $sourceCompose = <<<'YAML'
+services:
+  coolify:
+    image: coolify:test
+    ports:
+      - "${APP_PORT:-8000}:8080"
+YAML;
+    $commands = [];
+
+    $state = $action->handle(
+        server: $server,
+        operationId: 'replacement-enrollment',
+        token: 'replacement-token',
+        appPort: 8000,
+        exposure: ControlPlaneProxyExposure::Public,
+        activeBackendDnsNames: ['coolify-new'],
+        host: 'new.example.test',
+        expectedRevision: 'new-revision',
+        expectedMember: 'blue',
+        remoteExecutor: function (string $command) use (&$commands, $sourceCompose): string {
+            $commands[] = $command;
+
+            return match (true) {
+                str_contains($command, ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_PENDING_OUTPUT) => ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT,
+                str_starts_with($command, 'cat -- ') => $sourceCompose,
+                str_contains($command, '__COOLIFY_CONTROL_PLANE_ARTIFACT_') => "__COOLIFY_CONTROL_PLANE_ARTIFACT_ABSENT__\n",
+                default => throw new RuntimeException("Unexpected remote command: {$command}"),
+            };
+        },
+    );
+
+    $finalizationIndex = collect($commands)->search(
+        fn (string $command): bool => str_contains($command, ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT),
+    );
+    $sourceReadIndex = collect($commands)->search(fn (string $command): bool => str_starts_with($command, 'cat -- '));
+
+    expect($finalizationIndex)->toBeInt()
+        ->and($sourceReadIndex)->toBeInt()
+        ->and($finalizationIndex)->toBeLessThan($sourceReadIndex)
+        ->and($commands)->toHaveCount(3)
+        ->and(implode("\n", $commands))->not->toContain(InspectControlPlaneEnrollmentWriter::TRANSCRIPT_BEGIN)
+        ->and($state->operationId)->toBe('replacement-enrollment')
+        ->and($state->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Preparing)
+        ->and($store->read($server)?->operationId)->toBe('replacement-enrollment');
 });

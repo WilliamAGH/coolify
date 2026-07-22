@@ -53,6 +53,7 @@ final class ExecuteControlPlaneProxyEnrollmentRollback
         if ($state->phase === ControlPlaneProxyEnrollmentPhase::RolledBack) {
             return $state;
         }
+        $this->stateStore->assertRollbackAvailable($server);
 
         $execute = $remoteExecutor ?? static fn (string $command): ?string => instant_remote_process(
             [$command],
@@ -66,6 +67,18 @@ final class ExecuteControlPlaneProxyEnrollmentRollback
         }
 
         $wasAlreadyRollingBack = $state->phase === ControlPlaneProxyEnrollmentPhase::RollingBack;
+        $proxyPath = rtrim((string) $server->proxyPath(), '/');
+        $dynamicMutation = $this->rollbackMutation($server, $state);
+        [$replacementAuthority, $rolledBackAuthority] = $this->rollbackAuthorities(
+            $state,
+            $dynamicMutation,
+            $execute,
+        );
+        $this->assertExactOutput(
+            $execute($this->filesystemNormalizer->commandFor($proxyPath)),
+            NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT,
+            'control-plane enrollment filesystem normalization',
+        );
         if (! $wasAlreadyRollingBack) {
             $state = $this->stateStore->transition(
                 $server,
@@ -76,19 +89,6 @@ final class ExecuteControlPlaneProxyEnrollmentRollback
                 now()->toIso8601String(),
             );
         }
-
-        $proxyPath = rtrim((string) $server->proxyPath(), '/');
-        $this->assertExactOutput(
-            $execute($this->filesystemNormalizer->commandFor($proxyPath)),
-            NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT,
-            'control-plane enrollment filesystem normalization',
-        );
-        $dynamicMutation = $this->rollbackMutation($server, $state);
-        [$replacementAuthority, $rolledBackAuthority] = $this->rollbackAuthorities(
-            $state,
-            $dynamicMutation,
-            $execute,
-        );
         $this->assertExactOutput(
             $execute($this->staticHandoff->rollbackCommandFor($state, $operationId, $token)),
             ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT,
@@ -161,15 +161,35 @@ final class ExecuteControlPlaneProxyEnrollmentRollback
         $this->restoredRoutesVerifier->handle($proof, $transcript);
 
         $dynamicMutation = $this->rollbackMutation($server, $state);
-        [, $rolledBackAuthority] = $this->rollbackAuthorities($state, $dynamicMutation, $execute);
-        $this->assertExactOutput(
-            $execute($this->dynamicWriter->finalizeEnrollmentRollbackCommandFor(
-                $dynamicMutation,
-                $rolledBackAuthority,
-            )),
-            ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT,
-            'dynamic Traefik document rollback finalization',
+        $finalizationStatus = $execute(
+            $this->dynamicWriter->inspectEnrollmentRollbackFinalizationCommandFor($dynamicMutation),
         );
+        if (is_string($finalizationStatus)
+            && hash_equals(ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_CLEANUP_PENDING_OUTPUT, trim($finalizationStatus))) {
+            $this->assertExactOutput(
+                $execute($this->dynamicWriter->finalizePartialEnrollmentRollbackCommandFor($dynamicMutation)),
+                ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT,
+                'partial dynamic Traefik document rollback finalization',
+            );
+            $finalizationStatus = ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT;
+        }
+        if (! is_string($finalizationStatus)
+            || ! hash_equals(ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT, trim($finalizationStatus))) {
+            $this->assertExactOutput(
+                $finalizationStatus,
+                ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_PENDING_OUTPUT,
+                'dynamic Traefik document rollback finalization inspection',
+            );
+            [, $rolledBackAuthority] = $this->rollbackAuthorities($state, $dynamicMutation, $execute);
+            $this->assertExactOutput(
+                $execute($this->dynamicWriter->finalizeEnrollmentRollbackCommandFor(
+                    $dynamicMutation,
+                    $rolledBackAuthority,
+                )),
+                ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT,
+                'dynamic Traefik document rollback finalization',
+            );
+        }
 
         return $this->stateStore->transition(
             $server,

@@ -15,6 +15,11 @@ final class StoreControlPlaneProxyEnrollmentState
 
     public const STATE_KEY = 'control_plane_proxy_enrollment';
 
+    public static function operationLockName(int|string $serverId): string
+    {
+        return 'coolify:control-plane-proxy-enrollment:'.$serverId;
+    }
+
     public function serializeOperation(Server $server, Closure $operation): mixed
     {
         $connection = DB::connection();
@@ -25,7 +30,7 @@ final class StoreControlPlaneProxyEnrollmentState
             throw new RuntimeException('Control-plane enrollment serialization requires PostgreSQL.');
         }
 
-        $lockName = 'coolify:control-plane-proxy-enrollment:'.$server->getKey();
+        $lockName = self::operationLockName($server->getKey());
         $connection->selectOne('select pg_advisory_lock(hashtextextended(?, 0))', [$lockName], false);
 
         try {
@@ -51,15 +56,11 @@ final class StoreControlPlaneProxyEnrollmentState
                 if ($current->toArray() === $state->toArray() && $current->isOwnedBy($state->operationId, $token)) {
                     return $current;
                 }
-                if ($current->phase === ControlPlaneProxyEnrollmentPhase::RolledBack) {
-                    $this->writeTo($lockedServer, $state);
-
-                    return $state;
-                }
 
                 throw new RuntimeException('Another durable control-plane enrollment state already owns this server.');
             }
 
+            $this->assertNoGenerationPromotion($lockedServer);
             $this->writeTo($lockedServer, $state);
 
             return $state;
@@ -87,6 +88,9 @@ final class StoreControlPlaneProxyEnrollmentState
             if ($current->phase !== $expectedPhase) {
                 throw new RuntimeException('The durable control-plane enrollment phase changed concurrently.');
             }
+            if ($nextPhase === ControlPlaneProxyEnrollmentPhase::RollingBack) {
+                $this->assertNoGenerationPromotion($lockedServer);
+            }
 
             $next = $current->withPhase($nextPhase, $timestamp);
             $this->writeTo($lockedServer, $next);
@@ -103,6 +107,31 @@ final class StoreControlPlaneProxyEnrollmentState
         }
 
         return $this->readFrom($fresh);
+    }
+
+    public function assertRollbackAvailable(Server $server): void
+    {
+        $fresh = Server::query()->useWritePdo()->find($server->getKey())
+            ?? throw new RuntimeException('The control-plane enrollment server no longer exists.');
+        $this->assertNoGenerationPromotion($fresh);
+    }
+
+    public function clearRolledBackIfUnchanged(
+        Server $server,
+        ControlPlaneProxyEnrollmentState $expectedState,
+    ): void {
+        DB::transaction(function () use ($server, $expectedState): void {
+            $lockedServer = $this->lockServer($server);
+            $current = $this->readFrom($lockedServer)
+                ?? throw new RuntimeException('The durable control-plane enrollment state is missing.');
+            if ($current->phase !== ControlPlaneProxyEnrollmentPhase::RolledBack
+                || $current->toArray() !== $expectedState->toArray()) {
+                throw new RuntimeException('The rolled-back control-plane enrollment changed before reconciliation completed.');
+            }
+            $this->assertNoGenerationPromotion($lockedServer);
+            $lockedServer->proxy->set(self::STATE_KEY, null);
+            $lockedServer->save();
+        }, 3);
     }
 
     public function abortUnchanged(
@@ -161,5 +190,12 @@ final class StoreControlPlaneProxyEnrollmentState
     {
         $server->proxy->set(self::STATE_KEY, $state->toArray());
         $server->save();
+    }
+
+    private function assertNoGenerationPromotion(Server $server): void
+    {
+        if ($server->proxy->get(StoreControlPlaneGenerationPromotionState::STATE_KEY) !== null) {
+            throw new RuntimeException('Control-plane enrollment cannot change ownership while generation promotion state exists.');
+        }
     }
 }
