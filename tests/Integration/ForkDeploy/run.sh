@@ -1462,16 +1462,23 @@ test_verify_accepts_dual_stack_public_app_binding() {
 }
 
 test_update_preserves_control_plane_listener_override() {
+    local serialization=${1:-canonical}
+    local expectation='fork-deploy update preserves enrolled Traefik APP_PORT ownership'
     new_fixture
     write_manifest 4.13.0-fork.1
     if ! install_release >/dev/null; then
-        fail 'fork-deploy update preserves enrolled Traefik APP_PORT ownership'
+        fail "$expectation"
         cleanup_fixture
         return
     fi
     local override source_hash output state_directory managed_document sidecar authority private_state crash_directory crash_stage
     override=$(control_plane_listener_override_path)
-    printf 'services:\n  coolify:\n    ports: !reset []\n' >"$override"
+    if [[ $serialization == legacy-multiline ]]; then
+        expectation='fork-deploy accepts the released multiline listener reset'
+        printf 'services:\n  coolify:\n    ports: !reset\n      {  }\n' >"$override"
+    else
+        printf 'services:\n  coolify:\n    ports: !reset []\n' >"$override"
+    fi
     chmod 600 "$override"
     state_directory=$ROOT/proxy/.control-plane-managed-traefik
     managed_document=$ROOT/proxy/dynamic/coolify.yaml
@@ -1508,10 +1515,10 @@ test_update_preserves_control_plane_listener_override() {
         && [[ ! -e $crash_directory && ! -e $crash_stage ]] \
         && grep -Fq "chown root:9999 $ROOT/proxy $ROOT/proxy/dynamic $state_directory" "$LOG" \
         && grep -Fq "chown root:root $ROOT/source $ROOT/proxy/docker-compose.yml" "$LOG"; then
-        pass 'fork-deploy update preserves enrolled Traefik APP_PORT ownership'
+        pass "$expectation"
     else
         printf 'control-plane listener persistence diagnostic: %s\n' "$output" >&2
-        fail 'fork-deploy update preserves enrolled Traefik APP_PORT ownership'
+        fail "$expectation"
     fi
     cleanup_fixture
 }
@@ -2423,6 +2430,7 @@ fi
 
 if [[ ${FORK_DEPLOY_TEST_FILTER:-} == control-plane-listener ]]; then
     test_update_preserves_control_plane_listener_override
+    test_update_preserves_control_plane_listener_override legacy-multiline
     test_update_rejects_symlinked_control_plane_listener_override
     test_update_rejects_partial_control_plane_listener_override
     printf '%s passing, %s failing\n' "$PASS" "$FAIL"
@@ -2466,6 +2474,7 @@ fi
 
 if [[ ${FORK_DEPLOY_TEST_FILTER:-} == control-plane-ownership ]]; then
     test_update_preserves_control_plane_listener_override
+    test_update_preserves_control_plane_listener_override legacy-multiline
     test_update_keeps_ordinary_dynamic_proxy_non_enrolled
     printf '%s passing, %s failing\n' "$PASS" "$FAIL"
     ((FAIL == 0))
@@ -2520,6 +2529,7 @@ test_effective_compose_accepts_default_public_app_binding
 test_effective_compose_rejects_swapped_bindings
 test_verify_accepts_dual_stack_public_app_binding
 test_update_preserves_control_plane_listener_override
+test_update_preserves_control_plane_listener_override legacy-multiline
 test_update_keeps_ordinary_dynamic_proxy_non_enrolled
 test_update_rejects_symlinked_control_plane_listener_override
 test_update_rejects_partial_control_plane_listener_override
