@@ -238,6 +238,7 @@ jobs:
             tests/Feature/ProxyMutationQueueGateTest.php \
             tests/Feature/PostgresUserDeletionConcurrencyTest.php \
             tests/Feature/PostgresBlueGreenMultiDestinationConcurrencyTest.php \
+            tests/Feature/Proxy/ControlPlane/PrepareControlPlaneProxyEnrollmentFromHostTest.php \
             tests/Feature/QueueApplicationDeploymentCommitTest.php \
             tests/Feature/QueueServerDeletionTest.php \
             tests/Feature/ScheduleOnOneServerTest.php \

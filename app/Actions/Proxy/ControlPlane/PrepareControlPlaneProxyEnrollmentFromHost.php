@@ -59,56 +59,75 @@ final class PrepareControlPlaneProxyEnrollmentFromHost
         bool $submitActivation = false,
         ?Closure $remoteExecutor = null,
     ): ControlPlaneProxyEnrollmentState {
-        $execute = $remoteExecutor ?? static fn (string $command): ?string => instant_remote_process(
-            [$command],
+        return $this->stateStore->serializeOperation(
             $server,
-            timeout: 30,
-            disableMultiplexing: true,
-            retry: false,
+            function (Server $lockedServer) use (
+                $operationId,
+                $token,
+                $appPort,
+                $exposure,
+                $activeBackendDnsNames,
+                $host,
+                $expectedRevision,
+                $expectedMember,
+                $publicScheme,
+                $hasProvenAlternateRoute,
+                $submitActivation,
+                $remoteExecutor,
+            ): ControlPlaneProxyEnrollmentState {
+                $server = $lockedServer;
+                $execute = $remoteExecutor ?? static fn (string $command): ?string => instant_remote_process(
+                    [$command],
+                    $server,
+                    timeout: 30,
+                    disableMultiplexing: true,
+                    retry: false,
+                );
+                $existingState = $this->stateStore->read($server);
+                if ($existingState?->phase === ControlPlaneProxyEnrollmentPhase::RolledBack) {
+                    $this->rolledBackReconciler->handle($server, $existingState, $remoteExecutor);
+                    $this->stateStore->clearRolledBackIfUnchanged($server, $existingState);
+                }
+                $sourceComposeYaml = $execute('cat -- '.escapeshellarg($this->sourceProductionComposePath));
+                if (! is_string($sourceComposeYaml) || $sourceComposeYaml === '') {
+                    throw new RuntimeException('The canonical Coolify production Compose could not be read.');
+                }
+
+                $dynamicPath = rtrim((string) $server->proxyPath(), '/')
+                    .'/dynamic/'.ControlPlaneDynamicConfiguration::MANAGED_FILENAME;
+                $existingDynamicYaml = $this->decodeOptionalArtifact($execute($this->optionalArtifactCommand($dynamicPath)));
+                $configurationAcknowledgement = 'ack:'.hash('sha256', json_encode([
+                    'operation_id' => $operationId,
+                    'token_sha256' => hash('sha256', $token),
+                    'server_id' => (int) $server->getKey(),
+                    'host' => $host,
+                    'revision' => $expectedRevision,
+                    'member' => $expectedMember,
+                    'backends' => $activeBackendDnsNames,
+                ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES));
+
+                $state = $this->preparer->handle(
+                    server: $server,
+                    operationId: $operationId,
+                    token: $token,
+                    appPort: $appPort,
+                    exposure: $exposure,
+                    sourceComposeYaml: $sourceComposeYaml,
+                    existingDynamicYaml: $existingDynamicYaml,
+                    activeBackendDnsNames: $activeBackendDnsNames,
+                    host: $host,
+                    expectedRevision: $expectedRevision,
+                    expectedMember: $expectedMember,
+                    configurationAcknowledgement: $configurationAcknowledgement,
+                    publicScheme: $publicScheme,
+                    hasProvenAlternateRoute: $hasProvenAlternateRoute,
+                );
+
+                return $submitActivation
+                    ? $this->resumer->handle($server, $operationId, $token, $remoteExecutor)
+                    : $state;
+            },
         );
-        $existingState = $this->stateStore->read($server);
-        if ($existingState?->phase === ControlPlaneProxyEnrollmentPhase::RolledBack) {
-            $this->rolledBackReconciler->handle($server, $existingState, $remoteExecutor);
-            $this->stateStore->clearRolledBackIfUnchanged($server, $existingState);
-        }
-        $sourceComposeYaml = $execute('cat -- '.escapeshellarg($this->sourceProductionComposePath));
-        if (! is_string($sourceComposeYaml) || $sourceComposeYaml === '') {
-            throw new RuntimeException('The canonical Coolify production Compose could not be read.');
-        }
-
-        $dynamicPath = rtrim((string) $server->proxyPath(), '/')
-            .'/dynamic/'.ControlPlaneDynamicConfiguration::MANAGED_FILENAME;
-        $existingDynamicYaml = $this->decodeOptionalArtifact($execute($this->optionalArtifactCommand($dynamicPath)));
-        $configurationAcknowledgement = 'ack:'.hash('sha256', json_encode([
-            'operation_id' => $operationId,
-            'token_sha256' => hash('sha256', $token),
-            'server_id' => (int) $server->getKey(),
-            'host' => $host,
-            'revision' => $expectedRevision,
-            'member' => $expectedMember,
-            'backends' => $activeBackendDnsNames,
-        ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES));
-
-        $state = $this->preparer->handle(
-            server: $server,
-            operationId: $operationId,
-            token: $token,
-            appPort: $appPort,
-            exposure: $exposure,
-            sourceComposeYaml: $sourceComposeYaml,
-            existingDynamicYaml: $existingDynamicYaml,
-            activeBackendDnsNames: $activeBackendDnsNames,
-            host: $host,
-            expectedRevision: $expectedRevision,
-            expectedMember: $expectedMember,
-            configurationAcknowledgement: $configurationAcknowledgement,
-            publicScheme: $publicScheme,
-            hasProvenAlternateRoute: $hasProvenAlternateRoute,
-        );
-
-        return $submitActivation
-            ? $this->resumer->handle($server, $operationId, $token, $remoteExecutor)
-            : $state;
     }
 
     public function asCommand(Command $command): int
