@@ -21,6 +21,8 @@ final class AbortPreparedControlPlaneProxyEnrollment
 
     private const PRESENT_ARTIFACT = '__COOLIFY_CONTROL_PLANE_ARTIFACT_PRESENT__';
 
+    private const REGULAR_ARTIFACT_DIRECTORY = '__COOLIFY_CONTROL_PLANE_ARTIFACT_DIRECTORY_REGULAR__';
+
     public string $commandSignature = 'control-plane:proxy-enrollment:abort-prepared
         {server_id : Local Coolify server ID}
         {operation_id : Exact prepared enrollment operation ID}
@@ -130,7 +132,11 @@ final class AbortPreparedControlPlaneProxyEnrollment
         $sourceDirectory = rtrim($this->sourceDirectory, '/');
         $this->assertExactRegularFile($execute, $proxyPath.'/docker-compose.yml', $state->staticPredecessorBytes);
         $this->assertAbsent($execute, $sourceDirectory.'/docker-compose.control-plane-listener.yml');
-        $this->assertAbsentOrEmptyDirectory($execute, $proxyPath.'/.control-plane-managed-traefik');
+        if ($state->phase === ControlPlaneProxyEnrollmentPhase::Activating) {
+            $this->assertAbsentOrRegularDirectory($execute, $proxyPath.'/.control-plane-managed-traefik');
+        } else {
+            $this->assertAbsentOrEmptyDirectory($execute, $proxyPath.'/.control-plane-managed-traefik');
+        }
 
         $managedDocument = $proxyPath.'/dynamic/'.$state->managedFilename;
         if ($state->dynamicPredecessorBytes === null) {
@@ -223,6 +229,26 @@ final class AbortPreparedControlPlaneProxyEnrollment
             self::EMPTY_ARTIFACT_DIRECTORY."\n",
         ], true)) {
             throw new RuntimeException("Prepared control-plane enrollment artifact is not absent or empty: {$path}");
+        }
+    }
+
+    private function assertAbsentOrRegularDirectory(Closure $execute, string $path): void
+    {
+        $pathArgument = escapeshellarg($path);
+        $output = $execute(
+            'if [ ! -e '.$pathArgument.' ] && [ ! -L '.$pathArgument.' ]; then '
+            .'printf '.escapeshellarg(self::ABSENT_ARTIFACT."\n").'; '
+            .'elif [ -d '.$pathArgument.' ] && [ ! -L '.$pathArgument.' ]; then '
+            .'printf '.escapeshellarg(self::REGULAR_ARTIFACT_DIRECTORY."\n").'; '
+            .'else exit 1; fi',
+        );
+        if (! in_array($output, [
+            self::ABSENT_ARTIFACT,
+            self::ABSENT_ARTIFACT."\n",
+            self::REGULAR_ARTIFACT_DIRECTORY,
+            self::REGULAR_ARTIFACT_DIRECTORY."\n",
+        ], true)) {
+            throw new RuntimeException("Prepared control-plane enrollment artifact is not an absent or regular directory: {$path}");
         }
     }
 

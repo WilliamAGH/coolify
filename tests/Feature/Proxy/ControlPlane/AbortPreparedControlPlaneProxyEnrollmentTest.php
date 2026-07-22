@@ -301,6 +301,9 @@ it('refuses a prepared abort when an identity fence differs', function (string $
 it('aborts an activating enrollment after its host artifacts rolled back exactly', function (): void {
     $fixture = preparedEnrollmentAbortFixture(ControlPlaneProxyEnrollmentPhase::Activating);
     $this->preparedAbortRoot = $fixture['root'];
+    (new Filesystem)->makeDirectory($fixture['proxy'].'/.control-plane-managed-traefik', 0700);
+    file_put_contents($fixture['proxy'].'/.control-plane-managed-traefik/.coolify.yaml.lock', '');
+    file_put_contents($fixture['proxy'].'/.control-plane-managed-traefik/.coolify.yaml.state.json', "{}\n");
     $artifactExecutor = $fixture['remote'];
     $commands = [];
     $fixture['server']->proxy->set('last_saved_settings', md5(base64_encode($fixture['state']->staticReplacementBytes)));
@@ -388,7 +391,8 @@ it('refuses an abort when any activation artifact exists', function (ControlPlan
     'prepared state file' => [ControlPlaneProxyEnrollmentPhase::Prepared, 'state file'],
     'prepared dynamic' => [ControlPlaneProxyEnrollmentPhase::Prepared, 'dynamic'],
     'activating override' => [ControlPlaneProxyEnrollmentPhase::Activating, 'override'],
-    'activating state' => [ControlPlaneProxyEnrollmentPhase::Activating, 'state'],
+    'activating state symlink' => [ControlPlaneProxyEnrollmentPhase::Activating, 'state symlink'],
+    'activating state file' => [ControlPlaneProxyEnrollmentPhase::Activating, 'state file'],
     'activating dynamic' => [ControlPlaneProxyEnrollmentPhase::Activating, 'dynamic'],
 ]);
 
