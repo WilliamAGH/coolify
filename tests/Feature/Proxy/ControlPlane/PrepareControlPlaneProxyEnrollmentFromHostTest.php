@@ -303,7 +303,7 @@ it('holds the enrollment operation fence through reconciliation and replacement 
     $competitor = DB::connection($connectionName);
     $lockName = StoreControlPlaneProxyEnrollmentState::operationLockName($server->getKey());
     $sourceCompose = "services:\n  coolify:\n    image: coolify:test\n    ports:\n      - \"\${APP_PORT:-8000}:8080\"\n";
-    $competingLockResults = [];
+    $competingLockResults = new ArrayObject;
 
     try {
         expect(fn () => hostPreparedEnrollmentAction($store)->handle(
@@ -317,13 +317,13 @@ it('holds the enrollment operation fence through reconciliation and replacement 
             expectedRevision: 'new-revision',
             expectedMember: 'blue',
             submitActivation: true,
-            remoteExecutor: function (string $command) use ($competitor, $lockName, $sourceCompose, &$competingLockResults): string {
+            remoteExecutor: function (string $command) use ($competitor, $lockName, $sourceCompose, $competingLockResults): string {
                 $result = $competitor->selectOne(
                     'select case when pg_try_advisory_lock(hashtextextended(?, 0)) then 1 else 0 end as acquired',
                     [$lockName],
                     false,
                 );
-                $competingLockResults[] = (int) $result->acquired;
+                $competingLockResults->append((int) $result->acquired);
 
                 return match (true) {
                     str_contains($command, ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_PENDING_OUTPUT) => ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT,
@@ -335,7 +335,7 @@ it('holds the enrollment operation fence through reconciliation and replacement 
             },
         ))->toThrow(RuntimeException::class, 'nested activation reached');
 
-        expect($competingLockResults)->not->toBeEmpty()
+        expect($competingLockResults->getArrayCopy())->not->toBeEmpty()
             ->each->toBe(0);
         $released = $competitor->selectOne(
             'select case when pg_try_advisory_lock(hashtextextended(?, 0)) then 1 else 0 end as acquired',
