@@ -7,6 +7,11 @@ use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
+use App\Models\Server;
+use App\Models\StandaloneDocker;
+use Illuminate\Support\Collection;
+use Symfony\Component\Filesystem\Filesystem;
+use Symfony\Component\Process\Process;
 
 function activeImageResolution(
     int $destinationId,
@@ -76,6 +81,125 @@ function activeImageId(string $image): string
 {
     return 'sha256:'.hash('sha256', $image);
 }
+
+function activeContainerInspectionResolver(): ResolveActiveApplicationContainerState
+{
+    return new class extends ResolveActiveApplicationContainerState
+    {
+        /** @var list<array{server_id: int, application_id: int}> */
+        public array $containerInspectionCalls = [];
+
+        public function commandForApplicationContainers(int $applicationId): string
+        {
+            return $this->applicationContainersCommandFor($applicationId);
+        }
+
+        /**
+         * @param  Collection<int, int>  $destinationIds
+         * @param  Collection<int, StandaloneDocker>  $destinations
+         * @return Collection<int, Collection<int, array<string, mixed>>>|null
+         */
+        public function containersForDestinations(
+            Collection $destinationIds,
+            Collection $destinations,
+            int $applicationId,
+        ): ?Collection {
+            return $this->containersByDestination($destinationIds, $destinations, $applicationId);
+        }
+
+        /** @return Collection<int, array<string, mixed>> */
+        protected function applicationContainers(Server $server, int $applicationId): Collection
+        {
+            $this->containerInspectionCalls[] = [
+                'server_id' => (int) $server->id,
+                'application_id' => $applicationId,
+            ];
+
+            return collect();
+        }
+    };
+}
+
+it('scopes container inspection to one application base deployment and emits nothing when no containers match', function (): void {
+    $action = activeContainerInspectionResolver();
+    $command = $action->commandForApplicationContainers(42);
+
+    expect($command)
+        ->toContain("docker container ls -aq --no-trunc --filter 'label=coolify.applicationId=42' --filter 'label=coolify.pullRequestId=0'")
+        ->toContain('|| exit $?;')
+        ->toContain("docker container inspect --format='{{json .}}' \$ids")
+        ->not->toContain('docker container inspect $(docker container ls -aq)')
+        ->not->toContain('docker container ls -aq)');
+
+    $filesystem = new Filesystem;
+    $fakeDockerDirectory = sys_get_temp_dir().'/coolify-active-container-inspection-'.bin2hex(random_bytes(8));
+    $filesystem->mkdir($fakeDockerDirectory, 0700);
+    $fakeDockerPath = $fakeDockerDirectory.'/docker';
+    file_put_contents($fakeDockerPath, <<<'SH'
+#!/bin/sh
+if [ "$1" = container ] && [ "$2" = ls ]; then
+    if [ "${FAIL_DOCKER_LS:-0}" = 1 ]; then
+        exit 23
+    fi
+    exit 0
+fi
+
+if [ "$1" = container ] && [ "$2" = inspect ]; then
+    printf %s 'inspect-was-called'
+    exit 0
+fi
+
+exit 1
+SH);
+    chmod($fakeDockerPath, 0700);
+
+    try {
+        $process = Process::fromShellCommandline($command, env: [
+            'PATH' => $fakeDockerDirectory.PATH_SEPARATOR.(string) getenv('PATH'),
+        ]);
+        $process->run();
+
+        $failedListProcess = Process::fromShellCommandline($command, env: [
+            'FAIL_DOCKER_LS' => '1',
+            'PATH' => $fakeDockerDirectory.PATH_SEPARATOR.(string) getenv('PATH'),
+        ]);
+        $failedListProcess->run();
+
+        expect($process->isSuccessful())->toBeTrue()
+            ->and($process->getOutput())->toBe('')
+            ->and($failedListProcess->getExitCode())->toBe(23)
+            ->and(fn (): string => $action->commandForApplicationContainers(0))
+            ->toThrow(InvalidArgumentException::class, 'positive application ID');
+    } finally {
+        $filesystem->remove($fakeDockerDirectory);
+    }
+});
+
+it('memoizes the application-scoped container inventory per server', function (): void {
+    $server = new Server;
+    $server->id = 97;
+    $firstDestination = new StandaloneDocker;
+    $firstDestination->id = 21;
+    $firstDestination->setRelation('server', $server);
+    $secondDestination = new StandaloneDocker;
+    $secondDestination->id = 22;
+    $secondDestination->setRelation('server', $server);
+    $action = activeContainerInspectionResolver();
+
+    $containersByDestination = $action->containersForDestinations(
+        collect([21, 22]),
+        collect([21 => $firstDestination, 22 => $secondDestination]),
+        42,
+    );
+
+    expect($containersByDestination)->toBeInstanceOf(Collection::class)
+        ->and($action->containerInspectionCalls)->toBe([
+            ['server_id' => 97, 'application_id' => 42],
+        ])
+        ->and($containersByDestination?->keys()->all())->toBe([21, 22])
+        ->and($containersByDestination?->get(21))->toBe($containersByDestination?->get(22))
+        ->and($containersByDestination?->get(21))->toBeEmpty();
+});
 
 it('returns the routed predecessor image while a candidate rollback is active', function () {
     $predecessorId = str_repeat('a', 64);
