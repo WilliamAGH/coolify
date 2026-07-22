@@ -78,6 +78,23 @@ it('builds Git LFS from pinned upstream Go source instead of an Alpine package',
         ->not->toContain('--allow-untrusted');
 });
 
+it('builds cloudflared with the patched pinned gRPC dependency', function (): void {
+    $root = productionImageRuntimeContentRoot();
+    $dockerfile = (string) file_get_contents($root.'/docker/production/Dockerfile');
+
+    expect($dockerfile)
+        ->toContain('ARG CLOUDFLARED_GRPC_VERSION=v1.82.1')
+        ->toContain('ARG CLOUDFLARED_GO_MOD_SHA256=fb1684e0932f9601704dd9e9db9c113c1a38c1e43d26f3e54eff3ba9121ece66')
+        ->toContain('ARG CLOUDFLARED_GO_SUM_SHA256=e5443cd65101e0e995c19c7f200bfbdc4ee0fe0f24b387947ae5c2cb9fa736aa')
+        ->toContain('ARG CLOUDFLARED_VENDOR_MODULES_SHA256=4fe26f81ee87a6efee7ba2a84f76945d5067e2ca6f1d48c8c47a8f19490a6f64')
+        ->toContain('go get "google.golang.org/grpc@${CLOUDFLARED_GRPC_VERSION}"')
+        ->toContain('go mod verify')
+        ->toContain('go mod vendor')
+        ->toContain('go version -m /out/cloudflared')
+        ->toContain('$2 == "google.golang.org/grpc" && $3 == expected')
+        ->toContain('cloudflared --version | grep -F "cloudflared version ${CLOUDFLARED_VERSION}"');
+});
+
 it('generates and fences Windows testing-host key material with named volumes', function (): void {
     $root = productionImageRuntimeContentRoot();
 

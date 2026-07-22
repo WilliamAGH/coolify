@@ -822,6 +822,15 @@ jobs:
           [ "$VULNERABILITY_OUTCOME" = success ]
           [ "$SECRET_OUTCOME" = success ]
 
+      - name: Retain failed local vulnerability report
+        if: ${{ !cancelled() && steps.vulnerability.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          if-no-files-found: error
+          name: linux-vulnerability-${{ inputs.artifact_name }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.arch }}
+          path: linux-image/${{ inputs.artifact_name }}-${{ matrix.arch }}.vulnerabilities.json
+          retention-days: 7
+
       - name: Verify the exact testing-host OCI archive and runtime
         if: ${{ inputs.release_kind == 'testing-host' }}
         env:
@@ -1761,6 +1770,15 @@ jobs:
           [ "$SBOM_OUTCOME" = success ]
           [ "$VULNERABILITY_OUTCOME" = success ]
           [ "$SECRET_OUTCOME" = success ]
+
+      - name: Retain failed fork vulnerability report
+        if: ${{ !cancelled() && steps.fork-vulnerability.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          if-no-files-found: error
+          name: fork-vulnerability-${{ matrix.artifact_name }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.arch }}
+          path: fork-image/${{ matrix.artifact_name }}-${{ matrix.arch }}.vulnerabilities.json
+          retention-days: 7
 
       - name: Retain verified fork OCI evidence
         if: success()
