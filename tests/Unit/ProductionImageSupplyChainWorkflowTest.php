@@ -516,7 +516,6 @@ function releaseWorkflowNegativeCases(): array
 }
 
 /** @return list<string> */
-/** @return list<string> */
 function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $applicationValidationWorkflow, array $callers): array
 {
     $violations = [];
@@ -1294,6 +1293,60 @@ SH,
 
     return array_values(array_unique($violations));
 }
+
+it('retains failed vulnerability reports without retaining unverified OCI candidates', function (
+    string $jobName,
+    string $reportStepName,
+    string $guard,
+    string $artifactName,
+    string $reportPath,
+    string $verifiedStepName,
+): void {
+    $workflow = Yaml::parseFile(releaseWorkflowRepositoryRoot().'/.github/workflows/publish-linux-image.yml');
+    $job = $workflow['jobs'][$jobName] ?? [];
+    $report = releaseWorkflowStep($job, $reportStepName);
+    $violations = static function (array $step) use ($guard, $artifactName, $reportPath): array {
+        return array_values(array_filter([
+            ($step['if'] ?? null) === $guard ? null : 'failure-only guard',
+            ($step['uses'] ?? null) === 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' ? null : 'pinned uploader',
+            ($step['with'] ?? null) === [
+                'if-no-files-found' => 'error',
+                'name' => $artifactName,
+                'path' => $reportPath,
+                'retention-days' => 7,
+            ] ? null : 'report-only artifact',
+        ]));
+    };
+
+    expect($violations($report))->toBe([])
+        ->and(releaseWorkflowStep($job, $verifiedStepName)['if'] ?? null)->toBe('success()');
+
+    $mutated = $report;
+    $mutated['if'] = 'success()';
+    expect($violations($mutated))->toContain('failure-only guard');
+
+    if ($jobName === 'fork-build') {
+        expect($workflow['jobs']['fork-stage']['if'] ?? null)
+            ->toBe('${{ inputs.release_kind == \'fork\' && needs.fork-build.result == \'success\' }}');
+    }
+})->with([
+    'shared publisher' => [
+        'build-and-scan',
+        'Retain failed local vulnerability report',
+        '${{ !cancelled() && steps.vulnerability.outcome == \'failure\' }}',
+        'linux-vulnerability-${{ inputs.artifact_name }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.arch }}',
+        'linux-image/${{ inputs.artifact_name }}-${{ matrix.arch }}.vulnerabilities.json',
+        'Retain gated OCI evidence',
+    ],
+    'fork publisher' => [
+        'fork-build',
+        'Retain failed fork vulnerability report',
+        '${{ !cancelled() && steps.fork-vulnerability.outcome == \'failure\' }}',
+        'fork-vulnerability-${{ matrix.artifact_name }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.arch }}',
+        'fork-image/${{ matrix.artifact_name }}-${{ matrix.arch }}.vulnerabilities.json',
+        'Retain verified fork OCI evidence',
+    ],
+]);
 
 it('keeps signed fork tags and native hosted builders as the only release authority', function (): void {
     $root = releaseWorkflowRepositoryRoot();

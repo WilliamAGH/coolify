@@ -23,6 +23,11 @@ ARG CLOUDFLARED_TAG=2026.7.1
 ARG CLOUDFLARED_COMMIT=ecb88678f1368581964ca2bb55615502a2ed2dbe
 ARG CLOUDFLARED_SOURCE_SHA256=94a8f8e057bf4eec41416d6db56a5f8379b833fd40fdce4dcdc668b8cb6b5c65
 ARG CLOUDFLARED_RELEASE_DATE=2026-07-09-12:06
+# https://github.com/advisories/GHSA-hrxh-6v49-42gf
+ARG CLOUDFLARED_GRPC_VERSION=v1.82.1
+ARG CLOUDFLARED_GO_MOD_SHA256=fb1684e0932f9601704dd9e9db9c113c1a38c1e43d26f3e54eff3ba9121ece66
+ARG CLOUDFLARED_GO_SUM_SHA256=e5443cd65101e0e995c19c7f200bfbdc4ee0fe0f24b387947ae5c2cb9fa736aa
+ARG CLOUDFLARED_VENDOR_MODULES_SHA256=4fe26f81ee87a6efee7ba2a84f76945d5067e2ca6f1d48c8c47a8f19490a6f64
 # https://www.postgresql.org/support/versioning/
 # Note: We are using version 18 of the postgres client (while still using postgres 15 for the postgres server) as version 15 has been removed from Alpine 3.23+ https://pkgs.alpinelinux.org/packages?name=postgresql*-client&branch=v3.23&repo=&arch=x86_64&origin=&flagged=&maintainer=
 ARG POSTGRES_VERSION=18
@@ -123,11 +128,29 @@ ARG CLOUDFLARED_VERSION
 ARG CLOUDFLARED_COMMIT
 ARG CLOUDFLARED_SOURCE_SHA256
 ARG CLOUDFLARED_RELEASE_DATE
+ARG CLOUDFLARED_GRPC_VERSION
+ARG CLOUDFLARED_GO_MOD_SHA256
+ARG CLOUDFLARED_GO_SUM_SHA256
+ARG CLOUDFLARED_VENDOR_MODULES_SHA256
+
+ENV GOTOOLCHAIN=local \
+    GOPROXY=https://proxy.golang.org \
+    GOSUMDB=sum.golang.org
 
 RUN curl -fSsL "https://github.com/cloudflare/cloudflared/archive/${CLOUDFLARED_COMMIT}.tar.gz" -o /tmp/cloudflared.tar.gz && \
     echo "${CLOUDFLARED_SOURCE_SHA256}  /tmp/cloudflared.tar.gz" | sha256sum -c - && \
     tar -xzf /tmp/cloudflared.tar.gz --strip-components=1 && \
     test -f vendor/modules.txt
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go get "google.golang.org/grpc@${CLOUDFLARED_GRPC_VERSION}" && \
+    echo "${CLOUDFLARED_GO_MOD_SHA256}  go.mod" | sha256sum -c - && \
+    echo "${CLOUDFLARED_GO_SUM_SHA256}  go.sum" | sha256sum -c - && \
+    go mod download && \
+    go mod verify && \
+    go mod vendor && \
+    echo "${CLOUDFLARED_VENDOR_MODULES_SHA256}  vendor/modules.txt" | sha256sum -c - && \
+    test "$(go env GOVERSION)" = 'go1.26.5'
 
 # Cloudflare's Makefile builds with GOOS/GOARCH, -mod=vendor, and these version fields.
 RUN --mount=type=cache,target=/root/.cache/go-build \
@@ -142,6 +165,8 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
         -ldflags="-X main.Version=${CLOUDFLARED_VERSION} -X \"main.BuildTime=${CLOUDFLARED_RELEASE_DATE} UTC\"" \
         -o /out/cloudflared \
         github.com/cloudflare/cloudflared/cmd/cloudflared
+
+RUN go version -m /out/cloudflared | awk -v expected="${CLOUDFLARED_GRPC_VERSION}" '$1 == "dep" && $2 == "google.golang.org/grpc" && $3 == expected { found = 1 } END { exit found ? 0 : 1 }'
 
 # =================================================================
 # Stage 6: Git LFS from checksum-verified source and Go modules
@@ -202,6 +227,7 @@ ARG POSTGRES_VERSION
 ARG SU_EXEC_VERSION
 ARG GIT_LFS_VERSION
 ARG GIT_LFS_COMMIT
+ARG CLOUDFLARED_VERSION
 ARG NGINX_VERSION
 ARG NGINX_APK_SIGNER_FILE_SHA256
 ARG NGINX_APK_SIGNER_FINGERPRINT_SHA256
@@ -260,7 +286,9 @@ COPY --from=cloudflared-builder --chmod=755 /out/cloudflared /usr/local/bin/clou
 
 RUN test "$(command -v git-lfs)" = /usr/local/bin/git-lfs && \
     ! apk info -e git-lfs >/dev/null 2>&1 && \
-    git lfs version | grep -E "^git-lfs/${GIT_LFS_VERSION} \\(GitHub; linux ${TARGETARCH}; go 1\\.26\\.5; git ${GIT_LFS_COMMIT}\\)$"
+    git lfs version | grep -E "^git-lfs/${GIT_LFS_VERSION} \\(GitHub; linux ${TARGETARCH}; go 1\\.26\\.5; git ${GIT_LFS_COMMIT}\\)$" && \
+    test "$(command -v cloudflared)" = /usr/local/bin/cloudflared && \
+    cloudflared --version | grep -F "cloudflared version ${CLOUDFLARED_VERSION}"
 
 # Configure PHP
 COPY docker/production/etc/php/conf.d/zzz-custom-php.ini /usr/local/etc/php/conf.d/zzz-custom-php.ini
