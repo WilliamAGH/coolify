@@ -6,7 +6,23 @@ All notable changes to this project will be documented in this file.
 
 ### 📚 Documentation
 
+- Update changelog (#115)
+
+## [4.13.8-fork] - 2026-07-21
+
+### 🐛 Bug Fixes
+
+- *(deployments)* Fence active container provenance
+- *(deployments)* Replace empty provenance labels
+- *(compose)* Preserve raw label representation
+
+### 📚 Documentation
+
 - Update changelog (#113)
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Reserve 4.13.9 fork
 
 ## [4.13.7-fork] - 2026-07-21
 
