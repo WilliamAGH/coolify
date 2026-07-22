@@ -6,6 +6,16 @@ All notable changes to this project will be documented in this file.
 
 ### 🐛 Bug Fixes
 
+- *(release)* Patch bundled cloudflared grpc
+
+### 📚 Documentation
+
+- Update changelog (#119)
+
+## [4.13.10-fork] - 2026-07-22
+
+### 🐛 Bug Fixes
+
 - *(proxy)* Finalize control-plane enrollment ownership
 - *(proxy)* Render unambiguous rollback guards
 
