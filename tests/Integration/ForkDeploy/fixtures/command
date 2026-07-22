@@ -19,6 +19,12 @@ control_plane_listener_override_is_active() {
             found = 1
             exit
         }
+        in_coolify && $0 ~ /^    ports:[[:space:]]*!reset[[:space:]]*$/ {
+            if (getline > 0 && $0 ~ /^      \{[[:space:]]*\}[[:space:]]*$/) {
+                found = 1
+            }
+            exit
+        }
         END { exit !found }
     ' "$path"
 }
