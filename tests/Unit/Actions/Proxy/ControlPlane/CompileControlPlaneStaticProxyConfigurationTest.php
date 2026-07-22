@@ -54,6 +54,7 @@ it('moves the canonical APP_PORT listener to Traefik with public exposure by def
         ->and(data_get($proxy, 'services.traefik.volumes'))->toBe(['/data/coolify/proxy:/traefik'])
         ->and(data_get($override, 'services.coolify.ports'))->toBeInstanceOf(TaggedValue::class)
         ->and(data_get($override, 'services.coolify.ports')->getTag())->toBe('reset')
+        ->and($configuration->sourceOverrideYaml)->toContain('    ports: !reset []')
         ->and($configuration->predecessorProxyYaml)->toBe(controlPlaneProxyCompose())
         ->and($configuration->replacementProxySha256)->toBe(hash('sha256', $configuration->replacementProxyYaml));
 });
@@ -103,19 +104,20 @@ it('adds only hashed proof credentials and immutable backend identity to the sou
         'COOLIFY_TRAEFIK_ATTESTOR_PROBE_HOST' => 'dashboard.example.test',
         'COOLIFY_TRAEFIK_ATTESTOR_PROBE_URL' => 'http://host.docker.internal:8000/api/health',
         'COOLIFY_TRAEFIK_ATTESTOR_SERVER_ID' => '42',
-    ])->and(data_get($override, 'services.coolify.volumes'))->toBe([
-        [
-            'type' => 'bind',
-            'source' => '/data/coolify/proxy',
-            'target' => '/var/www/html/storage/app/control-plane-proxy',
-            'read_only' => true,
-        ],
-        [
-            'type' => 'bind',
-            'source' => '/data/coolify/control-plane-attestor',
-            'target' => '/var/www/html/storage/app/control-plane-attestor',
-        ],
-    ]);
+    ])->and($configuration->sourceOverrideYaml)->toContain('    ports: !reset []')
+        ->and(data_get($override, 'services.coolify.volumes'))->toBe([
+            [
+                'type' => 'bind',
+                'source' => '/data/coolify/proxy',
+                'target' => '/var/www/html/storage/app/control-plane-proxy',
+                'read_only' => true,
+            ],
+            [
+                'type' => 'bind',
+                'source' => '/data/coolify/control-plane-attestor',
+                'target' => '/var/www/html/storage/app/control-plane-attestor',
+            ],
+        ]);
 });
 
 it('reapplies the managed listener to a newly generated canonical proxy configuration', function () {

@@ -59,13 +59,13 @@ class CompileControlPlaneStaticProxyConfiguration
         }
 
         $replacementProxyYaml = $this->compileProxyConfiguration($proxyComposeYaml, $exposure);
-        $sourceOverrideYaml = Yaml::dump([
+        $sourceOverrideYaml = $this->dumpCompose([
             'services' => [
                 'coolify' => [
                     'ports' => new TaggedValue('reset', []),
                 ],
             ],
-        ], 6, 2, Yaml::DUMP_OBJECT_AS_MAP | Yaml::DUMP_EXCEPTION_ON_INVALID_TYPE);
+        ]);
 
         return new ControlPlaneStaticProxyConfiguration(
             predecessorProxyYaml: $proxyComposeYaml,
@@ -202,7 +202,9 @@ class CompileControlPlaneStaticProxyConfiguration
     /** @param array<string, mixed> $compose */
     private function dumpCompose(array $compose): string
     {
-        return Yaml::dump($compose, 12, 2, Yaml::DUMP_OBJECT_AS_MAP | Yaml::DUMP_EXCEPTION_ON_INVALID_TYPE);
+        $yaml = Yaml::dump($compose, 12, 2, Yaml::DUMP_OBJECT_AS_MAP | Yaml::DUMP_EXCEPTION_ON_INVALID_TYPE | Yaml::DUMP_EMPTY_ARRAY_AS_SEQUENCE);
+
+        return str_replace("    ports: !reset\n      []", '    ports: !reset []', $yaml);
     }
 
     private function publishesContainerPort(mixed $publication, int $containerPort): bool
