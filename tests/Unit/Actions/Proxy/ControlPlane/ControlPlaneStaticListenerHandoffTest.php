@@ -434,3 +434,67 @@ it('resumes an interrupted static listener rollback from its durable journal', f
         $filesystem->remove($fixture['root']);
     }
 });
+
+it('reclaims an exact interrupted rollback journal from the legacy runtime uid before replay', function (): void {
+    $filesystem = new Filesystem;
+    $state = staticListenerHandoffState()
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::RollingBack, '2026-07-19T00:01:00Z');
+    $fixture = staticListenerHandoffFixtures($state);
+
+    try {
+        $writer = staticListenerHandoffWriter($fixture);
+        expect(runStaticListenerHandoffCommand($writer->commandFor($state), $fixture)->isSuccessful())->toBeTrue();
+        $interrupted = runStaticListenerHandoffCommand(
+            $writer->rollbackCommandFor($state, $state->operationId, 'test-token'),
+            $fixture,
+            ['COOLIFY_CONTROL_PLANE_ROLLBACK_FAIL_AFTER_TRAEFIK' => '1'],
+        );
+        expect($interrupted->isSuccessful())->toBeFalse()
+            ->and(file_get_contents($fixture['rollback_journal']))->toContain('phase=rolling-back');
+
+        file_put_contents($fixture['bin'].'/stat', <<<'SH'
+#!/bin/sh
+set -eu
+
+last=
+for argument in "$@"; do last=$argument; done
+if [ "$last" = "$LEGACY_JOURNAL_PATH" ] && [ ! -e "$LEGACY_JOURNAL_STATE/reclaimed" ]; then
+  case "$*" in
+    *%u*) printf '%s\n' 9999; exit 0 ;;
+  esac
+fi
+exec /usr/bin/stat "$@"
+SH
+        );
+        file_put_contents($fixture['bin'].'/chown', <<<'SH'
+#!/bin/sh
+set -eu
+
+[ "$#" = 3 ] || exit 1
+[ "$1" = -h ] || exit 1
+[ "$2" = "$(id -u):$(id -g)" ] || exit 1
+[ "$3" = "$LEGACY_JOURNAL_PATH" ] || exit 1
+: > "$LEGACY_JOURNAL_STATE/reclaimed"
+SH
+        );
+        chmod($fixture['bin'].'/stat', 0700);
+        chmod($fixture['bin'].'/chown', 0700);
+
+        $resumed = runStaticListenerHandoffCommand(
+            $writer->rollbackCommandFor($state, $state->operationId, 'test-token'),
+            $fixture,
+            [
+                'LEGACY_JOURNAL_PATH' => $fixture['rollback_journal'],
+                'LEGACY_JOURNAL_STATE' => $fixture['state'],
+            ],
+        );
+
+        expect($resumed->isSuccessful())->toBeTrue()
+            ->and(trim($resumed->getOutput()))->toBe(ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT)
+            ->and(file_exists($fixture['state'].'/reclaimed'))->toBeTrue()
+            ->and(fileperms($fixture['rollback_journal']) & 0777)->toBe(0600)
+            ->and(file_get_contents($fixture['rollback_journal']))->toContain('phase=rolled-back');
+    } finally {
+        $filesystem->remove($fixture['root']);
+    }
+});
