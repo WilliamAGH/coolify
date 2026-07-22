@@ -126,6 +126,7 @@ docker() {
     *) return 1 ;;
   esac
 }
+
 sleep() { :; }
 SH;
         $output = [];
@@ -138,6 +139,23 @@ SH;
 
         return $exitCode === 0 ? implode("\n", $output) : null;
     };
+}
+
+function preparedEnrollmentAbortMutation(array $fixture): ManagedTraefikDocumentMutation
+{
+    return new ManagedTraefikDocumentMutation(
+        dynamicDirectory: $fixture['proxy'].'/dynamic',
+        stateDirectory: $fixture['proxy'].'/.control-plane-managed-traefik',
+        filename: $fixture['state']->managedFilename,
+        operationId: $fixture['state']->operationId,
+        revision: $fixture['state']->dynamicRevision,
+        expectedSha256: $fixture['state']->dynamicPredecessorBytes === null
+            ? null
+            : hash('sha256', $fixture['state']->dynamicPredecessorBytes),
+        expectedOperationId: null,
+        expectedRevision: null,
+        replacementBytes: $fixture['state']->dynamicReplacementBytes,
+    );
 }
 
 it('serializes enrollment mutations on a dedicated postgres session lock', function (): void {
@@ -304,23 +322,16 @@ it('aborts an activating enrollment after its host artifacts rolled back exactly
     $fixture = preparedEnrollmentAbortFixture(ControlPlaneProxyEnrollmentPhase::Activating);
     $this->preparedAbortRoot = $fixture['root'];
     (new Filesystem)->makeDirectory($fixture['proxy'].'/.control-plane-managed-traefik', 0700);
-    $mutation = new ManagedTraefikDocumentMutation(
-        dynamicDirectory: $fixture['proxy'].'/dynamic',
-        stateDirectory: $fixture['proxy'].'/.control-plane-managed-traefik',
-        filename: $fixture['state']->managedFilename,
-        operationId: $fixture['state']->operationId,
-        revision: $fixture['state']->dynamicRevision,
-        expectedSha256: null,
-        expectedOperationId: null,
-        expectedRevision: null,
-        replacementBytes: $fixture['state']->dynamicReplacementBytes,
-    );
+    $mutation = preparedEnrollmentAbortMutation($fixture);
     file_put_contents($mutation->lockPath(), '');
     file_put_contents($mutation->sidecarPath(), $mutation->replacementSidecar());
     file_put_contents(
         $mutation->rollbackArtifactPath(),
         (new ManagedTraefikDocumentWriter)->rollbackArtifactFor($mutation, null),
     );
+    $scratch = $mutation->stateDirectory.'/.managed-traefik-document.interrupted';
+    (new Filesystem)->makeDirectory($scratch, 0700);
+    file_put_contents($scratch.'/expected-sidecar', '');
     $artifactExecutor = $fixture['remote'];
     $commands = [];
     $fixture['server']->proxy->set('last_saved_settings', md5(base64_encode($fixture['state']->staticReplacementBytes)));
@@ -341,12 +352,31 @@ it('aborts an activating enrollment after its host artifacts rolled back exactly
         ->and($fixture['server']->fresh()?->proxy->get('last_saved_settings'))->toBe(md5(base64_encode($fixture['state']->staticPredecessorBytes)));
 });
 
-it('keeps an activating owner when a visible sidecar has no matching rollback artifact', function (): void {
+it('keeps an activating owner unless its managed state is exactly recoverable', function (string $scenario): void {
     $fixture = preparedEnrollmentAbortFixture(ControlPlaneProxyEnrollmentPhase::Activating);
     $this->preparedAbortRoot = $fixture['root'];
     (new Filesystem)->makeDirectory($fixture['proxy'].'/.control-plane-managed-traefik', 0700);
-    file_put_contents($fixture['proxy'].'/.control-plane-managed-traefik/.coolify.yaml.lock', '');
-    file_put_contents($fixture['proxy'].'/.control-plane-managed-traefik/.coolify.yaml.state.json', "{}\n");
+    $mutation = preparedEnrollmentAbortMutation($fixture);
+    if ($scenario !== 'missing lock') {
+        file_put_contents($mutation->lockPath(), '');
+    }
+    file_put_contents(
+        $mutation->sidecarPath(),
+        $scenario === 'malformed sidecar' ? "{}\n" : $mutation->replacementSidecar(),
+    );
+    if ($scenario !== 'missing artifact') {
+        file_put_contents(
+            $mutation->rollbackArtifactPath(),
+            $scenario === 'malformed artifact'
+                ? "rollback\n"
+                : (new ManagedTraefikDocumentWriter)->rollbackArtifactFor($mutation, null),
+        );
+    }
+    if ($scenario === 'unknown journal') {
+        file_put_contents($mutation->journalPath(), "journal\n");
+    } elseif ($scenario === 'foreign authority') {
+        file_put_contents($mutation->stateDirectory.'/.'.$mutation->filename.'.writer-authority.json', "{}\n");
+    }
     $commands = [];
     $remoteExecutor = preparedEnrollmentRuntimeExecutor($fixture['remote'], 'valid', $commands);
 
@@ -356,9 +386,9 @@ it('keeps an activating owner when a visible sidecar has no matching rollback ar
         'wrong.example.test',
         'old-revision',
         $remoteExecutor,
-    ))->toThrow(RuntimeException::class, 'absent or regular directory')
+    ))->toThrow(RuntimeException::class)
         ->and($fixture['store']->read($fixture['server'])?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Activating);
-});
+})->with(['missing lock', 'missing artifact', 'malformed sidecar', 'malformed artifact', 'unknown journal', 'foreign authority']);
 
 it('keeps an activating owner unless exact legacy runtime ownership is proved', function (?string $evidence): void {
     $fixture = preparedEnrollmentAbortFixture(ControlPlaneProxyEnrollmentPhase::Activating);

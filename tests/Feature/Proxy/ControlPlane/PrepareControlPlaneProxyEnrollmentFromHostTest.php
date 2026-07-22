@@ -302,7 +302,7 @@ it('holds the enrollment operation fence through reconciliation and replacement 
     config()->set("database.connections.{$connectionName}", config('database.connections.'.DB::getDefaultConnection()));
     $competitor = DB::connection($connectionName);
     $lockName = StoreControlPlaneProxyEnrollmentState::operationLockName($server->getKey());
-    $sourceCompose = "services:\n  coolify:\n    image: coolify:test\n";
+    $sourceCompose = "services:\n  coolify:\n    image: coolify:test\n    ports:\n      - \"\${APP_PORT:-8000}:8080\"\n";
     $competingLockResults = [];
 
     try {
