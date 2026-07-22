@@ -115,8 +115,12 @@ function executableControlPlaneWriterInspectionTranscript(): string
 it('persists rollback before self-replacement and requires a fresh replay to finish', function (): void {
     [$server, $store, $action] = executableControlPlaneRollback();
     $calls = 0;
-    $executor = function (string $command) use (&$calls): string {
+    $staticHandoffCommand = null;
+    $executor = function (string $command) use (&$calls, &$staticHandoffCommand): string {
         $calls++;
+        if (str_contains($command, ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT)) {
+            $staticHandoffCommand = $command;
+        }
 
         return match (true) {
             str_contains($command, NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT) => NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT,
@@ -140,6 +144,7 @@ it('persists rollback before self-replacement and requires a fresh replay to fin
         ->and($rolledBack->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack)
         ->and($replayed->toArray())->toBe($rolledBack->toArray())
         ->and($calls)->toBe(14)
+        ->and($staticHandoffCommand)->toContain("sed -n 's/^[^ ]* -> //p'")
         ->and($server->fresh()?->proxy->get('last_saved_proxy_configuration'))->toBe($rolledBack->staticPredecessorBytes)
         ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack);
 });

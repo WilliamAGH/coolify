@@ -10,6 +10,7 @@ use App\Models\Server;
 use App\Models\Team;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\DB;
 
 uses(RefreshDatabase::class);
 
@@ -78,6 +79,98 @@ function preparedEnrollmentAbortFixture(
         'action' => new AbortPreparedControlPlaneProxyEnrollment($store, $proxyPath, $sourcePath),
     ];
 }
+
+function preparedEnrollmentRuntimeExecutor(Closure $artifactExecutor, string $scenario, array &$commands): Closure
+{
+    return static function (string $command) use ($artifactExecutor, $scenario, &$commands): ?string {
+        $commands[] = $command;
+        if (! str_contains($command, '__COOLIFY_CONTROL_PLANE_LEGACY_RUNTIME__')) {
+            return $artifactExecutor($command);
+        }
+
+        $censusFile = tempnam(sys_get_temp_dir(), 'coolify-port-census-');
+        if ($censusFile === false) {
+            throw new RuntimeException('Unable to create the Docker census fixture.');
+        }
+
+        $fakeDocker = <<<'SH'
+scenario=$1
+counter_file=$2
+shift
+docker() {
+  subcommand=$1
+  shift
+  case "$subcommand" in
+    inspect) printf true ;;
+    ps)
+      printf x >> "$counter_file"
+      census_round=$(wc -c < "$counter_file")
+      printf '%s\n' coolify coolify-proxy
+      if [ "$scenario" = duplicate-ipv6 ] || { [ "$scenario" = second-round-duplicate-ipv6 ] && [ "$census_round" -ge 2 ]; }; then printf '%s\n' rogue; fi
+      ;;
+    port)
+      container=$1
+      requested_port=${2:-}
+      if [ "$scenario" = port-failure ] && [ "$container" = coolify-proxy ]; then return 1; fi
+      case "$container:$requested_port" in
+        coolify:8080/tcp) printf '%s\n' '0.0.0.0:8000' '[::]:8000' ;;
+        coolify:) printf '%s\n' '8080/tcp -> 0.0.0.0:8000' '8080/tcp -> [::]:8000' ;;
+        coolify-proxy:) printf '%s\n' '80/tcp -> 0.0.0.0:80' '443/tcp -> 0.0.0.0:443' ;;
+        rogue:) printf '%s\n' '9000/tcp -> [::]:8000' ;;
+        *) return 1 ;;
+      esac
+      ;;
+    *) return 1 ;;
+  esac
+}
+sleep() { :; }
+SH;
+        $output = [];
+        $exitCode = 0;
+        try {
+            exec('sh -c '.escapeshellarg($fakeDocker."\n".$command).' sh '.escapeshellarg($scenario).' '.escapeshellarg($censusFile), $output, $exitCode);
+        } finally {
+            unlink($censusFile);
+        }
+
+        return $exitCode === 0 ? implode("\n", $output) : null;
+    };
+}
+
+it('serializes enrollment mutations on a dedicated postgres session lock', function (): void {
+    if (DB::getDriverName() !== 'pgsql') {
+        $this->markTestSkipped('PostgreSQL is required for the enrollment serialization assertion.');
+    }
+    $fixture = preparedEnrollmentAbortFixture();
+    $this->preparedAbortRoot = $fixture['root'];
+    $connectionName = 'control_plane_enrollment_lock_competitor';
+    config()->set("database.connections.{$connectionName}", config('database.connections.'.DB::getDefaultConnection()));
+    $competitor = DB::connection($connectionName);
+    $lockName = 'coolify:control-plane-proxy-enrollment:'.$fixture['server']->getKey();
+
+    try {
+        $fixture['store']->serializeOperation($fixture['server'], function () use ($competitor, $lockName): void {
+            $result = $competitor->selectOne(
+                'select case when pg_try_advisory_lock(hashtextextended(?, 0)) then 1 else 0 end as acquired',
+                [$lockName],
+                false,
+            );
+
+            expect((int) $result->acquired)->toBe(0);
+        });
+
+        $released = $competitor->selectOne(
+            'select case when pg_try_advisory_lock(hashtextextended(?, 0)) then 1 else 0 end as acquired',
+            [$lockName],
+            false,
+        );
+        expect((int) $released->acquired)->toBe(1);
+        $competitor->selectOne('select pg_advisory_unlock(hashtextextended(?, 0))', [$lockName], false);
+    } finally {
+        DB::purge($connectionName);
+        config()->set("database.connections.{$connectionName}", null);
+    }
+});
 
 it('aborts only an unchanged prepared local enrollment and admits a new owner', function (): void {
     $fixture = preparedEnrollmentAbortFixture();
@@ -199,21 +292,67 @@ it('refuses a prepared abort when an identity fence differs', function (string $
     'revision' => ['stale-prepared-enrollment', 'wrong.example.test', 'another-revision'],
 ]);
 
-it('refuses a prepared abort after activation owns the operation', function (): void {
+it('aborts an activating enrollment after its host artifacts rolled back exactly', function (): void {
     $fixture = preparedEnrollmentAbortFixture(ControlPlaneProxyEnrollmentPhase::Activating);
     $this->preparedAbortRoot = $fixture['root'];
+    $artifactExecutor = $fixture['remote'];
+    $commands = [];
+    $fixture['server']->proxy->set('last_saved_settings', md5(base64_encode($fixture['state']->staticReplacementBytes)));
+    $fixture['server']->proxy->set('last_saved_proxy_configuration', $fixture['state']->staticReplacementBytes);
+    $fixture['server']->save();
+    $remoteExecutor = preparedEnrollmentRuntimeExecutor($artifactExecutor, 'valid', $commands);
+
+    expect($fixture['action']->handle(
+        $fixture['server'],
+        'stale-prepared-enrollment',
+        'wrong.example.test',
+        'old-revision',
+        $remoteExecutor,
+    )->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack)
+        ->and($fixture['store']->read($fixture['server'])?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack)
+        ->and($commands)->toHaveCount(5)
+        ->and($fixture['server']->fresh()?->proxy->get('last_saved_proxy_configuration'))->toBe($fixture['state']->staticPredecessorBytes)
+        ->and($fixture['server']->fresh()?->proxy->get('last_saved_settings'))->toBe(md5(base64_encode($fixture['state']->staticPredecessorBytes)));
+});
+
+it('keeps an activating owner unless exact legacy runtime ownership is proved', function (?string $evidence): void {
+    $fixture = preparedEnrollmentAbortFixture(ControlPlaneProxyEnrollmentPhase::Activating);
+    $this->preparedAbortRoot = $fixture['root'];
+    $artifactExecutor = $fixture['remote'];
+    $remoteExecutor = static function (string $command) use ($artifactExecutor, $evidence): ?string {
+        return str_contains($command, '__COOLIFY_CONTROL_PLANE_LEGACY_RUNTIME__')
+            ? $evidence
+            : $artifactExecutor($command);
+    };
 
     expect(fn () => $fixture['action']->handle(
         $fixture['server'],
         'stale-prepared-enrollment',
         'wrong.example.test',
         'old-revision',
-        $fixture['remote'],
-    ))->toThrow(RuntimeException::class, 'abort fence does not match');
-});
+        $remoteExecutor,
+    ))->toThrow(RuntimeException::class, 'exact legacy runtime ownership')
+        ->and($fixture['store']->read($fixture['server'])?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Activating);
+})->with(['malformed', null]);
 
-it('refuses a prepared abort when any activation artifact exists', function (string $artifact): void {
-    $fixture = preparedEnrollmentAbortFixture();
+it('rejects an activating abort on duplicate IPv6 ownership or Docker inspection failure', function (string $scenario): void {
+    $fixture = preparedEnrollmentAbortFixture(ControlPlaneProxyEnrollmentPhase::Activating);
+    $this->preparedAbortRoot = $fixture['root'];
+    $commands = [];
+    $remoteExecutor = preparedEnrollmentRuntimeExecutor($fixture['remote'], $scenario, $commands);
+
+    expect(fn () => $fixture['action']->handle(
+        $fixture['server'],
+        'stale-prepared-enrollment',
+        'wrong.example.test',
+        'old-revision',
+        $remoteExecutor,
+    ))->toThrow(RuntimeException::class, 'exact legacy runtime ownership')
+        ->and($fixture['store']->read($fixture['server'])?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Activating);
+})->with(['duplicate-ipv6', 'second-round-duplicate-ipv6', 'port-failure']);
+
+it('refuses an abort when any activation artifact exists', function (ControlPlaneProxyEnrollmentPhase $phase, string $artifact): void {
+    $fixture = preparedEnrollmentAbortFixture($phase);
     $this->preparedAbortRoot = $fixture['root'];
     if ($artifact === 'override') {
         file_put_contents($fixture['source'].'/docker-compose.control-plane-listener.yml', "services: {}\n");
@@ -235,8 +374,34 @@ it('refuses a prepared abort when any activation artifact exists', function (str
         'old-revision',
         $fixture['remote'],
     ))->toThrow(RuntimeException::class)
-        ->and($fixture['store']->read($fixture['server'])?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Prepared);
-})->with(['override', 'state', 'state symlink', 'state file', 'dynamic']);
+        ->and($fixture['store']->read($fixture['server'])?->phase)->toBe($phase);
+})->with([
+    'prepared override' => [ControlPlaneProxyEnrollmentPhase::Prepared, 'override'],
+    'prepared state' => [ControlPlaneProxyEnrollmentPhase::Prepared, 'state'],
+    'prepared state symlink' => [ControlPlaneProxyEnrollmentPhase::Prepared, 'state symlink'],
+    'prepared state file' => [ControlPlaneProxyEnrollmentPhase::Prepared, 'state file'],
+    'prepared dynamic' => [ControlPlaneProxyEnrollmentPhase::Prepared, 'dynamic'],
+    'activating override' => [ControlPlaneProxyEnrollmentPhase::Activating, 'override'],
+    'activating state' => [ControlPlaneProxyEnrollmentPhase::Activating, 'state'],
+    'activating dynamic' => [ControlPlaneProxyEnrollmentPhase::Activating, 'dynamic'],
+]);
+
+it('refuses an abort when the durable state names another server', function (): void {
+    $fixture = preparedEnrollmentAbortFixture();
+    $this->preparedAbortRoot = $fixture['root'];
+    $stored = $fixture['state']->toArray();
+    $stored['server_id'] = 1;
+    $fixture['server']->proxy->set(StoreControlPlaneProxyEnrollmentState::STATE_KEY, $stored);
+    $fixture['server']->save();
+
+    expect(fn () => $fixture['action']->handle(
+        $fixture['server'],
+        'stale-prepared-enrollment',
+        'wrong.example.test',
+        'old-revision',
+        $fixture['remote'],
+    ))->toThrow(RuntimeException::class, 'abort fence does not match');
+});
 
 it('refuses mismatched predecessor bytes and non-local servers', function (): void {
     $fixture = preparedEnrollmentAbortFixture();

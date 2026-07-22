@@ -2,7 +2,9 @@
 
 namespace App\Actions\Proxy\ControlPlane;
 
+use App\Actions\Proxy\SaveProxyConfiguration;
 use App\Models\Server;
+use Closure;
 use Illuminate\Support\Facades\DB;
 use Lorisleiva\Actions\Concerns\AsAction;
 use RuntimeException;
@@ -12,6 +14,29 @@ final class StoreControlPlaneProxyEnrollmentState
     use AsAction;
 
     public const STATE_KEY = 'control_plane_proxy_enrollment';
+
+    public function serializeOperation(Server $server, Closure $operation): mixed
+    {
+        $connection = DB::connection();
+        if ($connection->getDriverName() === 'sqlite') {
+            return $operation($server);
+        }
+        if ($connection->getDriverName() !== 'pgsql') {
+            throw new RuntimeException('Control-plane enrollment serialization requires PostgreSQL.');
+        }
+
+        $lockName = 'coolify:control-plane-proxy-enrollment:'.$server->getKey();
+        $connection->selectOne('select pg_advisory_lock(hashtextextended(?, 0))', [$lockName], false);
+
+        try {
+            $freshServer = Server::query()->useWritePdo()->find($server->getKey())
+                ?? throw new RuntimeException('The control-plane enrollment server no longer exists.');
+
+            return $operation($freshServer);
+        } finally {
+            $connection->selectOne('select pg_advisory_unlock(hashtextextended(?, 0))', [$lockName], false);
+        }
+    }
 
     public function reserve(Server $server, ControlPlaneProxyEnrollmentState $state, string $token): ControlPlaneProxyEnrollmentState
     {
@@ -72,7 +97,7 @@ final class StoreControlPlaneProxyEnrollmentState
 
     public function read(Server $server): ?ControlPlaneProxyEnrollmentState
     {
-        $fresh = Server::query()->find($server->getKey());
+        $fresh = Server::query()->useWritePdo()->find($server->getKey());
         if ($fresh === null) {
             throw new RuntimeException('The control-plane enrollment server no longer exists.');
         }
@@ -80,7 +105,7 @@ final class StoreControlPlaneProxyEnrollmentState
         return $this->readFrom($fresh);
     }
 
-    public function abortPrepared(
+    public function abortUnchanged(
         Server $server,
         string $operationId,
         string $canonicalHost,
@@ -91,17 +116,22 @@ final class StoreControlPlaneProxyEnrollmentState
             $lockedServer = $this->lockServer($server);
             $current = $this->readFrom($lockedServer)
                 ?? throw new RuntimeException('The durable control-plane enrollment state is missing.');
-            if ($current->phase !== ControlPlaneProxyEnrollmentPhase::Prepared
+            if ($current->serverId !== (int) $lockedServer->getKey()
+                || ! in_array($current->phase, [
+                    ControlPlaneProxyEnrollmentPhase::Prepared,
+                    ControlPlaneProxyEnrollmentPhase::Activating,
+                ], true)
                 || ! hash_equals($current->operationId, $operationId)
                 || ! hash_equals($current->canonicalHost, $canonicalHost)
                 || ! hash_equals($current->expectedRevision, $expectedRevision)) {
-                throw new RuntimeException('The prepared control-plane enrollment abort fence does not match the durable state.');
+                throw new RuntimeException('The unchanged control-plane enrollment abort fence does not match the durable state.');
             }
 
             $rolledBack = $current
                 ->withPhase(ControlPlaneProxyEnrollmentPhase::RollingBack, $timestamp)
                 ->withPhase(ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement, $timestamp)
                 ->withPhase(ControlPlaneProxyEnrollmentPhase::RolledBack, $timestamp);
+            (new SaveProxyConfiguration)->persistDatabaseState($lockedServer, $current->staticPredecessorBytes);
             $this->writeTo($lockedServer, $rolledBack);
 
             return $rolledBack;

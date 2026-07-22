@@ -35,6 +35,26 @@ final class ResumeControlPlaneProxyEnrollment
         ?Closure $remoteExecutor = null,
         bool $rollback = false,
     ): ControlPlaneProxyEnrollmentState {
+        return $this->stateStore->serializeOperation(
+            $server,
+            fn (Server $lockedServer): ControlPlaneProxyEnrollmentState => $this->handleLocked(
+                $lockedServer,
+                $operationId,
+                $token,
+                $remoteExecutor,
+                $rollback,
+            ),
+        );
+    }
+
+    /** @param null|Closure(string): ?string $remoteExecutor */
+    private function handleLocked(
+        Server $server,
+        string $operationId,
+        string $token,
+        ?Closure $remoteExecutor,
+        bool $rollback,
+    ): ControlPlaneProxyEnrollmentState {
         $state = $this->stateStore->read($server)
             ?? throw new RuntimeException('The durable control-plane enrollment state is missing.');
         if (! $state->isOwnedBy($operationId, $token)) {

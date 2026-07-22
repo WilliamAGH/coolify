@@ -97,7 +97,13 @@ case "$command" in
     ;;
   port)
     container=$1
-    cat "$state_directory/${container}_port"
+    requested_port=${2:-}
+    case "$container" in coolify) private_port=8080 ;; coolify-proxy) private_port=8000 ;; *) exit 1 ;; esac
+    if [ -n "$requested_port" ] && [ "$requested_port" != "$private_port/tcp" ]; then exit 1; fi
+    while IFS= read -r binding; do
+      [ -n "$binding" ] || continue
+      printf '%s/tcp -> %s\n' "$private_port" "$binding"
+    done < "$state_directory/${container}_port"
     ;;
   ps)
     printf '%s\n' coolify coolify-proxy

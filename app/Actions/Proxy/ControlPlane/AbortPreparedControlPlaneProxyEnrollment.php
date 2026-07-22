@@ -17,6 +17,8 @@ final class AbortPreparedControlPlaneProxyEnrollment
 
     private const EMPTY_ARTIFACT_DIRECTORY = '__COOLIFY_CONTROL_PLANE_ARTIFACT_DIRECTORY_EMPTY__';
 
+    private const LEGACY_RUNTIME = '__COOLIFY_CONTROL_PLANE_LEGACY_RUNTIME__';
+
     private const PRESENT_ARTIFACT = '__COOLIFY_CONTROL_PLANE_ARTIFACT_PRESENT__';
 
     public string $commandSignature = 'control-plane:proxy-enrollment:abort-prepared
@@ -25,7 +27,7 @@ final class AbortPreparedControlPlaneProxyEnrollment
         {canonical_host : Exact prepared dashboard host}
         {expected_revision : Exact prepared release revision}';
 
-    public string $commandDescription = 'Abort an unchanged local prepared enrollment whose token is unavailable.';
+    public string $commandDescription = 'Abort an unchanged local enrollment whose token is unavailable.';
 
     public function __construct(
         private readonly StoreControlPlaneProxyEnrollmentState $stateStore,
@@ -40,22 +42,48 @@ final class AbortPreparedControlPlaneProxyEnrollment
         string $expectedRevision,
         ?Closure $remoteExecutor = null,
     ): ControlPlaneProxyEnrollmentState {
+        return $this->stateStore->serializeOperation(
+            $server,
+            fn (Server $lockedServer): ControlPlaneProxyEnrollmentState => $this->handleLocked(
+                $lockedServer,
+                $operationId,
+                $canonicalHost,
+                $expectedRevision,
+                $remoteExecutor,
+            ),
+        );
+    }
+
+    private function handleLocked(
+        Server $server,
+        string $operationId,
+        string $canonicalHost,
+        string $expectedRevision,
+        ?Closure $remoteExecutor,
+    ): ControlPlaneProxyEnrollmentState {
         if (! $server->isLocalhost()) {
             throw new InvalidArgumentException('A prepared control-plane enrollment can only be aborted on the local Coolify server.');
         }
 
         $state = $this->stateStore->read($server)
             ?? throw new RuntimeException('The durable control-plane enrollment state is missing.');
-        if ($state->phase !== ControlPlaneProxyEnrollmentPhase::Prepared
+        if ($state->serverId !== (int) $server->getKey()
+            || ! in_array($state->phase, [
+                ControlPlaneProxyEnrollmentPhase::Prepared,
+                ControlPlaneProxyEnrollmentPhase::Activating,
+            ], true)
             || ! hash_equals($state->operationId, $operationId)
             || ! hash_equals($state->canonicalHost, $canonicalHost)
             || ! hash_equals($state->expectedRevision, $expectedRevision)) {
-            throw new RuntimeException('The prepared control-plane enrollment abort fence does not match the durable state.');
+            throw new RuntimeException('The unchanged control-plane enrollment abort fence does not match the durable state.');
         }
 
         $this->assertUnchangedPreparedFilesystem($server, $state, $remoteExecutor);
+        if ($state->phase === ControlPlaneProxyEnrollmentPhase::Activating) {
+            $this->assertLegacyRuntimeOwnership($server, $state->appPort, $remoteExecutor);
+        }
 
-        return $this->stateStore->abortPrepared(
+        return $this->stateStore->abortUnchanged(
             $server,
             $operationId,
             $canonicalHost,
@@ -109,6 +137,55 @@ final class AbortPreparedControlPlaneProxyEnrollment
             $this->assertAbsent($execute, $managedDocument);
         } else {
             $this->assertExactRegularFile($execute, $managedDocument, $state->dynamicPredecessorBytes);
+        }
+    }
+
+    private function assertLegacyRuntimeOwnership(
+        Server $server,
+        int $appPort,
+        ?Closure $remoteExecutor,
+    ): void {
+        $execute = $remoteExecutor ?? static fn (string $command): ?string => instant_remote_process(
+            [$command],
+            $server,
+            timeout: 30,
+            disableMultiplexing: true,
+            retry: false,
+        );
+        $expectedBinding = '0.0.0.0:'.$appPort;
+        $publicIpv6Binding = '[::]:'.$appPort;
+        $output = $execute(implode("\n", [
+            'set -eu',
+            'round=1',
+            'while [ "$round" -le 2 ]; do',
+            '  [ "$(docker inspect --type container --format '.escapeshellarg('{{.State.Running}}').' coolify)" = true ]',
+            '  [ "$(docker inspect --type container --format '.escapeshellarg('{{.State.Running}}').' coolify-proxy)" = true ]',
+            '  coolify_bindings=$(docker port coolify 8080/tcp)',
+            '  printf "%s\n" "$coolify_bindings" | grep -Fx '.escapeshellarg($expectedBinding).' >/dev/null',
+            '  unexpected_bindings=$(printf "%s\n" "$coolify_bindings" | grep -Fvx '.escapeshellarg($expectedBinding).' | grep -Fvx '.escapeshellarg($publicIpv6Binding).' || true)',
+            '  [ -z "$unexpected_bindings" ]',
+            '  proxy_ports=$(docker port coolify-proxy 2>/dev/null)',
+            '  proxy_bindings=$(printf "%s\n" "$proxy_ports" | sed -n '.escapeshellarg('s#^'.$appPort.'/tcp -> ##p').')',
+            '  [ -z "$proxy_bindings" ]',
+            '  owner_count=0',
+            '  owner=',
+            '  for candidate in $(docker ps --format '.escapeshellarg('{{.Names}}').'); do',
+            '    candidate_ports=$(docker port "$candidate" 2>/dev/null)',
+            '    candidate_bindings=$(printf "%s\n" "$candidate_ports" | sed -n '.escapeshellarg('s/^[^ ]* -> //p').')',
+            '    if printf "%s\n" "$candidate_bindings" | grep -Fx '.escapeshellarg($expectedBinding).' >/dev/null '
+                .'|| printf "%s\n" "$candidate_bindings" | grep -Fx '.escapeshellarg($publicIpv6Binding).' >/dev/null; then',
+            '      owner_count=$((owner_count + 1))',
+            '      owner=$candidate',
+            '    fi',
+            '  done',
+            '  if [ "$owner_count" != 1 ] || [ "$owner" != coolify ]; then exit 1; fi',
+            '  [ "$round" = 2 ] || sleep 1',
+            '  round=$((round + 1))',
+            'done',
+            'printf '.escapeshellarg(self::LEGACY_RUNTIME."\n"),
+        ]));
+        if (! in_array($output, [self::LEGACY_RUNTIME, self::LEGACY_RUNTIME."\n"], true)) {
+            throw new RuntimeException('The activating control-plane enrollment no longer has exact legacy runtime ownership.');
         }
     }
 
