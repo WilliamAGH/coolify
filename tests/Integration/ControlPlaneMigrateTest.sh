@@ -72,7 +72,9 @@ case "$cmd" in
       php)
         # php artisan start:migration | php artisan config:show app.key
         if printf '%s' "$*" | grep -q 'config:show'; then
-          printf 'app.key ..................................... %s\n' "${MOCK_EFFECTIVE_APP_KEY:-base64:sourcekey}"
+          # Laravel's twoColumnDetail output: blank line, padded value row
+          # with trailing spaces, blank line.
+          printf '\n  app.key ..................................... %s  \n\n' "${MOCK_EFFECTIVE_APP_KEY:-base64:sourcekey}"
           exit 0
         fi
         exit "${MOCK_MIGRATION_EXIT:-0}"

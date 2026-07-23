@@ -205,7 +205,8 @@ verify_effective_app_key() {
     local env_file="$1"
     local expected effective
     expected=$(get_env_var APP_KEY "$env_file")
-    effective=$(docker exec "$APP_CONTAINER" php artisan config:show app.key 2>/dev/null | awk 'END {print $NF}')
+    effective=$(docker exec "$APP_CONTAINER" php artisan config:show app.key 2>/dev/null \
+        | awk '/app\.key/ {print $NF; exit}')
     [ -n "$effective" ] || fail "could not read the effective app.key from '$APP_CONTAINER'"
     if [ "$effective" != "$expected" ]; then
         fail "effective APP_KEY mismatch: '$APP_CONTAINER' still runs its creation-time key, so data encrypted under the restored APP_KEY cannot decrypt. Recreate the app container from its compose project (docker compose ... up -d --force-recreate) so the restored .env takes effect, then re-run restore with a fresh --target-backup-dir."
