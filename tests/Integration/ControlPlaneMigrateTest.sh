@@ -541,7 +541,7 @@ test_restore_backs_up_target_database_before_overwrite() {
     restore --root "$root" $(restore_args) > "$STATE/out.log" 2>&1 \
     || { cat "$STATE/out.log" >&2; fail "restore for target-db backup test failed"; }
   local backup_dump
-  backup_dump=$(ls "$root"/control-plane-migrate-target-backup-*/postgres.pre-restore.dump 2>/dev/null | head -n 1 || true)
+  backup_dump=$(find "$root" -type f -path '*/control-plane-migrate-target-backup-*/postgres.pre-restore.dump' 2>/dev/null | head -n 1 || true)
   [ -n "$backup_dump" ] || fail "target backup must contain a pre-restore database dump"
   grep -qx 'PGDMP-fake-custom-format' "$backup_dump" || fail "pre-restore dump must come from pg_dump"
   local dump_line drop_line

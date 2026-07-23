@@ -552,7 +552,7 @@ cmd_env_merge() {
     # Pass 2: source-only keys. Target-retained keys never cross over; preserved
     # keys are appended; unclassified keys carry the source value and are logged
     # for operator review. The source .env is never copied wholesale.
-    while IFS= read -r line; do
+    while IFS= read -r line <&3; do
         case "$line" in
             ''|'#'*) continue ;;
         esac
@@ -561,7 +561,11 @@ cmd_env_merge() {
         if grep -qE "^${key}=" "$target_env"; then
             continue
         fi
-        value=$(get_env_var "$key" "$source_env")
+        value="${line#*=}"
+        value="${value%\"}"
+        value="${value#\"}"
+        value="${value%\'}"
+        value="${value#\'}"
         # shellcheck disable=SC2086
         if in_word_list "$key" "$TARGET_RETAINED_KEYS"; then
             printf '%s=target(retained-absent)\n' "$key" >> "$report"
@@ -575,7 +579,7 @@ cmd_env_merge() {
             printf '%s=%s\n' "$key" "$value" >> "$tmp"
             printf '%s=source(unclassified-review)\n' "$key" >> "$report"
         fi
-    done < "$source_env"
+    done 3< "$source_env"
 
     # Postconditions: merged file must decrypt credentials and reach target infra.
     [ -n "$(get_env_var APP_KEY "$tmp")" ] || fail "merged .env lost APP_KEY"
@@ -643,10 +647,11 @@ cmd_restore() {
 
     cmd_verify --archive "$archive"
 
-    # shellcheck disable=SC1090
     local expected_schema="$MANIFEST_SCHEMA"
+    # shellcheck disable=SC1090,SC1091
     . "$archive/manifest.env"
     [ "${MANIFEST_SCHEMA:-}" = "$expected_schema" ] || fail "manifest schema mismatch"
+    # shellcheck disable=SC2153  # assigned by the sourced manifest.env
     local source_pg_major="$SOURCE_PG_MAJOR"
 
     # Target proof: exact signed fork version and immutable image digest.
@@ -706,7 +711,7 @@ cmd_restore() {
     # 'opt-in' (proxy) requires --restore-proxy.
     local pre_migration="$root/.pre-migration-${stamp}"
     mkdir -p "$pre_migration"
-    # shellcheck disable=SC2034
+    # shellcheck disable=SC2034,SC2153  # TREES is assigned by the sourced manifest.env
     for tree in $TREES; do
         case "$tree" in
             source) continue ;;
