@@ -170,7 +170,7 @@ it('persists rollback before self-replacement and requires a fresh replay to fin
         ->and($awaitingAcknowledgement->phase)->toBe(ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement)
         ->and($rolledBack->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack)
         ->and($replayed->toArray())->toBe($rolledBack->toArray())
-        ->and($calls)->toBe(15)
+        ->and($calls)->toBe(16)
         ->and($staticHandoffCommand)->toContain("sed -n 's/^[^ ]* -> //p'")
         ->and($server->fresh()?->proxy->get('last_saved_proxy_configuration'))->toBe($rolledBack->staticPredecessorBytes)
         ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack);
@@ -314,15 +314,18 @@ it('replays a crash after remote rollback finalization without the retired backe
         ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement,
     );
     $remoteCalls = 0;
+    $commands = [];
 
     $rolledBack = $action->handle(
         $server,
         'execute-control-plane-rollback',
         'rollback-token',
-        static function (string $command) use (&$remoteCalls): string {
+        static function (string $command) use (&$remoteCalls, &$commands): string {
             $remoteCalls++;
+            $commands[] = $command;
 
             return match (true) {
+                str_contains($command, ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT) => ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT,
                 str_contains($command, ControlPlaneCandidateHealthMarker::CONTAINER_MARKER_PATH) => '',
                 str_contains($command, ControlPlaneRestoredRoutesProof::TRANSCRIPT_BEGIN) => executableControlPlaneRestoredTranscript(),
                 str_contains($command, ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_PENDING_OUTPUT) => ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT,
@@ -332,8 +335,38 @@ it('replays a crash after remote rollback finalization without the retired backe
     );
 
     expect($rolledBack->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack)
-        ->and($remoteCalls)->toBe(3)
+        ->and($remoteCalls)->toBe(4)
+        ->and($commands[0])->toContain(ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT)
+        ->and($commands[0])->toContain("reassert_awaiting='1'")
+        ->and($commands[1])->toContain(ControlPlaneCandidateHealthMarker::CONTAINER_MARKER_PATH)
+        ->and($commands[2])->toContain(ControlPlaneRestoredRoutesProof::TRANSCRIPT_BEGIN)
         ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack);
+});
+
+it('does not probe or finalize when awaiting static rollback reassertion is ambiguous', function (): void {
+    [$server, $store, $action] = executableControlPlaneRollback(
+        ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement,
+    );
+    $remote = (object) ['calls' => 0, 'command' => ''];
+
+    expect(fn () => $action->handle(
+        $server,
+        'execute-control-plane-rollback',
+        'rollback-token',
+        static function (string $command) use ($remote): string {
+            $remote->calls++;
+            $remote->command = $command;
+
+            return 'ambiguous-static-rollback';
+        },
+    ))->toThrow(RuntimeException::class, 'static listener rollback reassertion did not return its exact completion proof');
+
+    expect($remote->calls)->toBe(1)
+        ->and($remote->command)->toContain("reassert_awaiting='1'")
+        ->and($remote->command)->not->toContain(ControlPlaneCandidateHealthMarker::CONTAINER_MARKER_PATH)
+        ->and($remote->command)->not->toContain(ControlPlaneRestoredRoutesProof::TRANSCRIPT_BEGIN)
+        ->and($store->read($server)?->phase)
+        ->toBe(ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement);
 });
 
 it('finishes authority-less partial rollback cleanup without the retired backend', function (): void {
@@ -350,6 +383,7 @@ it('finishes authority-less partial rollback cleanup without the retired backend
             $remoteCalls++;
 
             return match (true) {
+                str_contains($command, ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT) => ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT,
                 str_contains($command, ControlPlaneCandidateHealthMarker::CONTAINER_MARKER_PATH) => '',
                 str_contains($command, ControlPlaneRestoredRoutesProof::TRANSCRIPT_BEGIN) => executableControlPlaneRestoredTranscript(),
                 str_contains($command, ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_CLEANUP_PENDING_OUTPUT) => ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_CLEANUP_PENDING_OUTPUT,
@@ -360,6 +394,6 @@ it('finishes authority-less partial rollback cleanup without the retired backend
     );
 
     expect($rolledBack->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack)
-        ->and($remoteCalls)->toBe(4)
+        ->and($remoteCalls)->toBe(5)
         ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack);
 });
