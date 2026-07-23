@@ -18,7 +18,10 @@ services:
       - PHP_FPM_PM_START_SERVERS=${PHP_FPM_PM_START_SERVERS:-1}
       - PHP_FPM_PM_MIN_SPARE_SERVERS=${PHP_FPM_PM_MIN_SPARE_SERVERS:-1}
       - PHP_FPM_PM_MAX_SPARE_SERVERS=${PHP_FPM_PM_MAX_SPARE_SERVERS:-10}
-      - PUSHER_PORT=${PUSHER_PORT:-6001}
+      # Only pass a browser websocket port pin through when explicitly set:
+      # a non-empty PUSHER_PORT makes the UI dial wss://host:<port> directly
+      # instead of the same-origin /app path Traefik routes to Reverb.
+      - PUSHER_PORT=${PUSHER_PORT:-}
       - PUSHER_BACKEND_HOST=${PUSHER_BACKEND_HOST:-127.0.0.1}
       - PUSHER_BACKEND_PORT=${PUSHER_BACKEND_PORT:-6001}
       - TERMINAL_BACKEND_PORT=${TERMINAL_BACKEND_PORT:-6002}

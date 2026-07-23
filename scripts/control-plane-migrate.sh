@@ -42,8 +42,14 @@ TARGET_RETAINED_KEYS="APP_ENV APP_DEBUG \
 DB_HOST DB_PORT DB_DATABASE DB_USERNAME DB_PASSWORD \
 REDIS_HOST REDIS_PORT REDIS_PASSWORD REDIS_DB \
 COOLIFY_FORK_VERSION VERSIONS_URL UPGRADE_SCRIPT_URL RELEASES_URL AUTOUPDATE \
-APP_PORT PUSHER_PORT PUSHER_BACKEND_HOST PUSHER_BACKEND_PORT SOKETI_PORT \
+APP_PORT PUSHER_BACKEND_HOST PUSHER_BACKEND_PORT \
 TERMINAL_PORT TERMINAL_BACKEND_PORT HORIZON_ENABLED SCHEDULER_ENABLED"
+# Browser-facing websocket port pins. If either reaches the runtime env, the UI
+# dials wss://host:6001 directly instead of the same-origin /app path that
+# Traefik routes to the in-container Reverb, breaking realtime on the canonical
+# domain. Production keeps both unset (compose defaults still serve direct
+# port access), so the merge drops them from both sides.
+DROPPED_KEYS="PUSHER_PORT SOKETI_PORT"
 REQUIRED_SOURCE_KEYS="APP_KEY"
 
 INVENTORY_TABLES="users teams projects environments servers private_keys \
@@ -538,6 +544,11 @@ cmd_env_merge() {
         esac
         key="${line%%=*}"
         [ "$key" = "$line" ] && { printf '%s\n' "$line" >> "$tmp"; continue; }
+        # shellcheck disable=SC2086
+        if in_word_list "$key" "$DROPPED_KEYS"; then
+            printf '%s=dropped(browser-port-pin)\n' "$key" >> "$report"
+            continue
+        fi
         source_value=$(get_env_var "$key" "$source_env")
         # shellcheck disable=SC2086
         if in_word_list "$key" "$SOURCE_PRESERVED_KEYS" && [ -n "$source_value" ]; then
@@ -559,6 +570,11 @@ cmd_env_merge() {
         key="${line%%=*}"
         [ "$key" = "$line" ] && continue
         if grep -qE "^${key}=" "$target_env"; then
+            continue
+        fi
+        # shellcheck disable=SC2086
+        if in_word_list "$key" "$DROPPED_KEYS"; then
+            printf '%s=dropped(browser-port-pin)\n' "$key" >> "$report"
             continue
         fi
         value="${line#*=}"
