@@ -397,6 +397,7 @@ jobs:
           tests/Integration/DownloadGitHubReleaseAssetTest.sh
           tests/Integration/DockerSsotCleanTest.sh
           tests/Integration/ProductionApplicationBlueGreen/SanitizeEvidenceTest.sh
+          tests/Integration/ControlPlaneMigrateTest.sh
       - name: Run v4.x candidate ship contract
         run: scripts/dev/ship.test.sh
       - name: Verify Docker daemon configuration ownership
