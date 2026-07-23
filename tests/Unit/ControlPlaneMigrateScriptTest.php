@@ -114,6 +114,13 @@ it('verifies archives fail-closed before restore', function () {
         ->toContain('cmd_verify --archive "$archive"');
 });
 
+it('fails closed when the app container runs a creation-time APP_KEY', function () {
+    expect(controlPlaneMigrateScript())
+        ->toContain('verify_effective_app_key')
+        ->toContain('effective APP_KEY mismatch')
+        ->toContain('--force-recreate');
+});
+
 it('distinguishes a missing postgres client image from an unreadable dump', function () {
     expect(controlPlaneMigrateScript())
         ->toContain('docker image inspect "$client_image"')

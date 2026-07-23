@@ -70,7 +70,11 @@ case "$cmd" in
         esac
         ;;
       php)
-        # php artisan start:migration
+        # php artisan start:migration | php artisan config:show app.key
+        if printf '%s' "$*" | grep -q 'config:show'; then
+          printf 'app.key ..................................... %s\n' "${MOCK_EFFECTIVE_APP_KEY:-base64:sourcekey}"
+          exit 0
+        fi
         exit "${MOCK_MIGRATION_EXIT:-0}"
         ;;
       redis-cli)
@@ -547,6 +551,18 @@ test_restore_backs_up_target_database_before_overwrite() {
   pass 'restore_backs_up_target_database_before_overwrite'
 }
 
+test_restore_fails_closed_on_stale_effective_app_key() {
+  local root="$STATE/res10/root"
+  build_target_root "$root"
+  : > "$DOCKER_LOG"
+  # shellcheck disable=SC2046
+  MOCK_RUNNING_CONTAINERS="coolify coolify-db coolify-redis" MOCK_EFFECTIVE_APP_KEY="base64:stale-creation-key" \
+    expect_fail "restore with stale effective APP_KEY" restore --root "$root" $(restore_args)
+  expect_output_contains 'effective APP_KEY mismatch'
+  expect_output_contains 'force-recreate'
+  pass 'restore_fails_closed_on_stale_effective_app_key'
+}
+
 test_restore_enable_workers_is_explicit() {
   local root="$STATE/res7/root"
   build_target_root "$root"
@@ -593,6 +609,7 @@ test_restore_refuses_digest_mismatch
 test_restore_refuses_version_mismatch
 test_restore_happy_path_disables_workers_by_default
 test_restore_backs_up_target_database_before_overwrite
+test_restore_fails_closed_on_stale_effective_app_key
 test_restore_enable_workers_is_explicit
 test_restore_migration_failure_fails_closed
 
