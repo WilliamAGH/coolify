@@ -114,6 +114,13 @@ it('verifies archives fail-closed before restore', function () {
         ->toContain('cmd_verify --archive "$archive"');
 });
 
+it('distinguishes a missing postgres client image from an unreadable dump', function () {
+    expect(controlPlaneMigrateScript())
+        ->toContain('docker image inspect "$client_image"')
+        ->toContain('is not present locally')
+        ->toContain('this check never pulls images');
+});
+
 it('requires contextual overwrite authorization and a managed target for restore', function () {
     expect(controlPlaneMigrateScript())
         ->toContain('--authorize-overwrite must equal this host\'s hostname')

@@ -92,8 +92,16 @@ case "$cmd" in
     printf '%s\n' "${MOCK_APP_IMAGE_REF:-registry.example.test/williamagh/coolify:4.13.23-fork}"
     ;;
   image)
-    # docker image inspect --format '{{json .RepoDigests}}' ref
-    printf '%s\n' "${MOCK_APP_REPO_DIGESTS:-[\"registry.example.test/williamagh/coolify@sha256:expecteddigest\"]}"
+    # docker image inspect [--format fmt] <ref>
+    ref="${*: -1}"
+    case "$ref" in
+      postgres:*-alpine)
+        [ "${MOCK_PG_CLIENT_IMAGE_MISSING:-false}" = true ] && exit 1
+        ;;
+      *)
+        printf '%s\n' "${MOCK_APP_REPO_DIGESTS:-[\"registry.example.test/williamagh/coolify@sha256:expecteddigest\"]}"
+        ;;
+    esac
     ;;
   stop|start)
     exit 0
@@ -128,7 +136,7 @@ chmod +x "$MOCK_BIN/docker" "$MOCK_BIN/pg_restore"
 run_migrate() {
   COOLIFY_MIGRATE_TEST_MODE=true \
   COOLIFY_MIGRATE_HOSTNAME="target-host.test" \
-  COOLIFY_MIGRATE_PG_RESTORE_BIN="$MOCK_BIN/pg_restore" \
+  COOLIFY_MIGRATE_PG_RESTORE_BIN="${TEST_PG_RESTORE_BIN:-$MOCK_BIN/pg_restore}" \
   MOCK_DOCKER_LOG="$DOCKER_LOG" \
   PATH="$MOCK_BIN:$PATH" \
   bash "$SCRIPT" "$@"
@@ -390,6 +398,17 @@ test_verify_detects_unreadable_dump() {
   pass 'verify_detects_unreadable_dump'
 }
 
+test_verify_reports_missing_pg_client_image() {
+  TEST_PG_RESTORE_BIN="$STATE/definitely-missing-pg-restore" MOCK_PG_CLIENT_IMAGE_MISSING=true \
+    expect_fail "verify without local pg_restore or client image" verify --archive "$STATE/archive"
+  expect_output_contains 'is not present locally'
+  if grep -Fq 'not readable' "$STATE/out.log"; then
+    cat "$STATE/out.log" >&2
+    fail "missing client image must not be misreported as an unreadable dump"
+  fi
+  pass 'verify_reports_missing_pg_client_image'
+}
+
 # --- restore tests -----------------------------------------------------------
 
 build_target_root() {
@@ -545,6 +564,7 @@ test_capture_produces_verifiable_archive
 test_capture_redis_opt_in_uses_stdin_auth
 test_verify_detects_tampering
 test_verify_detects_unreadable_dump
+test_verify_reports_missing_pg_client_image
 test_restore_refuses_wrong_hostname_authorization
 test_restore_refuses_unmanaged_target
 test_restore_refuses_pg_major_downgrade

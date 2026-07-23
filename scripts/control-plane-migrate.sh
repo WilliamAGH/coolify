@@ -204,10 +204,13 @@ verify_dump_readable() {
         fail "pg_dump archive is not readable by local pg_restore: $dump"
     fi
     [ -n "$major" ] || fail "pg_restore is unavailable locally and no PostgreSQL major is known for a client container"
+    local client_image="postgres:${major}-alpine"
+    docker image inspect "$client_image" >/dev/null 2>&1 \
+        || fail "PostgreSQL client image $client_image is not present locally; run 'docker pull $client_image' first (this check never pulls images)"
     docker run --rm -i --network none --pull never \
         -v "$dump:/tmp/migration.dump:ro" \
-        "postgres:${major}-alpine" pg_restore -l /tmp/migration.dump >/dev/null 2>&1 \
-        || fail "pg_dump archive is not readable (verified with postgres:${major}-alpine client): $dump"
+        "$client_image" pg_restore -l /tmp/migration.dump >/dev/null 2>&1 \
+        || fail "pg_dump archive is not readable (verified with $client_image client): $dump"
 }
 
 ## ---------------------------------------------------------------------------
