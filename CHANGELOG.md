@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file.
 
 ### 🐛 Bug Fixes
 
+- *(control-plane)* Fence delayed enrollment activation
+
+### 📚 Documentation
+
+- Update changelog (#149)
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.23-fork
+
+## [4.13.22-fork] - 2026-07-22
+
+### 🐛 Bug Fixes
+
 - *(control-plane)* Attest absent rollback routes
 
 ### 📚 Documentation
