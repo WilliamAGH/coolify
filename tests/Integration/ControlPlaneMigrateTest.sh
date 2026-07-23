@@ -526,6 +526,27 @@ test_restore_happy_path_disables_workers_by_default() {
   pass 'restore_happy_path_disables_workers_by_default'
 }
 
+test_restore_backs_up_target_database_before_overwrite() {
+  local root="$STATE/res9/root"
+  build_target_root "$root"
+  : > "$DOCKER_LOG"
+  # shellcheck disable=SC2046
+  MOCK_RUNNING_CONTAINERS="coolify coolify-db coolify-redis" run_migrate \
+    restore --root "$root" $(restore_args) > "$STATE/out.log" 2>&1 \
+    || { cat "$STATE/out.log" >&2; fail "restore for target-db backup test failed"; }
+  local backup_dump
+  backup_dump=$(ls "$root"/control-plane-migrate-target-backup-*/postgres.pre-restore.dump 2>/dev/null | head -n 1 || true)
+  [ -n "$backup_dump" ] || fail "target backup must contain a pre-restore database dump"
+  grep -qx 'PGDMP-fake-custom-format' "$backup_dump" || fail "pre-restore dump must come from pg_dump"
+  local dump_line drop_line
+  dump_line=$(grep -n 'pg_dump' "$DOCKER_LOG" | head -n 1 | cut -d: -f1 || true)
+  drop_line=$(grep -n 'DROP DATABASE' "$DOCKER_LOG" | head -n 1 | cut -d: -f1 || true)
+  [ -n "$dump_line" ] || fail "restore must pg_dump the target database before overwrite"
+  [ -n "$drop_line" ] || fail "mock log must record the database drop"
+  [ "$dump_line" -lt "$drop_line" ] || fail "target database dump must happen before the database is dropped"
+  pass 'restore_backs_up_target_database_before_overwrite'
+}
+
 test_restore_enable_workers_is_explicit() {
   local root="$STATE/res7/root"
   build_target_root "$root"
@@ -571,6 +592,7 @@ test_restore_refuses_pg_major_downgrade
 test_restore_refuses_digest_mismatch
 test_restore_refuses_version_mismatch
 test_restore_happy_path_disables_workers_by_default
+test_restore_backs_up_target_database_before_overwrite
 test_restore_enable_workers_is_explicit
 test_restore_migration_failure_fails_closed
 

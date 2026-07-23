@@ -168,6 +168,8 @@ it('backs up the target installation before overwriting it', function () {
         ->toContain('control-plane-migrate-target-backup-')
         ->toContain('cp -p "$target_env" "$target_backup_dir/env.pre-restore"')
         ->toContain('target backup failed for tree')
+        ->toContain('postgres.pre-restore.dump')
+        ->toContain('target database backup failed')
         ->toContain('.pre-migration-');
 });
 

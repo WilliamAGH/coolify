@@ -670,6 +670,10 @@ cmd_restore() {
     done
     cp -p "$target_env" "$target_backup_dir/env.pre-restore"
     chmod 0600 "$target_backup_dir/env.pre-restore"
+    docker exec "$DB_CONTAINER" pg_dump -U "$DB_USERNAME" -d "$DB_DATABASE" -Fc \
+        > "$target_backup_dir/postgres.pre-restore.dump" \
+        || fail "target database backup failed: pg_dump of '$DB_DATABASE' in $DB_CONTAINER"
+    chmod 0600 "$target_backup_dir/postgres.pre-restore.dump"
     log "target backup complete: $target_backup_dir"
 
     # Stop mutable control-plane services; database and redis stay up.
