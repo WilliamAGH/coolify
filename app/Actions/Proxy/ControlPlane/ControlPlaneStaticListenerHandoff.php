@@ -68,6 +68,9 @@ final class ControlPlaneStaticListenerHandoff
 
     public function commandFor(ControlPlaneProxyEnrollmentState $state): string
     {
+        $proxyDirectory = dirname($this->proxyComposePath);
+        $rollbackJournalPath = $proxyDirectory.'/.control-plane-static-listener-rollback.'.$state->operationId.'.journal';
+        $this->assertAbsolutePath($rollbackJournalPath, 'rollback journal path');
         $expectedProxyBinding = match ($state->exposure) {
             ControlPlaneProxyExposure::Public => '0.0.0.0:'.$state->appPort,
             ControlPlaneProxyExposure::Loopback => '127.0.0.1:'.$state->appPort,
@@ -77,7 +80,7 @@ final class ControlPlaneStaticListenerHandoff
             'set -eu',
             'umask 077',
             'proxy_compose_path='.escapeshellarg($this->proxyComposePath),
-            'proxy_directory='.escapeshellarg(dirname($this->proxyComposePath)),
+            'proxy_directory='.escapeshellarg($proxyDirectory),
             'source_compose_path='.escapeshellarg($this->sourceComposePath),
             'source_production_compose_path='.escapeshellarg($this->sourceProductionComposePath),
             'source_override_path='.escapeshellarg($this->sourceOverridePath),
@@ -86,6 +89,7 @@ final class ControlPlaneStaticListenerHandoff
             'source_postgres_upgrade_compose_path='.escapeshellarg($this->sourcePostgresUpgradeComposePath),
             'source_directory='.escapeshellarg(dirname($this->sourceComposePath)),
             'enrollment_lock_path='.escapeshellarg($this->enrollmentLockPath),
+            'rollback_journal_path='.escapeshellarg($rollbackJournalPath),
             'attestor_state_directory='.escapeshellarg($this->attestorStateDirectory),
             'expected_proxy_binding='.escapeshellarg($expectedProxyBinding),
             'legacy_proxy_binding='.escapeshellarg('0.0.0.0:'.$state->appPort),
@@ -189,6 +193,7 @@ final class ControlPlaneStaticListenerHandoff
             'assert_regular_or_absent "$source_custom_compose_path"',
             'assert_regular_or_absent "$source_postgres_upgrade_compose_path"',
             'assert_regular_or_absent "$source_override_path"',
+            'assert_regular_or_absent "$rollback_journal_path"',
             'assert_regular_or_absent "$enrollment_lock_path"',
             'prepare_attestor_state_directory',
             'command -v flock >/dev/null 2>&1 || fail',
@@ -201,6 +206,8 @@ final class ControlPlaneStaticListenerHandoff
             'assert_regular_or_absent "$source_custom_compose_path"',
             'assert_regular_or_absent "$source_postgres_upgrade_compose_path"',
             'assert_regular_or_absent "$source_override_path"',
+            'assert_regular_or_absent "$rollback_journal_path"',
+            'is_absent "$rollback_journal_path" || fail',
             'scratch=$(mktemp -d "$proxy_directory/.control-plane-listener.XXXXXX") || fail',
             'predecessor_proxy_file="$scratch/proxy-predecessor"',
             'replacement_proxy_file="$scratch/proxy-replacement"',
@@ -253,6 +260,29 @@ final class ControlPlaneStaticListenerHandoff
             throw new InvalidArgumentException('The control-plane static listener rollback requires durable rolling-back state.');
         }
 
+        return $this->renderRollbackCommand($state, false);
+    }
+
+    public function reassertAwaitingRollbackCommandFor(
+        ControlPlaneProxyEnrollmentState $state,
+        string $operationId,
+        string $token,
+    ): string {
+        if (! $state->isOwnedBy($operationId, $token)) {
+            throw new InvalidArgumentException('The control-plane static listener rollback is owned by another operation.');
+        }
+        if ($state->phase !== ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement) {
+            throw new InvalidArgumentException('The control-plane static listener rollback reassertion requires durable awaiting-acknowledgement state.');
+        }
+
+        return $this->renderRollbackCommand($state, true);
+    }
+
+    private function renderRollbackCommand(
+        ControlPlaneProxyEnrollmentState $state,
+        bool $reassertAwaiting,
+    ): string {
+
         $proxyDirectory = dirname($this->proxyComposePath);
         $rollbackJournalPath = $proxyDirectory.'/.control-plane-static-listener-rollback.'.$state->operationId.'.journal';
         $this->assertAbsolutePath($rollbackJournalPath, 'rollback journal path');
@@ -272,6 +302,7 @@ final class ControlPlaneStaticListenerHandoff
             'enrollment_lock_path='.escapeshellarg($this->enrollmentLockPath),
             'rollback_journal_path='.escapeshellarg($rollbackJournalPath),
             'state_phase='.escapeshellarg($state->phase->value),
+            'reassert_awaiting='.escapeshellarg($reassertAwaiting ? '1' : '0'),
             'expected_proxy_binding='.escapeshellarg(match ($state->exposure) {
                 ControlPlaneProxyExposure::Public => '0.0.0.0:'.$state->appPort,
                 ControlPlaneProxyExposure::Loopback => '127.0.0.1:'.$state->appPort,
@@ -340,6 +371,7 @@ final class ControlPlaneStaticListenerHandoff
             'verify_legacy() { legacy_is_verified || fail; }',
             'ensure_rollback_journal() {',
             '  if is_absent "$rollback_journal_path"; then',
+            '    [ "$reassert_awaiting" = 0 ] || fail',
             '    atomic_replace "$rollback_journal_path" "$rollback_started_journal_file" "$proxy_directory"',
             '  elif ! matches "$rollback_journal_path" "$rollback_started_journal_file" && ! matches "$rollback_journal_path" "$rollback_completed_journal_file"; then',
             '    fail',
@@ -360,6 +392,10 @@ final class ControlPlaneStaticListenerHandoff
             'complete_rollback_journal() {',
             '  atomic_replace "$rollback_journal_path" "$rollback_completed_journal_file" "$proxy_directory"',
             '  matches "$rollback_journal_path" "$rollback_completed_journal_file" || fail',
+            '}',
+            'restart_rollback_journal() {',
+            '  atomic_replace "$rollback_journal_path" "$rollback_started_journal_file" "$proxy_directory"',
+            '  matches "$rollback_journal_path" "$rollback_started_journal_file" || fail',
             '}',
             '',
             'assert_directory "$proxy_directory"',
@@ -411,15 +447,15 @@ final class ControlPlaneStaticListenerHandoff
             'fi',
             'ensure_rollback_journal',
             'reclaim_legacy_rollback_journal',
-            'if matches "$rollback_journal_path" "$rollback_completed_journal_file"; then',
-            '  matches "$proxy_compose_path" "$predecessor_proxy_file" || fail',
-            '  is_absent "$source_override_path" || fail',
-            '  verify_legacy',
+            'if matches "$rollback_journal_path" "$rollback_completed_journal_file" && matches "$proxy_compose_path" "$predecessor_proxy_file" && is_absent "$source_override_path" && legacy_is_verified; then',
             '  durable_remote_reaffirm "$proxy_compose_path" "$proxy_directory" || fail',
             '  durable_remote_remove "$source_override_path" "$source_directory" || fail',
             '  durable_remote_reaffirm "$rollback_journal_path" "$proxy_directory" || fail',
             '  printf %s "$rolled_back_output"',
             '  exit 0',
+            'fi',
+            'if [ "$reassert_awaiting" = 1 ] && matches "$rollback_journal_path" "$rollback_completed_journal_file"; then',
+            '  restart_rollback_journal',
             'fi',
             'if [ "$state_phase" = rolled_back ]; then',
             '  matches "$proxy_compose_path" "$predecessor_proxy_file" || fail',

@@ -151,7 +151,7 @@ function staticListenerHandoffWriter(array $fixture): ControlPlaneStaticListener
 }
 
 /** @param array{bin: string, state: string, log: string, source_override: string, proxy_compose: string} $fixture */
-function runStaticListenerHandoffCommand(string $command, array $fixture, array $environment = []): Process
+function staticListenerHandoffProcess(string $command, array $fixture, array $environment = []): Process
 {
     $process = Process::fromShellCommandline($command);
     $process->setTimeout(10);
@@ -163,6 +163,14 @@ function runStaticListenerHandoffCommand(string $command, array $fixture, array 
         'FAKE_PROXY_COMPOSE' => $fixture['proxy_compose'],
         'FAKE_APP_PORT' => '8000',
     ], $environment));
+
+    return $process;
+}
+
+/** @param array{bin: string, state: string, log: string, source_override: string, proxy_compose: string} $fixture */
+function runStaticListenerHandoffCommand(string $command, array $fixture, array $environment = []): Process
+{
+    $process = staticListenerHandoffProcess($command, $fixture, $environment);
     $process->run();
 
     return $process;
@@ -335,6 +343,178 @@ it('rolls back a post-success static listener handoff once and replays exact leg
             ->and(file_get_contents($fixture['rollback_journal']))->toContain('phase=rolled-back')
             ->and(substr_count($commands, 'compose '))->toBe(4)
             ->and(strrpos($commands, 'traefik'))->toBeLessThan(strrpos($commands, 'coolify'));
+    } finally {
+        $filesystem->remove($fixture['root']);
+    }
+});
+
+it('reasserts an exact completed rollback when a delayed activation restores the replacement listener', function (): void {
+    $filesystem = new Filesystem;
+    $rollingBackState = staticListenerHandoffState()
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::RollingBack, '2026-07-19T00:01:00Z');
+    $awaitingState = $rollingBackState
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement, '2026-07-19T00:02:00Z');
+    $fixture = staticListenerHandoffFixtures($rollingBackState);
+
+    try {
+        $writer = staticListenerHandoffWriter($fixture);
+        expect(runStaticListenerHandoffCommand($writer->commandFor($rollingBackState), $fixture)->isSuccessful())->toBeTrue();
+        expect(runStaticListenerHandoffCommand(
+            $writer->rollbackCommandFor($rollingBackState, $rollingBackState->operationId, 'test-token'),
+            $fixture,
+        )->isSuccessful())->toBeTrue();
+
+        file_put_contents($fixture['proxy_compose'], $rollingBackState->staticReplacementBytes);
+        file_put_contents($fixture['source_override'], $rollingBackState->sourceOverrideBytes);
+        file_put_contents($fixture['state'].'/coolify_port', '');
+        file_put_contents($fixture['state'].'/coolify-proxy_port', "0.0.0.0:8000\n");
+        $proxyBytesAfterDelayedActivation = file_get_contents($fixture['proxy_compose']);
+        $sourceOverrideBytesAfterDelayedActivation = file_get_contents($fixture['source_override']);
+        $reassertedRollback = runStaticListenerHandoffCommand(
+            $writer->reassertAwaitingRollbackCommandFor($awaitingState, $awaitingState->operationId, 'test-token'),
+            $fixture,
+        );
+
+        expect($proxyBytesAfterDelayedActivation)->toBe($rollingBackState->staticReplacementBytes)
+            ->and($sourceOverrideBytesAfterDelayedActivation)->toBe($rollingBackState->sourceOverrideBytes)
+            ->and($reassertedRollback->isSuccessful())->toBeTrue()
+            ->and(trim($reassertedRollback->getOutput()))->toBe(ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT)
+            ->and(file_get_contents($fixture['proxy_compose']))->toBe($rollingBackState->staticPredecessorBytes)
+            ->and(file_exists($fixture['source_override']))->toBeFalse()
+            ->and(file_get_contents($fixture['state'].'/coolify_port'))->toBe("0.0.0.0:8000\n")
+            ->and(file_get_contents($fixture['state'].'/coolify-proxy_port'))->toBe('')
+            ->and(file_get_contents($fixture['rollback_journal']))->toContain('phase=rolled-back');
+    } finally {
+        $filesystem->remove($fixture['root']);
+    }
+});
+
+it('fails closed when awaiting rollback reassertion has no durable rollback journal', function (): void {
+    $filesystem = new Filesystem;
+    $state = staticListenerHandoffState()
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::RollingBack, '2026-07-19T00:01:00Z')
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement, '2026-07-19T00:02:00Z');
+    $fixture = staticListenerHandoffFixtures($state);
+
+    try {
+        $result = runStaticListenerHandoffCommand(
+            staticListenerHandoffWriter($fixture)->reassertAwaitingRollbackCommandFor(
+                $state,
+                $state->operationId,
+                'test-token',
+            ),
+            $fixture,
+        );
+
+        expect($result->isSuccessful())->toBeFalse()
+            ->and(file_exists($fixture['rollback_journal']))->toBeFalse()
+            ->and(file_get_contents($fixture['proxy_compose']))->toBe($state->staticPredecessorBytes)
+            ->and(file_exists($fixture['source_override']))->toBeFalse()
+            ->and(file_get_contents($fixture['log']))->toBe('');
+    } finally {
+        $filesystem->remove($fixture['root']);
+    }
+});
+
+it('resumes an interrupted reassertion after a delayed activation restores the replacement listener', function (): void {
+    $filesystem = new Filesystem;
+    $rollingBackState = staticListenerHandoffState()
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::RollingBack, '2026-07-19T00:01:00Z');
+    $awaitingState = $rollingBackState
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement, '2026-07-19T00:02:00Z');
+    $fixture = staticListenerHandoffFixtures($rollingBackState);
+
+    try {
+        $writer = staticListenerHandoffWriter($fixture);
+        expect(runStaticListenerHandoffCommand($writer->commandFor($rollingBackState), $fixture)->isSuccessful())->toBeTrue()
+            ->and(runStaticListenerHandoffCommand(
+                $writer->rollbackCommandFor($rollingBackState, $rollingBackState->operationId, 'test-token'),
+                $fixture,
+            )->isSuccessful())->toBeTrue();
+
+        file_put_contents($fixture['proxy_compose'], $rollingBackState->staticReplacementBytes);
+        file_put_contents($fixture['source_override'], $rollingBackState->sourceOverrideBytes);
+        file_put_contents($fixture['state'].'/coolify_port', '');
+        file_put_contents($fixture['state'].'/coolify-proxy_port', "0.0.0.0:8000\n");
+
+        $interrupted = runStaticListenerHandoffCommand(
+            $writer->reassertAwaitingRollbackCommandFor($awaitingState, $awaitingState->operationId, 'test-token'),
+            $fixture,
+            ['COOLIFY_CONTROL_PLANE_ROLLBACK_FAIL_AFTER_TRAEFIK' => '1'],
+        );
+        expect($interrupted->isSuccessful())->toBeFalse()
+            ->and(file_get_contents($fixture['rollback_journal']))->toContain('phase=rolling-back')
+            ->and(file_get_contents($fixture['state'].'/coolify_port'))->toBe('')
+            ->and(file_get_contents($fixture['state'].'/coolify-proxy_port'))->toBe('');
+
+        $resumed = runStaticListenerHandoffCommand(
+            $writer->reassertAwaitingRollbackCommandFor($awaitingState, $awaitingState->operationId, 'test-token'),
+            $fixture,
+        );
+
+        expect($resumed->isSuccessful())->toBeTrue()
+            ->and(trim($resumed->getOutput()))->toBe(ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT)
+            ->and(file_get_contents($fixture['proxy_compose']))->toBe($rollingBackState->staticPredecessorBytes)
+            ->and(file_exists($fixture['source_override']))->toBeFalse()
+            ->and(file_get_contents($fixture['state'].'/coolify_port'))->toBe("0.0.0.0:8000\n")
+            ->and(file_get_contents($fixture['state'].'/coolify-proxy_port'))->toBe('')
+            ->and(file_get_contents($fixture['rollback_journal']))->toContain('phase=rolled-back');
+    } finally {
+        $filesystem->remove($fixture['root']);
+    }
+});
+
+it('rejects a queued activation after the durable rollback tombstone exists', function (): void {
+    $filesystem = new Filesystem;
+    $state = staticListenerHandoffState()
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::RollingBack, '2026-07-19T00:01:00Z');
+    $fixture = staticListenerHandoffFixtures($state);
+
+    try {
+        $writer = staticListenerHandoffWriter($fixture);
+        $activationCommand = $writer->commandFor($state);
+        expect(runStaticListenerHandoffCommand($activationCommand, $fixture)->isSuccessful())->toBeTrue()
+            ->and(runStaticListenerHandoffCommand(
+                $writer->rollbackCommandFor($state, $state->operationId, 'test-token'),
+                $fixture,
+            )->isSuccessful())->toBeTrue();
+        $rollbackJournalBytes = file_get_contents($fixture['rollback_journal']);
+        $commandsAfterRollback = file_get_contents($fixture['log']);
+        unlink($fixture['rollback_journal']);
+
+        $flockReady = $fixture['state'].'/flock-ready';
+        $flockRelease = $fixture['state'].'/flock-release';
+        file_put_contents($fixture['bin'].'/flock', <<<'SH'
+#!/bin/sh
+set -eu
+: > "$FAKE_FLOCK_READY"
+while [ ! -e "$FAKE_FLOCK_RELEASE" ]; do sleep 0.01; done
+SH
+        );
+        chmod($fixture['bin'].'/flock', 0700);
+
+        $queuedActivation = staticListenerHandoffProcess($activationCommand, $fixture, [
+            'FAKE_FLOCK_READY' => $flockReady,
+            'FAKE_FLOCK_RELEASE' => $flockRelease,
+        ]);
+        $queuedActivation->start();
+        $deadline = microtime(true) + 2;
+        while (! file_exists($flockReady) && microtime(true) < $deadline) {
+            usleep(10_000);
+        }
+        $reachedFlock = file_exists($flockReady);
+        file_put_contents($fixture['rollback_journal'], $rollbackJournalBytes);
+        touch($flockRelease);
+        $queuedActivation->wait();
+
+        expect($reachedFlock)->toBeTrue()
+            ->and($queuedActivation->isSuccessful())->toBeFalse()
+            ->and(file_get_contents($fixture['proxy_compose']))->toBe($state->staticPredecessorBytes)
+            ->and(file_exists($fixture['source_override']))->toBeFalse()
+            ->and(file_get_contents($fixture['state'].'/coolify_port'))->toBe("0.0.0.0:8000\n")
+            ->and(file_get_contents($fixture['state'].'/coolify-proxy_port'))->toBe('')
+            ->and(file_get_contents($fixture['rollback_journal']))->toContain('phase=rolled-back')
+            ->and(file_get_contents($fixture['log']))->toBe($commandsAfterRollback);
     } finally {
         $filesystem->remove($fixture['root']);
     }

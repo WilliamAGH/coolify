@@ -129,6 +129,12 @@ final class ExecuteControlPlaneProxyEnrollmentRollback
         string $token,
         Closure $execute,
     ): ControlPlaneProxyEnrollmentState {
+        $this->assertExactOutput(
+            $execute($this->staticHandoff->reassertAwaitingRollbackCommandFor($state, $operationId, $token)),
+            ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT,
+            'static listener rollback reassertion',
+        );
+
         $expectedMember = 'coolify';
         $expectedRevision = 'rollback-'.$state->dynamicRevision;
         $expectedDynamicSha256 = hash('sha256', $state->dynamicPredecessorBytes ?? '');
