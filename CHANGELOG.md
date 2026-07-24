@@ -4,9 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 📚 Documentation
+
+- Update changelog
+
+## [4.13.30-fork] - 2026-07-24
+
+### 🐛 Bug Fixes
+
+- *(status)* Survive null container-status entries in sentinel pushes
+
 ### 🚜 Refactor
 
 - *(ci)* Retire the v4.x candidate machinery for staging-always
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.30-fork
 
 ## [4.13.29-fork] - 2026-07-24
 
