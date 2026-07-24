@@ -2,16 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
-## [unreleased]
+## [4.13.32-fork] - 2026-07-24
 
 ### 🐛 Bug Fixes
 
 - *(blue-green)* Treat FAILED queue rows as terminal owners in lifecycle transitions
+- *(blue-green)* Let recovery begin rollback from a terminally ended queue row
+- *(blue-green)* Let intervention marking own a terminal queue row's phase
+- *(blue-green)* Recover first-adoption crashes torn between fence enrollment and routing mutation
 
 ### 📚 Documentation
 
 - Update changelog
 - Update changelog
+- Update changelog
+
+### 🧪 Testing
+
+- *(blue-green)* Cover recovery convergence for failed terminal queue rows
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.32-fork
 
 ## [4.13.31-fork] - 2026-07-24
 
