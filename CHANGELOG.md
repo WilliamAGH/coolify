@@ -4,8 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🐛 Bug Fixes
+
+- *(deployment)* Pull missing images before unscoped compose attestation
+
 ### 📚 Documentation
 
+- Update changelog
 - Update changelog
 
 ## [4.13.33-fork] - 2026-07-24
