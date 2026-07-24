@@ -14,8 +14,10 @@ ARG GIT_LFS_COMMIT=b84b33847fe6458f36ef521534dc0eac953cb379
 ARG GIT_LFS_SOURCE_SHA256=e1ef5ba4828fa632337be6a2c421a685432faec0405bf187f46a1459e82a9a62
 # https://pkg.go.dev/vuln/GO-2026-5026
 ARG GIT_LFS_X_NET_VERSION=v0.56.0
-ARG GIT_LFS_GO_MOD_SHA256=9b34961df646f48ca832d5201d9a4a78059a06269f50237d682630cf28485460
-ARG GIT_LFS_GO_SUM_SHA256=f2e6c6da7a7d84ef4ffcad42902798eaa2aa14b795c3639a857d36504f2c6396
+# https://pkg.go.dev/vuln/GO-2026-5970
+ARG GIT_LFS_X_TEXT_VERSION=v0.39.0
+ARG GIT_LFS_GO_MOD_SHA256=9fd88c4c8e3c1c3f2ab5d8449c9ce6ec8f9c21124a7a33e3372654f45a5a5be0
+ARG GIT_LFS_GO_SUM_SHA256=709461d5999a5fb0e1acf4d205dcefdd249b8315a8c1a81344b8eefd90f596ee
 # https://github.com/cloudflare/cloudflared/releases/tag/2026.7.1
 ARG CLOUDFLARED_VERSION=2026.7.1
 ARG CLOUDFLARED_TAG=2026.7.1
@@ -25,9 +27,13 @@ ARG CLOUDFLARED_SOURCE_SHA256=94a8f8e057bf4eec41416d6db56a5f8379b833fd40fdce4dcd
 ARG CLOUDFLARED_RELEASE_DATE=2026-07-09-12:06
 # https://github.com/advisories/GHSA-hrxh-6v49-42gf
 ARG CLOUDFLARED_GRPC_VERSION=v1.82.1
-ARG CLOUDFLARED_GO_MOD_SHA256=fb1684e0932f9601704dd9e9db9c113c1a38c1e43d26f3e54eff3ba9121ece66
-ARG CLOUDFLARED_GO_SUM_SHA256=e5443cd65101e0e995c19c7f200bfbdc4ee0fe0f24b387947ae5c2cb9fa736aa
-ARG CLOUDFLARED_VENDOR_MODULES_SHA256=4fe26f81ee87a6efee7ba2a84f76945d5067e2ca6f1d48c8c47a8f19490a6f64
+# https://pkg.go.dev/vuln/GO-2026-5942
+ARG CLOUDFLARED_X_NET_VERSION=v0.56.0
+# https://pkg.go.dev/vuln/GO-2026-5970
+ARG CLOUDFLARED_X_TEXT_VERSION=v0.39.0
+ARG CLOUDFLARED_GO_MOD_SHA256=e0f8109466e24fe9cb240c700025acdc4ec16b054702ea95f7f84e6a746120b1
+ARG CLOUDFLARED_GO_SUM_SHA256=15826bd98600e4f7ebbe7f4042145037fb40a2e9739251a388eb6e46ca6c5c52
+ARG CLOUDFLARED_VENDOR_MODULES_SHA256=a275b5c08eb99e8d9c4c3e877add4f73a2a716306420a7e90fd704411b43a5de
 # https://www.postgresql.org/support/versioning/
 # Note: We are using version 18 of the postgres client (while still using postgres 15 for the postgres server) as version 15 has been removed from Alpine 3.23+ https://pkgs.alpinelinux.org/packages?name=postgresql*-client&branch=v3.23&repo=&arch=x86_64&origin=&flagged=&maintainer=
 ARG POSTGRES_VERSION=18
@@ -129,6 +135,8 @@ ARG CLOUDFLARED_COMMIT
 ARG CLOUDFLARED_SOURCE_SHA256
 ARG CLOUDFLARED_RELEASE_DATE
 ARG CLOUDFLARED_GRPC_VERSION
+ARG CLOUDFLARED_X_NET_VERSION
+ARG CLOUDFLARED_X_TEXT_VERSION
 ARG CLOUDFLARED_GO_MOD_SHA256
 ARG CLOUDFLARED_GO_SUM_SHA256
 ARG CLOUDFLARED_VENDOR_MODULES_SHA256
@@ -143,7 +151,7 @@ RUN curl -fSsL "https://github.com/cloudflare/cloudflared/archive/${CLOUDFLARED_
     test -f vendor/modules.txt
 
 RUN --mount=type=cache,target=/go/pkg/mod \
-    go get "google.golang.org/grpc@${CLOUDFLARED_GRPC_VERSION}" && \
+    go get "google.golang.org/grpc@${CLOUDFLARED_GRPC_VERSION}" "golang.org/x/net@${CLOUDFLARED_X_NET_VERSION}" "golang.org/x/text@${CLOUDFLARED_X_TEXT_VERSION}" && \
     echo "${CLOUDFLARED_GO_MOD_SHA256}  go.mod" | sha256sum -c - && \
     echo "${CLOUDFLARED_GO_SUM_SHA256}  go.sum" | sha256sum -c - && \
     go mod download && \
@@ -166,7 +174,9 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
         -o /out/cloudflared \
         github.com/cloudflare/cloudflared/cmd/cloudflared
 
-RUN go version -m /out/cloudflared | awk -v expected="${CLOUDFLARED_GRPC_VERSION}" '$1 == "dep" && $2 == "google.golang.org/grpc" && $3 == expected { found = 1 } END { exit found ? 0 : 1 }'
+RUN go version -m /out/cloudflared | awk -v expected="${CLOUDFLARED_GRPC_VERSION}" '$1 == "dep" && $2 == "google.golang.org/grpc" && $3 == expected { found = 1 } END { exit found ? 0 : 1 }' && \
+    go version -m /out/cloudflared | awk -v expected="${CLOUDFLARED_X_NET_VERSION}" '$1 == "dep" && $2 == "golang.org/x/net" && $3 == expected { found = 1 } END { exit found ? 0 : 1 }' && \
+    go version -m /out/cloudflared | awk -v expected="${CLOUDFLARED_X_TEXT_VERSION}" '$1 == "dep" && $2 == "golang.org/x/text" && $3 == expected { found = 1 } END { exit found ? 0 : 1 }'
 
 # =================================================================
 # Stage 6: Git LFS from checksum-verified source and Go modules
@@ -178,6 +188,7 @@ ARG GIT_LFS_VERSION
 ARG GIT_LFS_COMMIT
 ARG GIT_LFS_SOURCE_SHA256
 ARG GIT_LFS_X_NET_VERSION
+ARG GIT_LFS_X_TEXT_VERSION
 ARG GIT_LFS_GO_MOD_SHA256
 ARG GIT_LFS_GO_SUM_SHA256
 
@@ -193,7 +204,7 @@ RUN curl -fSsL "https://github.com/git-lfs/git-lfs/archive/${GIT_LFS_COMMIT}.tar
 
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    go get "golang.org/x/net@${GIT_LFS_X_NET_VERSION}" && \
+    go get "golang.org/x/net@${GIT_LFS_X_NET_VERSION}" "golang.org/x/text@${GIT_LFS_X_TEXT_VERSION}" && \
     go mod tidy && \
     echo "${GIT_LFS_GO_MOD_SHA256}  go.mod" | sha256sum -c - && \
     echo "${GIT_LFS_GO_SUM_SHA256}  go.sum" | sha256sum -c - && \
@@ -201,6 +212,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     go mod verify && \
     test "$(go env GOVERSION)" = 'go1.26.5' && \
     test "$(awk '$1 == "golang.org/x/net" { print $2 }' go.mod)" = "${GIT_LFS_X_NET_VERSION}" && \
+    test "$(awk '$1 == "golang.org/x/text" { print $2 }' go.mod)" = "${GIT_LFS_X_TEXT_VERSION}" && \
     GOOS=linux \
     GOARCH="${TARGETARCH}" \
     CGO_ENABLED=0 \
@@ -213,7 +225,8 @@ RUN --mount=type=cache,target=/go/pkg/mod \
         ./git-lfs.go
 
 RUN /out/git-lfs version | grep -E "^git-lfs/${GIT_LFS_VERSION} \\(GitHub; linux ${TARGETARCH}; go 1\\.26\\.5; git ${GIT_LFS_COMMIT}\\)$" && \
-    go version -m /out/git-lfs | awk -v expected="${GIT_LFS_X_NET_VERSION}" '$1 == "dep" && $2 == "golang.org/x/net" && $3 == expected { found = 1 } END { exit found ? 0 : 1 }'
+    go version -m /out/git-lfs | awk -v expected="${GIT_LFS_X_NET_VERSION}" '$1 == "dep" && $2 == "golang.org/x/net" && $3 == expected { found = 1 } END { exit found ? 0 : 1 }' && \
+    go version -m /out/git-lfs | awk -v expected="${GIT_LFS_X_TEXT_VERSION}" '$1 == "dep" && $2 == "golang.org/x/text" && $3 == expected { found = 1 } END { exit found ? 0 : 1 }'
 
 # =================================================================
 # Final Stage: Production image
