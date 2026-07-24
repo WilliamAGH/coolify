@@ -753,6 +753,10 @@ cmd_restore() {
     cmd_env_merge --source-env "$archive/env.source" --target-env "$target_env" \
         --output "$merged_env" --report "$root/source/.env.provenance"
     if [ "$enable_workers" = true ]; then
+        # Set explicitly: the merge retains the target's previous values, and a
+        # target that followed this playbook carries false from earlier restores.
+        set_env_var HORIZON_ENABLED true "$merged_env"
+        set_env_var SCHEDULER_ENABLED true "$merged_env"
         log "WARNING: --enable-workers given; Horizon and the scheduler will run on the target."
         log "WARNING: confirm the source control plane is stopped before exposing this instance."
     else

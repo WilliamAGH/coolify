@@ -207,6 +207,8 @@ PUSHER_PORT=6001
 PUSHER_BACKEND_HOST=127.0.0.1
 PUSHER_BACKEND_PORT=6001
 TERMINAL_PORT=6002
+HORIZON_ENABLED=false
+SCHEDULER_ENABLED=false
 EOF
 }
 
@@ -576,9 +578,10 @@ test_restore_enable_workers_is_explicit() {
   MOCK_RUNNING_CONTAINERS="coolify coolify-db" run_migrate \
     restore --root "$root" $(restore_args) --enable-workers > "$STATE/out.log" 2>&1 \
     || { cat "$STATE/out.log" >&2; fail "restore --enable-workers failed"; }
-  if grep -qx 'HORIZON_ENABLED=false' "$root/source/.env"; then
-    fail "--enable-workers must not disable Horizon"
-  fi
+  grep -qx 'HORIZON_ENABLED=true' "$root/source/.env" \
+    || fail "--enable-workers must set HORIZON_ENABLED=true even when the target carried false"
+  grep -qx 'SCHEDULER_ENABLED=true' "$root/source/.env" \
+    || fail "--enable-workers must set SCHEDULER_ENABLED=true even when the target carried false"
   expect_output_contains 'WARNING: --enable-workers given'
   pass 'restore_enable_workers_is_explicit'
 }
