@@ -149,6 +149,7 @@ final readonly class BlueGreenLifecycleDatabaseLocks
         BlueGreenDeploymentPhase $expectedPhase,
         ?BlueGreenDeploymentPhase $expectedStatePhase = null,
         bool $stateRetainsOperationIdentity = true,
+        bool $allowCancelledRollbackEntry = false,
     ): Builder {
         $expectedStatePhase ??= $expectedPhase;
 
@@ -186,7 +187,7 @@ final readonly class BlueGreenLifecycleDatabaseLocks
             });
         $query = self::constrainLiveApplication($query, $claim->applicationId);
 
-        return self::constrainQueueStatus($query, $expectedStatePhase);
+        return self::constrainQueueStatus($query, $expectedStatePhase, $allowCancelledRollbackEntry);
     }
 
     public static function constrainLiveApplication(Builder $query, int $applicationId): Builder

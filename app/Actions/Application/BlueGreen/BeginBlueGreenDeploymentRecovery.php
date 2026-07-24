@@ -54,6 +54,7 @@ final class BeginBlueGreenDeploymentRecovery
                     ->where('blue_green_rollback_managed_filename', $operation->rollbackKey->managedFilename()),
                 $claim,
                 $expectedPhase,
+                allowCancelledRollbackEntry: true,
             )->update(['blue_green_phase' => BlueGreenDeploymentPhase::ROLLING_BACK->value]);
             if ($deploymentUpdated !== 1) {
                 throw new BlueGreenDeploymentTransitionException('The recovery queue changed while rollback was beginning.');
