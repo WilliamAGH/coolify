@@ -1,5 +1,6 @@
 <?php
 
+use App\Enums\ProxyTypes;
 use App\Models\Application;
 use App\Models\Environment;
 use App\Models\InstanceSettings;
@@ -57,7 +58,23 @@ function recommendedApplicationSettingsPayload(): array
         'is_gzip_enabled' => false,
         'is_stripprefix_enabled' => false,
         'is_raw_compose_deployment_enabled' => true,
+        'is_blue_green_deployment_enabled' => false,
     ];
+}
+
+function eligibleBlueGreenApplication(): Application
+{
+    $server = test()->server;
+    $server->proxy->set('type', ProxyTypes::TRAEFIK->value);
+    $server->save();
+    test()->application->update([
+        'fqdn' => 'https://blue-green-api.example.com',
+        'health_check_enabled' => true,
+        'ports_mappings' => null,
+        'custom_docker_run_options' => null,
+    ]);
+
+    return test()->application->fresh();
 }
 
 test('GET /api/v1/applications/{uuid} includes settings without internal metadata', function () {
@@ -126,6 +143,49 @@ test('proxy settings regenerate managed labels', function () {
         ->assertOk();
 
     expect(base64_decode($this->application->fresh()->custom_labels))->not->toContain('sentinel-label=true');
+});
+
+test('PATCH /api/v1/applications/{uuid} enables blue-green deployment on an eligible application', function () {
+    $application = eligibleBlueGreenApplication();
+    $application->settings()->update(['is_blue_green_deployment_enabled' => false]);
+
+    $this->withHeaders(applicationSettingsApiHeaders($this->bearerToken))
+        ->patchJson("/api/v1/applications/{$application->uuid}", [
+            'is_blue_green_deployment_enabled' => true,
+        ])
+        ->assertOk();
+
+    expect($application->fresh()->settings->is_blue_green_deployment_enabled)->toBeTrue();
+});
+
+test('PATCH /api/v1/applications/{uuid} rejects blue-green opt-in while the application is ineligible', function () {
+    $this->application->settings()->update(['is_blue_green_deployment_enabled' => false]);
+
+    $this->withHeaders(applicationSettingsApiHeaders($this->bearerToken))
+        ->patchJson("/api/v1/applications/{$this->application->uuid}", [
+            'is_blue_green_deployment_enabled' => true,
+        ])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('settings');
+
+    expect($this->application->fresh()->settings->is_blue_green_deployment_enabled)->toBeFalse();
+});
+
+test('PATCH /api/v1/applications/{uuid} rejects blue-green opt-out while durable state exists', function () {
+    $application = eligibleBlueGreenApplication();
+    $application->settings()->update(['is_blue_green_deployment_enabled' => true]);
+    $application->blueGreenDeployments()->create([
+        'standalone_docker_id' => $application->destination_id,
+    ]);
+
+    $this->withHeaders(applicationSettingsApiHeaders($this->bearerToken))
+        ->patchJson("/api/v1/applications/{$application->uuid}", [
+            'is_blue_green_deployment_enabled' => false,
+        ])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('settings');
+
+    expect($application->fresh()->settings->is_blue_green_deployment_enabled)->toBeTrue();
 });
 
 test('rejects invalid boolean application settings', function () {
