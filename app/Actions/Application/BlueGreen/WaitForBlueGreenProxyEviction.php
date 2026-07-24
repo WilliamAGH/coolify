@@ -71,10 +71,11 @@ final class WaitForBlueGreenProxyEviction
                 if ($response['status'] === 0) {
                     throw new BlueGreenDeactivationInProgressException("Managed router {$route['router']} did not return an HTTP status during eviction.");
                 }
-                if ($response['status'] >= 500) {
+                $matchesExpectedState = $this->matchesExpectedState($response, $snapshot, $expectedState);
+                if (! $matchesExpectedState && $response['status'] >= 500) {
                     throw new BlueGreenDeactivationException("Managed router {$route['router']} returned an unsafe gateway/server status during eviction.");
                 }
-                if (! $this->matchesExpectedState($response, $snapshot, $expectedState)) {
+                if (! $matchesExpectedState) {
                     $allRoutesExpected = false;
                 }
             }
@@ -172,8 +173,10 @@ final class WaitForBlueGreenProxyEviction
         return match ($expectedState) {
             BlueGreenProxyEvictionState::Tombstone => $response['status'] === 418
                 && $response['acknowledgements'] === [$snapshot->tombstoneAcknowledgement],
-            BlueGreenProxyEvictionState::Absent => $response['status'] === 404
-                && $response['acknowledgements'] === [],
+            BlueGreenProxyEvictionState::Absent => VerifyBlueGreenPublicRecovery::indicatesRouteAbsence(
+                $response['status'],
+                $response['acknowledgements'],
+            ),
         };
     }
 }

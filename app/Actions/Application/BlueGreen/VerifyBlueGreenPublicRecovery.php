@@ -56,6 +56,8 @@ class VerifyBlueGreenPublicRecovery
      * handle()) and deployment verification (the lifecycle's fenced retry loop).
      * A null $expectedAcknowledgement asserts no acknowledgement leaks at all;
      * $beforeRequest runs after the request is built and before it is sent.
+     * The release proof header is optional — only applications that echo
+     * COOLIFY_DEPLOYMENT_RELEASE_PROOF emit it — but strict when present.
      *
      * @param  array{router: string, url: string}  $route
      */
@@ -148,6 +150,36 @@ class VerifyBlueGreenPublicRecovery
         ).'"';
     }
 
+    /**
+     * A managed host with no blue-green route answers with the server's
+     * catchall: 404 when the default redirect is disabled, 503 from the
+     * default empty-service catchall, or 302 when a redirect URL is set
+     * (Server::setupDefaultRedirect). Managed routes attach the probe
+     * acknowledgement through a response middleware even on backend error
+     * statuses, so a catchall status without any acknowledgement can only
+     * mean the route is not present in Traefik.
+     *
+     * @param  list<string>  $acknowledgements
+     */
+    public static function indicatesRouteAbsence(int $status, array $acknowledgements): bool
+    {
+        return $acknowledgements === [] && in_array($status, [404, 503, 302], true);
+    }
+
+    /**
+     * Traefik's file provider applies a freshly written managed file only
+     * after its throttle window (~2s), during which the previous file keeps
+     * serving. A healthy response carrying a stale or absent acknowledgement
+     * is therefore a converging observation worth retrying; any error status
+     * stays terminal so the post-switch zero-error guarantee holds.
+     */
+    public static function isConvergingRouteObservation(Throwable $exception): bool
+    {
+        return $exception instanceof BlueGreenPublicRouteAcknowledgementMismatch
+            && $exception->status >= 200
+            && $exception->status < 400;
+    }
+
     /** @return array{status: int, acknowledgements: list<string>} */
     public function responseFor(string $headers): array
     {
@@ -204,7 +236,7 @@ class VerifyBlueGreenPublicRecovery
             $releaseProofMatches[1],
             static fn (string $releaseProof): bool => trim($releaseProof) !== '',
         )));
-        if ($releaseProofs !== [$expectedReleaseProof]) {
+        if ($releaseProofs !== [] && $releaseProofs !== [$expectedReleaseProof]) {
             throw new RuntimeException("The restored router {$route['router']} did not return the exact application release proof.");
         }
     }
