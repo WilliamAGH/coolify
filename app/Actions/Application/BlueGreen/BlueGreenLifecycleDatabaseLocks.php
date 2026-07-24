@@ -248,6 +248,58 @@ final readonly class BlueGreenLifecycleDatabaseLocks
             });
     }
 
+    /**
+     * Authorizes a terminal FAILED write for a claimed queue row whose durable
+     * blue-green ownership is provably gone: no state row names this deployment
+     * as its operation or pending owner anymore, so no canonical lifecycle
+     * transition can ever terminalize the row itself. Without this escape the
+     * row would stay in progress forever. The ownership absence is re-checked
+     * atomically inside the update, so a canonical owner that reappears
+     * concurrently keeps exclusive control.
+     */
+    public static function constrainOrphanedTerminalQueueOwner(
+        Builder $query,
+        ApplicationDeploymentQueue $snapshot,
+    ): Builder {
+        if ($snapshot->blue_green_supersession_generation === null) {
+            return self::constrainTerminalQueueOwner($query, $snapshot);
+        }
+
+        $query = $query
+            ->where('application_id', $snapshot->application_id)
+            ->where('deployment_uuid', $snapshot->deployment_uuid)
+            ->where('pull_request_id', $snapshot->pull_request_id)
+            ->where('blue_green_supersession_generation', $snapshot->blue_green_supersession_generation)
+            ->whereNotExists(function ($stateQuery) use ($snapshot): void {
+                $stateQuery->selectRaw('1')
+                    ->from('application_blue_green_deployments as orphaned_owner_state')
+                    ->where('orphaned_owner_state.application_id', (int) $snapshot->application_id)
+                    ->where('orphaned_owner_state.standalone_docker_id', (int) $snapshot->destination_id)
+                    ->where(function ($ownership) use ($snapshot): void {
+                        $ownership->where('orphaned_owner_state.operation_deployment_uuid', $snapshot->deployment_uuid)
+                            ->orWhere(function ($pendingOwnership) use ($snapshot): void {
+                                // A pending reference only names a durable owner
+                                // while no other operation took the state over.
+                                $pendingOwnership->whereNull('orphaned_owner_state.operation_deployment_uuid')
+                                    ->where('orphaned_owner_state.pending_deployment_uuid', $snapshot->deployment_uuid);
+                            });
+                    });
+            })
+            ->whereNotExists(function ($deactivationQuery) use ($snapshot): void {
+                $deactivationQuery->selectRaw('1')
+                    ->from('application_blue_green_deactivations as orphaned_owner_deactivation')
+                    ->where('orphaned_owner_deactivation.application_id', (int) $snapshot->application_id)
+                    ->where('orphaned_owner_deactivation.standalone_docker_id', (int) $snapshot->destination_id);
+            });
+        $query = $snapshot->destination_id === null
+            ? $query->whereNull('destination_id')
+            : $query->where('destination_id', $snapshot->destination_id);
+
+        return $snapshot->server_id === null
+            ? $query->whereNull('server_id')
+            : $query->where('server_id', $snapshot->server_id);
+    }
+
     public static function constrainQueueStatus(
         Builder $query,
         BlueGreenDeploymentPhase $phase,
