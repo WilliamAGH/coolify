@@ -931,3 +931,33 @@ it('allows only exact absent-route scopes to refresh operation fingerprints', fu
         $filesystem->remove($proxyPath);
     }
 });
+
+it('normalizes an inherited group-writable state directory before fencing', function () {
+    $filesystem = new Filesystem;
+    $proxyPath = sys_get_temp_dir().'/coolify-blue-green-fence-acl-'.bin2hex(random_bytes(8));
+    $filesystem->mkdir($proxyPath.'/dynamic', 0700);
+    // Fleet hosts apply default POSIX ACLs under /data/coolify, so the fence's
+    // own mkdir inherits a group-writable state directory (observed as 770 on
+    // popos-sf3); the durable-artifact permission fence must not fail on it.
+    $filesystem->mkdir($proxyPath.'/.coolify-blue-green');
+    $filesystem->chmod($proxyPath.'/.coolify-blue-green', 0770);
+
+    try {
+        $writer = destinationFenceWriter();
+        $configuration = compileDestinationFencedBlueGreenConfiguration(
+            epoch: 1,
+            activeColor: BlueGreenDeploymentColor::BLUE,
+            deploymentUuid: 'deployment-blue-1',
+            containerId: '0123456789abcdef',
+            operationId: 'acl-normalized-adoption',
+        );
+        $key = new BlueGreenProxyRollbackKey('acl-normalized-adoption', null, $configuration->state);
+        runDestinationFenceCommand($writer->commandFor($proxyPath, $configuration, $key, destinationFenceBootId()));
+
+        expect(substr(sprintf('%o', fileperms($proxyPath.'/.coolify-blue-green')), -3))->toBe('700')
+            ->and(file_get_contents($writer->managedPath($proxyPath, $configuration->managedFilename)))
+            ->toBe($configuration->yaml);
+    } finally {
+        $filesystem->remove($proxyPath);
+    }
+});

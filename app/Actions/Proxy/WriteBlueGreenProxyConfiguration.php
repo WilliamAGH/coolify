@@ -185,6 +185,13 @@ class WriteBlueGreenProxyConfiguration
 
         return [
             'mkdir -p -- '.escapeshellarg($stateDirectory),
+            // Destination hosts may apply default POSIX ACLs to the coolify
+            // tree, so the freshly created (or inherited) state directory can
+            // be group-writable. Normalize it to the permissions the durable
+            // artifact fence requires instead of failing on inheritance; the
+            // fence still verifies afterward, so this stays fail-closed.
+            'chmod 700 '.escapeshellarg($stateDirectory),
+            '! command -v setfacl >/dev/null 2>&1 || setfacl -b -k '.escapeshellarg($stateDirectory),
             'command -v flock >/dev/null 2>&1',
             'if [ -e '.$safeLockPath.' ] || [ -L '.$safeLockPath.' ]; then test -f '.$safeLockPath.'; test ! -L '.$safeLockPath.'; fi',
             'exec 9>'.$safeLockPath,
