@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🐛 Bug Fixes
+
+- *(release)* Skip check-run source binding for reusable-workflow callers
+
+## [4.13.27-fork] - 2026-07-24
+
 ### 🚀 Features
 
 - *(ui)* Expose the blue-green deployment opt-in as an Advanced settings toggle
@@ -18,6 +24,7 @@ All notable changes to this project will be documented in this file.
 ### 📚 Documentation
 
 - Update changelog (#176)
+- Update changelog (#179)
 
 ### 🧪 Testing
 
