@@ -32,5 +32,57 @@ it('fails closed for non-compensable terminal queue ownership', function (Applic
         ->toThrow(BlueGreenDeploymentTransitionException::class, 'live generation');
 })->with([
     'finished queue' => ApplicationDeploymentStatus::FINISHED,
-    'failed queue' => ApplicationDeploymentStatus::FAILED,
 ]);
+
+it('reconstructs recovery for a failed terminal queue owner instead of failing closed', function () {
+    $scenario = BlueGreenRecoveryScenario::create();
+    $scenario->deployment->update(['status' => ApplicationDeploymentStatus::FAILED->value]);
+
+    $operation = ReconstructBlueGreenDeploymentRecovery::run($scenario->state);
+
+    expect($operation->wasFinalized)->toBeTrue()
+        ->and($operation->routingMutationRecorded)->toBeTrue()
+        ->and($operation->claim->deploymentUuid)->toBe(BlueGreenRecoveryScenario::OPERATION_UUID);
+});
+
+it('reconstructs the recorded first-adoption enrollment as the expected destination state', function () {
+    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
+    $scenario->state->update([
+        'destination_fence_epoch' => 0,
+        'destination_fence_operation_id' => BlueGreenRecoveryScenario::OPERATION_UUID,
+        'destination_fence_mutation_sequence' => 1,
+        'managed_file_sha256' => null,
+        'destination_topology_digest' => $scenario->state->operation_topology_digest,
+        'application_routing_config_digest' => $scenario->state->operation_routing_config_digest,
+    ]);
+
+    $operation = ReconstructBlueGreenDeploymentRecovery::run($scenario->state->fresh());
+    $expectedState = $operation->rollbackKey->expectedState;
+
+    expect($operation->routingMutationRecorded)->toBeFalse()
+        ->and($expectedState)->not->toBeNull()
+        ->and($expectedState->destinationFenceEpoch)->toBe(0)
+        ->and($expectedState->mutationSequence)->toBe(1)
+        ->and($expectedState->routingRevision)->toBe(0)
+        ->and($expectedState->managedSha256)->toBeNull()
+        ->and($expectedState->activeColor)->toBeNull()
+        ->and($expectedState->operationId)->toBe(BlueGreenRecoveryScenario::OPERATION_UUID)
+        ->and($operation->rollbackKey->replacementState->mutationSequence)->toBe(2)
+        ->and($operation->rollbackKey->replacementState->destinationFenceEpoch)->toBe(1)
+        ->and($operation->currentDestinationState?->serialize())->toBe($expectedState->serialize());
+});
+
+it('keeps a foreign partial destination fence fail-closed during first-adoption recovery', function () {
+    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
+    $scenario->state->update([
+        'destination_fence_epoch' => 0,
+        'destination_fence_operation_id' => 'foreign-operation',
+        'destination_fence_mutation_sequence' => 1,
+        'managed_file_sha256' => null,
+        'destination_topology_digest' => $scenario->state->operation_topology_digest,
+        'application_routing_config_digest' => $scenario->state->operation_routing_config_digest,
+    ]);
+
+    expect(fn () => ReconstructBlueGreenDeploymentRecovery::run($scenario->state->fresh()))
+        ->toThrow(BlueGreenDeploymentTransitionException::class, 'no exact first-adoption destination state');
+});

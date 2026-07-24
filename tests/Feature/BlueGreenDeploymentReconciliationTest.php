@@ -348,6 +348,89 @@ it('converges only a stale unmutated operation whose exact candidate is proven a
     );
 });
 
+it('converges a mid-flight failed deployment left rolling back', function (): void {
+    Notification::fake();
+    InspectBlueGreenContainer::shouldRun()->andReturn(BlueGreenContainerInspection::missing());
+    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
+    $scenario->application->team()->emailNotificationSettings()->update([
+        'use_instance_email_settings' => true,
+        'deployment_failure_email_notifications' => true,
+    ]);
+    $scenario->state->update(['phase' => BlueGreenDeploymentPhase::ROLLING_BACK]);
+    $failedAt = now()->subMinutes(11)->startOfSecond();
+    $scenario->deployment->update([
+        'blue_green_phase' => BlueGreenDeploymentPhase::ROLLING_BACK,
+        'status' => ApplicationDeploymentStatus::FAILED->value,
+        'finished_at' => $failedAt,
+    ]);
+    blueGreenReconciliationMakeQueueStale($scenario->deployment);
+
+    $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
+
+    expect($result->outcome)->toBe(BlueGreenReconciliationResult::RECONCILED, $result->message)
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::IDLE)
+        ->and($scenario->state->fresh()->operation_deployment_uuid)->toBeNull()
+        ->and($scenario->state->fresh()->routing_revision)->toBe(0)
+        ->and($scenario->deployment->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::IDLE)
+        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value)
+        ->and($scenario->deployment->fresh()->finished_at->equalTo($failedAt))->toBeTrue();
+    Notification::assertSentToTimes(
+        $scenario->application->team(),
+        BlueGreenDeploymentRolledBack::class,
+        1,
+    );
+});
+
+it('converges a failed deployment interrupted before rollback began', function (): void {
+    Notification::fake();
+    InspectBlueGreenContainer::shouldRun()->andReturn(BlueGreenContainerInspection::missing());
+    BlueGreenProxyRollbackArtifactReader::shouldRun()->andReturnNull();
+    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
+    $scenario->deployment->update([
+        'status' => ApplicationDeploymentStatus::FAILED->value,
+        'finished_at' => now()->subMinutes(11),
+    ]);
+    blueGreenReconciliationMakeQueueStale($scenario->deployment);
+
+    $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
+
+    expect($result->outcome)->toBe(BlueGreenReconciliationResult::RECONCILED, $result->message)
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::IDLE)
+        ->and($scenario->state->fresh()->operation_deployment_uuid)->toBeNull()
+        ->and($scenario->deployment->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::IDLE)
+        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value);
+});
+
+it('converges a first-adoption crash that recorded fence enrollment before its routing mutation', function (): void {
+    Notification::fake();
+    InspectBlueGreenContainer::shouldRun()->andReturn(BlueGreenContainerInspection::missing());
+    BlueGreenProxyRollbackArtifactReader::shouldRun()->andReturnNull();
+    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
+    $scenario->state->update([
+        'destination_fence_epoch' => 0,
+        'destination_fence_operation_id' => BlueGreenRecoveryScenario::OPERATION_UUID,
+        'destination_fence_mutation_sequence' => 1,
+        'managed_file_sha256' => null,
+        'destination_topology_digest' => $scenario->state->operation_topology_digest,
+        'application_routing_config_digest' => $scenario->state->operation_routing_config_digest,
+    ]);
+    $scenario->deployment->update([
+        'status' => ApplicationDeploymentStatus::FAILED->value,
+        'finished_at' => now()->subMinutes(11),
+    ]);
+    blueGreenReconciliationMakeQueueStale($scenario->deployment);
+
+    $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
+
+    expect($result->outcome)->toBe(BlueGreenReconciliationResult::RECONCILED, $result->message)
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::IDLE)
+        ->and($scenario->state->fresh()->routing_revision)->toBe(0)
+        ->and($scenario->state->fresh()->operation_deployment_uuid)->toBeNull()
+        ->and($scenario->state->fresh()->destination_fence_epoch)->toBe(0)
+        ->and($scenario->state->fresh()->destination_fence_operation_id)->toBe(BlueGreenRecoveryScenario::OPERATION_UUID)
+        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value);
+});
+
 it('reconciles one interrupted state per bounded deterministic scan', function (): void {
     $first = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: true);
     $firstOperationUuid = 'recovery-candidate-operation-first';
