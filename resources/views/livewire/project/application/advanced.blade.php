@@ -101,7 +101,11 @@
                 />
                 <x-forms.button canGate="update" :canResource="$application" type="submit">Save</x-forms.button>
             </form>
-            @if ($application->settings->is_blue_green_deployment_enabled)
+            <x-forms.checkbox
+                helper="Deploy a fully health-checked new color next to the running one and switch traffic only after it is release-proven, with fast rollback to the previous color. Disable to use the classic rolling update path instead. Disabling is blocked while durable blue-green state exists; stop the application and finish the blue-green cleanup lifecycle first."
+                instantSave="instantSaveBlueGreenDeployment" id="isBlueGreenDeploymentEnabled"
+                label="Blue-Green Deployments" canGate="update" :canResource="$application" />
+            @if ($isBlueGreenDeploymentEnabled)
                 <form class="flex items-end gap-2" wire:submit.prevent='saveBlueGreenReplicaCount'>
                     <x-forms.input
                         type="number"
