@@ -44,6 +44,7 @@ jobs:
         env:
           CHECK_RUN_SHA: ${{ github.sha }}
           VALIDATION_SOURCE_SHA: ${{ inputs.source_sha }}
+          VALIDATION_BASE_SHA: ${{ inputs.base_sha }}
         run: |
           set -Eeuo pipefail
           if [[ -z "$VALIDATION_SOURCE_SHA" ]]; then
@@ -53,17 +54,21 @@ jobs:
             echo "The requested validation source is not a full lowercase commit SHA." >&2
             exit 1
           }
-          # Reusable-workflow callers (the v4.x candidate gate) validate a
-          # source that intentionally differs from the caller revision:
-          # github.sha is the caller's base, while the gate binds the exact
-          # candidate ref to the requested SHA and attests the check to it.
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_call" ]]; then
+          if [[ "$VALIDATION_SOURCE_SHA" == "$CHECK_RUN_SHA" ]]; then
             exit 0
           fi
-          [[ "$VALIDATION_SOURCE_SHA" == "$CHECK_RUN_SHA" ]] || {
-            echo "The requested validation source does not match the check-run revision." >&2
-            exit 1
-          }
+          # Gate shape: a reusable-workflow caller (the v4.x candidate gate)
+          # validates a candidate that descends from the frozen base this run
+          # executes on. github.event_name stays the caller's trigger, so the
+          # shape is recognized by the frozen base input instead. The caller
+          # binds the exact candidate ref to the requested SHA and attests
+          # the check to it; the binding here proves the run executes on the
+          # declared base.
+          if [[ -n "$VALIDATION_BASE_SHA" && "$CHECK_RUN_SHA" == "$VALIDATION_BASE_SHA" ]]; then
+            exit 0
+          fi
+          echo "The requested validation source does not match the check-run revision." >&2
+          exit 1
 
   php:
     name: PHP 8.5 application
