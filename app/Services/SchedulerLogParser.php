@@ -7,6 +7,9 @@ use Illuminate\Support\Facades\File;
 
 class SchedulerLogParser
 {
+    /** @param ?string $logDirectory Overrides storage_path('logs'); lets tests parse an isolated directory. */
+    public function __construct(private readonly ?string $logDirectory = null) {}
+
     /**
      * Get recent skip events from the scheduled log files.
      *
@@ -83,7 +86,7 @@ class SchedulerLogParser
 
     private function getLogFiles(): array
     {
-        $logDir = storage_path('logs');
+        $logDir = $this->logDirectory ?? storage_path('logs');
         if (! File::isDirectory($logDir)) {
             return [];
         }

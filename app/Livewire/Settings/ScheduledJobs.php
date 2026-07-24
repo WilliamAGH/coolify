@@ -111,7 +111,7 @@ class ScheduledJobs extends Component
     {
         $this->executions = $this->getExecutions($teamId);
 
-        $parser = new SchedulerLogParser;
+        $parser = app(SchedulerLogParser::class);
         $allSkips = $parser->getRecentSkips(500, $teamId);
         $this->skipTotalCount = $allSkips->count();
         $this->skipLogs = $this->enrichSkipLogsWithLinks(

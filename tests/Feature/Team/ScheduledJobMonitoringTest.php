@@ -21,30 +21,17 @@ uses(RefreshDatabase::class);
 
 function withIsolatedScheduledLogsForMonitoringTest(callable $callback): mixed
 {
-    $logDir = storage_path('logs');
-    if (! is_dir($logDir)) {
-        mkdir($logDir, 0755, true);
-    }
-
-    $renamed = [];
-    foreach (glob($logDir.'/scheduled-*.log') as $log) {
-        $tmp = $log.'.scheduled-jobs-test-bak';
-        rename($log, $tmp);
-        $renamed[$tmp] = $log;
-    }
+    $logDir = storage_path('framework/testing/scheduler-logs-'.uniqid());
+    mkdir($logDir, 0755, true);
+    app()->bind(SchedulerLogParser::class, fn (): SchedulerLogParser => new SchedulerLogParser($logDir));
 
     try {
         return $callback($logDir.'/scheduled-'.now()->format('Y-m-d').'.log');
     } finally {
-        foreach (glob($logDir.'/scheduled-*.log') as $log) {
+        foreach (glob($logDir.'/scheduled-*.log') ?: [] as $log) {
             @unlink($log);
         }
-
-        foreach ($renamed as $tmp => $original) {
-            if (file_exists($tmp)) {
-                rename($tmp, $original);
-            }
-        }
+        @rmdir($logDir);
     }
 }
 
@@ -176,27 +163,50 @@ test('filter by date range works', function () {
         ->assertStatus(200);
 });
 
+/**
+ * Isolated scheduler log directory so the parser never reads the real
+ * storage/logs, which accumulates entries from the dev environment.
+ *
+ * @param  list<string>  $lines
+ */
+function isolatedSchedulerLogDirectory(array $lines = []): string
+{
+    $logDir = storage_path('framework/testing/scheduler-logs-'.uniqid());
+    mkdir($logDir, 0755, true);
+    if ($lines !== []) {
+        file_put_contents($logDir.'/scheduled-'.now()->format('Y-m-d').'.log', implode("\n", $lines)."\n");
+    }
+
+    return $logDir;
+}
+
+function removeIsolatedSchedulerLogDirectory(string $logDir): void
+{
+    foreach (glob($logDir.'/scheduled-*.log') ?: [] as $logFile) {
+        @unlink($logFile);
+    }
+    @rmdir($logDir);
+}
+
 test('scheduler log parser returns empty collection when no logs exist', function () {
-    $parser = new SchedulerLogParser;
+    $logDir = isolatedSchedulerLogDirectory();
+    $parser = new SchedulerLogParser($logDir);
 
     $skips = $parser->getRecentSkips();
     expect($skips)->toBeEmpty();
 
     $runs = $parser->getRecentRuns();
     expect($runs)->toBeEmpty();
-})->skip(fn () => file_exists(storage_path('logs/scheduled-'.now()->format('Y-m-d').'.log')), 'Skipped: log file already exists from other tests');
+
+    removeIsolatedSchedulerLogDirectory($logDir);
+});
 
 test('scheduler log parser parses skip entries correctly', function () {
-    $logPath = storage_path('logs/scheduled-'.now()->format('Y-m-d').'.log');
-    $logDir = dirname($logPath);
-    if (! is_dir($logDir)) {
-        mkdir($logDir, 0755, true);
-    }
+    $logDir = isolatedSchedulerLogDirectory([
+        '['.now()->format('Y-m-d H:i:s').'] production.INFO: Backup skipped {"type":"backup","skip_reason":"server_not_functional","execution_time":"'.now()->toIso8601String().'","backup_id":1,"team_id":5}',
+    ]);
 
-    $logLine = '['.now()->format('Y-m-d H:i:s').'] production.INFO: Backup skipped {"type":"backup","skip_reason":"server_not_functional","execution_time":"'.now()->toIso8601String().'","backup_id":1,"team_id":5}';
-    file_put_contents($logPath, $logLine."\n");
-
-    $parser = new SchedulerLogParser;
+    $parser = new SchedulerLogParser($logDir);
     $skips = $parser->getRecentSkips();
 
     expect($skips)->toHaveCount(1);
@@ -204,60 +214,31 @@ test('scheduler log parser parses skip entries correctly', function () {
     expect($skips->first()['reason'])->toBe('server_not_functional');
     expect($skips->first()['team_id'])->toBe(5);
 
-    // Cleanup
-    @unlink($logPath);
+    removeIsolatedSchedulerLogDirectory($logDir);
 });
 
 test('scheduler log parser excludes started events from runs', function () {
-    $logPath = storage_path('logs/scheduled-test-started-filter.log');
-    $logDir = dirname($logPath);
-    if (! is_dir($logDir)) {
-        mkdir($logDir, 0755, true);
-    }
-
-    // Temporarily rename existing logs so they don't interfere
-    $existingLogs = glob(storage_path('logs/scheduled-*.log'));
-    $renamed = [];
-    foreach ($existingLogs as $log) {
-        $tmp = $log.'.bak';
-        rename($log, $tmp);
-        $renamed[$tmp] = $log;
-    }
-
-    $logPath = storage_path('logs/scheduled-'.now()->format('Y-m-d').'.log');
-    $lines = [
+    $logDir = isolatedSchedulerLogDirectory([
         '['.now()->format('Y-m-d H:i:s').'] production.INFO: ScheduledJobManager started {}',
         '['.now()->format('Y-m-d H:i:s').'] production.INFO: ScheduledJobManager completed {"duration_ms":74,"dispatched":1,"skipped":13}',
-    ];
-    file_put_contents($logPath, implode("\n", $lines)."\n");
+    ]);
 
-    $parser = new SchedulerLogParser;
+    $parser = new SchedulerLogParser($logDir);
     $runs = $parser->getRecentRuns();
 
     expect($runs)->toHaveCount(1);
     expect($runs->first()['message'])->toContain('completed');
 
-    // Cleanup
-    @unlink($logPath);
-    foreach ($renamed as $tmp => $original) {
-        rename($tmp, $original);
-    }
+    removeIsolatedSchedulerLogDirectory($logDir);
 });
 
 test('scheduler log parser filters by team id', function () {
-    $logPath = storage_path('logs/scheduled-'.now()->format('Y-m-d').'.log');
-    $logDir = dirname($logPath);
-    if (! is_dir($logDir)) {
-        mkdir($logDir, 0755, true);
-    }
-
-    $lines = [
+    $logDir = isolatedSchedulerLogDirectory([
         '['.now()->format('Y-m-d H:i:s').'] production.INFO: Backup skipped {"type":"backup","skip_reason":"server_not_functional","team_id":1}',
         '['.now()->format('Y-m-d H:i:s').'] production.INFO: Backup skipped {"type":"backup","skip_reason":"subscription_unpaid","team_id":2}',
-    ];
-    file_put_contents($logPath, implode("\n", $lines)."\n");
+    ]);
 
-    $parser = new SchedulerLogParser;
+    $parser = new SchedulerLogParser($logDir);
 
     $allSkips = $parser->getRecentSkips(100);
     expect($allSkips)->toHaveCount(2);
@@ -266,44 +247,24 @@ test('scheduler log parser filters by team id', function () {
     expect($team1Skips)->toHaveCount(1);
     expect($team1Skips->first()['team_id'])->toBe(1);
 
-    // Cleanup
-    @unlink($logPath);
+    removeIsolatedSchedulerLogDirectory($logDir);
 });
 
 test('skipped jobs show fallback when resource is deleted', function () {
     $this->actingAs($this->rootUser);
     session(['currentTeam' => $this->rootTeam]);
 
-    $logPath = storage_path('logs/scheduled-'.now()->format('Y-m-d').'.log');
-    $logDir = dirname($logPath);
-    if (! is_dir($logDir)) {
-        mkdir($logDir, 0755, true);
-    }
+    withIsolatedScheduledLogsForMonitoringTest(function (string $logPath) {
+        file_put_contents(
+            $logPath,
+            '['.now()->format('Y-m-d H:i:s').'] production.INFO: Task skipped {"type":"task","skip_reason":"application_not_running","task_id":99999,"task_name":"my-cron-job","team_id":0}'."\n"
+        );
 
-    // Temporarily rename existing logs so they don't interfere
-    $existingLogs = glob(storage_path('logs/scheduled-*.log'));
-    $renamed = [];
-    foreach ($existingLogs as $log) {
-        $tmp = $log.'.bak';
-        rename($log, $tmp);
-        $renamed[$tmp] = $log;
-    }
-
-    $lines = [
-        '['.now()->format('Y-m-d H:i:s').'] production.INFO: Task skipped {"type":"task","skip_reason":"application_not_running","task_id":99999,"task_name":"my-cron-job","team_id":0}',
-    ];
-    file_put_contents($logPath, implode("\n", $lines)."\n");
-
-    Livewire::test(ScheduledJobs::class)
-        ->assertStatus(200)
-        ->assertSee('my-cron-job')
-        ->assertSee('Application not running');
-
-    // Cleanup
-    @unlink($logPath);
-    foreach ($renamed as $tmp => $original) {
-        rename($tmp, $original);
-    }
+        Livewire::test(ScheduledJobs::class)
+            ->assertStatus(200)
+            ->assertSee('my-cron-job')
+            ->assertSee('Application not running');
+    });
 });
 
 test('skipped service database backups render with service backup link', function () {
