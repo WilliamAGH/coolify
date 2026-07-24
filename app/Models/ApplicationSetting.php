@@ -4,6 +4,7 @@ namespace App\Models;
 
 use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
 use App\Enums\BlueGreenDeploymentPhase;
+use App\Exceptions\BlueGreenAdmissionException;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Model;
@@ -217,7 +218,7 @@ class ApplicationSetting extends Model
             if ($states->contains(
                 static fn (ApplicationBlueGreenDeployment $state): bool => $state->phase !== BlueGreenDeploymentPhase::IDLE,
             )) {
-                throw new RuntimeException('Blue-green routing and lifecycle settings cannot change while a deployment operation is in progress. Wait for promotion or recovery to finish.');
+                throw new BlueGreenAdmissionException('Blue-green routing and lifecycle settings cannot change while a deployment operation is in progress. Wait for promotion or recovery to finish.');
             }
 
             $application->setRelation('settings', $this);
@@ -238,7 +239,7 @@ class ApplicationSetting extends Model
         $application = $this->application;
         if ($application === null) {
             if ($this->is_blue_green_deployment_enabled) {
-                throw new RuntimeException('Blue-green deployments require an application before they can be enabled.');
+                throw new BlueGreenAdmissionException('Blue-green deployments require an application before they can be enabled.');
             }
 
             return;
@@ -246,7 +247,7 @@ class ApplicationSetting extends Model
         if ($this->isDirty('is_blue_green_deployment_enabled')
             && ! $this->is_blue_green_deployment_enabled
             && ($blockedReason = $application->blueGreenDeploymentOptOutBlockedReason()) !== null) {
-            throw new RuntimeException($blockedReason);
+            throw new BlueGreenAdmissionException($blockedReason);
         }
 
         $isEnablingBlueGreenDeployment = $this->isDirty('is_blue_green_deployment_enabled')

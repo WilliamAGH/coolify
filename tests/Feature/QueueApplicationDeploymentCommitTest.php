@@ -417,6 +417,41 @@ describe('application deployment execution phase handoff', function () {
             ->and($deployment->fresh()->current_process_id)->toBeNull();
     });
 
+    test('the owning attempt keeps process ownership for terminal-status cleanup commands', function () {
+        $application = makeApplication($this->environment->id, $this->destination->id, null);
+        $deployment = makeQueueAdmissionDeployment(
+            $application,
+            $this->server,
+            'queue-process-owner-terminal-cleanup',
+        );
+        expect($deployment->claimForDispatch(bypassServerCapacity: true))->toBeTrue();
+        $deployment = $deployment->fresh();
+        $attemptUuid = $deployment->horizon_job_id;
+        expect($deployment->acquireDispatchExecution($attemptUuid, 'prepare-worker-a'))->toBeTrue();
+
+        foreach ([ApplicationDeploymentStatus::FINISHED, ApplicationDeploymentStatus::FAILED] as $terminalStatus) {
+            ApplicationDeploymentQueue::query()
+                ->whereKey($deployment->id)
+                ->update(['status' => $terminalStatus->value]);
+
+            expect($deployment->claimCurrentProcessOwnership((string) Str::uuid(), 'foreign-cleanup'))->toBeFalse()
+                ->and($deployment->fresh()->current_process_id)->toBeNull()
+                ->and($deployment->claimCurrentProcessOwnership($attemptUuid, "cleanup-{$terminalStatus->value}"))->toBeTrue()
+                ->and($deployment->fresh()->current_process_id)->toBe("cleanup-{$terminalStatus->value}")
+                ->and($deployment->releaseCurrentProcessOwnership($attemptUuid, "cleanup-{$terminalStatus->value}"))->toBeTrue()
+                ->and($deployment->fresh()->current_process_id)->toBeNull();
+        }
+
+        foreach ([ApplicationDeploymentStatus::CANCELLED_BY_USER, ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET] as $cancelledStatus) {
+            ApplicationDeploymentQueue::query()
+                ->whereKey($deployment->id)
+                ->update(['status' => $cancelledStatus->value]);
+
+            expect($deployment->claimCurrentProcessOwnership($attemptUuid, 'cleanup-after-cancel'))->toBeFalse()
+                ->and($deployment->fresh()->current_process_id)->toBeNull();
+        }
+    });
+
     test('only the owning preparation attempt can persist its build server', function () {
         $application = makeApplication($this->environment->id, $this->destination->id, null);
         $buildServer = Server::factory()->create(['team_id' => $this->team->id]);

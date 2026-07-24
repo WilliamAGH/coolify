@@ -66,6 +66,9 @@ class Advanced extends Component
     #[Validate(['string', 'nullable'])]
     public ?string $stopGracePeriod = null;
 
+    #[Validate(['boolean'])]
+    public bool $isBlueGreenDeploymentEnabled = true;
+
     #[Validate(['integer', 'min:0', 'max:3600'])]
     public int $blueGreenInactiveRetentionSeconds = DEFAULT_BLUE_GREEN_INACTIVE_RETENTION_SECONDS;
 
@@ -164,6 +167,7 @@ class Advanced extends Component
         // Load stop_grace_period separately since it has its own save handler
         // Convert null to empty string to prevent dirty detection issues
         $this->stopGracePeriod = $this->application->settings->stop_grace_period ?? '';
+        $this->isBlueGreenDeploymentEnabled = (bool) $this->application->settings->is_blue_green_deployment_enabled;
         $this->blueGreenInactiveRetentionSeconds = $this->application->settings->blueGreenInactiveRetentionSeconds();
         $this->blueGreenReplicaCount = $this->application->settings->blueGreenReplicaCount();
     }
@@ -299,6 +303,23 @@ class Advanced extends Component
             throw $e;
         } catch (\Throwable $e) {
             return handleError($e, $this);
+        }
+    }
+
+    public function instantSaveBlueGreenDeployment(): void
+    {
+        try {
+            $this->authorize('update', $this->application);
+            $this->application->settings->update([
+                'is_blue_green_deployment_enabled' => $this->isBlueGreenDeploymentEnabled,
+            ]);
+            $this->dispatch('success', $this->isBlueGreenDeploymentEnabled
+                ? 'Blue-green deployments enabled.'
+                : 'Blue-green deployments disabled. The next deployment uses the rolling update path.');
+            $this->dispatch('configurationChanged');
+        } catch (\Throwable $exception) {
+            $this->isBlueGreenDeploymentEnabled = (bool) $this->application->settings->refresh()->is_blue_green_deployment_enabled;
+            handleError($exception, $this);
         }
     }
 

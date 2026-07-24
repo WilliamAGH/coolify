@@ -9,6 +9,7 @@ use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\BlueGreenIneligibilityReason;
 use App\Enums\ProxyTypes;
+use App\Exceptions\BlueGreenAdmissionException;
 use App\Services\ConfigurationGenerator;
 use App\Services\DeploymentConfiguration\ApplicationConfigurationSnapshot;
 use App\Services\DeploymentConfiguration\ConfigurationDiff;
@@ -1652,7 +1653,7 @@ class Application extends BaseModel
             $this->assertBlueGreenComposeSidecarIdentitiesUnchanged();
         }
         if ($hasDurableState && ($topologyReason = $this->blueGreenDurableStateTopologyIneligibilityReason()) !== null) {
-            throw new RuntimeException($topologyReason);
+            throw new BlueGreenAdmissionException($topologyReason);
         }
 
         $this->reconcileBlueGreenConfigurationIneligibility(
@@ -1683,7 +1684,7 @@ class Application extends BaseModel
         $proposedSidecars = BlueGreenComposeTopology::tryFromApplication($this)?->fixedSidecars();
 
         if ($persistedSidecars !== $proposedSidecars) {
-            throw new RuntimeException('Blue-green Docker Compose fixed sidecar identities cannot change while durable state exists. Stop the application and finish blue-green cleanup first.');
+            throw new BlueGreenAdmissionException('Blue-green Docker Compose fixed sidecar identities cannot change while durable state exists. Stop the application and finish blue-green cleanup first.');
         }
     }
 
@@ -1818,7 +1819,7 @@ class Application extends BaseModel
     public function assertBlueGreenTopologyMutationAllowed(?int $standaloneDockerId = null): void
     {
         if ($this->trashed()) {
-            throw new RuntimeException('Blue-green application topology cannot change after the application is soft-deleted. Finish or recover strict deactivation first.');
+            throw new BlueGreenAdmissionException('Blue-green application topology cannot change after the application is soft-deleted. Finish or recover strict deactivation first.');
         }
 
         $deactivationQuery = $this->blueGreenDeactivations();
@@ -1826,7 +1827,7 @@ class Application extends BaseModel
             $deactivationQuery->where('standalone_docker_id', $standaloneDockerId);
         }
         if ($deactivationQuery->exists()) {
-            throw new RuntimeException('Blue-green application topology cannot change while durable deactivation state exists. Finish or recover the strict deactivation lifecycle first.');
+            throw new BlueGreenAdmissionException('Blue-green application topology cannot change while durable deactivation state exists. Finish or recover the strict deactivation lifecycle first.');
         }
     }
 
@@ -1842,7 +1843,7 @@ class Application extends BaseModel
             return;
         }
         if ($hasDurableState) {
-            throw new RuntimeException("Blue-green deployment configuration cannot become ineligible while durable state exists. {$ineligibility['message']} Stop the application and use the blue-green cleanup lifecycle first.");
+            throw new BlueGreenAdmissionException("Blue-green deployment configuration cannot become ineligible while durable state exists. {$ineligibility['message']} Stop the application and use the blue-green cleanup lifecycle first.");
         }
 
         if ($allowPendingSettingOptOut && $setting !== null && $setting->is_blue_green_deployment_enabled) {
@@ -1869,7 +1870,7 @@ class Application extends BaseModel
             return;
         }
 
-        throw new RuntimeException("Blue-green deployment configuration cannot become ineligible while it is opted in. {$ineligibility['message']} Disable blue-green deployment first.");
+        throw new BlueGreenAdmissionException("Blue-green deployment configuration cannot become ineligible while it is opted in. {$ineligibility['message']} Disable blue-green deployment first.");
     }
 
     /** @return array{reason: BlueGreenIneligibilityReason, message: string} */
