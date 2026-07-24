@@ -242,7 +242,10 @@ test_env_merge_provenance() {
   grep -qx 'PUSHER_BACKEND_HOST=127.0.0.1' "$work/merged.env" || fail "target managed runtime must be retained"
   grep -qx 'AUTOUPDATE=false' "$work/merged.env" || fail "target-retained AUTOUPDATE must never cross over from source"
   if grep -q '^SOKETI_PORT=' "$work/merged.env"; then
-    fail "source-only target-retained SOKETI_PORT must be dropped"
+    fail "source-only SOKETI_PORT must be dropped"
+  fi
+  if grep -q '^PUSHER_PORT=' "$work/merged.env"; then
+    fail "browser websocket port pins must never survive the merge (canonical-domain realtime uses the /app path)"
   fi
   grep -qx 'UNCLASSIFIED_KEY=carryme' "$work/merged.env" || fail "unclassified source keys carry over with review flag"
   grep -qx 'APP_ID=sourceappid' "$work/merged.env" || fail "source APP_ID must be preserved"
@@ -251,7 +254,8 @@ test_env_merge_provenance() {
   grep -qx 'DB_PASSWORD=target(retained)' "$report" || fail "provenance must record target retention"
   grep -qx 'APP_KEY=source(preserved)' "$report" || fail "provenance must record source preservation"
   grep -qx 'AUTOUPDATE=target(retained)' "$report" || fail "provenance must record overridden target-retained key"
-  grep -qx 'SOKETI_PORT=target(retained-absent)' "$report" || fail "provenance must record dropped source-only target-retained key"
+  grep -qx 'SOKETI_PORT=dropped(browser-port-pin)' "$report" || fail "provenance must record dropped source-side port pin"
+  grep -qx 'PUSHER_PORT=dropped(browser-port-pin)' "$report" || fail "provenance must record dropped target-side port pin"
   grep -qx 'UNCLASSIFIED_KEY=source(unclassified-review)' "$report" || fail "provenance must flag unclassified keys"
 
   [ "$(stat -c '%a' "$work/merged.env" 2>/dev/null || stat -f '%Lp' "$work/merged.env")" = "600" ] \
