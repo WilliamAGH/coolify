@@ -1547,5 +1547,11 @@ it('attests every compose service image for a non-blue-green compose deployment'
     $attestationCommand = invokeBlueGreenComposeJobMethod($job, 'blueGreenComposeImageDigestCommand');
 
     expect($attestationCommand)->toContain('config --images |')
-        ->and($attestationCommand)->toContain('docker image inspect');
+        ->and($attestationCommand)->toContain('docker image inspect')
+        // Registry images referenced by the compose file may not be pulled
+        // yet (aventure-cli-sidecar incident, deploy cyejdzwsorfm4a8br46d8ppv):
+        // the attestation must pull missing images and fail hard when a pull
+        // fails instead of digesting a partial image set.
+        ->and($attestationCommand)->toContain('docker pull')
+        ->and($attestationCommand)->toContain('|| exit 1');
 });
