@@ -4,9 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🚀 Features
+
+- *(fork-deploy)* Reconcile release tracking after a control-plane bridge migration
+
 ### 🐛 Bug Fixes
 
+- *(realtime)* Route the dashboard websocket through the same-origin /app path behind a proxy
+- *(deployments)* Carry the prepared container name through activation handoff
 - *(blue-green)* Absorb Traefik file-provider apply lag into route verification
+
+### 📚 Documentation
+
+- Update changelog (#168)
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.25-fork
 
 ## [4.13.24-fork] - 2026-07-24
 
@@ -29,6 +43,7 @@ All notable changes to this project will be documented in this file.
 - *(blue-green)* Terminalize unresumable prepared activations instead of looping
 - *(blue-green)* Reconcile failed first-adoption rollback for a clean retry
 - *(blue-green)* Scope the opt-out assembly bypass by typed ineligibility reason
+- *(blue-green)* Absorb Traefik file-provider apply lag into route verification
 
 ### 📚 Documentation
 
