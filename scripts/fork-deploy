@@ -190,6 +190,7 @@ Usage:
   fork-deploy recover-forward
   fork-deploy status
   fork-deploy verify
+  fork-deploy reconcile-migrated-state
   fork-deploy trust --public-key ABSOLUTE_PATH
 
 Install and update inputs are accepted only from a detached-signature-verified release manifest.
@@ -204,6 +205,9 @@ Recover-forward retries the exact signed candidate after startup was declared an
 writes accepted by that candidate. Pre-start undo is forbidden after candidate startup.
 Existing unmanaged state is never adopted by this release tool; migrate it through the
 control-plane enrollment path before installing a managed release.
+Reconcile-migrated-state re-records the active release's migration fingerprint and rendered
+Compose state after a control-plane bridge migration, but only once the running container image
+digests prove the code is the recorded signed release; it refuses on any other integrity drift.
 EOF
 }
 
@@ -872,7 +876,7 @@ fd_parse_args() {
     ACTION=$1
     shift
     case $ACTION in
-        install|update|rollback|repair|recover-abort|recover-forward|status|trust|verify) ;;
+        install|update|rollback|repair|recover-abort|recover-forward|status|trust|verify|reconcile-migrated-state) ;;
         -h|--help)
             usage
             exit 0
@@ -933,7 +937,7 @@ fd_parse_args() {
         repair)
             [[ -z $VERSION && -z $MANIFEST_INPUT && -z $OFFLINE_MANIFEST && -z $TRUST_PUBLIC_KEY ]] || die "$ACTION does not accept release arguments"
             ;;
-        recover-abort|recover-forward|status|verify)
+        recover-abort|recover-forward|status|verify|reconcile-migrated-state)
             [[ -z $VERSION && -z $MANIFEST_INPUT && -z $OFFLINE_MANIFEST && -z $TRUST_PUBLIC_KEY && $DRY_RUN == false ]] \
                 || die "$ACTION does not accept release arguments or --dry-run"
             ;;
@@ -3050,6 +3054,73 @@ fd_verify_current() {
     note "Release $current is healthy and matches its immutable verified bundle and active state."
 }
 
+# Re-record the active release's tracking state after a control-plane bridge
+# migration (control-plane-migrate.sh restore) has replaced the database and
+# env-merged .env underneath a fork-deploy-managed host. Such a restore leaves
+# the code untouched but necessarily shifts two derived values: the migration
+# fingerprint (restored dump keeps the same migration filenames but different
+# batch numbers) and the rendered-Compose sha (the env-merge changes .env). Both
+# are benign drift, but fd_verify_current refuses on them, so update/repair are
+# blocked until the recorded MIGRATION_FINGERPRINT_AFTER and
+# RENDERED_COMPOSE_SHA256 are re-recorded to post-migration reality.
+#
+# The crucial guard is that the running code must PROVE it is the legitimate
+# signed release before any drift is adopted: fd_verify_runtime compares each
+# running container's image digest against the recorded, signature-verified
+# release digests. Every other integrity check fork-deploy already runs must
+# still pass here (signed-manifest asset shas, fail-closed environment fields,
+# ports, effective immutable Compose images and bindings). Only the migration
+# fingerprint and rendered-Compose equalities are treated as adoptable drift; a
+# drift in any signed asset or fail-closed field is real tampering and refuses.
+fd_reconcile_migrated_state() {
+    local current dir before migrations_now rendered_now
+
+    # 1. There must be an active current release.
+    current=$(fd_current_version)
+    fd_load_recorded_release "$current" active-v1-predecessor
+    fd_load_activation "$current"
+    dir=$(fd_release_dir "$current")
+
+    # 3. Every non-migration integrity check must still pass. A signed-asset,
+    #    fail-closed-environment, or port drift is tampering, not migration
+    #    residue, so those refuse before anything is re-recorded.
+    fd_validate_active_assets "$dir"
+    fd_validate_active_environment
+    if [[ $MANIFEST_SCHEMA == coolify-fork-release/v1 ]]; then
+        fd_validate_effective_images_legacy "$SOURCE_DIR"
+        fd_validate_effective_bindings_legacy "$SOURCE_DIR"
+    else
+        fd_validate_effective_images "$SOURCE_DIR"
+        fd_validate_effective_bindings "$SOURCE_DIR"
+    fi
+
+    # 2. Prove the running code is the legitimate signed release before adopting
+    #    any drift: the running container image digests must equal the recorded,
+    #    signature-verified release digests. This is the trust anchor — drifted
+    #    DB/render state is adopted only when the CODE is verified-signed.
+    if [[ $MANIFEST_SCHEMA == coolify-fork-release/v1 ]]; then
+        fd_verify_runtime_legacy \
+            || die 'reconcile refused: the running runtime does not match the signed release image digest'
+    else
+        fd_verify_runtime \
+            || die 'reconcile refused: the running runtime does not match the signed release image digest'
+    fi
+
+    # 4. Adopt post-migration reality: re-record MIGRATION_FINGERPRINT_AFTER and
+    #    RENDERED_COMPOSE_SHA256, preserve the recorded BEFORE fingerprint, and
+    #    append a reconcile-migrated-state history entry.
+    before=$(fd_activation_field "$current" MIGRATION_FINGERPRINT_BEFORE)
+    migrations_now=$(fd_migration_fingerprint "$SOURCE_DIR/.env")
+    rendered_now=$(fd_rendered_sha "$SOURCE_DIR")
+    ACTION=reconcile-migrated-state
+    fd_write_activation "$before" "$migrations_now" "$rendered_now"
+
+    # 5. Re-run the full verifier to confirm the host is now internally
+    #    consistent under the newly recorded tracking state.
+    fd_verify_current
+    note "Reconciled release $current: adopted the post-migration migration fingerprint and rendered Compose state."
+}
+
 main() {
     [[ -n ${BASH_VERSION:-} ]] || die 'this script requires Bash'
     fd_parse_args "$@"
@@ -3096,6 +3167,10 @@ main() {
         verify)
             fd_ensure_no_unresolved
             fd_verify_current
+            ;;
+        reconcile-migrated-state)
+            fd_ensure_no_unresolved
+            fd_reconcile_migrated_state
             ;;
     esac
 }

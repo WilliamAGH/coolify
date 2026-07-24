@@ -272,6 +272,11 @@ case $name in
                 elif [[ $* == *State.Running* ]]; then
                     printf 'true\n'
                 elif [[ $* == *Config.Image* ]]; then
+                    if [[ ${FORK_DEPLOY_DRIFT_RUNNING_MAIN_IMAGE:-false} == true \
+                        && ${*: -1} == coolify ]]; then
+                        printf 'docker.iocloudhost.net/williamagh/coolify@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n'
+                        exit 0
+                    fi
                     if [[ ${FORK_DEPLOY_FAIL_CANDIDATE_RUNTIME_VERIFY:-false} == true \
                         && -e ${FORK_DEPLOY_CANDIDATE_STARTED_MARKER:-/nonexistent} \
                         && ${*: -1} == coolify ]]; then

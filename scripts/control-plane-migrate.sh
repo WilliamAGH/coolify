@@ -629,6 +629,56 @@ prove_release_digest() {
     fail "release proof failed: app image does not resolve to expected digest $expected"
 }
 
+resolve_fork_deploy_bin() {
+    # Resolves the fork-deploy binary used to reconcile release tracking after a
+    # restore. An explicit override always wins. In test mode without an
+    # override the binary is treated as unresolved so a fresh checkout never
+    # auto-invokes the real release tool; production resolves a sibling script
+    # or a PATH entry.
+    local candidate
+    if [ -n "${COOLIFY_MIGRATE_FORK_DEPLOY_BIN:-}" ]; then
+        [ -x "$COOLIFY_MIGRATE_FORK_DEPLOY_BIN" ] || return 1
+        printf '%s' "$COOLIFY_MIGRATE_FORK_DEPLOY_BIN"
+        return 0
+    fi
+    if [ "${COOLIFY_MIGRATE_TEST_MODE:-false}" = "true" ]; then
+        return 1
+    fi
+    candidate="$(dirname "$0")/fork-deploy"
+    if [ -x "$candidate" ]; then
+        printf '%s' "$candidate"
+        return 0
+    fi
+    candidate=$(command -v fork-deploy 2>/dev/null || true)
+    if [ -n "$candidate" ]; then
+        printf '%s' "$candidate"
+        return 0
+    fi
+    return 1
+}
+
+reconcile_fork_deploy_state() {
+    # After a successful restore onto a fork-deploy-managed target, re-record the
+    # active release's migration fingerprint and rendered-Compose state so
+    # fork-deploy update/repair stop refusing on the benign drift a bridge
+    # migration introduces. fork-deploy itself proves the running image is the
+    # recorded signed release before adopting any drift; this bridge only invokes
+    # it. Non-managed targets and hosts without the tool are left untouched.
+    local root="$1" bin
+    if [ ! -f "$root/fork-deploy/current" ]; then
+        log "target is not fork-deploy managed; skipping release-tracking reconciliation"
+        return 0
+    fi
+    if ! bin=$(resolve_fork_deploy_bin); then
+        log "fork-deploy tooling not found on this host; after this migration run 'fork-deploy reconcile-migrated-state' to re-record release tracking (migration fingerprint and rendered Compose state)"
+        return 0
+    fi
+    log "reconciling fork-deploy release tracking after the bridge migration: $bin reconcile-migrated-state"
+    "$bin" reconcile-migrated-state \
+        || fail "fork-deploy reconcile-migrated-state failed; the database was restored but fork-deploy release tracking is not reconciled. Investigate, then re-run 'fork-deploy reconcile-migrated-state' on this host before any fork-deploy update or repair."
+    log "fork-deploy release tracking reconciled to the post-migration state"
+}
+
 cmd_restore() {
     local root="" archive="" authorize="" expect_version="" expect_digest=""
     local restore_proxy=false enable_workers=false skip_app_start=false target_backup_dir=""
@@ -805,8 +855,13 @@ cmd_restore() {
         done
         log "database migrations completed against the restored database"
         verify_effective_app_key "$root/source/.env"
+        # Re-record fork-deploy release tracking now that the app is up and the
+        # database/env reflect the migrated source. fork-deploy re-proves the
+        # running image against the signed release before adopting any drift.
+        reconcile_fork_deploy_state "$root"
     else
         log "app start skipped (--skip-app-start); run migrations before serving traffic"
+        log "after starting the app, run 'fork-deploy reconcile-migrated-state' to re-record release tracking"
     fi
 
     # Post-restore inventory for acceptance comparison against the manifest.
@@ -828,6 +883,10 @@ Next steps (operator):
      There must never be two mutable production control planes.
   5. The pre-migration target state is retained at: $pre_migration
      The pre-restore target backup is at: $target_backup_dir
+  6. fork-deploy release tracking is re-recorded automatically when the tool is
+     present (see the reconciliation log lines above); otherwise run
+     'fork-deploy reconcile-migrated-state' on this host before any fork-deploy
+     update or repair.
 EOF
 }
 

@@ -137,7 +137,17 @@ done
 printf 'fake archive TOC\n'
 STUB
 
-chmod +x "$MOCK_BIN/docker" "$MOCK_BIN/pg_restore"
+FORK_DEPLOY_STUB="$MOCK_BIN/fork-deploy-stub"
+FORK_DEPLOY_STUB_LOG="$STATE/fork-deploy-stub.log"
+cat > "$FORK_DEPLOY_STUB" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'fork-deploy:%s\n' "$*" >> "${FORK_DEPLOY_STUB_LOG:?}"
+exit "${FORK_DEPLOY_STUB_EXIT:-0}"
+STUB
+: > "$FORK_DEPLOY_STUB_LOG"
+
+chmod +x "$MOCK_BIN/docker" "$MOCK_BIN/pg_restore" "$FORK_DEPLOY_STUB"
 
 run_migrate() {
   COOLIFY_MIGRATE_TEST_MODE=true \
@@ -598,6 +608,55 @@ test_restore_migration_failure_fails_closed() {
   pass 'restore_migration_failure_fails_closed'
 }
 
+test_restore_reconciles_fork_deploy_managed_target() {
+  local root="$STATE/res11/root"
+  build_target_root "$root"
+  : > "$FORK_DEPLOY_STUB_LOG"
+  # shellcheck disable=SC2046
+  MOCK_RUNNING_CONTAINERS="coolify coolify-db coolify-redis" \
+    COOLIFY_MIGRATE_FORK_DEPLOY_BIN="$FORK_DEPLOY_STUB" \
+    FORK_DEPLOY_STUB_LOG="$FORK_DEPLOY_STUB_LOG" \
+    run_migrate restore --root "$root" $(restore_args) > "$STATE/out.log" 2>&1 \
+    || { cat "$STATE/out.log" >&2; fail "reconcile-managed restore failed"; }
+  grep -Fq 'fork-deploy:reconcile-migrated-state' "$FORK_DEPLOY_STUB_LOG" \
+    || fail "restore must invoke fork-deploy reconcile-migrated-state on a managed target"
+  expect_output_contains 'release tracking reconciled'
+  pass 'restore_reconciles_fork_deploy_managed_target'
+}
+
+test_restore_skips_reconcile_without_fork_deploy_tooling() {
+  local root="$STATE/res12/root"
+  build_target_root "$root"
+  : > "$FORK_DEPLOY_STUB_LOG"
+  # No COOLIFY_MIGRATE_FORK_DEPLOY_BIN: in test mode the binary stays unresolved,
+  # so the bridge must not auto-invoke the real release tool.
+  # shellcheck disable=SC2046
+  MOCK_RUNNING_CONTAINERS="coolify coolify-db coolify-redis" \
+    FORK_DEPLOY_STUB_LOG="$FORK_DEPLOY_STUB_LOG" \
+    run_migrate restore --root "$root" $(restore_args) > "$STATE/out.log" 2>&1 \
+    || { cat "$STATE/out.log" >&2; fail "restore without fork-deploy tooling failed"; }
+  [ ! -s "$FORK_DEPLOY_STUB_LOG" ] \
+    || fail "restore must not invoke fork-deploy when the tool is not resolvable"
+  expect_output_contains 'fork-deploy tooling not found'
+  expect_output_contains 'restore complete'
+  pass 'restore_skips_reconcile_without_fork_deploy_tooling'
+}
+
+test_restore_fails_closed_when_reconcile_fails() {
+  local root="$STATE/res13/root"
+  build_target_root "$root"
+  : > "$FORK_DEPLOY_STUB_LOG"
+  # shellcheck disable=SC2046
+  MOCK_RUNNING_CONTAINERS="coolify coolify-db coolify-redis" \
+    COOLIFY_MIGRATE_FORK_DEPLOY_BIN="$FORK_DEPLOY_STUB" \
+    FORK_DEPLOY_STUB_LOG="$FORK_DEPLOY_STUB_LOG" \
+    FORK_DEPLOY_STUB_EXIT=1 \
+    expect_fail "restore with failing reconcile" \
+    restore --root "$root" $(restore_args)
+  expect_output_contains 'reconcile-migrated-state failed'
+  pass 'restore_fails_closed_when_reconcile_fails'
+}
+
 # --- runner ------------------------------------------------------------------
 
 test_env_merge_provenance
@@ -621,5 +680,8 @@ test_restore_backs_up_target_database_before_overwrite
 test_restore_fails_closed_on_stale_effective_app_key
 test_restore_enable_workers_is_explicit
 test_restore_migration_failure_fails_closed
+test_restore_reconciles_fork_deploy_managed_target
+test_restore_skips_reconcile_without_fork_deploy_tooling
+test_restore_fails_closed_when_reconcile_fails
 
 printf 'all control-plane-migrate integration tests passed\n'
