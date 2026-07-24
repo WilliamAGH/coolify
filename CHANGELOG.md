@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🚀 Features
+
+- *(control-plane)* Add fail-closed migration bridge for popos-sf0 to 22.haiku.host
+
+### 🐛 Bug Fixes
+
+- *(control-plane)* Distinguish missing postgres client image from unreadable dump
+- *(control-plane)* Dump the target database into the pre-restore backup
+- *(control-plane)* Fail closed when the app container runs a creation-time APP_KEY
+- *(control-plane)* Parse the app.key row instead of the last output line
+- *(control-plane)* Satisfy the strict shellcheck lane
+
+### 📚 Documentation
+
+- Update changelog (#152)
+
+## [4.13.23-fork] - 2026-07-23
+
 ### 🐛 Bug Fixes
 
 - *(control-plane)* Fence delayed enrollment activation
