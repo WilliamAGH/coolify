@@ -45,9 +45,9 @@ jobs:
             "https://github.com/$GITHUB_REPOSITORY.git" \
             docker/fork-release-tag-allowed-signers
           [[ "$(git cat-file -t "$SOURCE_REVISION")" == commit ]]
-          git fetch --no-tags origin '+refs/heads/v4.x:refs/remotes/origin/v4.x'
-          trusted_default_branch="$(git rev-parse --verify 'refs/remotes/origin/v4.x^{commit}')"
-          git merge-base --is-ancestor "$SOURCE_REVISION" "$trusted_default_branch"
+          git fetch --no-tags origin '+refs/heads/staging:refs/remotes/origin/staging'
+          trusted_release_branch="$(git rev-parse --verify 'refs/remotes/origin/staging^{commit}')"
+          git merge-base --is-ancestor "$SOURCE_REVISION" "$trusted_release_branch"
 
           command -v php >/dev/null
           command -v jq >/dev/null

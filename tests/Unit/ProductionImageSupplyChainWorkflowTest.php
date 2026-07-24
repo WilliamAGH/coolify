@@ -2248,10 +2248,11 @@ DOCKERFILE;
         ->toContain('ARG GIT_LFS_COMMIT=b84b33847fe6458f36ef521534dc0eac953cb379')
         ->toContain('ARG GIT_LFS_SOURCE_SHA256=e1ef5ba4828fa632337be6a2c421a685432faec0405bf187f46a1459e82a9a62')
         ->toContain('ARG GIT_LFS_X_NET_VERSION=v0.56.0')
-        ->toContain('ARG GIT_LFS_GO_MOD_SHA256=9b34961df646f48ca832d5201d9a4a78059a06269f50237d682630cf28485460')
-        ->toContain('ARG GIT_LFS_GO_SUM_SHA256=f2e6c6da7a7d84ef4ffcad42902798eaa2aa14b795c3639a857d36504f2c6396')
+        ->toContain('ARG GIT_LFS_X_TEXT_VERSION=v0.39.0')
+        ->toContain('ARG GIT_LFS_GO_MOD_SHA256=9fd88c4c8e3c1c3f2ab5d8449c9ce6ec8f9c21124a7a33e3372654f45a5a5be0')
+        ->toContain('ARG GIT_LFS_GO_SUM_SHA256=709461d5999a5fb0e1acf4d205dcefdd249b8315a8c1a81344b8eefd90f596ee')
         ->toContain('FROM go-source-builder AS git-lfs-builder')
-        ->toContain('go get "golang.org/x/net@${GIT_LFS_X_NET_VERSION}"')
+        ->toContain('go get "golang.org/x/net@${GIT_LFS_X_NET_VERSION}" "golang.org/x/text@${GIT_LFS_X_TEXT_VERSION}"')
         ->toContain('go mod verify')
         ->toContain('go version -m /out/git-lfs')
         ->toContain('COPY --from=git-lfs-builder --chmod=755 /out/git-lfs /usr/local/bin/git-lfs')
@@ -3493,7 +3494,7 @@ it('fails when a fork alias moves during signed release publication', function (
     }
 });
 
-it('requires the fork tag commit to be reachable from the trusted v4.x branch before publication', function () {
+it('requires the fork tag commit to be reachable from the trusted staging branch before publication', function () {
     $caller = Yaml::parseFile(releaseWorkflowRepositoryRoot().'/.github/workflows/publish-fork.yml');
     $resolveTag = $caller['jobs']['resolve-tag'] ?? [];
     $resolveTagRun = (string) (releaseWorkflowStepById($resolveTag, 'version')['run'] ?? '');
@@ -3501,9 +3502,9 @@ it('requires the fork tag commit to be reachable from the trusted v4.x branch be
     expect($resolveTag)->not->toHaveKey('needs')
         ->and($caller['jobs']['application-validation']['needs'] ?? null)->toBe('resolve-tag')
         ->and($resolveTagRun)
-        ->toContain("git fetch --no-tags origin '+refs/heads/v4.x:refs/remotes/origin/v4.x'")
-        ->toContain("git rev-parse --verify 'refs/remotes/origin/v4.x^{commit}'")
-        ->toContain('git merge-base --is-ancestor "$SOURCE_REVISION" "$trusted_default_branch"');
+        ->toContain("git fetch --no-tags origin '+refs/heads/staging:refs/remotes/origin/staging'")
+        ->toContain("git rev-parse --verify 'refs/remotes/origin/staging^{commit}'")
+        ->toContain('git merge-base --is-ancestor "$SOURCE_REVISION" "$trusted_release_branch"');
 });
 
 it('emits the strict signed fork deploy manifest schema', function () {
