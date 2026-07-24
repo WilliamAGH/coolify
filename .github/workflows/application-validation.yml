@@ -381,7 +381,6 @@ jobs:
         .github/workflows/coolify-staging-build.yml
         .github/workflows/coolify-testing-host.yml
         .github/workflows/generate-changelog.yml
-        .github/workflows/gate-v4x-candidate.yml
         .github/workflows/publish-fork.yml
         .github/workflows/publish-linux-image.yml
         .github/workflows/release-operational-acceptance.yml
@@ -410,8 +409,6 @@ jobs:
           tests/Integration/DockerSsotCleanTest.sh
           tests/Integration/ProductionApplicationBlueGreen/SanitizeEvidenceTest.sh
           tests/Integration/ControlPlaneMigrateTest.sh
-      - name: Run v4.x candidate ship contract
-        run: scripts/dev/ship.test.sh
       - name: Verify Docker daemon configuration ownership
         run: tests/Integration/DockerDaemonConfigurationTest.sh
       - name: Verify database migration S6 exit propagation

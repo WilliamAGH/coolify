@@ -1,7 +1,7 @@
 cases:
   - name: production bypasses application validation
     mutation: remove-production-validation
-    expected: production publication must wait for a trusted preflight or hosted validation
+    expected: production publication must wait for hosted validation
   - name: testing host targets the production image
     mutation: testing-host-targets-production
     expected: testing-host has an invalid target_repository

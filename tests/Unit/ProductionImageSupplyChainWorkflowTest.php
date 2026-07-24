@@ -773,7 +773,6 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
         '.github/workflows/coolify-staging-build.yml',
         '.github/workflows/coolify-testing-host.yml',
         '.github/workflows/generate-changelog.yml',
-        '.github/workflows/gate-v4x-candidate.yml',
         '.github/workflows/publish-fork.yml',
         '.github/workflows/publish-linux-image.yml',
         '.github/workflows/release-operational-acceptance.yml',
@@ -845,8 +844,8 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
     }
 
     $productionNeeds = releaseWorkflowNeeds($callers['production']['jobs']['resolve-version'] ?? []);
-    if (! in_array('validation-required', $productionNeeds, true)) {
-        $violations[] = 'production publication must wait for a trusted preflight or hosted validation';
+    if (! in_array('application-validation', $productionNeeds, true)) {
+        $violations[] = 'production publication must wait for hosted validation';
     }
 
     $archiveGate = releaseWorkflowStep(
@@ -2294,7 +2293,6 @@ it('rejects omission of an owned workflow from actionlint', function (string $wo
     'production caller' => '.github/workflows/coolify-production-build.yml',
     'staging caller' => '.github/workflows/coolify-staging-build.yml',
     'testing-host caller' => '.github/workflows/coolify-testing-host.yml',
-    'v4.x candidate gate' => '.github/workflows/gate-v4x-candidate.yml',
     'fork publisher' => '.github/workflows/publish-fork.yml',
     'reusable publisher' => '.github/workflows/publish-linux-image.yml',
     'operational acceptance' => '.github/workflows/release-operational-acceptance.yml',

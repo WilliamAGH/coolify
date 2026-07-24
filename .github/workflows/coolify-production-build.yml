@@ -2,7 +2,7 @@ name: Production Build (v4)
 
 on:
   push:
-    branches: ["v4.x"]
+    branches: ["staging"]
     paths-ignore:
       - .github/workflows/coolify-helper.yml
       - .github/workflows/coolify-helper-next.yml
@@ -14,50 +14,8 @@ on:
 permissions: {}
 
 jobs:
-  candidate-preflight:
-    name: Reuse trusted v4.x candidate preflight
-    if: ${{ github.repository == 'williamacallahan/coolify' }}
-    permissions:
-      actions: read
-      contents: read
-    runs-on: ubuntu-24.04
-    outputs:
-      verified: ${{ steps.verify.outputs.verified }}
-    steps:
-      - id: trusted_base
-        name: Check out protected base verifier
-        continue-on-error: true
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-        with:
-          persist-credentials: false
-          ref: ${{ github.event.before }}
-          path: trusted-v4x
-
-      - id: verify
-        name: Verify exact candidate preflight
-        if: always()
-        shell: bash
-        env:
-          BASE_SHA: ${{ github.event.before }}
-          CANDIDATE_SHA: ${{ github.sha }}
-          CHECKOUT_OUTCOME: ${{ steps.trusted_base.outcome }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -Eeuo pipefail
-          verified=false
-          if [[ "$CHECKOUT_OUTCOME" == success ]] &&
-            [[ -x trusted-v4x/scripts/ci/verify-v4x-candidate-gate.sh ]] &&
-            trusted-v4x/scripts/ci/verify-v4x-candidate-gate.sh "$CANDIDATE_SHA" "$BASE_SHA"; then
-            verified=true
-          else
-            echo 'No trusted candidate preflight matched this v4.x push; hosted validation will run.'
-          fi
-          printf 'verified=%s\n' "$verified" >> "$GITHUB_OUTPUT"
-
   application-validation:
     name: Validate application before image publication
-    needs: candidate-preflight
-    if: ${{ always() && needs.candidate-preflight.outputs.verified != 'true' }}
     uses: ./.github/workflows/application-validation.yml
     permissions:
       contents: read
@@ -65,29 +23,9 @@ jobs:
       base_sha: ${{ github.event.before }}
       source_sha: ${{ github.sha }}
 
-  validation-required:
-    name: Require trusted preflight or hosted validation
-    needs: [candidate-preflight, application-validation]
-    if: always()
-    permissions: {}
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Require a successful validation path
-        shell: bash
-        env:
-          HOSTED_VALIDATION_RESULT: ${{ needs.application-validation.result }}
-          PREFLIGHT_RESULT: ${{ needs.candidate-preflight.result }}
-          PREFLIGHT_VERIFIED: ${{ needs.candidate-preflight.outputs.verified }}
-        run: |
-          set -Eeuo pipefail
-          if [[ "$PREFLIGHT_RESULT" == success && "$PREFLIGHT_VERIFIED" == true ]]; then
-            exit 0
-          fi
-          [[ "$HOSTED_VALIDATION_RESULT" == success ]]
-
   resolve-version:
     name: Resolve production version
-    needs: validation-required
+    needs: application-validation
     permissions:
       contents: read
     runs-on: ubuntu-24.04
