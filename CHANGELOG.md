@@ -4,8 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🐛 Bug Fixes
+
+- *(blue-green)* Treat FAILED queue rows as terminal owners in lifecycle transitions
+
 ### 📚 Documentation
 
+- Update changelog
 - Update changelog
 
 ## [4.13.31-fork] - 2026-07-24
