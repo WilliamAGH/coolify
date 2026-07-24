@@ -115,7 +115,8 @@ new_fixture() {
         FORK_DEPLOY_TEST_KILL_AFTER_PENDING_WRITE \
         FORK_DEPLOY_TEST_KILL_AFTER_FORWARD_RECORD \
         FORK_DEPLOY_TEST_SWAP_SSH_KEYS_DURING_LOCK \
-        FORK_DEPLOY_TEST_SSH_SWAP_TARGET || true
+        FORK_DEPLOY_TEST_SSH_SWAP_TARGET \
+        FORK_DEPLOY_DRIFT_RUNNING_MAIN_IMAGE || true
 }
 
 cleanup_fixture() {
@@ -2406,6 +2407,107 @@ test_uses_migrated_github_raw_base() {
     fi
 }
 
+# Drives the active source into the state a control-plane bridge migration
+# leaves behind: the recorded release code is untouched, but the migration
+# fingerprint and rendered-Compose sha both drift (restored DB has different
+# migration batch numbers; env-merge rewrites .env). Confirms fork-deploy verify
+# refuses so the reconcile subcommand is genuinely closing a real gap.
+seed_bridge_migrated_drift() {
+    export FORK_DEPLOY_MIGRATION_FINGERPRINT=abcdef0123456789abcdef0123456789
+    printf 'APP_NAME=Coolify\n' >>"$ROOT/source/.env"
+}
+
+test_reconcile_readopts_benign_bridge_migration_drift() {
+    new_fixture
+    write_manifest 4.13.0-fork.1
+    if ! install_release >/dev/null; then
+        fail 'reconcile re-records benign bridge-migration drift for a verified-signed release'
+        cleanup_fixture
+        return
+    fi
+    local activation=$ROOT/fork-deploy/activations/4.13.0-fork.1 rendered_now
+    seed_bridge_migrated_drift
+    if "$SUBJECT" verify >/dev/null 2>&1; then
+        fail 'reconcile re-records benign bridge-migration drift for a verified-signed release'
+        cleanup_fixture
+        return
+    fi
+    rendered_now=$(hash_file "$ROOT/source/.env")
+    : >"$LOG"
+    if "$SUBJECT" reconcile-migrated-state >/dev/null 2>&1 \
+        && grep -Fxq 'MIGRATION_FINGERPRINT_AFTER=abcdef0123456789abcdef0123456789' "$activation" \
+        && grep -Fxq "RENDERED_COMPOSE_SHA256=$rendered_now" "$activation" \
+        && grep -Fxq 'MIGRATION_FINGERPRINT_BEFORE=uninitialized' "$activation" \
+        && awk -F '\t' '$2 == "reconcile-migrated-state" && $3 == "4.13.0-fork.1" { found = 1 } END { exit !found }' \
+            "$ROOT/fork-deploy/history.tsv" \
+        && "$SUBJECT" verify >/dev/null 2>&1; then
+        pass 'reconcile re-records benign bridge-migration drift for a verified-signed release'
+    else
+        fail 'reconcile re-records benign bridge-migration drift for a verified-signed release'
+    fi
+    cleanup_fixture
+}
+
+test_reconcile_refuses_when_running_image_is_untrusted() {
+    new_fixture
+    write_manifest 4.13.0-fork.1
+    if ! install_release >/dev/null; then
+        fail 'reconcile refuses to adopt drift when the running image is not the signed release'
+        cleanup_fixture
+        return
+    fi
+    local activation=$ROOT/fork-deploy/activations/4.13.0-fork.1
+    seed_bridge_migrated_drift
+    export FORK_DEPLOY_DRIFT_RUNNING_MAIN_IMAGE=true
+    : >"$LOG"
+    local output
+    if output=$("$SUBJECT" reconcile-migrated-state 2>&1); then
+        fail 'reconcile refuses to adopt drift when the running image is not the signed release'
+    elif [[ $output == *'expected'* || $output == *'signed release image digest'* ]] \
+        && grep -Fxq 'MIGRATION_FINGERPRINT_AFTER=uninitialized' "$activation" \
+        && ! awk -F '\t' '$2 == "reconcile-migrated-state" { found = 1 } END { exit !found }' \
+            "$ROOT/fork-deploy/history.tsv"; then
+        pass 'reconcile refuses to adopt drift when the running image is not the signed release'
+    else
+        fail 'reconcile refuses to adopt drift when the running image is not the signed release'
+    fi
+    cleanup_fixture
+}
+
+test_reconcile_refuses_signed_asset_drift() {
+    new_fixture
+    write_manifest 4.13.0-fork.1
+    if ! install_release >/dev/null; then
+        fail 'reconcile refuses when a signed release asset has drifted'
+        cleanup_fixture
+        return
+    fi
+    local activation=$ROOT/fork-deploy/activations/4.13.0-fork.1
+    seed_bridge_migrated_drift
+    printf 'tampered-overlay\n' >>"$ROOT/source/docker-compose.custom.yml"
+    : >"$LOG"
+    local output
+    if output=$("$SUBJECT" reconcile-migrated-state 2>&1); then
+        fail 'reconcile refuses when a signed release asset has drifted'
+    elif [[ $output == *'differs from the verified release'* ]] \
+        && grep -Fxq 'MIGRATION_FINGERPRINT_AFTER=uninitialized' "$activation" \
+        && ! grep -q 'compose .* up' "$LOG"; then
+        pass 'reconcile refuses when a signed release asset has drifted'
+    else
+        fail 'reconcile refuses when a signed release asset has drifted'
+    fi
+    cleanup_fixture
+}
+
+if [[ ${FORK_DEPLOY_TEST_FILTER:-} == reconcile-migrated-state ]]; then
+    test_reconcile_readopts_benign_bridge_migration_drift
+    test_reconcile_refuses_when_running_image_is_untrusted
+    test_reconcile_refuses_signed_asset_drift
+    printf '%s passing, %s failing\n' "$PASS" "$FAIL"
+    ((FAIL == 0))
+    exit
+fi
+
 if [[ ${FORK_DEPLOY_TEST_FILTER:-} == port-normalization ]]; then
     test_normalizes_legacy_pusher_app_port
     printf '%s passing, %s failing\n' "$PASS" "$FAIL"
@@ -2561,6 +2663,9 @@ test_privileged_ssh_mutation_rejects_directory_swap
 test_recover_abort_restores_only_prestart_pending_state
 test_recover_abort_retries_after_restore_cleanup_interruption
 test_recover_abort_refuses_after_candidate_start
+test_reconcile_readopts_benign_bridge_migration_drift
+test_reconcile_refuses_when_running_image_is_untrusted
+test_reconcile_refuses_signed_asset_drift
 
 printf '%s passing, %s failing\n' "$PASS" "$FAIL"
 ((FAIL == 0))

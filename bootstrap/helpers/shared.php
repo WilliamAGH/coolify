@@ -2021,20 +2021,51 @@ function generateEnvValue(string $command, Service|Application|null $service = n
     return $generatedValue;
 }
 
-function getRealtime()
+/**
+ * The dashboard is served behind a reverse proxy whenever an instance FQDN is
+ * configured. Coolify then generates the Traefik `Host(<fqdn>) && PathPrefix(/app)`
+ * router that forwards same-origin websocket traffic to the internal Reverb port,
+ * so the browser reaches realtime through the public 80/443 listener, not 6001.
+ */
+function isRealtimeProxied(): bool
 {
-    $envDefined = config('constants.pusher.port');
-    if (empty($envDefined)) {
-        $url = Url::fromString(Request::getSchemeAndHttpHost());
-        $port = $url->getPort();
-        if ($port) {
-            return '6001';
-        } else {
-            return null;
-        }
-    } else {
-        return $envDefined;
+    try {
+        return filled(data_get(instanceSettings(), 'fqdn'));
+    } catch (Throwable) {
+        return false;
     }
+}
+
+/**
+ * Resolve the browser-facing realtime (Reverb/pusher-js) port for the Echo client.
+ *
+ * pusher-js dials `<wsHost>:<wsPort|wssPort>` and appends `/app/<key>`, so this
+ * must return the PUBLIC port the browser can actually reach — never the internal
+ * Reverb bind port (PUSHER_PORT/6001), which is only exposed inside the container
+ * behind the Traefik `/app` route.
+ *
+ * - Proxied (an instance FQDN is set, dashboard served on 80/443): return the
+ *   public request port so the browser hits the same-origin `/app` route
+ *   (wss://<fqdn>:443/app/<key>). This is independent of PUSHER_PORT and therefore
+ *   survives fork-deploy, which normalizes PUSHER_PORT to 6001.
+ * - Un-proxied (direct SERVER_IP:PORT access, no FQDN): return the direct Reverb
+ *   port so upstream standalone installs still connect straight to the container.
+ */
+function getRealtime(): ?string
+{
+    if (isRealtimeProxied()) {
+        $publicPort = Request::getPort();
+
+        if ($publicPort) {
+            return (string) $publicPort;
+        }
+
+        return Request::isSecure() ? '443' : '80';
+    }
+
+    $directPort = config('constants.pusher.port');
+
+    return filled($directPort) ? (string) $directPort : '6001';
 }
 
 function validateDNSEntry(string $fqdn, Server $server)

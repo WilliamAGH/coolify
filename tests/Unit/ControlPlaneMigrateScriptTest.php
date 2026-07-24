@@ -206,6 +206,28 @@ it('records inventory and quiescence evidence in the manifest', function () {
         ->toContain('.inventory-post-restore.json');
 });
 
+it('reconciles fork-deploy release tracking after a restore onto a managed target', function () {
+    $script = controlPlaneMigrateScript();
+
+    expect($script)
+        ->toContain('reconcile_fork_deploy_state()')
+        ->toContain('resolve_fork_deploy_bin()')
+        ->toContain('"$bin" reconcile-migrated-state')
+        ->toContain('reconcile_fork_deploy_state "$root"')
+        ->toContain('target is not fork-deploy managed; skipping release-tracking reconciliation')
+        ->toContain('fork-deploy tooling not found on this host')
+        ->toContain('fork-deploy reconcile-migrated-state failed');
+});
+
+it('leaves fresh checkouts and non-managed targets from auto-invoking the release tool', function () {
+    $script = controlPlaneMigrateScript();
+
+    expect($script)
+        ->toContain('COOLIFY_MIGRATE_FORK_DEPLOY_BIN')
+        ->toContain('if [ "${COOLIFY_MIGRATE_TEST_MODE:-false}" = "true" ]; then')
+        ->toContain('if [ ! -f "$root/fork-deploy/current" ]; then');
+});
+
 it('has a functional integration suite wired for CI', function () {
     $workflow = file_get_contents(getcwd().'/.github/workflows/application-validation.yml');
 
