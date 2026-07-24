@@ -2056,7 +2056,8 @@ final class BlueGreenDeploymentLifecycle
                         );
                         throw new DeploymentException('Blue-green public verification failed after switch without retry: '.$lastFailure, previous: $exception);
                     }
-                } elseif (! $this->isExpectedInitialProbeRouteAppearance($exception, $expectedPhase)) {
+                } elseif (! $this->isExpectedInitialProbeRouteAppearance($exception, $expectedPhase)
+                    && ! VerifyBlueGreenPublicRecovery::isConvergingRouteObservation($exception)) {
                     throw new DeploymentException('Blue-green candidate probe verification failed without retry: '.$lastFailure, previous: $exception);
                 }
             }

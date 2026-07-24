@@ -349,6 +349,7 @@ it('retries only an initial unacknowledged catchall-status candidate probe route
     int $expectedProbeRequests,
     int $expectedSleeps,
     bool $shouldSucceed,
+    string $expectedFailure = 'candidate probe verification failed without retry',
 ): void {
     config(['constants.ssh.mux_enabled' => false]);
     Sleep::fake();
@@ -409,7 +410,12 @@ it('retries only an initial unacknowledged catchall-status candidate probe route
                 .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$wrongAcknowledgement}\r\n\r\n"),
             'stale-503-acknowledgement' => Process::result(output: "HTTP/1.1 503 Service Unavailable\r\n"
                 .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$wrongAcknowledgement}\r\n\r\n"),
-            'wrong-acknowledgement' => Process::result(output: "HTTP/1.1 200 OK\r\n"
+            'wrong-acknowledgement' => $probeRequests === 1
+                ? Process::result(output: "HTTP/1.1 200 OK\r\n"
+                    .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$wrongAcknowledgement}\r\n"
+                    .BlueGreenRoutingTarget::RELEASE_PROOF_HEADER.": {$releaseProof}\r\n\r\n")
+                : Process::result(output: $successfulResponse),
+            'never-converging-acknowledgement' => Process::result(output: "HTTP/1.1 200 OK\r\n"
                 .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$wrongAcknowledgement}\r\n"
                 .BlueGreenRoutingTarget::RELEASE_PROOF_HEADER.": {$releaseProof}\r\n\r\n"),
             'wrong-release-proof' => Process::result(output: "HTTP/1.1 200 OK\r\n"
@@ -439,7 +445,7 @@ it('retries only an initial unacknowledged catchall-status candidate probe route
                 $configuration,
                 $target,
                 BlueGreenDeploymentPhase::PREPARING,
-            ))->toThrow(DeploymentException::class, 'candidate probe verification failed without retry');
+            ))->toThrow(DeploymentException::class, $expectedFailure);
         }
     } finally {
         $lifecycle->release();
@@ -454,7 +460,8 @@ it('retries only an initial unacknowledged catchall-status candidate probe route
     'candidate application does not emit the release proof header' => ['missing-release-proof', 1, 0, true],
     'initial route returns a stale acknowledgement' => ['stale-404-acknowledgement', 1, 0, false],
     'catchall status with an acknowledgement is a managed route failure' => ['stale-503-acknowledgement', 1, 0, false],
-    'candidate route returns a wrong acknowledgement' => ['wrong-acknowledgement', 1, 0, false],
+    'candidate route acknowledgement converges after Traefik apply lag' => ['wrong-acknowledgement', 2, 1, true],
+    'candidate route never converges its acknowledgement' => ['never-converging-acknowledgement', 10, 9, false, 'Traefik did not acknowledge every canonical blue-green router'],
     'candidate route returns a wrong release proof' => ['wrong-release-proof', 1, 0, false],
     'candidate probe transport fails' => ['transport-failure', 1, 0, false],
     'candidate route returns another non-success status' => ['other-status', 1, 0, false],

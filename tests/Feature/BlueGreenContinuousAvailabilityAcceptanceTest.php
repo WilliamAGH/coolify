@@ -440,3 +440,52 @@ it('fails a legacy-adoption candidate probe without retry before a public router
         0,
     );
 });
+
+it('absorbs Traefik file-provider apply lag before asserting the legacy-adoption candidate probe acknowledgement', function (): void {
+    config(['constants.ssh.mux_enabled' => false]);
+    Sleep::fake();
+    $context = blueGreenContinuousAvailabilityContext(BlueGreenRoutingMode::ProbeOnly, probeOnly: true);
+    $lifecycle = $context['lifecycle'];
+    $configuration = $context['configuration'];
+    $target = $context['target'];
+    $claim = $context['claim'];
+    $acknowledgement = $target->probeAcknowledgement();
+    expect($acknowledgement)->not->toBeNull()
+        ->and($claim->legacyContainerName)->toBe($context['previous']->name);
+    $staleLegacyResponse = "HTTP/1.1 200 OK\r\n\r\n";
+    $appliedResponse =
+        "HTTP/1.1 200 OK\r\n".
+        BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$acknowledgement}\r\n".
+        BlueGreenRoutingTarget::RELEASE_PROOF_HEADER.": {$target->releaseProofToken}\r\n\r\n";
+    Process::fake(['*' => Process::sequence([
+        Process::result(output: $claim->serverBootId),
+        Process::result(output: 'coolify-blue-green-destination-state-attested'),
+        Process::result(output: $claim->serverBootId),
+        Process::result(output: $staleLegacyResponse),
+        Process::result(output: $claim->serverBootId),
+        Process::result(output: 'coolify-blue-green-destination-state-attested'),
+        Process::result(output: $claim->serverBootId),
+        Process::result(output: $appliedResponse),
+    ])]);
+
+    try {
+        invokeBlueGreenContinuousAvailabilityLifecycle(
+            $lifecycle,
+            'waitForRoutes',
+            $configuration,
+            $target,
+            BlueGreenDeploymentPhase::PREPARING,
+        );
+    } finally {
+        $lifecycle->release();
+    }
+
+    Sleep::assertSleptTimes(1);
+    Process::assertRanTimes(
+        fn (PendingProcess $process): bool => str_contains(
+            (string) $process->input,
+            'X-Coolify-Blue-Green-Probe',
+        ),
+        2,
+    );
+});
