@@ -344,7 +344,7 @@ it('uses a private probe only for first or legacy-adoption promotions', function
             $previous,
         ))->toBeTrue();
 });
-it('retries only an initial unacknowledged 404 candidate probe route', function (
+it('retries only an initial unacknowledged catchall-status candidate probe route', function (
     string $outcome,
     int $expectedProbeRequests,
     int $expectedSleeps,
@@ -397,7 +397,17 @@ it('retries only an initial unacknowledged 404 candidate probe route', function 
             'initial-404' => $probeRequests === 1
                 ? Process::result(output: "HTTP/1.1 404 Not Found\r\n\r\n")
                 : Process::result(output: $successfulResponse),
+            'initial-503-catchall' => $probeRequests === 1
+                ? Process::result(output: "HTTP/1.1 503 Service Unavailable\r\n\r\n")
+                : Process::result(output: $successfulResponse),
+            'initial-302-catchall' => $probeRequests === 1
+                ? Process::result(output: "HTTP/1.1 302 Found\r\nLocation: https://redirect.example.test/\r\n\r\n")
+                : Process::result(output: $successfulResponse),
+            'missing-release-proof' => Process::result(output: "HTTP/1.1 200 OK\r\n"
+                .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$probeAcknowledgement}\r\n\r\n"),
             'stale-404-acknowledgement' => Process::result(output: "HTTP/1.1 404 Not Found\r\n"
+                .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$wrongAcknowledgement}\r\n\r\n"),
+            'stale-503-acknowledgement' => Process::result(output: "HTTP/1.1 503 Service Unavailable\r\n"
                 .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$wrongAcknowledgement}\r\n\r\n"),
             'wrong-acknowledgement' => Process::result(output: "HTTP/1.1 200 OK\r\n"
                 .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$wrongAcknowledgement}\r\n"
@@ -409,7 +419,7 @@ it('retries only an initial unacknowledged 404 candidate probe route', function 
                 errorOutput: 'curl: (7) Failed to connect to direct origin',
                 exitCode: 7,
             ),
-            'other-status' => Process::result(output: "HTTP/1.1 503 Service Unavailable\r\n\r\n"),
+            'other-status' => Process::result(output: "HTTP/1.1 500 Internal Server Error\r\n\r\n"),
         };
     });
 
@@ -439,7 +449,11 @@ it('retries only an initial unacknowledged 404 candidate probe route', function 
     Sleep::assertSleptTimes($expectedSleeps);
 })->with([
     'initial route is absent before Traefik exposes it' => ['initial-404', 2, 1, true],
+    'initial route hides behind the default 503 catchall' => ['initial-503-catchall', 2, 1, true],
+    'initial route hides behind the redirecting catchall' => ['initial-302-catchall', 2, 1, true],
+    'candidate application does not emit the release proof header' => ['missing-release-proof', 1, 0, true],
     'initial route returns a stale acknowledgement' => ['stale-404-acknowledgement', 1, 0, false],
+    'catchall status with an acknowledgement is a managed route failure' => ['stale-503-acknowledgement', 1, 0, false],
     'candidate route returns a wrong acknowledgement' => ['wrong-acknowledgement', 1, 0, false],
     'candidate route returns a wrong release proof' => ['wrong-release-proof', 1, 0, false],
     'candidate probe transport fails' => ['transport-failure', 1, 0, false],

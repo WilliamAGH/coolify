@@ -2009,9 +2009,7 @@ final class BlueGreenDeploymentLifecycle
             throw new DeploymentException('Blue-green routing has neither a public route nor a candidate probe route to verify.');
         }
         $verifier = new VerifyBlueGreenPublicRecovery;
-        $attempts = $publicRoutes === []
-            ? max(10, (int) $this->application->health_check_retries)
-            : 1;
+        $attempts = max(10, (int) $this->application->health_check_retries);
         $lastFailure = 'Traefik did not expose a route verification result.';
 
         for ($attempt = 1; $attempt <= $attempts; $attempt++) {
@@ -2051,13 +2049,14 @@ final class BlueGreenDeploymentLifecycle
             } catch (Throwable $exception) {
                 $lastFailure = $exception->getMessage();
                 if ($publicRoutes !== []) {
-                    $this->deployment->addLogEntry(
-                        'Blue-green public handoff observed an error after switch; the zero-error guarantee is not met: '.$lastFailure,
-                        'stderr',
-                    );
-                    throw new DeploymentException('Blue-green public verification failed after switch without retry: '.$lastFailure, previous: $exception);
-                }
-                if (! $this->isExpectedInitialProbeRouteAppearance($exception, $expectedPhase)) {
+                    if (! VerifyBlueGreenPublicRecovery::isConvergingRouteObservation($exception)) {
+                        $this->deployment->addLogEntry(
+                            'Blue-green public handoff observed an error after switch; the zero-error guarantee is not met: '.$lastFailure,
+                            'stderr',
+                        );
+                        throw new DeploymentException('Blue-green public verification failed after switch without retry: '.$lastFailure, previous: $exception);
+                    }
+                } elseif (! $this->isExpectedInitialProbeRouteAppearance($exception, $expectedPhase)) {
                     throw new DeploymentException('Blue-green candidate probe verification failed without retry: '.$lastFailure, previous: $exception);
                 }
             }
@@ -2074,8 +2073,7 @@ final class BlueGreenDeploymentLifecycle
         BlueGreenDeploymentPhase $expectedPhase,
     ): bool {
         if (! $exception instanceof BlueGreenPublicRouteAcknowledgementMismatch
-            || $exception->status !== 404
-            || $exception->acknowledgements !== []
+            || ! VerifyBlueGreenPublicRecovery::indicatesRouteAbsence($exception->status, $exception->acknowledgements)
             || $expectedPhase !== BlueGreenDeploymentPhase::PREPARING
             || $this->previousActiveColor !== null
             || $this->legacyContainerName !== null

@@ -304,6 +304,92 @@ it('fails a public handoff after one post-switch gateway error instead of maskin
     );
 })->with([502, 503]);
 
+it('absorbs Traefik file-provider apply lag before asserting the public handoff acknowledgement', function (): void {
+    config(['constants.ssh.mux_enabled' => false]);
+    Sleep::fake();
+    $context = blueGreenContinuousAvailabilityContext(BlueGreenRoutingMode::LegacyAdoption);
+    $lifecycle = $context['lifecycle'];
+    $configuration = $context['configuration'];
+    $target = $context['target'];
+    $claim = $context['claim'];
+    $acknowledgement = $target->publicAcknowledgement();
+    $releaseProof = $target->releaseProofToken;
+    expect($acknowledgement)->not->toBeNull()
+        ->and($releaseProof)->not->toBeNull();
+    $staleResponse =
+        "HTTP/1.1 200 OK\r\n".
+        BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.': '.str_repeat('e', 64)."\r\n\r\n";
+    $appliedResponse =
+        "HTTP/1.1 200 OK\r\n".
+        BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$acknowledgement}\r\n".
+        BlueGreenRoutingTarget::RELEASE_PROOF_HEADER.": {$releaseProof}\r\n\r\n";
+    Process::fake(['*' => Process::sequence([
+        Process::result(output: $claim->serverBootId),
+        Process::result(output: 'coolify-blue-green-destination-state-attested'),
+        Process::result(output: $claim->serverBootId),
+        Process::result(output: $staleResponse),
+        Process::result(output: $claim->serverBootId),
+        Process::result(output: 'coolify-blue-green-destination-state-attested'),
+        Process::result(output: $claim->serverBootId),
+        Process::result(output: $appliedResponse),
+    ])]);
+
+    try {
+        invokeBlueGreenContinuousAvailabilityLifecycle(
+            $lifecycle,
+            'waitForRoutes',
+            $configuration,
+            $target,
+            BlueGreenDeploymentPhase::PREPARING,
+        );
+    } finally {
+        $lifecycle->release();
+    }
+
+    Sleep::assertSleptTimes(1);
+    Process::assertRanTimes(
+        fn (PendingProcess $process): bool => str_contains((string) $process->input, 'url = '),
+        2,
+    );
+});
+
+it('fails a public handoff verification without retry when the observed response is a user-visible error', function (): void {
+    config(['constants.ssh.mux_enabled' => false]);
+    Sleep::fake();
+    $context = blueGreenContinuousAvailabilityContext(BlueGreenRoutingMode::LegacyAdoption);
+    $lifecycle = $context['lifecycle'];
+    $configuration = $context['configuration'];
+    $target = $context['target'];
+    $claim = $context['claim'];
+    $deployment = $context['deployment'];
+    Process::fake(['*' => Process::sequence([
+        Process::result(output: $claim->serverBootId),
+        Process::result(output: 'coolify-blue-green-destination-state-attested'),
+        Process::result(output: $claim->serverBootId),
+        Process::result(output: "HTTP/1.1 502 Bad Gateway\r\n\r\n"),
+    ])]);
+
+    try {
+        expect(fn () => invokeBlueGreenContinuousAvailabilityLifecycle(
+            $lifecycle,
+            'waitForRoutes',
+            $configuration,
+            $target,
+            BlueGreenDeploymentPhase::PREPARING,
+        ))->toThrow(DeploymentException::class, 'failed after switch without retry');
+    } finally {
+        $lifecycle->release();
+    }
+
+    expect((string) $deployment->fresh()->logs)
+        ->toContain('zero-error guarantee is not met', 'ineligible public status 502');
+    Sleep::assertNeverSlept();
+    Process::assertRanTimes(
+        fn (PendingProcess $process): bool => str_contains((string) $process->input, 'url = '),
+        1,
+    );
+});
+
 it('fails a legacy-adoption candidate probe without retry before a public router can shadow legacy traffic', function (): void {
     config(['constants.ssh.mux_enabled' => false]);
     Sleep::fake();
