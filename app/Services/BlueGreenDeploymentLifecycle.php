@@ -2266,6 +2266,7 @@ final class BlueGreenDeploymentLifecycle
             TransitionsBlueGreenDeployment::beginRollback($claim);
             $this->reconcilePendingDestinationState();
             $this->reconcileAppliedRoutingState();
+            $this->reconcileUncommittedDestinationAdvance();
             if ($this->proxyChanged) {
                 $rollbackKey = $this->rollbackKey
                     ?? throw new DeploymentException('Blue-green routing changed without a durable rollback key.');
@@ -2556,6 +2557,43 @@ final class BlueGreenDeploymentLifecycle
         }
         $this->destinationState = $replacementState;
         $this->pendingDestinationState = null;
+    }
+
+    /**
+     * A fenced destination mutation commits its durable state file on the
+     * destination before its container commands run. When the remote script
+     * fails after that commit, the deployment sees only a mutation error while
+     * the destination fence has already advanced one owned sequence past the
+     * recorded state. Rollback probes for exactly that deterministic successor
+     * and records it durably, so the retained IDLE row and the destination
+     * agree on the absent-route fence identity and the next deployment can
+     * adopt it refreshably instead of failing its pristine-destination
+     * attestation.
+     */
+    private function reconcileUncommittedDestinationAdvance(): void
+    {
+        $claim = $this->claim;
+        if ($claim === null) {
+            return;
+        }
+        $candidateAdvance = (new ExecuteBlueGreenDestinationMutation)->replacementStateFor(
+            $this->application,
+            $claim,
+            $this->destinationState,
+        );
+        if ($this->destinationState !== null
+            && $candidateAdvance->serialize() === $this->destinationState->serialize()) {
+            return;
+        }
+        if (! $this->remoteDestinationStateMatches($candidateAdvance)) {
+            return;
+        }
+        RecordBlueGreenDestinationState::run($claim, $this->destinationState, $candidateAdvance);
+        $this->destinationState = $candidateAdvance;
+        $this->deployment->addLogEntry(
+            'Blue-green rollback recorded a destination fence advance that its failed mutation had already committed remotely.',
+            'stderr',
+        );
     }
 
     private function reconcileAppliedRoutingState(): void
