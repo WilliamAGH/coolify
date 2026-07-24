@@ -8,6 +8,21 @@ All notable changes to this project will be documented in this file.
 
 - Update changelog
 
+## [4.13.31-fork] - 2026-07-24
+
+### 🐛 Bug Fixes
+
+- *(ci)* Finish retiring V4xCandidateWorkflowTest from validation
+- *(deps)* Bump postcss to 8.5.23 for GHSA-r28c-9q8g-f849
+
+### 📚 Documentation
+
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.31-fork
+
 ## [4.13.30-fork] - 2026-07-24
 
 ### 🐛 Bug Fixes
