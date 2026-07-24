@@ -10,12 +10,9 @@ use App\Models\ApplicationDeploymentQueue;
 use App\Models\Environment;
 use App\Models\InstanceSettings;
 use App\Models\ScheduledDatabaseBackup;
-use App\Models\ScheduledDatabaseBackupExecution;
-use App\Models\ScheduledTaskExecution;
 use App\Models\Server;
 use App\Models\StandalonePostgresql;
 use App\Models\User;
-use Carbon\Carbon;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\File;
@@ -107,31 +104,9 @@ class Init extends Command
         }
 
         try {
-            $updatedTaskCount = ScheduledTaskExecution::where('status', 'running')->update([
-                'status' => 'failed',
-                'message' => 'Marked as failed during Coolify startup - job was interrupted',
-                'finished_at' => Carbon::now(),
-            ]);
-
-            if ($updatedTaskCount > 0) {
-                echo "Marked {$updatedTaskCount} stuck scheduled task executions as failed\n";
-            }
+            $this->call('cleanup:stuck-executions');
         } catch (\Throwable $e) {
-            echo "Could not cleanup stuck scheduled task executions: {$e->getMessage()}\n";
-        }
-
-        try {
-            $updatedBackupCount = ScheduledDatabaseBackupExecution::where('status', 'running')->update([
-                'status' => 'failed',
-                'message' => 'Marked as failed during Coolify startup - job was interrupted',
-                'finished_at' => Carbon::now(),
-            ]);
-
-            if ($updatedBackupCount > 0) {
-                echo "Marked {$updatedBackupCount} stuck database backup executions as failed\n";
-            }
-        } catch (\Throwable $e) {
-            echo "Could not cleanup stuck database backup executions: {$e->getMessage()}\n";
+            echo "Error in cleanup:stuck-executions command: {$e->getMessage()}\n";
         }
 
         try {

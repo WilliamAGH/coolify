@@ -25,7 +25,7 @@ afterEach(function () {
     Carbon::setTestNow();
 });
 
-test('app:init marks stuck scheduled task executions as failed', function () {
+test('cleanup:stuck-executions marks stuck scheduled task executions as failed', function () {
     // Create a team for the scheduled task
     $team = Team::factory()->create();
 
@@ -55,8 +55,8 @@ test('app:init marks stuck scheduled task executions as failed', function () {
         'finished_at' => Carbon::now()->subMinutes(14),
     ]);
 
-    // Run the app:init command
-    Artisan::call('app:init');
+    // Run the cleanup command
+    Artisan::call('cleanup:stuck-executions');
 
     // Refresh models from database
     $runningExecution1->refresh();
@@ -81,14 +81,12 @@ test('app:init marks stuck scheduled task executions as failed', function () {
     Notification::assertNothingSent();
 });
 
-test('app:init marks stuck database backup executions as failed', function () {
+test('cleanup:stuck-executions marks stuck database backup executions as failed', function () {
     // Create a team for the scheduled backup
     $team = Team::factory()->create();
 
-    // Create a database
-    $database = StandalonePostgresql::factory()->create([
-        'team_id' => $team->id,
-    ]);
+    // Create a database (databases belong to an environment, not a team)
+    $database = StandalonePostgresql::factory()->create();
 
     // Create a scheduled backup
     $scheduledBackup = ScheduledDatabaseBackup::factory()->create([
@@ -118,8 +116,8 @@ test('app:init marks stuck database backup executions as failed', function () {
         'finished_at' => Carbon::now()->subMinutes(20),
     ]);
 
-    // Run the app:init command
-    Artisan::call('app:init');
+    // Run the cleanup command
+    Artisan::call('cleanup:stuck-executions');
 
     // Refresh models from database
     $runningBackup1->refresh();
@@ -144,7 +142,7 @@ test('app:init marks stuck database backup executions as failed', function () {
     Notification::assertNothingSent();
 });
 
-test('app:init handles cleanup when no stuck executions exist', function () {
+test('cleanup:stuck-executions handles cleanup when no stuck executions exist', function () {
     // Create a team
     $team = Team::factory()->create();
 
@@ -168,8 +166,8 @@ test('app:init handles cleanup when no stuck executions exist', function () {
         'finished_at' => Carbon::now()->subMinutes(19),
     ]);
 
-    // Run the app:init command (should not fail)
-    $exitCode = Artisan::call('app:init');
+    // Run the cleanup command (should not fail)
+    $exitCode = Artisan::call('cleanup:stuck-executions');
 
     // Assert command succeeded
     expect($exitCode)->toBe(0);
@@ -184,8 +182,10 @@ test('app:init handles cleanup when no stuck executions exist', function () {
 });
 
 test('cleanup does not send notifications even when team has notification settings', function () {
-    // Create a team with notification settings enabled
-    $team = Team::factory()->create([
+    // Create a team with notification settings enabled (auto-created on team
+    // creation; SMTP fields live on email_notification_settings, not teams)
+    $team = Team::factory()->create();
+    $team->emailNotificationSettings()->update([
         'smtp_enabled' => true,
         'smtp_from_address' => 'test@example.com',
     ]);
@@ -202,8 +202,8 @@ test('cleanup does not send notifications even when team has notification settin
         'started_at' => Carbon::now()->subMinutes(5),
     ]);
 
-    // Run the app:init command
-    Artisan::call('app:init');
+    // Run the cleanup command
+    Artisan::call('cleanup:stuck-executions');
 
     // Refresh model
     $runningExecution->refresh();
