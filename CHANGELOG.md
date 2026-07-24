@@ -4,13 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 📚 Documentation
+
+- Update changelog
+
+## [4.13.33-fork] - 2026-07-24
+
 ### 🐛 Bug Fixes
 
 - *(blue-green)* Let a fenced manual stop supersede a parked intervention promotion owner
+- *(deployment)* Attest all compose images when blue-green is not in play
 
 ### 📚 Documentation
 
 - Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.33-fork
 
 ## [4.13.32-fork] - 2026-07-24
 
