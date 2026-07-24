@@ -297,7 +297,10 @@ function generateDefaultProxyConfiguration(Server $server, array $custom_command
                         '80:80',
                         '443:443',
                         '443:443/udp',
-                        '8080:8080',
+                        // Loopback-only: on-host provider proofs read /api/rawdata
+                        // here; Swarm rewrites this below because ingress publishes
+                        // cannot bind a host IP.
+                        '127.0.0.1:8080:8080',
                     ],
                     'healthcheck' => [
                         'test' => 'wget -qO- http://localhost:80/ping || exit 1',
@@ -337,13 +340,21 @@ function generateDefaultProxyConfiguration(Server $server, array $custom_command
             $config['services']['traefik']['command'][] = '--accesslog.bufferingsize=100';
             $config['services']['traefik']['volumes'][] = '/var/lib/docker/volumes/coolify_dev_coolify_data/_data/proxy/:/traefik';
         } else {
-            $config['services']['traefik']['command'][] = '--api.insecure=false';
+            // The API stays enabled because it only listens on the loopback
+            // 8080 bind above; blue-green provider proofs depend on rawdata.
+            $config['services']['traefik']['command'][] = '--api.insecure=true';
             $config['services']['traefik']['volumes'][] = "{$proxy_path}:/traefik";
         }
         if ($server->isSwarm()) {
             data_forget($config, 'services.traefik.container_name');
             data_forget($config, 'services.traefik.restart');
             data_forget($config, 'services.traefik.labels');
+            $config['services']['traefik']['ports'] = [
+                '80:80',
+                '443:443',
+                '443:443/udp',
+                '8080:8080',
+            ];
 
             $config['services']['traefik']['command'][] = '--providers.swarm.endpoint=unix:///var/run/docker.sock';
             $config['services']['traefik']['command'][] = '--providers.swarm.exposedbydefault=false';
