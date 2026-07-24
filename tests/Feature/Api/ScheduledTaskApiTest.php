@@ -16,8 +16,9 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
-    // ApiAllowed middleware requires InstanceSettings with id=0
-    InstanceSettings::create(['id' => 0, 'is_api_enabled' => true]);
+    // The API request path resolves the instance-owned id-0 settings row via
+    // InstanceSettings::get(); id is guarded, so mass assignment cannot seed it.
+    InstanceSettings::forceCreate(['id' => 0, 'is_api_enabled' => true]);
 
     $this->team = Team::factory()->create();
     $this->user = User::factory()->create();

@@ -2,6 +2,7 @@
 
 use App\Models\Application;
 use App\Models\Environment;
+use App\Models\InstanceSettings;
 use App\Models\Project;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
@@ -13,6 +14,10 @@ use Visus\Cuid2\Cuid2;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
+    // The API request path resolves the instance-owned id-0 settings row via
+    // InstanceSettings::get(); id is guarded, so mass assignment cannot seed it.
+    InstanceSettings::forceCreate(['id' => 0, 'is_api_enabled' => true]);
+
     $this->team = Team::factory()->create();
     $this->user = User::factory()->create();
     $this->team->members()->attach($this->user->id, ['role' => 'owner']);

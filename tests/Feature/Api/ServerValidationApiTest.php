@@ -12,11 +12,14 @@ use Illuminate\Support\Facades\Queue;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
-    InstanceSettings::updateOrCreate(['id' => 0], ['is_api_enabled' => true]);
+    // The API request path resolves the instance-owned id-0 settings row via
+    // InstanceSettings::get(); id is guarded, so mass assignment cannot seed it.
+    InstanceSettings::forceCreate(['id' => 0, 'is_api_enabled' => true]);
 
     $this->team = Team::factory()->create();
     $this->user = User::factory()->create();
     $this->team->members()->attach($this->user->id, ['role' => 'owner']);
+    session(['currentTeam' => $this->team]);
     $this->server = Server::factory()->create(['team_id' => $this->team->id]);
     $this->token = $this->user->createToken('server-validation', ['write'])->plainTextToken;
 
