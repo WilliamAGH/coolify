@@ -161,6 +161,37 @@ describe('POST /api/v1/deployments/{uuid}/cancel', function () {
         $deployment->refresh();
         expect($deployment->status)->toBe(ApplicationDeploymentStatus::CANCELLED_BY_USER->value);
     });
+    test('returns 200 when the deployment container no longer exists during post-cancel cleanup', function () {
+        $deployment = ApplicationDeploymentQueue::create([
+            'deployment_uuid' => 'missing-container-uuid',
+            'application_id' => 1,
+            'server_id' => $this->server->id,
+            'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+        ]);
+
+        Process::fake([
+            '*docker rm -f*' => Process::result(
+                errorOutput: "Error response from daemon: No such container: {$deployment->deployment_uuid}",
+                exitCode: 1,
+            ),
+            '*docker ps -a*' => Process::result(output: $deployment->deployment_uuid, exitCode: 0),
+            '*' => Process::result(output: '', exitCode: 0),
+        ]);
+
+        $response = $this->withHeaders([
+            'Authorization' => 'Bearer '.$this->bearerToken,
+            'Content-Type' => 'application/json',
+        ])->postJson("/api/v1/deployments/{$deployment->deployment_uuid}/cancel");
+
+        $response->assertStatus(200);
+        $response->assertJson([
+            'message' => 'Deployment cancelled successfully.',
+            'deployment_uuid' => $deployment->deployment_uuid,
+            'status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+        ]);
+        expect($deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::CANCELLED_BY_USER->value);
+    });
+
     test('drains the serialized application lane when remote cleanup fails', function () {
         Bus::fake([ApplicationDeploymentJob::class]);
         Process::fake([
@@ -203,7 +234,7 @@ describe('POST /api/v1/deployments/{uuid}/cancel', function () {
             'Content-Type' => 'application/json',
         ])->postJson("/api/v1/deployments/{$cancelledDeployment->deployment_uuid}/cancel");
 
-        $response->assertStatus(500);
+        $response->assertStatus(200);
         expect($cancelledDeployment->fresh()->status)->toBe(ApplicationDeploymentStatus::CANCELLED_BY_USER->value)
             ->and($nextDeployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
         Bus::assertDispatched(
@@ -228,17 +259,15 @@ describe('POST /api/v1/deployments/{uuid}/cancel', function () {
             'Content-Type' => 'application/json',
         ])->postJson("/api/v1/deployments/{$deployment->deployment_uuid}/cancel");
 
-        expect($response->status())->toBeIn([200, 500]);
-        if ($response->status() === 200) {
-            $response->assertJsonStructure([
-                'message',
-                'deployment_uuid',
-                'status',
-            ]);
-            $response->assertJson([
-                'deployment_uuid' => $deployment->deployment_uuid,
-                'status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
-            ]);
-        }
+        $response->assertStatus(200);
+        $response->assertJsonStructure([
+            'message',
+            'deployment_uuid',
+            'status',
+        ]);
+        $response->assertJson([
+            'deployment_uuid' => $deployment->deployment_uuid,
+            'status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+        ]);
     });
 });
