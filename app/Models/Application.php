@@ -1843,6 +1843,15 @@ class Application extends BaseModel
             return;
         }
 
+        // Blue-green is opt-out: an application still being assembled (never
+        // deployed, no durable state) may be saved while ineligible so the
+        // default-enabled flag survives creation. The deploy-time eligibility
+        // gate still fails closed with the exact reason - fix the shape or
+        // opt out; rolling fallback stays forbidden.
+        if ($this->deployment_queue()->doesntExist()) {
+            return;
+        }
+
         throw new RuntimeException("Blue-green deployment configuration cannot become ineligible while it is opted in. {$ineligibilityReason} Disable blue-green deployment first.");
     }
 
@@ -1995,9 +2004,15 @@ class Application extends BaseModel
 
     public function requiresBlueGreenDeactivation(): bool
     {
+        if ($this->blueGreenDeployments()->exists() || $this->blueGreenDeactivations()->exists()) {
+            return true;
+        }
+
+        // Opt-in alone (the opt-out default) does not create anything to
+        // deactivate: an application with no deployment history has no
+        // containers or routing under blue-green management.
         return $this->isBlueGreenDeploymentOptedIn($this->settings()->first())
-            || $this->blueGreenDeployments()->exists()
-            || $this->blueGreenDeactivations()->exists();
+            && $this->deployment_queue()->exists();
     }
 
     public function isBlueGreenDeploymentEligible(): bool
