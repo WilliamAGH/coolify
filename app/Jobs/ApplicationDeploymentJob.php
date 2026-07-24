@@ -2627,6 +2627,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             'build_pack' => $this->application->build_pack,
             'build_server_id' => $this->use_build_server ? $this->build_server->id : null,
             'compose_sha256' => $composeSha256,
+            'container_name' => $this->container_name,
             'coolify_variables' => $this->coolify_variables,
             'deployment_uuid' => $this->deployment_uuid,
             'docker_compose_custom_start_command' => $this->docker_compose_custom_start_command,
@@ -3027,6 +3028,17 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         $preparedBlueGreenClaim = $artifact['blue_green_claim'] ?? null;
         if ($preparedBlueGreenClaim !== null && ! is_array($preparedBlueGreenClaim)) {
             throw new DeploymentException('Prepared deployment blue-green ownership is malformed.');
+        }
+        if ($preparedBlueGreenClaim === null) {
+            // The name is timestamp-derived, so the activation process must run
+            // against the exact container the preparation wrote into the compose
+            // file — a regenerated name inspects a container that never existed.
+            $preparedContainerName = $artifact['container_name'] ?? null;
+            if (! is_string($preparedContainerName)
+                || preg_match(ValidationPatterns::CONTAINER_NAME_PATTERN, $preparedContainerName) !== 1) {
+                throw new DeploymentException('Prepared deployment artifact carries no exact container name.');
+            }
+            $this->container_name = $preparedContainerName;
         }
         if ($preparedBlueGreenClaim !== null && ! $runtimeRenderDeferred) {
             throw new DeploymentException('Prepared deployment blue-green ownership is inconsistent with its runtime artifact.');
