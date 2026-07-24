@@ -151,6 +151,43 @@ class VerifyBlueGreenPublicRecovery
     }
 
     /**
+     * Verifies every route with the bounded provider apply-lag budget:
+     * healthy responses carrying a stale or absent acknowledgement are
+     * retried while Traefik's file provider converges on a freshly written
+     * managed file; every other failure is terminal on first observation.
+     *
+     * @param  list<array{router: string, url: string}>  $routes
+     */
+    public function verifyRoutesAbsorbingProviderLag(
+        Server $server,
+        Application $application,
+        array $routes,
+        ?string $expectedAcknowledgement,
+        ?string $expectedReleaseProof = null,
+        string $nonceParameter = self::RECOVERY_NONCE_PARAMETER,
+        ?Closure $beforeRequest = null,
+    ): void {
+        retry(
+            max(10, (int) $application->health_check_retries),
+            function () use ($server, $application, $routes, $expectedAcknowledgement, $expectedReleaseProof, $nonceParameter, $beforeRequest): void {
+                foreach ($routes as $route) {
+                    $this->verifyRoute(
+                        $server,
+                        $application,
+                        $route,
+                        $expectedAcknowledgement,
+                        $expectedReleaseProof,
+                        nonceParameter: $nonceParameter,
+                        beforeRequest: $beforeRequest,
+                    );
+                }
+            },
+            1000,
+            fn (Throwable $exception): bool => self::isConvergingRouteObservation($exception),
+        );
+    }
+
+    /**
      * A managed host with no blue-green route answers with the server's
      * catchall: 404 when the default redirect is disabled, 503 from the
      * default empty-service catchall, or 302 when a redirect URL is set
