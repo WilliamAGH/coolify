@@ -2897,9 +2897,15 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         $safeComposePath = escapeshellarg("{$this->workdir}{$this->docker_compose_location}");
         $services = $this->blueGreenComposePreparedServiceNames();
         if ($services === []) {
-            throw new DeploymentException('Blue-green Compose image attestation has no prepared services.');
+            if (($this->blueGreenLifecycle?->isEnabled() ?? false) || $this->blueGreenLifecycle?->claim() !== null) {
+                throw new DeploymentException('Blue-green Compose image attestation has no prepared services.');
+            }
+            // A Compose deployment without blue-green has no candidate service
+            // set to scope the digest to; attest every service image instead.
+            $serviceArgument = '';
+        } else {
+            $serviceArgument = ' '.implode(' ', array_map(escapeshellarg(...), $services));
         }
-        $serviceArgument = ' '.implode(' ', array_map(escapeshellarg(...), $services));
 
         return "image_ids=\"$(docker compose -f {$safeComposePath} config --images{$serviceArgument} | while IFS= read -r image; do test -n \"\$image\"; docker image inspect --format='{{.Id}}' \"\$image\"; done | sort -u)\"; test -n \"\$image_ids\"; printf '%s\\n' \"\$image_ids\" | sha256sum | cut -d ' ' -f1";
     }

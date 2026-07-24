@@ -277,7 +277,7 @@ function blueGreenComposeClaim(
 function blueGreenComposeJobForClaim(
     Application $application,
     StandaloneDocker $destination,
-    BlueGreenDeploymentClaim $claim,
+    ?BlueGreenDeploymentClaim $claim,
 ): ApplicationDeploymentJob {
     $lifecycle = new BlueGreenDeploymentLifecycle(
         application: $application,
@@ -287,7 +287,7 @@ function blueGreenComposeJobForClaim(
         timeout: 30,
         checkForCancellation: static function (): void {},
     );
-    (new ReflectionProperty(BlueGreenDeploymentLifecycle::class, 'enabled'))->setValue($lifecycle, true);
+    (new ReflectionProperty(BlueGreenDeploymentLifecycle::class, 'enabled'))->setValue($lifecycle, $claim !== null);
     (new ReflectionProperty(BlueGreenDeploymentLifecycle::class, 'claim'))->setValue($lifecycle, $claim);
 
     $job = (new ReflectionClass(ApplicationDeploymentJob::class))->newInstanceWithoutConstructor();
@@ -1531,4 +1531,21 @@ it('fails closed when an opted-in Compose application mutates its routed topolog
 
     expect(fn (): bool => $application->save())
         ->toThrow(RuntimeException::class, 'Blue-green Docker Compose routed service `web` must be stateless and cannot declare volumes.');
+});
+
+it('attests every compose service image for a non-blue-green compose deployment', function (): void {
+    $application = blueGreenComposeApplication();
+    $application->settings()->update(['is_blue_green_deployment_enabled' => false]);
+    $destination = StandaloneDocker::query()->with('server')->findOrFail($application->destination_id);
+
+    // Mirror the 2026-07-24 incident: a Compose application with blue-green
+    // opted out (no claim, no candidate services) must still produce a
+    // prepared-artifact digest covering every service image instead of
+    // failing the deploy with "no prepared services".
+    $job = blueGreenComposeJobForClaim($application, $destination, null);
+
+    $attestationCommand = invokeBlueGreenComposeJobMethod($job, 'blueGreenComposeImageDigestCommand');
+
+    expect($attestationCommand)->toContain('config --images |')
+        ->and($attestationCommand)->toContain('docker image inspect');
 });
