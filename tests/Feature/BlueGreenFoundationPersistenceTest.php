@@ -116,7 +116,8 @@ it('persists the typed blue-green foundation and queue provenance', function () 
     ]);
 
     $setting = $application->settings()->firstOrFail();
-    expect($setting->is_blue_green_deployment_enabled)->toBeFalse();
+    // Blue-green is opt-out: new application settings default to enabled.
+    expect($setting->is_blue_green_deployment_enabled)->toBeTrue();
 
     $setting->update([
         'is_container_label_readonly_enabled' => true,

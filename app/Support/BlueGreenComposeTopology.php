@@ -38,6 +38,23 @@ final class BlueGreenComposeTopology
         return self::resolve($application)['reason'];
     }
 
+    /**
+     * Typed ineligibility outcome: `incomplete` is true only for parse-state
+     * reasons (the parser has not finished a round trip yet), never for a
+     * conflicting topology. Branch on this flag, not on message text.
+     *
+     * @return array{reason: ?string, incomplete: bool}
+     */
+    public static function ineligibility(Application $application): array
+    {
+        $resolved = self::resolve($application);
+
+        return [
+            'reason' => $resolved['reason'],
+            'incomplete' => (bool) ($resolved['incomplete'] ?? false),
+        ];
+    }
+
     public static function tryFromApplication(Application $application): ?self
     {
         return self::resolve($application)['topology'];
@@ -200,7 +217,7 @@ final class BlueGreenComposeTopology
 
         $compose = self::parsedCompose($application);
         if ($compose === null) {
-            return ['topology' => null, 'reason' => 'Blue-green Docker Compose deployments require a valid parsed Compose document.'];
+            return ['topology' => null, 'reason' => 'Blue-green Docker Compose deployments require a valid parsed Compose document.', 'incomplete' => true];
         }
         $services = $compose['services'] ?? null;
         if (! is_array($services) || $services === []) {
@@ -277,6 +294,7 @@ final class BlueGreenComposeTopology
             return [
                 'topology' => null,
                 'reason' => 'Blue-green Docker Compose parsed and pre-injection service inventories must match exactly; parsed services are `'.implode('`, `', $parsedServiceNames).'`, raw services are `'.implode('`, `', $rawServiceNames).'`.',
+                'incomplete' => true,
             ];
         }
         $containerNames = [];

@@ -60,7 +60,7 @@ class ApplicationSetting extends Model
     protected $attributes = [
         'blue_green_inactive_retention_seconds' => DEFAULT_BLUE_GREEN_INACTIVE_RETENTION_SECONDS,
         'blue_green_replica_count' => DEFAULT_BLUE_GREEN_REPLICA_COUNT,
-        'is_blue_green_deployment_enabled' => false,
+        'is_blue_green_deployment_enabled' => true,
     ];
 
     protected $casts = [
@@ -255,6 +255,7 @@ class ApplicationSetting extends Model
         $application->prepareBlueGreenConfigurationMutation(
             setting: $this,
             allowPendingSettingOptOut: ! $isEnablingBlueGreenDeployment,
+            isExplicitOptIn: $isEnablingBlueGreenDeployment,
         );
     }
 

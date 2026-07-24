@@ -2,9 +2,6 @@
 
 namespace App\Actions\Application\BlueGreen;
 
-use App\Actions\Proxy\BlueGreenRoutingTarget;
-use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
-use App\Enums\BlueGreenDeploymentColor;
 use App\Models\Application;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
@@ -75,7 +72,7 @@ class CaptureBlueGreenLegacyRouting
         if ($ports === null) {
             throw new RuntimeException('The legacy application no longer has an exact backend port inventory.');
         }
-        $canonicalLabels = $this->canonicalTraefikLabels($application, $destination, $ports);
+        $canonicalLabels = $this->canonicalTraefikLabels($application, $destination);
         $actualLabels = $this->actualTraefikLabels($labels);
         if ($canonicalLabels !== $actualLabels) {
             throw new RuntimeException('The immutable legacy Traefik labels do not exactly match the recognized current canonical routing inventory.');
@@ -109,27 +106,12 @@ class CaptureBlueGreenLegacyRouting
     private function canonicalTraefikLabels(
         Application $application,
         StandaloneDocker $destination,
-        array $ports,
     ): array {
         $applicationForLabels = clone $application;
         $applicationForLabels->setRelation('destination', $destination);
         $labels = $application->build_pack === 'dockercompose'
             ? $application->blueGreenRoutingLabels()
             : generateLabelsApplication($applicationForLabels);
-        $applicationUuid = (string) $application->uuid;
-        CompileBlueGreenProxyConfiguration::run(
-            $application,
-            $destination,
-            new BlueGreenRoutingTarget(
-                destinationId: $destination->id,
-                activeColor: BlueGreenDeploymentColor::BLUE,
-                blueContainerName: "{$applicationUuid}-blue",
-                greenContainerName: "{$applicationUuid}-green",
-                port: $ports[0],
-                ports: $ports,
-                routingRevision: 0,
-            ),
-        );
 
         return $this->labelMap($labels);
     }

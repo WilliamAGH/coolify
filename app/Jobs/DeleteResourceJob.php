@@ -47,7 +47,7 @@ class DeleteResourceJob implements ShouldBeEncrypted, ShouldQueue
     public function handle()
     {
         $requiresBlueGreenDeactivation = $this->resource instanceof Application
-            && $this->resource->requiresBlueGreenDeactivation();
+            && $this->resource->requiresBlueGreenDeletionDeactivation();
         $resourceCleanupCompleted = false;
 
         try {

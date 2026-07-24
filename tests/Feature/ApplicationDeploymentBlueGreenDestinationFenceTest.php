@@ -514,7 +514,7 @@ it('atomically refuses a terminal update after deletion supersedes the job snaps
         ->and($fixture['deployment']->fresh()->blue_green_supersession_generation)->toBe(1);
 });
 
-it('atomically refuses a terminal update after a newer state generation supersedes the job', function () {
+it('terminally fails a superseded claimed job that no durable owner can ever terminalize', function () {
     $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
     ApplicationDeploymentQueue::query()
         ->whereKey($fixture['deployment']->id)
@@ -532,6 +532,41 @@ it('atomically refuses a terminal update after a newer state generation supersed
         'supersession_generation' => 2,
     ]);
 
+    $refusedFinish = invokeApplicationDeploymentBlueGreenMethod(
+        $job,
+        'updateDeploymentStatus',
+        ApplicationDeploymentStatus::FINISHED,
+    );
+    $failed = invokeApplicationDeploymentBlueGreenMethod(
+        $job,
+        'updateDeploymentStatus',
+        ApplicationDeploymentStatus::FAILED,
+    );
+
+    expect($refusedFinish)->toBeFalse()
+        ->and($failed)->toBeTrue()
+        ->and($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value)
+        ->and($fixture['deployment']->fresh()->blue_green_supersession_generation)->toBe(1);
+});
+
+it('refuses a terminal failure while a durable state row still owns the claimed job', function () {
+    $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
+    ApplicationDeploymentQueue::query()
+        ->whereKey($fixture['deployment']->id)
+        ->update([
+            'blue_green_phase' => BlueGreenDeploymentPhase::ROLLING_BACK->value,
+            'blue_green_supersession_generation' => 1,
+        ]);
+    $job = new ApplicationDeploymentJob($fixture['deployment']->id);
+    ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $fixture['application']->id,
+        'standalone_docker_id' => $fixture['destination']->id,
+        'phase' => BlueGreenDeploymentPhase::ROLLING_BACK,
+        'routing_revision' => 1,
+        'operation_deployment_uuid' => $fixture['deployment']->deployment_uuid,
+        'supersession_generation' => 2,
+    ]);
+
     $updated = invokeApplicationDeploymentBlueGreenMethod(
         $job,
         'updateDeploymentStatus',
@@ -539,6 +574,5 @@ it('atomically refuses a terminal update after a newer state generation supersed
     );
 
     expect($updated)->toBeFalse()
-        ->and($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
-        ->and($fixture['deployment']->fresh()->blue_green_supersession_generation)->toBe(1);
+        ->and($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
 });

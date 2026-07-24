@@ -138,6 +138,8 @@ final class BlueGreenDeploymentLifecycle
 
     private bool $preparedActivationHandled = false;
 
+    private ?string $preparedActivationTerminalFailure = null;
+
     private readonly int $inactiveRetentionSeconds;
 
     /** @param Closure(): void $checkForCancellation */
@@ -242,7 +244,16 @@ final class BlueGreenDeploymentLifecycle
                 BlueGreenDeploymentPhase::SWITCHING,
                 BlueGreenDeploymentPhase::ROLLING_BACK,
             ], true)) {
+            if ($state === null
+                && ! $this->deploymentHasBlueGreenClaimProvenance()
+                && ! $this->application->isBlueGreenDeploymentOptedIn()) {
+                // A plain prepared activation: the deployment prepared without a
+                // blue-green claim and the destination has no durable blue-green
+                // state or opt-in, so the standard activation path owns it.
+                return;
+            }
             $this->preparedActivationHandled = true;
+            $this->preparedActivationTerminalFailure = 'The prepared blue-green activation can never succeed because its exact durable blue-green operation is no longer resumable by this queue owner.';
             $this->deployment->addLogEntry(
                 'Deferred a stale prepared activation because its exact durable blue-green operation is no longer resumable by this queue owner.',
                 'stderr',
@@ -291,6 +302,11 @@ final class BlueGreenDeploymentLifecycle
         }
         if ($state === null || $state->operation_deployment_uuid !== $this->deployment->deployment_uuid) {
             $this->preparedActivationHandled = true;
+            $this->preparedActivationTerminalFailure = 'The prepared blue-green activation can never succeed because its exact durable operation owner changed after queue handoff.';
+            $this->deployment->addLogEntry(
+                'Deferred a stale prepared activation because its exact durable operation owner changed after queue handoff.',
+                'stderr',
+            );
 
             return;
         }
@@ -306,6 +322,11 @@ final class BlueGreenDeploymentLifecycle
             BlueGreenDeploymentPhase::ROLLING_BACK,
         ], true)) {
             $this->preparedActivationHandled = true;
+            $this->preparedActivationTerminalFailure = 'The prepared blue-green activation can never succeed because its exact durable operation left every resumable phase.';
+            $this->deployment->addLogEntry(
+                'Deferred a stale prepared activation because its exact durable operation left every resumable phase.',
+                'stderr',
+            );
 
             return;
         }
@@ -396,6 +417,25 @@ final class BlueGreenDeploymentLifecycle
     public function wasPreparedActivationHandled(): bool
     {
         return $this->preparedActivationHandled;
+    }
+
+    /**
+     * A non-null reason proves the prepared activation is permanently
+     * unresumable by this queue owner: the deployment must terminalize instead
+     * of remaining in progress for the stale-dispatch resumer to republish
+     * forever. Transient defers (lock contention, deactivation fences,
+     * reconciler-owned recovery) keep this null.
+     */
+    public function preparedActivationTerminalFailureReason(): ?string
+    {
+        return $this->preparedActivationTerminalFailure;
+    }
+
+    private function deploymentHasBlueGreenClaimProvenance(): bool
+    {
+        return $this->deployment->blue_green_phase !== null
+            || $this->deployment->blue_green_color !== null
+            || $this->deployment->blue_green_supersession_generation !== null;
     }
 
     public function wasFinalizedFallbackRecovered(): bool
@@ -2226,6 +2266,7 @@ final class BlueGreenDeploymentLifecycle
             TransitionsBlueGreenDeployment::beginRollback($claim);
             $this->reconcilePendingDestinationState();
             $this->reconcileAppliedRoutingState();
+            $this->reconcileUncommittedDestinationAdvance();
             if ($this->proxyChanged) {
                 $rollbackKey = $this->rollbackKey
                     ?? throw new DeploymentException('Blue-green routing changed without a durable rollback key.');
@@ -2516,6 +2557,43 @@ final class BlueGreenDeploymentLifecycle
         }
         $this->destinationState = $replacementState;
         $this->pendingDestinationState = null;
+    }
+
+    /**
+     * A fenced destination mutation commits its durable state file on the
+     * destination before its container commands run. When the remote script
+     * fails after that commit, the deployment sees only a mutation error while
+     * the destination fence has already advanced one owned sequence past the
+     * recorded state. Rollback probes for exactly that deterministic successor
+     * and records it durably, so the retained IDLE row and the destination
+     * agree on the absent-route fence identity and the next deployment can
+     * adopt it refreshably instead of failing its pristine-destination
+     * attestation.
+     */
+    private function reconcileUncommittedDestinationAdvance(): void
+    {
+        $claim = $this->claim;
+        if ($claim === null) {
+            return;
+        }
+        $candidateAdvance = (new ExecuteBlueGreenDestinationMutation)->replacementStateFor(
+            $this->application,
+            $claim,
+            $this->destinationState,
+        );
+        if ($this->destinationState !== null
+            && $candidateAdvance->serialize() === $this->destinationState->serialize()) {
+            return;
+        }
+        if (! $this->remoteDestinationStateMatches($candidateAdvance)) {
+            return;
+        }
+        RecordBlueGreenDestinationState::run($claim, $this->destinationState, $candidateAdvance);
+        $this->destinationState = $candidateAdvance;
+        $this->deployment->addLogEntry(
+            'Blue-green rollback recorded a destination fence advance that its failed mutation had already committed remotely.',
+            'stderr',
+        );
     }
 
     private function reconcileAppliedRoutingState(): void

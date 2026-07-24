@@ -452,6 +452,18 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
                     $this->blueGreenLifecycle->initialize();
                 }
                 if ($this->blueGreenLifecycle->wasPreparedActivationHandled()) {
+                    $terminalFailure = $this->blueGreenLifecycle->preparedActivationTerminalFailureReason();
+                    if ($terminalFailure !== null) {
+                        // A provably unresumable prepared activation must reach a
+                        // terminal state; preserving it in progress would loop the
+                        // scheduled stale-dispatch resumer forever. The status
+                        // write stays fenced: it only lands while no durable
+                        // blue-green owner can still terminalize this row itself.
+                        $this->application_deployment_queue->addLogEntry("Deployment failed: {$terminalFailure}", 'stderr');
+                        $this->failDeployment();
+
+                        return;
+                    }
                     $this->preserveBlueGreenRecovery = true;
 
                     return;
@@ -6319,20 +6331,38 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         ApplicationDeploymentStatus $status,
         ?Closure $statusConstraint = null,
     ): bool {
-        $query = ApplicationDeploymentQueue::query()
-            ->whereKey($this->application_deployment_queue->getKey())
-            ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
-            ->when(
-                $this->dispatch_attempt_uuid !== null,
-                fn ($query) => $query->where('horizon_job_id', $this->dispatch_attempt_uuid),
-            );
-        $statusConstraint?->__invoke($query);
+        $baseQuery = function () use ($statusConstraint): Builder {
+            $query = ApplicationDeploymentQueue::query()
+                ->whereKey($this->application_deployment_queue->getKey())
+                ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
+                ->when(
+                    $this->dispatch_attempt_uuid !== null,
+                    fn ($query) => $query->where('horizon_job_id', $this->dispatch_attempt_uuid),
+                );
+            $statusConstraint?->__invoke($query);
+
+            return $query;
+        };
         $updated = BlueGreenLifecycleDatabaseLocks::constrainTerminalQueueOwner(
-            $query,
+            $baseQuery(),
             $this->application_deployment_queue,
         )->update([
             'status' => $status->value,
         ]);
+        if ($updated !== 1
+            && $status === ApplicationDeploymentStatus::FAILED
+            && $this->application_deployment_queue->blue_green_supersession_generation !== null) {
+            // The exact-owner constraint matches nothing once the durable
+            // blue-green operation was superseded or removed. Such an orphaned
+            // claimed row can never be terminalized by a canonical lifecycle
+            // transition, so it must fail here instead of looping in progress.
+            $updated = BlueGreenLifecycleDatabaseLocks::constrainOrphanedTerminalQueueOwner(
+                $baseQuery(),
+                $this->application_deployment_queue,
+            )->update([
+                'status' => $status->value,
+            ]);
+        }
         if ($updated !== 1) {
             return false;
         }

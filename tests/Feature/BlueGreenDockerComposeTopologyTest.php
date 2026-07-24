@@ -888,6 +888,9 @@ it('keeps database sidecars out of legacy discovery and fixed-color recovery', f
 
 it('allows pre-existing stateful sidecars but rejects new routed storage and unsafe dependent topology with exact reasons', function (): void {
     $application = blueGreenComposeApplication();
+    // Model a pre-blue-green estate: the sidecar volume predates opt-in.
+    // Blue-green is opt-out by default, so the fixture opts out first.
+    $application->settings->update(['is_blue_green_deployment_enabled' => false]);
     LocalPersistentVolume::query()->create([
         'name' => $application->uuid.'-database',
         'mount_path' => '/var/lib/postgresql/data',

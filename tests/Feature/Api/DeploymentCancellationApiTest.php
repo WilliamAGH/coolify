@@ -5,6 +5,7 @@ use App\Jobs\ApplicationDeploymentJob;
 use App\Models\Application;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\InstanceSettings;
+use App\Models\PrivateKey;
 use App\Models\Project;
 use App\Models\Server;
 use App\Models\Team;
@@ -12,6 +13,7 @@ use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Facades\Storage;
 
 uses(RefreshDatabase::class);
 
@@ -161,6 +163,37 @@ describe('POST /api/v1/deployments/{uuid}/cancel', function () {
         $deployment->refresh();
         expect($deployment->status)->toBe(ApplicationDeploymentStatus::CANCELLED_BY_USER->value);
     });
+    test('returns 200 when the deployment container no longer exists during post-cancel cleanup', function () {
+        $deployment = ApplicationDeploymentQueue::create([
+            'deployment_uuid' => 'missing-container-uuid',
+            'application_id' => 1,
+            'server_id' => $this->server->id,
+            'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+        ]);
+
+        Process::fake([
+            '*docker rm -f*' => Process::result(
+                errorOutput: "Error response from daemon: No such container: {$deployment->deployment_uuid}",
+                exitCode: 1,
+            ),
+            '*docker ps -a*' => Process::result(output: $deployment->deployment_uuid, exitCode: 0),
+            '*' => Process::result(output: '', exitCode: 0),
+        ]);
+
+        $response = $this->withHeaders([
+            'Authorization' => 'Bearer '.$this->bearerToken,
+            'Content-Type' => 'application/json',
+        ])->postJson("/api/v1/deployments/{$deployment->deployment_uuid}/cancel");
+
+        $response->assertStatus(200);
+        $response->assertJson([
+            'message' => 'Deployment cancelled successfully.',
+            'deployment_uuid' => $deployment->deployment_uuid,
+            'status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+        ]);
+        expect($deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::CANCELLED_BY_USER->value);
+    });
+
     test('drains the serialized application lane when remote cleanup fails', function () {
         Bus::fake([ApplicationDeploymentJob::class]);
         Process::fake([
@@ -203,13 +236,88 @@ describe('POST /api/v1/deployments/{uuid}/cancel', function () {
             'Content-Type' => 'application/json',
         ])->postJson("/api/v1/deployments/{$cancelledDeployment->deployment_uuid}/cancel");
 
-        $response->assertStatus(500);
+        $response->assertStatus(200);
         expect($cancelledDeployment->fresh()->status)->toBe(ApplicationDeploymentStatus::CANCELLED_BY_USER->value)
             ->and($nextDeployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
         Bus::assertDispatched(
             ApplicationDeploymentJob::class,
             fn (ApplicationDeploymentJob $job): bool => $job->application_deployment_queue_id === $nextDeployment->id,
         );
+    });
+
+    test('returns 200 for a blue-green activate-phase deployment when the helper container is missing', function () {
+        $deployment = ApplicationDeploymentQueue::create([
+            'deployment_uuid' => 'blue-green-activate-uuid',
+            'application_id' => 1,
+            'server_id' => $this->server->id,
+            'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+            'execution_phase' => 'activate',
+        ]);
+
+        Process::fake([
+            '*docker rm -f*' => Process::result(
+                errorOutput: "Error response from daemon: No such container: {$deployment->deployment_uuid}",
+                exitCode: 1,
+            ),
+            '*docker ps -a*' => Process::result(output: $deployment->deployment_uuid, exitCode: 0),
+            '*' => Process::result(output: '', exitCode: 0),
+        ]);
+
+        $response = $this->withHeaders([
+            'Authorization' => 'Bearer '.$this->bearerToken,
+            'Content-Type' => 'application/json',
+        ])->postJson("/api/v1/deployments/{$deployment->deployment_uuid}/cancel");
+
+        $response->assertStatus(200);
+        $response->assertJson([
+            'message' => 'Deployment cancelled successfully.',
+            'deployment_uuid' => $deployment->deployment_uuid,
+            'status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+        ]);
+        expect($deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::CANCELLED_BY_USER->value);
+    });
+
+    test('records genuine cleanup failures to the deployment log without failing the cancellation', function () {
+        $privateKey = PrivateKey::query()->create([
+            'name' => 'Cancel cleanup failure test key',
+            'private_key' => generateSSHKey('ed25519')['private'],
+            'team_id' => $this->team->id,
+        ]);
+        Storage::fake('ssh-keys');
+        Storage::disk('ssh-keys')->put("ssh_key@{$privateKey->uuid}", $privateKey->private_key);
+        $this->server->update(['private_key_id' => $privateKey->id]);
+
+        $deployment = ApplicationDeploymentQueue::create([
+            'deployment_uuid' => 'ssh-failure-uuid',
+            'application_id' => 1,
+            'server_id' => $this->server->id,
+            'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+        ]);
+
+        Process::fake([
+            '*' => Process::result(
+                errorOutput: 'bash: line 1: docker: command not found',
+                exitCode: 127,
+            ),
+        ]);
+
+        $response = $this->withHeaders([
+            'Authorization' => 'Bearer '.$this->bearerToken,
+            'Content-Type' => 'application/json',
+        ])->postJson("/api/v1/deployments/{$deployment->deployment_uuid}/cancel");
+
+        $response->assertStatus(200);
+        $response->assertJson([
+            'message' => 'Deployment cancelled successfully.',
+            'status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+        ]);
+        expect($deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::CANCELLED_BY_USER->value);
+
+        $logEntries = collect(json_decode($deployment->fresh()->logs, true));
+        $stderrEntries = $logEntries->where('type', 'stderr');
+        expect($stderrEntries->contains(
+            fn (array $entry): bool => str($entry['output'])->contains('docker: command not found')
+        ))->toBeTrue();
     });
 
     test('returns correct response structure on success', function () {
@@ -228,17 +336,15 @@ describe('POST /api/v1/deployments/{uuid}/cancel', function () {
             'Content-Type' => 'application/json',
         ])->postJson("/api/v1/deployments/{$deployment->deployment_uuid}/cancel");
 
-        expect($response->status())->toBeIn([200, 500]);
-        if ($response->status() === 200) {
-            $response->assertJsonStructure([
-                'message',
-                'deployment_uuid',
-                'status',
-            ]);
-            $response->assertJson([
-                'deployment_uuid' => $deployment->deployment_uuid,
-                'status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
-            ]);
-        }
+        $response->assertStatus(200);
+        $response->assertJsonStructure([
+            'message',
+            'deployment_uuid',
+            'status',
+        ]);
+        $response->assertJson([
+            'deployment_uuid' => $deployment->deployment_uuid,
+            'status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+        ]);
     });
 });
