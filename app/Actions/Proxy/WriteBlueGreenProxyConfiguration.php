@@ -359,6 +359,98 @@ class WriteBlueGreenProxyConfiguration
     }
 
     /**
+     * First-adoption attestation: the control plane holds no durable state, so
+     * the destination must be pristine — except for one provably-inert residue
+     * class this command repairs under the route lock: a fence sidecar whose
+     * record is an absent epoch-zero route for this exact application and
+     * destination with no managed file beside it (what an interrupted
+     * first-adoption rollback leaves behind). Every other residue fails with a
+     * precise reason instead of a bare non-zero exit.
+     */
+    public function firstAdoptionAttestStateCommandFor(
+        string $proxyPath,
+        string $managedFilename,
+        string $applicationUuid,
+        int $destinationId,
+    ): string {
+        if (preg_match('/^[A-Za-z0-9][A-Za-z0-9_-]*$/D', $applicationUuid) !== 1) {
+            throw new InvalidArgumentException('The first-adoption attestation application UUID is invalid.');
+        }
+        if ($destinationId < 0) {
+            throw new InvalidArgumentException('The first-adoption attestation destination ID is invalid.');
+        }
+        $activePath = $this->managedPath($proxyPath, $managedFilename);
+        $statePath = $this->statePath($proxyPath, $managedFilename);
+
+        return implode("\n", [
+            ...$this->lockedCommandPrefix($proxyPath, $managedFilename),
+            ...$this->repairOrphanedAbsentRouteStateCommands(
+                $managedFilename,
+                $applicationUuid,
+                $destinationId,
+                $activePath,
+                $statePath,
+            ),
+            ...$this->assertExpectedStateCommands(null, $activePath, $statePath),
+            'printf %s '.escapeshellarg('coolify-blue-green-destination-state-attested'),
+        ]);
+    }
+
+    /** @return list<string> */
+    private function repairOrphanedAbsentRouteStateCommands(
+        string $managedFilename,
+        string $applicationUuid,
+        int $destinationId,
+        string $activePath,
+        string $statePath,
+    ): array {
+        $safeActivePath = escapeshellarg($activePath);
+        $safeStatePath = escapeshellarg($statePath);
+        $orphanPattern = implode('*', array_map(escapeshellarg(...), [
+            sprintf(
+                '{"magic":"%s","managed_filename":"%s","application_uuid":"%s","destination_id":%d,"operation_id":"',
+                BlueGreenProxyState::MAGIC,
+                $managedFilename,
+                $applicationUuid,
+                $destinationId,
+            ),
+            '","mutation_sequence":',
+            ',"destination_fence_epoch":0,"routing_revision":',
+            ',"managed_sha256":null,"active_color":null,"active_deployment_uuid":null,"active_container_name":null,"active_container_id":null,"application_routing_config_digest":"',
+            '","destination_topology_digest":"',
+            '"}',
+        ]));
+
+        return [
+            'if [ -e '.$safeStatePath.' ] || [ -L '.$safeStatePath.' ]; then',
+            '  if [ -L '.$safeStatePath.' ] || [ ! -f '.$safeStatePath.' ]; then',
+            '    echo '.escapeshellarg('The blue/green destination fence state is not a regular file; reconciliation is required before first adoption.').' >&2',
+            '    exit 1',
+            '  fi',
+            '  orphan_state_owner=$(stat -c %u -- '.$safeStatePath.' 2>/dev/null || stat -f %u -- '.$safeStatePath.')',
+            '  if [ "$orphan_state_owner" != "$(id -u)" ]; then',
+            '    echo '.escapeshellarg('The blue/green destination fence state is not owned by the deployment user; reconciliation is required before first adoption.').' >&2',
+            '    exit 1',
+            '  fi',
+            '  if [ -e '.$safeActivePath.' ] || [ -L '.$safeActivePath.' ]; then',
+            '    echo '.escapeshellarg('A managed blue/green route file exists without durable control-plane state; reconciliation is required before first adoption.').' >&2',
+            '    exit 1',
+            '  fi',
+            '  orphan_state_line=$(tr -d \'\\n\' < '.$safeStatePath.')',
+            '  case "$orphan_state_line" in',
+            '    '.$orphanPattern.')',
+            '      durable_remote_remove '.$safeStatePath.' '.escapeshellarg(dirname($statePath)),
+            '      ;;',
+            '    *)',
+            '      echo '.escapeshellarg('The blue/green destination fence state does not record an absent epoch-zero route for this destination; reconciliation is required before first adoption.').' >&2',
+            '      exit 1',
+            '      ;;',
+            '  esac',
+            'fi',
+        ];
+    }
+
+    /**
      * @param  non-empty-list<string>  $commands
      * @param  non-empty-list<string>  $completionCommands
      */

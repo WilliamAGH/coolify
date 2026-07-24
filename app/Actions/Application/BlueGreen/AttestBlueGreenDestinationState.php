@@ -29,11 +29,18 @@ final class AttestBlueGreenDestinationState
             (int) $destination->id,
         );
         $result = trim((string) instant_privileged_remote_script(
-            (new WriteBlueGreenProxyConfiguration)->attestStateCommandFor(
-                $server->proxyPath(),
-                $managedFilename,
-                $expectedState,
-            ),
+            $expectedState === null
+                ? (new WriteBlueGreenProxyConfiguration)->firstAdoptionAttestStateCommandFor(
+                    $server->proxyPath(),
+                    $managedFilename,
+                    (string) $application->uuid,
+                    (int) $destination->id,
+                )
+                : (new WriteBlueGreenProxyConfiguration)->attestStateCommandFor(
+                    $server->proxyPath(),
+                    $managedFilename,
+                    $expectedState,
+                ),
             $server,
         ));
         if ($result !== 'coolify-blue-green-destination-state-attested') {

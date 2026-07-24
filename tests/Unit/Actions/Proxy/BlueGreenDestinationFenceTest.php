@@ -961,3 +961,164 @@ it('normalizes an inherited group-writable state directory before fencing', func
         $filesystem->remove($proxyPath);
     }
 });
+
+function orphanedAbsentRouteFenceState(
+    string $applicationUuid = 'orphanadoptionapp',
+    int $destinationId = 42,
+): BlueGreenProxyState {
+    return new BlueGreenProxyState(
+        managedFilename: BlueGreenRoutingTarget::managedFilename($applicationUuid, $destinationId),
+        applicationUuid: $applicationUuid,
+        destinationId: $destinationId,
+        operationId: 'rolled-back-first-adoption',
+        mutationSequence: 2,
+        destinationFenceEpoch: 0,
+        routingRevision: 0,
+        managedSha256: null,
+        activeColor: null,
+        activeDeploymentUuid: null,
+        activeContainerName: null,
+        activeContainerId: null,
+        applicationRoutingConfigDigest: hash('sha256', 'orphan-routing'),
+        destinationTopologyDigest: hash('sha256', 'orphan-topology'),
+    );
+}
+
+it('repairs an orphaned absent-route epoch-zero fence sidecar during first-adoption attestation', function () {
+    $filesystem = new Filesystem;
+    $proxyPath = sys_get_temp_dir().'/coolify-blue-green-orphan-repair-'.bin2hex(random_bytes(8));
+    $filesystem->mkdir([$proxyPath.'/dynamic', $proxyPath.'/.coolify-blue-green'], 0700);
+
+    try {
+        $writer = destinationFenceWriter();
+        $orphan = orphanedAbsentRouteFenceState();
+        $statePath = $writer->statePath($proxyPath, $orphan->managedFilename);
+        file_put_contents($statePath, $orphan->serialize());
+        chmod($statePath, 0600);
+
+        $attestation = runDestinationFenceCommand($writer->firstAdoptionAttestStateCommandFor(
+            $proxyPath,
+            $orphan->managedFilename,
+            $orphan->applicationUuid,
+            $orphan->destinationId,
+        ));
+
+        expect($attestation)->toBe('coolify-blue-green-destination-state-attested')
+            ->and(file_exists($statePath))->toBeFalse();
+    } finally {
+        $filesystem->remove($proxyPath);
+    }
+});
+
+it('attests a pristine destination unchanged through the first-adoption attestation', function () {
+    $filesystem = new Filesystem;
+    $proxyPath = sys_get_temp_dir().'/coolify-blue-green-orphan-pristine-'.bin2hex(random_bytes(8));
+    $filesystem->mkdir($proxyPath.'/dynamic', 0700);
+
+    try {
+        $writer = destinationFenceWriter();
+        $orphan = orphanedAbsentRouteFenceState();
+
+        expect(runDestinationFenceCommand($writer->firstAdoptionAttestStateCommandFor(
+            $proxyPath,
+            $orphan->managedFilename,
+            $orphan->applicationUuid,
+            $orphan->destinationId,
+        )))->toBe('coolify-blue-green-destination-state-attested');
+    } finally {
+        $filesystem->remove($proxyPath);
+    }
+});
+
+it('refuses first-adoption attestation when the fence sidecar records a routed or foreign state', function () {
+    $filesystem = new Filesystem;
+    $proxyPath = sys_get_temp_dir().'/coolify-blue-green-orphan-refusal-'.bin2hex(random_bytes(8));
+    $filesystem->mkdir([$proxyPath.'/dynamic', $proxyPath.'/.coolify-blue-green'], 0700);
+
+    try {
+        $writer = destinationFenceWriter();
+        $orphan = orphanedAbsentRouteFenceState();
+        $statePath = $writer->statePath($proxyPath, $orphan->managedFilename);
+        $attestCommand = $writer->firstAdoptionAttestStateCommandFor(
+            $proxyPath,
+            $orphan->managedFilename,
+            $orphan->applicationUuid,
+            $orphan->destinationId,
+        );
+
+        $routed = compileDestinationFencedBlueGreenConfiguration(
+            epoch: 1,
+            activeColor: BlueGreenDeploymentColor::BLUE,
+            deploymentUuid: 'deployment-routed',
+            containerId: str_repeat('a', 64),
+            operationId: 'routed-operation',
+        )->state;
+        file_put_contents($statePath, $routed->serialize());
+        chmod($statePath, 0600);
+        $routedRefusal = failedDestinationFenceCommand($attestCommand);
+        expect($routedRefusal->isSuccessful())->toBeFalse()
+            ->and($routedRefusal->getErrorOutput())->toContain('does not record an absent epoch-zero route')
+            ->and(file_get_contents($statePath))->toBe($routed->serialize());
+
+        $foreign = orphanedAbsentRouteFenceState(applicationUuid: 'someotherapplication');
+        file_put_contents($statePath, $foreign->serialize());
+        chmod($statePath, 0600);
+        $foreignRefusal = failedDestinationFenceCommand($attestCommand);
+        expect($foreignRefusal->isSuccessful())->toBeFalse()
+            ->and($foreignRefusal->getErrorOutput())->toContain('does not record an absent epoch-zero route')
+            ->and(file_get_contents($statePath))->toBe($foreign->serialize());
+
+        file_put_contents($statePath, orphanedAbsentRouteFenceState()->serialize());
+        chmod($statePath, 0600);
+        file_put_contents($writer->managedPath($proxyPath, $orphan->managedFilename), 'stray-managed-route');
+        $strayRouteRefusal = failedDestinationFenceCommand($attestCommand);
+        expect($strayRouteRefusal->isSuccessful())->toBeFalse()
+            ->and($strayRouteRefusal->getErrorOutput())->toContain('managed blue/green route file exists')
+            ->and(file_exists($statePath))->toBeTrue();
+    } finally {
+        $filesystem->remove($proxyPath);
+    }
+});
+
+it('rejects invalid first-adoption attestation identity inputs', function () {
+    $writer = new WriteBlueGreenProxyConfiguration;
+    $managedFilename = BlueGreenRoutingTarget::managedFilename('orphanadoptionapp', 42);
+
+    expect(fn () => $writer->firstAdoptionAttestStateCommandFor('/tmp/proxy', $managedFilename, 'bad uuid!', 42))
+        ->toThrow(InvalidArgumentException::class)
+        ->and(fn () => $writer->firstAdoptionAttestStateCommandFor('/tmp/proxy', $managedFilename, 'orphanadoptionapp', -1))
+        ->toThrow(InvalidArgumentException::class);
+});
+
+it('repairs the exact rollback residue an interrupted first adoption records', function () {
+    $residue = '{"magic":"coolify-blue-green-destination-fence-v2","managed_filename":"coolify-blue-green-585088d398440262.yaml",'
+        .'"application_uuid":"iq8dfnl24mnsj1cj4jf46vf0","destination_id":4,"operation_id":"7cddpkgpitaglirwr5eehtxi",'
+        .'"mutation_sequence":2,"destination_fence_epoch":0,"routing_revision":0,"managed_sha256":null,"active_color":null,'
+        .'"active_deployment_uuid":null,"active_container_name":null,"active_container_id":null,'
+        .'"application_routing_config_digest":"ca9b23a7149c843d5602fd3388c09b3c821cdaeb2ff630e59d4eb44fd79a656f",'
+        .'"destination_topology_digest":"f188bf115b3aae530ca0deb3cb2e54f74e38875f9e21eb9bf6961fc24f1c2bbe"}'."\n";
+    $managedFilename = BlueGreenRoutingTarget::managedFilename('iq8dfnl24mnsj1cj4jf46vf0', 4);
+    expect(BlueGreenProxyState::parse($residue)->serialize())->toBe($residue)
+        ->and($managedFilename)->toBe('coolify-blue-green-585088d398440262.yaml');
+
+    $filesystem = new Filesystem;
+    $proxyPath = sys_get_temp_dir().'/coolify-blue-green-orphan-incident-'.bin2hex(random_bytes(8));
+    $filesystem->mkdir([$proxyPath.'/dynamic', $proxyPath.'/.coolify-blue-green'], 0700);
+
+    try {
+        $writer = destinationFenceWriter();
+        $statePath = $writer->statePath($proxyPath, $managedFilename);
+        file_put_contents($statePath, $residue);
+        chmod($statePath, 0600);
+
+        expect(runDestinationFenceCommand($writer->firstAdoptionAttestStateCommandFor(
+            $proxyPath,
+            $managedFilename,
+            'iq8dfnl24mnsj1cj4jf46vf0',
+            4,
+        )))->toBe('coolify-blue-green-destination-state-attested')
+            ->and(file_exists($statePath))->toBeFalse();
+    } finally {
+        $filesystem->remove($proxyPath);
+    }
+});

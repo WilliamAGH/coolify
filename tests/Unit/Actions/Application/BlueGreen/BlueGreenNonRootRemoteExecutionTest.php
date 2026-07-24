@@ -388,7 +388,7 @@ it('routes every blue-green application script executor through the privileged s
             $bootId,
         ),
         $deactivation->commandFor($deactivationCommand),
-        $writer->attestStateCommandFor($server->proxyPath(), $configuration->managedFilename, null),
+        $writer->firstAdoptionAttestStateCommandFor($server->proxyPath(), $configuration->managedFilename, 'nonrootapp', 1),
         $attestationScript,
         (new ReadBlueGreenManagedRouteMetadata)->commandFor($server->proxyPath(), $configuration->managedFilename),
         $inspect->commandFor((string) $expectation->dockerId),
