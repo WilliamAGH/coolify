@@ -363,6 +363,24 @@ class ApplicationDeploymentQueue extends Model
         return true;
     }
 
+    /**
+     * Statuses under which the owning dispatch attempt may still hold remote
+     * process ownership: active execution plus terminal outcomes, because the
+     * job's finally-block cleanup (config persistence, helper shutdown) runs
+     * after the FINISHED/FAILED status flip. Cancelled rows stay excluded so
+     * cancellation keeps fencing further remote commands.
+     *
+     * @return list<string>
+     */
+    private static function processOwnershipStatuses(): array
+    {
+        return [
+            ApplicationDeploymentStatus::IN_PROGRESS->value,
+            ApplicationDeploymentStatus::FINISHED->value,
+            ApplicationDeploymentStatus::FAILED->value,
+        ];
+    }
+
     public function releaseCurrentProcessOwnership(string $dispatchAttemptUuid, string $processId): bool
     {
         if (! Str::isUuid($dispatchAttemptUuid)) {
@@ -374,7 +392,7 @@ class ApplicationDeploymentQueue extends Model
 
         $updated = self::query()
             ->whereKey($this->getKey())
-            ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
+            ->whereIn('status', self::processOwnershipStatuses())
             ->where('horizon_job_id', $dispatchAttemptUuid)
             ->where('current_process_id', $processId)
             ->update(['current_process_id' => null]);
@@ -400,7 +418,7 @@ class ApplicationDeploymentQueue extends Model
 
         $updated = self::query()
             ->whereKey($this->getKey())
-            ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
+            ->whereIn('status', self::processOwnershipStatuses())
             ->where('horizon_job_id', $dispatchAttemptUuid)
             ->whereNull('current_process_id')
             ->update(['current_process_id' => $processId]);
