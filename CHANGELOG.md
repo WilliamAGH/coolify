@@ -4,9 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🐛 Bug Fixes
+
+- *(blue-green)* Absorb Traefik file-provider apply lag into route verification
+
+## [4.13.24-fork] - 2026-07-24
+
 ### 🚀 Features
 
 - *(control-plane)* Add fail-closed migration bridge for popos-sf0 to 22.haiku.host
+- *(blue-green)* Make blue-green deployment opt-out instead of opt-in
 
 ### 🐛 Bug Fixes
 
@@ -17,12 +24,26 @@ All notable changes to this project will be documented in this file.
 - *(control-plane)* Satisfy the strict shellcheck lane
 - *(control-plane)* Keep browser websocket port pins out of the runtime env
 - *(control-plane)* Actually enable workers when --enable-workers is given
+- *(blue-green)* Normalize the state directory instead of failing on inherited ACLs
+- *(api)* Return 200 when deployment cancel succeeds but cleanup fails
+- *(blue-green)* Terminalize unresumable prepared activations instead of looping
+- *(blue-green)* Reconcile failed first-adoption rollback for a clean retry
+- *(blue-green)* Scope the opt-out assembly bypass by typed ineligibility reason
 
 ### 📚 Documentation
 
 - Update changelog (#152)
 - Update changelog (#155)
 - Update changelog (#157)
+- Update changelog (#159)
+
+### 🧪 Testing
+
+- *(api)* Cover post-cancel cleanup logging for unexpected failures
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.24-fork
 
 ## [4.13.23-fork] - 2026-07-23
 
