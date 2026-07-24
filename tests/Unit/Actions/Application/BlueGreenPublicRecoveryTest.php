@@ -513,6 +513,23 @@ it('accepts an ack-proven route from an application that does not emit the relea
     ))->not->toThrow(RuntimeException::class);
 });
 
+it('rejects a route that proves neither the managed acknowledgement nor the release proof', function () {
+    $verifier = new VerifyBlueGreenPublicRecovery;
+    $route = ['router' => 'managed-public', 'url' => 'https://app.example.test/health'];
+    // A healthy 200 that carries no managed acknowledgement and no release
+    // proof proves nothing about which backend answered. Even though the
+    // release proof is optional, the acknowledgement is the fail-closed
+    // primary proof, so a route that satisfies neither is always rejected.
+    $headers = "HTTP/1.1 200 OK\r\n\r\n";
+
+    expect(fn () => $verifier->assertResponse(
+        $route,
+        $headers,
+        str_repeat('a', 64),
+        BlueGreenRoutingTarget::durableReleaseProofToken('unproven-application'),
+    ))->toThrow(RuntimeException::class, 'did not return its exact opaque acknowledgement');
+});
+
 it('classifies every catchall response shape as route absence and nothing else', function (int $status, array $acknowledgements, bool $expected) {
     expect(VerifyBlueGreenPublicRecovery::indicatesRouteAbsence($status, $acknowledgements))->toBe($expected);
 })->with([

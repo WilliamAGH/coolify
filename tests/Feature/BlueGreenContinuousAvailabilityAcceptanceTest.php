@@ -353,6 +353,51 @@ it('absorbs Traefik file-provider apply lag before asserting the public handoff 
     );
 });
 
+it('establishes a public handoff route from an application that omits the release proof header', function (): void {
+    config(['constants.ssh.mux_enabled' => false]);
+    Sleep::fake();
+    $context = blueGreenContinuousAvailabilityContext(BlueGreenRoutingMode::LegacyAdoption);
+    $lifecycle = $context['lifecycle'];
+    $configuration = $context['configuration'];
+    $target = $context['target'];
+    $claim = $context['claim'];
+    $acknowledgement = $target->publicAcknowledgement();
+    // The deployment still carries a durable release proof token, but an
+    // ordinary application (Next.js, Spring, ...) cannot echo it. Only the
+    // managed-route acknowledgement Traefik injects proves the fenced route
+    // points at the new deployment, so the routed response carries the
+    // acknowledgement and no release proof header at all.
+    expect($acknowledgement)->not->toBeNull()
+        ->and($target->releaseProofToken)->not->toBeNull();
+    $applied =
+        "HTTP/1.1 200 OK\r\n".
+        BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$acknowledgement}\r\n\r\n";
+    Process::fake(['*' => Process::sequence([
+        Process::result(output: $claim->serverBootId),
+        Process::result(output: 'coolify-blue-green-destination-state-attested'),
+        Process::result(output: $claim->serverBootId),
+        Process::result(output: $applied),
+    ])]);
+
+    try {
+        invokeBlueGreenContinuousAvailabilityLifecycle(
+            $lifecycle,
+            'waitForRoutes',
+            $configuration,
+            $target,
+            BlueGreenDeploymentPhase::PREPARING,
+        );
+    } finally {
+        $lifecycle->release();
+    }
+
+    Sleep::assertNeverSlept();
+    Process::assertRanTimes(
+        fn (PendingProcess $process): bool => str_contains((string) $process->input, 'url = '),
+        1,
+    );
+});
+
 it('fails a public handoff verification without retry when the observed response is a user-visible error', function (): void {
     config(['constants.ssh.mux_enabled' => false]);
     Sleep::fake();

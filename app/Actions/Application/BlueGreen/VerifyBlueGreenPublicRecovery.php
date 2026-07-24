@@ -232,7 +232,31 @@ class VerifyBlueGreenPublicRecovery
         return compact('status', 'acknowledgements');
     }
 
-    /** @param array{router: string, url: string} $route */
+    /**
+     * Two-proof fenced-route acceptance. A routed response is accepted only
+     * when it satisfies at least one Coolify-controlled proof and never
+     * contradicts either:
+     *
+     *  1. Managed-route acknowledgement (primary, always required when
+     *     $expectedAcknowledgement is non-null): the exact opaque
+     *     acknowledgement that Traefik's response middleware attaches to the
+     *     fenced managed route. This is written by Coolify — not the
+     *     application — so it proves the fenced route points at this exact
+     *     new deployment's backend regardless of what the app emits.
+     *  2. Application release proof (secondary, strict only when present): the
+     *     RELEASE_PROOF_HEADER an application may echo. Only the control-plane
+     *     app (RespondToControlPlaneHealthCheck) emits it; ordinary
+     *     applications (Next.js, Spring, ...) cannot. It is therefore treated
+     *     as optional — verified exactly when the app emits it (defense in
+     *     depth) and skipped when absent — but a wrong value is always fatal.
+     *
+     * The acknowledgement is the fail-closed boundary: a route that proves
+     * neither the acknowledgement nor a matching release proof is rejected.
+     * A null $expectedAcknowledgement inverts proof (1) to assert that no
+     * managed acknowledgement leaks on a restored plain direct-origin route.
+     *
+     * @param  array{router: string, url: string}  $route
+     */
     public function assertResponse(
         array $route,
         string $headers,
@@ -268,6 +292,11 @@ class VerifyBlueGreenPublicRecovery
         if ($expectedReleaseProof === null) {
             return;
         }
+        // The acknowledgement above already proved the fenced route. The
+        // release proof is the optional secondary proof: an ordinary app emits
+        // no RELEASE_PROOF_HEADER, so an absent header is accepted, but a
+        // present-and-wrong value proves a stale or foreign backend and is
+        // always fatal (never a converging observation).
         preg_match_all('/^'.preg_quote(BlueGreenRoutingTarget::RELEASE_PROOF_HEADER, '/').':\s*(.*?)\s*$/mi', $headers, $releaseProofMatches);
         $releaseProofs = array_values(array_unique(array_filter(
             $releaseProofMatches[1],
