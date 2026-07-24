@@ -91,7 +91,7 @@ final class PrepareBlueGreenDeactivation
         if ($requestedPhase->isManualStop() && $state !== null) {
             $this->adoptRouteLessLegacyContainer($application, $state);
         }
-        $this->assertNoPromotionOwnership($state);
+        $this->assertNoPromotionOwnership($state, allowParkedPromotionSupersession: $requestedPhase->isManualStop());
         $this->assertExpectedOwner(
             $locks->deactivation,
             $expectedDeactivationId,
@@ -437,22 +437,48 @@ final class PrepareBlueGreenDeactivation
             ->whereKey($state->id)
             ->where('application_id', $state->application_id)
             ->where('standalone_docker_id', $state->standalone_docker_id)
-            ->whereIn('phase', [
-                BlueGreenDeploymentPhase::IDLE->value,
-                BlueGreenDeploymentPhase::STOPPED->value,
-            ])
-            ->whereNull('operation_deployment_uuid')
-            ->whereNull('pending_color')
-            ->whereNull('pending_deployment_uuid')
             ->whereNull('deactivation_operation_id')
             ->whereNull('deactivation_started_at')
             ->where('supersession_generation', $state->supersession_generation)
             ->where('routing_revision', $state->routing_revision);
+        // A parked promotion owner (intervention_required with recorded
+        // promotion ownership and no deactivation provenance) is claimed by
+        // matching its exact recorded owner, so a concurrent recovery or
+        // retry can never be raced; every other claim requires the idle
+        // ownership-free shape.
+        $isParkedPromotionSupersession = $state->phase === BlueGreenDeploymentPhase::INTERVENTION_REQUIRED
+            && $state->operation_deployment_uuid !== null;
+        $clearedSupersededAttributes = [];
+        if ($isParkedPromotionSupersession) {
+            $query = $query
+                ->where('phase', BlueGreenDeploymentPhase::INTERVENTION_REQUIRED->value)
+                ->where('operation_deployment_uuid', $state->operation_deployment_uuid);
+            $query = $state->pending_deployment_uuid === null
+                ? $query->whereNull('pending_deployment_uuid')
+                : $query->where('pending_deployment_uuid', $state->pending_deployment_uuid);
+            $clearedSupersededAttributes = [
+                ...ApplicationBlueGreenDeployment::clearedOperationAttributes(),
+                'pending_color' => null,
+                'pending_deployment_uuid' => null,
+                'intervention_phase' => null,
+                'intervention_reason' => null,
+            ];
+        } else {
+            $query = $query
+                ->whereIn('phase', [
+                    BlueGreenDeploymentPhase::IDLE->value,
+                    BlueGreenDeploymentPhase::STOPPED->value,
+                ])
+                ->whereNull('operation_deployment_uuid')
+                ->whereNull('pending_color')
+                ->whereNull('pending_deployment_uuid');
+        }
         $query = $state->active_color === null
             ? $query->whereNull('active_color')
             : $query->where('active_color', $state->active_color->value);
 
         if ($query->update([
+            ...$clearedSupersededAttributes,
             'phase' => BlueGreenDeploymentPhase::DEACTIVATING->value,
             'deactivation_operation_id' => $deactivation->operation_id,
             'deactivation_started_at' => $deactivation->started_at,
@@ -460,10 +486,7 @@ final class PrepareBlueGreenDeactivation
         ]) !== 1) {
             throw new BlueGreenDeactivationInProgressException('The blue-green state changed while deactivation was being claimed.');
         }
-        $state->phase = BlueGreenDeploymentPhase::DEACTIVATING;
-        $state->deactivation_operation_id = $deactivation->operation_id;
-        $state->deactivation_started_at = $deactivation->started_at;
-        $state->supersession_generation = $deactivation->supersession_generation;
+        $state->refresh();
     }
 
     private function nextSupersessionGeneration(
@@ -521,8 +544,10 @@ final class PrepareBlueGreenDeactivation
         }
     }
 
-    private function assertNoPromotionOwnership(?ApplicationBlueGreenDeployment $state): void
-    {
+    private function assertNoPromotionOwnership(
+        ?ApplicationBlueGreenDeployment $state,
+        bool $allowParkedPromotionSupersession = false,
+    ): void {
         if ($state === null) {
             return;
         }
@@ -533,6 +558,17 @@ final class PrepareBlueGreenDeactivation
                 throw new BlueGreenDeactivationException('The deactivating blue-green state still carries promotion ownership and requires intervention.');
             }
 
+            return;
+        }
+        // A promotion owner parked as intervention_required has no live
+        // executor: recovery refused deterministically and re-refuses on every
+        // retry, so waiting can never release it. A fenced manual stop is the
+        // sanctioned operator exit and may supersede it; a deactivation-owned
+        // intervention still belongs to the deactivation resume lifecycle.
+        if ($allowParkedPromotionSupersession
+            && $state->phase === BlueGreenDeploymentPhase::INTERVENTION_REQUIRED
+            && $state->deactivation_operation_id === null
+            && $state->deactivation_started_at === null) {
             return;
         }
         if (! in_array($state->phase, [BlueGreenDeploymentPhase::IDLE, BlueGreenDeploymentPhase::STOPPED], true)

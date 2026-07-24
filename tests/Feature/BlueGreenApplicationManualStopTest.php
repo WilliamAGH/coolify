@@ -654,3 +654,80 @@ it('claims a fresh blue-green deployment from a stopped state', function () {
         ->and($state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
         ->and($deployment->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::PREPARING);
 });
+
+it('supersedes a parked intervention promotion owner through a fenced manual stop', function () {
+    $context = BlueGreenDeactivationScenario::context();
+    $application = $context['application'];
+    $destination = $context['destination'];
+
+    // Mirror the 2026-07-24 incident: a first adoption whose recovery
+    // deterministically refused (inconsistent predecessor destination-fence
+    // provenance) parks as intervention_required while still carrying
+    // promotion ownership. Recovery re-refuses on every retry and settings
+    // are fenced while non-idle, so a fenced manual stop must be able to
+    // supersede the parked owner or the operator has no exit at all.
+    ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $application->id,
+        'standalone_docker_id' => $destination->id,
+        'phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+        'pending_color' => 'blue',
+        'pending_deployment_uuid' => 'parked-first-adoption',
+        'operation_deployment_uuid' => 'parked-first-adoption',
+        'operation_previous_destination_fence_epoch' => 2,
+        'intervention_phase' => BlueGreenDeploymentPhase::PREPARING->value,
+        'intervention_reason' => 'The interrupted operation could not be proven safe to reconcile: The first-adoption recovery has inconsistent predecessor destination-fence provenance.',
+        'routing_revision' => 0,
+        'supersession_generation' => 2,
+        'destination_fence_epoch' => 2,
+        'destination_fence_operation_id' => 'interrupted-predecessor',
+        'destination_fence_mutation_sequence' => 4,
+        'destination_topology_digest' => str_repeat('a', 64),
+        'application_routing_config_digest' => str_repeat('b', 64),
+    ]);
+
+    fakeManualBlueGreenStopRemoteSuccess();
+    Event::fake([ServiceStatusChanged::class]);
+
+    $result = StopApplication::run($application, dockerCleanup: false);
+    $stoppedState = ApplicationBlueGreenDeployment::query()->sole();
+    $deactivation = ApplicationBlueGreenDeactivation::query()->sole();
+
+    expect($result)->toBeNull()
+        ->and($stoppedState->phase)->toBe(BlueGreenDeploymentPhase::STOPPED)
+        ->and($stoppedState->operation_deployment_uuid)->toBeNull()
+        ->and($stoppedState->operation_previous_destination_fence_epoch)->toBeNull()
+        ->and($stoppedState->pending_color)->toBeNull()
+        ->and($stoppedState->pending_deployment_uuid)->toBeNull()
+        ->and($stoppedState->intervention_phase)->toBeNull()
+        ->and($stoppedState->intervention_reason)->toBeNull()
+        ->and((int) $stoppedState->supersession_generation)->toBeGreaterThan(2)
+        ->and($deactivation->phase)->toBe(BlueGreenDeactivationPhase::STOPPED);
+});
+
+it('still refuses to supersede a live promotion owner through a fenced manual stop', function () {
+    $context = BlueGreenDeactivationScenario::context();
+    $application = $context['application'];
+    $destination = $context['destination'];
+
+    ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $application->id,
+        'standalone_docker_id' => $destination->id,
+        'phase' => BlueGreenDeploymentPhase::PREPARING,
+        'pending_color' => 'blue',
+        'pending_deployment_uuid' => 'live-first-adoption',
+        'operation_deployment_uuid' => 'live-first-adoption',
+        'routing_revision' => 0,
+        'supersession_generation' => 2,
+        'destination_fence_epoch' => 2,
+    ]);
+
+    fakeManualBlueGreenStopRemoteSuccess();
+    Event::fake([ServiceStatusChanged::class]);
+
+    expect(fn () => StopApplication::run($application, dockerCleanup: false))
+        ->toThrow(BlueGreenDeactivationInProgressException::class, 'must recover or finish');
+
+    $state = ApplicationBlueGreenDeployment::query()->sole();
+    expect($state->phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
+        ->and($state->operation_deployment_uuid)->toBe('live-first-adoption');
+});
