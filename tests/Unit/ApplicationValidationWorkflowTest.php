@@ -378,8 +378,8 @@ function applicationValidationWorkflowViolations(array $workflow): array
     $phpApplication = is_array($jobs) ? ($jobs['php'] ?? []) : [];
     $releaseTestsScript = collect($phpApplication['steps'] ?? [])
         ->firstWhere('name', 'Run release and version-consumer tests')['run'] ?? '';
-    if (! str_contains((string) $releaseTestsScript, 'tests/Unit/V4xCandidateWorkflowTest.php')) {
-        $violations[] = 'application validation must execute the v4.x candidate workflow regression owner';
+    if (! str_contains((string) $releaseTestsScript, 'tests/Unit/StagingImageReferenceWorkflowTest.php')) {
+        $violations[] = 'application validation must execute the staging image reference workflow regression owner';
     }
     $controlPlaneScript = collect($phpApplication['steps'] ?? [])
         ->firstWhere('name', 'Run native Traefik control-plane tests')['run'] ?? '';

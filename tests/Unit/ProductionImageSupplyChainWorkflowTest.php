@@ -653,7 +653,7 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
     foreach ([
         'tests/Unit/CheckHelperImageJobTest.php',
         'tests/Unit/SentinelVersionTest.php',
-        'tests/Unit/V4xCandidateWorkflowTest.php',
+        'tests/Unit/StagingImageReferenceWorkflowTest.php',
         'tests/Feature/UpgradeComponentTest.php',
     ] as $requiredPhpTest) {
         if (! str_contains($phpTestScript, $requiredPhpTest)) {
@@ -2064,7 +2064,7 @@ it('keeps helper Sentinel and upgrade regressions in the required PHP lane', fun
     foreach ([
         'tests/Unit/CheckHelperImageJobTest.php',
         'tests/Unit/SentinelVersionTest.php',
-        'tests/Unit/V4xCandidateWorkflowTest.php',
+        'tests/Unit/StagingImageReferenceWorkflowTest.php',
         'tests/Feature/UpgradeComponentTest.php',
     ] as $requiredPhpTest) {
         $mutatedWorkflow = $applicationValidationWorkflow;

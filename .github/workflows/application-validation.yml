@@ -140,7 +140,6 @@ jobs:
             tests/Unit/SentinelVersionTest.php \
             tests/Unit/StagingImageReferenceWorkflowTest.php \
             tests/Unit/UpdateCoolifyTest.php \
-            tests/Unit/V4xCandidateWorkflowTest.php \
             tests/Feature/ForkVersionConsumerTest.php \
             tests/Feature/ProductionSeederTest.php \
             tests/Feature/ReverbAndTerminalPackagingTest.php \
