@@ -130,12 +130,14 @@ final class TransitionsBlueGreenDeployment
                     'status' => in_array($deployment->status, [
                         ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
                         ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value,
+                        ApplicationDeploymentStatus::FAILED->value,
                     ], true)
                         ? $deployment->status
                         : ApplicationDeploymentStatus::FAILED->value,
                     'finished_at' => in_array($deployment->status, [
                         ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
                         ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value,
+                        ApplicationDeploymentStatus::FAILED->value,
                     ], true)
                         ? ($deployment->finished_at ?? now())
                         : now(),

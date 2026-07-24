@@ -92,6 +92,7 @@ final class CompleteBlueGreenDeploymentOperation
                         ApplicationDeploymentStatus::FINISHED->value,
                         ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
                         ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value,
+                        ApplicationDeploymentStatus::FAILED->value,
                     ], true)
                     || $deployment->finished_at === null) {
                     throw new BlueGreenDeploymentTransitionException('The completed blue-green operation does not match the exact finalized claim cycle.');
@@ -236,6 +237,7 @@ final class CompleteBlueGreenDeploymentOperation
                 'status' => in_array($deployment->status, [
                     ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
                     ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value,
+                    ApplicationDeploymentStatus::FAILED->value,
                 ], true)
                     ? $deployment->status
                     : ApplicationDeploymentStatus::FINISHED->value,

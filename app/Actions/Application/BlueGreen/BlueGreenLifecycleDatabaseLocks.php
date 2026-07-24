@@ -311,12 +311,19 @@ final readonly class BlueGreenLifecycleDatabaseLocks
                 ApplicationDeploymentStatus::IN_PROGRESS->value,
                 ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
                 ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value,
+                ApplicationDeploymentStatus::FAILED->value,
             ]);
         }
 
         return $query->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value);
     }
 
+    /**
+     * A terminally cancelled or failed queue row still owns its interrupted
+     * ROLLING_BACK/IDLE phase (or any recovery-entry phase) so the fenced
+     * recovery lifecycle can converge it; only forward progress demands a
+     * live IN_PROGRESS owner.
+     */
     public static function queueStatusOwnsPhase(
         string $status,
         BlueGreenDeploymentPhase $phase,
@@ -326,6 +333,7 @@ final readonly class BlueGreenLifecycleDatabaseLocks
             || (in_array($status, [
                 ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
                 ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value,
+                ApplicationDeploymentStatus::FAILED->value,
             ], true)
                 && (in_array($phase, [BlueGreenDeploymentPhase::ROLLING_BACK, BlueGreenDeploymentPhase::IDLE], true)
                     || $allowCancelledRollbackEntry));
