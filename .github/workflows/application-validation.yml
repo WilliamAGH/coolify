@@ -53,6 +53,13 @@ jobs:
             echo "The requested validation source is not a full lowercase commit SHA." >&2
             exit 1
           }
+          # Reusable-workflow callers (the v4.x candidate gate) validate a
+          # source that intentionally differs from the caller revision:
+          # github.sha is the caller's base, while the gate binds the exact
+          # candidate ref to the requested SHA and attests the check to it.
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_call" ]]; then
+            exit 0
+          fi
           [[ "$VALIDATION_SOURCE_SHA" == "$CHECK_RUN_SHA" ]] || {
             echo "The requested validation source does not match the check-run revision." >&2
             exit 1
