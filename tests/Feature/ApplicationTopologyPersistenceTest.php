@@ -1,8 +1,12 @@
 <?php
 
+use App\Enums\ApplicationDeploymentStatus;
+use App\Enums\BlueGreenIneligibilityReason;
 use App\Enums\ProxyTypes;
+use App\Exceptions\BlueGreenAdmissionException;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeactivation;
+use App\Models\ApplicationDeploymentQueue;
 use App\Models\Project;
 use App\Models\Server;
 use App\Models\Team;
@@ -62,14 +66,39 @@ function applicationTopologyMutationOwner(bool $withDeactivation, bool $softDele
     return $application;
 }
 
-it('rejects direct and quiet application changes that make an opted-in topology ineligible', function (bool $quietly): void {
+it('rejects direct and quiet ineligibility changes once the application has deployment history', function (bool $quietly): void {
     $application = applicationTopologyPersistenceFixture();
+    ApplicationDeploymentQueue::create([
+        'application_id' => $application->id,
+        'application_name' => $application->name,
+        'server_id' => $application->destination->server_id,
+        'server_name' => $application->destination->server->name,
+        'destination_id' => $application->destination_id,
+        'deployment_uuid' => 'application-topology-deployed',
+        'commit' => 'commit-application-topology-deployed',
+        'status' => ApplicationDeploymentStatus::FINISHED->value,
+    ]);
     $application->health_check_enabled = false;
 
     expect(fn (): bool => $quietly ? $application->saveQuietly() : $application->save())
-        ->toThrow(RuntimeException::class, 'cannot become ineligible');
+        ->toThrow(BlueGreenAdmissionException::class, 'cannot become ineligible');
 
     expect($application->fresh()->health_check_enabled)->toBeTruthy();
+})->with([
+    'ordinary save' => false,
+    'quiet save' => true,
+]);
+
+it('admits direct and quiet ineligibility changes for never-deployed assembly-incomplete applications', function (bool $quietly): void {
+    $application = applicationTopologyPersistenceFixture();
+    $application->health_check_enabled = false;
+
+    expect($quietly ? $application->saveQuietly() : $application->save())->toBeTrue();
+
+    $persistedApplication = $application->fresh();
+    expect($persistedApplication->health_check_enabled)->toBeFalsy()
+        ->and($persistedApplication->blueGreenIneligibilityReason())->toBe(BlueGreenIneligibilityReason::HealthcheckRequired)
+        ->and($persistedApplication->isBlueGreenDeploymentEnabled())->toBeFalse();
 })->with([
     'ordinary save' => false,
     'quiet save' => true,

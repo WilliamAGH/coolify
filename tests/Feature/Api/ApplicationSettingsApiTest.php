@@ -1,7 +1,9 @@
 <?php
 
 use App\Enums\ProxyTypes;
+use App\Exceptions\BlueGreenAdmissionException;
 use App\Models\Application;
+use App\Models\ApplicationSetting;
 use App\Models\Environment;
 use App\Models\InstanceSettings;
 use App\Models\Project;
@@ -10,6 +12,7 @@ use App\Models\StandaloneDocker;
 use App\Models\Team;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Queue;
 
 uses(RefreshDatabase::class);
@@ -186,6 +189,31 @@ test('PATCH /api/v1/applications/{uuid} rejects blue-green opt-out while durable
         ->assertJsonValidationErrors('settings');
 
     expect($application->fresh()->settings->is_blue_green_deployment_enabled)->toBeTrue();
+});
+
+test('blue-green admission guards throw the dedicated domain exception', function () {
+    $application = eligibleBlueGreenApplication();
+    $application->settings()->update(['is_blue_green_deployment_enabled' => true]);
+    $application->blueGreenDeployments()->create([
+        'standalone_docker_id' => $application->destination_id,
+    ]);
+
+    $settings = $application->fresh()->settings;
+    $settings->is_blue_green_deployment_enabled = false;
+
+    expect(fn () => $settings->save())->toThrow(BlueGreenAdmissionException::class);
+});
+
+test('PATCH /api/v1/applications/{uuid} does not rewrite unrelated runtime failures as validation errors', function () {
+    Event::listen('eloquent.saving: '.ApplicationSetting::class, function (): void {
+        throw new RuntimeException('database connection lost mid-save');
+    });
+
+    $this->withHeaders(applicationSettingsApiHeaders($this->bearerToken))
+        ->patchJson("/api/v1/applications/{$this->application->uuid}", [
+            'disable_build_cache' => true,
+        ])
+        ->assertStatus(500);
 });
 
 test('rejects invalid boolean application settings', function () {

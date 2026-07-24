@@ -7,6 +7,7 @@ use App\Actions\Application\CleanupPreviewDeployment;
 use App\Actions\Application\LoadComposeFile;
 use App\Actions\Application\StopApplication;
 use App\Enums\BuildPackTypes;
+use App\Exceptions\BlueGreenAdmissionException;
 use App\Http\Controllers\Controller;
 use App\Jobs\DeleteResourceJob;
 use App\Models\Application;
@@ -157,7 +158,7 @@ class ApplicationsController extends Controller
 
         try {
             $application->settings->fill($settings)->save();
-        } catch (\RuntimeException $exception) {
+        } catch (BlueGreenAdmissionException $exception) {
             throw ValidationException::withMessages(['settings' => [$exception->getMessage()]]);
         }
 
