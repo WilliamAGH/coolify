@@ -4,6 +4,42 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🚜 Refactor
+
+- *(ci)* Retire the v4.x candidate machinery for staging-always
+
+## [4.13.29-fork] - 2026-07-24
+
+### 🐛 Bug Fixes
+
+- *(blue-green)* Absorb Traefik file-provider apply lag in candidate probe verification
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.29-fork
+
+## [4.13.28-fork] - 2026-07-24
+
+### 🚀 Features
+
+- *(release)* Ship fork releases directly from staging
+
+### 🐛 Bug Fixes
+
+- *(release)* Skip check-run source binding for reusable-workflow callers
+- *(release)* Admit gate-shaped validation sources in source identity binding
+- *(docker)* Patch vendored x/net and x/text CVEs in cloudflared and git-lfs
+
+### 🧪 Testing
+
+- *(ci)* Cover the gate-shaped source identity contract
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.28-fork
+
+## [4.13.27-fork] - 2026-07-24
+
 ### 🚀 Features
 
 - *(ui)* Expose the blue-green deployment opt-in as an Advanced settings toggle
@@ -14,19 +50,30 @@ All notable changes to this project will be documented in this file.
 - *(deployment)* Let the owning attempt keep process ownership through terminal-status cleanup
 - *(blue-green)* Tolerate the server catchall and provider lag in public recovery route verification
 - *(api)* Stop rewriting unrelated runtime failures as settings validation errors
+- *(deployment)* Repair orphaned epoch-zero fence sidecar during first-adoption attestation
+- *(database)* Cast scheduled backup flags to boolean
+- *(database)* Cast backup execution finished_at to datetime
+
+### 🚜 Refactor
+
+- *(console)* Extract stuck-execution cleanup into cleanup:stuck-executions
+- *(scheduler)* Make SchedulerLogParser testable with an injected log directory
 
 ### 📚 Documentation
 
 - Update changelog (#176)
+- Update changelog (#179)
 
 ### 🧪 Testing
 
 - *(deployment)* Admit blue-green setting inserts for never-deployed assembly-incomplete applications
 - *(api)* Cover blue-green deployment opt-in validation on application settings
+- *(api)* Seed the id-0 InstanceSettings row with forceCreate in API tests
 
 ### ⚙️ Miscellaneous Tasks
 
 - *(release)* Prepare 4.13.27-fork
+- *(templates)* Sync service templates with the upstream catalog
 
 ## [4.13.26-fork] - 2026-07-24
 
