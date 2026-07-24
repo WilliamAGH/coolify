@@ -535,6 +535,20 @@ final class ReconstructBlueGreenDeploymentRecovery
             throw new BlueGreenDeploymentTransitionException('The first-adoption recovery has inconsistent predecessor destination-fence provenance.');
         }
 
+        $enrolledState = $routingMutationRecorded
+            ? null
+            : $this->recordedFirstAdoptionEnrollmentState($state, $application, $claim);
+        if ($enrolledState !== null) {
+            return new BlueGreenProxyRollbackKey(
+                operationId: $claim->deploymentUuid,
+                expectedState: $enrolledState,
+                replacementState: $enrolledState->withDestinationFenceEpoch(
+                    $enrolledState->destinationFenceEpoch + 1,
+                    $claim->deploymentUuid,
+                ),
+            );
+        }
+
         $replacementState = $routingMutationRecorded
             ? $this->recordedReplacementState($state, $application, $claim)
             : $this->unrecordedReplacementState($state, $application, $claim);
@@ -543,6 +557,49 @@ final class ReconstructBlueGreenDeploymentRecovery
             operationId: $claim->deploymentUuid,
             expectedState: null,
             replacementState: $replacementState,
+        );
+    }
+
+    /**
+     * A first adoption durably records its own epoch-zero absent-route fence
+     * enrollment before the routing mutation ever runs. A crash inside that
+     * window is a provable torn write: the destination sidecar still carries
+     * the enrollment record (routing revision one behind the claimed state
+     * row), so recovery can expect exactly that record instead of a pristine
+     * destination. Any other partial fence shape stays fail-closed.
+     */
+    private function recordedFirstAdoptionEnrollmentState(
+        ApplicationBlueGreenDeployment $state,
+        Application $application,
+        BlueGreenDeploymentClaim $claim,
+    ): ?BlueGreenProxyState {
+        if ($state->destination_fence_epoch !== 0
+            || $state->destination_fence_operation_id !== $claim->deploymentUuid
+            || ! is_int($state->destination_fence_mutation_sequence)
+            || $state->destination_fence_mutation_sequence < 1
+            || $state->managed_file_sha256 !== null
+            || $state->destination_topology_digest !== $claim->topologyDigest
+            || $state->application_routing_config_digest !== $claim->routingConfigDigest
+            || $claim->destinationFenceEpoch !== 1) {
+            return null;
+        }
+
+        return new BlueGreenProxyState(
+            managedFilename: $claim->rollbackManagedFilename
+                ?? throw new BlueGreenDeploymentTransitionException('The enrolled first-adoption operation has no managed filename.'),
+            applicationUuid: (string) $application->uuid,
+            destinationId: $claim->standaloneDockerId,
+            operationId: $claim->deploymentUuid,
+            mutationSequence: $state->destination_fence_mutation_sequence,
+            destinationFenceEpoch: 0,
+            routingRevision: $claim->expectedRoutingRevision - 1,
+            managedSha256: null,
+            activeColor: null,
+            activeDeploymentUuid: null,
+            activeContainerName: null,
+            activeContainerId: null,
+            applicationRoutingConfigDigest: $claim->routingConfigDigest,
+            destinationTopologyDigest: $claim->topologyDigest,
         );
     }
 
