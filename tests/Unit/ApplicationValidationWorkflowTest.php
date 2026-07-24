@@ -190,7 +190,7 @@ function runApplicationValidationRequiredAggregate(array $environment): Process
     return $process;
 }
 
-function runApplicationValidationSourceIdentity(string $sourceSha, string $checkRunSha): Process
+function runApplicationValidationSourceIdentity(string $sourceSha, string $checkRunSha, string $baseSha = ''): Process
 {
     $step = applicationValidationSourceIdentityStep(applicationValidationWorkflow());
     $process = new Process(
@@ -199,6 +199,7 @@ function runApplicationValidationSourceIdentity(string $sourceSha, string $check
         [
             'CHECK_RUN_SHA' => $checkRunSha,
             'VALIDATION_SOURCE_SHA' => $sourceSha,
+            'VALIDATION_BASE_SHA' => $baseSha,
         ],
     );
     $process->run();
@@ -289,8 +290,10 @@ function applicationValidationWorkflowViolations(array $workflow): array
         || ($sourceIdentityStep['env'] ?? null) !== [
             'CHECK_RUN_SHA' => '${{ github.sha }}',
             'VALIDATION_SOURCE_SHA' => '${{ inputs.source_sha }}',
+            'VALIDATION_BASE_SHA' => '${{ inputs.base_sha }}',
         ]
-        || ! str_contains((string) ($sourceIdentityStep['run'] ?? ''), '[[ "$VALIDATION_SOURCE_SHA" == "$CHECK_RUN_SHA" ]]')) {
+        || ! str_contains((string) ($sourceIdentityStep['run'] ?? ''), '[[ "$VALIDATION_SOURCE_SHA" == "$CHECK_RUN_SHA" ]]')
+        || ! str_contains((string) ($sourceIdentityStep['run'] ?? ''), '"$CHECK_RUN_SHA" == "$VALIDATION_BASE_SHA"')) {
         $violations[] = 'application validation must bind an exact requested source to the check-run revision';
     }
     foreach (is_array($jobs) ? $jobs : [] as $jobName => $job) {
@@ -535,6 +538,19 @@ it('rejects malformed or mismatched exact validation sources', function (string 
     'uppercase source' => [str_repeat('A', 40), str_repeat('a', 40)],
     'different revision' => [str_repeat('a', 40), str_repeat('b', 40)],
 ]);
+
+it('accepts a gate-shaped source when the run executes on the exact frozen base', function (): void {
+    $base = str_repeat('c', 40);
+    $process = runApplicationValidationSourceIdentity(str_repeat('d', 40), $base, $base);
+
+    expect($process->isSuccessful())->toBeTrue($process->getErrorOutput());
+});
+
+it('rejects a differing source when the run does not execute on the frozen base', function (): void {
+    $process = runApplicationValidationSourceIdentity(str_repeat('d', 40), str_repeat('c', 40), str_repeat('e', 40));
+
+    expect($process->isSuccessful())->toBeFalse();
+});
 
 it('rejects removing the exact validation source binding', function (): void {
     $workflow = applicationValidationWorkflow();
