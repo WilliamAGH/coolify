@@ -247,6 +247,9 @@ class Server extends BaseModel
     private function proxyTypeChanged(): bool
     {
         $originalProxy = $this->getRawOriginal('proxy');
+        if ($originalProxy === null) {
+            return $this->proxyType() !== null;
+        }
         if (is_string($originalProxy)) {
             try {
                 $originalProxy = json_decode($originalProxy, true, flags: JSON_THROW_ON_ERROR);

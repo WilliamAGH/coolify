@@ -263,3 +263,24 @@ it('dispatches proxy network reconciliation only after the destination transacti
         app()->detectEnvironment(static fn (): string => $environment);
     }
 });
+
+it('allows unrelated updates on a server with an unconfigured proxy hosting an opted-in application', function () {
+    $team = Team::factory()->create();
+    $server = Server::factory()->create(['team_id' => $team->id]);
+    $destination = $server->standaloneDockers()->firstOrFail();
+    $project = Project::factory()->create(['team_id' => $team->id]);
+    Application::factory()->create([
+        'environment_id' => $project->environments()->firstOrFail()->id,
+        'destination_id' => $destination->id,
+        'destination_type' => $destination->getMorphClass(),
+    ]);
+    $privateKey = PrivateKey::factory()->create(['team_id' => $team->id]);
+
+    $server = $server->fresh();
+    expect($server->getRawOriginal('proxy'))->toBeNull();
+
+    expect(fn () => $server->update(['private_key_id' => $privateKey->id]))
+        ->not->toThrow(RuntimeException::class);
+
+    expect($server->fresh()->private_key_id)->toBe($privateKey->id);
+});
