@@ -1,5 +1,6 @@
 <?php
 
+use App\Enums\BlueGreenIneligibilityReason;
 use App\Enums\ProxyTypes;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeactivation;
@@ -63,22 +64,22 @@ function applicationSettingMutationOwner(bool $withDeactivation, bool $softDelet
     return $application;
 }
 
-it('applies blue-green admission rules to direct Eloquent setting inserts', function (): void {
+it('admits direct Eloquent setting inserts for never-deployed assembly-incomplete applications', function (): void {
     $application = applicationSettingTopologyApplication();
     $application->update(['health_check_enabled' => false]);
     $application->settings()->firstOrFail()->delete();
 
-    expect(fn (): ApplicationSetting => ApplicationSetting::query()->create([
+    $setting = ApplicationSetting::query()->create([
         'application_id' => $application->id,
         'is_blue_green_deployment_enabled' => true,
-    ]))->toThrow(RuntimeException::class);
+    ]);
 
-    expect(ApplicationSetting::query()
-        ->where('application_id', $application->id)
-        ->exists())->toBeFalse();
+    expect($setting->fresh()->is_blue_green_deployment_enabled)->toBeTrue()
+        ->and($application->fresh()->blueGreenIneligibilityReason())->toBe(BlueGreenIneligibilityReason::HealthcheckRequired)
+        ->and($application->fresh()->isBlueGreenDeploymentEnabled())->toBeFalse();
 });
 
-it('applies blue-green admission rules to quiet setting inserts', function (): void {
+it('admits quiet setting inserts for never-deployed assembly-incomplete applications', function (): void {
     $application = applicationSettingTopologyApplication();
     $application->update(['health_check_enabled' => false]);
     $application->settings()->firstOrFail()->delete();
@@ -87,12 +88,11 @@ it('applies blue-green admission rules to quiet setting inserts', function (): v
         'is_blue_green_deployment_enabled' => true,
     ]);
 
-    expect(fn (): bool => $setting->saveQuietly())
-        ->toThrow(RuntimeException::class);
+    expect($setting->saveQuietly())->toBeTrue();
 
-    expect(ApplicationSetting::query()
-        ->where('application_id', $application->id)
-        ->exists())->toBeFalse();
+    expect($setting->fresh()->is_blue_green_deployment_enabled)->toBeTrue()
+        ->and($application->fresh()->blueGreenIneligibilityReason())->toBe(BlueGreenIneligibilityReason::HealthcheckRequired)
+        ->and($application->fresh()->isBlueGreenDeploymentEnabled())->toBeFalse();
 });
 
 it('rebases locked non-dirty attributes before saving a lifecycle setting mutation', function (): void {
