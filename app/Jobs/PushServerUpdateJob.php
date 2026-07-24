@@ -38,6 +38,7 @@ use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Laravel\Horizon\Contracts\Silenced;
 
 class PushServerUpdateJob implements ShouldBeEncrypted, ShouldQueue, Silenced
@@ -265,13 +266,17 @@ class PushServerUpdateJob implements ShouldBeEncrypted, ShouldQueue, Silenced
                         if ($this->allApplicationIds->contains($applicationId)) {
                             $this->foundApplicationIds->push($applicationId);
                         }
-                        // Store container status for aggregation
-                        if (! $this->applicationContainerStatuses->has($applicationId)) {
-                            $this->applicationContainerStatuses->put($applicationId, collect());
+                        // Store container status for aggregation. A stale job
+                        // snapshot can deserialize with a null entry, so a
+                        // has() check is not enough - require a Collection.
+                        $containerStatuses = $this->applicationContainerStatuses->get($applicationId);
+                        if (! $containerStatuses instanceof Collection) {
+                            $containerStatuses = collect();
+                            $this->applicationContainerStatuses->put($applicationId, $containerStatuses);
                         }
                         $containerName = $labels->get('com.docker.compose.service');
                         if ($containerName) {
-                            $this->applicationContainerStatuses->get($applicationId)->put($containerName, $containerStatus);
+                            $containerStatuses->put($containerName, $containerStatus);
                         }
                     } else {
                         $previewKey = $applicationId.':'.$pullRequestId;
@@ -280,7 +285,8 @@ class PushServerUpdateJob implements ShouldBeEncrypted, ShouldQueue, Silenced
                         }
                         $this->updateApplicationPreviewStatus($applicationId, $pullRequestId, $containerStatus);
                     }
-                } catch (\Exception $e) {
+                } catch (\Throwable $e) {
+                    Log::warning('Failed to process container status for application '.$applicationId.' on server '.$this->server->id.': '.$e->getMessage());
                 }
             } elseif ($labels->has('coolify.serviceId')) {
                 $serviceId = $labels->get('coolify.serviceId');
