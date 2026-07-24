@@ -255,6 +255,7 @@ class ApplicationSetting extends Model
         $application->prepareBlueGreenConfigurationMutation(
             setting: $this,
             allowPendingSettingOptOut: ! $isEnablingBlueGreenDeployment,
+            isExplicitOptIn: $isEnablingBlueGreenDeployment,
         );
     }
 

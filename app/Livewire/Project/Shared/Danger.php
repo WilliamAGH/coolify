@@ -109,7 +109,7 @@ class Danger extends Component
         try {
             $this->authorize('delete', $this->resource);
             if ($this->resource instanceof Application
-                && $this->resource->requiresBlueGreenDeactivation()) {
+                && $this->resource->requiresBlueGreenDeletionDeactivation()) {
                 (new DeactivateBlueGreenApplication)->beginDeletion($this->resource);
             } else {
                 $this->resource->delete();

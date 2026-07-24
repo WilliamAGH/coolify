@@ -46,6 +46,9 @@ function blueGreenStorageTopologyApplication(): Application
         'is_container_label_readonly_enabled' => true,
         'is_consistent_container_name_enabled' => false,
         'custom_internal_name' => null,
+        // These fixtures model applications that are NOT blue-green managed;
+        // the opt-out default would otherwise opt them in.
+        'is_blue_green_deployment_enabled' => false,
     ]);
 
     return $application;
@@ -159,8 +162,14 @@ it('fails closed when an opted-in application receives a storage addition', func
 
 it('fails closed when an application has durable blue-green state', function (string $storageModel, Closure $storageAttributes): void {
     $scenario = BlueGreenRecoveryScenario::create(finalized: false);
+    // Bypass the settings hooks: opting out normally requires resolving the
+    // durable state first, but this test needs "not opted in with durable
+    // state" to prove the state alone forbids storage additions.
+    DB::table('application_settings')
+        ->where('application_id', $scenario->application->id)
+        ->update(['is_blue_green_deployment_enabled' => false]);
 
-    expect($scenario->application->isBlueGreenDeploymentOptedIn())->toBeFalse()
+    expect($scenario->application->fresh()->isBlueGreenDeploymentOptedIn())->toBeFalse()
         ->and(fn () => $storageModel::query()->create($storageAttributes($scenario->application)))->toThrow(RuntimeException::class)
         ->and($storageModel::query()
             ->where('resource_id', $scenario->application->id)

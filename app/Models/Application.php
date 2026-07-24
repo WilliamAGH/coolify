@@ -7,6 +7,7 @@ use App\Actions\Proxy\RemoveProxyConnectedNetwork;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentPhase;
+use App\Enums\BlueGreenIneligibilityReason;
 use App\Enums\ProxyTypes;
 use App\Services\ConfigurationGenerator;
 use App\Services\DeploymentConfiguration\ApplicationConfigurationSnapshot;
@@ -1639,6 +1640,7 @@ class Application extends BaseModel
     public function prepareBlueGreenConfigurationMutation(
         ?ApplicationSetting $setting = null,
         bool $allowPendingSettingOptOut = false,
+        bool $isExplicitOptIn = false,
     ): void {
         $setting ??= $this->settings()->first();
         $this->assertBlueGreenTopologyMutationAllowed();
@@ -1654,10 +1656,11 @@ class Application extends BaseModel
         }
 
         $this->reconcileBlueGreenConfigurationIneligibility(
-            $this->blueGreenDeploymentIneligibilityReason($setting),
+            $this->blueGreenIneligibility($setting),
             $hasDurableState,
             $setting,
             $allowPendingSettingOptOut,
+            $isExplicitOptIn,
         );
     }
 
@@ -1718,11 +1721,14 @@ class Application extends BaseModel
             ->push($destination)
             ->unique('id')
             ->values();
+        $destinationTopologyIneligibility = $this->blueGreenDestinationTopologyIneligibility(
+            $configuredDestinationIds,
+            $configuredDestinations,
+        );
         $this->reconcileBlueGreenConfigurationIneligibility(
-            $this->blueGreenDestinationTopologyIneligibilityReason(
-                $configuredDestinationIds,
-                $configuredDestinations,
-            ),
+            $destinationTopologyIneligibility === null
+                ? null
+                : self::blueGreenIneligibilityFinding($destinationTopologyIneligibility),
             $hasDurableState,
             $setting,
             false,
@@ -1824,17 +1830,19 @@ class Application extends BaseModel
         }
     }
 
+    /** @param ?array{reason: BlueGreenIneligibilityReason, message: string} $ineligibility */
     private function reconcileBlueGreenConfigurationIneligibility(
-        ?string $ineligibilityReason,
+        ?array $ineligibility,
         bool $hasDurableState,
         ?ApplicationSetting $setting,
         bool $allowPendingSettingOptOut,
+        bool $isExplicitOptIn = false,
     ): void {
-        if ($ineligibilityReason === null) {
+        if ($ineligibility === null) {
             return;
         }
         if ($hasDurableState) {
-            throw new RuntimeException("Blue-green deployment configuration cannot become ineligible while durable state exists. {$ineligibilityReason} Stop the application and use the blue-green cleanup lifecycle first.");
+            throw new RuntimeException("Blue-green deployment configuration cannot become ineligible while durable state exists. {$ineligibility['message']} Stop the application and use the blue-green cleanup lifecycle first.");
         }
 
         if ($allowPendingSettingOptOut && $setting !== null && $setting->is_blue_green_deployment_enabled) {
@@ -1844,15 +1852,38 @@ class Application extends BaseModel
         }
 
         // Blue-green is opt-out: an application still being assembled (never
-        // deployed, no durable state) may be saved while ineligible so the
-        // default-enabled flag survives creation. The deploy-time eligibility
-        // gate still fails closed with the exact reason - fix the shape or
-        // opt out; rolling fallback stays forbidden.
-        if ($this->deployment_queue()->doesntExist()) {
+        // deployed, no durable state) may be saved while its configuration is
+        // merely incomplete, so the default-enabled flag survives creation,
+        // and it may keep saving while its persisted configuration was
+        // already ineligible - the save does not make it BECOME ineligible.
+        // The deploy-time eligibility gate still fails closed with the exact
+        // reason - fix the shape or opt out; rolling fallback stays forbidden.
+        // A save that turns an eligible opted-in application into one that
+        // actively conflicts with blue-green (volumes, raw Compose, multiple
+        // routed services, host ports, custom names) always fails closed, as
+        // does explicitly opting in while any ineligibility exists.
+        if (! $isExplicitOptIn
+            && $this->deployment_queue()->doesntExist()
+            && ($ineligibility['reason']->isAssemblyIncomplete()
+                || $this->persistedBlueGreenConfigurationWasAlreadyIneligible($setting))) {
             return;
         }
 
-        throw new RuntimeException("Blue-green deployment configuration cannot become ineligible while it is opted in. {$ineligibilityReason} Disable blue-green deployment first.");
+        throw new RuntimeException("Blue-green deployment configuration cannot become ineligible while it is opted in. {$ineligibility['message']} Disable blue-green deployment first.");
+    }
+
+    /** @return array{reason: BlueGreenIneligibilityReason, message: string} */
+    private static function blueGreenIneligibilityFinding(BlueGreenIneligibilityReason $reason): array
+    {
+        return ['reason' => $reason, 'message' => $reason->message()];
+    }
+
+    private function persistedBlueGreenConfigurationWasAlreadyIneligible(?ApplicationSetting $setting): bool
+    {
+        $persistedApplication = clone $this;
+        $persistedApplication->setRawAttributes($this->getRawOriginal(), sync: true);
+
+        return $persistedApplication->blueGreenIneligibility($setting) !== null;
     }
 
     private function blueGreenDurableStateTopologyIneligibilityReason(): ?string
@@ -1871,59 +1902,84 @@ class Application extends BaseModel
 
     public function blueGreenDeploymentIneligibilityReason(?ApplicationSetting $setting = null): ?string
     {
+        return $this->blueGreenIneligibility($setting)['message'] ?? null;
+    }
+
+    public function blueGreenIneligibilityReason(?ApplicationSetting $setting = null): ?BlueGreenIneligibilityReason
+    {
+        return $this->blueGreenIneligibility($setting)['reason'] ?? null;
+    }
+
+    /**
+     * The typed ineligibility finding: the enum reason drives every branch
+     * while the message carries the operator-facing detail (Docker Compose
+     * findings compose their detail inside BlueGreenComposeTopology).
+     *
+     * @return ?array{reason: BlueGreenIneligibilityReason, message: string}
+     */
+    private function blueGreenIneligibility(?ApplicationSetting $setting = null): ?array
+    {
         $setting ??= $this->settings()->first();
         if ($this->blueGreenPrimaryStandaloneDockerDestinationId() === null) {
-            return 'Blue-green deployments require a standalone Docker primary destination.';
+            return self::blueGreenIneligibilityFinding(BlueGreenIneligibilityReason::NoStandaloneDockerPrimaryDestination);
         }
 
         $configuredDestinationIds = $this->blueGreenConfiguredStandaloneDockerDestinationIds();
         $destinations = $this->blueGreenConfiguredStandaloneDockerDestinations();
-        if (($topologyReason = $this->blueGreenDestinationTopologyIneligibilityReason(
+        if (($topologyIneligibility = $this->blueGreenDestinationTopologyIneligibility(
             $configuredDestinationIds,
             $destinations,
         )) !== null) {
-            return $topologyReason;
+            return self::blueGreenIneligibilityFinding($topologyIneligibility);
         }
         if (! (bool) ($setting?->is_container_label_readonly_enabled ?? false)) {
-            return 'Blue-green deployments require generated, read-only container labels.';
+            return self::blueGreenIneligibilityFinding(BlueGreenIneligibilityReason::GeneratedReadonlyLabelsRequired);
         }
         if ((bool) ($setting?->is_raw_compose_deployment_enabled ?? false)) {
-            return 'Blue-green deployments do not support raw Docker Compose applications because raw Compose cannot be safely rewritten.';
+            return self::blueGreenIneligibilityFinding(BlueGreenIneligibilityReason::RawComposeConflict);
         }
         $isParsedCompose = $this->build_pack === 'dockercompose';
-        if ($isParsedCompose && ($composeReason = BlueGreenComposeTopology::ineligibilityReason($this)) !== null) {
-            return $composeReason;
+        if ($isParsedCompose) {
+            $composeIneligibility = BlueGreenComposeTopology::ineligibility($this);
+            if ($composeIneligibility['reason'] !== null) {
+                return [
+                    'reason' => $composeIneligibility['incomplete']
+                        ? BlueGreenIneligibilityReason::ComposeParseIncomplete
+                        : BlueGreenIneligibilityReason::ComposeTopologyConflict,
+                    'message' => $composeIneligibility['reason'],
+                ];
+            }
         }
         if ($isParsedCompose) {
             if (! (bool) $this->health_check_enabled || $this->health_check_type !== 'http') {
-                return 'Blue-green Docker Compose applications require an enabled HTTP Coolify healthcheck for routed failover.';
+                return self::blueGreenIneligibilityFinding(BlueGreenIneligibilityReason::ComposeHttpHealthcheckRequired);
             }
         } elseif (! (bool) $this->health_check_enabled && ! (bool) $this->custom_healthcheck_found) {
-            return 'Blue-green deployments require either an enabled Coolify healthcheck or a detected image healthcheck.';
+            return self::blueGreenIneligibilityFinding(BlueGreenIneligibilityReason::HealthcheckRequired);
         }
         if (! $isParsedCompose && str($this->fqdn)->trim()->isEmpty()) {
-            return 'Blue-green deployments require at least one FQDN.';
+            return self::blueGreenIneligibilityFinding(BlueGreenIneligibilityReason::FqdnRequired);
         }
         if ($this->blueGreenDeploymentBackendPorts($setting) === null) {
-            return 'Blue-green deployments require unique valid exposed backend ports. Multiple ports require every FQDN to declare one exposed :port, and every exposed port must have a matching FQDN; static applications use port 80.';
+            return self::blueGreenIneligibilityFinding(BlueGreenIneligibilityReason::BackendPortsRequired);
         }
         if (count($this->ports_mappings_array) > 0) {
-            return 'Blue-green deployments do not support ports mapped to the host.';
+            return self::blueGreenIneligibilityFinding(BlueGreenIneligibilityReason::HostPortMappingConflict);
         }
         if ((bool) ($setting?->is_consistent_container_name_enabled ?? false)) {
-            return 'Blue-green deployments do not support consistent container names.';
+            return self::blueGreenIneligibilityFinding(BlueGreenIneligibilityReason::ConsistentContainerNameConflict);
         }
         if (str($setting?->custom_internal_name)->trim()->isNotEmpty()) {
-            return 'Blue-green deployments do not support custom container names.';
+            return self::blueGreenIneligibilityFinding(BlueGreenIneligibilityReason::CustomInternalNameConflict);
         }
         if (! empty($this->custom_network_aliases_array)) {
-            return 'Blue-green deployments do not support custom network aliases.';
+            return self::blueGreenIneligibilityFinding(BlueGreenIneligibilityReason::CustomNetworkAliasConflict);
         }
         if (str($this->custom_docker_run_options)->trim()->isNotEmpty()) {
-            return 'Blue-green deployments do not support custom Docker run options.';
+            return self::blueGreenIneligibilityFinding(BlueGreenIneligibilityReason::CustomDockerRunOptionsConflict);
         }
         if (! $isParsedCompose && ($this->persistentStorages()->exists() || $this->fileStorages()->exists())) {
-            return 'Blue-green deployments require stateless applications without writable storage.';
+            return self::blueGreenIneligibilityFinding(BlueGreenIneligibilityReason::WritableStorageConflict);
         }
 
         return null;
@@ -1937,23 +1993,37 @@ class Application extends BaseModel
         Collection $configuredDestinationIds,
         Collection $destinations,
     ): ?string {
+        return $this->blueGreenDestinationTopologyIneligibility(
+            $configuredDestinationIds,
+            $destinations,
+        )?->message();
+    }
+
+    /**
+     * @param  Collection<int, int>  $configuredDestinationIds
+     * @param  Collection<int, StandaloneDocker>  $destinations
+     */
+    private function blueGreenDestinationTopologyIneligibility(
+        Collection $configuredDestinationIds,
+        Collection $destinations,
+    ): ?BlueGreenIneligibilityReason {
         if ($destinations->count() !== $configuredDestinationIds->count()) {
-            return 'Blue-green deployments require every configured standalone Docker destination to remain available.';
+            return BlueGreenIneligibilityReason::DestinationUnavailableConflict;
         }
         if ($destinations->isEmpty()) {
-            return 'Blue-green deployments require at least one standalone Docker destination.';
+            return BlueGreenIneligibilityReason::NoStandaloneDockerDestination;
         }
         $serverIds = [];
         foreach ($destinations as $destination) {
             $server = $destination->server;
             if ($server === null || $server->isSwarm()) {
-                return 'Blue-green deployments are not available for Docker Swarm destinations.';
+                return BlueGreenIneligibilityReason::SwarmDestinationConflict;
             }
             if ($server->proxyType() !== ProxyTypes::TRAEFIK->value) {
-                return 'Blue-green deployments require Traefik as the proxy on every configured destination.';
+                return BlueGreenIneligibilityReason::NonTraefikProxyConflict;
             }
             if (isset($serverIds[$server->id])) {
-                return 'Blue-green deployments require one destination per server.';
+                return BlueGreenIneligibilityReason::DestinationPerServerConflict;
             }
             $serverIds[$server->id] = true;
         }
@@ -1963,7 +2033,7 @@ class Application extends BaseModel
 
     public function assertBlueGreenDeletionAuthorized(): void
     {
-        if (! $this->requiresBlueGreenDeactivation()) {
+        if (! $this->requiresBlueGreenDeletionDeactivation()) {
             return;
         }
         if (! $this->trashed()) {
@@ -2008,9 +2078,25 @@ class Application extends BaseModel
             return true;
         }
 
-        // Opt-in alone (the opt-out default) does not create anything to
-        // deactivate: an application with no deployment history has no
-        // containers or routing under blue-green management.
+        // Opt-in requires the fenced stop lifecycle even without deployment
+        // history: a pre-blue-green legacy container may still serve traffic,
+        // and the first manual stop must adopt and remove it under the
+        // destination fence. The fenced flow is safely a no-op when nothing
+        // exists to adopt.
+        return $this->isBlueGreenDeploymentOptedIn($this->settings()->first());
+    }
+
+    public function requiresBlueGreenDeletionDeactivation(): bool
+    {
+        if ($this->blueGreenDeployments()->exists() || $this->blueGreenDeactivations()->exists()) {
+            return true;
+        }
+
+        // Deleting a never-deployed application has nothing under blue-green
+        // management to hand off: without durable state no managed route or
+        // fenced container ownership exists, and the plain deletion path
+        // removes stray containers by UUID. Opt-in alone (the opt-out
+        // default) therefore does not demand strict deactivation.
         return $this->isBlueGreenDeploymentOptedIn($this->settings()->first())
             && $this->deployment_queue()->exists();
     }
