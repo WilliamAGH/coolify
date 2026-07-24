@@ -16,11 +16,13 @@ All notable changes to this project will be documented in this file.
 - *(control-plane)* Parse the app.key row instead of the last output line
 - *(control-plane)* Satisfy the strict shellcheck lane
 - *(control-plane)* Keep browser websocket port pins out of the runtime env
+- *(control-plane)* Actually enable workers when --enable-workers is given
 
 ### 📚 Documentation
 
 - Update changelog (#152)
 - Update changelog (#155)
+- Update changelog (#157)
 
 ## [4.13.23-fork] - 2026-07-23
 
