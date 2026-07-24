@@ -337,6 +337,7 @@ class DeployController extends Controller
                 if (str_contains($e->getMessage(), 'No such container')) {
                     $deployment->addLogEntry('Deployment container already removed.');
                 } else {
+                    $deployment->addLogEntry('Post-cancellation cleanup failed: '.$e->getMessage(), 'stderr');
                     Log::warning('Post-cancel cleanup failed for deployment.', [
                         'deployment_uuid' => $deployment->deployment_uuid,
                         'error' => $e->getMessage(),
