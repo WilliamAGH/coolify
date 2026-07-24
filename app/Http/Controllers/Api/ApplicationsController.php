@@ -28,6 +28,7 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\Rule;
+use Illuminate\Validation\ValidationException;
 use OpenApi\Attributes as OA;
 use Spatie\Url\Url;
 use Symfony\Component\Yaml\Yaml;
@@ -50,6 +51,7 @@ class ApplicationsController extends Controller
         'is_gzip_enabled',
         'is_stripprefix_enabled',
         'is_raw_compose_deployment_enabled',
+        'is_blue_green_deployment_enabled',
     ];
 
     private const BOOLEAN_APPLICATION_SETTING_FIELDS = [
@@ -64,6 +66,7 @@ class ApplicationsController extends Controller
         'is_gzip_enabled',
         'is_stripprefix_enabled',
         'is_raw_compose_deployment_enabled',
+        'is_blue_green_deployment_enabled',
     ];
 
     protected function findTaggableResource(string $uuid, int|string $teamId): mixed
@@ -152,7 +155,11 @@ class ApplicationsController extends Controller
             && $application->settings->is_container_label_readonly_enabled
             && (array_key_exists('is_gzip_enabled', $settings) || array_key_exists('is_stripprefix_enabled', $settings));
 
-        $application->settings->fill($settings)->save();
+        try {
+            $application->settings->fill($settings)->save();
+        } catch (\RuntimeException $exception) {
+            throw ValidationException::withMessages(['settings' => [$exception->getMessage()]]);
+        }
 
         if ($regenerateLabels) {
             $application->custom_labels = str(implode('|coolify|', generateLabelsApplication($application)))->replace('|coolify|', "\n");
@@ -369,6 +376,7 @@ class ApplicationsController extends Controller
                             'is_gzip_enabled' => ['type' => 'boolean', 'description' => 'Enable gzip compression.'],
                             'is_stripprefix_enabled' => ['type' => 'boolean', 'description' => 'Enable path prefix stripping.'],
                             'is_raw_compose_deployment_enabled' => ['type' => 'boolean', 'description' => 'Deploy the raw Docker Compose definition.'],
+                            'is_blue_green_deployment_enabled' => ['type' => 'boolean', 'description' => 'Deploy with the blue-green lifecycle instead of rolling updates. Enabling requires an eligible application; disabling is rejected while durable blue-green state exists.'],
                             'is_http_basic_auth_enabled' => ['type' => 'boolean', 'description' => 'HTTP Basic Authentication enabled.'],
                             'http_basic_auth_username' => ['type' => 'string', 'nullable' => true, 'description' => 'Username for HTTP Basic Authentication'],
                             'http_basic_auth_password' => ['type' => 'string', 'nullable' => true, 'description' => 'Password for HTTP Basic Authentication'],
@@ -551,6 +559,7 @@ class ApplicationsController extends Controller
                             'is_gzip_enabled' => ['type' => 'boolean', 'description' => 'Enable gzip compression.'],
                             'is_stripprefix_enabled' => ['type' => 'boolean', 'description' => 'Enable path prefix stripping.'],
                             'is_raw_compose_deployment_enabled' => ['type' => 'boolean', 'description' => 'Deploy the raw Docker Compose definition.'],
+                            'is_blue_green_deployment_enabled' => ['type' => 'boolean', 'description' => 'Deploy with the blue-green lifecycle instead of rolling updates. Enabling requires an eligible application; disabling is rejected while durable blue-green state exists.'],
                             'is_http_basic_auth_enabled' => ['type' => 'boolean', 'description' => 'HTTP Basic Authentication enabled.'],
                             'http_basic_auth_username' => ['type' => 'string', 'nullable' => true, 'description' => 'Username for HTTP Basic Authentication'],
                             'http_basic_auth_password' => ['type' => 'string', 'nullable' => true, 'description' => 'Password for HTTP Basic Authentication'],
@@ -733,6 +742,7 @@ class ApplicationsController extends Controller
                             'is_gzip_enabled' => ['type' => 'boolean', 'description' => 'Enable gzip compression.'],
                             'is_stripprefix_enabled' => ['type' => 'boolean', 'description' => 'Enable path prefix stripping.'],
                             'is_raw_compose_deployment_enabled' => ['type' => 'boolean', 'description' => 'Deploy the raw Docker Compose definition.'],
+                            'is_blue_green_deployment_enabled' => ['type' => 'boolean', 'description' => 'Deploy with the blue-green lifecycle instead of rolling updates. Enabling requires an eligible application; disabling is rejected while durable blue-green state exists.'],
                             'is_http_basic_auth_enabled' => ['type' => 'boolean', 'description' => 'HTTP Basic Authentication enabled.'],
                             'http_basic_auth_username' => ['type' => 'string', 'nullable' => true, 'description' => 'Username for HTTP Basic Authentication'],
                             'http_basic_auth_password' => ['type' => 'string', 'nullable' => true, 'description' => 'Password for HTTP Basic Authentication'],
@@ -887,6 +897,7 @@ class ApplicationsController extends Controller
                             'is_gzip_enabled' => ['type' => 'boolean', 'description' => 'Enable gzip compression.'],
                             'is_stripprefix_enabled' => ['type' => 'boolean', 'description' => 'Enable path prefix stripping.'],
                             'is_raw_compose_deployment_enabled' => ['type' => 'boolean', 'description' => 'Deploy the raw Docker Compose definition.'],
+                            'is_blue_green_deployment_enabled' => ['type' => 'boolean', 'description' => 'Deploy with the blue-green lifecycle instead of rolling updates. Enabling requires an eligible application; disabling is rejected while durable blue-green state exists.'],
                             'is_http_basic_auth_enabled' => ['type' => 'boolean', 'description' => 'HTTP Basic Authentication enabled.'],
                             'http_basic_auth_username' => ['type' => 'string', 'nullable' => true, 'description' => 'Username for HTTP Basic Authentication'],
                             'http_basic_auth_password' => ['type' => 'string', 'nullable' => true, 'description' => 'Password for HTTP Basic Authentication'],
@@ -1037,6 +1048,7 @@ class ApplicationsController extends Controller
                             'is_gzip_enabled' => ['type' => 'boolean', 'description' => 'Enable gzip compression.'],
                             'is_stripprefix_enabled' => ['type' => 'boolean', 'description' => 'Enable path prefix stripping.'],
                             'is_raw_compose_deployment_enabled' => ['type' => 'boolean', 'description' => 'Deploy the raw Docker Compose definition.'],
+                            'is_blue_green_deployment_enabled' => ['type' => 'boolean', 'description' => 'Deploy with the blue-green lifecycle instead of rolling updates. Enabling requires an eligible application; disabling is rejected while durable blue-green state exists.'],
                             'is_http_basic_auth_enabled' => ['type' => 'boolean', 'description' => 'HTTP Basic Authentication enabled.'],
                             'http_basic_auth_username' => ['type' => 'string', 'nullable' => true, 'description' => 'Username for HTTP Basic Authentication'],
                             'http_basic_auth_password' => ['type' => 'string', 'nullable' => true, 'description' => 'Password for HTTP Basic Authentication'],
@@ -2717,6 +2729,7 @@ class ApplicationsController extends Controller
                             'is_gzip_enabled' => ['type' => 'boolean', 'description' => 'Enable gzip compression.'],
                             'is_stripprefix_enabled' => ['type' => 'boolean', 'description' => 'Enable path prefix stripping.'],
                             'is_raw_compose_deployment_enabled' => ['type' => 'boolean', 'description' => 'Deploy the raw Docker Compose definition.'],
+                            'is_blue_green_deployment_enabled' => ['type' => 'boolean', 'description' => 'Deploy with the blue-green lifecycle instead of rolling updates. Enabling requires an eligible application; disabling is rejected while durable blue-green state exists.'],
                             'connect_to_docker_network' => ['type' => 'boolean', 'description' => 'The flag to connect the service to the predefined Docker network.'],
                             'force_domain_override' => ['type' => 'boolean', 'description' => 'Force domain usage even if conflicts are detected. Default is false.'],
                             'is_container_label_escape_enabled' => ['type' => 'boolean', 'default' => true, 'description' => 'Escape special characters in labels. By default, $ (and other chars) is escaped. So if you write $ in the labels, it will be saved as $$. If you want to use env variables inside the labels, turn this off.'],
