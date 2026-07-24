@@ -79,21 +79,18 @@ final class RepairBlueGreenSteadyState
             $fence->assertLockOwnership();
             $this->assertSnapshotUnchanged($state);
             VerifyBlueGreenManagedConfiguration::run($destination->server, $plan->configuration);
-            $verifier = new VerifyBlueGreenPublicRecovery;
-            foreach ($plan->publicRoutes as $route) {
-                $verifier->verifyRoute(
-                    server: $destination->server,
-                    application: $locks->application,
-                    route: $route,
-                    expectedAcknowledgement: $plan->publicAcknowledgement,
-                    expectedReleaseProof: BlueGreenRoutingTarget::durableReleaseProofToken($plan->activeDeployment->deployment_uuid),
-                    nonceParameter: VerifyBlueGreenPublicRecovery::DEPLOYMENT_NONCE_PARAMETER,
-                    beforeRequest: function () use ($fence, $state): void {
-                        $fence->assertLockOwnership();
-                        $this->assertSnapshotUnchanged($state);
-                    },
-                );
-            }
+            (new VerifyBlueGreenPublicRecovery)->verifyRoutesAbsorbingProviderLag(
+                server: $destination->server,
+                application: $locks->application,
+                routes: $plan->publicRoutes,
+                expectedAcknowledgement: $plan->publicAcknowledgement,
+                expectedReleaseProof: BlueGreenRoutingTarget::durableReleaseProofToken($plan->activeDeployment->deployment_uuid),
+                nonceParameter: VerifyBlueGreenPublicRecovery::DEPLOYMENT_NONCE_PARAMETER,
+                beforeRequest: function () use ($fence, $state): void {
+                    $fence->assertLockOwnership();
+                    $this->assertSnapshotUnchanged($state);
+                },
+            );
 
             $result = match ($outcome) {
                 WriteBlueGreenProxyConfiguration::REPAIR_HEALTHY_OUTPUT => BlueGreenSteadyStateRepairResult::HEALTHY,

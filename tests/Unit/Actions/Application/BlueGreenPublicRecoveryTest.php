@@ -19,6 +19,7 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Sleep;
 use Symfony\Component\Yaml\Yaml;
 use Tests\TestCase;
 
@@ -524,6 +525,59 @@ it('classifies every catchall response shape as route absence and nothing else',
     'a gateway error is not absence' => [502, [], false],
     'a transport failure is not absence' => [0, [], false],
 ]);
+
+it('absorbs provider apply lag while verifying steady routes', function () {
+    config(['constants.ssh.mux_enabled' => false]);
+    Sleep::fake();
+    $server = makeBlueGreenPublicRecoveryServer();
+    $application = new Application;
+    $route = ['router' => 'managed-public', 'url' => 'https://app.example.test/health'];
+    $acknowledgement = str_repeat('a', 64);
+    $staleResponse = "HTTP/1.1 200 OK\r\n"
+        .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.': '.str_repeat('e', 64)."\r\n\r\n";
+    $appliedResponse = "HTTP/1.1 200 OK\r\n"
+        .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$acknowledgement}\r\n\r\n";
+    Process::fake(['*' => Process::sequence([
+        Process::result(output: $staleResponse),
+        Process::result(output: $appliedResponse),
+    ])]);
+
+    (new VerifyBlueGreenPublicRecovery)->verifyRoutesAbsorbingProviderLag(
+        $server,
+        $application,
+        [$route],
+        $acknowledgement,
+        BlueGreenRoutingTarget::durableReleaseProofToken('steady-deployment'),
+    );
+
+    Sleep::assertSleptTimes(1);
+    Process::assertRanTimes(
+        fn (PendingProcess $process): bool => str_contains((string) $process->input, 'url = '),
+        2,
+    );
+});
+
+it('fails steady-route verification immediately on a non-converging observation', function () {
+    config(['constants.ssh.mux_enabled' => false]);
+    Sleep::fake();
+    $server = makeBlueGreenPublicRecoveryServer();
+    $application = new Application;
+    $route = ['router' => 'managed-public', 'url' => 'https://app.example.test/health'];
+    Process::fake(['*' => Process::result(output: "HTTP/1.1 502 Bad Gateway\r\n\r\n")]);
+
+    expect(fn () => (new VerifyBlueGreenPublicRecovery)->verifyRoutesAbsorbingProviderLag(
+        $server,
+        $application,
+        [$route],
+        str_repeat('a', 64),
+    ))->toThrow(BlueGreenPublicRouteAcknowledgementMismatch::class, 'ineligible public status 502');
+
+    Sleep::assertNeverSlept();
+    Process::assertRanTimes(
+        fn (PendingProcess $process): bool => str_contains((string) $process->input, 'url = '),
+        1,
+    );
+});
 
 it('classifies only healthy stale-acknowledgement observations as converging provider state', function () {
     $mismatch = fn (int $status): BlueGreenPublicRouteAcknowledgementMismatch => new BlueGreenPublicRouteAcknowledgementMismatch(
