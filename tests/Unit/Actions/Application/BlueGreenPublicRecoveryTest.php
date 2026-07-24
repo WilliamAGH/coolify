@@ -5,6 +5,7 @@ use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteOutcome;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteResult;
 use App\Actions\Application\BlueGreen\BlueGreenProxyDeactivationSnapshot;
 use App\Actions\Application\BlueGreen\BlueGreenProxyEvictionState;
+use App\Actions\Application\BlueGreen\BlueGreenPublicRouteAcknowledgementMismatch;
 use App\Actions\Application\BlueGreen\ExecuteBlueGreenDeactivationRemoteCommand;
 use App\Actions\Application\BlueGreen\PlanBlueGreenPublicRecovery;
 use App\Actions\Application\BlueGreen\VerifyBlueGreenPublicRecovery;
@@ -317,7 +318,7 @@ it('proves exact tombstone and absence states through canonical direct-origin tr
         Process::result(output: blueGreenPublicRecoveryEvictionRemoteOutput()),
         Process::result(output: blueGreenPublicRecoveryEvictionRemoteOutput('1700000000')),
         Process::result(output: blueGreenPublicRecoveryEvictionRemoteOutput('1700000000')),
-        Process::result(output: "HTTP/1.1 404 Not Found\r\n\r\n"),
+        Process::result(output: "HTTP/1.1 503 Service Unavailable\r\n\r\n"),
         Process::result(output: blueGreenPublicRecoveryEvictionRemoteOutput('1700000000')),
         Process::result(output: blueGreenPublicRecoveryEvictionRemoteOutput()),
     ])]);
@@ -494,4 +495,47 @@ it('requires the candidate application release proof on a public handoff route',
             $acknowledgement,
             BlueGreenRoutingTarget::durableReleaseProofToken('previous-deployment'),
         ))->toThrow(RuntimeException::class, 'exact application release proof');
+});
+
+it('accepts an ack-proven route from an application that does not emit the release proof header', function () {
+    $verifier = new VerifyBlueGreenPublicRecovery;
+    $route = ['router' => 'managed-public', 'url' => 'https://app.example.test/health'];
+    $acknowledgement = str_repeat('a', 64);
+    $headers = "HTTP/1.1 200 OK\r\n"
+        .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$acknowledgement}\r\n\r\n";
+
+    expect(fn () => $verifier->assertResponse(
+        $route,
+        $headers,
+        $acknowledgement,
+        BlueGreenRoutingTarget::durableReleaseProofToken('ordinary-application'),
+    ))->not->toThrow(RuntimeException::class);
+});
+
+it('classifies every catchall response shape as route absence and nothing else', function (int $status, array $acknowledgements, bool $expected) {
+    expect(VerifyBlueGreenPublicRecovery::indicatesRouteAbsence($status, $acknowledgements))->toBe($expected);
+})->with([
+    'catchall disabled answers 404' => [404, [], true],
+    'default noop catchall answers 503' => [503, [], true],
+    'redirect catchall answers 302' => [302, [], true],
+    'an acknowledged 503 comes from a managed route' => [503, [str_repeat('a', 64)], false],
+    'an acknowledged 404 comes from a managed route' => [404, [str_repeat('a', 64)], false],
+    'a healthy anonymous response is not absence' => [200, [], false],
+    'a gateway error is not absence' => [502, [], false],
+    'a transport failure is not absence' => [0, [], false],
+]);
+
+it('classifies only healthy stale-acknowledgement observations as converging provider state', function () {
+    $mismatch = fn (int $status): BlueGreenPublicRouteAcknowledgementMismatch => new BlueGreenPublicRouteAcknowledgementMismatch(
+        status: $status,
+        acknowledgements: [str_repeat('e', 64)],
+        message: 'stale acknowledgement',
+    );
+
+    expect(VerifyBlueGreenPublicRecovery::isConvergingRouteObservation($mismatch(200)))->toBeTrue()
+        ->and(VerifyBlueGreenPublicRecovery::isConvergingRouteObservation($mismatch(302)))->toBeTrue()
+        ->and(VerifyBlueGreenPublicRecovery::isConvergingRouteObservation($mismatch(502)))->toBeFalse()
+        ->and(VerifyBlueGreenPublicRecovery::isConvergingRouteObservation($mismatch(503)))->toBeFalse()
+        ->and(VerifyBlueGreenPublicRecovery::isConvergingRouteObservation($mismatch(0)))->toBeFalse()
+        ->and(VerifyBlueGreenPublicRecovery::isConvergingRouteObservation(new RuntimeException('wrong release proof')))->toBeFalse();
 });
