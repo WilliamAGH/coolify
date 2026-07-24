@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🚀 Features
+
+- *(ui)* Expose the blue-green deployment opt-in as an Advanced settings toggle
+- *(api)* Expose blue-green deployment opt-in on application settings
+
+### 🐛 Bug Fixes
+
+- *(deployment)* Let the owning attempt keep process ownership through terminal-status cleanup
+- *(blue-green)* Tolerate the server catchall and provider lag in public recovery route verification
+- *(api)* Stop rewriting unrelated runtime failures as settings validation errors
+
+### 📚 Documentation
+
+- Update changelog (#176)
+
+### 🧪 Testing
+
+- *(deployment)* Admit blue-green setting inserts for never-deployed assembly-incomplete applications
+- *(api)* Cover blue-green deployment opt-in validation on application settings
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.27-fork
+
+## [4.13.26-fork] - 2026-07-24
+
 ### 🐛 Bug Fixes
 
 - *(blue-green)* Absorb Traefik file-provider apply lag into route verification
