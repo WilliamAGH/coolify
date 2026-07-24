@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🐛 Bug Fixes
+
+- *(blue-green)* Absorb Traefik file-provider apply lag into route verification
+- *(blue-green)* Tolerate the server catchall and provider lag in public recovery route verification
+- *(proxy)* Bind the Traefik API to loopback and keep it enabled
+
+### 📚 Documentation
+
+- Update changelog (#168)
+- Update changelog (#172)
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.26-fork
+
+## [4.13.25-fork] - 2026-07-24
+
 ### 🚀 Features
 
 - *(fork-deploy)* Reconcile release tracking after a control-plane bridge migration
@@ -12,11 +29,6 @@ All notable changes to this project will be documented in this file.
 
 - *(realtime)* Route the dashboard websocket through the same-origin /app path behind a proxy
 - *(deployments)* Carry the prepared container name through activation handoff
-- *(blue-green)* Absorb Traefik file-provider apply lag into route verification
-
-### 📚 Documentation
-
-- Update changelog (#168)
 
 ### ⚙️ Miscellaneous Tasks
 
