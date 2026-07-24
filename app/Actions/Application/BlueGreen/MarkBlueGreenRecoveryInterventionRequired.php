@@ -229,7 +229,7 @@ final class MarkBlueGreenRecoveryInterventionRequired
             || ! is_string($state->operation_server_boot_id)
             || ! is_string($state->operation_topology_digest)
             || ! is_string($state->operation_routing_config_digest)
-            || ! BlueGreenLifecycleDatabaseLocks::queueStatusOwnsPhase($deployment->status, $state->phase)
+            || ! BlueGreenLifecycleDatabaseLocks::queueStatusOwnsPhase($deployment->status, $state->phase, true)
             || $deployment->deployment_uuid !== $operationUuid
             || (int) $deployment->application_id !== (int) $state->application_id
             || (int) $deployment->destination_id !== (int) $state->standalone_docker_id
@@ -298,6 +298,6 @@ final class MarkBlueGreenRecoveryInterventionRequired
                     ->whereNull('reconciliation_owner.deactivation_started_at');
             });
 
-        return BlueGreenLifecycleDatabaseLocks::constrainQueueStatus($query, $state->phase);
+        return BlueGreenLifecycleDatabaseLocks::constrainQueueStatus($query, $state->phase, true);
     }
 }
