@@ -10,6 +10,8 @@ final readonly class BlueGreenInterventionRecoveryResult
 
     public const LEGACY_MANUAL_ONLY = 'legacy_manual_only';
 
+    public const STALE_CONTAINER_JOURNAL = 'stale_container_journal';
+
     public const DEACTIVATION = 'deactivation';
 
     public const RECOVERED = 'recovered';

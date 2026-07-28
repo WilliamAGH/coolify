@@ -21,9 +21,15 @@ class WriteBlueGreenProxyConfiguration
 
     public const REPAIR_DRIFT_OUTPUT = 'coolify-blue-green-managed-route:repaired-drift';
 
+    public const STALE_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX = 'coolify-blue-green-stale-container-journal-v1';
+
+    public const STALE_CONTAINER_MUTATION_JOURNAL_ROUTE_LOCK_WAIT_SECONDS = 15;
+
     private const MUTATION_JOURNAL_MAGIC = 'coolify-blue-green-proxy-mutation-v1';
 
     private const CONTAINER_MUTATION_JOURNAL_MAGIC = 'coolify-blue-green-container-mutation-v1';
+
+    private const STALE_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC = 'coolify-blue-green-stale-container-journal-archive-v1';
 
     private const PROBE_HEADER = 'X-Coolify-Blue-Green-Probe';
 
@@ -176,9 +182,101 @@ class WriteBlueGreenProxyConfiguration
         return $this->stateDirectory($proxyPath).'/.'.$managedFilename.'.pending-container-mutation';
     }
 
+    /**
+     * The archive name deliberately carries a complete managed-filename hash
+     * rather than the filename itself, leaving room for the archive manifest
+     * and avoiding filesystem component-length ambiguity.
+     */
+    public function staleContainerMutationJournalArchiveFilename(
+        string $managedFilename,
+        int $stateId,
+    ): string {
+        BlueGreenProxyConfiguration::assertManagedFilename($managedFilename);
+        if ($stateId < 1) {
+            throw new InvalidArgumentException('The stale container-mutation journal state ID must be positive.');
+        }
+
+        return sprintf(
+            '.blue-green-stale-container-mutation-%s.state-%d.journal',
+            hash('sha256', $managedFilename),
+            $stateId,
+        );
+    }
+
+    /**
+     * Inspect exactly one journal that cannot be replayed after a reboot. This
+     * intentionally does not use lockedCommandPrefix(): that prefix repairs
+     * the journal, which is precisely what this narrowly scoped escape hatch
+     * must never do.
+     */
+    public function inspectStaleContainerMutationJournalCommandFor(
+        string $proxyPath,
+        string $managedFilename,
+        string $applicationUuid,
+        int $destinationId,
+        int $stateId,
+        string $expectedCurrentBootId,
+    ): string {
+        $this->assertStaleContainerMutationJournalScope(
+            $managedFilename,
+            $applicationUuid,
+            $destinationId,
+            $stateId,
+            $expectedCurrentBootId,
+        );
+
+        return $this->staleContainerMutationJournalCommandFor(
+            $proxyPath,
+            $managedFilename,
+            $applicationUuid,
+            $destinationId,
+            $stateId,
+            $expectedCurrentBootId,
+        );
+    }
+
+    /**
+     * Quarantine, rather than remove or replay, a journal already proven to
+     * describe a pristine first-adoption route from an earlier host boot.
+     */
+    public function quarantineStaleContainerMutationJournalCommandFor(
+        string $proxyPath,
+        string $managedFilename,
+        string $applicationUuid,
+        int $destinationId,
+        int $stateId,
+        string $expectedCurrentBootId,
+        string $expectedJournalSha256,
+    ): string {
+        $this->assertStaleContainerMutationJournalScope(
+            $managedFilename,
+            $applicationUuid,
+            $destinationId,
+            $stateId,
+            $expectedCurrentBootId,
+        );
+        $this->assertSha256($expectedJournalSha256, 'expected stale container-mutation journal');
+
+        return $this->staleContainerMutationJournalCommandFor(
+            $proxyPath,
+            $managedFilename,
+            $applicationUuid,
+            $destinationId,
+            $stateId,
+            $expectedCurrentBootId,
+            $expectedJournalSha256,
+        );
+    }
+
     /** @return list<string> */
-    public function exclusiveManagedFileLockCommands(string $proxyPath, string $managedFilename): array
-    {
+    public function exclusiveManagedFileLockCommands(
+        string $proxyPath,
+        string $managedFilename,
+        ?int $waitSeconds = null,
+    ): array {
+        if ($waitSeconds !== null && ($waitSeconds < 1 || $waitSeconds > 300)) {
+            throw new InvalidArgumentException('The managed-file lock wait must be between 1 and 300 seconds.');
+        }
         $stateDirectory = $this->stateDirectory($proxyPath);
         $lockPath = $this->managedLockPath($proxyPath, $managedFilename);
         $safeLockPath = escapeshellarg($lockPath);
@@ -195,7 +293,9 @@ class WriteBlueGreenProxyConfiguration
             'command -v flock >/dev/null 2>&1',
             'if [ -e '.$safeLockPath.' ] || [ -L '.$safeLockPath.' ]; then test -f '.$safeLockPath.'; test ! -L '.$safeLockPath.'; fi',
             'exec 9>'.$safeLockPath,
-            'flock -x 9',
+            $waitSeconds === null
+                ? 'flock -x 9'
+                : 'flock -x -w '.escapeshellarg((string) $waitSeconds).' 9',
         ];
     }
 
@@ -1021,6 +1121,321 @@ class WriteBlueGreenProxyConfiguration
             ...$this->repairPendingMutationJournalCommands($proxyPath, $managedFilename),
             ...$this->repairPendingContainerMutationJournalCommands($proxyPath, $managedFilename),
         ];
+    }
+
+    private function staleContainerMutationJournalCommandFor(
+        string $proxyPath,
+        string $managedFilename,
+        string $applicationUuid,
+        int $destinationId,
+        int $stateId,
+        string $expectedCurrentBootId,
+        ?string $expectedJournalSha256 = null,
+    ): string {
+        $stateDirectory = $this->stateDirectory($proxyPath);
+        $dynamicDirectory = $this->dynamicDirectory($proxyPath);
+        $activePath = $this->managedPath($proxyPath, $managedFilename);
+        $statePath = $this->statePath($proxyPath, $managedFilename);
+        $mutationJournalPath = $this->mutationJournalPath($proxyPath, $managedFilename);
+        $journalPath = $this->containerMutationJournalPath($proxyPath, $managedFilename);
+        $archiveFilename = $this->staleContainerMutationJournalArchiveFilename($managedFilename, $stateId);
+        $archivePath = $stateDirectory.'/'.$archiveFilename;
+        $manifestPath = $archivePath.'.manifest';
+        $archivePrefix = '.blue-green-stale-container-mutation-'.hash('sha256', $managedFilename).'.state-'.$stateId;
+        $quarantineCommands = $expectedJournalSha256 === null
+            ? []
+            : $this->quarantineStaleContainerMutationJournalCommands(
+                $expectedJournalSha256,
+                $expectedCurrentBootId,
+                $managedFilename,
+                $applicationUuid,
+                $destinationId,
+                $stateId,
+                $archiveFilename,
+            );
+
+        return implode("\n", [
+            'set -eu',
+            'umask 077',
+            ...DurableRemoteArtifact::shellFunctions(),
+            'test "$(id -u)" = 0',
+            'mkdir -p -- '.escapeshellarg($dynamicDirectory),
+            ...$this->exclusiveManagedFileLockCommands(
+                $proxyPath,
+                $managedFilename,
+                self::STALE_CONTAINER_MUTATION_JOURNAL_ROUTE_LOCK_WAIT_SECONDS,
+            ),
+            'container_journal_state_directory='.escapeshellarg($stateDirectory),
+            'container_journal_active_path='.escapeshellarg($activePath),
+            'container_journal_state_path='.escapeshellarg($statePath),
+            'container_journal_mutation_path='.escapeshellarg($mutationJournalPath),
+            'container_journal_path='.escapeshellarg($journalPath),
+            'container_journal_archive_path='.escapeshellarg($archivePath),
+            'container_journal_manifest_path='.escapeshellarg($manifestPath),
+            'container_journal_archive_prefix='.escapeshellarg($archivePrefix),
+            'durable_remote_assert_owned_directory "$container_journal_state_directory"',
+            'durable_remote_assert_owned_directory '.escapeshellarg($dynamicDirectory),
+            $this->bootIdentityAssertionCommand(escapeshellarg($expectedCurrentBootId)),
+            ...$this->assertNoUnexpectedStaleContainerMutationArchivesCommands(),
+            'container_journal_present=false',
+            'container_journal_archive_present=false',
+            'container_journal_manifest_present=false',
+            'if [ -e "$container_journal_path" ] || [ -L "$container_journal_path" ]; then container_journal_present=true; fi',
+            'if [ -e "$container_journal_archive_path" ] || [ -L "$container_journal_archive_path" ]; then container_journal_archive_present=true; fi',
+            'if [ -e "$container_journal_manifest_path" ] || [ -L "$container_journal_manifest_path" ]; then container_journal_manifest_present=true; fi',
+            'if [ "$container_journal_present" = true ]; then',
+            '  test "$container_journal_archive_present" = false',
+            '  container_journal_source="$container_journal_path"',
+            '  container_journal_status=pending',
+            'elif [ "$container_journal_archive_present" = true ] && [ "$container_journal_manifest_present" = true ]; then',
+            '  container_journal_source="$container_journal_archive_path"',
+            '  container_journal_status=archived',
+            'else',
+            '  exit 1',
+            'fi',
+            ...$this->validateStaleContainerMutationJournalCommands(
+                $managedFilename,
+                $applicationUuid,
+                $destinationId,
+                $expectedCurrentBootId,
+            ),
+            'if [ "$container_journal_manifest_present" = true ]; then',
+            ...$this->indent($this->validateStaleContainerMutationJournalManifestCommands(
+                $managedFilename,
+                $applicationUuid,
+                $destinationId,
+                $stateId,
+                $archiveFilename,
+            )),
+            'fi',
+            ...$quarantineCommands,
+            ...$this->discardStaleContainerMutationJournalValidationCommands(),
+            'printf \'%s|%s|%s|%s\' '.escapeshellarg(self::STALE_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX).' "$container_journal_status" "$container_journal_checksum" '.escapeshellarg($archiveFilename),
+        ]);
+    }
+
+    /** @return list<string> */
+    private function assertNoUnexpectedStaleContainerMutationArchivesCommands(): array
+    {
+        return [
+            'for container_journal_archive_candidate in "$container_journal_state_directory"/"$container_journal_archive_prefix"*; do',
+            '  if [ ! -e "$container_journal_archive_candidate" ] && [ ! -L "$container_journal_archive_candidate" ]; then continue; fi',
+            '  test "$container_journal_archive_candidate" = "$container_journal_archive_path" || test "$container_journal_archive_candidate" = "$container_journal_manifest_path" || exit 1',
+            'done',
+        ];
+    }
+
+    /** @return list<string> */
+    private function validateStaleContainerMutationJournalCommands(
+        string $managedFilename,
+        string $applicationUuid,
+        int $destinationId,
+        string $expectedCurrentBootId,
+    ): array {
+        $emptyChecksum = hash('sha256', '');
+        $replacementPattern = $this->staleContainerMutationReplacementStatePattern(
+            $managedFilename,
+            $applicationUuid,
+            $destinationId,
+        );
+
+        return [
+            'test ! -e "$container_journal_active_path"',
+            'test ! -L "$container_journal_active_path"',
+            'test ! -e "$container_journal_state_path"',
+            'test ! -L "$container_journal_state_path"',
+            'test ! -e "$container_journal_mutation_path"',
+            'test ! -L "$container_journal_mutation_path"',
+            'durable_remote_assert_owned_regular "$container_journal_source"',
+            'test "$(durable_remote_owner_uid "$container_journal_source")" = 0',
+            'test "$(durable_remote_permissions "$container_journal_source")" = 600',
+            'container_journal_line_count=$(wc -l < "$container_journal_source")',
+            'test "$container_journal_line_count" = 13',
+            'exec 5< "$container_journal_source"',
+            'IFS= read -r container_journal_magic <&5',
+            'IFS= read -r container_journal_filename <&5',
+            'IFS= read -r container_journal_expected_boot_id <&5',
+            'IFS= read -r container_journal_expected_state <&5',
+            'IFS= read -r container_journal_expected_state_checksum <&5',
+            'IFS= read -r container_journal_replacement_state <&5',
+            'IFS= read -r container_journal_replacement_state_checksum <&5',
+            'IFS= read -r container_journal_managed_file_state <&5',
+            'IFS= read -r container_journal_managed_checksum <&5',
+            'IFS= read -r container_journal_mutation_checksum <&5',
+            'IFS= read -r container_journal_completion_checksum <&5',
+            'IFS= read -r container_journal_mutation <&5',
+            'IFS= read -r container_journal_completion <&5',
+            'exec 5<&-',
+            'test "$container_journal_magic" = '.escapeshellarg(self::CONTAINER_MUTATION_JOURNAL_MAGIC),
+            'test "$container_journal_filename" = '.escapeshellarg($managedFilename),
+            $this->lowercaseUuidAssertionCommand('$container_journal_expected_boot_id'),
+            'test "$container_journal_expected_boot_id" != '.escapeshellarg($expectedCurrentBootId),
+            'test "$container_journal_expected_state" = absent',
+            'test "$container_journal_expected_state_checksum" = '.escapeshellarg($emptyChecksum),
+            'test "$container_journal_managed_file_state" = missing',
+            'test "$container_journal_managed_checksum" = '.escapeshellarg($emptyChecksum),
+            'for container_journal_checksum_value in "$container_journal_expected_state_checksum" "$container_journal_replacement_state_checksum" "$container_journal_managed_checksum" "$container_journal_mutation_checksum" "$container_journal_completion_checksum"; do',
+            '  case "$container_journal_checksum_value" in *[!0-9a-f]*|\'\') exit 1 ;; esac',
+            '  test "${#container_journal_checksum_value}" -eq 64',
+            'done',
+            'container_journal_replacement_decoded=$(mktemp "$container_journal_state_directory/.blue-green-stale-container-replacement.XXXXXX")',
+            'container_journal_mutation_decoded=$(mktemp "$container_journal_state_directory/.blue-green-stale-container-mutation.XXXXXX")',
+            'container_journal_completion_decoded=$(mktemp "$container_journal_state_directory/.blue-green-stale-container-completion.XXXXXX")',
+            'trap \'rm -f -- "${container_journal_replacement_decoded:-}" "${container_journal_mutation_decoded:-}" "${container_journal_completion_decoded:-}" "${container_journal_manifest_stage:-}"\' 0 HUP INT TERM',
+            'printf %s "$container_journal_replacement_state" | base64 -d > "$container_journal_replacement_decoded"',
+            'printf %s "$container_journal_mutation" | base64 -d > "$container_journal_mutation_decoded"',
+            'printf %s "$container_journal_completion" | base64 -d > "$container_journal_completion_decoded"',
+            'container_journal_actual_checksum=$(sha256sum "$container_journal_replacement_decoded")',
+            'test "${container_journal_actual_checksum%% *}" = "$container_journal_replacement_state_checksum"',
+            'container_journal_actual_checksum=$(sha256sum "$container_journal_mutation_decoded")',
+            'test "${container_journal_actual_checksum%% *}" = "$container_journal_mutation_checksum"',
+            'container_journal_actual_checksum=$(sha256sum "$container_journal_completion_decoded")',
+            'test "${container_journal_actual_checksum%% *}" = "$container_journal_completion_checksum"',
+            'test "$(head -n 1 "$container_journal_mutation_decoded")" = \'set -eu\'',
+            'test "$(head -n 1 "$container_journal_completion_decoded")" = \'set -eu\'',
+            'LC_ALL=C grep -Eq '.escapeshellarg($replacementPattern).' "$container_journal_replacement_decoded"',
+            'container_journal_checksum=$(sha256sum "$container_journal_source")',
+            'container_journal_checksum=${container_journal_checksum%% *}',
+            'case "$container_journal_checksum" in *[!0-9a-f]*|\'\') exit 1 ;; esac',
+            'test "${#container_journal_checksum}" -eq 64',
+        ];
+    }
+
+    /** @return list<string> */
+    private function validateStaleContainerMutationJournalManifestCommands(
+        string $managedFilename,
+        string $applicationUuid,
+        int $destinationId,
+        int $stateId,
+        string $archiveFilename,
+    ): array {
+        return [
+            'durable_remote_assert_owned_regular "$container_journal_manifest_path"',
+            'test "$(durable_remote_owner_uid "$container_journal_manifest_path")" = 0',
+            'test "$(durable_remote_permissions "$container_journal_manifest_path")" = 600',
+            'container_journal_manifest_line_count=$(wc -l < "$container_journal_manifest_path")',
+            'test "$container_journal_manifest_line_count" = 9',
+            'exec 6< "$container_journal_manifest_path"',
+            'IFS= read -r container_journal_manifest_magic <&6',
+            'IFS= read -r container_journal_manifest_filename <&6',
+            'IFS= read -r container_journal_manifest_state_id <&6',
+            'IFS= read -r container_journal_manifest_application_uuid <&6',
+            'IFS= read -r container_journal_manifest_destination_id <&6',
+            'IFS= read -r container_journal_manifest_checksum <&6',
+            'IFS= read -r container_journal_manifest_expected_boot_id <&6',
+            'IFS= read -r container_journal_manifest_archive_boot_id <&6',
+            'IFS= read -r container_journal_manifest_archive_filename <&6',
+            'exec 6<&-',
+            'test "$container_journal_manifest_magic" = '.escapeshellarg(self::STALE_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC),
+            'test "$container_journal_manifest_filename" = '.escapeshellarg($managedFilename),
+            'test "$container_journal_manifest_state_id" = '.escapeshellarg((string) $stateId),
+            'test "$container_journal_manifest_application_uuid" = '.escapeshellarg($applicationUuid),
+            'test "$container_journal_manifest_destination_id" = '.escapeshellarg((string) $destinationId),
+            'test "$container_journal_manifest_checksum" = "$container_journal_checksum"',
+            'test "$container_journal_manifest_expected_boot_id" = "$container_journal_expected_boot_id"',
+            $this->lowercaseUuidAssertionCommand('$container_journal_manifest_archive_boot_id'),
+            'test "$container_journal_manifest_archive_filename" = '.escapeshellarg($archiveFilename),
+        ];
+    }
+
+    /** @return list<string> */
+    private function quarantineStaleContainerMutationJournalCommands(
+        string $expectedJournalSha256,
+        string $expectedCurrentBootId,
+        string $managedFilename,
+        string $applicationUuid,
+        int $destinationId,
+        int $stateId,
+        string $archiveFilename,
+    ): array {
+        return [
+            'test "$container_journal_checksum" = '.escapeshellarg($expectedJournalSha256),
+            'if [ "$container_journal_status" = pending ]; then',
+            $this->bootIdentityAssertionCommand(escapeshellarg($expectedCurrentBootId)),
+            '  if [ "$container_journal_manifest_present" = false ]; then',
+            '    container_journal_manifest_stage=$(mktemp "$container_journal_state_directory/.blue-green-stale-container-manifest.XXXXXX")',
+            '    {',
+            '      printf \'%s\\n\' '.escapeshellarg(self::STALE_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC),
+            '      printf \'%s\\n\' '.escapeshellarg($managedFilename),
+            '      printf \'%s\\n\' '.escapeshellarg((string) $stateId),
+            '      printf \'%s\\n\' '.escapeshellarg($applicationUuid),
+            '      printf \'%s\\n\' '.escapeshellarg((string) $destinationId),
+            '      printf \'%s\\n\' "$container_journal_checksum"',
+            '      printf \'%s\\n\' "$container_journal_expected_boot_id"',
+            '      printf \'%s\\n\' '.escapeshellarg($expectedCurrentBootId),
+            '      printf \'%s\\n\' '.escapeshellarg($archiveFilename),
+            '    } > "$container_journal_manifest_stage"',
+            '    chmod 600 "$container_journal_manifest_stage"',
+            '    durable_remote_replace "$container_journal_manifest_stage" "$container_journal_manifest_path" "$container_journal_state_directory"',
+            '    container_journal_manifest_present=true',
+            '  fi',
+            $this->bootIdentityAssertionCommand(escapeshellarg($expectedCurrentBootId)),
+            '  container_journal_final_checksum=$(sha256sum "$container_journal_path")',
+            '  test "${container_journal_final_checksum%% *}" = "$container_journal_checksum"',
+            '  durable_remote_replace "$container_journal_path" "$container_journal_archive_path" "$container_journal_state_directory"',
+            '  test ! -e "$container_journal_path"',
+            '  test ! -L "$container_journal_path"',
+            '  durable_remote_assert_owned_regular "$container_journal_archive_path"',
+            '  test "$(durable_remote_owner_uid "$container_journal_archive_path")" = 0',
+            '  test "$(durable_remote_permissions "$container_journal_archive_path")" = 600',
+            '  container_journal_final_checksum=$(sha256sum "$container_journal_archive_path")',
+            '  test "${container_journal_final_checksum%% *}" = "$container_journal_checksum"',
+            $this->bootIdentityAssertionCommand(escapeshellarg($expectedCurrentBootId)),
+            '  container_journal_status=archived',
+            'fi',
+        ];
+    }
+
+    /** @return list<string> */
+    private function discardStaleContainerMutationJournalValidationCommands(): array
+    {
+        return [
+            'rm -f -- "${container_journal_replacement_decoded:-}" "${container_journal_mutation_decoded:-}" "${container_journal_completion_decoded:-}" "${container_journal_manifest_stage:-}"',
+            'trap - 0 HUP INT TERM',
+        ];
+    }
+
+    private function staleContainerMutationReplacementStatePattern(
+        string $managedFilename,
+        string $applicationUuid,
+        int $destinationId,
+    ): string {
+        return sprintf(
+            '^\\{"magic":"%s","managed_filename":"%s","application_uuid":"%s","destination_id":%d,"operation_id":"[A-Za-z0-9][A-Za-z0-9_-]{0,79}","mutation_sequence":1,"destination_fence_epoch":0,"routing_revision":0,"managed_sha256":null,"active_color":null,"active_deployment_uuid":null,"active_container_name":null,"active_container_id":null,"application_routing_config_digest":"[a-f0-9]{64}","destination_topology_digest":"[a-f0-9]{64}"\\}$',
+            preg_quote(BlueGreenProxyState::MAGIC, '/'),
+            preg_quote($managedFilename, '/'),
+            preg_quote($applicationUuid, '/'),
+            $destinationId,
+        );
+    }
+
+    private function lowercaseUuidAssertionCommand(string $shellValue): string
+    {
+        return 'case "'.$shellValue.'" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; *) exit 1 ;; esac';
+    }
+
+    private function assertStaleContainerMutationJournalScope(
+        string $managedFilename,
+        string $applicationUuid,
+        int $destinationId,
+        int $stateId,
+        string $expectedCurrentBootId,
+    ): void {
+        BlueGreenProxyConfiguration::assertManagedFilename($managedFilename);
+        if (preg_match('/^[A-Za-z0-9][A-Za-z0-9_-]*$/D', $applicationUuid) !== 1) {
+            throw new InvalidArgumentException('The stale container-mutation journal application UUID is invalid.');
+        }
+        if ($destinationId < 0 || $stateId < 1) {
+            throw new InvalidArgumentException('The stale container-mutation journal destination or state ID is invalid.');
+        }
+        $this->assertBootId($expectedCurrentBootId);
+    }
+
+    private function assertSha256(string $checksum, string $role): void
+    {
+        if (preg_match('/^[a-f0-9]{64}$/D', $checksum) !== 1) {
+            throw new InvalidArgumentException("The {$role} checksum must be a lowercase SHA-256 value.");
+        }
     }
 
     /** @return list<string> */
