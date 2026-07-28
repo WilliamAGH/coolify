@@ -251,6 +251,8 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
 
     private bool $activationOnly = false;
 
+    private ?string $preparedArtifactDigest = null;
+
     private bool $handoffScheduled = false;
 
     private bool $preserveBlueGreenRecovery = false;
@@ -2452,10 +2454,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             if ($this->blueGreenLifecycle?->isEnabled()) {
                 $this->blueGreenLifecycle->promote(
                     prepareCandidateStart: function (): void {
-                        if ($this->use_build_server) {
-                            $this->write_deployment_configurations();
-                            $this->server = $this->mainServer;
-                        }
+                        $this->switchToActivationServer();
                     },
                     startCandidate: function (): array {
                         $this->checkForCancellation();
@@ -2486,10 +2485,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
                 );
                 $this->application_deployment_queue->addLogEntry('Rolling update completed.');
             } else {
-                if ($this->use_build_server) {
-                    $this->write_deployment_configurations();
-                    $this->server = $this->mainServer;
-                }
+                $this->switchToActivationServer();
                 if (count($this->application->ports_mappings_array) > 0 || (bool) $this->application->settings->is_consistent_container_name_enabled || str($this->application->settings->custom_internal_name)->isNotEmpty() || $this->pull_request_id !== 0 || str($this->application->custom_docker_run_options)->contains('--ip') || str($this->application->custom_docker_run_options)->contains('--ip6')) {
                     $this->application_deployment_queue->addLogEntry('----------------------------------------');
                     if (count($this->application->ports_mappings_array) > 0) {
@@ -2522,6 +2518,64 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         } catch (Exception $e) {
             throw new DeploymentException('Rolling update failed ('.get_class($e).'): '.$e->getMessage(), $e->getCode(), $e);
         }
+    }
+
+    /**
+     * Hand the deployment over to the server that will run the container.
+     *
+     * A build-server deployment has been operating on the build server up to
+     * this point, so the runtime configuration has to be written there before
+     * the runtime image is delivered to the activation target.
+     */
+    private function switchToActivationServer(): void
+    {
+        if (! $this->use_build_server) {
+            return;
+        }
+        $this->write_deployment_configurations();
+        $this->server = $this->mainServer;
+        $this->deliverPreparedImageToActivationServer();
+    }
+
+    /**
+     * Build-server deployments build and push the runtime image on the build
+     * server, so the activation server holds no copy of it. Activation starts
+     * the candidate with `--pull never` so it can only ever run the exact
+     * attested artifact, which means the image has to be pulled here first and
+     * proven identical to what preparation attested.
+     *
+     * Compose deployments deliver their own immutable per-service manifest in
+     * transferPreparedBlueGreenComposeImagesToMainServer(), and `dockerimage`
+     * deployments never build an image to deliver.
+     */
+    private function deliverPreparedImageToActivationServer(): void
+    {
+        if (! $this->activationOnly) {
+            return;
+        }
+        if (in_array($this->application->build_pack, ['dockercompose', 'dockerimage'], true)) {
+            return;
+        }
+        if (! isset($this->production_image_name) || $this->production_image_name === '') {
+            throw new DeploymentException('Prepared build-server activation has no runtime image identity to deliver.');
+        }
+        if (blank($this->application->docker_registry_image_name)
+            || ! ValidationPatterns::isValidDockerImageName($this->application->docker_registry_image_name)) {
+            throw new DeploymentException('Prepared build-server activation requires a valid Docker registry image name to deliver its runtime image to the activation server.');
+        }
+        if ($this->preparedArtifactDigest === null) {
+            throw new DeploymentException('Prepared build-server activation has no attested artifact digest to verify its delivered runtime image against.');
+        }
+        $this->application_deployment_queue->addLogEntry("Delivering the prepared image to the activation server ({$this->production_image_name}).");
+        $safeImage = escapeshellarg($this->production_image_name);
+        $inspectImageId = 'docker image inspect --format='.escapeshellarg('{{.Id}}').' '.$safeImage;
+        $this->execute_remote_command([
+            "{$inspectImageId} >/dev/null 2>&1 || docker pull {$safeImage}",
+            'hidden' => true,
+        ], [
+            'image_id=$('.$inspectImageId.'); test "$image_id" = '.escapeshellarg($this->preparedArtifactDigest),
+            'hidden' => true,
+        ]);
     }
 
     protected function activate_prepared_runtime(): void
@@ -3017,6 +3071,9 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
 
         $this->build_image_name = (string) ($artifact['build_image_name'] ?? '');
         $this->production_image_name = (string) ($artifact['production_image_name'] ?? '');
+        $this->preparedArtifactDigest = is_string($artifact['artifact_digest'] ?? null)
+            ? $artifact['artifact_digest']
+            : null;
         $this->dockerImage = is_string($artifact['docker_image'] ?? null) ? $artifact['docker_image'] : null;
         $this->dockerImageTag = is_string($artifact['docker_image_tag'] ?? null) ? $artifact['docker_image_tag'] : null;
         $this->docker_compose_location = (string) ($artifact['docker_compose_location'] ?? '/docker-compose.yaml');
@@ -3121,10 +3178,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
     private function activatePreparedDeployment(): void
     {
         if ($this->application->build_pack === 'dockercompose') {
-            if ($this->use_build_server) {
-                $this->write_deployment_configurations();
-                $this->server = $this->mainServer;
-            }
+            $this->switchToActivationServer();
             $this->activate_docker_compose_runtime();
 
             return;
