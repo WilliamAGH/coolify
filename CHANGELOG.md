@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [unreleased]
+
+### 🐛 Bug Fixes
+
+- *(blue-green)* Allow proven stopped opt-out
+
+### 📚 Documentation
+
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.36-fork
+
 ## [4.13.35-fork] - 2026-07-28
 
 ### 🐛 Bug Fixes
