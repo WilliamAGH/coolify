@@ -2,6 +2,7 @@
 
 namespace App\Actions\Application\BlueGreen;
 
+use App\Actions\Proxy\ResolveCanonicalApplicationRoutingLabels;
 use App\Models\Application;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
@@ -78,7 +79,11 @@ class CaptureBlueGreenLegacyRouting
             throw new RuntimeException('The immutable legacy Traefik labels do not exactly match the recognized current canonical routing inventory.');
         }
 
-        [$routers, $services] = $this->routingInventory($actualLabels, $ports);
+        [$routers, $services] = $this->routingInventory(
+            $actualLabels,
+            $ports,
+            (string) $destination->network,
+        );
         $addresses = $this->containerAddresses($networks);
         $encodedLabels = json_encode($actualLabels, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
 
@@ -107,11 +112,7 @@ class CaptureBlueGreenLegacyRouting
         Application $application,
         StandaloneDocker $destination,
     ): array {
-        $applicationForLabels = clone $application;
-        $applicationForLabels->setRelation('destination', $destination);
-        $labels = $application->build_pack === 'dockercompose'
-            ? $application->blueGreenRoutingLabels()
-            : generateLabelsApplication($applicationForLabels);
+        $labels = ResolveCanonicalApplicationRoutingLabels::run($application, $destination);
 
         return $this->labelMap($labels);
     }
@@ -166,8 +167,11 @@ class CaptureBlueGreenLegacyRouting
      * @param  array<string, string>  $labels
      * @return array{list<BlueGreenLegacyRouter>, list<BlueGreenLegacyService>}
      */
-    private function routingInventory(array $labels, array $expectedPorts): array
-    {
+    private function routingInventory(
+        array $labels,
+        array $expectedPorts,
+        string $expectedNetwork,
+    ): array {
         if (($labels['traefik.enable'] ?? null) !== 'true') {
             throw new RuntimeException('The immutable legacy routing labels do not enable the Traefik Docker provider.');
         }
@@ -177,7 +181,14 @@ class CaptureBlueGreenLegacyRouting
             if ($key === 'traefik.enable') {
                 continue;
             }
-            if (preg_match('/^traefik\.http\.routers\.([A-Za-z0-9_-]+)\.(rule|entryPoints|service|middlewares|tls|tls\.certresolver)$/D', $key, $matches) === 1) {
+            if ($key === 'traefik.docker.network') {
+                if (! hash_equals($expectedNetwork, $value)) {
+                    throw new RuntimeException('The immutable legacy Traefik network does not match the deployment destination.');
+                }
+
+                continue;
+            }
+            if (preg_match('/^traefik\.http\.routers\.([A-Za-z0-9_-]+)\.(rule|entryPoints|service|middlewares|priority|tls|tls\.certresolver)$/D', $key, $matches) === 1) {
                 $routerProperties[$matches[1]][$matches[2]] = $value;
 
                 continue;
@@ -226,13 +237,21 @@ class CaptureBlueGreenLegacyRouting
             if (! isset($servicePorts[$serviceName])) {
                 throw new RuntimeException("The immutable legacy Traefik router {$name} references an unknown service.");
             }
+            $priority = strlen($properties['rule']);
+            if (isset($properties['priority'])) {
+                $validatedPriority = filter_var($properties['priority'], FILTER_VALIDATE_INT);
+                if ($validatedPriority === false || $validatedPriority < 1) {
+                    throw new RuntimeException("The immutable legacy Traefik router {$name} has an invalid priority.");
+                }
+                $priority = $validatedPriority;
+            }
             $routers[] = new BlueGreenLegacyRouter(
                 name: $name,
                 rule: $properties['rule'],
                 entryPoints: $entryPoints,
                 serviceName: $serviceName,
                 middlewares: $middlewares,
-                priority: strlen($properties['rule']),
+                priority: $priority,
                 tls: $tls,
                 certificateResolver: $certificateResolver,
             );

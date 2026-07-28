@@ -26,22 +26,17 @@ class CompileBlueGreenProxyConfiguration
             throw new InvalidArgumentException('Blue/green routing compilation requires a Traefik destination.');
         }
         $applicationUuid = (string) $application->uuid;
-        $applicationForLabels = clone $application;
-        $applicationForLabels->setRelation('destination', $destination);
-
-        $generatedLabels = $application->build_pack === 'dockercompose'
-            ? $application->blueGreenRoutingLabels()
-            : generateLabelsApplication($applicationForLabels);
 
         return $this->compileGeneratedLabels(
             applicationUuid: $applicationUuid,
-            generatedLabels: $generatedLabels,
+            generatedLabels: ResolveCanonicalApplicationRoutingLabels::run($application, $destination),
             target: $target,
+            expectedNetwork: (string) $destination->network,
         );
     }
 
     /**
-     * Compiles the output of generateLabelsApplication(). Production callers must use handle().
+     * Compiles an already-resolved canonical routing-label inventory. Production callers must use handle().
      *
      * @param  array<array-key, mixed>  $generatedLabels
      */
@@ -49,8 +44,9 @@ class CompileBlueGreenProxyConfiguration
         string $applicationUuid,
         array $generatedLabels,
         BlueGreenRoutingTarget $target,
+        ?string $expectedNetwork = null,
     ): BlueGreenProxyConfiguration {
-        $parsed = $this->parseGeneratedLabels($generatedLabels);
+        $parsed = $this->parseGeneratedLabels($generatedLabels, $expectedNetwork);
         if ($parsed['traefikEnabled'] !== true) {
             throw new InvalidArgumentException('Canonical application labels must enable Traefik.');
         }
@@ -118,7 +114,14 @@ class CompileBlueGreenProxyConfiguration
                         $target->probeColor,
                         $backendPort,
                     );
-                unset($probeRouter['priority']);
+                if (isset($properties['priority'])) {
+                    $probeRouter['priority'] = $this->higherRoutingPriority(
+                        (int) $properties['priority'],
+                        $routerName,
+                    );
+                } else {
+                    unset($probeRouter['priority']);
+                }
                 $probeRouter['middlewares'] = array_values(array_merge(
                     [$probeMiddlewareName],
                     $router['middlewares'] ?? [],
@@ -332,7 +335,7 @@ class CompileBlueGreenProxyConfiguration
      *     servicePorts: array<string, int>
      * }
      */
-    private function parseGeneratedLabels(array $labels): array
+    private function parseGeneratedLabels(array $labels, ?string $expectedNetwork): array
     {
         $traefikEnabled = false;
         $seen = [];
@@ -361,7 +364,20 @@ class CompileBlueGreenProxyConfiguration
 
                 continue;
             }
-            if (preg_match('/^traefik\.http\.routers\.([A-Za-z0-9_-]+)\.(rule|entryPoints|service|middlewares|tls|tls\.certresolver)$/D', $key, $matches) === 1) {
+            if ($key === 'traefik.docker.network') {
+                if ($expectedNetwork === null || ! hash_equals($expectedNetwork, $value)) {
+                    throw new InvalidArgumentException('Canonical application routing network does not match the deployment destination.');
+                }
+
+                continue;
+            }
+            if (preg_match('/^traefik\.http\.routers\.([A-Za-z0-9_-]+)\.(rule|entryPoints|service|middlewares|priority|tls|tls\.certresolver)$/D', $key, $matches) === 1) {
+                if ($matches[2] === 'priority') {
+                    $priority = filter_var($value, FILTER_VALIDATE_INT);
+                    if ($priority === false || $priority < 1) {
+                        throw new InvalidArgumentException("Generated Traefik router {$matches[1]} has an invalid priority.");
+                    }
+                }
                 $routers[$matches[1]][$matches[2]] = $value;
 
                 continue;
@@ -451,7 +467,7 @@ class CompileBlueGreenProxyConfiguration
         array $middlewareNames,
         BlueGreenRoutingMode $mode,
     ): array {
-        $allowed = ['rule', 'entryPoints', 'service', 'middlewares', 'tls', 'tls.certresolver'];
+        $allowed = ['rule', 'entryPoints', 'service', 'middlewares', 'priority', 'tls', 'tls.certresolver'];
         $unknown = array_diff(array_keys($properties), $allowed);
         if ($unknown !== []) {
             throw new InvalidArgumentException("Generated Traefik router {$routerName} has unsupported properties.");
@@ -472,8 +488,13 @@ class CompileBlueGreenProxyConfiguration
             'entryPoints' => $entryPoints,
             'service' => $serviceName,
         ];
+        $priority = isset($properties['priority'])
+            ? (int) $properties['priority']
+            : strlen($properties['rule']);
         if (in_array($mode, [BlueGreenRoutingMode::LegacyAdoption, BlueGreenRoutingMode::LegacyRecoveryBridge], true)) {
-            $router['priority'] = strlen($properties['rule']) + 1;
+            $router['priority'] = $this->higherRoutingPriority($priority, $routerName);
+        } elseif (isset($properties['priority'])) {
+            $router['priority'] = $priority;
         }
         if (isset($properties['middlewares'])) {
             $router['middlewares'] = array_map(function (string $middlewareName) use ($routerName, $middlewareNames): string {
@@ -501,6 +522,15 @@ class CompileBlueGreenProxyConfiguration
         }
 
         return $router;
+    }
+
+    private function higherRoutingPriority(int $priority, string $routerName): int
+    {
+        if ($priority === PHP_INT_MAX) {
+            throw new InvalidArgumentException("Generated Traefik router {$routerName} priority cannot be raised safely.");
+        }
+
+        return $priority + 1;
     }
 
     /** @param array<string, string> $properties */
