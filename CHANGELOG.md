@@ -7,9 +7,11 @@ All notable changes to this project will be documented in this file.
 ### 🐛 Bug Fixes
 
 - *(deployment)* Pull missing images before unscoped compose attestation
+- *(blue-green)* Preserve canonical custom routing labels
 
 ### 📚 Documentation
 
+- Update changelog
 - Update changelog
 - Update changelog
 
