@@ -301,6 +301,38 @@ it('classifies an exact absent-route predecessor for attested mid-flight recover
         ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value);
 });
 
+it('keeps malformed absent-route predecessor provenance manual-only', function (string $mutation): void {
+    [
+        'previousState' => $previousState,
+        'scenario' => $scenario,
+    ] = absentRouteMidFlightInterventionScenario();
+    if ($mutation === 'null prior fence epoch') {
+        $scenario->state->update(['operation_previous_destination_fence_epoch' => null]);
+    } else {
+        $record = json_decode($previousState->serialize(), true, flags: JSON_THROW_ON_ERROR);
+        $record[$mutation === 'foreign application' ? 'application_uuid' : 'managed_filename'] =
+            $mutation === 'foreign application'
+                ? 'foreign-application'
+                : 'coolify-blue-green-foreign.yml';
+        $bytes = json_encode($record, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES)."\n";
+        $scenario->state->update([
+            'operation_previous_proxy_state' => $bytes,
+            'operation_previous_proxy_state_sha256' => hash('sha256', $bytes),
+        ]);
+    }
+
+    $result = RecoverBlueGreenIntervention::run(stateId: $scenario->state->id);
+
+    expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::LEGACY_MANUAL_ONLY)
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::INSPECTED)
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
+        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value);
+})->with([
+    'foreign application UUID' => 'foreign application',
+    'wrong managed filename' => 'wrong managed filename',
+    'null prior fence epoch' => 'null prior fence epoch',
+]);
+
 it('attests and reopens the exact prepared activation from an absent-route intervention', function (): void {
     BlueGreenProxyRollbackArtifactReader::shouldRun()->once()->andReturnNull();
     [

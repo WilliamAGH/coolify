@@ -828,9 +828,21 @@ final class RecoverBlueGreenIntervention
             $state->operation_previous_proxy_state,
             $state->operation_previous_proxy_state_sha256,
         );
+        $applicationUuid = $state->application()->value('uuid');
         if ($previousState === null
+            || ! is_string($applicationUuid)
+            || ! is_string($state->operation_rollback_managed_filename)
+            || ! is_string($state->destination_fence_operation_id)
+            || ! is_int($state->destination_fence_mutation_sequence)
+            || ! is_int($state->destination_fence_epoch)
+            || ! is_int($state->operation_previous_destination_fence_epoch)
+            || ! is_int($state->routing_revision)
+            || ! is_string($state->application_routing_config_digest)
+            || ! is_string($state->destination_topology_digest)
             || $previousState->managedSha256 !== null
             || $previousState->activeColor !== null
+            || $previousState->applicationUuid !== $applicationUuid
+            || $previousState->managedFilename !== $state->operation_rollback_managed_filename
             || $state->operation_previous_active_color !== null
             || $state->operation_previous_managed_file_sha256 !== null
             || $state->managed_file_sha256 !== null
