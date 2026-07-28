@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file.
 
 ### 🐛 Bug Fixes
 
+- *(blue-green)* Recover boot-stale container journals
+
+### 📚 Documentation
+
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.37-fork
+
+## [4.13.36-fork] - 2026-07-28
+
+### 🐛 Bug Fixes
+
 - *(blue-green)* Allow proven stopped opt-out
 
 ### 📚 Documentation
