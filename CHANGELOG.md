@@ -2,7 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
-## [unreleased]
+## [4.13.35-fork] - 2026-07-28
+
+### 🐛 Bug Fixes
+
+- *(blue-green)* Recover absent-route interventions
+- *(blue-green)* Reject foreign absent-route provenance
+
+### 📚 Documentation
+
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.35-fork
+
+## [4.13.34-fork] - 2026-07-28
 
 ### 🐛 Bug Fixes
 
