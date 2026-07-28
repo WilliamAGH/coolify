@@ -6,6 +6,21 @@ All notable changes to this project will be documented in this file.
 
 ### 🐛 Bug Fixes
 
+- *(deployment)* Deliver build-server images to the activation server
+- *(blue-green)* Recover failed first-adoption journals
+
+### 📚 Documentation
+
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.38-fork
+
+## [4.13.37-fork] - 2026-07-28
+
+### 🐛 Bug Fixes
+
 - *(blue-green)* Recover boot-stale container journals
 
 ### 📚 Documentation
