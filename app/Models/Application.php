@@ -1804,6 +1804,120 @@ class Application extends BaseModel
         $deactivation->delete();
     }
 
+    /**
+     * Consume the terminal proof left by a successful manual stop before
+     * disabling blue-green deployment.
+     *
+     * @param  Collection<int, ApplicationBlueGreenDeployment>  $states
+     * @param  Collection<int, ApplicationBlueGreenDeactivation>  $deactivations
+     */
+    public function consumeBlueGreenManualStopProofsForOptOut(
+        Collection $states,
+        Collection $deactivations,
+    ): void {
+        if ($states->isEmpty() && $deactivations->isEmpty()) {
+            return;
+        }
+        if ($this->trashed()) {
+            throw new BlueGreenAdmissionException('Blue-green deployment cannot be disabled after the application is soft-deleted.');
+        }
+        if ($deactivations->isEmpty()) {
+            throw new BlueGreenAdmissionException(
+                $this->blueGreenDeploymentOptOutBlockedReason()
+                    ?? 'Blue-green deployment cannot be disabled while durable state exists.',
+            );
+        }
+
+        $statesByDestination = $states->keyBy(
+            static fn (ApplicationBlueGreenDeployment $state): int => (int) $state->standalone_docker_id,
+        );
+        $deactivationsByDestination = $deactivations->keyBy(
+            static fn (ApplicationBlueGreenDeactivation $deactivation): int => (int) $deactivation->standalone_docker_id,
+        );
+        $configuredDestinationIds = $this->blueGreenConfiguredStandaloneDockerDestinationIds()
+            ->map(static fn (mixed $standaloneDockerId): int => (int) $standaloneDockerId)
+            ->sort()
+            ->values();
+        $stoppedDestinationIds = $statesByDestination->keys()
+            ->map(static fn (mixed $standaloneDockerId): int => (int) $standaloneDockerId)
+            ->sort()
+            ->values();
+        if ($statesByDestination->count() !== $states->count()
+            || $deactivationsByDestination->count() !== $deactivations->count()
+            || $configuredDestinationIds->all() !== $stoppedDestinationIds->all()
+            || $statesByDestination->keys()->diff($deactivationsByDestination->keys())->isNotEmpty()
+            || $deactivationsByDestination->keys()->diff($statesByDestination->keys())->isNotEmpty()) {
+            throw new BlueGreenAdmissionException('Blue-green deployment cannot be disabled because its manual-stop proof is incomplete.');
+        }
+
+        foreach ($deactivationsByDestination as $standaloneDockerId => $deactivation) {
+            try {
+                $deactivation->assertValid();
+            } catch (\LogicException $exception) {
+                throw new BlueGreenAdmissionException(
+                    'Blue-green deployment cannot be disabled because its manual-stop proof is malformed.',
+                    previous: $exception,
+                );
+            }
+            if ($deactivation->phase !== BlueGreenDeactivationPhase::STOPPED
+                || ! $deactivation->ownsApplicationLifecycle($this)
+                || $deactivation->intervention_phase !== null
+                || $deactivation->intervention_reason !== null) {
+                throw new BlueGreenAdmissionException('Blue-green deployment cannot be disabled until strict manual stop completes without intervention.');
+            }
+
+            $state = $statesByDestination->get($standaloneDockerId);
+            $hasUnclearedOperation = $state !== null
+                && collect(ApplicationBlueGreenDeployment::clearedOperationAttributes())
+                    ->contains(
+                        static fn (mixed $expected, string $attribute): bool => $state->{$attribute} !== $expected,
+                    );
+            if ($state !== null
+                && ($state->phase !== BlueGreenDeploymentPhase::STOPPED
+                    || (int) $state->supersession_generation !== (int) $deactivation->supersession_generation
+                    || $state->active_color !== null
+                    || $state->pending_color !== null
+                    || $state->blue_deployment_uuid !== null
+                    || $state->green_deployment_uuid !== null
+                    || $state->pending_deployment_uuid !== null
+                    || $state->legacy_container_name !== null
+                    || $state->operation_deployment_uuid !== null
+                    || $state->deactivation_operation_id !== null
+                    || $state->deactivation_started_at !== null
+                    || $state->destination_fence_operation_id !== $deactivation->operation_id
+                    || $state->destination_fence_mutation_sequence < 1
+                    || $state->managed_file_sha256 !== null
+                    || ! is_string($state->destination_topology_digest)
+                    || preg_match('/^[0-9a-f]{64}$/D', $state->destination_topology_digest) !== 1
+                    || ! is_string($state->application_routing_config_digest)
+                    || preg_match('/^[0-9a-f]{64}$/D', $state->application_routing_config_digest) !== 1
+                    || $state->intervention_phase !== null
+                    || $state->intervention_reason !== null
+                    || $hasUnclearedOperation)) {
+                throw new BlueGreenAdmissionException('Blue-green deployment cannot be disabled because its stopped state no longer matches the manual-stop proof.');
+            }
+
+            if (ApplicationDeploymentQueue::query()
+                ->where('application_id', $this->id)
+                ->where('destination_id', $standaloneDockerId)
+                ->whereIn('status', [
+                    ApplicationDeploymentStatus::QUEUED->value,
+                    ApplicationDeploymentStatus::IN_PROGRESS->value,
+                ])
+                ->lockForUpdate()
+                ->exists()) {
+                throw new BlueGreenAdmissionException('Blue-green deployment cannot be disabled while a deployment owns a stopped destination.');
+            }
+        }
+
+        foreach ($states as $state) {
+            $state->delete();
+        }
+        foreach ($deactivations as $deactivation) {
+            $deactivation->delete();
+        }
+    }
+
     private function hasBlueGreenDurableState(?int $standaloneDockerId = null): bool
     {
         $deploymentQuery = $this->blueGreenDeployments();

@@ -200,6 +200,33 @@ it('adopts and removes the exact legacy container through a fenced first manual 
         ->and($deactivation->phase)->toBe(BlueGreenDeactivationPhase::STOPPED);
 });
 
+it('consumes the exact fenced manual-stop proof when blue-green is disabled', function (): void {
+    $context = BlueGreenDeactivationScenario::context();
+    $application = $context['application'];
+    $destination = $context['destination'];
+    BlueGreenDeactivationScenario::routeLessState($application, $destination);
+    fakeManualBlueGreenStopRemoteSuccess();
+    Event::fake([ServiceStatusChanged::class]);
+
+    StopApplication::run($application, dockerCleanup: false);
+    $stoppedState = ApplicationBlueGreenDeployment::query()->sole();
+    $stoppedDeactivation = ApplicationBlueGreenDeactivation::query()->sole();
+
+    expect($stoppedState->phase)->toBe(BlueGreenDeploymentPhase::STOPPED)
+        ->and($stoppedState->destination_fence_operation_id)->toBe($stoppedDeactivation->operation_id)
+        ->and($stoppedState->destination_topology_digest)->not->toBeNull()
+        ->and($stoppedState->application_routing_config_digest)->not->toBeNull()
+        ->and($stoppedDeactivation->phase)->toBe(BlueGreenDeactivationPhase::STOPPED);
+
+    $setting = $application->settings()->firstOrFail();
+    $setting->is_blue_green_deployment_enabled = false;
+
+    expect($setting->save())->toBeTrue()
+        ->and($setting->fresh()->is_blue_green_deployment_enabled)->toBeFalse()
+        ->and(ApplicationBlueGreenDeployment::query()->doesntExist())->toBeTrue()
+        ->and(ApplicationBlueGreenDeactivation::query()->doesntExist())->toBeTrue();
+});
+
 it('records a typed remote invariant failure through manual stop and renders its durable intervention', function (): void {
     $context = BlueGreenDeactivationScenario::context();
     $application = $context['application'];

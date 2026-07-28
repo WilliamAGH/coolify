@@ -1,9 +1,14 @@
 <?php
 
+use App\Enums\ApplicationDeploymentStatus;
+use App\Enums\BlueGreenDeactivationPhase;
+use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\BlueGreenIneligibilityReason;
 use App\Enums\ProxyTypes;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeactivation;
+use App\Models\ApplicationBlueGreenDeployment;
+use App\Models\ApplicationDeploymentQueue;
 use App\Models\ApplicationSetting;
 use App\Models\Project;
 use App\Models\Server;
@@ -157,6 +162,161 @@ it('rejects quiet blue-green opt-out while durable state exists', function (): v
         ->toThrow(RuntimeException::class, 'cannot be disabled while durable state exists');
 
     expect($setting->fresh()->is_blue_green_deployment_enabled)->toBeTrue();
+});
+
+it('consumes proven terminal manual-stop state during quiet blue-green opt-out', function (): void {
+    $application = applicationSettingTopologyApplication();
+    $setting = $application->settings()->firstOrFail();
+    $setting->is_blue_green_deployment_enabled = true;
+    $setting->save();
+    $startedAt = now()->subMinute()->startOfSecond();
+    $operationId = str_repeat('b', 64);
+    $state = $application->blueGreenDeployments()->create([
+        'standalone_docker_id' => $application->destination_id,
+        'phase' => BlueGreenDeploymentPhase::STOPPED,
+        'supersession_generation' => 2,
+        'destination_fence_operation_id' => $operationId,
+        'destination_fence_mutation_sequence' => 1,
+        'destination_topology_digest' => str_repeat('1', 64),
+        'application_routing_config_digest' => str_repeat('2', 64),
+        'inactive_retirement_attempts' => 2,
+        'inactive_retirement_stopped_at' => $startedAt,
+    ]);
+    $deactivation = $application->blueGreenDeactivations()->create([
+        'standalone_docker_id' => $application->destination_id,
+        'operation_id' => $operationId,
+        'started_at' => $startedAt,
+        'queue_cutoff_id' => 0,
+        'supersession_generation' => 2,
+        'phase' => BlueGreenDeactivationPhase::STOPPED,
+        'completed_at' => $startedAt->copy()->addSecond(),
+    ]);
+    $setting->is_blue_green_deployment_enabled = false;
+
+    expect($setting->saveQuietly())->toBeTrue();
+
+    expect($setting->fresh()->is_blue_green_deployment_enabled)->toBeFalse()
+        ->and(ApplicationBlueGreenDeployment::query()->whereKey($state->id)->doesntExist())->toBeTrue()
+        ->and(ApplicationBlueGreenDeactivation::query()->whereKey($deactivation->id)->doesntExist())->toBeTrue();
+});
+
+it('rejects blue-green opt-out when stopped state lacks the exact remote fence proof', function (): void {
+    $application = applicationSettingTopologyApplication();
+    $setting = $application->settings()->firstOrFail();
+    $setting->is_blue_green_deployment_enabled = true;
+    $setting->save();
+    $startedAt = now()->subMinute()->startOfSecond();
+    $state = $application->blueGreenDeployments()->create([
+        'standalone_docker_id' => $application->destination_id,
+        'phase' => BlueGreenDeploymentPhase::STOPPED,
+        'supersession_generation' => 1,
+        'destination_fence_operation_id' => str_repeat('7', 64),
+        'destination_fence_mutation_sequence' => 1,
+        'destination_topology_digest' => str_repeat('8', 64),
+        'application_routing_config_digest' => str_repeat('9', 64),
+    ]);
+    $deactivation = $application->blueGreenDeactivations()->create([
+        'standalone_docker_id' => $application->destination_id,
+        'operation_id' => str_repeat('a', 64),
+        'started_at' => $startedAt,
+        'queue_cutoff_id' => 0,
+        'supersession_generation' => 1,
+        'phase' => BlueGreenDeactivationPhase::STOPPED,
+        'completed_at' => $startedAt->copy()->addSecond(),
+    ]);
+    $setting->is_blue_green_deployment_enabled = false;
+
+    expect(fn (): bool => $setting->saveQuietly())
+        ->toThrow(RuntimeException::class, 'stopped state no longer matches');
+
+    expect($setting->fresh()->is_blue_green_deployment_enabled)->toBeTrue()
+        ->and(ApplicationBlueGreenDeployment::query()->whereKey($state->id)->exists())->toBeTrue()
+        ->and(ApplicationBlueGreenDeactivation::query()->whereKey($deactivation->id)->exists())->toBeTrue();
+});
+
+it('rejects blue-green opt-out when a stopped destination has a live deployment owner', function (): void {
+    $application = applicationSettingTopologyApplication();
+    $setting = $application->settings()->firstOrFail();
+    $setting->is_blue_green_deployment_enabled = true;
+    $setting->save();
+    $startedAt = now()->subMinute()->startOfSecond();
+    $operationId = str_repeat('c', 64);
+    $state = $application->blueGreenDeployments()->create([
+        'standalone_docker_id' => $application->destination_id,
+        'phase' => BlueGreenDeploymentPhase::STOPPED,
+        'supersession_generation' => 1,
+        'destination_fence_operation_id' => $operationId,
+        'destination_fence_mutation_sequence' => 1,
+        'destination_topology_digest' => str_repeat('3', 64),
+        'application_routing_config_digest' => str_repeat('4', 64),
+    ]);
+    $deactivation = $application->blueGreenDeactivations()->create([
+        'standalone_docker_id' => $application->destination_id,
+        'operation_id' => $operationId,
+        'started_at' => $startedAt,
+        'queue_cutoff_id' => 0,
+        'supersession_generation' => 1,
+        'phase' => BlueGreenDeactivationPhase::STOPPED,
+        'completed_at' => $startedAt->copy()->addSecond(),
+    ]);
+    ApplicationDeploymentQueue::query()->create([
+        'application_id' => $application->id,
+        'deployment_uuid' => 'manual-stop-opt-out-live-owner',
+        'pull_request_id' => 0,
+        'destination_id' => $application->destination_id,
+        'server_id' => $application->destination->server_id,
+        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+    ]);
+    $setting->is_blue_green_deployment_enabled = false;
+
+    expect(fn (): bool => $setting->saveQuietly())
+        ->toThrow(RuntimeException::class, 'deployment owns a stopped destination');
+
+    expect($setting->fresh()->is_blue_green_deployment_enabled)->toBeTrue()
+        ->and(ApplicationBlueGreenDeployment::query()->whereKey($state->id)->exists())->toBeTrue()
+        ->and(ApplicationBlueGreenDeactivation::query()->whereKey($deactivation->id)->exists())->toBeTrue();
+});
+
+it('rejects blue-green opt-out when manual-stop proof misses a configured destination', function (): void {
+    $application = applicationSettingTopologyApplication();
+    $setting = $application->settings()->firstOrFail();
+    $setting->is_blue_green_deployment_enabled = true;
+    $setting->save();
+    $additionalServer = Server::factory()->create([
+        'team_id' => $application->environment->project->team_id,
+    ]);
+    $additionalDestination = $additionalServer->standaloneDockers()->firstOrFail();
+    $application->additional_networks()->attach($additionalDestination->id, [
+        'server_id' => $additionalServer->id,
+    ]);
+    $startedAt = now()->subMinute()->startOfSecond();
+    $operationId = str_repeat('e', 64);
+    $application->blueGreenDeployments()->create([
+        'standalone_docker_id' => $application->destination_id,
+        'phase' => BlueGreenDeploymentPhase::STOPPED,
+        'supersession_generation' => 1,
+        'destination_fence_operation_id' => $operationId,
+        'destination_fence_mutation_sequence' => 1,
+        'destination_topology_digest' => str_repeat('5', 64),
+        'application_routing_config_digest' => str_repeat('6', 64),
+    ]);
+    $application->blueGreenDeactivations()->create([
+        'standalone_docker_id' => $application->destination_id,
+        'operation_id' => $operationId,
+        'started_at' => $startedAt,
+        'queue_cutoff_id' => 0,
+        'supersession_generation' => 1,
+        'phase' => BlueGreenDeactivationPhase::STOPPED,
+        'completed_at' => $startedAt->copy()->addSecond(),
+    ]);
+    $setting->is_blue_green_deployment_enabled = false;
+
+    expect(fn (): bool => $setting->saveQuietly())
+        ->toThrow(RuntimeException::class, 'manual-stop proof is incomplete');
+
+    expect($setting->fresh()->is_blue_green_deployment_enabled)->toBeTrue()
+        ->and($application->blueGreenDeployments()->count())->toBe(1)
+        ->and($application->blueGreenDeactivations()->count())->toBe(1);
 });
 
 it('rejects quiet configuration changes that make durable blue-green state ineligible', function (): void {

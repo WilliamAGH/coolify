@@ -188,7 +188,7 @@ class ApplicationSetting extends Model
                 ->orderBy('id')
                 ->lockForUpdate()
                 ->get();
-            ApplicationBlueGreenDeactivation::query()
+            $deactivations = ApplicationBlueGreenDeactivation::query()
                 ->where('application_id', $application->id)
                 ->orderBy('id')
                 ->lockForUpdate()
@@ -213,6 +213,13 @@ class ApplicationSetting extends Model
                     ->orderBy('id')
                     ->lockForUpdate()
                     ->get();
+            }
+
+            $isOptingOut = $this->isDirty('is_blue_green_deployment_enabled')
+                && ! $this->is_blue_green_deployment_enabled;
+            if ($isOptingOut) {
+                $application->consumeBlueGreenManualStopProofsForOptOut($states, $deactivations);
+                $states = collect();
             }
 
             if ($states->contains(

@@ -1,8 +1,12 @@
 <?php
 
+use App\Enums\BlueGreenDeactivationPhase;
+use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\ProxyTypes;
 use App\Exceptions\BlueGreenAdmissionException;
 use App\Models\Application;
+use App\Models\ApplicationBlueGreenDeactivation;
+use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationSetting;
 use App\Models\Environment;
 use App\Models\InstanceSettings;
@@ -189,6 +193,41 @@ test('PATCH /api/v1/applications/{uuid} rejects blue-green opt-out while durable
         ->assertJsonValidationErrors('settings');
 
     expect($application->fresh()->settings->is_blue_green_deployment_enabled)->toBeTrue();
+});
+
+test('PATCH /api/v1/applications/{uuid} consumes completed manual-stop proof during blue-green opt-out', function () {
+    $application = eligibleBlueGreenApplication();
+    $application->settings()->update(['is_blue_green_deployment_enabled' => true]);
+    $startedAt = now()->subMinute()->startOfSecond();
+    $operationId = str_repeat('d', 64);
+    $state = $application->blueGreenDeployments()->create([
+        'standalone_docker_id' => $application->destination_id,
+        'phase' => BlueGreenDeploymentPhase::STOPPED,
+        'supersession_generation' => 3,
+        'destination_fence_operation_id' => $operationId,
+        'destination_fence_mutation_sequence' => 1,
+        'destination_topology_digest' => str_repeat('1', 64),
+        'application_routing_config_digest' => str_repeat('2', 64),
+    ]);
+    $deactivation = $application->blueGreenDeactivations()->create([
+        'standalone_docker_id' => $application->destination_id,
+        'operation_id' => $operationId,
+        'started_at' => $startedAt,
+        'queue_cutoff_id' => 0,
+        'supersession_generation' => 3,
+        'phase' => BlueGreenDeactivationPhase::STOPPED,
+        'completed_at' => $startedAt->copy()->addSecond(),
+    ]);
+
+    $this->withHeaders(applicationSettingsApiHeaders($this->bearerToken))
+        ->patchJson("/api/v1/applications/{$application->uuid}", [
+            'is_blue_green_deployment_enabled' => false,
+        ])
+        ->assertOk();
+
+    expect($application->fresh()->settings->is_blue_green_deployment_enabled)->toBeFalse()
+        ->and(ApplicationBlueGreenDeployment::query()->whereKey($state->id)->doesntExist())->toBeTrue()
+        ->and(ApplicationBlueGreenDeactivation::query()->whereKey($deactivation->id)->doesntExist())->toBeTrue();
 });
 
 test('blue-green admission guards throw the dedicated domain exception', function () {
