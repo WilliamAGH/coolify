@@ -34,6 +34,8 @@ final class RecoverBlueGreenIntervention
 
     private const STALE_CONTAINER_JOURNAL_REMOTE_TIMEOUT_SECONDS = 60;
 
+    private const STALE_FIRST_ADOPTION_RUNTIME_OUTPUT_PREFIX = 'coolify-blue-green-stale-first-adoption-runtime:v1';
+
     public string $commandSignature = 'blue-green:recover-intervention
         {--state= : application_blue_green_deployments ID}
         {--deactivation= : application_blue_green_deactivations ID}
@@ -138,7 +140,8 @@ final class RecoverBlueGreenIntervention
         }
 
         try {
-            $inspectionBootId = ReadBlueGreenServerBootIdentity::run($context['server']);
+            $inspectionBootId = $this->readStaleContainerMutationJournalBootIdentity($context['server']);
+            $this->assertFailedFirstAdoptionRuntimeIsInert($context);
             $inspection = $this->inspectStaleContainerMutationJournal($context, $inspectionBootId);
         } catch (BlueGreenOperationFenceLostException) {
             return $this->staleContainerMutationJournalDeferred($stateId, $reason, $context, 'boot_unstable');
@@ -196,10 +199,12 @@ final class RecoverBlueGreenIntervention
                 return $this->staleContainerMutationJournalManualOnly($stateId, $reason, $lockedContext, 'resource_changed');
             }
             $operationFence->assertLockOwnership();
-            $lockedBootId = ReadBlueGreenServerBootIdentity::run($lockedContext['server']);
+            $lockedBootId = $this->readStaleContainerMutationJournalBootIdentity($lockedContext['server']);
             if (! hash_equals($inspectionBootId, $lockedBootId)) {
                 return $this->staleContainerMutationJournalDeferred($stateId, $reason, $lockedContext, 'boot_changed');
             }
+            $operationFence->assertLockOwnership();
+            $this->assertFailedFirstAdoptionRuntimeIsInert($lockedContext);
             $operationFence->assertLockOwnership();
             $archiveAttempted = true;
             $quarantine = $this->quarantineStaleContainerMutationJournal(
@@ -274,6 +279,82 @@ final class RecoverBlueGreenIntervention
         }
     }
 
+    private function readStaleContainerMutationJournalBootIdentity(Server $server): string
+    {
+        $reader = new ReadBlueGreenServerBootIdentity;
+        $output = instant_privileged_remote_script(
+            $reader->commandFor(),
+            $server,
+            timeout: self::STALE_CONTAINER_JOURNAL_REMOTE_TIMEOUT_SECONDS,
+            retry: false,
+        );
+
+        return $reader->fromRemoteOutput((string) $output);
+    }
+
+    /**
+     * @param  array{
+     *     server: Server,
+     *     failed_first_adoption: null|array{
+     *         candidate_container: BlueGreenContainerExpectation,
+     *         legacy_container: BlueGreenContainerExpectation,
+     *         replica: ApplicationBlueGreenReplica
+     *     }
+     * }  $context
+     */
+    private function assertFailedFirstAdoptionRuntimeIsInert(array $context): void
+    {
+        $failedFirstAdoption = $context['failed_first_adoption'];
+        if ($failedFirstAdoption === null) {
+            return;
+        }
+
+        $legacyInspector = new InspectBlueGreenContainer;
+        $candidateExpectation = $failedFirstAdoption['candidate_container'];
+        $legacyExpectation = $failedFirstAdoption['legacy_container'];
+        $replica = $failedFirstAdoption['replica'];
+        $candidateContainerName = $candidateExpectation->name;
+        $candidateReleaseFilters = implode(' ', array_map(
+            static fn (string $filter): string => '--filter '.escapeshellarg($filter),
+            [
+                'label=coolify.applicationId='.$replica->application_id,
+                'label=coolify.pullRequestId=0',
+                'label=coolify.blueGreen.managed=true',
+                'label=coolify.blueGreen.deploymentUuid='.$replica->deployment_uuid,
+                'label=coolify.blueGreen.color='.$replica->color->value,
+                'label=coolify.blueGreen.routingRevision='.$replica->routing_revision,
+            ],
+        ));
+        $script = implode("\n", [
+            'set -eu',
+            'legacy_inspection=$('.$legacyInspector->commandFor($legacyExpectation->name).')',
+            'candidate_name_inspection=$(docker ps -aq --no-trunc --filter '
+                .escapeshellarg('name='.$candidateContainerName).')',
+            'test -z "$candidate_name_inspection"',
+            'candidate_release_inspection=$(docker ps -aq --no-trunc '.$candidateReleaseFilters.')',
+            'test -z "$candidate_release_inspection"',
+            'printf '.escapeshellarg("%s\n%s\n")
+                .' '.escapeshellarg(self::STALE_FIRST_ADOPTION_RUNTIME_OUTPUT_PREFIX)
+                .' "$legacy_inspection"',
+        ]);
+        $output = trim((string) instant_privileged_remote_script(
+            $script,
+            $context['server'],
+            timeout: self::STALE_CONTAINER_JOURNAL_REMOTE_TIMEOUT_SECONDS,
+            retry: false,
+        ));
+        [$prefix, $legacyOutput] = explode("\n", $output, 2) + [null, null];
+        if ($prefix !== self::STALE_FIRST_ADOPTION_RUNTIME_OUTPUT_PREFIX || ! is_string($legacyOutput)) {
+            throw new BlueGreenDeploymentTransitionException('The failed first-adoption runtime did not return its exact inert-state proof.');
+        }
+        $legacyInspection = $legacyInspector->parse($legacyOutput, $legacyExpectation);
+        if (! $legacyInspection->exists
+            || $legacyInspection->status !== 'running'
+            || $legacyInspection->health !== 'healthy') {
+            throw new BlueGreenDeploymentTransitionException('The retained legacy application container is not exactly running and healthy.');
+        }
+    }
+
     /**
      * @param  array{application: Application, destination: StandaloneDocker, managed_filename: string, server: Server, state: ApplicationBlueGreenDeployment}  $context
      * @return array{archive_filename: string, journal_sha256: string, status: 'archived'|'pending'}
@@ -281,6 +362,7 @@ final class RecoverBlueGreenIntervention
     private function inspectStaleContainerMutationJournal(array $context, string $expectedCurrentBootId): array
     {
         $writer = new WriteBlueGreenProxyConfiguration;
+        $deployment = $context['failed_first_adoption']['deployment'] ?? null;
         $output = trim((string) instant_privileged_remote_script(
             $writer->inspectStaleContainerMutationJournalCommandFor(
                 $context['server']->proxyPath(),
@@ -289,6 +371,10 @@ final class RecoverBlueGreenIntervention
                 (int) $context['destination']->id,
                 (int) $context['state']->id,
                 $expectedCurrentBootId,
+                expectedOperationId: $deployment === null ? null : (string) $deployment->deployment_uuid,
+                expectedJournalBootId: $deployment === null ? null : (string) $deployment->blue_green_server_boot_id,
+                expectedRoutingConfigDigest: $deployment === null ? null : (string) $deployment->blue_green_routing_config_digest,
+                expectedTopologyDigest: $deployment === null ? null : (string) $deployment->blue_green_topology_digest,
             ),
             $context['server'],
             timeout: self::STALE_CONTAINER_JOURNAL_REMOTE_TIMEOUT_SECONDS,
@@ -308,6 +394,7 @@ final class RecoverBlueGreenIntervention
         string $expectedJournalSha256,
     ): array {
         $writer = new WriteBlueGreenProxyConfiguration;
+        $deployment = $context['failed_first_adoption']['deployment'] ?? null;
         $output = trim((string) instant_privileged_remote_script(
             $writer->quarantineStaleContainerMutationJournalCommandFor(
                 $context['server']->proxyPath(),
@@ -317,6 +404,10 @@ final class RecoverBlueGreenIntervention
                 (int) $context['state']->id,
                 $expectedCurrentBootId,
                 $expectedJournalSha256,
+                expectedOperationId: $deployment === null ? null : (string) $deployment->deployment_uuid,
+                expectedJournalBootId: $deployment === null ? null : (string) $deployment->blue_green_server_boot_id,
+                expectedRoutingConfigDigest: $deployment === null ? null : (string) $deployment->blue_green_routing_config_digest,
+                expectedTopologyDigest: $deployment === null ? null : (string) $deployment->blue_green_topology_digest,
             ),
             $context['server'],
             timeout: self::STALE_CONTAINER_JOURNAL_REMOTE_TIMEOUT_SECONDS,
@@ -336,7 +427,24 @@ final class RecoverBlueGreenIntervention
         array $context,
     ): array {
         $fields = explode('|', $output);
-        if (count($fields) !== 4
+        $deployment = $context['failed_first_adoption']['deployment'] ?? null;
+        $expectedProvenanceSha256 = $deployment === null
+            ? null
+            : $writer->staleContainerMutationJournalProvenanceSha256For(
+                $context['managed_filename'],
+                (string) $context['application']->uuid,
+                (int) $context['destination']->id,
+                (string) $deployment->deployment_uuid,
+                (string) $deployment->blue_green_server_boot_id,
+                (string) $deployment->blue_green_routing_config_digest,
+                (string) $deployment->blue_green_topology_digest,
+            );
+        $hasExactProvenanceOutput = $expectedProvenanceSha256 === null
+            ? count($fields) === 4
+            : count($fields) === 5
+                && preg_match('/^[a-f0-9]{64}$/D', $fields[4]) === 1
+                && hash_equals($expectedProvenanceSha256, $fields[4]);
+        if (! $hasExactProvenanceOutput
             || $fields[0] !== WriteBlueGreenProxyConfiguration::STALE_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX
             || ! in_array($fields[1], ['pending', 'archived'], true)
             || preg_match('/^[a-f0-9]{64}$/D', $fields[2]) !== 1
@@ -358,7 +466,20 @@ final class RecoverBlueGreenIntervention
     }
 
     /**
-     * @return array{application: Application, destination: StandaloneDocker, managed_filename: string, server: Server, state: ApplicationBlueGreenDeployment}
+     * @return array{
+     *     application: Application,
+     *     destination: StandaloneDocker,
+     *     managed_filename: string,
+     *     server: Server,
+     *     state: ApplicationBlueGreenDeployment,
+     *     guard_sha256: string,
+     *     failed_first_adoption: null|array{
+     *         candidate_container: BlueGreenContainerExpectation,
+     *         deployment: ApplicationDeploymentQueue,
+     *         legacy_container: BlueGreenContainerExpectation,
+     *         replica: ApplicationBlueGreenReplica
+     *     }
+     * }
      */
     private function staleContainerMutationJournalContext(int $stateId): array
     {
@@ -392,14 +513,89 @@ final class RecoverBlueGreenIntervention
                 || $server->proxyType() !== ProxyTypes::TRAEFIK->value) {
                 throw new BlueGreenDeploymentTransitionException('The requested stale-journal recovery target is no longer one exact live Traefik destination.');
             }
-            $this->assertPristineStaleContainerMutationJournalState($state);
-            if (ApplicationBlueGreenReplica::query()
+            $this->assertIdleStaleContainerMutationJournalState($state);
+            $managedFilename = BlueGreenRoutingTarget::managedFilename(
+                (string) $application->uuid,
+                (int) $destination->id,
+            );
+            $replicas = ApplicationBlueGreenReplica::query()
                 ->where('application_blue_green_deployment_id', $state->id)
+                ->orderBy('id')
                 ->lockForUpdate()
-                ->first() !== null) {
-                throw new BlueGreenDeploymentTransitionException('The requested stale-journal recovery state still has a blue-green replica owner.');
+                ->get();
+            $failedFirstAdoption = null;
+            if ($state->supersession_generation === 0 && $state->legacy_container_name === null) {
+                if ($replicas->isNotEmpty()) {
+                    throw new BlueGreenDeploymentTransitionException('The pristine stale-journal recovery state still has a blue-green replica owner.');
+                }
+            } elseif ($state->supersession_generation === 1
+                && is_string($state->legacy_container_name)
+                && $state->legacy_container_name !== '') {
+                if ($replicas->count() !== 1) {
+                    throw new BlueGreenDeploymentTransitionException('The failed first-adoption recovery state does not retain exactly one inert replica row.');
+                }
+                $replica = $replicas->first();
+                if (! $replica instanceof ApplicationBlueGreenReplica) {
+                    throw new BlueGreenDeploymentTransitionException('The failed first-adoption replica row could not be locked.');
+                }
+                $generationDeployments = ApplicationDeploymentQueue::query()
+                    ->where('application_id', $state->application_id)
+                    ->where('destination_id', $state->standalone_docker_id)
+                    ->where('pull_request_id', 0)
+                    ->where('blue_green_supersession_generation', $state->supersession_generation)
+                    ->orderBy('id')
+                    ->lockForUpdate()
+                    ->get();
+                if ($generationDeployments->count() !== 1) {
+                    throw new BlueGreenDeploymentTransitionException('The failed first-adoption generation does not retain exactly one queue history row.');
+                }
+                $deployment = $generationDeployments->first();
+                if (! $deployment instanceof ApplicationDeploymentQueue) {
+                    throw new BlueGreenDeploymentTransitionException('The failed first-adoption queue history could not be locked.');
+                }
+                $this->assertFailedFirstAdoptionHistory(
+                    $application,
+                    $destination,
+                    $server,
+                    $state,
+                    $deployment,
+                    $replica,
+                    $managedFilename,
+                );
+                try {
+                    $legacyContainer = new BlueGreenContainerExpectation(
+                        name: $state->legacy_container_name,
+                        dockerId: $deployment->blue_green_previous_container_id,
+                        applicationId: (int) $application->id,
+                        pullRequestId: 0,
+                        blueGreenManaged: false,
+                    );
+                    $candidateContainer = new BlueGreenContainerExpectation(
+                        name: (string) $replica->container_name,
+                        dockerId: null,
+                        applicationId: (int) $application->id,
+                        pullRequestId: 0,
+                        blueGreenManaged: true,
+                        deploymentUuid: $replica->deployment_uuid,
+                        color: $replica->color,
+                        routingRevision: $replica->routing_revision,
+                    );
+                } catch (InvalidArgumentException $exception) {
+                    throw new BlueGreenDeploymentTransitionException(
+                        'The failed first-adoption container identity is malformed.',
+                        previous: $exception,
+                    );
+                }
+                $failedFirstAdoption = [
+                    'candidate_container' => $candidateContainer,
+                    'deployment' => $deployment,
+                    'legacy_container' => $legacyContainer,
+                    'replica' => $replica,
+                ];
+            } else {
+                throw new BlueGreenDeploymentTransitionException('The requested stale-journal recovery state is neither pristine nor one exact failed first-adoption rollback.');
             }
-            $liveBlueGreenQueue = ApplicationDeploymentQueue::query()
+            $liveQueue = ApplicationDeploymentQueue::query()
                 ->where('application_id', $state->application_id)
                 ->where('destination_id', $state->standalone_docker_id)
                 ->where('pull_request_id', 0)
@@ -407,51 +603,35 @@ final class RecoverBlueGreenIntervention
                     ApplicationDeploymentStatus::QUEUED->value,
                     ApplicationDeploymentStatus::IN_PROGRESS->value,
                 ])
-                ->where(function ($query): void {
-                    $query->whereNotNull('blue_green_color')
-                        ->orWhereNotNull('blue_green_phase')
-                        ->orWhereNotNull('blue_green_routing_revision')
-                        ->orWhereNotNull('blue_green_destination_fence_epoch')
-                        ->orWhereNotNull('blue_green_server_boot_id')
-                        ->orWhereNotNull('blue_green_topology_digest')
-                        ->orWhereNotNull('blue_green_routing_config_digest')
-                        ->orWhereNotNull('blue_green_backend_port_inventory')
-                        ->orWhereNotNull('blue_green_drain_backend_port_inventory')
-                        ->orWhereNotNull('blue_green_supersession_generation')
-                        ->orWhereNotNull('blue_green_fleet_deployment_uuid')
-                        ->orWhereNotNull('blue_green_fleet_status')
-                        ->orWhereNotNull('blue_green_previous_container_id')
-                        ->orWhereNotNull('blue_green_candidate_container_id')
-                        ->orWhereNotNull('blue_green_rollback_managed_filename')
-                        ->orWhereNotNull('blue_green_routing_mutated_at');
-                })
+                ->orderBy('id')
                 ->lockForUpdate()
                 ->first();
-            if ($liveBlueGreenQueue !== null) {
-                throw new BlueGreenDeploymentTransitionException('A live blue-green queue owner prevents stale-journal archival.');
+            if ($liveQueue !== null) {
+                throw new BlueGreenDeploymentTransitionException('A live application queue owner prevents stale-journal archival.');
             }
 
             return [
                 'application' => $application,
                 'destination' => $destination,
+                'failed_first_adoption' => $failedFirstAdoption,
+                'guard_sha256' => $this->staleContainerMutationJournalGuardSha256(
+                    $state,
+                    $failedFirstAdoption,
+                ),
                 'server' => $server,
                 'state' => $state,
-                'managed_filename' => BlueGreenRoutingTarget::managedFilename(
-                    (string) $application->uuid,
-                    (int) $destination->id,
-                ),
+                'managed_filename' => $managedFilename,
             ];
         }, attempts: 5);
     }
 
-    private function assertPristineStaleContainerMutationJournalState(ApplicationBlueGreenDeployment $state): void
+    private function assertIdleStaleContainerMutationJournalState(ApplicationBlueGreenDeployment $state): void
     {
         if ($state->phase !== BlueGreenDeploymentPhase::IDLE
             || $state->routing_revision !== 0
-            || $state->supersession_generation !== 0
             || $state->destination_fence_epoch !== 0
             || $state->destination_fence_mutation_sequence !== 0) {
-            throw new BlueGreenDeploymentTransitionException('The requested stale-journal recovery state is not an untouched idle blue-green state.');
+            throw new BlueGreenDeploymentTransitionException('The requested stale-journal recovery state is not an unrouted idle blue-green state.');
         }
         $requiredNull = [
             'active_color',
@@ -459,7 +639,6 @@ final class RecoverBlueGreenIntervention
             'blue_deployment_uuid',
             'green_deployment_uuid',
             'pending_deployment_uuid',
-            'legacy_container_name',
             'deactivation_operation_id',
             'deactivation_started_at',
             'destination_fence_operation_id',
@@ -482,6 +661,120 @@ final class RecoverBlueGreenIntervention
         }
     }
 
+    private function assertFailedFirstAdoptionHistory(
+        Application $application,
+        StandaloneDocker $destination,
+        Server $server,
+        ApplicationBlueGreenDeployment $state,
+        ApplicationDeploymentQueue $deployment,
+        ApplicationBlueGreenReplica $replica,
+        string $managedFilename,
+    ): void {
+        $expectedCandidateContainerName = $application->uuid.'-blue';
+        if ((int) $replica->application_blue_green_deployment_id !== (int) $state->id
+            || (int) $replica->application_id !== (int) $application->id
+            || (int) $replica->standalone_docker_id !== (int) $destination->id
+            || $replica->color !== BlueGreenDeploymentColor::BLUE
+            || $replica->replica_index !== 1
+            || $replica->routing_revision !== 1
+            || $replica->deployment_uuid === ''
+            || $replica->compose_project !== (string) $application->uuid
+            || $replica->compose_service !== $expectedCandidateContainerName
+            || $replica->container_name !== $expectedCandidateContainerName
+            || $replica->container_id !== null
+            || $replica->health_status !== 'pending'
+            || $replica->last_observed_at !== null) {
+            throw new BlueGreenDeploymentTransitionException('The failed first-adoption replica is not one exact unbound pending candidate.');
+        }
+        if ((int) $deployment->application_id !== (int) $application->id
+            || (int) $deployment->destination_id !== (int) $destination->id
+            || (int) $deployment->server_id !== (int) $server->id
+            || $deployment->deployment_uuid !== $replica->deployment_uuid
+            || $deployment->pull_request_id !== 0
+            || $deployment->status !== ApplicationDeploymentStatus::FAILED->value
+            || $deployment->finished_at === null
+            || $deployment->blue_green_phase !== BlueGreenDeploymentPhase::IDLE
+            || $deployment->blue_green_color !== BlueGreenDeploymentColor::BLUE
+            || $deployment->blue_green_routing_revision !== 1
+            || $deployment->blue_green_destination_fence_epoch !== 1
+            || $deployment->blue_green_supersession_generation !== 1
+            || $deployment->blue_green_candidate_container_id !== null
+            || $deployment->blue_green_rollback_managed_filename !== $managedFilename
+            || $deployment->blue_green_routing_mutated_at !== null
+            || ! is_string($deployment->blue_green_previous_container_id)
+            || preg_match('/^[a-f0-9]{64}$/D', $deployment->blue_green_previous_container_id) !== 1
+            || ! is_string($deployment->blue_green_server_boot_id)
+            || preg_match('/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/D', $deployment->blue_green_server_boot_id) !== 1
+            || ! is_string($deployment->blue_green_topology_digest)
+            || preg_match('/^[a-f0-9]{64}$/D', $deployment->blue_green_topology_digest) !== 1
+            || ! is_string($deployment->blue_green_routing_config_digest)
+            || preg_match('/^[a-f0-9]{64}$/D', $deployment->blue_green_routing_config_digest) !== 1) {
+            throw new BlueGreenDeploymentTransitionException('The failed first-adoption replica is not linked to one exact terminal queue owner.');
+        }
+        $backendInventory = BlueGreenBackendPortInventory::fromSerialized(
+            $deployment->blue_green_backend_port_inventory,
+        );
+        $drainInventory = BlueGreenBackendPortInventory::fromSerialized(
+            $deployment->blue_green_drain_backend_port_inventory,
+        );
+        if (! hash_equals($backendInventory->serialized, $drainInventory->serialized)) {
+            throw new BlueGreenDeploymentTransitionException('The failed first-adoption queue does not retain its exact legacy drain inventory.');
+        }
+    }
+
+    /**
+     * @param  null|array{
+     *     candidate_container: BlueGreenContainerExpectation,
+     *     deployment: ApplicationDeploymentQueue,
+     *     legacy_container: BlueGreenContainerExpectation,
+     *     replica: ApplicationBlueGreenReplica
+     * }  $failedFirstAdoption
+     */
+    private function staleContainerMutationJournalGuardSha256(
+        ApplicationBlueGreenDeployment $state,
+        ?array $failedFirstAdoption,
+    ): string {
+        $failedHistory = null;
+        if ($failedFirstAdoption !== null) {
+            $deployment = $failedFirstAdoption['deployment'];
+            $replica = $failedFirstAdoption['replica'];
+            $failedHistory = [
+                'candidate_container_name' => $failedFirstAdoption['candidate_container']->name,
+                'deployment_id' => (int) $deployment->id,
+                'deployment_uuid' => $deployment->deployment_uuid,
+                'deployment_finished_at' => $deployment->getRawOriginal('finished_at'),
+                'deployment_backend_port_inventory' => $deployment->blue_green_backend_port_inventory,
+                'deployment_drain_backend_port_inventory' => $deployment->blue_green_drain_backend_port_inventory,
+                'deployment_previous_container_id' => $deployment->blue_green_previous_container_id,
+                'deployment_routing_config_digest' => $deployment->blue_green_routing_config_digest,
+                'deployment_server_boot_id' => $deployment->blue_green_server_boot_id,
+                'deployment_topology_digest' => $deployment->blue_green_topology_digest,
+                'legacy_container_name' => $failedFirstAdoption['legacy_container']->name,
+                'replica_id' => (int) $replica->id,
+                'replica_compose_project' => $replica->compose_project,
+                'replica_compose_service' => $replica->compose_service,
+            ];
+        }
+
+        try {
+            $guard = json_encode([
+                'state_id' => (int) $state->id,
+                'application_id' => (int) $state->application_id,
+                'destination_id' => (int) $state->standalone_docker_id,
+                'legacy_container_name' => $state->legacy_container_name,
+                'supersession_generation' => $state->supersession_generation,
+                'failed_first_adoption' => $failedHistory,
+            ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
+        } catch (\JsonException $exception) {
+            throw new BlueGreenDeploymentTransitionException(
+                'The stale-journal recovery guard could not encode its exact durable identity.',
+                previous: $exception,
+            );
+        }
+
+        return hash('sha256', $guard);
+    }
+
     /**
      * @param  array{application: Application, destination: StandaloneDocker, managed_filename: string, server: Server, state: ApplicationBlueGreenDeployment}  $initial
      * @param  array{application: Application, destination: StandaloneDocker, managed_filename: string, server: Server, state: ApplicationBlueGreenDeployment}  $locked
@@ -493,7 +786,8 @@ final class RecoverBlueGreenIntervention
             && (int) $initial['destination']->id === (int) $locked['destination']->id
             && (int) $initial['server']->id === (int) $locked['server']->id
             && $initial['server']->proxyPath() === $locked['server']->proxyPath()
-            && $initial['managed_filename'] === $locked['managed_filename'];
+            && $initial['managed_filename'] === $locked['managed_filename']
+            && hash_equals($initial['guard_sha256'], $locked['guard_sha256']);
     }
 
     /**

@@ -31,6 +31,8 @@ class WriteBlueGreenProxyConfiguration
 
     private const STALE_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC = 'coolify-blue-green-stale-container-journal-archive-v1';
 
+    private const STALE_CONTAINER_MUTATION_JOURNAL_PROVENANCE_MAGIC = 'coolify-blue-green-stale-container-journal-provenance-v1';
+
     private const PROBE_HEADER = 'X-Coolify-Blue-Green-Probe';
 
     private const PROBE_ONLY_CONTRACT_METADATA = 'coolify.probe-only-contract';
@@ -216,6 +218,10 @@ class WriteBlueGreenProxyConfiguration
         int $destinationId,
         int $stateId,
         string $expectedCurrentBootId,
+        ?string $expectedOperationId = null,
+        ?string $expectedJournalBootId = null,
+        ?string $expectedRoutingConfigDigest = null,
+        ?string $expectedTopologyDigest = null,
     ): string {
         $this->assertStaleContainerMutationJournalScope(
             $managedFilename,
@@ -223,6 +229,15 @@ class WriteBlueGreenProxyConfiguration
             $destinationId,
             $stateId,
             $expectedCurrentBootId,
+        );
+        $expectedJournalProvenance = $this->resolveStaleContainerMutationJournalProvenance(
+            $managedFilename,
+            $applicationUuid,
+            $destinationId,
+            $expectedOperationId,
+            $expectedJournalBootId,
+            $expectedRoutingConfigDigest,
+            $expectedTopologyDigest,
         );
 
         return $this->staleContainerMutationJournalCommandFor(
@@ -232,6 +247,7 @@ class WriteBlueGreenProxyConfiguration
             $destinationId,
             $stateId,
             $expectedCurrentBootId,
+            expectedJournalProvenance: $expectedJournalProvenance,
         );
     }
 
@@ -247,6 +263,10 @@ class WriteBlueGreenProxyConfiguration
         int $stateId,
         string $expectedCurrentBootId,
         string $expectedJournalSha256,
+        ?string $expectedOperationId = null,
+        ?string $expectedJournalBootId = null,
+        ?string $expectedRoutingConfigDigest = null,
+        ?string $expectedTopologyDigest = null,
     ): string {
         $this->assertStaleContainerMutationJournalScope(
             $managedFilename,
@@ -256,6 +276,15 @@ class WriteBlueGreenProxyConfiguration
             $expectedCurrentBootId,
         );
         $this->assertSha256($expectedJournalSha256, 'expected stale container-mutation journal');
+        $expectedJournalProvenance = $this->resolveStaleContainerMutationJournalProvenance(
+            $managedFilename,
+            $applicationUuid,
+            $destinationId,
+            $expectedOperationId,
+            $expectedJournalBootId,
+            $expectedRoutingConfigDigest,
+            $expectedTopologyDigest,
+        );
 
         return $this->staleContainerMutationJournalCommandFor(
             $proxyPath,
@@ -265,7 +294,28 @@ class WriteBlueGreenProxyConfiguration
             $stateId,
             $expectedCurrentBootId,
             $expectedJournalSha256,
+            $expectedJournalProvenance,
         );
+    }
+
+    public function staleContainerMutationJournalProvenanceSha256For(
+        string $managedFilename,
+        string $applicationUuid,
+        int $destinationId,
+        string $expectedOperationId,
+        string $expectedJournalBootId,
+        string $expectedRoutingConfigDigest,
+        string $expectedTopologyDigest,
+    ): string {
+        return $this->staleContainerMutationJournalProvenance(
+            $managedFilename,
+            $applicationUuid,
+            $destinationId,
+            $expectedOperationId,
+            $expectedJournalBootId,
+            $expectedRoutingConfigDigest,
+            $expectedTopologyDigest,
+        )['sha256'];
     }
 
     /** @return list<string> */
@@ -1131,6 +1181,7 @@ class WriteBlueGreenProxyConfiguration
         int $stateId,
         string $expectedCurrentBootId,
         ?string $expectedJournalSha256 = null,
+        ?array $expectedJournalProvenance = null,
     ): string {
         $stateDirectory = $this->stateDirectory($proxyPath);
         $dynamicDirectory = $this->dynamicDirectory($proxyPath);
@@ -1153,6 +1204,9 @@ class WriteBlueGreenProxyConfiguration
                 $stateId,
                 $archiveFilename,
             );
+        $outputCommand = $expectedJournalProvenance === null
+            ? 'printf \'%s|%s|%s|%s\' '.escapeshellarg(self::STALE_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX).' "$container_journal_status" "$container_journal_checksum" '.escapeshellarg($archiveFilename)
+            : 'printf \'%s|%s|%s|%s|%s\' '.escapeshellarg(self::STALE_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX).' "$container_journal_status" "$container_journal_checksum" '.escapeshellarg($archiveFilename).' '.escapeshellarg($expectedJournalProvenance['sha256']);
 
         return implode("\n", [
             'set -eu',
@@ -1198,6 +1252,7 @@ class WriteBlueGreenProxyConfiguration
                 $applicationUuid,
                 $destinationId,
                 $expectedCurrentBootId,
+                $expectedJournalProvenance,
             ),
             'if [ "$container_journal_manifest_present" = true ]; then',
             ...$this->indent($this->validateStaleContainerMutationJournalManifestCommands(
@@ -1210,7 +1265,7 @@ class WriteBlueGreenProxyConfiguration
             'fi',
             ...$quarantineCommands,
             ...$this->discardStaleContainerMutationJournalValidationCommands(),
-            'printf \'%s|%s|%s|%s\' '.escapeshellarg(self::STALE_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX).' "$container_journal_status" "$container_journal_checksum" '.escapeshellarg($archiveFilename),
+            $outputCommand,
         ]);
     }
 
@@ -1231,6 +1286,7 @@ class WriteBlueGreenProxyConfiguration
         string $applicationUuid,
         int $destinationId,
         string $expectedCurrentBootId,
+        ?array $expectedJournalProvenance,
     ): array {
         $emptyChecksum = hash('sha256', '');
         $replacementPattern = $this->staleContainerMutationReplacementStatePattern(
@@ -1238,6 +1294,17 @@ class WriteBlueGreenProxyConfiguration
             $applicationUuid,
             $destinationId,
         );
+        $provenanceCommands = $expectedJournalProvenance === null
+            ? []
+            : [
+                'test "$container_journal_expected_boot_id" = '.escapeshellarg($expectedJournalProvenance['journal_boot_id']),
+                'test "$container_journal_replacement_state_checksum" = '.escapeshellarg($expectedJournalProvenance['replacement_state_sha256']),
+            ];
+        $decodedReplacementProvenanceCommands = $expectedJournalProvenance === null
+            ? []
+            : [
+                'test "${container_journal_actual_checksum%% *}" = '.escapeshellarg($expectedJournalProvenance['replacement_state_sha256']),
+            ];
 
         return [
             'test ! -e "$container_journal_active_path"',
@@ -1270,6 +1337,7 @@ class WriteBlueGreenProxyConfiguration
             'test "$container_journal_filename" = '.escapeshellarg($managedFilename),
             $this->lowercaseUuidAssertionCommand('$container_journal_expected_boot_id'),
             'test "$container_journal_expected_boot_id" != '.escapeshellarg($expectedCurrentBootId),
+            ...$provenanceCommands,
             'test "$container_journal_expected_state" = absent',
             'test "$container_journal_expected_state_checksum" = '.escapeshellarg($emptyChecksum),
             'test "$container_journal_managed_file_state" = missing',
@@ -1287,6 +1355,7 @@ class WriteBlueGreenProxyConfiguration
             'printf %s "$container_journal_completion" | base64 -d > "$container_journal_completion_decoded"',
             'container_journal_actual_checksum=$(sha256sum "$container_journal_replacement_decoded")',
             'test "${container_journal_actual_checksum%% *}" = "$container_journal_replacement_state_checksum"',
+            ...$decodedReplacementProvenanceCommands,
             'container_journal_actual_checksum=$(sha256sum "$container_journal_mutation_decoded")',
             'test "${container_journal_actual_checksum%% *}" = "$container_journal_mutation_checksum"',
             'container_journal_actual_checksum=$(sha256sum "$container_journal_completion_decoded")',
@@ -1412,6 +1481,98 @@ class WriteBlueGreenProxyConfiguration
     private function lowercaseUuidAssertionCommand(string $shellValue): string
     {
         return 'case "'.$shellValue.'" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; *) exit 1 ;; esac';
+    }
+
+    /**
+     * @return null|array{
+     *     journal_boot_id: string,
+     *     replacement_state_sha256: string,
+     *     sha256: string
+     * }
+     */
+    private function resolveStaleContainerMutationJournalProvenance(
+        string $managedFilename,
+        string $applicationUuid,
+        int $destinationId,
+        ?string $expectedOperationId,
+        ?string $expectedJournalBootId,
+        ?string $expectedRoutingConfigDigest,
+        ?string $expectedTopologyDigest,
+    ): ?array {
+        $values = [
+            $expectedOperationId,
+            $expectedJournalBootId,
+            $expectedRoutingConfigDigest,
+            $expectedTopologyDigest,
+        ];
+        $provided = count(array_filter($values, static fn (?string $value): bool => $value !== null));
+        if ($provided === 0) {
+            return null;
+        }
+        if ($provided !== count($values)
+            || $expectedOperationId === null
+            || $expectedJournalBootId === null
+            || $expectedRoutingConfigDigest === null
+            || $expectedTopologyDigest === null) {
+            throw new InvalidArgumentException('The stale container-mutation journal provenance must be specified completely.');
+        }
+
+        return $this->staleContainerMutationJournalProvenance(
+            $managedFilename,
+            $applicationUuid,
+            $destinationId,
+            $expectedOperationId,
+            $expectedJournalBootId,
+            $expectedRoutingConfigDigest,
+            $expectedTopologyDigest,
+        );
+    }
+
+    /**
+     * @return array{
+     *     journal_boot_id: string,
+     *     replacement_state_sha256: string,
+     *     sha256: string
+     * }
+     */
+    private function staleContainerMutationJournalProvenance(
+        string $managedFilename,
+        string $applicationUuid,
+        int $destinationId,
+        string $expectedOperationId,
+        string $expectedJournalBootId,
+        string $expectedRoutingConfigDigest,
+        string $expectedTopologyDigest,
+    ): array {
+        $this->assertBootId($expectedJournalBootId);
+        $expectedReplacementState = new BlueGreenProxyState(
+            managedFilename: $managedFilename,
+            applicationUuid: $applicationUuid,
+            destinationId: $destinationId,
+            operationId: $expectedOperationId,
+            mutationSequence: 1,
+            destinationFenceEpoch: 0,
+            routingRevision: 0,
+            managedSha256: null,
+            activeColor: null,
+            activeDeploymentUuid: null,
+            activeContainerName: null,
+            activeContainerId: null,
+            applicationRoutingConfigDigest: $expectedRoutingConfigDigest,
+            destinationTopologyDigest: $expectedTopologyDigest,
+        );
+        $replacementStateSha256 = hash('sha256', $expectedReplacementState->serialize());
+
+        return [
+            'journal_boot_id' => $expectedJournalBootId,
+            'replacement_state_sha256' => $replacementStateSha256,
+            'sha256' => hash('sha256', implode("\n", [
+                self::STALE_CONTAINER_MUTATION_JOURNAL_PROVENANCE_MAGIC,
+                $expectedJournalBootId,
+                $replacementStateSha256,
+                '',
+            ])),
+        ];
     }
 
     private function assertStaleContainerMutationJournalScope(
