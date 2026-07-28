@@ -514,9 +514,10 @@ final class ReconstructBlueGreenDeploymentRecovery
             || $state->operation_rollback_proxy_state_sha256 !== null) {
             return $this->persistedRollbackKey($state, $claim);
         }
-        if ($state->operation_previous_managed_file_sha256 !== null) {
+        if ($state->operation_previous_proxy_state !== null
+            || $state->operation_previous_proxy_state_sha256 !== null) {
             $previousState = $this->persistedPreviousProxyState($state, $claim)
-                ?? throw new BlueGreenDeploymentTransitionException('The durable fixed-color operation has no exact predecessor proxy state.');
+                ?? throw new BlueGreenDeploymentTransitionException('The durable operation has no exact predecessor proxy state.');
             if ($routingMutationRecorded) {
                 throw new BlueGreenDeploymentTransitionException('The routed fixed-color operation has no persisted rollback replacement state.');
             }

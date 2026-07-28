@@ -153,11 +153,20 @@ final class RecoverBlueGreenIntervention
 
         try {
             $operationFence->assertLockOwnership();
-            $liveState = ReadBlueGreenManagedRouteMetadata::run(
-                $context['server'],
-                $context['application'],
-                $context['destination'],
-            );
+            $absentRoutePredecessor = $this->persistedAbsentRoutePredecessor($context['state']);
+            $liveState = $absentRoutePredecessor === null
+                ? ReadBlueGreenManagedRouteMetadata::run(
+                    $context['server'],
+                    $context['application'],
+                    $context['destination'],
+                )
+                : AttestBlueGreenDestinationState::run(
+                    $context['server'],
+                    $context['application'],
+                    $context['destination'],
+                    null,
+                    $absentRoutePredecessor,
+                );
             $operationFence->assertLockOwnership();
             if (! $this->liveRouteCanBeReconciled($context['state'], $liveState)) {
                 $this->audit('blue_green.intervention.midflight_manual_only', $plan, $reason, [
@@ -712,10 +721,18 @@ final class RecoverBlueGreenIntervention
         $activeColor = $state->active_color;
         $pendingColor = $state->pending_color;
         if ($liveState === null
-            || $liveState->activeColor === null
             || ! is_string($operationUuid)
-            || ! $activeColor instanceof BlueGreenDeploymentColor
             || ! $pendingColor instanceof BlueGreenDeploymentColor) {
+            return false;
+        }
+        if ($state->operation_previous_active_color === null) {
+            $previousState = $this->persistedAbsentRoutePredecessor($state);
+
+            return $previousState !== null
+                && $liveState->toArray() === $previousState->toArray();
+        }
+        if ($liveState->activeColor === null
+            || ! $activeColor instanceof BlueGreenDeploymentColor) {
             return false;
         }
         if ($state->operation_previous_active_color instanceof BlueGreenDeploymentColor) {
@@ -795,10 +812,40 @@ final class RecoverBlueGreenIntervention
 
     private function looksMidFlight(ApplicationBlueGreenDeployment $state): bool
     {
-        return is_string($state->operation_deployment_uuid)
+        $ownsPendingGeneration = is_string($state->operation_deployment_uuid)
             && $state->pending_deployment_uuid === $state->operation_deployment_uuid
-            && $state->pending_color instanceof BlueGreenDeploymentColor
-            && $state->active_color instanceof BlueGreenDeploymentColor;
+            && $state->pending_color instanceof BlueGreenDeploymentColor;
+
+        return $ownsPendingGeneration
+            && ($state->active_color instanceof BlueGreenDeploymentColor
+                || $this->persistedAbsentRoutePredecessor($state) !== null);
+    }
+
+    private function persistedAbsentRoutePredecessor(
+        ApplicationBlueGreenDeployment $state,
+    ): ?BlueGreenProxyState {
+        $previousState = $this->verifiedPersistedProxyState(
+            $state->operation_previous_proxy_state,
+            $state->operation_previous_proxy_state_sha256,
+        );
+        if ($previousState === null
+            || $previousState->managedSha256 !== null
+            || $previousState->activeColor !== null
+            || $state->operation_previous_active_color !== null
+            || $state->operation_previous_managed_file_sha256 !== null
+            || $state->managed_file_sha256 !== null
+            || $previousState->destinationId !== (int) $state->standalone_docker_id
+            || $previousState->operationId !== $state->destination_fence_operation_id
+            || $previousState->mutationSequence !== (int) $state->destination_fence_mutation_sequence
+            || $previousState->destinationFenceEpoch !== (int) $state->destination_fence_epoch
+            || $previousState->destinationFenceEpoch !== (int) $state->operation_previous_destination_fence_epoch
+            || $previousState->routingRevision !== (int) $state->routing_revision - 1
+            || $previousState->applicationRoutingConfigDigest !== $state->application_routing_config_digest
+            || $previousState->destinationTopologyDigest !== $state->destination_topology_digest) {
+            return null;
+        }
+
+        return $previousState;
     }
 
     private function assertFinalizedIntervention(

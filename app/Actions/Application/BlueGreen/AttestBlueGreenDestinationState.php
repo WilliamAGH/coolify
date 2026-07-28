@@ -20,14 +20,24 @@ final class AttestBlueGreenDestinationState
         Application $application,
         StandaloneDocker $destination,
         ?ApplicationBlueGreenDeployment $state,
+        ?BlueGreenProxyState $expectedState = null,
     ): ?BlueGreenProxyState {
-        $expectedState = $state === null
-            ? null
-            : ResolveBlueGreenExpectedProxyState::run($application, $destination, $state);
         $managedFilename = BlueGreenRoutingTarget::managedFilename(
             (string) $application->uuid,
             (int) $destination->id,
         );
+        if ($state !== null && $expectedState !== null) {
+            throw new BlueGreenDeploymentTransitionException('Destination attestation received two competing expected states.');
+        }
+        $expectedState ??= $state === null
+            ? null
+            : ResolveBlueGreenExpectedProxyState::run($application, $destination, $state);
+        if ($expectedState !== null
+            && ($expectedState->managedFilename !== $managedFilename
+                || $expectedState->applicationUuid !== (string) $application->uuid
+                || $expectedState->destinationId !== (int) $destination->id)) {
+            throw new BlueGreenDeploymentTransitionException('The expected destination state belongs to a different application topology.');
+        }
         $result = trim((string) instant_privileged_remote_script(
             $expectedState === null
                 ? (new WriteBlueGreenProxyConfiguration)->firstAdoptionAttestStateCommandFor(

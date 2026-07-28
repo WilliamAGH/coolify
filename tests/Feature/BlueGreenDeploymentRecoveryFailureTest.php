@@ -2,6 +2,7 @@
 
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentTransitionException;
 use App\Actions\Application\BlueGreen\ReconstructBlueGreenDeploymentRecovery;
+use App\Actions\Proxy\BlueGreenProxyState;
 use App\Enums\ApplicationDeploymentStatus;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Tests\Support\BlueGreenRecoveryScenario;
@@ -70,6 +71,47 @@ it('reconstructs the recorded first-adoption enrollment as the expected destinat
         ->and($operation->rollbackKey->replacementState->mutationSequence)->toBe(2)
         ->and($operation->rollbackKey->replacementState->destinationFenceEpoch)->toBe(1)
         ->and($operation->currentDestinationState?->serialize())->toBe($expectedState->serialize());
+});
+
+it('reconstructs an absent-route predecessor recorded by a superseded first adoption', function () {
+    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
+    $previousState = new BlueGreenProxyState(
+        managedFilename: $scenario->state->operation_rollback_managed_filename,
+        applicationUuid: $scenario->application->uuid,
+        destinationId: $scenario->destination->id,
+        operationId: 'superseded-first-adoption',
+        mutationSequence: 2,
+        destinationFenceEpoch: 0,
+        routingRevision: 0,
+        managedSha256: null,
+        activeColor: null,
+        activeDeploymentUuid: null,
+        activeContainerName: null,
+        activeContainerId: null,
+        applicationRoutingConfigDigest: str_repeat('a', 64),
+        destinationTopologyDigest: $scenario->state->operation_topology_digest,
+    );
+    $previousBytes = $previousState->serialize();
+    $scenario->state->update([
+        'destination_fence_epoch' => $previousState->destinationFenceEpoch,
+        'destination_fence_operation_id' => $previousState->operationId,
+        'destination_fence_mutation_sequence' => $previousState->mutationSequence,
+        'managed_file_sha256' => null,
+        'destination_topology_digest' => $previousState->destinationTopologyDigest,
+        'application_routing_config_digest' => $previousState->applicationRoutingConfigDigest,
+        'operation_previous_proxy_state' => $previousBytes,
+        'operation_previous_proxy_state_sha256' => hash('sha256', $previousBytes),
+    ]);
+
+    $operation = ReconstructBlueGreenDeploymentRecovery::run($scenario->state->fresh());
+
+    expect($operation->routingMutationRecorded)->toBeFalse()
+        ->and($operation->rollbackKey->expectedState?->serialize())->toBe($previousBytes)
+        ->and($operation->rollbackKey->replacementState->operationId)->toBe(BlueGreenRecoveryScenario::OPERATION_UUID)
+        ->and($operation->rollbackKey->replacementState->mutationSequence)->toBe(1)
+        ->and($operation->rollbackKey->replacementState->destinationFenceEpoch)->toBe(1)
+        ->and($operation->rollbackKey->replacementState->managedSha256)->toBeNull()
+        ->and($operation->currentDestinationState?->serialize())->toBe($previousBytes);
 });
 
 it('keeps a foreign partial destination fence fail-closed during first-adoption recovery', function () {

@@ -6,8 +6,10 @@ use App\Actions\Application\BlueGreen\BlueGreenInterventionRecoveryResult;
 use App\Actions\Application\BlueGreen\MarkBlueGreenRecoveryInterventionRequired;
 use App\Actions\Application\BlueGreen\ReadBlueGreenManagedRouteMetadata;
 use App\Actions\Application\BlueGreen\RecoverBlueGreenIntervention;
+use App\Actions\Proxy\BlueGreenProxyRollbackArtifactReader;
 use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
+use App\Enums\ApplicationDeploymentExecutionPhase;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentColor;
@@ -20,6 +22,7 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Str;
 use Tests\Support\BlueGreenDeactivationScenario;
 use Tests\Support\BlueGreenRecoveryScenario;
 
@@ -153,6 +156,69 @@ function fixedColorMidFlightInterventionScenario(): array
     return compact('currentState', 'previousState', 'scenario');
 }
 
+/**
+ * @return array{activationAttemptUuid: string, previousState: BlueGreenProxyState, scenario: BlueGreenRecoveryScenario}
+ */
+function absentRouteMidFlightInterventionScenario(): array
+{
+    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
+    $preparationAttemptUuid = (string) Str::uuid();
+    $preparationWorker = 'absent-route-intervention-preparation-worker';
+    $scenario->deployment->update([
+        'execution_phase' => ApplicationDeploymentExecutionPhase::Prepare,
+        'horizon_job_id' => $preparationAttemptUuid,
+        'horizon_job_worker' => null,
+        'current_process_id' => null,
+    ]);
+    $scenario->deployment->refresh();
+    expect($scenario->deployment->acquireDispatchExecution(
+        $preparationAttemptUuid,
+        $preparationWorker,
+    ))->toBeTrue();
+    $activationAttemptUuid = $scenario->deployment->handoffToActivation(
+        $preparationAttemptUuid,
+        $preparationWorker,
+        $scenario->deployment->makePreparedActivationPayload([]),
+    );
+    $previousState = new BlueGreenProxyState(
+        managedFilename: $scenario->state->operation_rollback_managed_filename,
+        applicationUuid: $scenario->application->uuid,
+        destinationId: $scenario->destination->id,
+        operationId: 'superseded-first-adoption',
+        mutationSequence: 2,
+        destinationFenceEpoch: 0,
+        routingRevision: 0,
+        managedSha256: null,
+        activeColor: null,
+        activeDeploymentUuid: null,
+        activeContainerName: null,
+        activeContainerId: null,
+        applicationRoutingConfigDigest: str_repeat('a', 64),
+        destinationTopologyDigest: $scenario->state->operation_topology_digest,
+    );
+    $previousBytes = $previousState->serialize();
+    $scenario->state->update([
+        'destination_fence_epoch' => $previousState->destinationFenceEpoch,
+        'destination_fence_operation_id' => $previousState->operationId,
+        'destination_fence_mutation_sequence' => $previousState->mutationSequence,
+        'managed_file_sha256' => null,
+        'destination_topology_digest' => $previousState->destinationTopologyDigest,
+        'application_routing_config_digest' => $previousState->applicationRoutingConfigDigest,
+        'operation_previous_proxy_state' => $previousBytes,
+        'operation_previous_proxy_state_sha256' => hash('sha256', $previousBytes),
+        'phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+        'intervention_phase' => BlueGreenDeploymentPhase::PREPARING->value,
+        'intervention_reason' => 'A superseded first adoption left an exact absent-route predecessor.',
+    ]);
+    $scenario->deployment->update([
+        'status' => ApplicationDeploymentStatus::FAILED->value,
+        'blue_green_phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+        'finished_at' => now(),
+    ]);
+
+    return compact('activationAttemptUuid', 'previousState', 'scenario');
+}
+
 function fakeBlueGreenManagedRouteMetadata(BlueGreenProxyState $state): void
 {
     Process::fake([
@@ -222,6 +288,43 @@ it('classifies an exact pending generation for live managed-route inspection bef
         ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::INSPECTED)
         ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
         ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value);
+});
+
+it('classifies an exact absent-route predecessor for attested mid-flight recovery', function (): void {
+    ['scenario' => $scenario] = absentRouteMidFlightInterventionScenario();
+
+    $result = RecoverBlueGreenIntervention::run(stateId: $scenario->state->id);
+
+    expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::MID_FLIGHT)
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::INSPECTED)
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
+        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value);
+});
+
+it('attests and reopens the exact prepared activation from an absent-route intervention', function (): void {
+    BlueGreenProxyRollbackArtifactReader::shouldRun()->once()->andReturnNull();
+    [
+        'activationAttemptUuid' => $activationAttemptUuid,
+        'scenario' => $scenario,
+    ] = absentRouteMidFlightInterventionScenario();
+    Process::fake([
+        '*' => Process::result(output: 'coolify-blue-green-destination-state-attested'),
+    ]);
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        apply: true,
+        reason: 'Reopen the exact prepared activation after absent-route predecessor attestation.',
+    );
+
+    expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::MID_FLIGHT)
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::DEFERRED)
+        ->and($result->message)->toBe('Prepared activation publication is deferred to the scheduler-owned lifecycle fence.')
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
+        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+        ->and($scenario->deployment->fresh()->execution_phase)->toBe(ApplicationDeploymentExecutionPhase::Activate)
+        ->and($scenario->deployment->fresh()->horizon_job_id)->toBe($activationAttemptUuid)
+        ->and($scenario->deployment->fresh()->finished_at)->toBeNull();
 });
 
 it('rolls back a finalized recovery attempt when exact draining provenance is incomplete', function (): void {
@@ -450,6 +553,19 @@ it('accepts a fixed-color intervention when live metadata exactly matches its pe
 
     expect($method->invoke(new RecoverBlueGreenIntervention, $scenario->state->fresh(), $previousState))->toBeTrue()
         ->and($method->invoke(new RecoverBlueGreenIntervention, $scenario->state->fresh(), $currentState))->toBeTrue();
+});
+
+it('only accepts the exact persisted absent-route predecessor for first-adoption recovery', function (): void {
+    ['previousState' => $previousState, 'scenario' => $scenario] = absentRouteMidFlightInterventionScenario();
+    $foreignState = $previousState->withAbsentRouteMutationOwner(
+        'foreign-operation',
+        $previousState->applicationRoutingConfigDigest,
+        $previousState->destinationTopologyDigest,
+    );
+    $method = new ReflectionMethod(RecoverBlueGreenIntervention::class, 'liveRouteCanBeReconciled');
+
+    expect($method->invoke(new RecoverBlueGreenIntervention, $scenario->state->fresh(), $previousState))->toBeTrue()
+        ->and($method->invoke(new RecoverBlueGreenIntervention, $scenario->state->fresh(), $foreignState))->toBeFalse();
 });
 
 it('only accepts live managed metadata whose sidecar matches its managed route checksum', function (): void {
