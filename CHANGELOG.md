@@ -6,6 +6,16 @@ All notable changes to this project will be documented in this file.
 
 ### 🐛 Bug Fixes
 
+- *(blue-green)* Auto-recover intervention_required at deployment start
+
+### 📚 Documentation
+
+- Update changelog
+
+## [4.13.44-fork] - 2026-07-29
+
+### 🐛 Bug Fixes
+
 - *(release)* Enforce operational acceptance guards
 - *(deployments)* Restart the exact active runtime
 
