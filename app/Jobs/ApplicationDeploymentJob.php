@@ -107,6 +107,8 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         int $destinationId,
         BlueGreenDeploymentClaim $claim,
     ): array {
+        $customLogOwnerLabel = self::customLogOwnerLabel($application);
+
         return [
             ...generateBlueGreenApplicationContainerLabels(
                 $application,
@@ -115,10 +117,27 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
                 $claim->expectedRoutingRevision,
                 $claim->backendPortInventory->ports(),
             ),
+            ...($customLogOwnerLabel === null ? [] : [$customLogOwnerLabel]),
             "coolify.blueGreen.deploymentUuid={$claim->deploymentUuid}",
             'coolify.blueGreen.releaseProof='.
                 BlueGreenRoutingTarget::durableReleaseProofToken($claim->deploymentUuid),
         ];
+    }
+
+    private static function customLogOwnerLabel(Application $application): ?string
+    {
+        $configuredLabels = data_get($application, 'custom_labels');
+        if (! is_string($configuredLabels) || $configuredLabels === '') {
+            return null;
+        }
+
+        $decodedLabels = base64_decode($configuredLabels, true);
+        $customLabels = preg_split(
+            "/\r\n|\n|\r/",
+            $decodedLabels === false ? $configuredLabels : $decodedLabels,
+        );
+
+        return findLogOwnerLabel(collect($customLabels === false ? [] : $customLabels));
     }
 
     private bool $newVersionIsHealthy = false;
@@ -5096,7 +5115,19 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         if (! is_null($this->application->limits_cpuset)) {
             data_set($docker_compose, 'services.'.$this->container_name.'.cpuset', $this->application->limits_cpuset);
         }
+        if ($this->mainServer->isLogDrainEnabled() && $this->application->isLogDrainEnabled()) {
+            $docker_compose['services'][$this->container_name]['logging'] = generate_fluentd_configuration();
+        }
+        $labels = addDefaultLogOwnerLabel(
+            collect($labels),
+            data_get($docker_compose, 'services.'.$this->container_name.'.logging'),
+        )->all();
         if ($this->mainServer->isSwarm()) {
+            $swarmTaskLogOwnerLabel = findLogOwnerLabel(collect($labels));
+            if ($swarmTaskLogOwnerLabel === null) {
+                throw new DeploymentException('The generated application labels have no log owner.');
+            }
+            $docker_compose['services'][$this->container_name]['labels'] = [$swarmTaskLogOwnerLabel];
             data_forget($docker_compose, 'services.'.$this->container_name.'.container_name');
             data_forget($docker_compose, 'services.'.$this->container_name.'.expose');
             data_forget($docker_compose, 'services.'.$this->container_name.'.restart');
@@ -5145,9 +5176,6 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
             }
         } else {
             $docker_compose['services'][$this->container_name]['labels'] = $labels;
-        }
-        if ($this->mainServer->isLogDrainEnabled() && $this->application->isLogDrainEnabled()) {
-            $docker_compose['services'][$this->container_name]['logging'] = generate_fluentd_configuration();
         }
         if ($this->application->settings->is_gpu_enabled) {
             $docker_compose['services'][$this->container_name]['deploy']['resources']['reservations']['devices'] = [

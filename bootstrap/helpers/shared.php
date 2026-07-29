@@ -3083,6 +3083,7 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
                 if ($resource->server->isLogDrainEnabled() && $savedService->isLogDrainEnabled()) {
                     data_set($service, 'logging', generate_fluentd_configuration());
                 }
+                $serviceLabels = addDefaultLogOwnerLabel($serviceLabels, data_get($service, 'logging'));
                 if ($serviceLabels->count() > 0) {
                     if ($resource->is_container_label_escape_enabled) {
                         $serviceLabels = $serviceLabels->map(function ($value, $key) {
@@ -3878,6 +3879,7 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
                     data_set($service, 'logging', generate_fluentd_configuration());
                 }
             }
+            $serviceLabels = addDefaultLogOwnerLabel($serviceLabels, data_get($service, 'logging'));
             if ($serviceLabels->count() > 0) {
                 if ($resource->settings->is_container_label_escape_enabled) {
                     $serviceLabels = $serviceLabels->map(function ($value, $key) {

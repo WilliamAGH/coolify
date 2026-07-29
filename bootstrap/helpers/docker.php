@@ -289,6 +289,54 @@ function defaultLabels($id, $name, string $projectName, string $resourceName, st
     return $labels;
 }
 
+function findLogOwnerLabel(Collection $labels): ?string
+{
+    $labelName = 'io.iocloudhost.logs.owner';
+    if ($labels->has($labelName)) {
+        $owner = $labels->get($labelName);
+        if (! is_scalar($owner) || trim((string) $owner) === '') {
+            return null;
+        }
+
+        return "{$labelName}={$owner}";
+    }
+
+    $ownerLabel = $labels->first(
+        function (mixed $label) use ($labelName): bool {
+            if (! is_string($label) || ! str_contains($label, '=')) {
+                return false;
+            }
+
+            [$candidateLabelName, $candidateOwner] = explode('=', $label, 2);
+
+            return $candidateLabelName === $labelName && trim($candidateOwner) !== '';
+        }
+    );
+
+    return is_string($ownerLabel) ? $ownerLabel : null;
+}
+
+function addDefaultLogOwnerLabel(Collection $labels, mixed $logging): Collection
+{
+    $labelName = 'io.iocloudhost.logs.owner';
+    $explicitOwnerLabel = findLogOwnerLabel($labels);
+    $owner = data_get($logging, 'driver') === 'fluentd' ? 'fluent-bit' : 'vector';
+    if (array_is_list($labels->all())) {
+        return $labels
+            ->reject(
+                fn (mixed $label): bool => is_string($label)
+                    && str($label)->before('=')->value() === $labelName
+            )
+            ->values()
+            ->push($explicitOwnerLabel ?? "{$labelName}={$owner}");
+    }
+    if ($explicitOwnerLabel !== null) {
+        return $labels;
+    }
+
+    return $labels->put($labelName, $owner);
+}
+
 function generateServiceSpecificFqdns(ServiceApplication|Application $resource)
 {
     if ($resource->getMorphClass() === ServiceApplication::class) {
@@ -1266,6 +1314,10 @@ function generateCustomDockerRunOptionsForDatabases($docker_run_options, $docker
         $docker_compose['services'][$container_name]['networks'][$network]['ipv6_address'] = $ipv6;
     }
     $docker_compose['services'][$container_name] = array_merge_recursive($docker_compose['services'][$container_name], $docker_run_options);
+    $docker_compose['services'][$container_name]['labels'] = addDefaultLogOwnerLabel(
+        collect(data_get($docker_compose, "services.{$container_name}.labels", [])),
+        data_get($docker_compose, "services.{$container_name}.logging"),
+    )->all();
 
     return $docker_compose;
 }

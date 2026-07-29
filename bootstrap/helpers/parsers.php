@@ -1406,6 +1406,7 @@ function applicationParser(Application $resource, int $pull_request_id = 0, ?int
                 ));
             }
         }
+        $serviceLabels = addDefaultLogOwnerLabel($serviceLabels, $logging);
         data_forget($service, 'volumes.*.content');
         data_forget($service, 'volumes.*.isDirectory');
         data_forget($service, 'volumes.*.is_directory');
@@ -2669,6 +2670,7 @@ function serviceParser(Service $resource): Collection
                 ));
             }
         }
+        $serviceLabels = addDefaultLogOwnerLabel($serviceLabels, $logging);
         if (data_get($service, 'restart') === 'no' || data_get($service, 'exclude_from_hc')) {
             $savedService->update(['exclude_from_status' => true]);
         }
