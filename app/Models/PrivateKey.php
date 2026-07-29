@@ -268,14 +268,6 @@ class PrivateKey extends BaseModel
     protected function ensureStorageDirectoryExists()
     {
         $disk = Storage::disk('ssh-keys');
-        $directoryPath = '';
-
-        if (! $disk->exists($directoryPath)) {
-            $success = $disk->makeDirectory($directoryPath);
-            if (! $success) {
-                throw new \Exception('Failed to create SSH keys storage directory');
-            }
-        }
 
         // Check if directory is writable by attempting a test file
         $testFilename = '.test_write_'.uniqid();
