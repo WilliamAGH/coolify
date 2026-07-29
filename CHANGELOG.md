@@ -6,6 +6,16 @@ All notable changes to this project will be documented in this file.
 
 ### 🐛 Bug Fixes
 
+- *(observability)* Assign durable Docker log owners
+
+### 📚 Documentation
+
+- Update changelog
+
+## [4.13.42-fork] - 2026-07-29
+
+### 🐛 Bug Fixes
+
 - *(build)* Preserve source revision with build secrets
 
 ### 📚 Documentation
