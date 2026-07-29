@@ -139,6 +139,34 @@ run_check() {
         "$SUBJECT" check
 }
 
+run_status() {
+    env \
+        PATH="$BIN:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/sbin" \
+        ATTESTOR_TEST_LOG="$LOG" \
+        ATTESTOR_TEST_STATE="$STATE_ROOT" \
+        ATTESTOR_TEST_DYNAMIC_SHA="$ATTESTOR_TEST_DYNAMIC_SHA" \
+        COOLIFY_TRAEFIK_ATTESTOR_PROXY_ROOT="$PROXY_ROOT" \
+        COOLIFY_TRAEFIK_ATTESTOR_STATE_ROOT="$STATE_ROOT" \
+        "$SUBJECT" status
+}
+
+write_managed_state
+expected_status=$'attestor-owner\t7\t'"$ATTESTOR_TEST_DYNAMIC_SHA"$'\tattestor-owner\t3\tblue\t7\t'"$ATTESTOR_TEST_DYNAMIC_SHA"
+if [[ $(run_status) == "$expected_status" ]] \
+    && [[ ! -e $STATE_ROOT/heartbeat.json ]] \
+    && [[ ! -s $LOG ]]; then
+    pass 'read-only status reports the managed document and writer identities without attestation writes'
+else
+    fail 'read-only status reports the managed document and writer identities without attestation writes'
+fi
+
+printf 'http:\n  routers:\n    tampered: {}\n' > "$PROXY_ROOT/dynamic/coolify.yaml"
+if ! run_status >/dev/null 2>&1 && [[ ! -s $LOG ]]; then
+    pass 'read-only status rejects a document and sidecar digest mismatch without escalation'
+else
+    fail 'read-only status rejects a document and sidecar digest mismatch without escalation'
+fi
+
 write_managed_state
 protected_before=$(sha256sum \
     "$PROXY_ROOT/dynamic/coolify.yaml" \
