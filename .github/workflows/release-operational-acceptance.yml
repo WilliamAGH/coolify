@@ -40,13 +40,13 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          [[ "$GITHUB_REPOSITORY" == 'williamacallahan/coolify' ]]
-          [[ "$GITHUB_EVENT_NAME" == 'repository_dispatch' ]]
-          [[ "$EVENT_ACTION" == 'release-operational-acceptance' ]]
-          [[ "$GITHUB_REF" == 'refs/heads/v4.x' ]]
-          [[ "$REF_PROTECTED" == true ]]
-          [[ "$REQUESTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$REQUESTED_SOURCE_SHA" == "$GITHUB_SHA" ]]
+          [[ "$GITHUB_REPOSITORY" == 'williamacallahan/coolify' ]] || exit 1
+          [[ "$GITHUB_EVENT_NAME" == 'repository_dispatch' ]] || exit 1
+          [[ "$EVENT_ACTION" == 'release-operational-acceptance' ]] || exit 1
+          [[ "$GITHUB_REF" == 'refs/heads/v4.x' ]] || exit 1
+          [[ "$REF_PROTECTED" == true ]] || exit 1
+          [[ "$REQUESTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$REQUESTED_SOURCE_SHA" == "$GITHUB_SHA" ]] || exit 1
           jq -e 'type == "object" and keys == ["scenario", "source_sha"]' <<< "$CLIENT_PAYLOAD" >/dev/null
 
           artifact_name=''
