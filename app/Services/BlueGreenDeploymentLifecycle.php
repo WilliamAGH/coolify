@@ -37,6 +37,7 @@ use App\Actions\Application\BlueGreen\RecordBlueGreenLegacyRoutingSnapshot;
 use App\Actions\Application\BlueGreen\RecordBlueGreenRollbackKey;
 use App\Actions\Application\BlueGreen\RecordBlueGreenRoutingMutation;
 use App\Actions\Application\BlueGreen\RecoverBlueGreenFinalizedDrainingOperation;
+use App\Actions\Application\BlueGreen\RecoverBlueGreenIntervention;
 use App\Actions\Application\BlueGreen\RemoveBlueGreenComposeSidecars;
 use App\Actions\Application\BlueGreen\RemoveBlueGreenInactiveContainer;
 use App\Actions\Application\BlueGreen\RemoveBlueGreenReplicaSet;
@@ -181,6 +182,9 @@ final class BlueGreenDeploymentLifecycle
             $this->completedDrainingRecovery = true;
 
             return;
+        }
+        if ($durableState?->phase === BlueGreenDeploymentPhase::INTERVENTION_REQUIRED) {
+            $durableState = $this->recoverInterventionAtDeploymentStart($durableState);
         }
         if ($durableState !== null
             && ($durableState->phase !== BlueGreenDeploymentPhase::IDLE
@@ -925,6 +929,26 @@ final class BlueGreenDeploymentLifecycle
         }
 
         return true;
+    }
+
+    /**
+     * A deployment retry is the operator's recovery intent: run the same classified, lock-guarded
+     * recovery `blue-green:recover-intervention --apply` performs, and keep the lifecycle fence
+     * only when the state stays unrecovered (manual-only or deferred classifications).
+     */
+    private function recoverInterventionAtDeploymentStart(
+        ApplicationBlueGreenDeployment $durableState,
+    ): ?ApplicationBlueGreenDeployment {
+        $result = RecoverBlueGreenIntervention::run(
+            stateId: $durableState->id,
+            apply: true,
+            reason: 'automatic recovery at deployment start',
+        );
+        $this->deployment->addLogEntry(
+            "Blue-green intervention auto-recovery: classification={$result->classification} outcome={$result->outcome} {$result->message}",
+        );
+
+        return ApplicationBlueGreenDeployment::query()->find($durableState->id);
     }
 
     private function initializeDrainingRecovery(ApplicationBlueGreenDeployment $state): void
