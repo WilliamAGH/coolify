@@ -697,6 +697,16 @@ class Server extends BaseModel
 
     public function setupDynamicProxyConfiguration()
     {
+        (new StoreControlPlaneProxyEnrollmentState)->serializeOperation(
+            $this,
+            function (Server $lockedServer): void {
+                $lockedServer->setupDynamicProxyConfigurationWithoutOperationLock();
+            },
+        );
+    }
+
+    private function setupDynamicProxyConfigurationWithoutOperationLock(): void
+    {
         try {
             $enrollment = $this->controlPlaneProxyEnrollmentState();
         } catch (\Throwable $exception) {
@@ -714,8 +724,13 @@ class Server extends BaseModel
                 'Managed control-plane Traefik artifacts exist but the durable enrollment state is missing; operator recovery is required before generic proxy configuration can run.',
             );
         }
-        if ($enrollment !== null && $enrollment->phase !== ControlPlaneProxyEnrollmentPhase::RolledBack) {
-            return;
+        if ($enrollment !== null) {
+            if ($enrollment->phase !== ControlPlaneProxyEnrollmentPhase::RolledBack) {
+                return;
+            }
+            if ($this->hasManagedControlPlaneTraefikArtifacts()) {
+                return;
+            }
         }
 
         $settings = instanceSettings();
@@ -920,6 +935,7 @@ $schema://$host {
         $managedStateDirectory = rtrim($this->proxyPath(), '/').'/.control-plane-managed-traefik';
         $managedFilename = ControlPlaneDynamicConfiguration::MANAGED_FILENAME;
         $artifacts = [
+            $managedStateDirectory,
             $managedStateDirectory.'/.'.$managedFilename.'.state.json',
             $managedStateDirectory.'/.'.$managedFilename.'.writer-authority.json',
         ];

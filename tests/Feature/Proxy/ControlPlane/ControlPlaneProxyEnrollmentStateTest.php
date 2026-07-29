@@ -7,10 +7,12 @@ use App\Actions\Proxy\ControlPlane\ControlPlaneProxyExposure;
 use App\Actions\Proxy\ControlPlane\ControlPlaneStaticProxyConfiguration;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneGenerationPromotionState;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
+use App\Models\InstanceSettings;
 use App\Models\PrivateKey;
 use App\Models\Server;
 use App\Models\Team;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Storage;
 use Symfony\Component\Yaml\Yaml;
@@ -56,6 +58,14 @@ function controlPlaneEnrollmentState(Server $server, string $operationId = 'enro
         dynamicPredecessorBytes: "http:\n  routers:\n    legacy: {}\n",
         timestamp: '2026-07-18T12:00:00Z',
     );
+}
+
+function rolledBackControlPlaneEnrollmentState(Server $server): ControlPlaneProxyEnrollmentState
+{
+    return controlPlaneEnrollmentState($server)
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::RollingBack, '2026-07-18T12:01:00Z')
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement, '2026-07-18T12:02:00Z')
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::RolledBack, '2026-07-18T12:03:00Z');
 }
 
 it('durably reserves and advances one exact enrollment owner idempotently', function () {
@@ -179,6 +189,167 @@ it('preserves managed Traefik artifacts when durable enrollment state is unavail
     'missing enrollment state' => [null],
     'malformed enrollment state' => ['not-an-enrollment-array'],
 ]);
+
+it('preserves the generic dynamic route while a rolled-back enrollment retains managed artifacts', function (): void {
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(
+        ['id' => 0],
+        ['fqdn' => 'https://dashboard.example.test'],
+    ));
+    $team = Team::factory()->create();
+    $privateKey = PrivateKey::factory()->create(['team_id' => $team->id]);
+    $server = Server::factory()->create([
+        'id' => 0,
+        'team_id' => $team->id,
+        'private_key_id' => $privateKey->id,
+        'ip' => 'host.docker.internal',
+    ]);
+    $server->proxy->set('type', 'TRAEFIK');
+    $server->proxy->set(
+        StoreControlPlaneProxyEnrollmentState::STATE_KEY,
+        rolledBackControlPlaneEnrollmentState($server)->toArray(),
+    );
+    $server->save();
+
+    Process::fake([
+        '*control-plane-managed-traefik*' => Process::result(output: 'present'),
+        '*' => Process::result(),
+    ]);
+
+    $server->fresh()->setupDynamicProxyConfiguration();
+
+    Process::assertRan(fn ($process): bool => str_contains((string) $process->command, '.control-plane-managed-traefik'));
+    Process::assertNotRan(fn ($process): bool => str_contains((string) $process->command, 'tee ')
+        && str_contains((string) $process->command, '/dynamic/coolify.yaml'));
+});
+
+it('preserves the generic dynamic route while a rolled-back enrollment retains only its managed state directory', function (): void {
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(
+        ['id' => 0],
+        ['fqdn' => 'https://dashboard.example.test'],
+    ));
+    $team = Team::factory()->create();
+    $privateKey = PrivateKey::factory()->create(['team_id' => $team->id]);
+    $server = Server::factory()->create([
+        'id' => 0,
+        'team_id' => $team->id,
+        'private_key_id' => $privateKey->id,
+        'ip' => 'host.docker.internal',
+    ]);
+    $server->proxy->set('type', 'TRAEFIK');
+    $server->proxy->set(
+        StoreControlPlaneProxyEnrollmentState::STATE_KEY,
+        rolledBackControlPlaneEnrollmentState($server)->toArray(),
+    );
+    $server->save();
+    $managedStateDirectory = rtrim($server->proxyPath(), '/').'/.control-plane-managed-traefik';
+
+    Process::fake([
+        '*' => Process::result(output: 'present'),
+    ]);
+
+    $server->fresh()->setupDynamicProxyConfiguration();
+
+    Process::assertRan(fn ($process): bool => str_contains(
+        (string) $process->command,
+        'for path in '.escapeshellarg($managedStateDirectory),
+    ));
+    Process::assertNotRan(fn ($process): bool => str_contains((string) $process->command, 'tee ')
+        && str_contains((string) $process->command, '/dynamic/coolify.yaml'));
+});
+
+it('resumes generic dynamic route writes after a rolled-back enrollment has no managed artifacts', function (): void {
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(
+        ['id' => 0],
+        ['fqdn' => 'https://dashboard.example.test'],
+    ));
+    $team = Team::factory()->create();
+    $privateKey = PrivateKey::factory()->create(['team_id' => $team->id]);
+    $server = Server::factory()->create([
+        'id' => 0,
+        'team_id' => $team->id,
+        'private_key_id' => $privateKey->id,
+        'ip' => 'host.docker.internal',
+    ]);
+    $server->proxy->set('type', 'TRAEFIK');
+    $server->proxy->set(
+        StoreControlPlaneProxyEnrollmentState::STATE_KEY,
+        rolledBackControlPlaneEnrollmentState($server)->toArray(),
+    );
+    $server->save();
+
+    Process::fake([
+        '*control-plane-managed-traefik*' => Process::result(output: 'absent'),
+        '*' => Process::result(),
+    ]);
+
+    $server->fresh()->setupDynamicProxyConfiguration();
+
+    Process::assertRan(fn ($process): bool => str_contains((string) $process->command, '.control-plane-managed-traefik'));
+    Process::assertRan(fn ($process): bool => str_contains((string) $process->command, 'tee ')
+        && str_contains((string) $process->command, '/dynamic/coolify.yaml'));
+});
+
+it('holds the enrollment operation lock through generic dynamic route writes', function (): void {
+    if (DB::getDriverName() !== 'pgsql') {
+        $this->markTestSkipped('PostgreSQL is required for the enrollment serialization assertion.');
+    }
+
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(
+        ['id' => 0],
+        ['fqdn' => 'https://dashboard.example.test'],
+    ));
+    $team = Team::factory()->create();
+    $privateKey = PrivateKey::factory()->create(['team_id' => $team->id]);
+    $server = Server::factory()->create([
+        'id' => 0,
+        'team_id' => $team->id,
+        'private_key_id' => $privateKey->id,
+        'ip' => 'host.docker.internal',
+    ]);
+    $server->proxy->set('type', 'TRAEFIK');
+    $server->save();
+
+    $connectionName = 'generic_dynamic_proxy_lock_competitor';
+    config()->set("database.connections.{$connectionName}", config('database.connections.'.DB::getDefaultConnection()));
+    $competitor = DB::connection($connectionName);
+    $lockName = StoreControlPlaneProxyEnrollmentState::operationLockName($server->getKey());
+    $lockAttempts = new ArrayObject;
+
+    try {
+        Process::fake(function () use ($competitor, $lockName, $lockAttempts) {
+            $result = $competitor->selectOne(
+                'select case when pg_try_advisory_lock(hashtextextended(?, 0)) then 1 else 0 end as acquired',
+                [$lockName],
+                false,
+            );
+            $acquired = (int) $result->acquired;
+            $lockAttempts->append($acquired);
+            if ($acquired === 1) {
+                $competitor->selectOne('select pg_advisory_unlock(hashtextextended(?, 0))', [$lockName], false);
+            }
+
+            return Process::result();
+        });
+
+        $server->fresh()->setupDynamicProxyConfiguration();
+
+        expect($lockAttempts->getArrayCopy())->not->toBeEmpty()
+            ->each->toBe(0);
+        Process::assertRan(fn ($process): bool => str_contains((string) $process->command, 'tee ')
+            && str_contains((string) $process->command, '/dynamic/coolify.yaml'));
+
+        $released = $competitor->selectOne(
+            'select case when pg_try_advisory_lock(hashtextextended(?, 0)) then 1 else 0 end as acquired',
+            [$lockName],
+            false,
+        );
+        expect((int) $released->acquired)->toBe(1);
+        $competitor->selectOne('select pg_advisory_unlock(hashtextextended(?, 0))', [$lockName], false);
+    } finally {
+        DB::purge($connectionName);
+        config()->set("database.connections.{$connectionName}", null);
+    }
+});
 
 it('rejects foreign owners, stale phases, invalid transitions, and corrupted artifacts', function () {
     $team = Team::factory()->create();
