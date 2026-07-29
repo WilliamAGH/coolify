@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 📚 Documentation
+
+- Update changelog
+
+### 🧪 Testing
+
+- *(blue-green)* Execute journal provenance gate
+
+## [4.13.38-fork] - 2026-07-28
+
 ### 🐛 Bug Fixes
 
 - *(deployment)* Deliver build-server images to the activation server
