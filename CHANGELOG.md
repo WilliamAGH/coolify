@@ -14,9 +14,11 @@ All notable changes to this project will be documented in this file.
 - *(proxy)* Serialize generic control-plane routes
 - *(proxy)* Preserve exact enrollment artifacts
 - *(proxy)* Supersede orphaned enrollment authority
+- *(blue-green)* Attest registry image manifests
 
 ### 📚 Documentation
 
+- Update changelog
 - Update changelog
 - Update changelog
 - Update changelog
