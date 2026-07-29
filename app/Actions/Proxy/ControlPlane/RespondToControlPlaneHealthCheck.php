@@ -34,31 +34,27 @@ final class RespondToControlPlaneHealthCheck
             $revision,
             $dynamicSha256,
         );
-        $candidateIdentity = $this->candidateMarkerIdentity();
 
         if ($suppliedAcknowledgement === null && $suppliedHealthProof === null) {
             $response = response('OK');
             if ($this->validDeploymentReleaseProof($deploymentReleaseProof)) {
                 $response->header(BlueGreenRoutingTarget::RELEASE_PROOF_HEADER, $deploymentReleaseProof);
             }
-            if ($configuredIdentity !== null) {
+            $identity = $configuredIdentity ?? $this->candidateMarkerIdentity();
+            if ($identity !== null) {
                 $response->withHeaders($this->backendIdentityHeaders(
-                    $configuredIdentity['member'],
-                    $configuredIdentity['revision'],
-                    $configuredIdentity['dynamicSha256'],
-                ));
-            } elseif ($candidateIdentity !== null) {
-                $response->withHeaders($this->backendIdentityHeaders(
-                    $candidateIdentity['member'],
-                    $candidateIdentity['revision'],
-                    $candidateIdentity['dynamicSha256'],
+                    $identity['member'],
+                    $identity['revision'],
+                    $identity['dynamicSha256'],
                 ));
             }
 
             return $response;
         }
 
-        $identity = $candidateIdentity ?? $configuredIdentity;
+        $identity = $suppliedAcknowledgement !== null
+            ? $configuredIdentity ?? $this->candidateMarkerIdentity()
+            : $this->candidateMarkerIdentity() ?? $configuredIdentity;
         if ($identity === null) {
             return response('', Response::HTTP_SERVICE_UNAVAILABLE);
         }
