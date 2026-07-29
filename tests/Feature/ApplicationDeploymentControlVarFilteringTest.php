@@ -507,3 +507,46 @@ it('builds preview railpack variables without leaking stale nixpacks vars', func
     expect($variables->has('NIXPACKS_NODE_VERSION'))->toBeFalse();
     expect($variables->has('PREVIEW_RUNTIME_ONLY'))->toBeFalse();
 });
+
+it('reserves source commit provenance across build-pack inputs', function (int $pullRequestId, bool $isPreview) {
+    [$application, $server] = makeDeploymentControlVarFixture([
+        'build_pack' => 'nixpacks',
+        'fqdn' => 'https://source-commit.example.com',
+    ]);
+    $application->settings()->update([
+        'include_source_commit_in_build' => true,
+    ]);
+    createApplicationEnvironmentVariable($application, [
+        'key' => 'SOURCE_COMMIT',
+        'value' => 'user-defined-value-must-not-win',
+        'is_preview' => $isPreview,
+        'is_runtime' => false,
+        'is_buildtime' => true,
+    ]);
+
+    $trustedCommit = '2059234c16e832002b621b120d9166b21ad419f2';
+    [$job, $reflection] = makeControlVarFilteringJob($application->fresh(), $server, [
+        'build_pack' => 'nixpacks',
+        'commit' => $trustedCommit,
+        'pull_request_id' => $pullRequestId,
+    ]);
+
+    invokeDeploymentJobMethod($job, $reflection, 'generate_nixpacks_env_variables');
+    $nixpacksArgs = readDeploymentJobProperty($job, $reflection, 'env_nixpacks_args');
+    /** @var Collection $railpackVariables */
+    $railpackVariables = invokeDeploymentJobMethod($job, $reflection, 'railpack_build_variables');
+    /** @var Collection $buildtimeEnvironment */
+    $buildtimeEnvironment = invokeDeploymentJobMethod($job, $reflection, 'generate_buildtime_environment_variables');
+
+    expect($nixpacksArgs)
+        ->toContain("--env 'SOURCE_COMMIT={$trustedCommit}'")
+        ->not->toContain('user-defined-value-must-not-win')
+        ->and($railpackVariables->get('SOURCE_COMMIT'))
+        ->toBe($trustedCommit)
+        ->and($buildtimeEnvironment)
+        ->toContain("SOURCE_COMMIT='{$trustedCommit}'")
+        ->not->toContain('SOURCE_COMMIT="user-defined-value-must-not-win"');
+})->with([
+    'production' => [0, false],
+    'preview' => [123, true],
+]);
