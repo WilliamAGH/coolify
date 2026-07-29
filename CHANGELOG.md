@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🐛 Bug Fixes
+
+- *(control-plane)* Fence migration and rollback recovery
+
+### 📚 Documentation
+
+- Update changelog
+
+## [4.13.40-fork] - 2026-07-29
+
 ### 🚀 Features
 
 - *(proxy)* Expose read-only attestor identity
