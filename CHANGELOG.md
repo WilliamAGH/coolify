@@ -4,8 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🐛 Bug Fixes
+
+- *(blue-green)* Accept canonical journal boot UUIDs
+- *(proxy)* Preserve managed control-plane routes
+
 ### 📚 Documentation
 
+- Update changelog
 - Update changelog
 
 ### 🧪 Testing
