@@ -27,30 +27,38 @@ final class RespondToControlPlaneHealthCheck
         $suppliedAcknowledgement = $request->header(ControlPlaneDynamicConfiguration::CONFIGURATION_ACKNOWLEDGEMENT_HEADER);
         $suppliedHealthProof = $request->header(ControlPlaneDynamicConfiguration::HEALTH_PROOF_HEADER);
 
-        $identity = $this->configuredIdentity(
+        $configuredIdentity = $this->configuredIdentity(
             $configurationAcknowledgement,
             $healthProofTokenSha256,
             $member,
             $revision,
             $dynamicSha256,
-        ) ?? $this->candidateMarkerIdentity();
+        );
+        $candidateIdentity = $this->candidateMarkerIdentity();
 
         if ($suppliedAcknowledgement === null && $suppliedHealthProof === null) {
             $response = response('OK');
             if ($this->validDeploymentReleaseProof($deploymentReleaseProof)) {
                 $response->header(BlueGreenRoutingTarget::RELEASE_PROOF_HEADER, $deploymentReleaseProof);
             }
-            if ($identity !== null) {
+            if ($configuredIdentity !== null) {
                 $response->withHeaders($this->backendIdentityHeaders(
-                    $identity['member'],
-                    $identity['revision'],
-                    $identity['dynamicSha256'],
+                    $configuredIdentity['member'],
+                    $configuredIdentity['revision'],
+                    $configuredIdentity['dynamicSha256'],
+                ));
+            } elseif ($candidateIdentity !== null) {
+                $response->withHeaders($this->backendIdentityHeaders(
+                    $candidateIdentity['member'],
+                    $candidateIdentity['revision'],
+                    $candidateIdentity['dynamicSha256'],
                 ));
             }
 
             return $response;
         }
 
+        $identity = $candidateIdentity ?? $configuredIdentity;
         if ($identity === null) {
             return response('', Response::HTTP_SERVICE_UNAVAILABLE);
         }

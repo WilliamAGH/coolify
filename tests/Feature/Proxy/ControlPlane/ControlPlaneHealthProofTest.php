@@ -123,14 +123,7 @@ it('omits backend identity from ordinary health when enrollment identity is inco
         ->assertHeaderMissing(ControlPlaneProxyRouteProof::DYNAMIC_SHA256_HEADER);
 });
 
-it('uses the exact container-local candidate marker before static handoff', function (): void {
-    config([
-        'constants.control_plane_health.configuration_acknowledgement' => null,
-        'constants.control_plane_health.health_proof_token_sha256' => null,
-        'constants.control_plane_health.dynamic_sha256' => null,
-        'constants.control_plane_health.member' => null,
-        'constants.control_plane_health.revision' => null,
-    ]);
+it('prefers the exact container-local candidate proof over stale configured identity while preserving ordinary health', function (): void {
     $derivedHealthProof = hash_hmac(
         'sha256',
         ControlPlaneDynamicConfiguration::HEALTH_PROOF_DERIVATION_CONTEXT,
@@ -148,6 +141,13 @@ it('uses the exact container-local candidate marker before static handoff', func
     file_put_contents($markerPath, $marker->toJson());
 
     try {
+        $ordinaryResponse = (new RespondToControlPlaneHealthCheck($markerPath))->handle(Request::create('/api/health'));
+        expect($ordinaryResponse->getStatusCode())->toBe(200)
+            ->and($ordinaryResponse->getContent())->toBe('OK')
+            ->and($ordinaryResponse->headers->get(ControlPlaneProxyRouteProof::BACKEND_MEMBER_HEADER))->toBe('blue')
+            ->and($ordinaryResponse->headers->get(ControlPlaneProxyRouteProof::BACKEND_REVISION_HEADER))->toBe('revision-42')
+            ->and($ordinaryResponse->headers->get(ControlPlaneProxyRouteProof::DYNAMIC_SHA256_HEADER))->toBe(str_repeat('d', 64));
+
         $request = Request::create('/api/health');
         $request->headers->set(ControlPlaneDynamicConfiguration::HEALTH_PROOF_HEADER, $derivedHealthProof);
         $response = (new RespondToControlPlaneHealthCheck($markerPath))->handle($request);
@@ -156,6 +156,10 @@ it('uses the exact container-local candidate marker before static handoff', func
             ->and($response->headers->get(ControlPlaneProxyRouteProof::BACKEND_MEMBER_HEADER))->toBe('green')
             ->and($response->headers->get(ControlPlaneProxyRouteProof::BACKEND_REVISION_HEADER))->toBe('revision-43')
             ->and($response->headers->get(ControlPlaneProxyRouteProof::DYNAMIC_SHA256_HEADER))->toBe(str_repeat('e', 64));
+
+        $staleConfiguredRequest = Request::create('/api/health');
+        $staleConfiguredRequest->headers->set(ControlPlaneDynamicConfiguration::HEALTH_PROOF_HEADER, 'health-proof-token');
+        expect((new RespondToControlPlaneHealthCheck($markerPath))->handle($staleConfiguredRequest)->getStatusCode())->toBe(401);
 
         $invalidRequest = Request::create('/api/health');
         $invalidRequest->headers->set(ControlPlaneDynamicConfiguration::HEALTH_PROOF_HEADER, str_repeat('0', 64));
