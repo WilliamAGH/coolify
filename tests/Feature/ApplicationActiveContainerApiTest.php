@@ -14,6 +14,7 @@ use App\Models\StandaloneDocker;
 use App\Models\Team;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Collection;
 
 uses(RefreshDatabase::class);
 
@@ -185,6 +186,30 @@ it('fails closed when only a stale ordinary deployment is observable', function 
     ))->toBeNull();
 });
 
+it('fails closed when an ordinary deployment has more than one matching container', function () {
+    $destinationId = (int) $this->application->destination_id;
+    $matchingContainers = collect([
+        ordinaryApplicationContainer(
+            (int) $this->application->id,
+            str_repeat('3', 64),
+            'deployment-duplicate',
+            'registry.example/app:duplicate',
+        ),
+        ordinaryApplicationContainer(
+            (int) $this->application->id,
+            str_repeat('4', 64),
+            'deployment-duplicate',
+            'registry.example/app:duplicate',
+        ),
+    ]);
+
+    expect((new ResolveActiveApplicationContainerState)->resolveOrdinaryFromContainers(
+        (int) $this->application->id,
+        collect([$destinationId => 'deployment-duplicate']),
+        collect([$destinationId => $matchingContainers]),
+    ))->toBeNull();
+});
+
 it('fails closed when configured and observed destination inventories differ', function () {
     $action = new ResolveActiveApplicationContainerState;
 
@@ -230,6 +255,109 @@ it('fails closed while an ordinary deployment can change the current container',
         $this->application,
         collect([$destinationId]),
     ))->toBeNull();
+});
+
+it('excludes only the exact current restart when resolving the ordinary predecessor', function () {
+    $destinationId = (int) $this->application->destination_id;
+    ApplicationDeploymentQueue::query()->create([
+        'application_id' => $this->application->id,
+        'deployment_uuid' => 'deployment-current',
+        'destination_id' => $destinationId,
+        'status' => ApplicationDeploymentStatus::FINISHED->value,
+    ]);
+    $restart = ApplicationDeploymentQueue::query()->create([
+        'application_id' => $this->application->id,
+        'deployment_uuid' => 'deployment-restart',
+        'destination_id' => $destinationId,
+        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+        'restart_only' => true,
+    ]);
+
+    expect(ResolveOrdinaryApplicationDeploymentUuids::run(
+        $this->application,
+        collect([$destinationId]),
+    ))->toBeNull()
+        ->and(ResolveOrdinaryApplicationDeploymentUuids::run(
+            $this->application,
+            collect([$destinationId]),
+            $restart->id,
+        )?->all())->toBe([$destinationId => 'deployment-current'])
+        ->and((new ResolveOrdinaryApplicationDeploymentUuids)->currentRestartDeploymentUuids(
+            $this->application,
+            collect([$destinationId]),
+            $restart->id,
+        )?->all())->toBe([$destinationId => 'deployment-restart']);
+
+    $restart->update(['restart_only' => false]);
+
+    expect(ResolveOrdinaryApplicationDeploymentUuids::run(
+        $this->application,
+        collect([$destinationId]),
+        $restart->id,
+    ))->toBeNull()
+        ->and((new ResolveOrdinaryApplicationDeploymentUuids)->currentRestartDeploymentUuids(
+            $this->application,
+            collect([$destinationId]),
+            $restart->id,
+        ))->toBeNull();
+});
+
+it('fails current restart recovery when a competing deployment appears during container observation', function () {
+    $destinationId = (int) $this->application->destination_id;
+    ApplicationDeploymentQueue::query()->create([
+        'application_id' => $this->application->id,
+        'deployment_uuid' => 'deployment-current',
+        'destination_id' => $destinationId,
+        'status' => ApplicationDeploymentStatus::FINISHED->value,
+    ]);
+    $restart = ApplicationDeploymentQueue::query()->create([
+        'application_id' => $this->application->id,
+        'deployment_uuid' => 'deployment-restart',
+        'destination_id' => $destinationId,
+        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+        'restart_only' => true,
+    ]);
+    $competingDeploymentCreated = false;
+    $observedContainer = ordinaryApplicationContainer(
+        (int) $this->application->id,
+        str_repeat('2', 64),
+        $restart->deployment_uuid,
+        "{$this->application->uuid}:restart-current",
+    );
+    $resolver = new class($destinationId, (int) $this->application->id, $observedContainer, function () use (&$competingDeploymentCreated): void {
+        $competingDeploymentCreated = true;
+    },
+    ) extends ResolveActiveApplicationContainerState {
+        public function __construct(
+            private readonly int $destinationId,
+            private readonly int $applicationId,
+            private readonly array $observedContainer,
+            private readonly Closure $onContainerObservation,
+        ) {}
+
+        protected function containersByDestination(
+            Collection $destinationIds,
+            Collection $destinations,
+        ): ?Collection {
+            ($this->onContainerObservation)();
+            ApplicationDeploymentQueue::query()->create([
+                'application_id' => $this->applicationId,
+                'deployment_uuid' => 'deployment-competing',
+                'destination_id' => $this->destinationId,
+                'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+            ]);
+
+            return collect([
+                $this->destinationId => collect([$this->observedContainer]),
+            ]);
+        }
+    };
+
+    expect($resolver->handleCurrentOrdinaryRestart(
+        $this->application,
+        $restart->id,
+    ))->toBeNull()
+        ->and($competingDeploymentCreated)->toBeTrue();
 });
 
 it('fails closed when no exact active container image is observable', function () {

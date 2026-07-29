@@ -58,6 +58,23 @@ it('stores a diff between successful deployments', function () {
         ->and(data_get($secondDeployment->configuration_diff, 'changes.0.label'))->toBe('Build command');
 });
 
+it('records an exact deployed snapshot without hiding later configuration changes', function () {
+    $application = configurationChangedTestApplication();
+    $deployedConfigurationSnapshot = $application->deploymentConfigurationSnapshot();
+    $deployment = configurationChangedDeployment($application);
+    $application->update(['build_command' => 'pnpm build']);
+
+    $application->markDeploymentConfigurationSnapshotApplied(
+        $deployment,
+        $deployedConfigurationSnapshot,
+    );
+
+    expect($deployment->refresh()->configuration_snapshot)->toBe($deployedConfigurationSnapshot)
+        ->and($application->refresh()->pendingDeploymentConfigurationDiff()->isChanged())->toBeTrue()
+        ->and(collect($application->pendingDeploymentConfigurationDiff()->changes())->pluck('label')->all())
+        ->toContain('Build command');
+});
+
 it('checks legacy preview deployment configuration hash using preview environment variable query', function () {
     $application = configurationChangedTestApplication();
 

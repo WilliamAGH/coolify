@@ -2,6 +2,7 @@
 
 namespace App\Jobs;
 
+use App\Actions\Application\BlueGreen\ActiveApplicationContainerState;
 use App\Actions\Application\BlueGreen\BlueGreenComposeSidecarDeactivationPlan;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenLifecycleDatabaseLocks;
@@ -9,6 +10,7 @@ use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
 use App\Actions\Application\BlueGreen\FindBlueGreenDeactivationFence;
 use App\Actions\Application\BlueGreen\RemoveBlueGreenComposeSidecars;
+use App\Actions\Application\BlueGreen\ResolveActiveApplicationContainerState;
 use App\Actions\Application\BlueGreen\StartBlueGreenComposeSidecars;
 use App\Actions\Application\StampApplicationDeploymentProvenance;
 use App\Actions\Application\WaitForSwarmStackConvergence;
@@ -38,6 +40,7 @@ use App\Models\SwarmDocker;
 use App\Notifications\Application\DeploymentFailed;
 use App\Notifications\Application\DeploymentSuccess;
 use App\Services\BlueGreenDeploymentLifecycle;
+use App\Services\DeploymentConfiguration\ApplicationConfigurationSnapshot;
 use App\Support\BlueGreenComposeTopology;
 use App\Support\ValidationPatterns;
 use App\Traits\EnvironmentVariableAnalyzer;
@@ -156,7 +159,14 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
 
     private bool $force_rebuild;
 
-    private bool $restart_only;
+    private bool $restart_only = false;
+
+    private ?ActiveApplicationContainerState $restartActiveContainer = null;
+
+    private ?string $restartConfigurationHash = null;
+
+    /** @var array<string, mixed>|null */
+    private ?array $restartConfigurationSnapshot = null;
 
     private ?string $dockerImage = null;
 
@@ -352,7 +362,6 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             $this->force_rebuild = true;
         }
         $this->restart_only = $this->application_deployment_queue->restart_only;
-        $this->restart_only = $this->restart_only && $this->application->build_pack !== 'dockerimage' && $this->application->build_pack !== 'dockerfile';
         $this->only_this_server = $this->application_deployment_queue->only_this_server;
         $this->dockerImagePreviewTag = $this->application_deployment_queue->docker_registry_image_tag;
         $this->validateDockerRegistryImageConfiguration();
@@ -467,6 +476,9 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         try {
             // Make sure the private key is stored in the filesystem
             $this->server->privateKey->storeInFileSystem();
+            if ($this->restart_only && ! $this->activationOnly) {
+                $this->prepareRestartContext();
+            }
             if ($this->pull_request_id === 0
                 && $this->destination instanceof StandaloneDocker) {
                 $this->blueGreenLifecycle = new BlueGreenDeploymentLifecycle(
@@ -563,7 +575,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
 
             if ($this->activationOnly) {
                 $this->restorePreparedBuildServer();
-            } elseif (data_get($this->application, 'settings.is_build_server_enabled')) {
+            } elseif (! $this->restart_only && data_get($this->application, 'settings.is_build_server_enabled')) {
                 $teamId = data_get($this->application, 'environment.project.team.id');
                 $buildServers = Server::buildServers($teamId)->get();
                 if ($buildServers->count() === 0) {
@@ -589,7 +601,9 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
                 $this->activatePreparedDeployment();
                 $this->post_deployment();
             } else {
-                $this->detectBuildKitCapabilities();
+                if (! $this->restart_only) {
+                    $this->detectBuildKitCapabilities();
+                }
                 $this->decide_what_to_do();
             }
         } catch (Throwable $e) {
@@ -1785,24 +1799,102 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
 
     private function just_restart()
     {
-        $this->application_deployment_queue->addLogEntry("Restarting {$this->customRepository}:{$this->application->git_branch} on {$this->server->name}.");
+        $activeContainer = ResolveActiveApplicationContainerState::run(
+            $this->application,
+            $this->application_deployment_queue->id,
+        );
+        if ($this->restartActiveContainer === null
+            || $activeContainer === null
+            || $activeContainer->image !== $this->restartActiveContainer->image
+            || $activeContainer->imageReference !== $this->restartActiveContainer->imageReference
+            || $activeContainer->destination !== $this->restartActiveContainer->destination) {
+            throw new DeploymentException('The active runtime changed after restart preflight.');
+        }
 
-        // Restart doesn't need the build server — disable it so the helper container
-        // is created on the deployment server with the correct network/flags.
-        $originalUseBuildServer = $this->use_build_server;
-        $this->use_build_server = false;
-
+        $this->application_deployment_queue->addLogEntry("Restarting the active runtime image on {$this->server->name}.");
         $this->prepare_builder_image();
-        $this->check_git_if_build_needed();
-        $this->generate_image_names();
-        $this->check_image_locally_or_remotely();
+        $this->production_image_name = $this->restartImageReference($activeContainer->image);
+        $safeActiveImage = escapeshellarg($activeContainer->image);
+        $safeRestartImage = escapeshellarg($this->production_image_name);
+        $inspectImageId = 'docker image inspect --format='.escapeshellarg('{{.Id}}');
+        $this->execute_remote_command([
+            executeInDocker(
+                $this->deployment_uuid,
+                "active_image_id=\$({$inspectImageId} {$safeActiveImage}); "
+                    ."test \"\$active_image_id\" = {$safeActiveImage}; "
+                    ."docker image tag {$safeActiveImage} {$safeRestartImage}; "
+                    ."restart_image_id=\$({$inspectImageId} {$safeRestartImage}); "
+                    ."test \"\$restart_image_id\" = {$safeActiveImage}",
+            ),
+            'hidden' => true,
+        ]);
+        $this->set_coolify_variables();
+        $this->skip_build = true;
+        $this->assertRestartConfigurationUnchanged();
+        $this->generate_compose_file();
+        $this->save_runtime_environment_variables();
+        $this->assertRestartConfigurationUnchanged();
+        $this->activate_prepared_runtime();
+    }
 
-        // Restore before should_skip_build() — it may re-enter decide_what_to_do()
-        // for a full rebuild which needs the build server.
-        $this->use_build_server = $originalUseBuildServer;
+    private function prepareRestartContext(): void
+    {
+        $this->restartConfigurationSnapshot = $this->application->deploymentConfigurationSnapshot();
+        $this->restartConfigurationHash = ApplicationConfigurationSnapshot::hashSnapshot(
+            $this->restartConfigurationSnapshot,
+        );
+        $this->assertRestartSupported();
+        $this->restartActiveContainer = ResolveActiveApplicationContainerState::run(
+            $this->application,
+            $this->application_deployment_queue->id,
+        );
+        if ($this->restartActiveContainer === null) {
+            throw new DeploymentException('Restart requires one unambiguous active runtime image.');
+        }
+    }
 
-        $this->should_skip_build();
-        $this->completeDeployment();
+    private function assertRestartSupported(): void
+    {
+        if ($this->application->build_pack === 'dockercompose') {
+            throw new DeploymentException('Restarting a Docker Compose application requires a deploy because its topology comes from the source Compose file.');
+        }
+        if ($this->server->isSwarm()) {
+            throw new DeploymentException('Restarting a Swarm application requires a deploy because its topology is owned by the deployed stack.');
+        }
+        if ($this->pull_request_id !== 0) {
+            throw new DeploymentException('Restarting a pull request preview requires a deploy because previews do not own a stable active runtime image.');
+        }
+        if (count($this->application->ports_mappings_array) > 0
+            || (bool) $this->application->settings->is_consistent_container_name_enabled
+            || str($this->application->settings->custom_internal_name)->isNotEmpty()
+            || str($this->application->custom_docker_run_options)->contains('--ip')
+            || str($this->application->custom_docker_run_options)->contains('--ip6')) {
+            throw new DeploymentException('Restart requires a deploy for applications that must stop the active container before replacement.');
+        }
+        if ($this->application->additional_networks->isNotEmpty()) {
+            throw new DeploymentException('Restarting an application with additional destinations requires a fleet-aware deploy.');
+        }
+        if ($this->application->pendingDeploymentConfigurationDiff()->isChanged()) {
+            throw new DeploymentException('Restart cannot apply pending configuration changes; deploy them first.');
+        }
+    }
+
+    private function assertRestartConfigurationUnchanged(): void
+    {
+        if ($this->restartConfigurationHash === null
+            || ! hash_equals(
+                $this->restartConfigurationHash,
+                $this->application->fresh()->deploymentConfigurationHash(),
+            )) {
+            throw new DeploymentException('Application configuration changed during restart preparation.');
+        }
+    }
+
+    private function restartImageReference(string $activeImage): string
+    {
+        $restartTag = hash('sha256', $this->deployment_uuid."\0".$activeImage);
+
+        return "{$this->application->uuid}:restart-{$restartTag}";
     }
 
     private function should_skip_build()
@@ -1839,10 +1931,6 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             }
         } else {
             $this->application_deployment_queue->addLogEntry("Image not found ({$this->production_image_name}). Building new image.");
-        }
-        if ($this->restart_only) {
-            $this->restart_only = false;
-            $this->decide_what_to_do();
         }
 
         return false;
@@ -3008,7 +3096,12 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         }
 
         $artifact = [
-            'application_configuration_hash' => $this->application->deploymentConfigurationHash(),
+            'application_configuration_hash' => $this->restart_only
+                ? $this->preparedRestartConfigurationHash()
+                : $this->application->deploymentConfigurationHash(),
+            'application_configuration_snapshot' => $this->restart_only
+                ? $this->preparedRestartConfigurationSnapshot()
+                : null,
             'artifact_digest' => $artifactDigest,
             'blue_green_claim' => $this->preparedBlueGreenClaimArtifact($blueGreenClaim),
             'build_image_name' => $this->build_image_name ?? null,
@@ -3025,6 +3118,9 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             'docker_image_tag' => $this->dockerImageTag,
             'production_image_name' => $this->production_image_name ?? null,
             'prepared_compose_images' => $this->preparedBlueGreenComposeImages,
+            'restart_active_container' => $this->restartActiveContainer === null
+                ? null
+                : $this->restartActiveContainerArtifact($this->restartActiveContainer),
             'runtime_environment_sha256' => $runtimeEnvironmentSha256,
             'runtime_render_deferred' => $blueGreenClaim !== null,
             'use_build_server' => $this->use_build_server,
@@ -3254,7 +3350,9 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
                 throw new DeploymentException('Prepared deployment has no production image identity.');
             }
             $safeImage = escapeshellarg($this->production_image_name);
-            if ($this->application->build_pack === 'dockerimage' && $this->preparationOnly) {
+            if ($this->application->build_pack === 'dockerimage'
+                && $this->preparationOnly
+                && ! $this->restart_only) {
                 $this->execute_remote_command([
                     executeInDocker($this->deployment_uuid, "docker pull {$safeImage}"),
                     'hidden' => true,
@@ -3487,14 +3585,22 @@ BASH;
 
     private function hydratePreparedActivation(): void
     {
-        $payload = $this->application_deployment_queue->validatedPreparedActivationPayload();
-        $artifact = $payload['artifact'];
+        $preparedActivation = $this->application_deployment_queue->validatedPreparedActivationPayload();
+        $artifact = $preparedActivation['artifact'];
         if (($artifact['build_pack'] ?? null) !== $this->application->build_pack
             || ($artifact['deployment_uuid'] ?? null) !== $this->deployment_uuid
             || (bool) ($artifact['use_build_server'] ?? false) !== $this->use_build_server
             || ($artifact['build_server_id'] ?? null) !== ($this->use_build_server ? $this->build_server->id : null)) {
             throw new DeploymentException('Prepared deployment artifact identity no longer matches the activation target.');
         }
+        $this->assertPreparedRestartActiveContainer(
+            $artifact['restart_active_container'] ?? null,
+            $artifact['production_image_name'] ?? null,
+        );
+        $this->hydratePreparedRestartConfiguration(
+            $artifact['application_configuration_hash'] ?? null,
+            $artifact['application_configuration_snapshot'] ?? null,
+        );
 
         $this->build_image_name = (string) ($artifact['build_image_name'] ?? '');
         $this->production_image_name = (string) ($artifact['production_image_name'] ?? '');
@@ -3575,6 +3681,170 @@ BASH;
                 $this->save_runtime_environment_variables();
             }
         }
+    }
+
+    /**
+     * @return array{
+     *     image: string,
+     *     image_reference: string,
+     *     destination: non-empty-list<array{
+     *         destination_id: int,
+     *         deployment_uuid: string,
+     *         color: string|null,
+     *         routing_revision: int|null,
+     *         container_ids: non-empty-list<string>
+     *     }>
+     * }
+     */
+    private function restartActiveContainerArtifact(ActiveApplicationContainerState $activeContainer): array
+    {
+        return [
+            'image' => $activeContainer->image,
+            'image_reference' => $activeContainer->imageReference,
+            'destination' => $activeContainer->destination,
+        ];
+    }
+
+    private function assertPreparedRestartActiveContainer(
+        mixed $preparedActiveContainer,
+        mixed $preparedImageReference,
+    ): void {
+        if (! $this->restart_only) {
+            if ($preparedActiveContainer !== null) {
+                throw new DeploymentException('A non-restart activation carries unexpected active runtime provenance.');
+            }
+
+            return;
+        }
+        $this->assertRestartSupported();
+        if (! is_array($preparedActiveContainer)
+            || ! is_string($preparedImageReference)
+            || $preparedImageReference === '') {
+            throw new DeploymentException('The active runtime changed after restart preparation.');
+        }
+
+        $activeContainer = ResolveActiveApplicationContainerState::run(
+            $this->application,
+            $this->application_deployment_queue->id,
+        );
+        if ($activeContainer !== null
+            && $preparedActiveContainer === $this->restartActiveContainerArtifact($activeContainer)) {
+            $this->restartActiveContainer = $activeContainer;
+
+            return;
+        }
+        if ($activeContainer === null) {
+            $activeContainer = app(ResolveActiveApplicationContainerState::class)
+                ->handleCurrentOrdinaryRestart(
+                    $this->application,
+                    $this->application_deployment_queue->id,
+                );
+        }
+        if ($activeContainer === null
+            || ! $this->isPreparedRestartRecoveryState(
+                $activeContainer,
+                $preparedActiveContainer,
+                $preparedImageReference,
+            )) {
+            throw new DeploymentException('The active runtime changed after restart preparation.');
+        }
+        $this->restartActiveContainer = $activeContainer;
+    }
+
+    private function isPreparedRestartRecoveryState(
+        ActiveApplicationContainerState $activeContainer,
+        array $preparedActiveContainer,
+        string $preparedImageReference,
+    ): bool {
+        $preparedImage = $preparedActiveContainer['image'] ?? null;
+        $preparedDestinations = $preparedActiveContainer['destination'] ?? null;
+        if (! is_string($preparedImage)
+            || ! is_array($preparedDestinations)
+            || $activeContainer->image !== $preparedImage
+            || $activeContainer->imageReference !== $preparedImageReference) {
+            return false;
+        }
+
+        $preparedDestinationIds = collect($preparedDestinations)
+            ->pluck('destination_id')
+            ->map(static fn (mixed $destinationId): int => (int) $destinationId)
+            ->sort()
+            ->values()
+            ->all();
+        $activeDestinationIds = collect($activeContainer->destination)
+            ->pluck('destination_id')
+            ->map(static fn (mixed $destinationId): int => (int) $destinationId)
+            ->sort()
+            ->values()
+            ->all();
+
+        return $preparedDestinationIds !== []
+            && $preparedDestinationIds === $activeDestinationIds
+            && collect($activeContainer->destination)->every(
+                fn (array $destination): bool => ($destination['deployment_uuid'] ?? null) === $this->deployment_uuid,
+            );
+    }
+
+    private function hydratePreparedRestartConfiguration(
+        mixed $preparedConfigurationHash,
+        mixed $preparedConfigurationSnapshot,
+    ): void {
+        if (! $this->restart_only) {
+            if ($preparedConfigurationSnapshot !== null) {
+                throw new DeploymentException('A non-restart activation carries an unexpected configuration snapshot.');
+            }
+
+            return;
+        }
+        if (! is_string($preparedConfigurationHash)
+            || preg_match('/\A[a-f0-9]{64}\z/D', $preparedConfigurationHash) !== 1
+            || ! is_array($preparedConfigurationSnapshot)
+            || ! hash_equals(
+                $preparedConfigurationHash,
+                ApplicationConfigurationSnapshot::hashSnapshot($preparedConfigurationSnapshot),
+            )) {
+            throw new DeploymentException('Prepared restart configuration provenance is invalid.');
+        }
+        $this->restartConfigurationHash = $preparedConfigurationHash;
+        $this->restartConfigurationSnapshot = $preparedConfigurationSnapshot;
+    }
+
+    private function preparedRestartConfigurationHash(): string
+    {
+        $this->restorePreparedRestartConfiguration();
+        if ($this->restartConfigurationHash === null) {
+            throw new DeploymentException('Restart preparation has no configuration hash.');
+        }
+
+        return $this->restartConfigurationHash;
+    }
+
+    /** @return array<string, mixed> */
+    private function preparedRestartConfigurationSnapshot(): array
+    {
+        $this->restorePreparedRestartConfiguration();
+        if ($this->restartConfigurationSnapshot === null
+            || ! hash_equals(
+                $this->preparedRestartConfigurationHash(),
+                ApplicationConfigurationSnapshot::hashSnapshot($this->restartConfigurationSnapshot),
+            )) {
+            throw new DeploymentException('Restart preparation has no exact configuration snapshot.');
+        }
+
+        return $this->restartConfigurationSnapshot;
+    }
+
+    private function restorePreparedRestartConfiguration(): void
+    {
+        if ($this->restartConfigurationHash !== null && $this->restartConfigurationSnapshot !== null) {
+            return;
+        }
+        $preparedActivation = $this->application_deployment_queue->validatedPreparedActivationPayload();
+        $artifact = $preparedActivation['artifact'];
+        $this->hydratePreparedRestartConfiguration(
+            $artifact['application_configuration_hash'] ?? null,
+            $artifact['application_configuration_snapshot'] ?? null,
+        );
     }
 
     /** @param array<string, mixed> $artifact */
@@ -3844,12 +4114,13 @@ BASH;
             }
             $runCommand = "docker run -d --name {$this->deployment_uuid} {$env_flags} --rm -v {$this->serverUserHomeDir}/.docker/config.json:/root/.docker/config.json:ro {$buildxMetadataVolume} -v /var/run/docker.sock:/var/run/docker.sock {$helperImage}";
         } else {
+            $helperPullPolicy = $this->restart_only ? '--pull=never ' : '';
             if ($this->dockerConfigFileExists === 'OK') {
                 $safeNetwork = escapeshellarg($this->destination->network);
-                $runCommand = "docker run -d --network {$safeNetwork} --name {$this->deployment_uuid} {$env_flags} --rm -v {$this->serverUserHomeDir}/.docker/config.json:/root/.docker/config.json:ro {$buildxMetadataVolume} -v /var/run/docker.sock:/var/run/docker.sock {$helperImage}";
+                $runCommand = "docker run {$helperPullPolicy}-d --network {$safeNetwork} --name {$this->deployment_uuid} {$env_flags} --rm -v {$this->serverUserHomeDir}/.docker/config.json:/root/.docker/config.json:ro {$buildxMetadataVolume} -v /var/run/docker.sock:/var/run/docker.sock {$helperImage}";
             } else {
                 $safeNetwork = escapeshellarg($this->destination->network);
-                $runCommand = "docker run -d --network {$safeNetwork} --name {$this->deployment_uuid} {$env_flags} --rm {$buildxMetadataVolume} -v /var/run/docker.sock:/var/run/docker.sock {$helperImage}";
+                $runCommand = "docker run {$helperPullPolicy}-d --network {$safeNetwork} --name {$this->deployment_uuid} {$env_flags} --rm {$buildxMetadataVolume} -v /var/run/docker.sock:/var/run/docker.sock {$helperImage}";
             }
         }
         if ($firstTry) {
@@ -5046,7 +5317,8 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
             ->toArray();
 
         // Check for custom HEALTHCHECK
-        if ($this->application->build_pack === 'dockerfile' || $this->application->dockerfile) {
+        if (! $this->restart_only
+            && ($this->application->build_pack === 'dockerfile' || $this->application->dockerfile)) {
             $this->execute_remote_command([
                 executeInDocker($this->deployment_uuid, "cat {$this->workdir}{$this->dockerfile_location}"),
                 'hidden' => true,
@@ -5900,9 +6172,10 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         $sidecarPlan = $this->firstAdoptionComposeSidecarPlan();
         $sidecarStarter = new StartBlueGreenComposeSidecars;
         $blueGreenCandidateService = $this->blueGreenComposeCandidateServiceArguments();
+        $reusePreparedRuntime = $this->activationOnly || $this->restart_only;
 
         if ($this->application->build_pack === 'dockerimage') {
-            if (! $this->activationOnly) {
+            if (! $reusePreparedRuntime) {
                 $this->application_deployment_queue->addLogEntry('Pulling latest images from the registry.');
                 $commands[] = executeInDocker(
                     $this->deployment_uuid,
@@ -5912,7 +6185,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
             $commands[] = executeInDocker(
                 $this->deployment_uuid,
                 "{$this->coolify_variables} docker compose --project-name {$this->application->uuid} --project-directory {$this->workdir} up"
-                    .($this->activationOnly ? ' -d --no-build --pull never' : ' --build -d'),
+                    .($reusePreparedRuntime ? ' -d --no-build --pull never' : ' --build -d'),
             );
 
             return $commands;
@@ -5923,16 +6196,16 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
             $sidecarCommand = $sidecarStarter->composeUpCommand(
                 $composeCommandPrefix,
                 $sidecarPlan,
-                $this->activationOnly ? ' --no-build --pull never' : ' --pull always',
-                build: ! $this->activationOnly,
-                detachedBeforeOptions: $this->activationOnly,
+                $reusePreparedRuntime ? ' --no-build --pull never' : ' --pull always',
+                build: ! $reusePreparedRuntime,
+                detachedBeforeOptions: $reusePreparedRuntime,
             );
             if ($sidecarCommand !== null) {
                 $commands[] = $sidecarCommand;
                 array_push($commands, ...$sidecarStarter->runningMutationCompletionAssertionsFor($sidecarPlan));
             }
             $commands[] = "{$composeCommandPrefix} up"
-                .($this->activationOnly ? ' -d --no-build --pull never' : ' --pull always --build -d')
+                .($reusePreparedRuntime ? ' -d --no-build --pull never' : ' --pull always --build -d')
                 .$blueGreenCandidateService;
 
             return $commands;
@@ -5942,9 +6215,9 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         $sidecarCommand = $sidecarStarter->composeUpCommand(
             $composeCommandPrefix,
             $sidecarPlan,
-            $this->activationOnly ? ' --no-build --pull never' : '',
-            build: ! $this->activationOnly,
-            detachedBeforeOptions: $this->activationOnly,
+            $reusePreparedRuntime ? ' --no-build --pull never' : '',
+            build: ! $reusePreparedRuntime,
+            detachedBeforeOptions: $reusePreparedRuntime,
         );
         if ($sidecarCommand !== null) {
             $commands[] = executeInDocker($this->deployment_uuid, $sidecarCommand);
@@ -5954,7 +6227,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         $commands[] = executeInDocker(
             $this->deployment_uuid,
             "{$composeCommandPrefix} up"
-                .($this->activationOnly ? ' -d --no-build --pull never' : ' --build -d')
+                .($reusePreparedRuntime ? ' -d --no-build --pull never' : ' --build -d')
                 .$blueGreenCandidateService,
         );
 
@@ -6991,7 +7264,14 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         ]);
 
         try {
-            $this->application->markDeploymentConfigurationApplied($this->application_deployment_queue);
+            if ($this->restart_only) {
+                $this->application->markDeploymentConfigurationSnapshotApplied(
+                    $this->application_deployment_queue,
+                    $this->preparedRestartConfigurationSnapshot(),
+                );
+            } else {
+                $this->application->markDeploymentConfigurationApplied($this->application_deployment_queue);
+            }
         } catch (Exception $e) {
             Log::warning('Failed to mark configuration as applied for deployment '.$this->deployment_uuid.': '.$e->getMessage());
         }

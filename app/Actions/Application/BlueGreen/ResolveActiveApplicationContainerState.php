@@ -14,12 +14,16 @@ class ResolveActiveApplicationContainerState
 {
     use AsAction;
 
-    public function handle(Application $application): ?ActiveApplicationContainerState
+    public function handle(Application $application, ?int $currentRestartQueueId = null): ?ActiveApplicationContainerState
     {
         $configuredDestinationIds = $application->blueGreenConfiguredStandaloneDockerDestinationIds();
         $resolutions = ResolveActiveApplicationContainer::run(collect([$application]));
         if ($resolutions->isEmpty()) {
-            $deploymentUuids = ResolveOrdinaryApplicationDeploymentUuids::run($application, $configuredDestinationIds);
+            $deploymentUuids = ResolveOrdinaryApplicationDeploymentUuids::run(
+                $application,
+                $configuredDestinationIds,
+                $currentRestartQueueId,
+            );
             if ($deploymentUuids === null) {
                 return null;
             }
@@ -30,7 +34,11 @@ class ResolveActiveApplicationContainerState
             $currentApplication = Application::query()->find($application->id);
             $currentDeploymentUuids = $currentApplication === null
                 ? null
-                : ResolveOrdinaryApplicationDeploymentUuids::run($currentApplication, $configuredDestinationIds);
+                : ResolveOrdinaryApplicationDeploymentUuids::run(
+                    $currentApplication,
+                    $configuredDestinationIds,
+                    $currentRestartQueueId,
+                );
             if ($containersByDestination === null
                 || ResolveActiveApplicationContainer::run(collect([$application]))->isNotEmpty()
                 || ! $this->destinationIdsMatch(
@@ -76,6 +84,64 @@ class ResolveActiveApplicationContainerState
         }
 
         return $this->resolveFromContainers($resolutions, $containersByDestination);
+    }
+
+    public function handleCurrentOrdinaryRestart(
+        Application $application,
+        int $currentRestartQueueId,
+    ): ?ActiveApplicationContainerState {
+        $configuredDestinationIds = $application->blueGreenConfiguredStandaloneDockerDestinationIds();
+        $deploymentUuids = (new ResolveOrdinaryApplicationDeploymentUuids)->currentRestartDeploymentUuids(
+            $application,
+            $configuredDestinationIds,
+            $currentRestartQueueId,
+        );
+        $predecessorDeploymentUuids = ResolveOrdinaryApplicationDeploymentUuids::run(
+            $application,
+            $configuredDestinationIds,
+            $currentRestartQueueId,
+        );
+        if ($deploymentUuids === null || $predecessorDeploymentUuids === null) {
+            return null;
+        }
+        $destinations = $this->destinations($configuredDestinationIds);
+        $containersByDestination = $destinations === null
+            ? null
+            : $this->containersByDestination($configuredDestinationIds, $destinations);
+        $currentApplication = Application::query()->find($application->id);
+        $currentDeploymentUuids = $currentApplication === null
+            ? null
+            : (new ResolveOrdinaryApplicationDeploymentUuids)->currentRestartDeploymentUuids(
+                $currentApplication,
+                $configuredDestinationIds,
+                $currentRestartQueueId,
+            );
+        $currentPredecessorDeploymentUuids = $currentApplication === null
+            ? null
+            : ResolveOrdinaryApplicationDeploymentUuids::run(
+                $currentApplication,
+                $configuredDestinationIds,
+                $currentRestartQueueId,
+            );
+        if ($containersByDestination === null
+            || $currentApplication === null
+            || ! $this->destinationIdsMatch(
+                $configuredDestinationIds,
+                $currentApplication->blueGreenConfiguredStandaloneDockerDestinationIds(),
+            )
+            || ! $this->ordinaryDeploymentsMatch($deploymentUuids, $currentDeploymentUuids)
+            || ! $this->ordinaryDeploymentsMatch(
+                $predecessorDeploymentUuids,
+                $currentPredecessorDeploymentUuids,
+            )) {
+            return null;
+        }
+
+        return $this->resolveOrdinaryFromContainers(
+            (int) $application->id,
+            $deploymentUuids,
+            $containersByDestination,
+        );
     }
 
     /** @param  Collection<int, int>  $expected */
@@ -153,7 +219,7 @@ class ResolveActiveApplicationContainerState
                     && (string) data_get($labels, 'coolify.blueGreen.managed') !== 'true'
                     && (string) data_get($labels, 'coolify.deploymentId') === $deploymentUuid;
             });
-            if ($selected->isEmpty()) {
+            if ($selected->count() !== 1) {
                 return null;
             }
             $containerIds = $selected->pluck('Id')->filter(
@@ -297,7 +363,7 @@ class ResolveActiveApplicationContainerState
      * @param  Collection<int, int>  $destinationIds
      * @param  Collection<int, StandaloneDocker>  $destinations
      */
-    private function containersByDestination(
+    protected function containersByDestination(
         Collection $destinationIds,
         Collection $destinations,
     ): ?Collection {

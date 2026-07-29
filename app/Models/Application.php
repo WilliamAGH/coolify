@@ -2359,8 +2359,22 @@ class Application extends BaseModel
             return;
         }
 
-        $snapshot = $this->deploymentConfigurationSnapshot();
-        $hash = ApplicationConfigurationSnapshot::hashSnapshot($snapshot);
+        $this->markDeploymentConfigurationSnapshotApplied(
+            $deployment,
+            $this->deploymentConfigurationSnapshot(),
+        );
+    }
+
+    /**
+     * Records the exact configuration rendered for a deployment so later edits remain pending.
+     *
+     * @param  array<string, mixed>  $configurationSnapshot
+     */
+    public function markDeploymentConfigurationSnapshotApplied(
+        ApplicationDeploymentQueue $deployment,
+        array $configurationSnapshot,
+    ): void {
+        $configurationHash = ApplicationConfigurationSnapshot::hashSnapshot($configurationSnapshot);
 
         $previousDeployment = ApplicationDeploymentQueue::query()
             ->where('application_id', $this->id)
@@ -2372,14 +2386,17 @@ class Application extends BaseModel
             ->first();
 
         $deployment->update([
-            'configuration_hash' => $hash,
-            'configuration_snapshot' => $snapshot,
+            'configuration_hash' => $configurationHash,
+            'configuration_snapshot' => $configurationSnapshot,
             'configuration_diff' => $previousDeployment?->configuration_snapshot
-                ? app(ConfigurationDiffer::class)->diff($previousDeployment->configuration_snapshot, $snapshot)->toArray()
+                ? app(ConfigurationDiffer::class)->diff(
+                    $previousDeployment->configuration_snapshot,
+                    $configurationSnapshot,
+                )->toArray()
                 : null,
         ]);
 
-        $this->forceFill(['config_hash' => $hash])->save();
+        $this->forceFill(['config_hash' => $configurationHash])->save();
     }
 
     private function legacyConfigurationHash(): string
