@@ -22,6 +22,11 @@ All notable changes to this project will be documented in this file.
 - Update changelog
 - Update changelog
 - Update changelog
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.40-fork
 
 ## [4.13.39-fork] - 2026-07-29
 
