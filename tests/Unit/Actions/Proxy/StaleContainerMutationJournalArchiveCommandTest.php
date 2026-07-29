@@ -20,13 +20,6 @@ function staleContainerMutationJournalTestWriter(): WriteBlueGreenProxyConfigura
 
 function staleContainerMutationJournalTestCommand(string $command): string
 {
-    $command = preg_replace(
-        '/^case "\\$container_journal_expected_boot_id" in .*$/m',
-        'true',
-        $command,
-        1,
-    ) ?? $command;
-
     return str_replace(
         [
             'test "$(id -u)" = 0',
@@ -71,6 +64,61 @@ function writeStaleContainerMutationJournalTestFixture(
     ]));
     chmod($journalPath, 0600);
 }
+
+it('accepts only canonical lowercase boot identities in the generated stale-journal shell guard', function (
+    string $journalBootId,
+    bool $expectedSuccess,
+): void {
+    $filesystem = new Filesystem;
+    $proxyPath = sys_get_temp_dir().'/coolify-stale-journal-boot-id-'.bin2hex(random_bytes(8));
+    $writer = staleContainerMutationJournalTestWriter();
+    $managedFilename = BlueGreenRoutingTarget::managedFilename('stale_journal_application', 62);
+    $replacementState = new BlueGreenProxyState(
+        managedFilename: $managedFilename,
+        applicationUuid: 'stale_journal_application',
+        destinationId: 62,
+        operationId: 'failed-first-adoption-operation',
+        mutationSequence: 1,
+        destinationFenceEpoch: 0,
+        routingRevision: 0,
+        managedSha256: null,
+        activeColor: null,
+        activeDeploymentUuid: null,
+        activeContainerName: null,
+        activeContainerId: null,
+        applicationRoutingConfigDigest: str_repeat('b', 64),
+        destinationTopologyDigest: str_repeat('c', 64),
+    );
+
+    try {
+        writeStaleContainerMutationJournalTestFixture(
+            $writer,
+            $proxyPath,
+            $replacementState,
+            $journalBootId,
+        );
+        $command = staleContainerMutationJournalTestCommand(
+            $writer->inspectStaleContainerMutationJournalCommandFor(
+                $proxyPath,
+                $managedFilename,
+                'stale_journal_application',
+                62,
+                62,
+                '11111111-2222-3333-4444-555555555555',
+            ),
+        );
+        $process = Process::fromShellCommandline($command);
+        $process->run();
+
+        expect($process->isSuccessful())->toBe($expectedSuccess);
+    } finally {
+        $filesystem->remove($proxyPath);
+    }
+})->with([
+    'canonical lowercase UUID' => ['22222222-3333-4444-5555-666666666666', true],
+    'missing fourth separator' => ['22222222-3333-4444-5555666666666666', false],
+    'uppercase hexadecimal' => ['AAAAAAAA-bbbb-cccc-dddd-eeeeeeeeeeee', false],
+]);
 
 it('builds a root-only journal quarantine command that cannot replay the stale scripts', function (): void {
     $writer = new WriteBlueGreenProxyConfiguration;
