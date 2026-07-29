@@ -1516,7 +1516,7 @@ final class RecoverBlueGreenIntervention
             $previousState = $this->persistedAbsentRoutePredecessor($state);
 
             return $previousState !== null
-                && $liveState->toArray() === $previousState->toArray();
+                && $liveState->provesSameManagedRouteAs($previousState, $operationUuid);
         }
         if ($liveState->activeColor === null
             || ! $activeColor instanceof BlueGreenDeploymentColor) {
@@ -1541,26 +1541,44 @@ final class RecoverBlueGreenIntervention
             && $liveState->activeDeploymentUuid === $state->{$activeDeploymentColumn};
     }
 
+    /**
+     * A fixed-color operation proves its live route by matching one persisted endpoint:
+     * the pre-operation state it started from, or the rollback state it was steered to.
+     * The rollback snapshot is only recorded once a rollback reaches its proxy mutation,
+     * so an operation interrupted before that point legitimately has none; matching the
+     * pre-operation state alone still proves the managed route was never mutated or was
+     * fully undone. A recorded rollback snapshot that fails its checksum is corruption
+     * rather than absence and keeps the intervention fenced. The interrupted operation's
+     * own rollback restore re-writes a snapshot's exact bytes with advanced fence
+     * counters that intervention persists nowhere, so the proof tolerates forward-only
+     * counter movement when the live fence is owned by that operation.
+     */
     private function liveRouteMatchesPersistedFixedColorStates(
         ApplicationBlueGreenDeployment $state,
         BlueGreenProxyState $liveState,
     ): bool {
+        $operationUuid = $state->operation_deployment_uuid;
+        if (! is_string($operationUuid)) {
+            return false;
+        }
         $previousState = $this->verifiedPersistedProxyState(
             $state->operation_previous_proxy_state,
             $state->operation_previous_proxy_state_sha256,
         );
-        $currentState = $this->verifiedPersistedProxyState(
+        if ($previousState === null) {
+            return false;
+        }
+        $rollbackState = $this->verifiedPersistedProxyState(
             $state->operation_rollback_proxy_state,
             $state->operation_rollback_proxy_state_sha256,
         );
-        if ($previousState === null || $currentState === null) {
+        if ($rollbackState === null && $state->operation_rollback_proxy_state !== null) {
             return false;
         }
 
-        $liveMetadata = $liveState->toArray();
-
-        return $liveMetadata === $previousState->toArray()
-            || $liveMetadata === $currentState->toArray();
+        return $liveState->provesSameManagedRouteAs($previousState, $operationUuid)
+            || ($rollbackState !== null
+                && $liveState->provesSameManagedRouteAs($rollbackState, $operationUuid));
     }
 
     private function verifiedPersistedProxyState(

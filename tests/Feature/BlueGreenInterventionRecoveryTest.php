@@ -587,6 +587,63 @@ it('accepts a fixed-color intervention when live metadata exactly matches its pe
         ->and($method->invoke(new RecoverBlueGreenIntervention, $scenario->state->fresh(), $currentState))->toBeTrue();
 });
 
+it('accepts a fixed-color intervention when the interrupted operation advanced the fence counters past every persisted snapshot', function (): void {
+    ['previousState' => $previousState, 'scenario' => $scenario] = fixedColorMidFlightInterventionScenario();
+    // A rollback restore re-writes the pre-operation bytes under the interrupted operation's
+    // ownership with advanced counters, and the grace-window failure persists that nowhere.
+    $rollbackRestoredState = $previousState->withDestinationFenceEpoch(
+        $previousState->destinationFenceEpoch + 2,
+        BlueGreenRecoveryScenario::OPERATION_UUID,
+        3,
+    );
+    $method = new ReflectionMethod(RecoverBlueGreenIntervention::class, 'liveRouteCanBeReconciled');
+
+    expect($method->invoke(new RecoverBlueGreenIntervention, $scenario->state->fresh(), $rollbackRestoredState))->toBeTrue();
+});
+
+it('keeps a fixed-color intervention manual-only when the interrupted operation fence regressed behind its persisted snapshot', function (): void {
+    ['currentState' => $currentState, 'scenario' => $scenario] = fixedColorMidFlightInterventionScenario();
+    $regressedState = $currentState->withDestinationFenceEpoch(
+        $currentState->destinationFenceEpoch - 1,
+        BlueGreenRecoveryScenario::OPERATION_UUID,
+        3,
+    );
+    $method = new ReflectionMethod(RecoverBlueGreenIntervention::class, 'liveRouteCanBeReconciled');
+
+    expect($method->invoke(new RecoverBlueGreenIntervention, $scenario->state->fresh(), $regressedState))->toBeFalse();
+});
+
+it('accepts a fixed-color intervention interrupted before its rollback route was recorded', function (): void {
+    [
+        'currentState' => $currentState,
+        'previousState' => $previousState,
+        'scenario' => $scenario,
+    ] = fixedColorMidFlightInterventionScenario();
+    $scenario->state->update([
+        'operation_rollback_proxy_state' => null,
+        'operation_rollback_proxy_state_sha256' => null,
+    ]);
+    $method = new ReflectionMethod(RecoverBlueGreenIntervention::class, 'liveRouteCanBeReconciled');
+
+    expect($method->invoke(new RecoverBlueGreenIntervention, $scenario->state->fresh(), $previousState))->toBeTrue()
+        ->and($method->invoke(new RecoverBlueGreenIntervention, $scenario->state->fresh(), $currentState))->toBeFalse();
+});
+
+it('keeps a fixed-color intervention manual-only when its recorded rollback route fails its checksum', function (): void {
+    [
+        'currentState' => $currentState,
+        'previousState' => $previousState,
+        'scenario' => $scenario,
+    ] = fixedColorMidFlightInterventionScenario();
+    $scenario->state->update([
+        'operation_rollback_proxy_state_sha256' => str_repeat('0', 64),
+    ]);
+    $method = new ReflectionMethod(RecoverBlueGreenIntervention::class, 'liveRouteCanBeReconciled');
+
+    expect($method->invoke(new RecoverBlueGreenIntervention, $scenario->state->fresh(), $previousState))->toBeFalse()
+        ->and($method->invoke(new RecoverBlueGreenIntervention, $scenario->state->fresh(), $currentState))->toBeFalse();
+});
+
 it('only accepts the exact persisted absent-route predecessor for first-adoption recovery', function (): void {
     ['previousState' => $previousState, 'scenario' => $scenario] = absentRouteMidFlightInterventionScenario();
     $foreignState = $previousState->withAbsentRouteMutationOwner(

@@ -303,4 +303,40 @@ final readonly class BlueGreenProxyState
             ? $this->mutationSequence + 1
             : 1;
     }
+
+    /**
+     * Whether this live state proves the same managed route as a persisted $snapshot.
+     *
+     * Exact field equality proves a persisted generation directly. Beyond that, a rollback's
+     * restore mutation re-writes the exact snapshot bytes with a higher mutation_sequence and
+     * destination_fence_epoch, and the grace-window failure that demands intervention aborts
+     * before those counters are persisted — so exact equality can never re-prove a route the
+     * rollback itself restored. Counter advancement is therefore attributable only when this
+     * live state is owned by $interruptedOperationId (the durable operation whose recovery
+     * machinery legitimately kept mutating the fence); route identity remains the byte-exact
+     * managed file, the active slot, and the routing evidence, and the counters only move
+     * forward. Advancement under any other owner stays unprovable.
+     */
+    public function provesSameManagedRouteAs(self $snapshot, string $interruptedOperationId): bool
+    {
+        if ($this->toArray() === $snapshot->toArray()) {
+            return true;
+        }
+
+        return hash_equals($interruptedOperationId, $this->operationId)
+            && $this->managedFilename === $snapshot->managedFilename
+            && $this->applicationUuid === $snapshot->applicationUuid
+            && $this->destinationId === $snapshot->destinationId
+            && $this->routingRevision === $snapshot->routingRevision
+            && $this->managedSha256 === $snapshot->managedSha256
+            && $this->activeColor === $snapshot->activeColor
+            && $this->activeDeploymentUuid === $snapshot->activeDeploymentUuid
+            && $this->activeContainerName === $snapshot->activeContainerName
+            && $this->activeContainerId === $snapshot->activeContainerId
+            && $this->applicationRoutingConfigDigest === $snapshot->applicationRoutingConfigDigest
+            && $this->destinationTopologyDigest === $snapshot->destinationTopologyDigest
+            && $this->destinationFenceEpoch >= $snapshot->destinationFenceEpoch
+            && ($this->operationId !== $snapshot->operationId
+                || $this->mutationSequence >= $snapshot->mutationSequence);
+    }
 }
