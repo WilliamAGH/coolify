@@ -72,6 +72,8 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
 
     private const BUILD_SCRIPT_PATH = '/artifacts/build.sh';
 
+    private const PREPARED_IMAGE_IDENTITY_VERSION = 1;
+
     private const NIXPACKS_PLAN_PATH = '/artifacts/thegameplan.json';
 
     private const RAILPACK_REPOSITORY_CONFIG_PATH = 'railpack.json';
@@ -252,6 +254,16 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
     private bool $activationOnly = false;
 
     private ?string $preparedArtifactDigest = null;
+
+    /**
+     * The outer prepared-activation envelope remains schema-v1. This inner
+     * contract is versioned so durable schema-v1 payloads created before
+     * registry identity was introduced continue to replay through the legacy
+     * local-image-ID path.
+     *
+     * @var array{version: int, repository: string, image: string, digest: string, platform: string}|null
+     */
+    private ?array $preparedImageIdentity = null;
 
     private bool $handoffScheduled = false;
 
@@ -1627,12 +1639,18 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             instant_remote_process(["docker images --format '{{json .}}' {$this->production_image_name}"], $this->server);
             $this->application_deployment_queue->addLogEntry('----------------------------------------');
             $this->application_deployment_queue->addLogEntry("Pushing image to docker registry ({$this->production_image_name}).");
-            $this->execute_remote_command(
-                [
-                    executeInDocker($this->deployment_uuid, "docker push {$this->production_image_name}"),
-                    'hidden' => true,
-                ],
-            );
+            $pushCommand = [
+                executeInDocker($this->deployment_uuid, 'docker push '.escapeshellarg($this->production_image_name)),
+                'hidden' => true,
+            ];
+            if ($this->shouldCapturePreparedRegistryImageIdentity()) {
+                // This command is for the exact production image tag. Retain
+                // its immutable registry digest as the provenance for the
+                // versioned prepared-image contract below.
+                $pushCommand['save'] = 'prepared_registry_push_output';
+                $pushCommand['append'] = true;
+            }
+            $this->execute_remote_command($pushCommand);
             if ($this->shouldPushDockerRegistryImageTag()) {
                 // Tag image with docker_registry_image_tag
                 $this->application_deployment_queue->addLogEntry("Tagging and pushing image with {$this->application->docker_registry_image_tag} tag.");
@@ -2559,6 +2577,54 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         if (! isset($this->production_image_name) || $this->production_image_name === '') {
             throw new DeploymentException('Prepared build-server activation has no runtime image identity to deliver.');
         }
+
+        if ($this->preparedImageIdentity !== null) {
+            $this->deliverVersionedPreparedImageToActivationServer($this->preparedImageIdentity);
+
+            return;
+        }
+
+        // Schema-v1 payloads created before the versioned registry contract
+        // keep their local Docker image identity in artifact_digest. Preserve
+        // that replay path instead of reinterpreting the existing field.
+        $this->deliverLegacyPreparedImageToActivationServer();
+    }
+
+    /** @param array{version: int, repository: string, image: string, digest: string, platform: string} $identity */
+    private function deliverVersionedPreparedImageToActivationServer(array $identity): void
+    {
+        $identity = $this->validatedPreparedImageIdentity(
+            $identity,
+            'Prepared build-server image identity',
+        );
+        $this->application_deployment_queue->addLogEntry("Delivering the prepared image to the activation server ({$identity['image']}).");
+        $pulledDigest = $this->pullPreparedRegistryDigest(
+            $identity['image'],
+            'activation_prepared_image_pull_output',
+            "Activation pull for {$identity['image']}",
+        );
+        if (! hash_equals($identity['digest'], $pulledDigest)) {
+            throw new DeploymentException('Activation pull digest does not match the prepared image identity.');
+        }
+        $activationIdentity = [
+            'version' => self::PREPARED_IMAGE_IDENTITY_VERSION,
+            ...$this->inspectPreparedRegistryImageIdentity(
+                $identity['repository'],
+                $identity['image'],
+                $identity['digest'],
+                'activation_prepared_image',
+                'Activation image identity evidence',
+            ),
+        ];
+        $this->assertPreparedImageIdentityMatches(
+            $identity,
+            $activationIdentity,
+            'Activation image identity',
+        );
+    }
+
+    private function deliverLegacyPreparedImageToActivationServer(): void
+    {
         if (blank($this->application->docker_registry_image_name)
             || ! ValidationPatterns::isValidDockerImageName($this->application->docker_registry_image_name)) {
             throw new DeploymentException('Prepared build-server activation requires a valid Docker registry image name to deliver its runtime image to the activation server.');
@@ -2576,6 +2642,228 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             'image_id=$('.$inspectImageId.'); test "$image_id" = '.escapeshellarg($this->preparedArtifactDigest),
             'hidden' => true,
         ]);
+    }
+
+    private function usesPreparedRegistryArtifactIdentity(): bool
+    {
+        return $this->use_build_server
+            && ! in_array($this->application->build_pack, ['dockercompose', 'dockerimage'], true);
+    }
+
+    private function shouldCapturePreparedRegistryImageIdentity(): bool
+    {
+        return $this->preparationOnly && $this->usesPreparedRegistryArtifactIdentity();
+    }
+
+    private function preparedRegistryRepository(): string
+    {
+        $repository = trim((string) $this->application->docker_registry_image_name);
+        if ($repository === '' || ! ValidationPatterns::isValidDockerImageName($repository)) {
+            throw new DeploymentException('Prepared build-server activation requires a valid Docker registry image name to deliver its runtime image to the activation server.');
+        }
+        if (! isset($this->production_image_name)
+            || ! str_starts_with($this->production_image_name, "{$repository}:")) {
+            throw new DeploymentException('Prepared build-server activation runtime image does not match its configured registry repository.');
+        }
+
+        return $repository;
+    }
+
+    private function imageRepoDigestsInspectionCommand(string $safeImage): string
+    {
+        return 'docker image inspect --format='.escapeshellarg('{{json .RepoDigests}}').' '.$safeImage;
+    }
+
+    private function imagePlatformInspectionCommand(string $safeImage): string
+    {
+        return 'docker image inspect --format='.escapeshellarg('{{.Os}}/{{.Architecture}}/{{.Variant}}').' '.$safeImage;
+    }
+
+    /**
+     * @return array{repository: string, image: string, digest: string, platform: string}
+     */
+    private function inspectPreparedRegistryImageIdentity(
+        string $repository,
+        string $image,
+        string $expectedDigest,
+        string $savePrefix,
+        string $context,
+        bool $insideDeploymentContainer = false,
+    ): array {
+        $safeImage = escapeshellarg($image);
+        $repoDigestsCommand = $this->imageRepoDigestsInspectionCommand($safeImage);
+        $platformCommand = $this->imagePlatformInspectionCommand($safeImage);
+        if ($insideDeploymentContainer) {
+            $repoDigestsCommand = executeInDocker($this->deployment_uuid, $repoDigestsCommand);
+            $platformCommand = executeInDocker($this->deployment_uuid, $platformCommand);
+        }
+        $this->execute_remote_command([
+            $repoDigestsCommand,
+            'hidden' => true,
+            'save' => "{$savePrefix}_repository_digests",
+            'append' => false,
+        ], [
+            $platformCommand,
+            'hidden' => true,
+            'save' => "{$savePrefix}_platform",
+            'append' => false,
+        ]);
+        $this->corroborateExpectedRepositoryDigestFromOutput(
+            (string) $this->saved_outputs->get("{$savePrefix}_repository_digests"),
+            $repository,
+            $expectedDigest,
+            "{$context} repository digest evidence",
+        );
+
+        return [
+            'repository' => $repository,
+            'image' => $image,
+            'digest' => $expectedDigest,
+            'platform' => $this->normalizePreparedImagePlatform(
+                (string) $this->saved_outputs->get("{$savePrefix}_platform"),
+                "{$context} platform evidence",
+            ),
+        ];
+    }
+
+    private function corroborateExpectedRepositoryDigestFromOutput(
+        string $output,
+        string $repository,
+        string $expectedDigest,
+        string $context,
+    ): void {
+        try {
+            $repoDigests = json_decode(trim($output), true, 512, JSON_THROW_ON_ERROR);
+        } catch (JsonException) {
+            return;
+        }
+        if (! is_array($repoDigests) || ! array_is_list($repoDigests)) {
+            return;
+        }
+        $repositoryDigests = [];
+        foreach ($repoDigests as $repoDigest) {
+            if (! is_string($repoDigest)) {
+                continue;
+            }
+            if (preg_match(
+                '/\A'.preg_quote($repository, '/').'@(sha256:[a-f0-9]{64})\z/D',
+                $repoDigest,
+                $matches,
+            ) === 1) {
+                $repositoryDigests[] = $matches[1];
+            }
+        }
+        if ($repositoryDigests === [] || in_array($expectedDigest, $repositoryDigests, true)) {
+            return;
+        }
+
+        throw new DeploymentException("{$context} does not corroborate the expected immutable registry digest for {$repository}.");
+    }
+
+    private function immutableDigestFromPreparedPushOutput(string $output): string
+    {
+        return $this->uniqueImmutableDigestFromOutput(
+            $output,
+            '/(?<![A-Za-z])digest:\s*(sha256:[a-f0-9]{64})\b/',
+            "Prepared build-server push for {$this->production_image_name}",
+        );
+    }
+
+    private function immutableDigestFromPreparedPullOutput(string $output, string $context): string
+    {
+        return $this->uniqueImmutableDigestFromOutput(
+            $output,
+            '/\A(sha256:[a-f0-9]{64})\z/D',
+            $context,
+        );
+    }
+
+    private function uniqueImmutableDigestFromOutput(string $output, string $pattern, string $context): string
+    {
+        preg_match_all($pattern, $output, $matches);
+        $digests = array_values(array_unique($matches[1] ?? []));
+        if (count($digests) !== 1) {
+            throw new DeploymentException("{$context} did not prove one immutable registry digest.");
+        }
+
+        return $digests[0];
+    }
+
+    /** @param array<string, mixed> $artifact */
+    private function preparedImageIdentityFromArtifact(array $artifact): ?array
+    {
+        if (! array_key_exists('prepared_image_identity', $artifact)) {
+            return null;
+        }
+
+        return $this->validatedPreparedImageIdentity(
+            $artifact['prepared_image_identity'],
+            'Prepared deployment image identity',
+        );
+    }
+
+    /**
+     * @return array{version: int, repository: string, image: string, digest: string, platform: string}
+     */
+    private function validatedPreparedImageIdentity(mixed $identity, string $context): array
+    {
+        if (! is_array($identity)
+            || ($identity['version'] ?? null) !== self::PREPARED_IMAGE_IDENTITY_VERSION
+            || ! is_string($identity['repository'] ?? null)
+            || ! is_string($identity['image'] ?? null)
+            || ! is_string($identity['digest'] ?? null)
+            || ! is_string($identity['platform'] ?? null)) {
+            throw new DeploymentException("{$context} is malformed.");
+        }
+        $repository = $this->preparedRegistryRepository();
+        if (! hash_equals($repository, $identity['repository'])
+            || ! hash_equals($this->production_image_name, $identity['image'])
+            || preg_match('/\Asha256:[a-f0-9]{64}\z/D', $identity['digest']) !== 1) {
+            throw new DeploymentException("{$context} is malformed.");
+        }
+        $tag = substr($identity['image'], strlen($repository) + 1);
+        if ($tag === '' || ! ValidationPatterns::isValidDockerImageTag($tag)) {
+            throw new DeploymentException("{$context} is malformed.");
+        }
+
+        return [
+            'version' => self::PREPARED_IMAGE_IDENTITY_VERSION,
+            'repository' => $repository,
+            'image' => $this->production_image_name,
+            'digest' => $identity['digest'],
+            'platform' => $this->normalizePreparedImagePlatform($identity['platform'], "{$context} platform"),
+        ];
+    }
+
+    /**
+     * @param  array{version: int, repository: string, image: string, digest: string, platform: string}  $expected
+     * @param  array{version: int, repository: string, image: string, digest: string, platform: string}  $actual
+     */
+    private function assertPreparedImageIdentityMatches(array $expected, array $actual, string $context): void
+    {
+        foreach (['version', 'repository', 'image', 'digest', 'platform'] as $key) {
+            if (! hash_equals((string) $expected[$key], (string) $actual[$key])) {
+                throw new DeploymentException("{$context} does not match the prepared image identity.");
+            }
+        }
+    }
+
+    private function normalizePreparedImagePlatform(string $platform, string $context): string
+    {
+        $parts = explode('/', trim($platform));
+        if (count($parts) === 3 && $parts[2] === '') {
+            array_pop($parts);
+        }
+        if (count($parts) !== 2 && count($parts) !== 3) {
+            throw new DeploymentException("{$context} is malformed.");
+        }
+        foreach ($parts as $part) {
+            if (preg_match('/\A[a-z0-9][a-z0-9._-]*\z/D', $part) !== 1) {
+                throw new DeploymentException("{$context} is malformed.");
+            }
+        }
+
+        return implode('/', $parts);
     }
 
     protected function activate_prepared_runtime(): void
@@ -2665,7 +2953,30 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             'save' => 'prepared_compose_sha256',
             'append' => false,
         ]);
+        $preparedRegistrySourceDigest = $this->shouldCapturePreparedRegistryImageIdentity()
+            ? $this->resolvePreparedRegistryDigestForPreparation()
+            : null;
         $artifactDigest = $this->capturePreparedImageDigest();
+        $capturedImageIdentity = null;
+        if ($preparedRegistrySourceDigest !== null) {
+            $capturedImageIdentity = $this->capturePreparedRegistryImageIdentity($preparedRegistrySourceDigest);
+        } elseif ($this->activationOnly && $this->preparedImageIdentity !== null) {
+            $identity = $this->validatedPreparedImageIdentity(
+                $this->preparedImageIdentity,
+                'Prepared deployment image identity',
+            );
+            $capturedImageIdentity = [
+                'version' => self::PREPARED_IMAGE_IDENTITY_VERSION,
+                ...$this->inspectPreparedRegistryImageIdentity(
+                    $identity['repository'],
+                    $identity['image'],
+                    $identity['digest'],
+                    'attested_prepared_image',
+                    'Prepared deployment image identity attestation',
+                    insideDeploymentContainer: true,
+                ),
+            ];
+        }
         $runtimeEnvironmentSha256 = trim((string) $this->saved_outputs->get('prepared_runtime_environment_sha256'));
         $composeSha256 = trim((string) $this->saved_outputs->get('prepared_compose_sha256'));
         if (preg_match('/\A[a-f0-9]{64}\z/D', $runtimeEnvironmentSha256) !== 1
@@ -2673,7 +2984,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             throw new DeploymentException('Prepared deployment file digest is invalid.');
         }
 
-        return [
+        $artifact = [
             'application_configuration_hash' => $this->application->deploymentConfigurationHash(),
             'artifact_digest' => $artifactDigest,
             'blue_green_claim' => $this->preparedBlueGreenClaimArtifact($blueGreenClaim),
@@ -2695,6 +3006,11 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             'runtime_render_deferred' => $blueGreenClaim !== null,
             'use_build_server' => $this->use_build_server,
         ];
+        if ($capturedImageIdentity !== null) {
+            $artifact['prepared_image_identity'] = $capturedImageIdentity;
+        }
+
+        return $artifact;
     }
 
     /**
@@ -2942,6 +3258,94 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         return $artifactDigest;
     }
 
+    /**
+     * Preparation normally has the exact-tag push output. Additional-server
+     * preparation intentionally skips that push, so pull the exact tag in the
+     * authenticated deployment container before capturing its local image ID.
+     */
+    private function resolvePreparedRegistryDigestForPreparation(): string
+    {
+        $pushOutput = trim((string) $this->saved_outputs->get('prepared_registry_push_output'));
+        if ($pushOutput !== '') {
+            return $this->immutableDigestFromPreparedPushOutput($pushOutput);
+        }
+
+        return $this->pullPreparedRegistryDigest(
+            $this->production_image_name,
+            'prepared_registry_pull_output',
+            "Prepared build-server pull for {$this->production_image_name}",
+            insideDeploymentContainer: true,
+        );
+    }
+
+    private function pullPreparedRegistryDigest(
+        string $image,
+        string $saveKey,
+        string $context,
+        bool $insideDeploymentContainer = false,
+    ): string {
+        $this->saved_outputs->forget($saveKey);
+        $command = $this->preparedRegistryPullProofCommand($image);
+        if ($insideDeploymentContainer) {
+            $command = executeInDocker($this->deployment_uuid, $command);
+        }
+        $this->execute_remote_command([
+            $command,
+            'hidden' => true,
+            'save' => $saveKey,
+            'append' => true,
+        ]);
+
+        return $this->immutableDigestFromPreparedPullOutput(
+            (string) $this->saved_outputs->get($saveKey),
+            $context,
+        );
+    }
+
+    private function preparedRegistryPullProofCommand(string $image): string
+    {
+        $safeImage = escapeshellarg($image);
+
+        return <<<BASH
+umask 077
+prepared_pull_output=\$(mktemp) || { printf '%s\\n' 'Prepared registry pull could not allocate a private transcript.' >&2; exit 1; }
+trap 'rm -f -- "\$prepared_pull_output"' 0 HUP INT TERM
+if ! docker pull {$safeImage} >"\$prepared_pull_output" 2>&1; then
+  tail -c 4096 "\$prepared_pull_output" >&2
+  exit 1
+fi
+prepared_pull_digest_count=\$(grep -Ec '^Digest: sha256:[a-f0-9]{64}\$' "\$prepared_pull_output" 2>/dev/null || true)
+if [ "\$prepared_pull_digest_count" != 1 ]; then
+  printf '%s\\n' 'Prepared registry pull did not prove one immutable registry digest.' >&2
+  exit 1
+fi
+prepared_pull_digest=\$(grep -E '^Digest: sha256:[a-f0-9]{64}\$' "\$prepared_pull_output") || {
+  printf '%s\\n' 'Prepared registry pull did not prove one immutable registry digest.' >&2
+  exit 1
+}
+printf '%s\\n' "\${prepared_pull_digest#Digest: }"
+BASH;
+    }
+
+    /** @return array{version: int, repository: string, image: string, digest: string, platform: string} */
+    private function capturePreparedRegistryImageIdentity(string $sourceDigest): array
+    {
+        $repository = $this->preparedRegistryRepository();
+        $observed = $this->inspectPreparedRegistryImageIdentity(
+            $repository,
+            $this->production_image_name,
+            $sourceDigest,
+            'prepared_registry_image',
+            'Prepared build-server image identity evidence',
+            insideDeploymentContainer: true,
+        );
+
+        return [
+            'version' => self::PREPARED_IMAGE_IDENTITY_VERSION,
+            ...$observed,
+        ];
+    }
+
     private function blueGreenComposeImageDigestCommand(): string
     {
         if ($this->preparedBlueGreenComposeImages !== []) {
@@ -3074,6 +3478,10 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         $this->preparedArtifactDigest = is_string($artifact['artifact_digest'] ?? null)
             ? $artifact['artifact_digest']
             : null;
+        $this->preparedImageIdentity = $this->preparedImageIdentityFromArtifact($artifact);
+        if ($this->preparedImageIdentity !== null && ! $this->usesPreparedRegistryArtifactIdentity()) {
+            throw new DeploymentException('Prepared deployment image identity is incompatible with its activation target.');
+        }
         $this->dockerImage = is_string($artifact['docker_image'] ?? null) ? $artifact['docker_image'] : null;
         $this->dockerImageTag = is_string($artifact['docker_image_tag'] ?? null) ? $artifact['docker_image_tag'] : null;
         $this->docker_compose_location = (string) ($artifact['docker_compose_location'] ?? '/docker-compose.yaml');
@@ -3151,7 +3559,12 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
     {
         $expectedArtifactDigest = $artifact['artifact_digest'] ?? null;
         $runtimeRenderDeferred = (bool) ($artifact['runtime_render_deferred'] ?? false);
-        $expectedDigests = [$expectedArtifactDigest];
+        if (! is_string($expectedArtifactDigest)
+            || preg_match('/\A(?:sha256:)?[a-f0-9]{64}\z/D', $expectedArtifactDigest) !== 1) {
+            throw new DeploymentException('Prepared deployment artifact attestation is malformed.');
+        }
+
+        $expectedDigests = [];
         if (! $runtimeRenderDeferred) {
             $expectedDigests[] = $artifact['runtime_environment_sha256'] ?? null;
             $expectedDigests[] = $artifact['compose_sha256'] ?? null;
@@ -3162,16 +3575,49 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             }
         }
 
+        $expectedImageIdentity = $this->preparedImageIdentity === null
+            ? null
+            : $this->validatedPreparedImageIdentity(
+                $this->preparedImageIdentity,
+                'Prepared deployment image identity',
+            );
         $capturedArtifact = $runtimeRenderDeferred
             ? ['artifact_digest' => $this->capturePreparedImageDigest()]
             : $this->capturePreparedArtifact();
+        if ($runtimeRenderDeferred && $expectedImageIdentity !== null) {
+            $capturedArtifact['prepared_image_identity'] = [
+                'version' => self::PREPARED_IMAGE_IDENTITY_VERSION,
+                ...$this->inspectPreparedRegistryImageIdentity(
+                    $expectedImageIdentity['repository'],
+                    $expectedImageIdentity['image'],
+                    $expectedImageIdentity['digest'],
+                    'attested_prepared_image',
+                    'Prepared deployment image identity attestation',
+                    insideDeploymentContainer: true,
+                ),
+            ];
+        }
         $attestedKeys = $runtimeRenderDeferred
             ? ['artifact_digest']
             : ['artifact_digest', 'runtime_environment_sha256', 'compose_sha256'];
         foreach ($attestedKeys as $key) {
-            if (! hash_equals((string) $artifact[$key], (string) $capturedArtifact[$key])) {
+            if (! hash_equals((string) $artifact[$key], (string) ($capturedArtifact[$key] ?? ''))) {
                 throw new DeploymentException("Prepared deployment {$key} changed before activation.");
             }
+        }
+        if ($expectedImageIdentity !== null) {
+            $capturedImageIdentity = $capturedArtifact['prepared_image_identity'] ?? null;
+            if (! is_array($capturedImageIdentity)) {
+                throw new DeploymentException('Prepared deployment image identity changed before activation.');
+            }
+            $this->assertPreparedImageIdentityMatches(
+                $expectedImageIdentity,
+                $this->validatedPreparedImageIdentity(
+                    $capturedImageIdentity,
+                    'Captured prepared deployment image identity',
+                ),
+                'Prepared deployment image identity',
+            );
         }
     }
 
