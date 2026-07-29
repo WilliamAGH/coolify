@@ -22,6 +22,8 @@ final class ManagedTraefikDocumentWriter
 
     public const WRITER_AUTHORITY_PROMOTED_OUTPUT = 'coolify-managed-traefik-writer-authority:promoted';
 
+    public const ORPHANED_ENROLLMENT_AUTHORITY_SUPERSEDED_OUTPUT = 'coolify-managed-traefik-document:orphaned-enrollment-authority-superseded';
+
     private const ARTIFACT_MAGIC = 'coolify-managed-traefik-document-rollback-v1';
 
     private const JOURNAL_MAGIC = 'coolify-managed-traefik-document-journal-v1';
@@ -77,6 +79,31 @@ final class ManagedTraefikDocumentWriter
             rollback: false,
             requiredAuthority: $activeAuthority,
             allowAuthorityBootstrap: $allowBootstrap,
+        );
+    }
+
+    public function supersedeOrphanedInitialEnrollmentAuthorityCommandFor(
+        ManagedTraefikDocumentMutation $mutation,
+        string $correctedPredecessorBytes,
+        ManagedTraefikDocumentWriterAuthority $orphanedAuthority,
+        ManagedTraefikDocumentWriterAuthority $targetAuthority,
+        bool $transportLfRepairProvenance,
+    ): string {
+        $this->assertOrphanedInitialEnrollmentAuthoritySupersession(
+            $mutation,
+            $correctedPredecessorBytes,
+            $orphanedAuthority,
+            $targetAuthority,
+            $transportLfRepairProvenance,
+        );
+
+        return $this->commandFor(
+            mutation: $mutation,
+            rollback: false,
+            requiredAuthority: $orphanedAuthority,
+            nextAuthority: $targetAuthority,
+            orphanedInitialEnrollmentAuthority: $orphanedAuthority,
+            orphanedSupersessionPredecessorBytes: $correctedPredecessorBytes,
         );
     }
 
@@ -512,11 +539,45 @@ final class ManagedTraefikDocumentWriter
         bool $allowAuthorityBootstrap = false,
         bool $allowAuthorityAbsence = false,
         bool $exactAbandonedInitialEnrollmentRollback = false,
+        ?ManagedTraefikDocumentWriterAuthority $orphanedInitialEnrollmentAuthority = null,
+        ?string $orphanedSupersessionPredecessorBytes = null,
     ): string {
         $expectedSidecar = $mutation->expectedSidecar();
-        $authorityMode = $requiredAuthority === null
+        $orphanedAuthoritySupersession = $orphanedInitialEnrollmentAuthority !== null;
+        $authorityMode = $orphanedAuthoritySupersession
+            ? 'supersede'
+            : ($requiredAuthority === null
             ? 'none'
-            : ($nextAuthority === null ? 'require' : 'rollback');
+            : ($nextAuthority === null ? 'require' : 'rollback'));
+        $liveExpectedSidecar = $orphanedAuthoritySupersession
+            ? json_encode([
+                'version' => 1,
+                'filename' => $mutation->filename,
+                'operation_id' => $orphanedInitialEnrollmentAuthority->operationId,
+                'revision' => $orphanedInitialEnrollmentAuthority->dynamicRevision,
+                'sha256' => $orphanedInitialEnrollmentAuthority->dynamicSha256,
+            ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES)."\n"
+            : $expectedSidecar;
+        $orphanedArtifactPath = $orphanedAuthoritySupersession
+            ? rtrim($mutation->stateDirectory, '/').'/.'.$mutation->filename.'.'.$orphanedInitialEnrollmentAuthority->operationId.'.r'.$orphanedInitialEnrollmentAuthority->dynamicRevision.'.rollback'
+            : 'absent';
+        $orphanedArtifactBytes = $orphanedAuthoritySupersession
+            ? implode("\n", [
+                self::ARTIFACT_MAGIC,
+                $mutation->filename,
+                $orphanedInitialEnrollmentAuthority->operationId,
+                (string) $orphanedInitialEnrollmentAuthority->dynamicRevision,
+                'absent',
+                $orphanedInitialEnrollmentAuthority->dynamicSha256,
+                'absent',
+                'absent',
+                '',
+            ])
+            : null;
+        $targetArtifactBytes = $orphanedAuthoritySupersession
+            ? $this->rollbackArtifactFor($mutation, $orphanedSupersessionPredecessorBytes)
+            : null;
+        $targetAuthority = $orphanedAuthoritySupersession ? $nextAuthority : null;
         $requiredAuthority = $requiredAuthority?->toJson();
         $nextAuthority = $nextAuthority?->toJson();
 
@@ -543,15 +604,25 @@ final class ManagedTraefikDocumentWriter
             'allow_authority_absence='.escapeshellarg($allowAuthorityAbsence ? 'true' : 'false'),
             'allow_missing_artifact_noop='.escapeshellarg($allowMissingArtifactNoop ? 'true' : 'false'),
             'exact_abandoned_initial_enrollment_rollback='.escapeshellarg($exactAbandonedInitialEnrollmentRollback ? 'true' : 'false'),
+            'orphaned_authority_supersession='.escapeshellarg($orphanedAuthoritySupersession ? 'true' : 'false'),
+            'orphaned_artifact_path='.escapeshellarg($orphanedArtifactPath),
+            'orphaned_artifact_base64='.escapeshellarg($orphanedArtifactBytes === null ? 'absent' : base64_encode($orphanedArtifactBytes)),
+            'target_artifact_base64='.escapeshellarg($targetArtifactBytes === null ? 'absent' : base64_encode($targetArtifactBytes)),
+            'orphaned_container_id='.escapeshellarg($orphanedInitialEnrollmentAuthority?->containerId ?? 'absent'),
+            'target_container_id='.escapeshellarg($targetAuthority?->containerId ?? 'absent'),
+            'target_container_name='.escapeshellarg($targetAuthority?->containerName ?? 'absent'),
+            'target_image_id='.escapeshellarg($targetAuthority?->imageId ?? 'absent'),
             'original_expected_document_sha='.escapeshellarg($mutation->expectedSha256 ?? 'absent'),
             'original_replacement_document_sha='.escapeshellarg($mutation->replacementSha256()),
             'original_expected_sidecar_base64='.escapeshellarg($expectedSidecar === null ? 'absent' : base64_encode($expectedSidecar)),
+            'original_live_expected_sidecar_base64='.escapeshellarg($liveExpectedSidecar === null ? 'absent' : base64_encode($liveExpectedSidecar)),
             'original_replacement_sidecar_base64='.escapeshellarg(base64_encode($mutation->replacementSidecar())),
             'original_replacement_payload_base64='.escapeshellarg(base64_encode($mutation->replacementBytes)),
             'artifact_magic='.escapeshellarg(self::ARTIFACT_MAGIC),
             'journal_magic='.escapeshellarg(self::JOURNAL_MAGIC),
             'applied_output='.escapeshellarg(self::APPLIED_OUTPUT),
             'rolled_back_output='.escapeshellarg(self::ROLLED_BACK_OUTPUT),
+            'orphaned_authority_superseded_output='.escapeshellarg(self::ORPHANED_ENROLLMENT_AUTHORITY_SUPERSEDED_OUTPUT),
             '',
             'fail() { exit 1; }',
             ...DurableRemoteArtifact::shellFunctions(),
@@ -627,6 +698,118 @@ final class ManagedTraefikDocumentWriter
             '  test "$authority_size" -le "$authority_maximum_bytes" || return 1',
             '  cmp -s "$authority_candidate" "$authority_expected"',
             '}',
+            'assert_exact_orphan_runtime() {',
+            '  visible_container_ids=$(docker container ls --all --no-trunc --format "{{.ID}}") || fail',
+            '  if printf "%s\\n" "$visible_container_ids" | grep -F -x "$orphaned_container_id" >/dev/null 2>&1; then fail; fi',
+            '  target_runtime=$(docker inspect --type container --format "{{.Id}}|{{.Name}}|{{.Image}}|{{.State.Running}}" "$target_container_id" 2>/dev/null) || fail',
+            '  test "$target_runtime" = "$target_container_id|/$target_container_name|$target_image_id|true" || fail',
+            '}',
+            'orphaned_artifact_matches() {',
+            '  assert_regular_or_absent "$orphaned_artifact_path"',
+            '  test -e "$orphaned_artifact_path" || return 1',
+            '  cmp -s "$orphaned_artifact_path" "$orphaned_artifact_file"',
+            '}',
+            'assert_orphan_candidate_name() {',
+            '  candidate_path=$1',
+            '  candidate_prefix=$2',
+            '  candidate_suffix=${candidate_path#"$candidate_prefix"}',
+            '  test "$candidate_suffix" != "$candidate_path" || fail',
+            '  test "${#candidate_suffix}" = 6 || fail',
+            '  case "$candidate_suffix" in *[!A-Za-z0-9]*) fail ;; esac',
+            '}',
+            'assert_orphan_supersession_census_names() {',
+            '  test "$orphaned_authority_supersession" = true || return 0',
+            '  orphan_candidate_count=0',
+            '  orphan_dynamic_candidate_present=false',
+            '  for state_path in "$state_directory"/* "$state_directory"/.*; do',
+            '    if [ ! -e "$state_path" ] && [ ! -L "$state_path" ]; then continue; fi',
+            '    case "$state_path" in',
+            '      "$state_directory/."|"$state_directory/..") continue ;;',
+            '      "$sidecar_path"|"$lock_path"|"$journal_path"|"$artifact_path"|"$authority_path"|"$orphaned_artifact_path") durable_remote_assert_owned_regular "$state_path" || fail ;;',
+            '      "$state_directory/.managed-traefik-document.$filename."*) assert_orphan_candidate_name "$state_path" "$state_directory/.managed-traefik-document.$filename."; durable_remote_assert_owned_regular "$state_path" || fail; orphan_candidate_count=$((orphan_candidate_count + 1)) ;;',
+            '      "$state_directory/.managed-traefik-journal.$filename."*) assert_orphan_candidate_name "$state_path" "$state_directory/.managed-traefik-journal.$filename."; durable_remote_assert_owned_regular "$state_path" || fail; orphan_candidate_count=$((orphan_candidate_count + 1)) ;;',
+            '      "$state_directory/.managed-traefik-artifact.$filename."*) assert_orphan_candidate_name "$state_path" "$state_directory/.managed-traefik-artifact.$filename."; durable_remote_assert_owned_regular "$state_path" || fail; orphan_candidate_count=$((orphan_candidate_count + 1)) ;;',
+            '      *) fail ;;',
+            '    esac',
+            '  done',
+            '  for dynamic_candidate_path in "$dynamic_directory/.managed-traefik-document.$filename."*; do',
+            '    if [ ! -e "$dynamic_candidate_path" ] && [ ! -L "$dynamic_candidate_path" ]; then continue; fi',
+            '    assert_orphan_candidate_name "$dynamic_candidate_path" "$dynamic_directory/.managed-traefik-document.$filename."',
+            '    durable_remote_assert_owned_regular "$dynamic_candidate_path" || fail',
+            '    orphan_candidate_count=$((orphan_candidate_count + 1))',
+            '    orphan_dynamic_candidate_present=true',
+            '  done',
+            '  test "$orphan_candidate_count" -le 1 || fail',
+            '  durable_remote_assert_owned_regular "$sidecar_path" || fail',
+            '  durable_remote_assert_owned_regular "$lock_path" || fail',
+            '  durable_remote_assert_owned_regular "$authority_path" || fail',
+            '}',
+            'assert_orphan_supersession_candidates() {',
+            '  for candidate_path in "$state_directory/.managed-traefik-document.$filename."*; do',
+            '    if [ ! -e "$candidate_path" ] && [ ! -L "$candidate_path" ]; then continue; fi',
+            '    if cmp -s "$candidate_path" "$authority_next_file"; then :',
+            '    elif cmp -s "$candidate_path" "$replacement_sidecar_file"; then :',
+            '    else fail; fi',
+            '  done',
+            '  for candidate_path in "$state_directory/.managed-traefik-journal.$filename."*; do',
+            '    if [ ! -e "$candidate_path" ] && [ ! -L "$candidate_path" ]; then continue; fi',
+            '    cmp -s "$candidate_path" "$expected_journal" || fail',
+            '  done',
+            '  for candidate_path in "$state_directory/.managed-traefik-artifact.$filename."*; do',
+            '    if [ ! -e "$candidate_path" ] && [ ! -L "$candidate_path" ]; then continue; fi',
+            '    cmp -s "$candidate_path" "$target_artifact_file" || fail',
+            '  done',
+            '  for candidate_path in "$dynamic_directory/.managed-traefik-document.$filename."*; do',
+            '    if [ ! -e "$candidate_path" ] && [ ! -L "$candidate_path" ]; then continue; fi',
+            '    cmp -s "$candidate_path" "$replacement_payload_file" || fail',
+            '  done',
+            '}',
+            'assert_no_orphan_supersession_candidates() {',
+            '  for candidate_path in "$state_directory/.managed-traefik-document.$filename."* "$state_directory/.managed-traefik-journal.$filename."* "$state_directory/.managed-traefik-artifact.$filename."* "$dynamic_directory/.managed-traefik-document.$filename."*; do',
+            '    if [ -e "$candidate_path" ] || [ -L "$candidate_path" ]; then fail; fi',
+            '  done',
+            '}',
+            'assert_orphan_supersession_context() {',
+            '  test "$orphaned_authority_supersession" = true || return 0',
+            '  assert_orphan_supersession_census_names',
+            '  assert_orphan_supersession_candidates',
+            '  assert_exact_orphan_runtime',
+            '  if [ "$orphan_dynamic_candidate_present" = true ]; then',
+            '    orphaned_artifact_matches || fail',
+            '    authority_matches "$authority_path" "$authority_next_file" || fail',
+            '    validate_artifact',
+            '    test -e "$journal_path" || fail',
+            '    cmp -s "$journal_path" "$expected_journal" || fail',
+            '    document_matches "$document_path" "$original_expected_document_sha" || fail',
+            '    sidecar_matches "$sidecar_path" "$original_live_expected_sidecar_base64" "$expected_sidecar_file" || fail',
+            '    return',
+            '  fi',
+            '  if ! orphaned_artifact_matches; then',
+            '    if [ -e "$orphaned_artifact_path" ] || [ -L "$orphaned_artifact_path" ]; then fail; fi',
+            '    authority_matches "$authority_path" "$authority_next_file" || fail',
+            '    document_matches "$document_path" "$original_replacement_document_sha" || fail',
+            '    sidecar_matches "$sidecar_path" "$original_replacement_sidecar_base64" "$replacement_sidecar_file" || fail',
+            '    if [ -e "$journal_path" ] || [ -L "$journal_path" ]; then fail; fi',
+            '    validate_artifact',
+            '    return',
+            '  fi',
+            '  if authority_matches "$authority_path" "$authority_required_file"; then',
+            '    if [ -e "$artifact_path" ] || [ -L "$artifact_path" ]; then fail; fi',
+            '    if [ -e "$journal_path" ] || [ -L "$journal_path" ]; then fail; fi',
+            '    document_matches "$document_path" "$original_expected_document_sha" || fail',
+            '    sidecar_matches "$sidecar_path" "$original_live_expected_sidecar_base64" "$expected_sidecar_file" || fail',
+            '    return',
+            '  fi',
+            '  authority_matches "$authority_path" "$authority_next_file" || fail',
+            '  if [ -e "$artifact_path" ] || [ -L "$artifact_path" ]; then',
+            '    validate_artifact',
+            '  else',
+            '    if [ -e "$journal_path" ] || [ -L "$journal_path" ]; then fail; fi',
+            '    document_matches "$document_path" "$original_expected_document_sha" || fail',
+            '    sidecar_matches "$sidecar_path" "$original_live_expected_sidecar_base64" "$expected_sidecar_file" || fail',
+            '  fi',
+            '  if [ -e "$journal_path" ] || [ -L "$journal_path" ]; then cmp -s "$journal_path" "$expected_journal" || fail; fi',
+            '}',
             'authorize_writer() {',
             '  if [ "$exact_abandoned_initial_enrollment_rollback" = true ]; then',
             '    if [ -e "$authority_path" ] || [ -L "$authority_path" ]; then',
@@ -663,6 +846,12 @@ final class ManagedTraefikDocumentWriter
             '      atomic_replace "$authority_path" "$authority_next_file" "$state_directory"',
             '      authority_matches "$authority_path" "$authority_next_file" || fail',
             '      ;;',
+            '    supersede)',
+            '      if authority_matches "$authority_path" "$authority_next_file"; then return; fi',
+            '      authority_matches "$authority_path" "$authority_required_file" || fail',
+            '      atomic_replace "$authority_path" "$authority_next_file" "$state_directory"',
+            '      authority_matches "$authority_path" "$authority_next_file" || fail',
+            '      ;;',
             '    *)',
             '      fail',
             '      ;;',
@@ -683,6 +872,11 @@ final class ManagedTraefikDocumentWriter
             '  replacement_stage=$(mktemp "$replacement_directory/${replacement_prefix}XXXXXX") || fail',
             '  cp "$replacement_source" "$replacement_stage" || fail',
             '  chmod 600 "$replacement_stage" || fail',
+            '  if [ "$orphaned_authority_supersession" = true ] && [ "$replacement_target" = "$document_path" ] && [ "${COOLIFY_MANAGED_TRAEFIK_DOCUMENT_CRASH_AFTER_DOCUMENT_CANDIDATE_FSYNC:-}" = 1 ]; then',
+            '    durable_remote_assert_owned_regular "$replacement_stage" || fail',
+            '    sync "$replacement_stage" || fail',
+            '    exit 75',
+            '  fi',
             '  durable_remote_replace "$replacement_stage" "$replacement_target" "$replacement_directory" || fail',
             '  normalize_target_visibility "$replacement_target"',
             '}',
@@ -901,6 +1095,13 @@ final class ManagedTraefikDocumentWriter
             '  durable_remote_assert_owned_regular "$artifact_path" || fail',
             '  durable_remote_assert_owned_regular "$lock_path" || fail',
             '  assert_exact_abandoned_initial_enrollment_census',
+            'elif [ "$orphaned_authority_supersession" = true ]; then',
+            '  assert_directory "$dynamic_directory"',
+            '  assert_directory "$state_directory"',
+            '  assert_regular_or_absent "$sidecar_path"',
+            '  assert_regular_or_absent "$orphaned_artifact_path"',
+            '  durable_remote_assert_owned_regular "$lock_path" || fail',
+            '  assert_orphan_supersession_census_names',
             'else',
             '  mkdir -p "$dynamic_directory" "$state_directory" || fail',
             'fi',
@@ -910,21 +1111,25 @@ final class ManagedTraefikDocumentWriter
             'assert_regular_or_absent "$sidecar_path"',
             'assert_regular_or_absent "$journal_path"',
             'assert_regular_or_absent "$artifact_path"',
+            'if [ "$orphaned_authority_supersession" = true ]; then assert_regular_or_absent "$orphaned_artifact_path"; fi',
             'assert_regular_or_absent "$authority_path"',
             'assert_regular_or_absent "$lock_path"',
             'command -v flock >/dev/null 2>&1 || fail',
             'exec 9> "$lock_path" || fail',
             'durable_remote_assert_owned_regular "$lock_path" || fail',
-            'if [ "$exact_abandoned_initial_enrollment_rollback" != true ]; then normalize_private_file "$lock_path"; fi',
+            'if [ "$exact_abandoned_initial_enrollment_rollback" != true ] && [ "$orphaned_authority_supersession" != true ]; then normalize_private_file "$lock_path"; fi',
             'flock -x 9 || fail',
             'if [ "$exact_abandoned_initial_enrollment_rollback" = true ]; then',
             '  assert_exact_abandoned_initial_enrollment_census',
             '  cleanup_reconcilable_legacy_scratch_directories',
+            'elif [ "$orphaned_authority_supersession" = true ]; then',
+            '  assert_orphan_supersession_census_names',
             'fi',
             'assert_regular_or_absent "$document_path"',
             'assert_regular_or_absent "$sidecar_path"',
             'assert_regular_or_absent "$journal_path"',
             'assert_regular_or_absent "$artifact_path"',
+            'if [ "$orphaned_authority_supersession" = true ]; then assert_regular_or_absent "$orphaned_artifact_path"; fi',
             'assert_regular_or_absent "$authority_path"',
             'scratch=$(mktemp -d "${TMPDIR:-/tmp}/coolify-managed-traefik-document.${filename}.XXXXXX") || fail',
             'expected_sidecar_file="$scratch/expected-sidecar"',
@@ -934,11 +1139,13 @@ final class ManagedTraefikDocumentWriter
             'forward_journal="$scratch/forward-journal"',
             'authority_required_file="$scratch/authority-required"',
             'authority_next_file="$scratch/authority-next"',
-            'cleanup() { rm -f "$scratch/expected-sidecar" "$scratch/replacement-sidecar" "$scratch/replacement-payload" "$scratch/expected-journal" "$scratch/forward-journal" "$scratch/authority-required" "$scratch/authority-next" "$scratch/predecessor-document"; rmdir "$scratch" 2>/dev/null || true; }',
+            'orphaned_artifact_file="$scratch/orphaned-artifact"',
+            'target_artifact_file="$scratch/target-artifact"',
+            'cleanup() { rm -f "$scratch/expected-sidecar" "$scratch/replacement-sidecar" "$scratch/replacement-payload" "$scratch/expected-journal" "$scratch/forward-journal" "$scratch/authority-required" "$scratch/authority-next" "$scratch/orphaned-artifact" "$scratch/target-artifact" "$scratch/predecessor-document"; rmdir "$scratch" 2>/dev/null || true; }',
             'trap cleanup 0 HUP INT TERM',
             'expected_document_sha=$original_expected_document_sha',
             'replacement_document_sha=$original_replacement_document_sha',
-            'expected_sidecar_base64=$original_expected_sidecar_base64',
+            'expected_sidecar_base64=$original_live_expected_sidecar_base64',
             'replacement_sidecar_base64=$original_replacement_sidecar_base64',
             'replacement_payload_base64=$original_replacement_payload_base64',
             'rollback_without_artifact=false',
@@ -961,8 +1168,11 @@ final class ManagedTraefikDocumentWriter
             'load_mutation_files',
             'case "$allow_missing_artifact_noop" in true|false) ;; *) fail ;; esac',
             'case "$exact_abandoned_initial_enrollment_rollback" in true|false) ;; *) fail ;; esac',
+            'case "$orphaned_authority_supersession" in true|false) ;; *) fail ;; esac',
             'if [ "$authority_required_base64" = absent ]; then : > "$authority_required_file"; else printf %s "$authority_required_base64" | base64 -d > "$authority_required_file" || fail; fi',
             'if [ "$authority_next_base64" = absent ]; then : > "$authority_next_file"; else printf %s "$authority_next_base64" | base64 -d > "$authority_next_file" || fail; fi',
+            'if [ "$orphaned_artifact_base64" = absent ]; then : > "$orphaned_artifact_file"; else printf %s "$orphaned_artifact_base64" | base64 -d > "$orphaned_artifact_file" || fail; fi',
+            'if [ "$target_artifact_base64" = absent ]; then : > "$target_artifact_file"; else printf %s "$target_artifact_base64" | base64 -d > "$target_artifact_file" || fail; fi',
             'case "$allow_authority_bootstrap" in true|false) ;; *) fail ;; esac',
             'case "$allow_authority_absence" in true|false) ;; *) fail ;; esac',
             'case "$authority_mode" in',
@@ -977,10 +1187,22 @@ final class ManagedTraefikDocumentWriter
             '    if ! { test "$mode" = rollback && test "$authority_required_base64" != absent && test "$authority_next_base64" != absent; }; then fail; fi',
             '    test "$allow_authority_bootstrap" = false || fail',
             '    ;;',
+            '  supersede)',
+            '    if ! { test "$mode" = write && test "$authority_required_base64" != absent && test "$authority_next_base64" != absent; }; then fail; fi',
+            '    if ! { test "$allow_missing_artifact_noop" = false && test "$allow_authority_bootstrap" = false && test "$allow_authority_absence" = false; }; then fail; fi',
+            '    ;;',
             '  *) fail ;;',
             'esac',
             'if [ "$exact_abandoned_initial_enrollment_rollback" = true ]; then',
             '  if ! { test "$mode" = rollback && test "$authority_mode" = rollback && test "$allow_missing_artifact_noop" = false && test "$allow_authority_bootstrap" = false && test "$allow_authority_absence" = false; }; then fail; fi',
+            'fi',
+            'if [ "$orphaned_authority_supersession" = true ]; then',
+            '  if ! { test "$authority_mode" = supersede && test "$orphaned_artifact_path" != absent && test "$orphaned_artifact_base64" != absent && test "$target_artifact_base64" != absent && test "$orphaned_container_id" != absent && test "$target_container_id" != absent && test "$target_container_name" != absent && test "$target_image_id" != absent; }; then fail; fi',
+            '  test "$original_expected_sidecar_base64" = absent || fail',
+            '  test "$original_live_expected_sidecar_base64" != absent || fail',
+            'else',
+            '  if ! { test "$orphaned_artifact_path" = absent && test "$orphaned_artifact_base64" = absent && test "$target_artifact_base64" = absent && test "$orphaned_container_id" = absent && test "$target_container_id" = absent && test "$target_container_name" = absent && test "$target_image_id" = absent; }; then fail; fi',
+            '  test "$original_live_expected_sidecar_base64" = "$original_expected_sidecar_base64" || fail',
             'fi',
             'if [ "$rollback_without_artifact" = true ]; then',
             '  if [ -e "$journal_path" ] || [ -L "$journal_path" ]; then fail; fi',
@@ -1003,6 +1225,7 @@ final class ManagedTraefikDocumentWriter
             '  write_record "$forward_journal" write "$original_expected_document_sha" "$original_replacement_document_sha" "$original_expected_sidecar_base64" "$original_replacement_sidecar_base64" "$original_replacement_payload_base64"',
             'fi',
             'if [ "$exact_abandoned_initial_enrollment_rollback" = true ]; then assert_exact_abandoned_initial_enrollment_state; fi',
+            'assert_orphan_supersession_context',
             'if [ -e "$journal_path" ] || [ -L "$journal_path" ]; then',
             '  assert_regular_or_absent "$journal_path"',
             '  if cmp -s "$journal_path" "$expected_journal"; then',
@@ -1045,6 +1268,26 @@ final class ManagedTraefikDocumentWriter
             'if [ "$replacement_document_sha" = absent ]; then durable_remote_remove "$document_path" "$dynamic_directory" || fail; else durable_remote_reaffirm "$document_path" "$dynamic_directory" || fail; fi',
             'if [ "$replacement_sidecar_base64" = absent ]; then durable_remote_remove "$sidecar_path" "$state_directory" || fail; else durable_remote_reaffirm "$sidecar_path" "$state_directory" || fail; fi',
             'durable_remote_remove "$journal_path" "$state_directory" || fail',
+            'if [ "$orphaned_authority_supersession" = true ]; then',
+            '  assert_orphan_supersession_census_names',
+            '  assert_no_orphan_supersession_candidates',
+            '  assert_exact_orphan_runtime',
+            '  authority_matches "$authority_path" "$authority_next_file" || fail',
+            '  document_matches "$document_path" "$original_replacement_document_sha" || fail',
+            '  sidecar_matches "$sidecar_path" "$original_replacement_sidecar_base64" "$replacement_sidecar_file" || fail',
+            '  validate_artifact',
+            '  if [ -e "$orphaned_artifact_path" ] || [ -L "$orphaned_artifact_path" ]; then',
+            '    orphaned_artifact_matches || fail',
+            '    durable_remote_remove "$orphaned_artifact_path" "$state_directory" || fail',
+            '  fi',
+            '  if [ "${COOLIFY_MANAGED_TRAEFIK_DOCUMENT_CRASH_AFTER_ORPHAN_ARTIFACT_UNLINK:-}" = 1 ]; then exit 75; fi',
+            '  if [ -e "$orphaned_artifact_path" ] || [ -L "$orphaned_artifact_path" ]; then fail; fi',
+            '  assert_orphan_supersession_census_names',
+            '  assert_no_orphan_supersession_candidates',
+            '  normalize_visible_state',
+            '  printf %s "$orphaned_authority_superseded_output"',
+            '  exit 0',
+            'fi',
             'normalize_visible_state',
             'if [ "$mode" = rollback ]; then printf %s "$rolled_back_output"; else printf %s "$applied_output"; fi',
         ]);
@@ -1467,6 +1710,35 @@ final class ManagedTraefikDocumentWriter
 
         if (! $activeAuthority->matchesPredecessor($mutation)) {
             throw new InvalidArgumentException('The managed Traefik document write must require the exact active predecessor authority.');
+        }
+    }
+
+    private function assertOrphanedInitialEnrollmentAuthoritySupersession(
+        ManagedTraefikDocumentMutation $mutation,
+        string $correctedPredecessorBytes,
+        ManagedTraefikDocumentWriterAuthority $orphanedAuthority,
+        ManagedTraefikDocumentWriterAuthority $targetAuthority,
+        bool $transportLfRepairProvenance,
+    ): void {
+        if (! $transportLfRepairProvenance
+            || $correctedPredecessorBytes === ''
+            || ! str_ends_with($correctedPredecessorBytes, "\n")
+            || str_ends_with($correctedPredecessorBytes, "\n\n")
+            || $mutation->revision !== 1
+            || $mutation->expectedSha256 === null
+            || ! hash_equals($mutation->expectedSha256, hash('sha256', $correctedPredecessorBytes))
+            || $mutation->expectedOperationId !== null
+            || $mutation->expectedRevision !== null
+            || hash_equals($mutation->expectedSha256, $mutation->replacementSha256())
+            || $targetAuthority->epoch !== 1
+            || ! $targetAuthority->matchesReplacement($mutation)
+            || $orphanedAuthority->epoch !== 1
+            || $orphanedAuthority->dynamicRevision !== 1
+            || hash_equals($orphanedAuthority->operationId, $mutation->operationId)
+            || hash_equals($orphanedAuthority->dynamicSha256, $mutation->expectedSha256)
+            || hash_equals($orphanedAuthority->dynamicSha256, $mutation->replacementSha256())
+            || hash_equals($orphanedAuthority->containerId, $targetAuthority->containerId)) {
+            throw new InvalidArgumentException('Orphaned initial-enrollment authority supersession requires durable transport-LF repair provenance, one exact foreign epoch-one authority, corrected unmanaged predecessor, and distinct live replacement.');
         }
     }
 

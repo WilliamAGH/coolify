@@ -146,6 +146,42 @@ final readonly class ControlPlaneProxyEnrollmentState
         );
     }
 
+    public function withRepairedDynamicPredecessorTerminalLf(): self
+    {
+        if ($this->phase !== ControlPlaneProxyEnrollmentPhase::Activating) {
+            throw new InvalidArgumentException('The dynamic predecessor transport-LF repair is limited to an activating enrollment.');
+        }
+        if ($this->dynamicPredecessorBytes === null
+            || $this->dynamicPredecessorBytes === ''
+            || str_ends_with($this->dynamicPredecessorBytes, "\n")) {
+            throw new InvalidArgumentException('The dynamic predecessor transport-LF repair requires one non-empty predecessor missing its terminal LF.');
+        }
+
+        return new self(
+            phase: $this->phase,
+            operationId: $this->operationId,
+            tokenSha256: $this->tokenSha256,
+            serverId: $this->serverId,
+            appPort: $this->appPort,
+            exposure: $this->exposure,
+            managedFilename: $this->managedFilename,
+            dynamicRevision: $this->dynamicRevision,
+            canonicalHost: $this->canonicalHost,
+            publicScheme: $this->publicScheme,
+            expectedMember: $this->expectedMember,
+            expectedRevision: $this->expectedRevision,
+            configurationAcknowledgement: $this->configurationAcknowledgement,
+            activeBackendDnsNames: $this->activeBackendDnsNames,
+            staticPredecessorBytes: $this->staticPredecessorBytes,
+            staticReplacementBytes: $this->staticReplacementBytes,
+            sourceOverrideBytes: $this->sourceOverrideBytes,
+            dynamicPredecessorBytes: $this->dynamicPredecessorBytes."\n",
+            dynamicReplacementBytes: $this->dynamicReplacementBytes,
+            createdAt: $this->createdAt,
+            updatedAt: $this->updatedAt,
+        );
+    }
+
     public function isOwnedBy(string $operationId, string $token): bool
     {
         return hash_equals($this->operationId, $operationId)

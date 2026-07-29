@@ -73,6 +73,8 @@ it('durably reserves and advances one exact enrollment owner idempotently', func
     $server = Server::factory()->create(['team_id' => $team->id]);
     $repository = new StoreControlPlaneProxyEnrollmentState;
     $state = controlPlaneEnrollmentState($server);
+    $server->proxy->set(StoreControlPlaneProxyEnrollmentState::LF_REPAIR_PROVENANCE_KEY, ['stale' => true]);
+    $server->save();
 
     $reserved = $repository->reserve($server, $state, 'secret-token');
     $replayed = $repository->reserve($server, $state, 'secret-token');
@@ -101,8 +103,211 @@ it('durably reserves and advances one exact enrollment owner idempotently', func
         ->not->toContain('secret-token')
         ->and($repository->read($server)?->dynamicPredecessorBytes)
         ->toBe("http:\n  routers:\n    legacy: {}\n")
+        ->and($server->fresh()->proxy->get(StoreControlPlaneProxyEnrollmentState::LF_REPAIR_PROVENANCE_KEY))->toBeNull()
         ->and($server->fresh()->controlPlaneProxyEnrollmentState()?->phase)
         ->toBe(ControlPlaneProxyEnrollmentPhase::Prepared);
+});
+
+it('treats a v3 activating state without sibling LF-repair provenance as unrepaired', function (): void {
+    $server = Server::factory()->create(['team_id' => Team::factory()->create()->id]);
+    $repository = new StoreControlPlaneProxyEnrollmentState;
+    $legacy = controlPlaneEnrollmentState($server)
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::Prepared, '2026-07-18T12:01:00Z')
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::Activating, '2026-07-18T12:02:00Z');
+    $repository->reserve($server, $legacy, 'secret-token');
+
+    expect($legacy->toArray()['version'])->toBe(3)
+        ->and($repository->hasDynamicPredecessorTerminalLfRepairProvenance(
+            $server,
+            $legacy,
+            'enrollment-op',
+            'secret-token',
+        ))->toBeFalse()
+        ->and($server->fresh()->proxy->get(StoreControlPlaneProxyEnrollmentState::LF_REPAIR_PROVENANCE_KEY))->toBeNull();
+});
+
+it('repairs only one missing transport LF in the exact activating predecessor state and replays idempotently', function (): void {
+    $server = Server::factory()->create(['team_id' => Team::factory()->create()->id]);
+    $repository = new StoreControlPlaneProxyEnrollmentState;
+    $state = controlPlaneEnrollmentState($server)
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::Prepared, '2026-07-18T12:01:00Z')
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::Activating, '2026-07-18T12:02:00Z');
+    $stored = $state->toArray();
+    $predecessorWithoutLf = rtrim($state->dynamicPredecessorBytes ?? '', "\n");
+    $stored['dynamic_predecessor'] = [
+        'base64' => base64_encode($predecessorWithoutLf),
+        'sha256' => hash('sha256', $predecessorWithoutLf),
+    ];
+    $state = ControlPlaneProxyEnrollmentState::fromArray($stored);
+    $repository->reserve($server, $state, 'secret-token');
+
+    $repaired = $repository->repairDynamicPredecessorTerminalLfIfUnchanged(
+        $server,
+        $state,
+        'enrollment-op',
+        'secret-token',
+    );
+    $replayed = $repository->repairDynamicPredecessorTerminalLfIfUnchanged(
+        $server,
+        $state,
+        'enrollment-op',
+        'secret-token',
+    );
+    $replayedFromCorrected = $repository->repairDynamicPredecessorTerminalLfIfUnchanged(
+        $server,
+        $repaired,
+        'enrollment-op',
+        'secret-token',
+    );
+
+    $expected = $state->toArray();
+    $expected['dynamic_predecessor'] = [
+        'base64' => base64_encode($predecessorWithoutLf."\n"),
+        'sha256' => hash('sha256', $predecessorWithoutLf."\n"),
+    ];
+    expect($repaired->toArray())->toBe($expected)
+        ->and($replayed->toArray())->toBe($expected)
+        ->and($replayedFromCorrected->toArray())->toBe($expected)
+        ->and($repaired->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Activating)
+        ->and($repaired->createdAt)->toBe($state->createdAt)
+        ->and($repaired->updatedAt)->toBe($state->updatedAt)
+        ->and($repository->hasDynamicPredecessorTerminalLfRepairProvenance(
+            $server,
+            $repaired,
+            'enrollment-op',
+            'secret-token',
+        ))->toBeTrue()
+        ->and($repository->read($server)?->toArray())->toBe($expected);
+
+    $tamperedServer = $server->fresh();
+    $tamperedServer->proxy->set(StoreControlPlaneProxyEnrollmentState::LF_REPAIR_PROVENANCE_KEY, null);
+    $tamperedServer->save();
+    expect(fn () => $repository->repairDynamicPredecessorTerminalLfIfUnchanged(
+        $server,
+        $repaired,
+        'enrollment-op',
+        'secret-token',
+    ))->toThrow(RuntimeException::class, 'provenance is missing or stale');
+});
+
+it('clears LF-repair provenance on a transition away from its exact activating state', function (): void {
+    $server = Server::factory()->create(['team_id' => Team::factory()->create()->id]);
+    $repository = new StoreControlPlaneProxyEnrollmentState;
+    $state = controlPlaneEnrollmentState($server)
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::Prepared, '2026-07-18T12:01:00Z')
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::Activating, '2026-07-18T12:02:00Z');
+    $stored = $state->toArray();
+    $predecessorWithoutLf = rtrim($state->dynamicPredecessorBytes ?? '', "\n");
+    $stored['dynamic_predecessor'] = [
+        'base64' => base64_encode($predecessorWithoutLf),
+        'sha256' => hash('sha256', $predecessorWithoutLf),
+    ];
+    $state = ControlPlaneProxyEnrollmentState::fromArray($stored);
+    $repository->reserve($server, $state, 'secret-token');
+    $repaired = $repository->repairDynamicPredecessorTerminalLfIfUnchanged(
+        $server,
+        $state,
+        'enrollment-op',
+        'secret-token',
+    );
+
+    expect($server->fresh()->proxy->get(StoreControlPlaneProxyEnrollmentState::LF_REPAIR_PROVENANCE_KEY))
+        ->toBeArray();
+    $active = $repository->transition(
+        $server,
+        'enrollment-op',
+        'secret-token',
+        ControlPlaneProxyEnrollmentPhase::Activating,
+        ControlPlaneProxyEnrollmentPhase::Active,
+        '2026-07-18T12:03:00Z',
+    );
+
+    expect($server->fresh()->proxy->get(StoreControlPlaneProxyEnrollmentState::LF_REPAIR_PROVENANCE_KEY))->toBeNull()
+        ->and($repository->hasDynamicPredecessorTerminalLfRepairProvenance(
+            $server,
+            $active,
+            'enrollment-op',
+            'secret-token',
+        ))->toBeFalse()
+        ->and($repaired->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Activating);
+});
+
+it('rejects stale LF-repair provenance left by a legacy v3 transition', function (): void {
+    $server = Server::factory()->create(['team_id' => Team::factory()->create()->id]);
+    $repository = new StoreControlPlaneProxyEnrollmentState;
+    $state = controlPlaneEnrollmentState($server)
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::Prepared, '2026-07-18T12:01:00Z')
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::Activating, '2026-07-18T12:02:00Z');
+    $stored = $state->toArray();
+    $predecessorWithoutLf = rtrim($state->dynamicPredecessorBytes ?? '', "\n");
+    $stored['dynamic_predecessor'] = [
+        'base64' => base64_encode($predecessorWithoutLf),
+        'sha256' => hash('sha256', $predecessorWithoutLf),
+    ];
+    $state = ControlPlaneProxyEnrollmentState::fromArray($stored);
+    $repository->reserve($server, $state, 'secret-token');
+    $repaired = $repository->repairDynamicPredecessorTerminalLfIfUnchanged(
+        $server,
+        $state,
+        'enrollment-op',
+        'secret-token',
+    );
+    $legacyTransition = $repaired->withPhase(
+        ControlPlaneProxyEnrollmentPhase::RollingBack,
+        '2026-07-18T12:03:00Z',
+    );
+    $legacyServer = $server->fresh();
+    $preservedMarker = $legacyServer->proxy->get(StoreControlPlaneProxyEnrollmentState::LF_REPAIR_PROVENANCE_KEY);
+    $legacyServer->proxy->set(StoreControlPlaneProxyEnrollmentState::STATE_KEY, $legacyTransition->toArray());
+    $legacyServer->save();
+
+    expect($server->fresh()->proxy->get(StoreControlPlaneProxyEnrollmentState::LF_REPAIR_PROVENANCE_KEY))
+        ->toBe($preservedMarker)
+        ->and($repository->hasDynamicPredecessorTerminalLfRepairProvenance(
+            $server,
+            $legacyTransition,
+            'enrollment-op',
+            'secret-token',
+        ))->toBeFalse();
+});
+
+it('fails closed when the transport-LF repair is not the exact owned activating state', function (): void {
+    $server = Server::factory()->create(['team_id' => Team::factory()->create()->id]);
+    $repository = new StoreControlPlaneProxyEnrollmentState;
+    $prepared = controlPlaneEnrollmentState($server)
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::Prepared, '2026-07-18T12:01:00Z');
+    $stored = $prepared->toArray();
+    $predecessorWithoutLf = rtrim($prepared->dynamicPredecessorBytes ?? '', "\n");
+    $stored['dynamic_predecessor'] = [
+        'base64' => base64_encode($predecessorWithoutLf),
+        'sha256' => hash('sha256', $predecessorWithoutLf),
+    ];
+    $prepared = ControlPlaneProxyEnrollmentState::fromArray($stored);
+    $repository->reserve($server, $prepared, 'secret-token');
+
+    expect(fn () => $prepared->withRepairedDynamicPredecessorTerminalLf())
+        ->toThrow(InvalidArgumentException::class, 'activating');
+
+    $activating = $prepared->withPhase(ControlPlaneProxyEnrollmentPhase::Activating, '2026-07-18T12:02:00Z');
+    $server->refresh();
+    $server->proxy->set(StoreControlPlaneProxyEnrollmentState::STATE_KEY, $activating->toArray());
+    $server->save();
+    expect(fn () => $repository->repairDynamicPredecessorTerminalLfIfUnchanged(
+        $server,
+        $activating,
+        'enrollment-op',
+        'wrong-token',
+    ))->toThrow(RuntimeException::class, 'owned by another operation');
+
+    $server->refresh();
+    $server->proxy->set(StoreControlPlaneGenerationPromotionState::STATE_KEY, ['present' => true]);
+    $server->save();
+    expect(fn () => $repository->repairDynamicPredecessorTerminalLfIfUnchanged(
+        $server,
+        $activating,
+        'enrollment-op',
+        'secret-token',
+    ))->toThrow(RuntimeException::class, 'generation promotion state exists');
 });
 
 it('freezes the canonical dynamic owner and preserves the managed static listener', function () {

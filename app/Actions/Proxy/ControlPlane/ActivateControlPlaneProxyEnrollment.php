@@ -5,6 +5,7 @@ namespace App\Actions\Proxy\ControlPlane;
 use App\Actions\Proxy\SaveProxyConfiguration;
 use App\Models\Server;
 use Closure;
+use InvalidArgumentException;
 use Lorisleiva\Actions\Concerns\AsAction;
 use RuntimeException;
 
@@ -143,7 +144,69 @@ final class ActivateControlPlaneProxyEnrollment
                 'dynamic Traefik document',
             );
         } elseif (! hash_equals($existingAuthority->toJson(), $writerAuthority->toJson())) {
-            throw new RuntimeException('The control-plane enrollment writer authority is not owned by this exact enrollment.');
+            $transportLfRepairProvenance = $this->stateStore
+                ->hasDynamicPredecessorTerminalLfRepairProvenance(
+                    $server,
+                    $state,
+                    $operationId,
+                    $token,
+                );
+            if (! $this->canSupersedeOrphanedInitialEnrollmentAuthority(
+                $state,
+                $wasAlreadyActivating,
+                $existingAuthority,
+                $writerAuthority,
+                $transportLfRepairProvenance,
+            )) {
+                throw $this->writerAuthorityOwnershipException();
+            }
+
+            if (! str_ends_with($state->dynamicPredecessorBytes ?? '', "\n")) {
+                $state = $this->stateStore->repairDynamicPredecessorTerminalLfIfUnchanged(
+                    $server,
+                    $state,
+                    $operationId,
+                    $token,
+                );
+            }
+            $transportLfRepairProvenance = $this->stateStore
+                ->hasDynamicPredecessorTerminalLfRepairProvenance(
+                    $server,
+                    $state,
+                    $operationId,
+                    $token,
+                );
+            if (! $transportLfRepairProvenance) {
+                throw $this->writerAuthorityOwnershipException();
+            }
+            $mutation = $this->dynamicMutation($server, $state);
+            $writerAuthority = $this->writerAuthorityBootstrap->authorityFor(
+                $state,
+                new ControlPlaneEnrollmentWriterIdentity(
+                    containerId: $writerAuthority->containerId,
+                    containerName: $writerAuthority->containerName,
+                    imageId: $writerAuthority->imageId,
+                ),
+            );
+            try {
+                $supersessionCommand = $this->dynamicWriter->supersedeOrphanedInitialEnrollmentAuthorityCommandFor(
+                    mutation: $mutation,
+                    correctedPredecessorBytes: $state->dynamicPredecessorBytes ?? '',
+                    orphanedAuthority: $existingAuthority,
+                    targetAuthority: $writerAuthority,
+                    transportLfRepairProvenance: $transportLfRepairProvenance,
+                );
+            } catch (InvalidArgumentException) {
+                throw $this->writerAuthorityOwnershipException();
+            }
+            $supersessionOutput = $execute($supersessionCommand);
+            if (! is_string($supersessionOutput)
+                || ! hash_equals(
+                    ManagedTraefikDocumentWriter::ORPHANED_ENROLLMENT_AUTHORITY_SUPERSEDED_OUTPUT,
+                    trim($supersessionOutput),
+                )) {
+                throw $this->writerAuthorityOwnershipException();
+            }
         }
 
         $this->assertExactOutput(
@@ -266,6 +329,47 @@ final class ActivateControlPlaneProxyEnrollment
             expectedRevision: null,
             replacementBytes: $state->dynamicReplacementBytes,
         );
+    }
+
+    private function canSupersedeOrphanedInitialEnrollmentAuthority(
+        ControlPlaneProxyEnrollmentState $state,
+        bool $wasAlreadyActivating,
+        ManagedTraefikDocumentWriterAuthority $existingAuthority,
+        ManagedTraefikDocumentWriterAuthority $targetAuthority,
+        bool $transportLfRepairProvenance,
+    ): bool {
+        $predecessorBytes = $state->dynamicPredecessorBytes;
+        $predecessorEndsWithLf = is_string($predecessorBytes) && str_ends_with($predecessorBytes, "\n");
+        if (! $wasAlreadyActivating
+            || $state->phase !== ControlPlaneProxyEnrollmentPhase::Activating
+            || $predecessorBytes === null
+            || $predecessorBytes === ''
+            || $state->dynamicRevision !== 1
+            || $existingAuthority->epoch !== 1
+            || $existingAuthority->dynamicRevision !== 1
+            || $targetAuthority->epoch !== 1
+            || $targetAuthority->dynamicRevision !== 1
+            || $predecessorEndsWithLf !== $transportLfRepairProvenance
+            || hash_equals($existingAuthority->operationId, $state->operationId)
+            || hash_equals($existingAuthority->containerId, $targetAuthority->containerId)) {
+            return false;
+        }
+
+        $correctedPredecessorBytes = str_ends_with($predecessorBytes, "\n")
+            ? $predecessorBytes
+            : $predecessorBytes."\n";
+        $correctedPredecessorSha256 = hash('sha256', $correctedPredecessorBytes);
+        $replacementSha256 = hash('sha256', $state->dynamicReplacementBytes);
+
+        return ! str_ends_with($correctedPredecessorBytes, "\n\n")
+            && ! hash_equals($correctedPredecessorSha256, $replacementSha256)
+            && ! hash_equals($existingAuthority->dynamicSha256, $correctedPredecessorSha256)
+            && ! hash_equals($existingAuthority->dynamicSha256, $replacementSha256);
+    }
+
+    private function writerAuthorityOwnershipException(): RuntimeException
+    {
+        return new RuntimeException('The control-plane enrollment writer authority is not owned by this exact enrollment.');
     }
 
     private function assertExactOutput(?string $output, string $expected, string $operation): void

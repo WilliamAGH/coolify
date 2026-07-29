@@ -95,6 +95,156 @@ function managedTraefikDocumentEnrollmentRollbackAuthority(
     );
 }
 
+/** @return array<string, string> */
+function managedTraefikDocumentDockerEnvironment(
+    string $root,
+    ManagedTraefikDocumentWriterAuthority $targetAuthority,
+    string $visibleContainerIds,
+    bool $targetRunning = true,
+    ?string $targetImageId = null,
+): array {
+    $binDirectory = $root.'/bin';
+    mkdir($binDirectory, 0700, true);
+    $dockerPath = $binDirectory.'/docker';
+    file_put_contents($dockerPath, <<<'SH'
+#!/bin/sh
+set -eu
+
+if [ "$1" = container ] && [ "$2" = ls ]; then
+    if [ -n "$COOLIFY_TEST_DOCKER_IDS" ]; then
+        printf '%s\n' "$COOLIFY_TEST_DOCKER_IDS"
+    fi
+    exit 0
+fi
+
+if [ "$1" = inspect ]; then
+    inspected=
+    for argument in "$@"; do
+        inspected=$argument
+    done
+    [ "$inspected" = "$COOLIFY_TEST_TARGET_CONTAINER_ID" ] || exit 1
+    printf '%s|/%s|%s|%s\n' \
+        "$COOLIFY_TEST_TARGET_CONTAINER_ID" \
+        "$COOLIFY_TEST_TARGET_CONTAINER_NAME" \
+        "$COOLIFY_TEST_TARGET_IMAGE_ID" \
+        "$COOLIFY_TEST_TARGET_RUNNING"
+    exit 0
+fi
+
+exit 1
+SH);
+    chmod($dockerPath, 0700);
+
+    return [
+        'PATH' => $binDirectory.PATH_SEPARATOR.(getenv('PATH') ?: '/usr/bin:/bin'),
+        'COOLIFY_TEST_DOCKER_IDS' => $visibleContainerIds,
+        'COOLIFY_TEST_TARGET_CONTAINER_ID' => $targetAuthority->containerId,
+        'COOLIFY_TEST_TARGET_CONTAINER_NAME' => $targetAuthority->containerName,
+        'COOLIFY_TEST_TARGET_IMAGE_ID' => $targetImageId ?? $targetAuthority->imageId,
+        'COOLIFY_TEST_TARGET_RUNNING' => $targetRunning ? 'true' : 'false',
+    ];
+}
+
+/**
+ * @return array{
+ *     writer: ManagedTraefikDocumentWriter,
+ *     orphaned: ManagedTraefikDocumentMutation,
+ *     mutation: ManagedTraefikDocumentMutation,
+ *     correctedMutation: ManagedTraefikDocumentMutation,
+ *     orphanedAuthority: ManagedTraefikDocumentWriterAuthority,
+ *     targetAuthority: ManagedTraefikDocumentWriterAuthority,
+ *     correctedPredecessorBytes: string,
+ *     command: string,
+ *     staleCommand: string,
+ *     environment: array<string, string>,
+ *     orphanedArtifactBytes: string
+ * }
+ */
+function managedTraefikDocumentOrphanSupersessionFixture(string $root): array
+{
+    $writer = new ManagedTraefikDocumentWriter;
+    $orphaned = managedTraefikDocumentMutation(
+        root: $root,
+        operationId: 'orphaned-initial-enrollment',
+        revision: 1,
+        replacementBytes: "http:\n  routers:\n    orphaned: {}\n",
+    );
+    $orphanedWrite = runManagedTraefikDocumentCommand($writer->writeCommandFor($orphaned));
+    if (! $orphanedWrite->isSuccessful()) {
+        throw new RuntimeException($orphanedWrite->getErrorOutput());
+    }
+    $orphanedArtifactBytes = file_get_contents($orphaned->rollbackArtifactPath());
+    if (! is_string($orphanedArtifactBytes)) {
+        throw new RuntimeException('The orphaned rollback artifact fixture is missing.');
+    }
+
+    $orphanedAuthority = managedTraefikDocumentWriterAuthority(
+        $orphaned,
+        epoch: 1,
+        member: 'orphaned',
+        identity: 'c',
+    );
+    file_put_contents($orphaned->writerAuthorityPath(), $orphanedAuthority->toJson());
+    chmod($orphaned->writerAuthorityPath(), 0640);
+
+    $correctedPredecessorBytes = "http:\n  routers:\n    generic-overwrite: {}\n";
+    file_put_contents($orphaned->documentPath(), $correctedPredecessorBytes);
+    $mutation = new ManagedTraefikDocumentMutation(
+        dynamicDirectory: $orphaned->dynamicDirectory,
+        stateDirectory: $orphaned->stateDirectory,
+        filename: $orphaned->filename,
+        operationId: 'replacement-enrollment',
+        revision: 1,
+        expectedSha256: hash('sha256', $correctedPredecessorBytes),
+        expectedOperationId: null,
+        expectedRevision: null,
+        replacementBytes: "http:\n  routers:\n    replacement: {}\n",
+    );
+    $correctedMutation = $mutation;
+    $targetAuthority = managedTraefikDocumentWriterAuthority(
+        $mutation,
+        epoch: 1,
+        member: 'replacement',
+        identity: 'd',
+    );
+    $command = $writer->supersedeOrphanedInitialEnrollmentAuthorityCommandFor(
+        mutation: $mutation,
+        correctedPredecessorBytes: $correctedPredecessorBytes,
+        orphanedAuthority: $orphanedAuthority,
+        targetAuthority: $targetAuthority,
+        transportLfRepairProvenance: true,
+    );
+    $staleSuccessor = managedTraefikDocumentMutation(
+        root: $root,
+        operationId: 'captured-orphaned-successor',
+        revision: 2,
+        replacementBytes: "http:\n  routers:\n    stale: {}\n",
+        predecessor: $orphaned,
+    );
+
+    return [
+        'writer' => $writer,
+        'orphaned' => $orphaned,
+        'mutation' => $mutation,
+        'correctedMutation' => $correctedMutation,
+        'orphanedAuthority' => $orphanedAuthority,
+        'targetAuthority' => $targetAuthority,
+        'correctedPredecessorBytes' => $correctedPredecessorBytes,
+        'command' => $command,
+        'staleCommand' => $writer->writeCommandForRequiringAuthority(
+            $staleSuccessor,
+            $orphanedAuthority,
+            allowBootstrap: false,
+        ),
+        'environment' => managedTraefikDocumentDockerEnvironment(
+            root: $root,
+            targetAuthority: $targetAuthority,
+            visibleContainerIds: $targetAuthority->containerId,
+        ),
+        'orphanedArtifactBytes' => $orphanedArtifactBytes,
+    ];
+}
+
 it('atomically writes one managed file-provider document and replays its owner idempotently', function () {
     $filesystem = new Filesystem;
     $root = managedTraefikDocumentRoot();
@@ -315,6 +465,223 @@ it('adopts one exact unmanaged predecessor checksum before installing its first 
         $filesystem->remove($root);
     }
 });
+
+it('supersedes one exact orphaned initial-enrollment authority without an authority or route absence window', function (): void {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $fixture = managedTraefikDocumentOrphanSupersessionFixture($root);
+        expect(fn () => $fixture['writer']->supersedeOrphanedInitialEnrollmentAuthorityCommandFor(
+            mutation: $fixture['mutation'],
+            correctedPredecessorBytes: $fixture['correctedPredecessorBytes'],
+            orphanedAuthority: $fixture['orphanedAuthority'],
+            targetAuthority: $fixture['targetAuthority'],
+            transportLfRepairProvenance: false,
+        ))->toThrow(InvalidArgumentException::class, 'transport-LF');
+        $result = runManagedTraefikDocumentCommand($fixture['command'], $fixture['environment']);
+        $newRollbackArtifact = file_get_contents($fixture['mutation']->rollbackArtifactPath());
+
+        expect($result->isSuccessful())->toBeTrue($result->getErrorOutput())
+            ->and(trim($result->getOutput()))->toBe(ManagedTraefikDocumentWriter::ORPHANED_ENROLLMENT_AUTHORITY_SUPERSEDED_OUTPUT)
+            ->and(file_get_contents($fixture['mutation']->documentPath()))->toBe($fixture['mutation']->replacementBytes)
+            ->and(file_get_contents($fixture['mutation']->sidecarPath()))->toBe($fixture['mutation']->replacementSidecar())
+            ->and(file_get_contents($fixture['mutation']->writerAuthorityPath()))->toBe($fixture['targetAuthority']->toJson())
+            ->and(file_exists($fixture['orphaned']->rollbackArtifactPath()))->toBeFalse()
+            ->and($newRollbackArtifact)->toBe($fixture['writer']->rollbackArtifactFor(
+                $fixture['correctedMutation'],
+                $fixture['correctedPredecessorBytes'],
+            ))
+            ->and($newRollbackArtifact)->toContain("\nabsent\n".base64_encode($fixture['correctedPredecessorBytes'])."\n")
+            ->and(file_exists($fixture['mutation']->journalPath()))->toBeFalse();
+
+        $staleWriter = runManagedTraefikDocumentCommand($fixture['staleCommand']);
+        expect($staleWriter->isSuccessful())->toBeFalse()
+            ->and(file_get_contents($fixture['mutation']->documentPath()))->toBe($fixture['mutation']->replacementBytes)
+            ->and(file_get_contents($fixture['mutation']->writerAuthorityPath()))->toBe($fixture['targetAuthority']->toJson());
+
+        $rolledBackAuthority = managedTraefikDocumentEnrollmentRollbackAuthority(
+            $fixture['correctedMutation'],
+            $fixture['targetAuthority'],
+        );
+        $rolledBack = runManagedTraefikDocumentCommand($fixture['writer']->rollbackEnrollmentCommandFor(
+            $fixture['correctedMutation'],
+            $fixture['targetAuthority'],
+            $rolledBackAuthority,
+        ));
+
+        expect($rolledBack->isSuccessful())->toBeTrue($rolledBack->getErrorOutput())
+            ->and(file_get_contents($fixture['mutation']->documentPath()))->toBe($fixture['correctedPredecessorBytes'])
+            ->and(file_exists($fixture['mutation']->sidecarPath()))->toBeFalse()
+            ->and(file_get_contents($fixture['mutation']->writerAuthorityPath()))->toBe($rolledBackAuthority->toJson());
+
+        $finalized = runManagedTraefikDocumentCommand(
+            $fixture['writer']->finalizeEnrollmentRollbackCommandFor(
+                $fixture['correctedMutation'],
+                $rolledBackAuthority,
+            ),
+        );
+        expect($finalized->isSuccessful())->toBeTrue($finalized->getErrorOutput())
+            ->and(trim($finalized->getOutput()))->toBe(ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT)
+            ->and(file_get_contents($fixture['mutation']->documentPath()))->toBe($fixture['correctedPredecessorBytes'])
+            ->and(file_exists($fixture['mutation']->stateDirectory))->toBeFalse();
+    } finally {
+        $filesystem->remove($root);
+    }
+});
+
+it('replays orphan-authority supersession after every durable mutation boundary', function (string $crashVariable): void {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $fixture = managedTraefikDocumentOrphanSupersessionFixture($root);
+        $crashed = runManagedTraefikDocumentCommand(
+            $fixture['command'],
+            [...$fixture['environment'], $crashVariable => '1'],
+        );
+        $documentCandidates = glob(
+            $fixture['mutation']->dynamicDirectory.'/.managed-traefik-document.'.$fixture['mutation']->filename.'.*',
+        );
+        if ($crashVariable === 'COOLIFY_MANAGED_TRAEFIK_DOCUMENT_CRASH_AFTER_DOCUMENT_CANDIDATE_FSYNC') {
+            expect($documentCandidates)->toBeArray()->toHaveCount(1)
+                ->and(file_get_contents($documentCandidates[0]))->toBe($fixture['mutation']->replacementBytes)
+                ->and(file_exists($fixture['mutation']->journalPath()))->toBeTrue()
+                ->and(file_get_contents($fixture['mutation']->documentPath()))->toBe($fixture['correctedPredecessorBytes'])
+                ->and(file_get_contents($fixture['mutation']->sidecarPath()))->toBe($fixture['orphaned']->replacementSidecar());
+        }
+        $replayed = runManagedTraefikDocumentCommand($fixture['command'], $fixture['environment']);
+
+        expect($crashed->isSuccessful())->toBeFalse()
+            ->and($crashed->getExitCode())->toBe(75)
+            ->and($replayed->isSuccessful())->toBeTrue($replayed->getErrorOutput())
+            ->and(trim($replayed->getOutput()))->toBe(ManagedTraefikDocumentWriter::ORPHANED_ENROLLMENT_AUTHORITY_SUPERSEDED_OUTPUT)
+            ->and(file_get_contents($fixture['mutation']->documentPath()))->toBe($fixture['mutation']->replacementBytes)
+            ->and(file_get_contents($fixture['mutation']->sidecarPath()))->toBe($fixture['mutation']->replacementSidecar())
+            ->and(file_get_contents($fixture['mutation']->writerAuthorityPath()))->toBe($fixture['targetAuthority']->toJson())
+            ->and(file_exists($fixture['orphaned']->rollbackArtifactPath()))->toBeFalse()
+            ->and(file_exists($fixture['mutation']->journalPath()))->toBeFalse()
+            ->and(glob(
+                $fixture['mutation']->dynamicDirectory.'/.managed-traefik-document.'.$fixture['mutation']->filename.'.*',
+            ))->toBe([]);
+    } finally {
+        $filesystem->remove($root);
+    }
+})->with([
+    'authority candidate fsync' => 'COOLIFY_DURABLE_REMOTE_ARTIFACT_CRASH_AFTER_CANDIDATE_FSYNC',
+    'authority fence' => 'COOLIFY_MANAGED_TRAEFIK_DOCUMENT_CRASH_AFTER_AUTHORITY',
+    'forward journal' => 'COOLIFY_MANAGED_TRAEFIK_DOCUMENT_CRASH_AFTER_JOURNAL',
+    'document candidate fsync after journal' => 'COOLIFY_MANAGED_TRAEFIK_DOCUMENT_CRASH_AFTER_DOCUMENT_CANDIDATE_FSYNC',
+    'document replacement' => 'COOLIFY_MANAGED_TRAEFIK_DOCUMENT_CRASH_AFTER_DOCUMENT',
+    'sidecar replacement' => 'COOLIFY_MANAGED_TRAEFIK_DOCUMENT_CRASH_AFTER_SIDECAR',
+    'journal unlink' => 'COOLIFY_DURABLE_REMOTE_ARTIFACT_CRASH_AFTER_UNLINK',
+    'orphan artifact unlink' => 'COOLIFY_MANAGED_TRAEFIK_DOCUMENT_CRASH_AFTER_ORPHAN_ARTIFACT_UNLINK',
+]);
+
+it('fails closed before fencing an orphan authority when any exact compare-and-set or runtime proof drifts', function (string $drift): void {
+    $filesystem = new Filesystem;
+    $root = managedTraefikDocumentRoot();
+
+    try {
+        $fixture = managedTraefikDocumentOrphanSupersessionFixture($root);
+        $environment = $fixture['environment'];
+
+        match ($drift) {
+            'document' => file_put_contents($fixture['mutation']->documentPath(), "http:\n  routers:\n    foreign-document: {}\n"),
+            'sidecar' => file_put_contents($fixture['mutation']->sidecarPath(), "{}\n"),
+            'authority' => file_put_contents($fixture['mutation']->writerAuthorityPath(), "{}\n"),
+            'orphan-lineage-artifact' => file_put_contents($fixture['orphaned']->rollbackArtifactPath(), "foreign\n"),
+            'extra-rollback-artifact' => file_put_contents(
+                $fixture['mutation']->stateDirectory.'/.'.$fixture['mutation']->filename.'.extra-enrollment.r1.rollback',
+                "foreign\n",
+            ),
+            'unknown-state-file' => file_put_contents($fixture['mutation']->stateDirectory.'/foreign-state', "foreign\n"),
+            'symlink-state-file' => symlink(
+                $fixture['mutation']->documentPath(),
+                $fixture['mutation']->stateDirectory.'/foreign-link',
+            ),
+            'dynamic-candidate-wrong-content' => file_put_contents(
+                $fixture['mutation']->dynamicDirectory.'/.managed-traefik-document.'.$fixture['mutation']->filename.'.ABC123',
+                "foreign\n",
+            ),
+            'dynamic-candidate-without-journal' => file_put_contents(
+                $fixture['mutation']->dynamicDirectory.'/.managed-traefik-document.'.$fixture['mutation']->filename.'.ABC123',
+                $fixture['mutation']->replacementBytes,
+            ),
+            'dynamic-candidate-symlink' => symlink(
+                $fixture['mutation']->documentPath(),
+                $fixture['mutation']->dynamicDirectory.'/.managed-traefik-document.'.$fixture['mutation']->filename.'.ABC123',
+            ),
+            'dynamic-candidate-hardlink' => link(
+                $fixture['mutation']->documentPath(),
+                $fixture['mutation']->dynamicDirectory.'/.managed-traefik-document.'.$fixture['mutation']->filename.'.ABC123',
+            ),
+            'dynamic-candidate-unknown-name' => file_put_contents(
+                $fixture['mutation']->dynamicDirectory.'/.managed-traefik-document.'.$fixture['mutation']->filename.'.TOO-LONG',
+                $fixture['mutation']->replacementBytes,
+            ),
+            'dynamic-candidate-multiple' => [
+                file_put_contents(
+                    $fixture['mutation']->dynamicDirectory.'/.managed-traefik-document.'.$fixture['mutation']->filename.'.ABC123',
+                    $fixture['mutation']->replacementBytes,
+                ),
+                file_put_contents(
+                    $fixture['mutation']->dynamicDirectory.'/.managed-traefik-document.'.$fixture['mutation']->filename.'.DEF456',
+                    $fixture['mutation']->replacementBytes,
+                ),
+            ],
+            'orphan-container-present' => $environment['COOLIFY_TEST_DOCKER_IDS'] = implode("\n", [
+                $fixture['targetAuthority']->containerId,
+                $fixture['orphanedAuthority']->containerId,
+            ]),
+            'target-container-stopped' => $environment['COOLIFY_TEST_TARGET_RUNNING'] = 'false',
+            'target-image-changed' => $environment['COOLIFY_TEST_TARGET_IMAGE_ID'] = 'sha256:'.str_repeat('e', 64),
+        };
+
+        $result = runManagedTraefikDocumentCommand($fixture['command'], $environment);
+
+        expect($result->isSuccessful())->toBeFalse()
+            ->and(file_exists($fixture['mutation']->rollbackArtifactPath()))->toBeFalse()
+            ->and(file_exists($fixture['mutation']->journalPath()))->toBeFalse();
+        if ($drift !== 'authority') {
+            expect(file_get_contents($fixture['mutation']->writerAuthorityPath()))->toBe($fixture['orphanedAuthority']->toJson());
+        }
+        if (in_array($drift, [
+            'orphan-lineage-artifact',
+            'extra-rollback-artifact',
+            'unknown-state-file',
+            'symlink-state-file',
+            'dynamic-candidate-wrong-content',
+            'dynamic-candidate-without-journal',
+            'dynamic-candidate-symlink',
+            'dynamic-candidate-hardlink',
+            'dynamic-candidate-unknown-name',
+            'dynamic-candidate-multiple',
+        ], true)) {
+            expect(file_get_contents($fixture['mutation']->documentPath()))->toBe($fixture['correctedPredecessorBytes'])
+                ->and(file_get_contents($fixture['mutation']->sidecarPath()))->toBe($fixture['orphaned']->replacementSidecar());
+        }
+    } finally {
+        $filesystem->remove($root);
+    }
+})->with([
+    'document',
+    'sidecar',
+    'authority',
+    'orphan-lineage-artifact',
+    'extra-rollback-artifact',
+    'unknown-state-file',
+    'symlink-state-file',
+    'dynamic-candidate-wrong-content',
+    'dynamic-candidate-without-journal',
+    'dynamic-candidate-symlink',
+    'dynamic-candidate-hardlink',
+    'dynamic-candidate-unknown-name',
+    'dynamic-candidate-multiple',
+    'orphan-container-present',
+    'target-container-stopped',
+    'target-image-changed',
+]);
 
 it('rejects stale document writers after a successor owns the sidecar revision', function () {
     $filesystem = new Filesystem;
@@ -1882,6 +2249,34 @@ it('renders valid dash and bash commands without shellcheck findings', function 
             $enrollment,
             $enrollmentReplacementAuthority,
         );
+        $orphanedEnrollment = managedTraefikDocumentMutation(
+            root: $root,
+            operationId: 'control-plane-shell-orphaned',
+            revision: 1,
+            replacementBytes: "http:\n  routers:\n    orphaned: {}\n",
+        );
+        $orphanedAuthority = managedTraefikDocumentWriterAuthority(
+            $orphanedEnrollment,
+            epoch: 1,
+            identity: 'd',
+        );
+        $correctedPredecessor = "http:\n  routers:\n    generic: {}\n";
+        $replacementEnrollment = new ManagedTraefikDocumentMutation(
+            dynamicDirectory: $root.'/dynamic',
+            stateDirectory: $root.'/state',
+            filename: $orphanedEnrollment->filename,
+            operationId: 'control-plane-shell-replacement',
+            revision: 1,
+            expectedSha256: hash('sha256', $correctedPredecessor),
+            expectedOperationId: null,
+            expectedRevision: null,
+            replacementBytes: "http:\n  routers:\n    replacement: {}\n",
+        );
+        $replacementAuthority = managedTraefikDocumentWriterAuthority(
+            $replacementEnrollment,
+            epoch: 1,
+            identity: 'e',
+        );
         $commands = [
             $writer->writeCommandFor($first),
             $writer->promoteWriterAuthorityCommandFor(
@@ -1897,6 +2292,13 @@ it('renders valid dash and bash commands without shellcheck findings', function 
                 $enrollmentRolledBackAuthority,
             ),
             $writer->finalizeEnrollmentRollbackCommandFor($enrollment, $enrollmentRolledBackAuthority),
+            $writer->supersedeOrphanedInitialEnrollmentAuthorityCommandFor(
+                $replacementEnrollment,
+                $correctedPredecessor,
+                $orphanedAuthority,
+                $replacementAuthority,
+                true,
+            ),
         ];
 
         foreach ($commands as $index => $command) {
