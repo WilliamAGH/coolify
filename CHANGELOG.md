@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [unreleased]
+
+### 🚀 Features
+
+- *(proxy)* Expose read-only attestor identity
+
+### 🐛 Bug Fixes
+
+- *(proxy)* Preserve configured health identity semantics
+
+### 📚 Documentation
+
+- Update changelog
+
 ## [4.13.39-fork] - 2026-07-29
 
 ### 🐛 Bug Fixes
