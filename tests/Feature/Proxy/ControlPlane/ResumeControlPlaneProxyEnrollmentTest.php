@@ -198,6 +198,123 @@ it('resumes a fenced enrollment across self-replacement without exposing its tok
         ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Enrolled);
 });
 
+it('plumbs an exact orphaned source override authorization only through explicit rollback', function (): void {
+    [$server, $store, , $action] = resumableControlPlaneEnrollment();
+    $authorizedSha256 = hash('sha256', "stale managed source override\n");
+    $staticHandoffCommand = null;
+    $executor = static function (string $command) use (&$staticHandoffCommand): string {
+        if (str_contains($command, ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT)) {
+            $staticHandoffCommand = $command;
+        }
+
+        return match (true) {
+            str_contains($command, NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT) => NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT,
+            str_contains($command, InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_BEGIN) => resumedControlPlaneWriterAuthorityAbsentTranscript(),
+            str_contains($command, InspectControlPlaneEnrollmentWriter::TRANSCRIPT_BEGIN) => resumedControlPlaneWriterInspectionTranscript(),
+            str_contains($command, ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT) => ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT,
+            default => throw new RuntimeException("Unexpected rollback command: {$command}"),
+        };
+    };
+
+    $rollingBack = $action->handle(
+        $server,
+        'resume-control-plane',
+        'resume-token',
+        $executor,
+        rollback: true,
+        authorizedOrphanedSourceOverrideSha256: $authorizedSha256,
+    );
+
+    expect($rollingBack->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RollingBack)
+        ->and($staticHandoffCommand)->toContain(
+            "authorized_orphaned_source_override_sha256='{$authorizedSha256}'",
+        )
+        ->and($action->commandSignature)->toContain('--authorize-orphaned-source-override-sha256=')
+        ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RollingBack);
+});
+
+it('rejects orphaned source override authorization without explicit rollback or an exact lowercase digest', function (): void {
+    [$server, $store, , $action] = resumableControlPlaneEnrollment();
+    $remoteCalls = 0;
+    $executor = static function (string $command) use (&$remoteCalls): string {
+        $remoteCalls++;
+
+        return $command;
+    };
+
+    expect(fn () => $action->handle(
+        $server,
+        'resume-control-plane',
+        'resume-token',
+        $executor,
+        authorizedOrphanedSourceOverrideSha256: str_repeat('a', 64),
+    ))->toThrow(InvalidArgumentException::class, 'only be used with explicit rollback');
+    expect(fn () => $action->handle(
+        $server,
+        'resume-control-plane',
+        'resume-token',
+        $executor,
+        rollback: true,
+        authorizedOrphanedSourceOverrideSha256: str_repeat('A', 64),
+    ))->toThrow(InvalidArgumentException::class, 'exact lowercase SHA-256');
+
+    expect($remoteCalls)->toBe(0)
+        ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Preparing);
+});
+
+it('rejects orphaned source override authorization after static rollback without remote execution', function (
+    ControlPlaneProxyEnrollmentPhase $phase,
+): void {
+    [$server, $store, , $action] = resumableControlPlaneEnrollment();
+    $timestamp = '2026-07-19T12:01:00Z';
+    $store->transition(
+        $server,
+        'resume-control-plane',
+        'resume-token',
+        ControlPlaneProxyEnrollmentPhase::Preparing,
+        ControlPlaneProxyEnrollmentPhase::RollingBack,
+        $timestamp,
+    );
+    $store->transition(
+        $server,
+        'resume-control-plane',
+        'resume-token',
+        ControlPlaneProxyEnrollmentPhase::RollingBack,
+        ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement,
+        $timestamp,
+    );
+    if ($phase === ControlPlaneProxyEnrollmentPhase::RolledBack) {
+        $store->transition(
+            $server,
+            'resume-control-plane',
+            'resume-token',
+            ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement,
+            ControlPlaneProxyEnrollmentPhase::RolledBack,
+            $timestamp,
+        );
+    }
+    $remoteCalls = 0;
+
+    expect(fn () => $action->handle(
+        $server,
+        'resume-control-plane',
+        'resume-token',
+        static function (string $command) use (&$remoteCalls): string {
+            $remoteCalls++;
+
+            return $command;
+        },
+        rollback: true,
+        authorizedOrphanedSourceOverrideSha256: str_repeat('a', 64),
+    ))->toThrow(InvalidArgumentException::class, 'invalid after static rollback');
+
+    expect($remoteCalls)->toBe(0)
+        ->and($store->read($server)?->phase)->toBe($phase);
+})->with([
+    'awaiting rollback acknowledgement' => ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement,
+    'rolled back' => ControlPlaneProxyEnrollmentPhase::RolledBack,
+]);
+
 it('keeps a terminal enrollment replay remote-side-effect free when legacy authority is absent', function (): void {
     [$server, $store, , $action] = resumableControlPlaneEnrollment();
     $timestamp = '2026-07-19T12:01:00Z';

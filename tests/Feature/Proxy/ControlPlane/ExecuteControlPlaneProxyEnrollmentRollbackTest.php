@@ -176,6 +176,84 @@ it('persists rollback before self-replacement and requires a fresh replay to fin
         ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RolledBack);
 });
 
+it('passes an exact orphaned source override authorization only to the initial static rollback', function (): void {
+    [$server, $store, $action] = executableControlPlaneRollback();
+    $authorizedSha256 = hash('sha256', "stale managed source override\n");
+    $staticHandoffCommand = null;
+    $executor = static function (string $command) use (&$staticHandoffCommand): string {
+        if (str_contains($command, ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT)) {
+            $staticHandoffCommand = $command;
+        }
+
+        return match (true) {
+            str_contains($command, NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT) => NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT,
+            str_contains($command, InspectControlPlaneEnrollmentWriterAuthority::TRANSCRIPT_BEGIN) => executableControlPlaneAuthorityAbsentTranscript(),
+            str_contains($command, InspectControlPlaneEnrollmentWriter::TRANSCRIPT_BEGIN) => executableControlPlaneWriterInspectionTranscript(),
+            str_contains($command, ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT) => ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT,
+            default => throw new RuntimeException("Unexpected rollback command: {$command}"),
+        };
+    };
+
+    $rollingBack = $action->handle(
+        $server,
+        'execute-control-plane-rollback',
+        'rollback-token',
+        $executor,
+        $authorizedSha256,
+    );
+
+    expect($rollingBack->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RollingBack)
+        ->and($staticHandoffCommand)->toContain(
+            "authorized_orphaned_source_override_sha256='{$authorizedSha256}'",
+        )
+        ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::RollingBack);
+});
+
+it('rejects a malformed orphaned source override authorization before remote rollback', function (): void {
+    [$server, $store, $action] = executableControlPlaneRollback();
+    $remoteCalls = 0;
+
+    expect(fn () => $action->handle(
+        $server,
+        'execute-control-plane-rollback',
+        'rollback-token',
+        static function (string $command) use (&$remoteCalls): string {
+            $remoteCalls++;
+
+            return $command;
+        },
+        str_repeat('A', 64),
+    ))->toThrow(InvalidArgumentException::class, 'exact lowercase SHA-256');
+
+    expect($remoteCalls)->toBe(0)
+        ->and($store->read($server)?->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Active);
+});
+
+it('rejects orphaned source override authorization after static rollback without remote execution', function (
+    ControlPlaneProxyEnrollmentPhase $phase,
+): void {
+    [$server, $store, $action] = executableControlPlaneRollback($phase);
+    $remoteCalls = 0;
+
+    expect(fn () => $action->handle(
+        $server,
+        'execute-control-plane-rollback',
+        'rollback-token',
+        static function (string $command) use (&$remoteCalls): string {
+            $remoteCalls++;
+
+            return $command;
+        },
+        str_repeat('a', 64),
+    ))->toThrow(InvalidArgumentException::class, 'invalid after static rollback');
+
+    expect($remoteCalls)->toBe(0)
+        ->and($store->read($server)?->phase)->toBe($phase);
+})->with([
+    'awaiting rollback acknowledgement' => ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement,
+    'rolled back' => ControlPlaneProxyEnrollmentPhase::RolledBack,
+]);
+
 it('finishes rollback when the durable predecessor intentionally had no public route', function (): void {
     [$server, $store, $action] = executableControlPlaneRollback(dynamicPredecessorBytes: null);
     $executor = static function (string $command): string {

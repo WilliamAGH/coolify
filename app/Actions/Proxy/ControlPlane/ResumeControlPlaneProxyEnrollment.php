@@ -16,7 +16,8 @@ final class ResumeControlPlaneProxyEnrollment
     public string $commandSignature = 'control-plane:proxy-enrollment
         {server_id : Local Coolify server ID}
         {operation_id : Exact durable enrollment operation ID}
-        {--rollback : Restore the exact pre-enrollment listener and dynamic document}';
+        {--rollback : Restore the exact pre-enrollment listener and dynamic document}
+        {--authorize-orphaned-source-override-sha256= : Exact stale managed source override SHA-256 authorized for rollback quarantine}';
 
     public string $commandDescription = 'Resume an existing fenced control-plane Traefik enrollment.';
 
@@ -34,7 +35,16 @@ final class ResumeControlPlaneProxyEnrollment
         string $token,
         ?Closure $remoteExecutor = null,
         bool $rollback = false,
+        ?string $authorizedOrphanedSourceOverrideSha256 = null,
     ): ControlPlaneProxyEnrollmentState {
+        if ($authorizedOrphanedSourceOverrideSha256 !== null && ! $rollback) {
+            throw new InvalidArgumentException('The orphaned source override authorization may only be used with explicit rollback.');
+        }
+        if ($authorizedOrphanedSourceOverrideSha256 !== null
+            && preg_match('/\A[a-f0-9]{64}\z/D', $authorizedOrphanedSourceOverrideSha256) !== 1) {
+            throw new InvalidArgumentException('The orphaned source override authorization must be an exact lowercase SHA-256.');
+        }
+
         return $this->stateStore->serializeOperation(
             $server,
             fn (Server $lockedServer): ControlPlaneProxyEnrollmentState => $this->handleLocked(
@@ -43,6 +53,7 @@ final class ResumeControlPlaneProxyEnrollment
                 $token,
                 $remoteExecutor,
                 $rollback,
+                $authorizedOrphanedSourceOverrideSha256,
             ),
         );
     }
@@ -54,17 +65,30 @@ final class ResumeControlPlaneProxyEnrollment
         string $token,
         ?Closure $remoteExecutor,
         bool $rollback,
+        ?string $authorizedOrphanedSourceOverrideSha256,
     ): ControlPlaneProxyEnrollmentState {
         $state = $this->stateStore->read($server)
             ?? throw new RuntimeException('The durable control-plane enrollment state is missing.');
         if (! $state->isOwnedBy($operationId, $token)) {
             throw new RuntimeException('The durable control-plane enrollment state is owned by another operation.');
         }
+        if ($authorizedOrphanedSourceOverrideSha256 !== null && in_array($state->phase, [
+            ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement,
+            ControlPlaneProxyEnrollmentPhase::RolledBack,
+        ], true)) {
+            throw new InvalidArgumentException('The orphaned source override authorization is invalid after static rollback.');
+        }
         if ($rollback || in_array($state->phase, [
             ControlPlaneProxyEnrollmentPhase::RollingBack,
             ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement,
         ], true)) {
-            return $this->rollback->handle($server, $operationId, $token, $remoteExecutor);
+            return $this->rollback->handle(
+                $server,
+                $operationId,
+                $token,
+                $remoteExecutor,
+                $authorizedOrphanedSourceOverrideSha256,
+            );
         }
         if (in_array($state->phase, [
             ControlPlaneProxyEnrollmentPhase::Preparing,
@@ -106,6 +130,10 @@ final class ResumeControlPlaneProxyEnrollment
         if (! is_string($token) || $token === '') {
             throw new InvalidArgumentException('The control-plane enrollment token must not be empty.');
         }
+        $authorizedOrphanedSourceOverrideSha256 = $command->option('authorize-orphaned-source-override-sha256');
+        if ($authorizedOrphanedSourceOverrideSha256 !== null && ! is_string($authorizedOrphanedSourceOverrideSha256)) {
+            throw new InvalidArgumentException('The orphaned source override authorization must be an exact lowercase SHA-256.');
+        }
         $server = Server::query()->find($serverId)
             ?? throw new RuntimeException('The control-plane enrollment server does not exist.');
         $state = $this->handle(
@@ -113,6 +141,7 @@ final class ResumeControlPlaneProxyEnrollment
             $operationId,
             $token,
             rollback: (bool) $command->option('rollback'),
+            authorizedOrphanedSourceOverrideSha256: $authorizedOrphanedSourceOverrideSha256,
         );
         $command->info("Control-plane enrollment phase: {$state->phase->value}");
 

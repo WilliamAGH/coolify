@@ -5,6 +5,7 @@ namespace App\Actions\Proxy\ControlPlane;
 use App\Actions\Proxy\SaveProxyConfiguration;
 use App\Models\Server;
 use Closure;
+use InvalidArgumentException;
 use Lorisleiva\Actions\Concerns\AsAction;
 use RuntimeException;
 
@@ -30,7 +31,13 @@ final class ExecuteControlPlaneProxyEnrollmentRollback
         string $operationId,
         string $token,
         ?Closure $remoteExecutor = null,
+        ?string $authorizedOrphanedSourceOverrideSha256 = null,
     ): ControlPlaneProxyEnrollmentState {
+        if ($authorizedOrphanedSourceOverrideSha256 !== null
+            && preg_match('/\A[a-f0-9]{64}\z/D', $authorizedOrphanedSourceOverrideSha256) !== 1) {
+            throw new InvalidArgumentException('The orphaned source override authorization must be an exact lowercase SHA-256.');
+        }
+
         return $this->stateStore->serializeOperation(
             $server,
             fn (Server $lockedServer): ControlPlaneProxyEnrollmentState => $this->handleLocked(
@@ -38,6 +45,7 @@ final class ExecuteControlPlaneProxyEnrollmentRollback
                 $operationId,
                 $token,
                 $remoteExecutor,
+                $authorizedOrphanedSourceOverrideSha256,
             ),
         );
     }
@@ -48,8 +56,15 @@ final class ExecuteControlPlaneProxyEnrollmentRollback
         string $operationId,
         string $token,
         ?Closure $remoteExecutor,
+        ?string $authorizedOrphanedSourceOverrideSha256,
     ): ControlPlaneProxyEnrollmentState {
         $state = $this->ownedState($server, $operationId, $token);
+        if ($authorizedOrphanedSourceOverrideSha256 !== null && in_array($state->phase, [
+            ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement,
+            ControlPlaneProxyEnrollmentPhase::RolledBack,
+        ], true)) {
+            throw new InvalidArgumentException('The orphaned source override authorization is invalid after static rollback.');
+        }
         if ($state->phase === ControlPlaneProxyEnrollmentPhase::RolledBack) {
             return $state;
         }
@@ -90,7 +105,12 @@ final class ExecuteControlPlaneProxyEnrollmentRollback
             );
         }
         $this->assertExactOutput(
-            $execute($this->staticHandoff->rollbackCommandFor($state, $operationId, $token)),
+            $execute($this->staticHandoff->rollbackCommandFor(
+                $state,
+                $operationId,
+                $token,
+                $authorizedOrphanedSourceOverrideSha256,
+            )),
             ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT,
             'static listener rollback',
         );

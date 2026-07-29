@@ -69,6 +69,7 @@ final class ControlPlaneStaticListenerHandoff
     public function commandFor(ControlPlaneProxyEnrollmentState $state): string
     {
         $proxyDirectory = dirname($this->proxyComposePath);
+        $sourceDirectory = dirname($this->sourceComposePath);
         $rollbackJournalPath = $proxyDirectory.'/.control-plane-static-listener-rollback.'.$state->operationId.'.journal';
         $this->assertAbsolutePath($rollbackJournalPath, 'rollback journal path');
         $expectedProxyBinding = match ($state->exposure) {
@@ -87,7 +88,7 @@ final class ControlPlaneStaticListenerHandoff
             'source_environment_path='.escapeshellarg($this->sourceEnvironmentPath),
             'source_custom_compose_path='.escapeshellarg($this->sourceCustomComposePath),
             'source_postgres_upgrade_compose_path='.escapeshellarg($this->sourcePostgresUpgradeComposePath),
-            'source_directory='.escapeshellarg(dirname($this->sourceComposePath)),
+            'source_directory='.escapeshellarg($sourceDirectory),
             'enrollment_lock_path='.escapeshellarg($this->enrollmentLockPath),
             'rollback_journal_path='.escapeshellarg($rollbackJournalPath),
             'attestor_state_directory='.escapeshellarg($this->attestorStateDirectory),
@@ -100,6 +101,8 @@ final class ControlPlaneStaticListenerHandoff
             'predecessor_proxy_sha256='.escapeshellarg(hash('sha256', $state->staticPredecessorBytes)),
             'replacement_proxy_sha256='.escapeshellarg(hash('sha256', $state->staticReplacementBytes)),
             'source_override_sha256='.escapeshellarg(hash('sha256', $state->sourceOverrideBytes)),
+            'rename_noreplace_python_base64='.escapeshellarg(base64_encode($this->renameNoReplacePython())),
+            'historical_evidence_validator_python_base64='.escapeshellarg(base64_encode($this->historicalEvidenceValidatorPython())),
             'applied_output='.escapeshellarg(self::APPLIED_OUTPUT),
             '',
             ...$this->shellSafetyFunctions(),
@@ -195,7 +198,6 @@ final class ControlPlaneStaticListenerHandoff
             'assert_regular_or_absent "$source_override_path"',
             'assert_regular_or_absent "$rollback_journal_path"',
             'assert_regular_or_absent "$enrollment_lock_path"',
-            'prepare_attestor_state_directory',
             'command -v flock >/dev/null 2>&1 || fail',
             'exec 9> "$enrollment_lock_path" || fail',
             'flock -x 9 || fail',
@@ -207,7 +209,9 @@ final class ControlPlaneStaticListenerHandoff
             'assert_regular_or_absent "$source_postgres_upgrade_compose_path"',
             'assert_regular_or_absent "$source_override_path"',
             'assert_regular_or_absent "$rollback_journal_path"',
+            'assert_valid_source_override_rollback_artifacts',
             'is_absent "$rollback_journal_path" || fail',
+            'prepare_attestor_state_directory',
             'scratch=$(mktemp -d "$proxy_directory/.control-plane-listener.XXXXXX") || fail',
             'predecessor_proxy_file="$scratch/proxy-predecessor"',
             'replacement_proxy_file="$scratch/proxy-replacement"',
@@ -225,6 +229,7 @@ final class ControlPlaneStaticListenerHandoff
             '  durable_remote_reaffirm "$proxy_compose_path" "$proxy_directory" || fail',
             '  durable_remote_reaffirm "$source_override_path" "$source_directory" || fail',
             '  verify_enrolled',
+            '  assert_valid_source_override_rollback_artifacts',
             '  completed=1',
             '  printf %s "$applied_output"',
             '  exit 0',
@@ -243,6 +248,7 @@ final class ControlPlaneStaticListenerHandoff
             'verify_enrolled',
             'durable_remote_reaffirm "$proxy_compose_path" "$proxy_directory" || fail',
             'durable_remote_reaffirm "$source_override_path" "$source_directory" || fail',
+            'assert_valid_source_override_rollback_artifacts',
             'completed=1',
             'printf %s "$applied_output"',
         ]);
@@ -252,6 +258,7 @@ final class ControlPlaneStaticListenerHandoff
         ControlPlaneProxyEnrollmentState $state,
         string $operationId,
         string $token,
+        ?string $authorizedOrphanedSourceOverrideSha256 = null,
     ): string {
         if (! $state->isOwnedBy($operationId, $token)) {
             throw new InvalidArgumentException('The control-plane static listener rollback is owned by another operation.');
@@ -259,8 +266,16 @@ final class ControlPlaneStaticListenerHandoff
         if (! in_array($state->phase, [ControlPlaneProxyEnrollmentPhase::RollingBack, ControlPlaneProxyEnrollmentPhase::RolledBack], true)) {
             throw new InvalidArgumentException('The control-plane static listener rollback requires durable rolling-back state.');
         }
+        if ($authorizedOrphanedSourceOverrideSha256 !== null
+            && preg_match('/\A[a-f0-9]{64}\z/D', $authorizedOrphanedSourceOverrideSha256) !== 1) {
+            throw new InvalidArgumentException('The orphaned source override authorization must be an exact lowercase SHA-256.');
+        }
+        if ($authorizedOrphanedSourceOverrideSha256 !== null
+            && $state->phase !== ControlPlaneProxyEnrollmentPhase::RollingBack) {
+            throw new InvalidArgumentException('The orphaned source override authorization is invalid after static rollback.');
+        }
 
-        return $this->renderRollbackCommand($state, false);
+        return $this->renderRollbackCommand($state, false, $authorizedOrphanedSourceOverrideSha256);
     }
 
     public function reassertAwaitingRollbackCommandFor(
@@ -275,17 +290,21 @@ final class ControlPlaneStaticListenerHandoff
             throw new InvalidArgumentException('The control-plane static listener rollback reassertion requires durable awaiting-acknowledgement state.');
         }
 
-        return $this->renderRollbackCommand($state, true);
+        return $this->renderRollbackCommand($state, true, null);
     }
 
     private function renderRollbackCommand(
         ControlPlaneProxyEnrollmentState $state,
         bool $reassertAwaiting,
+        ?string $authorizedOrphanedSourceOverrideSha256,
     ): string {
 
         $proxyDirectory = dirname($this->proxyComposePath);
+        $sourceDirectory = dirname($this->sourceComposePath);
         $rollbackJournalPath = $proxyDirectory.'/.control-plane-static-listener-rollback.'.$state->operationId.'.journal';
+        $sourceOverrideQuarantinePath = $sourceDirectory.'/.control-plane-source-override-rollback.'.$state->operationId.'.quarantine';
         $this->assertAbsolutePath($rollbackJournalPath, 'rollback journal path');
+        $this->assertAbsolutePath($sourceOverrideQuarantinePath, 'source override quarantine path');
 
         return implode("\n", [
             'set -eu',
@@ -298,7 +317,8 @@ final class ControlPlaneStaticListenerHandoff
             'source_environment_path='.escapeshellarg($this->sourceEnvironmentPath),
             'source_custom_compose_path='.escapeshellarg($this->sourceCustomComposePath),
             'source_postgres_upgrade_compose_path='.escapeshellarg($this->sourcePostgresUpgradeComposePath),
-            'source_directory='.escapeshellarg(dirname($this->sourceComposePath)),
+            'source_directory='.escapeshellarg($sourceDirectory),
+            'source_override_quarantine_path='.escapeshellarg($sourceOverrideQuarantinePath),
             'enrollment_lock_path='.escapeshellarg($this->enrollmentLockPath),
             'rollback_journal_path='.escapeshellarg($rollbackJournalPath),
             'state_phase='.escapeshellarg($state->phase->value),
@@ -315,13 +335,15 @@ final class ControlPlaneStaticListenerHandoff
             'predecessor_proxy_sha256='.escapeshellarg(hash('sha256', $state->staticPredecessorBytes)),
             'replacement_proxy_sha256='.escapeshellarg(hash('sha256', $state->staticReplacementBytes)),
             'source_override_sha256='.escapeshellarg(hash('sha256', $state->sourceOverrideBytes)),
-            'rollback_started_journal_base64='.escapeshellarg(base64_encode($this->rollbackJournal($state, 'rolling-back'))),
-            'rollback_completed_journal_base64='.escapeshellarg(base64_encode($this->rollbackJournal($state, 'rolled-back'))),
+            'authorized_orphaned_source_override_sha256='.escapeshellarg($authorizedOrphanedSourceOverrideSha256 ?? 'absent'),
+            'rename_noreplace_python_base64='.escapeshellarg(base64_encode($this->renameNoReplacePython())),
+            'rollback_journal_prefix_base64='.escapeshellarg(base64_encode($this->rollbackJournalPrefix($state))),
+            'rollback_started_journal_suffix_base64='.escapeshellarg(base64_encode($this->rollbackJournalSuffix('rolling-back'))),
+            'rollback_completed_journal_suffix_base64='.escapeshellarg(base64_encode($this->rollbackJournalSuffix('rolled-back'))),
             'rolled_back_output='.escapeshellarg(self::ROLLED_BACK_OUTPUT),
             '',
             ...$this->shellSafetyFunctions(),
             ...$this->portInspectionFunctions(),
-            ...$this->atomicRemoveFunction(allowAbsent: false),
             ...$this->coolifyComposeArgumentFunction(),
             ...$this->legacyRecreationFunctions(),
             'has_port_owner() {',
@@ -407,6 +429,7 @@ final class ControlPlaneStaticListenerHandoff
             'assert_regular_or_absent "$source_custom_compose_path"',
             'assert_regular_or_absent "$source_postgres_upgrade_compose_path"',
             'assert_regular_or_absent "$source_override_path"',
+            'assert_regular_or_absent "$source_override_quarantine_path"',
             'assert_regular_or_absent "$rollback_journal_path"',
             'assert_regular_or_absent "$enrollment_lock_path"',
             'command -v flock >/dev/null 2>&1 || fail',
@@ -419,6 +442,7 @@ final class ControlPlaneStaticListenerHandoff
             'assert_regular_or_absent "$source_custom_compose_path"',
             'assert_regular_or_absent "$source_postgres_upgrade_compose_path"',
             'assert_regular_or_absent "$source_override_path"',
+            'assert_regular_or_absent "$source_override_quarantine_path"',
             'assert_regular_or_absent "$rollback_journal_path"',
             'scratch=$(mktemp -d "$proxy_directory/.control-plane-listener.XXXXXX") || fail',
             'predecessor_proxy_file="$scratch/proxy-predecessor"',
@@ -432,24 +456,105 @@ final class ControlPlaneStaticListenerHandoff
             'printf %s "$predecessor_proxy_base64" | base64 -d > "$predecessor_proxy_file" || fail',
             'printf %s "$replacement_proxy_base64" | base64 -d > "$replacement_proxy_file" || fail',
             'printf %s "$source_override_base64" | base64 -d > "$source_override_file" || fail',
-            'printf %s "$rollback_started_journal_base64" | base64 -d > "$rollback_started_journal_file" || fail',
-            'printf %s "$rollback_completed_journal_base64" | base64 -d > "$rollback_completed_journal_file" || fail',
             'checksum_matches "$predecessor_proxy_file" "$predecessor_proxy_sha256" || fail',
             'checksum_matches "$replacement_proxy_file" "$replacement_proxy_sha256" || fail',
             'checksum_matches "$source_override_file" "$source_override_sha256" || fail',
+            'rollback_orphaned_source_override_sha256=absent',
+            'source_override_disposition=absent',
             'if matches "$proxy_compose_path" "$replacement_proxy_file"; then',
+            '  is_absent "$source_override_quarantine_path" || fail',
             '  matches "$source_override_path" "$source_override_file" || fail',
             '  enrolled_is_verified || fail',
+            '  [ "$authorized_orphaned_source_override_sha256" = absent ] || fail',
+            '  rollback_orphaned_source_override_sha256=$source_override_sha256',
+            '  source_override_disposition=canonical',
             'elif matches "$proxy_compose_path" "$predecessor_proxy_file"; then',
-            '  if ! is_absent "$source_override_path" && ! matches "$source_override_path" "$source_override_file"; then fail; fi',
+            '  if ! is_absent "$source_override_path"; then',
+            '    is_absent "$source_override_quarantine_path" || fail',
+            '    if matches "$source_override_path" "$source_override_file"; then',
+            '      [ "$authorized_orphaned_source_override_sha256" = absent ] || fail',
+            '      rollback_orphaned_source_override_sha256=$source_override_sha256',
+            '    else',
+            '      [ "$authorized_orphaned_source_override_sha256" != absent ] || fail',
+            '      checksum_matches "$source_override_path" "$authorized_orphaned_source_override_sha256" || fail',
+            '      rollback_orphaned_source_override_sha256=$authorized_orphaned_source_override_sha256',
+            '    fi',
+            '    source_override_disposition=canonical',
+            '  elif ! is_absent "$source_override_quarantine_path"; then',
+            '    durable_remote_assert_owned_regular "$source_override_quarantine_path" || fail',
+            '    source_override_audit_checksum=$(sha256sum "$source_override_quarantine_path") || fail',
+            '    rollback_orphaned_source_override_sha256=${source_override_audit_checksum%% *}',
+            '    is_sha256 "$rollback_orphaned_source_override_sha256" || fail',
+            '    if [ "$authorized_orphaned_source_override_sha256" != absent ]; then',
+            '      [ "$authorized_orphaned_source_override_sha256" = "$rollback_orphaned_source_override_sha256" ] || fail',
+            '    fi',
+            '    checksum_matches "$source_override_quarantine_path" "$rollback_orphaned_source_override_sha256" || fail',
+            '    source_override_disposition=quarantined',
+            '  else',
+            '    [ "$authorized_orphaned_source_override_sha256" = absent ] || fail',
+            '  fi',
             'else',
             '  fail',
             'fi',
+            'printf %s "$rollback_journal_prefix_base64" | base64 -d > "$rollback_started_journal_file" || fail',
+            'printf %s "$rollback_orphaned_source_override_sha256" >> "$rollback_started_journal_file" || fail',
+            'printf %s "$rollback_started_journal_suffix_base64" | base64 -d >> "$rollback_started_journal_file" || fail',
+            'printf %s "$rollback_journal_prefix_base64" | base64 -d > "$rollback_completed_journal_file" || fail',
+            'printf %s "$rollback_orphaned_source_override_sha256" >> "$rollback_completed_journal_file" || fail',
+            'printf %s "$rollback_completed_journal_suffix_base64" | base64 -d >> "$rollback_completed_journal_file" || fail',
             'ensure_rollback_journal',
             'reclaim_legacy_rollback_journal',
-            'if matches "$rollback_journal_path" "$rollback_completed_journal_file" && matches "$proxy_compose_path" "$predecessor_proxy_file" && is_absent "$source_override_path" && legacy_is_verified; then',
+            'if [ "$source_override_disposition" != absent ]; then',
+            '  if [ "$source_override_disposition" = quarantined ] && is_absent "$source_override_path" && matches "$rollback_journal_path" "$rollback_completed_journal_file" && legacy_is_verified; then',
+            '    durable_remote_assert_owned_regular "$source_override_quarantine_path" || fail',
+            '    checksum_matches "$source_override_quarantine_path" "$rollback_orphaned_source_override_sha256" || fail',
+            '    durable_remote_reaffirm "$source_override_quarantine_path" "$source_directory" || fail',
+            '    checksum_matches "$source_override_quarantine_path" "$rollback_orphaned_source_override_sha256" || fail',
+            '    durable_remote_reaffirm "$proxy_compose_path" "$proxy_directory" || fail',
+            '    durable_remote_reaffirm "$rollback_journal_path" "$proxy_directory" || fail',
+            '    printf %s "$rolled_back_output"',
+            '    exit 0',
+            '  fi',
+            '  if matches "$rollback_journal_path" "$rollback_completed_journal_file"; then restart_rollback_journal; fi',
+            '  matches "$rollback_journal_path" "$rollback_started_journal_file" || fail',
+            '  durable_remote_reaffirm "$rollback_journal_path" "$proxy_directory" || fail',
+            '  if matches "$proxy_compose_path" "$replacement_proxy_file"; then atomic_replace "$proxy_compose_path" "$predecessor_proxy_file" "$proxy_directory"; fi',
+            '  matches "$proxy_compose_path" "$predecessor_proxy_file" || fail',
+            '  if [ "$source_override_disposition" = canonical ]; then',
+            '    is_absent "$source_override_quarantine_path" || fail',
+            '    checksum_matches "$source_override_path" "$rollback_orphaned_source_override_sha256" || fail',
+            '    durable_move_no_clobber "$source_override_path" "$source_override_quarantine_path" "$source_directory" || fail',
+            '  else',
+            '    is_absent "$source_override_path" || fail',
+            '  fi',
+            '  is_absent "$source_override_path" || fail',
+            '  durable_remote_assert_owned_regular "$source_override_quarantine_path" || fail',
+            '  source_override_audit_identity=$(file_identity "$source_override_quarantine_path") || fail',
+            '  checksum_matches "$source_override_quarantine_path" "$rollback_orphaned_source_override_sha256" || fail',
+            '  durable_remote_reaffirm "$source_override_quarantine_path" "$source_directory" || fail',
+            '  if [ "${COOLIFY_CONTROL_PLANE_ROLLBACK_FAIL_AFTER_STATIC:-}" = 1 ]; then fail; fi',
+            '  recreate_traefik',
+            '  if [ "${COOLIFY_CONTROL_PLANE_ROLLBACK_FAIL_AFTER_TRAEFIK:-}" = 1 ]; then fail; fi',
+            '  recreate_legacy_coolify',
+            '  verify_legacy',
+            '  durable_remote_assert_owned_regular "$source_override_quarantine_path" || fail',
+            '  [ "$(file_identity "$source_override_quarantine_path")" = "$source_override_audit_identity" ] || fail',
+            '  checksum_matches "$source_override_quarantine_path" "$rollback_orphaned_source_override_sha256" || fail',
+            '  durable_remote_reaffirm "$source_override_quarantine_path" "$source_directory" || fail',
+            '  durable_remote_assert_owned_regular "$source_override_quarantine_path" || fail',
+            '  [ "$(file_identity "$source_override_quarantine_path")" = "$source_override_audit_identity" ] || fail',
+            '  checksum_matches "$source_override_quarantine_path" "$rollback_orphaned_source_override_sha256" || fail',
+            '  if [ "${COOLIFY_CONTROL_PLANE_ROLLBACK_FAIL_AFTER_AUDIT_COMPLETION:-}" = 1 ]; then fail; fi',
+            '  complete_rollback_journal',
             '  durable_remote_reaffirm "$proxy_compose_path" "$proxy_directory" || fail',
-            '  durable_remote_remove "$source_override_path" "$source_directory" || fail',
+            '  is_absent "$source_override_path" || fail',
+            '  durable_remote_reaffirm "$rollback_journal_path" "$proxy_directory" || fail',
+            '  printf %s "$rolled_back_output"',
+            '  exit 0',
+            'fi',
+            'if matches "$rollback_journal_path" "$rollback_completed_journal_file" && matches "$proxy_compose_path" "$predecessor_proxy_file" && is_absent "$source_override_path" && is_absent "$source_override_quarantine_path" && legacy_is_verified; then',
+            '  durable_remote_reaffirm "$proxy_compose_path" "$proxy_directory" || fail',
+            '  is_absent "$source_override_path" || fail',
             '  durable_remote_reaffirm "$rollback_journal_path" "$proxy_directory" || fail',
             '  printf %s "$rolled_back_output"',
             '  exit 0',
@@ -460,29 +565,26 @@ final class ControlPlaneStaticListenerHandoff
             'if [ "$state_phase" = rolled_back ]; then',
             '  matches "$proxy_compose_path" "$predecessor_proxy_file" || fail',
             '  is_absent "$source_override_path" || fail',
+            '  is_absent "$source_override_quarantine_path" || fail',
             '  verify_legacy',
             '  complete_rollback_journal',
             '  durable_remote_reaffirm "$proxy_compose_path" "$proxy_directory" || fail',
-            '  durable_remote_remove "$source_override_path" "$source_directory" || fail',
+            '  is_absent "$source_override_path" || fail',
             '  durable_remote_reaffirm "$rollback_journal_path" "$proxy_directory" || fail',
             '  printf %s "$rolled_back_output"',
             '  exit 0',
             'fi',
-            'if matches "$proxy_compose_path" "$predecessor_proxy_file" && is_absent "$source_override_path" && legacy_is_verified; then',
+            'if matches "$proxy_compose_path" "$predecessor_proxy_file" && is_absent "$source_override_path" && is_absent "$source_override_quarantine_path" && legacy_is_verified; then',
             '  complete_rollback_journal',
             '  durable_remote_reaffirm "$proxy_compose_path" "$proxy_directory" || fail',
-            '  durable_remote_remove "$source_override_path" "$source_directory" || fail',
+            '  is_absent "$source_override_path" || fail',
             '  durable_remote_reaffirm "$rollback_journal_path" "$proxy_directory" || fail',
             '  printf %s "$rolled_back_output"',
             '  exit 0',
             'fi',
-            'if matches "$proxy_compose_path" "$replacement_proxy_file"; then atomic_replace "$proxy_compose_path" "$predecessor_proxy_file" "$proxy_directory"; fi',
             'matches "$proxy_compose_path" "$predecessor_proxy_file" || fail',
-            'if ! is_absent "$source_override_path"; then',
-            '  matches "$source_override_path" "$source_override_file" || fail',
-            '  atomic_remove "$source_override_path" "$source_directory"',
-            'fi',
             'is_absent "$source_override_path" || fail',
+            'is_absent "$source_override_quarantine_path" || fail',
             'if [ "${COOLIFY_CONTROL_PLANE_ROLLBACK_FAIL_AFTER_STATIC:-}" = 1 ]; then fail; fi',
             'recreate_traefik',
             'if [ "${COOLIFY_CONTROL_PLANE_ROLLBACK_FAIL_AFTER_TRAEFIK:-}" = 1 ]; then fail; fi',
@@ -490,7 +592,7 @@ final class ControlPlaneStaticListenerHandoff
             'verify_legacy',
             'complete_rollback_journal',
             'durable_remote_reaffirm "$proxy_compose_path" "$proxy_directory" || fail',
-            'durable_remote_remove "$source_override_path" "$source_directory" || fail',
+            'is_absent "$source_override_path" || fail',
             'durable_remote_reaffirm "$rollback_journal_path" "$proxy_directory" || fail',
             'printf %s "$rolled_back_output"',
         ]);
@@ -508,11 +610,45 @@ final class ControlPlaneStaticListenerHandoff
             '  if [ -e "$1" ] || [ -L "$1" ]; then assert_regular "$1"; fi',
             '}',
             'is_absent() { test ! -e "$1" && test ! -L "$1"; }',
+            'is_sha256() {',
+            '  [ "$#" -eq 1 ] || return 64',
+            '  [ "${#1}" = 64 ] || return 1',
+            '  case "$1" in *[!a-f0-9]*) return 1 ;; esac',
+            '}',
+            'is_operation_id() {',
+            '  [ "$#" -eq 1 ] || return 64',
+            '  [ "${#1}" -ge 1 ] && [ "${#1}" -le 128 ] || return 1',
+            '  case "$1" in [a-z0-9]*) ;; *) return 1 ;; esac',
+            '  case "$1" in *[!a-z0-9._-]*) return 1 ;; esac',
+            '}',
+            'assert_valid_completed_source_override_rollback_journal() {',
+            '  historical_quarantine_path=$1',
+            '  historical_journal_path=$2',
+            '  historical_operation_id=$3',
+            '  command -v python3 >/dev/null 2>&1 || fail',
+            '  historical_owner_uid=$(id -u) || fail',
+            '  printf %s "$historical_evidence_validator_python_base64" | base64 -d | python3 - --validate-historical "$historical_quarantine_path" "$historical_journal_path" "$historical_operation_id" "$historical_owner_uid" || fail',
+            '}',
+            'assert_valid_source_override_rollback_artifacts() {',
+            '  for source_override_rollback_artifact in "$source_directory"/.control-plane-source-override-rollback.*; do',
+            '    if [ ! -e "$source_override_rollback_artifact" ] && [ ! -L "$source_override_rollback_artifact" ]; then continue; fi',
+            '    source_override_rollback_name=${source_override_rollback_artifact##*/}',
+            '    case "$source_override_rollback_name" in .control-plane-source-override-rollback.*.quarantine) ;; *) fail ;; esac',
+            '    source_override_rollback_operation_id=${source_override_rollback_name#.control-plane-source-override-rollback.}',
+            '    source_override_rollback_operation_id=${source_override_rollback_operation_id%.quarantine}',
+            '    is_operation_id "$source_override_rollback_operation_id" || fail',
+            '    source_override_rollback_journal="$proxy_directory/.control-plane-static-listener-rollback.$source_override_rollback_operation_id.journal"',
+            '    assert_valid_completed_source_override_rollback_journal "$source_override_rollback_artifact" "$source_override_rollback_journal" "$source_override_rollback_operation_id"',
+            '  done',
+            '}',
             'matches() { assert_regular "$1"; cmp -s "$1" "$2"; }',
             'matches_if_present() { is_absent "$1" && return 1; matches "$1" "$2"; }',
             'checksum_matches() {',
             '  checksum=$(sha256sum "$1")',
             '  test "${checksum%% *}" = "$2"',
+            '}',
+            'file_identity() {',
+            '  if stat -c "%d:%i" "$1" >/dev/null 2>&1; then stat -c "%d:%i" "$1"; else stat -f "%d:%i" "$1"; fi',
             '}',
             'atomic_replace() {',
             '  target=$1',
@@ -522,6 +658,20 @@ final class ControlPlaneStaticListenerHandoff
             '  cp "$source" "$stage" || fail',
             '  chmod 600 "$stage" || fail',
             '  durable_remote_replace "$stage" "$target" "$target_directory" || fail',
+            '}',
+            'durable_move_no_clobber() {',
+            '  source=$1',
+            '  destination=$2',
+            '  target_directory=$3',
+            '  durable_remote_assert_owned_directory "$target_directory" || fail',
+            '  durable_remote_assert_owned_regular "$source" || fail',
+            '  is_absent "$destination" || fail',
+            '  sync "$source" || fail',
+            '  command -v python3 >/dev/null 2>&1 || fail',
+            '  printf %s "$rename_noreplace_python_base64" | base64 -d | python3 - "$source" "$destination" || fail',
+            '  is_absent "$source" || fail',
+            '  durable_remote_assert_owned_regular "$destination" || fail',
+            '  sync "$target_directory" || fail',
             '}',
         ];
     }
@@ -593,10 +743,10 @@ final class ControlPlaneStaticListenerHandoff
         ];
     }
 
-    private function rollbackJournal(ControlPlaneProxyEnrollmentState $state, string $phase): string
+    private function rollbackJournalPrefix(ControlPlaneProxyEnrollmentState $state): string
     {
         return implode("\n", [
-            'version=1',
+            'version=2',
             'operation_id='.$state->operationId,
             'token_sha256='.$state->tokenSha256,
             'app_port='.$state->appPort,
@@ -604,8 +754,183 @@ final class ControlPlaneStaticListenerHandoff
             'static_predecessor_sha256='.hash('sha256', $state->staticPredecessorBytes),
             'static_replacement_sha256='.hash('sha256', $state->staticReplacementBytes),
             'source_override_sha256='.hash('sha256', $state->sourceOverrideBytes),
-            'phase='.$phase,
-            '',
+            'orphaned_source_override_audit_sha256=',
         ]);
+    }
+
+    private function rollbackJournalSuffix(string $phase): string
+    {
+        return "\nphase={$phase}\n";
+    }
+
+    private function historicalEvidenceValidatorPython(): string
+    {
+        return <<<'PYTHON'
+import hashlib
+import os
+import re
+import stat
+import sys
+
+if len(sys.argv) != 6 or sys.argv[1] != "--validate-historical":
+    raise SystemExit(64)
+if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_NONBLOCK"):
+    raise SystemExit(95)
+
+quarantine_path = sys.argv[2]
+journal_path = sys.argv[3]
+operation_id = sys.argv[4]
+expected_uid = int(sys.argv[5])
+operation_id_bytes = operation_id.encode("ascii", "strict")
+if re.fullmatch(rb"[a-z0-9][a-z0-9._-]{0,127}", operation_id_bytes) is None:
+    raise SystemExit(1)
+
+open_flags = (
+    os.O_RDONLY
+    | os.O_NOFOLLOW
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+)
+quarantine_fd = os.open(quarantine_path, open_flags)
+try:
+    journal_fd = os.open(journal_path, open_flags)
+    try:
+        quarantine_before = os.fstat(quarantine_fd)
+        journal_before = os.fstat(journal_fd)
+
+        def validate_stat(value, *, exact_mode=None):
+            if not stat.S_ISREG(value.st_mode):
+                raise SystemExit(1)
+            if value.st_uid != expected_uid or value.st_nlink != 1:
+                raise SystemExit(1)
+            permissions = stat.S_IMODE(value.st_mode)
+            if exact_mode is not None:
+                if permissions != exact_mode:
+                    raise SystemExit(1)
+            elif permissions & 0o022 or permissions & 0o600 != 0o600:
+                raise SystemExit(1)
+
+        validate_stat(quarantine_before)
+        validate_stat(journal_before, exact_mode=0o600)
+        if (quarantine_before.st_dev, quarantine_before.st_ino) == (
+            journal_before.st_dev,
+            journal_before.st_ino,
+        ):
+            raise SystemExit(1)
+
+        quarantine_hash = hashlib.sha256()
+        while True:
+            chunk = os.read(quarantine_fd, 1024 * 1024)
+            if not chunk:
+                break
+            quarantine_hash.update(chunk)
+        quarantine_sha256 = quarantine_hash.hexdigest().encode("ascii")
+
+        journal_bytes = bytearray()
+        while True:
+            chunk = os.read(journal_fd, 4096)
+            if not chunk:
+                break
+            journal_bytes.extend(chunk)
+            if len(journal_bytes) > 4096:
+                raise SystemExit(1)
+
+        pattern = (
+            rb"version=2\n"
+            rb"operation_id=" + re.escape(operation_id_bytes) + rb"\n"
+            rb"token_sha256=[a-f0-9]{64}\n"
+            rb"app_port=(?P<app_port>[1-9][0-9]{0,4})\n"
+            rb"exposure=(?:public|loopback)\n"
+            rb"static_predecessor_sha256=[a-f0-9]{64}\n"
+            rb"static_replacement_sha256=[a-f0-9]{64}\n"
+            rb"source_override_sha256=[a-f0-9]{64}\n"
+            rb"orphaned_source_override_audit_sha256="
+            + quarantine_sha256
+            + rb"\nphase=rolled-back\n"
+        )
+        match = re.fullmatch(pattern, bytes(journal_bytes))
+        if match is None or int(match.group("app_port")) > 65535:
+            raise SystemExit(1)
+
+        quarantine_after = os.fstat(quarantine_fd)
+        journal_after = os.fstat(journal_fd)
+
+        def stable_fingerprint(value):
+            return (
+                value.st_dev,
+                value.st_ino,
+                value.st_mode,
+                value.st_uid,
+                value.st_gid,
+                value.st_nlink,
+                value.st_size,
+                value.st_mtime_ns,
+                value.st_ctime_ns,
+            )
+
+        if stable_fingerprint(quarantine_before) != stable_fingerprint(quarantine_after):
+            raise SystemExit(1)
+        if stable_fingerprint(journal_before) != stable_fingerprint(journal_after):
+            raise SystemExit(1)
+
+        quarantine_path_stat = os.stat(quarantine_path, follow_symlinks=False)
+        journal_path_stat = os.stat(journal_path, follow_symlinks=False)
+        if (quarantine_path_stat.st_dev, quarantine_path_stat.st_ino) != (
+            quarantine_before.st_dev,
+            quarantine_before.st_ino,
+        ):
+            raise SystemExit(1)
+        if (journal_path_stat.st_dev, journal_path_stat.st_ino) != (
+            journal_before.st_dev,
+            journal_before.st_ino,
+        ):
+            raise SystemExit(1)
+    finally:
+        os.close(journal_fd)
+finally:
+    os.close(quarantine_fd)
+PYTHON;
+    }
+
+    private function renameNoReplacePython(): string
+    {
+        return <<<'PYTHON'
+import ctypes
+import errno
+import os
+import sys
+
+libc = ctypes.CDLL(None, use_errno=True)
+try:
+    renameat2 = libc.renameat2
+except AttributeError:
+    raise SystemExit(95)
+
+renameat2.argtypes = [
+    ctypes.c_int,
+    ctypes.c_char_p,
+    ctypes.c_int,
+    ctypes.c_char_p,
+    ctypes.c_uint,
+]
+renameat2.restype = ctypes.c_int
+
+result = renameat2(
+    -100,
+    os.fsencode(sys.argv[1]),
+    -100,
+    os.fsencode(sys.argv[2]),
+    1,
+)
+if result == 0:
+    raise SystemExit(0)
+
+error = ctypes.get_errno()
+if error == errno.EEXIST:
+    raise SystemExit(17)
+if error in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}:
+    raise SystemExit(95)
+raise SystemExit(96)
+PYTHON;
     }
 }

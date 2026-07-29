@@ -16,12 +16,29 @@
 ## It never touches fork-deploy trust/release state and never runs fork-deploy install.
 set -Eeuo pipefail
 
-MANIFEST_SCHEMA="coolify-control-plane-migration/1"
+MANIFEST_SCHEMA="coolify-control-plane-migration/2"
+SUPPORTED_CONTROL_PLANE_STATE_CONTRACT="absent"
 DEFAULT_ROOT="/data/coolify"
 APP_CONTAINER="${COOLIFY_MIGRATE_APP_CONTAINER:-coolify}"
 DB_CONTAINER="${COOLIFY_MIGRATE_DB_CONTAINER:-coolify-db}"
 REDIS_CONTAINER="${COOLIFY_MIGRATE_REDIS_CONTAINER:-coolify-redis}"
 LEGACY_REALTIME_CONTAINER="${COOLIFY_MIGRATE_REALTIME_CONTAINER:-coolify-realtime}"
+FLOCK_BIN="${COOLIFY_MIGRATE_FLOCK_BIN:-flock}"
+CONTROL_PLANE_LISTENER_OVERRIDE_RELATIVE_PATH="source/docker-compose.control-plane-listener.yml"
+CONTROL_PLANE_MANAGED_STATE_RELATIVE_PATH="proxy/.control-plane-managed-traefik"
+CONTROL_PLANE_STATIC_LOCK_RELATIVE_PATH="proxy/.control-plane-static-listener-enrollment.lock"
+CONTROL_PLANE_DYNAMIC_LOCK_RELATIVE_PATH="$CONTROL_PLANE_MANAGED_STATE_RELATIVE_PATH/.coolify.yaml.lock"
+CONTROL_PLANE_SOURCE_ROLLBACK_PREFIX=".control-plane-source-override-rollback."
+CAPTURE_INCOMPLETE_MARKER=".control-plane-migrate.incomplete"
+CONTROL_PLANE_LOCKS_HELD=false
+CONTROL_PLANE_LOCK_ROOT=""
+CONTROL_PLANE_PROXY_IDENTITY=""
+CONTROL_PLANE_STATIC_LOCK_IDENTITY=""
+CONTROL_PLANE_DYNAMIC_LOCK_IDENTITY=""
+CAPTURE_STAGING_OUTPUT=""
+CAPTURE_STAGING_OUTPUT_IDENTITY=""
+CAPTURE_STAGING_PARENT=""
+CAPTURE_STAGING_PARENT_IDENTITY=""
 
 # Trees captured by default and their restore policy on the target.
 #   replace      restored verbatim onto the target (after target backup)
@@ -73,7 +90,7 @@ usage() {
     cat <<'EOF'
 Usage:
   control-plane-migrate.sh capture --output DIR [--root DIR]
-      (--attest-quiesced "reason" | --require-source-stopped)
+      --require-source-stopped
       [--include NAME]... [--exclude NAME]... [--capture-redis] [--gpg-recipient ID]
   control-plane-migrate.sh verify --archive DIR
   control-plane-migrate.sh env-merge --source-env FILE --target-env FILE --output FILE [--report FILE]
@@ -84,7 +101,9 @@ Usage:
 
 Safety contract:
   - capture refuses undecided top-level directories (full /data/coolify census).
-  - capture requires an explicit quiescence attestation or a verified stopped source.
+  - schema-v2 capture requires a verified stopped source; live attestations are rejected.
+  - capture and restore hold the canonical static and dynamic enrollment writer
+    locks through archive acceptance or restore completion.
   - restore requires the exact target hostname as overwrite authorization.
   - restore refuses non-managed targets (missing fork-deploy/current), PostgreSQL
     major downgrades, release/digest mismatches, and failed checksums.
@@ -189,6 +208,506 @@ pg_admin_query() {
     docker exec "$DB_CONTAINER" psql -U "$DB_USERNAME" -d postgres -Atc "$1"
 }
 
+control_plane_state_count() {
+    local key="$1"
+    pg_query "SELECT count(*) FROM servers WHERE proxy ? '${key}'"
+}
+
+control_plane_state_fingerprint() {
+    local fingerprint
+    fingerprint=$(pg_query "SELECT md5(COALESCE(string_agg(id::text || ':' || xmin::text || ':' || COALESCE((proxy ? 'control_plane_proxy_enrollment')::text, 'false') || ':' || COALESCE((proxy ? 'control_plane_generation_promotion')::text, 'false'), ',' ORDER BY id), '')) FROM servers /* coolify-control-plane-migration-state-fingerprint */") \
+        || fail "control-plane server state fingerprint could not be inspected"
+    [ "${#fingerprint}" -eq 32 ] \
+        || fail "control-plane server state fingerprint is malformed"
+    case "$fingerprint" in
+        *[!a-f0-9]*) fail "control-plane server state fingerprint is malformed" ;;
+    esac
+    printf '%s' "$fingerprint"
+}
+
+path_link_count() {
+    stat -c '%h' "$1" 2>/dev/null || stat -f '%l' "$1"
+}
+
+path_owner_uid() {
+    stat -c '%u' "$1" 2>/dev/null || stat -f '%u' "$1"
+}
+
+path_group_gid() {
+    stat -c '%g' "$1" 2>/dev/null || stat -f '%g' "$1"
+}
+
+path_mode() {
+    stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
+path_identity_following_symlinks() {
+    stat -Lc '%d:%i' "$1" 2>/dev/null || stat -Lf '%d:%i' "$1"
+}
+
+path_inode_following_symlinks() {
+    stat -Lc '%i' "$1" 2>/dev/null || stat -Lf '%i' "$1"
+}
+
+assert_trusted_control_plane_directory() {
+    local path="$1" label="$2" owner expected_owner mode group_digit other_digit
+    [ -d "$path" ] && [ ! -L "$path" ] || fail "$label must be a non-symlink directory: $path"
+    owner=$(path_owner_uid "$path") || fail "$label owner could not be inspected: $path"
+    if [ "${COOLIFY_MIGRATE_TEST_MODE:-false}" = "true" ]; then
+        expected_owner=$(id -u)
+    else
+        expected_owner=0
+    fi
+    [ "$owner" -eq "$expected_owner" ] || fail "$label must be root-owned: $path"
+    mode=$(path_mode "$path") || fail "$label permissions could not be inspected: $path"
+    case "$mode" in
+        ''|*[!0-7]*) fail "$label permissions are malformed: $path" ;;
+    esac
+    [ "${#mode}" -le 3 ] || fail "$label must not carry special permission bits: $path"
+    group_digit="${mode: -2:1}"
+    other_digit="${mode: -1}"
+    case "${group_digit}${other_digit}" in
+        *[2367]*) fail "$label must not be writable by group or other: $path" ;;
+    esac
+}
+
+assert_safe_control_plane_lock_or_absent() {
+    local path="$1" label="$2" owner group expected_owner expected_group mode links
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+        return 0
+    fi
+    [ -f "$path" ] && [ ! -L "$path" ] || fail "$label must be a regular non-symlink file: $path"
+    links=$(path_link_count "$path") || fail "$label link count could not be inspected: $path"
+    [ "$links" -eq 1 ] || fail "$label must have exactly one hard link: $path"
+    owner=$(path_owner_uid "$path") || fail "$label owner could not be inspected: $path"
+    group=$(path_group_gid "$path") || fail "$label group could not be inspected: $path"
+    if [ "${COOLIFY_MIGRATE_TEST_MODE:-false}" = "true" ]; then
+        expected_owner=$(id -u)
+        expected_group=$(id -g)
+    else
+        expected_owner=0
+        expected_group=0
+    fi
+    [ "$owner" -eq "$expected_owner" ] && [ "$group" -eq "$expected_group" ] \
+        || fail "$label must be root:root: $path"
+    mode=$(path_mode "$path") || fail "$label permissions could not be inspected: $path"
+    [ "$mode" = 600 ] || fail "$label must have mode 0600: $path"
+}
+
+assert_static_control_plane_lock_pre_acquire_or_absent() {
+    local path="$1" label="$2" owner group root_owner root_group mode links
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+        return 0
+    fi
+    [ -f "$path" ] && [ ! -L "$path" ] || fail "$label must be a regular non-symlink file: $path"
+    links=$(path_link_count "$path") || fail "$label link count could not be inspected: $path"
+    [ "$links" -eq 1 ] || fail "$label must have exactly one hard link: $path"
+    owner=$(path_owner_uid "$path") || fail "$label owner could not be inspected: $path"
+    group=$(path_group_gid "$path") || fail "$label group could not be inspected: $path"
+    mode=$(path_mode "$path") || fail "$label permissions could not be inspected: $path"
+    if [ "${COOLIFY_MIGRATE_TEST_MODE:-false}" = "true" ]; then
+        root_owner=$(id -u)
+        root_group=$(id -g)
+    else
+        root_owner=0
+        root_group=0
+    fi
+    if [ "$owner" -eq "$root_owner" ] && [ "$group" -eq "$root_group" ] && [ "$mode" = 600 ]; then
+        return 0
+    fi
+    if [ "$owner" -eq 9999 ] && [ "$group" -eq 0 ] && [ "$mode" = 700 ]; then
+        return 0
+    fi
+    fail "$label must be root:root mode 0600 or legacy 9999:root mode 0700: $path"
+}
+
+assert_control_plane_proxy_directory_identity() {
+    local root="$1" expected_identity="$2" proxy_path identity
+    assert_trusted_control_plane_directory "$root" "Coolify root"
+    proxy_path="$root/proxy"
+    assert_trusted_control_plane_directory "$proxy_path" "control-plane proxy directory"
+    identity=$(path_identity_following_symlinks "$proxy_path") \
+        || fail "control-plane proxy directory identity could not be inspected"
+    [ "$identity" = "$expected_identity" ] \
+        || fail "control-plane proxy directory inode changed while migration held its fence"
+}
+
+assert_control_plane_writer_locks_held() {
+    local static_path dynamic_path static_identity dynamic_identity
+    [ "$CONTROL_PLANE_LOCKS_HELD" = true ] || fail "control-plane writer locks are not held"
+    assert_control_plane_proxy_directory_identity \
+        "$CONTROL_PLANE_LOCK_ROOT" "$CONTROL_PLANE_PROXY_IDENTITY"
+    static_path="$CONTROL_PLANE_LOCK_ROOT/$CONTROL_PLANE_STATIC_LOCK_RELATIVE_PATH"
+    dynamic_path="$CONTROL_PLANE_LOCK_ROOT/$CONTROL_PLANE_DYNAMIC_LOCK_RELATIVE_PATH"
+    assert_safe_control_plane_lock_or_absent "$static_path" "control-plane static listener lock"
+    assert_safe_control_plane_lock_or_absent "$dynamic_path" "control-plane managed Traefik lock"
+    static_identity=$(path_identity_following_symlinks "$static_path") \
+        || fail "control-plane static listener lock identity could not be inspected"
+    dynamic_identity=$(path_identity_following_symlinks "$dynamic_path") \
+        || fail "control-plane managed Traefik lock identity could not be inspected"
+    [ "$static_identity" = "$CONTROL_PLANE_STATIC_LOCK_IDENTITY" ] \
+        || fail "control-plane static listener lock inode changed while migration held its fence"
+    [ "$dynamic_identity" = "$CONTROL_PLANE_DYNAMIC_LOCK_IDENTITY" ] \
+        || fail "control-plane managed Traefik lock inode changed while migration held its fence"
+}
+
+acquire_control_plane_writer_locks() {
+    local root="$1" proxy_path managed_state_path static_path dynamic_path previous_umask
+    local proxy_identity static_path_inode dynamic_path_inode static_fd_inode dynamic_fd_inode
+    [ "$CONTROL_PLANE_LOCKS_HELD" = false ] || fail "control-plane writer locks were already acquired"
+    command -v "$FLOCK_BIN" >/dev/null 2>&1 || fail "flock is required for the control-plane migration fence"
+
+    assert_trusted_control_plane_directory "$root" "Coolify root"
+    proxy_path="$root/proxy"
+    assert_trusted_control_plane_directory "$proxy_path" "control-plane proxy directory"
+    proxy_identity=$(path_identity_following_symlinks "$proxy_path") \
+        || fail "control-plane proxy directory identity could not be recorded"
+    managed_state_path="$root/$CONTROL_PLANE_MANAGED_STATE_RELATIVE_PATH"
+    if [ ! -e "$managed_state_path" ] && [ ! -L "$managed_state_path" ]; then
+        mkdir "$managed_state_path" || fail "could not create the persistent control-plane writer state directory"
+        if [ "${COOLIFY_MIGRATE_TEST_MODE:-false}" = "true" ]; then
+            chmod 0700 "$managed_state_path"
+        else
+            chown root:9999 "$managed_state_path"
+            chmod 0710 "$managed_state_path"
+        fi
+    fi
+    assert_trusted_control_plane_directory "$managed_state_path" "control-plane managed Traefik state directory"
+
+    static_path="$root/$CONTROL_PLANE_STATIC_LOCK_RELATIVE_PATH"
+    dynamic_path="$root/$CONTROL_PLANE_DYNAMIC_LOCK_RELATIVE_PATH"
+    assert_static_control_plane_lock_pre_acquire_or_absent "$static_path" "control-plane static listener lock"
+    assert_safe_control_plane_lock_or_absent "$dynamic_path" "control-plane managed Traefik lock"
+
+    previous_umask=$(umask)
+    umask 077
+    exec 8>>"$static_path" || fail "could not open the control-plane static listener lock"
+    "$FLOCK_BIN" -x 8 || fail "could not acquire the control-plane static listener lock"
+    assert_control_plane_proxy_directory_identity "$root" "$proxy_identity"
+    static_path_inode=$(path_inode_following_symlinks "$static_path") \
+        || fail "control-plane static listener lock inode could not be inspected"
+    static_fd_inode=$(path_inode_following_symlinks /dev/fd/8) \
+        || fail "open control-plane static listener lock inode could not be inspected"
+    [ "$static_fd_inode" = "$static_path_inode" ] \
+        || fail "control-plane static listener lock path did not retain its opened inode"
+    chown root:root /dev/fd/8 || fail "could not normalize the opened control-plane static listener lock owner"
+    chmod 0600 /dev/fd/8 || fail "could not normalize the opened control-plane static listener lock mode"
+    assert_control_plane_proxy_directory_identity "$root" "$proxy_identity"
+    static_path_inode=$(path_inode_following_symlinks "$static_path") \
+        || fail "normalized control-plane static listener lock inode could not be inspected"
+    static_fd_inode=$(path_inode_following_symlinks /dev/fd/8) \
+        || fail "normalized open control-plane static listener lock inode could not be inspected"
+    [ "$static_fd_inode" = "$static_path_inode" ] \
+        || fail "normalized control-plane static listener lock path changed inode"
+    assert_safe_control_plane_lock_or_absent "$static_path" "control-plane static listener lock"
+
+    exec 9>>"$dynamic_path" || fail "could not open the control-plane managed Traefik lock"
+    "$FLOCK_BIN" -x 9 || fail "could not acquire the control-plane managed Traefik lock"
+    assert_control_plane_proxy_directory_identity "$root" "$proxy_identity"
+    dynamic_path_inode=$(path_inode_following_symlinks "$dynamic_path") \
+        || fail "control-plane managed Traefik lock inode could not be inspected"
+    dynamic_fd_inode=$(path_inode_following_symlinks /dev/fd/9) \
+        || fail "open control-plane managed Traefik lock inode could not be inspected"
+    [ "$dynamic_fd_inode" = "$dynamic_path_inode" ] \
+        || fail "control-plane managed Traefik lock path did not retain its opened inode"
+    chown root:root /dev/fd/9 || fail "could not secure the opened control-plane managed Traefik lock owner"
+    chmod 0600 /dev/fd/9 || fail "could not secure the opened control-plane managed Traefik lock mode"
+    assert_control_plane_proxy_directory_identity "$root" "$proxy_identity"
+    umask "$previous_umask"
+
+    assert_control_plane_proxy_directory_identity "$root" "$proxy_identity"
+    assert_safe_control_plane_lock_or_absent "$static_path" "control-plane static listener lock"
+    assert_safe_control_plane_lock_or_absent "$dynamic_path" "control-plane managed Traefik lock"
+    # macOS exposes open descriptors through fdesc with a synthetic device ID,
+    # while retaining the opened vnode's inode. Compare each FD/path inode here,
+    # then retain device+inode for all subsequent pathname checks.
+    static_path_inode=$(path_inode_following_symlinks "$static_path") \
+        || fail "control-plane static listener lock inode could not be inspected"
+    static_fd_inode=$(path_inode_following_symlinks /dev/fd/8) \
+        || fail "open control-plane static listener lock inode could not be inspected"
+    dynamic_path_inode=$(path_inode_following_symlinks "$dynamic_path") \
+        || fail "control-plane managed Traefik lock inode could not be inspected"
+    dynamic_fd_inode=$(path_inode_following_symlinks /dev/fd/9) \
+        || fail "open control-plane managed Traefik lock inode could not be inspected"
+    [ "$static_fd_inode" = "$static_path_inode" ] \
+        || fail "control-plane static listener lock path did not retain its opened inode"
+    [ "$dynamic_fd_inode" = "$dynamic_path_inode" ] \
+        || fail "control-plane managed Traefik lock path did not retain its opened inode"
+    CONTROL_PLANE_STATIC_LOCK_IDENTITY=$(path_identity_following_symlinks "$static_path") \
+        || fail "control-plane static listener lock identity could not be inspected"
+    CONTROL_PLANE_DYNAMIC_LOCK_IDENTITY=$(path_identity_following_symlinks "$dynamic_path") \
+        || fail "control-plane managed Traefik lock identity could not be inspected"
+
+    CONTROL_PLANE_LOCK_ROOT="$root"
+    CONTROL_PLANE_PROXY_IDENTITY="$proxy_identity"
+    CONTROL_PLANE_LOCKS_HELD=true
+    assert_control_plane_writer_locks_held
+}
+
+assert_control_plane_migration_filesystem_absent() {
+    local root="$1" owner="$2"
+    local listener_path proxy_path managed_state_path static_lock_path dynamic_lock_path path basename
+
+    listener_path="$root/$CONTROL_PLANE_LISTENER_OVERRIDE_RELATIVE_PATH"
+    if [ -e "$listener_path" ] || [ -L "$listener_path" ]; then
+        fail "$owner filesystem contains a managed control-plane listener override: $listener_path. Enrollment migration is unsupported; roll back or reconcile the enrollment until the listener override is absent, then retry."
+    fi
+
+    for path in "$root/source/$CONTROL_PLANE_SOURCE_ROLLBACK_PREFIX"*; do
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            fail "$owner filesystem contains managed control-plane source-override rollback state: $path. Enrollment migration is unsupported; complete and reconcile the rollback before retrying."
+        fi
+    done
+
+    assert_trusted_control_plane_directory "$root" "Coolify root"
+    proxy_path="$root/proxy"
+    assert_trusted_control_plane_directory "$proxy_path" "control-plane proxy directory"
+    static_lock_path="$root/$CONTROL_PLANE_STATIC_LOCK_RELATIVE_PATH"
+    dynamic_lock_path="$root/$CONTROL_PLANE_DYNAMIC_LOCK_RELATIVE_PATH"
+    if [ "$CONTROL_PLANE_LOCKS_HELD" = true ] && [ "$CONTROL_PLANE_LOCK_ROOT" = "$root" ]; then
+        assert_safe_control_plane_lock_or_absent "$static_lock_path" "control-plane static listener lock"
+    else
+        assert_static_control_plane_lock_pre_acquire_or_absent "$static_lock_path" "control-plane static listener lock"
+    fi
+
+    managed_state_path="$root/$CONTROL_PLANE_MANAGED_STATE_RELATIVE_PATH"
+    if [ -L "$managed_state_path" ]; then
+        fail "$owner filesystem control-plane enrollment writer state path is a symlink: $managed_state_path. Enrollment migration is unsupported; roll back or reconcile the enrollment until writer state is absent or contains only the persistent lock, then retry."
+    fi
+    if [ -e "$managed_state_path" ]; then
+        assert_trusted_control_plane_directory "$managed_state_path" "control-plane managed Traefik state directory"
+        assert_safe_control_plane_lock_or_absent "$dynamic_lock_path" "control-plane managed Traefik lock"
+        for path in "$managed_state_path"/* "$managed_state_path"/.*; do
+            [ -e "$path" ] || [ -L "$path" ] || continue
+            basename="${path##*/}"
+            [ "$basename" != . ] && [ "$basename" != .. ] || continue
+            if [ "$path" = "$dynamic_lock_path" ]; then
+                assert_safe_control_plane_lock_or_absent "$path" "control-plane managed Traefik lock"
+                continue
+            fi
+            fail "$owner filesystem contains managed control-plane enrollment writer state: $path. Enrollment migration is unsupported; roll back or reconcile the enrollment until only the persistent writer lock remains, then retry."
+        done
+    fi
+}
+
+assert_control_plane_migration_state_absent() {
+    local root="$1" owner="$2"
+    local enrollment_count promotion_count
+
+    enrollment_count=$(control_plane_state_count control_plane_proxy_enrollment) \
+        || fail "$owner database control-plane enrollment state could not be inspected"
+    promotion_count=$(control_plane_state_count control_plane_generation_promotion) \
+        || fail "$owner database control-plane generation-promotion state could not be inspected"
+    case "$enrollment_count" in
+        ''|*[!0-9]*) fail "$owner database returned an invalid control-plane enrollment state count: $enrollment_count" ;;
+    esac
+    case "$promotion_count" in
+        ''|*[!0-9]*) fail "$owner database returned an invalid control-plane generation-promotion state count: $promotion_count" ;;
+    esac
+    [ "$enrollment_count" -eq 0 ] \
+        || fail "$owner database contains durable control-plane proxy enrollment state. Enrollment migration is unsupported; roll back or reconcile the enrollment until control_plane_proxy_enrollment is absent, then retry."
+    [ "$promotion_count" -eq 0 ] \
+        || fail "$owner database contains durable control-plane generation-promotion state. Generation migration is unsupported; roll back or reconcile the promotion until control_plane_generation_promotion is absent, then retry."
+
+    assert_control_plane_migration_filesystem_absent "$root" "$owner"
+}
+
+assert_control_plane_archive_filesystem_absent() {
+    local archive_root="$1" owner="$2"
+    local source_archive="$archive_root/tree-source.tar.gz"
+    local proxy_archive="$archive_root/tree-proxy.tar.gz"
+    local listing member normalized verbose saw_static=false saw_dynamic=false
+
+    require_file "$source_archive" "$owner source tree archive"
+    require_file "$proxy_archive" "$owner proxy tree archive"
+
+    listing=$(tar -tzf "$source_archive") || fail "$owner source tree archive could not be inspected"
+    while IFS= read -r member; do
+        normalized="${member#./}"
+        normalized="${normalized%/}"
+        case "$normalized" in
+            "$CONTROL_PLANE_LISTENER_OVERRIDE_RELATIVE_PATH"|source/"$CONTROL_PLANE_SOURCE_ROLLBACK_PREFIX"*)
+                fail "$owner source tree archive contains unsupported control-plane enrollment state: $normalized"
+                ;;
+        esac
+    done <<< "$listing"
+
+    listing=$(tar -tzf "$proxy_archive") || fail "$owner proxy tree archive could not be inspected"
+    while IFS= read -r member; do
+        normalized="${member#./}"
+        normalized="${normalized%/}"
+        case "$normalized" in
+            "$CONTROL_PLANE_STATIC_LOCK_RELATIVE_PATH")
+                saw_static=true
+                ;;
+            "$CONTROL_PLANE_STATIC_LOCK_RELATIVE_PATH"/*)
+                fail "$owner proxy tree archive contains an unsafe static listener lock entry: $normalized"
+                ;;
+            "$CONTROL_PLANE_MANAGED_STATE_RELATIVE_PATH")
+                ;;
+            "$CONTROL_PLANE_DYNAMIC_LOCK_RELATIVE_PATH")
+                saw_dynamic=true
+                ;;
+            "$CONTROL_PLANE_MANAGED_STATE_RELATIVE_PATH"/*)
+                fail "$owner proxy tree archive contains unsupported control-plane writer state: $normalized"
+                ;;
+        esac
+    done <<< "$listing"
+    [ "$saw_static" = true ] || fail "$owner proxy tree archive is missing the persistent static listener lock"
+    [ "$saw_dynamic" = true ] || fail "$owner proxy tree archive is missing the persistent managed Traefik lock"
+    verbose=$(tar -tvzf "$proxy_archive" "$CONTROL_PLANE_STATIC_LOCK_RELATIVE_PATH") \
+        || fail "$owner static listener lock archive entry could not be inspected"
+    case "$verbose" in -*) ;; *) fail "$owner static listener lock archive entry is not a regular file" ;; esac
+    verbose=$(tar -tvzf "$proxy_archive" "$CONTROL_PLANE_DYNAMIC_LOCK_RELATIVE_PATH") \
+        || fail "$owner managed Traefik lock archive entry could not be inspected"
+    case "$verbose" in -*) ;; *) fail "$owner managed Traefik lock archive entry is not a regular file" ;; esac
+}
+
+assert_capture_staging_output_owned() {
+    local path="$CAPTURE_STAGING_OUTPUT" marker identity parent_identity links mode
+    [ -n "$path" ] || fail "capture staging output was not recorded"
+    [ -d "$path" ] && [ ! -L "$path" ] \
+        || fail "capture staging output is no longer a non-symlink directory: $path"
+    identity=$(path_identity_following_symlinks "$path") \
+        || fail "capture staging output identity could not be inspected: $path"
+    [ "$identity" = "$CAPTURE_STAGING_OUTPUT_IDENTITY" ] \
+        || fail "capture staging output inode changed: $path"
+    parent_identity=$(path_identity_following_symlinks "$CAPTURE_STAGING_PARENT") \
+        || fail "capture output parent identity could not be inspected"
+    [ "$parent_identity" = "$CAPTURE_STAGING_PARENT_IDENTITY" ] \
+        || fail "capture output parent inode changed"
+    mode=$(path_mode "$path") || fail "capture staging output permissions could not be inspected"
+    [ "$mode" = 700 ] || fail "capture staging output must have mode 0700: $path"
+    marker="$path/$CAPTURE_INCOMPLETE_MARKER"
+    require_file "$marker" "capture incomplete marker"
+    links=$(path_link_count "$marker") || fail "capture incomplete marker link count could not be inspected"
+    [ "$links" -eq 1 ] || fail "capture incomplete marker must have exactly one hard link"
+    [ "$(path_mode "$marker")" = 600 ] || fail "capture incomplete marker must have mode 0600"
+    grep -Fqx "$MANIFEST_SCHEMA" "$marker" \
+        || fail "capture incomplete marker does not match migration schema"
+}
+
+mark_capture_staging_incomplete_if_owned() {
+    local path="$CAPTURE_STAGING_OUTPUT" marker identity parent_identity
+    [ -n "$path" ] || return 0
+    [ -d "$path" ] && [ ! -L "$path" ] || return 1
+    identity=$(path_identity_following_symlinks "$path" 2>/dev/null || true)
+    [ -n "$identity" ] && [ "$identity" = "$CAPTURE_STAGING_OUTPUT_IDENTITY" ] || return 1
+    parent_identity=$(path_identity_following_symlinks "$CAPTURE_STAGING_PARENT" 2>/dev/null || true)
+    [ -n "$parent_identity" ] && [ "$parent_identity" = "$CAPTURE_STAGING_PARENT_IDENTITY" ] || return 1
+    marker="$path/$CAPTURE_INCOMPLETE_MARKER"
+    if [ -f "$marker" ] && [ ! -L "$marker" ] \
+        && [ "$(path_link_count "$marker" 2>/dev/null || true)" = 1 ] \
+        && grep -Fqx "$MANIFEST_SCHEMA" "$marker"; then
+        chmod 0600 "$marker" 2>/dev/null || true
+        return 0
+    fi
+    [ ! -e "$marker" ] && [ ! -L "$marker" ] || return 1
+    (
+        set -C
+        umask 077
+        printf '%s\n' "$MANIFEST_SCHEMA" > "$marker"
+    ) || return 1
+    chmod 0600 "$marker" || return 1
+}
+
+preserve_incomplete_capture_on_exit() {
+    local status=$?
+    trap - EXIT
+    if [ "$status" -ne 0 ] && [ -n "$CAPTURE_STAGING_OUTPUT" ]; then
+        if mark_capture_staging_incomplete_if_owned; then
+            printf 'ERROR: incomplete capture staging directory preserved for inspection: %s\n' \
+                "$CAPTURE_STAGING_OUTPUT" >&2
+        else
+            printf 'ERROR: capture staging ownership changed; inspect without deleting either path: %s\n' \
+                "$CAPTURE_STAGING_OUTPUT" >&2
+        fi
+    fi
+    exit "$status"
+}
+
+atomic_rename_noreplace() {
+    local source="$1" destination="$2" python_bin
+    if [ "${COOLIFY_MIGRATE_TEST_MODE:-false}" = "true" ] \
+        && [ -n "${COOLIFY_MIGRATE_RENAME_NOREPLACE_BIN:-}" ]; then
+        "$COOLIFY_MIGRATE_RENAME_NOREPLACE_BIN" "$source" "$destination"
+        return
+    fi
+    python_bin=$(command -v python3) \
+        || fail "python3 is required for atomic no-replace archive publication"
+    "$python_bin" - "$source" "$destination" <<'PY'
+import ctypes
+import errno
+import os
+import sys
+
+AT_FDCWD = -100
+RENAME_NOREPLACE = 1
+source = os.fsencode(sys.argv[1])
+destination = os.fsencode(sys.argv[2])
+libc = ctypes.CDLL(None, use_errno=True)
+try:
+    renameat2 = libc.renameat2
+except AttributeError:
+    print("renameat2 is unavailable; refusing non-atomic archive publication", file=sys.stderr)
+    raise SystemExit(70)
+renameat2.argtypes = [
+    ctypes.c_int,
+    ctypes.c_char_p,
+    ctypes.c_int,
+    ctypes.c_char_p,
+    ctypes.c_uint,
+]
+renameat2.restype = ctypes.c_int
+if renameat2(AT_FDCWD, source, AT_FDCWD, destination, RENAME_NOREPLACE) == 0:
+    raise SystemExit(0)
+error = ctypes.get_errno()
+if error == errno.EEXIST:
+    print("archive destination already exists; no path was replaced", file=sys.stderr)
+elif error in {errno.ENOSYS, errno.EINVAL, getattr(errno, "ENOTSUP", errno.EINVAL)}:
+    print("renameat2 RENAME_NOREPLACE is unsupported; refusing archive publication", file=sys.stderr)
+else:
+    print(f"renameat2 RENAME_NOREPLACE failed: {os.strerror(error)}", file=sys.stderr)
+raise SystemExit(error if 0 < error < 126 else 70)
+PY
+}
+
+publish_capture_staging_output() {
+    local requested_output="$1" marker final_identity
+    assert_capture_staging_output_owned
+    [ ! -e "$requested_output" ] && [ ! -L "$requested_output" ] \
+        || fail "capture output destination appeared before publication; staging is preserved: $requested_output"
+
+    marker="$CAPTURE_STAGING_OUTPUT/$CAPTURE_INCOMPLETE_MARKER"
+    rm -f -- "$marker" \
+        || fail "could not remove the verified incomplete marker immediately before publication"
+    [ ! -e "$marker" ] && [ ! -L "$marker" ] \
+        || fail "capture incomplete marker still exists immediately before publication"
+
+    if ! atomic_rename_noreplace "$CAPTURE_STAGING_OUTPUT" "$requested_output"; then
+        mark_capture_staging_incomplete_if_owned || true
+        fail "atomic no-replace capture publication failed; destination and staging were preserved"
+    fi
+    if [ -e "$CAPTURE_STAGING_OUTPUT" ] || [ -L "$CAPTURE_STAGING_OUTPUT" ]; then
+        mark_capture_staging_incomplete_if_owned || true
+        fail "atomic capture publication did not consume the staging path; destination and staging were preserved"
+    fi
+    [ -d "$requested_output" ] && [ ! -L "$requested_output" ] \
+        || fail "published capture output is not the recorded staging directory"
+    final_identity=$(path_identity_following_symlinks "$requested_output") \
+        || fail "published capture output identity could not be inspected"
+    [ "$final_identity" = "$CAPTURE_STAGING_OUTPUT_IDENTITY" ] \
+        || fail "published capture output does not have the recorded staging inode"
+    [ ! -e "$requested_output/$CAPTURE_INCOMPLETE_MARKER" ] \
+        && [ ! -L "$requested_output/$CAPTURE_INCOMPLETE_MARKER" ] \
+        || fail "published capture output retained the incomplete marker"
+
+    CAPTURE_STAGING_OUTPUT=""
+    CAPTURE_STAGING_OUTPUT_IDENTITY=""
+    CAPTURE_STAGING_PARENT=""
+    CAPTURE_STAGING_PARENT_IDENTITY=""
+}
+
 container_running() {
     docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$1"
 }
@@ -269,6 +788,8 @@ write_inventory_json() {
 
 cmd_capture() {
     local root="" output="" attest="" require_stopped=false capture_redis=false gpg_recipient=""
+    local capture_state_fingerprint final_state_fingerprint
+    local requested_output output_parent output_basename
     local -a extra_includes=() extra_excludes=()
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -285,20 +806,24 @@ cmd_capture() {
     done
     [ -n "$output" ] || { usage; fail "capture requires --output"; }
     root=$(resolve_root "$root")
-    if [ "$require_stopped" = true ] && [ -n "$attest" ]; then
-        fail "choose exactly one quiescence mode"
+    [ -z "$attest" ] \
+        || fail "schema-v2 capture rejects --attest-quiesced because a running app cannot substantiate the absent control-plane state contract; stop the source and use --require-source-stopped"
+    [ "$require_stopped" = true ] \
+        || fail "schema-v2 capture is fail-closed: stop the source application and pass --require-source-stopped"
+    if container_running "$APP_CONTAINER"; then
+        fail "source application container '$APP_CONTAINER' is still running; stop it before the final capture"
     fi
-    if [ "$require_stopped" = false ] && [ -z "$attest" ]; then
-        fail "capture is fail-closed: pass --attest-quiesced \"reason\" or --require-source-stopped"
-    fi
+    container_running "$DB_CONTAINER" || fail "database container '$DB_CONTAINER' must be running for the dump"
 
-    # Quiescence proof.
-    if [ "$require_stopped" = true ]; then
-        if container_running "$APP_CONTAINER"; then
-            fail "source application container '$APP_CONTAINER' is still running; stop it before the final capture"
-        fi
-        container_running "$DB_CONTAINER" || fail "database container '$DB_CONTAINER' must be running for the dump"
-    fi
+    db_credentials "$root"
+    container_running "$DB_CONTAINER" || fail "database container '$DB_CONTAINER' is not running"
+    assert_control_plane_migration_state_absent "$root" "source"
+    acquire_control_plane_writer_locks "$root"
+    container_running "$APP_CONTAINER" \
+        && fail "source application container '$APP_CONTAINER' restarted while the migration fence was being acquired"
+    assert_control_plane_writer_locks_held
+    assert_control_plane_migration_state_absent "$root" "source after writer-lock acquisition"
+    capture_state_fingerprint=$(control_plane_state_fingerprint)
 
     # Full fail-closed census of the control-plane root.
     local -a trees=()
@@ -331,10 +856,28 @@ cmd_capture() {
     done
     [ "${#trees[@]}" -gt 0 ] || fail "census found no trees to capture under $root"
 
-    [ ! -e "$output" ] || fail "output directory already exists (fail-closed): $output"
-    mkdir -p "$output"
+    requested_output="$output"
+    output_parent=$(dirname "$requested_output")
+    output_basename=$(basename "$requested_output")
+    case "$output_basename" in
+        ''|.|..) fail "capture output must name a new child directory" ;;
+    esac
+    [ ! -e "$requested_output" ] && [ ! -L "$requested_output" ] \
+        || fail "output directory already exists (fail-closed): $requested_output"
+    require_dir "$output_parent" "capture output parent"
+    CAPTURE_STAGING_PARENT="$output_parent"
+    CAPTURE_STAGING_PARENT_IDENTITY=$(path_identity_following_symlinks "$output_parent") \
+        || fail "capture output parent identity could not be recorded"
+    output=$(mktemp -d "$output_parent/.${output_basename}.control-plane-migrate-staging.XXXXXX") \
+        || fail "could not create private sibling capture staging directory"
     chmod 0700 "$output"
-    db_credentials "$root"
+    CAPTURE_STAGING_OUTPUT="$output"
+    CAPTURE_STAGING_OUTPUT_IDENTITY=$(path_identity_following_symlinks "$output") \
+        || fail "capture staging output identity could not be recorded"
+    printf '%s\n' "$MANIFEST_SCHEMA" > "$output/$CAPTURE_INCOMPLETE_MARKER"
+    chmod 0600 "$output/$CAPTURE_INCOMPLETE_MARKER"
+    trap preserve_incomplete_capture_on_exit EXIT
+    assert_capture_staging_output_owned
 
     # .env snapshot first; the migration is impossible without APP_KEY.
     cp -p "$root/source/.env" "$output/env.source"
@@ -342,6 +885,8 @@ cmd_capture() {
     [ -n "$(get_env_var APP_KEY "$output/env.source")" ] || fail "source .env has no usable APP_KEY; encrypted credentials would be unrecoverable"
 
     # Tree archives with numeric ownership preserved.
+    container_running "$APP_CONTAINER" \
+        && fail "source application container '$APP_CONTAINER' restarted before the migration snapshot"
     local tree archive
     for tree in "${trees[@]}"; do
         archive="$output/tree-${tree}.tar.gz"
@@ -384,6 +929,12 @@ cmd_capture() {
     fi
 
     write_inventory_json "$output/inventory.json"
+    assert_control_plane_archive_filesystem_absent "$output" "captured"
+    assert_control_plane_writer_locks_held
+    assert_control_plane_migration_state_absent "$root" "source after snapshot"
+    final_state_fingerprint=$(control_plane_state_fingerprint)
+    [ "$final_state_fingerprint" = "$capture_state_fingerprint" ] \
+        || fail "source control-plane server rows changed while the migration snapshot was captured; the incomplete archive is invalid"
 
     # Manifest: machine-checkable contract for verify/restore plus a
     # shell-consumable manifest.env (no secrets).
@@ -402,6 +953,7 @@ cmd_capture() {
         printf 'DB_USERNAME=%s\n' "$DB_USERNAME"
         printf 'DB_DATABASE=%s\n' "$DB_DATABASE"
         printf 'REDIS_CAPTURED=%s\n' "$redis_captured"
+        printf 'CONTROL_PLANE_STATE_CONTRACT=%s\n' "$SUPPORTED_CONTROL_PLANE_STATE_CONTRACT"
         printf 'TREES="%s"\n' "${trees[*]}"
     } > "$output/manifest.env"
     chmod 0600 "$output/manifest.env"
@@ -417,9 +969,10 @@ cmd_capture() {
         printf '    "postgres_major": %s\n' "$source_pg_major"
         printf '  },\n'
         printf '  "quiescence": {\n'
-        printf '    "mode": "%s",\n' "$([ "$require_stopped" = true ] && printf 'source-stopped' || printf 'attested')"
-        printf '    "attestation": "%s"\n' "$(json_escape "$attest")"
+        printf '    "mode": "source-stopped",\n'
+        printf '    "attestation": ""\n'
         printf '  },\n'
+        printf '  "control_plane_state": { "contract": "%s" },\n' "$SUPPORTED_CONTROL_PLANE_STATE_CONTRACT"
         printf '  "redis": { "captured": %s },\n' "$redis_captured"
         printf '  "database": { "dump": "postgres.dump", "format": "pg-custom", "username": "%s", "database": "%s" },\n' "$DB_USERNAME" "$DB_DATABASE"
         printf '  "env": { "file": "env.source", "app_key_present": true },\n'
@@ -455,6 +1008,17 @@ cmd_capture() {
         log "encrypted archive to recipient ${gpg_recipient}; keep the decryption key off-host and away from this archive"
     fi
 
+    assert_control_plane_writer_locks_held
+    assert_control_plane_migration_state_absent "$root" "source before archive acceptance"
+    final_state_fingerprint=$(control_plane_state_fingerprint)
+    [ "$final_state_fingerprint" = "$capture_state_fingerprint" ] \
+        || fail "source control-plane server rows changed before archive acceptance; the incomplete archive is invalid"
+    container_running "$APP_CONTAINER" \
+        && fail "source application container '$APP_CONTAINER' restarted before archive acceptance"
+    publish_capture_staging_output "$requested_output"
+    trap - EXIT
+    output="$requested_output"
+
     log "capture complete: $output"
     log "inventory: $(tr -d '\n' < "$output/inventory.json")"
 }
@@ -479,9 +1043,15 @@ cmd_verify() {
     require_file "$archive/env.source" "archived env.source"
     require_file "$archive/postgres.dump" "archived postgres.dump"
     require_file "$archive/inventory.json" "archived inventory"
+    [ ! -e "$archive/$CAPTURE_INCOMPLETE_MARKER" ] && [ ! -L "$archive/$CAPTURE_INCOMPLETE_MARKER" ] \
+        || fail "migration archive is marked incomplete and cannot be verified"
 
     grep -q "^MANIFEST_SCHEMA=${MANIFEST_SCHEMA}\$" "$archive/manifest.env" \
         || fail "archive schema mismatch; expected $MANIFEST_SCHEMA"
+    [ "$(get_env_var CONTROL_PLANE_STATE_CONTRACT "$archive/manifest.env")" = "$SUPPORTED_CONTROL_PLANE_STATE_CONTRACT" ] \
+        || fail "archive control-plane state contract must be '$SUPPORTED_CONTROL_PLANE_STATE_CONTRACT'; enrollment and generation migration are unsupported"
+    grep -Fq '"control_plane_state": { "contract": "absent" }' "$archive/manifest.json" \
+        || fail "archive JSON control-plane state contract must be '$SUPPORTED_CONTROL_PLANE_STATE_CONTRACT'"
     [ -n "$(get_env_var APP_KEY "$archive/env.source")" ] \
         || fail "archived env.source has no usable APP_KEY"
 
@@ -495,6 +1065,7 @@ cmd_verify() {
         tar -tzf "$archive/tree-${tree}.tar.gz" > /dev/null 2>&1 \
             || fail "tree archive is corrupt: tree-${tree}.tar.gz"
     done < <(get_env_var TREES "$archive/manifest.env" | tr ' ' '\n')
+    assert_control_plane_archive_filesystem_absent "$archive" "archive"
 
     major=$(get_env_var SOURCE_PG_MAJOR "$archive/manifest.env")
     verify_dump_readable "$archive/postgres.dump" "$major"
@@ -698,6 +1269,8 @@ cmd_restore() {
     done
     [ -n "$archive" ] && [ -n "$authorize" ] && [ -n "$expect_version" ] && [ -n "$expect_digest" ] \
         || { usage; fail "restore requires --archive, --authorize-overwrite, --expect-fork-version, and --expect-image-digest"; }
+    [ "$restore_proxy" = false ] \
+        || fail "--restore-proxy is unsupported by migration schema v2 because replacing the proxy tree would invalidate the held canonical writer-lock inodes; reconstruct or reconcile target proxy state separately after the default restore"
     root=$(resolve_root "$root")
     require_dir "$archive" "migration archive"
 
@@ -717,6 +1290,8 @@ cmd_restore() {
     # shellcheck disable=SC1090,SC1091
     . "$archive/manifest.env"
     [ "${MANIFEST_SCHEMA:-}" = "$expected_schema" ] || fail "manifest schema mismatch"
+    [ "${CONTROL_PLANE_STATE_CONTRACT:-}" = "$SUPPORTED_CONTROL_PLANE_STATE_CONTRACT" ] \
+        || fail "archive control-plane state contract must be '$SUPPORTED_CONTROL_PLANE_STATE_CONTRACT'"
     # shellcheck disable=SC2153  # assigned by the sourced manifest.env
     local source_pg_major="$SOURCE_PG_MAJOR"
 
@@ -736,6 +1311,7 @@ cmd_restore() {
     target_pg_major=$(pg_server_major)
     [ "$target_pg_major" -ge "$source_pg_major" ] \
         || fail "PostgreSQL major downgrade refused: source $source_pg_major, target $target_pg_major"
+    assert_control_plane_migration_state_absent "$root" "target"
 
     # Free-space gate: target backup plus extracted trees need headroom.
     local archive_kb available_kb
@@ -744,12 +1320,31 @@ cmd_restore() {
     [ "$((available_kb))" -gt "$((archive_kb * 2))" ] \
         || fail "insufficient free space under $root: need > $((archive_kb * 2)) KiB, have $available_kb KiB"
 
-    # Back up the target's current installation before overwriting anything.
     local stamp
     stamp=$(date +%Y-%m-%d-%H-%M-%S)
     [ -n "$target_backup_dir" ] || target_backup_dir="$root/control-plane-migrate-target-backup-${stamp}"
-    [ ! -e "$target_backup_dir" ] || fail "target backup directory already exists: $target_backup_dir"
-    mkdir -p "$target_backup_dir"
+    [ ! -e "$target_backup_dir" ] && [ ! -L "$target_backup_dir" ] \
+        || fail "target backup directory already exists: $target_backup_dir"
+
+    acquire_control_plane_writer_locks "$root"
+
+    # Stop every mutable application process while both canonical remote-writer
+    # locks are held. The database and Redis remain available for backup.
+    if container_running "$APP_CONTAINER"; then
+        docker stop "$APP_CONTAINER" > /dev/null || fail "could not stop app container '$APP_CONTAINER'"
+    fi
+    if container_running "$LEGACY_REALTIME_CONTAINER"; then
+        docker stop "$LEGACY_REALTIME_CONTAINER" > /dev/null || fail "could not stop legacy realtime container"
+    fi
+    assert_control_plane_writer_locks_held
+    assert_control_plane_migration_state_absent "$root" "quiesced target"
+    local quiesced_state_fingerprint final_state_fingerprint
+    quiesced_state_fingerprint=$(control_plane_state_fingerprint)
+
+    # Back up the quiesced target's current installation before overwriting
+    # anything. The backup is intentionally preserved if the final fence fails.
+    require_dir "$(dirname "$target_backup_dir")" "target backup parent"
+    mkdir "$target_backup_dir" || fail "could not atomically claim target backup directory: $target_backup_dir"
     chmod 0700 "$target_backup_dir"
     local tree
     for tree in $DEFAULT_CAPTURE_TREES; do
@@ -765,16 +1360,15 @@ cmd_restore() {
     chmod 0600 "$target_backup_dir/postgres.pre-restore.dump"
     log "target backup complete: $target_backup_dir"
 
-    # Stop mutable control-plane services; database and redis stay up.
-    if container_running "$APP_CONTAINER"; then
-        docker stop "$APP_CONTAINER" > /dev/null || fail "could not stop app container '$APP_CONTAINER'"
-    fi
-    if container_running "$LEGACY_REALTIME_CONTAINER"; then
-        docker stop "$LEGACY_REALTIME_CONTAINER" > /dev/null || fail "could not stop legacy realtime container"
-    fi
+    assert_control_plane_archive_filesystem_absent "$target_backup_dir" "target backup"
+    assert_control_plane_writer_locks_held
+    assert_control_plane_migration_state_absent "$root" "target immediately before restore mutation"
+    final_state_fingerprint=$(control_plane_state_fingerprint)
+    [ "$final_state_fingerprint" = "$quiesced_state_fingerprint" ] \
+        || fail "target control-plane server rows changed while the quiesced backup was captured; target backup was preserved and restore mutation was refused"
 
     # Restore trees per manifest policy. 'never' trees are evidence only;
-    # 'opt-in' (proxy) requires --restore-proxy.
+    # schema v2 refuses proxy replacement because it would replace held locks.
     local pre_migration="$root/.pre-migration-${stamp}"
     mkdir -p "$pre_migration"
     # shellcheck disable=SC2034,SC2153  # TREES is assigned by the sourced manifest.env
@@ -871,6 +1465,8 @@ cmd_restore() {
         log "post-restore inventory: $(tr -d '\n' < "$root/source/.inventory-post-restore.json")"
     fi
     log "manifest inventory:      $(tr -d '\n' < "$archive/inventory.json")"
+    assert_control_plane_writer_locks_held
+    assert_control_plane_migration_state_absent "$root" "restored target before acceptance"
 
     cat <<EOF
 restore complete.

@@ -9,10 +9,11 @@ use Symfony\Component\Process\Process;
 
 function staticListenerHandoffState(
     ControlPlaneProxyExposure $exposure = ControlPlaneProxyExposure::Public,
+    string $operationId = 'static-listener-handoff',
 ): ControlPlaneProxyEnrollmentState {
     return new ControlPlaneProxyEnrollmentState(
         phase: ControlPlaneProxyEnrollmentPhase::Preparing,
-        operationId: 'static-listener-handoff',
+        operationId: $operationId,
         tokenSha256: hash('sha256', 'test-token'),
         serverId: 1,
         appPort: 8000,
@@ -35,7 +36,7 @@ function staticListenerHandoffState(
     );
 }
 
-/** @return array{root: string, proxy_compose: string, source_compose: string, source_production_compose: string, source_custom_compose: string, source_postgres_upgrade_compose: string, source_override: string, source_environment: string, lock: string, attestor_state: string, rollback_journal: string, bin: string, state: string, log: string} */
+/** @return array{root: string, proxy_compose: string, source_compose: string, source_production_compose: string, source_custom_compose: string, source_postgres_upgrade_compose: string, source_override: string, source_override_quarantine: string, source_environment: string, lock: string, attestor_state: string, rollback_journal: string, bin: string, state: string, log: string} */
 function staticListenerHandoffFixtures(ControlPlaneProxyEnrollmentState $state): array
 {
     $root = sys_get_temp_dir().'/coolify-static-listener-handoff-'.bin2hex(random_bytes(8));
@@ -115,6 +116,49 @@ esac
 SH
     );
     chmod($binDirectory.'/docker', 0700);
+    file_put_contents($binDirectory.'/python3', <<<'SH'
+#!/bin/sh
+set -eu
+
+if [ "$#" = 6 ] && [ "$1" = - ] && [ "$2" = --validate-historical ]; then
+  if [ "${FAKE_HISTORICAL_EVIDENCE_MODE:-}" = aba-journal ]; then
+    validator_source="$FAKE_DOCKER_STATE/historical-evidence-validator.py"
+    instrumented_source="$FAKE_DOCKER_STATE/historical-evidence-validator-instrumented.py"
+    /bin/cat > "$validator_source"
+    /usr/bin/sed '/^        quarantine_path_stat = os.stat/i\
+        os.replace(os.environ["FAKE_HISTORICAL_EVIDENCE_ABA_JOURNAL_PATH"], journal_path)
+' "$validator_source" > "$instrumented_source"
+    exec /usr/bin/python3 "$instrumented_source" "$2" "$3" "$4" "$5" "$6"
+  fi
+  exec /usr/bin/python3 "$@"
+fi
+[ "$#" = 3 ] || exit 64
+[ "$1" = - ] || exit 64
+source_path=$2
+destination_path=$3
+/bin/cat >/dev/null
+
+case "${FAKE_RENAME_NOREPLACE_MODE:-success}" in
+  unavailable) exit 127 ;;
+  unsupported) exit 95 ;;
+  late-file)
+    printf '%s\n' "${FAKE_RENAME_NOREPLACE_DESTINATION_BYTES:-late destination}" > "$destination_path"
+    exit 17
+    ;;
+  late-directory)
+    /bin/mkdir "$destination_path"
+    exit 17
+    ;;
+  success) ;;
+  *) exit 64 ;;
+esac
+
+if [ -e "$destination_path" ] || [ -L "$destination_path" ]; then exit 17; fi
+/bin/ln "$source_path" "$destination_path" || exit 17
+/bin/rm -f -- "$source_path"
+SH
+    );
+    chmod($binDirectory.'/python3', 0700);
 
     return [
         'root' => $root,
@@ -124,6 +168,7 @@ SH
         'source_custom_compose' => $sourceCustomCompose,
         'source_postgres_upgrade_compose' => $sourcePostgresUpgradeCompose,
         'source_override' => $sourceOverride,
+        'source_override_quarantine' => $sourceDirectory.'/.control-plane-source-override-rollback.'.$state->operationId.'.quarantine',
         'source_environment' => $sourceEnvironment,
         'lock' => $proxyDirectory.'/.handoff.lock',
         'attestor_state' => $root.'/control-plane-attestor',
@@ -338,8 +383,12 @@ it('rolls back a post-success static listener handoff once and replays exact leg
             ->and(trim($second->getOutput()))->toBe(ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT)
             ->and(file_get_contents($fixture['proxy_compose']))->toBe($state->staticPredecessorBytes)
             ->and(file_exists($fixture['source_override']))->toBeFalse()
+            ->and(file_get_contents($fixture['source_override_quarantine']))->toBe($state->sourceOverrideBytes)
             ->and(file_get_contents($fixture['state'].'/coolify_port'))->toBe("0.0.0.0:8000\n")
             ->and(file_get_contents($fixture['state'].'/coolify-proxy_port'))->toBe('')
+            ->and(file_get_contents($fixture['rollback_journal']))->toContain(
+                'orphaned_source_override_audit_sha256='.hash('sha256', $state->sourceOverrideBytes),
+            )
             ->and(file_get_contents($fixture['rollback_journal']))->toContain('phase=rolled-back')
             ->and(substr_count($commands, 'compose '))->toBe(4)
             ->and(strrpos($commands, 'traefik'))->toBeLessThan(strrpos($commands, 'coolify'));
@@ -348,7 +397,612 @@ it('rolls back a post-success static listener handoff once and replays exact leg
     }
 });
 
-it('reasserts an exact completed rollback when a delayed activation restores the replacement listener', function (): void {
+it('preserves an exact completed audit artifact and replays it from durable journal provenance', function (): void {
+    $filesystem = new Filesystem;
+    $state = staticListenerHandoffState()
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::RollingBack, '2026-07-19T00:01:00Z');
+    $fixture = staticListenerHandoffFixtures($state);
+    $orphanedOverrideBytes = "services:\n  coolify:\n    environment:\n      COOLIFY_CONTROL_PLANE_OPERATION_ID: stale-operation\n";
+    $authorizedSha256 = hash('sha256', $orphanedOverrideBytes);
+
+    try {
+        file_put_contents($fixture['source_override'], $orphanedOverrideBytes);
+        file_put_contents($fixture['state'].'/coolify_port', '');
+
+        $writer = staticListenerHandoffWriter($fixture);
+        $interrupted = runStaticListenerHandoffCommand(
+            $writer->rollbackCommandFor(
+                $state,
+                $state->operationId,
+                'test-token',
+                $authorizedSha256,
+            ),
+            $fixture,
+            ['COOLIFY_CONTROL_PLANE_ROLLBACK_FAIL_AFTER_STATIC' => '1'],
+        );
+
+        expect($interrupted->isSuccessful())->toBeFalse()
+            ->and(file_exists($fixture['source_override']))->toBeFalse()
+            ->and(file_get_contents($fixture['source_override_quarantine']))->toBe($orphanedOverrideBytes)
+            ->and(file_get_contents($fixture['proxy_compose']))->toBe($state->staticPredecessorBytes)
+            ->and(file_get_contents($fixture['rollback_journal']))->toContain('phase=rolling-back')
+            ->and(file_get_contents($fixture['log']))->toBe('');
+
+        $resumed = runStaticListenerHandoffCommand(
+            $writer->rollbackCommandFor(
+                $state,
+                $state->operationId,
+                'test-token',
+                $authorizedSha256,
+            ),
+            $fixture,
+        );
+        $commands = file_get_contents($fixture['log']);
+
+        expect($resumed->isSuccessful())->toBeTrue()
+            ->and(trim($resumed->getOutput()))->toBe(ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT)
+            ->and(file_get_contents($fixture['source_override_quarantine']))->toBe($orphanedOverrideBytes)
+            ->and(file_get_contents($fixture['state'].'/coolify_port'))->toBe("0.0.0.0:8000\n")
+            ->and(file_get_contents($fixture['state'].'/coolify-proxy_port'))->toBe('')
+            ->and(file_get_contents($fixture['rollback_journal']))->toContain(
+                "orphaned_source_override_audit_sha256={$authorizedSha256}",
+            )
+            ->and(file_get_contents($fixture['rollback_journal']))->toContain('phase=rolled-back')
+            ->and(strrpos($commands, 'traefik'))->toBeLessThan(strrpos($commands, 'coolify'));
+
+        $awaitingAcknowledgement = $state
+            ->withPhase(ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement, '2026-07-19T00:02:00Z');
+        $terminalReplay = runStaticListenerHandoffCommand(
+            $writer->reassertAwaitingRollbackCommandFor(
+                $awaitingAcknowledgement,
+                $awaitingAcknowledgement->operationId,
+                'test-token',
+            ),
+            $fixture,
+        );
+        $freshState = staticListenerHandoffState(operationId: 'fresh-static-listener-handoff');
+        $freshEnrollment = runStaticListenerHandoffCommand($writer->commandFor($freshState), $fixture);
+
+        expect($terminalReplay->isSuccessful())->toBeTrue()
+            ->and(trim($terminalReplay->getOutput()))->toBe(ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT)
+            ->and(file_get_contents($fixture['source_override_quarantine']))->toBe($orphanedOverrideBytes)
+            ->and($freshEnrollment->isSuccessful())->toBeTrue()
+            ->and(trim($freshEnrollment->getOutput()))->toBe(ControlPlaneStaticListenerHandoff::APPLIED_OUTPUT)
+            ->and(file_get_contents($fixture['source_override']))->toBe($freshState->sourceOverrideBytes)
+            ->and(file_get_contents($fixture['source_override_quarantine']))->toBe($orphanedOverrideBytes);
+    } finally {
+        $filesystem->remove($fixture['root']);
+    }
+});
+
+it('rejects tampered or unpaired historical rollback evidence before a fresh enrollment mutation', function (): void {
+    $filesystem = new Filesystem;
+    $state = staticListenerHandoffState()
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::RollingBack, '2026-07-19T00:01:00Z');
+    $fixture = staticListenerHandoffFixtures($state);
+    $orphanedOverrideBytes = "services:\n  coolify:\n    environment:\n      COOLIFY_CONTROL_PLANE_OPERATION_ID: retained-evidence\n";
+
+    try {
+        file_put_contents($fixture['source_override'], $orphanedOverrideBytes);
+        file_put_contents($fixture['state'].'/coolify_port', '');
+        $writer = staticListenerHandoffWriter($fixture);
+        expect(runStaticListenerHandoffCommand(
+            $writer->rollbackCommandFor(
+                $state,
+                $state->operationId,
+                'test-token',
+                hash('sha256', $orphanedOverrideBytes),
+            ),
+            $fixture,
+        )->isSuccessful())->toBeTrue();
+
+        $freshState = staticListenerHandoffState(operationId: 'fresh-after-retained-evidence');
+        $freshCommand = $writer->commandFor($freshState);
+        $journalBytes = file_get_contents($fixture['rollback_journal']);
+        $commandsAfterRollback = file_get_contents($fixture['log']);
+
+        file_put_contents(
+            $fixture['rollback_journal'],
+            str_replace('phase=rolled-back', 'phase=rolling-back', $journalBytes),
+        );
+        $inProgress = runStaticListenerHandoffCommand($freshCommand, $fixture);
+        file_put_contents($fixture['rollback_journal'], $journalBytes);
+
+        file_put_contents($fixture['source_override_quarantine'], $orphanedOverrideBytes."tampered\n");
+        $tampered = runStaticListenerHandoffCommand($freshCommand, $fixture);
+        file_put_contents($fixture['source_override_quarantine'], $orphanedOverrideBytes);
+
+        $abaJournalPath = $fixture['rollback_journal'].'.aba';
+        file_put_contents($abaJournalPath, $journalBytes);
+        chmod($abaJournalPath, 0600);
+        $abaSwapped = runStaticListenerHandoffCommand(
+            $freshCommand,
+            $fixture,
+            [
+                'FAKE_HISTORICAL_EVIDENCE_MODE' => 'aba-journal',
+                'FAKE_HISTORICAL_EVIDENCE_ABA_JOURNAL_PATH' => $abaJournalPath,
+            ],
+        );
+        file_put_contents($fixture['rollback_journal'], $journalBytes);
+        chmod($fixture['rollback_journal'], 0600);
+
+        unlink($fixture['rollback_journal']);
+        $unpaired = runStaticListenerHandoffCommand($freshCommand, $fixture);
+        file_put_contents($fixture['rollback_journal'], $journalBytes);
+        chmod($fixture['rollback_journal'], 0600);
+
+        $hardlinkPath = $fixture['source_override_quarantine'].'.hardlink';
+        link($fixture['source_override_quarantine'], $hardlinkPath);
+        $hardlinked = runStaticListenerHandoffCommand($freshCommand, $fixture);
+        unlink($hardlinkPath);
+
+        $foreignArtifactPath = dirname($fixture['source_override'])
+            .'/.control-plane-source-override-rollback.foreign';
+        file_put_contents($foreignArtifactPath, "foreign\n");
+        $foreign = runStaticListenerHandoffCommand($freshCommand, $fixture);
+
+        expect($inProgress->isSuccessful())->toBeFalse()
+            ->and($tampered->isSuccessful())->toBeFalse()
+            ->and($abaSwapped->isSuccessful())->toBeFalse()
+            ->and($unpaired->isSuccessful())->toBeFalse()
+            ->and($hardlinked->isSuccessful())->toBeFalse()
+            ->and($foreign->isSuccessful())->toBeFalse()
+            ->and(file_get_contents($fixture['source_override_quarantine']))->toBe($orphanedOverrideBytes)
+            ->and(file_get_contents($fixture['rollback_journal']))->toBe($journalBytes)
+            ->and(file_exists($fixture['source_override']))->toBeFalse()
+            ->and(file_get_contents($fixture['proxy_compose']))->toBe($state->staticPredecessorBytes)
+            ->and(file_get_contents($fixture['log']))->toBe($commandsAfterRollback);
+    } finally {
+        $filesystem->remove($fixture['root']);
+    }
+});
+
+it('rejects a historical evidence FIFO without blocking the enrollment lock', function (string $pathKey): void {
+    $filesystem = new Filesystem;
+    $state = staticListenerHandoffState()
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::RollingBack, '2026-07-19T00:01:00Z');
+    $fixture = staticListenerHandoffFixtures($state);
+    $orphanedOverrideBytes = "services:\n  coolify:\n    environment:\n      COOLIFY_CONTROL_PLANE_OPERATION_ID: fifo-evidence\n";
+
+    try {
+        file_put_contents($fixture['source_override'], $orphanedOverrideBytes);
+        file_put_contents($fixture['state'].'/coolify_port', '');
+        $writer = staticListenerHandoffWriter($fixture);
+        expect(runStaticListenerHandoffCommand(
+            $writer->rollbackCommandFor(
+                $state,
+                $state->operationId,
+                'test-token',
+                hash('sha256', $orphanedOverrideBytes),
+            ),
+            $fixture,
+        )->isSuccessful())->toBeTrue();
+
+        $evidencePath = $fixture[$pathKey];
+        $evidenceBackupPath = $evidencePath.'.regular';
+        rename($evidencePath, $evidenceBackupPath);
+        (new Process(['mkfifo', $evidencePath]))->mustRun();
+        $commandsAfterRollback = file_get_contents($fixture['log']);
+        $startedAt = microtime(true);
+        $result = runStaticListenerHandoffCommand(
+            $writer->commandFor(staticListenerHandoffState(operationId: 'fresh-after-fifo-evidence')),
+            $fixture,
+        );
+        $elapsedSeconds = microtime(true) - $startedAt;
+        unlink($evidencePath);
+        rename($evidenceBackupPath, $evidencePath);
+
+        expect($result->isSuccessful())->toBeFalse()
+            ->and($elapsedSeconds)->toBeLessThan(5.0)
+            ->and(file_get_contents($fixture['source_override_quarantine']))->toBe($orphanedOverrideBytes)
+            ->and(file_exists($fixture['source_override']))->toBeFalse()
+            ->and(file_get_contents($fixture['log']))->toBe($commandsAfterRollback);
+    } finally {
+        $filesystem->remove($fixture['root']);
+    }
+})->with([
+    'quarantine FIFO' => 'source_override_quarantine',
+    'journal FIFO' => 'rollback_journal',
+]);
+
+it('rejects an unused orphan authorization before creating a rollback journal', function (bool $managedOverridePresent): void {
+    $filesystem = new Filesystem;
+    $state = staticListenerHandoffState()
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::RollingBack, '2026-07-19T00:01:00Z');
+    $fixture = staticListenerHandoffFixtures($state);
+
+    try {
+        if ($managedOverridePresent) {
+            file_put_contents($fixture['source_override'], $state->sourceOverrideBytes);
+        }
+        $sourceOverrideBefore = $managedOverridePresent
+            ? file_get_contents($fixture['source_override'])
+            : null;
+        $result = runStaticListenerHandoffCommand(
+            staticListenerHandoffWriter($fixture)->rollbackCommandFor(
+                $state,
+                $state->operationId,
+                'test-token',
+                str_repeat('a', 64),
+            ),
+            $fixture,
+        );
+
+        expect($result->isSuccessful())->toBeFalse()
+            ->and(file_exists($fixture['rollback_journal']))->toBeFalse()
+            ->and(file_exists($fixture['source_override_quarantine']))->toBeFalse()
+            ->and(file_exists($fixture['source_override']))->toBe($managedOverridePresent)
+            ->and($managedOverridePresent ? file_get_contents($fixture['source_override']) : null)
+            ->toBe($sourceOverrideBefore)
+            ->and(file_get_contents($fixture['proxy_compose']))->toBe($state->staticPredecessorBytes)
+            ->and(file_get_contents($fixture['log']))->toBe('');
+    } finally {
+        $filesystem->remove($fixture['root']);
+    }
+})->with([
+    'managed override present' => true,
+    'override absent' => false,
+]);
+
+it('replays a crash after completed audit preservation without repeating authorization', function (): void {
+    $filesystem = new Filesystem;
+    $state = staticListenerHandoffState()
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::RollingBack, '2026-07-19T00:01:00Z');
+    $fixture = staticListenerHandoffFixtures($state);
+    $orphanedOverrideBytes = "services:\n  coolify:\n    environment:\n      COOLIFY_CONTROL_PLANE_OPERATION_ID: crash-before-journal-completion\n";
+    $authorizedSha256 = hash('sha256', $orphanedOverrideBytes);
+
+    try {
+        file_put_contents($fixture['source_override'], $orphanedOverrideBytes);
+        file_put_contents($fixture['state'].'/coolify_port', '');
+        $writer = staticListenerHandoffWriter($fixture);
+
+        $interrupted = runStaticListenerHandoffCommand(
+            $writer->rollbackCommandFor(
+                $state,
+                $state->operationId,
+                'test-token',
+                $authorizedSha256,
+            ),
+            $fixture,
+            ['COOLIFY_CONTROL_PLANE_ROLLBACK_FAIL_AFTER_AUDIT_COMPLETION' => '1'],
+        );
+
+        expect($interrupted->isSuccessful())->toBeFalse()
+            ->and(file_exists($fixture['source_override']))->toBeFalse()
+            ->and(file_get_contents($fixture['source_override_quarantine']))->toBe($orphanedOverrideBytes)
+            ->and(file_get_contents($fixture['rollback_journal']))->toContain(
+                "orphaned_source_override_audit_sha256={$authorizedSha256}",
+            )
+            ->and(file_get_contents($fixture['rollback_journal']))->toContain('phase=rolling-back')
+            ->and(file_get_contents($fixture['state'].'/coolify_port'))->toBe("0.0.0.0:8000\n")
+            ->and(file_get_contents($fixture['state'].'/coolify-proxy_port'))->toBe('');
+
+        $resumed = runStaticListenerHandoffCommand(
+            $writer->rollbackCommandFor($state, $state->operationId, 'test-token'),
+            $fixture,
+        );
+
+        expect($resumed->isSuccessful())->toBeTrue()
+            ->and(trim($resumed->getOutput()))->toBe(ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT)
+            ->and(file_get_contents($fixture['source_override_quarantine']))->toBe($orphanedOverrideBytes)
+            ->and(file_get_contents($fixture['rollback_journal']))->toContain('phase=rolled-back');
+    } finally {
+        $filesystem->remove($fixture['root']);
+    }
+});
+
+it('preserves a pathname swap in quarantine without allowing durable authorization replacement', function (): void {
+    $filesystem = new Filesystem;
+    $state = staticListenerHandoffState()
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::RollingBack, '2026-07-19T00:01:00Z');
+    $fixture = staticListenerHandoffFixtures($state);
+    $authorizedOverrideBytes = "services:\n  coolify:\n    environment:\n      COOLIFY_CONTROL_PLANE_OPERATION_ID: authorized-stale-operation\n";
+    $swappedOverrideBytes = "services:\n  coolify:\n    environment:\n      COOLIFY_CONTROL_PLANE_OPERATION_ID: pathname-swap\n";
+    $swapMarker = $fixture['state'].'/source-override-swapped';
+    $swapEnvironment = [
+        'SWAP_SOURCE_PATH' => $fixture['source_override'],
+        'SWAP_ONCE_PATH' => $swapMarker,
+        'SWAP_REPLACEMENT_BASE64' => base64_encode($swappedOverrideBytes),
+    ];
+
+    try {
+        file_put_contents($fixture['source_override'], $authorizedOverrideBytes);
+        file_put_contents($fixture['state'].'/coolify_port', '');
+        file_put_contents($fixture['bin'].'/sync', <<<'SH'
+#!/bin/sh
+set -eu
+
+if [ "$#" -eq 1 ] && [ "$1" = "$SWAP_SOURCE_PATH" ] && [ ! -e "$SWAP_ONCE_PATH" ]; then
+  swap_candidate="$SWAP_SOURCE_PATH.pathname-swap"
+  printf %s "$SWAP_REPLACEMENT_BASE64" | base64 -d > "$swap_candidate"
+  chmod 600 "$swap_candidate"
+  /bin/mv -f -- "$swap_candidate" "$SWAP_SOURCE_PATH"
+  : > "$SWAP_ONCE_PATH"
+fi
+exec /bin/sync "$@"
+SH
+        );
+        chmod($fixture['bin'].'/sync', 0700);
+
+        $writer = staticListenerHandoffWriter($fixture);
+        $swapped = runStaticListenerHandoffCommand(
+            $writer->rollbackCommandFor(
+                $state,
+                $state->operationId,
+                'test-token',
+                hash('sha256', $authorizedOverrideBytes),
+            ),
+            $fixture,
+            $swapEnvironment,
+        );
+
+        expect($swapped->isSuccessful())->toBeFalse()
+            ->and(file_exists($swapMarker))->toBeTrue()
+            ->and(file_exists($fixture['source_override']))->toBeFalse()
+            ->and(file_get_contents($fixture['source_override_quarantine']))->toBe($swappedOverrideBytes)
+            ->and(file_get_contents($fixture['rollback_journal']))->toContain('phase=rolling-back')
+            ->and(file_get_contents($fixture['log']))->toBe('');
+
+        $reauthorized = runStaticListenerHandoffCommand(
+            $writer->rollbackCommandFor(
+                $state,
+                $state->operationId,
+                'test-token',
+                hash('sha256', $swappedOverrideBytes),
+            ),
+            $fixture,
+            $swapEnvironment,
+        );
+
+        expect($reauthorized->isSuccessful())->toBeFalse()
+            ->and(file_exists($fixture['source_override']))->toBeFalse()
+            ->and(file_get_contents($fixture['source_override_quarantine']))->toBe($swappedOverrideBytes)
+            ->and(file_get_contents($fixture['rollback_journal']))->toContain(
+                'orphaned_source_override_audit_sha256='.hash('sha256', $authorizedOverrideBytes),
+            )
+            ->and(file_get_contents($fixture['rollback_journal']))->toContain('phase=rolling-back');
+    } finally {
+        $filesystem->remove($fixture['root']);
+    }
+});
+
+it('preserves both paths when the no-clobber destination appears late', function (
+    string $mode,
+    bool $destinationIsDirectory,
+): void {
+    $filesystem = new Filesystem;
+    $state = staticListenerHandoffState()
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::RollingBack, '2026-07-19T00:01:00Z');
+    $fixture = staticListenerHandoffFixtures($state);
+    $authorizedOverrideBytes = "services:\n  coolify:\n    environment:\n      COOLIFY_CONTROL_PLANE_OPERATION_ID: no-clobber-source\n";
+    $destinationBytes = "late destination must survive\n";
+
+    try {
+        file_put_contents($fixture['source_override'], $authorizedOverrideBytes);
+        file_put_contents($fixture['state'].'/coolify_port', '');
+        $result = runStaticListenerHandoffCommand(
+            staticListenerHandoffWriter($fixture)->rollbackCommandFor(
+                $state,
+                $state->operationId,
+                'test-token',
+                hash('sha256', $authorizedOverrideBytes),
+            ),
+            $fixture,
+            [
+                'FAKE_RENAME_NOREPLACE_MODE' => $mode,
+                'FAKE_RENAME_NOREPLACE_DESTINATION_BYTES' => trim($destinationBytes),
+            ],
+        );
+
+        expect($result->isSuccessful())->toBeFalse()
+            ->and(file_get_contents($fixture['source_override']))->toBe($authorizedOverrideBytes)
+            ->and(is_dir($fixture['source_override_quarantine']))->toBe($destinationIsDirectory)
+            ->and($destinationIsDirectory
+                ? null
+                : file_get_contents($fixture['source_override_quarantine']))->toBe(
+                    $destinationIsDirectory ? null : $destinationBytes,
+                )
+            ->and(file_get_contents($fixture['rollback_journal']))->toContain('phase=rolling-back')
+            ->and(file_get_contents($fixture['log']))->toBe('');
+    } finally {
+        $filesystem->remove($fixture['root']);
+    }
+})->with([
+    'late regular file' => ['late-file', false],
+    'late directory' => ['late-directory', true],
+]);
+
+it('preserves the authorized source when atomic no-clobber support is unavailable', function (string $mode): void {
+    $filesystem = new Filesystem;
+    $state = staticListenerHandoffState()
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::RollingBack, '2026-07-19T00:01:00Z');
+    $fixture = staticListenerHandoffFixtures($state);
+    $authorizedOverrideBytes = "services:\n  coolify:\n    environment:\n      COOLIFY_CONTROL_PLANE_OPERATION_ID: helper-unavailable\n";
+
+    try {
+        file_put_contents($fixture['source_override'], $authorizedOverrideBytes);
+        file_put_contents($fixture['state'].'/coolify_port', '');
+        $result = runStaticListenerHandoffCommand(
+            staticListenerHandoffWriter($fixture)->rollbackCommandFor(
+                $state,
+                $state->operationId,
+                'test-token',
+                hash('sha256', $authorizedOverrideBytes),
+            ),
+            $fixture,
+            ['FAKE_RENAME_NOREPLACE_MODE' => $mode],
+        );
+
+        expect($result->isSuccessful())->toBeFalse()
+            ->and(file_get_contents($fixture['source_override']))->toBe($authorizedOverrideBytes)
+            ->and(file_exists($fixture['source_override_quarantine']))->toBeFalse()
+            ->and(file_get_contents($fixture['rollback_journal']))->toContain('phase=rolling-back')
+            ->and(file_get_contents($fixture['log']))->toBe('');
+    } finally {
+        $filesystem->remove($fixture['root']);
+    }
+})->with([
+    'python helper unavailable' => 'unavailable',
+    'renameat2 unsupported' => 'unsupported',
+]);
+
+it('preserves a final pathname swap as audit evidence instead of unlinking it', function (): void {
+    $filesystem = new Filesystem;
+    $state = staticListenerHandoffState()
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::RollingBack, '2026-07-19T00:01:00Z');
+    $fixture = staticListenerHandoffFixtures($state);
+    $authorizedOverrideBytes = "services:\n  coolify:\n    environment:\n      COOLIFY_CONTROL_PLANE_OPERATION_ID: authorized-final-cleanup\n";
+    $swappedOverrideBytes = "services:\n  coolify:\n    environment:\n      COOLIFY_CONTROL_PLANE_OPERATION_ID: final-pathname-swap\n";
+    $authorizedSha256 = hash('sha256', $authorizedOverrideBytes);
+    $syncCountPath = $fixture['state'].'/quarantine-sync-count';
+    $swapEnvironment = [
+        'SWAP_QUARANTINE_PATH' => $fixture['source_override_quarantine'],
+        'SWAP_SYNC_COUNT_PATH' => $syncCountPath,
+        'SWAP_REPLACEMENT_BASE64' => base64_encode($swappedOverrideBytes),
+    ];
+
+    try {
+        file_put_contents($fixture['source_override'], $authorizedOverrideBytes);
+        file_put_contents($fixture['state'].'/coolify_port', '');
+        file_put_contents($fixture['bin'].'/sync', <<<'SH'
+#!/bin/sh
+set -eu
+
+if [ "$#" -eq 1 ] && [ "$1" = "$SWAP_QUARANTINE_PATH" ]; then
+  sync_count=0
+  if [ -e "$SWAP_SYNC_COUNT_PATH" ]; then IFS= read -r sync_count < "$SWAP_SYNC_COUNT_PATH"; fi
+  sync_count=$((sync_count + 1))
+  printf '%s\n' "$sync_count" > "$SWAP_SYNC_COUNT_PATH"
+  if [ "$sync_count" = 2 ]; then
+    swap_candidate="$SWAP_QUARANTINE_PATH.pathname-swap"
+    printf %s "$SWAP_REPLACEMENT_BASE64" | base64 -d > "$swap_candidate"
+    chmod 600 "$swap_candidate"
+    /bin/mv -f -- "$swap_candidate" "$SWAP_QUARANTINE_PATH"
+  fi
+fi
+exec /bin/sync "$@"
+SH
+        );
+        chmod($fixture['bin'].'/sync', 0700);
+        $writer = staticListenerHandoffWriter($fixture);
+
+        $swapped = runStaticListenerHandoffCommand(
+            $writer->rollbackCommandFor(
+                $state,
+                $state->operationId,
+                'test-token',
+                $authorizedSha256,
+            ),
+            $fixture,
+            $swapEnvironment,
+        );
+
+        expect($swapped->isSuccessful())->toBeFalse()
+            ->and(trim((string) file_get_contents($syncCountPath)))->toBe('2')
+            ->and(file_exists($fixture['source_override']))->toBeFalse()
+            ->and(file_get_contents($fixture['source_override_quarantine']))->toBe($swappedOverrideBytes)
+            ->and(file_get_contents($fixture['rollback_journal']))->toContain(
+                "orphaned_source_override_audit_sha256={$authorizedSha256}",
+            )
+            ->and(file_get_contents($fixture['rollback_journal']))->toContain('phase=rolling-back')
+            ->and(file_get_contents($fixture['state'].'/coolify_port'))->toBe("0.0.0.0:8000\n")
+            ->and(file_get_contents($fixture['state'].'/coolify-proxy_port'))->toBe('');
+
+        $replayed = runStaticListenerHandoffCommand(
+            $writer->rollbackCommandFor(
+                $state,
+                $state->operationId,
+                'test-token',
+                hash('sha256', $swappedOverrideBytes),
+            ),
+            $fixture,
+            $swapEnvironment,
+        );
+
+        expect($replayed->isSuccessful())->toBeFalse()
+            ->and(file_get_contents($fixture['source_override_quarantine']))->toBe($swappedOverrideBytes)
+            ->and(file_get_contents($fixture['rollback_journal']))->toContain('phase=rolling-back');
+    } finally {
+        $filesystem->remove($fixture['root']);
+    }
+});
+
+it('fails closed on orphaned source override drift without its exact lowercase authorization', function (): void {
+    $filesystem = new Filesystem;
+    $state = staticListenerHandoffState()
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::RollingBack, '2026-07-19T00:01:00Z');
+    $fixture = staticListenerHandoffFixtures($state);
+    $orphanedOverrideBytes = "services:\n  coolify:\n    environment:\n      COOLIFY_CONTROL_PLANE_OPERATION_ID: stale-operation\n";
+
+    try {
+        file_put_contents($fixture['source_override'], $orphanedOverrideBytes);
+        file_put_contents($fixture['state'].'/coolify_port', '');
+        $writer = staticListenerHandoffWriter($fixture);
+
+        $unauthorized = runStaticListenerHandoffCommand(
+            $writer->rollbackCommandFor($state, $state->operationId, 'test-token'),
+            $fixture,
+        );
+        $wrongAuthorization = runStaticListenerHandoffCommand(
+            $writer->rollbackCommandFor(
+                $state,
+                $state->operationId,
+                'test-token',
+                str_repeat('0', 64),
+            ),
+            $fixture,
+        );
+
+        expect($unauthorized->isSuccessful())->toBeFalse()
+            ->and($wrongAuthorization->isSuccessful())->toBeFalse()
+            ->and(file_get_contents($fixture['source_override']))->toBe($orphanedOverrideBytes)
+            ->and(file_exists($fixture['source_override_quarantine']))->toBeFalse()
+            ->and(file_get_contents($fixture['proxy_compose']))->toBe($state->staticPredecessorBytes)
+            ->and(file_exists($fixture['rollback_journal']))->toBeFalse()
+            ->and(file_get_contents($fixture['log']))->toBe('')
+            ->and(fn (): string => $writer->rollbackCommandFor(
+                $state,
+                $state->operationId,
+                'test-token',
+                str_repeat('A', 64),
+            ))->toThrow(InvalidArgumentException::class, 'exact lowercase SHA-256');
+    } finally {
+        $filesystem->remove($fixture['root']);
+    }
+});
+
+it('limits orphaned source override authorization to durable rolling-back state', function (): void {
+    $rollingBack = staticListenerHandoffState()
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::RollingBack, '2026-07-19T00:01:00Z');
+    $awaitingAcknowledgement = $rollingBack
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::AwaitingRollbackAcknowledgement, '2026-07-19T00:02:00Z');
+    $rolledBack = $awaitingAcknowledgement
+        ->withPhase(ControlPlaneProxyEnrollmentPhase::RolledBack, '2026-07-19T00:03:00Z');
+    $writer = new ControlPlaneStaticListenerHandoff;
+    $authorization = str_repeat('a', 64);
+
+    expect($writer->rollbackCommandFor(
+        $rollingBack,
+        $rollingBack->operationId,
+        'test-token',
+        $authorization,
+    ))->toContain("authorized_orphaned_source_override_sha256='{$authorization}'")
+        ->and(fn (): string => $writer->rollbackCommandFor(
+            $awaitingAcknowledgement,
+            $awaitingAcknowledgement->operationId,
+            'test-token',
+            $authorization,
+        ))->toThrow(InvalidArgumentException::class, 'requires durable rolling-back state')
+        ->and(fn (): string => $writer->rollbackCommandFor(
+            $rolledBack,
+            $rolledBack->operationId,
+            'test-token',
+            $authorization,
+        ))->toThrow(InvalidArgumentException::class, 'invalid after static rollback');
+});
+
+it('fails closed when a delayed activation conflicts with retained rollback evidence', function (): void {
     $filesystem = new Filesystem;
     $rollingBackState = staticListenerHandoffState()
         ->withPhase(ControlPlaneProxyEnrollmentPhase::RollingBack, '2026-07-19T00:01:00Z');
@@ -377,12 +1031,12 @@ it('reasserts an exact completed rollback when a delayed activation restores the
 
         expect($proxyBytesAfterDelayedActivation)->toBe($rollingBackState->staticReplacementBytes)
             ->and($sourceOverrideBytesAfterDelayedActivation)->toBe($rollingBackState->sourceOverrideBytes)
-            ->and($reassertedRollback->isSuccessful())->toBeTrue()
-            ->and(trim($reassertedRollback->getOutput()))->toBe(ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT)
-            ->and(file_get_contents($fixture['proxy_compose']))->toBe($rollingBackState->staticPredecessorBytes)
-            ->and(file_exists($fixture['source_override']))->toBeFalse()
-            ->and(file_get_contents($fixture['state'].'/coolify_port'))->toBe("0.0.0.0:8000\n")
-            ->and(file_get_contents($fixture['state'].'/coolify-proxy_port'))->toBe('')
+            ->and($reassertedRollback->isSuccessful())->toBeFalse()
+            ->and(file_get_contents($fixture['proxy_compose']))->toBe($rollingBackState->staticReplacementBytes)
+            ->and(file_get_contents($fixture['source_override']))->toBe($rollingBackState->sourceOverrideBytes)
+            ->and(file_get_contents($fixture['source_override_quarantine']))->toBe($rollingBackState->sourceOverrideBytes)
+            ->and(file_get_contents($fixture['state'].'/coolify_port'))->toBe('')
+            ->and(file_get_contents($fixture['state'].'/coolify-proxy_port'))->toBe("0.0.0.0:8000\n")
             ->and(file_get_contents($fixture['rollback_journal']))->toContain('phase=rolled-back');
     } finally {
         $filesystem->remove($fixture['root']);
@@ -416,7 +1070,7 @@ it('fails closed when awaiting rollback reassertion has no durable rollback jour
     }
 });
 
-it('resumes an interrupted reassertion after a delayed activation restores the replacement listener', function (): void {
+it('keeps completed evidence unchanged across repeated delayed-activation reassertions', function (): void {
     $filesystem = new Filesystem;
     $rollingBackState = staticListenerHandoffState()
         ->withPhase(ControlPlaneProxyEnrollmentPhase::RollingBack, '2026-07-19T00:01:00Z');
@@ -443,21 +1097,21 @@ it('resumes an interrupted reassertion after a delayed activation restores the r
             ['COOLIFY_CONTROL_PLANE_ROLLBACK_FAIL_AFTER_TRAEFIK' => '1'],
         );
         expect($interrupted->isSuccessful())->toBeFalse()
-            ->and(file_get_contents($fixture['rollback_journal']))->toContain('phase=rolling-back')
+            ->and(file_get_contents($fixture['rollback_journal']))->toContain('phase=rolled-back')
             ->and(file_get_contents($fixture['state'].'/coolify_port'))->toBe('')
-            ->and(file_get_contents($fixture['state'].'/coolify-proxy_port'))->toBe('');
+            ->and(file_get_contents($fixture['state'].'/coolify-proxy_port'))->toBe("0.0.0.0:8000\n");
 
         $resumed = runStaticListenerHandoffCommand(
             $writer->reassertAwaitingRollbackCommandFor($awaitingState, $awaitingState->operationId, 'test-token'),
             $fixture,
         );
 
-        expect($resumed->isSuccessful())->toBeTrue()
-            ->and(trim($resumed->getOutput()))->toBe(ControlPlaneStaticListenerHandoff::ROLLED_BACK_OUTPUT)
-            ->and(file_get_contents($fixture['proxy_compose']))->toBe($rollingBackState->staticPredecessorBytes)
-            ->and(file_exists($fixture['source_override']))->toBeFalse()
-            ->and(file_get_contents($fixture['state'].'/coolify_port'))->toBe("0.0.0.0:8000\n")
-            ->and(file_get_contents($fixture['state'].'/coolify-proxy_port'))->toBe('')
+        expect($resumed->isSuccessful())->toBeFalse()
+            ->and(file_get_contents($fixture['proxy_compose']))->toBe($rollingBackState->staticReplacementBytes)
+            ->and(file_get_contents($fixture['source_override']))->toBe($rollingBackState->sourceOverrideBytes)
+            ->and(file_get_contents($fixture['source_override_quarantine']))->toBe($rollingBackState->sourceOverrideBytes)
+            ->and(file_get_contents($fixture['state'].'/coolify_port'))->toBe('')
+            ->and(file_get_contents($fixture['state'].'/coolify-proxy_port'))->toBe("0.0.0.0:8000\n")
             ->and(file_get_contents($fixture['rollback_journal']))->toContain('phase=rolled-back');
     } finally {
         $filesystem->remove($fixture['root']);
