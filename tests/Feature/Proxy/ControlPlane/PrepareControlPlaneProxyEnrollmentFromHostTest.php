@@ -118,7 +118,29 @@ function hostPreparedEnrollmentAction(StoreControlPlaneProxyEnrollmentState $sto
     );
 }
 
-it('prepares exact host artifacts through the thin operator boundary without exposing its token', function (): void {
+function hostOptionalArtifactTranscript(?string $bytes = null): string
+{
+    return implode("\n", [
+        '__COOLIFY_CONTROL_PLANE_ARTIFACT_BEGIN__',
+        $bytes === null
+            ? '__COOLIFY_CONTROL_PLANE_ARTIFACT_ABSENT__'
+            : '__COOLIFY_CONTROL_PLANE_ARTIFACT_PRESENT__ '.base64_encode($bytes),
+        '__COOLIFY_CONTROL_PLANE_ARTIFACT_END__',
+    ]);
+}
+
+function hostEnrollmentStateDirectoryTranscript(bool $isPresent = false): string
+{
+    return implode("\n", [
+        '__COOLIFY_CONTROL_PLANE_STATE_DIRECTORY_BEGIN__',
+        $isPresent
+            ? '__COOLIFY_CONTROL_PLANE_STATE_DIRECTORY_PRESENT__'
+            : '__COOLIFY_CONTROL_PLANE_STATE_DIRECTORY_ABSENT__',
+        '__COOLIFY_CONTROL_PLANE_STATE_DIRECTORY_END__',
+    ]);
+}
+
+it('prepares exact host artifacts after an absent state-directory check without exposing its token', function (): void {
     $server = Server::factory()->create([
         'id' => 0,
         'team_id' => Team::factory()->create()->id,
@@ -151,9 +173,12 @@ YAML;
         remoteExecutor: function (string $command) use (&$commands, $sourceCompose): string {
             $commands[] = $command;
 
-            return count($commands) === 1
-                ? $sourceCompose
-                : "__COOLIFY_CONTROL_PLANE_ARTIFACT_ABSENT__\n";
+            return match (true) {
+                str_contains($command, '__COOLIFY_CONTROL_PLANE_STATE_DIRECTORY_') => hostEnrollmentStateDirectoryTranscript(),
+                str_starts_with($command, 'cat -- ') => $sourceCompose,
+                str_contains($command, '__COOLIFY_CONTROL_PLANE_ARTIFACT_') => hostOptionalArtifactTranscript(),
+                default => throw new RuntimeException("Unexpected remote command: {$command}"),
+            };
         },
     );
 
@@ -162,9 +187,159 @@ YAML;
         ->and($state->configurationAcknowledgement)->toStartWith('ack:')
         ->and($state->dynamicPredecessorBytes)->toBeNull()
         ->and($action->commandSignature)->not->toContain('token')
-        ->and($commands)->toHaveCount(2)
+        ->and($commands)->toHaveCount(3)
+        ->and($commands[0])->toContain('__COOLIFY_CONTROL_PLANE_STATE_DIRECTORY_BEGIN__')
+        ->and($commands[1])->toStartWith('cat -- ')
         ->and(implode("\n", $commands))->not->toContain('host-enrollment-token')
         ->and(json_encode($store->read($server)?->toArray(), JSON_THROW_ON_ERROR))->not->toContain('host-enrollment-token');
+});
+
+it('rejects a retained state directory before reading host artifacts for a new reservation', function (): void {
+    $server = Server::factory()->create([
+        'id' => 0,
+        'team_id' => Team::factory()->create()->id,
+        'ip' => 'host.docker.internal',
+    ]);
+    $server->proxy->set('type', ProxyTypes::TRAEFIK->value);
+    $server->proxy->set('last_saved_proxy_configuration', generateDefaultProxyConfiguration($server, save: false));
+    $server->save();
+    $store = new StoreControlPlaneProxyEnrollmentState;
+    $action = hostPreparedEnrollmentAction($store);
+    $commands = [];
+    $remoteExecutor = function (string $command) use (&$commands): string {
+        $commands[] = $command;
+
+        return str_contains($command, '__COOLIFY_CONTROL_PLANE_STATE_DIRECTORY_')
+            ? hostEnrollmentStateDirectoryTranscript(isPresent: true)
+            : throw new RuntimeException("Retained state directory check read host artifacts: {$command}");
+    };
+
+    expect(fn () => $action->handle(
+        server: $server,
+        operationId: 'retained-state-directory-enrollment',
+        token: 'retained-state-directory-token',
+        appPort: 8000,
+        exposure: ControlPlaneProxyExposure::Public,
+        activeBackendDnsNames: ['coolify-web-a'],
+        host: 'dashboard.example.test',
+        expectedRevision: 'revision-42',
+        expectedMember: 'blue',
+        remoteExecutor: $remoteExecutor,
+    ))->toThrow(RuntimeException::class, 'The control-plane enrollment state directory is present without a durable enrollment state.');
+
+    expect($commands)->toHaveCount(1)
+        ->and($commands[0])->toContain('__COOLIFY_CONTROL_PLANE_STATE_DIRECTORY_BEGIN__')
+        ->and($store->read($server))->toBeNull();
+});
+
+it('does not recheck the state directory for an idempotent same-owner replay', function (): void {
+    $server = Server::factory()->create([
+        'id' => 0,
+        'team_id' => Team::factory()->create()->id,
+        'ip' => 'host.docker.internal',
+    ]);
+    $server->proxy->set('type', ProxyTypes::TRAEFIK->value);
+    $server->proxy->set('last_saved_proxy_configuration', generateDefaultProxyConfiguration($server, save: false));
+    $server->save();
+    $store = new StoreControlPlaneProxyEnrollmentState;
+    $action = hostPreparedEnrollmentAction($store);
+    $sourceCompose = <<<'YAML'
+services:
+  coolify:
+    image: coolify:test
+    ports:
+      - "${APP_PORT:-8000}:8080"
+YAML;
+    $commands = [];
+    $stateDirectoryChecks = 0;
+    $remoteExecutor = function (string $command) use (&$commands, &$stateDirectoryChecks, $sourceCompose): string {
+        $commands[] = $command;
+
+        return match (true) {
+            str_contains($command, '__COOLIFY_CONTROL_PLANE_STATE_DIRECTORY_') => ++$stateDirectoryChecks === 1
+                ? hostEnrollmentStateDirectoryTranscript()
+                : hostEnrollmentStateDirectoryTranscript(isPresent: true),
+            str_starts_with($command, 'cat -- ') => $sourceCompose,
+            str_contains($command, '__COOLIFY_CONTROL_PLANE_ARTIFACT_') => hostOptionalArtifactTranscript(),
+            default => throw new RuntimeException("Unexpected remote command: {$command}"),
+        };
+    };
+
+    $first = $action->handle(
+        server: $server,
+        operationId: 'replay-enrollment',
+        token: 'replay-token',
+        appPort: 8000,
+        exposure: ControlPlaneProxyExposure::Public,
+        activeBackendDnsNames: ['coolify-web-a'],
+        host: 'dashboard.example.test',
+        expectedRevision: 'revision-42',
+        expectedMember: 'blue',
+        remoteExecutor: $remoteExecutor,
+    );
+    $replayed = $action->handle(
+        server: $server,
+        operationId: 'replay-enrollment',
+        token: 'replay-token',
+        appPort: 8000,
+        exposure: ControlPlaneProxyExposure::Public,
+        activeBackendDnsNames: ['coolify-web-a'],
+        host: 'dashboard.example.test',
+        expectedRevision: 'revision-42',
+        expectedMember: 'blue',
+        remoteExecutor: $remoteExecutor,
+    );
+
+    expect($stateDirectoryChecks)->toBe(1)
+        ->and($commands)->toHaveCount(5)
+        ->and($replayed->toArray())->toBe($first->toArray());
+});
+
+it('rejects malformed base64 optional artifact transcripts', function (): void {
+    $server = Server::factory()->create([
+        'id' => 0,
+        'team_id' => Team::factory()->create()->id,
+        'ip' => 'host.docker.internal',
+    ]);
+    $server->proxy->set('type', ProxyTypes::TRAEFIK->value);
+    $server->proxy->set('last_saved_proxy_configuration', generateDefaultProxyConfiguration($server, save: false));
+    $server->save();
+    $store = new StoreControlPlaneProxyEnrollmentState;
+    $action = hostPreparedEnrollmentAction($store);
+    $sourceCompose = <<<'YAML'
+services:
+  coolify:
+    image: coolify:test
+    ports:
+      - "${APP_PORT:-8000}:8080"
+YAML;
+    $malformedTranscript = implode("\n", [
+        '__COOLIFY_CONTROL_PLANE_ARTIFACT_BEGIN__',
+        '__COOLIFY_CONTROL_PLANE_ARTIFACT_PRESENT__ invalid*base64',
+        '__COOLIFY_CONTROL_PLANE_ARTIFACT_END__',
+    ]);
+
+    expect(fn () => $action->handle(
+        server: $server,
+        operationId: 'malformed-artifact-enrollment',
+        token: 'malformed-artifact-token',
+        appPort: 8000,
+        exposure: ControlPlaneProxyExposure::Public,
+        activeBackendDnsNames: ['coolify-web-a'],
+        host: 'dashboard.example.test',
+        expectedRevision: 'revision-42',
+        expectedMember: 'blue',
+        remoteExecutor: static function (string $command) use ($sourceCompose, $malformedTranscript): string {
+            return match (true) {
+                str_contains($command, '__COOLIFY_CONTROL_PLANE_STATE_DIRECTORY_') => hostEnrollmentStateDirectoryTranscript(),
+                str_starts_with($command, 'cat -- ') => $sourceCompose,
+                str_contains($command, '__COOLIFY_CONTROL_PLANE_ARTIFACT_') => $malformedTranscript,
+                default => throw new RuntimeException("Unexpected remote command: {$command}"),
+            };
+        },
+    ))->toThrow(RuntimeException::class, 'The existing managed Traefik document inspection was malformed.');
+
+    expect($store->read($server))->toBeNull();
 });
 
 it('reconciles an exact rolled-back owner before reserving a replacement from host artifacts', function (): void {
@@ -204,8 +379,9 @@ YAML;
 
             return match (true) {
                 str_contains($command, ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_PENDING_OUTPUT) => ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT,
+                str_contains($command, '__COOLIFY_CONTROL_PLANE_STATE_DIRECTORY_') => hostEnrollmentStateDirectoryTranscript(),
                 str_starts_with($command, 'cat -- ') => $sourceCompose,
-                str_contains($command, '__COOLIFY_CONTROL_PLANE_ARTIFACT_') => "__COOLIFY_CONTROL_PLANE_ARTIFACT_ABSENT__\n",
+                str_contains($command, '__COOLIFY_CONTROL_PLANE_ARTIFACT_') => hostOptionalArtifactTranscript(),
                 default => throw new RuntimeException("Unexpected remote command: {$command}"),
             };
         },
@@ -214,19 +390,24 @@ YAML;
     $finalizationIndex = collect($commands)->search(
         fn (string $command): bool => str_contains($command, ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT),
     );
+    $stateDirectoryInspectionIndex = collect($commands)->search(
+        fn (string $command): bool => str_contains($command, '__COOLIFY_CONTROL_PLANE_STATE_DIRECTORY_BEGIN__'),
+    );
     $sourceReadIndex = collect($commands)->search(fn (string $command): bool => str_starts_with($command, 'cat -- '));
 
     expect($finalizationIndex)->toBeInt()
+        ->and($stateDirectoryInspectionIndex)->toBeInt()
         ->and($sourceReadIndex)->toBeInt()
-        ->and($finalizationIndex)->toBeLessThan($sourceReadIndex)
-        ->and($commands)->toHaveCount(3)
+        ->and($finalizationIndex)->toBeLessThan($stateDirectoryInspectionIndex)
+        ->and($stateDirectoryInspectionIndex)->toBeLessThan($sourceReadIndex)
+        ->and($commands)->toHaveCount(4)
         ->and(implode("\n", $commands))->not->toContain(InspectControlPlaneEnrollmentWriter::TRANSCRIPT_BEGIN)
         ->and($state->operationId)->toBe('replacement-enrollment')
         ->and($state->phase)->toBe(ControlPlaneProxyEnrollmentPhase::Preparing)
         ->and($store->read($server)?->operationId)->toBe('replacement-enrollment');
 });
 
-it('preserves the reconciliation transport budget before using the host artifact budget', function (): void {
+it('preserves the reconciliation transport budget and terminal-LF dynamic artifact', function (): void {
     Storage::fake('ssh-keys');
     $team = Team::factory()->create();
     $privateKey = PrivateKey::factory()->create(['team_id' => $team->id]);
@@ -251,22 +432,28 @@ services:
       - "${APP_PORT:-8000}:8080"
 YAML;
     $timeouts = [];
-    Process::fake(function (PendingProcess $process) use (&$timeouts, $sourceCompose): FakeProcessResult {
+    $commands = [];
+    $existingDynamicYaml = "http:\n  routers: {}\n";
+    Process::fake(function (PendingProcess $process) use (&$timeouts, &$commands, $sourceCompose, $existingDynamicYaml): FakeProcessResult {
         $timeouts[] = $process->timeout;
+        $commands[] = $process->command;
 
         return match (true) {
             str_contains($process->command, ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_PENDING_OUTPUT) => Process::result(
                 output: ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT,
             ),
+            str_contains($process->command, '__COOLIFY_CONTROL_PLANE_STATE_DIRECTORY_') => Process::result(
+                output: hostEnrollmentStateDirectoryTranscript(),
+            ),
             str_contains($process->command, '__COOLIFY_CONTROL_PLANE_ARTIFACT_') => Process::result(
-                output: "__COOLIFY_CONTROL_PLANE_ARTIFACT_ABSENT__\n",
+                output: hostOptionalArtifactTranscript($existingDynamicYaml),
             ),
             str_contains($process->command, 'cat -- ') => Process::result(output: $sourceCompose),
             default => throw new RuntimeException("Unexpected remote command: {$process->command}"),
         };
     });
 
-    hostPreparedEnrollmentAction(new StoreControlPlaneProxyEnrollmentState)->handle(
+    $state = hostPreparedEnrollmentAction(new StoreControlPlaneProxyEnrollmentState)->handle(
         server: $server,
         operationId: 'replacement-enrollment',
         token: 'replacement-token',
@@ -278,7 +465,12 @@ YAML;
         expectedMember: 'blue',
     );
 
-    expect($timeouts)->toBe([120, 30, 30]);
+    expect($timeouts)->toBe([120, 30, 30, 30])
+        ->and($state->dynamicPredecessorBytes)->toBe($existingDynamicYaml)
+        ->and(implode("\n", $commands))->toContain('base64 <')
+        ->toContain('__COOLIFY_CONTROL_PLANE_ARTIFACT_BEGIN__')
+        ->toContain('__COOLIFY_CONTROL_PLANE_ARTIFACT_PRESENT__')
+        ->toContain('__COOLIFY_CONTROL_PLANE_ARTIFACT_END__');
 });
 
 it('holds the enrollment operation fence through reconciliation and replacement reservation', function (): void {
@@ -327,8 +519,9 @@ it('holds the enrollment operation fence through reconciliation and replacement 
 
                 return match (true) {
                     str_contains($command, ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_PENDING_OUTPUT) => ManagedTraefikDocumentWriter::ENROLLMENT_ROLLBACK_FINALIZED_OUTPUT,
+                    str_contains($command, '__COOLIFY_CONTROL_PLANE_STATE_DIRECTORY_') => hostEnrollmentStateDirectoryTranscript(),
                     str_starts_with($command, 'cat -- ') => $sourceCompose,
-                    str_contains($command, '__COOLIFY_CONTROL_PLANE_ARTIFACT_') => "__COOLIFY_CONTROL_PLANE_ARTIFACT_ABSENT__\n",
+                    str_contains($command, '__COOLIFY_CONTROL_PLANE_ARTIFACT_') => hostOptionalArtifactTranscript(),
                     str_contains($command, NormalizeControlPlaneEnrollmentFilesystem::NORMALIZED_OUTPUT) => throw new RuntimeException('nested activation reached'),
                     default => throw new RuntimeException("Unexpected remote command: {$command}"),
                 };

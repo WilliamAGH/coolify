@@ -13,9 +13,23 @@ final class PrepareControlPlaneProxyEnrollmentFromHost
 {
     use AsAction;
 
+    private const MAXIMUM_OPTIONAL_ARTIFACT_BYTES = 1_048_576;
+
+    private const ARTIFACT_TRANSCRIPT_BEGIN = '__COOLIFY_CONTROL_PLANE_ARTIFACT_BEGIN__';
+
     private const ABSENT_ARTIFACT = '__COOLIFY_CONTROL_PLANE_ARTIFACT_ABSENT__';
 
     private const PRESENT_ARTIFACT = '__COOLIFY_CONTROL_PLANE_ARTIFACT_PRESENT__';
+
+    private const ARTIFACT_TRANSCRIPT_END = '__COOLIFY_CONTROL_PLANE_ARTIFACT_END__';
+
+    private const STATE_DIRECTORY_TRANSCRIPT_BEGIN = '__COOLIFY_CONTROL_PLANE_STATE_DIRECTORY_BEGIN__';
+
+    private const STATE_DIRECTORY_ABSENT = '__COOLIFY_CONTROL_PLANE_STATE_DIRECTORY_ABSENT__';
+
+    private const STATE_DIRECTORY_PRESENT = '__COOLIFY_CONTROL_PLANE_STATE_DIRECTORY_PRESENT__';
+
+    private const STATE_DIRECTORY_TRANSCRIPT_END = '__COOLIFY_CONTROL_PLANE_STATE_DIRECTORY_END__';
 
     public string $commandSignature = 'control-plane:proxy-enrollment:prepare
         {server_id : Local Coolify server ID}
@@ -87,14 +101,20 @@ final class PrepareControlPlaneProxyEnrollmentFromHost
                 if ($existingState?->phase === ControlPlaneProxyEnrollmentPhase::RolledBack) {
                     $this->rolledBackReconciler->handle($server, $existingState, $remoteExecutor);
                     $this->stateStore->clearRolledBackIfUnchanged($server, $existingState);
+                    $existingState = null;
+                }
+                $proxyPath = rtrim((string) $server->proxyPath(), '/');
+                if ($existingState === null) {
+                    $this->assertEnrollmentStateDirectoryAbsent(
+                        $execute($this->stateDirectoryInspectionCommand($proxyPath.'/.control-plane-managed-traefik')),
+                    );
                 }
                 $sourceComposeYaml = $execute('cat -- '.escapeshellarg($this->sourceProductionComposePath));
                 if (! is_string($sourceComposeYaml) || $sourceComposeYaml === '') {
                     throw new RuntimeException('The canonical Coolify production Compose could not be read.');
                 }
 
-                $dynamicPath = rtrim((string) $server->proxyPath(), '/')
-                    .'/dynamic/'.ControlPlaneDynamicConfiguration::MANAGED_FILENAME;
+                $dynamicPath = $proxyPath.'/dynamic/'.ControlPlaneDynamicConfiguration::MANAGED_FILENAME;
                 $existingDynamicYaml = $this->decodeOptionalArtifact($execute($this->optionalArtifactCommand($dynamicPath)));
                 $configurationAcknowledgement = 'ack:'.hash('sha256', json_encode([
                     'operation_id' => $operationId,
@@ -173,10 +193,27 @@ final class PrepareControlPlaneProxyEnrollmentFromHost
     {
         $path = escapeshellarg($path);
 
-        return 'if [ -e '.$path.' ] || [ -L '.$path.' ]; then '
-            .'test -f '.$path.' && test ! -L '.$path.' || exit 1; '
-            .'printf '.escapeshellarg(self::PRESENT_ARTIFACT."\n").'; cat -- '.$path.'; '
-            .'else printf '.escapeshellarg(self::ABSENT_ARTIFACT."\n").'; fi';
+        return implode("\n", [
+            'set -eu',
+            'artifact_path='.$path,
+            'maximum_artifact_bytes='.escapeshellarg((string) self::MAXIMUM_OPTIONAL_ARTIFACT_BYTES),
+            'transcript_begin='.escapeshellarg(self::ARTIFACT_TRANSCRIPT_BEGIN),
+            'transcript_absent='.escapeshellarg(self::ABSENT_ARTIFACT),
+            'transcript_present='.escapeshellarg(self::PRESENT_ARTIFACT),
+            'transcript_end='.escapeshellarg(self::ARTIFACT_TRANSCRIPT_END),
+            'if [ ! -e "$artifact_path" ] && [ ! -L "$artifact_path" ]; then',
+            '  printf "%s\\n%s\\n%s" "$transcript_begin" "$transcript_absent" "$transcript_end"',
+            '  exit 0',
+            'fi',
+            'test -f "$artifact_path" && test ! -L "$artifact_path" || exit 1',
+            'artifact_size=$(wc -c < "$artifact_path") || exit 1',
+            'artifact_size=$(printf %s "$artifact_size" | tr -d "[:space:]") || exit 1',
+            'case "$artifact_size" in ""|*[!0-9]*) exit 1 ;; esac',
+            '[ "$artifact_size" -gt 0 ] && [ "$artifact_size" -le "$maximum_artifact_bytes" ] || exit 1',
+            'artifact_base64=$(base64 < "$artifact_path") || exit 1',
+            'artifact_base64=$(printf %s "$artifact_base64" | tr -d "\\n") || exit 1',
+            'printf "%s\\n%s %s\\n%s" "$transcript_begin" "$transcript_present" "$artifact_base64" "$transcript_end"',
+        ]);
     }
 
     private function decodeOptionalArtifact(?string $output): ?string
@@ -184,18 +221,80 @@ final class PrepareControlPlaneProxyEnrollmentFromHost
         if (! is_string($output)) {
             throw new RuntimeException('The existing managed Traefik document could not be inspected.');
         }
-        if ($output === self::ABSENT_ARTIFACT."\n" || $output === self::ABSENT_ARTIFACT) {
-            return null;
-        }
-        $prefix = self::PRESENT_ARTIFACT."\n";
-        if (! str_starts_with($output, $prefix)) {
+        $lines = explode("\n", $output);
+        if (count($lines) !== 3
+            || $lines[0] !== self::ARTIFACT_TRANSCRIPT_BEGIN
+            || $lines[2] !== self::ARTIFACT_TRANSCRIPT_END) {
             throw new RuntimeException('The existing managed Traefik document inspection was malformed.');
         }
-        $artifact = substr($output, strlen($prefix));
-        if ($artifact === '') {
-            throw new RuntimeException('The existing managed Traefik document is empty.');
+        if ($lines[1] === self::ABSENT_ARTIFACT) {
+            return null;
+        }
+        $prefix = self::PRESENT_ARTIFACT.' ';
+        if (! str_starts_with($lines[1], $prefix)) {
+            throw new RuntimeException('The existing managed Traefik document inspection was malformed.');
+        }
+        $encoded = substr($lines[1], strlen($prefix));
+        if ($encoded === ''
+            || strlen($encoded) > 4 * intdiv(self::MAXIMUM_OPTIONAL_ARTIFACT_BYTES + 2, 3)
+            || preg_match('/\A[A-Za-z0-9+\\/]+={0,2}\z/D', $encoded) !== 1) {
+            throw new RuntimeException('The existing managed Traefik document inspection was malformed.');
+        }
+        $artifact = base64_decode($encoded, true);
+        if (! is_string($artifact)
+            || $artifact === ''
+            || strlen($artifact) > self::MAXIMUM_OPTIONAL_ARTIFACT_BYTES
+            || ! hash_equals(base64_encode($artifact), $encoded)) {
+            throw new RuntimeException('The existing managed Traefik document inspection was malformed.');
         }
 
         return $artifact;
+    }
+
+    private function stateDirectoryInspectionCommand(string $stateDirectory): string
+    {
+        $stateDirectory = escapeshellarg($stateDirectory);
+
+        return implode("\n", [
+            'set -eu',
+            'state_directory='.$stateDirectory,
+            'transcript_begin='.escapeshellarg(self::STATE_DIRECTORY_TRANSCRIPT_BEGIN),
+            'transcript_absent='.escapeshellarg(self::STATE_DIRECTORY_ABSENT),
+            'transcript_present='.escapeshellarg(self::STATE_DIRECTORY_PRESENT),
+            'transcript_end='.escapeshellarg(self::STATE_DIRECTORY_TRANSCRIPT_END),
+            'if [ ! -e "$state_directory" ] && [ ! -L "$state_directory" ]; then',
+            '  printf "%s\\n%s\\n%s" "$transcript_begin" "$transcript_absent" "$transcript_end"',
+            'elif [ -d "$state_directory" ] && [ ! -L "$state_directory" ]; then',
+            '  printf "%s\\n%s\\n%s" "$transcript_begin" "$transcript_present" "$transcript_end"',
+            'else',
+            '  exit 1',
+            'fi',
+        ]);
+    }
+
+    private function assertEnrollmentStateDirectoryAbsent(?string $output): void
+    {
+        $absentTranscript = implode("\n", [
+            self::STATE_DIRECTORY_TRANSCRIPT_BEGIN,
+            self::STATE_DIRECTORY_ABSENT,
+            self::STATE_DIRECTORY_TRANSCRIPT_END,
+        ]);
+        $presentTranscript = implode("\n", [
+            self::STATE_DIRECTORY_TRANSCRIPT_BEGIN,
+            self::STATE_DIRECTORY_PRESENT,
+            self::STATE_DIRECTORY_TRANSCRIPT_END,
+        ]);
+        if (! is_string($output)
+            || strlen($output) > max(strlen($absentTranscript), strlen($presentTranscript))) {
+            throw new RuntimeException('The control-plane enrollment state directory inspection was malformed.');
+        }
+        if (hash_equals($absentTranscript, $output)) {
+            return;
+        }
+        if (hash_equals($presentTranscript, $output)) {
+            throw new RuntimeException('The control-plane enrollment state directory is present without a durable enrollment state.');
+        }
+
+        throw new RuntimeException('The control-plane enrollment state directory inspection was malformed.');
     }
 }
