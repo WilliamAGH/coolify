@@ -13,9 +13,11 @@ All notable changes to this project will be documented in this file.
 - *(proxy)* Preserve configured health identity semantics
 - *(proxy)* Serialize generic control-plane routes
 - *(proxy)* Preserve exact enrollment artifacts
+- *(proxy)* Supersede orphaned enrollment authority
 
 ### 📚 Documentation
 
+- Update changelog
 - Update changelog
 - Update changelog
 
