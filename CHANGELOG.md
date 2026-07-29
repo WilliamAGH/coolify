@@ -11,9 +11,12 @@ All notable changes to this project will be documented in this file.
 ### 🐛 Bug Fixes
 
 - *(proxy)* Preserve configured health identity semantics
+- *(proxy)* Serialize generic control-plane routes
+- *(proxy)* Preserve exact enrollment artifacts
 
 ### 📚 Documentation
 
+- Update changelog
 - Update changelog
 
 ## [4.13.39-fork] - 2026-07-29
