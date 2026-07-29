@@ -3,6 +3,7 @@
 namespace App\Models;
 
 use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
+use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentPhase;
 use App\Actions\Proxy\ControlPlane\ControlPlaneProxyEnrollmentState;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
@@ -696,7 +697,23 @@ class Server extends BaseModel
 
     public function setupDynamicProxyConfiguration()
     {
-        $enrollment = $this->controlPlaneProxyEnrollmentState();
+        try {
+            $enrollment = $this->controlPlaneProxyEnrollmentState();
+        } catch (\Throwable $exception) {
+            if ($this->hasManagedControlPlaneTraefikArtifacts()) {
+                throw new \RuntimeException(
+                    'Managed control-plane Traefik artifacts exist but the durable enrollment state is malformed; operator recovery is required before generic proxy configuration can run.',
+                    previous: $exception,
+                );
+            }
+
+            throw $exception;
+        }
+        if ($enrollment === null && $this->hasManagedControlPlaneTraefikArtifacts()) {
+            throw new \RuntimeException(
+                'Managed control-plane Traefik artifacts exist but the durable enrollment state is missing; operator recovery is required before generic proxy configuration can run.',
+            );
+        }
         if ($enrollment !== null && $enrollment->phase !== ControlPlaneProxyEnrollmentPhase::RolledBack) {
             return;
         }
@@ -892,6 +909,41 @@ $schema://$host {
         }
 
         return ControlPlaneProxyEnrollmentState::fromArray($state);
+    }
+
+    private function hasManagedControlPlaneTraefikArtifacts(): bool
+    {
+        if ($this->proxyType() !== ProxyTypes::TRAEFIK->value) {
+            return false;
+        }
+
+        $managedStateDirectory = rtrim($this->proxyPath(), '/').'/.control-plane-managed-traefik';
+        $managedFilename = ControlPlaneDynamicConfiguration::MANAGED_FILENAME;
+        $artifacts = [
+            $managedStateDirectory.'/.'.$managedFilename.'.state.json',
+            $managedStateDirectory.'/.'.$managedFilename.'.writer-authority.json',
+        ];
+        $inspection = null;
+        try {
+            $inspection = instant_remote_process([
+                'for path in '.implode(' ', array_map('escapeshellarg', $artifacts)).'; do '
+                    .'if [ -e "$path" ] || [ -L "$path" ]; then printf present; exit 0; fi; '
+                    .'done; printf absent',
+            ], $this, timeout: 10, retry: false);
+        } catch (\Throwable $exception) {
+            throw new \RuntimeException(
+                'Managed control-plane Traefik artifacts could not be safely inspected; operator recovery is required before generic proxy configuration can run.',
+                previous: $exception,
+            );
+        }
+
+        return match ($inspection) {
+            'present' => true,
+            'absent' => false,
+            default => throw new \RuntimeException(
+                'Managed control-plane Traefik artifact inspection was invalid; operator recovery is required before generic proxy configuration can run.',
+            ),
+        };
     }
 
     public function reloadCaddy()

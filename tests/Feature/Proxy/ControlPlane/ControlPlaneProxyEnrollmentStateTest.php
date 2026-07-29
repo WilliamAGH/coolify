@@ -7,13 +7,20 @@ use App\Actions\Proxy\ControlPlane\ControlPlaneProxyExposure;
 use App\Actions\Proxy\ControlPlane\ControlPlaneStaticProxyConfiguration;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneGenerationPromotionState;
 use App\Actions\Proxy\ControlPlane\StoreControlPlaneProxyEnrollmentState;
+use App\Models\PrivateKey;
 use App\Models\Server;
 use App\Models\Team;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Facades\Storage;
 use Symfony\Component\Yaml\Yaml;
 
 uses(RefreshDatabase::class);
+
+beforeEach(function (): void {
+    Storage::fake('ssh-keys');
+    config(['constants.ssh.mux_enabled' => false]);
+});
 
 function controlPlaneEnrollmentState(Server $server, string $operationId = 'enrollment-op', string $token = 'secret-token'): ControlPlaneProxyEnrollmentState
 {
@@ -145,6 +152,33 @@ it('freezes the canonical dynamic owner and preserves the managed static listene
         ->and(data_get(Yaml::parse($active), 'services.traefik.ports'))->toContain('8000:8000');
     Process::assertNothingRan();
 });
+
+it('preserves managed Traefik artifacts when durable enrollment state is unavailable', function (mixed $storedState): void {
+    $team = Team::factory()->create();
+    $privateKey = PrivateKey::factory()->create(['team_id' => $team->id]);
+    $server = Server::factory()->create([
+        'team_id' => $team->id,
+        'private_key_id' => $privateKey->id,
+    ]);
+    $server->proxy->set('type', 'TRAEFIK');
+    if ($storedState !== null) {
+        $server->proxy->set(StoreControlPlaneProxyEnrollmentState::STATE_KEY, $storedState);
+    }
+    $server->save();
+
+    Process::fake([
+        '*' => Process::result(output: 'present'),
+    ]);
+
+    expect(fn () => $server->fresh()->setupDynamicProxyConfiguration())
+        ->toThrow(RuntimeException::class, 'Managed control-plane Traefik artifacts exist');
+
+    Process::assertRan(fn ($process): bool => str_contains((string) $process->command, '.control-plane-managed-traefik'));
+    Process::assertNotRan(fn ($process): bool => str_contains((string) $process->command, 'tee '));
+})->with([
+    'missing enrollment state' => [null],
+    'malformed enrollment state' => ['not-an-enrollment-array'],
+]);
 
 it('rejects foreign owners, stale phases, invalid transitions, and corrupted artifacts', function () {
     $team = Team::factory()->create();
