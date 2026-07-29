@@ -2,21 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
-## [unreleased]
+## [4.13.39-fork] - 2026-07-29
 
 ### 🐛 Bug Fixes
 
 - *(blue-green)* Accept canonical journal boot UUIDs
 - *(proxy)* Preserve managed control-plane routes
+- *(proxy)* Prove replacement enrollment candidates
 
 ### 📚 Documentation
 
+- Update changelog
 - Update changelog
 - Update changelog
 
 ### 🧪 Testing
 
 - *(blue-green)* Execute journal provenance gate
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.39-fork
 
 ## [4.13.38-fork] - 2026-07-28
 
