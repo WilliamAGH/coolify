@@ -7,9 +7,11 @@ All notable changes to this project will be documented in this file.
 ### 🐛 Bug Fixes
 
 - *(blue-green)* Auto-recover intervention_required at deployment start
+- *(storage)* Trust a writable SSH key root
 
 ### 📚 Documentation
 
+- Update changelog
 - Update changelog
 
 ## [4.13.44-fork] - 2026-07-29
