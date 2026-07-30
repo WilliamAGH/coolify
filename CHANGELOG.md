@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file.
 
 ### 🐛 Bug Fixes
 
+- *(blue-green)* Prove rollback-restored routes despite advanced fence counters
+
+### 📚 Documentation
+
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.46-fork
+
+## [4.13.45-fork] - 2026-07-29
+
+### 🐛 Bug Fixes
+
 - *(blue-green)* Auto-recover intervention_required at deployment start
 - *(storage)* Trust a writable SSH key root
 
