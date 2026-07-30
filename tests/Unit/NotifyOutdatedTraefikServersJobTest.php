@@ -1,11 +1,14 @@
 <?php
 
-use App\Jobs\NotifyOutdatedTraefikServersJob;
+use App\Jobs\CheckTraefikVersionForServerJob;
+use App\Jobs\CheckTraefikVersionJob;
+use App\Models\Server;
 
 it('has correct queue and retry configuration', function () {
-    $job = new NotifyOutdatedTraefikServersJob;
+    $job = new CheckTraefikVersionJob;
 
     expect($job->tries)->toBe(3);
+    expect((new CheckTraefikVersionForServerJob(Mockery::mock(Server::class), []))->tries)->toBe(3);
 });
 
 it('handles servers with null traefik_outdated_info gracefully', function () {

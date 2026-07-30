@@ -98,8 +98,11 @@ describe('executeInDocker git log escaping', function () {
         $command = 'cd /workdir && git log -1 '.escapeshellarg($maliciousCommit).' --pretty=%B';
         $result = executeInDocker('test-container', $command);
 
-        // The malicious payload must not be able to break out of quoting
-        expect($result)->not->toContain('id;');
+        // The malicious payload must not be able to break out of quoting: the whole
+        // command must round-trip through the documented bash -c quoting exactly, so
+        // the payload's quote is always escaped and stays inside quoted context.
+        $expected = "docker exec test-container bash -c '".str_replace("'", "'\\''", $command)."'";
+        expect($result)->toBe($expected);
         expect($result)->toContain("'HEAD'\\''");
     });
 });
@@ -119,7 +122,9 @@ describe('buildGitCheckoutCommand escaping', function () {
         expect($result)->toContain("git checkout 'abc123'");
 
         $result = $method->invoke($app, "abc'; id; #");
-        expect($result)->not->toContain('id;');
+        // The payload's quote must be escaped ('\''), keeping "; id; #" inside the
+        // single-quoted checkout target instead of terminating it.
+        expect($result)->toContain("git checkout 'abc'\\''; id; #'");
         expect($result)->toContain("git checkout 'abc'");
     });
 });

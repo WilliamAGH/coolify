@@ -22,27 +22,18 @@ it('implements service multi-container aggregation in SSH path', function () {
         ->toContain('private function aggregateServiceContainerStatuses($services)')
         ->toContain('$this->aggregateServiceContainerStatuses($services);');
 
-    // Verify service aggregation uses same logic as applications
+    // Verify service aggregation delegates to the canonical aggregator
     expect($actionFile)
-        ->toContain('$hasUnknown = false;');
+        ->toContain('$aggregator = new ContainerStatusAggregator;');
 });
 
 it('services use same priority as applications in SSH path', function () {
     $actionFile = file_get_contents(__DIR__.'/../../app/Actions/Docker/GetContainersStatus.php');
 
-    // Both aggregation methods should use the same priority logic
-    $priorityLogic = <<<'PHP'
-                if ($hasUnhealthy) {
-                    $aggregatedStatus = 'running (unhealthy)';
-                } elseif ($hasUnknown) {
-                    $aggregatedStatus = 'running (unknown)';
-                } else {
-                    $aggregatedStatus = 'running (healthy)';
-                }
-PHP;
-
-    // Should appear in service aggregation
-    expect($actionFile)->toContain($priorityLogic);
+    // Application and service aggregation must both delegate to ContainerStatusAggregator,
+    // which owns the shared priority state machine.
+    expect(substr_count($actionFile, '$aggregator = new ContainerStatusAggregator;'))->toBeGreaterThanOrEqual(2);
+    expect(substr_count($actionFile, '$aggregator->aggregateFromStrings($relevantStatuses'))->toBeGreaterThanOrEqual(2);
 });
 
 it('collects service containers before aggregating in SSH path', function () {
@@ -63,17 +54,17 @@ it('SSH and Sentinel paths use identical service aggregation logic', function ()
     $jobFile = file_get_contents(__DIR__.'/../../app/Jobs/PushServerUpdateJob.php');
     $actionFile = file_get_contents(__DIR__.'/../../app/Actions/Docker/GetContainersStatus.php');
 
-    // Both should track the same status flags
-    expect($jobFile)->toContain('$hasUnknown = false;');
-    expect($actionFile)->toContain('$hasUnknown = false;');
+    // Both must delegate the priority state machine to the canonical aggregator
+    expect($jobFile)->toContain('$aggregator = new ContainerStatusAggregator;');
+    expect($actionFile)->toContain('$aggregator = new ContainerStatusAggregator;');
 
-    // Both should check for unknown status
-    expect($jobFile)->toContain('if (str($status)->contains(\'unknown\')) {');
-    expect($actionFile)->toContain('if (str($status)->contains(\'unknown\')) {');
+    // Both must aggregate the filtered (non-excluded) container statuses
+    expect($jobFile)->toContain('$aggregator->aggregateFromStrings($relevantStatuses');
+    expect($actionFile)->toContain('$aggregator->aggregateFromStrings($relevantStatuses');
 
-    // Both should have elseif for unknown priority
-    expect($jobFile)->toContain('} elseif ($hasUnknown) {');
-    expect($actionFile)->toContain('} elseif ($hasUnknown) {');
+    // Both must preserve "Restarting" for individual sub-resources
+    expect($jobFile)->toContain('preserveRestarting: true');
+    expect($actionFile)->toContain('preserveRestarting: true');
 });
 
 it('handles service status updates consistently', function () {
@@ -84,7 +75,7 @@ it('handles service status updates consistently', function () {
     expect($jobFile)->toContain('[$serviceId, $subType, $subId] = explode(\':\', $key);');
     expect($actionFile)->toContain('[$serviceId, $subType, $subId] = explode(\':\', $key);');
 
-    // Both should handle excluded containers
-    expect($jobFile)->toContain('$excludedContainers = collect();');
-    expect($actionFile)->toContain('$excludedContainers = collect();');
+    // Both should handle excluded containers through the shared compose-derived exclusion list
+    expect($jobFile)->toContain('$excludedContainers = $this->getExcludedContainersFromDockerCompose($dockerComposeRaw);');
+    expect($actionFile)->toContain('$excludedContainers = $this->getExcludedContainersFromDockerCompose($dockerComposeRaw);');
 });

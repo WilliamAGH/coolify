@@ -170,6 +170,7 @@ function applicationValidationRequiredEnvironment(string $eventName, string $sou
         'SOURCE_IDENTITY_RESULT' => 'success',
         'VALIDATION_SOURCE_SHA' => $sourceSha,
         'TESTING_HOST_RUNTIME_RESULT' => $eventName === 'pull_request' || $sourceSha !== '' ? 'success' : 'skipped',
+        'UNIT_SUITE_RESULT' => 'success',
         'WORKFLOW_RESULT' => 'success',
     ];
 }
@@ -222,6 +223,7 @@ function applicationValidationGenericResultFailures(): array
         'NODE_RESULT',
         'PHP_RESULT',
         'SOURCE_IDENTITY_RESULT',
+        'UNIT_SUITE_RESULT',
         'WORKFLOW_RESULT',
     ] as $variable) {
         foreach (['failure', 'skipped', 'cancelled'] as $result) {
@@ -249,6 +251,7 @@ function applicationValidationMissingOrEmptyEnvironmentCases(): array
         'PHP_RESULT',
         'SOURCE_IDENTITY_RESULT',
         'TESTING_HOST_RUNTIME_RESULT',
+        'UNIT_SUITE_RESULT',
         'WORKFLOW_RESULT',
     ] as $variable) {
         foreach (['missing', 'empty'] as $state) {
@@ -653,6 +656,7 @@ it('keeps the aggregate contract structurally connected to every selected result
             'node',
             'source-identity',
             'testing-host-runtime',
+            'unit-suite',
             'workflow-and-shell',
         ])
         ->and($step['shell'] ?? null)->toBe('bash')
@@ -667,6 +671,7 @@ it('keeps the aggregate contract structurally connected to every selected result
             'SOURCE_IDENTITY_RESULT' => '${{ needs.source-identity.result }}',
             'VALIDATION_SOURCE_SHA' => '${{ inputs.source_sha }}',
             'TESTING_HOST_RUNTIME_RESULT' => '${{ needs.testing-host-runtime.result }}',
+            'UNIT_SUITE_RESULT' => '${{ needs.unit-suite.result }}',
             'WORKFLOW_RESULT' => '${{ needs.workflow-and-shell.result }}',
         ])
         ->and((string) ($phpStep['run'] ?? ''))

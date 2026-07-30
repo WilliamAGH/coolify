@@ -19,13 +19,19 @@ function snapshotTestApplication(array $attributes = []): Application
     $project = Project::factory()->create(['team_id' => $team->id]);
     $environment = Environment::factory()->create(['project_id' => $project->id]);
 
-    return Application::factory()->create(array_merge([
+    $application = Application::factory()->create(array_merge([
         'environment_id' => $environment->id,
         'status' => 'running:healthy',
         'fqdn' => 'https://example.com',
         'build_command' => 'npm run build',
         'start_command' => 'npm run start',
     ], $attributes));
+
+    // These fixtures have no standalone Docker destination, so keep them opted
+    // out of blue-green: otherwise eligibility-affecting updates fail closed.
+    $application->settings->update(['is_blue_green_deployment_enabled' => false]);
+
+    return $application->refresh();
 }
 
 function markSnapshotTestApplicationDeployed(Application $application): ApplicationDeploymentQueue

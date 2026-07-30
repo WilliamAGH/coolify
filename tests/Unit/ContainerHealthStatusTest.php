@@ -178,15 +178,15 @@ it('preserves unknown health state in ContainerStatusAggregator aggregated statu
 it('preserves unknown health state in Service model aggregation', function () {
     $serviceFile = file_get_contents(__DIR__.'/../../app/Models/Service.php');
 
-    // Verify unknown is handled correctly
+    // The Service model delegates aggregation to the canonical ContainerStatusAggregator,
+    // which owns the unknown-health preservation (asserted above via 'running:unknown').
     expect($serviceFile)
-        ->toContain("} elseif (\$health->value() === 'unknown') {")
-        ->toContain("if (\$aggregateHealth !== 'unhealthy') {")
-        ->toContain("\$aggregateHealth = 'unknown';");
+        ->toContain('$aggregator = new ContainerStatusAggregator;')
+        ->toContain('$aggregatedStatus = $aggregator->aggregateFromStrings($statusStrings);');
 
-    // The pattern should appear at least once (Service model has different aggregation logic than ContainerStatusAggregator)
-    $unknownCount = substr_count($serviceFile, "} elseif (\$health->value() === 'unknown') {");
-    expect($unknownCount)->toBeGreaterThan(0);
+    // The parsed health component must flow back out of the aggregated "status:health" string
+    expect($serviceFile)
+        ->toContain("\$health = \$parts[1] ?? null;");
 });
 
 it('handles starting state (created/starting) in GetContainersStatus', function () {
@@ -285,19 +285,21 @@ it('handles edge case states in ContainerStatusAggregator aggregation', function
 });
 
 it('handles edge case states in Service model', function () {
+    // Edge-state handling moved to the canonical ContainerStatusAggregator; the
+    // Service model reaches it through aggregateResourceStatuses().
     $serviceFile = file_get_contents(__DIR__.'/../../app/Models/Service.php');
+    expect($serviceFile)->toContain('$aggregator = new ContainerStatusAggregator;');
+
+    $aggregatorFile = file_get_contents(__DIR__.'/../../app/Services/ContainerStatusAggregator.php');
 
     // Check for created/starting handling pattern
-    $createdStartingCount = substr_count($serviceFile, "\$status->startsWith('created') || \$status->startsWith('starting')");
-    expect($createdStartingCount)->toBeGreaterThan(0, 'created/starting handling should exist');
+    expect($aggregatorFile)->toContain("str(\$status)->contains('created') || str(\$status)->contains('starting')");
 
     // Check for paused handling pattern
-    $pausedCount = substr_count($serviceFile, "\$status->startsWith('paused')");
-    expect($pausedCount)->toBeGreaterThan(0, 'paused handling should exist');
+    expect($aggregatorFile)->toContain("str(\$status)->contains('paused')");
 
     // Check for dead/removing handling pattern
-    $deadRemovingCount = substr_count($serviceFile, "\$status->startsWith('dead') || \$status->startsWith('removing')");
-    expect($deadRemovingCount)->toBeGreaterThan(0, 'dead/removing handling should exist');
+    expect($aggregatorFile)->toContain("str(\$status)->contains('dead') || str(\$status)->contains('removing')");
 });
 
 it('appends :excluded suffix to excluded container statuses in GetContainersStatus', function () {

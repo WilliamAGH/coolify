@@ -3,6 +3,9 @@
 use App\Models\Application;
 use Illuminate\Support\Facades\DB;
 use Symfony\Component\Yaml\Yaml;
+use Tests\TestCase;
+
+uses(TestCase::class);
 
 /**
  * Integration test to verify docker_compose_raw remains clean after parsing

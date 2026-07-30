@@ -44,16 +44,26 @@ it('normalizes environment variable keys before storing them on the model', func
     expect($env->key)->toBe('node.name');
 });
 
-it('allows Docker-compatible environment variable keys on the model', function (string $key) {
+it('allows valid environment variable keys on the model', function (string $key) {
     $env = new EnvironmentVariable;
     $env->key = $key;
 
     expect($env->key)->toBe($key);
 })->with([
-    'starts with digit' => '1BAD',
-    'hyphen' => 'BAD-KEY',
     'dot' => 'node.name',
     'uppercase dots' => 'XPACK.SECURITY.ENABLED',
+    'leading underscore' => '_PRIVATE_KEY',
+]);
+
+it('rejects environment variable keys outside the strict key pattern', function (string $key) {
+    $env = new EnvironmentVariable;
+
+    expect(function () use ($env, $key) {
+        $env->key = $key;
+    })->toThrow(InvalidArgumentException::class, 'must start with a letter or underscore');
+})->with([
+    'starts with digit' => '1BAD',
+    'hyphen' => 'BAD-KEY',
     'semicolon' => 'BAD;KEY',
 ]);
 
@@ -62,7 +72,7 @@ it('rejects environment variable keys Docker cannot represent on the model', fun
 
     expect(function () use ($env) {
         $env->key = 'BAD=KEY';
-    })->toThrow(InvalidArgumentException::class, 'Docker-compatible');
+    })->toThrow(InvalidArgumentException::class, 'must start with a letter or underscore');
 });
 
 it('rejects shared environment variable keys Docker cannot represent on the model', function () {
@@ -70,5 +80,5 @@ it('rejects shared environment variable keys Docker cannot represent on the mode
 
     expect(function () use ($env) {
         $env->key = 'BAD=KEY';
-    })->toThrow(InvalidArgumentException::class, 'Docker-compatible');
+    })->toThrow(InvalidArgumentException::class, 'must start with a letter or underscore');
 });

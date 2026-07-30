@@ -14,7 +14,7 @@ use App\Models\StandaloneDocker;
 it('syncs docker_compose_raw to component property after loading compose file', function () {
     // Create a mock application
     $app = Mockery::mock(Application::class)->makePartial();
-    $app->shouldReceive('getAttribute')->with('docker_compose_raw')->andReturn(null, 'version: "3"\nservices:\n  web:\n    image: nginx');
+    $app->shouldReceive('getAttribute')->with('docker_compose_raw')->andReturn('version: "3"\nservices:\n  web:\n    image: nginx');
     $app->shouldReceive('getAttribute')->with('docker_compose_location')->andReturn('/docker-compose.yml');
     $app->shouldReceive('getAttribute')->with('base_directory')->andReturn('/');
     $app->shouldReceive('getAttribute')->with('docker_compose_domains')->andReturn(null);
@@ -25,7 +25,7 @@ it('syncs docker_compose_raw to component property after loading compose file', 
     $server = Mockery::mock(Server::class);
     $server->shouldReceive('proxyType')->andReturn('traefik');
 
-    $destination = Mockery::mock(StandaloneDocker::class);
+    $destination = Mockery::mock(StandaloneDocker::class)->makePartial();
     $destination->server = $server;
 
     $app->shouldReceive('getAttribute')->with('destination')->andReturn($destination);

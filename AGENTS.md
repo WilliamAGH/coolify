@@ -38,6 +38,11 @@ php artisan test --compact                          # all tests
 php artisan test --compact --filter=testName         # single test
 php artisan test --compact tests/Feature/SomeTest.php  # specific file
 
+# macOS only: the supply-chain release tests need OpenSSL 3 (Ed25519) and bash >= 4
+# (mapfile) ahead of the system LibreSSL/bash 3.2, or they self-skip with a reason.
+# Apple Silicon shown; use /usr/local/opt/openssl@3/bin and /usr/local/bin on Intel.
+export PATH="/opt/homebrew/opt/openssl@3/bin:/opt/homebrew/bin:$PATH"
+
 # Code formatting (Pint, Laravel preset)
 vendor/bin/pint --dirty --format agent              # format changed files
 

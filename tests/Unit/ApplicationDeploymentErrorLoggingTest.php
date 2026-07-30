@@ -40,6 +40,7 @@ it('logs comprehensive error details when failed() is called', function () {
         ->atLeast()->once();
 
     $mockQueue->shouldReceive('update')->andReturn(true);
+    $mockQueue->shouldReceive('fresh')->andReturn(null);
 
     // Mock Application and its relationships
     $mockApplication = Mockery::mock(Application::class);
@@ -151,6 +152,7 @@ it('handles exceptions with no message gracefully', function () {
         ->atLeast()->once();
 
     $mockQueue->shouldReceive('update')->andReturn(true);
+    $mockQueue->shouldReceive('fresh')->andReturn(null);
 
     $mockApplication = Mockery::mock(Application::class);
     $mockApplication->shouldReceive('getAttribute')
@@ -242,6 +244,7 @@ it('logs error code 0 correctly', function () {
         ->atLeast()->once();
 
     $mockQueue->shouldReceive('update')->andReturn(true);
+    $mockQueue->shouldReceive('fresh')->andReturn(null);
 
     $mockApplication = Mockery::mock(Application::class);
     $mockApplication->shouldReceive('getAttribute')

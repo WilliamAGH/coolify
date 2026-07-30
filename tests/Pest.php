@@ -18,6 +18,30 @@ use Tests\TestCase;
 uses(TestCase::class)->in('Feature', 'v4/Feature', 'v4/Browser');
 
 /*
+ * Unit tests run on plain PHPUnit\Framework\TestCase. Bind only the Mockery
+ * teardown trait so Mockery::close() runs (and verifies expectations) after
+ * every test instead of letting mock state leak across the whole process.
+ *
+ * The beforeEach hook resets leaked global container/facade state before every
+ * plain unit test: an earlier test (including a TestCase-bound file whose torn
+ * down application object lingers in the Facade root) can leave a partial
+ * container behind, and facades resolved against it fail with
+ * BindingResolutionException. TestCase-bound tests are skipped — Laravel's own
+ * setUp/tearDown manages their application lifecycle.
+ */
+uses(Mockery\Adapter\Phpunit\MockeryPHPUnitIntegration::class)
+    ->beforeEach(function (): void {
+        if ($this instanceof TestCase) {
+            return;
+        }
+
+        Illuminate\Support\Facades\Facade::clearResolvedInstances();
+        Illuminate\Support\Facades\Facade::setFacadeApplication(null);
+        Illuminate\Container\Container::setInstance(null);
+    })
+    ->in('Unit');
+
+/*
 |--------------------------------------------------------------------------
 | Test Hooks
 |--------------------------------------------------------------------------

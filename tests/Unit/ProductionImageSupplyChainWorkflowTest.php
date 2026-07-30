@@ -15,6 +15,63 @@ function releaseWorkflowTestDigest(string $character): string
 }
 
 /**
+ * Require the PATH-resolved `openssl` to support `genpkey -algorithm Ed25519`.
+ *
+ * macOS ships LibreSSL, which lacks Ed25519; the affected tests skip there with
+ * an actionable reason. On Linux the capability is mandatory, so a missing
+ * capability fails loudly instead of skipping — CI coverage can never be
+ * silently lost.
+ */
+function releaseWorkflowRequireEd25519OpensslCapability(): void
+{
+    static $supported = null;
+    if ($supported === null) {
+        $probe = new Process(['openssl', 'genpkey', '-algorithm', 'Ed25519']);
+        $probe->run();
+        $supported = $probe->isSuccessful();
+    }
+
+    if ($supported) {
+        return;
+    }
+
+    if (PHP_OS_FAMILY === 'Linux') {
+        test()->fail('openssl on PATH cannot run `genpkey -algorithm Ed25519`; Linux CI must provide OpenSSL with Ed25519 support so this coverage never silently skips.');
+    }
+
+    test()->markTestSkipped('openssl on PATH cannot run `genpkey -algorithm Ed25519` (macOS ships LibreSSL). Put OpenSSL 3 first: export PATH="/opt/homebrew/opt/openssl@3/bin:$PATH" (Apple Silicon) or PATH="/usr/local/opt/openssl@3/bin:$PATH" (Intel).');
+}
+
+/**
+ * Require the PATH-resolved `bash` to provide the `mapfile` builtin used by the
+ * release workflow scripts under test.
+ *
+ * macOS ships bash 3.2 without `mapfile`; the affected tests skip there with an
+ * actionable reason. On Linux the capability is mandatory, so a missing
+ * capability fails loudly instead of skipping — CI coverage can never be
+ * silently lost.
+ */
+function releaseWorkflowRequireBashMapfileCapability(): void
+{
+    static $supported = null;
+    if ($supported === null) {
+        $probe = new Process(['bash', '-c', 'type mapfile']);
+        $probe->run();
+        $supported = $probe->isSuccessful();
+    }
+
+    if ($supported) {
+        return;
+    }
+
+    if (PHP_OS_FAMILY === 'Linux') {
+        test()->fail('bash on PATH lacks the `mapfile` builtin; Linux CI must provide bash >= 4 so this coverage never silently skips.');
+    }
+
+    test()->markTestSkipped('bash on PATH lacks the `mapfile` builtin (macOS ships bash 3.2). Put Homebrew bash first: export PATH="/opt/homebrew/bin:$PATH" (Apple Silicon) or PATH="/usr/local/bin:$PATH" (Intel).');
+}
+
+/**
  * @return array{environment: array<string, string>, log: string, state: string}
  */
 function releaseWorkflowPrepareForkPromotionRegistryDouble(
@@ -640,7 +697,7 @@ function releaseFoundationWorkflowViolations(array $sharedWorkflow, array $appli
         $violations[] = 'application validation must serialize pushes without cancellation while superseding stale pull requests';
     }
 
-    $genericJobs = ['php', 'blue-green-lifecycle', 'browser', 'formatting', 'node', 'workflow-and-shell'];
+    $genericJobs = ['php', 'blue-green-lifecycle', 'browser', 'formatting', 'node', 'unit-suite', 'workflow-and-shell'];
     foreach ($genericJobs as $jobName) {
         if (! isset($applicationJobs[$jobName])) {
             $violations[] = "missing generic application validation job: {$jobName}";
@@ -1933,6 +1990,7 @@ it('rejects OCI tags longer than 128 characters in input validation', function (
 });
 
 it('rejects fork versions whose derived canonical tag exceeds the OCI limit', function () {
+    releaseWorkflowRequireBashMapfileCapability();
     $root = releaseWorkflowRepositoryRoot();
     $sharedWorkflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
     $targetStep = releaseWorkflowStepById($sharedWorkflow['jobs']['validate-inputs'] ?? [], 'target');
@@ -3117,6 +3175,7 @@ it('defines one referrerless fork release graph for the main image on both platf
 });
 
 it('requires exact fork tag source binding and rejects fork aliases', function () {
+    releaseWorkflowRequireBashMapfileCapability();
     $root = releaseWorkflowRepositoryRoot();
     $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
     $targetStep = releaseWorkflowStepById($workflow['jobs']['validate-inputs'] ?? [], 'target');
@@ -3398,6 +3457,7 @@ it('rejects published fork release identity, inventory, digest, and tag target m
 });
 
 it('reconciles ambiguous fork release publication and accepts exact published reruns', function () {
+    releaseWorkflowRequireEd25519OpensslCapability();
     $root = releaseWorkflowRepositoryRoot();
     $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
     $publicationRun = (string) (releaseWorkflowStep(
@@ -3564,6 +3624,7 @@ it('emits the strict signed fork deploy manifest schema', function () {
 });
 
 it('accepts an idempotent fork semantic promotion without overwriting its matching image', function () {
+    releaseWorkflowRequireBashMapfileCapability();
     $root = releaseWorkflowRepositoryRoot();
     $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
     $promotionRun = (string) (releaseWorkflowStep(
@@ -3628,6 +3689,7 @@ it('fails closed when the canonical signed-tag verifier rejects semantic registr
 });
 
 it('fails closed when the canonical signed-tag verifier rejects release publication', function () {
+    releaseWorkflowRequireEd25519OpensslCapability();
     $root = releaseWorkflowRepositoryRoot();
     $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
     $publicationRun = (string) (releaseWorkflowStep(
@@ -3681,6 +3743,7 @@ it('rejects a mismatched fork semantic tag before any registry write', function 
 });
 
 it('rejects a mismatched canonical fork identity tag before updating fork latest', function () {
+    releaseWorkflowRequireBashMapfileCapability();
     $root = releaseWorkflowRepositoryRoot();
     $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
     $promotionRun = (string) (releaseWorkflowStep(
@@ -3709,6 +3772,7 @@ it('rejects a mismatched canonical fork identity tag before updating fork latest
 });
 
 it('refuses to move fork latest backward after a newer release has won serialization', function () {
+    releaseWorkflowRequireBashMapfileCapability();
     $root = releaseWorkflowRepositoryRoot();
     $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
     $promotionRun = (string) (releaseWorkflowStep(
@@ -3736,6 +3800,7 @@ it('refuses to move fork latest backward after a newer release has won serializa
 });
 
 it('moves fork latest forward after an older release has won serialization', function () {
+    releaseWorkflowRequireBashMapfileCapability();
     $root = releaseWorkflowRepositoryRoot();
     $workflow = Yaml::parseFile($root.'/.github/workflows/publish-linux-image.yml');
     $promotionRun = (string) (releaseWorkflowStep(

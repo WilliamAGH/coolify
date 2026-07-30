@@ -36,6 +36,7 @@ it('returns empty arrays when currentTeam returns null', function () {
         'team' => [],
         'project' => [],
         'environment' => [],
+        'server' => [],
     ]);
 });
 
@@ -49,5 +50,6 @@ it('availableSharedVariables method wraps authorization checks in try-catch bloc
         ->and($source)->toContain('$this->authorize(\'view\', $project)')
         ->and($source)->toContain('$this->authorize(\'view\', $environment)')
         // Verify authorization checks are wrapped in try-catch blocks
-        ->and($source)->toContain('} catch (\Illuminate\Auth\Access\AuthorizationException $e) {');
+        ->and($source)->toContain('use Illuminate\Auth\Access\AuthorizationException;')
+        ->and($source)->toContain('} catch (AuthorizationException $e) {');
 });

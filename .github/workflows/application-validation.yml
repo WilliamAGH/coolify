@@ -270,6 +270,45 @@ jobs:
       - name: Validate deployment activation configuration fence
         run: php artisan test --compact tests/Unit/DeploymentConfiguration/ApplicationConfigurationSnapshotTest.php --filter='fences deployment command'
 
+  unit-suite:
+    name: Unit suite (single process)
+    needs: source-identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    services:
+      redis:
+        image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      APP_ENV: testing
+      APP_MAINTENANCE_DRIVER: file
+      CACHE_STORE: array
+      DB_CONNECTION: testing
+      QUEUE_CONNECTION: sync
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: 6379
+      SESSION_DRIVER: array
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source_sha || github.sha }}
+      - name: Set up PHP
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: '8.5'
+          coverage: none
+          extensions: mbstring, pdo_sqlite, redis
+      - run: composer install --no-interaction --prefer-dist --optimize-autoloader
+      - name: Run the whole unit directory in one process
+        run: php -d memory_limit=2G vendor/bin/pest --compact --do-not-cache-result tests/Unit
+
   browser:
     name: Pest browser tests
     needs: source-identity
@@ -568,6 +607,7 @@ jobs:
       - node
       - source-identity
       - testing-host-runtime
+      - unit-suite
       - workflow-and-shell
     runs-on: ubuntu-24.04
     steps:
@@ -584,6 +624,7 @@ jobs:
           SOURCE_IDENTITY_RESULT: ${{ needs.source-identity.result }}
           VALIDATION_SOURCE_SHA: ${{ inputs.source_sha }}
           TESTING_HOST_RUNTIME_RESULT: ${{ needs.testing-host-runtime.result }}
+          UNIT_SUITE_RESULT: ${{ needs.unit-suite.result }}
           WORKFLOW_RESULT: ${{ needs.workflow-and-shell.result }}
         run: |
           set -Eeuo pipefail
@@ -595,6 +636,7 @@ jobs:
             "$FORK_DEPLOY_RESULT" \
             "$NODE_RESULT" \
             "$SOURCE_IDENTITY_RESULT" \
+            "$UNIT_SUITE_RESULT" \
             "$WORKFLOW_RESULT"; do
             [[ "$result" == success ]] || {
               echo "A required generic application validation job did not succeed: $result" >&2

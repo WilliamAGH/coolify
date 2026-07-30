@@ -48,15 +48,20 @@ it('rejects volume names with shell metacharacters', function (string $name) {
 // --- escapeshellarg Defense Tests ---
 
 it('escapeshellarg neutralizes injection in docker volume rm command', function (string $maliciousName) {
-    $command = 'docker volume rm -f '.escapeshellarg($maliciousName);
+    $escaped = escapeshellarg($maliciousName);
+    $command = 'docker volume rm -f '.$escaped;
 
-    // The command should contain the name as a single quoted argument,
-    // preventing shell interpretation of metacharacters
-    expect($command)->not->toContain('; ')
-        ->not->toContain('| ')
-        ->not->toContain('&& ')
-        ->not->toContain('`')
-        ->toStartWith('docker volume rm -f ');
+    // The malicious name must be passed as exactly one single-quoted argument, so
+    // its metacharacters stay inside quoted context and are never shell-interpreted.
+    expect($command)->toBe('docker volume rm -f '.$escaped)
+        ->toStartWith("docker volume rm -f '")
+        ->toEndWith("'");
+
+    // Once the escapeshellarg quote-escape sequence ('\'') is removed, no bare
+    // single quote may remain inside the argument — the shell can never leave
+    // quoted context while parsing the malicious name.
+    $inner = substr($escaped, 1, -1);
+    expect(str_replace("'\\''", '', $inner))->not->toContain("'");
 })->with([
     'semicolon' => 'vol; rm -rf /',
     'pipe' => 'vol | cat /etc/passwd',

@@ -10,7 +10,7 @@ beforeEach(function () {
 });
 
 it('generateUrl produces correct URL with wildcard domain', function () {
-    $serverSettings = Mockery::mock(ServerSetting::class);
+    $serverSettings = Mockery::mock(ServerSetting::class)->makePartial();
     $serverSettings->wildcard_domain = 'http://example.com';
 
     $server = Mockery::mock(Server::class)->makePartial();

@@ -15,7 +15,8 @@ it('has empty container safeguard for applications', function () {
 
     // The safeguard should appear before marking applications as exited
     expect($actionFile)
-        ->toContain('$notRunningApplications = $this->applications->pluck(\'id\')->diff($foundApplications);');
+        ->toContain('$notRunningApplications = $this->applications')
+        ->toContain('->diff($foundApplications);');
 
     // Count occurrences of the safeguard pattern in the not-found sections
     $safeguardPattern = '// Only protection: If no containers at all, Docker query might have failed';

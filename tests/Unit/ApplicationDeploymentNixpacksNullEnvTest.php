@@ -4,6 +4,7 @@ use App\Jobs\ApplicationDeploymentJob;
 use App\Models\Application;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\EnvironmentVariable;
+use App\Models\Server;
 
 /**
  * Test to verify that null and empty environment variables are filtered out
@@ -24,24 +25,31 @@ it('filters out null environment variables from nixpacks build command', functio
     $mockApplication->shouldReceive('getAttribute')
         ->with('build_pack')
         ->andReturn('nixpacks');
-    $mockApplication->build_pack = 'nixpacks';
 
     // Mock environment variables - some with null/empty values
     $envVar1 = Mockery::mock(EnvironmentVariable::class);
-    $envVar1->key = 'VALID_VAR';
-    $envVar1->real_value = 'valid_value';
+    $envVar1->shouldReceive('getResolvedValueWithServer')->andReturn('valid_value');
+    $envVar1->shouldReceive('getAttribute')->with('key')->andReturn('VALID_VAR');
+    $envVar1->shouldReceive('getAttribute')->with('is_literal')->andReturn(false);
+    $envVar1->shouldReceive('getAttribute')->with('is_multiline')->andReturn(false);
 
     $envVar2 = Mockery::mock(EnvironmentVariable::class);
-    $envVar2->key = 'NULL_VAR';
-    $envVar2->real_value = null;
+    $envVar2->shouldReceive('getResolvedValueWithServer')->andReturn(null);
+    $envVar2->shouldReceive('getAttribute')->with('key')->andReturn('NULL_VAR');
+    $envVar2->shouldReceive('getAttribute')->with('is_literal')->andReturn(false);
+    $envVar2->shouldReceive('getAttribute')->with('is_multiline')->andReturn(false);
 
     $envVar3 = Mockery::mock(EnvironmentVariable::class);
-    $envVar3->key = 'EMPTY_VAR';
-    $envVar3->real_value = '';
+    $envVar3->shouldReceive('getResolvedValueWithServer')->andReturn('');
+    $envVar3->shouldReceive('getAttribute')->with('key')->andReturn('EMPTY_VAR');
+    $envVar3->shouldReceive('getAttribute')->with('is_literal')->andReturn(false);
+    $envVar3->shouldReceive('getAttribute')->with('is_multiline')->andReturn(false);
 
     $envVar4 = Mockery::mock(EnvironmentVariable::class);
-    $envVar4->key = 'ANOTHER_VALID_VAR';
-    $envVar4->real_value = 'another_value';
+    $envVar4->shouldReceive('getResolvedValueWithServer')->andReturn('another_value');
+    $envVar4->shouldReceive('getAttribute')->with('key')->andReturn('ANOTHER_VALID_VAR');
+    $envVar4->shouldReceive('getAttribute')->with('is_literal')->andReturn(false);
+    $envVar4->shouldReceive('getAttribute')->with('is_multiline')->andReturn(false);
 
     $nixpacksEnvVars = collect([$envVar1, $envVar2, $envVar3, $envVar4]);
 
@@ -52,7 +60,6 @@ it('filters out null environment variables from nixpacks build command', functio
     // Mock application deployment queue
     $mockQueue = Mockery::mock(ApplicationDeploymentQueue::class);
     $mockQueue->shouldReceive('getAttribute')->with('application_id')->andReturn(1);
-    $mockQueue->application_id = 1;
 
     // Mock the job
     $job = Mockery::mock(ApplicationDeploymentJob::class)->makePartial();
@@ -68,6 +75,10 @@ it('filters out null environment variables from nixpacks build command', functio
     $pullRequestProperty = $reflection->getProperty('pull_request_id');
     $pullRequestProperty->setAccessible(true);
     $pullRequestProperty->setValue($job, 0);
+
+    $mainServerProperty = $reflection->getProperty('mainServer');
+    $mainServerProperty->setAccessible(true);
+    $mainServerProperty->setValue($job, Mockery::mock(Server::class));
 
     // Mock generate_coolify_env_variables to return some values including null
     $job->shouldReceive('generate_coolify_env_variables')
@@ -111,16 +122,19 @@ it('filters out null environment variables from nixpacks preview deployments', f
     $mockApplication->shouldReceive('getAttribute')
         ->with('build_pack')
         ->andReturn('nixpacks');
-    $mockApplication->build_pack = 'nixpacks';
 
     // Mock preview environment variables - some with null/empty values
     $envVar1 = Mockery::mock(EnvironmentVariable::class);
-    $envVar1->key = 'PREVIEW_VAR';
-    $envVar1->real_value = 'preview_value';
+    $envVar1->shouldReceive('getResolvedValueWithServer')->andReturn('preview_value');
+    $envVar1->shouldReceive('getAttribute')->with('key')->andReturn('PREVIEW_VAR');
+    $envVar1->shouldReceive('getAttribute')->with('is_literal')->andReturn(false);
+    $envVar1->shouldReceive('getAttribute')->with('is_multiline')->andReturn(false);
 
     $envVar2 = Mockery::mock(EnvironmentVariable::class);
-    $envVar2->key = 'NULL_PREVIEW_VAR';
-    $envVar2->real_value = null;
+    $envVar2->shouldReceive('getResolvedValueWithServer')->andReturn(null);
+    $envVar2->shouldReceive('getAttribute')->with('key')->andReturn('NULL_PREVIEW_VAR');
+    $envVar2->shouldReceive('getAttribute')->with('is_literal')->andReturn(false);
+    $envVar2->shouldReceive('getAttribute')->with('is_multiline')->andReturn(false);
 
     $previewEnvVars = collect([$envVar1, $envVar2]);
 
@@ -131,7 +145,6 @@ it('filters out null environment variables from nixpacks preview deployments', f
     // Mock application deployment queue
     $mockQueue = Mockery::mock(ApplicationDeploymentQueue::class);
     $mockQueue->shouldReceive('getAttribute')->with('application_id')->andReturn(1);
-    $mockQueue->application_id = 1;
 
     // Mock the job
     $job = Mockery::mock(ApplicationDeploymentJob::class)->makePartial();
@@ -147,6 +160,10 @@ it('filters out null environment variables from nixpacks preview deployments', f
     $pullRequestProperty = $reflection->getProperty('pull_request_id');
     $pullRequestProperty->setAccessible(true);
     $pullRequestProperty->setValue($job, 123);  // Non-zero for preview deployment
+
+    $mainServerProperty = $reflection->getProperty('mainServer');
+    $mainServerProperty->setAccessible(true);
+    $mainServerProperty->setValue($job, Mockery::mock(Server::class));
 
     // Mock generate_coolify_env_variables
     $job->shouldReceive('generate_coolify_env_variables')
@@ -178,16 +195,19 @@ it('handles all environment variables being null or empty', function () {
     $mockApplication->shouldReceive('getAttribute')
         ->with('build_pack')
         ->andReturn('nixpacks');
-    $mockApplication->build_pack = 'nixpacks';
 
     // Mock environment variables - all null or empty
     $envVar1 = Mockery::mock(EnvironmentVariable::class);
-    $envVar1->key = 'NULL_VAR';
-    $envVar1->real_value = null;
+    $envVar1->shouldReceive('getResolvedValueWithServer')->andReturn(null);
+    $envVar1->shouldReceive('getAttribute')->with('key')->andReturn('NULL_VAR');
+    $envVar1->shouldReceive('getAttribute')->with('is_literal')->andReturn(false);
+    $envVar1->shouldReceive('getAttribute')->with('is_multiline')->andReturn(false);
 
     $envVar2 = Mockery::mock(EnvironmentVariable::class);
-    $envVar2->key = 'EMPTY_VAR';
-    $envVar2->real_value = '';
+    $envVar2->shouldReceive('getResolvedValueWithServer')->andReturn('');
+    $envVar2->shouldReceive('getAttribute')->with('key')->andReturn('EMPTY_VAR');
+    $envVar2->shouldReceive('getAttribute')->with('is_literal')->andReturn(false);
+    $envVar2->shouldReceive('getAttribute')->with('is_multiline')->andReturn(false);
 
     $nixpacksEnvVars = collect([$envVar1, $envVar2]);
 
@@ -198,7 +218,6 @@ it('handles all environment variables being null or empty', function () {
     // Mock application deployment queue
     $mockQueue = Mockery::mock(ApplicationDeploymentQueue::class);
     $mockQueue->shouldReceive('getAttribute')->with('application_id')->andReturn(1);
-    $mockQueue->application_id = 1;
 
     // Mock the job
     $job = Mockery::mock(ApplicationDeploymentJob::class)->makePartial();
@@ -214,6 +233,10 @@ it('handles all environment variables being null or empty', function () {
     $pullRequestProperty = $reflection->getProperty('pull_request_id');
     $pullRequestProperty->setAccessible(true);
     $pullRequestProperty->setValue($job, 0);
+
+    $mainServerProperty = $reflection->getProperty('mainServer');
+    $mainServerProperty->setAccessible(true);
+    $mainServerProperty->setValue($job, Mockery::mock(Server::class));
 
     // Mock generate_coolify_env_variables to return all null/empty values
     $job->shouldReceive('generate_coolify_env_variables')
@@ -284,16 +307,19 @@ it('preserves environment variables with zero values', function () {
     $mockApplication->shouldReceive('getAttribute')
         ->with('build_pack')
         ->andReturn('nixpacks');
-    $mockApplication->build_pack = 'nixpacks';
 
     // Mock environment variables with zero values (which should NOT be filtered)
     $envVar1 = Mockery::mock(EnvironmentVariable::class);
-    $envVar1->key = 'ZERO_VALUE';
-    $envVar1->real_value = '0';
+    $envVar1->shouldReceive('getResolvedValueWithServer')->andReturn('0');
+    $envVar1->shouldReceive('getAttribute')->with('key')->andReturn('ZERO_VALUE');
+    $envVar1->shouldReceive('getAttribute')->with('is_literal')->andReturn(false);
+    $envVar1->shouldReceive('getAttribute')->with('is_multiline')->andReturn(false);
 
     $envVar2 = Mockery::mock(EnvironmentVariable::class);
-    $envVar2->key = 'FALSE_VALUE';
-    $envVar2->real_value = 'false';
+    $envVar2->shouldReceive('getResolvedValueWithServer')->andReturn('false');
+    $envVar2->shouldReceive('getAttribute')->with('key')->andReturn('FALSE_VALUE');
+    $envVar2->shouldReceive('getAttribute')->with('is_literal')->andReturn(false);
+    $envVar2->shouldReceive('getAttribute')->with('is_multiline')->andReturn(false);
 
     $nixpacksEnvVars = collect([$envVar1, $envVar2]);
 
@@ -304,7 +330,6 @@ it('preserves environment variables with zero values', function () {
     // Mock application deployment queue
     $mockQueue = Mockery::mock(ApplicationDeploymentQueue::class);
     $mockQueue->shouldReceive('getAttribute')->with('application_id')->andReturn(1);
-    $mockQueue->application_id = 1;
 
     // Mock the job
     $job = Mockery::mock(ApplicationDeploymentJob::class)->makePartial();
@@ -320,6 +345,10 @@ it('preserves environment variables with zero values', function () {
     $pullRequestProperty = $reflection->getProperty('pull_request_id');
     $pullRequestProperty->setAccessible(true);
     $pullRequestProperty->setValue($job, 0);
+
+    $mainServerProperty = $reflection->getProperty('mainServer');
+    $mainServerProperty->setAccessible(true);
+    $mainServerProperty->setValue($job, Mockery::mock(Server::class));
 
     // Mock generate_coolify_env_variables
     $job->shouldReceive('generate_coolify_env_variables')
