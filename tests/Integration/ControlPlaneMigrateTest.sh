@@ -90,7 +90,7 @@ case "$cmd" in
               printf 'race-artifact\n' > "$MOCK_CREATE_ARTIFACT_ON_FINGERPRINT"
             fi
             ;;
-          *"WHERE proxy ? 'control_plane_proxy_enrollment'"*)
+          *"WHERE proxy::jsonb ? 'control_plane_proxy_enrollment'"*)
             if [ "${MOCK_CONTROL_PLANE_ENROLLMENT_NULL_KEY_PRESENT:-false}" = true ]; then
               printf '1\n'
             else
@@ -100,7 +100,7 @@ case "$cmd" in
                 "${MOCK_CONTROL_PLANE_ENROLLMENT_COUNT:-0}"
             fi
             ;;
-          *"WHERE proxy ? 'control_plane_generation_promotion'"*)
+          *"WHERE proxy::jsonb ? 'control_plane_generation_promotion'"*)
             if [ "${MOCK_CONTROL_PLANE_GENERATION_NULL_KEY_PRESENT:-false}" = true ]; then
               printf '1\n'
             else
@@ -362,7 +362,7 @@ COOLIFY_FORK_VERSION=4.13.23-fork
 VERSIONS_URL=http://127.0.0.1:9/fork-deploy-disabled/versions.json
 AUTOUPDATE=false
 APP_PORT=8000
-PUSHER_PORT=6001
+PUSHER_PORT=6301
 PUSHER_BACKEND_HOST=127.0.0.1
 PUSHER_BACKEND_PORT=6001
 TERMINAL_PORT=6002
@@ -405,8 +405,10 @@ test_env_merge_provenance() {
   if grep -q '^SOKETI_PORT=' "$work/merged.env"; then
     fail "source-only SOKETI_PORT must be dropped"
   fi
-  if grep -q '^PUSHER_PORT=' "$work/merged.env"; then
-    fail "browser websocket port pins must never survive the merge (canonical-domain realtime uses the /app path)"
+  grep -qx 'PUSHER_PORT=6301' "$work/merged.env" \
+    || fail "a fork-deploy managed target keeps its own PUSHER_PORT (its environment contract requires the key)"
+  if [ "$(grep -c '^PUSHER_PORT=' "$work/merged.env")" != 1 ]; then
+    fail "PUSHER_PORT must appear exactly once or fork-deploy reconcile/verify fail closed"
   fi
   grep -qx 'UNCLASSIFIED_KEY=carryme' "$work/merged.env" || fail "unclassified source keys carry over with review flag"
   grep -qx 'APP_ID=sourceappid' "$work/merged.env" || fail "source APP_ID must be preserved"
@@ -416,7 +418,7 @@ test_env_merge_provenance() {
   grep -qx 'APP_KEY=source(preserved)' "$report" || fail "provenance must record source preservation"
   grep -qx 'AUTOUPDATE=target(retained)' "$report" || fail "provenance must record overridden target-retained key"
   grep -qx 'SOKETI_PORT=dropped(browser-port-pin)' "$report" || fail "provenance must record dropped source-side port pin"
-  grep -qx 'PUSHER_PORT=dropped(browser-port-pin)' "$report" || fail "provenance must record dropped target-side port pin"
+  grep -qx 'PUSHER_PORT=target(retained-browser-port-pin)' "$report" || fail "provenance must record the retained target-side port pin"
   grep -qx 'UNCLASSIFIED_KEY=source(unclassified-review)' "$report" || fail "provenance must flag unclassified keys"
 
   [ "$(stat -c '%a' "$work/merged.env" 2>/dev/null || stat -f '%Lp' "$work/merged.env")" = "600" ] \
@@ -524,9 +526,9 @@ test_capture_refuses_durable_control_plane_state() {
     capture --root "$root" --output "$STATE/capstate/generation-null-out" --require-source-stopped
   expect_output_contains 'control_plane_generation_promotion is absent'
 
-  grep -Fq "SELECT count(*) FROM servers WHERE proxy ? 'control_plane_proxy_enrollment'" "$DOCKER_LOG" \
+  grep -Fq "SELECT count(*) FROM servers WHERE proxy::jsonb ? 'control_plane_proxy_enrollment'" "$DOCKER_LOG" \
     || fail "enrollment state guard must use PostgreSQL JSONB key-existence semantics"
-  grep -Fq "SELECT count(*) FROM servers WHERE proxy ? 'control_plane_generation_promotion'" "$DOCKER_LOG" \
+  grep -Fq "SELECT count(*) FROM servers WHERE proxy::jsonb ? 'control_plane_generation_promotion'" "$DOCKER_LOG" \
     || fail "generation state guard must use PostgreSQL JSONB key-existence semantics"
   if grep -Fq "proxy->>'control_plane_" "$DOCKER_LOG"; then
     fail "state guard must not use value extraction because JSON null still represents a present durable key"

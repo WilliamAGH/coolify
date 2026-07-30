@@ -208,14 +208,19 @@ pg_admin_query() {
     docker exec "$DB_CONTAINER" psql -U "$DB_USERNAME" -d postgres -Atc "$1"
 }
 
+# The key-existence operator ? is defined for jsonb only. Pre-fork control planes
+# (upstream 4.1.2 and earlier) declare servers.proxy as json, so an uncast operand
+# aborts with "operator does not exist: json ? unknown" and fails the census on
+# exactly the unmigrated sources this bridge exists to move. The cast is a no-op
+# once the column is already jsonb.
 control_plane_state_count() {
     local key="$1"
-    pg_query "SELECT count(*) FROM servers WHERE proxy ? '${key}'"
+    pg_query "SELECT count(*) FROM servers WHERE proxy::jsonb ? '${key}'"
 }
 
 control_plane_state_fingerprint() {
     local fingerprint
-    fingerprint=$(pg_query "SELECT md5(COALESCE(string_agg(id::text || ':' || xmin::text || ':' || COALESCE((proxy ? 'control_plane_proxy_enrollment')::text, 'false') || ':' || COALESCE((proxy ? 'control_plane_generation_promotion')::text, 'false'), ',' ORDER BY id), '')) FROM servers /* coolify-control-plane-migration-state-fingerprint */") \
+    fingerprint=$(pg_query "SELECT md5(COALESCE(string_agg(id::text || ':' || xmin::text || ':' || COALESCE((proxy::jsonb ? 'control_plane_proxy_enrollment')::text, 'false') || ':' || COALESCE((proxy::jsonb ? 'control_plane_generation_promotion')::text, 'false'), ',' ORDER BY id), '')) FROM servers /* coolify-control-plane-migration-state-fingerprint */") \
         || fail "control-plane server state fingerprint could not be inspected"
     [ "${#fingerprint}" -eq 32 ] \
         || fail "control-plane server state fingerprint is malformed"
@@ -1115,9 +1120,16 @@ cmd_env_merge() {
         esac
         key="${line%%=*}"
         [ "$key" = "$line" ] && { printf '%s\n' "$line" >> "$tmp"; continue; }
+        # The source's browser port pin must never cross over, but a fork-deploy
+        # managed target requires PUSHER_PORT present exactly once: its environment
+        # contract fails closed with "environment field is missing or duplicated"
+        # otherwise, leaving reconcile-migrated-state and verify permanently red on
+        # every restored host. Retain the target's own value here; the source-side
+        # drop below still keeps the pin from being inherited.
         # shellcheck disable=SC2086
         if in_word_list "$key" "$DROPPED_KEYS"; then
-            printf '%s=dropped(browser-port-pin)\n' "$key" >> "$report"
+            printf '%s\n' "$line" >> "$tmp"
+            printf '%s=target(retained-browser-port-pin)\n' "$key" >> "$report"
             continue
         fi
         source_value=$(get_env_var "$key" "$source_env")
