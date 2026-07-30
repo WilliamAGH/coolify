@@ -18,6 +18,15 @@ set -Eeuo pipefail
 
 MANIFEST_SCHEMA="coolify-control-plane-migration/2"
 SUPPORTED_CONTROL_PLANE_STATE_CONTRACT="absent"
+# Reduced-guarantee warm-standby seed capture (--live-standby-seed). The source
+# keeps running, so the absent control-plane state contract cannot be
+# substantiated; the archive records exactly what it may and may not claim and
+# restore fences such archives to standby-only use (workers refused).
+LIVE_STANDBY_SEED_STATE_CONTRACT="live-standby-seed-unverified"
+LIVE_STANDBY_SEED_GUARANTEE="point-in-time warm-standby seed from a running source: the database dump is transactionally consistent; tree archives are crash-consistent under the held control-plane writer locks; the absent control-plane state contract is NOT verified and the archive may carry durable control-plane state; restore refuses --enable-workers; production takeover requires docs/operations/warm-standby-refresh.md"
+LIVE_STANDBY_SEED_CAPTURE=false
+LIVE_STANDBY_SEED_ARCHIVE=false
+LIVE_STANDBY_SEED_RESTORE=false
 DEFAULT_ROOT="/data/coolify"
 APP_CONTAINER="${COOLIFY_MIGRATE_APP_CONTAINER:-coolify}"
 DB_CONTAINER="${COOLIFY_MIGRATE_DB_CONTAINER:-coolify-db}"
@@ -90,7 +99,7 @@ usage() {
     cat <<'EOF'
 Usage:
   control-plane-migrate.sh capture --output DIR [--root DIR]
-      --require-source-stopped
+      (--require-source-stopped | --live-standby-seed)
       [--include NAME]... [--exclude NAME]... [--capture-redis] [--gpg-recipient ID]
   control-plane-migrate.sh verify --archive DIR
   control-plane-migrate.sh env-merge --source-env FILE --target-env FILE --output FILE [--report FILE]
@@ -102,6 +111,11 @@ Usage:
 Safety contract:
   - capture refuses undecided top-level directories (full /data/coolify census).
   - schema-v2 capture requires a verified stopped source; live attestations are rejected.
+  - --live-standby-seed is the sole supported no-downtime capture: it is read-only
+    with respect to the running source (no stops, no compose changes, no redis
+    BGSAVE), records a reduced guarantee in the manifest instead of the absent
+    control-plane state contract, and its archives restore only as a warm-standby
+    seed (--enable-workers is refused).
   - capture and restore hold the canonical static and dynamic enrollment writer
     locks through archive acceptance or restore completion.
   - restore requires the exact target hostname as overwrite authorization.
@@ -499,6 +513,16 @@ assert_control_plane_migration_state_absent() {
     local root="$1" owner="$2"
     local enrollment_count promotion_count
 
+    if [ "$LIVE_STANDBY_SEED_CAPTURE" = true ]; then
+        log "live-standby-seed capture: skipping the absent control-plane state contract for the $owner (reduced guarantee is recorded in the manifest)"
+        return 0
+    fi
+    if [ "$LIVE_STANDBY_SEED_RESTORE" = true ]; then
+        log "live-standby-seed restore: tolerating durable control-plane database state on the $owner (standby seed; the filesystem contract stays enforced)"
+        assert_control_plane_migration_filesystem_absent "$root" "$owner"
+        return 0
+    fi
+
     enrollment_count=$(control_plane_state_count control_plane_proxy_enrollment) \
         || fail "$owner database control-plane enrollment state could not be inspected"
     promotion_count=$(control_plane_state_count control_plane_generation_promotion) \
@@ -532,7 +556,11 @@ assert_control_plane_archive_filesystem_absent() {
         normalized="${normalized%/}"
         case "$normalized" in
             "$CONTROL_PLANE_LISTENER_OVERRIDE_RELATIVE_PATH"|source/"$CONTROL_PLANE_SOURCE_ROLLBACK_PREFIX"*)
-                fail "$owner source tree archive contains unsupported control-plane enrollment state: $normalized"
+                # A live standby seed legitimately snapshots an enrolled running
+                # plane; its source tree is restore-never, so tolerated entries
+                # can never reach a target filesystem.
+                [ "$LIVE_STANDBY_SEED_ARCHIVE" = true ] \
+                    || fail "$owner source tree archive contains unsupported control-plane enrollment state: $normalized"
                 ;;
         esac
     done <<< "$listing"
@@ -554,7 +582,11 @@ assert_control_plane_archive_filesystem_absent() {
                 saw_dynamic=true
                 ;;
             "$CONTROL_PLANE_MANAGED_STATE_RELATIVE_PATH"/*)
-                fail "$owner proxy tree archive contains unsupported control-plane writer state: $normalized"
+                # Tolerated for live standby seeds: the proxy tree is opt-in and
+                # --restore-proxy is refused by schema v2, so writer state in the
+                # archive can never reach a target filesystem.
+                [ "$LIVE_STANDBY_SEED_ARCHIVE" = true ] \
+                    || fail "$owner proxy tree archive contains unsupported control-plane writer state: $normalized"
                 ;;
         esac
     done <<< "$listing"
@@ -792,7 +824,7 @@ write_inventory_json() {
 ## ---------------------------------------------------------------------------
 
 cmd_capture() {
-    local root="" output="" attest="" require_stopped=false capture_redis=false gpg_recipient=""
+    local root="" output="" attest="" require_stopped=false live_standby_seed=false capture_redis=false gpg_recipient=""
     local capture_state_fingerprint final_state_fingerprint
     local requested_output output_parent output_basename
     local -a extra_includes=() extra_excludes=()
@@ -802,6 +834,7 @@ cmd_capture() {
             --output) output="$2"; shift 2 ;;
             --attest-quiesced) attest="$2"; shift 2 ;;
             --require-source-stopped) require_stopped=true; shift ;;
+            --live-standby-seed) live_standby_seed=true; shift ;;
             --include) extra_includes+=("$2"); shift 2 ;;
             --exclude) extra_excludes+=("$2"); shift 2 ;;
             --capture-redis) capture_redis=true; shift ;;
@@ -812,10 +845,22 @@ cmd_capture() {
     [ -n "$output" ] || { usage; fail "capture requires --output"; }
     root=$(resolve_root "$root")
     [ -z "$attest" ] \
-        || fail "schema-v2 capture rejects --attest-quiesced because a running app cannot substantiate the absent control-plane state contract; stop the source and use --require-source-stopped"
-    [ "$require_stopped" = true ] \
-        || fail "schema-v2 capture is fail-closed: stop the source application and pass --require-source-stopped"
-    if container_running "$APP_CONTAINER"; then
+        || fail "schema-v2 capture rejects --attest-quiesced because a running app cannot substantiate the absent control-plane state contract; stop the source and use --require-source-stopped, or seed a warm standby with --live-standby-seed (reduced guarantee)"
+    if [ "$require_stopped" = true ] && [ "$live_standby_seed" = true ]; then
+        fail "capture quiescence modes are mutually exclusive: pass exactly one of --require-source-stopped or --live-standby-seed"
+    fi
+    if [ "$require_stopped" != true ] && [ "$live_standby_seed" != true ]; then
+        fail "schema-v2 capture is fail-closed: stop the source application and pass --require-source-stopped, or pass --live-standby-seed for a reduced-guarantee warm-standby seed that keeps the source running"
+    fi
+    if [ "$live_standby_seed" = true ] && [ "$capture_redis" = true ]; then
+        fail "--capture-redis is refused with --live-standby-seed: BGSAVE mutates the running source's redis state, and a live capture must stay read-only with respect to the source"
+    fi
+    if [ "$live_standby_seed" = true ]; then
+        LIVE_STANDBY_SEED_CAPTURE=true
+        LIVE_STANDBY_SEED_ARCHIVE=true
+        log "live-standby-seed capture: the source keeps running; the archive records a reduced guarantee and restores only as a warm-standby seed"
+    fi
+    if [ "$live_standby_seed" = false ] && container_running "$APP_CONTAINER"; then
         fail "source application container '$APP_CONTAINER' is still running; stop it before the final capture"
     fi
     container_running "$DB_CONTAINER" || fail "database container '$DB_CONTAINER' must be running for the dump"
@@ -824,11 +869,13 @@ cmd_capture() {
     container_running "$DB_CONTAINER" || fail "database container '$DB_CONTAINER' is not running"
     assert_control_plane_migration_state_absent "$root" "source"
     acquire_control_plane_writer_locks "$root"
-    container_running "$APP_CONTAINER" \
+    [ "$live_standby_seed" = false ] && container_running "$APP_CONTAINER" \
         && fail "source application container '$APP_CONTAINER' restarted while the migration fence was being acquired"
     assert_control_plane_writer_locks_held
     assert_control_plane_migration_state_absent "$root" "source after writer-lock acquisition"
-    capture_state_fingerprint=$(control_plane_state_fingerprint)
+    if [ "$live_standby_seed" = false ]; then
+        capture_state_fingerprint=$(control_plane_state_fingerprint)
+    fi
 
     # Full fail-closed census of the control-plane root.
     local -a trees=()
@@ -890,7 +937,7 @@ cmd_capture() {
     [ -n "$(get_env_var APP_KEY "$output/env.source")" ] || fail "source .env has no usable APP_KEY; encrypted credentials would be unrecoverable"
 
     # Tree archives with numeric ownership preserved.
-    container_running "$APP_CONTAINER" \
+    [ "$live_standby_seed" = false ] && container_running "$APP_CONTAINER" \
         && fail "source application container '$APP_CONTAINER' restarted before the migration snapshot"
     local tree archive
     for tree in "${trees[@]}"; do
@@ -937,17 +984,26 @@ cmd_capture() {
     assert_control_plane_archive_filesystem_absent "$output" "captured"
     assert_control_plane_writer_locks_held
     assert_control_plane_migration_state_absent "$root" "source after snapshot"
-    final_state_fingerprint=$(control_plane_state_fingerprint)
-    [ "$final_state_fingerprint" = "$capture_state_fingerprint" ] \
-        || fail "source control-plane server rows changed while the migration snapshot was captured; the incomplete archive is invalid"
+    if [ "$live_standby_seed" = false ]; then
+        final_state_fingerprint=$(control_plane_state_fingerprint)
+        [ "$final_state_fingerprint" = "$capture_state_fingerprint" ] \
+            || fail "source control-plane server rows changed while the migration snapshot was captured; the incomplete archive is invalid"
+    fi
 
     # Manifest: machine-checkable contract for verify/restore plus a
     # shell-consumable manifest.env (no secrets).
-    local created_at arch hostname_value coolify_version
+    local created_at arch hostname_value coolify_version capture_mode state_contract
     created_at=$(utc_now)
     arch=$(uname -m)
     hostname_value="${COOLIFY_MIGRATE_HOSTNAME:-$(hostname)}"
     coolify_version=$(get_env_var COOLIFY_FORK_VERSION "$output/env.source" "unmanaged")
+    if [ "$live_standby_seed" = true ]; then
+        capture_mode="live-standby-seed"
+        state_contract="$LIVE_STANDBY_SEED_STATE_CONTRACT"
+    else
+        capture_mode="source-stopped"
+        state_contract="$SUPPORTED_CONTROL_PLANE_STATE_CONTRACT"
+    fi
     {
         printf 'MANIFEST_SCHEMA=%s\n' "$MANIFEST_SCHEMA"
         printf 'CREATED_AT_UTC=%s\n' "$created_at"
@@ -958,7 +1014,11 @@ cmd_capture() {
         printf 'DB_USERNAME=%s\n' "$DB_USERNAME"
         printf 'DB_DATABASE=%s\n' "$DB_DATABASE"
         printf 'REDIS_CAPTURED=%s\n' "$redis_captured"
-        printf 'CONTROL_PLANE_STATE_CONTRACT=%s\n' "$SUPPORTED_CONTROL_PLANE_STATE_CONTRACT"
+        printf 'CAPTURE_MODE=%s\n' "$capture_mode"
+        printf 'CONTROL_PLANE_STATE_CONTRACT=%s\n' "$state_contract"
+        if [ "$live_standby_seed" = true ]; then
+            printf 'LIVE_STANDBY_SEED_GUARANTEE="%s"\n' "$LIVE_STANDBY_SEED_GUARANTEE"
+        fi
         printf 'TREES="%s"\n' "${trees[*]}"
     } > "$output/manifest.env"
     chmod 0600 "$output/manifest.env"
@@ -974,10 +1034,16 @@ cmd_capture() {
         printf '    "postgres_major": %s\n' "$source_pg_major"
         printf '  },\n'
         printf '  "quiescence": {\n'
-        printf '    "mode": "source-stopped",\n'
-        printf '    "attestation": ""\n'
+        if [ "$live_standby_seed" = true ]; then
+            printf '    "mode": "live-standby-seed",\n'
+            printf '    "attestation": "",\n'
+            printf '    "guarantee": "%s"\n' "$(json_escape "$LIVE_STANDBY_SEED_GUARANTEE")"
+        else
+            printf '    "mode": "source-stopped",\n'
+            printf '    "attestation": ""\n'
+        fi
         printf '  },\n'
-        printf '  "control_plane_state": { "contract": "%s" },\n' "$SUPPORTED_CONTROL_PLANE_STATE_CONTRACT"
+        printf '  "control_plane_state": { "contract": "%s" },\n' "$state_contract"
         printf '  "redis": { "captured": %s },\n' "$redis_captured"
         printf '  "database": { "dump": "postgres.dump", "format": "pg-custom", "username": "%s", "database": "%s" },\n' "$DB_USERNAME" "$DB_DATABASE"
         printf '  "env": { "file": "env.source", "app_key_present": true },\n'
@@ -1015,10 +1081,12 @@ cmd_capture() {
 
     assert_control_plane_writer_locks_held
     assert_control_plane_migration_state_absent "$root" "source before archive acceptance"
-    final_state_fingerprint=$(control_plane_state_fingerprint)
-    [ "$final_state_fingerprint" = "$capture_state_fingerprint" ] \
-        || fail "source control-plane server rows changed before archive acceptance; the incomplete archive is invalid"
-    container_running "$APP_CONTAINER" \
+    if [ "$live_standby_seed" = false ]; then
+        final_state_fingerprint=$(control_plane_state_fingerprint)
+        [ "$final_state_fingerprint" = "$capture_state_fingerprint" ] \
+            || fail "source control-plane server rows changed before archive acceptance; the incomplete archive is invalid"
+    fi
+    [ "$live_standby_seed" = false ] && container_running "$APP_CONTAINER" \
         && fail "source application container '$APP_CONTAINER' restarted before archive acceptance"
     publish_capture_staging_output "$requested_output"
     trap - EXIT
@@ -1053,10 +1121,33 @@ cmd_verify() {
 
     grep -q "^MANIFEST_SCHEMA=${MANIFEST_SCHEMA}\$" "$archive/manifest.env" \
         || fail "archive schema mismatch; expected $MANIFEST_SCHEMA"
-    [ "$(get_env_var CONTROL_PLANE_STATE_CONTRACT "$archive/manifest.env")" = "$SUPPORTED_CONTROL_PLANE_STATE_CONTRACT" ] \
-        || fail "archive control-plane state contract must be '$SUPPORTED_CONTROL_PLANE_STATE_CONTRACT'; enrollment and generation migration are unsupported"
-    grep -Fq '"control_plane_state": { "contract": "absent" }' "$archive/manifest.json" \
-        || fail "archive JSON control-plane state contract must be '$SUPPORTED_CONTROL_PLANE_STATE_CONTRACT'"
+    local archive_capture_mode archive_state_contract
+    archive_capture_mode=$(get_env_var CAPTURE_MODE "$archive/manifest.env" "source-stopped")
+    archive_state_contract=$(get_env_var CONTROL_PLANE_STATE_CONTRACT "$archive/manifest.env")
+    LIVE_STANDBY_SEED_ARCHIVE=false
+    case "$archive_capture_mode" in
+        source-stopped)
+            [ "$archive_state_contract" = "$SUPPORTED_CONTROL_PLANE_STATE_CONTRACT" ] \
+                || fail "archive control-plane state contract must be '$SUPPORTED_CONTROL_PLANE_STATE_CONTRACT'; enrollment and generation migration are unsupported"
+            grep -Fq '"control_plane_state": { "contract": "absent" }' "$archive/manifest.json" \
+                || fail "archive JSON control-plane state contract must be '$SUPPORTED_CONTROL_PLANE_STATE_CONTRACT'"
+            grep -Fq '"mode": "source-stopped"' "$archive/manifest.json" \
+                || fail "archive JSON quiescence mode must match the source-stopped capture mode"
+            ;;
+        live-standby-seed)
+            [ "$archive_state_contract" = "$LIVE_STANDBY_SEED_STATE_CONTRACT" ] \
+                || fail "live-standby-seed archive must record the '$LIVE_STANDBY_SEED_STATE_CONTRACT' control-plane state contract"
+            grep -Fq "\"control_plane_state\": { \"contract\": \"$LIVE_STANDBY_SEED_STATE_CONTRACT\" }" "$archive/manifest.json" \
+                || fail "live-standby-seed archive JSON control-plane state contract must be '$LIVE_STANDBY_SEED_STATE_CONTRACT'"
+            grep -Fq '"mode": "live-standby-seed"' "$archive/manifest.json" \
+                || fail "archive JSON quiescence mode must match the live-standby-seed capture mode"
+            LIVE_STANDBY_SEED_ARCHIVE=true
+            log "live-standby-seed archive: reduced guarantee — $(get_env_var LIVE_STANDBY_SEED_GUARANTEE "$archive/manifest.env" "$LIVE_STANDBY_SEED_GUARANTEE")"
+            ;;
+        *)
+            fail "unsupported capture mode in archive manifest: $archive_capture_mode"
+            ;;
+    esac
     [ -n "$(get_env_var APP_KEY "$archive/env.source")" ] \
         || fail "archived env.source has no usable APP_KEY"
 
@@ -1302,8 +1393,24 @@ cmd_restore() {
     # shellcheck disable=SC1090,SC1091
     . "$archive/manifest.env"
     [ "${MANIFEST_SCHEMA:-}" = "$expected_schema" ] || fail "manifest schema mismatch"
-    [ "${CONTROL_PLANE_STATE_CONTRACT:-}" = "$SUPPORTED_CONTROL_PLANE_STATE_CONTRACT" ] \
-        || fail "archive control-plane state contract must be '$SUPPORTED_CONTROL_PLANE_STATE_CONTRACT'"
+    local archive_capture_mode="${CAPTURE_MODE:-source-stopped}"
+    case "$archive_capture_mode" in
+        source-stopped)
+            [ "${CONTROL_PLANE_STATE_CONTRACT:-}" = "$SUPPORTED_CONTROL_PLANE_STATE_CONTRACT" ] \
+                || fail "archive control-plane state contract must be '$SUPPORTED_CONTROL_PLANE_STATE_CONTRACT'"
+            ;;
+        live-standby-seed)
+            [ "${CONTROL_PLANE_STATE_CONTRACT:-}" = "$LIVE_STANDBY_SEED_STATE_CONTRACT" ] \
+                || fail "live-standby-seed archive must record the '$LIVE_STANDBY_SEED_STATE_CONTRACT' control-plane state contract"
+            [ "$enable_workers" = false ] \
+                || fail "a live-standby-seed archive seeds a warm standby only, so --enable-workers is refused; production takeover follows docs/operations/warm-standby-refresh.md after a stopped-source capture or an accepted data-loss window"
+            LIVE_STANDBY_SEED_RESTORE=true
+            log "live-standby-seed restore: workers stay disabled and the restored database may carry the running source's durable control-plane state; only the documented takeover reconciles it"
+            ;;
+        *)
+            fail "unsupported capture mode in archive manifest: $archive_capture_mode"
+            ;;
+    esac
     # shellcheck disable=SC2153  # assigned by the sourced manifest.env
     local source_pg_major="$SOURCE_PG_MAJOR"
 
@@ -1496,6 +1603,19 @@ Next steps (operator):
      'fork-deploy reconcile-migrated-state' on this host before any fork-deploy
      update or repair.
 EOF
+    if [ "$LIVE_STANDBY_SEED_RESTORE" = true ]; then
+        cat <<EOF
+live-standby-seed notes (warm standby only):
+  - --enable-workers is refused for this archive by contract; Horizon and the
+    scheduler stay disabled on this standby.
+  - The restored database carries the running source's instance FQDN and may
+    carry its durable control-plane state. Never regenerate proxy configuration
+    and never request ACME certificates for the production hostname from this
+    standby.
+  - Refresh cadence and the production takeover procedure are documented in
+    docs/operations/warm-standby-refresh.md.
+EOF
+    fi
 }
 
 ## ---------------------------------------------------------------------------

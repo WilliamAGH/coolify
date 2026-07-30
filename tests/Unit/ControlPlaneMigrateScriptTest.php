@@ -384,6 +384,54 @@ it('leaves fresh checkouts and non-managed targets from auto-invoking the releas
         ->toContain('if [ ! -f "$root/fork-deploy/current" ]; then');
 });
 
+it('supports a reduced-guarantee live standby seed capture mode', function () {
+    $script = controlPlaneMigrateScript();
+
+    expect($script)
+        ->toContain('--live-standby-seed')
+        ->toContain('LIVE_STANDBY_SEED_STATE_CONTRACT="live-standby-seed-unverified"')
+        ->toContain('pass exactly one of --require-source-stopped or --live-standby-seed')
+        ->toContain('CAPTURE_MODE=%s')
+        ->toContain('"mode": "live-standby-seed"')
+        ->toContain('LIVE_STANDBY_SEED_GUARANTEE=')
+        ->toContain('control-plane state contract is NOT verified')
+        ->toContain('live-standby-seed capture: skipping the absent control-plane state contract')
+        ->toContain('--capture-redis is refused with --live-standby-seed');
+
+    // The stopped-source path remains the fully-guaranteed default and freeform
+    // live attestations stay rejected.
+    expect($script)
+        ->toContain('"mode": "source-stopped"')
+        ->toContain('schema-v2 capture rejects --attest-quiesced')
+        ->toContain('schema-v2 capture is fail-closed: stop the source application and pass --require-source-stopped');
+});
+
+it('fences live standby seed archives to standby-only restores', function () {
+    $script = controlPlaneMigrateScript();
+
+    expect($script)
+        ->toContain('LIVE_STANDBY_SEED_RESTORE=true')
+        ->toContain('--enable-workers is refused')
+        ->toContain('docs/operations/warm-standby-refresh.md')
+        ->toContain('unsupported capture mode in archive manifest')
+        ->toContain('live-standby-seed restore: tolerating durable control-plane database state');
+});
+
+it('documents the warm standby refresh and takeover runbook', function () {
+    $runbook = file_get_contents(getcwd().'/docs/operations/warm-standby-refresh.md');
+
+    expect($runbook)->toBeString()
+        ->toContain('--live-standby-seed')
+        ->toContain('fork-deploy reconcile-migrated-state')
+        ->toContain('instance_fqdn')
+        ->toContain('ACME')
+        ->toContain('control-plane-migrate.sh.v1-live-capture')
+        ->toContain('docker-compose.custom.yml')
+        ->toContain('22.haiku.host')
+        ->toContain('popos-sf0')
+        ->toContain('exactly one');
+});
+
 it('has a functional integration suite wired for CI', function () {
     $workflow = file_get_contents(getcwd().'/.github/workflows/application-validation.yml');
 

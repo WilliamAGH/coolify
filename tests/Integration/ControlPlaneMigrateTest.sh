@@ -909,6 +909,60 @@ test_capture_redis_opt_in_uses_stdin_auth() {
   pass 'capture_redis_opt_in_uses_stdin_auth'
 }
 
+test_capture_live_standby_seed_reduced_guarantee() {
+  local root="$STATE/caplive/root"
+  build_root "$root" ssh source proxy
+  write_source_env "$root/source/.env"
+  # A running enrolled production plane: listener override, managed writer
+  # state, durable enrollment rows, app container up.
+  printf 'services: {}\n' > "$root/source/docker-compose.control-plane-listener.yml"
+  mkdir -p "$root/proxy/.control-plane-managed-traefik"
+  chmod 0700 "$root/proxy/.control-plane-managed-traefik"
+  printf '{}\n' > "$root/proxy/.control-plane-managed-traefik/authority.json"
+
+  MOCK_RUNNING_CONTAINERS="coolify coolify-db" expect_fail "capture with both quiescence modes" \
+    capture --root "$root" --output "$STATE/caplive/both-out" --require-source-stopped --live-standby-seed
+  expect_output_contains 'exactly one of --require-source-stopped or --live-standby-seed'
+
+  MOCK_RUNNING_CONTAINERS="coolify coolify-db" expect_fail "live capture with a quiescence attestation" \
+    capture --root "$root" --output "$STATE/caplive/attest-out" --live-standby-seed --attest-quiesced "test"
+  expect_output_contains 'rejects --attest-quiesced'
+
+  MOCK_RUNNING_CONTAINERS="coolify coolify-db" expect_fail "live capture with redis capture" \
+    capture --root "$root" --output "$STATE/caplive/redis-out" --live-standby-seed --capture-redis
+  expect_output_contains '--capture-redis is refused with --live-standby-seed'
+
+  : > "$DOCKER_LOG"
+  MOCK_RUNNING_CONTAINERS="coolify coolify-db" MOCK_CONTROL_PLANE_ENROLLMENT_COUNT=1 run_migrate \
+    capture --root "$root" --output "$STATE/live-archive" --live-standby-seed > "$STATE/out.log" 2>&1 \
+    || { cat "$STATE/out.log" >&2; fail "live standby seed capture failed against a running enrolled source"; }
+  expect_output_contains 'live-standby-seed capture'
+  grep -qx 'CAPTURE_MODE=live-standby-seed' "$STATE/live-archive/manifest.env" \
+    || fail "live archive manifest must record the live-standby-seed capture mode"
+  grep -qx 'CONTROL_PLANE_STATE_CONTRACT=live-standby-seed-unverified' "$STATE/live-archive/manifest.env" \
+    || fail "live archive manifest must record the unverified control-plane state contract"
+  grep -q '^LIVE_STANDBY_SEED_GUARANTEE=' "$STATE/live-archive/manifest.env" \
+    || fail "live archive manifest must record the reduced guarantee text"
+  grep -q '"mode": "live-standby-seed"' "$STATE/live-archive/manifest.json" \
+    || fail "live archive JSON manifest must record the live quiescence mode"
+  grep -q '"contract": "live-standby-seed-unverified"' "$STATE/live-archive/manifest.json" \
+    || fail "live archive JSON manifest must record the unverified state contract"
+  tar -tzf "$STATE/live-archive/tree-proxy.tar.gz" \
+    | grep -qx 'proxy/.control-plane-static-listener-enrollment.lock' \
+    || fail "live archive must still carry the persistent static writer lock"
+  tar -tzf "$STATE/live-archive/tree-proxy.tar.gz" \
+    | grep -qx 'proxy/.control-plane-managed-traefik/.coolify.yaml.lock' \
+    || fail "live archive must still carry the persistent dynamic writer lock"
+  if grep -Fq 'docker:stop' "$DOCKER_LOG" || grep -Fq 'docker:start' "$DOCKER_LOG"; then
+    fail "live capture must be read-only with respect to source containers"
+  fi
+
+  run_migrate verify --archive "$STATE/live-archive" > "$STATE/out.log" 2>&1 \
+    || { cat "$STATE/out.log" >&2; fail "verify of a live standby seed archive failed"; }
+  expect_output_contains 'reduced guarantee'
+  pass 'capture_live_standby_seed_reduced_guarantee'
+}
+
 # --- verify tests ------------------------------------------------------------
 
 test_verify_detects_tampering() {
@@ -966,6 +1020,32 @@ test_verify_reports_missing_pg_client_image() {
     fail "missing client image must not be misreported as an unreadable dump"
   fi
   pass 'verify_reports_missing_pg_client_image'
+}
+
+test_verify_rejects_capture_mode_contract_mismatch() {
+  cp -R "$STATE/live-archive" "$STATE/mode-mismatch"
+  awk '
+    /^CAPTURE_MODE=/ { print "CAPTURE_MODE=source-stopped"; next }
+    { print }
+  ' "$STATE/mode-mismatch/manifest.env" > "$STATE/mode-mismatch/manifest.env.next"
+  mv "$STATE/mode-mismatch/manifest.env.next" "$STATE/mode-mismatch/manifest.env"
+  rm -f "$STATE/mode-mismatch/SHA256SUMS"
+  (cd "$STATE/mode-mismatch" && sha256sum ./* > SHA256SUMS)
+  expect_fail "verify of a live archive relabeled as source-stopped" \
+    verify --archive "$STATE/mode-mismatch"
+  expect_output_contains "control-plane state contract must be 'absent'"
+
+  cp -R "$STATE/live-archive" "$STATE/mode-unknown"
+  awk '
+    /^CAPTURE_MODE=/ { print "CAPTURE_MODE=warm-fuzzy"; next }
+    { print }
+  ' "$STATE/mode-unknown/manifest.env" > "$STATE/mode-unknown/manifest.env.next"
+  mv "$STATE/mode-unknown/manifest.env.next" "$STATE/mode-unknown/manifest.env"
+  rm -f "$STATE/mode-unknown/SHA256SUMS"
+  (cd "$STATE/mode-unknown" && sha256sum ./* > SHA256SUMS)
+  expect_fail "verify of an unknown capture mode" verify --archive "$STATE/mode-unknown"
+  expect_output_contains 'unsupported capture mode in archive manifest: warm-fuzzy'
+  pass 'verify_rejects_capture_mode_contract_mismatch'
 }
 
 # --- restore tests -----------------------------------------------------------
@@ -1414,6 +1494,65 @@ test_restore_fails_closed_when_reconcile_fails() {
   pass 'restore_fails_closed_when_reconcile_fails'
 }
 
+test_live_standby_seed_restore_refuses_workers_before_mutation() {
+  local root="$STATE/res-live-workers/root"
+  build_target_root "$root"
+  : > "$DOCKER_LOG"
+  MOCK_RUNNING_CONTAINERS="coolify coolify-db" \
+    expect_fail "live-seed restore with --enable-workers" \
+    restore --root "$root" --archive "$STATE/live-archive" \
+    --authorize-overwrite "target-host.test" \
+    --expect-fork-version "4.13.23-fork" \
+    --expect-image-digest "sha256:expecteddigest" \
+    --enable-workers
+  expect_output_contains '--enable-workers is refused'
+  expect_output_contains 'docs/operations/warm-standby-refresh.md'
+  assert_restore_guard_precedes_mutation "$root"
+  pass 'live_standby_seed_restore_refuses_workers_before_mutation'
+}
+
+test_live_standby_seed_restore_seeds_standby() {
+  local root="$STATE/res-live-happy/root"
+  build_target_root "$root"
+  : > "$DOCKER_LOG"
+  # The standby's database may already carry control-plane rows imported by a
+  # previous live seed; a second refresh must not be blocked by them.
+  MOCK_RUNNING_CONTAINERS="coolify coolify-db coolify-redis" \
+    MOCK_CONTROL_PLANE_ENROLLMENT_COUNT=1 \
+    run_migrate restore --root "$root" --archive "$STATE/live-archive" \
+    --authorize-overwrite "target-host.test" \
+    --expect-fork-version "4.13.23-fork" \
+    --expect-image-digest "sha256:expecteddigest" > "$STATE/out.log" 2>&1 \
+    || { cat "$STATE/out.log" >&2; fail "live standby seed restore failed"; }
+  expect_output_contains 'live-standby-seed restore'
+  expect_output_contains 'restore complete'
+  expect_output_contains 'live-standby-seed notes'
+  grep -qx 'HORIZON_ENABLED=false' "$root/source/.env" \
+    || fail "live seed restore must leave Horizon disabled"
+  grep -qx 'SCHEDULER_ENABLED=false' "$root/source/.env" \
+    || fail "live seed restore must leave the scheduler disabled"
+  grep -qx 'APP_KEY=base64:sourcekey' "$root/source/.env" \
+    || fail "live seed restore must carry the source APP_KEY"
+  grep -qx 'target-docker-compose-sentinel' "$root/source/docker-compose.yml" \
+    || fail "live seed restore must never restore the source tree over the standby"
+  pass 'live_standby_seed_restore_seeds_standby'
+}
+
+test_live_standby_seed_restore_keeps_target_filesystem_contract() {
+  local root="$STATE/res-live-fs/root"
+  build_target_root "$root"
+  printf 'services: {}\n' > "$root/source/docker-compose.control-plane-listener.yml"
+  : > "$DOCKER_LOG"
+  MOCK_RUNNING_CONTAINERS="coolify coolify-db" \
+    expect_fail "live-seed restore onto a standby carrying a listener override" \
+    restore --root "$root" --archive "$STATE/live-archive" \
+    --authorize-overwrite "target-host.test" \
+    --expect-fork-version "4.13.23-fork" \
+    --expect-image-digest "sha256:expecteddigest"
+  expect_output_contains 'docker-compose.control-plane-listener.yml'
+  pass 'live_standby_seed_restore_keeps_target_filesystem_contract'
+}
+
 # --- runner ------------------------------------------------------------------
 
 test_env_merge_provenance
@@ -1427,11 +1566,13 @@ test_capture_refuses_managed_control_plane_filesystem_artifacts
 test_capture_rechecks_state_and_preserves_racy_snapshot
 test_capture_produces_verifiable_archive
 test_capture_redis_opt_in_uses_stdin_auth
+test_capture_live_standby_seed_reduced_guarantee
 test_verify_detects_tampering
 test_verify_rejects_incomplete_capture_marker
 test_verify_requires_proxy_lock_evidence
 test_verify_detects_unreadable_dump
 test_verify_reports_missing_pg_client_image
+test_verify_rejects_capture_mode_contract_mismatch
 test_restore_refuses_wrong_hostname_authorization
 test_restore_refuses_unmanaged_target
 test_restore_refuses_pg_major_downgrade
@@ -1450,5 +1591,8 @@ test_restore_migration_failure_fails_closed
 test_restore_reconciles_fork_deploy_managed_target
 test_restore_skips_reconcile_without_fork_deploy_tooling
 test_restore_fails_closed_when_reconcile_fails
+test_live_standby_seed_restore_refuses_workers_before_mutation
+test_live_standby_seed_restore_seeds_standby
+test_live_standby_seed_restore_keeps_target_filesystem_contract
 
 printf 'all control-plane-migrate integration tests passed\n'
