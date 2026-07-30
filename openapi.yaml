@@ -316,6 +316,9 @@ paths:
                 is_raw_compose_deployment_enabled:
                   type: boolean
                   description: 'Deploy the raw Docker Compose definition.'
+                is_blue_green_deployment_enabled:
+                  type: boolean
+                  description: 'Deploy with the blue-green lifecycle instead of rolling updates. Enabling requires an eligible application; disabling is rejected while durable blue-green state exists.'
                 is_http_basic_auth_enabled:
                   type: boolean
                   description: 'HTTP Basic Authentication enabled.'
@@ -658,6 +661,9 @@ paths:
                 is_raw_compose_deployment_enabled:
                   type: boolean
                   description: 'Deploy the raw Docker Compose definition.'
+                is_blue_green_deployment_enabled:
+                  type: boolean
+                  description: 'Deploy with the blue-green lifecycle instead of rolling updates. Enabling requires an eligible application; disabling is rejected while durable blue-green state exists.'
                 is_http_basic_auth_enabled:
                   type: boolean
                   description: 'HTTP Basic Authentication enabled.'
@@ -1000,6 +1006,9 @@ paths:
                 is_raw_compose_deployment_enabled:
                   type: boolean
                   description: 'Deploy the raw Docker Compose definition.'
+                is_blue_green_deployment_enabled:
+                  type: boolean
+                  description: 'Deploy with the blue-green lifecycle instead of rolling updates. Enabling requires an eligible application; disabling is rejected while durable blue-green state exists.'
                 is_http_basic_auth_enabled:
                   type: boolean
                   description: 'HTTP Basic Authentication enabled.'
@@ -1283,6 +1292,9 @@ paths:
                 is_raw_compose_deployment_enabled:
                   type: boolean
                   description: 'Deploy the raw Docker Compose definition.'
+                is_blue_green_deployment_enabled:
+                  type: boolean
+                  description: 'Deploy with the blue-green lifecycle instead of rolling updates. Enabling requires an eligible application; disabling is rejected while durable blue-green state exists.'
                 is_http_basic_auth_enabled:
                   type: boolean
                   description: 'HTTP Basic Authentication enabled.'
@@ -1552,6 +1564,9 @@ paths:
                 is_raw_compose_deployment_enabled:
                   type: boolean
                   description: 'Deploy the raw Docker Compose definition.'
+                is_blue_green_deployment_enabled:
+                  type: boolean
+                  description: 'Deploy with the blue-green lifecycle instead of rolling updates. Enabling requires an eligible application; disabling is rejected while durable blue-green state exists.'
                 is_http_basic_auth_enabled:
                   type: boolean
                   description: 'HTTP Basic Authentication enabled.'
@@ -1975,6 +1990,9 @@ paths:
                 is_raw_compose_deployment_enabled:
                   type: boolean
                   description: 'Deploy the raw Docker Compose definition.'
+                is_blue_green_deployment_enabled:
+                  type: boolean
+                  description: 'Deploy with the blue-green lifecycle instead of rolling updates. Enabling requires an eligible application; disabling is rejected while durable blue-green state exists.'
                 connect_to_docker_network:
                   type: boolean
                   description: 'The flag to connect the service to the predefined Docker network.'
@@ -5491,7 +5509,7 @@ paths:
         -
           name: docker_tag
           in: query
-          description: 'Docker image tag for Docker Image preview deployments. Requires pull_request_id.'
+          description: 'Docker image tag for Docker Image applications. With pull_request_id it deploys a preview; without it the tag is frozen immutably on the queued primary deployment.'
           schema:
             type: string
       responses:
