@@ -6627,7 +6627,14 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
             return;
         }
 
-        // Read the Dockerfile
+        // Read the Dockerfile. Saved outputs append across calls (append=true
+        // exists for intra-command output chunks), so a stale value under this
+        // shared key concatenates every prior read onto the next one: a compose
+        // deploy whose services share one Dockerfile doubles the file per
+        // service (1→2→4→8→16 copies) until the base64 write-back exceeds the
+        // kernel's per-argument limit and dies with posix_spawn E2BIG. Reset
+        // the key so each call reads exactly one copy.
+        $this->saved_outputs->forget('dockerfile_content');
         $this->execute_remote_command([
             executeInDocker($this->deployment_uuid, "cat {$dockerfile_path}"),
             'hidden' => true,
