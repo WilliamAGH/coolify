@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file.
 
 ### 🐛 Bug Fixes
 
+- *(blue-green)* Defer Compose claim until parsing completes
+
+### 📚 Documentation
+
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.47-fork
+
+## [4.13.46-fork] - 2026-07-30
+
+### 🐛 Bug Fixes
+
 - *(blue-green)* Prove rollback-restored routes despite advanced fence counters
 
 ### 📚 Documentation
