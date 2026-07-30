@@ -2,6 +2,7 @@
 
 namespace App\Console\Commands;
 
+use App\Enums\BlueGreenDeactivationPhase;
 use App\Jobs\CleanupHelperContainersJob;
 use App\Jobs\DeleteResourceJob;
 use App\Models\Application;
@@ -80,7 +81,12 @@ class CleanupStuckedResources extends Command
             echo "Error in cleaning stuck application deployment queue: {$e->getMessage()}\n";
         }
         try {
-            $applications = Application::withTrashed()->whereNotNull('deleted_at')->get();
+            $applications = Application::withTrashed()
+                ->whereNotNull('deleted_at')
+                ->whereDoesntHave('blueGreenDeactivations', function ($query): void {
+                    $query->where('phase', BlueGreenDeactivationPhase::INTERVENTION_REQUIRED->value);
+                })
+                ->get();
             foreach ($applications as $application) {
                 echo "Deleting stuck application: {$application->name}\n";
                 DeleteResourceJob::dispatch($application);

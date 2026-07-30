@@ -129,7 +129,9 @@ class DeleteResourceJob implements ShouldBeEncrypted, ShouldQueue
                     CleanupDocker::dispatch($server, false, false);
                 }
             }
-            Artisan::queue('cleanup:stucked-resources');
+            if (! $requiresBlueGreenDeactivation || $resourceCleanupCompleted) {
+                Artisan::queue('cleanup:stucked-resources');
+            }
         }
     }
 
