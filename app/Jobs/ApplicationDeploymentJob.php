@@ -528,7 +528,9 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
 
                     return;
                 }
-                if ($this->preparationOnly && $this->blueGreenLifecycle->isEnabled()) {
+                if ($this->preparationOnly
+                    && $this->blueGreenLifecycle->isEnabled()
+                    && $this->application->build_pack !== 'dockercompose') {
                     $this->blueGreenLifecycle->claim();
                 }
             }

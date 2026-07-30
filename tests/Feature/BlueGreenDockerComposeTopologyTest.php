@@ -14,6 +14,8 @@ use App\Actions\Application\BlueGreen\ReserveBlueGreenReplicaSet;
 use App\Actions\Application\StampApplicationDeploymentProvenance;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
+use App\Enums\ApplicationDeploymentExecutionPhase;
+use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\ProxyTypes;
@@ -21,7 +23,9 @@ use App\Jobs\ApplicationDeploymentJob;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
+use App\Models\InstanceSettings;
 use App\Models\LocalPersistentVolume;
+use App\Models\PrivateKey;
 use App\Models\Project;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
@@ -31,6 +35,8 @@ use App\Support\BlueGreenComposeTopology;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
 use Symfony\Component\Yaml\Yaml;
 use Tests\Support\BlueGreenDeactivationScenario;
 
@@ -273,6 +279,85 @@ function blueGreenComposeClaim(
 
     return $claim;
 }
+
+it('persists repository Compose parsing before claiming a blue-green slot', function (): void {
+    InstanceSettings::unguarded(
+        fn () => InstanceSettings::query()->firstOrCreate(['id' => 0]),
+    );
+    $application = blueGreenComposeApplication();
+    $application->settings()->update(['is_blue_green_deployment_enabled' => true]);
+    $application = $application->fresh(['destination.server.privateKey', 'settings']);
+    $destination = $application->destination;
+    $server = $destination->server;
+    $privateKey = PrivateKey::factory()->create(['team_id' => $server->team_id]);
+    $server->update(['private_key_id' => $privateKey->id]);
+    $server->settings()->update([
+        'is_reachable' => true,
+        'is_usable' => true,
+        'force_disabled' => false,
+    ]);
+    $server = $server->fresh('privateKey');
+    $deploymentAttempt = (string) Str::uuid();
+    $deployment = ApplicationDeploymentQueue::query()->create([
+        'application_id' => $application->id,
+        'application_name' => $application->name,
+        'server_id' => $server->id,
+        'server_name' => $server->name,
+        'destination_id' => $destination->id,
+        'deployment_uuid' => 'compose-refresh-before-claim',
+        'pull_request_id' => 0,
+        'commit' => 'compose-refresh-before-claim',
+        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+        'execution_phase' => ApplicationDeploymentExecutionPhase::Prepare,
+        'horizon_job_id' => $deploymentAttempt,
+        'only_this_server' => true,
+    ]);
+    Storage::fake('ssh-keys');
+    Storage::disk('ssh-keys')->put(
+        "ssh_key@{$server->privateKey->uuid}",
+        $server->privateKey->private_key,
+    );
+    Process::fake(function (PendingProcess $process) {
+        $command = is_array($process->command)
+            ? implode(' ', $process->command)
+            : (string) $process->command;
+
+        if (str_contains($command, 'coolify-blue-green-destination-state-attested')) {
+            return Process::result(output: 'coolify-blue-green-destination-state-attested');
+        }
+        if (str_contains($command, '/proc/sys/kernel/random/boot_id')) {
+            return Process::result(output: BlueGreenDeactivationScenario::BOOT_ID);
+        }
+
+        return Process::result(output: '[]');
+    });
+
+    $phaseObservedDuringComposeRefresh = null;
+    $applicationMock = Mockery::mock($application)->makePartial();
+    $applicationMock->shouldReceive('loadComposeFile')
+        ->once()
+        ->andReturnUsing(function () use ($application, $destination, &$phaseObservedDuringComposeRefresh): never {
+            $phaseObservedDuringComposeRefresh = ApplicationBlueGreenDeployment::query()
+                ->where('application_id', $application->id)
+                ->where('standalone_docker_id', $destination->id)
+                ->value('phase');
+
+            throw new RuntimeException('stop after observing Compose refresh ordering');
+        });
+    $job = new ApplicationDeploymentJob($deployment->id, $deploymentAttempt);
+    setBlueGreenComposeJobProperty($job, 'application', $applicationMock);
+
+    try {
+        $job->handlePreparation();
+    } catch (Throwable) {
+    }
+
+    expect($phaseObservedDuringComposeRefresh)->toBeNull()
+        ->and(ApplicationBlueGreenDeployment::query()
+            ->where('application_id', $application->id)
+            ->where('standalone_docker_id', $destination->id)
+            ->exists())->toBeFalse();
+});
 
 function blueGreenComposeJobForClaim(
     Application $application,
