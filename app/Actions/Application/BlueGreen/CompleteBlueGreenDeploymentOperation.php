@@ -85,16 +85,18 @@ final class CompleteBlueGreenDeploymentOperation
                 && $hasExactPromotedRoute
                 && $deployment->blue_green_phase === $state->phase;
             if ($state->operation_deployment_uuid === null) {
+                $isFinalizedTerminalCycle = in_array($deployment->status, [
+                    ApplicationDeploymentStatus::FINISHED->value,
+                    ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+                    ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value,
+                    ApplicationDeploymentStatus::FAILED->value,
+                ], true) && $deployment->finished_at !== null;
+                $isExactCompletionResidue = $deployment->status === ApplicationDeploymentStatus::IN_PROGRESS->value
+                    && $deployment->finished_at === null;
                 if (! $isExactCompletedCycle
                     || $state->legacy_container_name !== null
                     || ! $this->operationProvenanceIsCleared($state)
-                    || ! in_array($deployment->status, [
-                        ApplicationDeploymentStatus::FINISHED->value,
-                        ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
-                        ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value,
-                        ApplicationDeploymentStatus::FAILED->value,
-                    ], true)
-                    || $deployment->finished_at === null) {
+                    || (! $isFinalizedTerminalCycle && ! $isExactCompletionResidue)) {
                     throw new BlueGreenDeploymentTransitionException('The completed blue-green operation does not match the exact finalized claim cycle.');
                 }
 
@@ -167,10 +169,10 @@ final class CompleteBlueGreenDeploymentOperation
                     ),
                     'inactive_retirement_stop_grace_seconds' => $stopGraceSeconds,
                     'inactive_retirement_lease_seconds' => $retirementLeaseSeconds,
-                    'inactive_retirement_last_observed_connections' => $retentionSeconds === 0 ? 0 : null,
-                    'inactive_retirement_observed_at' => $retentionSeconds === 0 ? now() : null,
+                    'inactive_retirement_last_observed_connections' => null,
+                    'inactive_retirement_observed_at' => null,
                     'inactive_retirement_attempts' => 0,
-                    'inactive_retirement_stopped_at' => $retentionSeconds === 0 ? now() : null,
+                    'inactive_retirement_stopped_at' => null,
                     'inactive_retirement_intervention_required_at' => null,
                 ];
             }
@@ -234,14 +236,6 @@ final class CompleteBlueGreenDeploymentOperation
                 false,
             )->update([
                 'blue_green_phase' => BlueGreenDeploymentPhase::IDLE->value,
-                'status' => in_array($deployment->status, [
-                    ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
-                    ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value,
-                    ApplicationDeploymentStatus::FAILED->value,
-                ], true)
-                    ? $deployment->status
-                    : ApplicationDeploymentStatus::FINISHED->value,
-                'finished_at' => $deployment->finished_at ?? now(),
             ]);
             if ($stateUpdated !== 1 || $deploymentUpdated !== 1) {
                 throw new BlueGreenDeploymentTransitionException('The finalized operation changed while durable cleanup was completing.');

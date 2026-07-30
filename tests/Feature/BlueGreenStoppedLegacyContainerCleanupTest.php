@@ -265,5 +265,6 @@ it('removes only an exact stopped base-name legacy container before fixed-color 
         ->and($state->fresh()->active_color)->toBe(BlueGreenDeploymentColor::GREEN)
         ->and($state->fresh()->managed_file_sha256)->toBe($managedSha256)
         ->and($state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::IDLE)
-        ->and($deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FINISHED->value);
+        ->and($deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+        ->and($deployment->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::IDLE);
 });

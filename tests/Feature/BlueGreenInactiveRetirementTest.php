@@ -3,7 +3,6 @@
 use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
 use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
-use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
 use App\Actions\Application\BlueGreen\ComputeBlueGreenDeploymentFingerprint;
 use App\Actions\Application\BlueGreen\DrainBlueGreenPreviousContainer;
@@ -17,6 +16,7 @@ use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\ProxyTypes;
+use App\Jobs\ApplicationDeploymentJob;
 use App\Jobs\RetireBlueGreenInactiveContainerJob;
 use App\Livewire\Project\Application\Advanced;
 use App\Models\Application;
@@ -31,6 +31,7 @@ use App\Models\Team;
 use App\Models\User;
 use App\Services\BlueGreenDeploymentLifecycle;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Storage;
@@ -169,13 +170,13 @@ it('rejects retention outside the bounded interval', function (int $seconds, str
     'above maximum' => [3601, 'max'],
 ]);
 
-it('freezes the retention decision across a concurrent setting change', function () {
+it('always defers a blue-green-managed predecessor and never a legacy one at any retention', function () {
     $application = makeBlueGreenInactiveRetirementApplication();
     $deployment = makeBlueGreenInactiveRetirementDeployment($application);
-    $immediateLifecycle = makeBlueGreenInactiveRetirementLifecycle($application, $deployment);
+    $zeroRetentionLifecycle = makeBlueGreenInactiveRetirementLifecycle($application, $deployment);
     $application->settings->update(['blue_green_inactive_retention_seconds' => 300]);
     $retainedLifecycle = makeBlueGreenInactiveRetirementLifecycle($application, $deployment);
-    $expectation = new BlueGreenContainerExpectation(
+    $managedExpectation = new BlueGreenContainerExpectation(
         name: $application->uuid.'-green',
         dockerId: str_repeat('a', 64),
         applicationId: $application->id,
@@ -185,59 +186,56 @@ it('freezes the retention decision across a concurrent setting change', function
         color: BlueGreenDeploymentColor::GREEN,
         routingRevision: 6,
     );
-    (new ReflectionProperty($immediateLifecycle, 'previousContainerExpectation'))->setValue($immediateLifecycle, $expectation);
-    (new ReflectionProperty($retainedLifecycle, 'previousContainerExpectation'))->setValue($retainedLifecycle, $expectation);
+    $legacyExpectation = new BlueGreenContainerExpectation(
+        name: 'legacy-container',
+        dockerId: str_repeat('b', 64),
+        applicationId: $application->id,
+        pullRequestId: 0,
+        blueGreenManaged: false,
+        deploymentUuid: null,
+        color: null,
+        routingRevision: null,
+    );
+    (new ReflectionProperty($zeroRetentionLifecycle, 'previousContainerExpectation'))->setValue($zeroRetentionLifecycle, $managedExpectation);
+    (new ReflectionProperty($retainedLifecycle, 'previousContainerExpectation'))->setValue($retainedLifecycle, $managedExpectation);
 
-    $application->settings->update(['blue_green_inactive_retention_seconds' => 0]);
-
-    expect($immediateLifecycle->shouldDeferPreviousContainerRetirement())->toBeFalse()
+    expect($zeroRetentionLifecycle->shouldDeferPreviousContainerRetirement())->toBeTrue()
         ->and($retainedLifecycle->shouldDeferPreviousContainerRetirement())->toBeTrue();
+
+    (new ReflectionProperty($zeroRetentionLifecycle, 'previousContainerExpectation'))->setValue($zeroRetentionLifecycle, $legacyExpectation);
+
+    expect($zeroRetentionLifecycle->shouldDeferPreviousContainerRetirement())->toBeFalse();
 });
 
-it('dispatches direct retention with the same durable timeout contract as scheduled redispatch', function () {
+it('dispatches the deferred retirement after finalization with the same durable timeout contract as scheduled redispatch', function () {
     $application = makeBlueGreenInactiveRetirementApplication();
-    $application->settings->update(['blue_green_inactive_retention_seconds' => 300]);
     $deployment = makeBlueGreenInactiveRetirementDeployment($application);
-    $lifecycle = makeBlueGreenInactiveRetirementLifecycle($application, $deployment);
-    $backendPortInventory = BlueGreenBackendPortInventory::fromPorts([3000]);
-    $claim = new BlueGreenDeploymentClaim(
-        stateId: 123,
-        applicationId: $application->id,
-        standaloneDockerId: $application->destination->id,
-        pendingColor: BlueGreenDeploymentColor::GREEN,
-        previousActiveColor: BlueGreenDeploymentColor::BLUE,
-        deploymentUuid: $deployment->deployment_uuid,
-        expectedRoutingRevision: 2,
-        destinationFenceEpoch: 2,
-        serverBootId: '11111111-2222-3333-4444-555555555555',
-        topologyDigest: hash('sha256', 'direct-retirement-topology'),
-        routingConfigDigest: hash('sha256', 'direct-retirement-routing'),
-        backendPortInventory: $backendPortInventory,
-        drainBackendPortInventory: $backendPortInventory,
-        supersessionGeneration: 2,
-        legacyContainerName: null,
-    );
     $deadline = now()->addMinutes(5)->startOfSecond();
-    $state = new ApplicationBlueGreenDeployment([
-        'inactive_retirement_owner_deployment_uuid' => $claim->deploymentUuid,
+    $state = ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $application->id,
+        'standalone_docker_id' => $application->destination->id,
+        'phase' => BlueGreenDeploymentPhase::IDLE,
+        'routing_revision' => 2,
+        'supersession_generation' => 2,
+        'inactive_retirement_owner_deployment_uuid' => $deployment->deployment_uuid,
         'inactive_retirement_color' => BlueGreenDeploymentColor::BLUE,
         'inactive_retirement_container_id' => str_repeat('a', 64),
-        'inactive_retirement_supersession_generation' => $claim->supersessionGeneration,
+        'inactive_retirement_supersession_generation' => 2,
         'inactive_retirement_not_before_at' => $deadline,
         'inactive_retirement_lease_seconds' => 4_000,
     ]);
-    $state->id = 123;
     Queue::fake();
+    $job = new ApplicationDeploymentJob($deployment->id);
 
-    (new ReflectionMethod($lifecycle, 'dispatchInactiveRetirement'))->invoke($lifecycle, $state, $claim);
+    (new ReflectionMethod($job, 'dispatchDeferredBlueGreenRetirement'))->invoke($job, $state);
 
     Queue::assertPushed(
         RetireBlueGreenInactiveContainerJob::class,
-        fn (RetireBlueGreenInactiveContainerJob $job): bool => $job->stateId === 123
-            && $job->ownerDeploymentUuid === $claim->deploymentUuid
-            && $job->supersessionGeneration === $claim->supersessionGeneration
-            && $job->timeout === 4_060
-            && $job->delay?->equalTo($deadline),
+        fn (RetireBlueGreenInactiveContainerJob $retirement): bool => $retirement->stateId === $state->id
+            && $retirement->ownerDeploymentUuid === $deployment->deployment_uuid
+            && $retirement->supersessionGeneration === 2
+            && $retirement->timeout === 4_060
+            && $retirement->delay?->equalTo($deadline),
     );
 });
 
@@ -267,6 +265,43 @@ it('redispatches a durable due inactive retirement owner', function () {
 
     expect(ResumeBlueGreenInactiveRetirements::run())->toBe(0)
         ->and($state->fresh()->inactive_retirement_dispatch_reserved_until_at->isAfter(now()))->toBeTrue();
+});
+
+it('redispatches a retryable retirement with the durable timeout so the retry is never lost', function () {
+    $application = makeBlueGreenInactiveRetirementApplication();
+    $state = ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $application->id,
+        'standalone_docker_id' => $application->destination->id,
+        'phase' => BlueGreenDeploymentPhase::IDLE,
+        'routing_revision' => 2,
+        'supersession_generation' => 2,
+        'inactive_retirement_owner_deployment_uuid' => 'retry-owner',
+        'inactive_retirement_supersession_generation' => 2,
+        'inactive_retirement_not_before_at' => now()->subSecond(),
+        'inactive_retirement_lease_seconds' => 4_000,
+        'inactive_retirement_stop_grace_seconds' => 30,
+    ]);
+    Queue::fake();
+    $heldLock = Cache::lock(
+        BlueGreenDeploymentLock::key($application->id, $application->destination->id),
+        60,
+    );
+    expect($heldLock->get())->toBeTrue();
+
+    try {
+        (new RetireBlueGreenInactiveContainerJob($state->id, 'retry-owner', 2, 4_060))->handle();
+    } finally {
+        $heldLock->release();
+    }
+
+    Queue::assertPushed(
+        RetireBlueGreenInactiveContainerJob::class,
+        fn (RetireBlueGreenInactiveContainerJob $job): bool => $job->stateId === $state->id
+            && $job->ownerDeploymentUuid === 'retry-owner'
+            && $job->supersessionGeneration === 2
+            && $job->timeout === 4_060
+            && $job->delay !== null,
+    );
 });
 
 it('reserves each scheduler page so older due rows cannot starve later owners', function () {

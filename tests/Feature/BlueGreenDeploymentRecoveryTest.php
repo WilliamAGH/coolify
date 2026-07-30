@@ -4,21 +4,68 @@ use App\Actions\Application\BlueGreen\BlueGreenOperationFenceLostException;
 use App\Actions\Application\BlueGreen\CompleteBlueGreenDeploymentOperation;
 use App\Actions\Application\BlueGreen\ReconstructBlueGreenDeploymentRecovery;
 use App\Enums\ApplicationDeploymentStatus;
+use App\Enums\BlueGreenDeploymentPhase;
+use App\Events\ApplicationConfigurationChanged;
+use App\Jobs\ApplicationDeploymentJob;
+use App\Models\ApplicationDeploymentQueue;
+use App\Models\InstanceSettings;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Notification;
+use Illuminate\Support\Facades\Queue;
 use Tests\Support\BlueGreenRecoveryScenario;
 
 uses(RefreshDatabase::class);
 
-it('completes an exact active finalized generation atomically', function () {
+it('completes an exact active finalized generation atomically while leaving queue finalization to the completion finalizer', function () {
     $scenario = BlueGreenRecoveryScenario::create();
     $operation = ReconstructBlueGreenDeploymentRecovery::run($scenario->state);
 
     $state = CompleteBlueGreenDeploymentOperation::run($operation);
 
+    $deployment = $scenario->deployment->fresh();
     expect($state->operation_deployment_uuid)->toBeNull()
         ->and($state->supersession_generation)->toBe($operation->claim->supersessionGeneration)
-        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FINISHED->value)
-        ->and($scenario->deployment->fresh()->finished_at)->not->toBeNull();
+        ->and($deployment->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+        ->and($deployment->finished_at)->toBeNull()
+        ->and($deployment->blue_green_phase)->toBe(BlueGreenDeploymentPhase::IDLE);
+});
+
+it('finalizes the exact completion residue once: publishes success, notifies the winner only, and drains the queue', function () {
+    Notification::fake();
+    Queue::fake();
+    InstanceSettings::unguarded(
+        fn () => InstanceSettings::query()->firstOrCreate(['id' => 0]),
+    );
+    $scenario = BlueGreenRecoveryScenario::create();
+    $scenario->application->environment->project->team->emailNotificationSettings->update([
+        'smtp_enabled' => true,
+        'deployment_success_email_notifications' => true,
+    ]);
+    Event::fake([ApplicationConfigurationChanged::class]);
+    $operation = ReconstructBlueGreenDeploymentRecovery::run($scenario->state);
+    CompleteBlueGreenDeploymentOperation::run($operation);
+    $queuedSuccessor = ApplicationDeploymentQueue::query()->create([
+        'application_id' => $scenario->application->id,
+        'deployment_uuid' => 'queued-successor-after-residue',
+        'pull_request_id' => 0,
+        'destination_id' => $scenario->destination->id,
+        'server_id' => $scenario->server->id,
+        'commit' => 'queued-successor-commit',
+        'status' => ApplicationDeploymentStatus::QUEUED->value,
+    ]);
+
+    (new ApplicationDeploymentJob($scenario->deployment->id))->completeBlueGreenDrainRecovery();
+
+    $deployment = $scenario->deployment->fresh();
+    expect($deployment->status)->toBe(ApplicationDeploymentStatus::FINISHED->value)
+        ->and($deployment->finished_at)->not->toBeNull()
+        ->and($queuedSuccessor->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
+    Notification::assertCount(1);
+
+    (new ApplicationDeploymentJob($scenario->deployment->id))->completeBlueGreenDrainRecovery();
+
+    Notification::assertCount(1);
 });
 
 it('reconstructs the exact trashed recovery operation but never completes it forward', function () {

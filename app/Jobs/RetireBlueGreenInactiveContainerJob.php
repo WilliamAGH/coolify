@@ -56,7 +56,7 @@ final class RetireBlueGreenInactiveContainerJob implements ShouldQueue
             $this->supersessionGeneration,
         );
         if ($outcome === RetireBlueGreenInactiveContainer::RETRY) {
-            self::dispatch($this->stateId, $this->ownerDeploymentUuid, $this->supersessionGeneration)
+            self::dispatch($this->stateId, $this->ownerDeploymentUuid, $this->supersessionGeneration, $this->timeout)
                 ->delay(now()->addSeconds(30));
         }
     }

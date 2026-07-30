@@ -5,6 +5,7 @@ namespace App\Jobs;
 use App\Actions\Application\BlueGreen\ActiveApplicationContainerState;
 use App\Actions\Application\BlueGreen\BlueGreenComposeSidecarDeactivationPlan;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
+use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
 use App\Actions\Application\BlueGreen\BlueGreenLifecycleDatabaseLocks;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
@@ -7554,7 +7555,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
                 $this->blueGreenLifecycle->retirePreviousContainer();
             }
             $this->blueGreenLifecycle->complete();
-            $this->transitionToStatus(ApplicationDeploymentStatus::FINISHED);
+            $this->finalizeBlueGreenCompletion();
 
             return;
         }
@@ -7573,9 +7574,29 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
     public function completeBlueGreenDrainRecovery(): void
     {
         $this->hydrateDeploymentContext();
+        $this->finalizeBlueGreenCompletion();
+    }
+
+    /**
+     * The single blue-green completion finalizer: validates the exact durable
+     * IDLE completion residue, atomically publishes queue success exactly once,
+     * runs success side effects for the CAS winner only, dispatches the
+     * deferred inactive-container retirement after the finish committed, and
+     * always drains the deployment queue. Used by normal completion, drain
+     * recovery, and automatic convergence; re-runs may re-drain but never
+     * re-notify or re-dispatch fleet fanout.
+     */
+    public function finalizeBlueGreenCompletion(): void
+    {
         $this->application_deployment_queue->refresh();
         if ($this->application_deployment_queue->status === ApplicationDeploymentStatus::FINISHED->value) {
+            queue_next_deployment($this->application_deployment_queue);
+
             return;
+        }
+        if ($this->deploymentWasCancelled()) {
+            $this->application_deployment_queue->addLogEntry($this->deploymentCancellationMessage());
+            throw new DeploymentException($this->deploymentCancellationExceptionMessage(), 69420);
         }
         $state = ApplicationBlueGreenDeployment::query()
             ->where('application_id', $this->application->id)
@@ -7619,14 +7640,52 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         if ($completed !== 1) {
             $this->application_deployment_queue->refresh();
             if ($this->application_deployment_queue->status === ApplicationDeploymentStatus::FINISHED->value) {
+                queue_next_deployment($this->application_deployment_queue);
+
                 return;
             }
 
-            throw new DeploymentException('Blue-green drain recovery lost queue ownership before publishing success.');
+            throw new DeploymentException('Blue-green completion lost queue ownership before publishing success.');
         }
         $this->application_deployment_queue->refresh();
+        $this->dispatchDeferredBlueGreenRetirement($state);
         $this->handleStatusTransition(ApplicationDeploymentStatus::FINISHED);
         queue_next_deployment($this->application_deployment_queue);
+    }
+
+    /**
+     * Dispatches the durable inactive-container retirement obligation exactly
+     * once per successful finalization, strictly after the queue finish
+     * committed; the blue-green:retire-inactive scheduler remains the durable
+     * rediscovery owner for every crash in between.
+     */
+    private function dispatchDeferredBlueGreenRetirement(ApplicationBlueGreenDeployment $state): void
+    {
+        $state->refresh();
+        if ($state->inactive_retirement_owner_deployment_uuid !== $this->application_deployment_queue->deployment_uuid
+            || ! is_int($state->inactive_retirement_lease_seconds)
+            || $state->inactive_retirement_not_before_at === null
+            || $state->inactive_retirement_intervention_required_at !== null) {
+            return;
+        }
+        if ($state->inactive_retirement_stopped_at !== null) {
+            $this->application_deployment_queue->addLogEntry(
+                "Inactive {$state->inactive_retirement_color->value} container {$state->inactive_retirement_container_id} was stopped and retained for fast rollback.",
+            );
+
+            return;
+        }
+        RetireBlueGreenInactiveContainerJob::dispatch(
+            $state->id,
+            $state->inactive_retirement_owner_deployment_uuid,
+            $state->inactive_retirement_supersession_generation,
+            BlueGreenDeploymentLock::inactiveRetirementJobTimeoutSeconds(
+                $state->inactive_retirement_lease_seconds,
+            ),
+        )->delay($state->inactive_retirement_not_before_at);
+        $this->application_deployment_queue->addLogEntry(
+            "Inactive {$state->inactive_retirement_color->value} container {$state->inactive_retirement_container_id} remains running until {$state->inactive_retirement_not_before_at->toIso8601String()} for fast rollback; embedded workers, schedulers, and cron processes remain active until retirement.",
+        );
     }
 
     public function deferBlueGreenDrainRecovery(): void

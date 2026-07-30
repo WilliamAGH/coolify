@@ -373,7 +373,8 @@ it('completes a proven three-replica switching route with its stage-specific dig
     expect($completedState->phase)->toBe(BlueGreenDeploymentPhase::IDLE)
         ->and($completedState->operation_deployment_uuid)->toBeNull()
         ->and($completedState->application_routing_config_digest)->toBe($configuration->routingConfigDigest)
-        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FINISHED->value);
+        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+        ->and($scenario->deployment->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::IDLE);
 });
 
 it('restores and proves the legacy route even when the failed candidate is unhealthy', function (): void {
