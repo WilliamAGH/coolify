@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🐛 Bug Fixes
+
+- *(blue-green)* Pace intervention rediscovery with a cooldown and yield the chain
+- *(blue-green)* Stop cleanup from requeuing intervention-owned resource deletions
+
+### 📚 Documentation
+
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.49-fork
+
+## [4.13.48-fork] - 2026-07-30
+
 ### 🚀 Features
 
 - *(deployments)* Transactionally admit deployment requests with reattach semantics
