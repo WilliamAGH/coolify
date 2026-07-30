@@ -79,7 +79,7 @@ it('stops at the bounded attempt limit and leaves rediscovery to the scheduler',
     expect((string) $successor->fresh()->logs)->toContain('bounded retry limit');
 });
 
-it('rediscovers intervention-required destinations and blocked stale successors with bounded dispatch', function () {
+it('rediscovers intervention-required stale successors once per cooldown window', function () {
     Queue::fake();
     $scenario = BlueGreenRecoveryScenario::create(finalized: false);
     $scenario->state->update(['phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED]);
@@ -96,21 +96,26 @@ it('rediscovers intervention-required destinations and blocked stale successors 
             && $job->applicationId === $scenario->application->id
             && $job->standaloneDockerId === $scenario->destination->id,
     );
+
+    expect(ResumeBlueGreenConvergences::run())->toBe(0);
+    Queue::assertPushed(ConvergeBlueGreenDeploymentJob::class, 1);
+
+    ApplicationBlueGreenDeployment::query()->whereKey($scenario->state->id)->update(['updated_at' => now()->subMinutes(15)]);
+
+    expect(ResumeBlueGreenConvergences::run())->toBe(1);
+    Queue::assertPushed(ConvergeBlueGreenDeploymentJob::class, 2);
 });
 
-it('cools down intervention rediscovery for recently attempted states without blocking their stale successors', function () {
+it('does not redispatch stale successors while their intervention state is in cooldown', function () {
     Queue::fake();
     $scenario = BlueGreenRecoveryScenario::create(finalized: false);
     $scenario->state->update(['phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED]);
 
-    expect(ResumeBlueGreenConvergences::run())->toBe(0);
-    Queue::assertNotPushed(ConvergeBlueGreenDeploymentJob::class);
-
     $successor = makeConvergenceSuccessor($scenario, 'convergence-cooldown-successor');
     ApplicationDeploymentQueue::query()->whereKey($successor->id)->update(['updated_at' => now()->subMinutes(5)]);
 
-    expect(ResumeBlueGreenConvergences::run())->toBe(1);
-    Queue::assertPushed(ConvergeBlueGreenDeploymentJob::class, 1);
+    expect(ResumeBlueGreenConvergences::run())->toBe(0);
+    Queue::assertNotPushed(ConvergeBlueGreenDeploymentJob::class);
 });
 
 it('yields to the scheduler instead of chaining while a destination stays intervention-required', function () {

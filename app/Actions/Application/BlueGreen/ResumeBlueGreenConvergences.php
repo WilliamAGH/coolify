@@ -81,6 +81,9 @@ final class ResumeBlueGreenConvergences
             if (isset($visitedDestinations[$destinationKey])) {
                 continue;
             }
+            if (! $this->claimInterventionRediscovery($state, $attemptedBefore)) {
+                continue;
+            }
             $visitedDestinations[$destinationKey] = true;
             ConvergeBlueGreenDeploymentJob::dispatch(
                 (int) $trigger->getKey(),
@@ -114,6 +117,9 @@ final class ResumeBlueGreenConvergences
             if ($state === null || ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state)) {
                 continue;
             }
+            if ($state->phase === BlueGreenDeploymentPhase::INTERVENTION_REQUIRED && ! $this->claimInterventionRediscovery($state, $attemptedBefore)) {
+                continue;
+            }
             $visitedDestinations[$destinationKey] = true;
             ConvergeBlueGreenDeploymentJob::dispatch(
                 (int) $successor->getKey(),
@@ -124,6 +130,19 @@ final class ResumeBlueGreenConvergences
         }
 
         return $dispatched;
+    }
+
+    /**
+     * Claims an intervention state immediately before redispatching it so one
+     * scheduler window cannot enqueue repeated manual-recovery attempts.
+     */
+    private function claimInterventionRediscovery(ApplicationBlueGreenDeployment $state, \DateTimeInterface $attemptedBefore): bool
+    {
+        return ApplicationBlueGreenDeployment::query()
+            ->whereKey($state->getKey())
+            ->where('phase', BlueGreenDeploymentPhase::INTERVENTION_REQUIRED->value)
+            ->where('updated_at', '<=', $attemptedBefore)
+            ->update(['updated_at' => now()]) === 1;
     }
 
     /**
