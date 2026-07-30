@@ -342,6 +342,7 @@ function applicationValidationWorkflowViolations(array $workflow): array
         'tests/Feature/BlueGreenDeploymentReconciliationTest.php',
         'tests/Feature/BlueGreenFinalizedDrainingRecoveryTest.php',
         'tests/Feature/BlueGreenInactiveRetirementTest.php',
+        'tests/Feature/BlueGreenInterventionRecoveryTest.php',
         'tests/Feature/BlueGreenLifecyclePublicRecoveryTest.php',
         'tests/Feature/BlueGreenMigrationReplayTest.php',
         'tests/Feature/BlueGreenMultiPortPromotionAcceptanceTest.php',
@@ -357,6 +358,7 @@ function applicationValidationWorkflowViolations(array $workflow): array
         'tests/Unit/ApplicationDeploymentActivationOrderTest.php',
         'tests/Unit/Actions/Application/BlueGreen/BlueGreenNonRootRemoteExecutionTest.php',
         'tests/Unit/Actions/Proxy/BlueGreenNonRootRemoteExecutionTest.php',
+        'tests/Unit/Actions/Proxy/BlueGreenProxyStateRouteProofTest.php',
         'tests/Unit/ProxyMutationQueueTest.php',
         'tests/Unit/ScheduledJobsRetryConfigTest.php',
     ] as $requiredTest) {
