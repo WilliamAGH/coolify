@@ -1,6 +1,7 @@
 <?php
 
 use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
+use App\Actions\Application\BlueGreen\BlueGreenComposeSidecarDeactivationPlan;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationException;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteOutcome;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteResult;
@@ -1433,6 +1434,44 @@ it('builds a provenance-checked deactivation plan for every fixed Compose sideca
         ->and($command)->toContain('coolify.pullRequestId')
         ->and($command)->toContain("/db-compose-application {$application->id} true 0 application")
         ->and($command)->toContain('docker stop --time=');
+});
+
+it('plans no sidecar removal when the parsed Compose document never completed a round trip', function (): void {
+    $application = blueGreenComposeApplication();
+    $application->forceFill(['docker_compose' => null])->save();
+
+    expect(BlueGreenComposeTopology::ineligibility($application)['incomplete'])->toBeTrue()
+        ->and((new RemoveBlueGreenComposeSidecars)->planFor($application))->toBeNull();
+});
+
+it('still refuses to skip fixed Compose sidecar removal when durable blue-green state already exists', function (): void {
+    $application = blueGreenComposeApplication();
+    $application->forceFill(['docker_compose' => null])->save();
+    ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $application->id,
+        'standalone_docker_id' => $application->destination_id,
+        'operation_id' => (string) Str::uuid(),
+        'phase' => BlueGreenDeploymentPhase::DRAINING->value,
+        'active_color' => BlueGreenDeploymentColor::BLUE->value,
+        'candidate_color' => BlueGreenDeploymentColor::GREEN->value,
+    ]);
+
+    expect(BlueGreenComposeTopology::ineligibility($application)['incomplete'])->toBeTrue()
+        ->and(fn (): ?BlueGreenComposeSidecarDeactivationPlan => (new RemoveBlueGreenComposeSidecars)->planFor($application->fresh()))
+        ->toThrow(BlueGreenDeactivationException::class);
+});
+
+it('names the exact topology conflict when fixed Compose sidecars cannot be proven safe to deactivate', function (): void {
+    $application = blueGreenComposeApplication([
+        'services' => ['worker' => ['network_mode' => 'service:web']],
+    ]);
+
+    expect(BlueGreenComposeTopology::ineligibility($application)['incomplete'])->toBeFalse()
+        ->and(fn (): ?BlueGreenComposeSidecarDeactivationPlan => (new RemoveBlueGreenComposeSidecars)->planFor($application))
+        ->toThrow(
+            BlueGreenDeactivationException::class,
+            'Blue-green Docker Compose service `worker` has unsupported network_mode=service:web topology.',
+        );
 });
 
 it('carries the fixed Compose sidecar removal plan into deletion preparation', function (): void {

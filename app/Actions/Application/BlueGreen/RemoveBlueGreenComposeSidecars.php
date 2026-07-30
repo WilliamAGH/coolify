@@ -36,7 +36,28 @@ final class RemoveBlueGreenComposeSidecars
         }
         $topology = BlueGreenComposeTopology::tryFromApplication($application);
         if ($topology === null) {
-            throw new BlueGreenDeactivationException('The Docker Compose sidecar topology is no longer eligible and cannot be proven safe to deactivate.');
+            $ineligibility = BlueGreenComposeTopology::ineligibility($application);
+            // An unreadable parsed Compose document is only provably harmless
+            // when the application never completed a blue-green deployment: no
+            // durable state means no fixed sidecar was ever started, so there
+            // is nothing to remove and nothing to prove unsafe. Converging here
+            // keeps deletion and deactivation from parking the durable row in
+            // `intervention_required` forever.
+            //
+            // Once durable blue-green state exists the sidecars may be real and
+            // a parse-state reason can be transient (a mid-reparse inventory
+            // mismatch on a healthy application), so an unreadable document
+            // must still fail loudly rather than silently skip their removal.
+            if ($ineligibility['incomplete']
+                && ! $application->blueGreenDeployments()->exists()
+                && ! $application->blueGreenReplicas()->exists()) {
+                return null;
+            }
+
+            throw new BlueGreenDeactivationException(
+                'The Docker Compose sidecar topology is no longer eligible and cannot be proven safe to deactivate: '
+                .($ineligibility['reason'] ?? 'the parsed Compose topology is unavailable.'),
+            );
         }
 
         $sidecars = array_map(
