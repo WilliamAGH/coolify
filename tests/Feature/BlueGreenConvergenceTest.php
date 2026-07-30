@@ -83,6 +83,7 @@ it('rediscovers intervention-required destinations and blocked stale successors 
     Queue::fake();
     $scenario = BlueGreenRecoveryScenario::create(finalized: false);
     $scenario->state->update(['phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED]);
+    ApplicationBlueGreenDeployment::query()->whereKey($scenario->state->id)->update(['updated_at' => now()->subMinutes(15)]);
     $successor = makeConvergenceSuccessor($scenario, 'convergence-rediscovered');
     ApplicationDeploymentQueue::query()->whereKey($successor->id)->update(['updated_at' => now()->subMinutes(5)]);
 
@@ -95,6 +96,33 @@ it('rediscovers intervention-required destinations and blocked stale successors 
             && $job->applicationId === $scenario->application->id
             && $job->standaloneDockerId === $scenario->destination->id,
     );
+});
+
+it('cools down intervention rediscovery for recently attempted states without blocking their stale successors', function () {
+    Queue::fake();
+    $scenario = BlueGreenRecoveryScenario::create(finalized: false);
+    $scenario->state->update(['phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED]);
+
+    expect(ResumeBlueGreenConvergences::run())->toBe(0);
+    Queue::assertNotPushed(ConvergeBlueGreenDeploymentJob::class);
+
+    $successor = makeConvergenceSuccessor($scenario, 'convergence-cooldown-successor');
+    ApplicationDeploymentQueue::query()->whereKey($successor->id)->update(['updated_at' => now()->subMinutes(5)]);
+
+    expect(ResumeBlueGreenConvergences::run())->toBe(1);
+    Queue::assertPushed(ConvergeBlueGreenDeploymentJob::class, 1);
+});
+
+it('yields to the scheduler instead of chaining while a destination stays intervention-required', function () {
+    Queue::fake();
+    $scenario = BlueGreenRecoveryScenario::create(finalized: false);
+    $scenario->state->update(['phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED]);
+    $successor = makeConvergenceSuccessor($scenario, 'convergence-yields');
+
+    (new ConvergeBlueGreenDeploymentJob($successor->id, $scenario->application->id, $scenario->destination->id))->handle();
+
+    expect($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED);
+    Queue::assertNotPushed(ConvergeBlueGreenDeploymentJob::class);
 });
 
 it('rediscovers a blocked stale successor even without an intervention classification', function () {
@@ -138,6 +166,6 @@ it('schedules one bounded blue-green convergence rediscovery in the background',
         ->and($event->onOneServer)->toBeTrue()
         ->and($event->withoutOverlapping)->toBeTrue()
         ->and($event->runInBackground)->toBeTrue()
-        ->and($event->command)->toContain('blue-green:converge --scan=100 --limit=10 --stale-after=60')
+        ->and($event->command)->toContain('blue-green:converge --scan=100 --limit=10 --stale-after=60 --intervention-cooldown=600')
         ->and($event->expression)->toBe('* * * * *');
 });

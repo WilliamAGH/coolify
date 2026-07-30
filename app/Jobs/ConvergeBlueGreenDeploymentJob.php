@@ -99,6 +99,12 @@ final class ConvergeBlueGreenDeploymentJob implements ShouldQueue
 
             return;
         }
+        if ($state->phase === BlueGreenDeploymentPhase::INTERVENTION_REQUIRED) {
+            // A destination that stays intervention-required after an attempt
+            // yields to the scheduler's cooldown-paced rediscovery instead of
+            // stacking another bounded chain against an unprovable state.
+            return;
+        }
 
         $this->scheduleNextAttempt($deployment);
     }

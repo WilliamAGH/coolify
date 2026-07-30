@@ -25,21 +25,31 @@ final class ResumeBlueGreenConvergences
     public string $commandSignature = 'blue-green:converge
         {--scan=100 : Scan at most this many rows per run}
         {--limit=10 : Dispatch at most this many convergences per run}
-        {--stale-after=60 : Only consider queued successors older than this many seconds}';
+        {--stale-after=60 : Only consider queued successors older than this many seconds}
+        {--intervention-cooldown=600 : Only re-attempt intervention states untouched for this many seconds}';
 
     public string $commandDescription = 'Redispatch automatic convergence for intervention-required destinations and blocked queued blue-green successors.';
 
     public const CURSOR_CACHE_KEY = 'blue-green:converge:cursor';
 
-    public function handle(int $scanLimit = 100, int $dispatchLimit = 10, int $staleAfterSeconds = 60): int
-    {
-        if ($scanLimit < 1 || $dispatchLimit < 1 || $staleAfterSeconds < 1) {
-            throw new \InvalidArgumentException('The convergence scan, dispatch, and staleness bounds must be positive.');
+    public function handle(
+        int $scanLimit = 100,
+        int $dispatchLimit = 10,
+        int $staleAfterSeconds = 60,
+        int $interventionCooldownSeconds = 600,
+    ): int {
+        if ($scanLimit < 1 || $dispatchLimit < 1 || $staleAfterSeconds < 1 || $interventionCooldownSeconds < 1) {
+            throw new \InvalidArgumentException('The convergence scan, dispatch, staleness, and cooldown bounds must be positive.');
         }
 
+        // Every recovery attempt touches the state row, so updated_at is the
+        // last-attempted signal: a destination whose recovery keeps failing is
+        // re-attempted once per cooldown window instead of every scheduler run.
         $cursor = (int) Cache::get(self::CURSOR_CACHE_KEY, 0);
+        $attemptedBefore = now()->subSeconds($interventionCooldownSeconds);
         $states = ApplicationBlueGreenDeployment::query()
             ->where('phase', BlueGreenDeploymentPhase::INTERVENTION_REQUIRED->value)
+            ->where('updated_at', '<=', $attemptedBefore)
             ->where('id', '>', $cursor)
             ->orderBy('id')
             ->limit($scanLimit)
@@ -48,6 +58,7 @@ final class ResumeBlueGreenConvergences
             $states = $states->concat(
                 ApplicationBlueGreenDeployment::query()
                     ->where('phase', BlueGreenDeploymentPhase::INTERVENTION_REQUIRED->value)
+                    ->where('updated_at', '<=', $attemptedBefore)
                     ->where('id', '<=', $cursor)
                     ->orderBy('id')
                     ->limit($scanLimit - $states->count())
@@ -157,6 +168,7 @@ final class ResumeBlueGreenConvergences
             scanLimit: (int) $command->option('scan'),
             dispatchLimit: (int) $command->option('limit'),
             staleAfterSeconds: (int) $command->option('stale-after'),
+            interventionCooldownSeconds: (int) $command->option('intervention-cooldown'),
         );
         $command->info("Dispatched {$count} blue-green convergence job(s).");
 
