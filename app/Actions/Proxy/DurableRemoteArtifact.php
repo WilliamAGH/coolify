@@ -42,7 +42,9 @@ final class DurableRemoteArtifact
             '  [ "$#" -eq 2 ] || return 64',
             '  durable_remote_assert_owned_directory "$1" || return 1',
             '  case "$2" in .?* ) ;; *) return 64 ;; esac',
-            '  case "$2" in *[!a-z0-9.-]* ) return 64 ;; esac',
+            // Enumerated class instead of a-z/0-9 ranges: POSIX pattern ranges follow the
+            // host locale's collation, which can admit uppercase on remote hosts.
+            '  case "$2" in *[!abcdefghijklmnopqrstuvwxyz0123456789.-]* ) return 64 ;; esac',
             '  for durable_remote_candidate in "$1"/"$2"*; do',
             '    if [ ! -e "$durable_remote_candidate" ] && [ ! -L "$durable_remote_candidate" ]; then continue; fi',
             '    if [ -d "$durable_remote_candidate" ] && [ ! -L "$durable_remote_candidate" ]; then continue; fi',

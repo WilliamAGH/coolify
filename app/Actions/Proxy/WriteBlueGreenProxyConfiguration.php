@@ -1343,7 +1343,7 @@ class WriteBlueGreenProxyConfiguration
             'test "$container_journal_managed_file_state" = missing',
             'test "$container_journal_managed_checksum" = '.escapeshellarg($emptyChecksum),
             'for container_journal_checksum_value in "$container_journal_expected_state_checksum" "$container_journal_replacement_state_checksum" "$container_journal_managed_checksum" "$container_journal_mutation_checksum" "$container_journal_completion_checksum"; do',
-            '  case "$container_journal_checksum_value" in *[!0-9a-f]*|\'\') exit 1 ;; esac',
+            '  case "$container_journal_checksum_value" in *[!0123456789abcdef]*|\'\') exit 1 ;; esac',
             '  test "${#container_journal_checksum_value}" -eq 64',
             'done',
             'container_journal_replacement_decoded=$(mktemp "$container_journal_state_directory/.blue-green-stale-container-replacement.XXXXXX")',
@@ -1365,7 +1365,7 @@ class WriteBlueGreenProxyConfiguration
             'LC_ALL=C grep -Eq '.escapeshellarg($replacementPattern).' "$container_journal_replacement_decoded"',
             'container_journal_checksum=$(sha256sum "$container_journal_source")',
             'container_journal_checksum=${container_journal_checksum%% *}',
-            'case "$container_journal_checksum" in *[!0-9a-f]*|\'\') exit 1 ;; esac',
+            'case "$container_journal_checksum" in *[!0123456789abcdef]*|\'\') exit 1 ;; esac',
             'test "${#container_journal_checksum}" -eq 64',
         ];
     }
@@ -1480,7 +1480,7 @@ class WriteBlueGreenProxyConfiguration
 
     private function lowercaseUuidAssertionCommand(string $shellValue): string
     {
-        return 'case "'.$shellValue.'" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; *) exit 1 ;; esac';
+        return 'case "'.$shellValue.'" in [0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]) ;; *) exit 1 ;; esac';
     }
 
     /**
@@ -1837,9 +1837,9 @@ class WriteBlueGreenProxyConfiguration
             'test "$mutation_journal_magic" = '.escapeshellarg(self::MUTATION_JOURNAL_MAGIC),
             'test "$mutation_journal_filename" = '.escapeshellarg($managedFilename),
             'case "$mutation_journal_operation" in *[!A-Za-z0-9_-]*|\'\') exit 1 ;; esac',
-            'case "$mutation_journal_expected_boot_id" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; *) exit 1 ;; esac',
+            'case "$mutation_journal_expected_boot_id" in [0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]) ;; *) exit 1 ;; esac',
             $this->bootIdentityAssertionCommand('"$mutation_journal_expected_boot_id"'),
-            'case "$mutation_journal_expected_state_checksum$mutation_journal_replacement_state_checksum$mutation_journal_expected_checksum$mutation_journal_replacement_checksum" in *[!0-9a-f]*) exit 1 ;; esac',
+            'case "$mutation_journal_expected_state_checksum$mutation_journal_replacement_state_checksum$mutation_journal_expected_checksum$mutation_journal_replacement_checksum" in *[!0123456789abcdef]*) exit 1 ;; esac',
             'test "${#mutation_journal_expected_state_checksum}" -eq 64',
             'test "${#mutation_journal_replacement_state_checksum}" -eq 64',
             'test "${#mutation_journal_expected_checksum}" -eq 64',
@@ -1983,9 +1983,9 @@ class WriteBlueGreenProxyConfiguration
             '  exec 5<&-',
             '  test "$container_journal_magic" = '.escapeshellarg(self::CONTAINER_MUTATION_JOURNAL_MAGIC),
             '  test "$container_journal_filename" = '.escapeshellarg($managedFilename),
-            '  case "$container_journal_expected_boot_id" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; *) exit 1 ;; esac',
+            '  case "$container_journal_expected_boot_id" in [0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]) ;; *) exit 1 ;; esac',
             $this->bootIdentityAssertionCommand('"$container_journal_expected_boot_id"'),
-            '  case "$container_journal_expected_state_checksum$container_journal_replacement_state_checksum$container_journal_managed_checksum$container_journal_mutation_checksum$container_journal_completion_checksum" in *[!0-9a-f]*) exit 1 ;; esac',
+            '  case "$container_journal_expected_state_checksum$container_journal_replacement_state_checksum$container_journal_managed_checksum$container_journal_mutation_checksum$container_journal_completion_checksum" in *[!0123456789abcdef]*) exit 1 ;; esac',
             '  test "${#container_journal_expected_state_checksum}" -eq 64',
             '  test "${#container_journal_replacement_state_checksum}" -eq 64',
             '  test "${#container_journal_managed_checksum}" -eq 64',
@@ -2180,7 +2180,7 @@ class WriteBlueGreenProxyConfiguration
             'test "$rollback_file_state" = '.escapeshellarg($rollbackKey->expectedState?->managedSha256 === null
                 ? BlueGreenProxyRollbackArtifact::MISSING_STATE
                 : BlueGreenProxyRollbackArtifact::PRESENT_STATE),
-            'case "$rollback_checksum" in *[!0-9a-f]*|\'\') exit 1 ;; esac',
+            'case "$rollback_checksum" in *[!0123456789abcdef]*|\'\') exit 1 ;; esac',
             'test "${#rollback_checksum}" -eq 64',
             'rollback_actual_checksum=$(sha256sum "$rollback_decoded")',
             'test "${rollback_actual_checksum%% *}" = "$rollback_checksum"',

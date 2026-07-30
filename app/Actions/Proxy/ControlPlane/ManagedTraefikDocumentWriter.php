@@ -1521,7 +1521,7 @@ final class ManagedTraefikDocumentWriter
             '  case "$candidate_operation" in *[!a-z0-9._-]* ) return 1 ;; esac',
             '}',
             'valid_revision() { case "$1" in ""|*[!0-9]*) return 1 ;; *) test "$1" -ge 1 ;; esac; }',
-            'valid_sha256() { test "${#1}" -eq 64 && case "$1" in *[!a-f0-9]*) return 1 ;; *) return 0 ;; esac; }',
+            'valid_sha256() { test "${#1}" -eq 64 && case "$1" in *[!abcdef0123456789]*) return 1 ;; *) return 0 ;; esac; }',
             'read_artifact() {',
             '  artifact_candidate=$1',
             '  artifact_size=$(wc -c < "$artifact_candidate" | tr -d "[:space:]") || return 1',
