@@ -1,5 +1,6 @@
 <?php
 
+use App\Jobs\ApplicationDeploymentJob;
 use App\Models\Application;
 use App\Models\ApplicationPreview;
 use App\Models\Environment;
@@ -149,18 +150,40 @@ test('it rejects an invalid docker tag without creating preview or deployment st
         ->and($application->deployment_queue()->doesntExist())->toBeTrue();
 });
 
-test('it rejects docker_tag without pull_request_id', function () {
+test('it queues a primary deployment with an exact docker_tag frozen on the queue row', function () {
     $application = createDockerImageApplication($this->environment, $this->destination);
 
     $response = $this->withHeaders([
         'Authorization' => 'Bearer '.$this->bearerToken,
     ])->postJson('/api/v1/deploy', [
         'uuid' => $application->uuid,
-        'docker_tag' => 'pr_1234',
+        'docker_tag' => 'sha-'.str_repeat('a', 40),
     ]);
 
-    $response->assertStatus(400);
-    $response->assertJson(['message' => 'docker_tag requires pull_request_id.']);
+    $response->assertSuccessful();
+    $deployment = $application->deployment_queue()->latest('id')->firstOrFail();
+    expect($deployment->pull_request_id)->toBe(0)
+        ->and($deployment->docker_registry_image_tag)->toBe('sha-'.str_repeat('a', 40))
+        ->and($response->json('deployments.0.deployment_uuid'))->toBe($deployment->deployment_uuid)
+        ->and($application->fresh()->docker_registry_image_tag)->not->toBe('sha-'.str_repeat('a', 40));
+});
+
+test('a queued docker tag survives a concurrent application default change', function () {
+    $application = createDockerImageApplication($this->environment, $this->destination);
+    $this->withHeaders([
+        'Authorization' => 'Bearer '.$this->bearerToken,
+    ])->postJson('/api/v1/deploy', [
+        'uuid' => $application->uuid,
+        'docker_tag' => 'sha-queued-identity',
+    ])->assertSuccessful();
+    $deployment = $application->deployment_queue()->latest('id')->firstOrFail();
+
+    $application->update(['docker_registry_image_tag' => 'sha-mutated-later']);
+
+    $job = new ApplicationDeploymentJob($deployment->id);
+    $resolved = (new ReflectionMethod($job, 'resolveDockerImageTag'))->invoke($job);
+
+    expect($resolved)->toBe('sha-queued-identity');
 });
 
 test('it rejects docker_tag for non docker image applications', function () {

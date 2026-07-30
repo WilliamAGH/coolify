@@ -365,7 +365,7 @@ class DeployController extends Controller
             new OA\Parameter(name: 'force', in: 'query', description: 'Force rebuild (without cache)', schema: new OA\Schema(type: 'boolean')),
             new OA\Parameter(name: 'pr', in: 'query', description: 'Pull Request Id for deploying specific PR builds. Cannot be used with tag parameter.', schema: new OA\Schema(type: 'integer')),
             new OA\Parameter(name: 'pull_request_id', in: 'query', description: 'Preview deployment identifier. Alias of pr.', schema: new OA\Schema(type: 'integer')),
-            new OA\Parameter(name: 'docker_tag', in: 'query', description: 'Docker image tag for Docker Image preview deployments. Requires pull_request_id.', schema: new OA\Schema(type: 'string')),
+            new OA\Parameter(name: 'docker_tag', in: 'query', description: 'Docker image tag for Docker Image applications. With pull_request_id it deploys a preview; without it the tag is frozen immutably on the queued primary deployment.', schema: new OA\Schema(type: 'string')),
         ],
 
         responses: [
@@ -429,9 +429,6 @@ class DeployController extends Controller
         }
         if ($tags && $pr) {
             return response()->json(['message' => 'You can only use tag or pr, not both.'], 400);
-        }
-        if ($dockerTag && $pr === 0) {
-            return response()->json(['message' => 'docker_tag requires pull_request_id.'], 400);
         }
         if ($dockerTag && $tags) {
             return response()->json(['message' => 'You can only use tag or docker_tag, not both.'], 400);

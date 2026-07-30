@@ -954,9 +954,15 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         $this->activate_prepared_runtime();
     }
 
+    /**
+     * The queued row's docker tag is the immutable identity of this
+     * deployment; the mutable application default only fills in when no tag
+     * was frozen at admission, so a concurrent PATCH of the application can
+     * never change what an already-queued deployment prepares.
+     */
     private function resolveDockerImageTag(): string
     {
-        if ($this->pull_request_id !== 0 && str($this->dockerImagePreviewTag)->isNotEmpty()) {
+        if (str($this->dockerImagePreviewTag)->isNotEmpty()) {
             return $this->dockerImagePreviewTag;
         }
 
