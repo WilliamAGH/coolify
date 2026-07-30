@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [unreleased]
+
+### 🚀 Features
+
+- *(control-plane)* Add reduced-guarantee live standby seed capture
+
+### 🐛 Bug Fixes
+
+- *(proxy)* Use locale-safe enumerated classes in generated shell guards
+
+### 📚 Documentation
+
+- Update changelog
+
+### 🧪 Testing
+
+- *(unit)* Make the unit suite runnable in a single process
+- *(unit)* Gate namespace helper overrides behind explicit capture flags
+
 ## [4.13.51-fork] - 2026-07-30
 
 ### 🐛 Bug Fixes
