@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🚀 Features
+
+- *(deployments)* Transactionally admit deployment requests with reattach semantics
+- *(blue-green)* Gate dispatch claims behind convergence and admit only the newest request
+- *(deployments)* Freeze the queued docker tag as immutable deployment identity
+
+### 🐛 Bug Fixes
+
+- *(blue-green)* Converge completion through one finalizer with async retirement
+- *(api)* Return real authorization failures from deployment endpoints
+- *(blue-green)* Validate the completion residue by ownership, not claim snapshot
+
+### 📚 Documentation
+
+- *(api)* Regenerate OpenAPI artifacts for docker_tag and blue-green settings
+- Update changelog
+
+### 🧪 Testing
+
+- *(deployments)* Pin queued-tag precedence in docker tag resolution
+- *(blue-green)* Repin the completion refusal message to the residue wording
+
+### ⚙️ Miscellaneous Tasks
+
+- Gate the two shipped recovery test suites in application validation
+- *(release)* Prepare 4.13.48-fork
+
+## [4.13.47-fork] - 2026-07-30
+
 ### 🐛 Bug Fixes
 
 - *(blue-green)* Defer Compose claim until parsing completes
