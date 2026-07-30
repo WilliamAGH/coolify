@@ -6,6 +6,18 @@ All notable changes to this project will be documented in this file.
 
 ### 🐛 Bug Fixes
 
+- *(blue-green)* Converge Compose sidecar deactivation with no parsed topology
+- *(fork-deploy)* Scope the clean-install container check to containers
+- *(control-plane-migrate)* Unblock capture and restore on managed hosts
+
+### 📚 Documentation
+
+- Update changelog
+
+## [4.13.50-fork] - 2026-07-30
+
+### 🐛 Bug Fixes
+
 - *(blue-green)* Atomically claim intervention rediscovery
 
 ### 📚 Documentation
