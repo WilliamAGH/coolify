@@ -1910,8 +1910,12 @@ fd_migration_fingerprint() {
     printf '%s\n' "$fingerprint"
 }
 
+# Unscoped `docker inspect` resolves networks, images, and volumes as well as
+# containers. Coolify always creates a network named "coolify", which survives
+# container and volume removal, so the unscoped form reports unmanaged state on
+# every host that has ever run Coolify and permanently blocks enrollment.
 fd_container_exists() {
-    docker inspect "$1" >/dev/null 2>&1
+    docker container inspect "$1" >/dev/null 2>&1
 }
 
 fd_empty_install_scaffold_directory() {

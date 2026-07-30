@@ -203,7 +203,15 @@ case $name in
             container)
                 case ${2:-} in
                     inspect)
-                        [[ ${3:-} == coolify-realtime && -e ${FORK_DEPLOY_LEGACY_REALTIME_MARKER:-/nonexistent} ]]
+                        # Container-scoped lookup: only containers resolve here. Networks,
+                        # images, and volumes sharing a name must not.
+                        case ${3:-} in
+                            coolify) [[ -e ${FORK_DEPLOY_RUNTIME_MARKER:-/nonexistent} ]] || exit 1 ;;
+                            coolify-realtime) [[ -e ${FORK_DEPLOY_LEGACY_REALTIME_MARKER:-/nonexistent} ]] || exit 1 ;;
+                            coolify-db) [[ -e ${FORK_DEPLOY_DB_MARKER:-${FORK_DEPLOY_RUNTIME_MARKER:-/nonexistent}} ]] || exit 1 ;;
+                            coolify-redis) [[ -e ${FORK_DEPLOY_REDIS_MARKER:-${FORK_DEPLOY_RUNTIME_MARKER:-/nonexistent}} ]] || exit 1 ;;
+                            *) exit 1 ;;
+                        esac
                         ;;
                     stop)
                         [[ ${3:-} == coolify-realtime \
@@ -234,7 +242,10 @@ case $name in
                 inspected=${*: -1}
                 case $inspected in
                     coolify)
-                        [[ -e ${FORK_DEPLOY_RUNTIME_MARKER:-/nonexistent} ]] || exit 1
+                        # Unscoped inspect also resolves networks/images/volumes, which is
+                        # the false positive FORK_DEPLOY_NETWORK_ONLY_MARKER reproduces.
+                        [[ -e ${FORK_DEPLOY_RUNTIME_MARKER:-/nonexistent} \
+                            || -e ${FORK_DEPLOY_NETWORK_ONLY_MARKER:-/nonexistent} ]] || exit 1
                         ;;
                     coolify-realtime) [[ -e ${FORK_DEPLOY_LEGACY_REALTIME_MARKER:-/nonexistent} ]] || exit 1 ;;
                     coolify-db) [[ -e ${FORK_DEPLOY_DB_MARKER:-${FORK_DEPLOY_RUNTIME_MARKER:-/nonexistent}} ]] || exit 1 ;;

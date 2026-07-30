@@ -90,6 +90,7 @@ new_fixture() {
     export FORK_DEPLOY_CANDIDATE_STARTED_MARKER=$FIXTURE/candidate-started
     export FORK_DEPLOY_DB_MARKER=$FIXTURE/database-active
     export FORK_DEPLOY_REDIS_MARKER=$FIXTURE/redis-active
+    export FORK_DEPLOY_NETWORK_ONLY_MARKER=$FIXTURE/network-only-coolify
     export FORK_DEPLOY_LEGACY_REALTIME_MARKER=$FIXTURE/legacy-realtime
     export FORK_DEPLOY_LEGACY_REALTIME_STOPPED_MARKER=$FIXTURE/legacy-realtime-stopped
     export FORK_DEPLOY_ACTIVE_SOURCE=$ROOT/source
@@ -1976,6 +1977,24 @@ test_install_refuses_writable_empty_scaffold() {
 }
 
 
+test_install_ignores_non_container_docker_objects_named_coolify() {
+    new_fixture
+    # A host that previously ran Coolify keeps the "coolify" docker network after its
+    # containers and volumes are removed. The clean-install gate must scope its lookup
+    # to containers, or that leftover network reports unmanaged state forever and no
+    # host can ever be enrolled after a teardown.
+    : >"$FORK_DEPLOY_NETWORK_ONLY_MARKER"
+    write_manifest 4.13.0-fork.1
+    local output
+    if output=$("$SUBJECT" install --offline-manifest "$MANIFEST_FILE" --dry-run 2>&1) \
+        && [[ $output == *'PLAN:'* && $output != *'unmanaged'* ]]; then
+        pass 'leftover non-container docker object named coolify does not block install'
+    else
+        fail 'leftover non-container docker object named coolify does not block install'
+    fi
+    cleanup_fixture
+}
+
 test_refuses_complete_unmanaged_state_before_mutation() {
     new_fixture
     mkdir -p "$ROOT/source" "$ROOT/ssh/keys" "$ROOT/ssh/mux" "$ROOT/applications" \
@@ -2651,6 +2670,7 @@ test_fresh_install_retries_after_prestart_recovery
 test_fresh_install_retries_after_manual_recover_abort
 test_install_refuses_unrecognized_empty_scaffold
 test_install_refuses_writable_empty_scaffold
+test_install_ignores_non_container_docker_objects_named_coolify
 test_refuses_complete_unmanaged_state_before_mutation
 test_refuses_orphan_legacy_volume_without_complete_adoption
 test_refuses_unmanaged_source_asset_without_complete_adoption
