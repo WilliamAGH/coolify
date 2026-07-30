@@ -150,10 +150,11 @@ class Bitbucket extends Controller
                         );
                         if ($result['status'] === 'queue_full') {
                             return response($result['message'], 429)->header('Retry-After', 60);
-                        } elseif ($result['status'] === 'skipped') {
+                        } elseif ($result['status'] === 'reattached') {
                             $return_payloads->push([
                                 'application' => $application->name,
-                                'status' => 'skipped',
+                                'status' => 'reattached',
+                                'deployment_uuid' => $result['deployment_uuid'],
                                 'message' => $result['message'],
                             ]);
                         } else {
@@ -224,10 +225,11 @@ class Bitbucket extends Controller
                         );
                         if ($result['status'] === 'queue_full') {
                             return response($result['message'], 429)->header('Retry-After', 60);
-                        } elseif ($result['status'] === 'skipped') {
+                        } elseif ($result['status'] === 'reattached') {
                             $return_payloads->push([
                                 'application' => $application->name,
-                                'status' => 'skipped',
+                                'status' => 'reattached',
+                                'deployment_uuid' => $result['deployment_uuid'],
                                 'message' => $result['message'],
                             ]);
                         } else {

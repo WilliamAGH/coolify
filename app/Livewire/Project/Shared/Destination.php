@@ -113,10 +113,8 @@ class Destination extends Component
 
                 return;
             }
-            if ($result['status'] === 'skipped') {
-                $this->dispatch('success', 'Deployment skipped', $result['message']);
-
-                return;
+            if ($result['status'] === 'reattached') {
+                $deployment_uuid = $result['deployment_uuid'];
             }
 
             return redirectRoute($this, 'project.application.deployment.show', [

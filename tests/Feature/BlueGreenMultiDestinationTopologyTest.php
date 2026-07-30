@@ -351,6 +351,50 @@ it('keeps rollback fleet children pinned to the root rollback artifact identity'
         ->and($child->git_type)->toBe('gitlab');
 });
 
+it('accepts reattached fleet children instead of exploding when fanout fires twice', function (): void {
+    Queue::fake();
+    $fixture = blueGreenMultiDestinationFixture();
+    $additional = blueGreenMultiDestinationAdditional($fixture['team'], 'double-fire');
+    $fixture['application']->additional_networks()->attach($additional['destination']->id, ['server_id' => $additional['server']->id]);
+    $rootDeployment = blueGreenMultiDestinationQueue(
+        $fixture['application'],
+        $fixture['destination'],
+        $fixture['server'],
+        'double-fire-root',
+        ApplicationDeploymentStatus::FINISHED->value,
+    );
+
+    blueGreenMultiDestinationInvoke(
+        blueGreenMultiDestinationJob($fixture['application'], $rootDeployment->fresh(), $fixture['destination'], $fixture['server']),
+        'deploy_to_additional_destinations',
+    );
+    $child = ApplicationDeploymentQueue::query()
+        ->where('blue_green_fleet_deployment_uuid', $rootDeployment->deployment_uuid)
+        ->where('id', '!=', $rootDeployment->id)
+        ->sole();
+
+    $rootDeployment->fresh()->update([
+        'blue_green_fleet_deployment_uuid' => null,
+        'blue_green_fleet_status' => null,
+    ]);
+
+    blueGreenMultiDestinationInvoke(
+        blueGreenMultiDestinationJob($fixture['application'], $rootDeployment->fresh(), $fixture['destination'], $fixture['server']),
+        'deploy_to_additional_destinations',
+    );
+
+    expect(ApplicationDeploymentQueue::query()
+        ->where('blue_green_fleet_deployment_uuid', $rootDeployment->deployment_uuid)
+        ->where('id', '!=', $rootDeployment->id)
+        ->count())->toBe(1)
+        ->and(ApplicationDeploymentQueue::query()
+            ->where('blue_green_fleet_deployment_uuid', $rootDeployment->deployment_uuid)
+            ->where('id', '!=', $rootDeployment->id)
+            ->sole()->id)->toBe($child->id)
+        ->and($rootDeployment->fresh()->blue_green_fleet_deployment_uuid)->toBe($rootDeployment->deployment_uuid)
+        ->and((string) $rootDeployment->fresh()->logs)->not->toContain('could not enqueue every destination');
+});
+
 it('surfaces a degraded fleet when scheduling rejects the locked topology', function (): void {
     Notification::fake();
     $fixture = blueGreenMultiDestinationFixture();

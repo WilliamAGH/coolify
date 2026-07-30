@@ -188,10 +188,8 @@ class Heading extends Component
 
                 return;
             }
-            if ($result['status'] === 'skipped') {
-                $this->dispatch('error', 'Deployment skipped', $result['message']);
-
-                return;
+            if ($result['status'] === 'reattached') {
+                $this->deploymentUuid = $result['deployment_uuid'];
             }
 
             return $this->redirectRoute('project.application.deployment.show', [
@@ -245,10 +243,8 @@ class Heading extends Component
 
                 return;
             }
-            if ($result['status'] === 'skipped') {
-                $this->dispatch('success', 'Deployment skipped', $result['message']);
-
-                return;
+            if ($result['status'] === 'reattached') {
+                $this->deploymentUuid = $result['deployment_uuid'];
             }
 
             return $this->redirectRoute('project.application.deployment.show', [

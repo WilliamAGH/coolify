@@ -153,10 +153,11 @@ class Github extends Controller
                                 );
                                 if ($result['status'] === 'queue_full') {
                                     return response($result['message'], 429)->header('Retry-After', 60);
-                                } elseif ($result['status'] === 'skipped') {
+                                } elseif ($result['status'] === 'reattached') {
                                     $return_payloads->push([
                                         'application' => $application->name,
-                                        'status' => 'skipped',
+                                        'status' => 'reattached',
+                                        'deployment_uuid' => $result['deployment_uuid'],
                                         'message' => $result['message'],
                                     ]);
                                 } else {
@@ -382,7 +383,7 @@ class Github extends Controller
                                 if ($result['status'] === 'queue_full') {
                                     return response($result['message'], 429)->header('Retry-After', 60);
                                 }
-                                if ($result['status'] !== 'skipped' && ! empty($result['deployment_uuid'])) {
+                                if (! empty($result['deployment_uuid'])) {
                                     auditLog('webhook.deployment.queued', [
                                         'provider' => 'github',
                                         'mode' => 'app',

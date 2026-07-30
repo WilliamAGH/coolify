@@ -66,6 +66,9 @@ class Rollback extends Component
 
             return;
         }
+        if ($result['status'] === 'reattached') {
+            $deployment_uuid = $result['deployment_uuid'];
+        }
 
         return redirectRoute($this, 'project.application.deployment.show', [
             'project_uuid' => $this->parameters['project_uuid'],

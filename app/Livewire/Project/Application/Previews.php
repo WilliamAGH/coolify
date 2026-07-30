@@ -295,10 +295,8 @@ class Previews extends Component
 
                 return;
             }
-            if ($result['status'] === 'skipped') {
-                $this->dispatch('success', 'Deployment skipped', $result['message']);
-
-                return;
+            if ($result['status'] === 'reattached') {
+                $this->deployment_uuid = $result['deployment_uuid'];
             }
 
             return redirect()->route('project.application.deployment.show', [

@@ -4289,13 +4289,13 @@ BASH;
                     docker_registry_image_tag: $fleetOwner->docker_registry_image_tag,
                     blue_green_fleet_deployment_uuid: $fleetOwner->deployment_uuid,
                 );
-                if (($result['status'] ?? null) !== 'queued') {
+                if (! in_array($result['status'] ?? null, ['queued', 'reattached'], true)) {
                     throw new DeploymentException('Blue-green fleet scheduling could not enqueue every destination: '.($result['message'] ?? 'unknown queue failure'));
                 }
                 $fleetOwner->addLogEntry("Blue-green fleet scheduled {$destination->server->name}. Logs: ".route('project.application.deployment.show', [
                     'project_uuid' => data_get($application, 'environment.project.uuid'),
                     'application_uuid' => data_get($application, 'uuid'),
-                    'deployment_uuid' => $deploymentUuid,
+                    'deployment_uuid' => $result['deployment_uuid'] ?? $deploymentUuid,
                     'environment_uuid' => data_get($application, 'environment.uuid'),
                 ]));
             }

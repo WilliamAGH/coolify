@@ -885,3 +885,161 @@ describe('activation job queue restore', function () {
             ->and($deployment->fresh()->horizon_job_id)->toBe($newerAttempt);
     });
 });
+
+describe('transactional admission and reattach', function () {
+    test('reattaches an identical nonterminal deployment and returns its real uuid', function () {
+        $application = makeApplication($this->environment->id, $this->destination->id, 'abc1234');
+
+        $first = queue_application_deployment(
+            application: $application,
+            deployment_uuid: 'admission-first',
+        );
+        $second = queue_application_deployment(
+            application: $application,
+            deployment_uuid: 'admission-second',
+        );
+
+        expect($first['status'])->toBe('queued')
+            ->and($second['status'])->toBe('reattached')
+            ->and($second['deployment_uuid'])->toBe('admission-first')
+            ->and(ApplicationDeploymentQueue::query()->where('application_id', $application->id)->count())->toBe(1);
+    });
+
+    test('promotes force_rebuild on a queued reattach but never mutates a running row', function () {
+        $application = makeApplication($this->environment->id, $this->destination->id, 'abc1234');
+        ApplicationDeploymentQueue::create([
+            'application_id' => $application->id,
+            'application_name' => $application->name,
+            'server_id' => $this->server->id,
+            'server_name' => $this->server->name,
+            'destination_id' => $this->destination->id,
+            'deployment_uuid' => 'admission-running-blocker',
+            'commit' => 'unrelated-running-commit',
+            'pull_request_id' => 0,
+            'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+        ]);
+
+        $first = queue_application_deployment(
+            application: $application,
+            deployment_uuid: 'admission-queued',
+        );
+        $queuedRow = ApplicationDeploymentQueue::query()->where('deployment_uuid', 'admission-queued')->firstOrFail();
+        expect($first['status'])->toBe('queued')
+            ->and($queuedRow->status)->toBe(ApplicationDeploymentStatus::QUEUED->value)
+            ->and((bool) $queuedRow->force_rebuild)->toBeFalse();
+
+        $second = queue_application_deployment(
+            application: $application,
+            deployment_uuid: 'admission-queued-retry',
+            force_rebuild: true,
+        );
+
+        expect($second['status'])->toBe('reattached')
+            ->and($second['deployment_uuid'])->toBe('admission-queued')
+            ->and((bool) $queuedRow->fresh()->force_rebuild)->toBeTrue();
+
+        $runningRetry = queue_application_deployment(
+            application: $application,
+            deployment_uuid: 'admission-running-retry',
+            commit: 'unrelated-running-commit',
+            force_rebuild: true,
+        );
+
+        expect($runningRetry['status'])->toBe('reattached')
+            ->and($runningRetry['deployment_uuid'])->toBe('admission-running-blocker')
+            ->and((bool) ApplicationDeploymentQueue::query()->where('deployment_uuid', 'admission-running-blocker')->firstOrFail()->force_rebuild)->toBeFalse();
+    });
+
+    test('terminal rows never dedup a retry', function () {
+        $application = makeApplication($this->environment->id, $this->destination->id, 'abc1234');
+        ApplicationDeploymentQueue::create([
+            'application_id' => $application->id,
+            'application_name' => $application->name,
+            'server_id' => $this->server->id,
+            'server_name' => $this->server->name,
+            'destination_id' => $this->destination->id,
+            'deployment_uuid' => 'admission-failed',
+            'commit' => 'abc1234',
+            'pull_request_id' => 0,
+            'status' => ApplicationDeploymentStatus::FAILED->value,
+        ]);
+
+        $result = queue_application_deployment(
+            application: $application,
+            deployment_uuid: 'admission-after-failure',
+        );
+
+        expect($result['status'])->toBe('queued')
+            ->and($result['deployment_uuid'])->toBe('admission-after-failure');
+    });
+
+    test('distinct logical identity always creates a new row', function () {
+        $application = makeApplication($this->environment->id, $this->destination->id, 'abc1234');
+        ApplicationDeploymentQueue::create([
+            'application_id' => $application->id,
+            'application_name' => $application->name,
+            'server_id' => $this->server->id,
+            'server_name' => $this->server->name,
+            'destination_id' => $this->destination->id,
+            'deployment_uuid' => 'admission-running-blocker',
+            'commit' => 'unrelated-running-commit',
+            'pull_request_id' => 0,
+            'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+        ]);
+
+        $plain = queue_application_deployment(
+            application: $application,
+            deployment_uuid: 'admission-plain',
+        );
+        $rollback = queue_application_deployment(
+            application: $application,
+            deployment_uuid: 'admission-rollback',
+            rollback: true,
+        );
+        $tagged = queue_application_deployment(
+            application: $application,
+            deployment_uuid: 'admission-tagged',
+            docker_registry_image_tag: 'sha-abc',
+        );
+
+        expect($plain['status'])->toBe('queued')
+            ->and($rollback['status'])->toBe('queued')
+            ->and($tagged['status'])->toBe('queued')
+            ->and(ApplicationDeploymentQueue::query()->where('application_id', $application->id)->count())->toBe(4);
+    });
+
+    test('reattach happens before the capacity check so retries never see queue_full', function () {
+        $application = makeApplication($this->environment->id, $this->destination->id, 'abc1234');
+        $this->server->settings()->update(['deployment_queue_limit' => 1]);
+        ApplicationDeploymentQueue::create([
+            'application_id' => $application->id,
+            'application_name' => $application->name,
+            'server_id' => $this->server->id,
+            'server_name' => $this->server->name,
+            'destination_id' => $this->destination->id,
+            'deployment_uuid' => 'admission-running-blocker',
+            'commit' => 'unrelated-running-commit',
+            'pull_request_id' => 0,
+            'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+        ]);
+        $first = queue_application_deployment(
+            application: $application,
+            deployment_uuid: 'admission-fills-queue',
+        );
+        expect($first['status'])->toBe('queued');
+
+        $retry = queue_application_deployment(
+            application: $application,
+            deployment_uuid: 'admission-retry-at-capacity',
+        );
+        $overflow = queue_application_deployment(
+            application: $application,
+            deployment_uuid: 'admission-overflow',
+            rollback: true,
+        );
+
+        expect($retry['status'])->toBe('reattached')
+            ->and($retry['deployment_uuid'])->toBe('admission-fills-queue')
+            ->and($overflow['status'])->toBe('queue_full');
+    });
+});

@@ -21,12 +21,24 @@ use Illuminate\Support\Str;
 use Laravel\Horizon\Contracts\JobRepository;
 use Spatie\Url\Url;
 
+/**
+ * Transactionally admit a deployment request into the queue.
+ *
+ * Identical nonterminal work is reattached before the capacity check and the
+ * existing row's UUID is returned; the caller polls that receipt. Logical
+ * identity is the application, server + destination, pull request, resolved
+ * commit, queued docker tag, restart_only, rollback, only_this_server, and the
+ * fleet-owner linkage. force_rebuild and no_questions_asked are execution
+ * controls, not identity; terminal rows never dedup a retry.
+ *
+ * @return array{status: 'queued'|'reattached'|'queue_full', message: string, deployment_uuid?: string, existing_deployment?: ApplicationDeploymentQueue}
+ */
 function queue_application_deployment(Application $application, string $deployment_uuid, ?int $pull_request_id = 0, ?string $commit = null, bool $force_rebuild = false, bool $is_webhook = false, bool $is_api = false, bool $restart_only = false, ?string $git_type = null, bool $no_questions_asked = false, ?Server $server = null, ?StandaloneDocker $destination = null, bool $only_this_server = false, bool $rollback = false, ?string $docker_registry_image_tag = null, ?string $blue_green_fleet_deployment_uuid = null)
 {
     if ($blue_green_fleet_deployment_uuid !== null && trim($blue_green_fleet_deployment_uuid) === '') {
         throw new InvalidArgumentException('A blue-green fleet deployment UUID cannot be empty.');
     }
-    $commit = $commit ?: ($application->git_commit_sha ?: 'HEAD');
+    $commit = (string) ($commit ?: ($application->git_commit_sha ?: 'HEAD'));
     $application_id = $application->id;
     $deployment_link = Url::fromString($application->link()."/deployment/{$deployment_uuid}");
     $deployment_url = $deployment_link->getPath();
@@ -42,61 +54,98 @@ function queue_application_deployment(Application $application, string $deployme
         $destination_id = $destination->id;
     }
 
-    // Check if the deployment queue is full for this server
-    $serverForQueueCheck = $server ?? Server::find($server_id);
-    $queue_limit = $serverForQueueCheck->settings->deployment_queue_limit ?? 25;
-    $queued_count = ApplicationDeploymentQueue::where('server_id', $server_id)
-        ->where('status', ApplicationDeploymentStatus::QUEUED->value)
-        ->count();
+    $admission = DB::transaction(function () use ($application, $application_id, $deployment_uuid, $deployment_url, $pull_request_id, $commit, $force_rebuild, $is_webhook, $is_api, $restart_only, $git_type, $server_id, $server_name, $destination_id, $only_this_server, $rollback, $docker_registry_image_tag, $blue_green_fleet_deployment_uuid): array {
+        Application::withTrashed()->whereKey($application_id)->lockForUpdate()->first();
+        $application->settings()->lockForUpdate()->first();
+        $lockedServer = Server::query()->whereKey($server_id)->lockForUpdate()->first();
 
-    if ($queued_count >= $queue_limit) {
+        $candidates = ApplicationDeploymentQueue::query()
+            ->where('application_id', $application_id)
+            ->where('pull_request_id', $pull_request_id)
+            ->whereIn('status', [
+                ApplicationDeploymentStatus::QUEUED->value,
+                ApplicationDeploymentStatus::IN_PROGRESS->value,
+            ])
+            ->orderBy('id')
+            ->lockForUpdate()
+            ->get();
+        $identical = $candidates->first(fn (ApplicationDeploymentQueue $row): bool => (string) $row->server_id === (string) $server_id
+            && (string) $row->destination_id === (string) $destination_id
+            && $row->commit === $commit
+            && $row->docker_registry_image_tag === $docker_registry_image_tag
+            && (bool) $row->restart_only === $restart_only
+            && (bool) $row->rollback === $rollback
+            && (bool) $row->only_this_server === $only_this_server
+            && $row->blue_green_fleet_deployment_uuid === $blue_green_fleet_deployment_uuid);
+        if ($identical !== null) {
+            if ($force_rebuild
+                && ! $identical->force_rebuild
+                && $identical->status === ApplicationDeploymentStatus::QUEUED->value) {
+                ApplicationDeploymentQueue::query()
+                    ->whereKey($identical->getKey())
+                    ->where('status', ApplicationDeploymentStatus::QUEUED->value)
+                    ->update(['force_rebuild' => true]);
+                $identical->setAttribute('force_rebuild', true);
+                $identical->syncOriginalAttribute('force_rebuild');
+            }
+
+            return ['status' => 'reattached', 'deployment' => $identical];
+        }
+
+        $queue_limit = $lockedServer?->settings?->deployment_queue_limit ?? 25;
+        $queued_count = ApplicationDeploymentQueue::query()
+            ->where('server_id', $server_id)
+            ->where('status', ApplicationDeploymentStatus::QUEUED->value)
+            ->count();
+        if ($queued_count >= $queue_limit) {
+            return ['status' => 'queue_full'];
+        }
+
+        $deployment = ApplicationDeploymentQueue::create([
+            'application_id' => $application_id,
+            'application_name' => $application->name,
+            'server_id' => $server_id,
+            'server_name' => $server_name,
+            'destination_id' => $destination_id,
+            'deployment_uuid' => $deployment_uuid,
+            'deployment_url' => $deployment_url,
+            'pull_request_id' => $pull_request_id,
+            'docker_registry_image_tag' => $docker_registry_image_tag,
+            'force_rebuild' => $force_rebuild,
+            'is_webhook' => $is_webhook,
+            'is_api' => $is_api,
+            'restart_only' => $restart_only,
+            'commit' => $commit,
+            'rollback' => $rollback,
+            'git_type' => $git_type,
+            'only_this_server' => $only_this_server,
+            'blue_green_fleet_deployment_uuid' => $blue_green_fleet_deployment_uuid,
+        ]);
+
+        return ['status' => 'queued', 'deployment' => $deployment];
+    }, attempts: 5);
+
+    if ($admission['status'] === 'queue_full') {
         return [
             'status' => 'queue_full',
             'message' => 'Deployment queue is full. Please wait for existing deployments to complete.',
         ];
     }
 
-    // Check if there's already a deployment in progress or queued for this application and commit
-    $existing_deployment = ApplicationDeploymentQueue::where('application_id', $application_id)
-        ->where('commit', $commit)
-        ->where('pull_request_id', $pull_request_id)
-        ->where('docker_registry_image_tag', $docker_registry_image_tag)
-        ->whereIn('status', [ApplicationDeploymentStatus::IN_PROGRESS->value, ApplicationDeploymentStatus::QUEUED->value])
-        ->first();
-
-    if ($existing_deployment) {
-        // If force_rebuild is true or rollback is true or no_questions_asked is true, we'll still create a new deployment
-        if (! $force_rebuild && ! $rollback && ! $no_questions_asked) {
-            // Return the existing deployment's details
-            return [
-                'status' => 'skipped',
-                'message' => 'Deployment already queued for this commit.',
-                'deployment_uuid' => $existing_deployment->deployment_uuid,
-                'existing_deployment' => $existing_deployment,
-            ];
+    $deployment = $admission['deployment'];
+    if ($admission['status'] === 'reattached') {
+        if ($deployment->status === ApplicationDeploymentStatus::QUEUED->value
+            && $deployment->claimForDispatch(bypassServerCapacity: $no_questions_asked)) {
+            dispatch_claimed_application_deployment($deployment);
         }
-    }
 
-    $deployment = ApplicationDeploymentQueue::create([
-        'application_id' => $application_id,
-        'application_name' => $application->name,
-        'server_id' => $server_id,
-        'server_name' => $server_name,
-        'destination_id' => $destination_id,
-        'deployment_uuid' => $deployment_uuid,
-        'deployment_url' => $deployment_url,
-        'pull_request_id' => $pull_request_id,
-        'docker_registry_image_tag' => $docker_registry_image_tag,
-        'force_rebuild' => $force_rebuild,
-        'is_webhook' => $is_webhook,
-        'is_api' => $is_api,
-        'restart_only' => $restart_only,
-        'commit' => $commit,
-        'rollback' => $rollback,
-        'git_type' => $git_type,
-        'only_this_server' => $only_this_server,
-        'blue_green_fleet_deployment_uuid' => $blue_green_fleet_deployment_uuid,
-    ]);
+        return [
+            'status' => 'reattached',
+            'message' => 'Deployment already queued for this commit; reattached to the existing deployment.',
+            'deployment_uuid' => $deployment->deployment_uuid,
+            'existing_deployment' => $deployment,
+        ];
+    }
 
     if ($deployment->claimForDispatch(bypassServerCapacity: $no_questions_asked)) {
         dispatch_claimed_application_deployment($deployment);

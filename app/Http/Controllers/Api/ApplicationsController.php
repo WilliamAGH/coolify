@@ -1470,10 +1470,16 @@ class ApplicationsController extends Controller
                     no_questions_asked: true,
                     is_api: true,
                 );
-                if ($result['status'] === 'skipped') {
+                if ($result['status'] === 'reattached') {
                     return response()->json([
                         'message' => $result['message'],
+                        'deployment_uuid' => $result['deployment_uuid'],
                     ], 200);
+                }
+                if ($result['status'] === 'queue_full') {
+                    return response()->json([
+                        'message' => $result['message'],
+                    ], 429)->header('Retry-After', 60);
                 }
             } else {
                 if ($application->build_pack === 'dockercompose') {
@@ -1721,10 +1727,16 @@ class ApplicationsController extends Controller
                     no_questions_asked: true,
                     is_api: true,
                 );
-                if ($result['status'] === 'skipped') {
+                if ($result['status'] === 'reattached') {
                     return response()->json([
                         'message' => $result['message'],
+                        'deployment_uuid' => $result['deployment_uuid'],
                     ], 200);
+                }
+                if ($result['status'] === 'queue_full') {
+                    return response()->json([
+                        'message' => $result['message'],
+                    ], 429)->header('Retry-After', 60);
                 }
             } else {
                 if ($application->build_pack === 'dockercompose') {
@@ -1942,10 +1954,16 @@ class ApplicationsController extends Controller
                     no_questions_asked: true,
                     is_api: true,
                 );
-                if ($result['status'] === 'skipped') {
+                if ($result['status'] === 'reattached') {
                     return response()->json([
                         'message' => $result['message'],
+                        'deployment_uuid' => $result['deployment_uuid'],
                     ], 200);
+                }
+                if ($result['status'] === 'queue_full') {
+                    return response()->json([
+                        'message' => $result['message'],
+                    ], 429)->header('Retry-After', 60);
                 }
             } else {
                 if ($application->build_pack === 'dockercompose') {
@@ -2074,10 +2092,16 @@ class ApplicationsController extends Controller
                     no_questions_asked: true,
                     is_api: true,
                 );
-                if ($result['status'] === 'skipped') {
+                if ($result['status'] === 'reattached') {
                     return response()->json([
                         'message' => $result['message'],
+                        'deployment_uuid' => $result['deployment_uuid'],
                     ], 200);
+                }
+                if ($result['status'] === 'queue_full') {
+                    return response()->json([
+                        'message' => $result['message'],
+                    ], 429)->header('Retry-After', 60);
                 }
             }
 
@@ -2205,10 +2229,16 @@ class ApplicationsController extends Controller
                     no_questions_asked: true,
                     is_api: true,
                 );
-                if ($result['status'] === 'skipped') {
+                if ($result['status'] === 'reattached') {
                     return response()->json([
                         'message' => $result['message'],
+                        'deployment_uuid' => $result['deployment_uuid'],
                     ], 200);
+                }
+                if ($result['status'] === 'queue_full') {
+                    return response()->json([
+                        'message' => $result['message'],
+                    ], 429)->header('Retry-After', 60);
                 }
             }
 
@@ -3151,10 +3181,16 @@ class ApplicationsController extends Controller
                 deployment_uuid: $deployment_uuid,
                 is_api: true,
             );
-            if ($result['status'] === 'skipped') {
+            if ($result['status'] === 'reattached') {
                 return response()->json([
                     'message' => $result['message'],
+                    'deployment_uuid' => $result['deployment_uuid'],
                 ], 200);
+            }
+            if ($result['status'] === 'queue_full') {
+                return response()->json([
+                    'message' => $result['message'],
+                ], 429)->header('Retry-After', 60);
             }
         }
 
@@ -4074,15 +4110,16 @@ class ApplicationsController extends Controller
             is_api: true,
             no_questions_asked: $instant_deploy
         );
-        if ($result['status'] === 'skipped') {
+        if ($result['status'] === 'queue_full') {
             return response()->json(
                 [
                     'message' => $result['message'],
                 ],
-                200
-            );
+                429
+            )->header('Retry-After', 60);
         }
 
+        $deployment_uuid = $result['deployment_uuid'];
         auditLog('api.application.deployed', [
             'team_id' => $teamId,
             'application_uuid' => $application->uuid,
@@ -4094,7 +4131,9 @@ class ApplicationsController extends Controller
 
         return response()->json(
             [
-                'message' => 'Deployment request queued.',
+                'message' => $result['status'] === 'reattached'
+                    ? $result['message']
+                    : 'Deployment request queued.',
                 'deployment_uuid' => $deployment_uuid,
             ],
             200
@@ -4271,12 +4310,13 @@ class ApplicationsController extends Controller
             restart_only: true,
             is_api: true,
         );
-        if ($result['status'] === 'skipped') {
+        if ($result['status'] === 'queue_full') {
             return response()->json([
                 'message' => $result['message'],
-            ], 200);
+            ], 429)->header('Retry-After', 60);
         }
 
+        $deployment_uuid = $result['deployment_uuid'];
         auditLog('api.application.restarted', [
             'team_id' => $teamId,
             'application_uuid' => $application->uuid,
@@ -4286,7 +4326,9 @@ class ApplicationsController extends Controller
 
         return response()->json(
             [
-                'message' => 'Restart request queued.',
+                'message' => $result['status'] === 'reattached'
+                    ? $result['message']
+                    : 'Restart request queued.',
                 'deployment_uuid' => $deployment_uuid,
             ],
         );

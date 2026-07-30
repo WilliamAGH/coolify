@@ -586,19 +586,20 @@ class DeployController extends Controller
                 );
                 if ($result['status'] === 'queue_full') {
                     return ['message' => $result['message'], 'deployment_uuid' => null, 'status' => 429];
-                } elseif ($result['status'] === 'skipped') {
-                    $message = $result['message'];
-                } else {
-                    $message = "Application {$resource->name} deployment queued.";
-                    auditLog('api.deployment.triggered', [
-                        'resource_type' => 'application',
-                        'application_uuid' => $resource->uuid,
-                        'application_name' => $resource->name,
-                        'deployment_uuid' => $deployment_uuid,
-                        'force_rebuild' => $force,
-                        'pull_request_id' => $pr,
-                    ]);
                 }
+                $deployment_uuid = $result['deployment_uuid'];
+                $message = $result['status'] === 'reattached'
+                    ? $result['message']
+                    : "Application {$resource->name} deployment queued.";
+                auditLog('api.deployment.triggered', [
+                    'resource_type' => 'application',
+                    'application_uuid' => $resource->uuid,
+                    'application_name' => $resource->name,
+                    'deployment_uuid' => $deployment_uuid,
+                    'force_rebuild' => $force,
+                    'pull_request_id' => $pr,
+                    'reattached' => $result['status'] === 'reattached',
+                ]);
                 break;
             case Service::class:
                 // Check authorization for service deployment
