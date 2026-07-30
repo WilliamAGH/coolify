@@ -4,6 +4,7 @@ use App\Enums\ApplicationDeploymentStatus;
 use App\Models\Application;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\Environment;
+use App\Models\InstanceSettings;
 use App\Models\Project;
 use App\Models\Server;
 use App\Models\Team;
@@ -14,6 +15,9 @@ use Illuminate\Support\Str;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
+    InstanceSettings::unguarded(
+        fn () => InstanceSettings::query()->firstOrCreate(['id' => 0]),
+    );
     $this->team = Team::factory()->create();
     $this->user = User::factory()->create();
     $this->team->members()->attach($this->user->id, ['role' => 'owner']);
@@ -51,6 +55,22 @@ describe('GET /api/v1/deployments/{uuid}', function () {
 
         $response->assertNotFound();
         $response->assertJson(['message' => 'Deployment not found.']);
+    });
+
+    test('rejects a token whose user is no longer a team member', function () {
+        $deployment = ApplicationDeploymentQueue::create([
+            'deployment_uuid' => 'membership-revoked-uuid',
+            'application_id' => $this->application->id,
+            'server_id' => $this->server->id,
+            'status' => ApplicationDeploymentStatus::QUEUED->value,
+        ]);
+        $this->team->members()->detach($this->user->id);
+
+        $response = $this->withHeaders([
+            'Authorization' => 'Bearer '.$this->bearerToken,
+        ])->getJson("/api/v1/deployments/{$deployment->deployment_uuid}");
+
+        expect($response->getStatusCode())->toBeIn([401, 403]);
     });
 
     test('returns deployment when uuid is valid and belongs to team', function () {

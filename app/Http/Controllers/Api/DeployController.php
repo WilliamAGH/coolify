@@ -140,6 +140,7 @@ class DeployController extends Controller
         if (! $application || data_get($application->team(), 'id') !== (int) $teamId) {
             return response()->json(['message' => 'Deployment not found.'], 404);
         }
+        $this->authorize('view', $application);
 
         return response()->json($this->removeSensitiveData($deployment));
     }
@@ -481,6 +482,9 @@ class DeployController extends Controller
                 if (isset($result['status']) && $result['status'] === 429) {
                     return response()->json(['message' => $result['message']], 429)->header('Retry-After', 60);
                 }
+                if (isset($result['status']) && $result['status'] === 403) {
+                    return response()->json(['message' => $result['message']], 403);
+                }
                 ['message' => $return_message, 'deployment_uuid' => $deployment_uuid] = $result;
                 if ($deployment_uuid) {
                     $deployments->push(['message' => $return_message, 'resource_uuid' => $uuid, 'deployment_uuid' => $deployment_uuid]);
@@ -527,6 +531,9 @@ class DeployController extends Controller
                 if (isset($result['status']) && $result['status'] === 429) {
                     return response()->json(['message' => $result['message']], 429)->header('Retry-After', 60);
                 }
+                if (isset($result['status']) && $result['status'] === 403) {
+                    return response()->json(['message' => $result['message']], 403);
+                }
                 ['message' => $return_message, 'deployment_uuid' => $deployment_uuid] = $result;
                 if ($deployment_uuid) {
                     $deployments->push(['resource_uuid' => $resource->uuid, 'deployment_uuid' => $deployment_uuid]);
@@ -563,7 +570,7 @@ class DeployController extends Controller
                 try {
                     $this->authorize('deploy', $resource);
                 } catch (AuthorizationException $e) {
-                    return ['message' => 'Unauthorized to deploy this application.', 'deployment_uuid' => null];
+                    return ['message' => 'Unauthorized to deploy this application.', 'deployment_uuid' => null, 'status' => 403];
                 }
                 if ($dockerTag !== null && $resource->build_pack !== 'dockerimage') {
                     return ['message' => 'docker_tag can only be used with Docker Image applications.', 'deployment_uuid' => null];
@@ -598,7 +605,7 @@ class DeployController extends Controller
                 try {
                     $this->authorize('deploy', $resource);
                 } catch (AuthorizationException $e) {
-                    return ['message' => 'Unauthorized to deploy this service.', 'deployment_uuid' => null];
+                    return ['message' => 'Unauthorized to deploy this service.', 'deployment_uuid' => null, 'status' => 403];
                 }
                 StartService::run($resource);
                 $message = "Service {$resource->name} started. It could take a while, be patient.";
@@ -612,7 +619,7 @@ class DeployController extends Controller
                 try {
                     $this->authorize('manage', $resource);
                 } catch (AuthorizationException $e) {
-                    return ['message' => 'Unauthorized to start this database.', 'deployment_uuid' => null];
+                    return ['message' => 'Unauthorized to start this database.', 'deployment_uuid' => null, 'status' => 403];
                 }
                 StartDatabase::dispatch($resource);
 
@@ -753,7 +760,6 @@ class DeployController extends Controller
         }
 
         // Check authorization to view application deployments
-        $this->authorize('view', $application);
 
         $deployments = $application->deployments($skip, $take);
         if ($request->attributes->get('can_read_sensitive', false) === true) {

@@ -57,6 +57,19 @@ function createDockerImageApplication(Environment $environment, StandaloneDocker
     ]);
 }
 
+test('it returns 403 when the token user is not authorized to deploy the application', function () {
+    $application = createDockerImageApplication($this->environment, $this->destination);
+    $this->team->members()->updateExistingPivot($this->user->id, ['role' => 'member']);
+
+    $response = $this->withHeaders([
+        'Authorization' => 'Bearer '.$this->bearerToken,
+        'Accept' => 'application/json',
+    ])->postJson('/api/v1/deploy?uuid='.$application->uuid);
+
+    $response->assertForbidden();
+    expect($application->deployment_queue()->count())->toBe(0);
+});
+
 test('it queues a docker image preview deployment and stores the preview tag', function () {
     $application = createDockerImageApplication($this->environment, $this->destination);
 

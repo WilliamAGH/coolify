@@ -148,32 +148,6 @@ function queue_next_deployment(ApplicationDeploymentQueue $finishedDeployment): 
     }
 }
 
-function next_queuable(string $server_id, string $application_id, string $commit = 'HEAD', int $pull_request_id = 0): bool
-{
-    // Check if there's already a deployment in progress for this application with the same pull_request_id
-    // This allows normal deployments and PR deployments to run concurrently
-    $in_progress = ApplicationDeploymentQueue::where('application_id', $application_id)
-        ->where('pull_request_id', $pull_request_id)
-        ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
-        ->exists();
-
-    if ($in_progress) {
-        return false;
-    }
-
-    // Check server's concurrent build limit
-    $server = Server::find($server_id);
-    $concurrent_builds = $server->settings->concurrent_builds;
-    $active_deployments = ApplicationDeploymentQueue::where('server_id', $server_id)
-        ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
-        ->count();
-
-    if ($active_deployments >= $concurrent_builds) {
-        return false;
-    }
-
-    return true;
-}
 function next_after_cancel(ApplicationDeploymentQueue $cancelledDeployment): void
 {
     queue_next_deployment($cancelledDeployment);
