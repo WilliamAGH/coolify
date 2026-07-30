@@ -1,9 +1,30 @@
 <?php
 
 namespace App\Models {
+    use Tests\Support\GithubInstallationTokenStub;
+
+    /**
+     * Namespace-level override of the global generateGithubInstallationToken()
+     * helper. Once this file is loaded the override shadows the global helper
+     * for the whole App\Models namespace for the rest of the process, so it
+     * must delegate to the global helper unless stub mode is explicitly
+     * enabled — otherwise every later test hitting a private GithubApp flow
+     * silently receives this fixture token.
+     */
     function generateGithubInstallationToken(GithubApp $source): string
     {
-        return 'review token/with+symbols';
+        if (GithubInstallationTokenStub::$enabled) {
+            return 'review token/with+symbols';
+        }
+
+        return \generateGithubInstallationToken($source);
+    }
+}
+
+namespace Tests\Support {
+    class GithubInstallationTokenStub
+    {
+        public static bool $enabled = false;
     }
 }
 
@@ -11,6 +32,15 @@ namespace {
     use App\Models\Application;
     use App\Models\ApplicationSetting;
     use App\Models\GithubApp;
+    use Tests\Support\GithubInstallationTokenStub;
+
+    beforeEach(function (): void {
+        GithubInstallationTokenStub::$enabled = true;
+    });
+
+    afterEach(function (): void {
+        GithubInstallationTokenStub::$enabled = false;
+    });
 
     test('private github app submodule credentials use per command git config', function () {
         $application = new Application;

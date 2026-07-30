@@ -2,10 +2,30 @@
 
 namespace App\Actions\Server {
     use Illuminate\Support\Collection;
+    use Tests\Support\InstallDockerRemoteProcessCapture;
 
-    function remote_process(Collection|array $commands): Collection
+    /**
+     * Namespace-level override of the global remote_process() helper. Once this
+     * file is loaded the override shadows the global helper for the whole
+     * App\Actions\Server namespace for the rest of the process, so it must
+     * delegate to the global helper unless capture mode is explicitly enabled —
+     * otherwise it silently swallows remote_process() calls from every other
+     * action in this namespace (e.g. UpdateCoolify) in later tests.
+     */
+    function remote_process(Collection|array $commands, ...$args)
     {
-        return $commands instanceof Collection ? $commands : collect($commands);
+        if (InstallDockerRemoteProcessCapture::$enabled) {
+            return $commands instanceof Collection ? $commands : collect($commands);
+        }
+
+        return \remote_process($commands, ...$args);
+    }
+}
+
+namespace Tests\Support {
+    class InstallDockerRemoteProcessCapture
+    {
+        public static bool $enabled = false;
     }
 }
 
@@ -14,9 +34,18 @@ namespace {
     use App\Models\Server;
     use Illuminate\Foundation\Testing\RefreshDatabase;
     use Illuminate\Support\Str;
+    use Tests\Support\InstallDockerRemoteProcessCapture;
     use Tests\TestCase;
 
     uses(TestCase::class, RefreshDatabase::class);
+
+    beforeEach(function (): void {
+        InstallDockerRemoteProcessCapture::$enabled = true;
+    });
+
+    afterEach(function (): void {
+        InstallDockerRemoteProcessCapture::$enabled = false;
+    });
 
     it('delegates managed-server daemon mutation to the canonical installer entrypoint', function (): void {
         $certificates = Mockery::mock();
