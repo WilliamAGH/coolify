@@ -7613,26 +7613,33 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
             BlueGreenDeploymentColor::GREEN => 'green_deployment_uuid',
             null => null,
         };
-        if ($this->application_deployment_queue->status !== ApplicationDeploymentStatus::IN_PROGRESS->value
-            || $state === null
-            || $deploymentColumn === null
-            || $state->phase !== BlueGreenDeploymentPhase::IDLE
-            || $state->legacy_container_name !== null
-            || $state->{$deploymentColumn} !== $this->application_deployment_queue->deployment_uuid
-            || $this->application_deployment_queue->blue_green_phase !== BlueGreenDeploymentPhase::IDLE
-            || $this->application_deployment_queue->blue_green_color !== $state->active_color
-            || $this->application_deployment_queue->blue_green_routing_revision !== $state->routing_revision
-            || $this->application_deployment_queue->blue_green_destination_fence_epoch !== $state->destination_fence_epoch
-            || $this->application_deployment_queue->blue_green_topology_digest !== $state->destination_topology_digest
-            || ! is_string($this->application_deployment_queue->blue_green_routing_config_digest)
-            || preg_match('/^[a-f0-9]{64}$/D', $this->application_deployment_queue->blue_green_routing_config_digest) !== 1
-            || ! is_string($state->application_routing_config_digest)
-            || preg_match('/^[a-f0-9]{64}$/D', $state->application_routing_config_digest) !== 1) {
-            throw new DeploymentException('Blue-green drain recovery cannot mark deployment success before its exact durable IDLE completion state is present.');
+        // CompleteBlueGreenDeploymentOperation is the sole owner of the exact
+        // claim-cycle validation and only ever leaves this residue behind
+        // after it passed; the finalizer re-proves ownership of the residue —
+        // committed IDLE, cleared provenance, this deployment as the active
+        // owner at the same supersession generation — before publishing.
+        $residueViolation = match (true) {
+            $this->application_deployment_queue->status !== ApplicationDeploymentStatus::IN_PROGRESS->value => 'queue status is not in progress',
+            $state === null => 'destination has no durable blue-green state',
+            $deploymentColumn === null => 'durable state has no active color',
+            $state->phase !== BlueGreenDeploymentPhase::IDLE => "durable state phase is {$state->phase->value}",
+            $state->legacy_container_name !== null => 'legacy container provenance remains',
+            $state->{$deploymentColumn} !== $this->application_deployment_queue->deployment_uuid => 'another deployment owns the active color',
+            $this->application_deployment_queue->blue_green_phase !== BlueGreenDeploymentPhase::IDLE => 'queue row did not commit lifecycle IDLE',
+            $this->application_deployment_queue->blue_green_color !== $state->active_color => 'queue row color disagrees with the active color',
+            $this->application_deployment_queue->blue_green_supersession_generation !== $state->supersession_generation => 'a newer supersession generation owns this destination',
+            ! is_string($this->application_deployment_queue->blue_green_routing_config_digest)
+                || preg_match('/^[a-f0-9]{64}$/D', $this->application_deployment_queue->blue_green_routing_config_digest) !== 1 => 'queue row has no exact routing config digest',
+            ! is_string($state->application_routing_config_digest)
+                || preg_match('/^[a-f0-9]{64}$/D', $state->application_routing_config_digest) !== 1 => 'durable state has no exact routing config digest',
+            default => null,
+        };
+        if ($residueViolation !== null) {
+            throw new DeploymentException("Blue-green completion cannot publish deployment success before its exact durable IDLE completion residue is present: {$residueViolation}.");
         }
         foreach (ApplicationBlueGreenDeployment::clearedOperationAttributes() as $attribute => $_) {
             if ($state->{$attribute} !== null) {
-                throw new DeploymentException('Blue-green drain recovery cannot mark deployment success while operation provenance remains.');
+                throw new DeploymentException("Blue-green completion cannot publish deployment success while operation provenance remains: {$attribute}.");
             }
         }
 

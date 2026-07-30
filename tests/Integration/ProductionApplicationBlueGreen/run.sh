@@ -47,13 +47,16 @@ chmod 0600 "$capture_output_file"
 owned_child_is_running()
 {
     expected_pid=$1
-    for running_pid in $(jobs -p); do
-        if test "$running_pid" = "$expected_pid"; then
-            return 0
-        fi
-    done
+    # jobs -p keeps listing terminated-but-unreaped children on some shells
+    # (macOS bash-as-sh), which would spin the deadline loop on a dead child,
+    # so liveness comes from the kernel process table and excludes zombies.
+    child_state=$(ps -o stat= -p "$expected_pid" 2>/dev/null | tr -d ' \n')
+    test -n "$child_state" || return 1
+    case "$child_state" in
+        Z*) return 1 ;;
+    esac
 
-    return 1
+    return 0
 }
 
 terminate_owned_child()
