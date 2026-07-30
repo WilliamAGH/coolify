@@ -354,7 +354,7 @@ it('refuses to mark an arbitrary nonfinal deployment successful through drain re
     $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
 
     expect(fn () => $fixture['job']->completeBlueGreenDrainRecovery())
-        ->toThrow(DeploymentException::class, 'exact durable IDLE completion state');
+        ->toThrow(DeploymentException::class, 'exact durable IDLE completion residue');
 
     expect($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
 });
@@ -369,7 +369,7 @@ it('refuses completed drain recovery with a malformed claim or runtime route dig
     }
 
     expect(fn () => $fixture['job']->completeBlueGreenDrainRecovery())
-        ->toThrow(DeploymentException::class, 'exact durable IDLE completion state');
+        ->toThrow(DeploymentException::class, 'exact durable IDLE completion residue');
 
     expect($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
 })->with(['claim', 'runtime']);
