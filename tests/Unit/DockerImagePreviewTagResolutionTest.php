@@ -27,7 +27,7 @@ it('prefers the preview specific docker image tag for preview deployments', func
     expect($method->invoke($job))->toBe('pr_42');
 });
 
-it('falls back to the application docker image tag for non preview deployments', function () {
+it('prefers the immutable queued tag over the mutable application tag for primary deployments', function () {
     $reflection = new ReflectionClass(ApplicationDeploymentJob::class);
     $job = $reflection->newInstanceWithoutConstructor();
 
@@ -43,7 +43,31 @@ it('falls back to the application docker image tag for non preview deployments',
 
     $previewTagProperty = $reflection->getProperty('dockerImagePreviewTag');
     $previewTagProperty->setAccessible(true);
-    $previewTagProperty->setValue($job, 'pr_42');
+    $previewTagProperty->setValue($job, 'sha-frozen-at-admission');
+
+    $method = $reflection->getMethod('resolveDockerImageTag');
+    $method->setAccessible(true);
+
+    expect($method->invoke($job))->toBe('sha-frozen-at-admission');
+});
+
+it('falls back to the application docker image tag when no tag was frozen on the queue row', function () {
+    $reflection = new ReflectionClass(ApplicationDeploymentJob::class);
+    $job = $reflection->newInstanceWithoutConstructor();
+
+    $pullRequestProperty = $reflection->getProperty('pull_request_id');
+    $pullRequestProperty->setAccessible(true);
+    $pullRequestProperty->setValue($job, 0);
+
+    $applicationProperty = $reflection->getProperty('application');
+    $applicationProperty->setAccessible(true);
+    $applicationProperty->setValue($job, new Application([
+        'docker_registry_image_tag' => 'stable',
+    ]));
+
+    $previewTagProperty = $reflection->getProperty('dockerImagePreviewTag');
+    $previewTagProperty->setAccessible(true);
+    $previewTagProperty->setValue($job, null);
 
     $method = $reflection->getMethod('resolveDockerImageTag');
     $method->setAccessible(true);
