@@ -3483,6 +3483,12 @@ BASH;
         }
 
         $safeComposePath = escapeshellarg("{$this->workdir}{$this->docker_compose_location}");
+        // `config` re-interpolates the Compose file, and a file with required
+        // variables (`${VAR:?...}`) fails interpolation without the same env
+        // the build used — leaving an empty image list whose hash is the
+        // sha256 of a bare newline instead of a real digest.
+        $safeEnvPath = escapeshellarg("{$this->workdir}/.env");
+        $composeConfig = "docker compose --env-file {$safeEnvPath} -f {$safeComposePath} config --images";
         $services = $this->blueGreenComposePreparedServiceNames();
         if ($services === []) {
             if (($this->blueGreenLifecycle?->isEnabled() ?? false) || $this->blueGreenLifecycle?->claim() !== null) {
@@ -3494,13 +3500,13 @@ BASH;
             // Registry images may not be pulled yet at attestation time, so
             // pull missing images first and fail hard when a pull fails
             // instead of digesting a partial image set.
-            $ensureImagesPresent = "docker compose -f {$safeComposePath} config --images | while IFS= read -r image; do [ -n \"\$image\" ] || continue; docker image inspect --format='{{.Id}}' \"\$image\" >/dev/null 2>&1 || docker pull \"\$image\" >/dev/null || exit 1; done";
+            $ensureImagesPresent = "{$composeConfig} | while IFS= read -r image; do [ -n \"\$image\" ] || continue; docker image inspect --format='{{.Id}}' \"\$image\" >/dev/null 2>&1 || docker pull \"\$image\" >/dev/null || exit 1; done";
 
-            return "{$ensureImagesPresent} && image_ids=\"$(docker compose -f {$safeComposePath} config --images | while IFS= read -r image; do test -n \"\$image\"; docker image inspect --format='{{.Id}}' \"\$image\"; done | sort -u)\"; test -n \"\$image_ids\"; printf '%s\\n' \"\$image_ids\" | sha256sum | cut -d ' ' -f1";
+            return "{$ensureImagesPresent} && image_ids=\"$({$composeConfig} | while IFS= read -r image; do test -n \"\$image\"; docker image inspect --format='{{.Id}}' \"\$image\"; done | sort -u)\"; test -n \"\$image_ids\"; printf '%s\\n' \"\$image_ids\" | sha256sum | cut -d ' ' -f1";
         }
         $serviceArgument = ' '.implode(' ', array_map(escapeshellarg(...), $services));
 
-        return "image_ids=\"$(docker compose -f {$safeComposePath} config --images{$serviceArgument} | while IFS= read -r image; do test -n \"\$image\"; docker image inspect --format='{{.Id}}' \"\$image\"; done | sort -u)\"; test -n \"\$image_ids\"; printf '%s\\n' \"\$image_ids\" | sha256sum | cut -d ' ' -f1";
+        return "image_ids=\"$({$composeConfig}{$serviceArgument} | while IFS= read -r image; do test -n \"\$image\"; docker image inspect --format='{{.Id}}' \"\$image\"; done | sort -u)\"; test -n \"\$image_ids\"; printf '%s\\n' \"\$image_ids\" | sha256sum | cut -d ' ' -f1";
     }
 
     /**
