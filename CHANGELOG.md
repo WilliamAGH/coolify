@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file.
 
 ### 🐛 Bug Fixes
 
+- *(blue-green)* Atomically claim intervention rediscovery
+
+### 📚 Documentation
+
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.50-fork
+
+## [4.13.49-fork] - 2026-07-30
+
+### 🐛 Bug Fixes
+
 - *(blue-green)* Pace intervention rediscovery with a cooldown and yield the chain
 - *(blue-green)* Stop cleanup from requeuing intervention-owned resource deletions
 
