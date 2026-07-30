@@ -2,9 +2,14 @@
 
 use App\Enums\ApplicationDeploymentExecutionPhase;
 use App\Enums\ApplicationDeploymentStatus;
+use App\Enums\BlueGreenDeploymentPhase;
+use App\Enums\BlueGreenFleetStatus;
+use App\Enums\DeploymentDispatchClaimResult;
 use App\Jobs\ActivateApplicationDeploymentJob;
 use App\Jobs\ApplicationDeploymentJob;
+use App\Jobs\ConvergeBlueGreenDeploymentJob;
 use App\Models\Application;
+use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\Environment;
 use App\Models\Project;
@@ -1041,5 +1046,135 @@ describe('transactional admission and reattach', function () {
         expect($retry['status'])->toBe('reattached')
             ->and($retry['deployment_uuid'])->toBe('admission-fills-queue')
             ->and($overflow['status'])->toBe('queue_full');
+    });
+});
+
+describe('blue-green dispatch claim gate', function () {
+    test('defers the claim and registers convergence while durable state is not cleanly claimable', function () {
+        Queue::fake();
+        $application = makeApplication($this->environment->id, $this->destination->id, 'abc1234');
+        $state = ApplicationBlueGreenDeployment::query()->create([
+            'application_id' => $application->id,
+            'standalone_docker_id' => $this->destination->id,
+            'phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+            'routing_revision' => 2,
+            'supersession_generation' => 2,
+        ]);
+        $deployment = makeQueueAdmissionDeployment($application, $this->server, 'gate-deferred', $this->destination);
+
+        $result = $deployment->claimForDispatchDetailed();
+
+        expect($result)->toBe(DeploymentDispatchClaimResult::DEFERRED_FOR_BLUE_GREEN_CONVERGENCE)
+            ->and($deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::QUEUED->value);
+        Queue::assertPushed(
+            ConvergeBlueGreenDeploymentJob::class,
+            fn (ConvergeBlueGreenDeploymentJob $job): bool => $job->applicationDeploymentQueueId === $deployment->id
+                && $job->applicationId === $application->id
+                && $job->standaloneDockerId === $this->destination->id,
+        );
+    });
+
+    test('claims through absent, clean IDLE, and clean STOPPED states but defers every busy phase', function () {
+        Queue::fake();
+        $application = makeApplication($this->environment->id, $this->destination->id, 'abc1234');
+        $deployment = makeQueueAdmissionDeployment($application, $this->server, 'gate-absent', $this->destination);
+        expect($deployment->claimForDispatchDetailed())->toBe(DeploymentDispatchClaimResult::CLAIMED);
+        $deployment->update(['status' => ApplicationDeploymentStatus::FINISHED->value]);
+
+        $state = ApplicationBlueGreenDeployment::query()->create([
+            'application_id' => $application->id,
+            'standalone_docker_id' => $this->destination->id,
+            'phase' => BlueGreenDeploymentPhase::IDLE,
+            'routing_revision' => 2,
+            'supersession_generation' => 2,
+        ]);
+        $idleClaim = makeQueueAdmissionDeployment($application, $this->server, 'gate-idle', $this->destination);
+        expect($idleClaim->claimForDispatchDetailed())->toBe(DeploymentDispatchClaimResult::CLAIMED);
+        $idleClaim->update(['status' => ApplicationDeploymentStatus::FINISHED->value]);
+
+        $state->update(['phase' => BlueGreenDeploymentPhase::STOPPED]);
+        $stoppedClaim = makeQueueAdmissionDeployment($application, $this->server, 'gate-stopped', $this->destination);
+        expect($stoppedClaim->claimForDispatchDetailed())->toBe(DeploymentDispatchClaimResult::CLAIMED);
+        $stoppedClaim->update(['status' => ApplicationDeploymentStatus::FINISHED->value]);
+
+        foreach ([
+            BlueGreenDeploymentPhase::PREPARING,
+            BlueGreenDeploymentPhase::SWITCHING,
+            BlueGreenDeploymentPhase::DRAINING,
+            BlueGreenDeploymentPhase::ROLLING_BACK,
+            BlueGreenDeploymentPhase::DEACTIVATING,
+            BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+        ] as $busyPhase) {
+            $state->update(['phase' => $busyPhase]);
+            $busyClaim = makeQueueAdmissionDeployment($application, $this->server, 'gate-'.$busyPhase->value, $this->destination);
+            expect($busyClaim->claimForDispatchDetailed())
+                ->toBe(DeploymentDispatchClaimResult::DEFERRED_FOR_BLUE_GREEN_CONVERGENCE, "phase {$busyPhase->value} must defer");
+            $busyClaim->delete();
+        }
+
+        $state->update(['phase' => BlueGreenDeploymentPhase::IDLE, 'pending_deployment_uuid' => 'residual-pending']);
+        $dirtyIdleClaim = makeQueueAdmissionDeployment($application, $this->server, 'gate-dirty-idle', $this->destination);
+        expect($dirtyIdleClaim->claimForDispatchDetailed())->toBe(DeploymentDispatchClaimResult::DEFERRED_FOR_BLUE_GREEN_CONVERGENCE);
+    });
+});
+
+describe('newest-wins admission groups', function () {
+    test('the newest queued standalone row supersedes older ones before dispatch', function () {
+        $application = makeApplication($this->environment->id, $this->destination->id, 'abc1234');
+        $older = makeQueueAdmissionDeployment($application, $this->server, 'newest-wins-older', $this->destination);
+        $newer = makeQueueAdmissionDeployment($application, $this->server, 'newest-wins-newer', $this->destination);
+
+        expect($newer->claimForDispatchDetailed())->toBe(DeploymentDispatchClaimResult::CLAIMED);
+
+        $older->refresh();
+        expect($older->status)->toBe(ApplicationDeploymentStatus::CANCELLED_BY_USER->value)
+            ->and($older->finished_at)->not->toBeNull()
+            ->and((string) $older->logs)->toContain('Superseded before dispatch by deployment newest-wins-newer')
+            ->and((string) $older->logs)->toContain('no candidate, container, or route mutation occurred');
+    });
+
+    test('an older queued row is cancelled instead of claiming when a newer one waits', function () {
+        $application = makeApplication($this->environment->id, $this->destination->id, 'abc1234');
+        $older = makeQueueAdmissionDeployment($application, $this->server, 'older-loses', $this->destination);
+        makeQueueAdmissionDeployment($application, $this->server, 'newer-waits', $this->destination);
+
+        expect($older->claimForDispatchDetailed())->toBe(DeploymentDispatchClaimResult::NOT_CLAIMED)
+            ->and($older->fresh()->status)->toBe(ApplicationDeploymentStatus::CANCELLED_BY_USER->value);
+    });
+
+    test('superseded queued fleet children pause their finished fleet owner without rewriting its terminal status', function () {
+        $application = makeApplication($this->environment->id, $this->destination->id, 'abc1234');
+        $owner = ApplicationDeploymentQueue::create([
+            'application_id' => $application->id,
+            'application_name' => $application->name,
+            'server_id' => $this->server->id,
+            'server_name' => $this->server->name,
+            'destination_id' => $this->destination->id,
+            'deployment_uuid' => 'fleet-owner-root',
+            'commit' => 'fleet-commit',
+            'pull_request_id' => 0,
+            'status' => ApplicationDeploymentStatus::FINISHED->value,
+            'blue_green_fleet_deployment_uuid' => 'fleet-owner-root',
+            'blue_green_fleet_status' => BlueGreenFleetStatus::ACTIVE,
+        ]);
+        $child = ApplicationDeploymentQueue::create([
+            'application_id' => $application->id,
+            'application_name' => $application->name,
+            'server_id' => $this->server->id,
+            'server_name' => $this->server->name,
+            'destination_id' => $this->destination->id,
+            'deployment_uuid' => 'fleet-child',
+            'commit' => 'fleet-commit',
+            'pull_request_id' => 0,
+            'status' => ApplicationDeploymentStatus::QUEUED->value,
+            'blue_green_fleet_deployment_uuid' => 'fleet-owner-root',
+        ]);
+        $newer = makeQueueAdmissionDeployment($application, $this->server, 'newer-standalone', $this->destination);
+
+        expect($newer->claimForDispatchDetailed())->toBe(DeploymentDispatchClaimResult::CLAIMED);
+
+        expect($child->fresh()->status)->toBe(ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value)
+            ->and($owner->fresh()->status)->toBe(ApplicationDeploymentStatus::FINISHED->value)
+            ->and($owner->fresh()->blue_green_fleet_status)->toBe(BlueGreenFleetStatus::PAUSED);
     });
 });

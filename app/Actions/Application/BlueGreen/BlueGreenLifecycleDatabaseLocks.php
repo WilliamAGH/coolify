@@ -15,6 +15,11 @@ use Illuminate\Database\Eloquent\Collection;
 /**
  * Locks one application lifecycle in the only permitted order:
  * application, settings, state, deactivation, then queue owners.
+ *
+ * This ordering is canonical for every writer. The dispatch claim gate
+ * (ApplicationDeploymentQueue::claimForDispatchDetailed) additionally locks
+ * the Server row between settings and state; no other position for a Server
+ * lock is permitted, and this class deliberately takes no Server lock.
  */
 final readonly class BlueGreenLifecycleDatabaseLocks
 {

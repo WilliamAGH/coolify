@@ -72,6 +72,12 @@ class Kernel extends ConsoleKernel
             ->onOneServer()
             ->withoutOverlapping(16)
             ->runInBackground();
+        $this->scheduleInstance->command('blue-green:converge --scan=100 --limit=10 --stale-after=60')
+            ->name('blue-green:converge')
+            ->everyMinute()
+            ->onOneServer()
+            ->withoutOverlapping(16)
+            ->runInBackground();
         $this->scheduleInstance->command('blue-green:retire-inactive --limit=10')
             ->name('blue-green:retire-inactive')
             ->everyMinute()

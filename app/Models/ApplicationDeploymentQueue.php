@@ -2,12 +2,15 @@
 
 namespace App\Models;
 
+use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
 use App\Casts\EncryptedArrayCast;
 use App\Enums\ApplicationDeploymentExecutionPhase;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\BlueGreenFleetStatus;
+use App\Enums\DeploymentDispatchClaimResult;
+use App\Jobs\ConvergeBlueGreenDeploymentJob;
 use Closure;
 use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Model;
@@ -149,13 +152,24 @@ class ApplicationDeploymentQueue extends Model
 
     public function claimForDispatch(bool $bypassServerCapacity = false): bool
     {
-        return DB::transaction(function () use ($bypassServerCapacity): bool {
+        return $this->claimForDispatchDetailed($bypassServerCapacity) === DeploymentDispatchClaimResult::CLAIMED;
+    }
+
+    /**
+     * The single dispatch-claim authority. Every path that moves a queued row
+     * to in_progress goes through this gate; a destination whose durable
+     * blue-green state is not cleanly claimable defers the claim and
+     * registers automatic convergence instead of racing the recovery owner.
+     */
+    public function claimForDispatchDetailed(bool $bypassServerCapacity = false): DeploymentDispatchClaimResult
+    {
+        return DB::transaction(function () use ($bypassServerCapacity): DeploymentDispatchClaimResult {
             $application = Application::withTrashed()
                 ->whereKey($this->application_id)
                 ->lockForUpdate()
                 ->first();
             if ($application === null) {
-                return false;
+                return DeploymentDispatchClaimResult::NOT_CLAIMED;
             }
 
             $application->settings()->lockForUpdate()->first();
@@ -165,8 +179,17 @@ class ApplicationDeploymentQueue extends Model
                 ->lockForUpdate()
                 ->first();
             if ($server === null) {
-                return false;
+                return DeploymentDispatchClaimResult::NOT_CLAIMED;
             }
+
+            $blueGreenState = $this->destination_id === null
+                ? null
+                : ApplicationBlueGreenDeployment::query()
+                    ->where('application_id', $application->getKey())
+                    ->where('standalone_docker_id', $this->destination_id)
+                    ->orderBy('id')
+                    ->lockForUpdate()
+                    ->first();
 
             $deactivation = ApplicationBlueGreenDeactivation::query()
                 ->where('application_id', $application->getKey())
@@ -193,13 +216,13 @@ class ApplicationDeploymentQueue extends Model
                 || (string) $deployment->application_id !== (string) $application->getKey()
                 || (string) $deployment->server_id !== (string) $server->getKey()
                 || $deployment->status !== ApplicationDeploymentStatus::QUEUED->value) {
-                return false;
+                return DeploymentDispatchClaimResult::NOT_CLAIMED;
             }
 
             if ($deactivation?->fences($deployment) === true) {
                 $this->cancelRejectedDeploymentClaim($deployment, ApplicationDeploymentStatus::CANCELLED_BY_USER);
 
-                return false;
+                return DeploymentDispatchClaimResult::NOT_CLAIMED;
             }
 
             if (is_string($deployment->blue_green_fleet_deployment_uuid)
@@ -215,7 +238,7 @@ class ApplicationDeploymentQueue extends Model
                         ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET,
                     );
 
-                    return false;
+                    return DeploymentDispatchClaimResult::NOT_CLAIMED;
                 }
             }
 
@@ -234,7 +257,19 @@ class ApplicationDeploymentQueue extends Model
                     $this->syncOriginalAttributes(['status', 'finished_at']);
                 }
 
-                return false;
+                return DeploymentDispatchClaimResult::NOT_CLAIMED;
+            }
+
+            if ($deployment->pull_request_id === 0
+                && $blueGreenState !== null
+                && ! ClaimBlueGreenDeployment::stateIsCleanlyClaimable($blueGreenState)) {
+                $this->registerBlueGreenConvergenceDispatch($deployment);
+
+                return DeploymentDispatchClaimResult::DEFERRED_FOR_BLUE_GREEN_CONVERGENCE;
+            }
+
+            if (! $this->winsNewestAdmissionGroup($application, $deployment)) {
+                return DeploymentDispatchClaimResult::NOT_CLAIMED;
             }
 
             if (self::query()
@@ -242,7 +277,7 @@ class ApplicationDeploymentQueue extends Model
                 ->where('pull_request_id', $deployment->pull_request_id)
                 ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
                 ->exists()) {
-                return false;
+                return DeploymentDispatchClaimResult::NOT_CLAIMED;
             }
 
             if (! $bypassServerCapacity) {
@@ -252,7 +287,7 @@ class ApplicationDeploymentQueue extends Model
                     ->count();
                 $concurrentBuilds = $server->settings?->concurrent_builds ?? 0;
                 if ($activeDeployments >= $concurrentBuilds) {
-                    return false;
+                    return DeploymentDispatchClaimResult::NOT_CLAIMED;
                 }
             }
 
@@ -269,7 +304,7 @@ class ApplicationDeploymentQueue extends Model
                     'updated_at' => $claimedAt,
                 ]);
             if ($claimed !== 1) {
-                return false;
+                return DeploymentDispatchClaimResult::NOT_CLAIMED;
             }
 
             $this->setAttribute('status', ApplicationDeploymentStatus::IN_PROGRESS->value);
@@ -285,8 +320,131 @@ class ApplicationDeploymentQueue extends Model
                 'updated_at',
             ]);
 
-            return true;
+            return DeploymentDispatchClaimResult::CLAIMED;
         }, attempts: 5);
+    }
+
+    /**
+     * Registers automatic blue-green convergence for a deferred claim once
+     * the surrounding transaction commits. The scheduler remains the durable
+     * rediscovery owner when this process dies before dispatching.
+     */
+    private function registerBlueGreenConvergenceDispatch(self $deployment): void
+    {
+        $queueId = (int) $deployment->getKey();
+        $applicationId = (int) $deployment->application_id;
+        $destinationId = (int) $deployment->destination_id;
+        DB::afterCommit(static function () use ($queueId, $applicationId, $destinationId): void {
+            ConvergeBlueGreenDeploymentJob::dispatch($queueId, $applicationId, $destinationId);
+        });
+    }
+
+    /**
+     * Newest-wins admission: a standalone queued row forms its own group and
+     * fleet children belong to the root named by blue_green_fleet_deployment_uuid;
+     * group age is the root queue row id because children are created only
+     * after their root succeeds. Older queued rows are superseded before
+     * dispatch with no candidate, container, or route mutation; running rows
+     * are never touched.
+     */
+    private function winsNewestAdmissionGroup(Application $application, self $deployment): bool
+    {
+        $queuedLane = self::query()
+            ->where('application_id', $application->getKey())
+            ->where('pull_request_id', $deployment->pull_request_id)
+            ->when(
+                $deployment->destination_id === null,
+                fn ($query) => $query->whereNull('destination_id'),
+                fn ($query) => $query->where('destination_id', $deployment->destination_id),
+            )
+            ->where('status', ApplicationDeploymentStatus::QUEUED->value)
+            ->orderBy('id')
+            ->lockForUpdate()
+            ->get();
+        if ($queuedLane->doesntContain(fn (self $row): bool => $row->getKey() === $deployment->getKey())) {
+            return false;
+        }
+
+        $rootUuids = $queuedLane
+            ->filter(fn (self $row): bool => is_string($row->blue_green_fleet_deployment_uuid)
+                && $row->blue_green_fleet_deployment_uuid !== ''
+                && $row->blue_green_fleet_deployment_uuid !== $row->deployment_uuid)
+            ->pluck('blue_green_fleet_deployment_uuid')
+            ->unique()
+            ->values();
+        $fleetRoots = $rootUuids->isEmpty()
+            ? collect()
+            : self::query()
+                ->where('application_id', $application->getKey())
+                ->whereIn('deployment_uuid', $rootUuids)
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get()
+                ->keyBy('deployment_uuid');
+        $rootIdFor = function (self $row) use ($fleetRoots): int {
+            if (is_string($row->blue_green_fleet_deployment_uuid)
+                && $row->blue_green_fleet_deployment_uuid !== ''
+                && $row->blue_green_fleet_deployment_uuid !== $row->deployment_uuid) {
+                $root = $fleetRoots->get($row->blue_green_fleet_deployment_uuid);
+                if ($root !== null) {
+                    return (int) $root->getKey();
+                }
+            }
+
+            return (int) $row->getKey();
+        };
+
+        $greatestRootId = $queuedLane->map($rootIdFor)->max();
+        $claimRootId = $rootIdFor($deployment);
+        $superseded = $queuedLane->filter(
+            fn (self $row): bool => $rootIdFor($row) < $greatestRootId,
+        );
+        $winnerUuid = $queuedLane
+            ->first(fn (self $row): bool => $rootIdFor($row) === $greatestRootId)
+            ?->deployment_uuid ?? $deployment->deployment_uuid;
+        $pausedFleetRootUuids = [];
+        foreach ($superseded as $supersededRow) {
+            $isFleetChild = is_string($supersededRow->blue_green_fleet_deployment_uuid)
+                && $supersededRow->blue_green_fleet_deployment_uuid !== ''
+                && $supersededRow->blue_green_fleet_deployment_uuid !== $supersededRow->deployment_uuid;
+            $cancelled = self::query()
+                ->whereKey($supersededRow->getKey())
+                ->where('status', ApplicationDeploymentStatus::QUEUED->value)
+                ->update([
+                    'status' => $isFleetChild
+                        ? ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value
+                        : ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+                    'finished_at' => now(),
+                ]);
+            if ($cancelled !== 1) {
+                continue;
+            }
+            $supersededRow->addLogEntry(
+                "Superseded before dispatch by deployment {$winnerUuid}; no candidate, container, or route mutation occurred.",
+            );
+            if ($supersededRow->getKey() === $deployment->getKey()) {
+                $this->setAttribute('status', $isFleetChild
+                    ? ApplicationDeploymentStatus::CANCELLED_BY_BLUE_GREEN_FLEET->value
+                    : ApplicationDeploymentStatus::CANCELLED_BY_USER->value);
+                $this->syncOriginalAttribute('status');
+            }
+            if ($isFleetChild) {
+                $pausedFleetRootUuids[$supersededRow->blue_green_fleet_deployment_uuid] = true;
+            }
+        }
+        foreach (array_keys($pausedFleetRootUuids) as $rootUuid) {
+            $root = $fleetRoots->get($rootUuid);
+            if ($root !== null
+                && $root->status === ApplicationDeploymentStatus::FINISHED->value
+                && $root->blue_green_fleet_deployment_uuid === $root->deployment_uuid
+                && $root->blue_green_fleet_status === BlueGreenFleetStatus::ACTIVE) {
+                self::query()
+                    ->whereKey($root->getKey())
+                    ->update(['blue_green_fleet_status' => BlueGreenFleetStatus::PAUSED->value]);
+            }
+        }
+
+        return $claimRootId === $greatestRootId;
     }
 
     private function cancelRejectedDeploymentClaim(

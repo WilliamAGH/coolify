@@ -338,6 +338,7 @@ function applicationValidationWorkflowViolations(array $workflow): array
         'tests/Feature/BlueGreenApplicationManualStopTest.php',
         'tests/Feature/BlueGreenCancellationCompensationTest.php',
         'tests/Feature/BlueGreenContinuousAvailabilityAcceptanceTest.php',
+        'tests/Feature/BlueGreenConvergenceTest.php',
         'tests/Feature/BlueGreenCrashBoundaryAcceptanceTest.php',
         'tests/Feature/BlueGreenDeploymentReconciliationTest.php',
         'tests/Feature/BlueGreenFinalizedDrainingRecoveryTest.php',

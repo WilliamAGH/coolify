@@ -226,6 +226,7 @@ jobs:
             tests/Feature/BlueGreenApplicationDeletionFenceTest.php \
             tests/Feature/BlueGreenApplicationDeletionOrchestrationTest.php \
             tests/Feature/BlueGreenCancellationCompensationTest.php \
+            tests/Feature/BlueGreenConvergenceTest.php \
             tests/Feature/BlueGreenDeactivationResumeCommandTest.php \
             tests/Feature/BlueGreenDeploymentReconciliationTest.php \
             tests/Feature/BlueGreenDeploymentRecoveryFailureTest.php \

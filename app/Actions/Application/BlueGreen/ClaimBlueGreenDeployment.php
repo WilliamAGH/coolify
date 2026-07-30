@@ -376,19 +376,34 @@ class ClaimBlueGreenDeployment
         }
     }
 
-    private function assertStateIsIdle(ApplicationBlueGreenDeployment $state): void
+    /**
+     * The single claimability predicate for a durable blue-green state row:
+     * clean IDLE or clean STOPPED with no pending, deactivation, or operation
+     * provenance. The dispatch claim gate and the claim transition both
+     * consume this exact predicate so they can never disagree.
+     */
+    public static function stateIsCleanlyClaimable(ApplicationBlueGreenDeployment $state): bool
     {
         if (! in_array($state->phase, [BlueGreenDeploymentPhase::IDLE, BlueGreenDeploymentPhase::STOPPED], true)
             || $state->pending_color !== null
             || $state->pending_deployment_uuid !== null
             || $state->deactivation_operation_id !== null
             || $state->deactivation_started_at !== null) {
-            throw new BlueGreenDeploymentTransitionException('A blue-green deployment is already pending for this application destination.');
+            return false;
         }
         foreach (ApplicationBlueGreenDeployment::clearedOperationAttributes() as $attribute => $_) {
             if ($state->{$attribute} !== null) {
-                throw new BlueGreenDeploymentTransitionException('The blue-green deployment state has unfinished operation provenance.');
+                return false;
             }
+        }
+
+        return true;
+    }
+
+    private function assertStateIsIdle(ApplicationBlueGreenDeployment $state): void
+    {
+        if (! self::stateIsCleanlyClaimable($state)) {
+            throw new BlueGreenDeploymentTransitionException('A blue-green deployment is already pending for this application destination.');
         }
     }
 
