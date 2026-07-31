@@ -72,6 +72,13 @@ Consequences enforced by the tool:
 - Workers are disabled on the standby (`HORIZON_ENABLED=false`,
   `SCHEDULER_ENABLED=false`) and no router or ACME entry exists for the
   production hostname.
+- `/data/coolify/proxy` on the standby is root-owned (restore fails closed
+  otherwise). The v1 seeding left it owned by uid 9999; match production
+  before the first restore:
+
+  ```bash
+  chown root:9999 /data/coolify/proxy && chmod 710 /data/coolify/proxy
+  ```
 
 ## Refresh procedure
 
@@ -101,12 +108,32 @@ itself in step 4.
    `--exclude NAME` and re-run; the tool never guesses. Do not pass
    `--capture-redis` (refused in this mode) and do not stop anything.
 
+   Decisions made on the first refresh (2026-07-30), as the reference set:
+   `--exclude control-plane-attestor` (control-plane proxy attestor
+   workspaces; must never travel to a standby), `--exclude sentinel`
+   (actively written host-local metrics sqlite; meaningless off-host),
+   `--include log-drains --include ssl --include webhooks-during-maintenance`
+   (ordinary instance data). Re-evaluate any new undecided directory on its
+   own merits.
+
 3. **Transfer to the standby** — on `popos-sf0`:
 
    ```bash
    rsync -a --info=progress2 \
      root@22.haiku.host:/data/coolify/control-plane-migrate-standby-seed-<STAMP>/ \
      /data/coolify/control-plane-migrate-standby-seed-<STAMP>/
+   ```
+
+   If host-to-host SSH is not authorized (neither host holds a key for the
+   other — the state observed on the first refresh), relay the archive
+   through the operator machine with a tar pipe instead; step 4's `verify`
+   re-checks every artifact checksum on the target, so the relay adds no
+   integrity risk:
+
+   ```bash
+   ssh root@22.haiku.host \
+     'tar -C /data/coolify -cf - control-plane-migrate-standby-seed-<STAMP>' \
+     | ssh root@popos-sf0 'tar -C /data/coolify -xf -'
    ```
 
 4. **Verify the archive and read the standby's release identity** — on
