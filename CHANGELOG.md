@@ -15,6 +15,12 @@ All notable changes to this project will be documented in this file.
 ### 📚 Documentation
 
 - Update changelog
+- Update changelog
+- *(operations)* Fold first live standby refresh findings into the runbook
+
+### 🎨 Styling
+
+- Pint the single-process unit suite changes
 
 ### 🧪 Testing
 
