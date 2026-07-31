@@ -186,7 +186,7 @@ it('preserves unknown health state in Service model aggregation', function () {
 
     // The parsed health component must flow back out of the aggregated "status:health" string
     expect($serviceFile)
-        ->toContain("\$health = \$parts[1] ?? null;");
+        ->toContain('$health = $parts[1] ?? null;');
 });
 
 it('handles starting state (created/starting) in GetContainersStatus', function () {

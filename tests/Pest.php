@@ -2,7 +2,10 @@
 
 use App\Models\InstanceSettings;
 use App\Models\Server;
+use Illuminate\Container\Container;
+use Illuminate\Support\Facades\Facade;
 use Illuminate\Support\Once;
+use Mockery\Adapter\Phpunit\MockeryPHPUnitIntegration;
 use Tests\TestCase;
 
 /*
@@ -29,15 +32,15 @@ uses(TestCase::class)->in('Feature', 'v4/Feature', 'v4/Browser');
  * BindingResolutionException. TestCase-bound tests are skipped — Laravel's own
  * setUp/tearDown manages their application lifecycle.
  */
-uses(Mockery\Adapter\Phpunit\MockeryPHPUnitIntegration::class)
+uses(MockeryPHPUnitIntegration::class)
     ->beforeEach(function (): void {
         if ($this instanceof TestCase) {
             return;
         }
 
-        Illuminate\Support\Facades\Facade::clearResolvedInstances();
-        Illuminate\Support\Facades\Facade::setFacadeApplication(null);
-        Illuminate\Container\Container::setInstance(null);
+        Facade::clearResolvedInstances();
+        Facade::setFacadeApplication(null);
+        Container::setInstance(null);
     })
     ->in('Unit');
 

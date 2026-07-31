@@ -13,7 +13,7 @@ it('has correct queue and retry configuration', function () {
 
 it('handles servers with null traefik_outdated_info gracefully', function () {
     // Create a mock server with null traefik_outdated_info
-    $server = \Mockery::mock('App\Models\Server')->makePartial();
+    $server = Mockery::mock('App\Models\Server')->makePartial();
     $server->traefik_outdated_info = null;
 
     // Accessing the property should not throw an error
@@ -31,7 +31,7 @@ it('handles servers with traefik_outdated_info data', function () {
         'checked_at' => '2025-11-14T10:00:00Z',
     ];
 
-    $server = \Mockery::mock('App\Models\Server')->makePartial();
+    $server = Mockery::mock('App\Models\Server')->makePartial();
     $server->traefik_outdated_info = $expectedInfo;
 
     // Should return the outdated info
@@ -48,7 +48,7 @@ it('handles servers with patch update info without upgrade_target', function () 
         'checked_at' => '2025-11-14T10:00:00Z',
     ];
 
-    $server = \Mockery::mock('App\Models\Server')->makePartial();
+    $server = Mockery::mock('App\Models\Server')->makePartial();
     $server->traefik_outdated_info = $expectedInfo;
 
     // Should return the outdated info without upgrade_target

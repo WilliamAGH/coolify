@@ -19,7 +19,7 @@ use App\Models\ApplicationDeploymentQueue;
  */
 it('logs comprehensive error details when failed() is called', function () {
     // Create a mock exception with all properties
-    $innerException = new \RuntimeException('Connection refused', 111);
+    $innerException = new RuntimeException('Connection refused', 111);
     $exception = new DeploymentException(
         'Failed to start container',
         500,
@@ -72,7 +72,7 @@ it('logs comprehensive error details when failed() is called', function () {
     $job = Mockery::mock(ApplicationDeploymentJob::class)->makePartial();
     $job->shouldAllowMockingProtectedMethods();
 
-    $reflection = new \ReflectionClass(ApplicationDeploymentJob::class);
+    $reflection = new ReflectionClass(ApplicationDeploymentJob::class);
 
     $queueProperty = $reflection->getProperty('application_deployment_queue');
     $queueProperty->setAccessible(true);
@@ -138,7 +138,7 @@ it('logs comprehensive error details when failed() is called', function () {
 });
 
 it('handles exceptions with no message gracefully', function () {
-    $exception = new \Exception;
+    $exception = new Exception;
 
     $mockQueue = Mockery::mock(ApplicationDeploymentQueue::class);
     $logEntries = [];
@@ -182,7 +182,7 @@ it('handles exceptions with no message gracefully', function () {
     $job = Mockery::mock(ApplicationDeploymentJob::class)->makePartial();
     $job->shouldAllowMockingProtectedMethods();
 
-    $reflection = new \ReflectionClass(ApplicationDeploymentJob::class);
+    $reflection = new ReflectionClass(ApplicationDeploymentJob::class);
 
     $queueProperty = $reflection->getProperty('application_deployment_queue');
     $queueProperty->setAccessible(true);
@@ -217,7 +217,7 @@ it('handles exceptions with no message gracefully', function () {
 
 it('wraps exceptions in deployment methods with DeploymentException', function () {
     // Verify that our deployment methods wrap exceptions properly
-    $originalException = new \RuntimeException('Container not found');
+    $originalException = new RuntimeException('Container not found');
 
     try {
         throw new DeploymentException('Failed to start container', 0, $originalException);
@@ -230,7 +230,7 @@ it('wraps exceptions in deployment methods with DeploymentException', function (
 
 it('logs error code 0 correctly', function () {
     // Verify that error code 0 is logged (previously skipped due to falsy check)
-    $exception = new \Exception('Test error', 0);
+    $exception = new Exception('Test error', 0);
 
     $mockQueue = Mockery::mock(ApplicationDeploymentQueue::class);
     $logEntries = [];
@@ -274,7 +274,7 @@ it('logs error code 0 correctly', function () {
     $job = Mockery::mock(ApplicationDeploymentJob::class)->makePartial();
     $job->shouldAllowMockingProtectedMethods();
 
-    $reflection = new \ReflectionClass(ApplicationDeploymentJob::class);
+    $reflection = new ReflectionClass(ApplicationDeploymentJob::class);
 
     $queueProperty = $reflection->getProperty('application_deployment_queue');
     $queueProperty->setAccessible(true);
@@ -308,7 +308,7 @@ it('logs error code 0 correctly', function () {
 
 it('preserves original exception type in wrapped DeploymentException messages', function () {
     // Verify that when wrapping exceptions, the original exception type is included in the message
-    $originalException = new \RuntimeException('Connection timeout');
+    $originalException = new RuntimeException('Connection timeout');
 
     // Test rolling update scenario
     $wrappedException = new DeploymentException(
@@ -322,7 +322,7 @@ it('preserves original exception type in wrapped DeploymentException messages', 
     expect($wrappedException->getPrevious())->toBe($originalException);
 
     // Test health check scenario
-    $healthCheckException = new \InvalidArgumentException('Invalid health check URL');
+    $healthCheckException = new InvalidArgumentException('Invalid health check URL');
     $wrappedHealthCheck = new DeploymentException(
         'Health check failed ('.get_class($healthCheckException).'): '.$healthCheckException->getMessage(),
         $healthCheckException->getCode(),
@@ -334,7 +334,7 @@ it('preserves original exception type in wrapped DeploymentException messages', 
     expect($wrappedHealthCheck->getPrevious())->toBe($healthCheckException);
 
     // Test docker registry push scenario
-    $registryException = new \RuntimeException('Failed to authenticate');
+    $registryException = new RuntimeException('Failed to authenticate');
     $wrappedRegistry = new DeploymentException(
         get_class($registryException).': '.$registryException->getMessage(),
         $registryException->getCode(),

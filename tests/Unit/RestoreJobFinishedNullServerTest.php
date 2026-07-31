@@ -22,7 +22,7 @@ describe('RestoreJobFinished null server handling', function () {
         ];
 
         // Should not throw an error when server is null
-        expect(fn () => new RestoreJobFinished($data))->not->toThrow(\Throwable::class);
+        expect(fn () => new RestoreJobFinished($data))->not->toThrow(Throwable::class);
     });
 
     it('handles null server gracefully in S3RestoreJobFinished event', function () {
@@ -37,7 +37,7 @@ describe('RestoreJobFinished null server handling', function () {
         ];
 
         // Should not throw an error when server is null
-        expect(fn () => new S3RestoreJobFinished($data))->not->toThrow(\Throwable::class);
+        expect(fn () => new S3RestoreJobFinished($data))->not->toThrow(Throwable::class);
     });
 
     it('handles empty serverId in RestoreJobFinished event', function () {
@@ -49,7 +49,7 @@ describe('RestoreJobFinished null server handling', function () {
         ];
 
         // Should not throw an error when serverId is null
-        expect(fn () => new RestoreJobFinished($data))->not->toThrow(\Throwable::class);
+        expect(fn () => new RestoreJobFinished($data))->not->toThrow(Throwable::class);
     });
 
     it('handles empty serverId in S3RestoreJobFinished event', function () {
@@ -63,20 +63,20 @@ describe('RestoreJobFinished null server handling', function () {
         ];
 
         // Should not throw an error when serverId is null
-        expect(fn () => new S3RestoreJobFinished($data))->not->toThrow(\Throwable::class);
+        expect(fn () => new S3RestoreJobFinished($data))->not->toThrow(Throwable::class);
     });
 
     it('handles missing data gracefully in RestoreJobFinished', function () {
         $data = [];
 
         // Should not throw an error when data is empty
-        expect(fn () => new RestoreJobFinished($data))->not->toThrow(\Throwable::class);
+        expect(fn () => new RestoreJobFinished($data))->not->toThrow(Throwable::class);
     });
 
     it('handles missing data gracefully in S3RestoreJobFinished', function () {
         $data = [];
 
         // Should not throw an error when data is empty
-        expect(fn () => new S3RestoreJobFinished($data))->not->toThrow(\Throwable::class);
+        expect(fn () => new S3RestoreJobFinished($data))->not->toThrow(Throwable::class);
     });
 });
