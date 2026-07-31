@@ -11,12 +11,14 @@ All notable changes to this project will be documented in this file.
 ### 🐛 Bug Fixes
 
 - *(proxy)* Use locale-safe enumerated classes in generated shell guards
+- *(blue-green)* Admit clean stopped lifecycle claims
 
 ### 📚 Documentation
 
 - Update changelog
 - Update changelog
 - *(operations)* Fold first live standby refresh findings into the runbook
+- Update changelog
 
 ### 🎨 Styling
 
