@@ -19,6 +19,7 @@ All notable changes to this project will be documented in this file.
 - Update changelog
 - *(operations)* Fold first live standby refresh findings into the runbook
 - Update changelog
+- Update changelog
 
 ### 🎨 Styling
 
@@ -28,6 +29,10 @@ All notable changes to this project will be documented in this file.
 
 - *(unit)* Make the unit suite runnable in a single process
 - *(unit)* Gate namespace helper overrides behind explicit capture flags
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.52-fork
 
 ## [4.13.51-fork] - 2026-07-30
 
