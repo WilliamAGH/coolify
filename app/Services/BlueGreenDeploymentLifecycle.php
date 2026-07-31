@@ -186,8 +186,7 @@ final class BlueGreenDeploymentLifecycle
             $durableState = $this->recoverInterventionAtDeploymentStart($durableState);
         }
         if ($durableState !== null
-            && ($durableState->phase !== BlueGreenDeploymentPhase::IDLE
-                || $durableState->operation_deployment_uuid !== null)) {
+            && ! ClaimBlueGreenDeployment::stateIsCleanlyClaimable($durableState)) {
             throw new DeploymentException('An unfinished blue-green lifecycle must be reconciled before another deployment can mutate this destination.');
         }
         $this->assertEligibility();

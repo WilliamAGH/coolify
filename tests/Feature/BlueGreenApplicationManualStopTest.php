@@ -7,7 +7,6 @@ use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteOutcome;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteResult;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationTransportException;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
-use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\DeactivateBlueGreenApplication;
 use App\Actions\Application\BlueGreen\ExecuteBlueGreenDeactivationRemoteCommand;
 use App\Actions\Application\BlueGreen\ResumeBlueGreenDeactivations;
@@ -26,6 +25,7 @@ use App\Models\ApplicationDeploymentQueue;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
 use App\Models\User;
+use App\Services\BlueGreenDeploymentLifecycle;
 use Illuminate\Cache\ArrayStore;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Process\PendingProcess;
@@ -670,14 +670,27 @@ it('claims a fresh blue-green deployment from a stopped state', function () {
         'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
     ]);
 
-    $claim = ClaimBlueGreenDeployment::run(
-        $application,
-        $destination,
-        $deployment,
+    Process::fake(['*' => Process::sequence([
         BlueGreenDeactivationScenario::BOOT_ID,
+        'coolify-blue-green-destination-state-attested',
+        '',
+        BlueGreenDeactivationScenario::BOOT_ID,
+    ])]);
+    $lifecycle = new BlueGreenDeploymentLifecycle(
+        application: $application,
+        deployment: $deployment,
+        destination: $destination,
+        server: $context['server'],
+        timeout: 30,
+        checkForCancellation: static function (): void {},
     );
+    $lifecycle->initialize();
+    $claim = $lifecycle->claim();
 
-    expect($claim->supersessionGeneration)->toBeGreaterThan(4)
+    expect($claim)->not->toBeNull()
+        ->and($claim?->supersessionGeneration)->toBeGreaterThan(4)
+        ->and($claim?->legacyContainerName)->toBeNull()
+        ->and($lifecycle->previousContainerName())->toBeNull()
         ->and($state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
         ->and($deployment->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::PREPARING);
 });
