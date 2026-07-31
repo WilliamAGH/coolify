@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🐛 Bug Fixes
+
+- *(proxy)* Probe Traefik over the Docker network
+
+### 📚 Documentation
+
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.53-fork
+
+## [4.13.52-fork] - 2026-07-31
+
 ### 🚀 Features
 
 - *(control-plane)* Add reduced-guarantee live standby seed capture
