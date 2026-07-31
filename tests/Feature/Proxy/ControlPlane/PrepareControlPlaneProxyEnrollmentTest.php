@@ -126,7 +126,7 @@ it('compiles and reserves one public control-plane enrollment without retaining 
             'COOLIFY_CONTROL_PLANE_MEMBER' => 'blue',
             'COOLIFY_CONTROL_PLANE_REVISION' => 'revision-42',
             'COOLIFY_TRAEFIK_ATTESTOR_PROBE_HOST' => 'dashboard.example.test',
-            'COOLIFY_TRAEFIK_ATTESTOR_PROBE_URL' => 'http://host.docker.internal:8000/api/health',
+            'COOLIFY_TRAEFIK_ATTESTOR_PROBE_URL' => 'http://coolify-proxy:8000/api/health',
             'COOLIFY_TRAEFIK_ATTESTOR_SERVER_ID' => (string) $server->getKey(),
         ])
         ->and(data_get(Yaml::parse($state->sourceOverrideBytes, Yaml::PARSE_CUSTOM_TAGS), 'services.coolify.volumes'))->toBe([

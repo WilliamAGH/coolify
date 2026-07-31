@@ -159,7 +159,7 @@ class CompileControlPlaneStaticProxyConfiguration
             'COOLIFY_CONTROL_PLANE_MEMBER' => $expectedMember,
             'COOLIFY_CONTROL_PLANE_REVISION' => $expectedRevision,
             'COOLIFY_TRAEFIK_ATTESTOR_PROBE_HOST' => $canonicalHost,
-            'COOLIFY_TRAEFIK_ATTESTOR_PROBE_URL' => 'http://host.docker.internal:'.$configuration->appPort.'/api/health',
+            'COOLIFY_TRAEFIK_ATTESTOR_PROBE_URL' => 'http://coolify-proxy:'.$configuration->appPort.'/api/health',
             'COOLIFY_TRAEFIK_ATTESTOR_SERVER_ID' => (string) $serverId,
         ];
         $override['services']['coolify']['volumes'] = [

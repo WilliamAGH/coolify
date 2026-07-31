@@ -102,7 +102,7 @@ it('adds only hashed proof credentials and immutable backend identity to the sou
         'COOLIFY_CONTROL_PLANE_MEMBER' => 'blue',
         'COOLIFY_CONTROL_PLANE_REVISION' => 'revision-42',
         'COOLIFY_TRAEFIK_ATTESTOR_PROBE_HOST' => 'dashboard.example.test',
-        'COOLIFY_TRAEFIK_ATTESTOR_PROBE_URL' => 'http://host.docker.internal:8000/api/health',
+        'COOLIFY_TRAEFIK_ATTESTOR_PROBE_URL' => 'http://coolify-proxy:8000/api/health',
         'COOLIFY_TRAEFIK_ATTESTOR_SERVER_ID' => '42',
     ])->and($configuration->sourceOverrideYaml)->toContain('    ports: !reset []')
         ->and(data_get($override, 'services.coolify.volumes'))->toBe([
