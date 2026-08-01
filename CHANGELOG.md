@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [4.13.57-fork] - 2026-08-01
+
+### 🐛 Bug Fixes
+
+- *(user)* Restore email-change fillability and assert protection at its real boundary
+
+### 📚 Documentation
+
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- Validate the durable deactivation budget with the other blue-green suites
+- *(release)* Prepare 4.13.57-fork
+
 ## [4.13.56-fork] - 2026-08-01
 
 ### 🚀 Features
