@@ -11,6 +11,11 @@ All notable changes to this project will be documented in this file.
 ### 📚 Documentation
 
 - Update changelog
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.58-fork
 
 ## [4.13.57-fork] - 2026-08-01
 
