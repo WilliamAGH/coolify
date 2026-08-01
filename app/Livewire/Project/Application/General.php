@@ -309,7 +309,11 @@ class General extends Component
         $this->parsedServiceDomains = $sanitizedDomains;
 
         $this->customLabels = $this->application->parseContainerLabels();
-        if (! $this->customLabels && $this->application->destination->server->proxyType() !== 'NONE' && $this->application->settings->is_container_label_readonly_enabled === true) {
+        // Generated labels are proxy-specific, so an application whose destination or
+        // server cannot be resolved has no proxy to generate them for. Reading through
+        // the unresolved relation instead threw and took the whole settings page down.
+        $proxyType = $this->application->destination?->server?->proxyType();
+        if (! $this->customLabels && $proxyType !== null && $proxyType !== 'NONE' && $this->application->settings->is_container_label_readonly_enabled === true) {
             // Only update custom labels if user has permission
             try {
                 $this->authorize('update', $this->application);

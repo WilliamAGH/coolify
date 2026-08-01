@@ -170,12 +170,12 @@
             @if ($buildPack !== 'dockercompose')
                 <div class="flex items-center gap-2 pt-8">
                     <h3>Docker Registry</h3>
-                    @if ($application->build_pack !== 'dockerimage' && !$application->destination->server->isSwarm())
+                    @if ($application->build_pack !== 'dockerimage' && !$application->destination?->server?->isSwarm())
                         <x-helper
                             helper="Push the built image to a docker registry. More info <a class='underline' href='https://coolify.io/docs/knowledge-base/docker/registry' target='_blank'>here</a>." />
                     @endif
                 </div>
-                @if ($application->destination->server->isSwarm())
+                @if ($application->destination?->server?->isSwarm())
                     @if ($application->build_pack !== 'dockerimage')
                         <div>Docker Swarm requires the image to be available in a registry. More info <a
                                 class="underline" href="https://coolify.io/docs/knowledge-base/docker/registry"
@@ -184,7 +184,7 @@
                 @endif
                 <div class="flex flex-col gap-2 xl:flex-row">
                     @if ($application->build_pack === 'dockerimage')
-                        @if ($application->destination->server->isSwarm())
+                        @if ($application->destination?->server?->isSwarm())
                             <x-forms.input required id="dockerRegistryImageName" label="Docker Image"
                                 x-bind:disabled="!canUpdate" />
                             <x-forms.input id="dockerRegistryImageTag" label="Docker Image Tag or Hash"
@@ -199,7 +199,7 @@
                         @endif
                     @else
                         @if (
-                            $application->destination->server->isSwarm() ||
+                            $application->destination?->server?->isSwarm() ||
                                 $application->additional_servers->count() > 0 ||
                                 $application->settings->is_build_server_enabled)
                             <x-forms.input id="dockerRegistryImageName" required label="Docker Image"
@@ -522,12 +522,12 @@
                                 x-bind:disabled="!canUpdate" />
                         @endif
                     @endif
-                    @if (!$application->destination->server->isSwarm())
+                    @if (!$application->destination?->server?->isSwarm())
                         <x-forms.input placeholder="3000:3000" id="portsMappings" label="Port Mappings"
                             helper="A comma separated list of ports you would like to map to the host system. Useful when you do not want to use domains.<br><br><span class='inline-block font-bold dark:text-warning'>Format:</span> host:container<br><br><span class='inline-block font-bold dark:text-warning'>Example:</span> 3000:3000,3002:3002<br><br>Rolling update is not supported if you have a port mapped to the host."
                             x-bind:disabled="!canUpdate" />
                     @endif
-                    @if (!$application->destination->server->isSwarm())
+                    @if (!$application->destination?->server?->isSwarm())
                         <x-forms.input id="customNetworkAliases" label="Network Aliases"
                             helper="A comma separated list of custom network aliases you would like to add for container in Docker network.<br><br><span class='inline-block font-bold dark:text-warning'>Example:</span><br>api.internal,api.local"
                             wire:model="customNetworkAliases" x-bind:disabled="!canUpdate" />
