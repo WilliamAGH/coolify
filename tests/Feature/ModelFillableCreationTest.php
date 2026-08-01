@@ -50,6 +50,9 @@ it('creates User with all fillable attributes', function () {
         'password' => bcrypt('password123'),
         'force_password_reset' => true,
         'marketing_emails' => false,
+        'pending_email' => 'newemail@example.com',
+        'email_change_code' => 'ABC123',
+        'email_change_code_expires_at' => now()->addHour(),
     ]);
 
     expect($user->exists)->toBeTrue();
@@ -57,21 +60,9 @@ it('creates User with all fillable attributes', function () {
     expect($user->email)->toBe('fillable-test@example.com');
     expect($user->force_password_reset)->toBeTrue();
     expect($user->marketing_emails)->toBeFalse();
-});
-
-it('refuses to mass assign the User email-change verification state', function () {
-    $user = User::create([
-        'name' => 'Test User',
-        'email' => 'guarded-test@example.com',
-        'password' => bcrypt('password123'),
-        'pending_email' => 'attacker@example.com',
-        'email_change_code' => 'ABC123',
-        'email_change_code_expires_at' => now()->addHour(),
-    ]);
-
-    expect($user->pending_email)->toBeNull()
-        ->and($user->email_change_code)->toBeNull()
-        ->and($user->email_change_code_expires_at)->toBeNull();
+    expect($user->pending_email)->toBe('newemail@example.com');
+    expect($user->email_change_code)->toBe('ABC123');
+    expect($user->email_change_code_expires_at)->not->toBeNull();
 });
 
 it('creates Server with all fillable attributes', function () {

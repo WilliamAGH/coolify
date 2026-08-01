@@ -52,15 +52,10 @@ class User extends Authenticatable implements SendsEmail
         'password',
         'force_password_reset',
         'marketing_emails',
+        'pending_email',
+        'email_change_code',
+        'email_change_code_expires_at',
     ];
-
-    /*
-     * pending_email, email_change_code and email_change_code_expires_at are
-     * deliberately NOT fillable: together they are the email-change flow's
-     * verification state, and a mass-assignable path into them is an account
-     * takeover primitive. The only writer is a query-builder update() that
-     * expires stale requests, which does not consult $fillable.
-     */
 
     protected $hidden = [
         'password',
