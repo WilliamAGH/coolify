@@ -133,7 +133,9 @@ class Service extends BaseModel
     {
         return Attribute::make(
             get: function () {
-                return $this->server->isFunctional();
+                // A service whose server relation cannot be resolved is not functional;
+                // dereferencing it instead turned every page reading this into a 500.
+                return (bool) $this->server?->isFunctional();
             }
         );
     }

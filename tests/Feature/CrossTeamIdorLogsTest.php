@@ -8,22 +8,31 @@ use App\Models\Service;
 use App\Models\StandaloneDocker;
 use App\Models\Team;
 use App\Models\User;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+
+// Without this the in-memory connection is never migrated, so every factory call
+// dies on "no such table" and this cross-team IDOR guard silently never runs.
+uses(RefreshDatabase::class);
 
 beforeEach(function () {
+    seedInstanceSettings();
+
     // Attacker: Team A
     $this->userA = User::factory()->create();
     $this->teamA = Team::factory()->create();
     $this->userA->teams()->attach($this->teamA, ['role' => 'owner']);
 
     $this->serverA = Server::factory()->create(['team_id' => $this->teamA->id]);
-    $this->destinationA = StandaloneDocker::factory()->create(['server_id' => $this->serverA->id]);
+    // A server is created with its own coolify-network destination, and
+    // (server_id, network) is unique — so resolve that one rather than adding a duplicate.
+    $this->destinationA = StandaloneDocker::where('server_id', $this->serverA->id)->firstOrFail();
     $this->projectA = Project::factory()->create(['team_id' => $this->teamA->id]);
     $this->environmentA = Environment::factory()->create(['project_id' => $this->projectA->id]);
 
     // Victim: Team B
     $this->teamB = Team::factory()->create();
     $this->serverB = Server::factory()->create(['team_id' => $this->teamB->id]);
-    $this->destinationB = StandaloneDocker::factory()->create(['server_id' => $this->serverB->id]);
+    $this->destinationB = StandaloneDocker::where('server_id', $this->serverB->id)->firstOrFail();
     $this->projectB = Project::factory()->create(['team_id' => $this->teamB->id]);
     $this->environmentB = Environment::factory()->create(['project_id' => $this->projectB->id]);
 

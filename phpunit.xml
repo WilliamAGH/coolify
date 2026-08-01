@@ -13,6 +13,10 @@
   </testsuites>
   <coverage/>
   <php>
+    <!-- PHP's 128M CLI default is exhausted while Pest is still loading the suite,
+         so an unqualified `php artisan test` dies before running a single test.
+         CI already passes -d memory_limit=1G; set it here so local runs match. -->
+    <ini name="memory_limit" value="1G"/>
     <env name="APP_ENV" value="testing" force="true"/>
     <env name="BCRYPT_ROUNDS" value="4"/>
     <env name="CACHE_DRIVER" value="array" force="true"/>

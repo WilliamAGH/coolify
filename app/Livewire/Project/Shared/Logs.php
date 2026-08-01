@@ -139,7 +139,9 @@ class Logs extends Component
                 $this->resource->databases()->get()->each(function ($database) {
                     $this->containers->push(data_get($database, 'name').'-'.data_get($this->resource, 'uuid'));
                 });
-                if ($this->resource->server->isFunctional()) {
+                // An unresolvable server contributes no log source; dereferencing it
+                // instead made the logs page 500 rather than render an empty list.
+                if ($this->resource->server?->isFunctional()) {
                     $server = $this->resource->server;
                     $this->servers = $this->servers->push($server);
                 }

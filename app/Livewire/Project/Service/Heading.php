@@ -54,7 +54,7 @@ class Heading extends Component
     {
         $this->authorizeService('view');
 
-        if ($this->service->server->isFunctional()) {
+        if ($this->service->server?->isFunctional()) {
             GetContainersStatus::dispatch($this->service->server);
         } else {
             $this->dispatch('error', 'Server is not functional.');

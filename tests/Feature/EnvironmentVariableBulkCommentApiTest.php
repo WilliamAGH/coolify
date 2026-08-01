@@ -3,7 +3,6 @@
 use App\Models\Application;
 use App\Models\Environment;
 use App\Models\EnvironmentVariable;
-use App\Models\InstanceSettings;
 use App\Models\Project;
 use App\Models\Server;
 use App\Models\Service;
@@ -11,11 +10,12 @@ use App\Models\StandaloneDocker;
 use App\Models\Team;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Str;
 
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
-    InstanceSettings::updateOrCreate(['id' => 0]);
+    seedInstanceSettings();
 
     $this->team = Team::factory()->create();
     $this->user = User::factory()->create();
@@ -23,8 +23,17 @@ beforeEach(function () {
 
     session(['currentTeam' => $this->team]);
 
-    $this->token = $this->user->createToken('test-token', ['*']);
-    $this->bearerToken = $this->token->plainTextToken;
+    // getTeamIdFromToken() resolves the acting team from the token's own team_id, and
+    // createToken() leaves that null — a token without it reaches no resource and every
+    // request 404s. Mint it the way the API expects instead.
+    $plainTextToken = Str::random(40);
+    $token = $this->user->tokens()->create([
+        'name' => 'test-token',
+        'token' => hash('sha256', $plainTextToken),
+        'abilities' => ['*'],
+        'team_id' => $this->team->id,
+    ]);
+    $this->bearerToken = $token->getKey().'|'.$plainTextToken;
 
     $this->server = Server::factory()->create(['team_id' => $this->team->id]);
     $this->destination = StandaloneDocker::where('server_id', $this->server->id)->first();
