@@ -373,7 +373,19 @@ class Application extends BaseModel
         });
         static::forceDeleting(function ($application) {
             $application->assertBlueGreenDeletionAuthorized();
-            $application->update(['fqdn' => null]);
+            // Null the fqdn without re-entering the blue-green topology fence:
+            // deletion was already authorized above, and a trashed application's
+            // performUpdate fence rejects this exact sanctioned mutation, which
+            // traps force deletion after a recovered zero-state deactivation.
+            if ($application->fqdn !== null) {
+                $application->newQueryWithoutScopes()
+                    ->whereKey($application->getKey())
+                    ->update(['fqdn' => null]);
+                $application->setRawAttributes(
+                    array_merge($application->getAttributes(), ['fqdn' => null]),
+                    sync: true,
+                );
+            }
             $application->settings()->delete();
             $application->persistentStorages()->delete();
             $application->environment_variables()->delete();

@@ -272,9 +272,16 @@ final class DeactivateBlueGreenApplicationDestination
             } else {
                 $query->where('destination_fence_epoch', $expectedState->destinationFenceEpoch)
                     ->where('destination_fence_mutation_sequence', $expectedState->mutationSequence)
-                    ->where('destination_fence_operation_id', $expectedState->operationId)
-                    ->whereNull('managed_file_sha256')
-                    ->where('destination_topology_digest', $expectedState->destinationTopologyDigest)
+                    ->where('destination_fence_operation_id', $expectedState->operationId);
+                if ($expectedState->managedSha256 === null) {
+                    $query->whereNull('managed_file_sha256');
+                } else {
+                    // A proven-empty completion sheds an exact active-route
+                    // pre-image: only the durable bytes the destination probe
+                    // proved absent may be nulled by this route-less record.
+                    $query->where('managed_file_sha256', $expectedState->managedSha256);
+                }
+                $query->where('destination_topology_digest', $expectedState->destinationTopologyDigest)
                     ->where('application_routing_config_digest', $expectedState->applicationRoutingConfigDigest);
             }
 

@@ -65,13 +65,33 @@ class PrepareBlueGreenProxyDeactivation
             (string) $application->uuid,
             $preparation->destination->id,
         );
-        [$sourceYaml, $sourceSha256, $destinationClockObservedAtUnixSeconds] = $this->readSource(
-            $preparation->destination->server,
-            $preparation->destination->server->proxyPath(),
-            $managedFilename,
-            $expectedState,
-            $expectedServerBootId,
-        );
+        try {
+            [$sourceYaml, $sourceSha256, $destinationClockObservedAtUnixSeconds] = $this->readSource(
+                $preparation->destination->server,
+                $preparation->destination->server->proxyPath(),
+                $managedFilename,
+                $expectedState,
+                $expectedServerBootId,
+            );
+        } catch (BlueGreenDeactivationTransportException $exception) {
+            throw $exception;
+        } catch (BlueGreenDeactivationException $exception) {
+            // The durable state claims an active route, but its managed proxy
+            // bytes are gone. Before failing closed into an intervention,
+            // prove whether the destination was emptied out-of-band (no
+            // containers, no dynamic configuration for this application).
+            // Proven-empty destinations complete through the route-less
+            // path; anything else keeps the exact invariant failure.
+            if (! ProveBlueGreenDestinationEmpty::run(
+                $preparation->destination->server,
+                $application,
+                $preparation->destination,
+            )) {
+                throw $exception;
+            }
+
+            return null;
+        }
         $this->assertExpectedState($expectedState, $sourceSha256, $application, $preparation);
         try {
             $snapshot = $this->compileSnapshot(
