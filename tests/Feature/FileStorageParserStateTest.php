@@ -46,13 +46,13 @@ beforeEach(function () {
 
 function makeComposeApplication(string $dockerComposeRaw): Application
 {
-    return Application::factory()->create([
+    return withoutBlueGreenForStorage(Application::factory()->create([
         'environment_id' => test()->environment->id,
         'destination_id' => test()->destination->id,
         'destination_type' => test()->destination->getMorphClass(),
         'build_pack' => 'dockercompose',
         'docker_compose_raw' => $dockerComposeRaw,
-    ]);
+    ]));
 }
 
 /**

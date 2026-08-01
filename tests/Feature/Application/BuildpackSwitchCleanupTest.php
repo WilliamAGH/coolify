@@ -12,6 +12,8 @@ use Livewire\Livewire;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
+    seedInstanceSettings();
+
     // Create a team with owner
     $this->team = Team::factory()->create();
     $this->user = User::factory()->create();
@@ -41,8 +43,7 @@ describe('Buildpack Switching Cleanup', function () {
         // Switch to nixpacks buildpack
         Livewire::test(General::class, ['application' => $application])
             ->assertSuccessful()
-            ->set('buildPack', 'nixpacks')
-            ->call('updatedBuildPack');
+            ->set('buildPack', 'nixpacks');
 
         // Verify dockerfile fields were cleared
         $application->refresh();
@@ -50,7 +51,7 @@ describe('Buildpack Switching Cleanup', function () {
         expect($application->dockerfile)->toBeNull();
         expect($application->dockerfile_location)->toBeNull();
         expect($application->dockerfile_target_build)->toBeNull();
-        expect($application->custom_healthcheck_found)->toBeFalse();
+        expect($application->custom_healthcheck_found)->toBeFalsy();
     });
 
     test('clears dockerfile fields when switching from dockerfile to static', function () {
@@ -65,15 +66,14 @@ describe('Buildpack Switching Cleanup', function () {
 
         Livewire::test(General::class, ['application' => $application])
             ->assertSuccessful()
-            ->set('buildPack', 'static')
-            ->call('updatedBuildPack');
+            ->set('buildPack', 'static');
 
         $application->refresh();
         expect($application->build_pack)->toBe('static');
         expect($application->dockerfile)->toBeNull();
         expect($application->dockerfile_location)->toBeNull();
         expect($application->dockerfile_target_build)->toBeNull();
-        expect($application->custom_healthcheck_found)->toBeFalse();
+        expect($application->custom_healthcheck_found)->toBeFalsy();
     });
 
     test('does not clear dockerfile fields when switching to dockerfile', function () {
@@ -85,8 +85,7 @@ describe('Buildpack Switching Cleanup', function () {
 
         Livewire::test(General::class, ['application' => $application])
             ->assertSuccessful()
-            ->set('buildPack', 'dockerfile')
-            ->call('updatedBuildPack');
+            ->set('buildPack', 'dockerfile');
 
         // When switching TO dockerfile, fields remain as they were
         $application->refresh();
@@ -103,8 +102,7 @@ describe('Buildpack Switching Cleanup', function () {
 
         Livewire::test(General::class, ['application' => $application])
             ->assertSuccessful()
-            ->set('buildPack', 'static')
-            ->call('updatedBuildPack');
+            ->set('buildPack', 'static');
 
         $application->refresh();
         expect($application->build_pack)->toBe('static');
@@ -123,15 +121,14 @@ describe('Buildpack Switching Cleanup', function () {
 
         Livewire::test(General::class, ['application' => $application])
             ->assertSuccessful()
-            ->set('buildPack', 'railpack')
-            ->call('updatedBuildPack');
+            ->set('buildPack', 'railpack');
 
         $application->refresh();
         expect($application->build_pack)->toBe('railpack');
         expect($application->dockerfile)->toBeNull();
         expect($application->dockerfile_location)->toBeNull();
         expect($application->dockerfile_target_build)->toBeNull();
-        expect($application->custom_healthcheck_found)->toBeFalse();
+        expect($application->custom_healthcheck_found)->toBeFalsy();
     });
 
     test('clears dockerfile fields when switching from dockerfile to dockercompose', function () {
@@ -145,13 +142,12 @@ describe('Buildpack Switching Cleanup', function () {
 
         Livewire::test(General::class, ['application' => $application])
             ->assertSuccessful()
-            ->set('buildPack', 'dockercompose')
-            ->call('updatedBuildPack');
+            ->set('buildPack', 'dockercompose');
 
         $application->refresh();
         expect($application->build_pack)->toBe('dockercompose');
         expect($application->dockerfile)->toBeNull();
         expect($application->dockerfile_location)->toBeNull();
-        expect($application->custom_healthcheck_found)->toBeFalse();
+        expect($application->custom_healthcheck_found)->toBeFalsy();
     });
 });

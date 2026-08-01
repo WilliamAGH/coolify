@@ -46,7 +46,7 @@ beforeEach(function () {
 
 function createTestApplication($context): Application
 {
-    return Application::create([
+    $application = Application::create([
         'name' => 'test-storage-app',
         'git_repository' => 'https://github.com/test/test',
         'git_branch' => 'main',
@@ -56,6 +56,8 @@ function createTestApplication($context): Application
         'destination_id' => $context->destination->id,
         'destination_type' => $context->destination->getMorphClass(),
     ]);
+
+    return withoutBlueGreenForStorage($application);
 }
 
 function createTestDatabase($context): StandalonePostgresql

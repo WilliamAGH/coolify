@@ -1,5 +1,6 @@
 <?php
 
+use App\Models\Application;
 use App\Models\InstanceSettings;
 use App\Models\Server;
 use Illuminate\Container\Container;
@@ -109,3 +110,37 @@ function seedBrowserInstanceSettings(): InstanceSettings
 // {
 //     // ..
 // }
+
+/**
+ * Seeds the instance-wide settings singleton.
+ *
+ * `InstanceSettings::get()` resolves it with `findOrFail(0)`, so any code path
+ * reaching instance settings — proxy type, generated labels, most Livewire
+ * pages — dies with ModelNotFoundException until row 0 exists. A real instance
+ * always has it; a `RefreshDatabase` test only has it once seeded.
+ */
+function seedInstanceSettings(): InstanceSettings
+{
+    return InstanceSettings::unguarded(
+        fn (): InstanceSettings => InstanceSettings::updateOrCreate(['id' => 0], ['id' => 0]),
+    );
+}
+
+/**
+ * Opts an application out of blue-green so a test can exercise writable storage.
+ *
+ * This fork enables blue-green by default for new application settings, and
+ * blue-green legitimately refuses writable storage: two colors would share one
+ * writable volume. Tests whose subject is storage rather than blue-green state
+ * that here, so the refusal stays a real invariant everywhere else.
+ */
+function withoutBlueGreenForStorage(Application $application): Application
+{
+    $settings = $application->settings()->first();
+    if ($settings !== null && $settings->is_blue_green_deployment_enabled) {
+        $settings->is_blue_green_deployment_enabled = false;
+        $settings->save();
+    }
+
+    return $application->refresh();
+}

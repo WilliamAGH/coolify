@@ -58,13 +58,13 @@ beforeEach(function () {
     $this->environment = $this->project->environments()->first()
         ?? Environment::factory()->create(['project_id' => $this->project->id]);
 
-    $this->application = Application::factory()->create([
+    $this->application = withoutBlueGreenForStorage(Application::factory()->create([
         'uuid' => (string) Str::uuid(),
         'name' => 'Test App',
         'environment_id' => $this->environment->id,
         'destination_id' => $this->destination->id,
         'destination_type' => $this->destination->getMorphClass(),
-    ]);
+    ]));
 
     $this->actingAs($this->admin);
     session(['currentTeam' => $this->team]);
