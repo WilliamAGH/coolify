@@ -69,11 +69,46 @@ it('renders deployment logs in a full-height layout', function () {
 
     $response->assertSuccessful();
     $response->assertSee('rolling update started');
-    $response->assertSee('flex h-[calc(100vh-10rem)] min-h-40 flex-col overflow-hidden', false);
+    $response->assertSee('flex h-[calc(100vh-10rem)] min-h-[50rem] flex-col overflow-hidden', false);
     $response->assertSee('flex flex-1 min-h-0 flex-col overflow-hidden', false);
     $response->assertSee('mt-4 flex flex-1 min-h-0 flex-col overflow-hidden', false);
     $response->assertSee('flex min-h-0 flex-col w-full overflow-hidden bg-white', false);
     $response->assertSee('flex min-h-40 flex-1 flex-col overflow-y-auto p-2 px-4 scrollbar', false);
 
     expect($response->getContent())->not->toContain('max-h-[30rem]');
+});
+
+it('links back to the deployments list from the deployment log', function () {
+    $deployment = ApplicationDeploymentQueue::create([
+        'application_id' => $this->application->id,
+        'deployment_uuid' => 'deploy-back-link-test',
+        'server_id' => $this->server->id,
+        'status' => ApplicationDeploymentStatus::FINISHED->value,
+        'logs' => json_encode([
+            [
+                'command' => null,
+                'output' => 'rolling update started',
+                'type' => 'stdout',
+                'timestamp' => now()->toISOString(),
+                'hidden' => false,
+                'batch' => 1,
+                'order' => 1,
+            ],
+        ], JSON_THROW_ON_ERROR),
+    ]);
+
+    $response = $this->get(route('project.application.deployment.show', [
+        'project_uuid' => $this->project->uuid,
+        'environment_uuid' => $this->environment->uuid,
+        'application_uuid' => $this->application->uuid,
+        'deployment_uuid' => $deployment->deployment_uuid,
+    ]));
+
+    $response->assertSuccessful();
+    $response->assertSee('Back to Deployments');
+    $response->assertSee(route('project.application.deployment.index', [
+        'project_uuid' => $this->project->uuid,
+        'environment_uuid' => $this->environment->uuid,
+        'application_uuid' => $this->application->uuid,
+    ]), false);
 });
