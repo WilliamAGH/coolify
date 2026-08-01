@@ -129,6 +129,27 @@ class ApplicationsController extends Controller
         return serializeApiResponse($application);
     }
 
+    /**
+     * A Docker Image application runs the registry reference it is given, so it is
+     * unresolvable without one. The converse is deliberately NOT enforced: for a
+     * source-building pack the same field is the push destination for the image it
+     * builds, so carrying one there is normal and must keep working.
+     *
+     * @return array<string, string>|null
+     */
+    private function imageBuildPackCoherenceError(Application $application): ?array
+    {
+        $buildPack = BuildPackTypes::tryFrom((string) $application->build_pack);
+        if ($buildPack?->requiresImageRepository() !== true) {
+            return null;
+        }
+        if (filled($application->docker_registry_image_name)) {
+            return null;
+        }
+
+        return ['docker_registry_image_name' => 'A dockerimage application requires a docker_registry_image_name to pull.'];
+    }
+
     private function applicationSettingsFromRequest(Request $request): array
     {
         $settings = [];
@@ -2172,7 +2193,7 @@ class ApplicationsController extends Controller
 
             $application->fill($request->only($allowedFields));
             $application->fqdn = $fqdn;
-            $application->build_pack = 'dockerimage';
+            $application->build_pack = BuildPackTypes::DOCKERIMAGE->value;
             $application->destination_id = $destination->id;
             $application->destination_type = $destination->getMorphClass();
             $application->environment_id = $environment->id;
@@ -2960,6 +2981,17 @@ class ApplicationsController extends Controller
         if ($request->has('is_http_basic_auth_enabled') && $application->is_container_label_readonly_enabled === false) {
             $application->custom_labels = str(implode('|coolify|', generateLabelsApplication($application)))->replace('|coolify|', "\n");
             $application->save();
+        }
+
+        // A Docker Image application is defined by its registry reference, so the two
+        // must move together. Without this an application can be left declaring an
+        // image build pack with no repository to pull — a state no deploy can resolve
+        // and no later request can repair.
+        if ($buildPackCoherenceError = $this->imageBuildPackCoherenceError($application)) {
+            return response()->json([
+                'message' => 'Validation failed.',
+                'errors' => $buildPackCoherenceError,
+            ], 422);
         }
 
         // For dockercompose applications, domains (fqdn) field should not be used
