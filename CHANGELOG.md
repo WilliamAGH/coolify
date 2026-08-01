@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 📚 Documentation
+
+- Update changelog
+
+## [4.13.54-fork] - 2026-08-01
+
+### 🐛 Bug Fixes
+
+- *(blue-green)* Let an abandoned deactivation expire and be superseded
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.54-fork
+
+## [4.13.53-fork] - 2026-07-31
+
 ### 🐛 Bug Fixes
 
 - *(proxy)* Probe Traefik over the Docker network
