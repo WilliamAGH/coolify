@@ -425,6 +425,12 @@ it('retries only an initial unacknowledged catchall-status candidate probe route
                 errorOutput: 'curl: (7) Failed to connect to direct origin',
                 exitCode: 7,
             ),
+            'initial-tls-unverified' => $probeRequests === 1
+                ? Process::result(
+                    errorOutput: 'curl: (60) SSL certificate problem: self-signed certificate',
+                    exitCode: 60,
+                )
+                : Process::result(output: $successfulResponse),
             'other-status' => Process::result(output: "HTTP/1.1 500 Internal Server Error\r\n\r\n"),
         };
     });
@@ -464,6 +470,7 @@ it('retries only an initial unacknowledged catchall-status candidate probe route
     'candidate route never converges its acknowledgement' => ['never-converging-acknowledgement', 10, 9, false, 'Traefik did not acknowledge every canonical blue-green router'],
     'candidate route returns a wrong release proof' => ['wrong-release-proof', 1, 0, false],
     'candidate probe transport fails' => ['transport-failure', 1, 0, false],
+    'candidate probe TLS is unverified before first issuance' => ['initial-tls-unverified', 2, 1, true],
     'candidate route returns another non-success status' => ['other-status', 1, 0, false],
 ]);
 
@@ -691,4 +698,241 @@ it('uses the canonical direct-origin planner and verifier for every configured b
             'traefik.http.services.metrics.loadbalancer.server.port=8080',
         ],
     ],
+]);
+
+/**
+ * First-adoption PUBLIC verification context: a switching operation whose durable
+ * state has no previously proven color, container, or snapshot — the host served
+ * the proxy catchall before this operation, so initial-appearance observations
+ * must converge instead of failing terminally.
+ *
+ * @return array{
+ *     claim: BlueGreenDeploymentClaim,
+ *     configuration: BlueGreenProxyConfiguration,
+ *     lifecycle: BlueGreenDeploymentLifecycle,
+ *     target: BlueGreenRoutingTarget
+ * }
+ */
+function blueGreenInitialPublicRecoveryContext(): array
+{
+    $fixture = blueGreenLifecyclePublicRecoveryFixture([3000], 'https://initial-public.example.test');
+    $application = $fixture['application']->fresh(['settings']);
+    $deployment = $fixture['deployment'];
+    $destination = $fixture['destination'];
+    $server = $fixture['server'];
+    $bootId = '11111111-2222-3333-4444-555555555555';
+    $candidateId = str_repeat('b', 64);
+    $inventory = BlueGreenBackendPortInventory::fromPorts([3000]);
+    $fingerprint = ComputeBlueGreenDeploymentFingerprint::run(
+        $application,
+        $destination,
+        BlueGreenDeploymentColor::BLUE,
+        1,
+        1,
+        $deployment->deployment_uuid,
+    );
+    $target = new BlueGreenRoutingTarget(
+        destinationId: $destination->id,
+        activeColor: BlueGreenDeploymentColor::BLUE,
+        blueContainerName: $application->uuid.'-blue',
+        greenContainerName: $application->uuid.'-green',
+        port: 3000,
+        routingRevision: 1,
+        publicProofToken: BlueGreenRoutingTarget::durablePublicProofToken($deployment->deployment_uuid),
+        destinationFenceEpoch: 1,
+        operationId: $deployment->deployment_uuid,
+        mutationSequence: 1,
+        activeDeploymentUuid: $deployment->deployment_uuid,
+        activeContainerId: $candidateId,
+        destinationTopologyDigest: $fingerprint->topologyDigest,
+    );
+    $configuration = (new CompileBlueGreenProxyConfiguration)->compileGeneratedLabels(
+        applicationUuid: $application->uuid,
+        generatedLabels: [
+            'traefik.enable=true',
+            'traefik.http.routers.initial-public.rule=Host(`initial-public.example.test`) && PathPrefix(`/`)',
+            'traefik.http.routers.initial-public.entryPoints=https',
+            'traefik.http.routers.initial-public.service=initial-public',
+            'traefik.http.routers.initial-public.tls=true',
+            'traefik.http.services.initial-public.loadbalancer.server.port=3000',
+        ],
+        target: $target,
+    );
+    $state = ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $application->id,
+        'standalone_docker_id' => $destination->id,
+        'pending_color' => BlueGreenDeploymentColor::BLUE,
+        'pending_deployment_uuid' => $deployment->deployment_uuid,
+        'operation_deployment_uuid' => $deployment->deployment_uuid,
+        'operation_candidate_container_name' => $application->uuid.'-blue',
+        'operation_candidate_container_id' => $candidateId,
+        'operation_rollback_managed_filename' => $configuration->managedFilename,
+        'operation_destination_fence_epoch' => 1,
+        'operation_previous_destination_fence_epoch' => 0,
+        'operation_server_boot_id' => $bootId,
+        'operation_topology_digest' => $fingerprint->topologyDigest,
+        'operation_routing_config_digest' => $fingerprint->routingConfigDigest,
+        'destination_fence_epoch' => $configuration->state->destinationFenceEpoch,
+        'destination_fence_operation_id' => $configuration->state->operationId,
+        'destination_fence_mutation_sequence' => $configuration->state->mutationSequence,
+        'managed_file_sha256' => $configuration->state->managedSha256,
+        'destination_topology_digest' => $configuration->state->destinationTopologyDigest,
+        'application_routing_config_digest' => $configuration->state->applicationRoutingConfigDigest,
+        'supersession_generation' => 1,
+        'phase' => BlueGreenDeploymentPhase::SWITCHING,
+        'routing_revision' => 1,
+    ]);
+    $deployment->update([
+        'blue_green_color' => BlueGreenDeploymentColor::BLUE,
+        'blue_green_phase' => BlueGreenDeploymentPhase::SWITCHING,
+        'blue_green_routing_revision' => 1,
+        'blue_green_destination_fence_epoch' => 1,
+        'blue_green_server_boot_id' => $bootId,
+        'blue_green_topology_digest' => $fingerprint->topologyDigest,
+        'blue_green_routing_config_digest' => $fingerprint->routingConfigDigest,
+        'blue_green_backend_port_inventory' => $inventory->serialized,
+        'blue_green_drain_backend_port_inventory' => null,
+        'blue_green_supersession_generation' => 1,
+        'blue_green_previous_container_id' => null,
+        'blue_green_candidate_container_id' => $candidateId,
+        'blue_green_rollback_managed_filename' => $configuration->managedFilename,
+    ]);
+    $claim = new BlueGreenDeploymentClaim(
+        stateId: $state->id,
+        applicationId: $application->id,
+        standaloneDockerId: $destination->id,
+        pendingColor: BlueGreenDeploymentColor::BLUE,
+        previousActiveColor: null,
+        deploymentUuid: $deployment->deployment_uuid,
+        expectedRoutingRevision: 1,
+        destinationFenceEpoch: 1,
+        serverBootId: $bootId,
+        topologyDigest: $fingerprint->topologyDigest,
+        routingConfigDigest: $fingerprint->routingConfigDigest,
+        backendPortInventory: $inventory,
+        drainBackendPortInventory: null,
+        supersessionGeneration: 1,
+        legacyContainerName: null,
+        candidateContainerName: $application->uuid.'-blue',
+        rollbackManagedFilename: $configuration->managedFilename,
+    );
+    $lock = Cache::lock(
+        BlueGreenDeploymentLock::key($application->id, $destination->id),
+        300,
+    );
+    expect($lock->get())->toBeTrue();
+    $lifecycle = new BlueGreenDeploymentLifecycle(
+        application: $application,
+        deployment: $deployment->fresh(),
+        destination: $destination,
+        server: $server,
+        timeout: 30,
+        checkForCancellation: static function (): void {},
+    );
+    setBlueGreenLifecyclePublicRecoveryProperty($lifecycle, 'enabled', true);
+    setBlueGreenLifecyclePublicRecoveryProperty($lifecycle, 'claim', $claim);
+    setBlueGreenLifecyclePublicRecoveryProperty($lifecycle, 'destinationState', $configuration->state);
+    setBlueGreenLifecyclePublicRecoveryProperty(
+        $lifecycle,
+        'operationFence',
+        new BlueGreenOperationFence($lock, 300),
+    );
+
+    return compact('claim', 'configuration', 'lifecycle', 'target');
+}
+
+it('converges only a proven first-adoption public route through initial appearance', function (
+    string $outcome,
+    int $expectedPublicRequests,
+    int $expectedSleeps,
+    bool $shouldSucceed,
+    bool $established = false,
+    string $expectedFailure = 'public verification failed after switch without retry',
+): void {
+    config(['constants.ssh.mux_enabled' => false]);
+    Sleep::fake();
+    $context = blueGreenInitialPublicRecoveryContext();
+    $claim = $context['claim'];
+    $configuration = $context['configuration'];
+    $lifecycle = $context['lifecycle'];
+    $target = $context['target'];
+    if ($established) {
+        setBlueGreenLifecyclePublicRecoveryProperty(
+            $lifecycle,
+            'previousActiveColor',
+            BlueGreenDeploymentColor::GREEN,
+        );
+    }
+    $publicAcknowledgement = $target->publicAcknowledgement()
+        ?? throw new RuntimeException('The first-adoption public route must have an acknowledgement.');
+    $publicRequests = 0;
+    $successfulResponse = "HTTP/1.1 200 OK\r\n"
+        .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$publicAcknowledgement}\r\n\r\n";
+    Process::fake(function (PendingProcess $process) use (
+        $claim,
+        $outcome,
+        $successfulResponse,
+        &$publicRequests,
+    ) {
+        $command = is_array($process->command)
+            ? implode(' ', $process->command)
+            : (string) $process->command;
+        if (str_contains($command, 'coolify-blue-green-destination-state-attested')) {
+            return Process::result(output: 'coolify-blue-green-destination-state-attested');
+        }
+        if (str_contains($command, '/proc/sys/kernel/random/boot_id')) {
+            return Process::result(output: $claim->serverBootId);
+        }
+
+        $input = (string) $process->input;
+        if (! str_contains($input, VerifyBlueGreenPublicRecovery::DEPLOYMENT_NONCE_PARAMETER)) {
+            return Process::result(errorOutput: 'Unexpected non-public route verification.', exitCode: 1);
+        }
+        $publicRequests++;
+
+        return match ($outcome) {
+            'initial-404' => $publicRequests === 1
+                ? Process::result(output: "HTTP/1.1 404 Not Found\r\n\r\n")
+                : Process::result(output: $successfulResponse),
+            'initial-tls-unverified' => $publicRequests === 1
+                ? Process::result(
+                    errorOutput: 'curl: (60) SSL certificate problem: self-signed certificate',
+                    exitCode: 60,
+                )
+                : Process::result(output: $successfulResponse),
+            'never-present' => Process::result(output: "HTTP/1.1 404 Not Found\r\n\r\n"),
+            'other-status' => Process::result(output: "HTTP/1.1 500 Internal Server Error\r\n\r\n"),
+        };
+    });
+
+    try {
+        if ($shouldSucceed) {
+            invokesBlueGreenLifecyclePublicRecoveryMethod(
+                $lifecycle,
+                'waitForRoutes',
+                $configuration,
+                $target,
+                BlueGreenDeploymentPhase::SWITCHING,
+            );
+        } else {
+            expect(fn () => invokesBlueGreenLifecyclePublicRecoveryMethod(
+                $lifecycle,
+                'waitForRoutes',
+                $configuration,
+                $target,
+                BlueGreenDeploymentPhase::SWITCHING,
+            ))->toThrow(DeploymentException::class, $expectedFailure);
+        }
+    } finally {
+        $lifecycle->release();
+    }
+
+    expect($publicRequests)->toBe($expectedPublicRequests);
+    Sleep::assertSleptTimes($expectedSleeps);
+})->with([
+    'public route is absent until the managed file applies' => ['initial-404', 2, 1, true],
+    'public TLS is unverified before first issuance' => ['initial-tls-unverified', 2, 1, true],
+    'public route never appears within the extended budget' => ['never-present', 45, 44, false, false, 'Traefik did not acknowledge every canonical blue-green router'],
+    'public error status stays terminal' => ['other-status', 1, 0, false],
+    'established public route absence stays terminal' => ['initial-404', 1, 0, false, true],
 ]);

@@ -90,6 +90,10 @@ final class RepairBlueGreenSteadyState
                     $fence->assertLockOwnership();
                     $this->assertSnapshotUnchanged($state);
                 },
+                // A repaired MISSING managed file means nothing was routed before this
+                // write: catchall/unissued-TLS observations are the expected initial
+                // appearance, not a regression, while the file provider converges.
+                allowInitialRouteAppearance: $outcome === WriteBlueGreenProxyConfiguration::REPAIR_MISSING_OUTPUT,
             );
 
             $result = match ($outcome) {

@@ -84,6 +84,15 @@ final class BlueGreenDeploymentLifecycle
     /** @var list<string> */
     private const STOPPED_LEGACY_CONTAINER_STATES = ['created', 'exited', 'dead'];
 
+    /**
+     * Bounded route-appearance budget for a proven first adoption: Traefik's
+     * file-provider throttle (~2s) plus the hostname's first ACME issuance
+     * (typically 5-30s) both complete inside this window. It extends the
+     * verification loop only after an expected initial-appearance observation,
+     * so established routes keep the standard budget.
+     */
+    private const FIRST_ADOPTION_ROUTE_APPEARANCE_ATTEMPTS = 45;
+
     private bool $enabled = false;
 
     private ?BlueGreenDeploymentClaim $claim = null;
@@ -2086,17 +2095,22 @@ final class BlueGreenDeploymentLifecycle
                 return;
             } catch (Throwable $exception) {
                 $lastFailure = $exception->getMessage();
+                $initialAppearance = $this->isExpectedInitialRouteAppearance($exception, $expectedPhase);
                 if ($publicRoutes !== []) {
-                    if (! VerifyBlueGreenPublicRecovery::isConvergingRouteObservation($exception)) {
+                    if (! $initialAppearance
+                        && ! VerifyBlueGreenPublicRecovery::isConvergingRouteObservation($exception)) {
                         $this->deployment->addLogEntry(
                             'Blue-green public handoff observed an error after switch; the zero-error guarantee is not met: '.$lastFailure,
                             'stderr',
                         );
                         throw new DeploymentException('Blue-green public verification failed after switch without retry: '.$lastFailure, previous: $exception);
                     }
-                } elseif (! $this->isExpectedInitialProbeRouteAppearance($exception, $expectedPhase)
+                } elseif (! $initialAppearance
                     && ! VerifyBlueGreenPublicRecovery::isConvergingRouteObservation($exception)) {
                     throw new DeploymentException('Blue-green candidate probe verification failed without retry: '.$lastFailure, previous: $exception);
+                }
+                if ($initialAppearance) {
+                    $attempts = max($attempts, self::FIRST_ADOPTION_ROUTE_APPEARANCE_ATTEMPTS);
                 }
             }
             if ($attempt < $attempts) {
@@ -2107,13 +2121,21 @@ final class BlueGreenDeploymentLifecycle
         throw new DeploymentException("Traefik did not acknowledge every canonical blue-green router: {$lastFailure}");
     }
 
-    private function isExpectedInitialProbeRouteAppearance(
+    /**
+     * A first adoption has no previously proven route: the destination host was
+     * serving the proxy catchall before this operation began, so an expected
+     * initial-appearance observation (catchall without acknowledgement, or an
+     * unverified TLS peer before the hostname's first ACME issuance) cannot
+     * represent a user-visible regression — the zero-error guarantee is
+     * vacuously intact until the route first exists. The durable claim re-read
+     * keeps this allowance exactly as fenced as the operation itself; any
+     * previously proven color, container, expectation, or snapshot disables it.
+     */
+    private function isExpectedInitialRouteAppearance(
         Throwable $exception,
         BlueGreenDeploymentPhase $expectedPhase,
     ): bool {
-        if (! $exception instanceof BlueGreenPublicRouteAcknowledgementMismatch
-            || ! VerifyBlueGreenPublicRecovery::indicatesRouteAbsence($exception->status, $exception->acknowledgements)
-            || $expectedPhase !== BlueGreenDeploymentPhase::PREPARING
+        if (! VerifyBlueGreenPublicRecovery::indicatesInitialRouteAppearance($exception)
             || $this->previousActiveColor !== null
             || $this->legacyContainerName !== null
             || $this->previousContainerExpectation !== null
@@ -2131,7 +2153,7 @@ final class BlueGreenDeploymentLifecycle
             ->whereKey($claim->stateId)
             ->where('application_id', $claim->applicationId)
             ->where('standalone_docker_id', $claim->standaloneDockerId)
-            ->where('phase', BlueGreenDeploymentPhase::PREPARING->value)
+            ->where('phase', $expectedPhase->value)
             ->where('pending_color', $claim->pendingColor->value)
             ->where('pending_deployment_uuid', $claim->deploymentUuid)
             ->where('operation_deployment_uuid', $claim->deploymentUuid)

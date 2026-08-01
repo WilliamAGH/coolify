@@ -166,6 +166,7 @@ class VerifyBlueGreenPublicRecovery
         ?string $expectedReleaseProof = null,
         string $nonceParameter = self::RECOVERY_NONCE_PARAMETER,
         ?Closure $beforeRequest = null,
+        bool $allowInitialRouteAppearance = false,
     ): void {
         retry(
             max(10, (int) $application->health_check_retries),
@@ -183,7 +184,8 @@ class VerifyBlueGreenPublicRecovery
                 }
             },
             1000,
-            fn (Throwable $exception): bool => self::isConvergingRouteObservation($exception),
+            fn (Throwable $exception): bool => self::isConvergingRouteObservation($exception)
+                || ($allowInitialRouteAppearance && self::indicatesInitialRouteAppearance($exception)),
         );
     }
 
@@ -201,6 +203,39 @@ class VerifyBlueGreenPublicRecovery
     public static function indicatesRouteAbsence(int $status, array $acknowledgements): bool
     {
         return $acknowledgements === [] && in_array($status, [404, 503, 302], true);
+    }
+
+    /**
+     * The probe resolves the route's hostname to the local proxy, so TLS peer
+     * verification can only pass once the ACME resolver has issued for that
+     * hostname — which itself requires the router this verification is waiting
+     * on. The remote curl's exit status is preserved as the transport
+     * exception's code, so exit 60 (peer certificate cannot be authenticated)
+     * is classifiable without message parsing.
+     */
+    public static function indicatesUnverifiedTlsTransport(Throwable $exception): bool
+    {
+        return ! $exception instanceof BlueGreenPublicRouteAcknowledgementMismatch
+            && $exception instanceof RuntimeException
+            && $exception->getCode() === 60;
+    }
+
+    /**
+     * Observations expected while a route appears for the very first time:
+     * before the file provider applies the freshly written managed file the
+     * host serves the catchall, and before ACME first issues for the hostname
+     * the TLS probe cannot verify the peer. Callers may treat these as
+     * converging ONLY when durable state proves no route was previously proven
+     * for the operation — the zero-error guarantee is vacuous until the route
+     * first exists, and it stays enforced everywhere else.
+     */
+    public static function indicatesInitialRouteAppearance(Throwable $exception): bool
+    {
+        if ($exception instanceof BlueGreenPublicRouteAcknowledgementMismatch) {
+            return self::indicatesRouteAbsence($exception->status, $exception->acknowledgements);
+        }
+
+        return self::indicatesUnverifiedTlsTransport($exception);
     }
 
     /**
