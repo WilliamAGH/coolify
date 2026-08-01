@@ -2,11 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
-## [unreleased]
+## [4.13.55-fork] - 2026-08-01
+
+### 🐛 Bug Fixes
+
+- *(blue-green)* Converge first-adoption route appearance instead of failing terminally
 
 ### 📚 Documentation
 
 - Update changelog
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.55-fork
 
 ## [4.13.54-fork] - 2026-08-01
 
