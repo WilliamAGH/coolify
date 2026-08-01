@@ -8,6 +8,15 @@ final class BlueGreenDeploymentLock
 
     public const DEACTIVATION_REMOTE_TIMEOUT_SECONDS = 270;
 
+    /**
+     * The absolute budget a durable deactivation operation may occupy, measured on
+     * the control plane's own clock from `started_at`. Every in-attempt deadline is
+     * read from the destination, so a destination that cannot answer would otherwise
+     * keep an operation resumable forever; this budget is the one expiry that stays
+     * evaluable when the destination proves nothing at all.
+     */
+    public const DEACTIVATION_DURABLE_BUDGET_SECONDS = 3600;
+
     public static function key(int $applicationId, int $standaloneDockerId): string
     {
         return "application-blue-green:{$applicationId}:{$standaloneDockerId}";
@@ -16,6 +25,11 @@ final class BlueGreenDeploymentLock
     public static function deactivationLeaseSeconds(): int
     {
         return self::RENEWABLE_LEASE_SECONDS;
+    }
+
+    public static function deactivationDurableBudgetSeconds(): int
+    {
+        return self::DEACTIVATION_DURABLE_BUDGET_SECONDS;
     }
 
     public static function deactivationRemoteTimeoutSeconds(): int

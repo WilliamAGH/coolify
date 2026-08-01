@@ -60,10 +60,12 @@ use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
 use App\Actions\Shared\ComplexStatusCheck;
 use App\Enums\ApplicationDeploymentExecutionPhase;
 use App\Enums\ApplicationDeploymentStatus;
+use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Exceptions\DeploymentException;
 use App\Models\Application;
+use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationBlueGreenReplica;
 use App\Models\ApplicationDeploymentQueue;
@@ -162,7 +164,7 @@ final class BlueGreenDeploymentLifecycle
             ->where('standalone_docker_id', $this->destination->id)
             ->first();
         if ($durableState?->phase === BlueGreenDeploymentPhase::DEACTIVATING) {
-            throw new DeploymentException('The queued deployment is fenced by a blue-green deactivation in progress.');
+            $durableState = $this->supersedeAbandonedDeactivation($durableState);
         }
         if (! $this->application->isBlueGreenDeploymentOptedIn() && $durableState === null) {
             return;
@@ -907,6 +909,47 @@ final class BlueGreenDeploymentLifecycle
      * recovery `blue-green:recover-intervention --apply` performs, and keep the lifecycle fence
      * only when the state stays unrecovered (manual-only or deferred classifications).
      */
+    /**
+     * A destination parked in DEACTIVATING outlives the operation that parked it
+     * whenever that operation can no longer run: its owner row is gone, it already
+     * escalated to intervention, or it burned its durable budget. Only a live owner
+     * may fence a newer deployment, otherwise one abandoned stop permanently blocks
+     * every future push to this destination.
+     */
+    private function supersedeAbandonedDeactivation(
+        ApplicationBlueGreenDeployment $durableState,
+    ): ?ApplicationBlueGreenDeployment {
+        $owner = ApplicationBlueGreenDeactivation::query()
+            ->where('application_id', $this->application->id)
+            ->where('standalone_docker_id', $this->destination->id)
+            ->first();
+        if ($owner !== null
+            && $owner->phase->isInProgress()
+            && ! $owner->exceededDurableBudget()) {
+            throw new DeploymentException('The queued deployment is fenced by a blue-green deactivation in progress.');
+        }
+        if ($owner?->phase === BlueGreenDeactivationPhase::REMOVED) {
+            throw new DeploymentException('The queued deployment is fenced by a completed application removal.');
+        }
+
+        $this->deployment->addLogEntry(
+            'Superseding an abandoned blue-green deactivation on this destination: '
+            .($owner === null
+                ? 'no durable deactivation owner remains.'
+                : "owner phase={$owner->phase->value} exceeded its durable budget."),
+        );
+        $result = RecoverBlueGreenIntervention::run(
+            stateId: $durableState->id,
+            apply: true,
+            reason: 'abandoned deactivation superseded at deployment start',
+        );
+        $this->deployment->addLogEntry(
+            "Blue-green deactivation supersession: classification={$result->classification} outcome={$result->outcome} {$result->message}",
+        );
+
+        return ApplicationBlueGreenDeployment::query()->find($durableState->id);
+    }
+
     private function recoverInterventionAtDeploymentStart(
         ApplicationBlueGreenDeployment $durableState,
     ): ?ApplicationBlueGreenDeployment {

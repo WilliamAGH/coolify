@@ -3,6 +3,7 @@
 use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
 use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
+use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
 use App\Actions\Application\BlueGreen\FindBlueGreenDeactivationFence;
 use App\Actions\Application\BlueGreen\RecordBlueGreenDestinationState;
 use App\Enums\ApplicationDeploymentStatus;
@@ -575,4 +576,79 @@ it('refuses a terminal failure while a durable state row still owns the claimed 
 
     expect($updated)->toBeFalse()
         ->and($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
+});
+
+function deactivatingBlueGreenFixtureWithOwner(?array $ownerAttributes): array
+{
+    $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
+    ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $fixture['application']->id,
+        'standalone_docker_id' => $fixture['destination']->id,
+        'phase' => BlueGreenDeploymentPhase::DEACTIVATING,
+        'routing_revision' => 14,
+        'active_color' => 'green',
+        'supersession_generation' => 1,
+    ]);
+    if ($ownerAttributes !== null) {
+        ApplicationBlueGreenDeactivation::query()->create(array_merge([
+            'application_id' => $fixture['application']->id,
+            'standalone_docker_id' => $fixture['destination']->id,
+            'operation_id' => str_repeat('c', 64),
+            'queue_cutoff_id' => $fixture['deployment']->id,
+            'supersession_generation' => 1,
+        ], $ownerAttributes));
+    }
+
+    return $fixture;
+}
+
+function supersedeAbandonedDeactivationFor(array $fixture): mixed
+{
+    $state = ApplicationBlueGreenDeployment::query()
+        ->where('application_id', $fixture['application']->id)
+        ->firstOrFail();
+
+    return invokeApplicationDeploymentBlueGreenMethod(
+        applicationDeploymentBlueGreenLifecycle($fixture),
+        'supersedeAbandonedDeactivation',
+        $state,
+    );
+}
+
+it('still fences a newer deployment while a deactivation owner is live and inside its budget', function () {
+    $fixture = deactivatingBlueGreenFixtureWithOwner([
+        'started_at' => now()->subSeconds(120),
+        'phase' => BlueGreenDeactivationPhase::STOPPING,
+    ]);
+
+    expect(fn () => supersedeAbandonedDeactivationFor($fixture))
+        ->toThrow(DeploymentException::class, 'fenced by a blue-green deactivation in progress');
+});
+
+it('still fences a newer deployment once the application removal completed', function () {
+    $fixture = deactivatingBlueGreenFixtureWithOwner([
+        'started_at' => now()->subSeconds(120),
+        'phase' => BlueGreenDeactivationPhase::REMOVED,
+        'completed_at' => now(),
+    ]);
+
+    expect(fn () => supersedeAbandonedDeactivationFor($fixture))
+        ->toThrow(DeploymentException::class, 'fenced by a completed application removal');
+});
+
+it('supersedes a deactivation whose owner burned its durable budget', function () {
+    $fixture = deactivatingBlueGreenFixtureWithOwner([
+        'started_at' => now()->subSeconds(BlueGreenDeploymentLock::deactivationDurableBudgetSeconds() + 60),
+        'phase' => BlueGreenDeactivationPhase::STOPPING,
+    ]);
+
+    expect(fn () => supersedeAbandonedDeactivationFor($fixture))
+        ->not->toThrow(DeploymentException::class);
+});
+
+it('supersedes a deactivation whose owner row no longer exists', function () {
+    $fixture = deactivatingBlueGreenFixtureWithOwner(null);
+
+    expect(fn () => supersedeAbandonedDeactivationFor($fixture))
+        ->not->toThrow(DeploymentException::class);
 });

@@ -91,6 +91,9 @@ final class ResumeBlueGreenDeactivations
                 'The stale row is not one exact durable deleted-application deactivation owner.',
             );
         }
+        if ($deactivation->exceededDurableBudget()) {
+            return $this->terminalizeExhaustedBudget($deactivation);
+        }
 
         try {
             DeactivateBlueGreenApplicationDestination::run(
@@ -129,6 +132,37 @@ final class ResumeBlueGreenDeactivations
                 $exception->failure(),
             );
         }
+    }
+
+    /**
+     * Records the one durable escalation a destination cannot veto. Every other
+     * resume outcome is decided by the destination's own answers, so an operation
+     * whose destination answers nothing would otherwise defer without end and
+     * without ever writing the row it keeps re-reading.
+     */
+    private function terminalizeExhaustedBudget(
+        ApplicationBlueGreenDeactivation $deactivation,
+    ): BlueGreenDeactivationResumeResult {
+        $reason = 'The durable blue-green deactivation budget of '
+            .BlueGreenDeploymentLock::deactivationDurableBudgetSeconds()
+            .'s elapsed without the destination proving route convergence.';
+        $terminalized = ApplicationBlueGreenDeactivation::query()
+            ->whereKey($deactivation->getKey())
+            ->where('phase', $deactivation->phase->value)
+            ->where('supersession_generation', $deactivation->supersession_generation)
+            ->update([
+                'phase' => BlueGreenDeactivationPhase::INTERVENTION_REQUIRED->value,
+                'intervention_phase' => $deactivation->phase->value,
+                'intervention_reason' => $reason,
+            ]) === 1;
+
+        return new BlueGreenDeactivationResumeResult(
+            $deactivation->id,
+            BlueGreenDeactivationResumeResult::INTERVENTION_REQUIRED,
+            $terminalized
+                ? $reason
+                : 'The durable deactivation budget elapsed but the row changed before escalation was recorded.',
+        );
     }
 
     private function integerOption(Command $command, string $name): ?int

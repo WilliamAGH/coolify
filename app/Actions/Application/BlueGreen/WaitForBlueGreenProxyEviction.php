@@ -104,7 +104,13 @@ final class WaitForBlueGreenProxyEviction
 
     private function destinationUnixSeconds(Server $server): int
     {
-        $destinationUnixSeconds = ExecuteBlueGreenDeactivationRemoteCommand::run($server, 'date +%s');
+        // `date +%s` terminates its value with a newline, so the exact-end anchor
+        // only holds once that terminator is stripped, exactly as the boot-identity
+        // reader does before its own anchored match.
+        $destinationUnixSeconds = rtrim(
+            ExecuteBlueGreenDeactivationRemoteCommand::run($server, 'date +%s'),
+            "\r\n",
+        );
         if (preg_match('/^[1-9][0-9]*$/D', $destinationUnixSeconds) !== 1) {
             throw new BlueGreenDeactivationTransportException('The destination did not return a valid clock value for bounded route convergence.');
         }

@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
 use App\Actions\Application\BlueGreen\BlueGreenProxyDeactivationSnapshot;
 use App\Enums\BlueGreenDeactivationPhase;
 use Illuminate\Database\Eloquent\Model;
@@ -74,6 +75,24 @@ final class ApplicationBlueGreenDeactivation extends Model
 
         return $deployment->getKey() <= $this->queue_cutoff_id
             || ($deployment->created_at !== null && $deployment->created_at->lt($this->started_at));
+    }
+
+    /**
+     * Whether this operation has outlived its durable budget on the control plane's
+     * own clock. Deliberately independent of the destination: every in-attempt
+     * deadline is read from the destination, so this is the only expiry that still
+     * resolves when the destination proves nothing.
+     */
+    public function exceededDurableBudget(): bool
+    {
+        if ($this->started_at === null) {
+            return false;
+        }
+
+        return $this->started_at
+            ->clone()
+            ->addSeconds(BlueGreenDeploymentLock::deactivationDurableBudgetSeconds())
+            ->isPast();
     }
 
     public function ownsApplicationLifecycle(Application $application): bool
