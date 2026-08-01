@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [unreleased]
+
+### 🐛 Bug Fixes
+
+- *(deployments)* Restore back navigation from deployment log view
+
+### 📚 Documentation
+
+- Update changelog
+
 ## [4.13.57-fork] - 2026-08-01
 
 ### 🐛 Bug Fixes
