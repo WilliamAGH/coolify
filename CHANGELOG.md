@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [4.13.56-fork] - 2026-08-01
+
+### 🚀 Features
+
+- *(api)* Enforce dockerimage build-pack and registry image coherence
+
+### 🐛 Bug Fixes
+
+- *(application)* Null-safe destination/server access on settings page
+- Guard email-change state and repair the silently red suite
+
+### 📚 Documentation
+
+- Update changelog
+
+### 🧪 Testing
+
+- Add shared Pest helpers and adopt them across the suite
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.56-fork
+
 ## [4.13.55-fork] - 2026-08-01
 
 ### 🐛 Bug Fixes
