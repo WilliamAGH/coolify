@@ -4,12 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🚀 Features
+
+- *(blue-green)* Prove-empty destination completion for deactivation
+
+### 🧪 Testing
+
+- *(feature)* Repair 28 rotting feature tests and API token Never expiration
+
+## [4.13.58-fork] - 2026-08-01
+
 ### 🐛 Bug Fixes
 
 - *(deployments)* Restore back navigation from deployment log view
 
 ### 📚 Documentation
 
+- Update changelog
 - Update changelog
 - Update changelog
 
