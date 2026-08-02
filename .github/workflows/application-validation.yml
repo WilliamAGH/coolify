@@ -244,6 +244,7 @@ jobs:
             tests/Feature/DatabaseMigrationReadinessTest.php \
             tests/Feature/LivewireDestinationTopologyPersistenceTest.php \
             tests/Feature/BlueGreenOperationFencingTest.php \
+            tests/Feature/BlueGreenProvenEmptyDeactivationTest.php \
             tests/Feature/BlueGreenReplicaLifecycleTest.php \
             tests/Feature/BlueGreenStoppedLegacyContainerCleanupTest.php \
             tests/Feature/BlueGreenSupersessionGenerationTest.php \
