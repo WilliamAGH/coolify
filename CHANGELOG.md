@@ -4,13 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 📚 Documentation
+
+- Update changelog
+
+## [4.13.59-fork] - 2026-08-02
+
 ### 🚀 Features
 
 - *(blue-green)* Prove-empty destination completion for deactivation
 
+### 🐛 Bug Fixes
+
+- *(tests)* Register Pest isolation hooks on a class-less uses binding
+
 ### 🧪 Testing
 
 - *(feature)* Repair 28 rotting feature tests and API token Never expiration
+- *(feature)* Repair second wave of rotting tests and fix test-isolation hook
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.59-fork
 
 ## [4.13.58-fork] - 2026-08-01
 
