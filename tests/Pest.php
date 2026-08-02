@@ -11,26 +11,19 @@ use Tests\TestCase;
 
 /*
 |--------------------------------------------------------------------------
-| Test Case
-|--------------------------------------------------------------------------
-|
-| The closure you provide to your test functions is always bound to a specific PHPUnit test
-| case class. By default, that class is "PHPUnit\Framework\TestCase". Of course, you may
-| need to change it using the "uses()" function to bind a different classes or traits.
-|
-*/
-/*
-|--------------------------------------------------------------------------
 | Test Case + Global Hooks
 |--------------------------------------------------------------------------
 |
 | The closure you provide to your test functions is always bound to a specific PHPUnit test
-| case class. The global beforeEach MUST live on this uses() binding: a bare beforeEach()
-| at the top level of Pest.php is inert under Pest 4.3 and never executes, which let
+| case class. The global beforeEach hooks MUST be registered on their own class-less
+| uses() binding: a bare beforeEach() at the top level of Pest.php is inert under Pest 4.3,
+| and hooks chained onto the uses(TestCase::class) binding never execute either — both let
 | once() and Server::findCached identity-map state leak across test files in one process.
 |
 */
-uses(TestCase::class)
+uses(TestCase::class)->in('Feature', 'v4/Feature', 'v4/Browser');
+
+uses()
     ->beforeEach(function () {
         // Flush the Once memoization cache to ensure tests get fresh data
         Once::flush();
