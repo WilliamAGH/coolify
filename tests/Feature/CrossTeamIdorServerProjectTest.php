@@ -8,6 +8,8 @@ use App\Livewire\Project\DeleteProject;
 use App\Models\Application;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\Environment;
+use App\Models\InstanceSettings;
+use App\Models\PrivateKey;
 use App\Models\Project;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
@@ -15,17 +17,28 @@ use App\Models\Team;
 use App\Models\User;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Auth;
 use Livewire\Livewire;
 
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->create(['id' => 0]));
+
     // Attacker: Team A
     $this->userA = User::factory()->create();
     $this->teamA = Team::factory()->create();
     $this->userA->teams()->attach($this->teamA, ['role' => 'owner']);
 
-    $this->serverA = Server::factory()->create(['team_id' => $this->teamA->id]);
+    $this->privateKeyA = PrivateKey::create([
+        'name' => 'Team A key',
+        'private_key' => generateSSHKey('ed25519')['private'],
+        'team_id' => $this->teamA->id,
+    ]);
+    $this->serverA = Server::factory()->create([
+        'team_id' => $this->teamA->id,
+        'private_key_id' => $this->privateKeyA->id,
+    ]);
     $this->projectA = Project::factory()->create(['team_id' => $this->teamA->id]);
     $this->environmentA = Environment::factory()->create(['project_id' => $this->projectA->id]);
 
@@ -86,7 +99,12 @@ describe('Boarding Project IDOR', function () {
     });
 
     test('boarding selectExistingProject can load own team project', function () {
-        $component = Livewire::test(BoardingIndex::class)
+        // Follow the real boarding flow: an existing server is selected first,
+        // so the create-resource step renders with a created server present.
+        $component = Livewire::test(BoardingIndex::class, [
+            'selectedServerType' => 'remote',
+            'selectedExistingServer' => $this->serverA->id,
+        ])
             ->set('selectedProject', $this->projectA->id)
             ->call('selectExistingProject');
 
@@ -152,10 +170,11 @@ describe('CloneMe Project IDOR', function () {
 describe('DeployController API Server IDOR', function () {
     test('deploy cancel API cannot access build server from another team', function () {
         // Create a deployment queue entry that references Team B's server as build_server
+        $destination = StandaloneDocker::query()->where('server_id', $this->serverA->id)->firstOrFail();
         $application = Application::factory()->create([
             'environment_id' => $this->environmentA->id,
-            'destination_id' => StandaloneDocker::factory()->create(['server_id' => $this->serverA->id])->id,
-            'destination_type' => StandaloneDocker::class,
+            'destination_id' => $destination->id,
+            'destination_type' => $destination->getMorphClass(),
         ]);
 
         $deployment = ApplicationDeploymentQueue::create([
@@ -168,9 +187,13 @@ describe('DeployController API Server IDOR', function () {
 
         $token = $this->userA->createToken('test-token', ['*']);
 
+        // The session-authenticated user would take precedence over the Bearer
+        // token (TransientToken), so drop it to exercise the API token path.
+        Auth::guard('web')->forgetUser();
+
         $response = $this->withHeaders([
             'Authorization' => 'Bearer '.$token->plainTextToken,
-        ])->deleteJson("/api/v1/deployments/{$deployment->deployment_uuid}");
+        ])->postJson("/api/v1/deployments/{$deployment->deployment_uuid}/cancel");
 
         // The cancellation should proceed but the build_server should NOT be found
         // (team-scoped query returns null for Team B's server)

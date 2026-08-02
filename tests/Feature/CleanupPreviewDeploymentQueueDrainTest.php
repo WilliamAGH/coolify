@@ -63,6 +63,10 @@ it('releases server capacity after cancelling a preview deployment', function ()
     expect($previewDeployment->claimForDispatch(bypassServerCapacity: true))->toBeTrue()
         ->and($waitingDeployment->claimForDispatch())->toBeFalse();
 
+    // The Server identity map may hold a stale copy from factory setup; flush so
+    // the cleanup action sees the updated settings (see Server::flushIdentityMap).
+    Server::flushIdentityMap();
+
     $result = CleanupPreviewDeployment::run($previewApplication, 17);
 
     expect($result['cancelled_deployments'])->toBe(1)

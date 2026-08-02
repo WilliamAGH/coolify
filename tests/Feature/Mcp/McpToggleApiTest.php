@@ -5,6 +5,7 @@ use App\Models\Team;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Once;
 
 uses(RefreshDatabase::class);
 
@@ -16,6 +17,7 @@ beforeEach(function () {
     ]);
     $settings->id = 0;
     $settings->save();
+    Once::flush();
 
     $this->team = Team::factory()->create();
     $this->user = User::factory()->create();
@@ -25,6 +27,13 @@ beforeEach(function () {
 
 function makeRootMcpToken(User $user): string
 {
+    // The api.token.team middleware requires the user to be a member of the
+    // token's team, so root tokens (team_id 0) need root-team membership.
+    $rootTeam = Team::find(0) ?? Team::factory()->create(['id' => 0]);
+    if (! $user->teams()->where('teams.id', $rootTeam->id)->exists()) {
+        $rootTeam->members()->attach($user->id, ['role' => 'owner']);
+    }
+
     $token = $user->createToken('mcp-root', ['root']);
     DB::table('personal_access_tokens')
         ->where('id', $token->accessToken->id)

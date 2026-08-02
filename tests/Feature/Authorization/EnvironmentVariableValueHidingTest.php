@@ -18,7 +18,7 @@ use Livewire\Livewire;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
-    InstanceSettings::updateOrCreate(['id' => 0], ['is_api_enabled' => true]);
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->create(['id' => 0, 'is_api_enabled' => true]));
 
     $this->team = Team::factory()->create();
 
@@ -238,7 +238,9 @@ test('API hides locked env value with root token', function () {
 
 // --- API: member role hides env values ---
 
-test('API hides env values for member even with read:sensitive token', function () {
+test('API rejects member holding a read:sensitive token', function () {
+    // Members are restricted to read-only API access; a legacy read:sensitive
+    // token is rejected outright (ApiAbility::MEMBER_DISALLOWED_ABILITIES).
     session(['currentTeam' => $this->team]);
     $token = $this->member->createToken('member-sensitive', ['read', 'read:sensitive']);
 
@@ -246,14 +248,7 @@ test('API hides env values for member even with read:sensitive token', function 
         'Authorization' => 'Bearer '.$token->plainTextToken,
     ])->getJson("/api/v1/applications/{$this->application->uuid}/envs");
 
-    $response->assertOk();
-
-    $envs = collect($response->json());
-    $unlocked = $envs->firstWhere('key', 'UNLOCKED_VAR');
-
-    expect($unlocked)->not->toBeNull();
-    expect($unlocked)->not->toHaveKey('value');
-    expect($unlocked)->not->toHaveKey('real_value');
+    $response->assertStatus(403);
 });
 
 test('API shows env values for admin with read:sensitive token', function () {

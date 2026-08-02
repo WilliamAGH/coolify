@@ -14,7 +14,8 @@ class ApiTokens extends Component
 
     public ?string $description = null;
 
-    public ?int $expiresInDays = 30;
+    /** @var int|string|null Days until expiry; null or '' means "Never". */
+    public $expiresInDays = 30;
 
     public $tokens = [];
 
@@ -105,6 +106,16 @@ class ApiTokens extends Component
             }
         }
         sort($this->permissions);
+    }
+
+    public function updatedExpiresInDays(mixed $value): void
+    {
+        // The "Never" option submits an empty string; a strict int type cannot
+        // hydrate it and silently resets the property to its default on the
+        // next roundtrip. Normalize it to null here instead.
+        if ($value === '' || $value === null) {
+            $this->expiresInDays = null;
+        }
     }
 
     public function addNewToken()

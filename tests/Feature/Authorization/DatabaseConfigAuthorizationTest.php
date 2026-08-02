@@ -14,7 +14,7 @@ use Illuminate\Support\Str;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
-    InstanceSettings::updateOrCreate(['id' => 0]);
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->create(['id' => 0]));
 
     $this->team = Team::factory()->create();
 

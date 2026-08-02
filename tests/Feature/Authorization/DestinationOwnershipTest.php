@@ -13,7 +13,7 @@ use Livewire\Livewire;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
-    InstanceSettings::updateOrCreate(['id' => 0]);
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->create(['id' => 0]));
 
     // Team A owns the destination
     $this->teamA = Team::factory()->create();
@@ -55,6 +55,7 @@ test('cross-team user cannot view destination', function () {
     $this->actingAs($this->userB);
     session(['currentTeam' => $this->teamB]);
 
+    // The destination lookup is team-scoped; unknown destinations redirect to the index
     Livewire::test(Show::class, ['destination_uuid' => $this->destination->uuid])
-        ->assertStatus(403);
+        ->assertRedirect(route('destination.index'));
 });

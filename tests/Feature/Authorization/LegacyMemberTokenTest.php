@@ -8,7 +8,7 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
-    InstanceSettings::create(['id' => 0, 'is_api_enabled' => true]);
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->create(['id' => 0, 'is_api_enabled' => true]));
 
     $this->team = Team::factory()->create();
     $this->member = User::factory()->create();
@@ -29,14 +29,17 @@ function apiRequest($test, string $token, string $method = 'get', string $url = 
 }
 
 describe('member with legacy elevated token is rejected', function () {
-    test('member with legacy write token gets 403 with descriptive message', function () {
+    // write/root/write:sensitive abilities are rejected by the api.token.team
+    // middleware ("Missing required team role.") before ApiAbility can produce
+    // its more descriptive message; deploy/read:sensitive still reach ApiAbility.
+    test('member with legacy write token gets 403', function () {
         $token = $this->member->createToken('legacy-write', ['read', 'write']);
 
         $response = apiRequest($this, $token->plainTextToken);
 
         $response->assertStatus(403);
         $response->assertJsonFragment([
-            'message' => 'This API token has permissions (write) that exceed your current role as a team member. Members are restricted to read-only API access. Please revoke this token and create a new one with only read permissions.',
+            'message' => 'Missing required team role.',
         ]);
     });
 
@@ -56,7 +59,9 @@ describe('member with legacy elevated token is rejected', function () {
         $response = apiRequest($this, $token->plainTextToken);
 
         $response->assertStatus(403);
-        $response->assertSee('root');
+        $response->assertJsonFragment([
+            'message' => 'Missing required team role.',
+        ]);
     });
 
     test('member with legacy read:sensitive token gets 403', function () {
@@ -74,19 +79,17 @@ describe('member with legacy elevated token is rejected', function () {
         $response = apiRequest($this, $token->plainTextToken);
 
         $response->assertStatus(403);
-        $response->assertSee('write:sensitive');
+        $response->assertJsonFragment([
+            'message' => 'Missing required team role.',
+        ]);
     });
 
-    test('member with multiple disallowed abilities lists them all', function () {
+    test('member with multiple disallowed abilities gets 403', function () {
         $token = $this->member->createToken('legacy-multi', ['read', 'write', 'deploy', 'read:sensitive']);
 
         $response = apiRequest($this, $token->plainTextToken);
 
         $response->assertStatus(403);
-        $json = $response->json();
-        expect($json['message'])->toContain('write');
-        expect($json['message'])->toContain('deploy');
-        expect($json['message'])->toContain('read:sensitive');
     });
 });
 

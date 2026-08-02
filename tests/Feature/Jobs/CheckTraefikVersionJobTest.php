@@ -1,6 +1,7 @@
 <?php
 
 use App\Jobs\CheckTraefikVersionForServerJob;
+use App\Models\InstanceSettings;
 use App\Models\Server;
 use App\Models\Team;
 use App\Notifications\Server\TraefikVersionOutdated;
@@ -15,6 +16,10 @@ uses(RefreshDatabase::class);
 
 beforeEach(function () {
     Notification::fake();
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->create([
+        'id' => 0,
+        'fqdn' => 'https://coolify.example.com',
+    ]));
 });
 
 it('detects servers table has detected_traefik_version column', function () {
@@ -38,7 +43,8 @@ it('notification settings have traefik_outdated fields', function () {
 
     // Check Telegram notification settings
     expect($team->telegramNotificationSettings)->toHaveKey('traefik_outdated_telegram_notifications');
-    expect($team->telegramNotificationSettings)->toHaveKey('telegram_notifications_traefik_outdated_thread_id');
+    // Thread IDs are hidden from serialization (sensitive), so check the raw attributes
+    expect($team->telegramNotificationSettings->getAttributes())->toHaveKey('telegram_notifications_traefik_outdated_thread_id');
 
     // Check Slack notification settings
     expect($team->slackNotificationSettings)->toHaveKey('traefik_outdated_slack_notifications');

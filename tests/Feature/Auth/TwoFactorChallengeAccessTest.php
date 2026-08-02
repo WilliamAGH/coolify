@@ -1,5 +1,6 @@
 <?php
 
+use App\Models\InstanceSettings;
 use App\Models\Team;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -7,6 +8,8 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->create(['id' => 0]));
+
     $this->user = User::factory()->create();
     $this->team = Team::factory()->personal()->create();
     $this->team->members()->attach($this->user->id, ['role' => 'owner']);

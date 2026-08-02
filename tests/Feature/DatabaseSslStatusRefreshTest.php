@@ -25,6 +25,7 @@ use App\Livewire\Project\Service\ResourceCard as ServiceResourceCard;
 use App\Livewire\Server\Sentinel;
 use App\Livewire\Server\Show;
 use App\Models\Environment;
+use App\Models\InstanceSettings;
 use App\Models\Project;
 use App\Models\Server;
 use App\Models\Service;
@@ -40,6 +41,8 @@ use Livewire\Livewire;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->create(['id' => 0]));
+
     $this->team = Team::factory()->create();
     $this->user = User::factory()->create();
     $this->team->members()->attach($this->user->id, ['role' => 'owner']);
@@ -222,12 +225,12 @@ it('reloads the mysql status-info model when refresh is called so ssl controls f
     ]);
 
     $component = Livewire::test(MysqlStatusInfo::class, ['database' => $database])
-        ->assertDontSee('Database should be stopped to change this settings.');
+        ->assertDontSee('Database should be stopped to change this setting.');
 
     $database->fill(['status' => 'running:healthy'])->save();
 
     $component->call('refresh')
-        ->assertSee('Database should be stopped to change this settings.');
+        ->assertSee('Database should be stopped to change this setting.');
 });
 
 it('does not clobber server form text inputs when sentinel restarts', function () {
@@ -236,7 +239,7 @@ it('does not clobber server form text inputs when sentinel restarts', function (
         'name' => 'persisted-server-name',
     ]);
 
-    $component = Livewire::test(Sentinel::class, ['server_uuid' => $server->uuid])
+    $component = Livewire::test(Sentinel::class, ['server' => $server])
         ->set('sentinelToken', 'user-was-typing-this-token');
 
     $component->call('handleSentinelRestarted', ['serverUuid' => $server->uuid]);
@@ -280,10 +283,10 @@ it('shows the redis ssl gate hint after the sibling is refreshed', function () {
     ]);
 
     $component = Livewire::test(RedisStatusInfo::class, ['database' => $database])
-        ->assertDontSee('Database should be stopped to change this settings.');
+        ->assertDontSee('Database should be stopped to change this setting.');
 
     $database->fill(['status' => 'running:healthy'])->save();
 
     $component->call('refresh')
-        ->assertSee('Database should be stopped to change this settings.');
+        ->assertSee('Database should be stopped to change this setting.');
 });

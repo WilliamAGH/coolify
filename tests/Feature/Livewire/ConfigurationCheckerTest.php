@@ -110,6 +110,9 @@ it('refreshes stale modal configuration diff before opening changes', function (
 });
 
 it('does not render environment variable secret values', function () {
+    // Members are redacted at render time (owners/admins may see unlocked values)
+    $this->team->members()->updateExistingPivot($this->user->id, ['role' => 'member']);
+
     $application = configurationCheckerApplication($this->environment);
     EnvironmentVariable::create([
         'key' => 'API_TOKEN',
@@ -133,6 +136,9 @@ it('does not render environment variable secret values', function () {
 });
 
 it('renders added environment variables as set without exposing secret values', function () {
+    // Members are redacted at render time (owners/admins may see unlocked values)
+    $this->team->members()->updateExistingPivot($this->user->id, ['role' => 'member']);
+
     $application = configurationCheckerApplication($this->environment);
     markConfigurationCheckerApplicationDeployed($application);
 

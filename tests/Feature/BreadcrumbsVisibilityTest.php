@@ -53,16 +53,15 @@ it('hides the breadcrumb trail on mobile while keeping the current status visibl
     $response->assertSee('hidden flex-wrap items-center gap-y-1 md:flex', false);
     $response->assertSee('flex flex-wrap items-center gap-1', false);
     $response->assertSee(
-        'scrollbar flex min-h-10 w-full flex-nowrap items-center gap-6 overflow-x-scroll overflow-y-hidden pb-1 whitespace-nowrap md:w-auto md:overflow-visible',
+        'scrollbar hidden min-h-10 w-full flex-nowrap items-center gap-6 overflow-x-scroll overflow-y-hidden pb-1 whitespace-nowrap md:flex md:w-auto md:overflow-visible',
         false,
     );
     $response->assertSee('shrink-0', false);
     $response->assertSee('Actions');
-    $response->assertSee('dropdown-item-touch', false);
+    // Mobile actions render as a horizontal button row instead of a dropdown
+    $response->assertSee('application-mobile-actions', false);
+    $response->assertSee('flex flex-nowrap items-center gap-2 overflow-x-auto', false);
     $response->assertSee('hidden flex-wrap items-center gap-2 md:flex', false);
-    $response->assertSee('window.innerWidth >= 768', false);
-    $response->assertSee(':style="panelStyles"', false);
-    $response->assertSee('absolute top-full z-50 mt-1 min-w-max max-w-[calc(100vw-1rem)] md:top-0 md:mt-6', false);
     $response->assertSee('Pure Dockerfile Example');
     $response->assertSee('Running');
     $response->assertSee('pt-2 pb-4 md:pb-10', false);
