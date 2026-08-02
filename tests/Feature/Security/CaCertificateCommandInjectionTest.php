@@ -1,16 +1,22 @@
 <?php
 
 use App\Livewire\Server\CaCertificate\Show;
+use App\Models\InstanceSettings;
+use App\Models\PrivateKey;
 use App\Models\Server;
 use App\Models\SslCertificate;
 use App\Models\Team;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\Process;
 use Livewire\Livewire;
 
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->create(['id' => 0]));
+
     $this->user = User::factory()->create();
     $this->team = Team::factory()->create();
     $this->user->teams()->attach($this->team, ['role' => 'owner']);
@@ -19,6 +25,11 @@ beforeEach(function () {
 
     $this->server = Server::factory()->create([
         'team_id' => $this->team->id,
+        'private_key_id' => PrivateKey::create([
+            'name' => 'Test Key',
+            'private_key' => generateSSHKey('ed25519')['private'],
+            'team_id' => $this->team->id,
+        ])->id,
     ]);
 });
 
@@ -42,6 +53,13 @@ test('saveCaCertificate sanitizes injected commands after certificate marker', f
         'ssl_private_key' => 'test-key',
         'common_name' => 'Coolify CA Certificate',
         'valid_until' => now()->addYears(10),
+    ]);
+
+    // The save path writes the certificate over SSH and dispatches a
+    // regeneration job; fake both so the success path can complete
+    Bus::fake();
+    Process::fake([
+        '*' => Process::result(output: '', exitCode: 0),
     ]);
 
     // Inject shell command after valid certificate

@@ -17,7 +17,7 @@ beforeEach(function () {
 
     $this->privateKey = PrivateKey::create([
         'name' => 'Test Key',
-        'private_key' => 'test-key-content',
+        'private_key' => generateSSHKey('ed25519')['private'],
         'team_id' => $this->team->id,
     ]);
 });

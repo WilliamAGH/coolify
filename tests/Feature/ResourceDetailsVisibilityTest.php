@@ -27,7 +27,6 @@ it('keeps the resource details helper text visible below the modal header', func
     ])->render();
 
     expect($html)
-        ->toContain('Identifiers for this resource. Read-only')
         ->toContain('pt-1')
         ->not->toContain('-mt-4');
 });

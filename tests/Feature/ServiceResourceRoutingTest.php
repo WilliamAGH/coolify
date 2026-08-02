@@ -14,6 +14,8 @@ use App\Models\Team;
 use App\Models\User;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Http\Request;
+use Illuminate\Routing\Route;
 use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Once;
 use Livewire\Livewire;
@@ -113,15 +115,20 @@ test('does not open service database backups route from another team', function 
 })->throws(NotFoundHttpException::class);
 
 test('does not resolve service database import component from another team', function () {
-    $component = app(DatabaseImport::class);
-    $component->parameters = [
-        'project_uuid' => $this->projectA->uuid,
-        'environment_uuid' => $this->environmentA->uuid,
-        'service_uuid' => $this->otherService->uuid,
-        'stack_service_uuid' => $this->otherServiceDatabase->uuid,
-    ];
+    // The component resolves its resource from the current route parameters
+    // (team-scoped), so set up a current route carrying the cross-team UUIDs
+    $route = new Route(['GET'], '/x/{project_uuid}/{environment_uuid}/{service_uuid}/{stack_service_uuid}', ['uses' => fn () => null]);
+    $route->bind(Request::create('/x/a/b/c/d', 'GET'));
+    $route->setParameter('project_uuid', $this->projectA->uuid);
+    $route->setParameter('environment_uuid', $this->environmentA->uuid);
+    $route->setParameter('service_uuid', $this->otherService->uuid);
+    $route->setParameter('stack_service_uuid', $this->otherServiceDatabase->uuid);
+    $router = app('router');
+    $currentRoute = new ReflectionProperty($router, 'current');
+    $currentRoute->setValue($router, $route);
 
-    $component->getContainers();
+    $component = app(DatabaseImport::class);
+    $component->mount();
 })->throws(ModelNotFoundException::class);
 
 test('service heading does not hydrate with another team service', function () {

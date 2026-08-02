@@ -5,12 +5,13 @@ use App\Models\InstanceSettings;
 use App\Models\Team;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Livewire\Features\SupportLockedProperties\CannotUpdateLockedPropertyException;
 use Livewire\Livewire;
 
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
-    InstanceSettings::updateOrCreate(['id' => 0], ['is_api_enabled' => true]);
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(['id' => 0], ['is_api_enabled' => true]));
 
     $this->team = Team::factory()->create();
 
@@ -78,16 +79,11 @@ describe('Livewire ApiTokens — member cannot create elevated tokens', function
         $this->actingAs($this->member);
         session(['currentTeam' => $this->team]);
 
-        // Simulate snapshot replay: force the boolean to true
+        // Simulate snapshot replay: Livewire rejects client-side updates to
+        // #[Locked] properties outright
         Livewire::test(ApiTokens::class)
-            ->set('canUseRootPermissions', true)
-            ->set('description', 'sneaky-root-token')
-            ->set('permissions', ['root'])
-            ->call('addNewToken')
-            ->assertDispatched('error');
-
-        expect($this->member->tokens()->count())->toBe(0);
-    });
+            ->set('canUseRootPermissions', true);
+    })->throws(CannotUpdateLockedPropertyException::class);
 
     test('member can create token with read permissions', function () {
         $this->actingAs($this->member);

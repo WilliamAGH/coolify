@@ -79,7 +79,9 @@ test('only eligible deployment servers can host resources', function () {
 });
 
 test('a populated build server can be changed back to a deployment server', function () {
-    createResourceHostingTestApplication($this);
+    // Blue-green is on by default for new applications and its topology guard
+    // rejects saving the server; this test is about build-server toggling
+    withoutBlueGreenForStorage(createResourceHostingTestApplication($this));
     $this->server->settings()->update(['is_build_server' => true]);
 
     Livewire::actingAs($this->user)
@@ -208,7 +210,7 @@ test('server API rejects enabling build mode when resources exist', function () 
 });
 
 test('server API allows keeping build mode enabled when resources exist', function () {
-    createResourceHostingTestApplication($this);
+    withoutBlueGreenForStorage(createResourceHostingTestApplication($this));
     $this->server->settings()->update(['is_build_server' => true]);
 
     $this->withHeaders(resourceHostingApiHeaders($this->bearerToken))
@@ -221,7 +223,7 @@ test('server API allows keeping build mode enabled when resources exist', functi
 });
 
 test('server API allows disabling build mode when resources exist', function () {
-    createResourceHostingTestApplication($this);
+    withoutBlueGreenForStorage(createResourceHostingTestApplication($this));
     $this->server->settings()->update(['is_build_server' => true]);
 
     $this->withHeaders(resourceHostingApiHeaders($this->bearerToken))

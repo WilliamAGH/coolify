@@ -19,7 +19,7 @@ beforeEach(function () {
             Server::factory()->create(['id' => 0, 'team_id' => $this->rootTeam->id]);
         }
         if (! InstanceSettings::find(0)) {
-            InstanceSettings::create(['id' => 0]);
+            InstanceSettings::unguarded(fn () => InstanceSettings::query()->create(['id' => 0]));
         }
     });
     Once::flush();

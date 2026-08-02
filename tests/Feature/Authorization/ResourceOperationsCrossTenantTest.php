@@ -17,6 +17,9 @@ uses(RefreshDatabase::class);
 beforeEach(function () {
     $this->withoutVite();
     InstanceSettings::forceCreate(['id' => 0]);
+    // Flush the Server identity map: rows are rolled back per test, so ids repeat
+    // and a stale cached Server from a previous file can fail team checks.
+    Server::flushIdentityMap();
 
     // Team A (attacker's team)
     $this->userA = User::factory()->create();

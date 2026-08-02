@@ -4,10 +4,15 @@ use App\Models\Server;
 use App\Models\ServerSetting;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Queue;
 
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
+    // Sentinel setting changes dispatch a sentinel restart; fake the queue so
+    // it does not execute inline (sync queue) and fail on missing FQDN/SSH
+    Queue::fake();
+
     // Create user (which automatically creates a team)
     $user = User::factory()->create();
     $this->team = $user->teams()->first();

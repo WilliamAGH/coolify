@@ -1,6 +1,8 @@
 <?php
 
 use App\Actions\Database\StartDatabaseProxy;
+use App\Models\Environment;
+use App\Models\Project;
 use App\Models\StandalonePostgresql;
 use App\Models\Team;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -14,9 +16,11 @@ beforeEach(function () {
 
 test('database proxy is disabled on port already allocated error', function () {
     $team = Team::factory()->create();
+    $project = Project::factory()->create(['team_id' => $team->id]);
+    $environment = Environment::factory()->create(['project_id' => $project->id]);
 
     $database = StandalonePostgresql::factory()->create([
-        'team_id' => $team->id,
+        'environment_id' => $environment->id,
         'is_public' => true,
         'public_port' => 5432,
     ]);

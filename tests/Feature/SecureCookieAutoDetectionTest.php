@@ -1,13 +1,14 @@
 <?php
 
 use App\Models\InstanceSettings;
+use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Cache;
 
-uses(\Illuminate\Foundation\Testing\RefreshDatabase::class);
+uses(RefreshDatabase::class);
 
 beforeEach(function () {
     Cache::forget('instance_settings_fqdn_host');
-    InstanceSettings::updateOrCreate(['id' => 0], ['fqdn' => null]);
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(['id' => 0], ['fqdn' => null]));
     // Ensure session.secure starts unconfigured for each test
     config(['session.secure' => null]);
 });
@@ -53,7 +54,9 @@ it('marks session cookie with Secure flag when accessed over HTTPS proxy', funct
         'X-Forwarded-For' => '1.2.3.4',
     ]);
 
-    $response->assertSuccessful();
+    // /login redirects to onboarding when no user exists yet; the session
+    // cookie is set either way
+    expect($response->status())->toBeIn([200, 302]);
 
     $cookieName = config('session.cookie');
     $sessionCookie = collect($response->headers->all('set-cookie'))

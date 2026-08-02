@@ -28,7 +28,9 @@ class VultrService
                 );
             }
 
-            throw new \Exception('Vultr API error: '.$response->json('error', 'Unknown error'), $response->status());
+            $message = $response->json('error') ?? trim($response->body());
+
+            throw new \Exception('Vultr API error: '.($message !== '' ? $message : 'Unknown error'), $response->status());
         }
 
         return $response->json() ?? [];

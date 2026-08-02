@@ -5,6 +5,8 @@ use App\Models\Server;
 use App\Models\Team;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\Process;
 use Livewire\Livewire;
 
 uses(RefreshDatabase::class);
@@ -98,22 +100,33 @@ it('can overwrite server_metadata with new values', function () {
 });
 
 it('calls gatherServerMetadata during ValidateAndInstall when docker version is valid', function () {
+    // Invoke the component directly: Livewire::test() rehydrates the server
+    // property into a real model on the second roundtrip, losing the mock
     $serverMock = Mockery::mock($this->server)->makePartial();
     $serverMock->shouldReceive('isSwarm')->andReturn(false);
     $serverMock->shouldReceive('validateDockerEngineVersion')->once()->andReturn('24.0.0');
     $serverMock->shouldReceive('gatherServerMetadata')->once();
     $serverMock->shouldReceive('isBuildServer')->andReturn(false);
 
-    Livewire::test(ValidateAndInstall::class, ['server' => $serverMock])
-        ->call('validateDockerVersion');
+    Bus::fake();
+    Process::fake([
+        '*' => Process::result(output: '', exitCode: 0),
+    ]);
+
+    $component = app(ValidateAndInstall::class);
+    $component->server = $serverMock;
+    $component->validateDockerVersion();
 });
 
 it('does not call gatherServerMetadata when docker version validation fails', function () {
+    // Invoke the component directly: Livewire::test() rehydrates the server
+    // property into a real model on the second roundtrip, losing the mock
     $serverMock = Mockery::mock($this->server)->makePartial();
     $serverMock->shouldReceive('isSwarm')->andReturn(false);
     $serverMock->shouldReceive('validateDockerEngineVersion')->once()->andReturn(false);
     $serverMock->shouldNotReceive('gatherServerMetadata');
 
-    Livewire::test(ValidateAndInstall::class, ['server' => $serverMock])
-        ->call('validateDockerVersion');
+    $component = app(ValidateAndInstall::class);
+    $component->server = $serverMock;
+    $component->validateDockerVersion();
 });

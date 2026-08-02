@@ -2,6 +2,7 @@
 
 use App\Livewire\Project\Service\EditDomain;
 use App\Models\Environment;
+use App\Models\InstanceSettings;
 use App\Models\Project;
 use App\Models\Server;
 use App\Models\Service;
@@ -9,24 +10,28 @@ use App\Models\ServiceApplication;
 use App\Models\StandaloneDocker;
 use App\Models\Team;
 use App\Models\User;
+use Illuminate\Foundation\Testing\RefreshDatabase;
 use Livewire\Livewire;
 
+uses(RefreshDatabase::class);
+
 beforeEach(function () {
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->create(['id' => 0]));
+
     // Create user and team
     $this->user = User::factory()->create();
     $this->team = Team::factory()->create();
     $this->user->teams()->attach($this->team, ['role' => 'owner']);
     $this->actingAs($this->user);
+    session(['currentTeam' => $this->team]);
 
     // Create server
     $this->server = Server::factory()->create([
         'team_id' => $this->team->id,
     ]);
 
-    // Create standalone docker destination
-    $this->destination = StandaloneDocker::factory()->create([
-        'server_id' => $this->server->id,
-    ]);
+    // Use the standalone docker destination created by the Server factory
+    $this->destination = StandaloneDocker::query()->where('server_id', $this->server->id)->firstOrFail();
 
     // Create project and environment
     $this->project = Project::factory()->create([
@@ -47,8 +52,9 @@ beforeEach(function () {
     ]);
 
     // Create service application
-    $this->serviceApplication = ServiceApplication::factory()->create([
+    $this->serviceApplication = ServiceApplication::create([
         'service_id' => $this->service->id,
+        'name' => 'app',
         'fqdn' => 'http://example.com:8000',
     ]);
 
@@ -142,8 +148,9 @@ it('does not show warning for services without required port', function () {
         'environment_id' => $this->environment->id,
     ]);
 
-    $appWithoutPort = ServiceApplication::factory()->create([
+    $appWithoutPort = ServiceApplication::create([
         'service_id' => $serviceWithoutPort->id,
+        'name' => 'app',
         'fqdn' => 'http://example.com',
     ]);
 

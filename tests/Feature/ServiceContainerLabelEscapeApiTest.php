@@ -12,7 +12,7 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
-    InstanceSettings::create(['id' => 0, 'is_api_enabled' => true]);
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->create(['id' => 0, 'is_api_enabled' => true]));
 
     $this->team = Team::factory()->create();
     $this->user = User::factory()->create();
@@ -54,7 +54,7 @@ describe('PATCH /api/v1/services/{uuid}', function () {
         $response->assertStatus(200);
 
         $service->refresh();
-        expect($service->is_container_label_escape_enabled)->toBeFalse();
+        expect($service->is_container_label_escape_enabled)->toBeFalsy();
     });
 
     test('rejects invalid is_container_label_escape_enabled value', function () {

@@ -14,6 +14,7 @@ use App\Models\Server;
 use App\Models\Team;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
@@ -46,6 +47,10 @@ function makeAuditApiToken(User $user, Team $team, array $abilities = ['root']):
     DB::table('personal_access_tokens')->where('id', $token->accessToken->id)->update([
         'team_id' => $team->id,
     ]);
+
+    // The session-authenticated user would take precedence over the Bearer
+    // token (TransientToken has no team_id), so drop it for API requests
+    Auth::guard('web')->forgetUser();
 
     return $token->plainTextToken;
 }
@@ -363,9 +368,7 @@ describe('API mutation audit logging', function () {
         Log::shouldReceive('error')->andReturnNull();
 
         // Generate a valid OpenSSH-format private key for the test.
-        $opensshKey = "-----BEGIN OPENSSH PRIVATE KEY-----\n".
-            base64_encode(str_repeat('a', 256)).
-            "\n-----END OPENSSH PRIVATE KEY-----";
+        $opensshKey = generateSSHKey('ed25519')['private'];
 
         $response = $this->withHeaders([
             'Authorization' => 'Bearer '.$token,
@@ -468,6 +471,10 @@ describe('threat-detection audit logging (Phase 2)', function () {
         Log::shouldReceive('warning')->andReturnNull();
         Log::shouldReceive('info')->andReturnNull();
         Log::shouldReceive('error')->andReturnNull();
+
+        // The session-authenticated user would take precedence over the Bearer
+        // token (TransientToken has no team_id), so drop it for API requests
+        Auth::guard('web')->forgetUser();
 
         $response = $this->withHeaders([
             'Authorization' => 'Bearer '.$token->plainTextToken,

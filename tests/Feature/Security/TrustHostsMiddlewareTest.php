@@ -14,10 +14,10 @@ beforeEach(function () {
 
 it('trusts the configured FQDN from InstanceSettings', function () {
     // Create instance settings with FQDN
-    InstanceSettings::updateOrCreate(
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(
         ['id' => 0],
         ['fqdn' => 'https://coolify.example.com']
-    );
+    ));
 
     $middleware = new TrustHosts($this->app);
     $hosts = $middleware->hosts();
@@ -27,10 +27,10 @@ it('trusts the configured FQDN from InstanceSettings', function () {
 
 it('rejects password reset request with malicious host header', function () {
     // Set up instance settings with legitimate FQDN
-    InstanceSettings::updateOrCreate(
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(
         ['id' => 0],
         ['fqdn' => 'https://coolify.example.com']
-    );
+    ));
 
     $middleware = new TrustHosts($this->app);
     $hosts = $middleware->hosts();
@@ -42,10 +42,10 @@ it('rejects password reset request with malicious host header', function () {
 
 it('handles missing FQDN gracefully', function () {
     // Create instance settings without FQDN
-    InstanceSettings::updateOrCreate(
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(
         ['id' => 0],
         ['fqdn' => null]
-    );
+    ));
 
     $middleware = new TrustHosts($this->app);
     $hosts = $middleware->hosts();
@@ -55,10 +55,10 @@ it('handles missing FQDN gracefully', function () {
 });
 
 it('filters out null and empty values from trusted hosts', function () {
-    InstanceSettings::updateOrCreate(
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(
         ['id' => 0],
         ['fqdn' => '']
-    );
+    ));
 
     $middleware = new TrustHosts($this->app);
     $hosts = $middleware->hosts();
@@ -72,10 +72,10 @@ it('filters out null and empty values from trusted hosts', function () {
 });
 
 it('extracts host from FQDN with protocol and port', function () {
-    InstanceSettings::updateOrCreate(
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(
         ['id' => 0],
         ['fqdn' => 'https://coolify.example.com:8443']
-    );
+    ));
 
     $middleware = new TrustHosts($this->app);
     $hosts = $middleware->hosts();
@@ -96,10 +96,10 @@ it('handles exception during InstanceSettings fetch', function () {
 });
 
 it('trusts IP addresses with port', function () {
-    InstanceSettings::updateOrCreate(
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(
         ['id' => 0],
         ['fqdn' => 'http://65.21.3.91:8000']
-    );
+    ));
 
     $middleware = new TrustHosts($this->app);
     $hosts = $middleware->hosts();
@@ -108,10 +108,10 @@ it('trusts IP addresses with port', function () {
 });
 
 it('trusts IP addresses without port', function () {
-    InstanceSettings::updateOrCreate(
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(
         ['id' => 0],
         ['fqdn' => 'http://192.168.1.100']
-    );
+    ));
 
     $middleware = new TrustHosts($this->app);
     $hosts = $middleware->hosts();
@@ -121,10 +121,10 @@ it('trusts IP addresses without port', function () {
 
 it('rejects malicious host when using IP address', function () {
     // Simulate an instance using IP address
-    InstanceSettings::updateOrCreate(
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(
         ['id' => 0],
         ['fqdn' => 'http://65.21.3.91:8000']
-    );
+    ));
 
     $middleware = new TrustHosts($this->app);
     $hosts = $middleware->hosts();
@@ -136,10 +136,10 @@ it('rejects malicious host when using IP address', function () {
 });
 
 it('trusts IPv6 addresses', function () {
-    InstanceSettings::updateOrCreate(
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(
         ['id' => 0],
         ['fqdn' => 'http://[2001:db8::1]:8000']
-    );
+    ));
 
     $middleware = new TrustHosts($this->app);
     $hosts = $middleware->hosts();
@@ -150,10 +150,10 @@ it('trusts IPv6 addresses', function () {
 
 it('invalidates cache when FQDN is updated', function () {
     // Set initial FQDN
-    $settings = InstanceSettings::updateOrCreate(
+    $settings = InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(
         ['id' => 0],
         ['fqdn' => 'https://old-domain.com']
-    );
+    ));
 
     // First call should cache it
     $middleware = new TrustHosts($this->app);
@@ -178,10 +178,10 @@ it('invalidates cache when FQDN is updated', function () {
 });
 
 it('caches trusted hosts to avoid database queries on every request', function () {
-    InstanceSettings::updateOrCreate(
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(
         ['id' => 0],
         ['fqdn' => 'https://coolify.example.com']
-    );
+    ));
 
     // Clear cache first
     Cache::forget('instance_settings_fqdn_host');
@@ -204,10 +204,10 @@ it('caches trusted hosts to avoid database queries on every request', function (
 
 it('caches negative results when no FQDN is configured', function () {
     // Create instance settings without FQDN
-    InstanceSettings::updateOrCreate(
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(
         ['id' => 0],
         ['fqdn' => null]
-    );
+    ));
 
     // Clear cache first
     Cache::forget('instance_settings_fqdn_host');
@@ -250,18 +250,19 @@ it('skips host validation for terminal auth ips route', function () {
 });
 
 it('still enforces host validation for non-terminal routes', function () {
-    InstanceSettings::updateOrCreate(
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(
         ['id' => 0],
         ['fqdn' => 'https://coolify.example.com']
-    );
+    ));
 
-    // Regular routes should still validate Host header
-    $response = $this->get('/', [
-        'Host' => 'evil.com',
-    ]);
+    // Laravel's TrustHosts parent skips actual 400 enforcement when
+    // runningUnitTests(), so assert at the middleware level instead: an
+    // untrusted host must not appear in the trusted hosts list
+    $middleware = new TrustHosts($this->app);
+    $hosts = $middleware->hosts();
 
-    // Should get 400 Bad Host for untrusted host
-    expect($response->status())->toBe(400);
+    expect($hosts)->toContain('coolify.example.com');
+    expect($hosts)->not->toContain('evil.com');
 });
 
 it('skips host validation for API routes', function () {
@@ -288,10 +289,10 @@ it('skips host validation for API routes', function () {
 });
 
 it('trusts localhost when FQDN is configured', function () {
-    InstanceSettings::updateOrCreate(
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(
         ['id' => 0],
         ['fqdn' => 'https://coolify.example.com']
-    );
+    ));
 
     $middleware = new TrustHosts($this->app);
     $hosts = $middleware->hosts();
@@ -300,10 +301,10 @@ it('trusts localhost when FQDN is configured', function () {
 });
 
 it('trusts 127.0.0.1 when FQDN is configured', function () {
-    InstanceSettings::updateOrCreate(
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(
         ['id' => 0],
         ['fqdn' => 'https://coolify.example.com']
-    );
+    ));
 
     $middleware = new TrustHosts($this->app);
     $hosts = $middleware->hosts();
@@ -312,10 +313,10 @@ it('trusts 127.0.0.1 when FQDN is configured', function () {
 });
 
 it('trusts IPv6 loopback when FQDN is configured', function () {
-    InstanceSettings::updateOrCreate(
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(
         ['id' => 0],
         ['fqdn' => 'https://coolify.example.com']
-    );
+    ));
 
     $middleware = new TrustHosts($this->app);
     $hosts = $middleware->hosts();
@@ -324,10 +325,10 @@ it('trusts IPv6 loopback when FQDN is configured', function () {
 });
 
 it('allows local access via localhost when FQDN is configured and request uses localhost host header', function () {
-    InstanceSettings::updateOrCreate(
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->updateOrCreate(
         ['id' => 0],
         ['fqdn' => 'https://coolify.example.com']
-    );
+    ));
 
     $response = $this->get('/', [
         'Host' => 'localhost',
@@ -354,8 +355,10 @@ it('skips host validation for webhook endpoints', function () {
     expect($response->status())->not->toBe(400);
 
     // Test Stripe webhook
+    // Stripe's controller validates the signature and returns 400 for unsigned
+    // requests — the point is that host validation did not reject it first
     $response = $this->post('/webhooks/payments/stripe/events', [], [
         'Host' => 'stripe-webhook-forwarder.local',
     ]);
-    expect($response->status())->not->toBe(400);
+    expect($response->getContent())->not->toContain('Bad Host');
 });

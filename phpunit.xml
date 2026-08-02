@@ -15,8 +15,11 @@
   <php>
     <!-- PHP's 128M CLI default is exhausted while Pest is still loading the suite,
          so an unqualified `php artisan test` dies before running a single test.
-         CI already passes -d memory_limit=1G; set it here so local runs match. -->
-    <ini name="memory_limit" value="1G"/>
+         A full single-process suite (Unit + Feature + v4, ~3600 tests) creeps
+         roughly 1.1-1.3 GB across per-test application reboots; 2G keeps the
+         whole suite runnable locally while individual CI lanes stay far below it.
+         Note: this <ini> entry also overrides any `-d memory_limit=` CLI flag. -->
+    <ini name="memory_limit" value="2G"/>
     <env name="APP_ENV" value="testing" force="true"/>
     <env name="BCRYPT_ROUNDS" value="4"/>
     <env name="CACHE_DRIVER" value="array" force="true"/>

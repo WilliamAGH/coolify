@@ -45,7 +45,9 @@ class DigitalOceanService
                 );
             }
 
-            throw new \Exception('DigitalOcean API error: '.$response->json('message', 'Unknown error'), $response->status());
+            $message = $response->json('message') ?? trim($response->body());
+
+            throw new \Exception('DigitalOcean API error: '.($message !== '' ? $message : 'Unknown error'), $response->status());
         }
 
         return $response->json() ?? [];

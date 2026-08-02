@@ -12,12 +12,12 @@ beforeEach(function () {
     // This avoids Mockery alias/overload issues that pollute global state
     $this->setInstanceSettings = function ($fqdn = null, $publicIpv4 = null, $publicIpv6 = null) {
         InstanceSettings::query()->delete();
-        InstanceSettings::create([
+        InstanceSettings::unguarded(fn () => InstanceSettings::query()->create([
             'id' => 0,
             'fqdn' => $fqdn,
             'public_ipv4' => $publicIpv4,
             'public_ipv6' => $publicIpv6,
-        ]);
+        ]));
     };
 
     $this->createMockServer = function ($uuid, $name = 'Test Server') {

@@ -19,7 +19,26 @@ use Tests\TestCase;
 | need to change it using the "uses()" function to bind a different classes or traits.
 |
 */
-uses(TestCase::class)->in('Feature', 'v4/Feature', 'v4/Browser');
+/*
+|--------------------------------------------------------------------------
+| Test Case + Global Hooks
+|--------------------------------------------------------------------------
+|
+| The closure you provide to your test functions is always bound to a specific PHPUnit test
+| case class. The global beforeEach MUST live on this uses() binding: a bare beforeEach()
+| at the top level of Pest.php is inert under Pest 4.3 and never executes, which let
+| once() and Server::findCached identity-map state leak across test files in one process.
+|
+*/
+uses(TestCase::class)
+    ->beforeEach(function () {
+        // Flush the Once memoization cache to ensure tests get fresh data
+        Once::flush();
+
+        // Flush the Server identity map cache to ensure tests get fresh data
+        Server::flushIdentityMap();
+    })
+    ->in('Feature', 'v4/Feature', 'v4/Browser');
 
 /*
  * Unit tests run on plain PHPUnit\Framework\TestCase. Bind only the Mockery
@@ -44,22 +63,6 @@ uses(MockeryPHPUnitIntegration::class)
         Container::setInstance(null);
     })
     ->in('Unit');
-
-/*
-|--------------------------------------------------------------------------
-| Test Hooks
-|--------------------------------------------------------------------------
-|
-| Global hooks that run before/after each test.
-|
-*/
-beforeEach(function () {
-    // Flush the Once memoization cache to ensure tests get fresh data
-    Once::flush();
-
-    // Flush the Server identity map cache to ensure tests get fresh data
-    Server::flushIdentityMap();
-});
 
 function loginAndSkipBoarding(?string $email = null, string $password = 'password'): mixed
 {

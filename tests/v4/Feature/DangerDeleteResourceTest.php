@@ -18,7 +18,7 @@ use Livewire\Livewire;
 uses(RefreshDatabase::class);
 
 beforeEach(function () {
-    InstanceSettings::create(['id' => 0]);
+    InstanceSettings::unguarded(fn () => InstanceSettings::query()->create(['id' => 0]));
     Queue::fake();
 
     $this->user = User::factory()->create([
