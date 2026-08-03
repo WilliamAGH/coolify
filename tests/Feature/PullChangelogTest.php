@@ -3,6 +3,7 @@
 use App\Jobs\PullChangelog;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 
 /**
  * Fake releases land in a month that no real release uses, so the generated
@@ -32,12 +33,25 @@ afterEach(function () {
     File::delete(base_path('changelogs/1999-01.json'));
 });
 
+test('PullChangelog skips upstream changelog fetch for guarded fork releases', function () {
+    config(['constants.coolify.version' => '4.13.59-fork']);
+
+    Http::fake();
+    Log::spy();
+
+    (new PullChangelog)->handle();
+
+    Http::assertNothingSent();
+    Log::shouldNotHaveReceived('error');
+});
+
 test('releases_url config defaults to the CDN release feed', function () {
     expect(config('constants.coolify.releases_url'))
         ->toBe('https://cdn.coollabs.io/coolify/releases.json');
 });
 
 test('PullChangelog fetches from the configured releases_url and writes the changelog', function () {
+    config(['constants.coolify.version' => '4.13.59']);
     config(['constants.coolify.releases_url' => 'https://example.test/releases.json']);
 
     Http::fake([
@@ -57,6 +71,7 @@ test('PullChangelog fetches from the configured releases_url and writes the chan
 });
 
 test('PullChangelog skips draft releases', function () {
+    config(['constants.coolify.version' => '4.13.59']);
     config(['constants.coolify.releases_url' => 'https://example.test/releases.json']);
 
     Http::fake([

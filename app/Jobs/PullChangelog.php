@@ -2,6 +2,7 @@
 
 namespace App\Jobs;
 
+use App\Actions\Server\UpdateCoolify;
 use Carbon\Carbon;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeEncrypted;
@@ -26,6 +27,13 @@ class PullChangelog implements ShouldBeEncrypted, ShouldQueue
 
     public function handle(): void
     {
+        // Fork releases disable upstream update discovery by design; the
+        // upstream changelog is meaningless here and the disabled endpoint
+        // would only log a scheduled error on every run.
+        if (UpdateCoolify::isGuardedForkRelease(config('constants.coolify.version'))) {
+            return;
+        }
+
         try {
             // Fetch from CDN instead of GitHub API to avoid rate limits
             $cdnUrl = config('constants.coolify.releases_url');
