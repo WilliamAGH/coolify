@@ -7,6 +7,11 @@ All notable changes to this project will be documented in this file.
 ### 📚 Documentation
 
 - Update changelog
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(validation)* Run proven-empty deactivation tests in the blue-green lane
 
 ## [4.13.59-fork] - 2026-08-02
 
