@@ -13,6 +13,14 @@ class ValidationPatterns
     public const NAME_PATTERN = '/^[\p{L}\p{M}\p{N}\s\-_.@\/&()#,:+]+$/u';
 
     /**
+     * The complement of NAME_PATTERN, for turning arbitrary text into a name
+     * this application will accept. Kept beside the pattern it inverts so the
+     * allowed set is stated exactly once, following the same pairing as
+     * SERVER_USERNAME_PATTERN and its INVALID_ counterpart.
+     */
+    public const INVALID_NAME_CHARACTERS_PATTERN = '/[^\p{L}\p{M}\p{N}\s\-_.@\/&()#,:+]/u';
+
+    /**
      * Pattern for descriptions excluding all dangerous characters with some additional allowed characters
      */
     public const DESCRIPTION_PATTERN = '/^[\p{L}\p{M}\p{N}\s\-_.,!?()\'\"+=*@\/&]+$/u';
@@ -430,6 +438,20 @@ class ValidationPatterns
         $rules[] = 'regex:'.self::NAME_PATTERN;
 
         return $rules;
+    }
+
+    /**
+     * Turn arbitrary text into a name `nameRules()` accepts, by removing the
+     * characters NAME_PATTERN excludes and collapsing the whitespace that
+     * removal can leave behind. Falls back to a placeholder long enough to
+     * satisfy the rule's minimum when nothing usable survives.
+     */
+    public static function toName(string $value, int $minLength = 3): string
+    {
+        $name = (string) preg_replace(self::INVALID_NAME_CHARACTERS_PATTERN, '', $value);
+        $name = trim((string) preg_replace('/\s+/u', ' ', $name));
+
+        return mb_strlen($name) >= $minLength ? $name : str_pad($name, $minLength, 'x');
     }
 
     /**
