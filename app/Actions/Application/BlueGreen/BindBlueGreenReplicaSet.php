@@ -67,32 +67,41 @@ final class BindBlueGreenReplicaSet
                 ->lockForUpdate()
                 ->get();
             try {
-                $replicaSet = BlueGreenReplicaSet::fromReplicas($replicas);
+                $replicaSet = BlueGreenReplicaSet::fromReplicas($replicas, $claim->candidateComposeServices());
             } catch (\InvalidArgumentException $exception) {
                 throw new RuntimeException('The durable blue-green ledger no longer contains the exact contiguous claimed operation quorum.', 0, $exception);
             }
             if ($replicaSet->count !== $claim->replicaCount) {
                 throw new RuntimeException('The durable blue-green ledger no longer matches the claimed operation quorum.');
             }
-            $replicas = $replicas->keyBy('replica_index');
+            // Keyed by Compose service, not by replica index: two co-rolled
+            // members legitimately share an index, and collapsing them by index
+            // would bind one member's Docker identity onto the other's slot.
+            $replicas = $replicas->keyBy('compose_service');
 
             $bound = [];
             foreach ($inspections as $inspection) {
-                if (isset($bound[$inspection->replicaIndex])) {
+                if (isset($bound[$inspection->composeService])) {
                     throw new RuntimeException('The inspected blue-green replica set contains a duplicate durable slot.');
                 }
-                $replica = $replicas->get($inspection->replicaIndex);
+                $replica = $replicas->get($inspection->composeService);
                 if (! $replica instanceof ApplicationBlueGreenReplica
-                    || $replica->compose_service !== $inspection->composeService) {
+                    || $replica->replica_index !== $inspection->replicaIndex) {
                     throw new RuntimeException('The inspected replica does not match its durable slot.');
                 }
                 $this->bindExactReplicaInspection($replica, $inspection);
-                $bound[$inspection->replicaIndex] = $replica;
+                $bound[$inspection->composeService] = $replica;
             }
 
-            return collect($bound)->sortKeys()->values()->map(
-                static fn (ApplicationBlueGreenReplica $replica): ApplicationBlueGreenReplica => $replica->fresh(),
-            )->all();
+            // A single member sorts to exactly the historic replica-index order.
+            return collect($bound)
+                ->sortBy([
+                    ['replica_index', 'asc'],
+                    ['compose_service', 'asc'],
+                ])
+                ->values()
+                ->map(static fn (ApplicationBlueGreenReplica $replica): ApplicationBlueGreenReplica => $replica->fresh())
+                ->all();
         }, attempts: 5);
     }
 

@@ -10,6 +10,13 @@ final readonly class BlueGreenProxyState
 {
     public const MAGIC = 'coolify-blue-green-destination-fence-v2';
 
+    /**
+     * Written only when one color owns more than one container. A destination
+     * with a single container keeps emitting the v2 record byte-for-byte, so a
+     * rollback to a release that predates this format still reads its fence.
+     */
+    public const MAGIC_SET = 'coolify-blue-green-destination-fence-v3';
+
     private const RECORD_KEYS = [
         'magic',
         'managed_filename',
@@ -28,6 +35,11 @@ final readonly class BlueGreenProxyState
         'destination_topology_digest',
     ];
 
+    private const RECORD_KEYS_SET = [
+        ...self::RECORD_KEYS,
+        'active_container_set',
+    ];
+
     public function __construct(
         public string $managedFilename,
         public string $applicationUuid,
@@ -43,6 +55,7 @@ final readonly class BlueGreenProxyState
         public ?string $activeContainerId,
         public string $applicationRoutingConfigDigest,
         public string $destinationTopologyDigest,
+        public ?BlueGreenActiveContainerSet $activeContainerSet = null,
     ) {
         BlueGreenProxyConfiguration::assertManagedFilename($managedFilename);
         if (preg_match('/^[A-Za-z0-9][A-Za-z0-9_-]*$/D', $applicationUuid) !== 1) {
@@ -73,8 +86,20 @@ final readonly class BlueGreenProxyState
             throw new InvalidArgumentException('A managed blue/green route requires a positive destination fence epoch.');
         }
         foreach ([$activeDeploymentUuid, $activeContainerName, $activeContainerId] as $identity) {
-            if ($identity !== null && preg_match('/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/D', $identity) !== 1) {
-                throw new InvalidArgumentException('The active blue/green deployment and container identity is invalid.');
+            if ($identity !== null) {
+                BlueGreenActiveContainer::assertIdentityToken($identity);
+            }
+        }
+        // BlueGreenActiveContainerSet already proved its own shape. What is left
+        // is the relationship between the set and the scalar pair: the pair must
+        // name one of the members, so a reader that only knows the older record
+        // still names a container this color genuinely owns.
+        if ($activeContainerSet !== null) {
+            if ($activeContainerName === null || $activeContainerId === null) {
+                throw new InvalidArgumentException('An active blue/green container set requires the scalar active container identity.');
+            }
+            if (! $activeContainerSet->contains($activeContainerName, $activeContainerId)) {
+                throw new InvalidArgumentException('The scalar active blue/green container identity must be a member of the container set.');
             }
         }
     }
@@ -84,11 +109,11 @@ final readonly class BlueGreenProxyState
         return json_encode($this->toArray(), JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES)."\n";
     }
 
-    /** @return array<string, bool|int|string|null> */
+    /** @return array<string, int|string|list<array{port: int, name: string, id: string}>|null> */
     public function toArray(): array
     {
-        return [
-            'magic' => self::MAGIC,
+        $record = [
+            'magic' => $this->activeContainerSet === null ? self::MAGIC : self::MAGIC_SET,
             'managed_filename' => $this->managedFilename,
             'application_uuid' => $this->applicationUuid,
             'destination_id' => $this->destinationId,
@@ -104,6 +129,12 @@ final readonly class BlueGreenProxyState
             'application_routing_config_digest' => $this->applicationRoutingConfigDigest,
             'destination_topology_digest' => $this->destinationTopologyDigest,
         ];
+
+        if ($this->activeContainerSet !== null) {
+            $record['active_container_set'] = $this->activeContainerSet->toArray();
+        }
+
+        return $record;
     }
 
     public static function parse(string $serialized): self
@@ -113,7 +144,16 @@ final readonly class BlueGreenProxyState
         } catch (JsonException $exception) {
             throw new InvalidArgumentException('The blue/green destination fence state is not valid JSON.', previous: $exception);
         }
-        if (! is_array($decoded) || array_keys($decoded) !== self::RECORD_KEYS || ($decoded['magic'] ?? null) !== self::MAGIC) {
+        // Both records are accepted so an upgrade reads fences written by the
+        // previous release, and a rollback reads every fence this release wrote
+        // for a destination that still owns a single container.
+        $isScalarRecord = is_array($decoded)
+            && array_keys($decoded) === self::RECORD_KEYS
+            && ($decoded['magic'] ?? null) === self::MAGIC;
+        $isSetRecord = is_array($decoded)
+            && array_keys($decoded) === self::RECORD_KEYS_SET
+            && ($decoded['magic'] ?? null) === self::MAGIC_SET;
+        if (! $isScalarRecord && ! $isSetRecord) {
             throw new InvalidArgumentException('The blue/green destination fence state has an invalid record shape.');
         }
 
@@ -154,6 +194,7 @@ final readonly class BlueGreenProxyState
             activeContainerId: $decoded['active_container_id'],
             applicationRoutingConfigDigest: $decoded['application_routing_config_digest'],
             destinationTopologyDigest: $decoded['destination_topology_digest'],
+            activeContainerSet: $isSetRecord ? BlueGreenActiveContainerSet::fromArray($decoded['active_container_set']) : null,
         );
     }
 
@@ -180,6 +221,10 @@ final readonly class BlueGreenProxyState
             activeContainerId: $this->activeContainerId,
             applicationRoutingConfigDigest: $this->applicationRoutingConfigDigest,
             destinationTopologyDigest: $this->destinationTopologyDigest,
+            // The managed route is preserved here, so the container set that
+            // route owns must be preserved with it or the record silently
+            // downgrades to the scalar shape and disowns its other containers.
+            activeContainerSet: $this->activeContainerSet,
         );
     }
 
@@ -226,6 +271,9 @@ final readonly class BlueGreenProxyState
             activeContainerId: $this->activeContainerId,
             applicationRoutingConfigDigest: $this->applicationRoutingConfigDigest,
             destinationTopologyDigest: $this->destinationTopologyDigest,
+            // Changing the mutation owner does not change which containers the
+            // managed route owns.
+            activeContainerSet: $this->activeContainerSet,
         );
     }
 
@@ -333,6 +381,10 @@ final readonly class BlueGreenProxyState
             && $this->activeDeploymentUuid === $snapshot->activeDeploymentUuid
             && $this->activeContainerName === $snapshot->activeContainerName
             && $this->activeContainerId === $snapshot->activeContainerId
+            // Compared by value: without this a secondary container could change
+            // identity while the primary stayed put, and recovery would clear an
+            // intervention on a route that no longer matches its snapshot.
+            && $this->activeContainerSet?->toArray() === $snapshot->activeContainerSet?->toArray()
             && $this->applicationRoutingConfigDigest === $snapshot->applicationRoutingConfigDigest
             && $this->destinationTopologyDigest === $snapshot->destinationTopologyDigest
             && $this->destinationFenceEpoch >= $snapshot->destinationFenceEpoch

@@ -365,8 +365,10 @@ it('retains the inert failed replica without conflicting with a later deployment
         color: BlueGreenDeploymentColor::BLUE,
         deploymentUuid: 'later-first-adoption-retry',
         routingRevision: 1,
-        composeServiceBase: $scenario->application->uuid.'-blue',
-        scalarContainerName: $scenario->application->uuid.'-blue',
+        members: [[
+            'composeServiceBase' => $scenario->application->uuid.'-blue',
+            'containerName' => $scenario->application->uuid.'-blue',
+        ]],
         replicaCount: 1,
     );
 

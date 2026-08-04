@@ -232,6 +232,10 @@ final class ReconstructBlueGreenDeploymentRecovery
             replicaCount: $replicaCount,
             candidateContainerName: $candidateContainerName,
             rollbackManagedFilename: $rollbackManagedFilename,
+            // Reconstructed from what the interrupted operation durably claimed,
+            // never from the topology as it stands now: the recovered claim has
+            // to own exactly the containers that operation started.
+            candidateContainerNames: $state->operationCandidateContainerSet(),
         );
     }
 
@@ -249,13 +253,19 @@ final class ReconstructBlueGreenDeploymentRecovery
             ->where('color', $color->value)
             ->where('routing_revision', $routingRevision)
             ->orderBy('replica_index')
-            ->get(['replica_index']);
+            ->get(['replica_index', 'compose_service']);
         if ($replicas->isEmpty()) {
             return DEFAULT_BLUE_GREEN_REPLICA_COUNT;
         }
 
         try {
-            $replicaSet = BlueGreenReplicaSet::fromReplicas($replicas);
+            // Reconstruction must group the ledger exactly as the interrupted
+            // operation claimed it, so the members come from the durable set the
+            // claim wrote, never from the topology as it stands now.
+            $replicaSet = BlueGreenReplicaSet::fromReplicas(
+                $replicas,
+                $state->operationCandidateComposeServices(),
+            );
         } catch (\InvalidArgumentException $exception) {
             throw new BlueGreenDeploymentTransitionException(
                 'The interrupted operation has an invalid durable replica quorum.',

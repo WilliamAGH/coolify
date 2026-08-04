@@ -126,10 +126,8 @@ class ClaimBlueGreenDeployment
             }
             $supersessionGeneration = $previousSupersessionGeneration + 1;
             $replicaCount = $setting->blueGreenReplicaCount();
-            $backendPortInventory = BlueGreenBackendPortInventory::fromPorts(
-                $lockedApplication->blueGreenDeploymentBackendPorts($setting)
-                    ?? throw new BlueGreenDeploymentTransitionException('The blue-green application has no exact backend port inventory.'),
-            );
+            $backendPortInventory = BlueGreenBackendPortInventory::forApplication($lockedApplication, $setting)
+                ?? throw new BlueGreenDeploymentTransitionException('The blue-green application has no exact backend port inventory.');
             $inventoryCompatibility = new BackfillBlueGreenBackendPortInventories;
             $inventoryCompatibility->backfillPendingInactiveRetirement(
                 $lockedApplication,
@@ -177,6 +175,14 @@ class ClaimBlueGreenDeployment
                 throw new BlueGreenDeploymentTransitionException('The durable destination topology changed before the operation could be claimed.');
             }
             $previousProxyState = $expectedDestinationState?->serialize();
+            // The topology owns candidate naming. A destination that re-rolls a
+            // single service produces exactly the historic scalar identity, so
+            // the set stays empty and nothing downstream changes shape.
+            $candidateTopology = $lockedApplication->blueGreenComposeTopology();
+            $candidateContainerNames = [];
+            if ($candidateTopology !== null && count($candidateTopology->coRolledServices()) > 1) {
+                $candidateContainerNames = $candidateTopology->candidateContainerNames($lockedApplication, $pendingColor);
+            }
             $claim = new BlueGreenDeploymentClaim(
                 stateId: $state->id,
                 applicationId: $lockedApplication->id,
@@ -199,6 +205,7 @@ class ClaimBlueGreenDeployment
                     $lockedApplication,
                     $destination,
                 ),
+                candidateContainerNames: $candidateContainerNames,
             );
             $candidateContainer = $this->candidateContainer($claim);
             $this->assertPreviousContainer($claim, $previousContainer);
@@ -217,6 +224,10 @@ class ClaimBlueGreenDeployment
                     'operation_previous_container_id' => $previousContainer?->dockerId,
                     'operation_candidate_container_name' => $candidateContainer->name,
                     'operation_candidate_container_id' => null,
+                    // Null whenever this color owns one container, so a
+                    // single-service destination writes exactly the row earlier
+                    // releases wrote.
+                    'operation_candidate_container_set' => $claim->candidateContainerSetPayload(),
                     'operation_rollback_managed_filename' => $claim->rollbackManagedFilename,
                     'operation_routing_mutated_at' => null,
                     'operation_legacy_routing_snapshot_version' => null,
@@ -296,11 +307,30 @@ class ClaimBlueGreenDeployment
                 throw new BlueGreenDeploymentTransitionException('The deployment queue entry changed while blue-green ownership was being claimed.');
             }
 
-            $composeServiceBase = $lockedApplication->build_pack === 'dockercompose'
-                ? BlueGreenComposeTopology::fromApplication($lockedApplication)->candidateServiceName($pendingColor)
-                : $claim->candidateContainerName;
-            if (! is_string($composeServiceBase) || $composeServiceBase === '') {
-                throw new BlueGreenDeploymentTransitionException('The blue-green replica set has no exact Compose service identity.');
+            $scalarContainerName = $claim->candidateContainerName
+                ?? throw new BlueGreenDeploymentTransitionException('The blue-green claim has no scalar candidate identity.');
+            if ($claim->candidateContainerNames !== []) {
+                // Every co-rolled member gets its own ledger rows, keyed by the
+                // Compose service it is rendered as for this color.
+                $topology = BlueGreenComposeTopology::fromApplication($lockedApplication);
+                $replicaMembers = [];
+                foreach ($claim->candidateContainerNames as $service => $containerName) {
+                    $replicaMembers[] = [
+                        'composeServiceBase' => $topology->candidateServiceName($pendingColor, $service),
+                        'containerName' => $containerName,
+                    ];
+                }
+            } else {
+                $composeServiceBase = $lockedApplication->build_pack === 'dockercompose'
+                    ? BlueGreenComposeTopology::fromApplication($lockedApplication)->candidateServiceName($pendingColor)
+                    : $scalarContainerName;
+                if ($composeServiceBase === '') {
+                    throw new BlueGreenDeploymentTransitionException('The blue-green replica set has no exact Compose service identity.');
+                }
+                $replicaMembers = [[
+                    'composeServiceBase' => $composeServiceBase,
+                    'containerName' => $scalarContainerName,
+                ]];
             }
             (new ReserveBlueGreenReplicaSet)->handle(
                 application: $lockedApplication,
@@ -308,9 +338,7 @@ class ClaimBlueGreenDeployment
                 color: $pendingColor,
                 deploymentUuid: $lockedDeployment->deployment_uuid,
                 routingRevision: $expectedRoutingRevision,
-                composeServiceBase: $composeServiceBase,
-                scalarContainerName: $claim->candidateContainerName
-                    ?? throw new BlueGreenDeploymentTransitionException('The blue-green claim has no scalar candidate identity.'),
+                members: $replicaMembers,
                 replicaCount: $claim->replicaCount,
             );
 

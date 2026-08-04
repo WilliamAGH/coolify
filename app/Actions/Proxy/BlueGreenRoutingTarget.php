@@ -22,6 +22,15 @@ final readonly class BlueGreenRoutingTarget
 
     public bool $usesExplicitReplicaBackends;
 
+    /**
+     * Per-backend-port container identity, for a destination whose routed
+     * services each own a port. Empty means every port shares the one
+     * blue/green pair, which is the historic single-routed-service shape.
+     *
+     * @var array<int, array{blue: string, green: string}>
+     */
+    public array $portContainerNames;
+
     public static function managedFilename(string $applicationUuid, int $destinationId): string
     {
         return 'coolify-blue-green-'.self::routingScope($applicationUuid, $destinationId).'.yaml';
@@ -149,6 +158,7 @@ final readonly class BlueGreenRoutingTarget
         ?array $ports = null,
         ?array $blueReplicaBackends = null,
         ?array $greenReplicaBackends = null,
+        ?array $portContainerNames = null,
     ) {
         if ($destinationId < 0) {
             throw new InvalidArgumentException('The destination ID must be a nonnegative integer.');
@@ -169,6 +179,7 @@ final readonly class BlueGreenRoutingTarget
         if (($blueReplicaBackends === null) !== ($greenReplicaBackends === null)) {
             throw new InvalidArgumentException('Blue and green replica backend inventories must be supplied together.');
         }
+        $this->portContainerNames = $this->normalizePortContainerNames($portContainerNames);
         $this->usesExplicitReplicaBackends = $blueReplicaBackends !== null;
         $this->blueReplicaBackends = $this->normalizeReplicaBackends(
             $blueReplicaBackends ?? [$blueContainerName],
@@ -255,8 +266,50 @@ final readonly class BlueGreenRoutingTarget
         }
     }
 
-    public function containerName(BlueGreenDeploymentColor $color): string
+    /**
+     * Normalizes the per-port container map, proving every entry names a known
+     * backend port and a distinct, valid pair. An absent map keeps the single
+     * blue/green pair for every port.
+     *
+     * @return array<int, array{blue: string, green: string}>
+     */
+    private function normalizePortContainerNames(?array $portContainerNames): array
     {
+        if ($portContainerNames === null || $portContainerNames === []) {
+            return [];
+        }
+
+        $normalized = [];
+        foreach ($portContainerNames as $port => $pair) {
+            if (! is_int($port) || ! in_array($port, $this->ports, true)) {
+                throw new InvalidArgumentException('Each per-port blue/green container entry must name a configured backend port.');
+            }
+            if (! is_array($pair) || ! isset($pair['blue'], $pair['green'])
+                || ! is_string($pair['blue']) || ! is_string($pair['green'])) {
+                throw new InvalidArgumentException('Each per-port blue/green container entry must supply a blue and a green container name.');
+            }
+            if ($pair['blue'] === $pair['green']) {
+                throw new InvalidArgumentException('Blue and green container DNS names must differ.');
+            }
+            $this->assertContainerName($pair['blue']);
+            $this->assertContainerName($pair['green']);
+            $normalized[$port] = ['blue' => $pair['blue'], 'green' => $pair['green']];
+        }
+        ksort($normalized);
+
+        return $normalized;
+    }
+
+    /**
+     * The upstream container for a color, scoped to a backend port when the
+     * destination routes more than one service.
+     */
+    public function containerName(BlueGreenDeploymentColor $color, ?int $port = null): string
+    {
+        if ($port !== null && isset($this->portContainerNames[$port])) {
+            return $this->portContainerNames[$port][$color === BlueGreenDeploymentColor::BLUE ? 'blue' : 'green'];
+        }
+
         return $color === BlueGreenDeploymentColor::BLUE
             ? $this->blueContainerName
             : $this->greenContainerName;
@@ -513,6 +566,15 @@ final readonly class BlueGreenRoutingTarget
         }
         if ($this->replicaTopologyDigest() !== null) {
             $identity[] = $this->replicaTopologyDigest();
+        }
+        // Appended only when a per-port topology exists, so a destination that
+        // shares one container pair keeps producing its historic proof.
+        if ($this->portContainerNames !== []) {
+            $perPort = [];
+            foreach ($this->portContainerNames as $port => $pair) {
+                $perPort[] = "{$port}:{$pair['blue']}:{$pair['green']}";
+            }
+            $identity[] = implode(',', $perPort);
         }
 
         return hash_hmac('sha256', implode("\0", $identity), $token);

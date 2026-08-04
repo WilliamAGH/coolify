@@ -481,10 +481,8 @@ final class BackfillBlueGreenBackendPortInventories
         Application $application,
         ApplicationSetting $setting,
     ): BlueGreenBackendPortInventory {
-        return BlueGreenBackendPortInventory::fromPorts(
-            $application->blueGreenDeploymentBackendPorts($setting)
-                ?? throw new BlueGreenDeploymentTransitionException('The blue-green application has no exact backend port inventory.'),
-        );
+        return BlueGreenBackendPortInventory::forApplication($application, $setting)
+            ?? throw new BlueGreenDeploymentTransitionException('The blue-green application has no exact backend port inventory.');
     }
 
     private function storedInventory(mixed $serialized): ?BlueGreenBackendPortInventory

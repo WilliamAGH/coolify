@@ -180,7 +180,7 @@ class CompileBlueGreenProxyConfiguration
                     $backendPort,
                     count($target->ports) > 1,
                 )] = $this->service(
-                    $target->containerName($target->probeColor),
+                    $target->containerName($target->probeColor, $backendPort),
                     $backendPort,
                 );
             }
@@ -204,7 +204,7 @@ class CompileBlueGreenProxyConfiguration
                 $services[$candidateServiceName] = $target->usesExplicitReplicaBackends
                     ? $this->serviceForBackends($target->activeReplicaBackends(), $backendPort, $target->failoverHealthCheck())
                     : $this->service(
-                        $target->containerName($target->activeColor),
+                        $target->containerName($target->activeColor, $backendPort),
                         $backendPort,
                         $target->failoverHealthCheck(),
                     );

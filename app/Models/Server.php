@@ -1312,12 +1312,15 @@ $schema://$host {
 
     public function ip(): Attribute
     {
+        // A server row can hold a null IP, and PHP 8.5 deprecates passing null
+        // to preg_replace. The cast keeps the historic null-to-empty-string
+        // result rather than changing what callers read back.
         return Attribute::make(
             get: function ($value) {
-                return preg_replace('/[^0-9a-zA-Z.:%-]/', '', $value);
+                return preg_replace('/[^0-9a-zA-Z.:%-]/', '', (string) $value);
             },
             set: function ($value) {
-                return preg_replace('/[^0-9a-zA-Z.:%-]/', '', $value);
+                return preg_replace('/[^0-9a-zA-Z.:%-]/', '', (string) $value);
             }
         );
     }

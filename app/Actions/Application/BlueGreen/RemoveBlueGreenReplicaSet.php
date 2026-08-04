@@ -162,7 +162,7 @@ final class RemoveBlueGreenReplicaSet
             ->orderBy('replica_index')
             ->get();
         try {
-            $replicaSet = BlueGreenReplicaSet::fromReplicas($replicas);
+            $replicaSet = BlueGreenReplicaSet::fromReplicas($replicas, $claim->candidateComposeServices());
         } catch (\InvalidArgumentException $exception) {
             throw new RuntimeException('Replica cleanup no longer owns a contiguous durable pending release.', 0, $exception);
         }

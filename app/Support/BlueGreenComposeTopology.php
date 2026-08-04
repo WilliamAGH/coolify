@@ -31,7 +31,58 @@ final class BlueGreenComposeTopology
         public readonly string $legacyRoutedContainerName,
         private readonly array $routingLabels,
         private readonly array $fixedSidecars,
+        private readonly array $coRolledServices = [],
+        private readonly array $routedServicePorts = [],
     ) {}
+
+    /**
+     * Which backend port each routed service owns. The port is what
+     * discriminates routers, member services, and container identity downstream,
+     * so two routed services may never share one.
+     *
+     * @return array<string, int>
+     */
+    public function routedServicePorts(): array
+    {
+        return $this->routedServicePorts === []
+            ? [$this->routedService => $this->backendPort]
+            : $this->routedServicePorts;
+    }
+
+    /**
+     * The same mapping keyed by port, which is how every downstream consumer
+     * addresses it: the port is the discriminator, the service name is what it
+     * resolves to. Safe to invert because two routed services may never share a
+     * port.
+     *
+     * @return array<int, string>
+     */
+    public function backendPortServices(): array
+    {
+        return array_flip($this->routedServicePorts());
+    }
+
+    /** @return non-empty-list<int> */
+    public function backendPorts(): array
+    {
+        $ports = array_values(array_unique(array_values($this->routedServicePorts())));
+        sort($ports, SORT_NUMERIC);
+
+        return $ports;
+    }
+
+    /**
+     * Every service that moves with the routed service during a color swap: the
+     * routed service itself plus anything that addresses it. These are rendered
+     * per color, so their references to each other are rewritten rather than
+     * rejected. Fixed sidecars keep their identity and are never re-rolled.
+     *
+     * @return list<string>
+     */
+    public function coRolledServices(): array
+    {
+        return $this->coRolledServices === [] ? [$this->routedService] : $this->coRolledServices;
+    }
 
     public static function ineligibilityReason(Application $application): ?string
     {
@@ -72,14 +123,90 @@ final class BlueGreenComposeTopology
         return $resolved['topology'];
     }
 
-    public function candidateServiceName(BlueGreenDeploymentColor $color): string
+    /**
+     * The one rule that turns a co-rolled Compose service into the service this
+     * color renders it as. Static because a reader recovering a durable
+     * operation holds the member keys but may no longer be able to resolve a
+     * topology, and re-spelling the rule there would fork this owner.
+     */
+    public static function colorServiceName(string $service, BlueGreenDeploymentColor $color): string
     {
-        return "{$this->routedService}-{$color->value}";
+        return "{$service}-{$color->value}";
     }
 
-    public function candidateContainerName(Application $application, BlueGreenDeploymentColor $color): string
+    public function candidateServiceName(BlueGreenDeploymentColor $color, ?string $service = null): string
     {
-        return "{$application->uuid}-{$color->value}";
+        return self::colorServiceName($service ?? $this->routedService, $color);
+    }
+
+    /**
+     * A single co-rolled service keeps the historic `{uuid}-{color}` identity so
+     * durable rows and on-host fence records written by earlier releases still
+     * resolve. Only a genuinely multi-service set needs the service discriminator.
+     */
+    public function candidateContainerName(
+        Application $application,
+        BlueGreenDeploymentColor $color,
+        ?string $service = null,
+    ): string {
+        $coRolled = $this->coRolledServices();
+        if (count($coRolled) === 1 || $service === null || $service === $this->routedService) {
+            return "{$application->uuid}-{$color->value}";
+        }
+
+        return "{$application->uuid}-{$service}-{$color->value}";
+    }
+
+    /**
+     * The container every co-rolled service owns for this color, keyed by
+     * service. The routed service's entry is always the historic
+     * `{uuid}-{color}`, which is what lets the scalar candidate identity on the
+     * durable claim and the fence record keep naming a container that this
+     * color genuinely owns.
+     *
+     * @return non-empty-array<string, string>
+     */
+    public function candidateContainerNames(Application $application, BlueGreenDeploymentColor $color): array
+    {
+        $names = [];
+        foreach ($this->coRolledServices() as $service) {
+            $names[$service] = $this->candidateContainerName($application, $color, $service);
+        }
+
+        return $names;
+    }
+
+    /**
+     * The Compose service every co-rolled member is rendered as for `$color`,
+     * which is how the durable replica ledger is grouped. Empty for a
+     * destination that re-rolls exactly one service, so its ledger is read
+     * exactly as earlier releases read it.
+     *
+     * @return list<string>
+     */
+    public function candidateComposeServices(BlueGreenDeploymentColor $color): array
+    {
+        $coRolled = $this->coRolledServices();
+        if (count($coRolled) === 1) {
+            return [];
+        }
+
+        return array_map(
+            fn (string $service): string => $this->candidateServiceName($color, $service),
+            $coRolled,
+        );
+    }
+
+    /**
+     * The backend port each co-rolled service serves. A co-rolled service that
+     * is not routed serves nothing publicly and is absent, so callers can tell
+     * a routed member from one that merely travels with it.
+     *
+     * @return array<string, int>
+     */
+    public function candidateServicePorts(): array
+    {
+        return array_intersect_key($this->routedServicePorts(), array_flip($this->coRolledServices()));
     }
 
     /** @return list<string> */
@@ -99,7 +226,7 @@ final class BlueGreenComposeTopology
      */
     public function fingerprintPayload(): array
     {
-        return [
+        $payload = [
             'version' => 2,
             'routed_service' => $this->routedService,
             'backend_port' => $this->backendPort,
@@ -107,6 +234,19 @@ final class BlueGreenComposeTopology
             'routing_labels' => $this->routingLabels,
             'fixed_sidecars' => $this->fixedSidecars,
         ];
+
+        // A lone co-rolled service is the historic shape, so its digest must stay
+        // byte-identical or every persisted topology digest would mismatch and
+        // refuse to claim. Only a genuine set earns the newer payload.
+        $coRolled = $this->coRolledServices();
+        if (count($coRolled) === 1) {
+            return $payload;
+        }
+
+        $payload['version'] = 3;
+        $payload['co_rolled_services'] = $coRolled;
+
+        return $payload;
     }
 
     /**
@@ -132,20 +272,52 @@ final class BlueGreenComposeTopology
         }
 
         $candidateService = $this->candidateServiceName($color);
-        $candidateContainer = $this->candidateContainerName($application, $color);
         $replicaSet = new BlueGreenReplicaSet($replicaCount);
         $renderedServices = [];
+
+        $coRolled = $this->coRolledServices();
+        $candidateNames = [];
+        foreach ($coRolled as $member) {
+            $candidateNames[$member] = $this->candidateServiceName($color, $member);
+        }
 
         foreach ($services as $serviceName => $service) {
             if (! is_string($serviceName) || ! is_array($service)) {
                 throw new InvalidArgumentException('The parsed Compose services changed shape before candidate rendering.');
             }
 
+            if (! in_array($serviceName, $coRolled, true)) {
+                $renderedServices[$serviceName] = $service;
+
+                continue;
+            }
+
+            // Replicas are named from the untouched definition, so SERVICE_NAME_X
+            // still carries the original service name when it is rewritten to a
+            // replica identity rather than the already-colorized one.
+            $originalService = $service;
+
+            // Point every co-rolled sibling at this color's candidates before
+            // colorizing, so no member keeps an endpoint for the other color.
+            foreach ($candidateNames as $member => $memberCandidate) {
+                $service = self::rewriteRoutedServiceReferences($service, $member, $memberCandidate);
+                // A lone member has no sibling to repoint, and rewriting its own
+                // name through its environment would corrupt unrelated values
+                // such as `/usr/src/app`. Only a genuine set needs this.
+                if (count($coRolled) > 1) {
+                    $service['environment'] = self::rewriteEnvironmentHostReferences(
+                        $service['environment'] ?? [],
+                        $member,
+                        $memberCandidate,
+                    );
+                }
+            }
+
             if ($serviceName === $this->routedService) {
-                if (! $replicaSet->usesScalarCompatibilityPath()) {
+                if (! $replicaSet->usesScalarReplicaNaming()) {
                     foreach ($replicaSet->indexes() as $replicaIndex) {
                         $replicaService = $replicaSet->serviceName($candidateService, $replicaIndex);
-                        $replica = self::rewriteRoutedServiceReferences($service, $this->routedService, $replicaService);
+                        $replica = self::rewriteRoutedServiceReferences($originalService, $this->routedService, $replicaService);
                         unset($replica['container_name']);
                         $replica['networks'] = self::colorizeNetworkAliases(
                             $replica['networks'] ?? [],
@@ -167,29 +339,27 @@ final class BlueGreenComposeTopology
 
                     continue;
                 }
-                $service = self::rewriteRoutedServiceReferences($service, $this->routedService, $candidateService);
-                $service['container_name'] = $candidateContainer;
-                $service['networks'] = self::colorizeNetworkAliases(
-                    $service['networks'] ?? [],
-                    $candidateService,
-                    $color,
-                );
-                $service['labels'] = self::candidateLabels(
-                    $service['labels'] ?? [],
-                    $blueGreenLabels,
-                    $candidateContainer,
-                );
-                $service['environment'] = self::setEnvironmentValue(
-                    $service['environment'] ?? [],
-                    'COOLIFY_CONTAINER_NAME',
-                    $candidateContainer,
-                );
-                $renderedServices[$candidateService] = $service;
-
-                continue;
             }
 
-            $renderedServices[$serviceName] = $service;
+            $memberCandidateService = $candidateNames[$serviceName];
+            $memberCandidateContainer = $this->candidateContainerName($application, $color, $serviceName);
+            $service['container_name'] = $memberCandidateContainer;
+            $service['networks'] = self::colorizeNetworkAliases(
+                $service['networks'] ?? [],
+                $memberCandidateService,
+                $color,
+            );
+            $service['labels'] = self::candidateLabels(
+                $service['labels'] ?? [],
+                $blueGreenLabels,
+                $memberCandidateContainer,
+            );
+            $service['environment'] = self::setEnvironmentValue(
+                $service['environment'] ?? [],
+                'COOLIFY_CONTAINER_NAME',
+                $memberCandidateContainer,
+            );
+            $renderedServices[$memberCandidateService] = $service;
         }
 
         $compose['services'] = $renderedServices;
@@ -270,10 +440,8 @@ final class BlueGreenComposeTopology
         if ($routedServiceNames === []) {
             return ['topology' => null, 'reason' => 'Blue-green Docker Compose deployments require exactly one routed service; no parsed service has a configured domain.'];
         }
-        if (count($routedServiceNames) !== 1) {
-            return ['topology' => null, 'reason' => 'Blue-green Docker Compose deployments support exactly one routed service; configured routed services are `'.implode('`, `', $routedServiceNames).'`.'];
-        }
-
+        // Several routed services are modelled; they all swap color together and
+        // are refused for now by the phase gate below, not here.
         $routedService = $routedServiceNames[0];
         $routedDefinition = $services[$routedService];
         $rawCompose = self::rawCompose($application);
@@ -321,6 +489,79 @@ final class BlueGreenComposeTopology
             return ['topology' => null, 'reason' => $reason];
         }
 
+        // Anything that addresses the routed service cannot keep a stale endpoint
+        // across a swap, so it is re-rolled with it instead of being refused.
+        $coRolledServices = self::coRolledClosure($services, $rawServices, $routedServiceNames, $containerNames, $application);
+        foreach ($coRolledServices as $coRolledService) {
+            if ($coRolledService === $routedService) {
+                continue;
+            }
+            $reason = self::routedServiceIneligibilityReason($coRolledService, $services[$coRolledService]);
+            if ($reason !== null) {
+                return [
+                    'topology' => null,
+                    'reason' => "Blue-green Docker Compose service `{$coRolledService}` must be re-rolled with routed service `{$routedService}` because it addresses it, but it is not eligible: {$reason}",
+                ];
+            }
+        }
+
+        // Each routed service carries its own Traefik router group and backend
+        // port; the port is what discriminates them downstream. Resolved before
+        // the phase gate because a routing conflict outlives the gate.
+        $routedRouting = [];
+        $routingLabels = [];
+        foreach ($routedServiceNames as $eachRoutedService) {
+            $routing = self::routedServiceRouting($eachRoutedService, $services[$eachRoutedService]);
+            if (is_string($routing)) {
+                return ['topology' => null, 'reason' => $routing];
+            }
+            $routedRouting[$eachRoutedService] = $routing;
+            $routingLabels = [...$routingLabels, ...$routing['labels']];
+        }
+        // A single routed service keeps its label list exactly as before,
+        // duplicates included: the fingerprint is compared for equality against
+        // durable digests, so de-duplicating would reject every live claim.
+        if (count($routedServiceNames) === 1) {
+            $routingLabels = $routedRouting[$routedService]['labels'];
+        } else {
+            $routingLabels = array_values(array_unique($routingLabels));
+            sort($routingLabels);
+        }
+        $portOwners = [];
+        foreach ($routedRouting as $eachRoutedService => $routing) {
+            if (isset($portOwners[$routing['port']])) {
+                return [
+                    'topology' => null,
+                    'reason' => "Blue-green Docker Compose routed services `{$portOwners[$routing['port']]}` and `{$eachRoutedService}` share backend port {$routing['port']}; each routed service requires its own port.",
+                ];
+            }
+            $portOwners[$routing['port']] = $eachRoutedService;
+        }
+
+        // PHASE GATE — remove with the port-discriminated routing target.
+        // The topology below can already model and render a co-rolled set, but a
+        // color still owns exactly one tracked candidate container in the durable
+        // claim, the on-disk fence record, and the retirement plan. Admitting a
+        // set now would start containers that nothing owns, so this stays closed.
+        if (count($coRolledServices) > 1) {
+            $others = array_values(array_diff($coRolledServices, [$routedService]));
+            sort($others);
+
+            if (count($routedServiceNames) > 1) {
+                return [
+                    'topology' => null,
+                    'reason' => 'Blue-green Docker Compose routed services `'.implode('`, `', $routedServiceNames)
+                        .'` must swap color together, and re-rolling more than one service together is not supported yet.',
+                ];
+            }
+
+            return [
+                'topology' => null,
+                'reason' => 'Blue-green Docker Compose service `'.implode('`, `', $others)
+                    ."` must be re-rolled with routed service `{$routedService}` because it addresses it, and re-rolling more than one service together is not supported yet.",
+            ];
+        }
+
         foreach ([BlueGreenDeploymentColor::BLUE, BlueGreenDeploymentColor::GREEN] as $color) {
             $candidateService = "{$routedService}-{$color->value}";
             if (array_key_exists($candidateService, $services)) {
@@ -344,6 +585,7 @@ final class BlueGreenComposeTopology
             $routedService,
             $legacyContainerName,
             $application,
+            $coRolledServices,
         );
         if ($reason !== null) {
             return ['topology' => null, 'reason' => $reason];
@@ -357,32 +599,10 @@ final class BlueGreenComposeTopology
         if ($reason !== null) {
             return ['topology' => null, 'reason' => $reason];
         }
-        $labels = self::labelStrings($routedDefinition['labels'] ?? []);
-        $labelMap = self::labelMap($labels);
-        if (($labelMap['traefik.enable'] ?? null) !== 'true') {
-            return ['topology' => null, 'reason' => "Blue-green Docker Compose routed service `{$routedService}` has no managed Traefik routing labels."];
-        }
-        $ports = [];
-        foreach ($labelMap as $key => $value) {
-            if (preg_match('/^traefik\\.http\\.services\\.[A-Za-z0-9_-]+\\.loadbalancer\\.server\\.port$/D', $key) !== 1) {
-                continue;
-            }
-            if (filter_var($value, FILTER_VALIDATE_INT) === false || (int) $value < 1 || (int) $value > 65535) {
-                return ['topology' => null, 'reason' => "Blue-green Docker Compose routed service `{$routedService}` has an invalid Traefik backend port."];
-            }
-            $ports[(int) $value] = true;
-        }
-        if (count($ports) !== 1) {
-            return ['topology' => null, 'reason' => "Blue-green Docker Compose routed service `{$routedService}` requires exactly one valid Traefik backend port."];
-        }
-        $routingLabels = array_values(array_filter(
-            $labels,
-            static fn (string $label): bool => str_starts_with(explode('=', $label, 2)[0], 'traefik.'),
-        ));
-        sort($routingLabels);
+        $ports = [$routedRouting[$routedService]['port'] => true];
         $fixedSidecars = [];
         foreach ($containerNames as $serviceName => $containerName) {
-            if ($serviceName === $routedService) {
+            if (in_array($serviceName, $coRolledServices, true)) {
                 continue;
             }
             $fixedSidecars[] = [
@@ -398,6 +618,11 @@ final class BlueGreenComposeTopology
                 legacyRoutedContainerName: $legacyContainerName,
                 routingLabels: $routingLabels,
                 fixedSidecars: $fixedSidecars,
+                coRolledServices: $coRolledServices,
+                routedServicePorts: array_map(
+                    static fn (array $routing): int => $routing['port'],
+                    $routedRouting,
+                ),
             ),
             'reason' => null,
         ];
@@ -475,6 +700,41 @@ final class BlueGreenComposeTopology
         return $matches;
     }
 
+    /**
+     * The managed Traefik routing for one routed service.
+     *
+     * @param  array<string, mixed>  $service
+     * @return array{port: int, labels: list<string>}|string The ineligibility reason on failure
+     */
+    private static function routedServiceRouting(string $serviceName, array $service): array|string
+    {
+        $labels = self::labelStrings($service['labels'] ?? []);
+        $labelMap = self::labelMap($labels);
+        if (($labelMap['traefik.enable'] ?? null) !== 'true') {
+            return "Blue-green Docker Compose routed service `{$serviceName}` has no managed Traefik routing labels.";
+        }
+        $ports = [];
+        foreach ($labelMap as $key => $value) {
+            if (preg_match('/^traefik\\.http\\.services\\.[A-Za-z0-9_-]+\\.loadbalancer\\.server\\.port$/D', $key) !== 1) {
+                continue;
+            }
+            if (filter_var($value, FILTER_VALIDATE_INT) === false || (int) $value < 1 || (int) $value > 65535) {
+                return "Blue-green Docker Compose routed service `{$serviceName}` has an invalid Traefik backend port.";
+            }
+            $ports[(int) $value] = true;
+        }
+        if (count($ports) !== 1) {
+            return "Blue-green Docker Compose routed service `{$serviceName}` requires exactly one valid Traefik backend port.";
+        }
+        $routingLabels = array_values(array_filter(
+            $labels,
+            static fn (string $label): bool => str_starts_with(explode('=', $label, 2)[0], 'traefik.'),
+        ));
+        sort($routingLabels);
+
+        return ['port' => (int) array_key_first($ports), 'labels' => $routingLabels];
+    }
+
     /** @param array<string, mixed> $service */
     private static function routedServiceIneligibilityReason(string $serviceName, array $service): ?string
     {
@@ -510,13 +770,160 @@ final class BlueGreenComposeTopology
         return null;
     }
 
-    /** @param array<string, mixed> $services @param array<string, mixed> $rawServices */
+    /**
+     * Transitive set of services that must swap color together: the routed
+     * service plus anything that addresses it, directly or through another
+     * co-rolled service. Computed to a fixpoint so a chain (a -> b -> routed)
+     * is caught, not just direct references.
+     *
+     * @param  array<string, mixed>  $services
+     * @param  array<string, mixed>  $rawServices
+     * @return list<string>
+     */
+    private static function coRolledClosure(
+        array $services,
+        array $rawServices,
+        array $routedServiceNames,
+        array $containerNames,
+        Application $application,
+    ): array {
+        $coRolled = [];
+        foreach ($routedServiceNames as $routedServiceName) {
+            $coRolled[$routedServiceName] = true;
+        }
+        $rawServiceNames = array_values(array_filter(array_keys($rawServices), 'is_string'));
+
+        // A member's aliases never change, so they are resolved once rather than
+        // rebuilt on every pass of the fixpoint.
+        $aliasesByMember = [];
+        $aliasesFor = static function (string $member) use (&$aliasesByMember, $containerNames, $application): array {
+            return $aliasesByMember[$member] ??= self::referenceAliasesFor(
+                $member,
+                $containerNames[$member] ?? null,
+                $application,
+            );
+        };
+
+        do {
+            $grew = false;
+            foreach ($services as $serviceName => $service) {
+                if (isset($coRolled[$serviceName])) {
+                    continue;
+                }
+                foreach (array_keys($coRolled) as $member) {
+                    $references = $aliasesFor($member);
+                    if (! self::serviceAddresses(
+                        $service,
+                        $rawServices[$serviceName] ?? [],
+                        $references,
+                        $rawServiceNames,
+                        $member,
+                    )) {
+                        continue;
+                    }
+                    $coRolled[$serviceName] = true;
+                    $grew = true;
+
+                    break;
+                }
+            }
+        } while ($grew);
+
+        $names = array_keys($coRolled);
+        sort($names);
+
+        return $names;
+    }
+
+    /**
+     * Every name a sibling service could use to reach `$service`, including the
+     * reserved color identities so a compose file cannot pin one by hand.
+     *
+     * @return list<string>
+     */
+    private static function referenceAliasesFor(
+        string $service,
+        ?string $legacyContainerName,
+        Application $application,
+    ): array {
+        // Only the Compose service name and the identities this application
+        // actually generates. `{$service}-blue` is deliberately absent: a
+        // sibling naming it is addressing some other container, and treating it
+        // as a routed reference would make a previously eligible topology
+        // ineligible.
+        $aliases = [
+            $service,
+            "{$application->uuid}-blue",
+            "{$application->uuid}-green",
+        ];
+        if ($legacyContainerName !== null) {
+            $aliases[] = $legacyContainerName;
+        }
+
+        return array_values(array_unique($aliases));
+    }
+
+    /**
+     * @param  array<string, mixed>  $service
+     * @param  array<string, mixed>  $rawService
+     * @param  list<string>  $references
+     * @param  list<string>  $rawServiceNames
+     */
+    private static function serviceAddresses(
+        array $service,
+        array $rawService,
+        array $references,
+        array $rawServiceNames,
+        string $member,
+    ): bool {
+        if (self::dependsOnService($service['depends_on'] ?? null, $references)) {
+            return true;
+        }
+        foreach (['links', 'external_links', 'volumes_from'] as $attribute) {
+            foreach (self::listValues($service[$attribute] ?? []) as $value) {
+                if (self::referencesRoutedService($value, $references)) {
+                    return true;
+                }
+            }
+        }
+        foreach (['network_mode', 'pid', 'ipc', 'uts'] as $attribute) {
+            $value = $service[$attribute] ?? null;
+            if (is_string($value) && self::referencesRoutedService(trim($value), $references)) {
+                return true;
+            }
+        }
+        $extends = $service['extends'] ?? null;
+        $extendsService = is_string($extends) ? $extends : data_get($extends, 'service');
+        if (is_string($extendsService) && in_array($extendsService, $references, true)) {
+            return true;
+        }
+
+        // `SERVICE_NAME_X=x` is injected by the parser and merely names the
+        // service; it is not an endpoint, so it must not pull a service in.
+        $processed = self::environmentMap($service['environment'] ?? null) ?? [];
+        foreach ($processed as $key => $value) {
+            if (self::isStrictlyValidatedGeneratedServiceName($key, $value, $rawServiceNames)) {
+                continue;
+            }
+            if (self::environmentValueReferencesRoutedService($value, $references)) {
+                return true;
+            }
+        }
+
+        $generatedMemberEnvironment = 'SERVICE_NAME_'.strtoupper(self::normalizeServiceName($member));
+
+        return self::environmentUsesGeneratedServiceName($rawService['environment'] ?? null, $generatedMemberEnvironment)
+            || self::environmentReferencesRoutedService($rawService['environment'] ?? null, $references);
+    }
+
+    /** @param array<string, mixed> $services @param array<string, mixed> $rawServices @param list<string> $coRolledServices */
     private static function dependentTopologyIneligibilityReason(
         array $services,
         array $rawServices,
         string $routedService,
         string $legacyContainerName,
         Application $application,
+        array $coRolledServices = [],
     ): ?string {
         $routedNamespaceReferences = [
             "service:{$routedService}",
@@ -535,6 +942,20 @@ final class BlueGreenComposeTopology
             "{$application->uuid}-blue",
             "{$application->uuid}-green",
         ];
+        // A fixed sidecar may not address any co-rolled service, not just the
+        // routed one, because none of them keep their identity across a swap.
+        foreach ($coRolledServices as $coRolledService) {
+            if ($coRolledService === $routedService) {
+                continue;
+            }
+            $routedServiceReferences[] = $coRolledService;
+            $routedServiceReferences[] = "{$coRolledService}-blue";
+            $routedServiceReferences[] = "{$coRolledService}-green";
+            $routedNamespaceReferences[] = "service:{$coRolledService}";
+            $routedNamespaceReferences[] = "container:{$coRolledService}";
+        }
+        $routedServiceReferences = array_values(array_unique($routedServiceReferences));
+        $routedNamespaceReferences = array_values(array_unique($routedNamespaceReferences));
         $productionRuntimeEnvironmentVariables = $application->runtime_environment_variables()
             ->where('is_runtime', true)
             ->get()
@@ -543,12 +964,19 @@ final class BlueGreenComposeTopology
             ))
             ->groupBy(static fn ($environmentVariable): string => (string) $environmentVariable->key);
         $generatedRoutedServiceEnvironment = 'SERVICE_NAME_'.strtoupper(self::normalizeServiceName($routedService));
+        $coRolled = $coRolledServices === [] ? [$routedService] : $coRolledServices;
         foreach ($services as $serviceName => $service) {
-            if ($serviceName !== $routedService && self::dependsOnService($service['depends_on'] ?? null, $routedServiceReferences)) {
+            // Co-rolled services are re-rendered per color with their depends_on
+            // and environment endpoints rewritten, so only those two checks are
+            // waived for them. Static links, shared namespaces, volumes_from and
+            // extends are still proved for every service exactly as before,
+            // because none of those follow a color swap.
+            $isCoRolled = in_array($serviceName, $coRolled, true);
+            if (! $isCoRolled && self::dependsOnService($service['depends_on'] ?? null, $routedServiceReferences)) {
                 return "Blue-green Docker Compose service `{$serviceName}` cannot depend on routed service `{$routedService}` because fixed sidecars are not re-rolled during a color swap.";
             }
             $rawService = $rawServices[$serviceName];
-            if ($serviceName !== $routedService && ($environmentReason = self::processedEnvironmentReconciliationReason(
+            if (! $isCoRolled && ($environmentReason = self::processedEnvironmentReconciliationReason(
                 $serviceName,
                 $service['environment'] ?? null,
                 $rawService,
@@ -560,13 +988,13 @@ final class BlueGreenComposeTopology
             )) !== null) {
                 return $environmentReason;
             }
-            if ($serviceName !== $routedService && self::environmentUsesGeneratedServiceName(
+            if (! $isCoRolled && self::environmentUsesGeneratedServiceName(
                 $rawService['environment'] ?? null,
                 $generatedRoutedServiceEnvironment,
             )) {
                 return "Blue-green Docker Compose service `{$serviceName}` cannot retain an environment endpoint for routed service `{$routedService}` because fixed sidecars do not follow color swaps.";
             }
-            if ($serviceName !== $routedService && self::environmentReferencesRoutedService(
+            if (! $isCoRolled && self::environmentReferencesRoutedService(
                 $rawService['environment'] ?? null,
                 $routedServiceReferences,
             )) {
@@ -600,7 +1028,7 @@ final class BlueGreenComposeTopology
             if (is_string($extendsService) && in_array($extendsService, $routedServiceReferences, true)) {
                 return "Blue-green Docker Compose service `{$serviceName}` cannot extend routed service `{$routedService}`.";
             }
-            if ($serviceName !== $routedService && ($configurationReason = self::processedConfigurationReconciliationReason(
+            if (! $isCoRolled && ($configurationReason = self::processedConfigurationReconciliationReason(
                 $serviceName,
                 $service,
                 $rawService,
@@ -943,6 +1371,26 @@ final class BlueGreenComposeTopology
         return false;
     }
 
+    /**
+     * The host shapes a service name can appear in. One source of truth: the
+     * detector and the rewriter drifted apart once already, and the rewriter's
+     * looser pattern corrupted filesystem paths. `\K` keeps the delimiter out of
+     * the match so the same pattern can both test and replace.
+     *
+     * @return list<string>
+     */
+    private static function hostReferencePatterns(string $serviceName): array
+    {
+        $quoted = preg_quote($serviceName, '~');
+
+        return [
+            '~[A-Za-z][A-Za-z0-9+.-]*://(?:[^/@\s]+@)?\K'.$quoted.'(?=$|[:/?#\s,;\'"\]\)])~i',
+            '~(?:^|[\s,;=\[\(\{\'"])\K'.$quoted.'(?=:\d{1,5}(?:$|[\s,;/#?&\]\)\}\'"]))~i',
+            '~(?<![A-Za-z0-9_.-])(?:hosts?|hostname|servers?|addresses?)\s*=\s*[^;\s]*?(?<![A-Za-z0-9_.-])\K'.$quoted.'(?=$|[:,;\s\'"\]\}\)])~i',
+            '~(?:^|[\s,;=\[\(\{\'"])\K'.$quoted.'(?=$|[\s,;\]\)\}\'"])~i',
+        ];
+    }
+
     /** @param list<string> $serviceNames */
     private static function environmentValueReferencesRoutedService(mixed $value, array $serviceNames): bool
     {
@@ -951,17 +1399,13 @@ final class BlueGreenComposeTopology
         }
         $value = trim($value);
         foreach ($serviceNames as $serviceName) {
-            $quotedServiceName = preg_quote($serviceName, '~');
-            $uriAuthorityPattern = '~[A-Za-z][A-Za-z0-9+.-]*://(?:[^/@\s]+@)?'.$quotedServiceName.'(?=$|[:/?#\s,;\'"\]\)])~i';
-            $hostPortTokenPattern = '~(?:^|[\s,;=\[\(\{\'"])'.$quotedServiceName.':\d{1,5}(?=$|[\s,;/#?&\]\)\}\'"])~i';
-            $dsnHostPattern = '~(?<![A-Za-z0-9_.-])(?:hosts?|hostname|servers?|addresses?)\s*=\s*[^;\s]*?(?<![A-Za-z0-9_.-])'.$quotedServiceName.'(?=$|[:,;\s\'"\]\}\)])~i';
-            $bareHostTokenPattern = '~(?:^|[\s,;=\[\(\{\'"])'.$quotedServiceName.'(?=$|[\s,;\]\)\}\'"])~i';
-            if ($value === $serviceName
-                || preg_match($uriAuthorityPattern, $value) === 1
-                || preg_match($hostPortTokenPattern, $value) === 1
-                || preg_match($dsnHostPattern, $value) === 1
-                || preg_match($bareHostTokenPattern, $value) === 1) {
+            if ($value === $serviceName) {
                 return true;
+            }
+            foreach (self::hostReferencePatterns($serviceName) as $pattern) {
+                if (preg_match($pattern, $value) === 1) {
+                    return true;
+                }
             }
         }
 
@@ -1112,6 +1556,43 @@ final class BlueGreenComposeTopology
         }
 
         return $service;
+    }
+
+    /**
+     * Repoint environment values that address `$from` as a host at `$to`, so a
+     * co-rolled service reaches this color's sibling rather than the other one.
+     * Mirrors the host shapes environmentValueReferencesRoutedService detects.
+     */
+    private static function rewriteEnvironmentHostReferences(mixed $environment, string $from, string $to): mixed
+    {
+        if (! is_array($environment) || $from === $to) {
+            return $environment;
+        }
+
+        $patterns = self::hostReferencePatterns($from);
+        $rewriteValue = static function (mixed $value) use ($patterns, $from, $to): mixed {
+            if (! is_string($value)) {
+                return $value;
+            }
+            if (trim($value) === $from) {
+                return $to;
+            }
+
+            return preg_replace($patterns, $to, $value);
+        };
+
+        if (array_is_list($environment)) {
+            return array_map(static function (mixed $entry) use ($rewriteValue): mixed {
+                if (! is_string($entry) || ! str_contains($entry, '=')) {
+                    return $entry;
+                }
+                [$key, $value] = explode('=', $entry, 2);
+
+                return $key.'='.$rewriteValue($value);
+            }, $environment);
+        }
+
+        return array_map($rewriteValue, $environment);
     }
 
     private static function rewriteServiceNameEnvironment(mixed $environment, string $routedService, string $candidateService): mixed

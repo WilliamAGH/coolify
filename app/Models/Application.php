@@ -6,6 +6,7 @@ use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
 use App\Actions\Proxy\RemoveProxyConnectedNetwork;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeactivationPhase;
+use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\BlueGreenIneligibilityReason;
 use App\Enums\ProxyTypes;
@@ -1305,9 +1306,8 @@ class Application extends BaseModel
             ? $this->getRelation('settings')
             : $this->settings()->first();
         if ($this->build_pack === 'dockercompose') {
-            $backendPort = BlueGreenComposeTopology::tryFromApplication($this)?->backendPort;
-
-            return $backendPort === null ? null : [$backendPort];
+            // Every routed service contributes its own backend port.
+            return BlueGreenComposeTopology::tryFromApplication($this)?->backendPorts();
         }
         if ((bool) ($setting?->is_static ?? false)) {
             $backendPorts = [80];
@@ -1373,6 +1373,19 @@ class Application extends BaseModel
         }
 
         return BlueGreenComposeTopology::tryFromApplication($this);
+    }
+
+    /**
+     * How the durable replica ledger is grouped for `$color`. The topology owns
+     * co-rolling, so a reader that holds no claim consumes it here instead of
+     * taking a stored Compose service apart. A destination that re-rolls one
+     * service answers empty, which is the historic single-group reading.
+     *
+     * @return list<string>
+     */
+    public function blueGreenCandidateComposeServices(BlueGreenDeploymentColor $color): array
+    {
+        return $this->blueGreenComposeTopology()?->candidateComposeServices($color) ?? [];
     }
 
     /** @return list<string> */
@@ -1994,6 +2007,14 @@ class Application extends BaseModel
             && ($ineligibility['reason']->isAssemblyIncomplete()
                 || $this->persistedBlueGreenConfigurationWasAlreadyIneligible($setting))) {
             return;
+        }
+
+        // Opting in and drifting out of eligibility are different failures and
+        // need different instructions: nothing "became" ineligible when the
+        // user is switching blue-green on, and telling them to disable a
+        // setting they are trying to enable is advice they cannot act on.
+        if ($isExplicitOptIn) {
+            throw new BlueGreenAdmissionException("Blue-green deployment cannot be enabled for this application. {$ineligibility['message']} Resolve that first, then enable blue-green deployment.");
         }
 
         throw new BlueGreenAdmissionException("Blue-green deployment configuration cannot become ineligible while it is opted in. {$ineligibility['message']} Disable blue-green deployment first.");

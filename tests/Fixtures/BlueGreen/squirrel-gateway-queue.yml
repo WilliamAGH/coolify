@@ -1,0 +1,159 @@
+x-log-policy: &log-policy
+  driver: local
+  options:
+    max-size: 10m
+    max-file: '5'
+    mode: non-blocking
+    max-buffer-size: 4m
+
+services:
+  queue:
+    build:
+      context: ../..
+      dockerfile: gateway/edge-and-queue/queue/Dockerfile
+      args:
+        LLM_IMAGE_REVISION: '${SOURCE_COMMIT:-development}'
+    depends_on:
+      llm_gateway:
+        condition: service_healthy
+    environment:
+      # Magic-var identifier MUST equal the service name (queue -> QUEUE) and is
+      # declared in its BARE (port-less) form. The retained Compose resource may
+      # declare only this canonical iocloudhost identity; public
+      # *.popos-sf3.com candidate identities are retired. Port binding is done by
+      # the explicit Traefik labels below, not this var.
+      - 'SERVICE_FQDN_QUEUE=https://api.llm-gateway.iocloudhost.net'
+      - 'QUEUE_UPSTREAM=http://llm_gateway:8000'
+      # Upstream read budget covers one model generation, not the queue wait (the
+      # batch queue is now a short surge buffer; the durable backlog lives in the
+      # harness DB). 10m is generous for a single turn; a longer hold would let a
+      # silent non-streaming upstream occupy a slot/model-count (Oracle P2).
+      - QUEUE_UPSTREAM_TIMEOUT_S=600
+      - QUEUE_LOG_LEVEL=WARNING
+    restart: unless-stopped
+    logging: *log-policy
+    # Coolify (application path) writes Traefik routers from SERVICE_FQDN_*
+    # but does not auto-create the matching Traefik service or
+    # loadbalancer.server.port label, so Traefik returns 503 'no available
+    # server'. Declare them explicitly. ${COOLIFY_RESOURCE_UUID} is exported
+    # by Coolify into the compose env at deploy time.
+    labels:
+      - 'traefik.enable=true'
+      - "traefik.http.routers.https-0-${COOLIFY_RESOURCE_UUID}-queue.service=${COOLIFY_RESOURCE_UUID}-queue"
+      - "traefik.http.routers.http-0-${COOLIFY_RESOURCE_UUID}-queue.service=${COOLIFY_RESOURCE_UUID}-queue"
+      - "traefik.http.services.${COOLIFY_RESOURCE_UUID}-queue.loadbalancer.server.port=8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=2).status == 200 else 1)'
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+
+  llm_gateway:
+    # Build from the same exact branch revision as the queue. Keeping both
+    # services inside this git-owned Compose build removes the mutable image-tag
+    # race and makes origin/dev and origin/main the complete release boundary.
+    build:
+      context: ../..
+      dockerfile: llm-gateway/Dockerfile
+      args:
+        SOURCE_COMMIT: '${SOURCE_COMMIT:-development}'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Identifier MUST equal Coolify's normalized service identity
+      # (llm_gateway -> LLM_GATEWAY) and is
+      # declared in the bare (port-less) form to seed SERVICE_FQDN_LLM_GATEWAY
+      # directly. This retained Compose resource may declare only the canonical
+      # iocloudhost admin identity; public *.popos-sf3.com candidate identities are
+      # retired. Port binding is handled by the explicit Traefik labels below.
+      # ALLOWED_ORIGINS references the generated SERVICE_URL_* below.
+      - 'SERVICE_FQDN_LLM_GATEWAY=https://llm-gateway.iocloudhost.net'
+      - DEBUG=false
+      - DATABASE_TYPE=postgresql
+      - 'DATABASE_URL=postgresql+asyncpg://squirrel:${SERVICE_PASSWORD_POSTGRES:?}@postgres:5432/squirrel'
+      - 'REDIS_URL=redis://:${SERVICE_PASSWORD_REDIS:?}@redis:6379'
+      - KV_STORE_TYPE=redis
+      - 'ADMIN_USERNAME=${ADMIN_USERNAME:-admin}'
+      - 'ADMIN_PASSWORD=${SERVICE_PASSWORD_ADMIN:?}'
+      # SSOT: reference Coolify's generated SERVICE_URL_* (one owner per domain,
+      # derived from the SERVICE_FQDN_* seeds above) instead of restating the
+      # literals. The `:-` fallbacks keep a standalone `docker compose up` working
+      # and let Coolify override the values without a footgun.
+      - 'ALLOWED_ORIGINS=${SERVICE_URL_LLM_GATEWAY:-https://llm-gateway.iocloudhost.net},${SERVICE_URL_QUEUE:-https://api.llm-gateway.iocloudhost.net}'
+      - 'ENCRYPTION_KEY=${SERVICE_BASE64_64_ENCRYPTION_KEY:?}'
+      - ENABLE_VIEW_API_KEYS=false
+      - 'ALLOW_PRIVATE_IP_PROVIDER=${ALLOW_PRIVATE_IP_PROVIDER:-true}'
+    restart: unless-stopped
+    logging: *log-policy
+    # See queue.labels comment — same workaround for the Squirrel admin FQDN.
+    labels:
+      - 'traefik.enable=true'
+      - "traefik.http.routers.https-0-${COOLIFY_RESOURCE_UUID}-llm-gateway.service=${COOLIFY_RESOURCE_UUID}-llm-gateway"
+      - "traefik.http.routers.http-0-${COOLIFY_RESOURCE_UUID}-llm-gateway.service=${COOLIFY_RESOURCE_UUID}-llm-gateway"
+      - "traefik.http.services.${COOLIFY_RESOURCE_UUID}-llm-gateway.loadbalancer.server.port=8000"
+    healthcheck:
+      # /readyz stays unavailable until startup migrations, Postgres, Redis,
+      # and scheduler registration complete. Probe with Python stdlib because
+      # the image may not ship wget/curl.
+      test:
+        - CMD
+        - python
+        - -c
+        - 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen("http://127.0.0.1:8000/readyz", timeout=2).status == 200 else 1)'
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      # Existing production databases can spend multiple minutes in app-owned
+      # startup migrations/backfills before /health binds. Keep Compose from
+      # failing the whole stack and leaving queue in Created during that window.
+      start_period: 240s
+
+  postgres:
+    image: 'postgres:16-alpine'
+    environment:
+      - POSTGRES_DB=squirrel
+      - POSTGRES_USER=squirrel
+      - 'POSTGRES_PASSWORD=${SERVICE_PASSWORD_POSTGRES:?}'
+    volumes:
+      - 'squirrel-pgdata:/var/lib/postgresql/data'
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'pg_isready -U squirrel -d squirrel'
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+    logging: *log-policy
+
+  redis:
+    image: 'redis:7-alpine'
+    command:
+      - redis-server
+      - '--requirepass'
+      - '${SERVICE_PASSWORD_REDIS:?}'
+    environment:
+      - 'REDIS_PASSWORD=${SERVICE_PASSWORD_REDIS:?}'
+    volumes:
+      - 'squirrel-redis:/data'
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'redis-cli -a "$$REDIS_PASSWORD" ping | grep -q PONG'
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+    logging: *log-policy
+
+volumes:
+  squirrel-pgdata:
+  squirrel-redis:

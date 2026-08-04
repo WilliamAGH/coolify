@@ -882,6 +882,7 @@ function generateBlueGreenApplicationContainerLabels(
     BlueGreenDeploymentColor $color,
     int $routingRevision,
     int|array $backendPorts,
+    ?array $servedPorts = null,
 ): array {
     if ($routingRevision < 0) {
         throw new InvalidArgumentException('The routing revision must be a nonnegative integer.');
@@ -900,11 +901,33 @@ function generateBlueGreenApplicationContainerLabels(
     }
     sort($backendPorts, SORT_NUMERIC);
 
+    // A container advertises only the ports it actually serves, so a destination
+    // routing several services cannot discover a member service pointing at a
+    // sibling's container. Naming still keys off the destination's whole port
+    // inventory, otherwise the discovered names would not match the document.
+    if ($servedPorts === null) {
+        $servedPorts = $backendPorts;
+    } else {
+        $servedPorts = array_values($servedPorts);
+        if ($servedPorts === []) {
+            throw new InvalidArgumentException('Blue-green served ports must be a non-empty subset of the backend ports.');
+        }
+        foreach ($servedPorts as $servedPort) {
+            if (! is_int($servedPort) || ! in_array($servedPort, $backendPorts, true)) {
+                throw new InvalidArgumentException('Blue-green served ports must be a non-empty subset of the backend ports.');
+            }
+        }
+        if (count(array_unique($servedPorts)) !== count($servedPorts)) {
+            throw new InvalidArgumentException('Blue-green served ports must be unique.');
+        }
+        sort($servedPorts, SORT_NUMERIC);
+    }
+
     $applicationUuid = (string) $application->uuid;
     $labels = [
         'traefik.enable=true',
     ];
-    foreach ($backendPorts as $backendPort) {
+    foreach ($servedPorts as $backendPort) {
         $serviceName = BlueGreenRoutingTarget::memberServiceNameForPort(
             $applicationUuid,
             $destinationId,

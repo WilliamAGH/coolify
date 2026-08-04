@@ -129,8 +129,10 @@ function exactBlueGreenReplicaBindingFixture(int $replicaCount = 3): array
         color: $claim->pendingColor,
         deploymentUuid: $claim->deploymentUuid,
         routingRevision: $claim->expectedRoutingRevision,
-        composeServiceBase: $application->uuid.'-blue',
-        scalarContainerName: $claim->candidateContainerName,
+        members: [[
+            'composeServiceBase' => $application->uuid.'-blue',
+            'containerName' => $claim->candidateContainerName,
+        ]],
         replicaCount: $claim->replicaCount,
     );
 
@@ -315,6 +317,118 @@ it('rejects incomplete or duplicate durable replica ledger indexes', function (a
     'duplicate index' => [[1, 1, 3]],
     'non-contiguous index' => [[1, 2, 4]],
 ]);
+
+it('groups the durable replica ledger by co-rolled member rather than by index alone', function (): void {
+    // Two co-rolled services at one replica each: the flat ledger reads [1, 1],
+    // which the single-member reading rejects outright.
+    $rows = collect([
+        ['compose_service' => 'llm_gateway-blue', 'replica_index' => 1],
+        ['compose_service' => 'queue-blue', 'replica_index' => 1],
+    ])->map(static function (array $attributes): ApplicationBlueGreenReplica {
+        $replica = new ApplicationBlueGreenReplica;
+        $replica->forceFill($attributes);
+
+        return $replica;
+    });
+
+    expect(fn () => BlueGreenReplicaSet::fromReplicas($rows))
+        ->toThrow(InvalidArgumentException::class, 'every contiguous replica index exactly once');
+
+    $replicaSet = BlueGreenReplicaSet::fromReplicas($rows, ['llm_gateway-blue', 'queue-blue']);
+
+    expect($replicaSet->count)->toBe(1)
+        ->and($replicaSet->members)->toBe(['llm_gateway-blue', 'queue-blue'])
+        ->and($replicaSet->promotionThreshold())->toBe(2)
+        // One replica per member is still two containers, so the scalar
+        // candidate identity can no longer stand in for the color.
+        ->and($replicaSet->usesScalarCompatibilityPath())->toBeFalse();
+});
+
+it('proves replica contiguity inside every co-rolled member group', function (): void {
+    $rows = collect([
+        ['compose_service' => 'llm_gateway-blue-replica-1', 'replica_index' => 1],
+        ['compose_service' => 'llm_gateway-blue-replica-2', 'replica_index' => 2],
+        ['compose_service' => 'queue-blue-replica-1', 'replica_index' => 1],
+        ['compose_service' => 'queue-blue-replica-2', 'replica_index' => 2],
+    ])->map(static function (array $attributes): ApplicationBlueGreenReplica {
+        $replica = new ApplicationBlueGreenReplica;
+        $replica->forceFill($attributes);
+
+        return $replica;
+    });
+    $members = ['llm_gateway-blue', 'queue-blue'];
+
+    expect(BlueGreenReplicaSet::fromReplicas($rows, $members)->count)->toBe(2)
+        ->and(BlueGreenReplicaSet::fromReplicas($rows, $members)->promotionThreshold())->toBe(4);
+
+    // One member complete, the other doubled: the total still divides evenly, so
+    // only per-group contiguity catches it.
+    $skewed = collect([
+        ['compose_service' => 'llm_gateway-blue-replica-1', 'replica_index' => 1],
+        ['compose_service' => 'llm_gateway-blue-replica-2', 'replica_index' => 2],
+        ['compose_service' => 'llm_gateway-blue-replica-1', 'replica_index' => 1],
+        ['compose_service' => 'llm_gateway-blue-replica-2', 'replica_index' => 2],
+    ])->map(static function (array $attributes): ApplicationBlueGreenReplica {
+        $replica = new ApplicationBlueGreenReplica;
+        $replica->forceFill($attributes);
+
+        return $replica;
+    });
+
+    expect(fn () => BlueGreenReplicaSet::fromReplicas($skewed, $members))
+        ->toThrow(InvalidArgumentException::class, 'for every co-rolled member');
+});
+
+it('refuses promotion when any co-rolled member is unhealthy', function (): void {
+    $replicaSet = new BlueGreenReplicaSet(1, ['llm_gateway-blue', 'queue-blue']);
+    $healthy = static fn (string $composeService, string $health): BlueGreenReplicaInspection => BlueGreenReplicaInspection::fromRuntime(
+        replicaIndex: 1,
+        composeService: $composeService,
+        containerName: $composeService,
+        dockerId: str_repeat('a', 64),
+        status: 'running',
+        health: $health,
+    );
+
+    $replicaSet->assertPromotionThreshold([
+        $healthy('llm_gateway-blue', 'healthy'),
+        $healthy('queue-blue', 'healthy'),
+    ]);
+
+    expect(fn () => $replicaSet->assertPromotionThreshold([
+        $healthy('llm_gateway-blue', 'healthy'),
+        $healthy('queue-blue', 'starting'),
+    ]))->toThrow(InvalidArgumentException::class, 'running, and healthy before promotion')
+        // A color that only brought one member up must never satisfy the
+        // threshold by presenting that member twice.
+        ->and(fn () => $replicaSet->assertPromotionThreshold([
+            $healthy('llm_gateway-blue', 'healthy'),
+            $healthy('llm_gateway-blue', 'healthy'),
+        ]))->toThrow(InvalidArgumentException::class, 'running, and healthy before promotion');
+});
+
+it('keeps the single-member replica ledger reading byte-identical', function (): void {
+    $rows = collect([1, 2, 3])->map(static function (int $index): ApplicationBlueGreenReplica {
+        $replica = new ApplicationBlueGreenReplica;
+        $replica->forceFill([
+            'compose_service' => "application-blue-replica-{$index}",
+            'replica_index' => $index,
+        ]);
+
+        return $replica;
+    });
+
+    $historic = BlueGreenReplicaSet::fromReplicas($rows);
+    $explicit = BlueGreenReplicaSet::fromReplicas($rows, ['application-blue']);
+
+    expect($historic->count)->toBe(3)
+        ->and($historic->members)->toBe([])
+        ->and($historic->promotionThreshold())->toBe(3)
+        ->and($historic->usesScalarCompatibilityPath())->toBeFalse()
+        ->and($explicit->count)->toBe($historic->count)
+        ->and($explicit->promotionThreshold())->toBe($historic->promotionThreshold())
+        ->and($explicit->usesScalarCompatibilityPath())->toBe($historic->usesScalarCompatibilityPath());
+});
 
 it('refuses promotion unless every configured replica is running and healthy', function (): void {
     $replicas = new BlueGreenReplicaSet(3);

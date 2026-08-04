@@ -14,7 +14,6 @@ use App\Actions\Application\BlueGreen\BlueGreenLegacyProviderState;
 use App\Actions\Application\BlueGreen\BlueGreenLegacyRoutingSnapshot;
 use App\Actions\Application\BlueGreen\BlueGreenOperationFence;
 use App\Actions\Application\BlueGreen\BlueGreenOperationFenceLostException;
-use App\Actions\Application\BlueGreen\BlueGreenPublicRouteAcknowledgementMismatch;
 use App\Actions\Application\BlueGreen\BlueGreenReconciliationResult;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaInspection;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
@@ -564,7 +563,7 @@ final class BlueGreenDeploymentLifecycle
         BlueGreenContainerExpectation $candidateExpectation,
     ): array {
         $replicaRows = $this->candidateReplicaRows($claim);
-        $replicaSet = BlueGreenReplicaSet::fromReplicas($replicaRows);
+        $replicaSet = BlueGreenReplicaSet::fromReplicas($replicaRows, $claim->candidateComposeServices());
         $completionAssertions = $replicaSet->usesScalarCompatibilityPath()
             ? (new InspectBlueGreenContainer)->runningMutationCompletionAssertionsFor($candidateExpectation)
             : (new InspectBlueGreenReplicaSet)->runningMutationCompletionAssertionsFor(
@@ -1125,6 +1124,41 @@ final class BlueGreenDeploymentLifecycle
         return $this->validateContainerName("{$this->application->uuid}-{$color->value}");
     }
 
+    /**
+     * The container each backend port must reach, per color.
+     *
+     * Empty whenever the destination routes a single service, which keeps the
+     * historic single blue/green pair serving every port and every acknowledgement
+     * proof byte-identical. Names come from the topology, which is the one owner
+     * of candidate container naming, and are deterministic per color, so the
+     * inactive color resolves to exactly the containers it started.
+     *
+     * @return array<int, array{blue: string, green: string}>
+     */
+    private function portContainerNames(BlueGreenDeploymentClaim $claim): array
+    {
+        $services = $claim->backendPortInventory->services();
+        if ($services === []) {
+            return [];
+        }
+        $topology = $this->application->blueGreenComposeTopology()
+            ?? throw new DeploymentException('Blue-green port-scoped routing has no Compose topology.');
+
+        $portContainerNames = [];
+        foreach ($services as $port => $service) {
+            $portContainerNames[$port] = [
+                'blue' => $this->validateContainerName(
+                    $topology->candidateContainerName($this->application, BlueGreenDeploymentColor::BLUE, $service),
+                ),
+                'green' => $this->validateContainerName(
+                    $topology->candidateContainerName($this->application, BlueGreenDeploymentColor::GREEN, $service),
+                ),
+            ];
+        }
+
+        return $portContainerNames;
+    }
+
     private function validateContainerName(string $value): string
     {
         if (! preg_match(ValidationPatterns::CONTAINER_NAME_PATTERN, $value)) {
@@ -1466,7 +1500,10 @@ final class BlueGreenDeploymentLifecycle
             ?? throw new DeploymentException('The blue-green candidate has no durable label expectation.');
         $claim = $this->claim
             ?? throw new DeploymentException('The blue-green candidate has no durable deployment claim.');
-        $replicaSet = BlueGreenReplicaSet::fromReplicas($this->candidateReplicaRows($claim));
+        $replicaSet = BlueGreenReplicaSet::fromReplicas(
+            $this->candidateReplicaRows($claim),
+            $claim->candidateComposeServices(),
+        );
         if (! $replicaSet->usesScalarCompatibilityPath()) {
             $this->waitForExactCandidateReplicaHealth($claim, $replicaSet);
 
@@ -1598,7 +1635,7 @@ final class BlueGreenDeploymentLifecycle
             return $rows;
         }
         try {
-            $replicaSet = BlueGreenReplicaSet::fromReplicas($rows);
+            $replicaSet = BlueGreenReplicaSet::fromReplicas($rows, $claim->candidateComposeServices());
         } catch (\InvalidArgumentException $exception) {
             throw new DeploymentException('The candidate replica ledger no longer contains the exact contiguous durable quorum.', 0, $exception);
         }
@@ -1780,6 +1817,7 @@ final class BlueGreenDeploymentLifecycle
             destinationTopologyDigest: $claim->topologyDigest,
             blueReplicaBackends: $usesReplicaBackends ? $blueReplicaBackends : null,
             greenReplicaBackends: $usesReplicaBackends ? $greenReplicaBackends : null,
+            portContainerNames: $this->portContainerNames($claim),
         );
     }
 
@@ -2461,7 +2499,7 @@ final class BlueGreenDeploymentLifecycle
             ?? throw new DeploymentException('Cannot remove a blue-green candidate without its durable claim.');
         $candidateRows = $this->candidateReplicaRows($claim, allowLegacyScalarFallback: true);
         if ($candidateRows->isNotEmpty()
-            && ! BlueGreenReplicaSet::fromReplicas($candidateRows)->usesScalarCompatibilityPath()) {
+            && ! BlueGreenReplicaSet::fromReplicas($candidateRows, $claim->candidateComposeServices())->usesScalarCompatibilityPath()) {
             $this->bindAvailableCandidateReplicasForRollback($claim);
             $replicas = $this->candidateReplicaRows($claim)
                 ->filter(static fn (ApplicationBlueGreenReplica $replica): bool => $replica->container_id !== null

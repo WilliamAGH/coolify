@@ -56,6 +56,11 @@ final readonly class BlueGreenOperationFence
             || $state->operation_deployment_uuid !== $claim->deploymentUuid
             || $state->routing_revision !== $claim->expectedRoutingRevision
             || $state->operation_candidate_container_name !== $claim->candidateContainerName
+            // The scalar identity names one member, so on its own it cannot tell
+            // a co-rolled operation from a different one that happens to share
+            // that member. Compared as durable bytes, both null for a
+            // single-container destination.
+            || $state->operation_candidate_container_set !== $claim->candidateContainerSetPayload()
             || $state->operation_rollback_managed_filename !== $claim->rollbackManagedFilename
             || $state->deactivation_operation_id !== null
             || $state->deactivation_started_at !== null

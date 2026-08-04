@@ -70,7 +70,10 @@ function extractBalancedBraceContent(string $str, int $startPos = 0): ?array
  */
 function splitOnOperatorOutsideNested(string $content): ?array
 {
-    $operators = [':-', '-', ':?', '?'];
+    // `:+` and `+` are valid Compose modifiers too. Without them `${LOG:+debug}`
+    // yields the key `LOG:+debug`, which fails key validation and aborts the
+    // whole resource parse. Longer forms first so `:+` is not read as `+`.
+    $operators = [':-', ':?', ':+', '-', '?', '+'];
     $depth = 0;
     $len = strlen($content);
 
@@ -136,10 +139,35 @@ function replaceVariables(string $variable): Stringable
     return $str;
 }
 
+/**
+ * Split already-unwrapped interpolation content into its variable name and
+ * default, so `SERVICE_PASSWORD_ADMIN:?` resolves to the name
+ * `SERVICE_PASSWORD_ADMIN`. A modifier left on the name is not a valid
+ * environment variable key.
+ *
+ * @param  string|Stringable  $variable  Content without the outer `${...}`
+ * @return array{name: Stringable, default: ?string, isRequired: bool}
+ */
+function composeVariableInterpolation(string|Stringable $variable): array
+{
+    $content = (string) $variable;
+    $split = splitOnOperatorOutsideNested($content);
+
+    if ($split === null) {
+        return ['name' => str($content), 'default' => null, 'isRequired' => false];
+    }
+
+    return [
+        'name' => str($split['variable']),
+        'default' => $split['default'],
+        'isRequired' => in_array($split['operator'], [':?', '?'], true),
+    ];
+}
+
 function getFilesystemVolumesFromServer(ServiceApplication|ServiceDatabase|Application $oneService, bool $isInit = false)
 {
     try {
-        if ($oneService->getMorphClass() === \App\Models\Application::class) {
+        if ($oneService->getMorphClass() === Application::class) {
             $workdir = $oneService->workdir();
             $server = $oneService->destination->server;
         } else {
@@ -204,7 +232,7 @@ function getFilesystemVolumesFromServer(ServiceApplication|ServiceDatabase|Appli
                 instant_remote_process(["mkdir -p $fileLocation"], $server);
             }
         }
-    } catch (\Throwable $e) {
+    } catch (Throwable $e) {
         return handleError($e);
     }
 }
@@ -214,7 +242,7 @@ function updateCompose(ServiceApplication|ServiceDatabase $resource)
         $name = data_get($resource, 'name');
         $dockerComposeRaw = data_get($resource, 'service.docker_compose_raw');
         if (! $dockerComposeRaw) {
-            throw new \Exception('No compose file found or not a valid YAML file.');
+            throw new Exception('No compose file found or not a valid YAML file.');
         }
         $dockerCompose = Yaml::parse($dockerComposeRaw);
 
@@ -396,7 +424,7 @@ function updateCompose(ServiceApplication|ServiceDatabase $resource)
                 }
             }
         }
-    } catch (\Throwable $e) {
+    } catch (Throwable $e) {
         return handleError($e);
     }
 }
@@ -495,7 +523,7 @@ function applyServiceApplicationPrerequisites(Service $service): void
                 }
             }
         }
-    } catch (\Throwable $e) {
+    } catch (Throwable $e) {
         // Log error but don't throw - prerequisites are nice-to-have, not critical
         Log::error('Failed to apply service application prerequisites', [
             'service_id' => $service->id,

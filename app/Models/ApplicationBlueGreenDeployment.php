@@ -4,9 +4,12 @@ namespace App\Models;
 
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
+use App\Support\BlueGreenComposeTopology;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use JsonException;
+use RuntimeException;
 
 class ApplicationBlueGreenDeployment extends Model
 {
@@ -36,6 +39,7 @@ class ApplicationBlueGreenDeployment extends Model
         'operation_previous_container_id',
         'operation_candidate_container_name',
         'operation_candidate_container_id',
+        'operation_candidate_container_set',
         'operation_rollback_managed_filename',
         'operation_routing_mutated_at',
         'operation_legacy_routing_snapshot_version',
@@ -165,6 +169,62 @@ class ApplicationBlueGreenDeployment extends Model
         return $this->hasMany(ApplicationBlueGreenReplica::class);
     }
 
+    /**
+     * The container every co-rolled member owns for the operation's pending
+     * color, keyed by Compose service. Null and empty both mean the historic
+     * destination that owns exactly one container, whose scalar candidate
+     * identity is already complete.
+     *
+     * @return array<string, string>
+     */
+    public function operationCandidateContainerSet(): array
+    {
+        $encoded = $this->operation_candidate_container_set;
+        if (! is_string($encoded) || trim($encoded) === '') {
+            return [];
+        }
+        try {
+            $decoded = json_decode($encoded, true, flags: JSON_THROW_ON_ERROR);
+        } catch (JsonException) {
+            throw new RuntimeException('The durable blue-green candidate container set is not valid JSON.');
+        }
+        if (! is_array($decoded) || $decoded === []) {
+            throw new RuntimeException('The durable blue-green candidate container set has an invalid record shape.');
+        }
+        $set = [];
+        foreach ($decoded as $service => $containerName) {
+            if (! is_string($service) || $service === '' || ! is_string($containerName) || $containerName === '') {
+                throw new RuntimeException('The durable blue-green candidate container set has an invalid record shape.');
+            }
+            $set[$service] = $containerName;
+        }
+        if (count(array_unique($set)) !== count($set)) {
+            throw new RuntimeException('The durable blue-green candidate container set names one container twice.');
+        }
+        ksort($set);
+
+        return $set;
+    }
+
+    /**
+     * How the durable replica ledger is grouped for the operation's pending
+     * color. Empty for a destination that owns one container.
+     *
+     * @return list<string>
+     */
+    public function operationCandidateComposeServices(): array
+    {
+        $color = $this->pending_color;
+        if (! $color instanceof BlueGreenDeploymentColor) {
+            return [];
+        }
+
+        return array_map(
+            static fn (string $service): string => BlueGreenComposeTopology::colorServiceName($service, $color),
+            array_keys($this->operationCandidateContainerSet()),
+        );
+    }
+
     /** @return array<string, null> */
     public static function clearedOperationAttributes(): array
     {
@@ -177,6 +237,7 @@ class ApplicationBlueGreenDeployment extends Model
             'operation_previous_container_id' => null,
             'operation_candidate_container_name' => null,
             'operation_candidate_container_id' => null,
+            'operation_candidate_container_set' => null,
             'operation_rollback_managed_filename' => null,
             'operation_routing_mutated_at' => null,
             'operation_legacy_routing_snapshot_version' => null,

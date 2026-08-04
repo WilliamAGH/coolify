@@ -140,7 +140,7 @@ final class RecordBlueGreenCandidateIdentity
             ->lockForUpdate()
             ->get();
         try {
-            $replicaSet = BlueGreenReplicaSet::fromReplicas($replicas);
+            $replicaSet = BlueGreenReplicaSet::fromReplicas($replicas, $claim->candidateComposeServices());
         } catch (\InvalidArgumentException $exception) {
             throw new BlueGreenDeploymentTransitionException('The scalar blue-green replica ledger no longer has a contiguous exact candidate slot.', 0, $exception);
         }

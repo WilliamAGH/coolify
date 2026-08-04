@@ -76,10 +76,8 @@ final class ComputeBlueGreenDeploymentFingerprint
             $claim->deploymentUuid,
             $claim->legacyContainerName !== null,
         );
-        $backendPortInventory = BlueGreenBackendPortInventory::fromPorts(
-            $application->blueGreenDeploymentBackendPorts($application->settings)
-                ?? throw new BlueGreenOperationFenceLostException('The blue-green backend port inventory disappeared after the operation was claimed.'),
-        );
+        $backendPortInventory = BlueGreenBackendPortInventory::forApplication($application, $application->settings)
+            ?? throw new BlueGreenOperationFenceLostException('The blue-green backend port inventory disappeared after the operation was claimed.');
         if (! hash_equals($claim->backendPortInventory->serialized, $backendPortInventory->serialized)
             || ! hash_equals($claim->topologyDigest, $fingerprint->topologyDigest)
             || ! hash_equals($claim->routingConfigDigest, $fingerprint->routingConfigDigest)) {

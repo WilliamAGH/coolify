@@ -171,3 +171,29 @@ it('keeps JSON config updates atomic when blue-green opt-out is blocked', functi
     expect($application->fresh()->build_pack)->toBe($originalBuildPack)
         ->and($application->settings()->firstOrFail()->is_static)->toBe($originalStatic);
 });
+
+it('tells an explicit opt-in what to fix instead of telling it to disable', function (): void {
+    // Turning blue-green ON for an ineligible application is not the same
+    // failure as an opted-in application drifting out of eligibility, and the
+    // user cannot act on "disable blue-green deployment first" when the setting
+    // they are switching on is still off.
+    $application = applicationTopologyPersistenceFixture(enableBlueGreen: false);
+    $application->health_check_enabled = false;
+    $application->saveQuietly();
+
+    $setting = $application->fresh()->settings()->firstOrFail();
+    $setting->is_blue_green_deployment_enabled = true;
+
+    try {
+        $setting->save();
+        $message = null;
+    } catch (BlueGreenAdmissionException $exception) {
+        $message = $exception->getMessage();
+    }
+
+    expect($message)->toStartWith('Blue-green deployment cannot be enabled for this application.')
+        ->and($message)->toContain('require either an enabled Coolify healthcheck or a detected image healthcheck')
+        ->and($message)->not->toContain('Disable blue-green deployment first.')
+        ->and($message)->not->toContain('cannot become ineligible')
+        ->and($application->fresh()->settings()->firstOrFail()->is_blue_green_deployment_enabled)->toBeFalse();
+});

@@ -1189,7 +1189,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         $topology = BlueGreenComposeTopology::fromApplication($this->application);
         $this->container_name = $topology->candidateContainerName($this->application, $claim->pendingColor);
         $replicaRows = $this->blueGreenLifecycle->candidateReplicaRows($claim);
-        $replicaSet = BlueGreenReplicaSet::fromReplicas($replicaRows);
+        $replicaSet = BlueGreenReplicaSet::fromReplicas($replicaRows, $claim->candidateComposeServices());
         $this->blueGreenComposeCandidateService = $topology->candidateServiceName($claim->pendingColor);
         $this->blueGreenComposeCandidateServices = $replicaRows
             ->pluck('compose_service')
@@ -1211,7 +1211,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             ?? throw new DeploymentException('Blue-green Compose service resolution has no durable claim.');
         $replicaRows = $this->blueGreenLifecycle?->candidateReplicaRows($claim)
             ?? throw new DeploymentException('Blue-green Compose service resolution has no durable lifecycle owner.');
-        BlueGreenReplicaSet::fromReplicas($replicaRows);
+        BlueGreenReplicaSet::fromReplicas($replicaRows, $claim->candidateComposeServices());
         $this->blueGreenComposeCandidateService = BlueGreenComposeTopology::fromApplication($this->application)
             ->candidateServiceName($claim->pendingColor);
         $this->blueGreenComposeCandidateServices = $replicaRows
@@ -5566,7 +5566,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
     ): array {
         $claimRows = $this->blueGreenLifecycle?->candidateReplicaRows($claim)
             ?? throw new DeploymentException('Blue-green replica rendering has no durable lifecycle owner.');
-        $replicaSet = BlueGreenReplicaSet::fromReplicas($claimRows);
+        $replicaSet = BlueGreenReplicaSet::fromReplicas($claimRows, $claim->candidateComposeServices());
         if ($replicaSet->usesScalarCompatibilityPath()) {
             return $compose;
         }

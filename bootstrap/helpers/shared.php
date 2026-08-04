@@ -2882,8 +2882,14 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
                             'resourceable_id' => $resource->id,
                         ])->first();
                         $value = replaceVariables($value);
-                        $key = $value;
-                        if ($value->startsWith('SERVICE_')) {
+                        // Derive the name and default once, so both branches below agree
+                        // on where the variable name ends and a Compose modifier begins.
+                        $interpolation = composeVariableInterpolation($value);
+                        $key = $interpolation['name'];
+                        if ($key->startsWith('SERVICE_')) {
+                            // Magic variables own their generated value, so the modifier's
+                            // default is discarded rather than kept as part of the key.
+                            $value = $key;
                             $foundEnv = EnvironmentVariable::where([
                                 'key' => $key,
                                 'resourceable_type' => get_class($resource),
@@ -2968,22 +2974,7 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
                                 }
                             }
                         } else {
-                            if ($value->contains(':-')) {
-                                $key = $value->before(':');
-                                $defaultValue = $value->after(':-');
-                            } elseif ($value->contains('-')) {
-                                $key = $value->before('-');
-                                $defaultValue = $value->after('-');
-                            } elseif ($value->contains(':?')) {
-                                $key = $value->before(':');
-                                $defaultValue = $value->after(':?');
-                            } elseif ($value->contains('?')) {
-                                $key = $value->before('?');
-                                $defaultValue = $value->after('?');
-                            } else {
-                                $key = $value;
-                                $defaultValue = null;
-                            }
+                            $defaultValue = $interpolation['default'];
                             $foundEnv = EnvironmentVariable::where([
                                 'key' => $key,
                                 'resourceable_type' => get_class($resource),
@@ -3673,8 +3664,14 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
                         'is_preview' => false,
                     ])->first();
                     $value = replaceVariables($value);
-                    $key = $value;
-                    if ($value->startsWith('SERVICE_')) {
+                    // Derive the name and default once, so both branches below agree
+                    // on where the variable name ends and a Compose modifier begins.
+                    $interpolation = composeVariableInterpolation($value);
+                    $key = $interpolation['name'];
+                    if ($key->startsWith('SERVICE_')) {
+                        // Magic variables own their generated value, so the modifier's
+                        // default is discarded rather than kept as part of the key.
+                        $value = $key;
                         $foundEnv = EnvironmentVariable::where([
                             'key' => $key,
                             'resourceable_type' => get_class($resource),
@@ -3719,22 +3716,7 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
                             }
                         }
                     } else {
-                        if ($value->contains(':-')) {
-                            $key = $value->before(':');
-                            $defaultValue = $value->after(':-');
-                        } elseif ($value->contains('-')) {
-                            $key = $value->before('-');
-                            $defaultValue = $value->after('-');
-                        } elseif ($value->contains(':?')) {
-                            $key = $value->before(':');
-                            $defaultValue = $value->after(':?');
-                        } elseif ($value->contains('?')) {
-                            $key = $value->before('?');
-                            $defaultValue = $value->after('?');
-                        } else {
-                            $key = $value;
-                            $defaultValue = null;
-                        }
+                        $defaultValue = $interpolation['default'];
                         $foundEnv = EnvironmentVariable::where([
                             'key' => $key,
                             'resourceable_type' => get_class($resource),
@@ -3767,14 +3749,17 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
             if ($resource->serviceType()) {
                 $fqdns = generateServiceSpecificFqdns($resource);
             } else {
-                $domains = collect(json_decode($resource->docker_compose_domains)) ?? [];
+                // An application with no per-service domains stores null here, and
+                // passing null to json_decode is deprecated in PHP 8.5. Casting
+                // keeps the existing null-decode result without the warning.
+                $domains = collect(json_decode((string) $resource->docker_compose_domains));
                 if ($domains) {
                     $fqdns = data_get($domains, "$serviceName.domain");
                     if ($fqdns) {
                         $fqdns = str($fqdns)->explode(',');
                         if ($pull_request_id !== 0) {
                             $preview = $resource->previews()->find($preview_id);
-                            $docker_compose_domains = collect(json_decode(data_get($preview, 'docker_compose_domains')));
+                            $docker_compose_domains = collect(json_decode((string) data_get($preview, 'docker_compose_domains')));
                             if ($docker_compose_domains->count() > 0) {
                                 $found_fqdn = data_get($docker_compose_domains, "$serviceName.domain");
                                 if ($found_fqdn) {
