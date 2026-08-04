@@ -15,6 +15,12 @@ services:
       - REGISTRY_AUTH=htpasswd
       - REGISTRY_AUTH_HTPASSWD_REALM=Registry Realm
       - REGISTRY_AUTH_HTPASSWD_PATH=/auth/registry.password
+      # registry:3 builds an OTLP trace exporter by default and falls back to
+      # localhost:4318, so a registry with no collector beside it logs a
+      # connection-refused error for every export attempt. Opt out explicitly;
+      # set this to otlp and point OTEL_EXPORTER_OTLP_ENDPOINT at a collector to
+      # turn tracing back on.
+      - OTEL_TRACES_EXPORTER=none
     command: ["/entrypoint.sh"]
     volumes:
       - registry-data:/var/lib/registry
