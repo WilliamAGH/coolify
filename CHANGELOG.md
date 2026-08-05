@@ -6,6 +6,17 @@ All notable changes to this project will be documented in this file.
 
 ### 🐛 Bug Fixes
 
+- *(api)* Release a deployment stranded after a newer operation took over
+- *(deps)* Move the production base image past two high-severity PHP CVEs
+
+### 📚 Documentation
+
+- Update changelog
+
+## [4.13.63-fork] - 2026-08-05
+
+### 🐛 Bug Fixes
+
 - *(blue-green)* Unblock deployments after a retirement needs intervention
 - *(blue-green)* Resolve a spent drain budget instead of stranding DRAINING
 - *(blue-green)* Make the drain budget durable and fence break-glass recovery
