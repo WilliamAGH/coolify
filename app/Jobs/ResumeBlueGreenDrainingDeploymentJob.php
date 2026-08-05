@@ -74,6 +74,8 @@ final class ResumeBlueGreenDrainingDeploymentJob implements ShouldQueue
             }
             $lifecycle->resumeDrainingOperation();
             if ($lifecycle->wasFinalizedFallbackRecovered()) {
+                (new ApplicationDeploymentJob($deployment->id))->completeBlueGreenFallbackTermination();
+
                 return;
             }
             (new ApplicationDeploymentJob($deployment->id))->completeBlueGreenDrainRecovery();

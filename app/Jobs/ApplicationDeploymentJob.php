@@ -525,6 +525,12 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
                 if ($this->blueGreenLifecycle->isDrainingRecovery()) {
                     $this->blueGreenLifecycle->resumeDrainingOperation();
                     if ($this->blueGreenLifecycle->wasFinalizedFallbackRecovered()) {
+                        // No recovery preservation here: the fallback already wrote
+                        // its terminal row, so the ordinary cleanup this return
+                        // falls through to — helper-container removal above all —
+                        // is exactly the cleanup this deployment still owes.
+                        $this->completeBlueGreenFallbackTermination();
+
                         return;
                     }
                     $this->transitionToStatus(ApplicationDeploymentStatus::FINISHED);
@@ -7664,6 +7670,30 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
     {
         $this->hydrateDeploymentContext();
         $this->finalizeBlueGreenCompletion();
+    }
+
+    /**
+     * The finalized fixed-color fallback restores the predecessor and terminalizes
+     * its own candidate queue row inside one durable transition, so the ordinary
+     * FAILED transition is already a no-op by the time control returns here — it
+     * refuses to act on a row that is in a terminal state. The two obligations
+     * that transition still owns are not optional: without the failure
+     * notification the operator is never told the release was rolled back, and
+     * without draining the queue every successor already queued behind this
+     * destination waits forever on a row that is terminal. The fallback's own
+     * compare-and-set is what makes this exactly-once — it publishes FAILED only
+     * from an IN_PROGRESS DRAINING owner, so this finalizer can never re-notify.
+     */
+    public function completeBlueGreenFallbackTermination(): void
+    {
+        $this->hydrateDeploymentContext();
+        $this->application_deployment_queue->refresh();
+        if ($this->application_deployment_queue->status !== ApplicationDeploymentStatus::FAILED->value) {
+            throw new DeploymentException('The finalized blue-green fallback did not leave its exact terminal failed queue owner behind.');
+        }
+
+        $this->handleStatusTransition(ApplicationDeploymentStatus::FAILED);
+        queue_next_deployment($this->application_deployment_queue);
     }
 
     /**

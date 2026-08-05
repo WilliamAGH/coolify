@@ -6,6 +6,7 @@ use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
 use App\Actions\Application\BlueGreen\BlueGreenOperationFence;
+use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\ComputeBlueGreenDeploymentFingerprint;
 use App\Actions\Application\BlueGreen\DrainBlueGreenPreviousContainer;
 use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
@@ -31,6 +32,7 @@ use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\ProxyTypes;
 use App\Exceptions\DeploymentException;
+use App\Jobs\ApplicationDeploymentJob;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
@@ -45,7 +47,9 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Process\FakeProcessResult;
 use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Notification;
 use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Storage;
 use Symfony\Component\Yaml\Yaml;
 
@@ -395,6 +399,65 @@ it('terminalizes a finalized fallback when the predecessor runtime route digest 
         ->and($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value);
 });
 
+it('advances the successor queued behind a finalized fallback that terminalized its own row', function (): void {
+    Queue::fake();
+    Notification::fake();
+    $fixture = fixedColorBlueGreenRecoveryFixture(
+        BlueGreenDeploymentPhase::DRAINING,
+        stageSpecificPreviousRoute: true,
+    );
+    $currentState = $fixture['candidateConfiguration']->state;
+    $restoredState = $fixture['previousConfiguration']->state->withDestinationFenceEpoch(
+        $currentState->destinationFenceEpoch + 1,
+        FIXED_COLOR_CANDIDATE_DEPLOYMENT,
+        $currentState->mutationSequence + 1,
+    );
+    $fixture['state']->update([
+        'destination_fence_epoch' => $restoredState->destinationFenceEpoch,
+        'destination_fence_operation_id' => $restoredState->operationId,
+        'destination_fence_mutation_sequence' => $restoredState->mutationSequence,
+        'managed_file_sha256' => $restoredState->managedSha256,
+        'destination_topology_digest' => $restoredState->destinationTopologyDigest,
+        'application_routing_config_digest' => $restoredState->applicationRoutingConfigDigest,
+    ]);
+    $successor = ApplicationDeploymentQueue::query()->create([
+        'application_id' => $fixture['application']->id,
+        'server_id' => $fixture['server']->id,
+        'destination_id' => $fixture['destination']->id,
+        'deployment_uuid' => 'fixed-color-queued-successor',
+        'pull_request_id' => 0,
+        'status' => ApplicationDeploymentStatus::QUEUED->value,
+    ]);
+
+    TransitionsBlueGreenDeployment::finishFinalizedFixedColorFallback(
+        $fixture['claim'],
+        $fixture['previousExpectation'],
+        $restoredState,
+    );
+
+    // The fallback writes its own terminal FAILED row inside the durable
+    // transition, which makes the ordinary FAILED transition a no-op — it refuses
+    // to act on a row already in a terminal state. Both callers used to just
+    // return here, so the two obligations that transition owns were silently
+    // dropped and every successor queued behind this destination waited forever
+    // on a row that had already finished.
+    expect($successor->fresh()->status)->toBe(ApplicationDeploymentStatus::QUEUED->value);
+
+    (new ApplicationDeploymentJob($fixture['deployment']->id))->completeBlueGreenFallbackTermination();
+
+    expect($successor->fresh()->status)->not->toBe(ApplicationDeploymentStatus::QUEUED->value);
+});
+
+it('refuses to finalize a fallback termination that left no terminal failed row behind', function (): void {
+    $fixture = fixedColorBlueGreenRecoveryFixture(BlueGreenDeploymentPhase::DRAINING);
+
+    // Guards the finalizer against being reached on any path but the fallback's
+    // own: notifying failure and draining the queue for a row still in flight
+    // would hand the destination to a successor mid-operation.
+    expect(fn () => (new ApplicationDeploymentJob($fixture['deployment']->id))->completeBlueGreenFallbackTermination())
+        ->toThrow(DeploymentException::class, 'exact terminal failed queue owner');
+});
+
 it('starts a reconstructed fixed-color routing operation at mutation sequence one', function (): void {
     $fixture = fixedColorBlueGreenRecoveryFixture(BlueGreenDeploymentPhase::PREPARING);
     $previousBytes = $fixture['previousConfiguration']->state->serialize();
@@ -595,7 +658,7 @@ it('drains every immutable predecessor port when the live application dropped a 
         ->and($fixture['state']->fresh()->operation_drain_last_observed_connections)->toBe(1);
 });
 
-it('stops the exact predecessor with the configured grace and no further observation once the budget is spent', function (): void {
+it('completes a spent drain budget without re-observing or stopping the managed predecessor inline', function (): void {
     config(['constants.ssh.mux_enabled' => false]);
     $fixture = fixedColorBlueGreenRecoveryFixture(BlueGreenDeploymentPhase::DRAINING);
     $operation = ReconstructBlueGreenDeploymentRecovery::run($fixture['state']);
@@ -611,29 +674,33 @@ it('stops the exact predecessor with the configured grace and no further observa
     setFixedColorRecoveryLifecycleProperty($lifecycle, 'enabled', true);
     setFixedColorRecoveryLifecycleProperty($lifecycle, 'claim', $operation->claim);
     setFixedColorRecoveryLifecycleProperty($lifecycle, 'previousContainerExpectation', $operation->previousContainer);
+    setFixedColorRecoveryLifecycleProperty($lifecycle, 'candidateContainerExpectation', $operation->candidateContainer);
     setFixedColorRecoveryLifecycleProperty($lifecycle, 'destinationState', $operation->currentDestinationState);
     setFixedColorRecoveryLifecycleProperty($lifecycle, 'operationFence', $fence);
 
+    // The exhausted-drain path only resolves while the candidate it already routed
+    // still holds its exact identity and health, so both containers answer here.
     InspectBlueGreenContainer::shouldRun()
         ->atLeast()
         ->once()
-        ->andReturn(new BlueGreenContainerInspection(
+        ->andReturnUsing(static fn ($server, BlueGreenContainerExpectation $expectation): BlueGreenContainerInspection => new BlueGreenContainerInspection(
             exists: true,
-            dockerId: FIXED_COLOR_PREVIOUS_CONTAINER_ID,
+            dockerId: $expectation->dockerId,
             status: 'running',
             health: 'healthy',
         ));
     $observationCommands = [];
-    $mutationCommands = [];
-    Process::fake(function (PendingProcess $process) use (&$mutationCommands, &$observationCommands): FakeProcessResult {
+    $stopCommands = [];
+    Process::fake(function (PendingProcess $process) use (&$stopCommands, &$observationCommands): FakeProcessResult {
         $command = is_array($process->command)
             ? implode(' ', $process->command)
             : (string) $process->command;
         if (str_contains($command, 'target_port')) {
             $observationCommands[] = $command;
         }
-        if (str_contains($command, 'container_journal_stage=')) {
-            $mutationCommands[] = $command;
+        if (str_contains($command, base64_encode('docker stop --time='))
+            || str_contains($command, 'docker stop --time=')) {
+            $stopCommands[] = $command;
         }
         if (str_contains($command, '/proc/sys/kernel/random/boot_id')) {
             return Process::result(output: FIXED_COLOR_BOOT_ID);
@@ -642,31 +709,27 @@ it('stops the exact predecessor with the configured grace and no further observa
         return Process::result(output: '1');
     });
 
+    // Driven through the production entry point rather than the retirement helper
+    // it guards. Calling the helper directly proved a forced-stop command contract
+    // for a branch this exact fixture never takes, which is how a managed
+    // predecessor could look covered while nothing exercised what really happens.
+    setFixedColorRecoveryLifecycleProperty($lifecycle, 'drainingRecovery', true);
     try {
-        $lifecycle->retirePreviousContainer(force: true);
-    } catch (Throwable) {
-        // The durable completion plumbing is proven by its own tests; this test
-        // owns the forced-retirement command contract issued to the host.
+        $lifecycle->resolveExhaustedDrainingOperation();
     } finally {
         $lifecycle->release();
     }
 
-    $stopGrace = $operation->application->settings->deploymentStopGracePeriodSeconds();
-    $expectedMutationScript = implode("\n", [
-        'set -eu',
-        ...(new DrainBlueGreenPreviousContainer)->forcedStopCommandsFor(
-            $operation->previousContainer,
-            $stopGrace,
-        ),
-    ])."\n";
-
     // A spent budget must not re-observe backend connections against a deadline
-    // that can never pass again, and the stop must still carry the operator's
-    // configured Docker grace period rather than a shortened one.
+    // that can never pass again. It also must not stop the managed predecessor
+    // here: that container is already unrouted and belongs to the inactive
+    // retirement owner, which honours the configured retention window and is
+    // rediscovered by the blue-green:retire-inactive scheduler. What the spent
+    // budget owes is completion, so the destination stops fencing new deployments.
     expect($observationCommands)->toBeEmpty()
-        ->and($mutationCommands)->not->toBeEmpty()
-        ->and($mutationCommands[0])->toContain(base64_encode($expectedMutationScript))
-        ->and($expectedMutationScript)->toContain("docker stop --time={$stopGrace}");
+        ->and($stopCommands)->toBeEmpty()
+        ->and($fixture['state']->fresh()->phase)->toBe(BlueGreenDeploymentPhase::IDLE)
+        ->and(ClaimBlueGreenDeployment::stateIsCleanlyClaimable($fixture['state']->fresh()))->toBeTrue();
 });
 
 it('backfills an unchanged in-flight owner inventory before reconstructing a fixed-color recovery', function (): void {
