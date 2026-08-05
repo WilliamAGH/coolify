@@ -516,8 +516,16 @@ it('rolls back an exact successor document, releases its own empty freeze, and i
             static fn (): never => throw new RuntimeException('A terminal generation rollback must not execute remote work on replay.'),
         );
 
+        // Acknowledgement and completion are two distinct moments — routes proven
+        // restored, then the mutation freeze released — each stamped by its own
+        // step. Asserting they are the same string only held while both landed
+        // inside one second, so this failed on whichever run happened to straddle
+        // a second boundary. What the rollback actually owes is that both are
+        // recorded and that they are in order.
         expect($rolledBack->phase)->toBe(ControlPlaneGenerationPromotionPhase::RolledBack)
-            ->and($rolledBack->rollbackAcknowledgedAt)->toBe($rolledBack->rolledBackAt)
+            ->and($rolledBack->rollbackAcknowledgedAt)->not->toBeNull()
+            ->and($rolledBack->rolledBackAt)->not->toBeNull()
+            ->and($rolledBack->rollbackAcknowledgedAt)->toBeLessThanOrEqual($rolledBack->rolledBackAt)
             ->and($replayed->toArray())->toBe($rolledBack->toArray())
             ->and($commands)->toBe([
                 $writerCommand,
