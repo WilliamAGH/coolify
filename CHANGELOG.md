@@ -7,9 +7,11 @@ All notable changes to this project will be documented in this file.
 ### 🐛 Bug Fixes
 
 - *(blue-green)* Unblock deployments after a retirement needs intervention
+- *(blue-green)* Resolve a spent drain budget instead of stranding DRAINING
 
 ### 📚 Documentation
 
+- Update changelog
 - Update changelog
 - Update changelog
 
