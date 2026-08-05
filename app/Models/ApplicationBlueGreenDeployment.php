@@ -225,6 +225,30 @@ class ApplicationBlueGreenDeployment extends Model
         );
     }
 
+    /**
+     * How the durable replica ledger for one colour and release is grouped.
+     *
+     * The operation's own recorded set wins while that operation is still the
+     * one in flight, because it is what the interrupted process actually
+     * started; once the operation is cleared the topology as it now stands is
+     * the only owner left. A ledger that no longer groups under the answer
+     * fails closed in the reader rather than resolving to containers this
+     * colour may not own.
+     *
+     * @return list<string>
+     */
+    public function candidateComposeServicesFor(
+        BlueGreenDeploymentColor $color,
+        string $deploymentUuid,
+        ?Application $application = null,
+    ): array {
+        if ($this->operation_deployment_uuid === $deploymentUuid && $this->pending_color === $color) {
+            return $this->operationCandidateComposeServices();
+        }
+
+        return ($application ?? $this->application)?->blueGreenCandidateComposeServices($color) ?? [];
+    }
+
     /** @return array<string, null> */
     public static function clearedOperationAttributes(): array
     {

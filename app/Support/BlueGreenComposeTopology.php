@@ -149,12 +149,33 @@ final class BlueGreenComposeTopology
         BlueGreenDeploymentColor $color,
         ?string $service = null,
     ): string {
-        $coRolled = $this->coRolledServices();
-        if (count($coRolled) === 1 || $service === null || $service === $this->routedService) {
-            return "{$application->uuid}-{$color->value}";
+        return self::colorContainerName(
+            (string) $application->uuid,
+            $color,
+            $service,
+            $this->routedService,
+            count($this->coRolledServices()) > 1,
+        );
+    }
+
+    /**
+     * The one rule that names the container a co-rolled member owns for a
+     * colour. Static because eligibility has to prove those identities are free
+     * before a topology exists to ask, and re-spelling the rule there would fork
+     * this owner.
+     */
+    public static function colorContainerName(
+        string $applicationUuid,
+        BlueGreenDeploymentColor $color,
+        ?string $service,
+        string $routedService,
+        bool $isCoRolledSet,
+    ): string {
+        if (! $isCoRolledSet || $service === null || $service === $routedService) {
+            return "{$applicationUuid}-{$color->value}";
         }
 
-        return "{$application->uuid}-{$service}-{$color->value}";
+        return "{$applicationUuid}-{$service}-{$color->value}";
     }
 
     /**
@@ -222,6 +243,45 @@ final class BlueGreenComposeTopology
     }
 
     /**
+     * Whether the parsed Compose document mounts `$name` at `$mountPath` for a
+     * fixed sidecar.
+     *
+     * A fixed sidecar is never re-rolled, so its volume survives a colour swap
+     * untouched and is safe to record. Storage that no sidecar declares is not
+     * covered by that argument — and the routed and co-rolled members are
+     * separately proved stateless — so it stays refused.
+     */
+    public function declaresFixedSidecarVolume(Application $application, string $name, string $mountPath): bool
+    {
+        if ($name === '' || $mountPath === '') {
+            return false;
+        }
+        $services = self::parsedCompose($application)['services'] ?? null;
+        if (! is_array($services)) {
+            return false;
+        }
+
+        foreach ($this->fixedSidecars as $sidecar) {
+            $service = $services[$sidecar['serviceName']] ?? null;
+            if (! is_array($service)) {
+                continue;
+            }
+            foreach (self::listValues($service['volumes'] ?? []) as $volume) {
+                if (is_string($volume) && $volume === "{$name}:{$mountPath}") {
+                    return true;
+                }
+                if (is_array($volume)
+                    && ($volume['source'] ?? null) === $name
+                    && ($volume['target'] ?? null) === $mountPath) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
      * @return array{version: int, routed_service: string, backend_port: int, legacy_container_name: string, routing_labels: list<string>, fixed_sidecars: list<array{serviceName: string, containerName: string}>}
      */
     public function fingerprintPayload(): array
@@ -255,7 +315,10 @@ final class BlueGreenComposeTopology
      * dependencies before a candidate can be rendered.
      *
      * @param  array<array-key, mixed>  $compose
-     * @param  list<string>  $blueGreenLabels
+     * @param  list<string>|array<string, list<string>>  $blueGreenLabels  One list applied to every
+     *                                                                     co-rolled member, or a list per member
+     *                                                                     Compose service so each member
+     *                                                                     advertises only the port it serves.
      * @return array<array-key, mixed>
      */
     public function renderCandidate(
@@ -280,6 +343,7 @@ final class BlueGreenComposeTopology
         foreach ($coRolled as $member) {
             $candidateNames[$member] = $this->candidateServiceName($color, $member);
         }
+        $labelsForMember = self::memberLabelResolver($blueGreenLabels, $candidateNames);
 
         foreach ($services as $serviceName => $service) {
             if (! is_string($serviceName) || ! is_array($service)) {
@@ -326,7 +390,7 @@ final class BlueGreenComposeTopology
                         );
                         $replica['labels'] = self::candidateLabels(
                             $replica['labels'] ?? [],
-                            [...$blueGreenLabels, ...$replicaSet->labels($replicaIndex)],
+                            [...$labelsForMember($serviceName), ...$replicaSet->labels($replicaIndex)],
                             $replicaService,
                         );
                         $replica['environment'] = self::setEnvironmentValue(
@@ -351,7 +415,7 @@ final class BlueGreenComposeTopology
             );
             $service['labels'] = self::candidateLabels(
                 $service['labels'] ?? [],
-                $blueGreenLabels,
+                $labelsForMember($serviceName),
                 $memberCandidateContainer,
             );
             $service['environment'] = self::setEnvironmentValue(
@@ -365,6 +429,36 @@ final class BlueGreenComposeTopology
         $compose['services'] = $renderedServices;
 
         return $compose;
+    }
+
+    /**
+     * Resolves the blue-green labels one co-rolled member is rendered with.
+     *
+     * A single list is the historic shape and is applied to every member
+     * unchanged. A map is keyed by the member's own candidate Compose service,
+     * which is how a destination routing several services gives each member
+     * only the backend port it actually serves. A member missing from the map
+     * is refused rather than silently rendered with a sibling's routing.
+     *
+     * @param  list<string>|array<string, list<string>>  $blueGreenLabels
+     * @param  array<string, string>  $candidateNames
+     * @return callable(string): list<string>
+     */
+    private static function memberLabelResolver(array $blueGreenLabels, array $candidateNames): callable
+    {
+        if (array_is_list($blueGreenLabels)) {
+            return static fn (string $member): array => $blueGreenLabels;
+        }
+
+        return static function (string $member) use ($blueGreenLabels, $candidateNames): array {
+            $candidateService = $candidateNames[$member] ?? null;
+            $labels = $candidateService === null ? null : ($blueGreenLabels[$candidateService] ?? null);
+            if (! is_array($labels) || ! array_is_list($labels)) {
+                throw new InvalidArgumentException("The co-rolled blue-green member `{$member}` has no rendered routing labels.");
+            }
+
+            return $labels;
+        };
     }
 
     /**
@@ -538,44 +632,31 @@ final class BlueGreenComposeTopology
             $portOwners[$routing['port']] = $eachRoutedService;
         }
 
-        // PHASE GATE — remove with the port-discriminated routing target.
-        // The topology below can already model and render a co-rolled set, but a
-        // color still owns exactly one tracked candidate container in the durable
-        // claim, the on-disk fence record, and the retirement plan. Admitting a
-        // set now would start containers that nothing owns, so this stays closed.
-        if (count($coRolledServices) > 1) {
-            $others = array_values(array_diff($coRolledServices, [$routedService]));
-            sort($others);
-
-            if (count($routedServiceNames) > 1) {
-                return [
-                    'topology' => null,
-                    'reason' => 'Blue-green Docker Compose routed services `'.implode('`, `', $routedServiceNames)
-                        .'` must swap color together, and re-rolling more than one service together is not supported yet.',
-                ];
-            }
-
-            return [
-                'topology' => null,
-                'reason' => 'Blue-green Docker Compose service `'.implode('`, `', $others)
-                    ."` must be re-rolled with routed service `{$routedService}` because it addresses it, and re-rolling more than one service together is not supported yet.",
-            ];
-        }
-
+        // Every co-rolled member is rendered per colour, so every member's
+        // generated service and container identity has to be free — not just
+        // the routed one's.
         foreach ([BlueGreenDeploymentColor::BLUE, BlueGreenDeploymentColor::GREEN] as $color) {
-            $candidateService = "{$routedService}-{$color->value}";
-            if (array_key_exists($candidateService, $services)) {
-                return ['topology' => null, 'reason' => "Blue-green Docker Compose routed service `{$routedService}` conflicts with reserved color service `{$candidateService}`."];
-            }
-            $candidateContainer = "{$application->uuid}-{$color->value}";
-            if (! ValidationPatterns::isValidContainerName($candidateContainer)) {
-                return ['topology' => null, 'reason' => 'Blue-green Docker Compose generated candidate container identity is invalid.'];
-            }
-            if (isset($servicesByContainerName[$candidateContainer])) {
-                return [
-                    'topology' => null,
-                    'reason' => "Blue-green Docker Compose routed service `{$routedService}` conflicts with generated candidate container `{$candidateContainer}` used by service `{$servicesByContainerName[$candidateContainer]}`.",
-                ];
+            foreach ($coRolledServices as $coRolledService) {
+                $candidateService = self::colorServiceName($coRolledService, $color);
+                if (array_key_exists($candidateService, $services)) {
+                    return ['topology' => null, 'reason' => "Blue-green Docker Compose routed service `{$coRolledService}` conflicts with reserved color service `{$candidateService}`."];
+                }
+                $candidateContainer = self::colorContainerName(
+                    (string) $application->uuid,
+                    $color,
+                    $coRolledService,
+                    $routedService,
+                    count($coRolledServices) > 1,
+                );
+                if (! ValidationPatterns::isValidContainerName($candidateContainer)) {
+                    return ['topology' => null, 'reason' => 'Blue-green Docker Compose generated candidate container identity is invalid.'];
+                }
+                if (isset($servicesByContainerName[$candidateContainer])) {
+                    return [
+                        'topology' => null,
+                        'reason' => "Blue-green Docker Compose routed service `{$coRolledService}` conflicts with generated candidate container `{$candidateContainer}` used by service `{$servicesByContainerName[$candidateContainer]}`.",
+                    ];
+                }
             }
         }
 
@@ -966,11 +1047,12 @@ final class BlueGreenComposeTopology
         $generatedRoutedServiceEnvironment = 'SERVICE_NAME_'.strtoupper(self::normalizeServiceName($routedService));
         $coRolled = $coRolledServices === [] ? [$routedService] : $coRolledServices;
         foreach ($services as $serviceName => $service) {
-            // Co-rolled services are re-rendered per color with their depends_on
-            // and environment endpoints rewritten, so only those two checks are
-            // waived for them. Static links, shared namespaces, volumes_from and
-            // extends are still proved for every service exactly as before,
-            // because none of those follow a color swap.
+            // Co-rolled services are re-rendered per color with exactly the
+            // references renderCandidate() rewrites — depends_on, environment
+            // endpoints and links — so only those checks are waived for them.
+            // Shared namespaces, volumes_from, external_links and extends are
+            // still proved for every service, because the renderer does not
+            // rewrite those and they cannot follow a color swap.
             $isCoRolled = in_array($serviceName, $coRolled, true);
             if (! $isCoRolled && self::dependsOnService($service['depends_on'] ?? null, $routedServiceReferences)) {
                 return "Blue-green Docker Compose service `{$serviceName}` cannot depend on routed service `{$routedService}` because fixed sidecars are not re-rolled during a color swap.";
@@ -1011,7 +1093,7 @@ final class BlueGreenComposeTopology
                     return "Blue-green Docker Compose service `{$serviceName}` cannot mount from routed service `{$routedService}`.";
                 }
             }
-            foreach (self::listValues($service['links'] ?? []) as $value) {
+            foreach ($isCoRolled ? [] : self::listValues($service['links'] ?? []) as $value) {
                 if (self::referencesRoutedService($value, $routedServiceReferences)) {
                     return "Blue-green Docker Compose service `{$serviceName}` cannot link to routed service `{$routedService}` because fixed sidecars cannot refresh a static link.";
                 }
@@ -1163,8 +1245,11 @@ final class BlueGreenComposeTopology
         array $rawServiceNames,
         Collection $productionRuntimeEnvironmentVariables,
     ): array {
+        // Compose's interpolation grammar, not just the bare forms: a generated
+        // secret reaches the processed document as `${VAR:?}`, and `${VAR:-x}`
+        // is ordinary Compose. Refusing those refused a value that does resolve.
         preg_match_all(
-            '/(?<!\$)\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/',
+            '/(?<!\$)\$(?:\{([A-Za-z_][A-Za-z0-9_]*)(?:(:?[-?+])([^{}$]*))?\}|([A-Za-z_][A-Za-z0-9_]*))/',
             $value,
             $matches,
             PREG_SET_ORDER,
@@ -1182,40 +1267,55 @@ final class BlueGreenComposeTopology
 
         $resolvedValue = $value;
         foreach ($matches as $match) {
-            $runtimeKey = $match[1] !== '' ? $match[1] : $match[2];
+            $runtimeKey = ($match[1] ?? '') !== '' ? $match[1] : ($match[4] ?? '');
+            $operator = $match[2] ?? '';
+            $fallback = $match[3] ?? '';
+            $unresolvedReason = [
+                'value' => $value,
+                'reason' => "Blue-green Docker Compose service `{$serviceName}` cannot resolve processed environment `{$environmentKey}` runtime variable `{$runtimeKey}` exactly from production application environment.",
+            ];
             $generatedServiceNames = array_values(array_filter(
                 $rawServiceNames,
                 static fn (string $rawServiceName): bool => $runtimeKey === 'SERVICE_NAME_'.strtoupper(
                     self::normalizeServiceName($rawServiceName),
                 ),
             ));
+            $runtimeValue = null;
             if (count($generatedServiceNames) === 1) {
                 $runtimeValue = $generatedServiceNames[0];
             } else {
                 $variables = $productionRuntimeEnvironmentVariables->get($runtimeKey, collect());
-                if ($generatedServiceNames !== []
-                    || ! $variables instanceof Collection
-                    || $variables->count() !== 1) {
-                    return [
-                        'value' => $value,
-                        'reason' => "Blue-green Docker Compose service `{$serviceName}` cannot resolve processed environment `{$environmentKey}` runtime variable `{$runtimeKey}` exactly from production application environment.",
-                    ];
+                if ($generatedServiceNames !== [] || ! $variables instanceof Collection || $variables->count() > 1) {
+                    return $unresolvedReason;
                 }
-                $runtimeEnvironmentVariable = $variables->first();
-                $runtimeValue = $runtimeEnvironmentVariable->get_real_environment_variables_with_server(
-                    $runtimeEnvironmentVariable->value,
-                    $application,
-                    $application->destination?->server,
-                );
+                if ($variables->count() === 1) {
+                    $runtimeEnvironmentVariable = $variables->first();
+                    $runtimeValue = $runtimeEnvironmentVariable->get_real_environment_variables_with_server(
+                        $runtimeEnvironmentVariable->value,
+                        $application,
+                        $application->destination?->server,
+                    );
+                }
             }
-            if (! is_string($runtimeValue)
-                || preg_match('/(?<!\$)\$(?:\{|[A-Za-z_])/', $runtimeValue) === 1) {
-                return [
-                    'value' => $value,
-                    'reason' => "Blue-green Docker Compose service `{$serviceName}` cannot resolve processed environment `{$environmentKey}` runtime variable `{$runtimeKey}` exactly from production application environment.",
-                ];
+            if ($runtimeValue !== null && ! is_string($runtimeValue)) {
+                return $unresolvedReason;
             }
-            $resolvedValue = str_replace($match[0], $runtimeValue, $resolvedValue);
+
+            // `:-` and `:+` treat an empty value as unset; `-` and `+` only act
+            // on a genuinely unset variable. Anything else — including the
+            // required `:?`/`?` forms — is the variable's own value.
+            $treatsEmptyAsUnset = str_starts_with($operator, ':');
+            $isUnset = $runtimeValue === null || ($treatsEmptyAsUnset && $runtimeValue === '');
+            $substitution = match (substr($operator, -1)) {
+                '-' => $isUnset ? $fallback : $runtimeValue,
+                '+' => $isUnset ? '' : $fallback,
+                default => $runtimeValue,
+            };
+            if (! is_string($substitution)
+                || preg_match('/(?<!\$)\$(?:\{|[A-Za-z_])/', $substitution) === 1) {
+                return $unresolvedReason;
+            }
+            $resolvedValue = str_replace($match[0], $substitution, $resolvedValue);
         }
         if (preg_match('/(?<!\$)\$(?:\{|[A-Za-z_])/', $resolvedValue) === 1) {
             return [

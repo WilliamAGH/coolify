@@ -1451,7 +1451,10 @@ class Application extends BaseModel
 
     public function isBlueGreenStandaloneDockerDestinationConfigured(StandaloneDocker $destination): bool
     {
-        if (! $this->exists || (int) $destination->id < 1 || (int) $destination->server_id < 1) {
+        // Coolify reserves id 0 for instance-owned rows, including the
+        // `localhost` server every single-server install deploys to by default,
+        // so only a negative id is unset here.
+        if (! $this->exists || (int) $destination->id < 0 || (int) $destination->server_id < 0) {
             return false;
         }
 
@@ -1471,7 +1474,7 @@ class Application extends BaseModel
         if (! $this->exists) {
             throw new RuntimeException('An application must exist before an additional destination can be attached.');
         }
-        if ((int) $destination->id < 1 || (int) $destination->server_id < 1) {
+        if ((int) $destination->id < 0 || (int) $destination->server_id < 0) {
             throw new RuntimeException('An additional destination must belong to one exact server.');
         }
 
@@ -1690,6 +1693,39 @@ class Application extends BaseModel
         );
     }
 
+    /**
+     * The Compose container names this application's durable blue-green state
+     * has already pinned, keyed by Compose service.
+     *
+     * generateApplicationContainerName embeds the wall clock, so re-parsing an
+     * unchanged Compose document would rename every fixed identity, churn the
+     * persisted topology digest and recreate stateful sidecars. While durable
+     * state exists, the persisted legacy routed name and every fixed sidecar
+     * name are authoritative; co-rolled members are rendered per colour and
+     * carry no durable vanilla identity.
+     *
+     * @return array<string, string>
+     */
+    public function blueGreenPinnedComposeContainerNames(): array
+    {
+        if ($this->build_pack !== 'dockercompose' || ! $this->hasBlueGreenDurableState()) {
+            return [];
+        }
+        $persistedApplication = clone $this;
+        $persistedApplication->setRawAttributes($this->getRawOriginal(), sync: true);
+        $topology = BlueGreenComposeTopology::tryFromApplication($persistedApplication);
+        if ($topology === null) {
+            return [];
+        }
+
+        $pinned = [$topology->routedService => $topology->legacyRoutedContainerName];
+        foreach ($topology->fixedSidecars() as $sidecar) {
+            $pinned[$sidecar['serviceName']] = $sidecar['containerName'];
+        }
+
+        return $pinned;
+    }
+
     private function assertBlueGreenComposeSidecarIdentitiesUnchanged(): void
     {
         if (! $this->isDirty([
@@ -1713,12 +1749,27 @@ class Application extends BaseModel
         }
     }
 
-    public function prepareBlueGreenStorageAddition(): void
+    public function prepareBlueGreenStorageAddition(?LocalPersistentVolume $volume = null): void
     {
         $setting = $this->settings()->first();
         $this->assertBlueGreenTopologyMutationAllowed();
         $hasDurableState = $this->hasBlueGreenDurableState();
         if (! $this->isBlueGreenDeploymentOptedIn($setting) && ! $hasDurableState) {
+            return;
+        }
+        // A volume the parsed Compose document declares for a fixed sidecar is
+        // permitted: that sidecar is never re-rolled, so the volume survives a
+        // colour swap untouched, which is exactly why eligibility exempts a
+        // parsed Compose application from the writable-storage conflict.
+        // Refusing it outright left an opted-in Compose application unable to
+        // record its own sidecars' volumes at all. Anything else still fails.
+        if ($volume !== null
+            && $this->build_pack === 'dockercompose'
+            && ($this->blueGreenComposeTopology()?->declaresFixedSidecarVolume(
+                $this,
+                (string) $volume->name,
+                (string) $volume->mount_path,
+            ) ?? false)) {
             return;
         }
         if ($hasDurableState) {

@@ -263,3 +263,22 @@ it('dispatches proxy network reconciliation only after the destination transacti
         app()->detectEnvironment(static fn (): string => $environment);
     }
 });
+
+it('accepts the reserved instance server as a configured blue-green destination', function (): void {
+    // Coolify reserves id 0 for instance-owned rows, including the `localhost`
+    // server every single-server install deploys to by default. Treating 0 as
+    // "unset" silently refused blue-green on the default topology.
+    $team = Team::factory()->create();
+    $server = Server::factory()->create(['id' => 0, 'team_id' => $team->id]);
+    $destination = $server->standaloneDockers()->firstOrFail();
+
+    $project = Project::factory()->create(['team_id' => $team->id]);
+    $application = Application::factory()->create([
+        'environment_id' => $project->environments()->firstOrFail()->id,
+        'destination_id' => $destination->id,
+        'destination_type' => $destination->getMorphClass(),
+    ]);
+
+    expect((int) $destination->server_id)->toBe(0)
+        ->and($application->isBlueGreenStandaloneDockerDestinationConfigured($destination))->toBeTrue();
+});

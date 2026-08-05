@@ -344,6 +344,94 @@ it('groups the durable replica ledger by co-rolled member rather than by index a
         ->and($replicaSet->usesScalarCompatibilityPath())->toBeFalse();
 });
 
+it('inspects every co-rolled member through its own durable Compose identity', function (): void {
+    $rows = collect([
+        ['compose_service' => 'llm_gateway-blue', 'replica_index' => 1],
+        ['compose_service' => 'queue-blue', 'replica_index' => 1],
+    ])->map(static function (array $attributes): ApplicationBlueGreenReplica {
+        $replica = new ApplicationBlueGreenReplica;
+        $replica->forceFill([
+            ...$attributes,
+            'application_id' => 41,
+            'color' => BlueGreenDeploymentColor::BLUE,
+            'deployment_uuid' => 'co-rolled-release',
+            'routing_revision' => 12,
+            'compose_project' => 'application-project',
+        ]);
+
+        return $replica;
+    });
+    $replicaSet = BlueGreenReplicaSet::fromReplicas($rows, ['llm_gateway-blue', 'queue-blue']);
+    $inspector = new InspectBlueGreenReplicaSet;
+
+    $command = $inspector->commandFor($rows, $replicaSet);
+
+    // One replica per member emits no replica fan-out labels at all, so a
+    // filter naming a replicaCount would match nothing that was ever started.
+    expect($command)->toContain(
+        'label=com.docker.compose.service=llm_gateway-blue',
+        'label=com.docker.compose.service=queue-blue',
+    )
+        ->and($command)->not->toContain('coolify.blueGreen.replicaCount')
+        ->and($command)->not->toContain('coolify.blueGreen.replicaIndex');
+
+    // Both members sit at replica index 1, so a shell variable keyed by that
+    // index would have the second member overwrite the first.
+    expect(substr_count($command, 'coolify_replica_'))->toBeGreaterThanOrEqual(4)
+        ->and(preg_match_all('/(coolify_replica_[A-Za-z0-9_]+)=\$\(/', $command, $assigned))->toBe(2)
+        ->and(array_unique($assigned[1]))->toHaveCount(2);
+
+    $output = $rows->map(static function (ApplicationBlueGreenReplica $replica): string {
+        return json_encode([
+            'Id' => hash('sha256', $replica->compose_service),
+            'Name' => '/'.$replica->compose_service,
+            'State' => ['Status' => 'running', 'Health' => ['Status' => 'healthy']],
+            'Config' => ['Labels' => [
+                'coolify.applicationId' => '41',
+                'coolify.pullRequestId' => '0',
+                'coolify.blueGreen.managed' => 'true',
+                'coolify.blueGreen.deploymentUuid' => 'co-rolled-release',
+                'coolify.blueGreen.color' => 'blue',
+                'coolify.blueGreen.routingRevision' => '12',
+                'com.docker.compose.project' => 'application-project',
+                'com.docker.compose.service' => $replica->compose_service,
+            ]],
+        ], JSON_THROW_ON_ERROR);
+    })->implode("\n");
+
+    $inspections = $inspector->parse($output, $rows, $replicaSet);
+
+    expect($inspections)->toHaveCount(2)
+        ->and(array_column($inspections, 'composeService'))->toBe(['llm_gateway-blue', 'queue-blue'])
+        ->and(array_column($inspections, 'containerName'))->toBe(['llm_gateway-blue', 'queue-blue']);
+
+    // Both members are reported, so the available parse must key by the member
+    // rather than by the replica index the two of them share.
+    $availableOutput = $rows->map(static function (ApplicationBlueGreenReplica $replica) use ($rows): string {
+        $offset = $rows->values()->search(
+            static fn (ApplicationBlueGreenReplica $row): bool => $row->compose_service === $replica->compose_service,
+        );
+
+        return $offset."\t".json_encode([
+            'Id' => hash('sha256', $replica->compose_service),
+            'Name' => '/'.$replica->compose_service,
+            'State' => ['Status' => 'running', 'Health' => ['Status' => 'healthy']],
+            'Config' => ['Labels' => [
+                'coolify.applicationId' => '41',
+                'coolify.pullRequestId' => '0',
+                'coolify.blueGreen.managed' => 'true',
+                'coolify.blueGreen.deploymentUuid' => 'co-rolled-release',
+                'coolify.blueGreen.color' => 'blue',
+                'coolify.blueGreen.routingRevision' => '12',
+                'com.docker.compose.project' => 'application-project',
+                'com.docker.compose.service' => $replica->compose_service,
+            ]],
+        ], JSON_THROW_ON_ERROR);
+    })->implode("\n");
+
+    expect($inspector->parseAvailable($availableOutput, $rows, $replicaSet))->toHaveCount(2);
+});
+
 it('proves replica contiguity inside every co-rolled member group', function (): void {
     $rows = collect([
         ['compose_service' => 'llm_gateway-blue-replica-1', 'replica_index' => 1],
@@ -847,7 +935,7 @@ it('parses exactly one provenance-matched Docker identity per replica slot', fun
         ], JSON_THROW_ON_ERROR);
     })->implode("\n");
     $inspector = new InspectBlueGreenReplicaSet;
-    $inspections = $inspector->parse($output, $replicas, 3);
+    $inspections = $inspector->parse($output, $replicas, new BlueGreenReplicaSet(3));
 
     expect($inspections)->toHaveCount(3)
         ->and(array_column($inspections, 'replicaIndex'))->toBe([1, 2, 3])
@@ -856,18 +944,18 @@ it('parses exactly one provenance-matched Docker identity per replica slot', fun
             'application-blue-replica-2-1',
             'application-blue-replica-3-1',
         ])
-        ->and($inspector->commandFor($replicas, 3))->toContain(
+        ->and($inspector->commandFor($replicas, new BlueGreenReplicaSet(3)))->toContain(
             'docker ps -aq --no-trunc',
             'label=coolify.blueGreen.replicaIndex=1',
             'label=com.docker.compose.service=application-blue-replica-3',
         )
-        ->and($inspector->availableCommandFor($replicas, 3))->toContain('docker ps -aq --no-trunc');
+        ->and($inspector->availableCommandFor($replicas, new BlueGreenReplicaSet(3)))->toContain('docker ps -aq --no-trunc');
 
     expect(fn () => $inspector->parse(str_replace(
         '"coolify.blueGreen.replicaCount":"3"',
         '"coolify.blueGreen.replicaCount":"2"',
         $output,
-    ), $replicas, 3))->toThrow(RuntimeException::class, 'replicaCount');
+    ), $replicas, new BlueGreenReplicaSet(3)))->toThrow(RuntimeException::class, 'replicaCount');
 });
 
 it('deactivation removes each replica only through its immutable identity and provenance', function (): void {
@@ -1003,7 +1091,7 @@ it('fails closed when a durable replica ledger omits a contiguous slot', functio
 
     expect(fn (): BlueGreenReplicaSet => BlueGreenReplicaSet::fromReplicas($replicas))
         ->toThrow(InvalidArgumentException::class, 'contiguous replica index exactly once')
-        ->and(fn (): string => (new InspectBlueGreenReplicaSet)->availableCommandFor($replicas, 2))
+        ->and(fn (): string => (new InspectBlueGreenReplicaSet)->availableCommandFor($replicas, new BlueGreenReplicaSet(2)))
         ->toThrow(RuntimeException::class, 'contiguous claimed quorum');
 });
 
@@ -1414,3 +1502,123 @@ it('reconstructs the reserved replica quorum after the setting changes', functio
     'three to one' => [3, 1],
     'one to three' => [1, 3],
 ]);
+
+it('plans removal of every co-rolled member of a colour, including a partially started one', function (): void {
+    $rows = collect([
+        ['compose_service' => 'llm_gateway-blue', 'container_name' => 'app-blue', 'container_id' => str_repeat('a', 64)],
+        ['compose_service' => 'queue-blue', 'container_name' => 'app-queue-blue', 'container_id' => str_repeat('b', 64)],
+    ])->map(static function (array $attributes): ApplicationBlueGreenReplica {
+        $replica = new ApplicationBlueGreenReplica;
+        $replica->forceFill([
+            ...$attributes,
+            'application_blue_green_deployment_id' => 7,
+            'application_id' => 41,
+            'standalone_docker_id' => 3,
+            'deployment_uuid' => 'co-rolled-release',
+            'color' => BlueGreenDeploymentColor::BLUE,
+            'routing_revision' => 12,
+            'replica_index' => 1,
+            'compose_project' => 'application-project',
+        ]);
+
+        return $replica;
+    });
+    $claim = new BlueGreenDeploymentClaim(
+        stateId: 7,
+        applicationId: 41,
+        standaloneDockerId: 3,
+        pendingColor: BlueGreenDeploymentColor::BLUE,
+        previousActiveColor: null,
+        deploymentUuid: 'co-rolled-release',
+        expectedRoutingRevision: 12,
+        destinationFenceEpoch: 1,
+        serverBootId: '11111111-1111-1111-1111-111111111111',
+        topologyDigest: hash('sha256', 'co-rolled-topology'),
+        routingConfigDigest: hash('sha256', 'co-rolled-routing'),
+        backendPortInventory: BlueGreenBackendPortInventory::fromPorts([8000, 8080], [8000 => 'llm_gateway', 8080 => 'queue']),
+        drainBackendPortInventory: null,
+        supersessionGeneration: 1,
+        legacyContainerName: null,
+        replicaCount: 1,
+        candidateContainerName: 'app-blue',
+        rollbackManagedFilename: 'co-rolled-rollback.yaml',
+        candidateContainerNames: ['llm_gateway' => 'app-blue', 'queue' => 'app-queue-blue'],
+    );
+
+    [$commands] = (new RemoveBlueGreenReplicaSet)->commandsFor($claim, $rows);
+    $joined = implode("\n", $commands);
+
+    // Both members are planned for removal, each through its own durable
+    // identity, and neither is asserted to carry replica fan-out labels that a
+    // one-replica member never had.
+    expect($joined)->toContain(str_repeat('a', 64), str_repeat('b', 64))
+        ->and($joined)->toContain('label=com.docker.compose.service=llm_gateway-blue')
+        ->and($joined)->toContain('label=com.docker.compose.service=queue-blue')
+        ->and($joined)->not->toContain('coolify.blueGreen.replicaCount');
+
+    // A crash can leave only one member started; the survivor is still planned.
+    [$partialCommands] = (new RemoveBlueGreenReplicaSet)->commandsFor($claim, $rows->take(1));
+
+    expect(implode("\n", $partialCommands))->toContain(str_repeat('a', 64))
+        ->and(implode("\n", $partialCommands))->not->toContain(str_repeat('b', 64));
+});
+
+it('admits one inspection per co-rolled member when binding a colour', function (): void {
+    $fixture = exactBlueGreenReplicaBindingFixture(1);
+    $claim = $fixture['claim'];
+    $coRolled = new BlueGreenDeploymentClaim(
+        stateId: $claim->stateId,
+        applicationId: $claim->applicationId,
+        standaloneDockerId: $claim->standaloneDockerId,
+        pendingColor: $claim->pendingColor,
+        previousActiveColor: null,
+        deploymentUuid: $claim->deploymentUuid,
+        expectedRoutingRevision: $claim->expectedRoutingRevision,
+        destinationFenceEpoch: $claim->destinationFenceEpoch,
+        serverBootId: $claim->serverBootId,
+        topologyDigest: $claim->topologyDigest,
+        routingConfigDigest: $claim->routingConfigDigest,
+        backendPortInventory: $claim->backendPortInventory,
+        drainBackendPortInventory: null,
+        supersessionGeneration: $claim->supersessionGeneration,
+        legacyContainerName: null,
+        replicaCount: 1,
+        candidateContainerName: $claim->candidateContainerName,
+        rollbackManagedFilename: $claim->rollbackManagedFilename,
+        candidateContainerNames: [
+            'gateway' => $claim->candidateContainerName,
+            'queue' => $claim->candidateContainerName.'-queue',
+        ],
+    );
+
+    // Two members at one replica each is two containers, which is the colour's
+    // promotion threshold — not a breach of the claimed quorum.
+    expect(fn () => (new BindBlueGreenReplicaSet)->handle($coRolled, [
+        BlueGreenReplicaInspection::fromRuntime(1, 'gateway-blue', 'app-blue', str_repeat('a', 64), 'running', 'healthy'),
+        BlueGreenReplicaInspection::fromRuntime(1, 'queue-blue', 'app-queue-blue', str_repeat('b', 64), 'running', 'healthy'),
+    ]))->not->toThrow(RuntimeException::class, 'outside the claimed blue-green operation quorum');
+});
+
+it('binds a reserved slot whose container name was pinned before Docker gave it an id', function (): void {
+    $replica = new ApplicationBlueGreenReplica;
+    $replica->forceFill([
+        'container_name' => 'app-queue-blue',
+        'container_id' => null,
+    ]);
+
+    // A co-rolled member rendered under its own name has container_name pinned
+    // by the Compose document at reserve time; only an id without a name is
+    // genuinely partial.
+    expect(fn () => (new ReflectionMethod(BindBlueGreenReplicaSet::class, 'bindExactReplicaInspection'))
+        ->invoke(new BindBlueGreenReplicaSet, $replica, BlueGreenReplicaInspection::fromRuntime(
+            1, 'queue-blue', 'app-queue-blue', str_repeat('c', 64), 'running', 'healthy',
+        )))->not->toThrow(RuntimeException::class, 'partial container identity');
+
+    $mismatched = new ApplicationBlueGreenReplica;
+    $mismatched->forceFill(['container_name' => null, 'container_id' => str_repeat('d', 64)]);
+
+    expect(fn () => (new ReflectionMethod(BindBlueGreenReplicaSet::class, 'bindExactReplicaInspection'))
+        ->invoke(new BindBlueGreenReplicaSet, $mismatched, BlueGreenReplicaInspection::fromRuntime(
+            1, 'queue-blue', 'app-queue-blue', str_repeat('d', 64), 'running', 'healthy',
+        )))->toThrow(RuntimeException::class, 'partial container identity');
+});

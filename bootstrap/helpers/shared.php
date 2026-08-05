@@ -3210,7 +3210,10 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
         if ($pull_request_id !== 0) {
             $definedNetwork = collect(["{$resource->uuid}-$pull_request_id"]);
         }
-        $services = collect($services)->map(function ($service, $serviceName) use ($topLevelVolumes, $topLevelNetworks, $definedNetwork, $isNew, $generatedServiceFQDNS, $resource, $server, $pull_request_id, $preview_id) {
+        $blueGreenPinnedContainerNames = $pull_request_id === 0 && $resource instanceof Application
+            ? $resource->blueGreenPinnedComposeContainerNames()
+            : [];
+        $services = collect($services)->map(function ($service, $serviceName) use ($topLevelVolumes, $topLevelNetworks, $definedNetwork, $isNew, $generatedServiceFQDNS, $resource, $server, $pull_request_id, $preview_id, $blueGreenPinnedContainerNames) {
             $serviceVolumes = collect(data_get($service, 'volumes', []));
             $servicePorts = collect(data_get($service, 'ports', []));
             $serviceNetworks = collect(data_get($service, 'networks', []));
@@ -3246,7 +3249,7 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
             }
 
             $baseName = generateApplicationContainerName($resource, $pull_request_id);
-            $containerName = "$serviceName-$baseName";
+            $containerName = $blueGreenPinnedContainerNames[$serviceName] ?? "$serviceName-$baseName";
             if ($resource->compose_parsing_version === '1') {
                 if (count($serviceVolumes) > 0) {
                     $serviceVolumes = $serviceVolumes->map(function ($volume) use ($resource, $topLevelVolumes, $pull_request_id) {

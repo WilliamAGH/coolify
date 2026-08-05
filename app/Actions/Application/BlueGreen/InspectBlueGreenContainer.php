@@ -59,11 +59,10 @@ class InspectBlueGreenContainer
     public function exactReplicaMutationAssertionsFor(
         BlueGreenContainerExpectation $expectation,
         int $replicaIndex,
-        int $replicaCount,
+        BlueGreenReplicaSet $replicaSet,
         string $composeProject,
         string $composeService,
     ): array {
-        $replicaSet = new BlueGreenReplicaSet($replicaCount);
         if (! $expectation->blueGreenManaged
             || ! in_array($replicaIndex, $replicaSet->indexes(), true)
             || trim($composeProject) === ''
@@ -71,21 +70,18 @@ class InspectBlueGreenContainer
             throw new InvalidArgumentException('A replica mutation requires complete replica and Compose provenance.');
         }
         $containerId = escapeshellarg($expectation->dockerId);
-        $assertions = [
-            ...$this->exactIdentityAssertionsFor($expectation),
-            $this->labelAssertion($containerId, 'coolify.blueGreen.replicaIndex', (string) $replicaIndex),
-            $this->labelAssertion($containerId, 'coolify.blueGreen.replicaCount', (string) $replicaSet->count),
-            $this->labelAssertion($containerId, 'com.docker.compose.project', $composeProject),
-            $this->labelAssertion($containerId, 'com.docker.compose.service', $composeService),
-        ];
-        $replicaFilters = implode(' ', [
-            $this->blueGreenProvenanceFilters($expectation),
-            '--filter '.escapeshellarg('label=coolify.blueGreen.replicaIndex='.$replicaIndex),
-            '--filter '.escapeshellarg('label=coolify.blueGreen.replicaCount='.$replicaSet->count),
-            '--filter '.escapeshellarg('label=com.docker.compose.project='.$composeProject),
-            '--filter '.escapeshellarg('label=com.docker.compose.service='.$composeService),
-        ]);
-        $assertions[] = 'test "$(docker ps -aq --no-trunc '.$replicaFilters.')" = '.$containerId;
+        // The replica fan-out provenance comes from the set that rendered it, so
+        // a co-rolled member rendered under its own name is never asserted to
+        // carry labels that were never written. Its Compose service is unique
+        // across the colour, which is what identifies it.
+        $replicaLabels = $replicaSet->labelMap($replicaIndex);
+        $assertions = $this->exactIdentityAssertionsFor($expectation);
+        $replicaFilters = [$this->blueGreenProvenanceFilters($expectation)];
+        foreach ([...$replicaLabels, 'com.docker.compose.project' => $composeProject, 'com.docker.compose.service' => $composeService] as $label => $value) {
+            $assertions[] = $this->labelAssertion($containerId, $label, $value);
+            $replicaFilters[] = '--filter '.escapeshellarg("label={$label}={$value}");
+        }
+        $assertions[] = 'test "$(docker ps -aq --no-trunc '.implode(' ', $replicaFilters).')" = '.$containerId;
 
         return $assertions;
     }
@@ -106,7 +102,7 @@ class InspectBlueGreenContainer
     public function runningReplicaMutationCompletionAssertionsFor(
         BlueGreenContainerExpectation $expectation,
         int $replicaIndex,
-        int $replicaCount,
+        BlueGreenReplicaSet $replicaSet,
         string $composeProject,
         string $composeService,
     ): array {
@@ -116,7 +112,7 @@ class InspectBlueGreenContainer
         $assertions = $this->exactReplicaMutationAssertionsFor(
             $expectation,
             $replicaIndex,
-            $replicaCount,
+            $replicaSet,
             $composeProject,
             $composeService,
         );

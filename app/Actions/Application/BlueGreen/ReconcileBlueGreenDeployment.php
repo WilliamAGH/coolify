@@ -314,7 +314,7 @@ final class ReconcileBlueGreenDeployment
         $claim = $operation->claim;
         $candidateReplicas = $this->candidateReplicaInspections($operation);
         if ($candidateReplicas !== []) {
-            (new BlueGreenReplicaSet($claim->replicaCount))->assertPromotionThreshold($candidateReplicas);
+            $this->claimReplicaSet($operation)->assertPromotionThreshold($candidateReplicas);
         }
         $previousReplicas = $this->previousReplicaInspections($operation);
         $plan = PlanBlueGreenForwardRecovery::run($operation, $candidateReplicas, $previousReplicas);
@@ -368,7 +368,7 @@ final class ReconcileBlueGreenDeployment
     ): BlueGreenReconciliationResult {
         $claim = $operation->claim;
         $phase = $operation->recoveredPhase;
-        $replicaCandidate = ! (new BlueGreenReplicaSet($claim->replicaCount))->usesScalarCompatibilityPath();
+        $replicaCandidate = ! $this->claimReplicaSet($operation)->usesScalarCompatibilityPath();
         $candidateReplicas = $replicaCandidate
             ? $this->availableCandidateReplicaInspections($operation)
             : [];
@@ -384,6 +384,27 @@ final class ReconcileBlueGreenDeployment
         $previousInspection = null;
         $previousReplicas = [];
         $legacySnapshot = $operation->legacyRoutingSnapshot;
+        // A pending mutation journal replays forward under the managed-file lock
+        // before any later mutation runs, so an operation that crashed between its
+        // remote mutation and its durable recording may still hold a live route it
+        // owns. Only the operation's own pending-color state is claimed here; any
+        // other live shape keeps the durable view authoritative.
+        $liveMutatedState = null;
+        if (! $operation->routingMutationRecorded
+            && $operation->currentDestinationState !== null
+            && hash_equals($claim->deploymentUuid, $operation->currentDestinationState->operationId)) {
+            $liveState = ReadBlueGreenManagedRouteMetadata::run(
+                $operation->server,
+                $operation->application,
+                $operation->destination,
+            );
+            if ($liveState !== null
+                && hash_equals($claim->deploymentUuid, $liveState->operationId)
+                && $liveState->activeDeploymentUuid === $claim->deploymentUuid
+                && $liveState->activeColor === $claim->pendingColor) {
+                $liveMutatedState = $liveState;
+            }
+        }
         if ($operation->routingMutationRecorded) {
             $artifact = BlueGreenProxyRollbackArtifactReader::run($operation->server, $operation->rollbackKey);
             if ($artifact === null) {
@@ -441,7 +462,7 @@ final class ReconcileBlueGreenDeployment
                         $this->replicaExpectation($operation->previousContainer, $previousReplica),
                         $this->containerInspection($previousReplica),
                         $previousReplica->replicaIndex,
-                        count($previousReplicas),
+                        $this->previousReplicaSet($operation),
                         (string) $operation->application->uuid,
                         $previousReplica->composeService,
                     );
@@ -487,6 +508,29 @@ final class ReconcileBlueGreenDeployment
             }
         }
 
+        if ($liveMutatedState !== null) {
+            $liveArtifact = BlueGreenProxyRollbackArtifactReader::run($operation->server, $operation->rollbackKey);
+            if ($liveArtifact === null) {
+                throw new BlueGreenDeploymentTransitionException('The live-mutated unrecorded route has no exact rollback artifact.');
+            }
+            $operationFence->assertDeploymentOwnership($claim, [$phase]);
+            // The journal mutation provably reached the destination; record it
+            // durably before undoing it so every fence step stays monotonic.
+            RecordBlueGreenDestinationState::run($claim, $operation->currentDestinationState, $liveMutatedState);
+            $restoredState = $this->restoredStateFrom($operation, $liveMutatedState);
+            $operationFence->assertDeploymentOwnership($claim, [$phase]);
+            (new BlueGreenProxyRollbackArtifactRestorer)->restoreFromCurrentState(
+                $operation->server,
+                $operation->rollbackKey,
+                $liveMutatedState,
+                $restoredState,
+                $claim->serverBootId,
+            );
+            RecordBlueGreenDestinationState::run($claim, $liveMutatedState, $restoredState);
+            $currentState = $restoredState;
+            $artifact = $liveArtifact;
+        }
+
         if ($boundCandidateReplicas !== []) {
             $operationFence->assertDeploymentOwnership($claim, [$phase]);
             $currentState = (new RemoveBlueGreenReplicaSet)->handle(
@@ -528,7 +572,7 @@ final class ReconcileBlueGreenDeployment
     /** @return list<BlueGreenReplicaInspection> */
     private function candidateReplicaInspections(BlueGreenDeploymentRecoveryOperation $operation): array
     {
-        if ((new BlueGreenReplicaSet($operation->claim->replicaCount))->usesScalarCompatibilityPath()) {
+        if ($this->claimReplicaSet($operation)->usesScalarCompatibilityPath()) {
             return [];
         }
 
@@ -540,7 +584,15 @@ final class ReconcileBlueGreenDeployment
             $operation->claim->deploymentUuid,
             $operation->claim->pendingColor,
             $operation->claim->expectedRoutingRevision,
+            $this->claimReplicaSet($operation),
+        );
+    }
+
+    private function claimReplicaSet(BlueGreenDeploymentRecoveryOperation $operation): BlueGreenReplicaSet
+    {
+        return new BlueGreenReplicaSet(
             $operation->claim->replicaCount,
+            $operation->claim->candidateComposeServices(),
         );
     }
 
@@ -555,7 +607,7 @@ final class ReconcileBlueGreenDeployment
             $operation->claim->deploymentUuid,
             $operation->claim->pendingColor,
             $operation->claim->expectedRoutingRevision,
-            $operation->claim->replicaCount,
+            $this->claimReplicaSet($operation),
         );
     }
 
@@ -570,15 +622,15 @@ final class ReconcileBlueGreenDeployment
         }
 
         $state = $this->replicaState($operation);
-        $count = ApplicationBlueGreenReplica::query()
+        $rows = ApplicationBlueGreenReplica::query()
             ->where('application_blue_green_deployment_id', $state->id)
             ->where('application_id', $state->application_id)
             ->where('standalone_docker_id', $state->standalone_docker_id)
             ->where('deployment_uuid', $previous->deploymentUuid)
             ->where('color', $previous->color->value)
             ->where('routing_revision', $previous->routingRevision)
-            ->count();
-        if ($count <= DEFAULT_BLUE_GREEN_REPLICA_COUNT) {
+            ->get();
+        if ($rows->count() <= DEFAULT_BLUE_GREEN_REPLICA_COUNT) {
             return [];
         }
 
@@ -588,13 +640,46 @@ final class ReconcileBlueGreenDeployment
             $previous->deploymentUuid,
             $previous->color,
             $previous->routingRevision,
-            $count,
+            BlueGreenReplicaSet::fromReplicas($rows, $state->candidateComposeServicesFor(
+                $previous->color,
+                $previous->deploymentUuid,
+            )),
         );
         if (BlueGreenReplicaSet::identityDigest($replicas) !== $previous->dockerId) {
             throw new BlueGreenDeploymentTransitionException('The predecessor replica set no longer matches its exact durable aggregate identity.');
         }
 
         return $replicas;
+    }
+
+    /**
+     * How the outgoing colour's ledger groups, resolved from the durable state
+     * rather than counted back off the inspections in hand.
+     */
+    private function previousReplicaSet(BlueGreenDeploymentRecoveryOperation $operation): BlueGreenReplicaSet
+    {
+        $previous = $operation->previousContainer;
+        if ($previous?->deploymentUuid === null || $previous->color === null || $previous->routingRevision === null) {
+            throw new BlueGreenDeploymentTransitionException('The predecessor replica set has no durable provenance.');
+        }
+        $state = $this->replicaState($operation);
+        $rows = ApplicationBlueGreenReplica::query()
+            ->where('application_blue_green_deployment_id', $state->id)
+            ->where('application_id', $state->application_id)
+            ->where('standalone_docker_id', $state->standalone_docker_id)
+            ->where('deployment_uuid', $previous->deploymentUuid)
+            ->where('color', $previous->color->value)
+            ->where('routing_revision', $previous->routingRevision)
+            ->get();
+
+        try {
+            return BlueGreenReplicaSet::fromReplicas($rows, $state->candidateComposeServicesFor(
+                $previous->color,
+                $previous->deploymentUuid,
+            ));
+        } catch (\InvalidArgumentException $exception) {
+            throw new BlueGreenDeploymentTransitionException('The predecessor replica ledger no longer groups under its durable members.', 0, $exception);
+        }
     }
 
     private function replicaState(BlueGreenDeploymentRecoveryOperation $operation): ApplicationBlueGreenDeployment

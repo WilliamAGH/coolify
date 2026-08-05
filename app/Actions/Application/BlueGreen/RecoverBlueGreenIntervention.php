@@ -941,19 +941,20 @@ final class RecoverBlueGreenIntervention
         try {
             $operationFence->assertLockOwnership();
             $absentRoutePredecessor = $this->persistedAbsentRoutePredecessor($context['state']);
-            $liveState = $absentRoutePredecessor === null
-                ? ReadBlueGreenManagedRouteMetadata::run(
-                    $context['server'],
-                    $context['application'],
-                    $context['destination'],
-                )
-                : AttestBlueGreenDestinationState::run(
+            $liveState = ReadBlueGreenManagedRouteMetadata::run(
+                $context['server'],
+                $context['application'],
+                $context['destination'],
+            );
+            if ($liveState === null && $absentRoutePredecessor !== null) {
+                $liveState = AttestBlueGreenDestinationState::run(
                     $context['server'],
                     $context['application'],
                     $context['destination'],
                     null,
                     $absentRoutePredecessor,
                 );
+            }
             $operationFence->assertLockOwnership();
             if (! $this->liveRouteCanBeReconciled($context['state'], $liveState)) {
                 $this->audit('blue_green.intervention.midflight_manual_only', $plan, $reason, [
@@ -1514,9 +1515,20 @@ final class RecoverBlueGreenIntervention
         }
         if ($state->operation_previous_active_color === null) {
             $previousState = $this->persistedAbsentRoutePredecessor($state);
+            if ($previousState === null) {
+                return false;
+            }
+            if ($liveState->provesSameManagedRouteAs($previousState, $operationUuid)) {
+                return true;
+            }
 
-            return $previousState !== null
-                && $liveState->provesSameManagedRouteAs($previousState, $operationUuid);
+            // The pending mutation journal replays forward under the managed-file
+            // lock before any later mutation runs, so an interrupted first adoption
+            // may legitimately find its own replacement route live while the durable
+            // row still records the predecessor fence.
+            return $liveState->activeColor === $pendingColor
+                && $liveState->activeDeploymentUuid === $operationUuid
+                && $liveState->operationId === $operationUuid;
         }
         if ($liveState->activeColor === null
             || ! $activeColor instanceof BlueGreenDeploymentColor) {

@@ -1200,7 +1200,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             compose: convertToArray($composeFile),
             application: $this->application,
             color: $claim->pendingColor,
-            blueGreenLabels: $this->blueGreenComposeCandidateLabels($claim),
+            blueGreenLabels: $this->blueGreenComposeCandidateLabels($claim, $topology),
             replicaCount: $replicaSet->count,
         );
     }
@@ -1220,21 +1220,45 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             ->all();
     }
 
-    /** @return list<string> */
-    private function blueGreenComposeCandidateLabels(BlueGreenDeploymentClaim $claim): array
-    {
-        $backendPort = $this->application->blueGreenDeploymentBackendPort()
-            ?? throw new DeploymentException('The blue-green Compose routed service has no exact backend port.');
-        $labels = generateBlueGreenApplicationContainerLabels(
-            $this->application,
-            (int) $this->destination->id,
-            $claim->pendingColor,
-            $claim->expectedRoutingRevision,
-            $backendPort,
-        );
-        $labels[] = "coolify.blueGreen.deploymentUuid={$claim->deploymentUuid}";
-        $labels[] = 'coolify.blueGreen.releaseProof='
-            .BlueGreenRoutingTarget::durableReleaseProofToken($claim->deploymentUuid);
+    /**
+     * The blue-green labels every co-rolled member is rendered with, keyed by
+     * the candidate Compose service that member becomes.
+     *
+     * Each member advertises only the backend port it owns, so 8080 reaches the
+     * service that serves it and no member is discoverable on a sibling's port.
+     * A destination that re-rolls exactly one service has one entry whose
+     * served ports are its whole inventory, which is byte-identical to the
+     * single list earlier releases rendered.
+     *
+     * @return array<string, list<string>>
+     */
+    private function blueGreenComposeCandidateLabels(
+        BlueGreenDeploymentClaim $claim,
+        BlueGreenComposeTopology $topology,
+    ): array {
+        $backendPorts = $claim->backendPortInventory->ports();
+        $servicePorts = $topology->candidateServicePorts();
+        $provenance = [
+            "coolify.blueGreen.deploymentUuid={$claim->deploymentUuid}",
+            'coolify.blueGreen.releaseProof='
+                .BlueGreenRoutingTarget::durableReleaseProofToken($claim->deploymentUuid),
+        ];
+
+        $labels = [];
+        foreach ($topology->coRolledServices() as $member) {
+            $servedPort = $servicePorts[$member] ?? null;
+            $labels[$topology->candidateServiceName($claim->pendingColor, $member)] = [
+                ...generateBlueGreenApplicationContainerLabels(
+                    $this->application,
+                    (int) $this->destination->id,
+                    $claim->pendingColor,
+                    $claim->expectedRoutingRevision,
+                    $backendPorts,
+                    $servedPort === null ? [] : [$servedPort],
+                ),
+                ...$provenance,
+            ];
+        }
 
         return $labels;
     }
@@ -3190,9 +3214,11 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             throw new DeploymentException('Blue-green Compose preparation has no candidate or first-adoption sidecar images to attest.');
         }
 
+        $resolvedImages = $this->resolveBlueGreenComposeImageReferences();
         $images = [];
         foreach ($services as $service) {
-            $image = $this->resolveBlueGreenComposeImageReference($service);
+            $image = $resolvedImages[$service]
+                ?? throw new DeploymentException("Blue-green Compose service {$service} did not resolve to exactly one immutable image reference.");
             $images[] = [
                 'service' => $service,
                 'image' => $image,
@@ -3207,33 +3233,63 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
         return $images;
     }
 
-    private function resolveBlueGreenComposeImageReference(string $service): string
+    /**
+     * Every prepared Compose service mapped to the exact image it resolves to.
+     *
+     * Read from the interpolated project configuration rather than from
+     * `config --images <service>`, because that prints the images of the named
+     * service *and* of everything it depends on. A co-rolled member that
+     * addresses a sibling therefore never resolved to a single reference, and
+     * two members with different images could not be told apart at all.
+     *
+     * @return array<string, string>
+     */
+    private function resolveBlueGreenComposeImageReferences(): array
     {
-        $saveName = 'prepared_compose_image_reference_'.substr(hash('sha256', $service), 0, 16);
         $this->execute_remote_command([
-            executeInDocker($this->deployment_uuid, $this->blueGreenComposePreparedImageReferenceCommand($service)),
+            executeInDocker($this->deployment_uuid, $this->blueGreenComposePreparedConfigurationCommand()),
             'hidden' => true,
-            'save' => $saveName,
+            'save' => 'prepared_compose_configuration',
             'append' => false,
         ]);
-        $references = array_values(array_filter(
-            preg_split('/\R/', trim((string) $this->saved_outputs->get($saveName))) ?: [],
-            static fn (string $reference): bool => $reference !== '',
-        ));
-        if (count($references) !== 1
-            || preg_match('/[\x00-\x1f\x7f]/', $references[0]) === 1) {
-            throw new DeploymentException("Blue-green Compose service {$service} did not resolve to exactly one immutable image reference.");
+
+        try {
+            $configuration = json_decode(
+                trim((string) $this->saved_outputs->get('prepared_compose_configuration')),
+                true,
+                flags: JSON_THROW_ON_ERROR,
+            );
+        } catch (JsonException $exception) {
+            throw new DeploymentException('Blue-green Compose preparation could not read the interpolated project configuration.', 0, $exception);
+        }
+        $services = data_get($configuration, 'services');
+        if (! is_array($services)) {
+            throw new DeploymentException('Blue-green Compose preparation could not read the interpolated project configuration.');
         }
 
-        return $references[0];
+        $images = [];
+        foreach ($services as $service => $definition) {
+            $image = is_array($definition) ? ($definition['image'] ?? null) : null;
+            if (! is_string($service)
+                || ! is_string($image)
+                || $image === ''
+                || preg_match('/[\x00-\x1f\x7f]/', $image) === 1) {
+                continue;
+            }
+            $images[$service] = $image;
+        }
+
+        return $images;
     }
 
-    private function blueGreenComposePreparedImageReferenceCommand(string $service): string
+    private function blueGreenComposePreparedConfigurationCommand(): string
     {
         $safeComposePath = escapeshellarg("{$this->workdir}{$this->docker_compose_location}");
 
+        // Compose writes the configuration document to stdout and its
+        // diagnostics to stderr; the capture must hold only the document.
         return "{$this->coolify_variables} docker compose --env-file ".self::BUILD_TIME_ENV_PATH
-            ." --project-name {$this->application->uuid} --project-directory {$this->workdir} -f {$safeComposePath} config --images ".escapeshellarg($service);
+            ." --project-name {$this->application->uuid} --project-directory {$this->workdir} -f {$safeComposePath} config --format json 2>/dev/null";
     }
 
     private function inspectBlueGreenComposeImageId(string $image, string $service): string

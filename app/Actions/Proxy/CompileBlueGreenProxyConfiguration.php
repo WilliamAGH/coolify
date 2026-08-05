@@ -167,7 +167,7 @@ class CompileBlueGreenProxyConfiguration
                         $backendPort,
                         count($target->ports) > 1,
                     )] = $this->serviceForBackends(
-                        $target->replicaBackends($color),
+                        $target->replicaBackendsForPort($color, $backendPort),
                         $backendPort,
                         $target->failoverHealthCheck(),
                     );
@@ -202,14 +202,14 @@ class CompileBlueGreenProxyConfiguration
                 $candidateServiceName = $this->failoverServiceName($namePrefix, 'candidate-main', $target, $backendPort);
                 $fallbackServiceName = $this->failoverServiceName($namePrefix, 'previous-fallback', $target, $backendPort);
                 $services[$candidateServiceName] = $target->usesExplicitReplicaBackends
-                    ? $this->serviceForBackends($target->activeReplicaBackends(), $backendPort, $target->failoverHealthCheck())
+                    ? $this->serviceForBackends($target->replicaBackendsForPort($target->activeColor, $backendPort), $backendPort, $target->failoverHealthCheck())
                     : $this->service(
                         $target->containerName($target->activeColor, $backendPort),
                         $backendPort,
                         $target->failoverHealthCheck(),
                     );
                 $services[$fallbackServiceName] = $target->usesExplicitReplicaBackends
-                    ? $this->serviceForBackends($target->inactiveReplicaBackends(), $backendPort, $target->failoverHealthCheck())
+                    ? $this->serviceForBackends($target->replicaBackendsForPort($target->inactiveColor(), $backendPort), $backendPort, $target->failoverHealthCheck())
                     : $this->service(
                         $target->fallbackContainerName
                             ?? throw new InvalidArgumentException('A failover route has no exact previous backend identity.'),

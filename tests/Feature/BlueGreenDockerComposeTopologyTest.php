@@ -175,11 +175,6 @@ function blueGreenCoRolledReason(string $service, string $routedService, string 
     return "Blue-green Docker Compose service `{$service}` must be re-rolled with routed service `{$routedService}` because it addresses it, but it is not eligible: {$underlying}";
 }
 
-function blueGreenCoRolledGateReason(string $service, string $routedService): string
-{
-    return "Blue-green Docker Compose service `{$service}` must be re-rolled with routed service `{$routedService}` because it addresses it, and re-rolling more than one service together is not supported yet.";
-}
-
 function blueGreenComposeApplication(array $documentOverrides = []): Application
 {
     $team = Team::query()->create([
@@ -1032,8 +1027,7 @@ it('allows pre-existing stateful sidecars but rejects new routed storage and uns
         'services' => ['worker' => ['links' => ['web:legacy-web']]],
     ]);
     $application->forceFill(['docker_compose' => Yaml::dump($withStaticLink, 10)]);
-    expect(BlueGreenComposeTopology::ineligibilityReason($application))
-        ->toBe(blueGreenCoRolledGateReason('worker', 'web'));
+    expect(BlueGreenComposeTopology::ineligibilityReason($application))->toBeNull();
 
     $withExtension = blueGreenComposeFixtureDocument([
         'services' => ['worker' => ['extends' => 'web']],
@@ -1043,13 +1037,43 @@ it('allows pre-existing stateful sidecars but rejects new routed storage and uns
         ->toBe(blueGreenCoRolledReason('worker', 'web', 'Blue-green Docker Compose routed service `worker` does not support extends.'));
 });
 
-it('rejects fixed sidecars that depend on the routed Compose service before a candidate can leave them stale', function (): void {
+it('co-rolls a service that depends on the routed Compose service instead of leaving it stale', function (): void {
     $application = blueGreenComposeApplication([
         'services' => ['worker' => ['depends_on' => ['web' => ['condition' => 'service_started']]]],
     ]);
 
-    expect(BlueGreenComposeTopology::ineligibilityReason($application))
-        ->toBe(blueGreenCoRolledGateReason('worker', 'web'));
+    expect(BlueGreenComposeTopology::ineligibilityReason($application))->toBeNull();
+});
+
+it('pins persisted sidecar and legacy routed container names across compose re-parsing while durable state exists', function (): void {
+    $application = blueGreenComposeApplication();
+    $rawDocument = blueGreenComposeRawFixtureDocument(blueGreenComposeFixtureDocument());
+    unset($rawDocument['services']['db']['volumes'], $rawDocument['volumes']);
+    $application->forceFill([
+        'docker_compose' => null,
+        'docker_compose_raw' => Yaml::dump($rawDocument, 10),
+    ])->save();
+    applicationParser($application);
+    $application = $application->fresh(['settings']);
+    $topology = BlueGreenComposeTopology::fromApplication($application);
+    $pinnedLegacyName = $topology->legacyRoutedContainerName;
+    $pinnedSidecarNames = collect($topology->fixedSidecars())->pluck('containerName', 'serviceName');
+    expect($pinnedSidecarNames)->not->toBeEmpty();
+
+    ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $application->id,
+        'standalone_docker_id' => $application->destination->id,
+    ]);
+
+    // generateApplicationContainerName embeds the wall clock, so an unpinned
+    // re-parse would rewrite every fixed identity and churn the persisted
+    // topology digest.
+    $reparsed = applicationParser($application->fresh(['settings']));
+
+    expect(data_get($reparsed, 'services.web.container_name'))->toBe($pinnedLegacyName);
+    foreach ($pinnedSidecarNames as $serviceName => $containerName) {
+        expect(data_get($reparsed, "services.{$serviceName}.container_name"))->toBe($containerName);
+    }
 });
 
 it('keeps an independent fixed sidecar eligible through real parser-v3 SERVICE_NAME injection', function (): void {
@@ -1069,21 +1093,19 @@ it('keeps an independent fixed sidecar eligible through real parser-v3 SERVICE_N
         ->and(BlueGreenComposeTopology::ineligibilityReason($application))->toBeNull();
 });
 
-it('rejects a processed-only fixed-sidecar environment endpoint absent from raw Compose', function (): void {
+it('co-rolls a service whose processed environment addresses the routed service', function (): void {
     $application = blueGreenComposeApplication();
     $processedDocument = blueGreenComposeFixtureDocument();
     $processedDocument['services']['worker']['environment']['UPSTREAM_URL'] = 'http://web:3000';
     $application->forceFill(['docker_compose' => Yaml::dump($processedDocument, 10)]);
 
-    expect(BlueGreenComposeTopology::ineligibilityReason($application))
-        ->toBe(blueGreenCoRolledGateReason('worker', 'web'));
+    expect(BlueGreenComposeTopology::ineligibilityReason($application))->toBeNull();
 
     $rawDocument = blueGreenComposeRawFixtureDocument(blueGreenComposeFixtureDocument());
     $rawDocument['services']['worker']['environment']['UPSTREAM_URL'] = 'https://api.example.test';
     $application->forceFill(['docker_compose_raw' => Yaml::dump($rawDocument, 10)]);
 
-    expect(BlueGreenComposeTopology::ineligibilityReason($application))
-        ->toBe(blueGreenCoRolledGateReason('worker', 'web'));
+    expect(BlueGreenComposeTopology::ineligibilityReason($application))->toBeNull();
 
     $processedDocument = blueGreenComposeFixtureDocument();
     $processedDocument['services']['worker']['environment']['SERVICE_NAME_WEB'] = 'web-green';
@@ -1098,7 +1120,7 @@ it('rejects a processed-only fixed-sidecar environment endpoint absent from raw 
         ->toBe('Blue-green Docker Compose service `worker` cannot retain an environment endpoint for routed service `web` because fixed sidecars do not follow color swaps.');
 });
 
-it('rejects routed endpoints in every effective processed fixed-sidecar environment value', function (): void {
+it('co-rolls a service on a routed endpoint in any effective processed environment value', function (): void {
     $application = blueGreenComposeApplication();
 
     foreach ([
@@ -1115,8 +1137,7 @@ it('rejects routed endpoints in every effective processed fixed-sidecar environm
             'docker_compose_raw' => Yaml::dump($rawDocument, 10),
         ]);
 
-        expect(BlueGreenComposeTopology::ineligibilityReason($application))
-            ->toBe(blueGreenCoRolledGateReason('worker', 'web'));
+        expect(BlueGreenComposeTopology::ineligibilityReason($application))->toBeNull();
     }
 });
 
@@ -1168,6 +1189,48 @@ it('accepts a parser-preserved runtime placeholder resolved to a safe external e
 
     expect(data_get($parsed, 'services.worker.environment.UPSTREAM_URL'))->toBe('${UPSTREAM_URL}')
         ->and(BlueGreenComposeTopology::ineligibilityReason($application))->toBeNull();
+});
+
+it('resolves the required and default Compose interpolation forms a fixed sidecar may carry', function (): void {
+    $application = blueGreenComposeApplication();
+    $rawDocument = blueGreenComposeRawFixtureDocument(blueGreenComposeFixtureDocument());
+    $processedDocument = blueGreenComposeFixtureDocument();
+    // `${VAR:?}` is exactly what Coolify's own parser leaves behind for a
+    // generated secret, and `${VAR:-default}` is ordinary Compose. Both resolve
+    // exactly, so neither may refuse a topology.
+    foreach ([$rawDocument, $processedDocument] as $index => $document) {
+        $document['services']['worker']['environment']['UPSTREAM_URL'] = '${UPSTREAM_URL:?}';
+        $document['services']['worker']['environment']['UPSTREAM_MODE'] = '${UPSTREAM_MODE:-batch}';
+        $index === 0 ? $rawDocument = $document : $processedDocument = $document;
+    }
+    $application->forceFill([
+        'docker_compose' => Yaml::dump($processedDocument, 10),
+        'docker_compose_raw' => Yaml::dump($rawDocument, 10),
+    ]);
+    $application->environment_variables()->create([
+        'key' => 'UPSTREAM_URL',
+        'value' => 'https://api.example.test/v1',
+        'is_runtime' => true,
+    ]);
+
+    // UPSTREAM_MODE is deliberately never defined: `:-` resolves it to its
+    // literal default rather than refusing the topology.
+    expect(BlueGreenComposeTopology::ineligibilityReason($application))->toBeNull();
+});
+
+it('still refuses a required Compose interpolation whose source it cannot resolve exactly', function (): void {
+    $application = blueGreenComposeApplication();
+    $rawDocument = blueGreenComposeRawFixtureDocument(blueGreenComposeFixtureDocument());
+    $processedDocument = blueGreenComposeFixtureDocument();
+    $rawDocument['services']['worker']['environment']['UPSTREAM_URL'] = '${UPSTREAM_URL:?}';
+    $processedDocument['services']['worker']['environment']['UPSTREAM_URL'] = '${UPSTREAM_URL:?}';
+    $application->forceFill([
+        'docker_compose' => Yaml::dump($processedDocument, 10),
+        'docker_compose_raw' => Yaml::dump($rawDocument, 10),
+    ]);
+
+    expect(BlueGreenComposeTopology::ineligibilityReason($application))
+        ->toBe('Blue-green Docker Compose service `worker` cannot resolve processed environment `UPSTREAM_URL` runtime variable `UPSTREAM_URL` exactly from production application environment.');
 });
 
 it('fails closed when a fixed-sidecar runtime placeholder source is missing or ambiguous', function (): void {
@@ -1243,7 +1306,7 @@ it('detects routed hosts inside URI authorities, commands, DSNs, and endpoint li
     $application = blueGreenComposeApplication();
     // These endpoints are visible in the pre-injection Compose, so `worker` is
     // pulled into the co-rolled set and then refused on its own merits.
-    $reason = blueGreenCoRolledGateReason('worker', 'web');
+    $reason = null;
 
     foreach ([
         'jdbc:postgresql://web:5432/app',
@@ -1291,7 +1354,7 @@ it('detects routed hosts inside URI authorities, commands, DSNs, and endpoint li
     }
 });
 
-it('rejects routed service identity consumed by a fixed sidecar in raw Compose', function (): void {
+it('co-rolls a service that consumes routed service identity in raw Compose', function (): void {
     $application = blueGreenComposeApplication();
 
     foreach (['http://web:3000/healthz', '${SERVICE_NAME_WEB}:3000'] as $endpoint) {
@@ -1303,8 +1366,7 @@ it('rejects routed service identity consumed by a fixed sidecar in raw Compose',
         applicationParser($application);
         $application->refresh();
 
-        expect(BlueGreenComposeTopology::ineligibilityReason($application))
-            ->toBe(blueGreenCoRolledGateReason('worker', 'web'));
+        expect(BlueGreenComposeTopology::ineligibilityReason($application))->toBeNull();
     }
 });
 
@@ -1515,7 +1577,7 @@ it('keeps the historic candidate identity and digest for a lone co-rolled servic
         ->toBe("{$application->uuid}-blue");
 });
 
-it('pulls a service that addresses the routed service into the co-rolled set and refuses the set for now', function (): void {
+it('pulls a service that addresses the routed service into the co-rolled set', function (): void {
     $application = blueGreenComposeApplication([
         'services' => [
             'worker' => [
@@ -1525,10 +1587,12 @@ it('pulls a service that addresses the routed service into the co-rolled set and
         ],
     ]);
 
-    // `worker` is otherwise eligible, so it is no longer refused on its own
-    // merits — it is refused because the set cannot be tracked yet.
-    expect(BlueGreenComposeTopology::ineligibilityReason($application))
-        ->toBe('Blue-green Docker Compose service `worker` must be re-rolled with routed service `web` because it addresses it, and re-rolling more than one service together is not supported yet.');
+    // `worker` is eligible on its own merits and addresses `web`, so it joins
+    // the co-rolled set and swaps colour with it.
+    $topology = BlueGreenComposeTopology::fromApplication($application);
+
+    expect(BlueGreenComposeTopology::ineligibilityReason($application))->toBeNull()
+        ->and($topology->coRolledServices())->toEqualCanonicalizing(['web', 'worker']);
 });
 
 it('never rewrites unrelated environment values that merely contain the service name', function (): void {
@@ -1648,7 +1712,7 @@ it('refuses two routed services that share a backend port', function (): void {
         ->toBe('Blue-green Docker Compose routed services `web` and `worker` share backend port 3000; each routed service requires its own port.');
 });
 
-it('models two eligible routed services and refuses only on the phase gate', function (): void {
+it('models two eligible routed services as one co-rolled set', function (): void {
     $application = blueGreenComposeApplication([
         'services' => [
             'worker' => [
@@ -1674,10 +1738,12 @@ it('models two eligible routed services and refuses only on the phase gate', fun
     ]);
 
     // Both services are individually eligible and each owns its own backend
-    // port, so the only remaining obstacle is that a color cannot yet own more
-    // than one tracked candidate container.
-    expect(BlueGreenComposeTopology::ineligibilityReason($application))
-        ->toBe('Blue-green Docker Compose routed services `web`, `worker` must swap color together, and re-rolling more than one service together is not supported yet.');
+    // port, so they form one co-rolled set that swaps colour together.
+    $topology = BlueGreenComposeTopology::fromApplication($application);
+
+    expect(BlueGreenComposeTopology::ineligibilityReason($application))->toBeNull()
+        ->and($topology->coRolledServices())->toEqualCanonicalizing(['web', 'worker'])
+        ->and($topology->routedServicePorts())->toBe(['web' => 3000, 'worker' => 4000]);
 });
 
 it('names the exact topology conflict when fixed Compose sidecars cannot be proven safe to deactivate', function (): void {
@@ -1900,4 +1966,30 @@ it('attests every compose service image for a non-blue-green compose deployment'
         // fails instead of digesting a partial image set.
         ->and($attestationCommand)->toContain('docker pull')
         ->and($attestationCommand)->toContain('|| exit 1');
+});
+
+it('admits a fixed Compose sidecar volume while refusing writable storage on a non-Compose app', function (): void {
+    // Eligibility already exempts a parsed Compose application from the
+    // writable-storage conflict, because its volumes belong to fixed sidecars
+    // that are never re-rolled. The insert guard has to agree, or the sidecar's
+    // volume rows can never be created for an opted-in Compose application.
+    $application = blueGreenComposeApplication();
+    $document = blueGreenComposeFixtureDocument();
+    $document['services']['db']['volumes'] = ['sidecar-pgdata:/var/lib/postgresql/data'];
+    $application->forceFill(['docker_compose' => Yaml::dump($document, 10)])->save();
+
+    // The parsed Compose document declares this volume for the `db` sidecar,
+    // which is never re-rolled, so recording it is safe.
+    $volume = $application->persistentStorages()->create([
+        'name' => 'sidecar-pgdata',
+        'mount_path' => '/var/lib/postgresql/data',
+    ]);
+
+    expect($volume->exists)->toBeTrue();
+
+    // Storage no sidecar declares is still refused.
+    expect(fn () => $application->persistentStorages()->create([
+        'name' => 'hand-added',
+        'mount_path' => '/var/lib/hand-added',
+    ]))->toThrow(RuntimeException::class, 'cannot add writable storage while they are opted in');
 });

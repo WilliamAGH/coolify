@@ -29,20 +29,38 @@ final readonly class BlueGreenActiveContainerSet
         }
 
         $containers = [];
-        $seenPorts = [];
         foreach ($members as $member) {
             if (! is_array($member)) {
                 throw new InvalidArgumentException('Each active blue/green container set member must supply exactly a port, name, and id.');
             }
-            $container = BlueGreenActiveContainer::fromArray($member);
-            if (isset($seenPorts[$container->port])) {
-                throw new InvalidArgumentException('Active blue/green container set ports must be unique.');
-            }
-            $seenPorts[$container->port] = true;
-            $containers[] = $container;
+            $containers[] = BlueGreenActiveContainer::fromArray($member);
         }
 
-        return new self($containers);
+        return self::fromMembers($containers);
+    }
+
+    /**
+     * The record is ordered by backend port so the same colour always serializes
+     * to the same bytes, whatever order its members were inspected in.
+     *
+     * @param  non-empty-list<BlueGreenActiveContainer>  $members
+     */
+    public static function fromMembers(array $members): self
+    {
+        if ($members === []) {
+            throw new InvalidArgumentException('The active blue/green container set must be a non-empty list.');
+        }
+
+        $byPort = [];
+        foreach ($members as $member) {
+            if (isset($byPort[$member->port])) {
+                throw new InvalidArgumentException('Active blue/green container set ports must be unique.');
+            }
+            $byPort[$member->port] = $member;
+        }
+        ksort($byPort);
+
+        return new self(array_values($byPort));
     }
 
     public function contains(string $name, string $id): bool

@@ -425,7 +425,10 @@ final class RecoverBlueGreenFinalizedDrainingOperation
             $deploymentUuid,
             $color,
             $routingRevision,
-            $rows->count(),
+            BlueGreenReplicaSet::fromReplicas(
+                $rows,
+                $state->candidateComposeServicesFor($color, $deploymentUuid),
+            ),
         );
     }
 

@@ -678,6 +678,10 @@ function applicationParser(Application $resource, int $pull_request_id = 0, ?int
         $serviceNameEnvironments = generateDockerComposeServiceName($services, $pullRequestId);
     }
 
+    $blueGreenPinnedContainerNames = $pullRequestId === 0
+        ? $resource->blueGreenPinnedComposeContainerNames()
+        : [];
+
     // Parse the rest of the services
     foreach ($services as $serviceName => $service) {
         $image = data_get_str($service, 'image');
@@ -718,7 +722,7 @@ function applicationParser(Application $resource, int $pull_request_id = 0, ?int
             application: $resource,
             pull_request_id: $pullRequestId
         );
-        $containerName = "$serviceName-$baseName";
+        $containerName = $blueGreenPinnedContainerNames[$serviceName] ?? "$serviceName-$baseName";
         $predefinedPort = null;
 
         $originalResource = $resource;

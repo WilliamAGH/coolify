@@ -15,7 +15,12 @@ final class BindBlueGreenReplicaSet
      */
     public function handle(BlueGreenDeploymentClaim $claim, array $inspections): array
     {
-        if ($inspections === [] || count($inspections) > $claim->replicaCount) {
+        // Every replica of every co-rolled member counts toward the colour's
+        // quorum, so a set of two members at one replica each is two containers,
+        // not a breach of the claim.
+        $claimedQuorum = (new BlueGreenReplicaSet($claim->replicaCount, $claim->candidateComposeServices()))
+            ->promotionThreshold();
+        if ($inspections === [] || count($inspections) > $claimedQuorum) {
             throw new RuntimeException('The inspected replica count is outside the claimed blue-green operation quorum.');
         }
 
@@ -109,12 +114,18 @@ final class BindBlueGreenReplicaSet
         ApplicationBlueGreenReplica $replica,
         BlueGreenReplicaInspection $inspection,
     ): void {
-        if (($replica->container_id === null) !== ($replica->container_name === null)) {
+        // A slot whose member is rendered under its own name has its
+        // container_name pinned by the Compose document at reserve time, long
+        // before Docker has given it an id, so a known name beside a null id is
+        // a reserved slot rather than a corrupt one. An id without a name never
+        // is.
+        if ($replica->container_id !== null && $replica->container_name === null) {
             throw new RuntimeException('The durable blue-green replica slot has partial container identity.');
         }
-        if ($replica->container_id !== null
-            && ($replica->container_id !== $inspection->dockerId
-                || $replica->container_name !== $inspection->containerName)) {
+        if ($replica->container_name !== null && $replica->container_name !== $inspection->containerName) {
+            throw new RuntimeException('The inspected replica Docker identity changed after it was persisted.');
+        }
+        if ($replica->container_id !== null && $replica->container_id !== $inspection->dockerId) {
             throw new RuntimeException('The inspected replica Docker identity changed after it was persisted.');
         }
 
@@ -134,7 +145,10 @@ final class BindBlueGreenReplicaSet
             'last_observed_at' => now(),
         ];
         if ($replica->container_id === null) {
-            $query->whereNull('container_name')->whereNull('container_id');
+            $replica->container_name === null
+                ? $query->whereNull('container_name')
+                : $query->where('container_name', $replica->container_name);
+            $query->whereNull('container_id');
             $attributes['container_name'] = $inspection->containerName;
             $attributes['container_id'] = $inspection->dockerId;
         } else {

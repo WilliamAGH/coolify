@@ -10,6 +10,7 @@ use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteResult;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
 use App\Actions\Application\BlueGreen\BlueGreenOperationFence;
+use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\DrainBlueGreenPreviousContainer;
 use App\Actions\Application\BlueGreen\ExecuteBlueGreenDeactivationRemoteCommand;
@@ -511,8 +512,8 @@ it('runs lifecycle attestation and replica inspection availability paths through
     $containerName = $replica->container_name ?? $fixture['claim']->candidateContainerName.'-1';
     $containerId = $replica->container_id ?? str_repeat('b', 64);
     $replicaSet = new InspectBlueGreenReplicaSet;
-    $replicaScript = $replicaSet->commandFor(collect([$replica]), 1);
-    $availableReplicaScript = $replicaSet->availableCommandFor(collect([$replica]), 1);
+    $replicaScript = $replicaSet->commandFor(collect([$replica]), new BlueGreenReplicaSet(1));
+    $availableReplicaScript = $replicaSet->availableCommandFor(collect([$replica]), new BlueGreenReplicaSet(1));
     $replicaOutput = blueGreenApplicationRemoteReplicaInspectionOutput($replica, $containerName, $containerId);
     $replicaProcesses = [];
     Process::fake(function (PendingProcess $process) use (&$replicaProcesses, $replicaScript, $availableReplicaScript, $replica, $replicaOutput) {
@@ -533,7 +534,7 @@ it('runs lifecycle attestation and replica inspection availability paths through
         $fixture['claim']->deploymentUuid,
         BlueGreenDeploymentColor::BLUE,
         $fixture['claim']->expectedRoutingRevision,
-        1,
+        new BlueGreenReplicaSet(1),
     );
     $availableInspections = $replicaSet->available(
         $fixture['server'],
@@ -541,7 +542,7 @@ it('runs lifecycle attestation and replica inspection availability paths through
         $fixture['claim']->deploymentUuid,
         BlueGreenDeploymentColor::BLUE,
         $fixture['claim']->expectedRoutingRevision,
-        1,
+        new BlueGreenReplicaSet(1),
     );
 
     expect($inspections)->toHaveCount(1)

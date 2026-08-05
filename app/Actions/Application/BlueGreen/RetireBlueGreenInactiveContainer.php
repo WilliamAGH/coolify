@@ -217,7 +217,11 @@ final class RetireBlueGreenInactiveContainer
             $inactiveDeployment->deployment_uuid,
             $state->inactive_retirement_color,
             (int) $routingRevisions->sole(),
-            $replicas->count(),
+            BlueGreenReplicaSet::fromReplicas($replicas, $state->candidateComposeServicesFor(
+                $state->inactive_retirement_color,
+                $inactiveDeployment->deployment_uuid,
+                $application,
+            )),
         );
         if (! hash_equals(
             $state->inactive_retirement_container_id,

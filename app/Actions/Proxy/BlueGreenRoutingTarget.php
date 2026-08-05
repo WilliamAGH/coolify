@@ -159,6 +159,7 @@ final readonly class BlueGreenRoutingTarget
         ?array $blueReplicaBackends = null,
         ?array $greenReplicaBackends = null,
         ?array $portContainerNames = null,
+        public ?BlueGreenActiveContainerSet $activeContainerSet = null,
     ) {
         if ($destinationId < 0) {
             throw new InvalidArgumentException('The destination ID must be a nonnegative integer.');
@@ -361,6 +362,41 @@ final readonly class BlueGreenRoutingTarget
             : $this->greenReplicaBackends;
     }
 
+    /**
+     * The proven backends of a color that actually serve one backend port.
+     *
+     * A replica fan-out of a single routed service keeps every replica behind
+     * every port it exposes. A co-rolled set is different: each port belongs to
+     * exactly one member, and a sibling must never back a port it does not
+     * serve. The port-scoped member map is the canonical owner of that
+     * assignment, so a member it names that is missing from the proven backends
+     * is a fenced refusal rather than a silent widening.
+     *
+     * @return non-empty-list<string>
+     */
+    public function replicaBackendsForPort(BlueGreenDeploymentColor $color, int $port): array
+    {
+        $backends = $this->replicaBackends($color);
+        if (! isset($this->portContainerNames[$port])) {
+            return $backends;
+        }
+        $member = $this->containerName($color, $port);
+        if (in_array($member, $backends, true)) {
+            return [$member];
+        }
+        // A color with no proven containers carries only its scalar identity as
+        // a placeholder; each port keeps its own member's placeholder so the
+        // compiled record stays per-member and Traefik health-checks it out.
+        $scalarPlaceholder = [$this->containerName($color)];
+        if ($backends === $scalarPlaceholder) {
+            return [$member];
+        }
+
+        throw new InvalidArgumentException(
+            "The blue-green color has no proven backend for member `{$member}` on port {$port}.",
+        );
+    }
+
     /** @return non-empty-list<string> */
     public function activeReplicaBackends(): array
     {
@@ -484,6 +520,11 @@ final readonly class BlueGreenRoutingTarget
             activeContainerId: $this->activeContainerId,
             applicationRoutingConfigDigest: $applicationRoutingConfigDigest,
             destinationTopologyDigest: $this->destinationTopologyDigest,
+            // A destination that owns one container per colour keeps emitting
+            // the scalar record, byte for byte, so a rollback still reads it.
+            activeContainerSet: $this->mode === BlueGreenRoutingMode::LegacyRecoveryBridge
+                ? null
+                : $this->activeContainerSet,
         );
     }
 

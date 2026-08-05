@@ -110,6 +110,62 @@ final readonly class BlueGreenReplicaSet
         return $expected;
     }
 
+    /**
+     * Each co-rolled member mapped to the Compose services it is rendered as.
+     * Built forward from the member identities the topology supplied, so a
+     * member is never recovered by taking a rendered service name apart.
+     *
+     * @return array<string, non-empty-list<string>>
+     */
+    public function memberComposeServices(): array
+    {
+        $members = [];
+        foreach ($this->members as $member) {
+            $members[$member] = $this->serviceNames($member);
+        }
+
+        return $members;
+    }
+
+    /**
+     * The Docker identity each co-rolled member is fenced by, over just the
+     * replicas that member owns.
+     *
+     * A member rendered under its own name is fenced by its container's real
+     * Docker ID; a member fanned out into replicas is fenced by the digest over
+     * its own replicas. That is exactly the rule the scalar candidate identity
+     * already followed when a colour owned one member, so a fence record keeps
+     * naming identities of the same kind.
+     *
+     * @param  non-empty-list<BlueGreenReplicaInspection>  $inspections
+     * @return array<string, string>
+     */
+    public function memberIdentities(array $inspections): array
+    {
+        if ($this->members === []) {
+            throw new InvalidArgumentException('A blue-green replica set without co-rolled members has no per-member identity.');
+        }
+
+        $byService = [];
+        foreach ($inspections as $inspection) {
+            $byService[$inspection->composeService] = $inspection;
+        }
+
+        $identities = [];
+        foreach ($this->memberComposeServices() as $member => $services) {
+            $group = [];
+            foreach ($services as $service) {
+                $group[] = $byService[$service]
+                    ?? throw new InvalidArgumentException('The inspected blue-green replica set is missing a co-rolled member replica.');
+            }
+            $identities[$member] = $this->usesScalarReplicaNaming()
+                ? $group[0]->dockerId
+                : self::identityDigest($group);
+        }
+
+        return $identities;
+    }
+
     /** @param non-empty-list<BlueGreenReplicaInspection> $inspections */
     public static function identityDigest(array $inspections): string
     {
@@ -203,8 +259,16 @@ final readonly class BlueGreenReplicaSet
         );
     }
 
-    /** @return list<string> */
-    public function labels(int $replicaIndex): array
+    /**
+     * The replica provenance a fanned-out member carries, as label name to
+     * value. This is the owner: the rendered label list, the `docker ps`
+     * filters that rediscover the container and the assertion that verifies its
+     * runtime labels all project from this one map, so a filter can never look
+     * for provenance the renderer did not write.
+     *
+     * @return array<string, string>
+     */
+    public function labelMap(int $replicaIndex): array
     {
         $this->assertReplicaIndex($replicaIndex);
         if ($this->usesScalarReplicaNaming()) {
@@ -212,9 +276,20 @@ final readonly class BlueGreenReplicaSet
         }
 
         return [
-            "coolify.blueGreen.replicaIndex={$replicaIndex}",
-            "coolify.blueGreen.replicaCount={$this->count}",
+            'coolify.blueGreen.replicaIndex' => (string) $replicaIndex,
+            'coolify.blueGreen.replicaCount' => (string) $this->count,
         ];
+    }
+
+    /** @return list<string> */
+    public function labels(int $replicaIndex): array
+    {
+        $labels = [];
+        foreach ($this->labelMap($replicaIndex) as $name => $value) {
+            $labels[] = "{$name}={$value}";
+        }
+
+        return $labels;
     }
 
     private function assertReplicaIndex(int $replicaIndex): void

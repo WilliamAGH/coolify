@@ -29,7 +29,7 @@ class LocalPersistentVolume extends BaseModel
         return DB::transaction(function () use ($query): bool {
             BlueGreenTopologyLock::acquire();
             Application::findBlueGreenStorageApplication($this->resource_type, $this->resource_id)
-                ?->prepareBlueGreenStorageAddition();
+                ?->prepareBlueGreenStorageAddition($this);
 
             return parent::performInsert($query);
         }, attempts: 5);
@@ -44,7 +44,7 @@ class LocalPersistentVolume extends BaseModel
         return DB::transaction(function () use ($query): bool {
             BlueGreenTopologyLock::acquire();
             Application::findBlueGreenStorageApplication($this->resource_type, $this->resource_id)
-                ?->prepareBlueGreenStorageAddition();
+                ?->prepareBlueGreenStorageAddition($this);
 
             return parent::performUpdate($query);
         }, attempts: 5);

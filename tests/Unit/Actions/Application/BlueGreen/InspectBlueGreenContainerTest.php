@@ -1,6 +1,7 @@
 <?php
 
 use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
+use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Enums\BlueGreenDeploymentColor;
 use Symfony\Component\Filesystem\Filesystem;
@@ -80,7 +81,7 @@ it('scopes running replica assertions to one exact compose slot', function (): v
     $assertions = (new InspectBlueGreenContainer)->runningReplicaMutationCompletionAssertionsFor(
         $expectation,
         replicaIndex: 2,
-        replicaCount: 3,
+        replicaSet: new BlueGreenReplicaSet(3),
         composeProject: 'coolify-app',
         composeService: 'coolify-app-blue-replica-2',
     );

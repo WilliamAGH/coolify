@@ -1,5 +1,9 @@
 <?php
 
+use App\Actions\Application\BlueGreen\BlueGreenReplicaInspection;
+use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
+use App\Actions\Application\BlueGreen\ResolveBlueGreenActiveContainerSet;
+use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\ProxyTypes;
 use App\Models\Application;
 use App\Models\Project;
@@ -16,9 +20,10 @@ uses(RefreshDatabase::class);
  * development application (`gateway/edge-and-queue/infra/docker-compose.yml`).
  *
  * The stack routes two services — `llm_gateway` on 8000 and `queue` on 8080 —
- * and `queue` both depends on and addresses `llm_gateway`. Co-rolled Compose
- * services are not supported yet, so these tests record *why* the topology is
- * refused. They are expected to change when co-rolled support lands.
+ * and `queue` both depends on and addresses `llm_gateway`, so the two must swap
+ * colour together. `postgres` and `redis` are fixed sidecars holding live named
+ * volumes and are never re-rolled. This is the acceptance shape for a co-rolled
+ * multi-service colour swap.
  */
 function squirrelGatewayApplication(string $rawCompose, ?array $domains = null): Application
 {
@@ -70,31 +75,95 @@ it('parses every service of the real squirrel dev compose', function () {
     expect($services)->toEqualCanonicalizing(['queue', 'llm_gateway', 'postgres', 'redis']);
 });
 
-it('refuses the topology because two services are routed', function () {
+it('admits the topology with both routed services co-rolled onto their own ports', function () {
     $application = squirrelGatewayApplication(squirrelGatewayCompose(), [
         'llm_gateway' => ['domain' => 'https://dev.llm-gateway.iocloudhost.net:8000'],
         'queue' => ['domain' => 'https://dev.api.llm-gateway.iocloudhost.net:8080'],
     ]);
 
     $ineligibility = BlueGreenComposeTopology::ineligibility($application);
+    $topology = BlueGreenComposeTopology::fromApplication($application);
 
-    // Both services are recognised as routed and as needing to swap together;
-    // the only remaining obstacle is the single-tracked-container phase gate.
     expect($ineligibility['incomplete'])->toBeFalse()
-        ->and($ineligibility['reason'])
-        ->toBe('Blue-green Docker Compose routed services `llm_gateway`, `queue` must swap color together, and re-rolling more than one service together is not supported yet.');
+        ->and($ineligibility['reason'])->toBeNull()
+        ->and($topology->coRolledServices())->toEqualCanonicalizing(['llm_gateway', 'queue'])
+        ->and($topology->routedServicePorts())->toBe(['llm_gateway' => 8000, 'queue' => 8080])
+        ->and($topology->backendPorts())->toBe([8000, 8080]);
+
+    // The stateful sidecars keep their identity and their live named volumes.
+    expect(collect($topology->fixedSidecars())->pluck('serviceName')->all())
+        ->toEqualCanonicalizing(['postgres', 'redis']);
 });
 
-it('recognises the queue as co-rolled with the gateway and refuses only on the phase gate', function () {
+it('gives each co-rolled member its own candidate container and compose service per colour', function () {
+    $application = squirrelGatewayApplication(squirrelGatewayCompose(), [
+        'llm_gateway' => ['domain' => 'https://dev.llm-gateway.iocloudhost.net:8000'],
+        'queue' => ['domain' => 'https://dev.api.llm-gateway.iocloudhost.net:8080'],
+    ]);
+    $topology = BlueGreenComposeTopology::fromApplication($application);
+    $uuid = $application->uuid;
+
+    // The routed member keeps the historic scalar identity so durable rows and
+    // fence records written before co-rolling still resolve.
+    expect($topology->candidateContainerNames($application, BlueGreenDeploymentColor::BLUE))->toBe([
+        'llm_gateway' => "{$uuid}-blue",
+        'queue' => "{$uuid}-queue-blue",
+    ])
+        ->and($topology->candidateComposeServices(BlueGreenDeploymentColor::GREEN))
+        ->toBe(['llm_gateway-green', 'queue-green'])
+        ->and($topology->candidateServicePorts())->toBe(['llm_gateway' => 8000, 'queue' => 8080]);
+});
+
+it('replaces both routed services and leaves the stateful sidecars untouched when rendering a candidate', function () {
+    $application = squirrelGatewayApplication(squirrelGatewayCompose(), [
+        'llm_gateway' => ['domain' => 'https://dev.llm-gateway.iocloudhost.net:8000'],
+        'queue' => ['domain' => 'https://dev.api.llm-gateway.iocloudhost.net:8080'],
+    ]);
+    $topology = BlueGreenComposeTopology::fromApplication($application);
+    $compose = Yaml::parse($application->docker_compose);
+
+    $rendered = $topology->renderCandidate(
+        compose: $compose,
+        application: $application,
+        color: BlueGreenDeploymentColor::BLUE,
+        blueGreenLabels: [
+            'llm_gateway-blue' => ['traefik.http.services.gateway.loadbalancer.server.port=8000'],
+            'queue-blue' => ['traefik.http.services.queue.loadbalancer.server.port=8080'],
+        ],
+    );
+
+    expect(array_keys($rendered['services']))
+        ->toEqualCanonicalizing(['llm_gateway-blue', 'queue-blue', 'postgres', 'redis'])
+        // The stateful sidecars and their live named volumes survive verbatim.
+        ->and($rendered['services']['postgres'])->toBe($compose['services']['postgres'])
+        ->and($rendered['services']['redis'])->toBe($compose['services']['redis'])
+        ->and($rendered['volumes'] ?? null)->toBe($compose['volumes'] ?? null);
+
+    // The queue must address this colour's gateway, never the other colour's.
+    $upstream = collect($rendered['services']['queue-blue']['environment'])
+        ->map(static fn (mixed $value, mixed $key): string => is_int($key) ? (string) $value : "{$key}={$value}")
+        ->first(static fn (string $entry): bool => str_starts_with($entry, 'QUEUE_UPSTREAM='));
+
+    expect($upstream)->toBe('QUEUE_UPSTREAM=http://llm_gateway-blue:8000')
+        // Each member advertises only the port it serves.
+        ->and($rendered['services']['llm_gateway-blue']['labels'])
+        ->toContain('traefik.http.services.gateway.loadbalancer.server.port=8000')
+        ->and($rendered['services']['queue-blue']['labels'])
+        ->toContain('traefik.http.services.queue.loadbalancer.server.port=8080');
+});
+
+it('co-rolls the queue with the gateway even when only the gateway is routed', function () {
     $application = squirrelGatewayApplication(squirrelGatewayCompose(), [
         'llm_gateway' => ['domain' => 'https://dev.llm-gateway.iocloudhost.net:8000'],
     ]);
 
-    // The queue addresses the gateway, so it must swap color with it. It is no
-    // longer refused for depending on the gateway — only because a color cannot
-    // yet own more than one tracked candidate container.
-    expect(BlueGreenComposeTopology::ineligibilityReason($application))
-        ->toBe('Blue-green Docker Compose service `queue` must be re-rolled with routed service `llm_gateway` because it addresses it, and re-rolling more than one service together is not supported yet.');
+    // The queue addresses the gateway, so it swaps colour with it even though it
+    // is not itself routed, and therefore serves no backend port of its own.
+    $topology = BlueGreenComposeTopology::fromApplication($application);
+
+    expect(BlueGreenComposeTopology::ineligibilityReason($application))->toBeNull()
+        ->and($topology->coRolledServices())->toEqualCanonicalizing(['llm_gateway', 'queue'])
+        ->and($topology->candidateServicePorts())->toBe(['llm_gateway' => 8000]);
 });
 
 it('still co-rolls the queue through its upstream once depends_on is removed', function () {
@@ -107,8 +176,9 @@ it('still co-rolls the queue through its upstream once depends_on is removed', f
 
     // QUEUE_UPSTREAM still addresses the gateway, so the closure catches it even
     // without the explicit dependency edge.
-    expect(BlueGreenComposeTopology::ineligibilityReason($application))
-        ->toBe('Blue-green Docker Compose service `queue` must be re-rolled with routed service `llm_gateway` because it addresses it, and re-rolling more than one service together is not supported yet.');
+    expect(BlueGreenComposeTopology::ineligibilityReason($application))->toBeNull()
+        ->and(BlueGreenComposeTopology::fromApplication($application)->coRolledServices())
+        ->toEqualCanonicalizing(['llm_gateway', 'queue']);
 });
 
 it('generates an independent traefik router group per routed service', function () {
@@ -161,4 +231,82 @@ it('emits a topology-matchable backend port label only when the domain carries t
     // the port must come from the domain instead.
     expect($matchablePorts('llm_gateway'))->toBe([8000])
         ->and($matchablePorts('queue'))->toBe([8080]);
+});
+
+it('composes the fence container set from the replicas each co-rolled member owns', function () {
+    $application = squirrelGatewayApplication(squirrelGatewayCompose(), [
+        'llm_gateway' => ['domain' => 'https://dev.llm-gateway.iocloudhost.net:8000'],
+        'queue' => ['domain' => 'https://dev.api.llm-gateway.iocloudhost.net:8080'],
+    ]);
+    $topology = BlueGreenComposeTopology::fromApplication($application);
+    $uuid = $application->uuid;
+    $replicaSet = new BlueGreenReplicaSet(1, $topology->candidateComposeServices(BlueGreenDeploymentColor::BLUE));
+
+    $inspection = fn (string $service, string $container, string $id): BlueGreenReplicaInspection => BlueGreenReplicaInspection::fromRuntime(
+        replicaIndex: 1,
+        composeService: $service,
+        containerName: $container,
+        dockerId: $id,
+        status: 'running',
+        health: 'healthy',
+    );
+    $gatewayId = str_repeat('a', 64);
+    $queueId = str_repeat('b', 64);
+
+    $set = ResolveBlueGreenActiveContainerSet::run(
+        $application,
+        $topology,
+        BlueGreenDeploymentColor::BLUE,
+        $replicaSet,
+        [
+            $inspection('llm_gateway-blue', "{$uuid}-blue", $gatewayId),
+            $inspection('queue-blue', "{$uuid}-queue-blue", $queueId),
+        ],
+        "{$uuid}-blue",
+        $gatewayId,
+    );
+
+    // Each backend port names its own service's container, so 8080 can never
+    // resolve to the gateway.
+    expect($set?->toArray())->toBe([
+        ['port' => 8000, 'name' => "{$uuid}-blue", 'id' => $gatewayId],
+        ['port' => 8080, 'name' => "{$uuid}-queue-blue", 'id' => $queueId],
+    ]);
+
+    // The record only leaves the historic scalar encoding for a genuine set.
+    expect(ResolveBlueGreenActiveContainerSet::run(
+        $application,
+        $topology,
+        BlueGreenDeploymentColor::BLUE,
+        new BlueGreenReplicaSet(1),
+        [$inspection('llm_gateway-blue', "{$uuid}-blue", $gatewayId)],
+        "{$uuid}-blue",
+        $gatewayId,
+    ))->toBeNull();
+});
+
+it('refuses to fence a colour whose second member was never inspected', function () {
+    $application = squirrelGatewayApplication(squirrelGatewayCompose(), [
+        'llm_gateway' => ['domain' => 'https://dev.llm-gateway.iocloudhost.net:8000'],
+        'queue' => ['domain' => 'https://dev.api.llm-gateway.iocloudhost.net:8080'],
+    ]);
+    $topology = BlueGreenComposeTopology::fromApplication($application);
+    $replicaSet = new BlueGreenReplicaSet(1, $topology->candidateComposeServices(BlueGreenDeploymentColor::BLUE));
+
+    expect(fn () => ResolveBlueGreenActiveContainerSet::run(
+        $application,
+        $topology,
+        BlueGreenDeploymentColor::BLUE,
+        $replicaSet,
+        [BlueGreenReplicaInspection::fromRuntime(
+            replicaIndex: 1,
+            composeService: 'llm_gateway-blue',
+            containerName: $application->uuid.'-blue',
+            dockerId: str_repeat('a', 64),
+            status: 'running',
+            health: 'healthy',
+        )],
+        $application->uuid.'-blue',
+        str_repeat('a', 64),
+    ))->toThrow(InvalidArgumentException::class, 'missing a co-rolled member replica');
 });

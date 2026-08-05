@@ -14,6 +14,7 @@ function blueGreenMultiPortTarget(
     ?string $fallbackContainerName = null,
     ?array $blueReplicaBackends = null,
     ?array $greenReplicaBackends = null,
+    ?array $portContainerNames = null,
 ): BlueGreenRoutingTarget {
     return new BlueGreenRoutingTarget(
         destinationId: 42,
@@ -46,6 +47,7 @@ function blueGreenMultiPortTarget(
         destinationTopologyDigest: hash('sha256', 'destination:42'),
         blueReplicaBackends: $blueReplicaBackends,
         greenReplicaBackends: $greenReplicaBackends,
+        portContainerNames: $portContainerNames,
     );
 }
 
@@ -167,6 +169,40 @@ it('compiles one health-checked file-provider backend per proven replica and por
     }
 
     expect($parsed)->not->toBeNull();
+});
+
+it('routes each backend port only to the co-rolled member that serves it', function (): void {
+    [, $parsed] = compileBlueGreenMultiPortConfiguration(blueGreenMultiPortTarget(
+        blueReplicaBackends: ['app-multi-port-blue', 'app-multi-port-worker-blue'],
+        greenReplicaBackends: ['app-multi-port-green', 'app-multi-port-worker-green'],
+        portContainerNames: [
+            3000 => ['blue' => 'app-multi-port-blue', 'green' => 'app-multi-port-green'],
+            8080 => ['blue' => 'app-multi-port-worker-blue', 'green' => 'app-multi-port-worker-green'],
+        ],
+    ));
+    $prefix = BlueGreenRoutingTarget::routingNamePrefix('app-multi-port', 42);
+
+    // A sibling member never backs a port it does not serve: 8080 reaches only
+    // the worker and 3000 only the routed member, per color.
+    expect(data_get($parsed, "http.services.{$prefix}blue-3000.loadBalancer.servers"))
+        ->toBe([['url' => 'http://app-multi-port-blue:3000']])
+        ->and(data_get($parsed, "http.services.{$prefix}blue-8080.loadBalancer.servers"))
+        ->toBe([['url' => 'http://app-multi-port-worker-blue:8080']])
+        ->and(data_get($parsed, "http.services.{$prefix}green-3000.loadBalancer.servers"))
+        ->toBe([['url' => 'http://app-multi-port-green:3000']])
+        ->and(data_get($parsed, "http.services.{$prefix}green-8080.loadBalancer.servers"))
+        ->toBe([['url' => 'http://app-multi-port-worker-green:8080']]);
+});
+
+it('fails closed when a port-scoped member is missing from the proven replica backends', function (): void {
+    expect(fn () => compileBlueGreenMultiPortConfiguration(blueGreenMultiPortTarget(
+        blueReplicaBackends: ['app-multi-port-blue', 'app-multi-port-worker-blue'],
+        greenReplicaBackends: ['app-multi-port-green', 'app-multi-port-worker-green'],
+        portContainerNames: [
+            3000 => ['blue' => 'app-multi-port-blue', 'green' => 'app-multi-port-green'],
+            8080 => ['blue' => 'app-multi-port-absent-blue', 'green' => 'app-multi-port-worker-green'],
+        ],
+    )))->toThrow(InvalidArgumentException::class);
 });
 
 it('applies the failover health-check contract independently to every backend port', function (): void {

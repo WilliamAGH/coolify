@@ -2,13 +2,17 @@
 
 namespace App\Actions\Application\BlueGreen;
 
+use App\Actions\Proxy\BlueGreenActiveContainerSet;
 use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
+use App\Enums\BlueGreenDeploymentColor;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationBlueGreenReplica;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\StandaloneDocker;
+use Illuminate\Support\Collection;
+use InvalidArgumentException;
 use Lorisleiva\Actions\Concerns\AsAction;
 
 final class ResolveBlueGreenExpectedProxyState
@@ -51,6 +55,7 @@ final class ResolveBlueGreenExpectedProxyState
         $activeDeploymentUuid = null;
         $activeContainerName = null;
         $activeContainerId = null;
+        $activeContainerSet = null;
         if ($state->managed_file_sha256 !== null) {
             $deploymentUuids = collect([
                 $state->blue_deployment_uuid,
@@ -83,6 +88,17 @@ final class ResolveBlueGreenExpectedProxyState
             $activeDeploymentUuid = $resolution->deploymentUuid;
             $activeContainerName = $application->uuid.'-'.$activeColor->value;
             $activeContainerId = $resolution->containerId;
+            $activeContainerSet = is_string($activeContainerId)
+                ? $this->activeContainerSet(
+                    $application,
+                    $state,
+                    $activeColor,
+                    $activeDeploymentUuid,
+                    $replicas->get($activeDeploymentUuid) ?? collect(),
+                    $activeContainerName,
+                    $activeContainerId,
+                )
+                : null;
         } elseif ($state->active_color !== null) {
             throw new BlueGreenDeploymentTransitionException('Durable DB state names an active route while the managed file is absent.');
         }
@@ -102,6 +118,75 @@ final class ResolveBlueGreenExpectedProxyState
             activeContainerId: $activeContainerId,
             applicationRoutingConfigDigest: $state->application_routing_config_digest,
             destinationTopologyDigest: $state->destination_topology_digest,
+            activeContainerSet: $activeContainerSet,
+        );
+    }
+
+    /**
+     * The container set the on-host fence record must already carry, rebuilt
+     * from the durable ledger rather than from the record being attested.
+     *
+     * Null whenever the destination re-rolls a single service, which is what
+     * keeps its expected record on the scalar encoding and byte-identical to
+     * every record earlier releases wrote.
+     *
+     * @param  Collection<int, ApplicationBlueGreenReplica>  $replicas
+     */
+    private function activeContainerSet(
+        Application $application,
+        ApplicationBlueGreenDeployment $state,
+        BlueGreenDeploymentColor $activeColor,
+        string $activeDeploymentUuid,
+        Collection $replicas,
+        string $scalarContainerName,
+        string $scalarContainerId,
+    ): ?BlueGreenActiveContainerSet {
+        $topology = $application->blueGreenComposeTopology();
+        if ($topology === null || $replicas->isEmpty()) {
+            return null;
+        }
+        $members = $state->candidateComposeServicesFor($activeColor, $activeDeploymentUuid, $application);
+        if ($members === []) {
+            return null;
+        }
+
+        try {
+            $replicaSet = BlueGreenReplicaSet::fromReplicas($replicas, $members);
+        } catch (InvalidArgumentException $exception) {
+            throw new BlueGreenDeploymentTransitionException(
+                'The durable replica ledger no longer groups under the active colour it must fence.',
+                0,
+                $exception,
+            );
+        }
+
+        $inspections = $replicas
+            ->sortBy([['replica_index', 'asc'], ['compose_service', 'asc']])
+            ->values()
+            ->map(static function (ApplicationBlueGreenReplica $replica): BlueGreenReplicaInspection {
+                if (! is_string($replica->container_name) || ! is_string($replica->container_id)) {
+                    throw new BlueGreenDeploymentTransitionException('The durable replica ledger has no bound Docker identity to fence.');
+                }
+
+                return BlueGreenReplicaInspection::fromRuntime(
+                    replicaIndex: (int) $replica->replica_index,
+                    composeService: $replica->compose_service,
+                    containerName: $replica->container_name,
+                    dockerId: $replica->container_id,
+                    status: 'running',
+                    health: 'healthy',
+                );
+            })
+            ->all();
+
+        return ResolveBlueGreenActiveContainerSet::run(
+            $application,
+            $topology,
+            $activeColor,
+            $replicaSet,
+            $inspections,
+            $scalarContainerName,
+            $scalarContainerId,
         );
     }
 }

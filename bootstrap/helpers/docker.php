@@ -908,13 +908,13 @@ function generateBlueGreenApplicationContainerLabels(
     if ($servedPorts === null) {
         $servedPorts = $backendPorts;
     } else {
+        // An explicitly empty set is a co-rolled member that serves nothing
+        // publicly: it still carries the provenance labels its durable ledger
+        // row is rediscovered by, but advertises no Traefik backend at all.
         $servedPorts = array_values($servedPorts);
-        if ($servedPorts === []) {
-            throw new InvalidArgumentException('Blue-green served ports must be a non-empty subset of the backend ports.');
-        }
         foreach ($servedPorts as $servedPort) {
             if (! is_int($servedPort) || ! in_array($servedPort, $backendPorts, true)) {
-                throw new InvalidArgumentException('Blue-green served ports must be a non-empty subset of the backend ports.');
+                throw new InvalidArgumentException('Blue-green served ports must be a subset of the backend ports.');
             }
         }
         if (count(array_unique($servedPorts)) !== count($servedPorts)) {
@@ -925,7 +925,9 @@ function generateBlueGreenApplicationContainerLabels(
 
     $applicationUuid = (string) $application->uuid;
     $labels = [
-        'traefik.enable=true',
+        // A member that serves no backend must not be discoverable at all,
+        // otherwise Traefik would invent a default backend for it.
+        $servedPorts === [] ? 'traefik.enable=false' : 'traefik.enable=true',
     ];
     foreach ($servedPorts as $backendPort) {
         $serviceName = BlueGreenRoutingTarget::memberServiceNameForPort(

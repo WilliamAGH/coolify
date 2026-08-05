@@ -21,11 +21,11 @@ class EnsureBlueGreenPreviousContainerRunning
         BlueGreenContainerExpectation $expectation,
         BlueGreenContainerInspection $inspection,
         ?int $replicaIndex = null,
-        ?int $replicaCount = null,
+        ?BlueGreenReplicaSet $replicaSet = null,
         ?string $composeProject = null,
         ?string $composeService = null,
     ): ?BlueGreenProxyState {
-        $replicaProvenance = [$replicaIndex, $replicaCount, $composeProject, $composeService];
+        $replicaProvenance = [$replicaIndex, $replicaSet, $composeProject, $composeService];
         $replicaProvenanceCount = count(array_filter(
             $replicaProvenance,
             static fn (mixed $value): bool => $value !== null,
@@ -53,7 +53,7 @@ class EnsureBlueGreenPreviousContainerRunning
             : $inspector->exactReplicaMutationAssertionsFor(
                 $expectation,
                 $replicaIndex,
-                $replicaCount,
+                $replicaSet,
                 $composeProject,
                 $composeService,
             );
@@ -62,7 +62,7 @@ class EnsureBlueGreenPreviousContainerRunning
             : $inspector->runningReplicaMutationCompletionAssertionsFor(
                 $expectation,
                 $replicaIndex,
-                $replicaCount,
+                $replicaSet,
                 $composeProject,
                 $composeService,
             );

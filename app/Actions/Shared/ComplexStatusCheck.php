@@ -72,7 +72,9 @@ class ComplexStatusCheck
         int $serverId,
         string $status,
     ): bool {
-        if ($standaloneDockerId < 1 || $serverId < 1 || blank($status)) {
+        // Primary key 0 is the instance-owned localhost server and destination
+        // convention, so only negative identifiers are malformed.
+        if ($standaloneDockerId < 0 || $serverId < 0 || blank($status)) {
             throw new InvalidArgumentException('Application destination status updates require an exact destination, server, and status.');
         }
 

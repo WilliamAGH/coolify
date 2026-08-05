@@ -125,7 +125,11 @@ final class RecordBlueGreenCandidateIdentity
         ApplicationBlueGreenDeployment $state,
         BlueGreenContainerInspection $inspection,
     ): void {
-        if ($claim->replicaCount !== DEFAULT_BLUE_GREEN_REPLICA_COUNT) {
+        // Only a colour that owns exactly one container has a scalar ledger row
+        // to bind. A co-rolled colour owns one row per member, and those are
+        // bound by BindBlueGreenReplicaSet against each member's own identity.
+        if (! (new BlueGreenReplicaSet($claim->replicaCount, $claim->candidateComposeServices()))
+            ->usesScalarCompatibilityPath()) {
             return;
         }
 

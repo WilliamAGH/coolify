@@ -332,15 +332,9 @@ final class ResolveActiveApplicationContainer
             return [$deployment->blue_green_candidate_container_id];
         }
         try {
-            // The operation's own durable set is authoritative while it is still
-            // recorded; once the operation is cleared the topology is the only
-            // owner left, and a ledger that no longer groups under it resolves
-            // to null rather than to a container this color may not own.
             $replicaSet = BlueGreenReplicaSet::fromReplicas(
                 $replicas,
-                $state->operation_deployment_uuid === $deploymentUuid && $state->pending_color === $color
-                    ? $state->operationCandidateComposeServices()
-                    : $application->blueGreenCandidateComposeServices($color),
+                $state->candidateComposeServicesFor($color, $deploymentUuid, $application),
             );
         } catch (\InvalidArgumentException) {
             return null;

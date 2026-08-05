@@ -77,7 +77,11 @@ class RemoveBlueGreenInactiveContainer
                 $inactiveDeploymentUuid,
                 $claim->pendingColor,
                 (int) $routingRevisions->sole(),
-                $replicas->count(),
+                BlueGreenReplicaSet::fromReplicas($replicas, $state->candidateComposeServicesFor(
+                    $claim->pendingColor,
+                    $inactiveDeploymentUuid,
+                    $application,
+                )),
             );
             $commands = [];
             $completionAssertions = [];

@@ -77,14 +77,20 @@ final class RemoveBlueGreenReplicaSet
      */
     public function commandsFor(BlueGreenDeploymentClaim $claim, Collection $replicas): array
     {
-        $replicaSet = new BlueGreenReplicaSet($claim->replicaCount);
-        if ($replicas->isEmpty() || $replicas->count() > $replicaSet->count) {
+        $replicaSet = new BlueGreenReplicaSet($claim->replicaCount, $claim->candidateComposeServices());
+        // A crash can leave only some of a colour's members started, so a
+        // partial set is legitimate here; more slots than the colour owns is
+        // not.
+        if ($replicas->isEmpty() || $replicas->count() > $replicaSet->promotionThreshold()) {
             throw new RuntimeException('Replica cleanup has no bound durable identities to remove.');
         }
         $commands = [];
         $completionAssertions = [];
-        $seenIndexes = [];
-        foreach ($replicas->sortBy('replica_index')->values() as $replica) {
+        // Slots are identified by the member's own Compose service: two
+        // co-rolled members legitimately share a replica index, so an index
+        // alone would collapse them into one slot.
+        $seenSlots = [];
+        foreach ($replicas->sortBy([['replica_index', 'asc'], ['compose_service', 'asc']])->values() as $replica) {
             if ($replica->deployment_uuid !== $claim->deploymentUuid
                 || $replica->application_blue_green_deployment_id !== $claim->stateId
                 || $replica->application_id !== $claim->applicationId
@@ -93,14 +99,15 @@ final class RemoveBlueGreenReplicaSet
                 || $replica->routing_revision !== $claim->expectedRoutingRevision
                 || $replica->replica_index < 1
                 || $replica->replica_index > $replicaSet->count
-                || isset($seenIndexes[$replica->replica_index])
+                || ! is_string($replica->compose_service)
+                || isset($seenSlots[$replica->compose_service])
                 || ! is_string($replica->container_name)
                 || trim($replica->container_name) === ''
                 || ! is_string($replica->container_id)
                 || preg_match('/^[a-f0-9]{64}$/D', $replica->container_id) !== 1) {
                 throw new RuntimeException('Replica cleanup was given a slot outside the exact pending release.');
             }
-            $seenIndexes[$replica->replica_index] = true;
+            $seenSlots[$replica->compose_service] = true;
             $filters = [
                 'label=coolify.applicationId='.$replica->application_id,
                 'label=coolify.pullRequestId=0',
@@ -108,11 +115,12 @@ final class RemoveBlueGreenReplicaSet
                 'label=coolify.blueGreen.deploymentUuid='.$replica->deployment_uuid,
                 'label=coolify.blueGreen.color='.$replica->color->value,
                 'label=coolify.blueGreen.routingRevision='.$replica->routing_revision,
-                'label=coolify.blueGreen.replicaIndex='.$replica->replica_index,
-                'label=coolify.blueGreen.replicaCount='.$replicaSet->count,
-                'label=com.docker.compose.project='.$replica->compose_project,
-                'label=com.docker.compose.service='.$replica->compose_service,
             ];
+            foreach ($replicaSet->labelMap((int) $replica->replica_index) as $label => $value) {
+                $filters[] = "label={$label}={$value}";
+            }
+            $filters[] = 'label=com.docker.compose.project='.$replica->compose_project;
+            $filters[] = 'label=com.docker.compose.service='.$replica->compose_service;
             $filterArguments = implode(' ', array_map(
                 static fn (string $filter): string => '--filter '.escapeshellarg($filter),
                 $filters,
@@ -133,7 +141,7 @@ final class RemoveBlueGreenReplicaSet
             array_push($commands, ...(new InspectBlueGreenContainer)->exactReplicaMutationAssertionsFor(
                 expectation: $expectation,
                 replicaIndex: $replica->replica_index,
-                replicaCount: $replicaSet->count,
+                replicaSet: $replicaSet,
                 composeProject: $replica->compose_project,
                 composeService: $replica->compose_service,
             ));
@@ -182,10 +190,13 @@ final class RemoveBlueGreenReplicaSet
         Collection $requestedReplicas,
         Collection $durableReplicas,
     ): Collection {
-        $durableByIndex = $durableReplicas->keyBy('replica_index');
+        // Keyed by the member's Compose service, which is unique across the
+        // colour; a replica index is not, once a colour re-rolls more than one
+        // service.
+        $durableByService = $durableReplicas->keyBy('compose_service');
         $selected = [];
         foreach ($requestedReplicas as $requestedReplica) {
-            $durableReplica = $durableByIndex->get($requestedReplica->replica_index);
+            $durableReplica = $durableByService->get($requestedReplica->compose_service);
             if (! $durableReplica instanceof ApplicationBlueGreenReplica
                 || (string) $durableReplica->getKey() !== (string) $requestedReplica->getKey()
                 || $durableReplica->container_name !== $requestedReplica->container_name
@@ -197,6 +208,6 @@ final class RemoveBlueGreenReplicaSet
             $selected[] = $durableReplica;
         }
 
-        return collect($selected)->sortBy('replica_index')->values();
+        return collect($selected)->sortBy([['replica_index', 'asc'], ['compose_service', 'asc']])->values();
     }
 }

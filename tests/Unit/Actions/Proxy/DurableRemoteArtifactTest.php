@@ -72,6 +72,31 @@ it('rejects a group-writable artifact directory before opening durable state', f
     }
 });
 
+it('names the refused path and reason on stderr when an ownership assert fails', function (): void {
+    $fixture = durableRemoteArtifactFixture();
+
+    try {
+        chmod($fixture['directory'], 0770);
+        $rejectedDirectory = runDurableRemoteArtifactCommand(
+            'durable_remote_assert_owned_directory '.escapeshellarg($fixture['directory']),
+            $fixture['environment'],
+        );
+        chmod($fixture['directory'], 0700);
+        $missing = $fixture['directory'].'/missing-artifact';
+        $rejectedRegular = runDurableRemoteArtifactCommand(
+            'durable_remote_assert_owned_regular '.escapeshellarg($missing),
+            $fixture['environment'],
+        );
+
+        expect($rejectedDirectory->isSuccessful())->toBeFalse()
+            ->and($rejectedDirectory->getErrorOutput())->toContain($fixture['directory'])
+            ->and($rejectedRegular->isSuccessful())->toBeFalse()
+            ->and($rejectedRegular->getErrorOutput())->toContain($missing);
+    } finally {
+        (new Filesystem)->remove($fixture['root']);
+    }
+});
+
 it('publishes a stage only after its file barrier and then syncs the containing directory', function (): void {
     $fixture = durableRemoteArtifactFixture();
     $stage = $fixture['directory'].'/.stage';

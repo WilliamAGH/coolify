@@ -41,11 +41,13 @@ use App\Actions\Application\BlueGreen\RemoveBlueGreenComposeSidecars;
 use App\Actions\Application\BlueGreen\RemoveBlueGreenInactiveContainer;
 use App\Actions\Application\BlueGreen\RemoveBlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\RemoveExactBlueGreenCandidate;
+use App\Actions\Application\BlueGreen\ResolveBlueGreenActiveContainerSet;
 use App\Actions\Application\BlueGreen\StartBlueGreenComposeSidecars;
 use App\Actions\Application\BlueGreen\TransitionsBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\VerifyBlueGreenCandidateReleaseProof;
 use App\Actions\Application\BlueGreen\VerifyBlueGreenPublicRecovery;
 use App\Actions\Application\BlueGreen\WaitForBlueGreenLegacyDockerRouting;
+use App\Actions\Proxy\BlueGreenActiveContainerSet;
 use App\Actions\Proxy\BlueGreenProxyConfiguration;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifactCommitter;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifactReader;
@@ -568,7 +570,7 @@ final class BlueGreenDeploymentLifecycle
             ? (new InspectBlueGreenContainer)->runningMutationCompletionAssertionsFor($candidateExpectation)
             : (new InspectBlueGreenReplicaSet)->runningMutationCompletionAssertionsFor(
                 $replicaRows,
-                $replicaSet->count,
+                $replicaSet,
             );
         if ($claim->previousActiveColor === null && $this->application->build_pack === 'dockercompose') {
             $sidecarPlan = (new RemoveBlueGreenComposeSidecars)->planFor($this->application);
@@ -1027,7 +1029,7 @@ final class BlueGreenDeploymentLifecycle
                 $claim->deploymentUuid,
                 $claim->pendingColor,
                 $claim->expectedRoutingRevision,
-                $candidateRows->count(),
+                BlueGreenReplicaSet::fromReplicas($candidateRows, $claim->candidateComposeServices()),
             );
             if ($this->candidateContainerExpectation?->dockerId !== BlueGreenReplicaSet::identityDigest($this->candidateReplicaInspections)) {
                 throw new DeploymentException('The recovered candidate replica set does not match its durable operation identity.');
@@ -1035,6 +1037,34 @@ final class BlueGreenDeploymentLifecycle
         }
 
         $this->loadPreviousRecoveryReplicaInspections($state);
+    }
+
+    /**
+     * How the outgoing color's ledger groups. Resolved from the durable state
+     * rather than counted back off the inspections already held, so a member
+     * that disappeared between the two reads fails the ledger assertion instead
+     * of silently shrinking the set that is checked.
+     */
+    private function previousReplicaSet(
+        ApplicationBlueGreenDeployment $state,
+        string $deploymentUuid,
+        BlueGreenDeploymentColor $color,
+    ): BlueGreenReplicaSet {
+        $rows = ApplicationBlueGreenReplica::query()
+            ->where('application_blue_green_deployment_id', $state->id)
+            ->where('deployment_uuid', $deploymentUuid)
+            ->where('color', $color->value)
+            ->orderBy('replica_index')
+            ->get();
+
+        try {
+            return BlueGreenReplicaSet::fromReplicas(
+                $rows,
+                $state->candidateComposeServicesFor($color, $deploymentUuid, $this->application),
+            );
+        } catch (\InvalidArgumentException $exception) {
+            throw new DeploymentException('The previous blue-green replica ledger no longer groups under its durable members.', 0, $exception);
+        }
     }
 
     private function loadPreviousRecoveryReplicaInspections(
@@ -1059,7 +1089,11 @@ final class BlueGreenDeploymentLifecycle
             $previous->deploymentUuid,
             $previous->color,
             $previous->routingRevision,
-            $previousRows->count(),
+            BlueGreenReplicaSet::fromReplicas($previousRows, $state->candidateComposeServicesFor(
+                $previous->color,
+                $previous->deploymentUuid,
+                $this->application,
+            )),
         );
         if ($previous->dockerId !== BlueGreenReplicaSet::identityDigest($this->previousReplicaInspections)) {
             throw new DeploymentException('The recovered previous replica set does not match its durable operation identity.');
@@ -1135,6 +1169,56 @@ final class BlueGreenDeploymentLifecycle
      *
      * @return array<int, array{blue: string, green: string}>
      */
+    /**
+     * The containers `$activeColor` owns, as the fence record names them.
+     *
+     * Null whenever the destination re-rolls a single service, which keeps its
+     * fence record on the scalar encoding. Composed from the replicas this
+     * process actually inspected, so the record names identities that were
+     * observed running rather than identities the topology merely predicts.
+     */
+    private function activeContainerSetFor(
+        BlueGreenDeploymentColor $activeColor,
+        BlueGreenDeploymentClaim $claim,
+        string $scalarContainerName,
+        string $scalarContainerId,
+    ): ?BlueGreenActiveContainerSet {
+        $topology = $this->application->blueGreenComposeTopology();
+        if ($topology === null) {
+            return null;
+        }
+
+        if ($activeColor === $claim->pendingColor) {
+            $inspections = $this->candidateReplicaInspections;
+            $replicaSet = new BlueGreenReplicaSet($claim->replicaCount, $claim->candidateComposeServices());
+        } else {
+            $inspections = $this->previousReplicaInspections;
+            $previous = $this->previousContainerExpectation;
+            if ($previous?->deploymentUuid === null) {
+                return null;
+            }
+            $state = ApplicationBlueGreenDeployment::query()->find($claim->stateId);
+            if ($state === null) {
+                return null;
+            }
+            $replicaSet = $this->previousReplicaSet($state, $previous->deploymentUuid, $activeColor);
+        }
+
+        if ($inspections === [] || $replicaSet->members === []) {
+            return null;
+        }
+
+        return ResolveBlueGreenActiveContainerSet::run(
+            $this->application,
+            $topology,
+            $activeColor,
+            $replicaSet,
+            $inspections,
+            $scalarContainerName,
+            $scalarContainerId,
+        );
+    }
+
     private function portContainerNames(BlueGreenDeploymentClaim $claim): array
     {
         $services = $claim->backendPortInventory->services();
@@ -1256,7 +1340,11 @@ final class BlueGreenDeploymentLifecycle
             $deploymentUuid,
             $state->active_color,
             (int) $routingRevisions->sole(),
-            $rows->count(),
+            BlueGreenReplicaSet::fromReplicas($rows, $state->candidateComposeServicesFor(
+                $state->active_color,
+                $deploymentUuid,
+                $this->application,
+            )),
         );
         if (collect($inspections)->contains(
             static fn (BlueGreenReplicaInspection $inspection): bool => $inspection->status !== 'running'
@@ -1421,15 +1509,16 @@ final class BlueGreenDeploymentLifecycle
                 ->where('application_id', $this->application->id)
                 ->where('standalone_docker_id', $this->destination->id)
                 ->firstOrFail();
+            $previousColor = $expectation->color
+                ?? throw new DeploymentException('The previous replica set has no durable color.');
             $current = InspectBlueGreenReplicaSet::run(
                 $this->server,
                 $state,
                 (string) $expectation->deploymentUuid,
-                $expectation->color
-                    ?? throw new DeploymentException('The previous replica set has no durable color.'),
+                $previousColor,
                 $expectation->routingRevision
                     ?? throw new DeploymentException('The previous replica set has no durable routing revision.'),
-                count($this->previousReplicaInspections),
+                $this->previousReplicaSet($state, (string) $expectation->deploymentUuid, $previousColor),
             );
             if (BlueGreenReplicaSet::identityDigest($current) !== BlueGreenReplicaSet::identityDigest($this->previousReplicaInspections)
                 || collect($current)->contains(
@@ -1553,7 +1642,9 @@ final class BlueGreenDeploymentLifecycle
         BlueGreenDeploymentClaim $claim,
         BlueGreenReplicaSet $replicaSet,
     ): void {
-        $replicaCount = $replicaSet->count;
+        // Every replica of every co-rolled member has to be up, so a colour whose
+        // second service never came up cannot be promoted.
+        $expectedContainers = $replicaSet->promotionThreshold();
         $startPeriod = max(0, (int) $this->application->health_check_start_period);
         for ($elapsed = 0; $elapsed < $startPeriod; $elapsed++) {
             ($this->checkForCancellation)();
@@ -1571,7 +1662,7 @@ final class BlueGreenDeploymentLifecycle
                 $claim->deploymentUuid,
                 $claim->pendingColor,
                 $claim->expectedRoutingRevision,
-                $replicaCount,
+                $replicaSet,
             );
             $this->assertOperationOwned(BlueGreenDeploymentPhase::PREPARING);
             if ($inspections !== []) {
@@ -1582,9 +1673,9 @@ final class BlueGreenDeploymentLifecycle
                     && $inspection->health === 'healthy',
             )->count();
             $this->deployment->addLogEntry(
-                "Blue-green replica health attempt {$attempt} of {$attempts}: {$healthy} of {$replicaCount} running and healthy."
+                "Blue-green replica health attempt {$attempt} of {$attempts}: {$healthy} of {$expectedContainers} running and healthy."
             );
-            if (count($inspections) === $replicaCount && $healthy === $replicaCount) {
+            if (count($inspections) === $expectedContainers && $healthy === $expectedContainers) {
                 $replicaSet->assertPromotionThreshold($inspections);
                 $this->candidateReplicaInspections = $inspections;
                 $digest = BlueGreenReplicaSet::identityDigest($inspections);
@@ -1605,7 +1696,7 @@ final class BlueGreenDeploymentLifecycle
                 static fn (BlueGreenReplicaInspection $inspection): bool => $inspection->status !== 'running'
                     || in_array($inspection->health, ['unhealthy', 'missing'], true),
             )) {
-                throw new DeploymentException("The blue-green replica set is only {$healthy} of {$replicaCount} healthy; promotion is refused before routing mutation.");
+                throw new DeploymentException("The blue-green replica set is only {$healthy} of {$expectedContainers} healthy; promotion is refused before routing mutation.");
             }
             if ($attempt < $attempts) {
                 Sleep::for(max(1, (int) $this->application->health_check_interval))->seconds();
@@ -1818,6 +1909,12 @@ final class BlueGreenDeploymentLifecycle
             blueReplicaBackends: $usesReplicaBackends ? $blueReplicaBackends : null,
             greenReplicaBackends: $usesReplicaBackends ? $greenReplicaBackends : null,
             portContainerNames: $this->portContainerNames($claim),
+            activeContainerSet: $this->activeContainerSetFor(
+                $activeColor,
+                $claim,
+                $this->containerName($activeColor),
+                $activeContainer->dockerId,
+            ),
         );
     }
 
@@ -1984,7 +2081,10 @@ final class BlueGreenDeploymentLifecycle
                 $claim->deploymentUuid,
                 $claim->pendingColor,
                 $claim->expectedRoutingRevision,
-                count($this->candidateReplicaInspections),
+                BlueGreenReplicaSet::fromReplicas(
+                    $this->candidateReplicaRows($claim),
+                    $claim->candidateComposeServices(),
+                ),
             );
             if (BlueGreenReplicaSet::identityDigest($current) !== BlueGreenReplicaSet::identityDigest($this->candidateReplicaInspections)
                 || collect($current)->contains(
@@ -2564,7 +2664,7 @@ final class BlueGreenDeploymentLifecycle
             $claim->deploymentUuid,
             $claim->pendingColor,
             $claim->expectedRoutingRevision,
-            $claim->replicaCount,
+            new BlueGreenReplicaSet($claim->replicaCount, $claim->candidateComposeServices()),
         );
         $this->assertOperationOwned(BlueGreenDeploymentPhase::ROLLING_BACK);
         if ($inspections !== []) {
