@@ -2,7 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
-## [unreleased]
+## [4.13.61-fork] - 2026-08-05
+
+### 🚀 Features
+
+- *(blue-green)* Key the replica ledger and candidate identity by co-rolled member
+- *(blue-green)* Finish multi-service Compose color swaps
+
+### 🐛 Bug Fixes
+
+- *(templates)* Stop the docker registry exporting traces to nowhere
+- *(tests)* Stop factories generating names the product refuses
+
+### 📚 Documentation
+
+- Update changelog
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.61-fork
+
+## [4.13.60-fork] - 2026-08-03
 
 ### 🐛 Bug Fixes
 
@@ -10,7 +31,6 @@ All notable changes to this project will be documented in this file.
 
 ### 📚 Documentation
 
-- Update changelog
 - Update changelog
 - Update changelog
 
