@@ -2,6 +2,7 @@
 
 namespace App\Jobs;
 
+use App\Actions\Application\BlueGreen\BlueGreenDeploymentTransitionException;
 use App\Actions\Application\BlueGreen\MarkBlueGreenRecoveryInterventionRequired;
 use App\Actions\Application\BlueGreen\RecoverBlueGreenIntervention;
 use App\Enums\ApplicationDeploymentStatus;
@@ -199,7 +200,7 @@ final class ResumeBlueGreenDrainingDeploymentJob implements ShouldQueue
                 'Blue-green drain recovery could not prove exact lifecycle ownership: '.$exception->getMessage(),
                 'stderr',
             );
-            $this->parkUnreconstructableOwner($deployment);
+            $this->parkUnreconstructableOwner($deployment, $exception);
 
             return;
         }
@@ -234,8 +235,19 @@ final class ResumeBlueGreenDrainingDeploymentJob implements ShouldQueue
      * retired, and the destination is handed to the recovery owners that can
      * classify it — automatic intervention recovery first, break-glass after.
      */
-    private function parkUnreconstructableOwner(ApplicationDeploymentQueue $deployment): void
-    {
+    private function parkUnreconstructableOwner(
+        ApplicationDeploymentQueue $deployment,
+        Throwable $exception,
+    ): void {
+        // Only a durable-state verdict parks anything. Reaching this branch does
+        // not by itself prove the operation is unreconstructable: initialization
+        // also reads the server boot identity over SSH, and a host that blinks
+        // would otherwise park a perfectly resumable drain — permanently, since
+        // the classifier then refuses to reopen it.
+        if (! $exception instanceof BlueGreenDeploymentTransitionException) {
+            return;
+        }
+
         $state = ApplicationBlueGreenDeployment::query()
             ->where('application_id', $deployment->application_id)
             ->where('standalone_docker_id', $deployment->destination_id)

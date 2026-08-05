@@ -936,3 +936,25 @@ it('parks an unreconstructable draining owner instead of leaving it for an endle
         ->and($scenario->state->fresh()->intervention_reason)
         ->toBe(RecoverBlueGreenIntervention::UNRECONSTRUCTABLE_DRAIN_REASON);
 });
+
+it('leaves a resumable drain alone when the resume failed for a reason other than durable state', function (): void {
+    Queue::fake();
+    $scenario = BlueGreenRecoveryScenario::create(finalized: true, routingMutationRecorded: true);
+    $scenario->state->update(['phase' => BlueGreenDeploymentPhase::DRAINING]);
+    $scenario->deployment->update([
+        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+        'blue_green_phase' => BlueGreenDeploymentPhase::DRAINING,
+        'finished_at' => null,
+    ]);
+    // The destination row is intact; the server the resume needs is not
+    // reachable, which is the shape of a host that blinked rather than of an
+    // operation that can never be reconstructed.
+    $scenario->deployment->update(['server_id' => $scenario->server->id + 999]);
+
+    (new ResumeBlueGreenDrainingDeploymentJob($scenario->deployment->id))->handle();
+
+    // Parking here would be permanent: the classifier refuses to reopen a drain
+    // marked unreconstructable, so a blink would cost a manual intervention.
+    expect($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::DRAINING)
+        ->and($scenario->state->fresh()->intervention_reason)->toBeNull();
+});
