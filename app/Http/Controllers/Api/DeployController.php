@@ -362,6 +362,23 @@ class DeployController extends Controller
             ], 500);
         }
 
+        // A cancellation performed here owes the same follow-up work the cancel
+        // endpoint does: a genuinely stuck helper container is exactly what
+        // break-glass was called about, and a queue left unadvanced strands
+        // every successor behind the deployment we just cleared.
+        if ($recovery['cancelled'] === true) {
+            $this->cleanupCancelledDeployment($deployment, $teamId);
+
+            try {
+                next_after_cancel($deployment);
+            } catch (\Throwable $e) {
+                Log::warning('Failed to advance deployment queue after emergency recovery.', [
+                    'deployment_uuid' => $deployment->deployment_uuid,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
         auditLog('api.deployment.recovered', [
             'team_id' => $teamId,
             'deployment_uuid' => $deployment->deployment_uuid,

@@ -141,6 +141,92 @@ it('routes a parked intervention through recovery instead of leaving it fenced',
         );
 });
 
+it('recovers a draining hang without first cancelling the row its owner proof needs', function () {
+    $deployment = makeEmergencyRecoveryDeployment($this->environment, $this->server, $this->destination);
+    $deployment->update([
+        'blue_green_phase' => BlueGreenDeploymentPhase::DRAINING,
+        'blue_green_supersession_generation' => 1,
+    ]);
+    ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $deployment->application_id,
+        'standalone_docker_id' => $this->destination->id,
+        'phase' => BlueGreenDeploymentPhase::DRAINING,
+        'operation_deployment_uuid' => $deployment->deployment_uuid,
+        'active_color' => BlueGreenDeploymentColor::BLUE,
+        'supersession_generation' => 1,
+    ]);
+
+    $response = $this->withHeaders(emergencyRecoveryHeaders($this->token))
+        ->postJson("/api/v1/deployments/{$deployment->deployment_uuid}/recover");
+
+    $response->assertOk();
+
+    // The reconciler's exact-owner proof requires an IN_PROGRESS queue row, so
+    // cancelling before recovery would demote this to manual_only and, when a
+    // fenced resume owner is in flight, strand the work it was called to
+    // finish. Neither may happen.
+    expect($response->json('outcome'))->not->toBe('manual_only');
+
+    if ($response->json('outcome') === 'deferred') {
+        expect($response->json('cancelled'))->toBeFalse()
+            ->and($deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
+    }
+});
+
+it('refuses to recover through a stale deployment uuid that no longer owns the destination', function () {
+    $deployment = makeEmergencyRecoveryDeployment(
+        $this->environment,
+        $this->server,
+        $this->destination,
+        ApplicationDeploymentStatus::FAILED->value,
+    );
+    $liveOperationUuid = (string) str()->uuid();
+    ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $deployment->application_id,
+        'standalone_docker_id' => $this->destination->id,
+        'phase' => BlueGreenDeploymentPhase::DRAINING,
+        'operation_deployment_uuid' => $liveOperationUuid,
+        'active_color' => BlueGreenDeploymentColor::BLUE,
+        'supersession_generation' => 2,
+    ]);
+
+    $this->withHeaders(emergencyRecoveryHeaders($this->token))
+        ->postJson("/api/v1/deployments/{$deployment->deployment_uuid}/recover")
+        ->assertOk()
+        ->assertJsonPath('outcome', 'manual_only')
+        ->assertJsonPath('cancelled', false);
+
+    // The newer operation must be untouched by the stale handle.
+    $state = ApplicationBlueGreenDeployment::query()
+        ->where('standalone_docker_id', $this->destination->id)
+        ->firstOrFail();
+    expect($state->phase)->toBe(BlueGreenDeploymentPhase::DRAINING)
+        ->and($state->operation_deployment_uuid)->toBe($liveOperationUuid);
+});
+
+it('never reports clean while the destination is still fenced for the next push', function () {
+    $deployment = makeEmergencyRecoveryDeployment($this->environment, $this->server, $this->destination);
+    ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $deployment->application_id,
+        'standalone_docker_id' => $this->destination->id,
+        'phase' => BlueGreenDeploymentPhase::DEACTIVATING,
+        'operation_deployment_uuid' => $deployment->deployment_uuid,
+        'active_color' => BlueGreenDeploymentColor::BLUE,
+        'supersession_generation' => 1,
+    ]);
+
+    $response = $this->withHeaders(emergencyRecoveryHeaders($this->token))
+        ->postJson("/api/v1/deployments/{$deployment->deployment_uuid}/recover");
+
+    $response->assertOk();
+
+    // A DEACTIVATING state is skipped by the reconciler, which would otherwise
+    // read as "no work left"; it is not claimable, so it must not read clean.
+    if ($response->json('claimable') === false) {
+        expect($response->json('outcome'))->not->toBe('clean');
+    }
+});
+
 it('refuses emergency recovery for a deployment owned by another team', function () {
     $deployment = makeEmergencyRecoveryDeployment($this->environment, $this->server, $this->destination);
     $otherUser = User::factory()->create();

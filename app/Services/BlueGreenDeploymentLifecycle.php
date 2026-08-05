@@ -73,6 +73,7 @@ use App\Models\ApplicationDeploymentQueue;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
 use App\Support\ValidationPatterns;
+use Carbon\CarbonImmutable;
 use Closure;
 use Illuminate\Cache\Lock;
 use Illuminate\Support\Collection;
@@ -812,6 +813,23 @@ final class BlueGreenDeploymentLifecycle
             $this->retirePreviousContainer();
         }
         $this->complete();
+    }
+
+    /**
+     * The immutable drain deadline of the operation this recovery owns, so a
+     * caller can decide whether the bounded recovery budget is durably spent
+     * rather than trusting a counter that every re-dispatch resets.
+     */
+    public function drainRecoveryDeadline(): ?CarbonImmutable
+    {
+        $stateId = $this->claim?->stateId;
+        if ($stateId === null) {
+            return null;
+        }
+
+        $deadline = ApplicationBlueGreenDeployment::query()->find($stateId)?->operation_drain_deadline_at;
+
+        return $deadline === null ? null : $deadline->toImmutable();
     }
 
     /**

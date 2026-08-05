@@ -102,11 +102,12 @@ final class ResumeBlueGreenDrainingDeploymentJob implements ShouldQueue
         ApplicationDeploymentQueue $deployment,
         BlueGreenDeploymentLifecycle $lifecycle,
     ): bool {
-        if ($this->scheduleNextAttempt($deployment)) {
-            return true;
-        }
-        if ($this->recoveryAttempt < self::MAX_ATTEMPTS) {
+        if ($deployment->status !== ApplicationDeploymentStatus::IN_PROGRESS->value
+            || $deployment->blue_green_phase !== BlueGreenDeploymentPhase::DRAINING) {
             return false;
+        }
+        if (! $this->hasSpentDrainBudget($lifecycle) && $this->scheduleNextAttempt($deployment)) {
+            return true;
         }
 
         try {
@@ -124,6 +125,26 @@ final class ResumeBlueGreenDrainingDeploymentJob implements ShouldQueue
         (new ApplicationDeploymentJob($deployment->id))->completeBlueGreenDrainRecovery();
 
         return true;
+    }
+
+    /**
+     * The bounded recovery budget has to be durable, not merely a job-payload
+     * counter. Both the scheduled reconciler and intervention recovery
+     * re-dispatch this job with the attempt reset to one, so an attempt-only
+     * budget can be restarted forever against a deadline that already passed.
+     * The immutable deadline is persisted, so the budget is measured as
+     * wall-clock beyond it and survives every re-dispatch.
+     */
+    private function hasSpentDrainBudget(BlueGreenDeploymentLifecycle $lifecycle): bool
+    {
+        if ($this->recoveryAttempt >= self::MAX_ATTEMPTS) {
+            return true;
+        }
+
+        $deadline = $lifecycle->drainRecoveryDeadline();
+
+        return $deadline !== null
+            && $deadline->addSeconds(self::MAX_ATTEMPTS * self::RETRY_DELAY_SECONDS)->isPast();
     }
 
     public function failed(?Throwable $exception): void

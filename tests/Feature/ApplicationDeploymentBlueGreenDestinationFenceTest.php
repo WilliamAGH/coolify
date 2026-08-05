@@ -376,6 +376,113 @@ it('never leaves a spent drain budget resumable by no one', function () {
     Queue::assertNotPushed(ResumeBlueGreenDrainingDeploymentJob::class);
 });
 
+/**
+ * A claim whose stateId points at a real durable DRAINING row, so the immutable
+ * drain deadline can actually be read back the way the recovery owner reads it.
+ */
+function applicationDeploymentBlueGreenDrainingClaim(
+    array $fixture,
+    string $drainStartedAt,
+    string $drainDeadlineAt,
+): BlueGreenDeploymentClaim {
+    $state = ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $fixture['application']->id,
+        'standalone_docker_id' => $fixture['destination']->id,
+        'phase' => BlueGreenDeploymentPhase::DRAINING,
+        'active_color' => BlueGreenDeploymentColor::BLUE,
+        'operation_deployment_uuid' => $fixture['deployment']->deployment_uuid,
+        'supersession_generation' => 1,
+        'operation_drain_started_at' => $drainStartedAt,
+        'operation_drain_deadline_at' => $drainDeadlineAt,
+    ]);
+
+    return new BlueGreenDeploymentClaim(
+        stateId: $state->id,
+        applicationId: $fixture['application']->id,
+        standaloneDockerId: $fixture['destination']->id,
+        pendingColor: BlueGreenDeploymentColor::BLUE,
+        previousActiveColor: null,
+        deploymentUuid: $fixture['deployment']->deployment_uuid,
+        expectedRoutingRevision: 1,
+        destinationFenceEpoch: 1,
+        serverBootId: '11111111-2222-3333-4444-555555555555',
+        topologyDigest: hash('sha256', 'application-destination-topology'),
+        routingConfigDigest: hash('sha256', 'application-routing-configuration'),
+        backendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
+        drainBackendPortInventory: null,
+        supersessionGeneration: 1,
+        legacyContainerName: null,
+        candidateContainerName: $fixture['application']->uuid.'-blue',
+        rollbackManagedFilename: 'application-destination-fence.rollback.yaml',
+    );
+}
+
+it('treats a drain budget as spent from durable deadline evidence, not a resettable counter', function () {
+    $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
+    Queue::fake();
+    $fixture['deployment']->update([
+        'blue_green_phase' => BlueGreenDeploymentPhase::DRAINING,
+        'blue_green_supersession_generation' => 1,
+    ]);
+    $claim = applicationDeploymentBlueGreenDrainingClaim(
+        $fixture,
+        now()->subHour()->toDateTimeString(),
+        now()->subHour()->addMinute()->toDateTimeString(),
+    );
+    $lifecycle = applicationDeploymentBlueGreenLifecycle($fixture);
+    setApplicationDeploymentBlueGreenProperty($lifecycle, 'claim', $claim);
+
+    // Attempt one, but the immutable deadline elapsed an hour ago. A reconciler
+    // or intervention recovery re-dispatches this job with the counter reset,
+    // so an attempt-only budget would restart the timeout loop forever.
+    $firstAttempt = new ResumeBlueGreenDrainingDeploymentJob($fixture['deployment']->id, 1);
+
+    expect(invokeApplicationDeploymentBlueGreenMethod($firstAttempt, 'hasSpentDrainBudget', $lifecycle))
+        ->toBeTrue()
+        ->and(invokeApplicationDeploymentBlueGreenMethod(
+            $firstAttempt,
+            'resolveRetryableDrainTimeout',
+            $fixture['deployment'],
+            $lifecycle,
+        ))->toBeFalse();
+
+    // The spent budget must resolve terminally, never by queuing another resume.
+    Queue::assertNotPushed(ResumeBlueGreenDrainingDeploymentJob::class);
+    expect($fixture['deployment']->fresh()->logs)
+        ->toContain('could not retire the exact unrouted predecessor after its bounded budget was spent');
+});
+
+it('keeps retrying while the durable drain budget still has time left', function () {
+    $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
+    Queue::fake();
+    $fixture['deployment']->update([
+        'blue_green_phase' => BlueGreenDeploymentPhase::DRAINING,
+        'blue_green_supersession_generation' => 1,
+    ]);
+    $claim = applicationDeploymentBlueGreenDrainingClaim(
+        $fixture,
+        now()->subMinute()->toDateTimeString(),
+        now()->toDateTimeString(),
+    );
+    $lifecycle = applicationDeploymentBlueGreenLifecycle($fixture);
+    setApplicationDeploymentBlueGreenProperty($lifecycle, 'claim', $claim);
+    $firstAttempt = new ResumeBlueGreenDrainingDeploymentJob($fixture['deployment']->id, 1);
+
+    expect(invokeApplicationDeploymentBlueGreenMethod($firstAttempt, 'hasSpentDrainBudget', $lifecycle))
+        ->toBeFalse()
+        ->and(invokeApplicationDeploymentBlueGreenMethod(
+            $firstAttempt,
+            'resolveRetryableDrainTimeout',
+            $fixture['deployment'],
+            $lifecycle,
+        ))->toBeTrue();
+
+    Queue::assertPushed(
+        ResumeBlueGreenDrainingDeploymentJob::class,
+        fn (ResumeBlueGreenDrainingDeploymentJob $job): bool => $job->recoveryAttempt === 2,
+    );
+});
+
 it('does not force a retirement while the bounded drain budget still has attempts left', function () {
     $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
     Queue::fake();

@@ -46,24 +46,79 @@ final class EmergencyRecoverApplicationDeployment
      */
     public function handle(ApplicationDeploymentQueue $deployment, string $reason): array
     {
-        $cancelled = $this->cancelHangingQueueEntry($deployment);
         $state = $this->stateFor($deployment);
 
-        if ($state === null) {
+        // A deployment UUID is a stable historical handle: the queue keeps every
+        // past record, so an old UUID still resolves this destination's current
+        // state. Recovering through it would let a stale handle mutate whatever
+        // newer operation happens to own the destination now.
+        if ($state !== null && ! $this->ownsDurableState($state, $deployment)) {
             return $this->result(
                 $deployment,
-                $cancelled,
-                self::CLEAN,
-                'No durable blue-green state owns this destination; the next deployment can claim it.',
-                true,
+                false,
+                self::MANUAL_ONLY,
+                'A different blue-green operation owns this destination; no recovery was attempted for this deployment.',
+                ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state),
             );
         }
 
-        [$outcome, $message] = $state->phase === BlueGreenDeploymentPhase::INTERVENTION_REQUIRED
-            ? $this->recoverParkedIntervention($state, $reason)
-            : $this->reconcileInterruptedOperation($state);
+        // Durable recovery runs strictly before the queue row is cancelled.
+        // Every exact-owner proof in the reconciler requires that row to still
+        // be IN_PROGRESS, so cancelling first would demote a recoverable
+        // DRAINING hang into a manual-only intervention — the precise outcome
+        // this endpoint exists to avoid.
+        [$outcome, $message] = match (true) {
+            $state === null => [self::CLEAN, 'No durable blue-green state owns this destination; the next deployment can claim it.'],
+            $state->phase === BlueGreenDeploymentPhase::INTERVENTION_REQUIRED => $this->recoverParkedIntervention($state, $reason),
+            default => $this->reconcileInterruptedOperation($state),
+        };
 
-        return $this->result($deployment, $cancelled, $outcome, $message, $this->isClaimable($deployment));
+        $cancelled = $this->cancelAfterRecovery($deployment, $outcome);
+        $claimable = $this->isClaimable($deployment);
+
+        // Claimability is the only outcome the caller can act on, so a clean
+        // report must never outrun it: a destination still fenced for the next
+        // push is not clean, whatever the recovery owner classified.
+        if ($outcome === self::CLEAN && ! $claimable) {
+            $outcome = self::MANUAL_ONLY;
+            $message = 'Recovery reported no remaining work, but this destination is still fenced for the next deployment: '.$message;
+        }
+
+        return $this->result($deployment, $cancelled, $outcome, $message, $claimable);
+    }
+
+    /**
+     * Exact ownership means this deployment is the operation the durable state
+     * is actually running, either as the committed operation owner or as the
+     * pending claim.
+     */
+    private function ownsDurableState(
+        ApplicationBlueGreenDeployment $state,
+        ApplicationDeploymentQueue $deployment,
+    ): bool {
+        $uuid = $deployment->deployment_uuid;
+
+        return $uuid !== null
+            && in_array($uuid, [$state->operation_deployment_uuid, $state->pending_deployment_uuid], true);
+    }
+
+    /**
+     * A deferred outcome means a fenced recovery owner is in flight — for a
+     * DRAINING state the reconciler has just queued the resume job that will
+     * retire the predecessor and publish this release. That owner needs the
+     * exact queue row left IN_PROGRESS, so cancelling here would strand the
+     * work break-glass was called to finish. Cancellation is for a row no
+     * recovery owner is still driving.
+     */
+    private function cancelAfterRecovery(ApplicationDeploymentQueue $deployment, string $outcome): bool
+    {
+        if ($outcome === self::DEFERRED) {
+            return false;
+        }
+
+        $deployment->refresh();
+
+        return $this->cancelHangingQueueEntry($deployment);
     }
 
     /**
