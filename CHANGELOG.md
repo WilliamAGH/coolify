@@ -8,12 +8,22 @@ All notable changes to this project will be documented in this file.
 
 - *(blue-green)* Unblock deployments after a retirement needs intervention
 - *(blue-green)* Resolve a spent drain budget instead of stranding DRAINING
+- *(blue-green)* Make the drain budget durable and fence break-glass recovery
 
 ### 📚 Documentation
 
 - Update changelog
 - Update changelog
 - Update changelog
+- Update changelog
+
+### 🧪 Testing
+
+- *(blue-green)* Prove forced retirement issues the exact stop it claims
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.63-fork
 
 ## [4.13.62-fork] - 2026-08-05
 
