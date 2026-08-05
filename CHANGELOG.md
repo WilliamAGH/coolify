@@ -4,14 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🚀 Features
+
+- *(fork-deploy)* Adopt a signed running release that was never recorded
+
 ### 🐛 Bug Fixes
 
-- *(api)* Release a deployment stranded after a newer operation took over
-- *(deps)* Move the production base image past two high-severity PHP CVEs
+- *(blue-green)* Prove a recovery owner exists before break-glass spares its row
+- *(blue-green)* Finish the obligations a finalized fallback leaves behind
 
 ### 📚 Documentation
 
+- *(fork-deploy)* Give unrecorded-release adoption an operator runbook
 - Update changelog
+
+### 🧪 Testing
+
+- *(blue-green)* Prove the auto-recovery handoff tells a push to retry
+- *(blue-green)* Follow the reopened finalized handoff in the fleet suite
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.64-fork
 
 ## [4.13.63-fork] - 2026-08-05
 
@@ -20,9 +34,12 @@ All notable changes to this project will be documented in this file.
 - *(blue-green)* Unblock deployments after a retirement needs intervention
 - *(blue-green)* Resolve a spent drain budget instead of stranding DRAINING
 - *(blue-green)* Make the drain budget durable and fence break-glass recovery
+- *(api)* Release a deployment stranded after a newer operation took over
+- *(deps)* Move the production base image past two high-severity PHP CVEs
 
 ### 📚 Documentation
 
+- Update changelog
 - Update changelog
 - Update changelog
 - Update changelog
