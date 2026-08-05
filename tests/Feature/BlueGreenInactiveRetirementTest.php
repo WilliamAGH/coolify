@@ -4,6 +4,7 @@ use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
 use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
+use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\ComputeBlueGreenDeploymentFingerprint;
 use App\Actions\Application\BlueGreen\DrainBlueGreenPreviousContainer;
 use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
@@ -932,4 +933,175 @@ KEY;
         ->and($sawJournalRepair)->toBeTrue()
         ->and($state->fresh()->inactive_retirement_stopped_at)->not->toBeNull()
         ->and($state->fresh()->destination_fence_mutation_sequence)->toBe(5);
+});
+
+/**
+ * One idle generation whose delayed retirement already required intervention,
+ * exactly as a server reboot inside the retention window leaves it.
+ *
+ * @return array{application: Application, owner: ApplicationDeploymentQueue, state: ApplicationBlueGreenDeployment}
+ */
+function makeWedgedBlueGreenInactiveRetirement(): array
+{
+    $application = makeBlueGreenInactiveRetirementApplication();
+    $destination = $application->destination;
+    $server = $destination->server;
+    $ownerUuid = 'wedged-retirement-owner';
+    $inactiveUuid = 'wedged-retirement-inactive';
+    $activeContainerId = str_repeat('c', 64);
+    $inactiveContainerId = str_repeat('a', 64);
+    $fingerprint = ComputeBlueGreenDeploymentFingerprint::run(
+        $application,
+        $destination,
+        BlueGreenDeploymentColor::GREEN,
+        2,
+        2,
+        $ownerUuid,
+    );
+    $runtimeState = CompileBlueGreenProxyConfiguration::run(
+        $application,
+        $destination,
+        new BlueGreenRoutingTarget(
+            destinationId: $destination->id,
+            activeColor: BlueGreenDeploymentColor::GREEN,
+            blueContainerName: $application->uuid.'-blue',
+            greenContainerName: $application->uuid.'-green',
+            port: 3000,
+            routingRevision: 2,
+            publicProofToken: BlueGreenRoutingTarget::durablePublicProofToken($ownerUuid),
+            destinationFenceEpoch: 2,
+            operationId: $ownerUuid,
+            mutationSequence: 2,
+            activeDeploymentUuid: $ownerUuid,
+            activeContainerId: $activeContainerId,
+            destinationTopologyDigest: $fingerprint->topologyDigest,
+        ),
+    )->state;
+    $inventory = BlueGreenBackendPortInventory::forApplication($application, $application->settings);
+    $owner = ApplicationDeploymentQueue::query()->create([
+        'application_id' => $application->id,
+        'application_name' => $application->name,
+        'server_id' => $server->id,
+        'server_name' => $server->name,
+        'destination_id' => $destination->id,
+        'deployment_uuid' => $ownerUuid,
+        'pull_request_id' => 0,
+        'commit' => 'wedged-retirement-owner-commit',
+        'status' => ApplicationDeploymentStatus::FINISHED->value,
+        'blue_green_color' => BlueGreenDeploymentColor::GREEN,
+        'blue_green_phase' => BlueGreenDeploymentPhase::IDLE,
+        'blue_green_routing_revision' => 2,
+        'blue_green_destination_fence_epoch' => 2,
+        'blue_green_topology_digest' => $fingerprint->topologyDigest,
+        'blue_green_routing_config_digest' => $fingerprint->routingConfigDigest,
+        'blue_green_candidate_container_id' => $activeContainerId,
+        'blue_green_backend_port_inventory' => $inventory->serialized,
+        'blue_green_drain_backend_port_inventory' => $inventory->serialized,
+    ]);
+    ApplicationDeploymentQueue::query()->create([
+        'application_id' => $application->id,
+        'application_name' => $application->name,
+        'server_id' => $server->id,
+        'server_name' => $server->name,
+        'destination_id' => $destination->id,
+        'deployment_uuid' => $inactiveUuid,
+        'pull_request_id' => 0,
+        'commit' => 'wedged-retirement-inactive-commit',
+        'status' => ApplicationDeploymentStatus::FINISHED->value,
+        'blue_green_color' => BlueGreenDeploymentColor::BLUE,
+        'blue_green_phase' => BlueGreenDeploymentPhase::IDLE,
+        'blue_green_routing_revision' => 1,
+        'blue_green_destination_fence_epoch' => 1,
+        'blue_green_topology_digest' => $fingerprint->topologyDigest,
+        'blue_green_routing_config_digest' => $fingerprint->routingConfigDigest,
+        'blue_green_candidate_container_id' => $inactiveContainerId,
+        'blue_green_backend_port_inventory' => $inventory->serialized,
+    ]);
+    $state = ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $application->id,
+        'standalone_docker_id' => $destination->id,
+        'active_color' => BlueGreenDeploymentColor::GREEN,
+        'blue_deployment_uuid' => $inactiveUuid,
+        'green_deployment_uuid' => $ownerUuid,
+        'phase' => BlueGreenDeploymentPhase::IDLE,
+        'routing_revision' => 2,
+        'supersession_generation' => 2,
+        'destination_fence_epoch' => $runtimeState->destinationFenceEpoch,
+        'destination_fence_operation_id' => $runtimeState->operationId,
+        'destination_fence_mutation_sequence' => $runtimeState->mutationSequence,
+        'managed_file_sha256' => $runtimeState->managedSha256,
+        'destination_topology_digest' => $runtimeState->destinationTopologyDigest,
+        'application_routing_config_digest' => $runtimeState->applicationRoutingConfigDigest,
+        'inactive_retirement_owner_deployment_uuid' => $ownerUuid,
+        'inactive_retirement_color' => BlueGreenDeploymentColor::BLUE,
+        'inactive_retirement_deployment_uuid' => $inactiveUuid,
+        'inactive_retirement_container_id' => $inactiveContainerId,
+        'inactive_retirement_container_routing_revision' => 1,
+        'inactive_retirement_owner_routing_revision' => 2,
+        'inactive_retirement_supersession_generation' => 2,
+        'inactive_retirement_destination_fence_epoch' => 2,
+        'inactive_retirement_server_boot_id' => '11111111-2222-3333-4444-555555555555',
+        'inactive_retirement_topology_digest' => $runtimeState->destinationTopologyDigest,
+        'inactive_retirement_routing_config_digest' => $runtimeState->applicationRoutingConfigDigest,
+        'inactive_retirement_not_before_at' => now()->subMinute(),
+        'inactive_retirement_drain_deadline_at' => now(),
+        'inactive_retirement_stop_grace_seconds' => 30,
+        'inactive_retirement_lease_seconds' => 4_000,
+        'inactive_retirement_intervention_required_at' => now(),
+    ]);
+
+    return compact('application', 'owner', 'state');
+}
+
+it('supersedes a retirement that requires intervention when the next deployment is claimed', function (): void {
+    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeWedgedBlueGreenInactiveRetirement();
+    $destination = $application->destination;
+    $redeployment = ApplicationDeploymentQueue::query()->create([
+        'application_id' => $application->id,
+        'application_name' => $application->name,
+        'server_id' => $destination->server_id,
+        'server_name' => $destination->server->name,
+        'destination_id' => $destination->id,
+        'deployment_uuid' => 'wedged-retirement-redeploy',
+        'pull_request_id' => 0,
+        'commit' => 'wedged-retirement-redeploy-commit',
+        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+    ]);
+
+    $claim = ClaimBlueGreenDeployment::run(
+        $application,
+        $destination,
+        $redeployment,
+        '99999999-8888-7777-6666-555555555555',
+        null,
+        new BlueGreenContainerExpectation(
+            name: $application->uuid.'-green',
+            dockerId: $owner->blue_green_candidate_container_id,
+            applicationId: $application->id,
+            pullRequestId: 0,
+            blueGreenManaged: true,
+            deploymentUuid: $owner->deployment_uuid,
+            color: BlueGreenDeploymentColor::GREEN,
+            routingRevision: 2,
+        ),
+    );
+
+    $state = $state->fresh();
+    expect($claim->pendingColor)->toBe(BlueGreenDeploymentColor::BLUE)
+        ->and($state->phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
+        ->and($state->inactive_retirement_intervention_required_at)->toBeNull()
+        ->and($state->inactive_retirement_owner_deployment_uuid)->toBeNull()
+        ->and($state->inactive_retirement_container_id)->toBeNull()
+        ->and($owner->fresh()->status)->toBe(ApplicationDeploymentStatus::FINISHED->value);
+});
+
+it('leaves an already-marked retirement marked without a spurious transition failure', function (): void {
+    ['owner' => $owner, 'state' => $state] = makeWedgedBlueGreenInactiveRetirement();
+    $markedAt = $state->inactive_retirement_intervention_required_at;
+    Process::fake(fn () => Process::result(output: '11111111-2222-3333-4444-555555555555'));
+
+    expect(RetireBlueGreenInactiveContainer::run($state->id, $owner->deployment_uuid, 2))
+        ->toBe(RetireBlueGreenInactiveContainer::INTERVENTION)
+        ->and($state->fresh()->inactive_retirement_intervention_required_at->equalTo($markedAt))->toBeTrue()
+        ->and($state->fresh()->inactive_retirement_stopped_at)->toBeNull();
 });

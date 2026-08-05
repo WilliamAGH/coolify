@@ -194,9 +194,14 @@ final class BackfillBlueGreenBackendPortInventories
         if ($state->inactive_retirement_stopped_at !== null) {
             return;
         }
-        if ($state->inactive_retirement_intervention_required_at !== null) {
-            throw new BlueGreenDeploymentTransitionException('The pending inactive retirement already requires intervention and cannot be superseded.');
-        }
+        // A retirement that requires intervention is still supersedable. This
+        // backfill only makes a *pending* retirement executable; the claim that
+        // calls it is about to discard the whole retirement block, and the
+        // retained container it names is reclaimed fail-closed a phase later by
+        // RemoveBlueGreenInactiveContainer, which proves exact identity from
+        // blue_deployment_uuid/green_deployment_uuid rather than from this
+        // provenance. Refusing here only wedged the application: nothing else
+        // clears the marker, so every later deployment was refused too.
         if (! is_string($state->inactive_retirement_owner_deployment_uuid)
             || ! is_string($state->inactive_retirement_deployment_uuid)
             || ! $state->inactive_retirement_color instanceof BlueGreenDeploymentColor
