@@ -644,11 +644,16 @@ final class BlueGreenDeploymentLifecycle
                 "Blue-green previous container {$expectation->name} is being retired with the configured {$stopTimeout}s Docker stop grace period after its bounded drain budget was spent.",
                 'stderr',
             );
-            $this->destinationState = $this->executeDestinationMutation(
-                $drainer->forcedStopCommandsFor($expectation, $stopTimeout),
-                $drainer->completionAssertionsFor($expectation),
-            );
-            (new RecordBlueGreenDrainObservation)->record($claim, 0);
+            try {
+                $this->destinationState = $this->executeDestinationMutation(
+                    $drainer->forcedStopCommandsFor($expectation, $stopTimeout),
+                    $drainer->completionAssertionsFor($expectation),
+                );
+                (new RecordBlueGreenDrainObservation)->record($claim, 0);
+            } catch (BlueGreenDestinationStateRecordingException) {
+                $this->reconcilePendingDestinationState();
+                (new RecordBlueGreenDrainObservation)->record($claim, 0);
+            }
         } else {
             $ports = $claim->drainBackendPortInventory?->ports()
                 ?? throw new DeploymentException('The blue-green operation has no immutable previous-container backend port inventory.');

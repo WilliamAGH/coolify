@@ -595,6 +595,80 @@ it('drains every immutable predecessor port when the live application dropped a 
         ->and($fixture['state']->fresh()->operation_drain_last_observed_connections)->toBe(1);
 });
 
+it('stops the exact predecessor with the configured grace and no further observation once the budget is spent', function (): void {
+    config(['constants.ssh.mux_enabled' => false]);
+    $fixture = fixedColorBlueGreenRecoveryFixture(BlueGreenDeploymentPhase::DRAINING);
+    $operation = ReconstructBlueGreenDeploymentRecovery::run($fixture['state']);
+    $fence = fixedColorRecoveryFence($fixture);
+    $lifecycle = new BlueGreenDeploymentLifecycle(
+        application: $operation->application,
+        deployment: $operation->deployment,
+        destination: $operation->destination,
+        server: $operation->server,
+        timeout: 30,
+        checkForCancellation: static function (): void {},
+    );
+    setFixedColorRecoveryLifecycleProperty($lifecycle, 'enabled', true);
+    setFixedColorRecoveryLifecycleProperty($lifecycle, 'claim', $operation->claim);
+    setFixedColorRecoveryLifecycleProperty($lifecycle, 'previousContainerExpectation', $operation->previousContainer);
+    setFixedColorRecoveryLifecycleProperty($lifecycle, 'destinationState', $operation->currentDestinationState);
+    setFixedColorRecoveryLifecycleProperty($lifecycle, 'operationFence', $fence);
+
+    InspectBlueGreenContainer::shouldRun()
+        ->atLeast()
+        ->once()
+        ->andReturn(new BlueGreenContainerInspection(
+            exists: true,
+            dockerId: FIXED_COLOR_PREVIOUS_CONTAINER_ID,
+            status: 'running',
+            health: 'healthy',
+        ));
+    $observationCommands = [];
+    $mutationCommands = [];
+    Process::fake(function (PendingProcess $process) use (&$mutationCommands, &$observationCommands): FakeProcessResult {
+        $command = is_array($process->command)
+            ? implode(' ', $process->command)
+            : (string) $process->command;
+        if (str_contains($command, 'target_port')) {
+            $observationCommands[] = $command;
+        }
+        if (str_contains($command, 'container_journal_stage=')) {
+            $mutationCommands[] = $command;
+        }
+        if (str_contains($command, '/proc/sys/kernel/random/boot_id')) {
+            return Process::result(output: FIXED_COLOR_BOOT_ID);
+        }
+
+        return Process::result(output: '1');
+    });
+
+    try {
+        $lifecycle->retirePreviousContainer(force: true);
+    } catch (Throwable) {
+        // The durable completion plumbing is proven by its own tests; this test
+        // owns the forced-retirement command contract issued to the host.
+    } finally {
+        $lifecycle->release();
+    }
+
+    $stopGrace = $operation->application->settings->deploymentStopGracePeriodSeconds();
+    $expectedMutationScript = implode("\n", [
+        'set -eu',
+        ...(new DrainBlueGreenPreviousContainer)->forcedStopCommandsFor(
+            $operation->previousContainer,
+            $stopGrace,
+        ),
+    ])."\n";
+
+    // A spent budget must not re-observe backend connections against a deadline
+    // that can never pass again, and the stop must still carry the operator's
+    // configured Docker grace period rather than a shortened one.
+    expect($observationCommands)->toBeEmpty()
+        ->and($mutationCommands)->not->toBeEmpty()
+        ->and($mutationCommands[0])->toContain(base64_encode($expectedMutationScript))
+        ->and($expectedMutationScript)->toContain("docker stop --time={$stopGrace}");
+});
+
 it('backfills an unchanged in-flight owner inventory before reconstructing a fixed-color recovery', function (): void {
     $fixture = fixedColorBlueGreenRecoveryFixture(
         BlueGreenDeploymentPhase::DRAINING,
