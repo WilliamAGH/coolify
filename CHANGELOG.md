@@ -2,15 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
-## [unreleased]
+## [4.13.65-fork] - 2026-08-05
 
 ### 🐛 Bug Fixes
 
 - *(blue-green)* Stop a fleet fallback failure from claiming a pause it never did
+- *(blue-green)* Keep break-glass, recovery, and the next push from fighting
+- *(blue-green)* Park only a drain that is provably unreconstructable
 
 ### 📚 Documentation
 
 - Update changelog
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.65-fork
 
 ## [4.13.64-fork] - 2026-08-05
 
