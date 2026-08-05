@@ -913,11 +913,18 @@ final class RecoverBlueGreenIntervention
             ResumeBlueGreenDrainingDeploymentJob::dispatch($queueId);
             $this->audit('blue_green.intervention.finalized_resumed', $plan, $reason, ['queue_id' => $queueId]);
 
+            // Reopening leaves the destination DRAINING, not recovered: the drain
+            // still has to retire the predecessor and publish the release, and only
+            // the fenced resume job just queued can do it. Reporting RECOVERED here
+            // told every caller the opposite — break-glass read it as "no owner is
+            // still driving this row" and cancelled the exact IN_PROGRESS entry the
+            // resume job needs, which stranded the destination DRAINING forever.
             return new BlueGreenInterventionRecoveryResult(
                 classification: $plan->classification,
-                outcome: BlueGreenInterventionRecoveryResult::RECOVERED,
+                outcome: BlueGreenInterventionRecoveryResult::DEFERRED,
                 message: 'The exact finalized DRAINING owner was restored and its fenced drain-recovery job was queued.',
                 stateId: $stateId,
+                recoveryOwnerDispatched: true,
             );
         } catch (BlueGreenOperationFenceLostException) {
             return $this->deferredForLiveLifecycleOwner($plan, $reason);
@@ -990,6 +997,7 @@ final class RecoverBlueGreenIntervention
                 message: $reconciliation->message,
                 stateId: $stateId,
                 activeColor: $liveState->activeColor?->value,
+                recoveryOwnerDispatched: $reconciliation->recoveryOwnerDispatched,
             );
         } catch (BlueGreenOperationFenceLostException) {
             return $this->deferredForLiveLifecycleOwner($plan, $reason);

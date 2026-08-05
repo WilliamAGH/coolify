@@ -321,6 +321,7 @@ class DeployController extends Controller
                             new OA\Property(property: 'outcome', type: 'string', enum: ['clean', 'deferred', 'manual_only']),
                             new OA\Property(property: 'message', type: 'string'),
                             new OA\Property(property: 'claimable', type: 'boolean', description: 'True when the next ordinary deployment can claim this destination.'),
+                            new OA\Property(property: 'recovery_owner_dispatched', type: 'boolean', description: 'True when a fenced recovery owner was queued and is still finishing this operation, which is why the queue entry was left running. False on a deferred outcome means no owner is driving it and the hanging entry was released instead.'),
                         ]
                     )
                 ),
@@ -386,6 +387,7 @@ class DeployController extends Controller
             'server_id' => $deployment->server_id,
             'outcome' => $recovery['outcome'],
             'claimable' => $recovery['claimable'],
+            'recovery_owner_dispatched' => $recovery['recovery_owner_dispatched'],
         ]);
 
         return response()->json($recovery);

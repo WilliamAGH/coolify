@@ -24,6 +24,15 @@ final readonly class BlueGreenInterventionRecoveryResult
 
     public const SKIPPED = 'skipped';
 
+    /**
+     * @param  bool  $recoveryOwnerDispatched  True only when this recovery handed the remaining
+     *                                         work to a fenced recovery owner that needs the
+     *                                         exact queue row left IN_PROGRESS to finish it.
+     *                                         A deferred outcome on its own proves nothing:
+     *                                         most deferrals dispatch no owner at all, so a
+     *                                         caller that reads the outcome label alone cannot
+     *                                         tell "someone is finishing this" from "nobody is".
+     */
     public function __construct(
         public string $classification,
         public string $outcome,
@@ -31,5 +40,10 @@ final readonly class BlueGreenInterventionRecoveryResult
         public ?int $stateId = null,
         public ?int $deactivationId = null,
         public ?string $activeColor = null,
-    ) {}
+        public bool $recoveryOwnerDispatched = false,
+    ) {
+        if ($this->recoveryOwnerDispatched && $this->outcome !== self::DEFERRED) {
+            throw new \InvalidArgumentException('Only a deferred blue-green intervention recovery can hand work to a fenced recovery owner.');
+        }
+    }
 }

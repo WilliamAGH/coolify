@@ -125,6 +125,7 @@ final class ReconcileBlueGreenDeployment
                     $expectedOperationUuid,
                     $expectedGeneration,
                     $staleAfterSeconds,
+                    $ignoreQueueActivity,
                     $operationFence,
                 );
             }
@@ -796,11 +797,20 @@ final class ReconcileBlueGreenDeployment
         return $routes;
     }
 
+    /**
+     * The DRAINING branch is reached before the shared queue-activity gate, so it
+     * has to honour the caller's bypass itself. Break-glass recovery is the only
+     * caller that sets it, and it sets it precisely because the operator already
+     * proved this owner is hanging — ignoring the bypass here would leave the one
+     * path break-glass exists for judging the hang by the same freshness window
+     * the scheduled reconciler uses.
+     */
     private function deferDrainingRecovery(
         ApplicationBlueGreenDeployment $state,
         ?string $expectedOperationUuid,
         int $expectedGeneration,
         int $staleAfterSeconds,
+        bool $ignoreQueueActivity,
         BlueGreenOperationFence $operationFence,
     ): BlueGreenReconciliationResult {
         if ($expectedOperationUuid === null) {
@@ -826,7 +836,9 @@ final class ReconcileBlueGreenDeployment
             );
         }
         $deployment = ApplicationDeploymentQueue::query()->find($deploymentId);
-        if ($deployment !== null && BlueGreenDeploymentQueueActivity::run($deployment, $staleAfterSeconds)) {
+        if ($deployment !== null
+            && ! $ignoreQueueActivity
+            && BlueGreenDeploymentQueueActivity::run($deployment, $staleAfterSeconds)) {
             return new BlueGreenReconciliationResult(
                 $state->id,
                 BlueGreenReconciliationResult::DEFERRED,
@@ -848,6 +860,7 @@ final class ReconcileBlueGreenDeployment
             $state->id,
             BlueGreenReconciliationResult::DEFERRED,
             'The stale durable DRAINING operation was deferred to its dedicated fenced resume job.',
+            recoveryOwnerDispatched: true,
         );
     }
 

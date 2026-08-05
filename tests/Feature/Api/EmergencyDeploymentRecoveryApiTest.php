@@ -167,9 +167,19 @@ it('recovers a draining hang without first cancelling the row its owner proof ne
     // finish. Neither may happen.
     expect($response->json('outcome'))->not->toBe('manual_only');
 
+    // A deferral is only a reason to leave the row running when something is
+    // actually still running it. When recovery dispatched a fenced owner that
+    // owner needs this exact IN_PROGRESS entry; when it dispatched nothing the
+    // entry is a strand that would block every successor forever, and releasing
+    // it is precisely what break-glass was called to do.
     if ($response->json('outcome') === 'deferred') {
-        expect($response->json('cancelled'))->toBeFalse()
-            ->and($deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
+        if ($response->json('recovery_owner_dispatched') === true) {
+            expect($response->json('cancelled'))->toBeFalse()
+                ->and($deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
+        } else {
+            expect($response->json('cancelled'))->toBeTrue()
+                ->and($deployment->fresh()->status)->not->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
+        }
     }
 });
 

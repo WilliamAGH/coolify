@@ -76,13 +76,13 @@ final class EmergencyRecoverApplicationDeployment
         // be IN_PROGRESS, so cancelling first would demote a recoverable
         // DRAINING hang into a manual-only intervention — the precise outcome
         // this endpoint exists to avoid.
-        [$outcome, $message] = match (true) {
-            $state === null => [self::CLEAN, 'No durable blue-green state owns this destination; the next deployment can claim it.'],
+        [$outcome, $message, $recoveryOwnerDispatched] = match (true) {
+            $state === null => [self::CLEAN, 'No durable blue-green state owns this destination; the next deployment can claim it.', false],
             $state->phase === BlueGreenDeploymentPhase::INTERVENTION_REQUIRED => $this->recoverParkedIntervention($state, $reason),
             default => $this->reconcileInterruptedOperation($state),
         };
 
-        $cancelled = $this->cancelAfterRecovery($deployment, $outcome);
+        $cancelled = $this->cancelAfterRecovery($deployment, $recoveryOwnerDispatched);
         $claimable = $this->isClaimable($deployment);
 
         // Claimability is the only outcome the caller can act on, so a clean
@@ -93,7 +93,7 @@ final class EmergencyRecoverApplicationDeployment
             $message = 'Recovery reported no remaining work, but this destination is still fenced for the next deployment: '.$message;
         }
 
-        return $this->result($deployment, $cancelled, $outcome, $message, $claimable);
+        return $this->result($deployment, $cancelled, $outcome, $message, $claimable, $recoveryOwnerDispatched);
     }
 
     /**
@@ -112,16 +112,21 @@ final class EmergencyRecoverApplicationDeployment
     }
 
     /**
-     * A deferred outcome means a fenced recovery owner is in flight — for a
-     * DRAINING state the reconciler has just queued the resume job that will
-     * retire the predecessor and publish this release. That owner needs the
-     * exact queue row left IN_PROGRESS, so cancelling here would strand the
-     * work break-glass was called to finish. Cancellation is for a row no
-     * recovery owner is still driving.
+     * Cancellation is withheld for exactly one reason: a fenced recovery owner is
+     * in flight and needs this queue row left IN_PROGRESS to finish — for a
+     * DRAINING state, the resume job that will retire the predecessor and publish
+     * this release. Cancelling under it would strand the work break-glass was
+     * called to finish.
+     *
+     * The deferred outcome label cannot stand in for that proof. Most deferrals
+     * dispatch no owner at all — the durable owner changed mid-flight, another
+     * live lifecycle held the lock, intervention could not be recorded — and
+     * withholding cancellation there left the operator with a hanging row, no
+     * owner driving it, and an endpoint that reported it had deferred to one.
      */
-    private function cancelAfterRecovery(ApplicationDeploymentQueue $deployment, string $outcome): bool
+    private function cancelAfterRecovery(ApplicationDeploymentQueue $deployment, bool $recoveryOwnerDispatched): bool
     {
-        if ($outcome === self::DEFERRED) {
+        if ($recoveryOwnerDispatched) {
             return false;
         }
 
@@ -136,7 +141,7 @@ final class EmergencyRecoverApplicationDeployment
      * else about it — fences, ownership proofs, fail-closed classification —
      * is left exactly as the scheduled reconciler enforces it.
      *
-     * @return array{0: self::CLEAN|self::DEFERRED|self::MANUAL_ONLY, 1: string}
+     * @return array{0: self::CLEAN|self::DEFERRED|self::MANUAL_ONLY, 1: string, 2: bool}
      */
     private function reconcileInterruptedOperation(ApplicationBlueGreenDeployment $state): array
     {
@@ -147,7 +152,7 @@ final class EmergencyRecoverApplicationDeployment
                 ignoreQueueActivity: true,
             );
         } catch (Throwable $exception) {
-            return [self::MANUAL_ONLY, 'The blue-green reconciler could not prove a safe outcome: '.$exception->getMessage()];
+            return [self::MANUAL_ONLY, 'The blue-green reconciler could not prove a safe outcome: '.$exception->getMessage(), false];
         }
 
         $outcome = match ($result->outcome) {
@@ -156,11 +161,11 @@ final class EmergencyRecoverApplicationDeployment
             default => self::MANUAL_ONLY,
         };
 
-        return [$outcome, $result->message];
+        return [$outcome, $result->message, $result->recoveryOwnerDispatched];
     }
 
     /**
-     * @return array{0: self::CLEAN|self::DEFERRED|self::MANUAL_ONLY, 1: string}
+     * @return array{0: self::CLEAN|self::DEFERRED|self::MANUAL_ONLY, 1: string, 2: bool}
      */
     private function recoverParkedIntervention(ApplicationBlueGreenDeployment $state, string $reason): array
     {
@@ -171,7 +176,7 @@ final class EmergencyRecoverApplicationDeployment
                 reason: $reason,
             );
         } catch (Throwable $exception) {
-            return [self::MANUAL_ONLY, 'The blue-green intervention recovery could not prove a safe outcome: '.$exception->getMessage()];
+            return [self::MANUAL_ONLY, 'The blue-green intervention recovery could not prove a safe outcome: '.$exception->getMessage(), false];
         }
 
         $outcome = match ($result->outcome) {
@@ -180,7 +185,7 @@ final class EmergencyRecoverApplicationDeployment
             default => self::MANUAL_ONLY,
         };
 
-        return [$outcome, $result->message];
+        return [$outcome, $result->message, $result->recoveryOwnerDispatched];
     }
 
     private function cancelHangingQueueEntry(ApplicationDeploymentQueue $deployment): bool
@@ -230,7 +235,8 @@ final class EmergencyRecoverApplicationDeployment
      *     cancelled: bool,
      *     outcome: self::CLEAN|self::DEFERRED|self::MANUAL_ONLY,
      *     message: string,
-     *     claimable: bool
+     *     claimable: bool,
+     *     recovery_owner_dispatched: bool
      * }
      */
     private function result(
@@ -239,6 +245,7 @@ final class EmergencyRecoverApplicationDeployment
         string $outcome,
         string $message,
         bool $claimable,
+        bool $recoveryOwnerDispatched = false,
     ): array {
         return [
             'deployment_uuid' => (string) $deployment->deployment_uuid,
@@ -247,6 +254,11 @@ final class EmergencyRecoverApplicationDeployment
             'outcome' => $outcome,
             'message' => $message,
             'claimable' => $claimable,
+            // A deferred outcome alone never told the operator whether anything was
+            // still finishing the work. This does, and it is the same proof the
+            // action cancels on: dispatched means wait, not dispatched means the
+            // hanging row was released and the destination needs a fresh push.
+            'recovery_owner_dispatched' => $recoveryOwnerDispatched,
         ];
     }
 }

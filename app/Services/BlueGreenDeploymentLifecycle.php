@@ -141,6 +141,14 @@ final class BlueGreenDeploymentLifecycle
 
     private bool $finalizedFallbackRecovered = false;
 
+    /**
+     * Set when automatic intervention recovery at deployment start queued a fenced
+     * owner rather than clearing the destination, so the claimability refusal that
+     * follows can say a wait is in progress instead of asking for reconciliation
+     * that is already under way.
+     */
+    private ?string $interventionRecoveryHandoff = null;
+
     private ?BlueGreenDeploymentRecoveryOperation $drainingRecoveryOperation = null;
 
     private bool $promotionCommitted = false;
@@ -200,7 +208,13 @@ final class BlueGreenDeploymentLifecycle
         }
         if ($durableState !== null
             && ! ClaimBlueGreenDeployment::stateIsCleanlyClaimable($durableState)) {
-            throw new DeploymentException('An unfinished blue-green lifecycle must be reconciled before another deployment can mutate this destination.');
+            // Automatic recovery can legitimately leave the destination unclaimable
+            // by handing the remaining work to a fenced owner it just queued. That
+            // is a wait, not a reconciliation an operator has to perform, and the
+            // generic message sent them looking for state that nothing is wrong
+            // with. Failing closed is still correct — this deployment does not own
+            // that operation and must not mutate the destination underneath it.
+            throw new DeploymentException($this->interventionRecoveryHandoff ?? 'An unfinished blue-green lifecycle must be reconciled before another deployment can mutate this destination.');
         }
         $this->assertEligibility();
         $this->serverBootId = ReadBlueGreenServerBootIdentity::run($this->server);
@@ -844,10 +858,18 @@ final class BlueGreenDeploymentLifecycle
      * deployment to this application out during prepare, because a durable
      * DRAINING phase can only be resumed by the exact queue entry that owns it.
      * Draining is a bounded courtesy to in-flight backend connections, not an
-     * unbounded veto: once the budget is spent the exact predecessor this
-     * operation already unrouted is retired with the operator-configured Docker
-     * stop grace period, but only while the candidate this operation already
-     * routed is still proven to hold its exact identity and health.
+     * unbounded veto: once the budget is spent the operation completes, and it
+     * completes only while the candidate this operation already routed is still
+     * proven to hold its exact identity and health.
+     *
+     * Retirement of the predecessor splits by who owns it. A blue-green-managed
+     * predecessor is not retired here at all — completion hands it to the
+     * inactive-container retirement owner, which honours the configured retention
+     * window and is rediscovered by the blue-green:retire-inactive scheduler if
+     * that dispatch is lost. It is already unrouted, so nothing is served from it
+     * while it waits. Only an unmanaged legacy predecessor, which no retention
+     * owner tracks, is stopped inline here with the operator-configured Docker
+     * stop grace period.
      */
     public function resolveExhaustedDrainingOperation(): void
     {
@@ -1041,6 +1063,10 @@ final class BlueGreenDeploymentLifecycle
         $this->deployment->addLogEntry(
             "Blue-green intervention auto-recovery: classification={$result->classification} outcome={$result->outcome} {$result->message}",
         );
+        if ($result->recoveryOwnerDispatched) {
+            $this->interventionRecoveryHandoff = 'Automatic blue-green recovery queued a fenced owner to finish the previous operation on this destination; retry this deployment once it completes. '
+                .$result->message;
+        }
 
         return ApplicationBlueGreenDeployment::query()->find($durableState->id);
     }

@@ -3,9 +3,11 @@
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentTransitionException;
 use App\Actions\Application\BlueGreen\BlueGreenInterventionRecoveryResult;
+use App\Actions\Application\BlueGreen\BlueGreenLifecycleDatabaseLocks;
 use App\Actions\Application\BlueGreen\MarkBlueGreenRecoveryInterventionRequired;
 use App\Actions\Application\BlueGreen\ReadBlueGreenManagedRouteMetadata;
 use App\Actions\Application\BlueGreen\RecoverBlueGreenIntervention;
+use App\Actions\Application\EmergencyRecoverApplicationDeployment;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifactReader;
 use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
@@ -407,8 +409,13 @@ it('reopens one exact finalized draining intervention and queues only its fenced
         reason: 'Verified the durable finalized route before resuming drain recovery.',
     );
 
+    // Reopening is a handoff, not a recovery: the destination is left DRAINING
+    // and only the fenced resume job just queued can finish it. Reporting
+    // RECOVERED told break-glass no owner was still driving the row, so it
+    // cancelled the exact entry that owner needs.
     expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::FINALIZED_UNCONFIRMED)
-        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::RECOVERED)
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::DEFERRED)
+        ->and($result->recoveryOwnerDispatched)->toBeTrue()
         ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::DRAINING)
         ->and($scenario->state->fresh()->intervention_phase)->toBeNull()
         ->and($scenario->state->fresh()->intervention_reason)->toBeNull()
@@ -419,6 +426,59 @@ it('reopens one exact finalized draining intervention and queues only its fenced
         ResumeBlueGreenDrainingDeploymentJob::class,
         fn (ResumeBlueGreenDrainingDeploymentJob $job): bool => $job->applicationDeploymentQueueId === $scenario->deployment->id,
     );
+});
+
+it('leaves the reopened finalized owner running for the fenced resume job break-glass just queued', function (): void {
+    Queue::fake();
+    $scenario = BlueGreenRecoveryScenario::create(finalized: true, routingMutationRecorded: true);
+    $scenario->state->update([
+        'phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+        'intervention_phase' => BlueGreenDeploymentPhase::DRAINING->value,
+        'intervention_reason' => 'Finalization requires a fenced drain recovery retry.',
+        'operation_drain_started_at' => now()->subMinutes(2),
+        'operation_drain_deadline_at' => now()->subMinute(),
+    ]);
+    $scenario->deployment->update([
+        'status' => ApplicationDeploymentStatus::FAILED->value,
+        'blue_green_phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+        'finished_at' => now(),
+    ]);
+
+    $result = EmergencyRecoverApplicationDeployment::run(
+        $scenario->deployment->fresh(),
+        'operator called break-glass on a parked finalized drain',
+    );
+
+    // Break-glass reopened the drain and queued the only owner that can finish
+    // it. Cancelling the row underneath that owner is not a smaller mistake than
+    // doing nothing: the resume job proves ownership through the queue status,
+    // so a cancelled row fails its fence and leaves the destination DRAINING
+    // with nobody able to resume it — permanently unclaimable for every future
+    // deployment to this application.
+    expect($result['outcome'])->toBe(EmergencyRecoverApplicationDeployment::DEFERRED)
+        ->and($result['recovery_owner_dispatched'])->toBeTrue()
+        ->and($result['cancelled'])->toBeFalse()
+        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+        ->and($scenario->deployment->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::DRAINING)
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::DRAINING);
+    Queue::assertPushed(
+        ResumeBlueGreenDrainingDeploymentJob::class,
+        fn (ResumeBlueGreenDrainingDeploymentJob $job): bool => $job->applicationDeploymentQueueId === $scenario->deployment->id,
+    );
+});
+
+it('proves a cancelled queue row cannot own the draining phase its resume job resumes', function (): void {
+    // The mechanism behind the regression above, stated once: this predicate is
+    // what the resume job's fence consults, so cancelling a DRAINING owner is
+    // exactly what makes the resumption impossible rather than merely delayed.
+    expect(BlueGreenLifecycleDatabaseLocks::queueStatusOwnsPhase(
+        ApplicationDeploymentStatus::IN_PROGRESS->value,
+        BlueGreenDeploymentPhase::DRAINING,
+    ))->toBeTrue()
+        ->and(BlueGreenLifecycleDatabaseLocks::queueStatusOwnsPhase(
+            ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
+            BlueGreenDeploymentPhase::DRAINING,
+        ))->toBeFalse();
 });
 
 it('does not reopen a finalized intervention while another lifecycle owner still holds its lock', function (): void {
