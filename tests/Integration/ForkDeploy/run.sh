@@ -12,9 +12,11 @@ DIGEST_A=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 DIGEST_B=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 DIGEST_C=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 DIGEST_D=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+DIGEST_E=sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 REVISION=29891220cab933e9d35af952a3d905db7aa8f808
 REAL_DOCKER=$(command -v docker || true)
 FIXTURE=
+MAIN_IMAGE_DIGEST=$DIGEST_A
 
 pass() {
     printf 'ok - %s\n' "$1"
@@ -63,6 +65,7 @@ new_fixture() {
     local base
 
     unset BASH_ENV COOLIFY_ENV_FILE
+    MAIN_IMAGE_DIGEST=$DIGEST_A
     base=$(cd -P "${TMPDIR:-/tmp}" && pwd -P)
     FIXTURE=$(mktemp -d "$base/fork-deploy.XXXXXX")
     ROOT=$FIXTURE/data/coolify
@@ -117,7 +120,9 @@ new_fixture() {
         FORK_DEPLOY_TEST_KILL_AFTER_FORWARD_RECORD \
         FORK_DEPLOY_TEST_SWAP_SSH_KEYS_DURING_LOCK \
         FORK_DEPLOY_TEST_SSH_SWAP_TARGET \
-        FORK_DEPLOY_DRIFT_RUNNING_MAIN_IMAGE || true
+        FORK_DEPLOY_DRIFT_RUNNING_MAIN_IMAGE \
+        FORK_DEPLOY_RUNNING_MAIN_DIGEST \
+        FORK_DEPLOY_COMPOSE_MAIN_DIGEST || true
 }
 
 cleanup_fixture() {
@@ -147,7 +152,7 @@ write_assets() {
     done <<<"${FORK_DEPLOY_ENV_EXTRA:-}"
     {
         printf 'services:\n'
-        printf '  coolify:\n    image: "%s"\n    ports: !override\n' "docker.iocloudhost.net/williamagh/coolify@$DIGEST_A"
+        printf '  coolify:\n    image: "%s"\n    ports: !override\n' "docker.iocloudhost.net/williamagh/coolify@$MAIN_IMAGE_DIGEST"
         printf '%s\n' "      - \"\${APP_PORT:-8000}:8080\""
         printf '%s\n' "      - \"127.0.0.1:\${PUSHER_PORT:-\${SOKETI_PORT:-6001}}:6001\""
         printf '%s\n' "      - \"127.0.0.1:\${TERMINAL_PORT:-6002}:6002\""
@@ -280,8 +285,8 @@ write_manifest() {
         printf 'SOURCE_TAG=%s\n' "$version"
         printf 'PLATFORM=linux/amd64\n'
         printf 'MAIN_IMAGE=docker.iocloudhost.net/williamagh/coolify\n'
-        printf 'MAIN_INDEX_DIGEST=%s\n' "$DIGEST_A"
-        printf 'MAIN_PLATFORM_DIGEST=%s\n' "$DIGEST_A"
+        printf 'MAIN_INDEX_DIGEST=%s\n' "$MAIN_IMAGE_DIGEST"
+        printf 'MAIN_PLATFORM_DIGEST=%s\n' "$MAIN_IMAGE_DIGEST"
         printf 'POSTGRES_IMAGE=docker.io/library/postgres\n'
         printf 'POSTGRES_DIGEST=%s\n' "$DIGEST_C"
         printf 'POSTGRES_MAJOR=16\n'
@@ -2518,10 +2523,180 @@ test_reconcile_refuses_signed_asset_drift() {
     cleanup_fixture
 }
 
+# Reproduces the production drift class the adoption path exists for: later
+# releases were applied by hand-swapping the pinned digest in
+# /data/coolify/source/docker-compose.custom.yml, so the running code and the
+# database schema advanced past the last recorded activation and no recorded
+# release is reachable any more. Leaves the fixture with a signed manifest for
+# the release that is actually running at $MANIFEST_FILE.
+seed_unrecorded_running_release() {
+    local version=$1 asset
+
+    MAIN_IMAGE_DIGEST=$DIGEST_E
+    write_manifest "$version"
+    for asset in docker-compose.yml docker-compose.prod.yml docker-compose.custom.yml .env.production; do
+        cp -p "$ASSETS/$asset" "$ROOT/source/$asset"
+        chmod 0600 "$ROOT/source/$asset"
+    done
+    export FORK_DEPLOY_COMPOSE_MAIN_DIGEST=$DIGEST_E
+    export FORK_DEPLOY_RUNNING_MAIN_DIGEST=$DIGEST_E
+    export FORK_DEPLOY_MIGRATION_FINGERPRINT=abcdef0123456789abcdef0123456789
+}
+
+test_adoption_records_signed_running_release() {
+    new_fixture
+    export FORK_DEPLOY_USE_REAL_OPENSSL=true
+    write_manifest 4.13.0-fork.1
+    if ! install_release >/dev/null; then
+        fail 'adoption records a signed running release that was never recorded'
+        cleanup_fixture
+        return
+    fi
+    local activation=$ROOT/fork-deploy/activations/4.13.1-fork release=$ROOT/fork-deploy/releases/4.13.1-fork rendered_now
+    seed_unrecorded_running_release 4.13.1-fork
+    if "$SUBJECT" verify >/dev/null 2>&1; then
+        fail 'adoption records a signed running release that was never recorded'
+        cleanup_fixture
+        return
+    fi
+    rendered_now=$(hash_file "$ROOT/source/.env")
+    : >"$LOG"
+    if "$SUBJECT" reconcile-migrated-state --offline-manifest "$MANIFEST_FILE" >/dev/null 2>&1 \
+        && [[ $(<"$ROOT/fork-deploy/current") == 4.13.1-fork ]] \
+        && grep -Fxq 'MIGRATION_FINGERPRINT_BEFORE=uninitialized' "$activation" \
+        && grep -Fxq 'MIGRATION_FINGERPRINT_AFTER=abcdef0123456789abcdef0123456789' "$activation" \
+        && grep -Fxq "RENDERED_COMPOSE_SHA256=$rendered_now" "$activation" \
+        && grep -Fxq 'VERSION=4.13.1-fork' "$release/verified" \
+        && cmp -s "$MANIFEST_FILE" "$release/release.manifest" \
+        && cmp -s "$MANIFEST_FILE.sig" "$release/release.manifest.sig" \
+        && awk -F '\t' -v digest="$DIGEST_E" \
+            '$2 == "adopt-running-release" && $3 == "4.13.1-fork" && $4 == digest { found = 1 } END { exit !found }' \
+            "$ROOT/fork-deploy/history.tsv" \
+        && ! grep -q 'compose .* up ' "$LOG" \
+        && "$SUBJECT" verify >/dev/null 2>&1; then
+        pass 'adoption records a signed running release that was never recorded'
+    else
+        fail 'adoption records a signed running release that was never recorded'
+    fi
+    cleanup_fixture
+}
+
+test_adoption_refuses_manifest_signed_by_untrusted_key() {
+    new_fixture
+    export FORK_DEPLOY_USE_REAL_OPENSSL=true
+    write_manifest 4.13.0-fork.1
+    if ! install_release >/dev/null; then
+        fail 'adoption refuses a manifest that is not signed by the trusted release key'
+        cleanup_fixture
+        return
+    fi
+    seed_unrecorded_running_release 4.13.1-fork
+    "$FORK_DEPLOY_REAL_OPENSSL" genpkey -algorithm ED25519 -out "$FIXTURE/trust/untrusted.pem"
+    "$FORK_DEPLOY_REAL_OPENSSL" pkeyutl \
+        -sign \
+        -rawin \
+        -inkey "$FIXTURE/trust/untrusted.pem" \
+        -in "$MANIFEST_FILE" \
+        -out "$MANIFEST_FILE.sig"
+    : >"$LOG"
+    local output
+    if output=$("$SUBJECT" reconcile-migrated-state --offline-manifest "$MANIFEST_FILE" 2>&1); then
+        fail 'adoption refuses a manifest that is not signed by the trusted release key'
+    elif [[ $output == *'signature verification failed'* ]] \
+        && [[ $(<"$ROOT/fork-deploy/current") == 4.13.0-fork.1 ]] \
+        && [[ ! -e $ROOT/fork-deploy/releases/4.13.1-fork ]] \
+        && [[ ! -e $ROOT/fork-deploy/activations/4.13.1-fork ]] \
+        && ! awk -F '\t' '$2 == "adopt-running-release" { found = 1 } END { exit !found }' \
+            "$ROOT/fork-deploy/history.tsv"; then
+        pass 'adoption refuses a manifest that is not signed by the trusted release key'
+    else
+        fail 'adoption refuses a manifest that is not signed by the trusted release key'
+    fi
+    cleanup_fixture
+}
+
+test_adoption_refuses_running_digest_mismatch() {
+    new_fixture
+    export FORK_DEPLOY_USE_REAL_OPENSSL=true
+    write_manifest 4.13.0-fork.1
+    if ! install_release >/dev/null; then
+        fail 'adoption refuses when the running image digest is not the supplied signed release'
+        cleanup_fixture
+        return
+    fi
+    seed_unrecorded_running_release 4.13.1-fork
+    # The overlay was swapped but the container was never recreated, so the
+    # running code is still the previous release.
+    export FORK_DEPLOY_RUNNING_MAIN_DIGEST=$DIGEST_A
+    : >"$LOG"
+    local output
+    if output=$("$SUBJECT" reconcile-migrated-state --offline-manifest "$MANIFEST_FILE" 2>&1); then
+        fail 'adoption refuses when the running image digest is not the supplied signed release'
+    elif [[ $output == *'does not match the signed release image digests for 4.13.1-fork'* ]] \
+        && [[ $(<"$ROOT/fork-deploy/current") == 4.13.0-fork.1 ]] \
+        && [[ ! -e $ROOT/fork-deploy/releases/4.13.1-fork ]] \
+        && [[ ! -e $ROOT/fork-deploy/activations/4.13.1-fork ]] \
+        && ! grep -q 'compose .* up ' "$LOG" \
+        && ! awk -F '\t' '$2 == "adopt-running-release" { found = 1 } END { exit !found }' \
+            "$ROOT/fork-deploy/history.tsv"; then
+        pass 'adoption refuses when the running image digest is not the supplied signed release'
+    else
+        fail 'adoption refuses when the running image digest is not the supplied signed release'
+    fi
+    cleanup_fixture
+}
+
+test_adoption_refuses_signed_asset_drift() {
+    new_fixture
+    export FORK_DEPLOY_USE_REAL_OPENSSL=true
+    write_manifest 4.13.0-fork.1
+    if ! install_release >/dev/null; then
+        fail 'adoption refuses when an on-disk asset differs from the supplied signed manifest'
+        cleanup_fixture
+        return
+    fi
+    seed_unrecorded_running_release 4.13.1-fork
+    printf 'tampered-overlay\n' >>"$ROOT/source/docker-compose.custom.yml"
+    : >"$LOG"
+    local output
+    if output=$("$SUBJECT" reconcile-migrated-state --offline-manifest "$MANIFEST_FILE" 2>&1); then
+        fail 'adoption refuses when an on-disk asset differs from the supplied signed manifest'
+    elif [[ $output == *'differs from the verified release'* ]] \
+        && [[ $(<"$ROOT/fork-deploy/current") == 4.13.0-fork.1 ]] \
+        && [[ ! -e $ROOT/fork-deploy/releases/4.13.1-fork ]] \
+        && [[ ! -e $ROOT/fork-deploy/activations/4.13.1-fork ]]; then
+        pass 'adoption refuses when an on-disk asset differs from the supplied signed manifest'
+    else
+        fail 'adoption refuses when an on-disk asset differs from the supplied signed manifest'
+    fi
+    cleanup_fixture
+}
+
+test_adoption_rejects_unsupported_arguments() {
+    new_fixture
+    local output
+    if output=$("$SUBJECT" reconcile-migrated-state --manifest https://example.invalid/release.manifest 2>&1); then
+        fail 'reconcile-migrated-state accepts only --offline-manifest'
+    elif [[ $output == *'accepts only --offline-manifest'* ]] \
+        && output=$("$SUBJECT" reconcile-migrated-state --offline-manifest "$MANIFEST_FILE" --dry-run 2>&1); then
+        fail 'reconcile-migrated-state accepts only --offline-manifest'
+    elif [[ $output == *'accepts only --offline-manifest'* ]]; then
+        pass 'reconcile-migrated-state accepts only --offline-manifest'
+    else
+        fail 'reconcile-migrated-state accepts only --offline-manifest'
+    fi
+    cleanup_fixture
+}
+
 if [[ ${FORK_DEPLOY_TEST_FILTER:-} == reconcile-migrated-state ]]; then
     test_reconcile_readopts_benign_bridge_migration_drift
     test_reconcile_refuses_when_running_image_is_untrusted
     test_reconcile_refuses_signed_asset_drift
+    test_adoption_records_signed_running_release
+    test_adoption_refuses_manifest_signed_by_untrusted_key
+    test_adoption_refuses_running_digest_mismatch
+    test_adoption_refuses_signed_asset_drift
+    test_adoption_rejects_unsupported_arguments
     printf '%s passing, %s failing\n' "$PASS" "$FAIL"
     ((FAIL == 0))
     exit
@@ -2686,6 +2861,11 @@ test_recover_abort_refuses_after_candidate_start
 test_reconcile_readopts_benign_bridge_migration_drift
 test_reconcile_refuses_when_running_image_is_untrusted
 test_reconcile_refuses_signed_asset_drift
+test_adoption_records_signed_running_release
+test_adoption_refuses_manifest_signed_by_untrusted_key
+test_adoption_refuses_running_digest_mismatch
+test_adoption_refuses_signed_asset_drift
+test_adoption_rejects_unsupported_arguments
 
 printf '%s passing, %s failing\n' "$PASS" "$FAIL"
 ((FAIL == 0))

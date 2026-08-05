@@ -187,7 +187,7 @@ case $name in
                             'docker.io/library/redis@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
                     else
                         printf '%s\n' \
-                            'docker.iocloudhost.net/williamagh/coolify@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+                            "docker.iocloudhost.net/williamagh/coolify@${FORK_DEPLOY_COMPOSE_MAIN_DIGEST:-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
                             'docker.io/library/postgres@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' \
                             'docker.io/library/redis@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
                     fi
@@ -304,7 +304,7 @@ case $name in
                         coolify-realtime) printf 'docker.iocloudhost.net/williamagh/coolify-realtime@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' ;;
                         coolify-db) printf 'docker.io/library/postgres@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\n' ;;
                         coolify-redis) printf 'docker.io/library/redis@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\n' ;;
-                        *) printf 'docker.iocloudhost.net/williamagh/coolify@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' ;;
+                        *) printf 'docker.iocloudhost.net/williamagh/coolify@%s\n' "${FORK_DEPLOY_RUNNING_MAIN_DIGEST:-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" ;;
                     esac
                 else
                     printf 'healthy\n'

@@ -190,7 +190,7 @@ Usage:
   fork-deploy recover-forward
   fork-deploy status
   fork-deploy verify
-  fork-deploy reconcile-migrated-state
+  fork-deploy reconcile-migrated-state [--offline-manifest ABSOLUTE_PATH]
   fork-deploy trust --public-key ABSOLUTE_PATH
 
 Install and update inputs are accepted only from a detached-signature-verified release manifest.
@@ -208,6 +208,13 @@ control-plane enrollment path before installing a managed release.
 Reconcile-migrated-state re-records the active release's migration fingerprint and rendered
 Compose state after a control-plane bridge migration, but only once the running container image
 digests prove the code is the recorded signed release; it refuses on any other integrity drift.
+Reconcile-migrated-state --offline-manifest adopts a running release that is legitimately signed
+but was never recorded (for example after releases were applied by hand-swapping the Compose
+overlay). The operator supplies the detached-signature-verified manifest of the release that is
+actually running; adoption proceeds only when that manifest verifies against the same trusted
+Ed25519 key install and update require and the running container image digests, the on-disk signed
+assets, the fail-closed environment, and the effective Compose images and bindings all match it
+exactly. It refuses on every other drift and never adopts whatever happens to be running.
 EOF
 }
 
@@ -937,9 +944,13 @@ fd_parse_args() {
         repair)
             [[ -z $VERSION && -z $MANIFEST_INPUT && -z $OFFLINE_MANIFEST && -z $TRUST_PUBLIC_KEY ]] || die "$ACTION does not accept release arguments"
             ;;
-        recover-abort|recover-forward|status|verify|reconcile-migrated-state)
+        recover-abort|recover-forward|status|verify)
             [[ -z $VERSION && -z $MANIFEST_INPUT && -z $OFFLINE_MANIFEST && -z $TRUST_PUBLIC_KEY && $DRY_RUN == false ]] \
                 || die "$ACTION does not accept release arguments or --dry-run"
+            ;;
+        reconcile-migrated-state)
+            [[ -z $VERSION && -z $MANIFEST_INPUT && -z $TRUST_PUBLIC_KEY && $DRY_RUN == false ]] \
+                || die "$ACTION accepts only --offline-manifest ABSOLUTE_PATH"
             ;;
         trust)
             [[ -n $TRUST_PUBLIC_KEY && -z $VERSION && -z $MANIFEST_INPUT && -z $OFFLINE_MANIFEST && $DRY_RUN == false ]] || die 'trust requires only --public-key ABSOLUTE_PATH'
@@ -3125,6 +3136,88 @@ fd_reconcile_migrated_state() {
     note "Reconciled release $current: adopted the post-migration migration fingerprint and rendered Compose state."
 }
 
+# Adopt a running release that is legitimately signed but is NOT the recorded
+# one. This closes the drift class where releases were applied by hand — for
+# example by swapping the pinned image digest in
+# /data/coolify/source/docker-compose.custom.yml — so the running code and the
+# database schema advanced past the last recorded activation. In that state
+# update, repair, rollback, and the recorded-release reconcile above all refuse
+# by design, because no recorded release is reachable from reality any more.
+#
+# The trust anchor is preserved, not relaxed. The recorded-release reconcile
+# above proves "the running code is the RECORDED signed release". Adoption
+# proves "the running code is A signed release whose manifest passes the SAME
+# detached Ed25519 verification install and update require", using the exact
+# same fd_load_manifest path, the same trusted key (in production
+# /etc/coolify-fork/release-signing-ed25519.pub), and the same KEY_ID equality
+# check. The operator must supply that manifest and its detached signature; the
+# tool never infers a release from what happens to be running, and every
+# integrity equality is evaluated against the supplied signed manifest rather
+# than against the host.
+#
+# Fails closed on: an unsigned, badly signed, malformed, or untrusted-key
+# manifest; a version already bound to a different signed manifest; signed
+# asset drift; fail-closed environment drift; port or binding drift; effective
+# Compose image drift; a running image digest that differs from the supplied
+# manifest; and any trashed or ambiguous managed state (missing or unreadable
+# current pointer, unresolved pending or forward-recovery state, corrupt
+# recorded bundle for the release being replaced).
+fd_adopt_running_release() {
+    local recorded before migrations_now rendered_now release_directory
+
+    # 1. The host must be managed and its recorded state must be intact. An
+    #    unmanaged or trashed state is never adopted into management here; that
+    #    remains the control-plane enrollment path's job.
+    recorded=$(fd_current_version)
+    fd_load_recorded_release "$recorded" active-v1-predecessor
+    fd_load_activation "$recorded"
+    before=$(fd_activation_field "$recorded" MIGRATION_FINGERPRINT_AFTER)
+
+    # 2. The operator-supplied manifest is the only source of adoption inputs and
+    #    must pass the same signature and trusted-KEY_ID verification as install
+    #    and update. Adoption targets current-generation (v2) releases only: a v1
+    #    manifest is accepted solely as the active predecessor of a v2 update.
+    fd_download_manifest
+    fd_load_manifest
+    [[ $VERSION != "$recorded" ]] \
+        || note "Supplied manifest names the already-recorded release $recorded; re-recording its activation state."
+    release_directory=$(fd_release_dir "$VERSION")
+    fd_validate_existing_candidate "$release_directory"
+    note "Adopting running release $VERSION over recorded release $recorded; every check below is evaluated against the supplied signed manifest."
+
+    # 3. Every non-migration integrity check must pass against the SUPPLIED
+    #    manifest. Signed-asset, fail-closed-environment, port, or effective
+    #    Compose drift is tampering or an incomplete hand-swap, not adoptable
+    #    drift, so those refuse before anything is recorded.
+    fd_validate_active_assets "$release_directory"
+    fd_validate_active_environment
+    fd_validate_effective_images "$SOURCE_DIR"
+    fd_validate_effective_bindings "$SOURCE_DIR"
+
+    # 4. Trust anchor: the running container image digests must equal the
+    #    digests of the supplied, signature-verified manifest. This is the only
+    #    proof that the code actually running is the signed release being
+    #    adopted.
+    fd_verify_runtime \
+        || die "adoption refused: the running runtime does not match the signed release image digests for $VERSION"
+
+    # 5. Record the adopted release exactly as a deployment would: the immutable
+    #    signed bundle (assets already proven equal to the manifest in step 3,
+    #    plus the manifest and its detached signature), then the activation and
+    #    the current pointer. MIGRATION_FINGERPRINT_BEFORE preserves the last
+    #    recorded fingerprint, which is the truthful pre-drift value.
+    fd_commit_bundle "$SOURCE_DIR"
+    migrations_now=$(fd_migration_fingerprint "$SOURCE_DIR/.env")
+    rendered_now=$(fd_rendered_sha "$SOURCE_DIR")
+    ACTION=adopt-running-release
+    fd_write_activation "$before" "$migrations_now" "$rendered_now"
+
+    # 6. Re-run the full verifier so the host is proven internally consistent
+    #    under the newly recorded tracking state before this exits successfully.
+    fd_verify_current
+    note "Adopted running release $VERSION (previously recorded: $recorded). Update, repair, and rollback are available again from $VERSION."
+}
+
 main() {
     [[ -n ${BASH_VERSION:-} ]] || die 'this script requires Bash'
     fd_parse_args "$@"
@@ -3174,7 +3267,11 @@ main() {
             ;;
         reconcile-migrated-state)
             fd_ensure_no_unresolved
-            fd_reconcile_migrated_state
+            if [[ -n $OFFLINE_MANIFEST ]]; then
+                fd_adopt_running_release
+            else
+                fd_reconcile_migrated_state
+            fi
             ;;
     esac
 }
