@@ -2,7 +2,7 @@
 
 # Versions
 # https://hub.docker.com/r/serversideup/php/tags?name=8.5-fpm-nginx-alpine
-ARG SERVERSIDEUP_PHP_VERSION=8.5-fpm-nginx-alpine@sha256:1854d81da23fc5c174a26bf039bc7724aeccec5743524717bbc6c10c1c927ac2
+ARG SERVERSIDEUP_PHP_VERSION=8.5-fpm-nginx-alpine@sha256:638a31d2201022b61605fd423b86ccaed20c12732f6aba4870f4c3ff1d8e57da
 # https://hub.docker.com/_/node
 ARG NODE_VERSION=24-alpine@sha256:a0b9bf06e4e6193cf7a0f58816cc935ff8c2a908f81e6f1a95432d679c54fbfd
 # https://hub.docker.com/_/golang
