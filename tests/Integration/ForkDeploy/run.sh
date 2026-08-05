@@ -2675,6 +2675,13 @@ test_adoption_refuses_signed_asset_drift() {
 test_adoption_rejects_unsupported_arguments() {
     new_fixture
     local output
+    if ! output=$("$SUBJECT" --help 2>&1) \
+        || [[ $output != *'reconcile-migrated-state [--offline-manifest ABSOLUTE_PATH]'* \
+            || $output != *'adopts a running release that is legitimately signed'* ]]; then
+        fail 'reconcile-migrated-state accepts only --offline-manifest'
+        cleanup_fixture
+        return
+    fi
     if output=$("$SUBJECT" reconcile-migrated-state --manifest https://example.invalid/release.manifest 2>&1); then
         fail 'reconcile-migrated-state accepts only --offline-manifest'
     elif [[ $output == *'accepts only --offline-manifest'* ]] \

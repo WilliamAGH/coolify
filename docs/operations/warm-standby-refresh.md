@@ -189,6 +189,13 @@ itself in step 4.
    fork-deploy verify
    ```
 
+   This form re-records only the migration fingerprint and rendered-Compose sha
+   and requires the running image digests to equal the **recorded** signed
+   release. If it refuses because the host is running a signed release that was
+   never recorded (releases applied by hand-swapping the Compose overlay), use
+   `fork-deploy-unrecorded-release-adoption.md` instead — it adopts the running
+   release only against an operator-supplied, signature-verified manifest.
+
 7. **Post-refresh checks** — on `popos-sf0`:
 
    ```bash
