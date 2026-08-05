@@ -4,6 +4,7 @@ use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
 use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
+use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\FindBlueGreenDeactivationFence;
 use App\Actions\Application\BlueGreen\RecordBlueGreenDestinationState;
 use App\Enums\ApplicationDeploymentStatus;
@@ -416,6 +417,28 @@ function applicationDeploymentBlueGreenDrainingClaim(
         rollbackManagedFilename: 'application-destination-fence.rollback.yaml',
     );
 }
+
+it('unfences a successor deployment once the drain resolves, and only then', function () {
+    $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
+    $state = createCompletedApplicationDeploymentBlueGreenState($fixture);
+
+    // stateIsCleanlyClaimable is the exact gate initialize() consults before
+    // admitting any successor to this destination, so it is what decides
+    // whether the next ordinary push proceeds or dies during prepare.
+    expect(ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state->fresh()))->toBeTrue();
+
+    // This is the reported wedge: a durable DRAINING operation whose owner can
+    // no longer resume it. Every successor is fenced out for as long as it
+    // remains, which is why a spent budget must never leave the state here.
+    $state->update([
+        'phase' => BlueGreenDeploymentPhase::DRAINING,
+        'operation_deployment_uuid' => 'dead-drain-owner',
+        'operation_drain_started_at' => now()->subHour(),
+        'operation_drain_deadline_at' => now()->subHour()->addMinute(),
+    ]);
+
+    expect(ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state->fresh()))->toBeFalse();
+});
 
 it('treats a drain budget as spent from durable deadline evidence, not a resettable counter', function () {
     $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
