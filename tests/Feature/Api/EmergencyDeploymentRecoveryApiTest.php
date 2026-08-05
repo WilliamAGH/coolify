@@ -173,7 +173,7 @@ it('recovers a draining hang without first cancelling the row its owner proof ne
     // entry is a strand that would block every successor forever, and releasing
     // it is precisely what break-glass was called to do.
     if ($response->json('outcome') === 'deferred') {
-        if ($response->json('recovery_owner_dispatched') === true) {
+        if ($response->json('recovery_owner_active') === true) {
             expect($response->json('cancelled'))->toBeFalse()
                 ->and($deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
         } else {

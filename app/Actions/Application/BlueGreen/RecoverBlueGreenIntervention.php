@@ -45,13 +45,43 @@ final class RecoverBlueGreenIntervention
 
     public string $commandDescription = 'Classify and safely recover one blue-green intervention without direct state surgery.';
 
+    /**
+     * The durable marker a fenced drain resume writes when it could not reconstruct
+     * the operation it was sent to finish. Declared here, next to the classifier
+     * that must refuse to reopen such a state, so the writer and the reader can
+     * never drift into a marker only one of them recognises.
+     */
+    public const UNRECONSTRUCTABLE_DRAIN_REASON = 'A fenced drain resume could not reconstruct this exact durable DRAINING operation, so it can never complete on its own.';
+
+    public static function isUnreconstructableDrainReason(?string $reason): bool
+    {
+        return $reason === self::UNRECONSTRUCTABLE_DRAIN_REASON;
+    }
+
+    /**
+     * The operation the caller decided to recover, re-proven under the state fence
+     * before any durable mutation. Null when the caller has no prior decision to
+     * bind — the scheduled owners recover whatever the destination is parked on.
+     */
+    private ?string $requiredOperationUuid = null;
+
+    /**
+     * @param  string|null  $requiredOperationUuid  When set, the destination must still be
+     *                                              parked on this exact operation once the state
+     *                                              fence is held. A caller that decided
+     *                                              ownership before the fence decided it from a
+     *                                              snapshot, and a newer operation can take the
+     *                                              destination in between.
+     */
     public function handle(
         ?int $stateId = null,
         ?int $deactivationId = null,
         bool $apply = false,
         ?string $reason = null,
         bool $staleContainerJournal = false,
+        ?string $requiredOperationUuid = null,
     ): BlueGreenInterventionRecoveryResult {
+        $this->requiredOperationUuid = $requiredOperationUuid;
         if (($stateId === null) === ($deactivationId === null)) {
             throw new InvalidArgumentException('Blue-green intervention recovery requires exactly one state ID or deactivation ID.');
         }
@@ -924,7 +954,7 @@ final class RecoverBlueGreenIntervention
                 outcome: BlueGreenInterventionRecoveryResult::DEFERRED,
                 message: 'The exact finalized DRAINING owner was restored and its fenced drain-recovery job was queued.',
                 stateId: $stateId,
-                recoveryOwnerDispatched: true,
+                recoveryOwnerActive: true,
             );
         } catch (BlueGreenOperationFenceLostException) {
             return $this->deferredForLiveLifecycleOwner($plan, $reason);
@@ -997,7 +1027,7 @@ final class RecoverBlueGreenIntervention
                 message: $reconciliation->message,
                 stateId: $stateId,
                 activeColor: $liveState->activeColor?->value,
-                recoveryOwnerDispatched: $reconciliation->recoveryOwnerDispatched,
+                recoveryOwnerActive: $reconciliation->recoveryOwnerActive,
             );
         } catch (BlueGreenOperationFenceLostException) {
             return $this->deferredForLiveLifecycleOwner($plan, $reason);
@@ -1100,6 +1130,10 @@ final class RecoverBlueGreenIntervention
             message: 'Another live blue-green lifecycle owner still holds the destination lock; no durable recovery state was changed.',
             stateId: $plan->stateId,
             deactivationId: $plan->deactivationId,
+            // A held destination lock is a live owner mid-operation. Break-glass
+            // must not release the queue row underneath it: doing so destroys the
+            // very recovery a previous call set in motion.
+            recoveryOwnerActive: true,
         );
     }
 
@@ -1215,6 +1249,21 @@ final class RecoverBlueGreenIntervention
                 ? BlueGreenDeploymentPhase::tryFrom($state->intervention_phase)
                 : null;
             if ($sourcePhase === BlueGreenDeploymentPhase::DRAINING && $this->looksFinalized($state)) {
+                // A drain parked because its fenced resume could not reconstruct it
+                // is not a retry candidate. Reopening it queues the same resume,
+                // which fails the same way and parks it again — an endless
+                // reopen/park cycle that fences the destination for as long as it
+                // runs, and that every arriving push would restart.
+                if (self::isUnreconstructableDrainReason($state->intervention_reason)) {
+                    return new BlueGreenInterventionRecoveryPlan(
+                        BlueGreenInterventionRecoveryResult::FINALIZED_UNCONFIRMED,
+                        'A fenced resume already proved this finalized DRAINING generation cannot be reconstructed; reopening it would only repeat that failure.',
+                        false,
+                        stateId: $state->id,
+                        deploymentPhase: $sourcePhase,
+                    );
+                }
+
                 return new BlueGreenInterventionRecoveryPlan(
                     BlueGreenInterventionRecoveryResult::FINALIZED_UNCONFIRMED,
                     'The state records one finalized DRAINING generation with durable route provenance.',
@@ -1323,6 +1372,12 @@ final class RecoverBlueGreenIntervention
                 throw new BlueGreenDeploymentTransitionException('The finalized intervention owner changed before recovery could begin.');
             }
             $operationUuid = $state->operation_deployment_uuid;
+            // The caller's pre-fence decision is re-proven here, inside the row
+            // locks, so a request naming an operation that has since been
+            // superseded cannot reopen whatever took the destination instead.
+            if ($this->requiredOperationUuid !== null && $this->requiredOperationUuid !== $operationUuid) {
+                throw new BlueGreenDeploymentTransitionException('The requested finalized operation no longer owns this destination; a newer operation took it before the fence was held.');
+            }
             $deployment = is_string($operationUuid) ? $locks->queue($operationUuid) : null;
             $this->assertFinalizedIntervention($state, $deployment);
 

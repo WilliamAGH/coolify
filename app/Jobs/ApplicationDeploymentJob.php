@@ -27,6 +27,7 @@ use App\Enums\BlueGreenFleetStatus;
 use App\Enums\ProcessStatus;
 use App\Events\ApplicationConfigurationChanged;
 use App\Events\ServiceStatusChanged;
+use App\Exceptions\BlueGreenRecoveryHandoffException;
 use App\Exceptions\DeploymentException;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
@@ -619,8 +620,25 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             }
         } catch (Throwable $e) {
             $failure = $this->blueGreenLifecycle?->rollback($e) ?? $e;
-            if ($this->blueGreenLifecycle?->isRetryableDrainTimeout($failure)) {
+            // Deferring is only legitimate while the drain can still make
+            // progress. The immutable deadline never advances, so once its
+            // bounded budget is spent another deferral just returns this row
+            // nonterminal again, and a deployment that keeps re-entering this
+            // path defers forever — fencing every later push to the
+            // application behind a release that can never finish.
+            if ($this->blueGreenLifecycle?->isRetryableDrainTimeout($failure)
+                && ! $this->blueGreenLifecycle->hasSpentDrainRecoveryBudget()) {
                 $this->deferBlueGreenDrainRecovery();
+                $drainRecoveryScheduled = true;
+
+                return;
+            }
+            // Nothing is wrong with this release: automatic recovery took the
+            // destination for a bounded moment and queued the owner that frees it.
+            // Failing here made the operator push the same commit a second time to
+            // get the deployment they already asked for.
+            if ($failure instanceof BlueGreenRecoveryHandoffException
+                && $this->returnToQueueBehindBlueGreenRecovery($failure)) {
                 $drainRecoveryScheduled = true;
 
                 return;
@@ -7819,6 +7837,45 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         $this->application_deployment_queue->addLogEntry(
             "Inactive {$state->inactive_retirement_color->value} container {$state->inactive_retirement_container_id} remains running until {$state->inactive_retirement_not_before_at->toIso8601String()} for fast rollback; embedded workers, schedulers, and cron processes remain active until retirement.",
         );
+    }
+
+    /**
+     * Returns this deployment to the queue so it runs once the fenced recovery
+     * owner releases the destination. The dispatch-claim gate is the single
+     * authority on when that is true — it already defers a queued row whose
+     * durable blue-green state is not cleanly claimable and registers automatic
+     * convergence — so this only has to put the row back in its hands, never
+     * re-implement the waiting.
+     *
+     * The write is fenced on this exact dispatch attempt: a row some other
+     * attempt now owns must not be dragged back to queued underneath it. If the
+     * fence does not hold, the caller falls through to ordinary failure.
+     */
+    private function returnToQueueBehindBlueGreenRecovery(Throwable $failure): bool
+    {
+        if (! is_string($this->dispatch_attempt_uuid) || $this->pull_request_id !== 0) {
+            return false;
+        }
+
+        $returned = ApplicationDeploymentQueue::query()
+            ->whereKey($this->application_deployment_queue->getKey())
+            ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
+            ->where('horizon_job_id', $this->dispatch_attempt_uuid)
+            ->whereNull('finished_at')
+            ->update([
+                'status' => ApplicationDeploymentStatus::QUEUED->value,
+                'horizon_job_id' => null,
+                'horizon_job_worker' => null,
+                'current_process_id' => null,
+            ]);
+        if ($returned !== 1) {
+            return false;
+        }
+
+        $this->application_deployment_queue->refresh();
+        $this->application_deployment_queue->addLogEntry($failure->getMessage());
+
+        return true;
     }
 
     public function deferBlueGreenDrainRecovery(): void

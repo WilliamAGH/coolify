@@ -620,7 +620,7 @@ it('publishes a recoverable drain-recovery fleet failure timestamp under the exa
     // only the fenced resume job just queued can finish it.
     expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::FINALIZED_UNCONFIRMED)
         ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::DEFERRED)
-        ->and($result->recoveryOwnerDispatched)->toBeTrue()
+        ->and($result->recoveryOwnerActive)->toBeTrue()
         ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::DRAINING)
         ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
         ->and($scenario->deployment->fresh()->finished_at)->toBeNull();

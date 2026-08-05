@@ -64,6 +64,7 @@ use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
+use App\Exceptions\BlueGreenRecoveryHandoffException;
 use App\Exceptions\DeploymentException;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeactivation;
@@ -210,11 +211,16 @@ final class BlueGreenDeploymentLifecycle
             && ! ClaimBlueGreenDeployment::stateIsCleanlyClaimable($durableState)) {
             // Automatic recovery can legitimately leave the destination unclaimable
             // by handing the remaining work to a fenced owner it just queued. That
-            // is a wait, not a reconciliation an operator has to perform, and the
-            // generic message sent them looking for state that nothing is wrong
-            // with. Failing closed is still correct — this deployment does not own
-            // that operation and must not mutate the destination underneath it.
-            throw new DeploymentException($this->interventionRecoveryHandoff ?? 'An unfinished blue-green lifecycle must be reconciled before another deployment can mutate this destination.');
+            // is a bounded wait, not a reconciliation an operator has to perform,
+            // so this deployment is returned to the queue rather than failed — the
+            // dispatch-claim gate already knows how to hold a queued row back until
+            // the destination is cleanly claimable. Either way this deployment does
+            // not own that operation and must not mutate the destination under it.
+            if ($this->interventionRecoveryHandoff !== null) {
+                throw new BlueGreenRecoveryHandoffException($this->interventionRecoveryHandoff);
+            }
+
+            throw new DeploymentException('An unfinished blue-green lifecycle must be reconciled before another deployment can mutate this destination.');
         }
         $this->assertEligibility();
         $this->serverBootId = ReadBlueGreenServerBootIdentity::run($this->server);
@@ -835,6 +841,28 @@ final class BlueGreenDeploymentLifecycle
     }
 
     /**
+     * The bounded wall-clock a drain gets past its immutable deadline before
+     * every further resume is provably pointless. Ten fenced resumes thirty
+     * seconds apart, expressed as duration so it survives a re-dispatch that
+     * resets the attempt counter.
+     */
+    public const DRAIN_RECOVERY_BUDGET_SECONDS = 300;
+
+    /**
+     * True once the drain deadline is far enough in the past that no further
+     * deferral can make progress. The deadline never advances, so a caller that
+     * keeps deferring past this point loops forever and leaves the deployment
+     * nonterminal — fencing every later push to the application.
+     */
+    public function hasSpentDrainRecoveryBudget(): bool
+    {
+        $deadline = $this->drainRecoveryDeadline();
+
+        return $deadline !== null
+            && $deadline->addSeconds(self::DRAIN_RECOVERY_BUDGET_SECONDS)->isPast();
+    }
+
+    /**
      * The immutable drain deadline of the operation this recovery owns, so a
      * caller can decide whether the bounded recovery budget is durably spent
      * rather than trusting a counter that every re-dispatch resets.
@@ -1063,8 +1091,8 @@ final class BlueGreenDeploymentLifecycle
         $this->deployment->addLogEntry(
             "Blue-green intervention auto-recovery: classification={$result->classification} outcome={$result->outcome} {$result->message}",
         );
-        if ($result->recoveryOwnerDispatched) {
-            $this->interventionRecoveryHandoff = 'Automatic blue-green recovery queued a fenced owner to finish the previous operation on this destination; retry this deployment once it completes. '
+        if ($result->recoveryOwnerActive) {
+            $this->interventionRecoveryHandoff = 'Automatic blue-green recovery handed the previous operation on this destination to a fenced owner; this deployment returns to the queue and starts once that owner finishes. '
                 .$result->message;
         }
 

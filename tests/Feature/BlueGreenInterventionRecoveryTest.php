@@ -16,7 +16,7 @@ use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
-use App\Exceptions\DeploymentException;
+use App\Exceptions\BlueGreenRecoveryHandoffException;
 use App\Jobs\ResumeBlueGreenDrainingDeploymentJob;
 use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationDeploymentQueue;
@@ -417,7 +417,7 @@ it('reopens one exact finalized draining intervention and queues only its fenced
     // cancelled the exact entry that owner needs.
     expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::FINALIZED_UNCONFIRMED)
         ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::DEFERRED)
-        ->and($result->recoveryOwnerDispatched)->toBeTrue()
+        ->and($result->recoveryOwnerActive)->toBeTrue()
         ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::DRAINING)
         ->and($scenario->state->fresh()->intervention_phase)->toBeNull()
         ->and($scenario->state->fresh()->intervention_reason)->toBeNull()
@@ -458,7 +458,7 @@ it('leaves the reopened finalized owner running for the fenced resume job break-
     // with nobody able to resume it — permanently unclaimable for every future
     // deployment to this application.
     expect($result['outcome'])->toBe(EmergencyRecoverApplicationDeployment::DEFERRED)
-        ->and($result['recovery_owner_dispatched'])->toBeTrue()
+        ->and($result['recovery_owner_active'])->toBeTrue()
         ->and($result['cancelled'])->toBeFalse()
         ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
         ->and($scenario->deployment->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::DRAINING)
@@ -469,7 +469,7 @@ it('leaves the reopened finalized owner running for the fenced resume job break-
     );
 });
 
-it('tells a new push that automatic recovery queued an owner rather than asking for reconciliation', function (): void {
+it('hands a new push back to the queue when automatic recovery queued an owner', function (): void {
     Queue::fake();
     $scenario = BlueGreenRecoveryScenario::create(finalized: true, routingMutationRecorded: true);
     $scenario->state->update([
@@ -509,10 +509,12 @@ it('tells a new push that automatic recovery queued an owner rather than asking 
     try {
         $lifecycle->initialize();
         $this->fail('A destination left DRAINING by automatic recovery must not be claimable by a new push.');
-    } catch (DeploymentException $exception) {
+    } catch (BlueGreenRecoveryHandoffException $exception) {
+        // A distinct type, not a generic failure: the job handler reads it as
+        // "return this row to the queue", which is what makes one push enough.
         expect($exception->getMessage())
-            ->toContain('queued a fenced owner')
-            ->and($exception->getMessage())->toContain('retry this deployment once it completes');
+            ->toContain('handed the previous operation on this destination to a fenced owner')
+            ->and($exception->getMessage())->toContain('returns to the queue');
     } finally {
         $lifecycle->release();
     }
@@ -880,4 +882,57 @@ it('only accepts live managed metadata whose sidecar matches its managed route c
 
     expect($read?->activeColor)->toBe(BlueGreenDeploymentColor::BLUE)
         ->and($read?->activeDeploymentUuid)->toBe(BlueGreenRecoveryScenario::OPERATION_UUID);
+});
+
+it('refuses to reopen a finalized drain a fenced resume already proved unreconstructable', function (): void {
+    Queue::fake();
+    $scenario = BlueGreenRecoveryScenario::create(finalized: true, routingMutationRecorded: true);
+    $scenario->state->update([
+        'phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+        'intervention_phase' => BlueGreenDeploymentPhase::DRAINING->value,
+        'intervention_reason' => RecoverBlueGreenIntervention::UNRECONSTRUCTABLE_DRAIN_REASON,
+    ]);
+    $scenario->deployment->update([
+        'status' => ApplicationDeploymentStatus::FAILED->value,
+        'blue_green_phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+        'finished_at' => now(),
+    ]);
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        apply: true,
+        reason: 'Automatic retry after a resume proved the operation unreconstructable.',
+    );
+
+    // Reopening would queue the same resume, which would fail the same way and
+    // park it again. Left unbroken that cycle fences the destination for as long
+    // as anything keeps pushing, because every arriving push restarts it.
+    expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::SKIPPED)
+        ->and($result->recoveryOwnerActive)->toBeFalse()
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED);
+    Queue::assertNotPushed(ResumeBlueGreenDrainingDeploymentJob::class);
+});
+
+it('parks an unreconstructable draining owner instead of leaving it for an endless redispatch', function (): void {
+    Queue::fake();
+    $scenario = BlueGreenRecoveryScenario::create(finalized: true, routingMutationRecorded: true);
+    $scenario->state->update(['phase' => BlueGreenDeploymentPhase::DRAINING]);
+    $scenario->deployment->update([
+        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+        'blue_green_phase' => BlueGreenDeploymentPhase::DRAINING,
+        'finished_at' => null,
+    ]);
+    // Durable provenance the resume job cannot reconstruct into an exact owner.
+    // Chosen from the fields the queue row does not mirror, so state and queue
+    // still agree with each other — the case where parking is possible at all.
+    $scenario->state->update(['operation_candidate_container_name' => null]);
+
+    (new ResumeBlueGreenDrainingDeploymentJob($scenario->deployment->id))->handle();
+
+    // Left DRAINING, the reconciler rediscovers this same stale owner, dispatches
+    // this same job, it fails the same way, and every future push to the
+    // application stays fenced for as long as that runs.
+    expect($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
+        ->and($scenario->state->fresh()->intervention_reason)
+        ->toBe(RecoverBlueGreenIntervention::UNRECONSTRUCTABLE_DRAIN_REASON);
 });

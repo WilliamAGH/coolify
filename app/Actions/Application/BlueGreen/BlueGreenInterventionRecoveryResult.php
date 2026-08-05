@@ -25,13 +25,12 @@ final readonly class BlueGreenInterventionRecoveryResult
     public const SKIPPED = 'skipped';
 
     /**
-     * @param  bool  $recoveryOwnerDispatched  True only when this recovery handed the remaining
-     *                                         work to a fenced recovery owner that needs the
-     *                                         exact queue row left IN_PROGRESS to finish it.
-     *                                         A deferred outcome on its own proves nothing:
-     *                                         most deferrals dispatch no owner at all, so a
-     *                                         caller that reads the outcome label alone cannot
-     *                                         tell "someone is finishing this" from "nobody is".
+     * @param  bool  $recoveryOwnerActive  True when an owner is driving this destination and
+     *                                     needs the exact queue row left IN_PROGRESS to
+     *                                     finish: a fenced recovery job this recovery queued,
+     *                                     or a live lifecycle owner already holding the
+     *                                     destination lock. A deferred outcome on its own
+     *                                     proves nothing either way.
      */
     public function __construct(
         public string $classification,
@@ -40,9 +39,9 @@ final readonly class BlueGreenInterventionRecoveryResult
         public ?int $stateId = null,
         public ?int $deactivationId = null,
         public ?string $activeColor = null,
-        public bool $recoveryOwnerDispatched = false,
+        public bool $recoveryOwnerActive = false,
     ) {
-        if ($this->recoveryOwnerDispatched && $this->outcome !== self::DEFERRED) {
+        if ($this->recoveryOwnerActive && $this->outcome !== self::DEFERRED) {
             throw new \InvalidArgumentException('Only a deferred blue-green intervention recovery can hand work to a fenced recovery owner.');
         }
     }

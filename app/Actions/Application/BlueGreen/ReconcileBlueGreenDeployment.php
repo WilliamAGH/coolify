@@ -25,11 +25,24 @@ final class ReconcileBlueGreenDeployment
 {
     use AsAction;
 
+    /**
+     * @param  string|null  $requiredOperationUuid  When set, the destination must still be
+     *                                              running this exact operation once the lock is
+     *                                              held. A caller that validated ownership
+     *                                              before the lock — break-glass reads the state
+     *                                              to decide whether the requested UUID owns it —
+     *                                              validated a snapshot: a newer operation can
+     *                                              take the destination in between, and without
+     *                                              this the reconciliation would then act on the
+     *                                              successor a stale request never named.
+     */
     public function handle(
         ApplicationBlueGreenDeployment $state,
         int $staleAfterSeconds = 300,
         bool $ignoreQueueActivity = false,
         ?BlueGreenOperationFence $operationFence = null,
+        ?string $requiredOperationUuid = null,
+        ?int $requiredSupersessionGeneration = null,
     ): BlueGreenReconciliationResult {
         if ($staleAfterSeconds < 1) {
             throw new \InvalidArgumentException('The reconciliation stale window must be positive.');
@@ -81,10 +94,14 @@ final class ReconcileBlueGreenDeployment
                 BlueGreenDeploymentLock::RENEWABLE_LEASE_SECONDS,
             );
             if (! $lock->get()) {
+                // A held lock is a live owner working this destination right now.
+                // It is driving the queue row every bit as much as a job this
+                // reconciliation could have dispatched, so the row must survive.
                 return new BlueGreenReconciliationResult(
                     $stateId,
                     BlueGreenReconciliationResult::DEFERRED,
                     'Another lifecycle owner holds the blue-green reconciliation lock.',
+                    recoveryOwnerActive: true,
                 );
             }
             $operationFence = new BlueGreenOperationFence($lock, BlueGreenDeploymentLock::RENEWABLE_LEASE_SECONDS);
@@ -116,6 +133,21 @@ final class ReconcileBlueGreenDeployment
                     $stateId,
                     BlueGreenReconciliationResult::DEFERRED,
                     'A newer operation or deactivation changed the durable recovery owner before reconciliation acquired its lock.',
+                );
+            }
+            // The caller's own pre-lock ownership decision is re-proven here,
+            // under the lock, against the state as it actually is now.
+            if (($requiredOperationUuid !== null && $requiredOperationUuid !== $expectedOperationUuid)
+                || ($requiredSupersessionGeneration !== null && $requiredSupersessionGeneration !== $state->supersession_generation)) {
+                // Deliberately not an active owner: the operation the caller named
+                // lost the destination, so nothing is driving its row and releasing
+                // it is the same strand fix the pre-lock ownership check performs.
+                // The newer operation is untouched — that is the point of stopping
+                // here rather than reconciling whatever now owns the state.
+                return new BlueGreenReconciliationResult(
+                    $stateId,
+                    BlueGreenReconciliationResult::DEFERRED,
+                    'The requested recovery operation no longer owns this destination; a newer operation took it before the lock was held.',
                 );
             }
 
@@ -839,10 +871,13 @@ final class ReconcileBlueGreenDeployment
         if ($deployment !== null
             && ! $ignoreQueueActivity
             && BlueGreenDeploymentQueueActivity::run($deployment, $staleAfterSeconds)) {
+            // The owning job wrote to this row moments ago, so it is still running
+            // it; releasing the row would cut that owner off mid-drain.
             return new BlueGreenReconciliationResult(
                 $state->id,
                 BlueGreenReconciliationResult::DEFERRED,
                 'The durable DRAINING queue owner is still active or inside the stale-work safety window.',
+                recoveryOwnerActive: true,
             );
         }
         if ($this->exactDrainingDeploymentId($state->id, $expectedOperationUuid, $expectedGeneration) === null) {
@@ -860,7 +895,7 @@ final class ReconcileBlueGreenDeployment
             $state->id,
             BlueGreenReconciliationResult::DEFERRED,
             'The stale durable DRAINING operation was deferred to its dedicated fenced resume job.',
-            recoveryOwnerDispatched: true,
+            recoveryOwnerActive: true,
         );
     }
 

@@ -2,10 +2,13 @@
 
 namespace App\Jobs;
 
+use App\Actions\Application\BlueGreen\MarkBlueGreenRecoveryInterventionRequired;
+use App\Actions\Application\BlueGreen\RecoverBlueGreenIntervention;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Exceptions\DeploymentException;
 use App\Models\Application;
+use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\StandaloneDocker;
 use App\Services\BlueGreenDeploymentLifecycle;
@@ -139,14 +142,8 @@ final class ResumeBlueGreenDrainingDeploymentJob implements ShouldQueue
      */
     private function hasSpentDrainBudget(BlueGreenDeploymentLifecycle $lifecycle): bool
     {
-        if ($this->recoveryAttempt >= self::MAX_ATTEMPTS) {
-            return true;
-        }
-
-        $deadline = $lifecycle->drainRecoveryDeadline();
-
-        return $deadline !== null
-            && $deadline->addSeconds(self::MAX_ATTEMPTS * self::RETRY_DELAY_SECONDS)->isPast();
+        return $this->recoveryAttempt >= self::MAX_ATTEMPTS
+            || $lifecycle->hasSpentDrainRecoveryBudget();
     }
 
     public function failed(?Throwable $exception): void
@@ -199,9 +196,10 @@ final class ResumeBlueGreenDrainingDeploymentJob implements ShouldQueue
     ): void {
         if (! $lifecycle?->isDrainingRecovery()) {
             $deployment->addLogEntry(
-                'Blue-green drain recovery could not prove exact lifecycle ownership; durable state and queue status were left unchanged for reconciliation.',
+                'Blue-green drain recovery could not prove exact lifecycle ownership: '.$exception->getMessage(),
                 'stderr',
             );
+            $this->parkUnreconstructableOwner($deployment);
 
             return;
         }
@@ -221,5 +219,54 @@ final class ResumeBlueGreenDrainingDeploymentJob implements ShouldQueue
             'stderr',
         );
         (new ApplicationDeploymentJob($deployment->id))->failBlueGreenDrainRecovery($exception);
+    }
+
+    /**
+     * A DRAINING owner this job cannot reconstruct is not a transient miss: the
+     * durable provenance needed to resume it does not add up, and it will not add
+     * up on the next attempt either. Leaving the row DRAINING and IN_PROGRESS is
+     * what made that permanent — the reconciler rediscovers the same stale owner,
+     * dispatches this same job, it fails the same way, and the destination fences
+     * every future push for as long as the loop runs.
+     *
+     * Parking it at INTERVENTION_REQUIRED stops the loop without deciding
+     * anything about the live containers: no route is touched, no container is
+     * retired, and the destination is handed to the recovery owners that can
+     * classify it — automatic intervention recovery first, break-glass after.
+     */
+    private function parkUnreconstructableOwner(ApplicationDeploymentQueue $deployment): void
+    {
+        $state = ApplicationBlueGreenDeployment::query()
+            ->where('application_id', $deployment->application_id)
+            ->where('standalone_docker_id', $deployment->destination_id)
+            ->first();
+        if ($state === null
+            || $state->phase !== BlueGreenDeploymentPhase::DRAINING
+            || $state->operation_deployment_uuid !== $deployment->deployment_uuid) {
+            return;
+        }
+
+        try {
+            $parked = MarkBlueGreenRecoveryInterventionRequired::run(
+                (int) $state->getKey(),
+                $state->operation_deployment_uuid,
+                $state->supersession_generation,
+                RecoverBlueGreenIntervention::UNRECONSTRUCTABLE_DRAIN_REASON,
+            );
+        } catch (Throwable $parkFailure) {
+            $deployment->addLogEntry(
+                'Blue-green drain recovery could not park the unreconstructable durable owner: '.$parkFailure->getMessage(),
+                'stderr',
+            );
+
+            return;
+        }
+
+        $deployment->addLogEntry(
+            $parked
+                ? 'Blue-green drain recovery parked the unreconstructable durable owner at intervention rather than leaving it draining for an endless redispatch.'
+                : 'Blue-green drain recovery found the durable owner had already changed; no intervention was recorded.',
+            'stderr',
+        );
     }
 }
