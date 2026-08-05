@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [unreleased]
+
+### 📚 Documentation
+
+- Update changelog
+
+### 🧪 Testing
+
+- *(control-plane)* Stop asserting two independent timestamps are the same second
+
 ## [4.13.65-fork] - 2026-08-05
 
 ### 🐛 Bug Fixes
