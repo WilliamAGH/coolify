@@ -7683,6 +7683,13 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
      * destination waits forever on a row that is terminal. The fallback's own
      * compare-and-set is what makes this exactly-once — it publishes FAILED only
      * from an IN_PROGRESS DRAINING owner, so this finalizer can never re-notify.
+     *
+     * The notification is sent directly rather than through the shared failure
+     * handler. That handler also narrates a fleet failure — which destination was
+     * marked degraded, how many queued siblings were paused before remote
+     * mutation — and the fallback publishes its own terminal row without going
+     * near any of that. Routing a fleet child through it would report pausing
+     * that never happened.
      */
     public function completeBlueGreenFallbackTermination(): void
     {
@@ -7692,7 +7699,7 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
             throw new DeploymentException('The finalized blue-green fallback did not leave its exact terminal failed queue owner behind.');
         }
 
-        $this->handleStatusTransition(ApplicationDeploymentStatus::FAILED);
+        $this->sendDeploymentNotification(DeploymentFailed::class);
         queue_next_deployment($this->application_deployment_queue);
     }
 

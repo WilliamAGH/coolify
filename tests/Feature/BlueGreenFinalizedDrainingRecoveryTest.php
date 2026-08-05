@@ -42,6 +42,7 @@ use App\Models\Project;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
 use App\Models\Team;
+use App\Notifications\Application\DeploymentFailed;
 use App\Services\BlueGreenDeploymentLifecycle;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Process\FakeProcessResult;
@@ -406,6 +407,11 @@ it('advances the successor queued behind a finalized fallback that terminalized 
         BlueGreenDeploymentPhase::DRAINING,
         stageSpecificPreviousRoute: true,
     );
+    $fixture['application']->team()->emailNotificationSettings()->update([
+        'use_instance_email_settings' => true,
+        'deployment_failure_email_notifications' => true,
+    ]);
+
     $currentState = $fixture['candidateConfiguration']->state;
     $restoredState = $fixture['previousConfiguration']->state->withDestinationFenceEpoch(
         $currentState->destinationFenceEpoch + 1,
@@ -446,6 +452,51 @@ it('advances the successor queued behind a finalized fallback that terminalized 
     (new ApplicationDeploymentJob($fixture['deployment']->id))->completeBlueGreenFallbackTermination();
 
     expect($successor->fresh()->status)->not->toBe(ApplicationDeploymentStatus::QUEUED->value);
+    Notification::assertSentToTimes($fixture['application']->team(), DeploymentFailed::class, 1);
+});
+
+it('reports a fleet fallback failure without claiming sibling destinations were paused', function (): void {
+    Queue::fake();
+    Notification::fake();
+    $fixture = fixedColorBlueGreenRecoveryFixture(
+        BlueGreenDeploymentPhase::DRAINING,
+        stageSpecificPreviousRoute: true,
+    );
+    $fixture['application']->team()->emailNotificationSettings()->update([
+        'use_instance_email_settings' => true,
+        'deployment_failure_email_notifications' => true,
+    ]);
+
+    $currentState = $fixture['candidateConfiguration']->state;
+    $restoredState = $fixture['previousConfiguration']->state->withDestinationFenceEpoch(
+        $currentState->destinationFenceEpoch + 1,
+        FIXED_COLOR_CANDIDATE_DEPLOYMENT,
+        $currentState->mutationSequence + 1,
+    );
+    $fixture['state']->update([
+        'destination_fence_epoch' => $restoredState->destinationFenceEpoch,
+        'destination_fence_operation_id' => $restoredState->operationId,
+        'destination_fence_mutation_sequence' => $restoredState->mutationSequence,
+        'managed_file_sha256' => $restoredState->managedSha256,
+        'destination_topology_digest' => $restoredState->destinationTopologyDigest,
+        'application_routing_config_digest' => $restoredState->applicationRoutingConfigDigest,
+    ]);
+    // The fallback has no fleet awareness: it terminalizes whichever DRAINING
+    // owner it holds, fleet child included, and pauses nothing.
+    $fixture['deployment']->update(['blue_green_fleet_deployment_uuid' => 'fixed-color-fleet-owner']);
+
+    TransitionsBlueGreenDeployment::finishFinalizedFixedColorFallback(
+        $fixture['claim'],
+        $fixture['previousExpectation'],
+        $restoredState,
+    );
+    (new ApplicationDeploymentJob($fixture['deployment']->id))->completeBlueGreenFallbackTermination();
+
+    // The operator still has to hear the release failed, but not through the
+    // fleet narration, which would describe a degraded-destination marking and a
+    // sibling pause that this path never performed.
+    Notification::assertSentToTimes($fixture['application']->team(), DeploymentFailed::class, 1);
+    expect((string) $fixture['deployment']->fresh()->logs)->not->toContain('Paused the remaining destination(s)');
 });
 
 it('refuses to finalize a fallback termination that left no terminal failed row behind', function (): void {
