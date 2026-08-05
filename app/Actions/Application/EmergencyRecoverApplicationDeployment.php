@@ -41,7 +41,8 @@ final class EmergencyRecoverApplicationDeployment
      *     cancelled: bool,
      *     outcome: self::CLEAN|self::DEFERRED|self::MANUAL_ONLY,
      *     message: string,
-     *     claimable: bool
+     *     claimable: bool,
+     *     recovery_owner_dispatched: bool
      * }
      */
     public function handle(ApplicationDeploymentQueue $deployment, string $reason): array

@@ -16,10 +16,12 @@ use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
+use App\Exceptions\DeploymentException;
 use App\Jobs\ResumeBlueGreenDrainingDeploymentJob;
 use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\InstanceSettings;
+use App\Services\BlueGreenDeploymentLifecycle;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Process;
@@ -465,6 +467,57 @@ it('leaves the reopened finalized owner running for the fenced resume job break-
         ResumeBlueGreenDrainingDeploymentJob::class,
         fn (ResumeBlueGreenDrainingDeploymentJob $job): bool => $job->applicationDeploymentQueueId === $scenario->deployment->id,
     );
+});
+
+it('tells a new push that automatic recovery queued an owner rather than asking for reconciliation', function (): void {
+    Queue::fake();
+    $scenario = BlueGreenRecoveryScenario::create(finalized: true, routingMutationRecorded: true);
+    $scenario->state->update([
+        'phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+        'intervention_phase' => BlueGreenDeploymentPhase::DRAINING->value,
+        'intervention_reason' => 'Finalization requires a fenced drain recovery retry.',
+        'operation_drain_started_at' => now()->subMinutes(2),
+        'operation_drain_deadline_at' => now()->subMinute(),
+    ]);
+    $scenario->deployment->update([
+        'status' => ApplicationDeploymentStatus::FAILED->value,
+        'blue_green_phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+        'finished_at' => now(),
+    ]);
+    $incomingPush = ApplicationDeploymentQueue::query()->create([
+        'application_id' => $scenario->application->id,
+        'server_id' => $scenario->server->id,
+        'destination_id' => $scenario->destination->id,
+        'deployment_uuid' => 'incoming-push-after-intervention',
+        'pull_request_id' => 0,
+        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+    ]);
+    $lifecycle = new BlueGreenDeploymentLifecycle(
+        application: $scenario->application,
+        deployment: $incomingPush,
+        destination: $scenario->destination,
+        server: $scenario->server,
+        timeout: 30,
+        checkForCancellation: static function (): void {},
+    );
+
+    // Failing closed is right — this push does not own the reopened operation and
+    // must not mutate the destination underneath it. What was wrong was the
+    // reason given: automatic recovery had just queued the owner that finishes
+    // the work, and the generic refusal sent operators hunting for durable state
+    // to repair by hand when all that was needed was to push again.
+    try {
+        $lifecycle->initialize();
+        $this->fail('A destination left DRAINING by automatic recovery must not be claimable by a new push.');
+    } catch (DeploymentException $exception) {
+        expect($exception->getMessage())
+            ->toContain('queued a fenced owner')
+            ->and($exception->getMessage())->toContain('retry this deployment once it completes');
+    } finally {
+        $lifecycle->release();
+    }
+
+    Queue::assertPushed(ResumeBlueGreenDrainingDeploymentJob::class);
 });
 
 it('proves a cancelled queue row cannot own the draining phase its resume job resumes', function (): void {
