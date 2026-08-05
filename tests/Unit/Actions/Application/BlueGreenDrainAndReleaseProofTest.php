@@ -47,6 +47,45 @@ it('requires two observed zero-connection samples before exact previous-containe
         );
 });
 
+it('retires the exact predecessor without re-observing connections once the drain budget is spent', function () {
+    $commands = (new DrainBlueGreenPreviousContainer)->forcedStopCommandsFor(
+        blueGreenDrainExpectation(),
+        stopTimeoutSeconds: 15,
+    );
+    $script = $commands[array_key_last($commands)];
+
+    expect($commands)->not->toBeEmpty()
+        ->and($script)
+        ->toContain('docker stop --time=15', str_repeat('a', 64))
+        ->and($script)
+        ->not->toContain(
+            'drain_deadline',
+            'drain_zero_observations',
+            '/proc/$drain_pid/net/tcp',
+            DrainBlueGreenPreviousContainer::TIMEOUT_MARKER,
+        );
+});
+
+it('refuses a forced retirement without an exact Docker identity or a positive stop grace', function () {
+    $drain = new DrainBlueGreenPreviousContainer;
+
+    expect(fn () => $drain->forcedStopCommandsFor(
+        new BlueGreenContainerExpectation(
+            name: 'app-drain-blue',
+            dockerId: null,
+            applicationId: 42,
+            pullRequestId: 0,
+            blueGreenManaged: true,
+            deploymentUuid: 'deployment-drain',
+            color: BlueGreenDeploymentColor::BLUE,
+            routingRevision: 7,
+        ),
+        stopTimeoutSeconds: 15,
+    ))->toThrow(InvalidArgumentException::class, 'exact Docker ID is required')
+        ->and(fn () => $drain->forcedStopCommandsFor(blueGreenDrainExpectation(), stopTimeoutSeconds: 0))
+        ->toThrow(InvalidArgumentException::class, 'must be positive');
+});
+
 it('counts established connections across every exposed backend port before retirement', function () {
     $drain = new DrainBlueGreenPreviousContainer;
     $commands = $drain->commandsFor(

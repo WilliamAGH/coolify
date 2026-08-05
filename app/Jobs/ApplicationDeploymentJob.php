@@ -299,6 +299,8 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
 
     private bool $preserveBlueGreenRecovery = false;
 
+    private bool $helperContainerStartupAttempted = false;
+
     private Collection|string $build_secrets;
 
     private ?BlueGreenDeploymentLifecycle $blueGreenLifecycle = null;
@@ -656,8 +658,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
                 }
 
                 try {
-                    $this->application_deployment_queue->addLogEntry("Gracefully shutting down build container: {$this->deployment_uuid}");
-                    $this->graceful_shutdown_container($this->deployment_uuid, skipRemove: true);
+                    $this->cleanupStartedHelperContainer();
                 } catch (Exception $e) {
                     // Log but don't fail - container cleanup errors are expected when container is already gone
                     Log::warning('Failed to shutdown container '.$this->deployment_uuid.': '.$e->getMessage());
@@ -4206,10 +4207,23 @@ BASH;
                 $runCommand,
                 'hidden' => true,
             ],
+        );
+        $this->helperContainerStartupAttempted = true;
+        $this->execute_remote_command(
             [
                 'command' => executeInDocker($this->deployment_uuid, "mkdir -p {$this->basedir}"),
             ],
         );
+    }
+
+    private function cleanupStartedHelperContainer(): void
+    {
+        if (! $this->helperContainerStartupAttempted) {
+            return;
+        }
+
+        $this->application_deployment_queue->addLogEntry("Gracefully shutting down build container: {$this->deployment_uuid}");
+        $this->graceful_shutdown_container($this->deployment_uuid, skipRemove: true);
     }
 
     private function restart_builder_container_with_actual_commit()

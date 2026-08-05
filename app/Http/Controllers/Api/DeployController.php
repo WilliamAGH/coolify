@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Actions\Application\CancelApplicationDeployment;
+use App\Actions\Application\EmergencyRecoverApplicationDeployment;
 use App\Actions\Database\StartDatabase;
 use App\Actions\Service\StartService;
 use App\Enums\ApplicationDeploymentStatus;
@@ -293,6 +294,86 @@ class DeployController extends Controller
         ]);
     }
 
+    #[OA\Post(
+        summary: 'Emergency recover deployment',
+        description: 'Break-glass recovery for a hanging deployment: cancels the exact queue entry and clears the durable blue-green residue that would otherwise fence the next deployment. Ordinary deployments recover automatically and do not need this.',
+        path: '/deployments/{uuid}/recover',
+        operationId: 'recover-deployment-by-uuid',
+        security: [
+            ['bearerAuth' => []],
+        ],
+        tags: ['Deployments'],
+        parameters: [
+            new OA\Parameter(name: 'uuid', in: 'path', required: true, description: 'Deployment UUID', schema: new OA\Schema(type: 'string')),
+        ],
+        responses: [
+            new OA\Response(
+                response: 200,
+                description: 'Recovery attempted.',
+                content: new OA\MediaType(
+                    mediaType: 'application/json',
+                    schema: new OA\Schema(
+                        type: 'object',
+                        properties: [
+                            new OA\Property(property: 'deployment_uuid', type: 'string'),
+                            new OA\Property(property: 'status', type: 'string'),
+                            new OA\Property(property: 'cancelled', type: 'boolean'),
+                            new OA\Property(property: 'outcome', type: 'string', enum: ['clean', 'deferred', 'manual_only']),
+                            new OA\Property(property: 'message', type: 'string'),
+                            new OA\Property(property: 'claimable', type: 'boolean', description: 'True when the next ordinary deployment can claim this destination.'),
+                        ]
+                    )
+                ),
+            ),
+            new OA\Response(response: 401, ref: '#/components/responses/401'),
+            new OA\Response(response: 404, ref: '#/components/responses/404'),
+        ]
+    )]
+    public function recover_deployment(Request $request)
+    {
+        $teamId = getTeamIdFromToken();
+        if (is_null($teamId)) {
+            return invalidTokenResponse();
+        }
+
+        $uuid = $request->route('uuid');
+        if (! $uuid) {
+            return response()->json(['message' => 'UUID is required.'], 400);
+        }
+
+        $deployment = ApplicationDeploymentQueue::where('deployment_uuid', $uuid)->first();
+        if (! $deployment) {
+            return response()->json(['message' => 'Deployment not found.'], 404);
+        }
+
+        $servers = Server::whereTeamId($teamId)->pluck('id');
+        if (! $servers->contains($deployment->server_id)) {
+            return response()->json(['message' => 'You do not have permission to recover this deployment.'], 403);
+        }
+
+        try {
+            $recovery = EmergencyRecoverApplicationDeployment::run(
+                $deployment,
+                "emergency recovery requested through the deployments API by team {$teamId}",
+            );
+        } catch (\Throwable $e) {
+            return response()->json([
+                'message' => 'Failed to recover deployment: '.$e->getMessage(),
+            ], 500);
+        }
+
+        auditLog('api.deployment.recovered', [
+            'team_id' => $teamId,
+            'deployment_uuid' => $deployment->deployment_uuid,
+            'application_id' => $deployment->application_id,
+            'server_id' => $deployment->server_id,
+            'outcome' => $recovery['outcome'],
+            'claimable' => $recovery['claimable'],
+        ]);
+
+        return response()->json($recovery);
+    }
+
     /**
      * Best-effort removal of the helper/build container after a successful
      * cancellation. The container may never have been created (queued
@@ -324,15 +405,6 @@ class DeployController extends Controller
                 $deployment->addLogEntry('Deployment container not yet started. Will be cancelled when job checks status.');
             }
 
-            // Kill running process if process ID exists
-            if ($deployment->current_process_id) {
-                try {
-                    $processKillCommand = "kill -9 {$deployment->current_process_id}";
-                    instant_remote_process([$processKillCommand], $server);
-                } catch (\Throwable $e) {
-                    // Process might already be gone
-                }
-            }
         } catch (\Throwable $e) {
             try {
                 if (str_contains($e->getMessage(), 'No such container')) {

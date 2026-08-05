@@ -603,7 +603,6 @@ test('restart implementation excludes every git build and application-image pull
         $prepareBuilderMethod->getStartLine() - 1,
         $prepareBuilderMethod->getEndLine() - $prepareBuilderMethod->getStartLine() + 1,
     ));
-
     expect($restartSource)
         ->toContain(
             'ResolveActiveApplicationContainerState::run',
@@ -620,8 +619,48 @@ test('restart implementation excludes every git build and application-image pull
         ->and($captureDigestSource)
         ->toContain('&& ! $this->restart_only')
         ->and($prepareBuilderSource)
-        ->toContain("'--pull=never '");
+        ->toContain(
+            "'--pull=never '",
+            '$this->helperContainerStartupAttempted = true;',
+        )
+        ->and(strpos($prepareBuilderSource, '$this->helperContainerStartupAttempted = true;'))
+        ->toBeGreaterThan(strpos($prepareBuilderSource, '$this->execute_remote_command('));
 });
+
+test('deployment cleanup only stops a helper container after startup succeeded', function (bool $startupSucceeded) {
+    Process::fake();
+    $application = makeDeploymentActionApplication($this->environment, $this->destination);
+    $deploymentUuid = $startupSucceeded
+        ? 'started-helper-cleanup'
+        : 'never-started-helper-cleanup';
+    $deployment = ApplicationDeploymentQueue::query()->create([
+        'application_id' => $application->id,
+        'application_name' => $application->name,
+        'server_id' => $this->server->id,
+        'server_name' => $this->server->name,
+        'destination_id' => $this->destination->id,
+        'deployment_uuid' => $deploymentUuid,
+        'pull_request_id' => 0,
+        'commit' => 'helper-cleanup-test',
+        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+    ]);
+    $job = new ApplicationDeploymentJob($deployment->id);
+    (new ReflectionMethod($job, 'hydrateDeploymentContext'))->invoke($job);
+    (new ReflectionProperty($job, 'helperContainerStartupAttempted'))->setValue($job, $startupSucceeded);
+
+    (new ReflectionMethod($job, 'cleanupStartedHelperContainer'))->invoke($job);
+
+    if ($startupSucceeded) {
+        expect((string) $deployment->fresh()->logs)
+            ->toContain("Gracefully shutting down build container: {$deploymentUuid}");
+    } else {
+        Process::assertNothingRan();
+        expect((string) $deployment->fresh()->logs)->not->toContain('Gracefully shutting down build container');
+    }
+})->with([
+    'startup failed before helper creation' => false,
+    'startup completed before later failure' => true,
+]);
 
 test('deployment uuid strings are not converted as objects in API and webhook controllers', function () {
     $files = [

@@ -351,6 +351,52 @@ it('keeps a drain timeout nonterminal, schedules bounded recovery, and emits suc
     Event::assertDispatchedTimes(ApplicationConfigurationChanged::class, 1);
 });
 
+it('never leaves a spent drain budget resumable by no one', function () {
+    $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
+    Queue::fake();
+    $fixture['deployment']->update([
+        'blue_green_phase' => BlueGreenDeploymentPhase::DRAINING,
+        'blue_green_supersession_generation' => 1,
+    ]);
+    // Not a draining recovery, so the forced retirement cannot prove ownership:
+    // the spent budget must still resolve terminally through intervention
+    // rather than silently returning and stranding the operation in DRAINING.
+    $lifecycle = applicationDeploymentBlueGreenLifecycle($fixture);
+    $exhausted = new ResumeBlueGreenDrainingDeploymentJob($fixture['deployment']->id, 10);
+
+    expect(invokeApplicationDeploymentBlueGreenMethod(
+        $exhausted,
+        'resolveRetryableDrainTimeout',
+        $fixture['deployment'],
+        $lifecycle,
+    ))->toBeFalse();
+
+    expect($fixture['deployment']->fresh()->logs)
+        ->toContain('could not retire the exact unrouted predecessor after its bounded budget was spent');
+    Queue::assertNotPushed(ResumeBlueGreenDrainingDeploymentJob::class);
+});
+
+it('does not force a retirement while the bounded drain budget still has attempts left', function () {
+    $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
+    Queue::fake();
+    // The queue entry lost its DRAINING ownership mid-flight, so no further
+    // resume may be scheduled — but the budget is not spent, so this must fall
+    // through to intervention instead of forcing a predecessor stop.
+    $fixture['deployment']->update(['blue_green_phase' => null]);
+    $midBudget = new ResumeBlueGreenDrainingDeploymentJob($fixture['deployment']->id, 4);
+
+    expect(invokeApplicationDeploymentBlueGreenMethod(
+        $midBudget,
+        'resolveRetryableDrainTimeout',
+        $fixture['deployment'],
+        applicationDeploymentBlueGreenLifecycle($fixture),
+    ))->toBeFalse();
+
+    expect($fixture['deployment']->fresh()->logs ?? '')
+        ->not->toContain('could not retire the exact unrouted predecessor');
+    Queue::assertNotPushed(ResumeBlueGreenDrainingDeploymentJob::class);
+});
+
 it('refuses to mark an arbitrary nonfinal deployment successful through drain recovery', function () {
     $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
 

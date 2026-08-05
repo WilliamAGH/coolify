@@ -131,6 +131,44 @@ SH;
     }
 
     /**
+     * Retires the exact predecessor without observing backend connections again,
+     * for the single case where the bounded drain budget is already spent. The
+     * immutable drain deadline can never pass a second time, so re-entering the
+     * observation loop here would fail forever and strand the destination in
+     * DRAINING. Draining is a bounded courtesy to in-flight connections, not an
+     * unbounded veto: the operator-configured Docker stop grace period stays the
+     * only shutdown budget the remaining connections get.
+     *
+     * @return non-empty-list<string>
+     */
+    public function forcedStopCommandsFor(
+        BlueGreenContainerExpectation $expectation,
+        int $stopTimeoutSeconds,
+    ): array {
+        if ($expectation->dockerId === null) {
+            throw new InvalidArgumentException('An exact Docker ID is required before a blue-green container can be force retired.');
+        }
+        if ($stopTimeoutSeconds < 1) {
+            throw new InvalidArgumentException('Blue-green forced retirement timeouts must be positive and valid.');
+        }
+
+        $script = <<<'SH'
+if [ "$(docker inspect --format='{{.State.Status}}' __CONTAINER_ID__)" = running ]; then
+    docker stop --time=__STOP_TIMEOUT__ __CONTAINER_ID__ >/dev/null
+fi
+SH;
+
+        return [
+            ...(new InspectBlueGreenContainer)->exactMutationAssertionsFor($expectation),
+            str_replace(
+                ['__CONTAINER_ID__', '__STOP_TIMEOUT__'],
+                [escapeshellarg($expectation->dockerId), (string) $stopTimeoutSeconds],
+                $script,
+            ),
+        ];
+    }
+
+    /**
      * @return non-empty-list<string>
      */
     public function completionAssertionsFor(BlueGreenContainerExpectation $expectation): array

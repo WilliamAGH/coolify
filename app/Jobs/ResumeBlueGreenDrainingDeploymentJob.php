@@ -78,9 +78,9 @@ final class ResumeBlueGreenDrainingDeploymentJob implements ShouldQueue
             }
             (new ApplicationDeploymentJob($deployment->id))->completeBlueGreenDrainRecovery();
         } catch (Throwable $exception) {
-            if ($lifecycle?->isRetryableDrainTimeout($exception)) {
-                $this->scheduleNextAttempt($deployment);
-
+            if ($lifecycle !== null
+                && $lifecycle->isRetryableDrainTimeout($exception)
+                && $this->resolveRetryableDrainTimeout($deployment, $lifecycle)) {
                 return;
             }
 
@@ -88,6 +88,42 @@ final class ResumeBlueGreenDrainingDeploymentJob implements ShouldQueue
         } finally {
             $lifecycle?->release();
         }
+    }
+
+    /**
+     * A retryable drain timeout has exactly three outcomes: another bounded
+     * fenced resume, one terminal forced retirement once the bounded budget is
+     * spent, or a fall through to durable intervention. It must never simply
+     * return — the immutable drain deadline can never pass again, so an
+     * operation left DRAINING here is resumable by no one and fences every
+     * future deployment to this application out during prepare.
+     */
+    private function resolveRetryableDrainTimeout(
+        ApplicationDeploymentQueue $deployment,
+        BlueGreenDeploymentLifecycle $lifecycle,
+    ): bool {
+        if ($this->scheduleNextAttempt($deployment)) {
+            return true;
+        }
+        if ($this->recoveryAttempt < self::MAX_ATTEMPTS) {
+            return false;
+        }
+
+        try {
+            $lifecycle->resolveExhaustedDrainingOperation();
+        } catch (Throwable $exception) {
+            $deployment->addLogEntry(
+                'Blue-green drain recovery could not retire the exact unrouted predecessor after its bounded budget was spent: '
+                .$exception->getMessage(),
+                'stderr',
+            );
+
+            return false;
+        }
+
+        (new ApplicationDeploymentJob($deployment->id))->completeBlueGreenDrainRecovery();
+
+        return true;
     }
 
     public function failed(?Throwable $exception): void
@@ -114,7 +150,7 @@ final class ResumeBlueGreenDrainingDeploymentJob implements ShouldQueue
         }
         if ($this->recoveryAttempt >= self::MAX_ATTEMPTS) {
             $deployment->addLogEntry(
-                'Blue-green drain recovery reached its bounded retry limit; durable DRAINING evidence remains for an explicit fenced resume.',
+                'Blue-green drain recovery spent its bounded retry limit while backend connections remained; resolving the operation terminally instead of extending its immutable deadline.',
                 'stderr',
             );
 

@@ -146,15 +146,6 @@ class DeploymentNavbar extends Component
                 $this->application_deployment_queue->addLogEntry('Helper container not yet started. Deployment will be cancelled when job checks status.');
             }
 
-            // Also try to kill any running process if we have a process ID
-            if ($this->application_deployment_queue->current_process_id) {
-                try {
-                    $processKillCommand = "kill -9 {$this->application_deployment_queue->current_process_id}";
-                    instant_remote_process([$processKillCommand], $server);
-                } catch (\Throwable $e) {
-                    // Process might already be gone, that's ok
-                }
-            }
         } catch (\Throwable $e) {
             // Still mark as cancelled even if cleanup fails
             return handleError($e, $this);

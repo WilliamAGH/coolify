@@ -611,7 +611,7 @@ final class BlueGreenDeploymentLifecycle
         return $this->previousContainerExpectation?->blueGreenManaged === true;
     }
 
-    public function retirePreviousContainer(): void
+    public function retirePreviousContainer(bool $force = false): void
     {
         $expectation = $this->previousContainerExpectation;
         if ($expectation === null) {
@@ -621,7 +621,7 @@ final class BlueGreenDeploymentLifecycle
             ?? throw new DeploymentException('Previous-container retirement has no durable operation claim.');
         $this->assertOperationOwned(BlueGreenDeploymentPhase::DRAINING);
         if ($this->previousReplicaInspections !== []) {
-            $this->retirePreviousReplicaSet($claim);
+            $this->retirePreviousReplicaSet($claim, $force);
 
             return;
         }
@@ -636,49 +636,61 @@ final class BlueGreenDeploymentLifecycle
         if ($inspection->dockerId !== $expectation->dockerId) {
             throw new DeploymentException('The previous Docker identity changed before destination-fenced retirement.');
         }
-        $ports = $claim->drainBackendPortInventory?->ports()
-            ?? throw new DeploymentException('The blue-green operation has no immutable previous-container backend port inventory.');
         $stopTimeout = $this->application->settings->deploymentStopGracePeriodSeconds();
         $drainer = new DrainBlueGreenPreviousContainer;
-        $drainState = (new RecordBlueGreenDrainObservation)->deadlineFor($claim);
-        $activeConnections = $drainer->activeConnections($this->server, $expectation, $ports);
-        $drainState = (new RecordBlueGreenDrainObservation)->record($claim, $activeConnections);
-        $drainDeadline = $drainState->operation_drain_deadline_at
-            ?? throw new DeploymentException('The blue-green drain has no durable deadline.');
-        $this->deployment->addLogEntry(
-            "Blue-green previous container {$expectation->name} is draining {$activeConnections} active backend connection(s) before retirement.",
-        );
-        try {
+        if ($force) {
+            $this->deployment->addLogEntry(
+                "Blue-green previous container {$expectation->name} is being retired with the configured {$stopTimeout}s Docker stop grace period after its bounded drain budget was spent.",
+                'stderr',
+            );
             $this->destinationState = $this->executeDestinationMutation(
-                $drainer->commandsFor(
-                    $expectation,
-                    $ports,
-                    $drainDeadline->getTimestamp(),
-                    $stopTimeout,
-                    $activeConnections === 0,
-                ),
+                $drainer->forcedStopCommandsFor($expectation, $stopTimeout),
                 $drainer->completionAssertionsFor($expectation),
             );
             (new RecordBlueGreenDrainObservation)->record($claim, 0);
-        } catch (BlueGreenDestinationStateRecordingException) {
-            $this->reconcilePendingDestinationState();
-            (new RecordBlueGreenDrainObservation)->record($claim, 0);
-        } catch (Throwable $exception) {
-            if (str_contains($exception->getMessage(), DrainBlueGreenPreviousContainer::TIMEOUT_MARKER)) {
-                if (preg_match(DrainBlueGreenPreviousContainer::TIMEOUT_CONNECTIONS_PATTERN, $exception->getMessage(), $matches) === 1) {
-                    (new RecordBlueGreenDrainObservation)->record($claim, (int) $matches['connections']);
+        } else {
+            $ports = $claim->drainBackendPortInventory?->ports()
+                ?? throw new DeploymentException('The blue-green operation has no immutable previous-container backend port inventory.');
+            $drainState = (new RecordBlueGreenDrainObservation)->deadlineFor($claim);
+            $activeConnections = $drainer->activeConnections($this->server, $expectation, $ports);
+            $drainState = (new RecordBlueGreenDrainObservation)->record($claim, $activeConnections);
+            $drainDeadline = $drainState->operation_drain_deadline_at
+                ?? throw new DeploymentException('The blue-green drain has no durable deadline.');
+            $this->deployment->addLogEntry(
+                "Blue-green previous container {$expectation->name} is draining {$activeConnections} active backend connection(s) before retirement.",
+            );
+            try {
+                $this->destinationState = $this->executeDestinationMutation(
+                    $drainer->commandsFor(
+                        $expectation,
+                        $ports,
+                        $drainDeadline->getTimestamp(),
+                        $stopTimeout,
+                        $activeConnections === 0,
+                    ),
+                    $drainer->completionAssertionsFor($expectation),
+                );
+                (new RecordBlueGreenDrainObservation)->record($claim, 0);
+            } catch (BlueGreenDestinationStateRecordingException) {
+                $this->reconcilePendingDestinationState();
+                (new RecordBlueGreenDrainObservation)->record($claim, 0);
+            } catch (Throwable $exception) {
+                if (str_contains($exception->getMessage(), DrainBlueGreenPreviousContainer::TIMEOUT_MARKER)) {
+                    if (preg_match(DrainBlueGreenPreviousContainer::TIMEOUT_CONNECTIONS_PATTERN, $exception->getMessage(), $matches) === 1) {
+                        (new RecordBlueGreenDrainObservation)->record($claim, (int) $matches['connections']);
+                    }
+                    $this->deployment->addLogEntry(
+                        'Blue-green drain deadline elapsed; durable DRAINING state retained with the latest connection observation for a safe retry.',
+                        'stderr',
+                    );
+                    throw new DeploymentException(
+                        'Blue-green previous-container drain timed out; durable DRAINING state is retained for retry.',
+                        previous: $exception,
+                    );
                 }
-                $this->deployment->addLogEntry(
-                    'Blue-green drain deadline elapsed; durable DRAINING state retained with the latest connection observation for a safe retry.',
-                    'stderr',
-                );
-                throw new DeploymentException(
-                    'Blue-green previous-container drain timed out; durable DRAINING state is retained for retry.',
-                    previous: $exception,
-                );
-            }
 
-            throw $exception;
+                throw $exception;
+            }
         }
 
         if (! $expectation->blueGreenManaged) {
@@ -686,15 +698,18 @@ final class BlueGreenDeploymentLifecycle
         }
     }
 
-    private function retirePreviousReplicaSet(BlueGreenDeploymentClaim $claim): void
+    private function retirePreviousReplicaSet(BlueGreenDeploymentClaim $claim, bool $force = false): void
     {
         $ports = $claim->drainBackendPortInventory?->ports()
             ?? throw new DeploymentException('The blue-green operation has no immutable previous-replica backend port inventory.');
         $stopTimeout = $this->application->settings->deploymentStopGracePeriodSeconds();
         $drainer = new DrainBlueGreenPreviousContainer;
-        $drainState = (new RecordBlueGreenDrainObservation)->deadlineFor($claim);
-        $drainDeadline = $drainState->operation_drain_deadline_at
-            ?? throw new DeploymentException('The blue-green replica drain has no durable deadline.');
+        $drainDeadline = null;
+        if (! $force) {
+            $drainState = (new RecordBlueGreenDrainObservation)->deadlineFor($claim);
+            $drainDeadline = $drainState->operation_drain_deadline_at
+                ?? throw new DeploymentException('The blue-green replica drain has no durable deadline.');
+        }
         $commands = [];
         $completionAssertions = [];
         $activeConnections = 0;
@@ -709,6 +724,12 @@ final class BlueGreenDeploymentLifecycle
                 color: $claim->previousActiveColor,
                 routingRevision: $this->previousContainerExpectation?->routingRevision,
             );
+            if ($force) {
+                array_push($commands, ...$drainer->forcedStopCommandsFor($expectation, $stopTimeout));
+                array_push($completionAssertions, ...$drainer->completionAssertionsFor($expectation));
+
+                continue;
+            }
             $connections = $drainer->activeConnections($this->server, $expectation, $ports);
             $activeConnections += $connections;
             array_push($commands, ...$drainer->commandsFor(
@@ -789,6 +810,32 @@ final class BlueGreenDeploymentLifecycle
         $this->assertOperationOwned(BlueGreenDeploymentPhase::DRAINING);
         if (! $this->shouldDeferPreviousContainerRetirement()) {
             $this->retirePreviousContainer();
+        }
+        $this->complete();
+    }
+
+    /**
+     * The immutable drain deadline never advances, so once the bounded recovery
+     * budget is spent every further resume is guaranteed to time out again and
+     * the destination would stay DRAINING forever — fencing every future
+     * deployment to this application out during prepare, because a durable
+     * DRAINING phase can only be resumed by the exact queue entry that owns it.
+     * Draining is a bounded courtesy to in-flight backend connections, not an
+     * unbounded veto: once the budget is spent the exact predecessor this
+     * operation already unrouted is retired with the operator-configured Docker
+     * stop grace period, but only while the candidate this operation already
+     * routed is still proven to hold its exact identity and health.
+     */
+    public function resolveExhaustedDrainingOperation(): void
+    {
+        if (! $this->drainingRecovery) {
+            throw new DeploymentException('Blue-green forced drain retirement was not initialized from an exact durable DRAINING operation.');
+        }
+
+        $this->assertOperationOwned(BlueGreenDeploymentPhase::DRAINING);
+        $this->assertExactCandidateStillHealthy();
+        if (! $this->shouldDeferPreviousContainerRetirement()) {
+            $this->retirePreviousContainer(force: true);
         }
         $this->complete();
     }
