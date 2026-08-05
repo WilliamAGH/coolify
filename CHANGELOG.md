@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🐛 Bug Fixes
+
+- *(blue-green)* Stop a fleet fallback failure from claiming a pause it never did
+
+### 📚 Documentation
+
+- Update changelog
+
+## [4.13.64-fork] - 2026-08-05
+
 ### 🚀 Features
 
 - *(fork-deploy)* Adopt a signed running release that was never recorded
