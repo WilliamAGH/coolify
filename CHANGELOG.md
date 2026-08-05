@@ -4,14 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🐛 Bug Fixes
+
+- *(jobs)* Skip upstream changelog fetch for guarded fork releases
+
 ### 📚 Documentation
 
+- Update changelog
 - Update changelog
 - Update changelog
 
 ### ⚙️ Miscellaneous Tasks
 
 - *(validation)* Run proven-empty deactivation tests in the blue-green lane
+- *(release)* Prepare 4.13.60-fork
 
 ## [4.13.59-fork] - 2026-08-02
 
