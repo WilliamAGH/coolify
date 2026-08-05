@@ -4,8 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🐛 Bug Fixes
+
+- *(blue-green)* Unblock deployments after a retirement needs intervention
+
 ### 📚 Documentation
 
+- Update changelog
 - Update changelog
 
 ## [4.13.62-fork] - 2026-08-05
