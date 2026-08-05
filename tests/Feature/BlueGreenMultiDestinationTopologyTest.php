@@ -616,8 +616,11 @@ it('publishes a recoverable drain-recovery fleet failure timestamp under the exa
         reason: 'Retry the exact finalized drain owner under its lifecycle fence.',
     );
 
+    // Reopening is a handoff, not a recovery: the destination stays DRAINING and
+    // only the fenced resume job just queued can finish it.
     expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::FINALIZED_UNCONFIRMED)
-        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::RECOVERED)
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::DEFERRED)
+        ->and($result->recoveryOwnerDispatched)->toBeTrue()
         ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::DRAINING)
         ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
         ->and($scenario->deployment->fresh()->finished_at)->toBeNull();
