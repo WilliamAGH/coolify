@@ -53,12 +53,21 @@ final class EmergencyRecoverApplicationDeployment
         // state. Recovering through it would let a stale handle mutate whatever
         // newer operation happens to own the destination now.
         if ($state !== null && ! $this->ownsDurableState($state, $deployment)) {
+            // Durable recovery is refused, but the queue row is still released:
+            // a deployment that owns no durable operation cannot be driving one,
+            // and cancelling it touches nothing but itself. This is the strand
+            // left when a newer operation takes the destination mid-flight —
+            // the stranded row otherwise blocks every successor behind it
+            // forever, which is exactly what break-glass is called to clear.
+            $cancelled = $this->cancelHangingQueueEntry($deployment);
+            $claimable = ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state);
+
             return $this->result(
                 $deployment,
-                false,
-                self::MANUAL_ONLY,
-                'A different blue-green operation owns this destination; no recovery was attempted for this deployment.',
-                ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state),
+                $cancelled,
+                $claimable ? self::CLEAN : self::MANUAL_ONLY,
+                'This deployment no longer owns the destination; its stranded queue entry was released without touching the newer operation.',
+                $claimable,
             );
         }
 

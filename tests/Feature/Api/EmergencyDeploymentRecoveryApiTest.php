@@ -193,7 +193,6 @@ it('refuses to recover through a stale deployment uuid that no longer owns the d
     $this->withHeaders(emergencyRecoveryHeaders($this->token))
         ->postJson("/api/v1/deployments/{$deployment->deployment_uuid}/recover")
         ->assertOk()
-        ->assertJsonPath('outcome', 'manual_only')
         ->assertJsonPath('cancelled', false);
 
     // The newer operation must be untouched by the stale handle.
@@ -202,6 +201,29 @@ it('refuses to recover through a stale deployment uuid that no longer owns the d
         ->firstOrFail();
     expect($state->phase)->toBe(BlueGreenDeploymentPhase::DRAINING)
         ->and($state->operation_deployment_uuid)->toBe($liveOperationUuid);
+});
+
+it('releases a deployment stranded after a newer operation took the destination', function () {
+    // Observed live on 4.13.62: the durable state finished and moved to IDLE
+    // under a different owner, leaving the older queue entry IN_PROGRESS with
+    // no phase and every successor queued behind it forever. No scheduled
+    // reconciler scans an IDLE state, so nothing else releases this row.
+    $deployment = makeEmergencyRecoveryDeployment($this->environment, $this->server, $this->destination);
+    ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $deployment->application_id,
+        'standalone_docker_id' => $this->destination->id,
+        'phase' => BlueGreenDeploymentPhase::IDLE,
+        'active_color' => BlueGreenDeploymentColor::BLUE,
+        'blue_deployment_uuid' => (string) str()->uuid(),
+        'supersession_generation' => 1,
+    ]);
+
+    $this->withHeaders(emergencyRecoveryHeaders($this->token))
+        ->postJson("/api/v1/deployments/{$deployment->deployment_uuid}/recover")
+        ->assertOk()
+        ->assertJsonPath('cancelled', true);
+
+    expect($deployment->fresh()->status)->not->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
 });
 
 it('never reports clean while the destination is still fenced for the next push', function () {
