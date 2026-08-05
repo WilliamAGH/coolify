@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [unreleased]
+
+### 📚 Documentation
+
+- Update changelog
+
+## [4.13.62-fork] - 2026-08-05
+
+### 🐛 Bug Fixes
+
+- *(deps)* Update guzzle past GHSA-f7vp-7xgx-4w4r
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.62-fork
+
 ## [4.13.61-fork] - 2026-08-05
 
 ### 🚀 Features
