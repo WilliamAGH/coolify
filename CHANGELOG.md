@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [4.13.69-fork] - 2026-08-06
+
+### 🐛 Bug Fixes
+
+- *(blue-green)* Give a replica drain the retryable contract it always owed
+
+### 📚 Documentation
+
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.69-fork
+
 ## [4.13.68-fork] - 2026-08-06
 
 ### 🐛 Bug Fixes
