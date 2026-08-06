@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [4.13.73-fork] - 2026-08-06
+
+### 🐛 Bug Fixes
+
+- *(blue-green)* Stop a stopped-once application from never retiring its inactive colour
+
+### 📚 Documentation
+
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.73-fork
+
+### ◀️ Revert
+
+- *(blue-green)* Hold back the spent-journal extension that fails on Linux
+
 ## [4.13.72-fork] - 2026-08-06
 
 ### 🐛 Bug Fixes
