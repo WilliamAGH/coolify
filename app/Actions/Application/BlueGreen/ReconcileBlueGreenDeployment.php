@@ -87,6 +87,19 @@ final class ReconcileBlueGreenDeployment
         $expectedOperationUuid = $state->operation_deployment_uuid ?? $state->pending_deployment_uuid;
         $expectedGeneration = $state->supersession_generation;
         $expectedPhase = $state->phase;
+        // The requested-owner proof runs once before the lock is even attempted:
+        // the lock-contended result below vouches for the lock holder as this
+        // row's active recovery owner, and a request whose operation already
+        // lost the destination must never receive that vouching — the holder is
+        // driving the successor, not the stranded row the caller named.
+        if (($requiredOperationUuid !== null && $requiredOperationUuid !== $expectedOperationUuid)
+            || ($requiredSupersessionGeneration !== null && $requiredSupersessionGeneration !== $expectedGeneration)) {
+            return new BlueGreenReconciliationResult(
+                $stateId,
+                BlueGreenReconciliationResult::DEFERRED,
+                'The requested recovery operation no longer owns this destination; a newer operation took it before the lock was held.',
+            );
+        }
         $releaseOperationFence = false;
         if ($operationFence === null) {
             $lock = Cache::lock(
