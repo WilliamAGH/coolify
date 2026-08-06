@@ -28,6 +28,12 @@ class WriteBlueGreenProxyConfiguration
 
     public const PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT = 'coolify-blue-green-pending-container-mutation-journal';
 
+    public const CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX = 'coolify-blue-green-container-journal-inspection-v1';
+
+    public const CONTAINER_MUTATION_JOURNAL_CAS_OUTPUT_PREFIX = 'coolify-blue-green-container-journal-cas-v1';
+
+    public const COMMITTED_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX = 'coolify-blue-green-committed-container-journal-v1';
+
     public const STALE_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX = 'coolify-blue-green-stale-container-journal-v1';
 
     public const STALE_CONTAINER_MUTATION_JOURNAL_ROUTE_LOCK_WAIT_SECONDS = 15;
@@ -35,6 +41,12 @@ class WriteBlueGreenProxyConfiguration
     private const MUTATION_JOURNAL_MAGIC = 'coolify-blue-green-proxy-mutation-v1';
 
     private const CONTAINER_MUTATION_JOURNAL_MAGIC = 'coolify-blue-green-container-mutation-v1';
+
+    private const COMMITTED_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC = 'coolify-blue-green-committed-container-journal-archive-v1';
+
+    private const PENDING_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC = 'coolify-blue-green-pending-container-journal-archive-v1';
+
+    private const FINALIZED_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC = 'coolify-blue-green-finalized-container-journal-archive-v1';
 
     private const STALE_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC = 'coolify-blue-green-stale-container-journal-archive-v1';
 
@@ -193,6 +205,186 @@ class WriteBlueGreenProxyConfiguration
         BlueGreenProxyConfiguration::assertManagedFilename($managedFilename);
 
         return $this->stateDirectory($proxyPath).'/.'.$managedFilename.'.pending-container-mutation';
+    }
+
+    public function committedContainerMutationJournalArchiveFilename(
+        string $managedFilename,
+        string $journalSha256,
+    ): string {
+        BlueGreenProxyConfiguration::assertManagedFilename($managedFilename);
+        $this->assertSha256($journalSha256, 'committed container-mutation journal');
+
+        return sprintf(
+            '.blue-green-committed-container-mutation-%s.%s.journal',
+            hash('sha256', $managedFilename),
+            $journalSha256,
+        );
+    }
+
+    public function containerMutationJournalArchiveFilename(
+        string $managedFilename,
+        string $journalSha256,
+    ): string {
+        return $this->committedContainerMutationJournalArchiveFilename(
+            $managedFilename,
+            $journalSha256,
+        );
+    }
+
+    public function inspectCommittedContainerMutationJournalCommandFor(
+        string $proxyPath,
+        string $managedFilename,
+    ): string {
+        BlueGreenProxyConfiguration::assertManagedFilename($managedFilename);
+
+        return $this->committedContainerMutationJournalCommandFor(
+            $proxyPath,
+            $managedFilename,
+        );
+    }
+
+    public function inspectContainerMutationJournalCommandFor(
+        string $proxyPath,
+        string $managedFilename,
+        ?string $expectedCurrentBootId = null,
+    ): string {
+        BlueGreenProxyConfiguration::assertManagedFilename($managedFilename);
+        if ($expectedCurrentBootId !== null) {
+            $this->assertBootId($expectedCurrentBootId);
+        }
+
+        return $this->containerMutationJournalInspectionCommandFor(
+            $proxyPath,
+            $managedFilename,
+            expectedCurrentBootId: $expectedCurrentBootId,
+        );
+    }
+
+    public function inspectContainerMutationJournalForOperationCommandFor(
+        string $proxyPath,
+        string $managedFilename,
+        ?string $expectedCurrentBootId = null,
+    ): string {
+        BlueGreenProxyConfiguration::assertManagedFilename($managedFilename);
+        if ($expectedCurrentBootId !== null) {
+            $this->assertBootId($expectedCurrentBootId);
+        }
+
+        return $this->containerMutationJournalInspectionCommandFor(
+            $proxyPath,
+            $managedFilename,
+            recoverPendingArchive: true,
+            expectedCurrentBootId: $expectedCurrentBootId,
+        );
+    }
+
+    public function archivePendingContainerMutationJournalCommandFor(
+        string $proxyPath,
+        string $managedFilename,
+        string $expectedJournalSha256,
+        string $expectedJournalBootId,
+        ?BlueGreenProxyState $expectedState,
+        BlueGreenProxyState $replacementState,
+        ?string $expectedCurrentBootId = null,
+    ): string {
+        $this->assertContainerMutationJournalCas(
+            $managedFilename,
+            $expectedJournalSha256,
+            $expectedJournalBootId,
+            $expectedState,
+            $replacementState,
+        );
+        if ($expectedCurrentBootId !== null) {
+            $this->assertBootId($expectedCurrentBootId);
+        }
+
+        return $this->pendingContainerMutationJournalCasCommandFor(
+            proxyPath: $proxyPath,
+            managedFilename: $managedFilename,
+            expectedJournalSha256: $expectedJournalSha256,
+            expectedJournalBootId: $expectedJournalBootId,
+            expectedState: $expectedState,
+            replacementState: $replacementState,
+            finalizeReplacement: false,
+            expectedCurrentBootId: $expectedCurrentBootId,
+        );
+    }
+
+    /**
+     * The caller must independently prove the journal's canonical runtime
+     * postconditions before using this state-only finalization primitive.
+     */
+    public function finalizePendingContainerMutationJournalCommandFor(
+        string $proxyPath,
+        string $managedFilename,
+        string $expectedJournalSha256,
+        string $expectedJournalBootId,
+        ?BlueGreenProxyState $expectedState,
+        BlueGreenProxyState $replacementState,
+        ?string $expectedCurrentBootId = null,
+    ): string {
+        $this->assertContainerMutationJournalCas(
+            $managedFilename,
+            $expectedJournalSha256,
+            $expectedJournalBootId,
+            $expectedState,
+            $replacementState,
+        );
+        if ($expectedCurrentBootId !== null) {
+            $this->assertBootId($expectedCurrentBootId);
+        }
+
+        return $this->pendingContainerMutationJournalCasCommandFor(
+            proxyPath: $proxyPath,
+            managedFilename: $managedFilename,
+            expectedJournalSha256: $expectedJournalSha256,
+            expectedJournalBootId: $expectedJournalBootId,
+            expectedState: $expectedState,
+            replacementState: $replacementState,
+            finalizeReplacement: true,
+            expectedCurrentBootId: $expectedCurrentBootId,
+        );
+    }
+
+    public function archiveCommittedContainerMutationJournalCommandFor(
+        string $proxyPath,
+        string $managedFilename,
+        string $expectedJournalSha256,
+        ?BlueGreenProxyState $expectedState,
+        BlueGreenProxyState $replacementState,
+        ?string $expectedJournalBootId = null,
+        ?string $expectedCurrentBootId = null,
+    ): string {
+        $this->assertSha256($expectedJournalSha256, 'expected committed container-mutation journal');
+        if ($expectedJournalBootId !== null) {
+            $this->assertBootId($expectedJournalBootId);
+        }
+        if ($expectedCurrentBootId !== null) {
+            $this->assertBootId($expectedCurrentBootId);
+        }
+        $this->assertStateScope($managedFilename, $expectedState);
+        $this->assertStateScope($managedFilename, $replacementState);
+        if (! $replacementState->isMutationSuccessorOf($expectedState, $replacementState->operationId)) {
+            throw new InvalidArgumentException('The committed container-mutation replacement must advance its exact operation mutation sequence.');
+        }
+        if ($expectedState === null) {
+            if ($replacementState->destinationFenceEpoch !== 0 || $replacementState->managedSha256 !== null) {
+                throw new InvalidArgumentException('A first committed container mutation must adopt an absent epoch-zero route state.');
+            }
+        } elseif (! $replacementState->hasSameRouteIdentity($expectedState)
+            && ! $replacementState->hasSameAbsentRouteScope($expectedState)) {
+            throw new InvalidArgumentException('A committed container mutation cannot change the managed route identity.');
+        }
+
+        return $this->committedContainerMutationJournalCommandFor(
+            $proxyPath,
+            $managedFilename,
+            $expectedJournalSha256,
+            $expectedState,
+            $replacementState,
+            $expectedJournalBootId,
+            $expectedCurrentBootId,
+        );
     }
 
     /**
@@ -916,11 +1108,16 @@ class WriteBlueGreenProxyConfiguration
                 commands: $commands,
                 completionCommands: $completionCommands,
             ),
-            ...$this->pendingContainerMutationJournalCommands(
-                $proxyPath,
-                $managedFilename,
-                $this->containerMutationReplayCommands(),
-            ),
+            'if ! (',
+            ...$this->indent($completionCommands),
+            '); then',
+            ...$this->indent($commands),
+            ...$this->indent($this->afterContainerMutationCommands()),
+            ...$this->indent($completionCommands),
+            'fi',
+            ...$this->atomicStateReplaceCommands($statePath, $replacementState),
+            ...$this->assertStateCommands($replacementState, $activePath, $statePath),
+            'durable_remote_remove '.escapeshellarg($journalPath).' '.escapeshellarg(dirname($journalPath)),
         ]);
     }
 
@@ -1370,6 +1567,33 @@ class WriteBlueGreenProxyConfiguration
         }
     }
 
+    private function assertContainerMutationJournalCas(
+        string $managedFilename,
+        string $expectedJournalSha256,
+        string $expectedJournalBootId,
+        ?BlueGreenProxyState $expectedState,
+        BlueGreenProxyState $replacementState,
+    ): void {
+        $this->assertSha256($expectedJournalSha256, 'expected container-mutation journal');
+        $this->assertBootId($expectedJournalBootId);
+        $this->assertStateScope($managedFilename, $expectedState);
+        $this->assertStateScope($managedFilename, $replacementState);
+        if (! $replacementState->isMutationSuccessorOf($expectedState, $replacementState->operationId)) {
+            throw new InvalidArgumentException('The container-mutation journal replacement must advance its exact operation mutation sequence.');
+        }
+        if ($expectedState === null) {
+            if ($replacementState->destinationFenceEpoch !== 0 || $replacementState->managedSha256 !== null) {
+                throw new InvalidArgumentException('A first container mutation must adopt an absent epoch-zero route state.');
+            }
+
+            return;
+        }
+        if (! $replacementState->hasSameRouteIdentity($expectedState)
+            && ! $replacementState->hasSameAbsentRouteScope($expectedState)) {
+            throw new InvalidArgumentException('A container mutation cannot change the managed route identity.');
+        }
+    }
+
     private function mutationCommandFor(
         string $proxyPath,
         ?BlueGreenProxyConfiguration $configuration,
@@ -1432,11 +1656,7 @@ class WriteBlueGreenProxyConfiguration
     {
         return [
             ...$this->lockedCommandPrefixWithoutContainerMutationJournal($proxyPath, $managedFilename),
-            ...$this->pendingContainerMutationJournalCommands(
-                $proxyPath,
-                $managedFilename,
-                $this->containerMutationReplayCommands(),
-            ),
+            ...$this->pendingContainerMutationJournalCommands($proxyPath, $managedFilename),
         ];
     }
 
@@ -1445,10 +1665,7 @@ class WriteBlueGreenProxyConfiguration
     {
         return [
             ...$this->lockedCommandPrefixWithoutContainerMutationJournal($proxyPath, $managedFilename),
-            ...$this->pendingContainerMutationJournalCommands($proxyPath, $managedFilename, [
-                'printf \'%s\\n\' '.escapeshellarg(self::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT).' >&2',
-                'exit 75',
-            ]),
+            ...$this->pendingContainerMutationJournalCommands($proxyPath, $managedFilename),
         ];
     }
 
@@ -1464,17 +1681,6 @@ class WriteBlueGreenProxyConfiguration
             'mkdir -p -- '.escapeshellarg($this->dynamicDirectory($proxyPath)),
             ...$this->exclusiveManagedFileLockCommands($proxyPath, $managedFilename),
             ...$this->repairPendingMutationJournalCommands($proxyPath, $managedFilename),
-        ];
-    }
-
-    /** @return list<string> */
-    private function containerMutationReplayCommands(): array
-    {
-        return [
-            $this->bootIdentityAssertionCommand('"$container_journal_expected_boot_id"'),
-            'sh "$container_journal_mutation_decoded"',
-            ...$this->afterContainerMutationCommands(),
-            'sh "$container_journal_completion_decoded"',
         ];
     }
 
@@ -1549,7 +1755,11 @@ class WriteBlueGreenProxyConfiguration
         $journalValidationCommands = $canProveConsumedFirstAdoptionDrain
             ? [
                 'if [ "$container_journal_status" = consumed ]; then',
-                ...$this->indent($this->validateConsumedFirstAdoptionDrainCommands($spentFirstAdoptionDrain)),
+                ...$this->indent($this->validateConsumedFirstAdoptionDrainCommands(
+                    $spentFirstAdoptionDrain['expected_state'],
+                    $spentFirstAdoptionDrain['replacement_state'],
+                    $spentFirstAdoptionDrain['legacy_target'],
+                )),
                 'else',
                 ...$this->indent($this->validateStaleContainerMutationJournalCommands(
                     $managedFilename,
@@ -1839,20 +2049,6 @@ class WriteBlueGreenProxyConfiguration
     ): array {
         $expectedState = $profile['expected_state'];
         $replacementState = $profile['replacement_state'];
-        $legacyTarget = $profile['legacy_target'];
-        $containerId = escapeshellarg($legacyTarget->dockerId);
-        $containerName = escapeshellarg($legacyTarget->name);
-        $legacyRuntimeAssertions = (new InspectBlueGreenContainer)
-            ->exactMutationAssertionsFor($legacyTarget);
-        foreach ([
-            'coolify.blueGreen.managed',
-            'coolify.blueGreen.deploymentUuid',
-            'coolify.blueGreen.color',
-            'coolify.blueGreen.routingRevision',
-        ] as $fixedColorLabel) {
-            $format = escapeshellarg('{{ index .Config.Labels '.json_encode($fixedColorLabel, JSON_THROW_ON_ERROR).' }}');
-            $legacyRuntimeAssertions[] = 'test -z "$(docker inspect --format='.$format.' '.$containerId.')"';
-        }
 
         return [
             'test ! -e "$container_journal_mutation_path"',
@@ -1917,6 +2113,57 @@ class WriteBlueGreenProxyConfiguration
             'test "$(durable_remote_permissions "$container_journal_state_path")" = 600',
             ...$this->staleInactiveRetirementRouteStatusCommands($expectedState, $replacementState),
             'test "$container_journal_route_status" = expected',
+            ...$this->spentFirstAdoptionDrainTargetStatusCommands($profile['legacy_target']),
+            'container_journal_checksum=$(sha256sum "$container_journal_source")',
+            'container_journal_checksum=${container_journal_checksum%% *}',
+            'case "$container_journal_checksum" in *[!0123456789abcdef]*|\'\') exit 1 ;; esac',
+            'test "${#container_journal_checksum}" -eq 64',
+        ];
+    }
+
+    /** @return list<string> */
+    private function validateConsumedFirstAdoptionDrainCommands(
+        BlueGreenProxyState $expectedState,
+        BlueGreenProxyState $replacementState,
+        BlueGreenContainerExpectation $legacyTarget,
+    ): array {
+        return [
+            'test ! -e "$container_journal_mutation_path"',
+            'test ! -L "$container_journal_mutation_path"',
+            'durable_remote_assert_owned_regular "$container_journal_active_path"',
+            'test "$(durable_remote_owner_uid "$container_journal_active_path")" = 0',
+            'test "$(durable_remote_permissions "$container_journal_active_path")" = 600',
+            'container_journal_actual_checksum=$(sha256sum "$container_journal_active_path")',
+            'test "${container_journal_actual_checksum%% *}" = '.escapeshellarg($expectedState->managedSha256),
+            'durable_remote_assert_owned_regular "$container_journal_state_path"',
+            'test "$(durable_remote_owner_uid "$container_journal_state_path")" = 0',
+            'test "$(durable_remote_permissions "$container_journal_state_path")" = 600',
+            ...$this->staleInactiveRetirementRouteStatusCommands($expectedState, $replacementState),
+            'test "$container_journal_route_status" = replacement',
+            ...$this->spentFirstAdoptionDrainTargetStatusCommands($legacyTarget),
+            'case "$container_journal_target_status" in stopped|absent) ;; *) exit 1 ;; esac',
+        ];
+    }
+
+    /** @return list<string> */
+    private function spentFirstAdoptionDrainTargetStatusCommands(
+        BlueGreenContainerExpectation $legacyTarget,
+    ): array {
+        $containerId = escapeshellarg($legacyTarget->dockerId);
+        $containerName = escapeshellarg($legacyTarget->name);
+        $legacyRuntimeAssertions = (new InspectBlueGreenContainer)
+            ->exactMutationAssertionsFor($legacyTarget);
+        foreach ([
+            'coolify.blueGreen.managed',
+            'coolify.blueGreen.deploymentUuid',
+            'coolify.blueGreen.color',
+            'coolify.blueGreen.routingRevision',
+        ] as $fixedColorLabel) {
+            $format = escapeshellarg('{{ index .Config.Labels '.json_encode($fixedColorLabel, JSON_THROW_ON_ERROR).' }}');
+            $legacyRuntimeAssertions[] = 'test -z "$(docker inspect --format='.$format.' '.$containerId.')"';
+        }
+
+        return [
             'if docker container inspect '.$containerId.' >/dev/null 2>&1; then',
             ...$this->indent($legacyRuntimeAssertions),
             '  container_journal_target_runtime_status=$(docker inspect --format='.escapeshellarg('{{.State.Status}}').' '.$containerId.')',
@@ -1929,10 +2176,6 @@ class WriteBlueGreenProxyConfiguration
             '  ! docker container inspect '.$containerName.' >/dev/null 2>&1',
             '  container_journal_target_status=absent',
             'fi',
-            'container_journal_checksum=$(sha256sum "$container_journal_source")',
-            'container_journal_checksum=${container_journal_checksum%% *}',
-            'case "$container_journal_checksum" in *[!0123456789abcdef]*|\'\') exit 1 ;; esac',
-            'test "${#container_journal_checksum}" -eq 64',
         ];
     }
 
@@ -2762,6 +3005,792 @@ class WriteBlueGreenProxyConfiguration
         ];
     }
 
+    private function containerMutationJournalInspectionCommandFor(
+        string $proxyPath,
+        string $managedFilename,
+        bool $recoverPendingArchive = false,
+        ?string $expectedCurrentBootId = null,
+    ): string {
+        $stateDirectory = $this->stateDirectory($proxyPath);
+        $activePath = $this->managedPath($proxyPath, $managedFilename);
+        $statePath = $this->statePath($proxyPath, $managedFilename);
+        $mutationJournalPath = $this->mutationJournalPath($proxyPath, $managedFilename);
+        $journalPath = $this->containerMutationJournalPath($proxyPath, $managedFilename);
+
+        $missingJournalCommands = $recoverPendingArchive
+            ? $this->pendingContainerMutationArchiveDiscoveryCommands($stateDirectory, $managedFilename)
+            : [
+                '  printf %s '.escapeshellarg(self::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX.'|absent'),
+                '  exit 0',
+            ];
+        $pendingArchiveAuthenticationCommands = $recoverPendingArchive
+            ? [
+                'if [ "${operation_container_recovered_pending_archive:-false}" = true ]; then',
+                '  test "$operation_container_sidecar_status" = pending_expected_sidecar',
+                '  test "$operation_container_journal_checksum" = "$operation_container_pending_manifest_journal_checksum"',
+                '  test "$operation_container_expected_state_checksum" = "$operation_container_pending_manifest_expected_state_checksum"',
+                '  test "$operation_container_replacement_state_checksum" = "$operation_container_pending_manifest_replacement_state_checksum"',
+                '  test "$operation_container_expected_boot_id" = "$operation_container_pending_manifest_expected_boot_id"',
+                '  test "$operation_container_managed_file_state" = "$operation_container_pending_manifest_managed_file_state"',
+                '  test "$operation_container_managed_checksum" = "$operation_container_pending_manifest_managed_checksum"',
+                'fi',
+            ]
+            : [];
+
+        return implode("\n", [
+            'set -eu',
+            'umask 077',
+            ...DurableRemoteArtifact::shellFunctions(),
+            ...$this->exclusiveManagedFileLockCommands($proxyPath, $managedFilename),
+            'operation_container_state_directory='.escapeshellarg($stateDirectory),
+            'operation_container_active_path='.escapeshellarg($activePath),
+            'operation_container_state_path='.escapeshellarg($statePath),
+            'operation_container_mutation_path='.escapeshellarg($mutationJournalPath),
+            'operation_container_journal_path='.escapeshellarg($journalPath),
+            'durable_remote_assert_owned_directory "$operation_container_state_directory"',
+            ...($expectedCurrentBootId === null ? [] : [
+                $this->bootIdentityAssertionCommand(escapeshellarg($expectedCurrentBootId)),
+            ]),
+            'test ! -e "$operation_container_mutation_path"',
+            'test ! -L "$operation_container_mutation_path"',
+            'if [ ! -e "$operation_container_journal_path" ] && [ ! -L "$operation_container_journal_path" ]; then',
+            ...$missingJournalCommands,
+            'else',
+            '  operation_container_journal_source="$operation_container_journal_path"',
+            'fi',
+            ...$this->authenticatedContainerMutationJournalCommands(
+                $managedFilename,
+                $expectedCurrentBootId,
+            ),
+            ...$pendingArchiveAuthenticationCommands,
+            'rm -f -- "$operation_container_expected_state_decoded" "$operation_container_replacement_state_decoded" "$operation_container_mutation_decoded" "$operation_container_completion_decoded"',
+            'trap - 0 HUP INT TERM',
+            'printf \'%s|%s|%s|%s|%s|%s|%s|%s\\n%s\\n%s\' '
+                .escapeshellarg(self::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX)
+                .' "$operation_container_sidecar_status" "$operation_container_journal_checksum" "$operation_container_expected_boot_id" "$operation_container_managed_file_state" "$operation_container_managed_checksum" "$operation_container_mutation_checksum" "$operation_container_completion_checksum" "$operation_container_expected_state" "$operation_container_replacement_state"',
+        ]);
+    }
+
+    /** @return list<string> */
+    private function pendingContainerMutationArchiveDiscoveryCommands(
+        string $stateDirectory,
+        string $managedFilename,
+    ): array {
+        $archivePrefix = '.blue-green-committed-container-mutation-'.hash('sha256', $managedFilename).'.';
+        $archiveGlob = escapeshellarg($stateDirectory.'/'.$archivePrefix).'*.journal';
+        $manifestGlob = escapeshellarg($stateDirectory.'/'.$archivePrefix).'*.journal.manifest';
+
+        return [
+            '  operation_container_pending_archive_candidate_count=0',
+            '  operation_container_recovered_pending_archive=false',
+            '  for operation_container_archive_path in '.$archiveGlob.'; do',
+            '    if [ ! -e "$operation_container_archive_path" ] && [ ! -L "$operation_container_archive_path" ]; then continue; fi',
+            '    operation_container_manifest_path="$operation_container_archive_path.manifest"',
+            '    durable_remote_assert_owned_regular "$operation_container_archive_path"',
+            '    test "$(durable_remote_owner_uid "$operation_container_archive_path")" = "$(id -u)"',
+            '    test "$(durable_remote_permissions "$operation_container_archive_path")" = 600',
+            '    durable_remote_assert_owned_regular "$operation_container_manifest_path"',
+            '    test "$(durable_remote_owner_uid "$operation_container_manifest_path")" = "$(id -u)"',
+            '    test "$(durable_remote_permissions "$operation_container_manifest_path")" = 600',
+            '    operation_container_archive_filename=${operation_container_archive_path##*/}',
+            '    operation_container_archive_checksum=${operation_container_archive_filename#'.escapeshellarg($archivePrefix).'}',
+            '    operation_container_archive_checksum=${operation_container_archive_checksum%.journal}',
+            '    case "$operation_container_archive_checksum" in *[!0123456789abcdef]*|\'\') exit 1 ;; esac',
+            '    test "${#operation_container_archive_checksum}" -eq 64',
+            '    operation_container_archive_actual_checksum=$(sha256sum "$operation_container_archive_path")',
+            '    test "${operation_container_archive_actual_checksum%% *}" = "$operation_container_archive_checksum"',
+            '    operation_container_manifest_line_count=$(wc -l < "$operation_container_manifest_path" | tr -d \'[:blank:]\')',
+            '    case "$operation_container_manifest_line_count" in 9|10) ;; *) exit 1 ;; esac',
+            '    exec 6< "$operation_container_manifest_path"',
+            '    IFS= read -r operation_container_manifest_magic <&6',
+            '    IFS= read -r operation_container_manifest_filename <&6',
+            '    IFS= read -r operation_container_manifest_journal_checksum <&6',
+            '    IFS= read -r operation_container_manifest_expected_state_checksum <&6',
+            '    IFS= read -r operation_container_manifest_replacement_state_checksum <&6',
+            '    IFS= read -r operation_container_manifest_expected_boot_id <&6',
+            '    IFS= read -r operation_container_manifest_managed_file_state <&6',
+            '    IFS= read -r operation_container_manifest_managed_checksum <&6',
+            '    if [ "$operation_container_manifest_line_count" = 9 ]; then',
+            '      operation_container_manifest_sidecar_status=committed_replacement_sidecar',
+            '      IFS= read -r operation_container_manifest_archive_filename <&6',
+            '    else',
+            '      IFS= read -r operation_container_manifest_sidecar_status <&6',
+            '      IFS= read -r operation_container_manifest_archive_filename <&6',
+            '    fi',
+            '    exec 6<&-',
+            '    test "$operation_container_manifest_filename" = '.escapeshellarg($managedFilename),
+            '    test "$operation_container_manifest_journal_checksum" = "$operation_container_archive_checksum"',
+            '    test "$operation_container_manifest_archive_filename" = "$operation_container_archive_filename"',
+            '    case "$operation_container_manifest_managed_file_state" in present|missing) ;; *) exit 1 ;; esac',
+            '    '.$this->lowercaseUuidAssertionCommand('$operation_container_manifest_expected_boot_id'),
+            '    for operation_container_manifest_checksum_value in "$operation_container_manifest_journal_checksum" "$operation_container_manifest_expected_state_checksum" "$operation_container_manifest_replacement_state_checksum" "$operation_container_manifest_managed_checksum"; do',
+            '      case "$operation_container_manifest_checksum_value" in *[!0123456789abcdef]*|\'\') exit 1 ;; esac',
+            '      test "${#operation_container_manifest_checksum_value}" -eq 64',
+            '    done',
+            '    if [ "$operation_container_manifest_line_count" = 9 ]; then',
+            '      test "$operation_container_manifest_magic" = '.escapeshellarg(self::COMMITTED_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC),
+            '    elif [ "$operation_container_manifest_magic" = '.escapeshellarg(self::PENDING_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC).' ]; then',
+            '      test "$operation_container_manifest_sidecar_status" = pending_expected_sidecar',
+            '      operation_container_pending_archive_candidate_count=$((operation_container_pending_archive_candidate_count + 1))',
+            '      operation_container_journal_source="$operation_container_archive_path"',
+            '      operation_container_pending_manifest_journal_checksum="$operation_container_manifest_journal_checksum"',
+            '      operation_container_pending_manifest_expected_state_checksum="$operation_container_manifest_expected_state_checksum"',
+            '      operation_container_pending_manifest_replacement_state_checksum="$operation_container_manifest_replacement_state_checksum"',
+            '      operation_container_pending_manifest_expected_boot_id="$operation_container_manifest_expected_boot_id"',
+            '      operation_container_pending_manifest_managed_file_state="$operation_container_manifest_managed_file_state"',
+            '      operation_container_pending_manifest_managed_checksum="$operation_container_manifest_managed_checksum"',
+            '    else',
+            '      test "$operation_container_manifest_magic" = '.escapeshellarg(self::FINALIZED_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC),
+            '      test "$operation_container_manifest_sidecar_status" = committed_replacement_sidecar',
+            '    fi',
+            '  done',
+            '  for operation_container_manifest_path in '.$manifestGlob.'; do',
+            '    if [ ! -e "$operation_container_manifest_path" ] && [ ! -L "$operation_container_manifest_path" ]; then continue; fi',
+            '    operation_container_archive_path=${operation_container_manifest_path%.manifest}',
+            '    durable_remote_assert_owned_regular "$operation_container_archive_path"',
+            '  done',
+            '  if [ "$operation_container_pending_archive_candidate_count" -eq 0 ]; then',
+            '    printf %s '.escapeshellarg(self::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX.'|absent'),
+            '    exit 0',
+            '  fi',
+            '  test "$operation_container_pending_archive_candidate_count" -eq 1',
+            '  operation_container_recovered_pending_archive=true',
+        ];
+    }
+
+    /** @return list<string> */
+    private function authenticatedContainerMutationJournalCommands(
+        string $managedFilename,
+        ?string $expectedCurrentBootId = null,
+    ): array {
+        if ($expectedCurrentBootId !== null) {
+            $this->assertBootId($expectedCurrentBootId);
+        }
+        $bootIdentityAssertion = $expectedCurrentBootId === null
+            ? $this->bootIdentityAssertionCommand('"$operation_container_expected_boot_id"')
+            : $this->bootIdentityAssertionCommand(escapeshellarg($expectedCurrentBootId));
+
+        return [
+            'durable_remote_assert_owned_regular "$operation_container_journal_source"',
+            'test "$(durable_remote_owner_uid "$operation_container_journal_source")" = "$(id -u)"',
+            'test "$(durable_remote_permissions "$operation_container_journal_source")" = 600',
+            'operation_container_journal_line_count=$(wc -l < "$operation_container_journal_source" | tr -d \'[:blank:]\')',
+            'test "$operation_container_journal_line_count" = 13',
+            'exec 5< "$operation_container_journal_source"',
+            'IFS= read -r operation_container_journal_magic <&5',
+            'IFS= read -r operation_container_journal_filename <&5',
+            'IFS= read -r operation_container_expected_boot_id <&5',
+            'IFS= read -r operation_container_expected_state <&5',
+            'IFS= read -r operation_container_expected_state_checksum <&5',
+            'IFS= read -r operation_container_replacement_state <&5',
+            'IFS= read -r operation_container_replacement_state_checksum <&5',
+            'IFS= read -r operation_container_managed_file_state <&5',
+            'IFS= read -r operation_container_managed_checksum <&5',
+            'IFS= read -r operation_container_mutation_checksum <&5',
+            'IFS= read -r operation_container_completion_checksum <&5',
+            'IFS= read -r operation_container_mutation <&5',
+            'IFS= read -r operation_container_completion <&5',
+            'exec 5<&-',
+            'test "$operation_container_journal_magic" = '.escapeshellarg(self::CONTAINER_MUTATION_JOURNAL_MAGIC),
+            'test "$operation_container_journal_filename" = '.escapeshellarg($managedFilename),
+            $this->lowercaseUuidAssertionCommand('$operation_container_expected_boot_id'),
+            $bootIdentityAssertion,
+            'for operation_container_checksum_value in "$operation_container_expected_state_checksum" "$operation_container_replacement_state_checksum" "$operation_container_managed_checksum" "$operation_container_mutation_checksum" "$operation_container_completion_checksum"; do',
+            '  case "$operation_container_checksum_value" in *[!0123456789abcdef]*|\'\') exit 1 ;; esac',
+            '  test "${#operation_container_checksum_value}" -eq 64',
+            'done',
+            'case "$operation_container_managed_file_state" in present|missing) ;; *) exit 1 ;; esac',
+            'if [ "$operation_container_managed_file_state" = missing ]; then',
+            '  test ! -e "$operation_container_active_path"',
+            '  test ! -L "$operation_container_active_path"',
+            'else',
+            '  durable_remote_assert_owned_regular "$operation_container_active_path"',
+            '  test "$(durable_remote_owner_uid "$operation_container_active_path")" = "$(id -u)"',
+            '  test "$(durable_remote_permissions "$operation_container_active_path")" = 600',
+            '  operation_container_actual_checksum=$(sha256sum "$operation_container_active_path")',
+            '  test "${operation_container_actual_checksum%% *}" = "$operation_container_managed_checksum"',
+            'fi',
+            'operation_container_expected_state_decoded=$(mktemp "$operation_container_state_directory/.blue-green-operation-container-expected.XXXXXX")',
+            'operation_container_replacement_state_decoded=$(mktemp "$operation_container_state_directory/.blue-green-operation-container-replacement.XXXXXX")',
+            'operation_container_mutation_decoded=$(mktemp "$operation_container_state_directory/.blue-green-operation-container-mutation.XXXXXX")',
+            'operation_container_completion_decoded=$(mktemp "$operation_container_state_directory/.blue-green-operation-container-completion.XXXXXX")',
+            'trap \'rm -f -- "$operation_container_expected_state_decoded" "$operation_container_replacement_state_decoded" "$operation_container_mutation_decoded" "$operation_container_completion_decoded" "${operation_container_manifest_stage:-}" "${operation_container_state_stage:-}"\' 0 HUP INT TERM',
+            'if [ "$operation_container_expected_state" = absent ]; then',
+            '  : > "$operation_container_expected_state_decoded"',
+            'else',
+            '  printf %s "$operation_container_expected_state" | base64 -d > "$operation_container_expected_state_decoded"',
+            '  test "$(base64 < "$operation_container_expected_state_decoded" | tr -d \'\\n\')" = "$operation_container_expected_state"',
+            'fi',
+            'printf %s "$operation_container_replacement_state" | base64 -d > "$operation_container_replacement_state_decoded"',
+            'printf %s "$operation_container_mutation" | base64 -d > "$operation_container_mutation_decoded"',
+            'printf %s "$operation_container_completion" | base64 -d > "$operation_container_completion_decoded"',
+            'test "$(base64 < "$operation_container_replacement_state_decoded" | tr -d \'\\n\')" = "$operation_container_replacement_state"',
+            'test "$(base64 < "$operation_container_mutation_decoded" | tr -d \'\\n\')" = "$operation_container_mutation"',
+            'test "$(base64 < "$operation_container_completion_decoded" | tr -d \'\\n\')" = "$operation_container_completion"',
+            'operation_container_actual_checksum=$(sha256sum "$operation_container_expected_state_decoded")',
+            'test "${operation_container_actual_checksum%% *}" = "$operation_container_expected_state_checksum"',
+            'operation_container_actual_checksum=$(sha256sum "$operation_container_replacement_state_decoded")',
+            'test "${operation_container_actual_checksum%% *}" = "$operation_container_replacement_state_checksum"',
+            'operation_container_actual_checksum=$(sha256sum "$operation_container_mutation_decoded")',
+            'test "${operation_container_actual_checksum%% *}" = "$operation_container_mutation_checksum"',
+            'operation_container_actual_checksum=$(sha256sum "$operation_container_completion_decoded")',
+            'test "${operation_container_actual_checksum%% *}" = "$operation_container_completion_checksum"',
+            'test "$(head -n 1 "$operation_container_mutation_decoded")" = \'set -eu\'',
+            'test "$(head -n 1 "$operation_container_completion_decoded")" = \'set -eu\'',
+            'operation_container_sidecar_status=invalid',
+            'if [ ! -e "$operation_container_state_path" ] && [ ! -L "$operation_container_state_path" ]; then',
+            '  test "$operation_container_expected_state" = absent',
+            '  operation_container_sidecar_status=pending_expected_sidecar',
+            'else',
+            '  durable_remote_assert_owned_regular "$operation_container_state_path"',
+            '  test "$(durable_remote_owner_uid "$operation_container_state_path")" = "$(id -u)"',
+            '  test "$(durable_remote_permissions "$operation_container_state_path")" = 600',
+            '  if cmp -s "$operation_container_state_path" "$operation_container_replacement_state_decoded"; then',
+            '    operation_container_sidecar_status=committed_replacement_sidecar',
+            '  elif [ "$operation_container_expected_state" != absent ] && cmp -s "$operation_container_state_path" "$operation_container_expected_state_decoded"; then',
+            '    operation_container_sidecar_status=pending_expected_sidecar',
+            '  else',
+            '    exit 1',
+            '  fi',
+            'fi',
+            'operation_container_journal_checksum=$(sha256sum "$operation_container_journal_source")',
+            'operation_container_journal_checksum=${operation_container_journal_checksum%% *}',
+            'case "$operation_container_journal_checksum" in *[!0123456789abcdef]*|\'\') exit 1 ;; esac',
+            'test "${#operation_container_journal_checksum}" -eq 64',
+        ];
+    }
+
+    private function pendingContainerMutationJournalCasCommandFor(
+        string $proxyPath,
+        string $managedFilename,
+        string $expectedJournalSha256,
+        string $expectedJournalBootId,
+        ?BlueGreenProxyState $expectedState,
+        BlueGreenProxyState $replacementState,
+        bool $finalizeReplacement,
+        ?string $expectedCurrentBootId = null,
+    ): string {
+        $stateDirectory = $this->stateDirectory($proxyPath);
+        $activePath = $this->managedPath($proxyPath, $managedFilename);
+        $statePath = $this->statePath($proxyPath, $managedFilename);
+        $mutationJournalPath = $this->mutationJournalPath($proxyPath, $managedFilename);
+        $journalPath = $this->containerMutationJournalPath($proxyPath, $managedFilename);
+        $archiveFilename = $this->containerMutationJournalArchiveFilename(
+            $managedFilename,
+            $expectedJournalSha256,
+        );
+        $archivePath = $stateDirectory.'/'.$archiveFilename;
+        $manifestPath = $archivePath.'.manifest';
+        $expectedStateEncoded = BlueGreenProxyRollbackArtifact::encodedState($expectedState);
+        $replacementStateEncoded = BlueGreenProxyRollbackArtifact::encodedState($replacementState);
+        $expectedStateSha256 = $this->serializedStateChecksum($expectedState);
+        $replacementStateSha256 = $this->serializedStateChecksum($replacementState);
+        $managedFileState = $this->managedStateMarker($replacementState);
+        $managedFileSha256 = $this->managedStateChecksum($replacementState);
+        $terminalSidecarStatus = $finalizeReplacement
+            ? 'committed_replacement_sidecar'
+            : 'pending_expected_sidecar';
+        $manifestMagic = $finalizeReplacement
+            ? self::FINALIZED_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC
+            : self::PENDING_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC;
+        $sidecarPreconditionCommands = $finalizeReplacement
+            ? [
+                'case "$operation_container_sidecar_status" in',
+                '  pending_expected_sidecar|committed_replacement_sidecar) ;;',
+                '  *) exit 1 ;;',
+                'esac',
+            ]
+            : [
+                'test "$operation_container_sidecar_status" = pending_expected_sidecar',
+            ];
+        $sidecarFinalizationCommands = $finalizeReplacement
+            ? [
+                'if [ "$operation_container_sidecar_status" = pending_expected_sidecar ]; then',
+                '  operation_container_state_stage=$(mktemp "$operation_container_state_directory/.blue-green-operation-container-state.XXXXXX")',
+                '  cp -- "$operation_container_replacement_state_decoded" "$operation_container_state_stage"',
+                '  chmod 600 "$operation_container_state_stage"',
+                '  durable_remote_replace "$operation_container_state_stage" "$operation_container_state_path" "$operation_container_state_directory"',
+                '  operation_container_sidecar_status=committed_replacement_sidecar',
+                '  if [ "${COOLIFY_BLUE_GREEN_CONTAINER_JOURNAL_CAS_CRASH_AFTER_REPLACEMENT_SIDECAR:-}" = 1 ]; then exit 75; fi',
+                'fi',
+                'durable_remote_assert_owned_regular "$operation_container_state_path"',
+                'test "$(durable_remote_owner_uid "$operation_container_state_path")" = "$(id -u)"',
+                'test "$(durable_remote_permissions "$operation_container_state_path")" = 600',
+                'cmp -s "$operation_container_state_path" "$operation_container_replacement_state_decoded"',
+            ]
+            : ($expectedState === null
+                ? [
+                    'test ! -e "$operation_container_state_path"',
+                    'test ! -L "$operation_container_state_path"',
+                ]
+                : [
+                    'durable_remote_assert_owned_regular "$operation_container_state_path"',
+                    'test "$(durable_remote_owner_uid "$operation_container_state_path")" = "$(id -u)"',
+                    'test "$(durable_remote_permissions "$operation_container_state_path")" = 600',
+                    'cmp -s "$operation_container_state_path" "$operation_container_expected_state_decoded"',
+                ]);
+        $pendingManifestUpgradeCommands = $finalizeReplacement
+            ? [
+                'if [ "$operation_container_manifest_present" = true ]; then',
+                '  durable_remote_assert_owned_regular "$operation_container_manifest_path"',
+                '  test "$(durable_remote_owner_uid "$operation_container_manifest_path")" = "$(id -u)"',
+                '  test "$(durable_remote_permissions "$operation_container_manifest_path")" = 600',
+                '  operation_container_existing_manifest_line_count=$(wc -l < "$operation_container_manifest_path" | tr -d \'[:blank:]\')',
+                '  case "$operation_container_existing_manifest_line_count" in 9|10) ;; *) exit 1 ;; esac',
+                '  exec 6< "$operation_container_manifest_path"',
+                '  IFS= read -r operation_container_existing_manifest_magic <&6',
+                '  IFS= read -r operation_container_existing_manifest_filename <&6',
+                '  IFS= read -r operation_container_existing_manifest_journal_checksum <&6',
+                '  IFS= read -r operation_container_existing_manifest_expected_state_checksum <&6',
+                '  IFS= read -r operation_container_existing_manifest_replacement_state_checksum <&6',
+                '  IFS= read -r operation_container_existing_manifest_expected_boot_id <&6',
+                '  IFS= read -r operation_container_existing_manifest_managed_file_state <&6',
+                '  IFS= read -r operation_container_existing_manifest_managed_checksum <&6',
+                '  if [ "$operation_container_existing_manifest_line_count" = 9 ]; then',
+                '    operation_container_existing_manifest_sidecar_status=committed_replacement_sidecar',
+                '    IFS= read -r operation_container_existing_manifest_archive_filename <&6',
+                '  else',
+                '    IFS= read -r operation_container_existing_manifest_sidecar_status <&6',
+                '    IFS= read -r operation_container_existing_manifest_archive_filename <&6',
+                '  fi',
+                '  exec 6<&-',
+                '  test "$operation_container_existing_manifest_filename" = '.escapeshellarg($managedFilename),
+                '  test "$operation_container_existing_manifest_journal_checksum" = "$operation_container_journal_checksum"',
+                '  test "$operation_container_existing_manifest_expected_state_checksum" = "$operation_container_expected_state_checksum"',
+                '  test "$operation_container_existing_manifest_replacement_state_checksum" = "$operation_container_replacement_state_checksum"',
+                '  test "$operation_container_existing_manifest_expected_boot_id" = "$operation_container_expected_boot_id"',
+                '  test "$operation_container_existing_manifest_managed_file_state" = "$operation_container_managed_file_state"',
+                '  test "$operation_container_existing_manifest_managed_checksum" = "$operation_container_managed_checksum"',
+                '  test "$operation_container_existing_manifest_archive_filename" = '.escapeshellarg($archiveFilename),
+                '  if [ "$operation_container_existing_manifest_magic" = '.escapeshellarg(self::FINALIZED_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC).' ]; then',
+                '    test "$operation_container_existing_manifest_line_count" = 10',
+                '    test "$operation_container_existing_manifest_sidecar_status" = committed_replacement_sidecar',
+                '  else',
+                '    if [ "$operation_container_existing_manifest_magic" = '.escapeshellarg(self::PENDING_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC).' ]; then',
+                '      test "$operation_container_existing_manifest_line_count" = 10',
+                '      test "$operation_container_existing_manifest_sidecar_status" = pending_expected_sidecar',
+                '    else',
+                '      test "$operation_container_existing_manifest_magic" = '.escapeshellarg(self::COMMITTED_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC),
+                '      test "$operation_container_existing_manifest_line_count" = 9',
+                '      test "$operation_container_sidecar_status" = committed_replacement_sidecar',
+                '    fi',
+                '    operation_container_manifest_stage=$(mktemp "$operation_container_state_directory/.blue-green-operation-container-manifest.XXXXXX")',
+                '    {',
+                '      printf \'%s\\n\' '.escapeshellarg(self::FINALIZED_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC),
+                '      printf \'%s\\n\' '.escapeshellarg($managedFilename),
+                '      printf \'%s\\n\' "$operation_container_journal_checksum"',
+                '      printf \'%s\\n\' "$operation_container_expected_state_checksum"',
+                '      printf \'%s\\n\' "$operation_container_replacement_state_checksum"',
+                '      printf \'%s\\n\' "$operation_container_expected_boot_id"',
+                '      printf \'%s\\n\' "$operation_container_managed_file_state"',
+                '      printf \'%s\\n\' "$operation_container_managed_checksum"',
+                '      printf \'%s\\n\' committed_replacement_sidecar',
+                '      printf \'%s\\n\' '.escapeshellarg($archiveFilename),
+                '    } > "$operation_container_manifest_stage"',
+                '    chmod 600 "$operation_container_manifest_stage"',
+                '    durable_remote_replace "$operation_container_manifest_stage" "$operation_container_manifest_path" "$operation_container_state_directory"',
+                '  fi',
+                'fi',
+            ]
+            : [];
+        $pendingArchiveCrashCommands = $finalizeReplacement
+            ? []
+            : [
+                'if [ "$operation_container_journal_status" != archived ] && [ "${COOLIFY_BLUE_GREEN_CONTAINER_JOURNAL_CAS_CRASH_AFTER_PENDING_ARCHIVE:-}" = 1 ]; then exit 75; fi',
+            ];
+
+        return implode("\n", [
+            'set -eu',
+            'umask 077',
+            ...DurableRemoteArtifact::shellFunctions(),
+            ...$this->exclusiveManagedFileLockCommands($proxyPath, $managedFilename),
+            'operation_container_state_directory='.escapeshellarg($stateDirectory),
+            'operation_container_active_path='.escapeshellarg($activePath),
+            'operation_container_state_path='.escapeshellarg($statePath),
+            'operation_container_mutation_path='.escapeshellarg($mutationJournalPath),
+            'operation_container_journal_path='.escapeshellarg($journalPath),
+            'operation_container_archive_path='.escapeshellarg($archivePath),
+            'operation_container_manifest_path='.escapeshellarg($manifestPath),
+            'durable_remote_assert_owned_directory "$operation_container_state_directory"',
+            'test ! -e "$operation_container_mutation_path"',
+            'test ! -L "$operation_container_mutation_path"',
+            'operation_container_journal_present=false',
+            'operation_container_archive_present=false',
+            'operation_container_manifest_present=false',
+            'if [ -e "$operation_container_journal_path" ] || [ -L "$operation_container_journal_path" ]; then operation_container_journal_present=true; fi',
+            'if [ -e "$operation_container_archive_path" ] || [ -L "$operation_container_archive_path" ]; then operation_container_archive_present=true; fi',
+            'if [ -e "$operation_container_manifest_path" ] || [ -L "$operation_container_manifest_path" ]; then operation_container_manifest_present=true; fi',
+            'if [ "$operation_container_journal_present" = true ] && [ "$operation_container_archive_present" = false ]; then',
+            '  operation_container_journal_source="$operation_container_journal_path"',
+            '  operation_container_journal_status=pending',
+            'elif [ "$operation_container_journal_present" = true ] && [ "$operation_container_archive_present" = true ] && [ "$operation_container_manifest_present" = true ]; then',
+            '  durable_remote_assert_owned_regular "$operation_container_journal_path"',
+            '  test "$(durable_remote_owner_uid "$operation_container_journal_path")" = "$(id -u)"',
+            '  test "$(durable_remote_permissions "$operation_container_journal_path")" = 600',
+            '  durable_remote_assert_owned_regular "$operation_container_archive_path"',
+            '  test "$(durable_remote_owner_uid "$operation_container_archive_path")" = "$(id -u)"',
+            '  test "$(durable_remote_permissions "$operation_container_archive_path")" = 600',
+            '  cmp -s "$operation_container_journal_path" "$operation_container_archive_path"',
+            '  operation_container_journal_source="$operation_container_journal_path"',
+            '  operation_container_journal_status=pending_archived_duplicate',
+            'elif [ "$operation_container_journal_present" = false ] && [ "$operation_container_archive_present" = true ] && [ "$operation_container_manifest_present" = true ]; then',
+            '  operation_container_journal_source="$operation_container_archive_path"',
+            '  operation_container_journal_status=archived',
+            'else',
+            '  exit 1',
+            'fi',
+            ...$this->authenticatedContainerMutationJournalCommands(
+                $managedFilename,
+                $expectedCurrentBootId,
+            ),
+            'test "$operation_container_journal_checksum" = '.escapeshellarg($expectedJournalSha256),
+            'test "$operation_container_expected_boot_id" = '.escapeshellarg($expectedJournalBootId),
+            'test "$operation_container_expected_state" = '.escapeshellarg($expectedStateEncoded),
+            'test "$operation_container_expected_state_checksum" = '.escapeshellarg($expectedStateSha256),
+            'test "$operation_container_replacement_state" = '.escapeshellarg($replacementStateEncoded),
+            'test "$operation_container_replacement_state_checksum" = '.escapeshellarg($replacementStateSha256),
+            'test "$operation_container_managed_file_state" = '.escapeshellarg($managedFileState),
+            'test "$operation_container_managed_checksum" = '.escapeshellarg($managedFileSha256),
+            ...$sidecarPreconditionCommands,
+            ...$pendingManifestUpgradeCommands,
+            'if [ "$operation_container_manifest_present" = false ]; then',
+            '  test "$operation_container_journal_status" = pending',
+            '  operation_container_manifest_stage=$(mktemp "$operation_container_state_directory/.blue-green-operation-container-manifest.XXXXXX")',
+            '  {',
+            '    printf \'%s\\n\' '.escapeshellarg($manifestMagic),
+            '    printf \'%s\\n\' '.escapeshellarg($managedFilename),
+            '    printf \'%s\\n\' "$operation_container_journal_checksum"',
+            '    printf \'%s\\n\' "$operation_container_expected_state_checksum"',
+            '    printf \'%s\\n\' "$operation_container_replacement_state_checksum"',
+            '    printf \'%s\\n\' "$operation_container_expected_boot_id"',
+            '    printf \'%s\\n\' "$operation_container_managed_file_state"',
+            '    printf \'%s\\n\' "$operation_container_managed_checksum"',
+            '    printf \'%s\\n\' '.escapeshellarg($terminalSidecarStatus),
+            '    printf \'%s\\n\' '.escapeshellarg($archiveFilename),
+            '  } > "$operation_container_manifest_stage"',
+            '  chmod 600 "$operation_container_manifest_stage"',
+            '  durable_remote_replace "$operation_container_manifest_stage" "$operation_container_manifest_path" "$operation_container_state_directory"',
+            '  operation_container_manifest_present=true',
+            '  if [ "${COOLIFY_BLUE_GREEN_CONTAINER_JOURNAL_CAS_CRASH_AFTER_MANIFEST:-}" = 1 ]; then exit 75; fi',
+            'fi',
+            'durable_remote_assert_owned_regular "$operation_container_manifest_path"',
+            'test "$(durable_remote_owner_uid "$operation_container_manifest_path")" = "$(id -u)"',
+            'test "$(durable_remote_permissions "$operation_container_manifest_path")" = 600',
+            'operation_container_manifest_line_count=$(wc -l < "$operation_container_manifest_path" | tr -d \'[:blank:]\')',
+            'test "$operation_container_manifest_line_count" = 10',
+            'exec 6< "$operation_container_manifest_path"',
+            'IFS= read -r operation_container_manifest_magic <&6',
+            'IFS= read -r operation_container_manifest_filename <&6',
+            'IFS= read -r operation_container_manifest_journal_checksum <&6',
+            'IFS= read -r operation_container_manifest_expected_state_checksum <&6',
+            'IFS= read -r operation_container_manifest_replacement_state_checksum <&6',
+            'IFS= read -r operation_container_manifest_expected_boot_id <&6',
+            'IFS= read -r operation_container_manifest_managed_file_state <&6',
+            'IFS= read -r operation_container_manifest_managed_checksum <&6',
+            'IFS= read -r operation_container_manifest_sidecar_status <&6',
+            'IFS= read -r operation_container_manifest_archive_filename <&6',
+            'exec 6<&-',
+            'test "$operation_container_manifest_magic" = '.escapeshellarg($manifestMagic),
+            'test "$operation_container_manifest_filename" = '.escapeshellarg($managedFilename),
+            'test "$operation_container_manifest_journal_checksum" = "$operation_container_journal_checksum"',
+            'test "$operation_container_manifest_expected_state_checksum" = "$operation_container_expected_state_checksum"',
+            'test "$operation_container_manifest_replacement_state_checksum" = "$operation_container_replacement_state_checksum"',
+            'test "$operation_container_manifest_expected_boot_id" = "$operation_container_expected_boot_id"',
+            'test "$operation_container_manifest_managed_file_state" = "$operation_container_managed_file_state"',
+            'test "$operation_container_manifest_managed_checksum" = "$operation_container_managed_checksum"',
+            'test "$operation_container_manifest_sidecar_status" = '.escapeshellarg($terminalSidecarStatus),
+            'test "$operation_container_manifest_archive_filename" = '.escapeshellarg($archiveFilename),
+            ...$sidecarFinalizationCommands,
+            $expectedCurrentBootId === null
+                ? $this->bootIdentityAssertionCommand('"$operation_container_expected_boot_id"')
+                : $this->bootIdentityAssertionCommand(escapeshellarg($expectedCurrentBootId)),
+            'if [ "$operation_container_managed_file_state" = missing ]; then',
+            '  test ! -e "$operation_container_active_path"',
+            '  test ! -L "$operation_container_active_path"',
+            'else',
+            '  durable_remote_assert_owned_regular "$operation_container_active_path"',
+            '  test "$(durable_remote_owner_uid "$operation_container_active_path")" = "$(id -u)"',
+            '  test "$(durable_remote_permissions "$operation_container_active_path")" = 600',
+            '  operation_container_final_checksum=$(sha256sum "$operation_container_active_path")',
+            '  test "${operation_container_final_checksum%% *}" = "$operation_container_managed_checksum"',
+            'fi',
+            'operation_container_final_checksum=$(sha256sum "$operation_container_journal_source")',
+            'test "${operation_container_final_checksum%% *}" = "$operation_container_journal_checksum"',
+            'if [ "$operation_container_journal_status" = pending ]; then',
+            '  durable_remote_replace "$operation_container_journal_path" "$operation_container_archive_path" "$operation_container_state_directory"',
+            'elif [ "$operation_container_journal_status" = pending_archived_duplicate ]; then',
+            '  durable_remote_assert_owned_regular "$operation_container_journal_path"',
+            '  test "$(durable_remote_owner_uid "$operation_container_journal_path")" = "$(id -u)"',
+            '  test "$(durable_remote_permissions "$operation_container_journal_path")" = 600',
+            '  durable_remote_assert_owned_regular "$operation_container_archive_path"',
+            '  test "$(durable_remote_owner_uid "$operation_container_archive_path")" = "$(id -u)"',
+            '  test "$(durable_remote_permissions "$operation_container_archive_path")" = 600',
+            '  operation_container_final_checksum=$(sha256sum "$operation_container_journal_path")',
+            '  test "${operation_container_final_checksum%% *}" = "$operation_container_journal_checksum"',
+            '  operation_container_final_checksum=$(sha256sum "$operation_container_archive_path")',
+            '  test "${operation_container_final_checksum%% *}" = "$operation_container_journal_checksum"',
+            '  cmp -s "$operation_container_journal_path" "$operation_container_archive_path"',
+            '  durable_remote_remove "$operation_container_journal_path" "$operation_container_state_directory"',
+            'fi',
+            ...$pendingArchiveCrashCommands,
+            'test ! -e "$operation_container_journal_path"',
+            'test ! -L "$operation_container_journal_path"',
+            'durable_remote_assert_owned_regular "$operation_container_archive_path"',
+            'test "$(durable_remote_owner_uid "$operation_container_archive_path")" = "$(id -u)"',
+            'test "$(durable_remote_permissions "$operation_container_archive_path")" = 600',
+            'operation_container_final_checksum=$(sha256sum "$operation_container_archive_path")',
+            'test "${operation_container_final_checksum%% *}" = "$operation_container_journal_checksum"',
+            'rm -f -- "$operation_container_expected_state_decoded" "$operation_container_replacement_state_decoded" "$operation_container_mutation_decoded" "$operation_container_completion_decoded" "${operation_container_manifest_stage:-}" "${operation_container_state_stage:-}"',
+            'trap - 0 HUP INT TERM',
+            'printf \'%s|%s|%s|%s\' '.escapeshellarg(self::CONTAINER_MUTATION_JOURNAL_CAS_OUTPUT_PREFIX).' '.escapeshellarg($terminalSidecarStatus).' "$operation_container_journal_checksum" '.escapeshellarg($archiveFilename),
+        ]);
+    }
+
+    private function committedContainerMutationJournalCommandFor(
+        string $proxyPath,
+        string $managedFilename,
+        ?string $expectedJournalSha256 = null,
+        ?BlueGreenProxyState $expectedState = null,
+        ?BlueGreenProxyState $replacementState = null,
+        ?string $expectedJournalBootId = null,
+        ?string $expectedCurrentBootId = null,
+    ): string {
+        $stateDirectory = $this->stateDirectory($proxyPath);
+        $activePath = $this->managedPath($proxyPath, $managedFilename);
+        $statePath = $this->statePath($proxyPath, $managedFilename);
+        $mutationJournalPath = $this->mutationJournalPath($proxyPath, $managedFilename);
+        $journalPath = $this->containerMutationJournalPath($proxyPath, $managedFilename);
+        $archiveFilename = $expectedJournalSha256 === null
+            ? null
+            : $this->committedContainerMutationJournalArchiveFilename(
+                $managedFilename,
+                $expectedJournalSha256,
+            );
+        $archivePath = $archiveFilename === null ? null : $stateDirectory.'/'.$archiveFilename;
+        $manifestPath = $archivePath === null ? null : $archivePath.'.manifest';
+        $expectedStateEncoded = $replacementState === null
+            ? null
+            : BlueGreenProxyRollbackArtifact::encodedState($expectedState);
+        $replacementStateEncoded = $replacementState === null
+            ? null
+            : BlueGreenProxyRollbackArtifact::encodedState($replacementState);
+        $expectedStateSha256 = $replacementState === null
+            ? null
+            : $this->serializedStateChecksum($expectedState);
+        $replacementStateSha256 = $replacementState === null
+            ? null
+            : $this->serializedStateChecksum($replacementState);
+        $replacementManagedFileState = $replacementState === null
+            ? null
+            : $this->managedStateMarker($replacementState);
+        $replacementManagedSha256 = $replacementState === null
+            ? null
+            : $this->managedStateChecksum($replacementState);
+        $bootIdentityAssertion = $expectedCurrentBootId === null
+            ? $this->bootIdentityAssertionCommand('"$committed_container_expected_boot_id"')
+            : $this->bootIdentityAssertionCommand(escapeshellarg($expectedCurrentBootId));
+        $expectedJournalBootCommands = $expectedJournalBootId === null
+            ? []
+            : [
+                'test "$committed_container_expected_boot_id" = '.escapeshellarg($expectedJournalBootId),
+            ];
+        $journalSelectionCommands = $expectedJournalSha256 === null
+            ? [
+                'if [ ! -e "$committed_container_journal_path" ] && [ ! -L "$committed_container_journal_path" ]; then',
+                '  printf %s '.escapeshellarg(self::COMMITTED_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX.'|absent'),
+                '  exit 0',
+                'fi',
+                'committed_container_journal_source="$committed_container_journal_path"',
+                'committed_container_journal_status=committed',
+            ]
+            : [
+                'committed_container_journal_present=false',
+                'committed_container_archive_present=false',
+                'committed_container_manifest_present=false',
+                'if [ -e "$committed_container_journal_path" ] || [ -L "$committed_container_journal_path" ]; then committed_container_journal_present=true; fi',
+                'if [ -e "$committed_container_archive_path" ] || [ -L "$committed_container_archive_path" ]; then committed_container_archive_present=true; fi',
+                'if [ -e "$committed_container_manifest_path" ] || [ -L "$committed_container_manifest_path" ]; then committed_container_manifest_present=true; fi',
+                'if [ "$committed_container_journal_present" = true ] && [ "$committed_container_archive_present" = false ]; then',
+                '  committed_container_journal_source="$committed_container_journal_path"',
+                '  committed_container_journal_status=committed',
+                'elif [ "$committed_container_journal_present" = false ] && [ "$committed_container_archive_present" = true ] && [ "$committed_container_manifest_present" = true ]; then',
+                '  committed_container_journal_source="$committed_container_archive_path"',
+                '  committed_container_journal_status=archived',
+                'else',
+                '  exit 1',
+                'fi',
+            ];
+        $archiveCommands = $expectedJournalSha256 === null
+            ? [
+                'rm -f -- "$committed_container_expected_state_decoded" "$committed_container_replacement_state_decoded" "$committed_container_mutation_decoded" "$committed_container_completion_decoded"',
+                'trap - 0 HUP INT TERM',
+                'printf \'%s|committed|%s|%s|%s|%s\\n%s\\n%s\' '
+                    .escapeshellarg(self::COMMITTED_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX)
+                    .' "$committed_container_journal_checksum" "$committed_container_expected_boot_id" "$committed_container_managed_file_state" "$committed_container_managed_checksum" "$committed_container_expected_state" "$committed_container_replacement_state"',
+            ]
+            : [
+                'test "$committed_container_journal_checksum" = '.escapeshellarg($expectedJournalSha256),
+                'test "$committed_container_expected_state" = '.escapeshellarg($expectedStateEncoded),
+                'test "$committed_container_expected_state_checksum" = '.escapeshellarg($expectedStateSha256),
+                'test "$committed_container_replacement_state" = '.escapeshellarg($replacementStateEncoded),
+                'test "$committed_container_replacement_state_checksum" = '.escapeshellarg($replacementStateSha256),
+                'test "$committed_container_managed_file_state" = '.escapeshellarg($replacementManagedFileState),
+                'test "$committed_container_managed_checksum" = '.escapeshellarg($replacementManagedSha256),
+                'if [ "$committed_container_journal_status" = committed ]; then',
+                '  if [ "$committed_container_manifest_present" = false ]; then',
+                '    committed_container_manifest_stage=$(mktemp "$committed_container_state_directory/.blue-green-committed-container-manifest.XXXXXX")',
+                '    {',
+                '      printf \'%s\\n\' '.escapeshellarg(self::COMMITTED_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC),
+                '      printf \'%s\\n\' '.escapeshellarg($managedFilename),
+                '      printf \'%s\\n\' "$committed_container_journal_checksum"',
+                '      printf \'%s\\n\' "$committed_container_expected_state_checksum"',
+                '      printf \'%s\\n\' "$committed_container_replacement_state_checksum"',
+                '      printf \'%s\\n\' "$committed_container_expected_boot_id"',
+                '      printf \'%s\\n\' "$committed_container_managed_file_state"',
+                '      printf \'%s\\n\' "$committed_container_managed_checksum"',
+                '      printf \'%s\\n\' '.escapeshellarg($archiveFilename),
+                '    } > "$committed_container_manifest_stage"',
+                '    chmod 600 "$committed_container_manifest_stage"',
+                '    durable_remote_replace "$committed_container_manifest_stage" "$committed_container_manifest_path" "$committed_container_state_directory"',
+                '    committed_container_manifest_present=true',
+                '  fi',
+                'fi',
+                'durable_remote_assert_owned_regular "$committed_container_manifest_path"',
+                'test "$(durable_remote_owner_uid "$committed_container_manifest_path")" = "$(id -u)"',
+                'test "$(durable_remote_permissions "$committed_container_manifest_path")" = 600',
+                'committed_container_manifest_line_count=$(wc -l < "$committed_container_manifest_path" | tr -d \'[:blank:]\')',
+                'test "$committed_container_manifest_line_count" = 9',
+                'exec 6< "$committed_container_manifest_path"',
+                'IFS= read -r committed_container_manifest_magic <&6',
+                'IFS= read -r committed_container_manifest_filename <&6',
+                'IFS= read -r committed_container_manifest_journal_checksum <&6',
+                'IFS= read -r committed_container_manifest_expected_state_checksum <&6',
+                'IFS= read -r committed_container_manifest_replacement_state_checksum <&6',
+                'IFS= read -r committed_container_manifest_expected_boot_id <&6',
+                'IFS= read -r committed_container_manifest_managed_file_state <&6',
+                'IFS= read -r committed_container_manifest_managed_checksum <&6',
+                'IFS= read -r committed_container_manifest_archive_filename <&6',
+                'exec 6<&-',
+                'test "$committed_container_manifest_magic" = '.escapeshellarg(self::COMMITTED_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC),
+                'test "$committed_container_manifest_filename" = '.escapeshellarg($managedFilename),
+                'test "$committed_container_manifest_journal_checksum" = "$committed_container_journal_checksum"',
+                'test "$committed_container_manifest_expected_state_checksum" = "$committed_container_expected_state_checksum"',
+                'test "$committed_container_manifest_replacement_state_checksum" = "$committed_container_replacement_state_checksum"',
+                'test "$committed_container_manifest_expected_boot_id" = "$committed_container_expected_boot_id"',
+                'test "$committed_container_manifest_managed_file_state" = "$committed_container_managed_file_state"',
+                'test "$committed_container_manifest_managed_checksum" = "$committed_container_managed_checksum"',
+                'test "$committed_container_manifest_archive_filename" = '.escapeshellarg($archiveFilename),
+                'durable_remote_assert_owned_regular "$committed_container_state_path"',
+                'test "$(durable_remote_owner_uid "$committed_container_state_path")" = "$(id -u)"',
+                'test "$(durable_remote_permissions "$committed_container_state_path")" = 600',
+                'cmp -s "$committed_container_state_path" "$committed_container_replacement_state_decoded"',
+                'committed_container_final_checksum=$(sha256sum "$committed_container_journal_source")',
+                'test "${committed_container_final_checksum%% *}" = "$committed_container_journal_checksum"',
+                'if [ "$committed_container_journal_status" = committed ]; then',
+                '  if [ "${COOLIFY_BLUE_GREEN_COMMITTED_CONTAINER_JOURNAL_CRASH_AFTER_MANIFEST:-}" = 1 ]; then exit 75; fi',
+                '  durable_remote_replace "$committed_container_journal_path" "$committed_container_archive_path" "$committed_container_state_directory"',
+                'fi',
+                'test ! -e "$committed_container_journal_path"',
+                'test ! -L "$committed_container_journal_path"',
+                'durable_remote_assert_owned_regular "$committed_container_archive_path"',
+                'test "$(durable_remote_owner_uid "$committed_container_archive_path")" = "$(id -u)"',
+                'test "$(durable_remote_permissions "$committed_container_archive_path")" = 600',
+                'committed_container_final_checksum=$(sha256sum "$committed_container_archive_path")',
+                'test "${committed_container_final_checksum%% *}" = "$committed_container_journal_checksum"',
+                'rm -f -- "$committed_container_expected_state_decoded" "$committed_container_replacement_state_decoded" "$committed_container_mutation_decoded" "$committed_container_completion_decoded" "${committed_container_manifest_stage:-}"',
+                'trap - 0 HUP INT TERM',
+                'printf \'%s|archived|%s|%s\' '.escapeshellarg(self::COMMITTED_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX).' "$committed_container_journal_checksum" '.escapeshellarg($archiveFilename),
+            ];
+
+        return implode("\n", [
+            'set -eu',
+            'umask 077',
+            ...DurableRemoteArtifact::shellFunctions(),
+            ...$this->exclusiveManagedFileLockCommands($proxyPath, $managedFilename),
+            'committed_container_state_directory='.escapeshellarg($stateDirectory),
+            'committed_container_active_path='.escapeshellarg($activePath),
+            'committed_container_state_path='.escapeshellarg($statePath),
+            'committed_container_mutation_path='.escapeshellarg($mutationJournalPath),
+            'committed_container_journal_path='.escapeshellarg($journalPath),
+            ...($archivePath === null ? [] : [
+                'committed_container_archive_path='.escapeshellarg($archivePath),
+                'committed_container_manifest_path='.escapeshellarg($manifestPath),
+            ]),
+            'durable_remote_assert_owned_directory "$committed_container_state_directory"',
+            'test ! -e "$committed_container_mutation_path"',
+            'test ! -L "$committed_container_mutation_path"',
+            ...$journalSelectionCommands,
+            'durable_remote_assert_owned_regular "$committed_container_journal_source"',
+            'test "$(durable_remote_owner_uid "$committed_container_journal_source")" = "$(id -u)"',
+            'test "$(durable_remote_permissions "$committed_container_journal_source")" = 600',
+            'committed_container_journal_line_count=$(wc -l < "$committed_container_journal_source" | tr -d \'[:blank:]\')',
+            'test "$committed_container_journal_line_count" = 13',
+            'exec 5< "$committed_container_journal_source"',
+            'IFS= read -r committed_container_journal_magic <&5',
+            'IFS= read -r committed_container_journal_filename <&5',
+            'IFS= read -r committed_container_expected_boot_id <&5',
+            'IFS= read -r committed_container_expected_state <&5',
+            'IFS= read -r committed_container_expected_state_checksum <&5',
+            'IFS= read -r committed_container_replacement_state <&5',
+            'IFS= read -r committed_container_replacement_state_checksum <&5',
+            'IFS= read -r committed_container_managed_file_state <&5',
+            'IFS= read -r committed_container_managed_checksum <&5',
+            'IFS= read -r committed_container_mutation_checksum <&5',
+            'IFS= read -r committed_container_completion_checksum <&5',
+            'IFS= read -r committed_container_mutation <&5',
+            'IFS= read -r committed_container_completion <&5',
+            'exec 5<&-',
+            'test "$committed_container_journal_magic" = '.escapeshellarg(self::CONTAINER_MUTATION_JOURNAL_MAGIC),
+            'test "$committed_container_journal_filename" = '.escapeshellarg($managedFilename),
+            $this->lowercaseUuidAssertionCommand('$committed_container_expected_boot_id'),
+            ...$expectedJournalBootCommands,
+            $bootIdentityAssertion,
+            'for committed_container_checksum_value in "$committed_container_expected_state_checksum" "$committed_container_replacement_state_checksum" "$committed_container_managed_checksum" "$committed_container_mutation_checksum" "$committed_container_completion_checksum"; do',
+            '  case "$committed_container_checksum_value" in *[!0123456789abcdef]*|\'\') exit 1 ;; esac',
+            '  test "${#committed_container_checksum_value}" -eq 64',
+            'done',
+            'case "$committed_container_managed_file_state" in present|missing) ;; *) exit 1 ;; esac',
+            'if [ "$committed_container_managed_file_state" = missing ]; then',
+            '  test ! -e "$committed_container_active_path"',
+            '  test ! -L "$committed_container_active_path"',
+            'else',
+            '  durable_remote_assert_owned_regular "$committed_container_active_path"',
+            '  test "$(durable_remote_owner_uid "$committed_container_active_path")" = "$(id -u)"',
+            '  test "$(durable_remote_permissions "$committed_container_active_path")" = 600',
+            '  committed_container_active_checksum=$(sha256sum "$committed_container_active_path")',
+            '  test "${committed_container_active_checksum%% *}" = "$committed_container_managed_checksum"',
+            'fi',
+            'committed_container_expected_state_decoded=$(mktemp "$committed_container_state_directory/.blue-green-committed-container-expected.XXXXXX")',
+            'committed_container_replacement_state_decoded=$(mktemp "$committed_container_state_directory/.blue-green-committed-container-replacement.XXXXXX")',
+            'committed_container_mutation_decoded=$(mktemp "$committed_container_state_directory/.blue-green-committed-container-mutation.XXXXXX")',
+            'committed_container_completion_decoded=$(mktemp "$committed_container_state_directory/.blue-green-committed-container-completion.XXXXXX")',
+            'trap \'rm -f -- "$committed_container_expected_state_decoded" "$committed_container_replacement_state_decoded" "$committed_container_mutation_decoded" "$committed_container_completion_decoded" "${committed_container_manifest_stage:-}"\' 0 HUP INT TERM',
+            'if [ "$committed_container_expected_state" = absent ]; then : > "$committed_container_expected_state_decoded"; else printf %s "$committed_container_expected_state" | base64 -d > "$committed_container_expected_state_decoded"; fi',
+            'printf %s "$committed_container_replacement_state" | base64 -d > "$committed_container_replacement_state_decoded"',
+            'printf %s "$committed_container_mutation" | base64 -d > "$committed_container_mutation_decoded"',
+            'printf %s "$committed_container_completion" | base64 -d > "$committed_container_completion_decoded"',
+            'committed_container_actual_checksum=$(sha256sum "$committed_container_expected_state_decoded")',
+            'test "${committed_container_actual_checksum%% *}" = "$committed_container_expected_state_checksum"',
+            'committed_container_actual_checksum=$(sha256sum "$committed_container_replacement_state_decoded")',
+            'test "${committed_container_actual_checksum%% *}" = "$committed_container_replacement_state_checksum"',
+            'committed_container_actual_checksum=$(sha256sum "$committed_container_mutation_decoded")',
+            'test "${committed_container_actual_checksum%% *}" = "$committed_container_mutation_checksum"',
+            'committed_container_actual_checksum=$(sha256sum "$committed_container_completion_decoded")',
+            'test "${committed_container_actual_checksum%% *}" = "$committed_container_completion_checksum"',
+            'test "$(head -n 1 "$committed_container_mutation_decoded")" = \'set -eu\'',
+            'test "$(head -n 1 "$committed_container_completion_decoded")" = \'set -eu\'',
+            'durable_remote_assert_owned_regular "$committed_container_state_path"',
+            'test "$(durable_remote_owner_uid "$committed_container_state_path")" = "$(id -u)"',
+            'test "$(durable_remote_permissions "$committed_container_state_path")" = 600',
+            'cmp -s "$committed_container_state_path" "$committed_container_replacement_state_decoded"',
+            'committed_container_journal_checksum=$(sha256sum "$committed_container_journal_source")',
+            'committed_container_journal_checksum=${committed_container_journal_checksum%% *}',
+            'case "$committed_container_journal_checksum" in *[!0123456789abcdef]*|\'\') exit 1 ;; esac',
+            'test "${#committed_container_journal_checksum}" -eq 64',
+            ...$archiveCommands,
+        ]);
+    }
+
     /**
      * @param  non-empty-list<string>  $commands
      * @param  non-empty-list<string>  $completionCommands
@@ -2807,104 +3836,17 @@ class WriteBlueGreenProxyConfiguration
     }
 
     /** @return list<string> */
-    /**
-     * @param  non-empty-list<string>  $incompleteJournalCommands
-     * @return list<string>
-     */
     private function pendingContainerMutationJournalCommands(
         string $proxyPath,
         string $managedFilename,
-        array $incompleteJournalCommands,
     ): array {
         $journalPath = $this->containerMutationJournalPath($proxyPath, $managedFilename);
-        $activePath = $this->managedPath($proxyPath, $managedFilename);
-        $statePath = $this->statePath($proxyPath, $managedFilename);
         $safeJournalPath = escapeshellarg($journalPath);
-        $safeActivePath = escapeshellarg($activePath);
-        $safeStatePath = escapeshellarg($statePath);
-        $directory = dirname($journalPath);
 
         return [
             'if [ -e '.$safeJournalPath.' ] || [ -L '.$safeJournalPath.' ]; then',
-            '  test -f '.$safeJournalPath,
-            '  test ! -L '.$safeJournalPath,
-            '  container_journal_owner=$(stat -c %u -- '.$safeJournalPath.' 2>/dev/null || stat -f %u -- '.$safeJournalPath.')',
-            '  test "$container_journal_owner" = "$(id -u)"',
-            '  container_journal_mode=$(stat -c %a -- '.$safeJournalPath.' 2>/dev/null || stat -f %Lp -- '.$safeJournalPath.')',
-            '  test "$container_journal_mode" = 600',
-            '  exec 5< '.$safeJournalPath,
-            '  IFS= read -r container_journal_magic <&5',
-            '  IFS= read -r container_journal_filename <&5',
-            '  IFS= read -r container_journal_expected_boot_id <&5',
-            '  IFS= read -r container_journal_expected_state <&5',
-            '  IFS= read -r container_journal_expected_state_checksum <&5',
-            '  IFS= read -r container_journal_replacement_state <&5',
-            '  IFS= read -r container_journal_replacement_state_checksum <&5',
-            '  IFS= read -r container_journal_managed_file_state <&5',
-            '  IFS= read -r container_journal_managed_checksum <&5',
-            '  IFS= read -r container_journal_mutation_checksum <&5',
-            '  IFS= read -r container_journal_completion_checksum <&5',
-            '  IFS= read -r container_journal_mutation <&5',
-            '  IFS= read -r container_journal_completion <&5',
-            '  exec 5<&-',
-            '  test "$container_journal_magic" = '.escapeshellarg(self::CONTAINER_MUTATION_JOURNAL_MAGIC),
-            '  test "$container_journal_filename" = '.escapeshellarg($managedFilename),
-            '  case "$container_journal_expected_boot_id" in [0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]) ;; *) exit 1 ;; esac',
-            '  case "$container_journal_expected_state_checksum$container_journal_replacement_state_checksum$container_journal_managed_checksum$container_journal_mutation_checksum$container_journal_completion_checksum" in *[!0123456789abcdef]*) exit 1 ;; esac',
-            '  test "${#container_journal_expected_state_checksum}" -eq 64',
-            '  test "${#container_journal_replacement_state_checksum}" -eq 64',
-            '  test "${#container_journal_managed_checksum}" -eq 64',
-            '  test "${#container_journal_mutation_checksum}" -eq 64',
-            '  test "${#container_journal_completion_checksum}" -eq 64',
-            '  case "$container_journal_managed_file_state" in present|missing) ;; *) exit 1 ;; esac',
-            '  container_journal_expected_state_decoded=$(mktemp '.escapeshellarg($directory.'/.blue-green-container-expected.XXXXXX').')',
-            '  container_journal_replacement_state_decoded=$(mktemp '.escapeshellarg($directory.'/.blue-green-container-replacement.XXXXXX').')',
-            '  container_journal_mutation_decoded=$(mktemp '.escapeshellarg($directory.'/.blue-green-container-mutation.XXXXXX').')',
-            '  container_journal_completion_decoded=$(mktemp '.escapeshellarg($directory.'/.blue-green-container-completion.XXXXXX').')',
-            '  trap \'rm -f -- "$container_journal_expected_state_decoded" "$container_journal_replacement_state_decoded" "$container_journal_mutation_decoded" "$container_journal_completion_decoded"\' 0 HUP INT TERM',
-            '  if [ "$container_journal_expected_state" = absent ]; then : > "$container_journal_expected_state_decoded"; else printf %s "$container_journal_expected_state" | base64 -d > "$container_journal_expected_state_decoded"; fi',
-            '  printf %s "$container_journal_replacement_state" | base64 -d > "$container_journal_replacement_state_decoded"',
-            '  printf %s "$container_journal_mutation" | base64 -d > "$container_journal_mutation_decoded"',
-            '  printf %s "$container_journal_completion" | base64 -d > "$container_journal_completion_decoded"',
-            '  container_journal_actual_checksum=$(sha256sum "$container_journal_expected_state_decoded")',
-            '  test "${container_journal_actual_checksum%% *}" = "$container_journal_expected_state_checksum"',
-            '  container_journal_actual_checksum=$(sha256sum "$container_journal_replacement_state_decoded")',
-            '  test "${container_journal_actual_checksum%% *}" = "$container_journal_replacement_state_checksum"',
-            '  container_journal_actual_checksum=$(sha256sum "$container_journal_mutation_decoded")',
-            '  test "${container_journal_actual_checksum%% *}" = "$container_journal_mutation_checksum"',
-            '  container_journal_actual_checksum=$(sha256sum "$container_journal_completion_decoded")',
-            '  test "${container_journal_actual_checksum%% *}" = "$container_journal_completion_checksum"',
-            '  if [ "$container_journal_managed_file_state" = missing ]; then',
-            '    test ! -e '.$safeActivePath,
-            '    test ! -L '.$safeActivePath,
-            '  else',
-            '    test -f '.$safeActivePath,
-            '    test ! -L '.$safeActivePath,
-            '    container_journal_actual_checksum=$(sha256sum '.$safeActivePath.')',
-            '    test "${container_journal_actual_checksum%% *}" = "$container_journal_managed_checksum"',
-            '  fi',
-            '  if [ -f '.$safeStatePath.' ] && [ ! -L '.$safeStatePath.' ] && cmp -s '.$safeStatePath.' "$container_journal_replacement_state_decoded"; then',
-            '    :',
-            '  else',
-            '    if [ "$container_journal_expected_state" = absent ]; then',
-            '      test ! -e '.$safeStatePath,
-            '      test ! -L '.$safeStatePath,
-            '    else',
-            '      test -f '.$safeStatePath,
-            '      test ! -L '.$safeStatePath,
-            '      cmp -s '.$safeStatePath.' "$container_journal_expected_state_decoded"',
-            '    fi',
-            '    if ! sh "$container_journal_completion_decoded"; then',
-            ...$this->indent($this->indent($incompleteJournalCommands)),
-            '    fi',
-            '    container_state_stage=$(mktemp '.escapeshellarg($directory.'/.blue-green-container-state.XXXXXX').')',
-            '    cp -- "$container_journal_replacement_state_decoded" "$container_state_stage"',
-            '    chmod 600 "$container_state_stage"',
-            '    durable_remote_replace "$container_state_stage" '.$safeStatePath.' '.escapeshellarg($directory),
-            '  fi',
-            '  rm -f -- "$container_journal_expected_state_decoded" "$container_journal_replacement_state_decoded" "$container_journal_mutation_decoded" "$container_journal_completion_decoded"',
-            '  durable_remote_remove '.$safeJournalPath.' '.escapeshellarg($directory),
-            '  trap - 0 HUP INT TERM',
+            '  printf \'%s\\n\' '.escapeshellarg(self::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT).' >&2',
+            '  exit 75',
             'fi',
         ];
     }

@@ -771,6 +771,7 @@ it('does not archive while another lifecycle owner holds the destination fence',
 
     expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::STALE_CONTAINER_JOURNAL)
         ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::DEFERRED)
+        ->and($result->recoveryOwnerActive)->toBeTrue()
         ->and(implode("\n", $payloads))->not->toContain('durable_remote_replace "$container_journal_path" "$container_journal_archive_path"');
 });
 
@@ -861,5 +862,6 @@ it('does not archive when the host boot identity changes after inspection', func
 
     expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::STALE_CONTAINER_JOURNAL)
         ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::DEFERRED)
+        ->and($result->recoveryOwnerActive)->toBeFalse()
         ->and(implode("\n", $payloads))->not->toContain('durable_remote_replace "$container_journal_path" "$container_journal_archive_path"');
 });

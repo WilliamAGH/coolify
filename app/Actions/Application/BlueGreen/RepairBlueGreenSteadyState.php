@@ -8,7 +8,9 @@ use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\StandaloneDocker;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use LogicException;
 use Lorisleiva\Actions\Concerns\AsAction;
 use Throwable;
@@ -100,6 +102,8 @@ final class RepairBlueGreenSteadyState
                 // appearance, not a regression, while the file provider converges.
                 allowInitialRouteAppearance: $outcome === WriteBlueGreenProxyConfiguration::REPAIR_MISSING_OUTPUT,
             );
+            $this->assertSnapshotUnchanged($state);
+            $this->clearExactStaleInterventionDiagnostics($state, $fence);
 
             $result = match ($outcome) {
                 WriteBlueGreenProxyConfiguration::REPAIR_HEALTHY_OUTPUT => BlueGreenSteadyStateRepairResult::HEALTHY,
@@ -203,5 +207,117 @@ final class RepairBlueGreenSteadyState
                 throw new BlueGreenOperationFenceLostException('The durable IDLE destination changed during repair.');
             }
         }
+    }
+
+    /**
+     * An IDLE row can retain intervention text after its original owner has
+     * already completed. The manual recovery entry point owns the general
+     * cleanup, but it cannot be re-entered here because this repair already
+     * holds the destination lifecycle lock. Clear only the exact stale shape
+     * after this owner has re-proven its container, managed file, and public
+     * route; every ambiguous record remains visible for manual recovery.
+     */
+    private function clearExactStaleInterventionDiagnostics(
+        ApplicationBlueGreenDeployment $snapshot,
+        BlueGreenOperationFence $fence,
+    ): void {
+        if (! $this->hasExactStaleInterventionDiagnostics($snapshot)) {
+            return;
+        }
+
+        $fence->assertLockOwnership();
+        DB::transaction(function () use ($fence, $snapshot): void {
+            $fence->assertLockOwnership();
+            $identity = ApplicationBlueGreenDeployment::query()->find($snapshot->id);
+            if ($identity === null) {
+                throw new BlueGreenOperationFenceLostException('The IDLE destination disappeared before stale intervention diagnostics could be cleaned.');
+            }
+            $locks = BlueGreenLifecycleDatabaseLocks::forDestination(
+                $identity->application_id,
+                $identity->standalone_docker_id,
+            );
+            $current = $locks->state;
+            if ($current === null || $current->id !== $snapshot->id) {
+                throw new BlueGreenOperationFenceLostException('The IDLE destination changed before stale intervention diagnostics could be cleaned.');
+            }
+            if ($locks->application->trashed() || $this->deactivationFencesRepair($locks, $current)) {
+                throw new BlueGreenOperationFenceLostException('Lifecycle ownership changed before stale intervention diagnostics could be cleaned.');
+            }
+            $this->assertSnapshotUnchanged($snapshot);
+            if (! $this->hasExactStaleInterventionDiagnostics($current)) {
+                return;
+            }
+
+            $query = ApplicationBlueGreenDeployment::query()
+                ->whereKey($snapshot->id)
+                ->whereHas('application', static fn (Builder $applicationQuery): Builder => $applicationQuery->whereNull('deleted_at'));
+            foreach (array_unique([
+                'application_id',
+                'standalone_docker_id',
+                'phase',
+                'active_color',
+                'blue_deployment_uuid',
+                'green_deployment_uuid',
+                'pending_color',
+                'pending_deployment_uuid',
+                'legacy_container_name',
+                'deactivation_operation_id',
+                'deactivation_started_at',
+                'routing_revision',
+                'destination_fence_epoch',
+                'destination_fence_operation_id',
+                'destination_fence_mutation_sequence',
+                'managed_file_sha256',
+                'destination_topology_digest',
+                'application_routing_config_digest',
+                'supersession_generation',
+                'intervention_phase',
+                'intervention_reason',
+                ...array_keys(ApplicationBlueGreenDeployment::clearedOperationAttributes()),
+                ...array_keys(ApplicationBlueGreenDeployment::clearedInactiveRetirementAttributes()),
+            ]) as $attribute) {
+                $expected = $snapshot->getRawOriginal($attribute);
+                $expected === null
+                    ? $query->whereNull($attribute)
+                    : $query->where($attribute, $expected);
+            }
+            if ($query->update([
+                'intervention_phase' => null,
+                'intervention_reason' => null,
+            ]) !== 1) {
+                throw new BlueGreenOperationFenceLostException('The IDLE destination changed while stale intervention diagnostics were being cleaned.');
+            }
+        }, attempts: 5);
+    }
+
+    private function hasExactStaleInterventionDiagnostics(ApplicationBlueGreenDeployment $state): bool
+    {
+        if ($state->phase !== BlueGreenDeploymentPhase::IDLE
+            || ! ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state)
+            || ! is_string($state->intervention_phase)
+            || ! is_string($state->intervention_reason)
+            || trim($state->intervention_reason) === '') {
+            return false;
+        }
+        $sourcePhase = BlueGreenDeploymentPhase::tryFrom($state->intervention_phase);
+        if (! in_array($sourcePhase, [
+            BlueGreenDeploymentPhase::PREPARING,
+            BlueGreenDeploymentPhase::SWITCHING,
+            BlueGreenDeploymentPhase::DRAINING,
+            BlueGreenDeploymentPhase::ROLLING_BACK,
+            BlueGreenDeploymentPhase::DEACTIVATING,
+        ], true)) {
+            return false;
+        }
+
+        foreach (ApplicationBlueGreenDeployment::clearedInactiveRetirementAttributes() as $attribute => $expected) {
+            if ($state->getAttribute($attribute) !== $expected) {
+                return $state->inactive_retirement_stopped_at !== null
+                    && $state->inactive_retirement_intervention_required_at === null
+                    && $state->inactive_retirement_dispatch_reserved_until_at === null;
+            }
+        }
+
+        return true;
     }
 }

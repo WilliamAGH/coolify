@@ -63,8 +63,17 @@ final class AttestBlueGreenDestinationState
                 throw $exception;
             }
 
+            if ($state !== null && ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state)) {
+                return RecoverCleanIdleBlueGreenContainerMutationJournal::run(
+                    $server,
+                    $application,
+                    $destination,
+                    $state,
+                );
+            }
+
             throw new BlueGreenDeploymentTransitionException(
-                'The remote destination has a pending container mutation journal that requires explicit recovery.',
+                'The remote destination has a pending container mutation journal without one clean IDLE recovery owner.',
                 previous: $exception,
             );
         }

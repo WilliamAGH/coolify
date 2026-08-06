@@ -824,7 +824,7 @@ it('drains every immutable predecessor port when the live application dropped a 
     expect($operation->application->blueGreenDeploymentBackendPorts())->toBe([3000])
         ->and($operation->claim->backendPortInventory->ports())->toBe([3000])
         ->and($operation->claim->drainBackendPortInventory?->ports())->toBe([3000, 8080])
-        ->and($observationCommands)->toHaveCount(1)
+        ->and($observationCommands)->toHaveCount(2)
         ->each->toContain("target_ports='0BB8 1F90'")
         ->and($mutationCommands)->toHaveCount(1)
         ->each->toContain(base64_encode($expectedMutationScript))

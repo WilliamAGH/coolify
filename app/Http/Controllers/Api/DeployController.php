@@ -231,9 +231,14 @@ class DeployController extends Controller
             return response()->json(['message' => 'Deployment not found.'], 404);
         }
 
-        // Check if the deployment belongs to the user's team
-        $servers = Server::whereTeamId($teamId)->pluck('id');
-        if (! $servers->contains($deployment->server_id)) {
+        $application = $deployment->application;
+        if (! $application || data_get($application->team(), 'id') !== (int) $teamId) {
+            return response()->json(['message' => 'You do not have permission to cancel this deployment.'], 403);
+        }
+
+        try {
+            $this->authorize('manageDeployments', $application);
+        } catch (AuthorizationException) {
             return response()->json(['message' => 'You do not have permission to cancel this deployment.'], 403);
         }
 
@@ -264,11 +269,9 @@ class DeployController extends Controller
             ], 400);
         }
 
-        $application = $deployment->application;
-
         // The cancellation itself succeeded: everything below is best-effort
         // follow-up work and must never turn the response into an error.
-        $this->cleanupCancelledDeployment($deployment, $teamId);
+        $this->cleanupCancelledDeployment($deployment);
 
         try {
             next_after_cancel($deployment);
@@ -347,8 +350,14 @@ class DeployController extends Controller
             return response()->json(['message' => 'Deployment not found.'], 404);
         }
 
-        $servers = Server::whereTeamId($teamId)->pluck('id');
-        if (! $servers->contains($deployment->server_id)) {
+        $application = $deployment->application;
+        if (! $application || data_get($application->team(), 'id') !== (int) $teamId) {
+            return response()->json(['message' => 'You do not have permission to recover this deployment.'], 403);
+        }
+
+        try {
+            $this->authorize('deploy', $application);
+        } catch (AuthorizationException) {
             return response()->json(['message' => 'You do not have permission to recover this deployment.'], 403);
         }
 
@@ -368,7 +377,7 @@ class DeployController extends Controller
         // break-glass was called about, and a queue left unadvanced strands
         // every successor behind the deployment we just cleared.
         if ($recovery['cancelled'] === true) {
-            $this->cleanupCancelledDeployment($deployment, $teamId);
+            $this->cleanupCancelledDeployment($deployment);
 
             try {
                 next_after_cancel($deployment);
@@ -398,14 +407,16 @@ class DeployController extends Controller
      * cancellation. The container may never have been created (queued
      * deployment) or may already have been reaped, so a missing container is
      * an expected outcome; unexpected failures are logged, never surfaced.
+     * The caller has already authorized the exact deployment, while its
+     * persisted build server may legitimately belong to another team.
      */
-    private function cleanupCancelledDeployment(ApplicationDeploymentQueue $deployment, int|string $teamId): void
+    private function cleanupCancelledDeployment(ApplicationDeploymentQueue $deployment): void
     {
         try {
             $deployment_uuid = $deployment->deployment_uuid;
             $build_server_id = $deployment->build_server_id ?? $deployment->server_id;
 
-            $server = Server::whereTeamId($teamId)->find($build_server_id);
+            $server = Server::find($build_server_id);
             if (! $server) {
                 return;
             }

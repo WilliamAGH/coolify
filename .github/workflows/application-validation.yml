@@ -216,10 +216,13 @@ jobs:
         run: |
           set -Eeuo pipefail
           php -d memory_limit=1G vendor/bin/pest --compact --do-not-cache-result \
+            tests/Feature/Api/DeploymentCancellationApiTest.php \
             tests/Feature/Api/EmergencyDeploymentRecoveryApiTest.php \
             tests/Feature/ApplicationDeploymentBlueGreenDestinationFenceTest.php \
             tests/Feature/BlueGreenApplicationDeactivationTest.php \
             tests/Feature/BlueGreenApplicationManualStopTest.php \
+            tests/Feature/BlueGreenAutomaticRecoveryAcceptanceTest.php \
+            tests/Feature/BlueGreenCleanIdleContainerJournalRecoveryTest.php \
             tests/Feature/BlueGreenContinuousAvailabilityAcceptanceTest.php \
             tests/Feature/BlueGreenCrashBoundaryAcceptanceTest.php \
             tests/Feature/BlueGreenDockerComposeTopologyTest.php \
@@ -242,12 +245,14 @@ jobs:
             tests/Feature/BlueGreenMigrationReplayTest.php \
             tests/Feature/BlueGreenMultiPortPromotionAcceptanceTest.php \
             tests/Feature/BlueGreenMultiDestinationTopologyTest.php \
+            tests/Feature/BlueGreenOperationAwareManagedRouteReadTest.php \
             tests/Feature/DatabaseMigrationReadinessTest.php \
             tests/Feature/LivewireDestinationTopologyPersistenceTest.php \
             tests/Feature/BlueGreenOperationFencingTest.php \
             tests/Feature/BlueGreenProvenEmptyDeactivationTest.php \
             tests/Feature/BlueGreenReplicaLifecycleTest.php \
             tests/Feature/BlueGreenStaleContainerJournalRecoveryTest.php \
+            tests/Feature/BlueGreenSteadyStateRepairFenceTest.php \
             tests/Feature/BlueGreenStoppedLegacyContainerCleanupTest.php \
             tests/Feature/BlueGreenSupersessionGenerationTest.php \
             tests/Feature/DeleteResourceJobBlueGreenTest.php \

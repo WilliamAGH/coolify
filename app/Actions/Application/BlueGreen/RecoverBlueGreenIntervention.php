@@ -22,6 +22,7 @@ use App\Models\StandaloneDocker;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 use InvalidArgumentException;
 use Lorisleiva\Actions\Concerns\AsAction;
 
@@ -54,33 +55,23 @@ final class RecoverBlueGreenIntervention
      */
     public const UNRECONSTRUCTABLE_DRAIN_REASON = 'A fenced drain resume could not reconstruct this exact durable DRAINING operation, so it can never complete on its own.';
 
+    public const STALE_IDLE_DIAGNOSTICS = 'stale_idle_diagnostics';
+
     public static function isUnreconstructableDrainReason(?string $reason): bool
     {
         return $reason === self::UNRECONSTRUCTABLE_DRAIN_REASON;
     }
 
     /**
-     * Whether the destination's durable deactivation row is a live fence rather
-     * than permanent history.
-     *
-     * There is exactly one deactivation row per destination and nothing ever
-     * deletes it: a later stop supersedes it in place, so a terminal STOPPED or
-     * COMPLETED phase only records that this destination was stopped or torn
-     * down at some point in the past. Refusing recovery on its mere existence
-     * meant an application that had been stopped even once could never have any
-     * later intervention or stale journal recovered again — the destination
-     * stayed parked forever, which is exactly how retirement kept two live
-     * containers beside each other and served conflicting-owner 502s.
-     *
-     * Deployment claims already ask the right question, and deliberately do not
-     * treat a terminal stopped or completed deactivation as fencing. Intervention
-     * recovery asks the same one, so every in-progress deactivation, every
-     * deactivation parked for its own intervention, and every REMOVED
-     * destination still fences.
+     * A live phase fences immediately. A terminal phase is history only when it
+     * does not fence the exact queue owner by cutoff or creation time.
      */
-    private static function deactivationFencesRecovery(?ApplicationBlueGreenDeactivation $deactivation): bool
-    {
-        return $deactivation?->phase->fencesDeploymentClaims() === true;
+    private static function deactivationFencesRecovery(
+        ?ApplicationBlueGreenDeactivation $deactivation,
+        ?ApplicationDeploymentQueue $deployment = null,
+    ): bool {
+        return $deactivation?->phase->fencesDeploymentClaims() === true
+            || ($deployment !== null && $deactivation?->fences($deployment) === true);
     }
 
     /**
@@ -97,6 +88,10 @@ final class RecoverBlueGreenIntervention
      *                                              ownership before the fence decided it from a
      *                                              snapshot, and a newer operation can take the
      *                                              destination in between.
+     * @param  int|null  $successorQueueId  The primary discriminator for the one live successor
+     *                                      allowed during failed first-adoption journal recovery.
+     * @param  string|null  $successorHorizonJobId  The exact nullable dispatch-attempt UUID
+     *                                              captured before recovery starts.
      */
     public function handle(
         ?int $stateId = null,
@@ -105,6 +100,9 @@ final class RecoverBlueGreenIntervention
         ?string $reason = null,
         bool $staleContainerJournal = false,
         ?string $requiredOperationUuid = null,
+        ?int $successorQueueId = null,
+        ?string $successorDeploymentUuid = null,
+        ?string $successorHorizonJobId = null,
     ): BlueGreenInterventionRecoveryResult {
         $this->requiredOperationUuid = $requiredOperationUuid;
         if (($stateId === null) === ($deactivationId === null)) {
@@ -113,6 +111,22 @@ final class RecoverBlueGreenIntervention
         if (($stateId !== null && $stateId < 1) || ($deactivationId !== null && $deactivationId < 1)) {
             throw new InvalidArgumentException('Blue-green intervention recovery IDs must be positive.');
         }
+        $hasSuccessorBinding = $successorQueueId !== null
+            || $successorDeploymentUuid !== null
+            || $successorHorizonJobId !== null;
+        if ($hasSuccessorBinding
+            && ($successorQueueId === null
+                || $successorQueueId < 1
+                || ! is_string($successorDeploymentUuid)
+                || $successorDeploymentUuid === '')) {
+            throw new InvalidArgumentException('Stale-journal successor recovery requires one exact positive queue ID and deployment UUID.');
+        }
+        if ($successorHorizonJobId !== null && ! Str::isUuid($successorHorizonJobId)) {
+            throw new InvalidArgumentException('The stale-journal successor dispatch-attempt UUID is malformed.');
+        }
+        if ($hasSuccessorBinding && ! $staleContainerJournal) {
+            throw new InvalidArgumentException('A stale-journal successor binding is valid only for stale container-mutation journal recovery.');
+        }
 
         $reason = $this->normalizeReason($reason, $apply);
         if ($staleContainerJournal) {
@@ -120,7 +134,14 @@ final class RecoverBlueGreenIntervention
                 throw new InvalidArgumentException('Stale container-mutation journal recovery requires exactly one deployment state ID.');
             }
 
-            return $this->recoverStaleContainerMutationJournal($stateId, $apply, $reason);
+            return $this->recoverStaleContainerMutationJournal(
+                $stateId,
+                $apply,
+                $reason,
+                $successorQueueId,
+                $successorDeploymentUuid,
+                $successorHorizonJobId,
+            );
         }
         $plan = $stateId === null
             ? $this->planForDeactivation((int) $deactivationId)
@@ -148,6 +169,7 @@ final class RecoverBlueGreenIntervention
         }
 
         return match ($plan->classification) {
+            self::STALE_IDLE_DIAGNOSTICS => $this->recoverStaleIdleInterventionDiagnostics($plan, $reason),
             BlueGreenInterventionRecoveryResult::FINALIZED_UNCONFIRMED => $this->recoverFinalized($plan, $reason),
             BlueGreenInterventionRecoveryResult::FINALIZED_UNRECONSTRUCTABLE => $this->terminalizeUnreconstructableFinalized($plan, $reason),
             BlueGreenInterventionRecoveryResult::MID_FLIGHT => $this->recoverMidFlight($plan, $reason),
@@ -188,9 +210,17 @@ final class RecoverBlueGreenIntervention
         int $stateId,
         bool $apply,
         ?string $reason,
+        ?int $successorQueueId,
+        ?string $successorDeploymentUuid,
+        ?string $successorHorizonJobId,
     ): BlueGreenInterventionRecoveryResult {
         try {
-            $context = $this->staleContainerMutationJournalContext($stateId);
+            $context = $this->staleContainerMutationJournalContext(
+                $stateId,
+                $successorQueueId,
+                $successorDeploymentUuid,
+                $successorHorizonJobId,
+            );
         } catch (BlueGreenDeploymentTransitionException) {
             return $this->staleContainerMutationJournalManualOnly($stateId, $reason, null, 'rejected');
         }
@@ -259,7 +289,12 @@ final class RecoverBlueGreenIntervention
         $lockedContext = $context;
         try {
             $operationFence->assertLockOwnership();
-            $lockedContext = $this->staleContainerMutationJournalContext($stateId);
+            $lockedContext = $this->staleContainerMutationJournalContext(
+                $stateId,
+                $successorQueueId,
+                $successorDeploymentUuid,
+                $successorHorizonJobId,
+            );
             if (! $this->sameStaleContainerMutationJournalContext($context, $lockedContext)) {
                 return $this->staleContainerMutationJournalManualOnly($stateId, $reason, $lockedContext, 'resource_changed');
             }
@@ -801,11 +836,16 @@ final class RecoverBlueGreenIntervention
             );
             $state = $locks->state;
             if ($state === null
-                || (int) $state->id !== (int) $context['state']->id
-                || self::deactivationFencesRecovery($locks->deactivation)) {
+                || (int) $state->id !== (int) $context['state']->id) {
                 throw new BlueGreenDeploymentTransitionException('The inactive-retirement owner changed after journal archival.');
             }
             $retirement = $context['inactive_retirement'];
+            if (self::deactivationFencesRecovery(
+                $locks->deactivation,
+                $retirement['owner_deployment'],
+            )) {
+                throw new BlueGreenDeploymentTransitionException('The inactive-retirement owner changed after journal archival.');
+            }
             if ($targetStatus === 'running') {
                 if ($state->inactive_retirement_stopped_at !== null
                     || $state->destination_fence_operation_id !== $retirement['expected_state']->operationId
@@ -1063,6 +1103,7 @@ final class RecoverBlueGreenIntervention
      *     server: Server,
      *     state: ApplicationBlueGreenDeployment,
      *     guard_sha256: string,
+     *     live_successor: ?ApplicationDeploymentQueue,
      *     failed_first_adoption: null|array{
      *         candidate_container: BlueGreenContainerExpectation,
      *         deployment: ApplicationDeploymentQueue,
@@ -1071,9 +1112,18 @@ final class RecoverBlueGreenIntervention
      *     }
      * }
      */
-    private function staleContainerMutationJournalContext(int $stateId): array
-    {
-        return DB::transaction(function () use ($stateId): array {
+    private function staleContainerMutationJournalContext(
+        int $stateId,
+        ?int $successorQueueId = null,
+        ?string $successorDeploymentUuid = null,
+        ?string $successorHorizonJobId = null,
+    ): array {
+        return DB::transaction(function () use (
+            $stateId,
+            $successorDeploymentUuid,
+            $successorHorizonJobId,
+            $successorQueueId,
+        ): array {
             $identity = ApplicationBlueGreenDeployment::query()->find($stateId);
             if ($identity === null) {
                 throw new BlueGreenDeploymentTransitionException('The requested blue-green deployment state no longer exists.');
@@ -1112,6 +1162,10 @@ final class RecoverBlueGreenIntervention
                 (int) $destination->id,
             );
             if ($state->inactive_retirement_owner_deployment_uuid !== null) {
+                if ($successorQueueId !== null) {
+                    throw new BlueGreenDeploymentTransitionException('Exact-successor stale-journal recovery supports only a failed first-adoption rollback.');
+                }
+
                 return $this->staleInactiveRetirementContainerMutationJournalContext(
                     $locks,
                     $destination,
@@ -1140,6 +1194,8 @@ final class RecoverBlueGreenIntervention
                 if (! $replica instanceof ApplicationBlueGreenReplica) {
                     throw new BlueGreenDeploymentTransitionException('The failed first-adoption replica row could not be locked.');
                 }
+                // The failed historical owner always predates its successor. Lock it
+                // first, then lock every live row below in ascending primary-key order.
                 $generationDeployments = ApplicationDeploymentQueue::query()
                     ->where('application_id', $state->application_id)
                     ->where('destination_id', $state->standalone_docker_id)
@@ -1154,6 +1210,9 @@ final class RecoverBlueGreenIntervention
                 $deployment = $generationDeployments->first();
                 if (! $deployment instanceof ApplicationDeploymentQueue) {
                     throw new BlueGreenDeploymentTransitionException('The failed first-adoption queue history could not be locked.');
+                }
+                if (self::deactivationFencesRecovery($locks->deactivation, $deployment)) {
+                    throw new BlueGreenDeploymentTransitionException('The requested stale-journal recovery target is fenced by its durable deactivation.');
                 }
                 $this->assertFailedFirstAdoptionHistory(
                     $application,
@@ -1197,7 +1256,7 @@ final class RecoverBlueGreenIntervention
             } else {
                 throw new BlueGreenDeploymentTransitionException('The requested stale-journal recovery state is neither pristine nor one exact failed first-adoption rollback.');
             }
-            $liveQueue = ApplicationDeploymentQueue::query()
+            $liveQueues = ApplicationDeploymentQueue::query()
                 ->where('application_id', $state->application_id)
                 ->where('destination_id', $state->standalone_docker_id)
                 ->where('pull_request_id', 0)
@@ -1207,9 +1266,30 @@ final class RecoverBlueGreenIntervention
                 ])
                 ->orderBy('id')
                 ->lockForUpdate()
-                ->first();
-            if ($liveQueue !== null) {
+                ->get();
+            $liveSuccessor = null;
+            if ($successorQueueId === null && $liveQueues->isNotEmpty()) {
                 throw new BlueGreenDeploymentTransitionException('A live application queue owner prevents stale-journal archival.');
+            }
+            if ($successorQueueId !== null) {
+                if ($failedFirstAdoption === null) {
+                    throw new BlueGreenDeploymentTransitionException('Exact-successor stale-journal recovery requires one failed first-adoption rollback.');
+                }
+                $liveSuccessor = $liveQueues->count() === 1 ? $liveQueues->first() : null;
+                if (! $liveSuccessor instanceof ApplicationDeploymentQueue
+                    || (int) $liveSuccessor->getKey() !== $successorQueueId
+                    || (int) $liveSuccessor->application_id !== (int) $state->application_id
+                    || (int) $liveSuccessor->destination_id !== (int) $state->standalone_docker_id
+                    || (int) $liveSuccessor->server_id !== (int) $server->id
+                    || $liveSuccessor->pull_request_id !== 0
+                    || $liveSuccessor->deployment_uuid !== $successorDeploymentUuid
+                    || $liveSuccessor->getRawOriginal('horizon_job_id') !== $successorHorizonJobId
+                    || ! in_array($liveSuccessor->status, [
+                        ApplicationDeploymentStatus::QUEUED->value,
+                        ApplicationDeploymentStatus::IN_PROGRESS->value,
+                    ], true)) {
+                    throw new BlueGreenDeploymentTransitionException('The live stale-journal successor no longer matches its exact queue binding.');
+                }
             }
 
             return [
@@ -1220,7 +1300,9 @@ final class RecoverBlueGreenIntervention
                 'guard_sha256' => $this->staleContainerMutationJournalGuardSha256(
                     $state,
                     $failedFirstAdoption,
+                    $liveSuccessor,
                 ),
+                'live_successor' => $liveSuccessor,
                 'server' => $server,
                 'state' => $state,
                 'managed_filename' => $managedFilename,
@@ -1279,7 +1361,7 @@ final class RecoverBlueGreenIntervention
             || $inactiveUuid === ''
             || $owner === null
             || $inactive === null
-            || self::deactivationFencesRecovery($locks->deactivation)
+            || self::deactivationFencesRecovery($locks->deactivation, $owner)
             || $state->phase !== BlueGreenDeploymentPhase::IDLE
             || $state->pending_color !== null
             || $state->pending_deployment_uuid !== null
@@ -1559,6 +1641,7 @@ final class RecoverBlueGreenIntervention
     private function staleContainerMutationJournalGuardSha256(
         ApplicationBlueGreenDeployment $state,
         ?array $failedFirstAdoption,
+        ?ApplicationDeploymentQueue $liveSuccessor,
     ): string {
         $failedHistory = null;
         if ($failedFirstAdoption !== null) {
@@ -1590,6 +1673,16 @@ final class RecoverBlueGreenIntervention
                 'legacy_container_name' => $state->legacy_container_name,
                 'supersession_generation' => $state->supersession_generation,
                 'failed_first_adoption' => $failedHistory,
+                'live_successor' => $liveSuccessor === null ? null : [
+                    'id' => (int) $liveSuccessor->getKey(),
+                    'application_id' => (int) $liveSuccessor->application_id,
+                    'destination_id' => (int) $liveSuccessor->destination_id,
+                    'server_id' => (int) $liveSuccessor->server_id,
+                    'pull_request_id' => $liveSuccessor->pull_request_id,
+                    'deployment_uuid' => $liveSuccessor->deployment_uuid,
+                    'status' => $liveSuccessor->status,
+                    'horizon_job_id' => $liveSuccessor->getRawOriginal('horizon_job_id'),
+                ],
             ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
         } catch (\JsonException $exception) {
             throw new BlueGreenDeploymentTransitionException(
@@ -1795,6 +1888,7 @@ SH;
             outcome: BlueGreenInterventionRecoveryResult::DEFERRED,
             message: 'A live lifecycle owner or a changing server boot identity prevented stale-journal archival; no journal was changed.',
             stateId: $stateId,
+            recoveryOwnerActive: $phase === 'live_lifecycle_owner',
         );
     }
 
@@ -1996,12 +2090,22 @@ SH;
 
         try {
             $operationFence->assertLockOwnership();
-            $absentRoutePredecessor = $this->persistedAbsentRoutePredecessor($context['state']);
-            $liveState = ReadBlueGreenManagedRouteMetadata::run(
+            $sourcePhase = $plan->deploymentPhase
+                ?? throw new BlueGreenDeploymentTransitionException('The mid-flight intervention has no recoverable source phase.');
+            $stateForInspection = $this->midFlightInterventionForInspection($stateId, $sourcePhase);
+            $operationFence->assertLockOwnership();
+            $absentRoutePredecessor = $this->persistedAbsentRoutePredecessor($stateForInspection);
+            $operationUuid = $stateForInspection->operation_deployment_uuid;
+            if (! is_string($operationUuid)) {
+                throw new BlueGreenDeploymentTransitionException('The mid-flight intervention has no exact durable operation owner.');
+            }
+            $routeInspection = ReadBlueGreenManagedRouteMetadataForOperation::run(
                 $context['server'],
                 $context['application'],
                 $context['destination'],
+                $operationUuid,
             );
+            $liveState = $routeInspection->state;
             if ($liveState === null && $absentRoutePredecessor !== null) {
                 $liveState = AttestBlueGreenDestinationState::run(
                     $context['server'],
@@ -2012,7 +2116,7 @@ SH;
                 );
             }
             $operationFence->assertLockOwnership();
-            if (! $this->liveRouteCanBeReconciled($context['state'], $liveState)) {
+            if (! $this->liveRouteCanBeReconciled($stateForInspection, $liveState)) {
                 $this->audit('blue_green.intervention.midflight_manual_only', $plan, $reason, [
                     'active_color' => $liveState?->activeColor?->value,
                 ]);
@@ -2026,8 +2130,9 @@ SH;
                 );
             }
 
-            $this->reopenMidFlightState($stateId, $plan->deploymentPhase
-                ?? throw new BlueGreenDeploymentTransitionException('The mid-flight intervention has no recoverable source phase.'));
+            $this->reopenMidFlightState($stateId, $sourcePhase);
+            $operationFence->assertLockOwnership();
+            $this->recordExactOperationOwnedLiveSuccessor($stateId, $liveState, $operationFence);
             $operationFence->assertLockOwnership();
             $reconciliation = ReconcileBlueGreenDeployment::run(
                 ApplicationBlueGreenDeployment::query()->findOrFail($stateId),
@@ -2053,6 +2158,46 @@ SH;
         } finally {
             $this->releaseStateFence($operationFence);
         }
+    }
+
+    private function midFlightInterventionForInspection(
+        int $stateId,
+        BlueGreenDeploymentPhase $sourcePhase,
+    ): ApplicationBlueGreenDeployment {
+        return DB::transaction(function () use ($sourcePhase, $stateId): ApplicationBlueGreenDeployment {
+            $identity = ApplicationBlueGreenDeployment::query()->findOrFail($stateId);
+            $locks = BlueGreenLifecycleDatabaseLocks::forDestination(
+                $identity->application_id,
+                $identity->standalone_docker_id,
+            );
+
+            return $this->lockedMidFlightRecoveryOwner($locks, $stateId, $sourcePhase)['state'];
+        }, attempts: 5);
+    }
+
+    private function recordExactOperationOwnedLiveSuccessor(
+        int $stateId,
+        BlueGreenProxyState $liveState,
+        BlueGreenOperationFence $operationFence,
+    ): void {
+        $operation = ReconstructBlueGreenDeploymentRecovery::run(
+            ApplicationBlueGreenDeployment::query()->findOrFail($stateId),
+        );
+        $currentState = $operation->currentDestinationState;
+        if ($currentState === null
+            || hash_equals($currentState->serialize(), $liveState->serialize())
+            || ! $liveState->isMutationSuccessorOf($currentState, $operation->claim->deploymentUuid)
+            || (! $liveState->hasSameRouteIdentity($currentState)
+                && ! $liveState->hasSameAbsentRouteScope($currentState))) {
+            return;
+        }
+
+        $operationFence->assertLockOwnership();
+        RecordBlueGreenDestinationState::run(
+            $operation->claim,
+            $currentState,
+            $liveState,
+        );
     }
 
     private function recoverDeactivation(
@@ -2297,6 +2442,24 @@ SH;
                     false,
                 );
             }
+            if ($state->phase === BlueGreenDeploymentPhase::IDLE
+                && ($state->intervention_phase !== null || $state->intervention_reason !== null)) {
+                if (! $this->hasExactStaleIdleInterventionDiagnostics($locks, $state)) {
+                    return new BlueGreenInterventionRecoveryPlan(
+                        BlueGreenInterventionRecoveryResult::LEGACY_MANUAL_ONLY,
+                        'The IDLE destination retains intervention diagnostics beside ambiguous lifecycle provenance.',
+                        true,
+                        stateId: $state->id,
+                    );
+                }
+
+                return new BlueGreenInterventionRecoveryPlan(
+                    self::STALE_IDLE_DIAGNOSTICS,
+                    'The IDLE destination is otherwise exactly claimable and retains only stale intervention diagnostics.',
+                    true,
+                    stateId: $state->id,
+                );
+            }
             if ($state->phase !== BlueGreenDeploymentPhase::INTERVENTION_REQUIRED) {
                 return new BlueGreenInterventionRecoveryPlan(
                     BlueGreenInterventionRecoveryResult::LEGACY_MANUAL_ONLY,
@@ -2359,6 +2522,151 @@ SH;
                 stateId: $state->id,
             );
         }, attempts: 5);
+    }
+
+    private function recoverStaleIdleInterventionDiagnostics(
+        BlueGreenInterventionRecoveryPlan $plan,
+        string $reason,
+    ): BlueGreenInterventionRecoveryResult {
+        $state = ApplicationBlueGreenDeployment::query()->find($plan->stateId);
+        if ($state === null) {
+            return $this->deferredForMissingState($plan);
+        }
+        $operationFence = $this->acquireStateFence($state);
+        if ($operationFence === null) {
+            return $this->deferredForLiveLifecycleOwner($plan, $reason);
+        }
+
+        try {
+            $cleared = DB::transaction(function () use ($operationFence, $plan): bool {
+                $operationFence->assertLockOwnership();
+                $identity = ApplicationBlueGreenDeployment::query()->find($plan->stateId);
+                if ($identity === null) {
+                    return false;
+                }
+                $locks = BlueGreenLifecycleDatabaseLocks::forDestination(
+                    $identity->application_id,
+                    $identity->standalone_docker_id,
+                );
+                $state = $locks->state;
+                if ($state === null || $state->id !== $plan->stateId) {
+                    throw new BlueGreenDeploymentTransitionException('The stale IDLE intervention diagnostic owner changed before cleanup.');
+                }
+                if ($state->intervention_phase === null && $state->intervention_reason === null) {
+                    if (! $this->isOtherwiseCleanIdleState($locks, $state)) {
+                        throw new BlueGreenDeploymentTransitionException('The IDLE destination changed before stale intervention diagnostics could be cleaned.');
+                    }
+
+                    return false;
+                }
+                if (! $this->hasExactStaleIdleInterventionDiagnostics($locks, $state)) {
+                    throw new BlueGreenDeploymentTransitionException('The IDLE destination retains ambiguous intervention or lifecycle provenance.');
+                }
+
+                $query = ApplicationBlueGreenDeployment::query()
+                    ->whereKey($state->id)
+                    ->where('application_id', $state->application_id)
+                    ->where('standalone_docker_id', $state->standalone_docker_id)
+                    ->where('phase', BlueGreenDeploymentPhase::IDLE->value)
+                    ->where('intervention_phase', $state->intervention_phase)
+                    ->where('intervention_reason', $state->intervention_reason)
+                    ->whereNull('pending_color')
+                    ->whereNull('pending_deployment_uuid')
+                    ->whereNull('deactivation_operation_id')
+                    ->whereNull('deactivation_started_at');
+                foreach (ApplicationBlueGreenDeployment::clearedOperationAttributes() as $attribute => $_) {
+                    $query->whereNull($attribute);
+                }
+                foreach (ApplicationBlueGreenDeployment::clearedInactiveRetirementAttributes() as $attribute => $_) {
+                    $expected = $state->getRawOriginal($attribute);
+                    $expected === null
+                        ? $query->whereNull($attribute)
+                        : $query->where($attribute, $expected);
+                }
+                $updated = $query->update([
+                    'intervention_phase' => null,
+                    'intervention_reason' => null,
+                ]);
+                if ($updated !== 1) {
+                    throw new BlueGreenDeploymentTransitionException('The IDLE destination changed while stale intervention diagnostics were being cleaned.');
+                }
+
+                return true;
+            }, attempts: 5);
+
+            $this->audit(
+                $cleared
+                    ? 'blue_green.intervention.stale_idle_diagnostics_cleared'
+                    : 'blue_green.intervention.stale_idle_diagnostics_already_cleared',
+                $plan,
+                $reason,
+            );
+
+            return new BlueGreenInterventionRecoveryResult(
+                classification: self::STALE_IDLE_DIAGNOSTICS,
+                outcome: $cleared
+                    ? BlueGreenInterventionRecoveryResult::RECOVERED
+                    : BlueGreenInterventionRecoveryResult::SKIPPED,
+                message: $cleared
+                    ? 'The otherwise clean IDLE destination had only its stale intervention diagnostics cleared; no route or container was mutated.'
+                    : 'The otherwise clean IDLE destination no longer retains stale intervention diagnostics.',
+                stateId: $plan->stateId,
+            );
+        } finally {
+            $this->releaseStateFence($operationFence);
+        }
+    }
+
+    private function hasExactStaleIdleInterventionDiagnostics(
+        BlueGreenLifecycleDatabaseLocks $locks,
+        ApplicationBlueGreenDeployment $state,
+    ): bool {
+        if (! $this->isOtherwiseCleanIdleState($locks, $state)
+            || ! is_string($state->intervention_phase)
+            || ! is_string($state->intervention_reason)
+            || trim($state->intervention_reason) === '') {
+            return false;
+        }
+        $sourcePhase = BlueGreenDeploymentPhase::tryFrom($state->intervention_phase);
+
+        return in_array($sourcePhase, [
+            BlueGreenDeploymentPhase::PREPARING,
+            BlueGreenDeploymentPhase::SWITCHING,
+            BlueGreenDeploymentPhase::DRAINING,
+            BlueGreenDeploymentPhase::ROLLING_BACK,
+            BlueGreenDeploymentPhase::DEACTIVATING,
+        ], true);
+    }
+
+    private function isOtherwiseCleanIdleState(
+        BlueGreenLifecycleDatabaseLocks $locks,
+        ApplicationBlueGreenDeployment $state,
+    ): bool {
+        if ($locks->application->trashed()
+            || $state->phase !== BlueGreenDeploymentPhase::IDLE
+            || ! ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state)
+            || self::deactivationFencesRecovery($locks->deactivation)) {
+            return false;
+        }
+        if ($locks->deactivation !== null) {
+            try {
+                $locks->deactivation->assertValid();
+            } catch (\LogicException) {
+                return false;
+            }
+        }
+        $inactiveRetirementIsCleared = true;
+        foreach (ApplicationBlueGreenDeployment::clearedInactiveRetirementAttributes() as $attribute => $expected) {
+            if ($state->getAttribute($attribute) !== $expected) {
+                $inactiveRetirementIsCleared = false;
+                break;
+            }
+        }
+
+        return $inactiveRetirementIsCleared
+            || ($state->inactive_retirement_stopped_at !== null
+                && $state->inactive_retirement_intervention_required_at === null
+                && $state->inactive_retirement_dispatch_reserved_until_at === null);
     }
 
     private function planForDeactivation(int $deactivationId): BlueGreenInterventionRecoveryPlan
@@ -2436,18 +2744,20 @@ SH;
             $state = $locks->state;
             if ($state === null
                 || $state->id !== $stateId
-                || $locks->application->trashed()
-                || self::deactivationFencesRecovery($locks->deactivation)) {
+                || $locks->application->trashed()) {
                 throw new BlueGreenDeploymentTransitionException('The finalized intervention owner changed before recovery could begin.');
             }
             $operationUuid = $state->operation_deployment_uuid;
+            $deployment = is_string($operationUuid) ? $locks->queue($operationUuid) : null;
+            if (self::deactivationFencesRecovery($locks->deactivation, $deployment)) {
+                throw new BlueGreenDeploymentTransitionException('The finalized intervention owner changed before recovery could begin.');
+            }
             // The caller's pre-fence decision is re-proven here, inside the row
             // locks, so a request naming an operation that has since been
             // superseded cannot reopen whatever took the destination instead.
             if ($this->requiredOperationUuid !== null && $this->requiredOperationUuid !== $operationUuid) {
                 throw new BlueGreenDeploymentTransitionException('The requested finalized operation no longer owns this destination; a newer operation took it before the fence was held.');
             }
-            $deployment = is_string($operationUuid) ? $locks->queue($operationUuid) : null;
             $this->assertFinalizedIntervention($state, $deployment);
 
             if (ApplicationBlueGreenDeployment::query()
@@ -2506,18 +2816,20 @@ SH;
             $state = $locks->state;
             if ($state === null
                 || $state->id !== $stateId
-                || $locks->application->trashed()
-                || self::deactivationFencesRecovery($locks->deactivation)) {
+                || $locks->application->trashed()) {
                 throw new BlueGreenDeploymentTransitionException('The unreconstructable finalized intervention owner changed before terminalization could begin.');
             }
             $operationUuid = $state->operation_deployment_uuid;
+            $deployment = is_string($operationUuid) ? $locks->queue($operationUuid) : null;
+            if (self::deactivationFencesRecovery($locks->deactivation, $deployment)) {
+                throw new BlueGreenDeploymentTransitionException('The unreconstructable finalized intervention owner changed before terminalization could begin.');
+            }
             // The caller's pre-fence decision is re-proven here, inside the row
             // locks, so a request naming an operation that has since been
             // superseded cannot terminalize whatever took the destination instead.
             if ($this->requiredOperationUuid !== null && $this->requiredOperationUuid !== $operationUuid) {
                 throw new BlueGreenDeploymentTransitionException('The requested unreconstructable operation no longer owns this destination; a newer operation took it before the fence was held.');
             }
-            $deployment = is_string($operationUuid) ? $locks->queue($operationUuid) : null;
             $this->assertUnreconstructableFinalizedIntervention($state, $deployment);
 
             if (ApplicationBlueGreenDeployment::query()
@@ -2561,22 +2873,10 @@ SH;
                 $identity->application_id,
                 $identity->standalone_docker_id,
             );
-            $state = $locks->state;
-            if ($state === null
-                || $state->id !== $stateId
-                || $locks->application->trashed()
-                || self::deactivationFencesRecovery($locks->deactivation)) {
-                throw new BlueGreenDeploymentTransitionException('The mid-flight intervention owner changed before recovery could begin.');
-            }
-            $operationUuid = $state->operation_deployment_uuid;
-            // The caller's pre-fence decision is re-proven here, inside the row
-            // locks, so a request naming an operation that has since been
-            // superseded cannot reopen whatever took the destination instead.
-            if ($this->requiredOperationUuid !== null && $this->requiredOperationUuid !== $operationUuid) {
-                throw new BlueGreenDeploymentTransitionException('The requested mid-flight operation no longer owns this destination; a newer operation took it before the fence was held.');
-            }
-            $deployment = is_string($operationUuid) ? $locks->queue($operationUuid) : null;
-            $this->assertMidFlightIntervention($state, $deployment, $sourcePhase);
+            $owner = $this->lockedMidFlightRecoveryOwner($locks, $stateId, $sourcePhase);
+            $state = $owner['state'];
+            $deployment = $owner['deployment'];
+            $operationUuid = $owner['operation_uuid'];
 
             if (ApplicationBlueGreenDeployment::query()
                 ->whereKey($state->id)
@@ -2617,6 +2917,40 @@ SH;
                 throw new BlueGreenDeploymentTransitionException('The mid-flight intervention no longer reconstructs its exact pending generation.');
             }
         }, attempts: 5);
+    }
+
+    /**
+     * @return array{state: ApplicationBlueGreenDeployment, deployment: ApplicationDeploymentQueue, operation_uuid: string}
+     */
+    private function lockedMidFlightRecoveryOwner(
+        BlueGreenLifecycleDatabaseLocks $locks,
+        int $stateId,
+        BlueGreenDeploymentPhase $sourcePhase,
+    ): array {
+        $state = $locks->state;
+        if ($state === null
+            || $state->id !== $stateId
+            || $locks->application->trashed()) {
+            throw new BlueGreenDeploymentTransitionException('The mid-flight intervention owner changed before recovery could begin.');
+        }
+        $operationUuid = $state->operation_deployment_uuid;
+        $deployment = is_string($operationUuid) ? $locks->queue($operationUuid) : null;
+        if (self::deactivationFencesRecovery($locks->deactivation, $deployment)) {
+            throw new BlueGreenDeploymentTransitionException('The mid-flight intervention owner changed before recovery could begin.');
+        }
+        // A caller-bound operation must be proven before the operation-aware
+        // route reader may archive its journal, then proven again before the
+        // durable owner is reopened. Both proofs use this canonical predicate.
+        if ($this->requiredOperationUuid !== null && $this->requiredOperationUuid !== $operationUuid) {
+            throw new BlueGreenDeploymentTransitionException('The requested mid-flight operation no longer owns this destination; a newer operation took it before the fence was held.');
+        }
+        $this->assertMidFlightIntervention($state, $deployment, $sourcePhase);
+
+        return [
+            'state' => $state,
+            'deployment' => $deployment,
+            'operation_uuid' => $operationUuid,
+        ];
     }
 
     /**

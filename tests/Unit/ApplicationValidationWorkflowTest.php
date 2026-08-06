@@ -336,10 +336,13 @@ function applicationValidationWorkflowViolations(array $workflow): array
         $violations[] = 'blue-green lifecycle validation must run Pest with its bounded explicit memory contract';
     }
     foreach ([
+        'tests/Feature/Api/DeploymentCancellationApiTest.php',
         'tests/Feature/ApplicationDeploymentBlueGreenDestinationFenceTest.php',
         'tests/Feature/BlueGreenApplicationDeactivationTest.php',
         'tests/Feature/BlueGreenApplicationManualStopTest.php',
+        'tests/Feature/BlueGreenAutomaticRecoveryAcceptanceTest.php',
         'tests/Feature/BlueGreenCancellationCompensationTest.php',
+        'tests/Feature/BlueGreenCleanIdleContainerJournalRecoveryTest.php',
         'tests/Feature/BlueGreenContinuousAvailabilityAcceptanceTest.php',
         'tests/Feature/BlueGreenConvergenceTest.php',
         'tests/Feature/BlueGreenCrashBoundaryAcceptanceTest.php',
@@ -350,7 +353,9 @@ function applicationValidationWorkflowViolations(array $workflow): array
         'tests/Feature/BlueGreenLifecyclePublicRecoveryTest.php',
         'tests/Feature/BlueGreenMigrationReplayTest.php',
         'tests/Feature/BlueGreenMultiPortPromotionAcceptanceTest.php',
+        'tests/Feature/BlueGreenOperationAwareManagedRouteReadTest.php',
         'tests/Feature/BlueGreenReplicaLifecycleTest.php',
+        'tests/Feature/BlueGreenSteadyStateRepairFenceTest.php',
         'tests/Feature/BlueGreenStoppedLegacyContainerCleanupTest.php',
         'tests/Feature/DatabaseMigrationReadinessTest.php',
         'tests/Feature/BlueGreenSupersessionGenerationTest.php',
