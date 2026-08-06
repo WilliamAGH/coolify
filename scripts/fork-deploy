@@ -2985,7 +2985,15 @@ fd_deploy_new() {
     fd_stage_remote "$staging"
     migration_before=$(fd_migration_fingerprint "$staging/.env")
     fd_start_candidate "$staging" "$migration_before" true
-    note "Verified and recorded $VERSION. Roll back with: $PROGRAM rollback --version $VERSION"
+    # rollback --version names the release to deploy TO, so echoing $VERSION
+    # here told the operator to "roll back" to the release just installed --
+    # a no-op run at the exact moment a rollback is wanted. Name the release
+    # that was replaced, and say nothing when there is none to return to.
+    if [[ -n $PREVIOUS_CURRENT_VERSION && $PREVIOUS_CURRENT_VERSION != "$VERSION" ]]; then
+        note "Verified and recorded $VERSION. Roll back with: $PROGRAM rollback --version $PREVIOUS_CURRENT_VERSION"
+    else
+        note "Verified and recorded $VERSION."
+    fi
 }
 
 fd_deploy_recorded() {

@@ -424,13 +424,12 @@ final class ReconcileBlueGreenDeployment
         $claim = $operation->claim;
         $phase = $operation->recoveredPhase;
         $replicaCandidate = ! $this->claimReplicaSet($operation)->usesScalarCompatibilityPath();
-        $availableCandidateReplicas = $replicaCandidate
-            ? $this->availableCandidateReplicaInspections($operation)
-            : [];
         // Every returned inspection is an extant, exact durable slot. Replica
         // cleanup is status-agnostic and proves immutable removal remotely, just
         // like the scalar path; only slots absent from discovery are satisfied.
-        $candidateReplicas = $availableCandidateReplicas;
+        $candidateReplicas = $replicaCandidate
+            ? $this->availableCandidateReplicaInspections($operation)
+            : [];
         $candidateInspection = $replicaCandidate
             ? null
             : InspectBlueGreenContainer::run($operation->server, $operation->candidateContainer);
