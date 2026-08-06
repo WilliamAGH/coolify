@@ -2,7 +2,7 @@
 
 return [
     'coolify' => [
-        'version' => '4.13.72-fork',
+        'version' => '4.13.73-fork',
         'helper_version' => '1.0.14',
         'railpack_version' => '0.23.0',
         'self_hosted' => env('SELF_HOSTED', true),
