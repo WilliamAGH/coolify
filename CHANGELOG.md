@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [unreleased]
+
+### 🐛 Bug Fixes
+
+- *(blue-green)* Read a destination's deactivation through its phase, never its existence
+- *(blue-green)* Self-heal stale deployment state
+
+### 📚 Documentation
+
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.74-fork
+
 ## [4.13.73-fork] - 2026-08-06
 
 ### 🐛 Bug Fixes
