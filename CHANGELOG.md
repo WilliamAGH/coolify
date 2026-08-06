@@ -2,7 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
-## [unreleased]
+## [4.13.72-fork] - 2026-08-06
+
+### 🐛 Bug Fixes
+
+- *(blue-green)* Quarantine a spent first-adoption drain journal, and stop the attestor leaking scratch
+
+### 📚 Documentation
+
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.72-fork
+
+## [4.13.71-fork] - 2026-08-06
 
 ### 🐛 Bug Fixes
 
