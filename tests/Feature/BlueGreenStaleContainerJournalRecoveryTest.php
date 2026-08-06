@@ -673,7 +673,14 @@ it('reports an unknown outcome when the lifecycle fence is lost after an archive
 
 it('fails closed when the idle state retains blue-green provenance', function (): void {
     $scenario = pristineStaleContainerMutationJournalScenario();
-    $scenario->state->update(['operation_deployment_uuid' => 'unexpected-live-operation']);
+    // An operation owner only ever exists at a claimed generation:
+    // app_blue_green_deployments_generation_owner_check forbids owner
+    // provenance at generation 0, so pinning the owner alone would assert
+    // against a state the schema cannot hold.
+    $scenario->state->update([
+        'operation_deployment_uuid' => 'unexpected-live-operation',
+        'supersession_generation' => 1,
+    ]);
     Process::fake();
 
     $result = RecoverBlueGreenIntervention::run(
