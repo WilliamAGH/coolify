@@ -2,15 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
-## [unreleased]
+## [4.13.66-fork] - 2026-08-06
+
+### 🐛 Bug Fixes
+
+- *(fork)* Stop phoning upstream's CDN for the service catalog
+- *(blue-green)* Stop vouching for a lock holder that owns a newer operation
+- *(blue-green)* Give an unreconstructable finalized drain a proof-based exit
+- *(blue-green)* Drain a queued successor stranded on an ownerless lane
+- *(services)* Stop trying to create bind sources that already exist as devices
 
 ### 📚 Documentation
 
+- Update changelog
 - Update changelog
 
 ### 🧪 Testing
 
 - *(control-plane)* Stop asserting two independent timestamps are the same second
+
+### ⚙️ Miscellaneous Tasks
+
+- *(blue-green)* Run three uncovered recovery tests in the lifecycle lane
+- *(validation)* Stop running ProductionSeederTest twice in the php job
+- *(release)* Prepare 4.13.66-fork
 
 ## [4.13.65-fork] - 2026-08-05
 
