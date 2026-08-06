@@ -35,7 +35,7 @@ return [
     ],
 
     'services' => [
-        'official' => 'https://cdn.coollabs.io/coolify/service-templates-latest.json',
+        'official' => env('SERVICE_TEMPLATES_URL', 'https://cdn.coollabs.io/coolify/service-templates-latest.json'),
         'file_name' => 'service-templates-latest.json',
     ],
 

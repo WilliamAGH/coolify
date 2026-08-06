@@ -2,6 +2,7 @@
 
 namespace App\Jobs;
 
+use App\Actions\Server\UpdateCoolify;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeEncrypted;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -26,6 +27,17 @@ class PullTemplatesFromCDN implements ShouldBeEncrypted, ShouldQueue
     {
         try {
             if (isDev()) {
+                return;
+            }
+            // A fork ships its own templates/service-templates-latest.json and is
+            // the only authority over its own service catalog. Without this, the
+            // hourly pull overwrote that shipped file with upstream's copy, so a
+            // self-hosted fork still took a third party's ~1MB of JSON every hour
+            // and served it as its own. The other upstream fetches — version
+            // discovery, changelog, helper image, sentinel version — already fail
+            // closed on a fork release the same way; this one was reached through
+            // constants.services rather than constants.coolify and was missed.
+            if (UpdateCoolify::isGuardedForkRelease(config('constants.coolify.version'))) {
                 return;
             }
             $response = Http::retry(3, 1000)->get(config('constants.services.official'));
