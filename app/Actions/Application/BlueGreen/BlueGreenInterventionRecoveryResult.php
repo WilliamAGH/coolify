@@ -6,6 +6,8 @@ final readonly class BlueGreenInterventionRecoveryResult
 {
     public const FINALIZED_UNCONFIRMED = 'finalized_unconfirmed';
 
+    public const FINALIZED_UNRECONSTRUCTABLE = 'finalized_unreconstructable';
+
     public const MID_FLIGHT = 'mid_flight';
 
     public const LEGACY_MANUAL_ONLY = 'legacy_manual_only';

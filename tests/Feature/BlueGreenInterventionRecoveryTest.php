@@ -4,6 +4,7 @@ use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentTransitionException;
 use App\Actions\Application\BlueGreen\BlueGreenInterventionRecoveryResult;
 use App\Actions\Application\BlueGreen\BlueGreenLifecycleDatabaseLocks;
+use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\MarkBlueGreenRecoveryInterventionRequired;
 use App\Actions\Application\BlueGreen\ReadBlueGreenManagedRouteMetadata;
 use App\Actions\Application\BlueGreen\RecoverBlueGreenIntervention;
@@ -884,19 +885,52 @@ it('only accepts live managed metadata whose sidecar matches its managed route c
         ->and($read?->activeDeploymentUuid)->toBe(BlueGreenRecoveryScenario::OPERATION_UUID);
 });
 
-it('refuses to reopen a finalized drain a fenced resume already proved unreconstructable', function (): void {
-    Queue::fake();
+/**
+ * @return array{scenario: BlueGreenRecoveryScenario, liveState: BlueGreenProxyState}
+ */
+function unreconstructableFinalizedDrainScenario(): array
+{
     $scenario = BlueGreenRecoveryScenario::create(finalized: true, routingMutationRecorded: true);
     $scenario->state->update([
         'phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
         'intervention_phase' => BlueGreenDeploymentPhase::DRAINING->value,
         'intervention_reason' => RecoverBlueGreenIntervention::UNRECONSTRUCTABLE_DRAIN_REASON,
+        // The broken reconstruction provenance that parked this drain in the
+        // first place; terminalization must never need it back.
+        'operation_candidate_container_name' => null,
     ]);
     $scenario->deployment->update([
         'status' => ApplicationDeploymentStatus::FAILED->value,
         'blue_green_phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
         'finished_at' => now(),
     ]);
+    $liveState = new BlueGreenProxyState(
+        managedFilename: BlueGreenRoutingTarget::managedFilename(
+            (string) $scenario->application->uuid,
+            $scenario->destination->id,
+        ),
+        applicationUuid: (string) $scenario->application->uuid,
+        destinationId: $scenario->destination->id,
+        operationId: BlueGreenRecoveryScenario::OPERATION_UUID,
+        mutationSequence: 1,
+        destinationFenceEpoch: 1,
+        routingRevision: 1,
+        managedSha256: $scenario->state->fresh()->managed_file_sha256,
+        activeColor: BlueGreenDeploymentColor::BLUE,
+        activeDeploymentUuid: BlueGreenRecoveryScenario::OPERATION_UUID,
+        activeContainerName: $scenario->application->uuid.'-blue',
+        activeContainerId: BlueGreenRecoveryScenario::CANDIDATE_ID,
+        applicationRoutingConfigDigest: $scenario->state->application_routing_config_digest,
+        destinationTopologyDigest: $scenario->state->destination_topology_digest,
+    );
+
+    return compact('scenario', 'liveState');
+}
+
+it('terminalizes an unreconstructable finalized drain the live route proves exactly', function (): void {
+    Queue::fake();
+    ['scenario' => $scenario, 'liveState' => $liveState] = unreconstructableFinalizedDrainScenario();
+    fakeBlueGreenManagedRouteMetadata($liveState);
 
     $result = RecoverBlueGreenIntervention::run(
         stateId: $scenario->state->id,
@@ -905,12 +939,164 @@ it('refuses to reopen a finalized drain a fenced resume already proved unreconst
     );
 
     // Reopening would queue the same resume, which would fail the same way and
-    // park it again. Left unbroken that cycle fences the destination for as long
-    // as anything keeps pushing, because every arriving push restarts it.
+    // park the drain again — so the exact live incumbent route is attested
+    // instead, the obsolete drain owner is terminalized, and the destination
+    // returns to claimable IDLE without any container being touched.
+    $state = $scenario->state->fresh();
+    $queue = $scenario->deployment->fresh();
+    expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::FINALIZED_UNRECONSTRUCTABLE)
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::RECOVERED)
+        ->and($result->recoveryOwnerActive)->toBeFalse()
+        ->and($state->phase)->toBe(BlueGreenDeploymentPhase::IDLE)
+        ->and($state->intervention_phase)->toBeNull()
+        ->and($state->intervention_reason)->toBeNull()
+        ->and($state->operation_deployment_uuid)->toBeNull()
+        ->and($state->active_color)->toBe(BlueGreenDeploymentColor::BLUE)
+        ->and($state->blue_deployment_uuid)->toBe(BlueGreenRecoveryScenario::OPERATION_UUID)
+        ->and(ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state))->toBeTrue()
+        ->and($queue->status)->toBe(ApplicationDeploymentStatus::FAILED->value)
+        ->and($queue->blue_green_phase)->toBe(BlueGreenDeploymentPhase::IDLE);
+    Queue::assertNotPushed(ResumeBlueGreenDrainingDeploymentJob::class);
+});
+
+it('refuses to terminalize an unreconstructable drain when the live route does not prove it', function (): void {
+    Queue::fake();
+    ['scenario' => $scenario, 'liveState' => $liveState] = unreconstructableFinalizedDrainScenario();
+    fakeBlueGreenManagedRouteMetadata(new BlueGreenProxyState(
+        managedFilename: $liveState->managedFilename,
+        applicationUuid: $liveState->applicationUuid,
+        destinationId: $liveState->destinationId,
+        operationId: $liveState->operationId,
+        mutationSequence: $liveState->mutationSequence,
+        destinationFenceEpoch: $liveState->destinationFenceEpoch,
+        routingRevision: $liveState->routingRevision,
+        managedSha256: $liveState->managedSha256,
+        activeColor: $liveState->activeColor,
+        activeDeploymentUuid: 'a-foreign-deployment-serving-traffic',
+        activeContainerName: $liveState->activeContainerName,
+        activeContainerId: $liveState->activeContainerId,
+        applicationRoutingConfigDigest: $liveState->applicationRoutingConfigDigest,
+        destinationTopologyDigest: $liveState->destinationTopologyDigest,
+    ));
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        apply: true,
+        reason: 'Automatic retry against a live route this generation does not own.',
+    );
+
+    // A route the finalized generation cannot prove is exactly the case that
+    // must stay fenced: terminalizing here would publish IDLE over a
+    // destination whose incumbent is unknown.
+    expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::FINALIZED_UNRECONSTRUCTABLE)
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY)
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
+        ->and($scenario->state->fresh()->intervention_reason)->toBe(RecoverBlueGreenIntervention::UNRECONSTRUCTABLE_DRAIN_REASON)
+        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value);
+    Queue::assertNotPushed(ResumeBlueGreenDrainingDeploymentJob::class);
+});
+
+it('defers unreconstructable terminalization when the live route cannot be read', function (): void {
+    Queue::fake();
+    ['scenario' => $scenario] = unreconstructableFinalizedDrainScenario();
+    Process::fake(['*' => Process::result(output: 'not-a-managed-route-response')]);
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        apply: true,
+        reason: 'Automatic retry while the destination host blinked.',
+    );
+
+    // An unreadable route proves nothing in either direction — the host may
+    // have blinked — so nothing is terminalized and nothing goes manual-only.
+    expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::FINALIZED_UNRECONSTRUCTABLE)
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::DEFERRED)
+        ->and($result->recoveryOwnerActive)->toBeFalse()
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
+        ->and($scenario->state->fresh()->intervention_reason)->toBe(RecoverBlueGreenIntervention::UNRECONSTRUCTABLE_DRAIN_REASON);
+    Queue::assertNotPushed(ResumeBlueGreenDrainingDeploymentJob::class);
+});
+
+it('re-proves the requested operation before terminalizing an unreconstructable drain', function (): void {
+    Queue::fake();
+    ['scenario' => $scenario, 'liveState' => $liveState] = unreconstructableFinalizedDrainScenario();
+    fakeBlueGreenManagedRouteMetadata($liveState);
+    $stateBefore = $scenario->state->fresh()->getAttributes();
+
+    expect(fn () => RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        apply: true,
+        reason: 'break-glass request naming an operation that lost the destination',
+        requiredOperationUuid: 'a-superseded-break-glass-request',
+    ))->toThrow(BlueGreenDeploymentTransitionException::class);
+
+    expect($scenario->state->fresh()->getAttributes())->toBe($stateBefore)
+        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value);
+    Queue::assertNotPushed(ResumeBlueGreenDrainingDeploymentJob::class);
+});
+
+it('reports a proven terminalized drain clean and claimable through break-glass', function (): void {
+    Queue::fake();
+    ['scenario' => $scenario, 'liveState' => $liveState] = unreconstructableFinalizedDrainScenario();
+    fakeBlueGreenManagedRouteMetadata($liveState);
+
+    $result = EmergencyRecoverApplicationDeployment::run(
+        $scenario->deployment->fresh(),
+        'operator called break-glass on an unreconstructable drain',
+    );
+
+    expect($result['outcome'])->toBe(EmergencyRecoverApplicationDeployment::CLEAN)
+        ->and($result['claimable'])->toBeTrue()
+        ->and($result['recovery_owner_active'])->toBeFalse()
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::IDLE);
+});
+
+it('re-proves the requested operation before reopening a mid-flight intervention', function (): void {
+    Queue::fake();
+    ['currentState' => $currentState, 'scenario' => $scenario] = fixedColorMidFlightInterventionScenario();
+    fakeBlueGreenManagedRouteMetadata($currentState);
+    $stateBefore = $scenario->state->fresh()->getAttributes();
+
+    expect(fn () => RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        apply: true,
+        reason: 'break-glass request naming an operation that lost the destination',
+        requiredOperationUuid: 'a-superseded-break-glass-request',
+    ))->toThrow(BlueGreenDeploymentTransitionException::class);
+
+    // The finalized reopen path already re-proved the requested UUID inside its
+    // row locks; the mid-flight reopen must hold the same fence, or a stale
+    // break-glass request reopens whatever successor now owns the destination.
+    expect($scenario->state->fresh()->getAttributes())->toBe($stateBefore)
+        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value);
+});
+
+it('does not vouch for a live lock holder when the requested operation already lost the destination', function (): void {
+    Queue::fake();
+    ['scenario' => $scenario] = unreconstructableFinalizedDrainScenario();
+    $lock = Cache::lock(
+        BlueGreenDeploymentLock::key($scenario->application->id, $scenario->destination->id),
+        BlueGreenDeploymentLock::RENEWABLE_LEASE_SECONDS,
+    );
+    expect($lock->get())->toBeTrue();
+
+    try {
+        $result = RecoverBlueGreenIntervention::run(
+            stateId: $scenario->state->id,
+            apply: true,
+            reason: 'break-glass raced the successor that took this destination',
+            requiredOperationUuid: 'a-superseded-break-glass-request',
+        );
+    } finally {
+        $lock->release();
+    }
+
+    // The lock holder is driving the newer operation, not the requested one, so
+    // reporting it as the requested row's active owner would preserve a
+    // stranded queue entry forever on that owner's behalf.
     expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::SKIPPED)
         ->and($result->recoveryOwnerActive)->toBeFalse()
         ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED);
-    Queue::assertNotPushed(ResumeBlueGreenDrainingDeploymentJob::class);
 });
 
 it('parks an unreconstructable draining owner instead of leaving it for an endless redispatch', function (): void {
