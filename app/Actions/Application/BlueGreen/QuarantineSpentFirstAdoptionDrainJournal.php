@@ -28,9 +28,9 @@ final class QuarantineSpentFirstAdoptionDrainJournal
     /**
      * @return array{
      *     archive_filename: string,
-     *     journal_sha256: string,
+     *     journal_sha256: string|null,
      *     provenance_sha256: string,
-     *     status: 'archived'|'pending',
+     *     status: 'archived'|'consumed'|'pending',
      *     target_status: 'absent'|'running'|'stopped'
      * }
      */
@@ -48,9 +48,12 @@ final class QuarantineSpentFirstAdoptionDrainJournal
         $operationFence->assertLockOwnership();
 
         $inspection = $this->runRemote($context, expectedJournalSha256: null);
-        if (! $apply || $inspection['status'] === 'archived') {
+        if (! $apply || $inspection['status'] !== 'pending') {
             return $inspection;
         }
+
+        $journalSha256 = $inspection['journal_sha256']
+            ?? throw new BlueGreenDeploymentTransitionException('The pending spent first-adoption drain journal returned no authenticated checksum.');
 
         $operationFence->assertLockOwnership();
         $lockedContext = $this->context($stateId);
@@ -65,11 +68,12 @@ final class QuarantineSpentFirstAdoptionDrainJournal
 
         $quarantine = $this->runRemote(
             $lockedContext,
-            $inspection['journal_sha256'],
+            $journalSha256,
         );
         $operationFence->assertLockOwnership();
         if ($quarantine['status'] !== 'archived'
-            || ! hash_equals($inspection['journal_sha256'], $quarantine['journal_sha256'])
+            || $quarantine['journal_sha256'] === null
+            || ! hash_equals($journalSha256, $quarantine['journal_sha256'])
             || $inspection['target_status'] !== $quarantine['target_status']) {
             throw new BlueGreenDeploymentTransitionException('The spent first-adoption drain journal archival result did not preserve its exact inspected provenance.');
         }
@@ -94,9 +98,9 @@ final class QuarantineSpentFirstAdoptionDrainJournal
      * }  $context
      * @return array{
      *     archive_filename: string,
-     *     journal_sha256: string,
+     *     journal_sha256: string|null,
      *     provenance_sha256: string,
-     *     status: 'archived'|'pending',
+     *     status: 'archived'|'consumed'|'pending',
      *     target_status: 'absent'|'running'|'stopped'
      * }
      */
@@ -113,6 +117,7 @@ final class QuarantineSpentFirstAdoptionDrainJournal
                 $context['mutation_commands'],
                 $context['completion_commands'],
                 $context['legacy_target'],
+                allowConsumedJournalAbsence: $context['state']->operation_drain_last_observed_connections === 0,
             )
             : $writer->quarantineSpentFirstAdoptionDrainJournalCommandFor(
                 $context['server']->proxyPath(),
@@ -138,8 +143,10 @@ final class QuarantineSpentFirstAdoptionDrainJournal
         );
         if (count($fields) !== 8
             || $fields[0] !== WriteBlueGreenProxyConfiguration::STALE_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX
-            || ! in_array($fields[1], ['archived', 'pending'], true)
-            || preg_match('/^[a-f0-9]{64}$/D', $fields[2]) !== 1
+            || ! in_array($fields[1], ['archived', 'consumed', 'pending'], true)
+            || ($fields[1] === 'consumed'
+                ? $fields[2] !== 'none'
+                : preg_match('/^[a-f0-9]{64}$/D', $fields[2]) !== 1)
             || ! hash_equals($archiveFilename, $fields[3])
             || ! hash_equals($context['provenance_sha256'], $fields[4])
             || ! in_array($fields[5], ['absent', 'running', 'stopped'], true)
@@ -150,7 +157,7 @@ final class QuarantineSpentFirstAdoptionDrainJournal
 
         return [
             'archive_filename' => $fields[3],
-            'journal_sha256' => $fields[2],
+            'journal_sha256' => $fields[1] === 'consumed' ? null : $fields[2],
             'provenance_sha256' => $fields[4],
             'status' => $fields[1],
             'target_status' => $fields[5],
@@ -226,7 +233,7 @@ final class QuarantineSpentFirstAdoptionDrainJournal
                 $ports,
                 $state->operation_drain_deadline_at->getTimestamp(),
                 $locks->application->settings->deploymentStopGracePeriodSeconds(),
-                false,
+                $state->operation_drain_last_observed_connections === 0,
             );
             $completionCommands = $drainer->completionAssertionsFor($legacyTarget);
             $writer = new WriteBlueGreenProxyConfiguration;
@@ -314,7 +321,7 @@ final class QuarantineSpentFirstAdoptionDrainJournal
             || $state->operation_drain_deadline_at === null
             || ! $state->operation_drain_deadline_at->isPast()
             || ! is_int($state->operation_drain_last_observed_connections)
-            || $state->operation_drain_last_observed_connections < 1
+            || $state->operation_drain_last_observed_connections < 0
             || $state->operation_drain_observed_at === null
             || ! is_string($state->operation_server_boot_id)
             || $state->deactivation_operation_id !== null

@@ -305,6 +305,8 @@ check_once() {
         identity=$(heartbeat_identity 2>/dev/null || true)
         [ -n "$identity" ] && dispatch_drift managed-state-invalid "$identity"
         fail 'managed Traefik state is invalid'
+        rm -rf "$scratch"
+        trap - EXIT HUP INT TERM
         return 1
     fi
     identity=$(cat "$scratch/identity-before")
@@ -320,6 +322,8 @@ check_once() {
     if [ "$provider_healthy" != true ]; then
         dispatch_drift provider-health-drift "$identity"
         fail 'Traefik provider health proof drifted'
+        rm -rf "$scratch"
+        trap - EXIT HUP INT TERM
         return 1
     fi
 
