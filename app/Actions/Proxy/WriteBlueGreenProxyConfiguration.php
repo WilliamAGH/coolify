@@ -486,6 +486,7 @@ class WriteBlueGreenProxyConfiguration
         array $expectedMutationCommands,
         array $expectedCompletionCommands,
         BlueGreenContainerExpectation $legacyTarget,
+        bool $allowConsumedJournalAbsence = false,
     ): string {
         $profile = $this->spentFirstAdoptionDrainJournalProfile(
             expectedCurrentBootId: $expectedCurrentBootId,
@@ -511,6 +512,7 @@ class WriteBlueGreenProxyConfiguration
             $stateId,
             $expectedCurrentBootId,
             spentFirstAdoptionDrain: $profile,
+            allowConsumedJournalAbsence: $allowConsumedJournalAbsence,
         );
     }
 
@@ -1487,6 +1489,7 @@ class WriteBlueGreenProxyConfiguration
         ?array $expectedJournalProvenance = null,
         ?array $inactiveRetirement = null,
         ?array $spentFirstAdoptionDrain = null,
+        bool $allowConsumedJournalAbsence = false,
     ): string {
         $stateDirectory = $this->stateDirectory($proxyPath);
         $dynamicDirectory = $this->dynamicDirectory($proxyPath);
@@ -1498,6 +1501,9 @@ class WriteBlueGreenProxyConfiguration
         $archivePath = $stateDirectory.'/'.$archiveFilename;
         $manifestPath = $archivePath.'.manifest';
         $archivePrefix = '.blue-green-stale-container-mutation-'.hash('sha256', $managedFilename).'.state-'.$stateId;
+        $canProveConsumedFirstAdoptionDrain = $allowConsumedJournalAbsence
+            && $spentFirstAdoptionDrain !== null
+            && $expectedJournalSha256 === null;
         $quarantineCommands = $expectedJournalSha256 === null
             ? []
             : $this->quarantineStaleContainerMutationJournalCommands(
@@ -1532,6 +1538,39 @@ class WriteBlueGreenProxyConfiguration
             $expectedJournalProvenance === null => 'printf \'%s|%s|%s|%s\' '.escapeshellarg(self::STALE_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX).' "$container_journal_status" "$container_journal_checksum" '.escapeshellarg($archiveFilename),
             default => 'printf \'%s|%s|%s|%s|%s\' '.escapeshellarg(self::STALE_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX).' "$container_journal_status" "$container_journal_checksum" '.escapeshellarg($archiveFilename).' '.escapeshellarg($expectedJournalProvenance['sha256']),
         };
+        $consumedJournalSelectionCommands = $canProveConsumedFirstAdoptionDrain
+            ? [
+                'elif [ "$container_journal_archive_present" = false ] && [ "$container_journal_manifest_present" = false ]; then',
+                '  container_journal_status=consumed',
+                '  container_journal_checksum=none',
+                '  container_journal_expected_boot_id='.escapeshellarg($expectedCurrentBootId),
+            ]
+            : [];
+        $journalValidationCommands = $canProveConsumedFirstAdoptionDrain
+            ? [
+                'if [ "$container_journal_status" = consumed ]; then',
+                ...$this->indent($this->validateConsumedFirstAdoptionDrainCommands($spentFirstAdoptionDrain)),
+                'else',
+                ...$this->indent($this->validateStaleContainerMutationJournalCommands(
+                    $managedFilename,
+                    $applicationUuid,
+                    $destinationId,
+                    $expectedCurrentBootId,
+                    $expectedJournalProvenance,
+                    $inactiveRetirement,
+                    $spentFirstAdoptionDrain,
+                )),
+                'fi',
+            ]
+            : $this->validateStaleContainerMutationJournalCommands(
+                $managedFilename,
+                $applicationUuid,
+                $destinationId,
+                $expectedCurrentBootId,
+                $expectedJournalProvenance,
+                $inactiveRetirement,
+                $spentFirstAdoptionDrain,
+            );
 
         return implode("\n", [
             'set -eu',
@@ -1569,18 +1608,11 @@ class WriteBlueGreenProxyConfiguration
             'elif [ "$container_journal_archive_present" = true ] && [ "$container_journal_manifest_present" = true ]; then',
             '  container_journal_source="$container_journal_archive_path"',
             '  container_journal_status=archived',
+            ...$consumedJournalSelectionCommands,
             'else',
             '  exit 1',
             'fi',
-            ...$this->validateStaleContainerMutationJournalCommands(
-                $managedFilename,
-                $applicationUuid,
-                $destinationId,
-                $expectedCurrentBootId,
-                $expectedJournalProvenance,
-                $inactiveRetirement,
-                $spentFirstAdoptionDrain,
-            ),
+            ...$journalValidationCommands,
             'if [ "$container_journal_manifest_present" = true ]; then',
             ...$this->indent($this->validateStaleContainerMutationJournalManifestCommands(
                 $managedFilename,
