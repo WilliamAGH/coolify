@@ -102,7 +102,15 @@ while :; do
         drain_zero_observations=0
     fi
     if [ "$(date +%s)" -ge "$drain_deadline" ]; then
-            printf '%s\n' "coolify-blue-green-drain: timed out with $drain_connections active backend connection(s)" >&2
+        # Nothing is connected, so the drain is already complete: the second
+        # zero sample only confirms stability, and the deadline is not a reason
+        # to fail a predecessor that has no traffic left to lose. Timing out
+        # "with 0 active backend connection(s)" would fail a release for the
+        # one condition the drain exists to wait for.
+        if [ "$drain_connections" -eq 0 ]; then
+            break
+        fi
+        printf '%s\n' "coolify-blue-green-drain: timed out with $drain_connections active backend connection(s)" >&2
         exit 1
     fi
     sleep 1

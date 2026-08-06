@@ -47,6 +47,29 @@ it('requires two observed zero-connection samples before exact previous-containe
         );
 });
 
+it('never fails a drain whose current observation has no backend connections left', function () {
+    $commands = (new DrainBlueGreenPreviousContainer)->commandsFor(
+        blueGreenDrainExpectation(),
+        backendPort: 8080,
+        drainDeadlineEpoch: 1_700_000_030,
+        stopTimeoutSeconds: 15,
+    );
+    $script = $commands[array_key_last($commands)];
+
+    // Observed in production: a predecessor with zero connections still failed
+    // the release because the immutable deadline passed before the second
+    // confirming sample. Nothing was connected, so there was nothing to wait
+    // for — the deadline must not turn that into a deployment failure.
+    // The deadline branch runs from the clock test to the timeout exit; a
+    // zero-connection escape must live inside it, before that exit.
+    $deadlineStart = strpos($script, 'date +%s');
+    $timeoutExit = strpos($script, 'timed out with');
+    $deadlineBranch = substr($script, $deadlineStart, $timeoutExit - $deadlineStart);
+
+    expect($deadlineBranch)->toContain('-eq 0');
+    expect($deadlineBranch)->toContain('break');
+});
+
 it('retires the exact predecessor without re-observing connections once the drain budget is spent', function () {
     $commands = (new DrainBlueGreenPreviousContainer)->forcedStopCommandsFor(
         blueGreenDrainExpectation(),
