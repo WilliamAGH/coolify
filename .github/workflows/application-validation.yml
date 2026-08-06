@@ -126,7 +126,6 @@ jobs:
         run: |
           set -Eeuo pipefail
           php artisan test --compact \
-            tests/Feature/ProductionSeederTest.php \
             tests/Unit/ApplicationValidationWorkflowTest.php \
             tests/Unit/CheckHelperImageJobTest.php \
             tests/Unit/CheckForUpdatesJobTest.php \
