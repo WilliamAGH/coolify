@@ -20,6 +20,7 @@ use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
 use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
 use App\Enums\ApplicationDeploymentStatus;
+use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\ContainerStatusTypes;
@@ -28,6 +29,7 @@ use App\Jobs\ApplicationDeploymentJob;
 use App\Jobs\RetireBlueGreenInactiveContainerJob;
 use App\Livewire\Project\Application\Advanced;
 use App\Models\Application;
+use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationBlueGreenReplica;
 use App\Models\ApplicationDeploymentQueue;
@@ -519,6 +521,22 @@ it('delays retirement against the immutable inactive port inventory after a live
 
         return Process::result(output: '1');
     });
+
+    // A deactivation row is permanent history and nothing ever deletes one, so
+    // an application that was stopped even once carries it forever. Refusing
+    // retirement on its mere existence stranded the inactive container beside
+    // the active one for good, which for an application that cannot tolerate
+    // two live instances is an outage rather than untidiness. A terminal
+    // stopped deactivation must therefore change nothing here.
+    ApplicationBlueGreenDeactivation::query()->create([
+        'application_id' => $application->id,
+        'standalone_docker_id' => $application->destination->id,
+        'phase' => BlueGreenDeactivationPhase::STOPPED,
+        'operation_id' => str_repeat('c', 64),
+        'supersession_generation' => 1,
+        'started_at' => now()->subHour(),
+        'completed_at' => now()->subMinutes(59),
+    ]);
 
     expect(RetireBlueGreenInactiveContainer::run($state->id, $owner->deployment_uuid, 2))
         ->toBe(RetireBlueGreenInactiveContainer::RETRY);

@@ -368,7 +368,19 @@ final class RetireBlueGreenInactiveContainer
                 || $state->operation_deployment_uuid !== null
                 || $state->deactivation_operation_id !== null
                 || $state->supersession_generation !== $generation
-                || $locks->deactivation !== null
+                // A deactivation row is permanent history, not a live fence, and
+                // nothing ever deletes one. Refusing on its mere existence meant
+                // that once an application had been stopped even once, it could
+                // never retire an inactive colour again — the inactive container
+                // stayed up forever beside the active one. For an application
+                // that cannot tolerate two live instances that is an outage, not
+                // untidiness: codex-lb served 502s because both containers
+                // claimed ownership of the same continuity aliases.
+                //
+                // Deployment claims already ask the right question, and
+                // deliberately do not treat a terminal stopped or completed
+                // deactivation as fencing. Retirement now asks the same one.
+                || $locks->deactivation?->phase->fencesDeploymentClaims() === true
                 || $state->routing_revision !== $state->inactive_retirement_owner_routing_revision
                 || $state->destination_fence_epoch !== $state->inactive_retirement_destination_fence_epoch
                 || $state->destination_topology_digest !== $state->inactive_retirement_topology_digest
