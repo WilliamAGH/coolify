@@ -1622,3 +1622,29 @@ it('binds a reserved slot whose container name was pinned before Docker gave it 
             1, 'queue-blue', 'app-queue-blue', str_repeat('d', 64), 'running', 'healthy',
         )))->toThrow(RuntimeException::class, 'partial container identity');
 });
+
+it('gives a replica drain the same retryable timeout contract as a single container', function () {
+    // A replica application observed on dev.findmybook.net hard-failed with the
+    // raw remote RuntimeException because only the single-container path
+    // converted the drain timeout marker into the retryable DeploymentException
+    // that bounded recovery keys on. Nothing classifies the raw exception, so a
+    // replica release skipped fenced recovery and terminal forced retirement
+    // entirely. Both paths must classify the timeout identically.
+    $source = static function (string $method): string {
+        $reflection = new ReflectionMethod(BlueGreenDeploymentLifecycle::class, $method);
+
+        return implode('', array_slice(
+            file($reflection->getFileName()),
+            $reflection->getStartLine() - 1,
+            $reflection->getEndLine() - $reflection->getStartLine() + 1,
+        ));
+    };
+
+    foreach (['retirePreviousContainer', 'retirePreviousReplicaSet'] as $method) {
+        expect($source($method))
+            ->toContain('DrainBlueGreenPreviousContainer::TIMEOUT_MARKER')
+            ->toContain('DrainBlueGreenPreviousContainer::TIMEOUT_CONNECTIONS_PATTERN')
+            ->toContain('durable DRAINING state is retained for retry.')
+            ->toContain('BlueGreenDestinationStateRecordingException');
+    }
+});

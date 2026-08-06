@@ -768,8 +768,38 @@ final class BlueGreenDeploymentLifecycle
             array_push($completionAssertions, ...$drainer->completionAssertionsFor($expectation));
         }
         (new RecordBlueGreenDrainObservation)->record($claim, $activeConnections);
-        $this->destinationState = $this->executeDestinationMutation($commands, $completionAssertions);
-        (new RecordBlueGreenDrainObservation)->record($claim, 0);
+        $this->deployment->addLogEntry(
+            count($this->previousReplicaInspections)." inactive blue-green replicas are draining {$activeConnections} active backend connection(s) before retirement.",
+        );
+        // A replica drain owes the same bounded-recovery contract the single
+        // container path already honours. Without it a timeout escapes as the
+        // raw remote RuntimeException, which no caller classifies as
+        // retryable, so a replica application hard-fails instead of entering
+        // the fenced drain recovery — and never gets the terminal forced
+        // retirement its spent budget is supposed to reach.
+        try {
+            $this->destinationState = $this->executeDestinationMutation($commands, $completionAssertions);
+            (new RecordBlueGreenDrainObservation)->record($claim, 0);
+        } catch (BlueGreenDestinationStateRecordingException) {
+            $this->reconcilePendingDestinationState();
+            (new RecordBlueGreenDrainObservation)->record($claim, 0);
+        } catch (Throwable $exception) {
+            if (str_contains($exception->getMessage(), DrainBlueGreenPreviousContainer::TIMEOUT_MARKER)) {
+                if (preg_match(DrainBlueGreenPreviousContainer::TIMEOUT_CONNECTIONS_PATTERN, $exception->getMessage(), $matches) === 1) {
+                    (new RecordBlueGreenDrainObservation)->record($claim, (int) $matches['connections']);
+                }
+                $this->deployment->addLogEntry(
+                    'Blue-green replica drain deadline elapsed; durable DRAINING state retained with the latest connection observation for a safe retry.',
+                    'stderr',
+                );
+                throw new DeploymentException(
+                    'Blue-green previous-replica drain timed out; durable DRAINING state is retained for retry.',
+                    previous: $exception,
+                );
+            }
+
+            throw $exception;
+        }
         ApplicationBlueGreenReplica::query()
             ->where('application_blue_green_deployment_id', $claim->stateId)
             ->where('deployment_uuid', $this->previousContainerExpectation?->deploymentUuid)

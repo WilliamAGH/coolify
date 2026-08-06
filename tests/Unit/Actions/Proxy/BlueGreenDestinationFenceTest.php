@@ -1122,3 +1122,41 @@ it('repairs the exact rollback residue an interrupted first adoption records', f
         $filesystem->remove($proxyPath);
     }
 });
+
+it('builds a mature inactive-retirement journal inspection that cannot replay its mutation', function (): void {
+    $writer = destinationFenceWriter();
+    $expectedState = compileDestinationFencedBlueGreenConfiguration(
+        epoch: 2,
+        activeColor: BlueGreenDeploymentColor::GREEN,
+        deploymentUuid: 'retirement-owner',
+        containerId: str_repeat('c', 64),
+        operationId: 'retirement-owner',
+        mutationSequence: 4,
+    )->state;
+    $replacementState = $expectedState->withMutationOwner('retirement-owner');
+
+    $command = $writer->inspectStaleInactiveRetirementContainerMutationJournalCommandFor(
+        proxyPath: '/data/coolify/proxy',
+        stateId: 75,
+        expectedCurrentBootId: destinationFenceBootId(),
+        expectedJournalBootId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+        expectedState: $expectedState,
+        replacementState: $replacementState,
+        expectedMutationSha256: str_repeat('d', 64),
+        expectedCompletionSha256: str_repeat('e', 64),
+        targetContainerName: 'app-fenced-blue',
+        targetContainerId: str_repeat('a', 64),
+        applicationId: 17,
+        inactiveDeploymentUuid: 'retirement-inactive',
+        inactiveColor: BlueGreenDeploymentColor::BLUE,
+        inactiveRoutingRevision: 1,
+    );
+
+    expect($command)->toContain('test "$container_journal_expected_state" = '.escapeshellarg(base64_encode($expectedState->serialize())))
+        ->and($command)->toContain('test "$container_journal_replacement_state" = '.escapeshellarg(base64_encode($replacementState->serialize())))
+        ->and($command)->toContain('test "$container_journal_mutation_checksum" = '.escapeshellarg(str_repeat('d', 64)))
+        ->and($command)->toContain('test "$container_journal_completion_checksum" = '.escapeshellarg(str_repeat('e', 64)))
+        ->and($command)->toContain('coolify.blueGreen.deploymentUuid=retirement-inactive')
+        ->and($command)->not->toContain('sh "$container_journal_mutation_decoded"')
+        ->and($command)->not->toContain('sh "$container_journal_completion_decoded"');
+});
