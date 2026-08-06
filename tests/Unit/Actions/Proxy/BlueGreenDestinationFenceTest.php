@@ -8,6 +8,7 @@ use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
 use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
 use App\Enums\BlueGreenDeploymentColor;
+use App\Enums\ContainerStatusTypes;
 use Symfony\Component\Filesystem\Filesystem;
 use Symfony\Component\Process\Process;
 
@@ -1157,6 +1158,43 @@ it('builds a mature inactive-retirement journal inspection that cannot replay it
         ->and($command)->toContain('test "$container_journal_mutation_checksum" = '.escapeshellarg(str_repeat('d', 64)))
         ->and($command)->toContain('test "$container_journal_completion_checksum" = '.escapeshellarg(str_repeat('e', 64)))
         ->and($command)->toContain('coolify.blueGreen.deploymentUuid=retirement-inactive')
+        ->and($command)->toContain('case "$container_journal_target_runtime_status" in')
+        ->and($command)->toContain(
+            ContainerStatusTypes::EXITED->value.'|'.ContainerStatusTypes::DEAD->value.') container_journal_target_status=stopped',
+        )
+        ->and($command)->toContain('    *) exit 1 ;;')
+        ->and($command)->not->toContain(
+            'if [ "$container_journal_target_runtime_status" = running ]; then container_journal_target_status=running; else container_journal_target_status=stopped; fi',
+        )
         ->and($command)->not->toContain('sh "$container_journal_mutation_decoded"')
         ->and($command)->not->toContain('sh "$container_journal_completion_decoded"');
+
+    $quarantineCommand = $writer->quarantineStaleInactiveRetirementContainerMutationJournalCommandFor(
+        proxyPath: '/data/coolify/proxy',
+        stateId: 75,
+        expectedCurrentBootId: destinationFenceBootId(),
+        expectedJournalBootId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+        expectedState: $expectedState,
+        replacementState: $replacementState,
+        expectedMutationSha256: str_repeat('d', 64),
+        expectedCompletionSha256: str_repeat('e', 64),
+        targetContainerName: 'app-fenced-blue',
+        targetContainerId: str_repeat('a', 64),
+        applicationId: 17,
+        inactiveDeploymentUuid: 'retirement-inactive',
+        inactiveColor: BlueGreenDeploymentColor::BLUE,
+        inactiveRoutingRevision: 1,
+        expectedJournalSha256: str_repeat('f', 64),
+    );
+    $targetStatusAttestation = 'container_journal_target_runtime_status=$(docker inspect --format=';
+    $routeStatusAttestation = 'container_journal_route_state=$(base64 < "$container_journal_state_path"';
+    $routeReplacement = 'durable_remote_replace "$container_journal_state_stage"';
+    $firstTargetStatusAttestation = strpos($quarantineCommand, $targetStatusAttestation);
+    $routeReplacementPosition = strpos($quarantineCommand, $routeReplacement);
+    $lastTargetStatusAttestation = strrpos($quarantineCommand, $targetStatusAttestation);
+
+    expect(substr_count($quarantineCommand, $targetStatusAttestation))->toBe(2)
+        ->and(substr_count($quarantineCommand, $routeStatusAttestation))->toBe(2)
+        ->and($firstTargetStatusAttestation)->toBeInt()->toBeLessThan($routeReplacementPosition)
+        ->and($lastTargetStatusAttestation)->toBeInt()->toBeGreaterThan($routeReplacementPosition);
 });

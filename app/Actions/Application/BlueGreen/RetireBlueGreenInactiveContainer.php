@@ -7,6 +7,7 @@ use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
+use App\Enums\ContainerStatusTypes;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationBlueGreenReplica;
@@ -118,7 +119,7 @@ final class RetireBlueGreenInactiveContainer
                 return $this->markIntervention($state, $ownerDeployment, 'The managed route no longer proves the retained container is inactive.');
             }
             $replacementState = $expectedState->withMutationOwner($ownerDeploymentUuid);
-            if ($inspection->status !== 'running') {
+            if (self::isTerminalStoppedStatus($inspection->status)) {
                 if ($this->attestDestinationState($server, $replacementState)) {
                     $this->markStopped($state, $ownerDeployment, $expectedState, $replacementState);
 
@@ -130,6 +131,9 @@ final class RetireBlueGreenInactiveContainer
                 $this->markStopped($state, $ownerDeployment, null, null);
 
                 return self::COMPLETED;
+            }
+            if ($inspection->status !== ContainerStatusTypes::RUNNING->value) {
+                return self::RETRY;
             }
 
             $drainBackendPortInventory = BlueGreenBackendPortInventory::fromSerialized(
@@ -236,8 +240,14 @@ final class RetireBlueGreenInactiveContainer
             return $this->markIntervention($state, $ownerDeployment, 'The managed route no longer proves the retained replica set is inactive.');
         }
         $replacementState = $expectedState->withMutationOwner($ownerDeployment->deployment_uuid);
+        if (collect($inspections)->contains(
+            static fn (BlueGreenReplicaInspection $inspection): bool => $inspection->status !== ContainerStatusTypes::RUNNING->value
+                && ! self::isTerminalStoppedStatus($inspection->status),
+        )) {
+            return self::RETRY;
+        }
         if (collect($inspections)->every(
-            static fn (BlueGreenReplicaInspection $inspection): bool => $inspection->status !== 'running',
+            static fn (BlueGreenReplicaInspection $inspection): bool => self::isTerminalStoppedStatus($inspection->status),
         )) {
             if ($this->attestDestinationState($server, $replacementState)) {
                 $this->markStopped($state, $ownerDeployment, $expectedState, $replacementState);
@@ -392,6 +402,12 @@ final class RetireBlueGreenInactiveContainer
 
             return [$state, $application, $destination, $owner, $inactive];
         }, attempts: 5);
+    }
+
+    private static function isTerminalStoppedStatus(?string $status): bool
+    {
+        return $status === ContainerStatusTypes::EXITED->value
+            || $status === ContainerStatusTypes::DEAD->value;
     }
 
     private function recordObservation(ApplicationBlueGreenDeployment $state, int $connections): void

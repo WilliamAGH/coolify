@@ -4,24 +4,31 @@ use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
 use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
+use App\Actions\Application\BlueGreen\BlueGreenInterventionRecoveryResult;
+use App\Actions\Application\BlueGreen\BlueGreenReplicaInspection;
+use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\ComputeBlueGreenDeploymentFingerprint;
 use App\Actions\Application\BlueGreen\DrainBlueGreenPreviousContainer;
 use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
+use App\Actions\Application\BlueGreen\RecoverBlueGreenIntervention;
 use App\Actions\Application\BlueGreen\ResumeBlueGreenInactiveRetirements;
 use App\Actions\Application\BlueGreen\RetireBlueGreenInactiveContainer;
 use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
+use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
+use App\Enums\ContainerStatusTypes;
 use App\Enums\ProxyTypes;
 use App\Jobs\ApplicationDeploymentJob;
 use App\Jobs\RetireBlueGreenInactiveContainerJob;
 use App\Livewire\Project\Application\Advanced;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
+use App\Models\ApplicationBlueGreenReplica;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\ApplicationSetting;
 use App\Models\PrivateKey;
@@ -32,6 +39,8 @@ use App\Models\Team;
 use App\Models\User;
 use App\Services\BlueGreenDeploymentLifecycle;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Process\FakeProcessResult;
+use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Queue;
@@ -803,7 +812,7 @@ it('records an already-applied destination sidecar mutation during stopped-conta
         ->and($state->fresh()->destination_fence_mutation_sequence)->toBe(5);
 });
 
-it('reconciles the pending container journal under lock on the stopped-container action path', function () {
+it('reconciles the pending container journal under lock on the terminal stopped-container action path', function (string $status): void {
     $application = makeBlueGreenInactiveRetirementApplication();
     $destination = $application->destination;
     $privateKeyContent = <<<'KEY'
@@ -901,6 +910,7 @@ KEY;
         $bootId,
         $inactive,
         $inactiveContainerId,
+        $status,
         &$sawJournalRepair,
     ) {
         $command = is_array($process->command) ? implode(' ', $process->command) : (string) $process->command;
@@ -908,7 +918,7 @@ KEY;
             return Process::result(output: json_encode([
                 'Id' => $inactiveContainerId,
                 'Name' => '/'.$application->uuid.'-blue',
-                'State' => ['Status' => 'exited'],
+                'State' => ['Status' => $status],
                 'Config' => ['Labels' => [
                     'coolify.applicationId' => (string) $application->id,
                     'coolify.pullRequestId' => '0',
@@ -933,7 +943,10 @@ KEY;
         ->and($sawJournalRepair)->toBeTrue()
         ->and($state->fresh()->inactive_retirement_stopped_at)->not->toBeNull()
         ->and($state->fresh()->destination_fence_mutation_sequence)->toBe(5);
-});
+})->with([
+    'exited' => ContainerStatusTypes::EXITED->value,
+    'dead' => ContainerStatusTypes::DEAD->value,
+]);
 
 /**
  * One idle generation whose delayed retirement already required intervention,
@@ -1053,6 +1066,116 @@ function makeWedgedBlueGreenInactiveRetirement(): array
     return compact('application', 'owner', 'state');
 }
 
+function prepareBlueGreenInactiveRetirementRemote(Server $server): void
+{
+    config(['constants.ssh.mux_enabled' => false]);
+    $privateKey = PrivateKey::factory()->create(['team_id' => $server->team_id]);
+    Storage::fake('ssh-keys');
+    Storage::disk('ssh-keys')->put("ssh_key@{$privateKey->uuid}", $privateKey->private_key);
+    $server->update(['private_key_id' => $privateKey->id]);
+}
+
+/** @return array{application: Application, owner: ApplicationDeploymentQueue, state: ApplicationBlueGreenDeployment} */
+function makeReadyBlueGreenInactiveRetirement(): array
+{
+    $scenario = makeWedgedBlueGreenInactiveRetirement();
+    prepareBlueGreenInactiveRetirementRemote($scenario['application']->destination->server);
+    $scenario['state']->update([
+        'inactive_retirement_intervention_required_at' => null,
+        'inactive_retirement_drain_deadline_at' => now()->addMinute(),
+    ]);
+
+    return [
+        ...$scenario,
+        'state' => $scenario['state']->fresh(),
+    ];
+}
+
+/**
+ * @param  list<string>  $statuses
+ * @return array{application: Application, owner: ApplicationDeploymentQueue, state: ApplicationBlueGreenDeployment, inspections: list<BlueGreenReplicaInspection>}
+ */
+function makeReadyBlueGreenInactiveReplicaRetirement(array $statuses): array
+{
+    $scenario = makeReadyBlueGreenInactiveRetirement();
+    $application = $scenario['application'];
+    $state = $scenario['state'];
+    $inspections = array_map(function (string $status, int $offset) use ($application): BlueGreenReplicaInspection {
+        $replicaIndex = $offset + 1;
+        $composeService = $application->uuid."-blue-replica-{$replicaIndex}";
+
+        return BlueGreenReplicaInspection::fromRuntime(
+            replicaIndex: $replicaIndex,
+            composeService: $composeService,
+            containerName: "{$composeService}-1",
+            dockerId: str_repeat((string) $replicaIndex, 64),
+            status: $status,
+            health: 'healthy',
+        );
+    }, array_values($statuses), array_keys($statuses));
+    $identity = BlueGreenReplicaSet::identityDigest($inspections);
+    $state->update(['inactive_retirement_container_id' => $identity]);
+    ApplicationDeploymentQueue::query()
+        ->where('application_id', $application->id)
+        ->where('deployment_uuid', $state->inactive_retirement_deployment_uuid)
+        ->update(['blue_green_candidate_container_id' => $identity]);
+    foreach ($inspections as $inspection) {
+        ApplicationBlueGreenReplica::query()->create([
+            'application_blue_green_deployment_id' => $state->id,
+            'application_id' => $application->id,
+            'standalone_docker_id' => $application->destination->id,
+            'color' => $state->inactive_retirement_color,
+            'replica_index' => $inspection->replicaIndex,
+            'deployment_uuid' => $state->inactive_retirement_deployment_uuid,
+            'routing_revision' => $state->inactive_retirement_container_routing_revision,
+            'compose_project' => $application->uuid,
+            'compose_service' => $inspection->composeService,
+            'container_name' => $inspection->containerName,
+            'container_id' => $inspection->dockerId,
+            'health_status' => 'healthy',
+            'last_observed_at' => now()->subMinute(),
+        ]);
+    }
+
+    return [
+        ...$scenario,
+        'state' => $state->fresh(),
+        'inspections' => $inspections,
+    ];
+}
+
+/**
+ * @param  list<BlueGreenReplicaInspection>  $inspections
+ */
+function blueGreenInactiveRetirementReplicaInspectionOutput(
+    Application $application,
+    ApplicationBlueGreenDeployment $state,
+    array $inspections,
+): string {
+    return collect($inspections)->map(
+        static fn (BlueGreenReplicaInspection $inspection): string => json_encode([
+            'Id' => $inspection->dockerId,
+            'Name' => '/'.$inspection->containerName,
+            'State' => [
+                'Status' => $inspection->status,
+                'Health' => ['Status' => $inspection->health],
+            ],
+            'Config' => ['Labels' => [
+                'coolify.applicationId' => (string) $application->id,
+                'coolify.pullRequestId' => '0',
+                'coolify.blueGreen.managed' => 'true',
+                'coolify.blueGreen.deploymentUuid' => $state->inactive_retirement_deployment_uuid,
+                'coolify.blueGreen.color' => $state->inactive_retirement_color->value,
+                'coolify.blueGreen.routingRevision' => (string) $state->inactive_retirement_container_routing_revision,
+                'coolify.blueGreen.replicaIndex' => (string) $inspection->replicaIndex,
+                'coolify.blueGreen.replicaCount' => (string) count($inspections),
+                'com.docker.compose.project' => $application->uuid,
+                'com.docker.compose.service' => $inspection->composeService,
+            ]],
+        ], JSON_THROW_ON_ERROR),
+    )->implode("\n");
+}
+
 it('supersedes a retirement that requires intervention when the next deployment is claimed', function (): void {
     ['application' => $application, 'owner' => $owner, 'state' => $state] = makeWedgedBlueGreenInactiveRetirement();
     $destination = $application->destination;
@@ -1104,4 +1227,415 @@ it('leaves an already-marked retirement marked without a spurious transition fai
         ->toBe(RetireBlueGreenInactiveContainer::INTERVENTION)
         ->and($state->fresh()->inactive_retirement_intervention_required_at->equalTo($markedAt))->toBeTrue()
         ->and($state->fresh()->inactive_retirement_stopped_at)->toBeNull();
+});
+
+it('retries transient or unknown scalar inactive-container statuses before stopped reconciliation', function (string $status): void {
+    ['owner' => $owner, 'state' => $state] = makeReadyBlueGreenInactiveRetirement();
+    $inactiveContainerId = $state->inactive_retirement_container_id
+        ?? throw new RuntimeException('The ready inactive retirement test fixture requires an exact container identity.');
+    InspectBlueGreenContainer::shouldRun()
+        ->once()
+        ->andReturn(new BlueGreenContainerInspection(
+            exists: true,
+            dockerId: $inactiveContainerId,
+            status: $status,
+            health: 'healthy',
+        ));
+    Process::fake(fn () => Process::result(output: '11111111-2222-3333-4444-555555555555'));
+
+    expect(RetireBlueGreenInactiveContainer::run($state->id, $owner->deployment_uuid, 2))
+        ->toBe(RetireBlueGreenInactiveContainer::RETRY);
+
+    $state = $state->fresh();
+    expect($state->inactive_retirement_stopped_at)->toBeNull()
+        ->and($state->inactive_retirement_intervention_required_at)->toBeNull()
+        ->and($state->inactive_retirement_attempts)->toBe(0)
+        ->and($state->destination_fence_mutation_sequence)->toBe(2);
+})->with([
+    'restarting' => ContainerStatusTypes::RESTARTING->value,
+    'paused' => ContainerStatusTypes::PAUSED->value,
+    'created' => ContainerStatusTypes::CREATED->value,
+    'removing' => ContainerStatusTypes::REMOVING->value,
+    'unknown' => 'unknown',
+]);
+
+it('retries an inactive replica set when any member status is transient or unknown', function (string $status): void {
+    ['owner' => $owner, 'state' => $state, 'inspections' => $inspections] = makeReadyBlueGreenInactiveReplicaRetirement([
+        ContainerStatusTypes::RUNNING->value,
+        $status,
+    ]);
+    InspectBlueGreenContainer::shouldRun()->never();
+    $inspectionOutput = blueGreenInactiveRetirementReplicaInspectionOutput($state->application, $state, $inspections);
+    Process::fake(function (PendingProcess $process) use ($inspectionOutput): FakeProcessResult {
+        $payload = (string) $process->command."\n".(string) $process->input;
+
+        return Process::result(output: str_contains($payload, 'coolify_replica_')
+            ? $inspectionOutput
+            : '11111111-2222-3333-4444-555555555555');
+    });
+
+    expect(RetireBlueGreenInactiveContainer::run($state->id, $owner->deployment_uuid, 2))
+        ->toBe(RetireBlueGreenInactiveContainer::RETRY);
+
+    $state = $state->fresh();
+    expect($state->inactive_retirement_stopped_at)->toBeNull()
+        ->and($state->inactive_retirement_intervention_required_at)->toBeNull()
+        ->and($state->inactive_retirement_attempts)->toBe(0)
+        ->and($state->destination_fence_mutation_sequence)->toBe(2);
+})->with([
+    'restarting member' => ContainerStatusTypes::RESTARTING->value,
+    'paused member' => ContainerStatusTypes::PAUSED->value,
+    'created member' => ContainerStatusTypes::CREATED->value,
+    'removing member' => ContainerStatusTypes::REMOVING->value,
+    'unknown member' => 'unknown',
+]);
+
+it('reconciles an inactive replica set only when every member is terminal', function (): void {
+    ['owner' => $owner, 'state' => $state, 'inspections' => $inspections] = makeReadyBlueGreenInactiveReplicaRetirement([
+        ContainerStatusTypes::EXITED->value,
+        ContainerStatusTypes::DEAD->value,
+    ]);
+    InspectBlueGreenContainer::shouldRun()->never();
+    $inspectionOutput = blueGreenInactiveRetirementReplicaInspectionOutput($state->application, $state, $inspections);
+    Process::fake(function (PendingProcess $process) use ($inspectionOutput): FakeProcessResult {
+        $payload = (is_array($process->command) ? implode(' ', $process->command) : (string) $process->command)
+            ."\n".(string) $process->input;
+
+        return Process::result(output: match (true) {
+            str_contains($payload, 'coolify_replica_') => $inspectionOutput,
+            str_contains($payload, 'coolify-blue-green-destination-state-attested') => 'coolify-blue-green-destination-state-attested',
+            default => '11111111-2222-3333-4444-555555555555',
+        });
+    });
+
+    expect(RetireBlueGreenInactiveContainer::run($state->id, $owner->deployment_uuid, 2))
+        ->toBe(RetireBlueGreenInactiveContainer::COMPLETED);
+
+    expect($state->fresh()->inactive_retirement_stopped_at)->not->toBeNull()
+        ->and($state->fresh()->destination_fence_mutation_sequence)->toBe(3);
+});
+
+/** @return array{application: Application, owner: ApplicationDeploymentQueue, state: ApplicationBlueGreenDeployment} */
+function makeRecoverableMatureInactiveRetirementJournal(): array
+{
+    $scenario = makeWedgedBlueGreenInactiveRetirement();
+    $privateKey = PrivateKey::query()->create([
+        'name' => 'mature-inactive-retirement-recovery-key',
+        'private_key' => <<<'KEY'
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACBbhpqHhqv6aI67Mj9abM3DVbmcfYhZAhC7ca4d9UCevAAAAJi/QySHv0Mk
+hwAAAAtzc2gtZWQyNTUxOQAAACBbhpqHhqv6aI67Mj9abM3DVbmcfYhZAhC7ca4d9UCevA
+AAAECBQw4jg1WRT2IGHMncCiZhURCts2s24HoDS0thHnnRKVuGmoeGq/pojrsyP1pszcNV
+uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
+-----END OPENSSH PRIVATE KEY-----
+KEY,
+        'team_id' => $scenario['application']->destination->server->team_id,
+    ]);
+    Storage::fake('ssh-keys');
+    Storage::disk('ssh-keys')->put("ssh_key@{$privateKey->uuid}", $privateKey->private_key);
+    $scenario['application']->destination->server->update(['private_key_id' => $privateKey->id]);
+    $scenario['state']->update([
+        'inactive_retirement_last_observed_connections' => 0,
+        'inactive_retirement_observed_at' => now()->subMinute(),
+        'inactive_retirement_attempts' => 10,
+        'inactive_retirement_dispatch_reserved_until_at' => now()->subMinute(),
+    ]);
+
+    return [
+        ...$scenario,
+        'state' => $scenario['state']->fresh(),
+    ];
+}
+
+/**
+ * @param  list<string>  $payloads
+ * @param  null|Closure(): void  $afterInspection
+ */
+function fakeMatureInactiveRetirementJournalRemote(
+    array &$payloads,
+    bool &$archived,
+    string $targetStatus,
+    ?Closure $afterInspection = null,
+): void {
+    $payloads = [];
+    $inspectionCount = 0;
+    Process::fake(function (PendingProcess $process) use (
+        &$payloads,
+        &$archived,
+        &$inspectionCount,
+        $targetStatus,
+        $afterInspection,
+    ) {
+        $payload = (string) $process->command."\n".(string) $process->input;
+        $payloads[] = $payload;
+        if (str_contains($payload, "tr -d '\\n' < /proc/sys/kernel/random/boot_id")) {
+            return Process::result(output: '22222222-3333-4444-5555-666666666666');
+        }
+        if (! str_contains($payload, WriteBlueGreenProxyConfiguration::STALE_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX)) {
+            return Process::result();
+        }
+        $outputLine = collect(explode("\n", $payload))->first(
+            static fn (string $line): bool => str_contains($line, "printf '%s|%s|%s|%s|%s|%s|%s|%s'")
+                && str_contains($line, WriteBlueGreenProxyConfiguration::STALE_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX),
+        );
+        if (! is_string($outputLine)
+            || preg_match("/'(\\.blue-green-stale-container-mutation-[^']+\\.journal)'/", $outputLine, $archiveMatch) !== 1
+            || preg_match("/'([a-f0-9]{64})'/", $outputLine, $provenanceMatch) !== 1) {
+            throw new RuntimeException('The mature stale-journal test could not parse the generated authenticated output command.');
+        }
+        $isArchive = str_contains($payload, 'durable_remote_replace "$container_journal_path" "$container_journal_archive_path"');
+        if (! $isArchive) {
+            $inspectionCount++;
+            if ($inspectionCount === 1) {
+                $afterInspection?->__invoke();
+            }
+        } else {
+            $archived = true;
+        }
+        $routeStatus = $isArchive && $targetStatus !== 'running' ? 'replacement' : 'expected';
+
+        return Process::result(output: implode('|', [
+            WriteBlueGreenProxyConfiguration::STALE_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX,
+            $archived ? 'archived' : 'pending',
+            str_repeat('f', 64),
+            $archiveMatch[1],
+            $provenanceMatch[1],
+            $targetStatus,
+            $routeStatus,
+            '11111111-2222-3333-4444-555555555555',
+        ]));
+    });
+}
+
+it('inspects an exact mature inactive-retirement journal without changing it', function (): void {
+    ['state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    $payloads = [];
+    $archived = false;
+    fakeMatureInactiveRetirementJournalRemote($payloads, $archived, 'running');
+    $before = $state->fresh()->getAttributes();
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $state->id,
+        staleContainerJournal: true,
+    );
+
+    expect($payloads)->not->toBeEmpty()
+        ->and($result->classification)->toBe(BlueGreenInterventionRecoveryResult::STALE_CONTAINER_JOURNAL)
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::INSPECTED)
+        ->and($state->fresh()->getAttributes())->toBe($before)
+        ->and($archived)->toBeFalse()
+        ->and(implode("\n", $payloads))->not->toContain(
+            'durable_remote_replace "$container_journal_path" "$container_journal_archive_path"',
+            'sh "$container_journal_mutation_decoded"',
+            'sh "$container_journal_completion_decoded"',
+        );
+});
+
+it('archives a running mature target and queues one current-generator retirement', function (): void {
+    ['owner' => $owner, 'state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    Queue::fake();
+    $payloads = [];
+    $archived = false;
+    fakeMatureInactiveRetirementJournalRemote($payloads, $archived, 'running');
+    $expectedFenceSequence = $state->destination_fence_mutation_sequence;
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $state->id,
+        apply: true,
+        reason: 'Archive the authenticated affected journal and requeue its exact retirement.',
+        staleContainerJournal: true,
+    );
+    $state = $state->fresh();
+
+    expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::RECOVERED)
+        ->and($archived)->toBeTrue()
+        ->and($state->destination_fence_mutation_sequence)->toBe($expectedFenceSequence)
+        ->and($state->inactive_retirement_stopped_at)->toBeNull()
+        ->and($state->inactive_retirement_intervention_required_at)->toBeNull()
+        ->and($state->inactive_retirement_attempts)->toBe(0)
+        ->and($state->inactive_retirement_server_boot_id)->toBe('22222222-3333-4444-5555-666666666666')
+        ->and($state->inactive_retirement_dispatch_reserved_until_at->isFuture())->toBeTrue();
+    Queue::assertPushed(RetireBlueGreenInactiveContainerJob::class, fn (RetireBlueGreenInactiveContainerJob $job): bool => $job->stateId === $state->id
+        && $job->ownerDeploymentUuid === $owner->deployment_uuid
+        && $job->supersessionGeneration === $state->inactive_retirement_supersession_generation);
+    expect(implode("\n", $payloads))->not->toContain(
+        'sh "$container_journal_mutation_decoded"',
+        'sh "$container_journal_completion_decoded"',
+    );
+});
+
+it('reconciles an already retired mature target and advances only its exact fence successor', function (string $targetStatus): void {
+    ['state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    Queue::fake();
+    $payloads = [];
+    $archived = false;
+    fakeMatureInactiveRetirementJournalRemote($payloads, $archived, $targetStatus);
+    $expectedFenceSequence = $state->destination_fence_mutation_sequence + 1;
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $state->id,
+        apply: true,
+        reason: 'Reconcile the absent exact inactive target after preserving its immutable journal.',
+        staleContainerJournal: true,
+    );
+    $state = $state->fresh();
+
+    expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::RECOVERED)
+        ->and($archived)->toBeTrue()
+        ->and($state->destination_fence_mutation_sequence)->toBe($expectedFenceSequence)
+        ->and($state->inactive_retirement_stopped_at)->not->toBeNull();
+    Queue::assertNothingPushed();
+})->with([
+    'absent target' => 'absent',
+    'stopped target' => 'stopped',
+]);
+
+it('does not duplicate an already-reserved current-generator retirement', function (): void {
+    ['state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    Queue::fake();
+    $payloads = [];
+    $archived = false;
+    fakeMatureInactiveRetirementJournalRemote($payloads, $archived, 'running');
+
+    $first = RecoverBlueGreenIntervention::run(
+        stateId: $state->id,
+        apply: true,
+        reason: 'Archive and requeue the exact mature inactive retirement once.',
+        staleContainerJournal: true,
+    );
+    $second = RecoverBlueGreenIntervention::run(
+        stateId: $state->id,
+        apply: true,
+        reason: 'Verify the exact mature inactive retirement remains idempotently reserved.',
+        staleContainerJournal: true,
+    );
+
+    expect($first->outcome)->toBe(BlueGreenInterventionRecoveryResult::RECOVERED)
+        ->and($second->outcome)->toBe(BlueGreenInterventionRecoveryResult::SKIPPED);
+    Queue::assertPushed(RetireBlueGreenInactiveContainerJob::class, 1);
+});
+
+it('rejects unknown or nonzero mature retirement measurements before remote work', function (?int $connections): void {
+    ['state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    $state->update([
+        'inactive_retirement_last_observed_connections' => $connections,
+        'inactive_retirement_observed_at' => $connections === null ? null : now(),
+    ]);
+    Process::fake();
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $state->id,
+        staleContainerJournal: true,
+    );
+
+    expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY);
+    Process::assertNothingRan();
+})->with([
+    'unknown measurement' => null,
+    'nonzero measurement' => 1,
+]);
+
+it('rejects a mature replica-set retirement before remote work', function (): void {
+    ['application' => $application, 'state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    foreach ([1, 2] as $replicaIndex) {
+        ApplicationBlueGreenReplica::query()->create([
+            'application_blue_green_deployment_id' => $state->id,
+            'application_id' => $application->id,
+            'standalone_docker_id' => $application->destination->id,
+            'color' => $state->inactive_retirement_color,
+            'replica_index' => $replicaIndex,
+            'deployment_uuid' => $state->inactive_retirement_deployment_uuid,
+            'routing_revision' => $state->inactive_retirement_container_routing_revision,
+            'compose_project' => $application->uuid,
+            'compose_service' => $application->uuid."-blue-replica-{$replicaIndex}",
+            'container_name' => $application->uuid."-blue-replica-{$replicaIndex}",
+            'container_id' => str_repeat((string) $replicaIndex, 64),
+            'health_status' => 'healthy',
+            'last_observed_at' => now(),
+        ]);
+    }
+    Process::fake();
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $state->id,
+        apply: true,
+        reason: 'Verify that replica-set stale retirement recovery stays manual-only.',
+        staleContainerJournal: true,
+    );
+
+    expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::STALE_CONTAINER_JOURNAL)
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY);
+    Process::assertNothingRan();
+});
+
+it('rejects a mature retirement target that the active route still owns', function (): void {
+    ['state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    $state->update([
+        'inactive_retirement_color' => BlueGreenDeploymentColor::GREEN,
+        'inactive_retirement_deployment_uuid' => $state->green_deployment_uuid,
+        'inactive_retirement_container_id' => str_repeat('c', 64),
+        'inactive_retirement_container_routing_revision' => $state->routing_revision,
+    ]);
+    Process::fake();
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $state->id,
+        staleContainerJournal: true,
+    );
+
+    expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY);
+    Process::assertNothingRan();
+});
+
+it('rejects concurrent mature state drift before archival', function (): void {
+    ['state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    Queue::fake();
+    $payloads = [];
+    $archived = false;
+    fakeMatureInactiveRetirementJournalRemote(
+        $payloads,
+        $archived,
+        'running',
+        afterInspection: static fn () => ApplicationBlueGreenDeployment::query()
+            ->whereKey($state->id)
+            ->update(['inactive_retirement_attempts' => 9]),
+    );
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $state->id,
+        apply: true,
+        reason: 'Prove a concurrent state change fails closed before archival.',
+        staleContainerJournal: true,
+    );
+
+    expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY)
+        ->and($archived)->toBeFalse();
+    Queue::assertNothingPushed();
+});
+
+it('defers mature journal apply while a live lifecycle owner holds the destination', function (): void {
+    ['application' => $application, 'state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    $payloads = [];
+    $archived = false;
+    fakeMatureInactiveRetirementJournalRemote($payloads, $archived, 'running');
+    $lock = Cache::lock(
+        BlueGreenDeploymentLock::key($application->id, $application->destination->id),
+        30,
+    );
+    expect($lock->get())->toBeTrue();
+
+    try {
+        $result = RecoverBlueGreenIntervention::run(
+            stateId: $state->id,
+            apply: true,
+            reason: 'Prove the live lifecycle owner prevents archival and requeue.',
+            staleContainerJournal: true,
+        );
+    } finally {
+        $lock->release();
+    }
+
+    expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::DEFERRED)
+        ->and($archived)->toBeFalse();
 });
