@@ -207,6 +207,16 @@ function getFilesystemVolumesFromServer(ServiceApplication|ServiceDatabase|Appli
                 $fileVolume->content = null;
                 $fileVolume->is_directory = true;
                 $fileVolume->save();
+            } elseif (instant_remote_process(["test -e $fileLocation && echo OK || echo NOK"], $server) === 'OK') {
+                // Exists, but is neither a regular file nor a directory: a device
+                // node, socket, or fifo the compose file binds directly — masking
+                // a docker socket with /dev/null is the common case. Both `test -f`
+                // and `test -d` say NOK for these, so every branch below read that
+                // as "does not exist" and ran `mkdir -p` on a path that is already
+                // there, failing with "File exists" on every single run. Coolify
+                // did not create these and cannot recreate them; leave them exactly
+                // as the host has them.
+                continue;
             } elseif ($isFile === 'NOK' && $isDir === 'NOK' && ! $fileVolume->is_directory && $isInit && $content) {
                 // Does not exists (no dir or file), not flagged as directory, is init, has content
                 $fileVolume->content = $content;
