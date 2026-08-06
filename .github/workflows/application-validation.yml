@@ -217,6 +217,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           php -d memory_limit=1G vendor/bin/pest --compact --do-not-cache-result \
+            tests/Feature/Api/EmergencyDeploymentRecoveryApiTest.php \
             tests/Feature/ApplicationDeploymentBlueGreenDestinationFenceTest.php \
             tests/Feature/BlueGreenApplicationDeactivationTest.php \
             tests/Feature/BlueGreenApplicationManualStopTest.php \
@@ -230,6 +231,7 @@ jobs:
             tests/Feature/BlueGreenDeactivationDurableBudgetTest.php \
             tests/Feature/BlueGreenDeactivationResumeCommandTest.php \
             tests/Feature/BlueGreenDeploymentReconciliationTest.php \
+            tests/Feature/BlueGreenEmergencyRecoveryLockContentionTest.php \
             tests/Feature/BlueGreenDeploymentRecoveryFailureTest.php \
             tests/Feature/BlueGreenDeploymentRecoveryTest.php \
             tests/Feature/BlueGreenFinalizedDrainingRecoveryTest.php \
@@ -246,6 +248,7 @@ jobs:
             tests/Feature/BlueGreenOperationFencingTest.php \
             tests/Feature/BlueGreenProvenEmptyDeactivationTest.php \
             tests/Feature/BlueGreenReplicaLifecycleTest.php \
+            tests/Feature/BlueGreenStaleContainerJournalRecoveryTest.php \
             tests/Feature/BlueGreenStoppedLegacyContainerCleanupTest.php \
             tests/Feature/BlueGreenSupersessionGenerationTest.php \
             tests/Feature/DeleteResourceJobBlueGreenTest.php \
