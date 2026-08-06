@@ -141,7 +141,7 @@ it('rediscovers a blocked stale successor even without an intervention classific
     Queue::assertPushed(ConvergeBlueGreenDeploymentJob::class, 1);
 });
 
-it('never rediscovers cleanly claimable destinations or fresh successors', function () {
+it('never rediscovers claimable destinations while a live lane owner will drain them', function () {
     Queue::fake();
     $scenario = BlueGreenRecoveryScenario::create(finalized: false);
     ApplicationBlueGreenDeployment::query()->whereKey($scenario->state->id)->update([
@@ -150,6 +150,9 @@ it('never rediscovers cleanly claimable destinations or fresh successors', funct
         'pending_deployment_uuid' => null,
         ...ApplicationBlueGreenDeployment::clearedOperationAttributes(),
     ]);
+    // The scenario's own deployment row is IN_PROGRESS on this lane: when it
+    // finishes, its worker drains the queue, so nothing here is stranded.
+    expect($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
     $stale = makeConvergenceSuccessor($scenario, 'convergence-claimable');
     ApplicationDeploymentQueue::query()->whereKey($stale->id)->update(['updated_at' => now()->subMinutes(5)]);
     $fresh = makeConvergenceSuccessor($scenario, 'convergence-fresh');
@@ -157,6 +160,78 @@ it('never rediscovers cleanly claimable destinations or fresh successors', funct
     expect(ResumeBlueGreenConvergences::run())->toBe(0)
         ->and($fresh->fresh()->status)->toBe(ApplicationDeploymentStatus::QUEUED->value);
     Queue::assertNotPushed(ConvergeBlueGreenDeploymentJob::class);
+});
+
+it('advances a stale queued successor stranded on a claimable destination with no live lane owner', function () {
+    Queue::fake();
+    $scenario = BlueGreenRecoveryScenario::create(finalized: false);
+    ApplicationBlueGreenDeployment::query()->whereKey($scenario->state->id)->update([
+        'phase' => BlueGreenDeploymentPhase::IDLE->value,
+        'pending_color' => null,
+        'pending_deployment_uuid' => null,
+        ...ApplicationBlueGreenDeployment::clearedOperationAttributes(),
+    ]);
+    // The exact crash residue the finalized fixed-color fallback leaves when
+    // the worker dies after its terminal commit but before queue advancement:
+    // a terminal owner row and a successor already queued behind it.
+    $scenario->deployment->update([
+        'status' => ApplicationDeploymentStatus::FAILED->value,
+        'blue_green_phase' => BlueGreenDeploymentPhase::IDLE,
+        'finished_at' => now()->subMinutes(10),
+    ]);
+    $stranded = makeConvergenceSuccessor($scenario, 'convergence-stranded');
+    ApplicationDeploymentQueue::query()->whereKey($stranded->id)->update(['updated_at' => now()->subMinutes(5)]);
+
+    expect(ResumeBlueGreenConvergences::run())->toBe(1);
+    Queue::assertPushed(
+        ConvergeBlueGreenDeploymentJob::class,
+        fn (ConvergeBlueGreenDeploymentJob $job): bool => $job->applicationDeploymentQueueId === $stranded->id
+            && $job->applicationId === $scenario->application->id
+            && $job->standaloneDockerId === $scenario->destination->id,
+    );
+});
+
+it('paces stranded-successor re-attempts to the staleness window instead of every scheduler tick', function () {
+    Queue::fake();
+    $scenario = BlueGreenRecoveryScenario::create(finalized: false);
+    ApplicationBlueGreenDeployment::query()->whereKey($scenario->state->id)->update([
+        'phase' => BlueGreenDeploymentPhase::IDLE->value,
+        'pending_color' => null,
+        'pending_deployment_uuid' => null,
+        ...ApplicationBlueGreenDeployment::clearedOperationAttributes(),
+    ]);
+    $scenario->deployment->update([
+        'status' => ApplicationDeploymentStatus::FAILED->value,
+        'blue_green_phase' => BlueGreenDeploymentPhase::IDLE,
+        'finished_at' => now()->subMinutes(10),
+    ]);
+    $stranded = makeConvergenceSuccessor($scenario, 'convergence-stranded-unclaimable');
+    ApplicationDeploymentQueue::query()->whereKey($stranded->id)->update(['updated_at' => now()->subMinutes(5)]);
+
+    // The first run claims the successor row and dispatches once. A row the
+    // dispatch gate can never claim would otherwise be redispatched on every
+    // scheduler tick forever, silently consuming shared dispatch slots.
+    expect(ResumeBlueGreenConvergences::run())->toBe(1)
+        ->and(ResumeBlueGreenConvergences::run())->toBe(0);
+    Queue::assertPushed(ConvergeBlueGreenDeploymentJob::class, 1);
+});
+
+it('advances a stale queued successor stranded with no blue-green state at all', function () {
+    Queue::fake();
+    $scenario = BlueGreenRecoveryScenario::create(finalized: false);
+    ApplicationBlueGreenDeployment::query()->whereKey($scenario->state->id)->delete();
+    $scenario->deployment->update([
+        'status' => ApplicationDeploymentStatus::FAILED->value,
+        'finished_at' => now()->subMinutes(10),
+    ]);
+    $stranded = makeConvergenceSuccessor($scenario, 'convergence-stranded-stateless');
+    ApplicationDeploymentQueue::query()->whereKey($stranded->id)->update(['updated_at' => now()->subMinutes(5)]);
+
+    expect(ResumeBlueGreenConvergences::run())->toBe(1);
+    Queue::assertPushed(
+        ConvergeBlueGreenDeploymentJob::class,
+        fn (ConvergeBlueGreenDeploymentJob $job): bool => $job->applicationDeploymentQueueId === $stranded->id,
+    );
 });
 
 it('schedules one bounded blue-green convergence rediscovery in the background', function (): void {

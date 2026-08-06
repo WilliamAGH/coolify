@@ -32,6 +32,13 @@ final class ResumeBlueGreenConvergences
 
     public const CURSOR_CACHE_KEY = 'blue-green:converge:cursor';
 
+    /**
+     * The staleness threshold the current run selected blocked successors
+     * with; the stranded-successor claim re-checks the same threshold so its
+     * CAS can never claim a row a concurrent run already bumped.
+     */
+    private ?\DateTimeInterface $successorStaleBefore = null;
+
     public function handle(
         int $scanLimit = 100,
         int $dispatchLimit = 10,
@@ -93,11 +100,12 @@ final class ResumeBlueGreenConvergences
             $dispatched++;
         }
 
+        $this->successorStaleBefore = now()->subSeconds($staleAfterSeconds);
         $blockedSuccessors = ApplicationDeploymentQueue::query()
             ->where('status', ApplicationDeploymentStatus::QUEUED->value)
             ->where('pull_request_id', 0)
             ->whereNotNull('destination_id')
-            ->where('updated_at', '<=', now()->subSeconds($staleAfterSeconds))
+            ->where('updated_at', '<=', $this->successorStaleBefore)
             ->orderByDesc('id')
             ->limit($scanLimit)
             ->get();
@@ -115,9 +123,22 @@ final class ResumeBlueGreenConvergences
                 ->orderBy('id')
                 ->first();
             if ($state === null || ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state)) {
-                continue;
-            }
-            if ($state->phase === BlueGreenDeploymentPhase::INTERVENTION_REQUIRED && ! $this->claimInterventionRediscovery($state, $attemptedBefore)) {
+                // A claimable destination with a stale queued successor is not
+                // automatically "no work": every ordinary queue advancement runs
+                // inside the finishing worker, so a crash after its terminal
+                // state committed but before queue_next_deployment ran leaves
+                // this row queued with nothing left alive to drain it. A live
+                // lane owner will drain the lane when it finishes; only an
+                // ownerless lane is advanced from here — and only after the
+                // successor row itself is atomically claimed, exactly like
+                // intervention rediscovery, so a row the dispatch gate keeps
+                // refusing degrades to one paced re-attempt per staleness
+                // window instead of one dispatch per scheduler tick forever.
+                if ($this->laneHasLiveOwner($successor)
+                    || ! $this->claimStrandedSuccessorRediscovery($successor)) {
+                    continue;
+                }
+            } elseif ($state->phase === BlueGreenDeploymentPhase::INTERVENTION_REQUIRED && ! $this->claimInterventionRediscovery($state, $attemptedBefore)) {
                 continue;
             }
             $visitedDestinations[$destinationKey] = true;
@@ -130,6 +151,41 @@ final class ResumeBlueGreenConvergences
         }
 
         return $dispatched;
+    }
+
+    /**
+     * Claims a stranded queued successor immediately before redispatching it,
+     * the same way intervention rediscovery claims its state row: the atomic
+     * staleness CAS serializes overlapping scheduler runs and paces re-attempts
+     * for a row the dispatch gate keeps refusing to one per staleness window.
+     */
+    private function claimStrandedSuccessorRediscovery(ApplicationDeploymentQueue $successor): bool
+    {
+        return ApplicationDeploymentQueue::query()
+            ->whereKey($successor->getKey())
+            ->where('status', ApplicationDeploymentStatus::QUEUED->value)
+            ->where('updated_at', '<=', $this->successorStaleBefore)
+            ->update(['updated_at' => now()]) === 1;
+    }
+
+    /**
+     * Mirrors the exact lanes queue_next_deployment drains — the successor's
+     * server and its serialized application/PR lane. A row in progress on
+     * either lane calls queue_next_deployment when it finishes, so the
+     * successor is not stranded and must not be advanced from here.
+     */
+    private function laneHasLiveOwner(ApplicationDeploymentQueue $successor): bool
+    {
+        return ApplicationDeploymentQueue::query()
+            ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
+            ->where(function ($query) use ($successor): void {
+                $query->where('server_id', $successor->server_id)
+                    ->orWhere(function ($lane) use ($successor): void {
+                        $lane->where('application_id', $successor->application_id)
+                            ->where('pull_request_id', $successor->pull_request_id);
+                    });
+            })
+            ->exists();
     }
 
     /**
