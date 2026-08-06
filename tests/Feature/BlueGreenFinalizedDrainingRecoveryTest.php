@@ -1259,3 +1259,41 @@ it('rejects a one-sided rollback destination-state restoration request', functio
             $fixture['previousConfiguration']->state,
         ))->toThrow(InvalidArgumentException::class, 'requires both current and restored destination states');
 });
+
+it('treats an unmeasurable drain budget as spent so a deferral cannot loop forever', function (): void {
+    $fixture = fixedColorBlueGreenRecoveryFixture(BlueGreenDeploymentPhase::DRAINING);
+    $operation = ReconstructBlueGreenDeploymentRecovery::run($fixture['state']);
+    $lifecycle = new BlueGreenDeploymentLifecycle(
+        application: $operation->application,
+        deployment: $operation->deployment,
+        destination: $operation->destination,
+        server: $operation->server,
+        timeout: 30,
+        checkForCancellation: static function (): void {},
+    );
+
+    // No claim at all: nothing durable to resume. This is the exact shape that
+    // held a production deployment in progress for half an hour — the drain
+    // timeout deferred to a resume owner that found no operation, returned
+    // without terminalizing, and the stale-dispatch recovery replayed the whole
+    // deployment every six minutes. Reading "no deadline" as "budget remains" is
+    // what made that cycle endless.
+    expect($lifecycle->hasSpentDrainRecoveryBudget())->toBeTrue();
+
+    // A claim whose durable state carries no drain deadline is equally
+    // unmeasurable, and equally pointless to defer against.
+    setFixedColorRecoveryLifecycleProperty($lifecycle, 'claim', $operation->claim);
+    $fixture['state']->update(['operation_drain_deadline_at' => null]);
+    expect($lifecycle->drainRecoveryDeadline())->toBeNull()
+        ->and($lifecycle->hasSpentDrainRecoveryBudget())->toBeTrue();
+
+    // A live drain still inside its bounded budget must keep deferring, or a
+    // resumable drain would be abandoned the moment it timed out once.
+    $fixture['state']->update(['operation_drain_deadline_at' => now()->subSeconds(5)]);
+    expect($lifecycle->hasSpentDrainRecoveryBudget())->toBeFalse();
+
+    $fixture['state']->update([
+        'operation_drain_deadline_at' => now()->subSeconds(BlueGreenDeploymentLifecycle::DRAIN_RECOVERY_BUDGET_SECONDS + 5),
+    ]);
+    expect($lifecycle->hasSpentDrainRecoveryBudget())->toBeTrue();
+});

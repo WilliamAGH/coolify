@@ -853,13 +853,24 @@ final class BlueGreenDeploymentLifecycle
      * deferral can make progress. The deadline never advances, so a caller that
      * keeps deferring past this point loops forever and leaves the deployment
      * nonterminal — fencing every later push to the application.
+     *
+     * An absent deadline is spent, not unlimited. Callers ask this to decide
+     * whether deferring to a fenced resume owner can still achieve anything, and
+     * there is no deadline precisely when no durable drain operation exists to
+     * resume — so the resume owner would find nothing, return without
+     * terminalizing, and the stale-dispatch recovery would replay the whole
+     * deployment on its next window. Read as "budget remains", that produced an
+     * endless six-minute defer/replay cycle against an IDLE destination, holding
+     * a deployment in progress indefinitely with no build ever starting.
      */
     public function hasSpentDrainRecoveryBudget(): bool
     {
         $deadline = $this->drainRecoveryDeadline();
+        if ($deadline === null) {
+            return true;
+        }
 
-        return $deadline !== null
-            && $deadline->addSeconds(self::DRAIN_RECOVERY_BUDGET_SECONDS)->isPast();
+        return $deadline->addSeconds(self::DRAIN_RECOVERY_BUDGET_SECONDS)->isPast();
     }
 
     /**
