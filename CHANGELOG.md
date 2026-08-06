@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [4.13.70-fork] - 2026-08-06
+
+### 🐛 Bug Fixes
+
+- *(blue-green)* Finish stale-journal recovery and stop retiring a transient container
+
+### 📚 Documentation
+
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.70-fork
+
 ## [4.13.69-fork] - 2026-08-06
 
 ### 🐛 Bug Fixes
