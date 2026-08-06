@@ -118,6 +118,33 @@ it('accepts the exact live deployment owner after refreshing its heartbeat', fun
     ))->toBe(BlueGreenDeploymentPhase::PREPARING);
 });
 
+it('accepts a deployment owner minted after a terminal deactivation completed', function (BlueGreenDeactivationPhase $terminalPhase): void {
+    $fixture = blueGreenOperationFenceFixture();
+    // Deactivation rows are permanent history: nothing deletes them and the
+    // terminal phases below never fence, so an application that was stopped or
+    // deleted once must still be able to own a later deployment.
+    ApplicationBlueGreenDeactivation::query()->create([
+        'application_id' => $fixture['application']->id,
+        'standalone_docker_id' => $fixture['claim']->standaloneDockerId,
+        'operation_id' => str_repeat('e', 64),
+        'started_at' => now()->subMinute(),
+        'queue_cutoff_id' => $fixture['deployment']->getKey() - 1,
+        'supersession_generation' => $fixture['claim']->supersessionGeneration,
+        'phase' => $terminalPhase,
+        'completed_at' => now()->subMinute(),
+    ]);
+    $lock = Mockery::mock(Lock::class);
+    $lock->shouldReceive('refresh')->once()->with(17)->andReturnTrue();
+
+    expect(blueGreenOperationFence($lock)->assertDeploymentOwnership(
+        $fixture['claim'],
+        [BlueGreenDeploymentPhase::PREPARING],
+    ))->toBe(BlueGreenDeploymentPhase::PREPARING);
+})->with([
+    'stopped' => [BlueGreenDeactivationPhase::STOPPED],
+    'completed' => [BlueGreenDeactivationPhase::COMPLETED],
+]);
+
 it('rejects a deployment owner when its durable ownership changes', function (Closure $mutate): void {
     $fixture = blueGreenOperationFenceFixture();
     $lock = Mockery::mock(Lock::class);

@@ -253,6 +253,57 @@ it('defers durable draining states to the dedicated resume job without forward c
     );
 });
 
+it('resumes a durable drain on a destination whose only deactivation is a finished stop', function (): void {
+    Queue::fake();
+    $scenario = BlueGreenRecoveryScenario::create();
+    $startedAt = now()->subMinutes(10);
+    $deadlineAt = now()->subMinutes(5);
+    $scenario->state->update([
+        'phase' => BlueGreenDeploymentPhase::DRAINING,
+        'active_color' => BlueGreenDeploymentColor::BLUE,
+        'pending_color' => null,
+        'pending_deployment_uuid' => null,
+        'blue_deployment_uuid' => BlueGreenRecoveryScenario::OPERATION_UUID,
+        'operation_drain_started_at' => $startedAt,
+        'operation_drain_deadline_at' => $deadlineAt,
+        'operation_drain_last_observed_connections' => 1,
+        'operation_drain_observed_at' => $deadlineAt,
+    ]);
+    $scenario->deployment->update([
+        'blue_green_phase' => BlueGreenDeploymentPhase::DRAINING,
+        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+    ]);
+    // A destination keeps exactly one deactivation row and nothing ever deletes
+    // it, so this finished stop is history: the drain above belongs to a later
+    // deployment and no live owner is tearing the destination down. Fencing on
+    // the row's existence made one past stop withhold the resume job from every
+    // future drain on this application, permanently.
+    $finishedStop = ApplicationBlueGreenDeactivation::query()->create([
+        'application_id' => $scenario->application->id,
+        'standalone_docker_id' => $scenario->destination->id,
+        'operation_id' => str_repeat('d', 64),
+        'started_at' => now()->subDay(),
+        'queue_cutoff_id' => 0,
+        'supersession_generation' => 1,
+        'phase' => BlueGreenDeactivationPhase::STOPPED,
+        'completed_at' => now()->subDay()->addMinute(),
+    ]);
+    $finishedStop->assertValid();
+    blueGreenReconciliationMakeQueueStale($scenario->deployment);
+
+    $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
+
+    expect($result->outcome)->toBe(BlueGreenReconciliationResult::DEFERRED, $result->message)
+        ->and($result->message)->toContain('dedicated fenced resume job')
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::DRAINING)
+        ->and($scenario->deployment->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::DRAINING)
+        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
+    Queue::assertPushed(
+        ResumeBlueGreenDrainingDeploymentJob::class,
+        fn (ResumeBlueGreenDrainingDeploymentJob $job): bool => $job->applicationDeploymentQueueId === $scenario->deployment->id,
+    );
+});
+
 it('keeps a routed stale prepared activation on the intervention recovery path', function (): void {
     Bus::fake();
     Notification::fake();
@@ -323,6 +374,83 @@ it('leaves a deactivation-owned state untouched', function (): void {
         ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
         ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
         ->and($deactivation->fresh()->phase)->toBe(BlueGreenDeactivationPhase::DEACTIVATING);
+});
+
+it('parks a broken operation on a destination whose only deactivation is a finished stop', function (): void {
+    Notification::fake();
+    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
+    // Terminal deactivation phases are permanent history, never an owner. While
+    // this row fenced by existence, an application stopped even once could never
+    // park a later broken promotion again — the only exit this action provides —
+    // so its state stayed mid-operation and no retry could ever converge it.
+    $finishedStop = ApplicationBlueGreenDeactivation::query()->create([
+        'application_id' => $scenario->application->id,
+        'standalone_docker_id' => $scenario->destination->id,
+        'operation_id' => str_repeat('e', 64),
+        'started_at' => now()->subDay(),
+        'queue_cutoff_id' => 0,
+        'supersession_generation' => 1,
+        'phase' => BlueGreenDeactivationPhase::STOPPED,
+        'completed_at' => now()->subDay()->addMinute(),
+    ]);
+    $finishedStop->assertValid();
+
+    $recorded = MarkBlueGreenRecoveryInterventionRequired::run(
+        $scenario->state->id,
+        BlueGreenRecoveryScenario::OPERATION_UUID,
+        1,
+        'The durable operation lost its exact owner after a past stop.',
+    );
+
+    expect($recorded)->toBeTrue()
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
+        ->and($scenario->state->fresh()->intervention_phase)->toBe(BlueGreenDeploymentPhase::PREPARING->value)
+        ->and($scenario->deployment->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
+        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value)
+        ->and($scenario->deployment->fresh()->finished_at)->not->toBeNull()
+        ->and($finishedStop->fresh()->phase)->toBe(BlueGreenDeactivationPhase::STOPPED);
+});
+
+it('still refuses to park a state fenced by a deactivation that stopped short of terminal', function (): void {
+    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
+    $fencing = ApplicationBlueGreenDeactivation::query()->create([
+        'application_id' => $scenario->application->id,
+        'standalone_docker_id' => $scenario->destination->id,
+        'operation_id' => str_repeat('f', 64),
+        'started_at' => now()->subMinute(),
+        'queue_cutoff_id' => 0,
+        'supersession_generation' => 1,
+        'phase' => BlueGreenDeactivationPhase::INTERVENTION_REQUIRED,
+    ]);
+
+    expect(MarkBlueGreenRecoveryInterventionRequired::run(
+        $scenario->state->id,
+        BlueGreenRecoveryScenario::OPERATION_UUID,
+        1,
+    ))->toBeFalse()
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
+        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
+
+    $fencing->update(['phase' => BlueGreenDeactivationPhase::REMOVING]);
+
+    expect(MarkBlueGreenRecoveryInterventionRequired::run(
+        $scenario->state->id,
+        BlueGreenRecoveryScenario::OPERATION_UUID,
+        1,
+    ))->toBeFalse()
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::PREPARING);
+
+    $fencing->update([
+        'phase' => BlueGreenDeactivationPhase::REMOVED,
+        'completed_at' => now(),
+    ]);
+
+    expect(MarkBlueGreenRecoveryInterventionRequired::run(
+        $scenario->state->id,
+        BlueGreenRecoveryScenario::OPERATION_UUID,
+        1,
+    ))->toBeFalse()
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::PREPARING);
 });
 
 it('converges only a stale unmutated operation whose exact candidate is proven absent', function (): void {

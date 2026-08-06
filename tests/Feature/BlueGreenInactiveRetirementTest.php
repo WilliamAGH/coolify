@@ -570,6 +570,70 @@ it('delays retirement against the immutable inactive port inventory after a live
         ->and($state->fresh()->inactive_retirement_stopped_at)->toBeNull();
 });
 
+it('allows completed deactivation history but still fences a live deactivation before remote retirement work', function (): void {
+    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeReadyBlueGreenInactiveRetirement();
+    $bootId = '11111111-2222-3333-4444-555555555555';
+    $deactivation = ApplicationBlueGreenDeactivation::query()->create([
+        'application_id' => $application->id,
+        'standalone_docker_id' => $application->destination->id,
+        'phase' => BlueGreenDeactivationPhase::COMPLETED,
+        'operation_id' => hash('sha256', 'completed-retirement-deactivation-history'),
+        'started_at' => now()->subHour(),
+        'queue_cutoff_id' => 0,
+        'supersession_generation' => 1,
+        'completed_at' => now()->subMinutes(59),
+    ]);
+    InspectBlueGreenContainer::shouldRun()
+        ->once()
+        ->andReturn(new BlueGreenContainerInspection(
+            exists: true,
+            dockerId: $state->inactive_retirement_container_id,
+            status: ContainerStatusTypes::RESTARTING->value,
+            health: 'healthy',
+        ));
+    $remoteAttempts = 0;
+    Process::fake(function () use (&$remoteAttempts, $bootId): FakeProcessResult {
+        $remoteAttempts++;
+
+        return Process::result(output: $bootId);
+    });
+
+    expect(RetireBlueGreenInactiveContainer::run($state->id, $owner->deployment_uuid, 2))
+        ->toBe(RetireBlueGreenInactiveContainer::RETRY)
+        ->and($remoteAttempts)->toBe(1);
+
+    $deactivation->update([
+        'phase' => BlueGreenDeactivationPhase::DEACTIVATING,
+        'completed_at' => null,
+    ]);
+
+    expect(RetireBlueGreenInactiveContainer::run($state->id, $owner->deployment_uuid, 2))
+        ->toBe(RetireBlueGreenInactiveContainer::INTERVENTION)
+        ->and($remoteAttempts)->toBe(1)
+        ->and($state->fresh()->inactive_retirement_intervention_required_at)->not->toBeNull();
+});
+
+it('fences an inactive retirement owner covered by terminal stop history before remote work', function (): void {
+    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeReadyBlueGreenInactiveRetirement();
+    ApplicationBlueGreenDeactivation::query()->create([
+        'application_id' => $application->id,
+        'standalone_docker_id' => $application->destination->id,
+        'phase' => BlueGreenDeactivationPhase::STOPPED,
+        'operation_id' => hash('sha256', 'cut-off-retirement-owner'),
+        'started_at' => now(),
+        'queue_cutoff_id' => $owner->getKey(),
+        'supersession_generation' => 1,
+        'completed_at' => now(),
+    ]);
+    InspectBlueGreenContainer::shouldRun()->never();
+    Process::fake();
+
+    expect(RetireBlueGreenInactiveContainer::run($state->id, $owner->deployment_uuid, 2))
+        ->toBe(RetireBlueGreenInactiveContainer::INTERVENTION)
+        ->and($state->fresh()->inactive_retirement_intervention_required_at)->not->toBeNull();
+    Process::assertNothingRan();
+});
+
 it('backfills pending retirement inventories when the runtime route digest differs from its claim digest', function (): void {
     $application = makeBlueGreenInactiveRetirementApplication();
     $destination = $application->destination;
@@ -1798,6 +1862,77 @@ it('archives a running mature target and queues one current-generator retirement
         'sh "$container_journal_mutation_decoded"',
         'sh "$container_journal_completion_decoded"',
     );
+});
+
+it('archives and requeues a mature retirement on a destination that was stopped once before', function (): void {
+    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    // The permanent history a destination keeps after its application was
+    // stopped once: superseded in place by any later stop, deleted by nothing.
+    // It predates this retirement generation, so it fences none of it — and
+    // refusing on its mere existence left the stale journal, and with it the
+    // unretired inactive container, in place forever.
+    ApplicationBlueGreenDeactivation::query()->create([
+        'application_id' => $application->id,
+        'standalone_docker_id' => $application->destination->id,
+        'phase' => BlueGreenDeactivationPhase::STOPPED,
+        'operation_id' => hash('sha256', 'mature-journal-stop-history'),
+        'started_at' => now()->subDay(),
+        'queue_cutoff_id' => 0,
+        'supersession_generation' => 1,
+        'completed_at' => now()->subDay()->addMinute(),
+    ]);
+    Queue::fake();
+    $payloads = [];
+    $archived = false;
+    fakeMatureInactiveRetirementJournalRemote($payloads, $archived, 'running');
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $state->id,
+        apply: true,
+        reason: 'Archive the authenticated journal on a destination whose last stop already completed.',
+        staleContainerJournal: true,
+    );
+    $state = $state->fresh();
+
+    expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::RECOVERED)
+        ->and($archived)->toBeTrue()
+        ->and($state->inactive_retirement_intervention_required_at)->toBeNull()
+        ->and($state->inactive_retirement_attempts)->toBe(0)
+        ->and($state->inactive_retirement_dispatch_reserved_until_at->isFuture())->toBeTrue();
+    Queue::assertPushed(RetireBlueGreenInactiveContainerJob::class, fn (RetireBlueGreenInactiveContainerJob $job): bool => $job->stateId === $state->id
+        && $job->ownerDeploymentUuid === $owner->deployment_uuid
+        && $job->supersessionGeneration === $state->inactive_retirement_supersession_generation);
+});
+
+it('does not archive or requeue a mature retirement while its destination is being stopped', function (): void {
+    ['application' => $application, 'state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    ApplicationBlueGreenDeactivation::query()->create([
+        'application_id' => $application->id,
+        'standalone_docker_id' => $application->destination->id,
+        'phase' => BlueGreenDeactivationPhase::STOPPING,
+        'operation_id' => hash('sha256', 'mature-journal-live-stop'),
+        'started_at' => now()->subMinute(),
+        'queue_cutoff_id' => 0,
+        'supersession_generation' => 2,
+    ]);
+    Queue::fake();
+    $payloads = [];
+    $archived = false;
+    fakeMatureInactiveRetirementJournalRemote($payloads, $archived, 'running');
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $state->id,
+        apply: true,
+        reason: 'Attempt mature journal archival while a stop still owns the destination.',
+        staleContainerJournal: true,
+    );
+
+    // A stop in progress owns this destination's containers and routes right
+    // now; re-arming a retirement dispatch underneath it is exactly what the
+    // guard exists to prevent.
+    expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY)
+        ->and($archived)->toBeFalse();
+    Queue::assertNotPushed(RetireBlueGreenInactiveContainerJob::class);
 });
 
 it('reconciles an already retired mature target and advances only its exact fence successor', function (string $targetStatus): void {

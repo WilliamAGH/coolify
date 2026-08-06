@@ -60,6 +60,30 @@ final class RecoverBlueGreenIntervention
     }
 
     /**
+     * Whether the destination's durable deactivation row is a live fence rather
+     * than permanent history.
+     *
+     * There is exactly one deactivation row per destination and nothing ever
+     * deletes it: a later stop supersedes it in place, so a terminal STOPPED or
+     * COMPLETED phase only records that this destination was stopped or torn
+     * down at some point in the past. Refusing recovery on its mere existence
+     * meant an application that had been stopped even once could never have any
+     * later intervention or stale journal recovered again — the destination
+     * stayed parked forever, which is exactly how retirement kept two live
+     * containers beside each other and served conflicting-owner 502s.
+     *
+     * Deployment claims already ask the right question, and deliberately do not
+     * treat a terminal stopped or completed deactivation as fencing. Intervention
+     * recovery asks the same one, so every in-progress deactivation, every
+     * deactivation parked for its own intervention, and every REMOVED
+     * destination still fences.
+     */
+    private static function deactivationFencesRecovery(?ApplicationBlueGreenDeactivation $deactivation): bool
+    {
+        return $deactivation?->phase->fencesDeploymentClaims() === true;
+    }
+
+    /**
      * The operation the caller decided to recover, re-proven under the state fence
      * before any durable mutation. Null when the caller has no prior decision to
      * bind — the scheduled owners recover whatever the destination is parked on.
@@ -778,7 +802,7 @@ final class RecoverBlueGreenIntervention
             $state = $locks->state;
             if ($state === null
                 || (int) $state->id !== (int) $context['state']->id
-                || $locks->deactivation !== null) {
+                || self::deactivationFencesRecovery($locks->deactivation)) {
                 throw new BlueGreenDeploymentTransitionException('The inactive-retirement owner changed after journal archival.');
             }
             $retirement = $context['inactive_retirement'];
@@ -1075,7 +1099,7 @@ final class RecoverBlueGreenIntervention
                 ? null
                 : Server::query()->whereKey($destination->server_id)->lockForUpdate()->first();
             if ($application->trashed()
-                || $locks->deactivation !== null
+                || self::deactivationFencesRecovery($locks->deactivation)
                 || $destination === null
                 || $server === null
                 || $application->blueGreenPrimaryStandaloneDockerDestinationId() !== (int) $destination->id
@@ -1255,7 +1279,7 @@ final class RecoverBlueGreenIntervention
             || $inactiveUuid === ''
             || $owner === null
             || $inactive === null
-            || $locks->deactivation !== null
+            || self::deactivationFencesRecovery($locks->deactivation)
             || $state->phase !== BlueGreenDeploymentPhase::IDLE
             || $state->pending_color !== null
             || $state->pending_deployment_uuid !== null
@@ -2410,7 +2434,10 @@ SH;
                 $identity->standalone_docker_id,
             );
             $state = $locks->state;
-            if ($state === null || $state->id !== $stateId || $locks->application->trashed() || $locks->deactivation !== null) {
+            if ($state === null
+                || $state->id !== $stateId
+                || $locks->application->trashed()
+                || self::deactivationFencesRecovery($locks->deactivation)) {
                 throw new BlueGreenDeploymentTransitionException('The finalized intervention owner changed before recovery could begin.');
             }
             $operationUuid = $state->operation_deployment_uuid;
@@ -2477,7 +2504,10 @@ SH;
                 $identity->standalone_docker_id,
             );
             $state = $locks->state;
-            if ($state === null || $state->id !== $stateId || $locks->application->trashed() || $locks->deactivation !== null) {
+            if ($state === null
+                || $state->id !== $stateId
+                || $locks->application->trashed()
+                || self::deactivationFencesRecovery($locks->deactivation)) {
                 throw new BlueGreenDeploymentTransitionException('The unreconstructable finalized intervention owner changed before terminalization could begin.');
             }
             $operationUuid = $state->operation_deployment_uuid;
@@ -2532,7 +2562,10 @@ SH;
                 $identity->standalone_docker_id,
             );
             $state = $locks->state;
-            if ($state === null || $state->id !== $stateId || $locks->application->trashed() || $locks->deactivation !== null) {
+            if ($state === null
+                || $state->id !== $stateId
+                || $locks->application->trashed()
+                || self::deactivationFencesRecovery($locks->deactivation)) {
                 throw new BlueGreenDeploymentTransitionException('The mid-flight intervention owner changed before recovery could begin.');
             }
             $operationUuid = $state->operation_deployment_uuid;

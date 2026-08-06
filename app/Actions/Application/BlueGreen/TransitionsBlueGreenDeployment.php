@@ -177,9 +177,16 @@ final class TransitionsBlueGreenDeployment
                 || $deployment === null
                 || $previousDeployment === null
                 || $locks->application->trashed()
-                || $locks->deactivation !== null) {
+                || $locks->deactivation?->phase->fencesDeploymentClaims() === true) {
                 throw new BlueGreenDeploymentTransitionException('The finalized draining fallback no longer has its exact durable owners.');
             }
+            // The one deactivation row a destination keeps is never deleted, so a
+            // terminal STOPPED/COMPLETED phase is history, not an owner. Refusing on
+            // its existence meant one past stop permanently denied this fallback the
+            // only transition that can restore the predecessor and terminalize the
+            // failed candidate, leaving the destination stuck mid-drain forever.
+            // assertDeploymentOwner still applies the full canonical fence — including
+            // the per-deployment cutoff that catches a candidate predating that stop.
             $locks->assertDeploymentOwner($claim, $deployment);
             self::assertExactFinalizedFixedColorFallback(
                 $state,

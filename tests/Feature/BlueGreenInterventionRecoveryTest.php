@@ -1144,3 +1144,136 @@ it('leaves a resumable drain alone when the resume failed for a reason other tha
     expect($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::DRAINING)
         ->and($scenario->state->fresh()->intervention_reason)->toBeNull();
 });
+
+/**
+ * The permanent history a destination keeps after its application was stopped
+ * once: one terminal STOPPED row, superseded in place by any later stop and
+ * deleted by nothing. It predates every deployment in these scenarios, so it
+ * fences none of them under any canonical predicate.
+ */
+function stoppedBlueGreenDeactivationHistory(BlueGreenRecoveryScenario $scenario): ApplicationBlueGreenDeactivation
+{
+    return ApplicationBlueGreenDeactivation::query()->create([
+        'application_id' => $scenario->application->id,
+        'standalone_docker_id' => $scenario->destination->id,
+        'operation_id' => str_repeat('c', 64),
+        'started_at' => now()->subDay()->startOfSecond(),
+        'queue_cutoff_id' => 0,
+        'supersession_generation' => 1,
+        'phase' => BlueGreenDeactivationPhase::STOPPED,
+        'completed_at' => now()->subDay()->addMinute()->startOfSecond(),
+    ]);
+}
+
+it('reopens a finalized draining intervention on a destination that was stopped once before', function (): void {
+    Queue::fake();
+    $scenario = BlueGreenRecoveryScenario::create(finalized: true, routingMutationRecorded: true);
+    $deactivation = stoppedBlueGreenDeactivationHistory($scenario);
+    $scenario->state->update([
+        'phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+        'intervention_phase' => BlueGreenDeploymentPhase::DRAINING->value,
+        'intervention_reason' => 'Finalization requires a fenced drain recovery retry.',
+        'operation_drain_started_at' => now()->subMinutes(2),
+        'operation_drain_deadline_at' => now()->subMinute(),
+    ]);
+    $scenario->deployment->update([
+        'status' => ApplicationDeploymentStatus::FAILED->value,
+        'blue_green_phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+        'finished_at' => now(),
+    ]);
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        apply: true,
+        reason: 'Verified the durable finalized route before resuming drain recovery.',
+    );
+
+    // Refusing on the mere existence of the row parked this destination forever:
+    // the stop is dead history, and the deployment it is being asked to fence
+    // was created long after that stop completed.
+    expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::FINALIZED_UNCONFIRMED)
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::DEFERRED)
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::DRAINING)
+        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+        ->and($deactivation->fresh()->phase)->toBe(BlueGreenDeactivationPhase::STOPPED);
+    Queue::assertPushed(
+        ResumeBlueGreenDrainingDeploymentJob::class,
+        fn (ResumeBlueGreenDrainingDeploymentJob $job): bool => $job->applicationDeploymentQueueId === $scenario->deployment->id,
+    );
+});
+
+it('keeps a finalized draining intervention fenced while its destination is being stopped', function (): void {
+    Queue::fake();
+    $scenario = BlueGreenRecoveryScenario::create(finalized: true, routingMutationRecorded: true);
+    stoppedBlueGreenDeactivationHistory($scenario)->update([
+        'phase' => BlueGreenDeactivationPhase::STOPPING,
+        'completed_at' => null,
+    ]);
+    $scenario->state->update([
+        'phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+        'intervention_phase' => BlueGreenDeploymentPhase::DRAINING->value,
+        'intervention_reason' => 'Finalization requires a fenced drain recovery retry.',
+        'operation_drain_started_at' => now()->subMinutes(2),
+        'operation_drain_deadline_at' => now()->subMinute(),
+    ]);
+    $scenario->deployment->update([
+        'status' => ApplicationDeploymentStatus::FAILED->value,
+        'blue_green_phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+        'finished_at' => now(),
+    ]);
+    $stateBefore = $scenario->state->fresh()->getAttributes();
+
+    // An in-progress stop owns this destination's containers and routes right
+    // now; reopening a drain underneath it is the case the guard exists for.
+    expect(fn () => RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        apply: true,
+        reason: 'Attempt a drain resume while a stop still owns the destination.',
+    ))->toThrow(BlueGreenDeploymentTransitionException::class);
+
+    expect($scenario->state->fresh()->getAttributes())->toBe($stateBefore)
+        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value);
+    Queue::assertNotPushed(ResumeBlueGreenDrainingDeploymentJob::class);
+});
+
+it('terminalizes an unreconstructable drain on a destination that was stopped once before', function (): void {
+    Queue::fake();
+    ['scenario' => $scenario, 'liveState' => $liveState] = unreconstructableFinalizedDrainScenario();
+    stoppedBlueGreenDeactivationHistory($scenario);
+    fakeBlueGreenManagedRouteMetadata($liveState);
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        apply: true,
+        reason: 'Automatic retry after a resume proved the operation unreconstructable.',
+    );
+
+    // Terminalization mutates nothing on the destination, so a stop that already
+    // completed cannot be harmed by it — but refusing left the only exit from an
+    // unreconstructable drain permanently closed for this application.
+    expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::FINALIZED_UNRECONSTRUCTABLE)
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::RECOVERED)
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::IDLE)
+        ->and($scenario->deployment->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::IDLE);
+});
+
+it('reopens a mid-flight intervention on a destination that was stopped once before', function (): void {
+    BlueGreenProxyRollbackArtifactReader::shouldRun()->once()->andReturnNull();
+    ['scenario' => $scenario] = absentRouteMidFlightInterventionScenario();
+    stoppedBlueGreenDeactivationHistory($scenario);
+    Process::fake([
+        '*coolify-blue-green-managed-route*' => Process::result(output: 'coolify-blue-green-managed-route:absent'),
+        '*' => Process::result(output: 'coolify-blue-green-destination-state-attested'),
+    ]);
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        apply: true,
+        reason: 'Reopen the exact prepared activation after absent-route predecessor attestation.',
+    );
+
+    expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::MID_FLIGHT)
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
+        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+        ->and($scenario->deployment->fresh()->finished_at)->toBeNull();
+});

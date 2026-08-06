@@ -8,11 +8,13 @@ use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\Application;
+use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
 use Illuminate\Support\Facades\DB;
+use LogicException;
 use Lorisleiva\Actions\Concerns\AsAction;
 
 /**
@@ -196,10 +198,10 @@ final class QuarantineSpentFirstAdoptionDrainJournal
             if ($state === null
                 || (int) $state->getKey() !== $stateId
                 || $locks->application->trashed()
-                || $locks->deactivation !== null
                 || $deployment === null
                 || $destination === null
-                || $destination->server === null) {
+                || $destination->server === null
+                || $this->deactivationFencesQuarantine($locks->deactivation, $deployment)) {
                 throw new BlueGreenDeploymentTransitionException('The spent first-adoption drain no longer has one exact live destination owner.');
             }
             $this->assertDurableOwner($locks->application, $destination, $state, $deployment);
@@ -274,6 +276,41 @@ final class QuarantineSpentFirstAdoptionDrainJournal
                 'state' => $state,
             ];
         }, attempts: 5);
+    }
+
+    /**
+     * Whether the destination's durable deactivation row is a live fence rather
+     * than permanent history.
+     *
+     * There is exactly one deactivation row per destination and nothing ever
+     * deletes it, so a terminal STOPPED or COMPLETED phase only records that
+     * this destination was stopped or torn down at some point in the past. An
+     * application stopped even once would otherwise never be able to quarantine
+     * a spent first-adoption drain journal again: the live deployment path
+     * fails outright, and the parked recovery path audits the journal as
+     * unrecoverable and leaves a pending mutation journal on the host forever.
+     *
+     * Every in-progress deactivation, every deactivation parked for its own
+     * intervention, and every REMOVED destination still fences by phase, and
+     * beyond phase the exact drain owner this archival acts for must not be one
+     * the deactivation cut off.
+     */
+    private function deactivationFencesQuarantine(
+        ?ApplicationBlueGreenDeactivation $deactivation,
+        ApplicationDeploymentQueue $deployment,
+    ): bool {
+        if ($deactivation === null) {
+            return false;
+        }
+
+        try {
+            $deactivation->assertValid();
+        } catch (LogicException $exception) {
+            throw new BlueGreenDeploymentTransitionException('The spent first-adoption drain deactivation fence is malformed.', 0, $exception);
+        }
+
+        return $deactivation->phase->fencesDeploymentClaims()
+            || $deactivation->fences($deployment);
     }
 
     private function assertDurableOwner(
