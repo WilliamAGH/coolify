@@ -32,13 +32,6 @@ final class ResumeBlueGreenConvergences
 
     public const CURSOR_CACHE_KEY = 'blue-green:converge:cursor';
 
-    /**
-     * The staleness threshold the current run selected blocked successors
-     * with; the stranded-successor claim re-checks the same threshold so its
-     * CAS can never claim a row a concurrent run already bumped.
-     */
-    private ?\DateTimeInterface $successorStaleBefore = null;
-
     public function handle(
         int $scanLimit = 100,
         int $dispatchLimit = 10,
@@ -100,12 +93,12 @@ final class ResumeBlueGreenConvergences
             $dispatched++;
         }
 
-        $this->successorStaleBefore = now()->subSeconds($staleAfterSeconds);
+        $successorStaleBefore = now()->subSeconds($staleAfterSeconds);
         $blockedSuccessors = ApplicationDeploymentQueue::query()
             ->where('status', ApplicationDeploymentStatus::QUEUED->value)
             ->where('pull_request_id', 0)
             ->whereNotNull('destination_id')
-            ->where('updated_at', '<=', $this->successorStaleBefore)
+            ->where('updated_at', '<=', $successorStaleBefore)
             ->orderByDesc('id')
             ->limit($scanLimit)
             ->get();
@@ -135,7 +128,7 @@ final class ResumeBlueGreenConvergences
                 // refusing degrades to one paced re-attempt per staleness
                 // window instead of one dispatch per scheduler tick forever.
                 if ($this->laneHasLiveOwner($successor)
-                    || ! $this->claimStrandedSuccessorRediscovery($successor)) {
+                    || ! $this->claimStrandedSuccessorRediscovery($successor, $successorStaleBefore)) {
                     continue;
                 }
             } elseif ($state->phase === BlueGreenDeploymentPhase::INTERVENTION_REQUIRED && ! $this->claimInterventionRediscovery($state, $attemptedBefore)) {
@@ -159,12 +152,14 @@ final class ResumeBlueGreenConvergences
      * staleness CAS serializes overlapping scheduler runs and paces re-attempts
      * for a row the dispatch gate keeps refusing to one per staleness window.
      */
-    private function claimStrandedSuccessorRediscovery(ApplicationDeploymentQueue $successor): bool
-    {
+    private function claimStrandedSuccessorRediscovery(
+        ApplicationDeploymentQueue $successor,
+        \DateTimeInterface $staleBefore,
+    ): bool {
         return ApplicationDeploymentQueue::query()
             ->whereKey($successor->getKey())
             ->where('status', ApplicationDeploymentStatus::QUEUED->value)
-            ->where('updated_at', '<=', $this->successorStaleBefore)
+            ->where('updated_at', '<=', $staleBefore)
             ->update(['updated_at' => now()]) === 1;
     }
 

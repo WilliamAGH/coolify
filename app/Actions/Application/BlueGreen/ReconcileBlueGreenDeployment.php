@@ -26,6 +26,13 @@ final class ReconcileBlueGreenDeployment
     use AsAction;
 
     /**
+     * One message for both superseded-request refusals — the snapshot check
+     * before the lock and the re-proof under it — so the two sites can never
+     * drift into reporting the same outcome differently.
+     */
+    private const SUPERSEDED_REQUEST_MESSAGE = 'The requested recovery operation no longer owns this destination; a newer operation took it before the lock was held.';
+
+    /**
      * @param  string|null  $requiredOperationUuid  When set, the destination must still be
      *                                              running this exact operation once the lock is
      *                                              held. A caller that validated ownership
@@ -97,7 +104,7 @@ final class ReconcileBlueGreenDeployment
             return new BlueGreenReconciliationResult(
                 $stateId,
                 BlueGreenReconciliationResult::DEFERRED,
-                'The requested recovery operation no longer owns this destination; a newer operation took it before the lock was held.',
+                self::SUPERSEDED_REQUEST_MESSAGE,
             );
         }
         $releaseOperationFence = false;
@@ -160,7 +167,7 @@ final class ReconcileBlueGreenDeployment
                 return new BlueGreenReconciliationResult(
                     $stateId,
                     BlueGreenReconciliationResult::DEFERRED,
-                    'The requested recovery operation no longer owns this destination; a newer operation took it before the lock was held.',
+                    self::SUPERSEDED_REQUEST_MESSAGE,
                 );
             }
 
