@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [4.13.68-fork] - 2026-08-06
+
+### 🐛 Bug Fixes
+
+- *(blue-green)* Treat an unmeasurable drain budget as spent, not unlimited
+- *(test)* Stop asserting against a blue-green state the schema forbids
+
+### 📚 Documentation
+
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.68-fork
+
 ## [4.13.67-fork] - 2026-08-06
 
 ### 🐛 Bug Fixes
