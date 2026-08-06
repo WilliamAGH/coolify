@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [4.13.67-fork] - 2026-08-06
+
+### 🐛 Bug Fixes
+
+- *(blue-green)* Never fail a drain that has no connections left to lose
+
+### 🚜 Refactor
+
+- *(blue-green)* Remove duplicated superseded message and mutable stale cursor
+
+### 📚 Documentation
+
+- Update changelog
+
+### 🧪 Testing
+
+- *(services)* Cover the special-file bind source left uncreated
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.67-fork
+
 ## [4.13.66-fork] - 2026-08-06
 
 ### 🐛 Bug Fixes
