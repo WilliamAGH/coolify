@@ -19,6 +19,10 @@ final class MarkBlueGreenRecoveryInterventionRequired
 
     /**
      * Records intervention only while the same durable operation and generation still own the state.
+     *
+     * A terminal deactivation phase is history only for an operation it does not
+     * fence. The phase can reject immediately; once this action locks the exact
+     * queue owner below, its cutoff and creation-time fence are checked too.
      */
     public function handle(
         int $stateId,
@@ -52,7 +56,7 @@ final class MarkBlueGreenRecoveryInterventionRequired
             if ($state === null
                 || $state->id !== $stateId
                 || $locks->application->trashed()
-                || $locks->deactivation !== null
+                || $locks->deactivation?->phase->fencesDeploymentClaims() === true
                 || $state->phase === BlueGreenDeploymentPhase::DEACTIVATING) {
                 return false;
             }
@@ -98,7 +102,8 @@ final class MarkBlueGreenRecoveryInterventionRequired
             }
 
             $deployment = $locks->queue($operationUuid);
-            if (! $this->queueOwnsState($state, $deployment, $operationUuid, $generation)) {
+            if (! $this->queueOwnsState($state, $deployment, $operationUuid, $generation)
+                || ($deployment !== null && $locks->deactivation?->fences($deployment) === true)) {
                 return false;
             }
 

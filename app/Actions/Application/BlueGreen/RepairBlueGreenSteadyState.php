@@ -4,10 +4,12 @@ namespace App\Actions\Application\BlueGreen;
 
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
+use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\StandaloneDocker;
 use Illuminate\Support\Facades\Cache;
+use LogicException;
 use Lorisleiva\Actions\Concerns\AsAction;
 use Throwable;
 
@@ -37,7 +39,10 @@ final class RepairBlueGreenSteadyState
                 $state->standalone_docker_id,
             );
             $state = $locks->state;
-            if ($state === null || $state->id !== $stateId || $locks->application->trashed() || $locks->deactivation !== null) {
+            if ($state === null
+                || $state->id !== $stateId
+                || $locks->application->trashed()
+                || $this->deactivationFencesRepair($locks, $state)) {
                 return new BlueGreenSteadyStateRepairResult($stateId, BlueGreenSteadyStateRepairResult::SKIPPED, 'Deletion or deactivation owns the destination.');
             }
             $this->assertIdleOwner($state);
@@ -117,6 +122,55 @@ final class RepairBlueGreenSteadyState
                 report($exception);
             }
         }
+    }
+
+    /**
+     * Whether the destination's durable deactivation row is a live fence rather
+     * than permanent history.
+     *
+     * There is exactly one deactivation row per destination and nothing ever
+     * deletes it, so a terminal STOPPED or COMPLETED phase only records that
+     * this destination was stopped or torn down at some point in the past. An
+     * application stopped even once would otherwise never have its canonical
+     * steady route verified or repaired again: every scheduled sweep would skip
+     * it forever, leaving a missing or drifted managed route unrepaired with no
+     * owner left to notice.
+     *
+     * The two questions that still fence are the canonical ones. Every
+     * in-progress deactivation, every deactivation parked for its own
+     * intervention, and every REMOVED destination fences by phase, because
+     * writing proxy routes there could restore routing to something being torn
+     * down. Beyond phase, the active route owner this repair would re-publish
+     * must itself not be one the deactivation cut off; without one exact owner
+     * to ask that of, the repair refuses.
+     */
+    private function deactivationFencesRepair(
+        BlueGreenLifecycleDatabaseLocks $locks,
+        ApplicationBlueGreenDeployment $state,
+    ): bool {
+        $deactivation = $locks->deactivation;
+        if ($deactivation === null) {
+            return false;
+        }
+
+        try {
+            $deactivation->assertValid();
+        } catch (LogicException $exception) {
+            throw new BlueGreenDeploymentTransitionException('The blue-green steady-state repair deactivation fence is malformed.', 0, $exception);
+        }
+        if ($deactivation->phase->fencesDeploymentClaims()) {
+            return true;
+        }
+        $activeDeploymentUuid = match ($state->active_color) {
+            BlueGreenDeploymentColor::BLUE => $state->blue_deployment_uuid,
+            BlueGreenDeploymentColor::GREEN => $state->green_deployment_uuid,
+            null => null,
+        };
+        $activeDeployment = is_string($activeDeploymentUuid)
+            ? $locks->queue($activeDeploymentUuid)
+            : null;
+
+        return $activeDeployment === null || $deactivation->fences($activeDeployment);
     }
 
     private function assertIdleOwner(ApplicationBlueGreenDeployment $state): void

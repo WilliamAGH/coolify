@@ -9,6 +9,7 @@ use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\ContainerStatusTypes;
 use App\Models\Application;
+use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationBlueGreenReplica;
 use App\Models\ApplicationDeploymentQueue;
@@ -17,6 +18,7 @@ use App\Models\StandaloneDocker;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use LogicException;
 use Lorisleiva\Actions\Concerns\AsAction;
 use Throwable;
 
@@ -368,19 +370,7 @@ final class RetireBlueGreenInactiveContainer
                 || $state->operation_deployment_uuid !== null
                 || $state->deactivation_operation_id !== null
                 || $state->supersession_generation !== $generation
-                // A deactivation row is permanent history, not a live fence, and
-                // nothing ever deletes one. Refusing on its mere existence meant
-                // that once an application had been stopped even once, it could
-                // never retire an inactive colour again — the inactive container
-                // stayed up forever beside the active one. For an application
-                // that cannot tolerate two live instances that is an outage, not
-                // untidiness: codex-lb served 502s because both containers
-                // claimed ownership of the same continuity aliases.
-                //
-                // Deployment claims already ask the right question, and
-                // deliberately do not treat a terminal stopped or completed
-                // deactivation as fencing. Retirement now asks the same one.
-                || $locks->deactivation?->phase->fencesDeploymentClaims() === true
+                || $this->deactivationFencesRetirement($locks->deactivation, $owner)
                 || $state->routing_revision !== $state->inactive_retirement_owner_routing_revision
                 || $state->destination_fence_epoch !== $state->inactive_retirement_destination_fence_epoch
                 || $state->destination_topology_digest !== $state->inactive_retirement_topology_digest
@@ -414,6 +404,24 @@ final class RetireBlueGreenInactiveContainer
 
             return [$state, $application, $destination, $owner, $inactive];
         }, attempts: 5);
+    }
+
+    private function deactivationFencesRetirement(
+        ?ApplicationBlueGreenDeactivation $deactivation,
+        ApplicationDeploymentQueue $owner,
+    ): bool {
+        if ($deactivation === null) {
+            return false;
+        }
+
+        try {
+            $deactivation->assertValid();
+        } catch (LogicException $exception) {
+            throw new BlueGreenDeploymentTransitionException('The blue-green inactive retirement deactivation fence is malformed.', 0, $exception);
+        }
+
+        return $deactivation->phase->fencesDeploymentClaims()
+            || $deactivation->fences($owner);
     }
 
     private static function isTerminalStoppedStatus(?string $status): bool

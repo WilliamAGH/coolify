@@ -7,8 +7,10 @@ use App\Actions\Application\BlueGreen\ReserveBlueGreenReplicaSet;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
 use App\Enums\ApplicationDeploymentStatus;
+use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
+use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationBlueGreenReplica;
 use App\Models\ApplicationDeploymentQueue;
@@ -769,6 +771,70 @@ it('does not archive while another lifecycle owner holds the destination fence',
 
     expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::STALE_CONTAINER_JOURNAL)
         ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::DEFERRED)
+        ->and(implode("\n", $payloads))->not->toContain('durable_remote_replace "$container_journal_path" "$container_journal_archive_path"');
+});
+
+/**
+ * The permanent history a destination keeps after its application was stopped
+ * once: one terminal STOPPED row, superseded in place by any later stop and
+ * deleted by nothing.
+ */
+function stoppedStaleJournalDeactivationHistory(
+    BlueGreenRecoveryScenario $scenario,
+    BlueGreenDeactivationPhase $phase = BlueGreenDeactivationPhase::STOPPED,
+): ApplicationBlueGreenDeactivation {
+    return ApplicationBlueGreenDeactivation::query()->create([
+        'application_id' => $scenario->application->id,
+        'standalone_docker_id' => $scenario->destination->id,
+        'operation_id' => str_repeat('c', 64),
+        'started_at' => now()->subDay()->startOfSecond(),
+        'queue_cutoff_id' => 0,
+        'supersession_generation' => 1,
+        'phase' => $phase,
+        'completed_at' => $phase->isInProgress() ? null : now()->subDay()->addMinute()->startOfSecond(),
+    ]);
+}
+
+it('archives a proven stale journal on a destination that was stopped once before', function (): void {
+    $scenario = pristineStaleContainerMutationJournalScenario();
+    stoppedStaleJournalDeactivationHistory($scenario);
+    $inspection = staleContainerMutationJournalFixture($scenario);
+    $payloads = [];
+    fakeStaleContainerMutationJournalRemote($inspection, [...$inspection, 'status' => 'archived'], $payloads);
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        apply: true,
+        reason: 'Archive the exact boot-stale journal on a destination whose last stop already completed.',
+        staleContainerJournal: true,
+    );
+
+    // The completed stop is dead history: refusing on its mere existence meant a
+    // destination that had ever been stopped could never have a stale journal
+    // archived again, and the journal blocks every later container mutation.
+    expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::STALE_CONTAINER_JOURNAL)
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::RECOVERED)
+        ->and(implode("\n", $payloads))->toContain('durable_remote_replace "$container_journal_path" "$container_journal_archive_path"');
+});
+
+it('does not archive a stale journal while its destination is being stopped', function (): void {
+    $scenario = pristineStaleContainerMutationJournalScenario();
+    stoppedStaleJournalDeactivationHistory($scenario, BlueGreenDeactivationPhase::STOPPING);
+    $inspection = staleContainerMutationJournalFixture($scenario);
+    $payloads = [];
+    fakeStaleContainerMutationJournalRemote($inspection, [...$inspection, 'status' => 'archived'], $payloads);
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        apply: true,
+        reason: 'Attempt archival while a stop still owns the destination.',
+        staleContainerJournal: true,
+    );
+
+    // An in-progress stop owns this destination's containers and routes right
+    // now, so nothing on it may be archived or reconciled underneath it.
+    expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::STALE_CONTAINER_JOURNAL)
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY)
         ->and(implode("\n", $payloads))->not->toContain('durable_remote_replace "$container_journal_path" "$container_journal_archive_path"');
 });
 

@@ -5,6 +5,7 @@ use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
+use App\Actions\Application\BlueGreen\BlueGreenDeploymentTransitionException;
 use App\Actions\Application\BlueGreen\BlueGreenInterventionRecoveryResult;
 use App\Actions\Application\BlueGreen\BlueGreenOperationFence;
 use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
@@ -31,6 +32,7 @@ use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
 use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
 use App\Enums\ApplicationDeploymentStatus;
+use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\ProxyTypes;
@@ -38,6 +40,7 @@ use App\Exceptions\DeploymentException;
 use App\Jobs\ApplicationDeploymentJob;
 use App\Jobs\ResumeBlueGreenDrainingDeploymentJob;
 use App\Models\Application;
+use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\InstanceSettings;
@@ -406,6 +409,118 @@ it('terminalizes a finalized fallback when the predecessor runtime route digest 
         ->and($completedState->active_color)->toBe(BlueGreenDeploymentColor::GREEN)
         ->and($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value);
 });
+
+/**
+ * @return array{claim: BlueGreenDeploymentClaim, fixture: array<string, mixed>, restoredState: BlueGreenProxyState}
+ */
+function finalizedFixedColorFallbackRestoration(): array
+{
+    $fixture = fixedColorBlueGreenRecoveryFixture(
+        BlueGreenDeploymentPhase::DRAINING,
+        stageSpecificPreviousRoute: true,
+    );
+    $currentState = $fixture['candidateConfiguration']->state;
+    $restoredState = $fixture['previousConfiguration']->state->withDestinationFenceEpoch(
+        $currentState->destinationFenceEpoch + 1,
+        FIXED_COLOR_CANDIDATE_DEPLOYMENT,
+        $currentState->mutationSequence + 1,
+    );
+    $fixture['state']->update([
+        'destination_fence_epoch' => $restoredState->destinationFenceEpoch,
+        'destination_fence_operation_id' => $restoredState->operationId,
+        'destination_fence_mutation_sequence' => $restoredState->mutationSequence,
+        'managed_file_sha256' => $restoredState->managedSha256,
+        'destination_topology_digest' => $restoredState->destinationTopologyDigest,
+        'application_routing_config_digest' => $restoredState->applicationRoutingConfigDigest,
+    ]);
+
+    return [
+        'claim' => $fixture['claim'],
+        'fixture' => $fixture,
+        'restoredState' => $restoredState,
+    ];
+}
+
+function finalizedFixedColorFallbackDeactivation(
+    array $fixture,
+    BlueGreenDeactivationPhase $phase,
+    int $queueCutoffId = 0,
+): ApplicationBlueGreenDeactivation {
+    return ApplicationBlueGreenDeactivation::query()->create([
+        'application_id' => $fixture['application']->id,
+        'standalone_docker_id' => $fixture['destination']->id,
+        'operation_id' => str_repeat('9', 64),
+        'started_at' => now()->subDay(),
+        'queue_cutoff_id' => $queueCutoffId,
+        'supersession_generation' => 1,
+        'phase' => $phase,
+        'completed_at' => in_array($phase, [
+            BlueGreenDeactivationPhase::COMPLETED,
+            BlueGreenDeactivationPhase::STOPPED,
+            BlueGreenDeactivationPhase::REMOVED,
+        ], true) ? now()->subDay()->addMinute() : null,
+    ]);
+}
+
+it('terminalizes a finalized fallback on a destination whose only deactivation is a finished stop', function (): void {
+    $restoration = finalizedFixedColorFallbackRestoration();
+    $fixture = $restoration['fixture'];
+    // Nothing ever deletes a destination's single deactivation row, so a finished
+    // stop is history rather than an owner: this candidate was deployed after it.
+    // Refusing on the row's existence left the fallback unable to restore the
+    // predecessor or terminalize its failed candidate — permanently, for every
+    // future deployment of an application that was ever stopped once.
+    $finishedStop = finalizedFixedColorFallbackDeactivation(
+        $fixture,
+        BlueGreenDeactivationPhase::STOPPED,
+    );
+    $finishedStop->assertValid();
+
+    $completedState = TransitionsBlueGreenDeployment::finishFinalizedFixedColorFallback(
+        $restoration['claim'],
+        $fixture['previousExpectation'],
+        $restoration['restoredState'],
+    );
+
+    expect($completedState->phase)->toBe(BlueGreenDeploymentPhase::IDLE)
+        ->and($completedState->active_color)->toBe(BlueGreenDeploymentColor::GREEN)
+        ->and($completedState->operation_deployment_uuid)->toBeNull()
+        ->and($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value)
+        ->and($finishedStop->fresh()->phase)->toBe(BlueGreenDeactivationPhase::STOPPED);
+});
+
+it('refuses a finalized fallback while a deactivation still owns or fences the destination', function (
+    BlueGreenDeactivationPhase $phase,
+    bool $fenceByQueueCutoff,
+): void {
+    $restoration = finalizedFixedColorFallbackRestoration();
+    $fixture = $restoration['fixture'];
+    finalizedFixedColorFallbackDeactivation(
+        $fixture,
+        $phase,
+        $fenceByQueueCutoff ? (int) $fixture['deployment']->id : 0,
+    );
+    $stateBefore = $fixture['state']->fresh()->getAttributes();
+
+    expect(fn () => TransitionsBlueGreenDeployment::finishFinalizedFixedColorFallback(
+        $restoration['claim'],
+        $fixture['previousExpectation'],
+        $restoration['restoredState'],
+    ))->toThrow(BlueGreenDeploymentTransitionException::class);
+
+    expect($fixture['state']->fresh()->getAttributes())->toBe($stateBefore)
+        ->and($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
+})->with([
+    'deactivating' => [BlueGreenDeactivationPhase::DEACTIVATING, false],
+    'stopping' => [BlueGreenDeactivationPhase::STOPPING, false],
+    'removing' => [BlueGreenDeactivationPhase::REMOVING, false],
+    'intervention required' => [BlueGreenDeactivationPhase::INTERVENTION_REQUIRED, false],
+    'removed' => [BlueGreenDeactivationPhase::REMOVED, false],
+    // A candidate that predates a finished stop is still fenced per deployment,
+    // which is what keeps loosening the terminal-history refusal safe.
+    'stopped before the candidate queue cutoff' => [BlueGreenDeactivationPhase::STOPPED, true],
+    'completed before the candidate queue cutoff' => [BlueGreenDeactivationPhase::COMPLETED, true],
+]);
 
 it('advances the successor queued behind a finalized fallback that terminalized its own row', function (): void {
     Queue::fake();

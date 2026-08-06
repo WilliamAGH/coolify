@@ -945,6 +945,11 @@ final class ReconcileBlueGreenDeployment
         );
     }
 
+    /**
+     * The phase can reject a live deactivation immediately. Terminal rows are
+     * history only when they do not fence this exact queue owner by cutoff or
+     * creation time, which is checked after the operation-aware read proves it.
+     */
     private function exactDrainingDeploymentId(
         int $stateId,
         string $expectedOperationUuid,
@@ -965,8 +970,12 @@ final class ReconcileBlueGreenDeployment
             if ($state === null
                 || $state->id !== $stateId
                 || $locks->application->trashed()
-                || $locks->deactivation !== null
+                || $locks->deactivation?->phase->fencesDeploymentClaims() === true
+                || $deployment === null
                 || ! $this->isExactDrainingOwner($state, $deployment, $expectedOperationUuid, $expectedGeneration)) {
+                return null;
+            }
+            if ($locks->deactivation?->fences($deployment) === true) {
                 return null;
             }
 
