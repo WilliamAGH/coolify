@@ -12,6 +12,7 @@ use App\Actions\Application\BlueGreen\ComputeBlueGreenDeploymentFingerprint;
 use App\Actions\Application\BlueGreen\DrainBlueGreenPreviousContainer;
 use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Actions\Application\BlueGreen\RecoverBlueGreenIntervention;
+use App\Actions\Application\BlueGreen\ResolveBlueGreenExpectedProxyState;
 use App\Actions\Application\BlueGreen\ResumeBlueGreenInactiveRetirements;
 use App\Actions\Application\BlueGreen\RetireBlueGreenInactiveContainer;
 use App\Actions\Proxy\BlueGreenProxyState;
@@ -1336,7 +1337,8 @@ KEY,
     Storage::disk('ssh-keys')->put("ssh_key@{$privateKey->uuid}", $privateKey->private_key);
     $scenario['application']->destination->server->update(['private_key_id' => $privateKey->id]);
     $scenario['state']->update([
-        'inactive_retirement_last_observed_connections' => 0,
+        'inactive_retirement_server_boot_id' => '11111111-2222-3333-4444-555555555555',
+        'inactive_retirement_last_observed_connections' => 1,
         'inactive_retirement_observed_at' => now()->subMinute(),
         'inactive_retirement_attempts' => 10,
         'inactive_retirement_dispatch_reserved_until_at' => now()->subMinute(),
@@ -1357,22 +1359,36 @@ function fakeMatureInactiveRetirementJournalRemote(
     bool &$archived,
     string $targetStatus,
     ?Closure $afterInspection = null,
+    int|string $connections = 0,
 ): void {
     $payloads = [];
     $inspectionCount = 0;
+    if ($targetStatus === 'running') {
+        InspectBlueGreenContainer::shouldRun()->andReturn(new BlueGreenContainerInspection(
+            exists: true,
+            dockerId: str_repeat('a', 64),
+            status: ContainerStatusTypes::RUNNING->value,
+            health: 'healthy',
+        ));
+    }
     Process::fake(function (PendingProcess $process) use (
         &$payloads,
         &$archived,
         &$inspectionCount,
         $targetStatus,
         $afterInspection,
+        $connections,
     ) {
         $payload = (string) $process->command."\n".(string) $process->input;
         $payloads[] = $payload;
         if (str_contains($payload, "tr -d '\\n' < /proc/sys/kernel/random/boot_id")) {
-            return Process::result(output: '22222222-3333-4444-5555-666666666666');
+            return Process::result(output: '11111111-2222-3333-4444-555555555555');
         }
         if (! str_contains($payload, WriteBlueGreenProxyConfiguration::STALE_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX)) {
+            if (str_contains($payload, 'drain_pid=')) {
+                return Process::result(output: (string) $connections."\n");
+            }
+
             return Process::result();
         }
         $outputLine = collect(explode("\n", $payload))->first(
@@ -1404,6 +1420,307 @@ function fakeMatureInactiveRetirementJournalRemote(
             $targetStatus,
             $routeStatus,
             '11111111-2222-3333-4444-555555555555',
+        ]));
+    });
+}
+
+/**
+ * Rebuild the persisted 13-line journal as the affected release wrote it.
+ *
+ * @return array{
+ *     allow_pending_same_boot_journal: bool,
+ *     archive_filename: string,
+ *     completion_sha256: string,
+ *     connection_observation_command: string,
+ *     current_boot_id: string,
+ *     expected_state_sha256: string,
+ *     journal: string,
+ *     journal_boot_id: string,
+ *     journal_sha256: string,
+ *     managed_sha256: string,
+ *     mutation_sha256: string,
+ *     provenance_sha256: string,
+ *     replacement_state_sha256: string,
+ *     target_container_id: string
+ * }
+ */
+function authenticatedMatureInactiveRetirementJournal(
+    Application $application,
+    ApplicationDeploymentQueue $owner,
+    ApplicationBlueGreenDeployment $state,
+    string $currentBootId,
+    string $journalBootId,
+    bool $hasInitialZeroObservation,
+): array {
+    $state = $state->fresh() ?? throw new RuntimeException('The mature inactive-retirement state disappeared while rebuilding its journal.');
+    $owner = $owner->fresh() ?? throw new RuntimeException('The mature inactive-retirement owner disappeared while rebuilding its journal.');
+    $inactive = ApplicationDeploymentQueue::query()
+        ->where('application_id', $application->id)
+        ->where('deployment_uuid', $state->inactive_retirement_deployment_uuid)
+        ->firstOrFail();
+    if ($state->inactive_retirement_color === null
+        || $state->inactive_retirement_container_id === null
+        || $state->inactive_retirement_container_routing_revision === null
+        || $state->inactive_retirement_drain_deadline_at === null
+        || $state->inactive_retirement_stop_grace_seconds === null
+        || $owner->blue_green_drain_backend_port_inventory === null) {
+        throw new RuntimeException('The mature inactive-retirement journal fixture lacks one exact durable field.');
+    }
+    $target = new BlueGreenContainerExpectation(
+        name: $application->uuid.'-'.$state->inactive_retirement_color->value,
+        dockerId: $state->inactive_retirement_container_id,
+        applicationId: $application->id,
+        pullRequestId: 0,
+        blueGreenManaged: true,
+        deploymentUuid: $inactive->deployment_uuid,
+        color: $state->inactive_retirement_color,
+        routingRevision: $state->inactive_retirement_container_routing_revision,
+    );
+    $inventory = BlueGreenBackendPortInventory::fromSerialized(
+        $owner->blue_green_drain_backend_port_inventory,
+    );
+    $currentState = ResolveBlueGreenExpectedProxyState::run(
+        $application,
+        $application->destination,
+        $state,
+    ) ?? throw new RuntimeException('The mature inactive-retirement journal fixture needs an exact routed state.');
+    if ($state->inactive_retirement_stopped_at === null) {
+        $expectedState = $currentState;
+        $replacementState = $expectedState->withMutationOwner($owner->deployment_uuid);
+    } else {
+        if ($currentState->mutationSequence < 2) {
+            throw new RuntimeException('The stopped mature inactive-retirement fixture needs a fence predecessor.');
+        }
+        $replacementState = $currentState;
+        $expectedState = new BlueGreenProxyState(
+            managedFilename: $currentState->managedFilename,
+            applicationUuid: $currentState->applicationUuid,
+            destinationId: $currentState->destinationId,
+            operationId: $currentState->operationId,
+            mutationSequence: $currentState->mutationSequence - 1,
+            destinationFenceEpoch: $currentState->destinationFenceEpoch,
+            routingRevision: $currentState->routingRevision,
+            managedSha256: $currentState->managedSha256,
+            activeColor: $currentState->activeColor,
+            activeDeploymentUuid: $currentState->activeDeploymentUuid,
+            activeContainerName: $currentState->activeContainerName,
+            activeContainerId: $currentState->activeContainerId,
+            applicationRoutingConfigDigest: $currentState->applicationRoutingConfigDigest,
+            destinationTopologyDigest: $currentState->destinationTopologyDigest,
+            activeContainerSet: $currentState->activeContainerSet,
+        );
+    }
+    if ($expectedState->managedSha256 === null) {
+        throw new RuntimeException('The mature inactive-retirement journal fixture needs an exact managed-file checksum.');
+    }
+
+    $drainer = new DrainBlueGreenPreviousContainer;
+    $commands = $drainer->commandsFor(
+        $target,
+        $inventory->ports(),
+        $state->inactive_retirement_drain_deadline_at->getTimestamp(),
+        $state->inactive_retirement_stop_grace_seconds,
+        $hasInitialZeroObservation,
+    );
+    $scriptIndex = array_key_last($commands);
+    $currentDeadlineBlock = <<<'SH'
+        # Nothing is connected, so the drain is already complete: the second
+        # zero sample only confirms stability, and the deadline is not a reason
+        # to fail a predecessor that has no traffic left to lose. Timing out
+        # "with 0 active backend connection(s)" would fail a release for the
+        # one condition the drain exists to wait for.
+        if [ "$drain_connections" -eq 0 ]; then
+            break
+        fi
+        printf '%s\n' "coolify-blue-green-drain: timed out with $drain_connections active backend connection(s)" >&2
+SH;
+    $preFixDeadlineBlock = <<<'SH'
+            printf '%s\n' "coolify-blue-green-drain: timed out with $drain_connections active backend connection(s)" >&2
+SH;
+    if (! is_int($scriptIndex)
+        || ! is_string($commands[$scriptIndex])
+        || substr_count($commands[$scriptIndex], $currentDeadlineBlock) !== 1) {
+        throw new RuntimeException('The affected inactive-retirement drain journal no longer has its exact pre-fix deadline block.');
+    }
+    $commands[$scriptIndex] = str_replace(
+        $currentDeadlineBlock,
+        $preFixDeadlineBlock,
+        $commands[$scriptIndex],
+    );
+    $mutationScript = implode("\n", ['set -eu', ...$commands])."\n";
+    $completionScript = implode("\n", [
+        'set -eu',
+        ...$drainer->completionAssertionsFor($target),
+    ])."\n";
+    $expectedStateSha256 = hash('sha256', $expectedState->serialize());
+    $replacementStateSha256 = hash('sha256', $replacementState->serialize());
+    $mutationSha256 = hash('sha256', $mutationScript);
+    $completionSha256 = hash('sha256', $completionScript);
+    $connectionObservationCommand = $drainer->observationCommandFor($target, $inventory->ports());
+    $journal = implode("\n", [
+        'coolify-blue-green-container-mutation-v1',
+        $expectedState->managedFilename,
+        $journalBootId,
+        base64_encode($expectedState->serialize()),
+        $expectedStateSha256,
+        base64_encode($replacementState->serialize()),
+        $replacementStateSha256,
+        'present',
+        $expectedState->managedSha256,
+        $mutationSha256,
+        $completionSha256,
+        base64_encode($mutationScript),
+        base64_encode($completionScript),
+    ])."\n";
+    $provenanceSha256 = hash('sha256', implode("\n", [
+        'coolify-blue-green-stale-inactive-retirement-journal-provenance-v1',
+        $expectedStateSha256,
+        $replacementStateSha256,
+        $mutationSha256,
+        $completionSha256,
+        $target->name,
+        $target->dockerId,
+        (string) $target->applicationId,
+        (string) $target->deploymentUuid,
+        $state->inactive_retirement_color->value,
+        (string) $target->routingRevision,
+        hash('sha256', $connectionObservationCommand),
+        '',
+    ]));
+
+    return [
+        'allow_pending_same_boot_journal' => $state->inactive_retirement_stopped_at === null
+            && $state->inactive_retirement_intervention_required_at !== null
+            && $state->inactive_retirement_attempts === RetireBlueGreenInactiveContainer::MAX_ATTEMPTS
+            && $state->inactive_retirement_dispatch_reserved_until_at !== null
+            && ! $state->inactive_retirement_dispatch_reserved_until_at->isFuture()
+            && $state->inactive_retirement_last_observed_connections === 1
+            && hash_equals($currentBootId, $journalBootId),
+        'archive_filename' => sprintf(
+            '.blue-green-stale-container-mutation-%s.state-%d.journal',
+            hash('sha256', $expectedState->managedFilename),
+            $state->id,
+        ),
+        'completion_sha256' => $completionSha256,
+        'connection_observation_command' => $connectionObservationCommand,
+        'current_boot_id' => $currentBootId,
+        'expected_state_sha256' => $expectedStateSha256,
+        'journal' => $journal,
+        'journal_boot_id' => $journalBootId,
+        'journal_sha256' => hash('sha256', $journal),
+        'managed_sha256' => $expectedState->managedSha256,
+        'mutation_sha256' => $mutationSha256,
+        'provenance_sha256' => $provenanceSha256,
+        'replacement_state_sha256' => $replacementStateSha256,
+        'target_container_id' => $target->dockerId,
+    ];
+}
+
+/**
+ * @param  list<string>  $payloads
+ * @param  array{
+ *     allow_pending_same_boot_journal: bool,
+ *     archive_filename: string,
+ *     completion_sha256: string,
+ *     connection_observation_command: string,
+ *     current_boot_id: string,
+ *     expected_state_sha256: string,
+ *     journal: string,
+ *     journal_boot_id: string,
+ *     journal_sha256: string,
+ *     managed_sha256: string,
+ *     mutation_sha256: string,
+ *     provenance_sha256: string,
+ *     replacement_state_sha256: string,
+ *     target_container_id: string
+ * }  $journal
+ * @param  list<int|string>  $liveConnectionObservations
+ */
+function fakeAuthenticatedMatureInactiveRetirementJournalRemote(
+    array &$payloads,
+    bool &$archived,
+    string $targetStatus,
+    array $journal,
+    array $liveConnectionObservations = [0, 0],
+): void {
+    if ($targetStatus === 'running' && $liveConnectionObservations === []) {
+        throw new InvalidArgumentException('A running mature inactive-retirement journal needs live observations.');
+    }
+    $payloads = [];
+    $observationIndex = 0;
+    if ($targetStatus === 'running') {
+        InspectBlueGreenContainer::shouldRun()->andReturn(new BlueGreenContainerInspection(
+            exists: true,
+            dockerId: $journal['target_container_id'],
+            status: ContainerStatusTypes::RUNNING->value,
+            health: 'healthy',
+        ));
+    }
+    Process::fake(function (PendingProcess $process) use (
+        &$payloads,
+        &$archived,
+        &$observationIndex,
+        $targetStatus,
+        $journal,
+        $liveConnectionObservations,
+    ) {
+        $payload = (string) $process->command."\n".(string) $process->input;
+        $payloads[] = $payload;
+        if (str_contains($payload, "tr -d '\\n' < /proc/sys/kernel/random/boot_id")) {
+            return Process::result(output: $journal['current_boot_id']);
+        }
+        if (! str_contains($payload, WriteBlueGreenProxyConfiguration::STALE_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX)) {
+            if (str_contains($payload, 'drain_pid=')) {
+                $observation = $liveConnectionObservations[$observationIndex]
+                    ?? $liveConnectionObservations[array_key_last($liveConnectionObservations)];
+                $observationIndex++;
+
+                return Process::result(output: (string) $observation."\n");
+            }
+
+            return Process::result();
+        }
+
+        $isArchive = str_contains($payload, 'durable_remote_replace "$container_journal_path" "$container_journal_archive_path"');
+        if (! $archived
+            && ! $journal['allow_pending_same_boot_journal']
+            && hash_equals($journal['current_boot_id'], $journal['journal_boot_id'])) {
+            return Process::result(output: 'journal-authentication-failed');
+        }
+        if ($isArchive && ! str_contains($payload, $journal['connection_observation_command'])) {
+            return Process::result(output: 'journal-authentication-failed');
+        }
+        $requiredJournalFields = [
+            'completion_sha256',
+            'expected_state_sha256',
+            'journal_boot_id',
+            'managed_sha256',
+            'mutation_sha256',
+            'provenance_sha256',
+            'replacement_state_sha256',
+        ];
+        if ($isArchive) {
+            $requiredJournalFields[] = 'journal_sha256';
+        }
+        foreach ($requiredJournalFields as $field) {
+            if (! str_contains($payload, escapeshellarg($journal[$field]))) {
+                return Process::result(output: 'journal-authentication-failed');
+            }
+        }
+
+        if ($isArchive) {
+            $archived = true;
+        }
+
+        return Process::result(output: implode('|', [
+            WriteBlueGreenProxyConfiguration::STALE_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX,
+            $archived ? 'archived' : 'pending',
+            $journal['journal_sha256'],
+            $journal['archive_filename'],
+            $journal['provenance_sha256'],
+            $targetStatus,
+            $archived && $targetStatus !== 'running' ? 'replacement' : 'expected',
+            $journal['journal_boot_id'],
         ]));
     });
 }
@@ -1454,7 +1771,7 @@ it('archives a running mature target and queues one current-generator retirement
         ->and($state->inactive_retirement_stopped_at)->toBeNull()
         ->and($state->inactive_retirement_intervention_required_at)->toBeNull()
         ->and($state->inactive_retirement_attempts)->toBe(0)
-        ->and($state->inactive_retirement_server_boot_id)->toBe('22222222-3333-4444-5555-666666666666')
+        ->and($state->inactive_retirement_server_boot_id)->toBe('11111111-2222-3333-4444-555555555555')
         ->and($state->inactive_retirement_dispatch_reserved_until_at->isFuture())->toBeTrue();
     Queue::assertPushed(RetireBlueGreenInactiveContainerJob::class, fn (RetireBlueGreenInactiveContainerJob $job): bool => $job->stateId === $state->id
         && $job->ownerDeploymentUuid === $owner->deployment_uuid
@@ -1466,24 +1783,41 @@ it('archives a running mature target and queues one current-generator retirement
 });
 
 it('reconciles an already retired mature target and advances only its exact fence successor', function (string $targetStatus): void {
-    ['state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    $journal = authenticatedMatureInactiveRetirementJournal(
+        $application,
+        $owner,
+        $state,
+        '11111111-2222-3333-4444-555555555555',
+        '11111111-2222-3333-4444-555555555555',
+        false,
+    );
     Queue::fake();
     $payloads = [];
     $archived = false;
-    fakeMatureInactiveRetirementJournalRemote($payloads, $archived, $targetStatus);
+    fakeAuthenticatedMatureInactiveRetirementJournalRemote($payloads, $archived, $targetStatus, $journal);
     $expectedFenceSequence = $state->destination_fence_mutation_sequence + 1;
 
-    $result = RecoverBlueGreenIntervention::run(
+    $first = RecoverBlueGreenIntervention::run(
         stateId: $state->id,
         apply: true,
         reason: 'Reconcile the absent exact inactive target after preserving its immutable journal.',
         staleContainerJournal: true,
     );
+    $second = RecoverBlueGreenIntervention::run(
+        stateId: $state->id,
+        apply: true,
+        reason: 'Prove the archived affected journal remains exactly authentic after reconciliation.',
+        staleContainerJournal: true,
+    );
     $state = $state->fresh();
 
-    expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::RECOVERED)
+    expect($first->outcome)->toBe(BlueGreenInterventionRecoveryResult::RECOVERED)
+        ->and($second->outcome)->toBe(BlueGreenInterventionRecoveryResult::RECOVERED)
         ->and($archived)->toBeTrue()
         ->and($state->destination_fence_mutation_sequence)->toBe($expectedFenceSequence)
+        ->and($state->inactive_retirement_last_observed_connections)->toBe(1)
+        ->and($state->inactive_retirement_intervention_required_at)->toBeNull()
         ->and($state->inactive_retirement_stopped_at)->not->toBeNull();
     Queue::assertNothingPushed();
 })->with([
@@ -1516,7 +1850,198 @@ it('does not duplicate an already-reserved current-generator retirement', functi
     Queue::assertPushed(RetireBlueGreenInactiveContainerJob::class, 1);
 });
 
-it('rejects unknown or nonzero mature retirement measurements before remote work', function (?int $connections): void {
+it('authenticates the exact current-boot mature journal reconstructed without an initial zero observation', function (): void {
+    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    $journal = authenticatedMatureInactiveRetirementJournal(
+        $application,
+        $owner,
+        $state,
+        currentBootId: '11111111-2222-3333-4444-555555555555',
+        journalBootId: '11111111-2222-3333-4444-555555555555',
+        hasInitialZeroObservation: false,
+    );
+    Queue::fake();
+    $payloads = [];
+    $archived = false;
+    fakeAuthenticatedMatureInactiveRetirementJournalRemote($payloads, $archived, 'running', $journal);
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $state->id,
+        apply: true,
+        reason: 'Archive and requeue only the exact mature journal written before the zero-drain fix.',
+        staleContainerJournal: true,
+    );
+    expect(explode("\n", rtrim($journal['journal'], "\n")))->toHaveCount(13)
+        ->and($state->fresh()->inactive_retirement_last_observed_connections)->toBe(1)
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::RECOVERED)
+        ->and($archived)->toBeTrue()
+        ->and(implode("\n", $payloads))->toContain(
+            escapeshellarg($journal['mutation_sha256']),
+            escapeshellarg($journal['journal_sha256']),
+        );
+    Queue::assertPushed(RetireBlueGreenInactiveContainerJob::class, fn (RetireBlueGreenInactiveContainerJob $job): bool => $job->stateId === $state->id
+        && $job->ownerDeploymentUuid === $owner->deployment_uuid
+        && $job->supersessionGeneration === $state->inactive_retirement_supersession_generation);
+});
+
+it('rejects the otherwise identical mature journal that assumes an initial zero observation', function (): void {
+    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    $falseInitialZeroJournal = authenticatedMatureInactiveRetirementJournal(
+        $application,
+        $owner,
+        $state,
+        currentBootId: '11111111-2222-3333-4444-555555555555',
+        journalBootId: '11111111-2222-3333-4444-555555555555',
+        hasInitialZeroObservation: false,
+    );
+    $trueInitialZeroJournal = authenticatedMatureInactiveRetirementJournal(
+        $application,
+        $owner,
+        $state,
+        currentBootId: '11111111-2222-3333-4444-555555555555',
+        journalBootId: '11111111-2222-3333-4444-555555555555',
+        hasInitialZeroObservation: true,
+    );
+    Queue::fake();
+    $payloads = [];
+    $archived = false;
+    fakeAuthenticatedMatureInactiveRetirementJournalRemote(
+        $payloads,
+        $archived,
+        'running',
+        $trueInitialZeroJournal,
+    );
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $state->id,
+        apply: true,
+        reason: 'Reject a journal whose signed drain script assumes a first zero sample that never occurred.',
+        staleContainerJournal: true,
+    );
+
+    expect($state->fresh()->inactive_retirement_last_observed_connections)->toBe(1)
+        ->and($trueInitialZeroJournal['mutation_sha256'])->not->toBe($falseInitialZeroJournal['mutation_sha256'])
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY)
+        ->and($archived)->toBeFalse();
+    Queue::assertNothingPushed();
+});
+
+it('authenticates an old-boot mature journal only against its exact stored boot provenance', function (): void {
+    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    $storedJournalBootId = '22222222-3333-4444-5555-666666666666';
+    $state->update(['inactive_retirement_server_boot_id' => $storedJournalBootId]);
+    $state = $state->fresh();
+    $journal = authenticatedMatureInactiveRetirementJournal(
+        $application,
+        $owner,
+        $state,
+        currentBootId: '11111111-2222-3333-4444-555555555555',
+        journalBootId: $storedJournalBootId,
+        hasInitialZeroObservation: false,
+    );
+    Queue::fake();
+    $payloads = [];
+    $archived = false;
+    fakeAuthenticatedMatureInactiveRetirementJournalRemote($payloads, $archived, 'running', $journal);
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $state->id,
+        apply: true,
+        reason: 'Archive and requeue only an old-boot journal authenticated by its stored boot identity.',
+        staleContainerJournal: true,
+    );
+
+    expect($journal['journal_boot_id'])->toBe($storedJournalBootId)
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::RECOVERED)
+        ->and($archived)->toBeTrue()
+        ->and(implode("\n", $payloads))->toContain(escapeshellarg($storedJournalBootId))
+        ->and($state->fresh()->inactive_retirement_server_boot_id)->toBe('11111111-2222-3333-4444-555555555555');
+    Queue::assertPushed(RetireBlueGreenInactiveContainerJob::class, 1);
+});
+
+it('fails closed when the fenced live drain observation is no longer an exact zero', function (int|string $secondObservation): void {
+    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    $journal = authenticatedMatureInactiveRetirementJournal(
+        $application,
+        $owner,
+        $state,
+        currentBootId: '11111111-2222-3333-4444-555555555555',
+        journalBootId: '11111111-2222-3333-4444-555555555555',
+        hasInitialZeroObservation: false,
+    );
+    Queue::fake();
+    $payloads = [];
+    $archived = false;
+    fakeAuthenticatedMatureInactiveRetirementJournalRemote(
+        $payloads,
+        $archived,
+        'running',
+        $journal,
+        [0, $secondObservation],
+    );
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $state->id,
+        apply: true,
+        reason: 'Require the exact zero-connection observation again after taking the destination fence.',
+        staleContainerJournal: true,
+    );
+
+    $observations = array_values(array_filter(
+        $payloads,
+        static fn (string $payload): bool => str_contains($payload, 'drain_pid='),
+    ));
+    expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY)
+        ->and($observations)->toHaveCount(2)
+        ->and($archived)->toBeFalse();
+    Queue::assertNothingPushed();
+})->with([
+    'one connection after fencing' => 1,
+    'malformed count after fencing' => 'not-a-count',
+]);
+
+it('rejects pending current-boot journals outside the exact mature intervention profile', function (array $changes, string $targetStatus): void {
+    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    $state->update($changes);
+    $state = $state->fresh();
+    $journal = authenticatedMatureInactiveRetirementJournal(
+        $application,
+        $owner,
+        $state,
+        currentBootId: '11111111-2222-3333-4444-555555555555',
+        journalBootId: '11111111-2222-3333-4444-555555555555',
+        hasInitialZeroObservation: false,
+    );
+    Queue::fake();
+    $payloads = [];
+    $archived = false;
+    fakeAuthenticatedMatureInactiveRetirementJournalRemote($payloads, $archived, $targetStatus, $journal);
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $state->id,
+        apply: true,
+        reason: 'Fail closed for a current-boot pending journal that is not the exact mature intervention profile.',
+        staleContainerJournal: true,
+    );
+
+    expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY)
+        ->and($archived)->toBeFalse();
+    Queue::assertNothingPushed();
+})->with([
+    'non-intervened requeued owner' => [[
+        'inactive_retirement_attempts' => 0,
+        'inactive_retirement_intervention_required_at' => null,
+        'inactive_retirement_dispatch_reserved_until_at' => now()->subMinute(),
+    ], 'running'],
+    'stopped owner with a pending journal' => [[
+        'inactive_retirement_attempts' => 0,
+        'inactive_retirement_intervention_required_at' => null,
+        'inactive_retirement_stopped_at' => now()->subMinute(),
+        'inactive_retirement_dispatch_reserved_until_at' => null,
+    ], 'stopped'],
+]);
+
+it('rejects unknown or invalid historical retirement measurements before remote work', function (?int $connections): void {
     ['state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
     $state->update([
         'inactive_retirement_last_observed_connections' => $connections,
@@ -1533,7 +2058,97 @@ it('rejects unknown or nonzero mature retirement measurements before remote work
     Process::assertNothingRan();
 })->with([
     'unknown measurement' => null,
-    'nonzero measurement' => 1,
+    'invalid negative measurement' => -1,
+]);
+
+it('rejects another positive historical retirement measurement before journal inspection', function (): void {
+    ['state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    $state->update([
+        'inactive_retirement_last_observed_connections' => 2,
+        'inactive_retirement_observed_at' => now(),
+    ]);
+    $payloads = [];
+    Process::fake(function (PendingProcess $process) use (&$payloads) {
+        $payload = (string) $process->command."\n".(string) $process->input;
+        $payloads[] = $payload;
+
+        if (str_contains($payload, "tr -d '\\n' < /proc/sys/kernel/random/boot_id")) {
+            return Process::result(output: '11111111-2222-3333-4444-555555555555');
+        }
+
+        return Process::result();
+    });
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $state->id,
+        staleContainerJournal: true,
+    );
+
+    $remotePayloads = implode("\n", $payloads);
+
+    expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY)
+        ->and($remotePayloads)->toContain("tr -d '\\n' < /proc/sys/kernel/random/boot_id")
+        ->and($remotePayloads)->not->toContain(WriteBlueGreenProxyConfiguration::STALE_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX);
+});
+
+it('rejects a running mature target whose live connection count is not exactly zero', function (int|string $connections): void {
+    ['state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    Queue::fake();
+    $payloads = [];
+    $archived = false;
+    fakeMatureInactiveRetirementJournalRemote(
+        $payloads,
+        $archived,
+        'running',
+        connections: $connections,
+    );
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $state->id,
+        apply: true,
+        reason: 'Fail closed unless the exact running target has a current zero-connection observation.',
+        staleContainerJournal: true,
+    );
+
+    expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY)
+        ->and($archived)->toBeFalse();
+    Queue::assertNothingPushed();
+})->with([
+    'nonzero live count' => 1,
+    'unmeasurable live count' => 'unknown',
+]);
+
+it('rejects an immature or unexpired intervention before journal inspection', function (array $changes): void {
+    ['state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    $state->update($changes);
+    Queue::fake();
+    $payloads = [];
+    $archived = false;
+    fakeMatureInactiveRetirementJournalRemote($payloads, $archived, 'running');
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $state->id,
+        apply: true,
+        reason: 'Fail closed unless the exact intervention is mature and its dispatch reservation expired.',
+        staleContainerJournal: true,
+    );
+
+    expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY)
+        ->and($archived)->toBeFalse();
+    Queue::assertNothingPushed();
+})->with([
+    'attempt threshold not reached' => [[
+        'inactive_retirement_attempts' => RetireBlueGreenInactiveContainer::MAX_ATTEMPTS - 1,
+    ]],
+    'attempt threshold exceeded' => [[
+        'inactive_retirement_attempts' => RetireBlueGreenInactiveContainer::MAX_ATTEMPTS + 1,
+    ]],
+    'dispatch reservation missing' => [[
+        'inactive_retirement_dispatch_reserved_until_at' => null,
+    ]],
+    'dispatch reservation still live' => [[
+        'inactive_retirement_dispatch_reserved_until_at' => now()->addDay(),
+    ]],
 ]);
 
 it('rejects a mature replica-set retirement before remote work', function (): void {

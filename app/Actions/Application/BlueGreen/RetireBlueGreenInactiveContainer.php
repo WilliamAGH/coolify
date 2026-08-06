@@ -34,7 +34,7 @@ final class RetireBlueGreenInactiveContainer
 
     public const STALE = 'stale';
 
-    private const MAX_ATTEMPTS = 10;
+    public const MAX_ATTEMPTS = 10;
 
     public function handle(int $stateId, string $ownerDeploymentUuid, int $supersessionGeneration): string
     {

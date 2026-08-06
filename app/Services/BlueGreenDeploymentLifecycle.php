@@ -26,6 +26,7 @@ use App\Actions\Application\BlueGreen\FindBlueGreenDeactivationFence;
 use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Actions\Application\BlueGreen\InspectBlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\PlanBlueGreenPublicRecovery;
+use App\Actions\Application\BlueGreen\QuarantineSpentFirstAdoptionDrainJournal;
 use App\Actions\Application\BlueGreen\ReadBlueGreenServerBootIdentity;
 use App\Actions\Application\BlueGreen\ReconcileBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\ReconstructBlueGreenDeploymentRecovery;
@@ -949,6 +950,14 @@ final class BlueGreenDeploymentLifecycle
         $this->assertOperationOwned(BlueGreenDeploymentPhase::DRAINING);
         $this->assertExactCandidateStillHealthy();
         if (! $this->shouldDeferPreviousContainerRetirement()) {
+            $claim = $this->claim
+                ?? throw new DeploymentException('Spent first-adoption drain recovery has no exact durable claim.');
+            $operationFence = $this->operationFence
+                ?? throw new DeploymentException('Spent first-adoption drain recovery has no owned lifecycle fence.');
+            QuarantineSpentFirstAdoptionDrainJournal::run(
+                $claim->stateId,
+                $operationFence,
+            );
             $this->retirePreviousContainer(force: true);
         }
         $this->complete();
@@ -1163,6 +1172,7 @@ final class BlueGreenDeploymentLifecycle
         $this->serverBootId = $operation->claim->serverBootId;
         $this->destinationState = $operation->currentDestinationState
             ?? throw new DeploymentException('The durable blue-green DRAINING state has no exact routed destination state.');
+        $this->rollbackKey = $operation->rollbackKey;
         $this->candidateContainerExpectation = $operation->candidateContainer;
         $this->previousContainerExpectation = $operation->previousContainer;
         $this->server->privateKey->storeInFileSystem();
@@ -2176,7 +2186,13 @@ final class BlueGreenDeploymentLifecycle
 
         $this->rollbackKey ??= $routingMutationKey;
         $this->latestRoutingMutationKey = $routingMutationKey;
-        RecordBlueGreenRollbackKey::run($claim, $this->rollbackKey);
+        if ($this->rollbackKey->operationId !== $claim->deploymentUuid
+            || $this->rollbackKey->managedFilename() !== $claim->rollbackManagedFilename) {
+            throw new DeploymentException('Blue-green routing no longer owns its exact durable rollback key.');
+        }
+        if ($expectedPhase === BlueGreenDeploymentPhase::PREPARING) {
+            RecordBlueGreenRollbackKey::run($claim, $this->rollbackKey);
+        }
         $this->assertOperationOwned($expectedPhase);
         try {
             $this->assertServerBootIdentity();

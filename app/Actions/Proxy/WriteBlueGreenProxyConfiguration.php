@@ -2,6 +2,9 @@
 
 namespace App\Actions\Proxy;
 
+use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
+use App\Actions\Application\BlueGreen\DrainBlueGreenPreviousContainer;
+use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\ContainerStatusTypes;
@@ -23,6 +26,8 @@ class WriteBlueGreenProxyConfiguration
 
     public const REPAIR_DRIFT_OUTPUT = 'coolify-blue-green-managed-route:repaired-drift';
 
+    public const PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT = 'coolify-blue-green-pending-container-mutation-journal';
+
     public const STALE_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX = 'coolify-blue-green-stale-container-journal-v1';
 
     public const STALE_CONTAINER_MUTATION_JOURNAL_ROUTE_LOCK_WAIT_SECONDS = 15;
@@ -36,6 +41,8 @@ class WriteBlueGreenProxyConfiguration
     private const STALE_CONTAINER_MUTATION_JOURNAL_PROVENANCE_MAGIC = 'coolify-blue-green-stale-container-journal-provenance-v1';
 
     private const STALE_INACTIVE_RETIREMENT_JOURNAL_PROVENANCE_MAGIC = 'coolify-blue-green-stale-inactive-retirement-journal-provenance-v1';
+
+    private const SPENT_FIRST_ADOPTION_DRAIN_JOURNAL_PROVENANCE_MAGIC = 'coolify-blue-green-spent-first-adoption-drain-journal-provenance-v1';
 
     private const PROBE_HEADER = 'X-Coolify-Blue-Green-Probe';
 
@@ -326,11 +333,13 @@ class WriteBlueGreenProxyConfiguration
         string $proxyPath,
         int $stateId,
         string $expectedCurrentBootId,
-        ?string $expectedJournalBootId,
+        string $expectedJournalBootId,
+        bool $allowPendingSameBootJournal,
         BlueGreenProxyState $expectedState,
         BlueGreenProxyState $replacementState,
         string $expectedMutationSha256,
         string $expectedCompletionSha256,
+        array $backendPorts,
         string $targetContainerName,
         string $targetContainerId,
         int $applicationId,
@@ -341,10 +350,12 @@ class WriteBlueGreenProxyConfiguration
         $profile = $this->staleInactiveRetirementContainerMutationJournalProfile(
             expectedCurrentBootId: $expectedCurrentBootId,
             expectedJournalBootId: $expectedJournalBootId,
+            allowPendingSameBootJournal: $allowPendingSameBootJournal,
             expectedState: $expectedState,
             replacementState: $replacementState,
             expectedMutationSha256: $expectedMutationSha256,
             expectedCompletionSha256: $expectedCompletionSha256,
+            backendPorts: $backendPorts,
             targetContainerName: $targetContainerName,
             targetContainerId: $targetContainerId,
             applicationId: $applicationId,
@@ -375,11 +386,13 @@ class WriteBlueGreenProxyConfiguration
         string $proxyPath,
         int $stateId,
         string $expectedCurrentBootId,
-        ?string $expectedJournalBootId,
+        string $expectedJournalBootId,
+        bool $allowPendingSameBootJournal,
         BlueGreenProxyState $expectedState,
         BlueGreenProxyState $replacementState,
         string $expectedMutationSha256,
         string $expectedCompletionSha256,
+        array $backendPorts,
         string $targetContainerName,
         string $targetContainerId,
         int $applicationId,
@@ -392,10 +405,12 @@ class WriteBlueGreenProxyConfiguration
         $profile = $this->staleInactiveRetirementContainerMutationJournalProfile(
             expectedCurrentBootId: $expectedCurrentBootId,
             expectedJournalBootId: $expectedJournalBootId,
+            allowPendingSameBootJournal: $allowPendingSameBootJournal,
             expectedState: $expectedState,
             replacementState: $replacementState,
             expectedMutationSha256: $expectedMutationSha256,
             expectedCompletionSha256: $expectedCompletionSha256,
+            backendPorts: $backendPorts,
             targetContainerName: $targetContainerName,
             targetContainerId: $targetContainerId,
             applicationId: $applicationId,
@@ -428,6 +443,7 @@ class WriteBlueGreenProxyConfiguration
         BlueGreenProxyState $replacementState,
         string $expectedMutationSha256,
         string $expectedCompletionSha256,
+        array $backendPorts,
         string $targetContainerName,
         string $targetContainerId,
         int $applicationId,
@@ -437,17 +453,130 @@ class WriteBlueGreenProxyConfiguration
     ): string {
         return $this->staleInactiveRetirementContainerMutationJournalProfile(
             expectedCurrentBootId: '00000000-0000-0000-0000-000000000000',
-            expectedJournalBootId: null,
+            expectedJournalBootId: '00000000-0000-0000-0000-000000000000',
+            allowPendingSameBootJournal: false,
             expectedState: $expectedState,
             replacementState: $replacementState,
             expectedMutationSha256: $expectedMutationSha256,
             expectedCompletionSha256: $expectedCompletionSha256,
+            backendPorts: $backendPorts,
             targetContainerName: $targetContainerName,
             targetContainerId: $targetContainerId,
             applicationId: $applicationId,
             inactiveDeploymentUuid: $inactiveDeploymentUuid,
             inactiveColor: $inactiveColor,
             inactiveRoutingRevision: $inactiveRoutingRevision,
+        )['provenance_sha256'];
+    }
+
+    /**
+     * Inspect an expired first-adoption drain journal without replaying either
+     * embedded script. The exact route, successor state, legacy target, and
+     * script digests are all authenticated before the journal is classified.
+     *
+     * @param  non-empty-list<string>  $expectedMutationCommands
+     * @param  non-empty-list<string>  $expectedCompletionCommands
+     */
+    public function inspectSpentFirstAdoptionDrainJournalCommandFor(
+        string $proxyPath,
+        int $stateId,
+        string $expectedCurrentBootId,
+        BlueGreenProxyState $expectedState,
+        BlueGreenProxyState $replacementState,
+        array $expectedMutationCommands,
+        array $expectedCompletionCommands,
+        BlueGreenContainerExpectation $legacyTarget,
+    ): string {
+        $profile = $this->spentFirstAdoptionDrainJournalProfile(
+            expectedCurrentBootId: $expectedCurrentBootId,
+            expectedState: $expectedState,
+            replacementState: $replacementState,
+            expectedMutationCommands: $expectedMutationCommands,
+            expectedCompletionCommands: $expectedCompletionCommands,
+            legacyTarget: $legacyTarget,
+        );
+        $this->assertStaleContainerMutationJournalScope(
+            $expectedState->managedFilename,
+            $expectedState->applicationUuid,
+            $expectedState->destinationId,
+            $stateId,
+            $expectedCurrentBootId,
+        );
+
+        return $this->staleContainerMutationJournalCommandFor(
+            $proxyPath,
+            $expectedState->managedFilename,
+            $expectedState->applicationUuid,
+            $expectedState->destinationId,
+            $stateId,
+            $expectedCurrentBootId,
+            spentFirstAdoptionDrain: $profile,
+        );
+    }
+
+    /**
+     * @param  non-empty-list<string>  $expectedMutationCommands
+     * @param  non-empty-list<string>  $expectedCompletionCommands
+     */
+    public function quarantineSpentFirstAdoptionDrainJournalCommandFor(
+        string $proxyPath,
+        int $stateId,
+        string $expectedCurrentBootId,
+        BlueGreenProxyState $expectedState,
+        BlueGreenProxyState $replacementState,
+        array $expectedMutationCommands,
+        array $expectedCompletionCommands,
+        BlueGreenContainerExpectation $legacyTarget,
+        string $expectedJournalSha256,
+    ): string {
+        $this->assertSha256($expectedJournalSha256, 'expected spent first-adoption drain journal');
+        $profile = $this->spentFirstAdoptionDrainJournalProfile(
+            expectedCurrentBootId: $expectedCurrentBootId,
+            expectedState: $expectedState,
+            replacementState: $replacementState,
+            expectedMutationCommands: $expectedMutationCommands,
+            expectedCompletionCommands: $expectedCompletionCommands,
+            legacyTarget: $legacyTarget,
+        );
+        $this->assertStaleContainerMutationJournalScope(
+            $expectedState->managedFilename,
+            $expectedState->applicationUuid,
+            $expectedState->destinationId,
+            $stateId,
+            $expectedCurrentBootId,
+        );
+
+        return $this->staleContainerMutationJournalCommandFor(
+            $proxyPath,
+            $expectedState->managedFilename,
+            $expectedState->applicationUuid,
+            $expectedState->destinationId,
+            $stateId,
+            $expectedCurrentBootId,
+            expectedJournalSha256: $expectedJournalSha256,
+            spentFirstAdoptionDrain: $profile,
+        );
+    }
+
+    /**
+     * @param  non-empty-list<string>  $expectedMutationCommands
+     * @param  non-empty-list<string>  $expectedCompletionCommands
+     */
+    public function spentFirstAdoptionDrainJournalProvenanceSha256For(
+        string $expectedCurrentBootId,
+        BlueGreenProxyState $expectedState,
+        BlueGreenProxyState $replacementState,
+        array $expectedMutationCommands,
+        array $expectedCompletionCommands,
+        BlueGreenContainerExpectation $legacyTarget,
+    ): string {
+        return $this->spentFirstAdoptionDrainJournalProfile(
+            expectedCurrentBootId: $expectedCurrentBootId,
+            expectedState: $expectedState,
+            replacementState: $replacementState,
+            expectedMutationCommands: $expectedMutationCommands,
+            expectedCompletionCommands: $expectedCompletionCommands,
+            legacyTarget: $legacyTarget,
         )['provenance_sha256'];
     }
 
@@ -635,7 +764,7 @@ class WriteBlueGreenProxyConfiguration
         $this->assertStateScope($managedFilename, $expectedState);
 
         return implode("\n", [
-            ...$this->lockedCommandPrefix($proxyPath, $managedFilename),
+            ...$this->attestationLockedCommandPrefix($proxyPath, $managedFilename),
             ...$this->assertExpectedStateCommands($expectedState, $activePath, $statePath),
             'printf %s '.escapeshellarg('coolify-blue-green-destination-state-attested'),
         ]);
@@ -666,7 +795,7 @@ class WriteBlueGreenProxyConfiguration
         $statePath = $this->statePath($proxyPath, $managedFilename);
 
         return implode("\n", [
-            ...$this->lockedCommandPrefix($proxyPath, $managedFilename),
+            ...$this->attestationLockedCommandPrefix($proxyPath, $managedFilename),
             ...$this->repairOrphanedAbsentRouteStateCommands(
                 $managedFilename,
                 $applicationUuid,
@@ -785,7 +914,11 @@ class WriteBlueGreenProxyConfiguration
                 commands: $commands,
                 completionCommands: $completionCommands,
             ),
-            ...$this->repairPendingContainerMutationJournalCommands($proxyPath, $managedFilename),
+            ...$this->pendingContainerMutationJournalCommands(
+                $proxyPath,
+                $managedFilename,
+                $this->containerMutationReplayCommands(),
+            ),
         ]);
     }
 
@@ -1296,13 +1429,50 @@ class WriteBlueGreenProxyConfiguration
     private function lockedCommandPrefix(string $proxyPath, string $managedFilename): array
     {
         return [
+            ...$this->lockedCommandPrefixWithoutContainerMutationJournal($proxyPath, $managedFilename),
+            ...$this->pendingContainerMutationJournalCommands(
+                $proxyPath,
+                $managedFilename,
+                $this->containerMutationReplayCommands(),
+            ),
+        ];
+    }
+
+    /** @return list<string> */
+    private function attestationLockedCommandPrefix(string $proxyPath, string $managedFilename): array
+    {
+        return [
+            ...$this->lockedCommandPrefixWithoutContainerMutationJournal($proxyPath, $managedFilename),
+            ...$this->pendingContainerMutationJournalCommands($proxyPath, $managedFilename, [
+                'printf \'%s\\n\' '.escapeshellarg(self::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT).' >&2',
+                'exit 75',
+            ]),
+        ];
+    }
+
+    /** @return list<string> */
+    private function lockedCommandPrefixWithoutContainerMutationJournal(
+        string $proxyPath,
+        string $managedFilename,
+    ): array {
+        return [
             'set -eu',
             'umask 077',
             ...DurableRemoteArtifact::shellFunctions(),
             'mkdir -p -- '.escapeshellarg($this->dynamicDirectory($proxyPath)),
             ...$this->exclusiveManagedFileLockCommands($proxyPath, $managedFilename),
             ...$this->repairPendingMutationJournalCommands($proxyPath, $managedFilename),
-            ...$this->repairPendingContainerMutationJournalCommands($proxyPath, $managedFilename),
+        ];
+    }
+
+    /** @return list<string> */
+    private function containerMutationReplayCommands(): array
+    {
+        return [
+            $this->bootIdentityAssertionCommand('"$container_journal_expected_boot_id"'),
+            'sh "$container_journal_mutation_decoded"',
+            ...$this->afterContainerMutationCommands(),
+            'sh "$container_journal_completion_decoded"',
         ];
     }
 
@@ -1316,6 +1486,7 @@ class WriteBlueGreenProxyConfiguration
         ?string $expectedJournalSha256 = null,
         ?array $expectedJournalProvenance = null,
         ?array $inactiveRetirement = null,
+        ?array $spentFirstAdoptionDrain = null,
     ): string {
         $stateDirectory = $this->stateDirectory($proxyPath);
         $dynamicDirectory = $this->dynamicDirectory($proxyPath);
@@ -1337,6 +1508,7 @@ class WriteBlueGreenProxyConfiguration
                 $destinationId,
                 $stateId,
                 $archiveFilename,
+                $inactiveRetirement,
             );
         $inactiveRetirementReconciliationCommands = $expectedJournalSha256 === null || $inactiveRetirement === null
             ? []
@@ -1350,6 +1522,12 @@ class WriteBlueGreenProxyConfiguration
                 .' "$container_journal_status" "$container_journal_checksum" '
                 .escapeshellarg($archiveFilename).' '
                 .escapeshellarg($inactiveRetirement['provenance_sha256'])
+                .' "$container_journal_target_status" "$container_journal_route_status" "$container_journal_expected_boot_id"',
+            $spentFirstAdoptionDrain !== null => 'printf \'%s|%s|%s|%s|%s|%s|%s|%s\' '
+                .escapeshellarg(self::STALE_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX)
+                .' "$container_journal_status" "$container_journal_checksum" '
+                .escapeshellarg($archiveFilename).' '
+                .escapeshellarg($spentFirstAdoptionDrain['provenance_sha256'])
                 .' "$container_journal_target_status" "$container_journal_route_status" "$container_journal_expected_boot_id"',
             $expectedJournalProvenance === null => 'printf \'%s|%s|%s|%s\' '.escapeshellarg(self::STALE_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX).' "$container_journal_status" "$container_journal_checksum" '.escapeshellarg($archiveFilename),
             default => 'printf \'%s|%s|%s|%s|%s\' '.escapeshellarg(self::STALE_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX).' "$container_journal_status" "$container_journal_checksum" '.escapeshellarg($archiveFilename).' '.escapeshellarg($expectedJournalProvenance['sha256']),
@@ -1401,6 +1579,7 @@ class WriteBlueGreenProxyConfiguration
                 $expectedCurrentBootId,
                 $expectedJournalProvenance,
                 $inactiveRetirement,
+                $spentFirstAdoptionDrain,
             ),
             'if [ "$container_journal_manifest_present" = true ]; then',
             ...$this->indent($this->validateStaleContainerMutationJournalManifestCommands(
@@ -1437,12 +1616,19 @@ class WriteBlueGreenProxyConfiguration
         string $expectedCurrentBootId,
         ?array $expectedJournalProvenance,
         ?array $inactiveRetirement = null,
+        ?array $spentFirstAdoptionDrain = null,
     ): array {
         if ($inactiveRetirement !== null) {
             return $this->validateStaleInactiveRetirementContainerMutationJournalCommands(
                 $managedFilename,
                 $expectedCurrentBootId,
                 $inactiveRetirement,
+            );
+        }
+        if ($spentFirstAdoptionDrain !== null) {
+            return $this->validateSpentFirstAdoptionDrainContainerMutationJournalCommands(
+                $managedFilename,
+                $spentFirstAdoptionDrain,
             );
         }
         $emptyChecksum = hash('sha256', '');
@@ -1535,9 +1721,13 @@ class WriteBlueGreenProxyConfiguration
     ): array {
         $expectedState = $profile['expected_state'];
         $replacementState = $profile['replacement_state'];
-        $expectedBootCommand = $profile['expected_journal_boot_id'] === null
-            ? []
-            : ['test "$container_journal_expected_boot_id" = '.escapeshellarg($profile['expected_journal_boot_id'])];
+        $expectedBootCommands = [
+            'test "$container_journal_expected_boot_id" = '.escapeshellarg($profile['expected_journal_boot_id']),
+        ];
+        if (! $profile['allow_pending_same_boot_journal']
+            && hash_equals($expectedCurrentBootId, $profile['expected_journal_boot_id'])) {
+            $expectedBootCommands[] = 'test "$container_journal_status" = archived';
+        }
 
         return [
             'test ! -e "$container_journal_mutation_path"',
@@ -1565,8 +1755,7 @@ class WriteBlueGreenProxyConfiguration
             'test "$container_journal_magic" = '.escapeshellarg(self::CONTAINER_MUTATION_JOURNAL_MAGIC),
             'test "$container_journal_filename" = '.escapeshellarg($managedFilename),
             $this->lowercaseUuidAssertionCommand('$container_journal_expected_boot_id'),
-            'test "$container_journal_expected_boot_id" != '.escapeshellarg($expectedCurrentBootId),
-            ...$expectedBootCommand,
+            ...$expectedBootCommands,
             'test "$container_journal_expected_state" = '.escapeshellarg(BlueGreenProxyRollbackArtifact::encodedState($expectedState)),
             'test "$container_journal_expected_state_checksum" = '.escapeshellarg(hash('sha256', $expectedState->serialize())),
             'test "$container_journal_replacement_state" = '.escapeshellarg(BlueGreenProxyRollbackArtifact::encodedState($replacementState)),
@@ -1612,6 +1801,110 @@ class WriteBlueGreenProxyConfiguration
     }
 
     /** @return list<string> */
+    private function validateSpentFirstAdoptionDrainContainerMutationJournalCommands(
+        string $managedFilename,
+        array $profile,
+    ): array {
+        $expectedState = $profile['expected_state'];
+        $replacementState = $profile['replacement_state'];
+        $legacyTarget = $profile['legacy_target'];
+        $containerId = escapeshellarg($legacyTarget->dockerId);
+        $containerName = escapeshellarg($legacyTarget->name);
+        $legacyRuntimeAssertions = (new InspectBlueGreenContainer)
+            ->exactMutationAssertionsFor($legacyTarget);
+        foreach ([
+            'coolify.blueGreen.managed',
+            'coolify.blueGreen.deploymentUuid',
+            'coolify.blueGreen.color',
+            'coolify.blueGreen.routingRevision',
+        ] as $fixedColorLabel) {
+            $format = escapeshellarg('{{ index .Config.Labels '.json_encode($fixedColorLabel, JSON_THROW_ON_ERROR).' }}');
+            $legacyRuntimeAssertions[] = 'test -z "$(docker inspect --format='.$format.' '.$containerId.')"';
+        }
+
+        return [
+            'test ! -e "$container_journal_mutation_path"',
+            'test ! -L "$container_journal_mutation_path"',
+            'durable_remote_assert_owned_regular "$container_journal_source"',
+            'test "$(durable_remote_owner_uid "$container_journal_source")" = 0',
+            'test "$(durable_remote_permissions "$container_journal_source")" = 600',
+            'container_journal_line_count=$(wc -l < "$container_journal_source")',
+            'test "$container_journal_line_count" = 13',
+            'exec 5< "$container_journal_source"',
+            'IFS= read -r container_journal_magic <&5',
+            'IFS= read -r container_journal_filename <&5',
+            'IFS= read -r container_journal_expected_boot_id <&5',
+            'IFS= read -r container_journal_expected_state <&5',
+            'IFS= read -r container_journal_expected_state_checksum <&5',
+            'IFS= read -r container_journal_replacement_state <&5',
+            'IFS= read -r container_journal_replacement_state_checksum <&5',
+            'IFS= read -r container_journal_managed_file_state <&5',
+            'IFS= read -r container_journal_managed_checksum <&5',
+            'IFS= read -r container_journal_mutation_checksum <&5',
+            'IFS= read -r container_journal_completion_checksum <&5',
+            'IFS= read -r container_journal_mutation <&5',
+            'IFS= read -r container_journal_completion <&5',
+            'exec 5<&-',
+            'test "$container_journal_magic" = '.escapeshellarg(self::CONTAINER_MUTATION_JOURNAL_MAGIC),
+            'test "$container_journal_filename" = '.escapeshellarg($managedFilename),
+            'test "$container_journal_expected_boot_id" = '.escapeshellarg($profile['expected_journal_boot_id']),
+            'test "$container_journal_expected_state" = '.escapeshellarg(BlueGreenProxyRollbackArtifact::encodedState($expectedState)),
+            'test "$container_journal_expected_state_checksum" = '.escapeshellarg(hash('sha256', $expectedState->serialize())),
+            'test "$container_journal_replacement_state" = '.escapeshellarg(BlueGreenProxyRollbackArtifact::encodedState($replacementState)),
+            'test "$container_journal_replacement_state_checksum" = '.escapeshellarg(hash('sha256', $replacementState->serialize())),
+            'test "$container_journal_managed_file_state" = present',
+            'test "$container_journal_managed_checksum" = '.escapeshellarg($expectedState->managedSha256),
+            'test "$container_journal_mutation_checksum" = '.escapeshellarg($profile['expected_mutation_sha256']),
+            'test "$container_journal_completion_checksum" = '.escapeshellarg($profile['expected_completion_sha256']),
+            'container_journal_expected_state_decoded=$(mktemp "$container_journal_state_directory/.blue-green-stale-container-expected.XXXXXX")',
+            'container_journal_replacement_decoded=$(mktemp "$container_journal_state_directory/.blue-green-stale-container-replacement.XXXXXX")',
+            'container_journal_mutation_decoded=$(mktemp "$container_journal_state_directory/.blue-green-stale-container-mutation.XXXXXX")',
+            'container_journal_completion_decoded=$(mktemp "$container_journal_state_directory/.blue-green-stale-container-completion.XXXXXX")',
+            'trap \'rm -f -- "${container_journal_expected_state_decoded:-}" "${container_journal_replacement_decoded:-}" "${container_journal_mutation_decoded:-}" "${container_journal_completion_decoded:-}" "${container_journal_manifest_stage:-}"\' 0 HUP INT TERM',
+            'printf %s "$container_journal_expected_state" | base64 -d > "$container_journal_expected_state_decoded"',
+            'printf %s "$container_journal_replacement_state" | base64 -d > "$container_journal_replacement_decoded"',
+            'printf %s "$container_journal_mutation" | base64 -d > "$container_journal_mutation_decoded"',
+            'printf %s "$container_journal_completion" | base64 -d > "$container_journal_completion_decoded"',
+            'container_journal_actual_checksum=$(sha256sum "$container_journal_expected_state_decoded")',
+            'test "${container_journal_actual_checksum%% *}" = "$container_journal_expected_state_checksum"',
+            'container_journal_actual_checksum=$(sha256sum "$container_journal_replacement_decoded")',
+            'test "${container_journal_actual_checksum%% *}" = "$container_journal_replacement_state_checksum"',
+            'container_journal_actual_checksum=$(sha256sum "$container_journal_mutation_decoded")',
+            'test "${container_journal_actual_checksum%% *}" = "$container_journal_mutation_checksum"',
+            'container_journal_actual_checksum=$(sha256sum "$container_journal_completion_decoded")',
+            'test "${container_journal_actual_checksum%% *}" = "$container_journal_completion_checksum"',
+            'test "$(head -n 1 "$container_journal_mutation_decoded")" = \'set -eu\'',
+            'test "$(head -n 1 "$container_journal_completion_decoded")" = \'set -eu\'',
+            'durable_remote_assert_owned_regular "$container_journal_active_path"',
+            'test "$(durable_remote_owner_uid "$container_journal_active_path")" = 0',
+            'test "$(durable_remote_permissions "$container_journal_active_path")" = 600',
+            'container_journal_actual_checksum=$(sha256sum "$container_journal_active_path")',
+            'test "${container_journal_actual_checksum%% *}" = "$container_journal_managed_checksum"',
+            'durable_remote_assert_owned_regular "$container_journal_state_path"',
+            'test "$(durable_remote_owner_uid "$container_journal_state_path")" = 0',
+            'test "$(durable_remote_permissions "$container_journal_state_path")" = 600',
+            ...$this->staleInactiveRetirementRouteStatusCommands($expectedState, $replacementState),
+            'test "$container_journal_route_status" = expected',
+            'if docker container inspect '.$containerId.' >/dev/null 2>&1; then',
+            ...$this->indent($legacyRuntimeAssertions),
+            '  container_journal_target_runtime_status=$(docker inspect --format='.escapeshellarg('{{.State.Status}}').' '.$containerId.')',
+            '  case "$container_journal_target_runtime_status" in',
+            '    '.ContainerStatusTypes::RUNNING->value.') container_journal_target_status=running ;;',
+            '    '.ContainerStatusTypes::EXITED->value.'|'.ContainerStatusTypes::DEAD->value.') container_journal_target_status=stopped ;;',
+            '    *) exit 1 ;;',
+            '  esac',
+            'else',
+            '  ! docker container inspect '.$containerName.' >/dev/null 2>&1',
+            '  container_journal_target_status=absent',
+            'fi',
+            'container_journal_checksum=$(sha256sum "$container_journal_source")',
+            'container_journal_checksum=${container_journal_checksum%% *}',
+            'case "$container_journal_checksum" in *[!0123456789abcdef]*|\'\') exit 1 ;; esac',
+            'test "${#container_journal_checksum}" -eq 64',
+        ];
+    }
+
+    /** @return list<string> */
     private function reconcileStaleInactiveRetirementRouteCommands(
         array $profile,
         string $statePath,
@@ -1620,6 +1913,7 @@ class WriteBlueGreenProxyConfiguration
         $replacementState = $profile['replacement_state'];
 
         return [
+            ...$this->staleInactiveRetirementTargetStatusCommands($profile),
             'case "$container_journal_target_status" in',
             '  stopped|absent)',
             '    if [ "$container_journal_route_status" = expected ]; then',
@@ -1754,11 +2048,27 @@ class WriteBlueGreenProxyConfiguration
         int $destinationId,
         int $stateId,
         string $archiveFilename,
+        ?array $inactiveRetirement,
     ): array {
+        $inactiveRetirementTargetStatusCommands = $inactiveRetirement === null
+            ? []
+            : $this->indent($this->staleInactiveRetirementTargetStatusCommands($inactiveRetirement));
+        $inactiveRetirementConnectionCommands = $inactiveRetirement === null
+            ? []
+            : [
+                '  if [ "$container_journal_target_status" = running ]; then',
+                '    container_journal_active_connections=$('.$inactiveRetirement['connection_observation_command'].')',
+                '    case "$container_journal_active_connections" in \'\'|*[!0-9]*) exit 1 ;; esac',
+                '    test "$container_journal_active_connections" -eq 0',
+                '  fi',
+            ];
+
         return [
             'test "$container_journal_checksum" = '.escapeshellarg($expectedJournalSha256),
             'if [ "$container_journal_status" = pending ]; then',
             $this->bootIdentityAssertionCommand(escapeshellarg($expectedCurrentBootId)),
+            ...$inactiveRetirementTargetStatusCommands,
+            ...$inactiveRetirementConnectionCommands,
             '  if [ "$container_journal_manifest_present" = false ]; then',
             '    container_journal_manifest_stage=$(mktemp "$container_journal_state_directory/.blue-green-stale-container-manifest.XXXXXX")',
             '    {',
@@ -1779,6 +2089,8 @@ class WriteBlueGreenProxyConfiguration
             $this->bootIdentityAssertionCommand(escapeshellarg($expectedCurrentBootId)),
             '  container_journal_final_checksum=$(sha256sum "$container_journal_path")',
             '  test "${container_journal_final_checksum%% *}" = "$container_journal_checksum"',
+            ...$inactiveRetirementTargetStatusCommands,
+            ...$inactiveRetirementConnectionCommands,
             '  durable_remote_replace "$container_journal_path" "$container_journal_archive_path" "$container_journal_state_directory"',
             '  test ! -e "$container_journal_path"',
             '  test ! -L "$container_journal_path"',
@@ -1915,9 +2227,11 @@ class WriteBlueGreenProxyConfiguration
 
     /**
      * @return array{
+     *     allow_pending_same_boot_journal: bool,
      *     application_id: int,
+     *     connection_observation_command: string,
      *     expected_completion_sha256: string,
-     *     expected_journal_boot_id: ?string,
+     *     expected_journal_boot_id: string,
      *     expected_mutation_sha256: string,
      *     expected_state: BlueGreenProxyState,
      *     inactive_color: BlueGreenDeploymentColor,
@@ -1931,11 +2245,13 @@ class WriteBlueGreenProxyConfiguration
      */
     private function staleInactiveRetirementContainerMutationJournalProfile(
         string $expectedCurrentBootId,
-        ?string $expectedJournalBootId,
+        string $expectedJournalBootId,
+        bool $allowPendingSameBootJournal,
         BlueGreenProxyState $expectedState,
         BlueGreenProxyState $replacementState,
         string $expectedMutationSha256,
         string $expectedCompletionSha256,
+        array $backendPorts,
         string $targetContainerName,
         string $targetContainerId,
         int $applicationId,
@@ -1944,11 +2260,10 @@ class WriteBlueGreenProxyConfiguration
         int $inactiveRoutingRevision,
     ): array {
         $this->assertBootId($expectedCurrentBootId);
-        if ($expectedJournalBootId !== null) {
-            $this->assertBootId($expectedJournalBootId);
-            if (hash_equals($expectedCurrentBootId, $expectedJournalBootId)) {
-                throw new InvalidArgumentException('A stale inactive-retirement journal must belong to an earlier server boot.');
-            }
+        $this->assertBootId($expectedJournalBootId);
+        if ($allowPendingSameBootJournal
+            && ! hash_equals($expectedCurrentBootId, $expectedJournalBootId)) {
+            throw new InvalidArgumentException('Only the current-boot inactive-retirement journal can use the pending same-boot recovery profile.');
         }
         $this->assertSha256($expectedMutationSha256, 'stale inactive-retirement mutation');
         $this->assertSha256($expectedCompletionSha256, 'stale inactive-retirement completion');
@@ -1974,6 +2289,19 @@ class WriteBlueGreenProxyConfiguration
             || $targetContainerName !== $expectedState->applicationUuid.'-'.$inactiveColor->value) {
             throw new InvalidArgumentException('The stale inactive-retirement journal target identity is invalid.');
         }
+        $connectionObservationCommand = (new DrainBlueGreenPreviousContainer)->observationCommandFor(
+            new BlueGreenContainerExpectation(
+                name: $targetContainerName,
+                dockerId: $targetContainerId,
+                applicationId: $applicationId,
+                pullRequestId: 0,
+                blueGreenManaged: true,
+                deploymentUuid: $inactiveDeploymentUuid,
+                color: $inactiveColor,
+                routingRevision: $inactiveRoutingRevision,
+            ),
+            $backendPorts,
+        );
         $provenanceSha256 = hash('sha256', implode("\n", [
             self::STALE_INACTIVE_RETIREMENT_JOURNAL_PROVENANCE_MAGIC,
             hash('sha256', $expectedState->serialize()),
@@ -1986,11 +2314,14 @@ class WriteBlueGreenProxyConfiguration
             $inactiveDeploymentUuid,
             $inactiveColor->value,
             (string) $inactiveRoutingRevision,
+            hash('sha256', $connectionObservationCommand),
             '',
         ]));
 
         return [
+            'allow_pending_same_boot_journal' => $allowPendingSameBootJournal,
             'application_id' => $applicationId,
+            'connection_observation_command' => $connectionObservationCommand,
             'expected_completion_sha256' => $expectedCompletionSha256,
             'expected_journal_boot_id' => $expectedJournalBootId,
             'expected_mutation_sha256' => $expectedMutationSha256,
@@ -2002,6 +2333,74 @@ class WriteBlueGreenProxyConfiguration
             'replacement_state' => $replacementState,
             'target_container_id' => $targetContainerId,
             'target_container_name' => $targetContainerName,
+        ];
+    }
+
+    /**
+     * @param  non-empty-list<string>  $expectedMutationCommands
+     * @param  non-empty-list<string>  $expectedCompletionCommands
+     * @return array{
+     *     expected_completion_sha256: string,
+     *     expected_journal_boot_id: string,
+     *     expected_mutation_sha256: string,
+     *     expected_state: BlueGreenProxyState,
+     *     legacy_target: BlueGreenContainerExpectation,
+     *     provenance_sha256: string,
+     *     replacement_state: BlueGreenProxyState
+     * }
+     */
+    private function spentFirstAdoptionDrainJournalProfile(
+        string $expectedCurrentBootId,
+        BlueGreenProxyState $expectedState,
+        BlueGreenProxyState $replacementState,
+        array $expectedMutationCommands,
+        array $expectedCompletionCommands,
+        BlueGreenContainerExpectation $legacyTarget,
+    ): array {
+        $this->assertBootId($expectedCurrentBootId);
+        $this->assertCommandList($expectedMutationCommands, 'spent first-adoption drain mutation');
+        $this->assertCommandList($expectedCompletionCommands, 'spent first-adoption drain completion');
+        if ($legacyTarget->dockerId === null
+            || $legacyTarget->blueGreenManaged
+            || $legacyTarget->pullRequestId !== 0
+            || $legacyTarget->applicationId < 1
+            || $expectedState->managedSha256 === null
+            || $expectedState->activeColor === null
+            || $expectedState->activeDeploymentUuid === null
+            || $expectedState->activeContainerName === null
+            || $expectedState->activeContainerId === null
+            || ! hash_equals($expectedState->operationId, $expectedState->activeDeploymentUuid)
+            || ! $replacementState->isMutationSuccessorOf($expectedState, $expectedState->operationId)
+            || ! $replacementState->hasSameRouteIdentity($expectedState)
+            || hash_equals($expectedState->activeContainerId, $legacyTarget->dockerId)
+            || ($expectedState->activeContainerSet?->contains($legacyTarget->name, $legacyTarget->dockerId) ?? false)) {
+            throw new InvalidArgumentException('The spent first-adoption drain journal does not identify one exact unrouted legacy predecessor behind its routed candidate.');
+        }
+        $mutationScript = implode("\n", ['set -eu', ...$expectedMutationCommands])."\n";
+        $completionScript = implode("\n", ['set -eu', ...$expectedCompletionCommands])."\n";
+        $mutationSha256 = hash('sha256', $mutationScript);
+        $completionSha256 = hash('sha256', $completionScript);
+        $provenanceSha256 = hash('sha256', implode("\n", [
+            self::SPENT_FIRST_ADOPTION_DRAIN_JOURNAL_PROVENANCE_MAGIC,
+            $expectedCurrentBootId,
+            hash('sha256', $expectedState->serialize()),
+            hash('sha256', $replacementState->serialize()),
+            $mutationSha256,
+            $completionSha256,
+            $legacyTarget->name,
+            $legacyTarget->dockerId,
+            (string) $legacyTarget->applicationId,
+            '',
+        ]));
+
+        return [
+            'expected_completion_sha256' => $completionSha256,
+            'expected_journal_boot_id' => $expectedCurrentBootId,
+            'expected_mutation_sha256' => $mutationSha256,
+            'expected_state' => $expectedState,
+            'legacy_target' => $legacyTarget,
+            'provenance_sha256' => $provenanceSha256,
+            'replacement_state' => $replacementState,
         ];
     }
 
@@ -2376,9 +2775,14 @@ class WriteBlueGreenProxyConfiguration
     }
 
     /** @return list<string> */
-    private function repairPendingContainerMutationJournalCommands(
+    /**
+     * @param  non-empty-list<string>  $incompleteJournalCommands
+     * @return list<string>
+     */
+    private function pendingContainerMutationJournalCommands(
         string $proxyPath,
         string $managedFilename,
+        array $incompleteJournalCommands,
     ): array {
         $journalPath = $this->containerMutationJournalPath($proxyPath, $managedFilename);
         $activePath = $this->managedPath($proxyPath, $managedFilename);
@@ -2414,7 +2818,6 @@ class WriteBlueGreenProxyConfiguration
             '  test "$container_journal_magic" = '.escapeshellarg(self::CONTAINER_MUTATION_JOURNAL_MAGIC),
             '  test "$container_journal_filename" = '.escapeshellarg($managedFilename),
             '  case "$container_journal_expected_boot_id" in [0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]) ;; *) exit 1 ;; esac',
-            $this->bootIdentityAssertionCommand('"$container_journal_expected_boot_id"'),
             '  case "$container_journal_expected_state_checksum$container_journal_replacement_state_checksum$container_journal_managed_checksum$container_journal_mutation_checksum$container_journal_completion_checksum" in *[!0123456789abcdef]*) exit 1 ;; esac',
             '  test "${#container_journal_expected_state_checksum}" -eq 64',
             '  test "${#container_journal_replacement_state_checksum}" -eq 64',
@@ -2460,9 +2863,7 @@ class WriteBlueGreenProxyConfiguration
             '      cmp -s '.$safeStatePath.' "$container_journal_expected_state_decoded"',
             '    fi',
             '    if ! sh "$container_journal_completion_decoded"; then',
-            '      sh "$container_journal_mutation_decoded"',
-            ...$this->indent($this->indent($this->afterContainerMutationCommands())),
-            '      sh "$container_journal_completion_decoded"',
+            ...$this->indent($this->indent($incompleteJournalCommands)),
             '    fi',
             '    container_state_stage=$(mktemp '.escapeshellarg($directory.'/.blue-green-container-state.XXXXXX').')',
             '    cp -- "$container_journal_replacement_state_decoded" "$container_state_stage"',

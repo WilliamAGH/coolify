@@ -9,6 +9,7 @@ use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteOutcome;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteResult;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
+use App\Actions\Application\BlueGreen\BlueGreenDeploymentTransitionException;
 use App\Actions\Application\BlueGreen\BlueGreenOperationFence;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
@@ -553,6 +554,72 @@ it('runs lifecycle attestation and replica inspection availability paths through
         ->and($availableInspections[0]->dockerId)->toBe($containerId);
     assertBlueGreenApplicationNonRootProcessPayloads($replicaProcesses, [$replicaScript, $availableReplicaScript]);
     expect($fixture['operationFence']->releaseIfOwned())->toBeTrue();
+});
+
+it('translates a nonzero pending container mutation journal transport failure into an explicit transition failure', function (): void {
+    config(['constants.ssh.mux_enabled' => false]);
+    Storage::fake('ssh-keys');
+    $server = blueGreenApplicationRemoteServer('ubuntu');
+    $configuration = blueGreenApplicationRemoteConfiguration();
+    $application = new Application;
+    $application->uuid = 'nonrootapp';
+    $destination = new StandaloneDocker;
+    $destination->forceFill(['id' => 1, 'server_id' => $server->getKey()]);
+    $attempts = 0;
+    Process::fake(function () use (&$attempts) {
+        $attempts++;
+
+        return Process::result(
+            errorOutput: WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT,
+            exitCode: 91,
+        );
+    });
+
+    expect(fn () => (new AttestBlueGreenDestinationState)->handle(
+        server: $server,
+        application: $application,
+        destination: $destination,
+        state: null,
+        expectedState: $configuration->state,
+    ))->toThrow(
+        BlueGreenDeploymentTransitionException::class,
+        'pending container mutation journal',
+    );
+    expect($attempts)->toBe(1);
+});
+
+it('rethrows unrelated destination attestation transport failures unchanged', function (): void {
+    config(['constants.ssh.mux_enabled' => false]);
+    Storage::fake('ssh-keys');
+    $server = blueGreenApplicationRemoteServer('ubuntu');
+    $configuration = blueGreenApplicationRemoteConfiguration();
+    $application = new Application;
+    $application->uuid = 'nonrootapp';
+    $destination = new StandaloneDocker;
+    $destination->forceFill(['id' => 1, 'server_id' => $server->getKey()]);
+    $transportError = 'unrelated destination attestation transport failure';
+    $attempts = 0;
+    Process::fake(function () use (&$attempts, $transportError) {
+        $attempts++;
+
+        return Process::result(errorOutput: $transportError, exitCode: 73);
+    });
+
+    try {
+        (new AttestBlueGreenDestinationState)->handle(
+            server: $server,
+            application: $application,
+            destination: $destination,
+            state: null,
+            expectedState: $configuration->state,
+        );
+        $this->fail('Expected the unrelated transport exception to be rethrown.');
+    } catch (RuntimeException $exception) {
+        expect($exception::class)->toBe(RuntimeException::class)
+            ->and($exception->getMessage())->toBe($transportError)
+            ->and($exception->getCode())->toBe(73)
+            ->and($attempts)->toBe(1);
+    }
 });
 
 it('forwards privileged script transport options and runs disabled retries exactly once', function (): void {

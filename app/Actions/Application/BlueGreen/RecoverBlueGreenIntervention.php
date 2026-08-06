@@ -339,14 +339,18 @@ final class RecoverBlueGreenIntervention
     ): BlueGreenInterventionRecoveryResult {
         try {
             $inspectionBootId = $this->readStaleContainerMutationJournalBootIdentity($context['server']);
-            $expectedJournalBootId = $this->expectedStaleInactiveRetirementJournalBootId(
+            $journalBootProfile = $this->staleInactiveRetirementJournalBootProfile(
                 $context['state'],
                 $inspectionBootId,
             );
             $inspection = $this->inspectStaleInactiveRetirementContainerMutationJournal(
                 $context,
                 $inspectionBootId,
-                $expectedJournalBootId,
+                $journalBootProfile,
+            );
+            $this->assertStaleInactiveRetirementTargetHasNoActiveConnections(
+                $context,
+                $inspection['target_status'],
             );
         } catch (BlueGreenOperationFenceLostException) {
             return $this->staleContainerMutationJournalDeferred($stateId, $reason, $context, 'boot_unstable');
@@ -406,19 +410,24 @@ final class RecoverBlueGreenIntervention
             if (! hash_equals($inspectionBootId, $lockedBootId)) {
                 return $this->staleContainerMutationJournalDeferred($stateId, $reason, $lockedContext, 'boot_changed');
             }
-            $lockedExpectedJournalBootId = $this->expectedStaleInactiveRetirementJournalBootId(
+            $lockedJournalBootProfile = $this->staleInactiveRetirementJournalBootProfile(
                 $lockedContext['state'],
                 $lockedBootId,
             );
-            if ($lockedExpectedJournalBootId !== $expectedJournalBootId) {
+            if ($lockedJournalBootProfile !== $journalBootProfile) {
                 return $this->staleContainerMutationJournalManualOnly($stateId, $reason, $lockedContext, 'journal_boot_owner_changed');
             }
+            $operationFence->assertLockOwnership();
+            $this->assertStaleInactiveRetirementTargetHasNoActiveConnections(
+                $lockedContext,
+                $inspection['target_status'],
+            );
             $operationFence->assertLockOwnership();
             $archiveAttempted = true;
             $quarantine = $this->quarantineStaleInactiveRetirementContainerMutationJournal(
                 $lockedContext,
                 $lockedBootId,
-                $lockedExpectedJournalBootId,
+                $lockedJournalBootProfile,
                 $inspection['journal_sha256'],
             );
             $operationFence->assertLockOwnership();
@@ -529,31 +538,68 @@ final class RecoverBlueGreenIntervention
         );
     }
 
-    private function expectedStaleInactiveRetirementJournalBootId(
+    /**
+     * @return array{allow_pending_same_boot_journal: bool, journal_boot_id: string}
+     */
+    private function staleInactiveRetirementJournalBootProfile(
         ApplicationBlueGreenDeployment $state,
         string $currentBootId,
-    ): ?string {
+    ): array {
         $journalBootId = $state->inactive_retirement_server_boot_id;
         if (! is_string($journalBootId)) {
             throw new BlueGreenDeploymentTransitionException('The inactive-retirement journal has no typed server boot provenance.');
         }
         if ($state->inactive_retirement_stopped_at !== null) {
-            return hash_equals($journalBootId, $currentBootId) ? null : $journalBootId;
+            return [
+                'allow_pending_same_boot_journal' => false,
+                'journal_boot_id' => $journalBootId,
+            ];
         }
         if ($state->inactive_retirement_intervention_required_at !== null) {
-            if (hash_equals($journalBootId, $currentBootId)
-                || $this->inactiveRetirementDispatchReservationIsFuture($state)) {
-                throw new BlueGreenDeploymentTransitionException('A live or current-boot inactive-retirement owner prevents stale-journal recovery.');
+            if ($state->inactive_retirement_attempts !== RetireBlueGreenInactiveContainer::MAX_ATTEMPTS
+                || $state->inactive_retirement_dispatch_reserved_until_at === null
+                || $this->inactiveRetirementDispatchReservationIsFuture($state)
+                || $state->inactive_retirement_last_observed_connections !== 1) {
+                throw new BlueGreenDeploymentTransitionException('An immature or reserved inactive-retirement owner prevents stale-journal recovery.');
             }
 
-            return $journalBootId;
+            return [
+                'allow_pending_same_boot_journal' => hash_equals($journalBootId, $currentBootId),
+                'journal_boot_id' => $journalBootId,
+            ];
         }
         if (! hash_equals($journalBootId, $currentBootId)
-            || $state->inactive_retirement_attempts !== 0) {
+            || $state->inactive_retirement_attempts !== 0
+            || ! $this->inactiveRetirementDispatchReservationIsFuture($state)) {
             throw new BlueGreenDeploymentTransitionException('The inactive-retirement journal is neither an intervened stale owner nor an exact requeued recovery.');
         }
 
-        return null;
+        return [
+            'allow_pending_same_boot_journal' => false,
+            'journal_boot_id' => $journalBootId,
+        ];
+    }
+
+    /**
+     * @param  array{inactive_retirement: array{backend_ports: list<int>, target: BlueGreenContainerExpectation}, server: Server}  $context
+     */
+    private function assertStaleInactiveRetirementTargetHasNoActiveConnections(
+        array $context,
+        string $targetStatus,
+    ): void {
+        if ($targetStatus !== 'running') {
+            return;
+        }
+        $connections = (new DrainBlueGreenPreviousContainer)->activeConnections(
+            $context['server'],
+            $context['inactive_retirement']['target'],
+            $context['inactive_retirement']['backend_ports'],
+        );
+        if ($connections !== 0) {
+            throw new BlueGreenDeploymentTransitionException(
+                'The running inactive-retirement target still has active backend connections.',
+            );
+        }
     }
 
     private function inactiveRetirementDispatchReservationIsFuture(
@@ -577,7 +623,7 @@ final class RecoverBlueGreenIntervention
     private function inspectStaleInactiveRetirementContainerMutationJournal(
         array $context,
         string $expectedCurrentBootId,
-        ?string $expectedJournalBootId,
+        array $journalBootProfile,
     ): array {
         $writer = new WriteBlueGreenProxyConfiguration;
         $retirement = $context['inactive_retirement'];
@@ -587,11 +633,13 @@ final class RecoverBlueGreenIntervention
                 proxyPath: $context['server']->proxyPath(),
                 stateId: (int) $context['state']->id,
                 expectedCurrentBootId: $expectedCurrentBootId,
-                expectedJournalBootId: $expectedJournalBootId,
+                expectedJournalBootId: $journalBootProfile['journal_boot_id'],
+                allowPendingSameBootJournal: $journalBootProfile['allow_pending_same_boot_journal'],
                 expectedState: $retirement['expected_state'],
                 replacementState: $retirement['replacement_state'],
                 expectedMutationSha256: $retirement['mutation_sha256'],
                 expectedCompletionSha256: $retirement['completion_sha256'],
+                backendPorts: $retirement['backend_ports'],
                 targetContainerName: $target->name,
                 targetContainerId: (string) $target->dockerId,
                 applicationId: $target->applicationId,
@@ -608,15 +656,14 @@ final class RecoverBlueGreenIntervention
             $output,
             $writer,
             $context,
-            $expectedCurrentBootId,
-            $expectedJournalBootId,
+            $journalBootProfile['journal_boot_id'],
         );
     }
 
     private function quarantineStaleInactiveRetirementContainerMutationJournal(
         array $context,
         string $expectedCurrentBootId,
-        ?string $expectedJournalBootId,
+        array $journalBootProfile,
         string $expectedJournalSha256,
     ): array {
         $writer = new WriteBlueGreenProxyConfiguration;
@@ -627,11 +674,13 @@ final class RecoverBlueGreenIntervention
                 proxyPath: $context['server']->proxyPath(),
                 stateId: (int) $context['state']->id,
                 expectedCurrentBootId: $expectedCurrentBootId,
-                expectedJournalBootId: $expectedJournalBootId,
+                expectedJournalBootId: $journalBootProfile['journal_boot_id'],
+                allowPendingSameBootJournal: $journalBootProfile['allow_pending_same_boot_journal'],
                 expectedState: $retirement['expected_state'],
                 replacementState: $retirement['replacement_state'],
                 expectedMutationSha256: $retirement['mutation_sha256'],
                 expectedCompletionSha256: $retirement['completion_sha256'],
+                backendPorts: $retirement['backend_ports'],
                 targetContainerName: $target->name,
                 targetContainerId: (string) $target->dockerId,
                 applicationId: $target->applicationId,
@@ -649,8 +698,7 @@ final class RecoverBlueGreenIntervention
             $output,
             $writer,
             $context,
-            $expectedCurrentBootId,
-            $expectedJournalBootId,
+            $journalBootProfile['journal_boot_id'],
         );
     }
 
@@ -658,8 +706,7 @@ final class RecoverBlueGreenIntervention
         string $output,
         WriteBlueGreenProxyConfiguration $writer,
         array $context,
-        string $expectedCurrentBootId,
-        ?string $expectedJournalBootId,
+        string $expectedJournalBootId,
     ): array {
         $fields = explode('|', $output);
         $retirement = $context['inactive_retirement'];
@@ -669,6 +716,7 @@ final class RecoverBlueGreenIntervention
             replacementState: $retirement['replacement_state'],
             expectedMutationSha256: $retirement['mutation_sha256'],
             expectedCompletionSha256: $retirement['completion_sha256'],
+            backendPorts: $retirement['backend_ports'],
             targetContainerName: $target->name,
             targetContainerId: (string) $target->dockerId,
             applicationId: $target->applicationId,
@@ -691,8 +739,7 @@ final class RecoverBlueGreenIntervention
             || ! in_array($fields[5], ['absent', 'running', 'stopped'], true)
             || ! in_array($fields[6], ['expected', 'replacement'], true)
             || preg_match('/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/D', $fields[7]) !== 1
-            || hash_equals($fields[7], $expectedCurrentBootId)
-            || ($expectedJournalBootId !== null && ! hash_equals($fields[7], $expectedJournalBootId))
+            || ! hash_equals($fields[7], $expectedJournalBootId)
             || ($fields[5] === 'running' && $fields[6] !== 'expected')) {
             throw new BlueGreenDeploymentTransitionException('The mature stale inactive-retirement journal did not return its exact safe result.');
         }
@@ -786,8 +833,7 @@ final class RecoverBlueGreenIntervention
                 ->update([
                     'destination_fence_operation_id' => $retirement['replacement_state']->operationId,
                     'destination_fence_mutation_sequence' => $retirement['replacement_state']->mutationSequence,
-                    'inactive_retirement_last_observed_connections' => 0,
-                    'inactive_retirement_observed_at' => now(),
+                    'inactive_retirement_intervention_required_at' => null,
                     'inactive_retirement_stopped_at' => now(),
                     'inactive_retirement_dispatch_reserved_until_at' => null,
                 ]);
@@ -1245,7 +1291,8 @@ final class RecoverBlueGreenIntervention
             || $state->inactive_retirement_stop_grace_seconds < 1
             || ! is_int($state->inactive_retirement_lease_seconds)
             || $state->inactive_retirement_lease_seconds < 1
-            || $state->inactive_retirement_last_observed_connections !== 0
+            || ! is_int($state->inactive_retirement_last_observed_connections)
+            || $state->inactive_retirement_last_observed_connections < 0
             || $state->inactive_retirement_observed_at === null
             || (int) $owner->application_id !== (int) $application->id
             || (int) $owner->destination_id !== (int) $destination->id
@@ -1340,6 +1387,7 @@ final class RecoverBlueGreenIntervention
             $state,
         );
         $inactiveRetirement = [
+            'backend_ports' => $drainInventory->ports(),
             'completion_sha256' => $completionSha256,
             'expected_state' => $expectedState,
             'inactive_deployment' => $inactive,
@@ -1564,7 +1612,7 @@ final class RecoverBlueGreenIntervention
             $inventory->ports(),
             $state->inactive_retirement_drain_deadline_at->getTimestamp(),
             $state->inactive_retirement_stop_grace_seconds,
-            true,
+            $state->inactive_retirement_last_observed_connections === 0,
         );
         $scriptIndex = array_key_last($commands);
         $currentDeadlineBlock = <<<'SH'
@@ -1619,6 +1667,7 @@ SH;
                 'replacement_state' => $retirement['replacement_state']->serialize(),
                 'mutation_sha256' => $retirement['mutation_sha256'],
                 'completion_sha256' => $retirement['completion_sha256'],
+                'backend_ports' => $retirement['backend_ports'],
                 'target' => [
                     'name' => $retirement['target']->name,
                     'docker_id' => $retirement['target']->dockerId,
@@ -1817,13 +1866,28 @@ SH;
         try {
             $operationFence->assertLockOwnership();
 
+            $spentFirstAdoptionDrainJournal = null;
+            try {
+                $spentFirstAdoptionDrainJournal = QuarantineSpentFirstAdoptionDrainJournal::run(
+                    $stateId,
+                    $operationFence,
+                );
+            } catch (BlueGreenOperationFenceLostException $exception) {
+                throw $exception;
+            } catch (\Throwable $exception) {
+                $this->audit('blue_green.intervention.spent_first_adoption_journal_not_recovered', $plan, $reason, [
+                    'message' => $exception->getMessage(),
+                ]);
+            }
+            $operationFence->assertLockOwnership();
+
             try {
                 $liveState = ReadBlueGreenManagedRouteMetadata::run(
                     $context['server'],
                     $context['application'],
                     $context['destination'],
                 );
-            } catch (BlueGreenDeploymentTransitionException $exception) {
+            } catch (\Throwable $exception) {
                 // An unreadable route proves nothing in either direction — the
                 // host may have blinked — so the state stays parked for the
                 // scheduler's next cooldown-paced attempt.
@@ -1850,6 +1914,28 @@ SH;
                     message: 'The live managed route does not prove the exact finalized generation, so the unreconstructable drain owner cannot be terminalized; no route, container, or durable state was changed.',
                     stateId: $stateId,
                     activeColor: $liveState?->activeColor?->value,
+                );
+            }
+
+            if ($spentFirstAdoptionDrainJournal !== null
+                && $spentFirstAdoptionDrainJournal['status'] === 'archived') {
+                $queueId = $this->reopenFinalizedState($stateId);
+                $operationFence->assertLockOwnership();
+                ResumeBlueGreenDrainingDeploymentJob::dispatch($queueId);
+                $this->audit('blue_green.intervention.spent_first_adoption_drain_resumed', $plan, $reason, [
+                    'active_color' => $liveState->activeColor?->value,
+                    'archive_filename' => $spentFirstAdoptionDrainJournal['archive_filename'],
+                    'journal_sha256' => $spentFirstAdoptionDrainJournal['journal_sha256'],
+                    'queue_id' => $queueId,
+                ]);
+
+                return new BlueGreenInterventionRecoveryResult(
+                    classification: $plan->classification,
+                    outcome: BlueGreenInterventionRecoveryResult::DEFERRED,
+                    message: 'The exact expired first-adoption drain journal was archived without replay, the routed candidate was re-proven, and a fenced forced-retirement owner was queued.',
+                    stateId: $stateId,
+                    activeColor: $liveState->activeColor?->value,
+                    recoveryOwnerActive: true,
                 );
             }
 

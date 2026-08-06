@@ -17,13 +17,17 @@ function destinationFenceBootId(): string
     return '11111111-2222-3333-4444-555555555555';
 }
 
-function destinationFenceWriter(): WriteBlueGreenProxyConfiguration
+function destinationFenceWriter(?string $currentBootId = null): WriteBlueGreenProxyConfiguration
 {
-    return new class extends WriteBlueGreenProxyConfiguration
+    return new class($currentBootId) extends WriteBlueGreenProxyConfiguration
     {
+        public function __construct(private readonly ?string $currentBootId) {}
+
         protected function bootIdentityAssertionCommand(string $expectedBootIdShellValue): string
         {
-            return 'true';
+            return $this->currentBootId === null
+                ? 'true'
+                : 'test '.escapeshellarg($this->currentBootId).' = '.$expectedBootIdShellValue;
         }
     };
 }
@@ -657,7 +661,7 @@ it('repairs only missing or drifted regular managed files under the exact sideca
     }
 });
 
-it('reconciles a completed container removal after a crash without replaying the destructive command', function () {
+it('finalizes a completed container mutation but fences an unfinished journal during attestation', function (): void {
     $filesystem = new Filesystem;
     $proxyPath = sys_get_temp_dir().'/coolify-blue-green-container-journal-'.bin2hex(random_bytes(8));
     $filesystem->mkdir($proxyPath.'/dynamic', 0700);
@@ -723,6 +727,156 @@ it('reconciles a completed container removal after a crash without replaying the
             ->toBe('coolify-blue-green-destination-state-attested')
             ->and(BlueGreenProxyState::parse(file_get_contents($statePath))->serialize())->toBe($claim->serialize())
             ->and(file_exists($journalPath))->toBeFalse();
+
+        $pendingState = $claim->withMutationOwner('pending-sentinel');
+        $sentinelPath = $proxyPath.'/mutation-replay-sentinel';
+        file_put_contents($sentinelPath, 'before-mutation');
+
+        $interrupted = failedDestinationFenceCommand($crashingWriter->fencedDestinationCommandFor(
+            proxyPath: $proxyPath,
+            managedFilename: $managedFilename,
+            expectedState: $claim,
+            replacementState: $pendingState,
+            expectedBootId: destinationFenceBootId(),
+            commands: [
+                'printf %s '.escapeshellarg('mutation-applied').' > '.escapeshellarg($sentinelPath),
+            ],
+            completionCommands: destinationFenceFileAttestation($sentinelPath, 'mutation-applied'),
+        ));
+
+        expect($interrupted->getExitCode())->toBe(87)
+            ->and(file_get_contents($sentinelPath))->toBe('mutation-applied')
+            ->and(file_exists($journalPath))->toBeTrue()
+            ->and(BlueGreenProxyState::parse(file_get_contents($statePath))->serialize())
+            ->toBe($claim->serialize());
+
+        $journalBeforeAttestation = file_get_contents($journalPath);
+        $stateBeforeAttestation = file_get_contents($statePath);
+        file_put_contents($sentinelPath, 'replay-sentinel');
+
+        $pendingAttestation = failedDestinationFenceCommand(
+            $writer->attestStateCommandFor($proxyPath, $managedFilename, $claim),
+        );
+        expect($pendingAttestation->getExitCode())->not->toBe(0)
+            ->and($pendingAttestation->getErrorOutput())
+            ->toContain(WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT)
+            ->and(file_get_contents($sentinelPath))->toBe('replay-sentinel')
+            ->and(file_exists($journalPath))->toBeTrue()
+            ->and(file_get_contents($journalPath))->toBe($journalBeforeAttestation)
+            ->and(file_get_contents($statePath))->toBe($stateBeforeAttestation);
+
+        $conditionalSentinelPath = $proxyPath.'/attestation-conditional-sentinel';
+        file_put_contents($conditionalSentinelPath, 'unselected');
+        $conditional = failedDestinationFenceCommand(implode("\n", [
+            'if (',
+            $writer->attestStateCommandFor($proxyPath, $managedFilename, $claim),
+            '); then',
+            '  printf %s success-branch > '.escapeshellarg($conditionalSentinelPath),
+            'else',
+            '  printf %s failure-branch > '.escapeshellarg($conditionalSentinelPath),
+            'fi',
+        ]));
+
+        expect($conditional->isSuccessful())->toBeTrue($conditional->getErrorOutput())
+            ->and($conditional->getErrorOutput())
+            ->toContain(WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT)
+            ->and(file_get_contents($conditionalSentinelPath))->toBe('failure-branch')
+            ->and(file_get_contents($sentinelPath))->toBe('replay-sentinel')
+            ->and(file_get_contents($journalPath))->toBe($journalBeforeAttestation)
+            ->and(file_get_contents($statePath))->toBe($stateBeforeAttestation);
+
+        $outerContinuationPath = $proxyPath.'/attestation-outer-continuation';
+        $braceGroup = failedDestinationFenceCommand(implode("\n", [
+            '{',
+            $writer->attestStateCommandFor($proxyPath, $managedFilename, $claim),
+            '}',
+            'printf %s outer-script-continued > '.escapeshellarg($outerContinuationPath),
+        ]));
+
+        expect($braceGroup->isSuccessful())->toBeFalse()
+            ->and($braceGroup->getErrorOutput())
+            ->toContain(WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT)
+            ->and(file_exists($outerContinuationPath))->toBeFalse()
+            ->and(file_get_contents($sentinelPath))->toBe('replay-sentinel')
+            ->and(file_get_contents($journalPath))->toBe($journalBeforeAttestation)
+            ->and(file_get_contents($statePath))->toBe($stateBeforeAttestation);
+    } finally {
+        $filesystem->remove($proxyPath);
+    }
+});
+
+it('reports an unfinished journal from a different boot as pending rather than a boot assertion failure', function (): void {
+    $filesystem = new Filesystem;
+    $proxyPath = sys_get_temp_dir().'/coolify-blue-green-container-journal-boot-'.bin2hex(random_bytes(8));
+    $filesystem->mkdir($proxyPath.'/dynamic', 0700);
+
+    try {
+        $configuration = compileDestinationFencedBlueGreenConfiguration(
+            epoch: 1,
+            activeColor: BlueGreenDeploymentColor::BLUE,
+            deploymentUuid: 'deployment-journal-boot',
+            containerId: '0123456789abcdef',
+            operationId: 'journal-boot-owner',
+        );
+        $managedFilename = $configuration->managedFilename;
+        $writer = destinationFenceWriter(destinationFenceBootId());
+        $rollbackKey = new BlueGreenProxyRollbackKey('journal-boot-owner', null, $configuration->state);
+        runDestinationFenceCommand($writer->commandFor(
+            $proxyPath,
+            $configuration,
+            $rollbackKey,
+            destinationFenceBootId(),
+        ));
+
+        $pendingState = $configuration->state->withMutationOwner('journal-boot-pending');
+        $sentinelPath = $proxyPath.'/journal-boot-sentinel';
+        file_put_contents($sentinelPath, 'before-mutation');
+        $crashingWriter = new class extends WriteBlueGreenProxyConfiguration
+        {
+            /** @return list<string> */
+            protected function afterContainerMutationCommands(): array
+            {
+                return ['exit 87'];
+            }
+
+            protected function bootIdentityAssertionCommand(string $expectedBootIdShellValue): string
+            {
+                return 'true';
+            }
+        };
+        $journalBootId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+        $interrupted = failedDestinationFenceCommand($crashingWriter->fencedDestinationCommandFor(
+            proxyPath: $proxyPath,
+            managedFilename: $managedFilename,
+            expectedState: $configuration->state,
+            replacementState: $pendingState,
+            expectedBootId: $journalBootId,
+            commands: [
+                'printf %s '.escapeshellarg('mutation-applied').' > '.escapeshellarg($sentinelPath),
+            ],
+            completionCommands: destinationFenceFileAttestation($sentinelPath, 'mutation-applied'),
+        ));
+        $statePath = $writer->statePath($proxyPath, $managedFilename);
+        $journalPath = $writer->containerMutationJournalPath($proxyPath, $managedFilename);
+
+        expect($interrupted->getExitCode())->toBe(87)
+            ->and(file_get_contents($sentinelPath))->toBe('mutation-applied')
+            ->and(file_exists($journalPath))->toBeTrue();
+
+        $journalBeforeAttestation = file_get_contents($journalPath);
+        $stateBeforeAttestation = file_get_contents($statePath);
+        file_put_contents($sentinelPath, 'replay-sentinel');
+
+        $pendingAttestation = failedDestinationFenceCommand(
+            $writer->attestStateCommandFor($proxyPath, $managedFilename, $configuration->state),
+        );
+
+        expect($pendingAttestation->getExitCode())->not->toBe(0)
+            ->and($pendingAttestation->getErrorOutput())
+            ->toContain(WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT)
+            ->and(file_get_contents($sentinelPath))->toBe('replay-sentinel')
+            ->and(file_get_contents($journalPath))->toBe($journalBeforeAttestation)
+            ->and(file_get_contents($statePath))->toBe($stateBeforeAttestation);
     } finally {
         $filesystem->remove($proxyPath);
     }
@@ -1140,11 +1294,13 @@ it('builds a mature inactive-retirement journal inspection that cannot replay it
         proxyPath: '/data/coolify/proxy',
         stateId: 75,
         expectedCurrentBootId: destinationFenceBootId(),
-        expectedJournalBootId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+        expectedJournalBootId: destinationFenceBootId(),
+        allowPendingSameBootJournal: true,
         expectedState: $expectedState,
         replacementState: $replacementState,
         expectedMutationSha256: str_repeat('d', 64),
         expectedCompletionSha256: str_repeat('e', 64),
+        backendPorts: [8080],
         targetContainerName: 'app-fenced-blue',
         targetContainerId: str_repeat('a', 64),
         applicationId: 17,
@@ -1157,6 +1313,7 @@ it('builds a mature inactive-retirement journal inspection that cannot replay it
         ->and($command)->toContain('test "$container_journal_replacement_state" = '.escapeshellarg(base64_encode($replacementState->serialize())))
         ->and($command)->toContain('test "$container_journal_mutation_checksum" = '.escapeshellarg(str_repeat('d', 64)))
         ->and($command)->toContain('test "$container_journal_completion_checksum" = '.escapeshellarg(str_repeat('e', 64)))
+        ->and($command)->toContain('test "$container_journal_expected_boot_id" = '.escapeshellarg(destinationFenceBootId()))
         ->and($command)->toContain('coolify.blueGreen.deploymentUuid=retirement-inactive')
         ->and($command)->toContain('case "$container_journal_target_runtime_status" in')
         ->and($command)->toContain(
@@ -1173,11 +1330,13 @@ it('builds a mature inactive-retirement journal inspection that cannot replay it
         proxyPath: '/data/coolify/proxy',
         stateId: 75,
         expectedCurrentBootId: destinationFenceBootId(),
-        expectedJournalBootId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+        expectedJournalBootId: destinationFenceBootId(),
+        allowPendingSameBootJournal: true,
         expectedState: $expectedState,
         replacementState: $replacementState,
         expectedMutationSha256: str_repeat('d', 64),
         expectedCompletionSha256: str_repeat('e', 64),
+        backendPorts: [8080],
         targetContainerName: 'app-fenced-blue',
         targetContainerId: str_repeat('a', 64),
         applicationId: 17,
@@ -1189,12 +1348,41 @@ it('builds a mature inactive-retirement journal inspection that cannot replay it
     $targetStatusAttestation = 'container_journal_target_runtime_status=$(docker inspect --format=';
     $routeStatusAttestation = 'container_journal_route_state=$(base64 < "$container_journal_state_path"';
     $routeReplacement = 'durable_remote_replace "$container_journal_state_stage"';
+    $manifestReplacement = 'durable_remote_replace "$container_journal_manifest_stage"';
+    $journalArchive = 'durable_remote_replace "$container_journal_path" "$container_journal_archive_path"';
+    $activeConnectionFence = 'test "$container_journal_active_connections" -eq 0';
+    $activeConnectionArchiveFence = implode("\n", [
+        '    '.$activeConnectionFence,
+        '  fi',
+        '  durable_remote_replace "$container_journal_path" "$container_journal_archive_path" "$container_journal_state_directory"',
+    ]);
     $firstTargetStatusAttestation = strpos($quarantineCommand, $targetStatusAttestation);
     $routeReplacementPosition = strpos($quarantineCommand, $routeReplacement);
     $lastTargetStatusAttestation = strrpos($quarantineCommand, $targetStatusAttestation);
+    $manifestReplacementPosition = strpos($quarantineCommand, $manifestReplacement);
+    $journalArchivePosition = strpos($quarantineCommand, $journalArchive);
+    $firstActiveConnectionFence = strpos($quarantineCommand, $activeConnectionFence);
+    $lastActiveConnectionFence = strrpos($quarantineCommand, $activeConnectionFence);
+    preg_match_all(
+        '/'.preg_quote($targetStatusAttestation, '/').'/',
+        $quarantineCommand,
+        $targetStatusMatches,
+        PREG_OFFSET_CAPTURE,
+    );
+    $targetStatusPositions = array_column($targetStatusMatches[0], 1);
 
-    expect(substr_count($quarantineCommand, $targetStatusAttestation))->toBe(2)
+    expect($targetStatusPositions)->toHaveCount(5)
         ->and(substr_count($quarantineCommand, $routeStatusAttestation))->toBe(2)
+        ->and(substr_count($quarantineCommand, $activeConnectionFence))->toBe(2)
+        ->and($quarantineCommand)->toContain($activeConnectionArchiveFence)
         ->and($firstTargetStatusAttestation)->toBeInt()->toBeLessThan($routeReplacementPosition)
-        ->and($lastTargetStatusAttestation)->toBeInt()->toBeGreaterThan($routeReplacementPosition);
+        ->and($lastTargetStatusAttestation)->toBeInt()->toBeGreaterThan($routeReplacementPosition)
+        ->and($targetStatusPositions[1])->toBeLessThan($firstActiveConnectionFence)
+        ->and($firstActiveConnectionFence)->toBeInt()->toBeLessThan($manifestReplacementPosition)
+        ->and($manifestReplacementPosition)->toBeInt()->toBeLessThan($targetStatusPositions[2])
+        ->and($targetStatusPositions[2])->toBeLessThan($lastActiveConnectionFence)
+        ->and($lastActiveConnectionFence)->toBeInt()->toBeLessThan($journalArchivePosition)
+        ->and($journalArchivePosition)->toBeInt()->toBeLessThan($targetStatusPositions[3])
+        ->and($targetStatusPositions[3])->toBeLessThan($routeReplacementPosition)
+        ->and($routeReplacementPosition)->toBeInt()->toBeLessThan($targetStatusPositions[4]);
 });

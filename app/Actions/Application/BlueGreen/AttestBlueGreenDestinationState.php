@@ -10,6 +10,7 @@ use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
 use Lorisleiva\Actions\Concerns\AsAction;
+use RuntimeException;
 
 final class AttestBlueGreenDestinationState
 {
@@ -38,21 +39,35 @@ final class AttestBlueGreenDestinationState
                 || $expectedState->destinationId !== (int) $destination->id)) {
             throw new BlueGreenDeploymentTransitionException('The expected destination state belongs to a different application topology.');
         }
-        $result = trim((string) instant_privileged_remote_script(
-            $expectedState === null
-                ? (new WriteBlueGreenProxyConfiguration)->firstAdoptionAttestStateCommandFor(
-                    $server->proxyPath(),
-                    $managedFilename,
-                    (string) $application->uuid,
-                    (int) $destination->id,
-                )
-                : (new WriteBlueGreenProxyConfiguration)->attestStateCommandFor(
-                    $server->proxyPath(),
-                    $managedFilename,
-                    $expectedState,
-                ),
-            $server,
-        ));
+        try {
+            $result = trim((string) instant_privileged_remote_script(
+                $expectedState === null
+                    ? (new WriteBlueGreenProxyConfiguration)->firstAdoptionAttestStateCommandFor(
+                        $server->proxyPath(),
+                        $managedFilename,
+                        (string) $application->uuid,
+                        (int) $destination->id,
+                    )
+                    : (new WriteBlueGreenProxyConfiguration)->attestStateCommandFor(
+                        $server->proxyPath(),
+                        $managedFilename,
+                        $expectedState,
+                    ),
+                $server,
+            ));
+        } catch (RuntimeException $exception) {
+            if (! str_contains(
+                $exception->getMessage(),
+                WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT,
+            )) {
+                throw $exception;
+            }
+
+            throw new BlueGreenDeploymentTransitionException(
+                'The remote destination has a pending container mutation journal that requires explicit recovery.',
+                previous: $exception,
+            );
+        }
         if ($result !== 'coolify-blue-green-destination-state-attested') {
             throw new BlueGreenDeploymentTransitionException('The remote destination state did not return its exact attestation.');
         }

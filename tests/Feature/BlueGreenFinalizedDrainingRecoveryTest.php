@@ -5,6 +5,7 @@ use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
+use App\Actions\Application\BlueGreen\BlueGreenInterventionRecoveryResult;
 use App\Actions\Application\BlueGreen\BlueGreenOperationFence;
 use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\ComputeBlueGreenDeploymentFingerprint;
@@ -13,6 +14,8 @@ use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Actions\Application\BlueGreen\PlanBlueGreenPublicRecovery;
 use App\Actions\Application\BlueGreen\ReconstructBlueGreenDeploymentRecovery;
 use App\Actions\Application\BlueGreen\RecoverBlueGreenFinalizedDrainingOperation;
+use App\Actions\Application\BlueGreen\RecoverBlueGreenIntervention;
+use App\Actions\Application\BlueGreen\ResolveBlueGreenExpectedProxyState;
 use App\Actions\Application\BlueGreen\TransitionsBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\VerifyBlueGreenCandidateReleaseProof;
 use App\Actions\Application\BlueGreen\VerifyBlueGreenPublicRecovery;
@@ -33,6 +36,7 @@ use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\ProxyTypes;
 use App\Exceptions\DeploymentException;
 use App\Jobs\ApplicationDeploymentJob;
+use App\Jobs\ResumeBlueGreenDrainingDeploymentJob;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
@@ -52,7 +56,10 @@ use Illuminate\Support\Facades\Notification;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Storage;
+use Symfony\Component\Filesystem\Filesystem;
+use Symfony\Component\Process\Process as SymfonyProcess;
 use Symfony\Component\Yaml\Yaml;
+use Tests\Support\BlueGreenRecoveryScenario;
 
 uses(RefreshDatabase::class);
 
@@ -1296,4 +1303,527 @@ it('treats an unmeasurable drain budget as spent so a deferral cannot loop forev
         'operation_drain_deadline_at' => now()->subSeconds(BlueGreenDeploymentLifecycle::DRAIN_RECOVERY_BUDGET_SECONDS + 5),
     ]);
     expect($lifecycle->hasSpentDrainRecoveryBudget())->toBeTrue();
+});
+
+function spentFirstAdoptionCandidateConfiguration(
+    BlueGreenRecoveryScenario $scenario,
+): BlueGreenProxyConfiguration {
+    $state = $scenario->state->fresh();
+    $target = new BlueGreenRoutingTarget(
+        destinationId: $scenario->destination->id,
+        activeColor: BlueGreenDeploymentColor::BLUE,
+        blueContainerName: $scenario->application->uuid.'-blue',
+        greenContainerName: $scenario->application->uuid.'-green',
+        port: 3000,
+        routingRevision: 1,
+        mode: BlueGreenRoutingMode::LegacyAdoption,
+        publicProofToken: BlueGreenRoutingTarget::durablePublicProofToken(
+            BlueGreenRecoveryScenario::OPERATION_UUID,
+        ),
+        destinationFenceEpoch: $state->destination_fence_epoch,
+        operationId: BlueGreenRecoveryScenario::OPERATION_UUID,
+        mutationSequence: $state->destination_fence_mutation_sequence,
+        activeDeploymentUuid: BlueGreenRecoveryScenario::OPERATION_UUID,
+        activeContainerId: BlueGreenRecoveryScenario::CANDIDATE_ID,
+        destinationTopologyDigest: $state->destination_topology_digest,
+    );
+
+    return CompileBlueGreenProxyConfiguration::run(
+        $scenario->application,
+        $scenario->destination,
+        $target,
+    );
+}
+
+function spentFirstAdoptionRemoteScript(PendingProcess $process): ?string
+{
+    $command = is_array($process->command)
+        ? implode(' ', $process->command)
+        : (string) $process->command;
+    if ($process->input !== null && ! str_contains($command, 'curl --config -')) {
+        return (string) $process->input;
+    }
+
+    $marker = "'bash -se' << \\";
+    $markerPosition = strpos($command, $marker);
+    if ($markerPosition === false) {
+        return null;
+    }
+    $delimiterStart = $markerPosition + strlen($marker);
+    $delimiterEnd = strpos($command, "\n", $delimiterStart);
+    if ($delimiterEnd === false) {
+        return null;
+    }
+    $delimiter = substr($command, $delimiterStart, $delimiterEnd - $delimiterStart);
+    $scriptEnd = strrpos($command, "\n{$delimiter}");
+    if ($delimiter === '' || $scriptEnd === false || $scriptEnd <= $delimiterEnd) {
+        return null;
+    }
+
+    return substr($command, $delimiterEnd + 1, $scriptEnd - $delimiterEnd - 1);
+}
+
+/** @param array<string, string> $environment */
+function executeSpentFirstAdoptionRemoteScript(string $script, array $environment): SymfonyProcess
+{
+    $script = str_replace(
+        '/proc/sys/kernel/random/boot_id',
+        $environment['FAKE_BOOT_ID_PATH'],
+        $script,
+    );
+    $script = str_replace(
+        ['"/proc/$drain_pid/net/tcp"', '"/proc/$drain_pid/net/tcp6"'],
+        [escapeshellarg($environment['FAKE_TCP_PATH']), escapeshellarg($environment['FAKE_TCP6_PATH'])],
+        $script,
+    );
+    $script = str_replace(
+        'test "$(id -u)" = 0',
+        'test "$(id -u)" = "$FAKE_UID"',
+        $script,
+    );
+    $script = preg_replace(
+        '/test "\$\(durable_remote_owner_uid ([^)]+)\)" = 0/',
+        'test "$(durable_remote_owner_uid $1)" = "$FAKE_UID"',
+        $script,
+    ) ?? throw new RuntimeException('Could not adapt the remote owner assertion for the local regression host.');
+
+    $process = new SymfonyProcess(
+        ['/bin/bash', '-se'],
+        env: $environment,
+        input: $script,
+        timeout: 60,
+    );
+    $process->run();
+
+    return $process;
+}
+
+function spentFirstAdoptionDockerExecutable(): string
+{
+    return <<<'SH'
+#!/usr/bin/env bash
+set -eu
+
+printf '%s\n' "$*" >> "$FAKE_DOCKER_LOG"
+
+resolve_kind() {
+    case "$1" in
+        "$FAKE_CANDIDATE_ID"|"$FAKE_CANDIDATE_NAME"|"/$FAKE_CANDIDATE_NAME") printf '%s' candidate ;;
+        "$FAKE_LEGACY_ID"|"$FAKE_LEGACY_NAME"|"/$FAKE_LEGACY_NAME") printf '%s' legacy ;;
+        *) return 1 ;;
+    esac
+}
+
+status_path() {
+    if [ "$1" = candidate ]; then
+        printf '%s' "$FAKE_CANDIDATE_STATUS_PATH"
+    else
+        printf '%s' "$FAKE_LEGACY_STATUS_PATH"
+    fi
+}
+
+container_is_present() {
+    test "$(cat "$(status_path "$1")")" != absent
+}
+
+emit_inspection() {
+    kind="$1"
+    status="$(cat "$(status_path "$kind")")"
+    if [ "$kind" = candidate ]; then
+        printf '{"Id":"%s","Name":"/%s","State":{"Status":"%s","Pid":1,"Health":{"Status":"healthy"}},"Config":{"Labels":{"coolify.applicationId":"%s","coolify.pullRequestId":"0","coolify.blueGreen.managed":"true","coolify.blueGreen.deploymentUuid":"%s","coolify.blueGreen.color":"blue","coolify.blueGreen.routingRevision":"1","coolify.blueGreen.releaseProof":"%s"},"Env":["COOLIFY_DEPLOYMENT_RELEASE_PROOF=%s"]}}\n' \
+            "$FAKE_CANDIDATE_ID" "$FAKE_CANDIDATE_NAME" "$status" "$FAKE_APPLICATION_ID" "$FAKE_OPERATION_UUID" "$FAKE_RELEASE_PROOF" "$FAKE_RELEASE_PROOF"
+    else
+        printf '{"Id":"%s","Name":"/%s","State":{"Status":"%s","Pid":1,"Health":{"Status":"healthy"}},"Config":{"Labels":{"coolify.applicationId":"%s","coolify.pullRequestId":"0"},"Env":[]}}\n' \
+            "$FAKE_LEGACY_ID" "$FAKE_LEGACY_NAME" "$status" "$FAKE_APPLICATION_ID"
+    fi
+}
+
+emit_label() {
+    kind="$1"
+    label="$2"
+    case "$label" in
+        coolify.applicationId) printf '%s\n' "$FAKE_APPLICATION_ID" ;;
+        coolify.pullRequestId) printf '%s\n' 0 ;;
+        coolify.blueGreen.managed) test "$kind" = candidate && printf '%s\n' true || printf '\n' ;;
+        coolify.blueGreen.deploymentUuid) test "$kind" = candidate && printf '%s\n' "$FAKE_OPERATION_UUID" || printf '\n' ;;
+        coolify.blueGreen.color) test "$kind" = candidate && printf '%s\n' blue || printf '\n' ;;
+        coolify.blueGreen.routingRevision) test "$kind" = candidate && printf '%s\n' 1 || printf '\n' ;;
+        coolify.blueGreen.releaseProof) test "$kind" = candidate && printf '%s\n' "$FAKE_RELEASE_PROOF" || printf '\n' ;;
+        *) printf '\n' ;;
+    esac
+}
+
+command="${1:-}"
+if [ "$command" = container ] && [ "${2:-}" = inspect ]; then
+    kind="$(resolve_kind "${3:-}")" || exit 1
+    container_is_present "$kind"
+    exit
+fi
+
+if [ "$command" = inspect ]; then
+    shift
+    format=''
+    case "${1:-}" in
+        --format=*) format="${1#--format=}"; shift ;;
+        --format) format="${2:-}"; shift 2 ;;
+    esac
+    kind="$(resolve_kind "${1:-}")" || exit 1
+    container_is_present "$kind" || exit 1
+    case "$format" in
+        ''|'{{json .}}') emit_inspection "$kind" ;;
+        '{{.Id}}') test "$kind" = candidate && printf '%s\n' "$FAKE_CANDIDATE_ID" || printf '%s\n' "$FAKE_LEGACY_ID" ;;
+        '{{.Name}}') test "$kind" = candidate && printf '/%s\n' "$FAKE_CANDIDATE_NAME" || printf '/%s\n' "$FAKE_LEGACY_NAME" ;;
+        '{{.State.Status}}') cat "$(status_path "$kind")" ;;
+        '{{.State.Pid}}') printf '%s\n' 1 ;;
+        '{{json .Config.Env}}') test "$kind" = candidate && printf '["COOLIFY_DEPLOYMENT_RELEASE_PROOF=%s"]\n' "$FAKE_RELEASE_PROOF" || printf '[]\n' ;;
+        '{{json .Config}}')
+            if [ "$kind" = candidate ]; then
+                printf '{"Labels":{"coolify.applicationId":"%s","coolify.pullRequestId":"0","coolify.blueGreen.managed":"true","coolify.blueGreen.deploymentUuid":"%s","coolify.blueGreen.color":"blue","coolify.blueGreen.routingRevision":"1","coolify.blueGreen.releaseProof":"%s"},"Env":["COOLIFY_DEPLOYMENT_RELEASE_PROOF=%s"]}\n' \
+                    "$FAKE_APPLICATION_ID" "$FAKE_OPERATION_UUID" "$FAKE_RELEASE_PROOF" "$FAKE_RELEASE_PROOF"
+            else
+                printf '{"Labels":{"coolify.applicationId":"%s","coolify.pullRequestId":"0"},"Env":[]}\n' "$FAKE_APPLICATION_ID"
+            fi
+            ;;
+        *coolify.applicationId*) emit_label "$kind" coolify.applicationId ;;
+        *coolify.pullRequestId*) emit_label "$kind" coolify.pullRequestId ;;
+        *coolify.blueGreen.managed*) emit_label "$kind" coolify.blueGreen.managed ;;
+        *coolify.blueGreen.deploymentUuid*) emit_label "$kind" coolify.blueGreen.deploymentUuid ;;
+        *coolify.blueGreen.color*) emit_label "$kind" coolify.blueGreen.color ;;
+        *coolify.blueGreen.routingRevision*) emit_label "$kind" coolify.blueGreen.routingRevision ;;
+        *coolify.blueGreen.releaseProof*) emit_label "$kind" coolify.blueGreen.releaseProof ;;
+        *) printf 'unsupported docker inspect format: %s\n' "$format" >&2; exit 2 ;;
+    esac
+    exit
+fi
+
+if [ "$command" = ps ]; then
+    case "$*" in
+        *coolify.blueGreen.managed=true*)
+            if container_is_present candidate; then
+                printf '%s\n' "$FAKE_CANDIDATE_ID"
+            fi
+            ;;
+        *) printf 'unsupported docker ps query: %s\n' "$*" >&2; exit 2 ;;
+    esac
+    exit
+fi
+
+if [ "$command" = stop ]; then
+    shift
+    case "${1:-}" in --time=*) shift ;; esac
+    kind="$(resolve_kind "${1:-}")" || exit 1
+    container_is_present "$kind" || exit 1
+    printf '%s\n' exited > "$(status_path "$kind")"
+    exit
+fi
+
+if [ "$command" = rm ]; then
+    shift
+    while [ "${1#-}" != "$1" ]; do shift; done
+    kind="$(resolve_kind "${1:-}")" || exit 1
+    container_is_present "$kind" || exit 1
+    printf '%s\n' absent > "$(status_path "$kind")"
+    exit
+fi
+
+printf 'unsupported fake docker command: %s\n' "$*" >&2
+exit 2
+SH;
+}
+
+it('archives a spent first-adoption journal without replay before retiring only the legacy predecessor', function (): void {
+    config(['constants.ssh.mux_enabled' => false]);
+    Queue::fake();
+    Notification::fake();
+
+    $filesystem = new Filesystem;
+    $temporaryRoot = sys_get_temp_dir().'/coolify-spent-first-adoption-'.bin2hex(random_bytes(8));
+    $fakeBin = $temporaryRoot.'/bin';
+    $baseConfigPath = $temporaryRoot.'/coolify';
+    $filesystem->mkdir([$temporaryRoot, $fakeBin], 0700);
+    config(['constants.coolify.base_config_path' => $baseConfigPath]);
+
+    try {
+        InstanceSettings::unguarded(
+            fn () => InstanceSettings::query()->firstOrCreate(['id' => 0]),
+        );
+        $scenario = BlueGreenRecoveryScenario::create(finalized: true, routingMutationRecorded: true);
+        $configuration = spentFirstAdoptionCandidateConfiguration($scenario);
+        $drainDeadline = now()->subSeconds(BlueGreenDeploymentLifecycle::DRAIN_RECOVERY_BUDGET_SECONDS + 30);
+        $scenario->state->update([
+            'phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+            'intervention_phase' => BlueGreenDeploymentPhase::DRAINING->value,
+            'intervention_reason' => RecoverBlueGreenIntervention::UNRECONSTRUCTABLE_DRAIN_REASON,
+            'managed_file_sha256' => $configuration->state->managedSha256,
+            'application_routing_config_digest' => $configuration->routingConfigDigest,
+            'operation_routing_config_digest' => $configuration->routingConfigDigest,
+            'operation_drain_started_at' => $drainDeadline->clone()->subMinute(),
+            'operation_drain_deadline_at' => $drainDeadline,
+            'operation_drain_last_observed_connections' => 1,
+            'operation_drain_observed_at' => now()->subMinute(),
+        ]);
+        $scenario->deployment->update([
+            'status' => ApplicationDeploymentStatus::FAILED->value,
+            'blue_green_phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+            'blue_green_routing_config_digest' => $configuration->routingConfigDigest,
+            'finished_at' => now(),
+        ]);
+
+        $writer = new WriteBlueGreenProxyConfiguration;
+        $expectedState = ResolveBlueGreenExpectedProxyState::run(
+            $scenario->application,
+            $scenario->destination,
+            $scenario->state->fresh(),
+        );
+        expect($expectedState?->serialize())->toBe($configuration->state->serialize());
+        $expectedState ??= throw new RuntimeException('The spent first-adoption fixture has no routed candidate state.');
+        $replacementState = $expectedState->withMutationOwner(BlueGreenRecoveryScenario::OPERATION_UUID);
+        $legacyTarget = new BlueGreenContainerExpectation(
+            name: (string) $scenario->state->fresh()->operation_previous_container_name,
+            dockerId: BlueGreenRecoveryScenario::LEGACY_ID,
+            applicationId: $scenario->application->id,
+            pullRequestId: 0,
+            blueGreenManaged: false,
+        );
+        $drainer = new DrainBlueGreenPreviousContainer;
+        $mutationCommands = $drainer->commandsFor(
+            $legacyTarget,
+            [3000],
+            $drainDeadline->getTimestamp(),
+            $scenario->application->settings->deploymentStopGracePeriodSeconds(),
+            false,
+        );
+        $completionCommands = $drainer->completionAssertionsFor($legacyTarget);
+
+        $proxyPath = $scenario->server->proxyPath();
+        $managedPath = $writer->managedPath($proxyPath, $configuration->managedFilename);
+        $statePath = $writer->statePath($proxyPath, $configuration->managedFilename);
+        $journalPath = $writer->containerMutationJournalPath($proxyPath, $configuration->managedFilename);
+        $filesystem->mkdir([dirname($managedPath), dirname($statePath)], 0700);
+        file_put_contents($managedPath, $configuration->yaml);
+        file_put_contents($statePath, $expectedState->serialize());
+        chmod($managedPath, 0600);
+        chmod($statePath, 0600);
+
+        $dockerLog = $temporaryRoot.'/docker.log';
+        $awkLog = $temporaryRoot.'/awk.log';
+        $candidateStatusPath = $temporaryRoot.'/candidate.status';
+        $legacyStatusPath = $temporaryRoot.'/legacy.status';
+        $bootIdPath = $temporaryRoot.'/boot-id';
+        $tcpPath = $temporaryRoot.'/tcp';
+        $tcp6Path = $temporaryRoot.'/tcp6';
+        $rewrittenShPath = $temporaryRoot.'/rewritten.sh';
+        file_put_contents($fakeBin.'/docker', spentFirstAdoptionDockerExecutable());
+        file_put_contents($fakeBin.'/awk', <<<'SH'
+#!/bin/sh
+set -eu
+printf '%s\n' observation >> "$FAKE_AWK_LOG"
+printf '%s\n' 1
+SH);
+        file_put_contents($fakeBin.'/sh', <<<'SH'
+#!/usr/bin/env bash
+set -eu
+
+if [ "$#" -eq 1 ] && [ -f "$1" ] && grep -Fq '/proc/$drain_pid/net/tcp' "$1"; then
+    /usr/bin/sed \
+        -e "s#\"/proc/\\\$drain_pid/net/tcp6\"#\"$FAKE_TCP6_PATH\"#g" \
+        -e "s#\"/proc/\\\$drain_pid/net/tcp\"#\"$FAKE_TCP_PATH\"#g" \
+        "$1" > "$FAKE_REWRITTEN_SH_PATH"
+    exec /bin/sh "$FAKE_REWRITTEN_SH_PATH"
+fi
+
+exec /bin/sh "$@"
+SH);
+        file_put_contents($fakeBin.'/wc', <<<'SH'
+#!/bin/sh
+set -eu
+/usr/bin/wc "$@" | /usr/bin/tr -d '[:blank:]'
+SH);
+        chmod($fakeBin.'/docker', 0700);
+        chmod($fakeBin.'/awk', 0700);
+        chmod($fakeBin.'/sh', 0700);
+        chmod($fakeBin.'/wc', 0700);
+        file_put_contents($dockerLog, '');
+        file_put_contents($awkLog, '');
+        file_put_contents($candidateStatusPath, 'running'.PHP_EOL);
+        file_put_contents($legacyStatusPath, 'running'.PHP_EOL);
+        file_put_contents($bootIdPath, '11111111-2222-3333-4444-555555555555'.PHP_EOL);
+        file_put_contents($tcpPath, '');
+        file_put_contents($tcp6Path, '');
+        $releaseProof = BlueGreenRoutingTarget::durableReleaseProofToken(BlueGreenRecoveryScenario::OPERATION_UUID);
+        $uid = (string) (function_exists('posix_geteuid') ? posix_geteuid() : getmyuid());
+        $path = implode(':', array_filter([
+            $fakeBin,
+            (string) getenv('PATH'),
+            '/opt/homebrew/bin',
+            '/sbin',
+        ]));
+        $environment = [
+            'BASH_ENV' => '/dev/null',
+            'FAKE_APPLICATION_ID' => (string) $scenario->application->id,
+            'FAKE_AWK_LOG' => $awkLog,
+            'FAKE_BOOT_ID_PATH' => $bootIdPath,
+            'FAKE_CANDIDATE_ID' => BlueGreenRecoveryScenario::CANDIDATE_ID,
+            'FAKE_CANDIDATE_NAME' => $scenario->application->uuid.'-blue',
+            'FAKE_CANDIDATE_STATUS_PATH' => $candidateStatusPath,
+            'FAKE_DOCKER_LOG' => $dockerLog,
+            'FAKE_LEGACY_ID' => BlueGreenRecoveryScenario::LEGACY_ID,
+            'FAKE_LEGACY_NAME' => (string) $scenario->state->fresh()->operation_previous_container_name,
+            'FAKE_LEGACY_STATUS_PATH' => $legacyStatusPath,
+            'FAKE_OPERATION_UUID' => BlueGreenRecoveryScenario::OPERATION_UUID,
+            'FAKE_RELEASE_PROOF' => $releaseProof,
+            'FAKE_REWRITTEN_SH_PATH' => $rewrittenShPath,
+            'FAKE_TCP6_PATH' => $tcp6Path,
+            'FAKE_TCP_PATH' => $tcpPath,
+            'FAKE_UID' => $uid,
+            'PATH' => $path,
+        ];
+
+        $expiredDrain = executeSpentFirstAdoptionRemoteScript(
+            $writer->fencedDestinationCommandFor(
+                proxyPath: $proxyPath,
+                managedFilename: $configuration->managedFilename,
+                expectedState: $expectedState,
+                replacementState: $replacementState,
+                expectedBootId: '11111111-2222-3333-4444-555555555555',
+                commands: $mutationCommands,
+                completionCommands: $completionCommands,
+            ),
+            $environment,
+        );
+        $expiredDrainDiagnostics = implode(PHP_EOL, [
+            'exit='.$expiredDrain->getExitCode(),
+            'stdout='.$expiredDrain->getOutput(),
+            'stderr='.$expiredDrain->getErrorOutput(),
+            'docker='.implode(' | ', file($dockerLog, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: []),
+        ]);
+        if (! str_contains($expiredDrain->getErrorOutput(), DrainBlueGreenPreviousContainer::TIMEOUT_MARKER)) {
+            throw new RuntimeException($expiredDrainDiagnostics);
+        }
+        expect($expiredDrain->isSuccessful())
+            ->toBeFalse($expiredDrainDiagnostics)
+            ->and($expiredDrain->getErrorOutput().PHP_EOL.$expiredDrainDiagnostics)
+            ->toContain(DrainBlueGreenPreviousContainer::TIMEOUT_MARKER)
+            ->and(is_file($journalPath))->toBeTrue();
+        $journalSha256 = hash_file('sha256', $journalPath);
+        expect($journalSha256)->toBeString()->toHaveLength(64)
+            ->and(file($awkLog, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [])->toHaveCount(1);
+
+        $routePlan = new PlanBlueGreenPublicRecovery;
+        Process::fake(function (PendingProcess $process) use (
+            $environment,
+            $managedPath,
+            $releaseProof,
+            $routePlan,
+        ): FakeProcessResult {
+            $command = is_array($process->command)
+                ? implode(' ', $process->command)
+                : (string) $process->command;
+            if (str_contains($command, 'curl --config -')) {
+                $acknowledgement = $routePlan->publicAcknowledgementForYaml(
+                    (string) file_get_contents($managedPath),
+                );
+                if ($acknowledgement === null) {
+                    return Process::result(errorOutput: 'The live managed route has no public acknowledgement.', exitCode: 1);
+                }
+
+                return Process::result(output: "HTTP/1.1 200 OK\r\n"
+                    .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$acknowledgement}\r\n"
+                    .BlueGreenRoutingTarget::RELEASE_PROOF_HEADER.": {$releaseProof}\r\n\r\n");
+            }
+
+            $script = spentFirstAdoptionRemoteScript($process);
+            if ($script === null) {
+                return Process::result(
+                    errorOutput: "Could not extract the fake remote script from: {$command}",
+                    exitCode: 1,
+                );
+            }
+            $local = executeSpentFirstAdoptionRemoteScript($script, $environment);
+
+            return Process::result(
+                output: $local->getOutput(),
+                errorOutput: $local->getErrorOutput(),
+                exitCode: $local->getExitCode() ?? 1,
+            );
+        });
+
+        $recovery = RecoverBlueGreenIntervention::run(
+            stateId: $scenario->state->id,
+            apply: true,
+            reason: 'Automatic recovery of the exact spent first-adoption drain journal.',
+        );
+        expect($recovery->classification)->toBe(BlueGreenInterventionRecoveryResult::FINALIZED_UNRECONSTRUCTABLE)
+            ->and($recovery->outcome)->toBe(BlueGreenInterventionRecoveryResult::DEFERRED)
+            ->and($recovery->recoveryOwnerActive)->toBeTrue($recovery->message);
+        Queue::assertPushed(
+            ResumeBlueGreenDrainingDeploymentJob::class,
+            fn (ResumeBlueGreenDrainingDeploymentJob $job): bool => $job->applicationDeploymentQueueId === $scenario->deployment->id,
+        );
+
+        $archiveFilename = $writer->staleContainerMutationJournalArchiveFilename(
+            $configuration->managedFilename,
+            $scenario->state->id,
+        );
+        $archivePath = dirname($journalPath).'/'.$archiveFilename;
+        $manifestPath = $archivePath.'.manifest';
+        expect(is_file($journalPath))->toBeFalse()
+            ->and(is_file($archivePath))->toBeTrue()
+            ->and(hash_file('sha256', $archivePath))->toBe($journalSha256)
+            ->and(is_file($manifestPath))->toBeTrue();
+
+        (new ResumeBlueGreenDrainingDeploymentJob($scenario->deployment->id))->handle();
+
+        $state = $scenario->state->fresh();
+        $queue = $scenario->deployment->fresh();
+        $routedState = BlueGreenProxyState::parse((string) file_get_contents($statePath));
+        $dockerCalls = file($dockerLog, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
+        $awkCalls = file($awkLog, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
+        $stopCalls = array_values(array_filter(
+            $dockerCalls,
+            static fn (string $call): bool => str_starts_with($call, 'stop '),
+        ));
+        $removeCalls = array_values(array_filter(
+            $dockerCalls,
+            static fn (string $call): bool => str_starts_with($call, 'rm '),
+        ));
+        $candidateMutations = array_values(array_filter(
+            [...$stopCalls, ...$removeCalls],
+            static fn (string $call): bool => str_contains($call, BlueGreenRecoveryScenario::CANDIDATE_ID),
+        ));
+        $manifest = file($manifestPath, FILE_IGNORE_NEW_LINES);
+        $runtimeDiagnostics = implode(' | ', [
+            ...$dockerCalls,
+            'queue='.((string) $queue->logs),
+            'queue_status='.$queue->status,
+            'queue_phase='.($queue->blue_green_phase?->value ?? 'null'),
+            'state_phase='.$state->phase->value,
+        ]);
+
+        expect($awkCalls)->toHaveCount(1)
+            ->and($stopCalls)->toHaveCount(1, $runtimeDiagnostics)
+            ->and($stopCalls[0])->toContain(BlueGreenRecoveryScenario::LEGACY_ID)
+            ->and($removeCalls)->toHaveCount(1, $runtimeDiagnostics)
+            ->and($removeCalls[0])->toContain(BlueGreenRecoveryScenario::LEGACY_ID)
+            ->and($candidateMutations)->toBeEmpty()
+            ->and(trim((string) file_get_contents($candidateStatusPath)))->toBe('running')
+            ->and(trim((string) file_get_contents($legacyStatusPath)))->toBe('absent')
+            ->and($routedState->activeContainerId)->toBe(BlueGreenRecoveryScenario::CANDIDATE_ID)
+            ->and($routedState->activeDeploymentUuid)->toBe(BlueGreenRecoveryScenario::OPERATION_UUID)
+            ->and(is_file($journalPath))->toBeFalse()
+            ->and(hash_file('sha256', $archivePath))->toBe($journalSha256)
+            ->and($manifest)->toHaveCount(9)
+            ->and($manifest[1])->toBe($configuration->managedFilename)
+            ->and($manifest[2])->toBe((string) $scenario->state->id)
+            ->and($manifest[5])->toBe($journalSha256)
+            ->and($manifest[8])->toBe($archiveFilename)
+            ->and($state->phase)->toBe(BlueGreenDeploymentPhase::IDLE)
+            ->and($state->active_color)->toBe(BlueGreenDeploymentColor::BLUE)
+            ->and(ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state))->toBeTrue()
+            ->and($queue->status)->toBe(ApplicationDeploymentStatus::FINISHED->value)
+            ->and($queue->blue_green_phase)->toBe(BlueGreenDeploymentPhase::IDLE)
+            ->and($queue->finished_at)->not->toBeNull();
+    } finally {
+        $filesystem->remove($temporaryRoot);
+    }
 });
