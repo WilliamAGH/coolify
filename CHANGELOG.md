@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 💼 Other
+
+- *(ci)* Refresh patched nanoid lock resolution
+
+### 📚 Documentation
+
+- Update changelog
+- *(agents)* Document lockfile-only audit remediation
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.78-fork
+
+## [4.13.77-fork] - 2026-08-07
+
 ### 🚀 Features
 
 - *(blue-green)* Add operator commands for routing topology digests
