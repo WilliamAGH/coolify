@@ -509,7 +509,7 @@ class DeployController extends Controller
 
         $reasonCode = $recovery['reason_code'];
         $correlationId = $recovery['correlation_id'];
-        if (! is_string($reasonCode) || $reasonCode === '' || ! is_string($correlationId) || $correlationId === '') {
+        if (! is_string($reasonCode) || $reasonCode === '') {
             $reasonCode = 'recovery_failed';
             $correlationId = (string) Str::uuid();
             auditLog('api.deployment.recovery_response_sanitized', [
@@ -567,10 +567,15 @@ class DeployController extends Controller
                 if (str_contains($e->getMessage(), 'No such container')) {
                     $deployment->addLogEntry('Deployment container already removed.');
                 } else {
-                    $deployment->addLogEntry('Post-cancellation cleanup failed: '.$e->getMessage(), 'stderr');
+                    $correlationId = (string) Str::uuid();
+                    $deployment->addLogEntry(
+                        "Post-cancellation cleanup failed: reason=cleanup_failed correlation_id={$correlationId}",
+                        'stderr',
+                    );
                     Log::warning('Post-cancel cleanup failed for deployment.', [
                         'deployment_uuid' => $deployment->deployment_uuid,
-                        'error' => $e->getMessage(),
+                        'correlation_id' => $correlationId,
+                        'exception' => $e,
                     ]);
                 }
             } catch (\Throwable) {

@@ -704,6 +704,13 @@ final class EmergencyRecoverApplicationDeployment
         ?string $reasonCode = null,
         ?string $correlationId = null,
     ): array {
+        // Every non-clean result carries a stable reason code from this producer,
+        // so the API boundary never has to invent one — a deferral is not a
+        // failure and must not be relabelled downstream as recovery_failed.
+        if ($outcome !== self::CLEAN) {
+            $reasonCode ??= $outcome === self::DEFERRED ? 'recovery_deferred' : 'recovery_failed';
+        }
+
         return [
             'deployment_uuid' => (string) $deployment->deployment_uuid,
             'status' => (string) $deployment->fresh()?->status,

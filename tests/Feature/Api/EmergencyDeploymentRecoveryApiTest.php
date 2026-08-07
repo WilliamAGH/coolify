@@ -850,7 +850,9 @@ it('does not cancel an exact failed first-adoption successor while its lifecycle
         ->assertJsonPath('outcome', 'deferred')
         ->assertJsonPath('claimable', false)
         ->assertJsonPath('cancelled', false)
-        ->assertJsonPath('recovery_owner_active', true);
+        ->assertJsonPath('recovery_owner_active', true)
+        ->assertJsonPath('reason_code', 'recovery_deferred')
+        ->assertJsonPath('correlation_id', null);
 
     $preservedDeployment = $deployment->fresh();
     expect($archived)->toBeFalse()
@@ -1015,6 +1017,38 @@ it('reports a destination as claimable when no durable blue-green state fences i
     $cancelledDeployment = $deployment->fresh();
     expect($cancelledDeployment->status)->toBe(ApplicationDeploymentStatus::CANCELLED_BY_USER->value)
         ->and($cancelledDeployment->horizon_job_id)->toBe($dispatchAttemptUuid);
+});
+
+it('keeps remote diagnostics out of deployment logs when post-cancellation cleanup fails', function () {
+    $deployment = makeEmergencyRecoveryDeployment($this->environment, $this->server, $this->destination);
+    $application = Application::query()->findOrFail($deployment->application_id);
+    prepareEmergencyRemoteServer(
+        $this->server,
+        PrivateKey::query()->findOrFail($application->private_key_id),
+    );
+    $remoteDiagnostic = 'ssh: connect to host 10.0.0.9 port 22: Connection timed out; docker daemon unreachable';
+    Process::fake(function (PendingProcess $process) use ($deployment, $remoteDiagnostic): FakeProcessResult {
+        $payload = (is_array($process->command) ? implode(' ', $process->command) : (string) $process->command)
+            ."\n".(string) $process->input;
+        if (str_contains($payload, "docker ps -a --filter name={$deployment->deployment_uuid}")) {
+            return Process::result(errorOutput: $remoteDiagnostic, exitCode: 255);
+        }
+
+        return Process::result(output: str_contains($payload, 'coolify-blue-green-managed-route:absent')
+            ? 'coolify-blue-green-managed-route:absent'
+            : '');
+    });
+
+    $response = $this->withHeaders(emergencyRecoveryHeaders($this->token))
+        ->postJson("/api/v1/deployments/{$deployment->deployment_uuid}/recover");
+
+    $response->assertOk()
+        ->assertJsonPath('cancelled', true);
+
+    $logs = (string) $deployment->fresh()->logs;
+    expect($logs)->toContain('Post-cancellation cleanup failed: reason=cleanup_failed correlation_id=')
+        ->not->toContain($remoteDiagnostic)
+        ->not->toContain('10.0.0.9');
 });
 
 it('does not cancel a deployment that already reached a terminal status', function () {
@@ -1271,7 +1305,9 @@ it('releases the exact stale emergency queue row while a reserved inactive-retir
         ->assertJsonPath('outcome', 'deferred')
         ->assertJsonPath('claimable', false)
         ->assertJsonPath('cancelled', true)
-        ->assertJsonPath('recovery_owner_active', true);
+        ->assertJsonPath('recovery_owner_active', true)
+        ->assertJsonPath('reason_code', 'recovery_deferred')
+        ->assertJsonPath('correlation_id', null);
 
     $recoveredState = $state->fresh();
     expect($deployment->fresh()->status)->not->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
