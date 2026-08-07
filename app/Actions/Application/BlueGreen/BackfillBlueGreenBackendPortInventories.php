@@ -381,7 +381,7 @@ final class BackfillBlueGreenBackendPortInventories
         }
         if ($previousState->activeColor !== $previousColor
             || $previousState->activeDeploymentUuid !== $previousDeployment->deployment_uuid
-            || $previousState->activeContainerId !== $state->operation_previous_container_id
+            || $previousState->activeSetFenceIdentity() !== $state->operation_previous_container_id
             || $previousState->routingRevision !== $previousDeployment->blue_green_routing_revision
             || $previousState->destinationFenceEpoch !== $previousDeployment->blue_green_destination_fence_epoch) {
             throw new BlueGreenDeploymentTransitionException('The in-flight blue-green predecessor routing state no longer matches its queue provenance.');
@@ -419,7 +419,7 @@ final class BackfillBlueGreenBackendPortInventories
             || ! is_string($deployment->blue_green_routing_config_digest)) {
             throw new BlueGreenDeploymentTransitionException('The blue-green queue has incomplete persisted routing and topology fingerprints.');
         }
-        $fingerprint = ComputeBlueGreenDeploymentFingerprint::run(
+        $fingerprint = (new ComputeBlueGreenDeploymentFingerprint)->forOperationTopologyDigest(
             $application,
             $destination,
             $activeColor,
@@ -427,11 +427,11 @@ final class BackfillBlueGreenBackendPortInventories
             $deployment->blue_green_destination_fence_epoch,
             $deployment->deployment_uuid,
             $legacyAdoption,
+            $deployment->blue_green_topology_digest,
         );
-        if (! hash_equals($fingerprint->topologyDigest, $deployment->blue_green_topology_digest)
-            || ! hash_equals($fingerprint->routingConfigDigest, $deployment->blue_green_routing_config_digest)
-            || ($expectedTopologyDigest !== null
-                && ! hash_equals($fingerprint->topologyDigest, $expectedTopologyDigest))) {
+        if (($expectedTopologyDigest !== null
+                && ! hash_equals($deployment->blue_green_topology_digest, $expectedTopologyDigest))
+            || ! hash_equals($fingerprint->routingConfigDigest, $deployment->blue_green_routing_config_digest)) {
             throw new BlueGreenDeploymentTransitionException('The persisted blue-green routing or topology fingerprint drifted; backend port inventory cannot be adopted.');
         }
     }

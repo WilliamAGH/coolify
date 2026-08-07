@@ -451,6 +451,88 @@ it('requires exact provider proof and rejects acknowledgement leaks', function (
         ->toThrow(InvalidArgumentException::class, 'one exact opaque acknowledgement');
 });
 
+it('reports the observed status and acknowledgement evidence on an exact-acknowledgement mismatch', function () {
+    $verifier = new VerifyBlueGreenPublicRecovery;
+    $route = ['router' => 'managed-public', 'url' => 'https://app.example.test/health'];
+    $staleAcknowledgement = str_repeat('e', 64);
+    $headers = "HTTP/1.1 200 OK\r\n"
+        .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$staleAcknowledgement}\r\n"
+        .BlueGreenRoutingTarget::RELEASE_PROOF_HEADER.': release-proof-token'."\r\n\r\n";
+
+    try {
+        $verifier->assertResponse($route, $headers, str_repeat('a', 64));
+        $this->fail('The stale acknowledgement was accepted.');
+    } catch (BlueGreenPublicRouteAcknowledgementMismatch $exception) {
+        expect($exception->getMessage())
+            ->toContain('did not return its exact opaque acknowledgement')
+            ->toContain('HTTP 200')
+            ->toContain('observed acknowledgements: 1 [length 64; 64 lowercase hexadecimal characters]')
+            ->toContain('release-proof header present')
+            ->not->toContain(substr($staleAcknowledgement, 0, 12));
+    }
+});
+
+it('reports only safe acknowledgement metadata for long binary acknowledgement mismatches', function () {
+    $verifier = new VerifyBlueGreenPublicRecovery;
+    $route = ['router' => 'managed-public', 'url' => 'https://app.example.test/health'];
+    $staleAcknowledgement = 'raw-acknowledgement-prefix-'."\x00\x1b\x1f".str_repeat('retained-payload-', 8192);
+    $headers = "HTTP/1.1 200 OK\r\n"
+        .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$staleAcknowledgement}\r\n\r\n";
+
+    try {
+        $verifier->assertResponse($route, $headers, str_repeat('a', 64));
+        $this->fail('The binary acknowledgement was accepted.');
+    } catch (BlueGreenPublicRouteAcknowledgementMismatch $exception) {
+        expect($exception->getMessage())
+            ->toContain('HTTP 200')
+            ->toContain('observed acknowledgements: 1')
+            ->toContain('length '.strlen($staleAcknowledgement))
+            ->toContain('contains control bytes')
+            ->not->toContain(substr($staleAcknowledgement, 0, 12))
+            ->not->toContain('retained-payload-')
+            ->not->toContain("\x00")
+            ->not->toContain("\x1b")
+            ->not->toContain("\x1f");
+    }
+});
+
+it('reports an absent acknowledgement and release-proof header on an exact-acknowledgement mismatch', function () {
+    $verifier = new VerifyBlueGreenPublicRecovery;
+    $route = ['router' => 'managed-public', 'url' => 'https://app.example.test/health'];
+    $headers = "HTTP/1.1 302 Found\r\n\r\n";
+
+    try {
+        $verifier->assertResponse($route, $headers, str_repeat('a', 64));
+        $this->fail('The missing acknowledgement was accepted.');
+    } catch (BlueGreenPublicRouteAcknowledgementMismatch $exception) {
+        expect($exception->getMessage())
+            ->toContain('HTTP 302')
+            ->toContain('observed acknowledgements: 0 [none]')
+            ->toContain('release-proof header absent');
+    }
+});
+
+it('bounds the observed acknowledgement evidence when many distinct values are returned', function () {
+    $verifier = new VerifyBlueGreenPublicRecovery;
+    $route = ['router' => 'managed-public', 'url' => 'https://app.example.test/health'];
+    $headers = "HTTP/1.1 200 OK\r\n"
+        .implode('', array_map(
+            static fn (string $value): string => BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$value}\r\n",
+            [str_repeat('b', 64), str_repeat('c', 64), str_repeat('d', 64), str_repeat('e', 64)],
+        ))."\r\n";
+
+    try {
+        $verifier->assertResponse($route, $headers, str_repeat('a', 64));
+        $this->fail('The stacked acknowledgements were accepted.');
+    } catch (BlueGreenPublicRouteAcknowledgementMismatch $exception) {
+        expect($exception->getMessage())
+            ->toContain('observed acknowledgements: 4 [length 64; 64 lowercase hexadecimal characters')
+            ->toContain(', …')
+            ->not->toContain(substr(str_repeat('b', 64), 0, 12))
+            ->not->toContain(substr(str_repeat('e', 64), 0, 12));
+    }
+});
+
 it('rejects every ineligible public status instead of treating authentication failures as readiness', function (int $status) {
     $verifier = new VerifyBlueGreenPublicRecovery;
     $route = ['router' => 'managed-public', 'url' => 'https://app.example.test/health'];

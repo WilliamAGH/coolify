@@ -16,9 +16,58 @@ use App\Models\Project;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
 use App\Models\Team;
+use Illuminate\Database\QueryException;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\DB;
 
 uses(RefreshDatabase::class);
+
+it('executes the supersession owner constraint matrix on the configured database', function (string $owner): void {
+    ['application' => $application, 'destination' => $destination, 'deployment' => $deployment] = blueGreenSupersessionGenerationFixture();
+    $mutation = match ($owner) {
+        'deployment' => static fn () => ApplicationBlueGreenDeployment::query()->create([
+            'application_id' => $application->id,
+            'standalone_docker_id' => $destination->id,
+            'operation_deployment_uuid' => 'unversioned-deployment-owner',
+            'supersession_generation' => 0,
+        ]),
+        'deactivation' => static fn () => ApplicationBlueGreenDeactivation::query()->create([
+            'application_id' => $application->id,
+            'standalone_docker_id' => $destination->id,
+            'operation_id' => 'unversioned-deactivation-owner',
+            'started_at' => now(),
+            'queue_cutoff_id' => 0,
+            'supersession_generation' => 0,
+            'phase' => BlueGreenDeactivationPhase::COMPLETED,
+            'completed_at' => now(),
+        ]),
+        'queue' => static fn () => $deployment->update([
+            'blue_green_phase' => BlueGreenDeploymentPhase::PREPARING,
+            'blue_green_supersession_generation' => null,
+        ]),
+    };
+
+    if (DB::getDriverName() === 'pgsql') {
+        expect(fn () => DB::transaction($mutation))
+            ->toThrow(QueryException::class);
+
+        return;
+    }
+
+    expect(DB::getDriverName())->toBe('sqlite');
+    $mutation();
+
+    $persistedInvalidOwner = match ($owner) {
+        'deployment' => ApplicationBlueGreenDeployment::query()
+            ->where('operation_deployment_uuid', 'unversioned-deployment-owner')
+            ->exists(),
+        'deactivation' => ApplicationBlueGreenDeactivation::query()
+            ->where('operation_id', 'unversioned-deactivation-owner')
+            ->exists(),
+        'queue' => $deployment->fresh()->blue_green_phase === BlueGreenDeploymentPhase::PREPARING,
+    };
+    expect($persistedInvalidOwner)->toBeTrue();
+})->with(['deployment', 'deactivation', 'queue']);
 
 /**
  * @return array{application: Application, destination: StandaloneDocker, deployment: ApplicationDeploymentQueue}
@@ -130,7 +179,7 @@ it('does not overwrite a cancelled queue while completing a finalized generation
         'destination_fence_operation_id' => $claim->deploymentUuid,
         'destination_fence_mutation_sequence' => 1,
         'managed_file_sha256' => str_repeat('e', 64),
-        'destination_topology_digest' => $claim->topologyDigest,
+        'destination_topology_digest' => $claim->operationTopologyDigest,
         'application_routing_config_digest' => $claim->routingConfigDigest,
         'operation_candidate_container_id' => $candidateId,
         'operation_routing_mutated_at' => $mutatedAt,

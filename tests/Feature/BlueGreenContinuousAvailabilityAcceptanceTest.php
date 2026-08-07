@@ -5,6 +5,7 @@ use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
 use App\Actions\Application\BlueGreen\BlueGreenOperationFence;
+use App\Actions\Application\BlueGreen\ComputeBlueGreenDeploymentFingerprint;
 use App\Actions\Application\BlueGreen\VerifyBlueGreenCandidateReleaseProof;
 use App\Actions\Proxy\BlueGreenProxyConfiguration;
 use App\Actions\Proxy\BlueGreenRoutingMode;
@@ -94,12 +95,15 @@ function blueGreenContinuousAvailabilityContext(
         ],
         target: $target,
     );
+    $routingTopologyDigest = (new ComputeBlueGreenDeploymentFingerprint)
+        ->routingTopologyDigestFor($application, $destination);
     $state->update([
         'destination_fence_epoch' => $configuration->state->destinationFenceEpoch,
         'destination_fence_operation_id' => $configuration->state->operationId,
         'destination_fence_mutation_sequence' => $configuration->state->mutationSequence,
         'managed_file_sha256' => $configuration->state->managedSha256,
         'destination_topology_digest' => $configuration->state->destinationTopologyDigest,
+        'destination_routing_topology_digest' => $routingTopologyDigest,
         'application_routing_config_digest' => $configuration->state->applicationRoutingConfigDigest,
     ]);
     $claim = new BlueGreenDeploymentClaim(
@@ -112,7 +116,8 @@ function blueGreenContinuousAvailabilityContext(
         expectedRoutingRevision: 1,
         destinationFenceEpoch: 1,
         serverBootId: (string) $state->operation_server_boot_id,
-        topologyDigest: (string) $state->operation_topology_digest,
+        operationTopologyDigest: (string) $state->operation_topology_digest,
+        routingTopologyDigest: $routingTopologyDigest,
         routingConfigDigest: (string) $state->operation_routing_config_digest,
         backendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
         drainBackendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),

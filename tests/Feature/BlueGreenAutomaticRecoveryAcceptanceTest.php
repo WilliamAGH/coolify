@@ -4,6 +4,7 @@ use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
 use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
+use App\Actions\Application\BlueGreen\BlueGreenDeploymentTransitionException;
 use App\Actions\Application\BlueGreen\BlueGreenInterventionRecoveryResult;
 use App\Actions\Application\BlueGreen\BlueGreenManagedRouteMetadataForOperationResult;
 use App\Actions\Application\BlueGreen\CaptureBlueGreenLegacyRouting;
@@ -14,6 +15,7 @@ use App\Actions\Application\BlueGreen\PlanBlueGreenPublicRecovery;
 use App\Actions\Application\BlueGreen\ReconstructBlueGreenDeploymentRecovery;
 use App\Actions\Application\BlueGreen\RecoverBlueGreenIntervention;
 use App\Actions\Application\BlueGreen\ResolveBlueGreenExpectedProxyState;
+use App\Actions\Application\BlueGreen\RetireBlueGreenInactiveContainer;
 use App\Actions\Application\BlueGreen\WaitForBlueGreenLegacyDockerRouting;
 use App\Actions\Proxy\BlueGreenProxyConfiguration;
 use App\Actions\Proxy\BlueGreenProxyState;
@@ -25,7 +27,6 @@ use App\Enums\ApplicationDeploymentExecutionPhase;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
-use App\Exceptions\DeploymentException;
 use App\Jobs\ActivateApplicationDeploymentJob;
 use App\Jobs\ApplicationDeploymentJob;
 use App\Jobs\ConvergeBlueGreenDeploymentJob;
@@ -273,7 +274,7 @@ function fakeAutomaticFailedFirstAdoptionJournalRemote(
  *     scenario: BlueGreenRecoveryScenario
  * }
  */
-function automaticRecoveryFixedColorScenario(): array
+function automaticRecoveryFixedColorScenario(bool $rotateConnectionAfterPredecessor = true): array
 {
     $scenario = BlueGreenRecoveryScenario::create(
         finalized: true,
@@ -305,6 +306,14 @@ function automaticRecoveryFixedColorScenario(): array
         1,
         $previousDeploymentUuid,
     );
+    if ($rotateConnectionAfterPredecessor) {
+        $scenario->server->update([
+            'ip' => '10.255.254.23',
+            'user' => 'rotated-automatic-recovery-operator',
+            'port' => 2222,
+        ]);
+        $scenario->destination->unsetRelation('server');
+    }
     $candidateFingerprint = ComputeBlueGreenDeploymentFingerprint::run(
         $scenario->application,
         $scenario->destination,
@@ -330,7 +339,7 @@ function automaticRecoveryFixedColorScenario(): array
             mutationSequence: 1,
             activeDeploymentUuid: $previousDeploymentUuid,
             activeContainerId: BlueGreenRecoveryScenario::LEGACY_ID,
-            destinationTopologyDigest: $previousFingerprint->topologyDigest,
+            destinationTopologyDigest: $previousFingerprint->operationTopologyDigest,
         ),
     );
     $candidateConfiguration = CompileBlueGreenProxyConfiguration::run(
@@ -350,7 +359,7 @@ function automaticRecoveryFixedColorScenario(): array
             mutationSequence: 1,
             activeDeploymentUuid: BlueGreenRecoveryScenario::OPERATION_UUID,
             activeContainerId: BlueGreenRecoveryScenario::CANDIDATE_ID,
-            destinationTopologyDigest: $candidateFingerprint->topologyDigest,
+            destinationTopologyDigest: $candidateFingerprint->operationTopologyDigest,
         ),
     );
     $previousDeployment = ApplicationDeploymentQueue::query()->create([
@@ -366,8 +375,8 @@ function automaticRecoveryFixedColorScenario(): array
         'blue_green_routing_revision' => 1,
         'blue_green_destination_fence_epoch' => 1,
         'blue_green_server_boot_id' => $bootId,
-        'blue_green_topology_digest' => $previousFingerprint->topologyDigest,
-        'blue_green_routing_config_digest' => $candidateFingerprint->routingConfigDigest,
+        'blue_green_topology_digest' => $previousFingerprint->operationTopologyDigest,
+        'blue_green_routing_config_digest' => $previousFingerprint->routingConfigDigest,
         'blue_green_backend_port_inventory' => $backendPortInventory->serialized,
         'blue_green_drain_backend_port_inventory' => null,
         'blue_green_supersession_generation' => 1,
@@ -419,6 +428,7 @@ function automaticRecoveryFixedColorScenario(): array
         'destination_fence_mutation_sequence' => $candidateConfiguration->state->mutationSequence,
         'managed_file_sha256' => $candidateConfiguration->state->managedSha256,
         'destination_topology_digest' => $candidateConfiguration->state->destinationTopologyDigest,
+        'destination_routing_topology_digest' => $candidateFingerprint->routingTopologyDigest,
         'application_routing_config_digest' => $candidateConfiguration->state->applicationRoutingConfigDigest,
         'operation_destination_fence_epoch' => 2,
         'operation_previous_destination_fence_epoch' => 1,
@@ -1484,6 +1494,17 @@ it('recovers an unreconstructable fixed-color drain after its generic journal CA
         'is_usable' => true,
     ]);
     $expectedState = $fixture['candidateConfiguration']->state;
+    expect($fixture['previousConfiguration']->state->destinationTopologyDigest)
+        ->not->toBe($expectedState->destinationTopologyDigest)
+        ->and($fixture['previousDeployment']->blue_green_topology_digest)
+        ->toBe($fixture['previousConfiguration']->state->destinationTopologyDigest)
+        ->and($fixture['previousDeployment']->blue_green_routing_config_digest)
+        ->toBe($fixture['previousConfiguration']->routingConfigDigest)
+        ->and($scenario->state->destination_routing_topology_digest)
+        ->toBe((new ComputeBlueGreenDeploymentFingerprint)->routingTopologyDigestFor(
+            $scenario->application,
+            $scenario->destination,
+        ));
     $replacementState = $expectedState->withMutationOwner(BlueGreenRecoveryScenario::OPERATION_UUID);
     $liveJournalState = $journalStatus === BlueGreenManagedRouteMetadataForOperationResult::COMMITTED_REPLACEMENT_SIDECAR
         ? $replacementState
@@ -1866,6 +1887,7 @@ it('recovers an unreconstructable fixed-color drain after its generic journal CA
         ->and($stateAfterHandoff->destination_fence_operation_id)->toBe($expectedDurableState->operationId)
         ->and($stateAfterHandoff->destination_fence_mutation_sequence)->toBe($expectedDurableState->mutationSequence)
         ->and($stateAfterHandoff->managed_file_sha256)->toBe($expectedDurableState->managedSha256)
+        ->and($stateAfterHandoff->destination_topology_digest)->toBe($expectedDurableState->destinationTopologyDigest)
         ->and($successor->fresh()->status)->toBe(ApplicationDeploymentStatus::QUEUED->value)
         ->and($successor->fresh()->horizon_job_id)->toBeNull();
     Queue::assertPushed(
@@ -1890,9 +1912,40 @@ it('recovers an unreconstructable fixed-color drain after its generic journal CA
     ]);
     expect($oldOwnerAfterResume->status)->toBe(ApplicationDeploymentStatus::FINISHED->value, $resumeDiagnostics)
         ->and($stateAfterResume->phase)->toBe(BlueGreenDeploymentPhase::IDLE)
+        ->and($stateAfterResume->inactive_retirement_topology_digest)->toBe($expectedState->destinationTopologyDigest)
+        ->and($stateAfterResume->inactive_retirement_routing_config_digest)->toBe($expectedState->applicationRoutingConfigDigest)
+        ->and($fixture['previousDeployment']->fresh()->blue_green_topology_digest)
+        ->toBe($fixture['previousConfiguration']->state->destinationTopologyDigest)
+        ->and($fixture['previousDeployment']->fresh()->blue_green_routing_config_digest)
+        ->toBe($fixture['previousConfiguration']->routingConfigDigest)
         ->and($releasedSuccessor->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
         ->and($releasedSuccessorAttemptUuid)->toBeString()
         ->and(Str::isUuid($releasedSuccessorAttemptUuid))->toBeTrue();
+
+    $inactiveDeployment = $fixture['previousDeployment']->fresh();
+    $interruptedRetirementExpectedState = new ReflectionMethod(
+        RetireBlueGreenInactiveContainer::class,
+        'interruptedRetirementExpectedState',
+    );
+    foreach ([
+        ['blue_green_topology_digest' => null],
+        ['blue_green_routing_config_digest' => 'not-a-canonical-digest'],
+    ] as $malformedDigest) {
+        $originalDigest = $inactiveDeployment->getAttribute(array_key_first($malformedDigest));
+        $inactiveDeployment->update($malformedDigest);
+        expect(fn () => $interruptedRetirementExpectedState->invoke(
+            new RetireBlueGreenInactiveContainer,
+            [
+                $stateAfterResume->fresh(),
+                $scenario->application,
+                $scenario->destination,
+                $oldOwnerAfterResume->fresh(),
+                $inactiveDeployment->fresh(),
+            ],
+            BlueGreenRecoveryScenario::OPERATION_UUID,
+        ))->toThrow(BlueGreenDeploymentTransitionException::class, 'exact application server destination');
+        $inactiveDeployment->update([array_key_first($malformedDigest) => $originalDigest]);
+    }
 
     $retirementExpectedState = ResolveBlueGreenExpectedProxyState::run(
         $scenario->application,

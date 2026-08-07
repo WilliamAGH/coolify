@@ -41,12 +41,23 @@ it('compensates a claimed cancelled blue-green operation exactly once', function
         'only_this_server' => true,
     ]);
     $bootId = BlueGreenDeactivationScenario::BOOT_ID;
-    Process::fake(['*' => Process::sequence([
-        $bootId,
-        'coolify-blue-green-destination-state-attested',
-        '',
-        $bootId,
-    ])]);
+    /**
+     * Matched by payload rather than call order: the claim path performs a variable
+     * number of remote proofs, so a positional sequence breaks whenever one is added.
+     * The destination-state attestation is matched first because that script also
+     * reads the boot id.
+     */
+    Process::fake(function (PendingProcess $process) use ($bootId) {
+        $payload = (string) $process->command."\n".(string) $process->input;
+        if (str_contains($payload, 'coolify-blue-green-destination-state-attested')) {
+            return Process::result(output: 'coolify-blue-green-destination-state-attested', exitCode: 0);
+        }
+        if (str_contains($payload, '/proc/sys/kernel/random/boot_id')) {
+            return Process::result(output: $bootId, exitCode: 0);
+        }
+
+        return Process::result(output: '', exitCode: 0);
+    });
     $lifecycle = new BlueGreenDeploymentLifecycle(
         application: $application,
         deployment: $deployment,
@@ -167,12 +178,18 @@ it('compensates only the exact partial multi-replica start that exists before he
         'only_this_server' => true,
     ]);
     $bootId = BlueGreenDeactivationScenario::BOOT_ID;
-    Process::fake(['*' => Process::sequence([
-        $bootId,
-        'coolify-blue-green-destination-state-attested',
-        '',
-        $bootId,
-    ])]);
+    /** Payload-matched for the same reason as the compensation scenario above. */
+    Process::fake(function (PendingProcess $process) use ($bootId) {
+        $payload = (string) $process->command."\n".(string) $process->input;
+        if (str_contains($payload, 'coolify-blue-green-destination-state-attested')) {
+            return Process::result(output: 'coolify-blue-green-destination-state-attested', exitCode: 0);
+        }
+        if (str_contains($payload, '/proc/sys/kernel/random/boot_id')) {
+            return Process::result(output: $bootId, exitCode: 0);
+        }
+
+        return Process::result(output: '', exitCode: 0);
+    });
     $lifecycle = new BlueGreenDeploymentLifecycle(
         application: $application,
         deployment: $deployment,

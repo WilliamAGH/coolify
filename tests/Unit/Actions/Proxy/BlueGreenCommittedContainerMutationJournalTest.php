@@ -332,14 +332,14 @@ it('preserves expected-snapshot and cross-boot work without replay or archival',
     }
 });
 
-it('refuses an absent journal inspection when the destination boot changed after capture', function (): void {
+it('emits the exact success marker before non-recover journal inspection when the current boot changed', function (): void {
     $fixture = committedContainerJournalFixture();
     $filesystem = new Filesystem;
 
     try {
         file_put_contents($fixture['marker_path'], 'must-not-replay');
         $capturedBootId = trim((string) file_get_contents($fixture['boot_id_path']));
-        unlink($fixture['journal_path']);
+        $journalBefore = file_get_contents($fixture['journal_path']);
         file_put_contents($fixture['boot_id_path'], 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff');
         $command = $fixture['writer']->inspectContainerMutationJournalCommandFor(
             $fixture['proxy_path'],
@@ -348,9 +348,49 @@ it('refuses an absent journal inspection when the destination boot changed after
         );
         $inspection = runCommittedContainerJournalCommand($command);
 
-        expect($inspection->isSuccessful())->toBeFalse()
-            ->and(trim($inspection->getOutput()))->toBe('')
-            ->and(file_get_contents($fixture['marker_path']))->toBe('must-not-replay');
+        expect($inspection->isSuccessful())->toBeTrue($inspection->getErrorOutput())
+            ->and(trim($inspection->getOutput()))->toBe(
+                WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_BOOT_IDENTITY_MISMATCH_OUTPUT,
+            )
+            ->and(file_get_contents($fixture['journal_path']))->toBe($journalBefore)
+            ->and(file_get_contents($fixture['state_path']))->toBe($fixture['expected']->serialize())
+            ->and(file_get_contents($fixture['marker_path']))->toBe('must-not-replay')
+            ->and(strpos(
+                $command,
+                WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_BOOT_IDENTITY_MISMATCH_OUTPUT,
+            ))->toBeLessThan(strpos($command, 'operation_container_expected_state_decoded=$(mktemp'));
+    } finally {
+        $filesystem->remove($fixture['root']);
+    }
+});
+
+it('emits an exact success marker before operation journal inspection when the current boot changed', function (): void {
+    $fixture = committedContainerJournalFixture();
+    $filesystem = new Filesystem;
+
+    try {
+        file_put_contents($fixture['marker_path'], 'must-not-replay');
+        $journalBefore = file_get_contents($fixture['journal_path']);
+        $capturedBootId = trim((string) file_get_contents($fixture['boot_id_path']));
+        file_put_contents($fixture['boot_id_path'], 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff');
+        $command = $fixture['writer']->inspectContainerMutationJournalForOperationCommandFor(
+            $fixture['proxy_path'],
+            $fixture['managed_filename'],
+            $capturedBootId,
+        );
+        $inspection = runCommittedContainerJournalCommand($command);
+
+        expect($inspection->isSuccessful())->toBeTrue($inspection->getErrorOutput())
+            ->and(trim($inspection->getOutput()))->toBe(
+                WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_BOOT_IDENTITY_MISMATCH_OUTPUT,
+            )
+            ->and(file_get_contents($fixture['journal_path']))->toBe($journalBefore)
+            ->and(file_get_contents($fixture['state_path']))->toBe($fixture['expected']->serialize())
+            ->and(file_get_contents($fixture['marker_path']))->toBe('must-not-replay')
+            ->and(strpos(
+                $command,
+                WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_BOOT_IDENTITY_MISMATCH_OUTPUT,
+            ))->toBeLessThan(strpos($command, 'operation_container_expected_state_decoded=$(mktemp'));
     } finally {
         $filesystem->remove($fixture['root']);
     }
@@ -637,6 +677,12 @@ it('archives an old-boot committed journal only when historical and current boot
                 expectedCurrentBootId: 'cccccccc-dddd-eeee-ffff-000000000000',
             ),
         );
+        expect($wrongHistoricalBoot->isSuccessful())->toBeFalse()
+            ->and($wrongCurrentBoot->isSuccessful())->toBeTrue($wrongCurrentBoot->getErrorOutput())
+            ->and(trim($wrongCurrentBoot->getOutput()))->toBe(
+                WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_BOOT_IDENTITY_MISMATCH_OUTPUT,
+            )
+            ->and(is_file($fixture['journal_path']))->toBeTrue();
         $archiveCommand = $fixture['writer']->archiveCommittedContainerMutationJournalCommandFor(
             proxyPath: $fixture['proxy_path'],
             managedFilename: $fixture['managed_filename'],
@@ -653,10 +699,11 @@ it('archives an old-boot committed journal only when historical and current boot
                 $fixture['journal_sha256'],
             );
 
-        expect($wrongHistoricalBoot->isSuccessful())->toBeFalse()
-            ->and($wrongCurrentBoot->isSuccessful())->toBeFalse()
-            ->and($archiveCommand)->toContain($journalBootId)
+        expect($archiveCommand)->toContain($journalBootId)
             ->and($archiveCommand)->toContain($currentBootId)
+            ->and($archiveCommand)->toContain(
+                WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_BOOT_IDENTITY_MISMATCH_OUTPUT,
+            )
             ->and($archiveCommand)->not->toContain(
                 'sh "$committed_container_mutation_decoded"',
                 'sh "$committed_container_completion_decoded"',
@@ -811,4 +858,79 @@ it('rejects an archive CAS scoped to a different operation replacement', functio
     } finally {
         $filesystem->remove($fixture['root']);
     }
+});
+
+it('emits the canonical sidecar status wire tokens in generated journal scripts', function (): void {
+    $pending = BlueGreenManagedRouteMetadataForOperationResult::PENDING_EXPECTED_SIDECAR;
+    $committed = BlueGreenManagedRouteMetadataForOperationResult::COMMITTED_REPLACEMENT_SIDECAR;
+
+    expect($pending)->toBe('pending_expected_sidecar')
+        ->and($committed)->toBe('committed_replacement_sidecar');
+
+    $writer = new WriteBlueGreenProxyConfiguration;
+    $proxyPath = sys_get_temp_dir().'/coolify-wire-contract-proxy';
+    $managedFilename = BlueGreenRoutingTarget::managedFilename('app-wire-contract', 42);
+    $managedRouteBytes = "http:\n  routers: {}\n";
+    $expected = new BlueGreenProxyState(
+        managedFilename: $managedFilename,
+        applicationUuid: 'app-wire-contract',
+        destinationId: 42,
+        operationId: 'predecessor-operation',
+        mutationSequence: 1,
+        destinationFenceEpoch: 1,
+        routingRevision: 1,
+        managedSha256: hash('sha256', $managedRouteBytes),
+        activeColor: BlueGreenDeploymentColor::BLUE,
+        activeDeploymentUuid: 'deployment-blue',
+        activeContainerName: 'app-wire-contract-blue',
+        activeContainerId: '0123456789abcdef',
+        applicationRoutingConfigDigest: hash('sha256', 'routing'),
+        destinationTopologyDigest: hash('sha256', 'topology'),
+    );
+    $replacement = $expected->withMutationOwner('committed-operation');
+    $bootId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    $journalSha256 = hash('sha256', 'wire-contract-journal');
+
+    $inspection = $writer->inspectContainerMutationJournalForOperationCommandFor(
+        $proxyPath,
+        $managedFilename,
+        $bootId,
+    );
+    $archive = $writer->archivePendingContainerMutationJournalCommandFor(
+        $proxyPath,
+        $managedFilename,
+        $journalSha256,
+        $bootId,
+        $expected,
+        $replacement,
+        $bootId,
+    );
+    $finalize = $writer->finalizePendingContainerMutationJournalCommandFor(
+        $proxyPath,
+        $managedFilename,
+        $journalSha256,
+        $bootId,
+        $expected,
+        $replacement,
+        $bootId,
+    );
+
+    expect($inspection)
+        ->toContain('test "$operation_container_sidecar_status" = '.$pending)
+        ->toContain('operation_container_manifest_sidecar_status='.$committed)
+        ->toContain('test "$operation_container_manifest_sidecar_status" = '.$pending)
+        ->toContain('test "$operation_container_manifest_sidecar_status" = '.$committed)
+        ->toContain('operation_container_sidecar_status='.$pending)
+        ->toContain('operation_container_sidecar_status='.$committed)
+        ->and($archive)
+        ->toContain('test "$operation_container_sidecar_status" = '.$pending)
+        ->and($finalize)
+        ->toContain($pending.'|'.$committed.') ;;')
+        ->toContain('if [ "$operation_container_sidecar_status" = '.$pending.' ]; then')
+        ->toContain('operation_container_sidecar_status='.$committed)
+        ->toContain('operation_container_existing_manifest_sidecar_status='.$committed)
+        ->toContain('test "$operation_container_existing_manifest_sidecar_status" = '.$committed)
+        ->toContain('test "$operation_container_existing_manifest_sidecar_status" = '.$pending)
+        ->toContain('test "$operation_container_sidecar_status" = '.$committed)
+        ->toContain("printf '%s\\n' ".$committed);
 });

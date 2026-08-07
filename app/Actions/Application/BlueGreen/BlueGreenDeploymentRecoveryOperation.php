@@ -26,7 +26,24 @@ final readonly class BlueGreenDeploymentRecoveryOperation
         public BlueGreenDeploymentPhase $recoveredPhase,
         public bool $routingMutationRecorded,
         public bool $wasFinalized,
+        public ?string $candidateSetFenceIdentity = null,
+        public ?string $previousSetFenceIdentity = null,
     ) {}
+
+    public function candidateFenceIdentity(): ?string
+    {
+        return $this->candidateSetFenceIdentity ?? $this->candidateContainer->dockerId;
+    }
+
+    public function previousFenceIdentity(): ?string
+    {
+        return $this->previousSetFenceIdentity ?? $this->previousContainer?->dockerId;
+    }
+
+    public function previousDurableContainerName(): ?string
+    {
+        return $this->previousContainer?->name ?? $this->claim->legacyContainerName;
+    }
 
     public function restoredRoutingRevision(): int
     {
@@ -72,6 +89,8 @@ final readonly class BlueGreenDeploymentRecoveryOperation
             recoveredPhase: $this->recoveredPhase,
             routingMutationRecorded: true,
             wasFinalized: $this->wasFinalized,
+            candidateSetFenceIdentity: $this->candidateSetFenceIdentity,
+            previousSetFenceIdentity: $this->previousSetFenceIdentity,
         );
     }
 }

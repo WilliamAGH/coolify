@@ -22,7 +22,7 @@ final class RecordBlueGreenRoutingMutation
             || $replacementState->destinationFenceEpoch < $claim->destinationFenceEpoch
             || $replacementState->routingRevision !== $claim->expectedRoutingRevision
             || $replacementState->managedSha256 === null
-            || $replacementState->destinationTopologyDigest !== $claim->topologyDigest) {
+            || $replacementState->destinationTopologyDigest !== $claim->operationTopologyDigest) {
             throw new BlueGreenDeploymentTransitionException('The managed route does not carry the exact claimed destination identity.');
         }
 
@@ -43,7 +43,7 @@ final class RecordBlueGreenRoutingMutation
                 || $state->pending_deployment_uuid !== $claim->deploymentUuid
                 || $state->operation_deployment_uuid !== $claim->deploymentUuid
                 || $state->operation_destination_fence_epoch !== $claim->destinationFenceEpoch
-                || $state->operation_topology_digest !== $claim->topologyDigest
+                || $state->operation_topology_digest !== $claim->operationTopologyDigest
                 || $state->operation_routing_config_digest !== $claim->routingConfigDigest
                 || $state->supersession_generation !== $claim->supersessionGeneration
                 || $state->operation_candidate_container_id === null
@@ -58,7 +58,7 @@ final class RecordBlueGreenRoutingMutation
                 || $deployment->blue_green_color !== $claim->pendingColor
                 || $deployment->blue_green_routing_revision !== $claim->expectedRoutingRevision
                 || $deployment->blue_green_destination_fence_epoch !== $claim->destinationFenceEpoch
-                || $deployment->blue_green_topology_digest !== $claim->topologyDigest
+                || $deployment->blue_green_topology_digest !== $claim->operationTopologyDigest
                 || $deployment->blue_green_routing_config_digest !== $claim->routingConfigDigest
                 || $deployment->blue_green_candidate_container_id !== $state->operation_candidate_container_id
                 || $deployment->blue_green_rollback_managed_filename !== $state->operation_rollback_managed_filename) {
@@ -109,7 +109,7 @@ final class RecordBlueGreenRoutingMutation
                 ->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)
                 ->where('blue_green_supersession_generation', $claim->supersessionGeneration)
                 ->where('blue_green_destination_fence_epoch', $claim->destinationFenceEpoch)
-                ->where('blue_green_topology_digest', $claim->topologyDigest)
+                ->where('blue_green_topology_digest', $claim->operationTopologyDigest)
                 ->where('blue_green_routing_config_digest', $claim->routingConfigDigest)
                 ->whereNull('blue_green_routing_mutated_at');
             $deploymentUpdated = BlueGreenLifecycleDatabaseLocks::constrainDeploymentQueueOwner(

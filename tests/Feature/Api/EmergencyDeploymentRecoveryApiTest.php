@@ -161,7 +161,7 @@ function makeEmergencyFailedFirstAdoptionJournalScenario(
         'blue_green_rollback_managed_filename' => $managedFilename,
         'blue_green_routing_mutated_at' => null,
         'blue_green_server_boot_id' => '22222222-3333-4444-5555-666666666666',
-        'blue_green_topology_digest' => $fingerprint->topologyDigest,
+        'blue_green_topology_digest' => $fingerprint->operationTopologyDigest,
         'blue_green_routing_config_digest' => $fingerprint->routingConfigDigest,
         'blue_green_backend_port_inventory' => $inventory->serialized,
         'blue_green_drain_backend_port_inventory' => $inventory->serialized,
@@ -261,7 +261,7 @@ function makeEmergencyCommittedIdleRetirementScenario(
             mutationSequence: 2,
             activeDeploymentUuid: $ownerUuid,
             activeContainerId: $activeContainerId,
-            destinationTopologyDigest: $fingerprint->topologyDigest,
+            destinationTopologyDigest: $fingerprint->operationTopologyDigest,
         ),
     )->state;
     $inventory = BlueGreenBackendPortInventory::forApplication($application, $application->settings);
@@ -279,7 +279,7 @@ function makeEmergencyCommittedIdleRetirementScenario(
         'blue_green_phase' => BlueGreenDeploymentPhase::IDLE,
         'blue_green_routing_revision' => 2,
         'blue_green_destination_fence_epoch' => 2,
-        'blue_green_topology_digest' => $fingerprint->topologyDigest,
+        'blue_green_topology_digest' => $fingerprint->operationTopologyDigest,
         'blue_green_routing_config_digest' => $fingerprint->routingConfigDigest,
         'blue_green_candidate_container_id' => $activeContainerId,
         'blue_green_backend_port_inventory' => $inventory->serialized,
@@ -299,7 +299,7 @@ function makeEmergencyCommittedIdleRetirementScenario(
         'blue_green_phase' => BlueGreenDeploymentPhase::IDLE,
         'blue_green_routing_revision' => 1,
         'blue_green_destination_fence_epoch' => 1,
-        'blue_green_topology_digest' => $fingerprint->topologyDigest,
+        'blue_green_topology_digest' => $fingerprint->operationTopologyDigest,
         'blue_green_routing_config_digest' => $fingerprint->routingConfigDigest,
         'blue_green_candidate_container_id' => $inactiveContainerId,
         'blue_green_backend_port_inventory' => $inventory->serialized,
@@ -318,6 +318,7 @@ function makeEmergencyCommittedIdleRetirementScenario(
         'destination_fence_mutation_sequence' => $runtimeState->mutationSequence,
         'managed_file_sha256' => $runtimeState->managedSha256,
         'destination_topology_digest' => $runtimeState->destinationTopologyDigest,
+        'destination_routing_topology_digest' => $fingerprint->routingTopologyDigest,
         'application_routing_config_digest' => $runtimeState->applicationRoutingConfigDigest,
         'inactive_retirement_owner_deployment_uuid' => $ownerUuid,
         'inactive_retirement_color' => BlueGreenDeploymentColor::BLUE,
@@ -1124,6 +1125,25 @@ it('recovers the old durable inactive-retirement owner without an intervention m
             'sh "$operation_container_completion_decoded"',
             base64_encode($expectedState->withMutationOwner($deployment->deployment_uuid)->serialize()),
         );
+});
+
+it('keeps a legacy null routing topology digest manual-only during inactive-retirement recovery', function (): void {
+    ['deployment' => $deployment, 'state' => $state] = makeEmergencyCommittedIdleRetirementScenario(
+        $this->environment,
+        $this->server,
+        $this->destination,
+    );
+    $state->update(['destination_routing_topology_digest' => null]);
+
+    $response = $this->withHeaders(emergencyRecoveryHeaders($this->token))
+        ->postJson("/api/v1/deployments/{$deployment->deployment_uuid}/recover");
+
+    $response->assertOk()
+        ->assertJsonPath('outcome', 'manual_only')
+        ->assertJsonPath('claimable', false);
+
+    expect($state->fresh()->destination_routing_topology_digest)->toBeNull()
+        ->and($state->fresh()->inactive_retirement_stopped_at)->toBeNull();
 });
 
 it('releases only the stale emergency queue row when a foreign destination lock makes inactive-retirement recovery retry', function (): void {

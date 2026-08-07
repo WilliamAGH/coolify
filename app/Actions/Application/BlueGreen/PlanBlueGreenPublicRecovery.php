@@ -5,7 +5,7 @@ namespace App\Actions\Application\BlueGreen;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifact;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
-use App\Enums\BlueGreenDeploymentColor;
+use App\Models\ApplicationBlueGreenDeployment;
 use Lorisleiva\Actions\Concerns\AsAction;
 use RuntimeException;
 use Symfony\Component\Yaml\Yaml;
@@ -141,26 +141,13 @@ class PlanBlueGreenPublicRecovery
             || $expectedState->activeContainerId === null) {
             throw new RuntimeException('The durable predecessor has no managed route inventory to reconstruct.');
         }
-        $ports = $operation->application->blueGreenDeploymentBackendPorts();
-        if ($ports === null) {
-            throw new RuntimeException('The application no longer has an exact blue-green backend port inventory.');
-        }
-        $applicationUuid = (string) $operation->application->uuid;
-        $target = new BlueGreenRoutingTarget(
-            destinationId: $expectedState->destinationId,
-            activeColor: $expectedState->activeColor,
-            blueContainerName: "{$applicationUuid}-".BlueGreenDeploymentColor::BLUE->value,
-            greenContainerName: "{$applicationUuid}-".BlueGreenDeploymentColor::GREEN->value,
-            port: $ports[0],
-            ports: $ports,
-            routingRevision: $expectedState->routingRevision,
-            publicProofToken: BlueGreenRoutingTarget::durablePublicProofToken($expectedState->operationId),
-            destinationFenceEpoch: $expectedState->destinationFenceEpoch,
-            operationId: $expectedState->operationId,
-            mutationSequence: $expectedState->mutationSequence,
-            activeDeploymentUuid: $expectedState->activeDeploymentUuid,
-            activeContainerId: $expectedState->activeContainerId,
-            destinationTopologyDigest: $expectedState->destinationTopologyDigest,
+        $durableState = ApplicationBlueGreenDeployment::query()->find($operation->claim->stateId)
+            ?? throw new RuntimeException('The durable predecessor has no destination state to reconstruct.');
+        $target = (new PlanBlueGreenSteadyState)->routingTargetForState(
+            $operation->application,
+            $operation->destination,
+            $durableState,
+            $expectedState,
         );
 
         $configuration = CompileBlueGreenProxyConfiguration::run(

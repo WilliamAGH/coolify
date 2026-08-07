@@ -1179,7 +1179,7 @@ describe('blue-green dispatch claim gate', function () {
                 activeContainerName: null,
                 activeContainerId: null,
                 applicationRoutingConfigDigest: $claim->routingConfigDigest,
-                destinationTopologyDigest: $claim->topologyDigest,
+                destinationTopologyDigest: $claim->operationTopologyDigest,
             );
             RecordBlueGreenDestinationState::run($claim, null, $startedCandidateState);
             RecordBlueGreenCandidateIdentity::run($claim, new BlueGreenContainerInspection(
@@ -1206,7 +1206,7 @@ describe('blue-green dispatch claim gate', function () {
                     mutationSequence: 2,
                     activeDeploymentUuid: $claim->deploymentUuid,
                     activeContainerId: $candidateContainerId,
-                    destinationTopologyDigest: $claim->topologyDigest,
+                    destinationTopologyDigest: $claim->operationTopologyDigest,
                 ),
             );
             RecordBlueGreenDestinationState::run($claim, $startedCandidateState, $activeConfiguration->state);

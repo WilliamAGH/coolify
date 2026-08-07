@@ -297,7 +297,8 @@ class VerifyBlueGreenPublicRecovery
             throw new BlueGreenPublicRouteAcknowledgementMismatch(
                 status: $status,
                 acknowledgements: $acknowledgements,
-                message: "The restored router {$route['router']} did not return its exact opaque acknowledgement.",
+                message: "The restored router {$route['router']} did not return its exact opaque acknowledgement"
+                    .$this->describeRouteObservation($status, $acknowledgements, $headers),
             );
         }
         if ($expectedReleaseProof === null) {
@@ -311,5 +312,47 @@ class VerifyBlueGreenPublicRecovery
         if ($releaseProofs !== [] && $releaseProofs !== [$expectedReleaseProof]) {
             throw new RuntimeException("The restored router {$route['router']} did not return the exact application release proof.");
         }
+    }
+
+    /**
+     * Bounded, single-line evidence for the user-visible deployment log: the
+     * observed HTTP status, acknowledgement count, and up to three
+     * acknowledgement lengths and safe shape categories. Raw response header
+     * values must never enter a durable deployment or recovery message.
+     *
+     * @param  list<string>  $acknowledgements
+     */
+    private function describeRouteObservation(int $status, array $acknowledgements, string $headers): string
+    {
+        $acknowledgementCount = count($acknowledgements);
+        $observed = $acknowledgementCount === 0
+            ? 'none'
+            : implode(', ', array_map(
+                static fn (string $acknowledgement): string => 'length '.strlen($acknowledgement)
+                    .'; '.self::acknowledgementShape($acknowledgement),
+                array_slice($acknowledgements, 0, 3),
+            )).($acknowledgementCount > 3 ? ', …' : '');
+        $releaseProofPresent = preg_match(
+            '/^'.preg_quote(BlueGreenRoutingTarget::RELEASE_PROOF_HEADER, '/').':/mi',
+            $headers,
+        ) === 1;
+
+        return " (HTTP {$status}; observed acknowledgements: {$acknowledgementCount} [{$observed}]; release-proof header "
+            .($releaseProofPresent ? 'present' : 'absent').').';
+    }
+
+    private static function acknowledgementShape(string $acknowledgement): string
+    {
+        if (preg_match('/[\x00-\x1F\x7F]/', $acknowledgement) === 1) {
+            return 'contains control bytes';
+        }
+        if (preg_match('/^[a-f0-9]{64}$/D', $acknowledgement) === 1) {
+            return '64 lowercase hexadecimal characters';
+        }
+        if (preg_match('/^[\x20-\x7E]*$/D', $acknowledgement) === 1) {
+            return 'printable non-opaque value';
+        }
+
+        return 'non-printable non-opaque value';
     }
 }

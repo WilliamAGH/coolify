@@ -212,7 +212,7 @@ function blueGreenApplicationRemoteLifecycleFixture(Server $server): array
             activeContainerName: $claim->candidateContainerName,
             activeContainerId: str_repeat('a', 64),
             applicationRoutingConfigDigest: $claim->routingConfigDigest,
-            destinationTopologyDigest: $claim->topologyDigest,
+            destinationTopologyDigest: $claim->operationTopologyDigest,
         ),
     );
     ApplicationBlueGreenDeployment::query()

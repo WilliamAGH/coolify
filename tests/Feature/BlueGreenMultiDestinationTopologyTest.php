@@ -1,11 +1,22 @@
 <?php
 
+use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
+use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
 use App\Actions\Application\BlueGreen\BlueGreenInterventionRecoveryResult;
+use App\Actions\Application\BlueGreen\ComputeBlueGreenDeploymentFingerprint;
+use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
+use App\Actions\Application\BlueGreen\PlanBlueGreenSteadyState;
 use App\Actions\Application\BlueGreen\RecoverBlueGreenIntervention;
+use App\Actions\Application\BlueGreen\RetireBlueGreenInactiveContainer;
+use App\Actions\Proxy\BlueGreenRoutingMode;
+use App\Actions\Proxy\BlueGreenRoutingTarget;
+use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
 use App\Actions\Shared\ComplexStatusCheck;
 use App\Enums\ApplicationDeploymentStatus;
+use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\BlueGreenFleetStatus;
+use App\Enums\ContainerStatusTypes;
 use App\Enums\ProxyTypes;
 use App\Exceptions\DeploymentException;
 use App\Jobs\ApplicationDeploymentJob;
@@ -24,6 +35,7 @@ use App\Notifications\Application\DeploymentSuccess;
 use App\Services\BlueGreenDeploymentLifecycle;
 use Illuminate\Database\QueryException;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Notification;
@@ -565,6 +577,10 @@ it('publishes a recoverable drain-recovery fleet failure timestamp under the exa
     $scenario->application->additional_networks()->attach($pending['destination']->id, [
         'server_id' => $pending['server']->id,
     ]);
+    $scenario->state->update([
+        'destination_routing_topology_digest' => (new ComputeBlueGreenDeploymentFingerprint)
+            ->routingTopologyDigestFor($scenario->application, $scenario->destination),
+    ]);
     $rootDeployment = blueGreenMultiDestinationQueue(
         $scenario->application,
         $scenario->destination,
@@ -875,4 +891,176 @@ it('fails closed before a stale fleet child can mutate a destination removed fro
 
     expect(fn () => blueGreenMultiDestinationInvoke($lifecycle, 'assertEligibility'))
         ->toThrow(DeploymentException::class, 'no longer configured');
+});
+
+it('live-attests a pre-migration passive retirement on transaction-backed non-PostgreSQL fixtures', function (): void {
+    if (DB::getDriverName() === 'pgsql') {
+        $this->markTestSkipped('The transaction-free PostgreSQL fixture owns the live network-attestation contract.');
+    }
+    config(['constants.ssh.mux_enabled' => false]);
+    $scenario = BlueGreenRecoveryScenario::create(finalized: true, routingMutationRecorded: true);
+    $application = $scenario->application->fresh(['settings']);
+    $destination = $scenario->destination->fresh();
+    $owner = $scenario->deployment;
+    $inactiveContainerId = BlueGreenRecoveryScenario::LEGACY_ID;
+    $backendPortInventory = BlueGreenBackendPortInventory::fromPorts([3000]);
+    $topologyDigest = (string) $scenario->state->destination_topology_digest;
+    $configuration = CompileBlueGreenProxyConfiguration::run(
+        $application,
+        $destination,
+        new BlueGreenRoutingTarget(
+            destinationId: (int) $destination->id,
+            activeColor: BlueGreenDeploymentColor::BLUE,
+            blueContainerName: $application->uuid.'-blue',
+            greenContainerName: $application->uuid.'-green',
+            port: 3000,
+            ports: [3000],
+            routingRevision: 2,
+            mode: BlueGreenRoutingMode::Steady,
+            publicProofToken: BlueGreenRoutingTarget::durablePublicProofToken($owner->deployment_uuid),
+            destinationFenceEpoch: 2,
+            operationId: $owner->deployment_uuid,
+            mutationSequence: 1,
+            activeDeploymentUuid: $owner->deployment_uuid,
+            activeContainerId: BlueGreenRecoveryScenario::CANDIDATE_ID,
+            destinationTopologyDigest: $topologyDigest,
+        ),
+    );
+    $owner->update([
+        'status' => ApplicationDeploymentStatus::FINISHED->value,
+        'blue_green_phase' => BlueGreenDeploymentPhase::IDLE,
+        'blue_green_routing_revision' => 2,
+        'blue_green_destination_fence_epoch' => 2,
+        'blue_green_topology_digest' => $topologyDigest,
+        'blue_green_routing_config_digest' => $configuration->routingConfigDigest,
+        'blue_green_backend_port_inventory' => $backendPortInventory->serialized,
+        'blue_green_drain_backend_port_inventory' => $backendPortInventory->serialized,
+    ]);
+    $inactive = blueGreenMultiDestinationQueue(
+        $application,
+        $destination,
+        $scenario->server,
+        'pre-migration-passive-retirement-inactive',
+        ApplicationDeploymentStatus::FINISHED->value,
+    );
+    $inactive->update([
+        'blue_green_color' => BlueGreenDeploymentColor::GREEN,
+        'blue_green_phase' => BlueGreenDeploymentPhase::IDLE,
+        'blue_green_routing_revision' => 1,
+        'blue_green_destination_fence_epoch' => 1,
+        'blue_green_topology_digest' => $topologyDigest,
+        'blue_green_routing_config_digest' => $configuration->routingConfigDigest,
+        'blue_green_backend_port_inventory' => $backendPortInventory->serialized,
+        'blue_green_candidate_container_id' => $inactiveContainerId,
+    ]);
+    $bootId = '11111111-2222-3333-4444-555555555555';
+    $scenario->state->update([
+        ...ApplicationBlueGreenDeployment::clearedOperationAttributes(),
+        'active_color' => BlueGreenDeploymentColor::BLUE,
+        'blue_deployment_uuid' => $owner->deployment_uuid,
+        'green_deployment_uuid' => $inactive->deployment_uuid,
+        'phase' => BlueGreenDeploymentPhase::IDLE,
+        'routing_revision' => 2,
+        'supersession_generation' => 1,
+        'destination_fence_epoch' => 2,
+        'destination_fence_operation_id' => $owner->deployment_uuid,
+        'destination_fence_mutation_sequence' => 1,
+        'managed_file_sha256' => $configuration->sha256,
+        'destination_topology_digest' => $topologyDigest,
+        'destination_routing_topology_digest' => null,
+        'application_routing_config_digest' => $configuration->routingConfigDigest,
+        'inactive_retirement_owner_deployment_uuid' => $owner->deployment_uuid,
+        'inactive_retirement_color' => BlueGreenDeploymentColor::GREEN,
+        'inactive_retirement_deployment_uuid' => $inactive->deployment_uuid,
+        'inactive_retirement_container_id' => $inactiveContainerId,
+        'inactive_retirement_container_routing_revision' => 1,
+        'inactive_retirement_owner_routing_revision' => 2,
+        'inactive_retirement_supersession_generation' => 1,
+        'inactive_retirement_destination_fence_epoch' => 2,
+        'inactive_retirement_server_boot_id' => $bootId,
+        'inactive_retirement_topology_digest' => $topologyDigest,
+        'inactive_retirement_routing_config_digest' => $configuration->routingConfigDigest,
+        'inactive_retirement_not_before_at' => now()->subSecond(),
+        'inactive_retirement_drain_deadline_at' => now()->addMinute(),
+        'inactive_retirement_stop_grace_seconds' => 30,
+        'inactive_retirement_lease_seconds' => 4_000,
+        'inactive_retirement_dispatch_reserved_until_at' => now()->addSeconds(30),
+    ]);
+    $state = $scenario->state->fresh();
+    $plan = PlanBlueGreenSteadyState::run($application, $destination, $state);
+    $releaseProof = BlueGreenRoutingTarget::durableReleaseProofToken($owner->deployment_uuid);
+    $preservedAttributes = array_values(array_diff(
+        array_keys(ApplicationBlueGreenDeployment::clearedInactiveRetirementAttributes()),
+        ['inactive_retirement_last_observed_connections', 'inactive_retirement_observed_at', 'inactive_retirement_stopped_at'],
+    ));
+    $before = collect([...$preservedAttributes, 'supersession_generation'])
+        ->mapWithKeys(static fn (string $attribute): array => [$attribute => $state->getRawOriginal($attribute)])
+        ->all();
+    $activeInspection = new BlueGreenContainerInspection(
+        exists: true,
+        dockerId: BlueGreenRecoveryScenario::CANDIDATE_ID,
+        status: ContainerStatusTypes::RUNNING->value,
+        health: 'healthy',
+    );
+    InspectBlueGreenContainer::shouldRun()
+        ->twice()
+        ->andReturn(
+            $activeInspection,
+            new BlueGreenContainerInspection(
+                exists: true,
+                dockerId: $inactiveContainerId,
+                status: ContainerStatusTypes::EXITED->value,
+                health: 'healthy',
+            ),
+        );
+    Process::fake(static function (PendingProcess $process) use (
+        $bootId,
+        $configuration,
+        $destination,
+        $plan,
+        $releaseProof,
+    ) {
+        $command = is_array($process->command) ? implode(' ', $process->command) : (string) $process->command;
+        $payload = $command."\n".(string) $process->input;
+
+        return match (true) {
+            str_contains($command, 'coolify-blue-green-destination-state-attested') => Process::result(
+                output: 'coolify-blue-green-destination-state-attested',
+            ),
+            str_contains($command, 'coolify-blue-green-managed-route:present:') => Process::result(
+                output: 'coolify-blue-green-managed-route:present:'
+                    .base64_encode($configuration->state->serialize())."\n"
+                    .$configuration->state->managedSha256,
+            ),
+            str_contains($payload, 'coolify-blue-green-route-network-proof:') => Process::result(
+                output: 'coolify-blue-green-route-network-proof:'
+                    .BlueGreenRecoveryScenario::CANDIDATE_ID."\t"
+                    .json_encode([$destination->network => []], JSON_THROW_ON_ERROR),
+            ),
+            str_contains($command, '/proc/sys/kernel/random/boot_id') => Process::result(output: $bootId),
+            str_contains($command, '{{json .Config.Env}}') => Process::result(
+                output: json_encode(['COOLIFY_DEPLOYMENT_RELEASE_PROOF='.$releaseProof], JSON_THROW_ON_ERROR),
+            ),
+            str_contains($command, 'curl --config -') => Process::result(output: "HTTP/1.1 200 OK\r\n"
+                .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$plan->publicAcknowledgement}\r\n"
+                .BlueGreenRoutingTarget::RELEASE_PROOF_HEADER.": {$releaseProof}\r\n\r\n"),
+            default => throw new RuntimeException('Unexpected passive retirement rehydration process.'),
+        };
+    });
+
+    expect(RetireBlueGreenInactiveContainer::run($state->id, 'foreign-retirement-owner', 1))
+        ->toBe(RetireBlueGreenInactiveContainer::STALE)
+        ->and($state->fresh()->destination_routing_topology_digest)->toBeNull();
+    $result = RetireBlueGreenInactiveContainer::run($state->id, $owner->deployment_uuid, 1);
+    $state = $state->fresh();
+    $after = collect(array_keys($before))
+        ->mapWithKeys(static fn (string $attribute): array => [$attribute => $state->getRawOriginal($attribute)])
+        ->all();
+
+    expect($result)->toBe(RetireBlueGreenInactiveContainer::COMPLETED)
+        ->and($state->destination_routing_topology_digest)
+        ->toBe((new ComputeBlueGreenDeploymentFingerprint)->routingTopologyDigestFor($application, $destination))
+        ->and($after)->toBe($before)
+        ->and($state->inactive_retirement_stopped_at)->not->toBeNull()
+        ->and($state->inactive_retirement_intervention_required_at)->toBeNull();
 });

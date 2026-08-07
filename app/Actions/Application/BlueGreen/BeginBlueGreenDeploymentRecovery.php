@@ -49,8 +49,8 @@ final class BeginBlueGreenDeploymentRecovery
             $deploymentUpdated = BlueGreenLifecycleDatabaseLocks::constrainDeploymentQueueOwner(
                 ApplicationDeploymentQueue::query()
                     ->whereKey($deployment->getKey())
-                    ->where('blue_green_candidate_container_id', $operation->candidateContainer->dockerId)
-                    ->where('blue_green_previous_container_id', $operation->previousContainer?->dockerId)
+                    ->where('blue_green_candidate_container_id', $operation->candidateFenceIdentity())
+                    ->where('blue_green_previous_container_id', $operation->previousFenceIdentity())
                     ->where('blue_green_rollback_managed_filename', $operation->rollbackKey->managedFilename()),
                 $claim,
                 $expectedPhase,
@@ -64,8 +64,8 @@ final class BeginBlueGreenDeploymentRecovery
                 ->whereKey($state->getKey())
                 ->where('phase', $expectedPhase->value)
                 ->where('operation_deployment_uuid', $claim->deploymentUuid)
-                ->where('operation_candidate_container_name', $operation->candidateContainer->name)
-                ->where('operation_candidate_container_id', $operation->candidateContainer->dockerId)
+                ->where('operation_candidate_container_name', $claim->candidateContainerName)
+                ->where('operation_candidate_container_id', $operation->candidateFenceIdentity())
                 ->where('operation_rollback_managed_filename', $operation->rollbackKey->managedFilename())
                 ->where('routing_revision', $claim->expectedRoutingRevision)
                 ->where('supersession_generation', $claim->supersessionGeneration)
@@ -100,11 +100,11 @@ final class BeginBlueGreenDeploymentRecovery
             || $state->supersession_generation !== $claim->supersessionGeneration
             || $state->operation_destination_fence_epoch !== $claim->destinationFenceEpoch
             || $state->operation_server_boot_id !== $claim->serverBootId
-            || $state->operation_topology_digest !== $claim->topologyDigest
+            || $state->operation_topology_digest !== $claim->operationTopologyDigest
             || $state->operation_routing_config_digest !== $claim->routingConfigDigest
-            || $state->operation_candidate_container_name !== $operation->candidateContainer->name
-            || $state->operation_candidate_container_id !== $operation->candidateContainer->dockerId
-            || $state->operation_previous_container_id !== $operation->previousContainer?->dockerId
+            || $state->operation_candidate_container_name !== $claim->candidateContainerName
+            || $state->operation_candidate_container_id !== $operation->candidateFenceIdentity()
+            || $state->operation_previous_container_id !== $operation->previousFenceIdentity()
             || $state->operation_rollback_managed_filename !== $operation->rollbackKey->managedFilename()
             || $state->deactivation_operation_id !== null
             || $state->deactivation_started_at !== null
@@ -116,11 +116,11 @@ final class BeginBlueGreenDeploymentRecovery
             || $deployment->blue_green_routing_revision !== $claim->expectedRoutingRevision
             || $deployment->blue_green_destination_fence_epoch !== $claim->destinationFenceEpoch
             || $deployment->blue_green_server_boot_id !== $claim->serverBootId
-            || $deployment->blue_green_topology_digest !== $claim->topologyDigest
+            || $deployment->blue_green_topology_digest !== $claim->operationTopologyDigest
             || $deployment->blue_green_routing_config_digest !== $claim->routingConfigDigest
             || $deployment->blue_green_supersession_generation !== $claim->supersessionGeneration
-            || $deployment->blue_green_previous_container_id !== $operation->previousContainer?->dockerId
-            || $deployment->blue_green_candidate_container_id !== $operation->candidateContainer->dockerId
+            || $deployment->blue_green_previous_container_id !== $operation->previousFenceIdentity()
+            || $deployment->blue_green_candidate_container_id !== $operation->candidateFenceIdentity()
             || $deployment->blue_green_rollback_managed_filename !== $operation->rollbackKey->managedFilename()) {
             throw new BlueGreenDeploymentTransitionException('The recovery state no longer matches the exact durable operation.');
         }

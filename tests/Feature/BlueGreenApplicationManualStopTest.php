@@ -670,12 +670,22 @@ it('claims a fresh blue-green deployment from a stopped state', function () {
         'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
     ]);
 
-    Process::fake(['*' => Process::sequence([
-        BlueGreenDeactivationScenario::BOOT_ID,
-        'coolify-blue-green-destination-state-attested',
-        '',
-        BlueGreenDeactivationScenario::BOOT_ID,
-    ])]);
+    $bootId = BlueGreenDeactivationScenario::BOOT_ID;
+    Process::fake(function (PendingProcess $process) use ($bootId) {
+        $command = is_array($process->command)
+            ? implode(' ', $process->command)
+            : (string) $process->command;
+        $payload = $command."\n".(string) $process->input;
+
+        if (str_contains($payload, 'coolify-blue-green-destination-state-attested')) {
+            return Process::result(output: 'coolify-blue-green-destination-state-attested');
+        }
+        if (str_contains($payload, '/proc/sys/kernel/random/boot_id')) {
+            return Process::result(output: $bootId);
+        }
+
+        return Process::result(output: '');
+    });
     $lifecycle = new BlueGreenDeploymentLifecycle(
         application: $application,
         deployment: $deployment,

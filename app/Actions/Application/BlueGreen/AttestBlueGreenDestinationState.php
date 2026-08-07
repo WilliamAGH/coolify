@@ -23,6 +23,7 @@ final class AttestBlueGreenDestinationState
         ?ApplicationBlueGreenDeployment $state,
         ?BlueGreenProxyState $expectedState = null,
     ): ?BlueGreenProxyState {
+        $mayDiscoverReleasedState = $state !== null && $expectedState === null;
         $managedFilename = BlueGreenRoutingTarget::managedFilename(
             (string) $application->uuid,
             (int) $destination->id,
@@ -39,16 +40,17 @@ final class AttestBlueGreenDestinationState
                 || $expectedState->destinationId !== (int) $destination->id)) {
             throw new BlueGreenDeploymentTransitionException('The expected destination state belongs to a different application topology.');
         }
+        $writer = new WriteBlueGreenProxyConfiguration;
         try {
             $result = trim((string) instant_privileged_remote_script(
                 $expectedState === null
-                    ? (new WriteBlueGreenProxyConfiguration)->firstAdoptionAttestStateCommandFor(
+                    ? $writer->firstAdoptionAttestStateCommandFor(
                         $server->proxyPath(),
                         $managedFilename,
                         (string) $application->uuid,
                         (int) $destination->id,
                     )
-                    : (new WriteBlueGreenProxyConfiguration)->attestStateCommandFor(
+                    : $writer->attestStateCommandFor(
                         $server->proxyPath(),
                         $managedFilename,
                         $expectedState,
@@ -56,31 +58,75 @@ final class AttestBlueGreenDestinationState
                 $server,
             ));
         } catch (RuntimeException $exception) {
-            if (! str_contains(
+            if (str_contains(
                 $exception->getMessage(),
                 WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT,
             )) {
+                return $this->recoverPendingJournal($server, $application, $destination, $state, $exception);
+            }
+            if (! $mayDiscoverReleasedState || $state === null) {
                 throw $exception;
             }
 
-            if ($state !== null && ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state)) {
-                return RecoverCleanIdleBlueGreenContainerMutationJournal::run(
-                    $server,
-                    $application,
-                    $destination,
-                    $state,
-                );
+            $resolver = new ResolveBlueGreenExpectedProxyState;
+            $releasedState = $resolver->releasedV3State($application, $destination, $state)
+                ?? $resolver->releasedV2FanOutState($application, $destination, $state);
+            if ($releasedState === null) {
+                throw $exception;
             }
+            try {
+                $result = trim((string) instant_privileged_remote_script(
+                    $writer->attestStateCommandFor(
+                        $server->proxyPath(),
+                        $managedFilename,
+                        $releasedState,
+                    ),
+                    $server,
+                ));
+            } catch (RuntimeException $releasedException) {
+                if (str_contains(
+                    $releasedException->getMessage(),
+                    WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT,
+                )) {
+                    return $this->recoverPendingJournal(
+                        $server,
+                        $application,
+                        $destination,
+                        $state,
+                        $releasedException,
+                    );
+                }
 
-            throw new BlueGreenDeploymentTransitionException(
-                'The remote destination has a pending container mutation journal without one clean IDLE recovery owner.',
-                previous: $exception,
-            );
+                throw $releasedException;
+            }
+            $expectedState = $releasedState;
         }
         if ($result !== 'coolify-blue-green-destination-state-attested') {
             throw new BlueGreenDeploymentTransitionException('The remote destination state did not return its exact attestation.');
         }
 
         return $expectedState;
+    }
+
+    private function recoverPendingJournal(
+        Server $server,
+        Application $application,
+        StandaloneDocker $destination,
+        ?ApplicationBlueGreenDeployment $state,
+        RuntimeException $exception,
+    ): ?BlueGreenProxyState {
+        if ($state !== null && ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state)) {
+            return RecoverCleanIdleBlueGreenContainerMutationJournal::run(
+                $server,
+                $application,
+                $destination,
+                $state,
+            );
+        }
+
+        throw new BlueGreenDeploymentTransitionException(
+            'The remote destination has a pending container mutation journal without one clean IDLE recovery owner.',
+            previous: $exception,
+        );
     }
 }

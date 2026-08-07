@@ -65,7 +65,7 @@ final class RecordBlueGreenLegacyRoutingSnapshot
                 ->where('operation_deployment_uuid', $claim->deploymentUuid)
                 ->where('operation_destination_fence_epoch', $claim->destinationFenceEpoch)
                 ->where('operation_server_boot_id', $claim->serverBootId)
-                ->where('operation_topology_digest', $claim->topologyDigest)
+                ->where('operation_topology_digest', $claim->operationTopologyDigest)
                 ->where('operation_routing_config_digest', $claim->routingConfigDigest)
                 ->whereNull('deactivation_operation_id')
                 ->whereNull('deactivation_started_at')

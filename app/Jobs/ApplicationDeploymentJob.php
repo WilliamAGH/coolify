@@ -3212,7 +3212,7 @@ class ApplicationDeploymentJob implements AdoptsLegacyProxyMutationDispatch, Sho
             'state_id' => $claim->stateId,
             'standalone_docker_id' => $claim->standaloneDockerId,
             'supersession_generation' => $claim->supersessionGeneration,
-            'topology_digest' => $claim->topologyDigest,
+            'topology_digest' => $claim->operationTopologyDigest,
         ];
     }
 

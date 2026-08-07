@@ -71,6 +71,7 @@ function multiPortPromotionAcceptanceFixture(
     bool $historicalPreviousInventory = false,
     bool $claimOperation = true,
     bool $stageSpecificPreviousRoute = false,
+    bool $rotateConnectionAfterPredecessor = false,
 ): array {
     InstanceSettings::unguarded(
         fn () => InstanceSettings::query()->firstOrCreate(['id' => 0]),
@@ -138,7 +139,7 @@ function multiPortPromotionAcceptanceFixture(
         mutationSequence: 1,
         activeDeploymentUuid: MULTI_PORT_PREVIOUS_DEPLOYMENT,
         activeContainerId: MULTI_PORT_PREVIOUS_CONTAINER_ID,
-        destinationTopologyDigest: $previousFingerprint->topologyDigest,
+        destinationTopologyDigest: $previousFingerprint->operationTopologyDigest,
         blueReplicaBackends: $stageSpecificPreviousRoute
             ? [$application->uuid.'-blue']
             : null,
@@ -171,7 +172,7 @@ function multiPortPromotionAcceptanceFixture(
         'blue_green_routing_revision' => 1,
         'blue_green_destination_fence_epoch' => 1,
         'blue_green_server_boot_id' => MULTI_PORT_BOOT_ID,
-        'blue_green_topology_digest' => $previousFingerprint->topologyDigest,
+        'blue_green_topology_digest' => $previousFingerprint->operationTopologyDigest,
         'blue_green_routing_config_digest' => $previousFingerprint->routingConfigDigest,
         'blue_green_backend_port_inventory' => $historicalPreviousInventory ? null : $inventory->serialized,
         'blue_green_drain_backend_port_inventory' => null,
@@ -191,6 +192,7 @@ function multiPortPromotionAcceptanceFixture(
         'destination_fence_mutation_sequence' => $previousConfiguration->state->mutationSequence,
         'managed_file_sha256' => $previousConfiguration->state->managedSha256,
         'destination_topology_digest' => $previousConfiguration->state->destinationTopologyDigest,
+        'destination_routing_topology_digest' => $previousFingerprint->routingTopologyDigest,
         'application_routing_config_digest' => $previousConfiguration->state->applicationRoutingConfigDigest,
         'supersession_generation' => 1,
     ]);
@@ -216,6 +218,13 @@ function multiPortPromotionAcceptanceFixture(
         color: BlueGreenDeploymentColor::GREEN,
         routingRevision: 1,
     );
+    if ($rotateConnectionAfterPredecessor) {
+        $server->update([
+            'ip' => '10.255.254.21',
+            'user' => 'rotated-multi-port-operator',
+            'port' => 2222,
+        ]);
+    }
     $claim = $claimOperation
         ? ClaimBlueGreenDeployment::run(
             application: $application,
@@ -394,7 +403,7 @@ function verifyMultiPortRoutes(
 
 it('promotes two public routes across two backend ports through production labels and durable drain completion', function () {
     config(['constants.ssh.mux_enabled' => false]);
-    $context = multiPortPromotionAcceptanceFixture();
+    $context = multiPortPromotionAcceptanceFixture(rotateConnectionAfterPredecessor: true);
     $application = $context['application'];
     $destination = $context['destination'];
     $claim = $context['claim'];
@@ -457,7 +466,7 @@ it('promotes two public routes across two backend ports through production label
         mutationSequence: 1,
         activeDeploymentUuid: $claim->deploymentUuid,
         activeContainerId: MULTI_PORT_CANDIDATE_CONTAINER_ID,
-        destinationTopologyDigest: $claim->topologyDigest,
+        destinationTopologyDigest: $claim->operationTopologyDigest,
     );
     $handoffConfiguration = CompileBlueGreenProxyConfiguration::run(
         $application,
@@ -497,7 +506,7 @@ it('promotes two public routes across two backend ports through production label
         mutationSequence: 2,
         activeDeploymentUuid: $claim->deploymentUuid,
         activeContainerId: MULTI_PORT_CANDIDATE_CONTAINER_ID,
-        destinationTopologyDigest: $claim->topologyDigest,
+        destinationTopologyDigest: $claim->operationTopologyDigest,
     );
     $steadyConfiguration = CompileBlueGreenProxyConfiguration::run(
         $application,
@@ -533,7 +542,10 @@ it('promotes two public routes across two backend ports through production label
         $destination,
     );
 
-    expect($claim->previousActiveColor)->toBe(BlueGreenDeploymentColor::GREEN)
+    expect($claim->operationTopologyDigest)
+        ->not->toBe($context['previousConfiguration']->state->destinationTopologyDigest)
+        ->and($claim->routingTopologyDigest)->toBe($context['state']->fresh()->destination_routing_topology_digest)
+        ->and($claim->previousActiveColor)->toBe(BlueGreenDeploymentColor::GREEN)
         ->and($handoffRoutes)->toHaveCount(4)
         ->and($steadyRoutes)->toHaveCount(4)
         ->and($handoffRequests)->toHaveCount(4)
@@ -564,6 +576,7 @@ it('promotes two public routes across two backend ports through production label
         ->and($finalState->phase)->toBe(BlueGreenDeploymentPhase::IDLE)
         ->and($finalState->active_color)->toBe(BlueGreenDeploymentColor::BLUE)
         ->and($finalState->routing_revision)->toBe(2)
+        ->and($finalState->destination_topology_digest)->toBe($claim->operationTopologyDigest)
         ->and($finalState->managed_file_sha256)->toBe($steadyConfiguration->sha256)
         ->and($finalState->inactive_retirement_container_id)->toBe(MULTI_PORT_PREVIOUS_CONTAINER_ID)
         ->and($finalState->inactive_retirement_last_observed_connections)->toBeNull()
@@ -579,7 +592,7 @@ it('promotes two public routes across two backend ports through production label
 
 it('restores and verifies the exact two-route predecessor after a probed candidate rolls back', function () {
     config(['constants.ssh.mux_enabled' => false]);
-    $context = multiPortPromotionAcceptanceFixture();
+    $context = multiPortPromotionAcceptanceFixture(rotateConnectionAfterPredecessor: true);
     $application = $context['application'];
     $destination = $context['destination'];
     $claim = $context['claim'];
@@ -610,7 +623,7 @@ it('restores and verifies the exact two-route predecessor after a probed candida
         mutationSequence: 1,
         activeDeploymentUuid: $claim->deploymentUuid,
         activeContainerId: MULTI_PORT_CANDIDATE_CONTAINER_ID,
-        destinationTopologyDigest: $claim->topologyDigest,
+        destinationTopologyDigest: $claim->operationTopologyDigest,
     );
     $probeConfiguration = CompileBlueGreenProxyConfiguration::run(
         $application,
@@ -648,13 +661,18 @@ it('restores and verifies the exact two-route predecessor after a probed candida
     $finalState = TransitionsBlueGreenDeployment::finishRollback($claim);
     $finalQueue = $context['candidate']->fresh();
 
-    expect($routes)->toHaveCount(4)
+    expect($claim->operationTopologyDigest)
+        ->not->toBe($restoredState->destinationTopologyDigest)
+        ->and($restoredState->destinationTopologyDigest)
+        ->toBe($context['previousConfiguration']->state->destinationTopologyDigest)
+        ->and($routes)->toHaveCount(4)
         ->and($requests)->toHaveCount(4)
         ->each->toContain(VerifyBlueGreenPublicRecovery::DEPLOYMENT_NONCE_PARAMETER)
         ->and($finalState->phase)->toBe(BlueGreenDeploymentPhase::IDLE)
         ->and($finalState->active_color)->toBe(BlueGreenDeploymentColor::GREEN)
         ->and($finalState->routing_revision)->toBe(1)
         ->and($finalState->managed_file_sha256)->toBe($context['previousConfiguration']->sha256)
+        ->and($finalState->destination_topology_digest)->toBe($restoredState->destinationTopologyDigest)
         ->and($finalState->destination_fence_epoch)->toBe($claim->destinationFenceEpoch + 1)
         ->and($finalState->operation_deployment_uuid)->toBeNull()
         ->and($finalQueue->status)->toBe(ApplicationDeploymentStatus::FAILED->value)

@@ -247,19 +247,43 @@ class Server extends BaseModel
 
     private function proxyTypeChanged(): bool
     {
-        $originalProxy = $this->getRawOriginal('proxy');
-        if (is_string($originalProxy)) {
-            try {
-                $originalProxy = json_decode($originalProxy, true, flags: JSON_THROW_ON_ERROR);
-            } catch (\JsonException) {
-                return true;
-            }
-        }
-        if (! is_array($originalProxy)) {
-            return true;
+        $originalProxy = $this->originalProxyDocument();
+        if ($originalProxy === null) {
+            // A server without a stored proxy document has "no proxy type".
+            // Only a non-null new type is a change; null-to-null (any update
+            // that merely re-dirties the schemaless proxy attributes) is not.
+            return $this->proxyType() !== null;
         }
 
         return data_get($originalProxy, 'type') !== $this->proxyType();
+    }
+
+    private function originalProxyDocument(): ?array
+    {
+        $originalProxy = $this->getRawOriginal('proxy');
+        if ($originalProxy === null) {
+            return null;
+        }
+        if (! is_string($originalProxy)) {
+            throw new \UnexpectedValueException('The persisted server proxy configuration is malformed.');
+        }
+
+        try {
+            $originalProxy = json_decode($originalProxy, flags: JSON_THROW_ON_ERROR);
+        } catch (\JsonException $exception) {
+            throw new \UnexpectedValueException(
+                'The persisted server proxy configuration is malformed.',
+                previous: $exception,
+            );
+        }
+        if (
+            ! ($originalProxy instanceof \stdClass)
+            || (isset($originalProxy->type) && ! is_string($originalProxy->type))
+        ) {
+            throw new \UnexpectedValueException('The persisted server proxy configuration is malformed.');
+        }
+
+        return (array) $originalProxy;
     }
 
     public function delete(): ?bool
@@ -986,9 +1010,15 @@ $schema://$host {
         return $proxy_path;
     }
 
-    public function proxyType()
+    public function proxyType(): ?string
     {
-        return data_get($this->proxy, 'type');
+        $this->originalProxyDocument();
+        $proxyType = data_get($this->proxy, 'type');
+        if ($proxyType !== null && ! is_string($proxyType)) {
+            throw new \UnexpectedValueException('The server proxy configuration is malformed.');
+        }
+
+        return $proxyType;
     }
 
     public function scopeWithProxy(): Builder

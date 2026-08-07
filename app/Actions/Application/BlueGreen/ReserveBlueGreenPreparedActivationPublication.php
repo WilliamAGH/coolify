@@ -47,7 +47,7 @@ final class ReserveBlueGreenPreparedActivationPublication
                 || $state->routing_revision !== $claim->expectedRoutingRevision
                 || $state->operation_destination_fence_epoch !== $claim->destinationFenceEpoch
                 || $state->operation_server_boot_id !== $claim->serverBootId
-                || $state->operation_topology_digest !== $claim->topologyDigest
+                || $state->operation_topology_digest !== $claim->operationTopologyDigest
                 || $state->operation_routing_config_digest !== $claim->routingConfigDigest
                 || $state->supersession_generation !== $claim->supersessionGeneration
                 || $state->operation_routing_mutated_at !== null
@@ -56,7 +56,7 @@ final class ReserveBlueGreenPreparedActivationPublication
                 || $deployment->blue_green_routing_revision !== $claim->expectedRoutingRevision
                 || $deployment->blue_green_destination_fence_epoch !== $claim->destinationFenceEpoch
                 || $deployment->blue_green_server_boot_id !== $claim->serverBootId
-                || $deployment->blue_green_topology_digest !== $claim->topologyDigest
+                || $deployment->blue_green_topology_digest !== $claim->operationTopologyDigest
                 || $deployment->blue_green_routing_config_digest !== $claim->routingConfigDigest
                 || $deployment->blue_green_backend_port_inventory !== $claim->backendPortInventory->serialized
                 || $deployment->blue_green_drain_backend_port_inventory !== $claim->drainBackendPortInventory?->serialized

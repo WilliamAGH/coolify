@@ -9,6 +9,7 @@ use App\Actions\Application\BlueGreen\BlueGreenLifecycleDatabaseLocks;
 use App\Actions\Application\BlueGreen\BlueGreenManagedRouteMetadataForOperationResult;
 use App\Actions\Application\BlueGreen\BlueGreenReconciliationResult;
 use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
+use App\Actions\Application\BlueGreen\ComputeBlueGreenDeploymentFingerprint;
 use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Actions\Application\BlueGreen\MarkBlueGreenRecoveryInterventionRequired;
 use App\Actions\Application\BlueGreen\ReadBlueGreenManagedRouteMetadata;
@@ -64,7 +65,18 @@ function fixedColorMidFlightInterventionScenario(): array
         $scenario->destination->id,
     );
     $topologyDigest = (string) $scenario->state->operation_topology_digest;
-    $routingConfigDigest = (string) $scenario->state->operation_routing_config_digest;
+    $fingerprint = new ComputeBlueGreenDeploymentFingerprint;
+    $candidateFingerprint = $fingerprint->forOperationTopologyDigest(
+        $scenario->application,
+        $scenario->destination,
+        BlueGreenDeploymentColor::BLUE,
+        2,
+        2,
+        BlueGreenRecoveryScenario::OPERATION_UUID,
+        false,
+        $topologyDigest,
+    );
+    $routingConfigDigest = $candidateFingerprint->routingConfigDigest;
     $previousState = new BlueGreenProxyState(
         managedFilename: $managedFilename,
         applicationUuid: (string) $scenario->application->uuid,
@@ -251,7 +263,10 @@ function fakeBlueGreenManagedRouteMetadata(BlueGreenProxyState $state): void
     ]);
 }
 
-/** @param list<string> $payloads */
+/**
+ * @param  list<string>  $payloads
+ * @param  null|Closure(int): void  $afterJournalInspection
+ */
 function fakeCommittedMidFlightJournal(
     BlueGreenProxyState $expectedState,
     BlueGreenProxyState $replacementState,
@@ -259,6 +274,7 @@ function fakeCommittedMidFlightJournal(
     ?string $inspectionOutput = null,
     ?string $archiveOutput = null,
     string $journalBootId = '11111111-2222-3333-4444-555555555555',
+    ?Closure $afterJournalInspection = null,
 ): void {
     $journalSha256 = str_repeat('7', 64);
     $writer = new WriteBlueGreenProxyConfiguration;
@@ -268,15 +284,18 @@ function fakeCommittedMidFlightJournal(
     );
     $payloads = [];
     $pendingJournalPresent = true;
+    $journalInspectionCount = 0;
     Process::fake(function (PendingProcess $process) use (
         $archiveFilename,
         $archiveOutput,
+        $afterJournalInspection,
         $expectedState,
         $inspectionOutput,
         $journalBootId,
         $journalSha256,
         &$payloads,
         &$pendingJournalPresent,
+        &$journalInspectionCount,
         $replacementState,
     ) {
         $payload = (string) $process->command."\n".(string) $process->input;
@@ -297,6 +316,9 @@ function fakeCommittedMidFlightJournal(
                     output: WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX.'|absent',
                 );
             }
+
+            $journalInspectionCount++;
+            $afterJournalInspection?->__invoke($journalInspectionCount);
 
             return Process::result(output: $inspectionOutput ?? implode('|', [
                 WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX,
@@ -911,22 +933,44 @@ it('keeps a fixed-color intervention manual-only when a checksum-valid live rout
 });
 
 it('does not archive a committed journal while a prepared mid-flight recovery remains lifecycle-owned', function (): void {
+    fakeRollbackCommittedJournalReconciliationActions();
     ['currentState' => $currentState, 'scenario' => $scenario] = fixedColorMidFlightInterventionScenario();
     $replacementState = $currentState->withMutationOwner(BlueGreenRecoveryScenario::OPERATION_UUID);
     $payloads = [];
-    fakeCommittedMidFlightJournal($currentState, $replacementState, $payloads);
+    $replacementLifecycleLock = null;
+    $lifecycleLockKey = BlueGreenDeploymentLock::key($scenario->application->id, $scenario->destination->id);
+    fakeCommittedMidFlightJournal(
+        $currentState,
+        $replacementState,
+        $payloads,
+        afterJournalInspection: function (int $inspectionCount) use ($lifecycleLockKey, &$replacementLifecycleLock): void {
+            if ($inspectionCount !== 2) {
+                return;
+            }
 
-    $result = RecoverBlueGreenIntervention::run(
-        stateId: $scenario->state->id,
-        apply: true,
-        reason: 'Continue the exact parked operation after its container journal committed.',
+            Cache::lock($lifecycleLockKey, 1)->forceRelease();
+            $replacementLifecycleLock = Cache::lock(
+                $lifecycleLockKey,
+                BlueGreenDeploymentLock::RENEWABLE_LEASE_SECONDS,
+            );
+            expect($replacementLifecycleLock->get())->toBeTrue();
+        },
     );
-    $remotePayload = implode("\n", $payloads);
 
+    try {
+        $result = RecoverBlueGreenIntervention::run(
+            stateId: $scenario->state->id,
+            apply: true,
+            reason: 'Continue the exact parked operation after its container journal committed.',
+        );
+    } finally {
+        $replacementLifecycleLock?->release();
+    }
+
+    $remotePayload = implode("\n", $payloads);
     expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::MID_FLIGHT)
-        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::DEFERRED)
-        ->and($result->message)->toBe('Another live blue-green lifecycle owner still holds the destination lock; no durable recovery state was changed.')
-        ->and($result->recoveryOwnerActive)->toBeTrue()
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::DEFERRED, $result->message)
+        ->and($result->message)->toBe('Reconciliation lost its lifecycle lock before it could record intervention.')
         ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
         ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
         ->and($scenario->deployment->fresh()->execution_phase)->toBe(ApplicationDeploymentExecutionPhase::Prepare)

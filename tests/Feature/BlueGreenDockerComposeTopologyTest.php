@@ -6,6 +6,7 @@ use App\Actions\Application\BlueGreen\BlueGreenDeactivationException;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteOutcome;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteResult;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
+use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\ComputeBlueGreenDeploymentFingerprint;
 use App\Actions\Application\BlueGreen\DeactivateBlueGreenApplicationDestination;
 use App\Actions\Application\BlueGreen\ExecuteBlueGreenDeactivationRemoteCommand;
@@ -268,7 +269,8 @@ function blueGreenComposeClaim(
         expectedRoutingRevision: 1,
         destinationFenceEpoch: 1,
         serverBootId: '11111111-1111-1111-1111-111111111111',
-        topologyDigest: hash('sha256', 'compose-topology'),
+        operationTopologyDigest: hash('sha256', 'compose-topology'),
+        routingTopologyDigest: (new ComputeBlueGreenDeploymentFingerprint)->routingTopologyDigestFor($application, $destination),
         routingConfigDigest: hash('sha256', 'compose-routing'),
         backendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
         drainBackendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
@@ -799,7 +801,19 @@ it('includes the routed Compose topology in the durable destination fingerprint'
             $changed['services']['web']['labels'][$index] = 'traefik.http.routers.web.rule=Host(`changed.compose.example.test`)';
         }
     }
-    $application->forceFill(['docker_compose' => Yaml::dump($changed, 10)]);
+    $application->blueGreenDeployments()->create([
+        'standalone_docker_id' => $destination->id,
+        'destination_routing_topology_digest' => $before->routingTopologyDigest,
+    ]);
+    $application->forceFill([
+        'docker_compose' => Yaml::dump($changed, 10),
+        'docker_compose_raw' => Yaml::dump(blueGreenComposeRawFixtureDocument($changed), 10),
+    ]);
+
+    expect($application->save())->toBeTrue();
+
+    $application = $application->fresh(['settings']);
+    $application->settings()->update(['is_blue_green_deployment_enabled' => true]);
     $after = ComputeBlueGreenDeploymentFingerprint::run(
         $application,
         $destination,
@@ -808,9 +822,66 @@ it('includes the routed Compose topology in the durable destination fingerprint'
         1,
         'compose-fingerprint',
     );
+    $deployment = ApplicationDeploymentQueue::query()->create([
+        'application_id' => $application->id,
+        'application_name' => $application->name,
+        'server_id' => $destination->server_id,
+        'server_name' => $destination->server->name,
+        'destination_id' => $destination->id,
+        'deployment_uuid' => 'compose-routing-config-drift',
+        'pull_request_id' => 0,
+        'commit' => 'compose-routing-config-drift-commit',
+        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+        'only_this_server' => true,
+    ]);
+    $claim = ClaimBlueGreenDeployment::run(
+        application: $application->fresh(['settings']),
+        standaloneDocker: $destination->fresh(),
+        deployment: $deployment,
+        serverBootId: '11111111-1111-1111-1111-111111111111',
+    );
 
-    expect($after->topologyDigest)->not->toBe($before->topologyDigest)
-        ->and($after->routingConfigDigest)->not->toBe($before->routingConfigDigest);
+    expect($after->operationTopologyDigest)->not->toBe($before->operationTopologyDigest)
+        ->and($after->routingConfigDigest)->not->toBe($before->routingConfigDigest)
+        ->and($after->routingTopologyDigest)->toBe($before->routingTopologyDigest)
+        ->and($claim->routingTopologyDigest)->toBe($before->routingTopologyDigest);
+});
+
+it('keeps the durable route identity stable when only a fixed sidecar changes', function (): void {
+    $application = blueGreenComposeApplication();
+    $destination = StandaloneDocker::query()->with('server')->findOrFail($application->destination_id);
+    $before = ComputeBlueGreenDeploymentFingerprint::run(
+        $application,
+        $destination,
+        BlueGreenDeploymentColor::GREEN,
+        1,
+        1,
+        'fixed-sidecar-fingerprint',
+    );
+
+    $changed = blueGreenComposeFixtureDocument([
+        'services' => [
+            'worker' => ['container_name' => 'worker-compose-replacement'],
+        ],
+    ]);
+    $application->forceFill([
+        'docker_compose' => Yaml::dump($changed, 10),
+        'docker_compose_raw' => Yaml::dump(blueGreenComposeRawFixtureDocument($changed), 10),
+    ]);
+
+    expect($application->save())->toBeTrue();
+
+    $after = ComputeBlueGreenDeploymentFingerprint::run(
+        $application->fresh(['settings']),
+        $destination,
+        BlueGreenDeploymentColor::GREEN,
+        1,
+        1,
+        'fixed-sidecar-fingerprint',
+    );
+
+    expect($after->operationTopologyDigest)->not->toBe($before->operationTopologyDigest)
+        ->and($after->routingTopologyDigest)->toBe($before->routingTopologyDigest);
 });
 
 it('uses PHP reflection without setAccessible to start only the colored routed service with no Compose dependencies', function (): void {

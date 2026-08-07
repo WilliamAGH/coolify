@@ -49,4 +49,18 @@ final readonly class BlueGreenContainerExpectation
             routingRevision: $this->routingRevision,
         );
     }
+
+    public function withIdentity(string $name, string $dockerId): self
+    {
+        return new self(
+            name: $name,
+            dockerId: $dockerId,
+            applicationId: $this->applicationId,
+            pullRequestId: $this->pullRequestId,
+            blueGreenManaged: $this->blueGreenManaged,
+            deploymentUuid: $this->deploymentUuid,
+            color: $this->color,
+            routingRevision: $this->routingRevision,
+        );
+    }
 }

@@ -1,5 +1,11 @@
 <?php
 
+use App\Actions\Application\BlueGreen\BlueGreenReplicaInspection;
+use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
+use App\Actions\Proxy\BlueGreenActiveContainer;
+use App\Actions\Proxy\BlueGreenActiveContainerSet;
+use App\Actions\Proxy\BlueGreenActiveReplica;
+use App\Actions\Proxy\BlueGreenActiveReplicaSet;
 use App\Actions\Proxy\BlueGreenProxyConfiguration;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifact;
 use App\Actions\Proxy\BlueGreenProxyRollbackKey;
@@ -661,6 +667,533 @@ it('repairs only missing or drifted regular managed files under the exact sideca
     }
 });
 
+it('migrates only the exact released v3 scalar and routed member without replaying pending journals', function (): void {
+    $filesystem = new Filesystem;
+    $proxyPath = sys_get_temp_dir().'/coolify-blue-green-released-v3-migration-'.bin2hex(random_bytes(8));
+    $bin = $proxyPath.'/bin';
+    $filesystem->mkdir([$proxyPath.'/dynamic', $proxyPath.'/.coolify-blue-green', $bin], 0700);
+
+    try {
+        $writer = destinationFenceWriter();
+        $managedFilename = BlueGreenRoutingTarget::managedFilename('app-fenced', 42);
+        $managedBytes = "http:\n  routers: {}\n";
+        $managedSha256 = hash('sha256', $managedBytes);
+        $canonicalRoutedId = str_repeat('a', 64);
+        $secondaryId = str_repeat('b', 64);
+        $releasedAggregateId = str_repeat('c', 64);
+        $state = static function (string $routedId, string $secondaryMemberId) use (
+            $managedFilename,
+            $managedSha256,
+        ): BlueGreenProxyState {
+            return new BlueGreenProxyState(
+                managedFilename: $managedFilename,
+                applicationUuid: 'app-fenced',
+                destinationId: 42,
+                operationId: 'released-v3-owner',
+                mutationSequence: 3,
+                destinationFenceEpoch: 2,
+                routingRevision: 2,
+                managedSha256: $managedSha256,
+                activeColor: BlueGreenDeploymentColor::BLUE,
+                activeDeploymentUuid: 'released-v3-active',
+                activeContainerName: 'app-fenced-blue',
+                activeContainerId: $routedId,
+                applicationRoutingConfigDigest: hash('sha256', 'released-v3-routing'),
+                destinationTopologyDigest: hash('sha256', 'released-v3-topology'),
+                activeContainerSet: BlueGreenActiveContainerSet::fromMembers([
+                    new BlueGreenActiveContainer(8080, 'app-fenced-blue', $routedId),
+                    new BlueGreenActiveContainer(9090, 'app-fenced-worker-blue', $secondaryMemberId),
+                ]),
+            );
+        };
+        $released = $state($releasedAggregateId, $secondaryId);
+        $canonical = $state($canonicalRoutedId, $secondaryId);
+        $managedPath = $writer->managedPath($proxyPath, $managedFilename);
+        $statePath = $writer->statePath($proxyPath, $managedFilename);
+        file_put_contents($managedPath, $managedBytes);
+        file_put_contents($statePath, $released->serialize());
+        chmod($managedPath, 0600);
+        chmod($statePath, 0600);
+        $liveReplicas = [
+            [
+                'application_id' => 17,
+                'deployment_uuid' => 'released-v3-active',
+                'color' => BlueGreenDeploymentColor::BLUE->value,
+                'routing_revision' => 2,
+                'compose_project' => 'app-fenced',
+                'compose_service' => 'web-blue',
+                'replica_index' => 1,
+                'replica_count' => 1,
+                'container_name' => 'app-fenced-blue',
+                'container_id' => $canonicalRoutedId,
+            ],
+            [
+                'application_id' => 17,
+                'deployment_uuid' => 'released-v3-active',
+                'color' => BlueGreenDeploymentColor::BLUE->value,
+                'routing_revision' => 2,
+                'compose_project' => 'app-fenced',
+                'compose_service' => 'worker-blue',
+                'replica_index' => 1,
+                'replica_count' => 1,
+                'container_name' => 'app-fenced-worker-blue',
+                'container_id' => $secondaryId,
+            ],
+        ];
+        file_put_contents($bin.'/docker', <<<'SH'
+#!/bin/sh
+set -eu
+
+if [ "$1" = inspect ]; then
+    case "$2" in
+        --format=*) format=${2#--format=} ;;
+        *) exit 64 ;;
+    esac
+    container_id=$3
+    if [ "${FAKE_DOCKER_RESTARTED_ID:-}" = "$container_id" ]; then
+        exit 1
+    fi
+    case "$container_id" in
+        "$FAKE_DOCKER_PRIMARY_ID")
+            container_name=$FAKE_DOCKER_PRIMARY_NAME
+            compose_service=$FAKE_DOCKER_PRIMARY_SERVICE
+            ;;
+        "$FAKE_DOCKER_SECONDARY_ID")
+            container_name=$FAKE_DOCKER_SECONDARY_NAME
+            compose_service=$FAKE_DOCKER_SECONDARY_SERVICE
+            ;;
+        *) exit 1 ;;
+    esac
+    case "$format" in
+        '{{.Id}}') printf '%s\n' "$container_id" ;;
+        '{{.Name}}') printf '/%s\n' "$container_name" ;;
+        '{{.State.Status}}') printf 'running\n' ;;
+        '{{.State.Health.Status}}') printf 'healthy\n' ;;
+        *coolify.applicationId*) printf '%s\n' "$FAKE_DOCKER_APPLICATION_ID" ;;
+        *coolify.pullRequestId*) printf '0\n' ;;
+        *coolify.blueGreen.managed*) printf 'true\n' ;;
+        *coolify.blueGreen.deploymentUuid*) printf '%s\n' "$FAKE_DOCKER_DEPLOYMENT_UUID" ;;
+        *coolify.blueGreen.color*) printf '%s\n' "$FAKE_DOCKER_COLOR" ;;
+        *coolify.blueGreen.routingRevision*) printf '%s\n' "$FAKE_DOCKER_ROUTING_REVISION" ;;
+        *com.docker.compose.project*) printf '%s\n' "$FAKE_DOCKER_COMPOSE_PROJECT" ;;
+        *com.docker.compose.service*) printf '%s\n' "$compose_service" ;;
+        *) exit 64 ;;
+    esac
+    exit 0
+fi
+
+if [ "$1" = ps ]; then
+    shift
+    compose_service=
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = --filter ]; then
+            case "$2" in
+                label=com.docker.compose.service=*)
+                    compose_service=${2#label=com.docker.compose.service=}
+                    ;;
+            esac
+            shift 2
+            continue
+        fi
+        shift
+    done
+    secondary_id=$FAKE_DOCKER_SECONDARY_ID
+    if [ "${FAKE_DOCKER_RESTARTED_ID:-}" = "$secondary_id" ]; then
+        secondary_id=$FAKE_DOCKER_REPLACEMENT_ID
+    fi
+    case "$compose_service" in
+        "$FAKE_DOCKER_PRIMARY_SERVICE") printf '%s\n' "$FAKE_DOCKER_PRIMARY_ID" ;;
+        "$FAKE_DOCKER_SECONDARY_SERVICE") printf '%s\n' "$secondary_id" ;;
+        '') printf '%s\n%s\n' "$FAKE_DOCKER_PRIMARY_ID" "$secondary_id" ;;
+        *) exit 65 ;;
+    esac
+    exit 0
+fi
+
+exit 64
+SH
+        );
+        chmod($bin.'/docker', 0700);
+        $dockerEnvironment = [
+            'PATH' => $bin.PATH_SEPARATOR.(getenv('PATH') ?: '/usr/bin:/bin'),
+            'FAKE_DOCKER_APPLICATION_ID' => '17',
+            'FAKE_DOCKER_DEPLOYMENT_UUID' => 'released-v3-active',
+            'FAKE_DOCKER_COLOR' => BlueGreenDeploymentColor::BLUE->value,
+            'FAKE_DOCKER_ROUTING_REVISION' => '2',
+            'FAKE_DOCKER_COMPOSE_PROJECT' => 'app-fenced',
+            'FAKE_DOCKER_PRIMARY_ID' => $canonicalRoutedId,
+            'FAKE_DOCKER_PRIMARY_NAME' => 'app-fenced-blue',
+            'FAKE_DOCKER_PRIMARY_SERVICE' => 'web-blue',
+            'FAKE_DOCKER_SECONDARY_ID' => $secondaryId,
+            'FAKE_DOCKER_SECONDARY_NAME' => 'app-fenced-worker-blue',
+            'FAKE_DOCKER_SECONDARY_SERVICE' => 'worker-blue',
+            'FAKE_DOCKER_REPLACEMENT_ID' => str_repeat('e', 64),
+        ];
+        $command = $writer->migrateReleasedV3StateCommandFor(
+            $proxyPath,
+            $released,
+            $canonical,
+            destinationFenceBootId(),
+            $liveReplicas,
+        );
+
+        expect(trim(runDestinationFenceCommand($command, $dockerEnvironment)))
+            ->toBe(WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT)
+            ->and(file_get_contents($managedPath))->toBe($managedBytes)
+            ->and(file_get_contents($statePath))->toBe($canonical->serialize())
+            ->and(trim(runDestinationFenceCommand($command, $dockerEnvironment)))
+            ->toBe(WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT);
+
+        $restartedEnvironment = [
+            ...$dockerEnvironment,
+            'FAKE_DOCKER_RESTARTED_ID' => $secondaryId,
+        ];
+        expect(failedDestinationFenceCommand($command, $restartedEnvironment)->isSuccessful())
+            ->toBeFalse()
+            ->and(file_get_contents($statePath))->toBe($canonical->serialize());
+
+        file_put_contents($statePath, $released->serialize());
+        expect(failedDestinationFenceCommand($command, $restartedEnvironment)->isSuccessful())
+            ->toBeFalse()
+            ->and(file_get_contents($managedPath))->toBe($managedBytes)
+            ->and(file_get_contents($statePath))->toBe($released->serialize());
+
+        $foreign = $state($releasedAggregateId, str_repeat('d', 64));
+        file_put_contents($statePath, $foreign->serialize());
+        expect(failedDestinationFenceCommand($command, $dockerEnvironment)->isSuccessful())->toBeFalse()
+            ->and(file_get_contents($statePath))->toBe($foreign->serialize());
+
+        foreach ([
+            $writer->mutationJournalPath($proxyPath, $managedFilename),
+            $writer->containerMutationJournalPath($proxyPath, $managedFilename),
+        ] as $journalPath) {
+            file_put_contents($statePath, $released->serialize());
+            file_put_contents($journalPath, 'unrelated pending operation');
+            chmod($journalPath, 0600);
+
+            expect(failedDestinationFenceCommand($command, $dockerEnvironment)->isSuccessful())->toBeFalse()
+                ->and(file_get_contents($journalPath))->toBe('unrelated pending operation')
+                ->and(file_get_contents($statePath))->toBe($released->serialize());
+
+            unlink($journalPath);
+        }
+    } finally {
+        $filesystem->remove($proxyPath);
+    }
+});
+
+it('exactly migrates released v2 fan-out state and refuses live replica or sidecar mismatches', function (): void {
+    $filesystem = new Filesystem;
+    $proxyPath = sys_get_temp_dir().'/coolify-blue-green-released-v2-fanout-migration-'.bin2hex(random_bytes(8));
+    $bin = $proxyPath.'/bin';
+    $filesystem->mkdir([$proxyPath.'/dynamic', $proxyPath.'/.coolify-blue-green', $bin], 0700);
+
+    try {
+        $writer = destinationFenceWriter();
+        $managedFilename = BlueGreenRoutingTarget::managedFilename('app-fenced', 42);
+        $managedBytes = "http:\n  routers: {}\n";
+        $managedSha256 = hash('sha256', $managedBytes);
+        $firstId = str_repeat('a', 64);
+        $secondId = str_repeat('b', 64);
+        $inspections = [
+            BlueGreenReplicaInspection::fromRuntime(1, 'app-blue-replica-1', 'app-fenced-blue-replica-1', $firstId, 'running', 'healthy'),
+            BlueGreenReplicaInspection::fromRuntime(2, 'app-blue-replica-2', 'app-fenced-blue-replica-2', $secondId, 'running', 'healthy'),
+        ];
+        $legacyDigest = BlueGreenReplicaSet::identityDigest($inspections);
+        $activeReplicaSet = BlueGreenActiveReplicaSet::fromMembers([
+            new BlueGreenActiveReplica('app-blue-replica-1', 1, [8080], 'app-fenced-blue-replica-1', $firstId),
+            new BlueGreenActiveReplica('app-blue-replica-2', 2, [8080], 'app-fenced-blue-replica-2', $secondId),
+        ]);
+        $released = new BlueGreenProxyState(
+            managedFilename: $managedFilename,
+            applicationUuid: 'app-fenced',
+            destinationId: 42,
+            operationId: 'released-v2-fanout-owner',
+            mutationSequence: 3,
+            destinationFenceEpoch: 2,
+            routingRevision: 2,
+            managedSha256: $managedSha256,
+            activeColor: BlueGreenDeploymentColor::BLUE,
+            activeDeploymentUuid: 'released-v2-fanout-active',
+            activeContainerName: 'app-fenced-blue',
+            activeContainerId: $legacyDigest,
+            applicationRoutingConfigDigest: hash('sha256', 'released-v2-fanout-routing'),
+            destinationTopologyDigest: hash('sha256', 'released-v2-fanout-topology'),
+        );
+        $canonical = new BlueGreenProxyState(
+            managedFilename: $managedFilename,
+            applicationUuid: 'app-fenced',
+            destinationId: 42,
+            operationId: 'released-v2-fanout-owner',
+            mutationSequence: 3,
+            destinationFenceEpoch: 2,
+            routingRevision: 2,
+            managedSha256: $managedSha256,
+            activeColor: BlueGreenDeploymentColor::BLUE,
+            activeDeploymentUuid: 'released-v2-fanout-active',
+            activeContainerName: 'app-fenced-blue-replica-1',
+            activeContainerId: $firstId,
+            applicationRoutingConfigDigest: hash('sha256', 'released-v2-fanout-routing'),
+            destinationTopologyDigest: hash('sha256', 'released-v2-fanout-topology'),
+            activeReplicaSetDigest: $activeReplicaSet->identityDigest(),
+            activeReplicaSet: $activeReplicaSet,
+        );
+        $liveReplicas = [
+            [
+                'application_id' => 17,
+                'deployment_uuid' => 'released-v2-fanout-active',
+                'color' => BlueGreenDeploymentColor::BLUE->value,
+                'routing_revision' => 2,
+                'compose_project' => 'app-fenced',
+                'compose_service' => 'app-blue-replica-1',
+                'replica_index' => 1,
+                'replica_count' => 2,
+                'container_name' => 'app-fenced-blue-replica-1',
+                'container_id' => $firstId,
+            ],
+            [
+                'application_id' => 17,
+                'deployment_uuid' => 'released-v2-fanout-active',
+                'color' => BlueGreenDeploymentColor::BLUE->value,
+                'routing_revision' => 2,
+                'compose_project' => 'app-fenced',
+                'compose_service' => 'app-blue-replica-2',
+                'replica_index' => 2,
+                'replica_count' => 2,
+                'container_name' => 'app-fenced-blue-replica-2',
+                'container_id' => $secondId,
+            ],
+        ];
+        $managedPath = $writer->managedPath($proxyPath, $managedFilename);
+        $statePath = $writer->statePath($proxyPath, $managedFilename);
+        file_put_contents($managedPath, $managedBytes);
+        file_put_contents($statePath, $released->serialize());
+        chmod($managedPath, 0600);
+        chmod($statePath, 0600);
+        file_put_contents($bin.'/docker', <<<'SH'
+#!/bin/sh
+set -eu
+
+if [ "$1" = inspect ]; then
+    case "$2" in --format=*) format=${2#--format=} ;; *) exit 64 ;; esac
+    container_id=$3
+    case "$container_id" in
+        "$FAKE_DOCKER_FIRST_ID")
+            container_name=$FAKE_DOCKER_FIRST_NAME
+            compose_service=$FAKE_DOCKER_FIRST_SERVICE
+            replica_index=1
+            ;;
+        "$FAKE_DOCKER_SECOND_ID")
+            container_name=$FAKE_DOCKER_SECOND_NAME
+            compose_service=$FAKE_DOCKER_SECOND_SERVICE
+            replica_index=${FAKE_DOCKER_SECOND_REPLICA_INDEX:-2}
+            ;;
+        *) exit 1 ;;
+    esac
+    case "$format" in
+        '{{.Id}}') printf '%s\n' "$container_id" ;;
+        '{{.Name}}') printf '/%s\n' "$container_name" ;;
+        '{{.State.Status}}') printf 'running\n' ;;
+        '{{.State.Health.Status}}') printf 'healthy\n' ;;
+        *coolify.applicationId*) printf '17\n' ;;
+        *coolify.pullRequestId*) printf '0\n' ;;
+        *coolify.blueGreen.managed*) printf 'true\n' ;;
+        *coolify.blueGreen.deploymentUuid*) printf 'released-v2-fanout-active\n' ;;
+        *coolify.blueGreen.color*) printf 'blue\n' ;;
+        *coolify.blueGreen.routingRevision*) printf '2\n' ;;
+        *coolify.blueGreen.replicaIndex*) printf '%s\n' "$replica_index" ;;
+        *coolify.blueGreen.replicaCount*) printf '2\n' ;;
+        *com.docker.compose.project*) printf 'app-fenced\n' ;;
+        *com.docker.compose.service*) printf '%s\n' "$compose_service" ;;
+        *) exit 64 ;;
+    esac
+    exit 0
+fi
+
+if [ "$1" = ps ]; then
+    shift
+    compose_service=
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = --filter ]; then
+            case "$2" in label=com.docker.compose.service=*) compose_service=${2#label=com.docker.compose.service=} ;; esac
+            shift 2
+            continue
+        fi
+        shift
+    done
+    case "$compose_service" in
+        "$FAKE_DOCKER_FIRST_SERVICE") printf '%s\n' "$FAKE_DOCKER_FIRST_ID" ;;
+        "$FAKE_DOCKER_SECOND_SERVICE") printf '%s\n' "$FAKE_DOCKER_SECOND_ID" ;;
+        '') printf '%s\n%s\n' "$FAKE_DOCKER_FIRST_ID" "$FAKE_DOCKER_SECOND_ID" ;;
+        *) exit 65 ;;
+    esac
+    exit 0
+fi
+
+exit 64
+SH
+        );
+        chmod($bin.'/docker', 0700);
+        $dockerEnvironment = [
+            'PATH' => $bin.PATH_SEPARATOR.(getenv('PATH') ?: '/usr/bin:/bin'),
+            'FAKE_DOCKER_FIRST_ID' => $firstId,
+            'FAKE_DOCKER_FIRST_NAME' => 'app-fenced-blue-replica-1',
+            'FAKE_DOCKER_FIRST_SERVICE' => 'app-blue-replica-1',
+            'FAKE_DOCKER_SECOND_ID' => $secondId,
+            'FAKE_DOCKER_SECOND_NAME' => 'app-fenced-blue-replica-2',
+            'FAKE_DOCKER_SECOND_SERVICE' => 'app-blue-replica-2',
+        ];
+        $command = $writer->migrateReleasedV3StateCommandFor(
+            $proxyPath,
+            $released,
+            $canonical,
+            destinationFenceBootId(),
+            $liveReplicas,
+        );
+
+        expect(trim(runDestinationFenceCommand($command, $dockerEnvironment)))
+            ->toBe(WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT)
+            ->and(file_get_contents($managedPath))->toBe($managedBytes)
+            ->and(file_get_contents($statePath))->toBe($canonical->serialize())
+            ->and(trim(runDestinationFenceCommand($command, $dockerEnvironment)))
+            ->toBe(WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT);
+
+        file_put_contents($statePath, $released->serialize());
+        $mismatchedEnvironment = [...$dockerEnvironment, 'FAKE_DOCKER_SECOND_REPLICA_INDEX' => '1'];
+        expect(failedDestinationFenceCommand($command, $mismatchedEnvironment)->isSuccessful())
+            ->toBeFalse()
+            ->and(file_get_contents($statePath))->toBe($released->serialize());
+
+        $foreign = new BlueGreenProxyState(
+            managedFilename: $released->managedFilename,
+            applicationUuid: $released->applicationUuid,
+            destinationId: $released->destinationId,
+            operationId: $released->operationId,
+            mutationSequence: $released->mutationSequence,
+            destinationFenceEpoch: $released->destinationFenceEpoch,
+            routingRevision: $released->routingRevision,
+            managedSha256: $released->managedSha256,
+            activeColor: $released->activeColor,
+            activeDeploymentUuid: $released->activeDeploymentUuid,
+            activeContainerName: $released->activeContainerName,
+            activeContainerId: str_repeat('f', 64),
+            applicationRoutingConfigDigest: $released->applicationRoutingConfigDigest,
+            destinationTopologyDigest: $released->destinationTopologyDigest,
+        );
+        file_put_contents($statePath, $foreign->serialize());
+        expect(failedDestinationFenceCommand($command, $dockerEnvironment)->isSuccessful())
+            ->toBeFalse()
+            ->and(file_get_contents($statePath))->toBe($foreign->serialize());
+    } finally {
+        $filesystem->remove($proxyPath);
+    }
+});
+
+it('generates exact released v2 migration assertions for co-rolled fan-out replica slots', function (): void {
+    $writer = destinationFenceWriter();
+    $managedFilename = BlueGreenRoutingTarget::managedFilename('app-fenced', 42);
+    $managedSha256 = hash('sha256', 'co-rolled-fan-out-route');
+    $replicas = [
+        ['gateway-blue-replica-1', 1, [8080], 'app-fenced-gateway-blue-replica-1', str_repeat('1', 64)],
+        ['worker-blue-replica-1', 1, [], 'app-fenced-worker-blue-replica-1', str_repeat('2', 64)],
+        ['gateway-blue-replica-2', 2, [8080], 'app-fenced-gateway-blue-replica-2', str_repeat('3', 64)],
+        ['worker-blue-replica-2', 2, [], 'app-fenced-worker-blue-replica-2', str_repeat('4', 64)],
+    ];
+    $inspections = array_map(
+        static fn (array $replica): BlueGreenReplicaInspection => BlueGreenReplicaInspection::fromRuntime(
+            replicaIndex: $replica[1],
+            composeService: $replica[0],
+            containerName: $replica[3],
+            dockerId: $replica[4],
+            status: 'running',
+            health: 'healthy',
+        ),
+        $replicas,
+    );
+    $activeReplicaSet = BlueGreenActiveReplicaSet::fromMembers(array_map(
+        static fn (array $replica): BlueGreenActiveReplica => new BlueGreenActiveReplica(
+            composeService: $replica[0],
+            replicaIndex: $replica[1],
+            ports: $replica[2],
+            name: $replica[3],
+            id: $replica[4],
+        ),
+        $replicas,
+    ));
+    $legacyDigest = BlueGreenReplicaSet::identityDigest($inspections);
+    $released = new BlueGreenProxyState(
+        managedFilename: $managedFilename,
+        applicationUuid: 'app-fenced',
+        destinationId: 42,
+        operationId: 'released-v2-co-rolled-owner',
+        mutationSequence: 4,
+        destinationFenceEpoch: 3,
+        routingRevision: 7,
+        managedSha256: $managedSha256,
+        activeColor: BlueGreenDeploymentColor::BLUE,
+        activeDeploymentUuid: 'released-v2-co-rolled-active',
+        activeContainerName: 'app-fenced-blue',
+        activeContainerId: $legacyDigest,
+        applicationRoutingConfigDigest: hash('sha256', 'released-v2-co-rolled-routing'),
+        destinationTopologyDigest: hash('sha256', 'released-v2-co-rolled-topology'),
+    );
+    $representative = $activeReplicaSet->representative();
+    $canonical = new BlueGreenProxyState(
+        managedFilename: $managedFilename,
+        applicationUuid: 'app-fenced',
+        destinationId: 42,
+        operationId: 'released-v2-co-rolled-owner',
+        mutationSequence: 4,
+        destinationFenceEpoch: 3,
+        routingRevision: 7,
+        managedSha256: $managedSha256,
+        activeColor: BlueGreenDeploymentColor::BLUE,
+        activeDeploymentUuid: 'released-v2-co-rolled-active',
+        activeContainerName: $representative->name,
+        activeContainerId: $representative->id,
+        applicationRoutingConfigDigest: hash('sha256', 'released-v2-co-rolled-routing'),
+        destinationTopologyDigest: hash('sha256', 'released-v2-co-rolled-topology'),
+        activeReplicaSetDigest: $activeReplicaSet->identityDigest(),
+        activeReplicaSet: $activeReplicaSet,
+    );
+    $liveReplicas = array_map(
+        static fn (array $replica): array => [
+            'application_id' => 17,
+            'deployment_uuid' => 'released-v2-co-rolled-active',
+            'color' => BlueGreenDeploymentColor::BLUE->value,
+            'routing_revision' => 7,
+            'compose_project' => 'app-fenced',
+            'compose_service' => $replica[0],
+            'replica_index' => $replica[1],
+            'replica_count' => 2,
+            'container_name' => $replica[3],
+            'container_id' => $replica[4],
+        ],
+        $replicas,
+    );
+
+    $command = $writer->migrateReleasedV3StateCommandFor(
+        '/data/coolify/proxy',
+        $released,
+        $canonical,
+        destinationFenceBootId(),
+        $liveReplicas,
+    );
+
+    expect($legacyDigest)->not->toBe($activeReplicaSet->identityDigest())
+        ->and($canonical->activeSetFenceIdentity())->toBe($activeReplicaSet->identityDigest())
+        ->and($command)->toContain(
+            base64_encode($released->serialize()),
+            base64_encode($canonical->serialize()),
+        )
+        ->and(substr_count($command, 'label=coolify.blueGreen.replicaIndex=1'))->toBe(4)
+        ->and(substr_count($command, 'label=coolify.blueGreen.replicaIndex=2'))->toBe(4)
+        ->and(substr_count($command, 'label=coolify.blueGreen.replicaCount=2'))->toBe(8);
+    foreach ($replicas as $replica) {
+        expect($command)->toContain($replica[0], $replica[3], $replica[4]);
+    }
+});
+
 it('fences a pending container-mutation journal during attestation and attests once it is cleared', function (): void {
     $filesystem = new Filesystem;
     $proxyPath = sys_get_temp_dir().'/coolify-blue-green-container-journal-'.bin2hex(random_bytes(8));
@@ -819,6 +1352,84 @@ it('fences a pending container-mutation journal during attestation and attests o
             ->and(file_get_contents($sentinelPath))->toBe('replay-sentinel')
             ->and(file_get_contents($journalPath))->toBe($journalBeforeAttestation)
             ->and(file_get_contents($statePath))->toBe($stateBeforeAttestation);
+    } finally {
+        $filesystem->remove($proxyPath);
+    }
+});
+
+it('reports a leftover container-mutation journal as pending when the next fenced mutation retries', function (): void {
+    $filesystem = new Filesystem;
+    $proxyPath = sys_get_temp_dir().'/coolify-blue-green-container-journal-retry-'.bin2hex(random_bytes(8));
+    $filesystem->mkdir($proxyPath.'/dynamic', 0700);
+
+    try {
+        $configuration = compileDestinationFencedBlueGreenConfiguration(
+            epoch: 1,
+            activeColor: BlueGreenDeploymentColor::BLUE,
+            deploymentUuid: 'deployment-journal-retry',
+            containerId: '0123456789abcdef',
+            operationId: 'journal-retry-owner',
+        );
+        $managedFilename = $configuration->managedFilename;
+        $writer = destinationFenceWriter();
+        $rollbackKey = new BlueGreenProxyRollbackKey('journal-retry-owner', null, $configuration->state);
+        runDestinationFenceCommand($writer->commandFor(
+            $proxyPath,
+            $configuration,
+            $rollbackKey,
+            destinationFenceBootId(),
+        ));
+
+        $pendingState = $configuration->state->withMutationOwner('journal-retry-pending');
+        $sentinelPath = $proxyPath.'/journal-retry-sentinel';
+        file_put_contents($sentinelPath, 'before-mutation');
+        $crashingWriter = new class extends WriteBlueGreenProxyConfiguration
+        {
+            /** @return list<string> */
+            protected function afterContainerMutationCommands(): array
+            {
+                return ['exit 87'];
+            }
+
+            protected function bootIdentityAssertionCommand(string $expectedBootIdShellValue): string
+            {
+                return 'true';
+            }
+        };
+        $mutationArguments = [
+            'proxyPath' => $proxyPath,
+            'managedFilename' => $managedFilename,
+            'expectedState' => $configuration->state,
+            'replacementState' => $pendingState,
+            'expectedBootId' => destinationFenceBootId(),
+            'commands' => [
+                'printf %s '.escapeshellarg('mutation-applied').' > '.escapeshellarg($sentinelPath),
+            ],
+            'completionCommands' => destinationFenceFileAttestation($sentinelPath, 'mutation-applied'),
+        ];
+        $interrupted = failedDestinationFenceCommand($crashingWriter->fencedDestinationCommandFor(...$mutationArguments));
+        $statePath = $writer->statePath($proxyPath, $managedFilename);
+        $journalPath = $writer->containerMutationJournalPath($proxyPath, $managedFilename);
+
+        expect($interrupted->getExitCode())->toBe(87)
+            ->and(file_exists($journalPath))->toBeTrue();
+
+        $journalBeforeRetry = file_get_contents($journalPath);
+        $stateBeforeRetry = file_get_contents($statePath);
+        file_put_contents($sentinelPath, 'retry-sentinel');
+
+        // A bounded retirement retry regenerates the same fenced mutation. The
+        // leftover journal must surface as the canonical pending marker so the
+        // caller can route the retry through journal recovery, not as an
+        // anonymous failure that reads as an ambiguous mutation result.
+        $retry = failedDestinationFenceCommand($writer->fencedDestinationCommandFor(...$mutationArguments));
+
+        expect($retry->getExitCode())->toBe(75)
+            ->and($retry->getErrorOutput())
+            ->toContain(WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT)
+            ->and(file_get_contents($sentinelPath))->toBe('retry-sentinel')
+            ->and(file_get_contents($journalPath))->toBe($journalBeforeRetry)
+            ->and(file_get_contents($statePath))->toBe($stateBeforeRetry);
     } finally {
         $filesystem->remove($proxyPath);
     }

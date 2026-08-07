@@ -38,7 +38,7 @@ class RemoveBlueGreenInactiveContainer
             || $state->operation_deployment_uuid !== $claim->deploymentUuid
             || $state->routing_revision !== $claim->expectedRoutingRevision
             || $state->operation_destination_fence_epoch !== $claim->destinationFenceEpoch
-            || $state->operation_topology_digest !== $claim->topologyDigest
+            || $state->operation_topology_digest !== $claim->operationTopologyDigest
             || $state->operation_routing_config_digest !== $claim->routingConfigDigest) {
             throw new BlueGreenDeploymentTransitionException('The inactive slot cannot be retired because the durable claim changed.');
         }

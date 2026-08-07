@@ -9,6 +9,93 @@ use Tests\Support\BlueGreenRecoveryScenario;
 
 uses(RefreshDatabase::class);
 
+it('rehydrates a legacy active operation routing topology digest from exact frozen provenance', function (): void {
+    $scenario = BlueGreenRecoveryScenario::create();
+    $legacyRoutingTopologyPayload = [
+        'version' => 5,
+        'application_id' => (int) $scenario->application->id,
+        'application_uuid' => (string) $scenario->application->uuid,
+        'destination_id' => (int) $scenario->destination->id,
+        'destination_server_id' => (int) $scenario->destination->server_id,
+        'destination_network' => (string) $scenario->destination->network,
+        'server_id' => (int) $scenario->server->id,
+        'server_uuid' => (string) $scenario->server->uuid,
+        'server_proxy_type' => (string) $scenario->server->proxyType(),
+        'server_proxy_path' => $scenario->server->proxyPath(),
+    ];
+    $expectedRoutingTopologyDigest = hash(
+        'sha256',
+        json_encode($legacyRoutingTopologyPayload, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES),
+    );
+    $scenario->state->update(['destination_routing_topology_digest' => null]);
+
+    $operation = ReconstructBlueGreenDeploymentRecovery::run($scenario->state);
+
+    expect($operation->claim->routingTopologyDigest)->toBe($expectedRoutingTopologyDigest)
+        ->and($scenario->state->fresh()->destination_routing_topology_digest)
+        ->toBe($expectedRoutingTopologyDigest);
+});
+
+it('rolls back legacy routing topology digest rehydration when later queue provenance reconstruction fails', function (): void {
+    $scenario = BlueGreenRecoveryScenario::create();
+    $scenario->state->update(['destination_routing_topology_digest' => null]);
+    $scenario->deployment->update(['blue_green_rollback_managed_filename' => 'coolify-blue-green-invalid']);
+
+    expect(fn () => ReconstructBlueGreenDeploymentRecovery::run($scenario->state))
+        ->toThrow(
+            BlueGreenDeploymentTransitionException::class,
+            'The interrupted queue is not the exact live generation and provenance owner.',
+        );
+
+    $scenario->state->refresh();
+
+    expect($scenario->state->destination_routing_topology_digest)->toBeNull();
+});
+
+it('leaves a legacy active operation routing topology digest null when routing configuration drifted', function (): void {
+    $scenario = BlueGreenRecoveryScenario::create();
+    $scenario->state->update(['destination_routing_topology_digest' => null]);
+    $scenario->application->newQuery()
+        ->whereKey($scenario->application->id)
+        ->update(['fqdn' => 'https://drifted-recovery.example.test']);
+
+    expect(fn () => ReconstructBlueGreenDeploymentRecovery::run($scenario->state))
+        ->toThrow(
+            BlueGreenDeploymentTransitionException::class,
+            'legacy active operation topology or routing configuration drifted',
+        )
+        ->and($scenario->state->fresh()->destination_routing_topology_digest)->toBeNull();
+});
+
+it('leaves a legacy active operation routing topology digest null when frozen operation topology drifted', function (): void {
+    $scenario = BlueGreenRecoveryScenario::create();
+    $scenario->state->update(['destination_routing_topology_digest' => null]);
+    $scenario->server->newQuery()
+        ->whereKey($scenario->server->id)
+        ->update(['ip' => '192.0.2.44']);
+
+    expect(fn () => ReconstructBlueGreenDeploymentRecovery::run($scenario->state))
+        ->toThrow(
+            BlueGreenDeploymentTransitionException::class,
+            'legacy active operation topology or routing configuration drifted',
+        )
+        ->and($scenario->state->fresh()->destination_routing_topology_digest)->toBeNull();
+});
+
+it('fails closed when a routed first adoption lost its durable rollback replacement state', function (): void {
+    $scenario = BlueGreenRecoveryScenario::create();
+    $scenario->state->update([
+        'operation_rollback_proxy_state' => null,
+        'operation_rollback_proxy_state_sha256' => null,
+    ]);
+
+    expect(fn () => ReconstructBlueGreenDeploymentRecovery::run($scenario->state))
+        ->toThrow(
+            BlueGreenDeploymentTransitionException::class,
+            'routed first-adoption operation has no persisted rollback replacement state',
+        );
+});
+
 it('fails closed when a newer supersession generation leaves the queue stale', function () {
     $scenario = BlueGreenRecoveryScenario::create();
     $scenario->state->update(['supersession_generation' => 2]);

@@ -1148,7 +1148,7 @@ final class RecoverBlueGreenIntervention
             if ($identity === null) {
                 throw new BlueGreenDeploymentTransitionException('The requested blue-green deployment state no longer exists.');
             }
-            $locks = BlueGreenLifecycleDatabaseLocks::forDestination(
+            $locks = BlueGreenLifecycleDatabaseLocks::forDestinationWithServer(
                 (int) $identity->application_id,
                 (int) $identity->standalone_docker_id,
                 [
@@ -1161,13 +1161,8 @@ final class RecoverBlueGreenIntervention
                 throw new BlueGreenDeploymentTransitionException('The requested blue-green deployment state changed before stale-journal recovery could lock it.');
             }
             $application = $locks->application;
-            $destination = StandaloneDocker::query()
-                ->whereKey($state->standalone_docker_id)
-                ->lockForUpdate()
-                ->first();
-            $server = $destination === null
-                ? null
-                : Server::query()->whereKey($destination->server_id)->lockForUpdate()->first();
+            $destination = $locks->destination;
+            $server = $locks->server;
             if ($application->trashed()
                 || self::deactivationFencesRecovery($locks->deactivation)
                 || $destination === null
@@ -1490,8 +1485,7 @@ final class RecoverBlueGreenIntervention
             || $currentState->managedFilename !== $managedFilename
             || $currentState->activeColor !== $state->active_color
             || $currentState->activeDeploymentUuid !== $ownerUuid
-            || $currentState->activeContainerId === $target->dockerId
-            || ($currentState->activeContainerSet?->contains($target->name, (string) $target->dockerId) ?? false)) {
+            || $currentState->containsActiveContainerId((string) $target->dockerId)) {
             throw new BlueGreenDeploymentTransitionException('The active route does not prove that the inactive-retirement target is strictly unrouted.');
         }
         if ($state->inactive_retirement_stopped_at === null) {
@@ -1734,6 +1728,8 @@ final class RecoverBlueGreenIntervention
             applicationRoutingConfigDigest: $state->applicationRoutingConfigDigest,
             destinationTopologyDigest: $state->destinationTopologyDigest,
             activeContainerSet: $state->activeContainerSet,
+            activeReplicaSetDigest: $state->activeReplicaSetDigest,
+            activeReplicaSet: $state->activeReplicaSet,
         );
     }
 
@@ -2953,6 +2949,7 @@ SH;
             $committedJournalReplacementState,
             $stateId,
         ): int {
+            BlueGreenTopologyLock::acquire();
             $identity = ApplicationBlueGreenDeployment::query()->findOrFail($stateId);
             $locks = BlueGreenLifecycleDatabaseLocks::forDestination(
                 $identity->application_id,
@@ -3113,6 +3110,7 @@ SH;
     private function reopenMidFlightState(int $stateId, BlueGreenDeploymentPhase $sourcePhase): void
     {
         DB::transaction(function () use ($stateId, $sourcePhase): void {
+            BlueGreenTopologyLock::acquire();
             $identity = ApplicationBlueGreenDeployment::query()->findOrFail($stateId);
             $locks = BlueGreenLifecycleDatabaseLocks::forDestination(
                 $identity->application_id,

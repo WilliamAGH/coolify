@@ -230,7 +230,7 @@ function operationAwareFixedColorReconciliationScenario(): array
         activeContainerName: $scenario->application->uuid.'-green',
         activeContainerId: BlueGreenRecoveryScenario::LEGACY_ID,
         applicationRoutingConfigDigest: $previousFingerprint->routingConfigDigest,
-        destinationTopologyDigest: $candidateFingerprint->topologyDigest,
+        destinationTopologyDigest: $candidateFingerprint->operationTopologyDigest,
     );
     ApplicationDeploymentQueue::query()->create([
         'application_id' => $scenario->application->id,
@@ -245,7 +245,7 @@ function operationAwareFixedColorReconciliationScenario(): array
         'blue_green_routing_revision' => 1,
         'blue_green_destination_fence_epoch' => 1,
         'blue_green_server_boot_id' => $scenario->state->operation_server_boot_id,
-        'blue_green_topology_digest' => $previousFingerprint->topologyDigest,
+        'blue_green_topology_digest' => $previousFingerprint->operationTopologyDigest,
         'blue_green_routing_config_digest' => $previousFingerprint->routingConfigDigest,
         'blue_green_supersession_generation' => 1,
         'blue_green_candidate_container_id' => BlueGreenRecoveryScenario::LEGACY_ID,
@@ -278,7 +278,7 @@ function operationAwareFixedColorReconciliationScenario(): array
         'application_routing_config_digest' => $expected->applicationRoutingConfigDigest,
         'operation_destination_fence_epoch' => 2,
         'operation_previous_destination_fence_epoch' => 1,
-        'operation_topology_digest' => $candidateFingerprint->topologyDigest,
+        'operation_topology_digest' => $candidateFingerprint->operationTopologyDigest,
         'operation_routing_config_digest' => $candidateFingerprint->routingConfigDigest,
         'operation_previous_managed_file_sha256' => $expected->managedSha256,
         'operation_previous_proxy_state' => $previousState,
@@ -292,7 +292,7 @@ function operationAwareFixedColorReconciliationScenario(): array
         'blue_green_phase' => BlueGreenDeploymentPhase::ROLLING_BACK,
         'blue_green_routing_revision' => 2,
         'blue_green_destination_fence_epoch' => 2,
-        'blue_green_topology_digest' => $candidateFingerprint->topologyDigest,
+        'blue_green_topology_digest' => $candidateFingerprint->operationTopologyDigest,
         'blue_green_routing_config_digest' => $candidateFingerprint->routingConfigDigest,
         'blue_green_previous_container_id' => BlueGreenRecoveryScenario::LEGACY_ID,
         'blue_green_candidate_container_id' => BlueGreenRecoveryScenario::CANDIDATE_ID,
@@ -589,6 +589,7 @@ it('uses the unchanged strict reader directly when no pending journal exists', f
         ->and($inspection->state?->serialize())->toBe($replacement->serialize())
         ->and($payloads)->toHaveCount(2)
         ->and($strictCommand)->toContain('.pending-container-mutation')
+        ->and($strictCommand)->toContain(WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT)
         ->and($strictCommand)->not->toContain('operation_container_manifest_stage=');
 });
 

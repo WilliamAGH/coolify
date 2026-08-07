@@ -129,6 +129,7 @@ final class ReadBlueGreenManagedRouteMetadataForOperation
             $inspectionCommand,
             $server,
         ));
+        $this->throwIfExpectedCurrentBootIdentityMismatch($inspection);
         if ($inspection === WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX.'|absent') {
             return BlueGreenManagedRouteMetadataForOperationResult::absent(
                 ReadBlueGreenManagedRouteMetadata::run($server, $application, $destination),
@@ -325,6 +326,7 @@ final class ReadBlueGreenManagedRouteMetadataForOperation
             ),
             $server,
         ));
+        $this->throwIfExpectedCurrentBootIdentityMismatch($output);
         $this->assertCommittedArchiveOutput(
             $writer,
             $managedFilename,
@@ -414,6 +416,15 @@ final class ReadBlueGreenManagedRouteMetadataForOperation
         return $managedFilename;
     }
 
+    private function throwIfExpectedCurrentBootIdentityMismatch(string $output): void
+    {
+        if ($output === WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_BOOT_IDENTITY_MISMATCH_OUTPUT) {
+            throw new BlueGreenOperationFenceLostException(
+                'The destination boot identity changed during container-mutation journal recovery.',
+            );
+        }
+    }
+
     private function assertCasOutput(
         WriteBlueGreenProxyConfiguration $writer,
         string $managedFilename,
@@ -421,6 +432,7 @@ final class ReadBlueGreenManagedRouteMetadataForOperation
         string $output,
         string $expectedStatus,
     ): void {
+        $this->throwIfExpectedCurrentBootIdentityMismatch($output);
         $expectedOutput = implode('|', [
             WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_CAS_OUTPUT_PREFIX,
             $expectedStatus,

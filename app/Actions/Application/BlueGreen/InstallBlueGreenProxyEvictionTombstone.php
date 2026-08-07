@@ -129,6 +129,9 @@ final class InstallBlueGreenProxyEvictionTombstone
             activeContainerId: $expectedState->activeContainerId,
             applicationRoutingConfigDigest: $expectedState->applicationRoutingConfigDigest,
             destinationTopologyDigest: $expectedState->destinationTopologyDigest,
+            activeContainerSet: $expectedState->activeContainerSet,
+            activeReplicaSetDigest: $expectedState->activeReplicaSetDigest,
+            activeReplicaSet: $expectedState->activeReplicaSet,
         );
     }
 
@@ -263,15 +266,21 @@ final class InstallBlueGreenProxyEvictionTombstone
     ): BlueGreenProxyEvictionState {
         $writer = new WriteBlueGreenProxyConfiguration;
         $bootAssertion = (new ReadBlueGreenServerBootIdentity)->assertionCommandFor($expectedServerBootId).' || exit 75';
+        $tombstoneAttestation = $this->isolatedAttestationCommandFor(
+            $writer,
+            $server->proxyPath(),
+            $tombstoneState,
+        );
+        $absentAttestation = $this->isolatedAttestationCommandFor(
+            $writer,
+            $server->proxyPath(),
+            $absentState,
+        );
         $output = trim(ExecuteBlueGreenDeactivationRemoteCommand::run($server, implode("\n", [
             $bootAssertion,
-            'if (',
-            $writer->attestStateCommandFor($server->proxyPath(), $tombstoneState->managedFilename, $tombstoneState),
-            ') >/dev/null 2>&1; then',
+            'if '.$tombstoneAttestation.' >/dev/null 2>&1; then',
             '  printf %s '.escapeshellarg(BlueGreenProxyEvictionState::Tombstone->value),
-            'elif (',
-            $writer->attestStateCommandFor($server->proxyPath(), $absentState->managedFilename, $absentState),
-            ') >/dev/null 2>&1; then',
+            'elif '.$absentAttestation.' >/dev/null 2>&1; then',
             '  printf %s '.escapeshellarg(BlueGreenProxyEvictionState::Absent->value),
             'else',
             '  printf \'%s\n\' \'The remote proxy owns neither the durable tombstone nor its exact absent successor.\' >&2',
@@ -282,6 +291,18 @@ final class InstallBlueGreenProxyEvictionTombstone
 
         return BlueGreenProxyEvictionState::tryFrom($output)
             ?? throw new BlueGreenDeactivationException('The remote proxy returned an invalid durable eviction state.');
+    }
+
+    private function isolatedAttestationCommandFor(
+        WriteBlueGreenProxyConfiguration $writer,
+        string $proxyPath,
+        BlueGreenProxyState $expectedState,
+    ): string {
+        return 'sh -c '.escapeshellarg($writer->attestStateCommandFor(
+            $proxyPath,
+            $expectedState->managedFilename,
+            $expectedState,
+        ));
     }
 
     private function commitRollbackArtifact(Server $server, BlueGreenProxyRollbackKey $rollbackKey): void

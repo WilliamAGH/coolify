@@ -264,6 +264,96 @@ it('dispatches proxy network reconciliation only after the destination transacti
     }
 });
 
+/**
+ * A server whose stored `proxy` column is NULL hosting an opted-in
+ * blue-green application.
+ *
+ * @return array{application: Application, destination: StandaloneDocker, server: Server}
+ */
+function makeNullProxyBlueGreenFixture(): array
+{
+    $team = Team::factory()->create();
+    $privateKey = PrivateKey::factory()->create(['team_id' => $team->id]);
+    $server = Server::factory()->create([
+        'team_id' => $team->id,
+        'private_key_id' => $privateKey->id,
+    ]);
+    $destination = $server->standaloneDockers()->firstOrFail();
+    $project = Project::factory()->create(['team_id' => $team->id]);
+    $application = Application::factory()->create([
+        'environment_id' => $project->environments()->firstOrFail()->id,
+        'destination_id' => $destination->id,
+        'destination_type' => $destination->getMorphClass(),
+    ]);
+    $application->settings()->firstOrFail()->update([
+        'is_blue_green_deployment_enabled' => true,
+    ]);
+
+    return compact('application', 'destination', 'server');
+}
+
+it('allows unrelated updates on a server with an unconfigured proxy hosting an opted-in application', function () {
+    ['server' => $server] = makeNullProxyBlueGreenFixture();
+    $privateKey = PrivateKey::factory()->create(['team_id' => $server->team_id]);
+
+    $server = $server->fresh();
+    expect($server->getRawOriginal('proxy'))->toBeNull()
+        ->and($server->isDirty('proxy'))->toBeTrue()
+        ->and($server->proxyType())->toBeNull();
+
+    expect(fn () => $server->update(['private_key_id' => $privateKey->id]))
+        ->not->toThrow(RuntimeException::class);
+
+    $persistedServer = $server->fresh();
+    expect($persistedServer->private_key_id)->toBe($privateKey->id)
+        ->and($persistedServer->proxyType())->toBeNull();
+});
+
+it('treats installing a proxy on an unconfigured-proxy server as a topology change', function () {
+    // null -> traefik engages the guard path, which accepts Traefik.
+    ['server' => $server] = makeNullProxyBlueGreenFixture();
+    $server = $server->fresh();
+    expect($server->getRawOriginal('proxy'))->toBeNull();
+    $server->proxy->set('type', ProxyTypes::TRAEFIK->value);
+
+    expect(fn (): bool => $server->save())
+        ->not->toThrow(RuntimeException::class);
+    expect($server->fresh()->proxyType())->toBe(ProxyTypes::TRAEFIK->value);
+
+    // null -> caddy engages the same guard path, which rejects non-Traefik.
+    ['server' => $caddyServer] = makeNullProxyBlueGreenFixture();
+    $caddyServer = $caddyServer->fresh();
+    expect($caddyServer->getRawOriginal('proxy'))->toBeNull();
+    $caddyServer->proxy->set('type', ProxyTypes::CADDY->value);
+
+    expect(fn (): bool => $caddyServer->save())
+        ->toThrow(RuntimeException::class, 'require Traefik');
+});
+
+it('rejects a persisted proxy document with a non-empty JSON list root', function (): void {
+    $server = Server::factory()->create();
+    DB::table('servers')
+        ->where('id', $server->id)
+        ->update([
+            'proxy' => json_encode([
+                ['type' => ProxyTypes::TRAEFIK->value],
+            ], JSON_THROW_ON_ERROR),
+        ]);
+
+    $server = Server::query()->findOrFail($server->id);
+
+    expect(fn () => $server->proxyType())
+        ->toThrow(UnexpectedValueException::class, 'The persisted server proxy configuration is malformed.');
+});
+
+it('rejects a non-string proxy type before an unsaved topology can be fingerprinted', function (): void {
+    $server = Server::factory()->create();
+    $server->proxy->set('type', 123);
+
+    expect(fn () => $server->proxyType())
+        ->toThrow(UnexpectedValueException::class, 'The server proxy configuration is malformed.');
+});
+
 it('accepts the reserved instance server as a configured blue-green destination', function (): void {
     // Coolify reserves id 0 for instance-owned rows, including the `localhost`
     // server every single-server install deploys to by default. Treating 0 as

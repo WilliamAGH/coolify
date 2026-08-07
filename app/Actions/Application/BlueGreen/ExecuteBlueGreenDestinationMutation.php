@@ -64,7 +64,7 @@ final class ExecuteBlueGreenDestinationMutation
                 activeContainerName: null,
                 activeContainerId: null,
                 applicationRoutingConfigDigest: $claim->routingConfigDigest,
-                destinationTopologyDigest: $claim->topologyDigest,
+                destinationTopologyDigest: $claim->operationTopologyDigest,
             );
         }
         if ($expectedState->managedFilename !== $managedFilename
@@ -74,16 +74,11 @@ final class ExecuteBlueGreenDestinationMutation
         }
         $isRefreshableAbsentRoute = $expectedState->managedSha256 === null
             && $claim->previousActiveColor === null;
-        if ($expectedState->destinationTopologyDigest !== $claim->topologyDigest
-            && ! $isRefreshableAbsentRoute) {
-            throw new BlueGreenDeploymentTransitionException('The current destination state does not match the claimed application topology.');
-        }
-
         if ($isRefreshableAbsentRoute) {
             return $expectedState->withAbsentRouteMutationOwner(
                 $claim->deploymentUuid,
                 $claim->routingConfigDigest,
-                $claim->topologyDigest,
+                $claim->operationTopologyDigest,
             );
         }
 

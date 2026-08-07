@@ -5,6 +5,7 @@ use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
+use App\Actions\Application\BlueGreen\BlueGreenDeploymentRecoveryOperation;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentTransitionException;
 use App\Actions\Application\BlueGreen\BlueGreenInterventionRecoveryResult;
 use App\Actions\Application\BlueGreen\BlueGreenOperationFence;
@@ -94,6 +95,7 @@ const FIXED_COLOR_CANDIDATE_CONTAINER_ID = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 function fixedColorBlueGreenRecoveryFixture(
     BlueGreenDeploymentPhase $phase,
     bool $stageSpecificPreviousRoute = false,
+    bool $rotateConnectionAfterPredecessor = false,
 ): array {
     InstanceSettings::unguarded(
         fn () => InstanceSettings::query()->firstOrCreate(['id' => 0]),
@@ -148,6 +150,14 @@ KEY;
         1,
         FIXED_COLOR_PREVIOUS_DEPLOYMENT,
     );
+    if ($rotateConnectionAfterPredecessor) {
+        $server->update([
+            'ip' => '10.255.254.22',
+            'user' => 'rotated-fixed-recovery-operator',
+            'port' => 2222,
+        ]);
+        $destination->unsetRelation('server');
+    }
     $candidateFingerprint = ComputeBlueGreenDeploymentFingerprint::run(
         $application,
         $destination,
@@ -171,7 +181,7 @@ KEY;
         mutationSequence: 1,
         activeDeploymentUuid: FIXED_COLOR_PREVIOUS_DEPLOYMENT,
         activeContainerId: FIXED_COLOR_PREVIOUS_CONTAINER_ID,
-        destinationTopologyDigest: $previousFingerprint->topologyDigest,
+        destinationTopologyDigest: $previousFingerprint->operationTopologyDigest,
         blueReplicaBackends: $stageSpecificPreviousRoute
             ? ["{$applicationUuid}-blue"]
             : null,
@@ -202,7 +212,7 @@ KEY;
         mutationSequence: 1,
         activeDeploymentUuid: FIXED_COLOR_CANDIDATE_DEPLOYMENT,
         activeContainerId: FIXED_COLOR_CANDIDATE_CONTAINER_ID,
-        destinationTopologyDigest: $candidateFingerprint->topologyDigest,
+        destinationTopologyDigest: $candidateFingerprint->operationTopologyDigest,
     );
     $candidateConfiguration = CompileBlueGreenProxyConfiguration::run(
         $application,
@@ -242,7 +252,7 @@ KEY;
         'blue_green_routing_revision' => 1,
         'blue_green_destination_fence_epoch' => 1,
         'blue_green_server_boot_id' => FIXED_COLOR_BOOT_ID,
-        'blue_green_topology_digest' => $previousFingerprint->topologyDigest,
+        'blue_green_topology_digest' => $previousFingerprint->operationTopologyDigest,
         'blue_green_routing_config_digest' => $previousFingerprint->routingConfigDigest,
         'blue_green_backend_port_inventory' => $backendPortInventory->serialized,
         'blue_green_drain_backend_port_inventory' => null,
@@ -299,6 +309,7 @@ KEY;
         'destination_fence_mutation_sequence' => $currentConfiguration->state->mutationSequence,
         'managed_file_sha256' => $currentConfiguration->state->managedSha256,
         'destination_topology_digest' => $currentConfiguration->state->destinationTopologyDigest,
+        'destination_routing_topology_digest' => $candidateFingerprint->routingTopologyDigest,
         'application_routing_config_digest' => $currentConfiguration->state->applicationRoutingConfigDigest,
         'operation_destination_fence_epoch' => 2,
         'operation_previous_destination_fence_epoch' => 1,
@@ -324,7 +335,8 @@ KEY;
         expectedRoutingRevision: 2,
         destinationFenceEpoch: 2,
         serverBootId: FIXED_COLOR_BOOT_ID,
-        topologyDigest: $candidateConfiguration->state->destinationTopologyDigest,
+        operationTopologyDigest: $candidateConfiguration->state->destinationTopologyDigest,
+        routingTopologyDigest: $candidateFingerprint->routingTopologyDigest,
         routingConfigDigest: $candidateConfiguration->routingConfigDigest,
         backendPortInventory: $backendPortInventory,
         drainBackendPortInventory: $backendPortInventory,
@@ -376,10 +388,49 @@ function invokeFixedColorRecoveryLifecycleMethod(
     return (new ReflectionMethod($lifecycle, $method))->invoke($lifecycle, ...$arguments);
 }
 
+it('preserves a v4 predecessor representative name for finalized fallback', function (): void {
+    $fixture = fixedColorBlueGreenRecoveryFixture(BlueGreenDeploymentPhase::DRAINING);
+    $previousRepresentative = new BlueGreenContainerExpectation(
+        name: $fixture['application']->uuid.'-green-replica-1',
+        dockerId: FIXED_COLOR_PREVIOUS_CONTAINER_ID,
+        applicationId: $fixture['application']->id,
+        pullRequestId: 0,
+        blueGreenManaged: true,
+        deploymentUuid: FIXED_COLOR_PREVIOUS_DEPLOYMENT,
+        color: BlueGreenDeploymentColor::GREEN,
+        routingRevision: 1,
+    );
+    $operation = new BlueGreenDeploymentRecoveryOperation(
+        claim: $fixture['claim'],
+        application: $fixture['application'],
+        destination: $fixture['destination'],
+        server: $fixture['server'],
+        deployment: $fixture['deployment'],
+        previousContainer: $previousRepresentative,
+        legacyRoutingSnapshot: null,
+        candidateContainer: $fixture['candidateExpectation'],
+        rollbackKey: new BlueGreenProxyRollbackKey(
+            operationId: FIXED_COLOR_CANDIDATE_DEPLOYMENT,
+            expectedState: $fixture['previousConfiguration']->state,
+            replacementState: $fixture['candidateConfiguration']->state,
+        ),
+        currentDestinationState: $fixture['candidateConfiguration']->state,
+        recoveredPhase: BlueGreenDeploymentPhase::DRAINING,
+        routingMutationRecorded: true,
+        wasFinalized: true,
+        candidateSetFenceIdentity: FIXED_COLOR_CANDIDATE_CONTAINER_ID,
+        previousSetFenceIdentity: hash('sha256', 'fixed-color-v4-predecessor-fence'),
+    );
+
+    expect($operation->previousDurableContainerName())->toBe($previousRepresentative->name)
+        ->not->toBe($fixture['application']->uuid.'-green');
+});
+
 it('terminalizes a finalized fallback when the predecessor runtime route digest differs from its claim digest', function (): void {
     $fixture = fixedColorBlueGreenRecoveryFixture(
         BlueGreenDeploymentPhase::DRAINING,
         stageSpecificPreviousRoute: true,
+        rotateConnectionAfterPredecessor: true,
     );
     $currentState = $fixture['candidateConfiguration']->state;
     $restoredState = $fixture['previousConfiguration']->state->withDestinationFenceEpoch(
@@ -396,7 +447,13 @@ it('terminalizes a finalized fallback when the predecessor runtime route digest 
         'application_routing_config_digest' => $restoredState->applicationRoutingConfigDigest,
     ]);
 
-    expect($fixture['previousDeployment']->blue_green_routing_config_digest)
+    expect($fixture['claim']->operationTopologyDigest)
+        ->not->toBe($restoredState->destinationTopologyDigest)
+        ->and($restoredState->destinationTopologyDigest)
+        ->toBe($fixture['previousConfiguration']->state->destinationTopologyDigest)
+        ->and($fixture['claim']->routingTopologyDigest)
+        ->toBe($fixture['state']->destination_routing_topology_digest)
+        ->and($fixture['previousDeployment']->blue_green_routing_config_digest)
         ->not->toBe($restoredState->applicationRoutingConfigDigest);
 
     $completedState = TransitionsBlueGreenDeployment::finishFinalizedFixedColorFallback(
@@ -632,7 +689,10 @@ it('refuses to finalize a fallback termination that left no terminal failed row 
 });
 
 it('starts a reconstructed fixed-color routing operation at mutation sequence one', function (): void {
-    $fixture = fixedColorBlueGreenRecoveryFixture(BlueGreenDeploymentPhase::PREPARING);
+    $fixture = fixedColorBlueGreenRecoveryFixture(
+        BlueGreenDeploymentPhase::PREPARING,
+        rotateConnectionAfterPredecessor: true,
+    );
     $previousBytes = $fixture['previousConfiguration']->state->serialize();
     $fixture['state']->update([
         'operation_previous_proxy_state' => $previousBytes,
@@ -641,7 +701,11 @@ it('starts a reconstructed fixed-color routing operation at mutation sequence on
 
     $operation = ReconstructBlueGreenDeploymentRecovery::run($fixture['state']);
 
-    expect($operation->routingMutationRecorded)->toBeFalse()
+    expect($operation->claim->operationTopologyDigest)
+        ->not->toBe($operation->rollbackKey->expectedState?->destinationTopologyDigest)
+        ->and($operation->claim->routingTopologyDigest)
+        ->toBe($fixture['state']->destination_routing_topology_digest)
+        ->and($operation->routingMutationRecorded)->toBeFalse()
         ->and($operation->rollbackKey->expectedState?->operationId)->toBe(FIXED_COLOR_PREVIOUS_DEPLOYMENT)
         ->and($operation->rollbackKey->replacementState->operationId)->toBe(FIXED_COLOR_CANDIDATE_DEPLOYMENT)
         ->and($operation->rollbackKey->replacementState->mutationSequence)->toBe(1)

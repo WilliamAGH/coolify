@@ -3,6 +3,9 @@
 namespace App\Actions\Proxy;
 
 use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
+use App\Actions\Application\BlueGreen\BlueGreenManagedRouteMetadataForOperationResult;
+use App\Actions\Application\BlueGreen\BlueGreenReplicaInspection;
+use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\DrainBlueGreenPreviousContainer;
 use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Actions\Proxy\ControlPlane\ControlPlaneDynamicConfiguration;
@@ -26,7 +29,13 @@ class WriteBlueGreenProxyConfiguration
 
     public const REPAIR_DRIFT_OUTPUT = 'coolify-blue-green-managed-route:repaired-drift';
 
+    public const RELEASED_V3_STATE_MIGRATED_OUTPUT = 'coolify-blue-green-released-v3-state:migrated';
+
+    public const PENDING_PROXY_MUTATION_JOURNAL_OUTPUT = 'coolify-blue-green-pending-proxy-mutation-journal';
+
     public const PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT = 'coolify-blue-green-pending-container-mutation-journal';
+
+    public const CONTAINER_MUTATION_JOURNAL_BOOT_IDENTITY_MISMATCH_OUTPUT = 'coolify-blue-green-container-mutation-journal-boot-identity-mismatch';
 
     public const CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX = 'coolify-blue-green-container-journal-inspection-v1';
 
@@ -120,6 +129,94 @@ class WriteBlueGreenProxyConfiguration
         }
 
         return $output;
+    }
+
+    /**
+     * @param  non-empty-list<array{
+     *     application_id: int,
+     *     deployment_uuid: string,
+     *     color: string,
+     *     routing_revision: int,
+     *     compose_project: string,
+     *     compose_service: string,
+     *     replica_index: int,
+     *     replica_count: int,
+     *     container_name: string,
+     *     container_id: string
+     * }>  $liveReplicas
+     */
+    public function migrateReleasedV3State(
+        Server $server,
+        BlueGreenProxyState $releasedState,
+        BlueGreenProxyState $canonicalState,
+        string $expectedBootId,
+        array $liveReplicas,
+    ): BlueGreenProxyState {
+        $this->assertTraefik($server);
+        $output = trim((string) instant_privileged_remote_script(
+            $this->migrateReleasedV3StateCommandFor(
+                $server->proxyPath(),
+                $releasedState,
+                $canonicalState,
+                $expectedBootId,
+                $liveReplicas,
+            ),
+            $server,
+        ));
+        if ($output !== self::RELEASED_V3_STATE_MIGRATED_OUTPUT) {
+            throw new RuntimeException('The released v3 blue-green state migration returned an invalid outcome.');
+        }
+
+        return $canonicalState;
+    }
+
+    /**
+     * @param  non-empty-list<array{
+     *     application_id: int,
+     *     deployment_uuid: string,
+     *     color: string,
+     *     routing_revision: int,
+     *     compose_project: string,
+     *     compose_service: string,
+     *     replica_index: int,
+     *     replica_count: int,
+     *     container_name: string,
+     *     container_id: string
+     * }>  $liveReplicas
+     */
+    public function migrateReleasedV3StateCommandFor(
+        string $proxyPath,
+        BlueGreenProxyState $releasedState,
+        BlueGreenProxyState $canonicalState,
+        string $expectedBootId,
+        array $liveReplicas,
+    ): string {
+        $this->assertReleasedV3Migration($releasedState, $canonicalState);
+        $this->assertReleasedV3LiveReplicas($releasedState, $canonicalState, $liveReplicas);
+        $this->assertBootId($expectedBootId);
+        $activePath = $this->managedPath($proxyPath, $canonicalState->managedFilename);
+        $statePath = $this->statePath($proxyPath, $canonicalState->managedFilename);
+        $liveReplicaAssertions = $this->releasedV3LiveReplicaAssertions($canonicalState, $liveReplicas);
+
+        return implode("\n", [
+            ...$this->releasedV3MigrationLockedCommandPrefix($proxyPath, $canonicalState->managedFilename),
+            $this->bootIdentityAssertionCommand(escapeshellarg($expectedBootId)),
+            ...$this->idempotentStateReplayCommands(
+                state: $canonicalState,
+                activePath: $activePath,
+                statePath: $statePath,
+                replayCommands: [
+                    ...$liveReplicaAssertions,
+                    'printf %s '.escapeshellarg(self::RELEASED_V3_STATE_MIGRATED_OUTPUT),
+                    'exit 0',
+                ],
+            ),
+            ...$this->assertStateCommands($releasedState, $activePath, $statePath),
+            ...$liveReplicaAssertions,
+            ...$this->atomicStateReplaceCommands($statePath, $canonicalState),
+            ...$this->assertStateCommands($canonicalState, $activePath, $statePath),
+            'printf %s '.escapeshellarg(self::RELEASED_V3_STATE_MIGRATED_OUTPUT),
+        ]);
     }
 
     public function repairCommandFor(
@@ -802,6 +899,27 @@ class WriteBlueGreenProxyConfiguration
             $waitSeconds === null
                 ? 'flock -x 9'
                 : 'flock -x -w '.escapeshellarg((string) $waitSeconds).' 9',
+        ];
+    }
+
+    /**
+     * Acquires an existing managed-file lock without creating or normalizing it.
+     *
+     * @return list<string>
+     */
+    public function sharedManagedFileLockCommands(string $proxyPath, string $managedFilename): array
+    {
+        $lockPath = $this->managedLockPath($proxyPath, $managedFilename);
+        $safeLockPath = escapeshellarg($lockPath);
+
+        return [
+            'command -v flock >/dev/null 2>&1',
+            'test -f '.$safeLockPath,
+            'test ! -L '.$safeLockPath,
+            'exec 9<'.$safeLockPath,
+            'flock -s 9',
+            'test -f '.$safeLockPath,
+            'test ! -L '.$safeLockPath,
         ];
     }
 
@@ -1663,6 +1781,26 @@ class WriteBlueGreenProxyConfiguration
     {
         return [
             ...$this->lockedCommandPrefixWithoutContainerMutationJournal($proxyPath, $managedFilename),
+            ...$this->pendingContainerMutationJournalCommands($proxyPath, $managedFilename),
+        ];
+    }
+
+    /** @return list<string> */
+    private function releasedV3MigrationLockedCommandPrefix(string $proxyPath, string $managedFilename): array
+    {
+        $mutationJournalPath = $this->mutationJournalPath($proxyPath, $managedFilename);
+        $safeMutationJournalPath = escapeshellarg($mutationJournalPath);
+
+        return [
+            'set -eu',
+            'umask 077',
+            ...DurableRemoteArtifact::shellFunctions(),
+            'mkdir -p -- '.escapeshellarg($this->dynamicDirectory($proxyPath)),
+            ...$this->exclusiveManagedFileLockCommands($proxyPath, $managedFilename),
+            'if [ -e '.$safeMutationJournalPath.' ] || [ -L '.$safeMutationJournalPath.' ]; then',
+            '  printf \'%s\\n\' '.escapeshellarg(self::PENDING_PROXY_MUTATION_JOURNAL_OUTPUT).' >&2',
+            '  exit 75',
+            'fi',
             ...$this->pendingContainerMutationJournalCommands($proxyPath, $managedFilename),
         ];
     }
@@ -2551,8 +2689,7 @@ class WriteBlueGreenProxyConfiguration
             || $expectedState->activeColor === $inactiveColor
             || $expectedState->routingRevision <= $inactiveRoutingRevision
             || hash_equals($expectedState->activeDeploymentUuid, $inactiveDeploymentUuid)
-            || hash_equals($expectedState->activeContainerId, $targetContainerId)
-            || ($expectedState->activeContainerSet?->contains($targetContainerName, $targetContainerId) ?? false)) {
+            || $expectedState->containsActiveContainer($targetContainerName, $targetContainerId)) {
             throw new InvalidArgumentException('The stale inactive-retirement journal target is not strictly older and unrouted by the exact active fence.');
         }
         if ($applicationId < 1
@@ -2645,8 +2782,7 @@ class WriteBlueGreenProxyConfiguration
             || ! hash_equals($expectedState->operationId, $expectedState->activeDeploymentUuid)
             || ! $replacementState->isMutationSuccessorOf($expectedState, $expectedState->operationId)
             || ! $replacementState->hasSameRouteIdentity($expectedState)
-            || hash_equals($expectedState->activeContainerId, $legacyTarget->dockerId)
-            || ($expectedState->activeContainerSet?->contains($legacyTarget->name, $legacyTarget->dockerId) ?? false)) {
+            || $expectedState->containsActiveContainer($legacyTarget->name, $legacyTarget->dockerId)) {
             throw new InvalidArgumentException('The spent first-adoption drain journal does not identify one exact unrouted legacy predecessor behind its routed candidate.');
         }
         $mutationScript = implode("\n", ['set -eu', ...$expectedMutationCommands])."\n";
@@ -2699,6 +2835,300 @@ class WriteBlueGreenProxyConfiguration
         if (preg_match('/^[a-f0-9]{64}$/D', $checksum) !== 1) {
             throw new InvalidArgumentException("The {$role} checksum must be a lowercase SHA-256 value.");
         }
+    }
+
+    private function assertReleasedV3Migration(
+        BlueGreenProxyState $releasedState,
+        BlueGreenProxyState $canonicalState,
+    ): void {
+        if ($releasedState->managedFilename !== $canonicalState->managedFilename
+            || $releasedState->applicationUuid !== $canonicalState->applicationUuid
+            || $releasedState->destinationId !== $canonicalState->destinationId
+            || $releasedState->operationId !== $canonicalState->operationId
+            || $releasedState->mutationSequence !== $canonicalState->mutationSequence
+            || $releasedState->destinationFenceEpoch !== $canonicalState->destinationFenceEpoch
+            || $releasedState->routingRevision !== $canonicalState->routingRevision
+            || $releasedState->managedSha256 !== $canonicalState->managedSha256
+            || $releasedState->activeColor !== $canonicalState->activeColor
+            || ! $releasedState->activeColor instanceof BlueGreenDeploymentColor
+            || $releasedState->activeDeploymentUuid !== $canonicalState->activeDeploymentUuid
+            || ! is_string($releasedState->activeContainerName)
+            || ! is_string($releasedState->activeContainerId)
+            || ! is_string($canonicalState->activeContainerName)
+            || ! is_string($canonicalState->activeContainerId)
+            || hash_equals($releasedState->activeContainerId, $canonicalState->activeContainerId)
+            || $releasedState->applicationRoutingConfigDigest !== $canonicalState->applicationRoutingConfigDigest
+            || $releasedState->destinationTopologyDigest !== $canonicalState->destinationTopologyDigest) {
+            throw new InvalidArgumentException('A released state migration must preserve the exact route fence while projecting canonical Docker identities.');
+        }
+
+        if ($canonicalState->activeReplicaSet !== null) {
+            if ($releasedState->activeContainerSet !== null
+                || $releasedState->activeReplicaSet !== null
+                || $releasedState->activeReplicaSetDigest !== null
+                || $canonicalState->activeContainerSet !== null
+                || ! is_string($canonicalState->activeReplicaSetDigest)
+                || $releasedState->activeContainerName !== $releasedState->applicationUuid.'-'.$releasedState->activeColor->value
+                || hash_equals($releasedState->activeContainerId, $canonicalState->activeReplicaSetDigest)) {
+                throw new InvalidArgumentException('A released v2 fan-out migration must project one exact scalar legacy fence to the canonical v4 replica set.');
+            }
+
+            return;
+        }
+
+        if ($releasedState->activeContainerSet === null
+            || $canonicalState->activeContainerSet === null
+            || $releasedState->activeReplicaSet !== null
+            || $canonicalState->activeReplicaSetDigest !== null
+            || $releasedState->activeContainerName !== $canonicalState->activeContainerName
+            || count($releasedState->activeContainerSet->members) !== count($canonicalState->activeContainerSet->members)) {
+            throw new InvalidArgumentException('A released v3 state migration must preserve the exact routed container set.');
+        }
+
+        $routedMemberReplaced = false;
+        foreach ($canonicalState->activeContainerSet->members as $offset => $canonicalMember) {
+            $releasedMember = $releasedState->activeContainerSet->members[$offset] ?? null;
+            if (! $releasedMember instanceof BlueGreenActiveContainer
+                || $releasedMember->port !== $canonicalMember->port
+                || $releasedMember->name !== $canonicalMember->name) {
+                throw new InvalidArgumentException('A released v3 state migration cannot change the exact routed container set.');
+            }
+            if ($canonicalMember->name === $canonicalState->activeContainerName
+                && $canonicalMember->id === $canonicalState->activeContainerId) {
+                if ($releasedMember->id !== $releasedState->activeContainerId) {
+                    throw new InvalidArgumentException('The released v3 state must carry its aggregate scalar identity on the routed member.');
+                }
+                $routedMemberReplaced = true;
+
+                continue;
+            }
+            if ($releasedMember->id !== $canonicalMember->id) {
+                throw new InvalidArgumentException('A released v3 state migration cannot change a non-routed container identity.');
+            }
+        }
+        if (! $routedMemberReplaced) {
+            throw new InvalidArgumentException('A released v3 state migration requires one exact routed member replacement.');
+        }
+    }
+
+    /**
+     * @param  non-empty-list<array{
+     *     application_id: int,
+     *     deployment_uuid: string,
+     *     color: string,
+     *     routing_revision: int,
+     *     compose_project: string,
+     *     compose_service: string,
+     *     replica_index: int,
+     *     replica_count: int,
+     *     container_name: string,
+     *     container_id: string
+     * }>  $liveReplicas
+     */
+    private function assertReleasedV3LiveReplicas(
+        BlueGreenProxyState $releasedState,
+        BlueGreenProxyState $canonicalState,
+        array $liveReplicas,
+    ): void {
+        if (count($liveReplicas) < 2
+            || ! is_string($canonicalState->activeDeploymentUuid)
+            || ! $canonicalState->activeColor instanceof BlueGreenDeploymentColor
+            || ! is_string($canonicalState->activeContainerName)
+            || ! is_string($canonicalState->activeContainerId)) {
+            throw new InvalidArgumentException('A released state migration requires one exact live replica set.');
+        }
+        $isFanOut = $canonicalState->activeReplicaSet !== null;
+        $isV3 = $canonicalState->activeContainerSet !== null;
+        if ($isFanOut === $isV3) {
+            throw new InvalidArgumentException('A released state migration requires exactly one canonical container-set shape.');
+        }
+
+        $expectedKeys = [
+            'application_id',
+            'deployment_uuid',
+            'color',
+            'routing_revision',
+            'compose_project',
+            'compose_service',
+            'replica_index',
+            'replica_count',
+            'container_name',
+            'container_id',
+        ];
+        $applicationId = null;
+        $containerIds = [];
+        $containerNames = [];
+        $composeServices = [];
+        $identities = [];
+        $slots = [];
+        $observedIndexes = [];
+        $replicaCount = null;
+        $inspections = [];
+        foreach ($liveReplicas as $replica) {
+            if (! is_array($replica)
+                || array_keys($replica) !== $expectedKeys
+                || ! is_int($replica['application_id'])
+                || $replica['application_id'] < 1
+                || ! is_string($replica['deployment_uuid'])
+                || ! hash_equals($canonicalState->activeDeploymentUuid, $replica['deployment_uuid'])
+                || $replica['color'] !== $canonicalState->activeColor->value
+                || $replica['routing_revision'] !== $canonicalState->routingRevision
+                || ! is_string($replica['compose_project'])
+                || trim($replica['compose_project']) === ''
+                || ! is_string($replica['compose_service'])
+                || trim($replica['compose_service']) === ''
+                || ! is_int($replica['replica_index'])
+                || ! is_int($replica['replica_count'])
+                || $replica['replica_index'] < 1
+                || $replica['replica_count'] < 1
+                || $replica['replica_index'] > $replica['replica_count']
+                || ! is_string($replica['container_name'])
+                || trim($replica['container_name']) === ''
+                || ! is_string($replica['container_id'])
+                || preg_match('/^[a-f0-9]{64}$/D', $replica['container_id']) !== 1) {
+                throw new InvalidArgumentException('A released live replica has incomplete or foreign durable provenance.');
+            }
+            $applicationId ??= $replica['application_id'];
+            $replicaCount ??= $replica['replica_count'];
+            if ($replica['application_id'] !== $applicationId
+                || $replica['replica_count'] !== $replicaCount
+                || isset($containerIds[$replica['container_id']])
+                || isset($containerNames[$replica['container_name']])
+                || isset($composeServices[$replica['compose_service']])) {
+                throw new InvalidArgumentException('A released live replica set must contain unique identities under one application owner and replica count.');
+            }
+            $containerIds[$replica['container_id']] = true;
+            $containerNames[$replica['container_name']] = true;
+            $composeServices[$replica['compose_service']] = true;
+            $identities[$replica['container_name']."\0".$replica['container_id']] = true;
+            $slots[$replica['compose_service']."\0".$replica['replica_index']] = $replica;
+            $observedIndexes[$replica['replica_index']] = true;
+            $inspections[] = BlueGreenReplicaInspection::fromRuntime(
+                replicaIndex: $replica['replica_index'],
+                composeService: $replica['compose_service'],
+                containerName: $replica['container_name'],
+                dockerId: $replica['container_id'],
+                status: 'running',
+                health: 'healthy',
+            );
+        }
+
+        if ($isFanOut) {
+            $expectedSlots = [];
+            foreach ($canonicalState->activeReplicaSet?->members ?? [] as $member) {
+                $expectedSlots[$member->composeService."\0".$member->replicaIndex] = $member;
+            }
+            if (count($expectedSlots) !== count($slots)) {
+                throw new InvalidArgumentException('The canonical v4 replica set does not equal its exact live inventory.');
+            }
+            foreach ($expectedSlots as $slot => $member) {
+                $replica = $slots[$slot] ?? null;
+                if (! is_array($replica)
+                    || $replica['container_name'] !== $member->name
+                    || $replica['container_id'] !== $member->id) {
+                    throw new InvalidArgumentException('The canonical v4 replica set does not equal its exact live inventory.');
+                }
+            }
+            ksort($observedIndexes, SORT_NUMERIC);
+            if (array_keys($observedIndexes) !== range(1, $replicaCount)) {
+                throw new InvalidArgumentException('The canonical v4 replica set does not contain every declared replica index.');
+            }
+            if (! hash_equals(
+                $releasedState->activeContainerId,
+                BlueGreenReplicaSet::identityDigest($inspections),
+            )) {
+                throw new InvalidArgumentException('The released v2 fan-out scalar does not equal the exact legacy replica digest.');
+            }
+
+            return;
+        }
+
+        if ($replicaCount !== 1) {
+            throw new InvalidArgumentException('A released v3 co-rolled set must retain scalar replica provenance.');
+        }
+        if (! isset($identities[$canonicalState->activeContainerName."\0".$canonicalState->activeContainerId])) {
+            throw new InvalidArgumentException('The canonical v3 representative is not a member of its exact live replica set.');
+        }
+        foreach ($canonicalState->activeContainerSet?->members ?? [] as $member) {
+            if (! isset($identities[$member->name."\0".$member->id])) {
+                throw new InvalidArgumentException('The canonical v3 routed member set is not contained in its exact live replica set.');
+            }
+        }
+    }
+
+    /**
+     * @param  non-empty-list<array{
+     *     application_id: int,
+     *     deployment_uuid: string,
+     *     color: string,
+     *     routing_revision: int,
+     *     compose_project: string,
+     *     compose_service: string,
+     *     replica_index: int,
+     *     replica_count: int,
+     *     container_name: string,
+     *     container_id: string
+     * }>  $liveReplicas
+     * @return non-empty-list<string>
+     */
+    private function releasedV3LiveReplicaAssertions(
+        BlueGreenProxyState $canonicalState,
+        array $liveReplicas,
+    ): array {
+        $isFanOut = $canonicalState->activeReplicaSet !== null;
+        $first = $liveReplicas[0];
+        $commonFilters = [
+            'label=coolify.applicationId='.$first['application_id'],
+            'label=coolify.pullRequestId=0',
+            'label=coolify.blueGreen.managed=true',
+            'label=coolify.blueGreen.deploymentUuid='.$first['deployment_uuid'],
+            'label=coolify.blueGreen.color='.$first['color'],
+            'label=coolify.blueGreen.routingRevision='.$first['routing_revision'],
+        ];
+        $commands = [];
+        $expectedIds = [];
+        foreach ($liveReplicas as $replica) {
+            $containerId = escapeshellarg($replica['container_id']);
+            $commands[] = 'test "$(docker inspect --format='.escapeshellarg('{{.Id}}').' '.$containerId.')" = '.escapeshellarg($replica['container_id']);
+            $commands[] = 'test "$(docker inspect --format='.escapeshellarg('{{.Name}}').' '.$containerId.')" = '.escapeshellarg('/'.$replica['container_name']);
+            $commands[] = 'test "$(docker inspect --format='.escapeshellarg('{{.State.Status}}').' '.$containerId.')" = running';
+            $commands[] = 'test "$(docker inspect --format='.escapeshellarg('{{.State.Health.Status}}').' '.$containerId.')" = healthy';
+            $expectedLabels = [
+                'coolify.applicationId' => (string) $replica['application_id'],
+                'coolify.pullRequestId' => '0',
+                'coolify.blueGreen.managed' => 'true',
+                'coolify.blueGreen.deploymentUuid' => $replica['deployment_uuid'],
+                'coolify.blueGreen.color' => $replica['color'],
+                'coolify.blueGreen.routingRevision' => (string) $replica['routing_revision'],
+                'com.docker.compose.project' => $replica['compose_project'],
+                'com.docker.compose.service' => $replica['compose_service'],
+            ];
+            if ($isFanOut) {
+                $expectedLabels['coolify.blueGreen.replicaIndex'] = (string) $replica['replica_index'];
+                $expectedLabels['coolify.blueGreen.replicaCount'] = (string) $replica['replica_count'];
+            }
+            foreach ($expectedLabels as $label => $value) {
+                $format = '{{ index .Config.Labels '.json_encode($label, JSON_THROW_ON_ERROR).' }}';
+                $commands[] = 'test "$(docker inspect --format='.escapeshellarg($format).' '.$containerId.')" = '.escapeshellarg($value);
+            }
+            $memberFilters = [...$commonFilters, 'label=com.docker.compose.project='.$replica['compose_project'], 'label=com.docker.compose.service='.$replica['compose_service']];
+            if ($isFanOut) {
+                $memberFilters[] = 'label=coolify.blueGreen.replicaIndex='.$replica['replica_index'];
+                $memberFilters[] = 'label=coolify.blueGreen.replicaCount='.$replica['replica_count'];
+            }
+            $commands[] = 'test "$(docker ps -aq --no-trunc '.implode(' ', array_map(
+                static fn (string $filter): string => '--filter '.escapeshellarg($filter),
+                $memberFilters,
+            )).')" = '.escapeshellarg($replica['container_id']);
+            $expectedIds[] = $replica['container_id'];
+        }
+        sort($expectedIds, SORT_STRING);
+        $commands[] = 'test "$(docker ps -aq --no-trunc '.implode(' ', array_map(
+            static fn (string $filter): string => '--filter '.escapeshellarg($filter),
+            $commonFilters,
+        )).' | LC_ALL=C sort)" = '.escapeshellarg(implode("\n", $expectedIds));
+
+        return $commands;
     }
 
     /** @return list<string> */
@@ -3024,7 +3454,7 @@ class WriteBlueGreenProxyConfiguration
         $pendingArchiveAuthenticationCommands = $recoverPendingArchive
             ? [
                 'if [ "${operation_container_recovered_pending_archive:-false}" = true ]; then',
-                '  test "$operation_container_sidecar_status" = pending_expected_sidecar',
+                '  test "$operation_container_sidecar_status" = '.BlueGreenManagedRouteMetadataForOperationResult::PENDING_EXPECTED_SIDECAR,
                 '  test "$operation_container_journal_checksum" = "$operation_container_pending_manifest_journal_checksum"',
                 '  test "$operation_container_expected_state_checksum" = "$operation_container_pending_manifest_expected_state_checksum"',
                 '  test "$operation_container_replacement_state_checksum" = "$operation_container_pending_manifest_replacement_state_checksum"',
@@ -3038,6 +3468,7 @@ class WriteBlueGreenProxyConfiguration
         return implode("\n", [
             'set -eu',
             'umask 077',
+            ...$this->expectedCurrentBootIdentityMismatchGuardCommands($expectedCurrentBootId),
             ...DurableRemoteArtifact::shellFunctions(),
             ...$this->exclusiveManagedFileLockCommands($proxyPath, $managedFilename),
             'operation_container_state_directory='.escapeshellarg($stateDirectory),
@@ -3046,9 +3477,6 @@ class WriteBlueGreenProxyConfiguration
             'operation_container_mutation_path='.escapeshellarg($mutationJournalPath),
             'operation_container_journal_path='.escapeshellarg($journalPath),
             'durable_remote_assert_owned_directory "$operation_container_state_directory"',
-            ...($expectedCurrentBootId === null ? [] : [
-                $this->bootIdentityAssertionCommand(escapeshellarg($expectedCurrentBootId)),
-            ]),
             'test ! -e "$operation_container_mutation_path"',
             'test ! -L "$operation_container_mutation_path"',
             'if [ ! -e "$operation_container_journal_path" ] && [ ! -L "$operation_container_journal_path" ]; then',
@@ -3109,7 +3537,7 @@ class WriteBlueGreenProxyConfiguration
             '    IFS= read -r operation_container_manifest_managed_file_state <&6',
             '    IFS= read -r operation_container_manifest_managed_checksum <&6',
             '    if [ "$operation_container_manifest_line_count" = 9 ]; then',
-            '      operation_container_manifest_sidecar_status=committed_replacement_sidecar',
+            '      operation_container_manifest_sidecar_status='.BlueGreenManagedRouteMetadataForOperationResult::COMMITTED_REPLACEMENT_SIDECAR,
             '      IFS= read -r operation_container_manifest_archive_filename <&6',
             '    else',
             '      IFS= read -r operation_container_manifest_sidecar_status <&6',
@@ -3128,7 +3556,7 @@ class WriteBlueGreenProxyConfiguration
             '    if [ "$operation_container_manifest_line_count" = 9 ]; then',
             '      test "$operation_container_manifest_magic" = '.escapeshellarg(self::COMMITTED_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC),
             '    elif [ "$operation_container_manifest_magic" = '.escapeshellarg(self::PENDING_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC).' ]; then',
-            '      test "$operation_container_manifest_sidecar_status" = pending_expected_sidecar',
+            '      test "$operation_container_manifest_sidecar_status" = '.BlueGreenManagedRouteMetadataForOperationResult::PENDING_EXPECTED_SIDECAR,
             '      operation_container_pending_archive_candidate_count=$((operation_container_pending_archive_candidate_count + 1))',
             '      operation_container_journal_source="$operation_container_archive_path"',
             '      operation_container_pending_manifest_journal_checksum="$operation_container_manifest_journal_checksum"',
@@ -3139,7 +3567,7 @@ class WriteBlueGreenProxyConfiguration
             '      operation_container_pending_manifest_managed_checksum="$operation_container_manifest_managed_checksum"',
             '    else',
             '      test "$operation_container_manifest_magic" = '.escapeshellarg(self::FINALIZED_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC),
-            '      test "$operation_container_manifest_sidecar_status" = committed_replacement_sidecar',
+            '      test "$operation_container_manifest_sidecar_status" = '.BlueGreenManagedRouteMetadataForOperationResult::COMMITTED_REPLACEMENT_SIDECAR,
             '    fi',
             '  done',
             '  for operation_container_manifest_path in '.$manifestGlob.'; do',
@@ -3164,9 +3592,9 @@ class WriteBlueGreenProxyConfiguration
         if ($expectedCurrentBootId !== null) {
             $this->assertBootId($expectedCurrentBootId);
         }
-        $bootIdentityAssertion = $expectedCurrentBootId === null
-            ? $this->bootIdentityAssertionCommand('"$operation_container_expected_boot_id"')
-            : $this->bootIdentityAssertionCommand(escapeshellarg($expectedCurrentBootId));
+        $bootIdentityAssertionCommands = $expectedCurrentBootId === null
+            ? [$this->bootIdentityAssertionCommand('"$operation_container_expected_boot_id"')]
+            : $this->expectedCurrentBootIdentityMismatchGuardCommands($expectedCurrentBootId);
 
         return [
             'durable_remote_assert_owned_regular "$operation_container_journal_source"',
@@ -3192,7 +3620,7 @@ class WriteBlueGreenProxyConfiguration
             'test "$operation_container_journal_magic" = '.escapeshellarg(self::CONTAINER_MUTATION_JOURNAL_MAGIC),
             'test "$operation_container_journal_filename" = '.escapeshellarg($managedFilename),
             $this->lowercaseUuidAssertionCommand('$operation_container_expected_boot_id'),
-            $bootIdentityAssertion,
+            ...$bootIdentityAssertionCommands,
             'for operation_container_checksum_value in "$operation_container_expected_state_checksum" "$operation_container_replacement_state_checksum" "$operation_container_managed_checksum" "$operation_container_mutation_checksum" "$operation_container_completion_checksum"; do',
             '  case "$operation_container_checksum_value" in *[!0123456789abcdef]*|\'\') exit 1 ;; esac',
             '  test "${#operation_container_checksum_value}" -eq 64',
@@ -3238,15 +3666,15 @@ class WriteBlueGreenProxyConfiguration
             'operation_container_sidecar_status=invalid',
             'if [ ! -e "$operation_container_state_path" ] && [ ! -L "$operation_container_state_path" ]; then',
             '  test "$operation_container_expected_state" = absent',
-            '  operation_container_sidecar_status=pending_expected_sidecar',
+            '  operation_container_sidecar_status='.BlueGreenManagedRouteMetadataForOperationResult::PENDING_EXPECTED_SIDECAR,
             'else',
             '  durable_remote_assert_owned_regular "$operation_container_state_path"',
             '  test "$(durable_remote_owner_uid "$operation_container_state_path")" = "$(id -u)"',
             '  test "$(durable_remote_permissions "$operation_container_state_path")" = 600',
             '  if cmp -s "$operation_container_state_path" "$operation_container_replacement_state_decoded"; then',
-            '    operation_container_sidecar_status=committed_replacement_sidecar',
+            '    operation_container_sidecar_status='.BlueGreenManagedRouteMetadataForOperationResult::COMMITTED_REPLACEMENT_SIDECAR,
             '  elif [ "$operation_container_expected_state" != absent ] && cmp -s "$operation_container_state_path" "$operation_container_expected_state_decoded"; then',
-            '    operation_container_sidecar_status=pending_expected_sidecar',
+            '    operation_container_sidecar_status='.BlueGreenManagedRouteMetadataForOperationResult::PENDING_EXPECTED_SIDECAR,
             '  else',
             '    exit 1',
             '  fi',
@@ -3286,29 +3714,29 @@ class WriteBlueGreenProxyConfiguration
         $managedFileState = $this->managedStateMarker($replacementState);
         $managedFileSha256 = $this->managedStateChecksum($replacementState);
         $terminalSidecarStatus = $finalizeReplacement
-            ? 'committed_replacement_sidecar'
-            : 'pending_expected_sidecar';
+            ? BlueGreenManagedRouteMetadataForOperationResult::COMMITTED_REPLACEMENT_SIDECAR
+            : BlueGreenManagedRouteMetadataForOperationResult::PENDING_EXPECTED_SIDECAR;
         $manifestMagic = $finalizeReplacement
             ? self::FINALIZED_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC
             : self::PENDING_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC;
         $sidecarPreconditionCommands = $finalizeReplacement
             ? [
                 'case "$operation_container_sidecar_status" in',
-                '  pending_expected_sidecar|committed_replacement_sidecar) ;;',
+                '  '.BlueGreenManagedRouteMetadataForOperationResult::PENDING_EXPECTED_SIDECAR.'|'.BlueGreenManagedRouteMetadataForOperationResult::COMMITTED_REPLACEMENT_SIDECAR.') ;;',
                 '  *) exit 1 ;;',
                 'esac',
             ]
             : [
-                'test "$operation_container_sidecar_status" = pending_expected_sidecar',
+                'test "$operation_container_sidecar_status" = '.BlueGreenManagedRouteMetadataForOperationResult::PENDING_EXPECTED_SIDECAR,
             ];
         $sidecarFinalizationCommands = $finalizeReplacement
             ? [
-                'if [ "$operation_container_sidecar_status" = pending_expected_sidecar ]; then',
+                'if [ "$operation_container_sidecar_status" = '.BlueGreenManagedRouteMetadataForOperationResult::PENDING_EXPECTED_SIDECAR.' ]; then',
                 '  operation_container_state_stage=$(mktemp "$operation_container_state_directory/.blue-green-operation-container-state.XXXXXX")',
                 '  cp -- "$operation_container_replacement_state_decoded" "$operation_container_state_stage"',
                 '  chmod 600 "$operation_container_state_stage"',
                 '  durable_remote_replace "$operation_container_state_stage" "$operation_container_state_path" "$operation_container_state_directory"',
-                '  operation_container_sidecar_status=committed_replacement_sidecar',
+                '  operation_container_sidecar_status='.BlueGreenManagedRouteMetadataForOperationResult::COMMITTED_REPLACEMENT_SIDECAR,
                 '  if [ "${COOLIFY_BLUE_GREEN_CONTAINER_JOURNAL_CAS_CRASH_AFTER_REPLACEMENT_SIDECAR:-}" = 1 ]; then exit 75; fi',
                 'fi',
                 'durable_remote_assert_owned_regular "$operation_container_state_path"',
@@ -3345,7 +3773,7 @@ class WriteBlueGreenProxyConfiguration
                 '  IFS= read -r operation_container_existing_manifest_managed_file_state <&6',
                 '  IFS= read -r operation_container_existing_manifest_managed_checksum <&6',
                 '  if [ "$operation_container_existing_manifest_line_count" = 9 ]; then',
-                '    operation_container_existing_manifest_sidecar_status=committed_replacement_sidecar',
+                '    operation_container_existing_manifest_sidecar_status='.BlueGreenManagedRouteMetadataForOperationResult::COMMITTED_REPLACEMENT_SIDECAR,
                 '    IFS= read -r operation_container_existing_manifest_archive_filename <&6',
                 '  else',
                 '    IFS= read -r operation_container_existing_manifest_sidecar_status <&6',
@@ -3362,15 +3790,15 @@ class WriteBlueGreenProxyConfiguration
                 '  test "$operation_container_existing_manifest_archive_filename" = '.escapeshellarg($archiveFilename),
                 '  if [ "$operation_container_existing_manifest_magic" = '.escapeshellarg(self::FINALIZED_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC).' ]; then',
                 '    test "$operation_container_existing_manifest_line_count" = 10',
-                '    test "$operation_container_existing_manifest_sidecar_status" = committed_replacement_sidecar',
+                '    test "$operation_container_existing_manifest_sidecar_status" = '.BlueGreenManagedRouteMetadataForOperationResult::COMMITTED_REPLACEMENT_SIDECAR,
                 '  else',
                 '    if [ "$operation_container_existing_manifest_magic" = '.escapeshellarg(self::PENDING_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC).' ]; then',
                 '      test "$operation_container_existing_manifest_line_count" = 10',
-                '      test "$operation_container_existing_manifest_sidecar_status" = pending_expected_sidecar',
+                '      test "$operation_container_existing_manifest_sidecar_status" = '.BlueGreenManagedRouteMetadataForOperationResult::PENDING_EXPECTED_SIDECAR,
                 '    else',
                 '      test "$operation_container_existing_manifest_magic" = '.escapeshellarg(self::COMMITTED_CONTAINER_MUTATION_JOURNAL_ARCHIVE_MAGIC),
                 '      test "$operation_container_existing_manifest_line_count" = 9',
-                '      test "$operation_container_sidecar_status" = committed_replacement_sidecar',
+                '      test "$operation_container_sidecar_status" = '.BlueGreenManagedRouteMetadataForOperationResult::COMMITTED_REPLACEMENT_SIDECAR,
                 '    fi',
                 '    operation_container_manifest_stage=$(mktemp "$operation_container_state_directory/.blue-green-operation-container-manifest.XXXXXX")',
                 '    {',
@@ -3382,7 +3810,7 @@ class WriteBlueGreenProxyConfiguration
                 '      printf \'%s\\n\' "$operation_container_expected_boot_id"',
                 '      printf \'%s\\n\' "$operation_container_managed_file_state"',
                 '      printf \'%s\\n\' "$operation_container_managed_checksum"',
-                '      printf \'%s\\n\' committed_replacement_sidecar',
+                '      printf \'%s\\n\' '.BlueGreenManagedRouteMetadataForOperationResult::COMMITTED_REPLACEMENT_SIDECAR,
                 '      printf \'%s\\n\' '.escapeshellarg($archiveFilename),
                 '    } > "$operation_container_manifest_stage"',
                 '    chmod 600 "$operation_container_manifest_stage"',
@@ -3584,9 +4012,9 @@ class WriteBlueGreenProxyConfiguration
         $replacementManagedSha256 = $replacementState === null
             ? null
             : $this->managedStateChecksum($replacementState);
-        $bootIdentityAssertion = $expectedCurrentBootId === null
-            ? $this->bootIdentityAssertionCommand('"$committed_container_expected_boot_id"')
-            : $this->bootIdentityAssertionCommand(escapeshellarg($expectedCurrentBootId));
+        $bootIdentityAssertionCommands = $expectedCurrentBootId === null
+            ? [$this->bootIdentityAssertionCommand('"$committed_container_expected_boot_id"')]
+            : $this->expectedCurrentBootIdentityMismatchGuardCommands($expectedCurrentBootId);
         $expectedJournalBootCommands = $expectedJournalBootId === null
             ? []
             : [
@@ -3703,6 +4131,7 @@ class WriteBlueGreenProxyConfiguration
         return implode("\n", [
             'set -eu',
             'umask 077',
+            ...$this->expectedCurrentBootIdentityMismatchGuardCommands($expectedCurrentBootId),
             ...DurableRemoteArtifact::shellFunctions(),
             ...$this->exclusiveManagedFileLockCommands($proxyPath, $managedFilename),
             'committed_container_state_directory='.escapeshellarg($stateDirectory),
@@ -3742,7 +4171,7 @@ class WriteBlueGreenProxyConfiguration
             'test "$committed_container_journal_filename" = '.escapeshellarg($managedFilename),
             $this->lowercaseUuidAssertionCommand('$committed_container_expected_boot_id'),
             ...$expectedJournalBootCommands,
-            $bootIdentityAssertion,
+            ...$bootIdentityAssertionCommands,
             'for committed_container_checksum_value in "$committed_container_expected_state_checksum" "$committed_container_replacement_state_checksum" "$committed_container_managed_checksum" "$committed_container_mutation_checksum" "$committed_container_completion_checksum"; do',
             '  case "$committed_container_checksum_value" in *[!0123456789abcdef]*|\'\') exit 1 ;; esac',
             '  test "${#committed_container_checksum_value}" -eq 64',
@@ -3909,6 +4338,21 @@ class WriteBlueGreenProxyConfiguration
     protected function bootIdentityAssertionCommand(string $expectedBootIdShellValue): string
     {
         return 'test "$(cat /proc/sys/kernel/random/boot_id)" = '.$expectedBootIdShellValue;
+    }
+
+    /** @return list<string> */
+    private function expectedCurrentBootIdentityMismatchGuardCommands(?string $expectedCurrentBootId): array
+    {
+        if ($expectedCurrentBootId === null) {
+            return [];
+        }
+
+        return [
+            'if ! '.$this->bootIdentityAssertionCommand(escapeshellarg($expectedCurrentBootId)).'; then',
+            '  printf \'%s\\n\' '.escapeshellarg(self::CONTAINER_MUTATION_JOURNAL_BOOT_IDENTITY_MISMATCH_OUTPUT),
+            '  exit 0',
+            'fi',
+        ];
     }
 
     private function assertBootId(string $expectedBootId): void

@@ -30,6 +30,22 @@ function routeProofState(array $overrides = []): BlueGreenProxyState
     return new BlueGreenProxyState(...$attributes);
 }
 
+it('matches route absence only with route absence', function (): void {
+    $route = routeProofState();
+
+    expect(BlueGreenProxyState::matches(null, null))->toBeTrue()
+        ->and(BlueGreenProxyState::matches(null, $route))->toBeFalse()
+        ->and(BlueGreenProxyState::matches($route, null))->toBeFalse();
+});
+
+it('matches present routes by their exact serialized state', function (): void {
+    expect(BlueGreenProxyState::matches(routeProofState(), routeProofState()))->toBeTrue()
+        ->and(BlueGreenProxyState::matches(
+            routeProofState(),
+            routeProofState(['mutationSequence' => 2]),
+        ))->toBeFalse();
+});
+
 it('proves a snapshot the live route matches field for field', function (): void {
     expect(routeProofState()->provesSameManagedRouteAs(
         routeProofState(),

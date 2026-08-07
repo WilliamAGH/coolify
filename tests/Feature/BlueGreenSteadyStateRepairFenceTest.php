@@ -1,11 +1,18 @@
 <?php
 
 use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
+use App\Actions\Application\BlueGreen\BlueGreenLifecycleDatabaseLocks;
+use App\Actions\Application\BlueGreen\BlueGreenManagedRouteMetadataForOperationResult;
 use App\Actions\Application\BlueGreen\BlueGreenSteadyStateRepairResult;
+use App\Actions\Application\BlueGreen\ComputeBlueGreenDeploymentFingerprint;
 use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Actions\Application\BlueGreen\PlanBlueGreenPublicRecovery;
+use App\Actions\Application\BlueGreen\PlanBlueGreenSteadyState;
 use App\Actions\Application\BlueGreen\RepairBlueGreenSteadyState;
 use App\Actions\Application\BlueGreen\RepairBlueGreenSteadyStates;
+use App\Actions\Application\BlueGreen\ResolveBlueGreenExpectedProxyState;
+use App\Actions\Proxy\BlueGreenProxyRollbackArtifact;
+use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingMode;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
@@ -22,11 +29,13 @@ use App\Models\ApplicationDeploymentQueue;
 use App\Models\PrivateKey;
 use App\Models\Project;
 use App\Models\Server;
+use App\Models\StandaloneDocker;
 use App\Models\Team;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Process\FakeProcessResult;
 use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Storage;
 
@@ -38,6 +47,18 @@ beforeEach(function (): void {
 
 afterEach(function (): void {
     Cache::forget('blue-green:steady-repair-cursor');
+});
+
+it('refuses lifecycle row locks without an active database transaction', function (): void {
+    DB::partialMock()
+        ->shouldReceive('transactionLevel')
+        ->once()
+        ->andReturn(0);
+
+    expect(fn () => BlueGreenLifecycleDatabaseLocks::forDestination(
+        1,
+        1,
+    ))->toThrow(RuntimeException::class, 'active database transaction');
 });
 
 /**
@@ -78,6 +99,10 @@ function makeBlueGreenSteadyRepairFixture(): array
     $activeUuid = 'steady-repair-active-owner';
     $activeContainerId = str_repeat('a', 64);
     $topologyDigest = hash('sha256', 'steady-repair-topology');
+    $routingTopologyDigest = (new ComputeBlueGreenDeploymentFingerprint)->routingTopologyDigestFor(
+        $application,
+        $destination,
+    );
     $configuration = CompileBlueGreenProxyConfiguration::run(
         $application,
         $destination,
@@ -131,6 +156,7 @@ function makeBlueGreenSteadyRepairFixture(): array
         'destination_fence_mutation_sequence' => 3,
         'managed_file_sha256' => $configuration->sha256,
         'destination_topology_digest' => $topologyDigest,
+        'destination_routing_topology_digest' => $routingTopologyDigest,
         'application_routing_config_digest' => $configuration->routingConfigDigest,
     ]);
 
@@ -180,7 +206,7 @@ function fakeHealthyBlueGreenSteadyRepairProofs(
     $bootId = '11111111-2222-3333-4444-555555555555';
 
     InspectBlueGreenContainer::shouldRun()
-        ->twice()
+        ->once()
         ->andReturn(new BlueGreenContainerInspection(
             exists: true,
             dockerId: str_repeat('a', 64),
@@ -228,6 +254,43 @@ function fakeHealthyBlueGreenSteadyRepairProofs(
         };
     });
 }
+
+it('defers before remote proof when the routing-topology digest is missing', function (): void {
+    ['state' => $state] = makeBlueGreenSteadyRepairFixture();
+    $state->update(['destination_routing_topology_digest' => null]);
+    InspectBlueGreenContainer::shouldRun()->never();
+    Process::fake();
+
+    $result = RepairBlueGreenSteadyState::run($state->fresh());
+
+    expect($result->outcome)->toBe(BlueGreenSteadyStateRepairResult::PENDING_ROUTING_TOPOLOGY_DIGEST)
+        ->and($result->message)->toContain('run blue-green:rehydrate-routing-topology');
+    Process::assertNothingRan();
+});
+
+it('distinguishes a missing routing-topology digest from ordinary deferral', function (): void {
+    ['state' => $state] = makeBlueGreenSteadyRepairFixture();
+    $state->update(['destination_routing_topology_digest' => null]);
+    InspectBlueGreenContainer::shouldRun()->never();
+    Process::fake();
+
+    $result = RepairBlueGreenSteadyState::run($state->fresh());
+
+    expect($result->outcome)->not->toBe(BlueGreenSteadyStateRepairResult::DEFERRED);
+});
+
+it('defers before remote proof when the routing-topology digest no longer matches current topology', function (): void {
+    ['state' => $state] = makeBlueGreenSteadyRepairFixture();
+    $state->update(['destination_routing_topology_digest' => hash('sha256', 'stale-routing-topology')]);
+    InspectBlueGreenContainer::shouldRun()->never();
+    Process::fake();
+
+    $result = RepairBlueGreenSteadyState::run($state->fresh());
+
+    expect($result->outcome)->toBe(BlueGreenSteadyStateRepairResult::DEFERRED)
+        ->and($result->message)->toBe('The destination routing topology digest no longer matches current topology.');
+    Process::assertNothingRan();
+});
 
 it('repairs a steady route on a destination that carries only terminal deactivation history', function (BlueGreenDeactivationPhase $phase): void {
     ['application' => $application, 'deployment' => $deployment, 'state' => $state] = makeBlueGreenSteadyRepairFixture();
@@ -318,6 +381,132 @@ it('skips a steady repair whose active route owner terminal stop history cut off
         ->and($result->message)->toBe('Deletion or deactivation owns the destination.');
 });
 
+it('archives a committed clean idle journal from the scheduled sweep and repairs the route in the same pass', function (): void {
+    config(['constants.ssh.mux_enabled' => false]);
+    $fixture = makeBlueGreenSteadyRepairFixture();
+    $application = $fixture['application'];
+    $deployment = $fixture['deployment'];
+    $state = $fixture['state'];
+    $destination = $application->destination;
+    $expectedState = ResolveBlueGreenExpectedProxyState::run($application, $destination, $state)
+        ?? throw new RuntimeException('The sweep journal fixture requires an exact managed route.');
+    $journalExpectedState = new BlueGreenProxyState(
+        managedFilename: $expectedState->managedFilename,
+        applicationUuid: $expectedState->applicationUuid,
+        destinationId: $expectedState->destinationId,
+        operationId: $expectedState->operationId,
+        mutationSequence: $expectedState->mutationSequence - 1,
+        destinationFenceEpoch: $expectedState->destinationFenceEpoch,
+        routingRevision: $expectedState->routingRevision,
+        managedSha256: $expectedState->managedSha256,
+        activeColor: $expectedState->activeColor,
+        activeDeploymentUuid: $expectedState->activeDeploymentUuid,
+        activeContainerName: $expectedState->activeContainerName,
+        activeContainerId: $expectedState->activeContainerId,
+        applicationRoutingConfigDigest: $expectedState->applicationRoutingConfigDigest,
+        destinationTopologyDigest: $expectedState->destinationTopologyDigest,
+        activeContainerSet: $expectedState->activeContainerSet,
+        activeReplicaSetDigest: $expectedState->activeReplicaSetDigest,
+        activeReplicaSet: $expectedState->activeReplicaSet,
+    );
+    $journalSha256 = hash('sha256', 'sweep-committed-journal');
+    $bootId = '11111111-2222-3333-4444-555555555555';
+    $deployment->update(['blue_green_server_boot_id' => $bootId]);
+    $releaseProof = BlueGreenRoutingTarget::durableReleaseProofToken($deployment->deployment_uuid);
+    $plan = PlanBlueGreenSteadyState::run($application, $destination, $state);
+    $journalPresent = true;
+
+    InspectBlueGreenContainer::shouldRun()
+        ->times(3)
+        ->andReturn(new BlueGreenContainerInspection(
+            exists: true,
+            dockerId: str_repeat('a', 64),
+            status: 'running',
+            health: 'healthy',
+        ));
+    Process::fake(function (PendingProcess $process) use (
+        $expectedState,
+        $journalExpectedState,
+        $journalSha256,
+        $bootId,
+        $releaseProof,
+        $plan,
+        &$journalPresent,
+    ): FakeProcessResult {
+        $command = is_array($process->command) ? implode(' ', $process->command) : (string) $process->command;
+        $payload = $command."\n".(is_string($process->input) ? $process->input : '');
+        if (str_contains($payload, '__coolify_blue_green_probe')) {
+            return Process::result(output: "HTTP/1.1 200 OK\r\n"
+                .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$plan->publicAcknowledgement}\r\n"
+                .BlueGreenRoutingTarget::RELEASE_PROOF_HEADER.": {$releaseProof}\r\n\r\n");
+        }
+        if (str_contains($payload, 'repair_outcome=')) {
+            if ($journalPresent) {
+                return Process::result(
+                    errorOutput: WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT,
+                    exitCode: 75,
+                );
+            }
+
+            return Process::result(output: WriteBlueGreenProxyConfiguration::REPAIR_HEALTHY_OUTPUT);
+        }
+        if (str_contains($payload, 'committed_container_manifest_stage=')) {
+            $journalPresent = false;
+
+            return Process::result(output: implode('|', [
+                WriteBlueGreenProxyConfiguration::COMMITTED_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX,
+                'archived',
+                $journalSha256,
+                (new WriteBlueGreenProxyConfiguration)->committedContainerMutationJournalArchiveFilename(
+                    $expectedState->managedFilename,
+                    $journalSha256,
+                ),
+            ]));
+        }
+        if (str_contains($payload, WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX)) {
+            if (! $journalPresent) {
+                return Process::result(output: WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX.'|absent');
+            }
+
+            return Process::result(output: implode('|', [
+                WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX,
+                BlueGreenManagedRouteMetadataForOperationResult::COMMITTED_REPLACEMENT_SIDECAR,
+                $journalSha256,
+                $bootId,
+                BlueGreenProxyRollbackArtifact::PRESENT_STATE,
+                $expectedState->managedSha256,
+                hash('sha256', 'sweep-journal-mutation-script'),
+                hash('sha256', 'sweep-journal-completion-script'),
+            ])."\n".base64_encode($journalExpectedState->serialize())."\n".base64_encode($expectedState->serialize()));
+        }
+        if (str_contains($payload, 'coolify-blue-green-managed-route:present:')) {
+            if ($journalPresent) {
+                return Process::result(output: WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT);
+            }
+
+            return Process::result(output: 'coolify-blue-green-managed-route:present:'
+                .base64_encode($expectedState->serialize())."\n".$expectedState->managedSha256);
+        }
+        if (str_contains($payload, 'coolify-blue-green-destination-state-attested')) {
+            return Process::result(output: 'coolify-blue-green-destination-state-attested');
+        }
+        if (str_contains($payload, '{{json .Config.Env}}')) {
+            return Process::result(output: json_encode(['COOLIFY_DEPLOYMENT_RELEASE_PROOF='.$releaseProof], JSON_THROW_ON_ERROR));
+        }
+        if (str_contains($payload, '/proc/sys/kernel/random/boot_id')) {
+            return Process::result(output: $bootId);
+        }
+
+        return Process::result(errorOutput: 'Unexpected sweep journal repair command.', exitCode: 1);
+    });
+
+    $results = (new RepairBlueGreenSteadyStates)->handle(1, (int) $application->id, (int) $destination->id);
+
+    expect($results)->toHaveCount(1)
+        ->and($results[0]->outcome.' :: '.$results[0]->message)->toBe(BlueGreenSteadyStateRepairResult::HEALTHY.' :: The canonical steady route is present and publicly verified.')
+        ->and($journalPresent)->toBeFalse();
+});
+
 it('clears stale intervention diagnostics after the scheduled steady repair proves the canonical route', function (): void {
     ['application' => $application, 'deployment' => $deployment, 'state' => $state] = makeBlueGreenSteadyRepairFixture();
     $state->update([
@@ -383,3 +572,49 @@ it('retains changed stale intervention diagnostics when the proven boundary lose
         ->and($state->fresh()->intervention_phase)->toBe(BlueGreenDeploymentPhase::DRAINING->value)
         ->and($state->fresh()->intervention_reason)->toBe($replacementReason);
 });
+
+it('defers when routing inputs change during public proof', function (
+    Closure $mutateRoutingInput,
+    Closure $assertRoutingInputChanged,
+): void {
+    ['application' => $application, 'deployment' => $deployment, 'state' => $state] = makeBlueGreenSteadyRepairFixture();
+    $initialDigest = $state->destination_routing_topology_digest;
+    expect($initialDigest)->toBeString();
+    $reason = 'The prior fenced recovery was interrupted before it could clear its diagnostics.';
+    $state->update([
+        'destination_routing_topology_digest' => $initialDigest,
+        'intervention_phase' => BlueGreenDeploymentPhase::DRAINING->value,
+        'intervention_reason' => $reason,
+    ]);
+    fakeHealthyBlueGreenSteadyRepairProofs(
+        $application,
+        $deployment,
+        $state->fresh(),
+        static function () use ($application, $mutateRoutingInput): void {
+            $mutateRoutingInput($application);
+        },
+    );
+
+    $result = RepairBlueGreenSteadyState::run($state->fresh());
+
+    expect($result->outcome)->toBe(BlueGreenSteadyStateRepairResult::DEFERRED)
+        ->and($state->fresh()->destination_routing_topology_digest)->toBe($initialDigest)
+        ->and($state->fresh()->intervention_reason)->toBe($reason);
+    $assertRoutingInputChanged($application);
+})->with([
+    'destination network topology' => [
+        static fn (Application $application): int => StandaloneDocker::query()
+            ->whereKey($application->destination_id)
+            ->update(['network' => 'steady-repair-drifted-network']),
+        static fn (Application $application) => expect(
+            StandaloneDocker::query()->findOrFail($application->destination_id)->network,
+        )->toBe('steady-repair-drifted-network'),
+    ],
+    'application route configuration' => [
+        static fn (Application $application): int => Application::query()
+            ->whereKey($application->id)
+            ->update(['fqdn' => 'https://steady-repair-drifted.example.test']),
+        static fn (Application $application) => expect($application->fresh()->fqdn)
+            ->toBe('https://steady-repair-drifted.example.test'),
+    ],
+]);

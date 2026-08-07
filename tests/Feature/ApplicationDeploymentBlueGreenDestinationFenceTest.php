@@ -5,6 +5,7 @@ use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
 use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
+use App\Actions\Application\BlueGreen\ComputeBlueGreenDeploymentFingerprint;
 use App\Actions\Application\BlueGreen\FindBlueGreenDeactivationFence;
 use App\Actions\Application\BlueGreen\RecordBlueGreenDestinationState;
 use App\Enums\ApplicationDeploymentStatus;
@@ -124,7 +125,8 @@ function applicationDeploymentBlueGreenClaim(
         expectedRoutingRevision: 1,
         destinationFenceEpoch: 1,
         serverBootId: '11111111-2222-3333-4444-555555555555',
-        topologyDigest: hash('sha256', 'application-destination-topology'),
+        operationTopologyDigest: hash('sha256', 'application-destination-topology'),
+        routingTopologyDigest: (new ComputeBlueGreenDeploymentFingerprint)->routingTopologyDigestFor($application, $destination),
         routingConfigDigest: hash('sha256', 'application-routing-configuration'),
         backendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
         drainBackendPortInventory: null,
@@ -407,7 +409,11 @@ function applicationDeploymentBlueGreenDrainingClaim(
         expectedRoutingRevision: 1,
         destinationFenceEpoch: 1,
         serverBootId: '11111111-2222-3333-4444-555555555555',
-        topologyDigest: hash('sha256', 'application-destination-topology'),
+        operationTopologyDigest: hash('sha256', 'application-destination-topology'),
+        routingTopologyDigest: (new ComputeBlueGreenDeploymentFingerprint)->routingTopologyDigestFor(
+            $fixture['application'],
+            $fixture['destination'],
+        ),
         routingConfigDigest: hash('sha256', 'application-routing-configuration'),
         backendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
         drainBackendPortInventory: null,

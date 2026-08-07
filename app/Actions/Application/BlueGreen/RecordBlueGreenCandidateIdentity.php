@@ -44,14 +44,14 @@ final class RecordBlueGreenCandidateIdentity
                 || $state->pending_deployment_uuid !== $claim->deploymentUuid
                 || $state->operation_deployment_uuid !== $claim->deploymentUuid
                 || $state->operation_destination_fence_epoch !== $claim->destinationFenceEpoch
-                || $state->operation_topology_digest !== $claim->topologyDigest
+                || $state->operation_topology_digest !== $claim->operationTopologyDigest
                 || $state->operation_routing_config_digest !== $claim->routingConfigDigest
                 || $state->supersession_generation !== $claim->supersessionGeneration
                 || $deployment->blue_green_color !== $claim->pendingColor
                 || $deployment->blue_green_phase !== $state->phase
                 || $deployment->blue_green_routing_revision !== $claim->expectedRoutingRevision
                 || $deployment->blue_green_destination_fence_epoch !== $claim->destinationFenceEpoch
-                || $deployment->blue_green_topology_digest !== $claim->topologyDigest
+                || $deployment->blue_green_topology_digest !== $claim->operationTopologyDigest
                 || $deployment->blue_green_routing_config_digest !== $claim->routingConfigDigest) {
                 throw new BlueGreenDeploymentTransitionException('The candidate identity no longer belongs to the exact pending operation.');
             }
@@ -71,7 +71,7 @@ final class RecordBlueGreenCandidateIdentity
                 ->whereNull('operation_candidate_container_id')
                 ->where('operation_deployment_uuid', $claim->deploymentUuid)
                 ->where('operation_destination_fence_epoch', $claim->destinationFenceEpoch)
-                ->where('operation_topology_digest', $claim->topologyDigest)
+                ->where('operation_topology_digest', $claim->operationTopologyDigest)
                 ->where('operation_routing_config_digest', $claim->routingConfigDigest)
                 ->whereNull('deactivation_operation_id')
                 ->whereNull('deactivation_started_at')
@@ -99,7 +99,7 @@ final class RecordBlueGreenCandidateIdentity
                 ->where('blue_green_supersession_generation', $claim->supersessionGeneration)
                 ->whereNull('blue_green_candidate_container_id')
                 ->where('blue_green_destination_fence_epoch', $claim->destinationFenceEpoch)
-                ->where('blue_green_topology_digest', $claim->topologyDigest)
+                ->where('blue_green_topology_digest', $claim->operationTopologyDigest)
                 ->where('blue_green_routing_config_digest', $claim->routingConfigDigest);
             $deploymentQuery = BlueGreenLifecycleDatabaseLocks::constrainQueueStatus(
                 $deploymentQuery,

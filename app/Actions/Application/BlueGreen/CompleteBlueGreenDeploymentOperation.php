@@ -2,6 +2,7 @@
 
 namespace App\Actions\Application\BlueGreen;
 
+use App\Actions\Proxy\BlueGreenProxyState;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
@@ -57,14 +58,14 @@ final class CompleteBlueGreenDeploymentOperation
                 && $state->destination_fence_operation_id === $claim->deploymentUuid
                 && $state->destination_fence_mutation_sequence > 0
                 && $state->managed_file_sha256 !== null
-                && $state->destination_topology_digest === $claim->topologyDigest
+                && $state->destination_topology_digest === $claim->operationTopologyDigest
                 && is_string($state->application_routing_config_digest)
                 && preg_match('/^[a-f0-9]{64}$/D', $state->application_routing_config_digest) === 1
                 && $deployment->blue_green_color === $claim->pendingColor
                 && $deployment->blue_green_routing_revision === $claim->expectedRoutingRevision
                 && $deployment->blue_green_destination_fence_epoch === $claim->destinationFenceEpoch
                 && $deployment->blue_green_server_boot_id === $claim->serverBootId
-                && $deployment->blue_green_topology_digest === $claim->topologyDigest
+                && $deployment->blue_green_topology_digest === $claim->operationTopologyDigest
                 && $deployment->blue_green_routing_config_digest === $claim->routingConfigDigest
                 && $deployment->blue_green_backend_port_inventory === $claim->backendPortInventory->serialized
                 && $deployment->blue_green_drain_backend_port_inventory === $claim->drainBackendPortInventory?->serialized
@@ -104,9 +105,11 @@ final class CompleteBlueGreenDeploymentOperation
             }
             $locks->assertDeploymentOwner($claim, $deployment);
 
-            $expectedPreviousContainerName = $claim->previousActiveColor === null
-                ? $claim->legacyContainerName
-                : $application->uuid.'-'.$claim->previousActiveColor->value;
+            $expectedPreviousContainerName = $this->expectedPreviousContainerName(
+                $claim,
+                $state,
+                $operation,
+            );
             $completionPhase = $state->phase;
             if (! $isExactFinalizationCycle
                 || $state->legacy_container_name !== $claim->legacyContainerName
@@ -114,7 +117,7 @@ final class CompleteBlueGreenDeploymentOperation
                 || $state->operation_deployment_uuid !== $claim->deploymentUuid
                 || $state->operation_destination_fence_epoch !== $claim->destinationFenceEpoch
                 || $state->operation_server_boot_id !== $claim->serverBootId
-                || $state->operation_topology_digest !== $claim->topologyDigest
+                || $state->operation_topology_digest !== $claim->operationTopologyDigest
                 || $state->operation_routing_config_digest !== $claim->routingConfigDigest
                 || $state->operation_previous_active_color !== $claim->previousActiveColor
                 || $state->operation_previous_container_name !== $expectedPreviousContainerName
@@ -161,7 +164,7 @@ final class CompleteBlueGreenDeploymentOperation
                     'inactive_retirement_supersession_generation' => $claim->supersessionGeneration,
                     'inactive_retirement_destination_fence_epoch' => $state->destination_fence_epoch,
                     'inactive_retirement_server_boot_id' => $claim->serverBootId,
-                    'inactive_retirement_topology_digest' => $claim->topologyDigest,
+                    'inactive_retirement_topology_digest' => $claim->operationTopologyDigest,
                     'inactive_retirement_routing_config_digest' => $state->application_routing_config_digest,
                     'inactive_retirement_not_before_at' => $notBeforeAt,
                     'inactive_retirement_drain_deadline_at' => $notBeforeAt->copy()->addSeconds(
@@ -186,7 +189,7 @@ final class CompleteBlueGreenDeploymentOperation
                 ->where('destination_fence_epoch', '>=', $claim->destinationFenceEpoch)
                 ->where('destination_fence_operation_id', $claim->deploymentUuid)
                 ->where('operation_server_boot_id', $claim->serverBootId)
-                ->where('destination_topology_digest', $claim->topologyDigest)
+                ->where('destination_topology_digest', $claim->operationTopologyDigest)
                 ->whereNotNull('application_routing_config_digest')
                 ->whereNull('deactivation_operation_id')
                 ->whereNull('deactivation_started_at')
@@ -225,7 +228,7 @@ final class CompleteBlueGreenDeploymentOperation
                 ->where('blue_green_routing_revision', $claim->expectedRoutingRevision)
                 ->where('blue_green_destination_fence_epoch', $claim->destinationFenceEpoch)
                 ->where('blue_green_server_boot_id', $claim->serverBootId)
-                ->where('blue_green_topology_digest', $claim->topologyDigest)
+                ->where('blue_green_topology_digest', $claim->operationTopologyDigest)
                 ->where('blue_green_routing_config_digest', $claim->routingConfigDigest)
                 ->where('blue_green_candidate_container_id', $state->operation_candidate_container_id);
             $deploymentUpdated = BlueGreenLifecycleDatabaseLocks::constrainDeploymentQueueOwner(
@@ -254,6 +257,49 @@ final class CompleteBlueGreenDeploymentOperation
         }
 
         return true;
+    }
+
+    private function expectedPreviousContainerName(
+        BlueGreenDeploymentClaim $claim,
+        ApplicationBlueGreenDeployment $state,
+        ?BlueGreenDeploymentRecoveryOperation $operation,
+    ): ?string {
+        if ($claim->previousActiveColor === null) {
+            return $claim->legacyContainerName;
+        }
+        if ($operation !== null) {
+            return $operation->previousDurableContainerName();
+        }
+
+        $previousStateBytes = $state->operation_previous_proxy_state;
+        $previousStateSha256 = $state->operation_previous_proxy_state_sha256;
+        if (! is_string($previousStateBytes)
+            || ! is_string($previousStateSha256)
+            || ! hash_equals($previousStateSha256, hash('sha256', $previousStateBytes))) {
+            throw new BlueGreenDeploymentTransitionException('The finalized operation has no valid persisted predecessor proxy state.');
+        }
+
+        try {
+            $previousState = BlueGreenProxyState::parse($previousStateBytes);
+        } catch (\Throwable $exception) {
+            throw new BlueGreenDeploymentTransitionException(
+                'The finalized operation has an invalid persisted predecessor proxy state.',
+                0,
+                $exception,
+            );
+        }
+        if ($previousState->managedFilename !== $claim->rollbackManagedFilename
+            || $previousState->destinationId !== $claim->standaloneDockerId
+            || $previousState->managedSha256 !== $state->operation_previous_managed_file_sha256
+            || $previousState->destinationFenceEpoch !== $state->operation_previous_destination_fence_epoch
+            || $previousState->activeColor !== $claim->previousActiveColor
+            || $previousState->activeDeploymentUuid !== $state->operation_previous_deployment_uuid
+            || ! is_string($previousState->activeContainerName)
+            || $previousState->activeSetFenceIdentity() !== $state->operation_previous_container_id) {
+            throw new BlueGreenDeploymentTransitionException('The finalized operation predecessor does not match its durable proxy state.');
+        }
+
+        return $previousState->activeContainerName;
     }
 
     private function legacyRoutingSnapshotMatches(
@@ -300,9 +346,9 @@ final class CompleteBlueGreenDeploymentOperation
             && $operation->destination->id === $state->standalone_docker_id
             && $operation->server->id === (int) $deployment->server_id
             && $operation->deployment->getKey() === $deployment->getKey()
-            && $operation->previousContainer?->name === $state->operation_previous_container_name
-            && $operation->previousContainer?->dockerId === $state->operation_previous_container_id
-            && $operation->candidateContainer->dockerId === $state->operation_candidate_container_id
+            && $operation->previousDurableContainerName() === $state->operation_previous_container_name
+            && $operation->previousFenceIdentity() === $state->operation_previous_container_id
+            && $operation->candidateFenceIdentity() === $state->operation_candidate_container_id
             && $operation->rollbackKey->managedFilename() === $state->operation_rollback_managed_filename;
     }
 }
