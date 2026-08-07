@@ -1984,6 +1984,17 @@ SH;
         try {
             $operationFence->assertLockOwnership();
 
+            $operationJournalRecovery = $this->resumeUnreconstructableFixedColorOperationJournal(
+                $plan,
+                $reason,
+                $context,
+                $operationFence,
+            );
+            if ($operationJournalRecovery !== null) {
+                return $operationJournalRecovery;
+            }
+            $operationFence->assertLockOwnership();
+
             $spentFirstAdoptionDrainJournal = null;
             try {
                 $spentFirstAdoptionDrainJournal = QuarantineSpentFirstAdoptionDrainJournal::run(
@@ -2074,6 +2085,176 @@ SH;
         } finally {
             $this->releaseStateFence($operationFence);
         }
+    }
+
+    /**
+     * A generic container-mutation journal is only recoverable here when it
+     * belongs to the exact parked fixed-color operation. Its embedded commands
+     * are never replayed: the operation-aware reader authenticates the state
+     * transition, archives the sidecar with a CAS, and the reopened owner gets
+     * one ordinary fenced resume.
+     *
+     * @param  array{application: Application, destination: StandaloneDocker, server: Server, state: ApplicationBlueGreenDeployment}  $context
+     */
+    private function resumeUnreconstructableFixedColorOperationJournal(
+        BlueGreenInterventionRecoveryPlan $plan,
+        string $reason,
+        array $context,
+        BlueGreenOperationFence $operationFence,
+    ): ?BlueGreenInterventionRecoveryResult {
+        $state = $this->unreconstructableFinalizedOwnerForOperationJournal(
+            (int) $context['state']->getKey(),
+        );
+        if (! $state->operation_previous_active_color instanceof BlueGreenDeploymentColor) {
+            return null;
+        }
+        $operationUuid = $state->operation_deployment_uuid;
+        if (! is_string($operationUuid)) {
+            throw new BlueGreenDeploymentTransitionException('The unreconstructable fixed-color intervention has no exact durable operation owner.');
+        }
+
+        try {
+            $operationFence->assertLockOwnership();
+            $reader = new ReadBlueGreenManagedRouteMetadataForOperation;
+            $inspection = $reader->handle(
+                $context['server'],
+                $context['application'],
+                $context['destination'],
+                $operationUuid,
+            );
+            if ($inspection->isAbsent()) {
+                return null;
+            }
+
+            $expectedState = $inspection->expectedState;
+            if ($expectedState === null
+                || ! $this->matchesDurableDestinationState($state, $expectedState)) {
+                throw new BlueGreenDeploymentTransitionException('The fixed-color container-mutation journal does not begin at the exact durable destination state.');
+            }
+            $replacementState = $inspection->replacementState
+                ?? throw new BlueGreenDeploymentTransitionException('The fixed-color container-mutation journal has no exact replacement state.');
+            $committedReplacement = $inspection->hasCommittedReplacementSidecar();
+            if (! $committedReplacement && ! $inspection->hasPendingExpectedSidecar()) {
+                throw new BlueGreenDeploymentTransitionException('The fixed-color container-mutation journal has an unsupported sidecar state.');
+            }
+
+            $operationFence->assertLockOwnership();
+            $journalState = $committedReplacement
+                ? $reader->archiveCommittedReplacementSidecar(
+                    $context['server'],
+                    $context['application'],
+                    $context['destination'],
+                    $operationUuid,
+                    $inspection,
+                )
+                : $reader->archivePendingExpectedSidecar(
+                    $context['server'],
+                    $context['application'],
+                    $context['destination'],
+                    $operationUuid,
+                    $inspection,
+                );
+            $operationFence->assertLockOwnership();
+            if ($journalState === null) {
+                throw new BlueGreenDeploymentTransitionException('The fixed-color container-mutation journal has no durable route state to resume.');
+            }
+
+            $liveState = ReadBlueGreenManagedRouteMetadata::run(
+                $context['server'],
+                $context['application'],
+                $context['destination'],
+            );
+            if ($liveState === null
+                || ! hash_equals($journalState->serialize(), $liveState->serialize())) {
+                throw new BlueGreenDeploymentTransitionException('The fixed-color container-mutation journal archival did not leave its exact authenticated route state live.');
+            }
+            if (! $committedReplacement && ! $this->liveRouteProvesFinalizedGeneration($state, $liveState)) {
+                throw new BlueGreenDeploymentTransitionException('The pending fixed-color container-mutation journal did not preserve the exact finalized route generation.');
+            }
+
+            $queueId = $this->reopenFinalizedState(
+                (int) $state->getKey(),
+                $committedReplacement ? $expectedState : null,
+                $committedReplacement ? $replacementState : null,
+            );
+            $operationFence->assertLockOwnership();
+            ResumeBlueGreenDrainingDeploymentJob::dispatch($queueId);
+            $this->audit('blue_green.intervention.fixed_color_container_journal_resumed', $plan, $reason, [
+                'active_color' => $liveState->activeColor?->value,
+                'journal_sha256' => $inspection->journalSha256,
+                'sidecar_status' => $inspection->status,
+                'queue_id' => $queueId,
+            ]);
+
+            return new BlueGreenInterventionRecoveryResult(
+                classification: $plan->classification,
+                outcome: BlueGreenInterventionRecoveryResult::DEFERRED,
+                message: 'The exact fixed-color container-mutation journal was archived without replay, its authenticated route state was re-proven, and the same fenced drain owner was resumed.',
+                stateId: (int) $state->getKey(),
+                activeColor: $liveState->activeColor?->value,
+                recoveryOwnerActive: true,
+            );
+        } catch (BlueGreenOperationFenceLostException $exception) {
+            throw $exception;
+        } catch (\Throwable $exception) {
+            $this->audit('blue_green.intervention.fixed_color_container_journal_deferred', $plan, $reason, [
+                'message' => $exception->getMessage(),
+            ]);
+
+            return new BlueGreenInterventionRecoveryResult(
+                classification: $plan->classification,
+                outcome: BlueGreenInterventionRecoveryResult::DEFERRED,
+                message: 'The fixed-color container-mutation journal could not be authenticated and archived for the exact parked owner, so no resume or terminalization was attempted: '.$exception->getMessage(),
+                stateId: (int) $state->getKey(),
+            );
+        }
+    }
+
+    /**
+     * Re-proves the parked operation under the database destination fence
+     * immediately before its journal is inspected remotely. The inspection may
+     * only speak for this exact failed DRAINING owner, never whichever state
+     * acquired the destination after the scheduler chose it.
+     */
+    private function unreconstructableFinalizedOwnerForOperationJournal(
+        int $stateId,
+    ): ApplicationBlueGreenDeployment {
+        return DB::transaction(function () use ($stateId): ApplicationBlueGreenDeployment {
+            $identity = ApplicationBlueGreenDeployment::query()->findOrFail($stateId);
+            $locks = BlueGreenLifecycleDatabaseLocks::forDestination(
+                $identity->application_id,
+                $identity->standalone_docker_id,
+            );
+            $state = $locks->state;
+            if ($state === null
+                || (int) $state->getKey() !== $stateId
+                || $locks->application->trashed()) {
+                throw new BlueGreenDeploymentTransitionException('The unreconstructable fixed-color intervention owner changed before its journal could be inspected.');
+            }
+            $operationUuid = $state->operation_deployment_uuid;
+            $deployment = is_string($operationUuid) ? $locks->queue($operationUuid) : null;
+            if (self::deactivationFencesRecovery($locks->deactivation, $deployment)) {
+                throw new BlueGreenDeploymentTransitionException('The unreconstructable fixed-color intervention owner is fenced by a durable deactivation.');
+            }
+            if ($this->requiredOperationUuid !== null && $this->requiredOperationUuid !== $operationUuid) {
+                throw new BlueGreenDeploymentTransitionException('The requested unreconstructable operation no longer owns this destination before its journal could be inspected.');
+            }
+            $this->assertUnreconstructableFinalizedIntervention($state, $deployment);
+
+            return $state;
+        }, attempts: 5);
+    }
+
+    private function matchesDurableDestinationState(
+        ApplicationBlueGreenDeployment $state,
+        BlueGreenProxyState $destinationState,
+    ): bool {
+        return $state->destination_fence_epoch === $destinationState->destinationFenceEpoch
+            && $state->destination_fence_operation_id === $destinationState->operationId
+            && $state->destination_fence_mutation_sequence === $destinationState->mutationSequence
+            && $state->managed_file_sha256 === $destinationState->managedSha256
+            && $state->destination_topology_digest === $destinationState->destinationTopologyDigest
+            && $state->application_routing_config_digest === $destinationState->applicationRoutingConfigDigest;
     }
 
     private function recoverMidFlight(
@@ -2733,9 +2914,20 @@ SH;
         );
     }
 
-    private function reopenFinalizedState(int $stateId): int
-    {
-        return DB::transaction(function () use ($stateId): int {
+    private function reopenFinalizedState(
+        int $stateId,
+        ?BlueGreenProxyState $committedJournalExpectedState = null,
+        ?BlueGreenProxyState $committedJournalReplacementState = null,
+    ): int {
+        if (($committedJournalExpectedState === null) !== ($committedJournalReplacementState === null)) {
+            throw new InvalidArgumentException('A committed fixed-color journal recovery requires both exact destination states.');
+        }
+
+        return DB::transaction(function () use (
+            $committedJournalExpectedState,
+            $committedJournalReplacementState,
+            $stateId,
+        ): int {
             $identity = ApplicationBlueGreenDeployment::query()->findOrFail($stateId);
             $locks = BlueGreenLifecycleDatabaseLocks::forDestination(
                 $identity->application_id,
@@ -2799,6 +2991,34 @@ SH;
                 || ! $operation->routingMutationRecorded
                 || $operation->currentDestinationState === null) {
                 throw new BlueGreenDeploymentTransitionException('The finalized intervention cannot reconstruct one exact routed DRAINING operation.');
+            }
+            if ($committedJournalExpectedState !== null
+                && $committedJournalReplacementState !== null) {
+                if (! hash_equals(
+                    $committedJournalExpectedState->serialize(),
+                    $operation->currentDestinationState->serialize(),
+                )) {
+                    throw new BlueGreenDeploymentTransitionException('The committed fixed-color journal no longer begins at the exact reopened destination state.');
+                }
+                RecordBlueGreenDestinationState::run(
+                    $operation->claim,
+                    $committedJournalExpectedState,
+                    $committedJournalReplacementState,
+                );
+                $recordedState = ApplicationBlueGreenDeployment::query()->findOrFail($stateId);
+                if (! $this->liveRouteProvesFinalizedGeneration(
+                    $recordedState,
+                    $committedJournalReplacementState,
+                )) {
+                    throw new BlueGreenDeploymentTransitionException('The committed fixed-color journal replacement does not prove the exact reopened finalized generation.');
+                }
+                $operation = ReconstructBlueGreenDeploymentRecovery::run($recordedState);
+                if (! $operation->wasFinalized
+                    || $operation->recoveredPhase !== BlueGreenDeploymentPhase::DRAINING
+                    || ! $operation->routingMutationRecorded
+                    || $operation->currentDestinationState === null) {
+                    throw new BlueGreenDeploymentTransitionException('The committed fixed-color journal did not leave one exact routed DRAINING operation.');
+                }
             }
 
             return (int) $deployment->id;
