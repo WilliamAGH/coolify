@@ -55,6 +55,7 @@ All notable changes to this project will be documented in this file.
 - Update changelog
 - Update changelog
 - Update changelog
+- Update changelog
 
 ### 🧪 Testing
 
@@ -69,6 +70,7 @@ All notable changes to this project will be documented in this file.
 - *(api)* Pin the nullable recovery failure fields in the generated OpenAPI documents
 - *(blue-green)* Exercise shared fan-out fence matcher
 - *(blue-green)* Pin fence tests to the shared released fan-out contract
+- *(blue-green)* Prove every co-rolled legacy route
 
 ## [4.13.76-fork] - 2026-08-07
 
