@@ -3,7 +3,10 @@
 use App\Models\Application;
 use App\Models\Server;
 use App\Support\ValidationPatterns;
+use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Validator;
+
+uses(RefreshDatabase::class);
 
 /**
  * A factory must produce a model the product's own validation accepts.
