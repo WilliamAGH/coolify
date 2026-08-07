@@ -170,6 +170,12 @@ function loginAsRoot(): mixed
 - Treat shared production infrastructure as read-only during repository work. A failing CI or release check does not authorize changes to Nexus repository policies, registry routing or authentication, Coolify service configuration, DNS, GitHub rulesets, or Actions runner groups.
 - Resolve infrastructure-policy mismatches in repository-owned workflow, code, or configuration, or report the exact blocker. Follow `docs/operations/shared-production-change-control.md` for the required boundary and recovery procedure.
 
+### npm Audit Remediation
+
+- When `npm audit` flags a transitive package and its declared parent dependency already permits the patched version, update only that transitive resolution in `package-lock.json`. Keep `package.json` and all direct dependency pins unchanged.
+- Verify that the dependency diff contains only the expected lock entry, then run `npm ci`, `npm audit --audit-level=high`, `npm test`, and `npm run build`.
+- Never weaken or bypass the audit gate. Never reuse or move an already-pushed signed fork tag; advance to the next fork version.
+
 <laravel-boost-guidelines>
 === foundation rules ===
 
