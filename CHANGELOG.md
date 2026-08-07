@@ -57,6 +57,7 @@ All notable changes to this project will be documented in this file.
 - Update changelog
 - Update changelog
 - Update changelog
+- Update changelog
 
 ### 🧪 Testing
 
@@ -73,6 +74,8 @@ All notable changes to this project will be documented in this file.
 - *(blue-green)* Pin fence tests to the shared released fan-out contract
 - *(blue-green)* Prove every co-rolled legacy route
 - *(blue-green)* Align released-v3 migration and cancellation-cleanup tests with the split digests and sanitized diagnostics
+- *(blue-green)* Seed retirement settings per file
+- *(blue-green)* Keep PostgreSQL validation within its timeout
 
 ## [4.13.76-fork] - 2026-08-07
 
