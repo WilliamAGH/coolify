@@ -56,6 +56,7 @@ All notable changes to this project will be documented in this file.
 - Update changelog
 - Update changelog
 - Update changelog
+- Update changelog
 
 ### 🧪 Testing
 
@@ -71,6 +72,7 @@ All notable changes to this project will be documented in this file.
 - *(blue-green)* Exercise shared fan-out fence matcher
 - *(blue-green)* Pin fence tests to the shared released fan-out contract
 - *(blue-green)* Prove every co-rolled legacy route
+- *(blue-green)* Align released-v3 migration and cancellation-cleanup tests with the split digests and sanitized diagnostics
 
 ## [4.13.76-fork] - 2026-08-07
 
