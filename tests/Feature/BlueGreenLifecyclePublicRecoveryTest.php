@@ -64,8 +64,9 @@ KEY;
         'private_key' => $privateKeyContent,
         'team_id' => $team->id,
     ]);
-    Storage::fake('ssh-keys');
-    Storage::disk('ssh-keys')->put(
+    $sshKeys = Storage::fake('lifecycle-public-recovery-ssh-keys-'.getmypid());
+    app('filesystem')->set('ssh-keys', $sshKeys);
+    $sshKeys->put(
         "ssh_key@{$privateKey->uuid}",
         $privateKey->private_key,
     );
