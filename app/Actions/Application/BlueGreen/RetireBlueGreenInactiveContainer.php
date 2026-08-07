@@ -518,7 +518,7 @@ final class RetireBlueGreenInactiveContainer
                 $transientStatuses,
             );
         }
-        if (collect($inspections)->every(
+        if (! $isFinalAttempt && collect($inspections)->every(
             static fn (BlueGreenReplicaInspection $inspection): bool => self::isTerminalStoppedStatus($inspection->status),
         )) {
             if ($this->attestDestinationState($server, $replacementState)) {

@@ -1,5 +1,6 @@
 <?php
 
+use App\Actions\Application\BlueGreen\BlueGreenAmbiguousDestinationMutationException;
 use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
 use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
@@ -48,6 +49,7 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Process\FakeProcessResult;
 use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Exceptions;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Storage;
@@ -1868,6 +1870,15 @@ function fakePendingExpectedSidecarInactiveRetirementRemote(
             return Process::result(output: $connections."\n");
         }
         if (str_contains($payload, 'coolify-blue-green-destination-state-attested')) {
+            if ($journalPresent) {
+                // The real attestation script fences on a pending
+                // container-mutation journal before attesting anything.
+                return Process::result(
+                    errorOutput: WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT,
+                    exitCode: 75,
+                );
+            }
+
             return Process::result(output: 'coolify-blue-green-destination-state-attested');
         }
         if (str_contains($payload, "docker ps -a --filter='label=coolify.applicationId=")) {
@@ -3557,6 +3568,7 @@ it('idempotently archives and regenerates the same timed-out inactive-retirement
 
 it('queues a bounded retry when the inactive-container destination mutation result is ambiguous', function (): void {
     ['application' => $application, 'owner' => $owner, 'state' => $state] = makeReadyBlueGreenInactiveRetirement();
+    Exceptions::fake();
     $bootId = (string) $state->inactive_retirement_server_boot_id;
     $expectedState = ResolveBlueGreenExpectedProxyState::run(
         $application,
@@ -3596,18 +3608,29 @@ it('queues a bounded retry when the inactive-container destination mutation resu
 
     $state = $state->fresh();
     $logs = (string) $owner->fresh()->logs;
+    $correlationMatches = [];
+    expect(preg_match('/reason=ambiguous_mutation correlation_id=([a-f0-9-]{36})/', $logs, $correlationMatches))
+        ->toBe(1);
+    $correlationId = $correlationMatches[1] ?? throw new RuntimeException('The ambiguous retirement log requires a correlation ID.');
     expect($state->inactive_retirement_attempts)->toBe(1)
         ->and($state->inactive_retirement_intervention_required_at)->toBeNull()
         ->and($state->inactive_retirement_stopped_at)->toBeNull()
         ->and($logs)->toContain('ambiguous destination mutation result; queued a bounded retirement retry')
-        ->and($logs)->toContain('Reason: ambiguous_mutation.')
-        ->and($logs)->toMatch('/Correlation: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/')
+        ->toContain('reason=ambiguous_mutation')
         ->and($logs)->not->toContain('Error response from daemon: transport reset during stop');
+    Exceptions::assertReported(function (BlueGreenAmbiguousDestinationMutationException $reported) use ($correlationId): bool {
+        $remoteMessage = $reported->getPrevious()?->getPrevious()?->getMessage();
+
+        return $reported->getMessage() === "reason=ambiguous_mutation correlation_id={$correlationId}"
+            && is_string($remoteMessage)
+            && str_contains($remoteMessage, 'Error response from daemon: transport reset during stop');
+    });
 });
 
 it('marks intervention with a stable correlation identifier once the ambiguous mutation budget is exhausted', function (): void {
     ['application' => $application, 'owner' => $owner, 'state' => $state] = makeReadyBlueGreenInactiveRetirement();
     $state->update(['inactive_retirement_attempts' => RetireBlueGreenInactiveContainer::MAX_ATTEMPTS - 1]);
+    Exceptions::fake();
     $bootId = (string) $state->inactive_retirement_server_boot_id;
     InspectBlueGreenContainer::shouldRun()
         ->once()
@@ -3638,13 +3661,23 @@ it('marks intervention with a stable correlation identifier once the ambiguous m
 
     $state = $state->fresh();
     $logs = (string) $owner->fresh()->logs;
+    $correlationMatches = [];
+    expect(preg_match('/reason=ambiguous_mutation correlation_id=([a-f0-9-]{36})/', $logs, $correlationMatches))
+        ->toBe(1);
+    $correlationId = $correlationMatches[1] ?? throw new RuntimeException('The intervention retirement log requires a correlation ID.');
     expect($state->inactive_retirement_attempts)->toBe(RetireBlueGreenInactiveContainer::MAX_ATTEMPTS)
         ->and($state->inactive_retirement_intervention_required_at)->not->toBeNull()
         ->and($state->inactive_retirement_stopped_at)->toBeNull()
         ->and($logs)->toContain('Inactive blue-green retirement requires intervention')
-        ->and($logs)->toContain('Reason: ambiguous_mutation.')
-        ->and($logs)->toMatch('/Correlation: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/')
+        ->toContain('reason=ambiguous_mutation')
         ->and($logs)->not->toContain('Error response from daemon: removal already in progress');
+    Exceptions::assertReported(function (BlueGreenAmbiguousDestinationMutationException $reported) use ($correlationId): bool {
+        $remoteMessage = $reported->getPrevious()?->getPrevious()?->getMessage();
+
+        return $reported->getMessage() === "reason=ambiguous_mutation correlation_id={$correlationId}"
+            && is_string($remoteMessage)
+            && str_contains($remoteMessage, 'Error response from daemon: removal already in progress');
+    });
 });
 
 it('replays a pending inactive-retirement journal on an ordinary bounded retry instead of requiring intervention', function (): void {
@@ -4278,10 +4311,9 @@ it('removes an exact transient scalar target on the final bounded retirement att
     'unknown' => 'unknown',
 ]);
 
-it('removes every remaining member on the final bounded replica retirement attempt', function (string $status): void {
+it('removes every existing member on the final bounded replica retirement attempt', function (array $statuses): void {
     ['application' => $application, 'owner' => $owner, 'state' => $state, 'inspections' => $inspections] = makeReadyBlueGreenInactiveReplicaRetirement([
-        ContainerStatusTypes::RUNNING->value,
-        $status,
+        ...$statuses,
     ]);
     $state->update(['inactive_retirement_attempts' => RetireBlueGreenInactiveContainer::MAX_ATTEMPTS - 1]);
     $state = $state->fresh();
@@ -4385,11 +4417,12 @@ it('removes every remaining member on the final bounded replica retirement attem
             ->get()
             ->every(static fn (ApplicationBlueGreenReplica $replica): bool => $replica->health_status === 'stopped'))->toBeTrue();
 })->with([
-    'restarting member' => ContainerStatusTypes::RESTARTING->value,
-    'paused member' => ContainerStatusTypes::PAUSED->value,
-    'created member' => ContainerStatusTypes::CREATED->value,
-    'removing member' => ContainerStatusTypes::REMOVING->value,
-    'unknown member' => 'unknown',
+    'restarting member' => [[ContainerStatusTypes::RUNNING->value, ContainerStatusTypes::RESTARTING->value]],
+    'paused member' => [[ContainerStatusTypes::RUNNING->value, ContainerStatusTypes::PAUSED->value]],
+    'created member' => [[ContainerStatusTypes::RUNNING->value, ContainerStatusTypes::CREATED->value]],
+    'removing member' => [[ContainerStatusTypes::RUNNING->value, ContainerStatusTypes::REMOVING->value]],
+    'unknown member' => [[ContainerStatusTypes::RUNNING->value, 'unknown']],
+    'all terminal exited and dead members' => [[ContainerStatusTypes::EXITED->value, ContainerStatusTypes::DEAD->value]],
 ]);
 
 it('keeps exact replica ledgers unchanged when the destination fence CAS drifts after remote proof', function (): void {
