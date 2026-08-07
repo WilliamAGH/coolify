@@ -17,6 +17,7 @@ git init "$source_repository" >/dev/null
 git -C "$source_repository" config user.name 'Release Test'
 git -C "$source_repository" config user.email 'release-test@example.invalid'
 git -C "$source_repository" config commit.gpgSign false
+git -C "$source_repository" config gpg.format openpgp
 git -C "$source_repository" config gpg.ssh.program ssh-keygen
 ssh-keygen -q -t ed25519 -N '' -f "$allowed_key"
 ssh-keygen -q -t ed25519 -N '' -f "$unlisted_key"
@@ -34,9 +35,8 @@ create_signed_tag()
   tag=$1
   signing_key=$2
   tag_revision=${3:-$source_revision}
-  git -C "$source_repository" config gpg.format ssh
   git -C "$source_repository" config user.signingkey "$signing_key"
-  git -C "$source_repository" tag -s -m "$tag" "$tag" "$tag_revision"
+  git -C "$source_repository" -c gpg.format=ssh tag -s -m "$tag" "$tag" "$tag_revision"
   git -C "$source_repository" push --force "$remote" "refs/tags/$tag" >/dev/null
 }
 
@@ -49,6 +49,7 @@ git -C "$source_repository" commit -m 'remove canonical signer inventory' >/dev/
 missing_inventory_revision=$(git -C "$source_repository" rev-parse HEAD)
 create_signed_tag 4.13.6-fork "$allowed_key" "$missing_inventory_revision"
 git init "$verification_repository" >/dev/null
+git -C "$verification_repository" config gpg.format openpgp
 mkdir -p "$verification_repository/docker"
 printf 'release-test@example.invalid %s\n' "$(cat "$allowed_key.pub")" > "$verification_repository/docker/fork-release-tag-allowed-signers"
 

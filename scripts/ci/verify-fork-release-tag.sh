@@ -48,4 +48,5 @@ inventory_object=$(printf '%s\n' "$inventory_entry" | awk '{ print $3 }')
 [[ "$inventory_object" =~ ^[0-9a-f]{40,64}$ ]]
 git show "$tag_target:$allowed_signers_file" > "$allowed_signers_snapshot"
 [[ -s "$allowed_signers_snapshot" ]]
-git -c gpg.ssh.allowedSignersFile="$allowed_signers_snapshot" verify-tag "$verification_ref"
+git -c gpg.format=ssh \
+  -c gpg.ssh.allowedSignersFile="$allowed_signers_snapshot" verify-tag "$verification_ref"

@@ -1,12 +1,12 @@
-# Submit a frozen v4.x candidate to its trusted GitHub Actions gate.
+# Publish an exact signed fork release from the staging tip.
 .PHONY: ship ship-status
 
-ship: ## Submit the committed v4.x snapshot (SHIP_DRY_RUN=1 previews without network or mutation)
-	@scripts/dev/ship.sh $(if $(filter 1,$(SHIP_DRY_RUN)),--dry-run)
-
-ship-status: ## Watch an exact candidate gate (FOLLOW=<sha> CANDIDATE_REF=<ref> BASE_SHA=<sha>)
-	@FOLLOW='$(FOLLOW)' CANDIDATE_REF='$(CANDIDATE_REF)' BASE_SHA='$(BASE_SHA)' \
-	  WATCH='$(WATCH)' HISTORY='$(HISTORY)' HISTORY_N='$(HISTORY_N)' \
-	  SHIP_STATUS_DISCOVERY_ATTEMPTS='$(SHIP_STATUS_DISCOVERY_ATTEMPTS)' \
+ship: ## Sign, push, and watch a fork tag from clean staging (SHIP_DRY_RUN=1 previews only)
+	@SHIP_STATUS_DISCOVERY_ATTEMPTS='$(SHIP_STATUS_DISCOVERY_ATTEMPTS)' \
 	  SHIP_STATUS_DISCOVERY_DELAY_SECONDS='$(SHIP_STATUS_DISCOVERY_DELAY_SECONDS)' \
-	  scripts/dev/ship.sh status
+	  SHIP_STATUS_LIMIT='$(SHIP_STATUS_LIMIT)' \
+	  scripts/dev/ship.sh $(if $(filter 1,$(SHIP_DRY_RUN)),--dry-run)
+
+ship-status: ## Report one exact publish run (SHIP_TAG=X.Y.Z-fork SHIP_SHA=<40-hex>)
+	@SHIP_STATUS_LIMIT='$(SHIP_STATUS_LIMIT)' \
+	  scripts/dev/ship.sh status --tag '$(SHIP_TAG)' --sha '$(SHIP_SHA)'
