@@ -2425,6 +2425,13 @@ class ApplicationsController extends Controller
             new OA\Response(
                 response: 409,
                 description: 'No exact active application container image is observable.',
+                content: new OA\JsonContent(
+                    required: ['message'],
+                    properties: [
+                        new OA\Property(property: 'message', type: 'string'),
+                    ],
+                    type: 'object',
+                ),
             ),
         ],
     )]

@@ -2075,6 +2075,14 @@ paths:
           $ref: '#/components/responses/404'
         '409':
           description: 'No exact active application container image is observable.'
+          content:
+            application/json:
+              schema:
+                required:
+                  - message
+                properties:
+                  message: { type: string }
+                type: object
       security:
         -
           bearerAuth: []
@@ -5462,6 +5470,61 @@ paths:
               schema:
                 properties:
                   message: { type: string, example: 'You do not have permission to cancel this deployment.' }
+                type: object
+        '404':
+          $ref: '#/components/responses/404'
+      security:
+        -
+          bearerAuth: []
+  '/deployments/{uuid}/recover':
+    post:
+      tags:
+        - Deployments
+      summary: 'Emergency recover deployment'
+      description: 'Break-glass recovery for a hanging deployment: cancels the exact queue entry and clears the durable blue-green residue that would otherwise fence the next deployment. Ordinary deployments recover automatically and do not need this.'
+      operationId: recover-deployment-by-uuid
+      parameters:
+        -
+          name: uuid
+          in: path
+          description: 'Deployment UUID'
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 'Recovery attempted.'
+          content:
+            application/json:
+              schema:
+                required:
+                  - deployment_uuid
+                  - status
+                  - cancelled
+                  - outcome
+                  - message
+                  - claimable
+                  - recovery_owner_active
+                properties:
+                  deployment_uuid: { type: string }
+                  status: { type: string }
+                  cancelled: { type: boolean }
+                  outcome: { type: string, enum: [clean, deferred, manual_only] }
+                  message: { type: string }
+                  claimable: { description: 'True when the next ordinary deployment can claim this destination.', type: boolean }
+                  recovery_owner_active: { description: 'True when an owner is driving this destination — a fenced recovery job that was queued, or a live lifecycle owner already holding the destination lock — which is why the queue entry was left running. False on a deferred outcome means nothing is driving it and the hanging entry was released instead.', type: boolean }
+                type: object
+        '401':
+          $ref: '#/components/responses/401'
+        '403':
+          description: 'You do not have permission to recover this deployment.'
+          content:
+            application/json:
+              schema:
+                required:
+                  - message
+                properties:
+                  message: { type: string, example: 'You do not have permission to recover this deployment.' }
                 type: object
         '404':
           $ref: '#/components/responses/404'

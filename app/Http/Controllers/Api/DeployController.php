@@ -317,6 +317,15 @@ class DeployController extends Controller
                     mediaType: 'application/json',
                     schema: new OA\Schema(
                         type: 'object',
+                        required: [
+                            'deployment_uuid',
+                            'status',
+                            'cancelled',
+                            'outcome',
+                            'message',
+                            'claimable',
+                            'recovery_owner_active',
+                        ],
                         properties: [
                             new OA\Property(property: 'deployment_uuid', type: 'string'),
                             new OA\Property(property: 'status', type: 'string'),
@@ -330,6 +339,24 @@ class DeployController extends Controller
                 ),
             ),
             new OA\Response(response: 401, ref: '#/components/responses/401'),
+            new OA\Response(
+                response: 403,
+                description: 'You do not have permission to recover this deployment.',
+                content: new OA\MediaType(
+                    mediaType: 'application/json',
+                    schema: new OA\Schema(
+                        type: 'object',
+                        required: ['message'],
+                        properties: [
+                            new OA\Property(
+                                property: 'message',
+                                type: 'string',
+                                example: 'You do not have permission to recover this deployment.',
+                            ),
+                        ],
+                    ),
+                ),
+            ),
             new OA\Response(response: 404, ref: '#/components/responses/404'),
         ]
     )]
