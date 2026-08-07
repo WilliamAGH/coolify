@@ -23,6 +23,8 @@ All notable changes to this project will be documented in this file.
 - *(blue-green)* Prefer the validated pending deployment during switching recovery
 - *(blue-green)* Resume released fan-out recovery under the shared fence-identity rule
 - *(blue-green)* Retire stopped replicas on the final attempt and sanitize ambiguous-retirement logs
+- *(blue-green)* Emit the released fan-out identity for previous-color fence states
+- *(blue-green)* Attest released sidecar shapes instead of rewriting them
 
 ### 💼 Other
 
@@ -41,6 +43,7 @@ All notable changes to this project will be documented in this file.
 - *(agents)* Document the PostgreSQL lane and branch-currency guard
 - Update changelog
 - Update changelog
+- Update changelog
 
 ### 🧪 Testing
 
@@ -49,6 +52,7 @@ All notable changes to this project will be documented in this file.
 - *(ci)* Pin the canonical PostgreSQL runner contract
 - *(proxy)* Forbid bare subshell if conditions in generated shell
 - *(control-plane)* Stop cleanup failures from masking the primary status
+- *(blue-green)* Consume the split operation topology digest in stopped-legacy cleanup
 
 ## [4.13.76-fork] - 2026-08-07
 
