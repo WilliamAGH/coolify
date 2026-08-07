@@ -85,6 +85,8 @@ it('keeps emergency deployment recovery contracts synchronized', function () {
         'cancelled',
         'outcome',
         'message',
+        'reason_code',
+        'correlation_id',
         'claimable',
         'recovery_owner_active',
     ];
@@ -94,9 +96,17 @@ it('keeps emergency deployment recovery contracts synchronized', function () {
         'cancelled' => 'boolean',
         'outcome' => 'string',
         'message' => 'string',
+        'reason_code' => 'string',
+        'correlation_id' => 'string',
         'claimable' => 'boolean',
         'recovery_owner_active' => 'boolean',
     ];
+    // The generated 3.1 documents render the nullable failure fields as
+    // union types, while the PHP attributes keep type + nullable separate.
+    $recoveryDocumentFieldTypes = array_replace($recoveryFieldTypes, [
+        'reason_code' => ['string', 'null'],
+        'correlation_id' => ['string', 'null'],
+    ]);
     $forbiddenMessage = 'You do not have permission to recover this deployment.';
 
     $recoverOperation = (new ReflectionMethod(DeployController::class, 'recover_deployment'))
@@ -152,7 +162,7 @@ it('keeps emergency deployment recovery contracts synchronized', function () {
             ->and($successSchema['required'])->toBe($recoveryFields)
             ->and(collect($successSchema['properties'])
                 ->mapWithKeys(static fn (array $property, string $name): array => [$name => $property['type']])
-                ->all())->toBe($recoveryFieldTypes)
+                ->all())->toBe($recoveryDocumentFieldTypes)
             ->and($forbiddenSchema)->toBeArray()
             ->and($forbiddenSchema['required'])->toBe(['message'])
             ->and($forbiddenSchema['properties']['message'])->toMatchArray([
