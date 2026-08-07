@@ -321,7 +321,7 @@ it('composes every co-rolled replica as a real v4 backend even when replicas sha
         ['compose_service' => 'llm_gateway-blue-replica-2', 'replica_index' => 2, 'ports' => [8000], 'name' => "{$uuid}-blue-replica-2", 'id' => str_repeat('c', 64)],
         ['compose_service' => 'queue-blue-replica-2', 'replica_index' => 2, 'ports' => [8080], 'name' => "{$uuid}-queue-blue-replica-2", 'id' => str_repeat('d', 64)],
     ])
-        ->and($set?->identityDigest())->toBe(BlueGreenReplicaSet::identityDigest([
+        ->and($set?->releasedIdentityDigest())->toBe(BlueGreenReplicaSet::identityDigest([
             $inspection(1, 'llm_gateway-blue-replica-1', "{$uuid}-blue-replica-1", str_repeat('a', 64)),
             $inspection(1, 'queue-blue-replica-1', "{$uuid}-queue-blue-replica-1", str_repeat('b', 64)),
             $inspection(2, 'llm_gateway-blue-replica-2', "{$uuid}-blue-replica-2", str_repeat('c', 64)),
