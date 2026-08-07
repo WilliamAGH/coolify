@@ -15,11 +15,13 @@ use Lorisleiva\Actions\Concerns\AsAction;
  * Reads a durable, lock-consistent destination sidecar and verifies it against
  * the managed route bytes. It intentionally refuses pending mutation journals.
  */
-final class ReadBlueGreenManagedRouteMetadata
+class ReadBlueGreenManagedRouteMetadata
 {
     use AsAction;
 
     private const ABSENT_OUTPUT = 'coolify-blue-green-managed-route:absent';
+
+    private const LOCK_ABSENT_OUTPUT = 'coolify-blue-green-managed-route:lock-absent';
 
     private const PRESENT_OUTPUT = 'coolify-blue-green-managed-route:present:';
 
@@ -40,6 +42,15 @@ final class ReadBlueGreenManagedRouteMetadata
             $this->commandFor($server->proxyPath(), $managedFilename),
             $server,
         ));
+        if ($output === WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT) {
+            throw new BlueGreenPendingContainerMutationJournalException($output);
+        }
+        if ($output === WriteBlueGreenProxyConfiguration::PENDING_PROXY_MUTATION_JOURNAL_OUTPUT) {
+            throw new BlueGreenPendingProxyMutationJournalException($output);
+        }
+        if ($output === self::LOCK_ABSENT_OUTPUT) {
+            throw new BlueGreenManagedRouteLockAbsentException($output);
+        }
         if ($output === self::ABSENT_OUTPUT) {
             return null;
         }
@@ -85,17 +96,37 @@ final class ReadBlueGreenManagedRouteMetadata
         $statePath = $writer->statePath($proxyPath, $managedFilename);
         $mutationJournalPath = $writer->mutationJournalPath($proxyPath, $managedFilename);
         $containerJournalPath = $writer->containerMutationJournalPath($proxyPath, $managedFilename);
+        $lockPath = $writer->managedLockPath($proxyPath, $managedFilename);
         $safeManagedPath = escapeshellarg($managedPath);
         $safeStatePath = escapeshellarg($statePath);
+        $safeMutationJournalPath = escapeshellarg($mutationJournalPath);
+        $safeContainerJournalPath = escapeshellarg($containerJournalPath);
+        $safeLockPath = escapeshellarg($lockPath);
 
         return implode("\n", [
             'set -eu',
             'umask 077',
-            ...$writer->exclusiveManagedFileLockCommands($proxyPath, $managedFilename),
-            'test ! -e '.escapeshellarg($mutationJournalPath),
-            'test ! -L '.escapeshellarg($mutationJournalPath),
-            'test ! -e '.escapeshellarg($containerJournalPath),
-            'test ! -L '.escapeshellarg($containerJournalPath),
+            // Reads never create or normalize the lock. A missing lock with no
+            // durable remnants is an absent destination (wiped or first-ever
+            // host); a missing lock beside remnants is unobservable until a
+            // write lane recreates the lock.
+            'if [ ! -f '.$safeLockPath.' ] || [ -L '.$safeLockPath.' ]; then',
+            '  if [ ! -e '.$safeStatePath.' ] && [ ! -L '.$safeStatePath.' ] && [ ! -e '.$safeManagedPath.' ] && [ ! -L '.$safeManagedPath.' ] && [ ! -e '.$safeMutationJournalPath.' ] && [ ! -L '.$safeMutationJournalPath.' ] && [ ! -e '.$safeContainerJournalPath.' ] && [ ! -L '.$safeContainerJournalPath.' ]; then',
+            '    printf %s '.escapeshellarg(self::ABSENT_OUTPUT),
+            '    exit 0',
+            '  fi',
+            '  printf %s '.escapeshellarg(self::LOCK_ABSENT_OUTPUT),
+            '  exit 0',
+            'fi',
+            ...$writer->sharedManagedFileLockCommands($proxyPath, $managedFilename),
+            'if [ -e '.$safeMutationJournalPath.' ] || [ -L '.$safeMutationJournalPath.' ]; then',
+            '  printf \'%s\\n\' '.escapeshellarg(WriteBlueGreenProxyConfiguration::PENDING_PROXY_MUTATION_JOURNAL_OUTPUT),
+            '  exit 0',
+            'fi',
+            'if [ -e '.$safeContainerJournalPath.' ] || [ -L '.$safeContainerJournalPath.' ]; then',
+            '  printf \'%s\\n\' '.escapeshellarg(WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT),
+            '  exit 0',
+            'fi',
             'if [ ! -e '.$safeStatePath.' ] && [ ! -L '.$safeStatePath.' ]; then',
             '  test ! -e '.$safeManagedPath,
             '  test ! -L '.$safeManagedPath,

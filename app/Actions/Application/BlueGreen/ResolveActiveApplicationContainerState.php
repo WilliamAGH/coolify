@@ -2,12 +2,15 @@
 
 namespace App\Actions\Application\BlueGreen;
 
+use App\Actions\Proxy\BlueGreenActiveContainer;
 use App\Actions\Proxy\BlueGreenProxyState;
 use App\Models\Application;
+use App\Models\Server;
 use App\Models\StandaloneDocker;
 use App\Services\ContainerStatusAggregator;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Collection;
+use InvalidArgumentException;
 use Lorisleiva\Actions\Concerns\AsAction;
 
 class ResolveActiveApplicationContainerState
@@ -30,7 +33,7 @@ class ResolveActiveApplicationContainerState
             $destinations = $this->destinations($configuredDestinationIds);
             $containersByDestination = $destinations === null
                 ? null
-                : $this->containersByDestination($configuredDestinationIds, $destinations);
+                : $this->containersByDestination($configuredDestinationIds, $destinations, (int) $application->id);
             $currentApplication = Application::query()->find($application->id);
             $currentDeploymentUuids = $currentApplication === null
                 ? null
@@ -67,7 +70,7 @@ class ResolveActiveApplicationContainerState
         if ($destinations === null || ! $this->liveRoutesMatch($application, $resolutions, $destinations)) {
             return null;
         }
-        $containersByDestination = $this->containersByDestination($destinationIds, $destinations);
+        $containersByDestination = $this->containersByDestination($destinationIds, $destinations, (int) $application->id);
         $currentApplication = Application::query()->find($application->id);
         if ($containersByDestination === null
             || $currentApplication === null
@@ -107,7 +110,7 @@ class ResolveActiveApplicationContainerState
         $destinations = $this->destinations($configuredDestinationIds);
         $containersByDestination = $destinations === null
             ? null
-            : $this->containersByDestination($configuredDestinationIds, $destinations);
+            : $this->containersByDestination($configuredDestinationIds, $destinations, (int) $application->id);
         $currentApplication = Application::query()->find($application->id);
         $currentDeploymentUuids = $currentApplication === null
             ? null
@@ -168,9 +171,49 @@ class ResolveActiveApplicationContainerState
         return $liveRoute !== null
             && $liveRoute->destinationId === $resolution->destinationId
             && $liveRoute->activeDeploymentUuid === $resolution->deploymentUuid
-            && $liveRoute->activeContainerId === $resolution->containerId
+            && $this->routeIdentityMatches($resolution, $liveRoute)
             && $liveRoute->activeColor === $resolution->color
             && $liveRoute->routingRevision === $resolution->routingRevision;
+    }
+
+    private function routeIdentityMatches(
+        ActiveApplicationContainerResolution $resolution,
+        BlueGreenProxyState $liveRoute,
+    ): bool {
+        if ($liveRoute->activeReplicaSet !== null) {
+            return $liveRoute->activeReplicaSetDigest === $resolution->containerId;
+        }
+        if ($liveRoute->activeContainerSet === null) {
+            return $liveRoute->activeContainerId === $resolution->containerId;
+        }
+        if (! is_string($resolution->containerId)
+            || ! is_string($liveRoute->activeContainerName)
+            || ! is_string($liveRoute->activeContainerId)
+            || ! $liveRoute->activeContainerSet->contains(
+                $liveRoute->activeContainerName,
+                $liveRoute->activeContainerId,
+            )) {
+            return false;
+        }
+
+        $routeContainerIds = array_map(
+            static fn (BlueGreenActiveContainer $member): string => $member->id,
+            $liveRoute->activeContainerSet->members,
+        );
+        $resolvedContainerIds = $resolution->containerIds;
+        if ($resolvedContainerIds === []
+            || count(array_unique($routeContainerIds)) !== count($routeContainerIds)
+            || count(array_unique($resolvedContainerIds)) !== count($resolvedContainerIds)) {
+            return false;
+        }
+        sort($routeContainerIds);
+        sort($resolvedContainerIds);
+        if ($routeContainerIds !== $resolvedContainerIds) {
+            return false;
+        }
+
+        return $liveRoute->activeContainerId === $resolution->containerId
+            || ! in_array($resolution->containerId, $resolvedContainerIds, true);
     }
 
     /**
@@ -338,10 +381,22 @@ class ResolveActiveApplicationContainerState
             if (! $destination instanceof StandaloneDocker || $server === null) {
                 return false;
             }
-            $liveRoute = ReadBlueGreenManagedRouteMetadata::run($server, $application, $destination);
+            $liveRoute = $this->readLiveRoute($server, $application, $destination);
 
             return $this->routeMatches($resolution, $liveRoute);
         });
+    }
+
+    private function readLiveRoute(
+        Server $server,
+        Application $application,
+        StandaloneDocker $destination,
+    ): ?BlueGreenProxyState {
+        try {
+            return ReadBlueGreenManagedRouteMetadata::run($server, $application, $destination);
+        } catch (BlueGreenManagedRouteUnobservableException) {
+            return null;
+        }
     }
 
     /** @param  Collection<int, int>  $destinationIds */
@@ -366,16 +421,17 @@ class ResolveActiveApplicationContainerState
     protected function containersByDestination(
         Collection $destinationIds,
         Collection $destinations,
+        int $applicationId,
     ): ?Collection {
         $containersByServer = collect();
 
-        $containersByDestination = $destinationIds->mapWithKeys(function (int $destinationId) use ($destinations, $containersByServer): array {
+        $containersByDestination = $destinationIds->mapWithKeys(function (int $destinationId) use ($applicationId, $destinations, $containersByServer): array {
             $server = $destinations->get($destinationId)?->server;
             if ($server === null) {
                 return [];
             }
             if (! $containersByServer->has($server->id)) {
-                $containersByServer->put($server->id, $server->getContainers()['containers']);
+                $containersByServer->put($server->id, $this->applicationContainers($server, $applicationId));
             }
 
             return [$destinationId => $containersByServer->get($server->id)];
@@ -384,6 +440,33 @@ class ResolveActiveApplicationContainerState
         return $containersByDestination->count() === $destinationIds->count()
             ? $containersByDestination
             : null;
+    }
+
+    /** @return Collection<int, array<string, mixed>> */
+    protected function applicationContainers(Server $server, int $applicationId): Collection
+    {
+        $output = instant_privileged_remote_script(
+            $this->applicationContainersCommandFor($applicationId),
+            $server,
+            false,
+            timeout: 30,
+        );
+
+        return blank($output) ? collect() : format_docker_command_output_to_json($output);
+    }
+
+    protected function applicationContainersCommandFor(int $applicationId): string
+    {
+        if ($applicationId < 1) {
+            throw new InvalidArgumentException('Application container inspection requires a positive application ID.');
+        }
+
+        $applicationFilter = escapeshellarg('label=coolify.applicationId='.$applicationId);
+        $pullRequestFilter = escapeshellarg('label=coolify.pullRequestId=0');
+        $format = escapeshellarg('{{json .}}');
+
+        return 'ids="$(docker container ls -aq --no-trunc --filter '.$applicationFilter.' --filter '.$pullRequestFilter.')" || exit $?; '
+            .'if [ -n "$ids" ]; then docker container inspect --format='.$format.' $ids; fi';
     }
 
     private function labels(array $container): array
