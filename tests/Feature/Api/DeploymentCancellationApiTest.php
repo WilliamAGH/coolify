@@ -348,8 +348,11 @@ describe('POST /api/v1/deployments/{uuid}/cancel', function () {
         $logEntries = collect(json_decode($deployment->fresh()->logs, true));
         $stderrEntries = $logEntries->where('type', 'stderr');
         expect($stderrEntries->contains(
-            fn (array $entry): bool => str($entry['output'])->contains('docker: command not found')
-        ))->toBeTrue();
+            fn (array $entry): bool => str($entry['output'])->isMatch('/^Post-cancellation cleanup failed: reason=cleanup_failed correlation_id=[0-9a-f-]{36}$/')
+        ))->toBeTrue()
+            ->and($logEntries->contains(
+                fn (array $entry): bool => str($entry['output'])->contains('docker: command not found')
+            ))->toBeFalse();
     });
 
     test('returns correct response structure on success', function () {

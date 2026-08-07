@@ -43,18 +43,27 @@ use App\Models\Server;
 use App\Models\StandaloneDocker;
 use App\Models\Team;
 use App\Services\BlueGreenDeploymentLifecycle;
-use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Process\PendingProcess;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Storage;
 use Symfony\Component\Yaml\Yaml;
 
-uses(RefreshDatabase::class);
-
+// Not RefreshDatabase: its per-test wrapping transaction would keep
+// DB::transactionLevel() at 1 on the PostgreSQL lane, and the legacy
+// route network attestation these tests execute for real refuses to run
+// inside a transaction. migrate:fresh isolation matches
+// BlueGreenTopologyDigestConnectionSettingsTest, the sibling that also
+// attests against a live connection.
 beforeEach(function (): void {
+    Artisan::call('migrate:fresh', ['--no-interaction' => true]);
     InstanceSettings::unguarded(fn () => InstanceSettings::query()->create(['id' => 0]));
     config(['constants.ssh.mux_enabled' => false]);
+});
+
+afterEach(function (): void {
+    Artisan::call('migrate:fresh', ['--no-interaction' => true]);
 });
 
 /**
