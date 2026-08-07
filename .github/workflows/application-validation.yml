@@ -197,8 +197,13 @@ jobs:
       DB_USERNAME: postgres
       DB_PASSWORD: coolify-tests
       QUEUE_CONNECTION: sync
+      REDIS_URL: ''
       REDIS_HOST: 127.0.0.1
       REDIS_PORT: 6379
+      REDIS_DB: 0
+      REDIS_CACHE_DB: 1
+      REDIS_USERNAME: ''
+      REDIS_PASSWORD: ''
       SESSION_DRIVER: array
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -210,74 +215,10 @@ jobs:
         with:
           php-version: '8.5'
           coverage: none
-          extensions: mbstring, pdo_pgsql, redis
+          extensions: mbstring, pcntl, pdo_pgsql, redis
       - run: composer install --no-interaction --prefer-dist --optimize-autoloader
-      - name: Run blue-green lifecycle tests
-        run: |
-          set -Eeuo pipefail
-          php -d memory_limit=1G vendor/bin/pest --compact --do-not-cache-result \
-            tests/Feature/Api/DeploymentCancellationApiTest.php \
-            tests/Feature/Api/EmergencyDeploymentRecoveryApiTest.php \
-            tests/Feature/ApplicationDeploymentBlueGreenDestinationFenceTest.php \
-            tests/Feature/BlueGreenApplicationDeactivationTest.php \
-            tests/Feature/BlueGreenApplicationManualStopTest.php \
-            tests/Feature/BlueGreenAutomaticRecoveryAcceptanceTest.php \
-            tests/Feature/BlueGreenCleanIdleContainerJournalRecoveryTest.php \
-            tests/Feature/BlueGreenContinuousAvailabilityAcceptanceTest.php \
-            tests/Feature/BlueGreenCrashBoundaryAcceptanceTest.php \
-            tests/Feature/BlueGreenDockerComposeTopologyTest.php \
-            tests/Feature/BlueGreenApplicationDeletionFenceTest.php \
-            tests/Feature/BlueGreenApplicationDeletionOrchestrationTest.php \
-            tests/Feature/BlueGreenCancellationCompensationTest.php \
-            tests/Feature/BlueGreenConvergenceTest.php \
-            tests/Feature/BlueGreenDeactivationDurableBudgetTest.php \
-            tests/Feature/BlueGreenDeactivationResumeCommandTest.php \
-            tests/Feature/BlueGreenDeploymentReconciliationTest.php \
-            tests/Feature/BlueGreenEmergencyRecoveryLockContentionTest.php \
-            tests/Feature/BlueGreenDeploymentRecoveryFailureTest.php \
-            tests/Feature/BlueGreenDeploymentRecoveryTest.php \
-            tests/Feature/BlueGreenFinalizedDrainingRecoveryTest.php \
-            tests/Feature/BlueGreenFoundationMigrationReplayTest.php \
-            tests/Feature/BlueGreenFoundationPersistenceTest.php \
-            tests/Feature/BlueGreenInactiveRetirementTest.php \
-            tests/Feature/BlueGreenInterventionRecoveryTest.php \
-            tests/Feature/BlueGreenLifecyclePublicRecoveryTest.php \
-            tests/Feature/BlueGreenMigrationReplayTest.php \
-            tests/Feature/BlueGreenMultiPortPromotionAcceptanceTest.php \
-            tests/Feature/BlueGreenMultiDestinationTopologyTest.php \
-            tests/Feature/BlueGreenOperationAwareManagedRouteReadTest.php \
-            tests/Feature/DatabaseMigrationReadinessTest.php \
-            tests/Feature/LivewireDestinationTopologyPersistenceTest.php \
-            tests/Feature/BlueGreenOperationFencingTest.php \
-            tests/Feature/BlueGreenProvenEmptyDeactivationTest.php \
-            tests/Feature/BlueGreenReplicaLifecycleTest.php \
-            tests/Feature/BlueGreenStaleContainerJournalRecoveryTest.php \
-            tests/Feature/BlueGreenSteadyStateRepairFenceTest.php \
-            tests/Feature/BlueGreenStoppedLegacyContainerCleanupTest.php \
-            tests/Feature/BlueGreenSupersessionGenerationTest.php \
-            tests/Feature/DeleteResourceJobBlueGreenTest.php \
-            tests/Feature/LegacyProxyMutationPayloadAdoptionTest.php \
-            tests/Feature/ProxyMutationQueueGateTest.php \
-            tests/Feature/PostgresUserDeletionConcurrencyTest.php \
-            tests/Feature/PostgresBlueGreenMultiDestinationConcurrencyTest.php \
-            tests/Feature/Proxy/ControlPlane/PrepareControlPlaneProxyEnrollmentFromHostTest.php \
-            tests/Feature/QueueApplicationDeploymentCommitTest.php \
-            tests/Feature/QueueServerDeletionTest.php \
-            tests/Feature/ScheduleOnOneServerTest.php \
-            tests/Unit/Actions/Application/BlueGreen/BlueGreenDeploymentLockTest.php \
-            tests/Unit/Actions/Application/BlueGreen/BlueGreenOperationFenceTest.php \
-            tests/Unit/Actions/Application/BlueGreenDrainAndReleaseProofTest.php \
-            tests/Unit/Actions/Application/BlueGreen/BlueGreenNonRootRemoteExecutionTest.php \
-            tests/Unit/Actions/Application/BlueGreen/ExecuteBlueGreenDestinationMutationTest.php \
-            tests/Unit/Actions/Application/BlueGreenPublicRecoveryTest.php \
-            tests/Unit/Actions/Proxy/BlueGreenMultiPortConfigurationTest.php \
-            tests/Unit/Actions/Proxy/BlueGreenNonRootRemoteExecutionTest.php \
-            tests/Unit/Actions/Proxy/BlueGreenProxyStateRouteProofTest.php \
-            tests/Unit/ApplicationDeploymentActivationOrderTest.php \
-            tests/Unit/ProxyMutationQueueTest.php \
-            tests/Unit/ScheduledJobsRetryConfigTest.php
-      - name: Validate deployment activation configuration fence
-        run: php artisan test --compact tests/Unit/DeploymentConfiguration/ApplicationConfigurationSnapshotTest.php --filter='fences deployment command'
+      - name: Run canonical blue-green PostgreSQL tests
+        run: bash scripts/dev/test-blue-green-postgresql.sh external
 
   unit-suite:
     name: Unit suite (single process)
@@ -526,6 +467,8 @@ jobs:
           if (( ${#legacy_scripts[@]} > 0 )); then
             shellcheck --severity=error -e SC2015 -- "${legacy_scripts[@]}"
           fi
+      - name: Run release entrypoint contract tests
+        run: scripts/dev/ship.test.sh
 
   testing-host-runtime:
     name: Testing-host production identity bridge
