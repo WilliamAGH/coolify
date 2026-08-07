@@ -11,6 +11,410 @@ function applicationValidationWorkflow(): array
     return Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
 }
 
+function blueGreenPostgresqlRunner(): string
+{
+    return file_get_contents(dirname(__DIR__, 2).'/scripts/dev/test-blue-green-postgresql.sh');
+}
+
+function blueGreenPostgresqlMakeTarget(): string
+{
+    return file_get_contents(dirname(__DIR__, 2).'/make/test.mk');
+}
+
+/**
+ * @return list<string>
+ */
+function blueGreenPostgresqlTestManifest(?string $runner = null): array
+{
+    preg_match(
+        '/readonly -a BLUE_GREEN_POSTGRESQL_TESTS=\(\n(?<tests>.*?)\n\)/s',
+        $runner ?? blueGreenPostgresqlRunner(),
+        $matches,
+    );
+
+    if (! isset($matches['tests'])) {
+        throw new RuntimeException('The canonical PostgreSQL test manifest is missing.');
+    }
+
+    preg_match_all('/^\s*(tests\/[^\s]+\.php)$/m', $matches['tests'], $testPaths);
+
+    return $testPaths[1];
+}
+
+/**
+ * @return list<string>
+ */
+function readNullDelimitedFixtureFile(string $path): array
+{
+    if (! is_file($path)) {
+        return [];
+    }
+
+    $contents = file_get_contents($path);
+
+    if ($contents === false || $contents === '') {
+        return [];
+    }
+
+    return explode("\0", rtrim($contents, "\0"));
+}
+
+/**
+ * @param  array<string, string|false>  $environment
+ * @return array{
+ *     artisan_arguments: list<string>,
+ *     docker_calls: string,
+ *     pest_arguments: list<string>,
+ *     pest_environment: string,
+ *     process: Process
+ * }
+ */
+function runBlueGreenPostgresqlLocalRunner(array $environment = []): array
+{
+    $fixture = sys_get_temp_dir().'/coolify-blue-green-runner-'.bin2hex(random_bytes(8));
+    $bin = $fixture.'/bin';
+
+    if (! mkdir($bin, 0700, true) && ! is_dir($bin)) {
+        throw new RuntimeException('Could not create the blue-green runner fixture directory.');
+    }
+
+    $dockerCalls = $fixture.'/docker.calls';
+    $pestArguments = $fixture.'/pest.arguments';
+    $pestEnvironment = $fixture.'/pest.environment';
+    $artisanArguments = $fixture.'/artisan.arguments';
+
+    file_put_contents($bin.'/docker', <<<'BASH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+printf '%s\n' "$*" >> "$FAKE_DOCKER_CALLS"
+
+case "${1:-}" in
+    context)
+        case "${2:-}" in
+            show)
+                printf '%s\n' "${FAKE_DOCKER_CONTEXT:-default}"
+                ;;
+            inspect)
+                [[ "${FAKE_DOCKER_CONTEXT_INSPECT_FAILURE:-false}" != true ]] || exit 1
+                printf '%s\n' "${FAKE_DOCKER_ENDPOINT:-unix:///var/run/docker.sock}"
+                ;;
+            *)
+                exit 64
+                ;;
+        esac
+        ;;
+    create | start)
+        ;;
+    exec)
+        if [[ "$*" == *'redis-cli ping' ]]; then
+            printf 'PONG\n'
+        fi
+        ;;
+    port)
+        case "${3:-}" in
+            5432/tcp)
+                printf '127.0.0.1:55432\n'
+                ;;
+            6379/tcp)
+                printf '127.0.0.1:56379\n'
+                ;;
+            *)
+                exit 64
+                ;;
+        esac
+        ;;
+    rm)
+        if [[ "$*" == *cpbg-redis-tests-* && "${FAKE_REDIS_CLEANUP_FAILURE:-false}" == true ]]; then
+            exit 1
+        fi
+        if [[ "$*" == *cpbg-postgresql-tests-* && "${FAKE_POSTGRESQL_CLEANUP_FAILURE:-false}" == true ]]; then
+            exit 1
+        fi
+        ;;
+    *)
+        exit 64
+        ;;
+esac
+BASH);
+    file_put_contents($bin.'/php', <<<'BASH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [[ "${1:-}" == -r ]]; then
+    [[ "${FAKE_PCNTL_FORK_AVAILABLE:-true}" == true ]] || exit 1
+    exit 0
+fi
+
+if [[ "${1:-}" == -d ]]; then
+    printf '%s\0' "$@" > "$FAKE_PEST_ARGUMENTS"
+    {
+        for variable in DATABASE_URL DB_READ_HOST DB_READ_PORT DB_READ_USERNAME DB_READ_PASSWORD DB_WRITE_HOST DB_WRITE_PORT DB_WRITE_USERNAME DB_WRITE_PASSWORD; do
+            if printenv "$variable" >/dev/null; then
+                if [[ -z "${!variable}" ]]; then
+                    printf '%s=empty\n' "$variable"
+                else
+                    printf '%s=non-empty\n' "$variable"
+                fi
+            else
+                printf '%s=absent\n' "$variable"
+            fi
+        done
+    } > "$FAKE_PEST_ENVIRONMENT"
+    if [[ -n "${FAKE_LARAVEL_BOOTSTRAP_PROBE:-}" ]]; then
+        "$FAKE_LARAVEL_BOOTSTRAP_PHP" \
+            "$FAKE_LARAVEL_BOOTSTRAP_PROBE" \
+            "$FAKE_LARAVEL_BOOTSTRAP_REPOSITORY_ROOT" \
+            "$FAKE_LARAVEL_BOOTSTRAP_DOTENV_PATH" \
+            > "$FAKE_LARAVEL_BOOTSTRAP_OUTPUT"
+    fi
+    if [[ -n "${FAKE_CONFIG_CACHE_CONTENT:-}" ]]; then
+        printf '%s' "$FAKE_CONFIG_CACHE_CONTENT" > "$APP_CONFIG_CACHE"
+    fi
+    exit "${FAKE_PEST_EXIT_CODE:-0}"
+fi
+
+printf '%s\0' "$@" > "$FAKE_ARTISAN_ARGUMENTS"
+exit "${FAKE_ARTISAN_EXIT_CODE:-0}"
+BASH);
+    chmod($bin.'/docker', 0700);
+    chmod($bin.'/php', 0700);
+
+    try {
+        $process = new Process(
+            ['bash', 'scripts/dev/test-blue-green-postgresql.sh', 'local'],
+            dirname(__DIR__, 2),
+            array_merge([
+                'BASH_ENV' => '/dev/null',
+                'DATABASE_URL' => false,
+                'DB_READ_HOST' => false,
+                'DB_READ_PORT' => false,
+                'DB_READ_USERNAME' => false,
+                'DB_READ_PASSWORD' => false,
+                'DB_WRITE_HOST' => false,
+                'DB_WRITE_PORT' => false,
+                'DB_WRITE_USERNAME' => false,
+                'DB_WRITE_PASSWORD' => false,
+                'DOCKER_CONTEXT' => false,
+                'DOCKER_HOST' => false,
+                'FAKE_ARTISAN_ARGUMENTS' => $artisanArguments,
+                'FAKE_DOCKER_CALLS' => $dockerCalls,
+                'FAKE_PEST_ARGUMENTS' => $pestArguments,
+                'FAKE_PEST_ENVIRONMENT' => $pestEnvironment,
+                'PATH' => $bin.PATH_SEPARATOR.(string) getenv('PATH'),
+                'REDIS_URL' => false,
+            ], $environment),
+        );
+        $process->run();
+
+        return [
+            'artisan_arguments' => readNullDelimitedFixtureFile($artisanArguments),
+            'docker_calls' => is_file($dockerCalls) ? (string) file_get_contents($dockerCalls) : '',
+            'pest_arguments' => readNullDelimitedFixtureFile($pestArguments),
+            'pest_environment' => is_file($pestEnvironment) ? (string) file_get_contents($pestEnvironment) : '',
+            'process' => $process,
+        ];
+    } finally {
+        foreach ([$bin.'/docker', $bin.'/php', $dockerCalls, $pestArguments, $pestEnvironment, $artisanArguments] as $path) {
+            if (is_file($path)) {
+                unlink($path);
+            }
+        }
+        rmdir($bin);
+        rmdir($fixture);
+    }
+}
+
+/**
+ * @return array{configuration: array<string, mixed>, fixture: string, malicious_configuration_cache: string, runner: array<string, mixed>}
+ */
+function runBlueGreenPostgresqlLocalRunnerWithDotenvBootstrapProbe(): array
+{
+    $fixture = sys_get_temp_dir().'/coolify-blue-green-bootstrap-probe-'.bin2hex(random_bytes(8));
+    $dotenvPath = $fixture.'/dotenv';
+    $dotenvFile = $dotenvPath.'/.env.testing';
+    $bootstrapProbe = $fixture.'/bootstrap.php';
+    $bootstrapOutput = $fixture.'/configuration.json';
+    $maliciousConfigurationCache = $fixture.'/malicious-configuration.php';
+
+    if (! mkdir($dotenvPath, 0700, true) && ! is_dir($dotenvPath)) {
+        throw new RuntimeException('Could not create the blue-green Laravel bootstrap fixture directory.');
+    }
+
+    try {
+        if (file_put_contents($dotenvFile, <<<'ENV'
+BLUE_GREEN_DOTENV_PROBE=loaded
+DATABASE_URL=postgresql://dotenv-user:dotenv-password@database.internal:5432/unsafe
+DB_HOST=database.internal
+DB_PORT=5433
+DB_DATABASE=unsafe
+DB_USERNAME=dotenv-user
+DB_PASSWORD=dotenv-password
+DB_READ_HOST=read.internal
+DB_READ_PORT=5433
+DB_READ_USERNAME=replica
+DB_READ_PASSWORD=dotenv-read-password
+DB_WRITE_HOST=write.internal
+DB_WRITE_PORT=5434
+DB_WRITE_USERNAME=writer
+DB_WRITE_PASSWORD=dotenv-write-password
+ENV
+        ) === false) {
+            throw new RuntimeException('Could not write the blue-green Laravel dotenv fixture.');
+        }
+
+        if (file_put_contents($maliciousConfigurationCache, <<<'PHP'
+<?php
+
+return [
+    'database' => [
+        'default' => 'pgsql',
+        'connections' => [
+            'pgsql' => [
+                'database' => 'cached_unsafe',
+                'host' => 'cached.database.internal',
+                'read' => ['host' => 'cached.read.internal'],
+                'url' => 'postgresql://cached-user:cached-password@cached.database.internal:5432/cached_unsafe',
+                'write' => ['host' => 'cached.write.internal'],
+            ],
+        ],
+    ],
+];
+PHP
+        ) === false) {
+            throw new RuntimeException('Could not write the blue-green Laravel malicious config cache fixture.');
+        }
+
+        if (file_put_contents($bootstrapProbe, <<<'PHP'
+<?php
+
+$repositoryRoot = $argv[1];
+$environmentPath = $argv[2];
+
+require $repositoryRoot.'/vendor/autoload.php';
+
+$app = require $repositoryRoot.'/bootstrap/app.php';
+$app->useEnvironmentPath($environmentPath);
+
+(new Illuminate\Foundation\Bootstrap\LoadEnvironmentVariables)->bootstrap($app);
+(new Illuminate\Foundation\Bootstrap\LoadConfiguration)->bootstrap($app);
+
+$database = $app->make('config')->get('database');
+$pgsql = $database['connections']['pgsql'] ?? throw new RuntimeException('The pgsql connection was not configured.');
+
+echo json_encode([
+    'config_cache_path' => $app->getCachedConfigPath(),
+    'default' => $database['default'] ?? null,
+    'dotenv_probe' => Illuminate\Support\Env::get('BLUE_GREEN_DOTENV_PROBE'),
+    'pgsql' => [
+        'database' => $pgsql['database'] ?? null,
+        'has_read' => array_key_exists('read', $pgsql),
+        'has_write' => array_key_exists('write', $pgsql),
+        'host' => $pgsql['host'] ?? null,
+        'password' => $pgsql['password'] ?? null,
+        'port' => $pgsql['port'] ?? null,
+        'url' => $pgsql['url'] ?? null,
+        'username' => $pgsql['username'] ?? null,
+    ],
+], JSON_THROW_ON_ERROR);
+PHP
+        ) === false) {
+            throw new RuntimeException('Could not write the blue-green Laravel bootstrap probe.');
+        }
+
+        $runner = runBlueGreenPostgresqlLocalRunner([
+            'APP_BASE_PATH' => false,
+            'APP_CONFIG_CACHE' => $maliciousConfigurationCache,
+            'APP_ENV' => 'testing',
+            'APP_KEY' => 'base64:8nWXkyPyP3g2bK8nWXkyPyP3g2bK8nWXkyPyP3g2bK8=',
+            'FAKE_CONFIG_CACHE_CONTENT' => '<?php return [];',
+            'FAKE_LARAVEL_BOOTSTRAP_DOTENV_PATH' => $dotenvPath,
+            'FAKE_LARAVEL_BOOTSTRAP_OUTPUT' => $bootstrapOutput,
+            'FAKE_LARAVEL_BOOTSTRAP_PHP' => PHP_BINARY,
+            'FAKE_LARAVEL_BOOTSTRAP_PROBE' => $bootstrapProbe,
+            'FAKE_LARAVEL_BOOTSTRAP_REPOSITORY_ROOT' => dirname(__DIR__, 2),
+            'TMPDIR' => $fixture,
+        ]);
+
+        $configuration = [];
+        if (is_file($bootstrapOutput)) {
+            $contents = file_get_contents($bootstrapOutput);
+            if ($contents === false) {
+                throw new RuntimeException('Could not read the blue-green Laravel bootstrap configuration.');
+            }
+
+            $decoded = json_decode($contents, true, flags: JSON_THROW_ON_ERROR);
+            if (! is_array($decoded)) {
+                throw new RuntimeException('The blue-green Laravel bootstrap configuration was not an object.');
+            }
+            $configuration = $decoded;
+        }
+
+        return [
+            'configuration' => $configuration,
+            'fixture' => $fixture,
+            'malicious_configuration_cache' => $maliciousConfigurationCache,
+            'runner' => $runner,
+        ];
+    } finally {
+        foreach ([$dotenvFile, $bootstrapProbe, $bootstrapOutput, $maliciousConfigurationCache] as $path) {
+            if (is_file($path)) {
+                unlink($path);
+            }
+        }
+        rmdir($dotenvPath);
+        rmdir($fixture);
+    }
+}
+
+/**
+ * @param  array<string, string|false>  $overrides
+ * @return array<string, string|false>
+ */
+function blueGreenPostgresqlExternalEnvironment(array $overrides = []): array
+{
+    return array_merge([
+        'COOLIFY_EXTERNAL_TEST_SERVICES' => 'true',
+        'DATABASE_URL' => false,
+        'DB_CONNECTION' => 'pgsql',
+        'DB_DATABASE' => 'coolify_testing',
+        'DB_HOST' => '127.0.0.1',
+        'DB_PASSWORD' => 'secret',
+        'DB_PORT' => '5432',
+        'DB_READ_HOST' => false,
+        'DB_READ_PORT' => false,
+        'DB_READ_USERNAME' => false,
+        'DB_READ_PASSWORD' => false,
+        'DB_USERNAME' => 'postgres',
+        'DB_WRITE_HOST' => false,
+        'DB_WRITE_PORT' => false,
+        'DB_WRITE_USERNAME' => false,
+        'DB_WRITE_PASSWORD' => false,
+        'REDIS_CACHE_DB' => '1',
+        'REDIS_DB' => '0',
+        'REDIS_HOST' => '127.0.0.1',
+        'REDIS_PASSWORD' => '',
+        'REDIS_PORT' => '6379',
+        'REDIS_URL' => '',
+        'REDIS_USERNAME' => '',
+    ], $overrides);
+}
+
+/**
+ * @param  array<string, string|false>  $environment
+ */
+function runBlueGreenPostgresqlExternalRunner(array $environment): Process
+{
+    $process = new Process(
+        ['bash', 'scripts/dev/test-blue-green-postgresql.sh', 'external'],
+        dirname(__DIR__, 2),
+        $environment,
+    );
+    $process->run();
+
+    return $process;
+}
+
 function controlPlaneTraefikRuntimeScript(): string
 {
     return file_get_contents(dirname(__DIR__).'/Integration/ControlPlaneTraefik/run.sh');
@@ -266,10 +670,12 @@ function applicationValidationMissingOrEmptyEnvironmentCases(): array
  * @param  array<string, mixed>  $workflow
  * @return list<string>
  */
-function applicationValidationWorkflowViolations(array $workflow): array
+function applicationValidationWorkflowViolations(array $workflow, ?string $blueGreenRunner = null): array
 {
     $violations = [];
     $jobs = $workflow['jobs'] ?? [];
+    $blueGreenRunner ??= blueGreenPostgresqlRunner();
+    $manifestCounts = array_count_values(blueGreenPostgresqlTestManifest($blueGreenRunner));
 
     if (! is_array($workflow['on'] ?? null) || ! array_key_exists('workflow_call', $workflow['on'])) {
         $violations[] = 'application validation must remain reusable';
@@ -328,20 +734,54 @@ function applicationValidationWorkflowViolations(array $workflow): array
         || ($blueGreen['env']['DB_HOST'] ?? null) !== '127.0.0.1') {
         $violations[] = 'blue-green lifecycle validation must use its pinned PostgreSQL service';
     }
-    $blueGreenScript = collect($blueGreen['steps'] ?? [])->firstWhere('name', 'Run blue-green lifecycle tests')['run'] ?? '';
-    if (! str_contains(
-        (string) $blueGreenScript,
-        'php -d memory_limit=1G vendor/bin/pest --compact --do-not-cache-result',
-    )) {
+    $redis = $blueGreen['services']['redis'] ?? [];
+    $redisEnvironment = $blueGreen['env'] ?? [];
+    if (($redis['image'] ?? null) !== 'redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99'
+        || ($redisEnvironment['REDIS_HOST'] ?? null) !== '127.0.0.1'
+        || ($redisEnvironment['REDIS_PORT'] ?? null) !== 6379
+        || ($redisEnvironment['REDIS_DB'] ?? null) !== 0
+        || ($redisEnvironment['REDIS_CACHE_DB'] ?? null) !== 1
+        || ($redisEnvironment['REDIS_DB'] ?? null) === ($redisEnvironment['REDIS_CACHE_DB'] ?? null)
+        || ! array_key_exists('REDIS_USERNAME', $redisEnvironment)
+        || $redisEnvironment['REDIS_USERNAME'] !== ''
+        || ! array_key_exists('REDIS_PASSWORD', $redisEnvironment)
+        || $redisEnvironment['REDIS_PASSWORD'] !== ''
+        || ! array_key_exists('REDIS_URL', $redisEnvironment)
+        || $redisEnvironment['REDIS_URL'] !== '') {
+        $violations[] = 'blue-green lifecycle validation must use its pinned Redis service with explicit isolated loopback settings';
+    }
+    $blueGreenScript = collect($blueGreen['steps'] ?? [])
+        ->firstWhere('name', 'Run canonical blue-green PostgreSQL tests')['run'] ?? '';
+    if ($blueGreenScript !== 'bash scripts/dev/test-blue-green-postgresql.sh external') {
+        $violations[] = 'blue-green lifecycle validation must invoke the canonical PostgreSQL runner';
+    }
+    $blueGreenPhpSetup = collect($blueGreen['steps'] ?? [])
+        ->firstWhere('name', 'Set up PHP');
+    $blueGreenExtensions = is_array($blueGreenPhpSetup)
+        ? array_map('trim', explode(',', (string) ($blueGreenPhpSetup['with']['extensions'] ?? '')))
+        : [];
+    $pcntlForkPreflight = 'php -r \'exit(function_exists("pcntl_fork") ? 0 : 1);\'';
+    $pcntlForkPreflightPosition = strpos($blueGreenRunner, $pcntlForkPreflight);
+    $pestCommandPosition = strpos($blueGreenRunner, 'vendor/bin/pest');
+    if (! in_array('pcntl', $blueGreenExtensions, true)
+        || $pcntlForkPreflightPosition === false
+        || $pestCommandPosition === false
+        || $pcntlForkPreflightPosition > $pestCommandPosition) {
+        $violations[] = 'blue-green lifecycle validation must install pcntl and preflight pcntl_fork before Pest';
+    }
+    if (! str_contains($blueGreenRunner, 'php -d memory_limit=1G vendor/bin/pest "${pest_arguments[@]}"')
+        || ! str_contains($blueGreenRunner, 'pest_arguments=(--compact --do-not-cache-result)')) {
         $violations[] = 'blue-green lifecycle validation must run Pest with its bounded explicit memory contract';
     }
     foreach ([
         'tests/Feature/Api/DeploymentCancellationApiTest.php',
+        'tests/Feature/ApplicationActiveContainerApiTest.php',
         'tests/Feature/ApplicationDeploymentBlueGreenDestinationFenceTest.php',
         'tests/Feature/BlueGreenApplicationDeactivationTest.php',
         'tests/Feature/BlueGreenApplicationManualStopTest.php',
         'tests/Feature/BlueGreenAutomaticRecoveryAcceptanceTest.php',
         'tests/Feature/BlueGreenCancellationCompensationTest.php',
+        'tests/Feature/BlueGreenCandidateContainerSetMigrationTest.php',
         'tests/Feature/BlueGreenCleanIdleContainerJournalRecoveryTest.php',
         'tests/Feature/BlueGreenContinuousAvailabilityAcceptanceTest.php',
         'tests/Feature/BlueGreenConvergenceTest.php',
@@ -354,35 +794,40 @@ function applicationValidationWorkflowViolations(array $workflow): array
         'tests/Feature/BlueGreenMigrationReplayTest.php',
         'tests/Feature/BlueGreenMultiPortPromotionAcceptanceTest.php',
         'tests/Feature/BlueGreenOperationAwareManagedRouteReadTest.php',
+        'tests/Feature/BlueGreenReleasedV3StateMigrationTest.php',
         'tests/Feature/BlueGreenReplicaLifecycleTest.php',
+        'tests/Feature/BlueGreenServerDestinationTopologyGuardTest.php',
         'tests/Feature/BlueGreenSteadyStateRepairFenceTest.php',
         'tests/Feature/BlueGreenStoppedLegacyContainerCleanupTest.php',
         'tests/Feature/DatabaseMigrationReadinessTest.php',
+        'tests/Feature/FactoryIntegrityTest.php',
         'tests/Feature/BlueGreenSupersessionGenerationTest.php',
+        'tests/Feature/BlueGreenTopologyDigestCommandsTest.php',
+        'tests/Feature/BlueGreenTopologyDigestConnectionSettingsTest.php',
         'tests/Feature/LegacyProxyMutationPayloadAdoptionTest.php',
         'tests/Feature/PostgresUserDeletionConcurrencyTest.php',
         'tests/Feature/Proxy/ControlPlane/PrepareControlPlaneProxyEnrollmentFromHostTest.php',
         'tests/Feature/ProxyMutationQueueGateTest.php',
         'tests/Feature/QueueApplicationDeploymentCommitTest.php',
         'tests/Unit/ApplicationDeploymentActivationOrderTest.php',
+        'tests/Unit/Actions/Application/BlueGreenDrainAndReleaseProofTest.php',
         'tests/Unit/Actions/Application/BlueGreen/BlueGreenNonRootRemoteExecutionTest.php',
+        'tests/Unit/Actions/Application/BlueGreen/ResolveActiveApplicationContainerStateTest.php',
+        'tests/Unit/Actions/Proxy/BlueGreenCommittedContainerMutationJournalTest.php',
         'tests/Unit/Actions/Proxy/BlueGreenNonRootRemoteExecutionTest.php',
         'tests/Unit/Actions/Proxy/BlueGreenProxyStateRouteProofTest.php',
+        'tests/Unit/ApplicationOpenApiTest.php',
         'tests/Unit/ProxyMutationQueueTest.php',
         'tests/Unit/ScheduledJobsRetryConfigTest.php',
     ] as $requiredTest) {
-        if (! str_contains((string) $blueGreenScript, $requiredTest)) {
+        if (($manifestCounts[$requiredTest] ?? 0) !== 1) {
             $violations[] = 'blue-green lifecycle validation must execute every ownership and migration gate';
 
             break;
         }
     }
-    $activationConfigurationStep = collect($blueGreen['steps'] ?? [])
-        ->firstWhere('name', 'Validate deployment activation configuration fence')['run'] ?? '';
-    if (! str_contains(
-        (string) $activationConfigurationStep,
-        "tests/Unit/DeploymentConfiguration/ApplicationConfigurationSnapshotTest.php --filter='fences deployment command'",
-    )) {
+    if (! str_contains($blueGreenRunner, 'tests/Unit/DeploymentConfiguration/ApplicationConfigurationSnapshotTest.php')
+        || ! str_contains($blueGreenRunner, "--filter='fences deployment command'")) {
         $violations[] = 'blue-green lifecycle validation must fail closed when activation-time commands change after preparation';
     }
 
@@ -526,6 +971,431 @@ it('defines the required application validation contract', function () {
     expect(applicationValidationWorkflowViolations($workflow))->toBe([]);
 });
 
+it('runs release entrypoint contract tests in application validation', function (): void {
+    $step = collect(applicationValidationWorkflow()['jobs']['workflow-and-shell']['steps'] ?? [])
+        ->firstWhere('name', 'Run release entrypoint contract tests');
+
+    expect($step)->toBeArray()
+        ->and($step['run'] ?? null)->toBe('scripts/dev/ship.test.sh');
+});
+
+it('tracks every release and PostgreSQL validation executable with its checkout mode', function (): void {
+    $expectedModes = [
+        'make/test.mk' => '100644',
+        'scripts/dev/assert-branch-current.sh' => '100755',
+        'scripts/dev/ship.sh' => '100755',
+        'scripts/dev/ship.test.sh' => '100755',
+        'scripts/dev/test-blue-green-postgresql.sh' => '100755',
+    ];
+    $process = new Process([
+        'git',
+        'ls-files',
+        '--stage',
+        '--',
+        ...array_keys($expectedModes),
+    ], dirname(__DIR__, 2));
+    $process->mustRun();
+    $trackedModes = [];
+
+    foreach (preg_split('/\R/', trim($process->getOutput())) ?: [] as $entry) {
+        if (preg_match('/^(?<mode>[0-9]{6}) [0-9a-f]{40} 0\t(?<path>.+)$/D', $entry, $matches) === 1) {
+            $trackedModes[$matches['path']] = $matches['mode'];
+        }
+    }
+
+    expect($trackedModes)->toBe($expectedModes);
+});
+
+it('routes CI and the local PostgreSQL target through one canonical executable manifest', function (): void {
+    $workflow = applicationValidationWorkflow();
+    $workflowRun = collect($workflow['jobs']['blue-green-lifecycle']['steps'] ?? [])
+        ->firstWhere('name', 'Run canonical blue-green PostgreSQL tests')['run'] ?? null;
+    $blueGreenCommands = collect($workflow['jobs']['blue-green-lifecycle']['steps'] ?? [])
+        ->map(fn (array $step): string => (string) ($step['run'] ?? ''))
+        ->implode("\n");
+    $makeTarget = blueGreenPostgresqlMakeTarget();
+
+    expect($workflowRun)->toBe('bash scripts/dev/test-blue-green-postgresql.sh external')
+        ->and($blueGreenCommands)->not->toContain('vendor/bin/pest')
+        ->not->toContain('php artisan test')
+        ->and(file_get_contents(dirname(__DIR__, 2).'/Makefile'))->toContain('include make/test.mk')
+        ->and($makeTarget)->toContain('bash scripts/dev/test-blue-green-postgresql.sh local')
+        ->and($makeTarget)->not->toContain('tests/Feature/')
+        ->and(file_get_contents(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml'))
+        ->not->toContain('tests/Feature/BlueGreenCancellationCompensationTest.php');
+});
+
+it('rejects missing or unsafe Redis configuration in blue-green lifecycle CI', function (string $variable, mixed $value, bool $omit): void {
+    $workflow = applicationValidationWorkflow();
+
+    if ($omit) {
+        unset($workflow['jobs']['blue-green-lifecycle']['env'][$variable]);
+    } else {
+        $workflow['jobs']['blue-green-lifecycle']['env'][$variable] = $value;
+    }
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('blue-green lifecycle validation must use its pinned Redis service with explicit isolated loopback settings');
+})->with([
+    'missing URL override' => ['REDIS_URL', null, true],
+    'inherited URL' => ['REDIS_URL', 'redis://redis.internal:6379', false],
+    'missing host' => ['REDIS_HOST', null, true],
+    'non-loopback host' => ['REDIS_HOST', 'redis.internal', false],
+    'missing port' => ['REDIS_PORT', null, true],
+    'wrong port' => ['REDIS_PORT', 6380, false],
+    'missing database' => ['REDIS_DB', null, true],
+    'wrong database' => ['REDIS_DB', 2, false],
+    'missing cache database' => ['REDIS_CACHE_DB', null, true],
+    'wrong cache database' => ['REDIS_CACHE_DB', 2, false],
+    'shared queue and cache database' => ['REDIS_CACHE_DB', 0, false],
+    'missing username' => ['REDIS_USERNAME', null, true],
+    'non-empty username' => ['REDIS_USERNAME', 'default', false],
+    'missing password' => ['REDIS_PASSWORD', null, true],
+    'non-empty password' => ['REDIS_PASSWORD', 'secret', false],
+]);
+
+it('rejects a non-digest-pinned Redis lifecycle service', function (): void {
+    $workflow = applicationValidationWorkflow();
+    $workflow['jobs']['blue-green-lifecycle']['services']['redis']['image'] = 'redis:7-alpine';
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('blue-green lifecycle validation must use its pinned Redis service with explicit isolated loopback settings');
+});
+
+it('keeps the issue 194 and 195 regression owners exactly once in the canonical PostgreSQL manifest', function (string $testPath): void {
+    $manifest = blueGreenPostgresqlTestManifest();
+
+    expect($manifest)->toContain($testPath)
+        ->and(array_count_values($manifest)[$testPath] ?? 0)->toBe(1);
+})->with([
+    'factory integrity' => 'tests/Feature/FactoryIntegrityTest.php',
+    'active container API' => 'tests/Feature/ApplicationActiveContainerApiTest.php',
+    'server destination topology' => 'tests/Feature/BlueGreenServerDestinationTopologyGuardTest.php',
+    'active state resolution' => 'tests/Unit/Actions/Application/BlueGreen/ResolveActiveApplicationContainerStateTest.php',
+    'OpenAPI contract' => 'tests/Unit/ApplicationOpenApiTest.php',
+    'candidate container durability' => 'tests/Feature/BlueGreenCandidateContainerSetDurabilityTest.php',
+    'candidate container schema' => 'tests/Feature/BlueGreenCandidateContainerSetMigrationTest.php',
+    'Docker log owner label' => 'tests/Feature/DockerLogOwnerLabelTest.php',
+]);
+
+it('fails closed before Pest when pcntl_fork is unavailable', function (): void {
+    $result = runBlueGreenPostgresqlLocalRunner([
+        'FAKE_PCNTL_FORK_AVAILABLE' => 'false',
+    ]);
+
+    expect($result['process']->isSuccessful())->toBeFalse()
+        ->and($result['process']->getErrorOutput())->toContain('pcntl_fork is required for blue-green PostgreSQL concurrency tests.')
+        ->and($result['docker_calls'])->toBe('')
+        ->and($result['pest_arguments'])->toBe([])
+        ->and($result['artisan_arguments'])->toBe([]);
+});
+
+it('requires pcntl in canonical PostgreSQL validation', function (): void {
+    $workflow = applicationValidationWorkflow();
+    $step = collect($workflow['jobs']['blue-green-lifecycle']['steps'] ?? [])
+        ->search(fn (array $candidate): bool => ($candidate['name'] ?? null) === 'Set up PHP');
+    expect($step)->not->toBeFalse();
+    $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['with']['extensions'] = 'mbstring, pdo_pgsql, redis';
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('blue-green lifecycle validation must install pcntl and preflight pcntl_fork before Pest');
+});
+
+it('rejects canonical PostgreSQL validation without a pcntl_fork preflight', function (): void {
+    $runner = str_replace(
+        'php -r \'exit(function_exists("pcntl_fork") ? 0 : 1);\'',
+        'true',
+        blueGreenPostgresqlRunner(),
+    );
+
+    expect(applicationValidationWorkflowViolations(applicationValidationWorkflow(), $runner))
+        ->toContain('blue-green lifecycle validation must install pcntl and preflight pcntl_fork before Pest');
+});
+
+it('fails closed when external PostgreSQL is not explicitly configured', function (): void {
+    $process = runBlueGreenPostgresqlExternalRunner(blueGreenPostgresqlExternalEnvironment([
+        'COOLIFY_EXTERNAL_TEST_SERVICES' => false,
+        'DB_CONNECTION' => false,
+        'DB_HOST' => false,
+        'DB_PORT' => false,
+        'DB_DATABASE' => false,
+        'DB_USERNAME' => false,
+        'DB_PASSWORD' => false,
+    ]));
+
+    expect($process->isSuccessful())->toBeFalse()
+        ->and($process->getErrorOutput())->toContain('COOLIFY_EXTERNAL_TEST_SERVICES=true is required.');
+});
+
+it('rejects unsafe external PostgreSQL targets', function (array $environment, string $expectedError): void {
+    $process = runBlueGreenPostgresqlExternalRunner(blueGreenPostgresqlExternalEnvironment($environment));
+
+    expect($process->isSuccessful())->toBeFalse()
+        ->and($process->getErrorOutput())->toContain($expectedError);
+})->with([
+    'non-loopback host' => [
+        ['DB_HOST' => 'database.internal'],
+        'DB_HOST must be loopback.',
+    ],
+    'non-testing database' => [
+        ['DB_DATABASE' => 'coolify'],
+        'DB_DATABASE must end in _testing.',
+    ],
+]);
+
+it('rejects inherited PostgreSQL route overrides in external mode', function (string $variable, string $value): void {
+    $process = runBlueGreenPostgresqlExternalRunner(blueGreenPostgresqlExternalEnvironment([
+        $variable => $value,
+    ]));
+
+    expect($process->isSuccessful())->toBeFalse()
+        ->and($process->getErrorOutput())->toContain("$variable must be unset to prevent external database routes.");
+})->with([
+    'database URL' => ['DATABASE_URL', 'postgresql://postgres:secret@database.internal/coolify_testing'],
+    'read host' => ['DB_READ_HOST', 'database.internal'],
+    'read port' => ['DB_READ_PORT', '5433'],
+    'read username' => ['DB_READ_USERNAME', 'replica'],
+    'read password' => ['DB_READ_PASSWORD', 'secret'],
+    'write host' => ['DB_WRITE_HOST', 'database.internal'],
+    'write port' => ['DB_WRITE_PORT', '5433'],
+    'write username' => ['DB_WRITE_USERNAME', 'writer'],
+    'write password' => ['DB_WRITE_PASSWORD', 'secret'],
+]);
+
+it('rejects unsafe external Redis targets', function (array $environment, string $expectedError): void {
+    $process = runBlueGreenPostgresqlExternalRunner(blueGreenPostgresqlExternalEnvironment($environment));
+
+    expect($process->isSuccessful())->toBeFalse()
+        ->and($process->getErrorOutput())->toContain($expectedError);
+})->with([
+    'URL override' => [
+        ['REDIS_URL' => 'redis://redis.internal:6379'],
+        'REDIS_URL must be unset; configure Redis with explicit REDIS_* values.',
+    ],
+    'non-loopback host' => [
+        ['REDIS_HOST' => 'redis.internal'],
+        'REDIS_HOST must be loopback.',
+    ],
+    'missing port' => [
+        ['REDIS_PORT' => false],
+        'REDIS_PORT must be explicitly configured.',
+    ],
+    'invalid queue database' => [
+        ['REDIS_DB' => 'queue'],
+        'REDIS_DB must be explicitly configured.',
+    ],
+    'shared queue and cache database' => [
+        ['REDIS_CACHE_DB' => '0'],
+        'REDIS_DB and REDIS_CACHE_DB must be distinct.',
+    ],
+    'partial credentials' => [
+        ['REDIS_USERNAME' => 'default'],
+        'REDIS_USERNAME and REDIS_PASSWORD must both be empty or both be non-empty.',
+    ],
+]);
+
+it('empties database route overrides before local Pest execution', function (): void {
+    $result = runBlueGreenPostgresqlLocalRunner([
+        'DATABASE_URL' => 'postgresql://postgres:secret@database.internal/coolify_testing',
+        'DB_READ_HOST' => 'database.internal',
+        'DB_READ_PORT' => '5433',
+        'DB_READ_USERNAME' => 'replica',
+        'DB_READ_PASSWORD' => 'secret',
+        'DB_WRITE_HOST' => 'database.internal',
+        'DB_WRITE_PORT' => '5433',
+        'DB_WRITE_USERNAME' => 'writer',
+        'DB_WRITE_PASSWORD' => 'secret',
+    ]);
+
+    expect($result['process']->isSuccessful())->toBeTrue($result['process']->getErrorOutput())
+        ->and($result['pest_arguments'])->toBe(array_merge([
+            '-d',
+            'memory_limit=1G',
+            'vendor/bin/pest',
+            '--compact',
+            '--do-not-cache-result',
+        ], blueGreenPostgresqlTestManifest()))
+        ->and($result['artisan_arguments'])->toBe([
+            'artisan',
+            'test',
+            '--compact',
+            'tests/Unit/DeploymentConfiguration/ApplicationConfigurationSnapshotTest.php',
+            '--filter=fences deployment command',
+        ]);
+
+    $pestArgumentCounts = array_count_values($result['pest_arguments']);
+
+    foreach ([
+        'tests/Feature/BlueGreenCandidateContainerSetDurabilityTest.php',
+        'tests/Feature/BlueGreenCandidateContainerSetMigrationTest.php',
+        'tests/Feature/DockerLogOwnerLabelTest.php',
+    ] as $testPath) {
+        expect($pestArgumentCounts[$testPath] ?? 0)->toBe(1);
+    }
+
+    foreach ([
+        'DATABASE_URL',
+        'DB_READ_HOST',
+        'DB_READ_PORT',
+        'DB_READ_USERNAME',
+        'DB_READ_PASSWORD',
+        'DB_WRITE_HOST',
+        'DB_WRITE_PORT',
+        'DB_WRITE_USERNAME',
+        'DB_WRITE_PASSWORD',
+    ] as $variable) {
+        expect($result['pest_environment'])->toContain("$variable=empty");
+    }
+});
+
+it('keeps local Laravel pgsql configuration isolated from dotenv and cached config', function (): void {
+    $probe = runBlueGreenPostgresqlLocalRunnerWithDotenvBootstrapProbe();
+    $runner = $probe['runner'];
+
+    expect($runner['process']->isSuccessful())->toBeTrue($runner['process']->getErrorOutput());
+
+    foreach ([
+        'DATABASE_URL',
+        'DB_READ_HOST',
+        'DB_READ_PORT',
+        'DB_READ_USERNAME',
+        'DB_READ_PASSWORD',
+        'DB_WRITE_HOST',
+        'DB_WRITE_PORT',
+        'DB_WRITE_USERNAME',
+        'DB_WRITE_PASSWORD',
+    ] as $variable) {
+        expect($runner['pest_environment'])->toContain("$variable=empty");
+    }
+
+    $configuration = $probe['configuration'];
+    expect($configuration['default'] ?? null)->toBe('pgsql')
+        ->and($configuration['dotenv_probe'] ?? null)->toBe('loaded')
+        ->and($configuration['config_cache_path'] ?? null)->toBeString();
+
+    $configurationCachePath = $configuration['config_cache_path'];
+    expect($configurationCachePath)->not->toBe($probe['malicious_configuration_cache'])
+        ->and(str_starts_with($configurationCachePath, $probe['fixture'].'/coolify-blue-green-config-cache.'))->toBeTrue()
+        ->and(is_file($configurationCachePath))->toBeFalse()
+        ->and(is_dir(dirname($configurationCachePath)))->toBeFalse();
+
+    expect($configuration['pgsql'] ?? null)->toBeArray();
+    $pgsql = $configuration['pgsql'];
+
+    expect($pgsql['url'] ?? null)->toBe('')
+        ->and($pgsql['host'] ?? null)->toBe('127.0.0.1')
+        ->and($pgsql['port'] ?? null)->toBe('55432')
+        ->and($pgsql['database'] ?? null)->toBe('coolify_blue_green_testing')
+        ->and($pgsql['username'] ?? null)->toBe('postgres')
+        ->and($pgsql['password'] ?? null)->toBe('coolify-blue-green-tests')
+        ->and($pgsql['has_read'] ?? null)->toBeFalse()
+        ->and($pgsql['has_write'] ?? null)->toBeFalse();
+});
+
+it('allows named local Docker contexts backed by a socket endpoint', function (array $environment, string $expectedContext): void {
+    $result = runBlueGreenPostgresqlLocalRunner($environment);
+
+    expect($result['process']->isSuccessful())->toBeTrue($result['process']->getErrorOutput())
+        ->and($result['docker_calls'])->toContain("context inspect $expectedContext")
+        ->toContain('create --name');
+})->with([
+    'OrbStack Unix socket' => [
+        [
+            'FAKE_DOCKER_CONTEXT' => 'orbstack',
+            'FAKE_DOCKER_ENDPOINT' => 'unix:///Users/coolify/.orbstack/run/docker.sock',
+        ],
+        'orbstack',
+    ],
+    'named npipe socket' => [
+        [
+            'FAKE_DOCKER_CONTEXT' => 'desktop-windows',
+            'FAKE_DOCKER_ENDPOINT' => 'npipe:////./pipe/docker_engine',
+        ],
+        'desktop-windows',
+    ],
+]);
+
+it('rejects remote Docker selectors and endpoints before local containers are created', function (array $environment, string $expectedError): void {
+    $result = runBlueGreenPostgresqlLocalRunner($environment);
+
+    expect($result['process']->isSuccessful())->toBeFalse()
+        ->and($result['process']->getErrorOutput())->toContain($expectedError)
+        ->and($result['docker_calls'])->not->toContain('create --name');
+})->with([
+    'DOCKER_HOST' => [
+        ['DOCKER_HOST' => 'ssh://docker.example.test'],
+        'DOCKER_HOST must be unset for the disposable local PostgreSQL lane.',
+    ],
+    'DOCKER_CONTEXT' => [
+        ['DOCKER_CONTEXT' => 'remote'],
+        'DOCKER_CONTEXT must be unset for the disposable local PostgreSQL lane.',
+    ],
+    'failed context inspection' => [
+        ['FAKE_DOCKER_CONTEXT_INSPECT_FAILURE' => 'true'],
+        'Could not determine the Docker endpoint for the disposable local PostgreSQL lane.',
+    ],
+    'tcp active context endpoint' => [
+        [
+            'FAKE_DOCKER_CONTEXT' => 'orbstack-remote',
+            'FAKE_DOCKER_ENDPOINT' => 'tcp://docker.example.test:2376',
+        ],
+        'Docker context orbstack-remote must use a local Unix or npipe socket.',
+    ],
+    'ssh active context endpoint' => [
+        [
+            'FAKE_DOCKER_CONTEXT' => 'orbstack-remote',
+            'FAKE_DOCKER_ENDPOINT' => 'ssh://docker.example.test',
+        ],
+        'Docker context orbstack-remote must use a local Unix or npipe socket.',
+    ],
+]);
+
+it('fails local execution when cleanup of an owned disposable container fails', function (string $failureVariable, string $containerName): void {
+    $result = runBlueGreenPostgresqlLocalRunner([
+        $failureVariable => 'true',
+    ]);
+
+    expect($result['process']->isSuccessful())->toBeFalse()
+        ->and($result['process']->getExitCode())->toBe(1)
+        ->and($result['process']->getErrorOutput())->toContain("Failed to remove $containerName")
+        ->and($result['docker_calls'])->toContain("rm --force --volumes $containerName");
+})->with([
+    'Redis container' => ['FAKE_REDIS_CLEANUP_FAILURE', 'cpbg-redis-tests-'],
+    'PostgreSQL container' => ['FAKE_POSTGRESQL_CLEANUP_FAILURE', 'cpbg-postgresql-tests-'],
+]);
+
+it('preserves the original Pest failure when local cleanup also fails', function (): void {
+    $result = runBlueGreenPostgresqlLocalRunner([
+        'FAKE_PEST_EXIT_CODE' => '73',
+        'FAKE_REDIS_CLEANUP_FAILURE' => 'true',
+    ]);
+
+    expect($result['process']->isSuccessful())->toBeFalse()
+        ->and($result['process']->getExitCode())->toBe(73)
+        ->and($result['process']->getErrorOutput())->toContain('Failed to remove cpbg-redis-tests-');
+});
+
+it('owns and cleans only its named disposable PostgreSQL container', function (): void {
+    $runner = blueGreenPostgresqlRunner();
+
+    expect($runner)->toContain('LOCAL_CONTAINER="cpbg-postgresql-tests-$$"')
+        ->toContain('--label coolify.integration.ephemeral=true')
+        ->toContain('trap cleanup EXIT')
+        ->toContain('docker rm --force --volumes "$LOCAL_CONTAINER"')
+        ->toContain('postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777');
+});
+
+it('rejects bypassing the canonical PostgreSQL runner in CI', function (): void {
+    $workflow = applicationValidationWorkflow();
+    $step = collect($workflow['jobs']['blue-green-lifecycle']['steps'] ?? [])
+        ->search(fn (array $candidate): bool => ($candidate['name'] ?? null) === 'Run canonical blue-green PostgreSQL tests');
+    expect($step)->not->toBeFalse();
+    $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'] = 'php artisan test --compact tests/Feature/ExampleTest.php';
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('blue-green lifecycle validation must invoke the canonical PostgreSQL runner');
+});
+
 it('accepts only an empty source or the exact check-run revision', function (string $sourceSha, string $checkRunSha): void {
     $process = runApplicationValidationSourceIdentity($sourceSha, $checkRunSha);
 
@@ -602,23 +1472,34 @@ it('fails when the production application blue-green runtime owner is removed', 
 
 it('fails when an exact blue-green regression owner is removed from required validation', function (string $requiredTest): void {
     $workflow = applicationValidationWorkflow();
-    $step = collect($workflow['jobs']['blue-green-lifecycle']['steps'] ?? [])
-        ->search(fn (array $candidate): bool => ($candidate['name'] ?? null) === 'Run blue-green lifecycle tests');
-    expect($step)->not->toBeFalse();
-    $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'] = str_replace(
+    $runner = str_replace(
         $requiredTest,
         'tests/Feature/RemovedRequiredRegressionOwnerTest.php',
-        (string) $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'],
+        blueGreenPostgresqlRunner(),
     );
 
-    expect(applicationValidationWorkflowViolations($workflow))
+    expect(applicationValidationWorkflowViolations($workflow, $runner))
         ->toContain('blue-green lifecycle validation must execute every ownership and migration gate');
 })->with([
+    'released v3 state migration' => 'tests/Feature/BlueGreenReleasedV3StateMigrationTest.php',
     'replica identity' => 'tests/Feature/BlueGreenReplicaLifecycleTest.php',
+    'topology digest commands' => 'tests/Feature/BlueGreenTopologyDigestCommandsTest.php',
     'application privileged transport' => 'tests/Unit/Actions/Application/BlueGreen/BlueGreenNonRootRemoteExecutionTest.php',
     'proxy privileged transport' => 'tests/Unit/Actions/Proxy/BlueGreenNonRootRemoteExecutionTest.php',
     'control-plane enrollment serialization' => 'tests/Feature/Proxy/ControlPlane/PrepareControlPlaneProxyEnrollmentFromHostTest.php',
 ]);
+
+it('does not accept a comment as a PostgreSQL manifest entry', function (): void {
+    $requiredTest = 'tests/Feature/BlueGreenReplicaLifecycleTest.php';
+    $runner = str_replace(
+        '    '.$requiredTest,
+        "    tests/Feature/RemovedRequiredRegressionOwnerTest.php\n    # ".$requiredTest,
+        blueGreenPostgresqlRunner(),
+    );
+
+    expect(applicationValidationWorkflowViolations(applicationValidationWorkflow(), $runner))
+        ->toContain('blue-green lifecycle validation must execute every ownership and migration gate');
+});
 
 it('fails when production application blue-green evidence bypasses the sanitized export tree', function (): void {
     $workflow = applicationValidationWorkflow();
@@ -756,68 +1637,57 @@ it('rejects renaming the protected branch validation context', function () {
 });
 
 it('rejects omitting a blue-green ownership gate from PostgreSQL validation', function () {
-    $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
-    $step = collect($workflow['jobs']['blue-green-lifecycle']['steps'])
-        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Run blue-green lifecycle tests');
-    $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'] = str_replace(
+    $runner = str_replace(
         'tests/Feature/BlueGreenCancellationCompensationTest.php',
         'tests/Feature/BlueGreenApplicationDeactivationTest.php',
-        $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'],
+        blueGreenPostgresqlRunner(),
     );
 
-    expect(applicationValidationWorkflowViolations($workflow))
+    expect(applicationValidationWorkflowViolations(applicationValidationWorkflow(), $runner))
         ->toContain('blue-green lifecycle validation must execute every ownership and migration gate');
 });
 
 it('rejects omitting nullable backend inventory compatibility coverage from PostgreSQL validation', function (): void {
-    $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
-    $step = collect($workflow['jobs']['blue-green-lifecycle']['steps'])
-        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Run blue-green lifecycle tests');
-    $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'] = str_replace(
+    $runner = str_replace(
         'tests/Feature/BlueGreenMultiPortPromotionAcceptanceTest.php',
         'tests/Feature/BlueGreenLifecyclePublicRecoveryTest.php',
-        $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'],
+        blueGreenPostgresqlRunner(),
     );
 
-    expect(applicationValidationWorkflowViolations($workflow))
+    expect(applicationValidationWorkflowViolations(applicationValidationWorkflow(), $runner))
         ->toContain('blue-green lifecycle validation must execute every ownership and migration gate');
 });
 
 it('rejects omitting delayed database-startup coverage from PostgreSQL validation', function () {
-    $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
-    $step = collect($workflow['jobs']['blue-green-lifecycle']['steps'])
-        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Run blue-green lifecycle tests');
-    $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'] = str_replace(
+    $runner = str_replace(
         'tests/Feature/DatabaseMigrationReadinessTest.php',
         '',
-        $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'],
+        blueGreenPostgresqlRunner(),
     );
 
-    expect(applicationValidationWorkflowViolations($workflow))
+    expect(applicationValidationWorkflowViolations(applicationValidationWorkflow(), $runner))
         ->toContain('blue-green lifecycle validation must execute every ownership and migration gate');
 });
 
 it('rejects omitting PostgreSQL user-deletion concurrency coverage', function () {
-    $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
-    $step = collect($workflow['jobs']['blue-green-lifecycle']['steps'])
-        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Run blue-green lifecycle tests');
-    $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'] = str_replace(
+    $runner = str_replace(
         'tests/Feature/PostgresUserDeletionConcurrencyTest.php',
         '',
-        $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'],
+        blueGreenPostgresqlRunner(),
     );
 
-    expect(applicationValidationWorkflowViolations($workflow))
+    expect(applicationValidationWorkflowViolations(applicationValidationWorkflow(), $runner))
         ->toContain('blue-green lifecycle validation must execute every ownership and migration gate');
 });
 
 it('rejects omitting the activation configuration fence from PostgreSQL validation', function () {
-    $workflow = Yaml::parseFile(dirname(__DIR__, 2).'/.github/workflows/application-validation.yml');
-    $step = collect($workflow['jobs']['blue-green-lifecycle']['steps'])
-        ->search(fn (array $step): bool => ($step['name'] ?? null) === 'Validate deployment activation configuration fence');
-    $workflow['jobs']['blue-green-lifecycle']['steps'][$step]['run'] = 'true';
+    $runner = str_replace(
+        'tests/Unit/DeploymentConfiguration/ApplicationConfigurationSnapshotTest.php',
+        'tests/Unit/RemovedActivationConfigurationFenceTest.php',
+        blueGreenPostgresqlRunner(),
+    );
 
-    expect(applicationValidationWorkflowViolations($workflow))
+    expect(applicationValidationWorkflowViolations(applicationValidationWorkflow(), $runner))
         ->toContain('blue-green lifecycle validation must fail closed when activation-time commands change after preparation');
 });
 
@@ -924,8 +1794,8 @@ it('rejects shortening the full-cycle observer below its derived phase bounds', 
 it('rejects waiting on observer children before exact-project Compose teardown', function () {
     $script = controlPlaneTraefikRuntimeScript();
     $mutated = str_replace(
-        "    if [ \"\$COMPOSE_STARTED\" -eq 1 ]; then\n        compose down --volumes --remove-orphans >/dev/null 2>&1\n    fi\n    reap_registered_background_pids",
-        "    reap_registered_background_pids\n    if [ \"\$COMPOSE_STARTED\" -eq 1 ]; then\n        compose down --volumes --remove-orphans >/dev/null 2>&1\n    fi",
+        "    if [ \"\$COMPOSE_STARTED\" -eq 1 ]; then\n        if compose down --volumes --remove-orphans >/dev/null 2>&1; then\n            :\n        else\n            cleanup_status=\$?\n            cleanup_failures+=(\"owned Compose project cleanup failed with status \$cleanup_status\")\n        fi\n    fi\n    reap_registered_background_pids",
+        "    reap_registered_background_pids\n    if [ \"\$COMPOSE_STARTED\" -eq 1 ]; then\n        if compose down --volumes --remove-orphans >/dev/null 2>&1; then\n            :\n        else\n            cleanup_status=\$?\n            cleanup_failures+=(\"owned Compose project cleanup failed with status \$cleanup_status\")\n        fi\n    fi",
         $script,
     );
 
@@ -944,7 +1814,7 @@ it('executes negative full-cycle transport report fixtures', function () {
     $process->mustRun();
 
     expect($process->getOutput())
-        ->toContain('PASS: transition-log and transport-report validation self-tests completed.');
+        ->toContain('PASS: transition-log, transport-report, and cleanup validation self-tests completed.');
 });
 
 it('rejects omitting database migration S6 exit propagation coverage', function () {
