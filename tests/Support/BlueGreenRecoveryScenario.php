@@ -3,13 +3,14 @@
 namespace Tests\Support;
 
 use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
-use App\Actions\Application\BlueGreen\BlueGreenLegacyRouter;
+use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenLegacyRoutingSnapshot;
 use App\Actions\Application\BlueGreen\BlueGreenLegacyRoutingSnapshotCodec;
-use App\Actions\Application\BlueGreen\BlueGreenLegacyService;
+use App\Actions\Application\BlueGreen\CaptureBlueGreenLegacyRouting;
 use App\Actions\Application\BlueGreen\ComputeBlueGreenDeploymentFingerprint;
 use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
+use App\Actions\Proxy\ResolveCanonicalApplicationRoutingLabels;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
@@ -147,7 +148,7 @@ final readonly class BlueGreenRecoveryScenario
             'blue_green_rollback_managed_filename' => $managedFilename,
             'blue_green_routing_mutated_at' => $mutatedAt,
         ]);
-        $snapshot = (new BlueGreenLegacyRoutingSnapshotCodec)->encode(self::legacyRoutingSnapshot($application));
+        $snapshot = (new BlueGreenLegacyRoutingSnapshotCodec)->encode(self::legacyRoutingSnapshot($application, $destination));
         $state = ApplicationBlueGreenDeployment::query()->create([
             'application_id' => $application->id,
             'standalone_docker_id' => $destination->id,
@@ -236,7 +237,9 @@ final readonly class BlueGreenRecoveryScenario
                     'coolify.pullRequestId=0',
                     'coolify.type=application',
                     'traefik.enable=true',
-                    "traefik.http.routers.{$service}.rule=Host(`{$host}`)",
+                    // Canonical Coolify routing rules always carry a PathPrefix;
+                    // recovery derives its direct-origin probe routes from it.
+                    "traefik.http.routers.{$service}.rule=Host(`{$host}`) && PathPrefix(`/`)",
                     "traefik.http.routers.{$service}.entryPoints=https",
                     "traefik.http.routers.{$service}.service={$service}",
                     "traefik.http.routers.{$service}.tls=true",
@@ -274,31 +277,121 @@ final readonly class BlueGreenRecoveryScenario
         ];
     }
 
-    public static function legacyRoutingSnapshot(Application $application): BlueGreenLegacyRoutingSnapshot
-    {
-        $rule = 'Host(`recovery.example.test`) && PathPrefix(`/`)';
-
-        return new BlueGreenLegacyRoutingSnapshot(
-            containerName: $application->uuid.'-legacy',
+    /**
+     * The durable pre-stop snapshot of the legacy container's routing, derived
+     * from the same backend port inventory production writers persist: every
+     * routed backend port the application derives owns exactly one legacy
+     * Traefik service and router, mirroring the capture-time invariant that the
+     * legacy services must cover the whole canonical port inventory. Services
+     * are ordered by port, routers by name, exactly as capture emits them.
+     *
+     * `$destination` mirrors the capture call shape; the snapshot itself is
+     * fully determined by the application's routed topology.
+     */
+    public static function legacyRoutingSnapshot(
+        Application $application,
+        ?StandaloneDocker $destination = null,
+    ): BlueGreenLegacyRoutingSnapshot {
+        $destination ??= StandaloneDocker::query()->find((int) $application->destination_id)
+            ?? throw new RuntimeException('The recovery application has no standalone Docker destination.');
+        $expectation = new BlueGreenContainerExpectation(
+            name: $application->uuid.'-legacy',
             dockerId: self::LEGACY_ID,
-            port: 3000,
-            containerAddresses: ['10.0.0.2'],
-            routers: [new BlueGreenLegacyRouter(
-                name: 'recovery-public',
-                rule: $rule,
-                entryPoints: ['https'],
-                serviceName: 'recovery-service',
-                middlewares: [],
-                priority: strlen($rule),
-                tls: true,
-                certificateResolver: 'letsencrypt',
-            )],
-            services: [new BlueGreenLegacyService(
-                name: 'recovery-service',
-                port: 3000,
-                routerNames: ['recovery-public'],
-            )],
-            labelsSha256: str_repeat('f', 64),
+            applicationId: (int) $application->id,
+            pullRequestId: 0,
+            blueGreenManaged: false,
+        );
+
+        return (new CaptureBlueGreenLegacyRouting)->parse(
+            self::legacyRoutingDockerInspection($application, $destination, $expectation),
+            $application,
+            $destination,
+            $expectation,
+        );
+    }
+
+    public static function legacyRoutingDockerInspection(
+        Application $application,
+        StandaloneDocker $destination,
+        ?BlueGreenContainerExpectation $expectation = null,
+    ): string {
+        $expectation ??= new BlueGreenContainerExpectation(
+            name: $application->uuid.'-legacy',
+            dockerId: self::LEGACY_ID,
+            applicationId: (int) $application->id,
+            pullRequestId: 0,
+            blueGreenManaged: false,
+        );
+        $labels = [
+            'coolify.applicationId' => (string) $expectation->applicationId,
+            'coolify.pullRequestId' => (string) $expectation->pullRequestId,
+        ];
+        foreach (ResolveCanonicalApplicationRoutingLabels::run($application, $destination) as $label) {
+            [$key, $value] = explode('=', $label, 2);
+            $labels[$key] = $value;
+        }
+        ksort($labels);
+
+        return json_encode([
+            'Id' => $expectation->dockerId,
+            'Name' => '/'.$expectation->name,
+            'Config' => ['Labels' => $labels],
+            'NetworkSettings' => [
+                'Networks' => [
+                    (string) $destination->network => ['IPAddress' => '10.0.0.2'],
+                ],
+            ],
+        ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
+    }
+
+    /**
+     * Traefik rawdata that reports every router and service of `$snapshot`
+     * enabled, bound to the snapshot's container addresses and ports. Feed it
+     * to a Process fake so the real Docker-provider verification runs instead
+     * of being stubbed out.
+     */
+    public static function traefikRawDataFor(BlueGreenLegacyRoutingSnapshot $snapshot): string
+    {
+        $routers = [];
+        foreach ($snapshot->routers as $router) {
+            $entry = [
+                'status' => 'enabled',
+                'rule' => $router->rule,
+                'service' => $router->serviceName,
+                'priority' => $router->priority,
+                'entryPoints' => $router->entryPoints,
+                'using' => $router->entryPoints,
+                'middlewares' => $router->providerMiddlewareNames(),
+            ];
+            if ($router->tls) {
+                $entry['tls'] = $router->certificateResolver === null
+                    ? new \stdClass
+                    : ['certResolver' => $router->certificateResolver];
+            }
+            $routers[$router->providerName()] = $entry;
+        }
+        $services = [];
+        foreach ($snapshot->services as $service) {
+            $urls = array_map(
+                static fn (string $address): string => "http://{$address}:{$service->port}",
+                $snapshot->containerAddresses,
+            );
+            $services[$service->providerName()] = [
+                'status' => 'enabled',
+                'usedBy' => $service->providerRouterNames(),
+                'loadBalancer' => [
+                    'servers' => array_map(
+                        static fn (string $url): array => ['url' => $url],
+                        $urls,
+                    ),
+                ],
+                'serverStatus' => array_fill_keys($urls, 'UP'),
+            ];
+        }
+
+        return json_encode(
+            ['routers' => $routers, 'services' => $services],
+            JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES,
         );
     }
 }

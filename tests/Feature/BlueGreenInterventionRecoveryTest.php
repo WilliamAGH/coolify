@@ -13,11 +13,9 @@ use App\Actions\Application\BlueGreen\ComputeBlueGreenDeploymentFingerprint;
 use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Actions\Application\BlueGreen\MarkBlueGreenRecoveryInterventionRequired;
 use App\Actions\Application\BlueGreen\ReadBlueGreenManagedRouteMetadata;
-use App\Actions\Application\BlueGreen\RebindBlueGreenLegacyRoutingSnapshot;
 use App\Actions\Application\BlueGreen\ReconcileBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\RecoverBlueGreenIntervention;
 use App\Actions\Application\BlueGreen\ResolveBlueGreenExpectedProxyState;
-use App\Actions\Application\BlueGreen\VerifyBlueGreenLegacyProviderRecovery;
 use App\Actions\Application\EmergencyRecoverApplicationDeployment;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifact;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifactReader;
@@ -275,6 +273,8 @@ function fakeCommittedMidFlightJournal(
     ?string $archiveOutput = null,
     string $journalBootId = '11111111-2222-3333-4444-555555555555',
     ?Closure $afterJournalInspection = null,
+    ?string $traefikRawData = null,
+    ?BlueGreenRecoveryScenario $legacyScenario = null,
 ): void {
     $journalSha256 = str_repeat('7', 64);
     $writer = new WriteBlueGreenProxyConfiguration;
@@ -285,6 +285,12 @@ function fakeCommittedMidFlightJournal(
     $payloads = [];
     $pendingJournalPresent = true;
     $journalInspectionCount = 0;
+    $legacyDockerInspection = $legacyScenario === null
+        ? null
+        : BlueGreenRecoveryScenario::legacyRoutingDockerInspection(
+            $legacyScenario->application,
+            $legacyScenario->destination,
+        );
     Process::fake(function (PendingProcess $process) use (
         $archiveFilename,
         $archiveOutput,
@@ -293,13 +299,24 @@ function fakeCommittedMidFlightJournal(
         $inspectionOutput,
         $journalBootId,
         $journalSha256,
+        $legacyDockerInspection,
         &$payloads,
         &$pendingJournalPresent,
         &$journalInspectionCount,
         $replacementState,
+        $traefikRawData,
     ) {
         $payload = (string) $process->command."\n".(string) $process->input;
         $payloads[] = $payload;
+        if ($traefikRawData !== null && str_contains($payload, '/api/rawdata')) {
+            return Process::result(output: $traefikRawData);
+        }
+        if ($traefikRawData !== null && str_contains($payload, 'curl --config -')) {
+            return Process::result(output: "HTTP/1.1 200 OK\r\n\r\n");
+        }
+        if ($legacyDockerInspection !== null && str_contains($payload, 'docker inspect --format')) {
+            return Process::result(output: $legacyDockerInspection);
+        }
         if (str_contains($payload, WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_CAS_OUTPUT_PREFIX)) {
             $pendingJournalPresent = false;
 
@@ -404,11 +421,26 @@ function fakeRollbackCommittedJournalReconciliationActions(): void
     BlueGreenProxyRollbackArtifactReader::shouldRun()->andReturnUsing(
         fn ($server, $key) => new BlueGreenProxyRollbackArtifact($key, false, ''),
     );
-    RebindBlueGreenLegacyRoutingSnapshot::shouldRun()->andReturnUsing(
-        static fn ($server, $application, $destination, $expectation, $snapshot) => $snapshot,
-    );
-    VerifyBlueGreenLegacyProviderRecovery::shouldRun()->andReturnNull();
 }
+
+it('builds a legacy routing snapshot for every co-rolled routed backend port', function (): void {
+    $scenario = BlueGreenRecoveryScenario::create(
+        finalized: false,
+        routingMutationRecorded: false,
+        coRolledServices: ['web', 'metrics'],
+    );
+
+    $snapshot = BlueGreenRecoveryScenario::legacyRoutingSnapshot(
+        $scenario->application,
+        $scenario->destination,
+    );
+    $ports = array_map(static fn ($service): int => $service->port, $snapshot->services);
+    sort($ports, SORT_NUMERIC);
+
+    expect($snapshot->services)->toHaveCount(2)
+        ->and($ports)->toBe([3000, 3001])
+        ->and(array_map(static fn ($router): string => $router->serviceName, $snapshot->routers))->toBe(['metrics', 'web']);
+});
 
 it('records the source deployment phase and reason when reconciliation requires intervention', function (): void {
     $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: true);
@@ -1030,7 +1062,15 @@ it('archives an operation-owned committed journal through public rollback reconc
         'scenario' => $scenario,
     ] = rollbackCommittedJournalReconciliationScenario();
     $payloads = [];
-    fakeCommittedMidFlightJournal($expectedState, $replacementState, $payloads);
+    fakeCommittedMidFlightJournal(
+        $expectedState,
+        $replacementState,
+        $payloads,
+        traefikRawData: BlueGreenRecoveryScenario::traefikRawDataFor(
+            BlueGreenRecoveryScenario::legacyRoutingSnapshot($scenario->application, $scenario->destination),
+        ),
+        legacyScenario: $scenario,
+    );
 
     $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
     $remotePayload = implode("\n", $payloads);
