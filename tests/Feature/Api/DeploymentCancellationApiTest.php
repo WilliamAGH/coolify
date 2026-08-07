@@ -1,5 +1,6 @@
 <?php
 
+use App\Actions\Application\CancelApplicationDeployment;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Jobs\ApplicationDeploymentJob;
 use App\Models\Application;
@@ -179,6 +180,20 @@ describe('POST /api/v1/deployments/{uuid}/cancel', function () {
         // The controller updates status before SSH calls, so DB state is always correct
         $deployment->refresh();
         expect($deployment->status)->toBe(ApplicationDeploymentStatus::CANCELLED_BY_USER->value);
+    });
+
+    test('keeps generic cancellation unfenced when no expected dispatch binding is supplied', function (): void {
+        $deployment = ApplicationDeploymentQueue::query()->create([
+            'deployment_uuid' => (string) str()->uuid(),
+            'application_id' => $this->application->id,
+            'server_id' => $this->server->id,
+            'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+            'horizon_job_id' => (string) str()->uuid(),
+            'horizon_job_worker' => (string) str()->uuid(),
+        ]);
+
+        expect(CancelApplicationDeployment::run($deployment))->toBeTrue()
+            ->and($deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::CANCELLED_BY_USER->value);
     });
     test('returns 200 when the deployment container no longer exists during post-cancel cleanup', function () {
         $deployment = ApplicationDeploymentQueue::create([
