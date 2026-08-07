@@ -23,6 +23,8 @@ use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\StandaloneDocker;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
 use Lorisleiva\Actions\Concerns\AsAction;
 use Throwable;
 
@@ -47,6 +49,32 @@ final class EmergencyRecoverApplicationDeployment
 
     public const MANUAL_ONLY = 'manual_only';
 
+    /** Records privileged exception detail under an opaque public reference. */
+    private function reportRecoveryFailure(
+        Throwable $exception,
+        string $reasonCode,
+        ApplicationDeploymentQueue $deployment,
+    ): string {
+        $correlationId = (string) Str::uuid();
+        $context = [
+            'reason_code' => $reasonCode,
+            'correlation_id' => $correlationId,
+            'deployment_uuid' => $deployment->deployment_uuid,
+            'application_id' => $deployment->application_id,
+            'destination_id' => $deployment->destination_id,
+            'server_id' => $deployment->server_id,
+        ];
+
+        Log::warning('Emergency deployment recovery failed.', [
+            ...$context,
+            'exception' => $exception,
+        ]);
+        auditLog('blue_green.emergency_recovery.failed', $context, 'error');
+        report($exception);
+
+        return $correlationId;
+    }
+
     /**
      * @return array{
      *     deployment_uuid: string,
@@ -54,6 +82,8 @@ final class EmergencyRecoverApplicationDeployment
      *     cancelled: bool,
      *     outcome: self::CLEAN|self::DEFERRED|self::MANUAL_ONLY,
      *     message: string,
+     *     reason_code: string|null,
+     *     correlation_id: string|null,
      *     claimable: bool,
      *     recovery_owner_active: bool
      * }
@@ -88,13 +118,17 @@ final class EmergencyRecoverApplicationDeployment
                     : RetireBlueGreenInactiveContainer::STALE;
             } catch (Throwable $exception) {
                 $cancelled = $this->cancelHangingQueueEntry($deployment, $queueBinding);
+                $correlationId = $this->reportRecoveryFailure($exception, 'recovery_failed', $deployment);
 
                 return $this->result(
                     $deployment,
                     $cancelled,
                     self::MANUAL_ONLY,
-                    'The committed inactive-retirement journal could not be authenticated safely: '.$exception->getMessage(),
+                    'The committed inactive-retirement journal could not be authenticated safely.',
                     false,
+                    false,
+                    'recovery_failed',
+                    $correlationId,
                 );
             }
             $state = $this->stateFor($deployment);
@@ -158,8 +192,9 @@ final class EmergencyRecoverApplicationDeployment
         }
         if ($state?->phase === BlueGreenDeploymentPhase::IDLE
             && ($state->intervention_phase !== null || $state->intervention_reason !== null)) {
-            [$outcome, $message, $recoveryOwnerActive] = $this->recoverStaleIdleInterventionDiagnostics(
+            [$outcome, $message, $recoveryOwnerActive, $reasonCode, $correlationId] = $this->recoverStaleIdleInterventionDiagnostics(
                 $state,
+                $deployment,
                 $reason,
             );
             if ($outcome !== self::CLEAN) {
@@ -174,13 +209,15 @@ final class EmergencyRecoverApplicationDeployment
                     $message,
                     false,
                     $recoveryOwnerActive,
+                    $reasonCode,
+                    $correlationId,
                 );
             }
             $state = $this->stateFor($deployment);
         }
         if ($state !== null
             && RecoverBlueGreenIntervention::isFailedFirstAdoptionStaleJournalCandidate($state)) {
-            [$outcome, $message, $recoveryOwnerActive] = $this->recoverFailedFirstAdoptionStaleJournal(
+            [$outcome, $message, $recoveryOwnerActive, $reasonCode, $correlationId] = $this->recoverFailedFirstAdoptionStaleJournal(
                 $state,
                 $deployment,
                 $reason,
@@ -214,6 +251,8 @@ final class EmergencyRecoverApplicationDeployment
                     $message,
                     false,
                     $recoveryOwnerActive,
+                    $reasonCode,
+                    $correlationId,
                 );
             } else {
                 $state = $refreshed;
@@ -248,15 +287,17 @@ final class EmergencyRecoverApplicationDeployment
         // be IN_PROGRESS, so cancelling first would demote a recoverable
         // DRAINING hang into a manual-only intervention — the precise outcome
         // this endpoint exists to avoid.
-        [$outcome, $message, $recoveryOwnerActive] = match (true) {
-            $state === null => [self::CLEAN, 'No durable blue-green state owns this destination; the next deployment can claim it.', false],
+        [$outcome, $message, $recoveryOwnerActive, $reasonCode, $correlationId] = match (true) {
+            $state === null => [self::CLEAN, 'No durable blue-green state owns this destination; the next deployment can claim it.', false, null, null],
             $state->phase === BlueGreenDeploymentPhase::INTERVENTION_REQUIRED => $this->recoverParkedIntervention(
                 $state,
+                $deployment,
                 $reason,
                 $deployment->deployment_uuid,
             ),
             default => $this->reconcileInterruptedOperation(
                 $state,
+                $deployment,
                 $deployment->deployment_uuid,
                 $state->supersession_generation,
             ),
@@ -273,7 +314,16 @@ final class EmergencyRecoverApplicationDeployment
             $message = 'Recovery reported no remaining work, but this destination is still fenced for the next deployment: '.$message;
         }
 
-        return $this->result($deployment, $cancelled, $outcome, $message, $claimable, $recoveryOwnerActive);
+        return $this->result(
+            $deployment,
+            $cancelled,
+            $outcome,
+            $message,
+            $claimable,
+            $recoveryOwnerActive,
+            $reasonCode,
+            $correlationId,
+        );
     }
 
     /**
@@ -292,10 +342,11 @@ final class EmergencyRecoverApplicationDeployment
     }
 
     /**
-     * @return array{0: self::CLEAN|self::DEFERRED|self::MANUAL_ONLY, 1: string, 2: bool}
+     * @return array{0: self::CLEAN|self::DEFERRED|self::MANUAL_ONLY, 1: string, 2: bool, 3: string|null, 4: string|null}
      */
     private function recoverStaleIdleInterventionDiagnostics(
         ApplicationBlueGreenDeployment $state,
+        ApplicationDeploymentQueue $deployment,
         string $reason,
     ): array {
         try {
@@ -305,7 +356,9 @@ final class EmergencyRecoverApplicationDeployment
                 reason: $reason,
             );
         } catch (Throwable $exception) {
-            return [self::MANUAL_ONLY, 'The stale IDLE intervention diagnostics could not be cleared safely: '.$exception->getMessage(), false];
+            $correlationId = $this->reportRecoveryFailure($exception, 'recovery_failed', $deployment);
+
+            return [self::MANUAL_ONLY, 'The stale IDLE intervention diagnostics could not be cleared safely.', false, 'recovery_failed', $correlationId];
         }
 
         $recoveredState = ApplicationBlueGreenDeployment::query()->find($state->getKey());
@@ -316,16 +369,22 @@ final class EmergencyRecoverApplicationDeployment
             BlueGreenInterventionRecoveryResult::RECOVERED,
             BlueGreenInterventionRecoveryResult::SKIPPED,
         ], true)) {
-            return [self::CLEAN, $result->message, false];
+            return [self::CLEAN, $result->message, false, $result->reasonCode, $result->correlationId];
         }
         if ($result->outcome === BlueGreenInterventionRecoveryResult::DEFERRED) {
-            return [self::DEFERRED, $result->message, $result->recoveryOwnerActive];
+            return [
+                self::DEFERRED,
+                $result->message,
+                $result->recoveryOwnerActive,
+                $result->reasonCode,
+                $result->correlationId,
+            ];
         }
 
-        return [self::MANUAL_ONLY, $result->message, false];
+        return [self::MANUAL_ONLY, $result->message, false, $result->reasonCode, $result->correlationId];
     }
 
-    /** @return array{0: self::CLEAN|self::DEFERRED|self::MANUAL_ONLY, 1: string, 2: bool} */
+    /** @return array{0: self::CLEAN|self::DEFERRED|self::MANUAL_ONLY, 1: string, 2: bool, 3: string|null, 4: string|null} */
     private function recoverFailedFirstAdoptionStaleJournal(
         ApplicationBlueGreenDeployment $state,
         ApplicationDeploymentQueue $deployment,
@@ -333,7 +392,7 @@ final class EmergencyRecoverApplicationDeployment
     ): array {
         $horizonJobId = $deployment->getRawOriginal('horizon_job_id');
         if ($horizonJobId !== null && ! is_string($horizonJobId)) {
-            return [self::MANUAL_ONLY, 'The failed first-adoption successor has malformed dispatch-attempt provenance.', false];
+            return [self::MANUAL_ONLY, 'The failed first-adoption successor has malformed dispatch-attempt provenance.', false, null, null];
         }
         try {
             $result = RecoverBlueGreenIntervention::run(
@@ -346,14 +405,22 @@ final class EmergencyRecoverApplicationDeployment
                 successorHorizonJobId: $horizonJobId,
             );
         } catch (Throwable $exception) {
-            return [self::MANUAL_ONLY, 'The failed first-adoption stale journal could not be archived safely: '.$exception->getMessage(), false];
+            $correlationId = $this->reportRecoveryFailure($exception, 'recovery_failed', $deployment);
+
+            return [self::MANUAL_ONLY, 'The failed first-adoption stale journal could not be archived safely.', false, 'recovery_failed', $correlationId];
         }
 
         return match ($result->outcome) {
             BlueGreenInterventionRecoveryResult::RECOVERED,
-            BlueGreenInterventionRecoveryResult::SKIPPED => [self::CLEAN, $result->message, false],
-            BlueGreenInterventionRecoveryResult::DEFERRED => [self::DEFERRED, $result->message, $result->recoveryOwnerActive],
-            default => [self::MANUAL_ONLY, $result->message, false],
+            BlueGreenInterventionRecoveryResult::SKIPPED => [self::CLEAN, $result->message, false, $result->reasonCode, $result->correlationId],
+            BlueGreenInterventionRecoveryResult::DEFERRED => [
+                self::DEFERRED,
+                $result->message,
+                $result->recoveryOwnerActive,
+                $result->reasonCode,
+                $result->correlationId,
+            ],
+            default => [self::MANUAL_ONLY, $result->message, false, $result->reasonCode, $result->correlationId],
         };
     }
 
@@ -392,10 +459,11 @@ final class EmergencyRecoverApplicationDeployment
      * else about it — fences, ownership proofs, fail-closed classification —
      * is left exactly as the scheduled reconciler enforces it.
      *
-     * @return array{0: self::CLEAN|self::DEFERRED|self::MANUAL_ONLY, 1: string, 2: bool}
+     * @return array{0: self::CLEAN|self::DEFERRED|self::MANUAL_ONLY, 1: string, 2: bool, 3: string|null, 4: string|null}
      */
     private function reconcileInterruptedOperation(
         ApplicationBlueGreenDeployment $state,
+        ApplicationDeploymentQueue $deployment,
         ?string $requestedOperationUuid,
         ?int $requestedSupersessionGeneration,
     ): array {
@@ -408,7 +476,9 @@ final class EmergencyRecoverApplicationDeployment
                 requiredSupersessionGeneration: $requestedSupersessionGeneration,
             );
         } catch (Throwable $exception) {
-            return [self::MANUAL_ONLY, 'The blue-green reconciler could not prove a safe outcome: '.$exception->getMessage(), false];
+            $correlationId = $this->reportRecoveryFailure($exception, 'recovery_failed', $deployment);
+
+            return [self::MANUAL_ONLY, 'The blue-green reconciler could not prove a safe outcome.', false, 'recovery_failed', $correlationId];
         }
 
         $outcome = match ($result->outcome) {
@@ -417,14 +487,15 @@ final class EmergencyRecoverApplicationDeployment
             default => self::MANUAL_ONLY,
         };
 
-        return [$outcome, $result->message, $result->recoveryOwnerActive];
+        return [$outcome, $result->message, $result->recoveryOwnerActive, null, null];
     }
 
     /**
-     * @return array{0: self::CLEAN|self::DEFERRED|self::MANUAL_ONLY, 1: string, 2: bool}
+     * @return array{0: self::CLEAN|self::DEFERRED|self::MANUAL_ONLY, 1: string, 2: bool, 3: string|null, 4: string|null}
      */
     private function recoverParkedIntervention(
         ApplicationBlueGreenDeployment $state,
+        ApplicationDeploymentQueue $deployment,
         string $reason,
         ?string $requestedOperationUuid,
     ): array {
@@ -436,7 +507,9 @@ final class EmergencyRecoverApplicationDeployment
                 requiredOperationUuid: $requestedOperationUuid,
             );
         } catch (Throwable $exception) {
-            return [self::MANUAL_ONLY, 'The blue-green intervention recovery could not prove a safe outcome: '.$exception->getMessage(), false];
+            $correlationId = $this->reportRecoveryFailure($exception, 'recovery_failed', $deployment);
+
+            return [self::MANUAL_ONLY, 'The blue-green intervention recovery could not prove a safe outcome.', false, 'recovery_failed', $correlationId];
         }
 
         $outcome = match ($result->outcome) {
@@ -445,7 +518,7 @@ final class EmergencyRecoverApplicationDeployment
             default => self::MANUAL_ONLY,
         };
 
-        return [$outcome, $result->message, $result->recoveryOwnerActive];
+        return [$outcome, $result->message, $result->recoveryOwnerActive, $result->reasonCode, $result->correlationId];
     }
 
     /**
@@ -615,6 +688,8 @@ final class EmergencyRecoverApplicationDeployment
      *     cancelled: bool,
      *     outcome: self::CLEAN|self::DEFERRED|self::MANUAL_ONLY,
      *     message: string,
+     *     reason_code: string|null,
+     *     correlation_id: string|null,
      *     claimable: bool,
      *     recovery_owner_active: bool
      * }
@@ -626,6 +701,8 @@ final class EmergencyRecoverApplicationDeployment
         string $message,
         bool $claimable,
         bool $recoveryOwnerActive = false,
+        ?string $reasonCode = null,
+        ?string $correlationId = null,
     ): array {
         return [
             'deployment_uuid' => (string) $deployment->deployment_uuid,
@@ -633,6 +710,8 @@ final class EmergencyRecoverApplicationDeployment
             'cancelled' => $cancelled,
             'outcome' => $outcome,
             'message' => $message,
+            'reason_code' => $reasonCode,
+            'correlation_id' => $correlationId,
             'claimable' => $claimable,
             // A deferred outcome alone never told the operator whether anything was
             // still finishing the work. This does, and it is the same proof the

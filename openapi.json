@@ -8452,6 +8452,8 @@
                                         "cancelled",
                                         "outcome",
                                         "message",
+                                        "reason_code",
+                                        "correlation_id",
                                         "claimable",
                                         "recovery_owner_active"
                                     ],
@@ -8475,6 +8477,21 @@
                                         },
                                         "message": {
                                             "type": "string"
+                                        },
+                                        "reason_code": {
+                                            "description": "Stable failure code when recovery could not complete safely.",
+                                            "type": [
+                                                "string",
+                                                "null"
+                                            ]
+                                        },
+                                        "correlation_id": {
+                                            "description": "Opaque reference for protected diagnostics when recovery could not complete safely.",
+                                            "type": [
+                                                "string",
+                                                "null"
+                                            ],
+                                            "format": "uuid"
                                         },
                                         "claimable": {
                                             "description": "True when the next ordinary deployment can claim this destination.",

@@ -16,8 +16,10 @@ use App\Models\Service;
 use App\Models\Tag;
 use App\Support\ValidationPatterns;
 use Illuminate\Auth\Access\AuthorizationException;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
 use OpenApi\Attributes as OA;
 
 class DeployController extends Controller
@@ -258,9 +260,7 @@ class DeployController extends Controller
         try {
             $deploymentCancelled = CancelApplicationDeployment::run($deployment);
         } catch (\Throwable $e) {
-            return response()->json([
-                'message' => 'Failed to cancel deployment: '.$e->getMessage(),
-            ], 500);
+            return $this->sanitizedFailureResponse($e, 'cancel_failed', 'Deployment cancellation could not be completed safely.', $deployment, $teamId);
         }
 
         if (! $deploymentCancelled) {
@@ -323,6 +323,8 @@ class DeployController extends Controller
                             'cancelled',
                             'outcome',
                             'message',
+                            'reason_code',
+                            'correlation_id',
                             'claimable',
                             'recovery_owner_active',
                         ],
@@ -332,6 +334,8 @@ class DeployController extends Controller
                             new OA\Property(property: 'cancelled', type: 'boolean'),
                             new OA\Property(property: 'outcome', type: 'string', enum: ['clean', 'deferred', 'manual_only']),
                             new OA\Property(property: 'message', type: 'string'),
+                            new OA\Property(property: 'reason_code', type: 'string', nullable: true, description: 'Stable failure code when recovery could not complete safely.'),
+                            new OA\Property(property: 'correlation_id', type: 'string', format: 'uuid', nullable: true, description: 'Opaque reference for protected diagnostics when recovery could not complete safely.'),
                             new OA\Property(property: 'claimable', type: 'boolean', description: 'True when the next ordinary deployment can claim this destination.'),
                             new OA\Property(property: 'recovery_owner_active', type: 'boolean', description: 'True when an owner is driving this destination — a fenced recovery job that was queued, or a live lifecycle owner already holding the destination lock — which is why the queue entry was left running. False on a deferred outcome means nothing is driving it and the hanging entry was released instead.'),
                         ]
@@ -394,9 +398,7 @@ class DeployController extends Controller
                 "emergency recovery requested through the deployments API by team {$teamId}",
             );
         } catch (\Throwable $e) {
-            return response()->json([
-                'message' => 'Failed to recover deployment: '.$e->getMessage(),
-            ], 500);
+            return $this->sanitizedFailureResponse($e, 'recovery_failed', 'Deployment recovery could not be completed safely.', $deployment, $teamId);
         }
 
         // A cancellation performed here owes the same follow-up work the cancel
@@ -416,17 +418,115 @@ class DeployController extends Controller
             }
         }
 
+        $recovery = $this->sanitizedRecoveryResponse($recovery, $deployment, $teamId);
+
         auditLog('api.deployment.recovered', [
             'team_id' => $teamId,
             'deployment_uuid' => $deployment->deployment_uuid,
             'application_id' => $deployment->application_id,
             'server_id' => $deployment->server_id,
             'outcome' => $recovery['outcome'],
+            'reason_code' => $recovery['reason_code'],
+            'correlation_id' => $recovery['correlation_id'],
             'claimable' => $recovery['claimable'],
             'recovery_owner_active' => $recovery['recovery_owner_active'],
         ]);
 
         return response()->json($recovery);
+    }
+
+    /**
+     * Team-scoped API callers never receive raw exception detail: SSH stderr,
+     * Docker output, parser or database messages are privileged diagnostics.
+     * The full detail goes to the application log and the exception handler,
+     * the audit channel records only the stable codes, and every internal
+     * record shares one correlation identifier. The response carries only a
+     * stable reason code, a human-safe sentence, and that reference. The 500
+     * status of the original failure path is preserved.
+     */
+    private function sanitizedFailureResponse(
+        \Throwable $exception,
+        string $reasonCode,
+        string $publicMessage,
+        ApplicationDeploymentQueue $deployment,
+        int|string $teamId,
+    ): JsonResponse {
+        $correlationId = (string) Str::uuid();
+        $context = [
+            'team_id' => $teamId,
+            'deployment_uuid' => $deployment->deployment_uuid,
+            'application_id' => $deployment->application_id,
+            'server_id' => $deployment->server_id,
+            'correlation_id' => $correlationId,
+            'reason_code' => $reasonCode,
+        ];
+        Log::error('Deployment API request failed.', [
+            ...$context,
+            'exception' => $exception,
+        ]);
+        auditLog("api.deployment.{$reasonCode}", $context, 'error');
+        report($exception);
+
+        return response()->json([
+            'message' => $publicMessage,
+            'reason_code' => $reasonCode,
+            'correlation_id' => $correlationId,
+        ], 500);
+    }
+
+    /**
+     * @param  array{
+     *     deployment_uuid: string,
+     *     status: string,
+     *     cancelled: bool,
+     *     outcome: string,
+     *     message: string,
+     *     reason_code: string|null,
+     *     correlation_id: string|null,
+     *     claimable: bool,
+     *     recovery_owner_active: bool
+     * }  $recovery
+     * @return array{
+     *     deployment_uuid: string,
+     *     status: string,
+     *     cancelled: bool,
+     *     outcome: string,
+     *     message: string,
+     *     reason_code: string|null,
+     *     correlation_id: string|null,
+     *     claimable: bool,
+     *     recovery_owner_active: bool
+     * }
+     */
+    private function sanitizedRecoveryResponse(
+        array $recovery,
+        ApplicationDeploymentQueue $deployment,
+        int|string $teamId,
+    ): array {
+        if ($recovery['outcome'] === EmergencyRecoverApplicationDeployment::CLEAN) {
+            return $recovery;
+        }
+
+        $reasonCode = $recovery['reason_code'];
+        $correlationId = $recovery['correlation_id'];
+        if (! is_string($reasonCode) || $reasonCode === '' || ! is_string($correlationId) || $correlationId === '') {
+            $reasonCode = 'recovery_failed';
+            $correlationId = (string) Str::uuid();
+            auditLog('api.deployment.recovery_response_sanitized', [
+                'team_id' => $teamId,
+                'deployment_uuid' => $deployment->deployment_uuid,
+                'application_id' => $deployment->application_id,
+                'server_id' => $deployment->server_id,
+                'reason_code' => $reasonCode,
+                'correlation_id' => $correlationId,
+            ], 'warning');
+        }
+
+        $recovery['message'] = 'Deployment recovery could not be completed safely; no unproven recovery action was taken.';
+        $recovery['reason_code'] = $reasonCode;
+        $recovery['correlation_id'] = $correlationId;
+
+        return $recovery;
     }
 
     /**

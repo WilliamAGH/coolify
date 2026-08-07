@@ -38,6 +38,7 @@ use Illuminate\Process\FakeProcessResult;
 use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Notification;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Queue;
@@ -742,6 +743,72 @@ it('archives an exact failed first-adoption stale journal before releasing its e
             'sh "$container_journal_mutation_decoded"',
             'sh "$container_journal_completion_decoded"',
         );
+});
+
+it('returns a stable inspection failure code without remote diagnostics', function (): void {
+    ['application' => $application, 'deployment' => $deployment] = makeEmergencyFailedFirstAdoptionJournalScenario(
+        $this->environment,
+        $this->server,
+        $this->destination,
+    );
+    prepareEmergencyRemoteServer(
+        $this->server,
+        PrivateKey::query()->findOrFail($application->private_key_id),
+    );
+    $remoteDiagnostic = 'ssh: connect to host 10.0.0.9 port 22: Connection refused; docker parser state=invalid';
+    Process::fake(function (PendingProcess $process) use ($remoteDiagnostic): FakeProcessResult {
+        $payload = (is_array($process->command) ? implode(' ', $process->command) : (string) $process->command)
+            ."\n".(string) $process->input;
+        if (str_contains($payload, '/proc/sys/kernel/random/boot_id')) {
+            return Process::result(output: '11111111-2222-3333-4444-555555555555');
+        }
+        if (str_contains($payload, 'coolify-blue-green-stale-first-adoption-runtime:v1')) {
+            return Process::result(errorOutput: $remoteDiagnostic, exitCode: 255);
+        }
+
+        return Process::result();
+    });
+
+    $response = $this->withHeaders(emergencyRecoveryHeaders($this->token))
+        ->postJson("/api/v1/deployments/{$deployment->deployment_uuid}/recover");
+
+    $response->assertOk()
+        ->assertJsonPath('outcome', 'manual_only')
+        ->assertJsonPath('reason_code', 'inspection_failed')
+        ->assertJsonPath('message', 'Deployment recovery could not be completed safely; no unproven recovery action was taken.')
+        ->assertJsonMissing(['message' => $remoteDiagnostic]);
+    expect($response->json('correlation_id'))->toBeUuid();
+});
+
+it('returns a correlated stable response when emergency recovery throws', function (): void {
+    ['deployment' => $deployment] = makeEmergencyFailedFirstAdoptionJournalScenario(
+        $this->environment,
+        $this->server,
+        $this->destination,
+    );
+    $remoteDiagnostic = 'docker daemon replied with database password: not-for-public-response';
+    $throwOnStateLookup = true;
+    Event::listen(
+        'eloquent.retrieved: '.ApplicationBlueGreenDeployment::class,
+        static function () use (&$throwOnStateLookup, $remoteDiagnostic): void {
+            if ($throwOnStateLookup) {
+                throw new RuntimeException($remoteDiagnostic);
+            }
+        },
+    );
+
+    try {
+        $response = $this->withHeaders(emergencyRecoveryHeaders($this->token))
+            ->postJson("/api/v1/deployments/{$deployment->deployment_uuid}/recover");
+    } finally {
+        $throwOnStateLookup = false;
+    }
+
+    $response->assertStatus(500)
+        ->assertJsonPath('reason_code', 'recovery_failed')
+        ->assertJsonPath('message', 'Deployment recovery could not be completed safely.')
+        ->assertJsonMissing(['message' => $remoteDiagnostic]);
+    expect($response->json('correlation_id'))->toBeUuid();
 });
 
 it('does not cancel an exact failed first-adoption successor while its lifecycle owner is active', function (): void {

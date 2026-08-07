@@ -42,6 +42,8 @@ final readonly class BlueGreenInterventionRecoveryResult
         public ?int $deactivationId = null,
         public ?string $activeColor = null,
         public bool $recoveryOwnerActive = false,
+        public ?string $reasonCode = null,
+        public ?string $correlationId = null,
     ) {
         if ($this->recoveryOwnerActive && $this->outcome !== self::DEFERRED) {
             throw new \InvalidArgumentException('Only a deferred blue-green intervention recovery can hand work to a fenced recovery owner.');

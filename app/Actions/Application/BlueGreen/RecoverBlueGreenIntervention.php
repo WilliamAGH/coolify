@@ -22,6 +22,7 @@ use App\Models\StandaloneDocker;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use InvalidArgumentException;
 use Lorisleiva\Actions\Concerns\AsAction;
@@ -100,6 +101,45 @@ final class RecoverBlueGreenIntervention
      * bind — the scheduled owners recover whatever the destination is parked on.
      */
     private ?string $requiredOperationUuid = null;
+
+    /**
+     * One opaque reference shared by every internal audit entry and every
+     * public failure sentence this invocation produces. Raw exception detail
+     * (SSH stderr, Docker output, parser or database messages) is privileged
+     * diagnostics: it stays in the audit channel and error reporting, and the
+     * public result carries only a stable reason code plus this reference so
+     * an operator can find the full internal record.
+     */
+    private ?string $correlationId = null;
+
+    private function correlationId(): string
+    {
+        return $this->correlationId ??= (string) Str::uuid();
+    }
+
+    private function reportRecoveryFailure(
+        \Throwable $exception,
+        string $reasonCode,
+        ?int $stateId = null,
+        ?int $deactivationId = null,
+    ): string {
+        $correlationId = $this->correlationId();
+        $context = [
+            'reason_code' => $reasonCode,
+            'correlation_id' => $correlationId,
+            'state_id' => $stateId,
+            'deactivation_id' => $deactivationId,
+        ];
+
+        Log::warning('Blue-green intervention recovery failed.', [
+            ...$context,
+            'exception' => $exception,
+        ]);
+        auditLog('blue_green.intervention.recovery_failed', $context, 'error');
+        report($exception);
+
+        return $correlationId;
+    }
 
     /**
      * @param  string|null  $requiredOperationUuid  When set, the destination must still be
@@ -242,7 +282,14 @@ final class RecoverBlueGreenIntervention
                 $successorHorizonJobId,
             );
         } catch (BlueGreenDeploymentTransitionException $exception) {
-            return $this->staleContainerMutationJournalManualOnly($stateId, $reason, null, 'rejected', $exception->getMessage());
+            return $this->staleContainerMutationJournalManualOnly(
+                $stateId,
+                $reason,
+                null,
+                'rejected',
+                $exception,
+                'state_changed',
+            );
         }
 
         if ($context['inactive_retirement'] !== null) {
@@ -261,7 +308,14 @@ final class RecoverBlueGreenIntervention
         } catch (BlueGreenOperationFenceLostException) {
             return $this->staleContainerMutationJournalDeferred($stateId, $reason, $context, 'boot_unstable');
         } catch (\Throwable $exception) {
-            return $this->staleContainerMutationJournalManualOnly($stateId, $reason, $context, 'inspection_failed', $exception->getMessage());
+            return $this->staleContainerMutationJournalManualOnly(
+                $stateId,
+                $reason,
+                $context,
+                'inspection_failed',
+                $exception,
+                'inspection_failed',
+            );
         }
 
         if (! $apply) {
@@ -357,43 +411,57 @@ final class RecoverBlueGreenIntervention
             );
         } catch (BlueGreenOperationFenceLostException $exception) {
             if ($archiveAttempted) {
-                report($exception);
-
                 return $this->staleContainerMutationJournalArchiveOutcomeUnknown(
                     $stateId,
                     $reason,
                     $lockedContext,
                     'post_archive_fence_lost',
+                    $exception,
+                    'archive_failed',
                 );
             }
 
             return $this->staleContainerMutationJournalDeferred($stateId, $reason, $context, 'fence_lost');
         } catch (BlueGreenDeploymentTransitionException $exception) {
             if ($archiveAttempted) {
-                report($exception);
-
                 return $this->staleContainerMutationJournalArchiveOutcomeUnknown(
                     $stateId,
                     $reason,
                     $lockedContext,
                     'archive_result_invalid',
+                    $exception,
+                    'state_changed',
                 );
             }
 
-            return $this->staleContainerMutationJournalManualOnly($stateId, $reason, $context, 'state_changed', $exception->getMessage());
+            return $this->staleContainerMutationJournalManualOnly(
+                $stateId,
+                $reason,
+                $context,
+                'state_changed',
+                $exception,
+                'state_changed',
+            );
         } catch (\Throwable $exception) {
             if ($archiveAttempted) {
-                report($exception);
-
                 return $this->staleContainerMutationJournalArchiveOutcomeUnknown(
                     $stateId,
                     $reason,
                     $lockedContext,
                     'archive_transport_unknown',
+                    $exception,
+                    'archive_failed',
                 );
             }
 
-            return $this->staleContainerMutationJournalManualOnly($stateId, $reason, $context, 'archive_failed', $exception->getMessage());
+            return $this->staleContainerMutationJournalManualOnly(
+                $stateId,
+                $reason,
+                $context,
+                'archive_failed',
+                $exception,
+                'archive_failed',
+            );
         } finally {
             $this->releaseStateFence($operationFence);
         }
@@ -433,8 +501,15 @@ final class RecoverBlueGreenIntervention
             );
         } catch (BlueGreenOperationFenceLostException) {
             return $this->staleContainerMutationJournalDeferred($stateId, $reason, $context, 'boot_unstable');
-        } catch (\Throwable) {
-            return $this->staleContainerMutationJournalManualOnly($stateId, $reason, $context, 'mature_inspection_failed');
+        } catch (\Throwable $exception) {
+            return $this->staleContainerMutationJournalManualOnly(
+                $stateId,
+                $reason,
+                $context,
+                'mature_inspection_failed',
+                $exception,
+                'inspection_failed',
+            );
         }
         if (! $apply) {
             $this->auditStaleContainerMutationJournal(
@@ -546,43 +621,57 @@ final class RecoverBlueGreenIntervention
             );
         } catch (BlueGreenOperationFenceLostException $exception) {
             if ($archiveAttempted) {
-                report($exception);
-
                 return $this->staleContainerMutationJournalArchiveOutcomeUnknown(
                     $stateId,
                     $reason,
                     $lockedContext,
                     'mature_post_archive_fence_lost',
+                    $exception,
+                    'archive_failed',
                 );
             }
 
             return $this->staleContainerMutationJournalDeferred($stateId, $reason, $lockedContext, 'mature_fence_lost');
         } catch (BlueGreenDeploymentTransitionException $exception) {
             if ($archiveAttempted) {
-                report($exception);
-
                 return $this->staleContainerMutationJournalArchiveOutcomeUnknown(
                     $stateId,
                     $reason,
                     $lockedContext,
                     'mature_archive_db_reconciliation_failed',
+                    $exception,
+                    'state_changed',
                 );
             }
 
-            return $this->staleContainerMutationJournalManualOnly($stateId, $reason, $lockedContext, 'mature_state_changed');
+            return $this->staleContainerMutationJournalManualOnly(
+                $stateId,
+                $reason,
+                $lockedContext,
+                'mature_state_changed',
+                $exception,
+                'state_changed',
+            );
         } catch (\Throwable $exception) {
             if ($archiveAttempted) {
-                report($exception);
-
                 return $this->staleContainerMutationJournalArchiveOutcomeUnknown(
                     $stateId,
                     $reason,
                     $lockedContext,
                     'mature_archive_transport_unknown',
+                    $exception,
+                    'archive_failed',
                 );
             }
 
-            return $this->staleContainerMutationJournalManualOnly($stateId, $reason, $lockedContext, 'mature_archive_failed');
+            return $this->staleContainerMutationJournalManualOnly(
+                $stateId,
+                $reason,
+                $lockedContext,
+                'mature_archive_failed',
+                $exception,
+                'archive_failed',
+            );
         } finally {
             $this->releaseStateFence($operationFence);
         }
@@ -1845,6 +1934,7 @@ SH;
         try {
             auditLog($event, [
                 'classification' => BlueGreenInterventionRecoveryResult::STALE_CONTAINER_JOURNAL,
+                'correlation_id' => $this->correlationId(),
                 'state_id' => $stateId,
                 'application_id' => $context === null ? null : (int) $context['application']->id,
                 'destination_id' => $context === null ? null : (int) $context['destination']->id,
@@ -1865,25 +1955,35 @@ SH;
         ?string $reason,
         ?array $context,
         string $phase,
-        ?string $detail = null,
+        ?\Throwable $exception = null,
+        ?string $reasonCode = null,
     ): BlueGreenInterventionRecoveryResult {
+        $reasonCode ??= $exception === null ? null : $phase;
+        $correlationId = $exception === null
+            ? null
+            : $this->reportRecoveryFailure($exception, $reasonCode, $stateId);
+        $auditContext = ['phase' => $phase];
+        if ($reasonCode !== null) {
+            $auditContext['reason_code'] = $reasonCode;
+        }
+        if ($correlationId !== null) {
+            $auditContext['correlation_id'] = $correlationId;
+        }
         $this->auditStaleContainerMutationJournal(
             'blue_green.stale_container_journal.manual_only',
             $stateId,
             $context,
             $reason,
-            $detail === null ? ['phase' => $phase] : ['phase' => $phase, 'detail' => $detail],
+            $auditContext,
         );
-        $message = 'The requested state, destination, or stale journal did not prove one supported fail-closed recovery profile; no journal was changed.';
-        if ($detail !== null) {
-            $message .= ' Refused precondition: '.$detail;
-        }
 
         return new BlueGreenInterventionRecoveryResult(
             classification: BlueGreenInterventionRecoveryResult::STALE_CONTAINER_JOURNAL,
             outcome: BlueGreenInterventionRecoveryResult::MANUAL_ONLY,
-            message: $message,
+            message: 'The requested state, destination, or stale journal did not prove one supported fail-closed recovery profile; no journal was changed.',
             stateId: $stateId,
+            reasonCode: $reasonCode,
+            correlationId: $correlationId,
         );
     }
 
@@ -1921,13 +2021,26 @@ SH;
         ?string $reason,
         array $context,
         string $phase,
+        ?\Throwable $exception = null,
+        ?string $reasonCode = null,
     ): BlueGreenInterventionRecoveryResult {
+        $reasonCode ??= $exception === null ? null : $phase;
+        $correlationId = $exception === null
+            ? null
+            : $this->reportRecoveryFailure($exception, $reasonCode, $stateId);
+        $auditContext = ['phase' => $phase];
+        if ($reasonCode !== null) {
+            $auditContext['reason_code'] = $reasonCode;
+        }
+        if ($correlationId !== null) {
+            $auditContext['correlation_id'] = $correlationId;
+        }
         $this->auditStaleContainerMutationJournal(
             'blue_green.stale_container_journal.archive_outcome_unknown',
             $stateId,
             $context,
             $reason,
-            ['phase' => $phase],
+            $auditContext,
         );
 
         return new BlueGreenInterventionRecoveryResult(
@@ -1935,6 +2048,8 @@ SH;
             outcome: BlueGreenInterventionRecoveryResult::DEFERRED,
             message: 'Stale-journal archival may have completed, but its final state could not be proven. Re-run this exact recovery in inspection mode; do not replay, remove, or edit the journal manually.',
             stateId: $stateId,
+            reasonCode: $reasonCode,
+            correlationId: $correlationId,
         );
     }
 
@@ -2025,8 +2140,10 @@ SH;
             } catch (BlueGreenOperationFenceLostException $exception) {
                 throw $exception;
             } catch (\Throwable $exception) {
+                $correlationId = $this->reportRecoveryFailure($exception, 'archive_failed', $stateId);
                 $this->audit('blue_green.intervention.spent_first_adoption_journal_not_recovered', $plan, $reason, [
-                    'message' => $exception->getMessage(),
+                    'reason_code' => 'archive_failed',
+                    'correlation_id' => $correlationId,
                 ]);
             }
             $operationFence->assertLockOwnership();
@@ -2041,15 +2158,19 @@ SH;
                 // An unreadable route proves nothing in either direction — the
                 // host may have blinked — so the state stays parked for the
                 // scheduler's next cooldown-paced attempt.
+                $correlationId = $this->reportRecoveryFailure($exception, 'inspection_failed', $stateId);
                 $this->audit('blue_green.intervention.unreconstructable_deferred', $plan, $reason, [
-                    'message' => $exception->getMessage(),
+                    'reason_code' => 'inspection_failed',
+                    'correlation_id' => $correlationId,
                 ]);
 
                 return new BlueGreenInterventionRecoveryResult(
                     classification: $plan->classification,
                     outcome: BlueGreenInterventionRecoveryResult::DEFERRED,
-                    message: 'The live managed route could not be read, so the unreconstructable drain could be proven neither live nor obsolete; nothing was changed: '.$exception->getMessage(),
+                    message: 'The live managed route could not be read, so the unreconstructable drain could be proven neither live nor obsolete; nothing was changed.',
                     stateId: $stateId,
+                    reasonCode: 'inspection_failed',
+                    correlationId: $correlationId,
                 );
             }
             $operationFence->assertLockOwnership();
@@ -2218,15 +2339,23 @@ SH;
         } catch (BlueGreenOperationFenceLostException $exception) {
             throw $exception;
         } catch (\Throwable $exception) {
+            $correlationId = $this->reportRecoveryFailure(
+                $exception,
+                'archive_failed',
+                (int) $state->getKey(),
+            );
             $this->audit('blue_green.intervention.fixed_color_container_journal_deferred', $plan, $reason, [
-                'message' => $exception->getMessage(),
+                'reason_code' => 'archive_failed',
+                'correlation_id' => $correlationId,
             ]);
 
             return new BlueGreenInterventionRecoveryResult(
                 classification: $plan->classification,
                 outcome: BlueGreenInterventionRecoveryResult::DEFERRED,
-                message: 'The fixed-color container-mutation journal could not be authenticated and archived for the exact parked owner, so no resume or terminalization was attempted: '.$exception->getMessage(),
+                message: 'The fixed-color container-mutation journal could not be authenticated and archived for the exact parked owner, so no resume or terminalization was attempted.',
                 stateId: (int) $state->getKey(),
+                reasonCode: 'archive_failed',
+                correlationId: $correlationId,
             );
         }
     }
@@ -2437,28 +2566,46 @@ SH;
                     $operationFence,
                 );
             } catch (BlueGreenDeactivationInProgressException|BlueGreenDeactivationTransportException $exception) {
+                $correlationId = $this->reportRecoveryFailure(
+                    $exception,
+                    'deactivation_deferred',
+                    $plan->stateId,
+                    $deactivationId,
+                );
                 $this->audit('blue_green.intervention.deactivation_deferred', $plan, $reason, [
-                    'message' => $exception->getMessage(),
+                    'reason_code' => 'deactivation_deferred',
+                    'correlation_id' => $correlationId,
                 ]);
 
                 return new BlueGreenInterventionRecoveryResult(
                     classification: $plan->classification,
                     outcome: BlueGreenInterventionRecoveryResult::DEFERRED,
-                    message: $exception->getMessage(),
+                    message: 'The durable deactivation could not complete in this pass and remains resumable; no state was force-advanced.',
                     stateId: $plan->stateId,
                     deactivationId: $deactivationId,
+                    reasonCode: 'deactivation_deferred',
+                    correlationId: $correlationId,
                 );
             } catch (BlueGreenDeactivationException $exception) {
+                $correlationId = $this->reportRecoveryFailure(
+                    $exception,
+                    'deactivation_failed',
+                    $plan->stateId,
+                    $deactivationId,
+                );
                 $this->audit('blue_green.intervention.deactivation_failed', $plan, $reason, [
-                    'message' => $exception->getMessage(),
+                    'reason_code' => 'deactivation_failed',
+                    'correlation_id' => $correlationId,
                 ]);
 
                 return new BlueGreenInterventionRecoveryResult(
                     classification: $plan->classification,
                     outcome: BlueGreenInterventionRecoveryResult::MANUAL_ONLY,
-                    message: $exception->getMessage(),
+                    message: 'The durable deactivation could not be recovered safely and remains parked for manual intervention.',
                     stateId: $plan->stateId,
                     deactivationId: $deactivationId,
+                    reasonCode: 'deactivation_failed',
+                    correlationId: $correlationId,
                 );
             }
 
@@ -3616,6 +3763,7 @@ SH;
     ): void {
         auditLog($event, [
             'classification' => $plan->classification,
+            'correlation_id' => $this->correlationId(),
             'state_id' => $plan->stateId,
             'deactivation_id' => $plan->deactivationId,
             'reason' => $reason,
