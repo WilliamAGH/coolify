@@ -2,7 +2,10 @@
 
 namespace App\Actions\Application\BlueGreen;
 
+use App\Actions\Proxy\BlueGreenActiveContainer;
 use App\Actions\Proxy\BlueGreenActiveContainerSet;
+use App\Actions\Proxy\BlueGreenActiveReplica;
+use App\Actions\Proxy\BlueGreenActiveReplicaSet;
 use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Enums\BlueGreenDeploymentColor;
@@ -64,6 +67,8 @@ final class ResolveBlueGreenExpectedProxyState
         $activeContainerName = null;
         $activeContainerId = null;
         $activeContainerSet = null;
+        $activeReplicaSetDigest = null;
+        $activeReplicaSet = null;
         if ($state->managed_file_sha256 !== null) {
             $deploymentUuids = collect([
                 $state->blue_deployment_uuid,
@@ -96,8 +101,29 @@ final class ResolveBlueGreenExpectedProxyState
             $activeDeploymentUuid = $resolution->deploymentUuid;
             $activeContainerName = $application->uuid.'-'.$activeColor->value;
             $activeContainerId = $resolution->containerId;
-            $activeContainerSet = is_string($activeContainerId)
-                ? $this->activeContainerSet(
+            $activeDeployment = $activeDeployments->get($activeDeploymentUuid);
+            $activeBackendPortInventory = $activeDeployment instanceof ApplicationDeploymentQueue
+                && is_string($activeDeployment->blue_green_backend_port_inventory)
+                    ? BlueGreenBackendPortInventory::fromSerialized($activeDeployment->blue_green_backend_port_inventory)
+                    : null;
+            $activeReplicaSet = is_string($activeContainerId)
+                ? $this->activeReplicaSet(
+                    $application,
+                    $state,
+                    $activeColor,
+                    $activeDeploymentUuid,
+                    $replicas->get($activeDeploymentUuid) ?? collect(),
+                    $activeBackendPortInventory?->ports() ?? [],
+                    $activeContainerId,
+                )
+                : null;
+            if ($activeReplicaSet !== null) {
+                $representative = $activeReplicaSet->representative();
+                $activeContainerName = $representative->name;
+                $activeContainerId = $representative->id;
+                $activeReplicaSetDigest = $activeReplicaSet->identityDigest();
+            } elseif (is_string($activeContainerId)) {
+                $activeContainerSetProjection = $this->activeContainerSet(
                     $application,
                     $state,
                     $activeColor,
@@ -105,8 +131,13 @@ final class ResolveBlueGreenExpectedProxyState
                     $replicas->get($activeDeploymentUuid) ?? collect(),
                     $activeContainerName,
                     $activeContainerId,
-                )
-                : null;
+                );
+                if ($activeContainerSetProjection !== null) {
+                    $activeContainerSet = $activeContainerSetProjection['set'];
+                    $activeContainerName = $activeContainerSetProjection['representative']->containerName;
+                    $activeContainerId = $activeContainerSetProjection['representative']->dockerId;
+                }
+            }
         } elseif ($state->active_color !== null) {
             throw new BlueGreenDeploymentTransitionException('Durable DB state names an active route while the managed file is absent.');
         }
@@ -127,6 +158,138 @@ final class ResolveBlueGreenExpectedProxyState
             applicationRoutingConfigDigest: $state->application_routing_config_digest,
             destinationTopologyDigest: $state->destination_topology_digest,
             activeContainerSet: $activeContainerSet,
+            activeReplicaSetDigest: $activeReplicaSetDigest,
+            activeReplicaSet: $activeReplicaSet,
+        );
+    }
+
+    /**
+     * Reproduce only the v3 bytes emitted by the released aggregate-scalar
+     * writer. The canonical projection above first proves that the durable
+     * replica ledger accepts that aggregate identity; this method then changes
+     * only the routed scalar/member ID back to the released value so an exact
+     * on-host compatibility CAS can recognize it.
+     */
+    public function releasedV3State(
+        Application $application,
+        StandaloneDocker $destination,
+        ApplicationBlueGreenDeployment $state,
+    ): ?BlueGreenProxyState {
+        $canonical = $this->handle($application, $destination, $state);
+        if ($canonical?->activeContainerSet === null
+            || $canonical->activeReplicaSet !== null
+            || ! is_string($canonical->activeDeploymentUuid)
+            || ! is_string($canonical->activeContainerName)
+            || ! is_string($canonical->activeContainerId)) {
+            return null;
+        }
+        $deployment = ApplicationDeploymentQueue::query()
+            ->where('application_id', $application->id)
+            ->where('destination_id', $destination->id)
+            ->where('deployment_uuid', $canonical->activeDeploymentUuid)
+            ->first();
+        $releasedAggregateId = $deployment?->blue_green_candidate_container_id;
+        if (! is_string($releasedAggregateId)
+            || hash_equals($releasedAggregateId, $canonical->activeContainerId)) {
+            return null;
+        }
+
+        $replacedRoutedMember = false;
+        $members = array_map(function (BlueGreenActiveContainer $member) use (
+            $canonical,
+            $releasedAggregateId,
+            &$replacedRoutedMember,
+        ): BlueGreenActiveContainer {
+            if ($member->name !== $canonical->activeContainerName
+                || $member->id !== $canonical->activeContainerId) {
+                return $member;
+            }
+            $replacedRoutedMember = true;
+
+            return new BlueGreenActiveContainer($member->port, $member->name, $releasedAggregateId);
+        }, $canonical->activeContainerSet->members);
+        if (! $replacedRoutedMember) {
+            throw new BlueGreenDeploymentTransitionException('The canonical v3 route has no exact routed member to project to released bytes.');
+        }
+
+        return new BlueGreenProxyState(
+            managedFilename: $canonical->managedFilename,
+            applicationUuid: $canonical->applicationUuid,
+            destinationId: $canonical->destinationId,
+            operationId: $canonical->operationId,
+            mutationSequence: $canonical->mutationSequence,
+            destinationFenceEpoch: $canonical->destinationFenceEpoch,
+            routingRevision: $canonical->routingRevision,
+            managedSha256: $canonical->managedSha256,
+            activeColor: $canonical->activeColor,
+            activeDeploymentUuid: $canonical->activeDeploymentUuid,
+            activeContainerName: $canonical->activeContainerName,
+            activeContainerId: $releasedAggregateId,
+            applicationRoutingConfigDigest: $canonical->applicationRoutingConfigDigest,
+            destinationTopologyDigest: $canonical->destinationTopologyDigest,
+            activeContainerSet: BlueGreenActiveContainerSet::fromMembers($members),
+        );
+    }
+
+    /**
+     * Reproduce the scalar v2 sidecar emitted for replica fan-out before v4
+     * recorded every concrete backend. The fixed colour name and legacy digest
+     * are accepted only when the exact durable ledger independently reproduces
+     * both the released and canonical identities.
+     */
+    public function releasedV2FanOutState(
+        Application $application,
+        StandaloneDocker $destination,
+        ApplicationBlueGreenDeployment $state,
+    ): ?BlueGreenProxyState {
+        $canonical = $this->handle($application, $destination, $state);
+        if ($canonical?->activeReplicaSet === null
+            || ! is_string($canonical->activeReplicaSetDigest)
+            || ! $canonical->activeColor instanceof BlueGreenDeploymentColor
+            || ! is_string($canonical->activeDeploymentUuid)
+            || ! is_string($canonical->activeContainerName)
+            || ! is_string($canonical->activeContainerId)) {
+            return null;
+        }
+        $deployment = ApplicationDeploymentQueue::query()
+            ->where('application_id', $application->id)
+            ->where('destination_id', $destination->id)
+            ->where('deployment_uuid', $canonical->activeDeploymentUuid)
+            ->first();
+        $releasedAggregateId = $deployment?->blue_green_candidate_container_id;
+        $inspections = array_map(
+            static fn (BlueGreenActiveReplica $replica): BlueGreenReplicaInspection => BlueGreenReplicaInspection::fromRuntime(
+                replicaIndex: $replica->replicaIndex,
+                composeService: $replica->composeService,
+                containerName: $replica->name,
+                dockerId: $replica->id,
+                status: 'running',
+                health: 'healthy',
+            ),
+            $canonical->activeReplicaSet->members,
+        );
+        $legacyDigest = BlueGreenReplicaSet::identityDigest($inspections);
+        if (! is_string($releasedAggregateId)
+            || ! hash_equals($releasedAggregateId, $legacyDigest)
+            || hash_equals($releasedAggregateId, $canonical->activeReplicaSetDigest)) {
+            return null;
+        }
+
+        return new BlueGreenProxyState(
+            managedFilename: $canonical->managedFilename,
+            applicationUuid: $canonical->applicationUuid,
+            destinationId: $canonical->destinationId,
+            operationId: $canonical->operationId,
+            mutationSequence: $canonical->mutationSequence,
+            destinationFenceEpoch: $canonical->destinationFenceEpoch,
+            routingRevision: $canonical->routingRevision,
+            managedSha256: $canonical->managedSha256,
+            activeColor: $canonical->activeColor,
+            activeDeploymentUuid: $canonical->activeDeploymentUuid,
+            activeContainerName: $application->uuid.'-'.$canonical->activeColor->value,
+            activeContainerId: $releasedAggregateId,
+            applicationRoutingConfigDigest: $canonical->applicationRoutingConfigDigest,
+            destinationTopologyDigest: $canonical->destinationTopologyDigest,
         );
     }
 
@@ -139,6 +302,7 @@ final class ResolveBlueGreenExpectedProxyState
      * every record earlier releases wrote.
      *
      * @param  Collection<int, ApplicationBlueGreenReplica>  $replicas
+     * @return array{set: BlueGreenActiveContainerSet, representative: BlueGreenReplicaInspection}|null
      */
     private function activeContainerSet(
         Application $application,
@@ -148,7 +312,7 @@ final class ResolveBlueGreenExpectedProxyState
         Collection $replicas,
         string $scalarContainerName,
         string $scalarContainerId,
-    ): ?BlueGreenActiveContainerSet {
+    ): ?array {
         $topology = $application->blueGreenComposeTopology();
         if ($topology === null || $replicas->isEmpty()) {
             return null;
@@ -187,14 +351,95 @@ final class ResolveBlueGreenExpectedProxyState
             })
             ->all();
 
-        return ResolveBlueGreenActiveContainerSet::run(
-            $application,
+        $routedComposeService = $topology->candidateServiceName($activeColor);
+        if (! $replicaSet->matchesPersistedFenceIdentity(
+            $scalarContainerId,
+            $inspections,
+            $routedComposeService,
+        )) {
+            throw new BlueGreenDeploymentTransitionException('The durable co-rolled replica set no longer matches its scalar or released aggregate candidate identity.');
+        }
+        $representative = $replicaSet->representativeInspection($inspections, $routedComposeService);
+        if ($representative->containerName !== $scalarContainerName) {
+            throw new BlueGreenDeploymentTransitionException('The durable co-rolled replica set no longer has the canonical routed container name.');
+        }
+
+        return [
+            'set' => ResolveBlueGreenActiveContainerSet::run(
+                $application,
+                $topology,
+                $activeColor,
+                $replicaSet,
+                $inspections,
+                $scalarContainerName,
+                $representative->dockerId,
+            ) ?? throw new BlueGreenDeploymentTransitionException('The durable co-rolled replica set did not produce its exact route inventory.'),
+            'representative' => $representative,
+        ];
+    }
+
+    /**
+     * Rebuild v4 concrete backend identities only from the immutable replica
+     * ledger. The stored aggregate candidate ID remains a set fence, never a
+     * Docker ID selected for inspection.
+     *
+     * @param  Collection<int, ApplicationBlueGreenReplica>  $replicas
+     */
+    private function activeReplicaSet(
+        Application $application,
+        ApplicationBlueGreenDeployment $state,
+        BlueGreenDeploymentColor $activeColor,
+        string $activeDeploymentUuid,
+        Collection $replicas,
+        array $scalarBackendPorts,
+        string $persistedIdentity,
+    ): ?BlueGreenActiveReplicaSet {
+        $topology = $application->blueGreenComposeTopology();
+        if ($replicas->isEmpty()) {
+            return null;
+        }
+        $members = $state->candidateComposeServicesFor($activeColor, $activeDeploymentUuid, $application);
+        try {
+            $replicaSet = BlueGreenReplicaSet::fromReplicas($replicas, $members);
+        } catch (InvalidArgumentException $exception) {
+            throw new BlueGreenDeploymentTransitionException(
+                'The durable replica ledger no longer groups under the active colour it must fence.',
+                0,
+                $exception,
+            );
+        }
+        if ($replicaSet->usesScalarReplicaNaming()) {
+            return null;
+        }
+        $inspections = $replicas
+            ->sortBy([['replica_index', 'asc'], ['compose_service', 'asc']])
+            ->values()
+            ->map(static function (ApplicationBlueGreenReplica $replica): BlueGreenReplicaInspection {
+                if (! is_string($replica->container_name) || ! is_string($replica->container_id)) {
+                    throw new BlueGreenDeploymentTransitionException('The durable replica ledger has no bound Docker identity to fence.');
+                }
+
+                return BlueGreenReplicaInspection::fromRuntime(
+                    replicaIndex: (int) $replica->replica_index,
+                    composeService: $replica->compose_service,
+                    containerName: $replica->container_name,
+                    dockerId: $replica->container_id,
+                    status: 'running',
+                    health: $replica->health_status,
+                );
+            })
+            ->all();
+
+        if (! $replicaSet->matchesPersistedFenceIdentity($persistedIdentity, $inspections)) {
+            throw new BlueGreenDeploymentTransitionException('The durable active replica set no longer matches its canonical or released aggregate candidate identity.');
+        }
+
+        return (new ResolveBlueGreenActiveReplicaSet)->fromBoundIdentities(
             $topology,
             $activeColor,
             $replicaSet,
             $inspections,
-            $scalarContainerName,
-            $scalarContainerId,
+            $scalarBackendPorts,
         );
     }
 }

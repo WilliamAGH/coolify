@@ -59,6 +59,9 @@ final class ResolveBlueGreenActiveContainerSet
                 "The blue-green colour set has no inspected identity for routed member `{$service}`.",
             );
             $isRoutedMember = $service === $routedService;
+            if ($isRoutedMember && ! hash_equals($identity, $scalarContainerId)) {
+                throw new InvalidArgumentException('The scalar blue-green container identity must be the real routed member Docker ID.');
+            }
             $members[] = new BlueGreenActiveContainer(
                 port: $port,
                 name: $isRoutedMember

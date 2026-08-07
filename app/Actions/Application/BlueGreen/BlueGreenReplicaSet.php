@@ -2,6 +2,8 @@
 
 namespace App\Actions\Application\BlueGreen;
 
+use App\Actions\Proxy\BlueGreenActiveReplica;
+use App\Actions\Proxy\BlueGreenActiveReplicaSet;
 use App\Models\ApplicationBlueGreenReplica;
 use Illuminate\Support\Collection;
 use InvalidArgumentException;
@@ -169,13 +171,7 @@ final readonly class BlueGreenReplicaSet
     /** @param non-empty-list<BlueGreenReplicaInspection> $inspections */
     public static function identityDigest(array $inspections): string
     {
-        usort($inspections, static fn (BlueGreenReplicaInspection $left, BlueGreenReplicaInspection $right): int => [
-            $left->replicaIndex,
-            $left->composeService,
-        ] <=> [
-            $right->replicaIndex,
-            $right->composeService,
-        ]);
+        $inspections = self::canonicalInspections($inspections);
 
         return hash('sha256', implode("\0", array_map(
             static fn (BlueGreenReplicaInspection $inspection): string => implode(':', [
@@ -186,6 +182,92 @@ final readonly class BlueGreenReplicaSet
             ]),
             $inspections,
         )));
+    }
+
+    /**
+     * Select the real Docker identity carried beside a colour's durable fence.
+     * A v3 co-rolled set keeps the routed member as its scalar representative;
+     * a v4 fan-out uses the same canonical ordering as the serialized replica
+     * set. The historic v2 shape has exactly one inspection to select.
+     *
+     * @param  non-empty-list<BlueGreenReplicaInspection>  $inspections
+     */
+    public function representativeInspection(
+        array $inspections,
+        ?string $routedComposeService = null,
+    ): BlueGreenReplicaInspection {
+        $inspections = self::canonicalInspections($inspections);
+        if (! $this->usesScalarReplicaNaming()) {
+            return $inspections[0];
+        }
+        if ($this->members === []) {
+            if (count($inspections) !== 1) {
+                throw new InvalidArgumentException('The scalar blue-green replica set must have one exact representative identity.');
+            }
+
+            return $inspections[0];
+        }
+        if (! is_string($routedComposeService) || $routedComposeService === '') {
+            throw new InvalidArgumentException('The co-rolled blue-green replica set requires its exact routed Compose service.');
+        }
+        $routed = array_values(array_filter(
+            $inspections,
+            static fn (BlueGreenReplicaInspection $inspection): bool => $inspection->composeService === $routedComposeService,
+        ));
+        if (count($routed) !== 1) {
+            throw new InvalidArgumentException('The co-rolled blue-green replica set cannot prove one exact routed representative identity.');
+        }
+
+        return $routed[0];
+    }
+
+    /** @param non-empty-list<BlueGreenReplicaInspection> $inspections */
+    public function fenceIdentity(array $inspections, ?string $routedComposeService = null): string
+    {
+        if (! $this->usesScalarReplicaNaming()) {
+            return self::activeReplicaSetIdentityDigest($inspections);
+        }
+
+        return $this->representativeInspection($inspections, $routedComposeService)->dockerId;
+    }
+
+    /**
+     * Released v3 writers persisted the legacy full-set digest where the routed
+     * real Docker ID belongs, and released fan-out writers persisted that same
+     * digest before v4 introduced its canonical JSON identity. Recovery accepts
+     * either legacy shape only when the exact durable ledger still proves it;
+     * new writes always use fenceIdentity().
+     *
+     * @param  non-empty-list<BlueGreenReplicaInspection>  $inspections
+     */
+    public function matchesPersistedFenceIdentity(
+        string $persistedIdentity,
+        array $inspections,
+        ?string $routedComposeService = null,
+    ): bool {
+        if (hash_equals($persistedIdentity, $this->fenceIdentity($inspections, $routedComposeService))) {
+            return true;
+        }
+
+        return ! $this->usesScalarCompatibilityPath()
+            && hash_equals($persistedIdentity, self::identityDigest($inspections));
+    }
+
+    /** @param non-empty-list<BlueGreenReplicaInspection> $inspections */
+    private static function activeReplicaSetIdentityDigest(array $inspections): string
+    {
+        $members = array_map(
+            static fn (BlueGreenReplicaInspection $inspection): BlueGreenActiveReplica => new BlueGreenActiveReplica(
+                composeService: $inspection->composeService,
+                replicaIndex: $inspection->replicaIndex,
+                ports: [],
+                name: $inspection->containerName,
+                id: $inspection->dockerId,
+            ),
+            self::canonicalInspections($inspections),
+        );
+
+        return BlueGreenActiveReplicaSet::fromMembers($members)->identityDigest();
     }
 
     /** @param list<BlueGreenReplicaInspection> $inspections */
@@ -305,5 +387,30 @@ final readonly class BlueGreenReplicaSet
         if ($replicaIndex < 1 || $replicaIndex > $this->count) {
             throw new InvalidArgumentException('Blue-green replica index is outside the configured set.');
         }
+    }
+
+    /**
+     * @param  non-empty-list<BlueGreenReplicaInspection>  $inspections
+     * @return non-empty-list<BlueGreenReplicaInspection>
+     */
+    private static function canonicalInspections(array $inspections): array
+    {
+        if ($inspections === []) {
+            throw new InvalidArgumentException('The blue-green replica set requires at least one inspected identity.');
+        }
+        foreach ($inspections as $inspection) {
+            if (! $inspection instanceof BlueGreenReplicaInspection) {
+                throw new InvalidArgumentException('The blue-green replica set requires typed inspected identities.');
+            }
+        }
+        usort($inspections, static fn (BlueGreenReplicaInspection $left, BlueGreenReplicaInspection $right): int => [
+            $left->replicaIndex,
+            $left->composeService,
+        ] <=> [
+            $right->replicaIndex,
+            $right->composeService,
+        ]);
+
+        return $inspections;
     }
 }

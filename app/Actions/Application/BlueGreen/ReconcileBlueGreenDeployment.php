@@ -233,9 +233,9 @@ final class ReconcileBlueGreenDeployment
                     $replacementState = $operation->rollbackKey->replacementState;
                     if ($replacementState->activeColor !== $operation->claim->pendingColor
                         || $replacementState->activeDeploymentUuid !== $operation->claim->deploymentUuid
-                        || $replacementState->activeContainerId !== $operation->candidateContainer->dockerId
+                        || $replacementState->activeSetFenceIdentity() !== $operation->candidateFenceIdentity()
                         || $replacementState->routingRevision !== $operation->claim->expectedRoutingRevision
-                        || $replacementState->destinationTopologyDigest !== $operation->claim->topologyDigest) {
+                        || $replacementState->destinationTopologyDigest !== $operation->claim->operationTopologyDigest) {
                         throw new BlueGreenDeploymentTransitionException('The discovered routing mutation does not target the exact claimed candidate.');
                     }
                     $attestation = trim((string) instant_privileged_remote_script(
@@ -368,16 +368,34 @@ final class ReconcileBlueGreenDeployment
     ): BlueGreenReconciliationResult {
         $claim = $operation->claim;
         $candidateReplicas = $this->candidateReplicaInspections($operation);
+        $candidateProjection = null;
         if ($candidateReplicas !== []) {
-            $this->claimReplicaSet($operation)->assertPromotionThreshold($candidateReplicas);
+            $candidateReplicaSet = $this->claimReplicaSet($operation);
+            $candidateReplicaSet->assertPromotionThreshold($candidateReplicas);
+            $candidateProjection = $this->replicaIdentityProjection(
+                $operation,
+                $claim->pendingColor,
+                $candidateReplicaSet,
+                $candidateReplicas,
+            );
         }
         $previousReplicas = $this->previousReplicaInspections($operation);
         $plan = PlanBlueGreenForwardRecovery::run($operation, $candidateReplicas, $previousReplicas);
         $candidate = $candidateReplicas === []
             ? InspectBlueGreenContainer::run($operation->server, $operation->candidateContainer)
-            : $this->aggregateReplicaInspection($candidateReplicas);
+            : $this->aggregateReplicaInspection($candidateReplicas, $candidateProjection['fenceIdentity']);
+        $candidateIdentityMatches = $candidateProjection === null
+            ? $candidate->dockerId === $operation->candidateFenceIdentity()
+            : is_string($operation->candidateFenceIdentity())
+                && $candidateProjection['replicaSet']->matchesPersistedFenceIdentity(
+                    $operation->candidateFenceIdentity(),
+                    $candidateReplicas,
+                    $candidateProjection['routedComposeService'],
+                )
+                && $operation->candidateContainer->name === $candidateProjection['representative']->containerName
+                && $operation->candidateContainer->dockerId === $candidateProjection['representative']->dockerId;
         if (! $candidate->exists
-            || $candidate->dockerId !== $operation->candidateContainer->dockerId
+            || ! $candidateIdentityMatches
             || $candidate->status !== 'running'
             || $candidate->health !== 'healthy') {
             throw new BlueGreenDeploymentTransitionException('Forward recovery could not prove the exact candidate healthy.');
@@ -433,7 +451,7 @@ final class ReconcileBlueGreenDeployment
         $candidateInspection = $replicaCandidate
             ? null
             : InspectBlueGreenContainer::run($operation->server, $operation->candidateContainer);
-        if ($candidateInspection?->exists && $operation->candidateContainer->dockerId === null) {
+        if ($candidateInspection?->exists && $operation->candidateFenceIdentity() === null) {
             throw new BlueGreenDeploymentTransitionException('The interrupted candidate exists without an immutable Docker identity.');
         }
 
@@ -730,24 +748,21 @@ final class ReconcileBlueGreenDeployment
         $claim = $operation->claim;
         if ($state->activeDeploymentUuid !== $claim->deploymentUuid
             || $state->activeColor !== $claim->pendingColor
-            || $state->activeContainerName !== $operation->candidateContainer->name
-            || $state->activeContainerId !== $operation->candidateContainer->dockerId
+            || $state->activeSetFenceIdentity() !== $operation->candidateFenceIdentity()
             || $state->managedSha256 === null
             || $state->destinationFenceEpoch !== ($operation->currentDestinationState?->destinationFenceEpoch ?? 0) + 1
             || $state->routingRevision !== $claim->expectedRoutingRevision
             || $state->applicationRoutingConfigDigest !== $claim->routingConfigDigest
-            || $state->destinationTopologyDigest !== $claim->topologyDigest) {
+            || $state->destinationTopologyDigest !== $claim->operationTopologyDigest) {
             return false;
         }
 
-        if ($claim->candidateContainerNames === []) {
-            return $state->activeContainerSet === null;
-        }
-        // Older scalar fence records can name the aggregate candidate without a
-        // container-set extension. When the journal does carry the extension,
-        // prove every member from bound durable identities before accepting it.
-        if ($state->activeContainerSet === null) {
-            return true;
+        $replicaSet = $this->claimReplicaSet($operation);
+        if ($replicaSet->usesScalarCompatibilityPath()) {
+            return $state->activeContainerName === $operation->candidateContainer->name
+                && $state->activeContainerId === $operation->candidateFenceIdentity()
+                && $state->activeContainerSet === null
+                && $state->activeReplicaSet === null;
         }
 
         return $this->matchesDurableCandidateContainerSet($operation, $state);
@@ -790,6 +805,36 @@ final class ReconcileBlueGreenDeployment
                     );
                 },
             )->all();
+        } catch (\InvalidArgumentException) {
+            return false;
+        }
+
+        $topology = $operation->application->blueGreenComposeTopology();
+        try {
+            $activeReplicaSet = (new ResolveBlueGreenActiveReplicaSet)->fromBoundIdentities(
+                $topology,
+                $claim->pendingColor,
+                $replicaSet,
+                $durableInspections,
+                $claim->backendPortInventory->ports(),
+            );
+        } catch (\InvalidArgumentException) {
+            return false;
+        }
+        if ($activeReplicaSet !== null) {
+            $representative = $activeReplicaSet->representative();
+
+            return $state->activeContainerSet === null
+                && $state->activeContainerName === $representative->name
+                && $state->activeContainerId === $representative->id
+                && $state->activeReplicaSetDigest === $activeReplicaSet->identityDigest()
+                && $state->activeReplicaSet?->toArray() === $activeReplicaSet->toArray();
+        }
+        if ($topology === null) {
+            return false;
+        }
+
+        try {
             $memberIdentities = $replicaSet->memberIdentities($durableInspections);
         } catch (\InvalidArgumentException) {
             return false;
@@ -898,7 +943,25 @@ final class ReconcileBlueGreenDeployment
                 $previous->deploymentUuid,
             )),
         );
-        if (BlueGreenReplicaSet::identityDigest($replicas) !== $previous->dockerId) {
+        $replicaSet = BlueGreenReplicaSet::fromReplicas($rows, $state->candidateComposeServicesFor(
+            $previous->color,
+            $previous->deploymentUuid,
+            $operation->application,
+        ));
+        $projection = $this->replicaIdentityProjection(
+            $operation,
+            $previous->color,
+            $replicaSet,
+            $replicas,
+        );
+        if (! is_string($operation->previousFenceIdentity())
+            || ! $replicaSet->matchesPersistedFenceIdentity(
+                $operation->previousFenceIdentity(),
+                $replicas,
+                $projection['routedComposeService'],
+            )
+            || $previous->name !== $projection['representative']->containerName
+            || $previous->dockerId !== $projection['representative']->dockerId) {
             throw new BlueGreenDeploymentTransitionException('The predecessor replica set no longer matches its exact durable aggregate identity.');
         }
 
@@ -942,11 +1005,13 @@ final class ReconcileBlueGreenDeployment
     }
 
     /** @param non-empty-list<BlueGreenReplicaInspection> $replicas */
-    private function aggregateReplicaInspection(array $replicas): BlueGreenContainerInspection
-    {
+    private function aggregateReplicaInspection(
+        array $replicas,
+        ?string $fenceIdentity = null,
+    ): BlueGreenContainerInspection {
         return new BlueGreenContainerInspection(
             exists: true,
-            dockerId: BlueGreenReplicaSet::identityDigest($replicas),
+            dockerId: $fenceIdentity ?? BlueGreenReplicaSet::identityDigest($replicas),
             status: collect($replicas)->every(
                 static fn (BlueGreenReplicaInspection $inspection): bool => $inspection->status === 'running',
             ) ? 'running' : 'stopped',
@@ -954,6 +1019,31 @@ final class ReconcileBlueGreenDeployment
                 static fn (BlueGreenReplicaInspection $inspection): bool => $inspection->health === 'healthy',
             ) ? 'healthy' : 'unhealthy',
         );
+    }
+
+    /**
+     * @param  non-empty-list<BlueGreenReplicaInspection>  $inspections
+     * @return array{replicaSet: BlueGreenReplicaSet, representative: BlueGreenReplicaInspection, fenceIdentity: string, routedComposeService: ?string}
+     */
+    private function replicaIdentityProjection(
+        BlueGreenDeploymentRecoveryOperation $operation,
+        BlueGreenDeploymentColor $color,
+        BlueGreenReplicaSet $replicaSet,
+        array $inspections,
+    ): array {
+        $routedComposeService = null;
+        if ($replicaSet->usesScalarReplicaNaming() && $replicaSet->members !== []) {
+            $topology = $operation->application->blueGreenComposeTopology()
+                ?? throw new BlueGreenDeploymentTransitionException('The recovery co-rolled replica set has no exact Compose topology.');
+            $routedComposeService = $topology->candidateServiceName($color);
+        }
+
+        return [
+            'replicaSet' => $replicaSet,
+            'representative' => $replicaSet->representativeInspection($inspections, $routedComposeService),
+            'fenceIdentity' => $replicaSet->fenceIdentity($inspections, $routedComposeService),
+            'routedComposeService' => $routedComposeService,
+        ];
     }
 
     private function replicaExpectation(

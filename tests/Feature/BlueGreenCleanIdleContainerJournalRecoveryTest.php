@@ -6,12 +6,16 @@ use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentTransitionException;
 use App\Actions\Application\BlueGreen\BlueGreenManagedRouteMetadataForOperationResult;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaInspection;
-use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Actions\Application\BlueGreen\RecoverCleanIdleBlueGreenContainerMutationJournal;
+use App\Actions\Application\BlueGreen\RepairBlueGreenSteadyStates;
 use App\Actions\Application\BlueGreen\ResolveBlueGreenExpectedProxyState;
+use App\Actions\Application\BlueGreen\VerifyBlueGreenCandidateReleaseProof;
+use App\Actions\Proxy\BlueGreenActiveReplica;
+use App\Actions\Proxy\BlueGreenActiveReplicaSet;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifact;
 use App\Actions\Proxy\BlueGreenProxyState;
+use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeactivationPhase;
@@ -52,6 +56,8 @@ function cleanIdleJournalStateWithOperation(BlueGreenProxyState $state, string $
         applicationRoutingConfigDigest: $state->applicationRoutingConfigDigest,
         destinationTopologyDigest: $state->destinationTopologyDigest,
         activeContainerSet: $state->activeContainerSet,
+        activeReplicaSetDigest: $state->activeReplicaSetDigest,
+        activeReplicaSet: $state->activeReplicaSet,
     );
 }
 
@@ -164,6 +170,23 @@ it('archives an exact committed clean idle journal after a reboot and reproving 
             'sh "$operation_container_mutation_decoded"',
             'sh "$operation_container_completion_decoded"',
         );
+});
+
+it('does not select a clean idle recovery row outside the exact application destination scope', function (): void {
+    $applicationScenario = BlueGreenRecoveryScenario::create(finalized: true, routingMutationRecorded: true);
+    $foreignServer = Server::factory()->create();
+    $foreignDestination = $foreignServer->standaloneDockers()->firstOrFail();
+    Process::fake();
+
+    expect(fn () => RepairBlueGreenSteadyStates::make()->recoverCleanIdleContainerMutationJournal(
+        $applicationScenario->application,
+        $foreignDestination,
+    ))->toThrow(
+        BlueGreenDeploymentTransitionException::class,
+        'has no durable state for this application destination',
+    );
+
+    Process::assertNothingRan();
 });
 
 it('fails closed when a committed clean idle journal becomes pending before archival', function (): void {
@@ -308,8 +331,18 @@ it('archives a committed clean idle replica journal only after proving every dur
             health: 'healthy',
         );
     })->all();
+    $durableActiveReplicaSet = BlueGreenActiveReplicaSet::fromMembers(array_map(
+        static fn (BlueGreenReplicaInspection $inspection): BlueGreenActiveReplica => new BlueGreenActiveReplica(
+            composeService: $inspection->composeService,
+            replicaIndex: $inspection->replicaIndex,
+            ports: [3000],
+            name: $inspection->containerName,
+            id: $inspection->dockerId,
+        ),
+        $inspections,
+    ));
     $scenario->deployment->update([
-        'blue_green_candidate_container_id' => BlueGreenReplicaSet::identityDigest($inspections),
+        'blue_green_candidate_container_id' => $durableActiveReplicaSet->identityDigest(),
     ]);
     foreach ($inspections as $inspection) {
         ApplicationBlueGreenReplica::query()->create([
@@ -339,26 +372,30 @@ it('archives a committed clean idle replica journal only after proving every dur
     $journalPresent = true;
     $replicaInspectionRequested = false;
     $payloads = [];
-    $runtimeOutput = collect($inspections)->map(fn (BlueGreenReplicaInspection $inspection): string => json_encode([
-        'Id' => $inspection->dockerId,
-        'Name' => '/'.$inspection->containerName,
-        'State' => [
-            'Status' => $inspection->status,
-            'Health' => ['Status' => $inspection->health],
-        ],
-        'Config' => ['Labels' => [
-            'coolify.applicationId' => (string) $scenario->application->id,
-            'coolify.pullRequestId' => '0',
-            'coolify.blueGreen.managed' => 'true',
-            'coolify.blueGreen.deploymentUuid' => $scenario->deployment->deployment_uuid,
-            'coolify.blueGreen.color' => BlueGreenDeploymentColor::BLUE->value,
-            'coolify.blueGreen.routingRevision' => '1',
-            'coolify.blueGreen.replicaIndex' => (string) $inspection->replicaIndex,
-            'coolify.blueGreen.replicaCount' => '2',
-            'com.docker.compose.project' => $scenario->application->uuid,
-            'com.docker.compose.service' => $inspection->composeService,
-        ]],
-    ], JSON_THROW_ON_ERROR))->implode("\n");
+    $runtimeById = collect($inspections)->mapWithKeys(fn (BlueGreenReplicaInspection $inspection): array => [
+        $inspection->dockerId => json_encode([
+            'Id' => $inspection->dockerId,
+            'Name' => '/'.$inspection->containerName,
+            'State' => [
+                'Status' => $inspection->status,
+                'Health' => ['Status' => $inspection->health],
+            ],
+            'Config' => ['Labels' => [
+                'coolify.applicationId' => (string) $scenario->application->id,
+                'coolify.pullRequestId' => '0',
+                'coolify.blueGreen.managed' => 'true',
+                'coolify.blueGreen.deploymentUuid' => $scenario->deployment->deployment_uuid,
+                'coolify.blueGreen.color' => BlueGreenDeploymentColor::BLUE->value,
+                'coolify.blueGreen.routingRevision' => '1',
+                'coolify.blueGreen.replicaIndex' => (string) $inspection->replicaIndex,
+                'coolify.blueGreen.replicaCount' => '2',
+                'com.docker.compose.project' => $scenario->application->uuid,
+                'com.docker.compose.service' => $inspection->composeService,
+            ]],
+        ], JSON_THROW_ON_ERROR),
+    ]);
+    $runtimeOutput = $runtimeById->implode("\n");
+    $releaseProof = BlueGreenRoutingTarget::durableReleaseProofToken($scenario->deployment->deployment_uuid);
 
     Process::fake(function (PendingProcess $process) use (
         $expectedState,
@@ -368,6 +405,8 @@ it('archives a committed clean idle replica journal only after proving every dur
         &$journalPresent,
         &$payloads,
         &$replicaInspectionRequested,
+        $releaseProof,
+        $runtimeById,
         $runtimeOutput,
     ) {
         $payload = (string) $process->command."\n".(string) $process->input;
@@ -409,6 +448,16 @@ it('archives a committed clean idle replica journal only after proving every dur
 
             return Process::result(output: $runtimeOutput);
         }
+        if (str_contains($payload, VerifyBlueGreenCandidateReleaseProof::LABEL)) {
+            return Process::result(output: json_encode([
+                VerifyBlueGreenCandidateReleaseProof::ENVIRONMENT_VARIABLE.'='.$releaseProof,
+            ], JSON_THROW_ON_ERROR));
+        }
+        foreach ($runtimeById as $dockerId => $runtime) {
+            if (str_contains($payload, "docker container inspect '{$dockerId}'")) {
+                return Process::result(output: $runtime);
+            }
+        }
         if (str_contains($payload, 'coolify-blue-green-managed-route:present:')) {
             return Process::result(output: 'coolify-blue-green-managed-route:present:'
                 .base64_encode($expectedState->serialize())."\n".$expectedState->managedSha256);
@@ -416,8 +465,6 @@ it('archives a committed clean idle replica journal only after proving every dur
 
         return Process::result(errorOutput: 'Unexpected replica clean-IDLE journal recovery command.', exitCode: 1);
     });
-    InspectBlueGreenContainer::shouldNotRun();
-
     $recovered = RecoverCleanIdleBlueGreenContainerMutationJournal::run(
         $scenario->server,
         $scenario->application,
@@ -427,7 +474,8 @@ it('archives a committed clean idle replica journal only after proving every dur
 
     $allPayloads = implode("\n", $payloads);
     expect($recovered?->serialize())->toBe($expectedState->serialize())
-        ->and($expectedState->activeContainerId)->toBe(BlueGreenReplicaSet::identityDigest($inspections))
+        ->and($expectedState->activeContainerId)->toBe($durableActiveReplicaSet->representative()->id)
+        ->and($expectedState->activeReplicaSetDigest)->toBe($durableActiveReplicaSet->identityDigest())
         ->and($replicaInspectionRequested)->toBeTrue()
         ->and($journalPresent)->toBeFalse()
         ->and($allPayloads)->toContain(

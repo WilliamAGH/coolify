@@ -10,6 +10,7 @@ use App\Models\ApplicationBlueGreenReplica;
 use App\Models\ApplicationDeploymentQueue;
 use Illuminate\Support\Collection;
 use Lorisleiva\Actions\Concerns\AsAction;
+use Throwable;
 
 final class ResolveActiveApplicationContainer
 {
@@ -328,13 +329,27 @@ final class ResolveActiveApplicationContainer
         int $routingRevision,
         Collection $replicas,
     ): ?array {
+        $candidateComposeServices = $state->candidateComposeServicesFor(
+            $color,
+            $deploymentUuid,
+            $application,
+        );
         if ($replicas->isEmpty()) {
+            try {
+                $durableReplicaCount = $this->durableReplicaCount($deployment);
+            } catch (Throwable) {
+                return null;
+            }
+            if ($candidateComposeServices !== [] || ($durableReplicaCount ?? 1) > 1) {
+                return null;
+            }
+
             return [$deployment->blue_green_candidate_container_id];
         }
         try {
             $replicaSet = BlueGreenReplicaSet::fromReplicas(
                 $replicas,
-                $state->candidateComposeServicesFor($color, $deploymentUuid, $application),
+                $candidateComposeServices,
             );
         } catch (\InvalidArgumentException) {
             return null;
@@ -361,10 +376,65 @@ final class ResolveActiveApplicationContainer
             status: 'running',
             health: $replica->health_status,
         ))->all();
+        if ($replicaSet->usesScalarReplicaNaming()) {
+            $routedComposeService = null;
+            if ($replicaSet->members !== []) {
+                $topology = $application->blueGreenComposeTopology();
+                if ($topology === null) {
+                    return null;
+                }
+                $routedComposeService = $topology->candidateServiceName($color);
+            }
 
-        return hash_equals($deployment->blue_green_candidate_container_id, BlueGreenReplicaSet::identityDigest($inspections))
-            ? $containerIds
-            : null;
+            return $replicaSet->matchesPersistedFenceIdentity(
+                $deployment->blue_green_candidate_container_id,
+                $inspections,
+                $routedComposeService,
+            )
+                ? $containerIds
+                : null;
+        }
+
+        try {
+            $backendPortInventory = BlueGreenBackendPortInventory::fromSerialized(
+                $deployment->blue_green_backend_port_inventory,
+            );
+            $activeReplicaSet = (new ResolveBlueGreenActiveReplicaSet)->fromBoundIdentities(
+                $application->blueGreenComposeTopology(),
+                $color,
+                $replicaSet,
+                $inspections,
+                $backendPortInventory->ports(),
+            );
+        } catch (BlueGreenDeploymentTransitionException|\InvalidArgumentException) {
+            return null;
+        }
+
+        return $activeReplicaSet !== null
+            && $replicaSet->matchesPersistedFenceIdentity(
+                $deployment->blue_green_candidate_container_id,
+                $inspections,
+            )
+                ? $containerIds
+                : null;
+    }
+
+    private function durableReplicaCount(ApplicationDeploymentQueue $deployment): ?int
+    {
+        if ($deployment->prepared_activation_payload === null) {
+            return null;
+        }
+        $replicaCount = data_get(
+            $deployment->validatedPreparedActivationPayload(),
+            'artifact.blue_green_claim.replica_count',
+        );
+        if (! is_int($replicaCount)
+            || $replicaCount < MIN_BLUE_GREEN_REPLICA_COUNT
+            || $replicaCount > MAX_BLUE_GREEN_REPLICA_COUNT) {
+            throw new \InvalidArgumentException('The prepared blue-green release has no valid durable replica count.');
+        }
+
+        return $replicaCount;
     }
 
     private function resolveOperationCandidate(

@@ -22,6 +22,8 @@ final readonly class BlueGreenRoutingTarget
 
     public bool $usesExplicitReplicaBackends;
 
+    public ?BlueGreenActiveReplicaSet $activeReplicaSet;
+
     /**
      * Per-backend-port container identity, for a destination whose routed
      * services each own a port. Empty means every port shares the one
@@ -160,6 +162,9 @@ final readonly class BlueGreenRoutingTarget
         ?array $greenReplicaBackends = null,
         ?array $portContainerNames = null,
         public ?BlueGreenActiveContainerSet $activeContainerSet = null,
+        public ?string $activeReplicaSetDigest = null,
+        public ?BlueGreenActiveReplicaSet $blueReplicaSet = null,
+        public ?BlueGreenActiveReplicaSet $greenReplicaSet = null,
     ) {
         if ($destinationId < 0) {
             throw new InvalidArgumentException('The destination ID must be a nonnegative integer.');
@@ -188,10 +193,21 @@ final readonly class BlueGreenRoutingTarget
         $this->greenReplicaBackends = $this->normalizeReplicaBackends(
             $greenReplicaBackends ?? [$greenContainerName],
         );
+        $selectedReplicaSet = $activeColor === BlueGreenDeploymentColor::BLUE
+            ? $blueReplicaSet
+            : $greenReplicaSet;
+        // A v2/v3 rollback state can still need the exact replica topology to
+        // reproduce its managed YAML. Keep those routing inventories without
+        // silently upgrading the serialized fence shape to v4.
+        $this->activeReplicaSet = $activeReplicaSetDigest === null
+            ? null
+            : $selectedReplicaSet;
         if ($this->usesExplicitReplicaBackends
             && max(count($this->blueReplicaBackends), count($this->greenReplicaBackends)) < 2) {
             throw new InvalidArgumentException('An explicit blue-green replica backend inventory must contain at least one multi-replica color.');
         }
+        $this->assertReplicaSetMatchesBackends($blueReplicaSet, $this->blueReplicaBackends);
+        $this->assertReplicaSetMatchesBackends($greenReplicaSet, $this->greenReplicaBackends);
 
         $probeSettingCount = count(array_filter(
             [$probeHeaderName, $probeToken, $probeColor],
@@ -255,6 +271,22 @@ final readonly class BlueGreenRoutingTarget
         }
         if ($destinationFenceEpoch !== null && $destinationFenceEpoch < 1) {
             throw new InvalidArgumentException('The destination fence epoch must be positive.');
+        }
+        if (($activeReplicaSetDigest === null) !== ($this->activeReplicaSet === null)) {
+            throw new InvalidArgumentException('A replica-aware blue-green route requires its aggregate replica-set digest.');
+        }
+        if ($activeContainerSet !== null && $this->activeReplicaSet !== null) {
+            throw new InvalidArgumentException('A blue-green route cannot mix a v3 container set with a v4 replica set.');
+        }
+        if ($this->activeReplicaSet !== null
+            && (! is_string($activeReplicaSetDigest)
+                || ! hash_equals($this->activeReplicaSet->identityDigest(), $activeReplicaSetDigest))) {
+            throw new InvalidArgumentException('The active blue-green replica set does not match its aggregate identity digest.');
+        }
+        if ($this->activeReplicaSet !== null
+            && ($activeContainerId === null
+                || ! hash_equals($this->activeReplicaSet->representative()->id, $activeContainerId))) {
+            throw new InvalidArgumentException('A replica-aware blue-green route must name one real representative Docker ID.');
         }
         if ($operationId !== null && preg_match('/^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/D', $operationId) !== 1) {
             throw new InvalidArgumentException('The destination mutation operation ID is invalid.');
@@ -377,6 +409,23 @@ final readonly class BlueGreenRoutingTarget
     public function replicaBackendsForPort(BlueGreenDeploymentColor $color, int $port): array
     {
         $backends = $this->replicaBackends($color);
+        $replicaSet = $color === BlueGreenDeploymentColor::BLUE
+            ? $this->blueReplicaSet
+            : $this->greenReplicaSet;
+        if ($replicaSet !== null) {
+            $portBackends = array_values(array_map(
+                static fn (BlueGreenActiveReplica $member): string => $member->name,
+                array_filter(
+                    $replicaSet->members,
+                    static fn (BlueGreenActiveReplica $member): bool => in_array($port, $member->ports, true),
+                ),
+            ));
+            if ($portBackends === []) {
+                throw new InvalidArgumentException("The blue-green replica set has no proven backend for port {$port}.");
+            }
+
+            return $portBackends;
+        }
         if (! isset($this->portContainerNames[$port])) {
             return $backends;
         }
@@ -420,6 +469,25 @@ final readonly class BlueGreenRoutingTarget
             '--green--',
             ...$this->greenReplicaBackends,
         ]));
+    }
+
+    /**
+     * @param  non-empty-list<string>  $backends
+     */
+    private function assertReplicaSetMatchesBackends(
+        ?BlueGreenActiveReplicaSet $replicaSet,
+        array $backends,
+    ): void {
+        if ($replicaSet === null) {
+            return;
+        }
+        $replicaNames = array_map(
+            static fn (BlueGreenActiveReplica $member): string => $member->name,
+            $replicaSet->members,
+        );
+        if ($replicaNames !== $backends) {
+            throw new InvalidArgumentException('The exact replica set must match its ordered routing backend inventory.');
+        }
     }
 
     public function probeAcknowledgement(): ?string
@@ -516,7 +584,7 @@ final readonly class BlueGreenRoutingTarget
             activeDeploymentUuid: $this->activeDeploymentUuid,
             activeContainerName: $this->mode === BlueGreenRoutingMode::LegacyRecoveryBridge
                 ? $this->legacyContainerName
-                : $this->containerName($this->activeColor),
+                : ($this->activeReplicaSet?->representative()->name ?? $this->containerName($this->activeColor)),
             activeContainerId: $this->activeContainerId,
             applicationRoutingConfigDigest: $applicationRoutingConfigDigest,
             destinationTopologyDigest: $this->destinationTopologyDigest,
@@ -525,6 +593,12 @@ final readonly class BlueGreenRoutingTarget
             activeContainerSet: $this->mode === BlueGreenRoutingMode::LegacyRecoveryBridge
                 ? null
                 : $this->activeContainerSet,
+            activeReplicaSetDigest: $this->mode === BlueGreenRoutingMode::LegacyRecoveryBridge
+                ? null
+                : $this->activeReplicaSetDigest,
+            activeReplicaSet: $this->mode === BlueGreenRoutingMode::LegacyRecoveryBridge
+                ? null
+                : $this->activeReplicaSet,
         );
     }
 

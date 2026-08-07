@@ -6,16 +6,22 @@ use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenContainerRemovalPlan;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
+use App\Actions\Application\BlueGreen\BlueGreenDeploymentRecoveryOperation;
+use App\Actions\Application\BlueGreen\BlueGreenDeploymentTransitionException;
 use App\Actions\Application\BlueGreen\BlueGreenOperationFence;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaInspection;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
+use App\Actions\Application\BlueGreen\CompleteBlueGreenDeploymentOperation;
 use App\Actions\Application\BlueGreen\ComputeBlueGreenDeploymentFingerprint;
 use App\Actions\Application\BlueGreen\InspectBlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\ReconstructBlueGreenDeploymentRecovery;
 use App\Actions\Application\BlueGreen\RemoveBlueGreenApplicationContainers;
 use App\Actions\Application\BlueGreen\RemoveBlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\ReserveBlueGreenReplicaSet;
+use App\Actions\Proxy\BlueGreenActiveReplica;
+use App\Actions\Proxy\BlueGreenActiveReplicaSet;
+use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Enums\ApplicationDeploymentExecutionPhase;
 use App\Enums\ApplicationDeploymentStatus;
@@ -69,6 +75,7 @@ function exactBlueGreenReplicaBindingFixture(int $replicaCount = 3): array
         'destination_type' => $destination->getMorphClass(),
     ]);
     $deploymentUuid = 'replica-binding-release';
+    $routingTopologyDigest = (new ComputeBlueGreenDeploymentFingerprint)->routingTopologyDigestFor($application, $destination);
     $state = ApplicationBlueGreenDeployment::query()->create([
         'application_id' => $application->id,
         'standalone_docker_id' => $destination->id,
@@ -81,6 +88,7 @@ function exactBlueGreenReplicaBindingFixture(int $replicaCount = 3): array
         'operation_server_boot_id' => '11111111-1111-1111-1111-111111111111',
         'operation_topology_digest' => hash('sha256', 'replica-binding-topology'),
         'operation_routing_config_digest' => hash('sha256', 'replica-binding-routing'),
+        'destination_routing_topology_digest' => $routingTopologyDigest,
         'supersession_generation' => 1,
         'phase' => BlueGreenDeploymentPhase::PREPARING,
         'routing_revision' => 1,
@@ -95,7 +103,8 @@ function exactBlueGreenReplicaBindingFixture(int $replicaCount = 3): array
         expectedRoutingRevision: 1,
         destinationFenceEpoch: 1,
         serverBootId: '11111111-1111-1111-1111-111111111111',
-        topologyDigest: hash('sha256', 'replica-binding-topology'),
+        operationTopologyDigest: hash('sha256', 'replica-binding-topology'),
+        routingTopologyDigest: $routingTopologyDigest,
         routingConfigDigest: hash('sha256', 'replica-binding-routing'),
         backendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
         drainBackendPortInventory: null,
@@ -117,7 +126,7 @@ function exactBlueGreenReplicaBindingFixture(int $replicaCount = 3): array
         'blue_green_routing_revision' => $claim->expectedRoutingRevision,
         'blue_green_destination_fence_epoch' => $claim->destinationFenceEpoch,
         'blue_green_server_boot_id' => $claim->serverBootId,
-        'blue_green_topology_digest' => $claim->topologyDigest,
+        'blue_green_topology_digest' => $claim->operationTopologyDigest,
         'blue_green_routing_config_digest' => $claim->routingConfigDigest,
         'blue_green_backend_port_inventory' => $claim->backendPortInventory->serialized,
         'blue_green_drain_backend_port_inventory' => null,
@@ -155,6 +164,27 @@ function exactBlueGreenReplicaInspections(
         ),
         range(1, $replicaCount),
     );
+}
+
+/** @param non-empty-list<BlueGreenReplicaInspection> $inspections */
+function canonicalV4ReplicaSet(array $inspections): BlueGreenActiveReplicaSet
+{
+    return BlueGreenActiveReplicaSet::fromMembers(array_map(
+        static fn (BlueGreenReplicaInspection $inspection): BlueGreenActiveReplica => new BlueGreenActiveReplica(
+            composeService: $inspection->composeService,
+            replicaIndex: $inspection->replicaIndex,
+            ports: [3000],
+            name: $inspection->containerName,
+            id: $inspection->dockerId,
+        ),
+        $inspections,
+    ));
+}
+
+/** @param non-empty-list<BlueGreenReplicaInspection> $inspections */
+function canonicalV4ReplicaFence(array $inspections): string
+{
+    return canonicalV4ReplicaSet($inspections)->identityDigest();
 }
 
 /** @param array{commands: non-empty-list<string>, completionAssertions: non-empty-list<string>} $plan */
@@ -553,6 +583,86 @@ it('canonicalizes co-rolled replica identities across inspection permutations', 
             $inspections[0],
             $inspections[3],
         ]))->toBe($canonicalIdentity);
+});
+
+it('uses the routed concrete member as the v3 fence while accepting the released aggregate fence', function (): void {
+    $replicaSet = new BlueGreenReplicaSet(1, ['aaa-worker-blue', 'gateway-blue']);
+    $worker = BlueGreenReplicaInspection::fromRuntime(
+        replicaIndex: 1,
+        composeService: 'aaa-worker-blue',
+        containerName: 'app-aaa-worker-blue',
+        dockerId: str_repeat('a', 64),
+        status: 'running',
+        health: 'healthy',
+    );
+    $routed = BlueGreenReplicaInspection::fromRuntime(
+        replicaIndex: 1,
+        composeService: 'gateway-blue',
+        containerName: 'app-blue',
+        dockerId: str_repeat('b', 64),
+        status: 'running',
+        health: 'healthy',
+    );
+    $inspections = [$worker, $routed];
+    $releasedAggregateFence = BlueGreenReplicaSet::identityDigest($inspections);
+
+    expect($replicaSet->representativeInspection($inspections, 'gateway-blue'))->toBe($routed)
+        ->and($replicaSet->fenceIdentity($inspections, 'gateway-blue'))->toBe($routed->dockerId)
+        ->and($replicaSet->matchesPersistedFenceIdentity(
+            $routed->dockerId,
+            $inspections,
+            'gateway-blue',
+        ))->toBeTrue()
+        ->and($replicaSet->matchesPersistedFenceIdentity(
+            $releasedAggregateFence,
+            $inspections,
+            'gateway-blue',
+        ))->toBeTrue();
+});
+
+it('uses the canonical concrete representative beside the aggregate v4 fence', function (): void {
+    $replicaSet = new BlueGreenReplicaSet(2, ['gateway-blue']);
+    $second = BlueGreenReplicaInspection::fromRuntime(
+        replicaIndex: 2,
+        composeService: 'gateway-blue-replica-2',
+        containerName: 'app-blue-replica-2',
+        dockerId: str_repeat('d', 64),
+        status: 'running',
+        health: 'healthy',
+    );
+    $first = BlueGreenReplicaInspection::fromRuntime(
+        replicaIndex: 1,
+        composeService: 'gateway-blue-replica-1',
+        containerName: 'app-blue-replica-1',
+        dockerId: str_repeat('c', 64),
+        status: 'running',
+        health: 'healthy',
+    );
+    $inspections = [$second, $first];
+    $legacyAggregateFence = BlueGreenReplicaSet::identityDigest($inspections);
+    $canonicalAggregateFence = BlueGreenActiveReplicaSet::fromMembers([
+        new BlueGreenActiveReplica('gateway-blue-replica-1', 1, [], 'app-blue-replica-1', $first->dockerId),
+        new BlueGreenActiveReplica('gateway-blue-replica-2', 2, [], 'app-blue-replica-2', $second->dockerId),
+    ])->identityDigest();
+
+    expect($replicaSet->representativeInspection($inspections, 'gateway-blue'))->toBe($first)
+        ->and($canonicalAggregateFence)->not->toBe($legacyAggregateFence)
+        ->and($replicaSet->fenceIdentity($inspections, 'gateway-blue'))->toBe($canonicalAggregateFence)
+        ->and($replicaSet->matchesPersistedFenceIdentity(
+            $canonicalAggregateFence,
+            $inspections,
+            'gateway-blue',
+        ))->toBeTrue()
+        ->and($replicaSet->matchesPersistedFenceIdentity(
+            $legacyAggregateFence,
+            $inspections,
+            'gateway-blue',
+        ))->toBeTrue()
+        ->and($replicaSet->matchesPersistedFenceIdentity(
+            $first->dockerId,
+            $inspections,
+            'gateway-blue',
+        ))->toBeFalse();
 });
 
 it('keeps the single-member replica ledger reading byte-identical', function (): void {
@@ -1221,6 +1331,7 @@ it('freezes the configured replica count into durable claim provenance before se
         'coolify-blue-green-destination-state-attested',
         '',
         BlueGreenDeactivationScenario::BOOT_ID,
+        BlueGreenDeactivationScenario::BOOT_ID,
     ])]);
     $lifecycle = new BlueGreenDeploymentLifecycle(
         application: $application,
@@ -1318,7 +1429,7 @@ it('reconstructs the exact prepared claim after the activation queue handoff', f
             ->and($activationClaim->deploymentUuid)->toBe($preparedClaim->deploymentUuid)
             ->and($activationClaim->candidateContainerName)->toBe($preparedClaim->candidateContainerName)
             ->and($activationClaim->destinationFenceEpoch)->toBe($preparedClaim->destinationFenceEpoch)
-            ->and($activationClaim->topologyDigest)->toBe($preparedClaim->topologyDigest)
+            ->and($activationClaim->operationTopologyDigest)->toBe($preparedClaim->operationTopologyDigest)
             ->and($activationClaim->routingConfigDigest)->toBe($preparedClaim->routingConfigDigest);
     } finally {
         $activation->release();
@@ -1331,6 +1442,253 @@ it('reconstructs the exact prepared claim after the activation queue handoff', f
 
         return str_contains($command, 'coolify-blue-green-destination-state-attested');
     }, 2);
+});
+
+/**
+ * @return array{
+ *     application: Application,
+ *     claim: BlueGreenDeploymentClaim,
+ *     previousFence: string,
+ *     previousInspectionDigest: string,
+ *     previousRepresentative: BlueGreenReplicaInspection,
+ *     state: ApplicationBlueGreenDeployment
+ * }
+ */
+function v4PredecessorCompletionFixture(): array
+{
+    ['application' => $application, 'destination' => $destination, 'server' => $server] = BlueGreenDeactivationScenario::context();
+    $application->update([
+        'health_check_enabled' => true,
+        'ports_mappings' => null,
+    ]);
+    $application->settings()->update([
+        'is_blue_green_deployment_enabled' => true,
+        'is_container_label_readonly_enabled' => true,
+        'blue_green_replica_count' => 3,
+    ]);
+    $application = $application->fresh(['settings']);
+    $previousDeploymentUuid = 'v4-completion-previous-green';
+    $candidateDeploymentUuid = 'v4-completion-candidate-blue';
+    $backendPortInventory = BlueGreenBackendPortInventory::fromPorts([3000]);
+    $previousFingerprint = ComputeBlueGreenDeploymentFingerprint::run(
+        $application,
+        $destination,
+        BlueGreenDeploymentColor::GREEN,
+        1,
+        1,
+        $previousDeploymentUuid,
+    );
+    $state = ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $application->id,
+        'standalone_docker_id' => $destination->id,
+        'active_color' => BlueGreenDeploymentColor::GREEN,
+        'green_deployment_uuid' => $previousDeploymentUuid,
+        'phase' => BlueGreenDeploymentPhase::IDLE,
+        'routing_revision' => 1,
+        'destination_fence_epoch' => 1,
+        'destination_fence_operation_id' => $previousDeploymentUuid,
+        'destination_fence_mutation_sequence' => 1,
+        'managed_file_sha256' => hash('sha256', 'v4-completion-previous-route'),
+        'destination_topology_digest' => $previousFingerprint->operationTopologyDigest,
+        'destination_routing_topology_digest' => $previousFingerprint->routingTopologyDigest,
+        'application_routing_config_digest' => $previousFingerprint->routingConfigDigest,
+        'supersession_generation' => 1,
+    ]);
+    $previousInspections = collect(range(1, 3))->map(function (int $index) use (
+        $application,
+        $destination,
+        $previousDeploymentUuid,
+        $state,
+    ): BlueGreenReplicaInspection {
+        $composeService = $application->uuid."-green-replica-{$index}";
+        $containerName = $composeService.'-1';
+        $containerId = str_repeat((string) $index, 64);
+        ApplicationBlueGreenReplica::query()->create([
+            'application_blue_green_deployment_id' => $state->id,
+            'application_id' => $application->id,
+            'standalone_docker_id' => $destination->id,
+            'color' => BlueGreenDeploymentColor::GREEN,
+            'replica_index' => $index,
+            'deployment_uuid' => $previousDeploymentUuid,
+            'routing_revision' => 1,
+            'compose_project' => $application->uuid,
+            'compose_service' => $composeService,
+            'container_name' => $containerName,
+            'container_id' => $containerId,
+            'health_status' => 'healthy',
+        ]);
+
+        return BlueGreenReplicaInspection::fromRuntime(
+            replicaIndex: $index,
+            composeService: $composeService,
+            containerName: $containerName,
+            dockerId: $containerId,
+            status: 'running',
+            health: 'healthy',
+        );
+    })->all();
+    $previousInspectionDigest = BlueGreenReplicaSet::identityDigest($previousInspections);
+    $previousFence = canonicalV4ReplicaFence($previousInspections);
+    $previousRepresentative = $previousInspections[0];
+    ApplicationDeploymentQueue::query()->create([
+        'application_id' => $application->id,
+        'application_name' => $application->name,
+        'server_id' => $server->id,
+        'server_name' => $server->name,
+        'destination_id' => $destination->id,
+        'deployment_uuid' => $previousDeploymentUuid,
+        'pull_request_id' => 0,
+        'commit' => 'v4-completion-previous-green-commit',
+        'status' => ApplicationDeploymentStatus::FINISHED->value,
+        'finished_at' => now()->subMinute(),
+        'blue_green_color' => BlueGreenDeploymentColor::GREEN,
+        'blue_green_phase' => BlueGreenDeploymentPhase::IDLE,
+        'blue_green_routing_revision' => 1,
+        'blue_green_destination_fence_epoch' => 1,
+        'blue_green_server_boot_id' => BlueGreenDeactivationScenario::BOOT_ID,
+        'blue_green_topology_digest' => $previousFingerprint->operationTopologyDigest,
+        'blue_green_routing_config_digest' => $previousFingerprint->routingConfigDigest,
+        'blue_green_backend_port_inventory' => $backendPortInventory->serialized,
+        'blue_green_drain_backend_port_inventory' => null,
+        'blue_green_supersession_generation' => 1,
+        'blue_green_candidate_container_id' => $previousFence,
+        'blue_green_rollback_managed_filename' => BlueGreenRoutingTarget::managedFilename(
+            (string) $application->uuid,
+            (int) $destination->id,
+        ),
+    ]);
+    $candidateDeployment = ApplicationDeploymentQueue::query()->create([
+        'application_id' => $application->id,
+        'application_name' => $application->name,
+        'server_id' => $server->id,
+        'server_name' => $server->name,
+        'destination_id' => $destination->id,
+        'deployment_uuid' => $candidateDeploymentUuid,
+        'pull_request_id' => 0,
+        'commit' => 'v4-completion-candidate-blue-commit',
+        'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
+        'only_this_server' => true,
+    ]);
+    $candidateFingerprint = ComputeBlueGreenDeploymentFingerprint::run(
+        $application,
+        $destination,
+        BlueGreenDeploymentColor::BLUE,
+        2,
+        2,
+        $candidateDeploymentUuid,
+    );
+    $managedFilename = BlueGreenRoutingTarget::managedFilename((string) $application->uuid, (int) $destination->id);
+    $previousManagedSha256 = $state->managed_file_sha256;
+    $previousActiveReplicaSet = canonicalV4ReplicaSet($previousInspections);
+    $previousProxyState = new BlueGreenProxyState(
+        managedFilename: $managedFilename,
+        applicationUuid: (string) $application->uuid,
+        destinationId: $destination->id,
+        operationId: $previousDeploymentUuid,
+        mutationSequence: 1,
+        destinationFenceEpoch: 1,
+        routingRevision: 1,
+        managedSha256: $previousManagedSha256,
+        activeColor: BlueGreenDeploymentColor::GREEN,
+        activeDeploymentUuid: $previousDeploymentUuid,
+        activeContainerName: $previousRepresentative->containerName,
+        activeContainerId: $previousRepresentative->dockerId,
+        applicationRoutingConfigDigest: $previousFingerprint->routingConfigDigest,
+        destinationTopologyDigest: $previousFingerprint->operationTopologyDigest,
+        activeReplicaSetDigest: $previousFence,
+        activeReplicaSet: $previousActiveReplicaSet,
+    );
+    $claim = new BlueGreenDeploymentClaim(
+        stateId: $state->id,
+        applicationId: $application->id,
+        standaloneDockerId: $destination->id,
+        pendingColor: BlueGreenDeploymentColor::BLUE,
+        previousActiveColor: BlueGreenDeploymentColor::GREEN,
+        deploymentUuid: $candidateDeploymentUuid,
+        expectedRoutingRevision: 2,
+        destinationFenceEpoch: 2,
+        serverBootId: BlueGreenDeactivationScenario::BOOT_ID,
+        operationTopologyDigest: $candidateFingerprint->operationTopologyDigest,
+        routingTopologyDigest: $candidateFingerprint->routingTopologyDigest,
+        routingConfigDigest: $candidateFingerprint->routingConfigDigest,
+        backendPortInventory: $backendPortInventory,
+        drainBackendPortInventory: $backendPortInventory,
+        supersessionGeneration: 2,
+        legacyContainerName: null,
+        replicaCount: 3,
+        candidateContainerName: $application->uuid.'-blue',
+        rollbackManagedFilename: $managedFilename,
+    );
+    $candidateFence = hash('sha256', 'v4-completion-candidate-fence');
+    $routingMutatedAt = now();
+    $state->fresh()->update([
+        'active_color' => BlueGreenDeploymentColor::BLUE,
+        'pending_color' => null,
+        'pending_deployment_uuid' => null,
+        'blue_deployment_uuid' => $candidateDeploymentUuid,
+        'phase' => BlueGreenDeploymentPhase::DRAINING,
+        'routing_revision' => $claim->expectedRoutingRevision,
+        'operation_deployment_uuid' => $claim->deploymentUuid,
+        'operation_previous_active_color' => $claim->previousActiveColor,
+        'operation_previous_deployment_uuid' => $previousDeploymentUuid,
+        'operation_previous_routing_revision' => 1,
+        'operation_previous_container_name' => $previousRepresentative->containerName,
+        'operation_previous_container_id' => $previousFence,
+        'operation_candidate_container_name' => $claim->candidateContainerName,
+        'operation_candidate_container_id' => $candidateFence,
+        'operation_rollback_managed_filename' => $managedFilename,
+        'operation_routing_mutated_at' => $routingMutatedAt,
+        'operation_destination_fence_epoch' => $claim->destinationFenceEpoch,
+        'operation_previous_destination_fence_epoch' => 1,
+        'operation_server_boot_id' => $claim->serverBootId,
+        'operation_topology_digest' => $claim->operationTopologyDigest,
+        'operation_routing_config_digest' => $claim->routingConfigDigest,
+        'operation_previous_managed_file_sha256' => $previousManagedSha256,
+        'operation_previous_proxy_state' => $previousProxyState->serialize(),
+        'operation_previous_proxy_state_sha256' => hash('sha256', $previousProxyState->serialize()),
+        'destination_fence_epoch' => $claim->destinationFenceEpoch,
+        'destination_fence_operation_id' => $claim->deploymentUuid,
+        'destination_fence_mutation_sequence' => 2,
+        'managed_file_sha256' => hash('sha256', 'v4-completion-candidate-route'),
+        'destination_topology_digest' => $claim->operationTopologyDigest,
+        'destination_routing_topology_digest' => $claim->routingTopologyDigest,
+        'application_routing_config_digest' => $claim->routingConfigDigest,
+        'supersession_generation' => $claim->supersessionGeneration,
+    ]);
+    $candidateDeployment->update([
+        'blue_green_color' => $claim->pendingColor,
+        'blue_green_phase' => BlueGreenDeploymentPhase::DRAINING,
+        'blue_green_routing_revision' => $claim->expectedRoutingRevision,
+        'blue_green_destination_fence_epoch' => $claim->destinationFenceEpoch,
+        'blue_green_server_boot_id' => $claim->serverBootId,
+        'blue_green_topology_digest' => $claim->operationTopologyDigest,
+        'blue_green_routing_config_digest' => $claim->routingConfigDigest,
+        'blue_green_backend_port_inventory' => $claim->backendPortInventory->serialized,
+        'blue_green_drain_backend_port_inventory' => $claim->drainBackendPortInventory?->serialized,
+        'blue_green_supersession_generation' => $claim->supersessionGeneration,
+        'blue_green_previous_container_id' => $previousFence,
+        'blue_green_candidate_container_id' => $candidateFence,
+        'blue_green_rollback_managed_filename' => $managedFilename,
+        'blue_green_routing_mutated_at' => $routingMutatedAt,
+    ]);
+
+    return compact('application', 'claim', 'previousFence', 'previousInspectionDigest', 'previousRepresentative', 'state');
+}
+
+it('completes a v4 predecessor using its durable representative name beside the aggregate fence', function (): void {
+    $fixture = v4PredecessorCompletionFixture();
+    $state = $fixture['state']->fresh();
+
+    expect($state->operation_previous_container_name)->toBe($fixture['previousRepresentative']->containerName)
+        ->and($state->operation_previous_container_name)->not->toBe($fixture['application']->uuid.'-green')
+        ->and($state->operation_previous_container_id)->toBe($fixture['previousFence'])
+        ->and($fixture['previousFence'])->not->toBe($fixture['previousInspectionDigest']);
+
+    $completed = CompleteBlueGreenDeploymentOperation::run($fixture['claim']);
+
+    expect($completed->phase)->toBe(BlueGreenDeploymentPhase::IDLE)
+        ->and($completed->operation_deployment_uuid)->toBeNull()
+        ->and($completed->inactive_retirement_container_id)->toBe($fixture['previousFence']);
 });
 
 it('reconstructs the exact active three-replica predecessor after the activation queue handoff', function (): void {
@@ -1368,7 +1726,8 @@ it('reconstructs the exact active three-replica predecessor after the activation
         'destination_fence_operation_id' => $previousDeploymentUuid,
         'destination_fence_mutation_sequence' => 1,
         'managed_file_sha256' => str_repeat('d', 64),
-        'destination_topology_digest' => $previousFingerprint->topologyDigest,
+        'destination_topology_digest' => $previousFingerprint->operationTopologyDigest,
+        'destination_routing_topology_digest' => $previousFingerprint->routingTopologyDigest,
         'application_routing_config_digest' => $previousFingerprint->routingConfigDigest,
         'supersession_generation' => 1,
     ]);
@@ -1405,7 +1764,9 @@ it('reconstructs the exact active three-replica predecessor after the activation
             health: 'healthy',
         ),
     )->all();
-    $previousReplicaDigest = BlueGreenReplicaSet::identityDigest($previousInspections);
+    $previousInspectionDigest = BlueGreenReplicaSet::identityDigest($previousInspections);
+    $previousReplicaFence = canonicalV4ReplicaFence($previousInspections);
+    $previousRepresentative = $previousInspections[0];
     $previousDeployment = ApplicationDeploymentQueue::query()->create([
         'application_id' => $application->id,
         'application_name' => $application->name,
@@ -1422,12 +1783,12 @@ it('reconstructs the exact active three-replica predecessor after the activation
         'blue_green_routing_revision' => 1,
         'blue_green_destination_fence_epoch' => 1,
         'blue_green_server_boot_id' => BlueGreenDeactivationScenario::BOOT_ID,
-        'blue_green_topology_digest' => $previousFingerprint->topologyDigest,
+        'blue_green_topology_digest' => $previousFingerprint->operationTopologyDigest,
         'blue_green_routing_config_digest' => $previousFingerprint->routingConfigDigest,
         'blue_green_backend_port_inventory' => $backendPortInventory->serialized,
         'blue_green_drain_backend_port_inventory' => null,
         'blue_green_supersession_generation' => 1,
-        'blue_green_candidate_container_id' => $previousReplicaDigest,
+        'blue_green_candidate_container_id' => $previousReplicaFence,
         'blue_green_rollback_managed_filename' => $managedFilename,
     ]);
     $candidateDeployment = ApplicationDeploymentQueue::query()->create([
@@ -1443,23 +1804,6 @@ it('reconstructs the exact active three-replica predecessor after the activation
         'execution_phase' => ApplicationDeploymentExecutionPhase::Prepare,
         'only_this_server' => true,
     ]);
-    $preparedClaim = ClaimBlueGreenDeployment::run(
-        application: $application,
-        standaloneDocker: $destination,
-        deployment: $candidateDeployment,
-        serverBootId: BlueGreenDeactivationScenario::BOOT_ID,
-        previousContainer: new BlueGreenContainerExpectation(
-            name: $application->uuid.'-green',
-            dockerId: $previousReplicaDigest,
-            applicationId: $application->id,
-            pullRequestId: 0,
-            blueGreenManaged: true,
-            deploymentUuid: $previousDeployment->deployment_uuid,
-            color: BlueGreenDeploymentColor::GREEN,
-            routingRevision: 1,
-        ),
-    );
-    $candidateDeployment->update(['execution_phase' => ApplicationDeploymentExecutionPhase::Activate]);
     $previousReplicaOutput = $previousReplicaRows->map(static function (ApplicationBlueGreenReplica $replica): string {
         return json_encode([
             'Id' => $replica->container_id,
@@ -1491,6 +1835,32 @@ it('reconstructs the exact active three-replica predecessor after the activation
 
         return Process::result(output: '[]');
     });
+    $capture = new BlueGreenDeploymentLifecycle(
+        application: $application,
+        deployment: $candidateDeployment,
+        destination: $destination,
+        server: $server,
+        timeout: 30,
+        checkForCancellation: static function (): void {},
+    );
+    $captured = (new ReflectionMethod($capture, 'captureHealthyPreviousReplicaSet'))->invoke($capture, $state);
+    $capturedPreviousExpectation = (new ReflectionProperty($capture, 'previousContainerExpectation'))->getValue($capture);
+    $capturedPreviousFence = (new ReflectionProperty($capture, 'previousSetFenceIdentity'))->getValue($capture);
+
+    expect($captured)->toBeTrue()
+        ->and($capturedPreviousExpectation->name)->toBe($previousRepresentative->containerName)
+        ->and($capturedPreviousExpectation->dockerId)->toBe($previousRepresentative->dockerId)
+        ->and($capturedPreviousFence)->toBe($previousReplicaFence)
+        ->and($capturedPreviousFence)->not->toBe($previousInspectionDigest);
+    $preparedClaim = ClaimBlueGreenDeployment::run(
+        application: $application,
+        standaloneDocker: $destination,
+        deployment: $candidateDeployment,
+        serverBootId: BlueGreenDeactivationScenario::BOOT_ID,
+        previousContainer: $capturedPreviousExpectation,
+        previousSetFenceIdentity: $capturedPreviousFence,
+    );
+    $candidateDeployment->update(['execution_phase' => ApplicationDeploymentExecutionPhase::Activate]);
     $activation = new BlueGreenDeploymentLifecycle(
         application: $application,
         deployment: $candidateDeployment->fresh(),
@@ -1527,11 +1897,23 @@ it('reconstructs the exact active three-replica predecessor after the activation
                 $reconstructedPreviousReplicas,
             ))->toBe(['running/healthy', 'running/healthy', 'running/healthy'])
             ->and($reconstructedPreviousBackends)->toBe($previousReplicaRows->pluck('container_name')->all())
-            ->and(BlueGreenReplicaSet::identityDigest($reconstructedPreviousReplicas))->toBe($previousReplicaDigest)
-            ->and($reconstructedPreviousExpectation->dockerId)->toBe($previousReplicaDigest);
+            ->and(BlueGreenReplicaSet::identityDigest($reconstructedPreviousReplicas))->toBe($previousInspectionDigest)
+            ->and($reconstructedPreviousExpectation->name)->toBe($previousRepresentative->containerName)
+            ->and($reconstructedPreviousExpectation->dockerId)->toBe($previousRepresentative->dockerId)
+            ->and($candidateDeployment->fresh()->blue_green_previous_container_id)->toBe($previousReplicaFence)
+            ->and($state->fresh()->operation_previous_container_id)->toBe($previousReplicaFence);
     } finally {
         $activation->release();
     }
+
+    $operation = ReconstructBlueGreenDeploymentRecovery::run($state->fresh());
+    expect($operation->previousDurableContainerName())->toBe($previousRepresentative->containerName);
+
+    $state->fresh()->update([
+        'operation_previous_container_name' => $application->uuid.'-green',
+    ]);
+    expect(fn (): BlueGreenDeploymentRecoveryOperation => ReconstructBlueGreenDeploymentRecovery::run($state->fresh()))
+        ->toThrow(BlueGreenDeploymentTransitionException::class, 'representative');
 });
 
 it('reconstructs the reserved replica quorum after the setting changes', function (
@@ -1593,7 +1975,8 @@ it('plans removal of every co-rolled member of a colour, including a partially s
         expectedRoutingRevision: 12,
         destinationFenceEpoch: 1,
         serverBootId: '11111111-1111-1111-1111-111111111111',
-        topologyDigest: hash('sha256', 'co-rolled-topology'),
+        operationTopologyDigest: hash('sha256', 'co-rolled-topology'),
+        routingTopologyDigest: hash('sha256', 'co-rolled-routing-topology'),
         routingConfigDigest: hash('sha256', 'co-rolled-routing'),
         backendPortInventory: BlueGreenBackendPortInventory::fromPorts([8000, 8080], [8000 => 'llm_gateway', 8080 => 'queue']),
         drainBackendPortInventory: null,
@@ -1636,7 +2019,8 @@ it('admits one inspection per co-rolled member when binding a colour', function 
         expectedRoutingRevision: $claim->expectedRoutingRevision,
         destinationFenceEpoch: $claim->destinationFenceEpoch,
         serverBootId: $claim->serverBootId,
-        topologyDigest: $claim->topologyDigest,
+        operationTopologyDigest: $claim->operationTopologyDigest,
+        routingTopologyDigest: $claim->routingTopologyDigest,
         routingConfigDigest: $claim->routingConfigDigest,
         backendPortInventory: $claim->backendPortInventory,
         drainBackendPortInventory: null,

@@ -3,6 +3,7 @@
 use App\Actions\Application\BlueGreen\BlueGreenReplicaInspection;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\ResolveBlueGreenActiveContainerSet;
+use App\Actions\Application\BlueGreen\ResolveBlueGreenActiveReplicaSet;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\ProxyTypes;
 use App\Models\Application;
@@ -283,6 +284,49 @@ it('composes the fence container set from the replicas each co-rolled member own
         "{$uuid}-blue",
         $gatewayId,
     ))->toBeNull();
+});
+
+it('composes every co-rolled replica as a real v4 backend even when replicas share a port', function (): void {
+    $application = squirrelGatewayApplication(squirrelGatewayCompose(), [
+        'llm_gateway' => ['domain' => 'https://dev.llm-gateway.iocloudhost.net:8000'],
+        'queue' => ['domain' => 'https://dev.api.llm-gateway.iocloudhost.net:8080'],
+    ]);
+    $topology = BlueGreenComposeTopology::fromApplication($application);
+    $replicaSet = new BlueGreenReplicaSet(2, $topology->candidateComposeServices(BlueGreenDeploymentColor::BLUE));
+    $uuid = $application->uuid;
+    $inspection = fn (int $index, string $service, string $container, string $id): BlueGreenReplicaInspection => BlueGreenReplicaInspection::fromRuntime(
+        replicaIndex: $index,
+        composeService: $service,
+        containerName: $container,
+        dockerId: $id,
+        status: 'running',
+        health: 'healthy',
+    );
+
+    $set = ResolveBlueGreenActiveReplicaSet::run(
+        $topology,
+        BlueGreenDeploymentColor::BLUE,
+        $replicaSet,
+        [
+            $inspection(1, 'llm_gateway-blue-replica-1', "{$uuid}-blue-replica-1", str_repeat('a', 64)),
+            $inspection(1, 'queue-blue-replica-1', "{$uuid}-queue-blue-replica-1", str_repeat('b', 64)),
+            $inspection(2, 'llm_gateway-blue-replica-2', "{$uuid}-blue-replica-2", str_repeat('c', 64)),
+            $inspection(2, 'queue-blue-replica-2', "{$uuid}-queue-blue-replica-2", str_repeat('d', 64)),
+        ],
+    );
+
+    expect($set?->toArray())->toBe([
+        ['compose_service' => 'llm_gateway-blue-replica-1', 'replica_index' => 1, 'ports' => [8000], 'name' => "{$uuid}-blue-replica-1", 'id' => str_repeat('a', 64)],
+        ['compose_service' => 'queue-blue-replica-1', 'replica_index' => 1, 'ports' => [8080], 'name' => "{$uuid}-queue-blue-replica-1", 'id' => str_repeat('b', 64)],
+        ['compose_service' => 'llm_gateway-blue-replica-2', 'replica_index' => 2, 'ports' => [8000], 'name' => "{$uuid}-blue-replica-2", 'id' => str_repeat('c', 64)],
+        ['compose_service' => 'queue-blue-replica-2', 'replica_index' => 2, 'ports' => [8080], 'name' => "{$uuid}-queue-blue-replica-2", 'id' => str_repeat('d', 64)],
+    ])
+        ->and($set?->identityDigest())->toBe(BlueGreenReplicaSet::identityDigest([
+            $inspection(1, 'llm_gateway-blue-replica-1', "{$uuid}-blue-replica-1", str_repeat('a', 64)),
+            $inspection(1, 'queue-blue-replica-1', "{$uuid}-queue-blue-replica-1", str_repeat('b', 64)),
+            $inspection(2, 'llm_gateway-blue-replica-2', "{$uuid}-blue-replica-2", str_repeat('c', 64)),
+            $inspection(2, 'queue-blue-replica-2', "{$uuid}-queue-blue-replica-2", str_repeat('d', 64)),
+        ]));
 });
 
 it('refuses to fence a colour whose second member was never inspected', function () {

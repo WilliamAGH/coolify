@@ -17,6 +17,12 @@ final readonly class BlueGreenProxyState
      */
     public const MAGIC_SET = 'coolify-blue-green-destination-fence-v3';
 
+    /**
+     * Replica fan-out has real Docker backends that may share one port. v4
+     * records those identities independently from the aggregate set digest.
+     */
+    public const MAGIC_REPLICA_SET = 'coolify-blue-green-destination-fence-v4';
+
     private const RECORD_KEYS = [
         'magic',
         'managed_filename',
@@ -40,6 +46,12 @@ final readonly class BlueGreenProxyState
         'active_container_set',
     ];
 
+    private const RECORD_KEYS_REPLICA_SET = [
+        ...self::RECORD_KEYS,
+        'active_replica_set_digest',
+        'active_replica_set',
+    ];
+
     public function __construct(
         public string $managedFilename,
         public string $applicationUuid,
@@ -56,6 +68,8 @@ final readonly class BlueGreenProxyState
         public string $applicationRoutingConfigDigest,
         public string $destinationTopologyDigest,
         public ?BlueGreenActiveContainerSet $activeContainerSet = null,
+        public ?string $activeReplicaSetDigest = null,
+        public ?BlueGreenActiveReplicaSet $activeReplicaSet = null,
     ) {
         BlueGreenProxyConfiguration::assertManagedFilename($managedFilename);
         if (preg_match('/^[A-Za-z0-9][A-Za-z0-9_-]*$/D', $applicationUuid) !== 1) {
@@ -102,6 +116,25 @@ final readonly class BlueGreenProxyState
                 throw new InvalidArgumentException('The scalar active blue/green container identity must be a member of the container set.');
             }
         }
+        if (($activeReplicaSetDigest === null) !== ($activeReplicaSet === null)) {
+            throw new InvalidArgumentException('An active blue/green replica set requires one exact aggregate identity digest.');
+        }
+        if ($activeContainerSet !== null && $activeReplicaSet !== null) {
+            throw new InvalidArgumentException('A blue/green route cannot mix the v3 container set with the v4 replica set.');
+        }
+        if ($activeReplicaSet !== null) {
+            if ($activeContainerName === null || $activeContainerId === null) {
+                throw new InvalidArgumentException('An active blue/green replica set requires one exact representative container identity.');
+            }
+            if (! $activeReplicaSet->contains($activeContainerName, $activeContainerId)) {
+                throw new InvalidArgumentException('The representative active blue/green container identity must be a member of the replica set.');
+            }
+            if (! is_string($activeReplicaSetDigest)
+                || preg_match('/^[a-f0-9]{64}$/D', $activeReplicaSetDigest) !== 1
+                || ! hash_equals($activeReplicaSet->identityDigest(), $activeReplicaSetDigest)) {
+                throw new InvalidArgumentException('The active blue/green replica set digest does not match its exact Docker identities.');
+            }
+        }
     }
 
     public function serialize(): string
@@ -123,11 +156,74 @@ final readonly class BlueGreenProxyState
         return hash_equals($expected->serialize(), $actual->serialize());
     }
 
-    /** @return array<string, int|string|list<array{port: int, name: string, id: string}>|null> */
+    /**
+     * The identity compared with the durable deployment candidate. Scalar and
+     * v3 routes use their exact container ID; v4 routes use the aggregate set
+     * digest while keeping `activeContainerId` bound to one real Docker ID.
+     */
+    public function activeSetFenceIdentity(): ?string
+    {
+        if ($this->managedSha256 === null) {
+            return null;
+        }
+
+        return $this->activeReplicaSetDigest ?? $this->activeContainerId;
+    }
+
+    /** @return list<array{name: string, id: string}> */
+    public function activeContainerIdentities(): array
+    {
+        if ($this->activeReplicaSet !== null) {
+            return array_map(
+                static fn (BlueGreenActiveReplica $member): array => ['name' => $member->name, 'id' => $member->id],
+                $this->activeReplicaSet->members,
+            );
+        }
+        if ($this->activeContainerSet !== null) {
+            return array_map(
+                static fn (BlueGreenActiveContainer $member): array => ['name' => $member->name, 'id' => $member->id],
+                $this->activeContainerSet->members,
+            );
+        }
+        if ($this->activeContainerName === null || $this->activeContainerId === null) {
+            return [];
+        }
+
+        return [[
+            'name' => $this->activeContainerName,
+            'id' => $this->activeContainerId,
+        ]];
+    }
+
+    public function containsActiveContainer(string $name, string $id): bool
+    {
+        foreach ($this->activeContainerIdentities() as $identity) {
+            if ($identity['name'] === $name && $identity['id'] === $id) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public function containsActiveContainerId(string $id): bool
+    {
+        foreach ($this->activeContainerIdentities() as $identity) {
+            if ($identity['id'] === $id) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /** @return array<string, int|string|list<array<string, int|string|null>>|null> */
     public function toArray(): array
     {
         $record = [
-            'magic' => $this->activeContainerSet === null ? self::MAGIC : self::MAGIC_SET,
+            'magic' => $this->activeReplicaSet !== null
+                ? self::MAGIC_REPLICA_SET
+                : ($this->activeContainerSet === null ? self::MAGIC : self::MAGIC_SET),
             'managed_filename' => $this->managedFilename,
             'application_uuid' => $this->applicationUuid,
             'destination_id' => $this->destinationId,
@@ -144,7 +240,10 @@ final readonly class BlueGreenProxyState
             'destination_topology_digest' => $this->destinationTopologyDigest,
         ];
 
-        if ($this->activeContainerSet !== null) {
+        if ($this->activeReplicaSet !== null) {
+            $record['active_replica_set_digest'] = $this->activeReplicaSetDigest;
+            $record['active_replica_set'] = $this->activeReplicaSet->toArray();
+        } elseif ($this->activeContainerSet !== null) {
             $record['active_container_set'] = $this->activeContainerSet->toArray();
         }
 
@@ -167,7 +266,10 @@ final readonly class BlueGreenProxyState
         $isSetRecord = is_array($decoded)
             && array_keys($decoded) === self::RECORD_KEYS_SET
             && ($decoded['magic'] ?? null) === self::MAGIC_SET;
-        if (! $isScalarRecord && ! $isSetRecord) {
+        $isReplicaSetRecord = is_array($decoded)
+            && array_keys($decoded) === self::RECORD_KEYS_REPLICA_SET
+            && ($decoded['magic'] ?? null) === self::MAGIC_REPLICA_SET;
+        if (! $isScalarRecord && ! $isSetRecord && ! $isReplicaSetRecord) {
             throw new InvalidArgumentException('The blue/green destination fence state has an invalid record shape.');
         }
 
@@ -186,6 +288,10 @@ final readonly class BlueGreenProxyState
             if ($decoded[$key] !== null && ! is_string($decoded[$key])) {
                 throw new InvalidArgumentException('The blue/green destination fence state has invalid optional fields.');
             }
+        }
+        if ($isReplicaSetRecord
+            && (! is_string($decoded['active_replica_set_digest']) || ! is_array($decoded['active_replica_set']))) {
+            throw new InvalidArgumentException('The blue/green destination fence state has invalid active replica fields.');
         }
         foreach (['destination_id', 'mutation_sequence', 'destination_fence_epoch', 'routing_revision'] as $key) {
             if (! is_int($decoded[$key])) {
@@ -209,6 +315,8 @@ final readonly class BlueGreenProxyState
             applicationRoutingConfigDigest: $decoded['application_routing_config_digest'],
             destinationTopologyDigest: $decoded['destination_topology_digest'],
             activeContainerSet: $isSetRecord ? BlueGreenActiveContainerSet::fromArray($decoded['active_container_set']) : null,
+            activeReplicaSetDigest: $isReplicaSetRecord ? $decoded['active_replica_set_digest'] : null,
+            activeReplicaSet: $isReplicaSetRecord ? BlueGreenActiveReplicaSet::fromArray($decoded['active_replica_set']) : null,
         );
     }
 
@@ -239,6 +347,8 @@ final readonly class BlueGreenProxyState
             // route owns must be preserved with it or the record silently
             // downgrades to the scalar shape and disowns its other containers.
             activeContainerSet: $this->activeContainerSet,
+            activeReplicaSetDigest: $this->activeReplicaSetDigest,
+            activeReplicaSet: $this->activeReplicaSet,
         );
     }
 
@@ -288,6 +398,8 @@ final readonly class BlueGreenProxyState
             // Changing the mutation owner does not change which containers the
             // managed route owns.
             activeContainerSet: $this->activeContainerSet,
+            activeReplicaSetDigest: $this->activeReplicaSetDigest,
+            activeReplicaSet: $this->activeReplicaSet,
         );
     }
 
@@ -399,6 +511,8 @@ final readonly class BlueGreenProxyState
             // identity while the primary stayed put, and recovery would clear an
             // intervention on a route that no longer matches its snapshot.
             && $this->activeContainerSet?->toArray() === $snapshot->activeContainerSet?->toArray()
+            && $this->activeReplicaSetDigest === $snapshot->activeReplicaSetDigest
+            && $this->activeReplicaSet?->toArray() === $snapshot->activeReplicaSet?->toArray()
             && $this->applicationRoutingConfigDigest === $snapshot->applicationRoutingConfigDigest
             && $this->destinationTopologyDigest === $snapshot->destinationTopologyDigest
             && $this->destinationFenceEpoch >= $snapshot->destinationFenceEpoch

@@ -1,9 +1,11 @@
 <?php
 
 use App\Actions\Application\BlueGreen\ActiveApplicationContainerResolution;
+use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaInspection;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\ResolveActiveApplicationContainer;
+use App\Actions\Application\BlueGreen\ResolveBlueGreenActiveReplicaSet;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
@@ -70,11 +72,28 @@ function activeContainerQueue(
     ]);
 }
 
+function activeContainerPreparedReplicaCount(
+    ApplicationDeploymentQueue $deployment,
+    int $replicaCount,
+): ApplicationDeploymentQueue {
+    $deployment = $deployment->fresh();
+    $deployment->update([
+        'prepared_activation_payload' => $deployment->makePreparedActivationPayload([
+            'blue_green_claim' => ['replica_count' => $replicaCount],
+        ]),
+    ]);
+
+    return $deployment->fresh();
+}
+
 it('uses the exact active fixed-color provenance while idle', function () {
     $fixture = activeContainerResolverFixture('resolver-idle');
     $containerId = str_repeat('a', 64);
     $actualRoutingDigest = hash('sha256', 'resolver-idle-actual-routing');
-    activeContainerQueue($fixture, 'resolver-idle-blue', $containerId, BlueGreenDeploymentColor::BLUE, 3);
+    $deployment = activeContainerPreparedReplicaCount(
+        activeContainerQueue($fixture, 'resolver-idle-blue', $containerId, BlueGreenDeploymentColor::BLUE, 3),
+        1,
+    );
     ApplicationBlueGreenDeployment::query()->create([
         'application_id' => $fixture['application']->id,
         'standalone_docker_id' => $fixture['destination']->id,
@@ -85,7 +104,12 @@ it('uses the exact active fixed-color provenance while idle', function () {
         'destination_topology_digest' => $fixture['topology'],
         'application_routing_config_digest' => $actualRoutingDigest,
     ]);
+    $fixture['application']->settings->update(['blue_green_replica_count' => 2]);
 
+    expect(data_get(
+        $deployment->validatedPreparedActivationPayload(),
+        'artifact.blue_green_claim.replica_count',
+    ))->toBe(1);
     $resolution = ResolveActiveApplicationContainer::run(collect([$fixture['application']]))->first();
 
     expect($resolution)->toBeInstanceOf(ActiveApplicationContainerResolution::class)
@@ -277,22 +301,32 @@ it('fails closed while a preparing route mutation lacks durable public-cutover a
     expect($resolution)->toBeNull();
 });
 
-it('resolves a replica identity digest to every durable routed container', function () {
+it('resolves a canonical v4 replica fence to every durable routed container', function () {
     $fixture = activeContainerResolverFixture('resolver-replica-set');
+    $fixture['application']->settings->update(['blue_green_replica_count' => 2]);
     $firstId = str_repeat('6', 64);
     $secondId = str_repeat('7', 64);
     $inspections = [
         BlueGreenReplicaInspection::fromRuntime(1, 'app-blue-replica-1', 'app-blue-replica-1', $firstId, 'running', 'healthy'),
         BlueGreenReplicaInspection::fromRuntime(2, 'app-blue-replica-2', 'app-blue-replica-2', $secondId, 'running', 'healthy'),
     ];
-    $identityDigest = BlueGreenReplicaSet::identityDigest($inspections);
-    activeContainerQueue(
+    $backendPortInventory = BlueGreenBackendPortInventory::fromPorts([3000]);
+    $identityDigest = ResolveBlueGreenActiveReplicaSet::run(
+        $fixture['application']->blueGreenComposeTopology(),
+        BlueGreenDeploymentColor::BLUE,
+        new BlueGreenReplicaSet(2),
+        $inspections,
+        $backendPortInventory->ports(),
+    )?->identityDigest() ?? throw new RuntimeException('The v4 replica fixture requires an aggregate proxy identity.');
+    $queue = activeContainerQueue(
         $fixture,
         'resolver-replica-blue',
         $identityDigest,
         BlueGreenDeploymentColor::BLUE,
         8,
     );
+    $queue = activeContainerPreparedReplicaCount($queue, 2);
+    $queue->update(['blue_green_backend_port_inventory' => $backendPortInventory->serialized]);
     $state = ApplicationBlueGreenDeployment::query()->create([
         'application_id' => $fixture['application']->id,
         'standalone_docker_id' => $fixture['destination']->id,
@@ -321,12 +355,24 @@ it('resolves a replica identity digest to every durable routed container', funct
     }
 
     $resolution = ResolveActiveApplicationContainer::run(collect([$fixture['application']]))->first();
+    $legacyDigest = BlueGreenReplicaSet::identityDigest($inspections);
+    $queue->update(['blue_green_candidate_container_id' => $legacyDigest]);
+    $legacyResolution = ResolveActiveApplicationContainer::run(collect([$fixture['application']]))->first();
+    $state->replicas()->delete();
+    $fixture['application']->settings->update(['blue_green_replica_count' => 1]);
+    $missingLedgerResolution = ResolveActiveApplicationContainer::run(collect([$fixture['application']]))->first();
 
-    expect($resolution->containerId)->toBe($identityDigest)
+    expect($identityDigest)->not->toBe($legacyDigest)
+        ->and($resolution->containerId)->toBe($identityDigest)
         ->and($resolution->containerIds)->toBe([$firstId, $secondId])
         ->and($resolution->matches($firstId, 'resolver-replica-blue'))->toBeTrue()
         ->and($resolution->matches($secondId, 'resolver-replica-blue'))->toBeTrue()
-        ->and($resolution->matches($identityDigest, 'resolver-replica-blue'))->toBeFalse();
+        ->and($resolution->matches($identityDigest, 'resolver-replica-blue'))->toBeFalse()
+        ->and($legacyResolution->containerId)->toBe($legacyDigest)
+        ->and($legacyResolution->containerIds)->toBe([$firstId, $secondId])
+        ->and($missingLedgerResolution->observable)->toBeFalse()
+        ->and($missingLedgerResolution->containerId)->toBeNull()
+        ->and($missingLedgerResolution->containerIds)->toBe([]);
 });
 
 it('uses the routed candidate while draining', function () {

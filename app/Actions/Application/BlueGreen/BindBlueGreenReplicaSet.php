@@ -45,7 +45,7 @@ final class BindBlueGreenReplicaSet
                 || $state->operation_deployment_uuid !== $claim->deploymentUuid
                 || $state->operation_destination_fence_epoch !== $claim->destinationFenceEpoch
                 || $state->operation_server_boot_id !== $claim->serverBootId
-                || $state->operation_topology_digest !== $claim->topologyDigest
+                || $state->operation_topology_digest !== $claim->operationTopologyDigest
                 || $state->operation_routing_config_digest !== $claim->routingConfigDigest
                 || $state->supersession_generation !== $claim->supersessionGeneration
                 || $deployment->blue_green_phase !== $state->phase
@@ -53,7 +53,7 @@ final class BindBlueGreenReplicaSet
                 || $deployment->blue_green_routing_revision !== $claim->expectedRoutingRevision
                 || $deployment->blue_green_destination_fence_epoch !== $claim->destinationFenceEpoch
                 || $deployment->blue_green_server_boot_id !== $claim->serverBootId
-                || $deployment->blue_green_topology_digest !== $claim->topologyDigest
+                || $deployment->blue_green_topology_digest !== $claim->operationTopologyDigest
                 || $deployment->blue_green_routing_config_digest !== $claim->routingConfigDigest) {
                 throw new RuntimeException('The blue-green operation changed before its replica set could be bound.');
             }
