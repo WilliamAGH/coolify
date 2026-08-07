@@ -13,12 +13,18 @@ All notable changes to this project will be documented in this file.
 
 - Update changelog
 - Update changelog
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.75-fork
 
 ## [4.13.74-fork] - 2026-08-06
 
 ### 🐛 Bug Fixes
 
 - *(blue-green)* Read a destination's deactivation through its phase, never its existence
+- *(blue-green)* Accept plain-text custom labels when resolving canonical routes
 - *(blue-green)* Self-heal stale deployment state
 - *(fork-deploy)* Point the post-update rollback hint at the release it replaced
 
@@ -29,6 +35,7 @@ All notable changes to this project will be documented in this file.
 
 ### ⚙️ Miscellaneous Tasks
 
+- *(release)* Prepare 4.13.74-fork
 - *(release)* Prepare 4.13.74-fork
 
 ## [4.13.73-fork] - 2026-08-06
