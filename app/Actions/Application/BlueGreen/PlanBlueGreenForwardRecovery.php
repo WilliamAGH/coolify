@@ -2,6 +2,8 @@
 
 namespace App\Actions\Application\BlueGreen;
 
+use App\Actions\Proxy\BlueGreenProxyConfiguration;
+use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingMode;
 use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
 use App\Models\ApplicationBlueGreenDeployment;
@@ -55,7 +57,7 @@ final class PlanBlueGreenForwardRecovery
             $operation->application,
             $operation->destination,
             $durableState,
-            $compatibleState,
+            $canonicalState,
             $operation->claim->previousActiveColor === null
                 ? BlueGreenRoutingMode::LegacyAdoption
                 : BlueGreenRoutingMode::Steady,
@@ -66,7 +68,17 @@ final class PlanBlueGreenForwardRecovery
             $target,
         );
         if ($configuration->state->serialize() !== $compatibleState->serialize()) {
-            throw new RuntimeException('The canonical final route does not match the exact durable destination state.');
+            if ($configuration->state->serialize() !== $canonicalState->serialize()
+                || ! $this->sharesConfigurationFence($canonicalState, $compatibleState)) {
+                throw new RuntimeException('The canonical final route does not match the exact durable destination state.');
+            }
+            $configuration = new BlueGreenProxyConfiguration(
+                managedFilename: $configuration->managedFilename,
+                yaml: $configuration->yaml,
+                sha256: $configuration->sha256,
+                state: $compatibleState,
+                probeOnlyContract: $configuration->probeOnlyContract,
+            );
         }
 
         return new BlueGreenForwardRecoveryPlan(
@@ -78,6 +90,37 @@ final class PlanBlueGreenForwardRecovery
             publicAcknowledgement: $target->publicAcknowledgement()
                 ?? throw new RuntimeException('The canonical final route has no durable public acknowledgement.'),
         );
+    }
+
+    private function sharesConfigurationFence(
+        BlueGreenProxyState $canonicalState,
+        BlueGreenProxyState $compatibleState,
+    ): bool {
+        return $canonicalState->activeContainerSet !== null
+            && $canonicalState->activeReplicaSet === null
+            && $compatibleState->activeContainerSet !== null
+            && $compatibleState->activeReplicaSet === null
+            && $canonicalState->managedFilename === $compatibleState->managedFilename
+            && $canonicalState->applicationUuid === $compatibleState->applicationUuid
+            && $canonicalState->destinationId === $compatibleState->destinationId
+            && $canonicalState->operationId === $compatibleState->operationId
+            && $canonicalState->mutationSequence === $compatibleState->mutationSequence
+            && $canonicalState->destinationFenceEpoch === $compatibleState->destinationFenceEpoch
+            && $canonicalState->routingRevision === $compatibleState->routingRevision
+            && is_string($canonicalState->managedSha256)
+            && is_string($compatibleState->managedSha256)
+            && hash_equals($canonicalState->managedSha256, $compatibleState->managedSha256)
+            && hash_equals(
+                $canonicalState->applicationRoutingConfigDigest,
+                $compatibleState->applicationRoutingConfigDigest,
+            )
+            && hash_equals(
+                $canonicalState->destinationTopologyDigest,
+                $compatibleState->destinationTopologyDigest,
+            )
+            && $canonicalState->activeColor === $compatibleState->activeColor
+            && $canonicalState->activeDeploymentUuid === $compatibleState->activeDeploymentUuid
+            && $canonicalState->activeContainerName === $compatibleState->activeContainerName;
     }
 
     /** @param list<BlueGreenReplicaInspection> $candidateReplicas */

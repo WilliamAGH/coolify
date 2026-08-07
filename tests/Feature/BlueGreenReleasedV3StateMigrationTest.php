@@ -4,7 +4,9 @@ use App\Actions\Application\BlueGreen\AttestBlueGreenDestinationState;
 use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
 use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
+use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
+use App\Actions\Application\BlueGreen\BlueGreenDeploymentRecoveryOperation;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentTransitionException;
 use App\Actions\Application\BlueGreen\BlueGreenOperationFence;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaInspection;
@@ -13,6 +15,7 @@ use App\Actions\Application\BlueGreen\BlueGreenSteadyStateRepairResult;
 use App\Actions\Application\BlueGreen\ComputeBlueGreenDeploymentFingerprint;
 use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Actions\Application\BlueGreen\MigrateBlueGreenReleasedV3ProxyState;
+use App\Actions\Application\BlueGreen\PlanBlueGreenForwardRecovery;
 use App\Actions\Application\BlueGreen\PlanBlueGreenPublicRecovery;
 use App\Actions\Application\BlueGreen\PlanBlueGreenSteadyState;
 use App\Actions\Application\BlueGreen\ReconstructBlueGreenDeploymentRecovery;
@@ -20,6 +23,7 @@ use App\Actions\Application\BlueGreen\RehydrateBlueGreenDestinationRoutingTopolo
 use App\Actions\Application\BlueGreen\RepairBlueGreenSteadyState;
 use App\Actions\Application\BlueGreen\ResolveBlueGreenExpectedProxyState;
 use App\Actions\Proxy\BlueGreenProxyConfiguration;
+use App\Actions\Proxy\BlueGreenProxyRollbackKey;
 use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
@@ -636,6 +640,105 @@ it('derives the released v3 projection from one immutable canonical resolution',
         $fixture['state'],
         $fixture['canonical'],
     )?->serialize())->toBe($fixture['released']->serialize());
+});
+
+it('plans forward recovery against the exact released v3 projection', function (): void {
+    $fixture = releasedV3StateFixture();
+    $topology = $fixture['application']->blueGreenComposeTopology()
+        ?? throw new RuntimeException('The released-v3 forward-recovery fixture has no Compose topology.');
+    $state = $fixture['state'];
+    $deployment = $fixture['deployment'];
+    $canonical = $fixture['canonical'];
+    $compatible = $fixture['released'];
+
+    expect($compatible->managedSha256)->toBe($canonical->managedSha256)
+        ->and($compatible->activeContainerId)->not->toBe($canonical->activeContainerId);
+
+    $candidateReplicas = ApplicationBlueGreenReplica::query()
+        ->where('application_blue_green_deployment_id', $state->id)
+        ->where('deployment_uuid', $deployment->deployment_uuid)
+        ->orderBy('compose_service')
+        ->get()
+        ->map(static fn (ApplicationBlueGreenReplica $replica): BlueGreenReplicaInspection => BlueGreenReplicaInspection::fromRuntime(
+            replicaIndex: (int) $replica->replica_index,
+            composeService: (string) $replica->compose_service,
+            containerName: (string) $replica->container_name,
+            dockerId: (string) $replica->container_id,
+            status: 'running',
+            health: 'healthy',
+        ))
+        ->all();
+    $backendPortInventory = BlueGreenBackendPortInventory::fromSerialized(
+        $deployment->blue_green_backend_port_inventory,
+    );
+    $claim = new BlueGreenDeploymentClaim(
+        stateId: $state->id,
+        applicationId: $fixture['application']->id,
+        standaloneDockerId: $fixture['destination']->id,
+        pendingColor: BlueGreenDeploymentColor::BLUE,
+        previousActiveColor: BlueGreenDeploymentColor::GREEN,
+        deploymentUuid: $deployment->deployment_uuid,
+        expectedRoutingRevision: 1,
+        destinationFenceEpoch: 1,
+        serverBootId: '11111111-2222-3333-4444-555555555555',
+        operationTopologyDigest: $deployment->blue_green_topology_digest,
+        routingTopologyDigest: $state->destination_routing_topology_digest,
+        routingConfigDigest: $state->application_routing_config_digest,
+        backendPortInventory: $backendPortInventory,
+        drainBackendPortInventory: $backendPortInventory,
+        supersessionGeneration: 1,
+        legacyContainerName: null,
+        replicaCount: 1,
+        candidateContainerName: $canonical->activeContainerName,
+        rollbackManagedFilename: $compatible->managedFilename,
+        candidateContainerNames: $topology->candidateContainerNames(
+            $fixture['application'],
+            BlueGreenDeploymentColor::BLUE,
+        ),
+    );
+    $operation = new BlueGreenDeploymentRecoveryOperation(
+        claim: $claim,
+        application: $fixture['application'],
+        destination: $fixture['destination'],
+        server: $fixture['server'],
+        deployment: $deployment,
+        previousContainer: new BlueGreenContainerExpectation(
+            name: $fixture['application']->uuid.'-green',
+            dockerId: str_repeat('e', 64),
+            applicationId: $fixture['application']->id,
+            pullRequestId: 0,
+            blueGreenManaged: true,
+            deploymentUuid: 'released-v3-previous-green',
+            color: BlueGreenDeploymentColor::GREEN,
+            routingRevision: 1,
+        ),
+        legacyRoutingSnapshot: null,
+        candidateContainer: new BlueGreenContainerExpectation(
+            name: $canonical->activeContainerName,
+            dockerId: $canonical->activeContainerId,
+            applicationId: $fixture['application']->id,
+            pullRequestId: 0,
+            blueGreenManaged: true,
+            deploymentUuid: $deployment->deployment_uuid,
+            color: BlueGreenDeploymentColor::BLUE,
+            routingRevision: 1,
+        ),
+        rollbackKey: new BlueGreenProxyRollbackKey(
+            operationId: $deployment->deployment_uuid,
+            expectedState: null,
+            replacementState: $compatible,
+        ),
+        currentDestinationState: $compatible,
+        recoveredPhase: BlueGreenDeploymentPhase::SWITCHING,
+        routingMutationRecorded: true,
+        wasFinalized: false,
+        candidateSetFenceIdentity: $canonical->activeContainerId,
+    );
+
+    $plan = PlanBlueGreenForwardRecovery::run($operation, $candidateReplicas);
+
+    expect($plan->configuration->state->serialize())->toBe($compatible->serialize())
+        ->and($plan->configuration->state->serialize())->not->toBe($canonical->serialize());
 });
 
 it('repairs a released v2 fan-out destination against the exact released sidecar bytes', function (): void {
