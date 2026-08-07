@@ -491,6 +491,7 @@ it('delays retirement against the immutable inactive port inventory after a live
         'destination_fence_mutation_sequence' => 4,
         'managed_file_sha256' => hash('sha256', 'dropped-port-retirement-managed'),
         'destination_topology_digest' => $topologyDigest,
+        'destination_routing_topology_digest' => (new ComputeBlueGreenDeploymentFingerprint)->routingTopologyDigestFor($application, $destination),
         'application_routing_config_digest' => $routingDigest,
         'inactive_retirement_owner_deployment_uuid' => $owner->deployment_uuid,
         'inactive_retirement_color' => BlueGreenDeploymentColor::BLUE,
@@ -840,7 +841,7 @@ it('backfills pending retirement inventories when the runtime route digest diffe
             mutationSequence: 2,
             activeDeploymentUuid: $ownerUuid,
             activeContainerId: $activeContainerId,
-            destinationTopologyDigest: $ownerFingerprint->topologyDigest,
+            destinationTopologyDigest: $ownerFingerprint->operationTopologyDigest,
             blueReplicaBackends: [$application->uuid.'-blue'],
             greenReplicaBackends: [
                 $application->uuid.'-green-replica-1',
@@ -863,7 +864,7 @@ it('backfills pending retirement inventories when the runtime route digest diffe
         'blue_green_phase' => BlueGreenDeploymentPhase::IDLE,
         'blue_green_routing_revision' => 2,
         'blue_green_destination_fence_epoch' => 2,
-        'blue_green_topology_digest' => $ownerFingerprint->topologyDigest,
+        'blue_green_topology_digest' => $ownerFingerprint->operationTopologyDigest,
         'blue_green_routing_config_digest' => $ownerFingerprint->routingConfigDigest,
         'blue_green_candidate_container_id' => $activeContainerId,
     ]);
@@ -881,7 +882,7 @@ it('backfills pending retirement inventories when the runtime route digest diffe
         'blue_green_phase' => BlueGreenDeploymentPhase::IDLE,
         'blue_green_routing_revision' => 1,
         'blue_green_destination_fence_epoch' => 1,
-        'blue_green_topology_digest' => $inactiveFingerprint->topologyDigest,
+        'blue_green_topology_digest' => $inactiveFingerprint->operationTopologyDigest,
         'blue_green_routing_config_digest' => $inactiveFingerprint->routingConfigDigest,
         'blue_green_candidate_container_id' => $inactiveContainerId,
     ]);
@@ -900,6 +901,7 @@ it('backfills pending retirement inventories when the runtime route digest diffe
         'destination_fence_mutation_sequence' => $runtimeState->mutationSequence,
         'managed_file_sha256' => $runtimeState->managedSha256,
         'destination_topology_digest' => $runtimeState->destinationTopologyDigest,
+        'destination_routing_topology_digest' => $ownerFingerprint->routingTopologyDigest,
         'application_routing_config_digest' => $runtimeState->applicationRoutingConfigDigest,
         'inactive_retirement_owner_deployment_uuid' => $ownerUuid,
         'inactive_retirement_color' => BlueGreenDeploymentColor::BLUE,
@@ -978,6 +980,7 @@ it('refuses a pending delayed retirement with null inventories before remote wor
         'destination_fence_mutation_sequence' => 1,
         'managed_file_sha256' => hash('sha256', 'null-inventory-retirement-managed'),
         'destination_topology_digest' => hash('sha256', 'null-inventory-retirement-topology'),
+        'destination_routing_topology_digest' => (new ComputeBlueGreenDeploymentFingerprint)->routingTopologyDigestFor($application, $destination),
         'application_routing_config_digest' => hash('sha256', 'null-inventory-retirement-routing'),
         'inactive_retirement_owner_deployment_uuid' => $owner->deployment_uuid,
         'inactive_retirement_color' => BlueGreenDeploymentColor::BLUE,
@@ -1136,6 +1139,7 @@ KEY;
         'destination_fence_mutation_sequence' => 4,
         'managed_file_sha256' => hash('sha256', 'retirement-action-managed'),
         'destination_topology_digest' => $topologyDigest,
+        'destination_routing_topology_digest' => (new ComputeBlueGreenDeploymentFingerprint)->routingTopologyDigestFor($application, $destination),
         'application_routing_config_digest' => $routingDigest,
         'inactive_retirement_owner_deployment_uuid' => $owner->deployment_uuid,
         'inactive_retirement_color' => BlueGreenDeploymentColor::BLUE,
@@ -1237,7 +1241,7 @@ function makeWedgedBlueGreenInactiveRetirement(?Application $application = null)
             mutationSequence: 2,
             activeDeploymentUuid: $ownerUuid,
             activeContainerId: $activeContainerId,
-            destinationTopologyDigest: $fingerprint->topologyDigest,
+            destinationTopologyDigest: $fingerprint->operationTopologyDigest,
         ),
     )->state;
     $inventory = BlueGreenBackendPortInventory::forApplication($application, $application->settings);
@@ -1255,7 +1259,7 @@ function makeWedgedBlueGreenInactiveRetirement(?Application $application = null)
         'blue_green_phase' => BlueGreenDeploymentPhase::IDLE,
         'blue_green_routing_revision' => 2,
         'blue_green_destination_fence_epoch' => 2,
-        'blue_green_topology_digest' => $fingerprint->topologyDigest,
+        'blue_green_topology_digest' => $fingerprint->operationTopologyDigest,
         'blue_green_routing_config_digest' => $fingerprint->routingConfigDigest,
         'blue_green_candidate_container_id' => $activeContainerId,
         'blue_green_backend_port_inventory' => $inventory->serialized,
@@ -1275,7 +1279,7 @@ function makeWedgedBlueGreenInactiveRetirement(?Application $application = null)
         'blue_green_phase' => BlueGreenDeploymentPhase::IDLE,
         'blue_green_routing_revision' => 1,
         'blue_green_destination_fence_epoch' => 1,
-        'blue_green_topology_digest' => $fingerprint->topologyDigest,
+        'blue_green_topology_digest' => $fingerprint->operationTopologyDigest,
         'blue_green_routing_config_digest' => $fingerprint->routingConfigDigest,
         'blue_green_candidate_container_id' => $inactiveContainerId,
         'blue_green_backend_port_inventory' => $inventory->serialized,
@@ -1294,6 +1298,7 @@ function makeWedgedBlueGreenInactiveRetirement(?Application $application = null)
         'destination_fence_mutation_sequence' => $runtimeState->mutationSequence,
         'managed_file_sha256' => $runtimeState->managedSha256,
         'destination_topology_digest' => $runtimeState->destinationTopologyDigest,
+        'destination_routing_topology_digest' => $fingerprint->routingTopologyDigest,
         'application_routing_config_digest' => $runtimeState->applicationRoutingConfigDigest,
         'inactive_retirement_owner_deployment_uuid' => $ownerUuid,
         'inactive_retirement_color' => BlueGreenDeploymentColor::BLUE,
@@ -1641,6 +1646,9 @@ function fakeCommittedInactiveRetirementJournalRemote(
         }
         if (str_contains($payload, "tr -d '\\n' < /proc/sys/kernel/random/boot_id")) {
             return Process::result(output: $bootId);
+        }
+        if (str_contains($payload, WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT)) {
+            return Process::result(output: WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT);
         }
         if (str_contains($payload, 'coolify-blue-green-managed-route:present:')) {
             if (! $archived && $journalPresent) {
@@ -3545,6 +3553,222 @@ it('idempotently archives and regenerates the same timed-out inactive-retirement
             'sh "$operation_container_mutation_decoded"',
             'sh "$operation_container_completion_decoded"',
         );
+});
+
+it('queues a bounded retry when the inactive-container destination mutation result is ambiguous', function (): void {
+    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeReadyBlueGreenInactiveRetirement();
+    $bootId = (string) $state->inactive_retirement_server_boot_id;
+    $expectedState = ResolveBlueGreenExpectedProxyState::run(
+        $application,
+        $application->destination,
+        $state,
+    ) ?? throw new RuntimeException('The ambiguous retirement fixture requires an exact expected route state.');
+    InspectBlueGreenContainer::shouldRun()
+        ->twice()
+        ->andReturn(new BlueGreenContainerInspection(
+            exists: true,
+            dockerId: $state->inactive_retirement_container_id,
+            status: ContainerStatusTypes::RUNNING->value,
+            health: 'healthy',
+        ));
+    Process::fake(function ($process) use ($bootId, $expectedState): FakeProcessResult {
+        $payload = (is_array($process->command) ? implode(' ', $process->command) : (string) $process->command)
+            ."\n".(string) $process->input;
+        if (str_contains($payload, 'container_journal_stage=')) {
+            return Process::result(
+                errorOutput: 'Error response from daemon: transport reset during stop',
+                exitCode: 1,
+            );
+        }
+        if (str_contains($payload, 'coolify-blue-green-managed-route:present:')) {
+            return Process::result(output: 'coolify-blue-green-managed-route:present:'
+                .base64_encode($expectedState->serialize())."\n".$expectedState->managedSha256);
+        }
+        if (str_contains($payload, 'boot_id')) {
+            return Process::result(output: $bootId);
+        }
+
+        return Process::result(output: '1');
+    });
+
+    expect(RetireBlueGreenInactiveContainer::run($state->id, $owner->deployment_uuid, 2))
+        ->toBe(RetireBlueGreenInactiveContainer::RETRY);
+
+    $state = $state->fresh();
+    $logs = (string) $owner->fresh()->logs;
+    expect($state->inactive_retirement_attempts)->toBe(1)
+        ->and($state->inactive_retirement_intervention_required_at)->toBeNull()
+        ->and($state->inactive_retirement_stopped_at)->toBeNull()
+        ->and($logs)->toContain('ambiguous destination mutation result; queued a bounded retirement retry')
+        ->and($logs)->toContain('Reason: ambiguous_mutation.')
+        ->and($logs)->toMatch('/Correlation: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/')
+        ->and($logs)->not->toContain('Error response from daemon: transport reset during stop');
+});
+
+it('marks intervention with a stable correlation identifier once the ambiguous mutation budget is exhausted', function (): void {
+    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeReadyBlueGreenInactiveRetirement();
+    $state->update(['inactive_retirement_attempts' => RetireBlueGreenInactiveContainer::MAX_ATTEMPTS - 1]);
+    $bootId = (string) $state->inactive_retirement_server_boot_id;
+    InspectBlueGreenContainer::shouldRun()
+        ->once()
+        ->andReturn(new BlueGreenContainerInspection(
+            exists: true,
+            dockerId: $state->inactive_retirement_container_id,
+            status: ContainerStatusTypes::RUNNING->value,
+            health: 'healthy',
+        ));
+    Process::fake(function ($process) use ($bootId): FakeProcessResult {
+        $payload = (is_array($process->command) ? implode(' ', $process->command) : (string) $process->command)
+            ."\n".(string) $process->input;
+        if (str_contains($payload, 'container_journal_stage=')) {
+            return Process::result(
+                errorOutput: 'Error response from daemon: removal already in progress',
+                exitCode: 1,
+            );
+        }
+        if (str_contains($payload, 'boot_id')) {
+            return Process::result(output: $bootId);
+        }
+
+        return Process::result(output: '1');
+    });
+
+    expect(RetireBlueGreenInactiveContainer::run($state->id, $owner->deployment_uuid, 2))
+        ->toBe(RetireBlueGreenInactiveContainer::INTERVENTION);
+
+    $state = $state->fresh();
+    $logs = (string) $owner->fresh()->logs;
+    expect($state->inactive_retirement_attempts)->toBe(RetireBlueGreenInactiveContainer::MAX_ATTEMPTS)
+        ->and($state->inactive_retirement_intervention_required_at)->not->toBeNull()
+        ->and($state->inactive_retirement_stopped_at)->toBeNull()
+        ->and($logs)->toContain('Inactive blue-green retirement requires intervention')
+        ->and($logs)->toContain('Reason: ambiguous_mutation.')
+        ->and($logs)->toMatch('/Correlation: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/')
+        ->and($logs)->not->toContain('Error response from daemon: removal already in progress');
+});
+
+it('replays a pending inactive-retirement journal on an ordinary bounded retry instead of requiring intervention', function (): void {
+    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeWedgedBlueGreenInactiveRetirement();
+    prepareBlueGreenInactiveRetirementRemote($application->destination->server);
+    $state->update([
+        'inactive_retirement_intervention_required_at' => null,
+        'inactive_retirement_attempts' => 1,
+        'inactive_retirement_last_observed_connections' => 1,
+    ]);
+    $state = $state->fresh();
+    $expectedState = ResolveBlueGreenExpectedProxyState::run(
+        $application,
+        $application->destination,
+        $state,
+    ) ?? throw new RuntimeException('The blocked retry fixture requires an exact expected route state.');
+    $replacementState = $expectedState->withMutationOwner($owner->deployment_uuid);
+    $bootId = (string) $state->inactive_retirement_server_boot_id;
+    $journalSha256 = hash('sha256', 'journal-blocked-ordinary-retry');
+    $archiveFilename = (new WriteBlueGreenProxyConfiguration)->containerMutationJournalArchiveFilename(
+        $expectedState->managedFilename,
+        $journalSha256,
+    );
+    $replacementManagedSha256 = $replacementState->managedSha256
+        ?? throw new RuntimeException('The blocked retry fixture requires a present replacement route.');
+    $journalPresent = true;
+    $archiveCount = 0;
+    $regeneratedMutationPayloads = [];
+    Process::fake(function (PendingProcess $process) use (
+        &$archiveCount,
+        $archiveFilename,
+        $bootId,
+        $expectedState,
+        &$journalPresent,
+        $journalSha256,
+        &$regeneratedMutationPayloads,
+        $replacementManagedSha256,
+        $replacementState,
+    ): FakeProcessResult {
+        $payload = (is_array($process->command) ? implode(' ', $process->command) : (string) $process->command)
+            ."\n".(string) $process->input;
+        if (str_contains($payload, "tr -d '\\n' < /proc/sys/kernel/random/boot_id")) {
+            return Process::result(output: $bootId);
+        }
+        if (str_contains($payload, WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_CAS_OUTPUT_PREFIX)) {
+            if (! $journalPresent) {
+                return Process::result(errorOutput: 'The expected live journal is absent.', exitCode: 1);
+            }
+            $journalPresent = false;
+            $archiveCount++;
+
+            return Process::result(output: implode('|', [
+                WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_CAS_OUTPUT_PREFIX,
+                BlueGreenManagedRouteMetadataForOperationResult::PENDING_EXPECTED_SIDECAR,
+                $journalSha256,
+                $archiveFilename,
+            ]));
+        }
+        if (str_contains($payload, WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX)) {
+            if (! $journalPresent) {
+                return Process::result(
+                    output: WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX.'|absent',
+                );
+            }
+
+            return Process::result(output: implode('|', [
+                WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX,
+                BlueGreenManagedRouteMetadataForOperationResult::PENDING_EXPECTED_SIDECAR,
+                $journalSha256,
+                $bootId,
+                'present',
+                $replacementManagedSha256,
+                hash('sha256', 'journal-blocked-retry-mutation-script'),
+                hash('sha256', 'journal-blocked-retry-completion-script'),
+            ])."\n".base64_encode($expectedState->serialize())
+                ."\n".base64_encode($replacementState->serialize()));
+        }
+        if (str_contains($payload, 'container_journal_stage=$(mktemp')) {
+            if ($journalPresent) {
+                // The fenced mutation refuses to run over the leftover journal
+                // and reports the canonical pending marker, exactly as the real
+                // script does after a timed-out drain attempt.
+                return Process::result(
+                    errorOutput: WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT,
+                    exitCode: 75,
+                );
+            }
+            $regeneratedMutationPayloads[] = $payload;
+            $journalPresent = true;
+
+            return Process::result(
+                errorOutput: DrainBlueGreenPreviousContainer::TIMEOUT_MARKER.' with 1 active backend connection(s)',
+                exitCode: 1,
+            );
+        }
+        if (str_contains($payload, 'drain_pid=')) {
+            return Process::result(output: "1\n");
+        }
+        if (str_contains($payload, 'coolify-blue-green-managed-route:present:')) {
+            return Process::result(output: 'coolify-blue-green-managed-route:present:'
+                .base64_encode($expectedState->serialize())."\n".$expectedState->managedSha256);
+        }
+
+        return Process::result();
+    });
+    InspectBlueGreenContainer::shouldRun()
+        ->andReturn(new BlueGreenContainerInspection(
+            exists: true,
+            dockerId: $state->inactive_retirement_container_id,
+            status: ContainerStatusTypes::RUNNING->value,
+            health: 'healthy',
+        ));
+
+    expect(RetireBlueGreenInactiveContainer::run($state->id, $owner->deployment_uuid, 2))
+        ->toBe(RetireBlueGreenInactiveContainer::RETRY);
+
+    $state = $state->fresh();
+    expect($archiveCount)->toBe(1)
+        ->and($regeneratedMutationPayloads)->toHaveCount(1)
+        ->and($state->inactive_retirement_attempts)->toBe(2)
+        ->and($state->inactive_retirement_last_observed_connections)->toBe(1)
+        ->and($state->inactive_retirement_intervention_required_at)->toBeNull()
+        ->and($state->inactive_retirement_stopped_at)->toBeNull()
+        ->and((string) $owner->fresh()->logs)->toContain('queued a bounded retirement retry');
 });
 
 it('recovers an exact pending archive after a crash removes the live inactive-retirement journal', function (): void {
