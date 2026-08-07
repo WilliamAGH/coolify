@@ -40,21 +40,7 @@ final class PlanBlueGreenForwardRecovery
             $operation->destination,
             $durableState,
         ) ?? throw new RuntimeException('Forward recovery has no canonical durable destination state.');
-        $target = (new PlanBlueGreenSteadyState)->routingTargetForState(
-            $operation->application,
-            $operation->destination,
-            $durableState,
-            $canonicalState,
-            $operation->claim->previousActiveColor === null
-                ? BlueGreenRoutingMode::LegacyAdoption
-                : BlueGreenRoutingMode::Steady,
-        );
-        $configuration = CompileBlueGreenProxyConfiguration::run(
-            $operation->application,
-            $operation->destination,
-            $target,
-        );
-        $releasedState = $stateResolver->releasedV3State(
+        $compatibleState = $stateResolver->releasedV3State(
             $operation->application,
             $operation->destination,
             $durableState,
@@ -65,7 +51,21 @@ final class PlanBlueGreenForwardRecovery
             $durableState,
             $canonicalState,
         ) ?? $canonicalState;
-        if ($configuration->state->serialize() !== $releasedState->serialize()) {
+        $target = (new PlanBlueGreenSteadyState)->routingTargetForState(
+            $operation->application,
+            $operation->destination,
+            $durableState,
+            $compatibleState,
+            $operation->claim->previousActiveColor === null
+                ? BlueGreenRoutingMode::LegacyAdoption
+                : BlueGreenRoutingMode::Steady,
+        );
+        $configuration = CompileBlueGreenProxyConfiguration::run(
+            $operation->application,
+            $operation->destination,
+            $target,
+        );
+        if ($configuration->state->serialize() !== $compatibleState->serialize()) {
             throw new RuntimeException('The canonical final route does not match the exact durable destination state.');
         }
 
