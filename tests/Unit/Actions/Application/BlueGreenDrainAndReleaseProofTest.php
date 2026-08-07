@@ -1,10 +1,12 @@
 <?php
 
 use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
+use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
 use App\Actions\Application\BlueGreen\DrainBlueGreenPreviousContainer;
 use App\Actions\Application\BlueGreen\VerifyBlueGreenCandidateReleaseProof;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Enums\BlueGreenDeploymentColor;
+use App\Models\Server;
 use App\Services\BlueGreenDeploymentLifecycle;
 
 function blueGreenDrainExpectation(): BlueGreenContainerExpectation
@@ -163,3 +165,24 @@ it('caps public handoff observation independently of the Docker stop grace perio
     expect($method->invoke(null, 5, 5))->toBe(15)
         ->and($method->invoke(null, 3_600, 3_600))->toBe(30);
 });
+
+it('refuses release-proof verification when the supplied inspection cannot prove the exact candidate', function (string $case) {
+    $expectation = blueGreenDrainExpectation();
+    $inspection = match ($case) {
+        'missing' => new BlueGreenContainerInspection(exists: false),
+        'foreign-id' => new BlueGreenContainerInspection(
+            exists: true,
+            dockerId: str_repeat('b', 64),
+            status: 'running',
+            health: 'healthy',
+        ),
+    };
+
+    // The inspection is supplied, so the gate must fail before any remote work.
+    expect(fn () => VerifyBlueGreenCandidateReleaseProof::run(
+        new Server,
+        $expectation,
+        BlueGreenRoutingTarget::durableReleaseProofToken('deployment-drain'),
+        $inspection,
+    ))->toThrow(RuntimeException::class, 'The exact candidate is unavailable for release-proof verification.');
+})->with(['missing' => 'missing', 'foreign-id' => 'foreign-id']);

@@ -20,6 +20,7 @@ final class VerifyBlueGreenCandidateReleaseProof
         Server $server,
         BlueGreenContainerExpectation $expectation,
         string $releaseProof,
+        ?BlueGreenContainerInspection $inspection = null,
     ): void {
         if (! $expectation->blueGreenManaged || $expectation->dockerId === null) {
             throw new RuntimeException('A release-proof gate requires an exact managed blue-green candidate identity.');
@@ -31,7 +32,12 @@ final class VerifyBlueGreenCandidateReleaseProof
             throw new RuntimeException('The release-proof token does not match the exact candidate deployment.');
         }
 
-        InspectBlueGreenContainer::run($server, $expectation);
+        $inspection ??= InspectBlueGreenContainer::run($server, $expectation);
+        if (! $inspection->exists
+            || $inspection->dockerId === null
+            || ! hash_equals((string) $expectation->dockerId, $inspection->dockerId)) {
+            throw new RuntimeException('The exact candidate is unavailable for release-proof verification.');
+        }
         $environment = trim((string) instant_remote_process([
             $this->commandFor($expectation, $releaseProof),
         ], $server));
