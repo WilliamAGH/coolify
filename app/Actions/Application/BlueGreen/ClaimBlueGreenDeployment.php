@@ -2,6 +2,7 @@
 
 namespace App\Actions\Application\BlueGreen;
 
+use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
@@ -11,6 +12,7 @@ use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\ApplicationSetting;
+use App\Models\Server;
 use App\Models\StandaloneDocker;
 use App\Support\BlueGreenComposeTopology;
 use Illuminate\Database\Eloquent\Builder;
@@ -28,8 +30,11 @@ class ClaimBlueGreenDeployment
         string $serverBootId,
         ?string $detectedLegacyContainerName = null,
         ?BlueGreenContainerExpectation $previousContainer = null,
+        ?BlueGreenLegacyRouteNetworkAttestation $legacyRouteNetworkAttestation = null,
+        ?string $previousSetFenceIdentity = null,
     ): BlueGreenDeploymentClaim {
-        return DB::transaction(function () use ($application, $standaloneDocker, $deployment, $serverBootId, $detectedLegacyContainerName, $previousContainer): BlueGreenDeploymentClaim {
+        return DB::transaction(function () use ($application, $standaloneDocker, $deployment, $serverBootId, $detectedLegacyContainerName, $previousContainer, $legacyRouteNetworkAttestation, $previousSetFenceIdentity): BlueGreenDeploymentClaim {
+            BlueGreenTopologyLock::acquire();
             $lockedApplication = Application::withTrashed()
                 ->whereKey($application->id)
                 ->lockForUpdate()
@@ -48,12 +53,19 @@ class ClaimBlueGreenDeployment
             $lockedApplication->setRelation('settings', $setting);
 
             $destination = StandaloneDocker::query()
-                ->with('server')
                 ->whereKey($standaloneDocker->id)
+                ->lockForUpdate()
                 ->first();
-            if ($destination === null || $destination->server === null) {
+            $server = $destination === null
+                ? null
+                : Server::query()
+                    ->whereKey($destination->server_id)
+                    ->lockForUpdate()
+                    ->first();
+            if ($destination === null || $server === null) {
                 throw new BlueGreenDeploymentTransitionException('The standalone Docker destination no longer has a server.');
             }
+            $destination->setRelation('server', $server);
 
             if (! $lockedApplication->isBlueGreenDeploymentOptedIn($setting)) {
                 throw new BlueGreenDeploymentTransitionException('Blue-green deployment opt-in was disabled before this claim could be committed.');
@@ -168,12 +180,15 @@ class ClaimBlueGreenDeployment
                 $destination,
                 $state,
             );
-            if ($expectedDestinationState !== null
-                && $expectedDestinationState->destinationTopologyDigest !== $fingerprint->topologyDigest
-                && ! ($state->phase === BlueGreenDeploymentPhase::STOPPED
-                    && $expectedDestinationState->managedSha256 === null)) {
-                throw new BlueGreenDeploymentTransitionException('The durable destination topology changed before the operation could be claimed.');
-            }
+            $this->assertRoutingTopologyDigest(
+                $state,
+                $lockedApplication,
+                $destination,
+                $expectedDestinationState,
+                $fingerprint->routingTopologyDigest,
+                $serverBootId,
+                $legacyRouteNetworkAttestation,
+            );
             $previousProxyState = $expectedDestinationState?->serialize();
             // The topology owns candidate naming. A destination that re-rolls a
             // single service produces exactly the historic scalar identity, so
@@ -193,7 +208,8 @@ class ClaimBlueGreenDeployment
                 expectedRoutingRevision: $expectedRoutingRevision,
                 destinationFenceEpoch: $destinationFenceEpoch,
                 serverBootId: $serverBootId,
-                topologyDigest: $fingerprint->topologyDigest,
+                operationTopologyDigest: $fingerprint->operationTopologyDigest,
+                routingTopologyDigest: $fingerprint->routingTopologyDigest,
                 routingConfigDigest: $fingerprint->routingConfigDigest,
                 backendPortInventory: $backendPortInventory,
                 drainBackendPortInventory: $drainBackendPortInventory,
@@ -208,8 +224,13 @@ class ClaimBlueGreenDeployment
                 candidateContainerNames: $candidateContainerNames,
             );
             $candidateContainer = $this->candidateContainer($claim);
-            $this->assertPreviousContainer($claim, $previousContainer);
-
+            $previousFenceIdentity = $previousSetFenceIdentity ?? $previousContainer?->dockerId;
+            $this->assertPreviousContainer(
+                $claim,
+                $previousContainer,
+                $previousFenceIdentity,
+                $expectedDestinationState,
+            );
             $stateUpdated = $this->exactStateQuery($state, $lockedDeployment)
                 ->update([
                     ...ApplicationBlueGreenDeployment::clearedInactiveRetirementAttributes(),
@@ -221,7 +242,7 @@ class ClaimBlueGreenDeployment
                     'operation_previous_deployment_uuid' => $previousContainer?->deploymentUuid,
                     'operation_previous_routing_revision' => $previousContainer?->routingRevision,
                     'operation_previous_container_name' => $previousContainer?->name,
-                    'operation_previous_container_id' => $previousContainer?->dockerId,
+                    'operation_previous_container_id' => $previousFenceIdentity,
                     'operation_candidate_container_name' => $candidateContainer->name,
                     'operation_candidate_container_id' => null,
                     // Null whenever this color owns one container, so a
@@ -236,8 +257,9 @@ class ClaimBlueGreenDeployment
                     'operation_destination_fence_epoch' => $destinationFenceEpoch,
                     'operation_previous_destination_fence_epoch' => $state->destination_fence_epoch,
                     'operation_server_boot_id' => $serverBootId,
-                    'operation_topology_digest' => $fingerprint->topologyDigest,
+                    'operation_topology_digest' => $fingerprint->operationTopologyDigest,
                     'operation_routing_config_digest' => $fingerprint->routingConfigDigest,
+                    'destination_routing_topology_digest' => $fingerprint->routingTopologyDigest,
                     'operation_previous_managed_file_sha256' => $state->managed_file_sha256,
                     'operation_previous_proxy_state' => $previousProxyState,
                     'operation_previous_proxy_state_sha256' => $previousProxyState === null
@@ -292,12 +314,12 @@ class ClaimBlueGreenDeployment
                 'blue_green_routing_revision' => $expectedRoutingRevision,
                 'blue_green_destination_fence_epoch' => $destinationFenceEpoch,
                 'blue_green_server_boot_id' => $serverBootId,
-                'blue_green_topology_digest' => $fingerprint->topologyDigest,
+                'blue_green_topology_digest' => $fingerprint->operationTopologyDigest,
                 'blue_green_routing_config_digest' => $fingerprint->routingConfigDigest,
                 'blue_green_backend_port_inventory' => $backendPortInventory->serialized,
                 'blue_green_drain_backend_port_inventory' => $drainBackendPortInventory?->serialized,
                 'blue_green_supersession_generation' => $supersessionGeneration,
-                'blue_green_previous_container_id' => $previousContainer?->dockerId,
+                'blue_green_previous_container_id' => $previousFenceIdentity,
                 'blue_green_candidate_container_id' => null,
                 'blue_green_rollback_managed_filename' => $claim->rollbackManagedFilename,
                 'blue_green_routing_mutated_at' => null,
@@ -376,6 +398,57 @@ class ClaimBlueGreenDeployment
         }
     }
 
+    private function assertRoutingTopologyDigest(
+        ApplicationBlueGreenDeployment $state,
+        Application $application,
+        StandaloneDocker $destination,
+        ?BlueGreenProxyState $expectedState,
+        string $routingTopologyDigest,
+        string $serverBootId,
+        ?BlueGreenLegacyRouteNetworkAttestation $legacyRouteNetworkAttestation,
+    ): void {
+        $storedDigest = $state->destination_routing_topology_digest;
+        if ($storedDigest !== null) {
+            if (! is_string($storedDigest)
+                || preg_match('/^[a-f0-9]{64}$/D', $storedDigest) !== 1
+                || ! hash_equals($storedDigest, $routingTopologyDigest)) {
+                throw new BlueGreenDeploymentTransitionException(
+                    'The durable destination routing topology changed before the operation could be claimed. Check routing-affecting fields: destination network, server proxy type/path, or Compose routed topology.',
+                );
+            }
+
+            return;
+        }
+
+        if ($expectedState === null) {
+            if ($legacyRouteNetworkAttestation !== null) {
+                throw new BlueGreenDeploymentTransitionException('An absent destination cannot establish topology from an unrelated routed attestation.');
+            }
+
+            return;
+        }
+        if ($state->phase === BlueGreenDeploymentPhase::STOPPED && $expectedState->managedSha256 === null) {
+            if ($legacyRouteNetworkAttestation !== null) {
+                throw new BlueGreenDeploymentTransitionException('A route-less stopped destination cannot establish topology from an unrelated routed attestation.');
+            }
+
+            return;
+        }
+        if ($legacyRouteNetworkAttestation === null) {
+            throw new BlueGreenDeploymentTransitionException('The legacy destination must be remotely attested with an exact live route network artifact before its routing topology can be established.');
+        }
+        $server = $destination->server
+            ?? throw new BlueGreenDeploymentTransitionException('The legacy destination has no exact server for routing topology rehydration.');
+        $legacyRouteNetworkAttestation->assertMatches(
+            $application,
+            $server,
+            $destination,
+            $expectedState,
+            $serverBootId,
+            $routingTopologyDigest,
+        );
+    }
+
     private function assertDeploymentIsPrimaryProductionQueue(ApplicationDeploymentQueue $deployment): void
     {
         if ($deployment->pull_request_id !== 0) {
@@ -428,6 +501,16 @@ class ClaimBlueGreenDeployment
         return true;
     }
 
+    public static function stateDefersRoutingTopologyDigestToClaim(
+        Application $application,
+        StandaloneDocker $destination,
+        ApplicationBlueGreenDeployment $state,
+    ): bool {
+        return $state->destination_routing_topology_digest === null
+            && self::stateIsCleanlyClaimable($state)
+            && ResolveBlueGreenExpectedProxyState::run($application, $destination, $state) === null;
+    }
+
     private function assertStateIsIdle(ApplicationBlueGreenDeployment $state): void
     {
         if (! self::stateIsCleanlyClaimable($state)) {
@@ -458,15 +541,21 @@ class ClaimBlueGreenDeployment
     private function assertPreviousContainer(
         BlueGreenDeploymentClaim $claim,
         ?BlueGreenContainerExpectation $previousContainer,
+        ?string $previousFenceIdentity,
+        ?BlueGreenProxyState $expectedDestinationState,
     ): void {
         if ($previousContainer === null) {
-            if ($claim->previousActiveColor !== null || $claim->legacyContainerName !== null) {
+            if ($claim->previousActiveColor !== null
+                || $claim->legacyContainerName !== null
+                || $previousFenceIdentity !== null) {
                 throw new BlueGreenDeploymentTransitionException('The claimed previous target is missing immutable container provenance.');
             }
 
             return;
         }
         if ($previousContainer->dockerId === null
+            || ! is_string($previousFenceIdentity)
+            || preg_match('/^[a-f0-9]{64}$/D', $previousFenceIdentity) !== 1
             || $previousContainer->applicationId !== $claim->applicationId
             || $previousContainer->pullRequestId !== 0
             || $previousContainer->color !== $claim->previousActiveColor) {
@@ -478,6 +567,17 @@ class ClaimBlueGreenDeployment
         }
         if ($claim->previousActiveColor !== null && ! $previousContainer->blueGreenManaged) {
             throw new BlueGreenDeploymentTransitionException('A fixed-color rollback target requires fixed-color provenance.');
+        }
+        if ($claim->previousActiveColor !== null
+            && $expectedDestinationState?->activeSetFenceIdentity() !== $previousFenceIdentity) {
+            throw new BlueGreenDeploymentTransitionException('The previous target aggregate fence does not match the durable active route.');
+        }
+        if ($claim->previousActiveColor !== null
+            && $expectedDestinationState?->containsActiveContainer(
+                $previousContainer->name,
+                $previousContainer->dockerId,
+            ) !== true) {
+            throw new BlueGreenDeploymentTransitionException('The previous target representative is not a member of the durable active route.');
         }
     }
 
@@ -554,6 +654,9 @@ class ClaimBlueGreenDeployment
         foreach (ApplicationBlueGreenDeployment::clearedOperationAttributes() as $attribute => $_) {
             $query->whereNull($attribute);
         }
+        $query = $state->destination_routing_topology_digest === null
+            ? $query->whereNull('destination_routing_topology_digest')
+            : $query->where('destination_routing_topology_digest', $state->destination_routing_topology_digest);
         $query = $state->active_color === null
             ? $query->whereNull('active_color')
             : $query->where('active_color', $state->active_color->value);

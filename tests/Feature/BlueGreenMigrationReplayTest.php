@@ -1,6 +1,7 @@
 <?php
 
 use App\Console\Commands\Migration as MigrationCommand;
+use App\Enums\BlueGreenDeploymentPhase;
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Artisan;
@@ -16,6 +17,18 @@ function blueGreenMigration(string $filename): Migration
 function blueGreenMigrationNames(): array
 {
     return MigrationCommand::controlPlaneMigrationNames();
+}
+
+function runBlueGreenMigrationsThrough(string $lastMigrationName): void
+{
+    foreach (blueGreenMigrationNames() as $migrationName) {
+        blueGreenMigration($migrationName)->up();
+        if ($migrationName === $lastMigrationName) {
+            return;
+        }
+    }
+
+    throw new RuntimeException("Unknown control-plane migration: {$lastMigrationName}.");
 }
 
 function blueGreenMigrationMismatchMessage(string $sqliteMessage, string $postgresMessage): string
@@ -181,6 +194,7 @@ it('converges when each authorized schema commit exists without its migration le
         ->and(Schema::hasColumns('application_blue_green_deployments', ['intervention_phase', 'intervention_reason']))->toBeTrue()
         ->and(Schema::hasColumns('application_blue_green_deactivations', ['intervention_phase', 'intervention_reason']))->toBeTrue()
         ->and(Schema::hasColumn('application_blue_green_deployments', 'supersession_generation'))->toBeTrue()
+        ->and(Schema::hasColumn('application_blue_green_deployments', 'destination_routing_topology_digest'))->toBeTrue()
         ->and(Schema::hasColumn('application_blue_green_deactivations', 'supersession_generation'))->toBeTrue()
         ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_supersession_generation'))->toBeTrue()
         ->and(Schema::hasColumns('application_deployment_queues', [
@@ -192,16 +206,16 @@ it('converges when each authorized schema commit exists without its migration le
         ->and(Schema::hasTable('application_destination_reservations'))->toBeTrue();
 });
 
-it('replays every earlier migration against the complete later schema', function () {
+it('replays only the final schema owner against the complete later schema', function () {
     removeBlueGreenExpandSchema();
     $migrationNames = blueGreenMigrationNames();
 
     foreach ($migrationNames as $migrationName) {
         blueGreenMigration($migrationName)->up();
     }
-    foreach ($migrationNames as $migrationName) {
-        blueGreenMigration($migrationName)->up();
-    }
+    $finalMigration = blueGreenMigration($migrationNames[array_key_last($migrationNames)]);
+    $finalMigration->up();
+    $finalMigration->assertExactSchema();
 
     expect(Schema::hasColumns('application_blue_green_deployments', [
         'deactivation_operation_id',
@@ -211,6 +225,7 @@ it('replays every earlier migration against the complete later schema', function
         'operation_drain_last_observed_connections',
         'operation_drain_observed_at',
         'supersession_generation',
+        'destination_routing_topology_digest',
         'intervention_phase',
         'intervention_reason',
     ]))->toBeTrue()
@@ -229,22 +244,23 @@ it('replays every earlier migration against the complete later schema', function
         ->and(Schema::hasTable('application_destination_reservations'))->toBeTrue();
 });
 
-it('attests the complete schema through each migration public contract', function () {
+it('attests each historical schema only at its owned stage and the final schema through its newest owner', function () {
     removeBlueGreenExpandSchema();
-    $migrations = array_map(blueGreenMigration(...), blueGreenMigrationNames());
+    $migrationNames = blueGreenMigrationNames();
 
-    foreach ($migrations as $migration) {
+    foreach ($migrationNames as $migrationName) {
+        $migration = blueGreenMigration($migrationName);
         $migration->up();
-    }
-    foreach ($migrations as $migration) {
         $migration->assertExactSchema();
     }
+    blueGreenMigration($migrationNames[array_key_last($migrationNames)])->assertExactSchema();
 
     expect(Schema::hasTable('application_blue_green_deactivations'))->toBeTrue()
         ->and(Schema::hasColumn('application_blue_green_deactivations', 'proxy_snapshot'))->toBeTrue()
         ->and(Schema::hasColumns('application_blue_green_deployments', ['intervention_phase', 'intervention_reason']))->toBeTrue()
         ->and(Schema::hasColumns('application_blue_green_deactivations', ['intervention_phase', 'intervention_reason']))->toBeTrue()
         ->and(Schema::hasColumn('application_blue_green_deployments', 'supersession_generation'))->toBeTrue()
+        ->and(Schema::hasColumn('application_blue_green_deployments', 'destination_routing_topology_digest'))->toBeTrue()
         ->and(Schema::hasColumn('application_blue_green_deactivations', 'supersession_generation'))->toBeTrue()
         ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_supersession_generation'))->toBeTrue()
         ->and(Schema::hasColumns('application_deployment_queues', [
@@ -254,6 +270,108 @@ it('attests the complete schema through each migration public contract', functio
         ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_fleet_deployment_uuid'))->toBeTrue()
         ->and(Schema::hasColumn('application_deployment_queues', 'blue_green_fleet_status'))->toBeTrue()
         ->and(Schema::hasTable('application_destination_reservations'))->toBeTrue();
+});
+
+it('inventories and converges the destination routing topology digest migration', function (): void {
+    removeBlueGreenExpandSchema();
+    $migrationName = '2026_08_06_000000_add_destination_routing_topology_digest';
+
+    expect(blueGreenMigrationNames())->toContain($migrationName);
+
+    runBlueGreenMigrationsThrough('2026_08_04_044304_add_blue_green_candidate_container_set');
+    $migration = blueGreenMigration($migrationName);
+    $migration->up();
+    $migration->up();
+    $migration->assertExactSchema();
+
+    expect(array_count_values(Schema::getColumnListing('application_blue_green_deployments')))
+        ->toHaveKey('destination_routing_topology_digest', 1);
+});
+
+it('content-binds every reviewed control-plane migration', function (): void {
+    $fingerprint = file_get_contents(database_path('migrations/control-plane-migration-inventory.fingerprint'));
+    expect($fingerprint)->toBeString();
+    $driftedFingerprint = preg_replace(
+        '/content-sha256=[0-9a-f]{64}/',
+        'content-sha256='.str_repeat('0', 64),
+        $fingerprint,
+    );
+    expect($driftedFingerprint)->toBeString();
+    $fingerprintPath = tempnam(sys_get_temp_dir(), 'coolify-migration-fingerprint-');
+    expect($fingerprintPath)->toBeString();
+    file_put_contents($fingerprintPath, $driftedFingerprint);
+
+    try {
+        expect(fn () => MigrationCommand::controlPlaneMigrationNames(
+            database_path('migrations'),
+            $fingerprintPath,
+        ))->toThrow(RuntimeException::class, 'does not match the reviewed fingerprint');
+    } finally {
+        unlink($fingerprintPath);
+    }
+});
+
+it('adds the nullable routing topology digest without disturbing any lifecycle phase', function (
+    BlueGreenDeploymentPhase $phase,
+): void {
+    removeBlueGreenExpandSchema();
+    runBlueGreenMigrationsThrough('2026_08_04_044304_add_blue_green_candidate_container_set');
+    DB::table('servers')->insert(['id' => 1]);
+    DB::table('standalone_dockers')->insert(['id' => 1, 'server_id' => 1]);
+    DB::table('applications')->insert([
+        'id' => 1,
+        'destination_id' => 1,
+        'destination_type' => 'App\\Models\\StandaloneDocker',
+    ]);
+    DB::table('application_blue_green_deployments')->insert([
+        'application_id' => 1,
+        'standalone_docker_id' => 1,
+        'phase' => $phase->value,
+    ]);
+    $migration = blueGreenMigration('2026_08_06_000000_add_destination_routing_topology_digest');
+
+    $migration->up();
+
+    expect(Schema::hasColumn('application_blue_green_deployments', 'destination_routing_topology_digest'))
+        ->toBeTrue()
+        ->and(DB::table('application_blue_green_deployments')->value('destination_routing_topology_digest'))
+        ->toBeNull()
+        ->and(DB::table('application_blue_green_deployments')->value('phase'))
+        ->toBe($phase->value);
+})->with([
+    'idle' => [BlueGreenDeploymentPhase::IDLE],
+    'stopped' => [BlueGreenDeploymentPhase::STOPPED],
+    'preparing' => [BlueGreenDeploymentPhase::PREPARING],
+    'switching' => [BlueGreenDeploymentPhase::SWITCHING],
+    'draining' => [BlueGreenDeploymentPhase::DRAINING],
+    'rolling back' => [BlueGreenDeploymentPhase::ROLLING_BACK],
+    'deactivating' => [BlueGreenDeploymentPhase::DEACTIVATING],
+    'intervention required' => [BlueGreenDeploymentPhase::INTERVENTION_REQUIRED],
+]);
+
+it('creates the exact nullable SQLite state for the destination routing topology digest', function (): void {
+    if (Schema::getConnection()->getDriverName() !== 'sqlite') {
+        $this->markTestSkipped('SQLite column state is represented differently by PostgreSQL.');
+    }
+
+    removeBlueGreenExpandSchema();
+    runBlueGreenMigrationsThrough('2026_08_04_044304_add_blue_green_candidate_container_set');
+    blueGreenMigration('2026_08_06_000000_add_destination_routing_topology_digest')->up();
+
+    $column = collect(Schema::getColumns('application_blue_green_deployments'))
+        ->firstWhere('name', 'destination_routing_topology_digest');
+
+    expect($column)->toBe([
+        'name' => 'destination_routing_topology_digest',
+        'type_name' => 'varchar',
+        'type' => 'varchar',
+        'collation' => null,
+        'nullable' => true,
+        'default' => null,
+        'auto_increment' => false,
+        'comment' => null,
+        'generation' => null,
+    ]);
 });
 
 it('keeps all expand schema intact because every authorized migration is forward-only', function () {
@@ -629,6 +747,21 @@ it('fails closed on malformed postgres destination-fencing queue columns', funct
 
     expect(fn () => blueGreenMigration('2026_07_19_025448_add_destination_fencing_to_blue_green_operations')->up())
         ->toThrow(RuntimeException::class, 'queue columns do not match the authorized PostgreSQL catalog');
+});
+
+it('fails closed on a malformed postgres destination routing topology digest length', function (): void {
+    if (Schema::getConnection()->getDriverName() !== 'pgsql') {
+        $this->markTestSkipped('PostgreSQL varchar lengths are not represented by SQLite.');
+    }
+
+    removeBlueGreenExpandSchema();
+    runBlueGreenMigrationsThrough('2026_08_04_044304_add_blue_green_candidate_container_set');
+    $migration = blueGreenMigration('2026_08_06_000000_add_destination_routing_topology_digest');
+    $migration->up();
+    DB::statement('alter table application_blue_green_deployments alter column destination_routing_topology_digest type varchar(63)');
+
+    expect(fn () => $migration->up())
+        ->toThrow(RuntimeException::class, 'does not match the authorized database catalog');
 });
 
 it('fails closed on malformed postgres drain provenance columns', function () {

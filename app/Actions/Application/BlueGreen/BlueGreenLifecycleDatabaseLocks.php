@@ -10,17 +10,22 @@ use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\ApplicationSetting;
+use App\Models\Server;
+use App\Models\StandaloneDocker;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Support\Facades\DB;
+use RuntimeException;
 
 /**
  * Locks one application lifecycle in the only permitted order:
- * application, settings, state, deactivation, then queue owners.
+ * application, settings, optional destination and server, state, deactivation,
+ * then queue owners.
  *
  * This ordering is canonical for every writer. The dispatch claim gate
  * (ApplicationDeploymentQueue::claimForDispatchDetailed) additionally locks
  * the Server row between settings and state; no other position for a Server
- * lock is permitted, and this class deliberately takes no Server lock.
+ * lock is permitted.
  */
 final readonly class BlueGreenLifecycleDatabaseLocks
 {
@@ -30,6 +35,8 @@ final readonly class BlueGreenLifecycleDatabaseLocks
     private function __construct(
         public Application $application,
         public ApplicationSetting $setting,
+        public ?StandaloneDocker $destination,
+        public ?Server $server,
         public ?ApplicationBlueGreenDeployment $state,
         public ?ApplicationBlueGreenDeactivation $deactivation,
         public Collection $queues,
@@ -44,6 +51,47 @@ final readonly class BlueGreenLifecycleDatabaseLocks
         array $additionalQueueDeploymentUuids = [],
         bool $ensureDeploymentState = false,
     ): self {
+        return self::acquire(
+            $applicationId,
+            $standaloneDockerId,
+            $additionalQueueDeploymentUuids,
+            $ensureDeploymentState,
+            lockDestinationAndServer: false,
+        );
+    }
+
+    /**
+     * @param  list<string|null>  $additionalQueueDeploymentUuids
+     */
+    public static function forDestinationWithServer(
+        int $applicationId,
+        int $standaloneDockerId,
+        array $additionalQueueDeploymentUuids = [],
+        bool $ensureDeploymentState = false,
+    ): self {
+        return self::acquire(
+            $applicationId,
+            $standaloneDockerId,
+            $additionalQueueDeploymentUuids,
+            $ensureDeploymentState,
+            lockDestinationAndServer: true,
+        );
+    }
+
+    /**
+     * @param  list<string|null>  $additionalQueueDeploymentUuids
+     */
+    private static function acquire(
+        int $applicationId,
+        int $standaloneDockerId,
+        array $additionalQueueDeploymentUuids,
+        bool $ensureDeploymentState,
+        bool $lockDestinationAndServer,
+    ): self {
+        if (DB::transactionLevel() < 1) {
+            throw new RuntimeException('Blue-green lifecycle database locks require an active database transaction.');
+        }
+
         $application = Application::withTrashed()
             ->whereKey($applicationId)
             ->lockForUpdate()
@@ -60,6 +108,24 @@ final readonly class BlueGreenLifecycleDatabaseLocks
             throw new BlueGreenDeploymentTransitionException('The blue-green application has no durable settings row.');
         }
         $application->setRelation('settings', $setting);
+
+        $destination = null;
+        $server = null;
+        if ($lockDestinationAndServer) {
+            $destination = StandaloneDocker::query()
+                ->whereKey($standaloneDockerId)
+                ->lockForUpdate()
+                ->first();
+            $server = $destination === null
+                ? null
+                : Server::query()
+                    ->whereKey($destination->server_id)
+                    ->lockForUpdate()
+                    ->first();
+            if ($server !== null) {
+                $destination?->setRelation('server', $server);
+            }
+        }
 
         if ($ensureDeploymentState) {
             ApplicationBlueGreenDeployment::query()->fillAndInsertOrIgnore([
@@ -102,7 +168,7 @@ final readonly class BlueGreenLifecycleDatabaseLocks
                 ->lockForUpdate()
                 ->get();
 
-        return new self($application, $setting, $state, $deactivation, $queues);
+        return new self($application, $setting, $destination, $server, $state, $deactivation, $queues);
     }
 
     public function queue(string $deploymentUuid): ?ApplicationDeploymentQueue
@@ -124,6 +190,7 @@ final readonly class BlueGreenLifecycleDatabaseLocks
             || $state->deactivation_operation_id !== null
             || $state->deactivation_started_at !== null
             || $state->supersession_generation !== $claim->supersessionGeneration
+            || $state->destination_routing_topology_digest !== $claim->routingTopologyDigest
             || ! self::queueStatusOwnsPhase(
                 $deployment->status,
                 $state->phase,
@@ -170,7 +237,7 @@ final readonly class BlueGreenLifecycleDatabaseLocks
             ->where('blue_green_routing_revision', $claim->expectedRoutingRevision)
             ->where('blue_green_destination_fence_epoch', $claim->destinationFenceEpoch)
             ->where('blue_green_server_boot_id', $claim->serverBootId)
-            ->where('blue_green_topology_digest', $claim->topologyDigest)
+            ->where('blue_green_topology_digest', $claim->operationTopologyDigest)
             ->where('blue_green_routing_config_digest', $claim->routingConfigDigest)
             ->where('blue_green_backend_port_inventory', $claim->backendPortInventory->serialized);
         $query = $claim->drainBackendPortInventory === null
@@ -185,6 +252,7 @@ final readonly class BlueGreenLifecycleDatabaseLocks
                     ->where('owner_state.standalone_docker_id', $claim->standaloneDockerId)
                     ->where('owner_state.phase', $expectedStatePhase->value)
                     ->where('owner_state.supersession_generation', $claim->supersessionGeneration)
+                    ->where('owner_state.destination_routing_topology_digest', $claim->routingTopologyDigest)
                     ->whereNull('owner_state.deactivation_operation_id')
                     ->whereNull('owner_state.deactivation_started_at');
                 $stateRetainsOperationIdentity

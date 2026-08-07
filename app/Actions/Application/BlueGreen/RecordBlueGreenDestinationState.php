@@ -28,7 +28,6 @@ final class RecordBlueGreenDestinationState
             && ($replacementState->hasSameRouteIdentity($expectedState)
                 || $replacementState->hasSameAbsentRouteScope($expectedState));
         if ($replacementState->destinationId !== $claim->standaloneDockerId
-            || $replacementState->destinationTopologyDigest !== $claim->topologyDigest
             || ($expectedState === null && ($replacementState->destinationFenceEpoch !== 0 || $replacementState->managedSha256 !== null))
             || ($expectedState !== null && $isContainerOnlyMutation && $replacementState->destinationFenceEpoch !== $expectedEpoch)
             || ($expectedState !== null && ! $isContainerOnlyMutation && $replacementState->destinationFenceEpoch !== $expectedEpoch + 1)) {
@@ -48,6 +47,15 @@ final class RecordBlueGreenDestinationState
                 throw new BlueGreenDeploymentTransitionException('The destination mutation no longer belongs to the exact claimed operation.');
             }
             $locks->assertDeploymentOwner($claim, $deployment);
+            $isContainerOnlyMutation = $expectedState !== null
+                && ($replacementState->hasSameRouteIdentity($expectedState)
+                    || $replacementState->hasSameAbsentRouteScope($expectedState));
+            $isRollbackReplacement = $this->isExactRollbackReplacement($state, $claim, $replacementState);
+            $expectedOperationTopologyDigest = $isContainerOnlyMutation
+                ? $expectedState?->destinationTopologyDigest
+                : ($isRollbackReplacement
+                    ? $this->previousOperationTopologyDigest($state)
+                    : $claim->operationTopologyDigest);
             if (! in_array($state->phase, [
                 BlueGreenDeploymentPhase::PREPARING,
                 BlueGreenDeploymentPhase::SWITCHING,
@@ -57,12 +65,15 @@ final class RecordBlueGreenDestinationState
             ], true)
                 || $state->operation_deployment_uuid !== $claim->deploymentUuid
                 || $state->operation_destination_fence_epoch !== $claim->destinationFenceEpoch
-                || $state->operation_topology_digest !== $claim->topologyDigest
+                || $state->operation_topology_digest !== $claim->operationTopologyDigest
                 || $state->operation_routing_config_digest !== $claim->routingConfigDigest
+                || $state->destination_routing_topology_digest !== $claim->routingTopologyDigest
                 || $state->supersession_generation !== $claim->supersessionGeneration
                 || $deployment->blue_green_destination_fence_epoch !== $claim->destinationFenceEpoch
-                || $deployment->blue_green_topology_digest !== $claim->topologyDigest
+                || $deployment->blue_green_topology_digest !== $claim->operationTopologyDigest
                 || $deployment->blue_green_routing_config_digest !== $claim->routingConfigDigest
+                || ! is_string($expectedOperationTopologyDigest)
+                || ! hash_equals($expectedOperationTopologyDigest, $replacementState->destinationTopologyDigest)
                 || $replacementState->applicationUuid !== (string) $application->uuid
                 || $replacementState->managedFilename !== BlueGreenRoutingTarget::managedFilename(
                     (string) $application->uuid,
@@ -77,8 +88,9 @@ final class RecordBlueGreenDestinationState
                 ->where('operation_deployment_uuid', $claim->deploymentUuid)
                 ->where('operation_destination_fence_epoch', $claim->destinationFenceEpoch)
                 ->where('operation_server_boot_id', $claim->serverBootId)
-                ->where('operation_topology_digest', $claim->topologyDigest)
+                ->where('operation_topology_digest', $claim->operationTopologyDigest)
                 ->where('operation_routing_config_digest', $claim->routingConfigDigest)
+                ->where('destination_routing_topology_digest', $claim->routingTopologyDigest)
                 ->whereNull('deactivation_operation_id')
                 ->whereNull('deactivation_started_at')
                 ->where('supersession_generation', $claim->supersessionGeneration)
@@ -130,5 +142,53 @@ final class RecordBlueGreenDestinationState
         $expectedState->managedSha256 === null
             ? $query->whereNull('managed_file_sha256')
             : $query->where('managed_file_sha256', $expectedState->managedSha256);
+    }
+
+    private function isExactRollbackReplacement(
+        ApplicationBlueGreenDeployment $state,
+        BlueGreenDeploymentClaim $claim,
+        BlueGreenProxyState $replacementState,
+    ): bool {
+        if ($state->phase !== BlueGreenDeploymentPhase::ROLLING_BACK) {
+            return false;
+        }
+        $previousState = $this->previousProxyState($state);
+        if ($previousState === null) {
+            return false;
+        }
+
+        return hash_equals(
+            $previousState->withDestinationFenceEpoch(
+                $replacementState->destinationFenceEpoch,
+                $claim->deploymentUuid,
+                $replacementState->mutationSequence,
+            )->serialize(),
+            $replacementState->serialize(),
+        );
+    }
+
+    private function previousOperationTopologyDigest(ApplicationBlueGreenDeployment $state): ?string
+    {
+        return $this->previousProxyState($state)?->destinationTopologyDigest;
+    }
+
+    private function previousProxyState(ApplicationBlueGreenDeployment $state): ?BlueGreenProxyState
+    {
+        $serialized = $state->operation_previous_proxy_state;
+        $sha256 = $state->operation_previous_proxy_state_sha256;
+        if ($serialized === null && $sha256 === null) {
+            return null;
+        }
+        if (! is_string($serialized)
+            || ! is_string($sha256)
+            || ! hash_equals($sha256, hash('sha256', $serialized))) {
+            throw new BlueGreenDeploymentTransitionException('The rollback predecessor state is incomplete or corrupt.');
+        }
+
+        try {
+            return BlueGreenProxyState::parse($serialized);
+        } catch (\Throwable $exception) {
+            throw new BlueGreenDeploymentTransitionException('The rollback predecessor state is malformed.', 0, $exception);
+        }
     }
 }

@@ -65,6 +65,7 @@ final readonly class BlueGreenOperationFence
             || $state->deactivation_operation_id !== null
             || $state->deactivation_started_at !== null
             || $state->supersession_generation !== $claim->supersessionGeneration
+            || $state->destination_routing_topology_digest !== $claim->routingTopologyDigest
             || (int) $deployment->application_id !== $claim->applicationId
             || (int) $deployment->destination_id !== $claim->standaloneDockerId
             || $deployment->pull_request_id !== 0
@@ -78,7 +79,7 @@ final readonly class BlueGreenOperationFence
             || $deployment->blue_green_routing_revision !== $claim->expectedRoutingRevision
             || $deployment->blue_green_destination_fence_epoch !== $claim->destinationFenceEpoch
             || $deployment->blue_green_server_boot_id !== $claim->serverBootId
-            || $deployment->blue_green_topology_digest !== $claim->topologyDigest
+            || $deployment->blue_green_topology_digest !== $claim->operationTopologyDigest
             || $deployment->blue_green_routing_config_digest !== $claim->routingConfigDigest
             || $deployment->blue_green_backend_port_inventory !== $claim->backendPortInventory->serialized
             || $deployment->blue_green_drain_backend_port_inventory !== $claim->drainBackendPortInventory?->serialized
@@ -265,7 +266,7 @@ final readonly class BlueGreenOperationFence
         return $state->operation_previous_active_color === $claim->previousActiveColor
             && $state->operation_destination_fence_epoch === $claim->destinationFenceEpoch
             && $state->operation_server_boot_id === $claim->serverBootId
-            && $state->operation_topology_digest === $claim->topologyDigest
+            && $state->operation_topology_digest === $claim->operationTopologyDigest
             && $state->operation_routing_config_digest === $claim->routingConfigDigest
             && $state->operation_previous_container_id === $deployment->blue_green_previous_container_id
             && $state->operation_candidate_container_id === $deployment->blue_green_candidate_container_id

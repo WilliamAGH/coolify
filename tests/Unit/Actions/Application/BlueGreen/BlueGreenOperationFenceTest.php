@@ -28,7 +28,7 @@ uses(TestCase::class, RefreshDatabase::class);
 /**
  * @return array{application: Application, claim: BlueGreenDeploymentClaim, deployment: ApplicationDeploymentQueue, destination: StandaloneDocker, server: Server, state: ApplicationBlueGreenDeployment}
  */
-function blueGreenOperationFenceFixture(): array
+function blueGreenOperationFenceFixture(string $deploymentUuid = 'operation-fence-deployment'): array
 {
     $team = Team::factory()->create();
     $server = Server::factory()->create(['team_id' => $team->id]);
@@ -50,7 +50,7 @@ function blueGreenOperationFenceFixture(): array
     ]);
     $deployment = ApplicationDeploymentQueue::query()->create([
         'application_id' => $application->id,
-        'deployment_uuid' => 'operation-fence-deployment',
+        'deployment_uuid' => $deploymentUuid,
         'destination_id' => $destination->id,
         'server_id' => $destination->server_id,
         'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
@@ -68,7 +68,10 @@ function blueGreenOperationFenceFixture(): array
         'deployment' => $deployment,
         'destination' => $destination,
         'server' => $server,
-        'state' => ApplicationBlueGreenDeployment::query()->sole(),
+        'state' => ApplicationBlueGreenDeployment::query()
+            ->where('application_id', $application->id)
+            ->where('standalone_docker_id', $destination->id)
+            ->sole(),
     ];
 }
 
@@ -116,6 +119,14 @@ it('accepts the exact live deployment owner after refreshing its heartbeat', fun
         $fixture['claim'],
         [BlueGreenDeploymentPhase::PREPARING],
     ))->toBe(BlueGreenDeploymentPhase::PREPARING);
+});
+
+it('selects state only for its claimed application and destination', function (): void {
+    blueGreenOperationFenceFixture('unrelated-operation-fence-deployment');
+    $fixture = blueGreenOperationFenceFixture();
+
+    expect($fixture['state']->application_id)->toBe($fixture['application']->id)
+        ->and($fixture['state']->standalone_docker_id)->toBe($fixture['destination']->id);
 });
 
 it('accepts a deployment owner minted after a terminal deactivation completed', function (BlueGreenDeactivationPhase $terminalPhase): void {

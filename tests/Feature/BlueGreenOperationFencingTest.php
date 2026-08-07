@@ -1,8 +1,17 @@
 <?php
 
+use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
+use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
+use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
+use App\Actions\Application\BlueGreen\BlueGreenDeploymentTransitionException;
 use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\ResolveBlueGreenExpectedProxyState;
 use App\Actions\Application\BlueGreen\TransitionsBlueGreenDeployment;
+use App\Actions\Proxy\BlueGreenActiveContainer;
+use App\Actions\Proxy\BlueGreenActiveContainerSet;
+use App\Actions\Proxy\BlueGreenActiveReplica;
+use App\Actions\Proxy\BlueGreenActiveReplicaSet;
+use App\Actions\Proxy\BlueGreenProxyState;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
@@ -53,6 +62,90 @@ function makeBlueGreenOperationBootFixture(string $deploymentUuid): array
 
     return compact('application', 'deployment', 'destination');
 }
+
+function fixedPredecessorClaimMembershipRoute(string $format): BlueGreenProxyState
+{
+    $representativeId = str_repeat('a', 64);
+    $containerSet = null;
+    $replicaSet = null;
+    $replicaSetDigest = null;
+    if ($format === 'v3') {
+        $containerSet = BlueGreenActiveContainerSet::fromMembers([
+            new BlueGreenActiveContainer(3000, 'app-green', $representativeId),
+            new BlueGreenActiveContainer(8080, 'app-worker-green', str_repeat('b', 64)),
+        ]);
+    } elseif ($format === 'v4') {
+        $replicaSet = BlueGreenActiveReplicaSet::fromMembers([
+            new BlueGreenActiveReplica('gateway-green-replica-1', 1, [3000], 'app-green-replica-1', $representativeId),
+            new BlueGreenActiveReplica('gateway-green-replica-2', 2, [3000], 'app-green-replica-2', str_repeat('b', 64)),
+        ]);
+        $representative = $replicaSet->representative();
+        $representativeId = $representative->id;
+        $replicaSetDigest = $replicaSet->identityDigest();
+    }
+
+    return new BlueGreenProxyState(
+        managedFilename: 'coolify-blue-green-00112233445566aa.yaml',
+        applicationUuid: 'app',
+        destinationId: 1,
+        operationId: 'previous-green',
+        mutationSequence: 1,
+        destinationFenceEpoch: 1,
+        routingRevision: 1,
+        managedSha256: str_repeat('c', 64),
+        activeColor: BlueGreenDeploymentColor::GREEN,
+        activeDeploymentUuid: 'previous-green',
+        activeContainerName: $format === 'v4' ? 'app-green-replica-1' : 'app-green',
+        activeContainerId: $representativeId,
+        applicationRoutingConfigDigest: str_repeat('d', 64),
+        destinationTopologyDigest: str_repeat('e', 64),
+        activeContainerSet: $containerSet,
+        activeReplicaSetDigest: $replicaSetDigest,
+        activeReplicaSet: $replicaSet,
+    );
+}
+
+it('rejects a foreign fixed-color representative paired with the correct route fence', function (string $format): void {
+    $route = fixedPredecessorClaimMembershipRoute($format);
+    $claim = new BlueGreenDeploymentClaim(
+        stateId: 1,
+        applicationId: 7,
+        standaloneDockerId: 1,
+        pendingColor: BlueGreenDeploymentColor::BLUE,
+        previousActiveColor: BlueGreenDeploymentColor::GREEN,
+        deploymentUuid: 'candidate-blue',
+        expectedRoutingRevision: 2,
+        destinationFenceEpoch: 2,
+        serverBootId: '11111111-2222-3333-4444-555555555555',
+        operationTopologyDigest: str_repeat('1', 64),
+        routingTopologyDigest: str_repeat('2', 64),
+        routingConfigDigest: str_repeat('3', 64),
+        backendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
+        drainBackendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
+        supersessionGeneration: 2,
+        legacyContainerName: null,
+        candidateContainerName: 'app-blue',
+        rollbackManagedFilename: 'coolify-blue-green-00112233445566aa.yaml',
+    );
+    $foreignRepresentative = new BlueGreenContainerExpectation(
+        name: 'app-foreign-green',
+        dockerId: str_repeat('f', 64),
+        applicationId: $claim->applicationId,
+        pullRequestId: 0,
+        blueGreenManaged: true,
+        deploymentUuid: 'previous-green',
+        color: BlueGreenDeploymentColor::GREEN,
+        routingRevision: 1,
+    );
+
+    expect(fn () => (new ReflectionMethod(ClaimBlueGreenDeployment::class, 'assertPreviousContainer'))->invoke(
+        new ClaimBlueGreenDeployment,
+        $claim,
+        $foreignRepresentative,
+        $route->activeSetFenceIdentity(),
+        $route,
+    ))->toThrow(BlueGreenDeploymentTransitionException::class, 'representative is not a member');
+})->with(['v2 scalar' => 'v2', 'v3 co-rolled' => 'v3', 'v4 replicas' => 'v4']);
 
 it('reconstructs an exact rolled-back route after the destination epoch advances beyond its deployment epoch', function () {
     $team = Team::factory()->create();
