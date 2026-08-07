@@ -25,6 +25,16 @@ All notable changes to this project will be documented in this file.
 - *(blue-green)* Retire stopped replicas on the final attempt and sanitize ambiguous-retirement logs
 - *(blue-green)* Emit the released fan-out identity for previous-color fence states
 - *(blue-green)* Attest released sidecar shapes instead of rewriting them
+- *(blue-green)* Consume released projections through the shared canonical resolvers
+- *(blue-green)* Let the final retirement attempt proceed past all-stopped replicas
+- *(blue-green)* Fence clean-idle journal archival with the shared identity matcher
+- *(blue-green)* Disclose recovery failures as stable reason codes instead of raw exception detail
+- *(blue-green)* Accept replica-aware candidate fence identities during crash-boundary recovery
+- *(blue-green)* Attest canonical sidecar state before migration
+- *(api)* Keep recovery diagnostics behind correlation IDs
+- *(blue-green)* Plan forward recovery from the released-compatible projection
+- *(blue-green)* Preserve released state during forward recovery
+- *(blue-green)* Attest canonical-only migration state
 
 ### 💼 Other
 
@@ -44,6 +54,7 @@ All notable changes to this project will be documented in this file.
 - Update changelog
 - Update changelog
 - Update changelog
+- Update changelog
 
 ### 🧪 Testing
 
@@ -53,6 +64,11 @@ All notable changes to this project will be documented in this file.
 - *(proxy)* Forbid bare subshell if conditions in generated shell
 - *(control-plane)* Stop cleanup failures from masking the primary status
 - *(blue-green)* Consume the split operation topology digest in stopped-legacy cleanup
+- *(blue-green)* Pin reconciliation to the released fan-out fence identity
+- *(blue-green)* Derive recovery legacy routing snapshots from the canonical capture parser
+- *(api)* Pin the nullable recovery failure fields in the generated OpenAPI documents
+- *(blue-green)* Exercise shared fan-out fence matcher
+- *(blue-green)* Pin fence tests to the shared released fan-out contract
 
 ## [4.13.76-fork] - 2026-08-07
 
