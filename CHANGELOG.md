@@ -4,11 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🚀 Features
+
+- *(blue-green)* Add operator commands for routing topology digests
+- *(blue-green)* Fence v4 replica fan-out on the aggregate replica-set identity
+
 ### 🐛 Bug Fixes
 
 - *(blue-green)* Prove the exact candidate before release-proof verification
 - *(blue-green)* Prove interrupted replica-set recovery against the durable ledger
 - *(blue-green)* Unwedge cleanly rolled-back first adoptions
+- *(blue-green)* Land the classes and column that committed code references
+- *(blue-green)* Distinguish an absent destination from an unobservable one
+- *(blue-green)* Converge released legacy steady states under the lifecycle lock
+- *(blue-green)* Give an unproven retirement mutation a bounded retry
+- *(blue-green)* Split the claim topology digest into operation and routing identities
+- *(blue-green)* Carry replica-set identity and routing digest through the lifecycle
 
 ### 💼 Other
 
@@ -25,6 +36,7 @@ All notable changes to this project will be documented in this file.
 - Update changelog
 - *(api)* Document blue-green deployment and active-container API responses
 - *(agents)* Document the PostgreSQL lane and branch-currency guard
+- Update changelog
 
 ### 🧪 Testing
 
