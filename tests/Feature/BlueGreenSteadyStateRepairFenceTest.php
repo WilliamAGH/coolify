@@ -203,6 +203,8 @@ function fakeHealthyBlueGreenSteadyRepairProofs(
     );
     $publicAcknowledgement = (new PlanBlueGreenPublicRecovery)
         ->publicAcknowledgementForYaml($configuration->yaml);
+    $expectedState = ResolveBlueGreenExpectedProxyState::run($application, $application->destination, $state)
+        ?? throw new RuntimeException('The healthy steady repair fixture requires one exact managed route.');
     $bootId = '11111111-2222-3333-4444-555555555555';
 
     InspectBlueGreenContainer::shouldRun()
@@ -216,6 +218,7 @@ function fakeHealthyBlueGreenSteadyRepairProofs(
     Process::fake(static function (PendingProcess $process) use (
         $bootId,
         $beforePublicProofResponse,
+        $expectedState,
         $publicAcknowledgement,
         $releaseProof,
     ): FakeProcessResult {
@@ -238,6 +241,10 @@ function fakeHealthyBlueGreenSteadyRepairProofs(
         }
 
         return match (true) {
+            str_contains($invocation, 'coolify-blue-green-managed-route:present:') => Process::result(
+                output: 'coolify-blue-green-managed-route:present:'
+                    .base64_encode($expectedState->serialize())."\n".$expectedState->managedSha256,
+            ),
             str_contains($invocation, 'repair_outcome=') => Process::result(
                 output: WriteBlueGreenProxyConfiguration::REPAIR_HEALTHY_OUTPUT,
             ),

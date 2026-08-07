@@ -36,7 +36,8 @@ final class PlanBlueGreenSteadyState
             || ! $state->active_color instanceof BlueGreenDeploymentColor) {
             throw new BlueGreenDeploymentTransitionException('Only an unowned IDLE blue-green destination has a canonical steady-state repair plan.');
         }
-        $expectedState = ResolveBlueGreenExpectedProxyState::run($application, $destination, $state)
+        $expectedStateResolver = new ResolveBlueGreenExpectedProxyState;
+        $expectedState = $expectedStateResolver->handle($application, $destination, $state)
             ?? throw new BlueGreenDeploymentTransitionException('The IDLE destination has no managed route state to repair.');
         $activeDeploymentUuid = $expectedState->activeDeploymentUuid
             ?? throw new BlueGreenDeploymentTransitionException('The IDLE destination has no active deployment identity.');
@@ -46,7 +47,13 @@ final class PlanBlueGreenSteadyState
             ->firstOrFail();
         $target = $this->routingTargetForState($application, $destination, $state, $expectedState);
         $configuration = CompileBlueGreenProxyConfiguration::run($application, $destination, $target);
-        if ($configuration->state->serialize() !== $expectedState->serialize()) {
+        $releasedState = $expectedStateResolver->releasedV2FanOutState(
+            $application,
+            $destination,
+            $state,
+            $expectedState,
+        ) ?? $expectedState;
+        if ($configuration->state->serialize() !== $releasedState->serialize()) {
             throw new BlueGreenDeploymentTransitionException('The canonical steady route does not match its durable destination state.');
         }
 

@@ -64,13 +64,13 @@ final class AttestBlueGreenDestinationState
             )) {
                 return $this->recoverPendingJournal($server, $application, $destination, $state, $exception);
             }
-            if (! $mayDiscoverReleasedState || $state === null) {
+            if (! $mayDiscoverReleasedState || $state === null || $expectedState === null) {
                 throw $exception;
             }
 
             $resolver = new ResolveBlueGreenExpectedProxyState;
-            $releasedState = $resolver->releasedV3State($application, $destination, $state)
-                ?? $resolver->releasedV2FanOutState($application, $destination, $state);
+            $releasedState = $resolver->releasedV3State($application, $destination, $state, $expectedState)
+                ?? $resolver->releasedV2FanOutState($application, $destination, $state, $expectedState);
             if ($releasedState === null) {
                 throw $exception;
             }
