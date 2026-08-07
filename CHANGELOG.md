@@ -11,10 +11,15 @@ All notable changes to this project will be documented in this file.
 ### 📚 Documentation
 
 - Update changelog
+- Update changelog
 
 ### 🧪 Testing
 
 - *(api)* Prove generic cancellation stays unfenced without a dispatch binding
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.76-fork
 
 ## [4.13.75-fork] - 2026-08-07
 
