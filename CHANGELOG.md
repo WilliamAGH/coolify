@@ -20,6 +20,9 @@ All notable changes to this project will be documented in this file.
 - *(blue-green)* Give an unproven retirement mutation a bounded retry
 - *(blue-green)* Split the claim topology digest into operation and routing identities
 - *(blue-green)* Carry replica-set identity and routing digest through the lifecycle
+- *(blue-green)* Prefer the validated pending deployment during switching recovery
+- *(blue-green)* Resume released fan-out recovery under the shared fence-identity rule
+- *(blue-green)* Retire stopped replicas on the final attempt and sanitize ambiguous-retirement logs
 
 ### 💼 Other
 
@@ -36,6 +39,7 @@ All notable changes to this project will be documented in this file.
 - Update changelog
 - *(api)* Document blue-green deployment and active-container API responses
 - *(agents)* Document the PostgreSQL lane and branch-currency guard
+- Update changelog
 - Update changelog
 
 ### 🧪 Testing
