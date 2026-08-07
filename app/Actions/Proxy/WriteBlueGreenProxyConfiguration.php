@@ -1108,9 +1108,7 @@ class WriteBlueGreenProxyConfiguration
                 commands: $commands,
                 completionCommands: $completionCommands,
             ),
-            'if ! (',
-            ...$this->indent($completionCommands),
-            '); then',
+            'if ! '.$this->assertedCompletionProbeCommand($completionCommands).'; then',
             ...$this->indent($commands),
             ...$this->indent($this->afterContainerMutationCommands()),
             ...$this->indent($completionCommands),
@@ -3855,6 +3853,34 @@ class WriteBlueGreenProxyConfiguration
     protected function afterContainerMutationCommands(): array
     {
         return [];
+    }
+
+    /**
+     * Decide whether the container mutation still has work to do, failing on the
+     * first unmet assertion.
+     *
+     * POSIX suspends `set -e` for the whole condition of an `if`, including any
+     * `( ... )` written inside it, so a bare subshell reports only its LAST
+     * command's status. With assertions like `test ! -e <container>` followed by
+     * `test ! -L <container>`, a container that is still running fails the first
+     * and passes the second, so the subshell exited 0, the mutation was skipped,
+     * and the replacement state was then recorded and the journal removed --
+     * durably claiming a live container had been retired. Two containers keep
+     * serving the same continuity aliases, which is the conflicting-upstream-owner
+     * 502.
+     *
+     * A fresh `sh` reading a `set -eu` script is not inside any condition, so the
+     * first failed assertion aborts it and the status is honest. The assertions
+     * are the caller's own, not a recorded journal payload, so nothing here
+     * replays a mutation.
+     *
+     * @param  non-empty-list<string>  $completionCommands
+     */
+    private function assertedCompletionProbeCommand(array $completionCommands): string
+    {
+        $completionScript = implode("\n", ['set -eu', ...$completionCommands])."\n";
+
+        return 'printf %s '.escapeshellarg(base64_encode($completionScript)).' | base64 -d | sh';
     }
 
     private function managedStateMarker(?BlueGreenProxyState $state): string
