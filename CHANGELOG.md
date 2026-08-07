@@ -12,6 +12,11 @@ All notable changes to this project will be documented in this file.
 
 - Update changelog
 - *(agents)* Document lockfile-only audit remediation
+- Update changelog
+
+### 🧪 Testing
+
+- *(blue-green)* Isolate public recovery SSH keys
 
 ### ⚙️ Miscellaneous Tasks
 
