@@ -58,6 +58,7 @@ All notable changes to this project will be documented in this file.
 - Update changelog
 - Update changelog
 - Update changelog
+- Update changelog
 
 ### 🧪 Testing
 
@@ -76,6 +77,10 @@ All notable changes to this project will be documented in this file.
 - *(blue-green)* Align released-v3 migration and cancellation-cleanup tests with the split digests and sanitized diagnostics
 - *(blue-green)* Seed retirement settings per file
 - *(blue-green)* Keep PostgreSQL validation within its timeout
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.77-fork
 
 ## [4.13.76-fork] - 2026-08-07
 
