@@ -7,7 +7,6 @@ use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\ApplicationBlueGreenDeployment;
-use App\Models\StandaloneDocker;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -15,7 +14,7 @@ use LogicException;
 use Lorisleiva\Actions\Concerns\AsAction;
 use Throwable;
 
-final class RepairBlueGreenSteadyState
+class RepairBlueGreenSteadyState
 {
     use AsAction;
 
@@ -36,73 +35,112 @@ final class RepairBlueGreenSteadyState
         $fence = new BlueGreenOperationFence($lock, BlueGreenDeploymentLock::RENEWABLE_LEASE_SECONDS);
 
         try {
-            $locks = BlueGreenLifecycleDatabaseLocks::forDestination(
-                $state->application_id,
-                $state->standalone_docker_id,
-            );
-            $state = $locks->state;
-            if ($state === null
-                || $state->id !== $stateId
-                || $locks->application->trashed()
-                || $this->deactivationFencesRepair($locks, $state)) {
+            $context = DB::transaction(function () use ($state, $stateId): ?array {
+                BlueGreenTopologyLock::acquire();
+                $locks = BlueGreenLifecycleDatabaseLocks::forDestinationWithServer(
+                    $state->application_id,
+                    $state->standalone_docker_id,
+                );
+                $snapshot = $locks->state;
+                $destination = $locks->destination;
+                if ($snapshot === null
+                    || $snapshot->id !== $stateId
+                    || $locks->application->trashed()
+                    || $this->deactivationFencesRepair($locks, $snapshot)) {
+                    return null;
+                }
+                $this->assertIdleOwner($snapshot);
+                if ($destination === null || $locks->server === null) {
+                    throw new BlueGreenDeploymentTransitionException('The IDLE route destination is no longer configured on one exact server.');
+                }
+                $isPrimaryDestination = (int) $locks->application->destination_id === (int) $destination->id
+                    && $locks->application->destination_type === $destination->getMorphClass();
+                $isAdditionalDestination = $locks->application->additional_networks()
+                    ->whereKey($destination->id)
+                    ->wherePivot('server_id', $destination->server_id)
+                    ->exists();
+                if (! $isPrimaryDestination && ! $isAdditionalDestination) {
+                    throw new BlueGreenDeploymentTransitionException('The IDLE route destination is no longer assigned to the application.');
+                }
+
+                return [
+                    'application' => $locks->application,
+                    'destination' => $destination,
+                    'state' => $snapshot,
+                ];
+            }, attempts: 5);
+            if ($context === null) {
                 return new BlueGreenSteadyStateRepairResult($stateId, BlueGreenSteadyStateRepairResult::SKIPPED, 'Deletion or deactivation owns the destination.');
             }
-            $this->assertIdleOwner($state);
-            $destination = StandaloneDocker::query()
-                ->with('server')
-                ->find($state->standalone_docker_id);
-            if ($destination === null || $destination->server === null) {
-                throw new BlueGreenDeploymentTransitionException('The IDLE route destination is no longer configured on one exact server.');
+            $application = $context['application'];
+            $destination = $context['destination'];
+            $state = $context['state'];
+            if ($state->destination_routing_topology_digest === null) {
+                return new BlueGreenSteadyStateRepairResult($stateId, BlueGreenSteadyStateRepairResult::PENDING_ROUTING_TOPOLOGY_DIGEST, 'The destination routing topology digest is not established; run blue-green:rehydrate-routing-topology to converge this destination.');
             }
-            $isPrimaryDestination = (int) $locks->application->destination_id === (int) $destination->id
-                && $locks->application->destination_type === $destination->getMorphClass();
-            $isAdditionalDestination = $locks->application->additional_networks()
-                ->whereKey($destination->id)
-                ->wherePivot('server_id', $destination->server_id)
-                ->exists();
-            if (! $isPrimaryDestination && ! $isAdditionalDestination) {
-                throw new BlueGreenDeploymentTransitionException('The IDLE route destination is no longer assigned to the application.');
-            }
-            $plan = PlanBlueGreenSteadyState::run($locks->application, $destination, $state);
-            $inspection = InspectBlueGreenContainer::run($destination->server, $plan->activeContainer);
-            if (! $inspection->exists
-                || $inspection->dockerId !== $plan->activeContainer->dockerId
-                || $inspection->status !== 'running'
-                || $inspection->health !== 'healthy') {
-                throw new BlueGreenDeploymentTransitionException('The exact active container is not running and healthy; route repair refused.');
-            }
-            VerifyBlueGreenCandidateReleaseProof::run(
-                $destination->server,
-                $plan->activeContainer,
-                BlueGreenRoutingTarget::durableReleaseProofToken($plan->activeDeployment->deployment_uuid),
+            $currentRoutingTopologyDigest = (new ComputeBlueGreenDeploymentFingerprint)->routingTopologyDigestFor(
+                $application,
+                $destination,
             );
+            if (! is_string($state->destination_routing_topology_digest)
+                || preg_match('/^[a-f0-9]{64}$/D', $state->destination_routing_topology_digest) !== 1
+                || ! hash_equals($state->destination_routing_topology_digest, $currentRoutingTopologyDigest)) {
+                return new BlueGreenSteadyStateRepairResult($stateId, BlueGreenSteadyStateRepairResult::DEFERRED, 'The destination routing topology digest no longer matches current topology.');
+            }
+            $plan = PlanBlueGreenSteadyState::run($application, $destination, $state);
+            foreach ($plan->activeContainers as $activeContainer) {
+                $inspection = InspectBlueGreenContainer::run($destination->server, $activeContainer);
+                if (! $inspection->exists
+                    || $inspection->dockerId !== $activeContainer->dockerId
+                    || $inspection->status !== 'running'
+                    || $inspection->health !== 'healthy') {
+                    throw new BlueGreenDeploymentTransitionException('The exact active container is not running and healthy; route repair refused.');
+                }
+                VerifyBlueGreenCandidateReleaseProof::run(
+                    $destination->server,
+                    $activeContainer,
+                    BlueGreenRoutingTarget::durableReleaseProofToken($plan->activeDeployment->deployment_uuid),
+                    $inspection,
+                );
+            }
             $bootId = ReadBlueGreenServerBootIdentity::run($destination->server);
             $fence->assertLockOwnership();
+            $this->assertSnapshotAndTopologyUnchanged($state);
+            MigrateBlueGreenReleasedV3ProxyState::run(
+                $destination->server,
+                $application,
+                $destination,
+                $state,
+                $bootId,
+                $fence,
+            );
+            $fence->assertLockOwnership();
+            $this->assertSnapshotAndTopologyUnchanged($state);
             $outcome = (new WriteBlueGreenProxyConfiguration)->repairManagedConfiguration(
                 $destination->server,
                 $plan->configuration,
                 $bootId,
             );
             $fence->assertLockOwnership();
-            $this->assertSnapshotUnchanged($state);
+            $this->assertSnapshotAndTopologyUnchanged($state);
             VerifyBlueGreenManagedConfiguration::run($destination->server, $plan->configuration);
             (new VerifyBlueGreenPublicRecovery)->verifyRoutesAbsorbingProviderLag(
                 server: $destination->server,
-                application: $locks->application,
+                application: $application,
                 routes: $plan->publicRoutes,
                 expectedAcknowledgement: $plan->publicAcknowledgement,
                 expectedReleaseProof: BlueGreenRoutingTarget::durableReleaseProofToken($plan->activeDeployment->deployment_uuid),
                 nonceParameter: VerifyBlueGreenPublicRecovery::DEPLOYMENT_NONCE_PARAMETER,
                 beforeRequest: function () use ($fence, $state): void {
                     $fence->assertLockOwnership();
-                    $this->assertSnapshotUnchanged($state);
+                    $this->assertSnapshotAndTopologyUnchanged($state);
                 },
                 // A repaired MISSING managed file means nothing was routed before this
                 // write: catchall/unissued-TLS observations are the expected initial
                 // appearance, not a regression, while the file provider converges.
                 allowInitialRouteAppearance: $outcome === WriteBlueGreenProxyConfiguration::REPAIR_MISSING_OUTPUT,
             );
-            $this->assertSnapshotUnchanged($state);
+            $this->assertSnapshotAndTopologyUnchanged($state);
             $this->clearExactStaleInterventionDiagnostics($state, $fence);
 
             $result = match ($outcome) {
@@ -118,6 +156,10 @@ final class RepairBlueGreenSteadyState
         } catch (BlueGreenOperationFenceLostException) {
             return new BlueGreenSteadyStateRepairResult($stateId, BlueGreenSteadyStateRepairResult::DEFERRED, 'Lifecycle ownership changed during steady-state repair.');
         } catch (Throwable $exception) {
+            if (str_contains($exception->getMessage(), WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT)) {
+                return new BlueGreenSteadyStateRepairResult($stateId, BlueGreenSteadyStateRepairResult::PENDING_CONTAINER_JOURNAL, 'A container-mutation journal fences the IDLE route; clean-idle journal recovery owns it.');
+            }
+
             return new BlueGreenSteadyStateRepairResult($stateId, BlueGreenSteadyStateRepairResult::DEFERRED, $exception->getMessage());
         } finally {
             try {
@@ -189,11 +231,33 @@ final class RepairBlueGreenSteadyState
         }
     }
 
-    private function assertSnapshotUnchanged(ApplicationBlueGreenDeployment $snapshot): void
+    private function assertSnapshotAndTopologyUnchanged(ApplicationBlueGreenDeployment $snapshot): void
     {
-        $current = ApplicationBlueGreenDeployment::query()->find($snapshot->id);
-        if ($current === null) {
-            throw new BlueGreenOperationFenceLostException('The destination state was removed during repair.');
+        DB::transaction(function () use ($snapshot): void {
+            BlueGreenTopologyLock::acquire();
+            $identity = ApplicationBlueGreenDeployment::query()->find($snapshot->id);
+            if ($identity === null) {
+                throw new BlueGreenOperationFenceLostException('The destination state was removed during repair.');
+            }
+            $locks = BlueGreenLifecycleDatabaseLocks::forDestinationWithServer(
+                (int) $identity->application_id,
+                (int) $identity->standalone_docker_id,
+            );
+            $this->assertLockedSnapshotAndTopologyUnchanged($snapshot, $locks);
+        }, attempts: 5);
+    }
+
+    private function assertLockedSnapshotAndTopologyUnchanged(
+        ApplicationBlueGreenDeployment $snapshot,
+        BlueGreenLifecycleDatabaseLocks $locks,
+    ): void {
+        $current = $locks->state;
+        if ($current === null
+            || $current->id !== $snapshot->id
+            || $locks->application->trashed()
+            || $locks->destination === null
+            || $locks->server === null) {
+            throw new BlueGreenOperationFenceLostException('The destination ownership changed during repair.');
         }
         $this->assertIdleOwner($current);
         foreach ([
@@ -201,12 +265,23 @@ final class RepairBlueGreenSteadyState
             'green_deployment_uuid', 'routing_revision', 'destination_fence_epoch',
             'destination_fence_operation_id', 'destination_fence_mutation_sequence',
             'managed_file_sha256', 'destination_topology_digest', 'application_routing_config_digest',
-            'supersession_generation',
+            'destination_routing_topology_digest', 'supersession_generation',
         ] as $attribute) {
             if ($current->{$attribute} != $snapshot->{$attribute}) {
                 throw new BlueGreenOperationFenceLostException('The durable IDLE destination changed during repair.');
             }
         }
+        if (! is_string($snapshot->destination_routing_topology_digest)
+            || ! hash_equals(
+                $snapshot->destination_routing_topology_digest,
+                (new ComputeBlueGreenDeploymentFingerprint)->routingTopologyDigestFor(
+                    $locks->application,
+                    $locks->destination,
+                ),
+            )) {
+            throw new BlueGreenOperationFenceLostException('The destination routing topology changed during repair.');
+        }
+        PlanBlueGreenSteadyState::run($locks->application, $locks->destination, $current);
     }
 
     /**
@@ -227,12 +302,13 @@ final class RepairBlueGreenSteadyState
 
         $fence->assertLockOwnership();
         DB::transaction(function () use ($fence, $snapshot): void {
+            BlueGreenTopologyLock::acquire();
             $fence->assertLockOwnership();
             $identity = ApplicationBlueGreenDeployment::query()->find($snapshot->id);
             if ($identity === null) {
                 throw new BlueGreenOperationFenceLostException('The IDLE destination disappeared before stale intervention diagnostics could be cleaned.');
             }
-            $locks = BlueGreenLifecycleDatabaseLocks::forDestination(
+            $locks = BlueGreenLifecycleDatabaseLocks::forDestinationWithServer(
                 $identity->application_id,
                 $identity->standalone_docker_id,
             );
@@ -243,7 +319,7 @@ final class RepairBlueGreenSteadyState
             if ($locks->application->trashed() || $this->deactivationFencesRepair($locks, $current)) {
                 throw new BlueGreenOperationFenceLostException('Lifecycle ownership changed before stale intervention diagnostics could be cleaned.');
             }
-            $this->assertSnapshotUnchanged($snapshot);
+            $this->assertLockedSnapshotAndTopologyUnchanged($snapshot, $locks);
             if (! $this->hasExactStaleInterventionDiagnostics($current)) {
                 return;
             }

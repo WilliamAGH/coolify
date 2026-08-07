@@ -3,6 +3,7 @@
 namespace App\Actions\Application\BlueGreen;
 
 use App\Actions\Proxy\BlueGreenProxyState;
+use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Exceptions\BlueGreenRecoveryHandoffException;
@@ -22,7 +23,7 @@ use Throwable;
  * clean IDLE destination state. Pending work remains ambiguous because its
  * container mutation may have landed partially; stored scripts are never run.
  */
-final class RecoverCleanIdleBlueGreenContainerMutationJournal
+class RecoverCleanIdleBlueGreenContainerMutationJournal
 {
     use AsAction;
 
@@ -344,9 +345,24 @@ final class RecoverCleanIdleBlueGreenContainerMutationJournal
                     $replicaSet,
                 );
                 $replicaSet->assertPromotionThreshold($inspections);
-                $runtimeIdentity = $replicaSet->usesScalarCompatibilityPath()
-                    ? $inspections[0]->dockerId
-                    : BlueGreenReplicaSet::identityDigest($inspections);
+                if ($replicaSet->usesScalarCompatibilityPath()) {
+                    $runtimeIdentity = $inspections[0]->dockerId;
+                } else {
+                    $scalarBackendPorts = [];
+                    foreach ($expectedState->activeReplicaSet?->members ?? [] as $member) {
+                        foreach ($member->ports as $port) {
+                            $scalarBackendPorts[$port] = true;
+                        }
+                    }
+                    $runtimeIdentity = ResolveBlueGreenActiveReplicaSet::run(
+                        $application->blueGreenComposeTopology(),
+                        $expectedState->activeColor,
+                        $replicaSet,
+                        $inspections,
+                        array_keys($scalarBackendPorts),
+                    )?->identityDigest()
+                        ?? throw new BlueGreenDeploymentTransitionException('The live replica set has no aggregate identity to fence.');
+                }
             } catch (Throwable $exception) {
                 throw new BlueGreenDeploymentTransitionException(
                     'The exact active clean IDLE replica set could not be proven running and healthy; journal archival refused.',
@@ -354,26 +370,52 @@ final class RecoverCleanIdleBlueGreenContainerMutationJournal
                     $exception,
                 );
             }
-            if (! hash_equals($expectedState->activeContainerId, $runtimeIdentity)) {
+            $expectedFenceIdentity = $expectedState->activeSetFenceIdentity();
+            if (! is_string($expectedFenceIdentity) || ! hash_equals($expectedFenceIdentity, $runtimeIdentity)) {
                 throw new BlueGreenDeploymentTransitionException('The exact active clean IDLE replica set no longer matches its durable route identity.');
+            }
+
+            foreach ($inspections as $replica) {
+                if ($expectedState->activeReplicaSet !== null
+                    && ! $expectedState->containsActiveContainer($replica->containerName, $replica->dockerId)) {
+                    throw new BlueGreenDeploymentTransitionException('The exact active clean IDLE replica is absent from the durable route identity.');
+                }
+                if (! $replicaSet->usesScalarCompatibilityPath()) {
+                    VerifyBlueGreenCandidateReleaseProof::run(
+                        $server,
+                        new BlueGreenContainerExpectation(
+                            name: $replica->containerName,
+                            dockerId: $replica->dockerId,
+                            applicationId: (int) $application->getKey(),
+                            pullRequestId: 0,
+                            blueGreenManaged: true,
+                            deploymentUuid: $expectedState->activeDeploymentUuid,
+                            color: $expectedState->activeColor,
+                            routingRevision: $expectedState->routingRevision,
+                        ),
+                        BlueGreenRoutingTarget::durableReleaseProofToken($expectedState->activeDeploymentUuid),
+                    );
+                }
             }
 
             return;
         }
 
-        $inspection = InspectBlueGreenContainer::run(
-            $server,
-            new BlueGreenContainerExpectation(
-                name: $expectedState->activeContainerName,
-                dockerId: $expectedState->activeContainerId,
-                applicationId: (int) $application->getKey(),
-                pullRequestId: 0,
-                blueGreenManaged: true,
-                deploymentUuid: $expectedState->activeDeploymentUuid,
-                color: $expectedState->activeColor,
-                routingRevision: $expectedState->routingRevision,
-            ),
+        if ($expectedState->activeContainerSet !== null || $expectedState->activeReplicaSet !== null) {
+            throw new BlueGreenDeploymentTransitionException('The clean IDLE route names a container set whose durable replica ledger is missing.');
+        }
+
+        $activeContainer = new BlueGreenContainerExpectation(
+            name: $expectedState->activeContainerName,
+            dockerId: $expectedState->activeContainerId,
+            applicationId: (int) $application->getKey(),
+            pullRequestId: 0,
+            blueGreenManaged: true,
+            deploymentUuid: $expectedState->activeDeploymentUuid,
+            color: $expectedState->activeColor,
+            routingRevision: $expectedState->routingRevision,
         );
+        $inspection = InspectBlueGreenContainer::run($server, $activeContainer);
         if (! $inspection->exists
             || ! hash_equals($expectedState->activeContainerId, (string) $inspection->dockerId)
             || $inspection->status !== 'running'
