@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🐛 Bug Fixes
+
+- *(blue-green)* Prove the exact candidate before release-proof verification
+- *(blue-green)* Prove interrupted replica-set recovery against the durable ledger
+- *(blue-green)* Unwedge cleanly rolled-back first adoptions
+
+### 💼 Other
+
+- *(release)* Add staging ship preflight and harden fork tag verification
+- *(ci)* Make one script own the blue-green PostgreSQL lane
+
 ### 🚜 Refactor
 
 - *(blue-green)* Give route-state equality one owner on the value object
@@ -11,6 +22,17 @@ All notable changes to this project will be documented in this file.
 ### 📚 Documentation
 
 - Update changelog
+- Update changelog
+- *(api)* Document blue-green deployment and active-container API responses
+- *(agents)* Document the PostgreSQL lane and branch-currency guard
+
+### 🧪 Testing
+
+- *(factories)* Bind server and private-key factories to durable identities
+- Resolve seeded private keys by id instead of assuming id 1
+- *(ci)* Pin the canonical PostgreSQL runner contract
+- *(proxy)* Forbid bare subshell if conditions in generated shell
+- *(control-plane)* Stop cleanup failures from masking the primary status
 
 ## [4.13.76-fork] - 2026-08-07
 
@@ -35,6 +57,10 @@ All notable changes to this project will be documented in this file.
 
 ### 🐛 Bug Fixes
 
+- *(blue-green)* Read a destination's deactivation through its phase, never its existence
+- *(blue-green)* Accept plain-text custom labels when resolving canonical routes
+- *(blue-green)* Self-heal stale deployment state
+- *(fork-deploy)* Point the post-update rollback hint at the release it replaced
 - *(blue-green)* Fail the container-mutation guard on its first unmet assertion
 - *(deps)* Take league/commonmark 2.9.0 for six published advisories
 
@@ -43,29 +69,14 @@ All notable changes to this project will be documented in this file.
 - Update changelog
 - Update changelog
 - Update changelog
+- Update changelog
+- Update changelog
 
 ### ⚙️ Miscellaneous Tasks
 
+- *(release)* Prepare 4.13.74-fork
+- *(release)* Prepare 4.13.74-fork
 - *(release)* Prepare 4.13.75-fork
-
-## [4.13.74-fork] - 2026-08-06
-
-### 🐛 Bug Fixes
-
-- *(blue-green)* Read a destination's deactivation through its phase, never its existence
-- *(blue-green)* Accept plain-text custom labels when resolving canonical routes
-- *(blue-green)* Self-heal stale deployment state
-- *(fork-deploy)* Point the post-update rollback hint at the release it replaced
-
-### 📚 Documentation
-
-- Update changelog
-- Update changelog
-
-### ⚙️ Miscellaneous Tasks
-
-- *(release)* Prepare 4.13.74-fork
-- *(release)* Prepare 4.13.74-fork
 
 ## [4.13.73-fork] - 2026-08-06
 
