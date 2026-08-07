@@ -7,11 +7,14 @@ use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\CompleteBlueGreenDeploymentOperation;
 use App\Actions\Application\BlueGreen\EnsureBlueGreenPreviousContainerRunning;
 use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
+use App\Actions\Application\BlueGreen\PlanBlueGreenForwardRecovery;
 use App\Actions\Application\BlueGreen\PlanBlueGreenPublicRecovery;
+use App\Actions\Application\BlueGreen\PlanBlueGreenSteadyState;
 use App\Actions\Application\BlueGreen\RebindBlueGreenLegacyRoutingSnapshot;
 use App\Actions\Application\BlueGreen\ReconcileBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\ReconstructBlueGreenDeploymentRecovery;
 use App\Actions\Application\BlueGreen\RemoveExactBlueGreenCandidate;
+use App\Actions\Application\BlueGreen\ResolveBlueGreenActiveReplicaSet;
 use App\Actions\Application\BlueGreen\VerifyBlueGreenLegacyProviderRecovery;
 use App\Actions\Proxy\BlueGreenProxyConfiguration;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifact;
@@ -56,7 +59,15 @@ function blueGreenCrashBoundaryCandidateConfiguration(
     array $candidateReplicas = [],
 ): BlueGreenProxyConfiguration {
     $state = $scenario->state->fresh();
-    $usesReplicaBackends = $candidateReplicas !== [];
+    $activeReplicaSet = $candidateReplicas === []
+        ? null
+        : (new ResolveBlueGreenActiveReplicaSet)->handle(
+            $scenario->application->blueGreenComposeTopology(),
+            BlueGreenDeploymentColor::BLUE,
+            new BlueGreenReplicaSet(count($candidateReplicas)),
+            $candidateReplicas,
+            [3000],
+        );
     $target = new BlueGreenRoutingTarget(
         destinationId: $scenario->destination->id,
         activeColor: BlueGreenDeploymentColor::BLUE,
@@ -72,14 +83,17 @@ function blueGreenCrashBoundaryCandidateConfiguration(
         operationId: BlueGreenRecoveryScenario::OPERATION_UUID,
         mutationSequence: $state->destination_fence_mutation_sequence,
         activeDeploymentUuid: BlueGreenRecoveryScenario::OPERATION_UUID,
-        activeContainerId: $state->operation_candidate_container_id,
+        activeContainerId: $activeReplicaSet?->representative()->id
+            ?? $state->operation_candidate_container_id,
         destinationTopologyDigest: $state->destination_topology_digest,
-        blueReplicaBackends: $usesReplicaBackends
-            ? array_column($candidateReplicas, 'containerName')
+        blueReplicaBackends: $activeReplicaSet !== null
+            ? array_column($activeReplicaSet->members, 'name')
             : null,
-        greenReplicaBackends: $usesReplicaBackends
+        greenReplicaBackends: $activeReplicaSet !== null
             ? [$scenario->application->uuid.'-green']
             : null,
+        activeReplicaSetDigest: $activeReplicaSet?->identityDigest(),
+        blueReplicaSet: $activeReplicaSet,
     );
 
     return CompileBlueGreenProxyConfiguration::run(
@@ -123,7 +137,14 @@ function blueGreenCrashBoundaryReplicaCandidates(
         );
     }
 
-    $candidateId = BlueGreenReplicaSet::identityDigest($replicas);
+    $activeReplicaSet = (new ResolveBlueGreenActiveReplicaSet)->handle(
+        $scenario->application->blueGreenComposeTopology(),
+        BlueGreenDeploymentColor::BLUE,
+        new BlueGreenReplicaSet($replicaCount),
+        $replicas,
+        [3000],
+    );
+    $candidateId = $activeReplicaSet->identityDigest();
     $scenario->state->update(['operation_candidate_container_id' => $candidateId]);
     $scenario->deployment->update(['blue_green_candidate_container_id' => $candidateId]);
 
@@ -323,16 +344,35 @@ it('completes a proven three-replica switching route with its stage-specific dig
     $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: true);
     $replicas = blueGreenCrashBoundaryReplicaCandidates($scenario);
     $configuration = blueGreenCrashBoundaryCandidateConfiguration($scenario, $replicas);
+    $configurationBytes = $configuration->state->serialize();
     expect($configuration->routingConfigDigest)
         ->not->toBe($scenario->state->operation_routing_config_digest);
     $scenario->state->update([
         'phase' => BlueGreenDeploymentPhase::SWITCHING,
+        'operation_rollback_proxy_state' => $configurationBytes,
+        'operation_rollback_proxy_state_sha256' => hash('sha256', $configurationBytes),
         'managed_file_sha256' => $configuration->state->managedSha256,
         'application_routing_config_digest' => $configuration->routingConfigDigest,
     ]);
     $scenario->deployment->update(['blue_green_phase' => BlueGreenDeploymentPhase::SWITCHING]);
     blueGreenCrashBoundaryMakeStale($scenario->deployment);
-    $claim = ReconstructBlueGreenDeploymentRecovery::run($scenario->state->fresh())->claim;
+    $operation = ReconstructBlueGreenDeploymentRecovery::run($scenario->state->fresh());
+    $claim = $operation->claim;
+    $mismatchedState = $scenario->state->fresh();
+    $mismatchedState->pending_deployment_uuid = 'different-pending-operation';
+    expect(fn () => (new PlanBlueGreenSteadyState)->routingTargetForState(
+        $operation->application,
+        $operation->destination,
+        $mismatchedState,
+        $operation->currentDestinationState,
+        BlueGreenRoutingMode::LegacyAdoption,
+    ))->toThrow(
+        InvalidArgumentException::class,
+        'A replica-aware blue-green route requires its aggregate replica-set digest.',
+    );
+    $forwardPlan = PlanBlueGreenForwardRecovery::run($operation, $replicas);
+    expect($forwardPlan->configuration->state->serialize())
+        ->toBe($configuration->state->serialize());
 
     $releaseProof = BlueGreenRoutingTarget::durableReleaseProofToken(
         BlueGreenRecoveryScenario::OPERATION_UUID,
@@ -345,7 +385,6 @@ it('completes a proven three-replica switching route with its stage-specific dig
         .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$publicAcknowledgement}\r\n"
         .BlueGreenRoutingTarget::RELEASE_PROOF_HEADER.": {$releaseProof}\r\n\r\n";
     $responses = [
-        Process::result(output: blueGreenCrashBoundaryReplicaInspectionOutput($scenario, $replicas, includeIndexes: false)),
         ...array_map(
             static fn (): FakeProcessResult => Process::result(output: json_encode([
                 'COOLIFY_DEPLOYMENT_RELEASE_PROOF='.$releaseProof,
@@ -358,20 +397,49 @@ it('completes a proven three-replica switching route with its stage-specific dig
             $publicRoutes,
         ),
     ];
-    Process::fake(function (PendingProcess $process) use (&$responses) {
+    // The probe cycle is pattern-matched because the recovery flow re-runs it
+    // per attempt; only the proof/attestation/public tail stays positional.
+    Process::fake(function (PendingProcess $process) use (&$responses, $scenario, $replicas, $configuration) {
+        $payload = (string) $process->command."\n".(string) $process->input;
+        if (str_contains($payload, 'coolify_available_replica_')) {
+            return Process::result(output: blueGreenCrashBoundaryReplicaInspectionOutput($scenario, $replicas));
+        }
+        if (str_contains($payload, 'coolify_replica_')) {
+            return Process::result(output: blueGreenCrashBoundaryReplicaInspectionOutput($scenario, $replicas, includeIndexes: false));
+        }
+        if (str_contains($payload, WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX)) {
+            return Process::result(output: WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX.'|absent');
+        }
+        if (str_contains($payload, 'coolify-blue-green-managed-route')) {
+            return Process::result(output: 'coolify-blue-green-managed-route:present:'
+                .base64_encode($configuration->state->serialize())."\n".$configuration->state->managedSha256);
+        }
+
         return array_shift($responses) ?? Process::result();
     });
     InspectBlueGreenContainer::shouldRun()
-        ->times(count($replicas))
-        ->andReturn(...array_map(
-            static fn (BlueGreenReplicaInspection $replica): BlueGreenContainerInspection => new BlueGreenContainerInspection(
-                exists: true,
-                dockerId: $replica->dockerId,
-                status: $replica->status,
-                health: $replica->health,
-            ),
-            $replicas,
-        ));
+        ->andReturnUsing(static function ($server, $expectation) use ($replicas): BlueGreenContainerInspection {
+            if (hash_equals(BlueGreenRecoveryScenario::LEGACY_ID, (string) $expectation->dockerId)) {
+                return new BlueGreenContainerInspection(
+                    exists: true,
+                    dockerId: BlueGreenRecoveryScenario::LEGACY_ID,
+                    status: 'running',
+                    health: 'healthy',
+                );
+            }
+            foreach ($replicas as $replica) {
+                if (hash_equals($replica->dockerId, (string) $expectation->dockerId)) {
+                    return new BlueGreenContainerInspection(
+                        exists: true,
+                        dockerId: $replica->dockerId,
+                        status: $replica->status,
+                        health: $replica->health,
+                    );
+                }
+            }
+
+            return BlueGreenContainerInspection::missing();
+        });
     BlueGreenProxyRollbackArtifactCommitter::shouldRun()->once()->andReturnNull();
 
     $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);

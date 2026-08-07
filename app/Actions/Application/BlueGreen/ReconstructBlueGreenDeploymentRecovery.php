@@ -22,6 +22,7 @@ final class ReconstructBlueGreenDeploymentRecovery
     public function handle(ApplicationBlueGreenDeployment $state): BlueGreenDeploymentRecoveryOperation
     {
         return DB::transaction(function () use ($state): BlueGreenDeploymentRecoveryOperation {
+            BlueGreenTopologyLock::acquire();
             $stateId = (int) $state->getKey();
             $snapshot = ApplicationBlueGreenDeployment::query()->find($stateId);
             if ($snapshot === null) {
@@ -76,14 +77,14 @@ final class ReconstructBlueGreenDeploymentRecovery
                 throw new BlueGreenDeploymentTransitionException('A finalized operation has no durable routing-mutation provenance.');
             }
 
-            $previousContainer = $this->previousContainer($state, $claim, $deployment);
+            $previousContainer = $this->previousContainer($state, $application, $claim, $deployment);
             $legacyRoutingSnapshot = $this->legacyRoutingSnapshot(
                 $state,
                 $claim,
                 $previousContainer,
                 $routingMutationRecorded,
             );
-            $candidateContainer = $this->candidateContainer($state, $claim);
+            $candidateContainer = $this->candidateContainer($state, $application, $claim);
 
             $rollbackKey = $this->rollbackKey(
                 $state,
@@ -112,6 +113,12 @@ final class ReconstructBlueGreenDeploymentRecovery
                 recoveredPhase: $state->phase,
                 routingMutationRecorded: $routingMutationRecorded,
                 wasFinalized: $wasFinalized,
+                candidateSetFenceIdentity: is_string($state->operation_candidate_container_id)
+                    ? $state->operation_candidate_container_id
+                    : null,
+                previousSetFenceIdentity: is_string($state->operation_previous_container_id)
+                    ? $state->operation_previous_container_id
+                    : null,
             );
         }, attempts: 5);
     }
@@ -210,6 +217,12 @@ final class ReconstructBlueGreenDeploymentRecovery
             $pendingColor,
             $routingRevision,
         );
+        $fingerprint = (new RehydrateBlueGreenDestinationRoutingTopologyDigest)->rehydrateActiveOperationUnderLock(
+            state: $state,
+            application: $application,
+            destination: $destination,
+            deployment: $deployment,
+        );
 
         return new BlueGreenDeploymentClaim(
             stateId: $state->id,
@@ -221,7 +234,8 @@ final class ReconstructBlueGreenDeploymentRecovery
             expectedRoutingRevision: $routingRevision,
             destinationFenceEpoch: $destinationFenceEpoch,
             serverBootId: $serverBootId,
-            topologyDigest: $topologyDigest,
+            operationTopologyDigest: $topologyDigest,
+            routingTopologyDigest: $fingerprint->routingTopologyDigest,
             routingConfigDigest: $routingConfigDigest,
             backendPortInventory: $backendPortInventory,
             drainBackendPortInventory: $drainBackendPortInventory,
@@ -285,8 +299,9 @@ final class ReconstructBlueGreenDeploymentRecovery
         if ($state->operation_deployment_uuid !== $claim->deploymentUuid
             || $state->operation_destination_fence_epoch !== $claim->destinationFenceEpoch
             || $state->operation_server_boot_id !== $claim->serverBootId
-            || $state->operation_topology_digest !== $claim->topologyDigest
+            || $state->operation_topology_digest !== $claim->operationTopologyDigest
             || $state->operation_routing_config_digest !== $claim->routingConfigDigest
+            || $state->destination_routing_topology_digest !== $claim->routingTopologyDigest
             || $state->supersession_generation !== $claim->supersessionGeneration
             || $state->deactivation_operation_id !== null
             || $state->deactivation_started_at !== null
@@ -300,7 +315,7 @@ final class ReconstructBlueGreenDeploymentRecovery
             || $deployment->blue_green_routing_revision !== $claim->expectedRoutingRevision
             || $deployment->blue_green_destination_fence_epoch !== $claim->destinationFenceEpoch
             || $deployment->blue_green_server_boot_id !== $claim->serverBootId
-            || $deployment->blue_green_topology_digest !== $claim->topologyDigest
+            || $deployment->blue_green_topology_digest !== $claim->operationTopologyDigest
             || $deployment->blue_green_routing_config_digest !== $claim->routingConfigDigest
             || $deployment->blue_green_backend_port_inventory !== $claim->backendPortInventory->serialized
             || $deployment->blue_green_drain_backend_port_inventory !== $claim->drainBackendPortInventory?->serialized
@@ -384,6 +399,7 @@ final class ReconstructBlueGreenDeploymentRecovery
 
     private function previousContainer(
         ApplicationBlueGreenDeployment $state,
+        Application $application,
         BlueGreenDeploymentClaim $claim,
         ApplicationDeploymentQueue $deployment,
     ): ?BlueGreenContainerExpectation {
@@ -438,9 +454,25 @@ final class ReconstructBlueGreenDeploymentRecovery
             throw new BlueGreenDeploymentTransitionException('The previous fixed-color slot no longer points to its proven deployment.');
         }
 
+        $representative = $this->representativeContainerIdentity(
+            $state,
+            $application,
+            $previousDeploymentUuid,
+            $claim->previousActiveColor,
+            $previousRoutingRevision,
+            $dockerId,
+            $name,
+            backendPorts: ($claim->drainBackendPortInventory ?? $claim->backendPortInventory)->ports(),
+            requiresReplicaLedger: ($this->persistedPreviousProxyState($state, $claim)?->activeContainerSet !== null)
+                || ($this->persistedPreviousProxyState($state, $claim)?->activeReplicaSet !== null),
+        );
+        if ($name !== $representative['name']) {
+            throw new BlueGreenDeploymentTransitionException('The previous rollback target does not match its durable replica representative.');
+        }
+
         return new BlueGreenContainerExpectation(
-            name: $name,
-            dockerId: $dockerId,
+            name: $representative['name'],
+            dockerId: $representative['id'],
             applicationId: $claim->applicationId,
             pullRequestId: 0,
             blueGreenManaged: true,
@@ -494,6 +526,7 @@ final class ReconstructBlueGreenDeploymentRecovery
 
     private function candidateContainer(
         ApplicationBlueGreenDeployment $state,
+        Application $application,
         BlueGreenDeploymentClaim $claim,
     ): BlueGreenContainerExpectation {
         if ($state->operation_candidate_container_id !== null
@@ -501,10 +534,29 @@ final class ReconstructBlueGreenDeploymentRecovery
             throw new BlueGreenDeploymentTransitionException('The interrupted candidate Docker identity is malformed.');
         }
 
+        $candidateName = $claim->candidateContainerName
+            ?? throw new BlueGreenDeploymentTransitionException('The interrupted operation has no candidate container name.');
+        $representative = $state->operation_candidate_container_id === null
+            ? ['name' => $candidateName, 'id' => null]
+            : $this->representativeContainerIdentity(
+                $state,
+                $application,
+                $claim->deploymentUuid,
+                $claim->pendingColor,
+                $claim->expectedRoutingRevision,
+                $state->operation_candidate_container_id,
+                $candidateName,
+                candidateComposeServices: $claim->candidateComposeServices(),
+                backendPorts: $claim->backendPortInventory->ports(),
+                requiresReplicaLedger: ! (new BlueGreenReplicaSet(
+                    $claim->replicaCount,
+                    $claim->candidateComposeServices(),
+                ))->usesScalarCompatibilityPath(),
+            );
+
         return new BlueGreenContainerExpectation(
-            name: $claim->candidateContainerName
-                ?? throw new BlueGreenDeploymentTransitionException('The interrupted operation has no candidate container name.'),
-            dockerId: $state->operation_candidate_container_id,
+            name: $representative['name'],
+            dockerId: $representative['id'],
             applicationId: $claim->applicationId,
             pullRequestId: 0,
             blueGreenManaged: true,
@@ -512,6 +564,112 @@ final class ReconstructBlueGreenDeploymentRecovery
             color: $claim->pendingColor,
             routingRevision: $claim->expectedRoutingRevision,
         );
+    }
+
+    /**
+     * @param  list<string>|null  $candidateComposeServices
+     * @param  list<int>  $backendPorts
+     * @return array{name: string, id: string}
+     */
+    private function representativeContainerIdentity(
+        ApplicationBlueGreenDeployment $state,
+        Application $application,
+        string $deploymentUuid,
+        BlueGreenDeploymentColor $color,
+        int $routingRevision,
+        string $setFenceIdentity,
+        string $scalarName,
+        ?array $candidateComposeServices = null,
+        array $backendPorts = [],
+        bool $requiresReplicaLedger = false,
+    ): array {
+        $replicas = ApplicationBlueGreenReplica::query()
+            ->where('application_blue_green_deployment_id', $state->id)
+            ->where('application_id', $state->application_id)
+            ->where('standalone_docker_id', $state->standalone_docker_id)
+            ->where('deployment_uuid', $deploymentUuid)
+            ->where('color', $color->value)
+            ->where('routing_revision', $routingRevision)
+            ->orderBy('replica_index')
+            ->orderBy('compose_service')
+            ->get();
+        if ($replicas->isEmpty()) {
+            if ($requiresReplicaLedger) {
+                throw new BlueGreenDeploymentTransitionException('The recovery aggregate identity has no durable replica ledger.');
+            }
+
+            return ['name' => $scalarName, 'id' => $setFenceIdentity];
+        }
+
+        try {
+            $replicaSet = BlueGreenReplicaSet::fromReplicas(
+                $replicas,
+                $candidateComposeServices ?? $state->candidateComposeServicesFor(
+                    $color,
+                    $deploymentUuid,
+                    $application,
+                ),
+            );
+            $inspections = $replicas->map(static function (ApplicationBlueGreenReplica $replica): BlueGreenReplicaInspection {
+                if (! is_string($replica->container_name) || ! is_string($replica->container_id)) {
+                    throw new \InvalidArgumentException('The recovery replica identity is not durably bound.');
+                }
+
+                return BlueGreenReplicaInspection::fromRuntime(
+                    replicaIndex: (int) $replica->replica_index,
+                    composeService: $replica->compose_service,
+                    containerName: $replica->container_name,
+                    dockerId: $replica->container_id,
+                    status: 'durable',
+                    health: 'durable',
+                );
+            })->all();
+        } catch (\InvalidArgumentException $exception) {
+            throw new BlueGreenDeploymentTransitionException(
+                'The recovery replica ledger cannot prove one exact representative Docker identity.',
+                0,
+                $exception,
+            );
+        }
+        $routedComposeService = null;
+        if ($replicaSet->usesScalarReplicaNaming() && $replicaSet->members !== []) {
+            $topology = $application->blueGreenComposeTopology()
+                ?? throw new BlueGreenDeploymentTransitionException('The recovery co-rolled replica ledger has no exact Compose topology.');
+            $routedComposeService = $topology->candidateServiceName($color);
+        }
+        try {
+            $fenceIdentity = $replicaSet->fenceIdentity($inspections, $routedComposeService);
+            if (! $replicaSet->usesScalarReplicaNaming()) {
+                $activeReplicaSet = (new ResolveBlueGreenActiveReplicaSet)->fromBoundIdentities(
+                    $application->blueGreenComposeTopology(),
+                    $color,
+                    $replicaSet,
+                    $inspections,
+                    $backendPorts,
+                );
+                if ($activeReplicaSet === null) {
+                    throw new \InvalidArgumentException('The recovery replica ledger has no aggregate proxy identity.');
+                }
+                $fenceIdentity = $activeReplicaSet->identityDigest();
+            }
+        } catch (\InvalidArgumentException $exception) {
+            throw new BlueGreenDeploymentTransitionException(
+                'The recovery replica ledger cannot prove its canonical aggregate identity.',
+                0,
+                $exception,
+            );
+        }
+        if (! hash_equals($setFenceIdentity, $fenceIdentity)
+            && ! $replicaSet->matchesPersistedFenceIdentity(
+                $setFenceIdentity,
+                $inspections,
+                $routedComposeService,
+            )) {
+            throw new BlueGreenDeploymentTransitionException('The recovery replica ledger no longer matches its durable aggregate identity.');
+        }
+        $representative = $replicaSet->representativeInspection($inspections, $routedComposeService);
+
+        return ['name' => $representative->containerName, 'id' => $representative->dockerId];
     }
 
     private function rollbackKey(
@@ -560,9 +718,10 @@ final class ReconstructBlueGreenDeploymentRecovery
             );
         }
 
-        $replacementState = $routingMutationRecorded
-            ? $this->recordedReplacementState($state, $application, $claim)
-            : $this->unrecordedReplacementState($state, $application, $claim);
+        if ($routingMutationRecorded) {
+            throw new BlueGreenDeploymentTransitionException('The routed first-adoption operation has no persisted rollback replacement state.');
+        }
+        $replacementState = $this->unrecordedReplacementState($state, $application, $claim);
 
         return new BlueGreenProxyRollbackKey(
             operationId: $claim->deploymentUuid,
@@ -589,7 +748,7 @@ final class ReconstructBlueGreenDeploymentRecovery
             || ! is_int($state->destination_fence_mutation_sequence)
             || $state->destination_fence_mutation_sequence < 1
             || $state->managed_file_sha256 !== null
-            || $state->destination_topology_digest !== $claim->topologyDigest
+            || $state->destination_topology_digest !== $claim->operationTopologyDigest
             || $state->application_routing_config_digest !== $claim->routingConfigDigest
             || $claim->destinationFenceEpoch !== 1) {
             return null;
@@ -610,7 +769,7 @@ final class ReconstructBlueGreenDeploymentRecovery
             activeContainerName: null,
             activeContainerId: null,
             applicationRoutingConfigDigest: $claim->routingConfigDigest,
-            destinationTopologyDigest: $claim->topologyDigest,
+            destinationTopologyDigest: $claim->operationTopologyDigest,
         );
     }
 
@@ -632,7 +791,7 @@ final class ReconstructBlueGreenDeploymentRecovery
             || $replacementState->managedFilename !== $claim->rollbackManagedFilename
             || $replacementState->destinationId !== $claim->standaloneDockerId
             || $replacementState->destinationFenceEpoch !== $claim->destinationFenceEpoch
-            || $replacementState->destinationTopologyDigest !== $claim->topologyDigest
+            || $replacementState->destinationTopologyDigest !== $claim->operationTopologyDigest
             || $previousState?->managedSha256 !== $state->operation_previous_managed_file_sha256
             || ($previousState?->destinationFenceEpoch ?? 0) !== $state->operation_previous_destination_fence_epoch) {
             throw new BlueGreenDeploymentTransitionException('The persisted rollback key does not match the exact interrupted claim.');
@@ -702,41 +861,52 @@ final class ReconstructBlueGreenDeploymentRecovery
             );
         }
 
-        return $this->recordedReplacementState($state, $application, $claim);
+        return $this->recordedReplacementState($state, $application, $claim, $rollbackKey);
     }
 
     private function recordedReplacementState(
         ApplicationBlueGreenDeployment $state,
         Application $application,
         BlueGreenDeploymentClaim $claim,
+        BlueGreenProxyRollbackKey $rollbackKey,
     ): BlueGreenProxyState {
-        if ($state->destination_fence_epoch !== $claim->destinationFenceEpoch
+        $replacementState = $rollbackKey->replacementState;
+        $mutationSequence = $state->destination_fence_mutation_sequence;
+        $managedSha256 = $state->managed_file_sha256;
+        $applicationRoutingConfigDigest = $state->application_routing_config_digest;
+        if ($state->destination_fence_epoch !== $replacementState->destinationFenceEpoch
             || $state->destination_fence_operation_id !== $claim->deploymentUuid
-            || ! is_int($state->destination_fence_mutation_sequence)
-            || $state->destination_fence_mutation_sequence < 1
-            || ! is_string($state->managed_file_sha256)
-            || $state->destination_topology_digest !== $claim->topologyDigest
-            || ! is_string($state->application_routing_config_digest)
-            || ! is_string($state->operation_candidate_container_id)) {
+            || ! is_int($mutationSequence)
+            || $mutationSequence < $replacementState->mutationSequence
+            || ! is_string($managedSha256)
+            || $state->destination_topology_digest !== $replacementState->destinationTopologyDigest
+            || ! is_string($applicationRoutingConfigDigest)
+            || $replacementState->applicationUuid !== (string) $application->uuid
+            || $replacementState->routingRevision !== $claim->expectedRoutingRevision
+            || $replacementState->activeColor !== $claim->pendingColor
+            || $replacementState->activeDeploymentUuid !== $claim->deploymentUuid
+            || $replacementState->activeSetFenceIdentity() !== $state->operation_candidate_container_id) {
             throw new BlueGreenDeploymentTransitionException('The recorded destination state does not match the exact claimed routing mutation.');
         }
 
         return new BlueGreenProxyState(
-            managedFilename: $claim->rollbackManagedFilename
-                ?? throw new BlueGreenDeploymentTransitionException('The recorded routing mutation has no managed filename.'),
+            managedFilename: $replacementState->managedFilename,
             applicationUuid: (string) $application->uuid,
             destinationId: $claim->standaloneDockerId,
             operationId: $claim->deploymentUuid,
-            mutationSequence: $state->destination_fence_mutation_sequence,
+            mutationSequence: $mutationSequence,
             destinationFenceEpoch: $state->destination_fence_epoch,
             routingRevision: $claim->expectedRoutingRevision,
-            managedSha256: $state->managed_file_sha256,
-            activeColor: $claim->pendingColor,
-            activeDeploymentUuid: $claim->deploymentUuid,
-            activeContainerName: $claim->candidateContainerName,
-            activeContainerId: $state->operation_candidate_container_id,
-            applicationRoutingConfigDigest: $state->application_routing_config_digest,
-            destinationTopologyDigest: $claim->topologyDigest,
+            managedSha256: $managedSha256,
+            activeColor: $replacementState->activeColor,
+            activeDeploymentUuid: $replacementState->activeDeploymentUuid,
+            activeContainerName: $replacementState->activeContainerName,
+            activeContainerId: $replacementState->activeContainerId,
+            applicationRoutingConfigDigest: $applicationRoutingConfigDigest,
+            destinationTopologyDigest: $replacementState->destinationTopologyDigest,
+            activeContainerSet: $replacementState->activeContainerSet,
+            activeReplicaSetDigest: $replacementState->activeReplicaSetDigest,
+            activeReplicaSet: $replacementState->activeReplicaSet,
         );
     }
 
@@ -770,7 +940,7 @@ final class ReconstructBlueGreenDeploymentRecovery
             activeContainerName: null,
             activeContainerId: null,
             applicationRoutingConfigDigest: $claim->routingConfigDigest,
-            destinationTopologyDigest: $claim->topologyDigest,
+            destinationTopologyDigest: $claim->operationTopologyDigest,
         );
     }
 }

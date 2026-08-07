@@ -1,15 +1,19 @@
 <?php
 
+use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
 use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentQueueActivity;
 use App\Actions\Application\BlueGreen\BlueGreenReconciliationResult;
+use App\Actions\Application\BlueGreen\BlueGreenReplicaInspection;
+use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Actions\Application\BlueGreen\MarkBlueGreenRecoveryInterventionRequired;
 use App\Actions\Application\BlueGreen\RebindBlueGreenLegacyRoutingSnapshot;
 use App\Actions\Application\BlueGreen\ReconcileBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\ReconcileBlueGreenDeployments;
 use App\Actions\Application\BlueGreen\VerifyBlueGreenLegacyProviderRecovery;
+use App\Actions\Proxy\BlueGreenActiveContainerSet;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifact;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifactReader;
 use App\Actions\Proxy\BlueGreenProxyState;
@@ -37,6 +41,7 @@ use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Str;
 use Laravel\Horizon\Contracts\JobRepository;
+use Symfony\Component\Yaml\Yaml;
 use Tests\Support\BlueGreenRecoveryScenario;
 
 uses(RefreshDatabase::class);
@@ -600,7 +605,11 @@ it('converges a co-rolled mid-flight failed deployment through set inspection, n
     // is exactly the defect this pins.
     InspectBlueGreenContainer::shouldRun()->never();
     blueGreenReconciliationFakeNoJournalAbsentRoute();
-    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
+    $scenario = BlueGreenRecoveryScenario::create(
+        finalized: false,
+        routingMutationRecorded: false,
+        coRolledServices: ['gateway', 'queue'],
+    );
     $members = [
         'gateway' => $scenario->application->uuid.'-blue',
         'queue' => $scenario->application->uuid.'-queue-blue',
@@ -610,7 +619,11 @@ it('converges a co-rolled mid-flight failed deployment through set inspection, n
         'operation_candidate_container_set' => json_encode($members, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES),
         'operation_candidate_container_id' => str_repeat('c', 64),
     ]);
-    foreach (['gateway-blue', 'queue-blue'] as $composeService) {
+    $replicaIdentities = [
+        'gateway-blue' => ['name' => $members['gateway'], 'id' => str_repeat('c', 64)],
+        'queue-blue' => ['name' => $members['queue'], 'id' => str_repeat('7', 64)],
+    ];
+    foreach ($replicaIdentities as $composeService => $identity) {
         ApplicationBlueGreenReplica::query()->create([
             'application_blue_green_deployment_id' => $scenario->state->id,
             'application_id' => $scenario->application->id,
@@ -621,7 +634,8 @@ it('converges a co-rolled mid-flight failed deployment through set inspection, n
             'routing_revision' => 1,
             'compose_project' => $scenario->application->uuid,
             'compose_service' => $composeService,
-            'container_name' => $scenario->application->uuid.'-'.$composeService,
+            'container_name' => $identity['name'],
+            'container_id' => $identity['id'],
         ]);
     }
     $failedAt = now()->subMinutes(11)->startOfSecond();
@@ -645,15 +659,30 @@ it('converges a co-rolled mid-flight failed deployment through set inspection, n
 it('removes an exact restarting co-rolled candidate before rollback terminalizes', function (): void {
     Notification::fake();
     InspectBlueGreenContainer::shouldRun()->never();
-    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
+    $scenario = BlueGreenRecoveryScenario::create(
+        finalized: false,
+        routingMutationRecorded: false,
+        coRolledServices: ['gateway', 'queue'],
+    );
     $members = [
         'gateway' => $scenario->application->uuid.'-blue',
         'queue' => $scenario->application->uuid.'-queue-blue',
     ];
+    $restartingReplicaId = str_repeat('d', 64);
+    $replicaIdentities = [
+        'gateway-blue' => ['name' => $members['gateway'], 'id' => $restartingReplicaId],
+        'queue-blue' => ['name' => $members['queue'], 'id' => str_repeat('2', 64)],
+    ];
+    // Released v3 writers persisted the legacy full-set digest as the scalar
+    // candidate identity; the durable ledger below is what still proves it.
+    $persistedCandidateIdentity = BlueGreenReplicaSet::identityDigest([
+        BlueGreenReplicaInspection::fromRuntime(1, 'gateway-blue', $members['gateway'], $restartingReplicaId, 'durable', 'durable'),
+        BlueGreenReplicaInspection::fromRuntime(1, 'queue-blue', $members['queue'], str_repeat('2', 64), 'durable', 'durable'),
+    ]);
     $scenario->state->update([
         'phase' => BlueGreenDeploymentPhase::ROLLING_BACK,
         'operation_candidate_container_set' => json_encode($members, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES),
-        'operation_candidate_container_id' => str_repeat('c', 64),
+        'operation_candidate_container_id' => $persistedCandidateIdentity,
     ]);
     $replicas = collect(['gateway-blue', 'queue-blue'])->map(
         fn (string $composeService): ApplicationBlueGreenReplica => ApplicationBlueGreenReplica::query()->create([
@@ -666,11 +695,11 @@ it('removes an exact restarting co-rolled candidate before rollback terminalizes
             'routing_revision' => 1,
             'compose_project' => $scenario->application->uuid,
             'compose_service' => $composeService,
-            'container_name' => $scenario->application->uuid.'-'.$composeService,
+            'container_name' => $replicaIdentities[$composeService]['name'],
+            'container_id' => $replicaIdentities[$composeService]['id'],
         ]),
     );
     $restartingReplica = $replicas->first();
-    $restartingReplicaId = str_repeat('d', 64);
     $availableReplicaOutput = '0'."\t".json_encode([
         'Id' => $restartingReplicaId,
         'Name' => '/'.$restartingReplica->container_name,
@@ -725,7 +754,7 @@ it('removes an exact restarting co-rolled candidate before rollback terminalizes
         'blue_green_phase' => BlueGreenDeploymentPhase::ROLLING_BACK,
         'status' => ApplicationDeploymentStatus::FAILED->value,
         'finished_at' => now()->subMinutes(11)->startOfSecond(),
-        'blue_green_candidate_container_id' => str_repeat('c', 64),
+        'blue_green_candidate_container_id' => $persistedCandidateIdentity,
     ]);
     blueGreenReconciliationMakeQueueStale($scenario->deployment);
 
@@ -748,7 +777,57 @@ it('removes an exact restarting co-rolled candidate before rollback terminalizes
 
 it('restores a live-applied unrecorded first-adoption route before completing a co-rolled rollback', function (): void {
     Notification::fake();
-    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
+    $compose = [
+        'services' => [
+            'gateway' => [
+                'container_name' => 'recovery-compose-app-legacy',
+                'image' => 'example/gateway:latest',
+                'healthcheck' => ['test' => ['CMD', 'true']],
+                'labels' => [
+                    'traefik.enable=true',
+                    'traefik.http.routers.gateway.rule=Host(`gateway.recovery.example.test`)',
+                    'traefik.http.routers.gateway.entryPoints=https',
+                    'traefik.http.routers.gateway.service=gateway',
+                    'traefik.http.routers.gateway.tls=true',
+                    'traefik.http.services.gateway.loadbalancer.server.port=3000',
+                ],
+            ],
+            'queue' => [
+                'container_name' => 'recovery-compose-app-queue',
+                'image' => 'example/queue:latest',
+                'healthcheck' => ['test' => ['CMD', 'true']],
+                'labels' => [
+                    'traefik.enable=true',
+                    'traefik.http.routers.queue.rule=Host(`queue.recovery.example.test`)',
+                    'traefik.http.routers.queue.entryPoints=https',
+                    'traefik.http.routers.queue.service=queue',
+                    'traefik.http.routers.queue.tls=true',
+                    'traefik.http.services.queue.loadbalancer.server.port=4000',
+                ],
+            ],
+        ],
+    ];
+    $scenario = BlueGreenRecoveryScenario::create(
+        finalized: false,
+        routingMutationRecorded: false,
+        applicationAttributes: [
+            'uuid' => 'recovery-compose-app',
+            'build_pack' => 'dockercompose',
+            'compose_parsing_version' => '3',
+            'docker_compose' => Yaml::dump($compose, 10),
+            'docker_compose_raw' => Yaml::dump($compose, 10),
+            'docker_compose_domains' => json_encode([
+                'gateway' => ['domain' => 'https://gateway.recovery.example.test'],
+                'queue' => ['domain' => 'https://queue.recovery.example.test'],
+            ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES),
+            'fqdn' => null,
+            'health_check_enabled' => true,
+            'health_check_type' => 'http',
+        ],
+        coRolledServices: ['gateway', 'queue'],
+    );
+    $backendPortInventory = BlueGreenBackendPortInventory::forApplication($scenario->application)
+        ?? throw new RuntimeException('The co-rolled reconciliation fixture has no backend inventory.');
     InspectBlueGreenContainer::shouldRun()
         ->once()
         ->withArgs(static fn ($server, $expectation): bool => hash_equals(
@@ -781,7 +860,11 @@ it('restores a live-applied unrecorded first-adoption route before completing a 
         'destination_topology_digest' => $scenario->state->operation_topology_digest,
         'application_routing_config_digest' => $scenario->state->operation_routing_config_digest,
     ]);
-    foreach (['gateway-blue', 'queue-blue'] as $composeService) {
+    $replicaIdentities = [
+        'gateway-blue' => ['name' => $members['gateway'], 'id' => str_repeat('c', 64)],
+        'queue-blue' => ['name' => $members['queue'], 'id' => str_repeat('9', 64)],
+    ];
+    foreach ($replicaIdentities as $composeService => $identity) {
         ApplicationBlueGreenReplica::query()->create([
             'application_blue_green_deployment_id' => $scenario->state->id,
             'application_id' => $scenario->application->id,
@@ -792,7 +875,8 @@ it('restores a live-applied unrecorded first-adoption route before completing a 
             'routing_revision' => 1,
             'compose_project' => $scenario->application->uuid,
             'compose_service' => $composeService,
-            'container_name' => $scenario->application->uuid.'-'.$composeService,
+            'container_name' => $identity['name'],
+            'container_id' => $identity['id'],
         ]);
     }
     $scenario->deployment->update([
@@ -800,6 +884,8 @@ it('restores a live-applied unrecorded first-adoption route before completing a 
         'status' => ApplicationDeploymentStatus::FAILED->value,
         'finished_at' => now()->subMinutes(11)->startOfSecond(),
         'blue_green_candidate_container_id' => str_repeat('c', 64),
+        'blue_green_backend_port_inventory' => $backendPortInventory->serialized,
+        'blue_green_drain_backend_port_inventory' => $backendPortInventory->serialized,
     ]);
     blueGreenReconciliationMakeQueueStale($scenario->deployment);
     // The pending mutation journal replayed forward under the managed-file lock
@@ -820,6 +906,10 @@ it('restores a live-applied unrecorded first-adoption route before completing a 
         activeContainerId: str_repeat('c', 64),
         applicationRoutingConfigDigest: (string) $scenario->state->operation_routing_config_digest,
         destinationTopologyDigest: (string) $scenario->state->operation_topology_digest,
+        activeContainerSet: BlueGreenActiveContainerSet::fromArray([
+            ['port' => 3000, 'name' => $members['gateway'], 'id' => str_repeat('c', 64)],
+            ['port' => 4000, 'name' => $members['queue'], 'id' => str_repeat('9', 64)],
+        ]),
     );
     Process::fake([
         '*'.WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX.'*' => Process::result(
