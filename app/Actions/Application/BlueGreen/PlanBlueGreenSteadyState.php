@@ -164,13 +164,15 @@ final class PlanBlueGreenSteadyState
     ): array {
         $applicationUuid = (string) $application->uuid;
         $scalarBackend = "{$applicationUuid}-{$color->value}";
-        $deploymentUuid = match ($color) {
+        // A validated pending identity wins over the finalized color UUID: when
+        // a later promotion recycles a color mid-SWITCHING, the finalized UUID
+        // still names the PREVIOUS release, so preferring it would reconstruct
+        // the old deployment instead of the proven pending one. The caller only
+        // passes a pending UUID that hash-equals the route's active deployment.
+        $deploymentUuid = $pendingDeploymentUuid ?? match ($color) {
             BlueGreenDeploymentColor::BLUE => $state->blue_deployment_uuid,
             BlueGreenDeploymentColor::GREEN => $state->green_deployment_uuid,
         };
-        if ($deploymentUuid === null) {
-            $deploymentUuid = $pendingDeploymentUuid;
-        }
         if ($deploymentUuid === null) {
             return ['backends' => [$scalarBackend], 'replicaSet' => null];
         }
