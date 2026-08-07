@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🐛 Bug Fixes
+
+- *(blue-green)* Defer drain-journal-fenced rehydration and reschedule running-target retirements
+
+### 🧪 Testing
+
+- *(factories)* Isolate factory name validation database
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.79-fork
+
+## [4.13.78-fork] - 2026-08-07
+
 ### 💼 Other
 
 - *(ci)* Refresh patched nanoid lock resolution
@@ -12,6 +26,7 @@ All notable changes to this project will be documented in this file.
 
 - Update changelog
 - *(agents)* Document lockfile-only audit remediation
+- Update changelog
 - Update changelog
 
 ### 🧪 Testing
