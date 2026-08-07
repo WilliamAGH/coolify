@@ -58,6 +58,10 @@ use Symfony\Component\Yaml\Yaml;
 
 uses(RefreshDatabase::class);
 
+beforeEach(function (): void {
+    seedInstanceSettings();
+});
+
 function makeBlueGreenInactiveRetirementApplication(): Application
 {
     $team = Team::factory()->create();
