@@ -55,6 +55,17 @@ it('removes only an exact stopped base-name legacy container before fixed-color 
         2,
         $operationId,
     );
+    // The stopped BLUE predecessor was written by the earlier revision-1
+    // operation, so its serialized state must carry the fingerprint that
+    // operation would have computed — not the GREEN successor's.
+    $previousFingerprint = ComputeBlueGreenDeploymentFingerprint::run(
+        $application,
+        $destination,
+        BlueGreenDeploymentColor::BLUE,
+        1,
+        1,
+        'idle-fixed-blue',
+    );
     $managedFilename = BlueGreenRoutingTarget::managedFilename((string) $application->uuid, (int) $destination->id);
     $managedSha256 = str_repeat('d', 64);
     $mutatedAt = now()->subSecond()->startOfSecond();
@@ -86,7 +97,8 @@ it('removes only an exact stopped base-name legacy container before fixed-color 
         expectedRoutingRevision: 2,
         destinationFenceEpoch: 2,
         serverBootId: $bootId,
-        topologyDigest: $fingerprint->topologyDigest,
+        operationTopologyDigest: $fingerprint->operationTopologyDigest,
+        routingTopologyDigest: $fingerprint->routingTopologyDigest,
         routingConfigDigest: $fingerprint->routingConfigDigest,
         backendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
         drainBackendPortInventory: BlueGreenBackendPortInventory::fromPorts([3000]),
@@ -109,7 +121,7 @@ it('removes only an exact stopped base-name legacy container before fixed-color 
         activeContainerName: $application->uuid.'-green',
         activeContainerId: $candidateContainerId,
         applicationRoutingConfigDigest: $fingerprint->routingConfigDigest,
-        destinationTopologyDigest: $fingerprint->topologyDigest,
+        destinationTopologyDigest: $fingerprint->operationTopologyDigest,
     );
     $lock = Cache::lock(
         BlueGreenDeploymentLock::key($application->id, $destination->id),
@@ -190,6 +202,22 @@ it('removes only an exact stopped base-name legacy container before fixed-color 
             ->and($expectation->dockerId)->toBe($stoppedLegacyContainerId)
             ->and($expectation->blueGreenManaged)->toBeFalse();
 
+        $previousStateBytes = (new BlueGreenProxyState(
+            managedFilename: $managedFilename,
+            applicationUuid: (string) $application->uuid,
+            destinationId: $destination->id,
+            operationId: 'idle-fixed-blue',
+            mutationSequence: 1,
+            destinationFenceEpoch: 1,
+            routingRevision: 1,
+            managedSha256: str_repeat('e', 64),
+            activeColor: BlueGreenDeploymentColor::BLUE,
+            activeDeploymentUuid: 'idle-fixed-blue',
+            activeContainerName: $application->uuid.'-blue',
+            activeContainerId: $previousContainerId,
+            applicationRoutingConfigDigest: $previousFingerprint->routingConfigDigest,
+            destinationTopologyDigest: $previousFingerprint->operationTopologyDigest,
+        ))->serialize();
         $state->update([
             'active_color' => BlueGreenDeploymentColor::GREEN,
             'pending_color' => null,
@@ -208,14 +236,17 @@ it('removes only an exact stopped base-name legacy container before fixed-color 
             'operation_destination_fence_epoch' => 2,
             'operation_previous_destination_fence_epoch' => 1,
             'operation_server_boot_id' => $bootId,
-            'operation_topology_digest' => $fingerprint->topologyDigest,
+            'operation_topology_digest' => $fingerprint->operationTopologyDigest,
             'operation_routing_config_digest' => $fingerprint->routingConfigDigest,
             'operation_previous_managed_file_sha256' => str_repeat('e', 64),
+            'operation_previous_proxy_state' => $previousStateBytes,
+            'operation_previous_proxy_state_sha256' => hash('sha256', $previousStateBytes),
             'destination_fence_epoch' => 2,
             'destination_fence_operation_id' => $operationId,
             'destination_fence_mutation_sequence' => 1,
             'managed_file_sha256' => $managedSha256,
-            'destination_topology_digest' => $fingerprint->topologyDigest,
+            'destination_topology_digest' => $fingerprint->operationTopologyDigest,
+            'destination_routing_topology_digest' => $fingerprint->routingTopologyDigest,
             'application_routing_config_digest' => $fingerprint->routingConfigDigest,
             'supersession_generation' => 1,
             'phase' => BlueGreenDeploymentPhase::DRAINING,
@@ -227,7 +258,7 @@ it('removes only an exact stopped base-name legacy container before fixed-color 
             'blue_green_routing_revision' => 2,
             'blue_green_destination_fence_epoch' => 2,
             'blue_green_server_boot_id' => $bootId,
-            'blue_green_topology_digest' => $fingerprint->topologyDigest,
+            'blue_green_topology_digest' => $fingerprint->operationTopologyDigest,
             'blue_green_routing_config_digest' => $fingerprint->routingConfigDigest,
             'blue_green_backend_port_inventory' => $claim->backendPortInventory->serialized,
             'blue_green_drain_backend_port_inventory' => $claim->drainBackendPortInventory?->serialized,
