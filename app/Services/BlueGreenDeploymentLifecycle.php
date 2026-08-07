@@ -1355,7 +1355,7 @@ final class BlueGreenDeploymentLifecycle
         );
 
         if ($inspection->isAbsent()) {
-            if ($this->proxyStatesMatch($inspection->state, $durableState)) {
+            if (BlueGreenProxyState::matches($inspection->state, $durableState)) {
                 return $operation;
             }
             $liveState = $inspection->state;
@@ -1372,7 +1372,7 @@ final class BlueGreenDeploymentLifecycle
         }
 
         if (! hash_equals($claim->serverBootId, (string) $inspection->journalBootId)
-            || ! $this->proxyStatesMatch($inspection->expectedState, $durableState)) {
+            || ! BlueGreenProxyState::matches($inspection->expectedState, $durableState)) {
             throw new BlueGreenDeploymentTransitionException('The DRAINING container-mutation journal does not match its exact durable state and server boot.');
         }
 
@@ -1384,7 +1384,7 @@ final class BlueGreenDeploymentLifecycle
                 $claim->deploymentUuid,
                 $inspection,
             );
-            if (! $this->proxyStatesMatch($archivedState, $durableState)) {
+            if (! BlueGreenProxyState::matches($archivedState, $durableState)) {
                 throw new BlueGreenDeploymentTransitionException('The pending DRAINING journal CAS did not preserve its exact durable expected state.');
             }
             $operationFence->assertDeploymentOwnership(
@@ -1409,7 +1409,7 @@ final class BlueGreenDeploymentLifecycle
             $claim->deploymentUuid,
             $inspection,
         );
-        if (! $this->proxyStatesMatch($archivedState, $replacementState)) {
+        if (! BlueGreenProxyState::matches($archivedState, $replacementState)) {
             throw new BlueGreenDeploymentTransitionException('The committed DRAINING journal CAS did not preserve its exact replacement state.');
         }
         $operationFence->assertDeploymentOwnership(
@@ -1451,15 +1451,6 @@ final class BlueGreenDeploymentLifecycle
             routingMutationRecorded: $operation->routingMutationRecorded,
             wasFinalized: $operation->wasFinalized,
         );
-    }
-
-    private function proxyStatesMatch(?BlueGreenProxyState $actual, ?BlueGreenProxyState $expected): bool
-    {
-        if ($actual === null || $expected === null) {
-            return $actual === null && $expected === null;
-        }
-
-        return hash_equals($expected->serialize(), $actual->serialize());
     }
 
     private function loadRecoveryReplicaInspections(

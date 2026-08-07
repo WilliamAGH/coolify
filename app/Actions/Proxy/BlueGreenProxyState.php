@@ -109,6 +109,20 @@ final readonly class BlueGreenProxyState
         return json_encode($this->toArray(), JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES)."\n";
     }
 
+    /**
+     * Compare two possibly-absent route states by their exact serialized bytes.
+     * Absence is only ever equal to absence, so a caller that expects a state
+     * can never accept a missing route as a match.
+     */
+    public static function matches(?self $actual, ?self $expected): bool
+    {
+        if ($actual === null || $expected === null) {
+            return $actual === null && $expected === null;
+        }
+
+        return hash_equals($expected->serialize(), $actual->serialize());
+    }
+
     /** @return array<string, int|string|list<array{port: int, name: string, id: string}>|null> */
     public function toArray(): array
     {

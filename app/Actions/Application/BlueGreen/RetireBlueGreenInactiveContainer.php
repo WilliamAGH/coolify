@@ -809,7 +809,7 @@ final class RetireBlueGreenInactiveContainer
             if ($recoveringAcrossBoot) {
                 throw new BlueGreenDeploymentTransitionException('The rebooted inactive retirement has no exact authenticated container-mutation journal.');
             }
-            if ($this->statesMatch($inspection->state, $context['expected_state'])) {
+            if (BlueGreenProxyState::matches($inspection->state, $context['expected_state'])) {
                 if ($context['state']->inactive_retirement_intervention_required_at === null) {
                     return null;
                 }
@@ -848,7 +848,7 @@ final class RetireBlueGreenInactiveContainer
 
                 return self::COMPLETED;
             }
-            if (! $this->statesMatch($inspection->state, $context['replacement_state'])) {
+            if (! BlueGreenProxyState::matches($inspection->state, $context['replacement_state'])) {
                 throw new BlueGreenDeploymentTransitionException('The journal-free managed route is neither the exact inactive-retirement predecessor nor its replacement.');
             }
             $this->assertRetirementOwnership(
@@ -885,8 +885,8 @@ final class RetireBlueGreenInactiveContainer
 
         if (! is_string($inspection->journalBootId)
             || ! hash_equals($expectedBootId, $inspection->journalBootId)
-            || ! $this->statesMatch($inspection->expectedState, $context['expected_state'])
-            || ! $this->statesMatch($inspection->replacementState, $context['replacement_state'])) {
+            || ! BlueGreenProxyState::matches($inspection->expectedState, $context['expected_state'])
+            || ! BlueGreenProxyState::matches($inspection->replacementState, $context['replacement_state'])) {
             throw new BlueGreenDeploymentTransitionException('The inactive-retirement journal does not match its exact durable sidecars and boot provenance.');
         }
 
@@ -926,7 +926,7 @@ final class RetireBlueGreenInactiveContainer
                     $exception,
                 );
             }
-            if (! $this->statesMatch($archivedReplacement, $context['replacement_state'])) {
+            if (! BlueGreenProxyState::matches($archivedReplacement, $context['replacement_state'])) {
                 throw new BlueGreenDeploymentTransitionException('The committed inactive-retirement journal archived a foreign replacement sidecar.');
             }
             $this->assertRetirementOwnership(
@@ -1000,7 +1000,7 @@ final class RetireBlueGreenInactiveContainer
                 $exception,
             );
         }
-        if (! $this->statesMatch($archivedExpected, $context['expected_state'])) {
+        if (! BlueGreenProxyState::matches($archivedExpected, $context['expected_state'])) {
             throw new BlueGreenDeploymentTransitionException('The pending inactive-retirement journal did not retain its exact expected sidecar.');
         }
 
@@ -1119,7 +1119,7 @@ final class RetireBlueGreenInactiveContainer
                 $exception,
             );
         }
-        if (! $this->statesMatch($finalizedReplacement, $context['replacement_state'])) {
+        if (! BlueGreenProxyState::matches($finalizedReplacement, $context['replacement_state'])) {
             throw new BlueGreenDeploymentTransitionException('The pending inactive-retirement journal finalized a foreign replacement sidecar.');
         }
 
@@ -1212,8 +1212,8 @@ final class RetireBlueGreenInactiveContainer
             }
             [$state, $application, $destination] = $retirement;
             $expectedState = $this->interruptedRetirementExpectedState($retirement, $ownerDeploymentUuid);
-            if (! $this->statesMatch($expectedState, $context['expected_state'])
-                || ! $this->statesMatch(
+            if (! BlueGreenProxyState::matches($expectedState, $context['expected_state'])
+                || ! BlueGreenProxyState::matches(
                     $expectedState->withMutationOwner($ownerDeploymentUuid),
                     $context['replacement_state'],
                 )
@@ -1855,11 +1855,6 @@ final class RetireBlueGreenInactiveContainer
         ];
     }
 
-    private function statesMatch(?BlueGreenProxyState $actual, BlueGreenProxyState $expected): bool
-    {
-        return $actual !== null && hash_equals($expected->serialize(), $actual->serialize());
-    }
-
     private function assertRetirementBootIdentity(Server $server, string $expectedBootId): void
     {
         $currentBootId = $this->readRetirementBootIdentity($server);
@@ -1927,8 +1922,8 @@ final class RetireBlueGreenInactiveContainer
             }
             [$state, $application, $destination] = $retirement;
             $expectedState = $this->interruptedRetirementExpectedState($retirement, $ownerDeploymentUuid);
-            if (! $this->statesMatch($expectedState, $context['expected_state'])
-                || ! $this->statesMatch(
+            if (! BlueGreenProxyState::matches($expectedState, $context['expected_state'])
+                || ! BlueGreenProxyState::matches(
                     $expectedState->withMutationOwner($ownerDeploymentUuid),
                     $context['replacement_state'],
                 )) {

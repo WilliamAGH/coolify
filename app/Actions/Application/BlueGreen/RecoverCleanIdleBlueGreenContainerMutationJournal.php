@@ -64,7 +64,7 @@ final class RecoverCleanIdleBlueGreenContainerMutationJournal
                     $destination,
                     (int) $candidate->getKey(),
                 );
-                if (! $this->proxyStatesMatch($inspection->state, $expectedState)) {
+                if (! BlueGreenProxyState::matches($inspection->state, $expectedState)) {
                     throw new BlueGreenDeploymentTransitionException('The journal-free managed route does not match the exact clean IDLE destination state.');
                 }
 
@@ -87,7 +87,7 @@ final class RecoverCleanIdleBlueGreenContainerMutationJournal
                 $operationId,
                 $inspection->journalBootId,
             );
-            if (! $this->proxyStatesMatch($inspection->replacementState, $expectedState)) {
+            if (! BlueGreenProxyState::matches($inspection->replacementState, $expectedState)) {
                 throw new BlueGreenDeploymentTransitionException('The committed container-mutation journal replacement does not equal the exact clean IDLE destination state.');
             }
 
@@ -116,12 +116,12 @@ final class RecoverCleanIdleBlueGreenContainerMutationJournal
                 $inspection,
                 $currentBootId,
             );
-            if (! $this->proxyStatesMatch($archivedState, $expectedState)) {
+            if (! BlueGreenProxyState::matches($archivedState, $expectedState)) {
                 throw new BlueGreenDeploymentTransitionException('The committed clean IDLE journal CAS changed its replacement state.');
             }
             $operationFence->assertLockOwnership();
             $liveState = ReadBlueGreenManagedRouteMetadata::run($server, $application, $destination);
-            if (! $this->proxyStatesMatch($liveState, $expectedState)) {
+            if (! BlueGreenProxyState::matches($liveState, $expectedState)) {
                 throw new BlueGreenDeploymentTransitionException('The clean IDLE destination did not retain its exact managed route after journal archival.');
             }
             $this->assertSnapshotUnchanged(
@@ -233,7 +233,7 @@ final class RecoverCleanIdleBlueGreenContainerMutationJournal
             $expectedOperationId,
             $expectedJournalBootId,
         );
-        if (! $this->proxyStatesMatch($current, $snapshot)) {
+        if (! BlueGreenProxyState::matches($current, $snapshot)) {
             throw new BlueGreenOperationFenceLostException('The clean IDLE destination changed during journal recovery.');
         }
     }
@@ -380,14 +380,5 @@ final class RecoverCleanIdleBlueGreenContainerMutationJournal
             || $inspection->health !== 'healthy') {
             throw new BlueGreenDeploymentTransitionException('An exact active clean IDLE container is not running and healthy; journal archival refused.');
         }
-    }
-
-    private function proxyStatesMatch(?BlueGreenProxyState $left, ?BlueGreenProxyState $right): bool
-    {
-        if ($left === null || $right === null) {
-            return $left === $right;
-        }
-
-        return hash_equals($left->serialize(), $right->serialize());
     }
 }
