@@ -6,7 +6,7 @@ use RuntimeException;
 
 final class ControlPlaneMigrationInventory
 {
-    private const FILENAME_PATTERN = '/\A(?:2026_07_12_[0-9]{6}_[a-z0-9_]+|2026_07_19_(?:025448_add_destination_fencing_to_blue_green_operations|025449_add_blue_green_supersession_generation|030000_add_blue_green_drain_provenance|064536_add_blue_green_recovery_predecessor_state|120000_add_blue_green_inactive_retention_setting|120001_add_blue_green_inactive_retirement_provenance)|2026_07_20_(?:000000_add_blue_green_backend_port_inventories_to_deployment_queues|000100_add_blue_green_intervention_reasons|000200_add_blue_green_multi_destination_topology|211522_create_application_blue_green_replicas_table))\.php\z/';
+    private const FILENAME_PATTERN = '/\A(?:2026_07_12_[0-9]{6}_[a-z0-9_]+|2026_07_19_(?:025448_add_destination_fencing_to_blue_green_operations|025449_add_blue_green_supersession_generation|030000_add_blue_green_drain_provenance|064536_add_blue_green_recovery_predecessor_state|120000_add_blue_green_inactive_retention_setting|120001_add_blue_green_inactive_retirement_provenance)|2026_07_20_(?:000000_add_blue_green_backend_port_inventories_to_deployment_queues|000100_add_blue_green_intervention_reasons|000200_add_blue_green_multi_destination_topology|211522_create_application_blue_green_replicas_table)|2026_08_04_044304_add_blue_green_candidate_container_set|2026_08_06_000000_add_destination_routing_topology_digest)\.php\z/';
 
     private const GLOBS = [
         '2026_07_12_*.php',
@@ -20,6 +20,8 @@ final class ControlPlaneMigrationInventory
         '2026_07_20_000100_add_blue_green_intervention_reasons.php',
         '2026_07_20_000200_add_blue_green_multi_destination_topology.php',
         '2026_07_20_211522_create_application_blue_green_replicas_table.php',
+        '2026_08_04_044304_add_blue_green_candidate_container_set.php',
+        '2026_08_06_000000_add_destination_routing_topology_digest.php',
     ];
 
     private const FINGERPRINT_PATH = 'database/migrations/control-plane-migration-inventory.fingerprint';
@@ -68,7 +70,7 @@ final class ControlPlaneMigrationInventory
         }
 
         $migrationNames = array_keys($migrationNames);
-        self::assertReviewedInventory($migrationNames, $fingerprintPath);
+        self::assertReviewedInventory($migrationNames, $migrationDirectory, $fingerprintPath);
         if ($requireExclusiveMigrationDirectory) {
             self::assertExclusiveDirectory($migrationDirectory, $migrationNames);
         }
@@ -79,15 +81,22 @@ final class ControlPlaneMigrationInventory
     /**
      * @param  list<string>  $migrationNames
      */
-    private static function assertReviewedInventory(array $migrationNames, string $fingerprintPath): void
-    {
+    private static function assertReviewedInventory(
+        array $migrationNames,
+        string $migrationDirectory,
+        string $fingerprintPath,
+    ): void {
         if (! is_file($fingerprintPath) || is_link($fingerprintPath) || ! is_readable($fingerprintPath)) {
             throw new RuntimeException('Control-plane migration inventory fingerprint is missing, linked, or unreadable.');
         }
 
         $fingerprint = file_get_contents($fingerprintPath);
         if (! is_string($fingerprint)
-            || preg_match('/\Acount=([1-9][0-9]*)\nsha256=([0-9a-f]{64})\n\z/', $fingerprint, $matches) !== 1) {
+            || preg_match(
+                '/\Acount=([1-9][0-9]*)\nsha256=([0-9a-f]{64})\ncontent-sha256=([0-9a-f]{64})\n\z/',
+                $fingerprint,
+                $matches,
+            ) !== 1) {
             throw new RuntimeException('Control-plane migration inventory fingerprint is malformed.');
         }
 
@@ -96,8 +105,22 @@ final class ControlPlaneMigrationInventory
             $migrationNames,
         );
         $actualFingerprint = hash('sha256', implode("\n", $relativeMigrationPaths)."\n");
+        $contentRecords = [];
+        foreach ($migrationNames as $migrationName) {
+            $migrationPath = $migrationDirectory.DIRECTORY_SEPARATOR.$migrationName.'.php';
+            if (! is_file($migrationPath) || is_link($migrationPath) || ! is_readable($migrationPath)) {
+                throw new RuntimeException('Control-plane migration inventory contains an unsafe or unreadable file.');
+            }
+            $contentDigest = hash_file('sha256', $migrationPath);
+            if (! is_string($contentDigest)) {
+                throw new RuntimeException('Control-plane migration inventory content is unreadable.');
+            }
+            $contentRecords[] = "database/migrations/{$migrationName}.php\0{$contentDigest}";
+        }
+        $actualContentFingerprint = hash('sha256', implode("\n", $contentRecords)."\n");
         if (count($migrationNames) !== (int) $matches[1]
-            || ! hash_equals($matches[2], $actualFingerprint)) {
+            || ! hash_equals($matches[2], $actualFingerprint)
+            || ! hash_equals($matches[3], $actualContentFingerprint)) {
             throw new RuntimeException('Control-plane migration inventory does not match the reviewed fingerprint.');
         }
     }

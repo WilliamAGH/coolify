@@ -56,6 +56,7 @@ class ApplicationBlueGreenDeployment extends Model
         'destination_fence_mutation_sequence',
         'managed_file_sha256',
         'destination_topology_digest',
+        'destination_routing_topology_digest',
         'application_routing_config_digest',
         'operation_destination_fence_epoch',
         'operation_previous_destination_fence_epoch',
