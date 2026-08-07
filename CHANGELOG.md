@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🚜 Refactor
+
+- *(blue-green)* Give route-state equality one owner on the value object
+
+### 📚 Documentation
+
+- Update changelog
+
+## [4.13.76-fork] - 2026-08-07
+
 ### 🚀 Features
 
 - *(blue-green)* Resume an unreconstructable fixed-color drain from its operation journal
