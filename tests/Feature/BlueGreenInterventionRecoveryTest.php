@@ -1,17 +1,28 @@
 <?php
 
+use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
+use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentTransitionException;
 use App\Actions\Application\BlueGreen\BlueGreenInterventionRecoveryResult;
 use App\Actions\Application\BlueGreen\BlueGreenLifecycleDatabaseLocks;
+use App\Actions\Application\BlueGreen\BlueGreenManagedRouteMetadataForOperationResult;
+use App\Actions\Application\BlueGreen\BlueGreenReconciliationResult;
 use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
+use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Actions\Application\BlueGreen\MarkBlueGreenRecoveryInterventionRequired;
 use App\Actions\Application\BlueGreen\ReadBlueGreenManagedRouteMetadata;
+use App\Actions\Application\BlueGreen\RebindBlueGreenLegacyRoutingSnapshot;
+use App\Actions\Application\BlueGreen\ReconcileBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\RecoverBlueGreenIntervention;
+use App\Actions\Application\BlueGreen\ResolveBlueGreenExpectedProxyState;
+use App\Actions\Application\BlueGreen\VerifyBlueGreenLegacyProviderRecovery;
 use App\Actions\Application\EmergencyRecoverApplicationDeployment;
+use App\Actions\Proxy\BlueGreenProxyRollbackArtifact;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifactReader;
 use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
+use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
 use App\Enums\ApplicationDeploymentExecutionPhase;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeactivationPhase;
@@ -20,11 +31,15 @@ use App\Enums\BlueGreenDeploymentPhase;
 use App\Exceptions\BlueGreenRecoveryHandoffException;
 use App\Jobs\ResumeBlueGreenDrainingDeploymentJob;
 use App\Models\ApplicationBlueGreenDeactivation;
+use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\InstanceSettings;
 use App\Services\BlueGreenDeploymentLifecycle;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Notification;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Str;
@@ -227,10 +242,150 @@ function absentRouteMidFlightInterventionScenario(): array
 function fakeBlueGreenManagedRouteMetadata(BlueGreenProxyState $state): void
 {
     Process::fake([
+        '*'.WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX.'*' => Process::result(
+            output: WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX.'|absent',
+        ),
         '*' => Process::result(output: 'coolify-blue-green-managed-route:present:'
             .base64_encode($state->serialize())
             ."\n".$state->managedSha256),
     ]);
+}
+
+/** @param list<string> $payloads */
+function fakeCommittedMidFlightJournal(
+    BlueGreenProxyState $expectedState,
+    BlueGreenProxyState $replacementState,
+    array &$payloads,
+    ?string $inspectionOutput = null,
+    ?string $archiveOutput = null,
+    string $journalBootId = '11111111-2222-3333-4444-555555555555',
+): void {
+    $journalSha256 = str_repeat('7', 64);
+    $writer = new WriteBlueGreenProxyConfiguration;
+    $archiveFilename = $writer->containerMutationJournalArchiveFilename(
+        $replacementState->managedFilename,
+        $journalSha256,
+    );
+    $payloads = [];
+    $pendingJournalPresent = true;
+    Process::fake(function (PendingProcess $process) use (
+        $archiveFilename,
+        $archiveOutput,
+        $expectedState,
+        $inspectionOutput,
+        $journalBootId,
+        $journalSha256,
+        &$payloads,
+        &$pendingJournalPresent,
+        $replacementState,
+    ) {
+        $payload = (string) $process->command."\n".(string) $process->input;
+        $payloads[] = $payload;
+        if (str_contains($payload, WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_CAS_OUTPUT_PREFIX)) {
+            $pendingJournalPresent = false;
+
+            return Process::result(output: $archiveOutput ?? implode('|', [
+                WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_CAS_OUTPUT_PREFIX,
+                BlueGreenManagedRouteMetadataForOperationResult::COMMITTED_REPLACEMENT_SIDECAR,
+                $journalSha256,
+                $archiveFilename,
+            ]));
+        }
+        if (str_contains($payload, WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX)) {
+            if (! $pendingJournalPresent) {
+                return Process::result(
+                    output: WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX.'|absent',
+                );
+            }
+
+            return Process::result(output: $inspectionOutput ?? implode('|', [
+                WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX,
+                BlueGreenManagedRouteMetadataForOperationResult::COMMITTED_REPLACEMENT_SIDECAR,
+                $journalSha256,
+                $journalBootId,
+                BlueGreenProxyRollbackArtifact::PRESENT_STATE,
+                (string) $replacementState->managedSha256,
+                hash('sha256', 'intervention-recovery-committed-mutation-script'),
+                hash('sha256', 'intervention-recovery-committed-completion-script'),
+            ])."\n".base64_encode($expectedState->serialize())."\n".base64_encode($replacementState->serialize()));
+        }
+
+        return Process::result(output: 'coolify-blue-green-managed-route:present:'
+            .base64_encode($replacementState->serialize())
+            ."\n".$replacementState->managedSha256);
+    });
+}
+
+/**
+ * @return array{expectedState: BlueGreenProxyState, replacementState: BlueGreenProxyState, scenario: BlueGreenRecoveryScenario}
+ */
+function rollbackCommittedJournalReconciliationScenario(): array
+{
+    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
+    $scenario->state->update([
+        'phase' => BlueGreenDeploymentPhase::ROLLING_BACK,
+        'destination_fence_operation_id' => BlueGreenRecoveryScenario::OPERATION_UUID,
+        'destination_fence_mutation_sequence' => 1,
+        'destination_fence_epoch' => 0,
+        'destination_topology_digest' => $scenario->state->operation_topology_digest,
+        'application_routing_config_digest' => $scenario->state->operation_routing_config_digest,
+    ]);
+    $scenario->deployment->update([
+        'blue_green_phase' => BlueGreenDeploymentPhase::ROLLING_BACK,
+        'status' => ApplicationDeploymentStatus::FAILED->value,
+        'finished_at' => now()->subMinutes(10),
+    ]);
+    DB::table('application_deployment_queues')
+        ->where('id', $scenario->deployment->id)
+        ->update(['updated_at' => now()->subMinutes(10)]);
+    $expectedState = new BlueGreenProxyState(
+        managedFilename: (string) $scenario->state->operation_rollback_managed_filename,
+        applicationUuid: (string) $scenario->application->uuid,
+        destinationId: (int) $scenario->destination->id,
+        operationId: BlueGreenRecoveryScenario::OPERATION_UUID,
+        mutationSequence: 1,
+        destinationFenceEpoch: 1,
+        routingRevision: 1,
+        managedSha256: str_repeat('f', 64),
+        activeColor: BlueGreenDeploymentColor::BLUE,
+        activeDeploymentUuid: BlueGreenRecoveryScenario::OPERATION_UUID,
+        activeContainerName: $scenario->application->uuid.'-blue',
+        activeContainerId: BlueGreenRecoveryScenario::CANDIDATE_ID,
+        applicationRoutingConfigDigest: (string) $scenario->state->operation_routing_config_digest,
+        destinationTopologyDigest: (string) $scenario->state->operation_topology_digest,
+    );
+
+    return [
+        'expectedState' => $expectedState,
+        'replacementState' => $expectedState->withMutationOwner(BlueGreenRecoveryScenario::OPERATION_UUID),
+        'scenario' => $scenario,
+    ];
+}
+
+function fakeRollbackCommittedJournalReconciliationActions(): void
+{
+    Notification::fake();
+    InspectBlueGreenContainer::shouldRun()->andReturnUsing(
+        static function ($server, BlueGreenContainerExpectation $expectation): BlueGreenContainerInspection {
+            if ($expectation->dockerId === BlueGreenRecoveryScenario::CANDIDATE_ID) {
+                return BlueGreenContainerInspection::missing();
+            }
+
+            return new BlueGreenContainerInspection(
+                exists: true,
+                dockerId: $expectation->dockerId ?? BlueGreenRecoveryScenario::LEGACY_ID,
+                status: 'running',
+                health: 'healthy',
+            );
+        },
+    );
+    BlueGreenProxyRollbackArtifactReader::shouldRun()->andReturnUsing(
+        fn ($server, $key) => new BlueGreenProxyRollbackArtifact($key, false, ''),
+    );
+    RebindBlueGreenLegacyRoutingSnapshot::shouldRun()->andReturnUsing(
+        static fn ($server, $application, $destination, $expectation, $snapshot) => $snapshot,
+    );
+    VerifyBlueGreenLegacyProviderRecovery::shouldRun()->andReturnNull();
 }
 
 it('records the source deployment phase and reason when reconciliation requires intervention', function (): void {
@@ -267,6 +422,100 @@ it('keeps legacy zero-provenance intervention states manual-only', function (): 
     expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::LEGACY_MANUAL_ONLY)
         ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY)
         ->and($scenario->state->fresh()->getAttributes())->toBe($attributesBefore);
+});
+
+it('clears only stale intervention diagnostics from an otherwise clean idle destination', function (): void {
+    $scenario = BlueGreenRecoveryScenario::create(finalized: true, routingMutationRecorded: true);
+    $scenario->state->update([
+        ...ApplicationBlueGreenDeployment::clearedOperationAttributes(),
+        ...ApplicationBlueGreenDeployment::clearedInactiveRetirementAttributes(),
+        'legacy_container_name' => null,
+        'pending_color' => null,
+        'pending_deployment_uuid' => null,
+        'deactivation_operation_id' => null,
+        'deactivation_started_at' => null,
+        'phase' => BlueGreenDeploymentPhase::IDLE,
+        'intervention_phase' => BlueGreenDeploymentPhase::ROLLING_BACK->value,
+        'intervention_reason' => 'Rollback completed before its diagnostic marker was cleared.',
+    ]);
+
+    Process::preventStrayProcesses();
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        apply: true,
+        reason: 'Clear exact stale IDLE intervention diagnostics.',
+    );
+
+    expect($result->classification)->toBe(RecoverBlueGreenIntervention::STALE_IDLE_DIAGNOSTICS)
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::RECOVERED)
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::IDLE)
+        ->and($scenario->state->fresh()->intervention_phase)->toBeNull()
+        ->and($scenario->state->fresh()->intervention_reason)->toBeNull()
+        ->and($scenario->state->fresh()->active_color)->toBe(BlueGreenDeploymentColor::BLUE)
+        ->and($scenario->state->fresh()->blue_deployment_uuid)->toBe(BlueGreenRecoveryScenario::OPERATION_UUID);
+});
+
+it('keeps ambiguous idle intervention diagnostics fail closed', function (): void {
+    $scenario = BlueGreenRecoveryScenario::create(finalized: true, routingMutationRecorded: true);
+    $scenario->state->update([
+        ...ApplicationBlueGreenDeployment::clearedOperationAttributes(),
+        ...ApplicationBlueGreenDeployment::clearedInactiveRetirementAttributes(),
+        'legacy_container_name' => null,
+        'pending_color' => null,
+        'pending_deployment_uuid' => null,
+        'deactivation_operation_id' => null,
+        'deactivation_started_at' => null,
+        'phase' => BlueGreenDeploymentPhase::IDLE,
+        'inactive_retirement_attempts' => 1,
+        'intervention_phase' => BlueGreenDeploymentPhase::ROLLING_BACK->value,
+        'intervention_reason' => 'Rollback diagnostics overlap unexplained retirement provenance.',
+    ]);
+    $stateBefore = $scenario->state->fresh()->getAttributes();
+
+    Process::preventStrayProcesses();
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        apply: true,
+        reason: 'Refuse ambiguous IDLE intervention diagnostics.',
+    );
+
+    expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::LEGACY_MANUAL_ONLY)
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY)
+        ->and($scenario->state->fresh()->getAttributes())->toBe($stateBefore);
+});
+
+it('clears the same stale idle diagnostics through emergency recovery', function (): void {
+    $scenario = BlueGreenRecoveryScenario::create(finalized: true, routingMutationRecorded: true);
+    $scenario->state->update([
+        ...ApplicationBlueGreenDeployment::clearedOperationAttributes(),
+        ...ApplicationBlueGreenDeployment::clearedInactiveRetirementAttributes(),
+        'legacy_container_name' => null,
+        'pending_color' => null,
+        'pending_deployment_uuid' => null,
+        'deactivation_operation_id' => null,
+        'deactivation_started_at' => null,
+        'phase' => BlueGreenDeploymentPhase::IDLE,
+        'intervention_phase' => BlueGreenDeploymentPhase::ROLLING_BACK->value,
+        'intervention_reason' => 'Rollback completed before its diagnostic marker was cleared.',
+    ]);
+    $expectedRoute = ResolveBlueGreenExpectedProxyState::run(
+        $scenario->application,
+        $scenario->destination,
+        $scenario->state->fresh(),
+    );
+    fakeBlueGreenManagedRouteMetadata($expectedRoute);
+
+    $result = EmergencyRecoverApplicationDeployment::run(
+        $scenario->deployment->fresh(),
+        'Clear exact stale IDLE intervention diagnostics through break-glass.',
+    );
+
+    expect($result['outcome'])->toBe(EmergencyRecoverApplicationDeployment::CLEAN)
+        ->and($result['cancelled'])->toBeTrue()
+        ->and($result['claimable'])->toBeTrue()
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::IDLE)
+        ->and($scenario->state->fresh()->intervention_phase)->toBeNull()
+        ->and($scenario->state->fresh()->intervention_reason)->toBeNull();
 });
 
 it('classifies an exact pending generation for live managed-route inspection before recovery', function (): void {
@@ -345,6 +594,9 @@ it('attests and reopens the exact prepared activation from an absent-route inter
         'scenario' => $scenario,
     ] = absentRouteMidFlightInterventionScenario();
     Process::fake([
+        '*'.WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX.'*' => Process::result(
+            output: WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX.'|absent',
+        ),
         '*coolify-blue-green-managed-route*' => Process::result(output: 'coolify-blue-green-managed-route:absent'),
         '*' => Process::result(output: 'coolify-blue-green-destination-state-attested'),
     ]);
@@ -656,6 +908,159 @@ it('keeps a fixed-color intervention manual-only when a checksum-valid live rout
         ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY)
         ->and($scenario->state->fresh()->getAttributes())->toBe($stateBefore)
         ->and($scenario->deployment->fresh()->getAttributes())->toBe($queueBefore);
+});
+
+it('does not archive a committed journal while a prepared mid-flight recovery remains lifecycle-owned', function (): void {
+    ['currentState' => $currentState, 'scenario' => $scenario] = fixedColorMidFlightInterventionScenario();
+    $replacementState = $currentState->withMutationOwner(BlueGreenRecoveryScenario::OPERATION_UUID);
+    $payloads = [];
+    fakeCommittedMidFlightJournal($currentState, $replacementState, $payloads);
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        apply: true,
+        reason: 'Continue the exact parked operation after its container journal committed.',
+    );
+    $remotePayload = implode("\n", $payloads);
+
+    expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::MID_FLIGHT)
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::DEFERRED)
+        ->and($result->message)->toBe('Another live blue-green lifecycle owner still holds the destination lock; no durable recovery state was changed.')
+        ->and($result->recoveryOwnerActive)->toBeTrue()
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
+        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value)
+        ->and($scenario->deployment->fresh()->execution_phase)->toBe(ApplicationDeploymentExecutionPhase::Prepare)
+        ->and($remotePayload)->toContain(WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX)
+        ->and($remotePayload)->not->toContain(WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_CAS_OUTPUT_PREFIX)
+        ->and($remotePayload)->not->toContain('operation_container_manifest_stage=')
+        ->and($remotePayload)->not->toContain('sh "$operation_container_mutation_decoded"')
+        ->and($remotePayload)->not->toContain('sh "$operation_container_completion_decoded"');
+});
+
+it('keeps foreign or malformed committed journals parked during mid-flight recovery', function (
+    string $failureStage,
+    string $expectedMessage,
+): void {
+    ['currentState' => $currentState, 'scenario' => $scenario] = fixedColorMidFlightInterventionScenario();
+    $expectedState = $currentState;
+    $replacementState = $currentState->withMutationOwner(BlueGreenRecoveryScenario::OPERATION_UUID);
+    if ($failureStage === 'foreign') {
+        $expectedState = $currentState->withMutationOwner('foreign-recovery-operation');
+        $replacementState = $expectedState->withMutationOwner('foreign-recovery-operation');
+    }
+    $payloads = [];
+    fakeCommittedMidFlightJournal(
+        $expectedState,
+        $replacementState,
+        $payloads,
+        inspectionOutput: $failureStage === 'malformed'
+            ? WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX.'|committed'
+            : null,
+    );
+    $stateBefore = $scenario->state->fresh()->getAttributes();
+    $queueBefore = $scenario->deployment->fresh()->getAttributes();
+
+    expect(fn () => RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        apply: true,
+        reason: 'Refuse an unproven journal while the exact operation remains parked.',
+    ))->toThrow(BlueGreenDeploymentTransitionException::class, $expectedMessage);
+
+    $remotePayload = implode("\n", $payloads);
+    expect($scenario->state->fresh()->getAttributes())->toBe($stateBefore)
+        ->and($scenario->deployment->fresh()->getAttributes())->toBe($queueBefore);
+    expect($remotePayload)
+        ->toContain(WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX)
+        ->not->toContain('operation_container_manifest_stage=')
+        ->not->toContain(WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_CAS_OUTPUT_PREFIX);
+})->with([
+    'foreign owner' => ['foreign', 'does not belong to the requested recovery operation'],
+    'malformed inspection' => ['malformed', 'inspection returned an invalid response'],
+]);
+
+it('archives an operation-owned committed journal through public rollback reconciliation without replaying it', function (): void {
+    fakeRollbackCommittedJournalReconciliationActions();
+    [
+        'expectedState' => $expectedState,
+        'replacementState' => $replacementState,
+        'scenario' => $scenario,
+    ] = rollbackCommittedJournalReconciliationScenario();
+    $payloads = [];
+    fakeCommittedMidFlightJournal($expectedState, $replacementState, $payloads);
+
+    $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
+    $remotePayload = implode("\n", $payloads);
+
+    expect($result->outcome)->toBe(BlueGreenReconciliationResult::RECONCILED, $result->message)
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::IDLE)
+        ->and($remotePayload)->toContain(WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX)
+        ->and($remotePayload)->toContain(WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_CAS_OUTPUT_PREFIX)
+        ->and($remotePayload)->toContain('operation_container_manifest_stage=')
+        ->and($remotePayload)->not->toContain('sh "$operation_container_mutation_decoded"')
+        ->and($remotePayload)->not->toContain('sh "$operation_container_completion_decoded"')
+        ->and($remotePayload)->not->toContain('coolify-blue-green-managed-route:present:');
+});
+
+it('keeps a foreign committed journal fenced through public rollback reconciliation', function (): void {
+    fakeRollbackCommittedJournalReconciliationActions();
+    ['expectedState' => $expectedState, 'scenario' => $scenario] = rollbackCommittedJournalReconciliationScenario();
+    $foreignExpectedState = $expectedState->withMutationOwner('foreign-recovery-operation');
+    $foreignReplacementState = $foreignExpectedState->withMutationOwner('foreign-recovery-operation');
+    $payloads = [];
+    fakeCommittedMidFlightJournal($foreignExpectedState, $foreignReplacementState, $payloads);
+
+    $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
+    $remotePayload = implode("\n", $payloads);
+
+    expect($result->outcome)->toBe(BlueGreenReconciliationResult::INTERVENTION_REQUIRED)
+        ->and($result->message)->toContain('does not belong to the requested recovery operation')
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
+        ->and($scenario->state->fresh()->destination_fence_mutation_sequence)->toBe(1)
+        ->and($remotePayload)->toContain(WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX)
+        ->and($remotePayload)->not->toContain('operation_container_manifest_stage=')
+        ->and($remotePayload)->not->toContain(WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_CAS_OUTPUT_PREFIX)
+        ->and($remotePayload)->not->toContain('coolify-blue-green-managed-route:present:');
+});
+
+it('keeps an ambiguous committed journal archive fail-closed through public rollback reconciliation', function (): void {
+    fakeRollbackCommittedJournalReconciliationActions();
+    [
+        'expectedState' => $expectedState,
+        'replacementState' => $replacementState,
+        'scenario' => $scenario,
+    ] = rollbackCommittedJournalReconciliationScenario();
+    $writer = new WriteBlueGreenProxyConfiguration;
+    $journalSha256 = str_repeat('7', 64);
+    $validArchiveOutput = implode('|', [
+        WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_CAS_OUTPUT_PREFIX,
+        BlueGreenManagedRouteMetadataForOperationResult::COMMITTED_REPLACEMENT_SIDECAR,
+        $journalSha256,
+        $writer->containerMutationJournalArchiveFilename(
+            $replacementState->managedFilename,
+            $journalSha256,
+        ),
+    ]);
+    $payloads = [];
+    fakeCommittedMidFlightJournal(
+        $expectedState,
+        $replacementState,
+        $payloads,
+        archiveOutput: $validArchiveOutput."\n".$validArchiveOutput,
+    );
+
+    $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
+    $remotePayload = implode("\n", $payloads);
+
+    expect($result->outcome)->toBe(BlueGreenReconciliationResult::INTERVENTION_REQUIRED)
+        ->and($result->message)->toContain('CAS returned an invalid response')
+        ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
+        ->and($scenario->state->fresh()->destination_fence_mutation_sequence)->toBe(1)
+        ->and($remotePayload)->toContain(WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX)
+        ->and($remotePayload)->toContain(WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_CAS_OUTPUT_PREFIX)
+        ->and($remotePayload)->toContain('operation_container_manifest_stage=')
+        ->and($remotePayload)->not->toContain('sh "$operation_container_mutation_decoded"')
+        ->and($remotePayload)->not->toContain('sh "$operation_container_completion_decoded"')
+        ->and($remotePayload)->not->toContain('coolify-blue-green-managed-route:present:');
 });
 
 it('keeps a fixed-color intervention manual-only when checksum-valid metadata has foreign routing evidence', function (): void {
@@ -1054,7 +1459,12 @@ it('reports a proven terminalized drain clean and claimable through break-glass'
 it('re-proves the requested operation before reopening a mid-flight intervention', function (): void {
     Queue::fake();
     ['currentState' => $currentState, 'scenario' => $scenario] = fixedColorMidFlightInterventionScenario();
-    fakeBlueGreenManagedRouteMetadata($currentState);
+    $payloads = [];
+    fakeCommittedMidFlightJournal(
+        $currentState,
+        $currentState->withMutationOwner(BlueGreenRecoveryScenario::OPERATION_UUID),
+        $payloads,
+    );
     $stateBefore = $scenario->state->fresh()->getAttributes();
 
     expect(fn () => RecoverBlueGreenIntervention::run(
@@ -1064,11 +1474,20 @@ it('re-proves the requested operation before reopening a mid-flight intervention
         requiredOperationUuid: 'a-superseded-break-glass-request',
     ))->toThrow(BlueGreenDeploymentTransitionException::class);
 
-    // The finalized reopen path already re-proved the requested UUID inside its
-    // row locks; the mid-flight reopen must hold the same fence, or a stale
-    // break-glass request reopens whatever successor now owns the destination.
+    // The finalized reopen path already re-proves the requested UUID inside its
+    // row locks; mid-flight recovery must do the same before inspecting or
+    // archiving operation-owned remote evidence, or a stale break-glass request
+    // can consume the successor's journal before its later reopen is refused.
     expect($scenario->state->fresh()->getAttributes())->toBe($stateBefore)
-        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value);
+        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value)
+        ->and($payloads)->toBeEmpty();
+    $archivePayload = collect($payloads)->first(
+        fn (string $payload): bool => str_contains(
+            $payload,
+            WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_CAS_OUTPUT_PREFIX,
+        ),
+    );
+    expect($archivePayload)->toBeNull();
 });
 
 it('does not vouch for a live lock holder when the requested operation already lost the destination', function (): void {
@@ -1146,19 +1565,20 @@ it('leaves a resumable drain alone when the resume failed for a reason other tha
 });
 
 /**
- * The permanent history a destination keeps after its application was stopped
- * once: one terminal STOPPED row, superseded in place by any later stop and
- * deleted by nothing. It predates every deployment in these scenarios, so it
- * fences none of them under any canonical predicate.
+ * A terminal STOPPED row whose default zero cutoff keeps it as history for each
+ * later queue owner in these scenarios. Callers can pass an exact owner ID to
+ * exercise the terminal row's durable cutoff fence.
  */
-function stoppedBlueGreenDeactivationHistory(BlueGreenRecoveryScenario $scenario): ApplicationBlueGreenDeactivation
-{
+function stoppedBlueGreenDeactivationHistory(
+    BlueGreenRecoveryScenario $scenario,
+    int $queueCutoffId = 0,
+): ApplicationBlueGreenDeactivation {
     return ApplicationBlueGreenDeactivation::query()->create([
         'application_id' => $scenario->application->id,
         'standalone_docker_id' => $scenario->destination->id,
         'operation_id' => str_repeat('c', 64),
         'started_at' => now()->subDay()->startOfSecond(),
-        'queue_cutoff_id' => 0,
+        'queue_cutoff_id' => $queueCutoffId,
         'supersession_generation' => 1,
         'phase' => BlueGreenDeactivationPhase::STOPPED,
         'completed_at' => now()->subDay()->addMinute()->startOfSecond(),
@@ -1200,6 +1620,37 @@ it('reopens a finalized draining intervention on a destination that was stopped 
         ResumeBlueGreenDrainingDeploymentJob::class,
         fn (ResumeBlueGreenDrainingDeploymentJob $job): bool => $job->applicationDeploymentQueueId === $scenario->deployment->id,
     );
+});
+
+it('does not reopen a finalized drain cut off by a finished stop', function (): void {
+    Queue::fake();
+    $scenario = BlueGreenRecoveryScenario::create(finalized: true, routingMutationRecorded: true);
+    $deactivation = stoppedBlueGreenDeactivationHistory($scenario, (int) $scenario->deployment->id);
+    $scenario->state->update([
+        'phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+        'intervention_phase' => BlueGreenDeploymentPhase::DRAINING->value,
+        'intervention_reason' => 'Finalization requires a fenced drain recovery retry.',
+        'operation_drain_started_at' => now()->subMinutes(2),
+        'operation_drain_deadline_at' => now()->subMinute(),
+    ]);
+    $scenario->deployment->update([
+        'status' => ApplicationDeploymentStatus::FAILED->value,
+        'blue_green_phase' => BlueGreenDeploymentPhase::INTERVENTION_REQUIRED,
+        'finished_at' => now(),
+    ]);
+    $stateBefore = $scenario->state->fresh()->getAttributes();
+
+    expect(fn () => RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        apply: true,
+        reason: 'Attempt a drain resume below the completed stop cutoff.',
+    ))->toThrow(BlueGreenDeploymentTransitionException::class);
+
+    expect($scenario->state->fresh()->getAttributes())->toBe($stateBefore)
+        ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value)
+        ->and($scenario->deployment->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
+        ->and($deactivation->fresh()->phase)->toBe(BlueGreenDeactivationPhase::STOPPED);
+    Queue::assertNotPushed(ResumeBlueGreenDrainingDeploymentJob::class);
 });
 
 it('keeps a finalized draining intervention fenced while its destination is being stopped', function (): void {
@@ -1262,6 +1713,9 @@ it('reopens a mid-flight intervention on a destination that was stopped once bef
     ['scenario' => $scenario] = absentRouteMidFlightInterventionScenario();
     stoppedBlueGreenDeactivationHistory($scenario);
     Process::fake([
+        '*'.WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX.'*' => Process::result(
+            output: WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX.'|absent',
+        ),
         '*coolify-blue-green-managed-route*' => Process::result(output: 'coolify-blue-green-managed-route:absent'),
         '*' => Process::result(output: 'coolify-blue-green-destination-state-attested'),
     ]);

@@ -661,7 +661,7 @@ it('repairs only missing or drifted regular managed files under the exact sideca
     }
 });
 
-it('finalizes a completed container mutation but fences an unfinished journal during attestation', function (): void {
+it('fences a pending container-mutation journal during attestation and attests once it is cleared', function (): void {
     $filesystem = new Filesystem;
     $proxyPath = sys_get_temp_dir().'/coolify-blue-green-container-journal-'.bin2hex(random_bytes(8));
     $filesystem->mkdir($proxyPath.'/dynamic', 0700);
@@ -723,6 +723,25 @@ it('finalizes a completed container mutation but fences an unfinished journal du
             ->and(file_exists($statePath))->toBeFalse()
             ->and(file_exists($journalPath))->toBeTrue();
 
+        // Attestation never inspects, replays, or finalizes a container-mutation
+        // journal: only the operation-aware PHP reader may authenticate one and
+        // archive it under the destination fence. Until it does, attestation is
+        // refused and the journal is left exactly as the crash wrote it.
+        $crashedAttestation = failedDestinationFenceCommand(
+            $writer->attestStateCommandFor($proxyPath, $managedFilename, $claim),
+        );
+        expect($crashedAttestation->getExitCode())->toBe(75)
+            ->and($crashedAttestation->getErrorOutput())
+            ->toContain(WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT)
+            ->and(file_exists($journalPath))->toBeTrue()
+            ->and(file_exists($statePath))->toBeFalse();
+
+        // Stand in for that archival -- the reader removes the journal and records
+        // the replacement state -- so the rest of the attestation contract is
+        // still exercised on the same destination.
+        unlink($journalPath);
+        file_put_contents($statePath, $claim->serialize());
+        chmod($statePath, 0600);
         expect(runDestinationFenceCommand($writer->attestStateCommandFor($proxyPath, $managedFilename, $claim)))
             ->toBe('coolify-blue-green-destination-state-attested')
             ->and(BlueGreenProxyState::parse(file_get_contents($statePath))->serialize())->toBe($claim->serialize())

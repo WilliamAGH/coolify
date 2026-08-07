@@ -17,9 +17,11 @@ use App\Actions\Proxy\BlueGreenProxyConfiguration;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifact;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifactCommitter;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifactReader;
+use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingMode;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
+use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
@@ -163,6 +165,31 @@ function blueGreenCrashBoundaryReplicaInspectionOutput(
     })->implode("\n");
 }
 
+function blueGreenCrashBoundaryFakeNoJournalRemote(
+    ?string $availableReplicaOutput = null,
+    ?BlueGreenProxyState $managedRouteState = null,
+): void {
+    Process::fake(function (PendingProcess $process) use ($availableReplicaOutput, $managedRouteState): FakeProcessResult {
+        $payload = (string) $process->command."\n".(string) $process->input;
+        if (str_contains($payload, WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX)) {
+            return Process::result(output: WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX.'|absent');
+        }
+        if (str_contains($payload, 'coolify-blue-green-managed-route:absent')) {
+            if ($managedRouteState === null) {
+                return Process::result(output: 'coolify-blue-green-managed-route:absent');
+            }
+
+            return Process::result(output: 'coolify-blue-green-managed-route:present:'
+                .base64_encode($managedRouteState->serialize())."\n".$managedRouteState->managedSha256);
+        }
+        if ($availableReplicaOutput !== null && str_contains($payload, 'coolify_available_replica_')) {
+            return Process::result(output: $availableReplicaOutput);
+        }
+
+        return Process::result();
+    });
+}
+
 it('retires a pre-artifact candidate remnant without changing the healthy legacy route', function (): void {
     config(['constants.ssh.mux_enabled' => false]);
     Notification::fake();
@@ -186,7 +213,7 @@ it('retires a pre-artifact candidate remnant without changing the healthy legacy
             ),
         );
     BlueGreenProxyRollbackArtifactReader::shouldRun()->once()->andReturnNull();
-    Process::fake(fn (PendingProcess $process) => Process::result());
+    blueGreenCrashBoundaryFakeNoJournalRemote();
 
     $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
 
@@ -197,7 +224,7 @@ it('retires a pre-artifact candidate remnant without changing the healthy legacy
         ->and($state->active_color)->toBeNull()
         ->and($state->operation_deployment_uuid)->toBeNull()
         ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value);
-    Process::assertRanTimes(fn (): bool => true, 1);
+    Process::assertRanTimes(fn (): bool => true, 3);
 });
 
 it('retires only the available pre-artifact candidate replicas without changing the healthy legacy route', function (): void {
@@ -209,13 +236,7 @@ it('retires only the available pre-artifact candidate replicas without changing 
     blueGreenCrashBoundaryMakeStale($scenario->deployment);
 
     BlueGreenProxyRollbackArtifactReader::shouldRun()->once()->andReturnNull();
-    Process::fake(function (PendingProcess $process) use ($availableOutput): FakeProcessResult {
-        $command = is_array($process->command) ? implode(' ', $process->command) : (string) $process->command;
-
-        return str_contains($command, 'coolify_available_replica_')
-            ? Process::result(output: $availableOutput)
-            : Process::result();
-    });
+    blueGreenCrashBoundaryFakeNoJournalRemote($availableOutput);
 
     $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
 
@@ -231,7 +252,7 @@ it('retires only the available pre-artifact candidate replicas without changing 
         ->and($state->operation_deployment_uuid)->toBeNull()
         ->and($replicaRows->pluck('health_status')->all())->toBe(['stopped', 'stopped', 'healthy'])
         ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value);
-    Process::assertRanTimes(fn (): bool => true, 2);
+    Process::assertRanTimes(fn (): bool => true, 4);
 });
 
 it('completes a proven switching route forward into durable draining', function (): void {
@@ -412,7 +433,10 @@ it('restores and proves the legacy route even when the failed candidate is unhea
     VerifyBlueGreenLegacyProviderRecovery::shouldRun()->once()->andReturnNull();
     RemoveExactBlueGreenCandidate::shouldRun()->once()->andReturn($operation->rollbackKey->rollbackState());
     BlueGreenProxyRollbackArtifactCommitter::shouldRun()->once()->andReturnNull();
-    Process::fake(fn (PendingProcess $process) => Process::result());
+    blueGreenCrashBoundaryFakeNoJournalRemote(
+        managedRouteState: $operation->currentDestinationState
+            ?? throw new LogicException('The routed crash-boundary recovery must retain its durable destination state.'),
+    );
 
     $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
 
@@ -423,5 +447,5 @@ it('restores and proves the legacy route even when the failed candidate is unhea
         ->and($state->active_color)->toBeNull()
         ->and($state->operation_deployment_uuid)->toBeNull()
         ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value);
-    Process::assertRanTimes(fn (): bool => true, 1);
+    Process::assertRanTimes(fn (): bool => true, 3);
 });

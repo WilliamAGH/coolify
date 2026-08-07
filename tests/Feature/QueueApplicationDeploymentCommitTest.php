@@ -1,14 +1,29 @@
 <?php
 
+use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
+use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
+use App\Actions\Application\BlueGreen\CompleteBlueGreenDeploymentOperation;
+use App\Actions\Application\BlueGreen\FindBlueGreenDeactivationFence;
+use App\Actions\Application\BlueGreen\RecordBlueGreenCandidateIdentity;
+use App\Actions\Application\BlueGreen\RecordBlueGreenDestinationState;
+use App\Actions\Application\BlueGreen\RecordBlueGreenRoutingMutation;
+use App\Actions\Application\BlueGreen\TransitionsBlueGreenDeployment;
+use App\Actions\Proxy\BlueGreenProxyState;
+use App\Actions\Proxy\BlueGreenRoutingMode;
+use App\Actions\Proxy\BlueGreenRoutingTarget;
+use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
 use App\Enums\ApplicationDeploymentExecutionPhase;
 use App\Enums\ApplicationDeploymentStatus;
+use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\BlueGreenFleetStatus;
 use App\Enums\DeploymentDispatchClaimResult;
+use App\Events\ApplicationConfigurationChanged;
 use App\Jobs\ActivateApplicationDeploymentJob;
 use App\Jobs\ApplicationDeploymentJob;
 use App\Jobs\ConvergeBlueGreenDeploymentJob;
 use App\Models\Application;
+use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\Environment;
@@ -16,14 +31,19 @@ use App\Models\Project;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
 use App\Models\Team;
+use App\Services\BlueGreenDeploymentLifecycle;
 use App\Support\ProxyMutationQueue;
 use App\Support\ProxyMutationQueueFrozenException;
 use Illuminate\Contracts\Bus\Dispatcher;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Notification;
+use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Str;
 use Laravel\Horizon\Contracts\JobRepository;
+use Tests\Support\BlueGreenDeactivationScenario;
 
 uses(RefreshDatabase::class);
 
@@ -70,6 +90,28 @@ function makeQueueAdmissionDeployment(
         'deployment_uuid' => $deploymentUuid,
         'commit' => "commit-{$deploymentUuid}",
         'status' => ApplicationDeploymentStatus::QUEUED->value,
+    ]);
+}
+
+function createPostCutoffQueueDeactivationFence(
+    Application $application,
+    StandaloneDocker $destination,
+    int $queueCutoffId,
+    BlueGreenDeactivationPhase $phase,
+): ApplicationBlueGreenDeactivation {
+    return ApplicationBlueGreenDeactivation::query()->create([
+        'application_id' => $application->id,
+        'standalone_docker_id' => $destination->id,
+        'operation_id' => str_repeat('a', 64),
+        'started_at' => now()->subHour(),
+        'queue_cutoff_id' => $queueCutoffId,
+        'supersession_generation' => 1,
+        'phase' => $phase,
+        'completed_at' => in_array($phase, [
+            BlueGreenDeactivationPhase::COMPLETED,
+            BlueGreenDeactivationPhase::STOPPED,
+            BlueGreenDeactivationPhase::REMOVED,
+        ], true) ? now()->subMinutes(30) : null,
     ]);
 }
 
@@ -1050,6 +1092,186 @@ describe('transactional admission and reattach', function () {
 });
 
 describe('blue-green dispatch claim gate', function () {
+    test('ordinary lifecycle admission clears stale idle rollback diagnostics before an exact successor claims and completes', function () {
+        [
+            'application' => $application,
+            'destination' => $destination,
+            'server' => $server,
+        ] = BlueGreenDeactivationScenario::context();
+        $application->update([
+            'health_check_enabled' => true,
+            'ports_mappings' => null,
+        ]);
+        $application->settings()->update([
+            'is_blue_green_deployment_enabled' => true,
+            'is_container_label_readonly_enabled' => true,
+        ]);
+        $application = $application->fresh(['settings']);
+        $state = BlueGreenDeactivationScenario::routeLessState($application, $destination, supersessionGeneration: 1);
+        $state->update([
+            'intervention_phase' => BlueGreenDeploymentPhase::ROLLING_BACK->value,
+            'intervention_reason' => 'Rollback completed before its diagnostic marker was cleared.',
+        ]);
+        $oldOwner = BlueGreenDeactivationScenario::queuedDeployment(
+            $application,
+            $destination,
+            'stale-idle-rollback-owner',
+        );
+        $oldOwner->update([
+            'status' => ApplicationDeploymentStatus::FAILED->value,
+            'blue_green_phase' => BlueGreenDeploymentPhase::IDLE->value,
+            'blue_green_supersession_generation' => 1,
+            'finished_at' => now()->subMinute(),
+        ]);
+        $successor = BlueGreenDeactivationScenario::queuedDeployment(
+            $application,
+            $destination,
+            'ordinary-admission-after-stale-idle-diagnostics',
+        );
+        Event::fake([ApplicationConfigurationChanged::class]);
+        Notification::fake();
+        Process::fake(function ($process) {
+            $payload = (is_array($process->command)
+                ? implode(' ', $process->command)
+                : (string) $process->command)
+                ."\n".(string) $process->input;
+            if (str_contains($payload, 'coolify-blue-green-destination-state-attested')) {
+                return Process::result(output: 'coolify-blue-green-destination-state-attested');
+            }
+            if (str_contains($payload, '/proc/sys/kernel/random/boot_id')) {
+                return Process::result(output: BlueGreenDeactivationScenario::BOOT_ID);
+            }
+
+            return Process::result(output: '[]');
+        });
+
+        expect($successor->claimForDispatchDetailed(bypassServerCapacity: true))
+            ->toBe(DeploymentDispatchClaimResult::CLAIMED);
+        $lifecycle = new BlueGreenDeploymentLifecycle(
+            application: $application,
+            deployment: $successor->fresh(),
+            destination: $destination,
+            server: $server,
+            timeout: 30,
+            checkForCancellation: static function (): void {},
+        );
+        try {
+            $lifecycle->initialize();
+            $claim = $lifecycle->claim();
+
+            expect($claim?->deploymentUuid)->toBe($successor->deployment_uuid)
+                ->and($state->fresh()->intervention_phase)->toBeNull()
+                ->and($state->fresh()->intervention_reason)->toBeNull();
+
+            $claim ??= throw new RuntimeException('The clean successor did not produce a blue-green claim.');
+            $candidateContainerId = str_repeat('b', 64);
+            $startedCandidateState = new BlueGreenProxyState(
+                managedFilename: $claim->rollbackManagedFilename,
+                applicationUuid: (string) $application->uuid,
+                destinationId: $destination->id,
+                operationId: $claim->deploymentUuid,
+                mutationSequence: 1,
+                destinationFenceEpoch: 0,
+                routingRevision: $claim->expectedRoutingRevision,
+                managedSha256: null,
+                activeColor: null,
+                activeDeploymentUuid: null,
+                activeContainerName: null,
+                activeContainerId: null,
+                applicationRoutingConfigDigest: $claim->routingConfigDigest,
+                destinationTopologyDigest: $claim->topologyDigest,
+            );
+            RecordBlueGreenDestinationState::run($claim, null, $startedCandidateState);
+            RecordBlueGreenCandidateIdentity::run($claim, new BlueGreenContainerInspection(
+                exists: true,
+                dockerId: $candidateContainerId,
+                status: 'running',
+                health: 'healthy',
+            ));
+            $activeConfiguration = CompileBlueGreenProxyConfiguration::run(
+                $application,
+                $destination,
+                new BlueGreenRoutingTarget(
+                    destinationId: $destination->id,
+                    activeColor: $claim->pendingColor,
+                    blueContainerName: $application->uuid.'-blue',
+                    greenContainerName: $application->uuid.'-green',
+                    port: $claim->backendPortInventory->ports()[0],
+                    ports: $claim->backendPortInventory->ports(),
+                    routingRevision: $claim->expectedRoutingRevision,
+                    mode: BlueGreenRoutingMode::Steady,
+                    publicProofToken: BlueGreenRoutingTarget::durablePublicProofToken($claim->deploymentUuid),
+                    destinationFenceEpoch: $claim->destinationFenceEpoch,
+                    operationId: $claim->deploymentUuid,
+                    mutationSequence: 2,
+                    activeDeploymentUuid: $claim->deploymentUuid,
+                    activeContainerId: $candidateContainerId,
+                    destinationTopologyDigest: $claim->topologyDigest,
+                ),
+            );
+            RecordBlueGreenDestinationState::run($claim, $startedCandidateState, $activeConfiguration->state);
+            RecordBlueGreenRoutingMutation::run($claim, $activeConfiguration->state);
+            TransitionsBlueGreenDeployment::markSwitching($claim);
+            TransitionsBlueGreenDeployment::markDraining($claim, 1);
+            CompleteBlueGreenDeploymentOperation::run($claim);
+        } finally {
+            $lifecycle->release();
+        }
+
+        (new ApplicationDeploymentJob($successor->id))->completeBlueGreenDrainRecovery();
+
+        expect($oldOwner->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value)
+            ->and($oldOwner->fresh()->finished_at)->not->toBeNull()
+            ->and($state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::IDLE)
+            ->and($state->fresh()->intervention_phase)->toBeNull()
+            ->and($state->fresh()->intervention_reason)->toBeNull()
+            ->and(ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state->fresh()))->toBeTrue()
+            ->and($successor->fresh()->status)->toBe(ApplicationDeploymentStatus::FINISHED->value)
+            ->and($successor->fresh()->finished_at)->not->toBeNull();
+    });
+
+    test('fences post-cutoff dispatch claims while a live deactivation phase owns the destination', function (
+        BlueGreenDeactivationPhase $phase,
+    ) {
+        $application = makeApplication($this->environment->id, $this->destination->id, 'abc1234');
+        $cutoff = makeQueueAdmissionDeployment($application, $this->server, 'live-deactivation-cutoff', $this->destination);
+        $deactivation = createPostCutoffQueueDeactivationFence(
+            $application,
+            $this->destination,
+            $cutoff->id,
+            $phase,
+        );
+        $candidate = makeQueueAdmissionDeployment($application, $this->server, 'live-deactivation-candidate', $this->destination);
+
+        expect($deactivation->fences($candidate))->toBeFalse()
+            ->and(FindBlueGreenDeactivationFence::run($candidate)?->getKey())->toBe($deactivation->getKey())
+            ->and($candidate->claimForDispatchDetailed(bypassServerCapacity: true))
+            ->toBe(DeploymentDispatchClaimResult::NOT_CLAIMED)
+            ->and($candidate->fresh()->status)->toBe(ApplicationDeploymentStatus::CANCELLED_BY_USER->value);
+    })->with([
+        'deactivating' => [BlueGreenDeactivationPhase::DEACTIVATING],
+        'stopping' => [BlueGreenDeactivationPhase::STOPPING],
+        'removing' => [BlueGreenDeactivationPhase::REMOVING],
+        'intervention required' => [BlueGreenDeactivationPhase::INTERVENTION_REQUIRED],
+    ]);
+
+    test('allows post-cutoff dispatch claims past terminal deactivation history', function (
+        BlueGreenDeactivationPhase $phase,
+    ) {
+        $application = makeApplication($this->environment->id, $this->destination->id, 'abc1234');
+        $cutoff = makeQueueAdmissionDeployment($application, $this->server, 'terminal-deactivation-cutoff', $this->destination);
+        createPostCutoffQueueDeactivationFence($application, $this->destination, $cutoff->id, $phase);
+        $candidate = makeQueueAdmissionDeployment($application, $this->server, 'terminal-deactivation-candidate', $this->destination);
+
+        expect(FindBlueGreenDeactivationFence::run($candidate))->toBeNull()
+            ->and($candidate->claimForDispatchDetailed(bypassServerCapacity: true))
+            ->toBe(DeploymentDispatchClaimResult::CLAIMED)
+            ->and($candidate->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
+    })->with([
+        'completed history' => [BlueGreenDeactivationPhase::COMPLETED],
+        'stopped history' => [BlueGreenDeactivationPhase::STOPPED],
+    ]);
+
     test('defers the claim and registers convergence while durable state is not cleanly claimable', function () {
         Queue::fake();
         $application = makeApplication($this->environment->id, $this->destination->id, 'abc1234');

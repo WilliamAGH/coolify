@@ -495,6 +495,66 @@ it('refuses promotion when any co-rolled member is unhealthy', function (): void
         ]))->toThrow(InvalidArgumentException::class, 'running, and healthy before promotion');
 });
 
+it('canonicalizes co-rolled replica identities across inspection permutations', function (): void {
+    $inspections = [
+        BlueGreenReplicaInspection::fromRuntime(
+            replicaIndex: 1,
+            composeService: 'llm_gateway-blue-replica-1',
+            containerName: 'llm_gateway-blue-replica-1-1',
+            dockerId: str_repeat('a', 64),
+            status: 'running',
+            health: 'healthy',
+        ),
+        BlueGreenReplicaInspection::fromRuntime(
+            replicaIndex: 1,
+            composeService: 'queue-blue-replica-1',
+            containerName: 'queue-blue-replica-1-1',
+            dockerId: str_repeat('b', 64),
+            status: 'running',
+            health: 'healthy',
+        ),
+        BlueGreenReplicaInspection::fromRuntime(
+            replicaIndex: 2,
+            composeService: 'llm_gateway-blue-replica-2',
+            containerName: 'llm_gateway-blue-replica-2-1',
+            dockerId: str_repeat('c', 64),
+            status: 'running',
+            health: 'healthy',
+        ),
+        BlueGreenReplicaInspection::fromRuntime(
+            replicaIndex: 2,
+            composeService: 'queue-blue-replica-2',
+            containerName: 'queue-blue-replica-2-1',
+            dockerId: str_repeat('d', 64),
+            status: 'running',
+            health: 'healthy',
+        ),
+    ];
+    $canonicalIdentity = hash('sha256', implode("\0", array_map(
+        static fn (BlueGreenReplicaInspection $inspection): string => implode(':', [
+            $inspection->replicaIndex,
+            $inspection->composeService,
+            $inspection->containerName,
+            $inspection->dockerId,
+        ]),
+        $inspections,
+    )));
+
+    expect(BlueGreenReplicaSet::identityDigest($inspections))->toBe($canonicalIdentity)
+        ->and(BlueGreenReplicaSet::identityDigest([
+            $inspections[3],
+            $inspections[0],
+            $inspections[2],
+            $inspections[1],
+        ]))->toBe($canonicalIdentity)
+        ->and(BlueGreenReplicaSet::identityDigest([
+            $inspections[1],
+            $inspections[2],
+            $inspections[0],
+            $inspections[3],
+        ]))->toBe($canonicalIdentity);
+});
+
 it('keeps the single-member replica ledger reading byte-identical', function (): void {
     $rows = collect([1, 2, 3])->map(static function (int $index): ApplicationBlueGreenReplica {
         $replica = new ApplicationBlueGreenReplica;

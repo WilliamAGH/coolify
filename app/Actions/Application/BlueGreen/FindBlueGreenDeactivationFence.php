@@ -21,8 +21,16 @@ class FindBlueGreenDeactivationFence
             ->where('standalone_docker_id', $deployment->destination_id)
             ->first();
 
-        return $deactivation?->fences($deployment) === true
-            ? $deactivation
-            : null;
+        if ($deactivation === null) {
+            return null;
+        }
+
+        $deactivation->assertValid();
+
+        if ($deactivation->phase->fencesDeploymentClaims() || $deactivation->fences($deployment)) {
+            return $deactivation;
+        }
+
+        return null;
     }
 }

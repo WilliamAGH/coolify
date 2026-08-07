@@ -36,6 +36,14 @@ beforeEach(function () {
 
     // Create a server for the team
     $this->server = Server::factory()->create(['team_id' => $this->team->id]);
+    $project = Project::factory()->create(['team_id' => $this->team->id]);
+    $this->environment = $project->environments()->where('name', 'production')->firstOrFail();
+    $this->destination = $this->server->standaloneDockers()->firstOrFail();
+    $this->application = Application::factory()->create([
+        'environment_id' => $this->environment->id,
+        'destination_id' => $this->destination->id,
+        'destination_type' => $this->destination->getMorphClass(),
+    ]);
 });
 
 describe('POST /api/v1/deployments/{uuid}/cancel', function () {
@@ -60,10 +68,19 @@ describe('POST /api/v1/deployments/{uuid}/cancel', function () {
         $otherTeam = Team::factory()->create();
         $otherServer = Server::factory()->create(['team_id' => $otherTeam->id]);
 
-        // Create a deployment on the other team's server
+        $otherProject = Project::factory()->create(['team_id' => $otherTeam->id]);
+        $otherEnvironment = $otherProject->environments()->where('name', 'production')->firstOrFail();
+        $otherDestination = $otherServer->standaloneDockers()->firstOrFail();
+        $otherApplication = Application::factory()->create([
+            'environment_id' => $otherEnvironment->id,
+            'destination_id' => $otherDestination->id,
+            'destination_type' => $otherDestination->getMorphClass(),
+        ]);
+
+        // Create a deployment owned by the other team.
         $deployment = ApplicationDeploymentQueue::create([
             'deployment_uuid' => 'test-deployment-uuid',
-            'application_id' => 1,
+            'application_id' => $otherApplication->id,
             'server_id' => $otherServer->id,
             'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
         ]);
@@ -80,7 +97,7 @@ describe('POST /api/v1/deployments/{uuid}/cancel', function () {
     test('returns 400 when deployment is already finished', function () {
         $deployment = ApplicationDeploymentQueue::create([
             'deployment_uuid' => 'finished-deployment-uuid',
-            'application_id' => 1,
+            'application_id' => $this->application->id,
             'server_id' => $this->server->id,
             'status' => ApplicationDeploymentStatus::FINISHED->value,
         ]);
@@ -97,7 +114,7 @@ describe('POST /api/v1/deployments/{uuid}/cancel', function () {
     test('returns 400 when deployment is already failed', function () {
         $deployment = ApplicationDeploymentQueue::create([
             'deployment_uuid' => 'failed-deployment-uuid',
-            'application_id' => 1,
+            'application_id' => $this->application->id,
             'server_id' => $this->server->id,
             'status' => ApplicationDeploymentStatus::FAILED->value,
         ]);
@@ -114,7 +131,7 @@ describe('POST /api/v1/deployments/{uuid}/cancel', function () {
     test('returns 400 when deployment is already cancelled', function () {
         $deployment = ApplicationDeploymentQueue::create([
             'deployment_uuid' => 'cancelled-deployment-uuid',
-            'application_id' => 1,
+            'application_id' => $this->application->id,
             'server_id' => $this->server->id,
             'status' => ApplicationDeploymentStatus::CANCELLED_BY_USER->value,
         ]);
@@ -131,7 +148,7 @@ describe('POST /api/v1/deployments/{uuid}/cancel', function () {
     test('cancels queued deployment and updates status in database', function () {
         $deployment = ApplicationDeploymentQueue::create([
             'deployment_uuid' => 'queued-deployment-uuid',
-            'application_id' => 1,
+            'application_id' => $this->application->id,
             'server_id' => $this->server->id,
             'status' => ApplicationDeploymentStatus::QUEUED->value,
         ]);
@@ -149,7 +166,7 @@ describe('POST /api/v1/deployments/{uuid}/cancel', function () {
     test('cancels in-progress deployment and updates status in database', function () {
         $deployment = ApplicationDeploymentQueue::create([
             'deployment_uuid' => 'in-progress-deployment-uuid',
-            'application_id' => 1,
+            'application_id' => $this->application->id,
             'server_id' => $this->server->id,
             'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
         ]);
@@ -166,7 +183,7 @@ describe('POST /api/v1/deployments/{uuid}/cancel', function () {
     test('returns 200 when the deployment container no longer exists during post-cancel cleanup', function () {
         $deployment = ApplicationDeploymentQueue::create([
             'deployment_uuid' => 'missing-container-uuid',
-            'application_id' => 1,
+            'application_id' => $this->application->id,
             'server_id' => $this->server->id,
             'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
         ]);
@@ -248,7 +265,7 @@ describe('POST /api/v1/deployments/{uuid}/cancel', function () {
     test('returns 200 for a blue-green activate-phase deployment when the helper container is missing', function () {
         $deployment = ApplicationDeploymentQueue::create([
             'deployment_uuid' => 'blue-green-activate-uuid',
-            'application_id' => 1,
+            'application_id' => $this->application->id,
             'server_id' => $this->server->id,
             'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
             'execution_phase' => 'activate',
@@ -289,7 +306,7 @@ describe('POST /api/v1/deployments/{uuid}/cancel', function () {
 
         $deployment = ApplicationDeploymentQueue::create([
             'deployment_uuid' => 'ssh-failure-uuid',
-            'application_id' => 1,
+            'application_id' => $this->application->id,
             'server_id' => $this->server->id,
             'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
         ]);
@@ -326,7 +343,7 @@ describe('POST /api/v1/deployments/{uuid}/cancel', function () {
         ]);
         $deployment = ApplicationDeploymentQueue::create([
             'deployment_uuid' => 'success-deployment-uuid',
-            'application_id' => 1,
+            'application_id' => $this->application->id,
             'server_id' => $this->server->id,
             'status' => ApplicationDeploymentStatus::IN_PROGRESS->value,
         ]);

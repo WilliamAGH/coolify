@@ -2,6 +2,53 @@
 
 All notable changes to this project will be documented in this file.
 
+## [unreleased]
+
+### 🐛 Bug Fixes
+
+- *(blue-green)* Fail the container-mutation guard on its first unmet assertion
+- *(deps)* Take league/commonmark 2.9.0 for six published advisories
+
+### 📚 Documentation
+
+- Update changelog
+- Update changelog
+
+## [4.13.74-fork] - 2026-08-06
+
+### 🐛 Bug Fixes
+
+- *(blue-green)* Read a destination's deactivation through its phase, never its existence
+- *(blue-green)* Self-heal stale deployment state
+- *(fork-deploy)* Point the post-update rollback hint at the release it replaced
+
+### 📚 Documentation
+
+- Update changelog
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.74-fork
+
+## [4.13.73-fork] - 2026-08-06
+
+### 🐛 Bug Fixes
+
+- *(blue-green)* Stop a stopped-once application from never retiring its inactive colour
+
+### 📚 Documentation
+
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.73-fork
+
+### ◀️ Revert
+
+- *(blue-green)* Hold back the spent-journal extension that fails on Linux
+
 ## [4.13.72-fork] - 2026-08-06
 
 ### 🐛 Bug Fixes

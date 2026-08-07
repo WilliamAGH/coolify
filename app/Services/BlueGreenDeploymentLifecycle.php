@@ -9,7 +9,9 @@ use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentRecoveryOperation;
+use App\Actions\Application\BlueGreen\BlueGreenDeploymentTransitionException;
 use App\Actions\Application\BlueGreen\BlueGreenDestinationStateRecordingException;
+use App\Actions\Application\BlueGreen\BlueGreenInterventionRecoveryResult;
 use App\Actions\Application\BlueGreen\BlueGreenLegacyProviderState;
 use App\Actions\Application\BlueGreen\BlueGreenLegacyRoutingSnapshot;
 use App\Actions\Application\BlueGreen\BlueGreenOperationFence;
@@ -27,6 +29,7 @@ use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Actions\Application\BlueGreen\InspectBlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\PlanBlueGreenPublicRecovery;
 use App\Actions\Application\BlueGreen\QuarantineSpentFirstAdoptionDrainJournal;
+use App\Actions\Application\BlueGreen\ReadBlueGreenManagedRouteMetadataForOperation;
 use App\Actions\Application\BlueGreen\ReadBlueGreenServerBootIdentity;
 use App\Actions\Application\BlueGreen\ReconcileBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\ReconstructBlueGreenDeploymentRecovery;
@@ -43,6 +46,7 @@ use App\Actions\Application\BlueGreen\RemoveBlueGreenInactiveContainer;
 use App\Actions\Application\BlueGreen\RemoveBlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\RemoveExactBlueGreenCandidate;
 use App\Actions\Application\BlueGreen\ResolveBlueGreenActiveContainerSet;
+use App\Actions\Application\BlueGreen\RetireBlueGreenInactiveContainer;
 use App\Actions\Application\BlueGreen\StartBlueGreenComposeSidecars;
 use App\Actions\Application\BlueGreen\TransitionsBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\VerifyBlueGreenCandidateReleaseProof;
@@ -204,6 +208,28 @@ final class BlueGreenDeploymentLifecycle
             $this->completedDrainingRecovery = true;
 
             return;
+        }
+        if ($durableState?->phase === BlueGreenDeploymentPhase::IDLE
+            && $durableState->supersession_generation === 1
+            && $durableState->inactive_retirement_owner_deployment_uuid === null
+            && $durableState->intervention_phase === null
+            && $durableState->intervention_reason === null
+            && is_string($durableState->legacy_container_name)
+            && $durableState->legacy_container_name !== ''
+            && ClaimBlueGreenDeployment::stateIsCleanlyClaimable($durableState)) {
+            $durableState = $this->recoverFailedFirstAdoptionStaleJournalAtDeploymentStart($durableState);
+        }
+        if ($durableState?->phase === BlueGreenDeploymentPhase::IDLE
+            && $durableState->inactive_retirement_stopped_at === null
+            && ($durableState->inactive_retirement_intervention_required_at !== null
+                || (is_string($durableState->inactive_retirement_owner_deployment_uuid)
+                    && $durableState->inactive_retirement_owner_deployment_uuid !== ''
+                    && is_int($durableState->inactive_retirement_supersession_generation)))) {
+            $durableState = $this->recoverInactiveRetirementJournalAtDeploymentStart($durableState);
+        }
+        if ($durableState?->phase === BlueGreenDeploymentPhase::IDLE
+            && ($durableState->intervention_phase !== null || $durableState->intervention_reason !== null)) {
+            $durableState = $this->recoverStaleIdleInterventionDiagnosticsAtDeploymentStart($durableState);
         }
         if ($durableState?->phase === BlueGreenDeploymentPhase::INTERVENTION_REQUIRED) {
             $durableState = $this->recoverInterventionAtDeploymentStart($durableState);
@@ -1149,6 +1175,109 @@ final class BlueGreenDeploymentLifecycle
         return ApplicationBlueGreenDeployment::query()->find($durableState->id);
     }
 
+    private function recoverFailedFirstAdoptionStaleJournalAtDeploymentStart(
+        ApplicationBlueGreenDeployment $durableState,
+    ): ?ApplicationBlueGreenDeployment {
+        $horizonJobId = $this->deployment->getRawOriginal('horizon_job_id');
+        if ($horizonJobId !== null && ! is_string($horizonJobId)) {
+            throw new DeploymentException('The failed first-adoption successor has malformed dispatch-attempt provenance.');
+        }
+        $result = RecoverBlueGreenIntervention::run(
+            stateId: (int) $durableState->getKey(),
+            apply: true,
+            reason: 'automatic failed first-adoption stale-journal recovery at deployment start',
+            staleContainerJournal: true,
+            successorQueueId: (int) $this->deployment->getKey(),
+            successorDeploymentUuid: (string) $this->deployment->deployment_uuid,
+            successorHorizonJobId: $horizonJobId,
+        );
+        $this->deployment->addLogEntry(
+            "Failed first-adoption stale-journal recovery: classification={$result->classification} outcome={$result->outcome} {$result->message}",
+        );
+        if ($result->recoveryOwnerActive) {
+            $this->interventionRecoveryHandoff = 'Automatic failed first-adoption stale-journal recovery is waiting for the live lifecycle owner; this deployment returns to the queue. '
+                .$result->message;
+
+            throw new BlueGreenRecoveryHandoffException($this->interventionRecoveryHandoff);
+        }
+        if (! in_array($result->outcome, [
+            BlueGreenInterventionRecoveryResult::RECOVERED,
+            BlueGreenInterventionRecoveryResult::SKIPPED,
+        ], true)) {
+            throw new DeploymentException('The failed first-adoption stale journal could not be archived for this exact successor. '.$result->message);
+        }
+
+        return ApplicationBlueGreenDeployment::query()->find($durableState->id);
+    }
+
+    private function recoverStaleIdleInterventionDiagnosticsAtDeploymentStart(
+        ApplicationBlueGreenDeployment $durableState,
+    ): ?ApplicationBlueGreenDeployment {
+        $result = RecoverBlueGreenIntervention::run(
+            stateId: $durableState->id,
+            apply: true,
+            reason: 'automatic stale IDLE diagnostic cleanup at deployment start',
+        );
+        $this->deployment->addLogEntry(
+            "Blue-green stale IDLE diagnostic recovery: classification={$result->classification} outcome={$result->outcome} {$result->message}",
+        );
+        if ($result->recoveryOwnerActive) {
+            $this->interventionRecoveryHandoff = 'Automatic blue-green recovery is waiting for the live lifecycle owner before stale IDLE diagnostics can be cleared; this deployment returns to the queue. '
+                .$result->message;
+        }
+
+        $recoveredState = ApplicationBlueGreenDeployment::query()->find($durableState->id);
+        if ($recoveredState?->phase === BlueGreenDeploymentPhase::IDLE
+            && $recoveredState->intervention_phase === null
+            && $recoveredState->intervention_reason === null) {
+            return $recoveredState;
+        }
+        if ($this->interventionRecoveryHandoff !== null) {
+            throw new BlueGreenRecoveryHandoffException($this->interventionRecoveryHandoff);
+        }
+
+        throw new DeploymentException('The IDLE blue-green destination retains ambiguous intervention diagnostics and cannot admit a new operation. '.$result->message);
+    }
+
+    private function recoverInactiveRetirementJournalAtDeploymentStart(
+        ApplicationBlueGreenDeployment $durableState,
+    ): ?ApplicationBlueGreenDeployment {
+        $ownerDeploymentUuid = $durableState->inactive_retirement_owner_deployment_uuid;
+        $generation = $durableState->inactive_retirement_supersession_generation;
+        if (! is_string($ownerDeploymentUuid) || $ownerDeploymentUuid === '' || ! is_int($generation)) {
+            throw new DeploymentException('The intervention-marked inactive retirement has no exact durable owner generation.');
+        }
+
+        $result = RetireBlueGreenInactiveContainer::run(
+            $durableState->id,
+            $ownerDeploymentUuid,
+            $generation,
+            journalRecoveryOnly: true,
+        );
+        $this->deployment->addLogEntry(
+            "Inactive blue-green retirement journal recovery: result={$result} owner={$ownerDeploymentUuid} generation={$generation}.",
+        );
+        $recoveredState = ApplicationBlueGreenDeployment::query()->find($durableState->id);
+        if ($result === RetireBlueGreenInactiveContainer::NO_JOURNAL) {
+            return $recoveredState;
+        }
+        if (in_array($result, [
+            RetireBlueGreenInactiveContainer::RETRY,
+            RetireBlueGreenInactiveContainer::PENDING,
+        ], true)) {
+            $this->interventionRecoveryHandoff = 'Automatic blue-green recovery handed the old inactive-retirement intervention to its exact durable owner; this deployment returns to the queue until that owner finishes.';
+
+            throw new BlueGreenRecoveryHandoffException($this->interventionRecoveryHandoff);
+        }
+        $recoveredExactly = $recoveredState?->inactive_retirement_stopped_at !== null
+            && $recoveredState->inactive_retirement_intervention_required_at === null;
+        if ($result !== RetireBlueGreenInactiveContainer::COMPLETED && ! $recoveredExactly) {
+            throw new DeploymentException('The old inactive-retirement intervention could not authenticate an exact committed journal; the destination remains intervention-required.');
+        }
+
+        return $recoveredState;
+    }
+
     private function initializeDrainingRecovery(ApplicationBlueGreenDeployment $state): void
     {
         if ($state->operation_deployment_uuid !== $this->deployment->deployment_uuid) {
@@ -1165,6 +1294,9 @@ final class BlueGreenDeploymentLifecycle
             || $operation->deployment->getKey() !== $this->deployment->getKey()) {
             throw new DeploymentException('The durable blue-green DRAINING state does not reconstruct to this exact finalized queue owner.');
         }
+        $this->server->privateKey->storeInFileSystem();
+        ReadBlueGreenServerBootIdentity::run($this->server, $operation->claim->serverBootId);
+        $operation = $this->reconcileDrainingRecoveryContainerMutationJournal($operation);
         $this->drainingRecoveryOperation = $operation;
         $this->claim = $operation->claim;
         $this->previousActiveColor = $operation->claim->previousActiveColor;
@@ -1175,9 +1307,7 @@ final class BlueGreenDeploymentLifecycle
         $this->rollbackKey = $operation->rollbackKey;
         $this->candidateContainerExpectation = $operation->candidateContainer;
         $this->previousContainerExpectation = $operation->previousContainer;
-        $this->server->privateKey->storeInFileSystem();
-        ReadBlueGreenServerBootIdentity::run($this->server, $operation->claim->serverBootId);
-        $this->loadRecoveryReplicaInspections($state, $operation->claim);
+        $this->loadRecoveryReplicaInspections($state->fresh(), $operation->claim);
         $this->assertOperationOwned(BlueGreenDeploymentPhase::DRAINING);
         $this->captureStoppedLegacyContainerForRetirement();
         $this->finalized = true;
@@ -1185,6 +1315,151 @@ final class BlueGreenDeploymentLifecycle
         $this->deployment->addLogEntry(
             'Resuming the exact durable blue-green DRAINING operation; no candidate build or routing mutation will run.',
         );
+    }
+
+    /**
+     * A container mutation journal must not outlive the exact DRAINING owner that
+     * can authenticate it. Pending work is discarded and regenerated from the
+     * durable claim; a committed same-route successor is first CAS-archived and
+     * then recorded before the recovery operation is reconstructed. Every
+     * failure happens before lifecycle IDLE clears operation provenance, so the
+     * deployment finalizer cannot publish FINISHED or release its successor.
+     */
+    private function reconcileDrainingRecoveryContainerMutationJournal(
+        BlueGreenDeploymentRecoveryOperation $operation,
+    ): BlueGreenDeploymentRecoveryOperation {
+        $claim = $operation->claim;
+        $durableState = $operation->currentDestinationState
+            ?? throw new BlueGreenDeploymentTransitionException('The durable blue-green DRAINING state has no exact routed destination state.');
+        $operationFence = $this->operationFence
+            ?? throw new DeploymentException('Blue-green drain journal recovery has no owned lifecycle fence.');
+        $operationFence->assertDeploymentOwnership(
+            $claim,
+            [BlueGreenDeploymentPhase::DRAINING],
+            $durableState,
+            verifyDestinationState: true,
+        );
+
+        $reader = ReadBlueGreenManagedRouteMetadataForOperation::make();
+        $inspection = $reader->handle(
+            $operation->server,
+            $operation->application,
+            $operation->destination,
+            $claim->deploymentUuid,
+        );
+        $operationFence->assertDeploymentOwnership(
+            $claim,
+            [BlueGreenDeploymentPhase::DRAINING],
+            $durableState,
+            verifyDestinationState: true,
+        );
+
+        if ($inspection->isAbsent()) {
+            if ($this->proxyStatesMatch($inspection->state, $durableState)) {
+                return $operation;
+            }
+            $liveState = $inspection->state;
+            if ($liveState === null
+                || ! $liveState->isMutationSuccessorOf($durableState, $claim->deploymentUuid)
+                || (! $liveState->hasSameRouteIdentity($durableState)
+                    && ! $liveState->hasSameAbsentRouteScope($durableState))) {
+                throw new BlueGreenDeploymentTransitionException('The journal-free DRAINING route is neither its exact durable state nor one exact operation-owned container successor.');
+            }
+
+            RecordBlueGreenDestinationState::run($claim, $durableState, $liveState);
+
+            return $this->drainingRecoveryWithDestinationState($operation, $liveState);
+        }
+
+        if (! hash_equals($claim->serverBootId, (string) $inspection->journalBootId)
+            || ! $this->proxyStatesMatch($inspection->expectedState, $durableState)) {
+            throw new BlueGreenDeploymentTransitionException('The DRAINING container-mutation journal does not match its exact durable state and server boot.');
+        }
+
+        if ($inspection->hasPendingExpectedSidecar()) {
+            $archivedState = $reader->archivePendingExpectedSidecar(
+                $operation->server,
+                $operation->application,
+                $operation->destination,
+                $claim->deploymentUuid,
+                $inspection,
+            );
+            if (! $this->proxyStatesMatch($archivedState, $durableState)) {
+                throw new BlueGreenDeploymentTransitionException('The pending DRAINING journal CAS did not preserve its exact durable expected state.');
+            }
+            $operationFence->assertDeploymentOwnership(
+                $claim,
+                [BlueGreenDeploymentPhase::DRAINING],
+                $durableState,
+                verifyDestinationState: true,
+            );
+
+            return $operation;
+        }
+
+        if (! $inspection->hasCommittedReplacementSidecar()) {
+            throw new BlueGreenDeploymentTransitionException('The DRAINING container-mutation journal has an unsupported state.');
+        }
+        $replacementState = $inspection->replacementState
+            ?? throw new BlueGreenDeploymentTransitionException('The committed DRAINING container-mutation journal has no replacement state.');
+        $archivedState = $reader->archiveCommittedReplacementSidecar(
+            $operation->server,
+            $operation->application,
+            $operation->destination,
+            $claim->deploymentUuid,
+            $inspection,
+        );
+        if (! $this->proxyStatesMatch($archivedState, $replacementState)) {
+            throw new BlueGreenDeploymentTransitionException('The committed DRAINING journal CAS did not preserve its exact replacement state.');
+        }
+        $operationFence->assertDeploymentOwnership(
+            $claim,
+            [BlueGreenDeploymentPhase::DRAINING],
+            $durableState,
+            verifyDestinationState: true,
+        );
+        RecordBlueGreenDestinationState::run($claim, $durableState, $replacementState);
+
+        return $this->drainingRecoveryWithDestinationState($operation, $replacementState);
+    }
+
+    private function drainingRecoveryWithDestinationState(
+        BlueGreenDeploymentRecoveryOperation $operation,
+        BlueGreenProxyState $destinationState,
+    ): BlueGreenDeploymentRecoveryOperation {
+        $operationFence = $this->operationFence
+            ?? throw new DeploymentException('Blue-green drain journal recovery has no owned lifecycle fence.');
+        $operationFence->assertDeploymentOwnership(
+            $operation->claim,
+            [BlueGreenDeploymentPhase::DRAINING],
+            $destinationState,
+            verifyDestinationState: true,
+        );
+
+        return new BlueGreenDeploymentRecoveryOperation(
+            claim: $operation->claim,
+            application: $operation->application,
+            destination: $operation->destination,
+            server: $operation->server,
+            deployment: $operation->deployment,
+            previousContainer: $operation->previousContainer,
+            legacyRoutingSnapshot: $operation->legacyRoutingSnapshot,
+            candidateContainer: $operation->candidateContainer,
+            rollbackKey: $operation->rollbackKey,
+            currentDestinationState: $destinationState,
+            recoveredPhase: $operation->recoveredPhase,
+            routingMutationRecorded: $operation->routingMutationRecorded,
+            wasFinalized: $operation->wasFinalized,
+        );
+    }
+
+    private function proxyStatesMatch(?BlueGreenProxyState $actual, ?BlueGreenProxyState $expected): bool
+    {
+        if ($actual === null || $expected === null) {
+            return $actual === null && $expected === null;
+        }
+
+        return hash_equals($expected->serialize(), $actual->serialize());
     }
 
     private function loadRecoveryReplicaInspections(

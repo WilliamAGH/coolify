@@ -754,6 +754,186 @@ it('refuses a terminal failure while a durable state row still owns the claimed 
         ->and($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
 });
 
+function exactTerminalQueueOwnerFor(array $fixture): ApplicationDeploymentJob
+{
+    $fixture['deployment']->update([
+        'blue_green_phase' => BlueGreenDeploymentPhase::PREPARING->value,
+        'blue_green_supersession_generation' => 1,
+    ]);
+    ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $fixture['application']->id,
+        'standalone_docker_id' => $fixture['destination']->id,
+        'phase' => BlueGreenDeploymentPhase::PREPARING,
+        'operation_deployment_uuid' => $fixture['deployment']->deployment_uuid,
+        'supersession_generation' => 1,
+    ]);
+
+    return new ApplicationDeploymentJob($fixture['deployment']->id);
+}
+
+function orphanedTerminalQueueOwnerFor(array $fixture): ApplicationDeploymentJob
+{
+    $fixture['deployment']->update([
+        'blue_green_phase' => BlueGreenDeploymentPhase::PREPARING->value,
+        'blue_green_supersession_generation' => 1,
+    ]);
+    ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $fixture['application']->id,
+        'standalone_docker_id' => $fixture['destination']->id,
+        'phase' => BlueGreenDeploymentPhase::PREPARING,
+        'operation_deployment_uuid' => 'successor-terminal-owner',
+        'supersession_generation' => 2,
+    ]);
+
+    return new ApplicationDeploymentJob($fixture['deployment']->id);
+}
+
+function terminalQueueDeactivation(
+    array $fixture,
+    BlueGreenDeactivationPhase $phase,
+    bool $coversDeployment,
+): ApplicationBlueGreenDeactivation {
+    return ApplicationBlueGreenDeactivation::query()->create([
+        'application_id' => $fixture['application']->id,
+        'standalone_docker_id' => $fixture['destination']->id,
+        'operation_id' => str_repeat('d', 64),
+        'started_at' => $coversDeployment ? now()->addMinute() : now()->subMinute(),
+        'queue_cutoff_id' => $coversDeployment
+            ? $fixture['deployment']->id
+            : max(0, $fixture['deployment']->id - 1),
+        'supersession_generation' => 1,
+        'phase' => $phase,
+        'completed_at' => in_array($phase, [
+            BlueGreenDeactivationPhase::COMPLETED,
+            BlueGreenDeactivationPhase::STOPPED,
+            BlueGreenDeactivationPhase::REMOVED,
+        ], true) ? now() : null,
+    ]);
+}
+
+it('allows exact terminalization past unrelated terminal deactivation history', function (
+    BlueGreenDeactivationPhase $phase,
+) {
+    $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
+    terminalQueueDeactivation($fixture, $phase, false);
+
+    $updated = invokeApplicationDeploymentBlueGreenMethod(
+        exactTerminalQueueOwnerFor($fixture),
+        'updateDeploymentStatus',
+        ApplicationDeploymentStatus::FINISHED,
+    );
+
+    expect($updated)->toBeTrue()
+        ->and($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::FINISHED->value);
+})->with([
+    'completed history' => [BlueGreenDeactivationPhase::COMPLETED],
+    'stopped history' => [BlueGreenDeactivationPhase::STOPPED],
+]);
+
+it('allows orphan failure past unrelated terminal deactivation history', function (
+    BlueGreenDeactivationPhase $phase,
+) {
+    $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
+    terminalQueueDeactivation($fixture, $phase, false);
+
+    $updated = invokeApplicationDeploymentBlueGreenMethod(
+        orphanedTerminalQueueOwnerFor($fixture),
+        'updateDeploymentStatus',
+        ApplicationDeploymentStatus::FAILED,
+    );
+
+    expect($updated)->toBeTrue()
+        ->and($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value);
+})->with([
+    'completed history' => [BlueGreenDeactivationPhase::COMPLETED],
+    'stopped history' => [BlueGreenDeactivationPhase::STOPPED],
+]);
+
+it('retains the pull-request terminal-history exception while terminalizing a queue owner', function () {
+    $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
+    $fixture['deployment']->update(['pull_request_id' => 42]);
+    $fixture['deployment']->refresh();
+    terminalQueueDeactivation($fixture, BlueGreenDeactivationPhase::COMPLETED, true);
+    $fixture['deployment']->update([
+        'blue_green_phase' => BlueGreenDeploymentPhase::PREPARING->value,
+        'blue_green_supersession_generation' => 1,
+    ]);
+    ApplicationBlueGreenDeployment::query()->create([
+        'application_id' => $fixture['application']->id,
+        'standalone_docker_id' => $fixture['destination']->id,
+        'phase' => BlueGreenDeploymentPhase::PREPARING,
+        'operation_deployment_uuid' => $fixture['deployment']->deployment_uuid,
+        'supersession_generation' => 1,
+    ]);
+    $fixture['deployment']->refresh();
+    setApplicationDeploymentBlueGreenProperty($fixture['job'], 'application_deployment_queue', $fixture['deployment']);
+
+    $updated = invokeApplicationDeploymentBlueGreenMethod(
+        $fixture['job'],
+        'updateDeploymentStatus',
+        ApplicationDeploymentStatus::FINISHED,
+    );
+
+    expect($updated)->toBeTrue()
+        ->and($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::FINISHED->value);
+});
+
+it('refuses exact terminalization while a deactivation still fences the snapshot', function (
+    BlueGreenDeactivationPhase $phase,
+) {
+    $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
+    terminalQueueDeactivation(
+        $fixture,
+        $phase,
+        in_array($phase, [BlueGreenDeactivationPhase::COMPLETED, BlueGreenDeactivationPhase::STOPPED], true),
+    );
+
+    $updated = invokeApplicationDeploymentBlueGreenMethod(
+        exactTerminalQueueOwnerFor($fixture),
+        'updateDeploymentStatus',
+        ApplicationDeploymentStatus::FINISHED,
+    );
+
+    expect($updated)->toBeFalse()
+        ->and($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
+})->with([
+    'covered completed history' => [BlueGreenDeactivationPhase::COMPLETED],
+    'covered stopped history' => [BlueGreenDeactivationPhase::STOPPED],
+    'deactivating' => [BlueGreenDeactivationPhase::DEACTIVATING],
+    'stopping' => [BlueGreenDeactivationPhase::STOPPING],
+    'removing' => [BlueGreenDeactivationPhase::REMOVING],
+    'intervention required' => [BlueGreenDeactivationPhase::INTERVENTION_REQUIRED],
+    'removed' => [BlueGreenDeactivationPhase::REMOVED],
+]);
+
+it('refuses orphan failure while a deactivation still fences the snapshot', function (
+    BlueGreenDeactivationPhase $phase,
+) {
+    $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();
+    terminalQueueDeactivation(
+        $fixture,
+        $phase,
+        in_array($phase, [BlueGreenDeactivationPhase::COMPLETED, BlueGreenDeactivationPhase::STOPPED], true),
+    );
+
+    $updated = invokeApplicationDeploymentBlueGreenMethod(
+        orphanedTerminalQueueOwnerFor($fixture),
+        'updateDeploymentStatus',
+        ApplicationDeploymentStatus::FAILED,
+    );
+
+    expect($updated)->toBeFalse()
+        ->and($fixture['deployment']->fresh()->status)->toBe(ApplicationDeploymentStatus::IN_PROGRESS->value);
+})->with([
+    'covered completed history' => [BlueGreenDeactivationPhase::COMPLETED],
+    'covered stopped history' => [BlueGreenDeactivationPhase::STOPPED],
+    'deactivating' => [BlueGreenDeactivationPhase::DEACTIVATING],
+    'stopping' => [BlueGreenDeactivationPhase::STOPPING],
+    'removing' => [BlueGreenDeactivationPhase::REMOVING],
+    'intervention required' => [BlueGreenDeactivationPhase::INTERVENTION_REQUIRED],
+    'removed' => [BlueGreenDeactivationPhase::REMOVED],
+]);
+
 function deactivatingBlueGreenFixtureWithOwner(?array $ownerAttributes): array
 {
     $fixture = makeApplicationDeploymentBlueGreenDestinationFenceFixture();

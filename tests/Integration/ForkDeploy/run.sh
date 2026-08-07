@@ -1468,6 +1468,45 @@ test_verify_accepts_dual_stack_public_app_binding() {
     cleanup_fixture
 }
 
+test_update_rollback_hint_names_the_replaced_release() {
+    local expectation='fork-deploy update points rollback at the release it replaced'
+    local output
+    new_fixture
+    write_manifest 4.13.0-fork.1
+    if ! install_release >/dev/null; then
+        fail "$expectation"
+        cleanup_fixture
+        return
+    fi
+    write_manifest 4.13.0-fork.2
+    output=$(update_release 2>&1)
+    # rollback --version names the release to deploy TO. Echoing the release
+    # just installed told an operator to "roll back" to what they already have,
+    # which is a no-op at exactly the moment a rollback is wanted.
+    if [[ $output == *'rollback --version 4.13.0-fork.1'* ]] \
+        && [[ $output != *'rollback --version 4.13.0-fork.2'* ]]; then
+        pass "$expectation"
+    else
+        fail "$expectation"
+    fi
+    cleanup_fixture
+}
+
+test_install_rollback_hint_omits_absent_predecessor() {
+    local expectation='fork-deploy install offers no rollback target when there is no earlier release'
+    local output
+    new_fixture
+    write_manifest 4.13.0-fork.1
+    output=$(install_release 2>&1)
+    if [[ $output == *'Verified and recorded 4.13.0-fork.1'* ]] \
+        && [[ $output != *'rollback --version'* ]]; then
+        pass "$expectation"
+    else
+        fail "$expectation"
+    fi
+    cleanup_fixture
+}
+
 test_update_preserves_control_plane_listener_override() {
     local serialization=${1:-canonical}
     local expectation='fork-deploy update preserves enrolled Traefik APP_PORT ownership'
@@ -2842,6 +2881,8 @@ test_rejects_out_of_order_manifest_schema
 test_rejects_mismatched_manifest_source_tag
 test_bootstrap_rejects_preexisting_symlink
 test_rejects_hardlinked_privileged_state_before_chmod
+test_update_rollback_hint_names_the_replaced_release
+test_install_rollback_hint_omits_absent_predecessor
 test_update_requires_newer_unactivated_version
 test_compatible_rollback_succeeds
 test_incompatible_rollback_refuses_before_compose

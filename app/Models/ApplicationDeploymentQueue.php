@@ -219,10 +219,14 @@ class ApplicationDeploymentQueue extends Model
                 return DeploymentDispatchClaimResult::NOT_CLAIMED;
             }
 
-            if ($deactivation?->fences($deployment) === true) {
-                $this->cancelRejectedDeploymentClaim($deployment, ApplicationDeploymentStatus::CANCELLED_BY_USER);
+            if ($deactivation !== null) {
+                $deactivation->assertValid();
 
-                return DeploymentDispatchClaimResult::NOT_CLAIMED;
+                if ($deactivation->phase->fencesDeploymentClaims() || $deactivation->fences($deployment)) {
+                    $this->cancelRejectedDeploymentClaim($deployment, ApplicationDeploymentStatus::CANCELLED_BY_USER);
+
+                    return DeploymentDispatchClaimResult::NOT_CLAIMED;
+                }
             }
 
             if (is_string($deployment->blue_green_fleet_deployment_uuid)

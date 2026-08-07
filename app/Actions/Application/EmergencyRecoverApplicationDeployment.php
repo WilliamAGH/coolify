@@ -5,21 +5,28 @@ namespace App\Actions\Application;
 use App\Actions\Application\BlueGreen\BlueGreenInterventionRecoveryResult;
 use App\Actions\Application\BlueGreen\BlueGreenReconciliationResult;
 use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
+use App\Actions\Application\BlueGreen\ReadBlueGreenManagedRouteMetadata;
 use App\Actions\Application\BlueGreen\ReconcileBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\RecoverBlueGreenIntervention;
+use App\Actions\Application\BlueGreen\RecoverCleanIdleBlueGreenContainerMutationJournal;
+use App\Actions\Application\BlueGreen\ResolveBlueGreenExpectedProxyState;
+use App\Actions\Application\BlueGreen\RetireBlueGreenInactiveContainer;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentPhase;
+use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
+use App\Models\StandaloneDocker;
 use Lorisleiva\Actions\Concerns\AsAction;
 use Throwable;
 
 /**
  * The break-glass owner for a deployment that ordinary self-healing could not
  * clear. It cancels the exact hanging queue entry and then delegates durable
- * state recovery to the two existing canonical owners — the reconciler for an
- * interrupted operation and the intervention recovery for a parked one — so
- * this action never becomes a second, divergent recovery algorithm. It has no
+ * state recovery to the existing canonical owners — the reconciler for an
+ * interrupted operation, intervention recovery for a parked one, and the
+ * inactive-retirement owner for an IDLE committed-journal crash — so this
+ * action never becomes a second, divergent recovery algorithm. It has no
  * remote Docker, proxy, process-kill, or history-deletion behavior of its own:
  * an emergency is not a licence to bypass the fences that keep a live
  * incumbent serving traffic.
@@ -47,7 +54,153 @@ final class EmergencyRecoverApplicationDeployment
      */
     public function handle(ApplicationDeploymentQueue $deployment, string $reason): array
     {
+        /** @var array{status: string, horizon_job_id: string|null, horizon_job_worker: string|null} $queueBinding */
+        $queueBinding = [
+            'status' => (string) $deployment->getRawOriginal('status'),
+            'horizon_job_id' => $deployment->getRawOriginal('horizon_job_id'),
+            'horizon_job_worker' => $deployment->getRawOriginal('horizon_job_worker'),
+        ];
         $state = $this->stateFor($deployment);
+        if ($state?->phase === BlueGreenDeploymentPhase::IDLE
+            && $state->inactive_retirement_stopped_at === null
+            && ($state->inactive_retirement_intervention_required_at !== null
+                || (is_string($state->inactive_retirement_owner_deployment_uuid)
+                    && $state->inactive_retirement_owner_deployment_uuid !== ''
+                    && is_int($state->inactive_retirement_supersession_generation)))) {
+            $ownerDeploymentUuid = $state->inactive_retirement_owner_deployment_uuid;
+            $generation = $state->inactive_retirement_supersession_generation;
+            try {
+                $retirementResult = is_string($ownerDeploymentUuid)
+                    && $ownerDeploymentUuid !== ''
+                    && is_int($generation)
+                    ? RetireBlueGreenInactiveContainer::run(
+                        $state->id,
+                        $ownerDeploymentUuid,
+                        $generation,
+                        journalRecoveryOnly: true,
+                    )
+                    : RetireBlueGreenInactiveContainer::STALE;
+            } catch (Throwable $exception) {
+                $cancelled = $this->cancelHangingQueueEntry($deployment, $queueBinding);
+
+                return $this->result(
+                    $deployment,
+                    $cancelled,
+                    self::MANUAL_ONLY,
+                    'The committed inactive-retirement journal could not be authenticated safely: '.$exception->getMessage(),
+                    false,
+                );
+            }
+            $state = $this->stateFor($deployment);
+            if ($retirementResult === RetireBlueGreenInactiveContainer::RETRY) {
+                if (! $this->inactiveRetirementRecoveryExecutionIsReserved(
+                    $state,
+                    $ownerDeploymentUuid,
+                    $generation,
+                )) {
+                    $cancelled = $this->cancelHangingQueueEntry($deployment, $queueBinding);
+
+                    return $this->result(
+                        $deployment,
+                        $cancelled,
+                        self::DEFERRED,
+                        'The inactive-retirement recovery retried without a live reservation held by its exact durable owner; this stale deployment was released while the destination remains non-claimable.',
+                        false,
+                    );
+                }
+
+                $cancelled = $this->cancelHangingQueueEntry($deployment, $queueBinding);
+
+                return $this->result(
+                    $deployment,
+                    $cancelled,
+                    self::DEFERRED,
+                    'The old durable inactive-retirement owner is still reconciling its committed journal; the requested stale deployment was released while the destination remains non-claimable.',
+                    false,
+                    true,
+                );
+            }
+            if ($retirementResult === RetireBlueGreenInactiveContainer::PENDING
+                && $this->inactiveRetirementOwnerStillOwnsState(
+                    $state,
+                    $ownerDeploymentUuid,
+                    $generation,
+                )) {
+                return $this->result(
+                    $deployment,
+                    false,
+                    self::DEFERRED,
+                    'The old durable inactive-retirement owner is still reconciling its committed journal; this stale deployment was left untouched until that fenced recovery finishes.',
+                    false,
+                    true,
+                );
+            }
+            if (! in_array($retirementResult, [
+                RetireBlueGreenInactiveContainer::COMPLETED,
+                RetireBlueGreenInactiveContainer::NO_JOURNAL,
+            ], true)) {
+                $cancelled = $this->cancelHangingQueueEntry($deployment, $queueBinding);
+
+                return $this->result(
+                    $deployment,
+                    $cancelled,
+                    self::MANUAL_ONLY,
+                    'The old inactive-retirement intervention has no exact committed journal owned by its durable retirement owner; its stale queue handle was released without calling the destination clean.',
+                    false,
+                );
+            }
+        }
+        if ($state?->phase === BlueGreenDeploymentPhase::IDLE
+            && ($state->intervention_phase !== null || $state->intervention_reason !== null)) {
+            [$outcome, $message, $recoveryOwnerActive] = $this->recoverStaleIdleInterventionDiagnostics(
+                $state,
+                $reason,
+            );
+            if ($outcome !== self::CLEAN) {
+                $cancelled = $recoveryOwnerActive
+                    ? false
+                    : $this->cancelHangingQueueEntry($deployment, $queueBinding);
+
+                return $this->result(
+                    $deployment,
+                    $cancelled,
+                    $outcome,
+                    $message,
+                    false,
+                    $recoveryOwnerActive,
+                );
+            }
+            $state = $this->stateFor($deployment);
+        }
+        if ($state?->phase === BlueGreenDeploymentPhase::IDLE
+            && $state->supersession_generation === 1
+            && $state->inactive_retirement_owner_deployment_uuid === null
+            && is_string($state->legacy_container_name)
+            && $state->legacy_container_name !== ''
+            && ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state)) {
+            [$outcome, $message, $recoveryOwnerActive] = $this->recoverFailedFirstAdoptionStaleJournal(
+                $state,
+                $deployment,
+                $reason,
+            );
+            if ($outcome !== self::CLEAN) {
+                $cancelled = $this->cancelAfterRecovery(
+                    $deployment,
+                    $recoveryOwnerActive,
+                    $queueBinding,
+                );
+
+                return $this->result(
+                    $deployment,
+                    $cancelled,
+                    $outcome,
+                    $message,
+                    false,
+                    $recoveryOwnerActive,
+                );
+            }
+            $state = $this->stateFor($deployment);
+        }
 
         // A deployment UUID is a stable historical handle: the queue keeps every
         // past record, so an old UUID still resolves this destination's current
@@ -60,8 +213,8 @@ final class EmergencyRecoverApplicationDeployment
             // left when a newer operation takes the destination mid-flight —
             // the stranded row otherwise blocks every successor behind it
             // forever, which is exactly what break-glass is called to clear.
-            $cancelled = $this->cancelHangingQueueEntry($deployment);
-            $claimable = ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state);
+            $cancelled = $this->cancelHangingQueueEntry($deployment, $queueBinding);
+            $claimable = $this->isClaimable($deployment);
 
             return $this->result(
                 $deployment,
@@ -91,7 +244,7 @@ final class EmergencyRecoverApplicationDeployment
             ),
         };
 
-        $cancelled = $this->cancelAfterRecovery($deployment, $recoveryOwnerActive);
+        $cancelled = $this->cancelAfterRecovery($deployment, $recoveryOwnerActive, $queueBinding);
         $claimable = $this->isClaimable($deployment);
 
         // Claimability is the only outcome the caller can act on, so a clean
@@ -121,6 +274,72 @@ final class EmergencyRecoverApplicationDeployment
     }
 
     /**
+     * @return array{0: self::CLEAN|self::DEFERRED|self::MANUAL_ONLY, 1: string, 2: bool}
+     */
+    private function recoverStaleIdleInterventionDiagnostics(
+        ApplicationBlueGreenDeployment $state,
+        string $reason,
+    ): array {
+        try {
+            $result = RecoverBlueGreenIntervention::run(
+                stateId: (int) $state->getKey(),
+                apply: true,
+                reason: $reason,
+            );
+        } catch (Throwable $exception) {
+            return [self::MANUAL_ONLY, 'The stale IDLE intervention diagnostics could not be cleared safely: '.$exception->getMessage(), false];
+        }
+
+        $recoveredState = ApplicationBlueGreenDeployment::query()->find($state->getKey());
+        $cleared = $recoveredState?->phase === BlueGreenDeploymentPhase::IDLE
+            && $recoveredState->intervention_phase === null
+            && $recoveredState->intervention_reason === null;
+        if ($cleared && in_array($result->outcome, [
+            BlueGreenInterventionRecoveryResult::RECOVERED,
+            BlueGreenInterventionRecoveryResult::SKIPPED,
+        ], true)) {
+            return [self::CLEAN, $result->message, false];
+        }
+        if ($result->outcome === BlueGreenInterventionRecoveryResult::DEFERRED) {
+            return [self::DEFERRED, $result->message, $result->recoveryOwnerActive];
+        }
+
+        return [self::MANUAL_ONLY, $result->message, false];
+    }
+
+    /** @return array{0: self::CLEAN|self::DEFERRED|self::MANUAL_ONLY, 1: string, 2: bool} */
+    private function recoverFailedFirstAdoptionStaleJournal(
+        ApplicationBlueGreenDeployment $state,
+        ApplicationDeploymentQueue $deployment,
+        string $reason,
+    ): array {
+        $horizonJobId = $deployment->getRawOriginal('horizon_job_id');
+        if ($horizonJobId !== null && ! is_string($horizonJobId)) {
+            return [self::MANUAL_ONLY, 'The failed first-adoption successor has malformed dispatch-attempt provenance.', false];
+        }
+        try {
+            $result = RecoverBlueGreenIntervention::run(
+                stateId: (int) $state->getKey(),
+                apply: true,
+                reason: $reason,
+                staleContainerJournal: true,
+                successorQueueId: (int) $deployment->getKey(),
+                successorDeploymentUuid: (string) $deployment->deployment_uuid,
+                successorHorizonJobId: $horizonJobId,
+            );
+        } catch (Throwable $exception) {
+            return [self::MANUAL_ONLY, 'The failed first-adoption stale journal could not be archived safely: '.$exception->getMessage(), false];
+        }
+
+        return match ($result->outcome) {
+            BlueGreenInterventionRecoveryResult::RECOVERED,
+            BlueGreenInterventionRecoveryResult::SKIPPED => [self::CLEAN, $result->message, false],
+            BlueGreenInterventionRecoveryResult::DEFERRED => [self::DEFERRED, $result->message, $result->recoveryOwnerActive],
+            default => [self::MANUAL_ONLY, $result->message, false],
+        };
+    }
+
+    /**
      * Cancellation is withheld for exactly one reason: an owner is driving this
      * queue row and needs it left IN_PROGRESS to finish. That covers a fenced
      * resume job this recovery just queued and a live lifecycle owner already
@@ -132,16 +351,21 @@ final class EmergencyRecoverApplicationDeployment
      * mid-flight, intervention could not be recorded — and withholding
      * cancellation there leaves the operator with a hanging row, nothing driving
      * it, and an endpoint reporting it deferred to something.
+     *
+     * @param  array{status: string, horizon_job_id: string|null, horizon_job_worker: string|null}|null  $expectedBinding
      */
-    private function cancelAfterRecovery(ApplicationDeploymentQueue $deployment, bool $recoveryOwnerActive): bool
-    {
+    private function cancelAfterRecovery(
+        ApplicationDeploymentQueue $deployment,
+        bool $recoveryOwnerActive,
+        ?array $expectedBinding = null,
+    ): bool {
         if ($recoveryOwnerActive) {
             return false;
         }
 
         $deployment->refresh();
 
-        return $this->cancelHangingQueueEntry($deployment);
+        return $this->cancelHangingQueueEntry($deployment, $expectedBinding);
     }
 
     /**
@@ -206,8 +430,13 @@ final class EmergencyRecoverApplicationDeployment
         return [$outcome, $result->message, $result->recoveryOwnerActive];
     }
 
-    private function cancelHangingQueueEntry(ApplicationDeploymentQueue $deployment): bool
-    {
+    /**
+     * @param  array{status: string, horizon_job_id: string|null, horizon_job_worker: string|null}|null  $expectedBinding
+     */
+    private function cancelHangingQueueEntry(
+        ApplicationDeploymentQueue $deployment,
+        ?array $expectedBinding = null,
+    ): bool {
         if (! in_array($deployment->status, [
             ApplicationDeploymentStatus::QUEUED->value,
             ApplicationDeploymentStatus::IN_PROGRESS->value,
@@ -216,21 +445,66 @@ final class EmergencyRecoverApplicationDeployment
         }
 
         try {
-            return (bool) CancelApplicationDeployment::run($deployment);
+            return (bool) CancelApplicationDeployment::run($deployment, $expectedBinding);
         } catch (Throwable) {
             return false;
         }
     }
 
-    /**
-     * A destination with no durable state left, or one whose remaining state is
-     * cleanly claimable, is exactly what an ordinary next push needs.
-     */
     private function isClaimable(ApplicationDeploymentQueue $deployment): bool
     {
         $state = $this->stateFor($deployment);
+        if ($state !== null && ! ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state)) {
+            return false;
+        }
 
-        return $state === null || ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state);
+        $application = Application::query()->find($deployment->application_id);
+        if ($application === null) {
+            return false;
+        }
+        if (! $application->settings->is_blue_green_deployment_enabled) {
+            return $state === null;
+        }
+
+        $destination = StandaloneDocker::query()
+            ->with('server')
+            ->find($deployment->destination_id);
+        if ($destination?->server === null
+            || (int) $application->destination_id !== (int) $destination->getKey()) {
+            return false;
+        }
+
+        try {
+            $expectedState = $state === null
+                ? null
+                : ResolveBlueGreenExpectedProxyState::run($application, $destination, $state);
+            $liveState = ReadBlueGreenManagedRouteMetadata::run(
+                $destination->server,
+                $application,
+                $destination,
+            );
+        } catch (Throwable) {
+            if ($state === null || ! ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state)) {
+                return false;
+            }
+
+            try {
+                $expectedState = ResolveBlueGreenExpectedProxyState::run($application, $destination, $state);
+                $liveState = RecoverCleanIdleBlueGreenContainerMutationJournal::run(
+                    $destination->server,
+                    $application,
+                    $destination,
+                    $state,
+                );
+            } catch (Throwable) {
+                return false;
+            }
+        }
+
+        return $expectedState === null
+            ? $liveState === null
+            : $liveState !== null
+                && hash_equals($expectedState->serialize(), $liveState->serialize());
     }
 
     private function stateFor(ApplicationDeploymentQueue $deployment): ?ApplicationBlueGreenDeployment
@@ -243,6 +517,27 @@ final class EmergencyRecoverApplicationDeployment
             ->where('application_id', $deployment->application_id)
             ->where('standalone_docker_id', $deployment->destination_id)
             ->first();
+    }
+
+    private function inactiveRetirementRecoveryExecutionIsReserved(
+        ?ApplicationBlueGreenDeployment $state,
+        string $ownerDeploymentUuid,
+        int $generation,
+    ): bool {
+        return $this->inactiveRetirementOwnerStillOwnsState($state, $ownerDeploymentUuid, $generation)
+            && $state->inactive_retirement_dispatch_reserved_until_at?->isFuture() === true;
+    }
+
+    private function inactiveRetirementOwnerStillOwnsState(
+        ?ApplicationBlueGreenDeployment $state,
+        string $ownerDeploymentUuid,
+        int $generation,
+    ): bool {
+        return $state?->phase === BlueGreenDeploymentPhase::IDLE
+            && $state->inactive_retirement_stopped_at === null
+            && $state->supersession_generation === $generation
+            && $state->inactive_retirement_owner_deployment_uuid === $ownerDeploymentUuid
+            && $state->inactive_retirement_supersession_generation === $generation;
     }
 
     /**

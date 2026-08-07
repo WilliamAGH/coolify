@@ -169,6 +169,14 @@ final readonly class BlueGreenReplicaSet
     /** @param non-empty-list<BlueGreenReplicaInspection> $inspections */
     public static function identityDigest(array $inspections): string
     {
+        usort($inspections, static fn (BlueGreenReplicaInspection $left, BlueGreenReplicaInspection $right): int => [
+            $left->replicaIndex,
+            $left->composeService,
+        ] <=> [
+            $right->replicaIndex,
+            $right->composeService,
+        ]);
+
         return hash('sha256', implode("\0", array_map(
             static fn (BlueGreenReplicaInspection $inspection): string => implode(':', [
                 $inspection->replicaIndex,

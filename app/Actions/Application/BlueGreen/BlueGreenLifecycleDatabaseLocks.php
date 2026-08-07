@@ -3,6 +3,7 @@
 namespace App\Actions\Application\BlueGreen;
 
 use App\Enums\ApplicationDeploymentStatus;
+use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeactivation;
@@ -205,6 +206,58 @@ final readonly class BlueGreenLifecycleDatabaseLocks
         });
     }
 
+    /**
+     * Keep terminal queue writes fenced only by a deactivation that still owns
+     * the exact queue snapshot. STOPPED and COMPLETED rows are durable history
+     * once they cannot cover that snapshot; every other phase, and every
+     * terminal row that SQL cannot prove valid, remains fail-closed.
+     */
+    private static function constrainNoFencingDeactivation(
+        Builder $query,
+        ApplicationDeploymentQueue $snapshot,
+        string $alias,
+    ): Builder {
+        return $query->whereNotExists(function ($deactivationQuery) use ($snapshot, $alias): void {
+            $operationId = "{$alias}.operation_id";
+            $nonHexOperationId = $operationId;
+            foreach (str_split('0123456789abcdef') as $hexCharacter) {
+                $nonHexOperationId = "replace({$nonHexOperationId}, '{$hexCharacter}', '')";
+            }
+
+            $deactivationQuery->selectRaw('1')
+                ->from("application_blue_green_deactivations as {$alias}")
+                ->where("{$alias}.application_id", (int) $snapshot->application_id)
+                ->where("{$alias}.standalone_docker_id", (int) $snapshot->destination_id)
+                ->where(function ($fencingDeactivation) use ($snapshot, $alias, $operationId, $nonHexOperationId): void {
+                    $fencingDeactivation
+                        ->whereNotIn("{$alias}.phase", [
+                            BlueGreenDeactivationPhase::COMPLETED->value,
+                            BlueGreenDeactivationPhase::STOPPED->value,
+                        ])
+                        ->orWhereNull("{$alias}.phase")
+                        ->orWhereNull($operationId)
+                        ->orWhereRaw("length({$operationId}) <> 64")
+                        ->orWhereRaw("lower({$operationId}) <> {$operationId}")
+                        ->orWhereRaw("{$nonHexOperationId} <> ''")
+                        ->orWhereNull("{$alias}.started_at")
+                        ->orWhereNull("{$alias}.queue_cutoff_id")
+                        ->orWhere("{$alias}.queue_cutoff_id", '<', 0)
+                        ->orWhereNull("{$alias}.supersession_generation")
+                        ->orWhere("{$alias}.supersession_generation", '<', 1)
+                        ->orWhereNull("{$alias}.completed_at");
+
+                    if ($snapshot->pull_request_id === 0) {
+                        $fencingDeactivation->orWhere(function ($coveredSnapshot) use ($snapshot, $alias): void {
+                            $coveredSnapshot->where("{$alias}.queue_cutoff_id", '>=', $snapshot->getKey());
+                            if ($snapshot->created_at !== null) {
+                                $coveredSnapshot->orWhere("{$alias}.started_at", '>', $snapshot->created_at);
+                            }
+                        });
+                    }
+                });
+        });
+    }
+
     public static function constrainTerminalQueueOwner(
         Builder $query,
         ApplicationDeploymentQueue $snapshot,
@@ -218,13 +271,8 @@ final readonly class BlueGreenLifecycleDatabaseLocks
                     ->from('applications as terminal_application')
                     ->where('terminal_application.id', (int) $snapshot->application_id)
                     ->whereNull('terminal_application.deleted_at');
-            })
-            ->whereNotExists(function ($deactivationQuery) use ($snapshot): void {
-                $deactivationQuery->selectRaw('1')
-                    ->from('application_blue_green_deactivations as terminal_deactivation')
-                    ->where('terminal_deactivation.application_id', (int) $snapshot->application_id)
-                    ->where('terminal_deactivation.standalone_docker_id', (int) $snapshot->destination_id);
             });
+        $query = self::constrainNoFencingDeactivation($query, $snapshot, 'terminal_deactivation');
         $query = $snapshot->destination_id === null
             ? $query->whereNull('destination_id')
             : $query->where('destination_id', $snapshot->destination_id);
@@ -290,13 +338,8 @@ final readonly class BlueGreenLifecycleDatabaseLocks
                                     ->where('orphaned_owner_state.pending_deployment_uuid', $snapshot->deployment_uuid);
                             });
                     });
-            })
-            ->whereNotExists(function ($deactivationQuery) use ($snapshot): void {
-                $deactivationQuery->selectRaw('1')
-                    ->from('application_blue_green_deactivations as orphaned_owner_deactivation')
-                    ->where('orphaned_owner_deactivation.application_id', (int) $snapshot->application_id)
-                    ->where('orphaned_owner_deactivation.standalone_docker_id', (int) $snapshot->destination_id);
             });
+        $query = self::constrainNoFencingDeactivation($query, $snapshot, 'orphaned_owner_deactivation');
         $query = $snapshot->destination_id === null
             ? $query->whereNull('destination_id')
             : $query->where('destination_id', $snapshot->destination_id);
