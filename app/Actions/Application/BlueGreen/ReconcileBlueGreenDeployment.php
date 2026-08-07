@@ -233,7 +233,10 @@ final class ReconcileBlueGreenDeployment
                     $replacementState = $operation->rollbackKey->replacementState;
                     if ($replacementState->activeColor !== $operation->claim->pendingColor
                         || $replacementState->activeDeploymentUuid !== $operation->claim->deploymentUuid
-                        || $replacementState->activeSetFenceIdentity() !== $operation->candidateFenceIdentity()
+                        || ! $this->matchesCandidateFenceIdentity(
+                            $operation,
+                            $replacementState->activeSetFenceIdentity(),
+                        )
                         || $replacementState->routingRevision !== $operation->claim->expectedRoutingRevision
                         || $replacementState->destinationTopologyDigest !== $operation->claim->operationTopologyDigest) {
                         throw new BlueGreenDeploymentTransitionException('The discovered routing mutation does not target the exact claimed candidate.');
@@ -748,7 +751,7 @@ final class ReconcileBlueGreenDeployment
         $claim = $operation->claim;
         if ($state->activeDeploymentUuid !== $claim->deploymentUuid
             || $state->activeColor !== $claim->pendingColor
-            || $state->activeSetFenceIdentity() !== $operation->candidateFenceIdentity()
+            || ! $this->matchesCandidateFenceIdentity($operation, $state->activeSetFenceIdentity())
             || $state->managedSha256 === null
             || $state->destinationFenceEpoch !== ($operation->currentDestinationState?->destinationFenceEpoch ?? 0) + 1
             || $state->routingRevision !== $claim->expectedRoutingRevision
@@ -768,46 +771,53 @@ final class ReconcileBlueGreenDeployment
         return $this->matchesDurableCandidateContainerSet($operation, $state);
     }
 
+    private function matchesCandidateFenceIdentity(
+        BlueGreenDeploymentRecoveryOperation $operation,
+        ?string $persistedIdentity,
+    ): bool {
+        $candidateIdentity = $operation->candidateFenceIdentity();
+        if (! is_string($persistedIdentity) || ! is_string($candidateIdentity)) {
+            return false;
+        }
+
+        $replicaSet = $this->claimReplicaSet($operation);
+        if ($replicaSet->usesScalarCompatibilityPath()) {
+            return hash_equals($persistedIdentity, $candidateIdentity);
+        }
+        $identity = $this->durableCandidateReplicaIdentity($operation);
+        if ($identity === null) {
+            return false;
+        }
+        $routedComposeService = $replicaSet->usesScalarReplicaNaming()
+            ? $operation->application->blueGreenComposeTopology()?->candidateServiceName($operation->claim->pendingColor)
+            : null;
+
+        try {
+            return $replicaSet->matchesPersistedFenceIdentity(
+                $candidateIdentity,
+                $identity['inspections'],
+                $routedComposeService,
+            ) && $replicaSet->matchesPersistedFenceIdentity(
+                $persistedIdentity,
+                $identity['inspections'],
+                $routedComposeService,
+            );
+        } catch (\InvalidArgumentException) {
+            return false;
+        }
+    }
+
     private function matchesDurableCandidateContainerSet(
         BlueGreenDeploymentRecoveryOperation $operation,
         BlueGreenProxyState $state,
     ): bool {
         $claim = $operation->claim;
-        $replicas = ApplicationBlueGreenReplica::query()
-            ->where('application_blue_green_deployment_id', $claim->stateId)
-            ->where('application_id', $claim->applicationId)
-            ->where('standalone_docker_id', $claim->standaloneDockerId)
-            ->where('deployment_uuid', $claim->deploymentUuid)
-            ->where('color', $claim->pendingColor->value)
-            ->where('routing_revision', $claim->expectedRoutingRevision)
-            ->orderBy('replica_index')
-            ->orderBy('compose_service')
-            ->get();
-
-        try {
-            $replicaSet = BlueGreenReplicaSet::fromReplicas($replicas, $claim->candidateComposeServices());
-            if ($replicaSet->count !== $claim->replicaCount) {
-                return false;
-            }
-            $durableInspections = $replicas->map(
-                static function (ApplicationBlueGreenReplica $replica): BlueGreenReplicaInspection {
-                    if (! is_string($replica->container_name) || ! is_string($replica->container_id)) {
-                        throw new \InvalidArgumentException('The candidate replica identity is not durably bound.');
-                    }
-
-                    return BlueGreenReplicaInspection::fromRuntime(
-                        replicaIndex: (int) $replica->replica_index,
-                        composeService: $replica->compose_service,
-                        containerName: $replica->container_name,
-                        dockerId: $replica->container_id,
-                        status: 'durable',
-                        health: 'durable',
-                    );
-                },
-            )->all();
-        } catch (\InvalidArgumentException) {
+        $identity = $this->durableCandidateReplicaIdentity($operation);
+        if ($identity === null) {
             return false;
         }
+        $replicaSet = $identity['replicaSet'];
+        $durableInspections = $identity['inspections'];
 
         $topology = $operation->application->blueGreenComposeTopology();
         try {
@@ -823,6 +833,12 @@ final class ReconcileBlueGreenDeployment
         }
         if ($activeReplicaSet !== null) {
             $representative = $activeReplicaSet->representative();
+            if ($state->activeContainerSet === null
+                && $state->activeReplicaSet === null
+                && $state->activeReplicaSetDigest === null) {
+                return $state->activeContainerName === $state->applicationUuid.'-'.$claim->pendingColor->value
+                    && $state->activeContainerId === $activeReplicaSet->releasedIdentityDigest();
+            }
 
             return $state->activeContainerSet === null
                 && $state->activeContainerName === $representative->name
@@ -865,6 +881,51 @@ final class ReconcileBlueGreenDeployment
         }
 
         return $expected !== [] && $state->activeContainerSet?->toArray() === $expected;
+    }
+
+    /**
+     * @return array{replicaSet: BlueGreenReplicaSet, inspections: non-empty-list<BlueGreenReplicaInspection>}|null
+     */
+    private function durableCandidateReplicaIdentity(BlueGreenDeploymentRecoveryOperation $operation): ?array
+    {
+        $claim = $operation->claim;
+        $replicas = ApplicationBlueGreenReplica::query()
+            ->where('application_blue_green_deployment_id', $claim->stateId)
+            ->where('application_id', $claim->applicationId)
+            ->where('standalone_docker_id', $claim->standaloneDockerId)
+            ->where('deployment_uuid', $claim->deploymentUuid)
+            ->where('color', $claim->pendingColor->value)
+            ->where('routing_revision', $claim->expectedRoutingRevision)
+            ->orderBy('replica_index')
+            ->orderBy('compose_service')
+            ->get();
+
+        try {
+            $replicaSet = BlueGreenReplicaSet::fromReplicas($replicas, $claim->candidateComposeServices());
+            if ($replicaSet->count !== $claim->replicaCount) {
+                return null;
+            }
+            $durableInspections = $replicas->map(
+                static function (ApplicationBlueGreenReplica $replica): BlueGreenReplicaInspection {
+                    if (! is_string($replica->container_name) || ! is_string($replica->container_id)) {
+                        throw new \InvalidArgumentException('The candidate replica identity is not durably bound.');
+                    }
+
+                    return BlueGreenReplicaInspection::fromRuntime(
+                        replicaIndex: (int) $replica->replica_index,
+                        composeService: $replica->compose_service,
+                        containerName: $replica->container_name,
+                        dockerId: $replica->container_id,
+                        status: 'durable',
+                        health: 'durable',
+                    );
+                },
+            )->all();
+        } catch (\InvalidArgumentException) {
+            return null;
+        }
+
+        return ['replicaSet' => $replicaSet, 'inspections' => $durableInspections];
     }
 
     /** @return list<BlueGreenReplicaInspection> */

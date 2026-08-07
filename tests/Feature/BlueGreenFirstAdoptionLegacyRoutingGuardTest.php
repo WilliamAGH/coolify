@@ -18,6 +18,8 @@ use App\Services\BlueGreenDeploymentLifecycle;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Process\FakeProcessResult;
 use Illuminate\Process\PendingProcess;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Notification;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Str;
@@ -443,22 +445,37 @@ it('refuses first blue-green adoption before any destination mutation when legac
         ->and(ResolveBlueGreenExpectedProxyState::hasDurableDestinationState($state))->toBeFalse();
 });
 
-it('names the refused precondition in a manual-only stale-journal result', function (): void {
+it('names the stable refusal reason code publicly and keeps the precondition detail in the internal log', function (): void {
+    $appLogPath = storage_path('logs/first-adoption-guard-app-'.Str::uuid().'.log');
+    config([
+        'logging.default' => 'single',
+        'logging.channels.single.path' => $appLogPath,
+    ]);
+    Log::forgetChannel('single');
     $scenario = firstAdoptionGuardRolledBackScenario();
     $successor = firstAdoptionGuardSuccessor($scenario);
     Process::fake();
 
-    $result = RecoverBlueGreenIntervention::run(
-        stateId: (int) $scenario->state->getKey(),
-        apply: false,
-        reason: 'Inspect the rolled-back first adoption residue.',
-        staleContainerJournal: true,
-        successorQueueId: (int) $successor->getKey(),
-        successorDeploymentUuid: (string) $successor->deployment_uuid,
-        successorHorizonJobId: (string) $successor->getRawOriginal('horizon_job_id'),
-    );
+    try {
+        $result = RecoverBlueGreenIntervention::run(
+            stateId: (int) $scenario->state->getKey(),
+            apply: false,
+            reason: 'Inspect the rolled-back first adoption residue.',
+            staleContainerJournal: true,
+            successorQueueId: (int) $successor->getKey(),
+            successorDeploymentUuid: (string) $successor->deployment_uuid,
+            successorHorizonJobId: (string) $successor->getRawOriginal('horizon_job_id'),
+        );
 
-    expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY)
-        ->and($result->message)->toContain('not an unrouted idle blue-green state');
-    Process::assertNothingRan();
+        expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY)
+            ->and($result->reasonCode)->toBe('state_changed')
+            ->and($result->correlationId)->toBeUuid()
+            ->and($result->message)->not->toContain('not an unrouted idle blue-green state');
+        $appLog = File::get($appLogPath);
+        expect($appLog)->toContain('not an unrouted idle blue-green state')
+            ->and($appLog)->toContain($result->correlationId);
+        Process::assertNothingRan();
+    } finally {
+        File::delete($appLogPath);
+    }
 });

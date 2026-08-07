@@ -571,6 +571,10 @@ final readonly class BlueGreenRoutingTarget
             throw new InvalidArgumentException('Compiling a managed blue/green route requires its durable destination fence identity.');
         }
 
+        $releasedFanOut = $this->mode !== BlueGreenRoutingMode::LegacyRecoveryBridge
+            ? $this->activeReplicaSet
+            : null;
+
         return new BlueGreenProxyState(
             managedFilename: $managedFilename,
             applicationUuid: $applicationUuid,
@@ -584,8 +588,8 @@ final readonly class BlueGreenRoutingTarget
             activeDeploymentUuid: $this->activeDeploymentUuid,
             activeContainerName: $this->mode === BlueGreenRoutingMode::LegacyRecoveryBridge
                 ? $this->legacyContainerName
-                : ($this->activeReplicaSet?->representative()->name ?? $this->containerName($this->activeColor)),
-            activeContainerId: $this->activeContainerId,
+                : $this->containerName($this->activeColor),
+            activeContainerId: $releasedFanOut?->releasedIdentityDigest() ?? $this->activeContainerId,
             applicationRoutingConfigDigest: $applicationRoutingConfigDigest,
             destinationTopologyDigest: $this->destinationTopologyDigest,
             // A destination that owns one container per colour keeps emitting
@@ -593,12 +597,6 @@ final readonly class BlueGreenRoutingTarget
             activeContainerSet: $this->mode === BlueGreenRoutingMode::LegacyRecoveryBridge
                 ? null
                 : $this->activeContainerSet,
-            activeReplicaSetDigest: $this->mode === BlueGreenRoutingMode::LegacyRecoveryBridge
-                ? null
-                : $this->activeReplicaSetDigest,
-            activeReplicaSet: $this->mode === BlueGreenRoutingMode::LegacyRecoveryBridge
-                ? null
-                : $this->activeReplicaSet,
         );
     }
 

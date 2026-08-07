@@ -5,13 +5,12 @@ use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentTransitionException;
 use App\Actions\Application\BlueGreen\BlueGreenManagedRouteMetadataForOperationResult;
 use App\Actions\Application\BlueGreen\BlueGreenReconciliationResult;
+use App\Actions\Application\BlueGreen\CaptureBlueGreenLegacyRouting;
 use App\Actions\Application\BlueGreen\ComputeBlueGreenDeploymentFingerprint;
 use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Actions\Application\BlueGreen\ReadBlueGreenManagedRouteMetadata;
 use App\Actions\Application\BlueGreen\ReadBlueGreenManagedRouteMetadataForOperation;
-use App\Actions\Application\BlueGreen\RebindBlueGreenLegacyRoutingSnapshot;
 use App\Actions\Application\BlueGreen\ReconcileBlueGreenDeployment;
-use App\Actions\Application\BlueGreen\VerifyBlueGreenLegacyProviderRecovery;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifact;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifactReader;
 use App\Actions\Proxy\BlueGreenProxyState;
@@ -79,6 +78,7 @@ function fakeOperationAwareManagedRouteRemote(
     ?string $archiveOutput = null,
     ?string $strictOutput = null,
     string $journalBootId = '11111111-2222-3333-4444-555555555555',
+    ?string $traefikRawData = null,
 ): void {
     $payloads = [];
     $pendingJournalPresent = $journalPresent;
@@ -92,9 +92,16 @@ function fakeOperationAwareManagedRouteRemote(
         $archiveOutput,
         $strictOutput,
         $journalBootId,
+        $traefikRawData,
     ) {
         $payload = (string) $process->command."\n".(string) $process->input;
         $payloads[] = $payload;
+        if ($traefikRawData !== null && str_contains($payload, '/api/rawdata')) {
+            return Process::result(output: $traefikRawData);
+        }
+        if ($traefikRawData !== null && str_contains($payload, 'curl --config -')) {
+            return Process::result(output: "HTTP/1.1 200 OK\r\n\r\n");
+        }
         if (str_contains($payload, 'operation_container_manifest_stage=')) {
             $archiveFilename = (new WriteBlueGreenProxyConfiguration)
                 ->committedContainerMutationJournalArchiveFilename(
@@ -332,10 +339,13 @@ function fakeOperationAwarePublicReconciliationActions(): void
     BlueGreenProxyRollbackArtifactReader::shouldRun()->andReturnUsing(
         fn ($server, $key) => new BlueGreenProxyRollbackArtifact($key, false, ''),
     );
-    RebindBlueGreenLegacyRoutingSnapshot::shouldRun()->andReturnUsing(
-        static fn ($server, $application, $destination, $expectation, $snapshot) => $snapshot,
+    // Only the docker-inspect boundary is faked: the real rebind proves the
+    // captured routing identity against the durable pre-stop snapshot, and the
+    // real provider verification runs against each test's faked Traefik
+    // rawdata and direct-origin probes.
+    CaptureBlueGreenLegacyRouting::shouldRun()->andReturnUsing(
+        static fn ($server, $application) => BlueGreenRecoveryScenario::legacyRoutingSnapshot($application),
     );
-    VerifyBlueGreenLegacyProviderRecovery::shouldRun()->andReturnNull();
 }
 
 /**
@@ -603,6 +613,9 @@ it('archives an operation-owned committed journal through public reconciliation 
         $replacement,
         str_repeat('e', 64),
         $payloads,
+        traefikRawData: BlueGreenRecoveryScenario::traefikRawDataFor(
+            BlueGreenRecoveryScenario::legacyRoutingSnapshot($scenario->application, $scenario->destination),
+        ),
     );
 
     $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);

@@ -94,6 +94,24 @@ final readonly class BlueGreenActiveReplicaSet
         ), JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES));
     }
 
+    /**
+     * Aggregate identity emitted by released v2/v3 writers before the canonical
+     * JSON replica-set digest existed. Keep the legacy bytes owned beside the
+     * canonical projection so readers and rollback-safe writers cannot drift.
+     */
+    public function releasedIdentityDigest(): string
+    {
+        return hash('sha256', implode("\0", array_map(
+            static fn (BlueGreenActiveReplica $member): string => implode(':', [
+                $member->replicaIndex,
+                $member->composeService,
+                $member->name,
+                $member->id,
+            ]),
+            $this->members,
+        )));
+    }
+
     /** @return non-empty-list<array{compose_service: string, replica_index: int, ports: list<int>, name: string, id: string}> */
     public function toArray(): array
     {

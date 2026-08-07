@@ -171,17 +171,7 @@ final readonly class BlueGreenReplicaSet
     /** @param non-empty-list<BlueGreenReplicaInspection> $inspections */
     public static function identityDigest(array $inspections): string
     {
-        $inspections = self::canonicalInspections($inspections);
-
-        return hash('sha256', implode("\0", array_map(
-            static fn (BlueGreenReplicaInspection $inspection): string => implode(':', [
-                $inspection->replicaIndex,
-                $inspection->composeService,
-                $inspection->containerName,
-                $inspection->dockerId,
-            ]),
-            $inspections,
-        )));
+        return self::activeReplicaSet($inspections)->releasedIdentityDigest();
     }
 
     /**
@@ -256,7 +246,13 @@ final readonly class BlueGreenReplicaSet
     /** @param non-empty-list<BlueGreenReplicaInspection> $inspections */
     private static function activeReplicaSetIdentityDigest(array $inspections): string
     {
-        $members = array_map(
+        return self::activeReplicaSet($inspections)->identityDigest();
+    }
+
+    /** @param non-empty-list<BlueGreenReplicaInspection> $inspections */
+    private static function activeReplicaSet(array $inspections): BlueGreenActiveReplicaSet
+    {
+        return BlueGreenActiveReplicaSet::fromMembers(array_map(
             static fn (BlueGreenReplicaInspection $inspection): BlueGreenActiveReplica => new BlueGreenActiveReplica(
                 composeService: $inspection->composeService,
                 replicaIndex: $inspection->replicaIndex,
@@ -265,9 +261,7 @@ final readonly class BlueGreenReplicaSet
                 id: $inspection->dockerId,
             ),
             self::canonicalInspections($inspections),
-        );
-
-        return BlueGreenActiveReplicaSet::fromMembers($members)->identityDigest();
+        ));
     }
 
     /** @param list<BlueGreenReplicaInspection> $inspections */

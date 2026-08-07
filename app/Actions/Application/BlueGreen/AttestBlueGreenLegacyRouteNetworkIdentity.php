@@ -31,6 +31,7 @@ final class AttestBlueGreenLegacyRouteNetworkIdentity
         BlueGreenProxyState $routeState,
         string $expectedServerBootId,
         BlueGreenOperationFence $operationFence,
+        ?BlueGreenProxyState $containerIdentityState = null,
     ): BlueGreenLegacyRouteNetworkAttestation {
         if (DB::getDriverName() === 'pgsql' && DB::transactionLevel() !== 0) {
             throw new BlueGreenDeploymentTransitionException(
@@ -45,7 +46,9 @@ final class AttestBlueGreenLegacyRouteNetworkIdentity
             || ! ValidationPatterns::isValidDockerNetwork($destination->network)) {
             throw new BlueGreenDeploymentTransitionException('The legacy route has no exact valid destination network identity.');
         }
-        $containers = $this->activeContainers($routeState);
+        $containerIdentityState ??= $routeState;
+        $this->assertSameManagedRoute($routeState, $containerIdentityState);
+        $containers = $this->activeContainers($containerIdentityState);
         $bootAssertion = (new ReadBlueGreenServerBootIdentity)->assertionCommandFor($expectedServerBootId);
         $script = ['set -eu', $bootAssertion];
         foreach ($containers as $container) {
@@ -129,6 +132,28 @@ final class AttestBlueGreenLegacyRouteNetworkIdentity
         if (! BlueGreenProxyState::matches($actual, $expected)) {
             throw new BlueGreenDeploymentTransitionException(
                 'The live managed route changed while its legacy network identity was being attested.',
+            );
+        }
+    }
+
+    private function assertSameManagedRoute(
+        BlueGreenProxyState $routeState,
+        BlueGreenProxyState $containerIdentityState,
+    ): void {
+        if ($routeState->managedFilename !== $containerIdentityState->managedFilename
+            || $routeState->applicationUuid !== $containerIdentityState->applicationUuid
+            || $routeState->destinationId !== $containerIdentityState->destinationId
+            || $routeState->operationId !== $containerIdentityState->operationId
+            || $routeState->mutationSequence !== $containerIdentityState->mutationSequence
+            || $routeState->destinationFenceEpoch !== $containerIdentityState->destinationFenceEpoch
+            || $routeState->routingRevision !== $containerIdentityState->routingRevision
+            || $routeState->managedSha256 !== $containerIdentityState->managedSha256
+            || $routeState->activeColor !== $containerIdentityState->activeColor
+            || $routeState->activeDeploymentUuid !== $containerIdentityState->activeDeploymentUuid
+            || $routeState->applicationRoutingConfigDigest !== $containerIdentityState->applicationRoutingConfigDigest
+            || $routeState->destinationTopologyDigest !== $containerIdentityState->destinationTopologyDigest) {
+            throw new BlueGreenDeploymentTransitionException(
+                'The legacy route container identities do not belong to the exact attested managed route.',
             );
         }
     }
