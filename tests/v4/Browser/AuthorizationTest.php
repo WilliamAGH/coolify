@@ -24,8 +24,7 @@ beforeEach(function () {
     ]);
 
     // Create SSH key for the root user's team
-    PrivateKey::create([
-        'id' => 1,
+    $key = PrivateKey::create([
         'uuid' => 'ssh-test',
         'team_id' => 0,
         'name' => 'Test Key',
@@ -47,7 +46,7 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
         'description' => 'Test docker container in development',
         'ip' => 'coolify-testing-host',
         'team_id' => 0,
-        'private_key_id' => 1,
+        'private_key_id' => $key->id,
         'proxy' => [
             'type' => ProxyTypes::TRAEFIK->value,
             'status' => ProxyStatus::EXITED->value,
@@ -60,7 +59,7 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
         'description' => 'Production web server',
         'ip' => '10.0.0.1',
         'team_id' => 0,
-        'private_key_id' => 1,
+        'private_key_id' => $key->id,
         'proxy' => [
             'type' => ProxyTypes::TRAEFIK->value,
             'status' => ProxyStatus::EXITED->value,

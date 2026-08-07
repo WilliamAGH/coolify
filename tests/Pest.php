@@ -5,6 +5,7 @@ use App\Models\InstanceSettings;
 use App\Models\Server;
 use Illuminate\Container\Container;
 use Illuminate\Support\Facades\Facade;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Once;
 use Mockery\Adapter\Phpunit\MockeryPHPUnitIntegration;
 use Tests\TestCase;
@@ -33,21 +34,29 @@ uses()
     })
     ->in('Feature', 'v4/Feature', 'v4/Browser');
 
+uses()
+    ->beforeEach(function (): void {
+        // Model events still persist SSH keys, but only inside this test's disk.
+        Storage::fake('ssh-keys');
+    })
+    ->in('Feature', 'v4/Feature', 'v4/Browser');
+
 /*
  * Unit tests run on plain PHPUnit\Framework\TestCase. Bind only the Mockery
  * teardown trait so Mockery::close() runs (and verifies expectations) after
  * every test instead of letting mock state leak across the whole process.
  *
- * The beforeEach hook resets leaked global container/facade state before every
- * plain unit test: an earlier test (including a TestCase-bound file whose torn
- * down application object lingers in the Facade root) can leave a partial
- * container behind, and facades resolved against it fail with
- * BindingResolutionException. TestCase-bound tests are skipped — Laravel's own
- * setUp/tearDown manages their application lifecycle.
+ * The beforeEach hook gives Laravel-bound unit tests an isolated SSH-key disk.
+ * For plain unit tests it instead resets leaked global container/facade state:
+ * an earlier test (including a TestCase-bound file whose torn-down application
+ * object lingers in the Facade root) can leave a partial container behind, and
+ * facades resolved against it fail with BindingResolutionException.
  */
 uses(MockeryPHPUnitIntegration::class)
     ->beforeEach(function (): void {
         if ($this instanceof TestCase) {
+            Storage::fake('ssh-keys');
+
             return;
         }
 

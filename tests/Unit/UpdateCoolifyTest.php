@@ -3,6 +3,7 @@
 use App\Actions\Server\UpdateCoolify;
 use App\Livewire\Settings\Updates;
 use App\Models\InstanceSettings;
+use App\Models\PrivateKey;
 use App\Models\Server;
 use App\Models\Team;
 use App\Models\User;
@@ -19,16 +20,21 @@ use Tests\TestCase;
 
 uses(TestCase::class, RefreshDatabase::class);
 
+beforeEach(function (): void {
+    Process::fake();
+});
+
 function updateCoolifyTestCreateRootServerAndSettings(array $settings = []): void
 {
     Team::factory()->create(['id' => 0]);
+    $key = PrivateKey::factory()->create(['team_id' => 0]);
     Server::forceCreate([
         'id' => 0,
         'name' => 'localhost',
         'ip' => '127.0.0.1',
         'user' => 'root',
         'team_id' => 0,
-        'private_key_id' => 1,
+        'private_key_id' => $key->id,
     ]);
     InstanceSettings::forceCreate(array_merge([
         'id' => 0,
@@ -65,6 +71,7 @@ it('does not contact upstream or run the generic updater for a fork release', fu
     (new UpdateCoolify)->handle();
 
     Http::assertNothingSent();
+    Process::assertDidntRun(fn () => true);
     expect(InstanceSettings::findOrFail(0)->new_version_available)->toBeFalse();
 });
 
@@ -80,6 +87,7 @@ it('directs manual fork updates to the guarded deployment workflow', function ()
         ->toThrow(RuntimeException::class, 'guarded fork deployment workflow');
 
     Http::assertNothingSent();
+    Process::assertDidntRun(fn () => true);
     expect(InstanceSettings::findOrFail(0)->new_version_available)->toBeFalse();
 });
 

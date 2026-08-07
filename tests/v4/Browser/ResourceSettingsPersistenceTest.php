@@ -32,8 +32,7 @@ beforeEach(function () {
         'discord_webhook_url' => 'https://discord.com/test',
     ]);
 
-    PrivateKey::create([
-        'id' => 1,
+    $key = PrivateKey::create([
         'uuid' => 'ssh-test',
         'team_id' => 0,
         'name' => 'Test Key',
@@ -54,7 +53,7 @@ uZx9iFkCELtxrh31QJ68AAAAEXNhaWxANzZmZjY2ZDJlMmRkAQIDBA==
         'description' => 'Test docker container in development',
         'ip' => 'coolify-testing-host',
         'team_id' => 0,
-        'private_key_id' => 1,
+        'private_key_id' => $key->id,
         'proxy' => [
             'type' => ProxyTypes::TRAEFIK->value,
             'status' => ProxyStatus::EXITED->value,
