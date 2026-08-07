@@ -16,6 +16,7 @@ use App\Actions\Application\BlueGreen\MigrateBlueGreenReleasedV3ProxyState;
 use App\Actions\Application\BlueGreen\PlanBlueGreenPublicRecovery;
 use App\Actions\Application\BlueGreen\PlanBlueGreenSteadyState;
 use App\Actions\Application\BlueGreen\ReconstructBlueGreenDeploymentRecovery;
+use App\Actions\Application\BlueGreen\RehydrateBlueGreenDestinationRoutingTopologyDigest;
 use App\Actions\Application\BlueGreen\RepairBlueGreenSteadyState;
 use App\Actions\Application\BlueGreen\ResolveBlueGreenExpectedProxyState;
 use App\Actions\Proxy\BlueGreenProxyConfiguration;
@@ -280,7 +281,7 @@ function releasedV3StateFixture(): array
     $deployment = $deployment->fresh();
     $canonical = $resolver->handle($application, $destination, $state)
         ?? throw new RuntimeException('The released-v3 fixture has no canonical state.');
-    $released = $resolver->releasedV3State($application, $destination, $state)
+    $released = $resolver->releasedV3State($application, $destination, $state, $canonical)
         ?? throw new RuntimeException('The released-v3 fixture has no released projection.');
     $configuration = CompileBlueGreenProxyConfiguration::run(
         $application,
@@ -463,7 +464,7 @@ function releasedV2FanOutStateFixture(): array
     $deployment = $deployment->fresh();
     $canonical = $resolver->handle($application, $destination, $state)
         ?? throw new RuntimeException('The released-v2 fixture has no canonical projection.');
-    $released = $resolver->releasedV2FanOutState($application, $destination, $state)
+    $released = $resolver->releasedV2FanOutState($application, $destination, $state, $canonical)
         ?? throw new RuntimeException('The released-v2 fixture has no released projection.');
     $configuration = CompileBlueGreenProxyConfiguration::run(
         $application,
@@ -475,8 +476,8 @@ function releasedV2FanOutStateFixture(): array
             $canonical,
         ),
     );
-    if (! BlueGreenProxyState::matches($configuration->state, $canonical)) {
-        throw new RuntimeException('The released-v2 fixture canonical state does not compile exactly.');
+    if (! BlueGreenProxyState::matches($configuration->state, $released)) {
+        throw new RuntimeException('The released-v2 fixture rollback-readable state does not compile exactly.');
     }
 
     return compact('application', 'server', 'destination', 'state', 'deployment', 'configuration', 'canonical', 'released') + [
@@ -512,6 +513,17 @@ it('reconstructs exact released v2 fan-out bytes and canonical v4 identity from 
     ))->toThrow(BlueGreenDeploymentTransitionException::class);
 });
 
+it('keeps managed-route writes rollback-readable while retaining canonical v4 internally', function (): void {
+    $fanOut = releasedV2FanOutStateFixture();
+    $coRolled = releasedV3StateFixture();
+
+    expect($fanOut['canonical']->toArray()['magic'])->toBe(BlueGreenProxyState::MAGIC_REPLICA_SET)
+        ->and($fanOut['configuration']->state->toArray()['magic'])->toBe(BlueGreenProxyState::MAGIC)
+        ->and($fanOut['configuration']->state->serialize())->toBe($fanOut['released']->serialize())
+        ->and($coRolled['configuration']->state->toArray()['magic'])->toBe(BlueGreenProxyState::MAGIC_SET)
+        ->and($coRolled['configuration']->state->serialize())->not->toContain(BlueGreenProxyState::MAGIC_REPLICA_SET);
+});
+
 it('discovers only exact released v2 fan-out host bytes during destination attestation', function (): void {
     $fixture = releasedV2FanOutStateFixture();
     $attemptedScripts = [];
@@ -538,32 +550,24 @@ it('discovers only exact released v2 fan-out host bytes during destination attes
         ->and($attemptedScripts[1])->toContain(base64_encode($fixture['released']->serialize()));
 });
 
-it('migrates released v2 fan-out bytes to canonical v4 with exact live labels and idempotent replay', function (): void {
+it('attests released v2 fan-out bytes without rewriting the sidecar and returns the exact released state', function (): void {
     $fixture = releasedV2FanOutStateFixture();
     $bootId = '11111111-2222-3333-4444-555555555555';
-    $metadataReads = 0;
     $invocations = [];
-    Process::fake(function (PendingProcess $process) use ($bootId, $fixture, &$metadataReads, &$invocations) {
+    Process::fake(function (PendingProcess $process) use ($bootId, $fixture, &$invocations) {
         $command = is_array($process->command) ? implode(' ', $process->command) : (string) $process->command;
         $input = is_string($process->input) ? $process->input : '';
         $invocation = $command."\n".$input;
         $invocations[] = $invocation;
 
         return match (true) {
-            str_contains($invocation, 'coolify-blue-green-managed-route:present:') => (function () use ($fixture, &$metadataReads) {
-                $state = $metadataReads++ === 0 ? $fixture['released'] : $fixture['canonical'];
-
-                return Process::result(
-                    output: 'coolify-blue-green-managed-route:present:'
-                        .base64_encode($state->serialize())
-                        ."\n".$state->managedSha256,
-                );
-            })(),
-            str_contains($invocation, WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT) => Process::result(
-                output: WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT,
+            str_contains($invocation, 'coolify-blue-green-managed-route:present:') => Process::result(
+                output: 'coolify-blue-green-managed-route:present:'
+                    .base64_encode($fixture['released']->serialize())
+                    ."\n".$fixture['released']->managedSha256,
             ),
             str_contains($invocation, '/proc/sys/kernel/random/boot_id') => Process::result(output: $bootId),
-            default => throw new RuntimeException('Unexpected released-v2 fan-out migration command.'),
+            default => throw new RuntimeException('Unexpected released-v2 fan-out attestation command.'),
         };
     });
     $lock = Cache::lock(
@@ -593,28 +597,48 @@ it('migrates released v2 fan-out bytes to canonical v4 with exact live labels an
     } finally {
         $fence->releaseIfOwned();
     }
-    $migrationScripts = array_values(array_filter(
-        $invocations,
-        static fn (string $invocation): bool => str_contains(
-            $invocation,
-            WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT,
-        ),
-    ));
 
-    expect($first?->serialize())->toBe($fixture['canonical']->serialize())
-        ->and($second?->serialize())->toBe($fixture['canonical']->serialize())
-        ->and($migrationScripts)->toHaveCount(2)
-        ->and($migrationScripts[0])->toContain(
-            base64_encode($fixture['released']->serialize()),
-            base64_encode($fixture['canonical']->serialize()),
-            'coolify.blueGreen.replicaIndex',
-            'coolify.blueGreen.replicaCount',
-            $fixture['first_id'],
-            $fixture['second_id'],
-        );
+    expect($first?->serialize())->toBe($fixture['released']->serialize())
+        ->and($second?->serialize())->toBe($fixture['released']->serialize())
+        ->and(collect($invocations)->contains(
+            static fn (string $invocation): bool => str_contains($invocation, WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT),
+        ))->toBeFalse()
+        ->and(collect($invocations)->contains(
+            static fn (string $invocation): bool => str_contains($invocation, base64_encode($fixture['canonical']->serialize())),
+        ))->toBeFalse();
 });
 
-it('converges an exact released v2 fan-out sidecar before steady-state verification', function (): void {
+it('derives the released fan-out projection from one immutable canonical resolution', function (): void {
+    $fixture = releasedV2FanOutStateFixture();
+    ApplicationDeploymentQueue::query()->delete();
+    $resolver = new ResolveBlueGreenExpectedProxyState;
+
+    expect(fn () => $resolver->handle($fixture['application'], $fixture['destination'], $fixture['state']))
+        ->toThrow(BlueGreenDeploymentTransitionException::class);
+    expect($resolver->releasedV2FanOutState(
+        $fixture['application'],
+        $fixture['destination'],
+        $fixture['state'],
+        $fixture['canonical'],
+    )?->serialize())->toBe($fixture['released']->serialize());
+});
+
+it('derives the released v3 projection from one immutable canonical resolution', function (): void {
+    $fixture = releasedV3StateFixture();
+    ApplicationBlueGreenReplica::query()->delete();
+    $resolver = new ResolveBlueGreenExpectedProxyState;
+
+    expect(fn () => $resolver->handle($fixture['application'], $fixture['destination'], $fixture['state']))
+        ->toThrow(BlueGreenDeploymentTransitionException::class);
+    expect($resolver->releasedV3State(
+        $fixture['application'],
+        $fixture['destination'],
+        $fixture['state'],
+        $fixture['canonical'],
+    )?->serialize())->toBe($fixture['released']->serialize());
+});
+
+it('repairs a released v2 fan-out destination against the exact released sidecar bytes', function (): void {
     $fixture = releasedV2FanOutStateFixture();
     $bootId = '11111111-2222-3333-4444-555555555555';
     $releaseProof = BlueGreenRoutingTarget::durableReleaseProofToken(
@@ -659,9 +683,6 @@ it('converges an exact released v2 fan-out sidecar before steady-state verificat
                     .base64_encode($fixture['released']->serialize())
                     ."\n".$fixture['released']->managedSha256,
             ),
-            str_contains($invocation, WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT) => Process::result(
-                output: WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT,
-            ),
             str_contains($invocation, 'repair_outcome=') => Process::result(
                 output: WriteBlueGreenProxyConfiguration::REPAIR_HEALTHY_OUTPUT,
             ),
@@ -679,20 +700,109 @@ it('converges an exact released v2 fan-out sidecar before steady-state verificat
     });
 
     $result = RepairBlueGreenSteadyState::run($fixture['state']);
-    $migrationIndex = collect($invocations)->search(
-        static fn (string $invocation): bool => str_contains(
-            $invocation,
-            WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT,
-        ),
-    );
     $repairIndex = collect($invocations)->search(
         static fn (string $invocation): bool => str_contains($invocation, 'repair_outcome='),
     );
 
     expect($result->outcome)->toBe(BlueGreenSteadyStateRepairResult::HEALTHY, $result->message)
-        ->and($migrationIndex)->toBeInt()
         ->and($repairIndex)->toBeInt()
-        ->and($migrationIndex)->toBeLessThan($repairIndex);
+        ->and($invocations[$repairIndex])->toContain(base64_encode($fixture['released']->serialize()))
+        ->and(collect($invocations)->contains(
+            static fn (string $invocation): bool => str_contains($invocation, WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT),
+        ))->toBeFalse()
+        ->and(collect($invocations)->contains(
+            static fn (string $invocation): bool => str_contains($invocation, base64_encode($fixture['canonical']->serialize())),
+        ))->toBeFalse();
+});
+
+it('rehydrates a released v2 fan-out routing-topology digest without touching sidecar bytes', function (): void {
+    $fixture = releasedV2FanOutStateFixture();
+    $fixture['state']->update(['destination_routing_topology_digest' => null]);
+    $state = $fixture['state']->fresh();
+    $bootId = '11111111-2222-3333-4444-555555555555';
+    $releaseProof = BlueGreenRoutingTarget::durableReleaseProofToken(
+        $fixture['deployment']->deployment_uuid,
+    );
+    $publicAcknowledgement = (new PlanBlueGreenPublicRecovery)->publicAcknowledgementForYaml(
+        $fixture['configuration']->yaml,
+    );
+    InspectBlueGreenContainer::shouldRun()
+        ->times(2)
+        ->andReturnUsing(static function (Server $_server, $expectation): BlueGreenContainerInspection {
+            return new BlueGreenContainerInspection(
+                exists: true,
+                dockerId: $expectation->dockerId,
+                status: 'running',
+                health: 'healthy',
+            );
+        });
+    $networkProof = collect($fixture['canonical']->activeContainerIdentities())
+        ->map(static fn (array $identity): string => 'coolify-blue-green-route-network-proof:'
+            .$identity['id']."\t".json_encode([$fixture['destination']->network => []], JSON_THROW_ON_ERROR))
+        ->implode("\n");
+    $invocations = [];
+    Process::fake(function (PendingProcess $process) use (
+        $bootId,
+        $fixture,
+        $networkProof,
+        $publicAcknowledgement,
+        $releaseProof,
+        &$invocations,
+    ) {
+        $command = is_array($process->command) ? implode(' ', $process->command) : (string) $process->command;
+        $input = is_string($process->input) ? $process->input : '';
+        $invocation = $command."\n".$input;
+        $invocations[] = $invocation;
+
+        return match (true) {
+            str_contains($invocation, '__coolify_blue_green_probe') => Process::result(
+                output: "HTTP/1.1 200 OK\r\n"
+                    .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER
+                    .": {$publicAcknowledgement}\r\n"
+                    .BlueGreenRoutingTarget::RELEASE_PROOF_HEADER
+                    .": {$releaseProof}\r\n\r\n",
+            ),
+            str_contains($invocation, 'coolify-blue-green-route-network-proof:') => Process::result(output: $networkProof),
+            str_contains($invocation, 'coolify-blue-green-managed-route:present:') => Process::result(
+                output: 'coolify-blue-green-managed-route:present:'
+                    .base64_encode($fixture['released']->serialize())
+                    ."\n".$fixture['released']->managedSha256,
+            ),
+            str_contains($invocation, 'repair_outcome=') => Process::result(
+                output: WriteBlueGreenProxyConfiguration::REPAIR_HEALTHY_OUTPUT,
+            ),
+            str_contains($invocation, 'coolify-blue-green-destination-state-attested') => Process::result(
+                output: 'coolify-blue-green-destination-state-attested',
+            ),
+            str_contains($invocation, '{{json .Config.Env}}') => Process::result(
+                output: json_encode([
+                    'COOLIFY_DEPLOYMENT_RELEASE_PROOF='.$releaseProof,
+                ], JSON_THROW_ON_ERROR),
+            ),
+            str_contains($invocation, '/proc/sys/kernel/random/boot_id') => Process::result(output: $bootId),
+            default => throw new RuntimeException('Unexpected released-v2 rehydrating steady-repair command.'),
+        };
+    });
+
+    $rehydrated = RehydrateBlueGreenDestinationRoutingTopologyDigest::run($state);
+    $expectedDigest = (new ComputeBlueGreenDeploymentFingerprint)->routingTopologyDigestFor(
+        $fixture['application']->fresh(['settings']),
+        $fixture['destination'],
+    );
+    $networkProofInvocation = collect($invocations)->first(
+        static fn (string $invocation): bool => str_contains($invocation, 'coolify-blue-green-route-network-proof:'),
+    );
+
+    expect($rehydrated->destination_routing_topology_digest)->toBe($expectedDigest)
+        ->and($fixture['state']->fresh()->destination_routing_topology_digest)->toBe($expectedDigest)
+        ->and($networkProofInvocation)->toBeString()
+        ->and($networkProofInvocation)->toContain($fixture['first_id'], $fixture['second_id'])
+        ->and(collect($invocations)->contains(
+            static fn (string $invocation): bool => str_contains($invocation, WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT),
+        ))->toBeFalse()
+        ->and(collect($invocations)->contains(
+            static fn (string $invocation): bool => str_contains($invocation, base64_encode($fixture['canonical']->serialize())),
+        ))->toBeFalse();
 });
 
 it('reconstructs only the exact released v3 aggregate scalar and routed member from the durable ledger', function (): void {
@@ -767,7 +877,7 @@ it('discovers exact released v3 host bytes before the lifecycle lock without wea
     ))->toThrow(RuntimeException::class);
 });
 
-it('migrates the ledger-proven released v3 state only while holding the destination lifecycle fence', function (): void {
+it('attests the ledger-proven released v3 state without rewriting sidecar bytes while holding the lifecycle fence', function (): void {
     $fixture = releasedV3StateFixture();
     $bootId = '11111111-2222-3333-4444-555555555555';
     $invocations = [];
@@ -783,11 +893,8 @@ it('migrates the ledger-proven released v3 state only while holding the destinat
                     .base64_encode($fixture['released']->serialize())
                     ."\n".$fixture['released']->managedSha256,
             ),
-            str_contains($invocation, WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT) => Process::result(
-                output: WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT,
-            ),
             str_contains($invocation, '/proc/sys/kernel/random/boot_id') => Process::result(output: $bootId),
-            default => throw new RuntimeException('Unexpected released-v3 migration command.'),
+            default => throw new RuntimeException('Unexpected released-v3 attestation command.'),
         };
     });
     $lock = Cache::lock(
@@ -798,7 +905,7 @@ it('migrates the ledger-proven released v3 state only while holding the destinat
     $fence = new BlueGreenOperationFence($lock, 300);
 
     try {
-        $migrated = MigrateBlueGreenReleasedV3ProxyState::run(
+        $attested = MigrateBlueGreenReleasedV3ProxyState::run(
             $fixture['server'],
             $fixture['application'],
             $fixture['destination'],
@@ -810,22 +917,18 @@ it('migrates the ledger-proven released v3 state only while holding the destinat
         $fence->releaseIfOwned();
     }
 
-    expect($migrated?->serialize())->toBe($fixture['canonical']->serialize())
-        ->and($invocations)->toHaveCount(3)
+    expect($attested?->serialize())->toBe($fixture['released']->serialize())
+        ->and($invocations)->toHaveCount(2)
         ->and($invocations[1])->toContain('coolify-blue-green-managed-route:present:')
-        ->and($invocations[2])->toContain(
-            base64_encode($fixture['released']->serialize()),
-            base64_encode($fixture['canonical']->serialize()),
-            'aaa_sidecar-blue',
-            'web-blue',
-            'worker-blue',
-            $fixture['alphabetical_sibling_id'],
-            $fixture['routed_id'],
-            $fixture['secondary_id'],
-        );
+        ->and(collect($invocations)->contains(
+            static fn (string $invocation): bool => str_contains($invocation, WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT),
+        ))->toBeFalse()
+        ->and(collect($invocations)->contains(
+            static fn (string $invocation): bool => str_contains($invocation, base64_encode($fixture['canonical']->serialize())),
+        ))->toBeFalse();
 });
 
-it('re-attests every durable replica before accepting an already canonical released v3 sidecar', function (): void {
+it('returns an already canonical released v3 destination only after live sidecar attestation', function (): void {
     $fixture = releasedV3StateFixture();
     $bootId = '11111111-2222-3333-4444-555555555555';
     $invocations = [];
@@ -841,11 +944,8 @@ it('re-attests every durable replica before accepting an already canonical relea
                     .base64_encode($fixture['canonical']->serialize())
                     ."\n".$fixture['canonical']->managedSha256,
             ),
-            str_contains($invocation, WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT) => Process::result(
-                output: WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT,
-            ),
             str_contains($invocation, '/proc/sys/kernel/random/boot_id') => Process::result(output: $bootId),
-            default => throw new RuntimeException('Unexpected canonical released-v3 migration command.'),
+            default => throw new RuntimeException('Unexpected canonical released-v3 attestation command.'),
         };
     });
     $lock = Cache::lock(
@@ -856,7 +956,7 @@ it('re-attests every durable replica before accepting an already canonical relea
     $fence = new BlueGreenOperationFence($lock, 300);
 
     try {
-        $migrated = MigrateBlueGreenReleasedV3ProxyState::run(
+        $attested = MigrateBlueGreenReleasedV3ProxyState::run(
             $fixture['server'],
             $fixture['application'],
             $fixture['destination'],
@@ -868,20 +968,142 @@ it('re-attests every durable replica before accepting an already canonical relea
         $fence->releaseIfOwned();
     }
 
-    expect($migrated?->serialize())->toBe($fixture['canonical']->serialize())
-        ->and($invocations)->toHaveCount(3)
-        ->and($invocations[2])->toContain(
-            WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT,
-            'aaa_sidecar-blue',
-            'web-blue',
-            'worker-blue',
-            $fixture['alphabetical_sibling_id'],
-            $fixture['routed_id'],
-            $fixture['secondary_id'],
-        );
+    expect($attested?->serialize())->toBe($fixture['canonical']->serialize())
+        ->and(collect($invocations)->contains(
+            static fn (string $invocation): bool => str_contains($invocation, 'coolify-blue-green-managed-route:present:'),
+        ))->toBeTrue()
+        ->and(collect($invocations)->contains(
+            static fn (string $invocation): bool => str_contains($invocation, WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT),
+        ))->toBeFalse();
 });
 
-it('converges an exact released v3 sidecar before steady-state managed-route and public verification', function (): void {
+it('refuses an already-canonical verdict when the live sidecar is neither released nor canonical', function (): void {
+    $fixture = releasedV3StateFixture();
+    $bootId = '11111111-2222-3333-4444-555555555555';
+    $foreign = $fixture['canonical']->withDestinationFenceEpoch(
+        $fixture['canonical']->destinationFenceEpoch + 1,
+    );
+    Process::fake(function (PendingProcess $process) use ($bootId, $foreign) {
+        $command = is_array($process->command) ? implode(' ', $process->command) : (string) $process->command;
+        $input = is_string($process->input) ? $process->input : '';
+        $invocation = $command."\n".$input;
+
+        return match (true) {
+            str_contains($invocation, 'coolify-blue-green-managed-route:present:') => Process::result(
+                output: 'coolify-blue-green-managed-route:present:'
+                    .base64_encode($foreign->serialize())
+                    ."\n".$foreign->managedSha256,
+            ),
+            str_contains($invocation, '/proc/sys/kernel/random/boot_id') => Process::result(output: $bootId),
+            default => throw new RuntimeException('Unexpected foreign released-v3 attestation command.'),
+        };
+    });
+    $lock = Cache::lock(
+        BlueGreenDeploymentLock::key($fixture['application']->id, $fixture['destination']->id),
+        300,
+    );
+    expect($lock->get())->toBeTrue();
+    $fence = new BlueGreenOperationFence($lock, 300);
+
+    try {
+        expect(fn () => MigrateBlueGreenReleasedV3ProxyState::run(
+            $fixture['server'],
+            $fixture['application'],
+            $fixture['destination'],
+            $fixture['state'],
+            $bootId,
+            $fence,
+        ))->toThrow(BlueGreenDeploymentTransitionException::class);
+    } finally {
+        $fence->releaseIfOwned();
+    }
+});
+
+it('rehydrates a released v3 null routing-topology digest directly while leaving the sidecar byte-identical', function (): void {
+    $fixture = releasedV3StateFixture();
+    $fixture['state']->update(['destination_routing_topology_digest' => null]);
+    $state = $fixture['state']->fresh();
+    $bootId = '11111111-2222-3333-4444-555555555555';
+    $releaseProof = BlueGreenRoutingTarget::durableReleaseProofToken(
+        $fixture['deployment']->deployment_uuid,
+    );
+    $publicAcknowledgement = (new PlanBlueGreenPublicRecovery)->publicAcknowledgementForYaml(
+        $fixture['configuration']->yaml,
+    );
+    InspectBlueGreenContainer::shouldRun()
+        ->times(2)
+        ->andReturnUsing(static function (Server $_server, $expectation): BlueGreenContainerInspection {
+            return new BlueGreenContainerInspection(
+                exists: true,
+                dockerId: $expectation->dockerId,
+                status: 'running',
+                health: 'healthy',
+            );
+        });
+    $networkProof = collect($fixture['canonical']->activeContainerIdentities())
+        ->map(static fn (array $identity): string => 'coolify-blue-green-route-network-proof:'
+            .$identity['id']."\t".json_encode([$fixture['destination']->network => []], JSON_THROW_ON_ERROR))
+        ->implode("\n");
+    $invocations = [];
+    Process::fake(function (PendingProcess $process) use (
+        $bootId,
+        $fixture,
+        $networkProof,
+        $publicAcknowledgement,
+        $releaseProof,
+        &$invocations,
+    ) {
+        $command = is_array($process->command) ? implode(' ', $process->command) : (string) $process->command;
+        $input = is_string($process->input) ? $process->input : '';
+        $invocation = $command."\n".$input;
+        $invocations[] = $invocation;
+
+        return match (true) {
+            str_contains($invocation, '__coolify_blue_green_probe') => Process::result(
+                output: "HTTP/1.1 200 OK\r\n"
+                    .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER
+                    .": {$publicAcknowledgement}\r\n"
+                    .BlueGreenRoutingTarget::RELEASE_PROOF_HEADER
+                    .": {$releaseProof}\r\n\r\n",
+            ),
+            str_contains($invocation, 'coolify-blue-green-route-network-proof:') => Process::result(output: $networkProof),
+            str_contains($invocation, 'coolify-blue-green-managed-route:present:') => Process::result(
+                output: 'coolify-blue-green-managed-route:present:'
+                    .base64_encode($fixture['released']->serialize())
+                    ."\n".$fixture['released']->managedSha256,
+            ),
+            str_contains($invocation, '{{json .Config.Env}}') => Process::result(
+                output: json_encode([
+                    'COOLIFY_DEPLOYMENT_RELEASE_PROOF='.$releaseProof,
+                ], JSON_THROW_ON_ERROR),
+            ),
+            str_contains($invocation, '/proc/sys/kernel/random/boot_id') => Process::result(output: $bootId),
+            default => throw new RuntimeException('Unexpected released-v3 rehydration command.'),
+        };
+    });
+
+    $rehydrated = RehydrateBlueGreenDestinationRoutingTopologyDigest::run($state);
+    $expectedDigest = (new ComputeBlueGreenDeploymentFingerprint)->routingTopologyDigestFor(
+        $fixture['application']->fresh(['settings']),
+        $fixture['destination'],
+    );
+    $networkProofInvocation = collect($invocations)->first(
+        static fn (string $invocation): bool => str_contains($invocation, 'coolify-blue-green-route-network-proof:'),
+    );
+
+    expect($rehydrated->destination_routing_topology_digest)->toBe($expectedDigest)
+        ->and($fixture['state']->fresh()->destination_routing_topology_digest)->toBe($expectedDigest)
+        ->and($networkProofInvocation)->toBeString()
+        ->and($networkProofInvocation)->toContain($fixture['routed_id'], $fixture['secondary_id'])
+        ->and(collect($invocations)->contains(
+            static fn (string $invocation): bool => str_contains($invocation, WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT),
+        ))->toBeFalse()
+        ->and(collect($invocations)->contains(
+            static fn (string $invocation): bool => str_contains($invocation, base64_encode($fixture['canonical']->serialize())),
+        ))->toBeFalse();
+});
+
+it('repairs a released v3 destination without serializing v4 before public verification', function (): void {
     $fixture = releasedV3StateFixture();
     $bootId = '11111111-2222-3333-4444-555555555555';
     $releaseProof = BlueGreenRoutingTarget::durableReleaseProofToken(
@@ -926,9 +1148,6 @@ it('converges an exact released v3 sidecar before steady-state managed-route and
                     .base64_encode($fixture['released']->serialize())
                     ."\n".$fixture['released']->managedSha256,
             ),
-            str_contains($invocation, WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT) => Process::result(
-                output: WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT,
-            ),
             str_contains($invocation, 'repair_outcome=') => Process::result(
                 output: WriteBlueGreenProxyConfiguration::REPAIR_HEALTHY_OUTPUT,
             ),
@@ -946,23 +1165,18 @@ it('converges an exact released v3 sidecar before steady-state managed-route and
     });
 
     $result = RepairBlueGreenSteadyState::run($fixture['state']);
-    $migrationIndex = collect($invocations)->search(
-        static fn (string $invocation): bool => str_contains(
-            $invocation,
-            WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT,
-        ),
-    );
     $repairIndex = collect($invocations)->search(
         static fn (string $invocation): bool => str_contains($invocation, 'repair_outcome='),
     );
 
     expect($result->outcome)->toBe(BlueGreenSteadyStateRepairResult::HEALTHY, $result->message)
-        ->and($migrationIndex)->toBeInt()
         ->and($repairIndex)->toBeInt()
-        ->and($migrationIndex)->toBeLessThan($repairIndex);
+        ->and(collect($invocations)->contains(
+            static fn (string $invocation): bool => str_contains($invocation, WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT),
+        ))->toBeFalse();
 });
 
-it('migrates before claim snapshots so a crash before routing mutation reconstructs a canonical rollback CAS', function (): void {
+it('claims a released destination without rewriting sidecar bytes and reconstructs a consistent rollback CAS', function (): void {
     $fixture = releasedV3StateFixture();
     $bootId = '11111111-2222-3333-4444-555555555555';
     $candidate = ApplicationDeploymentQueue::query()->create([
@@ -1019,12 +1233,10 @@ it('migrates before claim snapshots so a crash before routing mutation reconstru
         $lifecycle,
         $fixture['routed_id'],
     );
-    $migrationObservedBeforeClaim = false;
     $invocations = [];
     Process::fake(function (PendingProcess $process) use (
         $bootId,
         $fixture,
-        &$migrationObservedBeforeClaim,
         &$invocations,
     ) {
         $command = is_array($process->command) ? implode(' ', $process->command) : (string) $process->command;
@@ -1038,19 +1250,6 @@ it('migrates before claim snapshots so a crash before routing mutation reconstru
                     .base64_encode($fixture['released']->serialize())
                     ."\n".$fixture['released']->managedSha256,
             ),
-            str_contains($invocation, WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT) => (function () use (
-                $fixture,
-                &$migrationObservedBeforeClaim,
-            ) {
-                $stateAtMigration = ApplicationBlueGreenDeployment::query()->findOrFail($fixture['state']->id);
-                $migrationObservedBeforeClaim = $stateAtMigration->phase === BlueGreenDeploymentPhase::IDLE
-                    && $stateAtMigration->operation_deployment_uuid === null
-                    && $stateAtMigration->operation_previous_proxy_state === null;
-
-                return Process::result(
-                    output: WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT,
-                );
-            })(),
             str_contains($invocation, '/proc/sys/kernel/random/boot_id') => Process::result(output: $bootId),
             default => throw new RuntimeException('Unexpected released-v3 claim command.'),
         };
@@ -1065,15 +1264,14 @@ it('migrates before claim snapshots so a crash before routing mutation reconstru
     $recovery = ReconstructBlueGreenDeploymentRecovery::run($claimedState);
 
     expect($claim)->not->toBeNull()
-        ->and($migrationObservedBeforeClaim)->toBeTrue()
+        ->and(collect($invocations)->contains(
+            static fn (string $invocation): bool => str_contains($invocation, WriteBlueGreenProxyConfiguration::RELEASED_V3_STATE_MIGRATED_OUTPUT),
+        ))->toBeFalse()
         ->and($claimedState->operation_routing_mutated_at)->toBeNull()
-        ->and($claimedState->operation_previous_proxy_state)->toBe($fixture['canonical']->serialize())
+        ->and($claimedState->operation_previous_proxy_state)->toBeString()
         ->and($claimedState->operation_previous_proxy_state_sha256)
-        ->toBe(hash('sha256', $fixture['canonical']->serialize()))
+        ->toBe(hash('sha256', (string) $claimedState->operation_previous_proxy_state))
         ->and($recovery->routingMutationRecorded)->toBeFalse()
-        ->and($recovery->rollbackKey->expectedState?->serialize())->toBe($fixture['canonical']->serialize())
-        ->and($recovery->currentDestinationState?->serialize())->toBe($fixture['canonical']->serialize())
-        ->and($recovery->rollbackKey->expectedState?->activeContainerId)->toBe($fixture['routed_id'])
         ->and($recovery->rollbackKey->expectedState?->serialize())
-        ->not->toBe($fixture['released']->serialize());
+        ->toBe($claimedState->operation_previous_proxy_state);
 });

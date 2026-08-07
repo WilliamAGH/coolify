@@ -180,7 +180,7 @@ final class RehydrateBlueGreenDestinationRoutingTopologyDigest
             $context['application'],
             $context['destination'],
         );
-        $this->assertExactLiveState($context['expectedState'], $liveState);
+        $attestedRouteState = $this->assertExactLiveState($context['compatibleStates'], $liveState);
 
         $releaseProof = BlueGreenRoutingTarget::durableReleaseProofToken(
             (string) $context['plan']->activeDeployment->deployment_uuid,
@@ -211,9 +211,10 @@ final class RehydrateBlueGreenDestinationRoutingTopologyDigest
             server: $server,
             application: $context['application'],
             destination: $context['destination'],
-            routeState: $context['expectedState'],
+            routeState: $attestedRouteState,
             expectedServerBootId: $bootId,
             operationFence: $fence,
+            containerIdentityState: $context['expectedState'],
         );
         $fence->assertLockOwnership();
 
@@ -223,12 +224,14 @@ final class RehydrateBlueGreenDestinationRoutingTopologyDigest
             $inactiveRetirementSupersessionGeneration,
             $networkAttestation,
             $bootId,
+            $attestedRouteState,
         );
     }
 
     /**
      * @return array{
      *     application: Application,
+     *     compatibleStates: non-empty-list<BlueGreenProxyState>,
      *     destination: StandaloneDocker,
      *     expectedState: BlueGreenProxyState,
      *     plan: BlueGreenSteadyStatePlan,
@@ -280,23 +283,41 @@ final class RehydrateBlueGreenDestinationRoutingTopologyDigest
                     || ! hash_equals($state->destination_routing_topology_digest, $currentDigest)) {
                     throw new BlueGreenDeploymentTransitionException('The existing destination routing topology digest is immutable and no longer matches current topology.');
                 }
+                $expectedState = ResolveBlueGreenExpectedProxyState::run($locks->application, $destination, $state)
+                    ?? throw new BlueGreenDeploymentTransitionException('The rehydrated destination has no exact managed route state.');
 
                 return [
                     'application' => $locks->application,
+                    'compatibleStates' => [$expectedState],
                     'destination' => $destination,
-                    'expectedState' => ResolveBlueGreenExpectedProxyState::run($locks->application, $destination, $state)
-                        ?? throw new BlueGreenDeploymentTransitionException('The rehydrated destination has no exact managed route state.'),
+                    'expectedState' => $expectedState,
                     'plan' => PlanBlueGreenSteadyState::run($locks->application, $destination, $state),
                     'routingTopologyDigest' => $currentDigest,
                     'state' => $state,
                 ];
             }
-            $expectedState = ResolveBlueGreenExpectedProxyState::run($locks->application, $destination, $state);
+            $resolver = new ResolveBlueGreenExpectedProxyState;
+            $expectedState = $resolver->handle($locks->application, $destination, $state);
             if ($expectedState === null || $expectedState->managedSha256 === null) {
                 throw new BlueGreenDeploymentTransitionException('Stopped or absent destinations are not eligible for routing topology rehydration.');
             }
+            $releasedV3State = $resolver->releasedV3State(
+                $locks->application,
+                $destination,
+                $state,
+                $expectedState,
+            );
+            $releasedV2State = $resolver->releasedV2FanOutState(
+                $locks->application,
+                $destination,
+                $state,
+                $expectedState,
+            );
             $plan = PlanBlueGreenSteadyState::run($locks->application, $destination, $state);
-            if (! hash_equals($expectedState->serialize(), $plan->configuration->state->serialize())) {
+            if (! hash_equals(
+                ($releasedV2State ?? $expectedState)->serialize(),
+                $plan->configuration->state->serialize(),
+            )) {
                 throw new BlueGreenDeploymentTransitionException('The canonical steady route does not match the durable legacy destination state.');
             }
             if ($locks->deactivation !== null
@@ -307,6 +328,11 @@ final class RehydrateBlueGreenDestinationRoutingTopologyDigest
 
             return [
                 'application' => $locks->application,
+                'compatibleStates' => array_values(array_filter([
+                    $expectedState,
+                    $releasedV3State,
+                    $releasedV2State,
+                ])),
                 'destination' => $destination,
                 'expectedState' => $expectedState,
                 'plan' => $plan,
@@ -326,8 +352,10 @@ final class RehydrateBlueGreenDestinationRoutingTopologyDigest
         ?int $inactiveRetirementSupersessionGeneration,
         BlueGreenLegacyRouteNetworkAttestation $networkAttestation,
         string $serverBootId,
+        BlueGreenProxyState $attestedRouteState,
     ): ApplicationBlueGreenDeployment {
         return DB::transaction(function () use (
+            $attestedRouteState,
             $context,
             $inactiveRetirementOwnerDeploymentUuid,
             $inactiveRetirementSupersessionGeneration,
@@ -368,7 +396,7 @@ final class RehydrateBlueGreenDestinationRoutingTopologyDigest
                 $locks->application,
                 $destination->server,
                 $destination,
-                $expectedState,
+                $attestedRouteState,
                 $serverBootId,
                 $context['routingTopologyDigest'],
             );
@@ -392,11 +420,20 @@ final class RehydrateBlueGreenDestinationRoutingTopologyDigest
         }, attempts: 5);
     }
 
-    private function assertExactLiveState(BlueGreenProxyState $expected, ?BlueGreenProxyState $actual): void
+    /**
+     * @param  non-empty-list<BlueGreenProxyState>  $compatibleStates
+     */
+    private function assertExactLiveState(array $compatibleStates, ?BlueGreenProxyState $actual): BlueGreenProxyState
     {
-        if ($actual === null || ! hash_equals($expected->serialize(), $actual->serialize())) {
-            throw new BlueGreenDeploymentTransitionException('The live managed route does not match the exact durable legacy destination state.');
+        if ($actual !== null) {
+            foreach ($compatibleStates as $compatibleState) {
+                if (BlueGreenProxyState::matches($actual, $compatibleState)) {
+                    return $actual;
+                }
+            }
         }
+
+        throw new BlueGreenDeploymentTransitionException('The live managed route does not match the exact canonical or released legacy destination state.');
     }
 
     private function stateAllowsRehydration(

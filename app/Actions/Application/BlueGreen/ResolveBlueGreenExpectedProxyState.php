@@ -4,7 +4,6 @@ namespace App\Actions\Application\BlueGreen;
 
 use App\Actions\Proxy\BlueGreenActiveContainer;
 use App\Actions\Proxy\BlueGreenActiveContainerSet;
-use App\Actions\Proxy\BlueGreenActiveReplica;
 use App\Actions\Proxy\BlueGreenActiveReplicaSet;
 use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
@@ -174,9 +173,10 @@ final class ResolveBlueGreenExpectedProxyState
         Application $application,
         StandaloneDocker $destination,
         ApplicationBlueGreenDeployment $state,
+        BlueGreenProxyState $canonical,
     ): ?BlueGreenProxyState {
-        $canonical = $this->handle($application, $destination, $state);
-        if ($canonical?->activeContainerSet === null
+        $this->assertCanonicalScope($application, $destination, $state, $canonical);
+        if ($canonical->activeContainerSet === null
             || $canonical->activeReplicaSet !== null
             || ! is_string($canonical->activeDeploymentUuid)
             || ! is_string($canonical->activeContainerName)
@@ -241,9 +241,10 @@ final class ResolveBlueGreenExpectedProxyState
         Application $application,
         StandaloneDocker $destination,
         ApplicationBlueGreenDeployment $state,
+        BlueGreenProxyState $canonical,
     ): ?BlueGreenProxyState {
-        $canonical = $this->handle($application, $destination, $state);
-        if ($canonical?->activeReplicaSet === null
+        $this->assertCanonicalScope($application, $destination, $state, $canonical);
+        if ($canonical->activeReplicaSet === null
             || ! is_string($canonical->activeReplicaSetDigest)
             || ! $canonical->activeColor instanceof BlueGreenDeploymentColor
             || ! is_string($canonical->activeDeploymentUuid)
@@ -251,27 +252,8 @@ final class ResolveBlueGreenExpectedProxyState
             || ! is_string($canonical->activeContainerId)) {
             return null;
         }
-        $deployment = ApplicationDeploymentQueue::query()
-            ->where('application_id', $application->id)
-            ->where('destination_id', $destination->id)
-            ->where('deployment_uuid', $canonical->activeDeploymentUuid)
-            ->first();
-        $releasedAggregateId = $deployment?->blue_green_candidate_container_id;
-        $inspections = array_map(
-            static fn (BlueGreenActiveReplica $replica): BlueGreenReplicaInspection => BlueGreenReplicaInspection::fromRuntime(
-                replicaIndex: $replica->replicaIndex,
-                composeService: $replica->composeService,
-                containerName: $replica->name,
-                dockerId: $replica->id,
-                status: 'running',
-                health: 'healthy',
-            ),
-            $canonical->activeReplicaSet->members,
-        );
-        $legacyDigest = BlueGreenReplicaSet::identityDigest($inspections);
-        if (! is_string($releasedAggregateId)
-            || ! hash_equals($releasedAggregateId, $legacyDigest)
-            || hash_equals($releasedAggregateId, $canonical->activeReplicaSetDigest)) {
+        $releasedAggregateId = $canonical->activeReplicaSet->releasedIdentityDigest();
+        if (hash_equals($releasedAggregateId, $canonical->activeReplicaSetDigest)) {
             return null;
         }
 
@@ -291,6 +273,29 @@ final class ResolveBlueGreenExpectedProxyState
             applicationRoutingConfigDigest: $canonical->applicationRoutingConfigDigest,
             destinationTopologyDigest: $canonical->destinationTopologyDigest,
         );
+    }
+
+    private function assertCanonicalScope(
+        Application $application,
+        StandaloneDocker $destination,
+        ApplicationBlueGreenDeployment $state,
+        BlueGreenProxyState $canonical,
+    ): void {
+        if ($canonical->managedFilename !== BlueGreenRoutingTarget::managedFilename(
+            (string) $application->uuid,
+            (int) $destination->id,
+        )
+            || $canonical->applicationUuid !== (string) $application->uuid
+            || $canonical->destinationId !== (int) $destination->id
+            || $canonical->operationId !== $state->destination_fence_operation_id
+            || $canonical->mutationSequence !== (int) $state->destination_fence_mutation_sequence
+            || $canonical->destinationFenceEpoch !== (int) $state->destination_fence_epoch
+            || $canonical->routingRevision !== (int) $state->routing_revision
+            || $canonical->managedSha256 !== $state->managed_file_sha256
+            || $canonical->applicationRoutingConfigDigest !== $state->application_routing_config_digest
+            || $canonical->destinationTopologyDigest !== $state->destination_topology_digest) {
+            throw new BlueGreenDeploymentTransitionException('The immutable canonical projection no longer matches its durable destination scope.');
+        }
     }
 
     /**

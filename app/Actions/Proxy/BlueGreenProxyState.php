@@ -20,6 +20,12 @@ final readonly class BlueGreenProxyState
     /**
      * Replica fan-out has real Docker backends that may share one port. v4
      * records those identities independently from the aggregate set digest.
+     *
+     * READ-ONLY compatibility in this release: parsing v4 must keep working,
+     * but no code path may automatically emit or migrate a destination sidecar
+     * to v4 — the released production binary cannot parse it, so any such
+     * write would strand the destination after a digest rollback. All v4
+     * writes are deferred to a future rollback-safe writer release.
      */
     public const MAGIC_REPLICA_SET = 'coolify-blue-green-destination-fence-v4';
 

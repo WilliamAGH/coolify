@@ -2,11 +2,15 @@
 
 namespace App\Actions\Application\BlueGreen;
 
+use App\Actions\Proxy\BlueGreenProxyConfiguration;
+use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
+use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
+use App\Models\StandaloneDocker;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -76,7 +80,11 @@ class RepairBlueGreenSteadyState
             $destination = $context['destination'];
             $state = $context['state'];
             if ($state->destination_routing_topology_digest === null) {
-                return new BlueGreenSteadyStateRepairResult($stateId, BlueGreenSteadyStateRepairResult::PENDING_ROUTING_TOPOLOGY_DIGEST, 'The destination routing topology digest is not established; run blue-green:rehydrate-routing-topology to converge this destination.');
+                $rehydrated = $this->rehydrateReleasedDestinationDigest($application, $destination, $state, $fence);
+                if ($rehydrated === null) {
+                    return new BlueGreenSteadyStateRepairResult($stateId, BlueGreenSteadyStateRepairResult::PENDING_ROUTING_TOPOLOGY_DIGEST, 'The destination routing topology digest is not established; run blue-green:rehydrate-routing-topology to converge this destination.');
+                }
+                $state = $rehydrated;
             }
             $currentRoutingTopologyDigest = (new ComputeBlueGreenDeploymentFingerprint)->routingTopologyDigestFor(
                 $application,
@@ -106,7 +114,7 @@ class RepairBlueGreenSteadyState
             $bootId = ReadBlueGreenServerBootIdentity::run($destination->server);
             $fence->assertLockOwnership();
             $this->assertSnapshotAndTopologyUnchanged($state);
-            MigrateBlueGreenReleasedV3ProxyState::run(
+            $attestedState = MigrateBlueGreenReleasedV3ProxyState::run(
                 $destination->server,
                 $application,
                 $destination,
@@ -116,14 +124,31 @@ class RepairBlueGreenSteadyState
             );
             $fence->assertLockOwnership();
             $this->assertSnapshotAndTopologyUnchanged($state);
+            // The live sidecar may legitimately carry exact released v2/v3
+            // bytes. Repair heals only the managed YAML — the sidecar is
+            // asserted on-host, never rewritten — so the assertion must target
+            // the attested live state: expecting the canonical projection here
+            // would refuse every released destination, and converging one would
+            // require emitting bytes the released binary cannot parse.
+            $repairConfiguration = $plan->configuration;
+            if ($attestedState instanceof BlueGreenProxyState
+                && ! BlueGreenProxyState::matches($attestedState, $plan->configuration->state)) {
+                $repairConfiguration = new BlueGreenProxyConfiguration(
+                    managedFilename: $plan->configuration->managedFilename,
+                    yaml: $plan->configuration->yaml,
+                    sha256: $plan->configuration->sha256,
+                    state: $attestedState,
+                    probeOnlyContract: $plan->configuration->probeOnlyContract,
+                );
+            }
             $outcome = (new WriteBlueGreenProxyConfiguration)->repairManagedConfiguration(
                 $destination->server,
-                $plan->configuration,
+                $repairConfiguration,
                 $bootId,
             );
             $fence->assertLockOwnership();
             $this->assertSnapshotAndTopologyUnchanged($state);
-            VerifyBlueGreenManagedConfiguration::run($destination->server, $plan->configuration);
+            VerifyBlueGreenManagedConfiguration::run($destination->server, $repairConfiguration);
             (new VerifyBlueGreenPublicRecovery)->verifyRoutesAbsorbingProviderLag(
                 server: $destination->server,
                 application: $application,
@@ -168,6 +193,44 @@ class RepairBlueGreenSteadyState
                 report($exception);
             }
         }
+    }
+
+    /**
+     * Converge a NULL routing-topology digest for a released v2/v3 destination
+     * without touching its sidecar bytes.
+     *
+     * A released destination's live sidecar intentionally keeps the exact
+     * released record, so the operator rehydration command is not a
+     * prerequisite this repair can defer to forever: before released-state
+     * support, the NULL-digest gate refused up front while rehydration
+     * demanded canonical bytes the released sidecar can never carry, so such
+     * rows could never be repaired. When the durable ledger projects a
+     * released shape, run the remotely attested rehydration under this
+     * repair's own lifecycle fence; every other destination keeps the
+     * explicit operator-driven convergence path and the PENDING result.
+     */
+    private function rehydrateReleasedDestinationDigest(
+        Application $application,
+        StandaloneDocker $destination,
+        ApplicationBlueGreenDeployment $state,
+        BlueGreenOperationFence $fence,
+    ): ?ApplicationBlueGreenDeployment {
+        try {
+            $resolver = new ResolveBlueGreenExpectedProxyState;
+            $canonicalState = $resolver->handle($application, $destination, $state);
+            if ($canonicalState === null) {
+                return null;
+            }
+            $releasedState = $resolver->releasedV3State($application, $destination, $state, $canonicalState)
+                ?? $resolver->releasedV2FanOutState($application, $destination, $state, $canonicalState);
+        } catch (BlueGreenDeploymentTransitionException) {
+            return null;
+        }
+        if ($releasedState === null) {
+            return null;
+        }
+
+        return (new RehydrateBlueGreenDestinationRoutingTopologyDigest)->handleUnderFence($state, $fence);
     }
 
     /**
