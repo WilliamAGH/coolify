@@ -5,9 +5,12 @@ use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentTransitionException;
 use App\Actions\Application\BlueGreen\BlueGreenInterventionRecoveryResult;
+use App\Actions\Application\BlueGreen\BlueGreenLegacyProviderState;
+use App\Actions\Application\BlueGreen\BlueGreenLegacyRoutingSnapshotCodec;
 use App\Actions\Application\BlueGreen\BlueGreenLifecycleDatabaseLocks;
 use App\Actions\Application\BlueGreen\BlueGreenManagedRouteMetadataForOperationResult;
 use App\Actions\Application\BlueGreen\BlueGreenReconciliationResult;
+use App\Actions\Application\BlueGreen\CaptureBlueGreenLegacyRouting;
 use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\ComputeBlueGreenDeploymentFingerprint;
 use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
@@ -16,6 +19,7 @@ use App\Actions\Application\BlueGreen\ReadBlueGreenManagedRouteMetadata;
 use App\Actions\Application\BlueGreen\ReconcileBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\RecoverBlueGreenIntervention;
 use App\Actions\Application\BlueGreen\ResolveBlueGreenExpectedProxyState;
+use App\Actions\Application\BlueGreen\WaitForBlueGreenLegacyDockerRouting;
 use App\Actions\Application\EmergencyRecoverApplicationDeployment;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifact;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifactReader;
@@ -423,23 +427,57 @@ function fakeRollbackCommittedJournalReconciliationActions(): void
     );
 }
 
-it('builds a legacy routing snapshot for every co-rolled routed backend port', function (): void {
+it('round-trips and verifies every co-rolled legacy Docker route', function (): void {
     $scenario = BlueGreenRecoveryScenario::create(
         finalized: false,
         routingMutationRecorded: false,
         coRolledServices: ['web', 'metrics'],
     );
 
-    $snapshot = BlueGreenRecoveryScenario::legacyRoutingSnapshot(
+    $expectation = new BlueGreenContainerExpectation(
+        name: $scenario->application->uuid.'-legacy',
+        dockerId: BlueGreenRecoveryScenario::LEGACY_ID,
+        applicationId: (int) $scenario->application->id,
+        pullRequestId: 0,
+        blueGreenManaged: false,
+    );
+    $snapshot = (new CaptureBlueGreenLegacyRouting)->parse(
+        BlueGreenRecoveryScenario::legacyRoutingDockerInspection(
+            $scenario->application,
+            $scenario->destination,
+            $expectation,
+        ),
         $scenario->application,
         $scenario->destination,
+        $expectation,
     );
-    $ports = array_map(static fn ($service): int => $service->port, $snapshot->services);
+    $codec = new BlueGreenLegacyRoutingSnapshotCodec;
+    $encoded = $codec->encode($snapshot);
+    $decoded = $codec->decode($encoded->version, $encoded->bytes, $encoded->sha256);
+    $rawData = BlueGreenRecoveryScenario::traefikRawDataFor($decoded);
+    $verifier = new WaitForBlueGreenLegacyDockerRouting;
+    $verifier->assertRawData($rawData, $decoded, BlueGreenLegacyProviderState::Active);
+
+    $ports = array_map(static fn ($service): int => $service->port, $decoded->services);
     sort($ports, SORT_NUMERIC);
 
-    expect($snapshot->services)->toHaveCount(2)
-        ->and($ports)->toBe([3000, 3001])
-        ->and(array_map(static fn ($router): string => $router->serviceName, $snapshot->routers))->toBe(['metrics', 'web']);
+    expect($decoded->services)->toHaveCount(2)
+        ->and($ports)->toBe([3000, 8080])
+        ->and(array_map(static fn ($router): string => $router->serviceName, $decoded->routers))->toBe(['metrics', 'web']);
+
+    foreach ($decoded->services as $service) {
+        $missingServiceRawData = json_decode($rawData, true, flags: JSON_THROW_ON_ERROR);
+        unset($missingServiceRawData['services'][$service->providerName()]);
+
+        expect(fn () => $verifier->assertRawData(
+            json_encode($missingServiceRawData, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES),
+            $decoded,
+            BlueGreenLegacyProviderState::Active,
+        ))->toThrow(
+            RuntimeException::class,
+            "Legacy Docker service {$service->providerName()} is not enabled.",
+        );
+    }
 });
 
 it('records the source deployment phase and reason when reconciliation requires intervention', function (): void {

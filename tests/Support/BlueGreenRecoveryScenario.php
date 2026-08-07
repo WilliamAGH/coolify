@@ -224,7 +224,7 @@ final readonly class BlueGreenRecoveryScenario
         $definitions = [];
         $domains = [];
         foreach ($services as $offset => $service) {
-            $port = 3000 + $offset;
+            $port = $offset === 0 ? 3000 : 8079 + $offset;
             $host = $offset === 0 ? 'recovery.example.test' : "{$service}.recovery.example.test";
             $domains[$service] = ['domain' => "https://{$host}"];
             $definition = [
