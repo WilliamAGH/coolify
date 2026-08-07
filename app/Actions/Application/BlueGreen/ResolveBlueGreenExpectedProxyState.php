@@ -19,6 +19,20 @@ final class ResolveBlueGreenExpectedProxyState
 {
     use AsAction;
 
+    /**
+     * Whether the durable row carries committed destination-fence provenance —
+     * the recorded expectation the destination attestation proves against.
+     */
+    public static function hasDurableDestinationState(ApplicationBlueGreenDeployment $state): bool
+    {
+        return $state->destination_fence_operation_id !== null
+            || (int) $state->destination_fence_mutation_sequence !== 0
+            || (int) $state->destination_fence_epoch !== 0
+            || $state->managed_file_sha256 !== null
+            || $state->destination_topology_digest !== null
+            || $state->application_routing_config_digest !== null;
+    }
+
     public function handle(
         Application $application,
         StandaloneDocker $destination,
@@ -28,13 +42,7 @@ final class ResolveBlueGreenExpectedProxyState
             || (int) $state->standalone_docker_id !== (int) $destination->id) {
             throw new BlueGreenDeploymentTransitionException('The durable blue-green state does not belong to this destination.');
         }
-        $hasDestinationState = $state->destination_fence_operation_id !== null
-            || (int) $state->destination_fence_mutation_sequence !== 0
-            || (int) $state->destination_fence_epoch !== 0
-            || $state->managed_file_sha256 !== null
-            || $state->destination_topology_digest !== null
-            || $state->application_routing_config_digest !== null;
-        if (! $hasDestinationState) {
+        if (! self::hasDurableDestinationState($state)) {
             if ($state->active_color !== null
                 || $state->blue_deployment_uuid !== null
                 || $state->green_deployment_uuid !== null

@@ -2,9 +2,14 @@
 
 namespace App\Actions\Application;
 
+use App\Actions\Application\BlueGreen\AttestBlueGreenDestinationState;
+use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
+use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
 use App\Actions\Application\BlueGreen\BlueGreenInterventionRecoveryResult;
+use App\Actions\Application\BlueGreen\BlueGreenManagedRouteUnobservableException;
 use App\Actions\Application\BlueGreen\BlueGreenReconciliationResult;
 use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
+use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Actions\Application\BlueGreen\ReadBlueGreenManagedRouteMetadata;
 use App\Actions\Application\BlueGreen\ReconcileBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\RecoverBlueGreenIntervention;
@@ -17,6 +22,7 @@ use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\StandaloneDocker;
+use Illuminate\Support\Facades\Cache;
 use Lorisleiva\Actions\Concerns\AsAction;
 use Throwable;
 
@@ -172,18 +178,29 @@ final class EmergencyRecoverApplicationDeployment
             }
             $state = $this->stateFor($deployment);
         }
-        if ($state?->phase === BlueGreenDeploymentPhase::IDLE
-            && $state->supersession_generation === 1
-            && $state->inactive_retirement_owner_deployment_uuid === null
-            && is_string($state->legacy_container_name)
-            && $state->legacy_container_name !== ''
-            && ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state)) {
+        if ($state !== null
+            && RecoverBlueGreenIntervention::isFailedFirstAdoptionStaleJournalCandidate($state)) {
             [$outcome, $message, $recoveryOwnerActive] = $this->recoverFailedFirstAdoptionStaleJournal(
                 $state,
                 $deployment,
                 $reason,
             );
-            if ($outcome !== self::CLEAN) {
+            $refreshed = $this->stateFor($deployment);
+            $targetIsTerminal = ! in_array($deployment->fresh()?->status, [
+                ApplicationDeploymentStatus::QUEUED->value,
+                ApplicationDeploymentStatus::IN_PROGRESS->value,
+            ], true);
+            if ($outcome === self::MANUAL_ONLY
+                && $targetIsTerminal
+                && $refreshed !== null
+                && ClaimBlueGreenDeployment::stateIsCleanlyClaimable($refreshed)) {
+                // The archival recovery refused without changing anything, and
+                // this already-terminal queue row cannot be re-adopted by a live
+                // worker, so the destination is exactly as claimable as it was;
+                // the ownership and claimability verdict below — whose cancel is
+                // a no-op on a terminal row — is the truthful answer.
+                $state = $refreshed;
+            } elseif ($outcome !== self::CLEAN) {
                 $cancelled = $this->cancelAfterRecovery(
                     $deployment,
                     $recoveryOwnerActive,
@@ -198,8 +215,9 @@ final class EmergencyRecoverApplicationDeployment
                     false,
                     $recoveryOwnerActive,
                 );
+            } else {
+                $state = $refreshed;
             }
-            $state = $this->stateFor($deployment);
         }
 
         // A deployment UUID is a stable historical handle: the queue keeps every
@@ -483,13 +501,62 @@ final class EmergencyRecoverApplicationDeployment
                 $application,
                 $destination,
             );
-        } catch (Throwable) {
+        } catch (Throwable $metadataFailure) {
             if ($state === null || ! ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state)) {
                 return false;
             }
 
             try {
                 $expectedState = ResolveBlueGreenExpectedProxyState::run($application, $destination, $state);
+                if ($expectedState !== null
+                    && $expectedState->managedSha256 === null
+                    && ! $metadataFailure instanceof BlueGreenManagedRouteUnobservableException) {
+                    // An absent-route destination fence keeps its state sidecar
+                    // without a managed route file — a shape the metadata read
+                    // refuses by design only AFTER it has proven no mutation
+                    // journal is pending, so a non-journal read failure makes
+                    // attestation — state bytes equal, managed file absent — the
+                    // prover for exactly this form. A pending or unobservable
+                    // journal never reaches here (attestation's locked prefix
+                    // would repair another owner's journal before asserting),
+                    // and the lifecycle lock excludes a concurrent claim from
+                    // journalling between that proof and this attestation.
+                    $lock = Cache::lock(
+                        BlueGreenDeploymentLock::key((int) $application->getKey(), (int) $destination->getKey()),
+                        BlueGreenDeploymentLock::RENEWABLE_LEASE_SECONDS,
+                    );
+                    if (! $lock->get()) {
+                        return false;
+                    }
+                    try {
+                        AttestBlueGreenDestinationState::run(
+                            $destination->server,
+                            $application,
+                            $destination,
+                            null,
+                            $expectedState,
+                        );
+                        $legacyName = $state->legacy_container_name;
+                        if (is_string($legacyName) && $legacyName !== '') {
+                            // Claimable also promises the retained legacy route
+                            // target the next first adoption requires.
+                            $legacy = InspectBlueGreenContainer::run($destination->server, new BlueGreenContainerExpectation(
+                                name: $legacyName,
+                                dockerId: null,
+                                applicationId: (int) $application->id,
+                                pullRequestId: 0,
+                                blueGreenManaged: false,
+                            ));
+                            if (! $legacy->exists || $legacy->status !== 'running' || $legacy->health !== 'healthy') {
+                                return false;
+                            }
+                        }
+
+                        return true;
+                    } finally {
+                        $lock->release();
+                    }
+                }
                 $liveState = RecoverCleanIdleBlueGreenContainerMutationJournal::run(
                     $destination->server,
                     $application,

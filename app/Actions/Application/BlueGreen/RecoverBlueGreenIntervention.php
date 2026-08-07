@@ -63,6 +63,26 @@ final class RecoverBlueGreenIntervention
     }
 
     /**
+     * The only durable shape the failed first-adoption stale-journal profile can
+     * accept: an idle generation-one row whose destination fence never committed.
+     * A cleanly rolled-back first adoption retains committed fence provenance and
+     * is re-claimable through ordinary attestation, so routing it here would
+     * demand a recovery that must refuse it.
+     */
+    public static function isFailedFirstAdoptionStaleJournalCandidate(ApplicationBlueGreenDeployment $state): bool
+    {
+        return $state->phase === BlueGreenDeploymentPhase::IDLE
+            && $state->supersession_generation === 1
+            && $state->inactive_retirement_owner_deployment_uuid === null
+            && $state->intervention_phase === null
+            && $state->intervention_reason === null
+            && is_string($state->legacy_container_name)
+            && $state->legacy_container_name !== ''
+            && ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state)
+            && ! ResolveBlueGreenExpectedProxyState::hasDurableDestinationState($state);
+    }
+
+    /**
      * A live phase fences immediately. A terminal phase is history only when it
      * does not fence the exact queue owner by cutoff or creation time.
      */
@@ -221,8 +241,8 @@ final class RecoverBlueGreenIntervention
                 $successorDeploymentUuid,
                 $successorHorizonJobId,
             );
-        } catch (BlueGreenDeploymentTransitionException) {
-            return $this->staleContainerMutationJournalManualOnly($stateId, $reason, null, 'rejected');
+        } catch (BlueGreenDeploymentTransitionException $exception) {
+            return $this->staleContainerMutationJournalManualOnly($stateId, $reason, null, 'rejected', $exception->getMessage());
         }
 
         if ($context['inactive_retirement'] !== null) {
@@ -240,8 +260,8 @@ final class RecoverBlueGreenIntervention
             $inspection = $this->inspectStaleContainerMutationJournal($context, $inspectionBootId);
         } catch (BlueGreenOperationFenceLostException) {
             return $this->staleContainerMutationJournalDeferred($stateId, $reason, $context, 'boot_unstable');
-        } catch (\Throwable) {
-            return $this->staleContainerMutationJournalManualOnly($stateId, $reason, $context, 'inspection_failed');
+        } catch (\Throwable $exception) {
+            return $this->staleContainerMutationJournalManualOnly($stateId, $reason, $context, 'inspection_failed', $exception->getMessage());
         }
 
         if (! $apply) {
@@ -360,7 +380,7 @@ final class RecoverBlueGreenIntervention
                 );
             }
 
-            return $this->staleContainerMutationJournalManualOnly($stateId, $reason, $context, 'state_changed');
+            return $this->staleContainerMutationJournalManualOnly($stateId, $reason, $context, 'state_changed', $exception->getMessage());
         } catch (\Throwable $exception) {
             if ($archiveAttempted) {
                 report($exception);
@@ -373,7 +393,7 @@ final class RecoverBlueGreenIntervention
                 );
             }
 
-            return $this->staleContainerMutationJournalManualOnly($stateId, $reason, $context, 'archive_failed');
+            return $this->staleContainerMutationJournalManualOnly($stateId, $reason, $context, 'archive_failed', $exception->getMessage());
         } finally {
             $this->releaseStateFence($operationFence);
         }
@@ -1849,19 +1869,24 @@ SH;
         ?string $reason,
         ?array $context,
         string $phase,
+        ?string $detail = null,
     ): BlueGreenInterventionRecoveryResult {
         $this->auditStaleContainerMutationJournal(
             'blue_green.stale_container_journal.manual_only',
             $stateId,
             $context,
             $reason,
-            ['phase' => $phase],
+            $detail === null ? ['phase' => $phase] : ['phase' => $phase, 'detail' => $detail],
         );
+        $message = 'The requested state, destination, or stale journal did not prove one supported fail-closed recovery profile; no journal was changed.';
+        if ($detail !== null) {
+            $message .= ' Refused precondition: '.$detail;
+        }
 
         return new BlueGreenInterventionRecoveryResult(
             classification: BlueGreenInterventionRecoveryResult::STALE_CONTAINER_JOURNAL,
             outcome: BlueGreenInterventionRecoveryResult::MANUAL_ONLY,
-            message: 'The requested state, destination, or stale journal did not prove one supported fail-closed recovery profile; no journal was changed.',
+            message: $message,
             stateId: $stateId,
         );
     }

@@ -209,14 +209,8 @@ final class BlueGreenDeploymentLifecycle
 
             return;
         }
-        if ($durableState?->phase === BlueGreenDeploymentPhase::IDLE
-            && $durableState->supersession_generation === 1
-            && $durableState->inactive_retirement_owner_deployment_uuid === null
-            && $durableState->intervention_phase === null
-            && $durableState->intervention_reason === null
-            && is_string($durableState->legacy_container_name)
-            && $durableState->legacy_container_name !== ''
-            && ClaimBlueGreenDeployment::stateIsCleanlyClaimable($durableState)) {
+        if ($durableState !== null
+            && RecoverBlueGreenIntervention::isFailedFirstAdoptionStaleJournalCandidate($durableState)) {
             $durableState = $this->recoverFailedFirstAdoptionStaleJournalAtDeploymentStart($durableState);
         }
         if ($durableState?->phase === BlueGreenDeploymentPhase::IDLE
@@ -586,6 +580,16 @@ final class BlueGreenDeploymentLifecycle
             $prepareCandidateStart();
             $this->deployment->addLogEntry('----------------------------------------');
             $this->deployment->addLogEntry('Blue-green deployment started. Replacing only the inactive slot.');
+            if ($claim->legacyContainerName !== null) {
+                // Captured before any destination mutation: a legacy container
+                // whose immutable labels drift from the canonical routing
+                // inventory can never activate, so it must refuse the adoption
+                // before the fence advances or a candidate container starts.
+                // Labels are immutable per container, and the activation path
+                // re-inspects the legacy container by its pinned Docker id, so
+                // capturing here proves the same bytes activation will use.
+                $this->legacyRoutingSnapshot = $this->captureAndProveLegacyRouting();
+            }
             $this->replaceCandidateContainer();
             $this->assertOperationOwned(BlueGreenDeploymentPhase::PREPARING);
             $candidateStartCommands = $startCandidate();
@@ -1204,7 +1208,15 @@ final class BlueGreenDeploymentLifecycle
             BlueGreenInterventionRecoveryResult::RECOVERED,
             BlueGreenInterventionRecoveryResult::SKIPPED,
         ], true)) {
-            throw new DeploymentException('The failed first-adoption stale journal could not be archived for this exact successor. '.$result->message);
+            // The archival recovery only quarantines crash residue it can prove.
+            // Every other residue is judged by the strict owners that follow —
+            // claim admission, destination attestation, and the fenced mutation
+            // scripts all fail closed on anything unprovable — so an
+            // unarchivable journal must not fail the successor deployment here.
+            $this->deployment->addLogEntry(
+                'The stale first-adoption journal was not archivable for this successor; continuing under claim admission and destination attestation. '.$result->message,
+                'stderr',
+            );
         }
 
         return ApplicationBlueGreenDeployment::query()->find($durableState->id);
@@ -2185,8 +2197,8 @@ final class BlueGreenDeploymentLifecycle
         $this->assertOperationOwned(BlueGreenDeploymentPhase::PREPARING);
         $this->assertExactPreviousContainerHealthy();
 
-        if ($claim->legacyContainerName !== null) {
-            $this->legacyRoutingSnapshot = $this->captureAndProveLegacyRouting();
+        if ($claim->legacyContainerName !== null && $this->legacyRoutingSnapshot === null) {
+            throw new DeploymentException('First blue-green adoption lost its legacy routing snapshot before activation.');
         }
 
         $previousContainer = $this->previousContainerExpectation;
@@ -2985,7 +2997,12 @@ final class BlueGreenDeploymentLifecycle
                     );
                 }
             }
-            $this->deployment->addLogEntry('Blue-green rollback restored and verified the previous route before removing the candidate.', 'stderr');
+            $this->deployment->addLogEntry(
+                $this->proxyChanged
+                    ? 'Blue-green rollback restored and verified the previous route before removing the candidate.'
+                    : 'Blue-green rollback removed the candidate; the previous route was never mutated and kept serving.',
+                'stderr',
+            );
 
             return $cause;
         } catch (Throwable $rollbackError) {

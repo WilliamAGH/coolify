@@ -166,6 +166,7 @@ function fakeAutomaticFailedFirstAdoptionJournalRemote(
     ?string $provenance = null,
     ?Closure $afterFirstBootRead = null,
     ?Closure $fallback = null,
+    bool $attestRefusesPendingJournal = false,
 ): void {
     $journalSha256 = hash('sha256', 'automatic-failed-first-adoption-journal');
     $managedFilename = BlueGreenRoutingTarget::managedFilename(
@@ -216,6 +217,7 @@ function fakeAutomaticFailedFirstAdoptionJournalRemote(
         $runtime,
         $scenario,
         $fallback,
+        $attestRefusesPendingJournal,
     ): FakeProcessResult {
         $command = is_array($process->command) ? implode(' ', $process->command) : (string) $process->command;
         $payload = $command."\n".(string) $process->input;
@@ -233,6 +235,14 @@ function fakeAutomaticFailedFirstAdoptionJournalRemote(
             return Process::result(output: $inspection);
         }
         if (str_contains($payload, 'coolify-blue-green-destination-state-attested')) {
+            if ($attestRefusesPendingJournal && ! $archived) {
+                return Process::result(
+                    output: '',
+                    errorOutput: WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT,
+                    exitCode: 75,
+                );
+            }
+
             return Process::result(output: 'coolify-blue-green-destination-state-attested');
         }
         if (str_contains($payload, "docker ps -a --filter='label=coolify.applicationId=")) {
@@ -829,7 +839,7 @@ it('rejects a malformed failed first-adoption dispatch-attempt UUID before recov
     Process::assertNothingRan();
 });
 
-it('refuses a foreign failed first-adoption journal provenance without archival or replay', function (): void {
+it('refuses a foreign failed first-adoption journal provenance without archival or replay, failing at attestation instead of the hook', function (): void {
     $scenario = automaticFailedFirstAdoptionStaleJournalScenario();
     $successor = automaticRecoverySuccessor($scenario, (string) Str::uuid());
     $payloads = [];
@@ -839,6 +849,9 @@ it('refuses a foreign failed first-adoption journal provenance without archival 
         $payloads,
         $archived,
         provenance: hash('sha256', 'foreign-failed-first-adoption-provenance'),
+        // The real destination refuses every attestation while the foreign
+        // container-mutation journal is still pending on the host.
+        attestRefusesPendingJournal: true,
     );
     $lifecycle = new BlueGreenDeploymentLifecycle(
         application: $scenario->application->fresh(['settings']),
@@ -849,10 +862,20 @@ it('refuses a foreign failed first-adoption journal provenance without archival 
         checkForCancellation: static function (): void {},
     );
 
-    expect(fn () => $lifecycle->initialize())
-        ->toThrow(DeploymentException::class, 'could not be archived for this exact successor');
+    // The foreign journal stays untouched and the deploy-start hook no longer
+    // fails the successor with a misleading archival error; destination
+    // attestation remains the fail-closed owner and names the real blocker.
+    $failure = null;
+    try {
+        $lifecycle->initialize();
+    } catch (Throwable $exception) {
+        $failure = $exception;
+    }
 
-    expect($archived)->toBeFalse()
+    expect($failure)->not->toBeNull()
+        ->and($archived)->toBeFalse()
+        ->and((string) $successor->fresh()?->logs)->toContain('was not archivable for this successor')
+        ->and((string) $successor->fresh()?->logs)->not->toContain('could not be archived for this exact successor')
         ->and(implode("\n", $payloads))->not->toContain(
             'durable_remote_replace "$container_journal_path" "$container_journal_archive_path"',
             'sh "$container_journal_mutation_decoded"',
