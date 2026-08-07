@@ -7,12 +7,11 @@ use App\Actions\Application\BlueGreen\BlueGreenDeploymentQueueActivity;
 use App\Actions\Application\BlueGreen\BlueGreenReconciliationResult;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaInspection;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
+use App\Actions\Application\BlueGreen\CaptureBlueGreenLegacyRouting;
 use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Actions\Application\BlueGreen\MarkBlueGreenRecoveryInterventionRequired;
-use App\Actions\Application\BlueGreen\RebindBlueGreenLegacyRoutingSnapshot;
 use App\Actions\Application\BlueGreen\ReconcileBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\ReconcileBlueGreenDeployments;
-use App\Actions\Application\BlueGreen\VerifyBlueGreenLegacyProviderRecovery;
 use App\Actions\Proxy\BlueGreenActiveContainerSet;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifact;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifactReader;
@@ -785,7 +784,7 @@ it('restores a live-applied unrecorded first-adoption route before completing a 
                 'healthcheck' => ['test' => ['CMD', 'true']],
                 'labels' => [
                     'traefik.enable=true',
-                    'traefik.http.routers.gateway.rule=Host(`gateway.recovery.example.test`)',
+                    'traefik.http.routers.gateway.rule=Host(`gateway.recovery.example.test`) && PathPrefix(`/`)',
                     'traefik.http.routers.gateway.entryPoints=https',
                     'traefik.http.routers.gateway.service=gateway',
                     'traefik.http.routers.gateway.tls=true',
@@ -798,7 +797,7 @@ it('restores a live-applied unrecorded first-adoption route before completing a 
                 'healthcheck' => ['test' => ['CMD', 'true']],
                 'labels' => [
                     'traefik.enable=true',
-                    'traefik.http.routers.queue.rule=Host(`queue.recovery.example.test`)',
+                    'traefik.http.routers.queue.rule=Host(`queue.recovery.example.test`) && PathPrefix(`/`)',
                     'traefik.http.routers.queue.entryPoints=https',
                     'traefik.http.routers.queue.service=queue',
                     'traefik.http.routers.queue.tls=true',
@@ -840,10 +839,17 @@ it('restores a live-applied unrecorded first-adoption route before completing a 
             status: 'running',
             health: 'healthy',
         ));
-    RebindBlueGreenLegacyRoutingSnapshot::shouldRun()
+    // Only the docker-inspect boundary is faked: the real rebind proves the
+    // captured routing identity against the durable pre-stop snapshot, and the
+    // real provider verification below proves every routed backend port
+    // against the faked Traefik rawdata and direct-origin probes.
+    $legacySnapshot = BlueGreenRecoveryScenario::legacyRoutingSnapshot(
+        $scenario->application,
+        $scenario->destination,
+    );
+    CaptureBlueGreenLegacyRouting::shouldRun()
         ->once()
-        ->andReturn(BlueGreenRecoveryScenario::legacyRoutingSnapshot($scenario->application));
-    VerifyBlueGreenLegacyProviderRecovery::shouldRun()->once()->andReturnNull();
+        ->andReturn($legacySnapshot);
     $members = [
         'gateway' => $scenario->application->uuid.'-blue',
         'queue' => $scenario->application->uuid.'-queue-blue',
@@ -918,6 +924,10 @@ it('restores a live-applied unrecorded first-adoption route before completing a 
         '*coolify-blue-green-managed-route*' => Process::result(output: 'coolify-blue-green-managed-route:present:'
             .base64_encode($liveState->serialize())
             ."\n".str_repeat('f', 64)),
+        '*rawdata*' => Process::result(
+            output: BlueGreenRecoveryScenario::traefikRawDataFor($legacySnapshot),
+        ),
+        '*curl --config -*' => Process::result(output: "HTTP/1.1 200 OK\r\n\r\n"),
         '*' => Process::result(output: ''),
     ]);
     BlueGreenProxyRollbackArtifactReader::shouldRun()->once()->andReturnUsing(
