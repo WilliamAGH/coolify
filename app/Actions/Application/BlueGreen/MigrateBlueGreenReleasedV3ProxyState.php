@@ -42,16 +42,6 @@ final class MigrateBlueGreenReleasedV3ProxyState
         $releasedV2State = $canonicalState === null
             ? null
             : $resolver->releasedV2FanOutState($application, $destination, $state, $canonicalState);
-        // Without a released projection there is no compatibility question to
-        // answer and no "already canonical" verdict to gate: the durable
-        // expectation is the only possible route state, exactly as before this
-        // boundary existed, so no extra live read is spent on it. Whenever a
-        // released projection exists, the verdict below is only ever reached
-        // after the live sidecar has actually been read and matched.
-        if ($releasedV3State === null && $releasedV2State === null) {
-            return $canonicalState;
-        }
-
         ReadBlueGreenServerBootIdentity::run($server, $expectedServerBootId);
         $operationFence->assertLockOwnership();
         $liveState = ReadBlueGreenManagedRouteMetadata::run($server, $application, $destination);

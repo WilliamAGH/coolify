@@ -1019,6 +1019,61 @@ it('refuses an already-canonical verdict when the live sidecar is neither releas
     }
 });
 
+it('refuses an unattested canonical verdict when no released projection exists', function (): void {
+    $fixture = releasedV3StateFixture();
+    $fixture['deployment']->update([
+        'blue_green_candidate_container_id' => $fixture['routed_id'],
+    ]);
+    $canonical = ResolveBlueGreenExpectedProxyState::run(
+        $fixture['application'],
+        $fixture['destination'],
+        $fixture['state'],
+    ) ?? throw new RuntimeException('The canonical-only fixture has no expected state.');
+    expect((new ResolveBlueGreenExpectedProxyState)->releasedV3State(
+        $fixture['application'],
+        $fixture['destination'],
+        $fixture['state'],
+        $canonical,
+    ))->toBeNull();
+
+    $bootId = '11111111-2222-3333-4444-555555555555';
+    $foreign = $canonical->withDestinationFenceEpoch($canonical->destinationFenceEpoch + 1);
+    Process::fake(function (PendingProcess $process) use ($bootId, $foreign) {
+        $command = is_array($process->command) ? implode(' ', $process->command) : (string) $process->command;
+        $input = is_string($process->input) ? $process->input : '';
+        $invocation = $command."\n".$input;
+
+        return match (true) {
+            str_contains($invocation, 'coolify-blue-green-managed-route:present:') => Process::result(
+                output: 'coolify-blue-green-managed-route:present:'
+                    .base64_encode($foreign->serialize())
+                    ."\n".$foreign->managedSha256,
+            ),
+            str_contains($invocation, '/proc/sys/kernel/random/boot_id') => Process::result(output: $bootId),
+            default => throw new RuntimeException('Unexpected canonical-only attestation command.'),
+        };
+    });
+    $lock = Cache::lock(
+        BlueGreenDeploymentLock::key($fixture['application']->id, $fixture['destination']->id),
+        300,
+    );
+    expect($lock->get())->toBeTrue();
+    $fence = new BlueGreenOperationFence($lock, 300);
+
+    try {
+        expect(fn () => MigrateBlueGreenReleasedV3ProxyState::run(
+            $fixture['server'],
+            $fixture['application'],
+            $fixture['destination'],
+            $fixture['state'],
+            $bootId,
+            $fence,
+        ))->toThrow(BlueGreenDeploymentTransitionException::class);
+    } finally {
+        $fence->releaseIfOwned();
+    }
+});
+
 it('rehydrates a released v3 null routing-topology digest directly while leaving the sidecar byte-identical', function (): void {
     $fixture = releasedV3StateFixture();
     $fixture['state']->update(['destination_routing_topology_digest' => null]);
