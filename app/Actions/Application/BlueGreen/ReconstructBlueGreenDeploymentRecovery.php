@@ -885,7 +885,12 @@ final class ReconstructBlueGreenDeploymentRecovery
             || $replacementState->routingRevision !== $claim->expectedRoutingRevision
             || $replacementState->activeColor !== $claim->pendingColor
             || $replacementState->activeDeploymentUuid !== $claim->deploymentUuid
-            || $replacementState->activeSetFenceIdentity() !== $state->operation_candidate_container_id) {
+            || ! $this->replacementMatchesCandidateFenceIdentity(
+                $state,
+                $application,
+                $claim,
+                $replacementState,
+            )) {
             throw new BlueGreenDeploymentTransitionException('The recorded destination state does not match the exact claimed routing mutation.');
         }
 
@@ -908,6 +913,47 @@ final class ReconstructBlueGreenDeploymentRecovery
             activeReplicaSetDigest: $replacementState->activeReplicaSetDigest,
             activeReplicaSet: $replacementState->activeReplicaSet,
         );
+    }
+
+    private function replacementMatchesCandidateFenceIdentity(
+        ApplicationBlueGreenDeployment $state,
+        Application $application,
+        BlueGreenDeploymentClaim $claim,
+        BlueGreenProxyState $replacementState,
+    ): bool {
+        $replacementIdentity = $replacementState->activeSetFenceIdentity();
+        $candidateIdentity = $state->operation_candidate_container_id;
+        if (! is_string($replacementIdentity) || ! is_string($candidateIdentity)) {
+            return false;
+        }
+        if (hash_equals($replacementIdentity, $candidateIdentity)) {
+            return true;
+        }
+
+        $replicaSet = new BlueGreenReplicaSet($claim->replicaCount, $claim->candidateComposeServices());
+        if ($replicaSet->usesScalarCompatibilityPath()) {
+            return false;
+        }
+
+        try {
+            $this->representativeContainerIdentity(
+                $state,
+                $application,
+                $claim->deploymentUuid,
+                $claim->pendingColor,
+                $claim->expectedRoutingRevision,
+                $replacementIdentity,
+                $claim->candidateContainerName
+                    ?? throw new BlueGreenDeploymentTransitionException('The interrupted operation has no candidate container name.'),
+                candidateComposeServices: $claim->candidateComposeServices(),
+                backendPorts: $claim->backendPortInventory->ports(),
+                requiresReplicaLedger: true,
+            );
+        } catch (BlueGreenDeploymentTransitionException) {
+            return false;
+        }
+
+        return true;
     }
 
     private function unrecordedReplacementState(

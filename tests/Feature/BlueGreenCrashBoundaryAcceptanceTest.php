@@ -4,18 +4,18 @@ use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
 use App\Actions\Application\BlueGreen\BlueGreenReconciliationResult;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaInspection;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
+use App\Actions\Application\BlueGreen\CaptureBlueGreenLegacyRouting;
 use App\Actions\Application\BlueGreen\CompleteBlueGreenDeploymentOperation;
 use App\Actions\Application\BlueGreen\EnsureBlueGreenPreviousContainerRunning;
 use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Actions\Application\BlueGreen\PlanBlueGreenForwardRecovery;
 use App\Actions\Application\BlueGreen\PlanBlueGreenPublicRecovery;
 use App\Actions\Application\BlueGreen\PlanBlueGreenSteadyState;
-use App\Actions\Application\BlueGreen\RebindBlueGreenLegacyRoutingSnapshot;
 use App\Actions\Application\BlueGreen\ReconcileBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\ReconstructBlueGreenDeploymentRecovery;
 use App\Actions\Application\BlueGreen\RemoveExactBlueGreenCandidate;
 use App\Actions\Application\BlueGreen\ResolveBlueGreenActiveReplicaSet;
-use App\Actions\Application\BlueGreen\VerifyBlueGreenLegacyProviderRecovery;
+use App\Actions\Application\BlueGreen\ResolveBlueGreenExpectedProxyState;
 use App\Actions\Proxy\BlueGreenProxyConfiguration;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifact;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifactCommitter;
@@ -29,6 +29,7 @@ use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Jobs\ResumeBlueGreenDrainingDeploymentJob;
+use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationBlueGreenReplica;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\InstanceSettings;
@@ -57,6 +58,9 @@ function blueGreenCrashBoundaryMakeStale(ApplicationDeploymentQueue $deployment)
 function blueGreenCrashBoundaryCandidateConfiguration(
     BlueGreenRecoveryScenario $scenario,
     array $candidateReplicas = [],
+    int $routingRevision = 1,
+    BlueGreenRoutingMode $mode = BlueGreenRoutingMode::LegacyAdoption,
+    ?int $destinationFenceEpoch = null,
 ): BlueGreenProxyConfiguration {
     $state = $scenario->state->fresh();
     $activeReplicaSet = $candidateReplicas === []
@@ -74,12 +78,12 @@ function blueGreenCrashBoundaryCandidateConfiguration(
         blueContainerName: $scenario->application->uuid.'-blue',
         greenContainerName: $scenario->application->uuid.'-green',
         port: 3000,
-        routingRevision: 1,
-        mode: BlueGreenRoutingMode::LegacyAdoption,
+        routingRevision: $routingRevision,
+        mode: $mode,
         publicProofToken: BlueGreenRoutingTarget::durablePublicProofToken(
             BlueGreenRecoveryScenario::OPERATION_UUID,
         ),
-        destinationFenceEpoch: $state->destination_fence_epoch,
+        destinationFenceEpoch: $destinationFenceEpoch ?? $state->destination_fence_epoch,
         operationId: BlueGreenRecoveryScenario::OPERATION_UUID,
         mutationSequence: $state->destination_fence_mutation_sequence,
         activeDeploymentUuid: BlueGreenRecoveryScenario::OPERATION_UUID,
@@ -107,6 +111,7 @@ function blueGreenCrashBoundaryCandidateConfiguration(
 function blueGreenCrashBoundaryReplicaCandidates(
     BlueGreenRecoveryScenario $scenario,
     int $replicaCount = 3,
+    int $routingRevision = 1,
 ): array {
     $replicas = [];
     foreach ((new BlueGreenReplicaSet($replicaCount))->indexes() as $replicaIndex) {
@@ -119,7 +124,7 @@ function blueGreenCrashBoundaryReplicaCandidates(
             'color' => BlueGreenDeploymentColor::BLUE,
             'replica_index' => $replicaIndex,
             'deployment_uuid' => BlueGreenRecoveryScenario::OPERATION_UUID,
-            'routing_revision' => 1,
+            'routing_revision' => $routingRevision,
             'compose_project' => $scenario->application->uuid,
             'compose_service' => $composeService,
             'container_name' => "{$composeService}-1",
@@ -189,8 +194,9 @@ function blueGreenCrashBoundaryReplicaInspectionOutput(
 function blueGreenCrashBoundaryFakeNoJournalRemote(
     ?string $availableReplicaOutput = null,
     ?BlueGreenProxyState $managedRouteState = null,
+    ?string $traefikRawData = null,
 ): void {
-    Process::fake(function (PendingProcess $process) use ($availableReplicaOutput, $managedRouteState): FakeProcessResult {
+    Process::fake(function (PendingProcess $process) use ($availableReplicaOutput, $managedRouteState, $traefikRawData): FakeProcessResult {
         $payload = (string) $process->command."\n".(string) $process->input;
         if (str_contains($payload, WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX)) {
             return Process::result(output: WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX.'|absent');
@@ -205,6 +211,12 @@ function blueGreenCrashBoundaryFakeNoJournalRemote(
         }
         if ($availableReplicaOutput !== null && str_contains($payload, 'coolify_available_replica_')) {
             return Process::result(output: $availableReplicaOutput);
+        }
+        if ($traefikRawData !== null && str_contains($payload, '/api/rawdata')) {
+            return Process::result(output: $traefikRawData);
+        }
+        if ($traefikRawData !== null && str_contains($payload, 'curl --config -')) {
+            return Process::result(output: "HTTP/1.1 200 OK\r\n\r\n");
         }
 
         return Process::result();
@@ -360,16 +372,26 @@ it('completes a proven three-replica switching route with its stage-specific dig
     $claim = $operation->claim;
     $mismatchedState = $scenario->state->fresh();
     $mismatchedState->pending_deployment_uuid = 'different-pending-operation';
-    expect(fn () => (new PlanBlueGreenSteadyState)->routingTargetForState(
+    $rollbackSafeState = $operation->currentDestinationState
+        ?? throw new LogicException('The proven switching route must retain its rollback-safe destination state.');
+    $mismatchedTarget = (new PlanBlueGreenSteadyState)->routingTargetForState(
         $operation->application,
         $operation->destination,
         $mismatchedState,
-        $operation->currentDestinationState,
+        $rollbackSafeState,
         BlueGreenRoutingMode::LegacyAdoption,
-    ))->toThrow(
-        InvalidArgumentException::class,
-        'A replica-aware blue-green route requires its aggregate replica-set digest.',
     );
+    $canonicalCandidateIdentity = (new BlueGreenReplicaSet(count($replicas)))->fenceIdentity($replicas);
+    $releasedCandidateIdentity = BlueGreenReplicaSet::identityDigest($replicas);
+    expect($scenario->state->fresh()->operation_candidate_container_id)->toBe($canonicalCandidateIdentity)
+        ->and($rollbackSafeState->activeDeploymentUuid)->toBe($claim->deploymentUuid)
+        ->and($rollbackSafeState->activeContainerName)->toBe($scenario->application->uuid.'-blue')
+        ->and($rollbackSafeState->activeContainerId)->toBe($releasedCandidateIdentity)
+        ->and($rollbackSafeState->activeContainerId)->not->toBe($canonicalCandidateIdentity)
+        ->and($rollbackSafeState->activeReplicaSet)->toBeNull()
+        ->and($mismatchedTarget->activeDeploymentUuid)->toBe($claim->deploymentUuid)
+        ->and($mismatchedTarget->activeReplicaSet)->toBeNull()
+        ->and($mismatchedTarget->blueReplicaBackends)->toBe([$scenario->application->uuid.'-blue']);
     $forwardPlan = PlanBlueGreenForwardRecovery::run($operation, $replicas);
     expect($forwardPlan->configuration->state->serialize())
         ->toBe($configuration->state->serialize());
@@ -466,6 +488,161 @@ it('completes a proven three-replica switching route with its stage-specific dig
         ->and($scenario->deployment->fresh()->blue_green_phase)->toBe(BlueGreenDeploymentPhase::IDLE);
 });
 
+it('reconstructs a recycled blue switching route from its pending deployment', function (): void {
+    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: true);
+    $candidateReplicas = blueGreenCrashBoundaryReplicaCandidates($scenario, routingRevision: 3);
+    $candidateConfiguration = blueGreenCrashBoundaryCandidateConfiguration(
+        $scenario,
+        $candidateReplicas,
+        routingRevision: 3,
+        mode: BlueGreenRoutingMode::Steady,
+        destinationFenceEpoch: 3,
+    );
+    $previousBlueDeploymentUuid = 'previous-finalized-blue';
+    $previousGreenDeploymentUuid = 'previous-finalized-green';
+    $previousBlueReplicaNames = [];
+
+    ApplicationDeploymentQueue::query()->create([
+        'application_id' => $scenario->application->id,
+        'deployment_uuid' => $previousBlueDeploymentUuid,
+        'pull_request_id' => 0,
+        'destination_id' => $scenario->destination->id,
+        'server_id' => $scenario->server->id,
+        'status' => ApplicationDeploymentStatus::FINISHED->value,
+        'finished_at' => now()->subMinutes(2),
+        'blue_green_color' => BlueGreenDeploymentColor::BLUE,
+        'blue_green_phase' => BlueGreenDeploymentPhase::IDLE,
+        'blue_green_routing_revision' => 1,
+    ]);
+    ApplicationDeploymentQueue::query()->create([
+        'application_id' => $scenario->application->id,
+        'deployment_uuid' => $previousGreenDeploymentUuid,
+        'pull_request_id' => 0,
+        'destination_id' => $scenario->destination->id,
+        'server_id' => $scenario->server->id,
+        'status' => ApplicationDeploymentStatus::FINISHED->value,
+        'finished_at' => now()->subMinute(),
+        'blue_green_color' => BlueGreenDeploymentColor::GREEN,
+        'blue_green_phase' => BlueGreenDeploymentPhase::IDLE,
+        'blue_green_routing_revision' => 2,
+    ]);
+    foreach ((new BlueGreenReplicaSet(3))->indexes() as $replicaIndex) {
+        $containerName = $scenario->application->uuid."-blue-finalized-replica-{$replicaIndex}";
+        $previousBlueReplicaNames[] = $containerName;
+        ApplicationBlueGreenReplica::query()->create([
+            'application_blue_green_deployment_id' => $scenario->state->id,
+            'application_id' => $scenario->application->id,
+            'standalone_docker_id' => $scenario->destination->id,
+            'color' => BlueGreenDeploymentColor::BLUE,
+            'replica_index' => $replicaIndex,
+            'deployment_uuid' => $previousBlueDeploymentUuid,
+            'routing_revision' => 1,
+            'compose_project' => $scenario->application->uuid,
+            'compose_service' => $containerName,
+            'container_name' => $containerName,
+            'container_id' => str_repeat((string) ($replicaIndex + 3), 64),
+            'health_status' => 'healthy',
+            'last_observed_at' => now()->subMinutes(2),
+        ]);
+    }
+    $scenario->deployment->update([
+        'blue_green_phase' => BlueGreenDeploymentPhase::SWITCHING,
+        'blue_green_routing_revision' => 3,
+    ]);
+    $scenario->state->update([
+        'active_color' => BlueGreenDeploymentColor::GREEN,
+        'pending_color' => BlueGreenDeploymentColor::BLUE,
+        'blue_deployment_uuid' => $previousBlueDeploymentUuid,
+        'green_deployment_uuid' => $previousGreenDeploymentUuid,
+        'pending_deployment_uuid' => BlueGreenRecoveryScenario::OPERATION_UUID,
+        'operation_previous_active_color' => BlueGreenDeploymentColor::GREEN,
+        'operation_previous_deployment_uuid' => $previousGreenDeploymentUuid,
+        'operation_previous_routing_revision' => 2,
+        'phase' => BlueGreenDeploymentPhase::SWITCHING,
+        'routing_revision' => 3,
+    ]);
+
+    $target = (new PlanBlueGreenSteadyState)->routingTargetForState(
+        $scenario->application,
+        $scenario->destination,
+        $scenario->state->fresh(),
+        $candidateConfiguration->state,
+    );
+    $reconstructedConfiguration = CompileBlueGreenProxyConfiguration::run(
+        $scenario->application,
+        $scenario->destination,
+        $target,
+    );
+    $candidateReplicaNames = array_map(
+        static fn (BlueGreenReplicaInspection $replica): string => $replica->containerName,
+        $candidateReplicas,
+    );
+
+    expect($target->blueReplicaBackends)->toBe($candidateReplicaNames)
+        ->and($target->blueReplicaBackends)->not->toContain($previousBlueReplicaNames[0])
+        ->and($target->activeReplicaSet?->identityDigest())->toBe($candidateConfiguration->state->activeReplicaSetDigest)
+        ->and($reconstructedConfiguration->state->activeDeploymentUuid)->toBe(BlueGreenRecoveryScenario::OPERATION_UUID)
+        ->and($reconstructedConfiguration->state->activeContainerId)->toBe($candidateConfiguration->state->activeContainerId)
+        ->and($reconstructedConfiguration->yaml)->toContain($candidateReplicaNames[0])
+        ->and($reconstructedConfiguration->yaml)->not->toContain($previousBlueReplicaNames[0]);
+});
+
+it('plans a released v2 fan-out sidecar instead of comparing it to its canonical projection', function (): void {
+    $scenario = BlueGreenRecoveryScenario::create();
+    $replicas = blueGreenCrashBoundaryReplicaCandidates($scenario, replicaCount: 2);
+    $releasedIdentity = BlueGreenReplicaSet::identityDigest($replicas);
+    $scenario->state->update([
+        ...ApplicationBlueGreenDeployment::clearedOperationAttributes(),
+        'active_color' => BlueGreenDeploymentColor::BLUE,
+        'blue_deployment_uuid' => BlueGreenRecoveryScenario::OPERATION_UUID,
+        'green_deployment_uuid' => null,
+        'pending_color' => null,
+        'pending_deployment_uuid' => null,
+        'phase' => BlueGreenDeploymentPhase::IDLE,
+    ]);
+    $scenario->deployment->update([
+        'status' => ApplicationDeploymentStatus::FINISHED->value,
+        'blue_green_phase' => BlueGreenDeploymentPhase::IDLE,
+        'blue_green_candidate_container_id' => $releasedIdentity,
+    ]);
+    $resolver = new ResolveBlueGreenExpectedProxyState;
+    $state = $scenario->state->fresh();
+    $provisional = $resolver->handle($scenario->application, $scenario->destination, $state)
+        ?? throw new LogicException('The released v2 fixture must resolve a provisional canonical state.');
+    $provisionalConfiguration = CompileBlueGreenProxyConfiguration::run(
+        $scenario->application,
+        $scenario->destination,
+        (new PlanBlueGreenSteadyState)->routingTargetForState(
+            $scenario->application,
+            $scenario->destination,
+            $state,
+            $provisional,
+        ),
+    );
+    $scenario->state->update([
+        'managed_file_sha256' => $provisionalConfiguration->sha256,
+        'application_routing_config_digest' => $provisionalConfiguration->routingConfigDigest,
+    ]);
+    $scenario->deployment->update([
+        'blue_green_routing_config_digest' => $provisionalConfiguration->routingConfigDigest,
+    ]);
+    $state = $scenario->state->fresh();
+    $canonical = $resolver->handle($scenario->application, $scenario->destination, $state)
+        ?? throw new LogicException('The released v2 fixture must resolve a canonical state.');
+    $released = $resolver->releasedV2FanOutState(
+        $scenario->application,
+        $scenario->destination,
+        $state,
+        $canonical,
+    ) ?? throw new LogicException('The released v2 fixture must preserve its rollback-safe sidecar state.');
+
+    $plan = PlanBlueGreenSteadyState::run($scenario->application, $scenario->destination, $state);
+
+    expect($canonical->serialize())->not->toBe($released->serialize())
+        ->and($plan->configuration->state->serialize())->toBe($released->serialize())
+        ->and($plan->configuration->state->serialize())->not->toBe($canonical->serialize());
+});
+
 it('restores and proves the legacy route even when the failed candidate is unhealthy', function (): void {
     config(['constants.ssh.mux_enabled' => false]);
     Notification::fake();
@@ -497,13 +674,17 @@ it('restores and proves the legacy route even when the failed candidate is unhea
     EnsureBlueGreenPreviousContainerRunning::shouldRun()
         ->once()
         ->andReturn($operation->currentDestinationState);
-    RebindBlueGreenLegacyRoutingSnapshot::shouldRun()->once()->andReturn($snapshot);
-    VerifyBlueGreenLegacyProviderRecovery::shouldRun()->once()->andReturnNull();
+    // Only the docker-inspect boundary is faked: the real rebind proves the
+    // captured routing identity against the durable pre-stop snapshot, and the
+    // real provider verification runs against the faked Traefik rawdata and
+    // direct-origin probes below.
+    CaptureBlueGreenLegacyRouting::shouldRun()->once()->andReturn($snapshot);
     RemoveExactBlueGreenCandidate::shouldRun()->once()->andReturn($operation->rollbackKey->rollbackState());
     BlueGreenProxyRollbackArtifactCommitter::shouldRun()->once()->andReturnNull();
     blueGreenCrashBoundaryFakeNoJournalRemote(
         managedRouteState: $operation->currentDestinationState
             ?? throw new LogicException('The routed crash-boundary recovery must retain its durable destination state.'),
+        traefikRawData: BlueGreenRecoveryScenario::traefikRawDataFor($snapshot),
     );
 
     $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
@@ -515,5 +696,16 @@ it('restores and proves the legacy route even when the failed candidate is unhea
         ->and($state->active_color)->toBeNull()
         ->and($state->operation_deployment_uuid)->toBeNull()
         ->and($scenario->deployment->fresh()->status)->toBe(ApplicationDeploymentStatus::FAILED->value);
-    Process::assertRanTimes(fn (): bool => true, 3);
+    // The required live sidecar attestation adds one managed-route read to the
+    // journal and provider-proof boundaries. The focused checks below still
+    // prove two Traefik rawdata reads bracket the direct-origin probes.
+    Process::assertRanTimes(fn (): bool => true, 7);
+    Process::assertRanTimes(
+        fn (PendingProcess $process): bool => str_contains((string) $process->command, '/api/rawdata'),
+        2,
+    );
+    Process::assertRanTimes(
+        fn (PendingProcess $process): bool => str_contains((string) $process->command, 'curl --config -'),
+        2,
+    );
 });
