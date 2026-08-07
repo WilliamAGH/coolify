@@ -7,9 +7,11 @@ All notable changes to this project will be documented in this file.
 ### 🐛 Bug Fixes
 
 - *(blue-green)* Fail the container-mutation guard on its first unmet assertion
+- *(deps)* Take league/commonmark 2.9.0 for six published advisories
 
 ### 📚 Documentation
 
+- Update changelog
 - Update changelog
 
 ## [4.13.74-fork] - 2026-08-06
