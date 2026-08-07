@@ -82,12 +82,25 @@ final class RetireBlueGreenInactiveContainer
                 return self::STALE;
             }
             if ($snapshot->destination_routing_topology_digest === null) {
-                (new RehydrateBlueGreenDestinationRoutingTopologyDigest)->handleUnderFence(
-                    $snapshot,
-                    $operationFence,
-                    $ownerDeploymentUuid,
-                    $supersessionGeneration,
-                );
+                try {
+                    (new RehydrateBlueGreenDestinationRoutingTopologyDigest)->handleUnderFence(
+                        $snapshot,
+                        $operationFence,
+                        $ownerDeploymentUuid,
+                        $supersessionGeneration,
+                    );
+                } catch (Throwable $exception) {
+                    if (! str_contains($exception->getMessage(), WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT)) {
+                        throw $exception;
+                    }
+
+                    // The retirement's own interrupted drain journal fences the
+                    // route read, and the journal-blocked recovery cannot
+                    // authenticate its context until the digest is established.
+                    // The journal is a transient artifact of a bounded drain
+                    // attempt: defer instead of wedging an intervention.
+                    return self::RETRY;
+                }
             }
             $operationFence->assertLockOwnership();
             $snapshot = ApplicationBlueGreenDeployment::query()->find($stateId);
@@ -915,11 +928,51 @@ final class RetireBlueGreenInactiveContainer
                     $ownerDeploymentUuid,
                     $generation,
                 );
-                $this->assertInactiveRetirementTargetsAreTerminal(
-                    $context['server'],
-                    $context['inactive_targets'],
-                    $context['replica_set'],
-                );
+                $hasRunningTargets = false;
+                foreach ($context['inactive_targets'] as $target) {
+                    $inspection = $this->inspectInactiveRetirementTarget(
+                        $context['server'],
+                        $target,
+                        $context['replica_set'],
+                    );
+                    if (! $inspection->exists) {
+                        throw new BlueGreenDeploymentTransitionException('A journal-free inactive-retirement target is missing instead of provably terminal.');
+                    }
+                    if (! is_string($inspection->dockerId)
+                        || ! is_string($target['expectation']->dockerId)
+                        || ! hash_equals($target['expectation']->dockerId, $inspection->dockerId)) {
+                        throw new BlueGreenDeploymentTransitionException('An inactive-retirement target changed immutable Docker identity during recovery.');
+                    }
+                    if (self::isTerminalStoppedStatus($inspection->status)) {
+                        continue;
+                    }
+                    if ($inspection->status !== ContainerStatusTypes::RUNNING->value) {
+                        throw new BlueGreenDeploymentTransitionException('A journal-free inactive-retirement target is neither provably terminal nor drainably running.');
+                    }
+                    $hasRunningTargets = true;
+                }
+                if ($hasRunningTargets) {
+                    // A journal-free route that still matches the pre-retirement
+                    // state with its exact target running is an unfinished drain,
+                    // not an ambiguity: reschedule the exact owner instead of
+                    // wedging the destination behind a permanent intervention.
+                    $updated = ApplicationBlueGreenDeployment::query()
+                        ->whereKey($stateId)
+                        ->where('inactive_retirement_owner_deployment_uuid', $ownerDeploymentUuid)
+                        ->where('inactive_retirement_supersession_generation', $generation)
+                        ->whereNull('inactive_retirement_stopped_at')
+                        ->whereNotNull('inactive_retirement_intervention_required_at')
+                        ->update([
+                            'inactive_retirement_attempts' => 0,
+                            'inactive_retirement_intervention_required_at' => null,
+                            'inactive_retirement_not_before_at' => now(),
+                        ]);
+                    if ($updated !== 1) {
+                        throw new BlueGreenDeploymentTransitionException('The running inactive-retirement owner changed during journal-free reconciliation.');
+                    }
+
+                    return self::RETRY;
+                }
                 $this->assertRetirementOwnership(
                     $operationFence,
                     $stateId,

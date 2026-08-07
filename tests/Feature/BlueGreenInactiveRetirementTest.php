@@ -1864,6 +1864,13 @@ function fakePendingExpectedSidecarInactiveRetirementRemote(
                 ."\n".base64_encode($replacementState->serialize()));
         }
         if (str_contains($payload, 'coolify-blue-green-managed-route:present:')) {
+            if ($journalPresent) {
+                // The real read script fences on a pending container-mutation
+                // journal before disclosing any route bytes.
+                return Process::result(
+                    output: WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT,
+                );
+            }
             $liveState = $replacementFinalized ? $replacementState : $expectedState;
 
             return Process::result(output: 'coolify-blue-green-managed-route:present:'
@@ -3337,6 +3344,121 @@ it('recovers a committed idle retirement with no intervention marker before a la
     expect($claim->deploymentUuid)->toBe($successor->deployment_uuid)
         ->and($claimedState->phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
         ->and($claimedState->destination_fence_operation_id)->toBe($owner->deployment_uuid);
+});
+
+it('defers a retirement whose rehydration is fenced by its own pending drain journal instead of wedging', function (): void {
+    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeWedgedBlueGreenInactiveRetirement();
+    prepareBlueGreenInactiveRetirementRemote($application->destination->server);
+    $state->update([
+        'inactive_retirement_intervention_required_at' => null,
+        'destination_routing_topology_digest' => null,
+    ]);
+    $state = $state->fresh();
+    $successor = makeBlueGreenInactiveRetirementDeployment($application);
+    $expectedState = ResolveBlueGreenExpectedProxyState::run(
+        $application,
+        $application->destination,
+        $state,
+    ) ?? throw new RuntimeException('The pending rehydration fixture requires an exact expected route state.');
+    $replacementState = $expectedState->withMutationOwner($owner->deployment_uuid);
+    $payloads = [];
+    $archiveRequested = false;
+    $journalPresent = true;
+    $journalScriptsReplayed = false;
+    fakePendingExpectedSidecarInactiveRetirementRemote(
+        $payloads,
+        $archiveRequested,
+        $journalPresent,
+        $journalScriptsReplayed,
+        $expectedState,
+        $replacementState,
+        $state->inactive_retirement_server_boot_id,
+    );
+    InspectBlueGreenContainer::shouldRun()
+        ->andReturnUsing(static fn (Server $server, BlueGreenContainerExpectation $expectation): BlueGreenContainerInspection => $expectation->dockerId === null
+            ? ($expectation->name === $expectedState->activeContainerName
+                ? new BlueGreenContainerInspection(
+                    exists: true,
+                    dockerId: $expectedState->activeContainerId,
+                    status: ContainerStatusTypes::RUNNING->value,
+                    health: 'healthy',
+                )
+                : BlueGreenContainerInspection::missing())
+            : new BlueGreenContainerInspection(
+                exists: true,
+                dockerId: $expectation->dockerId,
+                status: $expectation->deploymentUuid === $state->inactive_retirement_deployment_uuid
+                    ? ContainerStatusTypes::EXITED->value
+                    : ContainerStatusTypes::RUNNING->value,
+                health: 'healthy',
+            ));
+    $lifecycle = makeBlueGreenInactiveRetirementLifecycle($application, $successor);
+
+    expect(fn () => $lifecycle->initialize())->toThrow(BlueGreenRecoveryHandoffException::class);
+
+    $recoveredState = $state->fresh();
+    expect($archiveRequested)->toBeFalse()
+        ->and($journalPresent)->toBeTrue()
+        ->and($journalScriptsReplayed)->toBeFalse()
+        ->and($recoveredState->inactive_retirement_intervention_required_at)->toBeNull()
+        ->and($recoveredState->inactive_retirement_stopped_at)->toBeNull()
+        ->and($recoveredState->destination_routing_topology_digest)->toBeNull();
+});
+
+it('reschedules a marked journal-free retirement whose exact inactive target is still running instead of wedging', function (): void {
+    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeWedgedBlueGreenInactiveRetirement();
+    prepareBlueGreenInactiveRetirementRemote($application->destination->server);
+    $state = $state->fresh();
+    $successor = makeBlueGreenInactiveRetirementDeployment($application);
+    $expectedState = ResolveBlueGreenExpectedProxyState::run(
+        $application,
+        $application->destination,
+        $state,
+    ) ?? throw new RuntimeException('The running journal-free retirement fixture requires an exact expected route state.');
+    $inactiveContainerId = $state->inactive_retirement_container_id;
+    $payloads = [];
+    $strictManagedRouteRead = false;
+    fakeAbsentExpectedSidecarInactiveRetirementRemote(
+        $payloads,
+        $strictManagedRouteRead,
+        $expectedState,
+        $state->inactive_retirement_server_boot_id,
+    );
+    InspectBlueGreenContainer::shouldRun()
+        ->andReturnUsing(static function (Server $server, BlueGreenContainerExpectation $expectation) use ($expectedState, $inactiveContainerId): BlueGreenContainerInspection {
+            if ($expectation->dockerId === $inactiveContainerId) {
+                return new BlueGreenContainerInspection(
+                    exists: true,
+                    dockerId: $inactiveContainerId,
+                    status: ContainerStatusTypes::RUNNING->value,
+                    health: 'healthy',
+                );
+            }
+            if ($expectation->name === $expectedState->activeContainerName
+                || $expectation->dockerId === $expectedState->activeContainerId) {
+                return new BlueGreenContainerInspection(
+                    exists: true,
+                    dockerId: $expectedState->activeContainerId,
+                    status: ContainerStatusTypes::RUNNING->value,
+                    health: 'healthy',
+                );
+            }
+
+            return BlueGreenContainerInspection::missing();
+        });
+    $lifecycle = makeBlueGreenInactiveRetirementLifecycle($application, $successor);
+
+    expect(fn () => $lifecycle->initialize())->toThrow(BlueGreenRecoveryHandoffException::class);
+
+    $recoveredState = $state->fresh();
+    expect($recoveredState->inactive_retirement_intervention_required_at)->toBeNull()
+        ->and($recoveredState->inactive_retirement_attempts)->toBe(0)
+        ->and($recoveredState->inactive_retirement_stopped_at)->toBeNull()
+        ->and(implode("\n", $payloads))->not->toContain(
+            WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_CAS_OUTPUT_PREFIX,
+            'container_journal_stage=',
+            'operation_container_state_stage=',
+        );
 });
 
 it('recovers a pending expected-sidecar retirement with no intervention marker before successor claim', function (): void {
