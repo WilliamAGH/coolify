@@ -6,6 +6,7 @@ use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentTransitionException;
 use App\Actions\Application\BlueGreen\BlueGreenManagedRouteMetadataForOperationResult;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaInspection;
+use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Actions\Application\BlueGreen\RecoverCleanIdleBlueGreenContainerMutationJournal;
 use App\Actions\Application\BlueGreen\RepairBlueGreenSteadyStates;
@@ -684,4 +685,150 @@ it('invokes the same clean idle coordinator from ordinary destination attestatio
 
     expect($attested?->serialize())->toBe($expectedState->serialize())
         ->and($journalPresent)->toBeFalse();
+});
+
+it('proves a released fan-out route carrying the legacy aggregate digest against its exact live replica set', function (): void {
+    $scenario = BlueGreenRecoveryScenario::create(finalized: true, routingMutationRecorded: true);
+    $scenario->state->update([
+        ...ApplicationBlueGreenDeployment::clearedOperationAttributes(),
+        ...ApplicationBlueGreenDeployment::clearedInactiveRetirementAttributes(),
+        'legacy_container_name' => null,
+        'phase' => BlueGreenDeploymentPhase::IDLE,
+    ]);
+    $scenario->deployment->update([
+        'status' => ApplicationDeploymentStatus::FINISHED->value,
+        'finished_at' => now()->subMinute(),
+    ]);
+    $inspections = collect([1, 2])->map(function (int $replicaIndex) use ($scenario): BlueGreenReplicaInspection {
+        $composeService = "{$scenario->application->uuid}-blue-replica-{$replicaIndex}";
+
+        return BlueGreenReplicaInspection::fromRuntime(
+            replicaIndex: $replicaIndex,
+            composeService: $composeService,
+            containerName: $composeService,
+            dockerId: str_repeat((string) $replicaIndex, 64),
+            status: 'running',
+            health: 'healthy',
+        );
+    })->all();
+    $legacyAggregateDigest = BlueGreenReplicaSet::identityDigest($inspections);
+    $scenario->deployment->update([
+        'blue_green_candidate_container_id' => $legacyAggregateDigest,
+    ]);
+    foreach ($inspections as $inspection) {
+        ApplicationBlueGreenReplica::query()->create([
+            'application_blue_green_deployment_id' => $scenario->state->id,
+            'application_id' => $scenario->application->id,
+            'standalone_docker_id' => $scenario->destination->id,
+            'color' => BlueGreenDeploymentColor::BLUE,
+            'replica_index' => $inspection->replicaIndex,
+            'deployment_uuid' => $scenario->deployment->deployment_uuid,
+            'routing_revision' => 1,
+            'compose_project' => $scenario->application->uuid,
+            'compose_service' => $inspection->composeService,
+            'container_name' => $inspection->containerName,
+            'container_id' => $inspection->dockerId,
+            'health_status' => 'healthy',
+            'last_observed_at' => now()->subMinute(),
+        ]);
+    }
+    $canonicalState = ResolveBlueGreenExpectedProxyState::run(
+        $scenario->application,
+        $scenario->destination,
+        $scenario->state->fresh(),
+    ) ?? throw new RuntimeException('The released fan-out fixture requires an exact managed route.');
+    // The exact bytes a released v2 fan-out writer persisted: the fixed colour
+    // name and the legacy aggregate digest, with no v4 replica-set fields.
+    $releasedState = new BlueGreenProxyState(
+        managedFilename: $canonicalState->managedFilename,
+        applicationUuid: $canonicalState->applicationUuid,
+        destinationId: $canonicalState->destinationId,
+        operationId: $canonicalState->operationId,
+        mutationSequence: $canonicalState->mutationSequence,
+        destinationFenceEpoch: $canonicalState->destinationFenceEpoch,
+        routingRevision: $canonicalState->routingRevision,
+        managedSha256: $canonicalState->managedSha256,
+        activeColor: $canonicalState->activeColor,
+        activeDeploymentUuid: $canonicalState->activeDeploymentUuid,
+        activeContainerName: $scenario->application->uuid.'-blue',
+        activeContainerId: $legacyAggregateDigest,
+        applicationRoutingConfigDigest: $canonicalState->applicationRoutingConfigDigest,
+        destinationTopologyDigest: $canonicalState->destinationTopologyDigest,
+    );
+    $impostorState = new BlueGreenProxyState(
+        managedFilename: $releasedState->managedFilename,
+        applicationUuid: $releasedState->applicationUuid,
+        destinationId: $releasedState->destinationId,
+        operationId: $releasedState->operationId,
+        mutationSequence: $releasedState->mutationSequence,
+        destinationFenceEpoch: $releasedState->destinationFenceEpoch,
+        routingRevision: $releasedState->routingRevision,
+        managedSha256: $releasedState->managedSha256,
+        activeColor: $releasedState->activeColor,
+        activeDeploymentUuid: $releasedState->activeDeploymentUuid,
+        activeContainerName: $releasedState->activeContainerName,
+        activeContainerId: hash('sha256', 'released-fan-out-impostor-identity'),
+        applicationRoutingConfigDigest: $releasedState->applicationRoutingConfigDigest,
+        destinationTopologyDigest: $releasedState->destinationTopologyDigest,
+    );
+    $runtimeById = collect($inspections)->mapWithKeys(fn (BlueGreenReplicaInspection $inspection): array => [
+        $inspection->dockerId => json_encode([
+            'Id' => $inspection->dockerId,
+            'Name' => '/'.$inspection->containerName,
+            'State' => [
+                'Status' => $inspection->status,
+                'Health' => ['Status' => $inspection->health],
+            ],
+            'Config' => ['Labels' => [
+                'coolify.applicationId' => (string) $scenario->application->id,
+                'coolify.pullRequestId' => '0',
+                'coolify.blueGreen.managed' => 'true',
+                'coolify.blueGreen.deploymentUuid' => $scenario->deployment->deployment_uuid,
+                'coolify.blueGreen.color' => BlueGreenDeploymentColor::BLUE->value,
+                'coolify.blueGreen.routingRevision' => '1',
+                'coolify.blueGreen.replicaIndex' => (string) $inspection->replicaIndex,
+                'coolify.blueGreen.replicaCount' => '2',
+                'com.docker.compose.project' => $scenario->application->uuid,
+                'com.docker.compose.service' => $inspection->composeService,
+            ]],
+        ], JSON_THROW_ON_ERROR),
+    ]);
+    $runtimeOutput = $runtimeById->implode("\n");
+    $releaseProof = BlueGreenRoutingTarget::durableReleaseProofToken($scenario->deployment->deployment_uuid);
+    Process::fake(function (PendingProcess $process) use ($releaseProof, $runtimeById, $runtimeOutput) {
+        $payload = (string) $process->command."\n".(string) $process->input;
+        if (str_contains($payload, 'coolify_replica_')) {
+            return Process::result(output: $runtimeOutput);
+        }
+        if (str_contains($payload, VerifyBlueGreenCandidateReleaseProof::LABEL)) {
+            return Process::result(output: json_encode([
+                VerifyBlueGreenCandidateReleaseProof::ENVIRONMENT_VARIABLE.'='.$releaseProof,
+            ], JSON_THROW_ON_ERROR));
+        }
+        foreach ($runtimeById as $dockerId => $runtime) {
+            if (str_contains($payload, "docker container inspect '{$dockerId}'")) {
+                return Process::result(output: $runtime);
+            }
+        }
+
+        return Process::result(errorOutput: 'Unexpected released fan-out runtime proof command.', exitCode: 1);
+    });
+    $proveActiveRuntime = function (BlueGreenProxyState $expectedState) use ($scenario): void {
+        (new ReflectionMethod(RecoverCleanIdleBlueGreenContainerMutationJournal::class, 'assertExactActiveRuntime'))->invoke(
+            new RecoverCleanIdleBlueGreenContainerMutationJournal,
+            $scenario->server,
+            $scenario->application,
+            $scenario->destination,
+            $scenario->state->fresh(),
+            $expectedState,
+        );
+    };
+
+    expect($releasedState->activeSetFenceIdentity())->toBe($legacyAggregateDigest)
+        ->and($legacyAggregateDigest)->not->toBe($canonicalState->activeReplicaSetDigest)
+        ->and(fn () => $proveActiveRuntime($releasedState))->not->toThrow(BlueGreenDeploymentTransitionException::class)
+        ->and(fn () => $proveActiveRuntime($impostorState))->toThrow(
+            BlueGreenDeploymentTransitionException::class,
+            'no longer matches its durable route identity',
+        );
 });

@@ -345,24 +345,18 @@ class RecoverCleanIdleBlueGreenContainerMutationJournal
                     $replicaSet,
                 );
                 $replicaSet->assertPromotionThreshold($inspections);
-                if ($replicaSet->usesScalarCompatibilityPath()) {
-                    $runtimeIdentity = $inspections[0]->dockerId;
-                } else {
-                    $scalarBackendPorts = [];
-                    foreach ($expectedState->activeReplicaSet?->members ?? [] as $member) {
-                        foreach ($member->ports as $port) {
-                            $scalarBackendPorts[$port] = true;
-                        }
-                    }
-                    $runtimeIdentity = ResolveBlueGreenActiveReplicaSet::run(
-                        $application->blueGreenComposeTopology(),
-                        $expectedState->activeColor,
-                        $replicaSet,
-                        $inspections,
-                        array_keys($scalarBackendPorts),
-                    )?->identityDigest()
-                        ?? throw new BlueGreenDeploymentTransitionException('The live replica set has no aggregate identity to fence.');
+                $routedComposeService = null;
+                if ($replicaSet->usesScalarReplicaNaming() && $replicaSet->members !== []) {
+                    $routedComposeService = $application->blueGreenComposeTopology()
+                        ?->candidateServiceName($expectedState->activeColor);
                 }
+                $expectedFenceIdentity = $expectedState->activeSetFenceIdentity();
+                $matchesDurableRouteIdentity = is_string($expectedFenceIdentity)
+                    && $replicaSet->matchesPersistedFenceIdentity(
+                        $expectedFenceIdentity,
+                        $inspections,
+                        $routedComposeService,
+                    );
             } catch (Throwable $exception) {
                 throw new BlueGreenDeploymentTransitionException(
                     'The exact active clean IDLE replica set could not be proven running and healthy; journal archival refused.',
@@ -370,8 +364,7 @@ class RecoverCleanIdleBlueGreenContainerMutationJournal
                     $exception,
                 );
             }
-            $expectedFenceIdentity = $expectedState->activeSetFenceIdentity();
-            if (! is_string($expectedFenceIdentity) || ! hash_equals($expectedFenceIdentity, $runtimeIdentity)) {
+            if (! $matchesDurableRouteIdentity) {
                 throw new BlueGreenDeploymentTransitionException('The exact active clean IDLE replica set no longer matches its durable route identity.');
             }
 
