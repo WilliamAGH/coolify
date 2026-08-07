@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [unreleased]
+
+### 🐛 Bug Fixes
+
+- *(blue-green)* Fail the container-mutation guard on its first unmet assertion
+
+### 📚 Documentation
+
+- Update changelog
+
 ## [4.13.74-fork] - 2026-08-06
 
 ### 🐛 Bug Fixes
