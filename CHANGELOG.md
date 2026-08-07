@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [unreleased]
 
+### 🚀 Features
+
+- *(blue-green)* Resume an unreconstructable fixed-color drain from its operation journal
+
+### 📚 Documentation
+
+- Update changelog
+
+### 🧪 Testing
+
+- *(api)* Prove generic cancellation stays unfenced without a dispatch binding
+
+## [4.13.75-fork] - 2026-08-07
+
 ### 🐛 Bug Fixes
 
 - *(blue-green)* Fail the container-mutation guard on its first unmet assertion
