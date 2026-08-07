@@ -43,27 +43,51 @@ use App\Models\Server;
 use App\Models\StandaloneDocker;
 use App\Models\Team;
 use App\Services\BlueGreenDeploymentLifecycle;
+use Illuminate\Foundation\Testing\DatabaseTruncation as LaravelDatabaseTruncation;
 use Illuminate\Process\PendingProcess;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Storage;
 use Symfony\Component\Yaml\Yaml;
 
+trait TruncatesReleasedV3StateDatabase
+{
+    use LaravelDatabaseTruncation {
+        truncateDatabaseTables as private truncatePersistentDatabaseTables;
+    }
+
+    protected function truncateDatabaseTables(): void
+    {
+        if (DB::getDriverName() === 'sqlite') {
+            Artisan::call('migrate:fresh', ['--no-interaction' => true]);
+
+            return;
+        }
+
+        $this->truncatePersistentDatabaseTables();
+    }
+}
+
 // Not RefreshDatabase: its per-test wrapping transaction would keep
 // DB::transactionLevel() at 1 on the PostgreSQL lane, and the legacy
 // route network attestation these tests execute for real refuses to run
-// inside a transaction. migrate:fresh isolation matches
-// BlueGreenTopologyDigestConnectionSettingsTest, the sibling that also
-// attests against a live connection.
+// inside a transaction. DatabaseTruncation preserves transaction level 0
+// without rebuilding the entire persistent schema around every test. The
+// file-local trait retains migrate:fresh for in-memory SQLite because that
+// schema is discarded whenever Laravel rebuilds the test application.
+uses(TruncatesReleasedV3StateDatabase::class);
+
 beforeEach(function (): void {
-    Artisan::call('migrate:fresh', ['--no-interaction' => true]);
     InstanceSettings::unguarded(fn () => InstanceSettings::query()->create(['id' => 0]));
     config(['constants.ssh.mux_enabled' => false]);
 });
 
 afterEach(function (): void {
-    Artisan::call('migrate:fresh', ['--no-interaction' => true]);
+    if (DB::getDriverName() !== 'sqlite') {
+        $this->truncateDatabaseTables();
+    }
 });
 
 /**
