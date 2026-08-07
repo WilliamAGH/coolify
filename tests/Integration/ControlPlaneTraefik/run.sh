@@ -164,24 +164,53 @@ reap_registered_background_pids() {
 
 cleanup() {
     local exit_code=$?
+    local cleanup_status=0
+    local cleanup_failure
+    local temporary_directory_cleanup_status
+    local -a cleanup_failures=()
 
     trap - EXIT
     set +e
     terminate_registered_background_pids
     if [ "$COMPOSE_STARTED" -eq 1 ]; then
-        compose down --volumes --remove-orphans >/dev/null 2>&1
+        if compose down --volumes --remove-orphans >/dev/null 2>&1; then
+            :
+        else
+            cleanup_status=$?
+            cleanup_failures+=("owned Compose project cleanup failed with status $cleanup_status")
+        fi
     fi
     reap_registered_background_pids
     if [ -n "$TEMP_DIRECTORY" ]; then
         case "$TEMP_DIRECTORY" in
             "$TEMP_BASE"/coolify-control-plane-traefik.*)
-                rm -rf -- "$TEMP_DIRECTORY"
+                if rm -rf -- "$TEMP_DIRECTORY"; then
+                    :
+                else
+                    temporary_directory_cleanup_status=$?
+                    if [ "$cleanup_status" -eq 0 ]; then
+                        cleanup_status=$temporary_directory_cleanup_status
+                    fi
+                    cleanup_failures+=("owned temporary directory cleanup failed with status $temporary_directory_cleanup_status")
+                fi
                 ;;
             *)
                 printf 'Refusing to remove unexpected integration directory: %s\n' "$TEMP_DIRECTORY" >&2
                 ;;
         esac
     fi
+    if [ "$cleanup_status" -ne 0 ]; then
+        for cleanup_failure in "${cleanup_failures[@]}"; do
+            if [ "$exit_code" -eq 0 ]; then
+                printf 'FAIL: %s.\n' "$cleanup_failure" >&2
+            else
+                printf 'WARN: %s; preserving primary status %s.\n' \
+                    "$cleanup_failure" "$exit_code" >&2
+            fi
+        done
+        [ "$exit_code" -eq 0 ] && exit "$cleanup_status"
+    fi
+
     exit "$exit_code"
 }
 
@@ -1652,6 +1681,174 @@ assert_transport_report_validation() {
     done
 }
 
+assert_cleanup_exit_status_contract() {
+    local cleanup_case
+    local primary_status
+    local compose_cleanup_status
+    local temporary_directory_cleanup_status
+    local cleanup_exit_status
+    local expected_status
+    local child_exit_status
+    local expected_cleanup_message
+    local output_file
+    local fixture_base
+    local fixture_directory
+    local fake_command_directory
+    local fake_docker
+    local fake_rm
+    local -a expected_cleanup_messages=()
+
+    for cleanup_case in compose temporary-directory combined; do
+        expected_cleanup_messages=()
+        case "$cleanup_case" in
+            compose)
+                compose_cleanup_status=42
+                temporary_directory_cleanup_status=0
+                cleanup_exit_status=$compose_cleanup_status
+                expected_cleanup_messages+=("owned Compose project cleanup failed with status $compose_cleanup_status")
+                ;;
+            temporary-directory)
+                compose_cleanup_status=0
+                temporary_directory_cleanup_status=43
+                cleanup_exit_status=$temporary_directory_cleanup_status
+                expected_cleanup_messages+=("owned temporary directory cleanup failed with status $temporary_directory_cleanup_status")
+                ;;
+            combined)
+                compose_cleanup_status=42
+                temporary_directory_cleanup_status=43
+                cleanup_exit_status=$compose_cleanup_status
+                expected_cleanup_messages+=("owned Compose project cleanup failed with status $compose_cleanup_status")
+                expected_cleanup_messages+=("owned temporary directory cleanup failed with status $temporary_directory_cleanup_status")
+                ;;
+            *)
+                fail "Unsupported cleanup self-test case: $cleanup_case"
+                ;;
+        esac
+
+        for primary_status in 0 23; do
+            if [ "$primary_status" -eq 0 ]; then
+                expected_status=$cleanup_exit_status
+            else
+                expected_status=$primary_status
+            fi
+            output_file=$(mktemp "$TEMP_DIRECTORY/cleanup-status.${cleanup_case}.${primary_status}.XXXXXX")
+            fixture_base=$(mktemp -d "$TEMP_DIRECTORY/cleanup-fixture.${cleanup_case}.${primary_status}.XXXXXX")
+            fixture_directory="$fixture_base/coolify-control-plane-traefik.cleanup"
+            fake_command_directory="$fixture_base/fake-command-bin"
+            fake_docker="$fake_command_directory/docker"
+            fake_rm="$fake_command_directory/rm"
+            mkdir -p "$fake_command_directory"
+            printf '%s\n' '#!/usr/bin/env bash' "exit $compose_cleanup_status" > "$fake_docker"
+            chmod 700 "$fake_docker"
+            if [ "$temporary_directory_cleanup_status" -ne 0 ]; then
+                printf '%s\n' \
+                    '#!/usr/bin/env bash' \
+                    'set -euo pipefail' \
+                    "if [ \"\$#\" -ne 3 ] || [ \"\$1\" != \"-rf\" ] || [ \"\$2\" != \"--\" ] || [ \"\$3\" != \"\${CONTROL_PLANE_TRAEFIK_CLEANUP_SELF_TEST_TEMP_DIRECTORY:?}\" ]; then" \
+                    '    printf "Refusing unexpected cleanup self-test rm invocation.\\n" >&2' \
+                    '    exit 97' \
+                    'fi' \
+                    "exit $temporary_directory_cleanup_status" > "$fake_rm"
+                chmod 700 "$fake_rm"
+            fi
+
+            if PATH="$fake_command_directory:$PATH" \
+                CONTROL_PLANE_TRAEFIK_CLEANUP_SELF_TEST_ROOT="$TEMP_DIRECTORY" \
+                CONTROL_PLANE_TRAEFIK_CLEANUP_SELF_TEST_TEMP_DIRECTORY="$fixture_directory" \
+                "$SCRIPT_DIRECTORY/run.sh" --self-test-cleanup-child \
+                "$primary_status" "$fixture_base" "$fixture_directory" "$cleanup_case" > "$output_file" 2>&1; then
+                child_exit_status=0
+            else
+                child_exit_status=$?
+            fi
+
+            if [ "$child_exit_status" -ne "$expected_status" ]; then
+                rm -rf -- "$fixture_base" "$output_file"
+                fail "Cleanup self-test exited $child_exit_status instead of $expected_status for $cleanup_case primary status $primary_status"
+            fi
+            for expected_cleanup_message in "${expected_cleanup_messages[@]}"; do
+                if ! grep -Fq "$expected_cleanup_message" "$output_file"; then
+                    rm -rf -- "$fixture_base" "$output_file"
+                    fail "Cleanup self-test did not report $expected_cleanup_message for $cleanup_case primary status $primary_status"
+                fi
+            done
+            if [ "$temporary_directory_cleanup_status" -eq 0 ] && [ -e "$fixture_directory" ]; then
+                rm -rf -- "$fixture_base" "$output_file"
+                fail "Cleanup self-test did not remove its owned temporary directory for $cleanup_case primary status $primary_status"
+            fi
+            if [ "$temporary_directory_cleanup_status" -ne 0 ] && [ ! -d "$fixture_directory" ]; then
+                rm -rf -- "$fixture_base" "$output_file"
+                fail "Cleanup self-test did not preserve the injected temporary-directory cleanup failure for $cleanup_case primary status $primary_status"
+            fi
+            rm -rf -- "$fixture_base" "$output_file"
+        done
+    done
+}
+
+run_cleanup_self_test_child() {
+    local primary_status=$1
+    local fixture_base=$2
+    local fixture_directory=$3
+    local cleanup_case=$4
+    local fake_command_directory="$fixture_base/fake-command-bin"
+    local fake_docker="$fake_command_directory/docker"
+    local fake_rm="$fake_command_directory/rm"
+    local self_test_root=${CONTROL_PLANE_TRAEFIK_CLEANUP_SELF_TEST_ROOT:-}
+
+    case "$primary_status" in
+        0 | 23)
+            ;;
+        *)
+            fail "Unsupported cleanup self-test primary status: $primary_status"
+            ;;
+    esac
+    [ -x "$fake_docker" ] || fail "Cleanup self-test fake Docker executable is unavailable: $fake_docker"
+    [ "$(command -v docker)" = "$fake_docker" ] \
+        || fail 'Cleanup self-test refuses to run without its fake Docker executable first in PATH'
+    case "$self_test_root" in
+        ?*)
+            ;;
+        *)
+            fail 'Cleanup self-test root is unavailable'
+            ;;
+    esac
+    case "$fixture_base" in
+        "$self_test_root"/cleanup-fixture.*)
+            ;;
+        *)
+            fail "Unexpected cleanup self-test fixture base: $fixture_base"
+            ;;
+    esac
+    case "$fixture_directory" in
+        "$fixture_base"/coolify-control-plane-traefik.cleanup)
+            ;;
+        *)
+            fail "Unexpected cleanup self-test temporary directory: $fixture_directory"
+            ;;
+    esac
+    case "$cleanup_case" in
+        compose)
+            [ ! -e "$fake_rm" ] || fail "Unexpected fake rm executable for cleanup self-test case: $cleanup_case"
+            ;;
+        temporary-directory | combined)
+            [ -x "$fake_rm" ] || fail "Cleanup self-test fake rm executable is unavailable: $fake_rm"
+            [ "$(command -v rm)" = "$fake_rm" ] \
+                || fail 'Cleanup self-test refuses to run without its fake rm executable first in PATH'
+            ;;
+        *)
+            fail "Unsupported cleanup self-test case: $cleanup_case"
+            ;;
+    esac
+
+    COMPOSE_STARTED=1
+    PROJECT_NAME='cpbg-cleanup-self-test'
+    TEMP_BASE=$fixture_base
+    TEMP_DIRECTORY=$fixture_directory
+    BACKGROUND_PIDS=()
+    mkdir -p "$TEMP_DIRECTORY"
+    exit "$primary_status"
+}
+
 start_transition_observer() {
     local log_file=$1
     local applied_barrier_file=$2
@@ -2136,17 +2333,22 @@ main() {
     local restart_started_at
     local total_route_requests
 
+    if [ "${1:-}" = --self-test-cleanup-child ]; then
+        [ "$#" -eq 5 ] || fail 'Usage: run.sh --self-test-cleanup-child <primary-status> <fixture-base> <fixture-directory> <cleanup-case>'
+        run_cleanup_self_test_child "$2" "$3" "$4" "$5"
+    fi
     if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$1" != --self-test ]; }; then
         fail 'Usage: run.sh [--self-test]'
     fi
     if [ "${1:-}" = --self-test ]; then
-        for command in python3 mktemp awk jq; do
+        for command in python3 mktemp awk jq mkdir rm chmod grep; do
             require_command "$command"
         done
         initialize_temp_directory
         assert_transition_log_validation
         assert_transport_report_validation
-        printf 'PASS: transition-log and transport-report validation self-tests completed.\n'
+        assert_cleanup_exit_status_contract
+        printf 'PASS: transition-log, transport-report, and cleanup validation self-tests completed.\n'
         return
     fi
 
@@ -2177,7 +2379,7 @@ main() {
     initialize_temp_directory
     assert_transition_log_validation
     assert_transport_report_validation
-    PROJECT_NAME="coolify-control-plane-traefik-$$"
+    PROJECT_NAME="cpbg-control-plane-traefik-$$"
     TRAEFIK_CERT_DIR="$TEMP_DIRECTORY/certs"
     BACKEND_BLUE_STATE_DIR="$TEMP_DIRECTORY/backend-blue"
     BACKEND_GREEN_STATE_DIR="$TEMP_DIRECTORY/backend-green"
