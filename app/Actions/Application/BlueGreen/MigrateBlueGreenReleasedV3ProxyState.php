@@ -44,7 +44,15 @@ final class MigrateBlueGreenReleasedV3ProxyState
             : $resolver->releasedV2FanOutState($application, $destination, $state, $canonicalState);
         ReadBlueGreenServerBootIdentity::run($server, $expectedServerBootId);
         $operationFence->assertLockOwnership();
-        $liveState = ReadBlueGreenManagedRouteMetadata::run($server, $application, $destination);
+        $liveState = $releasedV3State === null && $releasedV2State === null
+            ? AttestBlueGreenDestinationState::run(
+                $server,
+                $application,
+                $destination,
+                null,
+                $canonicalState,
+            )
+            : ReadBlueGreenManagedRouteMetadata::run($server, $application, $destination);
         if (! BlueGreenProxyState::matches($liveState, $canonicalState)
             && ! BlueGreenProxyState::matches($liveState, $releasedV3State)
             && ! BlueGreenProxyState::matches($liveState, $releasedV2State)) {

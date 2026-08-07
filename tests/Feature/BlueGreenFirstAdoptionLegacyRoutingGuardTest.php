@@ -350,6 +350,9 @@ it('re-claims a cleanly rolled-back first adoption without routing into stale-jo
     }
 
     expect((string) $successor->fresh()?->logs)->not->toContain('Failed first-adoption stale-journal recovery')
+        ->and(collect($payloads)->filter(
+            static fn (string $payload): bool => str_contains($payload, 'coolify-blue-green-destination-state-attested'),
+        )->count())->toBeGreaterThanOrEqual(2)
         ->and(implode("\n", $payloads))->not->toContain(
             WriteBlueGreenProxyConfiguration::STALE_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX,
         );
@@ -395,7 +398,10 @@ it('continues a successor deploy when the stale first-adoption journal is not ar
     }
 
     expect((string) $successor->fresh()?->logs)
-        ->toContain('was not archivable for this successor');
+        ->toContain('was not archivable for this successor')
+        ->and(collect($payloads)->filter(
+            static fn (string $payload): bool => str_contains($payload, 'coolify-blue-green-destination-state-attested'),
+        )->count())->toBeGreaterThanOrEqual(2);
 });
 
 it('refuses first blue-green adoption before any destination mutation when legacy routing labels drift', function (): void {
