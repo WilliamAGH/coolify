@@ -42,6 +42,10 @@ final class RetireBlueGreenInactiveContainer
 
     public const MAX_ATTEMPTS = 10;
 
+    private const AMBIGUOUS_MUTATION_REASON = 'ambiguous_mutation';
+
+    private const TRANSITION_FAILURE_REASON = 'transition_failure';
+
     public function handle(
         int $stateId,
         string $ownerDeploymentUuid,
@@ -383,8 +387,13 @@ final class RetireBlueGreenInactiveContainer
                 ->first();
 
             if ($state->inactive_retirement_intervention_required_at !== null) {
+                $correlationId = $this->reportRetirementFailure(
+                    $exception,
+                    self::TRANSITION_FAILURE_REASON,
+                );
                 $owner?->addLogEntry(
-                    'Inactive blue-green retirement remains intervention-required: '.$exception->getMessage(),
+                    'Inactive blue-green retirement remains intervention-required: reason='
+                    .self::TRANSITION_FAILURE_REASON." correlation_id={$correlationId}",
                     'stderr',
                 );
 
@@ -2352,7 +2361,7 @@ final class RetireBlueGreenInactiveContainer
     ): string {
         $correlationId = (string) Str::uuid();
         report(new BlueGreenAmbiguousDestinationMutationException(
-            "Ambiguous inactive-retirement destination mutation (correlation: {$correlationId}): {$exception->getMessage()}",
+            'reason='.self::AMBIGUOUS_MUTATION_REASON." correlation_id={$correlationId}",
             0,
             $exception,
         ));
@@ -2367,10 +2376,10 @@ final class RetireBlueGreenInactiveContainer
                 'inactive_retirement_observed_at' => now(),
                 'inactive_retirement_intervention_required_at' => $interventionAt,
             ]);
-        $suffix = " Reason: ambiguous_mutation. Correlation: {$correlationId}.";
+        $diagnostic = ' reason='.self::AMBIGUOUS_MUTATION_REASON." correlation_id={$correlationId}";
         $owner?->addLogEntry($interventionAt === null
-            ? "Inactive blue-green retirement observed an ambiguous destination mutation result; queued a bounded retirement retry.{$suffix}"
-            : "Inactive blue-green retirement requires intervention: the bounded ambiguous-mutation budget is exhausted.{$suffix}", 'stderr');
+            ? "Inactive blue-green retirement observed an ambiguous destination mutation result; queued a bounded retirement retry.{$diagnostic}"
+            : "Inactive blue-green retirement requires intervention: the bounded ambiguous-mutation budget is exhausted.{$diagnostic}", 'stderr');
 
         return $interventionAt === null ? self::RETRY : self::INTERVENTION;
     }
@@ -2381,25 +2390,39 @@ final class RetireBlueGreenInactiveContainer
         string $message,
         ?Throwable $exception = null,
     ): string {
-        if ($exception !== null) {
-            report($exception);
-        }
         ApplicationBlueGreenDeployment::query()
             ->whereKey($state->id)
             ->where('inactive_retirement_owner_deployment_uuid', $state->inactive_retirement_owner_deployment_uuid)
             ->where('inactive_retirement_supersession_generation', $state->inactive_retirement_supersession_generation)
             ->update(['inactive_retirement_intervention_required_at' => now()]);
-        $suffix = $exception === null ? '' : self::causeSuffixFor($exception);
-        $owner?->addLogEntry("Inactive blue-green retirement requires intervention: {$message}{$suffix}", 'stderr');
+        if ($exception === null) {
+            $owner?->addLogEntry("Inactive blue-green retirement requires intervention: {$message}", 'stderr');
+
+            return self::INTERVENTION;
+        }
+        $correlationId = $this->reportRetirementFailure(
+            $exception,
+            self::TRANSITION_FAILURE_REASON,
+        );
+        $owner?->addLogEntry(
+            'Inactive blue-green retirement requires intervention: reason='
+            .self::TRANSITION_FAILURE_REASON." correlation_id={$correlationId}",
+            'stderr',
+        );
 
         return self::INTERVENTION;
     }
 
-    private static function causeSuffixFor(Throwable $exception): string
+    private function reportRetirementFailure(Throwable $exception, string $reason): string
     {
-        $cause = trim((string) $exception->getPrevious()?->getMessage());
+        $correlationId = (string) Str::uuid();
+        report(new BlueGreenDeploymentTransitionException(
+            "reason={$reason} correlation_id={$correlationId}",
+            0,
+            $exception,
+        ));
 
-        return $cause === '' ? '' : ' Cause: '.Str::limit($cause, 1000);
+        return $correlationId;
     }
 
     /**
