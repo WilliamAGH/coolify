@@ -4,7 +4,6 @@ use App\Actions\Application\BlueGreen\BlueGreenReplicaInspection;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
 use App\Actions\Proxy\BlueGreenActiveReplica;
 use App\Actions\Proxy\BlueGreenActiveReplicaSet;
-use App\Services\BlueGreenDeploymentLifecycle;
 
 /**
  * One identity-matching rule, one owner: reconciliation, reconstruction, and
@@ -32,9 +31,9 @@ function releasedFanOutFenceInspections(): array
 
 /**
  * The exact resume-side judgment loadRecoveryReplicaInspections() and
- * loadPreviousRecoveryReplicaInspections() apply to a durable fence identity.
- * The method reads no lifecycle state, so it is bound without a constructed
- * deployment.
+ * loadPreviousRecoveryReplicaInspections() apply to a durable fence identity:
+ * lifecycle resume delegates straight to the shared
+ * BlueGreenReplicaSet::matchesPersistedFenceIdentity() rule.
  *
  * @param  non-empty-list<BlueGreenReplicaInspection>  $inspections
  * @param  array{representative: BlueGreenReplicaInspection, fenceIdentity: string, routedComposeService: ?string}  $projection
@@ -45,14 +44,10 @@ function lifecycleResumeAcceptsPersistedReplicaFence(
     array $inspections,
     array $projection,
 ): bool {
-    $lifecycle = (new ReflectionClass(BlueGreenDeploymentLifecycle::class))->newInstanceWithoutConstructor();
-
-    return (new ReflectionMethod($lifecycle, 'matchesPersistedReplicaFenceIdentity'))->invoke(
-        $lifecycle,
-        $replicaSet,
+    return $replicaSet->matchesPersistedFenceIdentity(
         $persistedFenceIdentity,
         $inspections,
-        $projection,
+        $projection['routedComposeService'],
     );
 }
 
