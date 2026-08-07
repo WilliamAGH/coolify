@@ -51,6 +51,18 @@ npm run dev                     # vite dev server
 npm run build                   # production build
 ```
 
+### Running tests against PostgreSQL
+
+The default test connection is SQLite; reproduce CI's canonical PostgreSQL
+blue-green lane with:
+
+```bash
+make test-blue-green-postgresql
+```
+
+The target owns the digest-pinned disposable database, the exact test manifest,
+environment guards, and cleanup.
+
 ## Browser Tests (Pest Browser Plugin)
 
 Uses `pestphp/pest-plugin-browser` with Laravel Dusk 8. New browser tests go in `tests/v4/Browser/`.
@@ -154,8 +166,9 @@ function loginAsRoot(): mixed
 - Working branch: `staging` — ALWAYS. Every commit and every push goes to `staging`. Never create, switch to, or push any other branch, and never open pull requests for routine work in this repo.
 - Releases ship directly from `staging`: bump `config/constants.php` + `versions.json` to `X.Y.Z-fork`, push `staging`, then push a signed `X.Y.Z-fork` tag on that commit. `publish-fork.yml` verifies staging ancestry and the allowed-signer tag signature, runs application validation from the tag, and publishes the images. Deploying = digest swap in `/data/coolify/source/docker-compose.custom.yml` on the control plane.
 - `v4.x` is the legacy default branch (ruleset-locked to PR + "Application validation"); it is no longer part of the working or release path — do not target it. `next` is upstream's development branch — untouched.
+- Before any commit/tag/release work, run `scripts/dev/assert-branch-current.sh` (add `--require-clean` before tagging) — it fails when local HEAD is behind origin or the tree is dirty.
 - Treat shared production infrastructure as read-only during repository work. A failing CI or release check does not authorize changes to Nexus repository policies, registry routing or authentication, Coolify service configuration, DNS, GitHub rulesets, or Actions runner groups.
-- Resolve infrastructure-policy mismatches in repository-owned workflow, code, or configuration, or report the exact blocker. Generic directives such as “get it done,” “ship,” or “fix CI” are not authorization for an exact shared-infrastructure mutation. Follow `docs/operations/shared-production-change-control.md` for the required boundary and recovery procedure.
+- Resolve infrastructure-policy mismatches in repository-owned workflow, code, or configuration, or report the exact blocker. Follow `docs/operations/shared-production-change-control.md` for the required boundary and recovery procedure.
 
 <laravel-boost-guidelines>
 === foundation rules ===
