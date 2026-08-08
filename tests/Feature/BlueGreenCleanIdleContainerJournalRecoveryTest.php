@@ -25,6 +25,7 @@ use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\ApplicationBlueGreenDeactivation;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationBlueGreenReplica;
+use App\Models\ApplicationDeploymentQueue;
 use App\Models\InstanceSettings;
 use App\Models\Server;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -611,6 +612,21 @@ it('archives a pending journal whose owner retirement is terminal and whose live
         'status' => ApplicationDeploymentStatus::FINISHED->value,
         'finished_at' => now()->subMinute(),
     ]);
+    ApplicationDeploymentQueue::query()->create([
+        'application_id' => $scenario->application->id,
+        'deployment_uuid' => 'predecessor-retired-deployment',
+        'pull_request_id' => 0,
+        'destination_id' => $scenario->destination->id,
+        'server_id' => $scenario->server->id,
+        'status' => ApplicationDeploymentStatus::FINISHED->value,
+        'finished_at' => now()->subMinutes(2),
+        'blue_green_color' => BlueGreenDeploymentColor::GREEN,
+        'blue_green_phase' => BlueGreenDeploymentPhase::IDLE,
+        'blue_green_routing_revision' => 0,
+        'blue_green_candidate_container_id' => BlueGreenRecoveryScenario::LEGACY_ID,
+        'blue_green_topology_digest' => $scenario->state->destination_topology_digest,
+        'blue_green_routing_config_digest' => $scenario->state->application_routing_config_digest,
+    ]);
     // Pre-retirement managed route (fence before the drain mutation lands).
     $journalExpectedState = ResolveBlueGreenExpectedProxyState::run(
         $scenario->application,
@@ -623,6 +639,7 @@ it('archives a pending journal whose owner retirement is terminal and whose live
     $scenario->state->update([
         'destination_fence_operation_id' => $replacementState->operationId,
         'destination_fence_mutation_sequence' => $replacementState->mutationSequence,
+        'green_deployment_uuid' => 'predecessor-retired-deployment',
         'inactive_retirement_owner_deployment_uuid' => $ownerDeploymentUuid,
         'inactive_retirement_color' => BlueGreenDeploymentColor::GREEN->value,
         'inactive_retirement_deployment_uuid' => 'predecessor-retired-deployment',
@@ -657,6 +674,7 @@ it('archives a pending journal whose owner retirement is terminal and whose live
     $payloads = [];
     $archiveAttempted = false;
     $mutationScriptInvoked = false;
+    $replacementSidecarFinalized = false;
 
     Process::fake(function (PendingProcess $process) use (
         $journalBootId,
@@ -667,6 +685,7 @@ it('archives a pending journal whose owner retirement is terminal and whose live
         &$journalPresent,
         &$mutationScriptInvoked,
         &$payloads,
+        &$replacementSidecarFinalized,
     ) {
         $payload = (string) $process->command."\n".(string) $process->input;
         $payloads[] = $payload;
@@ -677,14 +696,14 @@ it('archives a pending journal whose owner retirement is terminal and whose live
             $archiveAttempted = true;
             $mutationScriptInvoked = $mutationScriptInvoked
                 || str_contains($payload, 'sh "$operation_container_mutation_decoded"')
-                || str_contains($payload, 'sh "$operation_container_completion_decoded"')
-                || str_contains($payload, 'operation_container_state_stage=')
-                || str_contains($payload, 'durable_remote_replace "$operation_container_state_stage"');
+                || str_contains($payload, 'sh "$operation_container_completion_decoded"');
+            $replacementSidecarFinalized = str_contains($payload, 'operation_container_state_stage=')
+                && str_contains($payload, 'durable_remote_replace "$operation_container_state_stage"');
             $journalPresent = false;
 
             return Process::result(output: implode('|', [
                 WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_CAS_OUTPUT_PREFIX,
-                BlueGreenManagedRouteMetadataForOperationResult::PENDING_EXPECTED_SIDECAR,
+                BlueGreenManagedRouteMetadataForOperationResult::COMMITTED_REPLACEMENT_SIDECAR,
                 $journalSha256,
                 (new WriteBlueGreenProxyConfiguration)->containerMutationJournalArchiveFilename(
                     $replacementState->managedFilename,
@@ -709,6 +728,10 @@ it('archives a pending journal whose owner retirement is terminal and whose live
             ])."\n".base64_encode($journalExpectedState->serialize())."\n".base64_encode($replacementState->serialize()));
         }
         if (str_contains($payload, 'coolify-blue-green-managed-route:present:')) {
+            if ($journalPresent) {
+                return Process::result(output: WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT);
+            }
+
             return Process::result(output: 'coolify-blue-green-managed-route:present:'
                 .base64_encode($replacementState->serialize())."\n".$replacementState->managedSha256);
         }
@@ -737,11 +760,11 @@ it('archives a pending journal whose owner retirement is terminal and whose live
         ->and($archiveAttempted)->toBeTrue()
         ->and($journalPresent)->toBeFalse()
         ->and($mutationScriptInvoked)->toBeFalse()
+        ->and($replacementSidecarFinalized)->toBeTrue()
         ->and($allPayloads)->toContain('operation_container_manifest_stage=')
         ->not->toContain(
             'sh "$operation_container_mutation_decoded"',
             'sh "$operation_container_completion_decoded"',
-            'committed_container_manifest_stage=',
         );
 });
 
@@ -790,17 +813,67 @@ it('keeps terminal-retirement pending journals fenced unless ownership live rout
     if ($failure === 'not-stopped') {
         $retirementAttributes['inactive_retirement_stopped_at'] = null;
     }
+    if ($failure === 'wrong-generation') {
+        $retirementAttributes['inactive_retirement_supersession_generation'] = 2;
+    }
+    if ($failure === 'wrong-topology') {
+        $retirementAttributes['inactive_retirement_topology_digest'] = str_repeat('a', 64);
+    }
+    if ($failure === 'active-target') {
+        $retirementAttributes['inactive_retirement_container_id'] = BlueGreenRecoveryScenario::CANDIDATE_ID;
+    }
     $scenario->state->update([
         ...ApplicationBlueGreenDeployment::clearedOperationAttributes(),
         ...ApplicationBlueGreenDeployment::clearedInactiveRetirementAttributes(),
         'legacy_container_name' => null,
         'phase' => BlueGreenDeploymentPhase::IDLE,
+        'green_deployment_uuid' => $failure === 'wrong-inactive-slot'
+            ? 'foreign-inactive-deployment'
+            : 'predecessor-retired-deployment',
         ...$retirementAttributes,
     ]);
     $scenario->deployment->update([
         'status' => ApplicationDeploymentStatus::FINISHED->value,
         'finished_at' => now()->subMinute(),
+        'blue_green_destination_fence_epoch' => $failure === 'wrong-owner-epoch' ? 2 : 1,
     ]);
+    if ($failure !== 'missing-inactive-queue') {
+        ApplicationDeploymentQueue::query()->create([
+            'application_id' => $scenario->application->id,
+            'deployment_uuid' => 'predecessor-retired-deployment',
+            'pull_request_id' => 0,
+            'destination_id' => $scenario->destination->id,
+            'server_id' => $scenario->server->id,
+            'status' => ApplicationDeploymentStatus::FINISHED->value,
+            'finished_at' => now()->subMinutes(2),
+            'blue_green_color' => BlueGreenDeploymentColor::GREEN,
+            'blue_green_phase' => BlueGreenDeploymentPhase::IDLE,
+            'blue_green_routing_revision' => 0,
+            'blue_green_candidate_container_id' => match ($failure) {
+                'wrong-target' => str_repeat('f', 64),
+                'active-target' => BlueGreenRecoveryScenario::CANDIDATE_ID,
+                default => BlueGreenRecoveryScenario::LEGACY_ID,
+            },
+            'blue_green_topology_digest' => $failure === 'missing-inactive-digests'
+                ? null
+                : $scenario->state->destination_topology_digest,
+            'blue_green_routing_config_digest' => $failure === 'missing-inactive-digests'
+                ? null
+                : $scenario->state->application_routing_config_digest,
+        ]);
+    }
+    if ($failure === 'owner-fenced-deactivation') {
+        ApplicationBlueGreenDeactivation::query()->create([
+            'application_id' => $scenario->application->id,
+            'standalone_docker_id' => $scenario->destination->id,
+            'operation_id' => str_repeat('d', 64),
+            'started_at' => now()->subMinutes(2),
+            'queue_cutoff_id' => $scenario->deployment->id,
+            'supersession_generation' => 1,
+            'phase' => BlueGreenDeactivationPhase::COMPLETED,
+            'completed_at' => now()->subMinute(),
+        ]);
+    }
     $replacementState = ResolveBlueGreenExpectedProxyState::run(
         $scenario->application,
         $scenario->destination,
@@ -809,12 +882,11 @@ it('keeps terminal-retirement pending journals fenced unless ownership live rout
     $journalExpectedState = cleanIdleJournalStateWithOperation($replacementState, 'terminal-retirement-negative-predecessor');
     $journalSha256 = hash('sha256', "terminal-retirement-negative-{$failure}");
     $casAttempted = false;
-    $liveState = $failure === 'live-mismatch'
-        ? cleanIdleJournalStateWithOperation($replacementState, 'live-route-diverged')
-        : $replacementState;
+    $liveState = $replacementState;
 
     Process::fake(function (PendingProcess $process) use (
         &$casAttempted,
+        $failure,
         $journalBootId,
         $journalExpectedState,
         $journalSha256,
@@ -837,7 +909,9 @@ it('keeps terminal-retirement pending journals fenced unless ownership live rout
                 $journalSha256,
                 $journalBootId,
                 BlueGreenProxyRollbackArtifact::PRESENT_STATE,
-                $replacementState->managedSha256,
+                $failure === 'live-mismatch'
+                    ? hash('sha256', 'live-route-diverged')
+                    : $replacementState->managedSha256,
                 hash('sha256', 'terminal-retirement-negative-mutation'),
                 hash('sha256', 'terminal-retirement-negative-completion'),
             ])."\n".base64_encode($journalExpectedState->serialize())."\n".base64_encode($replacementState->serialize()));
@@ -865,6 +939,15 @@ it('keeps terminal-retirement pending journals fenced unless ownership live rout
     'intervention-marked retirement remains fenced' => ['intervention'],
     'dispatch-reserved retirement remains fenced' => ['reserved'],
     'unstopped retirement remains fenced' => ['not-stopped'],
+    'wrong retirement generation remains fenced' => ['wrong-generation'],
+    'wrong retirement topology remains fenced' => ['wrong-topology'],
+    'wrong inactive color slot remains fenced' => ['wrong-inactive-slot'],
+    'wrong owner fence epoch remains fenced' => ['wrong-owner-epoch'],
+    'owner-fencing completed deactivation remains fenced' => ['owner-fenced-deactivation'],
+    'missing inactive queue remains fenced' => ['missing-inactive-queue'],
+    'missing inactive queue digests remain fenced' => ['missing-inactive-digests'],
+    'wrong inactive target remains fenced' => ['wrong-target'],
+    'active target reused as inactive remains fenced' => ['active-target'],
     'live route mismatch remains fenced' => ['live-mismatch'],
 ]);
 

@@ -5,6 +5,7 @@ namespace App\Actions\Application\BlueGreen;
 use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Enums\ApplicationDeploymentStatus;
+use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Exceptions\BlueGreenRecoveryHandoffException;
 use App\Models\Application;
@@ -169,6 +170,7 @@ class RecoverCleanIdleBlueGreenContainerMutationJournal
             $expectedStateId,
             $requireTerminalRetirementOwner,
         ): ?BlueGreenProxyState {
+            BlueGreenTopologyLock::acquire();
             $locks = BlueGreenLifecycleDatabaseLocks::forDestination(
                 (int) $application->getKey(),
                 (int) $destination->getKey(),
@@ -224,7 +226,10 @@ class RecoverCleanIdleBlueGreenContainerMutationJournal
                     // durable retirement provenance, not the active fence operation id
                     // (which may already have advanced past the retirement owner).
                     if (! $this->inactiveRetirementIsExactTerminalOwner(
+                        $locks,
                         $state,
+                        $expectedState,
+                        $freshDestination,
                         $expectedOperationId,
                         $expectedJournalBootId,
                     )) {
@@ -316,12 +321,8 @@ class RecoverCleanIdleBlueGreenContainerMutationJournal
         // journal's expected sidecar is the pre-retirement predecessor and is
         // intentionally not compared as the durable destination identity.
         if ($expectedState === null
+            || $expectedState->managedSha256 === null
             || ! BlueGreenProxyState::matches($inspection->replacementState, $expectedState)) {
-            throw new BlueGreenDeploymentTransitionException('The pending clean IDLE container-mutation journal is ambiguous and remains fenced.');
-        }
-
-        $liveState = ReadBlueGreenManagedRouteMetadata::run($server, $application, $destination);
-        if (! BlueGreenProxyState::matches($liveState, $expectedState)) {
             throw new BlueGreenDeploymentTransitionException('The pending clean IDLE container-mutation journal is ambiguous and remains fenced.');
         }
 
@@ -342,9 +343,10 @@ class RecoverCleanIdleBlueGreenContainerMutationJournal
             $inspection->journalBootId,
             requireTerminalRetirementOwner: true,
         );
+        $operationFence->assertLockOwnership();
 
         try {
-            $archivedExpected = $reader->archivePendingExpectedSidecar(
+            $finalizedReplacement = $reader->finalizePendingReplacementSidecar(
                 $server,
                 $application,
                 $destination,
@@ -359,11 +361,8 @@ class RecoverCleanIdleBlueGreenContainerMutationJournal
                 $exception,
             );
         }
-        // archivePendingExpectedSidecar returns the journal's expected (pre-mutation)
-        // sidecar; the durable destination identity is the replacement we already proved.
-        if ($archivedExpected !== null
-            && ! BlueGreenProxyState::matches($archivedExpected, $inspection->expectedState)) {
-            throw new BlueGreenDeploymentTransitionException('The terminal-retirement pending clean IDLE journal CAS changed its expected sidecar.');
+        if (! BlueGreenProxyState::matches($finalizedReplacement, $expectedState)) {
+            throw new BlueGreenDeploymentTransitionException('The terminal-retirement pending clean IDLE journal CAS changed its replacement sidecar.');
         }
         $operationFence->assertLockOwnership();
         $postArchiveState = ReadBlueGreenManagedRouteMetadata::run($server, $application, $destination);
@@ -397,17 +396,74 @@ class RecoverCleanIdleBlueGreenContainerMutationJournal
     }
 
     private function inactiveRetirementIsExactTerminalOwner(
+        BlueGreenLifecycleDatabaseLocks $locks,
         ApplicationBlueGreenDeployment $state,
+        BlueGreenProxyState $expectedState,
+        StandaloneDocker $destination,
         string $operationId,
         string $journalBootId,
     ): bool {
-        return $state->inactive_retirement_stopped_at !== null
+        $inactiveDeploymentUuid = $state->inactive_retirement_deployment_uuid;
+        $owner = $locks->queue($operationId);
+        $inactive = is_string($inactiveDeploymentUuid)
+            ? $locks->queue($inactiveDeploymentUuid)
+            : null;
+
+        return $expectedState->managedSha256 !== null
+            && $expectedState->activeDeploymentUuid === $operationId
+            && $expectedState->activeColor === $state->active_color
+            && $expectedState->activeSetFenceIdentity() !== $state->inactive_retirement_container_id
+            && $state->inactive_retirement_stopped_at !== null
             && $state->inactive_retirement_intervention_required_at === null
             && $state->inactive_retirement_dispatch_reserved_until_at === null
             && is_string($state->inactive_retirement_owner_deployment_uuid)
             && hash_equals($operationId, $state->inactive_retirement_owner_deployment_uuid)
             && is_string($state->inactive_retirement_server_boot_id)
-            && hash_equals($journalBootId, $state->inactive_retirement_server_boot_id);
+            && hash_equals($journalBootId, $state->inactive_retirement_server_boot_id)
+            && $state->inactive_retirement_supersession_generation === $state->supersession_generation
+            && $state->inactive_retirement_owner_routing_revision === $state->routing_revision
+            && $state->inactive_retirement_destination_fence_epoch === $state->destination_fence_epoch
+            && $state->inactive_retirement_topology_digest === $state->destination_topology_digest
+            && $state->inactive_retirement_routing_config_digest === $state->application_routing_config_digest
+            && is_string($state->destination_routing_topology_digest)
+            && hash_equals(
+                $state->destination_routing_topology_digest,
+                (new ComputeBlueGreenDeploymentFingerprint)->routingTopologyDigestFor($locks->application, $destination),
+            )
+            && $state->inactive_retirement_color !== $state->active_color
+            && match ($state->inactive_retirement_color) {
+                BlueGreenDeploymentColor::BLUE => $state->blue_deployment_uuid,
+                BlueGreenDeploymentColor::GREEN => $state->green_deployment_uuid,
+                null => null,
+            } === $inactiveDeploymentUuid
+            && $owner !== null
+            && (int) $owner->destination_id === (int) $destination->getKey()
+            && (int) $owner->server_id === (int) $destination->server_id
+            && $owner->pull_request_id === 0
+            && $owner->status === ApplicationDeploymentStatus::FINISHED->value
+            && $owner->blue_green_phase === BlueGreenDeploymentPhase::IDLE
+            && $owner->blue_green_color === $state->active_color
+            && $owner->blue_green_destination_fence_epoch === $state->inactive_retirement_destination_fence_epoch
+            && $owner->blue_green_routing_revision === $state->routing_revision
+            && $owner->blue_green_topology_digest === $state->destination_topology_digest
+            && $owner->blue_green_routing_config_digest === $state->application_routing_config_digest
+            && $owner->blue_green_supersession_generation === $state->supersession_generation
+            && is_string($owner->blue_green_server_boot_id)
+            && hash_equals($journalBootId, $owner->blue_green_server_boot_id)
+            && $inactive !== null
+            && (int) $inactive->destination_id === (int) $destination->getKey()
+            && (int) $inactive->server_id === (int) $destination->server_id
+            && $inactive->pull_request_id === 0
+            && $inactive->status === ApplicationDeploymentStatus::FINISHED->value
+            && $inactive->blue_green_phase === BlueGreenDeploymentPhase::IDLE
+            && $inactive->blue_green_color === $state->inactive_retirement_color
+            && $inactive->blue_green_candidate_container_id === $state->inactive_retirement_container_id
+            && $inactive->blue_green_routing_revision === $state->inactive_retirement_container_routing_revision
+            && is_string($inactive->blue_green_topology_digest)
+            && preg_match('/^[a-f0-9]{64}$/D', $inactive->blue_green_topology_digest) === 1
+            && is_string($inactive->blue_green_routing_config_digest)
+            && preg_match('/^[a-f0-9]{64}$/D', $inactive->blue_green_routing_config_digest) === 1
+            && ($locks->deactivation === null || ! $locks->deactivation->fences($owner));
     }
 
     private function hasExactTerminalOperation(
