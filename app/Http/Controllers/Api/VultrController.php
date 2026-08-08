@@ -378,7 +378,7 @@ class VultrController extends Controller
         } catch (RateLimitException $e) {
             $this->deleteUntrackedInstance($vultrService, $vultrInstanceId, $server);
 
-            $response = response()->json(['message' => $e->getMessage()], 429);
+            $response = response()->json(['message' => 'Vultr API rate limit exceeded. Please try again later.'], 429);
             if ($e->retryAfter !== null) {
                 $response->header('Retry-After', $e->retryAfter);
             }

@@ -13,6 +13,7 @@ use App\Models\Team;
 use App\Rules\ValidCloudInitYaml;
 use App\Rules\ValidHostname;
 use App\Services\HetznerService;
+use Illuminate\Http\Client\RequestException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use OpenApi\Attributes as OA;
@@ -980,14 +981,24 @@ class HetznerController extends Controller
                 'hetzner_server_id' => $hetznerServer['id'],
                 'ip' => $ipAddress,
             ])->setStatusCode(201);
-        } catch (RateLimitException $e) {
-            $response = response()->json(['message' => $e->getMessage()], 429);
-            if ($e->retryAfter !== null) {
-                $response->header('Retry-After', $e->retryAfter);
+        } catch (RateLimitException|RequestException $e) {
+            if ($e instanceof RequestException && $e->response?->status() !== 429) {
+                report($e);
+
+                return response()->json(['message' => 'Failed to create Hetzner server.'], 500);
+            }
+            $retryAfter = $e instanceof RateLimitException
+                ? $e->retryAfter
+                : $e->response?->header('Retry-After');
+            $response = response()->json(['message' => 'Hetzner API rate limit exceeded. Please try again later.'], 429);
+            if ($retryAfter !== null) {
+                $response->header('Retry-After', $retryAfter);
             }
 
             return $response;
         } catch (\Throwable $e) {
+            report($e);
+
             return response()->json(['message' => 'Failed to create Hetzner server.'], 500);
         }
     }

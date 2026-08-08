@@ -100,6 +100,33 @@ describe('GET /api/v1/vultr/regions', function () {
     });
 });
 
+describe('POST /api/v1/servers/vultr rate limiting', function () {
+    test('returns a stable rate limit response and preserves cleanup', function () {
+        $marker = 'UPSTREAM-VULTR-RATE-LIMIT-MARKER';
+        Http::fake([
+            'https://api.vultr.com/v2/ssh-keys*' => Http::response(['error' => $marker], 429, ['Retry-After' => '23']),
+        ]);
+
+        $response = $this->withHeaders([
+            'Authorization' => 'Bearer '.$this->bearerToken,
+            'Content-Type' => 'application/json',
+        ])->postJson('/api/v1/servers/vultr', [
+            'cloud_provider_token_id' => $this->vultrToken->uuid,
+            'region' => 'ewr',
+            'plan' => 'vc2-1c-1gb',
+            'os_id' => 2284,
+            'name' => 'rate-limited',
+            'private_key_uuid' => $this->privateKey->uuid,
+        ]);
+
+        $response->assertStatus(429)
+            ->assertHeader('Retry-After', '23')
+            ->assertExactJson(['message' => 'Vultr API rate limit exceeded. Please try again later.']);
+        expect($response->getContent())->not->toContain($marker);
+        Http::assertNotSent(fn ($request): bool => $request->method() === 'DELETE');
+    });
+});
+
 describe('GET /api/v1/vultr/plans', function () {
     test('gets Vultr plans', function () {
         Http::fake([

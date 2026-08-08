@@ -7,6 +7,8 @@ use App\Models\Team;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Http\Client\Request as HttpRequest;
+use Illuminate\Http\Client\RequestException;
+use Illuminate\Support\Facades\Exceptions;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Once;
 
@@ -346,6 +348,76 @@ describe('GET /api/v1/hetzner/networks', function () {
 });
 
 describe('POST /api/v1/servers/hetzner', function () {
+    test('reports generic failures internally without disclosing their detail', function () {
+        $marker = 'INTERNAL-HETZNER-GENERIC-FAILURE-MARKER';
+        Exceptions::fake();
+        Http::fake(function () use ($marker): never {
+            throw new RuntimeException($marker);
+        });
+
+        $response = $this->withHeaders([
+            'Authorization' => 'Bearer '.$this->bearerToken,
+            'Content-Type' => 'application/json',
+        ])->postJson('/api/v1/servers/hetzner', [
+            'cloud_provider_token_id' => $this->hetznerToken->uuid,
+            'location' => 'nbg1', 'server_type' => 'cx11', 'image' => 15512617,
+            'name' => 'test-server', 'private_key_uuid' => $this->privateKey->uuid,
+        ]);
+
+        $response->assertServerError()->assertExactJson(['message' => 'Failed to create Hetzner server.']);
+        expect($response->getContent())->not->toContain($marker);
+        Exceptions::assertReported(fn (RuntimeException $exception): bool => $exception->getMessage() === $marker);
+    });
+
+    test('reports non-rate-limit upstream diagnostics while returning the owned boundary', function () {
+        $marker = 'UPSTREAM-HETZNER-DIAGNOSTIC-MARKER';
+        Exceptions::fake();
+        Http::fake([
+            'https://api.hetzner.cloud/v1/ssh_keys*' => Http::response(['error' => ['message' => $marker]], 503),
+        ]);
+
+        $response = $this->withHeaders([
+            'Authorization' => 'Bearer '.$this->bearerToken,
+            'Content-Type' => 'application/json',
+        ])->postJson('/api/v1/servers/hetzner', [
+            'cloud_provider_token_id' => $this->hetznerToken->uuid,
+            'location' => 'nbg1', 'server_type' => 'cx11', 'image' => 15512617,
+            'name' => 'test-server', 'private_key_uuid' => $this->privateKey->uuid,
+        ]);
+
+        $response->assertServerError()->assertExactJson(['message' => 'Failed to create Hetzner server.']);
+        expect($response->getContent())->not->toContain($marker);
+        Exceptions::assertReported(fn (RequestException $exception): bool => str_contains($exception->getMessage(), $marker));
+    });
+
+    test('returns an application-owned rate limit response without upstream detail', function () {
+        $upstreamSecret = 'UPSTREAM-RATE-LIMIT-SECRET unrelated-request-body';
+        Http::fake([
+            'https://api.hetzner.cloud/v1/ssh_keys*' => Http::response([
+                'error' => ['message' => $upstreamSecret],
+            ], 429, ['Retry-After' => '17']),
+        ]);
+
+        $response = $this->withHeaders([
+            'Authorization' => 'Bearer '.$this->bearerToken,
+            'Content-Type' => 'application/json',
+        ])->postJson('/api/v1/servers/hetzner', [
+            'cloud_provider_token_id' => $this->hetznerToken->uuid,
+            'location' => 'nbg1',
+            'server_type' => 'cx11',
+            'image' => 15512617,
+            'name' => 'test-server',
+            'private_key_uuid' => $this->privateKey->uuid,
+            'enable_ipv4' => true,
+            'enable_ipv6' => true,
+        ]);
+
+        $response->assertStatus(429)
+            ->assertHeader('Retry-After', '17')
+            ->assertExactJson(['message' => 'Hetzner API rate limit exceeded. Please try again later.']);
+        expect($response->getContent())->not->toContain($upstreamSecret);
+    });
+
     test('creates a Hetzner server', function () {
         // Mock Hetzner API calls
         Http::fake([

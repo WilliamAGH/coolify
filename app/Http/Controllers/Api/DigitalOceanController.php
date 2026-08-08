@@ -369,7 +369,7 @@ class DigitalOceanController extends Controller
         } catch (RateLimitException $e) {
             $this->deleteUntrackedDroplet($digitalOceanService, $dropletId, $server);
 
-            $response = response()->json(['message' => $e->getMessage()], 429);
+            $response = response()->json(['message' => 'DigitalOcean API rate limit exceeded. Please try again later.'], 429);
             if ($e->retryAfter !== null) {
                 $response->header('Retry-After', $e->retryAfter);
             }

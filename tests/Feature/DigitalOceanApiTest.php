@@ -72,6 +72,31 @@ describe('GET /api/v1/digitalocean/regions', function () {
 });
 
 describe('POST /api/v1/servers/digitalocean', function () {
+    test('returns a stable rate limit response and preserves cleanup', function () {
+        $marker = 'UPSTREAM-DIGITALOCEAN-RATE-LIMIT-MARKER';
+        Http::fake([
+            'https://api.digitalocean.com/v2/account/keys*' => Http::response(['message' => $marker], 429, ['Retry-After' => '19']),
+        ]);
+
+        $response = $this->withHeaders([
+            'Authorization' => 'Bearer '.$this->bearerToken,
+            'Content-Type' => 'application/json',
+        ])->postJson('/api/v1/servers/digitalocean', [
+            'cloud_provider_token_id' => $this->digitalOceanToken->uuid,
+            'region' => 'nyc1',
+            'size' => 's-1vcpu-1gb',
+            'image' => 'ubuntu-24-04-x64',
+            'name' => 'rate-limited',
+            'private_key_uuid' => $this->privateKey->uuid,
+        ]);
+
+        $response->assertStatus(429)
+            ->assertHeader('Retry-After', '19')
+            ->assertExactJson(['message' => 'DigitalOcean API rate limit exceeded. Please try again later.']);
+        expect($response->getContent())->not->toContain($marker);
+        Http::assertNotSent(fn ($request): bool => $request->method() === 'DELETE');
+    });
+
     test('creates a DigitalOcean droplet server', function () {
         Http::fake([
             'https://api.digitalocean.com/v2/account/keys' => Http::response([
