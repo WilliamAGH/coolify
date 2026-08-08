@@ -1024,9 +1024,13 @@ it('parks a pristine first-adoption rollback with a pending container journal an
 
     $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
     $remotePayload = implode("\n", $remotePayloads);
+    $correlationId = str($result->message)->afterLast('Correlation ID: ')->rtrim('.')->toString();
 
     expect($result->outcome)->toBe(BlueGreenReconciliationResult::INTERVENTION_REQUIRED)
-        ->and($result->message)->toContain('container-mutation journal inspection returned an invalid response')
+        ->and($result->message)->toStartWith('The interrupted operation could not be proven safe to reconcile. Reason code: reconciliation_failed. Correlation ID: ')
+        ->and($correlationId)->toBeUuid()
+        ->and($result->message)->not->toContain('container-mutation journal inspection returned an invalid response')
+        ->and($scenario->state->fresh()->intervention_reason)->toBe($result->message)
         ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
         ->and($remotePayload)->toContain(WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX)
         ->and($remotePayload)->not->toContain('sh "$operation_container_mutation_decoded"')

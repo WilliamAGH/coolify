@@ -1133,9 +1133,13 @@ it('keeps a foreign committed journal fenced through public rollback reconciliat
 
     $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
     $remotePayload = implode("\n", $payloads);
+    $correlationId = str($result->message)->afterLast('Correlation ID: ')->rtrim('.')->toString();
 
     expect($result->outcome)->toBe(BlueGreenReconciliationResult::INTERVENTION_REQUIRED)
-        ->and($result->message)->toContain('does not belong to the requested recovery operation')
+        ->and($result->message)->toStartWith('The interrupted operation could not be proven safe to reconcile. Reason code: reconciliation_failed. Correlation ID: ')
+        ->and($correlationId)->toBeUuid()
+        ->and($result->message)->not->toContain('does not belong to the requested recovery operation')
+        ->and($scenario->state->fresh()->intervention_reason)->toBe($result->message)
         ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
         ->and($scenario->state->fresh()->destination_fence_mutation_sequence)->toBe(1)
         ->and($remotePayload)->toContain(WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX)
@@ -1172,9 +1176,13 @@ it('keeps an ambiguous committed journal archive fail-closed through public roll
 
     $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
     $remotePayload = implode("\n", $payloads);
+    $correlationId = str($result->message)->afterLast('Correlation ID: ')->rtrim('.')->toString();
 
     expect($result->outcome)->toBe(BlueGreenReconciliationResult::INTERVENTION_REQUIRED)
-        ->and($result->message)->toContain('CAS returned an invalid response')
+        ->and($result->message)->toStartWith('The interrupted operation could not be proven safe to reconcile. Reason code: reconciliation_failed. Correlation ID: ')
+        ->and($correlationId)->toBeUuid()
+        ->and($result->message)->not->toContain('CAS returned an invalid response')
+        ->and($scenario->state->fresh()->intervention_reason)->toBe($result->message)
         ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
         ->and($scenario->state->fresh()->destination_fence_mutation_sequence)->toBe(1)
         ->and($remotePayload)->toContain(WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX)

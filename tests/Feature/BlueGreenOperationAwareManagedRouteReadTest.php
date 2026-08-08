@@ -830,11 +830,14 @@ it('fences every non-null strict live route that is not an exact recoverable suc
 
     $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
     $state = $scenario->state->fresh();
+    $operationSpecificDetail = 'The operation-owned live managed route is neither the exact durable state nor its exact recoverable successor.';
+    $correlationId = str($result->message)->afterLast('Correlation ID: ')->rtrim('.')->toString();
 
     expect($result->outcome)->toBe(BlueGreenReconciliationResult::INTERVENTION_REQUIRED)
-        ->and($result->message)->toContain(
-            'The operation-owned live managed route is neither the exact durable state nor its exact recoverable successor.',
-        )
+        ->and($result->message)->toStartWith('The interrupted operation could not be proven safe to reconcile. Reason code: reconciliation_failed. Correlation ID: ')
+        ->and($correlationId)->toBeUuid()
+        ->and($result->message)->not->toContain($operationSpecificDetail)
+        ->and($state->intervention_reason)->toBe($result->message)
         ->and($state->phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
         ->and($state->destination_fence_mutation_sequence)->toBe(1)
         ->and($state->managed_file_sha256)->toBe($expected->managedSha256);
@@ -858,9 +861,13 @@ it('keeps a foreign committed journal fenced and unarchived through public recon
 
     $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
     $remotePayload = implode("\n", $payloads);
+    $correlationId = str($result->message)->afterLast('Correlation ID: ')->rtrim('.')->toString();
 
     expect($result->outcome)->toBe(BlueGreenReconciliationResult::INTERVENTION_REQUIRED)
-        ->and($result->message)->toContain('does not belong to the requested recovery operation')
+        ->and($result->message)->toStartWith('The interrupted operation could not be proven safe to reconcile. Reason code: reconciliation_failed. Correlation ID: ')
+        ->and($correlationId)->toBeUuid()
+        ->and($result->message)->not->toContain('does not belong to the requested recovery operation')
+        ->and($scenario->state->fresh()->intervention_reason)->toBe($result->message)
         ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
         ->and($scenario->state->fresh()->destination_fence_mutation_sequence)->toBe(1)
         ->and($remotePayload)->toContain(WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX)
@@ -870,7 +877,7 @@ it('keeps a foreign committed journal fenced and unarchived through public recon
 
 it('keeps malformed or ambiguous committed journal output fenced through public reconciliation', function (
     string $failureStage,
-    string $expectedMessage,
+    string $operationSpecificDetail,
 ): void {
     fakeOperationAwarePublicReconciliationActions();
     ['expected' => $expected, 'replacement' => $replacement, 'scenario' => $scenario]
@@ -903,9 +910,13 @@ it('keeps malformed or ambiguous committed journal output fenced through public 
 
     $result = ReconcileBlueGreenDeployment::run($scenario->state->fresh(), staleAfterSeconds: 1);
     $remotePayload = implode("\n", $payloads);
+    $correlationId = str($result->message)->afterLast('Correlation ID: ')->rtrim('.')->toString();
 
     expect($result->outcome)->toBe(BlueGreenReconciliationResult::INTERVENTION_REQUIRED)
-        ->and($result->message)->toContain($expectedMessage)
+        ->and($result->message)->toStartWith('The interrupted operation could not be proven safe to reconcile. Reason code: reconciliation_failed. Correlation ID: ')
+        ->and($correlationId)->toBeUuid()
+        ->and($result->message)->not->toContain($operationSpecificDetail)
+        ->and($scenario->state->fresh()->intervention_reason)->toBe($result->message)
         ->and($scenario->state->fresh()->phase)->toBe(BlueGreenDeploymentPhase::INTERVENTION_REQUIRED)
         ->and($scenario->state->fresh()->destination_fence_mutation_sequence)->toBe(1)
         ->and($remotePayload)->toContain(WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX)
