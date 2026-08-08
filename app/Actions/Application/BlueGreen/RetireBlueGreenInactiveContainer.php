@@ -82,8 +82,9 @@ final class RetireBlueGreenInactiveContainer
                 return self::STALE;
             }
             if ($snapshot->destination_routing_topology_digest === null) {
+                $rehydrator = new RehydrateBlueGreenDestinationRoutingTopologyDigest;
                 try {
-                    (new RehydrateBlueGreenDestinationRoutingTopologyDigest)->handleUnderFence(
+                    $rehydrator->handleUnderFence(
                         $snapshot,
                         $operationFence,
                         $ownerDeploymentUuid,
@@ -94,12 +95,20 @@ final class RetireBlueGreenInactiveContainer
                         throw $exception;
                     }
 
-                    // The retirement's own interrupted drain journal fences the
-                    // route read, and the journal-blocked recovery cannot
-                    // authenticate its context until the digest is established.
-                    // The journal is a transient artifact of a bounded drain
-                    // attempt: defer instead of wedging an intervention.
-                    return self::RETRY;
+                    $rehydrator->rehydratePendingInactiveRetirementJournalUnderFence(
+                        $snapshot,
+                        $operationFence,
+                        $ownerDeploymentUuid,
+                        $supersessionGeneration,
+                    );
+                    $operationFence->assertLockOwnership();
+
+                    return $this->recoverInterruptedRetirement(
+                        $stateId,
+                        $ownerDeploymentUuid,
+                        $supersessionGeneration,
+                        $operationFence,
+                    ) ?? self::RETRY;
                 }
             }
             $operationFence->assertLockOwnership();

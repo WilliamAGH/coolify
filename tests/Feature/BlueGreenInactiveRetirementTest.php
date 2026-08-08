@@ -13,11 +13,13 @@ use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\ComputeBlueGreenDeploymentFingerprint;
 use App\Actions\Application\BlueGreen\DrainBlueGreenPreviousContainer;
 use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
+use App\Actions\Application\BlueGreen\PlanBlueGreenSteadyState;
 use App\Actions\Application\BlueGreen\PrepareBlueGreenDeactivation;
 use App\Actions\Application\BlueGreen\RecoverBlueGreenIntervention;
 use App\Actions\Application\BlueGreen\ResolveBlueGreenExpectedProxyState;
 use App\Actions\Application\BlueGreen\ResumeBlueGreenInactiveRetirements;
 use App\Actions\Application\BlueGreen\RetireBlueGreenInactiveContainer;
+use App\Actions\Application\BlueGreen\VerifyBlueGreenCandidateReleaseProof;
 use App\Actions\Proxy\BlueGreenProxyState;
 use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
@@ -1787,6 +1789,9 @@ function fakePendingExpectedSidecarInactiveRetirementRemote(
     string $bootId,
     ?string $journalBootId = null,
     int|string $connections = 0,
+    ?string $publicAcknowledgement = null,
+    ?string $releaseProof = null,
+    ?string $destinationNetwork = null,
 ): void {
     $payloads = [];
     $archiveRequested = false;
@@ -1812,9 +1817,12 @@ function fakePendingExpectedSidecarInactiveRetirementRemote(
         $journalBootId,
         &$journalScriptsReplayed,
         &$payloads,
+        $publicAcknowledgement,
+        $releaseProof,
         &$replacementFinalized,
         $replacementManagedSha256,
         $replacementState,
+        $destinationNetwork,
     ): FakeProcessResult {
         $payload = (is_array($process->command) ? implode(' ', $process->command) : (string) $process->command)
             ."\n".(string) $process->input;
@@ -1825,8 +1833,25 @@ function fakePendingExpectedSidecarInactiveRetirementRemote(
             || str_contains($payload, 'sh "$operation_container_completion_decoded"')) {
             $journalScriptsReplayed = true;
         }
+        if ($destinationNetwork !== null && str_contains($payload, 'coolify-blue-green-route-network-proof:')) {
+            preg_match('/coolify-blue-green-route-network-proof:([a-f0-9]{64})/', $payload, $matches);
+
+            return Process::result(output: 'coolify-blue-green-route-network-proof:'
+                .($matches[1] ?? throw new RuntimeException('The network proof fixture did not receive an exact Docker identity.'))."\t"
+                .json_encode([$destinationNetwork => []], JSON_THROW_ON_ERROR));
+        }
         if (str_contains($payload, "tr -d '\\n' < /proc/sys/kernel/random/boot_id")) {
             return Process::result(output: $bootId);
+        }
+        if ($releaseProof !== null && str_contains($payload, VerifyBlueGreenCandidateReleaseProof::LABEL)) {
+            return Process::result(output: json_encode([
+                VerifyBlueGreenCandidateReleaseProof::ENVIRONMENT_VARIABLE.'='.$releaseProof,
+            ], JSON_THROW_ON_ERROR));
+        }
+        if ($publicAcknowledgement !== null && $releaseProof !== null && str_contains($payload, 'curl --config -')) {
+            return Process::result(output: "HTTP/1.1 200 OK\r\n"
+                .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$publicAcknowledgement}\r\n"
+                .BlueGreenRoutingTarget::RELEASE_PROOF_HEADER.": {$releaseProof}\r\n\r\n");
         }
         if (str_contains($payload, WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_CAS_OUTPUT_PREFIX)) {
             $archiveRequested = true;
@@ -3346,7 +3371,7 @@ it('recovers a committed idle retirement with no intervention marker before a la
         ->and($claimedState->destination_fence_operation_id)->toBe($owner->deployment_uuid);
 });
 
-it('defers a retirement whose rehydration is fenced by its own pending drain journal instead of wedging', function (): void {
+it('converges a retirement whose rehydration is fenced by its own pending drain journal', function (): void {
     ['application' => $application, 'owner' => $owner, 'state' => $state] = makeWedgedBlueGreenInactiveRetirement();
     prepareBlueGreenInactiveRetirementRemote($application->destination->server);
     $state->update([
@@ -3361,6 +3386,18 @@ it('defers a retirement whose rehydration is fenced by its own pending drain jou
         $state,
     ) ?? throw new RuntimeException('The pending rehydration fixture requires an exact expected route state.');
     $replacementState = $expectedState->withMutationOwner($owner->deployment_uuid);
+    $steadyStatePlan = PlanBlueGreenSteadyState::run(
+        $application,
+        $application->destination,
+        $state,
+    );
+    $releaseProof = BlueGreenRoutingTarget::durableReleaseProofToken(
+        (string) $expectedState->activeDeploymentUuid,
+    );
+    $expectedRoutingTopologyDigest = (new ComputeBlueGreenDeploymentFingerprint)->routingTopologyDigestFor(
+        $application,
+        $application->destination,
+    );
     $payloads = [];
     $archiveRequested = false;
     $journalPresent = true;
@@ -3373,6 +3410,9 @@ it('defers a retirement whose rehydration is fenced by its own pending drain jou
         $expectedState,
         $replacementState,
         $state->inactive_retirement_server_boot_id,
+        publicAcknowledgement: $steadyStatePlan->publicAcknowledgement,
+        releaseProof: $releaseProof,
+        destinationNetwork: $application->destination->network,
     );
     InspectBlueGreenContainer::shouldRun()
         ->andReturnUsing(static fn (Server $server, BlueGreenContainerExpectation $expectation): BlueGreenContainerInspection => $expectation->dockerId === null
@@ -3394,15 +3434,29 @@ it('defers a retirement whose rehydration is fenced by its own pending drain jou
             ));
     $lifecycle = makeBlueGreenInactiveRetirementLifecycle($application, $successor);
 
-    expect(fn () => $lifecycle->initialize())->toThrow(BlueGreenRecoveryHandoffException::class);
+    $lifecycle->initialize();
 
     $recoveredState = $state->fresh();
-    expect($archiveRequested)->toBeFalse()
-        ->and($journalPresent)->toBeTrue()
+    expect($archiveRequested)->toBeTrue()
+        ->and($journalPresent)->toBeFalse()
         ->and($journalScriptsReplayed)->toBeFalse()
         ->and($recoveredState->inactive_retirement_intervention_required_at)->toBeNull()
-        ->and($recoveredState->inactive_retirement_stopped_at)->toBeNull()
-        ->and($recoveredState->destination_routing_topology_digest)->toBeNull();
+        ->and($recoveredState->inactive_retirement_stopped_at)->not->toBeNull()
+        ->and($recoveredState->destination_routing_topology_digest)->toBe($expectedRoutingTopologyDigest)
+        ->and($recoveredState->destination_fence_operation_id)->toBe($owner->deployment_uuid)
+        ->and($recoveredState->destination_fence_mutation_sequence)->toBe($replacementState->mutationSequence)
+        ->and(implode("\n", $payloads))->not->toContain(
+            'sh "$container_journal_mutation_decoded"',
+            'sh "$container_journal_completion_decoded"',
+            'sh "$operation_container_mutation_decoded"',
+            'sh "$operation_container_completion_decoded"',
+        );
+
+    $claim = $lifecycle->claim();
+    $claimedState = $state->fresh();
+    expect($claim->deploymentUuid)->toBe($successor->deployment_uuid)
+        ->and($claimedState->phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
+        ->and($claimedState->inactive_retirement_owner_deployment_uuid)->toBeNull();
 });
 
 it('reschedules a marked journal-free retirement whose exact inactive target is still running instead of wedging', function (): void {

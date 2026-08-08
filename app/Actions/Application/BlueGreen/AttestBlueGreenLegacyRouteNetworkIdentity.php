@@ -9,6 +9,7 @@ use App\Models\Application;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
 use App\Support\ValidationPatterns;
+use Closure;
 use Illuminate\Support\Facades\DB;
 use JsonException;
 use Lorisleiva\Actions\Concerns\AsAction;
@@ -32,6 +33,74 @@ final class AttestBlueGreenLegacyRouteNetworkIdentity
         string $expectedServerBootId,
         BlueGreenOperationFence $operationFence,
         ?BlueGreenProxyState $containerIdentityState = null,
+    ): BlueGreenLegacyRouteNetworkAttestation {
+        return $this->attest(
+            $server,
+            $application,
+            $destination,
+            $routeState,
+            $expectedServerBootId,
+            $operationFence,
+            $containerIdentityState,
+            function () use ($server, $application, $destination, $routeState): void {
+                $liveState = ReadBlueGreenManagedRouteMetadata::run($server, $application, $destination);
+                $this->assertExactRouteState($routeState, $liveState);
+            },
+        );
+    }
+
+    /**
+     * Reuses the canonical network proof while the exact retirement owner has
+     * a pending journal that intentionally fences the strict sidecar reader.
+     */
+    public function handlePendingInactiveRetirementJournal(
+        Server $server,
+        Application $application,
+        StandaloneDocker $destination,
+        BlueGreenProxyState $routeState,
+        string $expectedServerBootId,
+        BlueGreenOperationFence $operationFence,
+        string $ownerDeploymentUuid,
+        ?BlueGreenProxyState $containerIdentityState = null,
+    ): BlueGreenLegacyRouteNetworkAttestation {
+        return $this->attest(
+            $server,
+            $application,
+            $destination,
+            $routeState,
+            $expectedServerBootId,
+            $operationFence,
+            $containerIdentityState,
+            function () use (
+                $server,
+                $application,
+                $destination,
+                $expectedServerBootId,
+                $ownerDeploymentUuid,
+                $routeState,
+            ): void {
+                $this->assertExactPendingInactiveRetirementJournalState(
+                    $server,
+                    $application,
+                    $destination,
+                    $routeState,
+                    $expectedServerBootId,
+                    $ownerDeploymentUuid,
+                );
+            },
+        );
+    }
+
+    /** @param Closure(): void $assertRouteState */
+    private function attest(
+        Server $server,
+        Application $application,
+        StandaloneDocker $destination,
+        BlueGreenProxyState $routeState,
+        string $expectedServerBootId,
+        BlueGreenOperationFence $operationFence,
+        ?BlueGreenProxyState $containerIdentityState,
+        Closure $assertRouteState,
     ): BlueGreenLegacyRouteNetworkAttestation {
         if (DB::getDriverName() === 'pgsql' && DB::transactionLevel() !== 0) {
             throw new BlueGreenDeploymentTransitionException(
@@ -62,8 +131,7 @@ final class AttestBlueGreenLegacyRouteNetworkIdentity
 
         $operationFence->assertLockOwnership();
         ReadBlueGreenServerBootIdentity::run($server, $expectedServerBootId);
-        $initialLiveState = ReadBlueGreenManagedRouteMetadata::run($server, $application, $destination);
-        $this->assertExactRouteState($routeState, $initialLiveState);
+        $assertRouteState();
         try {
             $output = instant_privileged_remote_script(
                 implode("\n", $script),
@@ -105,8 +173,7 @@ final class AttestBlueGreenLegacyRouteNetworkIdentity
                 );
             }
         }
-        $finalLiveState = ReadBlueGreenManagedRouteMetadata::run($server, $application, $destination);
-        $this->assertExactRouteState($routeState, $finalLiveState);
+        $assertRouteState();
         ReadBlueGreenServerBootIdentity::run($server, $expectedServerBootId);
         $operationFence->assertLockOwnership();
 
@@ -125,6 +192,33 @@ final class AttestBlueGreenLegacyRouteNetworkIdentity
             ),
             routeState: $routeState->serialize(),
         );
+    }
+
+    private function assertExactPendingInactiveRetirementJournalState(
+        Server $server,
+        Application $application,
+        StandaloneDocker $destination,
+        BlueGreenProxyState $routeState,
+        string $expectedServerBootId,
+        string $ownerDeploymentUuid,
+    ): void {
+        $inspection = ReadBlueGreenManagedRouteMetadataForOperation::run(
+            $server,
+            $application,
+            $destination,
+            $ownerDeploymentUuid,
+        );
+        if (! $inspection->hasPendingExpectedSidecar()
+            || ! is_string($inspection->journalBootId)
+            || ! hash_equals($expectedServerBootId, $inspection->journalBootId)
+            || ! BlueGreenProxyState::matches($inspection->expectedState, $routeState)
+            || $inspection->replacementState === null
+            || ! BlueGreenProxyState::matches(
+                $inspection->replacementState,
+                $routeState->withMutationOwner($ownerDeploymentUuid),
+            )) {
+            throw new BlueGreenDeploymentTransitionException('The pending inactive-retirement journal changed during legacy route network attestation.');
+        }
     }
 
     private function assertExactRouteState(BlueGreenProxyState $expected, ?BlueGreenProxyState $actual): void

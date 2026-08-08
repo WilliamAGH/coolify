@@ -9,6 +9,7 @@ use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
+use App\Models\Server;
 use App\Models\StandaloneDocker;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -182,31 +183,7 @@ final class RehydrateBlueGreenDestinationRoutingTopologyDigest
         );
         $attestedRouteState = $this->assertExactLiveState($context['compatibleStates'], $liveState);
 
-        $releaseProof = BlueGreenRoutingTarget::durableReleaseProofToken(
-            (string) $context['plan']->activeDeployment->deployment_uuid,
-        );
-        foreach ($context['plan']->activeContainers as $activeContainer) {
-            $inspection = InspectBlueGreenContainer::run($server, $activeContainer);
-            if (! $inspection->exists
-                || $inspection->dockerId !== $activeContainer->dockerId
-                || $inspection->status !== 'running'
-                || $inspection->health !== 'healthy') {
-                throw new BlueGreenDeploymentTransitionException('An exact active container is not running and healthy; routing topology rehydration refused.');
-            }
-            VerifyBlueGreenCandidateReleaseProof::run($server, $activeContainer, $releaseProof, $inspection);
-        }
-        (new VerifyBlueGreenPublicRecovery)->verifyRoutesAbsorbingProviderLag(
-            server: $server,
-            application: $context['application'],
-            routes: $context['plan']->publicRoutes,
-            expectedAcknowledgement: $context['plan']->publicAcknowledgement,
-            expectedReleaseProof: $releaseProof,
-            nonceParameter: VerifyBlueGreenPublicRecovery::DEPLOYMENT_NONCE_PARAMETER,
-            beforeRequest: static function () use ($fence): void {
-                $fence->assertLockOwnership();
-            },
-        );
-
+        $this->verifyActiveRoute($context, $server, $fence);
         $networkAttestation = AttestBlueGreenLegacyRouteNetworkIdentity::run(
             server: $server,
             application: $context['application'],
@@ -225,6 +202,85 @@ final class RehydrateBlueGreenDestinationRoutingTopologyDigest
             $networkAttestation,
             $bootId,
             $attestedRouteState,
+        );
+    }
+
+    /**
+     * Rehydrates only an exact pending journal owned by the inactive-retirement
+     * lifecycle. The operation reader authenticates the journal without
+     * replaying, archiving, or rewriting its sidecar; recovery consumes it
+     * after this DB-only digest CAS succeeds.
+     */
+    public function rehydratePendingInactiveRetirementJournalUnderFence(
+        ApplicationBlueGreenDeployment $candidate,
+        BlueGreenOperationFence $fence,
+        string $inactiveRetirementOwnerDeploymentUuid,
+        int $inactiveRetirementSupersessionGeneration,
+    ): ApplicationBlueGreenDeployment {
+        $fence->assertLockOwnership();
+        $context = $this->context(
+            (int) $candidate->getKey(),
+            $inactiveRetirementOwnerDeploymentUuid,
+            $inactiveRetirementSupersessionGeneration,
+        );
+        if ($context['state']->destination_routing_topology_digest !== null) {
+            return $context['state'];
+        }
+        $server = $context['destination']->server
+            ?? throw new BlueGreenDeploymentTransitionException('The legacy destination has no exact server.');
+        $expectedBootId = $context['state']->inactive_retirement_server_boot_id;
+        if (! is_string($expectedBootId)) {
+            throw new BlueGreenDeploymentTransitionException('The inactive retirement has no exact server boot identity.');
+        }
+        $currentBootId = ReadBlueGreenServerBootIdentity::run($server, $expectedBootId);
+        $fence->assertLockOwnership();
+        $inspection = ReadBlueGreenManagedRouteMetadataForOperation::run(
+            $server,
+            $context['application'],
+            $context['destination'],
+            $inactiveRetirementOwnerDeploymentUuid,
+        );
+        if (! $inspection->hasPendingExpectedSidecar()
+            || ! is_string($inspection->journalBootId)
+            || ! hash_equals($expectedBootId, $currentBootId)
+            || ! hash_equals($expectedBootId, $inspection->journalBootId)) {
+            throw new BlueGreenDeploymentTransitionException('The inactive-retirement journal is not the exact pending sidecar for its durable boot provenance.');
+        }
+        $attestedExpectedState = $this->assertExactLiveState(
+            $context['compatibleStates'],
+            $inspection->expectedState,
+        );
+        $replacementState = $inspection->replacementState;
+        if ($replacementState === null
+            || ! BlueGreenProxyState::matches(
+                $replacementState,
+                $attestedExpectedState->withMutationOwner($inactiveRetirementOwnerDeploymentUuid),
+            )) {
+            throw new BlueGreenDeploymentTransitionException('The inactive-retirement journal replacement does not exactly succeed its attested expected sidecar.');
+        }
+        $fence->assertLockOwnership();
+
+        $this->verifyActiveRoute($context, $server, $fence);
+        $networkAttestation = (new AttestBlueGreenLegacyRouteNetworkIdentity)
+            ->handlePendingInactiveRetirementJournal(
+                server: $server,
+                application: $context['application'],
+                destination: $context['destination'],
+                routeState: $attestedExpectedState,
+                expectedServerBootId: $currentBootId,
+                operationFence: $fence,
+                ownerDeploymentUuid: $inactiveRetirementOwnerDeploymentUuid,
+                containerIdentityState: $context['expectedState'],
+            );
+        $fence->assertLockOwnership();
+
+        return $this->commit(
+            $context,
+            $inactiveRetirementOwnerDeploymentUuid,
+            $inactiveRetirementSupersessionGeneration,
+            $networkAttestation,
+            $currentBootId,
+            $attestedExpectedState,
         );
     }
 
@@ -343,6 +399,38 @@ final class RehydrateBlueGreenDestinationRoutingTopologyDigest
                 'state' => $state,
             ];
         }, attempts: 5);
+    }
+
+    /** @param array<string, mixed> $context */
+    private function verifyActiveRoute(
+        array $context,
+        Server $server,
+        BlueGreenOperationFence $fence,
+    ): void {
+        $releaseProof = BlueGreenRoutingTarget::durableReleaseProofToken(
+            (string) $context['plan']->activeDeployment->deployment_uuid,
+        );
+        foreach ($context['plan']->activeContainers as $activeContainer) {
+            $inspection = InspectBlueGreenContainer::run($server, $activeContainer);
+            if (! $inspection->exists
+                || $inspection->dockerId !== $activeContainer->dockerId
+                || $inspection->status !== 'running'
+                || $inspection->health !== 'healthy') {
+                throw new BlueGreenDeploymentTransitionException('An exact active container is not running and healthy; routing topology rehydration refused.');
+            }
+            VerifyBlueGreenCandidateReleaseProof::run($server, $activeContainer, $releaseProof, $inspection);
+        }
+        (new VerifyBlueGreenPublicRecovery)->verifyRoutesAbsorbingProviderLag(
+            server: $server,
+            application: $context['application'],
+            routes: $context['plan']->publicRoutes,
+            expectedAcknowledgement: $context['plan']->publicAcknowledgement,
+            expectedReleaseProof: $releaseProof,
+            nonceParameter: VerifyBlueGreenPublicRecovery::DEPLOYMENT_NONCE_PARAMETER,
+            beforeRequest: static function () use ($fence): void {
+                $fence->assertLockOwnership();
+            },
+        );
     }
 
     /** @param array<string, mixed> $context */
