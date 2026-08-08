@@ -2,7 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
-## [unreleased]
+## [4.13.80-fork] - 2026-08-08
+
+### 🐛 Bug Fixes
+
+- *(blue-green)* Archive terminal-retirement pending journals
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.80-fork
+
+## [4.13.79-fork] - 2026-08-08
 
 ### 🐛 Bug Fixes
 
@@ -17,6 +27,7 @@ All notable changes to this project will be documented in this file.
 
 ### 📚 Documentation
 
+- Update changelog
 - Update changelog
 - Update changelog
 
