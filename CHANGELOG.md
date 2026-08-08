@@ -7,10 +7,23 @@ All notable changes to this project will be documented in this file.
 ### 🐛 Bug Fixes
 
 - *(blue-green)* Defer drain-journal-fenced rehydration and reschedule running-target retirements
+- *(blue-green)* Recover fenced retirement journal
+- *(blue-green)* Fence retirement recovery diagnostics
+- *(blue-green)* Redact reconciliation failures
+- *(api)* Sanitize provider error responses
+- *(api)* Sanitize compose validation errors
+- *(deploy)* Restore signed release assets on retry
+- *(blue-green)* Harden stopped topology recovery
+
+### 📚 Documentation
+
+- Update changelog
 
 ### 🧪 Testing
 
 - *(factories)* Isolate factory name validation database
+- *(blue-green)* Enforce sanitized reconciliation failures
+- *(blue-green)* Pin retirement recovery reservation state
 
 ### ⚙️ Miscellaneous Tasks
 
