@@ -48,10 +48,12 @@ use App\Models\StandaloneDocker;
 use App\Models\Team;
 use App\Models\User;
 use App\Services\BlueGreenDeploymentLifecycle;
-use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Foundation\Testing\DatabaseTruncation as LaravelDatabaseTruncation;
 use Illuminate\Process\FakeProcessResult;
 use Illuminate\Process\PendingProcess;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Exceptions;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Queue;
@@ -59,10 +61,40 @@ use Illuminate\Support\Facades\Storage;
 use Livewire\Livewire;
 use Symfony\Component\Yaml\Yaml;
 
-uses(RefreshDatabase::class);
+trait TruncatesBlueGreenInactiveRetirementDatabase
+{
+    use LaravelDatabaseTruncation {
+        truncateDatabaseTables as private truncatePersistentDatabaseTables;
+    }
+
+    protected function truncateDatabaseTables(): void
+    {
+        if (DB::getDriverName() === 'sqlite') {
+            Artisan::call('migrate:fresh', ['--no-interaction' => true]);
+
+            return;
+        }
+
+        $this->truncatePersistentDatabaseTables();
+    }
+}
+
+// Not RefreshDatabase: its per-test wrapping transaction keeps
+// DB::transactionLevel() at 1 on the PostgreSQL lane, and pending-journal
+// retirement recovery attests the legacy route network outside transactions.
+// DatabaseTruncation preserves transaction level 0 without rebuilding the
+// entire persistent schema around every test. SQLite still uses migrate:fresh
+// because that in-memory schema is discarded with the test application.
+uses(TruncatesBlueGreenInactiveRetirementDatabase::class);
 
 beforeEach(function (): void {
     seedInstanceSettings();
+});
+
+afterEach(function (): void {
+    if (DB::getDriverName() !== 'sqlite') {
+        $this->truncateDatabaseTables();
+    }
 });
 
 function makeBlueGreenInactiveRetirementApplication(): Application

@@ -572,6 +572,10 @@ it('promotes two public routes across two backend ports through production label
             'routingRevision' => $claim->expectedRoutingRevision,
             'deploymentUuid' => $claim->deploymentUuid,
             'index' => 1,
+            'count' => 1,
+            'composeProject' => $application->uuid,
+            'composeService' => $claim->candidateContainerName,
+            'ordinal' => 0,
         ]])
         ->and($finalState->phase)->toBe(BlueGreenDeploymentPhase::IDLE)
         ->and($finalState->active_color)->toBe(BlueGreenDeploymentColor::BLUE)
