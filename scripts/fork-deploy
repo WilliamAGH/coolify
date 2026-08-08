@@ -1887,6 +1887,20 @@ fd_stage_recorded() {
     fd_validate_staging "$staging"
 }
 
+fd_stage_forward_recorded() {
+    local staging=$1 dir asset environment=$SOURCE_DIR/.env
+
+    dir=$(fd_release_dir "$VERSION")
+    fd_verify_recorded_bundle "$dir"
+    fd_validate_forward_recovery_environment "$environment"
+    for asset in docker-compose.yml docker-compose.prod.yml docker-compose.custom.yml .env.production; do
+        cp -p "$dir/$asset" "$staging/$asset"
+    done
+    cp -p "$environment" "$staging/.env"
+    fd_assert_staged_hashes "$staging"
+    fd_validate_staging "$staging"
+}
+
 fd_append_history() {
     local line=$1 temporary
 
@@ -2697,6 +2711,19 @@ fd_validate_active_environment() {
     fd_validate_ports "$environment"
 }
 
+fd_validate_forward_recovery_environment() {
+    local environment=$1 key value
+
+    require_regular_file "$environment" 'active candidate environment'
+    for key in APP_ID APP_KEY DB_PASSWORD REDIS_PASSWORD PUSHER_APP_ID PUSHER_APP_KEY PUSHER_APP_SECRET; do
+        value=$(env_value "$environment" "$key")
+        [[ -n $value ]] || die "required identity value is missing: $key"
+    done
+    [[ $(env_value "$environment" COOLIFY_FORK_VERSION) == "$VERSION" ]] \
+        || die 'active environment does not identify the exact failed candidate'
+    fd_validate_active_environment
+}
+
 fd_require_verified_current() {
     fd_verify_current
 }
@@ -2838,7 +2865,7 @@ fd_recover_abort() {
 fd_recover_forward() {
     local candidate previous migration journal prestart_sha pending_started pending_state
     local migration_after rendered field current recovery_file='' recovery_label=''
-    local forward_present=false pending_present=false release_directory state
+    local forward_present=false pending_present=false release_directory staging state
 
     if [[ -e $FORWARD_RECOVERY_FILE || -L $FORWARD_RECOVERY_FILE ]]; then
         require_regular_file "$FORWARD_RECOVERY_FILE" 'forward recovery state'
@@ -2907,8 +2934,12 @@ fd_recover_forward() {
         [[ $current == "$candidate" ]] \
             || die "forward recovery found active release $current; expected candidate $candidate"
     fi
-    [[ $(env_value "$SOURCE_DIR/.env" COOLIFY_FORK_VERSION) == "$candidate" ]] \
-        || die 'active environment does not identify the exact failed candidate'
+    staging=$(fd_new_staging)
+    fd_track_staging "$staging"
+    fd_stage_forward_recorded "$staging"
+    fd_activate_staging "$staging"
+    fd_release_tracked_staging "$staging"
+
     fd_validate_active_assets "$release_directory"
     fd_validate_active_environment
     fd_validate_effective_images "$SOURCE_DIR"

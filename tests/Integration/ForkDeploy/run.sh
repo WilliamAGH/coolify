@@ -1201,6 +1201,168 @@ test_forward_recovery_preserves_writes_and_exact_candidate() {
     cleanup_fixture
 }
 
+test_forward_recovery_restores_signed_assets_before_retry() {
+    new_fixture
+    local active_environment_hash recorded_overlay
+    write_manifest 4.13.0-fork.1
+    if ! install_release >/dev/null; then
+        fail 'forward recovery restores signed active assets before retry'
+        cleanup_fixture
+        return
+    fi
+    write_manifest 4.13.0-fork.2
+    replace_key_value "$MANIFEST_FILE" MAIN_INDEX_DIGEST "$DIGEST_E"
+    sign_manifest
+    rm -f "$FORK_DEPLOY_CANDIDATE_STARTED_MARKER"
+    export FORK_DEPLOY_FAIL_CANDIDATE_RUNTIME_VERIFY=true
+    if update_release >/dev/null 2>&1; then
+        unset FORK_DEPLOY_FAIL_CANDIDATE_RUNTIME_VERIFY
+        fail 'forward recovery restores signed active assets before retry'
+        cleanup_fixture
+        return
+    fi
+    unset FORK_DEPLOY_FAIL_CANDIDATE_RUNTIME_VERIFY
+
+    recorded_overlay=$ROOT/fork-deploy/releases/4.13.0-fork.2/docker-compose.custom.yml
+    active_environment_hash=$(hash_file "$ROOT/source/.env")
+    sed "s/$DIGEST_A/$DIGEST_E/" "$recorded_overlay" >"$ROOT/source/docker-compose.custom.yml.drift"
+    chmod 0600 "$ROOT/source/docker-compose.custom.yml.drift"
+    mv -f "$ROOT/source/docker-compose.custom.yml.drift" "$ROOT/source/docker-compose.custom.yml"
+    printf 'accepted-after-candidate-start\n' >"$ROOT/applications/post-start-write"
+    : >"$LOG"
+
+    if "$SUBJECT" recover-forward >/dev/null \
+        && cmp -s "$ROOT/source/docker-compose.custom.yml" "$recorded_overlay" \
+        && [[ $(hash_file "$ROOT/source/.env") == "$active_environment_hash" \
+            && $(<"$ROOT/applications/post-start-write") == accepted-after-candidate-start \
+            && $(<"$ROOT/fork-deploy/current") == 4.13.0-fork.2 ]] \
+        && [[ $(grep -c 'compose .* up' "$LOG" || true) -eq 1 ]] \
+        && "$SUBJECT" verify >/dev/null; then
+        pass 'forward recovery restores signed active assets before retry'
+    else
+        fail 'forward recovery restores signed active assets before retry'
+    fi
+    cleanup_fixture
+}
+
+test_forward_recovery_rejects_corrupt_bundle_without_active_mutation() {
+    new_fixture
+    local active_hash output
+    if ! prepare_post_start_failure; then
+        fail 'forward recovery rejects a corrupt bundle without active mutation'
+        cleanup_fixture
+        return
+    fi
+    printf 'active-drift\n' >"$ROOT/source/docker-compose.custom.yml"
+    active_hash=$(hash_file "$ROOT/source/docker-compose.custom.yml")
+    printf 'corrupt\n' >"$ROOT/fork-deploy/releases/4.13.0-fork.2/docker-compose.custom.yml"
+    : >"$LOG"
+
+    if output=$("$SUBJECT" recover-forward 2>&1); then
+        fail 'forward recovery rejects a corrupt bundle without active mutation'
+    elif [[ $output == *'recorded release asset hash mismatch'* \
+        && $(hash_file "$ROOT/source/docker-compose.custom.yml") == "$active_hash" \
+        && -f $ROOT/fork-deploy/forward-recovery \
+        && -f $ROOT/fork-deploy/pending-candidate ]] \
+        && ! grep -q 'compose .* up' "$LOG"; then
+        pass 'forward recovery rejects a corrupt bundle without active mutation'
+    else
+        fail 'forward recovery rejects a corrupt bundle without active mutation'
+    fi
+    cleanup_fixture
+}
+
+test_forward_recovery_rejects_missing_identity_without_mutation() {
+    local key output environment_hash pending_hash recovery_hash asset asset_hashes_before asset_hashes_after
+
+    for key in APP_ID APP_KEY DB_PASSWORD REDIS_PASSWORD PUSHER_APP_ID PUSHER_APP_KEY PUSHER_APP_SECRET; do
+        new_fixture
+        if ! prepare_post_start_failure; then
+            fail "forward recovery rejects missing $key without mutation"
+            cleanup_fixture
+            continue
+        fi
+
+        awk -F= -v key="$key" '$1 != key { print }' "$ROOT/source/.env" >"$ROOT/source/.env.missing"
+        chmod 0600 "$ROOT/source/.env.missing"
+        mv -f "$ROOT/source/.env.missing" "$ROOT/source/.env"
+        environment_hash=$(hash_file "$ROOT/source/.env")
+        pending_hash=$(hash_file "$ROOT/fork-deploy/pending-candidate")
+        recovery_hash=$(hash_file "$ROOT/fork-deploy/forward-recovery")
+        asset_hashes_before=
+        for asset in docker-compose.yml docker-compose.prod.yml docker-compose.custom.yml .env.production; do
+            asset_hashes_before+="$(hash_file "$ROOT/source/$asset") "
+        done
+        : >"$LOG"
+
+        if output=$("$SUBJECT" recover-forward 2>&1); then
+            fail "forward recovery rejects missing $key without mutation"
+        else
+            asset_hashes_after=
+            for asset in docker-compose.yml docker-compose.prod.yml docker-compose.custom.yml .env.production; do
+                asset_hashes_after+="$(hash_file "$ROOT/source/$asset") "
+            done
+            if [[ $output == *"environment field is missing or duplicated: $key"* \
+                && $(hash_file "$ROOT/source/.env") == "$environment_hash" \
+                && $asset_hashes_after == "$asset_hashes_before" \
+                && $(hash_file "$ROOT/fork-deploy/pending-candidate") == "$pending_hash" \
+                && $(hash_file "$ROOT/fork-deploy/forward-recovery") == "$recovery_hash" ]] \
+                && ! grep -q 'compose .* up' "$LOG" \
+                && staging_directories_absent; then
+                pass "forward recovery rejects missing $key without mutation"
+            else
+                fail "forward recovery rejects missing $key without mutation"
+            fi
+        fi
+        cleanup_fixture
+    done
+}
+
+test_forward_recovery_rejects_duplicate_identity_without_mutation() {
+    local duplicate_value output environment_hash pending_hash recovery_hash asset
+    local asset_hashes_before asset_hashes_after
+
+    for duplicate_value in '' different-app-key; do
+        new_fixture
+        if ! prepare_post_start_failure; then
+            fail 'forward recovery rejects duplicate APP_KEY without mutation'
+            cleanup_fixture
+            continue
+        fi
+
+        printf 'APP_KEY=%s\n' "$duplicate_value" >>"$ROOT/source/.env"
+        environment_hash=$(hash_file "$ROOT/source/.env")
+        pending_hash=$(hash_file "$ROOT/fork-deploy/pending-candidate")
+        recovery_hash=$(hash_file "$ROOT/fork-deploy/forward-recovery")
+        asset_hashes_before=
+        for asset in docker-compose.yml docker-compose.prod.yml docker-compose.custom.yml .env.production; do
+            asset_hashes_before+="$(hash_file "$ROOT/source/$asset") "
+        done
+        : >"$LOG"
+
+        if output=$("$SUBJECT" recover-forward 2>&1); then
+            fail 'forward recovery rejects duplicate APP_KEY without mutation'
+        else
+            asset_hashes_after=
+            for asset in docker-compose.yml docker-compose.prod.yml docker-compose.custom.yml .env.production; do
+                asset_hashes_after+="$(hash_file "$ROOT/source/$asset") "
+            done
+            if [[ $output == *'environment field is missing or duplicated: APP_KEY'* \
+                && $(hash_file "$ROOT/source/.env") == "$environment_hash" \
+                && $asset_hashes_after == "$asset_hashes_before" \
+                && $(hash_file "$ROOT/fork-deploy/pending-candidate") == "$pending_hash" \
+                && $(hash_file "$ROOT/fork-deploy/forward-recovery") == "$recovery_hash" ]] \
+                && ! grep -q 'compose .* up' "$LOG" \
+                && staging_directories_absent; then
+                pass 'forward recovery rejects duplicate APP_KEY without mutation'
+            else
+                fail 'forward recovery rejects duplicate APP_KEY without mutation'
+            fi
+        fi
+        cleanup_fixture
+    done
+}
+
 test_forward_recovery_retries_one_sided_and_cleanup_states() {
     new_fixture
     local pending=$ROOT/fork-deploy/pending-candidate
@@ -2805,6 +2967,16 @@ if [[ ${FORK_DEPLOY_TEST_FILTER:-} == bundled-readiness-retry ]]; then
     exit
 fi
 
+if [[ ${FORK_DEPLOY_TEST_FILTER:-} == forward-asset-recovery ]]; then
+    test_forward_recovery_restores_signed_assets_before_retry
+    test_forward_recovery_rejects_corrupt_bundle_without_active_mutation
+    test_forward_recovery_rejects_missing_identity_without_mutation
+    test_forward_recovery_rejects_duplicate_identity_without_mutation
+    printf '%s passing, %s failing\n' "$PASS" "$FAIL"
+    ((FAIL == 0))
+    exit
+fi
+
 if [[ ${FORK_DEPLOY_TEST_FILTER:-} == database-default ]]; then
     test_install_records_signed_immutable_bundle
     test_verify_rejects_missing_database_name
@@ -2860,6 +3032,10 @@ test_repair_rejects_corrupted_recorded_asset
 test_help_and_parser_describe_forward_recovery
 test_post_start_failure_has_forward_only_disposition
 test_forward_recovery_preserves_writes_and_exact_candidate
+test_forward_recovery_restores_signed_assets_before_retry
+test_forward_recovery_rejects_corrupt_bundle_without_active_mutation
+test_forward_recovery_rejects_missing_identity_without_mutation
+test_forward_recovery_rejects_duplicate_identity_without_mutation
 test_forward_recovery_retries_one_sided_and_cleanup_states
 test_forward_recovery_forbids_mismatch_abort_and_rollback
 test_forward_recovery_reconciles_historical_rollback_activation
